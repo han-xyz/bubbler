@@ -1,23 +1,31 @@
 //! Turns granted services into builder calls. Each service touches only
 //! phase 4 (binds) and phase 5 (env); `network` is the one exception that
 //! edits phase 1 via [`BwrapArgs::share_net`].
+//!
+//! Paths come from untrusted host environment values, so every source is
+//! probed for its file *type*, never for mere existence: binding a
+//! directory binds the whole tree under it, so `XAUTHORITY=/` would bind
+//! the host root.
 
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::fs::FileType;
+use std::os::unix::fs::FileTypeExt;
+use std::path::{Component, Path, PathBuf};
 
 use crate::bwrap::BwrapArgs;
 use crate::config::{Service, ShareMode};
 use crate::env::{Env, SANDBOX_HOME};
 use crate::error::LaunchError;
 
-/// Apply every service to `args`. `probe` reports whether a host path
-/// exists, so tests run without real sockets. A [`Service::HomeShare`]
-/// `path` must be relative and normalised, exactly as the parser leaves it.
+/// Apply every service to `args`. `probe` reports the type of a host path
+/// with symlinks followed, so tests run without real sockets. A
+/// [`Service::HomeShare`] `path` must be relative and normalised, exactly
+/// as the parser leaves it.
 pub fn apply_all(
     services: &[Service],
     env: &Env,
     args: &mut BwrapArgs,
-    probe: &dyn Fn(&Path) -> bool,
+    probe: &dyn Fn(&Path) -> Option<FileType>,
 ) -> Result<(), LaunchError> {
     let has_x11 = services.contains(&Service::X11);
     for s in services {
@@ -32,14 +40,51 @@ pub fn apply_all(
 }
 
 fn require(
-    probe: &dyn Fn(&Path) -> bool,
+    probe: &dyn Fn(&Path) -> Option<FileType>,
+    service: &'static str,
+    path: PathBuf,
+    expected: &'static str,
+    accept: impl Fn(FileType) -> bool,
+) -> Result<PathBuf, LaunchError> {
+    match probe(&path) {
+        None => Err(LaunchError::MissingResource { service, path }),
+        Some(t) if accept(t) => Ok(path),
+        Some(_) => Err(LaunchError::WrongType {
+            service,
+            path,
+            expected,
+        }),
+    }
+}
+
+/// The source must be a Unix socket; a directory here would bind a tree.
+fn require_socket(
+    probe: &dyn Fn(&Path) -> Option<FileType>,
     service: &'static str,
     path: PathBuf,
 ) -> Result<PathBuf, LaunchError> {
-    if probe(&path) {
-        Ok(path)
-    } else {
-        Err(LaunchError::MissingResource { service, path })
+    require(probe, service, path, "a socket", |t| t.is_socket())
+}
+
+/// The source must be a regular file, e.g. an Xauthority cookie file.
+fn require_file(
+    probe: &dyn Fn(&Path) -> Option<FileType>,
+    service: &'static str,
+    path: PathBuf,
+) -> Result<PathBuf, LaunchError> {
+    require(probe, service, path, "a regular file", |t| t.is_file())
+}
+
+/// The source may be of any type; only used where the user named the path
+/// in the config rather than the environment naming it.
+fn require_exists(
+    probe: &dyn Fn(&Path) -> Option<FileType>,
+    service: &'static str,
+    path: PathBuf,
+) -> Result<PathBuf, LaunchError> {
+    match probe(&path) {
+        Some(_) => Ok(path),
+        None => Err(LaunchError::MissingResource { service, path }),
     }
 }
 
@@ -50,7 +95,7 @@ fn require(
 fn wayland(
     env: &Env,
     args: &mut BwrapArgs,
-    probe: &dyn Fn(&Path) -> bool,
+    probe: &dyn Fn(&Path) -> Option<FileType>,
     claim_session: bool,
 ) -> Result<(), LaunchError> {
     let display = env
@@ -60,7 +105,11 @@ fn wayland(
             service: "wayland",
             var: "WAYLAND_DISPLAY",
         })?;
-    if display.as_encoded_bytes().contains(&b'/') {
+    let mut comps = Path::new(display).components();
+    if !matches!(
+        (comps.next(), comps.next()),
+        (Some(Component::Normal(_)), None)
+    ) {
         return Err(LaunchError::BadValue {
             service: "wayland",
             reason: format!(
@@ -69,7 +118,7 @@ fn wayland(
             ),
         });
     }
-    let sock = require(probe, "wayland", env.runtime_dir.join(display))?;
+    let sock = require_socket(probe, "wayland", env.runtime_dir.join(display))?;
     args.ro_bind(&sock, &sock);
     args.setenv(OsStr::new("WAYLAND_DISPLAY"), display);
     if claim_session {
@@ -94,8 +143,13 @@ pub fn x11_display_number(display: &OsStr) -> Option<u32> {
 /// Bind the X11 socket at the same path (Arch wiki: binding to a different
 /// display number may not work) and any Xauthority file at the fixed inner
 /// path `/home/bubbler/.Xauthority`, so the host location stays hidden.
-/// The `$HOME/.Xauthority` fallback follows libX11's default, not the wiki.
-fn x11(env: &Env, args: &mut BwrapArgs, probe: &dyn Fn(&Path) -> bool) -> Result<(), LaunchError> {
+/// The `$HOME/.Xauthority` fallback follows libX11's default, not the wiki,
+/// and is used only when it is a regular file.
+fn x11(
+    env: &Env,
+    args: &mut BwrapArgs,
+    probe: &dyn Fn(&Path) -> Option<FileType>,
+) -> Result<(), LaunchError> {
     let display = env.display.as_deref().ok_or(LaunchError::MissingEnv {
         service: "x11",
         var: "DISPLAY",
@@ -107,15 +161,15 @@ fn x11(env: &Env, args: &mut BwrapArgs, probe: &dyn Fn(&Path) -> bool) -> Result
             display.to_string_lossy()
         ),
     })?;
-    let sock = require(probe, "x11", PathBuf::from(format!("/tmp/.X11-unix/X{n}")))?;
+    let sock = require_socket(probe, "x11", PathBuf::from(format!("/tmp/.X11-unix/X{n}")))?;
     args.ro_bind(&sock, &sock);
     args.setenv(OsStr::new("DISPLAY"), OsStr::new(&format!(":{n}")));
 
     let cookie = match &env.xauthority {
-        Some(xa) => Some(require(probe, "x11", xa.clone())?),
+        Some(xa) => Some(require_file(probe, "x11", xa.clone())?),
         None => {
             let home = env.home.join(".Xauthority");
-            probe(&home).then_some(home)
+            probe(&home).is_some_and(|t| t.is_file()).then_some(home)
         }
     };
     if let Some(host) = cookie {
@@ -126,16 +180,18 @@ fn x11(env: &Env, args: &mut BwrapArgs, probe: &dyn Fn(&Path) -> bool) -> Result
     Ok(())
 }
 
-/// Bind `$HOME/<path>` to `/home/bubbler/<path>`. The host path must exist;
-/// bubbler never creates directories in the real home.
+/// Bind `$HOME/<path>` to `/home/bubbler/<path>`. The host path must exist
+/// and may be of any type; bubbler never creates directories in the real
+/// home. Probing and binding both happen by path, so a symlink swapped in
+/// between the two is not detected; that is inherent to bwrap path binds.
 fn home_share(
     env: &Env,
     args: &mut BwrapArgs,
-    probe: &dyn Fn(&Path) -> bool,
+    probe: &dyn Fn(&Path) -> Option<FileType>,
     rel: &Path,
     mode: ShareMode,
 ) -> Result<(), LaunchError> {
-    let src = require(probe, "home-share", env.home.join(rel))?;
+    let src = require_exists(probe, "home-share", env.home.join(rel))?;
     let dst = Path::new(SANDBOX_HOME).join(rel);
     match mode {
         ShareMode::ReadOnly => args.ro_bind(&src, &dst),
@@ -147,9 +203,19 @@ fn home_share(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use std::collections::HashMap;
     use std::ffi::OsString;
+    use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
+
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Sock,
+        File,
+        Dir,
+    }
+
+    use Kind::{Dir, File, Sock};
 
     fn env() -> Env {
         Env {
@@ -163,14 +229,39 @@ mod tests {
         }
     }
 
+    // Real `FileType` values, since one cannot be constructed directly.
+    // They outlive the temporary directory they were read from.
+    fn file_types() -> HashMap<u8, FileType> {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("s");
+        let file = tmp.path().join("f");
+        let dir = tmp.path().join("d");
+        let _listener = UnixListener::bind(&sock).unwrap();
+        std::fs::write(&file, "").unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        let ty = |p: &Path| std::fs::metadata(p).unwrap().file_type();
+        HashMap::from([(b's', ty(&sock)), (b'f', ty(&file)), (b'd', ty(&dir))])
+    }
+
     fn argv(
         services: &[Service],
         env: &Env,
-        existing: &[&str],
+        existing: &[(&str, Kind)],
     ) -> Result<Vec<String>, LaunchError> {
-        let set: HashSet<PathBuf> = existing.iter().map(PathBuf::from).collect();
+        let types = file_types();
+        let map: HashMap<PathBuf, FileType> = existing
+            .iter()
+            .map(|(p, k)| {
+                let key = match k {
+                    Sock => b's',
+                    File => b'f',
+                    Dir => b'd',
+                };
+                (PathBuf::from(p), types[&key])
+            })
+            .collect();
         let mut args = BwrapArgs::baseline(env, Path::new("/i/home"));
-        apply_all(services, env, &mut args, &|p| set.contains(p))?;
+        apply_all(services, env, &mut args, &|p| map.get(p).copied())?;
         Ok(args
             .finish(&[OsString::from("x")])
             .iter()
@@ -185,7 +276,12 @@ mod tests {
 
     #[test]
     fn wayland_binds_socket_and_sets_env() {
-        let a = argv(&[Service::Wayland], &env(), &["/run/user/1000/wayland-1"]).unwrap();
+        let a = argv(
+            &[Service::Wayland],
+            &env(),
+            &[("/run/user/1000/wayland-1", Sock)],
+        )
+        .unwrap();
         assert!(has_seq(
             &a,
             &[
@@ -219,11 +315,32 @@ mod tests {
     }
 
     #[test]
+    fn wayland_socket_path_of_the_wrong_type_fails() {
+        for kind in [File, Dir] {
+            assert!(matches!(
+                argv(
+                    &[Service::Wayland],
+                    &env(),
+                    &[("/run/user/1000/wayland-1", kind)]
+                ),
+                Err(LaunchError::WrongType {
+                    service: "wayland",
+                    expected: "a socket",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
     fn x11_binds_socket_and_xauthority() {
         let a = argv(
             &[Service::X11],
             &env(),
-            &["/tmp/.X11-unix/X0", "/run/user/1000/Xauthority"],
+            &[
+                ("/tmp/.X11-unix/X0", Sock),
+                ("/run/user/1000/Xauthority", File),
+            ],
         )
         .unwrap();
         assert!(has_seq(
@@ -260,7 +377,7 @@ mod tests {
         let a = argv(
             &[Service::X11],
             &e,
-            &["/tmp/.X11-unix/X0", "/home/han/.Xauthority"],
+            &[("/tmp/.X11-unix/X0", Sock), ("/home/han/.Xauthority", File)],
         )
         .unwrap();
         assert!(has_seq(
@@ -275,15 +392,59 @@ mod tests {
             &a,
             &["--setenv", "XAUTHORITY", "/home/bubbler/.Xauthority"]
         ));
-        let a = argv(&[Service::X11], &e, &["/tmp/.X11-unix/X0"]).unwrap();
+        let a = argv(&[Service::X11], &e, &[("/tmp/.X11-unix/X0", Sock)]).unwrap();
         assert!(!a.contains(&"XAUTHORITY".to_string()));
+    }
+
+    #[test]
+    fn x11_fallback_xauthority_that_is_a_directory_is_skipped() {
+        let mut e = env();
+        e.xauthority = None;
+        let a = argv(
+            &[Service::X11],
+            &e,
+            &[("/tmp/.X11-unix/X0", Sock), ("/home/han/.Xauthority", Dir)],
+        )
+        .unwrap();
+        assert!(!a.contains(&"XAUTHORITY".to_string()));
+        assert!(!a.contains(&"/home/han/.Xauthority".to_string()));
     }
 
     #[test]
     fn x11_set_but_missing_xauthority_fails() {
         assert!(matches!(
-            argv(&[Service::X11], &env(), &["/tmp/.X11-unix/X0"]),
+            argv(&[Service::X11], &env(), &[("/tmp/.X11-unix/X0", Sock)]),
             Err(LaunchError::MissingResource { service: "x11", .. })
+        ));
+    }
+
+    #[test]
+    fn x11_xauthority_at_a_directory_fails() {
+        let mut e = env();
+        e.xauthority = Some("/".into());
+        assert!(matches!(
+            argv(
+                &[Service::X11],
+                &e,
+                &[("/tmp/.X11-unix/X0", Sock), ("/", Dir)]
+            ),
+            Err(LaunchError::WrongType {
+                service: "x11",
+                expected: "a regular file",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn x11_socket_that_is_not_a_socket_fails() {
+        assert!(matches!(
+            argv(&[Service::X11], &env(), &[("/tmp/.X11-unix/X0", File)]),
+            Err(LaunchError::WrongType {
+                service: "x11",
+                expected: "a socket",
+                ..
+            })
         ));
     }
 
@@ -292,7 +453,11 @@ mod tests {
         let mut e = env();
         e.wayland_display = Some("/run/user/1000/wayland-1".into());
         assert!(matches!(
-            argv(&[Service::Wayland], &e, &["/run/user/1000/wayland-1"]),
+            argv(
+                &[Service::Wayland],
+                &e,
+                &[("/run/user/1000/wayland-1", Sock)]
+            ),
             Err(LaunchError::BadValue {
                 service: "wayland",
                 ..
@@ -303,10 +468,50 @@ mod tests {
             argv(
                 &[Service::Wayland],
                 &e,
-                &["/run/user/1000/nested/wayland-1"]
+                &[("/run/user/1000/nested/wayland-1", Sock)]
             ),
             Err(LaunchError::BadValue {
                 service: "wayland",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn wayland_display_that_is_not_one_component_is_rejected() {
+        for bad in [".", "..", "wayland-1/..", ""] {
+            let mut e = env();
+            e.wayland_display = Some(bad.into());
+            assert!(
+                matches!(
+                    argv(
+                        &[Service::Wayland],
+                        &e,
+                        &[
+                            ("/run/user/1000", Dir),
+                            ("/run/user/1000/.", Dir),
+                            ("/run/user/1000/..", Dir),
+                        ]
+                    ),
+                    Err(LaunchError::BadValue {
+                        service: "wayland",
+                        ..
+                    })
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wayland_display_naming_a_directory_is_rejected() {
+        let mut e = env();
+        e.wayland_display = Some("dconf".into());
+        assert!(matches!(
+            argv(&[Service::Wayland], &e, &[("/run/user/1000/dconf", Dir)]),
+            Err(LaunchError::WrongType {
+                service: "wayland",
+                expected: "a socket",
                 ..
             })
         ));
@@ -337,9 +542,9 @@ mod tests {
             &[Service::Wayland, Service::X11],
             &env(),
             &[
-                "/run/user/1000/wayland-1",
-                "/tmp/.X11-unix/X0",
-                "/run/user/1000/Xauthority",
+                ("/run/user/1000/wayland-1", Sock),
+                ("/tmp/.X11-unix/X0", Sock),
+                ("/run/user/1000/Xauthority", File),
             ],
         )
         .unwrap();
@@ -367,7 +572,7 @@ mod tests {
         let a = argv(
             &svcs,
             &env(),
-            &["/home/han/Downloads", "/home/han/Projects/x"],
+            &[("/home/han/Downloads", Dir), ("/home/han/Projects/x", Dir)],
         )
         .unwrap();
         assert!(has_seq(
@@ -381,6 +586,23 @@ mod tests {
         assert!(has_seq(
             &a,
             &["--bind", "/home/han/Projects/x", "/home/bubbler/Projects/x"]
+        ));
+    }
+
+    #[test]
+    fn home_share_accepts_any_type_but_needs_the_source() {
+        let svcs = [Service::HomeShare {
+            path: "notes.txt".into(),
+            mode: ShareMode::ReadOnly,
+        }];
+        let a = argv(&svcs, &env(), &[("/home/han/notes.txt", File)]).unwrap();
+        assert!(has_seq(
+            &a,
+            &[
+                "--ro-bind",
+                "/home/han/notes.txt",
+                "/home/bubbler/notes.txt"
+            ]
         ));
     }
 

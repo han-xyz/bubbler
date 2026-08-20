@@ -76,6 +76,17 @@ pub enum LaunchError {
         /// The host path that is missing.
         path: PathBuf,
     },
+    /// A host path exists but is of the wrong type to bind, e.g. a
+    /// directory where a socket is expected.
+    #[error("service `{service}` needs `{path}` to be {expected}")]
+    WrongType {
+        /// Name of the service that made the request.
+        service: &'static str,
+        /// The host path with the wrong type.
+        path: PathBuf,
+        /// What the service expected, as an article plus noun.
+        expected: &'static str,
+    },
     /// A service needs an environment variable that is unset.
     #[error("service `{service}` needs ${var} to be set")]
     MissingEnv {

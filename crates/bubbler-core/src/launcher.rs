@@ -32,7 +32,8 @@ pub fn build_argv(
             .ok_or(ConfigError::MissingCommand)?,
     };
     let mut args = BwrapArgs::baseline(env, &inst.home());
-    service::apply_all(&inst.config.services, env, &mut args, &Path::exists)?;
+    let probe = |p: &Path| std::fs::metadata(p).ok().map(|m| m.file_type());
+    service::apply_all(&inst.config.services, env, &mut args, &probe)?;
     Ok(args.finish(command))
 }
 

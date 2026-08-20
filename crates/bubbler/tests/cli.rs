@@ -236,3 +236,30 @@ fn dry_run_writes_argv_bytes_verbatim() {
     );
     assert!(out.stdout.ends_with(b"--\n/tmp/\xff\n"), "{:?}", out.stdout);
 }
+
+#[test]
+fn wayland_display_must_name_a_socket() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "wayland\ncommand \"true\"\n").unwrap();
+
+    let out = bubbler(tmp.path())
+        .env("WAYLAND_DISPLAY", ".")
+        .args(["run", "t", "--dry-run"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("only a plain socket name"), "{err}");
+
+    std::fs::write(tmp.path().join("run/notasocket"), "").unwrap();
+    let out = bubbler(tmp.path())
+        .env("WAYLAND_DISPLAY", "notasocket")
+        .args(["run", "t", "--dry-run"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("notasocket"), "{err}");
+}
