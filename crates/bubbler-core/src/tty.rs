@@ -2,12 +2,13 @@
 //! mode on the user's terminal and the relay between the two.
 
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rustix::event::{Nsecs, PollFd, PollFlags, Secs, Timespec, poll};
-use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+use rustix::fs::{Mode, OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::io::{Errno, read, write};
 use rustix::pty::{OpenptFlags, grantpt, ioctl_tiocgptpeer, openpt, unlockpt};
 use rustix::termios::{
@@ -136,22 +137,44 @@ pub fn host_is_tty() -> [bool; 3] {
     [isatty(i), isatty(o), isatty(e)]
 }
 
+/// An open `/dev/null`: the stdio slot for something that must exist but
+/// carries nothing — a descriptor bubbler was started without, a sandbox
+/// asked for no terminal, or a pty whose output no fd of bubbler's can take.
+pub fn null_stdio() -> Result<OwnedFd, LaunchError> {
+    let path = Path::new("/dev/null");
+    rustix::fs::open(path, OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())
+        .map_err(|e| LaunchError::Io(path.to_path_buf(), e.into()))
+}
+
 /// bubbler's own fds 0, 1 and 2, duplicated so a plan can index them by
 /// number. The copies are `CLOEXEC`: what the sandbox gets is decided by
-/// the plan, never inherited by accident.
+/// the plan, never inherited by accident. A descriptor bubbler was
+/// started without stands in as `/dev/null` — a plan is made of three
+/// fds, and one nobody is using is no reason to refuse the launch.
 pub fn host_stdio() -> Result<[OwnedFd; 3], LaunchError> {
     let (i, o, e) = (std::io::stdin(), std::io::stdout(), std::io::stderr());
-    let dup = |fd: BorrowedFd<'_>| fd.try_clone_to_owned().map_err(LaunchError::Pty);
+    let dup = |fd: BorrowedFd<'_>| match fd.try_clone_to_owned() {
+        Ok(fd) => Ok(fd),
+        Err(_) => null_stdio(),
+    };
     Ok([dup(i.as_fd())?, dup(o.as_fd())?, dup(e.as_fd())?])
 }
 
 /// Which of bubbler's fds the pty's output goes back out on: the first of
 /// 1, 2 and 0 the pty stands in for, so output still reaches the terminal
-/// when stdout alone is redirected. `None` when there is no pty.
-pub fn output_fd(plan: &StdioPlan) -> Option<usize> {
+/// when stdout alone is redirected. `None` when there is no pty, or when
+/// the only candidate cannot be written to: `bubbler run x < /dev/tty` is
+/// a terminal opened read-only, and every write to it would fail.
+pub fn output_fd(plan: &StdioPlan, host: &[OwnedFd; 3]) -> Option<usize> {
     [1, 2, 0]
         .into_iter()
-        .find(|i| plan.fds[*i] == StdioTarget::Slave)
+        .find(|i| plan.fds[*i] == StdioTarget::Slave && writable(host[*i].as_fd()))
+}
+
+/// Whether `fd` was opened for writing. An fd whose access mode cannot be
+/// read is taken as unusable, which only costs it its turn as the output.
+fn writable(fd: BorrowedFd<'_>) -> bool {
+    fcntl_getfl(fd).is_ok_and(|f| f & OFlags::ACCMODE != OFlags::RDONLY)
 }
 
 /// Decide each of fds 0, 1 and 2 on its own from `mode` and which of
@@ -367,7 +390,10 @@ pub fn relay(
         }
         if let Some(fd) = read_stdin.filter(|_| stdin_ready) {
             match read(fd, &mut buf) {
-                // Only a host stdin that is not a terminal ends this way.
+                // Only a host stdin that is not a terminal ends this way,
+                // which no plan produces: a pipe or a redirect is handed
+                // to the sandbox directly. It serves a caller that relays
+                // one anyway, and the tests that drive this with a socket.
                 Ok(0) => {
                     stdin = None;
                     if let Some(eof) = eof_char(master) {
@@ -387,7 +413,10 @@ pub fn relay(
         if output && revents.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR) {
             match read(master, &mut buf) {
                 Ok(0) => output = false,
-                Ok(n) => write_all(host_out, &buf[..n])?,
+                // A terminal that cannot take the output — closed, gone,
+                // or opened read-only — ends the relaying, never the run:
+                // the command is still going and its status is still due.
+                Ok(n) => output = write_all(host_out, &buf[..n]).is_ok(),
                 Err(Errno::AGAIN) | Err(Errno::INTR) => {}
                 // EIO is the last slave closing: no more output is coming,
                 // but the status may still be on its way.
@@ -418,7 +447,9 @@ fn drain(master: BorrowedFd<'_>, host_out: BorrowedFd<'_>) -> Result<(), LaunchE
         }
         match read(master, &mut buf) {
             Ok(0) => return Ok(()),
-            Ok(n) => write_all(host_out, &buf[..n])?,
+            // Nowhere to put it is the same as nothing left to take.
+            Ok(n) if write_all(host_out, &buf[..n]).is_err() => return Ok(()),
+            Ok(_) => {}
             Err(Errno::AGAIN) | Err(Errno::INTR) => {}
             Err(_) => return Ok(()),
         }
@@ -471,7 +502,9 @@ pub fn pump(
             match read(pipes[i].0, &mut buf) {
                 // The sandbox closed this end; nothing more will come.
                 Ok(0) => open[i] = false,
-                Ok(n) => write_all(pipes[i].1, &buf[..n])?,
+                // As for the relay: output bubbler cannot pass on is not
+                // a reason to end a command that is still running.
+                Ok(n) => open[i] = write_all(pipes[i].1, &buf[..n]).is_ok(),
                 Err(Errno::AGAIN) | Err(Errno::INTR) => {}
                 Err(_) => open[i] = false,
             }
@@ -646,16 +679,37 @@ mod tests {
         }
     }
 
+    /// Three fds standing in for bubbler's own, `access` deciding how fd 0
+    /// was opened: `RDONLY` is `bubbler run x < /dev/tty`.
+    fn host_fds(access: OFlags) -> [OwnedFd; 3] {
+        let null = Path::new("/dev/null");
+        let open = |flags: OFlags| rustix::fs::open(null, flags, Mode::empty()).unwrap();
+        [open(access), open(OFlags::RDWR), open(OFlags::RDWR)]
+    }
+
     #[test]
     fn the_pty_writes_back_to_the_first_terminal_among_stdout_stderr_stdin() {
         use StdioTarget::{Inherit, Slave};
-        let at = |fds: [StdioTarget; 3]| output_fd(&StdioPlan { fds, pty: None });
+        let host = host_fds(OFlags::RDWR);
+        let at = |fds: [StdioTarget; 3]| output_fd(&StdioPlan { fds, pty: None }, &host);
         assert_eq!(at([Slave, Slave, Slave]), Some(1));
         // stdout redirected to a file: the terminal is still stderr's.
         assert_eq!(at([Slave, Inherit, Slave]), Some(2));
         // Only stdin is a terminal, so that is where its echo must go.
         assert_eq!(at([Slave, Inherit, Inherit]), Some(0));
         assert_eq!(at([Inherit; 3]), None);
+    }
+
+    #[test]
+    fn a_terminal_opened_read_only_is_no_place_to_write_output() {
+        use StdioTarget::{Inherit, Slave};
+        let host = host_fds(OFlags::RDONLY);
+        let at = |fds: [StdioTarget; 3]| output_fd(&StdioPlan { fds, pty: None }, &host);
+        // `bubbler run x < /dev/tty > out 2> err`: the one candidate is a
+        // terminal that cannot be written to, so the caller must find a
+        // sink of its own instead of failing on the first write.
+        assert_eq!(at([Slave, Inherit, Inherit]), None);
+        assert_eq!(at([Slave, Slave, Inherit]), Some(1));
     }
 
     #[test]
@@ -742,6 +796,27 @@ mod tests {
         expect(slave.as_fd(), b"typed\n");
         write(&slave, b"printed\n").unwrap();
         expect(test_out.as_fd(), b"printed\n");
+        assert_eq!(finish(r), RelayEnd::Exited(0));
+    }
+
+    #[test]
+    fn output_the_host_cannot_take_ends_the_relaying_and_not_the_run() {
+        let Pty { master, slave } = pty_pair();
+        let (host_in, test_in) = UnixStream::pair().unwrap();
+        // Every write to a read-only descriptor fails with EBADF, which is
+        // what a terminal opened `< /dev/tty` does to the first chunk of
+        // output the sandbox produces.
+        let read_only = rustix::fs::open(
+            Path::new("/dev/null"),
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let r = spawn_relay(master, Some(host_in.into()), read_only);
+        write(&slave, b"output nobody can take\n").unwrap();
+        // The relay is still there: what the user types still arrives.
+        write(&test_in, b"typed\n").unwrap();
+        expect(slave.as_fd(), b"typed\n");
         assert_eq!(finish(r), RelayEnd::Exited(0));
     }
 

@@ -1,5 +1,6 @@
 mod common;
 
+use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -1658,6 +1659,60 @@ fn real_bwrap_run_writes_nothing_to_a_terminal_it_does_not_own() {
     assert!(
         !seen.contains("INJECT"),
         "the sandbox wrote to the user's terminal: {seen:?}"
+    );
+}
+
+#[test]
+fn real_bwrap_run_survives_a_terminal_that_cannot_take_its_output() {
+    let Some((tmp, init)) = live_instance("t") else {
+        return;
+    };
+    let pty = test_pty();
+    // `bubbler run t < /dev/tty > out 2> err`: the only terminal is a
+    // read-only descriptor, so the pty's output has nowhere to go — and
+    // that must cost the run nothing, neither its command nor its status.
+    let path = std::fs::read_link(format!("/proc/self/fd/{}", pty.slave.as_raw_fd())).unwrap();
+    let read_only = rustix::fs::open(
+        &path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOCTTY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .unwrap();
+    let (out, err) = (tmp.path().join("out"), tmp.path().join("err"));
+    let mut run = bubbler_live(tmp.path(), &init)
+        .args([
+            "run",
+            "t",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            "read line; echo GOT $line; exit 4",
+        ])
+        .stdin(Stdio::from(read_only))
+        .stdout(Stdio::from(std::fs::File::create(&out).unwrap()))
+        .stderr(Stdio::from(std::fs::File::create(&err).unwrap()))
+        .spawn()
+        .unwrap();
+    pty.type_in(b"hello\n");
+    let mut status = None;
+    let finished = wait_until(
+        || {
+            status = run.try_wait().expect("waiting for the run");
+            status.is_some()
+        },
+        Duration::from_secs(20),
+    );
+    let said = std::fs::read_to_string(&err).unwrap_or_default();
+    if !finished {
+        let _ = run.kill();
+        panic!("the run never finished: {said}");
+    }
+    // The command's own status, not a failed relay's.
+    assert_eq!(status.and_then(|s| s.code()), Some(4), "{said}");
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "GOT hello\n",
+        "{said}"
     );
 }
 

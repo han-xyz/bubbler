@@ -214,16 +214,21 @@ one of the three is a terminal. The mode is the `tty` node in `config.kdl` and
                  through pipes, with nothing bound at /dev/console
 
 In `pty` mode the command inside leads its own session with that pty as its
-controlling terminal, so job control, `/dev/tty` and `stty` work, and bwrap
-binds the sandbox's own pty at `/dev/console` rather than yours. Your
-terminal is in raw mode while the sandbox runs: Ctrl-C and the erase key are
-bytes for the line discipline inside, and a window resize is copied onto the
-pty. `^]` (Ctrl-]) three times within a second detaches — `run` stops
-relaying, restores the terminal, prints a note and keeps waiting quietly,
-because leaving would end the sandbox through `--die-with-parent`; `exec`
-exits 0 and leaves the command to the supervisor, whose terminal hangs up
-with bubbler. A `^]` you meant for the application still reaches it, just
-after the run of three cannot complete.
+controlling terminal, so job control, `/dev/tty` and `stty` work. bwrap binds
+a terminal at `/dev/console` only when it sees one on its own stdout, and in
+`pty` mode that is the sandbox's pty rather than yours; with the output
+redirected there is no `/dev/console` at all. Your terminal is in raw mode
+while the sandbox runs: Ctrl-C and the erase key are bytes for the line
+discipline inside, and a window resize is copied onto the pty.
+
+`^]` (Ctrl-]) three times within a second detaches. `run` stops relaying,
+restores the terminal, prints a note and goes on waiting for the sandbox in
+silence, since leaving would end it through `--die-with-parent` — bubbler is
+still in the foreground, so `^Z` and `bg` are how you get the prompt back,
+and a Ctrl-C after detaching forwards SIGTERM to the sandbox as it always
+does. `exec` instead exits 0 and leaves the command to the supervisor, whose
+terminal hangs up with bubbler. A `^]` you meant for the application still
+reaches it, just after the run of three cannot complete.
 
 What remains, and is inherent to any relay: the application can read what you
 type into that session, and can emit escape sequences your terminal emulator
@@ -232,13 +237,20 @@ answers arrive as its own input. Do not type a password into a session you do
 not trust. `passthrough` gives up the rest as well: the sandbox holds your
 terminal's descriptors and reaches it again through `/dev/console`.
 
-Because the pty is allocated on the host, `ttyname(0)` inside names a host
-`/dev/pts/N` that the sandbox's own devpts does not have, so a program that
-resolves its terminal by path — `sudo`, `script`, `wall` — can fail there;
-`tty "passthrough"` is the way out if an application needs it. `bubbler exec`
-takes the instance's `tty` node when `config.kdl` parses and the default
-`pty` when it does not, since a running instance stays reachable while its
-config is being edited.
+The pty is allocated on the host, so its name inside is not its name outside.
+`/proc/self/fd/0` still reads back a host `/dev/pts/N`, a path the sandbox's
+fresh devpts either does not have or has since handed to a different pty, so
+anything resolving its terminal by that path is misled. `ttyname` then falls
+back to searching `/dev`, where it finds the console bind: `tty` inside
+prints `/dev/console` when bubbler's stdout is a terminal, and fails with
+`ttyname error: No such device` when nothing is bound there. A program that
+wants a real `/dev/pts` entry — `script`, `wall`, `sudo` with tty tickets —
+can fail either way; `tty "passthrough"` is the way out if an application
+needs it.
+
+`bubbler exec` takes the instance's `tty` node when `config.kdl` parses and
+the default `pty` when it does not, since a running instance stays reachable
+while its config is being edited.
 
 ## Baseline
 

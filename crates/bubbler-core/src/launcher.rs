@@ -839,26 +839,36 @@ fn wait_pumping(
     }
 }
 
+/// The host side of a relayed run: what the user types, which only
+/// reaches the pty when the sandbox reads through it; where the pty's
+/// output goes; and where it is drained when nothing of bubbler's can
+/// take that output, or after a detach.
+struct RelayEnds<'a> {
+    input: Option<BorrowedFd<'a>>,
+    output: BorrowedFd<'a>,
+    sink: BorrowedFd<'a>,
+}
+
 /// Wait while relaying between the user's terminal and the sandbox's pty.
 ///
 /// Detaching ends the relay, not the run: bubbler holds the master, and
 /// closing it would hang up the terminal inside, while leaving would take
 /// the sandbox with it through `--die-with-parent`. So it goes on
-/// waiting, quietly, with the pty drained into `/dev/null` so a program
-/// inside cannot fill it and block.
+/// waiting, quietly, with the pty drained into `sink` so a program inside
+/// cannot fill it and block.
 fn wait_relaying(
     child: &mut Child,
     stop: &AtomicBool,
     supervisor: Option<Pid>,
     winch: &AtomicBool,
     master: BorrowedFd<'_>,
-    ends: (Option<BorrowedFd<'_>>, BorrowedFd<'_>),
+    ends: RelayEnds<'_>,
     raw: &mut Option<RawGuard<'_>>,
 ) -> Result<i32, LaunchError> {
     let mut failed = None;
     let end = {
         let mut until = until_exit(child, stop, supervisor, &mut failed);
-        tty::relay(master, ends.0, ends.1, &mut until, winch)?
+        tty::relay(master, ends.input, ends.output, &mut until, winch)?
     };
     if let Some(e) = failed {
         return Err(LaunchError::Spawn(e));
@@ -873,13 +883,8 @@ fn wait_relaying(
                 guard.restore();
             }
             eprintln!("{}", tty::DETACHED_NOTE);
-            let path = Path::new("/dev/null");
-            let sink = std::fs::OpenOptions::new()
-                .write(true)
-                .open(path)
-                .map_err(|e| LaunchError::Io(path.to_path_buf(), e))?;
             let mut until = until_exit(child, stop, supervisor, &mut failed);
-            match tty::relay(master, None, sink.as_fd(), &mut until, winch)? {
+            match tty::relay(master, None, ends.sink, &mut until, winch)? {
                 RelayEnd::Exited(code) => code,
                 // Nothing is read from the user any more, so there is
                 // nothing left that could ask to detach.
@@ -1014,24 +1019,39 @@ pub fn run(
     let supervisor = info.as_ref().and_then(|(reaper, _)| {
         supervisor_pid(*reaper, &mut child, Instant::now() + SUPERVISOR_WAIT)
     });
-    let code = match (&master, tty::output_fd(&stdio)) {
-        (Some(master), Some(out)) => wait_relaying(
-            &mut child,
-            &stop,
-            supervisor,
-            &winch,
-            master.as_fd(),
-            (stdio.ctty().then(|| host[0].as_fd()), host[out].as_fd()),
-            &mut raw,
-        ),
-        _ if !pipes.is_empty() => {
+    let code = match &master {
+        Some(master) => {
+            // The pty is always drained somewhere: the terminal the plan
+            // picked, or `/dev/null` when none of bubbler's own fds can
+            // take output — `bubbler run x < /dev/tty > out` has only a
+            // read-only terminal to offer. It is also where the output
+            // goes after a detach.
+            let sink = tty::null_stdio()?;
+            let out = tty::output_fd(&stdio, &host);
+            let host_out = out.map_or(sink.as_fd(), |i| host[i].as_fd());
+            let ends = RelayEnds {
+                input: stdio.ctty().then(|| host[0].as_fd()),
+                output: host_out,
+                sink: sink.as_fd(),
+            };
+            wait_relaying(
+                &mut child,
+                &stop,
+                supervisor,
+                &winch,
+                master.as_fd(),
+                ends,
+                &mut raw,
+            )
+        }
+        None if !pipes.is_empty() => {
             let ends: Vec<(BorrowedFd<'_>, BorrowedFd<'_>)> = pipes
                 .iter()
                 .map(|(read, i)| (read.as_fd(), host[*i].as_fd()))
                 .collect();
             wait_pumping(&mut child, &stop, supervisor, &ends)
         }
-        _ => wait_plain(&mut child, &stop, supervisor),
+        None => wait_plain(&mut child, &stop, supervisor),
     }?;
     // bwrap copies the data files out of the fds while it starts, so they
     // must stay open until it has exited.

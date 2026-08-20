@@ -12,14 +12,14 @@ use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use bubbler_init::{proto, wire};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
-use rustix::fs::{Mode, OFlags};
+use rustix::pipe::PipeFlags;
 use signal_hook::consts::SIGWINCH;
 
 use crate::env::Env;
@@ -95,13 +95,12 @@ fn fd_for(
             ))),
         },
         StdioTarget::Inherit => host[index].try_clone().map_err(LaunchError::Pty),
-        StdioTarget::Null => {
-            let path = Path::new("/dev/null");
-            rustix::fs::open(path, OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())
-                .map_err(|e| LaunchError::Io(path.to_path_buf(), e.into()))
-        }
+        StdioTarget::Null => tty::null_stdio(),
         StdioTarget::Pipe => {
-            let (read, write) = rustix::pipe::pipe().map_err(|e| LaunchError::Pty(e.into()))?;
+            // CLOEXEC: only the supervisor's copy of the write end may
+            // outlive this call, and it travels by SCM_RIGHTS.
+            let (read, write) = rustix::pipe::pipe_with(PipeFlags::CLOEXEC)
+                .map_err(|e| LaunchError::Pty(e.into()))?;
             pipes.push((read, index));
             Ok(write)
         }
@@ -167,6 +166,13 @@ pub fn run_in(
         true => Some(RawGuard::new(host[0].as_fd())?),
         false => None,
     };
+    // A pty is always drained somewhere: the terminal the plan picked, or
+    // `/dev/null` when none of bubbler's own fds can take output, as for
+    // `bubbler exec x < /dev/tty > out`.
+    let sink = match master {
+        Some(_) => Some(tty::null_stdio()?),
+        None => None,
+    };
     let mut received: Option<io::Result<i32>> = None;
     let end = {
         let mut until = || {
@@ -181,14 +187,18 @@ pub fn run_in(
             received = Some(got);
             Some(code)
         };
-        match (&master, tty::output_fd(&plan)) {
-            (Some(master), Some(out)) => tty::relay(
-                master.as_fd(),
-                plan.ctty().then(|| host[0].as_fd()),
-                host[out].as_fd(),
-                &mut until,
-                &winch,
-            )?,
+        match (&master, &sink) {
+            (Some(master), Some(sink)) => {
+                let out = tty::output_fd(&plan, &host);
+                let host_out = out.map_or(sink.as_fd(), |i| host[i].as_fd());
+                tty::relay(
+                    master.as_fd(),
+                    plan.ctty().then(|| host[0].as_fd()),
+                    host_out,
+                    &mut until,
+                    &winch,
+                )?
+            }
             _ if !pipes.is_empty() => {
                 let ends: Vec<_> = pipes
                     .iter()
