@@ -37,6 +37,7 @@ const MAX_PENDING: usize = 16;
 
 struct Args {
     socket_fd: i32,
+    ctty: bool,
     command: Vec<OsString>,
 }
 
@@ -53,14 +54,16 @@ struct Pending {
     deadline: Instant,
 }
 
-/// Parse `--socket-fd N -- cmd...`; anything else is a usage error.
+/// Parse `--socket-fd N [--ctty] -- cmd...`; anything else is a usage error.
 fn parse_args() -> Option<Args> {
     let mut it = std::env::args_os().skip(1);
     let mut socket_fd = None;
+    let mut ctty = false;
     let mut command = Vec::new();
     while let Some(a) = it.next() {
         match a.to_str() {
             Some("--socket-fd") => socket_fd = it.next()?.to_str()?.parse().ok(),
+            Some("--ctty") => ctty = true,
             Some("--") => {
                 command.extend(it);
                 break;
@@ -73,6 +76,7 @@ fn parse_args() -> Option<Args> {
     }
     Some(Args {
         socket_fd: socket_fd?,
+        ctty,
         command,
     })
 }
@@ -104,7 +108,9 @@ fn listener_from_fd(fd: i32) -> Option<UnixListener> {
 }
 
 /// Give the command its own session with its stdin as the controlling
-/// terminal, so job control and `/dev/tty` work inside the sandbox.
+/// terminal, so job control and `/dev/tty` work inside the sandbox. Only
+/// ever called for a terminal bubbler allocated: claiming whatever sits
+/// on fd 0 would take over the user's own terminal in passthrough mode.
 fn take_ctty(command: &mut Command) {
     // SAFETY: the closure runs in the forked child between fork and execve,
     // where only async-signal-safe work is allowed: `setsid` and
@@ -126,7 +132,13 @@ fn take_ctty(command: &mut Command) {
 
 /// Execute one received request; a malformed one closes the connection,
 /// spawning nothing.
-fn serve(stream: UnixStream, argv: &[OsString], fds: Vec<OwnedFd>, execs: &mut Vec<Exec>) {
+fn serve(
+    stream: UnixStream,
+    argv: &[OsString],
+    fds: Vec<OwnedFd>,
+    execs: &mut Vec<Exec>,
+    ctty: bool,
+) {
     let Some((program, rest)) = argv.split_first() else {
         return;
     };
@@ -135,7 +147,7 @@ fn serve(stream: UnixStream, argv: &[OsString], fds: Vec<OwnedFd>, execs: &mut V
         return;
     };
     let report = stderr.try_clone().ok();
-    let terminal = rustix::termios::isatty(&stdin);
+    let terminal = ctty && rustix::termios::isatty(&stdin);
     // argv[0] is resolved through PATH as seen inside the sandbox.
     let mut command = Command::new(program);
     command
@@ -164,7 +176,12 @@ fn serve(stream: UnixStream, argv: &[OsString], fds: Vec<OwnedFd>, execs: &mut V
 /// Take one read step on every connection `poll` reported, spawning the
 /// commands whose requests are now whole. `ready` is parallel to
 /// `pending` and shrinks with it.
-fn read_pending(pending: &mut Vec<Pending>, ready: &mut Vec<bool>, execs: &mut Vec<Exec>) {
+fn read_pending(
+    pending: &mut Vec<Pending>,
+    ready: &mut Vec<bool>,
+    execs: &mut Vec<Exec>,
+    ctty: bool,
+) {
     let mut i = 0;
     while i < pending.len() {
         if !ready.get(i).copied().unwrap_or(false) {
@@ -177,7 +194,7 @@ fn read_pending(pending: &mut Vec<Pending>, ready: &mut Vec<bool>, execs: &mut V
             Ok(Some((argv, fds))) => {
                 let p = pending.remove(i);
                 ready.remove(i);
-                serve(p.stream, &argv, fds, execs);
+                serve(p.stream, &argv, fds, execs, ctty);
             }
             // A malformed request or a hangup closes the connection.
             Err(_) => {
@@ -238,7 +255,7 @@ fn code_of(status: ExitStatus) -> u8 {
 
 fn main() -> ExitCode {
     let Some(args) = parse_args() else {
-        eprintln!("bubbler-init: usage: --socket-fd N -- cmd...");
+        eprintln!("bubbler-init: usage: --socket-fd N [--ctty] -- cmd...");
         return ExitCode::from(2);
     };
     let Some(listener) = listener_from_fd(args.socket_fd) else {
@@ -264,14 +281,14 @@ fn main() -> ExitCode {
         }
     }
     let Some((program, rest)) = args.command.split_first() else {
-        eprintln!("bubbler-init: usage: --socket-fd N -- cmd...");
+        eprintln!("bubbler-init: usage: --socket-fd N [--ctty] -- cmd...");
         return ExitCode::from(2);
     };
     let mut launch = Command::new(program);
     launch.args(rest);
-    // The stdio is bubbler's: a pty slave in `tty "pty"` mode, the host's
-    // own terminal in `passthrough`, and no terminal at all otherwise.
-    if rustix::termios::isatty(std::io::stdin()) {
+    // `--ctty` is bubbler saying the terminal on fd 0 is a pty slave it
+    // allocated for this sandbox, and not the user's own terminal.
+    if args.ctty && rustix::termios::isatty(std::io::stdin()) {
         take_ctty(&mut launch);
     }
     let mut command = match launch.spawn() {
@@ -327,7 +344,7 @@ fn main() -> ExitCode {
             }
             Ok(_) => {}
         }
-        read_pending(&mut pending, &mut ready, &mut execs);
+        read_pending(&mut pending, &mut ready, &mut execs, args.ctty);
         // Dropping the connection is the whole answer to a client that
         // ran out of time: nothing was spawned for it.
         let now = Instant::now();

@@ -7,16 +7,28 @@ use std::time::{Duration, Instant};
 
 use bubbler_init::wire;
 
-fn start(cmd: &[&str]) -> (std::process::Child, std::path::PathBuf, tempfile::TempDir) {
+type Started = (std::process::Child, std::path::PathBuf, tempfile::TempDir);
+
+fn start(cmd: &[&str]) -> Started {
+    start_with(cmd, false)
+}
+
+/// `ctty` stands for bubbler passing `--ctty`: the terminal on fd 0 is a
+/// pty bubbler allocated, so the command may take it over.
+fn start_with(cmd: &[&str], ctty: bool) -> Started {
     let tmp = tempfile::tempdir().unwrap();
     let sock = tmp.path().join("init.sock");
     let listener = UnixListener::bind(&sock).unwrap();
     // The listener must be inherited: clear CLOEXEC on a dup.
     let inherited = rustix::io::fcntl_dupfd_cloexec(listener.as_fd(), 3).unwrap();
     rustix::io::fcntl_setfd(&inherited, rustix::io::FdFlags::empty()).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_bubbler-init"))
-        .arg("--socket-fd")
-        .arg(inherited.as_raw_fd().to_string())
+    let mut init = Command::new(env!("CARGO_BIN_EXE_bubbler-init"));
+    init.arg("--socket-fd")
+        .arg(inherited.as_raw_fd().to_string());
+    if ctty {
+        init.arg("--ctty");
+    }
+    let child = init
         .arg("--")
         .args(cmd)
         .stdout(Stdio::null())
@@ -109,10 +121,9 @@ fn read_to_end(fd: std::os::fd::BorrowedFd<'_>) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-#[test]
-fn a_command_given_a_terminal_leads_its_own_session_and_owns_it() {
-    let (mut init, sock, _tmp) = start(&["/usr/bin/sleep", "30"]);
-    std::thread::sleep(Duration::from_millis(200));
+/// Exec the probe with a fresh pty as its stdio; returns its status and
+/// everything it printed to that pty.
+fn exec_on_a_pty(sock: &std::path::Path) -> (i32, String) {
     let flags = rustix::pty::OpenptFlags::RDWR
         | rustix::pty::OpenptFlags::NOCTTY
         | rustix::pty::OpenptFlags::CLOEXEC;
@@ -120,29 +131,50 @@ fn a_command_given_a_terminal_leads_its_own_session_and_owns_it() {
     rustix::pty::grantpt(&master).unwrap();
     rustix::pty::unlockpt(&master).unwrap();
     let slave = rustix::pty::ioctl_tiocgptpeer(&master, flags).unwrap();
-
-    let s = UnixStream::connect(&sock).unwrap();
+    let s = UnixStream::connect(sock).unwrap();
     let argv = [
         std::ffi::OsStr::new("/usr/bin/sh"),
         std::ffi::OsStr::new("-c"),
         std::ffi::OsStr::new(TTY_PROBE),
     ];
     wire::send_request(&s, &argv, [slave.as_fd(); 3]).unwrap();
-    // The sandbox side holds the only slave, so the master reads to EIO
-    // once the command has exited.
+    // The supervisor side holds the only slave, so the master reads to
+    // EIO once the command has exited.
     drop(slave);
-    let st = wire::recv_status(&s).unwrap();
-    let out = read_to_end(master.as_fd());
-    assert!(out.contains("LEADER"), "not a session leader: {out:?}");
-    assert!(out.contains("CTTY"), "/dev/tty is not its own pty: {out:?}");
-    assert_eq!(ExitStatus::from_raw(st).code(), Some(0), "{out:?}");
+    let status = wire::recv_status(&s).unwrap();
+    (status, read_to_end(master.as_fd()))
+}
 
+fn stop(init: &mut std::process::Child) {
     rustix::process::kill_process(
-        rustix::process::Pid::from_child(&init),
+        rustix::process::Pid::from_child(init),
         rustix::process::Signal::TERM,
     )
     .unwrap();
     init.wait().unwrap();
+}
+
+#[test]
+fn a_command_given_a_terminal_leads_its_own_session_and_owns_it() {
+    let (mut init, sock, _tmp) = start_with(&["/usr/bin/sleep", "30"], true);
+    std::thread::sleep(Duration::from_millis(200));
+    let (status, out) = exec_on_a_pty(&sock);
+    assert!(out.contains("LEADER"), "not a session leader: {out:?}");
+    assert!(out.contains("CTTY"), "/dev/tty is not its own pty: {out:?}");
+    assert_eq!(ExitStatus::from_raw(status).code(), Some(0), "{out:?}");
+    stop(&mut init);
+}
+
+#[test]
+fn without_the_flag_a_terminal_is_left_to_whoever_owns_it() {
+    // No `--ctty`: the terminal on fd 0 may be the user's own, and taking
+    // it over would move their shell out of its session.
+    let (mut init, sock, _tmp) = start(&["/usr/bin/sleep", "30"]);
+    std::thread::sleep(Duration::from_millis(200));
+    let (_, out) = exec_on_a_pty(&sock);
+    assert!(!out.contains("LEADER"), "took a session anyway: {out:?}");
+    assert!(!out.contains("CTTY"), "took the terminal anyway: {out:?}");
+    stop(&mut init);
 }
 
 #[test]

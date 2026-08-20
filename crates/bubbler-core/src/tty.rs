@@ -137,7 +137,9 @@ pub fn plan(mode: TtyMode, is_tty: [bool; 3]) -> StdioPlan {
 
 /// Allocate a pty and copy `host_tty`'s settings and size onto its slave,
 /// so the erase key, `IUTF8` and the window size the user has apply
-/// inside the sandbox.
+/// inside the sandbox. `host_tty` must be a terminal (`ENOTTY` otherwise)
+/// and must still be in its normal mode: called after [`RawGuard::new`]
+/// this would hand the sandbox a raw pty, with no echo and no line editing.
 pub fn allocate(host_tty: BorrowedFd<'_>) -> Result<Pty, LaunchError> {
     let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
     let master = openpt(flags).map_err(pty_error)?;
@@ -163,7 +165,8 @@ pub struct RawGuard<'a> {
 }
 
 impl<'a> RawGuard<'a> {
-    /// Save `fd`'s settings and put it in raw mode.
+    /// Save `fd`'s settings and put it in raw mode. `fd` must be a
+    /// terminal; anything else fails with `ENOTTY`.
     pub fn new(fd: BorrowedFd<'a>) -> Result<Self, LaunchError> {
         let saved = tcgetattr(fd).map_err(pty_error)?;
         let mut raw = saved.clone();
@@ -258,7 +261,10 @@ impl Escape {
 
 /// Carry bytes between the user's terminal and the sandbox's pty until
 /// `until` reports an exit or the user detaches. `master` is never
-/// closed: that would tear the pty down under a running command.
+/// closed: that would tear the pty down under a running command. Every
+/// `winch` is answered by copying `host_out`'s size onto the pty, so
+/// `host_out` must be the user's terminal; the size it starts with is the
+/// one [`allocate`] copied from the terminal it was given.
 pub fn relay(
     master: BorrowedFd<'_>,
     host_in: Option<BorrowedFd<'_>>,
@@ -383,9 +389,9 @@ fn drain(master: BorrowedFd<'_>, host_out: BorrowedFd<'_>) -> Result<(), LaunchE
     }
 }
 
-/// The pty's end-of-file character, when its line discipline still has
-/// one: with `ICANON` off, `VEOF` shares its slot with `VMIN`, which is a
-/// byte count and not a character (termios(3)).
+/// The pty's end-of-file character, or `None` when its line discipline
+/// has no notion of one: `VEOF` is only acted on in canonical mode, so a
+/// reader that turned `ICANON` off would just receive a stray byte.
 fn eof_char(master: BorrowedFd<'_>) -> Option<u8> {
     let settings = tcgetattr(master).ok()?;
     settings
