@@ -110,11 +110,9 @@ pub fn flatpak_info(instance: &str, portals: bool) -> Vec<u8> {
     s.into_bytes()
 }
 
-/// The only directory the proxy sandbox may write to, a subdirectory of
-/// the instance's runtime directory. The instance directory itself is
-/// never handed to the proxy: it holds the control socket the supervisor
-/// listens on, and anything that can reach that socket can run commands
-/// in the app sandbox.
+/// The only directory the proxy sandbox may write to. The instance
+/// directory above it is never handed to the proxy: it holds the control
+/// socket, and reaching that socket means running commands in the app.
 pub fn socket_dir(instance_runtime: &Path) -> PathBuf {
     instance_runtime.join("dbus")
 }
@@ -146,8 +144,9 @@ fn unix_path(address: &OsStr) -> Option<PathBuf> {
 }
 
 /// Argv of the proxy itself, run inside its own sandbox: it connects to
-/// `host_bus`, serves the filtered socket in `instance_runtime` and exits
-/// when `ready_fd` is closed (`xdg-dbus-proxy(1)`).
+/// `host_bus`, serves the filtered socket in the `dbus/` subdirectory of
+/// `instance_runtime` and exits when `ready_fd` is closed
+/// (`xdg-dbus-proxy(1)`).
 pub fn proxy_command(
     plan: &Plan,
     host_bus: &Path,

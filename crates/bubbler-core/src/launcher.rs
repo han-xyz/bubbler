@@ -472,8 +472,9 @@ impl Drop for SocketGuard {
     }
 }
 
-/// Restores the default SIGINT/SIGTERM behaviour when the run leaves, so
-/// a later run in the same process starts from a clean disposition.
+/// Drops this run's SIGINT/SIGTERM actions when it leaves, so a later run
+/// never sees a stale flag. `signal-hook` leaves its own handler in place,
+/// so both signals stay caught and are ignored until the next run.
 struct SignalGuard(Vec<SigId>);
 
 impl Drop for SignalGuard {

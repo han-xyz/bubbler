@@ -5,8 +5,8 @@ combining bubblejail's explicit instances and resource grants with a profile
 library in the spirit of firejail. bubbler itself is unprivileged; `bwrap`
 does the namespace work.
 
-Status: milestone 2 — the `alacritty` and `firefox` profiles run, with GPU,
-sound and a private home. See "Known gaps" below.
+Status: milestone 3 — the `alacritty` and `firefox` profiles run, with GPU,
+sound, a private home and a filtered session bus. See "Known gaps" below.
 
 ## Usage
 
@@ -38,6 +38,17 @@ execs into it instead of starting a second sandbox; configuration changes
 apply on the next start. An exec'd process is given bubbler's own stdin,
 stdout and stderr, so the channel is for tooling and debugging, not an extra
 boundary.
+
+A run is a chain of processes; `bubbler` waits at the top of it and returns the
+command's status.
+
+    bubbler ─┬─ bwrap ── bwrap (pid 1 in the sandbox, reaps orphans)
+             │              └─ bubbler-init (pid 2) ── your command
+             └─ bwrap ── bwrap ── xdg-dbus-proxy    (only with `dbus`)
+
+Each `bwrap` leaves a reaper as pid 1 of its own pid namespace. The proxy's
+sandbox is a sibling of the app's, started by `bubbler` and invisible from
+inside it.
 
 `try` runs one command in a sandbox without creating an instance. Its config is
 the profile text (`generic` unless `--profile` says otherwise) plus one bare
@@ -125,8 +136,8 @@ variables the sandbox owns are rejected: `HOME`, `PATH`, `XDG_RUNTIME_DIR`,
 `dbus` never binds the session bus itself. bubbler starts an `xdg-dbus-proxy`
 in a sandbox of its own — no network, no home, read-only `/usr`, an `/etc`
 holding at most `ld.so.cache`, `ld.so.conf`, `ld.so.conf.d` and
-`nsswitch.conf`, the host bus socket read-only and the instance's runtime
-directory read-write — and binds the filtered socket it serves at
+`nsswitch.conf`, the host bus socket read-only and the instance's `dbus/`
+subdirectory read-write — and binds the filtered socket it serves at
 `$XDG_RUNTIME_DIR/bus` inside the sandbox, with `DBUS_SESSION_BUS_ADDRESS`
 pointing there. The start waits up to five seconds for the proxy to report
 that it has bound its socket and is accepting connections, and fails if it
@@ -142,9 +153,15 @@ The host bus is `$DBUS_SESSION_BUS_ADDRESS` when it is a `unix:path=`
 address, else `$XDG_RUNTIME_DIR/bus`, and must be a socket. Everything the
 sandbox may reach is a rule: the `dbus` children above, plus the bundles
 `portals`, `notify` and `mpris`, each of which needs `dbus`. `portals` also
-puts a `/.flatpak-info` naming the instance in the sandbox, which is what
-portals identify it by. `BUBBLER_DBUS_LOG=1` runs the proxy with `--log`, so
-every filtered message is printed to bubbler's stderr.
+puts a `/.flatpak-info` in the sandbox giving it the application id
+`org.bubbler.<name>`, which is what portals and the proxy identify it by.
+`BUBBLER_DBUS_LOG=1` runs the proxy with `--log`, so every filtered message is
+printed to bubbler's stderr.
+
+A rule grants exactly as much as it reads, and the globs are wide: `own
+"org.*"` claims every well-known name under `org.`, and `mpris name="*"` owns
+the whole `org.mpris.MediaPlayer2.` tree, so the sandbox can impersonate any
+player on the session bus. Name the application, not a prefix.
 
 ## Baseline
 
@@ -174,7 +191,22 @@ binding the tree under it.
 ## Known gaps
 
 - No system bus, no accessibility bus, no document-portal FUSE mount: `dbus`
-  covers the session bus only.
+  covers the session bus only, so a portal that hands back a `/run/user/<uid>/doc`
+  path gives the sandbox nothing it can open.
+- `portals` does not finish the handshake. Beside `/.flatpak-info`,
+  xdg-desktop-portal (tested against 1.22) wants
+  `$XDG_RUNTIME_DIR/.flatpak/<name>/bwrapinfo.json`, which only flatpak writes,
+  and answers every portal *operation* with `Portal operation not allowed`.
+  Properties and introspection get through; `Settings.Read` and the file
+  chooser do not. Worse, `/.flatpak-info` alone makes libnotify route through
+  the notification portal, so `notify` — which works on its own — stops
+  working once `portals` is granted.
+- `exec` passes bubbler's own stdin, stdout and stderr straight through, so
+  the process inside holds the host terminal's descriptors and is in no
+  session of its own. It is a tooling and debugging channel, not a boundary.
+- `try` runs as `try-<pid>` and sweeps runtime directories of that shape whose
+  pid is gone, so `try-<digits>` is a reserved instance name shape: an
+  instance called `try-1234` can have its runtime directory removed under it.
 - No seccomp filter — the sandbox is namespaces and mounts only.
 - No proprietary nvidia driver; `dri` covers the open stack.
 - `/etc/machine-id` is bound in, so every instance shares one stable
