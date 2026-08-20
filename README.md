@@ -158,6 +158,17 @@ puts a `/.flatpak-info` in the sandbox giving it the application id
 `BUBBLER_DBUS_LOG=1` runs the proxy with `--log`, so every filtered message is
 printed to bubbler's stderr.
 
+`portals` also publishes the instance's identity on the host, as
+`$XDG_RUNTIME_DIR/.flatpak/<name>/bwrapinfo.json`: bwrap's own `--info-fd`
+document, naming the `child-pid` of the sandbox. That file is how
+xdg-desktop-portal checks a sandboxed caller — it reads `instance-id` out of
+the caller's `/.flatpak-info`, looks the instance up there and opens a pidfd
+of that pid — and without it every portal *operation* is refused. The sandbox
+is held at bwrap's `--block-fd` until the file has been written, so the
+application never runs before its identity exists, and the directory is
+removed again when the run ends. The `.flatpak/` directory above it is
+flatpak's own and is never touched.
+
 A rule grants exactly as much as it reads, and the globs are wide: `own
 "org.*"` claims every well-known name under `org.`, and `mpris name="*"` owns
 the whole `org.mpris.MediaPlayer2.` tree, so the sandbox can impersonate any
@@ -193,14 +204,6 @@ binding the tree under it.
 - No system bus, no accessibility bus, no document-portal FUSE mount: `dbus`
   covers the session bus only, so a portal that hands back a `/run/user/<uid>/doc`
   path gives the sandbox nothing it can open.
-- `portals` does not finish the handshake. Beside `/.flatpak-info`,
-  xdg-desktop-portal (tested against 1.22) wants
-  `$XDG_RUNTIME_DIR/.flatpak/<name>/bwrapinfo.json`, which only flatpak writes,
-  and answers every portal *operation* with `Portal operation not allowed`.
-  Properties and introspection get through; `Settings.Read` and the file
-  chooser do not. Worse, `/.flatpak-info` alone makes libnotify route through
-  the notification portal, so `notify` — which works on its own — stops
-  working once `portals` is granted.
 - `exec` passes bubbler's own stdin, stdout and stderr straight through, so
   the process inside holds the host terminal's descriptors and is in no
   session of its own. It is a tooling and debugging channel, not a boundary.
@@ -220,7 +223,9 @@ Instances live in `$XDG_DATA_HOME/bubbler/instances/<name>/` (by default under
 run except `--dry-run` also creates `$XDG_RUNTIME_DIR/bubbler/<name>/`, mode
 0700, reusing one left over from an earlier run, and binds the control socket
 `init.sock` in it; a `dbus` grant adds the subdirectory `dbus/` holding the
-proxied bus socket. `HOME` and `XDG_RUNTIME_DIR` must be set and non-empty.
+proxied bus socket, and a `portals` grant adds
+`$XDG_RUNTIME_DIR/.flatpak/<name>/`, removed again when the run ends. `HOME`
+and `XDG_RUNTIME_DIR` must be set and non-empty.
 
 The `bubbler-init` binary is taken from `$BUBBLER_INIT` if set (it must be a
 regular file), else from next to the `bubbler` binary, else from

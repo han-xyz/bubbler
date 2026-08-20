@@ -1,6 +1,7 @@
 //! What the filtering session-bus sidecar needs: the proxy's rule list,
-//! the `.flatpak-info` portals identify the sandbox by, and where the
-//! filtered socket lives. The sandbox never reaches the host bus itself.
+//! the `.flatpak-info` portals identify the sandbox by, where portals look
+//! that identity up, and where the filtered socket lives. The sandbox
+//! never reaches the host bus itself.
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
@@ -15,6 +16,14 @@ pub const PROXY_BIN: &str = "xdg-dbus-proxy";
 
 /// Where portals expect the sandbox identity file.
 pub const FLATPAK_INFO: &str = "/.flatpak-info";
+
+/// Directory of live sandbox instances under `$XDG_RUNTIME_DIR`. It is
+/// flatpak's; bubbler only ever adds and removes its own entry in it.
+pub const FLATPAK_DIR: &str = ".flatpak";
+
+/// bwrap's `--info-fd` document, published for one instance. Portals read
+/// `child-pid` out of it to get a pidfd of the sandbox.
+pub const BWRAPINFO: &str = "bwrapinfo.json";
 
 /// Rules the `portals` bundle grants, in the order flatpak grants them.
 const PORTAL_RULES: &[&str] = &[
@@ -108,6 +117,13 @@ pub fn flatpak_info(instance: &str, portals: bool) -> Vec<u8> {
         s.push_str(&format!("\n[Instance]\ninstance-id={instance}\n"));
     }
     s.into_bytes()
+}
+
+/// `$XDG_RUNTIME_DIR/.flatpak/<instance>`: where xdg-desktop-portal looks
+/// a sandboxed caller up, by the `instance-id` in its `/.flatpak-info`.
+/// `instance` is a validated instance name.
+pub fn flatpak_instance_dir(env: &Env, instance: &str) -> PathBuf {
+    env.runtime_dir.join(FLATPAK_DIR).join(instance)
 }
 
 /// The only directory the proxy sandbox may write to. The instance
@@ -296,6 +312,18 @@ mod tests {
         assert_eq!(
             p.flatpak_info,
             b"[Application]\nname=org.bubbler.t\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn portals_look_the_instance_up_under_the_runtime_dir() {
+        assert_eq!(
+            flatpak_instance_dir(&env(), "t"),
+            PathBuf::from("/run/user/1000/.flatpak/t")
+        );
+        assert_eq!(
+            flatpak_instance_dir(&env(), "t").join(BWRAPINFO),
+            PathBuf::from("/run/user/1000/.flatpak/t/bwrapinfo.json")
         );
     }
 

@@ -6,7 +6,9 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use bubbler_core::bwrap::ETC_ALLOWLIST;
-use common::{bubbler, bubbler_dbus, bubbler_live, real_init, require_bwrap, require_dbus};
+use common::{
+    bubbler, bubbler_dbus, bubbler_live, real_init, require_bwrap, require_dbus, require_portal,
+};
 use rustix::process::{Pid, Signal, kill_process};
 
 fn setup() -> tempfile::TempDir {
@@ -472,11 +474,17 @@ fn proxy_running_for(needle: &str) -> bool {
 
 /// Instance whose runtime state lands in the session's real runtime dir,
 /// removed again so a bus test leaves nothing behind.
-struct RuntimeLeftovers(PathBuf);
+struct RuntimeLeftovers {
+    /// `$XDG_RUNTIME_DIR/bubbler/<name>`.
+    runtime: PathBuf,
+    /// `$XDG_RUNTIME_DIR/.flatpak/<name>`, written only with `portals`.
+    flatpak: PathBuf,
+}
 
 impl Drop for RuntimeLeftovers {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = std::fs::remove_dir_all(&self.runtime);
+        let _ = std::fs::remove_dir_all(&self.flatpak);
     }
 }
 
@@ -497,11 +505,12 @@ fn dbus_instance(tmp: &Path, init: &Path, name: &str, config: &str) -> RuntimeLe
         config,
     )
     .unwrap();
-    let runtime =
-        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").expect("checked by require_dbus"))
-            .join("bubbler")
-            .join(name);
-    RuntimeLeftovers(runtime)
+    let run_dir =
+        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").expect("checked by require_dbus"));
+    RuntimeLeftovers {
+        runtime: run_dir.join("bubbler").join(name),
+        flatpak: run_dir.join(".flatpak").join(name),
+    }
 }
 
 #[test]
@@ -541,7 +550,7 @@ fn real_dbus_hides_names_the_rules_do_not_grant() {
         "the proxy passed a name no rule grants:\n{s}"
     );
     assert!(
-        !proxy_running_for(&leftovers.0.display().to_string()),
+        !proxy_running_for(&leftovers.runtime.display().to_string()),
         "the proxy outlived the run"
     );
 }
@@ -610,6 +619,82 @@ fn real_dbus_notify_reaches_the_notification_service() {
         String::from_utf8_lossy(&out.stdout).contains("array"),
         "{}",
         String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn real_portal_answers_a_call_that_needs_the_app_identity() {
+    if !require_portal() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let name = "bubbler-test-portal-read";
+    let _leftovers = dbus_instance(tmp.path(), &init, name, "dbus\nportals\ncommand \"true\"\n");
+
+    // Settings.ReadAll goes through the portal's app-info lookup, unlike
+    // introspection or a property read, which any peer gets.
+    let out = bubbler_dbus(tmp.path(), &init)
+        .args([
+            "run",
+            name,
+            "--",
+            "/usr/bin/dbus-send",
+            "--session",
+            "--print-reply",
+            "--dest=org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.Settings.ReadAll",
+            "array:string:org.freedesktop.appearance",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(s.contains("method return"), "stdout: {s}stderr: {err}");
+}
+
+#[test]
+fn real_portal_identity_lives_exactly_as_long_as_the_run() {
+    if !require_portal() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let name = "bubbler-test-portal-identity";
+    let leftovers = dbus_instance(tmp.path(), &init, name, "dbus\nportals\ncommand \"true\"\n");
+    let dir = leftovers.flatpak.clone();
+    let info = dir.join("bwrapinfo.json");
+
+    let mut run = bubbler_dbus(tmp.path(), &init)
+        .args(["run", name, "--", "/usr/bin/sleep", "20"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    if !wait_until(|| info.is_file(), Duration::from_secs(10)) {
+        fail_with(run, "the run never published its bwrapinfo.json");
+    }
+    let text = std::fs::read_to_string(&info).unwrap();
+    assert!(text.contains("\"child-pid\""), "{text}");
+
+    kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
+    assert!(
+        wait_until(
+            || run
+                .try_wait()
+                .expect("waiting for the run process")
+                .is_some(),
+            Duration::from_secs(8)
+        ),
+        "the run did not stop after SIGTERM"
+    );
+    assert!(!dir.exists(), "the identity outlived the run");
+    // Only this instance's entry is removed: the directory above it holds
+    // flatpak's own instances.
+    assert!(
+        dir.parent().is_some_and(Path::is_dir),
+        "the .flatpak directory itself was removed"
     );
 }
 

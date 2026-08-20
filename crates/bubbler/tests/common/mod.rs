@@ -94,6 +94,36 @@ pub fn host_bus() -> Option<PathBuf> {
         .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.file_type().is_socket()))
 }
 
+/// Whether the session bus has an owner for `name` right now. Asking
+/// does not activate the service, so a portal that is merely
+/// activatable counts as absent.
+fn bus_name_has_owner(name: &str) -> bool {
+    Command::new("dbus-send")
+        .args([
+            "--session",
+            "--print-reply",
+            "--dest=org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus.NameHasOwner",
+            &format!("string:{name}"),
+        ])
+        .output()
+        .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("true"))
+}
+
+/// Returns false (after printing why) when portal calls cannot be tested
+/// here: no proxied session bus, or no running xdg-desktop-portal.
+pub fn require_portal() -> bool {
+    if !require_dbus() {
+        return false;
+    }
+    let desktop = bus_name_has_owner("org.freedesktop.portal.Desktop");
+    if !desktop {
+        eprintln!("skipping: no org.freedesktop.portal.Desktop on the session bus");
+    }
+    desktop
+}
+
 /// Returns false (after printing why) when a proxied session bus cannot
 /// be tested here: no bwrap, no `xdg-dbus-proxy` or `dbus-send`, or no
 /// session bus on the host.

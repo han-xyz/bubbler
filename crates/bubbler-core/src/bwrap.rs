@@ -25,6 +25,8 @@ enum Item {
     },
     /// `--info-fd` with the fd the allocator opens at `finish` time.
     InfoFd,
+    /// `--block-fd` with the fd the allocator opens at `finish` time.
+    BlockFd,
 }
 
 /// Where the `bubbler-init` supervisor is bound inside every sandbox.
@@ -46,6 +48,9 @@ pub trait FdAllocator {
     fn ready_pipe(&mut self) -> io::Result<OsString>;
     /// Fd bwrap reports the sandbox pid on; the allocator keeps the read end.
     fn info_pipe(&mut self) -> io::Result<OsString>;
+    /// Fd the sandbox is held at until released; the allocator keeps the
+    /// write end.
+    fn block_pipe(&mut self) -> io::Result<OsString>;
 }
 
 /// Ordered, phase-separated bubblewrap arguments.
@@ -323,6 +328,15 @@ impl BwrapArgs {
         }
     }
 
+    /// Hold the sandbox at startup until the launcher lets it go
+    /// (`bwrap(1)` `--block-fd`, phase 1). Only a sandbox whose identity
+    /// bubbler still has to publish waits, and it waits before it execs.
+    // After `--info-fd`, which bwrap writes before it reads this one: the
+    // identity is built out of that document.
+    pub fn block_until_released(&mut self) {
+        self.namespaces.push(Item::BlockFd);
+    }
+
     /// Read-only bind of a host path (phase 4).
     pub fn ro_bind(&mut self, src: &Path, dst: &Path) {
         push(
@@ -439,6 +453,10 @@ impl BwrapArgs {
                     let fd = alloc.info_pipe().map_err(LaunchError::Data)?;
                     out.extend(["--info-fd".into(), fd]);
                 }
+                Item::BlockFd => {
+                    let fd = alloc.block_pipe().map_err(LaunchError::Data)?;
+                    out.extend(["--block-fd".into(), fd]);
+                }
             }
         }
         Ok(out)
@@ -499,6 +517,9 @@ mod tests {
         fn info_pipe(&mut self) -> io::Result<OsString> {
             self.bump()
         }
+        fn block_pipe(&mut self) -> io::Result<OsString> {
+            self.bump()
+        }
     }
 
     /// Counter that also keeps every data payload it was handed.
@@ -521,6 +542,9 @@ mod tests {
         fn info_pipe(&mut self) -> io::Result<OsString> {
             self.next.bump()
         }
+        fn block_pipe(&mut self) -> io::Result<OsString> {
+            self.next.bump()
+        }
     }
 
     struct Failing;
@@ -536,6 +560,9 @@ mod tests {
             Err(io::Error::other("nope"))
         }
         fn info_pipe(&mut self) -> io::Result<OsString> {
+            Err(io::Error::other("nope"))
+        }
+        fn block_pipe(&mut self) -> io::Result<OsString> {
             Err(io::Error::other("nope"))
         }
     }
@@ -804,6 +831,22 @@ mod tests {
         assert!(pos("/run/user/1000/wayland-1") > pos("--dir"));
         assert!(pos("/run/user/1000/wayland-1") < pos("--clearenv"));
         assert!(pos("WAYLAND_DISPLAY") > pos("--clearenv"));
+    }
+
+    #[test]
+    fn the_sandbox_blocks_only_when_asked_to() {
+        let plain = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default())
+            .finish(&["sh".into()], &mut Counter::new())
+            .unwrap();
+        assert!(!strs(&plain).contains(&"--block-fd"));
+
+        let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default());
+        args.block_until_released();
+        let finished = args.finish(&["sh".into()], &mut Counter::new()).unwrap();
+        let s = strs(&finished);
+        // Phase 1, and after --info-fd: bwrap writes the info it is blocked
+        // for before it reads the block fd.
+        assert_eq!(&s[7..11], &["--info-fd", "3", "--block-fd", "4"], "{s:?}");
     }
 
     #[test]

@@ -74,6 +74,9 @@ impl FdAllocator for DryRunAlloc {
     fn info_pipe(&mut self) -> io::Result<OsString> {
         self.bump()
     }
+    fn block_pipe(&mut self) -> io::Result<OsString> {
+        self.bump()
+    }
 }
 
 /// Allocator for a real run: memfds for data files, the control socket
@@ -92,6 +95,9 @@ pub struct RealAlloc {
     /// Write end of the info pipe; the caller drops it once bwrap has
     /// started, so the read end reports EOF if bwrap never answers.
     pub info_write: Option<OwnedFd>,
+    /// Write end of the pipe the sandbox is blocked on. Writing to it or
+    /// dropping it is what lets the sandbox exec its command.
+    pub block_write: Option<OwnedFd>,
 }
 
 impl RealAlloc {
@@ -103,6 +109,7 @@ impl RealAlloc {
             ready_read: None,
             info_read: None,
             info_write: None,
+            block_write: None,
         }
     }
 
@@ -115,6 +122,7 @@ impl RealAlloc {
             ready_read: None,
             info_read: None,
             info_write: None,
+            block_write: None,
         }
     }
 
@@ -164,6 +172,16 @@ impl FdAllocator for RealAlloc {
         self.info_write = Some(write);
         Ok(OsString::from(n.to_string()))
     }
+
+    /// bwrap inherits the read end and waits on it; the write end stays
+    /// here and out of every child, so nothing but bubbler can release
+    /// the sandbox.
+    fn block_pipe(&mut self) -> io::Result<OsString> {
+        let (read, write) = rustix::pipe::pipe()?;
+        fcntl_setfd(&write, FdFlags::CLOEXEC)?;
+        self.block_write = Some(write);
+        Ok(self.keep(read))
+    }
 }
 
 /// The command to run: the CLI's if it gave one, else the config's.
@@ -199,6 +217,11 @@ pub fn build_argv(
         dbus: plan.as_ref(),
     };
     let mut args = BwrapArgs::baseline(env, &inst.home(), &host);
+    // A portal call is answered by the identity bubbler publishes from
+    // bwrap's own info document, so the app waits until that file is there.
+    if plan.as_ref().is_some_and(|p| p.portals) {
+        args.block_until_released();
+    }
     service::apply_all(&inst.config.services, env, &mut args, &host, &ctx)?;
     service::apply_env(&inst.config.env, &mut args)?;
     args.bind_init(&init_bin::locate(env, &host)?);
@@ -400,14 +423,48 @@ fn parse_child_pid(buf: &[u8]) -> Option<i32> {
     std::str::from_utf8(&tail[start..end]).ok()?.parse().ok()
 }
 
-/// Read the info pipe until bwrap has reported `child-pid`, or until the
-/// deadline, EOF or the child's own exit says it never will.
-fn read_child_pid(info: &OwnedFd, child: &mut Child, deadline: Instant) -> Option<i32> {
+/// End of the first complete JSON object in `buf`: braces counted outside
+/// strings. bwrap writes its info as one multi-line document, and a
+/// truncated one is no use to the portals that parse it.
+fn json_object_end(buf: &[u8]) -> Option<usize> {
+    let mut depth = 0u32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, b) in buf.iter().enumerate() {
+        match b {
+            _ if escaped => escaped = false,
+            b'\\' if in_string => escaped = true,
+            b'"' => in_string = !in_string,
+            b'{' if !in_string => depth += 1,
+            b'}' if !in_string => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Read the info pipe until bwrap has reported a whole document with
+/// `child-pid` in it, or until the deadline, EOF or the child's own exit
+/// says it never will. The bytes come back as bwrap wrote them: portals
+/// read that same document out of `bwrapinfo.json`.
+fn read_sandbox_info(
+    info: &OwnedFd,
+    child: &mut Child,
+    deadline: Instant,
+) -> Option<(i32, Vec<u8>)> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 512];
     loop {
-        if let Some(pid) = parse_child_pid(&buf) {
-            return Some(pid);
+        if let Some(end) = json_object_end(&buf)
+            && let Some(pid) = parse_child_pid(&buf[..end])
+        {
+            buf.truncate(end);
+            return Some((pid, buf));
         }
         if Instant::now() >= deadline || child.try_wait().ok()?.is_some() {
             return None;
@@ -432,13 +489,15 @@ fn read_child_pid(info: &OwnedFd, child: &mut Child, deadline: Instant) -> Optio
 }
 
 /// Host pid of the supervisor in the sandbox, for signalling it directly.
+/// `reaper` is the `child-pid` bwrap reported.
 ///
-/// bwrap reports its reaper, which is pid 1 of the sandbox's pid
-/// namespace and ignores every signal from outside it that it has no
-/// handler for (`pid_namespaces(7)`); `bubbler-init` is that reaper's only
-/// child at startup and does handle SIGTERM.
-fn supervisor_pid(info: &OwnedFd, child: &mut Child, deadline: Instant) -> Option<Pid> {
-    let reaper = read_child_pid(info, child, deadline)?;
+/// That reaper is pid 1 of the sandbox's pid namespace and ignores every
+/// signal from outside it that it has no handler for
+/// (`pid_namespaces(7)`); `bubbler-init` is its only child at startup and
+/// does handle SIGTERM.
+// Only callable once the sandbox has been released: a sandbox still
+// waiting on `--block-fd` has not forked the supervisor yet.
+fn supervisor_pid(reaper: i32, child: &mut Child, deadline: Instant) -> Option<Pid> {
     let children = PathBuf::from(format!("/proc/{reaper}/task/{reaper}/children"));
     loop {
         // Only an empty list is worth waiting on: the reaper forks the
@@ -469,6 +528,64 @@ impl Drop for SocketGuard {
         // Nothing to report: a concurrent start may have replaced the
         // socket, and a stale one is detected by connecting to it anyway.
         let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Removes this run's `$XDG_RUNTIME_DIR/.flatpak/<instance>` when the run
+/// leaves, on every path. Only that entry: the `.flatpak` directory above
+/// it is flatpak's own and holds other sandboxes' instances.
+struct FlatpakGuard(PathBuf);
+
+impl Drop for FlatpakGuard {
+    fn drop(&mut self) {
+        // Nothing to report: the directory holds this run's identity and
+        // nothing else, and a leftover only names a pid that is gone.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Publish bwrap's own info document as
+/// `$XDG_RUNTIME_DIR/.flatpak/<instance>/bwrapinfo.json`, which is how
+/// xdg-desktop-portal turns a sandboxed bus peer into a pidfd of the
+/// sandbox. The guard removes the directory again when the run ends.
+fn publish_bwrapinfo(env: &Env, instance: &str, info: &[u8]) -> Result<FlatpakGuard, LaunchError> {
+    mkdir_private(&env.runtime_dir.join(dbus::FLATPAK_DIR))?;
+    let dir = dbus::flatpak_instance_dir(env, instance);
+    mkdir_private(&dir)?;
+    // From here on the directory is removed again however this ends.
+    let guard = FlatpakGuard(dir.clone());
+    // Written and renamed inside the directory, so a portal reading it
+    // never sees half a document.
+    let tmp = dir.join(format!("{}.new", dbus::BWRAPINFO));
+    std::fs::write(&tmp, info).map_err(|e| LaunchError::Io(tmp.clone(), e))?;
+    let dest = dir.join(dbus::BWRAPINFO);
+    std::fs::rename(&tmp, &dest).map_err(|e| LaunchError::Io(dest, e))?;
+    Ok(guard)
+}
+
+/// Give xdg-desktop-portal this run's identity, or say why portals will
+/// not work. Never fatal: an app whose portal calls fail still runs.
+fn publish_identity(env: &Env, instance: &str, info: Option<&[u8]>) -> Option<FlatpakGuard> {
+    let Some(info) = info else {
+        eprintln!("bubbler: warning: the sandbox reported no pid, so portal operations will fail");
+        return None;
+    };
+    match publish_bwrapinfo(env, instance, info) {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            // `LaunchError::Io` shows the path; what went wrong is its source.
+            let why = std::error::Error::source(&e).map_or_else(String::new, |s| format!(": {s}"));
+            eprintln!("bubbler: warning: {e}{why}, so portal operations will fail");
+            None
+        }
+    }
+}
+
+/// Let the sandbox past its `--block-fd`. Closing the pipe releases it
+/// just as the byte does, so a failed write still starts the app.
+fn release_block(alloc: &mut RealAlloc) {
+    if let Some(fd) = alloc.block_write.take() {
+        let _ = rustix::io::write(&fd, b"\n");
     }
 }
 
@@ -508,8 +625,10 @@ pub fn run(env: &Env, inst: &Instance, command: Option<&[OsString]>) -> Result<i
     resolve_command(inst, command)?;
     // Before the argv is built, so the proxy's socket is there for bwrap
     // to bind: a missing bind source is a failed start, not a warning.
-    let _proxy = match dbus::plan(&inst.config.services, &inst.name) {
-        Some(plan) => Some(start_proxy(env, &dir, &plan, &RealHost)?),
+    let plan = dbus::plan(&inst.config.services, &inst.name);
+    let portals = plan.as_ref().is_some_and(|p| p.portals);
+    let _proxy = match &plan {
+        Some(plan) => Some(start_proxy(env, &dir, plan, &RealHost)?),
         None => None,
     };
     let argv = build_argv(env, inst, command, &mut alloc)?;
@@ -532,10 +651,25 @@ pub fn run(env: &Env, inst: &Instance, command: Option<&[OsString]>) -> Result<i
     drop(inherited);
     drop(listener);
     drop(alloc.info_write.take());
-    let supervisor = alloc
+    let deadline = Instant::now() + INFO_TIMEOUT;
+    let info = alloc
         .info_read
         .as_ref()
-        .and_then(|info| supervisor_pid(info, &mut child, Instant::now() + INFO_TIMEOUT));
+        .and_then(|fd| read_sandbox_info(fd, &mut child, deadline));
+    // Before the supervisor is looked for: a sandbox held at `--block-fd`
+    // has not forked it yet, so there would be nothing to find.
+    let _identity = if portals {
+        let published = publish_identity(env, &inst.name, info.as_ref().map(|(_, raw)| &raw[..]));
+        // However that went, the sandbox is let go: an app that cannot
+        // reach portals still has to run.
+        release_block(&mut alloc);
+        published
+    } else {
+        None
+    };
+    let supervisor = info
+        .as_ref()
+        .and_then(|(reaper, _)| supervisor_pid(*reaper, &mut child, deadline));
     let status = loop {
         if let Some(status) = child.try_wait().map_err(LaunchError::Spawn)? {
             break status;
@@ -887,6 +1021,20 @@ mod tests {
     }
 
     #[test]
+    fn only_a_portals_instance_waits_for_its_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let i = inst(tmp.path(), "dbus\nportals\ncommand \"x\"");
+        let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default()).unwrap());
+        assert!(a.windows(2).any(|w| w == ["--block-fd", "4"]), "{a:?}");
+        for kdl in ["dbus\ncommand \"x\"", "command \"x\""] {
+            let i = inst(tmp.path(), kdl);
+            let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default()).unwrap());
+            assert!(!a.contains(&"--block-fd".to_string()), "{kdl}: {a:?}");
+        }
+    }
+
+    #[test]
     fn dry_run_alloc_numbers_every_fd_from_three() {
         let mut alloc = DryRunAlloc::default();
         assert_eq!(alloc.data(b"a").unwrap(), OsString::from("3"));
@@ -894,6 +1042,38 @@ mod tests {
         assert_eq!(alloc.init_socket().unwrap(), OsString::from("5"));
         assert_eq!(alloc.ready_pipe().unwrap(), OsString::from("6"));
         assert_eq!(alloc.info_pipe().unwrap(), OsString::from("7"));
+        assert_eq!(alloc.block_pipe().unwrap(), OsString::from("8"));
+    }
+
+    #[test]
+    fn real_alloc_block_pipe_hands_the_sandbox_the_read_end() {
+        use std::io::Read;
+        let mut alloc = RealAlloc::new(7);
+        let fd = alloc.block_pipe().unwrap();
+        let read = alloc.fds.last().expect("the read end is inherited");
+        assert_eq!(fd, OsString::from(read.as_raw_fd().to_string()));
+        assert_eq!(rustix::io::fcntl_getfd(read).unwrap(), FdFlags::empty());
+        let write = alloc.block_write.take().expect("the write end stays here");
+        assert_eq!(rustix::io::fcntl_getfd(&write).unwrap(), FdFlags::CLOEXEC);
+        rustix::io::write(&write, b"\n").unwrap();
+        let mut got = [0u8; 1];
+        std::fs::File::from(read.try_clone().unwrap())
+            .read_exact(&mut got)
+            .unwrap();
+        assert_eq!(&got, b"\n");
+    }
+
+    #[test]
+    fn a_json_object_ends_at_its_closing_brace() {
+        let doc = b"{\n    \"child-pid\": 7\n}\n";
+        assert_eq!(json_object_end(doc), Some(doc.len() - 1));
+        assert_eq!(json_object_end(b"{\"a\": {\"b\": 1}}"), Some(15));
+        // Braces inside a string do not close the object, and a document
+        // still being written has no end yet.
+        assert_eq!(json_object_end(b"{\"a\": \"}\", \"b\": 1}"), Some(18));
+        assert_eq!(json_object_end(b"{\"a\": \"\\\"}\"}"), Some(12));
+        assert_eq!(json_object_end(b"{\n    \"child-pid\": 7"), None);
+        assert_eq!(json_object_end(b""), None);
     }
 
     #[test]
