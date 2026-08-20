@@ -21,6 +21,7 @@ pub const RESERVED_ENV: &[&str] = &[
     "XAUTHORITY",
     "XDG_SESSION_TYPE",
     "PULSE_SERVER",
+    "DBUS_SESSION_BUS_ADDRESS",
 ];
 
 /// `/etc` entries `etc-share` may not name: the sandbox generates its own
@@ -907,6 +908,29 @@ command "b""#
                 "org.freedesktop.portal.Desktop".into(),
                 "@/org/freedesktop/portal/desktop".into()
             )
+        );
+    }
+
+    #[test]
+    fn see_talk_and_own_map_to_their_own_variants() {
+        let cfg = parse("dbus { see \"a.b\"; talk \"c.d\"; own \"e.f\" }").unwrap();
+        assert_eq!(
+            cfg.services,
+            vec![Service::Dbus {
+                rules: vec![
+                    BusRule::See("a.b".into()),
+                    BusRule::Talk("c.d".into()),
+                    BusRule::Own("e.f".into()),
+                ]
+            }]
+        );
+    }
+
+    #[test]
+    fn a_bundle_may_precede_the_dbus_node() {
+        assert_eq!(
+            parse("notify\ndbus").unwrap().services,
+            vec![Service::Notify, Service::Dbus { rules: vec![] }]
         );
     }
 

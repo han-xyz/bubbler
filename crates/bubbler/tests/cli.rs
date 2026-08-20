@@ -1,11 +1,12 @@
 mod common;
 
 use std::os::unix::net::UnixStream;
-use std::process::{Child, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use bubbler_core::bwrap::ETC_ALLOWLIST;
-use common::{bubbler, bubbler_live, real_init, require_bwrap};
+use common::{bubbler, bubbler_dbus, bubbler_live, real_init, require_bwrap, require_dbus};
 use rustix::process::{Pid, Signal, kill_process};
 
 fn setup() -> tempfile::TempDir {
@@ -440,6 +441,146 @@ fn real_bwrap_sigterm_reaches_the_command_inside() {
         sent.elapsed()
     );
     assert!(!sock.exists(), "the control socket outlived the run");
+}
+
+/// Ask the host's own session bus whether a name is on it, so a test
+/// that expects the proxy to hide it is not proving the obvious.
+fn host_owns(name: &str) -> bool {
+    Command::new("dbus-send")
+        .args([
+            "--session",
+            "--print-reply",
+            "--dest=org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus.ListNames",
+        ])
+        .output()
+        .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains(name))
+}
+
+/// Whether any `xdg-dbus-proxy` still has `needle` in its argv.
+fn proxy_running_for(needle: &str) -> bool {
+    match Command::new("pgrep")
+        .args(["-f", &format!("xdg-dbus-proxy.*{needle}")])
+        .output()
+    {
+        Ok(o) => o.status.success(),
+        // No pgrep: the assertion cannot be made, so it does not fail.
+        Err(_) => false,
+    }
+}
+
+/// Instance whose runtime state lands in the session's real runtime dir,
+/// removed again so a bus test leaves nothing behind.
+struct RuntimeLeftovers(PathBuf);
+
+impl Drop for RuntimeLeftovers {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn dbus_instance(tmp: &Path, init: &Path, name: &str, config: &str) -> RuntimeLeftovers {
+    let out = bubbler_dbus(tmp, init)
+        .args(["create", name])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(
+        tmp.join("data/bubbler/instances")
+            .join(name)
+            .join("config.kdl"),
+        config,
+    )
+    .unwrap();
+    let runtime =
+        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").expect("checked by require_dbus"))
+            .join("bubbler")
+            .join(name);
+    RuntimeLeftovers(runtime)
+}
+
+#[test]
+fn real_dbus_hides_names_the_rules_do_not_grant() {
+    if !require_dbus() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    if !host_owns("org.freedesktop.Notifications") {
+        eprintln!("skipping: the host session bus has no org.freedesktop.Notifications");
+        return;
+    }
+    let tmp = setup();
+    let name = "bubbler-test-dbus-bare";
+    let leftovers = dbus_instance(tmp.path(), &init, name, "dbus\ncommand \"true\"\n");
+
+    let out = bubbler_dbus(tmp.path(), &init)
+        .args([
+            "run",
+            name,
+            "--",
+            "/usr/bin/dbus-send",
+            "--session",
+            "--print-reply",
+            "--dest=org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus.ListNames",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(s.contains("org.freedesktop.DBus"), "{s}");
+    assert!(
+        !s.contains("org.freedesktop.Notifications"),
+        "the proxy passed a name no rule grants:\n{s}"
+    );
+    assert!(
+        !proxy_running_for(&leftovers.0.display().to_string()),
+        "the proxy outlived the run"
+    );
+}
+
+#[test]
+fn real_dbus_notify_reaches_the_notification_service() {
+    if !require_dbus() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    if !host_owns("org.freedesktop.Notifications") {
+        eprintln!("skipping: the host session bus has no org.freedesktop.Notifications");
+        return;
+    }
+    let tmp = setup();
+    let name = "bubbler-test-dbus-notify";
+    let _leftovers = dbus_instance(tmp.path(), &init, name, "dbus\nnotify\ncommand \"true\"\n");
+
+    let out = bubbler_dbus(tmp.path(), &init)
+        .args([
+            "run",
+            name,
+            "--",
+            "/usr/bin/dbus-send",
+            "--session",
+            "--print-reply",
+            "--dest=org.freedesktop.Notifications",
+            "/org/freedesktop/Notifications",
+            "org.freedesktop.Notifications.GetCapabilities",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("array"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
 }
 
 #[test]

@@ -94,6 +94,10 @@ pub const ETC_ALLOWLIST: &[&str] = &[
     "os-release",
 ];
 
+/// Host `/etc` entries the D-Bus proxy sandbox gets when they exist:
+/// what the dynamic loader and name resolution read, and nothing else.
+pub const PROXY_ETC: &[&str] = &["ld.so.cache", "ld.so.conf", "ld.so.conf.d", "nsswitch.conf"];
+
 /// `/etc/passwd` for the sandbox: the fixed `bubbler` user plus `nobody`,
 /// which is what files owned by other host users map to in the user namespace.
 pub fn passwd_content(uid: u32, gid: u32) -> Vec<u8> {
@@ -232,6 +236,78 @@ impl BwrapArgs {
         a
     }
 
+    /// The sandbox the D-Bus proxy sidecar runs in: the same namespace
+    /// restrictions as [`BwrapArgs::baseline`], a read-only `/usr` and a
+    /// minimal `/etc` ([`PROXY_ETC`]) so the proxy binary can start, no
+    /// home, no runtime dir of its own, and exactly two paths from the
+    /// session: the host bus socket read-only and the instance's runtime
+    /// directory read-write, which is where it creates the filtered
+    /// socket. The environment is cleared; the bus address is an argument.
+    pub fn proxy_baseline(host_bus: &Path, instance_runtime: &Path, host: &dyn Host) -> Self {
+        let mut a = Self {
+            namespaces: Vec::new(),
+            skeleton: Vec::new(),
+            runtime_dir: Vec::new(),
+            binds: Vec::new(),
+            env: Vec::new(),
+        };
+        let o = OsStr::new;
+        push(
+            &mut a.namespaces,
+            [
+                o("--unshare-all"),
+                o("--die-with-parent"),
+                o("--new-session"),
+            ],
+        );
+        push(&mut a.skeleton, [o("--ro-bind"), o("/usr"), o("/usr")]);
+        for (target, link) in [
+            ("usr/bin", "/bin"),
+            ("usr/lib", "/lib"),
+            ("usr/lib64", "/lib64"),
+            ("usr/bin", "/sbin"),
+        ] {
+            push(&mut a.skeleton, [o("--symlink"), o(target), o(link)]);
+        }
+        push(&mut a.skeleton, [o("--tmpfs"), o("/etc")]);
+        for name in PROXY_ETC {
+            let p = Path::new("/etc").join(name);
+            if host.file_type(&p).is_some() {
+                push(
+                    &mut a.skeleton,
+                    [o("--ro-bind"), p.as_os_str(), p.as_os_str()],
+                );
+            }
+        }
+        push(
+            &mut a.skeleton,
+            [
+                o("--proc"),
+                o("/proc"),
+                o("--dev"),
+                o("/dev"),
+                o("--tmpfs"),
+                o("/tmp"),
+            ],
+        );
+        push(
+            &mut a.skeleton,
+            [o("--ro-bind"), host_bus.as_os_str(), host_bus.as_os_str()],
+        );
+        // Read-write and nothing above it: the proxy has to create its
+        // socket here, and this directory holds only this instance's state.
+        push(
+            &mut a.skeleton,
+            [
+                o("--bind"),
+                instance_runtime.as_os_str(),
+                instance_runtime.as_os_str(),
+            ],
+        );
+        push(&mut a.env, [o("--clearenv")]);
+        a
+    }
+
     /// Keep the host network namespace (`--share-net`). Only the
     /// `network` service calls this. Idempotent: `--share-net` is emitted
     /// once however often this is called, and always directly after
@@ -303,6 +379,34 @@ impl BwrapArgs {
         command: &[OsString],
         alloc: &mut dyn FdAllocator,
     ) -> Result<Vec<OsString>, LaunchError> {
+        let mut out = self.emit(alloc)?;
+        let socket = alloc.init_socket().map_err(LaunchError::Data)?;
+        out.extend([
+            OsString::from("--"),
+            INIT_INSIDE.into(),
+            "--socket-fd".into(),
+            socket,
+            "--".into(),
+        ]);
+        out.extend_from_slice(command);
+        Ok(out)
+    }
+
+    /// Like [`BwrapArgs::finish`] but running `command` directly. Only
+    /// sidecars use it: they have no exec channel to serve, so there is
+    /// nothing for `bubbler-init` to supervise.
+    pub fn finish_plain(
+        self,
+        command: &[OsString],
+        alloc: &mut dyn FdAllocator,
+    ) -> Result<Vec<OsString>, LaunchError> {
+        let mut out = self.emit(alloc)?;
+        out.push(OsString::from("--"));
+        out.extend_from_slice(command);
+        Ok(out)
+    }
+
+    fn emit(self, alloc: &mut dyn FdAllocator) -> Result<Vec<OsString>, LaunchError> {
         let mut out = Vec::new();
         for item in [
             self.namespaces,
@@ -337,15 +441,6 @@ impl BwrapArgs {
                 }
             }
         }
-        let socket = alloc.init_socket().map_err(LaunchError::Data)?;
-        out.extend([
-            OsString::from("--"),
-            INIT_INSIDE.into(),
-            "--socket-fd".into(),
-            socket,
-            "--".into(),
-        ]);
-        out.extend_from_slice(command);
         Ok(out)
     }
 }
@@ -368,6 +463,8 @@ mod tests {
             xauthority: None,
             passthrough: vec![("TERM".into(), "foot".into())],
             init_override: None,
+            dbus_address: None,
+            dbus_log: false,
         }
     }
 
@@ -539,6 +636,99 @@ mod tests {
                 "/usr/bin/true",
             ]
         );
+    }
+
+    #[test]
+    fn proxy_baseline_argv_is_exact() {
+        let (f, d, _) = crate::host::fake::types();
+        let host = FakeHost::default()
+            .with("/etc/ld.so.cache", f)
+            .with("/etc/ld.so.conf.d", d)
+            .with("/etc/nsswitch.conf", f)
+            .with("/etc/hosts", f);
+        let argv = BwrapArgs::proxy_baseline(
+            Path::new("/run/user/1000/bus"),
+            Path::new("/run/user/1000/bubbler/t"),
+            &host,
+        )
+        .finish_plain(&["xdg-dbus-proxy".into()], &mut Counter::new())
+        .unwrap();
+        assert_eq!(
+            strs(&argv),
+            vec![
+                "--unshare-all",
+                "--die-with-parent",
+                "--new-session",
+                "--ro-bind",
+                "/usr",
+                "/usr",
+                "--symlink",
+                "usr/bin",
+                "/bin",
+                "--symlink",
+                "usr/lib",
+                "/lib",
+                "--symlink",
+                "usr/lib64",
+                "/lib64",
+                "--symlink",
+                "usr/bin",
+                "/sbin",
+                "--tmpfs",
+                "/etc",
+                "--ro-bind",
+                "/etc/ld.so.cache",
+                "/etc/ld.so.cache",
+                "--ro-bind",
+                "/etc/ld.so.conf.d",
+                "/etc/ld.so.conf.d",
+                "--ro-bind",
+                "/etc/nsswitch.conf",
+                "/etc/nsswitch.conf",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--tmpfs",
+                "/tmp",
+                "--ro-bind",
+                "/run/user/1000/bus",
+                "/run/user/1000/bus",
+                "--bind",
+                "/run/user/1000/bubbler/t",
+                "/run/user/1000/bubbler/t",
+                "--clearenv",
+                "--",
+                "xdg-dbus-proxy",
+            ],
+            "an /etc entry that is not in PROXY_ETC must not appear"
+        );
+    }
+
+    #[test]
+    fn proxy_sandbox_takes_the_flatpak_info_data_file() {
+        let mut args = BwrapArgs::proxy_baseline(
+            Path::new("/run/user/1000/bus"),
+            Path::new("/run/user/1000/bubbler/t"),
+            &FakeHost::default(),
+        );
+        args.ro_bind_data(
+            b"[Application]\n".to_vec(),
+            Path::new("/.flatpak-info"),
+            "0644",
+        );
+        let argv = args
+            .finish_plain(&["xdg-dbus-proxy".into()], &mut Counter::new())
+            .unwrap();
+        let s = strs(&argv);
+        assert!(
+            s.windows(5)
+                .any(|w| w == ["--perms", "0644", "--ro-bind-data", "3", "/.flatpak-info"]),
+            "{s:?}"
+        );
+        // No supervisor and no control socket: the proxy is not an instance.
+        assert!(!s.contains(&INIT_INSIDE));
+        assert!(!s.contains(&"--info-fd"));
     }
 
     #[test]

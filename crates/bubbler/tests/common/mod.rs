@@ -1,5 +1,8 @@
 //! Shared helpers for CLI integration tests.
 
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -56,4 +59,54 @@ pub fn bubbler_live(root: &Path, init: &Path) -> Command {
     let mut c = bubbler(root);
     c.env("BUBBLER_INIT", init);
     c
+}
+
+/// [`bubbler_live`] with the session's real `XDG_RUNTIME_DIR` and
+/// `DBUS_SESSION_BUS_ADDRESS`, which a proxied bus needs; HOME and
+/// XDG_DATA_HOME stay under `root`. Instance runtime state therefore
+/// lands in the real runtime dir, so such tests need distinctive names.
+pub fn bubbler_dbus(root: &Path, init: &Path) -> Command {
+    let mut c = bubbler_live(root, init);
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        c.env("XDG_RUNTIME_DIR", dir);
+    }
+    if let Some(addr) = std::env::var_os("DBUS_SESSION_BUS_ADDRESS") {
+        c.env("DBUS_SESSION_BUS_ADDRESS", addr);
+    }
+    c
+}
+
+/// Whether `program` is on `PATH`. Only the spawn is checked: `dbus-send`
+/// exits 1 on `--version` even when it is installed.
+fn has_program(program: &str) -> bool {
+    Command::new(program).arg("--version").output().is_ok()
+}
+
+/// The host session bus socket, resolved the way bubbler resolves it.
+pub fn host_bus() -> Option<PathBuf> {
+    let from_address = std::env::var_os("DBUS_SESSION_BUS_ADDRESS").and_then(|a| {
+        let rest = a.as_bytes().strip_prefix(b"unix:path=")?.to_vec();
+        let end = rest.iter().position(|b| *b == b',').unwrap_or(rest.len());
+        Some(PathBuf::from(OsStr::from_bytes(&rest[..end])))
+    });
+    from_address
+        .or_else(|| std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("bus")))
+        .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.file_type().is_socket()))
+}
+
+/// Returns false (after printing why) when a proxied session bus cannot
+/// be tested here: no bwrap, no `xdg-dbus-proxy` or `dbus-send`, or no
+/// session bus on the host.
+pub fn require_dbus() -> bool {
+    if !require_bwrap() {
+        return false;
+    }
+    let proxy = has_program("xdg-dbus-proxy");
+    let send = has_program("dbus-send");
+    let bus = host_bus();
+    if !proxy || !send || bus.is_none() {
+        eprintln!("skipping: xdg-dbus-proxy={proxy} dbus-send={send} bus={bus:?}");
+        return false;
+    }
+    true
 }

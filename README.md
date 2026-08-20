@@ -71,6 +71,16 @@ file order does not affect the generated argv.
     home-share "Downloads"           # $HOME/Downloads at /home/bubbler/Downloads
     home-share "Projects/x" mode=rw
     etc-share "vulkan"               # /etc/vulkan read-only; one path component
+    dbus {                           # session bus through a filtering proxy
+        see "org.freedesktop.ScreenSaver"
+        talk "ca.desrt.dconf"
+        own "org.example.App"
+        call "org.freedesktop.portal.Desktop=org.freedesktop.portal.Settings.Read@/org/freedesktop/portal/desktop"
+        broadcast "org.freedesktop.portal.Desktop=@/org/freedesktop/portal/desktop"
+    }
+    portals                          # XDG portal rules plus /.flatpak-info
+    notify                           # talk to org.freedesktop.Notifications
+    mpris name="firefox.*"           # own org.mpris.MediaPlayer2.firefox.*
     env MOZ_ENABLE_WAYLAND="1"       # extra variables, KEY="value", repeatable
     command "firefox"
 
@@ -95,7 +105,27 @@ only once. `env` values and `command` arguments may not contain NUL, a newline
 or a carriage return — a newline would forge a line in `--dry-run` output. The
 variables the sandbox owns are rejected: `HOME`, `PATH`, `XDG_RUNTIME_DIR`,
 `USER`, `LOGNAME`, `WAYLAND_DISPLAY`, `DISPLAY`, `XAUTHORITY`,
-`XDG_SESSION_TYPE`, `PULSE_SERVER`.
+`XDG_SESSION_TYPE`, `PULSE_SERVER`, `DBUS_SESSION_BUS_ADDRESS`.
+
+## D-Bus
+
+`dbus` never binds the session bus itself. bubbler starts an `xdg-dbus-proxy`
+in a sandbox of its own — no network, no home, read-only `/usr`, an `/etc`
+holding at most `ld.so.cache`, `ld.so.conf`, `ld.so.conf.d` and
+`nsswitch.conf`, the host bus socket read-only and the instance's runtime
+directory read-write — and binds the filtered socket it serves at
+`$XDG_RUNTIME_DIR/bus` inside the sandbox, with `DBUS_SESSION_BUS_ADDRESS`
+pointing there. The start waits up to five seconds for the proxy to report
+its socket and fails if it does not; the proxy exits with the sandbox.
+`--dry-run` prints that bind without starting anything.
+
+The host bus is `$DBUS_SESSION_BUS_ADDRESS` when it is a `unix:path=`
+address, else `$XDG_RUNTIME_DIR/bus`, and must be a socket. Everything the
+sandbox may reach is a rule: the `dbus` children above, plus the bundles
+`portals`, `notify` and `mpris`, each of which needs `dbus`. `portals` also
+puts a `/.flatpak-info` naming the instance in the sandbox, which is what
+portals identify it by. `BUBBLER_DBUS_LOG=1` runs the proxy with `--log`, so
+every filtered message is printed to bubbler's stderr.
 
 ## Baseline
 
@@ -124,8 +154,8 @@ binding the tree under it.
 
 ## Known gaps
 
-- No D-Bus at all: no notifications, no MPRIS, no XDG portals (so no portal
-  file chooser and no screen sharing).
+- No system bus, no accessibility bus, no document-portal FUSE mount: `dbus`
+  covers the session bus only.
 - No seccomp filter — the sandbox is namespaces and mounts only.
 - No proprietary nvidia driver; `dri` covers the open stack.
 - `/etc/machine-id` is bound in, so every instance shares one stable

@@ -14,9 +14,20 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::bwrap::BwrapArgs;
 use crate::config::{RESERVED_ENV, Service, ShareMode};
+use crate::dbus;
 use crate::env::{Env, SANDBOX_HOME};
 use crate::error::LaunchError;
 use crate::host::Host;
+
+/// What a service needs to know about the instance beyond its config.
+#[derive(Debug, Clone)]
+pub struct ServiceCtx<'a> {
+    /// `$XDG_RUNTIME_DIR/bubbler/<instance>` on the host: where the
+    /// launcher's sidecars put the sockets a service binds.
+    pub instance_runtime: PathBuf,
+    /// The instance name, already validated as `[A-Za-z0-9._-]+`.
+    pub instance: &'a str,
+}
 
 /// Apply every service to `args`. `host` reports the type of a host path
 /// with symlinks followed, so tests run without real sockets. A
@@ -27,6 +38,7 @@ pub fn apply_all(
     env: &Env,
     args: &mut BwrapArgs,
     host: &dyn Host,
+    ctx: &ServiceCtx,
 ) -> Result<(), LaunchError> {
     let has_x11 = services.contains(&Service::X11);
     for s in services {
@@ -39,9 +51,15 @@ pub fn apply_all(
             Service::Pipewire => pipewire(env, args, host)?,
             Service::Pulseaudio => pulseaudio(env, args, host)?,
             Service::EtcShare { name } => etc_share(args, host, name)?,
-            // D-Bus grants are realised by the launcher's proxy step (the
-            // `dbus` module), so they add no bwrap args of their own here.
-            Service::Dbus { .. } | Service::Portals | Service::Notify | Service::Mpris { .. } => {}
+            Service::Dbus { .. } => dbus_socket(env, args, ctx),
+            Service::Portals => args.ro_bind_data(
+                dbus::flatpak_info(ctx.instance, true),
+                Path::new(dbus::FLATPAK_INFO),
+                "0644",
+            ),
+            // Rule-only bundles: they reach the sandbox through the proxy
+            // the launcher starts, not through bwrap arguments.
+            Service::Notify | Service::Mpris { .. } => {}
         }
     }
     Ok(())
@@ -66,7 +84,7 @@ fn require(
 }
 
 /// The source must be a Unix socket; a directory here would bind a tree.
-fn require_socket(
+pub(crate) fn require_socket(
     host: &dyn Host,
     service: &'static str,
     path: PathBuf,
@@ -258,6 +276,22 @@ fn pulseaudio(env: &Env, args: &mut BwrapArgs, host: &dyn Host) -> Result<(), La
     Ok(())
 }
 
+/// Bind the socket the launcher's `xdg-dbus-proxy` serves at the usual
+/// `$XDG_RUNTIME_DIR/bus` and point clients at it. The host bus is never
+/// bound; only the filtered socket is.
+///
+/// The source is not probed here, unlike every other bind: it exists only
+/// once the proxy is ready, which the launcher guarantees by starting it
+/// before this argv is built. A `--dry-run` builds the same argv with no
+/// proxy running at all.
+fn dbus_socket(env: &Env, args: &mut BwrapArgs, ctx: &ServiceCtx) {
+    let inside = env.runtime_dir.join("bus");
+    args.ro_bind(&dbus::bus_path(&ctx.instance_runtime), &inside);
+    let mut address = OsString::from("unix:path=");
+    address.push(inside.as_os_str());
+    args.setenv(OsStr::new("DBUS_SESSION_BUS_ADDRESS"), &address);
+}
+
 /// Emit profile/instance `env` pairs after all service variables, so a
 /// profile can layer toolkit settings on top. A [`RESERVED_ENV`] key is
 /// refused here as well as in the parser, so a caller building an
@@ -372,6 +406,8 @@ mod tests {
             xauthority: Some("/run/user/1000/Xauthority".into()),
             passthrough: vec![],
             init_override: None,
+            dbus_address: None,
+            dbus_log: false,
         }
     }
 
@@ -381,6 +417,13 @@ mod tests {
         existing: &[(&str, Kind)],
     ) -> Result<Vec<String>, LaunchError> {
         argv_linked(services, env, existing, &[])
+    }
+
+    fn ctx() -> ServiceCtx<'static> {
+        ServiceCtx {
+            instance_runtime: "/run/user/1000/bubbler/t".into(),
+            instance: "t",
+        }
     }
 
     fn argv_linked(
@@ -405,7 +448,7 @@ mod tests {
             host = host.link(from, to);
         }
         let mut args = BwrapArgs::baseline(env, Path::new("/i/home"), &host);
-        apply_all(services, env, &mut args, &host)?;
+        apply_all(services, env, &mut args, &host, &ctx())?;
         Ok(strs(&args.finish(
             &[OsString::from("x")],
             &mut crate::launcher::DryRunAlloc::default(),
@@ -841,7 +884,7 @@ mod tests {
         let e = env();
         let mut args = BwrapArgs::baseline(&e, Path::new("/i/home"), &host);
         assert!(matches!(
-            apply_all(&svcs, &e, &mut args, &NoHome(host)),
+            apply_all(&svcs, &e, &mut args, &NoHome(host), &ctx()),
             Err(LaunchError::MissingResource {
                 service: "home-share",
                 ..
@@ -1033,12 +1076,83 @@ mod tests {
     }
 
     #[test]
+    fn dbus_binds_the_proxied_socket_and_points_clients_at_it() {
+        let a = argv(&[Service::Dbus { rules: vec![] }], &env(), &[]).unwrap();
+        assert!(
+            has_seq(
+                &a,
+                &[
+                    "--ro-bind",
+                    "/run/user/1000/bubbler/t/bus",
+                    "/run/user/1000/bus"
+                ]
+            ),
+            "{a:?}"
+        );
+        assert!(
+            has_seq(
+                &a,
+                &[
+                    "--setenv",
+                    "DBUS_SESSION_BUS_ADDRESS",
+                    "unix:path=/run/user/1000/bus"
+                ]
+            ),
+            "{a:?}"
+        );
+        // Only as the bind source: the sandbox sees the socket at the
+        // usual runtime path, not at the instance's directory.
+        assert_eq!(
+            a.iter()
+                .filter(|s| *s == "/run/user/1000/bubbler/t/bus")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn portals_adds_the_flatpak_info_file() {
+        let a = argv(
+            &[Service::Dbus { rules: vec![] }, Service::Portals],
+            &env(),
+            &[],
+        )
+        .unwrap();
+        // Fd 3 is the info pipe, 4 and 5 the baseline passwd and group.
+        assert!(
+            has_seq(
+                &a,
+                &["--perms", "0644", "--ro-bind-data", "6", "/.flatpak-info"]
+            ),
+            "{a:?}"
+        );
+    }
+
+    #[test]
+    fn notify_and_mpris_add_no_bwrap_arguments() {
+        let bare = argv(&[Service::Dbus { rules: vec![] }], &env(), &[]).unwrap();
+        let bundled = argv(
+            &[
+                Service::Dbus { rules: vec![] },
+                Service::Notify,
+                Service::Mpris {
+                    name: "firefox.*".into(),
+                },
+            ],
+            &env(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(bare, bundled);
+    }
+
+    #[test]
     fn env_pairs_are_emitted_after_service_env() {
         let (_, _, sock) = fake::types();
         let host = FakeHost::default().with("/run/user/1000/wayland-1", sock);
         let e = env();
         let mut args = BwrapArgs::baseline(&e, Path::new("/i/home"), &host);
-        apply_all(&[Service::Wayland], &e, &mut args, &host).unwrap();
+        apply_all(&[Service::Wayland], &e, &mut args, &host, &ctx()).unwrap();
         apply_env(&[("MOZ_ENABLE_WAYLAND".into(), "1".into())], &mut args).unwrap();
         let a = strs(
             &args

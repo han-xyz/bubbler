@@ -22,9 +22,9 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use crate::bwrap::{BwrapArgs, FdAllocator};
 use crate::env::Env;
 use crate::error::{ConfigError, LaunchError};
-use crate::host::RealHost;
+use crate::host::{Host, RealHost};
 use crate::instance::Instance;
-use crate::{exec, init_bin, service};
+use crate::{dbus, exec, init_bin, service};
 
 /// How often a running sandbox is checked for having exited.
 const POLL: Duration = Duration::from_millis(100);
@@ -32,6 +32,13 @@ const POLL: Duration = Duration::from_millis(100);
 /// How long the sandbox has to report its pid before the run continues
 /// without being able to shut it down gracefully.
 const INFO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the D-Bus proxy has to report that its socket is up.
+const PROXY_READY: Duration = Duration::from_secs(5);
+
+/// How long a proxy may take to leave after its ready pipe is closed
+/// before it is killed.
+const PROXY_STOP: Duration = Duration::from_secs(1);
 
 /// Allocator for `--dry-run`: numbers every fd 3, 4, ... without creating
 /// anything.
@@ -71,11 +78,13 @@ impl FdAllocator for DryRunAlloc {
 
 /// Allocator for a real run: memfds for data files, the control socket
 /// bubbler already bound, and a sidecar ready pipe.
+#[derive(Debug)]
 pub struct RealAlloc {
     /// Fds bwrap inherits; they stay open until it has been spawned.
     pub fds: Vec<OwnedFd>,
-    /// The listening control socket, already dup'ed without `CLOEXEC`.
-    pub socket: RawFd,
+    /// The listening control socket, already dup'ed without `CLOEXEC`;
+    /// `None` for a sidecar, which serves no exec channel.
+    pub socket: Option<RawFd>,
     /// Read end of the ready pipe, once [`FdAllocator::ready_pipe`] made one.
     pub ready_read: Option<OwnedFd>,
     /// Read end of the info pipe bwrap reports the sandbox pid on.
@@ -90,7 +99,19 @@ impl RealAlloc {
     pub fn new(socket: RawFd) -> Self {
         Self {
             fds: Vec::new(),
-            socket,
+            socket: Some(socket),
+            ready_read: None,
+            info_read: None,
+            info_write: None,
+        }
+    }
+
+    /// Allocate for a sidecar sandbox: data files and a ready pipe, but
+    /// no control socket to hand out.
+    pub fn sidecar() -> Self {
+        Self {
+            fds: Vec::new(),
+            socket: None,
             ready_read: None,
             info_read: None,
             info_write: None,
@@ -116,7 +137,10 @@ impl FdAllocator for RealAlloc {
     }
 
     fn init_socket(&mut self) -> io::Result<OsString> {
-        Ok(OsString::from(self.socket.to_string()))
+        match self.socket {
+            Some(fd) => Ok(OsString::from(fd.to_string())),
+            None => Err(io::Error::other("this sandbox has no control socket")),
+        }
     }
 
     /// The sandboxed sidecar writes the ready byte, so it inherits the
@@ -169,11 +193,142 @@ pub fn build_argv(
 ) -> Result<Vec<OsString>, LaunchError> {
     let command = resolve_command(inst, command)?;
     let host = RealHost;
+    let ctx = service::ServiceCtx {
+        instance_runtime: instance_runtime_dir(env, &inst.name),
+        instance: &inst.name,
+    };
     let mut args = BwrapArgs::baseline(env, &inst.home(), &host);
-    service::apply_all(&inst.config.services, env, &mut args, &host)?;
+    service::apply_all(&inst.config.services, env, &mut args, &host, &ctx)?;
     service::apply_env(&inst.config.env, &mut args)?;
     args.bind_init(&init_bin::locate(env, &host)?);
     args.finish(command, alloc)
+}
+
+/// Complete bwrap argv (without the program name) for the D-Bus proxy
+/// sidecar of one instance. `alloc` keeps the read end of the pipe the
+/// proxy reports readiness on.
+pub fn proxy_argv(
+    env: &Env,
+    plan: &dbus::Plan,
+    host_bus: &Path,
+    dir: &Path,
+    host: &dyn Host,
+    alloc: &mut dyn FdAllocator,
+) -> Result<Vec<OsString>, LaunchError> {
+    let ready = alloc.ready_pipe().map_err(LaunchError::Data)?;
+    let command = dbus::proxy_command(plan, host_bus, dir, env.dbus_log, &ready);
+    let mut args = BwrapArgs::proxy_baseline(host_bus, dir, host);
+    // The proxy reads this to decide it is talking for a sandboxed app;
+    // without `portals` it is only the `[Application]` section.
+    args.ro_bind_data(
+        plan.flatpak_info.clone(),
+        Path::new(dbus::FLATPAK_INFO),
+        "0644",
+    );
+    args.finish_plain(&command, alloc)
+}
+
+/// A running proxy sidecar. Closing the fds it inherited closes its
+/// `--fd` pipe, which is what makes `xdg-dbus-proxy` exit, so the handle
+/// must outlive the sandbox that uses the socket.
+#[derive(Debug)]
+pub struct ProxyHandle {
+    child: Child,
+    /// Holds the write end of the ready pipe and the `/.flatpak-info` fd.
+    alloc: RealAlloc,
+}
+
+impl Drop for ProxyHandle {
+    /// Close the ready pipe so the proxy exits by itself, then reap it;
+    /// a proxy that ignores the closed pipe is killed instead of leaking.
+    fn drop(&mut self) {
+        self.alloc.fds.clear();
+        let deadline = Instant::now() + PROXY_STOP;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) => {}
+            }
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                return;
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+}
+
+/// Wait for the sidecar's ready byte. False when the deadline passes, the
+/// pipe reaches EOF or the child is gone: in each case nothing is
+/// listening on the socket the sandbox is about to bind.
+fn wait_ready(ready: &OwnedFd, child: &mut Child, deadline: Instant) -> bool {
+    let mut byte = [0u8; 1];
+    loop {
+        let slice = Timespec {
+            tv_sec: POLL.as_secs() as Secs,
+            tv_nsec: POLL.subsec_nanos() as Nsecs,
+        };
+        match poll(&mut [PollFd::new(ready, PollFlags::IN)], Some(&slice)) {
+            Ok(0) | Err(_) => {}
+            Ok(_) => match rustix::io::read(ready, &mut byte) {
+                Ok(0) => return false,
+                Ok(_) => return true,
+                Err(Errno::INTR) => {}
+                Err(_) => return false,
+            },
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
+            return false;
+        }
+    }
+}
+
+/// Start the filtering D-Bus proxy for an instance in its own sandbox and
+/// wait for it to report readiness, so the socket exists before the
+/// instance's own bwrap binds it. The returned handle must stay alive for
+/// as long as the sandbox runs.
+pub fn start_proxy(
+    env: &Env,
+    dir: &Path,
+    plan: &dbus::Plan,
+    host: &dyn Host,
+) -> Result<ProxyHandle, LaunchError> {
+    let host_bus = service::require_socket(host, "dbus", dbus::host_bus(env))?;
+    let mut alloc = RealAlloc::sidecar();
+    let argv = proxy_argv(env, plan, &host_bus, dir, host, &mut alloc)?;
+    let child = Command::new("bwrap")
+        .args(&argv)
+        .spawn()
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => LaunchError::BwrapMissing,
+            _ => LaunchError::Spawn(e),
+        })?;
+    // From here on every exit path stops the proxy through the handle.
+    let mut handle = ProxyHandle { child, alloc };
+    // The instance's own bwrap must not inherit these: a second holder of
+    // the ready pipe would keep the proxy alive after the run has ended.
+    for fd in &handle.alloc.fds {
+        fcntl_setfd(fd, FdFlags::CLOEXEC).map_err(|e| LaunchError::Data(e.into()))?;
+    }
+    let ProxyHandle { child, alloc } = &mut handle;
+    let ready = alloc
+        .ready_read
+        .as_ref()
+        .ok_or_else(|| LaunchError::Data(io::Error::other("no ready pipe was allocated")))?;
+    if !wait_ready(ready, child, Instant::now() + PROXY_READY) {
+        return Err(LaunchError::ProxyNotReady);
+    }
+    Ok(handle)
+}
+
+/// `$XDG_RUNTIME_DIR/bubbler/<name>`: an instance's runtime state on the
+/// host. `name` is an instance name the caller has already validated.
+pub fn instance_runtime_dir(env: &Env, name: &str) -> PathBuf {
+    env.runtime_dir.join("bubbler").join(name)
 }
 
 /// Create `dir` with mode 0700, tolerating one that already exists. Only
@@ -194,9 +349,8 @@ pub fn prepare_runtime_dir(env: &Env, inst: &Instance) -> Result<PathBuf, Launch
     // narrowed afterwards; a missing $XDG_RUNTIME_DIR is created, but its
     // parent is not, since that would mean the session has no runtime dir.
     mkdir_private(&env.runtime_dir)?;
-    let root = env.runtime_dir.join("bubbler");
-    mkdir_private(&root)?;
-    let dir = root.join(&inst.name);
+    mkdir_private(&env.runtime_dir.join("bubbler"))?;
+    let dir = instance_runtime_dir(env, &inst.name);
     mkdir_private(&dir)?;
     Ok(dir)
 }
@@ -337,6 +491,12 @@ pub fn run(env: &Env, inst: &Instance, command: Option<&[OsString]>) -> Result<i
     // bwrap must inherit exactly this one fd; everything else stays CLOEXEC.
     fcntl_setfd(&inherited, FdFlags::empty()).map_err(io_at)?;
     let mut alloc = RealAlloc::new(inherited.as_raw_fd());
+    // Before the argv is built, so the proxy's socket is there for bwrap
+    // to bind: a missing bind source is a failed start, not a warning.
+    let _proxy = match dbus::plan(&inst.config.services, &inst.name) {
+        Some(plan) => Some(start_proxy(env, &dir, &plan, &RealHost)?),
+        None => None,
+    };
     let argv = build_argv(env, inst, command, &mut alloc)?;
     let stop = Arc::new(AtomicBool::new(false));
     let mut registered = SignalGuard(Vec::new());
@@ -412,6 +572,8 @@ mod tests {
             xauthority: None,
             passthrough: vec![],
             init_override: Some(init),
+            dbus_address: None,
+            dbus_log: false,
         }
     }
 
@@ -551,6 +713,122 @@ mod tests {
             exec(&e, "t", &[OsString::from("/usr/bin/true")]),
             Err(LaunchError::NotRunning(n)) if n == "t"
         ));
+    }
+
+    #[test]
+    fn proxy_argv_runs_the_proxy_in_its_own_sandbox() {
+        use crate::config::Service;
+        use crate::host::fake::FakeHost;
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let plan = dbus::plan(&[Service::Dbus { rules: vec![] }, Service::Notify], "t")
+            .expect("dbus is granted");
+        let argv = proxy_argv(
+            &e,
+            &plan,
+            Path::new("/run/user/1000/bus"),
+            Path::new("/run/user/1000/bubbler/t"),
+            &FakeHost::default(),
+            &mut DryRunAlloc::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            strs(&argv),
+            vec![
+                "--unshare-all",
+                "--die-with-parent",
+                "--new-session",
+                "--ro-bind",
+                "/usr",
+                "/usr",
+                "--symlink",
+                "usr/bin",
+                "/bin",
+                "--symlink",
+                "usr/lib",
+                "/lib",
+                "--symlink",
+                "usr/lib64",
+                "/lib64",
+                "--symlink",
+                "usr/bin",
+                "/sbin",
+                "--tmpfs",
+                "/etc",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--tmpfs",
+                "/tmp",
+                "--ro-bind",
+                "/run/user/1000/bus",
+                "/run/user/1000/bus",
+                "--bind",
+                "/run/user/1000/bubbler/t",
+                "/run/user/1000/bubbler/t",
+                "--perms",
+                "0644",
+                "--ro-bind-data",
+                "4",
+                "/.flatpak-info",
+                "--clearenv",
+                "--",
+                "xdg-dbus-proxy",
+                "--fd=3",
+                "unix:path=/run/user/1000/bus",
+                "/run/user/1000/bubbler/t/bus",
+                "--filter",
+                "--talk=org.freedesktop.Notifications",
+            ]
+        );
+    }
+
+    #[test]
+    fn proxy_argv_logs_only_when_asked() {
+        use crate::config::Service;
+        use crate::host::fake::FakeHost;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut e = env(tmp.path());
+        e.dbus_log = true;
+        let plan = dbus::plan(&[Service::Dbus { rules: vec![] }], "t").expect("dbus is granted");
+        let argv = strs(
+            &proxy_argv(
+                &e,
+                &plan,
+                Path::new("/run/user/1000/bus"),
+                Path::new("/run/user/1000/bubbler/t"),
+                &FakeHost::default(),
+                &mut DryRunAlloc::default(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(&argv[argv.len() - 2..], &["--filter", "--log"]);
+    }
+
+    #[test]
+    fn a_dbus_instance_binds_the_proxied_socket_in_a_dry_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let i = inst(tmp.path(), "dbus\nportals\ncommand \"x\"");
+        let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default()).unwrap());
+        let bus = tmp.path().join("run/bubbler/t/bus").display().to_string();
+        let inside = tmp.path().join("run/bus").display().to_string();
+        assert!(
+            a.windows(3)
+                .any(|w| w == ["--ro-bind", bus.as_str(), inside.as_str()]),
+            "{a:?}"
+        );
+        assert!(
+            a.windows(3).any(|w| w
+                == [
+                    "--setenv",
+                    "DBUS_SESSION_BUS_ADDRESS",
+                    format!("unix:path={inside}").as_str()
+                ]),
+            "{a:?}"
+        );
+        assert!(a.contains(&"/.flatpak-info".to_string()), "{a:?}");
     }
 
     #[test]

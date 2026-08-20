@@ -120,6 +120,10 @@ pub enum LaunchError {
     /// Spawning `bwrap` failed for a reason other than it being missing.
     #[error("failed to run bwrap")]
     Spawn(#[source] io::Error),
+    /// The D-Bus proxy did not report readiness in time, so the sandbox
+    /// would have started without the bus socket it expects.
+    #[error("the D-Bus proxy did not become ready")]
+    ProxyNotReady,
     /// Nothing listens on the instance's control socket.
     #[error("instance `{0}` is not running")]
     NotRunning(String),

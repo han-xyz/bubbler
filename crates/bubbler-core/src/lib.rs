@@ -3,6 +3,7 @@
 
 pub mod bwrap;
 pub mod config;
+pub mod dbus;
 pub mod env;
 pub mod error;
 pub mod exec;

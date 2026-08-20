@@ -199,6 +199,8 @@ mod tests {
             xauthority: None,
             passthrough: vec![],
             init_override: None,
+            dbus_address: None,
+            dbus_log: false,
         }
     }
 

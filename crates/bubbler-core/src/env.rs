@@ -48,6 +48,12 @@ pub struct Env {
     /// `$BUBBLER_INIT`: host path of the `bubbler-init` binary to bind
     /// into the sandbox, overriding the usual search.
     pub init_override: Option<PathBuf>,
+    /// `$DBUS_SESSION_BUS_ADDRESS` as the host set it; only a
+    /// `unix:path=` address names a socket bubbler can proxy.
+    pub dbus_address: Option<OsString>,
+    /// `$BUBBLER_DBUS_LOG=1`: run the D-Bus proxy with `--log`, which
+    /// prints every filtered message to bubbler's stderr.
+    pub dbus_log: bool,
 }
 
 #[cfg(test)]
