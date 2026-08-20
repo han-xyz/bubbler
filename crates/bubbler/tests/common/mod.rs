@@ -20,6 +20,20 @@ pub fn require_bwrap() -> bool {
     has_bwrap && has_userns
 }
 
+/// Interpreter the fake `xdg-dbus-proxy` fixtures are written in; their
+/// shebang names this exact path.
+pub const PYTHON: &str = "/usr/bin/python3";
+
+/// Returns false (after printing why) when the fake-proxy fixtures cannot
+/// run here, because that interpreter is not installed.
+pub fn require_python() -> bool {
+    let ok = Path::new(PYTHON).is_file();
+    if !ok {
+        eprintln!("skipping: {PYTHON} is not installed");
+    }
+    ok
+}
+
 /// The `bubbler-init` binary cargo builds next to the `bubbler` binary,
 /// if it is there. `cargo test --workspace` builds it as a workspace
 /// member; `cargo test -p bubbler` does not, so tests that need the real

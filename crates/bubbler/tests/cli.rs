@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use bubbler_core::bwrap::ETC_ALLOWLIST;
 use common::{
     bubbler, bubbler_dbus, bubbler_live, real_init, require_bwrap, require_dbus, require_portal,
+    require_python,
 };
 use rustix::process::{Pid, Signal, kill_process};
 
@@ -788,7 +789,7 @@ while time.time() < deadline:
 
 #[test]
 fn a_proxy_racing_its_own_socket_never_gets_a_symlink_bound() {
-    if !require_bwrap() {
+    if !require_bwrap() || !require_python() {
         return;
     }
     let Some(init) = real_init() else { return };
@@ -845,7 +846,104 @@ fn a_proxy_racing_its_own_socket_never_gets_a_symlink_bound() {
             "run {i} left the moved entry behind"
         );
     }
-    assert!(ran + refused == 30, "{ran} ran, {refused} refused");
+    // Both outcomes have to occur, or the race was never run at all.
+    assert!(ran > 0 && refused > 0, "{ran} ran, {refused} refused");
+}
+
+/// A stand-in for `xdg-dbus-proxy` that puts a non-empty directory where
+/// its socket belongs, which cannot be unlinked as a file.
+fn directory_proxy(path: &Path) {
+    write_script(
+        path,
+        "#!/bin/sh\nmkdir -p \"$3\"\n: > \"$3/x\"\neval \"echo r >&${1#--fd=}\"\nexec sleep 5\n",
+    );
+}
+
+/// A stand-in for `xdg-dbus-proxy` that does the honest thing: bind a
+/// socket, report ready, and leave when the ready pipe closes.
+fn honest_proxy(path: &Path) {
+    write_script(
+        path,
+        r#"#!/usr/bin/python3
+import os, select, socket, sys, time
+fd = int(sys.argv[1].split("=", 1)[1])
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[3])
+s.listen(8)
+os.write(fd, b"r")
+poller = select.poll()
+poller.register(fd, 0)
+deadline = time.time() + 15
+while time.time() < deadline and not poller.poll(20):
+    pass
+"#,
+    );
+}
+
+#[test]
+fn a_directory_left_at_the_socket_path_does_not_wedge_the_instance() {
+    if !require_bwrap() || !require_python() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let bus = tmp.path().join("fakebus");
+    let _listener = UnixListener::bind(&bus).unwrap();
+    let planting = tmp.path().join("dir-proxy");
+    directory_proxy(&planting);
+    let honest = tmp.path().join("honest-proxy");
+    honest_proxy(&honest);
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["create", "wedge"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/wedge/config.kdl"),
+        "dbus\n",
+    )
+    .unwrap();
+    let run = |proxy: &Path| {
+        bubbler_live(tmp.path(), &init)
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}", bus.display()),
+            )
+            .env("BUBBLER_DBUS_PROXY", proxy)
+            .args([
+                "run",
+                "wedge",
+                "--",
+                "/usr/bin/sh",
+                "-c",
+                r#"test -S "$XDG_RUNTIME_DIR/bus""#,
+            ])
+            .output()
+            .unwrap()
+    };
+
+    let out = run(&planting);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("a socket"), "{err}");
+    let left: Vec<_> = std::fs::read_dir(tmp.path().join("run/bubbler/wedge"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "the refused run left {left:?}");
+
+    // The name has to be free again: renaming a socket onto a directory
+    // fails, so a leftover would fail every later start.
+    let out = run(&honest);
+    assert!(
+        out.status.success(),
+        "the instance stayed wedged: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]

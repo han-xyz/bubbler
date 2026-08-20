@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rustix::event::{Nsecs, PollFd, PollFlags, Secs, Timespec, poll};
-use rustix::fs::{MemfdFlags, Mode, OFlags};
+use rustix::fs::{AtFlags, MemfdFlags, Mode, OFlags};
 use rustix::io::{Errno, FdFlags, fcntl_dupfd_cloexec, fcntl_setfd};
 use rustix::process::{Pid, Signal, kill_process, test_kill_process};
 use signal_hook::SigId;
@@ -433,10 +433,24 @@ fn adopt_proxy_bus(dir: &Path) -> Result<FileGuard, LaunchError> {
         e => LaunchError::Io(path.clone(), e.into()),
     })?;
     let stat = rustix::fs::fstat(&bus).map_err(|e| LaunchError::Io(path.clone(), e.into()))?;
-    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Socket {
+    let kind = rustix::fs::FileType::from_raw_mode(stat.st_mode);
+    if kind != rustix::fs::FileType::Socket {
+        // A directory cannot be unlinked as a file, and one left at this
+        // name would fail the rename of every later start of the instance.
+        if kind == rustix::fs::FileType::Directory {
+            remove_moved_dir(&to, &path);
+        }
         return Err(wrong_type());
     }
     Ok(guard)
+}
+
+/// Remove a directory the proxy planted where its socket belongs. Whatever
+/// it holds goes with it: after the move nothing but bubbler can reach it.
+fn remove_moved_dir(inst: &OwnedFd, path: &Path) {
+    if rustix::fs::unlinkat(inst, "bus", AtFlags::REMOVEDIR).is_err() {
+        let _ = std::fs::remove_dir_all(path);
+    }
 }
 
 /// `$XDG_RUNTIME_DIR/bubbler/<name>`: an instance's runtime state on the
@@ -1276,6 +1290,24 @@ mod tests {
             })
         ));
         assert!(!dbus::app_bus_path(dir).exists());
+        // A directory is refused like anything else, and removed with what
+        // is in it: `remove_file` cannot take one, and one left at this
+        // name would fail the rename of every later start.
+        std::fs::create_dir(dbus::proxy_bus_path(dir)).unwrap();
+        std::fs::write(dbus::proxy_bus_path(dir).join("x"), b"").unwrap();
+        assert!(matches!(
+            adopt_proxy_bus(dir),
+            Err(LaunchError::WrongType {
+                service: "dbus",
+                expected: "a socket",
+                ..
+            })
+        ));
+        assert!(!dbus::app_bus_path(dir).exists(), "the directory was kept");
+        // And the next honest start works.
+        let listener = UnixListener::bind(dbus::proxy_bus_path(dir)).unwrap();
+        adopt_proxy_bus(dir).expect("a socket after a refused directory");
+        drop(listener);
     }
 
     /// A pid no process has: a child that has already been reaped.
