@@ -556,7 +556,8 @@ mod tests {
     #[test]
     fn keep_as_turns_a_try_into_an_instance() {
         let tmp = tempfile::tempdir().unwrap();
-        let env = env(tmp.path());
+        let mut env = env(tmp.path());
+        env.runtime_dir = tmp.path().join("run");
         {
             let mut eph = Instance::ephemeral(&env, "generic", &[]).unwrap();
             assert!(matches!(
@@ -578,7 +579,8 @@ mod tests {
     #[test]
     fn grants_are_checked_and_deduplicated() {
         let tmp = tempfile::tempdir().unwrap();
-        let env = env(tmp.path());
+        let mut env = env(tmp.path());
+        env.runtime_dir = tmp.path().join("run");
         let err = Instance::ephemeral(&env, "generic", &["bogus"]).unwrap_err();
         assert!(matches!(err, InstanceError::InvalidGrant(_)));
         assert!(err.to_string().contains("wayland"), "{err}");

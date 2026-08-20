@@ -29,6 +29,11 @@ mod tests {
 
         let ff = crate::config::parse(lookup("firefox").unwrap()).unwrap();
         assert!(ff.services.contains(&crate::config::Service::Dri));
+        assert!(ff.services.contains(&crate::config::Service::Portals));
+        assert!(ff.services.iter().any(|s| matches!(
+            s,
+            crate::config::Service::Mpris { name } if name == "firefox.*"
+        )));
         assert!(
             ff.env
                 .contains(&("MOZ_ENABLE_WAYLAND".to_owned(), "1".to_owned()))
