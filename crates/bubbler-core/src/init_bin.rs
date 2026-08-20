@@ -1,10 +1,11 @@
 //! Where the host copy of `bubbler-init` is. Every sandbox runs under it,
 //! so a run that cannot find it fails before bwrap is spawned.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::env::Env;
 use crate::error::LaunchError;
+use crate::host::Host;
 
 /// File name of the supervisor binary.
 pub const NAME: &str = "bubbler-init";
@@ -12,14 +13,20 @@ pub const NAME: &str = "bubbler-init";
 /// Where a packaged bubbler installs the supervisor.
 pub const INSTALLED: &str = "/usr/lib/bubbler/bubbler-init";
 
-fn is_regular_file(p: &Path) -> bool {
-    std::fs::metadata(p).is_ok_and(|m| m.is_file())
-}
-
-fn missing(path: PathBuf) -> LaunchError {
-    LaunchError::MissingResource {
-        service: "init",
-        path,
+/// `Ok` for a regular file, `WrongType` for anything else that exists and
+/// `MissingResource` for nothing at all.
+fn check(path: PathBuf, host: &dyn Host) -> Result<PathBuf, LaunchError> {
+    match host.file_type(&path) {
+        Some(t) if t.is_file() => Ok(path),
+        Some(_) => Err(LaunchError::WrongType {
+            service: "init",
+            path,
+            expected: "a regular file",
+        }),
+        None => Err(LaunchError::MissingResource {
+            service: "init",
+            path,
+        }),
     }
 }
 
@@ -27,32 +34,25 @@ fn missing(path: PathBuf) -> LaunchError {
 /// else next to the running executable, else [`INSTALLED`]. Must be a
 /// regular file; an override that is not one is an error, never a
 /// silent fallback to another binary.
-pub fn locate(env: &Env) -> Result<PathBuf, LaunchError> {
+pub fn locate(env: &Env, host: &dyn Host) -> Result<PathBuf, LaunchError> {
     if let Some(p) = &env.init_override {
-        return if is_regular_file(p) {
-            Ok(p.clone())
-        } else {
-            Err(missing(p.clone()))
-        };
+        return check(p.clone(), host);
     }
     if let Some(sibling) = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join(NAME)))
-        && is_regular_file(&sibling)
+        && host.file_type(&sibling).is_some_and(|t| t.is_file())
     {
         return Ok(sibling);
     }
-    let installed = PathBuf::from(INSTALLED);
-    if is_regular_file(&installed) {
-        Ok(installed)
-    } else {
-        Err(missing(installed))
-    }
+    check(PathBuf::from(INSTALLED), host)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::fake::{FakeHost, types};
+    use std::path::Path;
 
     fn env(init_override: Option<PathBuf>) -> Env {
         Env {
@@ -71,19 +71,24 @@ mod tests {
 
     #[test]
     fn an_override_wins_and_must_be_a_regular_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bin = tmp.path().join(NAME);
-        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
-        assert_eq!(locate(&env(Some(bin.clone()))).unwrap(), bin);
-
-        let dir = tmp.path().join("d");
-        std::fs::create_dir(&dir).unwrap();
+        let (file, dir, _) = types();
+        let host = FakeHost::default()
+            .with("/opt/bubbler-init", file)
+            .with("/opt/adir", dir);
+        assert_eq!(
+            locate(&env(Some("/opt/bubbler-init".into())), &host).unwrap(),
+            PathBuf::from("/opt/bubbler-init")
+        );
         assert!(matches!(
-            locate(&env(Some(dir.clone()))),
-            Err(LaunchError::MissingResource { service: "init", path }) if path == dir
+            locate(&env(Some("/opt/adir".into())), &host),
+            Err(LaunchError::WrongType {
+                service: "init",
+                expected: "a regular file",
+                ..
+            })
         ));
         assert!(matches!(
-            locate(&env(Some(tmp.path().join("nope")))),
+            locate(&env(Some("/opt/gone".into())), &host),
             Err(LaunchError::MissingResource {
                 service: "init",
                 ..
@@ -92,19 +97,27 @@ mod tests {
     }
 
     #[test]
-    fn without_an_override_the_sibling_of_the_test_binary_is_searched_first() {
-        // The test binary lives in `target/debug/deps/`, so this is the
-        // same rule the installed `bubbler` uses for its own directory.
+    fn without_an_override_the_installed_path_is_the_last_resort() {
+        let (file, _, _) = types();
+        let host = FakeHost::default().with(INSTALLED, file);
+        assert_eq!(locate(&env(None), &host).unwrap(), PathBuf::from(INSTALLED));
+        assert!(matches!(
+            locate(&env(None), &FakeHost::default()),
+            Err(LaunchError::MissingResource { service: "init", path }) if path == Path::new(INSTALLED)
+        ));
+    }
+
+    #[test]
+    fn a_sibling_of_the_running_binary_is_preferred_over_the_installed_one() {
+        let (file, _, _) = types();
         let sibling = std::env::current_exe()
-            .ok()
-            .and_then(|e| e.parent().map(|d| d.join(NAME)));
-        match locate(&env(None)) {
-            Ok(p) => assert!(Some(&p) == sibling.as_ref() || p == Path::new(INSTALLED)),
-            Err(LaunchError::MissingResource { path, .. }) => {
-                assert_eq!(path, Path::new(INSTALLED));
-                assert!(sibling.is_none_or(|s| !is_regular_file(&s)));
-            }
-            Err(e) => panic!("{e}"),
-        }
+            .expect("a test binary has a path")
+            .parent()
+            .expect("and a directory")
+            .join(NAME);
+        let host = FakeHost::default()
+            .with(&sibling.to_string_lossy(), file)
+            .with(INSTALLED, file);
+        assert_eq!(locate(&env(None), &host).unwrap(), sibling);
     }
 }

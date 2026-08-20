@@ -34,7 +34,15 @@ reach the path. `run` on an instance that is already running says so and
 execs into it instead of starting a second sandbox; configuration changes
 apply on the next start. An exec'd process is given bubbler's own stdin,
 stdout and stderr, so the channel is for tooling and debugging, not an extra
-boundary. `SIGINT` and `SIGTERM` are forwarded to the sandbox once.
+boundary.
+
+`SIGINT` and `SIGTERM` sent to `bubbler` are passed on once, as `SIGTERM`, to
+`bubbler-init` inside the sandbox — bwrap forwards no signals of its own, so
+its `--info-fd` is used to find the supervisor. The supervisor signals the
+command and every exec'd process, waits five seconds, and `SIGKILL`s whatever
+is left; the command's own exit status is what `bubbler` returns. If the
+supervisor cannot be found the signal goes to `bwrap` instead, and the sandbox
+is torn down by `--die-with-parent`, which is the backstop in any case.
 
 `edit` runs `$VISUAL`, else `$EDITOR`, split on whitespace into an argv with
 the config path appended — there is no shell, so quotes and `$VAR` in those

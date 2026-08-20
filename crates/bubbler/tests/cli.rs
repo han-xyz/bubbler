@@ -45,6 +45,7 @@ fn create_list_and_dry_run() {
     // Which allowlisted `/etc` entries exist is a property of this host, so
     // only the parts around them are exact.
     let expected_prefix = "bwrap\n--unshare-all\n--die-with-parent\n--new-session\n--hostname\nbubbler\n--chdir\n/home/bubbler\n\
+         --info-fd\n3\n\
          --ro-bind\n/usr\n/usr\n--symlink\nusr/bin\n/bin\n--symlink\nusr/lib\n/lib\n\
          --symlink\nusr/lib64\n/lib64\n--symlink\nusr/bin\n/sbin\n\
          --ro-bind-try\n/opt\n/opt\n--tmpfs\n/etc\n";
@@ -54,7 +55,7 @@ fn create_list_and_dry_run() {
          --ro-bind\n{init}\n/run/bubbler-init\n--clearenv\n--setenv\nTERM\ndumb\n\
          --setenv\nHOME\n/home/bubbler\n--setenv\nPATH\n/usr/bin\n--setenv\nXDG_RUNTIME_DIR\n{run}\n\
          --setenv\nUSER\nbubbler\n--setenv\nLOGNAME\nbubbler\n\
-         --\n/run/bubbler-init\n--socket-fd\n5\n--\n/usr/bin/true\n",
+         --\n/run/bubbler-init\n--socket-fd\n6\n--\n/usr/bin/true\n",
         home = home.display(),
         run = run.display(),
         init = tmp.path().join("bubbler-init").display()
@@ -62,11 +63,11 @@ fn create_list_and_dry_run() {
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.starts_with(expected_prefix), "{s}");
     assert!(
-        s.contains("--perms\n0644\n--ro-bind-data\n3\n/etc/passwd\n"),
+        s.contains("--perms\n0644\n--ro-bind-data\n4\n/etc/passwd\n"),
         "{s}"
     );
     assert!(
-        s.contains("--perms\n0644\n--ro-bind-data\n4\n/etc/group\n"),
+        s.contains("--perms\n0644\n--ro-bind-data\n5\n/etc/group\n"),
         "{s}"
     );
     assert!(s.ends_with(&expected_suffix), "{s}");
@@ -384,6 +385,61 @@ fn real_bwrap_exec_round_trip() {
     assert_eq!(out.status.code(), Some(1));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("not running"), "{err}");
+}
+
+#[test]
+fn real_bwrap_sigterm_reaches_the_command_inside() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    // `sleep` runs in the background and the shell waits for it: a POSIX
+    // shell only runs a trap once the foreground command has finished, so
+    // a foreground sleep would hide the forwarded signal until it ended.
+    let run = bubbler_live(tmp.path(), &init)
+        .args([
+            "run",
+            "t",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            "trap 'echo got; exit 7' TERM; /usr/bin/sleep 30 & wait",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let sock = tmp.path().join("run/bubbler/t/init.sock");
+    if !wait_until(
+        || UnixStream::connect(&sock).is_ok(),
+        Duration::from_secs(10),
+    ) {
+        fail_with(run, "the instance never accepted a connection");
+    }
+
+    let sent = Instant::now();
+    kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
+    let out = run.wait_with_output().expect("waiting for the run process");
+    // The command's own exit code, not 143: the signal reached it through
+    // the supervisor rather than killing the sandbox from outside.
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "got\n");
+    assert!(
+        sent.elapsed() < Duration::from_secs(2),
+        "the command took {:?} to see the signal",
+        sent.elapsed()
+    );
+    assert!(!sock.exists(), "the control socket outlived the run");
 }
 
 #[test]

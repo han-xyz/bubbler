@@ -23,13 +23,16 @@ enum Item {
         dest: PathBuf,
         mode: OsString,
     },
+    /// `--info-fd` with the fd the allocator opens at `finish` time.
+    InfoFd,
 }
 
 /// Where the `bubbler-init` supervisor is bound inside every sandbox.
-/// Not under `/usr`: that is a read-only bind of the host `/usr` and bwrap
-/// cannot create a mount point in it ("Can't mkdir parents for
-/// /usr/lib/bubbler/bubbler-init: Read-only file system", bubblewrap
-/// 0.11.2), while `/run` is a tmpfs this builder creates itself.
+/// `/run` is a tmpfs this builder creates, so the bind works whether or
+/// not bubbler is installed on the host.
+// Not under `/usr`: that is a read-only bind of the host `/usr`, and bwrap
+// 0.11.2 refuses a destination in it ("Can't mkdir parents for
+// /usr/lib/bubbler/bubbler-init: Read-only file system").
 pub const INIT_INSIDE: &str = "/run/bubbler-init";
 
 /// Turns generated content and channels into the fd numbers bwrap is told
@@ -41,6 +44,8 @@ pub trait FdAllocator {
     fn init_socket(&mut self) -> io::Result<OsString>;
     /// Fd a sidecar reports readiness on; the allocator keeps the other end.
     fn ready_pipe(&mut self) -> io::Result<OsString>;
+    /// Fd bwrap reports the sandbox pid on; the allocator keeps the read end.
+    fn info_pipe(&mut self) -> io::Result<OsString>;
 }
 
 /// Ordered, phase-separated bubblewrap arguments.
@@ -111,7 +116,8 @@ impl BwrapArgs {
     /// empty `$XDG_RUNTIME_DIR` at the same path as on the host and mode
     /// 0700 (`--perms` applies to the next operation only, so it must
     /// immediately precede `--dir`), the private home as the working
-    /// directory, cleared environment with only locale/terminal
+    /// directory, an `--info-fd` the sandbox pid is reported on, cleared
+    /// environment with only locale/terminal
     /// passthrough and the fixed user name. Services relax
     /// this explicitly. `--unshare-all` uses bwrap's `-try` semantics for
     /// the user namespace (`bwrap(1)`), so on a host without unprivileged
@@ -141,6 +147,9 @@ impl BwrapArgs {
                 o(SANDBOX_HOME),
             ],
         );
+        // bwrap reports the sandbox pid here; the launcher needs it to
+        // signal the supervisor, since bwrap forwards no signals itself.
+        a.namespaces.push(Item::InfoFd);
 
         push(&mut a.skeleton, [o("--ro-bind"), o("/usr"), o("/usr")]);
         for (target, link) in [
@@ -322,6 +331,10 @@ impl BwrapArgs {
                         dest.into_os_string(),
                     ]);
                 }
+                Item::InfoFd => {
+                    let fd = alloc.info_pipe().map_err(LaunchError::Data)?;
+                    out.extend(["--info-fd".into(), fd]);
+                }
             }
         }
         let socket = alloc.init_socket().map_err(LaunchError::Data)?;
@@ -386,6 +399,9 @@ mod tests {
         fn ready_pipe(&mut self) -> io::Result<OsString> {
             self.bump()
         }
+        fn info_pipe(&mut self) -> io::Result<OsString> {
+            self.bump()
+        }
     }
 
     /// Counter that also keeps every data payload it was handed.
@@ -405,6 +421,9 @@ mod tests {
         fn ready_pipe(&mut self) -> io::Result<OsString> {
             self.next.bump()
         }
+        fn info_pipe(&mut self) -> io::Result<OsString> {
+            self.next.bump()
+        }
     }
 
     struct Failing;
@@ -417,6 +436,9 @@ mod tests {
             Err(io::Error::other("nope"))
         }
         fn ready_pipe(&mut self) -> io::Result<OsString> {
+            Err(io::Error::other("nope"))
+        }
+        fn info_pipe(&mut self) -> io::Result<OsString> {
             Err(io::Error::other("nope"))
         }
     }
@@ -441,6 +463,8 @@ mod tests {
                 "bubbler",
                 "--chdir",
                 "/home/bubbler",
+                "--info-fd",
+                "3",
                 "--ro-bind",
                 "/usr",
                 "/usr",
@@ -464,12 +488,12 @@ mod tests {
                 "--perms",
                 "0644",
                 "--ro-bind-data",
-                "3",
+                "4",
                 "/etc/passwd",
                 "--perms",
                 "0644",
                 "--ro-bind-data",
-                "4",
+                "5",
                 "/etc/group",
                 "--proc",
                 "/proc",
@@ -510,7 +534,7 @@ mod tests {
                 "--",
                 "/run/bubbler-init",
                 "--socket-fd",
-                "5",
+                "6",
                 "--",
                 "/usr/bin/true",
             ]
@@ -543,11 +567,11 @@ mod tests {
         assert!(pos("/etc/hosts") > pos("--tmpfs"));
         assert!(
             s.windows(5)
-                .any(|w| w == ["--perms", "0644", "--ro-bind-data", "3", "/etc/passwd"])
+                .any(|w| w == ["--perms", "0644", "--ro-bind-data", "4", "/etc/passwd"])
         );
         assert!(
             s.windows(5)
-                .any(|w| w == ["--perms", "0644", "--ro-bind-data", "4", "/etc/group"])
+                .any(|w| w == ["--perms", "0644", "--ro-bind-data", "5", "/etc/group"])
         );
         assert!(pos("/etc/passwd") < pos("--proc"));
         assert!(s.windows(3).any(|w| w == ["--setenv", "USER", "bubbler"]));
@@ -614,14 +638,14 @@ mod tests {
         let argv = args.finish(&["sh".into()], &mut rec).unwrap();
         let seen = rec.seen;
         let s = strs(&argv);
-        // Fds 3 and 4 went to the baseline passwd and group.
+        // Fd 3 went to the info pipe, 4 and 5 to the baseline passwd and group.
         assert!(
             s.windows(5)
-                .any(|w| w == ["--perms", "0644", "--ro-bind-data", "5", "/etc/x"])
+                .any(|w| w == ["--perms", "0644", "--ro-bind-data", "6", "/etc/x"])
         );
         assert!(
             s.windows(5)
-                .any(|w| w == ["--perms", "0600", "--ro-bind-data", "6", "/etc/y"])
+                .any(|w| w == ["--perms", "0600", "--ro-bind-data", "7", "/etc/y"])
         );
         assert_eq!(seen[2..], [b"hello".to_vec(), b"world".to_vec()]);
     }
@@ -640,10 +664,10 @@ mod tests {
             .finish(&["sh".into()], &mut Counter::new())
             .unwrap();
         let s = strs(&argv);
-        // Fds 3 and 4 went to the baseline passwd and group.
+        // Fd 3 went to the info pipe, 4 and 5 to the baseline passwd and group.
         assert_eq!(
             &s[s.len() - 6..],
-            &["--", INIT_INSIDE, "--socket-fd", "5", "--", "sh"]
+            &["--", INIT_INSIDE, "--socket-fd", "6", "--", "sh"]
         );
     }
 

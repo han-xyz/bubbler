@@ -57,7 +57,12 @@ pub fn run_in(stream: &UnixStream, argv: &[OsString]) -> Result<i32, LaunchError
         [stdin.as_fd(), stdout.as_fd(), stderr.as_fd()],
     )
     .map_err(|e| LaunchError::Protocol(e.to_string()))?;
-    let raw = wire::recv_status(stream).map_err(|e| LaunchError::Protocol(e.to_string()))?;
+    let raw = wire::recv_status(stream).map_err(|e| match e.kind() {
+        io::ErrorKind::UnexpectedEof => {
+            LaunchError::Protocol("the instance stopped while the command was running".into())
+        }
+        _ => LaunchError::Protocol(e.to_string()),
+    })?;
     Ok(exit_code(ExitStatus::from_raw(raw)))
 }
 
