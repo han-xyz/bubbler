@@ -5,3 +5,4 @@ pub mod bwrap;
 pub mod config;
 pub mod env;
 pub mod error;
+pub mod service;
