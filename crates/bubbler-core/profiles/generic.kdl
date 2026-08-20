@@ -1,0 +1,7 @@
+// bubbler profile: generic
+// Baseline sandbox only. Add grants below, e.g.:
+//   wayland
+//   network
+//   home-share "Downloads"
+// and a default command:
+//   command "foot"
