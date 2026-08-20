@@ -39,6 +39,9 @@ pub fn apply_all(
             Service::Pipewire => pipewire(env, args, host)?,
             Service::Pulseaudio => pulseaudio(env, args, host)?,
             Service::EtcShare { name } => etc_share(args, host, name)?,
+            // D-Bus grants are realised by the launcher's proxy step (the
+            // `dbus` module), so they add no bwrap args of their own here.
+            Service::Dbus { .. } | Service::Portals | Service::Notify | Service::Mpris { .. } => {}
         }
     }
     Ok(())

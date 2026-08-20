@@ -41,6 +41,25 @@ pub enum ShareMode {
     ReadWrite,
 }
 
+/// One rule for the filtering D-Bus proxy. `See`, `Talk` and `Own` are the
+/// three policy levels for a well-known name; `Call` and `Broadcast` pair a
+/// name with an `[METHOD][@PATH]` rule narrowing it to single methods,
+/// signals or object subtrees (`xdg-dbus-proxy(1)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BusRule {
+    /// The name is visible: it shows up in `ListNames` and its owner
+    /// changes are delivered.
+    See(String),
+    /// Method calls and signals may be sent to the name; implies `See`.
+    Talk(String),
+    /// The sandbox may request the name; implies `Talk`.
+    Own(String),
+    /// Calls to the name are allowed for one rule only.
+    Call(String, String),
+    /// Broadcast signals from the name are received for one rule only.
+    Broadcast(String, String),
+}
+
 /// One granted resource. Order in the config file is irrelevant; the
 /// builder's phases decide argv order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +93,24 @@ pub enum Service {
         /// Entry name directly under `/etc`.
         name: OsString,
     },
+    /// A session bus filtered by an `xdg-dbus-proxy` sidecar: the sandbox
+    /// reaches only what `rules` allow, never the host bus itself.
+    Dbus {
+        /// Proxy filter rules, in file order; repeats are harmless.
+        rules: Vec<BusRule>,
+    },
+    /// The XDG desktop portal rule bundle plus the `/.flatpak-info` file
+    /// portals read to identify the sandbox. Requires [`Service::Dbus`].
+    Portals,
+    /// Talk to `org.freedesktop.Notifications`. Requires [`Service::Dbus`].
+    Notify,
+    /// Own `org.mpris.MediaPlayer2.<name>` so media keys and player
+    /// controls reach the app. Requires [`Service::Dbus`].
+    Mpris {
+        /// Appended to `org.mpris.MediaPlayer2.`; `*` allowed as the last
+        /// element.
+        name: String,
+    },
 }
 
 /// Parsed `config.kdl`.
@@ -96,7 +133,8 @@ pub fn parse(text: &str) -> Result<InstanceConfig, ConfigError> {
         let name = node.name().value();
         reject_types(node)?;
         match name {
-            "wayland" | "x11" | "network" | "dri" | "pipewire" | "pulseaudio" => {
+            "wayland" | "x11" | "network" | "dri" | "pipewire" | "pulseaudio" | "portals"
+            | "notify" => {
                 reject_entries(node)?;
                 let svc = match name {
                     "wayland" => Service::Wayland,
@@ -104,6 +142,8 @@ pub fn parse(text: &str) -> Result<InstanceConfig, ConfigError> {
                     "network" => Service::Network,
                     "dri" => Service::Dri,
                     "pipewire" => Service::Pipewire,
+                    "portals" => Service::Portals,
+                    "notify" => Service::Notify,
                     _ => Service::Pulseaudio,
                 };
                 if cfg.services.contains(&svc) {
@@ -119,6 +159,22 @@ pub fn parse(text: &str) -> Result<InstanceConfig, ConfigError> {
                 }
                 cfg.services.push(svc);
             }
+            "dbus" => {
+                if has_dbus(&cfg.services) {
+                    return Err(ConfigError::Duplicate(name.to_owned()));
+                }
+                cfg.services.push(parse_dbus(node)?);
+            }
+            "mpris" => {
+                if cfg
+                    .services
+                    .iter()
+                    .any(|s| matches!(s, Service::Mpris { .. }))
+                {
+                    return Err(ConfigError::Duplicate(name.to_owned()));
+                }
+                cfg.services.push(parse_mpris(node)?);
+            }
             "env" => parse_env(node, &mut cfg.env)?,
             "command" => {
                 if cfg.command.is_some() {
@@ -129,7 +185,33 @@ pub fn parse(text: &str) -> Result<InstanceConfig, ConfigError> {
             other => return Err(ConfigError::UnknownNode(other.to_owned())),
         }
     }
+    if let Some(node) = bundle_without_dbus(&cfg.services) {
+        return Err(ConfigError::BadArgument {
+            node: node.to_owned(),
+            reason: "requires dbus".to_owned(),
+        });
+    }
     Ok(cfg)
+}
+
+/// Two `dbus` nodes hold different rules, so the grant is recognised by
+/// its variant rather than by value.
+fn has_dbus(services: &[Service]) -> bool {
+    services.iter().any(|s| matches!(s, Service::Dbus { .. }))
+}
+
+/// The bundles are only sets of proxy rules; without `dbus` there is no
+/// proxy to carry them, and the grant would be silently dropped.
+fn bundle_without_dbus(services: &[Service]) -> Option<&'static str> {
+    if has_dbus(services) {
+        return None;
+    }
+    services.iter().find_map(|s| match s {
+        Service::Portals => Some("portals"),
+        Service::Notify => Some("notify"),
+        Service::Mpris { .. } => Some("mpris"),
+        _ => None,
+    })
 }
 
 fn bad(node: &KdlNode, reason: &str) -> ConfigError {
@@ -150,6 +232,14 @@ fn reject_types(node: &KdlNode) -> Result<(), ConfigError> {
 
 /// Flag-style services take no arguments, properties or children.
 fn reject_entries(node: &KdlNode) -> Result<(), ConfigError> {
+    reject_arguments(node)?;
+    if node.children().is_some() {
+        return Err(bad(node, "takes no children"));
+    }
+    Ok(())
+}
+
+fn reject_arguments(node: &KdlNode) -> Result<(), ConfigError> {
     if let Some(e) = node.entries().first() {
         if let Some(p) = e.name() {
             return Err(ConfigError::UnknownProperty {
@@ -158,9 +248,6 @@ fn reject_entries(node: &KdlNode) -> Result<(), ConfigError> {
             });
         }
         return Err(bad(node, "takes no arguments"));
-    }
-    if node.children().is_some() {
-        return Err(bad(node, "takes no children"));
     }
     Ok(())
 }
@@ -232,6 +319,144 @@ fn parse_etc_share(node: &KdlNode) -> Result<Service, ConfigError> {
     }
     let name = name.ok_or_else(|| bad(node, "expects exactly one name argument"))?;
     Ok(Service::EtcShare { name })
+}
+
+/// A D-Bus well-known name: at least two `[A-Za-z_-][A-Za-z0-9_-]*`
+/// elements joined by `.`, where the last may be `*` to cover the name and
+/// every name below it.
+pub fn is_bus_name(s: &str) -> bool {
+    is_name_glob(s, 2)
+}
+
+/// `mpris name` is a suffix of a bus name, so one element is enough there.
+fn is_name_glob(s: &str, min_elements: usize) -> bool {
+    let mut count = 0;
+    let mut elements = s.split('.').peekable();
+    while let Some(e) = elements.next() {
+        count += 1;
+        let last = elements.peek().is_none();
+        if !is_name_element(e) && !(last && e == "*") {
+            return false;
+        }
+    }
+    count >= min_elements
+}
+
+fn is_name_element(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_' || b == b'-')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// `dbus` itself is bare; every rule is a child node. Names are checked
+/// here so a typo cannot become a silent hole in the proxy filter.
+fn parse_dbus(node: &KdlNode) -> Result<Service, ConfigError> {
+    reject_arguments(node)?;
+    let mut rules = Vec::new();
+    let Some(children) = node.children() else {
+        return Ok(Service::Dbus { rules });
+    };
+    for child in children.nodes() {
+        reject_types(child)?;
+        if child.children().is_some() {
+            return Err(bad(child, "takes no children"));
+        }
+        let kind = child.name().value();
+        let arg = one_string_arg(child)?;
+        rules.push(match kind {
+            "see" | "talk" | "own" => {
+                let name = bus_name(child, arg)?;
+                match kind {
+                    "see" => BusRule::See(name),
+                    "talk" => BusRule::Talk(name),
+                    _ => BusRule::Own(name),
+                }
+            }
+            "call" | "broadcast" => {
+                let (name, rule) = arg
+                    .split_once('=')
+                    .ok_or_else(|| bad(child, "expects \"<name>=<rule>\""))?;
+                let name = bus_name(child, name)?;
+                if rule.is_empty() || rule.chars().any(|c| c.is_whitespace() || c == '\0') {
+                    return Err(bad(
+                        child,
+                        "rule after `=` must be non-empty and hold no whitespace",
+                    ));
+                }
+                let rule = rule.to_owned();
+                if kind == "call" {
+                    BusRule::Call(name, rule)
+                } else {
+                    BusRule::Broadcast(name, rule)
+                }
+            }
+            other => return Err(ConfigError::UnknownNode(other.to_owned())),
+        });
+    }
+    Ok(Service::Dbus { rules })
+}
+
+/// The value is not echoed back: it is arbitrary text and may hold the
+/// control bytes the error message would then carry.
+fn bus_name(node: &KdlNode, s: &str) -> Result<String, ConfigError> {
+    if !is_bus_name(s) {
+        return Err(bad(
+            node,
+            "expects a D-Bus well-known name such as \"org.example.App\", \
+             optionally ending in `.*`",
+        ));
+    }
+    Ok(s.to_owned())
+}
+
+fn one_string_arg(node: &KdlNode) -> Result<&str, ConfigError> {
+    if let Some(p) = node.entries().iter().find_map(|e| e.name()) {
+        return Err(ConfigError::UnknownProperty {
+            node: node.name().value().to_owned(),
+            prop: p.value().to_owned(),
+        });
+    }
+    let [e] = node.entries() else {
+        return Err(bad(node, "expects exactly one string argument"));
+    };
+    e.value()
+        .as_string()
+        .ok_or_else(|| bad(node, "expects exactly one string argument"))
+}
+
+fn parse_mpris(node: &KdlNode) -> Result<Service, ConfigError> {
+    let mut name: Option<String> = None;
+    for e in node.entries() {
+        match e.name().map(|n| n.value()) {
+            Some("name") => {
+                let s = e
+                    .value()
+                    .as_string()
+                    .ok_or_else(|| bad(node, "name must be a string"))?;
+                if !is_name_glob(s, 1) {
+                    return Err(bad(
+                        node,
+                        "name must be dot-separated name elements, `*` allowed last",
+                    ));
+                }
+                name = Some(s.to_owned());
+            }
+            Some(p) => {
+                return Err(ConfigError::UnknownProperty {
+                    node: node.name().value().to_owned(),
+                    prop: p.to_owned(),
+                });
+            }
+            None => return Err(bad(node, "expects a name=\"...\" property, not arguments")),
+        }
+    }
+    if node.children().is_some() {
+        return Err(bad(node, "takes no children"));
+    }
+    let name = name.ok_or_else(|| bad(node, "expects a name=\"...\" property"))?;
+    Ok(Service::Mpris { name })
 }
 
 /// bwrap 0.11.2 exits when `--setenv` is given an empty key or one holding
@@ -642,5 +867,189 @@ command "b""#
     #[test]
     fn kdl_syntax_error_is_parse() {
         assert!(matches!(parse("wayland {"), Err(ConfigError::Parse(_))));
+    }
+
+    #[test]
+    fn dbus_children_and_bundles() {
+        let cfg = parse(
+            r#"
+            dbus {
+                talk "org.freedesktop.Notifications"
+                own "org.mpris.MediaPlayer2.firefox.*"
+                call "org.freedesktop.portal.Desktop=org.freedesktop.portal.Settings.Read@/org/freedesktop/portal/desktop"
+                broadcast "org.freedesktop.portal.Desktop=@/org/freedesktop/portal/desktop"
+            }
+            portals
+            notify
+            mpris name="firefox.*"
+            "#,
+        )
+        .unwrap();
+        assert!(matches!(&cfg.services[0], Service::Dbus { rules } if rules.len() == 4));
+        assert!(cfg.services.contains(&Service::Portals));
+        assert!(cfg.services.contains(&Service::Notify));
+        assert!(cfg.services.contains(&Service::Mpris {
+            name: "firefox.*".into()
+        }));
+        let [Service::Dbus { rules }, ..] = &cfg.services[..] else {
+            panic!("expected dbus first, got {:?}", cfg.services);
+        };
+        assert_eq!(
+            rules[2],
+            BusRule::Call(
+                "org.freedesktop.portal.Desktop".into(),
+                "org.freedesktop.portal.Settings.Read@/org/freedesktop/portal/desktop".into()
+            )
+        );
+        assert_eq!(
+            rules[3],
+            BusRule::Broadcast(
+                "org.freedesktop.portal.Desktop".into(),
+                "@/org/freedesktop/portal/desktop".into()
+            )
+        );
+    }
+
+    #[test]
+    fn bundles_require_dbus_and_names_are_validated() {
+        assert!(matches!(
+            parse("notify"),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("dbus\nmpris"),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("dbus { talk \"nodots\" }"),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("dbus { talk \"a.*.b\" }"),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("dbus { talk \"a.b c\" }"),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("dbus { call \"a.b\" }"),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("dbus { call \"a.b=x y\" }"),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("dbus { call \"a.b=\" }"),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("dbus { frob \"a.b\" }"),
+            Err(ConfigError::UnknownNode(_))
+        ));
+        assert!(matches!(
+            parse("dbus\ndbus"),
+            Err(ConfigError::Duplicate(_))
+        ));
+        assert!(matches!(
+            parse("dbus { talk \"a.b\" }\ndbus"),
+            Err(ConfigError::Duplicate(_))
+        ));
+        assert_eq!(
+            parse("dbus").unwrap().services,
+            vec![Service::Dbus { rules: vec![] }]
+        );
+        for ok in ["a.b", "org.freedesktop.portal.*", "a-b.c_d", "_a.b9"] {
+            assert!(is_bus_name(ok), "{ok}");
+        }
+        for bad in [
+            "a", ".a.b", "a..b", "a.9b", "a.*.b", "*", "a.b.", "a.b=", "",
+        ] {
+            assert!(!is_bus_name(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn dbus_is_the_only_node_with_children() {
+        assert!(matches!(
+            parse("dbus \"x\""),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("dbus foo=bar"),
+            Err(ConfigError::UnknownProperty { .. })
+        ));
+        assert!(matches!(
+            parse("dbus\nnotify { talk \"a.b\" }"),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        for text in [
+            "dbus { talk }",
+            "dbus { talk 1 }",
+            "dbus { talk \"a.b\" \"c.d\" }",
+            "dbus { talk \"a.b\" { own \"c.d\" } }",
+            "dbus { (t)talk \"a.b\" }",
+            "dbus { talk (t)\"a.b\" }",
+        ] {
+            assert!(
+                matches!(parse(text), Err(ConfigError::BadArgument { .. })),
+                "{text}"
+            );
+        }
+        assert!(matches!(
+            parse("dbus { talk \"a.b\" name=\"x\" }"),
+            Err(ConfigError::UnknownProperty { .. })
+        ));
+        // The proxy takes repeated rules; deduplicating is the emitter's job.
+        let cfg = parse("dbus { talk \"a.b\"\ntalk \"a.b\" }").unwrap();
+        assert!(matches!(&cfg.services[0], Service::Dbus { rules } if rules.len() == 2));
+    }
+
+    #[test]
+    fn mpris_name_is_a_bus_name_suffix() {
+        assert_eq!(
+            parse("dbus\nmpris name=\"firefox.*\"").unwrap().services,
+            vec![
+                Service::Dbus { rules: vec![] },
+                Service::Mpris {
+                    name: "firefox.*".into()
+                }
+            ]
+        );
+        assert_eq!(
+            parse("dbus\nmpris name=\"firefox\"").unwrap().services[1],
+            Service::Mpris {
+                name: "firefox".into()
+            }
+        );
+        for text in [
+            "dbus\nmpris name=\"a b\"",
+            "dbus\nmpris name=\"\"",
+            "dbus\nmpris name=\".a\"",
+            "dbus\nmpris name=\"9a\"",
+            "dbus\nmpris name=\"a.*.b\"",
+            "dbus\nmpris name=\"a.\"",
+            "dbus\nmpris name=1",
+            "dbus\nmpris \"firefox\"",
+            "dbus\nmpris name=\"a\" { x }",
+        ] {
+            assert!(
+                matches!(parse(text), Err(ConfigError::BadArgument { .. })),
+                "{text}"
+            );
+        }
+        assert!(matches!(
+            parse("dbus\nmpris nome=\"a\""),
+            Err(ConfigError::UnknownProperty { .. })
+        ));
+        assert!(matches!(
+            parse("dbus\nmpris name=\"a\"\nmpris name=\"b\""),
+            Err(ConfigError::Duplicate(_))
+        ));
+        assert!(matches!(
+            parse("dbus\nportals\nportals"),
+            Err(ConfigError::Duplicate(_))
+        ));
     }
 }
