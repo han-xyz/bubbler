@@ -738,6 +738,116 @@ fn symlink_proxy(path: &Path, target: &str) {
     );
 }
 
+/// A stand-in for `xdg-dbus-proxy` that binds a socket, reports itself
+/// ready like a real one, and from then on keeps replacing that socket
+/// with a symlink by atomic rename. It stops when its ready pipe closes.
+fn racing_proxy(path: &Path) {
+    write_script(
+        path,
+        r#"#!/usr/bin/python3
+import os, select, socket, sys, time
+args = sys.argv[1:]
+fd = int(args[0].split("=", 1)[1])
+bus = args[2]
+d = os.path.dirname(bus)
+stage, link = os.path.join(d, "stage-s"), os.path.join(d, "stage-l")
+
+def fresh_socket():
+    try:
+        os.unlink(stage)
+    except FileNotFoundError:
+        pass
+    s = socket.socket(socket.AF_UNIX)
+    s.bind(stage)
+    s.listen(8)
+    os.rename(stage, bus)
+    return s
+
+def fresh_link():
+    try:
+        os.unlink(link)
+    except FileNotFoundError:
+        pass
+    os.symlink("/etc", link)
+    os.rename(link, bus)
+
+held = fresh_socket()
+os.write(fd, b"r")
+poller = select.poll()
+poller.register(fd, 0)
+deadline = time.time() + 15
+while time.time() < deadline:
+    if poller.poll(0):
+        break
+    fresh_link()
+    held.close()
+    held = fresh_socket()
+"#,
+    );
+}
+
+#[test]
+fn a_proxy_racing_its_own_socket_never_gets_a_symlink_bound() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let bus = tmp.path().join("fakebus");
+    let _listener = UnixListener::bind(&bus).unwrap();
+    let racer = tmp.path().join("race-proxy");
+    racing_proxy(&racer);
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["create", "race"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/race/config.kdl"),
+        "dbus\n",
+    )
+    .unwrap();
+    let mut refused = 0;
+    let mut ran = 0;
+    for i in 0..30 {
+        let out = bubbler_live(tmp.path(), &init)
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}", bus.display()),
+            )
+            .env("BUBBLER_DBUS_PROXY", &racer)
+            .args([
+                "run",
+                "race",
+                "--",
+                "/usr/bin/sh",
+                "-c",
+                // What the sandbox sees at the bus path: only ever a
+                // socket, never the symlink's target.
+                r#"test -S "$XDG_RUNTIME_DIR/bus" || { echo LEAK; ls "$XDG_RUNTIME_DIR/bus"; }"#,
+            ])
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!stdout.contains("LEAK"), "run {i}: {stdout}{err}");
+        match out.status.code() {
+            Some(0) => ran += 1,
+            Some(1) if err.contains("a socket") => refused += 1,
+            other => panic!("run {i}: exit {other:?}: {stdout}{err}"),
+        }
+        assert!(
+            !tmp.path().join("run/bubbler/race/bus").exists(),
+            "run {i} left the moved entry behind"
+        );
+    }
+    assert!(ran + refused == 30, "{ran} ran, {refused} refused");
+}
+
 #[test]
 fn a_proxy_that_swaps_its_socket_for_a_symlink_never_reaches_the_sandbox() {
     if !require_bwrap() {

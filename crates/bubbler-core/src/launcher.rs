@@ -391,45 +391,52 @@ fn open_dir(path: &Path) -> Result<OwnedFd, LaunchError> {
     .map_err(|e| LaunchError::Io(path.to_path_buf(), e.into()))
 }
 
-/// Prove the proxy really left a socket behind and move it out of the one
-/// directory the proxy can write to, so what the sandbox binds cannot be
-/// swapped between this check and the bind.
+/// Move the proxy's socket out of the one directory the proxy can write
+/// to, then prove that what was moved really is a socket. The returned
+/// guard removes the moved entry when the run ends.
 ///
 /// The proxy keeps serving after the move: it listens on the socket it
 /// bound, not on the path, and the sandbox connects through the new one.
-// Opened with `O_NOFOLLOW`, so a symlink left in the socket's place fails
-// with ELOOP instead of being followed: `stat` through a path reports the
-// type of the target, and bwrap would bind that target.
-fn adopt_proxy_bus(dir: &Path) -> Result<(), LaunchError> {
+// The move comes first and the check second: the reverse leaves a window
+// in which a proxy that keeps swapping the name can put a symlink in the
+// place of the socket that was just checked. Nothing outside the instance
+// directory can touch the entry once it is here, so its type cannot
+// change after this. `O_NOFOLLOW` then makes a symlink fail with ELOOP
+// instead of being followed, since `stat` through a path would report the
+// type of the target and bwrap would bind that target.
+fn adopt_proxy_bus(dir: &Path) -> Result<FileGuard, LaunchError> {
     let from = open_dir(&dbus::socket_dir(dir))?;
     let to = open_dir(dir)?;
-    let path = dbus::proxy_bus_path(dir);
+    let path = dbus::app_bus_path(dir);
+    rustix::fs::renameat(&from, "bus", &to, "bus").map_err(|e| match e {
+        Errno::NOENT => LaunchError::MissingResource {
+            service: "dbus",
+            path: dbus::proxy_bus_path(dir),
+        },
+        e => LaunchError::Io(path.clone(), e.into()),
+    })?;
+    // Whatever was moved is bubbler's to remove from here on, socket or not.
+    let guard = FileGuard(path.clone());
     let wrong_type = || LaunchError::WrongType {
         service: "dbus",
         path: path.clone(),
         expected: "a socket",
     };
     let bus = rustix::fs::openat(
-        &from,
+        &to,
         "bus",
         OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(|e| match e {
         Errno::LOOP => wrong_type(),
-        Errno::NOENT => LaunchError::MissingResource {
-            service: "dbus",
-            path: path.clone(),
-        },
         e => LaunchError::Io(path.clone(), e.into()),
     })?;
     let stat = rustix::fs::fstat(&bus).map_err(|e| LaunchError::Io(path.clone(), e.into()))?;
     if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Socket {
         return Err(wrong_type());
     }
-    drop(bus);
-    rustix::fs::renameat(&from, "bus", &to, "bus")
-        .map_err(|e| LaunchError::Io(dbus::app_bus_path(dir), e.into()))
+    Ok(guard)
 }
 
 /// `$XDG_RUNTIME_DIR/bubbler/<name>`: an instance's runtime state on the
@@ -746,12 +753,9 @@ pub fn run(env: &Env, inst: &Instance, command: Option<&[OsString]>) -> Result<i
         None => None,
     };
     // Between the proxy's ready byte and the sandbox's bind the socket is
-    // checked and moved where the proxy cannot reach it.
+    // moved where the proxy cannot reach it, and only then checked.
     let _bus = match &plan {
-        Some(_) => {
-            adopt_proxy_bus(&dir)?;
-            Some(FileGuard(dbus::app_bus_path(&dir)))
-        }
+        Some(_) => Some(adopt_proxy_bus(&dir)?),
         None => None,
     };
     let argv = build_argv(env, inst, command, &mut alloc)?;
@@ -1216,7 +1220,7 @@ mod tests {
         let dir = tmp.path();
         std::fs::create_dir(dbus::socket_dir(dir)).unwrap();
         let listener = UnixListener::bind(dbus::proxy_bus_path(dir)).unwrap();
-        adopt_proxy_bus(dir).unwrap();
+        let guard = adopt_proxy_bus(dir).unwrap();
         let moved = std::fs::symlink_metadata(dbus::app_bus_path(dir)).unwrap();
         assert!(std::os::unix::fs::FileTypeExt::is_socket(
             &moved.file_type()
@@ -1225,6 +1229,11 @@ mod tests {
         // The proxy serves the socket it bound, not the path it bound it at.
         assert!(UnixStream::connect(dbus::app_bus_path(dir)).is_ok());
         drop(listener);
+        drop(guard);
+        assert!(
+            !dbus::app_bus_path(dir).exists(),
+            "the socket outlived the run"
+        );
     }
 
     #[test]
@@ -1250,7 +1259,13 @@ mod tests {
                 ..
             })
         ));
-        std::fs::remove_file(dbus::proxy_bus_path(dir)).unwrap();
+        // Moved out of the proxy's reach first, so a refused run leaves
+        // nothing of it behind either.
+        assert!(!dbus::app_bus_path(dir).exists(), "the symlink was kept");
+        assert!(
+            !dbus::proxy_bus_path(dir).exists(),
+            "the symlink was left in place"
+        );
         std::fs::write(dbus::proxy_bus_path(dir), b"").unwrap();
         assert!(matches!(
             adopt_proxy_bus(dir),
