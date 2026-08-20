@@ -4,11 +4,13 @@ use std::ffi::OsStr;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::process::{Pid, Signal, kill_process_group};
 use rustix::termios::Winsize;
 
 /// Returns false (after printing why) when real bwrap runs cannot work
@@ -80,14 +82,28 @@ fn isolate(c: &mut Command, root: &Path) {
 /// bubbler started from a shell, for the two things `Command` cannot
 /// express: closing one of its standard descriptors, and putting it in a
 /// pipeline whose reader leaves early. `$B` in `script` is the binary.
+///
+/// The shell leads a process group of its own, so a test that gives up
+/// on it can end the bubbler and bwrap under it with [`kill_group`]
+/// instead of leaving them running.
 pub fn bubbler_in_sh(root: &Path, init: &Path, script: &str) -> Command {
     let mut c = Command::new("/usr/bin/sh");
     isolate(&mut c, root);
     c.env("BUBBLER_INIT", init)
         .env("B", env!("CARGO_BIN_EXE_bubbler"))
         .arg("-c")
-        .arg(script);
+        .arg(script)
+        .process_group(0);
     c
+}
+
+/// SIGKILL to a child's whole process group, for a run that has to be
+/// given up on: killing only the shell would leave the sandbox behind.
+/// Only for children started with a group of their own
+/// ([`bubbler_in_sh`]), whose pid is that group's id.
+pub fn kill_group(child: &Child) {
+    // A group that is already gone is what this wanted anyway.
+    let _ = kill_process_group(Pid::from_child(child), Signal::KILL);
 }
 
 /// [`bubbler`] pointed at the real supervisor binary, for tests that

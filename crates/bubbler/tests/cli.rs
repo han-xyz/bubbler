@@ -1,6 +1,6 @@
 mod common;
 
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -9,10 +9,11 @@ use std::time::{Duration, Instant};
 use bubbler_core::bwrap::ETC_ALLOWLIST;
 use bubbler_core::seccomp::{DEFAULT_ENOSYS, DEFAULT_EPERM, syscall_number};
 use common::{
-    bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, real_init, require_bwrap, require_dbus,
-    require_portal, require_python, test_pty,
+    bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, kill_group, real_init, require_bwrap,
+    require_dbus, require_portal, require_python, test_pty,
 };
 use rustix::process::{Pid, Signal, kill_process};
+use rustix::termios::{ControlModes, InputModes, LocalModes, OutputModes, tcgetattr};
 
 fn setup() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
@@ -1745,7 +1746,10 @@ fn real_bwrap_run_with_tty_none_outlives_a_reader_that_leaves() {
         Duration::from_secs(15),
     );
     if !finished {
-        let _ = run.kill();
+        // The shell's whole group: the bubbler and bwrap behind it must
+        // not outlive the test that gave up on them.
+        kill_group(&run);
+        let _ = run.wait();
         panic!("bubbler never finished after its output pipe closed");
     }
     let out = run.wait_with_output().expect("collecting stderr");
@@ -1990,6 +1994,119 @@ fn real_bwrap_run_detaches_on_three_escapes_and_keeps_the_sandbox() {
         ),
         "the detached run did not stop after SIGTERM"
     );
+}
+
+/// Whether a terminal is in raw mode, which is how a test sees that
+/// bubbler has taken it over.
+fn is_raw(fd: BorrowedFd<'_>) -> bool {
+    !tcgetattr(fd)
+        .unwrap()
+        .local_modes
+        .contains(LocalModes::ICANON)
+}
+
+/// The terminal settings a test compares before and after: the four mode
+/// words, which is everything raw mode changes about them.
+fn modes(fd: BorrowedFd<'_>) -> (InputModes, OutputModes, ControlModes, LocalModes) {
+    let t = tcgetattr(fd).unwrap();
+    (
+        t.input_modes,
+        t.output_modes,
+        t.control_modes,
+        t.local_modes,
+    )
+}
+
+#[test]
+fn real_bwrap_exec_stops_on_a_signal_and_gives_the_terminal_back() {
+    let Some((tmp, init)) = live_instance("t") else {
+        return;
+    };
+    let run = bubbler_live(tmp.path(), &init)
+        .args(["run", "t", "--", "/usr/bin/sleep", "30"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let sock = tmp.path().join("run/bubbler/t/init.sock");
+    if !wait_until(
+        || UnixStream::connect(&sock).is_ok(),
+        Duration::from_secs(10),
+    ) {
+        fail_with(run, "the instance never accepted a connection");
+    }
+    let pty = test_pty();
+    let before = modes(pty.slave.as_fd());
+    let mut exec = bubbler_live(tmp.path(), &init)
+        .args(["exec", "t", "--", "/usr/bin/sleep", "30"])
+        .stdin(pty.stdio())
+        .stdout(pty.stdio())
+        .stderr(pty.stdio())
+        .spawn()
+        .unwrap();
+    // Only once the relay really holds the terminal: a signal before that
+    // would prove nothing about handing it back.
+    assert!(
+        wait_until(|| is_raw(pty.slave.as_fd()), Duration::from_secs(10)),
+        "the exec never put the terminal in raw mode"
+    );
+    kill_process(Pid::from_child(&exec), Signal::TERM).unwrap();
+    let mut status = None;
+    let stopped = wait_until(
+        || {
+            status = exec.try_wait().expect("waiting for the exec");
+            status.is_some()
+        },
+        Duration::from_secs(1),
+    );
+    if !stopped {
+        let _ = exec.kill();
+        panic!("the exec did not stop within a second of SIGTERM");
+    }
+    assert_eq!(status.and_then(|s| s.code()), Some(128 + 15));
+    // And the terminal is the user's again, exactly as they left it.
+    assert_eq!(modes(pty.slave.as_fd()), before);
+
+    let mut run = run;
+    kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
+    assert!(
+        wait_until(
+            || run.try_wait().expect("waiting for the run").is_some(),
+            Duration::from_secs(8)
+        ),
+        "the run did not stop after SIGTERM"
+    );
+}
+
+#[test]
+fn real_bwrap_run_gives_the_terminal_back_after_a_hangup() {
+    let Some((tmp, init)) = live_instance("t") else {
+        return;
+    };
+    let pty = test_pty();
+    let before = modes(pty.slave.as_fd());
+    let mut run = bubbler_live(tmp.path(), &init)
+        .args(["run", "t", "--", "/usr/bin/sleep", "30"])
+        .stdin(pty.stdio())
+        .stdout(pty.stdio())
+        .stderr(pty.stdio())
+        .spawn()
+        .unwrap();
+    assert!(
+        wait_until(|| is_raw(pty.slave.as_fd()), Duration::from_secs(20)),
+        "the run never put the terminal in raw mode"
+    );
+    // A terminal that hangs up: the sandbox is stopped like any other
+    // signal, and the settings are put back on the way out.
+    kill_process(Pid::from_child(&run), Signal::HUP).unwrap();
+    assert!(
+        wait_until(
+            || run.try_wait().expect("waiting for the run").is_some(),
+            Duration::from_secs(10)
+        ),
+        "the run did not stop after SIGHUP"
+    );
+    assert_eq!(modes(pty.slave.as_fd()), before);
 }
 
 /// A python probe reporting how each syscall the default filter denies

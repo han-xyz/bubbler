@@ -17,7 +17,7 @@ use rustix::fs::{AtFlags, MemfdFlags, Mode, OFlags};
 use rustix::io::{Errno, FdFlags, fcntl_dupfd_cloexec, fcntl_setfd};
 use rustix::process::{Pid, Signal, kill_process, test_kill_process};
 use signal_hook::SigId;
-use signal_hook::consts::{SIGINT, SIGTERM, SIGWINCH};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 
 use crate::bwrap::{BwrapArgs, FdAllocator};
 use crate::env::Env;
@@ -1006,7 +1006,10 @@ pub fn run(
     let stop = Arc::new(AtomicBool::new(false));
     let winch = Arc::new(AtomicBool::new(false));
     let mut registered = SignalGuard(Vec::new());
-    for sig in [SIGINT, SIGTERM] {
+    // SIGHUP among them: a terminal that goes away must still leave
+    // through the same path, which stops the sandbox and hands the
+    // settings back, rather than killing bubbler where it stands.
+    for sig in [SIGINT, SIGTERM, SIGHUP] {
         let id =
             signal_hook::flag::register(sig, Arc::clone(&stop)).map_err(LaunchError::Signal)?;
         registered.0.push(id);

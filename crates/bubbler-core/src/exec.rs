@@ -15,12 +15,12 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bubbler_init::{proto, wire};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::pipe::PipeFlags;
-use signal_hook::consts::SIGWINCH;
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 
 use crate::env::Env;
 use crate::error::LaunchError;
@@ -58,6 +58,11 @@ const NOW: Timespec = Timespec {
     tv_sec: 0,
     tv_nsec: 0,
 };
+
+/// The signals that end a relayed exec, and the code each leaves. Caught
+/// rather than fatal because the terminal is bubbler's to give back: a
+/// killed relay would leave the user's terminal raw.
+const STOP_SIGNALS: [i32; 3] = [SIGINT, SIGTERM, SIGHUP];
 
 fn protocol_error(e: io::Error) -> LaunchError {
     match e.kind() {
@@ -117,6 +122,11 @@ fn fd_for(
 /// Detaching (`^]` three times) returns 0 and leaves it under the
 /// instance's supervisor — with bubbler gone its pty hangs up, so a
 /// command that does not ignore `SIGHUP` ends there.
+///
+/// A `SIGINT`, `SIGTERM` or `SIGHUP` while output is being relayed ends
+/// the relay the same way and returns `128 + signal`: the command stays
+/// with the supervisor, which is the most an exec can do about it — the
+/// channel carries a request and a status, and nothing else.
 pub fn run_in(
     stream: &UnixStream,
     argv: &[OsString],
@@ -155,7 +165,18 @@ pub fn run_in(
     drop(send);
     let master = plan.pty.take().map(|p| p.master);
     let winch = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicUsize::new(0));
     let mut registered = SignalGuard(Vec::new());
+    // Only while something is being relayed. With nothing of ours in
+    // between, the terminal is untouched and a signal is the caller's to
+    // die of, as it was before the command was sent.
+    if master.is_some() || !pipes.is_empty() {
+        for sig in STOP_SIGNALS {
+            let id = signal_hook::flag::register_usize(sig, Arc::clone(&stop), sig as usize)
+                .map_err(LaunchError::Signal)?;
+            registered.0.push(id);
+        }
+    }
     if master.is_some() {
         let id = signal_hook::flag::register(SIGWINCH, Arc::clone(&winch))
             .map_err(LaunchError::Signal)?;
@@ -172,18 +193,28 @@ pub fn run_in(
     // is what keeps the command from blocking on a full pty or pipe.
     let sink = tty::null_stdio()?;
     let mut received: Option<io::Result<i32>> = None;
+    let mut signalled: Option<i32> = None;
     let end = {
         let mut until = || {
-            if !status_ready(stream) {
-                return None;
+            if status_ready(stream) {
+                let got = wire::recv_status(stream);
+                // Any answer ends the wait; a broken one is reported below.
+                let code = got
+                    .as_ref()
+                    .map_or(1, |raw| exit_code(ExitStatus::from_raw(*raw)));
+                received = Some(got);
+                return Some(code);
             }
-            let got = wire::recv_status(stream);
-            // Any answer ends the wait; a broken one is reported below.
-            let code = got
-                .as_ref()
-                .map_or(1, |raw| exit_code(ExitStatus::from_raw(*raw)));
-            received = Some(got);
-            Some(code)
+            // A status already in hand wins over a signal arriving with
+            // it; what is left here ends the relay with nothing to
+            // report but the signal itself.
+            match stop.swap(0, Ordering::SeqCst) {
+                0 => None,
+                sig => {
+                    signalled = Some(sig as i32);
+                    Some(128 + sig as i32)
+                }
+            }
         };
         match &master {
             Some(master) => {
@@ -220,8 +251,8 @@ pub fn run_in(
             }
         }
     };
-    match (end, received) {
-        (RelayEnd::Detached, _) => {
+    match (end, received, signalled) {
+        (RelayEnd::Detached, ..) => {
             // Restored before the note, which would otherwise be printed
             // with the terminal still raw.
             if let Some(guard) = raw.as_mut() {
@@ -230,9 +261,12 @@ pub fn run_in(
             eprintln!("{}", tty::DETACHED_NOTE);
             Ok(0)
         }
-        (_, Some(Ok(raw))) => Ok(exit_code(ExitStatus::from_raw(raw))),
-        (_, Some(Err(e))) => Err(protocol_error(e)),
-        (_, None) => Err(LaunchError::Protocol(
+        (_, Some(Ok(raw)), _) => Ok(exit_code(ExitStatus::from_raw(raw))),
+        (_, Some(Err(e)), _) => Err(protocol_error(e)),
+        // The guard puts the terminal back as this returns, which is the
+        // whole reason the signal was caught instead of fatal.
+        (_, None, Some(sig)) => Ok(128 + sig),
+        (_, None, None) => Err(LaunchError::Protocol(
             "the instance sent no status for the command".into(),
         )),
     }

@@ -187,9 +187,11 @@ const TARGET: TargetArch = TargetArch::aarch64;
 #[cfg(target_arch = "riscv64")]
 const TARGET: TargetArch = TargetArch::riscv64;
 
-/// Mask applied to `ioctl`'s request argument: the kernel passes it as 64
-/// bits, so without it a request of `0x1_0000_5412` would not be TIOCSTI
-/// to the filter but still is to the driver.
+/// Mask applied to `ioctl`'s request argument. The comparison is already
+/// a `SeccompCmpArgLen::Dword` one, which looks at the low 32 bits —
+/// the same half the kernel hands the driver, so a request of
+/// `0x1_0000_5412` is TIOCSTI to both. The mask is belt and braces: it
+/// keeps the rule saying what it compares if that width ever widens.
 const REQUEST_MASK: u64 = 0xFFFF_FFFF;
 
 /// Set by the first compile that could report skipped names. Which names

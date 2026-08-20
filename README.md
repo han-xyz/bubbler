@@ -249,6 +249,13 @@ answers arrive as its own input. Do not type a password into a session you do
 not trust. `passthrough` gives up the rest as well: the sandbox holds your
 terminal's descriptors and reaches it again through `/dev/console`.
 
+`run` and `exec` catch SIGINT, SIGTERM and SIGHUP while they hold your
+terminal: the sandbox is stopped and your settings are put back on the way
+out. SIGKILL cannot be caught, and neither can anything else that takes
+bubbler down without letting it unwind — a hang-up it never gets to act on
+included — so those leave your terminal raw, with no echo and no line
+editing. `reset`, or `stty sane`, puts it right.
+
 The pty is allocated on the host, so its name inside is not its name outside.
 `/proc/self/fd/0` still reads back a host `/dev/pts/N`, a path the sandbox's
 fresh devpts either does not have or has since handed to a different pty, so
