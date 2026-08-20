@@ -5,46 +5,104 @@ combining bubblejail's explicit instances and resource grants with a profile
 library in the spirit of firejail. bubbler itself is unprivileged; `bwrap`
 does the namespace work.
 
-Status: milestone 1 — baseline sandbox with `wayland`, `x11`, `network`,
-`home-share`. No seccomp, no D-Bus filtering, no desktop entries yet.
+Status: milestone 2 — the `alacritty` and `firefox` profiles run, with GPU,
+sound and a private home. See "Known gaps" below.
 
 ## Usage
 
-    bubbler create firefox            # seeds from the built-in `generic` profile
-    bubbler create firefox --profile generic   # only `generic` exists so far
-    $EDITOR ~/.local/share/bubbler/instances/firefox/config.kdl
-    bubbler run firefox               # uses `command` from config.kdl
-    bubbler run firefox -- foot       # or run something else inside
-    bubbler run firefox --dry-run     # print the bwrap argv, do not launch
+    bubbler create ff --profile firefox   # seed config.kdl from a built-in profile
+    bubbler create ff                     # --profile defaults to `generic`
+    bubbler profiles                      # built-in profile names, one per line
+    bubbler edit ff                       # open config.kdl, then re-check it
+    bubbler run ff                        # uses `command` from config.kdl
+    bubbler run ff -- firefox --version   # or run something else inside
+    bubbler run ff --dry-run              # print the bwrap argv, do not launch
     bubbler list
+    bubbler delete ff --yes               # instance and private home; irreversible
 
 `create` prints the directory it made. `--dry-run` prints `bwrap` and then one
 argv element per line, byte for byte, so it can be diffed; an element
 containing a newline would be ambiguous in that framing. It builds the argv
 only: nothing is launched and no runtime directory is created.
 
+`edit` runs `$VISUAL`, else `$EDITOR`, split on whitespace into an argv with
+the config path appended — there is no shell, so quotes and `$VAR` in those
+variables are not expanded. A non-zero editor exit is propagated and the file
+is left alone; otherwise the config is re-parsed and any error printed, again
+without touching the file.
+
+`delete` refuses to do anything without `--yes`. It removes the instance
+directory (including its `home/`) and any leftover runtime directory, and
+refuses outright if the instance path is a symlink rather than following it.
+
 Instance names are letters, digits, `.`, `_` and `-`; they cannot start with
 `-`, and cannot be `.` or `..`.
 
 ## Config (KDL)
 
-    wayland
-    network
-    home-share "Downloads"
+One top-level node per grant, plus `command`. Unknown nodes are errors, and
+file order does not affect the generated argv.
+
+    wayland                          # the host Wayland socket
+    x11                              # X socket and Xauthority
+    network                          # network namespace shared, plus /etc/resolv.conf
+    dri                              # GPU: /dev/dri and the PCI devices' sysfs
+    pipewire                         # $XDG_RUNTIME_DIR/pipewire-0
+    pulseaudio                       # $XDG_RUNTIME_DIR/pulse/native, sets PULSE_SERVER
+    home-share "Downloads"           # $HOME/Downloads at /home/bubbler/Downloads
     home-share "Projects/x" mode=rw
+    etc-share "vulkan"               # /etc/vulkan read-only; one path component
+    env MOZ_ENABLE_WAYLAND="1"       # extra variables, KEY="value", repeatable
     command "firefox"
 
-Every sandbox gets: all namespaces unshared, no network, read-only `/usr`
-`/opt`, empty `/tmp` `/var` `/run`, a private home at `/home/bubbler`, and a
-cleared environment. `/etc` is an allowlist over a tmpfs: only known entries
-such as `hosts`, `fonts` or `ssl` are bound, and `passwd` and `group` are
-generated, so the sandbox sees the user `bubbler` and never the host's
-accounts. Grants only add to that. `x11` binds the X socket
-and remaps any Xauthority file to `/home/bubbler/.Xauthority`, but it stays a
-compatibility grant: X11 offers no isolation between clients. Sockets and
+Every source must exist and be of the expected type when the argv is built; a
+missing one is an error rather than a silently weaker sandbox. That covers
+`home-share` too, so the `firefox` profile needs a `~/Downloads`. `network`
+needs `/etc/resolv.conf` (the tmpfs over `/etc` would otherwise hide it).
+`dri` binds `/dev/dri` read-write and exposes `/sys/dev/char`,
+`/sys/devices/system/cpu` and every `/sys/devices/pci*` root read-only — that
+is the sysfs attributes of every PCI device on the machine, not just the GPU.
+
+`env` keys must look like `[A-Za-z_][A-Za-z0-9_]*`, values may not contain
+NUL, and each key may appear only once. The variables the sandbox owns are
+rejected: `HOME`, `PATH`, `XDG_RUNTIME_DIR`, `USER`, `LOGNAME`,
+`WAYLAND_DISPLAY`, `DISPLAY`, `XAUTHORITY`, `XDG_SESSION_TYPE`,
+`PULSE_SERVER`.
+
+## Baseline
+
+Every sandbox gets: all namespaces unshared, no network, read-only `/usr` and
+`/opt`, empty `/tmp` `/var` `/run`, a private home at `/home/bubbler`, an
+empty `$XDG_RUNTIME_DIR` at the host's path with mode 0700, and a cleared
+environment (only the locale and terminal variables — `TERM`, `LANG`,
+`LANGUAGE`, `COLORTERM`, `TZ`, `LC_*` — are carried over). Grants only add to
+that.
+
+`/etc` is an allowlist over a tmpfs: only the entries in `ETC_ALLOWLIST`
+(`crates/bubbler-core/src/bwrap.rs`) are bound, and only those that exist on
+the host — `ld.so.cache`, `ld.so.conf`, `ld.so.conf.d`, `fonts`, `localtime`,
+`machine-id`, `nsswitch.conf`, `hosts`, `host.conf`, `ssl`, `ca-certificates`,
+`mime.types`, `xdg`, `gtk-3.0`, `gtk-4.0`, `pulse`, `pipewire`, `drirc`,
+`vulkan`, `glvnd`, `egl`, `os-release`. `passwd` and `group` are generated:
+the sandbox sees the user `bubbler` (holding the host's uid and gid) and
+`nobody`, never the host's accounts, and `USER` and `LOGNAME` are `bubbler`
+as well.
+
+`x11` remaps any Xauthority file to `/home/bubbler/.Xauthority`, but it stays
+a compatibility grant: X11 offers no isolation between clients. Sockets and
 cookie files named by the environment must really be of that type, so a
 `WAYLAND_DISPLAY` or `XAUTHORITY` naming a directory is refused instead of
 binding the tree under it.
+
+## Known gaps
+
+- No D-Bus at all: no notifications, no MPRIS, no XDG portals (so no portal
+  file chooser and no screen sharing).
+- No seccomp filter — the sandbox is namespaces and mounts only.
+- No proprietary nvidia driver; `dri` covers the open stack.
+- `/etc/machine-id` is bound in, so every instance shares one stable
+  identifier with the host.
+- No desktop entries.
 
 ## Files
 

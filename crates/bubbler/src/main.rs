@@ -148,6 +148,7 @@ fn real_main() -> Result<i32> {
             let path = instance::config_path_checked(&env, &name)
                 .with_context(|| format!("opening instance `{name}`"))?;
             let editor = host_env::editor().context("neither VISUAL nor EDITOR is set")?;
+            // $VISUAL/$EDITOR is split into argv, never passed to a shell.
             let mut parts = editor
                 .as_bytes()
                 .split(u8::is_ascii_whitespace)
