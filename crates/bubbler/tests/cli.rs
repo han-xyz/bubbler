@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use bubbler_core::bwrap::ETC_ALLOWLIST;
 use common::{
     bubbler, bubbler_dbus, bubbler_live, real_init, require_bwrap, require_dbus, require_portal,
-    require_python,
+    require_python, test_pty,
 };
 use rustix::process::{Pid, Signal, kill_process};
 
@@ -1498,5 +1498,333 @@ fn real_bwrap_try_leaves_no_instance_unless_kept() {
         tmp.path()
             .join("data/bubbler/instances/kept/config.kdl")
             .is_file()
+    );
+}
+
+/// What a command sees of its terminal: the device behind its stdin, the
+/// one bwrap bound at `/dev/console`, and the one the kernel calls its
+/// controlling terminal.
+///
+/// The devices are read from descriptors through `/proc/self/fd`, which
+/// the kernel resolves to the open file itself. Paths cannot answer this:
+/// `/dev/tty` is the 5:0 node in every session, and the pty's own
+/// `/dev/pts` name is the host's, which the sandbox's fresh devpts does
+/// not have.
+const TTY_PROBE: &str = concat!(
+    r#"echo "fd0 $(stat -L -c %Hr:%Lr /proc/self/fd/0)"; "#,
+    r#"echo "console $(stat -L -c %Hr:%Lr /dev/console 2>/dev/null)"; "#,
+    // Field 7 of /proc/<pid>/stat is `tty_nr`, the controlling terminal
+    // the kernel recorded, and 0 when there is none. Field 2 is `comm`,
+    // which is `sh` here and holds no space to shift the fields.
+    r#"echo "ttynr $(awk '{print $7}' /proc/self/stat)""#,
+);
+
+/// The `tty_nr` the kernel records for the device `major:minor`, encoded
+/// as `MKDEV` does it (`include/linux/kdev_t.h`): the low eight bits of
+/// the minor sit under the major and the rest above it.
+fn tty_nr(dev: &str) -> u64 {
+    let (major, minor) = dev.split_once(':').expect("a `major:minor` device");
+    let (major, minor): (u64, u64) = (major.parse().unwrap(), minor.parse().unwrap());
+    (major << 8) | (minor & 0xff) | ((minor & !0xff) << 12)
+}
+
+/// The value the probe printed for `key`.
+fn probed<'a>(out: &'a str, key: &str) -> &'a str {
+    out.lines()
+        .find_map(|l| l.strip_prefix(&format!("{key} ")))
+        .unwrap_or_else(|| panic!("no `{key}` line in {out:?}"))
+        .trim()
+}
+
+/// An instance ready to be run, with the real supervisor behind it.
+fn live_instance(name: &str) -> Option<(tempfile::TempDir, PathBuf)> {
+    if !require_bwrap() {
+        return None;
+    }
+    let init = real_init()?;
+    let tmp = setup();
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["create", name])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "creating `{name}` failed");
+    Some((tmp, init))
+}
+
+#[test]
+fn real_bwrap_run_from_a_terminal_gives_the_sandbox_a_terminal_of_its_own() {
+    let Some((tmp, init)) = live_instance("t") else {
+        return;
+    };
+    let pty = test_pty();
+    let mut run = bubbler_live(tmp.path(), &init)
+        .args(["run", "t", "--", "/usr/bin/sh", "-c", TTY_PROBE])
+        .stdin(pty.stdio())
+        .stdout(pty.stdio())
+        .stderr(pty.stdio())
+        .spawn()
+        .unwrap();
+    let out = pty.read_until(Duration::from_secs(20), |s| s.contains("ttynr "));
+    assert_eq!(run.wait().unwrap().code(), Some(0), "{out:?}");
+    let (fd0, console) = (probed(&out, "fd0"), probed(&out, "console"));
+    assert_eq!(
+        fd0, console,
+        "/dev/console is not the sandbox's own pty:\n{out}"
+    );
+    assert_ne!(
+        fd0,
+        pty.dev(),
+        "the sandbox was handed the host terminal:\n{out}"
+    );
+    assert_eq!(
+        probed(&out, "ttynr").parse::<u64>().unwrap(),
+        tty_nr(fd0),
+        "the sandbox's pty is not its controlling terminal:\n{out}"
+    );
+}
+
+#[test]
+fn real_bwrap_run_with_tty_passthrough_hands_over_the_host_terminal() {
+    let Some((tmp, init)) = live_instance("t") else {
+        return;
+    };
+    let pty = test_pty();
+    let mut run = bubbler_live(tmp.path(), &init)
+        .args([
+            "run",
+            "t",
+            "--tty",
+            "passthrough",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            TTY_PROBE,
+        ])
+        .stdin(pty.stdio())
+        .stdout(pty.stdio())
+        .stderr(pty.stdio())
+        .spawn()
+        .unwrap();
+    let out = pty.read_until(Duration::from_secs(20), |s| s.contains("ttynr "));
+    assert_eq!(run.wait().unwrap().code(), Some(0), "{out:?}");
+    // The old behaviour, kept as a knob: bwrap binds the user's own
+    // terminal at /dev/console for anything inside to open, and the
+    // sandbox's stdin is that terminal.
+    assert_eq!(probed(&out, "console"), pty.dev(), "{out}");
+    assert_eq!(probed(&out, "fd0"), pty.dev(), "{out}");
+    assert_eq!(
+        probed(&out, "ttynr"),
+        "0",
+        "passthrough must not take the user's terminal:\n{out}"
+    );
+}
+
+#[test]
+fn real_bwrap_run_writes_nothing_to_a_terminal_it_does_not_own() {
+    let Some((tmp, init)) = live_instance("t") else {
+        return;
+    };
+    let pty = test_pty();
+    // Only stdin is the terminal, so the sandbox's own output goes to the
+    // pipe and anything reaching the pty came from /dev/console.
+    let run = bubbler_live(tmp.path(), &init)
+        .args([
+            "run",
+            "t",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            "test -e /dev/console && echo CONSOLE; echo INJECT > /dev/console 2>&1; echo done",
+        ])
+        .stdin(pty.stdio())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = run.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("done"), "{stdout:?}");
+    assert!(
+        !stdout.contains("CONSOLE"),
+        "a /dev/console was bound although no output went to a terminal:\n{stdout}"
+    );
+    let seen = pty.read_until(Duration::from_millis(300), |_| false);
+    assert!(
+        !seen.contains("INJECT"),
+        "the sandbox wrote to the user's terminal: {seen:?}"
+    );
+}
+
+#[test]
+fn real_bwrap_run_with_tty_none_leaves_the_sandbox_without_one() {
+    let Some((tmp, init)) = live_instance("t") else {
+        return;
+    };
+    let pty = test_pty();
+    let mut run = bubbler_live(tmp.path(), &init)
+        .args([
+            "run",
+            "t",
+            "--tty",
+            "none",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            "tty; test -e /dev/console || echo NOCONSOLE; echo hello",
+        ])
+        .stdin(pty.stdio())
+        .stdout(pty.stdio())
+        .stderr(pty.stdio())
+        .spawn()
+        .unwrap();
+    let out = pty.read_until(Duration::from_secs(20), |s| s.contains("hello"));
+    assert_eq!(run.wait().unwrap().code(), Some(0), "{out:?}");
+    // The output still reaches the terminal, through bubbler's pipes.
+    assert!(out.contains("not a tty"), "{out:?}");
+    assert!(out.contains("NOCONSOLE"), "{out:?}");
+    assert!(out.contains("hello"), "{out:?}");
+}
+
+#[test]
+fn real_bwrap_run_reads_a_pipe_on_stdin_while_the_terminal_takes_the_output() {
+    let Some((tmp, init)) = live_instance("t") else {
+        return;
+    };
+    let pty = test_pty();
+    let mut run = bubbler_live(tmp.path(), &init)
+        .args(["run", "t", "--", "/usr/bin/cat"])
+        .stdin(Stdio::piped())
+        .stdout(pty.stdio())
+        .stderr(pty.stdio())
+        .spawn()
+        .unwrap();
+    // A pipe is not a terminal, so `cat` reads it directly; only the
+    // output side is replaced by the pty.
+    let mut stdin = run.stdin.take().expect("stdin was piped");
+    std::io::Write::write_all(&mut stdin, b"piped in\n").unwrap();
+    drop(stdin);
+    let out = pty.read_until(Duration::from_secs(20), |s| s.contains("piped in"));
+    assert_eq!(run.wait().unwrap().code(), Some(0), "{out:?}");
+    assert!(out.contains("piped in"), "{out:?}");
+}
+
+/// What an exec'd command must see of the terminal it was given: its own
+/// session, and the window size of the user's terminal.
+const EXEC_PROBE: &str = concat!(
+    r#"test "$(ps -o sid= -p $$ | tr -d ' ')" = "$$" && echo LEADER; "#,
+    r#"echo "size $(stty size)""#,
+);
+
+#[test]
+fn real_bwrap_exec_from_a_terminal_leads_its_own_session_with_the_window_size() {
+    let Some((tmp, init)) = live_instance("t") else {
+        return;
+    };
+    let run = bubbler_live(tmp.path(), &init)
+        .args(["run", "t", "--", "/usr/bin/sleep", "30"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let sock = tmp.path().join("run/bubbler/t/init.sock");
+    if !wait_until(
+        || UnixStream::connect(&sock).is_ok(),
+        Duration::from_secs(10),
+    ) {
+        fail_with(run, "the instance never accepted a connection");
+    }
+
+    let pty = test_pty();
+    let mut exec = bubbler_live(tmp.path(), &init)
+        .args(["exec", "t", "--", "/usr/bin/sh", "-c", EXEC_PROBE])
+        .stdin(pty.stdio())
+        .stdout(pty.stdio())
+        .stderr(pty.stdio())
+        .spawn()
+        .unwrap();
+    let out = pty.read_until(Duration::from_secs(20), |s| s.contains("size "));
+    assert_eq!(exec.wait().unwrap().code(), Some(0), "{out:?}");
+    assert!(
+        out.contains("LEADER"),
+        "the command leads no session:\n{out}"
+    );
+    assert_eq!(probed(&out, "size"), "24 80", "{out:?}");
+
+    // Passthrough is the old behaviour: bubbler's own fds, and no session
+    // of its own, because taking one would take the user's terminal.
+    let plain = test_pty();
+    let mut exec = bubbler_live(tmp.path(), &init)
+        .args([
+            "exec",
+            "t",
+            "--tty",
+            "passthrough",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            EXEC_PROBE,
+        ])
+        .stdin(plain.stdio())
+        .stdout(plain.stdio())
+        .stderr(plain.stdio())
+        .spawn()
+        .unwrap();
+    let out = plain.read_until(Duration::from_secs(20), |s| s.contains("size "));
+    assert_eq!(exec.wait().unwrap().code(), Some(0), "{out:?}");
+    assert!(!out.contains("LEADER"), "took a session anyway:\n{out}");
+
+    kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
+    let mut run = run;
+    assert!(
+        wait_until(
+            || run.try_wait().expect("waiting for the run").is_some(),
+            Duration::from_secs(8)
+        ),
+        "the run did not stop after SIGTERM"
+    );
+}
+
+#[test]
+fn real_bwrap_run_detaches_on_three_escapes_and_keeps_the_sandbox() {
+    let Some((tmp, init)) = live_instance("t") else {
+        return;
+    };
+    let pty = test_pty();
+    let mut run = bubbler_live(tmp.path(), &init)
+        .args(["run", "t", "--", "/usr/bin/sleep", "30"])
+        .stdin(pty.stdio())
+        .stdout(pty.stdio())
+        .stderr(pty.stdio())
+        .spawn()
+        .unwrap();
+    let sock = tmp.path().join("run/bubbler/t/init.sock");
+    if !wait_until(
+        || UnixStream::connect(&sock).is_ok(),
+        Duration::from_secs(10),
+    ) {
+        let _ = run.kill();
+        panic!("the instance never accepted a connection");
+    }
+    pty.type_in(&[0x1d, 0x1d, 0x1d]);
+    let out = pty.read_until(Duration::from_secs(5), |s| s.contains("detached"));
+    assert!(out.contains("bubbler: detached"), "no detach note: {out:?}");
+    // The sandbox is still there, and bubbler is still waiting for it:
+    // leaving would end it through --die-with-parent.
+    assert!(UnixStream::connect(&sock).is_ok(), "the instance is gone");
+    assert!(run.try_wait().unwrap().is_none(), "bubbler left with it");
+
+    kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
+    assert!(
+        wait_until(
+            || run.try_wait().expect("waiting for the run").is_some(),
+            Duration::from_secs(8)
+        ),
+        "the detached run did not stop after SIGTERM"
     );
 }

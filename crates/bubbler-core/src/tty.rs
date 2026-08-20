@@ -1,7 +1,7 @@
 //! The sandbox's terminal: pty allocation, the per-fd stdio decision, raw
 //! mode on the user's terminal and the relay between the two.
 
-use std::os::fd::{BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -11,8 +11,8 @@ use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::io::{Errno, read, write};
 use rustix::pty::{OpenptFlags, grantpt, ioctl_tiocgptpeer, openpt, unlockpt};
 use rustix::termios::{
-    LocalModes, OptionalActions, SpecialCodeIndex, Termios, tcgetattr, tcgetwinsize, tcsetattr,
-    tcsetwinsize,
+    LocalModes, OptionalActions, SpecialCodeIndex, Termios, isatty, tcgetattr, tcgetwinsize,
+    tcsetattr, tcsetwinsize,
 };
 
 use crate::error::{ConfigError, LaunchError};
@@ -35,6 +35,10 @@ const DRAIN: Duration = Duration::from_millis(200);
 
 /// `^]`, the detach key.
 const ESCAPE: u8 = 0x1d;
+
+/// What the user is told when the detach sequence is typed. The sandbox
+/// keeps running either way; what ends is the relay.
+pub const DETACHED_NOTE: &str = "bubbler: detached; the sandbox keeps running";
 
 /// How many `ESCAPE` bytes in a row detach, and how long that run may take.
 const DETACH_RUN: usize = 3;
@@ -114,8 +118,40 @@ impl StdioPlan {
     /// sandbox reads its input through the pty, so its line discipline is
     /// the one interpreting Ctrl-C and the erase key.
     pub fn raw_mode(&self) -> bool {
+        self.ctty()
+    }
+
+    /// Whether the sandbox may take its fd 0 as a controlling terminal:
+    /// only when that fd is the slave of a pty bubbler allocated, never a
+    /// terminal it merely inherited from the user.
+    pub fn ctty(&self) -> bool {
         self.fds[0] == StdioTarget::Slave
     }
+}
+
+/// Which of bubbler's own fds 0, 1 and 2 are terminals. What the plan is
+/// made from: a pty replaces a terminal, never a pipe or a redirect.
+pub fn host_is_tty() -> [bool; 3] {
+    let (i, o, e) = (std::io::stdin(), std::io::stdout(), std::io::stderr());
+    [isatty(i), isatty(o), isatty(e)]
+}
+
+/// bubbler's own fds 0, 1 and 2, duplicated so a plan can index them by
+/// number. The copies are `CLOEXEC`: what the sandbox gets is decided by
+/// the plan, never inherited by accident.
+pub fn host_stdio() -> Result<[OwnedFd; 3], LaunchError> {
+    let (i, o, e) = (std::io::stdin(), std::io::stdout(), std::io::stderr());
+    let dup = |fd: BorrowedFd<'_>| fd.try_clone_to_owned().map_err(LaunchError::Pty);
+    Ok([dup(i.as_fd())?, dup(o.as_fd())?, dup(e.as_fd())?])
+}
+
+/// Which of bubbler's fds the pty's output goes back out on: the first of
+/// 1, 2 and 0 the pty stands in for, so output still reaches the terminal
+/// when stdout alone is redirected. `None` when there is no pty.
+pub fn output_fd(plan: &StdioPlan) -> Option<usize> {
+    [1, 2, 0]
+        .into_iter()
+        .find(|i| plan.fds[*i] == StdioTarget::Slave)
 }
 
 /// Decide each of fds 0, 1 and 2 on its own from `mode` and which of
@@ -389,6 +425,60 @@ fn drain(master: BorrowedFd<'_>, host_out: BorrowedFd<'_>) -> Result<(), LaunchE
     }
 }
 
+/// Copy each pipe to the fd next to it until `until` reports an exit and
+/// the pipes have run dry, or 200 ms after that at the latest. This is
+/// the whole relay for a sandbox with no terminal: same poll loop, no
+/// threads, and nothing that can hand the sandbox a terminal fd.
+pub fn pump(
+    pipes: &[(BorrowedFd<'_>, BorrowedFd<'_>)],
+    until: &mut dyn FnMut() -> Option<i32>,
+) -> Result<i32, LaunchError> {
+    let mut open = vec![true; pipes.len()];
+    let mut buf = [0u8; CHUNK];
+    let mut exited: Option<(i32, Instant)> = None;
+    loop {
+        if exited.is_none()
+            && let Some(code) = until()
+        {
+            exited = Some((code, Instant::now() + DRAIN));
+        }
+        if let Some((code, deadline)) = exited
+            && (!open.contains(&true) || Instant::now() >= deadline)
+        {
+            return Ok(code);
+        }
+        let mut fds: Vec<PollFd> = Vec::with_capacity(pipes.len());
+        let live: Vec<usize> = open
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| o.then_some(i))
+            .collect();
+        for i in &live {
+            fds.push(PollFd::from_borrowed_fd(pipes[*i].0, PollFlags::IN));
+        }
+        let polled = poll(&mut fds, Some(&TICK_TIMESPEC));
+        let ready: Vec<bool> = fds.iter().map(|f| !f.revents().is_empty()).collect();
+        drop(fds);
+        match polled {
+            Err(Errno::INTR) => continue,
+            Err(e) => return Err(pty_error(e)),
+            Ok(_) => {}
+        }
+        for (slot, i) in live.into_iter().enumerate() {
+            if !ready[slot] {
+                continue;
+            }
+            match read(pipes[i].0, &mut buf) {
+                // The sandbox closed this end; nothing more will come.
+                Ok(0) => open[i] = false,
+                Ok(n) => write_all(pipes[i].1, &buf[..n])?,
+                Err(Errno::AGAIN) | Err(Errno::INTR) => {}
+                Err(_) => open[i] = false,
+            }
+        }
+    }
+}
+
 /// The pty's end-of-file character, or `None` when its line discipline
 /// has no notion of one: `VEOF` is only acted on in canonical mode, so a
 /// reader that turned `ICANON` off would just receive a stray byte.
@@ -554,6 +644,18 @@ mod tests {
             assert_eq!(p.fds, [Null, Pipe, Pipe], "none with {is_tty:?}");
             assert!(!p.needs_pty() && !p.raw_mode());
         }
+    }
+
+    #[test]
+    fn the_pty_writes_back_to_the_first_terminal_among_stdout_stderr_stdin() {
+        use StdioTarget::{Inherit, Slave};
+        let at = |fds: [StdioTarget; 3]| output_fd(&StdioPlan { fds, pty: None });
+        assert_eq!(at([Slave, Slave, Slave]), Some(1));
+        // stdout redirected to a file: the terminal is still stderr's.
+        assert_eq!(at([Slave, Inherit, Slave]), Some(2));
+        // Only stdin is a terminal, so that is where its echo must go.
+        assert_eq!(at([Slave, Inherit, Inherit]), Some(0));
+        assert_eq!(at([Inherit; 3]), None);
     }
 
     #[test]
@@ -732,6 +834,47 @@ mod tests {
         assert_eq!(tcgetwinsize(&slave).unwrap().ws_row, 13);
         assert_eq!(finish(r), RelayEnd::Exited(0));
         drop(host.master);
+    }
+
+    #[test]
+    fn the_pump_copies_each_pipe_to_its_own_destination() {
+        let (r_out, w_out) = rustix::pipe::pipe().unwrap();
+        let (r_err, w_err) = rustix::pipe::pipe().unwrap();
+        let (host_out, test_out) = UnixStream::pair().unwrap();
+        let (host_err, test_err) = UnixStream::pair().unwrap();
+        write(&w_out, b"to stdout\n").unwrap();
+        write(&w_err, b"to stderr\n").unwrap();
+        // The sandbox is gone: its pipes are at EOF and the status is in.
+        drop(w_out);
+        drop(w_err);
+        let mut until = || Some(5);
+        let code = pump(
+            &[
+                (r_out.as_fd(), host_out.as_fd()),
+                (r_err.as_fd(), host_err.as_fd()),
+            ],
+            &mut until,
+        )
+        .unwrap();
+        assert_eq!(code, 5);
+        expect(test_out.as_fd(), b"to stdout\n");
+        expect(test_err.as_fd(), b"to stderr\n");
+    }
+
+    #[test]
+    fn the_pump_stops_on_the_drain_deadline_when_a_pipe_stays_open() {
+        let (read_end, write_end) = rustix::pipe::pipe().unwrap();
+        let (host_out, test_out) = UnixStream::pair().unwrap();
+        write(&write_end, b"last words\n").unwrap();
+        let mut until = || Some(0);
+        let started = Instant::now();
+        // Something inside still holds the write end, so only the deadline
+        // ends this; what was already written must still arrive.
+        let code = pump(&[(read_end.as_fd(), host_out.as_fd())], &mut until).unwrap();
+        assert_eq!(code, 0);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        expect(test_out.as_fd(), b"last words\n");
+        drop(write_end);
     }
 
     #[test]

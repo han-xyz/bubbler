@@ -66,6 +66,8 @@ pub struct BwrapArgs {
     runtime_dir: Vec<Item>,
     binds: Vec<Item>,
     env: Vec<Item>,
+    /// `--ctty` in the supervisor's own argv, not a bwrap flag.
+    ctty: bool,
 }
 
 fn push<const N: usize>(v: &mut Vec<Item>, parts: [&OsStr; N]) {
@@ -138,6 +140,7 @@ impl BwrapArgs {
             runtime_dir: Vec::new(),
             binds: Vec::new(),
             env: Vec::new(),
+            ctty: false,
         };
         let o = OsStr::new;
         push(
@@ -259,6 +262,7 @@ impl BwrapArgs {
             runtime_dir: Vec::new(),
             binds: Vec::new(),
             env: Vec::new(),
+            ctty: false,
         };
         let o = OsStr::new;
         push(
@@ -379,6 +383,13 @@ impl BwrapArgs {
         });
     }
 
+    /// Let the command take its stdin as a controlling terminal: `--ctty`
+    /// for the supervisor. Only for a pty bubbler allocated and handed to
+    /// this sandbox, never for a terminal it inherited from the user.
+    pub fn ctty(&mut self) {
+        self.ctty = true;
+    }
+
     /// Set a variable inside the sandbox (phase 5, after `--clearenv`).
     pub fn setenv(&mut self, key: &OsStr, value: &OsStr) {
         push(&mut self.env, [OsStr::new("--setenv"), key, value]);
@@ -393,6 +404,7 @@ impl BwrapArgs {
         command: &[OsString],
         alloc: &mut dyn FdAllocator,
     ) -> Result<Vec<OsString>, LaunchError> {
+        let ctty = self.ctty;
         let mut out = self.emit(alloc)?;
         let socket = alloc.init_socket().map_err(LaunchError::Data)?;
         out.extend([
@@ -400,8 +412,11 @@ impl BwrapArgs {
             INIT_INSIDE.into(),
             "--socket-fd".into(),
             socket,
-            "--".into(),
         ]);
+        if ctty {
+            out.push("--ctty".into());
+        }
+        out.push("--".into());
         out.extend_from_slice(command);
         Ok(out)
     }
@@ -902,6 +917,18 @@ mod tests {
         assert_eq!(
             &s[s.len() - 6..],
             &["--", INIT_INSIDE, "--socket-fd", "6", "--", "sh"]
+        );
+    }
+
+    #[test]
+    fn the_controlling_terminal_switch_reaches_the_supervisor_argv() {
+        let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default());
+        args.ctty();
+        let argv = args.finish(&["sh".into()], &mut Counter::new()).unwrap();
+        let s = strs(&argv);
+        assert_eq!(
+            &s[s.len() - 7..],
+            &["--", INIT_INSIDE, "--socket-fd", "6", "--ctty", "--", "sh"]
         );
     }
 

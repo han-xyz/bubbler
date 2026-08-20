@@ -5,8 +5,9 @@ combining bubblejail's explicit instances and resource grants with a profile
 library in the spirit of firejail. bubbler itself is unprivileged; `bwrap`
 does the namespace work.
 
-Status: milestone 3 — the `alacritty` and `firefox` profiles run, with GPU,
-sound, a private home and a filtered session bus. See "Known gaps" below.
+Status: milestone 3, plus milestone 4's isolated terminal — the `alacritty`
+and `firefox` profiles run, with GPU, sound, a private home and a filtered
+session bus. See "Known gaps" below.
 
 ## Usage
 
@@ -17,6 +18,7 @@ sound, a private home and a filtered session bus. See "Known gaps" below.
     bubbler run ff                        # uses `command` from config.kdl
     bubbler run ff -- firefox --version   # or run something else inside
     bubbler run ff --dry-run              # print the bwrap argv, do not launch
+    bubbler run ff --tty none             # no terminal inside at all
     bubbler exec ff -- firefox --version  # run inside the instance already running
     bubbler try -- id                     # throwaway sandbox, nothing kept
     bubbler try --profile firefox --grant network -- firefox --version
@@ -35,10 +37,10 @@ directory, which `exec` connects to; the socket is bound by bubbler and only
 handed to the sandbox as an inherited file descriptor, so nothing inside can
 reach the path. `run` on an instance that is already running says so and
 execs into it instead of starting a second sandbox; configuration changes
-apply on the next start. An exec'd process is given bubbler's own stdin,
-stdout and stderr, and descriptors passed to exec'd commands are reachable by
-the sandboxed application through `/proc`: exec is a convenience channel, not
-a boundary.
+apply on the next start. An exec'd process is given whatever the terminal
+mode decides on (see "Terminal"), and descriptors passed to exec'd commands
+are reachable by the sandboxed application through `/proc`: exec is a
+convenience channel, not a boundary.
 
 A run is a chain of processes; `bubbler` waits at the top of it and returns the
 command's status.
@@ -107,6 +109,7 @@ file order does not affect the generated argv.
     portals                          # XDG portal rules plus /.flatpak-info
     notify                           # talk to org.freedesktop.Notifications
     mpris name="firefox.*"           # own org.mpris.MediaPlayer2.firefox.*
+    tty "pty"                        # terminal: "pty", "passthrough" or "none"
     env MOZ_ENABLE_WAYLAND="1"       # extra variables, KEY="value", repeatable
     command "firefox"
 
@@ -194,6 +197,49 @@ A rule grants exactly as much as it reads, and the globs are wide: `own
 the whole `org.mpris.MediaPlayer2.` tree, so the sandbox can impersonate any
 player on the session bus. Name the application, not a prefix.
 
+## Terminal
+
+The host terminal does not enter the sandbox. For each of bubbler's own fds
+0, 1 and 2 that is a terminal, `run` and `exec` hand the sandbox the slave of
+a pseudoterminal bubbler allocated and relay between the two; an fd that is
+not a terminal — a pipe, a redirect — is passed through unchanged, so a
+piped `bubbler run t -- cat` still reads the pipe and a redirected
+`bubbler run t` still writes the file. A pty is allocated only when at least
+one of the three is a terminal. The mode is the `tty` node in `config.kdl` and
+`--tty <mode>` on `run`, `exec` and `try`, which wins over it:
+
+    pty          the default, described above
+    passthrough  bubbler's own descriptors, handed over as they are
+    none         no terminal: stdin is /dev/null and the output comes back
+                 through pipes, with nothing bound at /dev/console
+
+In `pty` mode the command inside leads its own session with that pty as its
+controlling terminal, so job control, `/dev/tty` and `stty` work, and bwrap
+binds the sandbox's own pty at `/dev/console` rather than yours. Your
+terminal is in raw mode while the sandbox runs: Ctrl-C and the erase key are
+bytes for the line discipline inside, and a window resize is copied onto the
+pty. `^]` (Ctrl-]) three times within a second detaches — `run` stops
+relaying, restores the terminal, prints a note and keeps waiting quietly,
+because leaving would end the sandbox through `--die-with-parent`; `exec`
+exits 0 and leaves the command to the supervisor, whose terminal hangs up
+with bubbler. A `^]` you meant for the application still reaches it, just
+after the run of three cannot complete.
+
+What remains, and is inherent to any relay: the application can read what you
+type into that session, and can emit escape sequences your terminal emulator
+parses — title changes, OSC 52 clipboard writes, and query sequences whose
+answers arrive as its own input. Do not type a password into a session you do
+not trust. `passthrough` gives up the rest as well: the sandbox holds your
+terminal's descriptors and reaches it again through `/dev/console`.
+
+Because the pty is allocated on the host, `ttyname(0)` inside names a host
+`/dev/pts/N` that the sandbox's own devpts does not have, so a program that
+resolves its terminal by path — `sudo`, `script`, `wall` — can fail there;
+`tty "passthrough"` is the way out if an application needs it. `bubbler exec`
+takes the instance's `tty` node when `config.kdl` parses and the default
+`pty` when it does not, since a running instance stays reachable while its
+config is being edited.
+
 ## Baseline
 
 Every sandbox gets: all namespaces unshared, no network, read-only `/usr` and
@@ -224,11 +270,10 @@ binding the tree under it.
 - No system bus, no accessibility bus, no document-portal FUSE mount: `dbus`
   covers the session bus only, so a portal that hands back a `/run/user/<uid>/doc`
   path gives the sandbox nothing it can open.
-- `exec` passes bubbler's own stdin, stdout and stderr straight through, so
-  the process inside holds the host terminal's descriptors and is in no
-  session of its own. Descriptors passed to exec'd commands are reachable by
-  the sandboxed application through `/proc` — exec is a convenience channel,
-  not a boundary.
+- Descriptors handed to a command through `exec` are reachable by the
+  sandboxed application through `/proc` — exec is a convenience channel, not
+  a boundary. What the sandbox can still do with the terminal it is given is
+  under "Terminal".
 - No seccomp filter — the sandbox is namespaces and mounts only.
 - No proprietary nvidia driver; `dri` covers the open stack.
 - `/etc/machine-id` is bound in, so every instance shares one stable

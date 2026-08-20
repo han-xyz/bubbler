@@ -1,10 +1,15 @@
 //! Shared helpers for CLI integration tests.
 
 use std::ffi::OsStr;
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::termios::Winsize;
 
 /// Returns false (after printing why) when real bwrap runs cannot work
 /// here: no `bwrap` on PATH or no user namespaces.
@@ -153,4 +158,88 @@ pub fn require_dbus() -> bool {
         return false;
     }
     true
+}
+
+/// Rows and columns every test pty is given, so `stty size` inside a
+/// sandbox has something to report: a fresh pty has none.
+const TEST_WINSIZE: Winsize = Winsize {
+    ws_row: 24,
+    ws_col: 80,
+    ws_xpixel: 0,
+    ws_ypixel: 0,
+};
+
+/// A terminal the test owns. bubbler is spawned with the slave as its
+/// stdio, which is the only way to exercise the pty mode: with pipes for
+/// stdio there is no terminal to replace.
+pub struct TestPty {
+    /// The test's end, where everything bubbler writes shows up.
+    pub master: OwnedFd,
+    /// bubbler's end, handed over as one or more of its stdio fds.
+    pub slave: OwnedFd,
+}
+
+/// A pty pair with a known window size.
+pub fn test_pty() -> TestPty {
+    let flags = rustix::pty::OpenptFlags::RDWR
+        | rustix::pty::OpenptFlags::NOCTTY
+        | rustix::pty::OpenptFlags::CLOEXEC;
+    let master = rustix::pty::openpt(flags).unwrap();
+    rustix::pty::grantpt(&master).unwrap();
+    rustix::pty::unlockpt(&master).unwrap();
+    let slave = rustix::pty::ioctl_tiocgptpeer(&master, flags).unwrap();
+    rustix::termios::tcsetwinsize(&slave, TEST_WINSIZE).unwrap();
+    TestPty { master, slave }
+}
+
+impl TestPty {
+    /// A duplicate of the slave for one of a command's three stdio slots.
+    pub fn stdio(&self) -> Stdio {
+        Stdio::from(self.slave.try_clone().unwrap())
+    }
+
+    /// This pty's device as `major:minor` in decimal, the way the probes
+    /// inside a sandbox report theirs. How a test tells the sandbox's
+    /// terminal from its own.
+    pub fn dev(&self) -> String {
+        let st = rustix::fs::fstat(&self.slave).unwrap();
+        format!(
+            "{}:{}",
+            rustix::fs::major(st.st_rdev),
+            rustix::fs::minor(st.st_rdev)
+        )
+    }
+
+    /// Type into the terminal, as a user at the keyboard would.
+    pub fn type_in(&self, bytes: &[u8]) {
+        rustix::io::write(&self.master, bytes).unwrap();
+    }
+
+    /// Everything the terminal shows until `done` matches it or `limit`
+    /// passes. Carriage returns are dropped: this is a terminal, so every
+    /// line ends `\r\n`.
+    pub fn read_until(&self, limit: Duration, done: impl Fn(&str) -> bool) -> String {
+        let deadline = Instant::now() + limit;
+        let mut out = String::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() || done(&out) {
+                return out;
+            }
+            let slice = Timespec {
+                tv_sec: left.as_secs() as _,
+                tv_nsec: left.subsec_nanos() as _,
+            };
+            let mut fds = [PollFd::new(&self.master, PollFlags::IN)];
+            if poll(&mut fds, Some(&slice)).is_err() || fds[0].revents().is_empty() {
+                continue;
+            }
+            match rustix::io::read(&self.master, &mut buf) {
+                // EOF and EIO both mean the last slave is gone.
+                Ok(0) | Err(_) => return out,
+                Ok(n) => out.push_str(&String::from_utf8_lossy(&buf[..n]).replace('\r', "")),
+            }
+        }
+    }
 }

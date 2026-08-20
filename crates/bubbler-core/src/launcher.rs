@@ -3,11 +3,11 @@
 
 use std::ffi::OsString;
 use std::io::{self, Seek, SeekFrom, Write};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -17,13 +17,14 @@ use rustix::fs::{AtFlags, MemfdFlags, Mode, OFlags};
 use rustix::io::{Errno, FdFlags, fcntl_dupfd_cloexec, fcntl_setfd};
 use rustix::process::{Pid, Signal, kill_process, test_kill_process};
 use signal_hook::SigId;
-use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::consts::{SIGINT, SIGTERM, SIGWINCH};
 
 use crate::bwrap::{BwrapArgs, FdAllocator};
 use crate::env::Env;
 use crate::error::{ConfigError, LaunchError};
 use crate::host::{Host, RealHost};
 use crate::instance::Instance;
+use crate::tty::{self, Pty, RawGuard, RelayEnd, StdioTarget, TtyMode};
 use crate::{dbus, exec, init_bin, service};
 
 /// How often a running sandbox is checked for having exited.
@@ -206,12 +207,15 @@ pub fn resolve_command<'a>(
 /// Complete bwrap argv (without the program name) for an instance.
 /// `command` from the CLI replaces the config's `command` entirely.
 /// `alloc` turns each generated data file and channel into the fd number
-/// bwrap reads it from.
+/// bwrap reads it from. `ctty` says the sandbox's stdin will be the slave
+/// of a pty bubbler allocated, which is the only case in which the
+/// supervisor may claim it.
 pub fn build_argv(
     env: &Env,
     inst: &Instance,
     command: Option<&[OsString]>,
     alloc: &mut dyn FdAllocator,
+    ctty: bool,
 ) -> Result<Vec<OsString>, LaunchError> {
     let command = resolve_command(inst, command)?;
     let host = RealHost;
@@ -221,6 +225,9 @@ pub fn build_argv(
         dbus: plan.as_ref(),
     };
     let mut args = BwrapArgs::baseline(env, &inst.home(), &host);
+    if ctty {
+        args.ctty();
+    }
     // A portal call is answered by the identity bubbler publishes from
     // bwrap's own info document, so the app waits until that file is there.
     if plan.as_ref().is_some_and(|p| p.portals) {
@@ -724,10 +731,10 @@ fn release_block(alloc: &mut RealAlloc) {
     }
 }
 
-/// Drops this run's SIGINT/SIGTERM actions when it leaves, so a later run
-/// never sees a stale flag. `signal-hook` leaves its own handler in place,
-/// so both signals stay caught and are ignored until the next run.
-struct SignalGuard(Vec<SigId>);
+/// Drops this run's signal actions when it leaves, so a later run never
+/// sees a stale flag. `signal-hook` leaves its own handler in place, so
+/// the signals stay caught and are ignored until the next run.
+pub(crate) struct SignalGuard(pub(crate) Vec<SigId>);
 
 impl Drop for SignalGuard {
     fn drop(&mut self) {
@@ -738,11 +745,166 @@ impl Drop for SignalGuard {
     }
 }
 
+/// What bwrap is spawned with for one of fds 0, 1 and 2. The slave is
+/// duplicated per fd, so closing bubbler's own copy after the spawn
+/// leaves the sandbox's three intact.
+fn stdio_for(target: StdioTarget, pty: Option<&Pty>) -> Result<Stdio, LaunchError> {
+    match (target, pty) {
+        (StdioTarget::Slave, Some(p)) => {
+            Ok(Stdio::from(p.slave.try_clone().map_err(LaunchError::Pty)?))
+        }
+        // A plan naming a pty that was never allocated is a bug; handing
+        // the sandbox bubbler's own terminal instead would hide it.
+        (StdioTarget::Slave, None) => Err(LaunchError::Pty(io::Error::other(
+            "no pty was allocated for this sandbox",
+        ))),
+        (StdioTarget::Inherit, _) => Ok(Stdio::inherit()),
+        (StdioTarget::Null, _) => Ok(Stdio::null()),
+        (StdioTarget::Pipe, _) => Ok(Stdio::piped()),
+    }
+}
+
+/// Forward a caught signal to the sandbox and report the exit code once
+/// bwrap has one. The single place a run learns that it is over.
+fn check_exit(
+    child: &mut Child,
+    stop: &AtomicBool,
+    supervisor: Option<Pid>,
+) -> io::Result<Option<i32>> {
+    if let Some(status) = child.try_wait()? {
+        return Ok(Some(exit_code(status)));
+    }
+    if stop.swap(false, Ordering::SeqCst) {
+        // bubblewrap 0.11.2 exits on SIGTERM instead of forwarding it,
+        // so the signal goes to the supervisor, which stops the command
+        // within its grace period; without its pid the sandbox can only
+        // be brought down through bwrap and --die-with-parent. Racing
+        // the child's own exit is normal, so a failed kill is not an
+        // error.
+        let target = supervisor.unwrap_or_else(|| Pid::from_child(child));
+        let _ = kill_process(target, Signal::TERM);
+    }
+    Ok(None)
+}
+
+/// The exit check as the relay wants it: a closure reporting the code
+/// once there is one. A `try_wait` that fails ends the wait too, with the
+/// error left in `failed` for the caller to return.
+fn until_exit<'a>(
+    child: &'a mut Child,
+    stop: &'a AtomicBool,
+    supervisor: Option<Pid>,
+    failed: &'a mut Option<io::Error>,
+) -> impl FnMut() -> Option<i32> + 'a {
+    move || match check_exit(child, stop, supervisor) {
+        Ok(code) => code,
+        Err(e) => {
+            *failed = Some(e);
+            Some(1)
+        }
+    }
+}
+
+/// Wait for a sandbox that has no terminal and no pipes of ours: nothing
+/// to move, so the loop only watches for the exit and for signals.
+fn wait_plain(
+    child: &mut Child,
+    stop: &AtomicBool,
+    supervisor: Option<Pid>,
+) -> Result<i32, LaunchError> {
+    loop {
+        if let Some(code) = check_exit(child, stop, supervisor).map_err(LaunchError::Spawn)? {
+            return Ok(code);
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+/// Wait while copying the sandbox's output pipes to bubbler's own stdout
+/// and stderr, which is all `tty "none"` needs.
+fn wait_pumping(
+    child: &mut Child,
+    stop: &AtomicBool,
+    supervisor: Option<Pid>,
+    pipes: &[(BorrowedFd<'_>, BorrowedFd<'_>)],
+) -> Result<i32, LaunchError> {
+    let mut failed = None;
+    let code = {
+        let mut until = until_exit(child, stop, supervisor, &mut failed);
+        tty::pump(pipes, &mut until)?
+    };
+    match failed {
+        Some(e) => Err(LaunchError::Spawn(e)),
+        None => Ok(code),
+    }
+}
+
+/// Wait while relaying between the user's terminal and the sandbox's pty.
+///
+/// Detaching ends the relay, not the run: bubbler holds the master, and
+/// closing it would hang up the terminal inside, while leaving would take
+/// the sandbox with it through `--die-with-parent`. So it goes on
+/// waiting, quietly, with the pty drained into `/dev/null` so a program
+/// inside cannot fill it and block.
+fn wait_relaying(
+    child: &mut Child,
+    stop: &AtomicBool,
+    supervisor: Option<Pid>,
+    winch: &AtomicBool,
+    master: BorrowedFd<'_>,
+    ends: (Option<BorrowedFd<'_>>, BorrowedFd<'_>),
+    raw: &mut Option<RawGuard<'_>>,
+) -> Result<i32, LaunchError> {
+    let mut failed = None;
+    let end = {
+        let mut until = until_exit(child, stop, supervisor, &mut failed);
+        tty::relay(master, ends.0, ends.1, &mut until, winch)?
+    };
+    if let Some(e) = failed {
+        return Err(LaunchError::Spawn(e));
+    }
+    let code = match end {
+        RelayEnd::Exited(code) => code,
+        RelayEnd::Detached => {
+            // Restored first: the note would otherwise be printed with the
+            // terminal still raw, and its newline would not return the
+            // cursor to the first column.
+            if let Some(guard) = raw.as_mut() {
+                guard.restore();
+            }
+            eprintln!("{}", tty::DETACHED_NOTE);
+            let path = Path::new("/dev/null");
+            let sink = std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .map_err(|e| LaunchError::Io(path.to_path_buf(), e))?;
+            let mut until = until_exit(child, stop, supervisor, &mut failed);
+            match tty::relay(master, None, sink.as_fd(), &mut until, winch)? {
+                RelayEnd::Exited(code) => code,
+                // Nothing is read from the user any more, so there is
+                // nothing left that could ask to detach.
+                RelayEnd::Detached => 0,
+            }
+        }
+    };
+    match failed {
+        Some(e) => Err(LaunchError::Spawn(e)),
+        None => Ok(code),
+    }
+}
+
 /// Start the instance: bind its control socket, run bwrap around
 /// `bubbler-init`, forward SIGINT/SIGTERM once as SIGTERM and return the
-/// exit code to propagate. `AlreadyRunning` when the instance is live;
-/// that is an exec, which the caller decides on.
-pub fn run(env: &Env, inst: &Instance, command: Option<&[OsString]>) -> Result<i32, LaunchError> {
+/// exit code to propagate. `mode` decides what the sandbox gets for stdio;
+/// in `pty` mode bubbler allocates one and relays, so the sandbox never
+/// holds a descriptor for the user's terminal. `AlreadyRunning` when the
+/// instance is live; that is an exec, which the caller decides on.
+pub fn run(
+    env: &Env,
+    inst: &Instance,
+    command: Option<&[OsString]>,
+    mode: TtyMode,
+) -> Result<i32, LaunchError> {
     let dir = prepare_runtime_dir(env, inst)?;
     if exec::connect(env, &inst.name)?.is_some() {
         return Err(LaunchError::AlreadyRunning(inst.name.clone()));
@@ -772,16 +934,45 @@ pub fn run(env: &Env, inst: &Instance, command: Option<&[OsString]>) -> Result<i
         Some(_) => Some(adopt_proxy_bus(&dir)?),
         None => None,
     };
-    let argv = build_argv(env, inst, command, &mut alloc)?;
+    let host = tty::host_stdio()?;
+    let is_tty = tty::host_is_tty();
+    let mut stdio = tty::plan(mode, is_tty);
+    // The pty copies the settings of the first terminal bubbler has, and
+    // is allocated before raw mode: afterwards it would carry raw
+    // settings, leaving the sandbox without echo or line editing.
+    if let Some(i) = stdio
+        .needs_pty()
+        .then(|| is_tty.iter().position(|t| *t))
+        .flatten()
+    {
+        stdio.pty = Some(tty::allocate(host[i].as_fd())?);
+    }
+    let argv = build_argv(env, inst, command, &mut alloc, stdio.ctty())?;
     let stop = Arc::new(AtomicBool::new(false));
+    let winch = Arc::new(AtomicBool::new(false));
     let mut registered = SignalGuard(Vec::new());
     for sig in [SIGINT, SIGTERM] {
         let id =
             signal_hook::flag::register(sig, Arc::clone(&stop)).map_err(LaunchError::Signal)?;
         registered.0.push(id);
     }
+    if stdio.needs_pty() {
+        let id = signal_hook::flag::register(SIGWINCH, Arc::clone(&winch))
+            .map_err(LaunchError::Signal)?;
+        registered.0.push(id);
+    }
+    // Raw from here on: the pty inside has the line discipline now, so
+    // Ctrl-C is a byte for it and the guard restores the terminal on
+    // every way out of this function.
+    let mut raw = match stdio.raw_mode() {
+        true => Some(RawGuard::new(host[0].as_fd())?),
+        false => None,
+    };
     let mut child = Command::new("bwrap")
         .args(&argv)
+        .stdin(stdio_for(stdio.fds[0], stdio.pty.as_ref())?)
+        .stdout(stdio_for(stdio.fds[1], stdio.pty.as_ref())?)
+        .stderr(stdio_for(stdio.fds[2], stdio.pty.as_ref())?)
         .spawn()
         .map_err(|e| match e.kind() {
             io::ErrorKind::NotFound => LaunchError::BwrapMissing,
@@ -792,6 +983,16 @@ pub fn run(env: &Env, inst: &Instance, command: Option<&[OsString]>) -> Result<i
     drop(inherited);
     drop(listener);
     drop(alloc.info_write.take());
+    // The slave goes with it: the sandbox has its own copies, and one left
+    // here would keep the pty from ever reporting the end of its output.
+    let master = stdio.pty.take().map(|p| p.master);
+    let mut pipes: Vec<(OwnedFd, usize)> = Vec::new();
+    if let Some(out) = child.stdout.take() {
+        pipes.push((out.into(), 1));
+    }
+    if let Some(err) = child.stderr.take() {
+        pipes.push((err.into(), 2));
+    }
     let deadline = Instant::now() + INFO_TIMEOUT;
     let info = alloc
         .info_read
@@ -813,32 +1014,37 @@ pub fn run(env: &Env, inst: &Instance, command: Option<&[OsString]>) -> Result<i
     let supervisor = info.as_ref().and_then(|(reaper, _)| {
         supervisor_pid(*reaper, &mut child, Instant::now() + SUPERVISOR_WAIT)
     });
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(LaunchError::Spawn)? {
-            break status;
+    let code = match (&master, tty::output_fd(&stdio)) {
+        (Some(master), Some(out)) => wait_relaying(
+            &mut child,
+            &stop,
+            supervisor,
+            &winch,
+            master.as_fd(),
+            (stdio.ctty().then(|| host[0].as_fd()), host[out].as_fd()),
+            &mut raw,
+        ),
+        _ if !pipes.is_empty() => {
+            let ends: Vec<(BorrowedFd<'_>, BorrowedFd<'_>)> = pipes
+                .iter()
+                .map(|(read, i)| (read.as_fd(), host[*i].as_fd()))
+                .collect();
+            wait_pumping(&mut child, &stop, supervisor, &ends)
         }
-        if stop.swap(false, Ordering::SeqCst) {
-            // bubblewrap 0.11.2 exits on SIGTERM instead of forwarding it,
-            // so the signal goes to the supervisor, which stops the command
-            // within its grace period; without its pid the sandbox can only
-            // be brought down through bwrap and --die-with-parent. Racing
-            // the child's own exit is normal, so a failed kill is not an
-            // error.
-            let target = supervisor.unwrap_or_else(|| Pid::from_child(&child));
-            let _ = kill_process(target, Signal::TERM);
-        }
-        std::thread::sleep(POLL);
-    };
+        _ => wait_plain(&mut child, &stop, supervisor),
+    }?;
     // bwrap copies the data files out of the fds while it starts, so they
     // must stay open until it has exited.
     drop(alloc);
-    Ok(exit_code(status))
+    Ok(code)
 }
 
 /// Run `argv` inside the live instance `name` and return its exit code.
-pub fn exec(env: &Env, name: &str, argv: &[OsString]) -> Result<i32, LaunchError> {
+/// `mode` decides the terminal the command inside gets, exactly as for
+/// [`run`].
+pub fn exec(env: &Env, name: &str, argv: &[OsString], mode: TtyMode) -> Result<i32, LaunchError> {
     match exec::connect(env, name)? {
-        Some(stream) => exec::run_in(&stream, argv),
+        Some(stream) => exec::run_in(&stream, argv, mode),
         None => Err(LaunchError::NotRunning(name.to_owned())),
     }
 }
@@ -888,7 +1094,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let e = env(tmp.path());
         let i = inst(tmp.path(), "command \"foot\" \"-e\" \"fish\"");
-        let a = build_argv(&e, &i, None, &mut DryRunAlloc::default()).unwrap();
+        let a = build_argv(&e, &i, None, &mut DryRunAlloc::default(), false).unwrap();
         assert_eq!(
             &a[a.len() - 4..],
             &[
@@ -903,6 +1109,7 @@ mod tests {
             &i,
             Some(&[OsString::from("ls")]),
             &mut DryRunAlloc::default(),
+            false,
         )
         .unwrap();
         assert_eq!(&a[a.len() - 2..], &[OsString::from("--"), "ls".into()]);
@@ -913,7 +1120,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let e = env(tmp.path());
         let i = inst(tmp.path(), "command \"foot\"");
-        let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default()).unwrap());
+        let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default(), false).unwrap());
         let init = tmp.path().join("bubbler-init").display().to_string();
         assert!(
             a.windows(3)
@@ -932,7 +1139,7 @@ mod tests {
         e.init_override = Some(tmp.path().join("gone"));
         let i = inst(tmp.path(), "command \"foot\"");
         assert!(matches!(
-            build_argv(&e, &i, None, &mut DryRunAlloc::default()),
+            build_argv(&e, &i, None, &mut DryRunAlloc::default(), false),
             Err(LaunchError::MissingResource {
                 service: "init",
                 ..
@@ -948,7 +1155,7 @@ mod tests {
             tmp.path(),
             "env MOZ_ENABLE_WAYLAND=\"1\"\ncommand \"firefox\"",
         );
-        let a = build_argv(&e, &i, None, &mut DryRunAlloc::default()).unwrap();
+        let a = build_argv(&e, &i, None, &mut DryRunAlloc::default(), false).unwrap();
         let s = strs(&a);
         assert!(
             s.windows(3)
@@ -962,11 +1169,11 @@ mod tests {
         let e = env(tmp.path());
         let i = inst(tmp.path(), "");
         assert!(matches!(
-            build_argv(&e, &i, None, &mut DryRunAlloc::default()),
+            build_argv(&e, &i, None, &mut DryRunAlloc::default(), false),
             Err(LaunchError::Config(ConfigError::MissingCommand))
         ));
         assert!(matches!(
-            build_argv(&e, &i, Some(&[]), &mut DryRunAlloc::default()),
+            build_argv(&e, &i, Some(&[]), &mut DryRunAlloc::default(), false),
             Err(LaunchError::Config(ConfigError::MissingCommand))
         ));
     }
@@ -994,7 +1201,7 @@ mod tests {
         let dir = prepare_runtime_dir(&e, &i).unwrap();
         let _listener = UnixListener::bind(dir.join(exec::SOCKET_NAME)).unwrap();
         assert!(matches!(
-            run(&e, &i, None),
+            run(&e, &i, None, TtyMode::Passthrough),
             Err(LaunchError::AlreadyRunning(n)) if n == "t"
         ));
     }
@@ -1004,7 +1211,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let e = env(tmp.path());
         assert!(matches!(
-            exec(&e, "t", &[OsString::from("/usr/bin/true")]),
+            exec(&e, "t", &[OsString::from("/usr/bin/true")], TtyMode::Passthrough),
             Err(LaunchError::NotRunning(n)) if n == "t"
         ));
     }
@@ -1194,7 +1401,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let e = env(tmp.path());
         let i = inst(tmp.path(), "dbus\nportals\ncommand \"x\"");
-        let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default()).unwrap());
+        let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default(), false).unwrap());
         let bus = tmp.path().join("run/bubbler/t/bus").display().to_string();
         let inside = tmp.path().join("run/bus").display().to_string();
         assert!(
@@ -1219,11 +1426,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let e = env(tmp.path());
         let i = inst(tmp.path(), "dbus\nportals\ncommand \"x\"");
-        let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default()).unwrap());
+        let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default(), false).unwrap());
         assert!(a.windows(2).any(|w| w == ["--block-fd", "4"]), "{a:?}");
         for kdl in ["dbus\ncommand \"x\"", "command \"x\""] {
             let i = inst(tmp.path(), kdl);
-            let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default()).unwrap());
+            let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default(), false).unwrap());
             assert!(!a.contains(&"--block-fd".to_string()), "{kdl}: {a:?}");
         }
     }

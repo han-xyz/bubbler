@@ -6,15 +6,26 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::process::{Command, ExitCode};
+use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
 use bubbler_core::config::Service;
-use bubbler_core::error::LaunchError;
+use bubbler_core::error::{ConfigError, LaunchError};
 use bubbler_core::exec;
 use bubbler_core::instance::{self, Instance};
 use bubbler_core::launcher;
 use bubbler_core::profile;
+use bubbler_core::tty::{self, TtyMode};
 use clap::{Parser, Subcommand};
+
+/// `--tty` takes the names the config's `tty` node takes; clap already
+/// says which value was rejected, so only the reason is passed on.
+fn tty_mode(s: &str) -> Result<TtyMode, String> {
+    TtyMode::from_str(s).map_err(|e| match e {
+        ConfigError::BadArgument { reason, .. } => reason,
+        other => other.to_string(),
+    })
+}
 
 /// bubblewrap-based application sandbox.
 #[derive(Parser)]
@@ -42,6 +53,10 @@ enum Cmd {
         /// Print the bwrap argv, one element per line, instead of running.
         #[arg(long)]
         dry_run: bool,
+        /// Terminal the sandbox gets: `pty`, `passthrough` or `none`;
+        /// overrides the instance's `tty` node.
+        #[arg(long, value_name = "MODE", value_parser = tty_mode)]
+        tty: Option<TtyMode>,
         /// Command to run; replaces the config's `command`.
         #[arg(last = true)]
         command: Vec<OsString>,
@@ -57,6 +72,10 @@ enum Cmd {
         /// Keep the sandbox afterwards as an instance with this name.
         #[arg(long, value_name = "NAME")]
         keep: Option<String>,
+        /// Terminal the sandbox gets: `pty`, `passthrough` or `none`;
+        /// overrides the profile's `tty` node.
+        #[arg(long, value_name = "MODE", value_parser = tty_mode)]
+        tty: Option<TtyMode>,
         /// Command to run; replaces the profile's `command`.
         #[arg(last = true)]
         command: Vec<OsString>,
@@ -65,6 +84,10 @@ enum Cmd {
     Exec {
         /// Instance name.
         name: String,
+        /// Terminal the command gets: `pty`, `passthrough` or `none`;
+        /// overrides the instance's `tty` node.
+        #[arg(long, value_name = "MODE", value_parser = tty_mode)]
+        tty: Option<TtyMode>,
         /// Command to run inside it, after `--`.
         #[arg(last = true, required = true)]
         command: Vec<OsString>,
@@ -130,6 +153,7 @@ fn real_main() -> Result<i32> {
         Cmd::Run {
             name,
             dry_run,
+            tty,
             command,
         } => {
             let inst = Instance::open(&env, &name).with_context(|| {
@@ -139,14 +163,20 @@ fn real_main() -> Result<i32> {
                 )
             })?;
             let command = (!command.is_empty()).then_some(command.as_slice());
+            let mode = tty.unwrap_or(inst.config.tty);
             if dry_run {
                 // A dry run describes a fresh start and never touches a
                 // live instance, so the liveness check is skipped here.
+                // The argv still depends on this terminal: `--ctty` is
+                // there exactly when a real run would allocate a pty for
+                // the sandbox's stdin.
+                let ctty = tty::plan(mode, tty::host_is_tty()).ctty();
                 let argv = launcher::build_argv(
                     &env,
                     &inst,
                     command,
                     &mut launcher::DryRunAlloc::default(),
+                    ctty,
                 )
                 .context("building bwrap arguments")?;
                 let mut lines = vec![OsStr::new("bwrap")];
@@ -161,19 +191,20 @@ fn real_main() -> Result<i32> {
                      (config changes apply after restart)"
                 );
                 let command = launcher::resolve_command(&inst, command)?;
-                return exec::run_in(&stream, command)
+                return exec::run_in(&stream, command, mode)
                     .with_context(|| format!("executing in instance `{name}`"));
             }
             if inst.has_service(&Service::X11) {
                 eprintln!("bubbler: warning: x11 grants no isolation between X clients");
             }
-            launcher::run(&env, &inst, command)
+            launcher::run(&env, &inst, command, mode)
                 .with_context(|| format!("running instance `{name}`"))
         }
         Cmd::Try {
             profile,
             grants,
             keep,
+            tty,
             command,
         } => {
             let grants: Vec<&str> = grants.iter().map(String::as_str).collect();
@@ -187,7 +218,8 @@ fn real_main() -> Result<i32> {
                 eprintln!("bubbler: warning: x11 grants no isolation between X clients");
             }
             let command = (!command.is_empty()).then_some(command.as_slice());
-            let code = launcher::run(&env, &eph.instance, command);
+            let mode = tty.unwrap_or(eph.instance.config.tty);
+            let code = launcher::run(&env, &eph.instance, command, mode);
             // Something else already answers on this pid's control socket,
             // so that runtime directory is not this run's to remove.
             if matches!(code, Err(LaunchError::AlreadyRunning(_))) {
@@ -204,12 +236,17 @@ fn real_main() -> Result<i32> {
             drop(eph);
             code
         }
-        Cmd::Exec { name, command } => {
+        Cmd::Exec { name, tty, command } => {
             // Checked, not opened: a running instance can be reached even
             // while its config.kdl is mid-edit and would not parse.
             instance::config_path_checked(&env, &name)
                 .with_context(|| format!("opening instance `{name}`"))?;
-            launcher::exec(&env, &name, &command)
+            // Which is also why a config that does not parse only costs
+            // the terminal mode its default here, rather than the exec.
+            let mode = tty.unwrap_or_else(|| {
+                Instance::open(&env, &name).map_or_else(|_| TtyMode::default(), |i| i.config.tty)
+            });
+            launcher::exec(&env, &name, &command, mode)
                 .with_context(|| format!("executing in instance `{name}`"))
         }
         Cmd::List => {

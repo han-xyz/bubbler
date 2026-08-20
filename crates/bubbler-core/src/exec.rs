@@ -1,23 +1,31 @@
 //! Client side of the exec channel: talk to a running instance's
 //! `bubbler-init` through the control socket in the runtime dir.
 //!
-//! The exec'd process is handed this process's own stdin, stdout and
-//! stderr, so it can reach the host terminal directly. The channel is a
-//! debugging and tooling path, not a hardening boundary.
+//! What the exec'd process gets for stdio is the terminal mode's
+//! decision: a pty bubbler allocated and relays, or bubbler's own
+//! descriptors. Descriptors handed over are reachable through `/proc` by
+//! everything else in the sandbox, so the channel is a tooling path, not
+//! a hardening boundary.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
-use bubbler_init::wire;
+use bubbler_init::{proto, wire};
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::fs::{Mode, OFlags};
+use signal_hook::consts::SIGWINCH;
 
 use crate::env::Env;
 use crate::error::LaunchError;
-use crate::launcher::exit_code;
+use crate::launcher::{SignalGuard, exit_code};
+use crate::tty::{self, RawGuard, RelayEnd, StdioPlan, StdioTarget};
 
 /// Name of the control socket inside an instance's runtime directory.
 pub const SOCKET_NAME: &str = "init.sock";
@@ -44,27 +52,174 @@ pub fn connect(env: &Env, name: &str) -> Result<Option<UnixStream>, LaunchError>
     }
 }
 
-/// Run `argv` inside the live instance with this process's stdio and
-/// return the exit code to propagate. Waits without a deadline: the
-/// command may run for as long as it likes, and interrupting bubbler
-/// here leaves it running under the instance's init.
-pub fn run_in(stream: &UnixStream, argv: &[OsString]) -> Result<i32, LaunchError> {
-    let refs: Vec<&OsStr> = argv.iter().map(|a| a.as_os_str()).collect();
-    let (stdin, stdout, stderr) = (io::stdin(), io::stdout(), io::stderr());
-    wire::send_request(
-        stream,
-        &refs,
-        0,
-        [stdin.as_fd(), stdout.as_fd(), stderr.as_fd()],
-    )
-    .map_err(|e| LaunchError::Protocol(e.to_string()))?;
-    let raw = wire::recv_status(stream).map_err(|e| match e.kind() {
+/// Poll with no wait at all: the relay asks between its own reads and
+/// must never park here.
+const NOW: Timespec = Timespec {
+    tv_sec: 0,
+    tv_nsec: 0,
+};
+
+fn protocol_error(e: io::Error) -> LaunchError {
+    match e.kind() {
         io::ErrorKind::UnexpectedEof => {
             LaunchError::Protocol("the instance stopped while the command was running".into())
         }
         _ => LaunchError::Protocol(e.to_string()),
-    })?;
-    Ok(exit_code(ExitStatus::from_raw(raw)))
+    }
+}
+
+/// Whether the supervisor has sent something: the status is the only
+/// thing it ever writes, so anything readable means the command is over.
+fn status_ready(stream: &UnixStream) -> bool {
+    let mut fds = [PollFd::new(stream, PollFlags::IN)];
+    poll(&mut fds, Some(&NOW)).is_ok() && !fds[0].revents().is_empty()
+}
+
+/// The descriptor the supervisor is given for one of fds 0, 1 and 2.
+/// Everything is duplicated: bubbler drops its copies once the request is
+/// on its way, and the ones inside the sandbox live on.
+fn fd_for(
+    target: StdioTarget,
+    index: usize,
+    host: &[OwnedFd; 3],
+    plan: &StdioPlan,
+    pipes: &mut Vec<(OwnedFd, usize)>,
+) -> Result<OwnedFd, LaunchError> {
+    match target {
+        StdioTarget::Slave => match &plan.pty {
+            Some(pty) => pty.slave.try_clone().map_err(LaunchError::Pty),
+            // A plan naming a pty that was never allocated is a bug;
+            // sending bubbler's own terminal instead would hide it.
+            None => Err(LaunchError::Pty(io::Error::other(
+                "no pty was allocated for this command",
+            ))),
+        },
+        StdioTarget::Inherit => host[index].try_clone().map_err(LaunchError::Pty),
+        StdioTarget::Null => {
+            let path = Path::new("/dev/null");
+            rustix::fs::open(path, OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())
+                .map_err(|e| LaunchError::Io(path.to_path_buf(), e.into()))
+        }
+        StdioTarget::Pipe => {
+            let (read, write) = rustix::pipe::pipe().map_err(|e| LaunchError::Pty(e.into()))?;
+            pipes.push((read, index));
+            Ok(write)
+        }
+    }
+}
+
+/// Run `argv` inside the live instance and return the exit code to
+/// propagate. `mode` decides what the command gets for stdio: in `pty`
+/// mode bubbler allocates one, asks the supervisor to make it the
+/// command's controlling terminal and relays it, so the sandbox never
+/// holds a descriptor for the user's terminal.
+///
+/// Waits without a deadline: the command may run for as long as it likes.
+/// Detaching (`^]` three times) returns 0 and leaves it under the
+/// instance's supervisor — with bubbler gone its pty hangs up, so a
+/// command that does not ignore `SIGHUP` ends there.
+pub fn run_in(
+    stream: &UnixStream,
+    argv: &[OsString],
+    mode: tty::TtyMode,
+) -> Result<i32, LaunchError> {
+    let refs: Vec<&OsStr> = argv.iter().map(|a| a.as_os_str()).collect();
+    let host = tty::host_stdio()?;
+    let is_tty = tty::host_is_tty();
+    let mut plan = tty::plan(mode, is_tty);
+    // The pty copies the first terminal bubbler has, and is allocated
+    // before raw mode: afterwards it would carry raw settings into the
+    // sandbox, leaving the command without echo or line editing.
+    if let Some(i) = plan
+        .needs_pty()
+        .then(|| is_tty.iter().position(|t| *t))
+        .flatten()
+    {
+        plan.pty = Some(tty::allocate(host[i].as_fd())?);
+    }
+    let mut pipes: Vec<(OwnedFd, usize)> = Vec::new();
+    let mut send: Vec<OwnedFd> = Vec::with_capacity(3);
+    for (i, target) in plan.fds.into_iter().enumerate() {
+        send.push(fd_for(target, i, &host, &plan, &mut pipes)?);
+    }
+    let flags = if plan.ctty() { proto::FLAG_CTTY } else { 0 };
+    wire::send_request(
+        stream,
+        &refs,
+        flags,
+        [send[0].as_fd(), send[1].as_fd(), send[2].as_fd()],
+    )
+    .map_err(|e| LaunchError::Protocol(e.to_string()))?;
+    // The fds are in the socket's queue and no longer need an owner here.
+    // The slave goes with them: one left behind would keep the pty from
+    // ever reporting the end of the command's output.
+    drop(send);
+    let master = plan.pty.take().map(|p| p.master);
+    let winch = Arc::new(AtomicBool::new(false));
+    let mut registered = SignalGuard(Vec::new());
+    if master.is_some() {
+        let id = signal_hook::flag::register(SIGWINCH, Arc::clone(&winch))
+            .map_err(LaunchError::Signal)?;
+        registered.0.push(id);
+    }
+    // The guard restores the terminal on every way out from here on.
+    let mut raw = match plan.raw_mode() {
+        true => Some(RawGuard::new(host[0].as_fd())?),
+        false => None,
+    };
+    let mut received: Option<io::Result<i32>> = None;
+    let end = {
+        let mut until = || {
+            if !status_ready(stream) {
+                return None;
+            }
+            let got = wire::recv_status(stream);
+            // Any answer ends the wait; a broken one is reported below.
+            let code = got
+                .as_ref()
+                .map_or(1, |raw| exit_code(ExitStatus::from_raw(*raw)));
+            received = Some(got);
+            Some(code)
+        };
+        match (&master, tty::output_fd(&plan)) {
+            (Some(master), Some(out)) => tty::relay(
+                master.as_fd(),
+                plan.ctty().then(|| host[0].as_fd()),
+                host[out].as_fd(),
+                &mut until,
+                &winch,
+            )?,
+            _ if !pipes.is_empty() => {
+                let ends: Vec<_> = pipes
+                    .iter()
+                    .map(|(read, i)| (read.as_fd(), host[*i].as_fd()))
+                    .collect();
+                tty::pump(&ends, &mut until)?;
+                RelayEnd::Exited(0)
+            }
+            // Nothing of ours to move: the status is all this waits for.
+            _ => {
+                received = Some(wire::recv_status(stream));
+                RelayEnd::Exited(0)
+            }
+        }
+    };
+    match (end, received) {
+        (RelayEnd::Detached, _) => {
+            // Restored before the note, which would otherwise be printed
+            // with the terminal still raw.
+            if let Some(guard) = raw.as_mut() {
+                guard.restore();
+            }
+            eprintln!("{}", tty::DETACHED_NOTE);
+            Ok(0)
+        }
+        (_, Some(Ok(raw))) => Ok(exit_code(ExitStatus::from_raw(raw))),
+        (_, Some(Err(e))) => Err(protocol_error(e)),
+        (_, None) => Err(LaunchError::Protocol(
+            "the instance sent no status for the command".into(),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -132,7 +287,8 @@ mod tests {
             wire::send_status(&stream, 3 << 8).unwrap();
         });
         let stream = connect(&e, "t").unwrap().expect("the listener is live");
-        assert_eq!(run_in(&stream, &[OsString::from("true")]).unwrap(), 3);
+        let mode = tty::TtyMode::Passthrough;
+        assert_eq!(run_in(&stream, &[OsString::from("true")], mode).unwrap(), 3);
         server.join().unwrap();
     }
 
@@ -145,7 +301,11 @@ mod tests {
         let server = std::thread::spawn(move || drop(listener.accept().unwrap()));
         let stream = connect(&e, "t").unwrap().expect("the listener is live");
         assert!(matches!(
-            run_in(&stream, &[OsString::from("true")]),
+            run_in(
+                &stream,
+                &[OsString::from("true")],
+                tty::TtyMode::Passthrough
+            ),
             Err(LaunchError::Protocol(_))
         ));
         server.join().unwrap();

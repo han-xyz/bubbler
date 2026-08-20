@@ -4,10 +4,12 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
+use std::str::FromStr;
 
 use kdl::{KdlDocument, KdlNode};
 
 pub use crate::error::ConfigError;
+pub use crate::tty::TtyMode;
 
 /// Keys `env` may not set: the sandbox owns them.
 pub const RESERVED_ENV: &[&str] = &[
@@ -124,12 +126,16 @@ pub struct InstanceConfig {
     /// Extra environment variables, in file order; never a key from
     /// [`RESERVED_ENV`].
     pub env: Vec<(String, String)>,
+    /// How the sandbox's stdio reaches the user's terminal; `pty` unless
+    /// a `tty` node says otherwise.
+    pub tty: TtyMode,
 }
 
 /// Parse KDL v2 text into an [`InstanceConfig`].
 pub fn parse(text: &str) -> Result<InstanceConfig, ConfigError> {
     let doc: KdlDocument = KdlDocument::parse(text)?;
     let mut cfg = InstanceConfig::default();
+    let mut seen_tty = false;
     for node in doc.nodes() {
         let name = node.name().value();
         reject_types(node)?;
@@ -175,6 +181,13 @@ pub fn parse(text: &str) -> Result<InstanceConfig, ConfigError> {
                     return Err(ConfigError::Duplicate(name.to_owned()));
                 }
                 cfg.services.push(parse_mpris(node)?);
+            }
+            "tty" => {
+                if seen_tty {
+                    return Err(ConfigError::Duplicate(name.to_owned()));
+                }
+                seen_tty = true;
+                cfg.tty = parse_tty(node)?;
             }
             "env" => parse_env(node, &mut cfg.env)?,
             "command" => {
@@ -530,6 +543,17 @@ fn validate_relative(node: &KdlNode, s: &str) -> Result<PathBuf, ConfigError> {
     Ok(p.components().collect())
 }
 
+/// `tty "pty"|"passthrough"|"none"`. The name of the mode is the whole
+/// node: an unknown one is an error, never a silent fallback to the
+/// default, which would give the sandbox a terminal the file refused it.
+fn parse_tty(node: &KdlNode) -> Result<TtyMode, ConfigError> {
+    let arg = one_string_arg(node)?;
+    if node.children().is_some() {
+        return Err(bad(node, "takes no children"));
+    }
+    TtyMode::from_str(arg)
+}
+
 fn parse_command(node: &KdlNode) -> Result<Vec<OsString>, ConfigError> {
     let mut argv = Vec::new();
     for e in node.entries() {
@@ -565,6 +589,33 @@ fn parse_command(node: &KdlNode) -> Result<Vec<OsString>, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_terminal_mode_is_a_private_pty_unless_the_file_says_otherwise() {
+        assert_eq!(parse("").unwrap().tty, TtyMode::Pty);
+        assert_eq!(
+            parse("tty \"passthrough\"").unwrap().tty,
+            TtyMode::Passthrough
+        );
+        assert_eq!(parse("tty \"none\"").unwrap().tty, TtyMode::None);
+        assert!(matches!(
+            parse("tty \"weird\""),
+            Err(ConfigError::BadArgument { node, .. }) if node == "tty"
+        ));
+        assert!(matches!(parse("tty"), Err(ConfigError::BadArgument { .. })));
+        assert!(matches!(
+            parse("tty \"pty\" \"none\""),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("tty \"pty\" { x; }"),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("tty \"pty\"\ntty \"none\""),
+            Err(ConfigError::Duplicate(n)) if n == "tty"
+        ));
+    }
 
     #[test]
     fn parses_full_example() {
