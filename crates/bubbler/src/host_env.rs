@@ -7,16 +7,22 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use bubbler_core::env::{Env, PASSTHROUGH_VARS};
 
-/// Build an [`Env`] from the current process environment. Missing `$HOME`
-/// or `$XDG_RUNTIME_DIR` are errors: both are needed for any sandbox.
+/// Build an [`Env`] from the current process environment. A missing or
+/// empty `$HOME` or `$XDG_RUNTIME_DIR` is an error: both are needed for
+/// any sandbox, and an empty one would silently become a relative path.
 pub fn from_process() -> Result<Env> {
-    let home = PathBuf::from(env::var_os("HOME").context("HOME is not set")?);
+    let home = PathBuf::from(
+        env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .context("HOME is not set")?,
+    );
     let data_home = env::var_os("XDG_DATA_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".local/share"));
     let runtime_dir = PathBuf::from(
         env::var_os("XDG_RUNTIME_DIR")
+            .filter(|v| !v.is_empty())
             .context("XDG_RUNTIME_DIR is not set; a session manager should set it")?,
     );
     let passthrough: Vec<(OsString, OsString)> = env::vars_os()

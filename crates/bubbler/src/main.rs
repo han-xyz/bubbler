@@ -3,6 +3,8 @@
 mod host_env;
 
 use std::ffi::OsString;
+use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
@@ -46,11 +48,32 @@ enum Cmd {
 
 fn main() -> ExitCode {
     match real_main() {
-        Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+        Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
         Err(e) => {
             eprintln!("bubbler: {e:#}");
             ExitCode::from(1)
         }
+    }
+}
+
+fn write_argv(out: &mut dyn Write, argv: &[OsString]) -> io::Result<()> {
+    out.write_all(b"bwrap\n")?;
+    for a in argv {
+        out.write_all(a.as_bytes())?;
+        out.write_all(b"\n")?;
+    }
+    out.flush()
+}
+
+/// Print the argv one element per line, byte for byte: argv is not UTF-8
+/// and a lossy rendering would not be the audit trail it claims to be. A
+/// reader that closed the pipe early (`| head`) is a normal end, not a
+/// failure.
+fn print_argv(argv: &[OsString]) -> Result<i32> {
+    match write_argv(&mut io::stdout().lock(), argv) {
+        Ok(()) => Ok(0),
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(0),
+        Err(e) => Err(e).context("writing the bwrap argv"),
     }
 }
 
@@ -75,11 +98,7 @@ fn real_main() -> Result<i32> {
             if dry_run {
                 let argv = launcher::build_argv(&env, &inst, command)
                     .context("building bwrap arguments")?;
-                println!("bwrap");
-                for a in argv {
-                    println!("{}", a.to_string_lossy());
-                }
-                return Ok(0);
+                return print_argv(&argv);
             }
             if inst.has_service(&Service::X11) {
                 eprintln!("bubbler: warning: x11 grants no isolation between X clients");

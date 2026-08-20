@@ -55,7 +55,7 @@ pub enum InstanceError {
     #[error("unknown profile `{0}`")]
     UnknownProfile(String),
     /// Filesystem failure at a specific path.
-    #[error("{0}: {1}")]
+    #[error("{0}")]
     Io(PathBuf, #[source] io::Error),
     /// The instance's `config.kdl` is invalid.
     #[error(transparent)]
@@ -93,7 +93,7 @@ pub enum LaunchError {
         reason: String,
     },
     /// Filesystem failure at a specific path.
-    #[error("{0}: {1}")]
+    #[error("{0}")]
     Io(PathBuf, #[source] io::Error),
     /// Spawning `bwrap` failed for a reason other than it being missing.
     #[error("failed to run bwrap: {0}")]

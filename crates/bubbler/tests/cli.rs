@@ -171,3 +171,68 @@ fn x11_warns_before_a_real_run() {
         .unwrap();
     assert!(!String::from_utf8_lossy(&out.stderr).contains("x11 grants no isolation"));
 }
+
+#[test]
+fn empty_required_vars_are_rejected() {
+    let tmp = setup();
+    let out = bubbler(tmp.path())
+        .env("HOME", "")
+        .arg("list")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("HOME is not set"));
+
+    let out = bubbler(tmp.path())
+        .env("XDG_RUNTIME_DIR", "")
+        .arg("list")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("XDG_RUNTIME_DIR is not set"));
+}
+
+#[test]
+fn dry_run_survives_a_closed_pipe() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let mut child = bubbler(tmp.path())
+        .args(["run", "t", "--dry-run", "--", "/usr/bin/true"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take().expect("stdout was requested as a pipe"));
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn dry_run_writes_argv_bytes_verbatim() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let arg = OsStr::from_bytes(b"/tmp/\xff");
+    let out = bubbler(tmp.path())
+        .args([
+            OsStr::new("run"),
+            OsStr::new("t"),
+            OsStr::new("--dry-run"),
+            OsStr::new("--"),
+            arg,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.ends_with(b"--\n/tmp/\xff\n"), "{:?}", out.stdout);
+}
