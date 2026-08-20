@@ -54,6 +54,7 @@ pub fn parse(text: &str) -> Result<InstanceConfig, ConfigError> {
     let mut cfg = InstanceConfig::default();
     for node in doc.nodes() {
         let name = node.name().value();
+        reject_types(node)?;
         match name {
             "wayland" | "x11" | "network" => {
                 reject_entries(node)?;
@@ -85,6 +86,15 @@ fn bad(node: &KdlNode, reason: &str) -> ConfigError {
         node: node.name().value().to_owned(),
         reason: reason.to_owned(),
     }
+}
+
+/// KDL type annotations are syntax we do not interpret, so they must not
+/// pass silently.
+fn reject_types(node: &KdlNode) -> Result<(), ConfigError> {
+    if node.ty().is_some() || node.entries().iter().any(|e| e.ty().is_some()) {
+        return Err(bad(node, "type annotations are not supported"));
+    }
+    Ok(())
 }
 
 /// Flag-style services take no arguments, properties or children.
@@ -150,7 +160,7 @@ fn validate_relative(node: &KdlNode, s: &str) -> Result<PathBuf, ConfigError> {
             "path must be relative to the home directory and contain no `..`",
         ));
     }
-    Ok(p.to_path_buf())
+    Ok(p.components().collect())
 }
 
 fn parse_command(node: &KdlNode) -> Result<Vec<OsString>, ConfigError> {
@@ -158,7 +168,7 @@ fn parse_command(node: &KdlNode) -> Result<Vec<OsString>, ConfigError> {
     for e in node.entries() {
         if let Some(p) = e.name() {
             return Err(ConfigError::UnknownProperty {
-                node: "command".into(),
+                node: node.name().value().to_owned(),
                 prop: p.value().to_owned(),
             });
         }
@@ -167,6 +177,9 @@ fn parse_command(node: &KdlNode) -> Result<Vec<OsString>, ConfigError> {
             .as_string()
             .ok_or_else(|| bad(node, "arguments must be strings"))?;
         argv.push(OsString::from(s));
+    }
+    if node.children().is_some() {
+        return Err(bad(node, "takes no children"));
     }
     if argv.is_empty() {
         return Err(bad(node, "needs at least one argument"));
@@ -295,6 +308,42 @@ command "b""#
             ),
             Err(ConfigError::Duplicate(_))
         ));
+    }
+
+    #[test]
+    fn command_rejects_children() {
+        assert!(matches!(
+            parse(r#"command "a" { wayland }"#),
+            Err(ConfigError::BadArgument { .. })
+        ));
+    }
+
+    #[test]
+    fn type_annotations_are_rejected() {
+        assert!(matches!(
+            parse("(foo)wayland"),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse(r#"home-share (t)"a""#),
+            Err(ConfigError::BadArgument { .. })
+        ));
+    }
+
+    #[test]
+    fn home_share_normalises_path() {
+        // `PathBuf` compares component-wise, so assert on the stored bytes.
+        for text in [
+            r#"home-share "a//b""#,
+            r#"home-share "a/./b""#,
+            r#"home-share "a/b/""#,
+        ] {
+            let services = parse(text).unwrap().services;
+            let [Service::HomeShare { path, .. }] = &services[..] else {
+                panic!("expected exactly one home-share, got {services:?}");
+            };
+            assert_eq!(path.to_str().unwrap(), "a/b");
+        }
     }
 
     #[test]
