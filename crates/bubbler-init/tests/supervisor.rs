@@ -142,7 +142,7 @@ fn a_stalled_client_cannot_hold_up_the_supervisor() {
         Some(0)
     );
     assert!(
-        t.elapsed() < Duration::from_millis(5500),
+        t.elapsed() < Duration::from_millis(1000),
         "second exec waited {:?}",
         t.elapsed()
     );
@@ -156,9 +156,49 @@ fn a_stalled_client_cannot_hold_up_the_supervisor() {
         if let Some(s) = init.try_wait().unwrap() {
             break s;
         }
-        assert!(t.elapsed() < Duration::from_secs(6), "init ignored SIGTERM");
-        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            t.elapsed() < Duration::from_millis(200),
+            "init took {:?} to honour SIGTERM",
+            t.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(10));
     };
     assert_eq!(status.code(), Some(143));
+    drop(stalled);
+}
+
+#[test]
+fn more_stalled_clients_than_the_table_holds_drops_the_oldest() {
+    let (mut init, sock, _tmp) = start(&["/usr/bin/sleep", "30"]);
+    std::thread::sleep(Duration::from_millis(200));
+    // One more than the supervisor keeps: the first connection makes room
+    // for the last instead of the table growing without bound.
+    let stalled: Vec<UnixStream> = (0..17)
+        .map(|_| {
+            let s = UnixStream::connect(&sock).unwrap();
+            send_prefix_and_fds(&s, 64);
+            s
+        })
+        .collect();
+    let oldest = &stalled[0];
+    oldest
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut byte = [0u8; 1];
+    assert_eq!(
+        std::io::Read::read(&mut &*oldest, &mut byte).unwrap(),
+        0,
+        "the oldest stalled connection was kept"
+    );
+    assert_eq!(
+        ExitStatus::from_raw(exec(&sock, &["/usr/bin/true"])).code(),
+        Some(0)
+    );
+    rustix::process::kill_process(
+        rustix::process::Pid::from_child(&init),
+        rustix::process::Signal::TERM,
+    )
+    .unwrap();
+    init.wait().unwrap();
     drop(stalled);
 }

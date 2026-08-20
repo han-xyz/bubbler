@@ -18,8 +18,8 @@ use rustix::process::{DumpableBehavior, Pid, Signal, kill_process, set_dumpable_
 
 use bubbler_init::wire;
 
-/// Supervisor tick: the `poll` timeout, so `accept` and `wait` never block.
-/// One iteration can still take up to [`REQUEST_TIMEOUT`] while it reads a request.
+/// Supervisor tick: the `poll` timeout, so `accept`, `wait` and every
+/// request read are non-blocking and one iteration is bounded by it.
 const TICK: Duration = Duration::from_millis(20);
 const TICK_TIMESPEC: Timespec = Timespec {
     tv_sec: 0,
@@ -27,10 +27,13 @@ const TICK_TIMESPEC: Timespec = Timespec {
 };
 /// How long a process gets between SIGTERM and SIGKILL.
 const GRACE: Duration = Duration::from_secs(5);
-/// Deadline for one whole request; a client sending slowly cannot extend it.
+/// Deadline for one whole request, counted from the accept.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Raw wait status for a command that could not be executed, as a shell reports it.
 const NOT_EXECUTABLE: i32 = 127 << 8;
+/// Connections whose request has not arrived in full. The oldest is
+/// dropped to make room, so stalled clients cannot grow the table.
+const MAX_PENDING: usize = 16;
 
 struct Args {
     socket_fd: i32,
@@ -41,6 +44,13 @@ struct Args {
 struct Exec {
     child: Child,
     stream: UnixStream,
+}
+
+/// An accepted connection whose request is still arriving.
+struct Pending {
+    stream: UnixStream,
+    incoming: wire::Incoming,
+    deadline: Instant,
 }
 
 /// Parse `--socket-fd N -- cmd...`; anything else is a usage error.
@@ -93,11 +103,9 @@ fn listener_from_fd(fd: i32) -> Option<UnixListener> {
     Some(listener)
 }
 
-/// Execute one request; a malformed one closes the connection, spawning nothing.
-fn serve(stream: UnixStream, execs: &mut Vec<Exec>) {
-    let Ok((argv, fds)) = wire::recv_request(&stream, Instant::now() + REQUEST_TIMEOUT) else {
-        return;
-    };
+/// Execute one received request; a malformed one closes the connection,
+/// spawning nothing.
+fn serve(stream: UnixStream, argv: &[OsString], fds: Vec<OwnedFd>, execs: &mut Vec<Exec>) {
     let Some((program, rest)) = argv.split_first() else {
         return;
     };
@@ -124,6 +132,33 @@ fn serve(stream: UnixStream, execs: &mut Vec<Exec>) {
                 );
             }
             let _ = wire::send_status(&stream, NOT_EXECUTABLE);
+        }
+    }
+}
+
+/// Take one read step on every connection `poll` reported, spawning the
+/// commands whose requests are now whole. `ready` is parallel to
+/// `pending` and shrinks with it.
+fn read_pending(pending: &mut Vec<Pending>, ready: &mut Vec<bool>, execs: &mut Vec<Exec>) {
+    let mut i = 0;
+    while i < pending.len() {
+        if !ready.get(i).copied().unwrap_or(false) {
+            i += 1;
+            continue;
+        }
+        let p = &mut pending[i];
+        match p.incoming.read_step(&p.stream) {
+            Ok(None) => i += 1,
+            Ok(Some((argv, fds))) => {
+                let p = pending.remove(i);
+                ready.remove(i);
+                serve(p.stream, &argv, fds, execs);
+            }
+            // A malformed request or a hangup closes the connection.
+            Err(_) => {
+                pending.remove(i);
+                ready.remove(i);
+            }
         }
     }
 }
@@ -216,6 +251,7 @@ fn main() -> ExitCode {
     };
 
     let mut execs: Vec<Exec> = Vec::new();
+    let mut pending: Vec<Pending> = Vec::new();
     let mut kill_at: Option<Instant> = None;
     loop {
         if stop.swap(false, Ordering::SeqCst) {
@@ -235,9 +271,21 @@ fn main() -> ExitCode {
             signal_execs(&execs, Signal::KILL);
             kill_at = None;
         }
-        let mut fds = [PollFd::new(&listener, PollFlags::IN)];
-        match poll(&mut fds, Some(&TICK_TIMESPEC)) {
-            Ok(0) => continue,
+        // The listener and every half-read request in one poll set: a
+        // client that stops mid-request delays nothing but itself.
+        let mut fds = Vec::with_capacity(1 + pending.len());
+        fds.push(PollFd::new(&listener, PollFlags::IN));
+        fds.extend(
+            pending
+                .iter()
+                .map(|p| PollFd::new(&p.stream, PollFlags::IN)),
+        );
+        let polled = poll(&mut fds, Some(&TICK_TIMESPEC));
+        let accept = fds[0].revents().contains(PollFlags::IN);
+        let mut ready: Vec<bool> = fds[1..].iter().map(|f| !f.revents().is_empty()).collect();
+        drop(fds);
+        match polled {
+            Ok(0) => {}
             // Every poll error is retried on purpose: EINTR means a signal was
             // delivered and the next tick acts on it, and no other error is a
             // reason to abandon a command that is still running.
@@ -247,8 +295,25 @@ fn main() -> ExitCode {
             }
             Ok(_) => {}
         }
-        while let Ok((stream, _)) = listener.accept() {
-            serve(stream, &mut execs);
+        read_pending(&mut pending, &mut ready, &mut execs);
+        // Dropping the connection is the whole answer to a client that
+        // ran out of time: nothing was spawned for it.
+        let now = Instant::now();
+        pending.retain(|p| p.deadline > now);
+        if accept {
+            while let Ok((stream, _)) = listener.accept() {
+                if stream.set_nonblocking(true).is_err() {
+                    continue;
+                }
+                if pending.len() >= MAX_PENDING {
+                    pending.remove(0);
+                }
+                pending.push(Pending {
+                    stream,
+                    incoming: wire::Incoming::new(),
+                    deadline: Instant::now() + REQUEST_TIMEOUT,
+                });
+            }
         }
     }
 }

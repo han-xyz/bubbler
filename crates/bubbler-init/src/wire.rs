@@ -76,7 +76,9 @@ pub fn send_request(
     (&*stream).write_all(&payload)
 }
 
-/// Receive one request whole before `deadline`: argv and its exactly three fds.
+/// Receive one request whole before `deadline`: argv and its exactly
+/// three fds. Blocks, so it is for a caller with nothing else to do; the
+/// supervisor reads with [`Incoming`] instead.
 pub fn recv_request(
     stream: &UnixStream,
     deadline: Instant,
@@ -113,6 +115,111 @@ pub fn recv_request(
     let argv = proto::decode_request(&buf)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}")))?;
     Ok((argv, fds))
+}
+
+/// One request arriving in pieces on a non-blocking connection: the
+/// length prefix carries the fds, the payload follows it. A client that
+/// stops mid-request holds up nothing but its own connection.
+#[derive(Debug, Default)]
+pub struct Incoming {
+    prefix: [u8; 4],
+    have: usize,
+    /// Payload length, known once the prefix is whole.
+    want: Option<usize>,
+    payload: Vec<u8>,
+    fds: Vec<OwnedFd>,
+}
+
+impl Incoming {
+    /// A connection nothing has been read from yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Read what `stream` has ready now. `Ok(None)` means the request is
+    /// still incomplete and the caller should poll again; an error means
+    /// the connection is unusable and must be dropped.
+    pub fn read_step(
+        &mut self,
+        stream: &UnixStream,
+    ) -> io::Result<Option<(Vec<OsString>, Vec<OwnedFd>)>> {
+        loop {
+            match self.want {
+                None => {
+                    if !self.read_prefix(stream)? {
+                        return Ok(None);
+                    }
+                }
+                Some(want) if self.payload.len() < want => {
+                    let mut chunk = [0u8; 4096];
+                    let room = (want - self.payload.len()).min(chunk.len());
+                    match (&*stream).read(&mut chunk[..room]) {
+                        Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+                        Ok(n) => self.payload.extend_from_slice(&chunk[..n]),
+                        Err(e) if would_block(&e) => return Ok(None),
+                        Err(e) => return Err(e),
+                    }
+                }
+                Some(_) => {
+                    let argv = proto::decode_request(&self.payload).map_err(|e| {
+                        io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}"))
+                    })?;
+                    return Ok(Some((argv, std::mem::take(&mut self.fds))));
+                }
+            }
+        }
+    }
+
+    /// Read towards the length prefix; `Ok(true)` once it is whole. The
+    /// fds ride on it, so they are collected here and nowhere else: a
+    /// plain `read` of the payload discards ancillary data.
+    fn read_prefix(&mut self, stream: &UnixStream) -> io::Result<bool> {
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(REQUEST_FDS))];
+        let mut anc = RecvAncillaryBuffer::new(&mut space);
+        let read = rustix::net::recvmsg(
+            stream.as_fd(),
+            &mut [IoSliceMut::new(&mut self.prefix[self.have..])],
+            &mut anc,
+            RecvFlags::CMSG_CLOEXEC,
+        )
+        .map_err(io::Error::from);
+        let n = match read {
+            Ok(r) => r.bytes,
+            Err(e) if would_block(&e) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        for m in anc.drain() {
+            if let RecvAncillaryMessage::ScmRights(it) = m {
+                self.fds.extend(it);
+            }
+        }
+        if n == 0 {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
+        self.have += n;
+        if self.have < self.prefix.len() {
+            return Ok(false);
+        }
+        if self.fds.len() != REQUEST_FDS {
+            return Err(invalid("expected exactly three fds"));
+        }
+        let len = u32::from_le_bytes(self.prefix) as usize;
+        if len > proto::MAX_REQUEST {
+            return Err(invalid("request too large"));
+        }
+        self.want = Some(len);
+        Ok(true)
+    }
+}
+
+/// Whether the connection had nothing more to give right now. `EINTR` is
+/// counted with it: the caller polls again, and the signal is acted on by
+/// the loop that called in.
+fn would_block(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+    )
 }
 
 /// Write the raw wait status of the executed command.
@@ -215,6 +322,75 @@ mod tests {
         );
         drop(server);
         let _ = writer.join();
+    }
+
+    #[test]
+    fn an_incoming_request_is_read_in_as_many_pieces_as_it_arrives_in() {
+        let (client, server) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let null = File::open("/dev/null").unwrap();
+        let argv: Vec<&OsStr> = vec![OsStr::new("sh"), OsStr::new("-c"), OsStr::new("exit 3")];
+        let payload = proto::encode_request(&argv);
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(REQUEST_FDS))];
+        let mut anc = SendAncillaryBuffer::new(&mut space);
+        let fds = [null.as_fd(); REQUEST_FDS];
+        assert!(anc.push(SendAncillaryMessage::ScmRights(&fds)));
+        let mut incoming = Incoming::new();
+        assert!(
+            incoming.read_step(&server).unwrap().is_none(),
+            "nothing sent yet"
+        );
+        rustix::net::sendmsg(
+            client.as_fd(),
+            &[IoSlice::new(&(payload.len() as u32).to_le_bytes())],
+            &mut anc,
+            SendFlags::empty(),
+        )
+        .unwrap();
+        assert!(
+            incoming.read_step(&server).unwrap().is_none(),
+            "no payload yet"
+        );
+        let (first, second) = payload.split_at(2);
+        (&client).write_all(first).unwrap();
+        assert!(
+            incoming.read_step(&server).unwrap().is_none(),
+            "half a payload"
+        );
+        (&client).write_all(second).unwrap();
+        let (got, fds) = incoming
+            .read_step(&server)
+            .unwrap()
+            .expect("the request is whole");
+        assert_eq!(got, vec!["sh", "-c", "exit 3"]);
+        assert_eq!(fds.len(), REQUEST_FDS);
+    }
+
+    #[test]
+    fn an_incoming_prefix_without_fds_is_rejected() {
+        let (client, server) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        (&client).write_all(&4u32.to_le_bytes()).unwrap();
+        assert!(Incoming::new().read_step(&server).is_err());
+    }
+
+    #[test]
+    fn an_incoming_request_larger_than_the_cap_is_rejected() {
+        let (client, server) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let null = File::open("/dev/null").unwrap();
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(REQUEST_FDS))];
+        let mut anc = SendAncillaryBuffer::new(&mut space);
+        let fds = [null.as_fd(); REQUEST_FDS];
+        assert!(anc.push(SendAncillaryMessage::ScmRights(&fds)));
+        rustix::net::sendmsg(
+            client.as_fd(),
+            &[IoSlice::new(&(proto::MAX_REQUEST as u32 + 1).to_le_bytes())],
+            &mut anc,
+            SendFlags::empty(),
+        )
+        .unwrap();
+        assert!(Incoming::new().read_step(&server).is_err());
     }
 
     #[test]
