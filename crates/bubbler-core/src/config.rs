@@ -9,7 +9,10 @@ use std::str::FromStr;
 use kdl::{KdlDocument, KdlNode};
 
 pub use crate::error::ConfigError;
+pub use crate::seccomp::{Errno, SeccompConfig};
 pub use crate::tty::TtyMode;
+
+use crate::seccomp::syscall_number;
 
 /// Keys `env` may not set: the sandbox owns them.
 pub const RESERVED_ENV: &[&str] = &[
@@ -129,6 +132,9 @@ pub struct InstanceConfig {
     /// How the sandbox's stdio reaches the user's terminal; `pty` unless
     /// a `tty` node says otherwise.
     pub tty: TtyMode,
+    /// Changes to the default seccomp denylist; empty unless a `seccomp`
+    /// node relaxes or extends it.
+    pub seccomp: SeccompConfig,
 }
 
 /// Parse KDL v2 text into an [`InstanceConfig`].
@@ -136,6 +142,7 @@ pub fn parse(text: &str) -> Result<InstanceConfig, ConfigError> {
     let doc: KdlDocument = KdlDocument::parse(text)?;
     let mut cfg = InstanceConfig::default();
     let mut seen_tty = false;
+    let mut seen_seccomp = false;
     for node in doc.nodes() {
         let name = node.name().value();
         reject_types(node)?;
@@ -188,6 +195,13 @@ pub fn parse(text: &str) -> Result<InstanceConfig, ConfigError> {
                 }
                 seen_tty = true;
                 cfg.tty = parse_tty(node)?;
+            }
+            "seccomp" => {
+                if seen_seccomp {
+                    return Err(ConfigError::Duplicate(name.to_owned()));
+                }
+                seen_seccomp = true;
+                cfg.seccomp = parse_seccomp(node)?;
             }
             "env" => parse_env(node, &mut cfg.env)?,
             "command" => {
@@ -552,6 +566,114 @@ fn parse_tty(node: &KdlNode) -> Result<TtyMode, ConfigError> {
         return Err(bad(node, "takes no children"));
     }
     TtyMode::from_str(arg)
+}
+
+/// `seccomp` itself is bare; every rule is a child node. Names are resolved
+/// against the build architecture's table here, so a typo cannot silently
+/// leave a syscall allowed the profile meant to deny.
+fn parse_seccomp(node: &KdlNode) -> Result<SeccompConfig, ConfigError> {
+    reject_arguments(node)?;
+    let mut cfg = SeccompConfig::default();
+    let Some(children) = node.children() else {
+        return Ok(cfg);
+    };
+    for child in children.nodes() {
+        reject_types(child)?;
+        if child.children().is_some() {
+            return Err(bad(child, "takes no children"));
+        }
+        match child.name().value() {
+            "allow" => {
+                if let Some(p) = child.entries().iter().find_map(|e| e.name()) {
+                    return Err(ConfigError::UnknownProperty {
+                        node: "allow".to_owned(),
+                        prop: p.value().to_owned(),
+                    });
+                }
+                cfg.allow.extend(syscall_names(child)?);
+            }
+            "deny" => {
+                let errno = deny_errno(child)?;
+                for name in syscall_names(child)? {
+                    if name == "prctl" {
+                        // bwrap(1): every stacked seccomp program except
+                        // possibly the last must allow PR_SET_SECCOMP.
+                        return Err(bad(child, "bwrap needs prctl to install the filter"));
+                    }
+                    cfg.deny.push((name, errno));
+                }
+            }
+            "disable" => {
+                reject_entries(child)?;
+                cfg.disable = true;
+            }
+            other => return Err(ConfigError::UnknownNode(other.to_owned())),
+        }
+    }
+    Ok(cfg)
+}
+
+/// The syscall names argued to one `allow` or `deny` child. `errno` is
+/// [`deny_errno`]'s business; any other property is an error.
+fn syscall_names(node: &KdlNode) -> Result<Vec<String>, ConfigError> {
+    let mut names = Vec::new();
+    for e in node.entries() {
+        if let Some(p) = e.name() {
+            if p.value() == "errno" {
+                continue;
+            }
+            return Err(ConfigError::UnknownProperty {
+                node: node.name().value().to_owned(),
+                prop: p.value().to_owned(),
+            });
+        }
+        let s = e
+            .value()
+            .as_string()
+            .ok_or_else(|| bad(node, "expects syscall names as strings"))?;
+        names.push(syscall_name(node, s)?);
+    }
+    if names.is_empty() {
+        return Err(bad(node, "expects at least one syscall name"));
+    }
+    Ok(names)
+}
+
+/// A name is echoed back only once it is known to be a plain identifier:
+/// config text is untrusted and may hold the control bytes the error
+/// message would then carry.
+fn syscall_name(node: &KdlNode, s: &str) -> Result<String, ConfigError> {
+    let plain = !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    if !plain {
+        return Err(bad(node, "expects a syscall name such as \"keyctl\""));
+    }
+    if syscall_number(s).is_none() {
+        return Err(bad(
+            node,
+            &format!("`{s}` is not a syscall on this architecture"),
+        ));
+    }
+    Ok(s.to_owned())
+}
+
+/// `deny` without `errno` means `EPERM`; KDL lets a property repeat, and
+/// the last one wins.
+fn deny_errno(node: &KdlNode) -> Result<Errno, ConfigError> {
+    let last = node
+        .entries()
+        .iter()
+        .rev()
+        .find(|e| e.name().is_some_and(|n| n.value() == "errno"));
+    let Some(e) = last else {
+        return Ok(Errno::Eperm);
+    };
+    match e.value().as_string() {
+        Some("EPERM") => Ok(Errno::Eperm),
+        Some("ENOSYS") => Ok(Errno::Enosys),
+        _ => Err(bad(node, "errno must be \"EPERM\" or \"ENOSYS\"")),
+    }
 }
 
 fn parse_command(node: &KdlNode) -> Result<Vec<OsString>, ConfigError> {
@@ -1125,6 +1247,114 @@ command "b""#
         assert!(matches!(
             parse("dbus\nportals\nportals"),
             Err(ConfigError::Duplicate(_))
+        ));
+    }
+
+    #[test]
+    fn seccomp_children_collect_allows_and_denies_in_file_order() {
+        let cfg = parse(
+            r#"
+            seccomp {
+                allow "ptrace" "perf_event_open"
+                deny "unshare" "setns"
+                deny "clone3" errno="ENOSYS"
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.seccomp.allow, ["ptrace", "perf_event_open"]);
+        assert_eq!(
+            cfg.seccomp.deny,
+            vec![
+                ("unshare".to_owned(), Errno::Eperm),
+                ("setns".to_owned(), Errno::Eperm),
+                ("clone3".to_owned(), Errno::Enosys),
+            ]
+        );
+        assert!(!cfg.seccomp.disable);
+    }
+
+    #[test]
+    fn without_a_seccomp_node_the_default_denylist_stands() {
+        assert_eq!(parse("").unwrap().seccomp, SeccompConfig::default());
+        assert_eq!(parse("seccomp").unwrap().seccomp, SeccompConfig::default());
+        assert_eq!(
+            parse("seccomp { }").unwrap().seccomp,
+            SeccompConfig::default()
+        );
+        assert!(parse("seccomp { disable }").unwrap().seccomp.disable);
+        assert!(matches!(
+            parse("seccomp\nseccomp"),
+            Err(ConfigError::Duplicate(n)) if n == "seccomp"
+        ));
+    }
+
+    #[test]
+    fn a_syscall_the_build_architecture_lacks_is_an_error_not_a_skip() {
+        for text in [
+            r#"seccomp { allow "nosuchcall" }"#,
+            r#"seccomp { deny "nosuchcall" }"#,
+            // 32-bit x86 only, so unknown on every architecture bubbler builds for.
+            r#"seccomp { allow "vm86old" }"#,
+        ] {
+            assert!(
+                matches!(parse(text), Err(ConfigError::BadArgument { node, .. }) if node == "allow" || node == "deny"),
+                "{text}"
+            );
+        }
+        assert!(parse(r#"seccomp { allow "keyctl" "clone3" }"#).is_ok());
+    }
+
+    #[test]
+    fn prctl_can_never_be_denied() {
+        let r = parse(r#"seccomp { deny "prctl" }"#);
+        assert!(
+            matches!(&r, Err(ConfigError::BadArgument { node, reason }) if node == "deny" && reason.contains("prctl")),
+            "{r:?}"
+        );
+        assert!(parse(r#"seccomp { allow "prctl" }"#).is_ok());
+    }
+
+    #[test]
+    fn seccomp_children_are_checked_like_the_dbus_ones() {
+        assert!(matches!(
+            parse(r#"seccomp "x""#),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("seccomp foo=bar"),
+            Err(ConfigError::UnknownProperty { .. })
+        ));
+        assert!(matches!(
+            parse(r#"seccomp { frob "read" }"#),
+            Err(ConfigError::UnknownNode(n)) if n == "frob"
+        ));
+        for text in [
+            "seccomp { allow }",
+            "seccomp { deny }",
+            "seccomp { allow 1 }",
+            r#"seccomp { allow "read" { deny "write" } }"#,
+            r#"seccomp { (t)allow "read" }"#,
+            r#"seccomp { allow (t)"read" }"#,
+            r#"seccomp { allow "a b" }"#,
+            r#"seccomp { allow "" }"#,
+            r#"seccomp { deny "read" errno="EIO" }"#,
+            r#"seccomp { deny "read" errno=1 }"#,
+            r#"seccomp { disable "x" }"#,
+            "seccomp { disable { x } }",
+        ] {
+            assert!(
+                matches!(parse(text), Err(ConfigError::BadArgument { .. })),
+                "{text}"
+            );
+        }
+        assert!(matches!(
+            parse(r#"seccomp { allow "read" errno="EPERM" }"#),
+            Err(ConfigError::UnknownProperty { prop, .. }) if prop == "errno"
+        ));
+        assert!(matches!(
+            parse(r#"seccomp { deny "read" foo="x" }"#),
+            Err(ConfigError::UnknownProperty { .. })
         ));
     }
 }

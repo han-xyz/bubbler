@@ -12,5 +12,6 @@ pub mod init_bin;
 pub mod instance;
 pub mod launcher;
 pub mod profile;
+pub mod seccomp;
 pub mod service;
 pub mod tty;
