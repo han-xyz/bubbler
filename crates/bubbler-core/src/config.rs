@@ -9,6 +9,20 @@ use kdl::{KdlDocument, KdlNode};
 
 pub use crate::error::ConfigError;
 
+/// Keys `env` may not set: the sandbox owns them.
+pub const RESERVED_ENV: &[&str] = &[
+    "HOME",
+    "PATH",
+    "XDG_RUNTIME_DIR",
+    "USER",
+    "LOGNAME",
+    "WAYLAND_DISPLAY",
+    "DISPLAY",
+    "XAUTHORITY",
+    "XDG_SESSION_TYPE",
+    "PULSE_SERVER",
+];
+
 /// Whether a shared path is writable inside the sandbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShareMode {
@@ -37,6 +51,12 @@ pub enum Service {
         /// Read-only unless `mode=rw`.
         mode: ShareMode,
     },
+    /// Bind one host `/etc` entry read-only at the same path, on top of
+    /// the baseline `/etc` allowlist.
+    EtcShare {
+        /// Entry name directly under `/etc`.
+        name: OsString,
+    },
 }
 
 /// Parsed `config.kdl`.
@@ -46,6 +66,9 @@ pub struct InstanceConfig {
     pub services: Vec<Service>,
     /// Default argv for `run`, if the file has a `command` node.
     pub command: Option<Vec<OsString>>,
+    /// Extra environment variables, in file order; never a key from
+    /// [`RESERVED_ENV`].
+    pub env: Vec<(String, String)>,
 }
 
 /// Parse KDL v2 text into an [`InstanceConfig`].
@@ -69,6 +92,14 @@ pub fn parse(text: &str) -> Result<InstanceConfig, ConfigError> {
                 cfg.services.push(svc);
             }
             "home-share" => cfg.services.push(parse_home_share(node)?),
+            "etc-share" => {
+                let svc = parse_etc_share(node)?;
+                if cfg.services.contains(&svc) {
+                    return Err(ConfigError::Duplicate(name.to_owned()));
+                }
+                cfg.services.push(svc);
+            }
+            "env" => parse_env(node, &mut cfg.env)?,
             "command" => {
                 if cfg.command.is_some() {
                     return Err(ConfigError::Duplicate(name.to_owned()));
@@ -149,6 +180,65 @@ fn parse_home_share(node: &KdlNode) -> Result<Service, ConfigError> {
     }
     let path = path.ok_or_else(|| bad(node, "expects exactly one path argument"))?;
     Ok(Service::HomeShare { path, mode })
+}
+
+fn parse_etc_share(node: &KdlNode) -> Result<Service, ConfigError> {
+    let mut name: Option<OsString> = None;
+    for e in node.entries() {
+        if let Some(p) = e.name() {
+            return Err(ConfigError::UnknownProperty {
+                node: node.name().value().to_owned(),
+                prop: p.value().to_owned(),
+            });
+        }
+        if name.is_some() {
+            return Err(bad(node, "expects exactly one name argument"));
+        }
+        let s = e
+            .value()
+            .as_string()
+            .ok_or_else(|| bad(node, "name must be a string"))?;
+        let mut c = Path::new(s).components();
+        if !matches!((c.next(), c.next()), (Some(Component::Normal(_)), None)) {
+            return Err(bad(node, "name must be a single entry directly under /etc"));
+        }
+        name = Some(OsString::from(s));
+    }
+    if node.children().is_some() {
+        return Err(bad(node, "takes no children"));
+    }
+    let name = name.ok_or_else(|| bad(node, "expects exactly one name argument"))?;
+    Ok(Service::EtcShare { name })
+}
+
+fn parse_env(node: &KdlNode, out: &mut Vec<(String, String)>) -> Result<(), ConfigError> {
+    if node.entries().is_empty() {
+        return Err(bad(node, "expects KEY=\"value\" properties"));
+    }
+    for e in node.entries() {
+        let key = e
+            .name()
+            .ok_or_else(|| bad(node, "expects KEY=\"value\" properties, not arguments"))?
+            .value();
+        let val = e
+            .value()
+            .as_string()
+            .ok_or_else(|| bad(node, "values must be strings"))?;
+        if RESERVED_ENV.contains(&key) {
+            return Err(bad(
+                node,
+                &format!("{key} is set by bubbler and cannot be overridden"),
+            ));
+        }
+        if out.iter().any(|(k, _)| k == key) {
+            return Err(ConfigError::Duplicate(key.to_owned()));
+        }
+        out.push((key.to_owned(), val.to_owned()));
+    }
+    if node.children().is_some() {
+        return Err(bad(node, "takes no children"));
+    }
+    Ok(())
 }
 
 /// Only plain relative paths: every component must be a normal name.
@@ -344,6 +434,78 @@ command "b""#
             };
             assert_eq!(path.to_str().unwrap(), "a/b");
         }
+    }
+
+    #[test]
+    fn env_properties_are_collected_in_order() {
+        let cfg = parse("env A=\"1\" B=\"two\"\nenv C=\"3\"").unwrap();
+        assert_eq!(
+            cfg.env,
+            vec![
+                ("A".into(), "1".into()),
+                ("B".into(), "two".into()),
+                ("C".into(), "3".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn env_rejects_duplicates_reserved_args_and_non_strings() {
+        assert!(
+            matches!(parse("env A=\"1\"\nenv A=\"2\""), Err(ConfigError::Duplicate(k)) if k == "A")
+        );
+        assert!(matches!(
+            parse("env HOME=\"/x\""),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("env PULSE_SERVER=\"x\""),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("env \"A=1\""),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("env A=1"),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(parse("env"), Err(ConfigError::BadArgument { .. })));
+        assert!(matches!(
+            parse("env A=\"1\" { x }"),
+            Err(ConfigError::BadArgument { .. })
+        ));
+    }
+
+    #[test]
+    fn etc_share_takes_one_plain_name() {
+        let cfg = parse("etc-share \"java\"").unwrap();
+        assert_eq!(
+            cfg.services,
+            vec![Service::EtcShare {
+                name: "java".into()
+            }]
+        );
+        assert!(matches!(
+            parse("etc-share \"a/b\""),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("etc-share \"..\""),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("etc-share \"a\" \"b\""),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("etc-share \"a\" mode=rw"),
+            Err(ConfigError::UnknownProperty { .. })
+        ));
+        assert!(matches!(
+            parse("etc-share \"a\"\netc-share \"a\""),
+            Err(ConfigError::Duplicate(_))
+        ));
     }
 
     #[test]

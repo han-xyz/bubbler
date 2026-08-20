@@ -35,6 +35,10 @@ pub fn apply_all(
             Service::X11 => x11(env, args, host)?,
             Service::Network => network(args, host)?,
             Service::HomeShare { path, mode } => home_share(env, args, host, path, *mode)?,
+            Service::EtcShare { name } => {
+                let p = require_exists(host, "etc-share", Path::new("/etc").join(name))?;
+                args.ro_bind(&p, &p);
+            }
         }
     }
     Ok(())
