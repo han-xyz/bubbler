@@ -64,13 +64,15 @@ impl Instance {
         let text = profile::lookup(profile_name)
             .ok_or_else(|| InstanceError::UnknownProfile(profile_name.to_owned()))?;
         let config = config::parse(text)?;
-        let dir = instances_root(env).join(name);
-        if dir.exists() {
-            return Err(InstanceError::AlreadyExists(name.to_owned()));
-        }
+        let root = instances_root(env);
+        let dir = root.join(name);
+        fs::create_dir_all(&root).map_err(io_err(&root))?;
+        fs::create_dir(&dir).map_err(|e| match e.kind() {
+            io::ErrorKind::AlreadyExists => InstanceError::AlreadyExists(name.to_owned()),
+            _ => InstanceError::Io(dir.clone(), e),
+        })?;
         let home = dir.join("home");
-        fs::create_dir_all(&home).map_err(io_err(&home))?;
-        rustix::fs::chmod(&home, Mode::RWXU)
+        rustix::fs::mkdir(&home, Mode::RWXU)
             .map_err(|e| InstanceError::Io(home.clone(), e.into()))?;
         let cfg_path = dir.join("config.kdl");
         fs::write(&cfg_path, text).map_err(io_err(&cfg_path))?;
@@ -123,7 +125,7 @@ impl Instance {
         Ok(names)
     }
 
-    /// Convenience for callers that need to know whether a display is granted.
+    /// Whether `s` is among the granted services.
     pub fn has_service(&self, s: &Service) -> bool {
         self.config.services.contains(s)
     }
@@ -175,6 +177,19 @@ mod tests {
         Instance::create(&env, "a", "generic").unwrap();
         assert!(matches!(
             Instance::create(&env, "a", "generic"),
+            Err(InstanceError::AlreadyExists(_))
+        ));
+    }
+
+    #[test]
+    fn create_on_dangling_symlink_is_already_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = env(tmp.path());
+        let root = instances_root(&env);
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink("/nonexistent", root.join("dangle")).unwrap();
+        assert!(matches!(
+            Instance::create(&env, "dangle", "generic"),
             Err(InstanceError::AlreadyExists(_))
         ));
     }
