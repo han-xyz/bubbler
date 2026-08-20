@@ -2,7 +2,9 @@
 //! inherited socket, forwards SIGTERM/SIGINT, exits with the command's status.
 
 use std::ffi::OsString;
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::fs::File;
+use std::io::Write;
+use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
@@ -11,12 +13,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rustix::event::{Nsecs, PollFd, PollFlags, Timespec, poll};
-use rustix::io::{FdFlags, fcntl_setfd};
-use rustix::process::{Pid, Signal, kill_process};
+use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
+use rustix::process::{DumpableBehavior, Pid, Signal, kill_process, set_dumpable_behavior};
 
 use bubbler_init::wire;
 
-/// Supervisor tick: poll timeout, so no `accept` or `wait` ever blocks.
+/// Supervisor tick: the `poll` timeout, so `accept` and `wait` never block.
+/// One iteration can still take up to [`REQUEST_TIMEOUT`] while it reads a request.
 const TICK: Duration = Duration::from_millis(20);
 const TICK_TIMESPEC: Timespec = Timespec {
     tv_sec: 0,
@@ -24,7 +27,7 @@ const TICK_TIMESPEC: Timespec = Timespec {
 };
 /// How long a process gets between SIGTERM and SIGKILL.
 const GRACE: Duration = Duration::from_secs(5);
-/// Bound on how long one client can stall the loop with a half-sent request.
+/// Deadline for one whole request; a client sending slowly cannot extend it.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Raw wait status for a command that could not be executed, as a shell reports it.
 const NOT_EXECUTABLE: i32 = 127 << 8;
@@ -40,6 +43,7 @@ struct Exec {
     stream: UnixStream,
 }
 
+/// Parse `--socket-fd N -- cmd...`; anything else is a usage error.
 fn parse_args() -> Option<Args> {
     let mut it = std::env::args_os().skip(1);
     let mut socket_fd = None;
@@ -63,15 +67,22 @@ fn parse_args() -> Option<Args> {
     })
 }
 
+/// Adopt the inherited listening socket named by `--socket-fd`, CLOEXEC at once.
 fn listener_from_fd(fd: i32) -> Option<UnixListener> {
     if fd < 3 {
         return None;
     }
-    // SAFETY: `--socket-fd` names the listening socket bubbler handed to bwrap.
-    // It is inherited exactly once and nothing else in this process refers to
-    // it, so this process is its sole owner. A number that is not an open
-    // listening socket is rejected below and closed again on drop.
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: the precondition is that `fd` names a descriptor this process
+    // owns and that nothing else will close. `fcntl_getfd` is the probe that
+    // rules out a number that is not open at all (EBADF) before any owning
+    // handle exists, so no closed number is ever adopted or closed twice;
+    // bubbler passes this listener as the only inherited fd above stdio, so
+    // there is no second owner. A number that is open but not a listening
+    // socket is rejected below and closed again on drop.
+    let owned = unsafe {
+        fcntl_getfd(BorrowedFd::borrow_raw(fd)).ok()?;
+        OwnedFd::from_raw_fd(fd)
+    };
     // CLOEXEC keeps the control channel out of the command and every exec'd child.
     fcntl_setfd(&owned, FdFlags::CLOEXEC).ok()?;
     if !rustix::net::sockopt::socket_acceptconn(&owned).ok()? {
@@ -84,10 +95,7 @@ fn listener_from_fd(fd: i32) -> Option<UnixListener> {
 
 /// Execute one request; a malformed one closes the connection, spawning nothing.
 fn serve(stream: UnixStream, execs: &mut Vec<Exec>) {
-    if stream.set_read_timeout(Some(REQUEST_TIMEOUT)).is_err() {
-        return;
-    }
-    let Ok((argv, fds)) = wire::recv_request(&stream) else {
+    let Ok((argv, fds)) = wire::recv_request(&stream, Instant::now() + REQUEST_TIMEOUT) else {
         return;
     };
     let Some((program, rest)) = argv.split_first() else {
@@ -97,6 +105,7 @@ fn serve(stream: UnixStream, execs: &mut Vec<Exec>) {
     let (Some(stdin), Some(stdout), Some(stderr)) = (fds.next(), fds.next(), fds.next()) else {
         return;
     };
+    let report = stderr.try_clone().ok();
     // argv[0] is resolved through PATH as seen inside the sandbox.
     let spawned = Command::new(program)
         .args(rest)
@@ -106,7 +115,14 @@ fn serve(stream: UnixStream, execs: &mut Vec<Exec>) {
         .spawn();
     match spawned {
         Ok(child) => execs.push(Exec { child, stream }),
-        Err(_) => {
+        Err(e) => {
+            if let Some(fd) = report {
+                let _ = writeln!(
+                    File::from(fd),
+                    "bubbler-init: {}: {e}",
+                    program.to_string_lossy()
+                );
+            }
             let _ = wire::send_status(&stream, NOT_EXECUTABLE);
         }
     }
@@ -144,8 +160,11 @@ fn shutdown(execs: &mut Vec<Exec>) {
     }
     signal_execs(execs, Signal::KILL);
     for e in execs.iter_mut() {
-        let _ = e.child.wait();
+        if let Ok(status) = e.child.wait() {
+            let _ = wire::send_status(&e.stream, status.into_raw());
+        }
     }
+    execs.clear();
 }
 
 /// The command's exit code, or 128 + signal when a signal killed it.
@@ -163,9 +182,20 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let Some(listener) = listener_from_fd(args.socket_fd) else {
-        eprintln!("bubbler-init: --socket-fd is not an inherited listening socket");
+        eprintln!(
+            "bubbler-init: {}: not an open listening socket fd",
+            args.socket_fd
+        );
         return ExitCode::from(2);
     };
+    // A non-dumpable process can only be ptraced, or have fds taken with
+    // pidfd_getfd, by a tracer holding CAP_SYS_PTRACE, even where
+    // kernel.yama.ptrace_scope is 0; execve resets it, so the command and every
+    // exec'd child are unaffected.
+    if let Err(e) = set_dumpable_behavior(DumpableBehavior::NotDumpable) {
+        eprintln!("bubbler-init: cannot become non-dumpable: {e}");
+        return ExitCode::from(2);
+    }
     let stop = Arc::new(AtomicBool::new(false));
     for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
         if signal_hook::flag::register(sig, Arc::clone(&stop)).is_err() {
@@ -208,7 +238,9 @@ fn main() -> ExitCode {
         let mut fds = [PollFd::new(&listener, PollFlags::IN)];
         match poll(&mut fds, Some(&TICK_TIMESPEC)) {
             Ok(0) => continue,
-            // A delivered signal interrupts the wait; the next tick acts on it.
+            // Every poll error is retried on purpose: EINTR means a signal was
+            // delivered and the next tick acts on it, and no other error is a
+            // reason to abandon a command that is still running.
             Err(_) => {
                 std::thread::sleep(TICK);
                 continue;

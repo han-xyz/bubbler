@@ -6,6 +6,7 @@ use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+use std::time::Instant;
 
 use rustix::net::{
     RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
@@ -19,6 +20,32 @@ pub const REQUEST_FDS: usize = 3;
 
 fn invalid(msg: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
+}
+
+/// Arm the socket with the time left until `deadline`, so a whole request,
+/// not merely one read, has to finish inside it.
+fn arm(stream: &UnixStream, deadline: Instant) -> io::Result<()> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(io::Error::new(io::ErrorKind::TimedOut, "request timed out"));
+    }
+    stream.set_read_timeout(Some(left))
+}
+
+/// `read_exact` that re-arms the timeout before every read, so a client
+/// trickling bytes cannot extend the deadline.
+fn read_exact_by(stream: &UnixStream, buf: &mut [u8], deadline: Instant) -> io::Result<()> {
+    let mut done = 0;
+    while done < buf.len() {
+        arm(stream, deadline)?;
+        match (&*stream).read(&mut buf[done..]) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            Ok(n) => done += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Send `argv` with the three stdio fds attached to the length prefix.
@@ -49,11 +76,15 @@ pub fn send_request(
     (&*stream).write_all(&payload)
 }
 
-/// Receive one request: argv and the attached fds, which must be exactly three.
-pub fn recv_request(stream: &UnixStream) -> io::Result<(Vec<OsString>, Vec<OwnedFd>)> {
+/// Receive one request whole before `deadline`: argv and its exactly three fds.
+pub fn recv_request(
+    stream: &UnixStream,
+    deadline: Instant,
+) -> io::Result<(Vec<OsString>, Vec<OwnedFd>)> {
     let mut len = [0u8; 4];
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(REQUEST_FDS))];
     let mut anc = RecvAncillaryBuffer::new(&mut space);
+    arm(stream, deadline)?;
     let n = rustix::net::recvmsg(
         stream.as_fd(),
         &mut [IoSliceMut::new(&mut len)],
@@ -78,7 +109,7 @@ pub fn recv_request(stream: &UnixStream) -> io::Result<(Vec<OsString>, Vec<Owned
         return Err(invalid("request too large"));
     }
     let mut buf = vec![0u8; len];
-    (&*stream).read_exact(&mut buf)?;
+    read_exact_by(stream, &mut buf, deadline)?;
     let argv = proto::decode_request(&buf)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}")))?;
     Ok((argv, fds))
@@ -100,27 +131,90 @@ pub fn recv_status(stream: &UnixStream) -> io::Result<i32> {
 mod tests {
     use super::*;
     use std::fs::File;
+    use std::time::Duration;
+
+    fn soon() -> Instant {
+        Instant::now() + Duration::from_secs(5)
+    }
 
     #[test]
     fn request_roundtrip_carries_three_fds() {
         let (client, server) = UnixStream::pair().unwrap();
         let null = File::open("/dev/null").unwrap();
         let argv: Vec<&OsStr> = vec![OsStr::new("sh"), OsStr::new("-c"), OsStr::new("exit 3")];
-        send_request(&client, &argv, [null.as_fd(), null.as_fd(), null.as_fd()]).unwrap();
-        let (got, fds) = recv_request(&server).unwrap();
+        send_request(&client, &argv, [null.as_fd(); REQUEST_FDS]).unwrap();
+        let (got, fds) = recv_request(&server, soon()).unwrap();
         assert_eq!(got, vec!["sh", "-c", "exit 3"]);
-        assert_eq!(fds.len(), 3);
+        assert_eq!(fds.len(), REQUEST_FDS);
     }
 
     #[test]
     fn request_without_fds_is_rejected() {
         let (client, server) = UnixStream::pair().unwrap();
-        let payload = crate::proto::encode_request(&[OsStr::new("true")]);
+        let payload = proto::encode_request(&[OsStr::new("true")]);
         (&client)
             .write_all(&(payload.len() as u32).to_le_bytes())
             .unwrap();
         (&client).write_all(&payload).unwrap();
-        assert!(recv_request(&server).is_err());
+        assert!(recv_request(&server, soon()).is_err());
+    }
+
+    #[test]
+    fn a_truncated_payload_times_out_instead_of_hanging() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let null = File::open("/dev/null").unwrap();
+        let argv: Vec<&OsStr> = vec![OsStr::new("true")];
+        let payload = proto::encode_request(&argv);
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(REQUEST_FDS))];
+        let mut anc = SendAncillaryBuffer::new(&mut space);
+        let fds = [null.as_fd(); REQUEST_FDS];
+        assert!(anc.push(SendAncillaryMessage::ScmRights(&fds)));
+        let len = (payload.len() as u32).to_le_bytes();
+        rustix::net::sendmsg(
+            client.as_fd(),
+            &[IoSlice::new(&len)],
+            &mut anc,
+            SendFlags::empty(),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let deadline = Instant::now() + Duration::from_millis(200);
+        assert!(recv_request(&server, deadline).is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_trickling_client_cannot_extend_the_deadline() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let null = File::open("/dev/null").unwrap();
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(REQUEST_FDS))];
+        let mut anc = SendAncillaryBuffer::new(&mut space);
+        let fds = [null.as_fd(); REQUEST_FDS];
+        assert!(anc.push(SendAncillaryMessage::ScmRights(&fds)));
+        rustix::net::sendmsg(
+            client.as_fd(),
+            &[IoSlice::new(&20u32.to_le_bytes())],
+            &mut anc,
+            SendFlags::empty(),
+        )
+        .unwrap();
+        let writer = std::thread::spawn(move || {
+            for _ in 0..20 {
+                if (&client).write_all(b"x").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let started = Instant::now();
+        assert!(recv_request(&server, started + Duration::from_millis(300)).is_err());
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "one byte at a time extended the deadline to {:?}",
+            started.elapsed()
+        );
+        drop(server);
+        let _ = writer.join();
     }
 
     #[test]

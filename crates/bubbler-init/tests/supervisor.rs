@@ -99,3 +99,66 @@ fn unexecutable_request_reports_127() {
     .unwrap();
     init.wait().unwrap();
 }
+
+/// Promise `len` payload bytes with the three fds attached, then send nothing.
+fn send_prefix_and_fds(stream: &UnixStream, len: u32) {
+    let null = std::fs::File::open("/dev/null").unwrap();
+    let fds = [null.as_fd(); 3];
+    let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(3))];
+    let mut anc = rustix::net::SendAncillaryBuffer::new(&mut space);
+    assert!(anc.push(rustix::net::SendAncillaryMessage::ScmRights(&fds)));
+    rustix::net::sendmsg(
+        stream.as_fd(),
+        &[std::io::IoSlice::new(&len.to_le_bytes())],
+        &mut anc,
+        rustix::net::SendFlags::empty(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_closed_socket_fd_is_a_usage_error_not_an_abort() {
+    let out = Command::new(env!("CARGO_BIN_EXE_bubbler-init"))
+        .arg("--socket-fd")
+        .arg("99")
+        .arg("--")
+        .arg("/usr/bin/true")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "aborted instead of exiting 2");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("socket fd"), "stderr was {err:?}");
+}
+
+#[test]
+fn a_stalled_client_cannot_hold_up_the_supervisor() {
+    let (mut init, sock, _tmp) = start(&["/usr/bin/sleep", "30"]);
+    std::thread::sleep(Duration::from_millis(200));
+    let stalled = UnixStream::connect(&sock).unwrap();
+    send_prefix_and_fds(&stalled, 64);
+    let t = Instant::now();
+    assert_eq!(
+        ExitStatus::from_raw(exec(&sock, &["/usr/bin/true"])).code(),
+        Some(0)
+    );
+    assert!(
+        t.elapsed() < Duration::from_millis(5500),
+        "second exec waited {:?}",
+        t.elapsed()
+    );
+    let t = Instant::now();
+    rustix::process::kill_process(
+        rustix::process::Pid::from_child(&init),
+        rustix::process::Signal::TERM,
+    )
+    .unwrap();
+    let status = loop {
+        if let Some(s) = init.try_wait().unwrap() {
+            break s;
+        }
+        assert!(t.elapsed() < Duration::from_secs(6), "init ignored SIGTERM");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status.code(), Some(143));
+    drop(stalled);
+}
