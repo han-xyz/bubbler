@@ -43,7 +43,7 @@ pub fn build_argv(
 }
 
 /// Allocator for `--dry-run`: numbers data files 3, 4, ... without
-/// creating anything, matching the fds a real run would inherit.
+/// creating anything, which is what a real run typically gets.
 pub fn dry_run_alloc() -> impl FnMut(&[u8]) -> io::Result<OsString> {
     let mut next = 2u32;
     move |_| {
@@ -117,6 +117,8 @@ pub fn run(env: &Env, inst: &Instance, command: Option<&[OsString]>) -> Result<i
             io::ErrorKind::NotFound => LaunchError::BwrapMissing,
             _ => LaunchError::Spawn(e),
         })?;
+    // bwrap copies the data files out of the fds while it starts, so they
+    // must stay open until it has exited.
     drop(fds);
     Ok(exit_code(status))
 }

@@ -35,8 +35,11 @@ Instance names are letters, digits, `.`, `_` and `-`; they cannot start with
     command "firefox"
 
 Every sandbox gets: all namespaces unshared, no network, read-only `/usr`
-`/etc` `/opt`, empty `/tmp` `/var` `/run`, a private home at `/home/bubbler`,
-and a cleared environment. Grants only add to that. `x11` binds the X socket
+`/opt`, empty `/tmp` `/var` `/run`, a private home at `/home/bubbler`, and a
+cleared environment. `/etc` is an allowlist over a tmpfs: only known entries
+such as `hosts`, `fonts` or `ssl` are bound, and `passwd` and `group` are
+generated, so the sandbox sees the user `bubbler` and never the host's
+accounts. Grants only add to that. `x11` binds the X socket
 and remaps any Xauthority file to `/home/bubbler/.Xauthority`, but it stays a
 compatibility grant: X11 offers no isolation between clients. Sockets and
 cookie files named by the environment must really be of that type, so a

@@ -44,17 +44,60 @@ fn push<const N: usize>(v: &mut Vec<Item>, parts: [&OsStr; N]) {
     v.extend(parts.iter().map(|p| Item::Arg(p.to_os_string())));
 }
 
+/// Host `/etc` entries bound read-only when they exist. Everything else in
+/// `/etc` is hidden by the tmpfs mounted first.
+pub const ETC_ALLOWLIST: &[&str] = &[
+    "ld.so.cache",
+    "ld.so.conf",
+    "ld.so.conf.d",
+    "fonts",
+    "localtime",
+    "machine-id",
+    "nsswitch.conf",
+    "hosts",
+    "host.conf",
+    "ssl",
+    "ca-certificates",
+    "mime.types",
+    "xdg",
+    "gtk-3.0",
+    "gtk-4.0",
+    "pulse",
+    "pipewire",
+    "drirc",
+    "vulkan",
+    "glvnd",
+    "egl",
+    "os-release",
+];
+
+/// `/etc/passwd` for the sandbox: the fixed `bubbler` user plus `nobody`,
+/// which is what files owned by other host users map to in the user namespace.
+pub fn passwd_content(uid: u32, gid: u32) -> Vec<u8> {
+    format!(
+        "bubbler:x:{uid}:{gid}:bubbler:{SANDBOX_HOME}:/bin/sh\nnobody:x:65534:65534:nobody:/:/bin/sh\n"
+    )
+    .into_bytes()
+}
+
+/// `/etc/group` matching [`passwd_content`].
+pub fn group_content(gid: u32) -> Vec<u8> {
+    format!("bubbler:x:{gid}:\nnobody:x:65534:\n").into_bytes()
+}
+
 impl BwrapArgs {
     /// The restrictions every sandbox gets: all namespaces unshared, no
-    /// network, read-only `/usr` `/etc` `/opt`, empty `/tmp` `/var` `/run`,
-    /// a private home at [`SANDBOX_HOME`], an empty `$XDG_RUNTIME_DIR` at
-    /// the same path as on the host and mode 0700 (`--perms` applies to the
-    /// next operation only, so it must immediately precede `--dir`), cleared
-    /// environment with only locale/terminal passthrough. Services relax
+    /// network, read-only `/usr` `/opt`, an `/etc` that is an allowlist
+    /// ([`ETC_ALLOWLIST`]) over a tmpfs plus a synthetic passwd and group,
+    /// empty `/tmp` `/var` `/run`, a private home at [`SANDBOX_HOME`], an
+    /// empty `$XDG_RUNTIME_DIR` at the same path as on the host and mode
+    /// 0700 (`--perms` applies to the next operation only, so it must
+    /// immediately precede `--dir`), cleared environment with only
+    /// locale/terminal passthrough and the fixed user name. Services relax
     /// this explicitly. `--unshare-all` uses bwrap's `-try` semantics for
     /// the user namespace (`bwrap(1)`), so on a host without unprivileged
     /// user namespaces the sandbox may start without one; to be revisited.
-    pub fn baseline(env: &Env, instance_home: &Path, _host: &dyn Host) -> Self {
+    pub fn baseline(env: &Env, instance_home: &Path, host: &dyn Host) -> Self {
         let mut a = Self {
             namespaces: Vec::new(),
             skeleton: Vec::new(),
@@ -83,8 +126,29 @@ impl BwrapArgs {
         ] {
             push(&mut a.skeleton, [o("--symlink"), o(target), o(link)]);
         }
-        push(&mut a.skeleton, [o("--ro-bind"), o("/etc"), o("/etc")]);
         push(&mut a.skeleton, [o("--ro-bind-try"), o("/opt"), o("/opt")]);
+        // The tmpfs has to precede the entry binds and the data files, or it
+        // would hide them: bwrap applies filesystem operations in argv order.
+        push(&mut a.skeleton, [o("--tmpfs"), o("/etc")]);
+        for name in ETC_ALLOWLIST {
+            let p = Path::new("/etc").join(name);
+            if host.file_type(&p).is_some() {
+                push(
+                    &mut a.skeleton,
+                    [o("--ro-bind"), p.as_os_str(), p.as_os_str()],
+                );
+            }
+        }
+        a.skeleton.push(Item::Data {
+            content: passwd_content(env.uid, env.gid),
+            dest: "/etc/passwd".into(),
+            mode: "0644".into(),
+        });
+        a.skeleton.push(Item::Data {
+            content: group_content(env.gid),
+            dest: "/etc/group".into(),
+            mode: "0644".into(),
+        });
         push(
             &mut a.skeleton,
             [o("--proc"), o("/proc"), o("--dev"), o("/dev")],
@@ -129,6 +193,8 @@ impl BwrapArgs {
                 env.runtime_dir.as_os_str(),
             ],
         );
+        push(&mut a.env, [o("--setenv"), o("USER"), o("bubbler")]);
+        push(&mut a.env, [o("--setenv"), o("LOGNAME"), o("bubbler")]);
         a
     }
 
@@ -287,12 +353,21 @@ mod tests {
                 "--symlink",
                 "usr/bin",
                 "/sbin",
-                "--ro-bind",
-                "/etc",
-                "/etc",
                 "--ro-bind-try",
                 "/opt",
                 "/opt",
+                "--tmpfs",
+                "/etc",
+                "--perms",
+                "0644",
+                "--ro-bind-data",
+                "3",
+                "/etc/passwd",
+                "--perms",
+                "0644",
+                "--ro-bind-data",
+                "4",
+                "/etc/group",
                 "--proc",
                 "/proc",
                 "--dev",
@@ -323,9 +398,68 @@ mod tests {
                 "--setenv",
                 "XDG_RUNTIME_DIR",
                 "/run/user/1000",
+                "--setenv",
+                "USER",
+                "bubbler",
+                "--setenv",
+                "LOGNAME",
+                "bubbler",
                 "--",
                 "/usr/bin/true",
             ]
+        );
+    }
+
+    #[test]
+    fn etc_is_an_allowlist_of_existing_entries() {
+        let (f, d, _) = crate::host::fake::types();
+        let host = FakeHost::default()
+            .with("/etc/hosts", f)
+            .with("/etc/fonts", d)
+            .with("/etc/shadow", f);
+        let argv = BwrapArgs::baseline(&env(), Path::new("/i/home"), &host)
+            .finish(&["sh".into()], &mut counter())
+            .unwrap();
+        let s = strs(&argv);
+        let pos = |x: &str| s.iter().position(|a| *a == x).unwrap();
+        assert!(s.windows(2).any(|w| w == ["--tmpfs", "/etc"]));
+        assert!(
+            s.windows(3)
+                .any(|w| w == ["--ro-bind", "/etc/hosts", "/etc/hosts"])
+        );
+        assert!(
+            s.windows(3)
+                .any(|w| w == ["--ro-bind", "/etc/fonts", "/etc/fonts"])
+        );
+        assert!(!s.contains(&"/etc/shadow"));
+        assert!(!s.windows(3).any(|w| w == ["--ro-bind", "/etc", "/etc"]));
+        assert!(pos("/etc/hosts") > pos("--tmpfs"));
+        assert!(
+            s.windows(5)
+                .any(|w| w == ["--perms", "0644", "--ro-bind-data", "3", "/etc/passwd"])
+        );
+        assert!(
+            s.windows(5)
+                .any(|w| w == ["--perms", "0644", "--ro-bind-data", "4", "/etc/group"])
+        );
+        assert!(pos("/etc/passwd") < pos("--proc"));
+        assert!(s.windows(3).any(|w| w == ["--setenv", "USER", "bubbler"]));
+        assert!(
+            s.windows(3)
+                .any(|w| w == ["--setenv", "LOGNAME", "bubbler"])
+        );
+    }
+
+    #[test]
+    fn passwd_and_group_content() {
+        assert_eq!(
+            passwd_content(1000, 1000),
+            b"bubbler:x:1000:1000:bubbler:/home/bubbler:/bin/sh\nnobody:x:65534:65534:nobody:/:/bin/sh\n"
+                .to_vec()
+        );
+        assert_eq!(
+            group_content(1000),
+            b"bubbler:x:1000:\nnobody:x:65534:\n".to_vec()
         );
     }
 
@@ -374,15 +508,16 @@ mod tests {
             })
             .unwrap();
         let s = strs(&argv);
+        // Fds 3 and 4 went to the baseline passwd and group.
         assert!(
             s.windows(5)
-                .any(|w| w == ["--perms", "0644", "--ro-bind-data", "3", "/etc/x"])
+                .any(|w| w == ["--perms", "0644", "--ro-bind-data", "5", "/etc/x"])
         );
         assert!(
             s.windows(5)
-                .any(|w| w == ["--perms", "0600", "--ro-bind-data", "4", "/etc/y"])
+                .any(|w| w == ["--perms", "0600", "--ro-bind-data", "6", "/etc/y"])
         );
-        assert_eq!(seen, vec![b"hello".to_vec(), b"world".to_vec()]);
+        assert_eq!(seen[2..], [b"hello".to_vec(), b"world".to_vec()]);
     }
 
     #[test]

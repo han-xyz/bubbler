@@ -5,8 +5,8 @@ use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
 /// Path of the private home inside every sandbox. Fixed so host home
-/// paths are not part of the sandbox layout. The username is still
-/// visible via `/etc/passwd` until `/etc` is allowlisted.
+/// paths are not part of the sandbox layout; the synthetic `/etc/passwd`
+/// names its owner `bubbler`, so the host user name stays hidden too.
 pub const SANDBOX_HOME: &str = "/home/bubbler";
 
 /// Environment variables copied from the host into the sandbox when set:

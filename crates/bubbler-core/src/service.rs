@@ -33,7 +33,7 @@ pub fn apply_all(
         match s {
             Service::Wayland => wayland(env, args, host, !has_x11)?,
             Service::X11 => x11(env, args, host)?,
-            Service::Network => args.share_net(),
+            Service::Network => network(args, host)?,
             Service::HomeShare { path, mode } => home_share(env, args, host, path, *mode)?,
         }
     }
@@ -87,6 +87,16 @@ fn require_exists(
         Some(_) => Ok(path),
         None => Err(LaunchError::MissingResource { service, path }),
     }
+}
+
+/// Keep the host network namespace and bind the resolver configuration,
+/// without which names cannot be resolved inside the sandbox. The bind is
+/// phase 4, so it lands inside the phase-2 tmpfs on `/etc`.
+fn network(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
+    args.share_net();
+    let p = require_file(host, "network", PathBuf::from("/etc/resolv.conf"))?;
+    args.ro_bind(&p, &p);
+    Ok(())
 }
 
 /// Bind `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY` at the same path, which must
@@ -171,9 +181,9 @@ fn x11(env: &Env, args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchErr
                 .then_some(home)
         }
     };
-    if let Some(host) = cookie {
+    if let Some(cookie_path) = cookie {
         let inner = Path::new(SANDBOX_HOME).join(".Xauthority");
-        args.ro_bind(&host, &inner);
+        args.ro_bind(&cookie_path, &inner);
         args.setenv(OsStr::new("XAUTHORITY"), inner.as_os_str());
     }
     Ok(())
@@ -545,9 +555,20 @@ mod tests {
     }
 
     #[test]
-    fn network_shares_net() {
-        let a = argv(&[Service::Network], &env(), &[]).unwrap();
+    fn network_shares_net_and_binds_resolv_conf() {
+        let a = argv(&[Service::Network], &env(), &[("/etc/resolv.conf", File)]).unwrap();
         assert_eq!(a[1], "--share-net");
+        assert!(has_seq(
+            &a,
+            &["--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf"]
+        ));
+        assert!(matches!(
+            argv(&[Service::Network], &env(), &[]),
+            Err(LaunchError::MissingResource {
+                service: "network",
+                ..
+            })
+        ));
     }
 
     #[test]

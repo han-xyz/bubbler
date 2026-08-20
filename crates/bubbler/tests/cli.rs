@@ -33,18 +33,31 @@ fn create_list_and_dry_run() {
     );
     let home = tmp.path().join("data/bubbler/instances/t/home");
     let run = tmp.path().join("run");
-    let expected = format!(
-        "bwrap\n--unshare-all\n--die-with-parent\n--new-session\n--hostname\nbubbler\n\
+    // Which allowlisted `/etc` entries exist is a property of this host, so
+    // only the parts around them are exact.
+    let expected_prefix = "bwrap\n--unshare-all\n--die-with-parent\n--new-session\n--hostname\nbubbler\n\
          --ro-bind\n/usr\n/usr\n--symlink\nusr/bin\n/bin\n--symlink\nusr/lib\n/lib\n\
-         --symlink\nusr/lib64\n/lib64\n--symlink\nusr/bin\n/sbin\n--ro-bind\n/etc\n/etc\n\
-         --ro-bind-try\n/opt\n/opt\n--proc\n/proc\n--dev\n/dev\n--tmpfs\n/tmp\n--tmpfs\n/var\n--tmpfs\n/run\n\
+         --symlink\nusr/lib64\n/lib64\n--symlink\nusr/bin\n/sbin\n\
+         --ro-bind-try\n/opt\n/opt\n--tmpfs\n/etc\n";
+    let expected_suffix = format!(
+        "--proc\n/proc\n--dev\n/dev\n--tmpfs\n/tmp\n--tmpfs\n/var\n--tmpfs\n/run\n\
          --bind\n{home}\n/home/bubbler\n--perms\n0700\n--dir\n{run}\n--clearenv\n--setenv\nTERM\ndumb\n\
          --setenv\nHOME\n/home/bubbler\n--setenv\nPATH\n/usr/bin\n--setenv\nXDG_RUNTIME_DIR\n{run}\n\
-         --\n/usr/bin/true\n",
+         --setenv\nUSER\nbubbler\n--setenv\nLOGNAME\nbubbler\n--\n/usr/bin/true\n",
         home = home.display(),
         run = run.display()
     );
-    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.starts_with(expected_prefix), "{s}");
+    assert!(
+        s.contains("--perms\n0644\n--ro-bind-data\n3\n/etc/passwd\n"),
+        "{s}"
+    );
+    assert!(
+        s.contains("--perms\n0644\n--ro-bind-data\n4\n/etc/group\n"),
+        "{s}"
+    );
+    assert!(s.ends_with(&expected_suffix), "{s}");
 }
 
 #[test]
@@ -152,6 +165,34 @@ fn real_bwrap_home_is_fixed_and_private() {
         String::from_utf8_lossy(&out.stdout),
         "/home/bubbler\nbubbler\n"
     );
+}
+
+#[test]
+fn real_bwrap_etc_is_allowlisted_and_user_is_bubbler() {
+    if !require_bwrap() {
+        return;
+    }
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let out = bubbler(tmp.path())
+        .args([
+            "run",
+            "t",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            "id -un; cat /etc/passwd | wc -l; test -e /etc/shadow && echo LEAK; ls /etc | grep -c .",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.starts_with("bubbler\n2\n"), "{s}");
+    assert!(!s.contains("LEAK"));
 }
 
 #[test]
