@@ -25,12 +25,16 @@ pub const FLATPAK_DIR: &str = ".flatpak";
 /// `child-pid` out of it to get a pidfd of the sandbox.
 pub const BWRAPINFO: &str = "bwrapinfo.json";
 
-/// Rules the `portals` bundle grants, in the order flatpak grants them.
+/// Rules the `portals` bundle grants: the three portal services a
+/// sandboxed app talks to, plus the `--call`/`--broadcast` pair from the
+/// `xdg-dbus-proxy(1)` EXAMPLES section.
+// Not `org.freedesktop.portal.Flatpak`: that is the spawn portal, which
+// starts processes outside the sandbox, and Settings, FileChooser and
+// Notification all live on `portal.Desktop`.
 const PORTAL_RULES: &[&str] = &[
     "--talk=org.freedesktop.portal.Desktop",
     "--talk=org.freedesktop.portal.Documents",
     "--talk=org.freedesktop.portal.FileChooser",
-    "--talk=org.freedesktop.portal.Flatpak",
     "--call=org.freedesktop.portal.*=*",
     "--broadcast=org.freedesktop.portal.*=@/org/freedesktop/portal/*",
 ];
@@ -106,24 +110,68 @@ fn render(rule: &BusRule) -> String {
     }
 }
 
+/// Application id of an instance: `org.bubbler.` and the instance name as
+/// one trailing element. Every `.` in the name becomes `_`, because only
+/// the last element of an id may hold `-`, and a leading digit is
+/// prefixed, which flatpak's own name check rejects even though the
+/// portal's does not.
+pub fn app_id(instance: &str) -> String {
+    let mut tail = instance.replace('.', "_");
+    if tail.starts_with(|c: char| c.is_ascii_digit()) {
+        tail.insert(0, '_');
+    }
+    format!("org.bubbler.{tail}")
+}
+
+/// Whether `id` is an application id xdg-desktop-portal accepts: at least
+/// two `.`-separated non-empty elements of `[A-Za-z0-9_]`, `-` allowed
+/// only in the last one, at most 255 bytes.
+// Mirrors `xdp_is_valid_app_id` (xdg-desktop-portal, shared/xdp-utils.c).
+// An id it rejects makes the portal refuse every operation of the sandbox.
+pub fn is_valid_app_id(id: &str) -> bool {
+    if id.is_empty() || id.len() > 255 {
+        return false;
+    }
+    let last = id.split('.').count() - 1;
+    last >= 1
+        && id.split('.').enumerate().all(|(i, element)| {
+            !element.is_empty()
+                && element
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || (i == last && b == b'-'))
+        })
+}
+
 /// The `/.flatpak-info` a sandbox is identified by. Without `portals` the
 /// proxy still gets the `[Application]` section, which is what makes
 /// `xdg-dbus-proxy` treat the peer as a sandboxed app.
 // An instance name is `[A-Za-z0-9._-]+`, so it cannot start a new key or
 // section in this file.
 pub fn flatpak_info(instance: &str, portals: bool) -> Vec<u8> {
-    let mut s = format!("[Application]\nname=org.bubbler.{instance}\n");
+    let mut s = format!("[Application]\nname={}\n", app_id(instance));
     if portals {
-        s.push_str(&format!("\n[Instance]\ninstance-id={instance}\n"));
+        s.push_str(&format!(
+            "\n[Instance]\ninstance-id={}\n",
+            flatpak_instance_id(instance)
+        ));
     }
     s.into_bytes()
 }
 
-/// `$XDG_RUNTIME_DIR/.flatpak/<instance>`: where xdg-desktop-portal looks
-/// a sandboxed caller up, by the `instance-id` in its `/.flatpak-info`.
-/// `instance` is a validated instance name.
+/// `bubbler-<instance>`: the `instance-id` portals look a sandbox up by.
+/// Namespaced because the `.flatpak` directory is shared with flatpak,
+/// whose own instance ids are plain numbers.
+pub fn flatpak_instance_id(instance: &str) -> String {
+    format!("bubbler-{instance}")
+}
+
+/// `$XDG_RUNTIME_DIR/.flatpak/bubbler-<instance>`: where xdg-desktop-portal
+/// looks a sandboxed caller up, by the `instance-id` in its
+/// `/.flatpak-info`. `instance` is a validated instance name.
 pub fn flatpak_instance_dir(env: &Env, instance: &str) -> PathBuf {
-    env.runtime_dir.join(FLATPAK_DIR).join(instance)
+    env.runtime_dir
+        .join(FLATPAK_DIR)
+        .join(flatpak_instance_id(instance))
 }
 
 /// The only directory the proxy sandbox may write to. The instance
@@ -259,7 +307,6 @@ mod tests {
                 "--talk=org.freedesktop.portal.Desktop",
                 "--talk=org.freedesktop.portal.Documents",
                 "--talk=org.freedesktop.portal.FileChooser",
-                "--talk=org.freedesktop.portal.Flatpak",
                 "--call=org.freedesktop.portal.*=*",
                 "--broadcast=org.freedesktop.portal.*=@/org/freedesktop/portal/*",
                 "--talk=org.freedesktop.Notifications",
@@ -269,7 +316,7 @@ mod tests {
         assert!(p.portals);
         assert_eq!(
             p.flatpak_info,
-            b"[Application]\nname=org.bubbler.ff\n\n[Instance]\ninstance-id=ff\n".to_vec()
+            b"[Application]\nname=org.bubbler.ff\n\n[Instance]\ninstance-id=bubbler-ff\n".to_vec()
         );
     }
 
@@ -323,6 +370,54 @@ mod tests {
     }
 
     #[test]
+    fn an_app_id_is_one_the_portal_accepts_however_the_instance_is_named() {
+        for (instance, id) in [
+            ("t", "org.bubbler.t"),
+            ("ff", "org.bubbler.ff"),
+            ("my.app", "org.bubbler.my_app"),
+            ("a_b.c-d", "org.bubbler.a_b_c-d"),
+            ("2fa", "org.bubbler._2fa"),
+            (".hidden", "org.bubbler._hidden"),
+            ("..", "org.bubbler.__"),
+        ] {
+            assert_eq!(app_id(instance), id, "{instance}");
+            assert!(is_valid_app_id(&app_id(instance)), "{instance}");
+        }
+    }
+
+    #[test]
+    fn the_app_id_grammar_is_the_one_xdg_desktop_portal_checks() {
+        for ok in [
+            "a.b",
+            "org.bubbler.t",
+            "org.bubbler.2t",
+            "org.bubbler.a-b",
+            "a.b.c_d",
+            "org.bubbler._",
+            &format!("a.{}", "x".repeat(253)),
+        ] {
+            assert!(is_valid_app_id(ok), "{ok}");
+        }
+        // The last two are what an instance name with a dash and a dot,
+        // or with a leading dot, used to produce.
+        for no in [
+            "",
+            "a",
+            "a.",
+            ".a",
+            "a..b",
+            "org.bubbler.a b",
+            "a.b/c",
+            "a.b\u{e9}",
+            &format!("a.{}", "x".repeat(254)),
+            "org.bubbler.my-app.v2",
+            "org.bubbler..hidden",
+        ] {
+            assert!(!is_valid_app_id(no), "{no}");
+        }
+    }
+
+    #[test]
     fn without_portals_the_flatpak_info_is_the_application_section_only() {
         let p = plan(&[Service::Dbus { rules: vec![] }], "t").expect("dbus is granted");
         assert!(!p.portals);
@@ -334,13 +429,15 @@ mod tests {
 
     #[test]
     fn portals_look_the_instance_up_under_the_runtime_dir() {
+        // Namespaced: flatpak names its own instances in the same
+        // directory, with plain numbers.
         assert_eq!(
             flatpak_instance_dir(&env(), "t"),
-            PathBuf::from("/run/user/1000/.flatpak/t")
+            PathBuf::from("/run/user/1000/.flatpak/bubbler-t")
         );
         assert_eq!(
             flatpak_instance_dir(&env(), "t").join(BWRAPINFO),
-            PathBuf::from("/run/user/1000/.flatpak/t/bwrapinfo.json")
+            PathBuf::from("/run/user/1000/.flatpak/bubbler-t/bwrapinfo.json")
         );
     }
 

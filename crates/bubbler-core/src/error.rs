@@ -48,11 +48,12 @@ pub enum InstanceError {
     /// `open` on a missing instance.
     #[error("instance `{0}` not found")]
     NotFound(String),
-    /// Name is empty, is `.` or `..`, starts with `-`, or contains
-    /// characters outside `[A-Za-z0-9._-]`.
+    /// Name is empty, is `.` or `..`, starts with `-`, has the reserved
+    /// `try-<digits>` shape, or contains characters outside `[A-Za-z0-9._-]`.
     #[error(
         "invalid instance name `{0}`: use letters, digits, `.`, `_` and `-`, \
-         not starting with `-`, and not `.` or `..`"
+         not starting with `-`, not `.` or `..`, and not `try-<digits>`, \
+         which `bubbler try` reserves"
     )]
     InvalidName(String),
     /// Unknown profile name passed to `create`.

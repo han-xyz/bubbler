@@ -74,6 +74,14 @@ pub struct Instance {
     pub config: InstanceConfig,
 }
 
+/// Whether `name` is the shape [`Instance::ephemeral`] gives a throwaway
+/// sandbox, `try-<pid>`, whose runtime directory is swept once that pid is
+/// gone. An instance of that name would have its own swept out from under it.
+fn is_try_name(name: &str) -> bool {
+    name.strip_prefix("try-")
+        .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+}
+
 // A leading `-` is rejected as well: such a name is a valid directory but
 // every CLI that takes it would read it as an option.
 fn validate_name(name: &str) -> Result<(), InstanceError> {
@@ -81,6 +89,7 @@ fn validate_name(name: &str) -> Result<(), InstanceError> {
         && name != "."
         && name != ".."
         && !name.starts_with('-')
+        && !is_try_name(name)
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-');
@@ -209,6 +218,13 @@ impl Ephemeral {
     /// to belong to something else that is already running there.
     pub fn disarm_runtime(&mut self) {
         self.remove_runtime = false;
+    }
+
+    /// Forget the name the sandbox was to be kept under, so it is removed
+    /// after all. What `--keep` keeps is a sandbox that ran, never one
+    /// whose launch failed.
+    pub fn disarm_keep(&mut self) {
+        self.keep = None;
     }
 }
 
@@ -444,7 +460,9 @@ mod tests {
             Instance::open(&env, "zz"),
             Err(InstanceError::NotFound(_))
         ));
-        for bad in ["", ".", "..", "-x", "a/b", "a b", "é"] {
+        // `try-<digits>` is what `bubbler try` names and sweeps its own
+        // sandboxes, so it is not a name a user's instance may take.
+        for bad in ["", ".", "..", "-x", "a/b", "a b", "é", "try-1", "try-04321"] {
             assert!(
                 matches!(
                     Instance::create(&env, bad, "generic"),
@@ -457,6 +475,10 @@ mod tests {
             Instance::create(&env, "ok", "nope"),
             Err(InstanceError::UnknownProfile(_))
         ));
+        // Only that exact shape is reserved.
+        for ok in ["try", "try-", "try-x", "try-1a", "tryout"] {
+            assert!(Instance::create(&env, ok, "generic").is_ok(), "{ok:?}");
+        }
     }
 
     #[test]

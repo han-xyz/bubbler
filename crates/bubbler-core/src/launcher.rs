@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use rustix::event::{Nsecs, PollFd, PollFlags, Secs, Timespec, poll};
 use rustix::fs::{MemfdFlags, Mode, OFlags};
 use rustix::io::{Errno, FdFlags, fcntl_dupfd_cloexec, fcntl_setfd};
-use rustix::process::{Pid, Signal, kill_process};
+use rustix::process::{Pid, Signal, kill_process, test_kill_process};
 use signal_hook::SigId;
 use signal_hook::consts::{SIGINT, SIGTERM};
 
@@ -39,6 +39,10 @@ const PROXY_READY: Duration = Duration::from_secs(5);
 /// How long a proxy may take to leave after its ready pipe is closed
 /// before it is killed.
 const PROXY_STOP: Duration = Duration::from_secs(1);
+
+/// How long the supervisor has to appear inside the sandbox before the
+/// run goes on without a pid to signal.
+const SUPERVISOR_WAIT: Duration = Duration::from_secs(2);
 
 /// Allocator for `--dry-run`: numbers every fd 3, 4, ... without creating
 /// anything.
@@ -556,6 +560,14 @@ fn read_sandbox_info(
     }
 }
 
+/// Whether `pid` is running the supervisor, by the name in
+/// `/proc/<pid>/comm`. The reaper's child carries bwrap's name until it
+/// execs, and a failed exec leaves something else there entirely.
+fn is_supervisor(pid: Pid) -> bool {
+    let comm = format!("/proc/{}/comm", pid.as_raw_nonzero());
+    std::fs::read_to_string(comm).is_ok_and(|name| name == format!("{}\n", init_bin::NAME))
+}
+
 /// Host pid of the supervisor in the sandbox, for signalling it directly.
 /// `reaper` is the `child-pid` bwrap reported.
 ///
@@ -568,16 +580,18 @@ fn read_sandbox_info(
 fn supervisor_pid(reaper: i32, child: &mut Child, deadline: Instant) -> Option<Pid> {
     let children = PathBuf::from(format!("/proc/{reaper}/task/{reaper}/children"));
     loop {
-        // Only an empty list is worth waiting on: the reaper forks the
-        // supervisor a moment after it appears. A read that fails means
-        // the sandbox is already gone, or this kernel has no `children`
-        // file, and neither gets better by asking again.
+        // An empty list and a child that has not exec'd yet are both worth
+        // waiting on: the reaper forks the supervisor a moment after it
+        // appears. A read that fails means the sandbox is already gone, or
+        // this kernel has no `children` file, and neither gets better by
+        // asking again.
         let list = std::fs::read_to_string(&children).ok()?;
         if let Some(pid) = list
             .split_ascii_whitespace()
             .next()
             .and_then(|p| p.parse::<i32>().ok())
             .and_then(Pid::from_raw)
+            && is_supervisor(pid)
         {
             return Some(pid);
         }
@@ -600,9 +614,10 @@ impl Drop for FileGuard {
     }
 }
 
-/// Removes this run's `$XDG_RUNTIME_DIR/.flatpak/<instance>` when the run
-/// leaves, on every path. Only that entry: the `.flatpak` directory above
-/// it is flatpak's own and holds other sandboxes' instances.
+/// Removes this run's `$XDG_RUNTIME_DIR/.flatpak/bubbler-<instance>` when
+/// the run leaves, on every path. Only that entry, and only one this run
+/// created: the `.flatpak` directory above it is shared with flatpak and
+/// holds other sandboxes' instances.
 struct FlatpakGuard(PathBuf);
 
 impl Drop for FlatpakGuard {
@@ -613,14 +628,44 @@ impl Drop for FlatpakGuard {
     }
 }
 
+/// Remove a `.flatpak` entry a killed run left behind, and only that: a
+/// directory holding nothing but a `bwrapinfo.json` whose `child-pid` is
+/// no longer a live process. Anything else is someone's to keep.
+fn sweep_identity(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let names: Vec<OsString> = entries.flatten().map(|e| e.file_name()).collect();
+    if names != [OsString::from(dbus::BWRAPINFO)] {
+        return;
+    }
+    let Ok(info) = std::fs::read(dir.join(dbus::BWRAPINFO)) else {
+        return;
+    };
+    // `kill(pid, 0)` fails with ESRCH only when no process has that pid;
+    // EPERM means it is alive and owned by someone else.
+    let gone = parse_child_pid(&info)
+        .and_then(Pid::from_raw)
+        .is_some_and(|pid| test_kill_process(pid) == Err(Errno::SRCH));
+    if gone {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 /// Publish bwrap's own info document as
-/// `$XDG_RUNTIME_DIR/.flatpak/<instance>/bwrapinfo.json`, which is how
-/// xdg-desktop-portal turns a sandboxed bus peer into a pidfd of the
+/// `$XDG_RUNTIME_DIR/.flatpak/bubbler-<instance>/bwrapinfo.json`, which is
+/// how xdg-desktop-portal turns a sandboxed bus peer into a pidfd of the
 /// sandbox. The guard removes the directory again when the run ends.
+///
+/// The instance directory is created outright, never adopted: a second
+/// run of the same instance must not publish over the first one's
+/// identity, and a directory that is not a dead run's is an error.
 fn publish_bwrapinfo(env: &Env, instance: &str, info: &[u8]) -> Result<FlatpakGuard, LaunchError> {
     mkdir_private(&env.runtime_dir.join(dbus::FLATPAK_DIR))?;
     let dir = dbus::flatpak_instance_dir(env, instance);
-    mkdir_private(&dir)?;
+    sweep_identity(&dir);
+    rustix::fs::mkdir(&dir, Mode::RWXU)
+        .map_err(|e| LaunchError::Io(dir.to_path_buf(), e.into()))?;
     // From here on the directory is removed again however this ends.
     let guard = FlatpakGuard(dir.clone());
     // Written and renamed inside the directory, so a portal reading it
@@ -745,9 +790,11 @@ pub fn run(env: &Env, inst: &Instance, command: Option<&[OsString]>) -> Result<i
     } else {
         None
     };
-    let supervisor = info
-        .as_ref()
-        .and_then(|(reaper, _)| supervisor_pid(*reaper, &mut child, deadline));
+    // Its own deadline: the one above may already have been spent waiting
+    // for bwrap's info document.
+    let supervisor = info.as_ref().and_then(|(reaper, _)| {
+        supervisor_pid(*reaper, &mut child, Instant::now() + SUPERVISOR_WAIT)
+    });
     let status = loop {
         if let Some(status) = child.try_wait().map_err(LaunchError::Spawn)? {
             break status;
@@ -1216,6 +1263,56 @@ mod tests {
         assert!(!dbus::app_bus_path(dir).exists());
     }
 
+    /// A pid no process has: a child that has already been reaped.
+    fn dead_pid() -> u32 {
+        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    fn bwrapinfo(pid: u32) -> Vec<u8> {
+        format!("{{\n    \"child-pid\": {pid},\n    \"x\": 1\n}}\n").into_bytes()
+    }
+
+    #[test]
+    fn a_dead_runs_identity_directory_is_swept_before_the_new_one_is_made() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let dir = dbus::flatpak_instance_dir(&e, "t");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(dbus::BWRAPINFO), bwrapinfo(dead_pid())).unwrap();
+        let guard = publish_bwrapinfo(&e, "t", &bwrapinfo(4321)).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join(dbus::BWRAPINFO)).unwrap(),
+            bwrapinfo(4321)
+        );
+        drop(guard);
+        assert!(!dir.exists(), "the identity outlived the run");
+    }
+
+    #[test]
+    fn an_identity_directory_that_is_not_a_dead_runs_is_never_adopted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let dir = dbus::flatpak_instance_dir(&e, "t");
+        // A live pid: another bubbler is using this instance's identity.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(dbus::BWRAPINFO), bwrapinfo(std::process::id())).unwrap();
+        assert!(matches!(
+            publish_bwrapinfo(&e, "t", &bwrapinfo(4321)),
+            Err(LaunchError::Io(_, _))
+        ));
+        // Anything else in it is not something bubbler put there.
+        std::fs::write(dir.join(dbus::BWRAPINFO), bwrapinfo(dead_pid())).unwrap();
+        std::fs::write(dir.join("other"), b"").unwrap();
+        assert!(matches!(
+            publish_bwrapinfo(&e, "t", &bwrapinfo(4321)),
+            Err(LaunchError::Io(_, _))
+        ));
+        assert!(dir.join("other").is_file(), "a foreign file was removed");
+    }
+
     #[test]
     fn dry_run_alloc_numbers_every_fd_from_three() {
         let mut alloc = DryRunAlloc::default();
@@ -1327,6 +1424,12 @@ mod tests {
         assert_eq!(parse_child_pid(b"{\n    \"child-pid\": }"), None);
         assert_eq!(parse_child_pid(b"{\"cgroup-namespace\": 4026533374}"), None);
         assert_eq!(parse_child_pid(b""), None);
+    }
+
+    #[test]
+    fn only_a_process_running_the_supervisor_is_signalled() {
+        let me = Pid::from_raw(std::process::id() as i32).expect("a live pid");
+        assert!(!is_supervisor(me), "this test binary is not the supervisor");
     }
 
     #[test]

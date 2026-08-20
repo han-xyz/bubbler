@@ -193,6 +193,11 @@ fn real_main() -> Result<i32> {
             if matches!(code, Err(LaunchError::AlreadyRunning(_))) {
                 eph.disarm_runtime();
             }
+            // A sandbox that never started is not one to keep, whatever
+            // `--keep` said.
+            if code.is_err() {
+                eph.disarm_keep();
+            }
             let code = code.context("running a throwaway sandbox");
             // The sandbox directory must outlive the run: dropping the
             // guard is what removes or keeps it.

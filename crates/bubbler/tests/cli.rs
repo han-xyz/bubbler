@@ -477,7 +477,8 @@ fn proxy_running_for(needle: &str) -> bool {
 struct RuntimeLeftovers {
     /// `$XDG_RUNTIME_DIR/bubbler/<name>`.
     runtime: PathBuf,
-    /// `$XDG_RUNTIME_DIR/.flatpak/<name>`, written only with `portals`.
+    /// `$XDG_RUNTIME_DIR/.flatpak/bubbler-<name>`, written only with
+    /// `portals`.
     flatpak: PathBuf,
 }
 
@@ -509,7 +510,7 @@ fn dbus_instance(tmp: &Path, init: &Path, name: &str, config: &str) -> RuntimeLe
         PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").expect("checked by require_dbus"));
     RuntimeLeftovers {
         runtime: run_dir.join("bubbler").join(name),
-        flatpak: run_dir.join(".flatpak").join(name),
+        flatpak: run_dir.join(".flatpak").join(format!("bubbler-{name}")),
     }
 }
 
@@ -1225,6 +1226,23 @@ fn real_bwrap_try_grants_network_and_leaves_nothing_behind() {
         .map(|e| e.unwrap().file_name())
         .collect();
     assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn try_keeps_nothing_when_the_launch_never_happened() {
+    let tmp = setup();
+    // A `$BUBBLER_INIT` that is not there fails the launch itself, after
+    // the throwaway sandbox has been created.
+    let out = bubbler(tmp.path())
+        .env("BUBBLER_INIT", tmp.path().join("gone"))
+        .args(["try", "--keep", "kept", "--", "/usr/bin/true"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    let out = bubbler(tmp.path()).arg("list").output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert!(!tmp.path().join("data/bubbler/instances/kept").exists());
 }
 
 #[test]

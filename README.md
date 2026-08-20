@@ -36,8 +36,9 @@ handed to the sandbox as an inherited file descriptor, so nothing inside can
 reach the path. `run` on an instance that is already running says so and
 execs into it instead of starting a second sandbox; configuration changes
 apply on the next start. An exec'd process is given bubbler's own stdin,
-stdout and stderr, so the channel is for tooling and debugging, not an extra
-boundary.
+stdout and stderr, and descriptors passed to exec'd commands are reachable by
+the sandboxed application through `/proc`: exec is a convenience channel, not
+a boundary.
 
 A run is a chain of processes; `bubbler` waits at the top of it and returns the
 command's status.
@@ -79,7 +80,8 @@ directory (including its `home/`) and any leftover runtime directory, and
 refuses outright if the instance path is a symlink rather than following it.
 
 Instance names are letters, digits, `.`, `_` and `-`; they cannot start with
-`-`, and cannot be `.` or `..`.
+`-`, cannot be `.` or `..`, and cannot look like `try-<digits>`, which is the
+shape `try` gives its own sandboxes and sweeps by pid.
 
 ## Config (KDL)
 
@@ -160,20 +162,32 @@ address, else `$XDG_RUNTIME_DIR/bus`, and must be a socket. Everything the
 sandbox may reach is a rule: the `dbus` children above, plus the bundles
 `portals`, `notify` and `mpris`, each of which needs `dbus`. `portals` also
 puts a `/.flatpak-info` in the sandbox giving it the application id
-`org.bubbler.<name>`, which is what portals and the proxy identify it by.
+`org.bubbler.<name>`, which is what portals and the proxy identify it by. A
+`.` in the name becomes `_`, since only the last element of an id may hold a
+`-` and xdg-desktop-portal refuses every operation of a sandbox whose id it
+cannot parse; a leading digit is prefixed with `_`, which the portal would
+take but flatpak's own name check would not. The rules it grants are `--talk`
+for `org.freedesktop.portal.Desktop`, `.Documents` and `.FileChooser` plus the
+`--call`/`--broadcast` pair from the `xdg-dbus-proxy(1)` examples; the spawn
+portal (`org.freedesktop.portal.Flatpak`), which starts processes outside the
+sandbox, is not among them.
 `BUBBLER_DBUS_LOG=1` runs the proxy with `--log`, so every filtered message is
 printed to bubbler's stderr.
 
 `portals` also publishes the instance's identity on the host, as
-`$XDG_RUNTIME_DIR/.flatpak/<name>/bwrapinfo.json`: bwrap's own `--info-fd`
-document, naming the `child-pid` of the sandbox. That file is how
+`$XDG_RUNTIME_DIR/.flatpak/bubbler-<name>/bwrapinfo.json`: bwrap's own
+`--info-fd` document, naming the `child-pid` of the sandbox. That file is how
 xdg-desktop-portal checks a sandboxed caller — it reads `instance-id` out of
 the caller's `/.flatpak-info`, looks the instance up there and opens a pidfd
 of that pid — and without it every portal *operation* is refused. The sandbox
 is held at bwrap's `--block-fd` until the file has been written, so the
 application never runs before its identity exists, and the directory is
-removed again when the run ends. The `.flatpak/` directory above it is
-flatpak's own and is never touched.
+removed again when the run ends. The `.flatpak/` directory above it is shared
+with flatpak, which names its own instances with plain numbers; bubbler
+creates it if it is missing and otherwise only ever adds and removes its own
+`bubbler-<name>` entry. That entry is created outright, never adopted: a
+leftover from a killed run is removed first, and only if it holds nothing but
+a `bwrapinfo.json` whose pid is gone.
 
 A rule grants exactly as much as it reads, and the globs are wide: `own
 "org.*"` claims every well-known name under `org.`, and `mpris name="*"` owns
@@ -212,10 +226,9 @@ binding the tree under it.
   path gives the sandbox nothing it can open.
 - `exec` passes bubbler's own stdin, stdout and stderr straight through, so
   the process inside holds the host terminal's descriptors and is in no
-  session of its own. It is a tooling and debugging channel, not a boundary.
-- `try` runs as `try-<pid>` and sweeps runtime directories of that shape whose
-  pid is gone, so `try-<digits>` is a reserved instance name shape: an
-  instance called `try-1234` can have its runtime directory removed under it.
+  session of its own. Descriptors passed to exec'd commands are reachable by
+  the sandboxed application through `/proc` — exec is a convenience channel,
+  not a boundary.
 - No seccomp filter — the sandbox is namespaces and mounts only.
 - No proprietary nvidia driver; `dri` covers the open stack.
 - `/etc/machine-id` is bound in, so every instance shares one stable
@@ -230,9 +243,9 @@ run except `--dry-run` also creates `$XDG_RUNTIME_DIR/bubbler/<name>/`, mode
 0700, reusing one left over from an earlier run, and binds the control socket
 `init.sock` in it; a `dbus` grant adds the subdirectory `dbus/` the proxy
 creates its socket in and the checked socket `bus` beside it, and a `portals`
-grant adds
-`$XDG_RUNTIME_DIR/.flatpak/<name>/`, removed again when the run ends. `HOME`
-and `XDG_RUNTIME_DIR` must be set and non-empty.
+grant adds `$XDG_RUNTIME_DIR/.flatpak/bubbler-<name>/`, creating `.flatpak/`
+if it is missing. Everything a run makes there is removed again when it ends.
+`HOME` and `XDG_RUNTIME_DIR` must be set and non-empty.
 
 The `bubbler-init` binary is taken from `$BUBBLER_INIT` if set (it must be a
 regular file), else from next to the `bubbler` binary, else from
