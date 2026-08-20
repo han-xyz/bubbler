@@ -28,8 +28,11 @@ fn push<const N: usize>(v: &mut Vec<OsString>, parts: [&OsStr; N]) {
 impl BwrapArgs {
     /// The restrictions every sandbox gets: all namespaces unshared, no
     /// network, read-only `/usr` `/etc` `/opt`, empty `/tmp` `/var` `/run`,
-    /// a private home at [`SANDBOX_HOME`], cleared environment with only
-    /// locale/terminal passthrough. Services relax this explicitly.
+    /// a private home at [`SANDBOX_HOME`], an empty `$XDG_RUNTIME_DIR` at
+    /// the same path as on the host and mode 0700 (`--perms` applies to the
+    /// next operation only, so it must immediately precede `--dir`), cleared
+    /// environment with only locale/terminal passthrough. Services relax
+    /// this explicitly.
     pub fn baseline(env: &Env, instance_home: &Path) -> Self {
         let mut a = Self::default();
         let o = OsStr::new;
@@ -77,7 +80,12 @@ impl BwrapArgs {
 
         push(
             &mut a.runtime_dir,
-            [o("--dir"), env.runtime_dir.as_os_str()],
+            [
+                o("--perms"),
+                o("0700"),
+                o("--dir"),
+                env.runtime_dir.as_os_str(),
+            ],
         );
 
         push(&mut a.env, [o("--clearenv")]);
@@ -98,9 +106,14 @@ impl BwrapArgs {
     }
 
     /// Keep the host network namespace (`--share-net`). Only the
-    /// `network` service calls this.
+    /// `network` service calls this. Idempotent: `--share-net` is emitted
+    /// once however often this is called, and always directly after
+    /// `--unshare-all`, which bwrap requires.
     pub fn share_net(&mut self) {
-        self.namespaces.insert(1, OsString::from("--share-net"));
+        let flag = OsString::from("--share-net");
+        if !self.namespaces.contains(&flag) {
+            self.namespaces.insert(1, flag);
+        }
     }
 
     /// Read-only bind of a host path (phase 4).
@@ -209,6 +222,8 @@ mod tests {
                 "--bind",
                 "/home/han/.local/share/bubbler/instances/t/home",
                 "/home/bubbler",
+                "--perms",
+                "0700",
                 "--dir",
                 "/run/user/1000",
                 "--clearenv",
@@ -250,5 +265,15 @@ mod tests {
         assert!(pos("/run/user/1000/wayland-1") > pos("--dir"));
         assert!(pos("/run/user/1000/wayland-1") < pos("--clearenv"));
         assert!(pos("WAYLAND_DISPLAY") > pos("--clearenv"));
+    }
+
+    #[test]
+    fn share_net_is_idempotent() {
+        let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"));
+        args.share_net();
+        args.share_net();
+        let finished = args.finish(&["sh".into()]);
+        let argv = strs(&finished);
+        assert_eq!(argv.iter().filter(|a| **a == "--share-net").count(), 1);
     }
 }
