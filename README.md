@@ -62,26 +62,30 @@ missing one is an error rather than a silently weaker sandbox. That covers
 home directory: a symlink pointing elsewhere is refused, not followed.
 `etc-share` is confined to `/etc` the same way, and cannot name the account
 files (`passwd`, `group`, `shadow`, `gshadow` and their `-`/`+` variants),
-which the sandbox generates itself. `network`
-needs `/etc/resolv.conf` (the tmpfs over `/etc` would otherwise hide it).
-`dri` binds `/dev/dri` read-write and exposes `/sys/dev/char`,
-`/sys/devices/system/cpu` and every `/sys/devices/pci*` root read-only — that
-is the sysfs attributes of every PCI device on the machine, not just the GPU.
+which the sandbox generates itself. `network` needs `/etc/resolv.conf` (the
+tmpfs over `/etc` would otherwise hide it). `dri` binds `/dev/dri` read-write
+and exposes `/sys/dev/char`, `/sys/devices/system/cpu` and every
+`/sys/devices/pci*` root read-only — that is the sysfs attributes of every PCI
+device on the machine, not just the GPU. `pipewire` and `pulseaudio` hand the
+sandbox the session's audio socket directly, which is capture as well as
+playback: everything the session exposes, including the microphone, with no
+portal in between.
 
-`env` keys must look like `[A-Za-z_][A-Za-z0-9_]*`, values may not contain
-NUL, and each key may appear only once. The variables the sandbox owns are
-rejected: `HOME`, `PATH`, `XDG_RUNTIME_DIR`, `USER`, `LOGNAME`,
-`WAYLAND_DISPLAY`, `DISPLAY`, `XAUTHORITY`, `XDG_SESSION_TYPE`,
-`PULSE_SERVER`.
+`env` keys must look like `[A-Za-z_][A-Za-z0-9_]*`, and each key may appear
+only once. `env` values and `command` arguments may not contain NUL, a newline
+or a carriage return — a newline would forge a line in `--dry-run` output. The
+variables the sandbox owns are rejected: `HOME`, `PATH`, `XDG_RUNTIME_DIR`,
+`USER`, `LOGNAME`, `WAYLAND_DISPLAY`, `DISPLAY`, `XAUTHORITY`,
+`XDG_SESSION_TYPE`, `PULSE_SERVER`.
 
 ## Baseline
 
 Every sandbox gets: all namespaces unshared, no network, read-only `/usr` and
 `/opt`, empty `/tmp` `/var` `/run`, a private home at `/home/bubbler`, an
-empty `$XDG_RUNTIME_DIR` at the host's path with mode 0700, and a cleared
-environment (only the locale and terminal variables — `TERM`, `LANG`,
-`LANGUAGE`, `COLORTERM`, `TZ`, `LC_*` — are carried over). Grants only add to
-that.
+empty `$XDG_RUNTIME_DIR` at the host's path with mode 0700, `/home/bubbler` as
+the working directory, and a cleared environment (only the locale and terminal
+variables — `TERM`, `LANG`, `LANGUAGE`, `COLORTERM`, `TZ`, `LC_*` — are
+carried over). Grants only add to that.
 
 `/etc` is an allowlist over a tmpfs: only the entries in `ETC_ALLOWLIST`
 (`crates/bubbler-core/src/bwrap.rs`) are bound, and only those that exist on

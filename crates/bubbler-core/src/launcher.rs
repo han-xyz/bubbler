@@ -39,7 +39,7 @@ pub fn build_argv(
     let host = RealHost;
     let mut args = BwrapArgs::baseline(env, &inst.home(), &host);
     service::apply_all(&inst.config.services, env, &mut args, &host)?;
-    service::apply_env(&inst.config.env, &mut args);
+    service::apply_env(&inst.config.env, &mut args)?;
     args.finish(command, alloc)
 }
 

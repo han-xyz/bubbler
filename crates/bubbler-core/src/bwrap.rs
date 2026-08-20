@@ -92,8 +92,9 @@ impl BwrapArgs {
     /// empty `/tmp` `/var` `/run`, a private home at [`SANDBOX_HOME`], an
     /// empty `$XDG_RUNTIME_DIR` at the same path as on the host and mode
     /// 0700 (`--perms` applies to the next operation only, so it must
-    /// immediately precede `--dir`), cleared environment with only
-    /// locale/terminal passthrough and the fixed user name. Services relax
+    /// immediately precede `--dir`), the private home as the working
+    /// directory, cleared environment with only locale/terminal
+    /// passthrough and the fixed user name. Services relax
     /// this explicitly. `--unshare-all` uses bwrap's `-try` semantics for
     /// the user namespace (`bwrap(1)`), so on a host without unprivileged
     /// user namespaces the sandbox may start without one; to be revisited.
@@ -114,6 +115,11 @@ impl BwrapArgs {
                 o("--new-session"),
                 o("--hostname"),
                 o("bubbler"),
+                // Without it bwrap uses its own $HOME as the cwd when the
+                // host cwd is absent inside (`bwrap(1)`, ENVIRONMENT),
+                // which is a host path the sandbox does not have.
+                o("--chdir"),
+                o(SANDBOX_HOME),
             ],
         );
 
@@ -348,6 +354,8 @@ mod tests {
                 "--new-session",
                 "--hostname",
                 "bubbler",
+                "--chdir",
+                "/home/bubbler",
                 "--ro-bind",
                 "/usr",
                 "/usr",

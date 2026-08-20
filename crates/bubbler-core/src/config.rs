@@ -244,6 +244,18 @@ fn is_env_key(key: &str) -> bool {
         && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+/// Names a byte that cannot appear in a value bubbler turns into an argv
+/// element: `execve` cuts a string at NUL, and a line break would forge an
+/// extra element in `--dry-run` output, which is one element per line.
+fn forbidden_byte(s: &str) -> Option<&'static str> {
+    s.bytes().find_map(|b| match b {
+        0 => Some("a NUL byte"),
+        b'\n' => Some("a newline"),
+        b'\r' => Some("a carriage return"),
+        _ => None,
+    })
+}
+
 fn parse_env(node: &KdlNode, out: &mut Vec<(String, String)>) -> Result<(), ConfigError> {
     if node.entries().is_empty() {
         return Err(bad(node, "expects KEY=\"value\" properties"));
@@ -260,8 +272,8 @@ fn parse_env(node: &KdlNode, out: &mut Vec<(String, String)>) -> Result<(), Conf
         if !is_env_key(key) {
             return Err(bad(node, &format!("`{key}` is not a usable variable name")));
         }
-        if val.as_bytes().contains(&0) {
-            return Err(bad(node, &format!("value of {key} contains a NUL byte")));
+        if let Some(what) = forbidden_byte(val) {
+            return Err(bad(node, &format!("value of {key} contains {what}")));
         }
         if RESERVED_ENV.contains(&key) {
             return Err(bad(
@@ -305,6 +317,14 @@ fn parse_command(node: &KdlNode) -> Result<Vec<OsString>, ConfigError> {
             .value()
             .as_string()
             .ok_or_else(|| bad(node, "arguments must be strings"))?;
+        if let Some(what) = forbidden_byte(s) {
+            // Positional, not quoted back: echoing the value would put the
+            // control byte in the error message too.
+            return Err(bad(
+                node,
+                &format!("argument {} contains {what}", argv.len() + 1),
+            ));
+        }
         argv.push(OsString::from(s));
     }
     if node.children().is_some() {
@@ -585,6 +605,23 @@ command "b""#
             parse("etc-share \"a\"\netc-share \"a/\""),
             Err(ConfigError::Duplicate(_))
         ));
+    }
+
+    #[test]
+    fn env_and_command_values_reject_bytes_that_cannot_be_argv() {
+        for text in [
+            r#"env A="x\ny""#,
+            r#"env A="x\ry""#,
+            r#"command "a\nb""#,
+            r#"command "a\rb""#,
+            r#"command "a\u{0}b""#,
+        ] {
+            assert!(
+                matches!(parse(text), Err(ConfigError::BadArgument { .. })),
+                "{text}"
+            );
+        }
+        assert!(parse("env A=\"x y\"\ncommand \"a b\"").is_ok());
     }
 
     #[test]

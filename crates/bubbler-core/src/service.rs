@@ -13,7 +13,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::{Component, Path, PathBuf};
 
 use crate::bwrap::BwrapArgs;
-use crate::config::{Service, ShareMode};
+use crate::config::{RESERVED_ENV, Service, ShareMode};
 use crate::env::{Env, SANDBOX_HOME};
 use crate::error::LaunchError;
 use crate::host::Host;
@@ -256,12 +256,21 @@ fn pulseaudio(env: &Env, args: &mut BwrapArgs, host: &dyn Host) -> Result<(), La
 }
 
 /// Emit profile/instance `env` pairs after all service variables, so a
-/// profile can layer toolkit settings on top; keys the sandbox owns were
-/// rejected by the parser.
-pub fn apply_env(pairs: &[(String, String)], args: &mut BwrapArgs) {
+/// profile can layer toolkit settings on top. A [`RESERVED_ENV`] key is
+/// refused here as well as in the parser, so a caller building an
+/// [`crate::config::InstanceConfig`] by hand cannot override what the
+/// sandbox sets.
+pub fn apply_env(pairs: &[(String, String)], args: &mut BwrapArgs) -> Result<(), LaunchError> {
     for (k, v) in pairs {
+        if RESERVED_ENV.contains(&k.as_str()) {
+            return Err(LaunchError::BadValue {
+                service: "env",
+                reason: format!("{k} is set by bubbler and cannot be overridden"),
+            });
+        }
         args.setenv(OsStr::new(k), OsStr::new(v));
     }
+    Ok(())
 }
 
 /// Resolve `src` and require that it stays under `root`; both are
@@ -1031,9 +1040,25 @@ mod tests {
         let e = env();
         let mut args = BwrapArgs::baseline(&e, Path::new("/i/home"), &host);
         apply_all(&[Service::Wayland], &e, &mut args, &host).unwrap();
-        apply_env(&[("MOZ_ENABLE_WAYLAND".into(), "1".into())], &mut args);
+        apply_env(&[("MOZ_ENABLE_WAYLAND".into(), "1".into())], &mut args).unwrap();
         let a = strs(&args.finish(&[OsString::from("x")], &mut counter()).unwrap());
         let pos = |x: &str| a.iter().position(|v| v == x).unwrap();
         assert!(pos("MOZ_ENABLE_WAYLAND") > pos("WAYLAND_DISPLAY"));
+    }
+
+    #[test]
+    fn env_pairs_may_not_set_a_variable_the_sandbox_owns() {
+        let e = env();
+        let host = FakeHost::default();
+        for key in crate::config::RESERVED_ENV {
+            let mut args = BwrapArgs::baseline(&e, Path::new("/i/home"), &host);
+            assert!(
+                matches!(
+                    apply_env(&[((*key).to_owned(), "x".into())], &mut args),
+                    Err(LaunchError::BadValue { service: "env", .. })
+                ),
+                "{key}"
+            );
+        }
     }
 }

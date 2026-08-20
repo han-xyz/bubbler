@@ -29,6 +29,9 @@ impl Host for RealHost {
         fs::canonicalize(p).ok()
     }
 
+    /// A directory that cannot be read yields an empty list, so a caller
+    /// that needs an entry from it reports the entry missing rather than
+    /// the I/O error: `dri` fails with `MissingResource`, never silently.
     fn list_dir(&self, p: &Path) -> Vec<OsString> {
         let mut names: Vec<OsString> = match fs::read_dir(p) {
             Ok(rd) => rd.filter_map(|e| e.ok().map(|e| e.file_name())).collect(),

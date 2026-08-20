@@ -1,5 +1,6 @@
 mod common;
 
+use bubbler_core::bwrap::ETC_ALLOWLIST;
 use common::{bubbler, require_bwrap};
 
 fn setup() -> tempfile::TempDir {
@@ -35,7 +36,7 @@ fn create_list_and_dry_run() {
     let run = tmp.path().join("run");
     // Which allowlisted `/etc` entries exist is a property of this host, so
     // only the parts around them are exact.
-    let expected_prefix = "bwrap\n--unshare-all\n--die-with-parent\n--new-session\n--hostname\nbubbler\n\
+    let expected_prefix = "bwrap\n--unshare-all\n--die-with-parent\n--new-session\n--hostname\nbubbler\n--chdir\n/home/bubbler\n\
          --ro-bind\n/usr\n/usr\n--symlink\nusr/bin\n/bin\n--symlink\nusr/lib\n/lib\n\
          --symlink\nusr/lib64\n/lib64\n--symlink\nusr/bin\n/sbin\n\
          --ro-bind-try\n/opt\n/opt\n--tmpfs\n/etc\n";
@@ -105,6 +106,7 @@ fn run_without_command_fails_with_message() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("no command"));
 }
 
+// `network` binds /etc/resolv.conf, so this test needs one on the host.
 #[test]
 fn network_share_and_home_share_appear_in_dry_run() {
     let tmp = setup();
@@ -235,7 +237,7 @@ fn real_bwrap_etc_is_allowlisted_and_user_is_bubbler() {
             "--",
             "/usr/bin/sh",
             "-c",
-            "id -un; cat /etc/passwd | wc -l; test -e /etc/shadow && echo LEAK; ls /etc | grep -c .",
+            "id -un; cat /etc/passwd | wc -l; test -e /etc/shadow && echo LEAK; ls /etc",
         ])
         .output()
         .unwrap();
@@ -245,8 +247,18 @@ fn real_bwrap_etc_is_allowlisted_and_user_is_bubbler() {
         String::from_utf8_lossy(&out.stderr)
     );
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(s.starts_with("bubbler\n2\n"), "{s}");
-    assert!(!s.contains("LEAK"));
+    assert!(!s.contains("LEAK"), "{s}");
+    let mut lines = s.lines();
+    assert_eq!(lines.next(), Some("bubbler"), "{s}");
+    assert_eq!(lines.next().map(str::trim), Some("2"), "{s}");
+    let entries: Vec<&str> = lines.collect();
+    assert!(entries.contains(&"passwd"), "{s}");
+    for name in entries {
+        assert!(
+            ETC_ALLOWLIST.contains(&name) || name == "passwd" || name == "group",
+            "unexpected /etc entry `{name}`:\n{s}"
+        );
+    }
 }
 
 #[test]
