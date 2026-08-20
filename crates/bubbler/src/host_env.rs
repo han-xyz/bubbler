@@ -41,3 +41,11 @@ pub fn from_process() -> Result<Env> {
         passthrough,
     })
 }
+
+/// The user's editor: `$VISUAL`, else `$EDITOR`. An empty value counts as
+/// unset, so it does not turn into an argv with a blank program.
+pub fn editor() -> Option<OsString> {
+    env::var_os("VISUAL")
+        .filter(|v| !v.is_empty())
+        .or_else(|| env::var_os("EDITOR").filter(|v| !v.is_empty()))
+}

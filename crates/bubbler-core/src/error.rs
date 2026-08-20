@@ -58,6 +58,9 @@ pub enum InstanceError {
     /// Unknown profile name passed to `create`.
     #[error("unknown profile `{0}`")]
     UnknownProfile(String),
+    /// The instance path is a symlink; bubbler never deletes through one.
+    #[error("{0} is a symlink; refusing to delete through it")]
+    IsSymlink(PathBuf),
     /// Filesystem failure at a specific path.
     #[error("{0}")]
     Io(PathBuf, #[source] io::Error),

@@ -1,16 +1,17 @@
-//! bubbler command line: create, run and list sandbox instances.
+//! bubbler command line: create, run, edit, delete and list sandbox instances.
 
 mod host_env;
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use bubbler_core::config::Service;
 use bubbler_core::instance::{self, Instance};
 use bubbler_core::launcher;
+use bubbler_core::profile;
 use clap::{Parser, Subcommand};
 
 /// bubblewrap-based application sandbox.
@@ -47,6 +48,19 @@ enum Cmd {
     List,
     /// List built-in profiles.
     Profiles,
+    /// Delete an instance and its private home. Irreversible.
+    Delete {
+        /// Instance name.
+        name: String,
+        /// Required: confirms deletion.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Open an instance's config.kdl in $VISUAL or $EDITOR, then re-check it.
+    Edit {
+        /// Instance name.
+        name: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -120,11 +134,49 @@ fn real_main() -> Result<i32> {
             print_lines(&lines, "the instance list")
         }
         Cmd::Profiles => {
-            let lines: Vec<&OsStr> = bubbler_core::profile::NAMES
-                .iter()
-                .map(OsStr::new)
-                .collect();
+            let lines: Vec<&OsStr> = profile::NAMES.iter().map(OsStr::new).collect();
             print_lines(&lines, "the profile list")
+        }
+        Cmd::Delete { name, yes } => {
+            if !yes {
+                bail!("refusing to delete `{name}` without --yes (this removes its private home)");
+            }
+            Instance::delete(&env, &name).with_context(|| format!("deleting instance `{name}`"))?;
+            Ok(0)
+        }
+        Cmd::Edit { name } => {
+            let inst = Instance::open(&env, &name).with_context(|| {
+                format!(
+                    "opening instance `{name}` ({})",
+                    instance::config_path(&env, &name).display()
+                )
+            })?;
+            let editor = host_env::editor().context("neither VISUAL nor EDITOR is set")?;
+            // Split on whitespace into argv: an editor setting may carry
+            // options, but bubbler never hands it to a shell.
+            let mut parts = editor
+                .as_bytes()
+                .split(u8::is_ascii_whitespace)
+                .filter(|p| !p.is_empty());
+            let program = parts.next().context("VISUAL or EDITOR is blank")?;
+            let status = Command::new(OsStr::from_bytes(program))
+                .args(parts.map(OsStr::from_bytes))
+                .arg(inst.config_path())
+                .status()
+                .with_context(|| format!("running editor {}", String::from_utf8_lossy(program)))?;
+            if !status.success() {
+                return Ok(launcher::exit_code(status));
+            }
+            match Instance::open(&env, &name) {
+                Ok(_) => Ok(0),
+                Err(e) => {
+                    eprintln!(
+                        "bubbler: {} still has errors: {e:#}",
+                        inst.config_path().display()
+                    );
+                    Ok(1)
+                }
+            }
         }
     }
 }

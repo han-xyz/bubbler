@@ -137,6 +137,31 @@ impl Instance {
         Ok(names)
     }
 
+    /// Remove the instance directory, including its private home, and its
+    /// runtime directory. Refuses to follow a symlink in place of the
+    /// instance directory.
+    pub fn delete(env: &Env, name: &str) -> Result<(), InstanceError> {
+        validate_name(name)?;
+        let dir = instances_root(env).join(name);
+        let meta = match fs::symlink_metadata(&dir) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(InstanceError::NotFound(name.to_owned()));
+            }
+            Err(e) => return Err(InstanceError::Io(dir, e)),
+        };
+        if meta.file_type().is_symlink() {
+            return Err(InstanceError::IsSymlink(dir));
+        }
+        fs::remove_dir_all(&dir).map_err(io_err(&dir))?;
+        let run = env.runtime_dir.join("bubbler").join(name);
+        match fs::remove_dir_all(&run) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(InstanceError::Io(run, e)),
+        }
+    }
+
     /// Whether `s` is among the granted services.
     pub fn has_service(&self, s: &Service) -> bool {
         self.config.services.contains(s)
@@ -245,5 +270,34 @@ mod tests {
             Instance::open(&env, "e"),
             Err(InstanceError::Config(_))
         ));
+    }
+
+    #[test]
+    fn delete_removes_instance_and_refuses_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut env = env(tmp.path());
+        env.runtime_dir = tmp.path().join("run");
+        Instance::create(&env, "a", "generic").unwrap();
+        std::fs::write(instances_root(&env).join("a/home/file"), b"x").unwrap();
+        let run = env.runtime_dir.join("bubbler").join("a");
+        std::fs::create_dir_all(&run).unwrap();
+        Instance::delete(&env, "a").unwrap();
+        assert!(!instances_root(&env).join("a").exists());
+        assert!(!run.exists());
+        assert!(matches!(
+            Instance::delete(&env, "a"),
+            Err(InstanceError::NotFound(_))
+        ));
+        std::fs::create_dir_all(tmp.path().join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(
+            tmp.path().join("elsewhere"),
+            instances_root(&env).join("lnk"),
+        )
+        .unwrap();
+        assert!(matches!(
+            Instance::delete(&env, "lnk"),
+            Err(InstanceError::IsSymlink(_))
+        ));
+        assert!(tmp.path().join("elsewhere").exists());
     }
 }
