@@ -11,7 +11,8 @@ use crate::env::{Env, SANDBOX_HOME};
 use crate::error::LaunchError;
 
 /// Apply every service to `args`. `probe` reports whether a host path
-/// exists; it is a parameter so tests run without real sockets.
+/// exists, so tests run without real sockets. A [`Service::HomeShare`]
+/// `path` must be relative and normalised, exactly as the parser leaves it.
 pub fn apply_all(
     services: &[Service],
     env: &Env,
@@ -42,9 +43,10 @@ fn require(
     }
 }
 
-/// Bind `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY` at the same path. Arch wiki
-/// (Bubblewrap/Examples) pattern. `XDG_SESSION_TYPE=wayland` only when
-/// X11 is not also granted, so toolkits do not get mixed signals.
+/// Bind `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY` at the same path, which must
+/// be a plain socket name. Arch wiki (Bubblewrap/Examples) pattern.
+/// `XDG_SESSION_TYPE=wayland` only when X11 is not also granted, so
+/// toolkits do not get mixed signals.
 fn wayland(
     env: &Env,
     args: &mut BwrapArgs,
@@ -58,6 +60,15 @@ fn wayland(
             service: "wayland",
             var: "WAYLAND_DISPLAY",
         })?;
+    if display.as_encoded_bytes().contains(&b'/') {
+        return Err(LaunchError::BadValue {
+            service: "wayland",
+            reason: format!(
+                "cannot use WAYLAND_DISPLAY={}; only a plain socket name is supported",
+                display.to_string_lossy()
+            ),
+        });
+    }
     let sock = require(probe, "wayland", env.runtime_dir.join(display))?;
     args.ro_bind(&sock, &sock);
     args.setenv(OsStr::new("WAYLAND_DISPLAY"), display);
@@ -73,13 +84,17 @@ pub fn x11_display_number(display: &OsStr) -> Option<u32> {
     let s = display.to_str()?;
     let rest = s.strip_prefix(':').or_else(|| s.strip_prefix("unix:"))?;
     let num = rest.split('.').next()?;
+    // `u32::from_str` accepts a leading `+`; a display number never has one.
+    if num.starts_with('+') {
+        return None;
+    }
     num.parse().ok()
 }
 
 /// Bind the X11 socket at the same path (Arch wiki: binding to a different
-/// display number may not work) and an Xauthority file if one is found.
-/// Xauthority fallback to `$HOME/.Xauthority` follows libX11's default
-/// and is not covered by the wiki.
+/// display number may not work) and any Xauthority file at the fixed inner
+/// path `/home/bubbler/.Xauthority`, so the host location stays hidden.
+/// The `$HOME/.Xauthority` fallback follows libX11's default, not the wiki.
 fn x11(env: &Env, args: &mut BwrapArgs, probe: &dyn Fn(&Path) -> bool) -> Result<(), LaunchError> {
     let display = env.display.as_deref().ok_or(LaunchError::MissingEnv {
         service: "x11",
@@ -96,17 +111,17 @@ fn x11(env: &Env, args: &mut BwrapArgs, probe: &dyn Fn(&Path) -> bool) -> Result
     args.ro_bind(&sock, &sock);
     args.setenv(OsStr::new("DISPLAY"), OsStr::new(&format!(":{n}")));
 
-    if let Some(xa) = &env.xauthority {
-        let xa = require(probe, "x11", xa.clone())?;
-        args.ro_bind(&xa, &xa);
-        args.setenv(OsStr::new("XAUTHORITY"), xa.as_os_str());
-    } else {
-        let host = env.home.join(".Xauthority");
-        if probe(&host) {
-            let inner = Path::new(SANDBOX_HOME).join(".Xauthority");
-            args.ro_bind(&host, &inner);
-            args.setenv(OsStr::new("XAUTHORITY"), inner.as_os_str());
+    let cookie = match &env.xauthority {
+        Some(xa) => Some(require(probe, "x11", xa.clone())?),
+        None => {
+            let home = env.home.join(".Xauthority");
+            probe(&home).then_some(home)
         }
+    };
+    if let Some(host) = cookie {
+        let inner = Path::new(SANDBOX_HOME).join(".Xauthority");
+        args.ro_bind(&host, &inner);
+        args.setenv(OsStr::new("XAUTHORITY"), inner.as_os_str());
     }
     Ok(())
 }
@@ -220,14 +235,21 @@ mod tests {
             &[
                 "--ro-bind",
                 "/run/user/1000/Xauthority",
-                "/run/user/1000/Xauthority"
+                "/home/bubbler/.Xauthority"
             ]
         ));
         assert!(has_seq(&a, &["--setenv", "DISPLAY", ":0"]));
         assert!(has_seq(
             &a,
-            &["--setenv", "XAUTHORITY", "/run/user/1000/Xauthority"]
+            &["--setenv", "XAUTHORITY", "/home/bubbler/.Xauthority"]
         ));
+        assert_eq!(
+            a.iter()
+                .filter(|s| *s == "/run/user/1000/Xauthority")
+                .count(),
+            1,
+            "the host path is a bind source only, never visible inside"
+        );
         assert!(!a.contains(&"XDG_SESSION_TYPE".to_string()));
     }
 
@@ -258,11 +280,45 @@ mod tests {
     }
 
     #[test]
+    fn x11_set_but_missing_xauthority_fails() {
+        assert!(matches!(
+            argv(&[Service::X11], &env(), &["/tmp/.X11-unix/X0"]),
+            Err(LaunchError::MissingResource { service: "x11", .. })
+        ));
+    }
+
+    #[test]
+    fn wayland_display_with_a_path_is_rejected() {
+        let mut e = env();
+        e.wayland_display = Some("/run/user/1000/wayland-1".into());
+        assert!(matches!(
+            argv(&[Service::Wayland], &e, &["/run/user/1000/wayland-1"]),
+            Err(LaunchError::BadValue {
+                service: "wayland",
+                ..
+            })
+        ));
+        e.wayland_display = Some("nested/wayland-1".into());
+        assert!(matches!(
+            argv(
+                &[Service::Wayland],
+                &e,
+                &["/run/user/1000/nested/wayland-1"]
+            ),
+            Err(LaunchError::BadValue {
+                service: "wayland",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn x11_display_parsing() {
         assert_eq!(x11_display_number(OsStr::new(":0")), Some(0));
         assert_eq!(x11_display_number(OsStr::new(":10.1")), Some(10));
         assert_eq!(x11_display_number(OsStr::new("unix:2")), Some(2));
         assert_eq!(x11_display_number(OsStr::new("host:0")), None);
+        assert_eq!(x11_display_number(OsStr::new(":+1")), None);
         assert_eq!(x11_display_number(OsStr::new("")), None);
         let mut e = env();
         e.display = None;
