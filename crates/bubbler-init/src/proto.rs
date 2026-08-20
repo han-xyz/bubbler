@@ -7,6 +7,14 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 /// Upper bound on an encoded request; larger is a protocol violation.
 pub const MAX_REQUEST: usize = 1 << 20;
 
+/// Request flag: the command may take the terminal on fd 0 as its
+/// controlling terminal. bubbler sets it only for a pty it allocated.
+pub const FLAG_CTTY: u32 = 1;
+
+/// Every flag bit this version knows; the rest must be zero, so an
+/// unrecognised request is refused rather than half honoured.
+const KNOWN_FLAGS: u32 = FLAG_CTTY;
+
 /// Malformed request bytes.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProtoError {
@@ -16,11 +24,31 @@ pub enum ProtoError {
     BadCount,
     /// Total size above [`MAX_REQUEST`].
     TooLarge,
+    /// A flag bit this version does not know.
+    BadFlags,
 }
 
-/// `u32 argc` then `argc` x (`u32 len`, bytes), little-endian.
-pub fn encode_request(argv: &[&OsStr]) -> Vec<u8> {
+/// One request: what the client asked for, and the argv to run.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Request {
+    /// Bitmask of [`FLAG_CTTY`].
+    pub flags: u32,
+    /// Program and arguments; never empty.
+    pub argv: Vec<OsString>,
+}
+
+impl Request {
+    /// Whether the client asked for the terminal on fd 0 to become the
+    /// command's controlling terminal.
+    pub fn ctty(&self) -> bool {
+        self.flags & FLAG_CTTY != 0
+    }
+}
+
+/// `u32 flags`, `u32 argc`, then `argc` x (`u32 len`, bytes), little-endian.
+pub fn encode_request(argv: &[&OsStr], flags: u32) -> Vec<u8> {
     let mut out = Vec::new();
+    out.extend_from_slice(&flags.to_le_bytes());
     out.extend_from_slice(&(argv.len() as u32).to_le_bytes());
     for a in argv {
         let b = a.as_bytes();
@@ -30,8 +58,9 @@ pub fn encode_request(argv: &[&OsStr]) -> Vec<u8> {
     out
 }
 
-/// Inverse of [`encode_request`]; rejects empty argv and oversize input.
-pub fn decode_request(buf: &[u8]) -> Result<Vec<OsString>, ProtoError> {
+/// Inverse of [`encode_request`]; rejects empty argv, unknown flags and
+/// oversize input.
+pub fn decode_request(buf: &[u8]) -> Result<Request, ProtoError> {
     if buf.len() > MAX_REQUEST {
         return Err(ProtoError::TooLarge);
     }
@@ -42,6 +71,10 @@ pub fn decode_request(buf: &[u8]) -> Result<Vec<OsString>, ProtoError> {
         *pos = end;
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     };
+    let flags = take4(&mut pos)?;
+    if flags & !KNOWN_FLAGS != 0 {
+        return Err(ProtoError::BadFlags);
+    }
     let argc = take4(&mut pos)? as usize;
     if argc == 0 || argc > MAX_REQUEST / 4 {
         return Err(ProtoError::BadCount);
@@ -57,7 +90,7 @@ pub fn decode_request(buf: &[u8]) -> Result<Vec<OsString>, ProtoError> {
     if pos != buf.len() {
         return Err(ProtoError::Truncated);
     }
-    Ok(argv)
+    Ok(Request { flags, argv })
 }
 
 /// Raw `waitpid` status, little-endian.
@@ -82,24 +115,45 @@ mod tests {
             OsString::from_vec(vec![0xff, 0x20, b'x']),
         ];
         let refs: Vec<&OsStr> = a.iter().map(|s| s.as_os_str()).collect();
-        assert_eq!(decode_request(&encode_request(&refs)).unwrap(), a);
+        let got = decode_request(&encode_request(&refs, 0)).unwrap();
+        assert_eq!(got.argv, a);
+        assert!(!got.ctty(), "no flag was sent");
+    }
+
+    #[test]
+    fn the_controlling_terminal_flag_rides_with_the_argv() {
+        let enc = encode_request(&[OsStr::new("sh")], FLAG_CTTY);
+        let got = decode_request(&enc).unwrap();
+        assert_eq!(got.flags, FLAG_CTTY);
+        assert!(got.ctty());
+        // The flags come first, so the argv still decodes byte for byte.
+        assert_eq!(got.argv, vec![OsString::from("sh")]);
+    }
+
+    #[test]
+    fn a_flag_this_version_does_not_know_is_refused() {
+        // Honouring an unknown bit by ignoring it would let a future
+        // client believe a request was served the way it asked.
+        let enc = encode_request(&[OsStr::new("sh")], FLAG_CTTY | 0x8000_0000);
+        assert_eq!(decode_request(&enc), Err(ProtoError::BadFlags));
     }
 
     #[test]
     fn rejects_empty_truncated_and_oversize() {
         assert_eq!(
-            decode_request(&encode_request(&[])),
+            decode_request(&encode_request(&[], 0)),
             Err(ProtoError::BadCount)
         );
-        let mut enc = encode_request(&[OsStr::new("abc")]);
+        let mut enc = encode_request(&[OsStr::new("abc")], 0);
         enc.truncate(enc.len() - 1);
         assert_eq!(decode_request(&enc), Err(ProtoError::Truncated));
         assert_eq!(decode_request(&[]), Err(ProtoError::Truncated));
+        assert_eq!(decode_request(&[0u8; 4]), Err(ProtoError::Truncated));
         assert_eq!(
             decode_request(&vec![0u8; MAX_REQUEST + 1]),
             Err(ProtoError::TooLarge)
         );
-        let mut trailing = encode_request(&[OsStr::new("a")]);
+        let mut trailing = encode_request(&[OsStr::new("a")], 0);
         trailing.push(0);
         assert_eq!(decode_request(&trailing), Err(ProtoError::Truncated));
     }

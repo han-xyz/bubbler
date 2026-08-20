@@ -1,7 +1,7 @@
 //! Socket I/O for the exec channel: request bytes plus exactly three fds
 //! (stdin, stdout, stderr) via `SCM_RIGHTS`, then a 4-byte status back.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -48,13 +48,15 @@ fn read_exact_by(stream: &UnixStream, buf: &mut [u8], deadline: Instant) -> io::
     Ok(())
 }
 
-/// Send `argv` with the three stdio fds attached to the length prefix.
+/// Send `argv` and `flags` with the three stdio fds attached to the
+/// length prefix. `flags` is a bitmask of [`proto::FLAG_CTTY`].
 pub fn send_request(
     stream: &UnixStream,
     argv: &[&OsStr],
+    flags: u32,
     fds: [BorrowedFd<'_>; REQUEST_FDS],
 ) -> io::Result<()> {
-    let payload = proto::encode_request(argv);
+    let payload = proto::encode_request(argv, flags);
     if payload.len() > proto::MAX_REQUEST {
         return Err(invalid("request too large"));
     }
@@ -82,7 +84,7 @@ pub fn send_request(
 pub fn recv_request(
     stream: &UnixStream,
     deadline: Instant,
-) -> io::Result<(Vec<OsString>, Vec<OwnedFd>)> {
+) -> io::Result<(proto::Request, Vec<OwnedFd>)> {
     let mut len = [0u8; 4];
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(REQUEST_FDS))];
     let mut anc = RecvAncillaryBuffer::new(&mut space);
@@ -112,9 +114,9 @@ pub fn recv_request(
     }
     let mut buf = vec![0u8; len];
     read_exact_by(stream, &mut buf, deadline)?;
-    let argv = proto::decode_request(&buf)
+    let request = proto::decode_request(&buf)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}")))?;
-    Ok((argv, fds))
+    Ok((request, fds))
 }
 
 /// One request arriving in pieces on a non-blocking connection: the
@@ -142,7 +144,7 @@ impl Incoming {
     pub fn read_step(
         &mut self,
         stream: &UnixStream,
-    ) -> io::Result<Option<(Vec<OsString>, Vec<OwnedFd>)>> {
+    ) -> io::Result<Option<(proto::Request, Vec<OwnedFd>)>> {
         loop {
             match self.want {
                 None => {
@@ -161,10 +163,10 @@ impl Incoming {
                     }
                 }
                 Some(_) => {
-                    let argv = proto::decode_request(&self.payload).map_err(|e| {
+                    let request = proto::decode_request(&self.payload).map_err(|e| {
                         io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}"))
                     })?;
-                    return Ok(Some((argv, std::mem::take(&mut self.fds))));
+                    return Ok(Some((request, std::mem::take(&mut self.fds))));
                 }
             }
         }
@@ -249,16 +251,33 @@ mod tests {
         let (client, server) = UnixStream::pair().unwrap();
         let null = File::open("/dev/null").unwrap();
         let argv: Vec<&OsStr> = vec![OsStr::new("sh"), OsStr::new("-c"), OsStr::new("exit 3")];
-        send_request(&client, &argv, [null.as_fd(); REQUEST_FDS]).unwrap();
+        send_request(&client, &argv, 0, [null.as_fd(); REQUEST_FDS]).unwrap();
         let (got, fds) = recv_request(&server, soon()).unwrap();
-        assert_eq!(got, vec!["sh", "-c", "exit 3"]);
+        assert_eq!(got.argv, vec!["sh", "-c", "exit 3"]);
+        assert!(!got.ctty());
         assert_eq!(fds.len(), REQUEST_FDS);
+    }
+
+    #[test]
+    fn a_request_carries_the_controlling_terminal_flag() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let null = File::open("/dev/null").unwrap();
+        let argv: Vec<&OsStr> = vec![OsStr::new("sh")];
+        send_request(
+            &client,
+            &argv,
+            proto::FLAG_CTTY,
+            [null.as_fd(); REQUEST_FDS],
+        )
+        .unwrap();
+        let (got, _fds) = recv_request(&server, soon()).unwrap();
+        assert!(got.ctty(), "the flag did not survive the socket");
     }
 
     #[test]
     fn request_without_fds_is_rejected() {
         let (client, server) = UnixStream::pair().unwrap();
-        let payload = proto::encode_request(&[OsStr::new("true")]);
+        let payload = proto::encode_request(&[OsStr::new("true")], 0);
         (&client)
             .write_all(&(payload.len() as u32).to_le_bytes())
             .unwrap();
@@ -271,7 +290,7 @@ mod tests {
         let (client, server) = UnixStream::pair().unwrap();
         let null = File::open("/dev/null").unwrap();
         let argv: Vec<&OsStr> = vec![OsStr::new("true")];
-        let payload = proto::encode_request(&argv);
+        let payload = proto::encode_request(&argv, 0);
         let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(REQUEST_FDS))];
         let mut anc = SendAncillaryBuffer::new(&mut space);
         let fds = [null.as_fd(); REQUEST_FDS];
@@ -330,7 +349,7 @@ mod tests {
         server.set_nonblocking(true).unwrap();
         let null = File::open("/dev/null").unwrap();
         let argv: Vec<&OsStr> = vec![OsStr::new("sh"), OsStr::new("-c"), OsStr::new("exit 3")];
-        let payload = proto::encode_request(&argv);
+        let payload = proto::encode_request(&argv, 0);
         let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(REQUEST_FDS))];
         let mut anc = SendAncillaryBuffer::new(&mut space);
         let fds = [null.as_fd(); REQUEST_FDS];
@@ -362,7 +381,7 @@ mod tests {
             .read_step(&server)
             .unwrap()
             .expect("the request is whole");
-        assert_eq!(got, vec!["sh", "-c", "exit 3"]);
+        assert_eq!(got.argv, vec!["sh", "-c", "exit 3"]);
         assert_eq!(fds.len(), REQUEST_FDS);
     }
 

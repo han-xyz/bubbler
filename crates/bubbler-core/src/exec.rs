@@ -54,6 +54,7 @@ pub fn run_in(stream: &UnixStream, argv: &[OsString]) -> Result<i32, LaunchError
     wire::send_request(
         stream,
         &refs,
+        0,
         [stdin.as_fd(), stdout.as_fd(), stderr.as_fd()],
     )
     .map_err(|e| LaunchError::Protocol(e.to_string()))?;
@@ -125,8 +126,8 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
-            let (argv, fds) = wire::recv_request(&stream, deadline).unwrap();
-            assert_eq!(argv, vec![OsString::from("true")]);
+            let (request, fds) = wire::recv_request(&stream, deadline).unwrap();
+            assert_eq!(request.argv, vec![OsString::from("true")]);
             assert_eq!(fds.len(), 3);
             wire::send_status(&stream, 3 << 8).unwrap();
         });

@@ -16,7 +16,7 @@ use rustix::event::{Nsecs, PollFd, PollFlags, Timespec, poll};
 use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
 use rustix::process::{DumpableBehavior, Pid, Signal, kill_process, set_dumpable_behavior};
 
-use bubbler_init::wire;
+use bubbler_init::{proto, wire};
 
 /// Supervisor tick: the `poll` timeout, so `accept`, `wait` and every
 /// request read are non-blocking and one iteration is bounded by it.
@@ -131,15 +131,11 @@ fn take_ctty(command: &mut Command) {
 }
 
 /// Execute one received request; a malformed one closes the connection,
-/// spawning nothing.
-fn serve(
-    stream: UnixStream,
-    argv: &[OsString],
-    fds: Vec<OwnedFd>,
-    execs: &mut Vec<Exec>,
-    ctty: bool,
-) {
-    let Some((program, rest)) = argv.split_first() else {
+/// spawning nothing. Whether the command takes fd 0 as its controlling
+/// terminal is the request's own flag, not the instance's `--ctty`: the
+/// client knows which of the fds it just sent is a pty it allocated.
+fn serve(stream: UnixStream, request: &proto::Request, fds: Vec<OwnedFd>, execs: &mut Vec<Exec>) {
+    let Some((program, rest)) = request.argv.split_first() else {
         return;
     };
     let mut fds = fds.into_iter();
@@ -147,7 +143,7 @@ fn serve(
         return;
     };
     let report = stderr.try_clone().ok();
-    let terminal = ctty && rustix::termios::isatty(&stdin);
+    let terminal = request.ctty() && rustix::termios::isatty(&stdin);
     // argv[0] is resolved through PATH as seen inside the sandbox.
     let mut command = Command::new(program);
     command
@@ -176,12 +172,7 @@ fn serve(
 /// Take one read step on every connection `poll` reported, spawning the
 /// commands whose requests are now whole. `ready` is parallel to
 /// `pending` and shrinks with it.
-fn read_pending(
-    pending: &mut Vec<Pending>,
-    ready: &mut Vec<bool>,
-    execs: &mut Vec<Exec>,
-    ctty: bool,
-) {
+fn read_pending(pending: &mut Vec<Pending>, ready: &mut Vec<bool>, execs: &mut Vec<Exec>) {
     let mut i = 0;
     while i < pending.len() {
         if !ready.get(i).copied().unwrap_or(false) {
@@ -191,10 +182,10 @@ fn read_pending(
         let p = &mut pending[i];
         match p.incoming.read_step(&p.stream) {
             Ok(None) => i += 1,
-            Ok(Some((argv, fds))) => {
+            Ok(Some((request, fds))) => {
                 let p = pending.remove(i);
                 ready.remove(i);
-                serve(p.stream, &argv, fds, execs, ctty);
+                serve(p.stream, &request, fds, execs);
             }
             // A malformed request or a hangup closes the connection.
             Err(_) => {
@@ -344,7 +335,7 @@ fn main() -> ExitCode {
             }
             Ok(_) => {}
         }
-        read_pending(&mut pending, &mut ready, &mut execs, args.ctty);
+        read_pending(&mut pending, &mut ready, &mut execs);
         // Dropping the connection is the whole answer to a client that
         // ran out of time: nothing was spawned for it.
         let now = Instant::now();
