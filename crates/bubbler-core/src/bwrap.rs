@@ -12,7 +12,9 @@ use crate::env::{Env, SANDBOX_HOME};
 ///
 /// Phases: 1 namespaces, 2 filesystem skeleton, 3 runtime dir,
 /// 4 service binds, 5 environment, then `--` and the command.
-#[derive(Debug, Default, Clone)]
+// No `Default`: `baseline` is the only constructor, so a `BwrapArgs`
+// without the baseline restrictions cannot be built.
+#[derive(Debug, Clone)]
 pub struct BwrapArgs {
     namespaces: Vec<OsString>,
     skeleton: Vec<OsString>,
@@ -34,7 +36,13 @@ impl BwrapArgs {
     /// environment with only locale/terminal passthrough. Services relax
     /// this explicitly.
     pub fn baseline(env: &Env, instance_home: &Path) -> Self {
-        let mut a = Self::default();
+        let mut a = Self {
+            namespaces: Vec::new(),
+            skeleton: Vec::new(),
+            runtime_dir: Vec::new(),
+            binds: Vec::new(),
+            env: Vec::new(),
+        };
         let o = OsStr::new;
         push(
             &mut a.namespaces,
