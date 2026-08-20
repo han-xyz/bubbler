@@ -25,6 +25,21 @@ pub fn config_path(env: &Env, name: &str) -> PathBuf {
     instances_root(env).join(name).join(CONFIG_FILE)
 }
 
+/// Where `name`'s configuration lives, checked to be an existing regular
+/// file but not parsed, so a broken config can still be opened by an editor.
+pub fn config_path_checked(env: &Env, name: &str) -> Result<PathBuf, InstanceError> {
+    validate_name(name)?;
+    let path = config_path(env, name);
+    match fs::metadata(&path) {
+        Ok(m) if m.is_file() => Ok(path),
+        Ok(_) => Err(InstanceError::NotFound(name.to_owned())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Err(InstanceError::NotFound(name.to_owned()))
+        }
+        Err(e) => Err(InstanceError::Io(path, e)),
+    }
+}
+
 /// A created instance with its parsed configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Instance {
@@ -299,5 +314,28 @@ mod tests {
             Err(InstanceError::IsSymlink(_))
         ));
         assert!(tmp.path().join("elsewhere").exists());
+    }
+
+    #[test]
+    fn config_path_checked_validates_name_and_existence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = env(tmp.path());
+        assert!(matches!(
+            config_path_checked(&env, "-x"),
+            Err(InstanceError::InvalidName(_))
+        ));
+        assert!(matches!(
+            config_path_checked(&env, "zz"),
+            Err(InstanceError::NotFound(_))
+        ));
+        let inst = Instance::create(&env, "b", "generic").unwrap();
+        std::fs::write(inst.config_path(), "bogus\n").unwrap();
+        assert_eq!(config_path_checked(&env, "b").unwrap(), inst.config_path());
+        std::fs::remove_file(inst.config_path()).unwrap();
+        std::fs::create_dir(inst.config_path()).unwrap();
+        assert!(matches!(
+            config_path_checked(&env, "b"),
+            Err(InstanceError::NotFound(_))
+        ));
     }
 }

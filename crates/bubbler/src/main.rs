@@ -145,15 +145,9 @@ fn real_main() -> Result<i32> {
             Ok(0)
         }
         Cmd::Edit { name } => {
-            let inst = Instance::open(&env, &name).with_context(|| {
-                format!(
-                    "opening instance `{name}` ({})",
-                    instance::config_path(&env, &name).display()
-                )
-            })?;
+            let path = instance::config_path_checked(&env, &name)
+                .with_context(|| format!("opening instance `{name}`"))?;
             let editor = host_env::editor().context("neither VISUAL nor EDITOR is set")?;
-            // Split on whitespace into argv: an editor setting may carry
-            // options, but bubbler never hands it to a shell.
             let mut parts = editor
                 .as_bytes()
                 .split(u8::is_ascii_whitespace)
@@ -161,7 +155,7 @@ fn real_main() -> Result<i32> {
             let program = parts.next().context("VISUAL or EDITOR is blank")?;
             let status = Command::new(OsStr::from_bytes(program))
                 .args(parts.map(OsStr::from_bytes))
-                .arg(inst.config_path())
+                .arg(&path)
                 .status()
                 .with_context(|| format!("running editor {}", String::from_utf8_lossy(program)))?;
             if !status.success() {
@@ -170,10 +164,9 @@ fn real_main() -> Result<i32> {
             match Instance::open(&env, &name) {
                 Ok(_) => Ok(0),
                 Err(e) => {
-                    eprintln!(
-                        "bubbler: {} still has errors: {e:#}",
-                        inst.config_path().display()
-                    );
+                    let e = anyhow::Error::new(e)
+                        .context(format!("{} still has errors", path.display()));
+                    eprintln!("bubbler: {e:#}");
                     Ok(1)
                 }
             }

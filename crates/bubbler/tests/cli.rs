@@ -420,6 +420,12 @@ fn delete_needs_yes_and_then_removes() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("not found"));
 }
 
+/// Write `body` as an executable script at `path`.
+fn write_script(path: &std::path::Path, body: &str) {
+    std::fs::write(path, body).unwrap();
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+}
+
 #[test]
 fn edit_runs_editor_and_rechecks() {
     let tmp = setup();
@@ -449,18 +455,98 @@ fn edit_runs_editor_and_rechecks() {
     // The editor under test is a script that corrupts the config: the
     // re-check must report it and keep the file as the user left it.
     let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
-    let script = tmp.path().join("bad-editor");
-    std::fs::write(&script, "#!/usr/bin/sh\nprintf 'bogus\\n' > \"$1\"\n").unwrap();
-    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let bad = tmp.path().join("bad-editor");
+    write_script(&bad, "#!/usr/bin/sh\nprintf 'bogus\\n' > \"$1\"\n");
     let out = bubbler(tmp.path())
-        .env("EDITOR", &script)
+        .env("EDITOR", &bad)
         .args(["edit", "t"])
         .output()
         .unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{err}");
     assert!(err.contains("still has errors"), "{err}");
-    assert_eq!(std::fs::read_to_string(cfg).unwrap(), "bogus\n");
+    assert!(err.contains("unknown node `bogus`"), "{err}");
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), "bogus\n");
+
+    let unclosed = tmp.path().join("unclosed-editor");
+    write_script(
+        &unclosed,
+        "#!/usr/bin/sh\nprintf 'command \"x\\n' > \"$1\"\n",
+    );
+    let out = bubbler(tmp.path())
+        .env("EDITOR", &unclosed)
+        .args(["edit", "t"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains(&cfg.display().to_string()), "{err}");
+    assert_eq!(
+        err.matches("Failed to parse KDL document").count(),
+        1,
+        "{err}"
+    );
+
+    // The config is broken now, which is exactly when `edit` is needed: it
+    // must still spawn instead of refusing on the parse error.
+    let out = bubbler(tmp.path())
+        .env("EDITOR", "/usr/bin/true")
+        .args(["edit", "t"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("still has errors"), "{err}");
+    assert_eq!(
+        err.matches("Failed to parse KDL document").count(),
+        1,
+        "{err}"
+    );
+
+    let fixer = tmp.path().join("fix-editor");
+    write_script(
+        &fixer,
+        "#!/usr/bin/sh\nprintf 'command \"true\"\\n' > \"$1\"\n",
+    );
+    let out = bubbler(tmp.path())
+        .env("EDITOR", &fixer)
+        .args(["edit", "t"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), "command \"true\"\n");
+}
+
+#[test]
+fn edit_rejects_a_blank_editor_and_propagates_a_signal() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let out = bubbler(tmp.path())
+        .env("EDITOR", "   ")
+        .args(["edit", "t"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("blank"), "{err}");
+
+    let script = tmp.path().join("dying-editor");
+    write_script(&script, "#!/usr/bin/sh\nkill -TERM $$\n");
+    let out = bubbler(tmp.path())
+        .env("EDITOR", &script)
+        .args(["edit", "t"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(143),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -469,15 +555,13 @@ fn edit_prefers_visual_and_passes_editor_arguments() {
     bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
     let marker = tmp.path().join("marker");
     let script = tmp.path().join("record-editor");
-    std::fs::write(
+    write_script(
         &script,
-        format!(
+        &format!(
             "#!/usr/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
             marker.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    );
     let mut visual = script.clone().into_os_string();
     visual.push(" --flag");
     let out = bubbler(tmp.path())
