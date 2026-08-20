@@ -98,4 +98,7 @@ pub enum LaunchError {
     /// Spawning `bwrap` failed for a reason other than it being missing.
     #[error("failed to run bwrap: {0}")]
     Spawn(#[source] io::Error),
+    /// Command resolution failed (config had no `command` and none given).
+    #[error(transparent)]
+    Config(#[from] ConfigError),
 }

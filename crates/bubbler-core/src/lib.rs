@@ -6,5 +6,6 @@ pub mod config;
 pub mod env;
 pub mod error;
 pub mod instance;
+pub mod launcher;
 pub mod profile;
 pub mod service;
