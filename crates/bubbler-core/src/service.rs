@@ -7,7 +7,7 @@
 //! directory binds the whole tree under it, so `XAUTHORITY=/` would bind
 //! the host root.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::FileType;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Component, Path, PathBuf};
@@ -35,6 +35,9 @@ pub fn apply_all(
             Service::X11 => x11(env, args, host)?,
             Service::Network => network(args, host)?,
             Service::HomeShare { path, mode } => home_share(env, args, host, path, *mode)?,
+            Service::Dri => dri(args, host)?,
+            Service::Pipewire => pipewire(env, args, host)?,
+            Service::Pulseaudio => pulseaudio(env, args, host)?,
             Service::EtcShare { name } => {
                 let p = require_exists(host, "etc-share", Path::new("/etc").join(name))?;
                 args.ro_bind(&p, &p);
@@ -78,6 +81,15 @@ fn require_file(
     path: PathBuf,
 ) -> Result<PathBuf, LaunchError> {
     require(host, service, path, "a regular file", |t| t.is_file())
+}
+
+/// The source must be a directory, e.g. a `/sys` subtree.
+fn require_dir(
+    host: &dyn Host,
+    service: &'static str,
+    path: PathBuf,
+) -> Result<PathBuf, LaunchError> {
+    require(host, service, path, "a directory", |t| t.is_dir())
 }
 
 /// The source may be of any type; only used where the user named the path
@@ -193,6 +205,67 @@ fn x11(env: &Env, args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchErr
     Ok(())
 }
 
+/// GPU access: `/dev/dri` plus the `/sys` paths a userspace driver reads
+/// to map a device node to its PCI device (Arch wiki Bubblewrap/Examples,
+/// bubblejail `direct_rendering`). PCI roots are enumerated so no
+/// unrelated `/sys/devices` subtree is exposed.
+fn dri(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
+    let dev = require_dir(host, "dri", PathBuf::from("/dev/dri"))?;
+    args.dev_bind(&dev, &dev);
+    for p in ["/sys/dev/char", "/sys/devices/system/cpu"] {
+        let p = require_dir(host, "dri", PathBuf::from(p))?;
+        args.ro_bind(&p, &p);
+    }
+    let devices = Path::new("/sys/devices");
+    let mut found = false;
+    for name in host.list_dir(devices) {
+        if !name.as_encoded_bytes().starts_with(b"pci") {
+            continue;
+        }
+        let p = devices.join(&name);
+        if host.file_type(&p).is_some_and(|t| t.is_dir()) {
+            args.ro_bind(&p, &p);
+            found = true;
+        }
+    }
+    if !found {
+        return Err(LaunchError::MissingResource {
+            service: "dri",
+            path: devices.join("pci*"),
+        });
+    }
+    Ok(())
+}
+
+/// Bind the PipeWire socket at the same path; clients find it through
+/// `$XDG_RUNTIME_DIR`, so no variable is needed.
+fn pipewire(env: &Env, args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
+    let p = require_socket(host, "pipewire", env.runtime_dir.join("pipewire-0"))?;
+    args.ro_bind(&p, &p);
+    Ok(())
+}
+
+/// Bind the PulseAudio native socket at the same path and point
+/// `PULSE_SERVER` at it, since the sandbox has no `~/.pulse` cookie or
+/// autospawn to fall back on.
+fn pulseaudio(env: &Env, args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
+    let p = require_socket(host, "pulseaudio", env.runtime_dir.join("pulse/native"))?;
+    args.ro_bind(&p, &p);
+    let mut value = OsString::from("unix:");
+    value.push(p.as_os_str());
+    args.setenv(OsStr::new("PULSE_SERVER"), &value);
+    Ok(())
+}
+
+/// Emit profile/instance `env` pairs after all service variables, so a
+/// profile can layer toolkit settings on top; keys the sandbox owns were
+/// rejected by the parser.
+pub fn apply_env(pairs: &[(String, String)], args: &mut BwrapArgs) {
+    for (k, v) in pairs {
+        args.setenv(OsStr::new(k), OsStr::new(v));
+    }
+}
+
 /// Bind `$HOME/<path>` to `/home/bubbler/<path>`. The host path must exist
 /// and may be of any type; bubbler never creates directories in the real
 /// home. Probing and binding both happen by path, so a symlink swapped in
@@ -269,11 +342,13 @@ mod tests {
         }
         let mut args = BwrapArgs::baseline(env, Path::new("/i/home"), &host);
         apply_all(services, env, &mut args, &host)?;
-        Ok(args
-            .finish(&[OsString::from("x")], &mut counter())?
-            .iter()
+        Ok(strs(&args.finish(&[OsString::from("x")], &mut counter())?))
+    }
+
+    fn strs(argv: &[OsString]) -> Vec<String> {
+        argv.iter()
             .map(|s| s.to_string_lossy().into_owned())
-            .collect())
+            .collect()
     }
 
     fn has_seq(argv: &[String], seq: &[&str]) -> bool {
@@ -637,5 +712,173 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn dri_binds_devices_and_pci_roots() {
+        let a = argv(
+            &[Service::Dri],
+            &env(),
+            &[
+                ("/dev/dri", Dir),
+                ("/sys/dev/char", Dir),
+                ("/sys/devices/system/cpu", Dir),
+                ("/sys/devices/pci0000:00", Dir),
+                ("/sys/devices/pci0000:40", Dir),
+                ("/sys/devices/virtual", Dir),
+            ],
+        )
+        .unwrap();
+        assert!(has_seq(&a, &["--dev-bind", "/dev/dri", "/dev/dri"]));
+        assert!(has_seq(
+            &a,
+            &["--ro-bind", "/sys/dev/char", "/sys/dev/char"]
+        ));
+        assert!(has_seq(
+            &a,
+            &[
+                "--ro-bind",
+                "/sys/devices/system/cpu",
+                "/sys/devices/system/cpu"
+            ]
+        ));
+        assert!(has_seq(
+            &a,
+            &[
+                "--ro-bind",
+                "/sys/devices/pci0000:00",
+                "/sys/devices/pci0000:00"
+            ]
+        ));
+        assert!(has_seq(
+            &a,
+            &[
+                "--ro-bind",
+                "/sys/devices/pci0000:40",
+                "/sys/devices/pci0000:40"
+            ]
+        ));
+        assert!(!a.contains(&"/sys/devices/virtual".to_string()));
+        assert!(!a.contains(&"/sys/devices".to_string()));
+    }
+
+    #[test]
+    fn dri_requires_dev_dri_directory_and_a_pci_root() {
+        assert!(matches!(
+            argv(&[Service::Dri], &env(), &[("/dev/dri", File)]),
+            Err(LaunchError::WrongType {
+                service: "dri",
+                expected: "a directory",
+                ..
+            })
+        ));
+        assert!(matches!(
+            argv(
+                &[Service::Dri],
+                &env(),
+                &[
+                    ("/dev/dri", Dir),
+                    ("/sys/dev/char", Dir),
+                    ("/sys/devices/system/cpu", Dir),
+                    ("/sys/devices/pci0000:00", File),
+                ]
+            ),
+            Err(LaunchError::MissingResource { service: "dri", .. })
+        ));
+    }
+
+    #[test]
+    fn pipewire_and_pulseaudio_bind_sockets() {
+        let a = argv(
+            &[Service::Pipewire, Service::Pulseaudio],
+            &env(),
+            &[
+                ("/run/user/1000/pipewire-0", Sock),
+                ("/run/user/1000/pulse/native", Sock),
+            ],
+        )
+        .unwrap();
+        assert!(has_seq(
+            &a,
+            &[
+                "--ro-bind",
+                "/run/user/1000/pipewire-0",
+                "/run/user/1000/pipewire-0"
+            ]
+        ));
+        assert!(has_seq(
+            &a,
+            &[
+                "--ro-bind",
+                "/run/user/1000/pulse/native",
+                "/run/user/1000/pulse/native"
+            ]
+        ));
+        assert!(has_seq(
+            &a,
+            &[
+                "--setenv",
+                "PULSE_SERVER",
+                "unix:/run/user/1000/pulse/native"
+            ]
+        ));
+        assert!(matches!(
+            argv(
+                &[Service::Pipewire],
+                &env(),
+                &[("/run/user/1000/pipewire-0", File)]
+            ),
+            Err(LaunchError::WrongType {
+                service: "pipewire",
+                expected: "a socket",
+                ..
+            })
+        ));
+        assert!(matches!(
+            argv(&[Service::Pulseaudio], &env(), &[]),
+            Err(LaunchError::MissingResource {
+                service: "pulseaudio",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn etc_share_binds_an_existing_entry() {
+        let a = argv(
+            &[Service::EtcShare {
+                name: "java".into(),
+            }],
+            &env(),
+            &[("/etc/java", Dir)],
+        )
+        .unwrap();
+        assert!(has_seq(&a, &["--ro-bind", "/etc/java", "/etc/java"]));
+        assert!(matches!(
+            argv(
+                &[Service::EtcShare {
+                    name: "nope".into()
+                }],
+                &env(),
+                &[("/etc/java", Dir)]
+            ),
+            Err(LaunchError::MissingResource {
+                service: "etc-share",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn env_pairs_are_emitted_after_service_env() {
+        let (_, _, sock) = fake::types();
+        let host = FakeHost::default().with("/run/user/1000/wayland-1", sock);
+        let e = env();
+        let mut args = BwrapArgs::baseline(&e, Path::new("/i/home"), &host);
+        apply_all(&[Service::Wayland], &e, &mut args, &host).unwrap();
+        apply_env(&[("MOZ_ENABLE_WAYLAND".into(), "1".into())], &mut args);
+        let a = strs(&args.finish(&[OsString::from("x")], &mut counter()).unwrap());
+        let pos = |x: &str| a.iter().position(|v| v == x).unwrap();
+        assert!(pos("MOZ_ENABLE_WAYLAND") > pos("WAYLAND_DISPLAY"));
     }
 }

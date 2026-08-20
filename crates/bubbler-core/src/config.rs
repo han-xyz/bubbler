@@ -43,6 +43,13 @@ pub enum Service {
     X11,
     /// Keep the host network namespace.
     Network,
+    /// GPU access: the `/dev/dri` device nodes plus the `/sys` entries a
+    /// userspace driver reads to match a node to its hardware.
+    Dri,
+    /// Access to the host PipeWire socket.
+    Pipewire,
+    /// Access to the host PulseAudio socket.
+    Pulseaudio,
     /// Bind `$HOME/<path>` on the host to the same relative path inside the
     /// private home.
     HomeShare {
@@ -79,12 +86,15 @@ pub fn parse(text: &str) -> Result<InstanceConfig, ConfigError> {
         let name = node.name().value();
         reject_types(node)?;
         match name {
-            "wayland" | "x11" | "network" => {
+            "wayland" | "x11" | "network" | "dri" | "pipewire" | "pulseaudio" => {
                 reject_entries(node)?;
                 let svc = match name {
                     "wayland" => Service::Wayland,
                     "x11" => Service::X11,
-                    _ => Service::Network,
+                    "network" => Service::Network,
+                    "dri" => Service::Dri,
+                    "pipewire" => Service::Pipewire,
+                    _ => Service::Pulseaudio,
                 };
                 if cfg.services.contains(&svc) {
                     return Err(ConfigError::Duplicate(name.to_owned()));
@@ -341,9 +351,25 @@ mod tests {
 
     #[test]
     fn unknown_node_is_an_error() {
-        assert!(
-            matches!(parse("pulseaudio"), Err(ConfigError::UnknownNode(n)) if n == "pulseaudio")
+        assert!(matches!(parse("bluetooth"), Err(ConfigError::UnknownNode(n)) if n == "bluetooth"));
+    }
+
+    #[test]
+    fn device_and_audio_services_are_flag_nodes() {
+        let cfg = parse("dri\npipewire\npulseaudio").unwrap();
+        assert_eq!(
+            cfg.services,
+            vec![Service::Dri, Service::Pipewire, Service::Pulseaudio]
         );
+        assert!(matches!(parse("dri\ndri"), Err(ConfigError::Duplicate(n)) if n == "dri"));
+        assert!(matches!(
+            parse("pulseaudio 1"),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("pipewire foo=bar"),
+            Err(ConfigError::UnknownProperty { .. })
+        ));
     }
 
     #[test]

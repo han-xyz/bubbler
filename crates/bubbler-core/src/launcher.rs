@@ -39,6 +39,7 @@ pub fn build_argv(
     let host = RealHost;
     let mut args = BwrapArgs::baseline(env, &inst.home(), &host);
     service::apply_all(&inst.config.services, env, &mut args, &host)?;
+    service::apply_env(&inst.config.env, &mut args);
     args.finish(command, alloc)
 }
 
@@ -166,6 +167,22 @@ mod tests {
         );
         let a = build_argv(&e, &i, Some(&[OsString::from("ls")]), &mut dry_run_alloc()).unwrap();
         assert_eq!(&a[a.len() - 2..], &[OsString::from("--"), "ls".into()]);
+    }
+
+    #[test]
+    fn config_env_pairs_reach_the_argv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let i = inst(
+            tmp.path(),
+            "env MOZ_ENABLE_WAYLAND=\"1\"\ncommand \"firefox\"",
+        );
+        let a = build_argv(&e, &i, None, &mut dry_run_alloc()).unwrap();
+        let s: Vec<String> = a.iter().map(|x| x.to_string_lossy().into_owned()).collect();
+        assert!(
+            s.windows(3)
+                .any(|w| w == ["--setenv", "MOZ_ENABLE_WAYLAND", "1"])
+        );
     }
 
     #[test]
