@@ -166,13 +166,11 @@ pub fn run_in(
         true => Some(RawGuard::new(host[0].as_fd())?),
         false => None,
     };
-    // A pty is always drained somewhere: the terminal the plan picked, or
-    // `/dev/null` when none of bubbler's own fds can take output, as for
-    // `bubbler exec x < /dev/tty > out`.
-    let sink = match master {
-        Some(_) => Some(tty::null_stdio()?),
-        None => None,
-    };
+    // Output the user's own descriptors cannot take goes here instead:
+    // when none of them can be written to at all (`bubbler exec x
+    // < /dev/tty > out`) and when one stops taking it. Draining somewhere
+    // is what keeps the command from blocking on a full pty or pipe.
+    let sink = tty::null_stdio()?;
     let mut received: Option<io::Result<i32>> = None;
     let end = {
         let mut until = || {
@@ -187,28 +185,29 @@ pub fn run_in(
             received = Some(got);
             Some(code)
         };
-        match (&master, &sink) {
-            (Some(master), Some(sink)) => {
+        match &master {
+            Some(master) => {
                 let out = tty::output_fd(&plan, &host);
                 let host_out = out.map_or(sink.as_fd(), |i| host[i].as_fd());
                 tty::relay(
                     master.as_fd(),
                     plan.ctty().then(|| host[0].as_fd()),
                     host_out,
+                    sink.as_fd(),
                     &mut until,
                     &winch,
                 )?
             }
-            _ if !pipes.is_empty() => {
+            None if !pipes.is_empty() => {
                 let ends: Vec<_> = pipes
                     .iter()
                     .map(|(read, i)| (read.as_fd(), host[*i].as_fd()))
                     .collect();
-                tty::pump(&ends, &mut until)?;
+                tty::pump(&ends, sink.as_fd(), &mut until)?;
                 RelayEnd::Exited(0)
             }
             // Nothing of ours to move: the status is all this waits for.
-            _ => {
+            None => {
                 received = Some(wire::recv_status(stream));
                 RelayEnd::Exited(0)
             }

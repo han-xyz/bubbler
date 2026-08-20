@@ -1,7 +1,8 @@
 //! The sandbox's terminal: pty allocation, the per-fd stdio decision, raw
 //! mode on the user's terminal and the relay between the two.
 
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::io::Write;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -148,9 +149,12 @@ pub fn null_stdio() -> Result<OwnedFd, LaunchError> {
 
 /// bubbler's own fds 0, 1 and 2, duplicated so a plan can index them by
 /// number. The copies are `CLOEXEC`: what the sandbox gets is decided by
-/// the plan, never inherited by accident. A descriptor bubbler was
-/// started without stands in as `/dev/null` — a plan is made of three
-/// fds, and one nobody is using is no reason to refuse the launch.
+/// the plan, never inherited by accident.
+///
+/// A descriptor the process was started without stands in as `/dev/null`,
+/// so a plan can assume all three exist. The `bubbler` binary fills such
+/// gaps at startup, before anything can take the number; this is the
+/// backstop for a library caller that does not.
 pub fn host_stdio() -> Result<[OwnedFd; 3], LaunchError> {
     let (i, o, e) = (std::io::stdin(), std::io::stdout(), std::io::stderr());
     let dup = |fd: BorrowedFd<'_>| match fd.try_clone_to_owned() {
@@ -323,11 +327,14 @@ impl Escape {
 /// closed: that would tear the pty down under a running command. Every
 /// `winch` is answered by copying `host_out`'s size onto the pty, so
 /// `host_out` must be the user's terminal; the size it starts with is the
-/// one [`allocate`] copied from the terminal it was given.
+/// one [`allocate`] copied from the terminal it was given. Output
+/// `host_out` refuses goes to `sink` instead, which must be a descriptor
+/// that always accepts it ([`null_stdio`]).
 pub fn relay(
     master: BorrowedFd<'_>,
     host_in: Option<BorrowedFd<'_>>,
     host_out: BorrowedFd<'_>,
+    sink: BorrowedFd<'_>,
     until: &mut dyn FnMut() -> Option<i32>,
     winch: &AtomicBool,
 ) -> Result<RelayEnd, LaunchError> {
@@ -336,6 +343,7 @@ pub fn relay(
     let flags = fcntl_getfl(master).map_err(pty_error)?;
     fcntl_setfl(master, flags | OFlags::NONBLOCK).map_err(pty_error)?;
     let mut stdin = host_in;
+    let mut out = host_out;
     let mut pending: Vec<u8> = Vec::new();
     let mut escape = Escape::new();
     let mut output = true;
@@ -343,7 +351,7 @@ pub fn relay(
     loop {
         if let Some(code) = until() {
             if output {
-                drain(master, host_out)?;
+                drain(master, out, sink);
             }
             return Ok(RelayEnd::Exited(code));
         }
@@ -390,10 +398,10 @@ pub fn relay(
         }
         if let Some(fd) = read_stdin.filter(|_| stdin_ready) {
             match read(fd, &mut buf) {
-                // Only a host stdin that is not a terminal ends this way,
-                // which no plan produces: a pipe or a redirect is handed
-                // to the sandbox directly. It serves a caller that relays
-                // one anyway, and the tests that drive this with a socket.
+                // A terminal that hung up, or a stdin that is not one and
+                // has run out. No plan produces the latter — a pipe or a
+                // redirect goes to the sandbox directly — so in bubbler
+                // this is the terminal going away.
                 Ok(0) => {
                     stdin = None;
                     if let Some(eof) = eof_char(master) {
@@ -414,9 +422,14 @@ pub fn relay(
             match read(master, &mut buf) {
                 Ok(0) => output = false,
                 // A terminal that cannot take the output — closed, gone,
-                // or opened read-only — ends the relaying, never the run:
-                // the command is still going and its status is still due.
-                Ok(n) => output = write_all(host_out, &buf[..n]).is_ok(),
+                // or opened read-only — costs the output its destination,
+                // never the run: the command is still going, its status is
+                // still due, and its pty must go on being emptied.
+                Ok(n) => {
+                    if let Err(e) = write_all(out, &buf[..n]) {
+                        output = redirect(&mut out, sink, e);
+                    }
+                }
                 Err(Errno::AGAIN) | Err(Errno::INTR) => {}
                 // EIO is the last slave closing: no more output is coming,
                 // but the status may still be on its way.
@@ -427,31 +440,37 @@ pub fn relay(
 }
 
 /// Move what the pty still holds to the host, for at most [`DRAIN`]:
-/// the status arrives before the last output has been read out.
-fn drain(master: BorrowedFd<'_>, host_out: BorrowedFd<'_>) -> Result<(), LaunchError> {
+/// the status arrives before the last output has been read out. Nothing
+/// here is worth failing a finished run over, so every error just ends it.
+fn drain(master: BorrowedFd<'_>, host_out: BorrowedFd<'_>, sink: BorrowedFd<'_>) {
     let deadline = Instant::now() + DRAIN;
+    let mut out = host_out;
     let mut buf = [0u8; CHUNK];
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return Ok(());
+            return;
         }
         let mut fds = [PollFd::from_borrowed_fd(master, PollFlags::IN)];
         match poll(&mut fds, Some(&timespec(left))) {
             Err(Errno::INTR) => continue,
-            Err(e) => return Err(pty_error(e)),
+            Err(_) => return,
             Ok(_) => {}
         }
         if fds[0].revents().is_empty() {
-            return Ok(());
+            return;
         }
         match read(master, &mut buf) {
-            Ok(0) => return Ok(()),
-            // Nowhere to put it is the same as nothing left to take.
-            Ok(n) if write_all(host_out, &buf[..n]).is_err() => return Ok(()),
-            Ok(_) => {}
+            Ok(0) => return,
+            Ok(n) => {
+                if let Err(e) = write_all(out, &buf[..n])
+                    && !redirect(&mut out, sink, e)
+                {
+                    return;
+                }
+            }
             Err(Errno::AGAIN) | Err(Errno::INTR) => {}
-            Err(_) => return Ok(()),
+            Err(_) => return,
         }
     }
 }
@@ -459,12 +478,17 @@ fn drain(master: BorrowedFd<'_>, host_out: BorrowedFd<'_>) -> Result<(), LaunchE
 /// Copy each pipe to the fd next to it until `until` reports an exit and
 /// the pipes have run dry, or 200 ms after that at the latest. This is
 /// the whole relay for a sandbox with no terminal: same poll loop, no
-/// threads, and nothing that can hand the sandbox a terminal fd.
+/// threads, and nothing that can hand the sandbox a terminal fd. A
+/// destination that stops taking output is replaced by `sink`, so a
+/// reader that left early (`bubbler run ... | head`) cannot leave the
+/// command blocked on a full pipe.
 pub fn pump(
     pipes: &[(BorrowedFd<'_>, BorrowedFd<'_>)],
+    sink: BorrowedFd<'_>,
     until: &mut dyn FnMut() -> Option<i32>,
 ) -> Result<i32, LaunchError> {
     let mut open = vec![true; pipes.len()];
+    let mut dest: Vec<BorrowedFd<'_>> = pipes.iter().map(|(_, to)| *to).collect();
     let mut buf = [0u8; CHUNK];
     let mut exited: Option<(i32, Instant)> = None;
     loop {
@@ -502,9 +526,13 @@ pub fn pump(
             match read(pipes[i].0, &mut buf) {
                 // The sandbox closed this end; nothing more will come.
                 Ok(0) => open[i] = false,
-                // As for the relay: output bubbler cannot pass on is not
-                // a reason to end a command that is still running.
-                Ok(n) => open[i] = write_all(pipes[i].1, &buf[..n]).is_ok(),
+                // As for the relay: output bubbler cannot pass on goes to
+                // the sink, and this pipe keeps being emptied.
+                Ok(n) => {
+                    if let Err(e) = write_all(dest[i], &buf[..n]) {
+                        open[i] = redirect(&mut dest[i], sink, e);
+                    }
+                }
                 Err(Errno::AGAIN) | Err(Errno::INTR) => {}
                 Err(_) => open[i] = false,
             }
@@ -533,21 +561,46 @@ fn resize(master: BorrowedFd<'_>, host: BorrowedFd<'_>) {
     }
 }
 
-/// Write every byte to the user's terminal, waiting for it when it is full.
-fn write_all(fd: BorrowedFd<'_>, mut buf: &[u8]) -> Result<(), LaunchError> {
+/// Write every byte to the user's terminal, waiting for it when it is
+/// full. The error is reported as it came, because what the caller does
+/// with it depends on which descriptor refused the bytes.
+fn write_all(fd: BorrowedFd<'_>, mut buf: &[u8]) -> Result<(), Errno> {
     while !buf.is_empty() {
         match write(fd, buf) {
-            Ok(0) => return Err(pty_error(Errno::IO)),
+            Ok(0) => return Err(Errno::IO),
             Ok(n) => buf = &buf[n..],
             Err(Errno::AGAIN) | Err(Errno::INTR) => {
                 let mut fds = [PollFd::from_borrowed_fd(fd, PollFlags::OUT)];
                 // Waiting is the whole point; a failed wait just retries.
                 let _ = poll(&mut fds, Some(&TICK_TIMESPEC));
             }
-            Err(e) => return Err(pty_error(e)),
+            Err(e) => return Err(e),
         }
     }
     Ok(())
+}
+
+/// Send what `dest` would not take to `sink` from now on, and say so
+/// once. `false` when `dest` already was the sink: there is nowhere left
+/// to put the output, and the copy stops.
+///
+/// Reading the sandbox side has to go on either way — a pty or a pipe
+/// nobody empties fills up, and the command blocks in `write` forever.
+fn redirect<'a>(dest: &mut BorrowedFd<'a>, sink: BorrowedFd<'a>, e: Errno) -> bool {
+    if dest.as_raw_fd() == sink.as_raw_fd() {
+        return false;
+    }
+    // Truncated output is worth a word, and a warning that cannot be
+    // printed either (the terminal is what just failed) is nothing to act
+    // on.
+    let _ = writeln!(
+        std::io::stderr(),
+        "bubbler: output to fd {} failed: {}; discarding further output",
+        dest.as_raw_fd(),
+        std::io::Error::from(e)
+    );
+    *dest = sink;
+    true
 }
 
 /// `Timespec` for `poll`, which takes no `Duration`.
@@ -629,10 +682,12 @@ mod tests {
         let (s, w) = (Arc::clone(&stop), Arc::clone(&winch));
         let handle = thread::spawn(move || {
             let mut until = || s.load(Ordering::SeqCst).then_some(0);
+            let sink = null_stdio().unwrap();
             relay(
                 master.as_fd(),
                 host_in.as_ref().map(|f| f.as_fd()),
                 host_out.as_fd(),
+                sink.as_fd(),
                 &mut until,
                 &w,
             )
@@ -800,7 +855,7 @@ mod tests {
     }
 
     #[test]
-    fn output_the_host_cannot_take_ends_the_relaying_and_not_the_run() {
+    fn output_the_host_cannot_take_is_discarded_and_the_pty_kept_empty() {
         let Pty { master, slave } = pty_pair();
         let (host_in, test_in) = UnixStream::pair().unwrap();
         // Every write to a read-only descriptor fails with EBADF, which is
@@ -813,11 +868,45 @@ mod tests {
         )
         .unwrap();
         let r = spawn_relay(master, Some(host_in.into()), read_only);
-        write(&slave, b"output nobody can take\n").unwrap();
-        // The relay is still there: what the user types still arrives.
+        // More than the pty holds: a relay that stopped reading here would
+        // leave the writer blocked in the sandbox for good.
+        let mut sent = 0;
+        while sent < 256 * 1024 {
+            sent += write(&slave, &[b'x'; 4096]).unwrap();
+        }
+        // And it is still a relay: what the user types still arrives.
         write(&test_in, b"typed\n").unwrap();
         expect(slave.as_fd(), b"typed\n");
         assert_eq!(finish(r), RelayEnd::Exited(0));
+    }
+
+    #[test]
+    fn a_pipe_whose_reader_left_is_drained_into_the_sink() {
+        let (read_end, write_end) = rustix::pipe::pipe().unwrap();
+        // A destination that is closed: `bubbler run ... | head`, once
+        // head has had enough.
+        let (gone, reader) = rustix::pipe::pipe().unwrap();
+        drop(reader);
+        let sink = null_stdio().unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let d = Arc::clone(&done);
+        let feeder = thread::spawn(move || {
+            let mut sent = 0;
+            // Far more than a pipe holds; without the sink this blocks.
+            while sent < 512 * 1024 {
+                sent += write(&write_end, &[b'x'; 4096]).unwrap();
+            }
+            d.store(true, Ordering::SeqCst);
+        });
+        let mut until = || done.load(Ordering::SeqCst).then_some(3);
+        let code = pump(
+            &[(read_end.as_fd(), gone.as_fd())],
+            sink.as_fd(),
+            &mut until,
+        )
+        .unwrap();
+        assert_eq!(code, 3);
+        feeder.join().unwrap();
     }
 
     #[test]
@@ -881,7 +970,16 @@ mod tests {
         let winch = AtomicBool::new(false);
         let mut until = || Some(7);
         let started = Instant::now();
-        let end = relay(master.as_fd(), None, host_out.as_fd(), &mut until, &winch).unwrap();
+        let sink = null_stdio().unwrap();
+        let end = relay(
+            master.as_fd(),
+            None,
+            host_out.as_fd(),
+            sink.as_fd(),
+            &mut until,
+            &winch,
+        )
+        .unwrap();
         assert_eq!(end, RelayEnd::Exited(7));
         // The slave is still open, so the drain ends on its own deadline.
         assert!(started.elapsed() < Duration::from_secs(1));
@@ -923,11 +1021,13 @@ mod tests {
         drop(w_out);
         drop(w_err);
         let mut until = || Some(5);
+        let sink = null_stdio().unwrap();
         let code = pump(
             &[
                 (r_out.as_fd(), host_out.as_fd()),
                 (r_err.as_fd(), host_err.as_fd()),
             ],
+            sink.as_fd(),
             &mut until,
         )
         .unwrap();
@@ -945,7 +1045,13 @@ mod tests {
         let started = Instant::now();
         // Something inside still holds the write end, so only the deadline
         // ends this; what was already written must still arrive.
-        let code = pump(&[(read_end.as_fd(), host_out.as_fd())], &mut until).unwrap();
+        let sink = null_stdio().unwrap();
+        let code = pump(
+            &[(read_end.as_fd(), host_out.as_fd())],
+            sink.as_fd(),
+            &mut until,
+        )
+        .unwrap();
         assert_eq!(code, 0);
         assert!(started.elapsed() < Duration::from_secs(1));
         expect(test_out.as_fd(), b"last words\n");

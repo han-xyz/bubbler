@@ -142,6 +142,8 @@ fn print_lines(lines: &[&OsStr], what: &str) -> Result<i32> {
 }
 
 fn real_main() -> Result<i32> {
+    // Before anything else opens a descriptor.
+    host_env::fill_closed_stdio()?;
     let cli = Cli::parse();
     let env = host_env::from_process()?;
     match cli.cmd {

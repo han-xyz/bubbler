@@ -62,6 +62,12 @@ pub fn real_init() -> Option<PathBuf> {
 /// sandbox override it with [`real_init`].
 pub fn bubbler(root: &Path) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_bubbler"));
+    isolate(&mut c, root);
+    c
+}
+
+/// The isolated environment every test process gets, whatever the program.
+fn isolate(c: &mut Command, root: &Path) {
     c.env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", root.join("home"))
@@ -69,6 +75,18 @@ pub fn bubbler(root: &Path) -> Command {
         .env("XDG_RUNTIME_DIR", root.join("run"))
         .env("BUBBLER_INIT", root.join("bubbler-init"))
         .env("TERM", "dumb");
+}
+
+/// bubbler started from a shell, for the two things `Command` cannot
+/// express: closing one of its standard descriptors, and putting it in a
+/// pipeline whose reader leaves early. `$B` in `script` is the binary.
+pub fn bubbler_in_sh(root: &Path, init: &Path, script: &str) -> Command {
+    let mut c = Command::new("/usr/bin/sh");
+    isolate(&mut c, root);
+    c.env("BUBBLER_INIT", init)
+        .env("B", env!("CARGO_BIN_EXE_bubbler"))
+        .arg("-c")
+        .arg(script);
     c
 }
 

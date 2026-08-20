@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use bubbler_core::bwrap::ETC_ALLOWLIST;
 use common::{
-    bubbler, bubbler_dbus, bubbler_live, real_init, require_bwrap, require_dbus, require_portal,
-    require_python, test_pty,
+    bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, real_init, require_bwrap, require_dbus,
+    require_portal, require_python, test_pty,
 };
 use rustix::process::{Pid, Signal, kill_process};
 
@@ -1714,6 +1714,111 @@ fn real_bwrap_run_survives_a_terminal_that_cannot_take_its_output() {
         "GOT hello\n",
         "{said}"
     );
+}
+
+#[test]
+fn real_bwrap_run_with_tty_none_outlives_a_reader_that_leaves() {
+    let Some((tmp, init)) = live_instance("t") else {
+        return;
+    };
+    // `bubbler run t --tty none -- ... | head -c 100`: the reader is gone
+    // long before the command is, and the pipe bubbler pumps into stops
+    // taking anything. Nothing may block on that — neither the command
+    // inside, on a pipe nobody empties, nor bubbler, waiting for it.
+    let mut run = bubbler_in_sh(
+        tmp.path(),
+        &init,
+        "\"$B\" run t --tty none -- /usr/bin/sh -c 'yes bytes | head -c 1000000' | head -c 100",
+    )
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    let mut status = None;
+    let finished = wait_until(
+        || {
+            status = run.try_wait().expect("waiting for the run");
+            status.is_some()
+        },
+        Duration::from_secs(15),
+    );
+    if !finished {
+        let _ = run.kill();
+        panic!("bubbler never finished after its output pipe closed");
+    }
+    let out = run.wait_with_output().expect("collecting stderr");
+    let err = String::from_utf8_lossy(&out.stderr);
+    // Truncation is not silent.
+    assert!(err.contains("discarding further output"), "{err:?}");
+}
+
+#[test]
+fn real_bwrap_run_returns_the_status_when_the_terminal_goes_away() {
+    let Some((tmp, init)) = live_instance("t") else {
+        return;
+    };
+    let pty = test_pty();
+    let mut run = bubbler_live(tmp.path(), &init)
+        .args([
+            "run",
+            "t",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            "echo started; sleep 0.3; yes bytes | head -c 400000; exit 5",
+        ])
+        .stdin(pty.stdio())
+        .stdout(pty.stdio())
+        .stderr(pty.stdio())
+        .spawn()
+        .unwrap();
+    // Only once the relay is really running: a terminal that is already
+    // gone is not a terminal at all, and no pty would be allocated.
+    let out = pty.read_until(Duration::from_secs(20), |s| s.contains("started"));
+    assert!(
+        out.contains("started"),
+        "the sandbox never started: {out:?}"
+    );
+    // The user's terminal disappears mid-run, before the command's bulk
+    // output. Everything written from here on has nowhere to go, and a
+    // relay that stopped reading would leave the command blocked on a
+    // full pty for good.
+    drop(pty);
+    let mut status = None;
+    let finished = wait_until(
+        || {
+            status = run.try_wait().expect("waiting for the run");
+            status.is_some()
+        },
+        Duration::from_secs(15),
+    );
+    if !finished {
+        let _ = run.kill();
+        panic!("bubbler never finished after its terminal went away");
+    }
+    // The command's own status, still reported after the relay lost its end.
+    assert_eq!(status.and_then(|s| s.code()), Some(5));
+}
+
+#[test]
+fn real_bwrap_run_with_a_closed_stdout_hands_the_sandbox_dev_null() {
+    let Some((tmp, init)) = live_instance("t") else {
+        return;
+    };
+    // `bubbler run t 1>&-`: the slot is empty, and whatever bubbler opens
+    // next must not become the sandbox's stdout. The probe reads fd 1
+    // through a duplicate, because `>&2` would replace the very fd it is
+    // asked about.
+    let out = bubbler_in_sh(
+        tmp.path(),
+        &init,
+        "exec \"$B\" run t -- /usr/bin/sh -c 'exec 4>&1; readlink /proc/self/fd/4 >&2' 1>&-",
+    )
+    .stderr(Stdio::piped())
+    .output()
+    .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(err.trim(), "/dev/null", "{err:?}");
 }
 
 #[test]

@@ -827,11 +827,12 @@ fn wait_pumping(
     stop: &AtomicBool,
     supervisor: Option<Pid>,
     pipes: &[(BorrowedFd<'_>, BorrowedFd<'_>)],
+    sink: BorrowedFd<'_>,
 ) -> Result<i32, LaunchError> {
     let mut failed = None;
     let code = {
         let mut until = until_exit(child, stop, supervisor, &mut failed);
-        tty::pump(pipes, &mut until)?
+        tty::pump(pipes, sink, &mut until)?
     };
     match failed {
         Some(e) => Err(LaunchError::Spawn(e)),
@@ -868,7 +869,14 @@ fn wait_relaying(
     let mut failed = None;
     let end = {
         let mut until = until_exit(child, stop, supervisor, &mut failed);
-        tty::relay(master, ends.input, ends.output, &mut until, winch)?
+        tty::relay(
+            master,
+            ends.input,
+            ends.output,
+            ends.sink,
+            &mut until,
+            winch,
+        )?
     };
     if let Some(e) = failed {
         return Err(LaunchError::Spawn(e));
@@ -884,7 +892,7 @@ fn wait_relaying(
             }
             eprintln!("{}", tty::DETACHED_NOTE);
             let mut until = until_exit(child, stop, supervisor, &mut failed);
-            match tty::relay(master, None, ends.sink, &mut until, winch)? {
+            match tty::relay(master, None, ends.sink, ends.sink, &mut until, winch)? {
                 RelayEnd::Exited(code) => code,
                 // Nothing is read from the user any more, so there is
                 // nothing left that could ask to detach.
@@ -1019,14 +1027,14 @@ pub fn run(
     let supervisor = info.as_ref().and_then(|(reaper, _)| {
         supervisor_pid(*reaper, &mut child, Instant::now() + SUPERVISOR_WAIT)
     });
+    // Output the user's own descriptors cannot take goes here instead:
+    // when none of them can be written to at all (`bubbler run x
+    // < /dev/tty > out`), when one stops taking it (a reader that left),
+    // and after a detach. Draining somewhere is what keeps a command from
+    // blocking on a full pty or pipe.
+    let sink = tty::null_stdio()?;
     let code = match &master {
         Some(master) => {
-            // The pty is always drained somewhere: the terminal the plan
-            // picked, or `/dev/null` when none of bubbler's own fds can
-            // take output — `bubbler run x < /dev/tty > out` has only a
-            // read-only terminal to offer. It is also where the output
-            // goes after a detach.
-            let sink = tty::null_stdio()?;
             let out = tty::output_fd(&stdio, &host);
             let host_out = out.map_or(sink.as_fd(), |i| host[i].as_fd());
             let ends = RelayEnds {
@@ -1049,7 +1057,7 @@ pub fn run(
                 .iter()
                 .map(|(read, i)| (read.as_fd(), host[*i].as_fd()))
                 .collect();
-            wait_pumping(&mut child, &stop, supervisor, &ends)
+            wait_pumping(&mut child, &stop, supervisor, &ends, sink.as_fd())
         }
         None => wait_plain(&mut child, &stop, supervisor),
     }?;

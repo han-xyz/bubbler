@@ -2,10 +2,51 @@
 
 use std::env;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::io;
+use std::os::fd::{AsFd, AsRawFd, RawFd};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bubbler_core::env::{Env, is_passthrough};
+use rustix::fs::{Mode, OFlags};
+use rustix::io::fcntl_getfd;
+
+/// Open `/dev/null` onto any of fds 0, 1 and 2 this process was started
+/// without, so a sandbox told to inherit "bubbler's stdout" can never be
+/// handed whatever bubbler opened into that slot instead. Must run before
+/// anything else opens a descriptor: the kernel hands out the lowest free
+/// number, so each open lands exactly in the gap it is meant for.
+///
+/// The Rust runtime already does this on Linux (`sanitize_standard_fds`),
+/// verified by removing this call and finding `/dev/null` on the
+/// sandbox's stdout all the same. It stays because the guarantee the
+/// terminal plan rests on should be bubbler's own and visible, not an
+/// implementation detail of the runtime it happens to be built with.
+pub fn fill_closed_stdio() -> Result<()> {
+    // The std handles name fds 0, 1 and 2 whether or not they are open, so
+    // the probe needs no raw descriptor of its own.
+    let present = [
+        fcntl_getfd(io::stdin().as_fd()).is_ok(),
+        fcntl_getfd(io::stdout().as_fd()).is_ok(),
+        fcntl_getfd(io::stderr().as_fd()).is_ok(),
+    ];
+    for (i, present) in present.iter().enumerate() {
+        if *present {
+            continue;
+        }
+        // No CLOEXEC: this is standard input or output, and every child
+        // that inherits it must keep it.
+        let fd = rustix::fs::open(Path::new("/dev/null"), OFlags::RDWR, Mode::empty())
+            .context("opening /dev/null for a closed standard descriptor")?;
+        // Filling the gaps in order means each open lands on its own
+        // number; anything else and the slot is left as it was found.
+        if fd.as_raw_fd() == i as RawFd {
+            // Leaked on purpose: it is this process's fd `i` from here on.
+            std::mem::forget(fd);
+        }
+    }
+    Ok(())
+}
 
 /// Build an [`Env`] from the current process environment. A missing or
 /// empty `$HOME` or `$XDG_RUNTIME_DIR` is an error: both are needed for
