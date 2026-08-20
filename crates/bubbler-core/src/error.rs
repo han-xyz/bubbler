@@ -9,8 +9,8 @@ use thiserror::Error;
 /// Failures while reading an instance or profile configuration.
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    /// KDL syntax error.
-    #[error("invalid KDL: {0}")]
+    /// KDL syntax error; the source carries the location.
+    #[error("invalid KDL")]
     Parse(#[from] kdl::KdlError),
     /// A top-level node that is not a known service or `command`.
     #[error("unknown node `{0}`")]
@@ -48,8 +48,12 @@ pub enum InstanceError {
     /// `open` on a missing instance.
     #[error("instance `{0}` not found")]
     NotFound(String),
-    /// Name contains characters outside `[A-Za-z0-9._-]` or is `.`/`..`.
-    #[error("invalid instance name `{0}`")]
+    /// Name is empty, is `.` or `..`, starts with `-`, or contains
+    /// characters outside `[A-Za-z0-9._-]`.
+    #[error(
+        "invalid instance name `{0}`: use letters, digits, `.`, `_` and `-`, \
+         not starting with `-`, and not `.` or `..`"
+    )]
     InvalidName(String),
     /// Unknown profile name passed to `create`.
     #[error("unknown profile `{0}`")]
@@ -107,7 +111,7 @@ pub enum LaunchError {
     #[error("{0}")]
     Io(PathBuf, #[source] io::Error),
     /// Spawning `bwrap` failed for a reason other than it being missing.
-    #[error("failed to run bwrap: {0}")]
+    #[error("failed to run bwrap")]
     Spawn(#[source] io::Error),
     /// Command resolution failed (config had no `command` and none given).
     #[error(transparent)]

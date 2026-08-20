@@ -263,3 +263,57 @@ fn wayland_display_must_name_a_socket() {
     assert_eq!(out.status.code(), Some(1), "{err}");
     assert!(err.contains("notasocket"), "{err}");
 }
+
+#[test]
+fn create_and_list_survive_a_closed_pipe() {
+    let tmp = setup();
+    for args in [["create", "t"], ["list", ""]] {
+        let mut cmd = bubbler(tmp.path());
+        cmd.args(args.iter().filter(|a| !a.is_empty()));
+        let mut child = cmd
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(child.stdout.take().expect("stdout was requested as a pipe"));
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn invalid_config_names_the_file_once() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "command \"unclosed\n").unwrap();
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--dry-run"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains(&cfg.display().to_string()), "{err}");
+    assert_eq!(
+        err.matches("Failed to parse KDL document").count(),
+        1,
+        "{err}"
+    );
+}
+
+#[test]
+fn instance_name_cannot_start_with_a_dash() {
+    let tmp = setup();
+    let out = bubbler(tmp.path())
+        .args(["create", "--", "-x"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("invalid instance name"), "{err}");
+}

@@ -1,16 +1,26 @@
 //! Host environment facts needed to build a sandbox. Filled in by the
 //! binary so the library never reads process environment itself.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
-/// Path of the private home inside every sandbox. Fixed so the real
-/// username never leaks into the sandbox.
+/// Path of the private home inside every sandbox. Fixed so host home
+/// paths are not part of the sandbox layout. The username is still
+/// visible via `/etc/passwd` until `/etc` is allowlisted.
 pub const SANDBOX_HOME: &str = "/home/bubbler";
 
-/// Environment variables copied from the host into the sandbox when set.
-/// Locale and terminal only; nothing that points at host paths.
+/// Environment variables copied from the host into the sandbox when set:
+/// terminal and locale. `LC_*` is not listed here; [`is_passthrough`] is
+/// the whole policy. `TZ` may name a path, so this is not a value-only list.
 pub const PASSTHROUGH_VARS: &[&str] = &["TERM", "LANG", "LANGUAGE", "COLORTERM", "TZ"];
+
+/// Whether a host variable is copied into the sandbox: one of
+/// [`PASSTHROUGH_VARS`] or an `LC_*` locale override. Compared by bytes,
+/// since environment names need not be UTF-8.
+pub fn is_passthrough(name: &OsStr) -> bool {
+    let name = name.as_encoded_bytes();
+    name.starts_with(b"LC_") || PASSTHROUGH_VARS.iter().any(|v| v.as_bytes() == name)
+}
 
 /// Host-side facts the builder and services need.
 #[derive(Debug, Clone)]
@@ -27,7 +37,34 @@ pub struct Env {
     pub display: Option<OsString>,
     /// `$XAUTHORITY` if set.
     pub xauthority: Option<PathBuf>,
-    /// Already-filtered `(name, value)` pairs from [`PASSTHROUGH_VARS`]
-    /// (and `LC_*`) that were set on the host.
+    /// Already-filtered `(name, value)` pairs that were set on the host,
+    /// selected by [`is_passthrough`].
     pub passthrough: Vec<(OsString, OsString)>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn passthrough_is_the_allowlist_plus_lc_prefix() {
+        for ok in [
+            "TERM",
+            "LANG",
+            "LANGUAGE",
+            "COLORTERM",
+            "TZ",
+            "LC_ALL",
+            "LC_",
+        ] {
+            assert!(is_passthrough(OsStr::new(ok)), "{ok}");
+        }
+        for no in [
+            "PATH", "HOME", "DISPLAY", "TERMINFO", "lc_all", "XLC_ALL", "",
+        ] {
+            assert!(!is_passthrough(OsStr::new(no)), "{no}");
+        }
+        assert!(!is_passthrough(OsStr::from_bytes(b"LC\xff")));
+    }
 }

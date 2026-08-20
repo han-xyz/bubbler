@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use bubbler_core::env::{Env, PASSTHROUGH_VARS};
+use bubbler_core::env::{Env, is_passthrough};
 
 /// Build an [`Env`] from the current process environment. A missing or
 /// empty `$HOME` or `$XDG_RUNTIME_DIR` is an error: both are needed for
@@ -25,12 +25,8 @@ pub fn from_process() -> Result<Env> {
             .filter(|v| !v.is_empty())
             .context("XDG_RUNTIME_DIR is not set; a session manager should set it")?,
     );
-    let passthrough: Vec<(OsString, OsString)> = env::vars_os()
-        .filter(|(k, _)| {
-            let k = k.to_string_lossy();
-            PASSTHROUGH_VARS.contains(&k.as_ref()) || k.starts_with("LC_")
-        })
-        .collect();
+    let passthrough: Vec<(OsString, OsString)> =
+        env::vars_os().filter(|(k, _)| is_passthrough(k)).collect();
     Ok(Env {
         home,
         data_home,

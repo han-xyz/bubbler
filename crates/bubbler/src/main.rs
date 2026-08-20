@@ -2,14 +2,14 @@
 
 mod host_env;
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use bubbler_core::config::Service;
-use bubbler_core::instance::Instance;
+use bubbler_core::instance::{self, Instance};
 use bubbler_core::launcher;
 use clap::{Parser, Subcommand};
 
@@ -25,7 +25,8 @@ struct Cli {
 enum Cmd {
     /// Create a new instance from a built-in profile.
     Create {
-        /// Instance name: letters, digits, `.`, `_`, `-`.
+        /// Instance name: letters, digits, `.`, `_`, `-`; not `.`, `..`
+        /// or a name starting with `-`.
         name: String,
         /// Built-in profile to seed config.kdl from.
         #[arg(long, default_value = "generic")]
@@ -56,24 +57,23 @@ fn main() -> ExitCode {
     }
 }
 
-fn write_argv(out: &mut dyn Write, argv: &[OsString]) -> io::Result<()> {
-    out.write_all(b"bwrap\n")?;
-    for a in argv {
-        out.write_all(a.as_bytes())?;
+fn write_lines(out: &mut dyn Write, lines: &[&OsStr]) -> io::Result<()> {
+    for l in lines {
+        out.write_all(l.as_bytes())?;
         out.write_all(b"\n")?;
     }
     out.flush()
 }
 
-/// Print the argv one element per line, byte for byte: argv is not UTF-8
+/// Print one line per element, byte for byte: argv and paths are not UTF-8
 /// and a lossy rendering would not be the audit trail it claims to be. A
 /// reader that closed the pipe early (`| head`) is a normal end, not a
 /// failure.
-fn print_argv(argv: &[OsString]) -> Result<i32> {
-    match write_argv(&mut io::stdout().lock(), argv) {
+fn print_lines(lines: &[&OsStr], what: &str) -> Result<i32> {
+    match write_lines(&mut io::stdout().lock(), lines) {
         Ok(()) => Ok(0),
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(0),
-        Err(e) => Err(e).context("writing the bwrap argv"),
+        Err(e) => Err(e).with_context(|| format!("writing {what}")),
     }
 }
 
@@ -84,21 +84,26 @@ fn real_main() -> Result<i32> {
         Cmd::Create { name, profile } => {
             let inst = Instance::create(&env, &name, &profile)
                 .with_context(|| format!("creating instance `{name}`"))?;
-            println!("{}", inst.dir.display());
-            Ok(0)
+            print_lines(&[inst.dir.as_os_str()], "the instance directory")
         }
         Cmd::Run {
             name,
             dry_run,
             command,
         } => {
-            let inst = Instance::open(&env, &name)
-                .with_context(|| format!("opening instance `{name}`"))?;
+            let inst = Instance::open(&env, &name).with_context(|| {
+                format!(
+                    "opening instance `{name}` ({})",
+                    instance::config_path(&env, &name).display()
+                )
+            })?;
             let command = (!command.is_empty()).then_some(command.as_slice());
             if dry_run {
                 let argv = launcher::build_argv(&env, &inst, command)
                     .context("building bwrap arguments")?;
-                return print_argv(&argv);
+                let mut lines = vec![OsStr::new("bwrap")];
+                lines.extend(argv.iter().map(OsString::as_os_str));
+                return print_lines(&lines, "the bwrap argv");
             }
             if inst.has_service(&Service::X11) {
                 eprintln!("bubbler: warning: x11 grants no isolation between X clients");
@@ -107,10 +112,9 @@ fn real_main() -> Result<i32> {
                 .with_context(|| format!("running instance `{name}`"))
         }
         Cmd::List => {
-            for n in Instance::list(&env).context("listing instances")? {
-                println!("{n}");
-            }
-            Ok(0)
+            let names = Instance::list(&env).context("listing instances")?;
+            let lines: Vec<&OsStr> = names.iter().map(OsStr::new).collect();
+            print_lines(&lines, "the instance list")
         }
     }
 }

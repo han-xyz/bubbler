@@ -34,7 +34,9 @@ impl BwrapArgs {
     /// the same path as on the host and mode 0700 (`--perms` applies to the
     /// next operation only, so it must immediately precede `--dir`), cleared
     /// environment with only locale/terminal passthrough. Services relax
-    /// this explicitly.
+    /// this explicitly. `--unshare-all` uses bwrap's `-try` semantics for
+    /// the user namespace (`bwrap(1)`), so on a host without unprivileged
+    /// user namespaces the sandbox may start without one; to be revisited.
     pub fn baseline(env: &Env, instance_home: &Path) -> Self {
         let mut a = Self {
             namespaces: Vec::new(),

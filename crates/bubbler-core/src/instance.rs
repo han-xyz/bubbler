@@ -12,15 +12,24 @@ use crate::env::Env;
 use crate::error::InstanceError;
 use crate::profile;
 
+const CONFIG_FILE: &str = "config.kdl";
+
 /// Directory holding all instances.
 pub fn instances_root(env: &Env) -> PathBuf {
     env.data_home.join("bubbler").join("instances")
 }
 
+/// Where `name`'s configuration would live, without opening the instance,
+/// so a caller can name the file in an error message.
+pub fn config_path(env: &Env, name: &str) -> PathBuf {
+    instances_root(env).join(name).join(CONFIG_FILE)
+}
+
 /// A created instance with its parsed configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Instance {
-    /// Validated name (`[A-Za-z0-9._-]+`, not `.` or `..`).
+    /// Validated name: `[A-Za-z0-9._-]+`, not starting with `-`, and not
+    /// `.` or `..`.
     pub name: String,
     /// `<instances_root>/<name>`.
     pub dir: PathBuf,
@@ -28,10 +37,13 @@ pub struct Instance {
     pub config: InstanceConfig,
 }
 
+// A leading `-` is rejected as well: such a name is a valid directory but
+// every CLI that takes it would read it as an option.
 fn validate_name(name: &str) -> Result<(), InstanceError> {
     let ok = !name.is_empty()
         && name != "."
         && name != ".."
+        && !name.starts_with('-')
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-');
@@ -54,7 +66,7 @@ impl Instance {
 
     /// Path of `config.kdl`.
     pub fn config_path(&self) -> PathBuf {
-        self.dir.join("config.kdl")
+        self.dir.join(CONFIG_FILE)
     }
 
     /// Create a new instance seeded from a built-in profile. Fails if the
@@ -74,7 +86,7 @@ impl Instance {
         let home = dir.join("home");
         rustix::fs::mkdir(&home, Mode::RWXU)
             .map_err(|e| InstanceError::Io(home.clone(), e.into()))?;
-        let cfg_path = dir.join("config.kdl");
+        let cfg_path = dir.join(CONFIG_FILE);
         fs::write(&cfg_path, text).map_err(io_err(&cfg_path))?;
         Ok(Self {
             name: name.to_owned(),
@@ -87,7 +99,7 @@ impl Instance {
     pub fn open(env: &Env, name: &str) -> Result<Self, InstanceError> {
         validate_name(name)?;
         let dir = instances_root(env).join(name);
-        let cfg_path = dir.join("config.kdl");
+        let cfg_path = dir.join(CONFIG_FILE);
         let text = match fs::read_to_string(&cfg_path) {
             Ok(t) => t,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -116,7 +128,7 @@ impl Instance {
             let entry = entry.map_err(io_err(&root))?;
             if let Some(n) = entry.file_name().to_str()
                 && validate_name(n).is_ok()
-                && entry.path().join("config.kdl").is_file()
+                && entry.path().join(CONFIG_FILE).is_file()
             {
                 names.push(n.to_owned());
             }
@@ -202,7 +214,7 @@ mod tests {
             Instance::open(&env, "zz"),
             Err(InstanceError::NotFound(_))
         ));
-        for bad in ["", ".", "..", "a/b", "a b", "é"] {
+        for bad in ["", ".", "..", "-x", "a/b", "a b", "é"] {
             assert!(
                 matches!(
                     Instance::create(&env, bad, "generic"),

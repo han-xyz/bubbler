@@ -47,8 +47,9 @@ fn mkdir_private(dir: &Path) -> Result<(), LaunchError> {
     }
 }
 
-/// Ensure `$XDG_RUNTIME_DIR/bubbler/<name>/` exists with mode 0700. Not a
-/// lock; concurrent runs of one instance are allowed.
+/// Create `$XDG_RUNTIME_DIR/bubbler/<name>/` with mode 0700; an existing
+/// directory is reused as is. Not a lock; concurrent runs of one instance
+/// are allowed.
 pub fn prepare_runtime_dir(env: &Env, inst: &Instance) -> Result<PathBuf, LaunchError> {
     // Each level is created 0700 outright rather than created wide and
     // narrowed afterwards; a missing $XDG_RUNTIME_DIR is created, but its
