@@ -164,11 +164,15 @@ pub fn host_stdio() -> Result<[OwnedFd; 3], LaunchError> {
     Ok([dup(i.as_fd())?, dup(o.as_fd())?, dup(e.as_fd())?])
 }
 
+/// What to call each of bubbler's own stdio fds in a message: the relay
+/// carries the output on dups of them, whose numbers name nothing the
+/// user has heard of.
+pub const FD_NAMES: [&str; 3] = ["stdin", "stdout", "stderr"];
+
 /// Which of bubbler's fds the pty's output goes back out on: the first of
 /// 1, 2 and 0 the pty stands in for, so output still reaches the terminal
 /// when stdout alone is redirected. `None` when there is no pty, or when
-/// the only candidate cannot be written to: `bubbler run x < /dev/tty` is
-/// a terminal opened read-only, and every write to it would fail.
+/// the only candidate is a terminal opened read-only.
 pub fn output_fd(plan: &StdioPlan, host: &[OwnedFd; 3]) -> Option<usize> {
     [1, 2, 0]
         .into_iter()
@@ -199,10 +203,10 @@ pub fn plan(mode: TtyMode, is_tty: [bool; 3]) -> StdioPlan {
 }
 
 /// Allocate a pty and copy `host_tty`'s settings and size onto its slave,
-/// so the erase key, `IUTF8` and the window size the user has apply
-/// inside the sandbox. `host_tty` must be a terminal (`ENOTTY` otherwise)
-/// and must still be in its normal mode: called after [`RawGuard::new`]
-/// this would hand the sandbox a raw pty, with no echo and no line editing.
+/// so the erase key, `IUTF8` and the window size the user has apply inside
+/// the sandbox. `host_tty` must be a terminal, and not yet in raw mode.
+// After `RawGuard::new` this would hand the sandbox a raw pty instead,
+// with no echo and no line editing.
 pub fn allocate(host_tty: BorrowedFd<'_>) -> Result<Pty, LaunchError> {
     let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
     let master = openpt(flags).map_err(pty_error)?;
@@ -334,6 +338,7 @@ pub fn relay(
     master: BorrowedFd<'_>,
     host_in: Option<BorrowedFd<'_>>,
     host_out: BorrowedFd<'_>,
+    out_name: &str,
     sink: BorrowedFd<'_>,
     until: &mut dyn FnMut() -> Option<i32>,
     winch: &AtomicBool,
@@ -351,7 +356,7 @@ pub fn relay(
     loop {
         if let Some(code) = until() {
             if output {
-                drain(master, out, sink);
+                drain(master, out, sink, out_name);
             }
             return Ok(RelayEnd::Exited(code));
         }
@@ -427,7 +432,7 @@ pub fn relay(
                 // still due, and its pty must go on being emptied.
                 Ok(n) => {
                     if let Err(e) = write_all(out, &buf[..n]) {
-                        output = redirect(&mut out, sink, e);
+                        output = redirect(&mut out, sink, e, out_name);
                     }
                 }
                 Err(Errno::AGAIN) | Err(Errno::INTR) => {}
@@ -442,7 +447,7 @@ pub fn relay(
 /// Move what the pty still holds to the host, for at most [`DRAIN`]:
 /// the status arrives before the last output has been read out. Nothing
 /// here is worth failing a finished run over, so every error just ends it.
-fn drain(master: BorrowedFd<'_>, host_out: BorrowedFd<'_>, sink: BorrowedFd<'_>) {
+fn drain(master: BorrowedFd<'_>, host_out: BorrowedFd<'_>, sink: BorrowedFd<'_>, name: &str) {
     let deadline = Instant::now() + DRAIN;
     let mut out = host_out;
     let mut buf = [0u8; CHUNK];
@@ -464,7 +469,7 @@ fn drain(master: BorrowedFd<'_>, host_out: BorrowedFd<'_>, sink: BorrowedFd<'_>)
             Ok(0) => return,
             Ok(n) => {
                 if let Err(e) = write_all(out, &buf[..n])
-                    && !redirect(&mut out, sink, e)
+                    && !redirect(&mut out, sink, e, name)
                 {
                     return;
                 }
@@ -483,12 +488,12 @@ fn drain(master: BorrowedFd<'_>, host_out: BorrowedFd<'_>, sink: BorrowedFd<'_>)
 /// reader that left early (`bubbler run ... | head`) cannot leave the
 /// command blocked on a full pipe.
 pub fn pump(
-    pipes: &[(BorrowedFd<'_>, BorrowedFd<'_>)],
+    pipes: &[(BorrowedFd<'_>, BorrowedFd<'_>, &str)],
     sink: BorrowedFd<'_>,
     until: &mut dyn FnMut() -> Option<i32>,
 ) -> Result<i32, LaunchError> {
     let mut open = vec![true; pipes.len()];
-    let mut dest: Vec<BorrowedFd<'_>> = pipes.iter().map(|(_, to)| *to).collect();
+    let mut dest: Vec<BorrowedFd<'_>> = pipes.iter().map(|(_, to, _)| *to).collect();
     let mut buf = [0u8; CHUNK];
     let mut exited: Option<(i32, Instant)> = None;
     loop {
@@ -530,7 +535,7 @@ pub fn pump(
                 // the sink, and this pipe keeps being emptied.
                 Ok(n) => {
                     if let Err(e) = write_all(dest[i], &buf[..n]) {
-                        open[i] = redirect(&mut dest[i], sink, e);
+                        open[i] = redirect(&mut dest[i], sink, e, pipes[i].2);
                     }
                 }
                 Err(Errno::AGAIN) | Err(Errno::INTR) => {}
@@ -581,12 +586,12 @@ fn write_all(fd: BorrowedFd<'_>, mut buf: &[u8]) -> Result<(), Errno> {
 }
 
 /// Send what `dest` would not take to `sink` from now on, and say so
-/// once. `false` when `dest` already was the sink: there is nowhere left
-/// to put the output, and the copy stops.
+/// once, calling it `what`. `false` when `dest` already was the sink:
+/// there is nowhere left to put the output, and the copy stops.
 ///
 /// Reading the sandbox side has to go on either way — a pty or a pipe
 /// nobody empties fills up, and the command blocks in `write` forever.
-fn redirect<'a>(dest: &mut BorrowedFd<'a>, sink: BorrowedFd<'a>, e: Errno) -> bool {
+fn redirect<'a>(dest: &mut BorrowedFd<'a>, sink: BorrowedFd<'a>, e: Errno, what: &str) -> bool {
     if dest.as_raw_fd() == sink.as_raw_fd() {
         return false;
     }
@@ -595,8 +600,7 @@ fn redirect<'a>(dest: &mut BorrowedFd<'a>, sink: BorrowedFd<'a>, e: Errno) -> bo
     // on.
     let _ = writeln!(
         std::io::stderr(),
-        "bubbler: output to fd {} failed: {}; discarding further output",
-        dest.as_raw_fd(),
+        "bubbler: output to {what} failed: {}; discarding further output",
         std::io::Error::from(e)
     );
     *dest = sink;
@@ -687,6 +691,7 @@ mod tests {
                 master.as_fd(),
                 host_in.as_ref().map(|f| f.as_fd()),
                 host_out.as_fd(),
+                FD_NAMES[1],
                 sink.as_fd(),
                 &mut until,
                 &w,
@@ -900,7 +905,7 @@ mod tests {
         });
         let mut until = || done.load(Ordering::SeqCst).then_some(3);
         let code = pump(
-            &[(read_end.as_fd(), gone.as_fd())],
+            &[(read_end.as_fd(), gone.as_fd(), FD_NAMES[1])],
             sink.as_fd(),
             &mut until,
         )
@@ -975,6 +980,7 @@ mod tests {
             master.as_fd(),
             None,
             host_out.as_fd(),
+            FD_NAMES[1],
             sink.as_fd(),
             &mut until,
             &winch,
@@ -1024,8 +1030,8 @@ mod tests {
         let sink = null_stdio().unwrap();
         let code = pump(
             &[
-                (r_out.as_fd(), host_out.as_fd()),
-                (r_err.as_fd(), host_err.as_fd()),
+                (r_out.as_fd(), host_out.as_fd(), FD_NAMES[1]),
+                (r_err.as_fd(), host_err.as_fd(), FD_NAMES[2]),
             ],
             sink.as_fd(),
             &mut until,
@@ -1047,7 +1053,7 @@ mod tests {
         // ends this; what was already written must still arrive.
         let sink = null_stdio().unwrap();
         let code = pump(
-            &[(read_end.as_fd(), host_out.as_fd())],
+            &[(read_end.as_fd(), host_out.as_fd(), FD_NAMES[1])],
             sink.as_fd(),
             &mut until,
         )

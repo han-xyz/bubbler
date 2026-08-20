@@ -247,7 +247,8 @@ pub fn build_argv(
 
 /// Load `set` into the sandbox as one program per error it uses, or say
 /// on stderr that this instance runs unfiltered. A profile asking for no
-/// filter is honoured, but never silently.
+/// filter is honoured, but never silently — and one whose `allow` list
+/// leaves nothing to deny asked for the same thing the long way round.
 fn apply_seccomp(
     args: &mut BwrapArgs,
     set: Option<seccomp::RuleSet>,
@@ -258,7 +259,11 @@ fn apply_seccomp(
         eprintln!("bubbler: seccomp disabled for instance {instance}");
         return Ok(());
     };
-    for program in seccomp::compile(&set, env.seccomp_log)? {
+    let programs = seccomp::compile(&set, env.seccomp_log)?;
+    if programs.is_empty() {
+        eprintln!("bubbler: seccomp has no rules left for instance {instance}");
+    }
+    for program in programs {
         args.add_seccomp(program);
     }
     Ok(())
@@ -342,8 +347,7 @@ impl Drop for ProxyHandle {
 
 /// Wait for the sidecar's ready byte, which says it has bound its socket
 /// and is accepting connections. False when the deadline passes, the pipe
-/// reaches EOF or the child is gone: in each case nothing is listening on
-/// the socket the sandbox is about to bind.
+/// reaches EOF or the child is gone: nothing is listening either way.
 fn wait_ready(ready: &OwnedFd, child: &mut Child, deadline: Instant) -> bool {
     let mut byte = [0u8; 1];
     loop {
@@ -374,8 +378,7 @@ fn wait_ready(ready: &OwnedFd, child: &mut Child, deadline: Instant) -> bool {
 
 /// Start the filtering D-Bus proxy for an instance in its own sandbox and
 /// wait for it to report readiness, so the socket exists before the
-/// instance's own bwrap binds it. The returned handle must stay alive for
-/// as long as the sandbox runs.
+/// instance's own bwrap binds it. The handle must outlive the sandbox.
 pub fn start_proxy(
     env: &Env,
     dir: &Path,
@@ -580,8 +583,8 @@ fn json_object_end(buf: &[u8]) -> Option<usize> {
 
 /// Read the info pipe until bwrap has reported a whole document with
 /// `child-pid` in it, or until the deadline, EOF or the child's own exit
-/// says it never will. The bytes come back as bwrap wrote them: portals
-/// read that same document out of `bwrapinfo.json`.
+/// says it never will. The bytes come back as bwrap wrote them.
+// Portals read that same document back out of `bwrapinfo.json`.
 fn read_sandbox_info(
     info: &OwnedFd,
     child: &mut Child,
@@ -673,9 +676,8 @@ impl Drop for FileGuard {
 }
 
 /// Removes this run's `$XDG_RUNTIME_DIR/.flatpak/bubbler-<instance>` when
-/// the run leaves, on every path. Only that entry, and only one this run
-/// created: the `.flatpak` directory above it is shared with flatpak and
-/// holds other sandboxes' instances.
+/// the run leaves, on every path — only that entry, and only one this run
+/// created: the `.flatpak` directory above it is shared with flatpak.
 struct FlatpakGuard(PathBuf);
 
 impl Drop for FlatpakGuard {
@@ -856,7 +858,7 @@ fn wait_pumping(
     child: &mut Child,
     stop: &AtomicBool,
     supervisor: Option<Pid>,
-    pipes: &[(BorrowedFd<'_>, BorrowedFd<'_>)],
+    pipes: &[(BorrowedFd<'_>, BorrowedFd<'_>, &str)],
     sink: BorrowedFd<'_>,
 ) -> Result<i32, LaunchError> {
     let mut failed = None;
@@ -870,13 +872,14 @@ fn wait_pumping(
     }
 }
 
-/// The host side of a relayed run: what the user types, which only
-/// reaches the pty when the sandbox reads through it; where the pty's
-/// output goes; and where it is drained when nothing of bubbler's can
-/// take that output, or after a detach.
+/// The host side of a relayed run: what the user types, where the pty's
+/// output goes, and where that output is drained instead when nothing of
+/// bubbler's can take it, or after a detach.
 struct RelayEnds<'a> {
     input: Option<BorrowedFd<'a>>,
     output: BorrowedFd<'a>,
+    /// What to call `output` when it stops taking the sandbox's output.
+    out_name: &'static str,
     sink: BorrowedFd<'a>,
 }
 
@@ -903,6 +906,7 @@ fn wait_relaying(
             master,
             ends.input,
             ends.output,
+            ends.out_name,
             ends.sink,
             &mut until,
             winch,
@@ -922,7 +926,15 @@ fn wait_relaying(
             }
             eprintln!("{}", tty::DETACHED_NOTE);
             let mut until = until_exit(child, stop, supervisor, &mut failed);
-            match tty::relay(master, None, ends.sink, ends.sink, &mut until, winch)? {
+            match tty::relay(
+                master,
+                None,
+                ends.sink,
+                ends.out_name,
+                ends.sink,
+                &mut until,
+                winch,
+            )? {
                 RelayEnd::Exited(code) => code,
                 // Nothing is read from the user any more, so there is
                 // nothing left that could ask to detach.
@@ -1066,10 +1078,17 @@ pub fn run(
     let code = match &master {
         Some(master) => {
             let out = tty::output_fd(&stdio, &host);
-            let host_out = out.map_or(sink.as_fd(), |i| host[i].as_fd());
+            // With nothing of the user's able to take the output it goes
+            // to the sink, which never refuses it, so the name is never
+            // printed.
+            let (host_out, out_name) = match out {
+                Some(i) => (host[i].as_fd(), tty::FD_NAMES[i]),
+                None => (sink.as_fd(), tty::FD_NAMES[1]),
+            };
             let ends = RelayEnds {
                 input: stdio.ctty().then(|| host[0].as_fd()),
                 output: host_out,
+                out_name,
                 sink: sink.as_fd(),
             };
             wait_relaying(
@@ -1083,9 +1102,9 @@ pub fn run(
             )
         }
         None if !pipes.is_empty() => {
-            let ends: Vec<(BorrowedFd<'_>, BorrowedFd<'_>)> = pipes
+            let ends: Vec<(BorrowedFd<'_>, BorrowedFd<'_>, &str)> = pipes
                 .iter()
-                .map(|(read, i)| (read.as_fd(), host[*i].as_fd()))
+                .map(|(read, i)| (read.as_fd(), host[*i].as_fd(), tty::FD_NAMES[*i]))
                 .collect();
             wait_pumping(&mut child, &stop, supervisor, &ends, sink.as_fd())
         }

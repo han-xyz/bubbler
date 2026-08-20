@@ -188,11 +188,18 @@ pub fn run_in(
         match &master {
             Some(master) => {
                 let out = tty::output_fd(&plan, &host);
-                let host_out = out.map_or(sink.as_fd(), |i| host[i].as_fd());
+                // With nothing of the user's able to take the output it
+                // goes to the sink, which never refuses it, so the name
+                // is never printed.
+                let (host_out, out_name) = match out {
+                    Some(i) => (host[i].as_fd(), tty::FD_NAMES[i]),
+                    None => (sink.as_fd(), tty::FD_NAMES[1]),
+                };
                 tty::relay(
                     master.as_fd(),
                     plan.ctty().then(|| host[0].as_fd()),
                     host_out,
+                    out_name,
                     sink.as_fd(),
                     &mut until,
                     &winch,
@@ -201,7 +208,7 @@ pub fn run_in(
             None if !pipes.is_empty() => {
                 let ends: Vec<_> = pipes
                     .iter()
-                    .map(|(read, i)| (read.as_fd(), host[*i].as_fd()))
+                    .map(|(read, i)| (read.as_fd(), host[*i].as_fd(), tty::FD_NAMES[*i]))
                     .collect();
                 tty::pump(&ends, sink.as_fd(), &mut until)?;
                 RelayEnd::Exited(0)

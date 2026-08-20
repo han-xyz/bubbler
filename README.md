@@ -5,9 +5,9 @@ combining bubblejail's explicit instances and resource grants with a profile
 library in the spirit of firejail. bubbler itself is unprivileged; `bwrap`
 does the namespace work.
 
-Status: milestone 3, plus milestone 4's isolated terminal — the `alacritty`
-and `firefox` profiles run, with GPU, sound, a private home and a filtered
-session bus. See "Known gaps" below.
+Status: milestone 4 — the `alacritty` and `firefox` profiles run, with GPU,
+sound, a private home, a filtered session bus, a terminal of their own and a
+seccomp denylist. See "Known gaps" below.
 
 ## Usage
 
@@ -226,6 +226,13 @@ redirected there is no `/dev/console` at all. Your terminal is in raw mode
 while the sandbox runs: Ctrl-C and the erase key are bytes for the line
 discipline inside, and a window resize is copied onto the pty.
 
+Every sandbox is started with bwrap's `--new-session`, in every mode, so it
+begins in a session of its own and inherits no controlling terminal from
+bubbler; in `pty` mode the supervisor then makes the pty the controlling
+terminal of the command's own session. The filter denies the `TIOCSTI` and
+`TIOCLINUX` ioctls on top of that (see "Seccomp"), which is what
+`bwrap(1)` recommends wherever a terminal descriptor still reaches a sandbox.
+
 `^]` (Ctrl-]) three times within a second detaches. `run` stops relaying,
 restores the terminal, prints a note and goes on waiting for the sandbox in
 silence, since leaving would end it through `--die-with-parent` — bubbler is
@@ -248,7 +255,9 @@ fresh devpts either does not have or has since handed to a different pty, so
 anything resolving its terminal by that path is misled. `ttyname` then falls
 back to searching `/dev`, where it finds the console bind: `tty` inside
 prints `/dev/console` when bubbler's stdout is a terminal, and fails with
-`ttyname error: No such device` when nothing is bound there. A program that
+`ttyname error: No such device` when nothing is bound there — and in an
+`exec`'d command, whose pty is one of its own that `/dev/console` does not
+name, it fails that way even while the run's terminal is bound. A program that
 wants a real `/dev/pts` entry — `script`, `wall`, `sudo` with tty tickets —
 can fail either way; `tty "passthrough"` is the way out if an application
 needs it.
@@ -298,12 +307,17 @@ argument rules, so it re-enables `TIOCSTI` and `TIOCLINUX` for that instance —
 do not reach for it to fix an unrelated `ioctl`. `deny "ioctl"` replaces those
 two rules with one that matches every request, which breaks nearly every
 program. `disable` prints `bubbler: seccomp disabled for instance <name>` on
-each run, so an unfiltered sandbox is never a quiet one.
+each run, so an unfiltered sandbox is never a quiet one; an `allow` list that
+takes back every rule leaves nothing to load and says
+`bubbler: seccomp has no rules left for instance <name>` for the same reason.
 
-`BUBBLER_SECCOMP_LOG=1` compiles the same rules with the log action instead:
-a call that would have been denied is written to the audit log and then
-succeeds. It is for finding over-denies while writing a profile, and it leaves
-the sandbox without a filter.
+`BUBBLER_SECCOMP_LOG=1` compiles the same rules with the log action instead.
+The programs are loaded as always, but a call that would have been denied is
+written to the kernel audit log and then succeeds — so the sandbox runs
+unrestricted while it says what it would have lost. It is for finding
+over-denies while writing a profile, not for running with. It also names, once
+per run, the default list's syscalls this architecture never had, which are
+skipped rather than compiled.
 
 The filter carries the architecture bubbler was built for, and a syscall made
 from any other ABI is killed rather than allowed — a 32-bit (i386) binary

@@ -3,6 +3,7 @@
 //! `seccomp` node produces, and the BPF programs it compiles into.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rustix::io::Errno as OsErrno;
 use seccompiler::{
@@ -64,8 +65,8 @@ pub const DEFAULT_EPERM: &[&str] = &[
 
 /// Syscalls the default filter answers with `ENOSYS`, so libc falls back
 /// to the older call instead of failing: seccomp cannot inspect `clone3`'s
-/// `clone_args` struct, and the new mount API can rewrite the sandbox's
-/// own VFS (CVE-2021-41133).
+/// `clone_args`, and the new mount API can rewrite the sandbox's own VFS.
+// The mount API hole is CVE-2021-41133.
 pub const DEFAULT_ENOSYS: &[&str] = &[
     "clone3",
     "open_tree",
@@ -139,9 +140,8 @@ impl RuleSet {
     }
 
     /// The default set with `cfg`'s allows removed and its denies appended,
-    /// or `None` when the profile disabled the filter. `allow "ioctl"` is
-    /// the only way to take back the [`DEFAULT_IOCTL_EPERM`] rules, and
-    /// `deny "ioctl"` replaces them with a rule matching every request.
+    /// or `None` when the profile disabled the filter. Naming `ioctl` in
+    /// either list drops the [`DEFAULT_IOCTL_EPERM`] rules.
     pub fn with(cfg: &SeccompConfig) -> Option<Self> {
         if cfg.disable {
             return None;
@@ -192,19 +192,29 @@ const TARGET: TargetArch = TargetArch::riscv64;
 /// to the filter but still is to the driver.
 const REQUEST_MASK: u64 = 0xFFFF_FFFF;
 
-/// The rule set as loadable BPF, one program per error it uses (`EPERM`
-/// first, then `ENOSYS`), each ready to be handed to `--add-seccomp-fd`.
-/// Everything not named is allowed. `log` turns matches into audit log
-/// entries instead of errors, for finding over-denies while writing a
-/// profile. Names this architecture never had are skipped.
+/// Set by the first compile that could report skipped names. Which names
+/// those are follows from the build, not from the launch, so an instance
+/// that also starts a proxy sidecar would otherwise say it all twice.
+static NOTED: AtomicBool = AtomicBool::new(false);
+
+/// Whether this compile is the one that reports the skipped names.
+fn take_note(log: bool, noted: &AtomicBool) -> bool {
+    log && !noted.swap(true, Ordering::Relaxed)
+}
+
+/// The rule set as loadable BPF for `--add-seccomp-fd`, one program per
+/// error it uses (`EPERM` first, then `ENOSYS`). Everything not named is
+/// allowed, names this architecture never had are skipped, and `log`
+/// turns matches into audit log entries instead of errors.
 pub fn compile(set: &RuleSet, log: bool) -> Result<Vec<Vec<u8>>, LaunchError> {
+    let note = take_note(log, &NOTED);
     let groups = [
         (&set.eperm, OsErrno::PERM, set.ioctl_eperm.as_slice()),
         (&set.enosys, OsErrno::NOSYS, &[][..]),
     ];
     let mut out = Vec::new();
     for (names, errno, ioctl) in groups {
-        let rules = rules_for(names, ioctl, log)?;
+        let rules = rules_for(names, ioctl, note)?;
         if rules.is_empty() {
             continue;
         }
@@ -227,8 +237,7 @@ pub fn compile(set: &RuleSet, log: bool) -> Result<Vec<Vec<u8>>, LaunchError> {
 /// One error's rules keyed by syscall number: an empty rule chain matches
 /// the syscall whatever its arguments are, and the `ioctl` requests in
 /// `ioctl_eperm` become one argument-filtered rule each. `note` reports
-/// skipped names on stderr; it is the same switch that turns the filter
-/// into an audit log, since both exist to explain what a profile got.
+/// the names skipped on this architecture on stderr.
 fn rules_for(
     names: &[String],
     ioctl_eperm: &[u32],
@@ -1659,6 +1668,16 @@ mod tests {
         let programs = compile(&set, false).unwrap();
         let names = ABSENT_HERE.iter().filter(|n| **n == "vm86old").count();
         assert_eq!(instructions(&programs[0]).len(), 5 + (2 - names) * 5);
+    }
+
+    #[test]
+    fn the_names_this_architecture_lacks_are_reported_once_per_process() {
+        let noted = AtomicBool::new(false);
+        // Off without the log switch, and then only for the first compile:
+        // an instance with a D-Bus proxy compiles twice.
+        assert!(!take_note(false, &noted));
+        assert!(take_note(true, &noted));
+        assert!(!take_note(true, &noted));
     }
 
     #[test]

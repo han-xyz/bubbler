@@ -7,7 +7,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use bubbler_core::bwrap::ETC_ALLOWLIST;
-use bubbler_core::seccomp::syscall_number;
+use bubbler_core::seccomp::{DEFAULT_ENOSYS, DEFAULT_EPERM, syscall_number};
 use common::{
     bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, real_init, require_bwrap, require_dbus,
     require_portal, require_python, test_pty,
@@ -1750,7 +1750,8 @@ fn real_bwrap_run_with_tty_none_outlives_a_reader_that_leaves() {
     }
     let out = run.wait_with_output().expect("collecting stderr");
     let err = String::from_utf8_lossy(&out.stderr);
-    // Truncation is not silent.
+    // Truncation is not silent, and it names the fd the user knows.
+    assert!(err.contains("bubbler: output to stdout failed"), "{err:?}");
     assert!(err.contains("discarding further output"), "{err:?}");
 }
 
@@ -2074,6 +2075,41 @@ fn probe_in(name: &str, config: &str) -> Option<(String, String)> {
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(out.status.success(), "{stderr}");
     Some((String::from_utf8_lossy(&out.stdout).into_owned(), stderr))
+}
+
+#[test]
+fn a_filter_a_profile_emptied_is_as_loud_as_a_disabled_one() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    // Allowing every name back leaves nothing to load, which is
+    // `seccomp { disable }` taken the long way round.
+    let names: Vec<String> = DEFAULT_EPERM
+        .iter()
+        .chain(DEFAULT_ENOSYS)
+        .filter(|n| syscall_number(n).is_some())
+        .map(|n| format!("\"{n}\""))
+        .collect();
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/t/config.kdl"),
+        format!(
+            "seccomp {{ allow \"ioctl\" {} }}\ncommand \"/usr/bin/true\"\n",
+            names.join(" ")
+        ),
+    )
+    .unwrap();
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--dry-run"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("bubbler: seccomp has no rules left for instance t"),
+        "{err}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("--add-seccomp-fd"),
+        "an empty filter must load nothing"
+    );
 }
 
 #[test]
