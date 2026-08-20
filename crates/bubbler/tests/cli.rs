@@ -970,3 +970,133 @@ fn edit_prefers_visual_and_passes_editor_arguments() {
         )
     );
 }
+
+#[test]
+fn try_rejects_bad_grants_and_cleans_up_a_failed_start() {
+    let tmp = setup();
+    let out = bubbler(tmp.path())
+        .args(["try", "--grant", "bogus", "--", "/usr/bin/true"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("unknown grant `bogus`"), "{err}");
+    for grant in [
+        "wayland",
+        "x11",
+        "network",
+        "dri",
+        "pipewire",
+        "pulseaudio",
+        "dbus",
+        "portals",
+        "notify",
+    ] {
+        assert!(err.contains(grant), "{grant} missing from {err}");
+    }
+
+    let out = bubbler(tmp.path())
+        .args(["try", "--grant", "portals", "--", "/usr/bin/true"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("requires dbus"), "{err}");
+
+    // No command anywhere: the failure happens after the directory exists,
+    // so it also shows the guard cleaning up.
+    let out = bubbler(tmp.path()).arg("try").output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("no command"), "{err}");
+    let left: Vec<_> = std::fs::read_dir(tmp.path().join("data/bubbler/try"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn real_bwrap_try_grants_network_and_leaves_nothing_behind() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let out = bubbler_live(tmp.path(), &init)
+        .args([
+            "try",
+            "--grant",
+            "network",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            "cat /etc/resolv.conf",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.stdout.is_empty());
+    let left: Vec<_> = std::fs::read_dir(tmp.path().join("data/bubbler/try"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+    let left: Vec<_> = std::fs::read_dir(tmp.path().join("run/bubbler"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn real_bwrap_try_leaves_no_instance_unless_kept() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["try", "--", "/usr/bin/true"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = bubbler_live(tmp.path(), &init)
+        .arg("list")
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["try", "--keep", "kept", "--", "/usr/bin/false"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let out = bubbler_live(tmp.path(), &init)
+        .arg("list")
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "kept\n");
+    assert!(tmp.path().join("data/bubbler/instances/kept/home").is_dir());
+
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["try", "--keep", "kept", "--", "/usr/bin/true"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("already exists"), "{err}");
+    assert!(
+        tmp.path()
+            .join("data/bubbler/instances/kept/config.kdl")
+            .is_file()
+    );
+}

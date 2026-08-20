@@ -18,6 +18,9 @@ sound and a private home. See "Known gaps" below.
     bubbler run ff -- firefox --version   # or run something else inside
     bubbler run ff --dry-run              # print the bwrap argv, do not launch
     bubbler exec ff -- firefox --version  # run inside the instance already running
+    bubbler try -- id                     # throwaway sandbox, nothing kept
+    bubbler try --profile firefox --grant network -- firefox --version
+    bubbler try --keep scratch -- sh      # keep it afterwards as instance `scratch`
     bubbler list
     bubbler delete ff --yes               # instance and private home; irreversible
 
@@ -35,6 +38,16 @@ execs into it instead of starting a second sandbox; configuration changes
 apply on the next start. An exec'd process is given bubbler's own stdin,
 stdout and stderr, so the channel is for tooling and debugging, not an extra
 boundary.
+
+`try` runs one command in a sandbox without creating an instance. Its config is
+the profile text (`generic` unless `--profile` says otherwise) plus one bare
+node per `--grant`; the grants are `wayland`, `x11`, `network`, `dri`,
+`pipewire`, `pulseaudio`, `dbus`, `portals` and `notify`, and anything with
+arguments needs a real instance. The sandbox lives in
+`$XDG_DATA_HOME/bubbler/try/<pid>/`, never appears in `list`, and is removed
+when the command exits whatever its status; `--keep <name>` renames it into an
+instance instead, refusing a name that is taken. Directories left behind by a
+killed `bubbler` are swept on the next `try`.
 
 `SIGINT` and `SIGTERM` sent to `bubbler` are passed on once, as `SIGTERM`, to
 `bubbler-init` inside the sandbox — bwrap forwards no signals of its own, so

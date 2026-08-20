@@ -6,6 +6,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::Mode;
+use rustix::io::Errno;
+use rustix::process::{Pid, test_kill_process};
 
 use crate::config::{self, InstanceConfig, Service};
 use crate::env::Env;
@@ -14,9 +16,29 @@ use crate::profile;
 
 const CONFIG_FILE: &str = "config.kdl";
 
+/// Service names [`Instance::ephemeral`] accepts as grants: the bare
+/// config nodes, which take no arguments. Anything else needs a config
+/// file and therefore a real instance.
+pub const GRANTS: &[&str] = &[
+    "wayland",
+    "x11",
+    "network",
+    "dri",
+    "pipewire",
+    "pulseaudio",
+    "dbus",
+    "portals",
+    "notify",
+];
+
 /// Directory holding all instances.
 pub fn instances_root(env: &Env) -> PathBuf {
     env.data_home.join("bubbler").join("instances")
+}
+
+/// Directory holding throwaway instances, one per bubbler pid.
+fn try_root(env: &Env) -> PathBuf {
+    env.data_home.join("bubbler").join("try")
 }
 
 /// Where `name`'s configuration would live, without opening the instance,
@@ -73,6 +95,117 @@ fn io_err(path: &Path) -> impl FnOnce(io::Error) -> InstanceError + '_ {
     move |e| InstanceError::Io(path.to_path_buf(), e)
 }
 
+/// Lay out an instance directory: `dir` itself (never overwriting one),
+/// a private `home/` and `config.kdl` holding `text`. `name` only names
+/// the instance in the "already exists" error.
+fn make_dir(dir: &Path, name: &str, text: &str) -> Result<(), InstanceError> {
+    if let Some(parent) = dir.parent() {
+        fs::create_dir_all(parent).map_err(io_err(parent))?;
+    }
+    fs::create_dir(dir).map_err(|e| match e.kind() {
+        io::ErrorKind::AlreadyExists => InstanceError::AlreadyExists(name.to_owned()),
+        _ => InstanceError::Io(dir.to_path_buf(), e),
+    })?;
+    let home = dir.join("home");
+    rustix::fs::mkdir(&home, Mode::RWXU).map_err(|e| InstanceError::Io(home.clone(), e.into()))?;
+    let cfg_path = dir.join(CONFIG_FILE);
+    fs::write(&cfg_path, text).map_err(io_err(&cfg_path))
+}
+
+/// Profile text plus one bare node per grant. A grant the text already
+/// has as a bare line is skipped: the parser rejects duplicates.
+fn with_grants(text: &str, grants: &[&str]) -> Result<String, InstanceError> {
+    let mut out = text.to_owned();
+    for g in grants {
+        if !GRANTS.contains(g) {
+            return Err(InstanceError::InvalidGrant((*g).to_owned()));
+        }
+        if out.lines().any(|l| l.trim() == *g) {
+            continue;
+        }
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(g);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// Remove `try/<pid>` directories whose bubbler is gone, so a crash does
+/// not leave a private home behind for good. Best effort: a directory
+/// that cannot be removed is reported, never fatal.
+pub fn sweep_stale(env: &Env) {
+    let root = try_root(env);
+    let Ok(entries) = fs::read_dir(&root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<i32>().ok())
+            .and_then(Pid::from_raw)
+        else {
+            continue;
+        };
+        if test_kill_process(pid) != Err(Errno::SRCH) {
+            continue;
+        }
+        if let Err(e) = fs::remove_dir_all(entry.path()) {
+            eprintln!("bubbler: {}: {e}", entry.path().display());
+        }
+    }
+}
+
+/// A throwaway instance under `try/<pid>`, removed when this guard drops
+/// unless [`Ephemeral::keep_as`] renamed it into a real instance first.
+#[derive(Debug)]
+pub struct Ephemeral {
+    /// The instance itself; the launcher takes it like any other.
+    pub instance: Instance,
+    /// Instance name to keep the directory under, if any.
+    keep: Option<String>,
+    // `Drop` runs without an `Env`, so the paths it needs are copied here.
+    instances_root: PathBuf,
+    runtime: PathBuf,
+}
+
+impl Ephemeral {
+    /// Keep the sandbox afterwards as instance `name` instead of removing
+    /// it. The name is checked now so a run that cannot be kept never
+    /// starts.
+    pub fn keep_as(&mut self, name: &str) -> Result<(), InstanceError> {
+        validate_name(name)?;
+        fs::create_dir_all(&self.instances_root).map_err(io_err(&self.instances_root))?;
+        if fs::symlink_metadata(self.instances_root.join(name)).is_ok() {
+            return Err(InstanceError::AlreadyExists(name.to_owned()));
+        }
+        self.keep = Some(name.to_owned());
+        Ok(())
+    }
+}
+
+impl Drop for Ephemeral {
+    fn drop(&mut self) {
+        let dir = &self.instance.dir;
+        let kept = match &self.keep {
+            Some(name) => fs::rename(dir, self.instances_root.join(name)),
+            None => fs::remove_dir_all(dir),
+        };
+        // A guard cannot propagate: naming the leftover directory is all
+        // it can do about a failure here.
+        if let Err(e) = kept {
+            eprintln!("bubbler: {}: {e}", dir.display());
+        }
+        if let Err(e) = fs::remove_dir_all(&self.runtime)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            eprintln!("bubbler: {}: {e}", self.runtime.display());
+        }
+    }
+}
+
 impl Instance {
     /// Private home directory on the host, bound to `/home/bubbler` inside.
     pub fn home(&self) -> PathBuf {
@@ -91,22 +224,45 @@ impl Instance {
         let text = profile::lookup(profile_name)
             .ok_or_else(|| InstanceError::UnknownProfile(profile_name.to_owned()))?;
         let config = config::parse(text)?;
-        let root = instances_root(env);
-        let dir = root.join(name);
-        fs::create_dir_all(&root).map_err(io_err(&root))?;
-        fs::create_dir(&dir).map_err(|e| match e.kind() {
-            io::ErrorKind::AlreadyExists => InstanceError::AlreadyExists(name.to_owned()),
-            _ => InstanceError::Io(dir.clone(), e),
-        })?;
-        let home = dir.join("home");
-        rustix::fs::mkdir(&home, Mode::RWXU)
-            .map_err(|e| InstanceError::Io(home.clone(), e.into()))?;
-        let cfg_path = dir.join(CONFIG_FILE);
-        fs::write(&cfg_path, text).map_err(io_err(&cfg_path))?;
+        let dir = instances_root(env).join(name);
+        make_dir(&dir, name, text)?;
         Ok(Self {
             name: name.to_owned(),
             dir,
             config,
+        })
+    }
+
+    /// Create a throwaway instance seeded from a profile plus one bare
+    /// node per grant, named `try-<pid>` so its runtime directory is its
+    /// own. The guard removes it again when it drops.
+    pub fn ephemeral(
+        env: &Env,
+        profile_name: &str,
+        grants: &[&str],
+    ) -> Result<Ephemeral, InstanceError> {
+        sweep_stale(env);
+        let text = profile::lookup(profile_name)
+            .ok_or_else(|| InstanceError::UnknownProfile(profile_name.to_owned()))?;
+        let text = with_grants(text, grants)?;
+        let config = config::parse(&text)?;
+        let pid = std::process::id();
+        let name = format!("try-{pid}");
+        let dir = try_root(env).join(pid.to_string());
+        let runtime = env.runtime_dir.join("bubbler").join(&name);
+        // Only this process can be the live owner of try/<own pid>, so a
+        // directory there is a leftover from a bubbler whose pid was reused.
+        if let Err(e) = fs::remove_dir_all(&dir)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            return Err(InstanceError::Io(dir, e));
+        }
+        make_dir(&dir, &name, &text)?;
+        Ok(Ephemeral {
+            instance: Self { name, dir, config },
+            keep: None,
+            instances_root: instances_root(env),
+            runtime,
         })
     }
 
@@ -340,5 +496,92 @@ mod tests {
             config_path_checked(&env, "b"),
             Err(InstanceError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn ephemeral_is_removed_on_drop_and_never_listed() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut env = env(tmp.path());
+        env.runtime_dir = tmp.path().join("run");
+        let pid = std::process::id();
+        let run = env.runtime_dir.join("bubbler").join(format!("try-{pid}"));
+        let dir = {
+            let eph = Instance::ephemeral(&env, "generic", &["network"]).unwrap();
+            assert_eq!(eph.instance.name, format!("try-{pid}"));
+            assert_eq!(eph.instance.dir, try_root(&env).join(pid.to_string()));
+            assert_eq!(eph.instance.config.services, vec![Service::Network]);
+            let mode = fs::metadata(eph.instance.home())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700);
+            assert!(eph.instance.config_path().is_file());
+            assert!(Instance::list(&env).unwrap().is_empty());
+            fs::create_dir_all(&run).unwrap();
+            eph.instance.dir.clone()
+        };
+        assert!(!dir.exists());
+        assert!(!run.exists());
+    }
+
+    #[test]
+    fn keep_as_turns_a_try_into_an_instance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = env(tmp.path());
+        {
+            let mut eph = Instance::ephemeral(&env, "generic", &[]).unwrap();
+            assert!(matches!(
+                eph.keep_as("-x"),
+                Err(InstanceError::InvalidName(_))
+            ));
+            eph.keep_as("kept").unwrap();
+        }
+        assert_eq!(Instance::list(&env).unwrap(), vec!["kept".to_string()]);
+        assert!(Instance::open(&env, "kept").unwrap().home().is_dir());
+        assert!(try_root(&env).read_dir().unwrap().next().is_none());
+        let mut eph = Instance::ephemeral(&env, "generic", &[]).unwrap();
+        assert!(matches!(
+            eph.keep_as("kept"),
+            Err(InstanceError::AlreadyExists(_))
+        ));
+    }
+
+    #[test]
+    fn grants_are_checked_and_deduplicated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = env(tmp.path());
+        let err = Instance::ephemeral(&env, "generic", &["bogus"]).unwrap_err();
+        assert!(matches!(err, InstanceError::InvalidGrant(_)));
+        assert!(err.to_string().contains("wayland"), "{err}");
+        let eph = Instance::ephemeral(&env, "firefox", &["dri", "dri", "network"]).unwrap();
+        let services = &eph.instance.config.services;
+        assert!(services.contains(&Service::Network));
+        assert_eq!(services.iter().filter(|s| **s == Service::Dri).count(), 1);
+        drop(eph);
+        // `portals` without `dbus` is rejected by the parser as usual, and
+        // nothing is created for a config that cannot run.
+        assert!(matches!(
+            Instance::ephemeral(&env, "generic", &["portals"]),
+            Err(InstanceError::Config(_))
+        ));
+        assert!(!try_root(&env).exists() || try_root(&env).read_dir().unwrap().next().is_none());
+    }
+
+    #[test]
+    fn sweep_stale_removes_only_dead_pids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = env(tmp.path());
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let dead = child.id().to_string();
+        child.wait().unwrap();
+        let live = std::process::id().to_string();
+        for n in [dead.as_str(), live.as_str(), "keepme"] {
+            fs::create_dir_all(try_root(&env).join(n)).unwrap();
+        }
+        sweep_stale(&env);
+        assert!(!try_root(&env).join(&dead).exists());
+        assert!(try_root(&env).join(&live).exists());
+        assert!(try_root(&env).join("keepme").exists());
     }
 }

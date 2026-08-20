@@ -58,6 +58,9 @@ pub enum InstanceError {
     /// Unknown profile name passed to `create`.
     #[error("unknown profile `{0}`")]
     UnknownProfile(String),
+    /// A grant name that is not one of the bare service nodes.
+    #[error("unknown grant `{0}`: valid grants are {names}", names = crate::instance::GRANTS.join(", "))]
+    InvalidGrant(String),
     /// The instance path is a symlink; bubbler never deletes through one.
     #[error("{0} is a symlink; refusing to delete through it")]
     IsSymlink(PathBuf),

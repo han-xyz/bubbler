@@ -45,6 +45,21 @@ enum Cmd {
         #[arg(last = true)]
         command: Vec<OsString>,
     },
+    /// Run a command in a throwaway sandbox, without creating an instance.
+    Try {
+        /// Built-in profile to seed the throwaway config from.
+        #[arg(long, default_value = "generic")]
+        profile: String,
+        /// Grant one service on top of the profile; repeatable.
+        #[arg(long = "grant", value_name = "SERVICE")]
+        grants: Vec<String>,
+        /// Keep the sandbox afterwards as an instance with this name.
+        #[arg(long, value_name = "NAME")]
+        keep: Option<String>,
+        /// Command to run; replaces the profile's `command`.
+        #[arg(last = true)]
+        command: Vec<OsString>,
+    },
     /// Run a command inside an already running instance.
     Exec {
         /// Instance name.
@@ -153,6 +168,30 @@ fn real_main() -> Result<i32> {
             }
             launcher::run(&env, &inst, command)
                 .with_context(|| format!("running instance `{name}`"))
+        }
+        Cmd::Try {
+            profile,
+            grants,
+            keep,
+            command,
+        } => {
+            let grants: Vec<&str> = grants.iter().map(String::as_str).collect();
+            let mut eph = Instance::ephemeral(&env, &profile, &grants)
+                .context("creating a throwaway sandbox")?;
+            if let Some(name) = &keep {
+                eph.keep_as(name)
+                    .with_context(|| format!("keeping the sandbox as instance `{name}`"))?;
+            }
+            if eph.instance.has_service(&Service::X11) {
+                eprintln!("bubbler: warning: x11 grants no isolation between X clients");
+            }
+            let command = (!command.is_empty()).then_some(command.as_slice());
+            let code =
+                launcher::run(&env, &eph.instance, command).context("running a throwaway sandbox");
+            // The sandbox directory must outlive the run: dropping the
+            // guard is what removes or keeps it.
+            drop(eph);
+            code
         }
         Cmd::Exec { name, command } => {
             // Checked, not opened: a running instance can be reached even
