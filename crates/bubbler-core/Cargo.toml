@@ -7,9 +7,11 @@ repository.workspace = true
 description = "Library core of bubbler: config model, services, bwrap argument builder, launcher"
 
 [dependencies]
+bubbler-init.workspace = true
 kdl.workspace = true
 thiserror.workspace = true
 rustix.workspace = true
+signal-hook.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

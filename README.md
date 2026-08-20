@@ -17,6 +17,7 @@ sound and a private home. See "Known gaps" below.
     bubbler run ff                        # uses `command` from config.kdl
     bubbler run ff -- firefox --version   # or run something else inside
     bubbler run ff --dry-run              # print the bwrap argv, do not launch
+    bubbler exec ff -- firefox --version  # run inside the instance already running
     bubbler list
     bubbler delete ff --yes               # instance and private home; irreversible
 
@@ -24,6 +25,16 @@ sound and a private home. See "Known gaps" below.
 argv element per line, byte for byte, so it can be diffed; an element
 containing a newline would be ambiguous in that framing. It builds the argv
 only: nothing is launched and no runtime directory is created.
+
+Every sandbox runs under `bubbler-init`, a small supervisor bound in at
+`/run/bubbler-init`. It serves a control socket in the instance's runtime
+directory, which `exec` connects to; the socket is bound by bubbler and only
+handed to the sandbox as an inherited file descriptor, so nothing inside can
+reach the path. `run` on an instance that is already running says so and
+execs into it instead of starting a second sandbox; configuration changes
+apply on the next start. An exec'd process is given bubbler's own stdin,
+stdout and stderr, so the channel is for tooling and debugging, not an extra
+boundary. `SIGINT` and `SIGTERM` are forwarded to the sandbox once.
 
 `edit` runs `$VISUAL`, else `$EDITOR`, split on whitespace into an argv with
 the config path appended — there is no shell, so quotes and `$VAR` in those
@@ -118,8 +129,12 @@ binding the tree under it.
 Instances live in `$XDG_DATA_HOME/bubbler/instances/<name>/` (by default under
 `~/.local/share`), each holding a `config.kdl` and the private `home/`. Every
 run except `--dry-run` also creates `$XDG_RUNTIME_DIR/bubbler/<name>/`, mode
-0700, reusing one left over from an earlier run. `HOME` and
-`XDG_RUNTIME_DIR` must be set and non-empty.
+0700, reusing one left over from an earlier run, and binds the control socket
+`init.sock` in it. `HOME` and `XDG_RUNTIME_DIR` must be set and non-empty.
+
+The `bubbler-init` binary is taken from `$BUBBLER_INIT` if set (it must be a
+regular file), else from next to the `bubbler` binary, else from
+`/usr/lib/bubbler/bubbler-init`.
 
 ## Build
 

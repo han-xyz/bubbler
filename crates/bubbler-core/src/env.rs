@@ -45,6 +45,9 @@ pub struct Env {
     /// Already-filtered `(name, value)` pairs that were set on the host,
     /// selected by [`is_passthrough`].
     pub passthrough: Vec<(OsString, OsString)>,
+    /// `$BUBBLER_INIT`: host path of the `bubbler-init` binary to bind
+    /// into the sandbox, overriding the usual search.
+    pub init_override: Option<PathBuf>,
 }
 
 #[cfg(test)]

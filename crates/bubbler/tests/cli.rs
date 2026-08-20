@@ -1,12 +1,20 @@
 mod common;
 
+use std::os::unix::net::UnixStream;
+use std::process::{Child, Stdio};
+use std::time::{Duration, Instant};
+
 use bubbler_core::bwrap::ETC_ALLOWLIST;
-use common::{bubbler, require_bwrap};
+use common::{bubbler, bubbler_live, real_init, require_bwrap};
+use rustix::process::{Pid, Signal, kill_process};
 
 fn setup() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join("home")).unwrap();
     std::fs::create_dir_all(tmp.path().join("run")).unwrap();
+    // Stand-in for the supervisor binary: `$BUBBLER_INIT` must name a
+    // regular file for argv building, which is all a dry run needs.
+    std::fs::write(tmp.path().join("bubbler-init"), b"").unwrap();
     tmp
 }
 
@@ -42,11 +50,14 @@ fn create_list_and_dry_run() {
          --ro-bind-try\n/opt\n/opt\n--tmpfs\n/etc\n";
     let expected_suffix = format!(
         "--proc\n/proc\n--dev\n/dev\n--tmpfs\n/tmp\n--tmpfs\n/var\n--tmpfs\n/run\n\
-         --bind\n{home}\n/home/bubbler\n--perms\n0700\n--dir\n{run}\n--clearenv\n--setenv\nTERM\ndumb\n\
+         --bind\n{home}\n/home/bubbler\n--perms\n0700\n--dir\n{run}\n\
+         --ro-bind\n{init}\n/run/bubbler-init\n--clearenv\n--setenv\nTERM\ndumb\n\
          --setenv\nHOME\n/home/bubbler\n--setenv\nPATH\n/usr/bin\n--setenv\nXDG_RUNTIME_DIR\n{run}\n\
-         --setenv\nUSER\nbubbler\n--setenv\nLOGNAME\nbubbler\n--\n/usr/bin/true\n",
+         --setenv\nUSER\nbubbler\n--setenv\nLOGNAME\nbubbler\n\
+         --\n/run/bubbler-init\n--socket-fd\n5\n--\n/usr/bin/true\n",
         home = home.display(),
-        run = run.display()
+        run = run.display(),
+        init = tmp.path().join("bubbler-init").display()
     );
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.starts_with(expected_prefix), "{s}");
@@ -175,9 +186,13 @@ fn real_bwrap_runs_true_and_propagates_exit_code() {
     if !require_bwrap() {
         return;
     }
+    let Some(init) = real_init() else { return };
     let tmp = setup();
-    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
-    let out = bubbler(tmp.path())
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    let out = bubbler_live(tmp.path(), &init)
         .args(["run", "t", "--", "/usr/bin/true"])
         .output()
         .unwrap();
@@ -186,7 +201,7 @@ fn real_bwrap_runs_true_and_propagates_exit_code() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let out = bubbler(tmp.path())
+    let out = bubbler_live(tmp.path(), &init)
         .args(["run", "t", "--", "/usr/bin/false"])
         .output()
         .unwrap();
@@ -199,9 +214,13 @@ fn real_bwrap_home_is_fixed_and_private() {
     if !require_bwrap() {
         return;
     }
+    let Some(init) = real_init() else { return };
     let tmp = setup();
-    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
-    let out = bubbler(tmp.path())
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    let out = bubbler_live(tmp.path(), &init)
         .args([
             "run",
             "t",
@@ -228,9 +247,13 @@ fn real_bwrap_etc_is_allowlisted_and_user_is_bubbler() {
     if !require_bwrap() {
         return;
     }
+    let Some(init) = real_init() else { return };
     let tmp = setup();
-    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
-    let out = bubbler(tmp.path())
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    let out = bubbler_live(tmp.path(), &init)
         .args([
             "run",
             "t",
@@ -259,6 +282,108 @@ fn real_bwrap_etc_is_allowlisted_and_user_is_bubbler() {
             "unexpected /etc entry `{name}`:\n{s}"
         );
     }
+}
+
+/// Poll until `ready` holds, so the test never sleeps longer than it must.
+fn wait_until(mut ready: impl FnMut() -> bool, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        if ready() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+/// The background run's stderr is where a failed start explains itself.
+fn fail_with(mut run: Child, what: &str) -> ! {
+    let _ = run.kill();
+    let out = run.wait_with_output().expect("waiting for the run process");
+    panic!("{what}: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn real_bwrap_exec_round_trip() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    let mut run = bubbler_live(tmp.path(), &init)
+        .args(["run", "t", "--", "/usr/bin/sleep", "30"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let sock = tmp.path().join("run/bubbler/t/init.sock");
+    if !wait_until(
+        || UnixStream::connect(&sock).is_ok(),
+        Duration::from_secs(10),
+    ) {
+        fail_with(run, "the instance never accepted a connection");
+    }
+
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["exec", "t", "--", "/usr/bin/true"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["exec", "t", "--", "/usr/bin/sh", "-c", "exit 3"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["exec", "t", "--", "/usr/bin/sh", "-c", "echo $HOME; id -un"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "/home/bubbler\nbubbler\n"
+    );
+
+    // A second `run` finds the instance live and executes inside it.
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["run", "t", "--", "/usr/bin/true"])
+        .output()
+        .unwrap();
+    let note = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(0), "{note}");
+    assert!(note.contains("executing inside it"), "{note}");
+
+    kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
+    let mut status = None;
+    assert!(
+        wait_until(
+            || {
+                status = run.try_wait().expect("waiting for the run process");
+                status.is_some()
+            },
+            Duration::from_secs(8)
+        ),
+        "the run did not stop after SIGTERM"
+    );
+    assert_eq!(status.and_then(|s| s.code()), Some(143));
+    assert!(!sock.exists(), "the control socket outlived the run");
+
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["exec", "t", "--", "/usr/bin/true"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not running"), "{err}");
 }
 
 #[test]

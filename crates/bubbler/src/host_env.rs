@@ -10,6 +10,7 @@ use bubbler_core::env::{Env, is_passthrough};
 /// Build an [`Env`] from the current process environment. A missing or
 /// empty `$HOME` or `$XDG_RUNTIME_DIR` is an error: both are needed for
 /// any sandbox, and an empty one would silently become a relative path.
+/// `$BUBBLER_INIT` overrides where the `bubbler-init` binary is taken from.
 pub fn from_process() -> Result<Env> {
     let home = PathBuf::from(
         env::var_os("HOME")
@@ -39,6 +40,9 @@ pub fn from_process() -> Result<Env> {
             .filter(|v| !v.is_empty())
             .map(PathBuf::from),
         passthrough,
+        init_override: env::var_os("BUBBLER_INIT")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from),
     })
 }
 

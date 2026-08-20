@@ -25,6 +25,24 @@ enum Item {
     },
 }
 
+/// Where the `bubbler-init` supervisor is bound inside every sandbox.
+/// Not under `/usr`: that is a read-only bind of the host `/usr` and bwrap
+/// cannot create a mount point in it ("Can't mkdir parents for
+/// /usr/lib/bubbler/bubbler-init: Read-only file system", bubblewrap
+/// 0.11.2), while `/run` is a tmpfs this builder creates itself.
+pub const INIT_INSIDE: &str = "/run/bubbler-init";
+
+/// Turns generated content and channels into the fd numbers bwrap is told
+/// to read them from. `--dry-run` counts, a real run creates the fds.
+pub trait FdAllocator {
+    /// Fd holding `content`, for a `--ro-bind-data`.
+    fn data(&mut self, content: &[u8]) -> io::Result<OsString>;
+    /// Fd of the listening control socket `bubbler-init` serves.
+    fn init_socket(&mut self) -> io::Result<OsString>;
+    /// Fd a sidecar reports readiness on; the allocator keeps the other end.
+    fn ready_pipe(&mut self) -> io::Result<OsString>;
+}
+
 /// Ordered, phase-separated bubblewrap arguments.
 ///
 /// Phases: 1 namespaces, 2 filesystem skeleton, 3 runtime dir,
@@ -115,9 +133,10 @@ impl BwrapArgs {
                 o("--new-session"),
                 o("--hostname"),
                 o("bubbler"),
-                // Without it bwrap uses its own $HOME as the cwd when the
-                // host cwd is absent inside (`bwrap(1)`, ENVIRONMENT),
-                // which is a host path the sandbox does not have.
+                // bwrap keeps the working directory it was started in when
+                // that path also exists inside, so without --chdir a sandbox
+                // started from, say, /tmp would run there instead of in the
+                // private home.
                 o("--chdir"),
                 o(SANDBOX_HOME),
             ],
@@ -245,6 +264,12 @@ impl BwrapArgs {
         );
     }
 
+    /// Bind the host `bubbler-init` binary read-only at [`INIT_INSIDE`]
+    /// (phase 4), which is the program every sandbox actually starts.
+    pub fn bind_init(&mut self, host_path: &Path) {
+        self.ro_bind(host_path, Path::new(INIT_INSIDE));
+    }
+
     /// Bind `content` read-only at `dest` with `mode` (phase 4). The bytes
     /// are handed to the fd allocator in `finish`.
     pub fn ro_bind_data(&mut self, content: Vec<u8>, dest: &Path, mode: &str) {
@@ -261,12 +286,13 @@ impl BwrapArgs {
     }
 
     /// Concatenate the phases, resolve data items through `alloc` (which
-    /// returns the fd number bwrap should read), append `--` and the
-    /// command. The result is the complete argv after the program name.
+    /// returns the fd number bwrap should read), then append `--` and the
+    /// command wrapped in [`INIT_INSIDE`], which supervises it and serves
+    /// the exec channel. The result is the complete argv after `bwrap`.
     pub fn finish(
         self,
         command: &[OsString],
-        alloc: &mut dyn FnMut(&[u8]) -> io::Result<OsString>,
+        alloc: &mut dyn FdAllocator,
     ) -> Result<Vec<OsString>, LaunchError> {
         let mut out = Vec::new();
         for item in [
@@ -286,7 +312,7 @@ impl BwrapArgs {
                     dest,
                     mode,
                 } => {
-                    let fd = alloc(&content).map_err(LaunchError::Data)?;
+                    let fd = alloc.data(&content).map_err(LaunchError::Data)?;
                     // `--perms` applies to the next operation only.
                     out.extend([
                         "--perms".into(),
@@ -298,7 +324,14 @@ impl BwrapArgs {
                 }
             }
         }
-        out.push(OsString::from("--"));
+        let socket = alloc.init_socket().map_err(LaunchError::Data)?;
+        out.extend([
+            OsString::from("--"),
+            INIT_INSIDE.into(),
+            "--socket-fd".into(),
+            socket,
+            "--".into(),
+        ]);
         out.extend_from_slice(command);
         Ok(out)
     }
@@ -321,6 +354,7 @@ mod tests {
             display: Some(":0".into()),
             xauthority: None,
             passthrough: vec![("TERM".into(), "foot".into())],
+            init_override: None,
         }
     }
 
@@ -328,11 +362,62 @@ mod tests {
         v.iter().map(|s| s.to_str().unwrap()).collect()
     }
 
-    fn counter() -> impl FnMut(&[u8]) -> std::io::Result<OsString> {
-        let mut n = 2;
-        move |_| {
-            n += 1;
-            Ok(OsString::from(n.to_string()))
+    /// Numbers every fd from 3 like a dry run, so argv assertions are exact.
+    struct Counter(u32);
+
+    impl Counter {
+        fn new() -> Self {
+            Self(2)
+        }
+
+        fn bump(&mut self) -> io::Result<OsString> {
+            self.0 += 1;
+            Ok(OsString::from(self.0.to_string()))
+        }
+    }
+
+    impl FdAllocator for Counter {
+        fn data(&mut self, _content: &[u8]) -> io::Result<OsString> {
+            self.bump()
+        }
+        fn init_socket(&mut self) -> io::Result<OsString> {
+            self.bump()
+        }
+        fn ready_pipe(&mut self) -> io::Result<OsString> {
+            self.bump()
+        }
+    }
+
+    /// Counter that also keeps every data payload it was handed.
+    struct Recorder {
+        seen: Vec<Vec<u8>>,
+        next: Counter,
+    }
+
+    impl FdAllocator for Recorder {
+        fn data(&mut self, content: &[u8]) -> io::Result<OsString> {
+            self.seen.push(content.to_vec());
+            self.next.bump()
+        }
+        fn init_socket(&mut self) -> io::Result<OsString> {
+            self.next.bump()
+        }
+        fn ready_pipe(&mut self) -> io::Result<OsString> {
+            self.next.bump()
+        }
+    }
+
+    struct Failing;
+
+    impl FdAllocator for Failing {
+        fn data(&mut self, _content: &[u8]) -> io::Result<OsString> {
+            Err(io::Error::other("nope"))
+        }
+        fn init_socket(&mut self) -> io::Result<OsString> {
+            Err(io::Error::other("nope"))
+        }
+        fn ready_pipe(&mut self) -> io::Result<OsString> {
+            Err(io::Error::other("nope"))
         }
     }
 
@@ -344,7 +429,7 @@ mod tests {
             &FakeHost::default(),
         );
         let argv = args
-            .finish(&["/usr/bin/true".into()], &mut counter())
+            .finish(&["/usr/bin/true".into()], &mut Counter::new())
             .unwrap();
         assert_eq!(
             strs(&argv),
@@ -423,6 +508,10 @@ mod tests {
                 "LOGNAME",
                 "bubbler",
                 "--",
+                "/run/bubbler-init",
+                "--socket-fd",
+                "5",
+                "--",
                 "/usr/bin/true",
             ]
         );
@@ -436,7 +525,7 @@ mod tests {
             .with("/etc/fonts", d)
             .with("/etc/shadow", f);
         let argv = BwrapArgs::baseline(&env(), Path::new("/i/home"), &host)
-            .finish(&["sh".into()], &mut counter())
+            .finish(&["sh".into()], &mut Counter::new())
             .unwrap();
         let s = strs(&argv);
         let pos = |x: &str| s.iter().position(|a| *a == x).unwrap();
@@ -490,7 +579,7 @@ mod tests {
             Path::new("/run/user/1000/wayland-1"),
         );
         args.share_net();
-        let finished = args.finish(&["sh".into()], &mut counter()).unwrap();
+        let finished = args.finish(&["sh".into()], &mut Counter::new()).unwrap();
         let argv = strs(&finished);
         let pos = |s: &str| argv.iter().position(|a| *a == s).unwrap();
         assert_eq!(
@@ -508,7 +597,7 @@ mod tests {
         let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default());
         args.share_net();
         args.share_net();
-        let finished = args.finish(&["sh".into()], &mut counter()).unwrap();
+        let finished = args.finish(&["sh".into()], &mut Counter::new()).unwrap();
         let argv = strs(&finished);
         assert_eq!(argv.iter().filter(|a| **a == "--share-net").count(), 1);
     }
@@ -518,13 +607,12 @@ mod tests {
         let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default());
         args.ro_bind_data(b"hello".to_vec(), Path::new("/etc/x"), "0644");
         args.ro_bind_data(b"world".to_vec(), Path::new("/etc/y"), "0600");
-        let mut seen = Vec::new();
-        let argv = args
-            .finish(&["sh".into()], &mut |c: &[u8]| {
-                seen.push(c.to_vec());
-                Ok(OsString::from((seen.len() + 2).to_string()))
-            })
-            .unwrap();
+        let mut rec = Recorder {
+            seen: Vec::new(),
+            next: Counter::new(),
+        };
+        let argv = args.finish(&["sh".into()], &mut rec).unwrap();
+        let seen = rec.seen;
         let s = strs(&argv);
         // Fds 3 and 4 went to the baseline passwd and group.
         assert!(
@@ -542,7 +630,35 @@ mod tests {
     fn allocator_failure_is_data_error() {
         let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default());
         args.ro_bind_data(b"x".to_vec(), Path::new("/etc/x"), "0644");
-        let r = args.finish(&["sh".into()], &mut |_| Err(std::io::Error::other("nope")));
+        let r = args.finish(&["sh".into()], &mut Failing);
         assert!(matches!(r, Err(LaunchError::Data(_))));
+    }
+
+    #[test]
+    fn the_command_runs_under_bubbler_init_on_the_allocated_socket_fd() {
+        let argv = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default())
+            .finish(&["sh".into()], &mut Counter::new())
+            .unwrap();
+        let s = strs(&argv);
+        // Fds 3 and 4 went to the baseline passwd and group.
+        assert_eq!(
+            &s[s.len() - 6..],
+            &["--", INIT_INSIDE, "--socket-fd", "5", "--", "sh"]
+        );
+    }
+
+    #[test]
+    fn bind_init_maps_the_host_binary_onto_the_fixed_inside_path() {
+        let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default());
+        args.bind_init(Path::new("/x/bubbler-init"));
+        let finished = args.finish(&["sh".into()], &mut Counter::new()).unwrap();
+        let s = strs(&finished);
+        let pos = |x: &str| s.iter().position(|a| *a == x).unwrap();
+        assert!(
+            s.windows(3)
+                .any(|w| w == ["--ro-bind", "/x/bubbler-init", INIT_INSIDE])
+        );
+        assert!(pos("/x/bubbler-init") > pos("--dir"));
+        assert!(pos("/x/bubbler-init") < pos("--clearenv"));
     }
 }

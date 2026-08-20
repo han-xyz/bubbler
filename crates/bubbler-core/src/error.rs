@@ -113,12 +113,26 @@ pub enum LaunchError {
     /// Filesystem failure at a specific path.
     #[error("{0}")]
     Io(PathBuf, #[source] io::Error),
-    /// Creating or writing an in-memory data file for bwrap failed.
-    #[error("preparing sandbox data file")]
+    /// Creating an fd bwrap must inherit failed: a data file, the control
+    /// socket or a sidecar's ready pipe.
+    #[error("preparing an fd for bwrap")]
     Data(#[source] io::Error),
     /// Spawning `bwrap` failed for a reason other than it being missing.
     #[error("failed to run bwrap")]
     Spawn(#[source] io::Error),
+    /// Nothing listens on the instance's control socket.
+    #[error("instance `{0}` is not running")]
+    NotRunning(String),
+    /// A fresh start was asked for while the instance is already running.
+    #[error("instance `{0}` is already running")]
+    AlreadyRunning(String),
+    /// The other end of the exec channel spoke out of protocol or hung up.
+    #[error("exec channel: {0}")]
+    Protocol(String),
+    /// Installing the SIGINT/SIGTERM handlers failed, so a signal could
+    /// not be forwarded into the sandbox.
+    #[error("installing signal handlers")]
+    Signal(#[source] io::Error),
     /// Command resolution failed (config had no `command` and none given).
     #[error(transparent)]
     Config(#[from] ConfigError),

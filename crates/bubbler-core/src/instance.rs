@@ -198,6 +198,7 @@ mod tests {
             display: None,
             xauthority: None,
             passthrough: vec![],
+            init_override: None,
         }
     }
 

@@ -9,6 +9,7 @@ use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail};
 use bubbler_core::config::Service;
+use bubbler_core::exec;
 use bubbler_core::instance::{self, Instance};
 use bubbler_core::launcher;
 use bubbler_core::profile;
@@ -42,6 +43,14 @@ enum Cmd {
         dry_run: bool,
         /// Command to run; replaces the config's `command`.
         #[arg(last = true)]
+        command: Vec<OsString>,
+    },
+    /// Run a command inside an already running instance.
+    Exec {
+        /// Instance name.
+        name: String,
+        /// Command to run inside it, after `--`.
+        #[arg(last = true, required = true)]
         command: Vec<OsString>,
     },
     /// List instances.
@@ -115,18 +124,43 @@ fn real_main() -> Result<i32> {
             })?;
             let command = (!command.is_empty()).then_some(command.as_slice());
             if dry_run {
-                let argv =
-                    launcher::build_argv(&env, &inst, command, &mut launcher::dry_run_alloc())
-                        .context("building bwrap arguments")?;
+                // A dry run describes a fresh start and never touches a
+                // live instance, so the liveness check is skipped here.
+                let argv = launcher::build_argv(
+                    &env,
+                    &inst,
+                    command,
+                    &mut launcher::DryRunAlloc::default(),
+                )
+                .context("building bwrap arguments")?;
                 let mut lines = vec![OsStr::new("bwrap")];
                 lines.extend(argv.iter().map(OsString::as_os_str));
                 return print_lines(&lines, "the bwrap argv");
+            }
+            if let Some(stream) = exec::connect(&env, &name)
+                .with_context(|| format!("connecting to instance `{name}`"))?
+            {
+                eprintln!(
+                    "bubbler: instance `{name}` is running; executing inside it \
+                     (config changes apply after restart)"
+                );
+                let command = launcher::resolve_command(&inst, command)?;
+                return exec::run_in(&stream, command)
+                    .with_context(|| format!("executing in instance `{name}`"));
             }
             if inst.has_service(&Service::X11) {
                 eprintln!("bubbler: warning: x11 grants no isolation between X clients");
             }
             launcher::run(&env, &inst, command)
                 .with_context(|| format!("running instance `{name}`"))
+        }
+        Cmd::Exec { name, command } => {
+            // Checked, not opened: a running instance can be reached even
+            // while its config.kdl is mid-edit and would not parse.
+            instance::config_path_checked(&env, &name)
+                .with_context(|| format!("opening instance `{name}`"))?;
+            launcher::exec(&env, &name, &command)
+                .with_context(|| format!("executing in instance `{name}`"))
         }
         Cmd::List => {
             let names = Instance::list(&env).context("listing instances")?;

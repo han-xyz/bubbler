@@ -85,8 +85,10 @@ dependencies = [
 name = "bubbler-core"
 version = "0.2.0"
 dependencies = [
+ "bubbler-init",
  "kdl",
  "rustix",
+ "signal-hook",
  "tempfile",
  "thiserror",
 ]

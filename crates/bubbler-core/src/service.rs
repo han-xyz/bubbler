@@ -368,14 +368,7 @@ mod tests {
             display: Some(":0".into()),
             xauthority: Some("/run/user/1000/Xauthority".into()),
             passthrough: vec![],
-        }
-    }
-
-    fn counter() -> impl FnMut(&[u8]) -> std::io::Result<OsString> {
-        let mut n = 2;
-        move |_| {
-            n += 1;
-            Ok(OsString::from(n.to_string()))
+            init_override: None,
         }
     }
 
@@ -410,7 +403,10 @@ mod tests {
         }
         let mut args = BwrapArgs::baseline(env, Path::new("/i/home"), &host);
         apply_all(services, env, &mut args, &host)?;
-        Ok(strs(&args.finish(&[OsString::from("x")], &mut counter())?))
+        Ok(strs(&args.finish(
+            &[OsString::from("x")],
+            &mut crate::launcher::DryRunAlloc::default(),
+        )?))
     }
 
     fn strs(argv: &[OsString]) -> Vec<String> {
@@ -1041,7 +1037,14 @@ mod tests {
         let mut args = BwrapArgs::baseline(&e, Path::new("/i/home"), &host);
         apply_all(&[Service::Wayland], &e, &mut args, &host).unwrap();
         apply_env(&[("MOZ_ENABLE_WAYLAND".into(), "1".into())], &mut args).unwrap();
-        let a = strs(&args.finish(&[OsString::from("x")], &mut counter()).unwrap());
+        let a = strs(
+            &args
+                .finish(
+                    &[OsString::from("x")],
+                    &mut crate::launcher::DryRunAlloc::default(),
+                )
+                .unwrap(),
+        );
         let pos = |x: &str| a.iter().position(|v| v == x).unwrap();
         assert!(pos("MOZ_ENABLE_WAYLAND") > pos("WAYLAND_DISPLAY"));
     }
