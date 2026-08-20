@@ -31,8 +31,8 @@ pub enum ConfigError {
         /// What the node expected instead.
         reason: String,
     },
-    /// A node that may appear only once appeared again.
-    #[error("node `{0}` given more than once")]
+    /// A node or `env` key that may appear only once appeared again.
+    #[error("`{0}` given more than once")]
     Duplicate(String),
     /// Neither the config nor the CLI supplied a command to run.
     #[error("no command: add a `command` node to the config or pass one after `--`")]

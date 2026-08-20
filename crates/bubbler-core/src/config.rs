@@ -199,16 +199,26 @@ fn parse_etc_share(node: &KdlNode) -> Result<Service, ConfigError> {
             .as_string()
             .ok_or_else(|| bad(node, "name must be a string"))?;
         let mut c = Path::new(s).components();
-        if !matches!((c.next(), c.next()), (Some(Component::Normal(_)), None)) {
+        let (Some(Component::Normal(n)), None) = (c.next(), c.next()) else {
             return Err(bad(node, "name must be a single entry directly under /etc"));
-        }
-        name = Some(OsString::from(s));
+        };
+        name = Some(n.to_os_string());
     }
     if node.children().is_some() {
         return Err(bad(node, "takes no children"));
     }
     let name = name.ok_or_else(|| bad(node, "expects exactly one name argument"))?;
     Ok(Service::EtcShare { name })
+}
+
+/// bwrap 0.11.2 exits when `--setenv` is given an empty key or one holding
+/// `=`, so only a C-identifier key can reach it.
+fn is_env_key(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 fn parse_env(node: &KdlNode, out: &mut Vec<(String, String)>) -> Result<(), ConfigError> {
@@ -224,6 +234,12 @@ fn parse_env(node: &KdlNode, out: &mut Vec<(String, String)>) -> Result<(), Conf
             .value()
             .as_string()
             .ok_or_else(|| bad(node, "values must be strings"))?;
+        if !is_env_key(key) {
+            return Err(bad(node, &format!("`{key}` is not a usable variable name")));
+        }
+        if val.as_bytes().contains(&0) {
+            return Err(bad(node, &format!("value of {key} contains a NUL byte")));
+        }
         if RESERVED_ENV.contains(&key) {
             return Err(bad(
                 node,
@@ -472,6 +488,22 @@ command "b""#
         ));
         assert!(matches!(parse("env"), Err(ConfigError::BadArgument { .. })));
         assert!(matches!(
+            parse("env \"\"=\"x\""),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("env \"A=B\"=\"x\""),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("env \"A B\"=\"x\""),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("env A=\"x\\u{0}y\""),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
             parse("env A=\"1\" { x }"),
             Err(ConfigError::BadArgument { .. })
         ));
@@ -504,6 +536,14 @@ command "b""#
         ));
         assert!(matches!(
             parse("etc-share \"a\"\netc-share \"a\""),
+            Err(ConfigError::Duplicate(_))
+        ));
+        assert_eq!(
+            parse("etc-share \"a/\"").unwrap().services,
+            vec![Service::EtcShare { name: "a".into() }]
+        );
+        assert!(matches!(
+            parse("etc-share \"a\"\netc-share \"a/\""),
             Err(ConfigError::Duplicate(_))
         ));
     }
