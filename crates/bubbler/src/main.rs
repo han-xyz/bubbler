@@ -9,6 +9,7 @@ use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail};
 use bubbler_core::config::Service;
+use bubbler_core::error::LaunchError;
 use bubbler_core::exec;
 use bubbler_core::instance::{self, Instance};
 use bubbler_core::launcher;
@@ -186,8 +187,13 @@ fn real_main() -> Result<i32> {
                 eprintln!("bubbler: warning: x11 grants no isolation between X clients");
             }
             let command = (!command.is_empty()).then_some(command.as_slice());
-            let code =
-                launcher::run(&env, &eph.instance, command).context("running a throwaway sandbox");
+            let code = launcher::run(&env, &eph.instance, command);
+            // Something else already answers on this pid's control socket,
+            // so that runtime directory is not this run's to remove.
+            if matches!(code, Err(LaunchError::AlreadyRunning(_))) {
+                eph.disarm_runtime();
+            }
+            let code = code.context("running a throwaway sandbox");
             // The sandbox directory must outlive the run: dropping the
             // guard is what removes or keeps it.
             drop(eph);

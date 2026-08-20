@@ -132,23 +132,33 @@ fn with_grants(text: &str, grants: &[&str]) -> Result<String, InstanceError> {
     Ok(out)
 }
 
-/// Remove `try/<pid>` directories whose bubbler is gone, so a crash does
-/// not leave a private home behind for good. Best effort: a directory
-/// that cannot be removed is reported, never fatal.
-pub fn sweep_stale(env: &Env) {
-    let root = try_root(env);
-    let Ok(entries) = fs::read_dir(&root) else {
+/// The pid a sweepable directory is named after: decimal digits only, so
+/// `-1`, `+5` and `0` name no process and are left alone.
+fn dir_pid(name: &str) -> Option<Pid> {
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Pid::from_raw(i32::try_from(name.parse::<u32>().ok()?).ok()?)
+}
+
+/// Remove every entry of `dir` named `<prefix><pid>` whose pid is not a
+/// live process, and nothing else. Best effort: a directory that cannot
+/// be removed is reported, never fatal.
+fn sweep_dir(dir: &Path, prefix: &str) {
+    let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
-        let Some(pid) = entry
-            .file_name()
+        let name = entry.file_name();
+        let Some(pid) = name
             .to_str()
-            .and_then(|n| n.parse::<i32>().ok())
-            .and_then(Pid::from_raw)
+            .and_then(|n| n.strip_prefix(prefix))
+            .and_then(dir_pid)
         else {
             continue;
         };
+        // `kill(pid, 0)` fails with ESRCH only when no process has that
+        // pid; EPERM means it is alive and owned by someone else.
         if test_kill_process(pid) != Err(Errno::SRCH) {
             continue;
         }
@@ -156,6 +166,14 @@ pub fn sweep_stale(env: &Env) {
             eprintln!("bubbler: {}: {e}", entry.path().display());
         }
     }
+}
+
+/// Remove leftovers of tries whose bubbler is gone: `try/<pid>` and
+/// `<runtime>/bubbler/try-<pid>` for every pid no live process has. A
+/// name that is not a pid is not swept.
+pub fn sweep_stale(env: &Env) {
+    sweep_dir(&try_root(env), "");
+    sweep_dir(&env.runtime_dir.join("bubbler"), "try-");
 }
 
 /// A throwaway instance under `try/<pid>`, removed when this guard drops
@@ -169,6 +187,8 @@ pub struct Ephemeral {
     // `Drop` runs without an `Env`, so the paths it needs are copied here.
     instances_root: PathBuf,
     runtime: PathBuf,
+    /// Whether the runtime directory is this guard's to remove.
+    remove_runtime: bool,
 }
 
 impl Ephemeral {
@@ -184,6 +204,12 @@ impl Ephemeral {
         self.keep = Some(name.to_owned());
         Ok(())
     }
+
+    /// Leave the runtime directory alone on drop, for when it turned out
+    /// to belong to something else that is already running there.
+    pub fn disarm_runtime(&mut self) {
+        self.remove_runtime = false;
+    }
 }
 
 impl Drop for Ephemeral {
@@ -198,7 +224,8 @@ impl Drop for Ephemeral {
         if let Err(e) = kept {
             eprintln!("bubbler: {}: {e}", dir.display());
         }
-        if let Err(e) = fs::remove_dir_all(&self.runtime)
+        if self.remove_runtime
+            && let Err(e) = fs::remove_dir_all(&self.runtime)
             && e.kind() != io::ErrorKind::NotFound
         {
             eprintln!("bubbler: {}: {e}", self.runtime.display());
@@ -263,6 +290,7 @@ impl Instance {
             keep: None,
             instances_root: instances_root(env),
             runtime,
+            remove_runtime: true,
         })
     }
 
@@ -571,17 +599,53 @@ mod tests {
     #[test]
     fn sweep_stale_removes_only_dead_pids() {
         let tmp = tempfile::tempdir().unwrap();
-        let env = env(tmp.path());
+        let mut env = env(tmp.path());
+        env.runtime_dir = tmp.path().join("run");
         let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
         let dead = child.id().to_string();
         child.wait().unwrap();
         let live = std::process::id().to_string();
-        for n in [dead.as_str(), live.as_str(), "keepme"] {
+        // `-1` and `+5` parse as numbers but name no process: sweeping
+        // them would mean `kill(-1, 0)`, a whole process group.
+        let kept = [live.as_str(), "keepme", "-1", "+5", "0"];
+        for n in kept.iter().chain([dead.as_str()].iter()) {
             fs::create_dir_all(try_root(&env).join(n)).unwrap();
         }
+        let runtime = env.runtime_dir.join("bubbler");
+        for n in ["try-", "inst", "try--1"] {
+            fs::create_dir_all(runtime.join(format!("{n}{dead}"))).unwrap();
+        }
+        fs::create_dir_all(runtime.join(format!("try-{live}"))).unwrap();
+
         sweep_stale(&env);
+
         assert!(!try_root(&env).join(&dead).exists());
-        assert!(try_root(&env).join(&live).exists());
-        assert!(try_root(&env).join("keepme").exists());
+        for n in kept {
+            assert!(try_root(&env).join(n).exists(), "{n}");
+        }
+        assert!(!runtime.join(format!("try-{dead}")).exists());
+        for n in ["inst", "try--1"] {
+            assert!(runtime.join(format!("{n}{dead}")).exists(), "{n}");
+        }
+        assert!(runtime.join(format!("try-{live}")).exists());
+    }
+
+    #[test]
+    fn a_disarmed_guard_leaves_the_runtime_directory_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut env = env(tmp.path());
+        env.runtime_dir = tmp.path().join("run");
+        let run = env
+            .runtime_dir
+            .join("bubbler")
+            .join(format!("try-{}", std::process::id()));
+        let dir = {
+            let mut eph = Instance::ephemeral(&env, "generic", &[]).unwrap();
+            fs::create_dir_all(&run).unwrap();
+            eph.disarm_runtime();
+            eph.instance.dir.clone()
+        };
+        assert!(!dir.exists());
+        assert!(run.is_dir());
     }
 }
