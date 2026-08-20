@@ -1,0 +1,15 @@
+[package]
+name = "bubbler-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Library core of bubbler: config model, services, bwrap argument builder, launcher"
+
+[dependencies]
+kdl.workspace = true
+thiserror.workspace = true
+rustix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
