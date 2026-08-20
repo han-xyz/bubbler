@@ -57,7 +57,12 @@ file order does not affect the generated argv.
 
 Every source must exist and be of the expected type when the argv is built; a
 missing one is an error rather than a silently weaker sandbox. That covers
-`home-share` too, so the `firefox` profile needs a `~/Downloads`. `network`
+`home-share` too, so the `firefox` profile needs a `~/Downloads`. A
+`home-share` source is resolved before it is bound and must stay inside your
+home directory: a symlink pointing elsewhere is refused, not followed.
+`etc-share` is confined to `/etc` the same way, and cannot name the account
+files (`passwd`, `group`, `shadow`, `gshadow` and their `-`/`+` variants),
+which the sandbox generates itself. `network`
 needs `/etc/resolv.conf` (the tmpfs over `/etc` would otherwise hide it).
 `dri` binds `/dev/dri` read-write and exposes `/sys/dev/char`,
 `/sys/devices/system/cpu` and every `/sys/devices/pci*` root read-only — that

@@ -148,6 +148,27 @@ fn missing_home_share_source_is_an_error() {
 }
 
 #[test]
+fn home_share_through_a_symlink_out_of_the_home_is_refused() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    std::os::unix::fs::symlink("/", tmp.path().join("home/RootLink")).unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "home-share \"RootLink\" mode=rw\ncommand \"true\"\n").unwrap();
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--dry-run"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("outside"), "{err}");
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("/home/bubbler/RootLink"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
 fn real_bwrap_runs_true_and_propagates_exit_code() {
     if !require_bwrap() {
         return;

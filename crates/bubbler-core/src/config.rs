@@ -2,7 +2,7 @@
 //! service grant or `command`. Unknown nodes are errors: silently
 //! ignoring a grant would produce a different sandbox than the file says.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 
 use kdl::{KdlDocument, KdlNode};
@@ -21,6 +21,15 @@ pub const RESERVED_ENV: &[&str] = &[
     "XAUTHORITY",
     "XDG_SESSION_TYPE",
     "PULSE_SERVER",
+];
+
+/// `/etc` entries `etc-share` may not name: the sandbox generates its own
+/// `passwd` and `group`, and binding the host's account files back in
+/// would undo that and leak the shadow hashes. The `-` and `+` forms are
+/// the backup and NIS-compatibility files next to them.
+pub const RESERVED_ETC: &[&str] = &[
+    "passwd", "passwd-", "passwd+", "group", "group-", "group+", "shadow", "shadow-", "shadow+",
+    "gshadow", "gshadow-", "gshadow+",
 ];
 
 /// Whether a shared path is writable inside the sandbox.
@@ -213,6 +222,9 @@ fn parse_etc_share(node: &KdlNode) -> Result<Service, ConfigError> {
         let (Some(Component::Normal(n)), None) = (c.next(), c.next()) else {
             return Err(bad(node, "name must be a single entry directly under /etc"));
         };
+        if let Some(r) = RESERVED_ETC.iter().find(|r| n == OsStr::new(**r)) {
+            return Err(bad(node, &format!("the sandbox owns /etc/{r}")));
+        }
         name = Some(n.to_os_string());
     }
     if node.children().is_some() {
@@ -573,6 +585,21 @@ command "b""#
             parse("etc-share \"a\"\netc-share \"a/\""),
             Err(ConfigError::Duplicate(_))
         ));
+    }
+
+    #[test]
+    fn etc_share_refuses_the_account_files() {
+        for name in [
+            "passwd", "passwd-", "passwd+", "group", "group-", "group+", "shadow", "shadow-",
+            "shadow+", "gshadow", "gshadow-", "gshadow+",
+        ] {
+            let r = parse(&format!("etc-share \"{name}\""));
+            assert!(
+                matches!(&r, Err(ConfigError::BadArgument { reason, .. }) if reason == &format!("the sandbox owns /etc/{name}")),
+                "{name}: {r:?}"
+            );
+        }
+        assert!(parse("etc-share \"passwdx\"").is_ok());
     }
 
     #[test]

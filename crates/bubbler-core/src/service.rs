@@ -38,10 +38,7 @@ pub fn apply_all(
             Service::Dri => dri(args, host)?,
             Service::Pipewire => pipewire(env, args, host)?,
             Service::Pulseaudio => pulseaudio(env, args, host)?,
-            Service::EtcShare { name } => {
-                let p = require_exists(host, "etc-share", Path::new("/etc").join(name))?;
-                args.ro_bind(&p, &p);
-            }
+            Service::EtcShare { name } => etc_share(args, host, name)?,
         }
     }
     Ok(())
@@ -267,10 +264,41 @@ pub fn apply_env(pairs: &[(String, String)], args: &mut BwrapArgs) {
     }
 }
 
-/// Bind `$HOME/<path>` to `/home/bubbler/<path>`. The host path must exist
-/// and may be of any type; bubbler never creates directories in the real
-/// home. Probing and binding both happen by path, so a symlink swapped in
-/// between the two is not detected; that is inherent to bwrap path binds.
+/// Resolve `src` and require that it stays under `root`; both are
+/// canonicalised, so a symlink cannot turn a grant inside `root` into a
+/// bind of something outside it. Returns the canonical source, which is
+/// what the caller must bind: binding the path as written would mount
+/// whatever the symlink points at instead.
+fn confine(
+    host: &dyn Host,
+    service: &'static str,
+    root: &Path,
+    src: PathBuf,
+    outside: &str,
+) -> Result<PathBuf, LaunchError> {
+    let root = host
+        .canonicalize(root)
+        .ok_or_else(|| LaunchError::MissingResource {
+            service,
+            path: root.to_path_buf(),
+        })?;
+    let Some(real) = host.canonicalize(&src) else {
+        return Err(LaunchError::MissingResource { service, path: src });
+    };
+    if !real.starts_with(&root) {
+        return Err(LaunchError::BadValue {
+            service,
+            reason: format!("{} resolves outside {outside}", src.display()),
+        });
+    }
+    require_exists(host, service, real)
+}
+
+/// Bind `$HOME/<path>` to `/home/bubbler/<path>`. The host path must exist,
+/// may be of any type and must resolve inside the real home; bubbler never
+/// creates directories in the real home. Resolving and binding both happen
+/// by path, so a symlink swapped in between the two is not detected; that
+/// is inherent to bwrap path binds.
 fn home_share(
     env: &Env,
     args: &mut BwrapArgs,
@@ -278,12 +306,30 @@ fn home_share(
     rel: &Path,
     mode: ShareMode,
 ) -> Result<(), LaunchError> {
-    let src = require_exists(host, "home-share", env.home.join(rel))?;
+    let src = confine(
+        host,
+        "home-share",
+        &env.home,
+        env.home.join(rel),
+        "the home directory",
+    )?;
     let dst = Path::new(SANDBOX_HOME).join(rel);
     match mode {
         ShareMode::ReadOnly => args.ro_bind(&src, &dst),
         ShareMode::ReadWrite => args.bind(&src, &dst),
     }
+    Ok(())
+}
+
+/// Bind one host `/etc` entry read-only at `/etc/<name>`, on top of the
+/// baseline allowlist. The entry must resolve inside `/etc`, so a symlink
+/// there cannot pull an unrelated part of the host into the sandbox; the
+/// names the sandbox generates itself were rejected by the parser.
+fn etc_share(args: &mut BwrapArgs, host: &dyn Host, name: &OsStr) -> Result<(), LaunchError> {
+    let etc = Path::new("/etc");
+    let dst = etc.join(name);
+    let src = confine(host, "etc-share", etc, dst.clone(), "/etc")?;
+    args.ro_bind(&src, &dst);
     Ok(())
 }
 
@@ -329,6 +375,15 @@ mod tests {
         env: &Env,
         existing: &[(&str, Kind)],
     ) -> Result<Vec<String>, LaunchError> {
+        argv_linked(services, env, existing, &[])
+    }
+
+    fn argv_linked(
+        services: &[Service],
+        env: &Env,
+        existing: &[(&str, Kind)],
+        links: &[(&str, &str)],
+    ) -> Result<Vec<String>, LaunchError> {
         let (file, dir, sock) = fake::types();
         let mut host = FakeHost::default();
         for (p, k) in existing {
@@ -340,6 +395,9 @@ mod tests {
                     Dir => dir,
                 },
             );
+        }
+        for (from, to) in links {
+            host = host.link(from, to);
         }
         let mut args = BwrapArgs::baseline(env, Path::new("/i/home"), &host);
         apply_all(services, env, &mut args, &host)?;
@@ -713,6 +771,102 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn home_share_through_a_symlink_out_of_the_home_is_refused() {
+        let svcs = [Service::HomeShare {
+            path: "RootLink".into(),
+            mode: ShareMode::ReadWrite,
+        }];
+        let r = argv_linked(
+            &svcs,
+            &env(),
+            &[("/home/han/RootLink", Dir), ("/", Dir)],
+            &[("/home/han/RootLink", "/")],
+        );
+        assert!(
+            matches!(&r, Err(LaunchError::BadValue { service: "home-share", reason }) if reason.contains("outside the home directory")),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn home_share_through_a_symlink_inside_the_home_binds_the_target() {
+        let svcs = [Service::HomeShare {
+            path: "Downloads".into(),
+            mode: ShareMode::ReadOnly,
+        }];
+        let a = argv_linked(
+            &svcs,
+            &env(),
+            &[("/home/han/Downloads", Dir), ("/home/han/dl", Dir)],
+            &[("/home/han/Downloads", "/home/han/dl")],
+        )
+        .unwrap();
+        assert!(has_seq(
+            &a,
+            &["--ro-bind", "/home/han/dl", "/home/bubbler/Downloads"]
+        ));
+    }
+
+    #[test]
+    fn home_share_needs_a_home_that_resolves() {
+        let svcs = [Service::HomeShare {
+            path: "Downloads".into(),
+            mode: ShareMode::ReadOnly,
+        }];
+        let (_, dir, _) = fake::types();
+        let host = FakeHost::default().with("/home/han/Downloads", dir);
+        struct NoHome(FakeHost);
+        impl Host for NoHome {
+            fn file_type(&self, p: &Path) -> Option<FileType> {
+                self.0.file_type(p)
+            }
+            fn list_dir(&self, p: &Path) -> Vec<OsString> {
+                self.0.list_dir(p)
+            }
+            fn canonicalize(&self, _: &Path) -> Option<PathBuf> {
+                None
+            }
+        }
+        let e = env();
+        let mut args = BwrapArgs::baseline(&e, Path::new("/i/home"), &host);
+        assert!(matches!(
+            apply_all(&svcs, &e, &mut args, &NoHome(host)),
+            Err(LaunchError::MissingResource {
+                service: "home-share",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn etc_share_through_a_symlink_out_of_etc_is_refused() {
+        let r = argv_linked(
+            &[Service::EtcShare {
+                name: "escape".into(),
+            }],
+            &env(),
+            &[("/etc/escape", Dir), ("/home/han", Dir)],
+            &[("/etc/escape", "/home/han")],
+        );
+        assert!(
+            matches!(&r, Err(LaunchError::BadValue { service: "etc-share", reason }) if reason.contains("outside")),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn etc_share_through_a_symlink_inside_etc_binds_the_target() {
+        let a = argv_linked(
+            &[Service::EtcShare { name: "foo".into() }],
+            &env(),
+            &[("/etc/foo", Dir), ("/etc/bar", Dir)],
+            &[("/etc/foo", "/etc/bar")],
+        )
+        .unwrap();
+        assert!(has_seq(&a, &["--ro-bind", "/etc/bar", "/etc/foo"]));
     }
 
     #[test]
