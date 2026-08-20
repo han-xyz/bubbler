@@ -1,0 +1,3 @@
+// bubbler profile: alacritty
+wayland
+command "alacritty"

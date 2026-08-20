@@ -205,11 +205,13 @@ fn x11(env: &Env, args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchErr
     Ok(())
 }
 
-/// GPU access: `/dev/dri` plus the `/sys` paths a userspace driver reads
-/// to map a device node to its PCI device (Arch wiki Bubblewrap/Examples,
-/// bubblejail `direct_rendering`). PCI roots are enumerated so no
-/// unrelated `/sys/devices` subtree is exposed.
+/// GPU access: `/dev/dri`, bound read-write because bwrap has no
+/// read-only device bind, plus the `/sys` paths a userspace driver reads;
+/// a PCI root exposes every PCI device's attributes, not only the GPU's.
 fn dri(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
+    // Paths from Arch wiki Bubblewrap/Examples and bubblejail
+    // `direct_rendering`; PCI roots are enumerated so no unrelated
+    // `/sys/devices` subtree is exposed.
     let dev = require_dir(host, "dri", PathBuf::from("/dev/dri"))?;
     args.dev_bind(&dev, &dev);
     for p in ["/sys/dev/char", "/sys/devices/system/cpu"] {
@@ -245,9 +247,8 @@ fn pipewire(env: &Env, args: &mut BwrapArgs, host: &dyn Host) -> Result<(), Laun
     Ok(())
 }
 
-/// Bind the PulseAudio native socket at the same path and point
-/// `PULSE_SERVER` at it, since the sandbox has no `~/.pulse` cookie or
-/// autospawn to fall back on.
+/// Bind the PulseAudio native socket at the same path and set
+/// `PULSE_SERVER` to it so clients find the socket.
 fn pulseaudio(env: &Env, args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
     let p = require_socket(host, "pulseaudio", env.runtime_dir.join("pulse/native"))?;
     args.ro_bind(&p, &p);

@@ -61,6 +61,39 @@ fn create_list_and_dry_run() {
 }
 
 #[test]
+fn profiles_lists_builtins_and_firefox_seeds_gpu_and_toolkit_env() {
+    let tmp = setup();
+    let out = bubbler(tmp.path()).arg("profiles").output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "alacritty\nfirefox\ngeneric\n"
+    );
+
+    let out = bubbler(tmp.path())
+        .args(["create", "ff", "--profile", "firefox"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // A dry run needs this host's sockets and GPU, so only the seeded
+    // config is asserted on.
+    let cfg =
+        std::fs::read_to_string(tmp.path().join("data/bubbler/instances/ff/config.kdl")).unwrap();
+    assert!(
+        cfg.contains("dri\n") && cfg.contains("MOZ_ENABLE_WAYLAND"),
+        "{cfg}"
+    );
+}
+
+#[test]
 fn run_without_command_fails_with_message() {
     let tmp = setup();
     bubbler(tmp.path()).args(["create", "t"]).status().unwrap();

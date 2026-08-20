@@ -1,0 +1,9 @@
+// bubbler profile: firefox
+wayland
+dri
+pipewire
+pulseaudio
+network
+home-share "Downloads" mode=rw
+env MOZ_ENABLE_WAYLAND="1"
+command "firefox"

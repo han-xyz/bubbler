@@ -45,6 +45,8 @@ enum Cmd {
     },
     /// List instances.
     List,
+    /// List built-in profiles.
+    Profiles,
 }
 
 fn main() -> ExitCode {
@@ -116,6 +118,13 @@ fn real_main() -> Result<i32> {
             let names = Instance::list(&env).context("listing instances")?;
             let lines: Vec<&OsStr> = names.iter().map(OsStr::new).collect();
             print_lines(&lines, "the instance list")
+        }
+        Cmd::Profiles => {
+            let lines: Vec<&OsStr> = bubbler_core::profile::NAMES
+                .iter()
+                .map(OsStr::new)
+                .collect();
+            print_lines(&lines, "the profile list")
         }
     }
 }

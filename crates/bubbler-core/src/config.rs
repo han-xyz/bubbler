@@ -43,8 +43,9 @@ pub enum Service {
     X11,
     /// Keep the host network namespace.
     Network,
-    /// GPU access: the `/dev/dri` device nodes plus the `/sys` entries a
-    /// userspace driver reads to match a node to its hardware.
+    /// GPU access: the `/dev/dri` device nodes, bound read-write, plus the
+    /// `/sys` entries a userspace driver reads to match a node to its
+    /// hardware.
     Dri,
     /// Access to the host PipeWire socket.
     Pipewire,
