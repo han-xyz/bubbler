@@ -152,6 +152,8 @@ mod tests {
             home: "/home/han".into(),
             data_home: data_home.to_path_buf(),
             runtime_dir: "/run/user/1000".into(),
+            uid: 1000,
+            gid: 1000,
             wayland_display: None,
             display: None,
             xauthority: None,

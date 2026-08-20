@@ -11,7 +11,7 @@ repository = "https://github.com/han-xyz/bubbler"
 bubbler-core = { path = "crates/bubbler-core" }
 kdl = "6"
 thiserror = "2"
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "process"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 tempfile = "3"

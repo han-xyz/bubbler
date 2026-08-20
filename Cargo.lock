@@ -77,6 +77,7 @@ dependencies = [
  "anyhow",
  "bubbler-core",
  "clap",
+ "rustix",
  "tempfile",
 ]
 

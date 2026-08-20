@@ -31,6 +31,8 @@ pub fn from_process() -> Result<Env> {
         home,
         data_home,
         runtime_dir,
+        uid: rustix::process::getuid().as_raw(),
+        gid: rustix::process::getgid().as_raw(),
         wayland_display: env::var_os("WAYLAND_DISPLAY").filter(|v| !v.is_empty()),
         display: env::var_os("DISPLAY").filter(|v| !v.is_empty()),
         xauthority: env::var_os("XAUTHORITY")

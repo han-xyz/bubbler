@@ -10,6 +10,7 @@ description = "bubblewrap-based application sandbox with instances and resource 
 bubbler-core.workspace = true
 clap.workspace = true
 anyhow.workspace = true
+rustix.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

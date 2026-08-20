@@ -110,6 +110,9 @@ pub enum LaunchError {
     /// Filesystem failure at a specific path.
     #[error("{0}")]
     Io(PathBuf, #[source] io::Error),
+    /// Creating or writing an in-memory data file for bwrap failed.
+    #[error("preparing sandbox data file")]
+    Data(#[source] io::Error),
     /// Spawning `bwrap` failed for a reason other than it being missing.
     #[error("failed to run bwrap")]
     Spawn(#[source] io::Error),

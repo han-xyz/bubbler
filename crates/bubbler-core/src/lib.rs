@@ -5,6 +5,7 @@ pub mod bwrap;
 pub mod config;
 pub mod env;
 pub mod error;
+pub mod host;
 pub mod instance;
 pub mod launcher;
 pub mod profile;

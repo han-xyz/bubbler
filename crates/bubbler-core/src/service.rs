@@ -16,8 +16,9 @@ use crate::bwrap::BwrapArgs;
 use crate::config::{Service, ShareMode};
 use crate::env::{Env, SANDBOX_HOME};
 use crate::error::LaunchError;
+use crate::host::Host;
 
-/// Apply every service to `args`. `probe` reports the type of a host path
+/// Apply every service to `args`. `host` reports the type of a host path
 /// with symlinks followed, so tests run without real sockets. A
 /// [`Service::HomeShare`] `path` must be relative and normalised, exactly
 /// as the parser leaves it.
@@ -25,28 +26,28 @@ pub fn apply_all(
     services: &[Service],
     env: &Env,
     args: &mut BwrapArgs,
-    probe: &dyn Fn(&Path) -> Option<FileType>,
+    host: &dyn Host,
 ) -> Result<(), LaunchError> {
     let has_x11 = services.contains(&Service::X11);
     for s in services {
         match s {
-            Service::Wayland => wayland(env, args, probe, !has_x11)?,
-            Service::X11 => x11(env, args, probe)?,
+            Service::Wayland => wayland(env, args, host, !has_x11)?,
+            Service::X11 => x11(env, args, host)?,
             Service::Network => args.share_net(),
-            Service::HomeShare { path, mode } => home_share(env, args, probe, path, *mode)?,
+            Service::HomeShare { path, mode } => home_share(env, args, host, path, *mode)?,
         }
     }
     Ok(())
 }
 
 fn require(
-    probe: &dyn Fn(&Path) -> Option<FileType>,
+    host: &dyn Host,
     service: &'static str,
     path: PathBuf,
     expected: &'static str,
     accept: impl Fn(FileType) -> bool,
 ) -> Result<PathBuf, LaunchError> {
-    match probe(&path) {
+    match host.file_type(&path) {
         None => Err(LaunchError::MissingResource { service, path }),
         Some(t) if accept(t) => Ok(path),
         Some(_) => Err(LaunchError::WrongType {
@@ -59,30 +60,30 @@ fn require(
 
 /// The source must be a Unix socket; a directory here would bind a tree.
 fn require_socket(
-    probe: &dyn Fn(&Path) -> Option<FileType>,
+    host: &dyn Host,
     service: &'static str,
     path: PathBuf,
 ) -> Result<PathBuf, LaunchError> {
-    require(probe, service, path, "a socket", |t| t.is_socket())
+    require(host, service, path, "a socket", |t| t.is_socket())
 }
 
 /// The source must be a regular file, e.g. an Xauthority cookie file.
 fn require_file(
-    probe: &dyn Fn(&Path) -> Option<FileType>,
+    host: &dyn Host,
     service: &'static str,
     path: PathBuf,
 ) -> Result<PathBuf, LaunchError> {
-    require(probe, service, path, "a regular file", |t| t.is_file())
+    require(host, service, path, "a regular file", |t| t.is_file())
 }
 
 /// The source may be of any type; only used where the user named the path
 /// in the config rather than the environment naming it.
 fn require_exists(
-    probe: &dyn Fn(&Path) -> Option<FileType>,
+    host: &dyn Host,
     service: &'static str,
     path: PathBuf,
 ) -> Result<PathBuf, LaunchError> {
-    match probe(&path) {
+    match host.file_type(&path) {
         Some(_) => Ok(path),
         None => Err(LaunchError::MissingResource { service, path }),
     }
@@ -95,7 +96,7 @@ fn require_exists(
 fn wayland(
     env: &Env,
     args: &mut BwrapArgs,
-    probe: &dyn Fn(&Path) -> Option<FileType>,
+    host: &dyn Host,
     claim_session: bool,
 ) -> Result<(), LaunchError> {
     let display = env
@@ -118,7 +119,7 @@ fn wayland(
             ),
         });
     }
-    let sock = require_socket(probe, "wayland", env.runtime_dir.join(display))?;
+    let sock = require_socket(host, "wayland", env.runtime_dir.join(display))?;
     args.ro_bind(&sock, &sock);
     args.setenv(OsStr::new("WAYLAND_DISPLAY"), display);
     if claim_session {
@@ -145,11 +146,7 @@ pub fn x11_display_number(display: &OsStr) -> Option<u32> {
 /// path `/home/bubbler/.Xauthority`, so the host location stays hidden.
 /// The `$HOME/.Xauthority` fallback follows libX11's default, not the wiki,
 /// and is used only when it is a regular file.
-fn x11(
-    env: &Env,
-    args: &mut BwrapArgs,
-    probe: &dyn Fn(&Path) -> Option<FileType>,
-) -> Result<(), LaunchError> {
+fn x11(env: &Env, args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
     let display = env.display.as_deref().ok_or(LaunchError::MissingEnv {
         service: "x11",
         var: "DISPLAY",
@@ -161,15 +158,17 @@ fn x11(
             display.to_string_lossy()
         ),
     })?;
-    let sock = require_socket(probe, "x11", PathBuf::from(format!("/tmp/.X11-unix/X{n}")))?;
+    let sock = require_socket(host, "x11", PathBuf::from(format!("/tmp/.X11-unix/X{n}")))?;
     args.ro_bind(&sock, &sock);
     args.setenv(OsStr::new("DISPLAY"), OsStr::new(&format!(":{n}")));
 
     let cookie = match &env.xauthority {
-        Some(xa) => Some(require_file(probe, "x11", xa.clone())?),
+        Some(xa) => Some(require_file(host, "x11", xa.clone())?),
         None => {
             let home = env.home.join(".Xauthority");
-            probe(&home).is_some_and(|t| t.is_file()).then_some(home)
+            host.file_type(&home)
+                .is_some_and(|t| t.is_file())
+                .then_some(home)
         }
     };
     if let Some(host) = cookie {
@@ -187,11 +186,11 @@ fn x11(
 fn home_share(
     env: &Env,
     args: &mut BwrapArgs,
-    probe: &dyn Fn(&Path) -> Option<FileType>,
+    host: &dyn Host,
     rel: &Path,
     mode: ShareMode,
 ) -> Result<(), LaunchError> {
-    let src = require_exists(probe, "home-share", env.home.join(rel))?;
+    let src = require_exists(host, "home-share", env.home.join(rel))?;
     let dst = Path::new(SANDBOX_HOME).join(rel);
     match mode {
         ShareMode::ReadOnly => args.ro_bind(&src, &dst),
@@ -203,10 +202,8 @@ fn home_share(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use crate::host::fake::{self, FakeHost};
     use std::ffi::OsString;
-    use std::os::unix::net::UnixListener;
-    use std::path::PathBuf;
 
     #[derive(Clone, Copy)]
     enum Kind {
@@ -222,6 +219,8 @@ mod tests {
             home: "/home/han".into(),
             data_home: "/home/han/.local/share".into(),
             runtime_dir: "/run/user/1000".into(),
+            uid: 1000,
+            gid: 1000,
             wayland_display: Some("wayland-1".into()),
             display: Some(":0".into()),
             xauthority: Some("/run/user/1000/Xauthority".into()),
@@ -229,18 +228,12 @@ mod tests {
         }
     }
 
-    // Real `FileType` values, since one cannot be constructed directly.
-    // They outlive the temporary directory they were read from.
-    fn file_types() -> HashMap<u8, FileType> {
-        let tmp = tempfile::tempdir().unwrap();
-        let sock = tmp.path().join("s");
-        let file = tmp.path().join("f");
-        let dir = tmp.path().join("d");
-        let _listener = UnixListener::bind(&sock).unwrap();
-        std::fs::write(&file, "").unwrap();
-        std::fs::create_dir(&dir).unwrap();
-        let ty = |p: &Path| std::fs::metadata(p).unwrap().file_type();
-        HashMap::from([(b's', ty(&sock)), (b'f', ty(&file)), (b'd', ty(&dir))])
+    fn counter() -> impl FnMut(&[u8]) -> std::io::Result<OsString> {
+        let mut n = 2;
+        move |_| {
+            n += 1;
+            Ok(OsString::from(n.to_string()))
+        }
     }
 
     fn argv(
@@ -248,22 +241,22 @@ mod tests {
         env: &Env,
         existing: &[(&str, Kind)],
     ) -> Result<Vec<String>, LaunchError> {
-        let types = file_types();
-        let map: HashMap<PathBuf, FileType> = existing
-            .iter()
-            .map(|(p, k)| {
-                let key = match k {
-                    Sock => b's',
-                    File => b'f',
-                    Dir => b'd',
-                };
-                (PathBuf::from(p), types[&key])
-            })
-            .collect();
-        let mut args = BwrapArgs::baseline(env, Path::new("/i/home"));
-        apply_all(services, env, &mut args, &|p| map.get(p).copied())?;
+        let (file, dir, sock) = fake::types();
+        let mut host = FakeHost::default();
+        for (p, k) in existing {
+            host = host.with(
+                p,
+                match k {
+                    Sock => sock,
+                    File => file,
+                    Dir => dir,
+                },
+            );
+        }
+        let mut args = BwrapArgs::baseline(env, Path::new("/i/home"), &host);
+        apply_all(services, env, &mut args, &host)?;
         Ok(args
-            .finish(&[OsString::from("x")])
+            .finish(&[OsString::from("x")], &mut counter())?
             .iter()
             .map(|s| s.to_string_lossy().into_owned())
             .collect())

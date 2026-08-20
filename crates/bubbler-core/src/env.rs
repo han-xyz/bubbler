@@ -31,6 +31,11 @@ pub struct Env {
     pub data_home: PathBuf,
     /// `$XDG_RUNTIME_DIR`; required, sockets live here.
     pub runtime_dir: PathBuf,
+    /// Real user id; unchanged inside the sandbox, so synthetic
+    /// `/etc/passwd` entries must use it.
+    pub uid: u32,
+    /// Real group id; unchanged inside the sandbox.
+    pub gid: u32,
     /// `$WAYLAND_DISPLAY` if set.
     pub wayland_display: Option<OsString>,
     /// `$DISPLAY` if set.

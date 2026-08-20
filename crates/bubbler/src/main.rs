@@ -99,8 +99,9 @@ fn real_main() -> Result<i32> {
             })?;
             let command = (!command.is_empty()).then_some(command.as_slice());
             if dry_run {
-                let argv = launcher::build_argv(&env, &inst, command)
-                    .context("building bwrap arguments")?;
+                let argv =
+                    launcher::build_argv(&env, &inst, command, &mut launcher::dry_run_alloc())
+                        .context("building bwrap arguments")?;
                 let mut lines = vec![OsStr::new("bwrap")];
                 lines.extend(argv.iter().map(OsString::as_os_str));
                 return print_lines(&lines, "the bwrap argv");
