@@ -128,6 +128,10 @@ pub enum LaunchError {
     /// failed; the sandbox would have had to use the host's terminal.
     #[error("setting up the sandbox terminal")]
     Pty(#[source] io::Error),
+    /// Turning the seccomp rule set into a BPF program failed; the
+    /// message is the compiler's own.
+    #[error("compiling the seccomp filter: {0}")]
+    Seccomp(String),
     /// The D-Bus proxy did not report readiness in time, so the sandbox
     /// would have started without the bus socket it expects.
     #[error("the D-Bus proxy did not become ready")]

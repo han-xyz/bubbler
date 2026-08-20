@@ -54,6 +54,10 @@ pub struct Env {
     /// `$BUBBLER_DBUS_LOG=1`: run the D-Bus proxy with `--log`, which
     /// prints every filtered message to bubbler's stderr.
     pub dbus_log: bool,
+    /// `$BUBBLER_SECCOMP_LOG=1`: the seccomp filter logs what it would
+    /// have denied to the audit log instead of denying it, which is how a
+    /// profile's `seccomp` node is worked out. Not a sandbox at all.
+    pub seccomp_log: bool,
     /// `$BUBBLER_DBUS_PROXY`: host path of the proxy binary to run
     /// instead of the one on `PATH`. A test and debugging hook; it must
     /// be a regular file and is bound into the proxy sandbox at its own

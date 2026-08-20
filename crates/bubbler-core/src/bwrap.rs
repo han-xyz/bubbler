@@ -27,6 +27,13 @@ enum Item {
     InfoFd,
     /// `--block-fd` with the fd the allocator opens at `finish` time.
     BlockFd,
+    /// A compiled seccomp program, read by bwrap from an fd the allocator
+    /// opens at `finish` time.
+    Seccomp {
+        /// cBPF as `struct sock_filter` bytes; bwrap rejects a length that
+        /// is not a multiple of eight.
+        program: Vec<u8>,
+    },
 }
 
 /// Where the `bubbler-init` supervisor is bound inside every sandbox.
@@ -341,6 +348,19 @@ impl BwrapArgs {
         self.namespaces.push(Item::BlockFd);
     }
 
+    /// Load one compiled seccomp program into the sandbox (`bwrap(1)`
+    /// `--add-seccomp-fd`, phase 1). Repeatable: bwrap loads every program
+    /// given, in order, which is how one denylist can answer with more
+    /// than one error.
+    // `bwrap(1)`: all of them "except possibly the last, must allow use of
+    // the PR_SET_SECCOMP prctl", which is why the config refuses
+    // `deny "prctl"`. Placed after `--info-fd` and `--block-fd` only for
+    // readability; bwrap orders seccomp fds among themselves, not against
+    // other flags.
+    pub fn add_seccomp(&mut self, program: Vec<u8>) {
+        self.namespaces.push(Item::Seccomp { program });
+    }
+
     /// Read-only bind of a host path (phase 4).
     pub fn ro_bind(&mut self, src: &Path, dst: &Path) {
         push(
@@ -472,6 +492,10 @@ impl BwrapArgs {
                     let fd = alloc.block_pipe().map_err(LaunchError::Data)?;
                     out.extend(["--block-fd".into(), fd]);
                 }
+                Item::Seccomp { program } => {
+                    let fd = alloc.data(&program).map_err(LaunchError::Data)?;
+                    out.extend(["--add-seccomp-fd".into(), fd]);
+                }
             }
         }
         Ok(out)
@@ -498,6 +522,7 @@ mod tests {
             init_override: None,
             dbus_address: None,
             dbus_log: false,
+            seccomp_log: false,
             proxy_override: None,
         }
     }
@@ -945,5 +970,46 @@ mod tests {
         );
         assert!(pos("/x/bubbler-init") > pos("--dir"));
         assert!(pos("/x/bubbler-init") < pos("--clearenv"));
+    }
+
+    #[test]
+    fn seccomp_programs_follow_the_info_and_block_fds_in_phase_one() {
+        let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default());
+        args.block_until_released();
+        args.add_seccomp(b"12345678".to_vec());
+        args.add_seccomp(b"87654321".to_vec());
+        let mut rec = Recorder {
+            seen: Vec::new(),
+            next: Counter::new(),
+        };
+        let finished = args.finish(&["sh".into()], &mut rec).unwrap();
+        let s = strs(&finished);
+        assert_eq!(
+            &s[7..15],
+            &[
+                "--info-fd",
+                "3",
+                "--block-fd",
+                "4",
+                "--add-seccomp-fd",
+                "5",
+                "--add-seccomp-fd",
+                "6",
+            ],
+            "{s:?}"
+        );
+        assert_eq!(
+            rec.seen[..2],
+            [b"12345678".to_vec(), b"87654321".to_vec()],
+            "the programs are the first data the allocator is handed"
+        );
+    }
+
+    #[test]
+    fn a_sandbox_without_a_filter_has_no_seccomp_flag() {
+        let argv = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default())
+            .finish(&["sh".into()], &mut Counter::new())
+            .unwrap();
+        assert!(!strs(&argv).contains(&"--add-seccomp-fd"));
     }
 }

@@ -110,6 +110,11 @@ file order does not affect the generated argv.
     notify                           # talk to org.freedesktop.Notifications
     mpris name="firefox.*"           # own org.mpris.MediaPlayer2.firefox.*
     tty "pty"                        # terminal: "pty", "passthrough" or "none"
+    seccomp {                        # changes to the default syscall denylist
+        allow "perf_event_open"
+        deny "unshare" errno="EPERM"
+        disable
+    }
     env MOZ_ENABLE_WAYLAND="1"       # extra variables, KEY="value", repeatable
     command "firefox"
 
@@ -252,6 +257,60 @@ needs it.
 the default `pty` when it does not, since a running instance stays reachable
 while its config is being edited.
 
+## Seccomp
+
+Every sandbox — an instance's, `try`'s, and the D-Bus proxy's own — starts with
+a seccomp-bpf denylist. bubbler compiles it at launch with `seccompiler` and
+hands it to bwrap as two programs on `--add-seccomp-fd`: one answering `EPERM`,
+one answering `ENOSYS` so that libc falls back to an older call instead of
+failing outright. Everything not named is allowed; this narrows the kernel
+surface, it is not a capability model.
+
+`EPERM`: the kernel keyring (`add_key`, `keyctl`, `request_key`),
+`perf_event_open`, `bpf`, `userfaultfd`, `fanotify_init`, the NUMA and
+page-migration calls, module and kexec loading, `iopl`/`ioperm`, swap,
+`reboot`, `syslog`, quota, the system clock and the host name — the list is
+`DEFAULT_EPERM` in `crates/bubbler-core/src/seccomp.rs`. Two `ioctl` requests
+are denied by their argument as well: `TIOCSTI` (0x5412) and `TIOCLINUX`
+(0x541C), which push bytes into a terminal's input queue (CVE-2017-5226,
+CVE-2023-28100). `ENOSYS`: `clone3` and the new mount API (`open_tree`,
+`move_mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `mount_setattr`),
+which is `DEFAULT_ENOSYS` in the same file. `unshare`, `setns`, `clone`,
+`mount`, `pivot_root`, `chroot` and `ptrace` are deliberately *not* denied:
+Firefox and Chromium build their own sandbox out of them, and a nested user
+namespace cannot undo bwrap's read-only binds.
+
+The `seccomp` node changes the list for one instance; the proxy sandbox always
+keeps the default:
+
+    seccomp {
+        allow "ptrace" "perf_event_open"   # take names off the list
+        deny "unshare" "setns"             # add names, EPERM unless stated
+        deny "clone3" errno="ENOSYS"
+        disable                            # no filter at all
+    }
+
+`deny` applies after `allow`, and a syscall named twice keeps only its last
+action. An unknown name, or one this architecture never had, is an error rather
+than a silent skip, and `deny "prctl"` is refused because bwrap needs `prctl`
+to install the filter. `allow "ioctl"` is the only way to take back the two
+argument rules, so it re-enables `TIOCSTI` and `TIOCLINUX` for that instance —
+do not reach for it to fix an unrelated `ioctl`. `deny "ioctl"` replaces those
+two rules with one that matches every request, which breaks nearly every
+program. `disable` prints `bubbler: seccomp disabled for instance <name>` on
+each run, so an unfiltered sandbox is never a quiet one.
+
+`BUBBLER_SECCOMP_LOG=1` compiles the same rules with the log action instead:
+a call that would have been denied is written to the audit log and then
+succeeds. It is for finding over-denies while writing a profile, and it leaves
+the sandbox without a filter.
+
+The filter carries the architecture bubbler was built for, and a syscall made
+from any other ABI is killed rather than allowed — a 32-bit (i386) binary
+inside a sandbox dies on its first syscall. Anything shipping 32-bit code,
+Steam and some Wine setups among them, needs `seccomp { disable }` until a
+libseccomp backend can add the second architecture to the filter.
+
 ## Baseline
 
 Every sandbox gets: all namespaces unshared, no network, read-only `/usr` and
@@ -286,7 +345,8 @@ binding the tree under it.
   sandboxed application through `/proc` — exec is a convenience channel, not
   a boundary. What the sandbox can still do with the terminal it is given is
   under "Terminal".
-- No seccomp filter — the sandbox is namespaces and mounts only.
+- The seccomp filter holds one architecture, so 32-bit binaries inside are
+  killed rather than filtered; see "Seccomp".
 - No proprietary nvidia driver; `dri` covers the open stack.
 - `/etc/machine-id` is bound in, so every instance shares one stable
   identifier with the host.

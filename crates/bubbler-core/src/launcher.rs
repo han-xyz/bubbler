@@ -25,7 +25,7 @@ use crate::error::{ConfigError, LaunchError};
 use crate::host::{Host, RealHost};
 use crate::instance::Instance;
 use crate::tty::{self, Pty, RawGuard, RelayEnd, StdioTarget, TtyMode};
-use crate::{dbus, exec, init_bin, service};
+use crate::{dbus, exec, init_bin, seccomp, service};
 
 /// How often a running sandbox is checked for having exited.
 const POLL: Duration = Duration::from_millis(100);
@@ -233,10 +233,35 @@ pub fn build_argv(
     if plan.as_ref().is_some_and(|p| p.portals) {
         args.block_until_released();
     }
+    apply_seccomp(
+        &mut args,
+        seccomp::RuleSet::with(&inst.config.seccomp),
+        env,
+        &inst.name,
+    )?;
     service::apply_all(&inst.config.services, env, &mut args, &host, &ctx)?;
     service::apply_env(&inst.config.env, &mut args)?;
     args.bind_init(&init_bin::locate(env, &host)?);
     args.finish(command, alloc)
+}
+
+/// Load `set` into the sandbox as one program per error it uses, or say
+/// on stderr that this instance runs unfiltered. A profile asking for no
+/// filter is honoured, but never silently.
+fn apply_seccomp(
+    args: &mut BwrapArgs,
+    set: Option<seccomp::RuleSet>,
+    env: &Env,
+    instance: &str,
+) -> Result<(), LaunchError> {
+    let Some(set) = set else {
+        eprintln!("bubbler: seccomp disabled for instance {instance}");
+        return Ok(());
+    };
+    for program in seccomp::compile(&set, env.seccomp_log)? {
+        args.add_seccomp(program);
+    }
+    Ok(())
 }
 
 /// Complete bwrap argv (without the program name) for the D-Bus proxy
@@ -254,6 +279,11 @@ pub fn proxy_argv(
     let program = dbus::proxy_program(env);
     let command = dbus::proxy_command(&program, plan, host_bus, dir, env.dbus_log, &ready);
     let mut args = BwrapArgs::proxy_baseline(host_bus, &dbus::socket_dir(dir), host);
+    // The sidecar has no `seccomp` node of its own: an instance may relax
+    // its own filter, never the one around the process holding its bus.
+    for program in seccomp::compile(&seccomp::RuleSet::default_set(), env.seccomp_log)? {
+        args.add_seccomp(program);
+    }
     // The proxy reads this to decide it is talking for a sandboxed app;
     // without `portals` it is only the `[Application]` section.
     args.ro_bind_data(
@@ -1101,6 +1131,7 @@ mod tests {
             init_override: Some(init),
             dbus_address: None,
             dbus_log: false,
+            seccomp_log: false,
             proxy_override: None,
         }
     }
@@ -1154,9 +1185,11 @@ mod tests {
             a.windows(3)
                 .any(|w| w == ["--ro-bind", init.as_str(), INIT_INSIDE])
         );
+        // Fd 3 went to the info pipe and 4 and 5 to the two seccomp
+        // programs, 6 and 7 to the baseline passwd and group.
         assert_eq!(
             &a[a.len() - 6..],
-            &["--", INIT_INSIDE, "--socket-fd", "6", "--", "foot"]
+            &["--", INIT_INSIDE, "--socket-fd", "8", "--", "foot"]
         );
     }
 
@@ -1267,6 +1300,10 @@ mod tests {
                 "--unshare-all",
                 "--die-with-parent",
                 "--new-session",
+                "--add-seccomp-fd",
+                "4",
+                "--add-seccomp-fd",
+                "5",
                 "--ro-bind",
                 "/usr",
                 "/usr",
@@ -1299,7 +1336,7 @@ mod tests {
                 "--perms",
                 "0644",
                 "--ro-bind-data",
-                "4",
+                "6",
                 "/.flatpak-info",
                 "--clearenv",
                 "--",
@@ -1719,5 +1756,64 @@ mod tests {
         assert_eq!(exit_code(ExitStatus::from_raw(0)), 0);
         assert_eq!(exit_code(ExitStatus::from_raw(3 << 8)), 3);
         assert_eq!(exit_code(ExitStatus::from_raw(9)), 137);
+    }
+
+    #[test]
+    fn the_default_denylist_reaches_the_argv_as_two_seccomp_fds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let i = inst(tmp.path(), "command \"foot\"");
+        let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default(), false).unwrap());
+        // Straight after the info fd, and before the filesystem phase.
+        assert_eq!(
+            &a[7..14],
+            &[
+                "--info-fd",
+                "3",
+                "--add-seccomp-fd",
+                "4",
+                "--add-seccomp-fd",
+                "5",
+                "--ro-bind",
+            ],
+            "{a:?}"
+        );
+        assert_eq!(
+            &a[a.len() - 6..],
+            &["--", INIT_INSIDE, "--socket-fd", "8", "--", "foot"]
+        );
+    }
+
+    #[test]
+    fn a_disabled_filter_leaves_the_argv_without_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let i = inst(tmp.path(), "seccomp { disable }\ncommand \"foot\"");
+        let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default(), false).unwrap());
+        assert!(!a.iter().any(|x| x == "--add-seccomp-fd"), "{a:?}");
+    }
+
+    #[test]
+    fn allowing_every_denied_syscall_leaves_no_program_to_load() {
+        use crate::seccomp::{DEFAULT_ENOSYS, DEFAULT_EPERM, syscall_number};
+        // A name this architecture never had is a config error, so only
+        // the ones it has can be allowed back.
+        let names: Vec<String> = DEFAULT_EPERM
+            .iter()
+            .chain(DEFAULT_ENOSYS)
+            .filter(|n| syscall_number(n).is_some())
+            .map(|n| format!("\"{n}\""))
+            .collect();
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let i = inst(
+            tmp.path(),
+            &format!(
+                "seccomp {{ allow \"ioctl\" {} }}\ncommand \"foot\"",
+                names.join(" ")
+            ),
+        );
+        let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default(), false).unwrap());
+        assert!(!a.iter().any(|x| x == "--add-seccomp-fd"), "{a:?}");
     }
 }

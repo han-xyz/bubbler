@@ -7,6 +7,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use bubbler_core::bwrap::ETC_ALLOWLIST;
+use bubbler_core::seccomp::syscall_number;
 use common::{
     bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, real_init, require_bwrap, require_dbus,
     require_portal, require_python, test_pty,
@@ -50,7 +51,7 @@ fn create_list_and_dry_run() {
     // Which allowlisted `/etc` entries exist is a property of this host, so
     // only the parts around them are exact.
     let expected_prefix = "bwrap\n--unshare-all\n--die-with-parent\n--new-session\n--hostname\nbubbler\n--chdir\n/home/bubbler\n\
-         --info-fd\n3\n\
+         --info-fd\n3\n--add-seccomp-fd\n4\n--add-seccomp-fd\n5\n\
          --ro-bind\n/usr\n/usr\n--symlink\nusr/bin\n/bin\n--symlink\nusr/lib\n/lib\n\
          --symlink\nusr/lib64\n/lib64\n--symlink\nusr/bin\n/sbin\n\
          --ro-bind-try\n/opt\n/opt\n--tmpfs\n/etc\n";
@@ -60,19 +61,20 @@ fn create_list_and_dry_run() {
          --ro-bind\n{init}\n/run/bubbler-init\n--clearenv\n--setenv\nTERM\ndumb\n\
          --setenv\nHOME\n/home/bubbler\n--setenv\nPATH\n/usr/bin\n--setenv\nXDG_RUNTIME_DIR\n{run}\n\
          --setenv\nUSER\nbubbler\n--setenv\nLOGNAME\nbubbler\n\
-         --\n/run/bubbler-init\n--socket-fd\n6\n--\n/usr/bin/true\n",
+         --\n/run/bubbler-init\n--socket-fd\n8\n--\n/usr/bin/true\n",
         home = home.display(),
         run = run.display(),
         init = tmp.path().join("bubbler-init").display()
     );
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.starts_with(expected_prefix), "{s}");
+    // Fd 3 is the info pipe and 4 and 5 the two seccomp programs.
     assert!(
-        s.contains("--perms\n0644\n--ro-bind-data\n4\n/etc/passwd\n"),
+        s.contains("--perms\n0644\n--ro-bind-data\n6\n/etc/passwd\n"),
         "{s}"
     );
     assert!(
-        s.contains("--perms\n0644\n--ro-bind-data\n5\n/etc/group\n"),
+        s.contains("--perms\n0644\n--ro-bind-data\n7\n/etc/group\n"),
         "{s}"
     );
     assert!(s.ends_with(&expected_suffix), "{s}");
@@ -1987,4 +1989,255 @@ fn real_bwrap_run_detaches_on_three_escapes_and_keeps_the_sandbox() {
         ),
         "the detached run did not stop after SIGTERM"
     );
+}
+
+/// A python probe reporting how each syscall the default filter denies
+/// actually fails inside the sandbox, as `name value` lines. The numbers
+/// are resolved on the host, so it is right for whatever architecture the
+/// tests run on; `ioctl` goes through libc, since its request argument is
+/// what the filter looks at.
+fn probe_source() -> String {
+    let nr = |name: &str| {
+        syscall_number(name).unwrap_or_else(|| panic!("no `{name}` on this architecture"))
+    };
+    format!(
+        r#"import ctypes, errno
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+
+def named(rc):
+    if rc >= 0:
+        return "ok"
+    e = ctypes.get_errno()
+    return errno.errorcode.get(e, "E%d" % e)
+
+def call(nr, *args):
+    ctypes.set_errno(0)
+    return named(libc.syscall(ctypes.c_long(nr), *[ctypes.c_long(a) for a in args]))
+
+def ioctl(request):
+    ctypes.set_errno(0)
+    buf = ctypes.create_string_buffer(b"x")
+    return named(libc.ioctl(0, ctypes.c_ulong(request), buf))
+
+probe = [
+    # KEYCTL_GET_KEYRING_ID of KEY_SPEC_SESSION_KEYRING, creating nothing.
+    ("keyctl", call({keyctl}, 0, -3, 0)),
+    # A null attribute struct: the kernel faults before it opens anything.
+    ("perf_event_open", call({perf_event_open}, 0, 0, -1, -1, 0)),
+    # Size 0 is rejected before any thread is made, so nothing is forked.
+    ("clone3", call({clone3}, 0, 0)),
+    ("tiocsti", ioctl(0x5412)),
+    ("tioclinux", ioctl(0x541C)),
+    ("getpid", call({getpid})),
+]
+report = "\n".join("%s %s" % p for p in probe)
+"#,
+        keyctl = nr("keyctl"),
+        perf_event_open = nr("perf_event_open"),
+        clone3 = nr("clone3"),
+        getpid = nr("getpid"),
+    )
+}
+
+/// The probe as a one-shot program for `python3 -c`.
+fn probe_program() -> String {
+    format!("{}print(report)\n", probe_source())
+}
+
+/// Run the probe inside `name`, whose `config.kdl` is `config`, and
+/// return its `name value` lines.
+fn probe_in(name: &str, config: &str) -> Option<(String, String)> {
+    if !require_python() {
+        return None;
+    }
+    let (tmp, init) = live_instance(name)?;
+    std::fs::write(
+        tmp.path()
+            .join("data/bubbler/instances")
+            .join(name)
+            .join("config.kdl"),
+        config,
+    )
+    .unwrap();
+    let out = bubbler_live(tmp.path(), &init)
+        .args([
+            "run",
+            name,
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            &probe_program(),
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "{stderr}");
+    Some((String::from_utf8_lossy(&out.stdout).into_owned(), stderr))
+}
+
+#[test]
+fn real_bwrap_seccomp_denies_the_default_list_and_nothing_else() {
+    let Some((out, _)) = probe_in("secc", "") else {
+        return;
+    };
+    assert_eq!(probed(&out, "keyctl"), "EPERM", "{out}");
+    assert_eq!(probed(&out, "perf_event_open"), "EPERM", "{out}");
+    // ENOSYS, so glibc falls back to `clone`; unfiltered this is EINVAL.
+    assert_eq!(probed(&out, "clone3"), "ENOSYS", "{out}");
+    assert_eq!(probed(&out, "tiocsti"), "EPERM", "{out}");
+    assert_eq!(probed(&out, "tioclinux"), "EPERM", "{out}");
+    // A denylist: everything not named keeps working.
+    assert_eq!(probed(&out, "getpid"), "ok", "{out}");
+}
+
+#[test]
+fn real_bwrap_seccomp_allow_hands_one_syscall_back() {
+    let Some((out, _)) = probe_in("secca", "seccomp { allow \"keyctl\" }\n") else {
+        return;
+    };
+    assert_ne!(probed(&out, "keyctl"), "EPERM", "{out}");
+    assert_eq!(probed(&out, "perf_event_open"), "EPERM", "{out}");
+    assert_eq!(probed(&out, "clone3"), "ENOSYS", "{out}");
+}
+
+#[test]
+fn real_bwrap_seccomp_disable_leaves_the_sandbox_unfiltered_and_says_so() {
+    let Some((out, err)) = probe_in("seccd", "seccomp { disable }\n") else {
+        return;
+    };
+    assert!(
+        err.contains("bubbler: seccomp disabled for instance seccd"),
+        "{err}"
+    );
+    assert_ne!(probed(&out, "keyctl"), "EPERM", "{out}");
+    assert_ne!(probed(&out, "perf_event_open"), "EPERM", "{out}");
+    assert_ne!(probed(&out, "clone3"), "ENOSYS", "{out}");
+    assert_ne!(probed(&out, "tiocsti"), "EPERM", "{out}");
+}
+
+#[test]
+fn real_bwrap_seccomp_leaves_threads_and_installed_programs_running() {
+    if !require_python() {
+        return;
+    }
+    let Some((tmp, init)) = live_instance("seccr") else {
+        return;
+    };
+    // clone3 answers ENOSYS, so a thread is only created if glibc really
+    // does fall back to `clone`.
+    let out = bubbler_live(tmp.path(), &init)
+        .args([
+            "run",
+            "seccr",
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            "import threading\nt = threading.Thread(target=lambda: print('thread ok'))\nt.start()\nt.join()\n",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "thread ok\n");
+
+    for program in ["/usr/bin/alacritty", "/usr/bin/firefox"] {
+        if !Path::new(program).is_file() {
+            eprintln!("skipping: {program} is not installed");
+            continue;
+        }
+        let out = bubbler_live(tmp.path(), &init)
+            .args(["run", "seccr", "--", program, "--version"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{program} --version under the filter: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// A stand-in for `xdg-dbus-proxy` that runs the probe first and leaves
+/// its report next to the socket it then serves, which is the only place
+/// the proxy sandbox can write to.
+fn probing_proxy(path: &Path) {
+    write_script(
+        path,
+        &format!(
+            r#"#!/usr/bin/python3
+import os, select, socket, sys, time
+{probe}
+d = os.path.dirname(sys.argv[3])
+with open(os.path.join(d, "probe.part"), "w") as f:
+    f.write(report)
+os.rename(os.path.join(d, "probe.part"), os.path.join(d, "probe.txt"))
+fd = int(sys.argv[1].split("=", 1)[1])
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[3])
+s.listen(8)
+os.write(fd, b"r")
+poller = select.poll()
+poller.register(fd, 0)
+deadline = time.time() + 15
+while time.time() < deadline and not poller.poll(20):
+    pass
+"#,
+            probe = probe_source()
+        ),
+    );
+}
+
+#[test]
+fn real_bwrap_seccomp_covers_the_dbus_proxy_sandbox() {
+    if !require_bwrap() || !require_python() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let bus = tmp.path().join("fakebus");
+    let _listener = UnixListener::bind(&bus).unwrap();
+    let proxy = tmp.path().join("probe-proxy");
+    probing_proxy(&proxy);
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["create", "seccp"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/seccp/config.kdl"),
+        "dbus\n",
+    )
+    .unwrap();
+    // The proxy's directory is removed when the run ends, so the report
+    // has to be read while the sandbox is still up.
+    let run = bubbler_live(tmp.path(), &init)
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}", bus.display()),
+        )
+        .env("BUBBLER_DBUS_PROXY", &proxy)
+        .args(["run", "seccp", "--", "/usr/bin/sleep", "30"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let report = tmp.path().join("run/bubbler/seccp/dbus/probe.txt");
+    if !wait_until(|| report.is_file(), Duration::from_secs(10)) {
+        fail_with(run, "the proxy never wrote its report");
+    }
+    let out = std::fs::read_to_string(&report).unwrap();
+    let mut run = run;
+    let _ = run.kill();
+    let _ = run.wait();
+    assert_eq!(probed(&out, "keyctl"), "EPERM", "{out}");
+    assert_eq!(probed(&out, "clone3"), "ENOSYS", "{out}");
+    assert_eq!(probed(&out, "getpid"), "ok", "{out}");
 }

@@ -252,6 +252,7 @@ mod tests {
             init_override: None,
             dbus_address: None,
             dbus_log: false,
+            seccomp_log: false,
             proxy_override: None,
         }
     }

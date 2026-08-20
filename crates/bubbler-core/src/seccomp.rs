@@ -1,6 +1,16 @@
 //! The seccomp denylist: which syscalls a sandbox loses by default, the
-//! per-architecture syscall name table, and the rule set a profile's
-//! `seccomp` node produces. Compiling rules into BPF is a separate step.
+//! per-architecture syscall name table, the rule set a profile's
+//! `seccomp` node produces, and the BPF programs it compiles into.
+
+use std::collections::BTreeMap;
+
+use rustix::io::Errno as OsErrno;
+use seccompiler::{
+    BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+    SeccompRule, TargetArch,
+};
+
+use crate::error::LaunchError;
 
 /// Syscalls the default filter answers with `EPERM`: the kernel keyring,
 /// NUMA and VM controls, module and kexec loading, accounting, quota, the
@@ -130,7 +140,8 @@ impl RuleSet {
 
     /// The default set with `cfg`'s allows removed and its denies appended,
     /// or `None` when the profile disabled the filter. `allow "ioctl"` is
-    /// the only way to take back the [`DEFAULT_IOCTL_EPERM`] rules.
+    /// the only way to take back the [`DEFAULT_IOCTL_EPERM`] rules, and
+    /// `deny "ioctl"` replaces them with a rule matching every request.
     pub fn with(cfg: &SeccompConfig) -> Option<Self> {
         if cfg.disable {
             return None;
@@ -146,6 +157,12 @@ impl RuleSet {
             // Removing first keeps one action per syscall, whichever list
             // the name was on, and keeps a repeated `deny` from doubling.
             set.remove(name);
+            if name == "ioctl" {
+                // A rule matching every request subsumes the two that
+                // match one each; keeping both would put `ioctl` in the
+                // filter twice with two different actions.
+                set.ioctl_eperm.clear();
+            }
             match errno {
                 Errno::Eperm => set.eperm.push(name.clone()),
                 Errno::Enosys => set.enosys.push(name.clone()),
@@ -158,6 +175,116 @@ impl RuleSet {
         self.eperm.retain(|s| s != name);
         self.enosys.retain(|s| s != name);
     }
+}
+
+/// The architecture the filter is compiled for. seccompiler embeds a check
+/// for it and kills a caller from any other ABI, so a 32-bit binary in the
+/// sandbox dies rather than slipping past the rules.
+#[cfg(target_arch = "x86_64")]
+const TARGET: TargetArch = TargetArch::x86_64;
+#[cfg(target_arch = "aarch64")]
+const TARGET: TargetArch = TargetArch::aarch64;
+#[cfg(target_arch = "riscv64")]
+const TARGET: TargetArch = TargetArch::riscv64;
+
+/// Mask applied to `ioctl`'s request argument: the kernel passes it as 64
+/// bits, so without it a request of `0x1_0000_5412` would not be TIOCSTI
+/// to the filter but still is to the driver.
+const REQUEST_MASK: u64 = 0xFFFF_FFFF;
+
+/// The rule set as loadable BPF, one program per error it uses (`EPERM`
+/// first, then `ENOSYS`), each ready to be handed to `--add-seccomp-fd`.
+/// Everything not named is allowed. `log` turns matches into audit log
+/// entries instead of errors, for finding over-denies while writing a
+/// profile. Names this architecture never had are skipped.
+pub fn compile(set: &RuleSet, log: bool) -> Result<Vec<Vec<u8>>, LaunchError> {
+    let groups = [
+        (&set.eperm, OsErrno::PERM, set.ioctl_eperm.as_slice()),
+        (&set.enosys, OsErrno::NOSYS, &[][..]),
+    ];
+    let mut out = Vec::new();
+    for (names, errno, ioctl) in groups {
+        let rules = rules_for(names, ioctl, log)?;
+        if rules.is_empty() {
+            continue;
+        }
+        let action = match log {
+            true => SeccompAction::Log,
+            // The errno is what the syscall returns, so it is the raw
+            // positive number, not a negated return value.
+            false => SeccompAction::Errno(errno.raw_os_error() as u32),
+        };
+        let filter = SeccompFilter::new(rules, SeccompAction::Allow, action, TARGET)
+            .map_err(|e| LaunchError::Seccomp(e.to_string()))?;
+        let program: BpfProgram = filter
+            .try_into()
+            .map_err(|e: seccompiler::BackendError| LaunchError::Seccomp(e.to_string()))?;
+        out.push(program_bytes(&program));
+    }
+    Ok(out)
+}
+
+/// One error's rules keyed by syscall number: an empty rule chain matches
+/// the syscall whatever its arguments are, and the `ioctl` requests in
+/// `ioctl_eperm` become one argument-filtered rule each. `note` reports
+/// skipped names on stderr; it is the same switch that turns the filter
+/// into an audit log, since both exist to explain what a profile got.
+fn rules_for(
+    names: &[String],
+    ioctl_eperm: &[u32],
+    note: bool,
+) -> Result<BTreeMap<i64, Vec<SeccompRule>>, LaunchError> {
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    for name in names {
+        match syscall_number(name) {
+            Some(nr) => {
+                rules.insert(nr, Vec::new());
+            }
+            // Not an error: the default list is written for every
+            // architecture, and a syscall this one never had cannot be
+            // called on it.
+            None => {
+                if note {
+                    eprintln!("bubbler: seccomp: no `{name}` on this architecture; skipping");
+                }
+            }
+        }
+    }
+    let Some(ioctl) = syscall_number("ioctl") else {
+        return Ok(rules);
+    };
+    // A blanket deny of `ioctl` already covers every request, so adding
+    // the argument-filtered rules to it would only narrow it.
+    if ioctl_eperm.is_empty() || rules.contains_key(&ioctl) {
+        return Ok(rules);
+    }
+    let mut chain = Vec::with_capacity(ioctl_eperm.len());
+    for request in ioctl_eperm {
+        let cond = SeccompCondition::new(
+            1,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::MaskedEq(REQUEST_MASK),
+            u64::from(*request),
+        )
+        .map_err(|e| LaunchError::Seccomp(e.to_string()))?;
+        chain.push(SeccompRule::new(vec![cond]).map_err(|e| LaunchError::Seccomp(e.to_string()))?);
+    }
+    rules.insert(ioctl, chain);
+    Ok(rules)
+}
+
+/// A compiled program as the bytes bwrap reads: `struct sock_filter` is
+/// `code` `jt` `jf` `k` in native order, eight bytes per instruction, and
+/// seccompiler only builds for little-endian targets.
+fn program_bytes(program: &BpfProgram) -> Vec<u8> {
+    let mut out = Vec::with_capacity(program.len() * 8);
+    for i in program {
+        out.extend_from_slice(&i.code.to_le_bytes());
+        out.push(i.jt);
+        out.push(i.jf);
+        out.extend_from_slice(&i.k.to_le_bytes());
+    }
+    out
 }
 
 // Syscall numbers for the architecture bubbler is built for, sorted by
@@ -1394,5 +1521,159 @@ mod tests {
         let set = RuleSet::with(&cfg).unwrap();
         assert_eq!(set.enosys, DEFAULT_ENOSYS[1..]);
         assert_eq!(set.eperm.last().unwrap(), "clone3");
+    }
+
+    /// Instruction fields as seccompiler lays them out, decoded back from
+    /// the bytes a program is passed to bwrap as.
+    fn instructions(program: &[u8]) -> Vec<(u16, u8, u8, u32)> {
+        assert_eq!(program.len() % 8, 0, "a sock_filter is eight bytes");
+        program
+            .chunks_exact(8)
+            .map(|c| {
+                (
+                    u16::from_le_bytes([c[0], c[1]]),
+                    c[2],
+                    c[3],
+                    u32::from_le_bytes([c[4], c[5], c[6], c[7]]),
+                )
+            })
+            .collect()
+    }
+
+    /// Instructions in the EPERM program of the default set. seccompiler
+    /// emits 3 for the architecture check, 1 to load the syscall number
+    /// and 1 closing mismatch action; then 5 for every syscall denied
+    /// whatever its arguments (compare, two jumps, match action, mismatch
+    /// action) and 2 + 6 per rule for an argument-filtered one (compare
+    /// and mismatch action around rules of two jumps, load, mask, compare
+    /// and match action). x86_64 resolves 38 of the 41 `DEFAULT_EPERM`
+    /// names (`ABSENT_HERE`) and adds the two `ioctl` rules:
+    /// 5 + 38 * 5 + 2 + 2 * 6 = 209.
+    #[cfg(target_arch = "x86_64")]
+    const EPERM_LEN: usize = 209;
+    /// As above with 34 of the names: 5 + 34 * 5 + 2 + 2 * 6 = 189.
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    const EPERM_LEN: usize = 189;
+    /// All eight `DEFAULT_ENOSYS` names resolve everywhere, and none of
+    /// them filters on an argument: 5 + 8 * 5 = 45.
+    const ENOSYS_LEN: usize = 45;
+
+    #[test]
+    fn the_default_set_compiles_to_two_programs_of_a_known_size() {
+        let programs = compile(&RuleSet::default_set(), false).unwrap();
+        assert_eq!(programs.len(), 2);
+        assert_eq!(instructions(&programs[0]).len(), EPERM_LEN);
+        assert_eq!(instructions(&programs[1]).len(), ENOSYS_LEN);
+    }
+
+    #[test]
+    fn a_program_starts_with_the_architecture_check() {
+        let programs = compile(&RuleSet::default_set(), false).unwrap();
+        let first = instructions(&programs[0])[0];
+        // BPF_LD | BPF_W | BPF_ABS of `seccomp_data.arch`, at offset 4.
+        assert_eq!(first, (0x0020, 0, 0, 4));
+    }
+
+    #[test]
+    fn the_ioctl_rules_compare_the_low_word_of_argument_one() {
+        let programs = compile(&RuleSet::default_set(), false).unwrap();
+        let eperm = instructions(&programs[0]);
+        // `seccomp_data.args[1]` starts at offset 16 + 1 * 8 = 24; the
+        // mask is loaded against its low half.
+        for value in DEFAULT_IOCTL_EPERM {
+            assert!(
+                eperm.windows(3).any(|w| w[0] == (0x0020, 0, 0, 24)
+                    && w[1] == (0x0054, 0, 0, 0xFFFF_FFFF)
+                    && w[2].3 == *value),
+                "no masked comparison for {value:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn allowing_a_syscall_costs_the_program_one_rule() {
+        let cfg = SeccompConfig {
+            allow: vec!["keyctl".to_owned()],
+            ..SeccompConfig::default()
+        };
+        let programs = compile(&RuleSet::with(&cfg).unwrap(), false).unwrap();
+        assert_eq!(instructions(&programs[0]).len(), EPERM_LEN - 5);
+        assert_eq!(instructions(&programs[1]).len(), ENOSYS_LEN);
+    }
+
+    #[test]
+    fn allowing_ioctl_drops_the_two_argument_rules() {
+        let cfg = SeccompConfig {
+            allow: vec!["ioctl".to_owned()],
+            ..SeccompConfig::default()
+        };
+        let programs = compile(&RuleSet::with(&cfg).unwrap(), false).unwrap();
+        assert_eq!(instructions(&programs[0]).len(), EPERM_LEN - 14);
+    }
+
+    #[test]
+    fn denying_ioctl_outright_replaces_the_argument_rules() {
+        let cfg = SeccompConfig {
+            deny: vec![("ioctl".to_owned(), Errno::Eperm)],
+            ..SeccompConfig::default()
+        };
+        let set = RuleSet::with(&cfg).unwrap();
+        assert!(set.ioctl_eperm.is_empty(), "a blanket deny subsumes them");
+        let programs = compile(&set, false).unwrap();
+        // The blanket rule replaces the argument-filtered pair, and the
+        // syscall appears once: -14 for the pair, +5 for the name.
+        assert_eq!(instructions(&programs[0]).len(), EPERM_LEN - 14 + 5);
+    }
+
+    #[test]
+    fn a_hand_built_set_never_weakens_a_blanket_ioctl_deny() {
+        let set = RuleSet {
+            eperm: vec!["ioctl".to_owned()],
+            enosys: vec![],
+            ioctl_eperm: DEFAULT_IOCTL_EPERM.to_vec(),
+        };
+        let programs = compile(&set, false).unwrap();
+        // 5 + 1 * 5: the blanket rule only, no argument comparison.
+        assert_eq!(instructions(&programs[0]).len(), 10);
+    }
+
+    #[test]
+    fn a_group_with_nothing_left_in_it_produces_no_program() {
+        let cfg = SeccompConfig {
+            allow: DEFAULT_ENOSYS.iter().map(|s| (*s).to_owned()).collect(),
+            ..SeccompConfig::default()
+        };
+        let programs = compile(&RuleSet::with(&cfg).unwrap(), false).unwrap();
+        assert_eq!(programs.len(), 1);
+        assert_eq!(instructions(&programs[0]).len(), EPERM_LEN);
+        assert!(compile(&RuleSet::default(), false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn names_this_architecture_never_had_are_skipped_not_an_error() {
+        let set = RuleSet {
+            eperm: vec!["keyctl".to_owned(), "vm86old".to_owned()],
+            enosys: vec![],
+            ioctl_eperm: vec![],
+        };
+        let programs = compile(&set, false).unwrap();
+        let names = ABSENT_HERE.iter().filter(|n| **n == "vm86old").count();
+        assert_eq!(instructions(&programs[0]).len(), 5 + (2 - names) * 5);
+    }
+
+    #[test]
+    fn logging_keeps_the_shape_and_changes_only_the_action() {
+        let set = RuleSet::default_set();
+        let quiet = compile(&set, false).unwrap();
+        let logged = compile(&set, true).unwrap();
+        assert_eq!(quiet.len(), logged.len());
+        for (q, l) in quiet.iter().zip(&logged) {
+            assert_eq!(q.len(), l.len());
+            assert_ne!(q, l, "the match action must differ");
+        }
+        // SECCOMP_RET_LOG, and no SECCOMP_RET_ERRNO with EPERM in it.
+        let ks: Vec<u32> = instructions(&logged[0]).iter().map(|i| i.3).collect();
+        assert!(ks.contains(&0x7ffc_0000));
+        assert!(!ks.contains(&(0x0005_0000 | 1)));
     }
 }

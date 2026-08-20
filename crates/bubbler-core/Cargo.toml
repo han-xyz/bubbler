@@ -12,6 +12,7 @@ kdl.workspace = true
 thiserror.workspace = true
 rustix.workspace = true
 signal-hook.workspace = true
+seccompiler.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

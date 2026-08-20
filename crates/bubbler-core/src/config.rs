@@ -661,19 +661,21 @@ fn syscall_name(node: &KdlNode, s: &str) -> Result<String, ConfigError> {
 /// `deny` without `errno` means `EPERM`; KDL lets a property repeat, and
 /// the last one wins.
 fn deny_errno(node: &KdlNode) -> Result<Errno, ConfigError> {
-    let last = node
+    let mut errno = Errno::Eperm;
+    // Every occurrence is checked, not only the one KDL lets win: a
+    // misspelled value that a later one overrides is still a mistake.
+    for e in node
         .entries()
         .iter()
-        .rev()
-        .find(|e| e.name().is_some_and(|n| n.value() == "errno"));
-    let Some(e) = last else {
-        return Ok(Errno::Eperm);
-    };
-    match e.value().as_string() {
-        Some("EPERM") => Ok(Errno::Eperm),
-        Some("ENOSYS") => Ok(Errno::Enosys),
-        _ => Err(bad(node, "errno must be \"EPERM\" or \"ENOSYS\"")),
+        .filter(|e| e.name().is_some_and(|n| n.value() == "errno"))
+    {
+        errno = match e.value().as_string() {
+            Some("EPERM") => Errno::Eperm,
+            Some("ENOSYS") => Errno::Enosys,
+            _ => return Err(bad(node, "errno must be \"EPERM\" or \"ENOSYS\"")),
+        };
     }
+    Ok(errno)
 }
 
 fn parse_command(node: &KdlNode) -> Result<Vec<OsString>, ConfigError> {
@@ -1168,7 +1170,7 @@ command "b""#
     }
 
     #[test]
-    fn dbus_is_the_only_node_with_children() {
+    fn the_dbus_node_takes_no_arguments_and_its_rules_take_one_name_each() {
         assert!(matches!(
             parse("dbus \"x\""),
             Err(ConfigError::BadArgument { .. })
@@ -1313,6 +1315,19 @@ command "b""#
             "{r:?}"
         );
         assert!(parse(r#"seccomp { allow "prctl" }"#).is_ok());
+    }
+
+    #[test]
+    fn a_repeated_errno_takes_the_last_one() {
+        let cfg = parse(r#"seccomp { deny "read" errno="EPERM" errno="ENOSYS" }"#).unwrap();
+        assert_eq!(cfg.seccomp.deny, [("read".to_owned(), Errno::Enosys)]);
+        let cfg = parse(r#"seccomp { deny "read" errno="ENOSYS" errno="EPERM" }"#).unwrap();
+        assert_eq!(cfg.seccomp.deny, [("read".to_owned(), Errno::Eperm)]);
+        // Still checked, wherever it stands.
+        assert!(matches!(
+            parse(r#"seccomp { deny "read" errno="EIO" errno="EPERM" }"#),
+            Err(ConfigError::BadArgument { .. })
+        ));
     }
 
     #[test]
