@@ -144,10 +144,16 @@ that it has bound its socket and is accepting connections, and fails if it
 does not; the proxy exits with the sandbox. `--dry-run` prints that bind
 without starting anything.
 
-The proxy's socket lives in `$XDG_RUNTIME_DIR/bubbler/<name>/dbus/`, and that
-directory is the only writable path in the proxy's own sandbox. The instance
-directory above it is never bound there: it holds the control socket
+The proxy creates its socket in `$XDG_RUNTIME_DIR/bubbler/<name>/dbus/`, and
+that directory is the only writable path in the proxy's own sandbox. The
+instance directory above it is never bound there: it holds the control socket
 `init.sock`, and reaching that socket means running commands inside the app.
+Once the proxy reports itself ready, bubbler opens the socket without
+following symlinks, checks that it really is a socket, and moves it up to
+`$XDG_RUNTIME_DIR/bubbler/<name>/bus` — out of the proxy's reach — before
+anything is bound into the sandbox. A proxy that replaced its socket with a
+symlink would otherwise have that symlink's target bound in its place. The
+proxy keeps serving after the move: it listens on the socket, not on the path.
 
 The host bus is `$DBUS_SESSION_BUS_ADDRESS` when it is a `unix:path=`
 address, else `$XDG_RUNTIME_DIR/bus`, and must be a socket. Everything the
@@ -222,14 +228,17 @@ Instances live in `$XDG_DATA_HOME/bubbler/instances/<name>/` (by default under
 `~/.local/share`), each holding a `config.kdl` and the private `home/`. Every
 run except `--dry-run` also creates `$XDG_RUNTIME_DIR/bubbler/<name>/`, mode
 0700, reusing one left over from an earlier run, and binds the control socket
-`init.sock` in it; a `dbus` grant adds the subdirectory `dbus/` holding the
-proxied bus socket, and a `portals` grant adds
+`init.sock` in it; a `dbus` grant adds the subdirectory `dbus/` the proxy
+creates its socket in and the checked socket `bus` beside it, and a `portals`
+grant adds
 `$XDG_RUNTIME_DIR/.flatpak/<name>/`, removed again when the run ends. `HOME`
 and `XDG_RUNTIME_DIR` must be set and non-empty.
 
 The `bubbler-init` binary is taken from `$BUBBLER_INIT` if set (it must be a
 regular file), else from next to the `bubbler` binary, else from
-`/usr/lib/bubbler/bubbler-init`.
+`/usr/lib/bubbler/bubbler-init`. `$BUBBLER_DBUS_PROXY` likewise replaces the
+`xdg-dbus-proxy` on `PATH` with a regular file bound into the proxy sandbox at
+its own path; it exists for tests and debugging.
 
 ## Build
 

@@ -91,7 +91,7 @@ pub(crate) fn require_socket(
 }
 
 /// The source must be a regular file, e.g. an Xauthority cookie file.
-fn require_file(
+pub(crate) fn require_file(
     host: &dyn Host,
     service: &'static str,
     path: PathBuf,
@@ -279,12 +279,12 @@ fn pulseaudio(env: &Env, args: &mut BwrapArgs, host: &dyn Host) -> Result<(), La
 /// bound; only the filtered socket is.
 ///
 /// The source is not probed here, unlike every other bind: it exists only
-/// once the proxy is ready, which the launcher guarantees by starting it
-/// before this argv is built. A `--dry-run` builds the same argv with no
-/// proxy running at all.
+/// once the launcher has checked the proxy's socket and moved it out of
+/// the directory the proxy can write to. A `--dry-run` builds the same
+/// argv with no proxy running at all.
 fn dbus_socket(env: &Env, args: &mut BwrapArgs, ctx: &ServiceCtx) {
     let inside = env.runtime_dir.join("bus");
-    args.ro_bind(&dbus::bus_path(&ctx.instance_runtime), &inside);
+    args.ro_bind(&dbus::app_bus_path(&ctx.instance_runtime), &inside);
     let mut address = OsString::from("unix:path=");
     address.push(inside.as_os_str());
     args.setenv(OsStr::new("DBUS_SESSION_BUS_ADDRESS"), &address);
@@ -423,6 +423,7 @@ mod tests {
             init_override: None,
             dbus_address: None,
             dbus_log: false,
+            proxy_override: None,
         }
     }
 
@@ -1096,16 +1097,22 @@ mod tests {
     #[test]
     fn dbus_binds_the_proxied_socket_and_points_clients_at_it() {
         let a = argv(&[Service::Dbus { rules: vec![] }], &env(), &[]).unwrap();
+        // The instance directory, not the proxy's `dbus/` subdirectory:
+        // the launcher moves the socket there once it has proved it is one.
         assert!(
             has_seq(
                 &a,
                 &[
                     "--ro-bind",
-                    "/run/user/1000/bubbler/t/dbus/bus",
+                    "/run/user/1000/bubbler/t/bus",
                     "/run/user/1000/bus"
                 ]
             ),
             "{a:?}"
+        );
+        assert!(
+            !a.iter().any(|s| s == "/run/user/1000/bubbler/t/dbus/bus"),
+            "the sandbox binds a path the proxy can still write to: {a:?}"
         );
         assert!(
             has_seq(
@@ -1122,7 +1129,7 @@ mod tests {
         // usual runtime path, not at the instance's directory.
         assert_eq!(
             a.iter()
-                .filter(|s| *s == "/run/user/1000/bubbler/t/dbus/bus")
+                .filter(|s| *s == "/run/user/1000/bubbler/t/bus")
                 .count(),
             1
         );

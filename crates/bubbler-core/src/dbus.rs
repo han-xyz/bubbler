@@ -133,10 +133,17 @@ pub fn socket_dir(instance_runtime: &Path) -> PathBuf {
     instance_runtime.join("dbus")
 }
 
-/// The filtered socket, in [`socket_dir`]. The single source of truth for
-/// the proxy command, the proxy's bind and the sandbox's own bind.
-pub fn bus_path(instance_runtime: &Path) -> PathBuf {
+/// Where the proxy creates the filtered socket, in [`socket_dir`]: the
+/// one path the proxy sandbox can write to.
+pub fn proxy_bus_path(instance_runtime: &Path) -> PathBuf {
     socket_dir(instance_runtime).join("bus")
+}
+
+/// Where the sandbox's bus bind comes from: the socket after the launcher
+/// has checked it and moved it out of [`socket_dir`]. The proxy cannot
+/// reach this path, so nothing can be swapped for it once it is there.
+pub fn app_bus_path(instance_runtime: &Path) -> PathBuf {
+    instance_runtime.join("bus")
 }
 
 /// Host session bus socket: the `unix:path=` of `$DBUS_SESSION_BUS_ADDRESS`
@@ -159,11 +166,20 @@ fn unix_path(address: &OsStr) -> Option<PathBuf> {
     (!path.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(path)))
 }
 
+/// The proxy binary to run: `$BUBBLER_DBUS_PROXY` when it is set, else
+/// [`PROXY_BIN`] from `PATH` inside the proxy sandbox.
+pub fn proxy_program(env: &Env) -> PathBuf {
+    env.proxy_override
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(PROXY_BIN))
+}
+
 /// Argv of the proxy itself, run inside its own sandbox: it connects to
 /// `host_bus`, serves the filtered socket in the `dbus/` subdirectory of
 /// `instance_runtime` and exits when `ready_fd` is closed
 /// (`xdg-dbus-proxy(1)`).
 pub fn proxy_command(
+    program: &Path,
     plan: &Plan,
     host_bus: &Path,
     instance_runtime: &Path,
@@ -176,10 +192,10 @@ pub fn proxy_command(
     address.push(host_bus);
     // The address and the socket path must precede the per-proxy options.
     let mut argv = vec![
-        OsString::from(PROXY_BIN),
+        program.as_os_str().to_os_string(),
         fd,
         address,
-        bus_path(instance_runtime).into_os_string(),
+        proxy_bus_path(instance_runtime).into_os_string(),
         OsString::from("--filter"),
     ];
     if log {
@@ -213,6 +229,7 @@ mod tests {
             init_override: None,
             dbus_address: None,
             dbus_log: false,
+            proxy_override: None,
         }
     }
 
@@ -353,6 +370,7 @@ mod tests {
         let p = plan(&[Service::Dbus { rules: vec![] }, Service::Notify], "t")
             .expect("dbus is granted");
         let argv = proxy_command(
+            Path::new(PROXY_BIN),
             &p,
             Path::new("/run/user/1000/bus"),
             Path::new("/run/user/1000/bubbler/t"),
@@ -371,6 +389,7 @@ mod tests {
             ]
         );
         let logged = proxy_command(
+            Path::new(PROXY_BIN),
             &p,
             Path::new("/run/user/1000/bus"),
             Path::new("/run/user/1000/bubbler/t"),

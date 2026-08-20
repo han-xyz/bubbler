@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rustix::event::{Nsecs, PollFd, PollFlags, Secs, Timespec, poll};
-use rustix::fs::{MemfdFlags, Mode};
+use rustix::fs::{MemfdFlags, Mode, OFlags};
 use rustix::io::{Errno, FdFlags, fcntl_dupfd_cloexec, fcntl_setfd};
 use rustix::process::{Pid, Signal, kill_process};
 use signal_hook::SigId;
@@ -240,7 +240,8 @@ pub fn proxy_argv(
     alloc: &mut dyn FdAllocator,
 ) -> Result<Vec<OsString>, LaunchError> {
     let ready = alloc.ready_pipe().map_err(LaunchError::Data)?;
-    let command = dbus::proxy_command(plan, host_bus, dir, env.dbus_log, &ready);
+    let program = dbus::proxy_program(env);
+    let command = dbus::proxy_command(&program, plan, host_bus, dir, env.dbus_log, &ready);
     let mut args = BwrapArgs::proxy_baseline(host_bus, &dbus::socket_dir(dir), host);
     // The proxy reads this to decide it is talking for a sandboxed app;
     // without `portals` it is only the `[Application]` section.
@@ -249,6 +250,12 @@ pub fn proxy_argv(
         Path::new(dbus::FLATPAK_INFO),
         "0644",
     );
+    // An overriding binary is not on the sandbox's `PATH`, so it is bound
+    // in at its own path; the packaged proxy needs no bind.
+    if env.proxy_override.is_some() {
+        let program = service::require_file(host, "dbus", program)?;
+        args.ro_bind(&program, &program);
+    }
     args.finish_plain(&command, alloc)
 }
 
@@ -260,6 +267,8 @@ pub struct ProxyHandle {
     child: Child,
     /// Holds both ends of the ready pipe and the `/.flatpak-info` fd.
     alloc: RealAlloc,
+    /// The proxy's own directory, removed once it has exited.
+    socket_dir: PathBuf,
 }
 
 impl Drop for ProxyHandle {
@@ -274,16 +283,19 @@ impl Drop for ProxyHandle {
         let deadline = Instant::now() + PROXY_STOP;
         loop {
             match self.child.try_wait() {
-                Ok(Some(_)) | Err(_) => return,
+                Ok(Some(_)) | Err(_) => break,
                 Ok(None) => {}
             }
             if Instant::now() >= deadline {
                 let _ = self.child.kill();
                 let _ = self.child.wait();
-                return;
+                break;
             }
             std::thread::sleep(POLL);
         }
+        // The directory is bubbler's own and holds only what the proxy put
+        // there; the socket it served has been moved out of it already.
+        let _ = std::fs::remove_dir_all(&self.socket_dir);
     }
 }
 
@@ -343,13 +355,17 @@ pub fn start_proxy(
             _ => LaunchError::Spawn(e),
         })?;
     // From here on every exit path stops the proxy through the handle.
-    let mut handle = ProxyHandle { child, alloc };
+    let mut handle = ProxyHandle {
+        child,
+        alloc,
+        socket_dir: dbus::socket_dir(dir),
+    };
     // The instance's own bwrap must not inherit these: a second holder of
     // the ready pipe would keep the proxy alive after the run has ended.
     for fd in &handle.alloc.fds {
         fcntl_setfd(fd, FdFlags::CLOEXEC).map_err(|e| LaunchError::Data(e.into()))?;
     }
-    let ProxyHandle { child, alloc } = &mut handle;
+    let ProxyHandle { child, alloc, .. } = &mut handle;
     let ready = alloc
         .ready_read
         .as_ref()
@@ -358,6 +374,58 @@ pub fn start_proxy(
         return Err(LaunchError::ProxyNotReady);
     }
     Ok(handle)
+}
+
+/// Open a directory bubbler itself created under `$XDG_RUNTIME_DIR`,
+/// for the `*at` calls that move the proxied socket.
+fn open_dir(path: &Path) -> Result<OwnedFd, LaunchError> {
+    rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| LaunchError::Io(path.to_path_buf(), e.into()))
+}
+
+/// Prove the proxy really left a socket behind and move it out of the one
+/// directory the proxy can write to, so what the sandbox binds cannot be
+/// swapped between this check and the bind.
+///
+/// The proxy keeps serving after the move: it listens on the socket it
+/// bound, not on the path, and the sandbox connects through the new one.
+// Opened with `O_NOFOLLOW`, so a symlink left in the socket's place fails
+// with ELOOP instead of being followed: `stat` through a path reports the
+// type of the target, and bwrap would bind that target.
+fn adopt_proxy_bus(dir: &Path) -> Result<(), LaunchError> {
+    let from = open_dir(&dbus::socket_dir(dir))?;
+    let to = open_dir(dir)?;
+    let path = dbus::proxy_bus_path(dir);
+    let wrong_type = || LaunchError::WrongType {
+        service: "dbus",
+        path: path.clone(),
+        expected: "a socket",
+    };
+    let bus = rustix::fs::openat(
+        &from,
+        "bus",
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| match e {
+        Errno::LOOP => wrong_type(),
+        Errno::NOENT => LaunchError::MissingResource {
+            service: "dbus",
+            path: path.clone(),
+        },
+        e => LaunchError::Io(path.clone(), e.into()),
+    })?;
+    let stat = rustix::fs::fstat(&bus).map_err(|e| LaunchError::Io(path.clone(), e.into()))?;
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Socket {
+        return Err(wrong_type());
+    }
+    drop(bus);
+    rustix::fs::renameat(&from, "bus", &to, "bus")
+        .map_err(|e| LaunchError::Io(dbus::app_bus_path(dir), e.into()))
 }
 
 /// `$XDG_RUNTIME_DIR/bubbler/<name>`: an instance's runtime state on the
@@ -520,10 +588,11 @@ fn supervisor_pid(reaper: i32, child: &mut Child, deadline: Instant) -> Option<P
     }
 }
 
-/// Removes the control socket when the run leaves, on every path.
-struct SocketGuard(PathBuf);
+/// Removes one of the run's own files when it leaves, on every path: the
+/// control socket, and the proxied bus socket once it has been moved.
+struct FileGuard(PathBuf);
 
-impl Drop for SocketGuard {
+impl Drop for FileGuard {
     fn drop(&mut self) {
         // Nothing to report: a concurrent start may have replaced the
         // socket, and a stale one is detected by connecting to it anyway.
@@ -616,7 +685,7 @@ pub fn run(env: &Env, inst: &Instance, command: Option<&[OsString]>) -> Result<i
     let io_at = |e: Errno| LaunchError::Io(sock_path.clone(), e.into());
     let listener =
         UnixListener::bind(&sock_path).map_err(|e| LaunchError::Io(sock_path.clone(), e))?;
-    let _socket_guard = SocketGuard(sock_path.clone());
+    let _socket_guard = FileGuard(sock_path.clone());
     let inherited = fcntl_dupfd_cloexec(listener.as_fd(), 3).map_err(io_at)?;
     // bwrap must inherit exactly this one fd; everything else stays CLOEXEC.
     fcntl_setfd(&inherited, FdFlags::empty()).map_err(io_at)?;
@@ -629,6 +698,15 @@ pub fn run(env: &Env, inst: &Instance, command: Option<&[OsString]>) -> Result<i
     let portals = plan.as_ref().is_some_and(|p| p.portals);
     let _proxy = match &plan {
         Some(plan) => Some(start_proxy(env, &dir, plan, &RealHost)?),
+        None => None,
+    };
+    // Between the proxy's ready byte and the sandbox's bind the socket is
+    // checked and moved where the proxy cannot reach it.
+    let _bus = match &plan {
+        Some(_) => {
+            adopt_proxy_bus(&dir)?;
+            Some(FileGuard(dbus::app_bus_path(&dir)))
+        }
         None => None,
     };
     let argv = build_argv(env, inst, command, &mut alloc)?;
@@ -704,6 +782,7 @@ pub fn exec(env: &Env, name: &str, argv: &[OsString]) -> Result<i32, LaunchError
 mod tests {
     use super::*;
     use crate::bwrap::INIT_INSIDE;
+    use std::os::unix::net::UnixStream;
 
     /// An `Env` whose `$BUBBLER_INIT` points at a stand-in binary, so
     /// argv building does not depend on where the test binary lives.
@@ -723,6 +802,7 @@ mod tests {
             init_override: Some(init),
             dbus_address: None,
             dbus_log: false,
+            proxy_override: None,
         }
     }
 
@@ -962,6 +1042,13 @@ mod tests {
             !argv.iter().any(|a| a.contains(exec::SOCKET_NAME)),
             "the control socket is reachable from the proxy: {argv:?}"
         );
+        // Where the checked socket is moved to; naming it here would give
+        // the proxy the path the sandbox actually binds.
+        let app_bus = dbus::app_bus_path(dir).display().to_string();
+        assert!(
+            !argv.contains(&app_bus),
+            "the proxy names the socket the sandbox binds: {argv:?}"
+        );
         assert_eq!(
             argv.iter().filter(|a| *a == "--bind").count(),
             1,
@@ -992,16 +1079,58 @@ mod tests {
     }
 
     #[test]
+    fn an_overriding_proxy_binary_is_bound_in_and_run() {
+        use crate::config::Service;
+        use crate::host::fake::{FakeHost, types};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut e = env(tmp.path());
+        let fake = tmp.path().join("fake-proxy");
+        e.proxy_override = Some(fake.clone());
+        let plan = dbus::plan(&[Service::Dbus { rules: vec![] }], "t").expect("dbus is granted");
+        let (file, _, _) = types();
+        let host = FakeHost::default().with(&fake.to_string_lossy(), file);
+        let argv = strs(
+            &proxy_argv(
+                &e,
+                &plan,
+                Path::new("/run/user/1000/bus"),
+                Path::new("/run/user/1000/bubbler/t"),
+                &host,
+                &mut DryRunAlloc::default(),
+            )
+            .unwrap(),
+        );
+        let fake = fake.display().to_string();
+        assert!(
+            argv.windows(3)
+                .any(|w| w == ["--ro-bind", fake.as_str(), fake.as_str()]),
+            "{argv:?}"
+        );
+        assert_eq!(argv[argv.len() - 6..argv.len() - 4], ["--", fake.as_str()]);
+        // Nothing is bound for a binary that is not there to run.
+        assert!(matches!(
+            proxy_argv(
+                &e,
+                &plan,
+                Path::new("/run/user/1000/bus"),
+                Path::new("/run/user/1000/bubbler/t"),
+                &FakeHost::default(),
+                &mut DryRunAlloc::default(),
+            ),
+            Err(LaunchError::MissingResource {
+                service: "dbus",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn a_dbus_instance_binds_the_proxied_socket_in_a_dry_run() {
         let tmp = tempfile::tempdir().unwrap();
         let e = env(tmp.path());
         let i = inst(tmp.path(), "dbus\nportals\ncommand \"x\"");
         let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default()).unwrap());
-        let bus = tmp
-            .path()
-            .join("run/bubbler/t/dbus/bus")
-            .display()
-            .to_string();
+        let bus = tmp.path().join("run/bubbler/t/bus").display().to_string();
         let inside = tmp.path().join("run/bus").display().to_string();
         assert!(
             a.windows(3)
@@ -1032,6 +1161,59 @@ mod tests {
             let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default()).unwrap());
             assert!(!a.contains(&"--block-fd".to_string()), "{kdl}: {a:?}");
         }
+    }
+
+    #[test]
+    fn a_proxied_socket_is_moved_out_of_the_proxys_reach() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir(dbus::socket_dir(dir)).unwrap();
+        let listener = UnixListener::bind(dbus::proxy_bus_path(dir)).unwrap();
+        adopt_proxy_bus(dir).unwrap();
+        let moved = std::fs::symlink_metadata(dbus::app_bus_path(dir)).unwrap();
+        assert!(std::os::unix::fs::FileTypeExt::is_socket(
+            &moved.file_type()
+        ));
+        assert!(!dbus::proxy_bus_path(dir).exists());
+        // The proxy serves the socket it bound, not the path it bound it at.
+        assert!(UnixStream::connect(dbus::app_bus_path(dir)).is_ok());
+        drop(listener);
+    }
+
+    #[test]
+    fn anything_but_a_socket_in_the_proxys_directory_stops_the_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir(dbus::socket_dir(dir)).unwrap();
+        assert!(matches!(
+            adopt_proxy_bus(dir),
+            Err(LaunchError::MissingResource {
+                service: "dbus",
+                ..
+            })
+        ));
+        // A symlink is the attack: `stat` through it would report the type
+        // of its target, and bwrap would bind that target.
+        std::os::unix::fs::symlink("/etc", dbus::proxy_bus_path(dir)).unwrap();
+        assert!(matches!(
+            adopt_proxy_bus(dir),
+            Err(LaunchError::WrongType {
+                service: "dbus",
+                expected: "a socket",
+                ..
+            })
+        ));
+        std::fs::remove_file(dbus::proxy_bus_path(dir)).unwrap();
+        std::fs::write(dbus::proxy_bus_path(dir), b"").unwrap();
+        assert!(matches!(
+            adopt_proxy_bus(dir),
+            Err(LaunchError::WrongType {
+                service: "dbus",
+                expected: "a socket",
+                ..
+            })
+        ));
+        assert!(!dbus::app_bus_path(dir).exists());
     }
 
     #[test]

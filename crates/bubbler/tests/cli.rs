@@ -1,6 +1,6 @@
 mod common;
 
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -695,6 +695,95 @@ fn real_portal_identity_lives_exactly_as_long_as_the_run() {
     assert!(
         dir.parent().is_some_and(Path::is_dir),
         "the .flatpak directory itself was removed"
+    );
+}
+
+#[test]
+fn real_dbus_leaves_the_instance_runtime_directory_empty() {
+    if !require_dbus() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let name = "bubbler-test-dbus-leftovers";
+    let leftovers = dbus_instance(tmp.path(), &init, name, "dbus\ncommand \"/usr/bin/true\"\n");
+    let out = bubbler_dbus(tmp.path(), &init)
+        .args(["run", name])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The moved socket, the control socket and the proxy's own directory
+    // are all this run's, and all of them go with it.
+    let left: Vec<_> = std::fs::read_dir(&leftovers.runtime)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+/// A stand-in for `xdg-dbus-proxy` that puts a symlink where its socket
+/// belongs and only then reports itself ready. Its arguments are the ones
+/// bubbler passes: `--fd=N`, the bus address, the socket path.
+fn symlink_proxy(path: &Path, target: &str) {
+    write_script(
+        path,
+        &format!(
+            "#!/bin/sh\nfd=${{1#--fd=}}\nln -sfn {target} \"$3\"\neval \"echo r >&$fd\"\nexec sleep 5\n"
+        ),
+    );
+}
+
+#[test]
+fn a_proxy_that_swaps_its_socket_for_a_symlink_never_reaches_the_sandbox() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    // A host bus socket for the proxy sandbox to bind; nothing ever
+    // speaks D-Bus on it, because the run must fail before that.
+    let bus = tmp.path().join("fakebus");
+    let _listener = UnixListener::bind(&bus).unwrap();
+    let fake = tmp.path().join("fake-proxy");
+    symlink_proxy(&fake, "/etc");
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["create", "atk"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/atk/config.kdl"),
+        "dbus\n",
+    )
+    .unwrap();
+    let marker = tmp.path().join("data/bubbler/instances/atk/home/ran");
+    let out = bubbler_live(tmp.path(), &init)
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}", bus.display()),
+        )
+        .env("BUBBLER_DBUS_PROXY", &fake)
+        .args(["run", "atk", "--", "/usr/bin/touch", "/home/bubbler/ran"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {err}");
+    assert!(err.contains("a socket"), "stderr: {err}");
+    assert!(
+        !marker.exists(),
+        "the application ran with the proxy's symlink bound in"
+    );
+    assert!(
+        !tmp.path().join("run/bubbler/atk/bus").exists(),
+        "the swapped socket was moved into the instance directory"
     );
 }
 
