@@ -87,6 +87,64 @@ fn main_exit_terminates_leftover_execs() {
     assert_eq!(init.wait().unwrap().code(), Some(0));
 }
 
+/// What the sandbox must see when its stdio is a terminal: its own
+/// session, and `/dev/tty` resolving to that terminal.
+const TTY_PROBE: &str = concat!(
+    r#"test "$(ps -o sid= -p $$ | tr -d ' ')" = "$$" && echo LEADER; "#,
+    // `ps -o tty=` names the controlling terminal from the kernel, and
+    // prints `?` when there is none; fd 0 is the pty that was handed in.
+    r#"test "$(readlink /proc/self/fd/0)" = "/dev/$(ps -o tty= -p $$ | tr -d ' ')" && echo CTTY"#
+);
+
+/// Read a pty master to the end; the last slave closing reports `EIO`.
+fn read_to_end(fd: std::os::fd::BorrowedFd<'_>) -> String {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 512];
+    loop {
+        match rustix::io::read(fd, &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[test]
+fn a_command_given_a_terminal_leads_its_own_session_and_owns_it() {
+    let (mut init, sock, _tmp) = start(&["/usr/bin/sleep", "30"]);
+    std::thread::sleep(Duration::from_millis(200));
+    let flags = rustix::pty::OpenptFlags::RDWR
+        | rustix::pty::OpenptFlags::NOCTTY
+        | rustix::pty::OpenptFlags::CLOEXEC;
+    let master = rustix::pty::openpt(flags).unwrap();
+    rustix::pty::grantpt(&master).unwrap();
+    rustix::pty::unlockpt(&master).unwrap();
+    let slave = rustix::pty::ioctl_tiocgptpeer(&master, flags).unwrap();
+
+    let s = UnixStream::connect(&sock).unwrap();
+    let argv = [
+        std::ffi::OsStr::new("/usr/bin/sh"),
+        std::ffi::OsStr::new("-c"),
+        std::ffi::OsStr::new(TTY_PROBE),
+    ];
+    wire::send_request(&s, &argv, [slave.as_fd(); 3]).unwrap();
+    // The sandbox side holds the only slave, so the master reads to EIO
+    // once the command has exited.
+    drop(slave);
+    let st = wire::recv_status(&s).unwrap();
+    let out = read_to_end(master.as_fd());
+    assert!(out.contains("LEADER"), "not a session leader: {out:?}");
+    assert!(out.contains("CTTY"), "/dev/tty is not its own pty: {out:?}");
+    assert_eq!(ExitStatus::from_raw(st).code(), Some(0), "{out:?}");
+
+    rustix::process::kill_process(
+        rustix::process::Pid::from_child(&init),
+        rustix::process::Signal::TERM,
+    )
+    .unwrap();
+    init.wait().unwrap();
+}
+
 #[test]
 fn unexecutable_request_reports_127() {
     let (mut init, sock, _tmp) = start(&["/usr/bin/sleep", "30"]);

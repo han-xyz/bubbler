@@ -13,3 +13,4 @@ pub mod instance;
 pub mod launcher;
 pub mod profile;
 pub mod service;
+pub mod tty;

@@ -124,6 +124,10 @@ pub enum LaunchError {
     /// Spawning `bwrap` failed for a reason other than it being missing.
     #[error("failed to run bwrap")]
     Spawn(#[source] io::Error),
+    /// Allocating the sandbox's pseudoterminal, or relaying through it,
+    /// failed; the sandbox would have had to use the host's terminal.
+    #[error("the sandbox terminal")]
+    Pty(#[source] io::Error),
     /// The D-Bus proxy did not report readiness in time, so the sandbox
     /// would have started without the bus socket it expects.
     #[error("the D-Bus proxy did not become ready")]

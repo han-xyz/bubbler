@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::Write;
 use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -103,6 +103,27 @@ fn listener_from_fd(fd: i32) -> Option<UnixListener> {
     Some(listener)
 }
 
+/// Give the command its own session with its stdin as the controlling
+/// terminal, so job control and `/dev/tty` work inside the sandbox.
+fn take_ctty(command: &mut Command) {
+    // SAFETY: the closure runs in the forked child between fork and execve,
+    // where only async-signal-safe work is allowed: `setsid` and
+    // `ioctl(TIOCSCTTY)` are single syscalls that allocate nothing and take
+    // no lock. `borrow_raw` only names fd 0 and never closes it, and by the
+    // time the closure runs that number is the command's own stdin, since
+    // the stdio is installed before these callbacks. Both failures are
+    // deliberately ignored: a child that already leads a session keeps it,
+    // and a command that cannot claim the terminal still has to run.
+    unsafe {
+        let stdin = BorrowedFd::borrow_raw(0);
+        command.pre_exec(move || {
+            let _ = rustix::process::setsid();
+            let _ = rustix::process::ioctl_tiocsctty(stdin);
+            Ok(())
+        });
+    }
+}
+
 /// Execute one received request; a malformed one closes the connection,
 /// spawning nothing.
 fn serve(stream: UnixStream, argv: &[OsString], fds: Vec<OwnedFd>, execs: &mut Vec<Exec>) {
@@ -114,14 +135,18 @@ fn serve(stream: UnixStream, argv: &[OsString], fds: Vec<OwnedFd>, execs: &mut V
         return;
     };
     let report = stderr.try_clone().ok();
+    let terminal = rustix::termios::isatty(&stdin);
     // argv[0] is resolved through PATH as seen inside the sandbox.
-    let spawned = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(rest)
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .spawn();
-    match spawned {
+        .stderr(Stdio::from(stderr));
+    if terminal {
+        take_ctty(&mut command);
+    }
+    match command.spawn() {
         Ok(child) => execs.push(Exec { child, stream }),
         Err(e) => {
             if let Some(fd) = report {
@@ -242,7 +267,14 @@ fn main() -> ExitCode {
         eprintln!("bubbler-init: usage: --socket-fd N -- cmd...");
         return ExitCode::from(2);
     };
-    let mut command = match Command::new(program).args(rest).spawn() {
+    let mut launch = Command::new(program);
+    launch.args(rest);
+    // The stdio is bubbler's: a pty slave in `tty "pty"` mode, the host's
+    // own terminal in `passthrough`, and no terminal at all otherwise.
+    if rustix::termios::isatty(std::io::stdin()) {
+        take_ctty(&mut launch);
+    }
+    let mut command = match launch.spawn() {
         Ok(child) => child,
         Err(e) => {
             eprintln!("bubbler-init: {}: {e}", program.to_string_lossy());
