@@ -240,10 +240,14 @@ impl BwrapArgs {
     /// restrictions as [`BwrapArgs::baseline`], a read-only `/usr` and a
     /// minimal `/etc` ([`PROXY_ETC`]) so the proxy binary can start, no
     /// home, no runtime dir of its own, and exactly two paths from the
-    /// session: the host bus socket read-only and the instance's runtime
-    /// directory read-write, which is where it creates the filtered
-    /// socket. The environment is cleared; the bus address is an argument.
-    pub fn proxy_baseline(host_bus: &Path, instance_runtime: &Path, host: &dyn Host) -> Self {
+    /// session: the host bus socket read-only and `socket_dir`
+    /// read-write, which is where it creates the filtered socket. The
+    /// environment is cleared; the bus address is an argument.
+    ///
+    /// `socket_dir` is a directory of its own, never the instance's
+    /// runtime directory: that one holds the supervisor's control socket,
+    /// and a process that reaches it can run commands inside the app.
+    pub fn proxy_baseline(host_bus: &Path, socket_dir: &Path, host: &dyn Host) -> Self {
         let mut a = Self {
             namespaces: Vec::new(),
             skeleton: Vec::new(),
@@ -294,15 +298,11 @@ impl BwrapArgs {
             &mut a.skeleton,
             [o("--ro-bind"), host_bus.as_os_str(), host_bus.as_os_str()],
         );
-        // Read-write and nothing above it: the proxy has to create its
-        // socket here, and this directory holds only this instance's state.
+        // Read-write because the proxy has to create its socket here, and
+        // nothing else of the session is in this directory.
         push(
             &mut a.skeleton,
-            [
-                o("--bind"),
-                instance_runtime.as_os_str(),
-                instance_runtime.as_os_str(),
-            ],
+            [o("--bind"), socket_dir.as_os_str(), socket_dir.as_os_str()],
         );
         push(&mut a.env, [o("--clearenv")]);
         a
@@ -648,7 +648,7 @@ mod tests {
             .with("/etc/hosts", f);
         let argv = BwrapArgs::proxy_baseline(
             Path::new("/run/user/1000/bus"),
-            Path::new("/run/user/1000/bubbler/t"),
+            Path::new("/run/user/1000/bubbler/t/dbus"),
             &host,
         )
         .finish_plain(&["xdg-dbus-proxy".into()], &mut Counter::new())
@@ -695,8 +695,8 @@ mod tests {
                 "/run/user/1000/bus",
                 "/run/user/1000/bus",
                 "--bind",
-                "/run/user/1000/bubbler/t",
-                "/run/user/1000/bubbler/t",
+                "/run/user/1000/bubbler/t/dbus",
+                "/run/user/1000/bubbler/t/dbus",
                 "--clearenv",
                 "--",
                 "xdg-dbus-proxy",
@@ -709,7 +709,7 @@ mod tests {
     fn proxy_sandbox_takes_the_flatpak_info_data_file() {
         let mut args = BwrapArgs::proxy_baseline(
             Path::new("/run/user/1000/bus"),
-            Path::new("/run/user/1000/bubbler/t"),
+            Path::new("/run/user/1000/bubbler/t/dbus"),
             &FakeHost::default(),
         );
         args.ro_bind_data(

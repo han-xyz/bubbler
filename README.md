@@ -116,8 +116,14 @@ holding at most `ld.so.cache`, `ld.so.conf`, `ld.so.conf.d` and
 directory read-write — and binds the filtered socket it serves at
 `$XDG_RUNTIME_DIR/bus` inside the sandbox, with `DBUS_SESSION_BUS_ADDRESS`
 pointing there. The start waits up to five seconds for the proxy to report
-its socket and fails if it does not; the proxy exits with the sandbox.
-`--dry-run` prints that bind without starting anything.
+that it has bound its socket and is accepting connections, and fails if it
+does not; the proxy exits with the sandbox. `--dry-run` prints that bind
+without starting anything.
+
+The proxy's socket lives in `$XDG_RUNTIME_DIR/bubbler/<name>/dbus/`, and that
+directory is the only writable path in the proxy's own sandbox. The instance
+directory above it is never bound there: it holds the control socket
+`init.sock`, and reaching that socket means running commands inside the app.
 
 The host bus is `$DBUS_SESSION_BUS_ADDRESS` when it is a `unix:path=`
 address, else `$XDG_RUNTIME_DIR/bus`, and must be a socket. Everything the
@@ -168,7 +174,8 @@ Instances live in `$XDG_DATA_HOME/bubbler/instances/<name>/` (by default under
 `~/.local/share`), each holding a `config.kdl` and the private `home/`. Every
 run except `--dry-run` also creates `$XDG_RUNTIME_DIR/bubbler/<name>/`, mode
 0700, reusing one left over from an earlier run, and binds the control socket
-`init.sock` in it. `HOME` and `XDG_RUNTIME_DIR` must be set and non-empty.
+`init.sock` in it; a `dbus` grant adds the subdirectory `dbus/` holding the
+proxied bus socket. `HOME` and `XDG_RUNTIME_DIR` must be set and non-empty.
 
 The `bubbler-init` binary is taken from `$BUBBLER_INIT` if set (it must be a
 regular file), else from next to the `bubbler` binary, else from

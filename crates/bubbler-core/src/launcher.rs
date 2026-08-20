@@ -193,9 +193,10 @@ pub fn build_argv(
 ) -> Result<Vec<OsString>, LaunchError> {
     let command = resolve_command(inst, command)?;
     let host = RealHost;
+    let plan = dbus::plan(&inst.config.services, &inst.name);
     let ctx = service::ServiceCtx {
         instance_runtime: instance_runtime_dir(env, &inst.name),
-        instance: &inst.name,
+        dbus: plan.as_ref(),
     };
     let mut args = BwrapArgs::baseline(env, &inst.home(), &host);
     service::apply_all(&inst.config.services, env, &mut args, &host, &ctx)?;
@@ -217,7 +218,7 @@ pub fn proxy_argv(
 ) -> Result<Vec<OsString>, LaunchError> {
     let ready = alloc.ready_pipe().map_err(LaunchError::Data)?;
     let command = dbus::proxy_command(plan, host_bus, dir, env.dbus_log, &ready);
-    let mut args = BwrapArgs::proxy_baseline(host_bus, dir, host);
+    let mut args = BwrapArgs::proxy_baseline(host_bus, &dbus::socket_dir(dir), host);
     // The proxy reads this to decide it is talking for a sandboxed app;
     // without `portals` it is only the `[Application]` section.
     args.ro_bind_data(
@@ -228,21 +229,25 @@ pub fn proxy_argv(
     args.finish_plain(&command, alloc)
 }
 
-/// A running proxy sidecar. Closing the fds it inherited closes its
-/// `--fd` pipe, which is what makes `xdg-dbus-proxy` exit, so the handle
-/// must outlive the sandbox that uses the socket.
+/// A running proxy sidecar. Dropping every end of its `--fd` pipe that
+/// bubbler holds is what makes `xdg-dbus-proxy` exit, so the handle must
+/// outlive the sandbox that uses the socket.
 #[derive(Debug)]
 pub struct ProxyHandle {
     child: Child,
-    /// Holds the write end of the ready pipe and the `/.flatpak-info` fd.
+    /// Holds both ends of the ready pipe and the `/.flatpak-info` fd.
     alloc: RealAlloc,
 }
 
 impl Drop for ProxyHandle {
     /// Close the ready pipe so the proxy exits by itself, then reap it;
     /// a proxy that ignores the closed pipe is killed instead of leaking.
+    // The proxy polls its own write end and leaves on `POLLHUP`, which
+    // needs the last *read* end gone: keeping ours would hold it alive
+    // until the kill below.
     fn drop(&mut self) {
         self.alloc.fds.clear();
+        self.alloc.ready_read.take();
         let deadline = Instant::now() + PROXY_STOP;
         loop {
             match self.child.try_wait() {
@@ -259,9 +264,10 @@ impl Drop for ProxyHandle {
     }
 }
 
-/// Wait for the sidecar's ready byte. False when the deadline passes, the
-/// pipe reaches EOF or the child is gone: in each case nothing is
-/// listening on the socket the sandbox is about to bind.
+/// Wait for the sidecar's ready byte, which says it has bound its socket
+/// and is accepting connections. False when the deadline passes, the pipe
+/// reaches EOF or the child is gone: in each case nothing is listening on
+/// the socket the sandbox is about to bind.
 fn wait_ready(ready: &OwnedFd, child: &mut Child, deadline: Instant) -> bool {
     let mut byte = [0u8; 1];
     loop {
@@ -270,7 +276,10 @@ fn wait_ready(ready: &OwnedFd, child: &mut Child, deadline: Instant) -> bool {
             tv_nsec: POLL.subsec_nanos() as Nsecs,
         };
         match poll(&mut [PollFd::new(ready, PollFlags::IN)], Some(&slice)) {
-            Ok(0) | Err(_) => {}
+            // `Ok(0)` already waited out the slice; a failing poll keeps
+            // failing, so sleep rather than spin until the deadline.
+            Ok(0) => {}
+            Err(_) => std::thread::sleep(POLL),
             Ok(_) => match rustix::io::read(ready, &mut byte) {
                 Ok(0) => return false,
                 Ok(_) => return true,
@@ -298,6 +307,9 @@ pub fn start_proxy(
     host: &dyn Host,
 ) -> Result<ProxyHandle, LaunchError> {
     let host_bus = service::require_socket(host, "dbus", dbus::host_bus(env))?;
+    // The proxy gets this directory and nothing else of the instance's
+    // runtime state, so it is created here rather than bound from above.
+    mkdir_private(&dbus::socket_dir(dir))?;
     let mut alloc = RealAlloc::sidecar();
     let argv = proxy_argv(env, plan, &host_bus, dir, host, &mut alloc)?;
     let child = Command::new("bwrap")
@@ -491,6 +503,8 @@ pub fn run(env: &Env, inst: &Instance, command: Option<&[OsString]>) -> Result<i
     // bwrap must inherit exactly this one fd; everything else stays CLOEXEC.
     fcntl_setfd(&inherited, FdFlags::empty()).map_err(io_at)?;
     let mut alloc = RealAlloc::new(inherited.as_raw_fd());
+    // A run with nothing to run must fail before a sidecar is started.
+    resolve_command(inst, command)?;
     // Before the argv is built, so the proxy's socket is there for bwrap
     // to bind: a missing bind source is a failed start, not a warning.
     let _proxy = match dbus::plan(&inst.config.services, &inst.name) {
@@ -765,8 +779,8 @@ mod tests {
                 "/run/user/1000/bus",
                 "/run/user/1000/bus",
                 "--bind",
-                "/run/user/1000/bubbler/t",
-                "/run/user/1000/bubbler/t",
+                "/run/user/1000/bubbler/t/dbus",
+                "/run/user/1000/bubbler/t/dbus",
                 "--perms",
                 "0644",
                 "--ro-bind-data",
@@ -777,10 +791,46 @@ mod tests {
                 "xdg-dbus-proxy",
                 "--fd=3",
                 "unix:path=/run/user/1000/bus",
-                "/run/user/1000/bubbler/t/bus",
+                "/run/user/1000/bubbler/t/dbus/bus",
                 "--filter",
                 "--talk=org.freedesktop.Notifications",
             ]
+        );
+    }
+
+    #[test]
+    fn the_proxy_never_sees_the_instances_control_socket() {
+        use crate::config::Service;
+        use crate::host::fake::FakeHost;
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let plan = dbus::plan(&[Service::Dbus { rules: vec![] }], "t").expect("dbus is granted");
+        let dir = Path::new("/run/user/1000/bubbler/t");
+        let argv = strs(
+            &proxy_argv(
+                &e,
+                &plan,
+                Path::new("/run/user/1000/bus"),
+                dir,
+                &FakeHost::default(),
+                &mut DryRunAlloc::default(),
+            )
+            .unwrap(),
+        );
+        // Compared element-wise: the instance directory is a prefix of the
+        // socket directory, so a substring check would prove nothing.
+        assert!(
+            !argv.iter().any(|a| a == dir.to_str().unwrap()),
+            "the instance directory itself is bound: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.contains(exec::SOCKET_NAME)),
+            "the control socket is reachable from the proxy: {argv:?}"
+        );
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--bind").count(),
+            1,
+            "the socket directory is the only writable bind: {argv:?}"
         );
     }
 
@@ -812,7 +862,11 @@ mod tests {
         let e = env(tmp.path());
         let i = inst(tmp.path(), "dbus\nportals\ncommand \"x\"");
         let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default()).unwrap());
-        let bus = tmp.path().join("run/bubbler/t/bus").display().to_string();
+        let bus = tmp
+            .path()
+            .join("run/bubbler/t/dbus/bus")
+            .display()
+            .to_string();
         let inside = tmp.path().join("run/bus").display().to_string();
         assert!(
             a.windows(3)

@@ -25,8 +25,10 @@ pub struct ServiceCtx<'a> {
     /// `$XDG_RUNTIME_DIR/bubbler/<instance>` on the host: where the
     /// launcher's sidecars put the sockets a service binds.
     pub instance_runtime: PathBuf,
-    /// The instance name, already validated as `[A-Za-z0-9._-]+`.
-    pub instance: &'a str,
+    /// The D-Bus plan the launcher carries out, when `dbus` is granted.
+    /// `portals` binds the `/.flatpak-info` from it, so the sandbox and
+    /// the proxy are handed the very same bytes.
+    pub dbus: Option<&'a dbus::Plan>,
 }
 
 /// Apply every service to `args`. `host` reports the type of a host path
@@ -52,11 +54,7 @@ pub fn apply_all(
             Service::Pulseaudio => pulseaudio(env, args, host)?,
             Service::EtcShare { name } => etc_share(args, host, name)?,
             Service::Dbus { .. } => dbus_socket(env, args, ctx),
-            Service::Portals => args.ro_bind_data(
-                dbus::flatpak_info(ctx.instance, true),
-                Path::new(dbus::FLATPAK_INFO),
-                "0644",
-            ),
+            Service::Portals => portals(args, ctx)?,
             // Rule-only bundles: they reach the sandbox through the proxy
             // the launcher starts, not through bwrap arguments.
             Service::Notify | Service::Mpris { .. } => {}
@@ -292,6 +290,23 @@ fn dbus_socket(env: &Env, args: &mut BwrapArgs, ctx: &ServiceCtx) {
     args.setenv(OsStr::new("DBUS_SESSION_BUS_ADDRESS"), &address);
 }
 
+/// Bind the `/.flatpak-info` portals identify the sandbox by. The bytes
+/// come from the launcher's plan, which hands the proxy the same file.
+/// Without a plan there is no proxy and no bus, so the grant is refused
+/// rather than quietly dropped; the parser rejects that config already.
+fn portals(args: &mut BwrapArgs, ctx: &ServiceCtx) -> Result<(), LaunchError> {
+    let plan = ctx.dbus.ok_or(LaunchError::BadValue {
+        service: "portals",
+        reason: "requires dbus".to_owned(),
+    })?;
+    args.ro_bind_data(
+        plan.flatpak_info.clone(),
+        Path::new(dbus::FLATPAK_INFO),
+        "0644",
+    );
+    Ok(())
+}
+
 /// Emit profile/instance `env` pairs after all service variables, so a
 /// profile can layer toolkit settings on top. A [`RESERVED_ENV`] key is
 /// refused here as well as in the parser, so a caller building an
@@ -419,10 +434,12 @@ mod tests {
         argv_linked(services, env, existing, &[])
     }
 
-    fn ctx() -> ServiceCtx<'static> {
+    /// Services are applied with the plan the launcher would build, so a
+    /// test sees the same `/.flatpak-info` the proxy would.
+    fn argv_ctx<'a>(plan: &'a Option<dbus::Plan>) -> ServiceCtx<'a> {
         ServiceCtx {
             instance_runtime: "/run/user/1000/bubbler/t".into(),
-            instance: "t",
+            dbus: plan.as_ref(),
         }
     }
 
@@ -447,8 +464,9 @@ mod tests {
         for (from, to) in links {
             host = host.link(from, to);
         }
+        let plan = dbus::plan(services, "t");
         let mut args = BwrapArgs::baseline(env, Path::new("/i/home"), &host);
-        apply_all(services, env, &mut args, &host, &ctx())?;
+        apply_all(services, env, &mut args, &host, &argv_ctx(&plan))?;
         Ok(strs(&args.finish(
             &[OsString::from("x")],
             &mut crate::launcher::DryRunAlloc::default(),
@@ -884,7 +902,7 @@ mod tests {
         let e = env();
         let mut args = BwrapArgs::baseline(&e, Path::new("/i/home"), &host);
         assert!(matches!(
-            apply_all(&svcs, &e, &mut args, &NoHome(host), &ctx()),
+            apply_all(&svcs, &e, &mut args, &NoHome(host), &argv_ctx(&None)),
             Err(LaunchError::MissingResource {
                 service: "home-share",
                 ..
@@ -1083,7 +1101,7 @@ mod tests {
                 &a,
                 &[
                     "--ro-bind",
-                    "/run/user/1000/bubbler/t/bus",
+                    "/run/user/1000/bubbler/t/dbus/bus",
                     "/run/user/1000/bus"
                 ]
             ),
@@ -1104,7 +1122,7 @@ mod tests {
         // usual runtime path, not at the instance's directory.
         assert_eq!(
             a.iter()
-                .filter(|s| *s == "/run/user/1000/bubbler/t/bus")
+                .filter(|s| *s == "/run/user/1000/bubbler/t/dbus/bus")
                 .count(),
             1
         );
@@ -1152,7 +1170,7 @@ mod tests {
         let host = FakeHost::default().with("/run/user/1000/wayland-1", sock);
         let e = env();
         let mut args = BwrapArgs::baseline(&e, Path::new("/i/home"), &host);
-        apply_all(&[Service::Wayland], &e, &mut args, &host, &ctx()).unwrap();
+        apply_all(&[Service::Wayland], &e, &mut args, &host, &argv_ctx(&None)).unwrap();
         apply_env(&[("MOZ_ENABLE_WAYLAND".into(), "1".into())], &mut args).unwrap();
         let a = strs(
             &args

@@ -547,6 +547,36 @@ fn real_dbus_hides_names_the_rules_do_not_grant() {
 }
 
 #[test]
+fn real_dbus_run_ends_as_soon_as_the_command_does() {
+    if !require_dbus() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let name = "bubbler-test-dbus-timing";
+    let _leftovers = dbus_instance(tmp.path(), &init, name, "dbus\ncommand \"/usr/bin/true\"\n");
+
+    let started = Instant::now();
+    let out = bubbler_dbus(tmp.path(), &init)
+        .args(["run", name])
+        .output()
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The proxy leaves when the ready pipe closes; a run that waits out
+    // the stop grace and kills it instead takes a second longer.
+    assert!(
+        elapsed < Duration::from_millis(800),
+        "the run took {elapsed:?}, so the proxy was killed rather than closed"
+    );
+}
+
+#[test]
 fn real_dbus_notify_reaches_the_notification_service() {
     if !require_dbus() {
         return;

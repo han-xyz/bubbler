@@ -110,10 +110,19 @@ pub fn flatpak_info(instance: &str, portals: bool) -> Vec<u8> {
     s.into_bytes()
 }
 
-/// The filtered socket inside an instance's runtime directory. Both the
-/// proxy (which creates it) and the sandbox (which binds it) use this.
+/// The only directory the proxy sandbox may write to, a subdirectory of
+/// the instance's runtime directory. The instance directory itself is
+/// never handed to the proxy: it holds the control socket the supervisor
+/// listens on, and anything that can reach that socket can run commands
+/// in the app sandbox.
+pub fn socket_dir(instance_runtime: &Path) -> PathBuf {
+    instance_runtime.join("dbus")
+}
+
+/// The filtered socket, in [`socket_dir`]. The single source of truth for
+/// the proxy command, the proxy's bind and the sandbox's own bind.
 pub fn bus_path(instance_runtime: &Path) -> PathBuf {
-    instance_runtime.join("bus")
+    socket_dir(instance_runtime).join("bus")
 }
 
 /// Host session bus socket: the `unix:path=` of `$DBUS_SESSION_BUS_ADDRESS`
@@ -329,7 +338,7 @@ mod tests {
                 "xdg-dbus-proxy",
                 "--fd=4",
                 "unix:path=/run/user/1000/bus",
-                "/run/user/1000/bubbler/t/bus",
+                "/run/user/1000/bubbler/t/dbus/bus",
                 "--filter",
                 "--talk=org.freedesktop.Notifications",
             ]
