@@ -3625,6 +3625,16 @@ fn probe_source() -> String {
     let nr = |name: &str| {
         syscall_number(name).unwrap_or_else(|| panic!("no `{name}` on this architecture"))
     };
+    // Only x86_64 has a second ABI sharing its `AUDIT_ARCH` value, so it
+    // is the only one where `nr | __X32_SYSCALL_BIT` names a syscall at
+    // all; elsewhere the line would report a number the kernel never had.
+    #[cfg(target_arch = "x86_64")]
+    let x32 = format!(
+        "    (\"keyctl_x32\", call({}, 0, -3, 0)),\n",
+        nr("keyctl") | 0x4000_0000
+    );
+    #[cfg(not(target_arch = "x86_64"))]
+    let x32 = String::new();
     format!(
         r#"import ctypes, errno
 libc = ctypes.CDLL(None, use_errno=True)
@@ -3648,7 +3658,7 @@ def ioctl(request):
 probe = [
     # KEYCTL_GET_KEYRING_ID of KEY_SPEC_SESSION_KEYRING, creating nothing.
     ("keyctl", call({keyctl}, 0, -3, 0)),
-    # A null attribute struct: the kernel faults before it opens anything.
+{x32}    # A null attribute struct: the kernel faults before it opens anything.
     ("perf_event_open", call({perf_event_open}, 0, 0, -1, -1, 0)),
     # Size 0 is rejected before any thread is made, so nothing is forked.
     ("clone3", call({clone3}, 0, 0)),
@@ -3659,6 +3669,7 @@ probe = [
 report = "\n".join("%s %s" % p for p in probe)
 "#,
         keyctl = nr("keyctl"),
+        x32 = x32,
         perf_event_open = nr("perf_event_open"),
         clone3 = nr("clone3"),
         getpid = nr("getpid"),
@@ -3742,6 +3753,11 @@ fn real_bwrap_seccomp_denies_the_default_list_and_nothing_else() {
         return;
     };
     assert_eq!(probed(&out, "keyctl"), "EPERM", "{out}");
+    // The same call with __X32_SYSCALL_BIT set: an x32 caller shares
+    // x86_64's AUDIT_ARCH value, so only the guard in front of the rules
+    // stops it from running past every one of them.
+    #[cfg(target_arch = "x86_64")]
+    assert_eq!(probed(&out, "keyctl_x32"), "EPERM", "{out}");
     assert_eq!(probed(&out, "perf_event_open"), "EPERM", "{out}");
     // ENOSYS, so glibc falls back to `clone`; unfiltered this is EINVAL.
     assert_eq!(probed(&out, "clone3"), "ENOSYS", "{out}");
@@ -3771,6 +3787,9 @@ fn real_bwrap_seccomp_disable_leaves_the_sandbox_unfiltered_and_says_so() {
         "{err}"
     );
     assert_ne!(probed(&out, "keyctl"), "EPERM", "{out}");
+    // No filter, so nothing denies the x32 call either.
+    #[cfg(target_arch = "x86_64")]
+    assert_ne!(probed(&out, "keyctl_x32"), "EPERM", "{out}");
     assert_ne!(probed(&out, "perf_event_open"), "EPERM", "{out}");
     assert_ne!(probed(&out, "clone3"), "ENOSYS", "{out}");
     assert_ne!(probed(&out, "tiocsti"), "EPERM", "{out}");

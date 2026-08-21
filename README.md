@@ -148,8 +148,8 @@ file descriptor numbers are the ones a dry run prints.
         rule-only: --talk=org.freedesktop.Notifications
 
       seccomp                                        4 arguments
-        --add-seccomp-fd 5  (EPERM program, 1672 bytes)
-        --add-seccomp-fd 6  (ENOSYS program, 360 bytes)
+        --add-seccomp-fd 5  (EPERM program, 1696 bytes)
+        --add-seccomp-fd 6  (ENOSYS program, 384 bytes)
 
       wayland                         config.kdl:2   9 arguments
         --ro-bind /run/user/1000/wayland-1 /run/user/1000/wayland-1
@@ -1010,7 +1010,11 @@ skipped rather than compiled.
 
 The filter carries the architecture bubbler was built for, and a syscall made
 from any other ABI is killed rather than allowed — a 32-bit (i386) binary
-inside a sandbox dies on its first syscall. Anything shipping 32-bit code,
+inside a sandbox dies on its first syscall. x32 is the ABI that check cannot
+see, since it shares x86_64's `AUDIT_ARCH` value, so on x86_64 every program
+starts with three instructions answering `EPERM` to any syscall carrying
+`__X32_SYSCALL_BIT`; neither `allow` nor `BUBBLER_SECCOMP_LOG` reaches that
+guard. Anything shipping 32-bit code,
 Steam and some Wine setups among them, needs `seccomp { disable }` until a
 libseccomp backend can add the second architecture to the filter.
 

@@ -11,6 +11,9 @@ use seccompiler::{
     SeccompRule, TargetArch,
 };
 
+#[cfg(target_arch = "x86_64")]
+use seccompiler::sock_filter;
+
 use crate::error::LaunchError;
 
 /// Syscalls the default filter answers with `EPERM`: the kernel keyring,
@@ -55,6 +58,7 @@ pub const DEFAULT_EPERM: &[&str] = &[
     "clock_settime64",
     "adjtimex",
     "clock_adjtime",
+    "clock_adjtime64",
     "sethostname",
     "setdomainname",
     "nfsservctl",
@@ -199,14 +203,74 @@ impl RuleSet {
 }
 
 /// The architecture the filter is compiled for. seccompiler embeds a check
-/// for it and kills a caller from any other ABI, so a 32-bit binary in the
-/// sandbox dies rather than slipping past the rules.
+/// for it and kills a caller from any other ABI, so a 32-bit (i386) binary
+/// in the sandbox dies rather than slipping past the rules. x32 is the one
+/// ABI that check cannot see; [`X32_GUARD`] is what stops it.
 #[cfg(target_arch = "x86_64")]
 const TARGET: TargetArch = TargetArch::x86_64;
 #[cfg(target_arch = "aarch64")]
 const TARGET: TargetArch = TargetArch::aarch64;
 #[cfg(target_arch = "riscv64")]
 const TARGET: TargetArch = TargetArch::riscv64;
+
+/// Denies every syscall made with `__X32_SYSCALL_BIT` set, in front of
+/// each compiled program. The x32 ABI shares x86_64's `AUDIT_ARCH_X86_64`,
+/// so [`TARGET`]'s architecture check passes an x32 caller straight into
+/// the rules, where every number misses: `keyctl` is 250 and an x32 caller
+/// asks for `0x4000_0000 | 250`. `man 2 seccomp`: a policy "must either
+/// deny all syscalls with `__X32_SYSCALL_BIT` or it must recognize
+/// syscalls with and without `__X32_SYSCALL_BIT` set".
+///
+/// Both programs answer `EPERM` here, the `ENOSYS` one included: an x32
+/// call is refused, not made to look unimplemented, and there is no older
+/// call to fall back to. `BUBBLER_SECCOMP_LOG` does not soften it either,
+/// because this is an ABI gate like the architecture check seccompiler
+/// emits, not one of the denylist's rules. Anything below the bit falls
+/// through into seccompiler's output, which needs no relocating: every
+/// jump a cBPF program makes is relative to the instruction making it.
+// Instruction codes from `linux/bpf_common.h`, `__X32_SYSCALL_BIT` from
+// `asm/unistd.h`, the return value from `linux/seccomp.h`.
+#[cfg(target_arch = "x86_64")]
+const X32_GUARD: [sock_filter; 3] = [
+    // BPF_LD | BPF_W | BPF_ABS of `seccomp_data.nr`, at offset 0.
+    sock_filter {
+        code: 0x0020,
+        jt: 0,
+        jf: 0,
+        k: 0,
+    },
+    // BPF_JMP | BPF_JGE | BPF_K: at or above the bit falls into the
+    // return below, anything else skips it into the rules.
+    sock_filter {
+        code: 0x0035,
+        jt: 0,
+        jf: 1,
+        k: 0x4000_0000,
+    },
+    // BPF_RET | BPF_K of SECCOMP_RET_ERRNO | EPERM.
+    sock_filter {
+        code: 0x0006,
+        jt: 0,
+        jf: 0,
+        k: 0x0005_0000 | 1,
+    },
+];
+
+/// `program` behind [`X32_GUARD`]. x86_64 is the only architecture
+/// bubbler builds for that has a second ABI sharing its `AUDIT_ARCH`
+/// value, so elsewhere seccompiler's own check already sees every caller.
+#[cfg(target_arch = "x86_64")]
+fn guarded(program: BpfProgram) -> BpfProgram {
+    let mut out = Vec::with_capacity(X32_GUARD.len() + program.len());
+    out.extend_from_slice(&X32_GUARD);
+    out.extend(program);
+    out
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn guarded(program: BpfProgram) -> BpfProgram {
+    program
+}
 
 /// Mask applied to `ioctl`'s request argument. The comparison is already
 /// a `SeccompCmpArgLen::Dword` one, which looks at the low 32 bits —
@@ -259,7 +323,7 @@ pub fn compile(set: &RuleSet, log: bool) -> Result<Vec<Program>, LaunchError> {
             .map_err(|e: seccompiler::BackendError| LaunchError::Seccomp(e.to_string()))?;
         out.push(Program {
             errno: kind,
-            bytes: program_bytes(&program),
+            bytes: program_bytes(&guarded(program)),
         });
     }
     Ok(out)
@@ -330,8 +394,9 @@ fn program_bytes(program: &BpfProgram) -> Vec<u8> {
 // Syscall numbers for the architecture bubbler is built for, sorted by
 // name so `syscall_number` can binary-search it.
 // Source: Linux 7.1 `arch/x86/entry/syscalls/syscall_64.tbl`, ABI columns
-// `common` and `64`. The x32 ABI is left out: seccompiler's architecture
-// check kills an x32 caller before any rule runs.
+// `common` and `64`. The x32 ABI is left out on purpose: it shares this
+// one's `AUDIT_ARCH_X86_64`, so `X32_GUARD` denies its numbers outright
+// rather than the table carrying a second set of them.
 #[cfg(target_arch = "x86_64")]
 static SYSCALLS: &[(&str, i64)] = &[
     ("_sysctl", 156),
@@ -1415,13 +1480,14 @@ mod tests {
     /// Default names the build architecture never had. Denying them is
     /// harmless, but the set must not grow by accident.
     #[cfg(target_arch = "x86_64")]
-    const ABSENT_HERE: &[&str] = &["clock_settime64", "vm86", "vm86old"];
+    const ABSENT_HERE: &[&str] = &["clock_settime64", "clock_adjtime64", "vm86", "vm86old"];
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     const ABSENT_HERE: &[&str] = &[
         "uselib",
         "iopl",
         "ioperm",
         "clock_settime64",
+        "clock_adjtime64",
         "vm86",
         "vm86old",
         "modify_ldt",
@@ -1580,6 +1646,13 @@ mod tests {
             .collect()
     }
 
+    /// Instructions of the x32 guard, which only x86_64 has a second ABI
+    /// to need.
+    #[cfg(target_arch = "x86_64")]
+    const GUARD_LEN: usize = 3;
+    #[cfg(not(target_arch = "x86_64"))]
+    const GUARD_LEN: usize = 0;
+
     /// Instructions in the EPERM program of the default set. seccompiler
     /// emits 3 for the architecture check, 1 to load the syscall number
     /// and 1 closing mismatch action; then 5 for every syscall denied
@@ -1588,15 +1661,15 @@ mod tests {
     /// and mismatch action around rules of two jumps, load, mask, compare
     /// and match action). x86_64 resolves 38 of the 41 `DEFAULT_EPERM`
     /// names (`ABSENT_HERE`) and adds the two `ioctl` rules:
-    /// 5 + 38 * 5 + 2 + 2 * 6 = 209.
+    /// 5 + 38 * 5 + 2 + 2 * 6 = 209, behind the x32 guard.
     #[cfg(target_arch = "x86_64")]
-    const EPERM_LEN: usize = 209;
+    const EPERM_LEN: usize = GUARD_LEN + 209;
     /// As above with 34 of the names: 5 + 34 * 5 + 2 + 2 * 6 = 189.
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     const EPERM_LEN: usize = 189;
     /// All eight `DEFAULT_ENOSYS` names resolve everywhere, and none of
-    /// them filters on an argument: 5 + 8 * 5 = 45.
-    const ENOSYS_LEN: usize = 45;
+    /// them filters on an argument: 5 + 8 * 5 = 45, behind the guard.
+    const ENOSYS_LEN: usize = GUARD_LEN + 45;
 
     #[test]
     fn the_default_set_compiles_to_two_programs_of_a_known_size() {
@@ -1609,9 +1682,62 @@ mod tests {
     #[test]
     fn a_program_starts_with_the_architecture_check() {
         let programs = compile(&RuleSet::default_set(), false).unwrap();
-        let first = instructions(&programs[0].bytes)[0];
+        let first = instructions(&programs[0].bytes)[GUARD_LEN];
         // BPF_LD | BPF_W | BPF_ABS of `seccomp_data.arch`, at offset 4.
         assert_eq!(first, (0x0020, 0, 0, 4));
+    }
+
+    /// The guard as bwrap reads it: `code` `jt` `jf` `k`, little-endian.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_x32_guard_is_the_same_three_instructions_on_every_program() {
+        let programs = compile(&RuleSet::default_set(), false).unwrap();
+        assert_eq!(programs.len(), 2);
+        for program in &programs {
+            assert_eq!(
+                &program.bytes[..GUARD_LEN * 8],
+                [
+                    // LD  [0]              ; seccomp_data.nr
+                    0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    // JGE 0x40000000 jf=1  ; __X32_SYSCALL_BIT
+                    0x35, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x40,
+                    // RET SECCOMP_RET_ERRNO | EPERM
+                    0x06, 0x00, 0x00, 0x00, 0x01, 0x00, 0x05, 0x00,
+                ]
+            );
+        }
+    }
+
+    /// The guard and seccompiler's output are one flat program: the body
+    /// is spliced in behind the guard exactly as it was compiled, since
+    /// every jump in it is relative.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_guard_and_the_body_flatten_into_one_program() {
+        let set = RuleSet {
+            eperm: vec!["keyctl".to_owned()],
+            enosys: vec![],
+            ioctl_eperm: vec![],
+        };
+        let programs = compile(&set, false).unwrap();
+        assert_eq!(
+            instructions(&programs[0].bytes),
+            [
+                (0x0020, 0, 0, 0x0000_0000), // LD  [0]      nr
+                (0x0035, 0, 1, 0x4000_0000), // JGE bit 30   -> RET, else +1
+                (0x0006, 0, 0, 0x0005_0001), // RET ERRNO(EPERM)
+                (0x0020, 0, 0, 0x0000_0004), // LD  [4]      arch
+                (0x0015, 1, 0, 0xc000_003e), // JEQ AUDIT_ARCH_X86_64
+                (0x0006, 0, 0, 0x8000_0000), // RET KILL_PROCESS
+                (0x0020, 0, 0, 0x0000_0000), // LD  [0]      nr
+                (0x0015, 0, 1, 0x0000_00fa), // JEQ keyctl
+                (0x0005, 0, 0, 0x0000_0001), // JA  +1       -> match
+                (0x0005, 0, 0, 0x0000_0002), // JA  +2       -> allow
+                (0x0006, 0, 0, 0x0005_0001), // RET ERRNO(EPERM)
+                (0x0006, 0, 0, 0x7fff_0000), // RET ALLOW
+                (0x0006, 0, 0, 0x7fff_0000), // RET ALLOW
+            ]
+        );
     }
 
     #[test]
@@ -1674,7 +1800,7 @@ mod tests {
         };
         let programs = compile(&set, false).unwrap();
         // 5 + 1 * 5: the blanket rule only, no argument comparison.
-        assert_eq!(instructions(&programs[0].bytes).len(), 10);
+        assert_eq!(instructions(&programs[0].bytes).len(), GUARD_LEN + 10);
     }
 
     #[test]
@@ -1698,7 +1824,10 @@ mod tests {
         };
         let programs = compile(&set, false).unwrap();
         let names = ABSENT_HERE.iter().filter(|n| **n == "vm86old").count();
-        assert_eq!(instructions(&programs[0].bytes).len(), 5 + (2 - names) * 5);
+        assert_eq!(
+            instructions(&programs[0].bytes).len(),
+            GUARD_LEN + 5 + (2 - names) * 5
+        );
     }
 
     #[test]
@@ -1721,8 +1850,15 @@ mod tests {
             assert_eq!(q.bytes.len(), l.bytes.len());
             assert_ne!(q, l, "the match action must differ");
         }
-        // SECCOMP_RET_LOG, and no SECCOMP_RET_ERRNO with EPERM in it.
-        let ks: Vec<u32> = instructions(&logged[0].bytes).iter().map(|i| i.3).collect();
+        // SECCOMP_RET_LOG, and no SECCOMP_RET_ERRNO with EPERM left in
+        // the rules. The x32 guard in front of them is an ABI gate, not a
+        // rule, so it keeps denying whatever the log switch says.
+        let insns = instructions(&logged[0].bytes);
+        assert_eq!(
+            insns[..GUARD_LEN],
+            instructions(&quiet[0].bytes)[..GUARD_LEN]
+        );
+        let ks: Vec<u32> = insns[GUARD_LEN..].iter().map(|i| i.3).collect();
         assert!(ks.contains(&0x7ffc_0000));
         assert!(!ks.contains(&(0x0005_0000 | 1)));
     }
