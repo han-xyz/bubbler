@@ -1,0 +1,48 @@
+// bubbler profile: lutris
+//
+// Lutris itself is a GTK app, but every Wine or Proton game it starts is
+// an X11 client — Wine's X11 driver takes precedence over its Wayland one
+// whenever DISPLAY is set (Arch wiki, Wine#Wayland) — so this profile
+// grants `x11`, with the isolation caveat that carries: X11 clients can
+// keylog and inject into each other.
+//
+// `seccomp { disable }` is here for the same reason as in `steam`: umu,
+// Proton and DXVK's 32-bit path make i386 syscalls, and the filter holds
+// one architecture. Never add `userns "disable"` either — those runtimes
+// nest pressure-vessel's own bubblewrap.
+//
+// GameMode is optional on the host: the D-Bus name below simply resolves
+// to nothing when gamemoded is not installed.
+//
+// `portals` stays because Lutris calls them itself. Not measured here: a
+// Proton or umu game brings pressure-vessel, the same steam-runtime-tools
+// that refuses to run where /.flatpak-info exists (see `steam`), so drop
+// the grant if a game stops with a Flatpak complaint.
+//
+// ~/Games is Lutris's own convention for the install directory, and a
+// missing share source is an error rather than a skipped bind, so create
+// it (`mkdir ~/Games`) or edit the node to the directory you use. A prefix
+// or library outside the home is named explicitly, e.g.
+//   path-share "/kioxia/Games" mode=rw
+wayland
+x11
+dri
+pipewire
+network
+dbus {
+    own "net.lutris.Lutris"
+    talk "com.feralinteractive.GameMode"
+    talk "org.freedesktop.ScreenSaver"
+}
+portals
+notify
+tray
+gamepad
+system-bus {
+    talk "org.freedesktop.UDisks2"
+}
+home-share "Games" mode=rw
+seccomp {
+    disable
+}
+command "lutris"

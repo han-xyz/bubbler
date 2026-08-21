@@ -4,10 +4,11 @@ dri
 pipewire
 pulseaudio
 network
-dbus
+dbus {
+    own "org.mozilla.firefox.*"
+}
 portals
 notify
 mpris name="firefox.*"
 home-share "Downloads" mode=rw
-env MOZ_ENABLE_WAYLAND="1"
 command "firefox"

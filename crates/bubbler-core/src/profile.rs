@@ -24,6 +24,7 @@ pub const NAMES: &[&str] = &[
     "firefox",
     "generic",
     "libreoffice",
+    "lutris",
     "mpv",
     "steam",
     "thunderbird",
@@ -52,6 +53,7 @@ pub fn lookup(name: &str) -> Option<&'static str> {
         "firefox" => Some(include_str!("../profiles/firefox.kdl")),
         "generic" => Some(include_str!("../profiles/generic.kdl")),
         "libreoffice" => Some(include_str!("../profiles/libreoffice.kdl")),
+        "lutris" => Some(include_str!("../profiles/lutris.kdl")),
         "mpv" => Some(include_str!("../profiles/mpv.kdl")),
         "steam" => Some(include_str!("../profiles/steam.kdl")),
         "thunderbird" => Some(include_str!("../profiles/thunderbird.kdl")),
@@ -765,10 +767,13 @@ mod tests {
         let ff = r.resolve("firefox").unwrap().config;
         assert!(ff.services.contains(&Service::Dri));
         assert!(ff.services.contains(&Service::Portals));
-        assert!(
-            ff.env
-                .contains(&("MOZ_ENABLE_WAYLAND".to_owned(), "1".to_owned()))
-        );
+        // Gecko picks Wayland on its own since Firefox 121, so the profile
+        // sets nothing; the owned name is the remote-instance protocol,
+        // which a second `firefox` needs to reach the running one.
+        assert!(ff.env.is_empty(), "{:?}", ff.env);
+        assert!(ff.services.contains(&Service::Dbus {
+            rules: vec![BusRule::Own("org.mozilla.firefox.*".to_owned())],
+        }));
         // One grant per profile the app does not work without, so a
         // profile edited into something weaker is caught here and not by
         // whoever runs it.
@@ -782,11 +787,7 @@ mod tests {
                 .services
                 .contains(&home_share("Videos", ShareMode::ReadOnly))
         );
-        assert!(
-            cfg("thunderbird")
-                .env
-                .contains(&("MOZ_ENABLE_WAYLAND".to_owned(), "1".to_owned()))
-        );
+        assert!(cfg("thunderbird").env.is_empty());
         assert!(
             cfg("libreoffice")
                 .env
@@ -804,11 +805,47 @@ mod tests {
             uinput: false
         }));
         // The 32-bit runtime would be killed by a filter built for this
-        // architecture alone.
+        // architecture alone, and steamwebhelper is an X11 client.
         assert!(steam.seccomp.disable);
+        assert!(steam.services.contains(&Service::X11));
+        assert!(steam.services.contains(&Service::SystemBus {
+            rules: vec![
+                BusRule::Talk("org.freedesktop.UPower".to_owned()),
+                BusRule::Talk("org.freedesktop.UDisks2".to_owned()),
+            ],
+        }));
+        // `portals` would write /.flatpak-info, which Steam's own runtime
+        // reads as being the unofficial Steam Flatpak: it then refuses to
+        // start without a flatpak-portal service to talk to.
+        assert!(!steam.services.contains(&Service::Portals));
+        // ~/.steam is a directory of absolute symlinks into the host home:
+        // shared, every one of them dangles inside and the account name
+        // the synthetic passwd hides leaks in with them.
+        assert!(
+            !steam
+                .services
+                .iter()
+                .any(|s| matches!(s, Service::HomeShare { .. })),
+            "{:?}",
+            steam.services
+        );
+
+        let lutris = cfg("lutris");
+        assert!(lutris.services.contains(&Service::X11));
+        assert!(lutris.seccomp.disable);
+        assert!(
+            lutris
+                .services
+                .contains(&home_share("Games", ShareMode::ReadWrite))
+        );
+        assert!(lutris.services.contains(&Service::SystemBus {
+            rules: vec![BusRule::Talk("org.freedesktop.UDisks2".to_owned())],
+        }));
+
         for n in [
             "chromium",
             "libreoffice",
+            "lutris",
             "mpv",
             "steam",
             "thunderbird",
@@ -818,6 +855,25 @@ mod tests {
         }
 
         assert!(matches!(r.resolve("nope"), Err(ProfileError::NotFound(n)) if n == "nope"));
+    }
+
+    #[test]
+    fn only_the_gaming_profiles_grant_x11_and_none_disables_user_namespaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(tmp.path(), &[], &[]);
+        let mut x11: Vec<&str> = Vec::new();
+        for n in NAMES {
+            let cfg = r.resolve(n).unwrap().config;
+            if cfg.services.contains(&Service::X11) {
+                x11.push(n);
+            }
+            // Proton, umu and pressure-vessel nest their own bubblewrap,
+            // and a browser's inner sandbox is a user namespace too.
+            assert_eq!(cfg.userns, Userns::Allow, "{n}");
+        }
+        // X11 gives a client the whole display: no profile gets it for
+        // convenience, only the two whose apps have no Wayland path.
+        assert_eq!(x11, ["lutris", "steam"]);
     }
 
     #[test]

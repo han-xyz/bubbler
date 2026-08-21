@@ -5,10 +5,10 @@ combining bubblejail's explicit instances and resource grants with a profile
 library in the spirit of firejail. bubbler itself is unprivileged; `bwrap`
 does the namespace work.
 
-Status: milestone 5 — a profile library (`alacritty`, `chromium`, `firefox`,
-`libreoffice`, `mpv`, `thunderbird` and `vesktop`, plus a partial `steam`)
+Status: milestone 6 — a profile library (`alacritty`, `chromium`, `firefox`,
+`libreoffice`, `lutris`, `mpv`, `steam`, `thunderbird` and `vesktop`)
 over GPU, sound, a private home, host paths through `path-share`, game
-controllers through `gamepad`, a filtered session bus with portals,
+controllers through `gamepad`, a filtered session and system bus with portals,
 notifications and `tray`, a terminal of their own and a seccomp denylist.
 Profiles come in three layers — yours, the system's, built-in — and compose
 with `include`. See "Known gaps" below.
@@ -144,13 +144,13 @@ file order does not affect the generated argv.
 
 Every source must exist and be of the expected type when the argv is built; a
 missing one is an error rather than a silently weaker sandbox. That covers
-`home-share` too, so the `firefox` profile needs a `~/Downloads`. A
-`home-share` source is resolved before it is bound and must stay inside your
-home directory: a symlink pointing elsewhere is refused, not followed. One
-home path may be shared once, whatever the modes, so `home-share "D"` beside
-`home-share "D" mode=rw` is an error rather than a share whose width depends
-on which line came first; a share below another (`"D"` and `"D/sub"`) names a
-different path and stays allowed.
+`home-share` too, so the `firefox` profile needs a `~/Downloads` and `lutris`
+a `~/Games`. A `home-share` source is resolved before it is bound and must
+stay inside your home directory: a symlink pointing elsewhere is refused, not
+followed. One home path may be shared once, whatever the modes, so
+`home-share "D"` beside `home-share "D" mode=rw` is an error rather than a
+share whose width depends on which line came first; a share below another
+(`"D"` and `"D/sub"`) names a different path and stays allowed.
 `etc-share` is confined to `/etc` the same way, and cannot name the account
 files (`passwd`, `group`, `shadow`, `gshadow` and their `-`/`+` variants),
 which the sandbox generates itself. `path-share` reaches outside the home and
@@ -353,37 +353,72 @@ changes an instance that was already seeded from it.
 
 ### Built-in profiles
 
-Every one is Wayland-first; none grants `x11`. `~/name` below is a
-`home-share`, read-only unless it says `rw`.
+Every one is Wayland-first; only the two gaming profiles grant `x11`.
+`~/name` below is a `home-share`, read-only unless it says `rw`.
 
     alacritty     wayland
     chromium      wayland dri pipewire network dbus portals notify, ~/Downloads rw
     firefox       wayland dri pipewire pulseaudio network dbus portals notify mpris, ~/Downloads rw
     generic       nothing beyond the baseline
     libreoffice   wayland dri dbus portals, ~/Documents rw, SAL_USE_VCLPLUGIN=gtk3
+    lutris        wayland x11 dri pipewire network dbus portals notify tray gamepad system-bus, ~/Games rw, seccomp disabled
     mpv           wayland dri pipewire, ~/Videos
-    steam         wayland dri pipewire network dbus portals notify tray gamepad, ~/.steam rw, seccomp disabled — partial
-    thunderbird   wayland network dri dbus portals notify, ~/Downloads rw, MOZ_ENABLE_WAYLAND=1
+    steam         wayland x11 dri pipewire network dbus notify tray gamepad system-bus, seccomp disabled
+    thunderbird   wayland network dri dbus portals notify, ~/Downloads rw
     vesktop       wayland dri pipewire network dbus portals notify tray
 
-The toolkit variables are there because bubbler clears the environment, so
-nothing is left for the toolkit to detect: `MOZ_ENABLE_WAYLAND=1` for the
-Mozilla apps and `SAL_USE_VCLPLUGIN=gtk3` for LibreOffice, whose VCL plugin
-would otherwise be chosen by an autodetection with nothing to go on.
+`SAL_USE_VCLPLUGIN=gtk3` is there because bubbler clears the environment,
+leaving LibreOffice's VCL plugin to an autodetection with nothing to go on.
+The Mozilla apps need no variable of their own: Gecko has defaulted to Wayland
+since Firefox 121 and takes it from the `WAYLAND_DISPLAY` the `wayland` grant
+sets, so `MOZ_ENABLE_WAYLAND=1` is gone from both profiles — write
+`env MOZ_ENABLE_WAYLAND="0"` to go back to Xwayland. `firefox` owns
+`org.mozilla.firefox.*` instead, which is the remote-instance protocol a
+second `firefox` reaches the running one through.
 
 `chromium` and `vesktop` keep their own namespace sandbox: it nests inside
 bubbler's, and the setuid helper they would otherwise use simply falls back to
 it, so neither needs `--no-sandbox`. On a kernel with unprivileged user
 namespaces turned off, that nesting is what breaks first.
 
-`steam` is partial, and its own first lines say so. bubbler has no system bus
-service, so UPower and the UDisks2 that Wine looks for are out of reach, and
-`/dev/hugepages`, `/dev/fuse` and `/dev/snd` are not bound either. Its
-`seccomp { disable }` is not a preference: the Steam runtime is 32-bit and
-bubbler's filter holds one architecture, which kills such a process rather
-than filtering it. A library folder outside the private home needs a
-`path-share` of its own, which the profile carries as a commented example to
-edit.
+`steam` and `lutris` are the two that grant `x11`, and that is the weak point
+of both: X11 has no isolation between clients, so a sandbox on your display can
+keylog every other client on it, Xwayland included. They have it because Steam's
+UI (steamwebhelper) is an X11/CEF client with no Wayland support and because
+Wine's X11 driver takes precedence over its Wayland one for every game Lutris
+starts. Their `seccomp { disable }` is not a preference either: the Steam
+runtime, umu/Proton and DXVK's 32-bit path are i386, and bubbler's filter holds
+one architecture, which kills such a process rather than filtering it. Neither
+may ever carry `userns "disable"` — pressure-vessel nests its own bubblewrap for
+every Proton game. On the system bus `steam` talks to UPower and UDisks2,
+`lutris` to UDisks2 alone, which is what Wine enumerates drives through.
+`/dev/hugepages`, `/dev/fuse` and `/dev/snd` are still not bound.
+
+`steam` is also the one profile with no `portals`, and that is not an
+oversight: the grant writes `/.flatpak-info`, Steam's own runtime reads that
+file as "I am the unofficial Steam Flatpak", and
+`steam-runtime-check-requirements` then exits 71 demanding the flatpak-portal
+service, which stops `steam.sh` before the client starts. Steam has its own
+file browser, so what it costs is the screencast and file-chooser portals.
+`lutris` keeps `portals` because Lutris itself calls them, but a Proton or umu
+game brings the same steam-runtime-tools along, so drop the grant there too if
+one stops with a Flatpak complaint.
+
+`steam` does not share the host's `~/.steam`. That is not a data directory but
+seven absolute symlinks into the host home, which dangle inside a sandbox whose
+home is `/home/bubbler` and which leak the account name the synthetic
+`/etc/passwd` exists to hide. Steam builds its own on first run; an existing
+install is moved into the instance's private home instead, with the instance
+stopped:
+
+    mv ~/.local/share/Steam ~/.local/share/bubbler/instances/steam/home/.local/share/
+
+A library folder outside the private home needs a `path-share` of its own,
+which both profiles carry as a commented example to edit. Steam Input's virtual
+controllers take `gamepad hidraw=#true uinput=#true` on top of the profile —
+read what those two properties grant under "Config" first: `uinput` lets the
+sandbox type into your session, and `hidraw` hands it every HID device on the
+machine, security keys and hardware wallets among them.
 
 Opening an arbitrary file from inside — LibreOffice's or Thunderbird's file
 chooser — goes through the portal, and the path it hands back today is one

@@ -1,23 +1,54 @@
 // bubbler profile: steam
-// Partial: this grants what bubbler has, which is not all Steam wants.
-// Missing is the system bus (UPower, and UDisks2 for Wine), which bubbler
-// has no service for, along with /dev/ntsync, /dev/hugepages, /dev/fuse
-// and /dev/snd. The 32-bit runtime is what `seccomp { disable }` is here
-// for: the filter is generated for this architecture alone and kills a
-// process that makes an i386 syscall. Steam also wants the multilib
-// 32-bit GL and Vulkan drivers and an en_US.UTF-8 locale on the host, and
-// a library folder outside the private home has to be named, e.g.
+//
+// The client is a 32-bit i386 binary and its UI (steamwebhelper) is an
+// X11/CEF client with no Wayland support, so this profile needs both
+// `seccomp { disable }` — the filter holds one architecture and kills an
+// i386 process rather than filtering it — and `x11`. The Arch wiki's own
+// bwrap example carries an accuracy dispute over exactly that forwarding:
+// an X11 client can keylog and inject into every other X11 client,
+// Xwayland included.
+//
+// Never add `userns "disable"`: Proton and the Steam Linux Runtime nest
+// their own bubblewrap (pressure-vessel ships srt-bwrap), which has to
+// create a user namespace inside this one.
+//
+// No `portals`: that grant writes /.flatpak-info, and Steam's runtime
+// reads it as "I am the unofficial Steam Flatpak" —
+// steam-runtime-check-requirements then demands the flatpak-portal
+// service and exits 71, so steam.sh stops before the client starts
+// (measured). Steam brings its own file browser; a path outside the
+// private home is shared below instead.
+//
+// Steam builds its own ~/.steam and ~/.local/share/Steam in the private
+// home on first run. The host's are not shared, because ~/.steam is a
+// directory of absolute symlinks into the host home; move an existing
+// install in instead, with the instance stopped:
+//   mv ~/.local/share/Steam ~/.local/share/bubbler/instances/steam/home/.local/share/
+// A library folder on another disk is named explicitly, e.g.
 //   path-share "/kioxia/Steam" mode=rw
+// Steam Input's virtual controllers need two more grants, each with a
+// warning of its own in the README:
+//   gamepad hidraw=#true uinput=#true
+// The host side is multilib 32-bit GL and Vulkan drivers and an
+// en_US.UTF-8 locale; the locale reaches the sandbox through LANG and the
+// read-only /usr, with nothing to bind for it.
 wayland
+x11
 dri
 pipewire
 network
-dbus
-portals
+dbus {
+    own "com.steampowered.*"
+    talk "org.freedesktop.ScreenSaver"
+    talk "org.freedesktop.PowerManagement"
+}
 notify
 tray
 gamepad
-home-share ".steam" mode=rw
+system-bus {
+    talk "org.freedesktop.UPower"
+    talk "org.freedesktop.UDisks2"
+}
 seccomp {
     disable
 }

@@ -104,7 +104,7 @@ fn create_list_and_dry_run() {
 }
 
 #[test]
-fn profiles_lists_builtins_and_firefox_seeds_gpu_and_toolkit_env() {
+fn profiles_lists_builtins_and_firefox_seeds_gpu_and_its_bus_name() {
     let tmp = setup();
     let out = bubbler(tmp.path()).arg("profiles").output().unwrap();
     assert!(
@@ -130,7 +130,7 @@ fn profiles_lists_builtins_and_firefox_seeds_gpu_and_toolkit_env() {
         std::fs::read_to_string(tmp.path().join("data/bubbler/instances/ff/config.kdl")).unwrap();
     assert!(cfg.starts_with("// bubbler profile: firefox\n"), "{cfg}");
     assert!(
-        cfg.contains("dri\n") && cfg.contains("MOZ_ENABLE_WAYLAND"),
+        cfg.contains("dri\n") && cfg.contains("own \"org.mozilla.firefox.*\""),
         "{cfg}"
     );
 }
@@ -191,11 +191,11 @@ fn a_user_profile_including_the_built_in_seeds_the_union() {
     write_profile(
         tmp.path(),
         "user",
-        "firefox",
-        "include \"firefox\"\nx11\nenv MOZ_ENABLE_WAYLAND=\"0\"\n",
+        "libreoffice",
+        "include \"libreoffice\"\nx11\nenv SAL_USE_VCLPLUGIN=\"qt6\"\n",
     );
     let out = bubbler(tmp.path())
-        .args(["create", "ff", "--profile", "firefox"])
+        .args(["create", "lo", "--profile", "libreoffice"])
         .output()
         .unwrap();
     assert!(
@@ -204,13 +204,13 @@ fn a_user_profile_including_the_built_in_seeds_the_union() {
         String::from_utf8_lossy(&out.stderr)
     );
     let cfg =
-        std::fs::read_to_string(tmp.path().join("data/bubbler/instances/ff/config.kdl")).unwrap();
+        std::fs::read_to_string(tmp.path().join("data/bubbler/instances/lo/config.kdl")).unwrap();
     // The built-in's grants, the user layer's extra one, and its override
     // of one key rather than a second `env` node for it.
     assert!(cfg.contains("\nwayland\n"), "{cfg}");
     assert!(cfg.contains("\nx11\n"), "{cfg}");
-    assert!(cfg.contains("env MOZ_ENABLE_WAYLAND=\"0\"\n"), "{cfg}");
-    assert!(!cfg.contains("\"1\""), "{cfg}");
+    assert!(cfg.contains("env SAL_USE_VCLPLUGIN=\"qt6\"\n"), "{cfg}");
+    assert!(!cfg.contains("gtk3"), "{cfg}");
 }
 
 #[test]
