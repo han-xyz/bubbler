@@ -283,7 +283,7 @@ fn text<'a>(node: &str, what: &str, s: &'a OsStr) -> Result<&'a str, ConfigError
 /// `s` as a KDL v2 quoted string. Only escapes KDL defines are used, and
 /// every other control character goes as `\u{..}`, so a value read out of
 /// a config file goes back into one unchanged.
-fn quote(s: &str) -> String {
+pub(crate) fn quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {

@@ -365,3 +365,12 @@ impl TestPty {
         }
     }
 }
+
+/// A `Command` for a PATH shim: the same isolated environment
+/// [`bubbler`] gets, but the program is the symlink, so `argv[0]` is the
+/// name the shim was made under rather than `bubbler`.
+pub fn shim(root: &Path, program: &Path) -> Command {
+    let mut c = Command::new(program);
+    isolate(&mut c, root);
+    c
+}
