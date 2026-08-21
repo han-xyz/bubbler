@@ -72,7 +72,7 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "bubbler"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "bubbler-core",
@@ -83,7 +83,7 @@ dependencies = [
 
 [[package]]
 name = "bubbler-core"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "bubbler-init",
  "kdl",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "bubbler-init"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "rustix",
  "signal-hook",
