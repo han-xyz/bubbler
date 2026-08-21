@@ -13,7 +13,7 @@ bubbler-core = { path = "crates/bubbler-core" }
 bubbler-init = { path = "crates/bubbler-init" }
 kdl = "6"
 thiserror = "2"
-rustix = { version = "1", features = ["fs", "process", "net", "pipe", "event", "pty", "termios", "stdio"] }
+rustix = { version = "1", features = ["fs", "process", "net", "pipe", "event", "pty", "termios"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 signal-hook = "0.3"

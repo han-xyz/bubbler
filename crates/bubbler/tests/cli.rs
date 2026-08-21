@@ -12,6 +12,7 @@ use common::{
     bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, kill_group, real_init, require_bwrap,
     require_dbus, require_portal, require_python, test_pty,
 };
+use rustix::fs::{OFlags, fcntl_getfl};
 use rustix::process::{Pid, Signal, kill_process};
 use rustix::termios::{ControlModes, InputModes, LocalModes, OutputModes, tcgetattr};
 
@@ -2017,6 +2018,21 @@ fn modes(fd: BorrowedFd<'_>) -> (InputModes, OutputModes, ControlModes, LocalMod
     )
 }
 
+/// Fail if `fd`'s open file description does not keep the flags `want`
+/// for `window`. A relay that made the user's own descriptor
+/// non-blocking shows up here wherever inside the window it started.
+fn flags_hold(fd: BorrowedFd<'_>, want: OFlags, window: Duration) {
+    let until = Instant::now() + window;
+    while Instant::now() < until {
+        assert_eq!(
+            fcntl_getfl(fd).unwrap(),
+            want,
+            "the relay changed the flags of the user's own descriptor"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn real_bwrap_exec_stops_on_a_signal_and_gives_the_terminal_back() {
     let Some((tmp, init)) = live_instance("t") else {
@@ -2037,6 +2053,9 @@ fn real_bwrap_exec_stops_on_a_signal_and_gives_the_terminal_back() {
     }
     let pty = test_pty();
     let before = modes(pty.slave.as_fd());
+    // The flags of the open file description the terminal's descriptor
+    // carries, which a shell handing bubbler its own fd would share.
+    let flags = fcntl_getfl(pty.slave.as_fd()).unwrap();
     let mut exec = bubbler_live(tmp.path(), &init)
         .args(["exec", "t", "--", "/usr/bin/sleep", "30"])
         .stdin(pty.stdio())
@@ -2050,6 +2069,10 @@ fn real_bwrap_exec_stops_on_a_signal_and_gives_the_terminal_back() {
         wait_until(|| is_raw(pty.slave.as_fd()), Duration::from_secs(10)),
         "the exec never put the terminal in raw mode"
     );
+    // Mid-relay: the non-blocking writes go through a description bubbler
+    // opened for itself, so nothing a SIGKILL could leave behind ever
+    // reaches the descriptor the user holds.
+    flags_hold(pty.slave.as_fd(), flags, Duration::from_secs(1));
     kill_process(Pid::from_child(&exec), Signal::TERM).unwrap();
     let mut status = None;
     let stopped = wait_until(
@@ -2066,6 +2089,7 @@ fn real_bwrap_exec_stops_on_a_signal_and_gives_the_terminal_back() {
     assert_eq!(status.and_then(|s| s.code()), Some(128 + 15));
     // And the terminal is the user's again, exactly as they left it.
     assert_eq!(modes(pty.slave.as_fd()), before);
+    assert_eq!(fcntl_getfl(pty.slave.as_fd()).unwrap(), flags);
 
     let mut run = run;
     kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
@@ -2085,6 +2109,7 @@ fn real_bwrap_run_gives_the_terminal_back_after_a_hangup() {
     };
     let pty = test_pty();
     let before = modes(pty.slave.as_fd());
+    let flags = fcntl_getfl(pty.slave.as_fd()).unwrap();
     let mut run = bubbler_live(tmp.path(), &init)
         .args(["run", "t", "--", "/usr/bin/sleep", "30"])
         .stdin(pty.stdio())
@@ -2096,6 +2121,7 @@ fn real_bwrap_run_gives_the_terminal_back_after_a_hangup() {
         wait_until(|| is_raw(pty.slave.as_fd()), Duration::from_secs(20)),
         "the run never put the terminal in raw mode"
     );
+    flags_hold(pty.slave.as_fd(), flags, Duration::from_secs(1));
     // A terminal that hangs up: the sandbox is stopped like any other
     // signal, and the settings are put back on the way out.
     kill_process(Pid::from_child(&run), Signal::HUP).unwrap();
@@ -2107,6 +2133,7 @@ fn real_bwrap_run_gives_the_terminal_back_after_a_hangup() {
         "the run did not stop after SIGHUP"
     );
     assert_eq!(modes(pty.slave.as_fd()), before);
+    assert_eq!(fcntl_getfl(pty.slave.as_fd()).unwrap(), flags);
 }
 
 /// A python probe reporting how each syscall the default filter denies

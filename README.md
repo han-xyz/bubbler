@@ -250,11 +250,24 @@ not trust. `passthrough` gives up the rest as well: the sandbox holds your
 terminal's descriptors and reaches it again through `/dev/console`.
 
 `run` and `exec` catch SIGINT, SIGTERM and SIGHUP while they hold your
-terminal: the sandbox is stopped and your settings are put back on the way
-out. SIGKILL cannot be caught, and neither can anything else that takes
-bubbler down without letting it unwind — a hang-up it never gets to act on
-included — so those leave your terminal raw, with no echo and no line
-editing. `reset`, or `stty sane`, puts it right.
+terminal and put your settings back on the way out. For `run` that also
+stops the sandbox. For `exec` it stops the relay and nothing else: the
+instance stays up, and the command stays with the supervisor until its own
+pty hangs up with bubbler — the same as after a detach, not a signal
+delivered to the command.
+
+Either way, the output the sandbox has already produced is handed over
+before bubbler leaves, however long your terminal takes to accept it; only
+a terminal that has taken nothing for a second is given up on, and bubbler
+says how much it dropped.
+
+SIGKILL cannot be caught, and neither can anything else that takes bubbler
+down without letting it unwind — a hang-up it never gets to act on
+included. All those can leave behind is your terminal still in raw mode,
+with no echo and no line editing; `reset`, or `stty sane`, puts it right.
+Nothing else of yours is touched: bubbler opens its own descriptor for the
+output it writes, so the non-blocking flag it needs never reaches the one
+your shell holds.
 
 The pty is allocated on the host, so its name inside is not its name outside.
 `/proc/self/fd/0` still reads back a host `/dev/pts/N`, a path the sandbox's

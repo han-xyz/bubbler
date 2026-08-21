@@ -15,4 +15,7 @@ signal-hook.workspace = true
 seccompiler.workspace = true
 
 [dev-dependencies]
+# `stdio` is only ever used to quiet fd 2 while a test makes the relay
+# report a destination that refuses its output.
+rustix = { workspace = true, features = ["stdio"] }
 tempfile.workspace = true
