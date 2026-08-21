@@ -96,6 +96,21 @@ pub enum BusRule {
     Broadcast(String, String),
 }
 
+impl BusRule {
+    /// The name and node word of a policy rule, or `None` for `call` and
+    /// `broadcast`, which narrow a policy rather than set one. A name
+    /// holds one policy: two of them for the same name would leave which
+    /// one the proxy applies to argument order.
+    pub fn policy(&self) -> Option<(&str, &'static str)> {
+        match self {
+            BusRule::See(n) => Some((n, "see")),
+            BusRule::Talk(n) => Some((n, "talk")),
+            BusRule::Own(n) => Some((n, "own")),
+            BusRule::Call(..) | BusRule::Broadcast(..) => None,
+        }
+    }
+}
+
 /// One granted resource. Order in the config file is irrelevant; the
 /// builder's phases decide argv order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -596,7 +611,7 @@ fn parse_bus_rules(node: &KdlNode, own_allowed: bool) -> Result<Vec<BusRule>, Co
         }
         let kind = child.name().value();
         let arg = one_string_arg(child)?;
-        rules.push(match kind {
+        let rule = match kind {
             "see" | "talk" | "own" => {
                 if kind == "own" && !own_allowed {
                     return Err(bad(node, "own is not allowed on the system bus"));
@@ -627,7 +642,20 @@ fn parse_bus_rules(node: &KdlNode, own_allowed: bool) -> Result<Vec<BusRule>, Co
                 }
             }
             other => return Err(ConfigError::UnknownNode(other.to_owned())),
-        });
+        };
+        if let Some((name, level)) = rule.policy()
+            && let Some((_, was)) = rules
+                .iter()
+                .filter_map(BusRule::policy)
+                .find(|(n, _)| *n == name)
+            && was != level
+        {
+            return Err(bad(
+                node,
+                &format!("grants `{name}` as `{was}` and as `{level}`; one name takes one policy"),
+            ));
+        }
+        rules.push(rule);
     }
     Ok(rules)
 }
@@ -1631,6 +1659,28 @@ command "b""#
             parse("system-bus { talk \"a.b\" }\nsystem-bus { talk \"c.d\" }"),
             Err(ConfigError::Duplicate(n)) if n == "system-bus"
         ));
+    }
+
+    #[test]
+    fn one_bus_name_takes_one_policy_in_a_node() {
+        // Which of the two the proxy would then apply is argument order,
+        // so the config is refused rather than resolved.
+        for text in [
+            "dbus { talk \"a.b\"; see \"a.b\" }",
+            "dbus { own \"a.b\"; talk \"a.b\" }",
+            "system-bus { see \"a.b\"; talk \"a.b\" }",
+        ] {
+            let Err(ConfigError::BadArgument { reason, .. }) = parse(text) else {
+                panic!("{text} was accepted");
+            };
+            assert!(reason.contains("a.b"), "{text}: {reason}");
+        }
+        // A repeat of the same policy is one policy, and `call` and
+        // `broadcast` filter messages rather than setting one.
+        parse("dbus { talk \"a.b\"; talk \"a.b\" }").unwrap();
+        parse("system-bus { see \"a.b\"; call \"a.b=c.d@/e\" }").unwrap();
+        // Two names are two policies.
+        parse("dbus { talk \"a.b\"; see \"a.c\" }").unwrap();
     }
 
     #[test]

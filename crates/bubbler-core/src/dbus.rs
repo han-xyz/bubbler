@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{BusRule, Service};
 use crate::env::Env;
+use crate::error::LaunchError;
 
 /// Program that filters the buses; found on `PATH` inside the proxy
 /// sandbox. One process serves every bus an instance is granted.
@@ -140,7 +141,21 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
                 Service::Mpris { name } => {
                     push(&mut rules, format!("--own=org.mpris.MediaPlayer2.{name}"));
                 }
-                _ => {}
+                // Every other grant is listed rather than caught by a
+                // wildcard: a new bundle must be given its rules here, and
+                // a wildcard would silently give it none.
+                Service::Wayland
+                | Service::X11
+                | Service::Network
+                | Service::Dri
+                | Service::Pipewire
+                | Service::Pulseaudio
+                | Service::Gamepad { .. }
+                | Service::HomeShare { .. }
+                | Service::PathShare { .. }
+                | Service::EtcShare { .. }
+                | Service::Dbus { .. }
+                | Service::SystemBus { .. } => {}
             }
         }
         Section { rules }
@@ -273,29 +288,59 @@ pub fn app_bus_path(instance_runtime: &Path, socket: &str) -> PathBuf {
 }
 
 /// Host session bus socket: the `unix:path=` of `$DBUS_SESSION_BUS_ADDRESS`
-/// when it names one, else `$XDG_RUNTIME_DIR/bus`. The caller must still
+/// when it is set, else `$XDG_RUNTIME_DIR/bus`. The caller must still
 /// check that the result is a socket.
-pub fn host_bus(env: &Env) -> PathBuf {
-    env.dbus_address
-        .as_deref()
-        .and_then(unix_path)
-        .unwrap_or_else(|| env.runtime_dir.join("bus"))
+pub fn host_bus(env: &Env) -> Result<PathBuf, LaunchError> {
+    Ok(address_path(
+        env.dbus_address.as_deref(),
+        "DBUS_SESSION_BUS_ADDRESS",
+        "dbus",
+    )?
+    .unwrap_or_else(|| env.runtime_dir.join("bus")))
 }
 
 /// Host system bus socket: the `unix:path=` of `$DBUS_SYSTEM_BUS_ADDRESS`
-/// when it names one, else [`SYSTEM_BUS_PATH`], which is what libdbus and
+/// when it is set, else [`SYSTEM_BUS_PATH`], which is what libdbus and
 /// libsystemd fall back to. The caller must still check that the result
 /// is a socket.
-pub fn host_system_bus(env: &Env) -> PathBuf {
-    env.dbus_system_address
-        .as_deref()
-        .and_then(unix_path)
-        .unwrap_or_else(|| PathBuf::from(SYSTEM_BUS_PATH))
+pub fn host_system_bus(env: &Env) -> Result<PathBuf, LaunchError> {
+    Ok(address_path(
+        env.dbus_system_address.as_deref(),
+        "DBUS_SYSTEM_BUS_ADDRESS",
+        "system-bus",
+    )?
+    .unwrap_or_else(|| PathBuf::from(SYSTEM_BUS_PATH)))
 }
 
-/// Path out of a `unix:path=<path>[,<key>=<value>]...` D-Bus address.
-/// Other transports (`tcp:`, `unix:abstract=`) name no socket to bind, so
-/// they yield `None` and the runtime dir is used instead.
+/// The socket a `DBUS_*_BUS_ADDRESS` names: `None` when the variable is
+/// unset or empty, so the caller's default path applies. A transport
+/// bubbler cannot bind (`tcp:`, `unix:abstract=`) is an error naming the
+/// variable rather than that default: the session is on the bus the
+/// variable names, and proxying another one would filter the wrong bus.
+fn address_path(
+    address: Option<&OsStr>,
+    var: &'static str,
+    service: &'static str,
+) -> Result<Option<PathBuf>, LaunchError> {
+    let Some(address) = address.filter(|a| !a.is_empty()) else {
+        return Ok(None);
+    };
+    match unix_path(address) {
+        Some(p) => Ok(Some(p)),
+        // The value itself is not echoed: it is host input, and an
+        // address may hold anything.
+        None => Err(LaunchError::BadValue {
+            service,
+            reason: format!(
+                "${var} names no Unix socket path; bubbler can proxy only a \
+                 `unix:path=<path>` address"
+            ),
+        }),
+    }
+}
+
+/// Path out of a `unix:path=<path>[,<key>=<value>]...` D-Bus address;
+/// `None` for any other transport, and for an empty path.
 fn unix_path(address: &OsStr) -> Option<PathBuf> {
     let rest = address.as_bytes().strip_prefix(b"unix:path=")?;
     let end = rest.iter().position(|b| *b == b',').unwrap_or(rest.len());
@@ -570,21 +615,26 @@ mod tests {
     #[test]
     fn host_bus_prefers_the_address_and_falls_back_to_the_runtime_dir() {
         let mut e = env();
-        assert_eq!(host_bus(&e), PathBuf::from("/run/user/1000/bus"));
+        assert_eq!(host_bus(&e).unwrap(), PathBuf::from("/run/user/1000/bus"));
         e.dbus_address = Some("unix:path=/tmp/other,guid=deadbeef".into());
-        assert_eq!(host_bus(&e), PathBuf::from("/tmp/other"));
-        for ignored in [
+        assert_eq!(host_bus(&e).unwrap(), PathBuf::from("/tmp/other"));
+        // An unset variable and an empty one both mean "wherever the bus
+        // usually is".
+        e.dbus_address = Some("".into());
+        assert_eq!(host_bus(&e).unwrap(), PathBuf::from("/run/user/1000/bus"));
+        // A transport that names no socket is refused: proxying the
+        // default socket instead would be a bus the session is not on.
+        for bad in [
             "tcp:host=localhost,port=1",
             "unix:abstract=/x",
-            "",
             "unix:path=",
         ] {
-            e.dbus_address = Some(ignored.into());
-            assert_eq!(
-                host_bus(&e),
-                PathBuf::from("/run/user/1000/bus"),
-                "{ignored}"
-            );
+            e.dbus_address = Some(bad.into());
+            let Err(LaunchError::BadValue { service, reason }) = host_bus(&e) else {
+                panic!("{bad} was accepted");
+            };
+            assert_eq!(service, "dbus");
+            assert!(reason.contains("DBUS_SESSION_BUS_ADDRESS"), "{reason}");
         }
     }
 
@@ -731,26 +781,27 @@ mod tests {
     #[test]
     fn the_system_bus_address_falls_back_to_the_compiled_in_path() {
         let mut e = env();
-        assert_eq!(host_system_bus(&e), PathBuf::from(SYSTEM_BUS_PATH));
+        assert_eq!(host_system_bus(&e).unwrap(), PathBuf::from(SYSTEM_BUS_PATH));
         e.dbus_system_address = Some("unix:path=/tmp/other,guid=deadbeef".into());
-        assert_eq!(host_system_bus(&e), PathBuf::from("/tmp/other"));
-        for ignored in [
+        assert_eq!(host_system_bus(&e).unwrap(), PathBuf::from("/tmp/other"));
+        e.dbus_system_address = Some("".into());
+        assert_eq!(host_system_bus(&e).unwrap(), PathBuf::from(SYSTEM_BUS_PATH));
+        for bad in [
             "tcp:host=localhost,port=1",
             "unix:abstract=/x",
-            "",
             "unix:path=",
         ] {
-            e.dbus_system_address = Some(ignored.into());
-            assert_eq!(
-                host_system_bus(&e),
-                PathBuf::from(SYSTEM_BUS_PATH),
-                "{ignored}"
-            );
+            e.dbus_system_address = Some(bad.into());
+            let Err(LaunchError::BadValue { service, reason }) = host_system_bus(&e) else {
+                panic!("{bad} was accepted");
+            };
+            assert_eq!(service, "system-bus");
+            assert!(reason.contains("DBUS_SYSTEM_BUS_ADDRESS"), "{reason}");
         }
         // The two addresses are read from their own variables.
         e.dbus_address = Some("unix:path=/tmp/session".into());
         e.dbus_system_address = None;
-        assert_eq!(host_bus(&e), PathBuf::from("/tmp/session"));
-        assert_eq!(host_system_bus(&e), PathBuf::from(SYSTEM_BUS_PATH));
+        assert_eq!(host_bus(&e).unwrap(), PathBuf::from("/tmp/session"));
+        assert_eq!(host_system_bus(&e).unwrap(), PathBuf::from(SYSTEM_BUS_PATH));
     }
 }

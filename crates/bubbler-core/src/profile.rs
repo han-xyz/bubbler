@@ -9,7 +9,7 @@ use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::config::{self, InstanceConfig, RawProfile, Service, ShareMode, Userns};
+use crate::config::{self, BusRule, InstanceConfig, RawProfile, Service, ShareMode, Userns};
 use crate::env::Env;
 use crate::error::ProfileError;
 use crate::instance::is_plain_name;
@@ -517,11 +517,7 @@ impl Merged {
                         _ => None,
                     })
                 {
-                    for r in rules {
-                        if !held_rules.contains(r) {
-                            held_rules.push(r.clone());
-                        }
-                    }
+                    union_bus_rules("dbus", held_rules, held_src, rules, src)?;
                     *held_src = src.clone();
                     return Ok(());
                 }
@@ -551,11 +547,7 @@ impl Merged {
                         _ => None,
                     })
                 {
-                    for r in rules {
-                        if !held_rules.contains(r) {
-                            held_rules.push(r.clone());
-                        }
-                    }
+                    union_bus_rules("system-bus", held_rules, held_src, rules, src)?;
                     *held_src = src.clone();
                     return Ok(());
                 }
@@ -674,6 +666,37 @@ impl Merged {
                 .collect(),
         })
     }
+}
+
+/// Union `rules` into `held`, dropping repeats. A name the two layers
+/// give two policy levels is a conflict rather than a union: which level
+/// applied would be layer order, and that is a privilege nobody wrote.
+fn union_bus_rules(
+    node: &str,
+    held: &mut Vec<BusRule>,
+    held_src: &Src,
+    rules: &[BusRule],
+    src: &Src,
+) -> Result<(), ProfileError> {
+    for r in rules {
+        if let Some((name, level)) = r.policy()
+            && let Some((_, was)) = held
+                .iter()
+                .filter_map(BusRule::policy)
+                .find(|(n, _)| *n == name)
+            && was != level
+        {
+            return Err(ProfileError::Conflict {
+                node: node.to_owned(),
+                a: format!("{was} \"{name}\" in {}", held_src.label),
+                b: format!("{level} \"{name}\" in {}", src.label),
+            });
+        }
+        if !held.contains(r) {
+            held.push(r.clone());
+        }
+    }
+    Ok(())
 }
 
 /// The path and mode of a `home-share` node, and nothing else.
@@ -808,12 +831,27 @@ mod tests {
         // architecture alone, and steamwebhelper is an X11 client.
         assert!(steam.seccomp.disable);
         assert!(steam.services.contains(&Service::X11));
-        assert!(steam.services.contains(&Service::SystemBus {
-            rules: vec![
-                BusRule::Talk("org.freedesktop.UPower".to_owned()),
-                BusRule::Talk("org.freedesktop.UDisks2".to_owned()),
-            ],
-        }));
+        // UDisks2 is enumeration only in both gaming profiles: `talk`
+        // would hand the sandbox loop-setup, mount and LUKS methods,
+        // which polkit judges as the user.
+        let enumerate_udisks = || {
+            vec![
+                BusRule::See("org.freedesktop.UDisks2".to_owned()),
+                BusRule::Call(
+                    "org.freedesktop.UDisks2".to_owned(),
+                    "org.freedesktop.DBus.ObjectManager.GetManagedObjects\
+                     @/org/freedesktop/UDisks2"
+                        .to_owned(),
+                ),
+            ]
+        };
+        let mut steam_bus = vec![BusRule::Talk("org.freedesktop.UPower".to_owned())];
+        steam_bus.extend(enumerate_udisks());
+        assert!(
+            steam
+                .services
+                .contains(&Service::SystemBus { rules: steam_bus })
+        );
         // `portals` would write /.flatpak-info, which Steam's own runtime
         // reads as being the unofficial Steam Flatpak: it then refuses to
         // start without a flatpak-portal service to talk to.
@@ -839,7 +877,7 @@ mod tests {
                 .contains(&home_share("Games", ShareMode::ReadWrite))
         );
         assert!(lutris.services.contains(&Service::SystemBus {
-            rules: vec![BusRule::Talk("org.freedesktop.UDisks2".to_owned())],
+            rules: enumerate_udisks()
         }));
 
         for n in [
@@ -1171,6 +1209,44 @@ mod tests {
         assert_eq!(node, "path-share \"/kioxia/Steam\"");
         assert!(a.contains("mode=rw") && a.contains("b.kdl"), "{a}");
         assert!(b.contains("mode=ro") && b.contains("a.kdl"), "{b}");
+    }
+
+    #[test]
+    fn two_layers_may_not_grant_one_bus_name_two_policies() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (node, upper, lower) in [
+            (
+                "dbus",
+                "dbus { see \"org.a.B\" }",
+                "dbus { talk \"org.a.B\" }",
+            ),
+            (
+                "system-bus",
+                "system-bus { talk \"org.a.B\" }",
+                "system-bus { see \"org.a.B\" }",
+            ),
+        ] {
+            let r = resolver(
+                tmp.path(),
+                &[("a", &format!("include \"b\"\n{upper}\n"))],
+                &[("b", &format!("{lower}\n"))],
+            );
+            let err = r.resolve("a").unwrap_err();
+            let ProfileError::Conflict { node: n, a, b } = &err else {
+                panic!("{err:?}")
+            };
+            assert_eq!(n, node);
+            assert!(a.contains("org.a.B") && a.contains("b.kdl"), "{a}");
+            assert!(b.contains("org.a.B") && b.contains("a.kdl"), "{b}");
+        }
+        // The narrowing rules are not policies: one layer may see a name
+        // the other calls one method on.
+        let r = resolver(
+            tmp.path(),
+            &[("a", "include \"b\"\nsystem-bus { see \"org.a.B\" }\n")],
+            &[("b", "system-bus { call \"org.a.B=c.D@/e\" }\n")],
+        );
+        r.resolve("a").unwrap();
     }
 
     #[test]

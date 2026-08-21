@@ -288,6 +288,14 @@ fn dri(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
             path: devices.join("pci*"),
         });
     }
+    // After the PCI roots, whose subtrees every entry in it is a relative
+    // symlink into: the only file it adds is `/sys/class/drm/version`.
+    // Missing on a host with no DRM driver loaded, which is not an error
+    // when `/dev/dri` is there.
+    let drm = PathBuf::from("/sys/class/drm");
+    if host.file_type(&drm).is_some_and(|t| t.is_dir()) {
+        args.ro_bind(&drm, &drm);
+    }
     // The NVIDIA nodes are created by the setuid `nvidia-modprobe` a udev
     // rule runs, and a sandbox has `NoNewPrivs` set, so a node missing at
     // launch can never appear later: bind what the host has, fail over
@@ -1705,6 +1713,40 @@ mod tests {
         ));
         assert!(!a.contains(&"/sys/devices/virtual".to_string()));
         assert!(!a.contains(&"/sys/devices".to_string()));
+    }
+
+    #[test]
+    fn dri_binds_the_drm_class_directory_after_the_pci_roots() {
+        let host = &[
+            ("/dev/dri", Dir),
+            ("/sys/dev/char", Dir),
+            ("/sys/devices/system/cpu", Dir),
+            ("/sys/devices/pci0000:00", Dir),
+            ("/sys/class/drm", Dir),
+        ];
+        let a = argv(&[Service::Dri], &env(), host).unwrap();
+        // Its entries are relative symlinks into the PCI roots, so it has
+        // to come after them for bwrap to resolve them.
+        let pci = seq_at(
+            &a,
+            &[
+                "--ro-bind",
+                "/sys/devices/pci0000:00",
+                "/sys/devices/pci0000:00",
+            ],
+        )
+        .expect("dri binds the PCI root");
+        let drm = seq_at(&a, &["--ro-bind", "/sys/class/drm", "/sys/class/drm"])
+            .expect("dri binds the drm class directory");
+        assert!(pci < drm, "{a:?}");
+
+        // A host without it is not an error: the class directory holds
+        // nothing but those symlinks and `version`.
+        let without = argv(&[Service::Dri], &env(), &host[..4]).unwrap();
+        assert!(
+            !without.contains(&"/sys/class/drm".to_string()),
+            "{without:?}"
+        );
     }
 
     #[test]

@@ -289,7 +289,7 @@ fn real_main() -> Result<i32> {
             let mut eph = Instance::ephemeral(&env, &profile, &grants)
                 .context("creating a throwaway sandbox")?;
             if let Some(name) = &keep {
-                eph.keep_as(name)
+                eph.keep_as(&env, name)
                     .with_context(|| format!("keeping the sandbox as instance `{name}`"))?;
             }
             if eph.instance.has_service(&Service::X11) {

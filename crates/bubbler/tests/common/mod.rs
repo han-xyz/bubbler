@@ -111,6 +111,19 @@ pub fn kill_group(child: &Child) {
     let _ = kill_process_group(Pid::from_child(child), Signal::KILL);
 }
 
+/// Whether a `bwrap` whose command line holds `needle` is still running.
+/// A run that has ended must leave none: bubbler tears its sandboxes down
+/// itself, and `--die-with-parent` is only the backstop behind that.
+pub fn bwrap_alive(needle: &str) -> bool {
+    let out = Command::new("pgrep")
+        .args(["-a", "-f", needle])
+        .output()
+        .expect("pgrep is part of procps-ng, which these tests need");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|l| l.contains("bwrap"))
+}
+
 /// [`bubbler`] pointed at the real supervisor binary, for tests that
 /// start an actual sandbox instead of only building its argv.
 pub fn bubbler_live(root: &Path, init: &Path) -> Command {

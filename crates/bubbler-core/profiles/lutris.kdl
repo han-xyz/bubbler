@@ -19,6 +19,10 @@
 // that refuses to run where /.flatpak-info exists (see `steam`), so drop
 // the grant if a game stops with a Flatpak complaint.
 //
+// The system bus grants UDisks2 enumeration only: `see` plus the one
+// ObjectManager call Wine builds its drive list from. `talk` would reach
+// loop setup, mount and LUKS unlock, which polkit judges as the user.
+//
 // ~/Games is Lutris's own convention for the install directory, and a
 // missing share source is an error rather than a skipped bind, so create
 // it (`mkdir ~/Games`) or edit the node to the directory you use. A prefix
@@ -39,7 +43,8 @@ notify
 tray
 gamepad
 system-bus {
-    talk "org.freedesktop.UDisks2"
+    see "org.freedesktop.UDisks2"
+    call "org.freedesktop.UDisks2=org.freedesktop.DBus.ObjectManager.GetManagedObjects@/org/freedesktop/UDisks2"
 }
 home-share "Games" mode=rw
 seccomp {

@@ -12,9 +12,9 @@ use bubbler_core::bwrap::ETC_ALLOWLIST;
 use bubbler_core::profile::NAMES;
 use bubbler_core::seccomp::{DEFAULT_ENOSYS, DEFAULT_EPERM, syscall_number};
 use common::{
-    bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, kill_group, real_init, require_bwrap,
-    require_dbus, require_portal, require_python, require_system_bus, require_tray, system_owns,
-    test_pty,
+    bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, bwrap_alive, kill_group, real_init,
+    require_bwrap, require_dbus, require_portal, require_python, require_system_bus, require_tray,
+    system_owns, test_pty,
 };
 use rustix::fs::{OFlags, fcntl_getfl};
 use rustix::process::{Pid, Signal, kill_process};
@@ -2422,6 +2422,21 @@ fn try_keeps_nothing_when_the_launch_never_happened() {
 }
 
 #[test]
+fn try_refuses_a_keep_name_whose_sockets_would_be_truncated() {
+    let tmp = setup();
+    // The name is checked before anything is launched, so what the user
+    // sees is the name they can fix, not a bind failing later.
+    let out = bubbler(tmp.path())
+        .args(["try", "--keep", &"k".repeat(100), "--", "/usr/bin/true"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("Unix socket path"), "{err}");
+    assert!(!err.contains("bwrap"), "{err}");
+}
+
+#[test]
 fn real_bwrap_try_leaves_no_instance_unless_kept() {
     if !require_bwrap() {
         return;
@@ -3432,7 +3447,7 @@ fn real_bwrap_seccomp_covers_the_dbus_proxy_sandbox() {
     .unwrap();
     // The proxy's directory is removed when the run ends, so the report
     // has to be read while the sandbox is still up.
-    let run = bubbler_live(tmp.path(), &init)
+    let mut run = bubbler_live(tmp.path(), &init)
         .env(
             "DBUS_SESSION_BUS_ADDRESS",
             format!("unix:path={}", bus.display()),
@@ -3448,10 +3463,24 @@ fn real_bwrap_seccomp_covers_the_dbus_proxy_sandbox() {
         fail_with(run, "the proxy never wrote its report");
     }
     let out = std::fs::read_to_string(&report).unwrap();
-    let mut run = run;
-    let _ = run.kill();
-    let _ = run.wait();
+    // SIGTERM and wait, never SIGKILL: bubbler is what tears the two
+    // sandboxes down, and killing it here — while the run is still
+    // starting up — is how a test leaves a bwrap of its own behind.
+    kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
+    assert!(
+        wait_until(
+            || run.try_wait().expect("waiting for the run").is_some(),
+            Duration::from_secs(10)
+        ),
+        "the run did not stop after SIGTERM"
+    );
     assert_eq!(probed(&out, "keyctl"), "EPERM", "{out}");
     assert_eq!(probed(&out, "clone3"), "ENOSYS", "{out}");
     assert_eq!(probed(&out, "getpid"), "ok", "{out}");
+    // Neither the app sandbox nor the proxy's outlives the run.
+    let instance = format!("{}/run/bubbler/seccp", tmp.path().display());
+    assert!(
+        wait_until(|| !bwrap_alive(&instance), Duration::from_secs(5)),
+        "a bwrap of instance `seccp` outlived the run"
+    );
 }

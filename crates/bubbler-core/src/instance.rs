@@ -15,7 +15,7 @@ use crate::env::Env;
 use crate::error::InstanceError;
 use crate::kdl_out;
 use crate::profile::{self, PROFILE_HEADER};
-use crate::{dbus, exec};
+use crate::{dbus, exec, launcher};
 
 const CONFIG_FILE: &str = "config.kdl";
 
@@ -129,7 +129,7 @@ const SUN_PATH_MAX: usize = 108;
 // own in the `dbus/` subdirectory, one level deeper than the path the
 // launcher then moves it to, so those are the longest of all.
 fn check_socket_paths(env: &Env, name: &str) -> Result<(), InstanceError> {
-    let runtime = env.runtime_dir.join("bubbler").join(name);
+    let runtime = launcher::instance_runtime_dir(env, name);
     for path in [
         dbus::proxy_bus_path(&runtime, dbus::SYSTEM_SOCKET),
         dbus::proxy_bus_path(&runtime, dbus::SESSION_SOCKET),
@@ -350,9 +350,11 @@ pub struct Ephemeral {
 impl Ephemeral {
     /// Keep the sandbox afterwards as instance `name` instead of removing
     /// it. The name is checked now so a run that cannot be kept never
-    /// starts.
-    pub fn keep_as(&mut self, name: &str) -> Result<(), InstanceError> {
+    /// starts: kept, it is what the next run's sockets are named after,
+    /// so it faces the same length limit as a name given to `create`.
+    pub fn keep_as(&mut self, env: &Env, name: &str) -> Result<(), InstanceError> {
         validate_name(name)?;
+        check_socket_paths(env, name)?;
         fs::create_dir_all(&self.instances_root).map_err(io_err(&self.instances_root))?;
         if fs::symlink_metadata(self.instances_root.join(name)).is_ok() {
             return Err(InstanceError::AlreadyExists(name.to_owned()));
@@ -436,7 +438,7 @@ impl Instance {
         let name = format!("try-{pid}");
         check_socket_paths(env, &name)?;
         let dir = try_root(env).join(pid.to_string());
-        let runtime = env.runtime_dir.join("bubbler").join(&name);
+        let runtime = launcher::instance_runtime_dir(env, &name);
         // Only this process can be the live owner of try/<own pid>, so a
         // directory there is a leftover from a bubbler whose pid was reused.
         if let Err(e) = fs::remove_dir_all(&dir)
@@ -812,17 +814,24 @@ mod tests {
         {
             let mut eph = Instance::ephemeral(&env, "generic", &[]).unwrap();
             assert!(matches!(
-                eph.keep_as("-x"),
+                eph.keep_as(&env, "-x"),
                 Err(InstanceError::InvalidName(_))
             ));
-            eph.keep_as("kept").unwrap();
+            // The kept name is what the next run's sockets are built
+            // from, so `--keep` is refused here rather than by the `run`
+            // after it.
+            assert!(matches!(
+                eph.keep_as(&env, &"k".repeat(100)),
+                Err(InstanceError::SocketPathTooLong(_))
+            ));
+            eph.keep_as(&env, "kept").unwrap();
         }
         assert_eq!(Instance::list(&env).unwrap(), vec!["kept".to_string()]);
         assert!(Instance::open(&env, "kept").unwrap().home().is_dir());
         assert!(try_root(&env).read_dir().unwrap().next().is_none());
         let mut eph = Instance::ephemeral(&env, "generic", &[]).unwrap();
         assert!(matches!(
-            eph.keep_as("kept"),
+            eph.keep_as(&env, "kept"),
             Err(InstanceError::AlreadyExists(_))
         ));
     }

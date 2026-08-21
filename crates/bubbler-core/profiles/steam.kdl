@@ -19,6 +19,10 @@
 // (measured). Steam brings its own file browser; a path outside the
 // private home is shared below instead.
 //
+// UDisks2 is `see` plus the one ObjectManager call Wine enumerates
+// drives with. `talk` would reach every UDisks2 method — loop setup,
+// mount, LUKS unlock — and polkit judges the proxy as the user.
+//
 // Steam builds its own ~/.steam and ~/.local/share/Steam in the private
 // home on first run. The host's are not shared, because ~/.steam is a
 // directory of absolute symlinks into the host home; move an existing
@@ -47,7 +51,8 @@ tray
 gamepad
 system-bus {
     talk "org.freedesktop.UPower"
-    talk "org.freedesktop.UDisks2"
+    see "org.freedesktop.UDisks2"
+    call "org.freedesktop.UDisks2=org.freedesktop.DBus.ObjectManager.GetManagedObjects@/org/freedesktop/UDisks2"
 }
 seccomp {
     disable

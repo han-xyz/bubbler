@@ -416,12 +416,12 @@ pub fn start_proxy(
     let session_bus = plan
         .session
         .as_ref()
-        .map(|_| service::require_socket(host, "dbus", dbus::host_bus(env)))
+        .map(|_| service::require_socket(host, "dbus", dbus::host_bus(env)?))
         .transpose()?;
     let system_bus = plan
         .system
         .as_ref()
-        .map(|_| service::require_socket(host, "system-bus", dbus::host_system_bus(env)))
+        .map(|_| service::require_socket(host, "system-bus", dbus::host_system_bus(env)?))
         .transpose()?;
     // The proxy gets this directory and nothing else of the instance's
     // runtime state, so it is created here rather than bound from above.

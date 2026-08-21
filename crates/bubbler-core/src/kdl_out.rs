@@ -106,6 +106,21 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
                         .to_owned(),
                 });
             }
+            // `own` is refused there for the same reason the node itself
+            // is narrow: the name would be owned with the user's own
+            // credentials.
+            if let Some(name) = rules.iter().find_map(|r| match r {
+                BusRule::Own(n) => Some(n),
+                _ => None,
+            }) {
+                return Err(ConfigError::BadArgument {
+                    node: "system-bus".to_owned(),
+                    reason: format!(
+                        "owns `{name}`, and `own` on the system bus is not a config \
+                         bubbler parses"
+                    ),
+                });
+            }
             bus_block("system-bus", rules)
         }
     })
@@ -354,6 +369,27 @@ mod tests {
             render(&cfg),
             Err(ConfigError::BadArgument { node, .. }) if node == "system-bus"
         ));
+    }
+
+    #[test]
+    fn a_system_bus_that_owns_a_name_is_refused_rather_than_written() {
+        // The parser refuses `own` there, for the same reason the node
+        // itself exists: the name would be owned with the user's own
+        // credentials.
+        let cfg = InstanceConfig {
+            services: vec![Service::SystemBus {
+                rules: vec![
+                    BusRule::Talk("org.freedesktop.UPower".to_owned()),
+                    BusRule::Own("org.example.App".to_owned()),
+                ],
+            }],
+            ..InstanceConfig::default()
+        };
+        let Err(ConfigError::BadArgument { node, reason }) = render(&cfg) else {
+            panic!("an owned name was written to the system bus");
+        };
+        assert_eq!(node, "system-bus");
+        assert!(reason.contains("org.example.App"), "{reason}");
     }
 
     #[test]

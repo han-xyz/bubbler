@@ -156,12 +156,13 @@ files (`passwd`, `group`, `shadow`, `gshadow` and their `-`/`+` variants),
 which the sandbox generates itself. `path-share` reaches outside the home and
 has rules of its own, under "Host paths". `network` needs `/etc/resolv.conf`
 (the tmpfs over `/etc` would otherwise hide it). `dri` binds `/dev/dri`
-read-write and exposes `/sys/dev/char`, `/sys/devices/system/cpu` and every
-`/sys/devices/pci*` root read-only — that is the sysfs attributes of every PCI
-device on the machine, not just the GPU. `pipewire` and `pulseaudio` hand the
-sandbox the session's audio socket directly, which is capture as well as
-playback: everything the session exposes, including the microphone, with no
-portal in between.
+read-write and exposes `/sys/dev/char`, `/sys/devices/system/cpu`, every
+`/sys/devices/pci*` root and, where the host has it, `/sys/class/drm` (whose
+entries are relative symlinks into those roots, so it adds only `version`)
+read-only — that is the sysfs attributes of every PCI device on the machine,
+not just the GPU. `pipewire` and `pulseaudio` hand the sandbox the session's
+audio socket directly, which is capture as well as playback: everything the
+session exposes, including the microphone, with no portal in between.
 
 `dri` also hands over the proprietary NVIDIA stack where the host has it:
 every `/dev/nvidia*` char device with device access, and every
@@ -332,12 +333,17 @@ single chain through it would.
 
 Merging is by node: grants are unioned, identical share nodes collapse, and
 the same `home-share` or `path-share` path in two modes is an error rather
-than a silent choice of `ro` or `rw`. `command`, `tty` and `mpris` from the including file
-replace the included one, `env` replaces by key, `dbus` and `system-bus`
-rules and `seccomp` lists are unioned, and `seccomp { disable }` in any layer disables the
-filter. `portals`, `notify`, `tray` and `mpris` need `dbus` in the merged
-result, not in every layer, so a layer may add `notify` to a `dbus` it
-includes.
+than a silent choice of `ro` or `rw`. `command`, `tty`, `userns` and `mpris`
+from the including file replace the included one — so a layer can relax a
+`userns "disable"` below it, the way it decides the terminal — `env` replaces
+by key, `gamepad`'s `hidraw` and `uinput` are unioned one property at a time
+rather than the last layer deciding both, `dbus` and `system-bus` rules and
+`seccomp` lists are unioned, and `seccomp { disable }` in any layer disables
+the filter. One bus name may not end up with two policies — `talk` in one
+layer and `see` in another — which is an error naming the name, as it is
+inside a single node. `portals`, `notify`, `tray` and `mpris` need `dbus` in
+the merged result, not in every layer, so a layer may add `notify` to a
+`dbus` it includes.
 
 `create` and `try` write the flattened result, so `config.kdl` is one screen
 that says everything the sandbox will be granted. Flattening keeps no
@@ -390,8 +396,11 @@ starts. Their `seccomp { disable }` is not a preference either: the Steam
 runtime, umu/Proton and DXVK's 32-bit path are i386, and bubbler's filter holds
 one architecture, which kills such a process rather than filtering it. Neither
 may ever carry `userns "disable"` — pressure-vessel nests its own bubblewrap for
-every Proton game. On the system bus `steam` talks to UPower and UDisks2,
-`lutris` to UDisks2 alone, which is what Wine enumerates drives through.
+every Proton game. On the system bus `steam` talks to UPower, and both grant
+UDisks2 enumeration alone — `see` plus the one `GetManagedObjects` call Wine
+builds its drive list from — because a `talk` there would also hand the
+sandbox loop setup, mount and LUKS unlock, which polkit judges as you; widen
+it yourself if a game needs more.
 `/dev/hugepages`, `/dev/fuse` and `/dev/snd` are still not bound.
 
 `steam` is also the one profile with no `portals`, and that is not an
@@ -499,9 +508,12 @@ anything is bound into the sandbox. A proxy that replaced its socket with a
 symlink would otherwise have that symlink's target bound in its place. The
 proxy keeps serving after the move: it listens on the socket, not on the path.
 
-The host bus is `$DBUS_SESSION_BUS_ADDRESS` when it is a `unix:path=`
-address, else `$XDG_RUNTIME_DIR/bus`, and must be a socket. Everything the
-sandbox may reach is a rule: the `dbus` children above, plus the bundles
+The host bus is `$DBUS_SESSION_BUS_ADDRESS` when it is set, else
+`$XDG_RUNTIME_DIR/bus`, and must be a socket. Either bus address variable
+holding a transport bubbler cannot bind — `tcp:`, `unix:abstract=` — fails the
+run naming the variable instead of falling back to the default socket, which
+would filter a bus the session is not on; unset or empty is that default.
+Everything the sandbox may reach is a rule: the `dbus` children above, plus the bundles
 `portals`, `notify`, `tray` and `mpris`, each of which needs `dbus`.
 `portals` also puts a `/.flatpak-info` in the sandbox giving it the
 application id `org.bubbler.<name>`, which is what portals and the proxy
@@ -554,8 +566,8 @@ player on the session bus. Name the application, not a prefix.
 
     system-bus {
         talk "org.freedesktop.UPower"
-        talk "org.freedesktop.UDisks2"
         see  "org.freedesktop.NetworkManager"
+        call "org.freedesktop.UDisks2=org.freedesktop.DBus.ObjectManager.GetManagedObjects@/org/freedesktop/UDisks2"
     }
 
 It takes the `dbus` children except `own`, needs at least one of them, and
@@ -568,9 +580,9 @@ sandbox reaches nothing on the system bus that the node does not write.
 The filtered socket is bound at `/run/dbus/system_bus_socket`, which is what
 libdbus and libsystemd compile in, so no environment variable is set and
 `DBUS_SYSTEM_BUS_ADDRESS` is one of the variables `env` may not set. The host
-socket is `$DBUS_SYSTEM_BUS_ADDRESS` when it is a `unix:path=` address, else
-`/run/dbus/system_bus_socket`, and must resolve to a socket. Everything the launcher
-does with the session socket it does with this one: the proxy writes it in
+socket is `$DBUS_SYSTEM_BUS_ADDRESS` when it is set, else
+`/run/dbus/system_bus_socket`, and must resolve to a socket. Everything the
+launcher does with the session socket it does with this one: the proxy writes it in
 `dbus/`, bubbler moves it to `$XDG_RUNTIME_DIR/bubbler/<name>/system` without
 following symlinks, checks it really is a socket, and only then does the
 sandbox bind it.
