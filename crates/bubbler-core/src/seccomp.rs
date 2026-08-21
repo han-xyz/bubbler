@@ -1,18 +1,17 @@
 //! The seccomp denylist: which syscalls a sandbox loses by default, the
-//! per-architecture syscall name table, the rule set a profile's
-//! `seccomp` node produces, and the BPF programs it compiles into.
+//! rule set a profile's `seccomp` node produces, and the one multi-ABI
+//! BPF program libseccomp compiles it into.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use rustix::io::Errno as OsErrno;
-use seccompiler::{
-    BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
-    SeccompRule, TargetArch,
+use libseccomp::error::SeccompError;
+use libseccomp::{
+    ScmpAction, ScmpArch, ScmpArgCompare, ScmpCompareOp, ScmpFilterContext, ScmpSyscall,
 };
-
-#[cfg(target_arch = "x86_64")]
-use seccompiler::sock_filter;
+use rustix::fs::MemfdFlags;
+use rustix::io::Errno as OsErrno;
 
 use crate::error::LaunchError;
 
@@ -64,8 +63,20 @@ pub const DEFAULT_EPERM: &[&str] = &[
     "nfsservctl",
     "vm86",
     "vm86old",
-    "modify_ldt",
 ];
+
+/// Denied with `EPERM` on top of [`DEFAULT_EPERM`], but only where the
+/// filter carries a single ABI. `modify_ldt` writes the local descriptor
+/// table, which 16-bit code and several Wine patches need. Every rule
+/// here goes in after both architectures, so it holds for both ABIs;
+/// keeping this one would break the 32-bit code the second architecture
+/// exists to filter rather than kill, which is why flatpak allows it
+/// wherever its own filter is multiarch (`flatpak-run.c`). The cost is
+/// real and not confined to 32-bit callers: on a multiarch build 64-bit
+/// code can call `modify_ldt` too, where a single-architecture filter
+/// answered `EPERM` (measured). A profile that wants it back writes
+/// `seccomp { deny "modify_ldt" }`.
+pub const SINGLE_ARCH_EPERM: &[&str] = &["modify_ldt"];
 
 /// Syscalls the default filter answers with `ENOSYS`, so libc falls back
 /// to the older call instead of failing: seccomp cannot inspect `clone3`'s
@@ -96,6 +107,23 @@ pub const TIOCSTI: u32 = 0x5412;
 /// `asm-generic/ioctls.h`.
 pub const TIOCLINUX: u32 = 0x541C;
 
+/// Architectures added to the filter beyond the one bubbler was built
+/// for. On x86_64 that is i386, so a 32-bit binary in the sandbox is
+/// filtered instead of killed by the ABI check; libseccomp translates
+/// every rule to it by name, including the `_time64` numbers glibc issues
+/// there. x32 is deliberately not among them: it shares x86_64's
+/// `AUDIT_ARCH` value, and libseccomp's own guard denies its numbers.
+#[cfg(target_arch = "x86_64")]
+const EXTRA_ARCHES: &[ScmpArch] = &[ScmpArch::X86];
+#[cfg(not(target_arch = "x86_64"))]
+const EXTRA_ARCHES: &[ScmpArch] = &[];
+
+/// The architectures one filter answers for, as `--explain` names them.
+#[cfg(target_arch = "x86_64")]
+pub const ARCHES: &str = "x86_64 + i386";
+#[cfg(not(target_arch = "x86_64"))]
+pub const ARCHES: &str = std::env::consts::ARCH;
+
 /// What a denied syscall returns to the sandboxed process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Errno {
@@ -107,21 +135,30 @@ pub enum Errno {
 }
 
 impl Errno {
-    /// The name as `errno(3)` writes it, for messages about the program
-    /// that answers with it.
+    /// The name as `errno(3)` writes it, for messages about the rules
+    /// that answer with it.
     pub fn name(self) -> &'static str {
         match self {
             Self::Eperm => "EPERM",
             Self::Enosys => "ENOSYS",
         }
     }
+
+    /// The number the syscall returns, as a positive `errno` value.
+    fn raw(self) -> i32 {
+        match self {
+            Self::Eperm => OsErrno::PERM.raw_os_error(),
+            Self::Enosys => OsErrno::NOSYS.raw_os_error(),
+        }
+    }
 }
 
-/// One compiled filter with the error every syscall it matches gets.
+/// One compiled filter and the architectures it answers for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
-    /// The error this program answers with.
-    pub errno: Errno,
+    /// The architectures the rules were translated to, for
+    /// [`crate::bwrap::Explained::note`].
+    pub arches: &'static str,
     /// cBPF as `struct sock_filter` bytes; bwrap rejects a length that is
     /// not a multiple of eight.
     pub bytes: Vec<u8>,
@@ -141,8 +178,8 @@ pub struct SeccompConfig {
 }
 
 /// The syscalls one sandbox is denied, split by the error each returns.
-/// Names absent on the build architecture stay in the lists; dropping them
-/// is the compile step's job.
+/// Names no architecture in the filter has stay in the lists; dropping
+/// them is the compile step's job.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuleSet {
     /// Syscall names denied with `EPERM`.
@@ -157,8 +194,16 @@ pub struct RuleSet {
 impl RuleSet {
     /// The denylist every sandbox gets unless its profile says otherwise.
     pub fn default_set() -> Self {
+        let extra: &[&str] = match EXTRA_ARCHES.is_empty() {
+            true => SINGLE_ARCH_EPERM,
+            false => &[],
+        };
         Self {
-            eperm: DEFAULT_EPERM.iter().map(|s| (*s).to_owned()).collect(),
+            eperm: DEFAULT_EPERM
+                .iter()
+                .chain(extra)
+                .map(|s| (*s).to_owned())
+                .collect(),
             enosys: DEFAULT_ENOSYS.iter().map(|s| (*s).to_owned()).collect(),
             ioctl_eperm: DEFAULT_IOCTL_EPERM.to_vec(),
         }
@@ -202,1327 +247,199 @@ impl RuleSet {
     }
 }
 
-/// The architecture the filter is compiled for. seccompiler embeds a check
-/// for it and kills a caller from any other ABI, so a 32-bit (i386) binary
-/// in the sandbox dies rather than slipping past the rules. x32 is the one
-/// ABI that check cannot see; [`X32_GUARD`] is what stops it.
-#[cfg(target_arch = "x86_64")]
-const TARGET: TargetArch = TargetArch::x86_64;
-#[cfg(target_arch = "aarch64")]
-const TARGET: TargetArch = TargetArch::aarch64;
-#[cfg(target_arch = "riscv64")]
-const TARGET: TargetArch = TargetArch::riscv64;
-
-/// Denies every syscall made with `__X32_SYSCALL_BIT` set, in front of
-/// each compiled program. The x32 ABI shares x86_64's `AUDIT_ARCH_X86_64`,
-/// so [`TARGET`]'s architecture check passes an x32 caller straight into
-/// the rules, where every number misses: `keyctl` is 250 and an x32 caller
-/// asks for `0x4000_0000 | 250`. `man 2 seccomp`: a policy "must either
-/// deny all syscalls with `__X32_SYSCALL_BIT` or it must recognize
-/// syscalls with and without `__X32_SYSCALL_BIT` set".
-///
-/// Both programs answer `EPERM` here, the `ENOSYS` one included: an x32
-/// call is refused, not made to look unimplemented, and there is no older
-/// call to fall back to. `BUBBLER_SECCOMP_LOG` does not soften it either,
-/// because this is an ABI gate like the architecture check seccompiler
-/// emits, not one of the denylist's rules. Anything below the bit falls
-/// through into seccompiler's output, which needs no relocating: every
-/// jump a cBPF program makes is relative to the instruction making it.
-// Instruction codes from `linux/bpf_common.h`, `__X32_SYSCALL_BIT` from
-// `asm/unistd.h`, the return value from `linux/seccomp.h`.
-#[cfg(target_arch = "x86_64")]
-const X32_GUARD: [sock_filter; 3] = [
-    // BPF_LD | BPF_W | BPF_ABS of `seccomp_data.nr`, at offset 0.
-    sock_filter {
-        code: 0x0020,
-        jt: 0,
-        jf: 0,
-        k: 0,
-    },
-    // BPF_JMP | BPF_JGE | BPF_K: at or above the bit falls into the
-    // return below, anything else skips it into the rules.
-    sock_filter {
-        code: 0x0035,
-        jt: 0,
-        jf: 1,
-        k: 0x4000_0000,
-    },
-    // BPF_RET | BPF_K of SECCOMP_RET_ERRNO | EPERM.
-    sock_filter {
-        code: 0x0006,
-        jt: 0,
-        jf: 0,
-        k: 0x0005_0000 | 1,
-    },
-];
-
-/// `program` behind [`X32_GUARD`]. x86_64 is the only architecture
-/// bubbler builds for that has a second ABI sharing its `AUDIT_ARCH`
-/// value, so elsewhere seccompiler's own check already sees every caller.
-#[cfg(target_arch = "x86_64")]
-fn guarded(program: BpfProgram) -> BpfProgram {
-    let mut out = Vec::with_capacity(X32_GUARD.len() + program.len());
-    out.extend_from_slice(&X32_GUARD);
-    out.extend(program);
-    out
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn guarded(program: BpfProgram) -> BpfProgram {
-    program
-}
-
-/// Mask applied to `ioctl`'s request argument. The comparison is already
-/// a `SeccompCmpArgLen::Dword` one, which looks at the low 32 bits —
-/// the same half the kernel hands the driver, so a request of
-/// `0x1_0000_5412` is TIOCSTI to both. The mask is belt and braces: it
-/// keeps the rule saying what it compares if that width ever widens.
+/// Mask applied to `ioctl`'s request argument, so the rule looks at the
+/// low 32 bits — the same half the kernel hands the driver, which makes a
+/// request of `0x1_0000_5412` TIOCSTI to both.
 const REQUEST_MASK: u64 = 0xFFFF_FFFF;
 
-/// Set by the first compile that could report skipped names. Which names
-/// those are follows from the build, not from the launch, so an instance
-/// that also starts a proxy sidecar would otherwise say it all twice.
+/// Set once a compile has named its skipped rules. Which names those are
+/// follows from the build, not from the launch, so an instance that also
+/// starts a proxy sidecar would otherwise say it all twice.
 static NOTED: AtomicBool = AtomicBool::new(false);
 
-/// Whether this compile is the one that reports the skipped names.
-fn take_note(log: bool, noted: &AtomicBool) -> bool {
-    log && !noted.swap(true, Ordering::Relaxed)
+/// Whether this compile is the one that names `skipped` on stderr: the
+/// first that has anything to name. A compile that failed, or that
+/// skipped nothing, leaves the report to the next one.
+fn take_note(skipped: &[String], noted: &AtomicBool) -> bool {
+    !skipped.is_empty() && !noted.swap(true, Ordering::Relaxed)
 }
 
-/// The rule set as loadable BPF for `--add-seccomp-fd`, one program per
-/// error it uses (`EPERM` first, then `ENOSYS`). Everything not named is
-/// allowed, names this architecture never had are skipped, and `log`
-/// turns matches into audit log entries instead of errors.
-pub fn compile(set: &RuleSet, log: bool) -> Result<Vec<Program>, LaunchError> {
-    let note = take_note(log, &NOTED);
-    let groups = [
-        (
-            &set.eperm,
-            Errno::Eperm,
-            OsErrno::PERM,
-            set.ioctl_eperm.as_slice(),
-        ),
-        (&set.enosys, Errno::Enosys, OsErrno::NOSYS, &[][..]),
-    ];
-    let mut out = Vec::new();
-    for (names, kind, errno, ioctl) in groups {
-        let rules = rules_for(names, ioctl, note)?;
-        if rules.is_empty() {
-            continue;
+/// One build's output: the filter, how many rules reached it, and the
+/// names this libseccomp did not know.
+struct Built {
+    filter: ScmpFilterContext,
+    rules: usize,
+    skipped: Vec<String>,
+}
+
+/// The rule set as one loadable BPF program for `--add-seccomp-fd`, or
+/// `None` when no rule went in — an `allow` list that takes every rule
+/// back, or names this libseccomp does not know. Everything not named is
+/// allowed, and `log` turns matches into audit log entries instead of
+/// errors.
+pub fn compile(set: &RuleSet, log: bool) -> Result<Option<Program>, LaunchError> {
+    let built = build(set, log)?;
+    // A skipped name is a rule that is not in the filter, so it is
+    // reported whatever the log switch says: the alternative is a
+    // silently weaker sandbox on a libseccomp too old for the list.
+    if take_note(&built.skipped, &NOTED) {
+        for name in &built.skipped {
+            eprintln!("bubbler: seccomp: {name} unknown to this libseccomp, rule skipped");
         }
-        let action = match log {
-            true => SeccompAction::Log,
-            // The errno is what the syscall returns, so it is the raw
-            // positive number, not a negated return value.
-            false => SeccompAction::Errno(errno.raw_os_error() as u32),
-        };
-        let filter = SeccompFilter::new(rules, SeccompAction::Allow, action, TARGET)
-            .map_err(|e| LaunchError::Seccomp(e.to_string()))?;
-        let program: BpfProgram = filter
-            .try_into()
-            .map_err(|e: seccompiler::BackendError| LaunchError::Seccomp(e.to_string()))?;
-        out.push(Program {
-            errno: kind,
-            bytes: program_bytes(&guarded(program)),
+    }
+    if built.rules == 0 {
+        return Ok(None);
+    }
+    Ok(Some(Program {
+        arches: ARCHES,
+        bytes: export(&built.filter)?,
+    }))
+}
+
+/// `set` as a libseccomp filter over [`ARCHES`], allowing everything it
+/// does not name. A syscall appears once even if both lists carry it:
+/// libseccomp refuses a second action for the same number, and the first
+/// list `RuleSet` puts it on decides.
+fn build(set: &RuleSet, log: bool) -> Result<Built, LaunchError> {
+    let mut filter = ScmpFilterContext::new(ScmpAction::Allow).map_err(failed)?;
+    // A syscall from an ABI the filter does not carry cannot be matched
+    // by number — x32 shares x86_64's `AUDIT_ARCH` value and offsets
+    // every number by `__X32_SYSCALL_BIT` — so such a caller is killed
+    // rather than let through. `man 2 seccomp` requires exactly this of
+    // any policy that does not enumerate the x32 numbers as well.
+    filter
+        .set_act_badarch(ScmpAction::KillProcess)
+        .map_err(failed)?;
+    // `man 3 seccomp_arch_add`: rules added after an architecture is
+    // added reach every architecture in the filter, and rules added
+    // before it do not. So the architectures come first.
+    for arch in EXTRA_ARCHES {
+        filter.add_arch(*arch).map_err(failed)?;
+    }
+    let mut seen: BTreeSet<i32> = BTreeSet::new();
+    let mut skipped = Vec::new();
+    for (names, errno) in [(&set.eperm, Errno::Eperm), (&set.enosys, Errno::Enosys)] {
+        for name in names {
+            let Ok(nr) = ScmpSyscall::from_name(name) else {
+                skipped.push(name.clone());
+                continue;
+            };
+            if !seen.insert(nr.into()) {
+                continue;
+            }
+            filter.add_rule(action(log, errno), nr).map_err(failed)?;
+        }
+    }
+    let mut rules = seen.len();
+    let Ok(ioctl) = ScmpSyscall::from_name("ioctl") else {
+        return Ok(Built {
+            filter,
+            rules,
+            skipped,
         });
-    }
-    Ok(out)
-}
-
-/// One error's rules keyed by syscall number: an empty rule chain matches
-/// the syscall whatever its arguments are, and the `ioctl` requests in
-/// `ioctl_eperm` become one argument-filtered rule each. `note` reports
-/// the names skipped on this architecture on stderr.
-fn rules_for(
-    names: &[String],
-    ioctl_eperm: &[u32],
-    note: bool,
-) -> Result<BTreeMap<i64, Vec<SeccompRule>>, LaunchError> {
-    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
-    for name in names {
-        match syscall_number(name) {
-            Some(nr) => {
-                rules.insert(nr, Vec::new());
-            }
-            // Not an error: the default list is written for every
-            // architecture, and a syscall this one never had cannot be
-            // called on it.
-            None => {
-                if note {
-                    eprintln!("bubbler: seccomp: no `{name}` on this architecture; skipping");
-                }
-            }
-        }
-    }
-    let Some(ioctl) = syscall_number("ioctl") else {
-        return Ok(rules);
     };
     // A blanket deny of `ioctl` already covers every request, so adding
     // the argument-filtered rules to it would only narrow it.
-    if ioctl_eperm.is_empty() || rules.contains_key(&ioctl) {
-        return Ok(rules);
+    if !set.ioctl_eperm.is_empty() && !seen.contains(&ioctl.into()) {
+        for request in &set.ioctl_eperm {
+            let cmp = ScmpArgCompare::new(
+                1,
+                ScmpCompareOp::MaskedEqual(REQUEST_MASK),
+                u64::from(*request),
+            );
+            filter
+                .add_rule_conditional(action(log, Errno::Eperm), ioctl, &[cmp])
+                .map_err(failed)?;
+            rules += 1;
+        }
     }
-    let mut chain = Vec::with_capacity(ioctl_eperm.len());
-    for request in ioctl_eperm {
-        let cond = SeccompCondition::new(
-            1,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::MaskedEq(REQUEST_MASK),
-            u64::from(*request),
-        )
-        .map_err(|e| LaunchError::Seccomp(e.to_string()))?;
-        chain.push(SeccompRule::new(vec![cond]).map_err(|e| LaunchError::Seccomp(e.to_string()))?);
-    }
-    rules.insert(ioctl, chain);
-    Ok(rules)
+    Ok(Built {
+        filter,
+        rules,
+        skipped,
+    })
 }
 
-/// A compiled program as the bytes bwrap reads: `struct sock_filter` is
-/// `code` `jt` `jf` `k` in native order, eight bytes per instruction, and
-/// seccompiler only builds for little-endian targets.
-fn program_bytes(program: &BpfProgram) -> Vec<u8> {
-    let mut out = Vec::with_capacity(program.len() * 8);
-    for i in program {
-        out.extend_from_slice(&i.code.to_le_bytes());
-        out.push(i.jt);
-        out.push(i.jf);
-        out.extend_from_slice(&i.k.to_le_bytes());
+/// What a matching syscall gets: the error, or an audit log entry and
+/// then the syscall it asked for.
+fn action(log: bool, errno: Errno) -> ScmpAction {
+    match log {
+        true => ScmpAction::Log,
+        // The errno is what the syscall returns, so it is the raw
+        // positive number, not a negated return value.
+        false => ScmpAction::Errno(errno.raw()),
     }
-    out
 }
 
-// Syscall numbers for the architecture bubbler is built for, sorted by
-// name so `syscall_number` can binary-search it.
-// Source: Linux 7.1 `arch/x86/entry/syscalls/syscall_64.tbl`, ABI columns
-// `common` and `64`. The x32 ABI is left out on purpose: it shares this
-// one's `AUDIT_ARCH_X86_64`, so `X32_GUARD` denies its numbers outright
-// rather than the table carrying a second set of them.
-#[cfg(target_arch = "x86_64")]
-static SYSCALLS: &[(&str, i64)] = &[
-    ("_sysctl", 156),
-    ("accept", 43),
-    ("accept4", 288),
-    ("access", 21),
-    ("acct", 163),
-    ("add_key", 248),
-    ("adjtimex", 159),
-    ("afs_syscall", 183),
-    ("alarm", 37),
-    ("arch_prctl", 158),
-    ("bind", 49),
-    ("bpf", 321),
-    ("brk", 12),
-    ("cachestat", 451),
-    ("capget", 125),
-    ("capset", 126),
-    ("chdir", 80),
-    ("chmod", 90),
-    ("chown", 92),
-    ("chroot", 161),
-    ("clock_adjtime", 305),
-    ("clock_getres", 229),
-    ("clock_gettime", 228),
-    ("clock_nanosleep", 230),
-    ("clock_settime", 227),
-    ("clone", 56),
-    ("clone3", 435),
-    ("close", 3),
-    ("close_range", 436),
-    ("connect", 42),
-    ("copy_file_range", 326),
-    ("creat", 85),
-    ("create_module", 174),
-    ("delete_module", 176),
-    ("dup", 32),
-    ("dup2", 33),
-    ("dup3", 292),
-    ("epoll_create", 213),
-    ("epoll_create1", 291),
-    ("epoll_ctl", 233),
-    ("epoll_ctl_old", 214),
-    ("epoll_pwait", 281),
-    ("epoll_pwait2", 441),
-    ("epoll_wait", 232),
-    ("epoll_wait_old", 215),
-    ("eventfd", 284),
-    ("eventfd2", 290),
-    ("execve", 59),
-    ("execveat", 322),
-    ("exit", 60),
-    ("exit_group", 231),
-    ("faccessat", 269),
-    ("faccessat2", 439),
-    ("fadvise64", 221),
-    ("fallocate", 285),
-    ("fanotify_init", 300),
-    ("fanotify_mark", 301),
-    ("fchdir", 81),
-    ("fchmod", 91),
-    ("fchmodat", 268),
-    ("fchmodat2", 452),
-    ("fchown", 93),
-    ("fchownat", 260),
-    ("fcntl", 72),
-    ("fdatasync", 75),
-    ("fgetxattr", 193),
-    ("file_getattr", 468),
-    ("file_setattr", 469),
-    ("finit_module", 313),
-    ("flistxattr", 196),
-    ("flock", 73),
-    ("fork", 57),
-    ("fremovexattr", 199),
-    ("fsconfig", 431),
-    ("fsetxattr", 190),
-    ("fsmount", 432),
-    ("fsopen", 430),
-    ("fspick", 433),
-    ("fstat", 5),
-    ("fstatfs", 138),
-    ("fsync", 74),
-    ("ftruncate", 77),
-    ("futex", 202),
-    ("futex_requeue", 456),
-    ("futex_wait", 455),
-    ("futex_waitv", 449),
-    ("futex_wake", 454),
-    ("futimesat", 261),
-    ("get_kernel_syms", 177),
-    ("get_mempolicy", 239),
-    ("get_robust_list", 274),
-    ("get_thread_area", 211),
-    ("getcpu", 309),
-    ("getcwd", 79),
-    ("getdents", 78),
-    ("getdents64", 217),
-    ("getegid", 108),
-    ("geteuid", 107),
-    ("getgid", 104),
-    ("getgroups", 115),
-    ("getitimer", 36),
-    ("getpeername", 52),
-    ("getpgid", 121),
-    ("getpgrp", 111),
-    ("getpid", 39),
-    ("getpmsg", 181),
-    ("getppid", 110),
-    ("getpriority", 140),
-    ("getrandom", 318),
-    ("getresgid", 120),
-    ("getresuid", 118),
-    ("getrlimit", 97),
-    ("getrusage", 98),
-    ("getsid", 124),
-    ("getsockname", 51),
-    ("getsockopt", 55),
-    ("gettid", 186),
-    ("gettimeofday", 96),
-    ("getuid", 102),
-    ("getxattr", 191),
-    ("getxattrat", 464),
-    ("init_module", 175),
-    ("inotify_add_watch", 254),
-    ("inotify_init", 253),
-    ("inotify_init1", 294),
-    ("inotify_rm_watch", 255),
-    ("io_cancel", 210),
-    ("io_destroy", 207),
-    ("io_getevents", 208),
-    ("io_pgetevents", 333),
-    ("io_setup", 206),
-    ("io_submit", 209),
-    ("io_uring_enter", 426),
-    ("io_uring_register", 427),
-    ("io_uring_setup", 425),
-    ("ioctl", 16),
-    ("ioperm", 173),
-    ("iopl", 172),
-    ("ioprio_get", 252),
-    ("ioprio_set", 251),
-    ("kcmp", 312),
-    ("kexec_file_load", 320),
-    ("kexec_load", 246),
-    ("keyctl", 250),
-    ("kill", 62),
-    ("landlock_add_rule", 445),
-    ("landlock_create_ruleset", 444),
-    ("landlock_restrict_self", 446),
-    ("lchown", 94),
-    ("lgetxattr", 192),
-    ("link", 86),
-    ("linkat", 265),
-    ("listen", 50),
-    ("listmount", 458),
-    ("listns", 470),
-    ("listxattr", 194),
-    ("listxattrat", 465),
-    ("llistxattr", 195),
-    ("lookup_dcookie", 212),
-    ("lremovexattr", 198),
-    ("lseek", 8),
-    ("lsetxattr", 189),
-    ("lsm_get_self_attr", 459),
-    ("lsm_list_modules", 461),
-    ("lsm_set_self_attr", 460),
-    ("lstat", 6),
-    ("madvise", 28),
-    ("map_shadow_stack", 453),
-    ("mbind", 237),
-    ("membarrier", 324),
-    ("memfd_create", 319),
-    ("memfd_secret", 447),
-    ("migrate_pages", 256),
-    ("mincore", 27),
-    ("mkdir", 83),
-    ("mkdirat", 258),
-    ("mknod", 133),
-    ("mknodat", 259),
-    ("mlock", 149),
-    ("mlock2", 325),
-    ("mlockall", 151),
-    ("mmap", 9),
-    ("modify_ldt", 154),
-    ("mount", 165),
-    ("mount_setattr", 442),
-    ("move_mount", 429),
-    ("move_pages", 279),
-    ("mprotect", 10),
-    ("mq_getsetattr", 245),
-    ("mq_notify", 244),
-    ("mq_open", 240),
-    ("mq_timedreceive", 243),
-    ("mq_timedsend", 242),
-    ("mq_unlink", 241),
-    ("mremap", 25),
-    ("mseal", 462),
-    ("msgctl", 71),
-    ("msgget", 68),
-    ("msgrcv", 70),
-    ("msgsnd", 69),
-    ("msync", 26),
-    ("munlock", 150),
-    ("munlockall", 152),
-    ("munmap", 11),
-    ("name_to_handle_at", 303),
-    ("nanosleep", 35),
-    ("newfstatat", 262),
-    ("nfsservctl", 180),
-    ("open", 2),
-    ("open_by_handle_at", 304),
-    ("open_tree", 428),
-    ("open_tree_attr", 467),
-    ("openat", 257),
-    ("openat2", 437),
-    ("pause", 34),
-    ("perf_event_open", 298),
-    ("personality", 135),
-    ("pidfd_getfd", 438),
-    ("pidfd_open", 434),
-    ("pidfd_send_signal", 424),
-    ("pipe", 22),
-    ("pipe2", 293),
-    ("pivot_root", 155),
-    ("pkey_alloc", 330),
-    ("pkey_free", 331),
-    ("pkey_mprotect", 329),
-    ("poll", 7),
-    ("ppoll", 271),
-    ("prctl", 157),
-    ("pread64", 17),
-    ("preadv", 295),
-    ("preadv2", 327),
-    ("prlimit64", 302),
-    ("process_madvise", 440),
-    ("process_mrelease", 448),
-    ("process_vm_readv", 310),
-    ("process_vm_writev", 311),
-    ("pselect6", 270),
-    ("ptrace", 101),
-    ("putpmsg", 182),
-    ("pwrite64", 18),
-    ("pwritev", 296),
-    ("pwritev2", 328),
-    ("query_module", 178),
-    ("quotactl", 179),
-    ("quotactl_fd", 443),
-    ("read", 0),
-    ("readahead", 187),
-    ("readlink", 89),
-    ("readlinkat", 267),
-    ("readv", 19),
-    ("reboot", 169),
-    ("recvfrom", 45),
-    ("recvmmsg", 299),
-    ("recvmsg", 47),
-    ("remap_file_pages", 216),
-    ("removexattr", 197),
-    ("removexattrat", 466),
-    ("rename", 82),
-    ("renameat", 264),
-    ("renameat2", 316),
-    ("request_key", 249),
-    ("restart_syscall", 219),
-    ("rmdir", 84),
-    ("rseq", 334),
-    ("rseq_slice_yield", 471),
-    ("rt_sigaction", 13),
-    ("rt_sigpending", 127),
-    ("rt_sigprocmask", 14),
-    ("rt_sigqueueinfo", 129),
-    ("rt_sigreturn", 15),
-    ("rt_sigsuspend", 130),
-    ("rt_sigtimedwait", 128),
-    ("rt_tgsigqueueinfo", 297),
-    ("sched_get_priority_max", 146),
-    ("sched_get_priority_min", 147),
-    ("sched_getaffinity", 204),
-    ("sched_getattr", 315),
-    ("sched_getparam", 143),
-    ("sched_getscheduler", 145),
-    ("sched_rr_get_interval", 148),
-    ("sched_setaffinity", 203),
-    ("sched_setattr", 314),
-    ("sched_setparam", 142),
-    ("sched_setscheduler", 144),
-    ("sched_yield", 24),
-    ("seccomp", 317),
-    ("security", 185),
-    ("select", 23),
-    ("semctl", 66),
-    ("semget", 64),
-    ("semop", 65),
-    ("semtimedop", 220),
-    ("sendfile", 40),
-    ("sendmmsg", 307),
-    ("sendmsg", 46),
-    ("sendto", 44),
-    ("set_mempolicy", 238),
-    ("set_mempolicy_home_node", 450),
-    ("set_robust_list", 273),
-    ("set_thread_area", 205),
-    ("set_tid_address", 218),
-    ("setdomainname", 171),
-    ("setfsgid", 123),
-    ("setfsuid", 122),
-    ("setgid", 106),
-    ("setgroups", 116),
-    ("sethostname", 170),
-    ("setitimer", 38),
-    ("setns", 308),
-    ("setpgid", 109),
-    ("setpriority", 141),
-    ("setregid", 114),
-    ("setresgid", 119),
-    ("setresuid", 117),
-    ("setreuid", 113),
-    ("setrlimit", 160),
-    ("setsid", 112),
-    ("setsockopt", 54),
-    ("settimeofday", 164),
-    ("setuid", 105),
-    ("setxattr", 188),
-    ("setxattrat", 463),
-    ("shmat", 30),
-    ("shmctl", 31),
-    ("shmdt", 67),
-    ("shmget", 29),
-    ("shutdown", 48),
-    ("sigaltstack", 131),
-    ("signalfd", 282),
-    ("signalfd4", 289),
-    ("socket", 41),
-    ("socketpair", 53),
-    ("splice", 275),
-    ("stat", 4),
-    ("statfs", 137),
-    ("statmount", 457),
-    ("statx", 332),
-    ("swapoff", 168),
-    ("swapon", 167),
-    ("symlink", 88),
-    ("symlinkat", 266),
-    ("sync", 162),
-    ("sync_file_range", 277),
-    ("syncfs", 306),
-    ("sysfs", 139),
-    ("sysinfo", 99),
-    ("syslog", 103),
-    ("tee", 276),
-    ("tgkill", 234),
-    ("time", 201),
-    ("timer_create", 222),
-    ("timer_delete", 226),
-    ("timer_getoverrun", 225),
-    ("timer_gettime", 224),
-    ("timer_settime", 223),
-    ("timerfd_create", 283),
-    ("timerfd_gettime", 287),
-    ("timerfd_settime", 286),
-    ("times", 100),
-    ("tkill", 200),
-    ("truncate", 76),
-    ("tuxcall", 184),
-    ("umask", 95),
-    ("umount2", 166),
-    ("uname", 63),
-    ("unlink", 87),
-    ("unlinkat", 263),
-    ("unshare", 272),
-    ("uprobe", 336),
-    ("uretprobe", 335),
-    ("uselib", 134),
-    ("userfaultfd", 323),
-    ("ustat", 136),
-    ("utime", 132),
-    ("utimensat", 280),
-    ("utimes", 235),
-    ("vfork", 58),
-    ("vhangup", 153),
-    ("vmsplice", 278),
-    ("vserver", 236),
-    ("wait4", 61),
-    ("waitid", 247),
-    ("write", 1),
-    ("writev", 20),
-];
+/// The filter as the bytes bwrap reads. libseccomp writes cBPF to a file
+/// descriptor, so it goes through a memfd rather than a temporary file;
+/// `export_bpf_mem` would do it in one call but needs libseccomp 2.6.
+fn export(filter: &ScmpFilterContext) -> Result<Vec<u8>, LaunchError> {
+    let io = |e: std::io::Error| LaunchError::Seccomp(format!("exporting the filter: {e}"));
+    let fd = rustix::fs::memfd_create("bubbler-seccomp", MemfdFlags::CLOEXEC)
+        .map_err(|e| io(e.into()))?;
+    filter.export_bpf(&fd).map_err(failed)?;
+    let mut file = std::fs::File::from(fd);
+    file.seek(SeekFrom::Start(0)).map_err(io)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(io)?;
+    Ok(bytes)
+}
 
-// Source: Linux 7.1 `include/uapi/asm-generic/unistd.h`, 64-bit branch,
-// equivalently `scripts/syscall.tbl` with the ABI set arm64 asks for in
-// `arch/arm64/kernel/Makefile.syscalls`: common, 64, renameat, rlimit,
-// memfd_secret.
-#[cfg(target_arch = "aarch64")]
-static SYSCALLS: &[(&str, i64)] = &[
-    ("accept", 202),
-    ("accept4", 242),
-    ("acct", 89),
-    ("add_key", 217),
-    ("adjtimex", 171),
-    ("bind", 200),
-    ("bpf", 280),
-    ("brk", 214),
-    ("cachestat", 451),
-    ("capget", 90),
-    ("capset", 91),
-    ("chdir", 49),
-    ("chroot", 51),
-    ("clock_adjtime", 266),
-    ("clock_getres", 114),
-    ("clock_gettime", 113),
-    ("clock_nanosleep", 115),
-    ("clock_settime", 112),
-    ("clone", 220),
-    ("clone3", 435),
-    ("close", 57),
-    ("close_range", 436),
-    ("connect", 203),
-    ("copy_file_range", 285),
-    ("delete_module", 106),
-    ("dup", 23),
-    ("dup3", 24),
-    ("epoll_create1", 20),
-    ("epoll_ctl", 21),
-    ("epoll_pwait", 22),
-    ("epoll_pwait2", 441),
-    ("eventfd2", 19),
-    ("execve", 221),
-    ("execveat", 281),
-    ("exit", 93),
-    ("exit_group", 94),
-    ("faccessat", 48),
-    ("faccessat2", 439),
-    ("fadvise64", 223),
-    ("fallocate", 47),
-    ("fanotify_init", 262),
-    ("fanotify_mark", 263),
-    ("fchdir", 50),
-    ("fchmod", 52),
-    ("fchmodat", 53),
-    ("fchmodat2", 452),
-    ("fchown", 55),
-    ("fchownat", 54),
-    ("fcntl", 25),
-    ("fdatasync", 83),
-    ("fgetxattr", 10),
-    ("file_getattr", 468),
-    ("file_setattr", 469),
-    ("finit_module", 273),
-    ("flistxattr", 13),
-    ("flock", 32),
-    ("fremovexattr", 16),
-    ("fsconfig", 431),
-    ("fsetxattr", 7),
-    ("fsmount", 432),
-    ("fsopen", 430),
-    ("fspick", 433),
-    ("fstat", 80),
-    ("fstatfs", 44),
-    ("fsync", 82),
-    ("ftruncate", 46),
-    ("futex", 98),
-    ("futex_requeue", 456),
-    ("futex_wait", 455),
-    ("futex_waitv", 449),
-    ("futex_wake", 454),
-    ("get_mempolicy", 236),
-    ("get_robust_list", 100),
-    ("getcpu", 168),
-    ("getcwd", 17),
-    ("getdents64", 61),
-    ("getegid", 177),
-    ("geteuid", 175),
-    ("getgid", 176),
-    ("getgroups", 158),
-    ("getitimer", 102),
-    ("getpeername", 205),
-    ("getpgid", 155),
-    ("getpid", 172),
-    ("getppid", 173),
-    ("getpriority", 141),
-    ("getrandom", 278),
-    ("getresgid", 150),
-    ("getresuid", 148),
-    ("getrlimit", 163),
-    ("getrusage", 165),
-    ("getsid", 156),
-    ("getsockname", 204),
-    ("getsockopt", 209),
-    ("gettid", 178),
-    ("gettimeofday", 169),
-    ("getuid", 174),
-    ("getxattr", 8),
-    ("getxattrat", 464),
-    ("init_module", 105),
-    ("inotify_add_watch", 27),
-    ("inotify_init1", 26),
-    ("inotify_rm_watch", 28),
-    ("io_cancel", 3),
-    ("io_destroy", 1),
-    ("io_getevents", 4),
-    ("io_pgetevents", 292),
-    ("io_setup", 0),
-    ("io_submit", 2),
-    ("io_uring_enter", 426),
-    ("io_uring_register", 427),
-    ("io_uring_setup", 425),
-    ("ioctl", 29),
-    ("ioprio_get", 31),
-    ("ioprio_set", 30),
-    ("kcmp", 272),
-    ("kexec_file_load", 294),
-    ("kexec_load", 104),
-    ("keyctl", 219),
-    ("kill", 129),
-    ("landlock_add_rule", 445),
-    ("landlock_create_ruleset", 444),
-    ("landlock_restrict_self", 446),
-    ("lgetxattr", 9),
-    ("linkat", 37),
-    ("listen", 201),
-    ("listmount", 458),
-    ("listns", 470),
-    ("listxattr", 11),
-    ("listxattrat", 465),
-    ("llistxattr", 12),
-    ("lookup_dcookie", 18),
-    ("lremovexattr", 15),
-    ("lseek", 62),
-    ("lsetxattr", 6),
-    ("lsm_get_self_attr", 459),
-    ("lsm_list_modules", 461),
-    ("lsm_set_self_attr", 460),
-    ("madvise", 233),
-    ("map_shadow_stack", 453),
-    ("mbind", 235),
-    ("membarrier", 283),
-    ("memfd_create", 279),
-    ("memfd_secret", 447),
-    ("migrate_pages", 238),
-    ("mincore", 232),
-    ("mkdirat", 34),
-    ("mknodat", 33),
-    ("mlock", 228),
-    ("mlock2", 284),
-    ("mlockall", 230),
-    ("mmap", 222),
-    ("mount", 40),
-    ("mount_setattr", 442),
-    ("move_mount", 429),
-    ("move_pages", 239),
-    ("mprotect", 226),
-    ("mq_getsetattr", 185),
-    ("mq_notify", 184),
-    ("mq_open", 180),
-    ("mq_timedreceive", 183),
-    ("mq_timedsend", 182),
-    ("mq_unlink", 181),
-    ("mremap", 216),
-    ("mseal", 462),
-    ("msgctl", 187),
-    ("msgget", 186),
-    ("msgrcv", 188),
-    ("msgsnd", 189),
-    ("msync", 227),
-    ("munlock", 229),
-    ("munlockall", 231),
-    ("munmap", 215),
-    ("name_to_handle_at", 264),
-    ("nanosleep", 101),
-    ("newfstatat", 79),
-    ("nfsservctl", 42),
-    ("open_by_handle_at", 265),
-    ("open_tree", 428),
-    ("open_tree_attr", 467),
-    ("openat", 56),
-    ("openat2", 437),
-    ("perf_event_open", 241),
-    ("personality", 92),
-    ("pidfd_getfd", 438),
-    ("pidfd_open", 434),
-    ("pidfd_send_signal", 424),
-    ("pipe2", 59),
-    ("pivot_root", 41),
-    ("pkey_alloc", 289),
-    ("pkey_free", 290),
-    ("pkey_mprotect", 288),
-    ("ppoll", 73),
-    ("prctl", 167),
-    ("pread64", 67),
-    ("preadv", 69),
-    ("preadv2", 286),
-    ("prlimit64", 261),
-    ("process_madvise", 440),
-    ("process_mrelease", 448),
-    ("process_vm_readv", 270),
-    ("process_vm_writev", 271),
-    ("pselect6", 72),
-    ("ptrace", 117),
-    ("pwrite64", 68),
-    ("pwritev", 70),
-    ("pwritev2", 287),
-    ("quotactl", 60),
-    ("quotactl_fd", 443),
-    ("read", 63),
-    ("readahead", 213),
-    ("readlinkat", 78),
-    ("readv", 65),
-    ("reboot", 142),
-    ("recvfrom", 207),
-    ("recvmmsg", 243),
-    ("recvmsg", 212),
-    ("remap_file_pages", 234),
-    ("removexattr", 14),
-    ("removexattrat", 466),
-    ("renameat", 38),
-    ("renameat2", 276),
-    ("request_key", 218),
-    ("restart_syscall", 128),
-    ("rseq", 293),
-    ("rseq_slice_yield", 471),
-    ("rt_sigaction", 134),
-    ("rt_sigpending", 136),
-    ("rt_sigprocmask", 135),
-    ("rt_sigqueueinfo", 138),
-    ("rt_sigreturn", 139),
-    ("rt_sigsuspend", 133),
-    ("rt_sigtimedwait", 137),
-    ("rt_tgsigqueueinfo", 240),
-    ("sched_get_priority_max", 125),
-    ("sched_get_priority_min", 126),
-    ("sched_getaffinity", 123),
-    ("sched_getattr", 275),
-    ("sched_getparam", 121),
-    ("sched_getscheduler", 120),
-    ("sched_rr_get_interval", 127),
-    ("sched_setaffinity", 122),
-    ("sched_setattr", 274),
-    ("sched_setparam", 118),
-    ("sched_setscheduler", 119),
-    ("sched_yield", 124),
-    ("seccomp", 277),
-    ("semctl", 191),
-    ("semget", 190),
-    ("semop", 193),
-    ("semtimedop", 192),
-    ("sendfile", 71),
-    ("sendmmsg", 269),
-    ("sendmsg", 211),
-    ("sendto", 206),
-    ("set_mempolicy", 237),
-    ("set_mempolicy_home_node", 450),
-    ("set_robust_list", 99),
-    ("set_tid_address", 96),
-    ("setdomainname", 162),
-    ("setfsgid", 152),
-    ("setfsuid", 151),
-    ("setgid", 144),
-    ("setgroups", 159),
-    ("sethostname", 161),
-    ("setitimer", 103),
-    ("setns", 268),
-    ("setpgid", 154),
-    ("setpriority", 140),
-    ("setregid", 143),
-    ("setresgid", 149),
-    ("setresuid", 147),
-    ("setreuid", 145),
-    ("setrlimit", 164),
-    ("setsid", 157),
-    ("setsockopt", 208),
-    ("settimeofday", 170),
-    ("setuid", 146),
-    ("setxattr", 5),
-    ("setxattrat", 463),
-    ("shmat", 196),
-    ("shmctl", 195),
-    ("shmdt", 197),
-    ("shmget", 194),
-    ("shutdown", 210),
-    ("sigaltstack", 132),
-    ("signalfd4", 74),
-    ("socket", 198),
-    ("socketpair", 199),
-    ("splice", 76),
-    ("statfs", 43),
-    ("statmount", 457),
-    ("statx", 291),
-    ("swapoff", 225),
-    ("swapon", 224),
-    ("symlinkat", 36),
-    ("sync", 81),
-    ("sync_file_range", 84),
-    ("syncfs", 267),
-    ("sysinfo", 179),
-    ("syslog", 116),
-    ("tee", 77),
-    ("tgkill", 131),
-    ("timer_create", 107),
-    ("timer_delete", 111),
-    ("timer_getoverrun", 109),
-    ("timer_gettime", 108),
-    ("timer_settime", 110),
-    ("timerfd_create", 85),
-    ("timerfd_gettime", 87),
-    ("timerfd_settime", 86),
-    ("times", 153),
-    ("tkill", 130),
-    ("truncate", 45),
-    ("umask", 166),
-    ("umount2", 39),
-    ("uname", 160),
-    ("unlinkat", 35),
-    ("unshare", 97),
-    ("userfaultfd", 282),
-    ("utimensat", 88),
-    ("vhangup", 58),
-    ("vmsplice", 75),
-    ("wait4", 260),
-    ("waitid", 95),
-    ("write", 64),
-    ("writev", 66),
-];
+fn failed(e: SeccompError) -> LaunchError {
+    LaunchError::Seccomp(e.to_string())
+}
 
-// Source: Linux 7.1 `include/uapi/asm-generic/unistd.h`, 64-bit branch,
-// plus the two riscv-specific calls; equivalently `scripts/syscall.tbl`
-// with the ABI set from `arch/riscv/kernel/Makefile.syscalls`: common, 64,
-// riscv, rlimit, memfd_secret. riscv64 has no `renameat`, only `renameat2`.
-#[cfg(target_arch = "riscv64")]
-static SYSCALLS: &[(&str, i64)] = &[
-    ("accept", 202),
-    ("accept4", 242),
-    ("acct", 89),
-    ("add_key", 217),
-    ("adjtimex", 171),
-    ("bind", 200),
-    ("bpf", 280),
-    ("brk", 214),
-    ("cachestat", 451),
-    ("capget", 90),
-    ("capset", 91),
-    ("chdir", 49),
-    ("chroot", 51),
-    ("clock_adjtime", 266),
-    ("clock_getres", 114),
-    ("clock_gettime", 113),
-    ("clock_nanosleep", 115),
-    ("clock_settime", 112),
-    ("clone", 220),
-    ("clone3", 435),
-    ("close", 57),
-    ("close_range", 436),
-    ("connect", 203),
-    ("copy_file_range", 285),
-    ("delete_module", 106),
-    ("dup", 23),
-    ("dup3", 24),
-    ("epoll_create1", 20),
-    ("epoll_ctl", 21),
-    ("epoll_pwait", 22),
-    ("epoll_pwait2", 441),
-    ("eventfd2", 19),
-    ("execve", 221),
-    ("execveat", 281),
-    ("exit", 93),
-    ("exit_group", 94),
-    ("faccessat", 48),
-    ("faccessat2", 439),
-    ("fadvise64", 223),
-    ("fallocate", 47),
-    ("fanotify_init", 262),
-    ("fanotify_mark", 263),
-    ("fchdir", 50),
-    ("fchmod", 52),
-    ("fchmodat", 53),
-    ("fchmodat2", 452),
-    ("fchown", 55),
-    ("fchownat", 54),
-    ("fcntl", 25),
-    ("fdatasync", 83),
-    ("fgetxattr", 10),
-    ("file_getattr", 468),
-    ("file_setattr", 469),
-    ("finit_module", 273),
-    ("flistxattr", 13),
-    ("flock", 32),
-    ("fremovexattr", 16),
-    ("fsconfig", 431),
-    ("fsetxattr", 7),
-    ("fsmount", 432),
-    ("fsopen", 430),
-    ("fspick", 433),
-    ("fstat", 80),
-    ("fstatfs", 44),
-    ("fsync", 82),
-    ("ftruncate", 46),
-    ("futex", 98),
-    ("futex_requeue", 456),
-    ("futex_wait", 455),
-    ("futex_waitv", 449),
-    ("futex_wake", 454),
-    ("get_mempolicy", 236),
-    ("get_robust_list", 100),
-    ("getcpu", 168),
-    ("getcwd", 17),
-    ("getdents64", 61),
-    ("getegid", 177),
-    ("geteuid", 175),
-    ("getgid", 176),
-    ("getgroups", 158),
-    ("getitimer", 102),
-    ("getpeername", 205),
-    ("getpgid", 155),
-    ("getpid", 172),
-    ("getppid", 173),
-    ("getpriority", 141),
-    ("getrandom", 278),
-    ("getresgid", 150),
-    ("getresuid", 148),
-    ("getrlimit", 163),
-    ("getrusage", 165),
-    ("getsid", 156),
-    ("getsockname", 204),
-    ("getsockopt", 209),
-    ("gettid", 178),
-    ("gettimeofday", 169),
-    ("getuid", 174),
-    ("getxattr", 8),
-    ("getxattrat", 464),
-    ("init_module", 105),
-    ("inotify_add_watch", 27),
-    ("inotify_init1", 26),
-    ("inotify_rm_watch", 28),
-    ("io_cancel", 3),
-    ("io_destroy", 1),
-    ("io_getevents", 4),
-    ("io_pgetevents", 292),
-    ("io_setup", 0),
-    ("io_submit", 2),
-    ("io_uring_enter", 426),
-    ("io_uring_register", 427),
-    ("io_uring_setup", 425),
-    ("ioctl", 29),
-    ("ioprio_get", 31),
-    ("ioprio_set", 30),
-    ("kcmp", 272),
-    ("kexec_file_load", 294),
-    ("kexec_load", 104),
-    ("keyctl", 219),
-    ("kill", 129),
-    ("landlock_add_rule", 445),
-    ("landlock_create_ruleset", 444),
-    ("landlock_restrict_self", 446),
-    ("lgetxattr", 9),
-    ("linkat", 37),
-    ("listen", 201),
-    ("listmount", 458),
-    ("listns", 470),
-    ("listxattr", 11),
-    ("listxattrat", 465),
-    ("llistxattr", 12),
-    ("lookup_dcookie", 18),
-    ("lremovexattr", 15),
-    ("lseek", 62),
-    ("lsetxattr", 6),
-    ("lsm_get_self_attr", 459),
-    ("lsm_list_modules", 461),
-    ("lsm_set_self_attr", 460),
-    ("madvise", 233),
-    ("map_shadow_stack", 453),
-    ("mbind", 235),
-    ("membarrier", 283),
-    ("memfd_create", 279),
-    ("memfd_secret", 447),
-    ("migrate_pages", 238),
-    ("mincore", 232),
-    ("mkdirat", 34),
-    ("mknodat", 33),
-    ("mlock", 228),
-    ("mlock2", 284),
-    ("mlockall", 230),
-    ("mmap", 222),
-    ("mount", 40),
-    ("mount_setattr", 442),
-    ("move_mount", 429),
-    ("move_pages", 239),
-    ("mprotect", 226),
-    ("mq_getsetattr", 185),
-    ("mq_notify", 184),
-    ("mq_open", 180),
-    ("mq_timedreceive", 183),
-    ("mq_timedsend", 182),
-    ("mq_unlink", 181),
-    ("mremap", 216),
-    ("mseal", 462),
-    ("msgctl", 187),
-    ("msgget", 186),
-    ("msgrcv", 188),
-    ("msgsnd", 189),
-    ("msync", 227),
-    ("munlock", 229),
-    ("munlockall", 231),
-    ("munmap", 215),
-    ("name_to_handle_at", 264),
-    ("nanosleep", 101),
-    ("newfstatat", 79),
-    ("nfsservctl", 42),
-    ("open_by_handle_at", 265),
-    ("open_tree", 428),
-    ("open_tree_attr", 467),
-    ("openat", 56),
-    ("openat2", 437),
-    ("perf_event_open", 241),
-    ("personality", 92),
-    ("pidfd_getfd", 438),
-    ("pidfd_open", 434),
-    ("pidfd_send_signal", 424),
-    ("pipe2", 59),
-    ("pivot_root", 41),
-    ("pkey_alloc", 289),
-    ("pkey_free", 290),
-    ("pkey_mprotect", 288),
-    ("ppoll", 73),
-    ("prctl", 167),
-    ("pread64", 67),
-    ("preadv", 69),
-    ("preadv2", 286),
-    ("prlimit64", 261),
-    ("process_madvise", 440),
-    ("process_mrelease", 448),
-    ("process_vm_readv", 270),
-    ("process_vm_writev", 271),
-    ("pselect6", 72),
-    ("ptrace", 117),
-    ("pwrite64", 68),
-    ("pwritev", 70),
-    ("pwritev2", 287),
-    ("quotactl", 60),
-    ("quotactl_fd", 443),
-    ("read", 63),
-    ("readahead", 213),
-    ("readlinkat", 78),
-    ("readv", 65),
-    ("reboot", 142),
-    ("recvfrom", 207),
-    ("recvmmsg", 243),
-    ("recvmsg", 212),
-    ("remap_file_pages", 234),
-    ("removexattr", 14),
-    ("removexattrat", 466),
-    ("renameat2", 276),
-    ("request_key", 218),
-    ("restart_syscall", 128),
-    ("riscv_flush_icache", 259),
-    ("riscv_hwprobe", 258),
-    ("rseq", 293),
-    ("rseq_slice_yield", 471),
-    ("rt_sigaction", 134),
-    ("rt_sigpending", 136),
-    ("rt_sigprocmask", 135),
-    ("rt_sigqueueinfo", 138),
-    ("rt_sigreturn", 139),
-    ("rt_sigsuspend", 133),
-    ("rt_sigtimedwait", 137),
-    ("rt_tgsigqueueinfo", 240),
-    ("sched_get_priority_max", 125),
-    ("sched_get_priority_min", 126),
-    ("sched_getaffinity", 123),
-    ("sched_getattr", 275),
-    ("sched_getparam", 121),
-    ("sched_getscheduler", 120),
-    ("sched_rr_get_interval", 127),
-    ("sched_setaffinity", 122),
-    ("sched_setattr", 274),
-    ("sched_setparam", 118),
-    ("sched_setscheduler", 119),
-    ("sched_yield", 124),
-    ("seccomp", 277),
-    ("semctl", 191),
-    ("semget", 190),
-    ("semop", 193),
-    ("semtimedop", 192),
-    ("sendfile", 71),
-    ("sendmmsg", 269),
-    ("sendmsg", 211),
-    ("sendto", 206),
-    ("set_mempolicy", 237),
-    ("set_mempolicy_home_node", 450),
-    ("set_robust_list", 99),
-    ("set_tid_address", 96),
-    ("setdomainname", 162),
-    ("setfsgid", 152),
-    ("setfsuid", 151),
-    ("setgid", 144),
-    ("setgroups", 159),
-    ("sethostname", 161),
-    ("setitimer", 103),
-    ("setns", 268),
-    ("setpgid", 154),
-    ("setpriority", 140),
-    ("setregid", 143),
-    ("setresgid", 149),
-    ("setresuid", 147),
-    ("setreuid", 145),
-    ("setrlimit", 164),
-    ("setsid", 157),
-    ("setsockopt", 208),
-    ("settimeofday", 170),
-    ("setuid", 146),
-    ("setxattr", 5),
-    ("setxattrat", 463),
-    ("shmat", 196),
-    ("shmctl", 195),
-    ("shmdt", 197),
-    ("shmget", 194),
-    ("shutdown", 210),
-    ("sigaltstack", 132),
-    ("signalfd4", 74),
-    ("socket", 198),
-    ("socketpair", 199),
-    ("splice", 76),
-    ("statfs", 43),
-    ("statmount", 457),
-    ("statx", 291),
-    ("swapoff", 225),
-    ("swapon", 224),
-    ("symlinkat", 36),
-    ("sync", 81),
-    ("sync_file_range", 84),
-    ("syncfs", 267),
-    ("sysinfo", 179),
-    ("syslog", 116),
-    ("tee", 77),
-    ("tgkill", 131),
-    ("timer_create", 107),
-    ("timer_delete", 111),
-    ("timer_getoverrun", 109),
-    ("timer_gettime", 108),
-    ("timer_settime", 110),
-    ("timerfd_create", 85),
-    ("timerfd_gettime", 87),
-    ("timerfd_settime", 86),
-    ("times", 153),
-    ("tkill", 130),
-    ("truncate", 45),
-    ("umask", 166),
-    ("umount2", 39),
-    ("uname", 160),
-    ("unlinkat", 35),
-    ("unshare", 97),
-    ("userfaultfd", 282),
-    ("utimensat", 88),
-    ("vhangup", 58),
-    ("vmsplice", 75),
-    ("wait4", 260),
-    ("waitid", 95),
-    ("write", 64),
-    ("writev", 66),
-];
-
-// Any other architecture would get an empty table, which reads as "deny
-// nothing"; seccompiler compiles filters for these three only.
-#[cfg(not(any(
-    target_arch = "x86_64",
-    target_arch = "aarch64",
-    target_arch = "riscv64"
-)))]
-compile_error!("bubbler has no syscall table for this target architecture");
-
-/// The kernel's number for `name` on the architecture bubbler is built
-/// for, or `None` when this architecture never had that syscall.
+/// The number libseccomp resolves `name` to on the build architecture, or
+/// `None` when this libseccomp does not know the name at all. A syscall
+/// the build architecture does not itself have — `clock_adjtime64` on
+/// x86_64, say — answers with a negative pseudo-number that still names
+/// a real rule on the other architectures in the filter, so only the
+/// sign of the answer tells the two apart.
 pub fn syscall_number(name: &str) -> Option<i64> {
-    let i = SYSCALLS.binary_search_by(|(n, _)| (*n).cmp(name)).ok()?;
-    Some(SYSCALLS[i].1)
+    ScmpSyscall::from_name(name)
+        .ok()
+        .map(|nr| i64::from(i32::from(nr)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Default names the build architecture never had. Denying them is
-    /// harmless, but the set must not grow by accident.
+    /// Every name in the default lists is one libseccomp knows, so none
+    /// of them is dropped from the filter. This is x86_64-only on
+    /// purpose: libseccomp's table is per-architecture but complete, and
+    /// resolves a name the native architecture lacks to a negative
+    /// pseudo-number rather than an error, so the same assertion on
+    /// another architecture would prove nothing about which rules the
+    /// filter actually got. A failure here means the linked libseccomp
+    /// is older than the floor the README states.
     #[cfg(target_arch = "x86_64")]
-    const ABSENT_HERE: &[&str] = &["clock_settime64", "clock_adjtime64", "vm86", "vm86old"];
-    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-    const ABSENT_HERE: &[&str] = &[
-        "uselib",
-        "iopl",
-        "ioperm",
-        "clock_settime64",
-        "clock_adjtime64",
-        "vm86",
-        "vm86old",
-        "modify_ldt",
-    ];
-
     #[test]
-    fn the_table_is_sorted_and_names_each_syscall_once() {
-        assert!(!SYSCALLS.is_empty());
-        assert!(
-            SYSCALLS.windows(2).all(|w| w[0].0 < w[1].0),
-            "table is not sorted by name"
-        );
-    }
-
-    #[test]
-    fn every_default_name_the_architecture_has_resolves() {
+    fn every_default_name_is_one_this_libseccomp_knows() {
         let missing: Vec<&str> = DEFAULT_EPERM
             .iter()
+            .chain(SINGLE_ARCH_EPERM)
             .chain(DEFAULT_ENOSYS)
             .copied()
             .filter(|n| syscall_number(n).is_none())
             .collect();
-        assert_eq!(missing, ABSENT_HERE);
+        assert_eq!(missing, [""; 0]);
     }
 
+    /// The names the second architecture contributes: on x86_64 the
+    /// `_time64` clock calls and the vm86 pair are i386-only, and
+    /// libseccomp answers for them with a pseudo-number.
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn known_x86_64_numbers_match_the_kernel_table() {
+    fn known_x86_64_numbers_and_the_i386_only_names_both_resolve() {
         assert_eq!(syscall_number("read"), Some(0));
-        assert_eq!(syscall_number("write"), Some(1));
         assert_eq!(syscall_number("ioctl"), Some(16));
         assert_eq!(syscall_number("prctl"), Some(157));
         assert_eq!(syscall_number("keyctl"), Some(250));
         assert_eq!(syscall_number("clone3"), Some(435));
-        assert_eq!(syscall_number("modify_ldt"), Some(154));
+        assert!(syscall_number("clock_adjtime64").is_some_and(|n| n < 0));
+        assert!(syscall_number("vm86").is_some_and(|n| n < 0));
         assert_eq!(syscall_number("nosuchcall"), None);
     }
 
@@ -1530,33 +447,51 @@ mod tests {
     #[test]
     fn known_aarch64_numbers_match_the_kernel_table() {
         assert_eq!(syscall_number("read"), Some(63));
-        assert_eq!(syscall_number("write"), Some(64));
         assert_eq!(syscall_number("ioctl"), Some(29));
         assert_eq!(syscall_number("keyctl"), Some(219));
         assert_eq!(syscall_number("clone3"), Some(435));
-        assert_eq!(syscall_number("renameat"), Some(38));
         assert_eq!(syscall_number("nosuchcall"), None);
     }
 
-    #[cfg(target_arch = "riscv64")]
+    /// `modify_ldt` is the one rule the second architecture takes away:
+    /// 32-bit code and Wine need it, and where the filter carries only
+    /// one ABI nothing in the sandbox can call it usefully anyway.
     #[test]
-    fn known_riscv64_numbers_match_the_kernel_table() {
-        assert_eq!(syscall_number("read"), Some(63));
-        assert_eq!(syscall_number("write"), Some(64));
-        assert_eq!(syscall_number("ioctl"), Some(29));
-        assert_eq!(syscall_number("keyctl"), Some(219));
-        assert_eq!(syscall_number("clone3"), Some(435));
-        assert_eq!(syscall_number("riscv_hwprobe"), Some(258));
-        // riscv64 has renameat2 only; the abi list in
-        // arch/riscv/kernel/Makefile.syscalls leaves out `renameat`.
-        assert_eq!(syscall_number("renameat"), None);
-        assert_eq!(syscall_number("nosuchcall"), None);
+    fn modify_ldt_is_denied_only_where_the_filter_holds_one_architecture() {
+        let denied = RuleSet::default_set()
+            .eperm
+            .contains(&"modify_ldt".to_owned());
+        assert_eq!(denied, EXTRA_ARCHES.is_empty());
+        #[cfg(target_arch = "x86_64")]
+        assert!(
+            !denied,
+            "i386 is in the filter, so modify_ldt stays allowed"
+        );
+        #[cfg(target_arch = "aarch64")]
+        assert!(denied, "a single-architecture filter denies it");
+    }
+
+    #[test]
+    fn the_filter_carries_the_build_architecture_and_i386_on_x86_64() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(EXTRA_ARCHES, &[ScmpArch::X86]);
+            assert_eq!(ARCHES, "x86_64 + i386");
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            assert!(EXTRA_ARCHES.is_empty());
+            assert_eq!(ARCHES, std::env::consts::ARCH);
+        }
+        // x32 is never added: it shares x86_64's `AUDIT_ARCH` value, and
+        // adding it would allow the numbers the bad-arch action kills.
+        assert!(!EXTRA_ARCHES.contains(&ScmpArch::X32));
     }
 
     #[test]
     fn the_default_set_is_the_two_lists_plus_the_ioctl_rules() {
         let set = RuleSet::default_set();
-        assert_eq!(set.eperm, DEFAULT_EPERM);
+        assert_eq!(set.eperm[..DEFAULT_EPERM.len()], *DEFAULT_EPERM);
         assert_eq!(set.enosys, DEFAULT_ENOSYS);
         assert_eq!(set.ioctl_eperm, vec![0x5412, 0x541C]);
         assert_eq!(RuleSet::with(&SeccompConfig::default()), Some(set));
@@ -1581,7 +516,7 @@ mod tests {
         let set = RuleSet::with(&cfg).unwrap();
         assert!(!set.eperm.contains(&"keyctl".to_owned()));
         assert!(!set.enosys.contains(&"clone3".to_owned()));
-        assert_eq!(set.eperm.len(), DEFAULT_EPERM.len() - 1);
+        assert_eq!(set.eperm.len(), RuleSet::default_set().eperm.len() - 1);
         assert_eq!(set.enosys.len(), DEFAULT_ENOSYS.len() - 1);
         assert_eq!(set.eperm[0], DEFAULT_EPERM[0]);
         assert_eq!(set.ioctl_eperm, DEFAULT_IOCTL_EPERM);
@@ -1613,7 +548,7 @@ mod tests {
             ["unshare", "setns", "keyctl"]
         );
         assert_eq!(set.eperm.iter().filter(|s| *s == "keyctl").count(), 1);
-        assert_eq!(set.eperm.len(), DEFAULT_EPERM.len() + 2);
+        assert_eq!(set.eperm.len(), RuleSet::default_set().eperm.len() + 2);
         assert_eq!(set.enosys.last().unwrap(), "chroot");
     }
 
@@ -1629,8 +564,8 @@ mod tests {
         assert_eq!(set.eperm.last().unwrap(), "clone3");
     }
 
-    /// Instruction fields as seccompiler lays them out, decoded back from
-    /// the bytes a program is passed to bwrap as.
+    /// Instruction fields as libseccomp lays them out, decoded back from
+    /// the bytes the program is passed to bwrap as.
     fn instructions(program: &[u8]) -> Vec<(u16, u8, u8, u32)> {
         assert_eq!(program.len() % 8, 0, "a sock_filter is eight bytes");
         program
@@ -1646,220 +581,189 @@ mod tests {
             .collect()
     }
 
-    /// Instructions of the x32 guard, which only x86_64 has a second ABI
-    /// to need.
+    /// Instructions in the default filter. libseccomp emits a balanced
+    /// search tree over the syscall numbers of each architecture, so the
+    /// number is a measurement rather than a formula; it is pinned here
+    /// so that a rule added by accident, or an architecture dropped from
+    /// the filter, is a test failure.
     #[cfg(target_arch = "x86_64")]
-    const GUARD_LEN: usize = 3;
-    #[cfg(not(target_arch = "x86_64"))]
-    const GUARD_LEN: usize = 0;
+    const DEFAULT_LEN: usize = 112;
 
-    /// Instructions in the EPERM program of the default set. seccompiler
-    /// emits 3 for the architecture check, 1 to load the syscall number
-    /// and 1 closing mismatch action; then 5 for every syscall denied
-    /// whatever its arguments (compare, two jumps, match action, mismatch
-    /// action) and 2 + 6 per rule for an argument-filtered one (compare
-    /// and mismatch action around rules of two jumps, load, mask, compare
-    /// and match action). x86_64 resolves 38 of the 41 `DEFAULT_EPERM`
-    /// names (`ABSENT_HERE`) and adds the two `ioctl` rules:
-    /// 5 + 38 * 5 + 2 + 2 * 6 = 209, behind the x32 guard.
     #[cfg(target_arch = "x86_64")]
-    const EPERM_LEN: usize = GUARD_LEN + 209;
-    /// As above with 34 of the names: 5 + 34 * 5 + 2 + 2 * 6 = 189.
-    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-    const EPERM_LEN: usize = 189;
-    /// All eight `DEFAULT_ENOSYS` names resolve everywhere, and none of
-    /// them filters on an argument: 5 + 8 * 5 = 45, behind the guard.
-    const ENOSYS_LEN: usize = GUARD_LEN + 45;
-
     #[test]
-    fn the_default_set_compiles_to_two_programs_of_a_known_size() {
-        let programs = compile(&RuleSet::default_set(), false).unwrap();
-        assert_eq!(programs.len(), 2);
-        assert_eq!(instructions(&programs[0].bytes).len(), EPERM_LEN);
-        assert_eq!(instructions(&programs[1].bytes).len(), ENOSYS_LEN);
+    fn the_default_set_compiles_to_one_program_of_a_known_size() {
+        let program = compile(&RuleSet::default_set(), false).unwrap().unwrap();
+        assert_eq!(program.arches, "x86_64 + i386");
+        assert_eq!(instructions(&program.bytes).len(), DEFAULT_LEN);
     }
 
     #[test]
     fn a_program_starts_with_the_architecture_check() {
-        let programs = compile(&RuleSet::default_set(), false).unwrap();
-        let first = instructions(&programs[0].bytes)[GUARD_LEN];
+        let program = compile(&RuleSet::default_set(), false).unwrap().unwrap();
         // BPF_LD | BPF_W | BPF_ABS of `seccomp_data.arch`, at offset 4.
-        assert_eq!(first, (0x0020, 0, 0, 4));
+        assert_eq!(instructions(&program.bytes)[0], (0x0020, 0, 0, 4));
     }
 
-    /// The guard as bwrap reads it: `code` `jt` `jf` `k`, little-endian.
-    #[cfg(target_arch = "x86_64")]
+    /// A caller from an ABI the filter does not carry is killed, so an
+    /// x32 syscall — the same `AUDIT_ARCH` value with `__X32_SYSCALL_BIT`
+    /// set on every number — cannot walk past rules keyed to x86_64.
     #[test]
-    fn the_x32_guard_is_the_same_three_instructions_on_every_program() {
-        let programs = compile(&RuleSet::default_set(), false).unwrap();
-        assert_eq!(programs.len(), 2);
-        for program in &programs {
-            assert_eq!(
-                &program.bytes[..GUARD_LEN * 8],
-                [
-                    // LD  [0]              ; seccomp_data.nr
-                    0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    // JGE 0x40000000 jf=1  ; __X32_SYSCALL_BIT
-                    0x35, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x40,
-                    // RET SECCOMP_RET_ERRNO | EPERM
-                    0x06, 0x00, 0x00, 0x00, 0x01, 0x00, 0x05, 0x00,
-                ]
+    fn an_unknown_abi_is_killed_rather_than_allowed() {
+        let program = compile(&RuleSet::default_set(), false).unwrap().unwrap();
+        let ks: Vec<u32> = instructions(&program.bytes).iter().map(|i| i.3).collect();
+        // SECCOMP_RET_KILL_PROCESS, from `linux/seccomp.h`.
+        assert!(ks.contains(&0x8000_0000), "no kill for a foreign ABI");
+    }
+
+    #[test]
+    fn the_ioctl_rules_compare_the_request_argument_once_per_architecture() {
+        let program = compile(&RuleSet::default_set(), false).unwrap().unwrap();
+        let insns = instructions(&program.bytes);
+        // `seccomp_data.args[1]` starts at offset 16 + 1 * 8 = 24, and it
+        // is little-endian, so the low half the kernel hands the driver
+        // is the word at 24.
+        assert!(
+            insns.contains(&(0x0020, 0, 0, 24)),
+            "argument 1 is never loaded"
+        );
+        for value in DEFAULT_IOCTL_EPERM {
+            // BPF_JMP | BPF_JEQ | BPF_K. One comparison serves every
+            // architecture: libseccomp shares an identical block between
+            // the per-architecture branches.
+            assert!(
+                insns.iter().any(|i| i.0 == 0x0015 && i.3 == *value),
+                "no comparison for {value:#x}"
             );
         }
     }
 
-    /// The guard and seccompiler's output are one flat program: the body
-    /// is spliced in behind the guard exactly as it was compiled, since
-    /// every jump in it is relative.
+    /// The filter branches on `seccomp_data.arch` once per architecture
+    /// it carries, so a rule really did reach both ABIs rather than only
+    /// the one bubbler was built for.
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn the_guard_and_the_body_flatten_into_one_program() {
-        let set = RuleSet {
-            eperm: vec!["keyctl".to_owned()],
+    fn the_program_branches_on_both_audit_arch_values() {
+        let program = compile(&RuleSet::default_set(), false).unwrap().unwrap();
+        let ks: Vec<u32> = instructions(&program.bytes).iter().map(|i| i.3).collect();
+        // AUDIT_ARCH_X86_64 and AUDIT_ARCH_I386, from `linux/audit.h`.
+        assert!(ks.contains(&0xc000_003e), "no x86_64 branch");
+        assert!(ks.contains(&0x4000_0003), "no i386 branch");
+    }
+
+    #[test]
+    fn a_rule_set_that_denies_nothing_produces_no_program() {
+        let cfg = SeccompConfig {
+            allow: RuleSet::default_set()
+                .eperm
+                .into_iter()
+                .chain(RuleSet::default_set().enosys)
+                .chain(["ioctl".to_owned()])
+                .collect(),
+            ..SeccompConfig::default()
+        };
+        assert_eq!(compile(&RuleSet::with(&cfg).unwrap(), false).unwrap(), None);
+        assert_eq!(compile(&RuleSet::default(), false).unwrap(), None);
+        // Names alone are not rules: a set only this architecture's
+        // sibling has leaves nothing to load either.
+        let absent = RuleSet {
+            eperm: vec!["nosuchcall".to_owned()],
             enosys: vec![],
             ioctl_eperm: vec![],
         };
-        let programs = compile(&set, false).unwrap();
-        assert_eq!(
-            instructions(&programs[0].bytes),
-            [
-                (0x0020, 0, 0, 0x0000_0000), // LD  [0]      nr
-                (0x0035, 0, 1, 0x4000_0000), // JGE bit 30   -> RET, else +1
-                (0x0006, 0, 0, 0x0005_0001), // RET ERRNO(EPERM)
-                (0x0020, 0, 0, 0x0000_0004), // LD  [4]      arch
-                (0x0015, 1, 0, 0xc000_003e), // JEQ AUDIT_ARCH_X86_64
-                (0x0006, 0, 0, 0x8000_0000), // RET KILL_PROCESS
-                (0x0020, 0, 0, 0x0000_0000), // LD  [0]      nr
-                (0x0015, 0, 1, 0x0000_00fa), // JEQ keyctl
-                (0x0005, 0, 0, 0x0000_0001), // JA  +1       -> match
-                (0x0005, 0, 0, 0x0000_0002), // JA  +2       -> allow
-                (0x0006, 0, 0, 0x0005_0001), // RET ERRNO(EPERM)
-                (0x0006, 0, 0, 0x7fff_0000), // RET ALLOW
-                (0x0006, 0, 0, 0x7fff_0000), // RET ALLOW
-            ]
-        );
+        assert_eq!(compile(&absent, false).unwrap(), None);
     }
 
     #[test]
-    fn the_ioctl_rules_compare_the_low_word_of_argument_one() {
-        let programs = compile(&RuleSet::default_set(), false).unwrap();
-        let eperm = instructions(&programs[0].bytes);
-        // `seccomp_data.args[1]` starts at offset 16 + 1 * 8 = 24; the
-        // mask is loaded against its low half.
-        for value in DEFAULT_IOCTL_EPERM {
-            assert!(
-                eperm.windows(3).any(|w| w[0] == (0x0020, 0, 0, 24)
-                    && w[1] == (0x0054, 0, 0, 0xFFFF_FFFF)
-                    && w[2].3 == *value),
-                "no masked comparison for {value:#x}"
-            );
-        }
-    }
-
-    #[test]
-    fn allowing_a_syscall_costs_the_program_one_rule() {
+    fn allowing_a_syscall_shrinks_the_program() {
         let cfg = SeccompConfig {
             allow: vec!["keyctl".to_owned()],
             ..SeccompConfig::default()
         };
-        let programs = compile(&RuleSet::with(&cfg).unwrap(), false).unwrap();
-        assert_eq!(instructions(&programs[0].bytes).len(), EPERM_LEN - 5);
-        assert_eq!(instructions(&programs[1].bytes).len(), ENOSYS_LEN);
+        let full = compile(&RuleSet::default_set(), false).unwrap().unwrap();
+        let fewer = compile(&RuleSet::with(&cfg).unwrap(), false)
+            .unwrap()
+            .unwrap();
+        assert!(fewer.bytes.len() < full.bytes.len());
     }
 
     #[test]
-    fn allowing_ioctl_drops_the_two_argument_rules() {
-        let cfg = SeccompConfig {
-            allow: vec!["ioctl".to_owned()],
-            ..SeccompConfig::default()
-        };
-        let programs = compile(&RuleSet::with(&cfg).unwrap(), false).unwrap();
-        assert_eq!(instructions(&programs[0].bytes).len(), EPERM_LEN - 14);
-    }
-
-    #[test]
-    fn denying_ioctl_outright_replaces_the_argument_rules() {
-        let cfg = SeccompConfig {
-            deny: vec![("ioctl".to_owned(), Errno::Eperm)],
-            ..SeccompConfig::default()
-        };
-        let set = RuleSet::with(&cfg).unwrap();
-        assert!(set.ioctl_eperm.is_empty(), "a blanket deny subsumes them");
-        let programs = compile(&set, false).unwrap();
-        // The blanket rule replaces the argument-filtered pair, and the
-        // syscall appears once: -14 for the pair, +5 for the name.
-        assert_eq!(instructions(&programs[0].bytes).len(), EPERM_LEN - 14 + 5);
-    }
-
-    #[test]
-    fn a_hand_built_set_never_weakens_a_blanket_ioctl_deny() {
+    fn a_blanket_ioctl_deny_leaves_out_the_argument_rules() {
         let set = RuleSet {
             eperm: vec!["ioctl".to_owned()],
             enosys: vec![],
             ioctl_eperm: DEFAULT_IOCTL_EPERM.to_vec(),
         };
-        let programs = compile(&set, false).unwrap();
-        // 5 + 1 * 5: the blanket rule only, no argument comparison.
-        assert_eq!(instructions(&programs[0].bytes).len(), GUARD_LEN + 10);
+        let insns = instructions(&compile(&set, false).unwrap().unwrap().bytes);
+        assert!(
+            !insns.iter().any(|i| i.3 == TIOCSTI),
+            "the blanket rule must subsume the argument comparisons"
+        );
     }
 
+    /// One action per syscall, whichever list carried it first:
+    /// libseccomp refuses a second rule for the same number, so a set
+    /// naming one twice must not reach it twice.
     #[test]
-    fn a_group_with_nothing_left_in_it_produces_no_program() {
-        let cfg = SeccompConfig {
-            allow: DEFAULT_ENOSYS.iter().map(|s| (*s).to_owned()).collect(),
-            ..SeccompConfig::default()
-        };
-        let programs = compile(&RuleSet::with(&cfg).unwrap(), false).unwrap();
-        assert_eq!(programs.len(), 1);
-        assert_eq!(instructions(&programs[0].bytes).len(), EPERM_LEN);
-        assert!(compile(&RuleSet::default(), false).unwrap().is_empty());
-    }
-
-    #[test]
-    fn names_this_architecture_never_had_are_skipped_not_an_error() {
+    fn a_name_on_both_lists_is_compiled_once() {
         let set = RuleSet {
-            eperm: vec!["keyctl".to_owned(), "vm86old".to_owned()],
+            eperm: vec!["keyctl".to_owned()],
+            enosys: vec!["keyctl".to_owned()],
+            ioctl_eperm: vec![],
+        };
+        let one = RuleSet {
+            eperm: vec!["keyctl".to_owned()],
             enosys: vec![],
             ioctl_eperm: vec![],
         };
-        let programs = compile(&set, false).unwrap();
-        let names = ABSENT_HERE.iter().filter(|n| **n == "vm86old").count();
-        assert_eq!(
-            instructions(&programs[0].bytes).len(),
-            GUARD_LEN + 5 + (2 - names) * 5
-        );
+        assert_eq!(compile(&set, false).unwrap(), compile(&one, false).unwrap());
     }
 
+    /// A name this libseccomp does not know is left out of the filter
+    /// rather than failing the launch — and named on stderr, because the
+    /// sandbox is weaker than the profile asked for.
     #[test]
-    fn the_names_this_architecture_lacks_are_reported_once_per_process() {
+    fn a_name_this_libseccomp_does_not_know_is_skipped_and_reported() {
+        let set = RuleSet {
+            eperm: vec!["keyctl".to_owned(), "nosuchcall".to_owned()],
+            enosys: vec![],
+            ioctl_eperm: vec![],
+        };
+        let built = build(&set, false).unwrap();
+        assert_eq!(built.skipped, ["nosuchcall"]);
+        assert_eq!(built.rules, 1);
+        let one = RuleSet {
+            eperm: vec!["keyctl".to_owned()],
+            enosys: vec![],
+            ioctl_eperm: vec![],
+        };
+        assert_eq!(compile(&set, false).unwrap(), compile(&one, false).unwrap());
+    }
+
+    /// Named once per process however many sandboxes are compiled — an
+    /// instance with a D-Bus proxy compiles twice — and a compile with
+    /// nothing to skip does not use up the one report.
+    #[test]
+    fn skipped_names_are_named_once_and_only_by_a_compile_that_has_any() {
         let noted = AtomicBool::new(false);
-        // Off without the log switch, and then only for the first compile:
-        // an instance with a D-Bus proxy compiles twice.
-        assert!(!take_note(false, &noted));
-        assert!(take_note(true, &noted));
-        assert!(!take_note(true, &noted));
+        let none: [String; 0] = [];
+        assert!(!take_note(&none, &noted));
+        let some = ["nosuchcall".to_owned()];
+        assert!(take_note(&some, &noted));
+        assert!(!take_note(&some, &noted));
     }
 
     #[test]
-    fn logging_keeps_the_shape_and_changes_only_the_action() {
+    fn logging_keeps_the_rules_and_changes_only_the_action() {
         let set = RuleSet::default_set();
-        let quiet = compile(&set, false).unwrap();
-        let logged = compile(&set, true).unwrap();
-        assert_eq!(quiet.len(), logged.len());
-        for (q, l) in quiet.iter().zip(&logged) {
-            assert_eq!(q.bytes.len(), l.bytes.len());
-            assert_ne!(q, l, "the match action must differ");
-        }
-        // SECCOMP_RET_LOG, and no SECCOMP_RET_ERRNO with EPERM left in
-        // the rules. The x32 guard in front of them is an ABI gate, not a
-        // rule, so it keeps denying whatever the log switch says.
-        let insns = instructions(&logged[0].bytes);
-        assert_eq!(
-            insns[..GUARD_LEN],
-            instructions(&quiet[0].bytes)[..GUARD_LEN]
-        );
-        let ks: Vec<u32> = insns[GUARD_LEN..].iter().map(|i| i.3).collect();
+        let quiet = compile(&set, false).unwrap().unwrap();
+        let logged = compile(&set, true).unwrap().unwrap();
+        assert_ne!(quiet, logged, "the match action must differ");
+        let ks: Vec<u32> = instructions(&logged.bytes).iter().map(|i| i.3).collect();
+        // SECCOMP_RET_LOG, and no SECCOMP_RET_ERRNO with EPERM left.
         assert!(ks.contains(&0x7ffc_0000));
         assert!(!ks.contains(&(0x0005_0000 | 1)));
+        // The bad-arch kill is an ABI gate, not one of the rules, so the
+        // log switch does not soften it.
+        assert!(ks.contains(&0x8000_0000));
     }
 }

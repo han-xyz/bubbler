@@ -6,10 +6,10 @@
 // grants `x11`, with the isolation caveat that carries: X11 clients can
 // keylog and inject into each other.
 //
-// `seccomp { disable }` is here for the same reason as in `steam`: umu,
-// Proton and DXVK's 32-bit path make i386 syscalls, and the filter holds
-// one architecture. Never add `userns "disable"` either — those runtimes
-// nest pressure-vessel's own bubblewrap.
+// umu, Proton and DXVK's 32-bit path make i386 syscalls; the default
+// filter carries i386 as well as x86_64, so they are filtered rather than
+// killed. Never add `userns "disable"` — those runtimes nest
+// pressure-vessel's own bubblewrap.
 //
 // GameMode is optional on the host: the D-Bus name below simply resolves
 // to nothing when gamemoded is not installed.
@@ -29,7 +29,6 @@
 // or library outside the home is named explicitly, e.g.
 //   path-share "/kioxia/Games" mode=rw
 lint-allow "x11-without-reason" reason="every Wine or Proton game Lutris starts is an X11 client"
-lint-allow "seccomp-disabled" reason="umu, Proton and 32-bit DXVK make i386 syscalls the one-architecture filter kills"
 wayland
 x11
 dri
@@ -49,7 +48,4 @@ system-bus {
     call "org.freedesktop.UDisks2=org.freedesktop.DBus.ObjectManager.GetManagedObjects@/org/freedesktop/UDisks2"
 }
 home-share "Games" mode=rw
-seccomp {
-    disable
-}
 command "lutris"

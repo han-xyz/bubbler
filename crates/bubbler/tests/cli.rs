@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use bubbler_core::bwrap::ETC_ALLOWLIST;
 use bubbler_core::profile::NAMES;
-use bubbler_core::seccomp::{DEFAULT_ENOSYS, DEFAULT_EPERM, syscall_number};
+use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
     PYTHON, bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, bwrap_alive, kill_group, real_init,
     require_bwrap, require_dbus, require_portal, require_python, require_system_bus, require_tray,
@@ -74,7 +74,7 @@ fn create_list_and_dry_run() {
     // Which allowlisted `/etc` entries exist is a property of this host, so
     // only the parts around them are exact.
     let expected_prefix = "bwrap\n--unshare-all\n--die-with-parent\n--new-session\n--hostname\nbubbler\n--chdir\n/home/bubbler\n\
-         --info-fd\n3\n--add-seccomp-fd\n4\n--add-seccomp-fd\n5\n\
+         --info-fd\n3\n--add-seccomp-fd\n4\n\
          --ro-bind\n/usr\n/usr\n--symlink\nusr/bin\n/bin\n--symlink\nusr/lib\n/lib\n\
          --symlink\nusr/lib64\n/lib64\n--symlink\nusr/bin\n/sbin\n\
          --ro-bind-try\n/opt\n/opt\n--tmpfs\n/etc\n";
@@ -84,7 +84,7 @@ fn create_list_and_dry_run() {
          --ro-bind\n{init}\n/run/bubbler-init\n--clearenv\n--setenv\nTERM\ndumb\n\
          --setenv\nHOME\n/home/bubbler\n--setenv\nPATH\n/usr/bin\n--setenv\nXDG_RUNTIME_DIR\n{run}\n\
          --setenv\nUSER\nbubbler\n--setenv\nLOGNAME\nbubbler\n\
-         --\n/run/bubbler-init\n--socket-fd\n8\n--\n/usr/bin/true\n",
+         --\n/run/bubbler-init\n--socket-fd\n7\n--\n/usr/bin/true\n",
         ntsync = ntsync_bind(),
         home = home.display(),
         run = run.display(),
@@ -92,13 +92,13 @@ fn create_list_and_dry_run() {
     );
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.starts_with(expected_prefix), "{s}");
-    // Fd 3 is the info pipe and 4 and 5 the two seccomp programs.
+    // Fd 3 is the info pipe and 4 the seccomp filter.
     assert!(
-        s.contains("--perms\n0644\n--ro-bind-data\n6\n/etc/passwd\n"),
+        s.contains("--perms\n0644\n--ro-bind-data\n5\n/etc/passwd\n"),
         "{s}"
     );
     assert!(
-        s.contains("--perms\n0644\n--ro-bind-data\n7\n/etc/group\n"),
+        s.contains("--perms\n0644\n--ro-bind-data\n6\n/etc/group\n"),
         "{s}"
     );
     assert!(s.ends_with(&expected_suffix), "{s}");
@@ -490,20 +490,15 @@ fn explain_puts_every_argument_under_the_node_it_came_from() {
         s.contains("    --block-fd 4  (pipe: the sandbox waits on it until bubbler lets it go)\n"),
         "{s}"
     );
+    // One filter for every architecture and every error it answers with.
+    assert!(s.contains("    --add-seccomp-fd 5  (filter, "), "{s}");
+    assert!(s.contains(&format!(", {ARCHES}")), "{s}");
     assert!(
-        s.contains("    --add-seccomp-fd 5  (EPERM program, "),
+        s.contains("--ro-bind-data 8 /.flatpak-info  (generated file, "),
         "{s}"
     );
     assert!(
-        s.contains("    --add-seccomp-fd 6  (ENOSYS program, "),
-        "{s}"
-    );
-    assert!(
-        s.contains("--ro-bind-data 9 /.flatpak-info  (generated file, "),
-        "{s}"
-    );
-    assert!(
-        s.contains("--socket-fd 10  (socket: the exec channel bubbler-init serves)"),
+        s.contains("--socket-fd 9  (socket: the exec channel bubbler-init serves)"),
         "{s}"
     );
     // Each granted node is named with the line it is on, `notify` too,
@@ -3973,15 +3968,17 @@ fn probe_source() -> String {
     // Only x86_64 has a second ABI sharing its `AUDIT_ARCH` value, so it
     // is the only one where `nr | __X32_SYSCALL_BIT` names a syscall at
     // all; elsewhere the line would report a number the kernel never had.
+    // The filter kills such a caller instead of answering it, so the call
+    // is made in a child process and the line reports how the child died.
     #[cfg(target_arch = "x86_64")]
     let x32 = format!(
-        "    (\"keyctl_x32\", call({}, 0, -3, 0)),\n",
+        "    (\"keyctl_x32\", forked({}, 0, -3, 0)),\n",
         nr("keyctl") | 0x4000_0000
     );
     #[cfg(not(target_arch = "x86_64"))]
     let x32 = String::new();
     format!(
-        r#"import ctypes, errno
+        r#"import ctypes, errno, os
 libc = ctypes.CDLL(None, use_errno=True)
 libc.syscall.restype = ctypes.c_long
 
@@ -3999,6 +3996,27 @@ def ioctl(request):
     ctypes.set_errno(0)
     buf = ctypes.create_string_buffer(b"x")
     return named(libc.ioctl(0, ctypes.c_ulong(request), buf))
+
+def forked(nr, *args):
+    """`call` in a child, reported as "signal:N" when the filter kills it."""
+    read, write = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read)
+        os.write(write, call(nr, *args).encode())
+        os._exit(0)
+    os.close(write)
+    answer = b""
+    while True:
+        chunk = os.read(read, 64)
+        if not chunk:
+            break
+        answer += chunk
+    os.close(read)
+    status = os.waitpid(pid, 0)[1]
+    if os.WIFSIGNALED(status):
+        return "signal:%d" % os.WTERMSIG(status)
+    return answer.decode() or "none"
 
 probe = [
     # KEYCTL_GET_KEYRING_ID of KEY_SPEC_SESSION_KEYRING, creating nothing.
@@ -4063,9 +4081,11 @@ fn a_filter_a_profile_emptied_is_as_loud_as_a_disabled_one() {
     bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
     // Allowing every name back leaves nothing to load, which is
     // `seccomp { disable }` taken the long way round.
-    let names: Vec<String> = DEFAULT_EPERM
+    let set = RuleSet::default_set();
+    let names: Vec<String> = set
+        .eperm
         .iter()
-        .chain(DEFAULT_ENOSYS)
+        .chain(&set.enosys)
         .filter(|n| syscall_number(n).is_some())
         .map(|n| format!("\"{n}\""))
         .collect();
@@ -4098,11 +4118,12 @@ fn real_bwrap_seccomp_denies_the_default_list_and_nothing_else() {
         return;
     };
     assert_eq!(probed(&out, "keyctl"), "EPERM", "{out}");
-    // The same call with __X32_SYSCALL_BIT set: an x32 caller shares
-    // x86_64's AUDIT_ARCH value, so only the guard in front of the rules
-    // stops it from running past every one of them.
+    // The same call with __X32_SYSCALL_BIT set. x32 shares x86_64's
+    // AUDIT_ARCH value but offsets every number, so no rule can match it;
+    // libseccomp answers such a caller with its bad-architecture action,
+    // which bubbler sets to kill. SIGSYS is 31 on x86.
     #[cfg(target_arch = "x86_64")]
-    assert_eq!(probed(&out, "keyctl_x32"), "EPERM", "{out}");
+    assert_eq!(probed(&out, "keyctl_x32"), "signal:31", "{out}");
     assert_eq!(probed(&out, "perf_event_open"), "EPERM", "{out}");
     // ENOSYS, so glibc falls back to `clone`; unfiltered this is EINVAL.
     assert_eq!(probed(&out, "clone3"), "ENOSYS", "{out}");
@@ -4132,9 +4153,10 @@ fn real_bwrap_seccomp_disable_leaves_the_sandbox_unfiltered_and_says_so() {
         "{err}"
     );
     assert_ne!(probed(&out, "keyctl"), "EPERM", "{out}");
-    // No filter, so nothing denies the x32 call either.
+    // No filter, so nothing kills the x32 caller: the kernel strips
+    // __X32_SYSCALL_BIT and runs the syscall it names.
     #[cfg(target_arch = "x86_64")]
-    assert_ne!(probed(&out, "keyctl_x32"), "EPERM", "{out}");
+    assert_ne!(probed(&out, "keyctl_x32"), "signal:31", "{out}");
     assert_ne!(probed(&out, "perf_event_open"), "EPERM", "{out}");
     assert_ne!(probed(&out, "clone3"), "ENOSYS", "{out}");
     assert_ne!(probed(&out, "tiocsti"), "EPERM", "{out}");
@@ -4168,7 +4190,11 @@ fn real_bwrap_seccomp_leaves_threads_and_installed_programs_running() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "thread ok\n");
 
-    for program in ["/usr/bin/alacritty", "/usr/bin/firefox"] {
+    for program in [
+        "/usr/bin/alacritty",
+        "/usr/bin/firefox",
+        "/usr/bin/chromium",
+    ] {
         if !Path::new(program).is_file() {
             eprintln!("skipping: {program} is not installed");
             continue;
@@ -4183,6 +4209,109 @@ fn real_bwrap_seccomp_leaves_threads_and_installed_programs_running() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+}
+
+/// A 32-bit probe reporting how the filter answers three syscalls and one
+/// glibc wrapper. Static, so the sandbox needs no 32-bit libraries; and
+/// `adjtimex` goes through glibc on purpose, because on i386 it issues
+/// `clock_adjtime64` (405) rather than the `clock_adjtime` (124) a table
+/// written for x86_64 would carry.
+const I386_PROBE: &str = r#"#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <sys/timex.h>
+#include <unistd.h>
+
+static char other[32];
+
+static const char *named(long rc)
+{
+    if (rc >= 0)
+        return "ok";
+    switch (errno) {
+    case EPERM:
+        return "EPERM";
+    case ENOSYS:
+        return "ENOSYS";
+    default:
+        snprintf(other, sizeof other, "E%d", errno);
+        return other;
+    }
+}
+
+int main(void)
+{
+    struct timex tx;
+    memset(&tx, 0, sizeof tx);
+    /* Mode 0 reads the clock and changes nothing, so an unfiltered run
+       leaves the host's timekeeping exactly as it was. */
+    printf("keyctl %s\n", named(syscall(__NR_keyctl, 0, -3, 0)));
+    printf("clone3 %s\n", named(syscall(__NR_clone3, 0, 0)));
+    printf("adjtimex %s\n", named(adjtimex(&tx)));
+    printf("getpid %s\n", named(syscall(__NR_getpid)));
+    return 0;
+}
+"#;
+
+/// [`I386_PROBE`] built into `dir`, or `None` (with a printed skip) where
+/// no 32-bit toolchain can link it.
+fn build_i386_probe(dir: &Path) -> Option<PathBuf> {
+    let src = dir.join("probe32.c");
+    std::fs::write(&src, I386_PROBE).unwrap();
+    let binary = dir.join("probe32");
+    let built = Command::new("gcc")
+        .args(["-m32", "-static", "-O0", "-o"])
+        .arg(&binary)
+        .arg(&src)
+        .output();
+    match built {
+        Ok(out) if out.status.success() => Some(binary),
+        Ok(out) => {
+            eprintln!(
+                "skipping: `gcc -m32 -static` failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!("skipping: gcc is not usable here: {e}");
+            None
+        }
+    }
+}
+
+#[test]
+fn real_bwrap_seccomp_filters_a_32_bit_binary_instead_of_killing_it() {
+    if ARCHES != "x86_64 + i386" {
+        eprintln!("skipping: this filter carries no second architecture");
+        return;
+    }
+    let Some((tmp, init)) = live_instance("secc32") else {
+        return;
+    };
+    let Some(probe) = build_i386_probe(tmp.path()) else {
+        return;
+    };
+    // The instance's home is what the sandbox sees at /home/bubbler.
+    let inside = tmp
+        .path()
+        .join("data/bubbler/instances/secc32/home/probe32");
+    std::fs::copy(&probe, &inside).unwrap();
+    std::fs::set_permissions(&inside, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["run", "secc32", "--", "/home/bubbler/probe32"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    // A filter carrying only x86_64 would kill this process with SIGSYS
+    // before its first `printf`.
+    assert!(out.status.success(), "{err}");
+    let s = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(probed(&s, "keyctl"), "EPERM", "{s}");
+    assert_eq!(probed(&s, "clone3"), "ENOSYS", "{s}");
+    assert_eq!(probed(&s, "adjtimex"), "EPERM", "{s}");
+    assert_eq!(probed(&s, "getpid"), "ok", "{s}");
 }
 
 /// A stand-in for `xdg-dbus-proxy` that runs the probe first and leaves

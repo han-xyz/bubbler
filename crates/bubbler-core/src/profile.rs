@@ -956,9 +956,9 @@ mod tests {
             hidraw: false,
             uinput: false
         }));
-        // The 32-bit runtime would be killed by a filter built for this
-        // architecture alone, and steamwebhelper is an X11 client.
-        assert!(steam.seccomp.disable);
+        // steamwebhelper is an X11 client. The 32-bit runtime needs no
+        // `seccomp` node any more: the default filter carries i386.
+        assert_eq!(steam.seccomp, SeccompConfig::default());
         assert!(steam.services.contains(&Service::X11));
         // UDisks2 is enumeration only in both gaming profiles: `talk`
         // would hand the sandbox loop-setup, mount and LUKS methods,
@@ -999,7 +999,7 @@ mod tests {
 
         let lutris = cfg("lutris");
         assert!(lutris.services.contains(&Service::X11));
-        assert!(lutris.seccomp.disable);
+        assert_eq!(lutris.seccomp, SeccompConfig::default());
         assert!(
             lutris
                 .services

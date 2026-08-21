@@ -1,12 +1,15 @@
 // bubbler profile: steam
 //
 // The client is a 32-bit i386 binary and its UI (steamwebhelper) is an
-// X11/CEF client with no Wayland support, so this profile needs both
-// `seccomp { disable }` — the filter holds one architecture and kills an
-// i386 process rather than filtering it — and `x11`. The Arch wiki's own
-// bwrap example carries an accuracy dispute over exactly that forwarding:
-// an X11 client can keylog and inject into every other X11 client,
-// Xwayland included.
+// X11/CEF client with no Wayland support, so this profile needs `x11`.
+// The Arch wiki's own bwrap example carries an accuracy dispute over
+// exactly that forwarding: an X11 client can keylog and inject into every
+// other X11 client, Xwayland included.
+//
+// The default filter covers i386 as well as x86_64, so the 32-bit client
+// and its games are filtered rather than killed, and `modify_ldt` stays
+// allowed for the 16-bit and Wine code that needs it. Measured: the
+// client reaches "Running Steam" with the filter on.
 //
 // Never add `userns "disable"`: Proton and the Steam Linux Runtime nest
 // their own bubblewrap (pressure-vessel ships srt-bwrap), which has to
@@ -37,7 +40,6 @@
 // en_US.UTF-8 locale; the locale reaches the sandbox through LANG and the
 // read-only /usr, with nothing to bind for it.
 lint-allow "x11-without-reason" reason="steamwebhelper is an X11/CEF client with no Wayland support"
-lint-allow "seccomp-disabled" reason="the client is a 32-bit i386 binary the one-architecture filter kills rather than filters"
 lint-allow "own-too-wide" reason="com.steampowered.* is Steam's own name space, and the client claims several names under it"
 wayland
 x11
@@ -56,8 +58,5 @@ system-bus {
     talk "org.freedesktop.UPower"
     see "org.freedesktop.UDisks2"
     call "org.freedesktop.UDisks2=org.freedesktop.DBus.ObjectManager.GetManagedObjects@/org/freedesktop/UDisks2"
-}
-seccomp {
-    disable
 }
 command "steam"

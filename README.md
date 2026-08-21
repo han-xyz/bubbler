@@ -140,7 +140,7 @@ file descriptor numbers are the ones a dry run prints.
 
       portals                         config.kdl:10  7 arguments
         --block-fd 4  (pipe: the sandbox waits on it until bubbler lets it go)
-        --perms 0644 --ro-bind-data 9 /.flatpak-info  (generated file, 69 bytes)
+        --perms 0644 --ro-bind-data 8 /.flatpak-info  (generated file, 69 bytes)
         rules: --talk=org.freedesktop.portal.Desktop
                --talk=org.freedesktop.portal.Documents
                --talk=org.freedesktop.portal.FileChooser
@@ -150,9 +150,8 @@ file descriptor numbers are the ones a dry run prints.
       notify                          config.kdl:11  0 arguments
         rule-only: --talk=org.freedesktop.Notifications
 
-      seccomp                                        4 arguments
-        --add-seccomp-fd 5  (EPERM program, 1696 bytes)
-        --add-seccomp-fd 6  (ENOSYS program, 384 bytes)
+      seccomp                                        2 arguments
+        --add-seccomp-fd 5  (filter, 896 bytes, x86_64 + i386)
 
       wayland                         config.kdl:2   9 arguments
         --ro-bind /run/user/1000/wayland-1 /run/user/1000/wayland-1
@@ -161,12 +160,12 @@ file descriptor numbers are the ones a dry run prints.
 
       init                                           7 arguments
         --ro-bind /usr/lib/bubbler/bubbler-init /run/bubbler-init
-        -- /run/bubbler-init --socket-fd 10  (socket: the exec channel bubbler-init serves)
+        -- /run/bubbler-init --socket-fd 9  (socket: the exec channel bubbler-init serves)
 
       command                                        2 arguments
         -- firefox
 
-    231 arguments in 14 groups, 129 hidden (--explain=full); 8 D-Bus rules to the proxy (--proxy)
+    229 arguments in 14 groups, 129 hidden (--explain=full); 8 D-Bus rules to the proxy (--proxy)
 
 A group sits where the node's *first* argument is emitted and gathers every
 later one it contributed, whichever phase that came from: `network` is placed by
@@ -176,13 +175,14 @@ argv. The listing is therefore neither file order nor argv order, and it is not
 the order of record: `--dry-run` is, and so is `--format json`, which stays in
 true argv order.
 
-Every generated descriptor says what is behind it: the error a seccomp program
-answers with, the size of a `--ro-bind-data`, which pipe an `--info-fd` or
-`--block-fd` is, and which socket the supervisor is handed. A node whose grant
+Every generated descriptor says what is behind it: the size of the seccomp
+filter and the architectures it carries, the size of a `--ro-bind-data`, which
+pipe an `--info-fd` or `--block-fd` is, and which socket the supervisor is
+handed. A node whose grant
 is D-Bus rules rather than bwrap arguments lists those rules instead — under
 `rule-only:` when it contributes nothing else, `rules:` when it also has
 arguments. A `seccomp` node reads the same way, since what it changed is not
-an argument either: `rules: allow ptrace` under the programs it did load, and
+an argument either: `rules: allow ptrace` under the filter it did load, and
 `rule-only: filter disabled` for a `seccomp { disable }`, which loads none and
 would otherwise be missing from the listing altogether.
 
@@ -678,10 +678,10 @@ Every one is Wayland-first; only the two gaming profiles grant `x11`.
     keepassxc     wayland dbus portals notify tray app-runtime rw, ~/Documents rw
     kitty         wayland dri dbus portals notify
     libreoffice   wayland dri dbus portals, ~/Documents rw, SAL_USE_VCLPLUGIN=gtk3
-    lutris        wayland x11 dri pipewire network dbus portals notify tray gamepad system-bus, ~/Games rw, seccomp disabled
+    lutris        wayland x11 dri pipewire network dbus portals notify tray gamepad system-bus, ~/Games rw
     mpv           wayland dri pipewire, ~/Videos
     spotify       wayland dri pipewire network dbus notify tray mpris
-    steam         wayland x11 dri pipewire network dbus notify tray gamepad system-bus, seccomp disabled
+    steam         wayland x11 dri pipewire network dbus notify tray gamepad system-bus
     thunderbird   wayland network dri dbus portals notify, ~/Downloads rw
     vesktop       wayland dri pipewire network dbus portals notify tray, ~/Downloads rw
 
@@ -736,9 +736,9 @@ of both: X11 has no isolation between clients, so a sandbox on your display can
 keylog every other client on it, Xwayland included. They have it because Steam's
 UI (steamwebhelper) is an X11/CEF client with no Wayland support and because
 Wine's X11 driver takes precedence over its Wayland one for every game Lutris
-starts. Their `seccomp { disable }` is not a preference either: the Steam
-runtime, umu/Proton and DXVK's 32-bit path are i386, and bubbler's filter holds
-one architecture, which kills such a process rather than filtering it. Neither
+starts. Neither carries a `seccomp` node any more: the Steam runtime,
+umu/Proton and DXVK's 32-bit path are i386, and the default filter now covers
+i386 alongside x86_64, so they are filtered rather than killed. Neither
 may ever carry `userns "disable"` — pressure-vessel nests its own bubblewrap for
 every Proton game. On the system bus `steam` talks to UPower, and both grant
 UDisks2 enumeration alone — `see` plus the one `GetManagedObjects` call Wine
@@ -913,10 +913,10 @@ The node holds for the whole flattened profile, not for one line, and a
 check has is a parse error, so a typo cannot leave a finding un-accepted with
 nothing to say so; an id whose check reports an *error* is a parse error too,
 since an error names something the file cannot do and nothing would ever
-silence it. `steam` and `lutris` carry the nodes for their `x11` and
-`seccomp { disable }` grants and `code` for its Secret Storage rule, with the
-reason each of their comments already gives; every shipped profile lints clean
-on a host that has what it shares.
+silence it. `steam` and `lutris` carry the node for their `x11` grant and
+`code` for its Secret Storage rule, with the reason each of their comments
+already gives; every shipped profile lints clean on a host that has what it
+shares.
 
 `create`, `reseed`, `edit` and `profile edit` run the lint themselves at the
 end and print any errors and warnings — never notes — to stderr, prefixed
@@ -1147,11 +1147,12 @@ while its config is being edited.
 ## Seccomp
 
 Every sandbox — an instance's, `try`'s, and the D-Bus proxy's own — starts with
-a seccomp-bpf denylist. bubbler compiles it at launch with `seccompiler` and
-hands it to bwrap as two programs on `--add-seccomp-fd`: one answering `EPERM`,
-one answering `ENOSYS` so that libc falls back to an older call instead of
-failing outright. Everything not named is allowed; this narrows the kernel
-surface, it is not a capability model.
+a seccomp-bpf denylist. bubbler compiles it at launch with `libseccomp` and
+hands it to bwrap as one program on `--add-seccomp-fd`. Rules are written by
+syscall name and carry their own error: `EPERM` for most, `ENOSYS` where libc
+should fall back to an older call instead of failing outright. Everything not
+named is allowed; this narrows the kernel surface, it is not a capability
+model.
 
 `EPERM`: the kernel keyring (`add_key`, `keyctl`, `request_key`),
 `perf_event_open`, `bpf`, `userfaultfd`, `fanotify_init`, the NUMA and
@@ -1178,9 +1179,12 @@ keeps the default:
     }
 
 `deny` applies after `allow`, and a syscall named twice keeps only its last
-action. An unknown name, or one this architecture never had, is an error rather
-than a silent skip, and `deny "prctl"` is refused because bwrap needs `prctl`
-to install the filter. `allow "ioctl"` is the only way to take back the two
+action. An unknown name is an error rather than a silent skip — a name only the
+filter's second architecture has, `vm86old` on x86_64 say, is *not* unknown —
+and `deny "prctl"` is refused because glibc and Chromium call `prctl` for
+themselves — thread names, `PR_SET_NO_NEW_PRIVS`, the renderer's own filter —
+so denying it breaks the sandbox from the inside.
+`allow "ioctl"` is the only way to take back the two
 argument rules, so it re-enables `TIOCSTI` and `TIOCLINUX` for that instance —
 do not reach for it to fix an unrelated `ioctl`. `deny "ioctl"` replaces those
 two rules with one that matches every request, which breaks nearly every
@@ -1189,23 +1193,57 @@ each run, so an unfiltered sandbox is never a quiet one; an `allow` list that
 takes back every rule leaves nothing to load and says
 `bubbler: seccomp has no rules left for instance <name>` for the same reason.
 
+A syscall name the linked libseccomp does not know is left out of the filter
+rather than failing the launch, and every run that does so prints, once,
+
+    bubbler: seccomp: <name> unknown to this libseccomp, rule skipped
+
+on stderr — a skipped rule is a weaker sandbox than the profile asked for, so
+it is never silent, and no environment variable is needed to see it. It should
+not happen on a supported build: see the floor under "Build".
+
 `BUBBLER_SECCOMP_LOG=1` compiles the same rules with the log action instead.
-The programs are loaded as always, but a call that would have been denied is
+The filter is loaded as always, but a call that would have been denied is
 written to the kernel audit log and then succeeds — so the sandbox runs
 unrestricted while it says what it would have lost. It is for finding
-over-denies while writing a profile, not for running with. It also names, once
-per run, the default list's syscalls this architecture never had, which are
-skipped rather than compiled.
+over-denies while writing a profile, not for running with.
 
-The filter carries the architecture bubbler was built for, and a syscall made
-from any other ABI is killed rather than allowed — a 32-bit (i386) binary
-inside a sandbox dies on its first syscall. x32 is the ABI that check cannot
-see, since it shares x86_64's `AUDIT_ARCH` value, so on x86_64 every program
-starts with three instructions answering `EPERM` to any syscall carrying
-`__X32_SYSCALL_BIT`; neither `allow` nor `BUBBLER_SECCOMP_LOG` reaches that
-guard. Anything shipping 32-bit code,
-Steam and some Wine setups among them, needs `seccomp { disable }` until a
-libseccomp backend can add the second architecture to the filter.
+On x86_64 the filter carries **two** architectures, x86_64 and i386, so 32-bit
+binaries in the sandbox are filtered rather than killed — Steam, umu/Proton and
+DXVK's 32-bit path run under the same rules as everything else, and no profile
+needs `seccomp { disable }` for them. libseccomp translates each rule to both
+ABIs by name, which is what makes this safe to write once: on i386 glibc issues
+`clock_settime64` (404) and `clock_adjtime64` (405) rather than the numbers
+x86_64 uses, and the name resolves to whichever number each architecture has.
+Elsewhere the filter carries the build architecture alone.
+
+Multiarch costs one rule, and the cost is not confined to 32-bit code.
+`modify_ldt` sets up the local descriptor table, which 16-bit programs and
+several Wine patches need. bubbler adds every rule *after* both architectures
+are in the filter, so a rule holds for both ABIs — there is no "deny it on
+x86_64 only" here — and keeping the deny would break the 32-bit code the second
+architecture exists to filter. So it is allowed, as flatpak allows it wherever
+its own filter is multiarch. Be clear about what that widens: on x86_64 **every
+profile** now lets 64-bit code call `modify_ldt` too, where the
+single-architecture filter answered `EPERM` (measured both ways). A
+single-architecture build still denies it. Put it back for one instance with
+
+    seccomp {
+        deny "modify_ldt"
+    }
+
+`--explain` prints the size and the architectures under the descriptor, e.g.
+`--add-seccomp-fd 5  (filter, 896 bytes, x86_64 + i386)`.
+
+A syscall from an ABI the filter does **not** carry is killed rather than
+allowed. x32 is the ABI this matters for: it shares x86_64's `AUDIT_ARCH`
+value but sets `__X32_SYSCALL_BIT` on every syscall number, so no rule keyed to
+x86_64 can match it, and `man 2 seccomp` requires a policy to either enumerate
+those numbers or deny them all. An x32 caller therefore dies with `SIGSYS`
+instead of walking past the denylist. Neither `allow` nor `BUBBLER_SECCOMP_LOG`
+softens that: it is an ABI gate, not one of the rules. x32 binaries are
+vanishingly rare — Arch does not build any — but a 64-bit program can issue an
+x32 syscall on purpose, which is exactly the bypass this closes.
 
 ## User namespaces
 
@@ -1278,8 +1316,6 @@ binding the tree under it.
   sandboxed application through `/proc` — exec is a convenience channel, not
   a boundary. What the sandbox can still do with the terminal it is given is
   under "Terminal".
-- The seccomp filter holds one architecture, so 32-bit binaries inside are
-  killed rather than filtered; see "Seccomp".
 - AMD compute (ROCm/OpenCL via `/dev/kfd`) is not supported yet; it needs its
   sysfs topology alongside the node.
 - `dri` binds the NVIDIA device nodes but not `/etc/OpenCL` or `/etc/nvidia`,
@@ -1336,5 +1372,17 @@ its own path; it exists for tests and debugging, as does the
 ## Build
 
     cargo build --release
+
+Links `libseccomp.so` — the `libseccomp` package on Arch, `libseccomp-dev` on
+Debian for the linker symlink. It is bubbler's only C dependency; everything
+else is Rust. No headers and no bindgen: the binding crate writes the FFI by
+hand, and `pkg-config` is optional, used only to set a cfg for a libseccomp 2.6
+API bubbler does not call.
+
+**libseccomp 2.5.4 or newer.** The floor is the syscall table, not the API:
+bubbler names its rules, and a libseccomp whose table predates Linux 5.17 does
+not know `mount_setattr`, so that rule would be skipped and the sandbox quietly
+weaker. A skipped name is printed (see "Seccomp"), so a too-old library is loud
+rather than silent, but it is still a downgrade.
 
 Requires `bwrap` at runtime and a kernel with user namespaces.
