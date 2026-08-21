@@ -3,12 +3,14 @@
 //! ignoring a grant would produce a different sandbox than the file says.
 
 use std::ffi::{OsStr, OsString};
+use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
 use kdl::{KdlDocument, KdlNode};
 
 pub use crate::error::ConfigError;
+pub use crate::network::{Forward, Mode as NetworkMode, NetworkConfig};
 pub use crate::seccomp::{Errno, SeccompConfig};
 pub use crate::tty::TtyMode;
 
@@ -133,8 +135,9 @@ pub enum Service {
     /// Access to the host X11 socket. X11 offers no isolation between
     /// clients; this is a compatibility grant, not a safe one.
     X11,
-    /// Keep the host network namespace.
-    Network,
+    /// A network namespace, and what it is connected to: the sandbox's
+    /// own by default, the host's under `network "host"`.
+    Network(NetworkConfig),
     /// GPU access: the `/dev/dri` device nodes, bound read-write, plus the
     /// `/sys` entries a userspace driver reads to match a node to its
     /// hardware.
@@ -333,13 +336,12 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
         let name = node.name().value();
         reject_types(node)?;
         match name {
-            "wayland" | "x11" | "network" | "dri" | "pipewire" | "pulseaudio" | "portals"
-            | "notify" | "tray" | "hidraw" => {
+            "wayland" | "x11" | "dri" | "pipewire" | "pulseaudio" | "portals" | "notify"
+            | "tray" | "hidraw" => {
                 reject_entries(node)?;
                 let svc = match name {
                     "wayland" => Service::Wayland,
                     "x11" => Service::X11,
-                    "network" => Service::Network,
                     "dri" => Service::Dri,
                     "pipewire" => Service::Pipewire,
                     "pulseaudio" => Service::Pulseaudio,
@@ -406,6 +408,19 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
                     return Err(ConfigError::Duplicate(name.to_owned()));
                 }
                 cfg.services.push(parse_dbus(node)?);
+            }
+            "network" => {
+                // By variant, like `gamepad`: two `network` nodes differ
+                // in mode or children, and which sandbox the config asks
+                // for would be a matter of their order in the file.
+                if cfg
+                    .services
+                    .iter()
+                    .any(|s| matches!(s, Service::Network { .. }))
+                {
+                    return Err(ConfigError::Duplicate(name.to_owned()));
+                }
+                cfg.services.push(parse_network(node)?);
             }
             "gamepad" => {
                 // By variant: two `gamepad` nodes differing only in their
@@ -1035,6 +1050,152 @@ fn validate_relative(node: &KdlNode, s: &str) -> Result<PathBuf, ConfigError> {
     Ok(p.components().collect())
 }
 
+/// `network ["host"|"none"] { dns "<ip>"; allow-port <n> [udp=#true];
+/// no-ipv6 }`. The bare node is the sandbox's own network namespace,
+/// which is the default; the two spellings name the host's namespace and
+/// no namespace at all.
+///
+/// `dns` is valid in every mode, since it only says what the sandbox's
+/// resolver file holds. The other two children configure the pasta
+/// sidecar, and only the isolated mode has one — under the others they
+/// are refused rather than ignored, which would leave a config granting
+/// less than it says.
+fn parse_network(node: &KdlNode) -> Result<Service, ConfigError> {
+    let mut cfg = NetworkConfig::default();
+    let mut seen_mode = false;
+    for e in node.entries() {
+        if let Some(p) = e.name() {
+            return Err(ConfigError::UnknownProperty {
+                node: node.name().value().to_owned(),
+                prop: p.value().to_owned(),
+            });
+        }
+        if seen_mode {
+            return Err(bad(node, "expects at most one mode argument"));
+        }
+        seen_mode = true;
+        let s = e
+            .value()
+            .as_string()
+            .ok_or_else(|| bad(node, "mode must be \"host\" or \"none\""))?;
+        cfg.mode = NetworkMode::from_str(s)?;
+    }
+    for child in node.children().into_iter().flat_map(KdlDocument::nodes) {
+        reject_types(child)?;
+        if child.children().is_some() {
+            return Err(bad(child, "takes no children"));
+        }
+        match child.name().value() {
+            "dns" => {
+                let ip = parse_dns(child)?;
+                // The sandbox's loopback is its own, so such an address
+                // names a resolver inside the sandbox and never the host
+                // one meant. pasta refuses a loopback `--dns-forward` for
+                // the same reason.
+                if ip.is_loopback() && cfg.mode == NetworkMode::Isolated {
+                    return Err(bad(
+                        child,
+                        "a loopback address is the sandbox's own loopback in an isolated \
+                         network namespace, not the host's; name a routable resolver, or \
+                         write `network \"host\"`",
+                    ));
+                }
+                if cfg.dns.contains(&ip) {
+                    return Err(ConfigError::Duplicate(format!("dns \"{ip}\"")));
+                }
+                cfg.dns.push(ip);
+            }
+            "allow-port" => {
+                let f = parse_allow_port(child)?;
+                if cfg.forwards.contains(&f) {
+                    let udp = if f.udp { " udp=#true" } else { "" };
+                    return Err(ConfigError::Duplicate(format!(
+                        "allow-port {}{udp}",
+                        f.port
+                    )));
+                }
+                cfg.forwards.push(f);
+            }
+            "no-ipv6" => {
+                reject_entries(child)?;
+                if cfg.no_ipv6 {
+                    return Err(ConfigError::Duplicate("no-ipv6".to_owned()));
+                }
+                cfg.no_ipv6 = true;
+            }
+            other => return Err(ConfigError::UnknownNode(other.to_owned())),
+        }
+    }
+    if cfg.mode != NetworkMode::Isolated {
+        if !cfg.forwards.is_empty() {
+            return Err(bad(
+                node,
+                "`allow-port` forwards into the sandbox's own network namespace, \
+                 which `host` and `none` do not have",
+            ));
+        }
+        if cfg.no_ipv6 {
+            return Err(bad(
+                node,
+                "`no-ipv6` configures the pasta sidecar, which only the isolated \
+                 network namespace runs",
+            ));
+        }
+    }
+    Ok(Service::Network(cfg))
+}
+
+/// `dns "<ip>"`. The value is not echoed back: it is arbitrary text and
+/// may hold the control bytes the error message would then carry.
+fn parse_dns(node: &KdlNode) -> Result<IpAddr, ConfigError> {
+    let s = one_string_arg(node)?;
+    IpAddr::from_str(s).map_err(|_| bad(node, "expects an IP address such as \"1.1.1.1\""))
+}
+
+/// `allow-port <n> [udp=#true]`: one port number, TCP unless the property
+/// says otherwise.
+fn parse_allow_port(node: &KdlNode) -> Result<Forward, ConfigError> {
+    let mut port: Option<u16> = None;
+    let mut udp: Option<bool> = None;
+    for e in node.entries() {
+        match e.name().map(|n| n.value()) {
+            None => {
+                if port.is_some() {
+                    return Err(bad(node, "expects exactly one port argument"));
+                }
+                port = Some(
+                    e.value()
+                        .as_integer()
+                        .and_then(|n| u16::try_from(n).ok())
+                        .filter(|n| *n != 0)
+                        .ok_or_else(|| bad(node, "expects a port number from 1 to 65535"))?,
+                );
+            }
+            Some("udp") => {
+                if udp.is_some() {
+                    return Err(ConfigError::Duplicate("allow-port udp".to_owned()));
+                }
+                udp = Some(
+                    e.value()
+                        .as_bool()
+                        .ok_or_else(|| bad(node, "udp must be #true or #false"))?,
+                );
+            }
+            Some(p) => {
+                return Err(ConfigError::UnknownProperty {
+                    node: node.name().value().to_owned(),
+                    prop: p.to_owned(),
+                });
+            }
+        }
+    }
+    let port = port.ok_or_else(|| bad(node, "expects exactly one port argument"))?;
+    Ok(Forward {
+        port,
+        udp: udp.unwrap_or(false),
+    })
+}
+
 /// `gamepad [hidraw=#true] [uinput=#true]`: the bare node is the evdev
 /// grant, and each property adds one more class of device node to it.
 fn parse_gamepad(node: &KdlNode) -> Result<Service, ConfigError> {
@@ -1278,6 +1439,7 @@ fn parse_command(node: &KdlNode) -> Result<Vec<OsString>, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
 
     #[test]
     fn every_node_is_paired_with_the_line_it_is_on() {
@@ -1442,7 +1604,7 @@ mod tests {
             vec![
                 Service::Wayland,
                 Service::X11,
-                Service::Network,
+                Service::Network(NetworkConfig::default()),
                 Service::HomeShare {
                     path: "Downloads".into(),
                     mode: ShareMode::ReadOnly
@@ -1457,6 +1619,146 @@ mod tests {
             cfg.command.unwrap(),
             vec![OsString::from("foot"), "-e".into(), "fish".into()]
         );
+    }
+
+    /// The three modes, and what a bare node means now.
+    #[test]
+    fn network_modes_are_the_bare_node_and_two_names() {
+        let net = |text: &str| match parse(text).unwrap().services.as_slice() {
+            [Service::Network(cfg)] => cfg.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(net("network").mode, NetworkMode::Isolated);
+        assert_eq!(net("network \"host\"").mode, NetworkMode::Host);
+        assert_eq!(net("network \"none\"").mode, NetworkMode::None);
+        for bad in [
+            "network \"isolated\"",
+            "network \"pasta\"",
+            "network \"host\" \"none\"",
+            "network #true",
+            "network mode=\"host\"",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn network_children_are_dns_allow_port_and_no_ipv6() {
+        let cfg = parse(
+            "network {\n    dns \"1.1.1.1\"\n    dns \"2606:4700:4700::1111\"\n    \
+             allow-port 8080\n    allow-port 5353 udp=#true\n    no-ipv6\n}",
+        )
+        .unwrap();
+        let Some(Service::Network(net)) = cfg.services.first() else {
+            panic!("{:?}", cfg.services)
+        };
+        assert_eq!(
+            net.dns,
+            vec![
+                IpAddr::from([1, 1, 1, 1]),
+                IpAddr::from_str("2606:4700:4700::1111").unwrap()
+            ]
+        );
+        assert_eq!(
+            net.forwards,
+            vec![
+                Forward {
+                    port: 8080,
+                    udp: false
+                },
+                Forward {
+                    port: 5353,
+                    udp: true
+                }
+            ]
+        );
+        assert!(net.no_ipv6);
+    }
+
+    /// The mode×child matrix: `dns` describes a file and is valid
+    /// everywhere; the other two configure the sidecar only the isolated
+    /// mode runs, and are refused rather than ignored under the others.
+    #[test]
+    fn sidecar_children_need_the_isolated_mode() {
+        for mode in ["", " \"host\"", " \"none\""] {
+            let text = format!("network{mode} {{\n    dns \"1.1.1.1\"\n}}");
+            assert!(parse(&text).is_ok(), "{text}");
+        }
+        for child in ["allow-port 80", "no-ipv6"] {
+            let ok = format!("network {{\n    {child}\n}}");
+            assert!(parse(&ok).is_ok(), "{ok}");
+            for mode in ["\"host\"", "\"none\""] {
+                let text = format!("network {mode} {{\n    {child}\n}}");
+                assert!(
+                    matches!(parse(&text), Err(ConfigError::BadArgument { node, .. }) if node == "network"),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn network_child_arguments_are_checked() {
+        for bad in [
+            "network {\n    dns \"not-an-ip\"\n}",
+            "network {\n    dns\n}",
+            "network {\n    allow-port 0\n}",
+            "network {\n    allow-port 65536\n}",
+            "network {\n    allow-port -1\n}",
+            "network {\n    allow-port \"80\"\n}",
+            "network {\n    allow-port 80 tcp=#true\n}",
+            "network {\n    no-ipv6 #true\n}",
+            "network {\n    allow-ports 80\n}",
+            "network {\n    dns \"1.1.1.1\" { x }\n}",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        assert!(parse("network {\n    allow-port 65535\n}").is_ok());
+    }
+
+    /// pasta refuses a loopback `--dns-forward`, and for the same reason
+    /// a loopback resolver in an isolated namespace names the sandbox
+    /// itself. Under the other two modes the loopback is the host's own
+    /// and a stub resolver there is the normal case.
+    #[test]
+    fn a_loopback_resolver_is_refused_only_where_it_would_be_the_sandbox() {
+        for addr in ["127.0.0.1", "127.0.0.53", "::1"] {
+            let isolated = format!("network {{\n    dns \"{addr}\"\n}}");
+            assert!(
+                matches!(parse(&isolated), Err(ConfigError::BadArgument { node, .. }) if node == "dns"),
+                "{isolated}: {:?}",
+                parse(&isolated)
+            );
+            for mode in ["\"host\"", "\"none\""] {
+                let text = format!("network {mode} {{\n    dns \"{addr}\"\n}}");
+                assert!(parse(&text).is_ok(), "{text}");
+            }
+        }
+        assert!(parse("network {\n    dns \"1.1.1.1\"\n}").is_ok());
+    }
+
+    #[test]
+    fn duplicate_network_nodes_and_children_are_errors() {
+        for (text, name) in [
+            ("network\nnetwork \"host\"", "network"),
+            (
+                "network {\n    dns \"1.1.1.1\"\n    dns \"1.1.1.1\"\n}",
+                "dns \"1.1.1.1\"",
+            ),
+            (
+                "network {\n    allow-port 80\n    allow-port 80\n}",
+                "allow-port 80",
+            ),
+            ("network {\n    no-ipv6\n    no-ipv6\n}", "no-ipv6"),
+        ] {
+            assert!(
+                matches!(parse(text), Err(ConfigError::Duplicate(ref n)) if n == name),
+                "{text}: {:?}",
+                parse(text)
+            );
+        }
+        // One port over two protocols is two grants, not a repeat.
+        assert!(parse("network {\n    allow-port 80\n    allow-port 80 udp=#true\n}").is_ok());
     }
 
     #[test]

@@ -11,6 +11,7 @@ use crate::config::{InstanceConfig, Lines, SeccompConfig, Service};
 use crate::dbus;
 use crate::error::ConfigError;
 use crate::kdl_out;
+use crate::network::{self, NetworkConfig};
 
 /// Arguments of the baseline listed before the rest is summed up. The
 /// baseline is the same in every sandbox and the longest group by far.
@@ -277,6 +278,27 @@ fn listed(empty: bool, items: Vec<String>) -> Vec<String> {
     out
 }
 
+/// The pasta argv an isolated `network` node is served by. The two
+/// descriptors and the sandbox pid are only known once bwrap is running,
+/// so they are named here rather than numbered; `--dry-run` is the
+/// sandbox's own argv and says nothing about sidecars.
+fn sidecar_line(cfg: &NetworkConfig) -> String {
+    let argv = network::pasta_argv(
+        cfg,
+        network::Attach {
+            userns: OsStr::new("<userns>"),
+            ready: OsStr::new("<ready-fd>"),
+            child: OsStr::new("<child-pid>"),
+        },
+    );
+    let mut line = String::from("    sidecar: pasta");
+    for a in &argv {
+        line.push(' ');
+        line.push_str(&a.to_string_lossy());
+    }
+    line
+}
+
 /// The D-Bus proxy rules of the node at `index`, in the order the proxy
 /// is given them.
 fn rules_of(index: usize, rules: &[(usize, String)]) -> Vec<String> {
@@ -346,14 +368,21 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
         // the arguments listed above, and its filter is not the config's.
         if !view.proxy {
             match g.origin {
-                Origin::Service(i) if view.cfg.services.get(i).is_some_and(carries_rules) => {
-                    out.extend(listed(n == 0, rules_of(i, view.rules)));
-                }
-                Origin::Service(i)
-                    if matches!(view.cfg.services.get(i), Some(Service::Camera { .. })) =>
-                {
-                    out.extend(listed(n == 0, vec![CAMERA_PORTAL.to_owned()]));
-                }
+                Origin::Service(i) => match view.cfg.services.get(i) {
+                    Some(s) if carries_rules(s) => {
+                        out.extend(listed(n == 0, rules_of(i, view.rules)));
+                    }
+                    Some(Service::Camera { .. }) => {
+                        out.extend(listed(n == 0, vec![CAMERA_PORTAL.to_owned()]));
+                    }
+                    // An isolated `network` is half a sidecar: its own
+                    // arguments are only the resolver file, and what
+                    // connects the namespace is the process below.
+                    Some(Service::Network(cfg)) if cfg.is_isolated() => {
+                        out.push(sidecar_line(cfg));
+                    }
+                    _ => {}
+                },
                 Origin::Seccomp => out.extend(listed(n == 0, seccomp_lines(&view.cfg.seccomp))),
                 _ => {}
             }

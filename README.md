@@ -125,55 +125,60 @@ file descriptor numbers are the ones a dry run prints.
 
     bwrap
 
-      baseline                                       138 arguments
+      baseline                                       132 arguments
         --unshare-all
         --die-with-parent
         --new-session
         --hostname bubbler
         --chdir /home/bubbler
         --info-fd 3  (pipe: bwrap reports the sandbox pid on it)
-        ... 129 more (--explain=full)
+        ... 123 more (--explain=full)
 
-      network                         config.kdl:6   4 arguments
-        --share-net
-        --ro-bind /etc/resolv.conf /etc/resolv.conf
-
-      portals                         config.kdl:10  7 arguments
+      portals                         config.kdl:11  7 arguments
         --block-fd 4  (pipe: the sandbox waits on it until bubbler lets it go)
-        --perms 0644 --ro-bind-data 8 /.flatpak-info  (generated file, 69 bytes)
+        --perms 0644 --ro-bind-data 9 /.flatpak-info  (generated file, 69 bytes)
         rules: --talk=org.freedesktop.portal.Desktop
                --talk=org.freedesktop.portal.Documents
                --talk=org.freedesktop.portal.FileChooser
                --call=org.freedesktop.portal.*=*
                --broadcast=org.freedesktop.portal.*=@/org/freedesktop/portal/*
 
-      notify                          config.kdl:11  0 arguments
+      notify                          config.kdl:12  0 arguments
         rule-only: --talk=org.freedesktop.Notifications
 
       seccomp                                        2 arguments
         --add-seccomp-fd 5  (filter, 896 bytes, x86_64 + i386)
 
-      wayland                         config.kdl:2   9 arguments
+      wayland                         config.kdl:3   9 arguments
         --ro-bind /run/user/1000/wayland-1 /run/user/1000/wayland-1
         --setenv WAYLAND_DISPLAY wayland-1
         --setenv XDG_SESSION_TYPE wayland
 
+      network                         config.kdl:7   5 arguments
+        --perms 0644 --ro-bind-data 8 /etc/resolv.conf  (generated file, 23 bytes)
+        sidecar: pasta --config-net --foreground --quiet -t none -u none -T none -U none --map-host-loopback none --map-guest-addr none --dns-forward 169.254.1.1 --userns <userns> --pid <ready-fd> <child-pid>
+
       init                                           7 arguments
         --ro-bind /usr/lib/bubbler/bubbler-init /run/bubbler-init
-        -- /run/bubbler-init --socket-fd 9  (socket: the exec channel bubbler-init serves)
+        -- /run/bubbler-init --socket-fd 10  (socket: the exec channel bubbler-init serves)
 
       command                                        2 arguments
         -- firefox
 
-    229 arguments in 14 groups, 129 hidden (--explain=full); 8 D-Bus rules to the proxy (--proxy)
+    224 arguments in 14 groups, 123 hidden (--explain=full); 8 D-Bus rules to the proxy (--proxy)
 
 A group sits where the node's *first* argument is emitted and gathers every
-later one it contributed, whichever phase that came from: `network` is placed by
-the `--share-net` inserted into phase 1 and its `/etc/resolv.conf` bind from
-phase 4 is listed with it, though 130 baseline arguments separate the two in the
-argv. The listing is therefore neither file order nor argv order, and it is not
-the order of record: `--dry-run` is, and so is `--format json`, which stays in
-true argv order.
+later one it contributed, whichever phase that came from: `network "host"` is
+placed by the `--share-net` inserted into phase 1 and its `/etc/resolv.conf`
+bind from phase 4 is listed with it, though the whole baseline separates the two
+in the argv. The listing is therefore neither file order nor argv order, and it
+is not the order of record: `--dry-run` is, and so is `--format json`, which
+stays in true argv order.
+
+A grant that is not only bwrap arguments says so under its own group: a `dbus`
+node lists the `rules:` it hands the proxy, and an isolated `network` lists the
+`sidecar:` argv pasta is started with — neither is in the argv, and `--dry-run`
+prints the sandbox's argv alone.
 
 Every generated descriptor says what is behind it: the size of the seccomp
 filter and the architectures it carries, the size of a `--ro-bind-data`, which
@@ -217,7 +222,16 @@ file order does not affect the generated argv.
 
     wayland                          # the host Wayland socket
     x11                              # X socket and Xauthority
-    network                          # network namespace shared, plus /etc/resolv.conf
+    network                          # the sandbox's own network namespace,
+                                     #   connected by a pasta sidecar
+    network "host"                   # the host's namespace instead
+    network "none"                   # no network; the same as no node at all
+    network {                        # children; `dns` in any of the three
+        dns "1.1.1.1"                #   generated /etc/resolv.conf
+        allow-port 8080              #   host 127.0.0.1:8080 reaches the sandbox
+        allow-port 5353 udp=#true    #   isolated mode only, like no-ipv6
+        no-ipv6
+    }
     dri                              # GPU: /dev/dri, NVIDIA nodes, the PCI devices' sysfs
     pipewire                         # $XDG_RUNTIME_DIR/pipewire-0
     pulseaudio                       # $XDG_RUNTIME_DIR/pulse/native, sets PULSE_SERVER
@@ -274,9 +288,8 @@ share whose width depends on which line came first; a share below another
 files (`passwd`, `group`, `shadow`, `gshadow` and their `-`/`+` variants),
 which the sandbox generates itself. `path-share` reaches outside the home and
 has rules of its own, under "Host paths"; `app-runtime` shares one directory
-under `$XDG_RUNTIME_DIR` and has a section of its own below. `network` needs
-`/etc/resolv.conf` (the tmpfs over `/etc` would otherwise hide it). `dri`
-binds `/dev/dri` read-write and exposes `/sys/dev/char`,
+under `$XDG_RUNTIME_DIR` and `network` has a section of its own below, as does
+`app-runtime`. `dri` binds `/dev/dri` read-write and exposes `/sys/dev/char`,
 `/sys/devices/system/cpu`, every
 `/sys/devices/pci*` root and, where the host has it, `/sys/class/drm` (whose
 entries are relative symlinks into those roots, so it adds only `version`)
@@ -547,6 +560,101 @@ One file under `/usr/lib/mozilla/native-messaging-hosts/` (or
 `/usr/lib64/…`) is Firefox's documented system-wide location and serves every
 instance and the host browser at once, at the cost of needing root; bubbler
 never writes there.
+
+### network
+
+`network` is the sandbox's **own** network namespace, connected to the outside
+by a [pasta](https://passt.top/) sidecar — the `passt` package, which is also
+what podman uses for rootless networking. `network "host"` is the host's
+namespace, which is what a bare `network` meant before this; `network "none"`
+is the baseline, spelled out.
+
+What the isolated namespace is worth is what the host one gives away. Measured
+against a host serving on `127.0.0.1:8099`: a sandbox on the host namespace
+reads it, one with its own namespace cannot reach it at all. The same holds for
+**abstract** unix sockets, which `network_namespaces(7)` isolates and which
+have no permission checks at all — flatpak documents that hole and has never
+closed it. The host namespace also hands over the host's interfaces, addresses,
+VPN tunnels and its whole listening-socket table.
+
+It is not a firewall, though. pasta routes, so a host service bound to
+`0.0.0.0` on an address pasta did not copy into the namespace — a VPN endpoint,
+`docker0`, a second NIC — is reachable from inside exactly as it is from any
+other machine on that network. What the isolated namespace closes is the
+host's *loopback* and its abstract sockets, not everything the host listens on.
+
+What it costs is the LAN. pasta does not bridge, so nothing that depends on
+broadcast or mDNS crosses the boundary: Chromecast, Spotify Connect, Steam
+Remote Play and local game discovery all need `network "host"`. Nor is a
+service on the host's own `127.0.0.1` — a dev server, say — reachable from
+inside. The shipped profiles that lose something say so in a comment.
+
+bubbler starts pasta with the same six values on every run, and they are not
+configurable:
+
+    pasta --config-net --foreground --quiet \
+          -t <ports|none> -u <ports|none> -T none -U none \
+          --map-host-loopback none --map-guest-addr none \
+          [--dns-forward 169.254.1.1] [-4] \
+          --userns <the sandbox's> --pid <a pipe> <the sandbox's pid>
+
+pasta's own defaults are `-t auto -u auto -T auto -U auto`, with
+`--map-host-loopback` set to the guest's gateway and `--map-guest-addr` to the
+host's global address. In `auto` mode it scans `/proc/net/{tcp,tcp6,udp,udp6}`
+on both sides and publishes what it finds — discarding the bound address, so a
+service the sandbox binds to its *own* `127.0.0.1` would be published on the
+host's public address — and the two `--map-*` defaults put the host's loopback
+services back inside the sandbox that unshared the network to be rid of them.
+Ship the naive invocation and the isolated mode would be worse than the host
+one in a dimension it was meant to be better in. `--foreground` is there for a
+different reason: a backgrounded pasta is not bubbler's child, and could not be
+killed when the run ends.
+
+`allow-port <n>` is the one thing that reaches *in*: the port is published on
+the host's `127.0.0.1` only, never on the LAN, and `udp=#true` makes it a UDP
+forward rather than a TCP one. pasta delivers such a connection to the
+namespace's public address, so the server inside must listen on `0.0.0.0` and
+not on its own loopback. `no-ipv6` is pasta's `-4`.
+
+**Outbound traffic is all or nothing.** pasta has no destination filtering and
+the passt project has no plans for any, so there is no `allow-host` here and
+nothing pretending to be one. A future version could install nftables rules in
+the sandbox's own namespace from the launcher side — the sandbox itself could
+not flush them — but a host allowlist by name breaks on every CDN, so it would
+be an address policy and not a name one.
+
+`/etc/resolv.conf` is **generated**, not bound: an isolated namespace can never
+reach a resolver on the host's loopback, which is exactly what the host file
+names on a systemd-resolved machine (`127.0.0.53`). Without `dns` children the
+file reads `nameserver 169.254.1.1` and pasta is given the matching
+`--dns-forward`, which translates that link-local address to the host's own
+first nameserver; the address cannot be a loopback one, pasta refuses that
+outright. `dns "<ip>"` replaces the list and drops the `--dns-forward` with it:
+a named resolver is reached over the tap like any other address, and a
+translation rule nothing points at is one more route to the host for no gain.
+For the same reason `dns` may not name a loopback address under the isolated
+mode — that is the sandbox's own loopback, not the host's — and the parser
+refuses it; under `network "host"` a stub resolver there is the normal case and
+is accepted. `network "none"` writes no resolver file at all, whatever `dns`
+says: there is no network to carry the query. Only `network "host"` with no
+`dns` child binds the host's own `/etc/resolv.conf`, which is what it always
+did.
+
+pasta is a hard requirement of the isolated mode, not a preference: a private
+namespace with connectivity has no other unprivileged route (a veth pair needs
+`CAP_NET_ADMIN` in the initial user namespace, which is real root). A missing
+`pasta` is an error naming the `passt` package and `network "host"`, never a
+quiet fall back to the host namespace — which would undo the whole grant. The
+sidecar is killed on every way out of a run, and a sandbox whose namespace
+cannot be connected is stopped where it stands rather than started without the
+network it was granted: it waits at bwrap's `--block-fd` until pasta reports
+that the namespace is configured.
+
+A config written before this — one with no `// bubbler config: 2` header line
+and a bare `network` node — asks for a different sandbox now than it did then,
+so every run of it prints a warning naming the change. `bubbler reseed <name>`
+re-flattens the profile and writes the header; `bubbler edit <name>` writes the
+header too, since a file you have just read through means what it says.
 
 ### env and command
 
@@ -891,7 +999,9 @@ without `/.flatpak-info`, which is worse than wrong).
 
 **Notes** are information and fail nothing: `app-runtime-rw` (a shared
 application runtime directory granted `mode=rw`, so the sandbox can replace the
-sockets everything else naming that id connects to), `ozone-hint-unnecessary`,
+sockets everything else naming that id connects to), `network-host`
+(`network "host"`, the one mode that puts the sandbox on the host's network
+stack), `ozone-hint-unnecessary`,
 `command-not-found`, `camera-nodes-none-present` (`camera nodes=#true` on a
 host with no `/dev/video*` or `/dev/media*`, so that half of the grant binds
 nothing), `camera-nodes-no-hotplug` (the node list is frozen at launch and an
@@ -1326,6 +1436,9 @@ binding the tree under it.
 - No raw-USB grant (`/dev/bus/usb` and its sysfs) and no pcsclite socket, so a
   challenge-response YubiKey or a smart card reader cannot be reached from a
   sandbox; `hidraw` is a different device class and no substitute.
+- Outbound traffic under `network` is all or nothing: pasta cannot filter by
+  destination, so there is no per-host or per-port egress policy. `allow-port`
+  covers the inbound direction only.
 - `app-runtime` does not carry Discord rich presence: those clients look for
   `discord-ipc-N` at the top of `$XDG_RUNTIME_DIR`, which no sandbox shares.
 - Nothing installs a browser's native messaging manifest into an instance's
@@ -1385,4 +1498,6 @@ not know `mount_setattr`, so that rule would be skipped and the sandbox quietly
 weaker. A skipped name is printed (see "Seccomp"), so a too-old library is loud
 rather than silent, but it is still a downgrade.
 
-Requires `bwrap` at runtime and a kernel with user namespaces.
+Requires `bwrap` at runtime and a kernel with user namespaces, plus `pasta`
+(the `passt` package) for any profile with an isolated `network` — which is
+every shipped profile that has one.

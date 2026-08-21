@@ -1,6 +1,6 @@
 //! Turns granted services into builder calls. Each service touches only
-//! phase 4 (binds) and phase 5 (env); `network` is the one exception that
-//! edits phase 1 via [`BwrapArgs::share_net`].
+//! phase 4 (binds) and phase 5 (env); `network "host"` is the one
+//! exception that edits phase 1 via [`BwrapArgs::share_net`].
 //!
 //! Paths come from untrusted host environment values, so every source is
 //! probed for its file *type*, never for mere existence: binding a
@@ -18,6 +18,7 @@ use crate::dbus;
 use crate::env::{Env, SANDBOX_HOME};
 use crate::error::LaunchError;
 use crate::host::Host;
+use crate::network::{self, Mode as NetworkMode, NetworkConfig};
 
 /// What a service needs to know about the instance beyond its config.
 #[derive(Debug, Clone)]
@@ -54,7 +55,7 @@ pub fn apply_all(
         match s {
             Service::Wayland => wayland(env, args, host, !has_x11)?,
             Service::X11 => x11(env, args, host)?,
-            Service::Network => network(args, host)?,
+            Service::Network(cfg) => network(args, host, cfg)?,
             Service::HomeShare { path, mode } => home_share(env, args, host, path, *mode)?,
             Service::Dri => dri(args, host)?,
             Service::Pipewire => pipewire(env, args, host)?,
@@ -187,13 +188,27 @@ fn require_exists(
     }
 }
 
-/// Keep the host network namespace and bind the resolver configuration,
-/// without which names cannot be resolved inside the sandbox. The bind is
-/// phase 4, so it lands inside the phase-2 tmpfs on `/etc`.
-fn network(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
-    args.share_net();
-    let p = require_file(host, "network", PathBuf::from("/etc/resolv.conf"))?;
-    args.ro_bind(&p, &p);
+/// The resolver configuration, and the host's network namespace where
+/// the node asked for it. The isolated mode needs nothing of bwrap beyond
+/// the baseline's `--unshare-all`; what connects it is the pasta sidecar
+/// the launcher starts once bwrap has reported the sandbox pid.
+///
+/// The bind is phase 4, so it lands inside the phase-2 tmpfs on `/etc`.
+/// A generated file rather than the host's, except under `"host"` with no
+/// `dns` child: the host's `/etc/resolv.conf` may name a resolver on its
+/// own loopback, which a sandbox with its own namespace can never reach.
+fn network(args: &mut BwrapArgs, host: &dyn Host, cfg: &NetworkConfig) -> Result<(), LaunchError> {
+    if cfg.mode == NetworkMode::Host {
+        args.share_net();
+    }
+    match network::resolv_conf(cfg) {
+        Some(content) => args.ro_bind_data(content, Path::new("/etc/resolv.conf"), "0644"),
+        None if cfg.mode == NetworkMode::Host => {
+            let p = require_file(host, "network", PathBuf::from("/etc/resolv.conf"))?;
+            args.ro_bind(&p, &p);
+        }
+        None => {}
+    }
     Ok(())
 }
 
@@ -1000,6 +1015,7 @@ mod tests {
             test_allow_path: None,
             profile_dir_override: None,
             proxy_override: None,
+            pasta_override: None,
         }
     }
 
@@ -1353,21 +1369,88 @@ mod tests {
         assert!(!a.contains(&"XDG_SESSION_TYPE".to_string()));
     }
 
+    /// The one mode that keeps the host's namespace, and the one that
+    /// binds the host's resolver file. Both are what `network` emitted
+    /// before the isolated mode became the default, unchanged.
     #[test]
-    fn network_shares_net_and_binds_resolv_conf() {
-        let a = argv(&[Service::Network], &env(), &[("/etc/resolv.conf", File)]).unwrap();
+    fn network_host_shares_net_and_binds_resolv_conf() {
+        let host = Service::Network(NetworkConfig {
+            mode: NetworkMode::Host,
+            ..NetworkConfig::default()
+        });
+        let a = argv(
+            std::slice::from_ref(&host),
+            &env(),
+            &[("/etc/resolv.conf", File)],
+        )
+        .unwrap();
         assert_eq!(a[1], "--share-net");
         assert!(has_seq(
             &a,
             &["--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf"]
         ));
         assert!(matches!(
-            argv(&[Service::Network], &env(), &[]),
+            argv(std::slice::from_ref(&host), &env(), &[]),
             Err(LaunchError::MissingResource {
                 service: "network",
                 ..
             })
         ));
+    }
+
+    /// The isolated mode is the baseline's own namespace: nothing of
+    /// bwrap beyond a resolver file, and no host path to depend on.
+    #[test]
+    fn isolated_network_generates_a_resolver_and_shares_nothing() {
+        let a = argv(
+            &[Service::Network(NetworkConfig::default())],
+            &env(),
+            &[("/etc/resolv.conf", File)],
+        )
+        .unwrap();
+        assert!(!a.contains(&"--share-net".to_string()), "{a:?}");
+        assert!(
+            !has_seq(&a, &["--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf"]),
+            "{a:?}"
+        );
+        assert!(has_seq(&a, &["--perms", "0644", "--ro-bind-data"]), "{a:?}");
+        // And it needs nothing of the host: an empty host tree is enough.
+        assert!(argv(&[Service::Network(NetworkConfig::default())], &env(), &[]).is_ok());
+    }
+
+    /// `dns` replaces the resolver file in every mode, so a sandbox on
+    /// the host's namespace never sees the host's own resolver either.
+    #[test]
+    fn dns_children_replace_the_resolver_file_under_host_too() {
+        let svc = Service::Network(NetworkConfig {
+            mode: NetworkMode::Host,
+            dns: vec![std::net::IpAddr::from([1, 1, 1, 1])],
+            ..NetworkConfig::default()
+        });
+        let a = argv(std::slice::from_ref(&svc), &env(), &[]).unwrap();
+        assert!(a.contains(&"--share-net".to_string()), "{a:?}");
+        assert!(has_seq(&a, &["--perms", "0644", "--ro-bind-data"]), "{a:?}");
+        assert!(
+            !has_seq(&a, &["--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf"]),
+            "{a:?}"
+        );
+    }
+
+    /// `none` is the baseline as it stands: the node grants nothing, and
+    /// emits nothing.
+    #[test]
+    fn network_none_emits_nothing() {
+        let plain = argv(&[], &env(), &[]).unwrap();
+        let none = argv(
+            &[Service::Network(NetworkConfig {
+                mode: NetworkMode::None,
+                ..NetworkConfig::default()
+            })],
+            &env(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(plain, none);
     }
 
     #[test]

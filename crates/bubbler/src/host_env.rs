@@ -51,9 +51,10 @@ pub fn fill_closed_stdio() -> Result<()> {
 /// Build an [`Env`] from the current process environment. A missing or
 /// empty `$HOME` or `$XDG_RUNTIME_DIR` is an error: both are needed for
 /// any sandbox, and an empty one would silently become a relative path.
-/// `$BUBBLER_INIT` and `$BUBBLER_DBUS_PROXY` override where the
-/// `bubbler-init` and `xdg-dbus-proxy` binaries are taken from, and
-/// `$BUBBLER_PROFILE_DIR` where the system profile layer is read from.
+/// `$BUBBLER_INIT`, `$BUBBLER_DBUS_PROXY` and `$BUBBLER_PASTA` override
+/// where the `bubbler-init`, `xdg-dbus-proxy` and `pasta` binaries are
+/// taken from, and `$BUBBLER_PROFILE_DIR` where the system profile layer
+/// is read from.
 pub fn from_process() -> Result<Env> {
     let home = PathBuf::from(
         env::var_os("HOME")
@@ -100,6 +101,9 @@ pub fn from_process() -> Result<Env> {
             .filter(|v| !v.is_empty())
             .map(PathBuf::from),
         proxy_override: env::var_os("BUBBLER_DBUS_PROXY")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from),
+        pasta_override: env::var_os("BUBBLER_PASTA")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from),
     })

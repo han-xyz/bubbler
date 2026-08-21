@@ -14,8 +14,8 @@ use bubbler_core::profile::NAMES;
 use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
     PYTHON, bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, bwrap_alive, kill_group, real_init,
-    require_bwrap, require_dbus, require_portal, require_python, require_system_bus, require_tray,
-    system_owns, test_pty,
+    require_bwrap, require_dbus, require_pasta, require_portal, require_python, require_system_bus,
+    require_tray, system_owns, test_pty,
 };
 use rustix::fs::{OFlags, fcntl_getfl};
 use rustix::process::{Pid, Signal, kill_process};
@@ -420,7 +420,7 @@ fn reseed_rewrites_the_config_from_the_profile_and_backs_it_up() {
     );
     assert_eq!(
         std::fs::read_to_string(&cfg).unwrap(),
-        "// bubbler profile: app\nwayland\nnetwork\ncommand \"sh\"\n"
+        "// bubbler profile: app\n// bubbler config: 2\nwayland\nnetwork\ncommand \"sh\"\n"
     );
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("data/bubbler/instances/a/config.kdl.bak"))
@@ -738,7 +738,12 @@ fn explain_proxy_reads_the_two_buses_one_at_a_time() {
 #[test]
 fn try_explains_a_throwaway_sandbox_without_running_it() {
     let tmp = setup();
-    write_profile(tmp.path(), "user", "app", "network\ncommand \"true\"\n");
+    write_profile(
+        tmp.path(),
+        "user",
+        "app",
+        "network \"host\"\ncommand \"true\"\n",
+    );
     let out = bubbler(tmp.path())
         .args(["try", "--profile", "app", "--explain"])
         .output()
@@ -749,9 +754,10 @@ fn try_explains_a_throwaway_sandbox_without_running_it() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(s.contains("\n  network "), "{s}");
+    assert!(s.contains("\n  network \"host\" "), "{s}");
     assert!(s.contains("\n    --share-net\n"), "{s}");
-    assert!(s.contains("config.kdl:2"), "{s}");
+    // Line 3: the profile header and the config version come first.
+    assert!(s.contains("config.kdl:3"), "{s}");
     // The throwaway directory is gone again, and no instance was left.
     let out = bubbler(tmp.path()).arg("list").output().unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), "");
@@ -977,7 +983,8 @@ fn real_bwrap_app_runtime_carries_a_byte_between_two_sandboxes_and_the_host() {
     assert!(dir.is_dir());
 }
 
-// `network` binds /etc/resolv.conf, so this test needs one on the host.
+// `network "host"` binds /etc/resolv.conf, so this test needs one on the
+// host.
 #[test]
 fn network_share_and_home_share_appear_in_dry_run() {
     let tmp = setup();
@@ -986,7 +993,7 @@ fn network_share_and_home_share_appear_in_dry_run() {
     let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
     std::fs::write(
         &cfg,
-        "network\nhome-share \"Downloads\"\ncommand \"true\"\n",
+        "network \"host\"\nhome-share \"Downloads\"\ncommand \"true\"\n",
     )
     .unwrap();
     let out = bubbler(tmp.path())
@@ -2999,7 +3006,12 @@ fn edit_runs_editor_and_rechecks() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), "command \"true\"\n");
+    // `edit` records the config version, so the file the user has just
+    // read through stops warning about what `network` now means.
+    assert_eq!(
+        std::fs::read_to_string(&cfg).unwrap(),
+        "// bubbler config: 2\ncommand \"true\"\n"
+    );
 }
 
 #[test]
@@ -4594,4 +4606,461 @@ fn lint_on_an_instance_reads_its_own_config() {
     assert!(err.contains("unknown node `bluetooth`"), "{err}");
     let (code, _, _) = run(tmp.path(), &["lint", "nosuch"]);
     assert_eq!(code, 3);
+}
+
+/// A stand-in pasta: it records the argv it was given, reports readiness
+/// on the `--pid` path exactly as pasta does, and then waits to be
+/// killed. What it proves is what bubbler does around the sidecar, not
+/// what pasta does with a namespace.
+const FAKE_PASTA: &str = "\
+#!/usr/bin/python3
+import os, signal, sys
+argv = sys.argv[1:]
+open(os.environ['FAKE_PASTA_ARGV'], 'w').write('\\n'.join(argv))
+open(os.environ['FAKE_PASTA_PID'], 'w').write(str(os.getpid()))
+if os.environ.get('FAKE_PASTA_SILENT') == '1':
+    sys.exit(3)
+with open(argv[argv.index('--pid') + 1], 'w') as f:
+    f.write(f'{os.getpid()}\\n')
+signal.pause()
+";
+
+/// Whether `pid` names a live process, for the sidecar lifetime checks.
+fn pid_alive(pid: i32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// A `network` instance under `root` whose config is `kdl`, with the
+/// stand-in pasta written next to it. Returns the command to run it.
+fn pasta_case(root: &std::path::Path, init: &std::path::Path, kdl: &str) -> Command {
+    let fake = root.join("fake-pasta");
+    write_script(&fake, FAKE_PASTA);
+    let mut c = bubbler_live(root, init);
+    c.env("BUBBLER_PASTA", &fake)
+        .env("FAKE_PASTA_ARGV", root.join("pasta.argv"))
+        .env("FAKE_PASTA_PID", root.join("pasta.pid"));
+    std::fs::write(root.join("data/bubbler/instances/t/config.kdl"), kdl).unwrap();
+    c
+}
+
+#[test]
+fn the_pasta_sidecar_gets_the_hardened_argv_and_does_not_outlive_the_run() {
+    if !require_bwrap() || !require_python() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    let out = pasta_case(
+        tmp.path(),
+        &init,
+        "network {\n    allow-port 8080\n    no-ipv6\n}\n",
+    )
+    .args(["run", "t", "--", "/usr/bin/echo", "ran"])
+    .output()
+    .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    // The sandbox ran, which means the block was released only after the
+    // sidecar reported that the namespace was configured.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ran\n");
+
+    let argv: Vec<String> = std::fs::read_to_string(tmp.path().join("pasta.argv"))
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let after = |flag: &str| {
+        let i = argv.iter().position(|a| a == flag).expect(flag);
+        argv[i + 1].clone()
+    };
+    assert_eq!(after("-T"), "none");
+    assert_eq!(after("-U"), "none");
+    assert_eq!(after("--map-host-loopback"), "none");
+    assert_eq!(after("--map-guest-addr"), "none");
+    assert_eq!(after("--dns-forward"), "169.254.1.1");
+    assert_eq!(after("-t"), "127.0.0.1/8080");
+    assert_eq!(after("-u"), "none");
+    for flag in ["--config-net", "--foreground", "-4"] {
+        assert!(argv.contains(&flag.to_owned()), "{flag}: {argv:?}");
+    }
+    // The pid it was pointed at is the sandbox's own.
+    assert!(argv.last().unwrap().parse::<u32>().is_ok(), "{argv:?}");
+
+    let pid: i32 = std::fs::read_to_string(tmp.path().join("pasta.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // It ignores the closed pipe and waits to be signalled, so a sidecar
+    // still here would be one bubbler never killed.
+    assert!(!pid_alive(pid), "the pasta sidecar outlived the run");
+}
+
+#[test]
+fn a_sandbox_whose_network_cannot_be_connected_never_runs() {
+    if !require_bwrap() || !require_python() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    let out = pasta_case(tmp.path(), &init, "network\n")
+        .env("FAKE_PASTA_SILENT", "1")
+        .args(["run", "t", "--", "/usr/bin/echo", "ran"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("network namespace"), "{err}");
+    // Held at its `--block-fd` and then stopped: the command never ran.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+}
+
+#[test]
+fn a_missing_pasta_names_the_package_and_the_host_mode() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/t/config.kdl"),
+        "network\n",
+    )
+    .unwrap();
+    let out = bubbler_live(tmp.path(), &init)
+        .env("BUBBLER_PASTA", tmp.path().join("no-such-pasta"))
+        .args(["run", "t", "--", "/usr/bin/echo", "ran"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("passt"), "{err}");
+    assert!(err.contains("network \"host\""), "{err}");
+    // Never a quiet fall back to the host namespace.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+}
+
+#[test]
+fn a_config_written_before_the_flip_warns_on_every_run() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    let warns = |text: &str| {
+        std::fs::write(&cfg, text).unwrap();
+        let out = bubbler(tmp.path())
+            .args(["run", "t", "--dry-run"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let err = warns("network\ncommand \"true\"\n");
+    assert!(err.contains("isolated network namespace"), "{err}");
+    assert!(err.contains("bubbler reseed t"), "{err}");
+    // A file that records the version, or names the mode, says what it
+    // means and is left alone.
+    for quiet in [
+        "// bubbler config: 2\nnetwork\ncommand \"true\"\n",
+        "network \"host\"\ncommand \"true\"\n",
+        "network \"none\"\ncommand \"true\"\n",
+    ] {
+        assert!(!warns(quiet).contains("isolated network"), "{quiet}");
+    }
+}
+
+/// A port nothing is listening on, taken by binding one and letting it
+/// go. Nothing else here binds it in between, and a port that turns out
+/// to be taken fails the test rather than passing quietly.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Whether this host can reach the public internet at all, so a sandbox
+/// that cannot is a finding rather than the weather.
+fn host_is_online() -> bool {
+    let addr = "1.1.1.1:443".parse().unwrap();
+    let ok = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(3)).is_ok();
+    if !ok {
+        eprintln!("skipping: this host cannot reach 1.1.1.1:443");
+    }
+    ok
+}
+
+/// A python snippet run inside instance `name`, as its whole output.
+fn in_sandbox(root: &std::path::Path, init: &std::path::Path, name: &str, py: &str) -> String {
+    let out = bubbler_live(root, init)
+        .args(["run", name, "--", PYTHON, "-c", py])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Connect to `127.0.0.1:<port>` and print what came back, or why not.
+const PROBE: &str = "\
+import socket, sys
+try:
+    s = socket.create_connection(('127.0.0.1', int(sys.argv[1])), 3)
+    print(s.recv(64).decode().strip())
+except OSError as e:
+    print('BLOCKED', type(e).__name__)
+";
+
+#[test]
+fn real_pasta_hides_the_host_loopback_that_network_host_still_reaches() {
+    if !require_bwrap() || !require_python() || !require_pasta() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let port = free_port();
+    // A host service on loopback, exactly what `--share-net` hands over.
+    let mut server = Command::new(PYTHON)
+        .args([
+            "-c",
+            "import socket,sys\n\
+             s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n\
+             s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen(8)\n\
+             while True:\n c,_=s.accept(); c.sendall(b'SECRET-HOST-SERVICE\\n'); c.close()\n",
+            &port.to_string(),
+        ])
+        .spawn()
+        .unwrap();
+    assert!(
+        wait_until(
+            || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(),
+            Duration::from_secs(5)
+        ),
+        "the host listener never came up"
+    );
+
+    for (kdl, expected) in [
+        ("network \"host\"\n", "SECRET-HOST-SERVICE"),
+        ("network\n", "BLOCKED"),
+    ] {
+        let name = if kdl.contains("host") { "h" } else { "i" };
+        bubbler_live(tmp.path(), &init)
+            .args(["create", name])
+            .status()
+            .unwrap();
+        std::fs::write(
+            tmp.path()
+                .join(format!("data/bubbler/instances/{name}/config.kdl")),
+            kdl,
+        )
+        .unwrap();
+        let out = bubbler_live(tmp.path(), &init)
+            .args(["run", name, "--", PYTHON, "-c", PROBE, &port.to_string()])
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{kdl}: {err}");
+        let got = String::from_utf8_lossy(&out.stdout);
+        assert!(got.starts_with(expected), "{kdl}: got {got:?} ({err})");
+    }
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
+#[test]
+fn real_pasta_reaches_the_internet_and_carries_the_generated_resolver() {
+    if !require_bwrap() || !require_python() || !require_pasta() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+
+    // The generated resolver: the address pasta translates to the host's
+    // nameserver, since the host's own file may name a loopback stub.
+    std::fs::write(&cfg, "network\n").unwrap();
+    let out = in_sandbox(
+        tmp.path(),
+        &init,
+        "t",
+        "print(open('/etc/resolv.conf').read().strip())",
+    );
+    assert_eq!(out.trim(), "nameserver 169.254.1.1");
+
+    // A `dns` child replaces it outright.
+    std::fs::write(&cfg, "network {\n    dns \"1.1.1.1\"\n}\n").unwrap();
+    let out = in_sandbox(
+        tmp.path(),
+        &init,
+        "t",
+        "print(open('/etc/resolv.conf').read().strip())",
+    );
+    assert_eq!(out.trim(), "nameserver 1.1.1.1");
+
+    if !host_is_online() {
+        return;
+    }
+    std::fs::write(&cfg, "network\n").unwrap();
+    let out = in_sandbox(
+        tmp.path(),
+        &init,
+        "t",
+        "import socket\n\
+         try:\n socket.create_connection(('1.1.1.1', 443), 8); print('ONLINE')\n\
+         except OSError as e: print('OFFLINE', e)\n",
+    );
+    assert_eq!(out.trim(), "ONLINE");
+}
+
+#[test]
+fn real_pasta_allow_port_publishes_one_port_on_the_host_loopback() {
+    if !require_bwrap() || !require_python() || !require_pasta() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let port = free_port();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/t/config.kdl"),
+        format!("network {{\n    allow-port {port}\n}}\n"),
+    )
+    .unwrap();
+    // Bound to every address in the namespace: without
+    // `--host-lo-to-ns-lo` pasta delivers a forwarded connection to the
+    // namespace's own public address, not to its loopback.
+    let mut run = bubbler_live(tmp.path(), &init)
+        .args([
+            "run",
+            "t",
+            "--",
+            PYTHON,
+            "-c",
+            "import socket,sys\n\
+             s=socket.socket(); s.bind(('0.0.0.0', int(sys.argv[1]))); s.listen(4)\n\
+             c,_=s.accept(); c.sendall(b'FROM-THE-SANDBOX\\n'); c.close()\n",
+            &port.to_string(),
+        ])
+        .spawn()
+        .unwrap();
+    let mut got = String::new();
+    let reached = wait_until(
+        || {
+            let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+                return false;
+            };
+            use std::io::Read;
+            let _ = s.read_to_string(&mut got);
+            !got.is_empty()
+        },
+        Duration::from_secs(15),
+    );
+    let _ = run.kill();
+    let _ = run.wait();
+    assert!(reached, "the forwarded port was never reachable");
+    assert_eq!(got.trim(), "FROM-THE-SANDBOX");
+}
+
+#[test]
+fn real_pasta_keeps_serving_an_instance_that_is_exec_ed_into() {
+    if !require_bwrap() || !require_python() || !require_pasta() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/t/config.kdl"),
+        "network\n",
+    )
+    .unwrap();
+    let mut run = bubbler_live(tmp.path(), &init)
+        .args(["run", "t", "--", "/usr/bin/sleep", "30"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let sock = tmp.path().join("run/bubbler/t/init.sock");
+    if !wait_until(
+        || UnixStream::connect(&sock).is_ok(),
+        Duration::from_secs(10),
+    ) {
+        fail_with(run, "the isolated instance never accepted a connection");
+    }
+    let out = bubbler_live(tmp.path(), &init)
+        .args([
+            "exec",
+            "t",
+            "--",
+            PYTHON,
+            "-c",
+            "print(open('/etc/resolv.conf').read().strip())",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "nameserver 169.254.1.1"
+    );
+    kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
+    let _ = run.wait();
+}
+
+#[test]
+fn edit_warns_about_the_flip_before_it_stamps_the_version() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "network\ncommand \"true\"\n").unwrap();
+    let edit = || {
+        let out = bubbler(tmp.path())
+            .env("EDITOR", "/usr/bin/true")
+            .args(["edit", "t"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    // The edit that stamps the file is the one that still says why.
+    assert!(edit().contains("isolated network namespace"));
+    assert_eq!(
+        std::fs::read_to_string(&cfg).unwrap(),
+        "// bubbler config: 2\nnetwork\ncommand \"true\"\n"
+    );
+    // And having been stamped, it is the last time.
+    assert!(!edit().contains("isolated network namespace"));
 }

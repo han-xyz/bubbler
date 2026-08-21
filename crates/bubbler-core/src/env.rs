@@ -79,6 +79,10 @@ pub struct Env {
     /// be a regular file and is bound into the proxy sandbox at its own
     /// path.
     pub proxy_override: Option<PathBuf>,
+    /// `$BUBBLER_PASTA`: host path of the pasta binary to run instead of
+    /// the one on `PATH`, for an isolated `network`. A test and debugging
+    /// hook, like `$BUBBLER_DBUS_PROXY`; nothing shipped sets it.
+    pub pasta_override: Option<PathBuf>,
 }
 
 #[cfg(test)]

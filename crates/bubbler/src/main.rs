@@ -412,6 +412,14 @@ fn warn_lint(result: Result<lint::Report, bubbler_core::error::LintError>) {
     }
 }
 
+/// What a config written before the current version has to say about
+/// itself, on stderr and before the run it applies to.
+fn warn_migration(inst: &Instance) {
+    if let Some(text) = inst.migration_warning() {
+        eprintln!("bubbler: warning: {text}");
+    }
+}
+
 fn real_main() -> Result<i32> {
     // Before anything else opens a descriptor.
     host_env::fill_closed_stdio()?;
@@ -445,6 +453,10 @@ fn real_main() -> Result<i32> {
                     instance::config_path(&env, &name).display()
                 )
             })?;
+            // Before the dry run and the explanation too: both describe
+            // the sandbox this config asks for, and what it asks for is
+            // exactly what changed meaning.
+            warn_migration(&inst);
             let command = (!command.is_empty()).then_some(command.as_slice());
             let mode = tty.unwrap_or(inst.config.tty);
             // A dry run and an explanation both describe a fresh start
@@ -561,10 +573,14 @@ fn real_main() -> Result<i32> {
             instance::config_path_checked(&env, &name)
                 .with_context(|| format!("opening instance `{name}`"))?;
             // Which is also why a config that does not parse only costs
-            // the terminal mode its default here, rather than the exec.
-            let mode = tty.unwrap_or_else(|| {
-                Instance::open(&env, &name).map_or_else(|_| TtyMode::default(), |i| i.config.tty)
-            });
+            // the terminal mode its default, and its warning, here rather
+            // than the exec.
+            let opened = Instance::open(&env, &name).ok();
+            if let Some(inst) = &opened {
+                warn_migration(inst);
+            }
+            let mode =
+                tty.unwrap_or_else(|| opened.map_or_else(TtyMode::default, |i| i.config.tty));
             launcher::exec(&env, &name, &command, mode)
                 .with_context(|| format!("executing in instance `{name}`"))
         }
@@ -607,7 +623,21 @@ fn real_main() -> Result<i32> {
             if let Some(code) = run_editor(&program, &args, &path)? {
                 return Ok(code);
             }
-            let code = recheck(&path, Instance::open(&env, &name));
+            let opened = Instance::open(&env, &name);
+            // Before the header is written, never after: stamping the
+            // file is what stops the warning, and a warning the user
+            // never saw would be one the edit quietly erased.
+            if let Ok(inst) = &opened {
+                warn_migration(inst);
+            }
+            let code = recheck(&path, opened);
+            // A file the user has just read through is a file whose
+            // grants mean what this bubbler says they mean, so the
+            // version header goes in and the warning above is the last.
+            if code == 0 {
+                Instance::mark_version(&env, &name)
+                    .with_context(|| format!("recording the config version of `{name}`"))?;
+            }
             // A config edited by hand is the likeliest place for an `x11`
             // or a share of `.ssh`, so it is linted like a profile is.
             if code == 0 {

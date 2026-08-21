@@ -623,6 +623,32 @@ impl Merged {
                     return Ok(());
                 }
             }
+            Service::Network(cfg) => {
+                if let Some((held, held_src)) =
+                    self.services.iter_mut().find_map(|(s, src)| match s {
+                        Service::Network(held) => Some((held, src)),
+                        _ => None,
+                    })
+                {
+                    // The mode is one choice and the including layer makes
+                    // it; the children are grants of their own, so they add
+                    // up rather than being replaced wholesale.
+                    held.mode = cfg.mode;
+                    for ip in &cfg.dns {
+                        if !held.dns.contains(ip) {
+                            held.dns.push(*ip);
+                        }
+                    }
+                    for f in &cfg.forwards {
+                        if !held.forwards.contains(f) {
+                            held.forwards.push(*f);
+                        }
+                    }
+                    held.no_ipv6 |= cfg.no_ipv6;
+                    *held_src = src.clone();
+                    return Ok(());
+                }
+            }
             Service::Gamepad { hidraw, uinput } => {
                 if let Some((held_hidraw, held_uinput, held_src)) =
                     self.services.iter_mut().find_map(|(s, src)| match s {
@@ -681,7 +707,6 @@ impl Merged {
             }
             Service::Wayland
             | Service::X11
-            | Service::Network
             | Service::Dri
             | Service::Pipewire
             | Service::Pulseaudio
@@ -859,7 +884,7 @@ fn mode_conflict(node: &str, a: ShareMode, a_src: &Src, b: ShareMode, b_src: &Sr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::BusRule;
+    use crate::config::{BusRule, NetworkConfig};
 
     fn env(root: &Path) -> Env {
         Env {
@@ -881,6 +906,7 @@ mod tests {
             test_allow_path: None,
             profile_dir_override: Some(root.join("system")),
             proxy_override: None,
+            pasta_override: None,
         }
     }
 
@@ -1053,7 +1079,10 @@ mod tests {
         // A database needs no network, no HID device and no session-wide
         // secrets name; each of the three is a comment in the profile
         // rather than a grant, and each would be a real widening.
-        assert!(!kp.services.contains(&Service::Network));
+        assert!(
+            !kp.services
+                .contains(&Service::Network(NetworkConfig::default()))
+        );
         assert!(!kp.services.contains(&Service::Hidraw));
         assert!(
             !kp.services.iter().any(|s| matches!(
@@ -1076,7 +1105,7 @@ mod tests {
         for s in [
             Service::Wayland,
             Service::Dri,
-            Service::Network,
+            Service::Network(NetworkConfig::default()),
             Service::Portals,
             Service::Notify,
         ] {
@@ -1182,7 +1211,7 @@ mod tests {
         );
         assert_eq!(
             r.resolve("firefox").unwrap().config.services,
-            vec![Service::Network]
+            vec![Service::Network(NetworkConfig::default())]
         );
         assert_eq!(
             r.resolve("only-system").unwrap().config.services,
@@ -1250,7 +1279,10 @@ mod tests {
         let resolved = r.resolve("firefox").unwrap();
         let cfg = &resolved.config;
         assert!(cfg.services.contains(&Service::Wayland));
-        assert!(cfg.services.contains(&Service::Network));
+        assert!(
+            cfg.services
+                .contains(&Service::Network(NetworkConfig::default()))
+        );
         // The including layer overrides by key, and says so.
         assert_eq!(
             cfg.env,
@@ -1279,6 +1311,88 @@ mod tests {
         assert!(err.to_string().contains("has no layer below"), "{err}");
     }
 
+    /// The mode is one choice and the including layer makes it; the
+    /// children are grants of their own and add up.
+    #[test]
+    fn network_takes_its_mode_from_the_including_layer_and_unions_the_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(
+            tmp.path(),
+            &[
+                (
+                    "base",
+                    "network {\n    dns \"1.1.1.1\"\n    allow-port 80\n}\n",
+                ),
+                (
+                    "app",
+                    "include \"base\"\nnetwork {\n    dns \"9.9.9.9\"\n    \
+                     allow-port 80\n    allow-port 443\n    no-ipv6\n}\n",
+                ),
+            ],
+            &[],
+        );
+        let cfg = r.resolve("app").unwrap().config;
+        let [Service::Network(net)] = cfg.services.as_slice() else {
+            panic!("{:?}", cfg.services)
+        };
+        assert_eq!(net.mode, crate::network::Mode::Isolated);
+        assert_eq!(
+            net.dns,
+            vec![
+                std::net::IpAddr::from([1, 1, 1, 1]),
+                std::net::IpAddr::from([9, 9, 9, 9])
+            ]
+        );
+        assert_eq!(
+            net.forwards
+                .iter()
+                .map(|f| (f.port, f.udp))
+                .collect::<Vec<_>>(),
+            vec![(80, false), (443, false)]
+        );
+        assert!(net.no_ipv6);
+    }
+
+    #[test]
+    fn an_including_layer_can_move_the_network_onto_the_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(
+            tmp.path(),
+            &[
+                ("base", "network {\n    dns \"1.1.1.1\"\n}\n"),
+                ("app", "include \"base\"\nnetwork \"host\"\n"),
+            ],
+            &[],
+        );
+        let resolved = r.resolve("app").unwrap();
+        let [Service::Network(net)] = resolved.config.services.as_slice() else {
+            panic!("{:?}", resolved.config.services)
+        };
+        assert_eq!(net.mode, crate::network::Mode::Host);
+        assert_eq!(net.dns, vec![std::net::IpAddr::from([1, 1, 1, 1])]);
+        assert_eq!(
+            resolved.text,
+            "network \"host\" {\n    dns \"1.1.1.1\"\n}\n"
+        );
+    }
+
+    /// A merge that would grant a forward into a namespace the mode does
+    /// not have is refused, rather than flattened into a config the
+    /// parser would then reject on the next read.
+    #[test]
+    fn a_forward_merged_onto_the_host_mode_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(
+            tmp.path(),
+            &[
+                ("base", "network {\n    allow-port 80\n}\n"),
+                ("app", "include \"base\"\nnetwork \"host\"\n"),
+            ],
+            &[],
+        );
+        assert!(matches!(r.resolve("app"), Err(ProfileError::Parse { .. })));
+    }
+
     #[test]
     fn includes_resolve_depth_first_before_the_including_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1292,7 +1406,10 @@ mod tests {
             &[],
         );
         let cfg = r.resolve("app").unwrap().config;
-        assert_eq!(cfg.services, vec![Service::Wayland, Service::Network]);
+        assert_eq!(
+            cfg.services,
+            vec![Service::Wayland, Service::Network(NetworkConfig::default())]
+        );
         assert_eq!(cfg.command.unwrap(), vec![OsString::from("app")]);
         assert_eq!(cfg.tty, TtyMode::None);
         // A layer without a `tty` node leaves the one below alone.
@@ -1420,7 +1537,7 @@ mod tests {
             cfg.services,
             vec![
                 Service::Wayland,
-                Service::Network,
+                Service::Network(NetworkConfig::default()),
                 Service::HomeShare {
                     path: "D".into(),
                     mode: ShareMode::ReadOnly
@@ -1680,7 +1797,11 @@ mod tests {
         let cfg = r.resolve("a").unwrap().config;
         assert_eq!(
             cfg.services,
-            vec![Service::Wayland, Service::Network, Service::Dri]
+            vec![
+                Service::Wayland,
+                Service::Network(NetworkConfig::default()),
+                Service::Dri
+            ]
         );
         // `base` merged under `b`, not again between `b` and `c`, where it
         // would have taken the command back.

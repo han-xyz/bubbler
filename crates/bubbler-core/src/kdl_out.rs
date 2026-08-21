@@ -6,6 +6,7 @@ use std::ffi::{OsStr, OsString};
 
 use crate::config::{BusRule, InstanceConfig, LintAllow, Service, ShareMode, Userns};
 use crate::error::ConfigError;
+use crate::network::{Mode as NetworkMode, NetworkConfig};
 use crate::seccomp::{Errno, SeccompConfig};
 use crate::tty::TtyMode;
 
@@ -54,7 +55,7 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
     Ok(match s {
         Service::Wayland => "wayland".to_owned(),
         Service::X11 => "x11".to_owned(),
-        Service::Network => "network".to_owned(),
+        Service::Network(cfg) => network(cfg),
         Service::Dri => "dri".to_owned(),
         Service::Pipewire => "pipewire".to_owned(),
         Service::Pulseaudio => "pulseaudio".to_owned(),
@@ -142,6 +143,39 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
             bus_block("system-bus", rules)
         }
     })
+}
+
+/// The `network` node: its mode where it is not the default, then one
+/// line per child.
+fn network(cfg: &NetworkConfig) -> String {
+    let mut node = String::from("network");
+    match cfg.mode {
+        // Isolated is what a bare node means, so it is never written out.
+        NetworkMode::Isolated => {}
+        NetworkMode::Host => node.push_str(" \"host\""),
+        NetworkMode::None => node.push_str(" \"none\""),
+    }
+    let mut kids: Vec<String> = cfg
+        .dns
+        .iter()
+        .map(|ip| format!("dns {}", quote(&ip.to_string())))
+        .collect();
+    for f in &cfg.forwards {
+        let udp = if f.udp { " udp=#true" } else { "" };
+        kids.push(format!("allow-port {}{udp}", f.port));
+    }
+    if cfg.no_ipv6 {
+        kids.push("no-ipv6".to_owned());
+    }
+    if kids.is_empty() {
+        return node;
+    }
+    node.push_str(" {\n");
+    for kid in kids {
+        node.push_str(&format!("    {kid}\n"));
+    }
+    node.push('}');
+    node
 }
 
 /// A bus node with its rule children, one per line.
@@ -268,6 +302,29 @@ mod tests {
         let rendered = render(&cfg).unwrap();
         let again = parse(&rendered).unwrap_or_else(|e| panic!("{rendered}: {e}"));
         assert_eq!(cfg, again, "rendered as:\n{rendered}");
+    }
+
+    /// Every shape the `network` node has: each mode, and the children
+    /// in every combination the parser accepts.
+    #[test]
+    fn every_network_shape_round_trips() {
+        for text in [
+            "network\n",
+            "network \"host\"\n",
+            "network \"none\"\n",
+            "network {\n    dns \"1.1.1.1\"\n}\n",
+            "network \"host\" {\n    dns \"1.1.1.1\"\n    dns \"9.9.9.9\"\n}\n",
+            "network \"none\" {\n    dns \"::1\"\n}\n",
+            "network {\n    allow-port 8080\n}\n",
+            "network {\n    allow-port 53 udp=#true\n}\n",
+            "network {\n    no-ipv6\n}\n",
+            "network {\n    dns \"1.1.1.1\"\n    allow-port 8080\n    \
+             allow-port 53 udp=#true\n    no-ipv6\n}\n",
+        ] {
+            round_trip(text);
+            // Canonical already: what the emitter writes is the input.
+            assert_eq!(render(&parse(text).unwrap()).unwrap(), text);
+        }
     }
 
     #[test]

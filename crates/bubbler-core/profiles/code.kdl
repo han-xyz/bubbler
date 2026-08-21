@@ -28,6 +28,13 @@
 //
 // A checkout outside the home is named explicitly, e.g.
 //     path-share "/kioxia/src" mode=rw
+//
+// `network` is the sandbox's own network namespace, so a dev server on
+// the host's own 127.0.0.1 is not reachable from the editor, and one the
+// editor starts is not reachable from a host browser. Add
+// `network { allow-port 3000 }` to publish a port of the sandbox on the
+// host's loopback — the server inside must listen on 0.0.0.0, not on its
+// own loopback — or write `network "host"` to share the host's stack.
 lint-allow "secrets-access" reason="extensions keep their tokens in the Secret Storage API, which is this bus name"
 wayland
 dri
