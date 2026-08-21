@@ -13,6 +13,11 @@
 // org.freedesktop.portal.Settings read is refused and it cannot follow
 // the desktop colour scheme (measured). It still starts either way.
 //
+// kitty logs `Could not move child process into a systemd scope` per child:
+// that is its StartTransientUnit call on org.freedesktop.systemd1, a name
+// the proxy does not carry. Harmless — the child runs anyway — and a `talk`
+// for it would let the sandbox start user units outside the sandbox.
+//
 // Never share kitty's remote-control socket out of the sandbox. `kitten @`
 // includes `launch`, so a reachable socket is command execution across
 // the boundary, in whichever direction it was shared.

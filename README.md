@@ -5,16 +5,18 @@ combining bubblejail's explicit instances and resource grants with a profile
 library in the spirit of firejail. bubbler itself is unprivileged; `bwrap`
 does the namespace work.
 
-Status: milestone 7 — a library of 14 profiles (`alacritty`, `chromium`,
+Status: milestone 8 — a library of 14 profiles (`alacritty`, `chromium`,
 `code`, `firefox`, `generic`, `keepassxc`, `kitty`, `libreoffice`, `lutris`,
 `mpv`, `spotify`, `steam`, `thunderbird`, `vesktop`) over GPU, sound, a private
-home, host paths through `path-share`, game controllers through `gamepad`, a
-filtered session and system bus with portals, notifications and `tray`, a
-terminal of their own and a seccomp denylist. Profiles come in three layers —
-yours, the system's, built-in — and compose with `include`. `bubbler lint`
-measures a profile or an instance config against what a sandbox is meant to
-give away, and `--dry-run --explain` puts every bwrap argument under the node
-that produced it. See "Known gaps" below.
+home, host paths through `path-share`, a runtime directory shared between
+sandboxes through `app-runtime`, game controllers through `gamepad`, a camera
+through the portal, a filtered session and system bus with portals,
+notifications and `tray`, a terminal of their own, a network namespace of their
+own through pasta and a seccomp filter that covers 32-bit binaries as well as
+64-bit. Profiles come in three layers — yours, the system's, built-in — and
+compose with `include`. `bubbler lint` measures a profile or an instance config
+against what a sandbox is meant to give away, and `--dry-run --explain` puts
+every bwrap argument under the node that produced it. See "Known gaps" below.
 
 ## Usage
 
@@ -125,14 +127,14 @@ file descriptor numbers are the ones a dry run prints.
 
     bwrap
 
-      baseline                                       132 arguments
+      baseline                                       138 arguments
         --unshare-all
         --die-with-parent
         --new-session
         --hostname bubbler
         --chdir /home/bubbler
         --info-fd 3  (pipe: bwrap reports the sandbox pid on it)
-        ... 123 more (--explain=full)
+        ... 129 more (--explain=full)
 
       portals                         config.kdl:11  7 arguments
         --block-fd 4  (pipe: the sandbox waits on it until bubbler lets it go)
@@ -165,7 +167,7 @@ file descriptor numbers are the ones a dry run prints.
       command                                        2 arguments
         -- firefox
 
-    224 arguments in 14 groups, 123 hidden (--explain=full); 8 D-Bus rules to the proxy (--proxy)
+    230 arguments in 14 groups, 129 hidden (--explain=full); 8 D-Bus rules to the proxy (--proxy)
 
 A group sits where the node's *first* argument is emitted and gathers every
 later one it contributed, whichever phase that came from: `network "host"` is
@@ -287,9 +289,9 @@ share whose width depends on which line came first; a share below another
 `etc-share` is confined to `/etc` the same way, and cannot name the account
 files (`passwd`, `group`, `shadow`, `gshadow` and their `-`/`+` variants),
 which the sandbox generates itself. `path-share` reaches outside the home and
-has rules of its own, under "Host paths"; `app-runtime` shares one directory
-under `$XDG_RUNTIME_DIR` and `network` has a section of its own below, as does
-`app-runtime`. `dri` binds `/dev/dri` read-write and exposes `/sys/dev/char`,
+has rules of its own, under "Host paths"; `app-runtime`, which shares one
+directory under `$XDG_RUNTIME_DIR`, and `network` each have a section of their
+own below. `dri` binds `/dev/dri` read-write and exposes `/sys/dev/char`,
 `/sys/devices/system/cpu`, every
 `/sys/devices/pci*` root and, where the host has it, `/sys/class/drm` (whose
 entries are relative symlinks into those roots, so it adds only `version`)
@@ -969,9 +971,7 @@ is deliberately a different code from "grants too much".
 
 **Errors** say the file will not do what it says: `bundle-without-dbus` (a
 `portals`/`notify`/`tray`/`mpris` bundle no layer gives a `dbus` to carry),
-`share-source-missing` (a `home-share`, `path-share` or `etc-share` source
-this host does not have, or has as something other than a directory or a
-regular file), `path-share-reserved` (a root bubbler never shares),
+`path-share-reserved` (a root bubbler never shares),
 `dup-name-policy` (one bus name given two policies by two layers),
 `own-on-system-bus`, `camera-without-portals` (a `camera` grant no layer gives
 a `portals` to carry, so the portal reads the sandbox as an ordinary process
@@ -990,7 +990,11 @@ and `.config`, `.local`, `.local/share` and `.cache` whole — a share of one
 application's own directory under those is what a profile is for),
 `path-share-mountpoint` (a whole mounted filesystem, `mode=rw`),
 `path-share-socket` (a socket, or the directory one sits in — a shared control
-socket is command execution across the boundary), `dbus-without-rules`,
+socket is command execution across the boundary), `share-source-missing` (a
+`home-share`, `path-share` or `etc-share` source this host does not have, or
+has as something other than a directory or a regular file — a profile is
+written for a host that has the directory, and the launcher refuses the run
+outright rather than skipping the bind), `dbus-without-rules`,
 `env-looks-secret` (an underscore-separated word of the name is `TOKEN`,
 `SECRET`, `PASSWORD`, `APIKEY`, `PAT` and the like, or the value starts
 `ghp_`/`sk-`/`AKIA` — whole words, so `TOKENIZERS_PARALLELISM` is not one),

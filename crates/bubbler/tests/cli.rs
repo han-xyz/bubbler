@@ -4531,6 +4531,19 @@ fn make_builtin_share_sources(root: &Path) {
 }
 
 #[test]
+fn a_built_in_share_this_host_does_not_have_is_a_warning_not_an_error() {
+    // A profile is written for a host that has the directory; this one
+    // need not. The run itself still refuses, so the lint says "this
+    // file grants more than it can here", not "this file is broken".
+    let tmp = setup();
+    let (code, out, err) = run(tmp.path(), &["profile", "lint", "--all"]);
+    assert_eq!(code, 1, "{out}{err}");
+    assert!(out.contains("warning[share-source-missing]"), "{out}");
+    assert!(!out.contains("error[share-source-missing]"), "{out}");
+    assert!(out.contains(", 0 errors, "), "{out}");
+}
+
+#[test]
 fn a_finding_never_stands_in_for_a_layer_that_does_not_parse() {
     let tmp = setup();
     // The share error is real and says nothing about `bluetooth`, so the

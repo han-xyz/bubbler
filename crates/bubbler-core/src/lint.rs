@@ -142,9 +142,13 @@ const SECRETS_ACCESS: Check = Check {
     id: "secrets-access",
     severity: Severity::Note,
 };
+// A warning, not an error: a profile is written for a host that has the
+// directory, and one that does not is a host the profile was not written
+// for. The launcher refuses the run outright, so nothing is skipped
+// quietly by the lint letting it through.
 const SHARE_SOURCE_MISSING: Check = Check {
     id: "share-source-missing",
-    severity: Severity::Error,
+    severity: Severity::Warning,
 };
 const SYSTEM_BUS_POLKIT_NAME: Check = Check {
     id: "system-bus-polkit-name",
@@ -1702,7 +1706,7 @@ mod tests {
     }
 
     #[test]
-    fn a_share_whose_source_is_not_on_this_host_is_an_error() {
+    fn a_share_whose_source_is_not_on_this_host_is_a_warning() {
         let (_, dir, _) = fake::types();
         let host = host()
             .with("/home/han/Downloads", dir)
@@ -1715,7 +1719,7 @@ mod tests {
             ] {
                 let report = lint(ctx, &[text]);
                 assert_eq!(ids(&report), ["share-source-missing"], "{text}");
-                assert_eq!(report.findings[0].severity, Severity::Error, "{text}");
+                assert_eq!(report.findings[0].severity, Severity::Warning, "{text}");
             }
             assert_eq!(
                 ids(&lint(
@@ -1728,7 +1732,7 @@ mod tests {
     }
 
     #[test]
-    fn a_share_source_that_is_not_a_directory_or_a_file_is_an_error() {
+    fn a_share_source_that_is_not_a_directory_or_a_file_is_a_warning() {
         let (file, dir, sock, fifo) = fake::every_type();
         let host = FakeHost::default()
             .with("/usr/bin/foot", file)
@@ -1745,6 +1749,7 @@ mod tests {
             ] {
                 let report = lint(ctx, &[text]);
                 assert_eq!(ids(&report), ["share-source-missing"], "{text}");
+                assert_eq!(report.findings[0].severity, Severity::Warning, "{text}");
                 assert!(
                     report.findings[0]
                         .message
