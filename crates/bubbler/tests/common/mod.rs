@@ -182,6 +182,19 @@ pub fn require_portal() -> bool {
     desktop
 }
 
+/// Returns false (after printing why) when tray calls cannot be tested
+/// here: no proxied session bus, or no running StatusNotifier watcher.
+pub fn require_tray() -> bool {
+    if !require_dbus() {
+        return false;
+    }
+    let watcher = bus_name_has_owner("org.kde.StatusNotifierWatcher");
+    if !watcher {
+        eprintln!("skipping: no org.kde.StatusNotifierWatcher on the session bus");
+    }
+    watcher
+}
+
 /// Returns false (after printing why) when a proxied session bus cannot
 /// be tested here: no bwrap, no `xdg-dbus-proxy` or `dbus-send`, or no
 /// session bus on the host.

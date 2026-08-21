@@ -810,12 +810,16 @@ mod tests {
         let r = resolver(tmp.path(), &[("firefox", "bogus\n")], &[]);
         let err = r.resolve("firefox").unwrap_err();
         let path = r.user_dir().join("firefox.kdl");
+        let ProfileError::Parse { origin, source } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(origin, &path.display().to_string());
+        // Never a fall-through to the built-in firefox, which parses. The
+        // reason is the chained cause, not part of this message.
         assert!(
-            matches!(&err, ProfileError::Parse { origin, .. } if origin == &path.display().to_string()),
-            "{err:?}"
+            source.to_string().contains("unknown node `bogus`"),
+            "{source}"
         );
-        // Never a fall-through to the built-in firefox, which parses.
-        assert!(err.to_string().contains("unknown node `bogus`"), "{err}");
     }
 
     #[test]

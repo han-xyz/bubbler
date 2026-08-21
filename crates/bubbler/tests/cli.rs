@@ -12,7 +12,7 @@ use bubbler_core::profile::NAMES;
 use bubbler_core::seccomp::{DEFAULT_ENOSYS, DEFAULT_EPERM, syscall_number};
 use common::{
     bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, kill_group, real_init, require_bwrap,
-    require_dbus, require_portal, require_python, test_pty,
+    require_dbus, require_portal, require_python, require_tray, test_pty,
 };
 use rustix::fs::{OFlags, fcntl_getfl};
 use rustix::process::{Pid, Signal, kill_process};
@@ -1150,6 +1150,40 @@ fn real_dbus_notify_reaches_the_notification_service() {
         "{}",
         String::from_utf8_lossy(&out.stdout)
     );
+}
+
+#[test]
+fn real_dbus_tray_reaches_the_status_notifier_watcher() {
+    if !require_tray() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let name = "bubbler-test-dbus-tray";
+    let _leftovers = dbus_instance(tmp.path(), &init, name, "dbus\ntray\ncommand \"true\"\n");
+
+    // A property read on the watcher's own object: the one call the
+    // single `--talk` rule has to carry, and it fails without it.
+    let out = bubbler_dbus(tmp.path(), &init)
+        .args([
+            "run",
+            name,
+            "--",
+            "/usr/bin/dbus-send",
+            "--session",
+            "--print-reply",
+            "--dest=org.kde.StatusNotifierWatcher",
+            "/StatusNotifierWatcher",
+            "org.freedesktop.DBus.Properties.Get",
+            "string:org.kde.StatusNotifierWatcher",
+            "string:RegisteredStatusNotifierItems",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(s.contains("variant"), "stdout: {s}stderr: {err}");
 }
 
 #[test]

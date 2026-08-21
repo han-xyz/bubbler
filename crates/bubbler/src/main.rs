@@ -38,7 +38,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create a new instance from a built-in profile.
+    /// Create a new instance from a profile (user, system or built-in layers).
     Create {
         /// Instance name: letters, digits, `.`, `_`, `-`; not `.`, `..`
         /// or a name starting with `-`.

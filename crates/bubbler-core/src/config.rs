@@ -218,6 +218,16 @@ fn parse_doc(text: &str, profile: bool) -> Result<RawProfile, ConfigError> {
             }
             "home-share" => {
                 let (path, mode) = parse_share(node, validate_relative)?;
+                // The path alone, not the path and the mode: nothing
+                // downstream chooses between two modes for one home path,
+                // so file order would decide how wide the share is.
+                if cfg
+                    .services
+                    .iter()
+                    .any(|s| matches!(s, Service::HomeShare { path: held, .. } if *held == path))
+                {
+                    return Err(ConfigError::Duplicate(name.to_owned()));
+                }
                 cfg.services.push(Service::HomeShare { path, mode });
             }
             "path-share" => {
@@ -1016,6 +1026,24 @@ command "b""#
             };
             assert_eq!(path.to_str().unwrap(), "a/b");
         }
+    }
+
+    #[test]
+    fn home_share_rejects_one_path_twice_whatever_the_modes() {
+        for text in [
+            "home-share \"D\"\nhome-share \"D\"",
+            "home-share \"D\"\nhome-share \"D\" mode=rw",
+            "home-share \"D\" mode=rw\nhome-share \"D\"",
+            "home-share \"D\"\nhome-share \"D/\"",
+        ] {
+            assert!(
+                matches!(parse(text), Err(ConfigError::Duplicate(n)) if n == "home-share"),
+                "{text}"
+            );
+        }
+        // A share below another is a different path, and the inner bind
+        // lands on top of the outer one rather than replacing it.
+        assert!(parse("home-share \"D\"\nhome-share \"D/sub\" mode=rw").is_ok());
     }
 
     #[test]

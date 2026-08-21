@@ -5,10 +5,13 @@ combining bubblejail's explicit instances and resource grants with a profile
 library in the spirit of firejail. bubbler itself is unprivileged; `bwrap`
 does the namespace work.
 
-Status: milestone 4 — a profile library (`alacritty`, `chromium`, `firefox`,
+Status: milestone 5 — a profile library (`alacritty`, `chromium`, `firefox`,
 `libreoffice`, `mpv`, `thunderbird` and `vesktop`, plus a partial `steam`)
-over GPU, sound, a private home, a filtered session bus, a terminal of their
-own and a seccomp denylist. See "Known gaps" below.
+over GPU, sound, a private home, host paths through `path-share`, game
+controllers through `gamepad`, a filtered session bus with portals,
+notifications and `tray`, a terminal of their own and a seccomp denylist.
+Profiles come in three layers — yours, the system's, built-in — and compose
+with `include`. See "Known gaps" below.
 
 ## Usage
 
@@ -133,7 +136,11 @@ Every source must exist and be of the expected type when the argv is built; a
 missing one is an error rather than a silently weaker sandbox. That covers
 `home-share` too, so the `firefox` profile needs a `~/Downloads`. A
 `home-share` source is resolved before it is bound and must stay inside your
-home directory: a symlink pointing elsewhere is refused, not followed.
+home directory: a symlink pointing elsewhere is refused, not followed. One
+home path may be shared once, whatever the modes, so `home-share "D"` beside
+`home-share "D" mode=rw` is an error rather than a share whose width depends
+on which line came first; a share below another (`"D"` and `"D/sub"`) names a
+different path and stays allowed.
 `etc-share` is confined to `/etc` the same way, and cannot name the account
 files (`passwd`, `group`, `shadow`, `gshadow` and their `-`/`+` variants),
 which the sandbox generates itself. `path-share` reaches outside the home and
@@ -345,6 +352,10 @@ It shows the flattening, not the file, so the comments a profile is written
 with are not in it: a profile that grants nothing — `generic` — is its header
 and nothing else, where `create` seeds the instance with commented examples
 to start from.
+
+A `dbus` or `seccomp` block is one node in the flattened result even when
+several layers wrote into it, so its `// from:` names the last layer that
+contributed to it, not every layer whose rules are in it.
 
 `profile edit` opens `$XDG_CONFIG_HOME/bubbler/profiles/<name>.kdl`, creating
 the directory if it is missing, under the same editor rules as `edit`. A name

@@ -53,7 +53,9 @@ pub enum ProfileError {
     #[error("include nesting deeper than {max}: {chain}", max = crate::profile::MAX_DEPTH, chain = .0.join(" -> "))]
     TooDeep(Vec<String>),
     /// One layer, or the flattened result, did not parse.
-    #[error("{origin}: {source}")]
+    // No `{source}` in the message: the cause is chained below, and
+    // printing it here too shows it twice.
+    #[error("{origin}")]
     Parse {
         /// The layer's path, or which built-in or flattened profile it was.
         origin: String,
