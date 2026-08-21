@@ -54,6 +54,19 @@ pub fn require_pasta() -> bool {
     ok
 }
 
+/// Returns false (after printing why) when the man pages cannot be
+/// checked here, because `groff` is not installed.
+pub fn require_groff() -> bool {
+    let ok = Command::new("groff")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !ok {
+        eprintln!("skipping: groff is not installed");
+    }
+    ok
+}
+
 /// The `bubbler-init` binary cargo builds next to the `bubbler` binary,
 /// if it is there. `cargo test --workspace` builds it as a workspace
 /// member; `cargo test -p bubbler` does not, so tests that need the real

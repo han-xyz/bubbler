@@ -9,6 +9,7 @@ description = "bubblewrap-based application sandbox with instances and resource 
 [dependencies]
 bubbler-core.workspace = true
 clap.workspace = true
+clap_mangen.workspace = true
 anyhow.workspace = true
 rustix.workspace = true
 

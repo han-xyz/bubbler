@@ -15,6 +15,7 @@ kdl = "6"
 thiserror = "2"
 rustix = { version = "1", features = ["fs", "process", "net", "pipe", "event", "pty", "termios"] }
 clap = { version = "4", features = ["derive"] }
+clap_mangen = "0.3"
 anyhow = "1"
 signal-hook = "0.3"
 libseccomp = "0.4"
