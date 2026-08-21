@@ -167,7 +167,7 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
                 // a wildcard would silently give it none.
                 Service::Wayland
                 | Service::X11
-                | Service::Network
+                | Service::Network { .. }
                 | Service::Dri
                 | Service::Pipewire
                 | Service::Pulseaudio
@@ -507,6 +507,7 @@ mod tests {
             test_allow_path: None,
             profile_dir_override: None,
             proxy_override: None,
+            pasta_override: None,
         }
     }
 

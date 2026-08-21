@@ -206,6 +206,12 @@ pub enum LaunchError {
     /// would have started without the bus socket it expects.
     #[error("the D-Bus proxy did not become ready")]
     ProxyNotReady,
+    /// The pasta sidecar could not be started or did not report that it
+    /// had configured the sandbox's network namespace. The sandbox is
+    /// stopped rather than let go: an isolated `network` that reached
+    /// nothing would look like a broken application.
+    #[error("connecting the sandbox network namespace: {0}")]
+    Network(String),
     /// Nothing listens on the instance's control socket.
     #[error("instance `{0}` is not running")]
     NotRunning(String),

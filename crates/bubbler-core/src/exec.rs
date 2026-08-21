@@ -307,6 +307,7 @@ mod tests {
             test_allow_path: None,
             profile_dir_override: None,
             proxy_override: None,
+            pasta_override: None,
         }
     }
 

@@ -102,6 +102,10 @@ const MPRIS_WILDCARD: Check = Check {
     id: "mpris-wildcard",
     severity: Severity::Warning,
 };
+const NETWORK_HOST: Check = Check {
+    id: "network-host",
+    severity: Severity::Note,
+};
 const OWN_ON_SYSTEM_BUS: Check = Check {
     id: "own-on-system-bus",
     severity: Severity::Error,
@@ -175,6 +179,7 @@ pub const CHECKS: &[Check] = &[
     HOME_SHARE_SENSITIVE,
     LINT_ALLOW_UNUSED,
     MPRIS_WILDCARD,
+    NETWORK_HOST,
     OWN_ON_SYSTEM_BUS,
     OWN_TOO_WIDE,
     OZONE_HINT_UNNECESSARY,
@@ -804,6 +809,16 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, f: &mut Findings) {
                     .to_owned(),
                 "leave the default `pty` unless the command has to share the caller's terminal",
             ),
+            "network" if arg(node) == Some("host") => f.push(
+                i,
+                node,
+                &NETWORK_HOST,
+                "`network \"host\"` puts the sandbox on the host's network stack: every \
+                 service on the host's loopback and every host abstract unix socket"
+                    .to_owned(),
+                "drop the argument for the sandbox's own network namespace, unless the app \
+                 needs the LAN or a service on the host's loopback",
+            ),
             "seccomp" if kids(node).any(|c| c.name().value() == "disable") => f.push(
                 i,
                 node,
@@ -1362,6 +1377,7 @@ mod tests {
             test_allow_path: None,
             profile_dir_override: None,
             proxy_override: None,
+            pasta_override: None,
         }
     }
 
@@ -1403,6 +1419,29 @@ mod tests {
     fn host() -> FakeHost {
         let (file, _, _) = fake::types();
         FakeHost::default().with("/usr/bin/foot", file)
+    }
+
+    /// Only the host namespace is a finding: the isolated default is
+    /// what the check exists to point back at.
+    #[test]
+    fn network_host_is_a_note_and_the_other_modes_are_not() {
+        with(&host(), |ctx| {
+            let report = lint(ctx, &["network \"host\""]);
+            assert_eq!(ids(&report), ["network-host"]);
+            assert_eq!(report.findings[0].severity, Severity::Note);
+            for clean in [
+                "network",
+                "network \"none\"",
+                "network {\n    dns \"1.1.1.1\"\n}",
+            ] {
+                assert_eq!(ids(&lint(ctx, &[clean])), [] as [&str; 0], "{clean}");
+            }
+            let allowed = lint(
+                ctx,
+                &["network \"host\"\nlint-allow \"network-host\" reason=\"LAN discovery\""],
+            );
+            assert_eq!(ids(&allowed), [] as [&str; 0]);
+        });
     }
 
     #[test]

@@ -41,6 +41,19 @@ pub fn require_python() -> bool {
     ok
 }
 
+/// Returns false (after printing why) when the real pasta sidecar cannot
+/// be started here, because the `passt` package is not installed.
+pub fn require_pasta() -> bool {
+    let ok = Command::new("pasta")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !ok {
+        eprintln!("skipping: pasta is not installed (package `passt`)");
+    }
+    ok
+}
+
 /// The `bubbler-init` binary cargo builds next to the `bubbler` binary,
 /// if it is there. `cargo test --workspace` builds it as a workspace
 /// member; `cargo test -p bubbler` does not, so tests that need the real

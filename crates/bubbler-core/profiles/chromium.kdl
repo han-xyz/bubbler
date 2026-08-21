@@ -4,6 +4,11 @@
 // grant the same id to `keepassxc` (it ships it already). Read-only
 // is enough: this side only connects to the socket KeePassXC serves.
 //   app-runtime "org.keepassxc.KeePassXC"
+//
+// `network` is the sandbox's own network namespace. Chromecast discovery
+// is mDNS on the LAN and pasta does not bridge, so casting does not find
+// anything; `network "host"` brings it back, together with every service
+// on the host's loopback.
 wayland
 dri
 pipewire

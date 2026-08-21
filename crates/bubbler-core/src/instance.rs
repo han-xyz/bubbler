@@ -10,7 +10,7 @@ use rustix::fs::Mode;
 use rustix::io::Errno;
 use rustix::process::{Pid, test_kill_process};
 
-use crate::config::{self, InstanceConfig, Service};
+use crate::config::{self, InstanceConfig, NetworkConfig, Service};
 use crate::env::Env;
 use crate::error::InstanceError;
 use crate::kdl_out;
@@ -18,6 +18,15 @@ use crate::profile::{self, PROFILE_HEADER};
 use crate::{dbus, exec, launcher};
 
 const CONFIG_FILE: &str = "config.kdl";
+
+/// Header line recording which meanings a `config.kdl` was written
+/// against. Second line of a seeded file, after the profile header.
+pub(crate) const CONFIG_HEADER: &str = "// bubbler config: ";
+
+/// The meanings this bubbler writes. Version 2 is where a bare `network`
+/// node became the sandbox's own network namespace; version 1 is every
+/// file written before that, which has no header at all.
+pub const CONFIG_VERSION: u32 = 2;
 
 /// Where `reseed` keeps the `config.kdl` it replaces.
 const BACKUP_FILE: &str = "config.kdl.bak";
@@ -86,6 +95,9 @@ pub struct Instance {
     pub dir: PathBuf,
     /// Parsed `config.kdl`.
     pub config: InstanceConfig,
+    /// Version its header records, or `None` for a file written before
+    /// there was one. [`Instance::migration_warning`] is what reads it.
+    pub config_version: Option<u32>,
 }
 
 /// Whether `name` is the shape [`Instance::ephemeral`] gives a throwaway
@@ -198,7 +210,7 @@ fn grant_service(name: &str) -> Option<Service> {
     Some(match name {
         "wayland" => Service::Wayland,
         "x11" => Service::X11,
-        "network" => Service::Network,
+        "network" => Service::Network(NetworkConfig::default()),
         "dri" => Service::Dri,
         "pipewire" => Service::Pipewire,
         "pulseaudio" => Service::Pulseaudio,
@@ -240,6 +252,12 @@ fn with_grants(cfg: &mut InstanceConfig, grants: &[&str]) -> Result<(), Instance
                 .services
                 .iter()
                 .any(|s| matches!(s, Service::Camera { .. })),
+            // The same for `network`, whose mode and children the bare
+            // grant does not carry.
+            Service::Network { .. } => cfg
+                .services
+                .iter()
+                .any(|s| matches!(s, Service::Network { .. })),
             other => cfg.services.contains(other),
         };
         if !held {
@@ -281,7 +299,7 @@ fn seed(
     };
     // The name passed the profile name grammar to resolve at all, so it
     // holds no newline that could end the header comment early.
-    let text = format!("{PROFILE_HEADER}{profile_name}\n{body}");
+    let text = format!("{PROFILE_HEADER}{profile_name}\n{CONFIG_HEADER}{CONFIG_VERSION}\n{body}");
     let config = config::parse(&text)?;
     Ok((text, config))
 }
@@ -296,6 +314,19 @@ fn profile_header(text: &str) -> Option<&str> {
         .strip_prefix(PROFILE_HEADER)?
         .trim_end();
     is_plain_name(name).then_some(name)
+}
+
+/// The version the header records, if the file has one. Only the leading
+/// comment block is read: a `// bubbler config:` line further down is
+/// part of somebody's notes, not a header.
+fn config_version(text: &str) -> Option<u32> {
+    text.lines()
+        .take_while(|l| {
+            let l = l.trim_start();
+            l.is_empty() || l.starts_with("//")
+        })
+        .find_map(|l| l.trim_start().strip_prefix(CONFIG_HEADER))
+        .and_then(|v| v.trim().parse().ok())
 }
 
 /// The pid a sweepable directory is named after: decimal digits only, so
@@ -431,6 +462,7 @@ impl Instance {
             name: name.to_owned(),
             dir,
             config,
+            config_version: Some(CONFIG_VERSION),
         })
     }
 
@@ -458,7 +490,12 @@ impl Instance {
         }
         make_dir(&dir, &name, &text)?;
         Ok(Ephemeral {
-            instance: Self { name, dir, config },
+            instance: Self {
+                name,
+                dir,
+                config,
+                config_version: Some(CONFIG_VERSION),
+            },
             keep: None,
             instances_root: instances_root(env),
             runtime,
@@ -483,6 +520,7 @@ impl Instance {
             name: name.to_owned(),
             dir,
             config,
+            config_version: config_version(&text),
         })
     }
 
@@ -559,6 +597,59 @@ impl Instance {
             name: name.to_owned(),
             dir,
             config,
+            config_version: Some(CONFIG_VERSION),
+        })
+    }
+
+    /// Record the current version in a config that does not already, by
+    /// replacing an older header or writing one after the profile header.
+    /// `true` when the file was changed. What it records is that the file
+    /// has been read against the current meanings, which is what
+    /// [`Instance::migration_warning`] stops warning about.
+    pub fn mark_version(env: &Env, name: &str) -> Result<bool, InstanceError> {
+        let cfg_path = config_path_checked(env, name)?;
+        let text = fs::read_to_string(&cfg_path).map_err(io_err(&cfg_path))?;
+        if config_version(&text).is_some_and(|v| v >= CONFIG_VERSION) {
+            return Ok(false);
+        }
+        let header = format!("{CONFIG_HEADER}{CONFIG_VERSION}");
+        let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        // An older header is replaced where it stands; without one the
+        // line goes under the profile header, or at the top.
+        match lines
+            .iter()
+            .position(|l| l.trim_start().starts_with(CONFIG_HEADER))
+        {
+            Some(i) => lines[i] = header,
+            None => {
+                let at = usize::from(lines.first().is_some_and(|l| l.starts_with(PROFILE_HEADER)));
+                lines.insert(at, header);
+            }
+        }
+        let mut marked = lines.join("\n");
+        marked.push('\n');
+        write_atomic(&cfg_path, &marked)?;
+        Ok(true)
+    }
+
+    /// What a run of this instance has to say about its config before it
+    /// starts, if anything: a file written before version 2 that still
+    /// holds a bare `network` node asks for a different sandbox now than
+    /// it did when it was written. A file recording any older version
+    /// counts the same as one recording none.
+    pub fn migration_warning(&self) -> Option<String> {
+        let bare = self
+            .config
+            .services
+            .iter()
+            .any(|s| matches!(s, Service::Network(c) if c.is_isolated()));
+        let old = self.config_version.is_none_or(|v| v < CONFIG_VERSION);
+        (old && bare).then(|| {
+            format!(
+                "`network` now means an isolated network namespace; run \
+                 `bubbler reseed {}` or write `network \"host\"` to keep the old behaviour",
+                self.name
+            )
         })
     }
 
@@ -592,6 +683,7 @@ mod tests {
             test_allow_path: None,
             profile_dir_override: Some(data_home.join("profiles")),
             proxy_override: None,
+            pasta_override: None,
         }
     }
 
@@ -721,6 +813,91 @@ mod tests {
         }
     }
 
+    /// The header a seeded file carries, and the warning a file written
+    /// before there was one earns: `network` grants a different sandbox
+    /// now than it did then, and only the bare node changed meaning.
+    #[test]
+    fn a_config_without_the_version_header_warns_about_a_bare_network() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = env(tmp.path());
+        let inst = Instance::create(&env, "e", "generic").unwrap();
+        assert_eq!(inst.config_version, Some(CONFIG_VERSION));
+        assert_eq!(inst.migration_warning(), None);
+
+        let cases = [
+            ("network\n", true),
+            ("network \"host\"\n", false),
+            ("network \"none\"\n", false),
+            ("wayland\n", false),
+            ("// bubbler config: 2\nnetwork\n", false),
+            (
+                "// bubbler profile: generic\n// bubbler config: 2\nnetwork\n",
+                false,
+            ),
+        ];
+        for (text, warns) in cases {
+            std::fs::write(inst.config_path(), text).unwrap();
+            let opened = Instance::open(&env, "e").unwrap();
+            let warning = opened.migration_warning();
+            assert_eq!(warning.is_some(), warns, "{text:?}");
+            if let Some(w) = warning {
+                assert!(w.contains("isolated network namespace"), "{w}");
+                assert!(w.contains("bubbler reseed e"), "{w}");
+                assert!(w.contains("network \"host\""), "{w}");
+            }
+        }
+        // A header recording an older version is as old as none at all.
+        std::fs::write(inst.config_path(), "// bubbler config: 1\nnetwork\n").unwrap();
+        let old = Instance::open(&env, "e").unwrap();
+        assert_eq!(old.config_version, Some(1));
+        assert!(old.migration_warning().is_some());
+
+        // A header further down is somebody's notes, not a header.
+        std::fs::write(inst.config_path(), "network\n// bubbler config: 2\n").unwrap();
+        assert!(
+            Instance::open(&env, "e")
+                .unwrap()
+                .migration_warning()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn marking_the_version_writes_one_header_under_the_profile_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = env(tmp.path());
+        let inst = Instance::create(&env, "e", "generic").unwrap();
+        std::fs::write(inst.config_path(), "// bubbler profile: generic\nnetwork\n").unwrap();
+        assert!(Instance::mark_version(&env, "e").unwrap());
+        assert_eq!(
+            std::fs::read_to_string(inst.config_path()).unwrap(),
+            "// bubbler profile: generic\n// bubbler config: 2\nnetwork\n"
+        );
+        // Idempotent: a file that already records a version is left alone.
+        assert!(!Instance::mark_version(&env, "e").unwrap());
+        assert_eq!(Instance::open(&env, "e").unwrap().migration_warning(), None);
+
+        // Without a profile header the version goes to the top.
+        std::fs::write(inst.config_path(), "network\n").unwrap();
+        assert!(Instance::mark_version(&env, "e").unwrap());
+        assert_eq!(
+            std::fs::read_to_string(inst.config_path()).unwrap(),
+            "// bubbler config: 2\nnetwork\n"
+        );
+
+        // An older header is replaced where it stands, never doubled.
+        std::fs::write(
+            inst.config_path(),
+            "// bubbler profile: generic\n// bubbler config: 1\nnetwork\n",
+        )
+        .unwrap();
+        assert!(Instance::mark_version(&env, "e").unwrap());
+        assert_eq!(
+            std::fs::read_to_string(inst.config_path()).unwrap(),
+            "// bubbler profile: generic\n// bubbler config: 2\nnetwork\n"
+        );
+    }
+
     #[test]
     fn open_reads_edited_config() {
         let tmp = tempfile::tempdir().unwrap();
@@ -728,7 +905,10 @@ mod tests {
         let inst = Instance::create(&env, "e", "generic").unwrap();
         std::fs::write(inst.config_path(), "network\ncommand \"true\"\n").unwrap();
         let inst = Instance::open(&env, "e").unwrap();
-        assert_eq!(inst.config.services, vec![Service::Network]);
+        assert_eq!(
+            inst.config.services,
+            vec![Service::Network(NetworkConfig::default())]
+        );
         assert!(Instance::open(&env, "e").is_ok());
         std::fs::write(inst.config_path(), "bogus\n").unwrap();
         assert!(matches!(
@@ -801,7 +981,10 @@ mod tests {
             let eph = Instance::ephemeral(&env, "generic", &["network"]).unwrap();
             assert_eq!(eph.instance.name, format!("try-{pid}"));
             assert_eq!(eph.instance.dir, try_root(&env).join(pid.to_string()));
-            assert_eq!(eph.instance.config.services, vec![Service::Network]);
+            assert_eq!(
+                eph.instance.config.services,
+                vec![Service::Network(NetworkConfig::default())]
+            );
             let mode = fs::metadata(eph.instance.home())
                 .unwrap()
                 .permissions()
@@ -856,7 +1039,7 @@ mod tests {
         assert!(err.to_string().contains("wayland"), "{err}");
         let eph = Instance::ephemeral(&env, "firefox", &["dri", "dri", "network"]).unwrap();
         let services = &eph.instance.config.services;
-        assert!(services.contains(&Service::Network));
+        assert!(services.contains(&Service::Network(NetworkConfig::default())));
         assert_eq!(services.iter().filter(|s| **s == Service::Dri).count(), 1);
         drop(eph);
         let eph = Instance::ephemeral(&env, "generic", &["gamepad", "dbus", "tray"]).unwrap();
@@ -1089,10 +1272,15 @@ mod tests {
 
         user_profile(&env, "app", "wayland\nnetwork\n");
         let after = Instance::reseed(&env, "a").unwrap();
-        assert!(after.config.services.contains(&Service::Network));
+        assert!(
+            after
+                .config
+                .services
+                .contains(&Service::Network(NetworkConfig::default()))
+        );
         assert_eq!(
             fs::read_to_string(after.config_path()).unwrap(),
-            "// bubbler profile: app\nwayland\nnetwork\n"
+            "// bubbler profile: app\n// bubbler config: 2\nwayland\nnetwork\n"
         );
         assert_eq!(
             fs::read_to_string(after.dir.join(BACKUP_FILE)).unwrap(),

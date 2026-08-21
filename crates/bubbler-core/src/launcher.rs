@@ -1,5 +1,7 @@
-//! Spawns bubblewrap. The only process-spawning code in the crate; it
-//! never goes through a shell.
+//! Spawns bubblewrap and the sidecars a sandbox needs — the filtering
+//! D-Bus proxy and, for an isolated `network`, pasta. The only
+//! process-spawning code in the crate; it never goes through a shell, and
+//! every sidecar is killed on every way out of a run.
 
 use std::ffi::OsString;
 use std::io::{self, Seek, SeekFrom, Write};
@@ -20,13 +22,13 @@ use signal_hook::SigId;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 
 use crate::bwrap::{BwrapArgs, Explained, FdAllocator, Origin};
-use crate::config::{Service, Userns};
+use crate::config::{NetworkConfig, Service, Userns};
 use crate::env::Env;
 use crate::error::{ConfigError, LaunchError};
 use crate::host::{Host, RealHost};
 use crate::instance::Instance;
 use crate::tty::{self, Pty, RawGuard, RelayEnd, StdioTarget, TtyMode};
-use crate::{dbus, exec, init_bin, seccomp, service};
+use crate::{dbus, exec, init_bin, network, seccomp, service};
 
 /// How often a running sandbox is checked for having exited.
 const POLL: Duration = Duration::from_millis(100);
@@ -41,6 +43,13 @@ const PROXY_READY: Duration = Duration::from_secs(5);
 /// How long a proxy may take to leave after its ready pipe is closed
 /// before it is killed.
 const PROXY_STOP: Duration = Duration::from_secs(1);
+
+/// How long pasta has to report that it has configured the sandbox's
+/// network namespace.
+const PASTA_READY: Duration = Duration::from_secs(5);
+
+/// How long pasta may take to leave after SIGTERM before it is killed.
+const PASTA_STOP: Duration = Duration::from_secs(1);
 
 /// How long the supervisor has to appear inside the sandbox before the
 /// run goes on without a pid to signal.
@@ -190,6 +199,14 @@ impl FdAllocator for RealAlloc {
     }
 }
 
+/// The `network` grant of a config, if it has one.
+fn network_of(services: &[Service]) -> Option<&NetworkConfig> {
+    services.iter().find_map(|s| match s {
+        Service::Network(cfg) => Some(cfg),
+        _ => None,
+    })
+}
+
 /// The command to run: the CLI's if it gave one, else the config's.
 pub fn resolve_command<'a>(
     inst: &'a Instance,
@@ -283,17 +300,28 @@ fn build_args_on<'a>(
     if ctty {
         args.ctty();
     }
-    // A portal call is answered by the identity bubbler publishes from
-    // bwrap's own info document, so the app waits until that file is there.
-    // The plan asks for portals only where a `portals` node granted them,
-    // which is the node the wait belongs to.
-    if let Some(i) = inst
-        .config
-        .services
-        .iter()
-        .position(|s| *s == Service::Portals)
-        && plan.as_ref().is_some_and(|p| p.portals)
-    {
+    // Two grants make the sandbox wait at startup, and each is tagged
+    // with the node that asked for it. A portal call is answered by the
+    // identity bubbler publishes from bwrap's own info document, so the
+    // app waits until that file is there; an isolated `network` waits
+    // until pasta has configured the namespace, which cannot happen
+    // before bwrap has reported the pid to attach to.
+    let waits = [
+        inst.config
+            .services
+            .iter()
+            .position(|s| *s == Service::Portals)
+            .filter(|_| plan.as_ref().is_some_and(|p| p.portals)),
+        inst.config
+            .services
+            .iter()
+            .position(|s| matches!(s, Service::Network(c) if c.is_isolated())),
+    ];
+    // One `--block-fd`, whichever grants asked for it: bwrap reads the fd
+    // once, and a second flag would leave the sandbox waiting for a pipe
+    // nothing closes. The portal grant is the one named where a config
+    // holds both, so an explanation of a portal sandbox reads as before.
+    if let Some(i) = waits.into_iter().flatten().next() {
         args.tag(Origin::Service(i));
         args.block_until_released();
     }
@@ -567,6 +595,119 @@ pub fn start_proxy(
         .ok_or_else(|| LaunchError::Data(io::Error::other("no ready pipe was allocated")))?;
     if !wait_ready(ready, child, Instant::now() + PROXY_READY) {
         return Err(LaunchError::ProxyNotReady);
+    }
+    Ok(handle)
+}
+
+/// Stop a sandbox that must not run after all, before the pipe it waits
+/// on is closed by the failing run unwinding.
+///
+/// The sandbox process is killed by pid and not only through bwrap:
+/// killing bwrap leaves its child where it is, and closing the block pipe
+/// on the way out would then let it exec. It is pid 1 of its own pid
+/// namespace and ignores signals it has no handler for, but SIGKILL from
+/// an ancestor namespace is not among those (`pid_namespaces(7)`).
+fn abort_sandbox(child: &mut Child, sandbox: Option<i32>) {
+    if let Some(pid) = sandbox.and_then(Pid::from_raw) {
+        let _ = kill_process(pid, Signal::KILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A running pasta sidecar: the sandbox's network namespace is connected
+/// to the outside for exactly as long as this handle is alive.
+#[derive(Debug)]
+struct PastaHandle {
+    child: Child,
+}
+
+impl Drop for PastaHandle {
+    /// Stop pasta, and do not return until it is gone. pasta exits by
+    /// itself when the namespace it serves does (`pasta(1)`, and bubbler
+    /// does not pass `--no-netns-quit`), but a sidecar with a route out of
+    /// the host must not be left to a condition bubbler does not control.
+    fn drop(&mut self) {
+        if let Some(pid) = i32::try_from(self.child.id()).ok().and_then(Pid::from_raw) {
+            let _ = kill_process(pid, Signal::TERM);
+        }
+        let deadline = Instant::now() + PASTA_STOP;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => {}
+            }
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                break;
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+}
+
+/// Start pasta on the sandbox's network namespace and wait until it has
+/// configured it. `child_pid` is the `child-pid` bwrap reported, and the
+/// sandbox must still be held at its `--block-fd`: until this returns the
+/// namespace has no route out at all.
+///
+/// pasta is handed two paths into bubbler's own descriptors rather than
+/// paths of its own to open. It makes itself non-dumpable while it starts
+/// (`pasta(1)`, self-isolation), and a non-dumpable process cannot open
+/// `/proc/self/fd/...`, so the paths name bubbler's process — which is
+/// why both descriptors have to stay open across the spawn.
+fn start_pasta(env: &Env, cfg: &NetworkConfig, child_pid: i32) -> Result<PastaHandle, LaunchError> {
+    // Opened here and not left to pasta: bwrap moves the sandbox into a
+    // nested user namespace shortly after reporting `child-pid`, and only
+    // the outer one owns the network namespace. Measured on bwrap 0.11.2:
+    // resolving the path this late works 3 times in 8, opening it now
+    // works 20 times in 20.
+    let ns_path = PathBuf::from(format!("/proc/{child_pid}/ns/user"));
+    let userns = rustix::fs::open(&ns_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+        .map_err(|e| LaunchError::Io(ns_path, e.into()))?;
+    let (ready, done) = rustix::pipe::pipe().map_err(|e| LaunchError::Data(e.into()))?;
+    for fd in [&ready, &done] {
+        fcntl_setfd(fd, FdFlags::CLOEXEC).map_err(|e| LaunchError::Data(e.into()))?;
+    }
+    let me = std::process::id();
+    let argv = network::pasta_argv(
+        cfg,
+        network::Attach {
+            userns: &OsString::from(format!("/proc/{me}/fd/{}", userns.as_raw_fd())),
+            ready: &OsString::from(format!("/proc/{me}/fd/{}", done.as_raw_fd())),
+            child: &OsString::from(child_pid.to_string()),
+        },
+    );
+    // pasta's own messages go where bubbler's do, never to the caller's
+    // stdout: that is the argv audit trail.
+    let log = io::stderr()
+        .as_fd()
+        .try_clone_to_owned()
+        .map_err(LaunchError::Data)?;
+    let child = Command::new(network::program(env))
+        .args(&argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => LaunchError::BadValue {
+                service: "network",
+                reason: format!(
+                    "`{}` is not on PATH; install the `passt` package, or write \
+                     `network \"host\"` to use the host network namespace",
+                    network::PASTA_BIN
+                ),
+            },
+            _ => LaunchError::Spawn(e),
+        })?;
+    // From here on every exit path stops pasta through the handle.
+    let mut handle = PastaHandle { child };
+    if !wait_ready(&ready, &mut handle.child, Instant::now() + PASTA_READY) {
+        return Err(LaunchError::Network(
+            "pasta did not configure the namespace".to_owned(),
+        ));
     }
     Ok(handle)
 }
@@ -1218,6 +1359,7 @@ pub fn run(
     // to bind: a missing bind source is a failed start, not a warning.
     let plan = dbus::plan(&inst.config.services, &inst.name);
     let portals = plan.as_ref().is_some_and(|p| p.portals);
+    let isolated = network_of(&inst.config.services).filter(|c| c.is_isolated());
     let _proxy = match &plan {
         Some(plan) => Some(start_proxy(env, &dir, plan, &RealHost)?),
         None => None,
@@ -1305,17 +1447,38 @@ pub fn run(
         .info_read
         .as_ref()
         .and_then(|fd| read_sandbox_info(fd, &mut child, deadline));
-    // Before the supervisor is looked for: a sandbox held at `--block-fd`
-    // has not forked it yet, so there would be nothing to find.
-    let _identity = if portals {
-        let published = publish_identity(env, &inst.name, info.as_ref().map(|(_, raw)| &raw[..]));
-        // However that went, the sandbox is let go: an app that cannot
-        // reach portals still has to run.
-        release_block(&mut alloc);
-        published
-    } else {
-        None
+    // However publishing goes, the sandbox is let go below: an app that
+    // cannot reach portals still has to run.
+    let _identity = match portals {
+        true => publish_identity(env, &inst.name, info.as_ref().map(|(_, raw)| &raw[..])),
+        false => None,
     };
+    // pasta before the release, and before the supervisor is looked for:
+    // a sandbox held at `--block-fd` has not forked the supervisor yet,
+    // and one let go before its namespace is connected would start with
+    // no network at all. A sandbox that cannot be connected is stopped
+    // where it stands rather than run without what it was granted.
+    let _pasta = match isolated {
+        Some(cfg) => {
+            let started = match info.as_ref() {
+                Some((child_pid, _)) => start_pasta(env, cfg, *child_pid),
+                None => Err(LaunchError::Network(
+                    "bwrap reported no sandbox pid for pasta to attach to".to_owned(),
+                )),
+            };
+            match started {
+                Ok(handle) => Some(handle),
+                Err(e) => {
+                    abort_sandbox(&mut child, info.as_ref().map(|(pid, _)| *pid));
+                    return Err(e);
+                }
+            }
+        }
+        None => None,
+    };
+    if portals || isolated.is_some() {
+        release_block(&mut alloc);
+    }
     // Its own deadline: the one above may already have been spent waiting
     // for bwrap's info document.
     let supervisor = info.as_ref().and_then(|(reaper, _)| {
@@ -1419,6 +1582,7 @@ mod tests {
             test_allow_path: None,
             profile_dir_override: None,
             proxy_override: None,
+            pasta_override: None,
         }
     }
 
@@ -1427,6 +1591,7 @@ mod tests {
             name: "t".into(),
             dir: tmp.join("data/bubbler/instances/t"),
             config: crate::config::parse(kdl).unwrap(),
+            config_version: Some(crate::instance::CONFIG_VERSION),
         }
     }
 
@@ -1627,7 +1792,7 @@ mod tests {
         let items = explained(
             tmp.path(),
             &e,
-            "home-share \"Downloads\"\nnetwork\ncommand \"true\"",
+            "home-share \"Downloads\"\nnetwork \"host\"\ncommand \"true\"",
         );
         assert_eq!(
             line(&items, Origin::Service(1)),

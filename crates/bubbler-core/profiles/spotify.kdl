@@ -23,6 +23,11 @@
 //
 // No `portals`: Spotify has no file chooser to speak of. Add it, with
 // `home-share "Music"`, if you use local files.
+//
+// `network` is the sandbox's own network namespace, so Spotify Connect
+// finds no devices: discovery is mDNS on the LAN and pasta does not
+// bridge. `network "host"` restores it at the price of the host's own
+// loopback services.
 wayland
 dri
 pipewire
