@@ -257,9 +257,14 @@ pty hangs up with bubbler — the same as after a detach, not a signal
 delivered to the command.
 
 Either way, the output the sandbox has already produced is handed over
-before bubbler leaves, however long your terminal takes to accept it; only
-a terminal that has taken nothing for a second is given up on, and bubbler
-says how much it dropped.
+before bubbler leaves, however long your terminal takes to accept it — up
+to ten seconds, and only for as long as it keeps taking any of it. A
+terminal that has gone five seconds without taking a byte or reporting
+itself ready for one is given up on, and so is the rest of the output a
+fifth of a second after a signal, since by then you are waiting for
+bubbler rather than for it. Either way bubbler says how much it dropped,
+and never waits for that message to be read: a terminal that has stopped
+reading would otherwise take the whole run with it.
 
 SIGKILL cannot be caught, and neither can anything else that takes bubbler
 down without letting it unwind — a hang-up it never gets to act on

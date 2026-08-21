@@ -802,11 +802,15 @@ fn check_exit(
     child: &mut Child,
     stop: &AtomicBool,
     supervisor: Option<Pid>,
+    stopping: &AtomicBool,
 ) -> io::Result<Option<i32>> {
     if let Some(status) = child.try_wait()? {
         return Ok(Some(exit_code(status)));
     }
     if stop.swap(false, Ordering::SeqCst) {
+        // Latched, unlike `stop` itself: from here on the user is
+        // waiting, and the relay hands over what it holds accordingly.
+        stopping.store(true, Ordering::SeqCst);
         // bubblewrap 0.11.2 exits on SIGTERM instead of forwarding it,
         // so the signal goes to the supervisor, which stops the command
         // within its grace period; without its pid the sandbox can only
@@ -826,9 +830,10 @@ fn until_exit<'a>(
     child: &'a mut Child,
     stop: &'a AtomicBool,
     supervisor: Option<Pid>,
+    stopping: &'a AtomicBool,
     failed: &'a mut Option<io::Error>,
 ) -> impl FnMut() -> Option<i32> + 'a {
-    move || match check_exit(child, stop, supervisor) {
+    move || match check_exit(child, stop, supervisor, stopping) {
         Ok(code) => code,
         Err(e) => {
             *failed = Some(e);
@@ -843,9 +848,12 @@ fn wait_plain(
     child: &mut Child,
     stop: &AtomicBool,
     supervisor: Option<Pid>,
+    stopping: &AtomicBool,
 ) -> Result<i32, LaunchError> {
     loop {
-        if let Some(code) = check_exit(child, stop, supervisor).map_err(LaunchError::Spawn)? {
+        if let Some(code) =
+            check_exit(child, stop, supervisor, stopping).map_err(LaunchError::Spawn)?
+        {
             return Ok(code);
         }
         std::thread::sleep(POLL);
@@ -858,13 +866,14 @@ fn wait_pumping(
     child: &mut Child,
     stop: &AtomicBool,
     supervisor: Option<Pid>,
+    stopping: &AtomicBool,
     pipes: &[(BorrowedFd<'_>, BorrowedFd<'_>, &str)],
     sink: BorrowedFd<'_>,
 ) -> Result<i32, LaunchError> {
     let mut failed = None;
     let code = {
-        let mut until = until_exit(child, stop, supervisor, &mut failed);
-        tty::pump(pipes, sink, &mut until)?
+        let mut until = until_exit(child, stop, supervisor, stopping, &mut failed);
+        tty::pump(pipes, sink, &mut until, stopping)?
     };
     match failed {
         Some(e) => Err(LaunchError::Spawn(e)),
@@ -894,14 +903,14 @@ fn wait_relaying(
     child: &mut Child,
     stop: &AtomicBool,
     supervisor: Option<Pid>,
-    winch: &AtomicBool,
+    caught: &tty::Caught<'_>,
     master: BorrowedFd<'_>,
     ends: RelayEnds<'_>,
     raw: &mut Option<RawGuard<'_>>,
 ) -> Result<i32, LaunchError> {
     let mut failed = None;
     let end = {
-        let mut until = until_exit(child, stop, supervisor, &mut failed);
+        let mut until = until_exit(child, stop, supervisor, caught.stop, &mut failed);
         tty::relay(
             master,
             ends.input,
@@ -909,7 +918,7 @@ fn wait_relaying(
             ends.out_name,
             ends.sink,
             &mut until,
-            winch,
+            caught,
         )?
     };
     if let Some(e) = failed {
@@ -925,7 +934,7 @@ fn wait_relaying(
                 guard.restore();
             }
             eprintln!("{}", tty::DETACHED_NOTE);
-            let mut until = until_exit(child, stop, supervisor, &mut failed);
+            let mut until = until_exit(child, stop, supervisor, caught.stop, &mut failed);
             match tty::relay(
                 master,
                 None,
@@ -933,7 +942,7 @@ fn wait_relaying(
                 ends.out_name,
                 ends.sink,
                 &mut until,
-                winch,
+                caught,
             )? {
                 RelayEnd::Exited(code) => code,
                 // Nothing is read from the user any more, so there is
@@ -1004,6 +1013,9 @@ pub fn run(
     }
     let argv = build_argv(env, inst, command, &mut alloc, stdio.ctty())?;
     let stop = Arc::new(AtomicBool::new(false));
+    // What `stop` becomes once a run has seen it: `stop` is cleared as
+    // the signal is acted on, this stays set for the rest of the run.
+    let stopping = AtomicBool::new(false);
     let winch = Arc::new(AtomicBool::new(false));
     let mut registered = SignalGuard(Vec::new());
     // SIGHUP among them: a terminal that goes away must still leave
@@ -1078,6 +1090,10 @@ pub fn run(
     // and after a detach. Draining somewhere is what keeps a command from
     // blocking on a full pty or pipe.
     let sink = tty::null_stdio()?;
+    let caught = tty::Caught {
+        winch: &winch,
+        stop: &stopping,
+    };
     let code = match &master {
         Some(master) => {
             let out = tty::output_fd(&stdio, &host);
@@ -1098,7 +1114,7 @@ pub fn run(
                 &mut child,
                 &stop,
                 supervisor,
-                &winch,
+                &caught,
                 master.as_fd(),
                 ends,
                 &mut raw,
@@ -1109,9 +1125,16 @@ pub fn run(
                 .iter()
                 .map(|(read, i)| (read.as_fd(), host[*i].as_fd(), tty::FD_NAMES[*i]))
                 .collect();
-            wait_pumping(&mut child, &stop, supervisor, &ends, sink.as_fd())
+            wait_pumping(
+                &mut child,
+                &stop,
+                supervisor,
+                &stopping,
+                &ends,
+                sink.as_fd(),
+            )
         }
-        None => wait_plain(&mut child, &stop, supervisor),
+        None => wait_plain(&mut child, &stop, supervisor, &stopping),
     }?;
     // bwrap copies the data files out of the fds while it starts, so they
     // must stay open until it has exited.

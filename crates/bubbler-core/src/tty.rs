@@ -1,7 +1,7 @@
 //! The sandbox's terminal: pty allocation, the per-fd stdio decision, raw
 //! mode on the user's terminal and the relay between the two.
 
-use std::io::Write;
+use std::collections::VecDeque;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 use std::str::FromStr;
@@ -31,15 +31,30 @@ const TICK_TIMESPEC: Timespec = Timespec {
     tv_nsec: TICK.subsec_nanos() as Nsecs,
 };
 
+/// A poll that only asks and never waits.
+const NOW: Timespec = Timespec {
+    tv_sec: 0,
+    tv_nsec: 0,
+};
+
 /// How long output still in the pty is waited for after the command's
 /// status arrives.
 const DRAIN: Duration = Duration::from_millis(200);
 
-/// How long a destination that has taken nothing at all is still waited
-/// for before what is left is given up on. Only reached on the way out,
-/// with the command's status already in hand and the host stopped for
-/// good; while it takes anything at all, it is waited for.
-const STALL: Duration = Duration::from_secs(1);
+/// How long a destination that is taking nothing at all is still waited
+/// for before what is left is given up on. A terminal frees its write
+/// room a buffer at a time, so a reader taking a little at a time leaves
+/// `write` failing for a while without being stuck: readiness counts as
+/// movement, and only the two together running out mean a stall.
+const STALL: Duration = Duration::from_secs(5);
+
+/// The whole of what handing over one destination's last output may
+/// take, however well it is going. The backstop behind [`STALL`].
+const FLUSH_MAX: Duration = Duration::from_secs(10);
+
+/// How much longer that output is offered once the user is waiting for
+/// bubbler to be gone. What the host will take at once it still gets.
+const HURRY: Duration = Duration::from_millis(200);
 
 /// How much output may wait for a host terminal that is not taking it.
 /// Once this much is held the sandbox's side is left unread, so its pty
@@ -362,18 +377,26 @@ struct Unblocked<'a> {
     saved: Option<OFlags>,
 }
 
+/// Whether `fd` has an offset of its own, which a second description of
+/// it would not share: it would write from 0 over what is already there.
+/// True of the two seekable kinds a descriptor can be open on, and both
+/// of them take a write without ever blocking on a reader.
+fn seekable(fd: BorrowedFd<'_>) -> bool {
+    rustix::fs::fstat(fd).is_ok_and(|stat| {
+        matches!(
+            FileType::from_raw_mode(stat.st_mode),
+            FileType::RegularFile | FileType::BlockDevice
+        )
+    })
+}
+
 /// A second description of what `fd` is open on, non-blocking and held
 /// by nobody else, or `None` when there can be none: a socket has no
-/// such description, a regular file's would write from offset 0 over
-/// what is already there, and a descriptor that is not already writable
-/// would gain an access it was denied — for the read end of a pipe, its
-/// *other* end.
+/// such description, a [`seekable`] one would start over at offset 0,
+/// and a descriptor that is not already writable would gain an access it
+/// was denied — for the read end of a pipe, its *other* end.
 fn reopen(fd: BorrowedFd<'_>) -> Option<OwnedFd> {
-    if !writable(fd) {
-        return None;
-    }
-    let stat = rustix::fs::fstat(fd).ok()?;
-    if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile {
+    if !writable(fd) || seekable(fd) {
         return None;
     }
     // A magic link: this re-opens the very file the descriptor is on,
@@ -386,6 +409,89 @@ fn reopen(fd: BorrowedFd<'_>) -> Option<OwnedFd> {
         Mode::empty(),
     )
     .ok()
+}
+
+/// Where a relay's warnings go: a description of fd 2 that only the
+/// relay holds, non-blocking, opened once when the relay starts.
+///
+/// A warning about output the host would not take must never be written
+/// to a host that would not take it — with the destination re-opened, fd
+/// 2 is the user's own blocking terminal, and one `write` to a terminal
+/// that has stopped reading parks the loop that answers the exit check
+/// and the signals for good. So a warning that will not go through at
+/// once is dropped: truncated output is worth a word, never a run that
+/// only `SIGKILL` can end.
+struct Warn {
+    fd: Option<OwnedFd>,
+    /// fd 2's own flags, when the duplicate had to change them.
+    saved: Option<OFlags>,
+}
+
+impl Warn {
+    fn new() -> Self {
+        let Ok(dup) = std::io::stderr().as_fd().try_clone_to_owned() else {
+            return Self {
+                fd: None,
+                saved: None,
+            };
+        };
+        if let Some(own) = reopen(dup.as_fd()) {
+            return Self {
+                fd: Some(own),
+                saved: None,
+            };
+        }
+        // No second description to be had. A seekable fd takes a write
+        // without blocking anyway, so it is left exactly as it is.
+        if seekable(dup.as_fd()) {
+            return Self {
+                fd: Some(dup),
+                saved: None,
+            };
+        }
+        // What is left is a socket, or a terminal on a system without
+        // `/proc`. The flag has to go on the description fd 2 shares,
+        // and comes off again when the relay is done with it.
+        let saved = fcntl_getfl(&dup).ok();
+        if let Some(flags) = saved {
+            // A failed set is the same case as no flag at all: the
+            // warning is dropped below rather than written.
+            let _ = fcntl_setfl(&dup, flags | OFlags::NONBLOCK);
+        }
+        Self {
+            fd: Some(dup),
+            saved,
+        }
+    }
+
+    /// Say `msg`, or drop it. Never blocks, never fails a run, and never
+    /// waits for a terminal that has stopped reading.
+    fn say(&self, msg: &str) {
+        let Some(fd) = &self.fd else {
+            return;
+        };
+        if self.saved.is_some() {
+            // The flag went on a description bubbler does not own alone
+            // and may not have taken at all, so this asks first. Not a
+            // guarantee — a ready destination can still take only part
+            // of a message — but the last resort behind the flag.
+            let mut fds = [PollFd::from_borrowed_fd(fd.as_fd(), PollFlags::OUT)];
+            if !poll(&mut fds, Some(&NOW)).is_ok_and(|n| n > 0) {
+                return;
+            }
+        }
+        let _ = write(fd, msg.as_bytes());
+    }
+}
+
+impl Drop for Warn {
+    fn drop(&mut self) {
+        if let (Some(fd), Some(flags)) = (&self.fd, self.saved) {
+            // Nothing to report and nothing to do about it, as for the
+            // destinations: this is the way out of a run.
+            let _ = fcntl_setfl(fd, flags);
+        }
+    }
 }
 
 /// The destinations of one relay, each with a way to write to it that
@@ -455,7 +561,11 @@ struct Out<'a> {
     sink: BorrowedFd<'a>,
     /// What to call `fd` when it stops taking the output.
     name: &'a str,
-    pending: Vec<u8>,
+    /// Where a word about output that had to be dropped goes, without
+    /// ever waiting for it to be taken.
+    warn: &'a Warn,
+    /// A ring: a partial write moves its front, never the rest of it.
+    pending: VecDeque<u8>,
     /// How much may wait here before the sandbox's side is left unread.
     limit: usize,
     /// False once even the sink refuses the output: there is nowhere
@@ -464,12 +574,13 @@ struct Out<'a> {
 }
 
 impl<'a> Out<'a> {
-    fn new(fd: BorrowedFd<'a>, sink: BorrowedFd<'a>, name: &'a str) -> Self {
+    fn new(fd: BorrowedFd<'a>, sink: BorrowedFd<'a>, name: &'a str, warn: &'a Warn) -> Self {
         Self {
             fd,
             sink,
             name,
-            pending: Vec::new(),
+            warn,
+            pending: VecDeque::new(),
             limit: PENDING_MAX,
             open: true,
         }
@@ -492,14 +603,16 @@ impl<'a> Out<'a> {
     }
 
     fn push(&mut self, bytes: &[u8]) {
-        self.pending.extend_from_slice(bytes);
+        self.pending.extend(bytes);
     }
 
     /// Hand the host what it will take right now. Never blocks: what is
     /// left waits for the next `POLLOUT`.
     fn flush(&mut self) {
         while self.open && !self.pending.is_empty() {
-            match write(self.fd, &self.pending) {
+            // The front run of the ring; the rest follows next turn.
+            let (front, _) = self.pending.as_slices();
+            match write(self.fd, front) {
                 Ok(0) => self.failed(Errno::IO),
                 Ok(n) => drop(self.pending.drain(..n)),
                 Err(Errno::AGAIN) | Err(Errno::INTR) => return,
@@ -509,41 +622,63 @@ impl<'a> Out<'a> {
     }
 
     /// Hand over what is still waiting, for as long as the host keeps
-    /// taking any of it: this is the end of the command's output, and a
-    /// deadline is no reason to drop it. A host that has taken nothing
-    /// for [`STALL`] is given up on, with a word about what was lost.
-    fn finish(&mut self) {
-        let mut left = self.pending.len();
-        let mut moved = Instant::now();
-        while self.open {
+    /// taking it: this is the end of the command's output, and a
+    /// deadline is no reason to drop it.
+    ///
+    /// Bounded three ways, none of which ever blocks: [`FLUSH_MAX`] for
+    /// the whole of it, [`STALL`] without either a write getting through
+    /// or the host reporting itself writable, and [`HURRY`] from the
+    /// moment `stop` says the user is waiting for bubbler to be gone.
+    fn finish(&mut self, stop: &AtomicBool) {
+        let start = Instant::now();
+        let mut moved = start;
+        let mut hurried = stop.load(Ordering::SeqCst).then_some(start);
+        while self.open && !self.pending.is_empty() {
+            let held = self.pending.len();
             self.flush();
             if self.pending.is_empty() {
                 return;
             }
-            if self.pending.len() < left {
-                left = self.pending.len();
-                moved = Instant::now();
-            } else if moved.elapsed() >= STALL {
-                // The one place output is dropped, and it is announced.
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "bubbler: output to {} stalled; discarding the last {} bytes",
-                    self.name,
-                    self.pending.len()
-                );
-                self.pending.clear();
+            let now = Instant::now();
+            if self.pending.len() < held {
+                moved = now;
+            }
+            if hurried.is_none() && stop.load(Ordering::SeqCst) {
+                hurried = Some(now);
+            }
+            if hurried.is_some_and(|t| now.duration_since(t) >= HURRY) {
+                self.give_up("bubbler is stopping");
                 return;
             }
+            if now.duration_since(moved) >= STALL || now.duration_since(start) >= FLUSH_MAX {
+                self.give_up("it stopped being taken");
+                return;
+            }
+            // Readiness counts as movement: a terminal frees its write
+            // room a buffer at a time, so a reader taking a little at a
+            // time leaves `write` failing for longer than a stall would
+            // allow while never actually being stuck.
             let mut fds = [PollFd::from_borrowed_fd(self.fd, PollFlags::OUT)];
-            // A failed wait only costs a turn; the stall check ends this.
-            let _ = poll(&mut fds, Some(&TICK_TIMESPEC));
+            if poll(&mut fds, Some(&TICK_TIMESPEC)).is_ok_and(|n| n > 0) {
+                moved = Instant::now();
+            }
         }
+    }
+
+    /// The one place output is dropped, and it is always announced.
+    fn give_up(&mut self, why: &str) {
+        self.warn.say(&format!(
+            "bubbler: {} bytes of output to {} were dropped: {why}\n",
+            self.pending.len(),
+            self.name
+        ));
+        self.pending.clear();
     }
 
     /// Send what `fd` would not take to the sink from now on; when that
     /// already was the sink, the output has nowhere left to go.
     fn failed(&mut self, e: Errno) {
-        if redirect(&mut self.fd, self.sink, e, self.name) {
+        if redirect(&mut self.fd, self.sink, e, self.name, self.warn) {
             return;
         }
         self.open = false;
@@ -551,21 +686,35 @@ impl<'a> Out<'a> {
     }
 }
 
+/// What this run's signal handlers have caught, as the relay reads it.
+pub struct Caught<'a> {
+    /// Set on `SIGWINCH` and cleared by the relay, which answers each
+    /// one by copying the host terminal's size onto the pty.
+    pub winch: &'a AtomicBool,
+    /// Latched once a stop signal has been caught: the user is waiting
+    /// for bubbler to be gone, so output still in hand is offered
+    /// briefly rather than to the end.
+    pub stop: &'a AtomicBool,
+}
+
 /// Carry bytes between the user's terminal and the sandbox's pty until
 /// `until` reports an exit or the user detaches. `master` is never
 /// closed: that would tear the pty down under a running command. Every
-/// `winch` is answered by copying `host_out`'s size onto the pty, so
-/// `host_out` must be the user's terminal; the size it starts with is the
-/// one [`allocate`] copied from the terminal it was given. Output
+/// `caught.winch` is answered by copying `host_out`'s size onto the pty,
+/// so `host_out` must be the user's terminal; the size it starts with is
+/// the one [`allocate`] copied from the terminal it was given. Output
 /// `host_out` refuses goes to `sink` instead, which must be a descriptor
 /// that always accepts it ([`null_stdio`]).
 ///
-/// `host_out` is non-blocking while this runs and has its own flags back
-/// afterwards: a host that stops reading must never park the loop that
-/// answers `until`. Up to 64 KiB of output waits here, and beyond that
-/// the pty is left unread, so the sandbox blocks on its own terminal
-/// rather than losing a byte; what it still holds when the command's
-/// status arrives is read out too, and handed over before this returns.
+/// Nothing here ever waits on the host: it is written to through a
+/// description of bubbler's own that is non-blocking, and so is the one
+/// warning that can come of it. A host that stops reading must never
+/// park the loop that answers `until` and the signals. Up to 64 KiB of
+/// output waits here, and beyond that the pty is left unread, so the
+/// sandbox blocks on its own terminal rather than losing a byte; what it
+/// still holds when the command's status arrives is read out too, and
+/// handed over before this returns unless `caught.stop` says the user is
+/// waiting for bubbler to be gone.
 pub fn relay(
     master: BorrowedFd<'_>,
     host_in: Option<BorrowedFd<'_>>,
@@ -573,15 +722,17 @@ pub fn relay(
     out_name: &str,
     sink: BorrowedFd<'_>,
     until: &mut dyn FnMut() -> Option<i32>,
-    winch: &AtomicBool,
+    caught: &Caught<'_>,
 ) -> Result<RelayEnd, LaunchError> {
     // Non-blocking, so a command that has stopped reading cannot hold the
     // loop inside write() while its own output waits to be relayed.
     let flags = fcntl_getfl(master).map_err(pty_error)?;
     fcntl_setfl(master, flags | OFlags::NONBLOCK).map_err(pty_error)?;
-    // And a way to write to the host's end that cannot block either.
+    // And a way to write to the host's end that cannot block either,
+    // nor to say so afterwards.
     let dests = NonBlocking::new(&[host_out]);
-    let mut out = Out::new(dests.fd(0), sink, out_name);
+    let warn = Warn::new();
+    let mut out = Out::new(dests.fd(0), sink, out_name, &warn);
     let mut stdin = host_in;
     let mut typed: Vec<u8> = Vec::new();
     let mut escape = Escape::new();
@@ -589,10 +740,10 @@ pub fn relay(
     let mut buf = [0u8; CHUNK];
     loop {
         if let Some(code) = until() {
-            drain(master, &mut out, reading);
+            drain(master, &mut out, reading, caught.stop);
             return Ok(RelayEnd::Exited(code));
         }
-        if winch.swap(false, Ordering::SeqCst) {
+        if caught.winch.swap(false, Ordering::SeqCst) {
             resize(master, host_out);
         }
         escape.expire(Instant::now(), &mut typed);
@@ -658,7 +809,8 @@ pub fn relay(
                     if escape.feed(&buf[..n], Instant::now(), &mut typed) {
                         // What the sandbox has already written is the
                         // user's to see, detach or not.
-                        out.finish();
+                        out.relax();
+                        out.finish(caught.stop);
                         return Ok(RelayEnd::Detached);
                     }
                 }
@@ -694,7 +846,7 @@ pub fn relay(
 /// then is handed over for as long as the host takes it. `reading` says
 /// whether the master is worth reading at all. Nothing here is worth
 /// failing a finished run over, so every error just ends it.
-fn drain(master: BorrowedFd<'_>, out: &mut Out<'_>, mut reading: bool) {
+fn drain(master: BorrowedFd<'_>, out: &mut Out<'_>, mut reading: bool, stop: &AtomicBool) {
     out.relax();
     let deadline = Instant::now() + DRAIN;
     let mut buf = [0u8; CHUNK];
@@ -732,8 +884,9 @@ fn drain(master: BorrowedFd<'_>, out: &mut Out<'_>, mut reading: bool) {
     }
     // The deadline bounds how long more is read out of the pty, never
     // what has already been read: that is the end of the command's
-    // output, and it is handed over however long the host takes.
-    out.finish();
+    // output, and it is handed over for as long as the host is taking it
+    // and the user is not waiting.
+    out.finish(stop);
 }
 
 /// Copy each pipe to the fd next to it until `until` reports an exit and
@@ -743,20 +896,23 @@ fn drain(master: BorrowedFd<'_>, out: &mut Out<'_>, mut reading: bool) {
 /// destination that stops taking output is replaced by `sink`, so a
 /// reader that left early (`bubbler run ... | head`) cannot leave the
 /// command blocked on a full pipe. What the pipes hold when the status
-/// arrives is handed over as in the relay, however long that takes.
+/// arrives is handed over as in the relay, and `stop` cuts that short
+/// the same way.
 pub fn pump(
     pipes: &[(BorrowedFd<'_>, BorrowedFd<'_>, &str)],
     sink: BorrowedFd<'_>,
     until: &mut dyn FnMut() -> Option<i32>,
+    stop: &AtomicBool,
 ) -> Result<i32, LaunchError> {
     let host: Vec<BorrowedFd<'_>> = pipes.iter().map(|(_, to, _)| *to).collect();
     // As for the relay: a destination that stops reading may cost the
     // output its place, never the loop that is waiting for the exit.
     let dests = NonBlocking::new(&host);
+    let warn = Warn::new();
     let mut outs: Vec<Out<'_>> = pipes
         .iter()
         .enumerate()
-        .map(|(i, (_, _, name))| Out::new(dests.fd(i), sink, name))
+        .map(|(i, (_, _, name))| Out::new(dests.fd(i), sink, name, &warn))
         .collect();
     let mut open = vec![true; pipes.len()];
     let mut buf = [0u8; CHUNK];
@@ -775,9 +931,9 @@ pub fn pump(
             && ((!open.contains(&true) && !waiting) || Instant::now() >= deadline)
         {
             // As in the relay: the deadline ends the reading, and what
-            // was read is handed over however long the host takes.
+            // was read is handed over while the host is taking it.
             for out in &mut outs {
-                out.finish();
+                out.finish(stop);
             }
             return Ok(code);
         }
@@ -859,18 +1015,23 @@ fn resize(master: BorrowedFd<'_>, host: BorrowedFd<'_>) {
 ///
 /// Reading the sandbox side has to go on either way — a pty or a pipe
 /// nobody empties fills up, and the command blocks in `write` forever.
-fn redirect<'a>(dest: &mut BorrowedFd<'a>, sink: BorrowedFd<'a>, e: Errno, what: &str) -> bool {
+fn redirect<'a>(
+    dest: &mut BorrowedFd<'a>,
+    sink: BorrowedFd<'a>,
+    e: Errno,
+    what: &str,
+    warn: &Warn,
+) -> bool {
     if dest.as_raw_fd() == sink.as_raw_fd() {
         return false;
     }
     // Truncated output is worth a word, and a warning that cannot be
-    // printed either (the terminal is what just failed) is nothing to act
+    // written either (the terminal is what just failed) is nothing to act
     // on.
-    let _ = writeln!(
-        std::io::stderr(),
-        "bubbler: output to {what} failed: {}; discarding further output",
+    warn.say(&format!(
+        "bubbler: output to {what} failed: {}; discarding further output\n",
         std::io::Error::from(e)
-    );
+    ));
     *dest = sink;
     true
 }
@@ -942,17 +1103,21 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// A relay on its own thread, stopped by setting `stop`.
+    /// A relay on its own thread, stopped by setting `stop`. `hurry`
+    /// stands in for a caught signal: the run ends as it would after the
+    /// command's own exit unless a test sets it.
     struct Running {
         stop: Arc<AtomicBool>,
+        hurry: Arc<AtomicBool>,
         winch: Arc<AtomicBool>,
         handle: JoinHandle<Result<RelayEnd, LaunchError>>,
     }
 
     fn spawn_relay(master: OwnedFd, host_in: Option<OwnedFd>, host_out: OwnedFd) -> Running {
         let stop = Arc::new(AtomicBool::new(false));
+        let hurry = Arc::new(AtomicBool::new(false));
         let winch = Arc::new(AtomicBool::new(false));
-        let (s, w) = (Arc::clone(&stop), Arc::clone(&winch));
+        let (s, h, w) = (Arc::clone(&stop), Arc::clone(&hurry), Arc::clone(&winch));
         let handle = thread::spawn(move || {
             let mut until = || s.load(Ordering::SeqCst).then_some(0);
             let sink = null_stdio().unwrap();
@@ -963,11 +1128,15 @@ mod tests {
                 FD_NAMES[1],
                 sink.as_fd(),
                 &mut until,
-                &w,
+                &Caught {
+                    winch: &w,
+                    stop: &h,
+                },
             )
         });
         Running {
             stop,
+            hurry,
             winch,
             handle,
         }
@@ -993,35 +1162,40 @@ mod tests {
         finish_within(r, Duration::from_secs(5))
     }
 
-    /// Held while fd 2 is not what it was, so two tests quieting it at
-    /// once cannot restore each other's `/dev/null` and swallow the rest
-    /// of the run's output.
+    /// Held while fd 2 is not what it was, so two tests moving it at once
+    /// cannot restore each other's and swallow the rest of the run's
+    /// output.
     static QUIET: Mutex<()> = Mutex::new(());
 
-    /// Point fd 2 at `/dev/null` while the guard lives. Two tests make
-    /// the relay report a destination that refuses its output, and that
-    /// warning is the expected result, not something to print through a
-    /// test run.
-    struct QuietStderr {
+    /// Point fd 2 somewhere else while the guard lives, and put it back
+    /// afterwards. Several tests make the relay report a destination that
+    /// refuses its output, and that warning is the expected result, not
+    /// something to print through a test run; one points fd 2 at the very
+    /// destination that refuses it, which is what a real run does.
+    struct StderrOn {
         saved: OwnedFd,
         _lock: MutexGuard<'static, ()>,
     }
 
-    impl QuietStderr {
-        fn new() -> Self {
-            // A poisoned lock only means a quieted test panicked, and its
+    impl StderrOn {
+        fn at(fd: OwnedFd) -> Self {
+            // A poisoned lock only means such a test panicked, and its
             // guard put fd 2 back on the way out.
             let lock = QUIET.lock().unwrap_or_else(PoisonError::into_inner);
             let saved = std::io::stderr()
                 .as_fd()
                 .try_clone_to_owned()
                 .expect("duplicating stderr");
-            rustix::stdio::dup2_stderr(null_stdio().unwrap()).expect("silencing stderr");
+            rustix::stdio::dup2_stderr(fd).expect("moving stderr");
             Self { saved, _lock: lock }
+        }
+
+        fn null() -> Self {
+            Self::at(null_stdio().unwrap())
         }
     }
 
-    impl Drop for QuietStderr {
+    impl Drop for StderrOn {
         fn drop(&mut self) {
             rustix::stdio::dup2_stderr(&self.saved).expect("restoring stderr");
         }
@@ -1207,7 +1381,7 @@ mod tests {
             Mode::empty(),
         )
         .unwrap();
-        let quiet = QuietStderr::new();
+        let quiet = StderrOn::null();
         let r = spawn_relay(master, Some(host_in.into()), read_only);
         // More than the pty holds: a relay that stopped reading here would
         // leave the writer blocked in the sandbox for good.
@@ -1266,11 +1440,11 @@ mod tests {
             !done.load(Ordering::SeqCst),
             "the flood was swallowed instead of held back"
         );
-        // The whole point: the exit check is still serviced, so a signal
-        // or a status ends the relay while the host is stuck. What it
-        // still held is offered for a second and then given up on, which
-        // is the one case where output is dropped, and it says so.
-        let quiet = QuietStderr::new();
+        // The whole point: the exit check is still serviced, so a status
+        // ends the relay while the host is stuck. What it still held is
+        // offered for [`STALL`] and then given up on, which is one of the
+        // two cases where output is dropped, and it says so.
+        let quiet = StderrOn::null();
         let end = finish_within(r, DRAIN + STALL + Duration::from_secs(1));
         drop(quiet);
         assert_eq!(end, RelayEnd::Exited(0));
@@ -1471,6 +1645,133 @@ mod tests {
     }
 
     #[test]
+    fn a_warning_never_parks_the_relay_on_a_wedged_terminal() {
+        let Pty { master, slave } = pty_pair();
+        // The destination and fd 2 are one and the same wedged pipe,
+        // which is what a real run has: with the destination re-opened,
+        // fd 2 is still the user's own blocking terminal. So the relay
+        // has output it cannot hand over and nowhere to say so either,
+        // and saying so must not be what ends it.
+        let (reader, host_out) = rustix::pipe::pipe().unwrap();
+        fill(host_out.as_fd());
+        let wedged = StderrOn::at(host_out.try_clone().unwrap());
+        let r = spawn_relay(master, None, host_out);
+        write(&slave, b"nowhere to go\n").unwrap();
+        thread::sleep(Duration::from_millis(200));
+        // A caught signal, so the last of the output is offered for
+        // [`HURRY`] and the warning about dropping it comes right after.
+        r.hurry.store(true, Ordering::SeqCst);
+        let end = finish_within(r, Duration::from_secs(2));
+        drop(wedged);
+        assert_eq!(end, RelayEnd::Exited(0));
+        drop(reader);
+    }
+
+    #[test]
+    fn a_caught_signal_cuts_the_last_of_the_output_short() {
+        let Pty { master, slave } = pty_pair();
+        let (reader, host_out) = rustix::pipe::pipe().unwrap();
+        fill(host_out.as_fd());
+        let quiet = StderrOn::null();
+        let r = spawn_relay(master, None, host_out);
+        write(&slave, b"waiting\n").unwrap();
+        thread::sleep(Duration::from_millis(200));
+        r.hurry.store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        let end = finish_within(r, Duration::from_secs(2));
+        drop(quiet);
+        assert_eq!(end, RelayEnd::Exited(0));
+        // [`HURRY`], not [`STALL`]: a host that is merely behind would be
+        // waited for, but the user is waiting for bubbler.
+        assert!(
+            started.elapsed() < STALL,
+            "the signal waited out the stall in {:?}",
+            started.elapsed()
+        );
+        drop(reader);
+    }
+
+    #[test]
+    fn a_terminal_taking_a_little_at_a_time_is_not_a_stalled_one() {
+        const HELD: usize = 8192;
+        let Pty { master, slave } = pty_pair();
+        let Pty {
+            master: host_master,
+            slave: host_slave,
+        } = pty_pair();
+        // A terminal with no room left, so what the sandbox writes now
+        // is still the relay's to hand over when the command ends.
+        fill(host_slave.as_fd());
+        let done = Arc::new(AtomicBool::new(false));
+        let d = Arc::clone(&done);
+        let taker = thread::spawn(move || {
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while Instant::now() < deadline {
+                // 256 bytes every 200 ms while the relay hands over what
+                // it holds. A pty frees its write room a buffer at a
+                // time, so `write` goes on failing for seconds at a
+                // stretch with the terminal not stuck in the least; then
+                // as fast as it likes, since what is being tested is
+                // what the relay handed over, not how long this takes.
+                let slow = !d.load(Ordering::SeqCst);
+                let want = match slow {
+                    true => 256,
+                    false => buf.len(),
+                };
+                if slow {
+                    thread::sleep(Duration::from_millis(200));
+                }
+                let mut fds = [PollFd::from_borrowed_fd(host_master.as_fd(), PollFlags::IN)];
+                if poll(&mut fds, Some(&timespec(Duration::from_millis(200)))).is_err() {
+                    break;
+                }
+                if fds[0].revents().is_empty() {
+                    if !slow {
+                        break;
+                    }
+                    continue;
+                }
+                match read(&host_master, &mut buf[..want]) {
+                    // The relay has gone and closed its end.
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                }
+            }
+            got
+        });
+        let r = spawn_relay(master, None, host_slave);
+        let payload: Vec<u8> = (0..HELD).map(flood_byte).collect();
+        let mut sent = 0;
+        while sent < HELD {
+            sent += write(&slave, &payload[sent..]).unwrap();
+        }
+        thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        assert_eq!(
+            finish_within(r, Duration::from_secs(40)),
+            RelayEnd::Exited(0)
+        );
+        let waited = started.elapsed();
+        done.store(true, Ordering::SeqCst);
+        let got = taker.join().unwrap();
+        // What the terminal was filled with first, and then every byte
+        // the relay was holding when the command ended.
+        assert!(
+            got.len() >= HELD && got[got.len() - HELD..] == payload,
+            "a slow terminal was taken for a stalled one: {} bytes read",
+            got.len()
+        );
+        // And it really was handed over against a `write` that kept
+        // failing: a run that never had to wait proves nothing here.
+        assert!(
+            waited > Duration::from_secs(2),
+            "the terminal took it all at once in {waited:?}"
+        );
+    }
+
+    #[test]
     fn a_destination_that_never_drains_does_not_park_the_pump() {
         let (read_end, write_end) = rustix::pipe::pipe().unwrap();
         // A destination nobody empties, filled before the pump ever sees
@@ -1482,20 +1783,22 @@ mod tests {
         let deadline = Instant::now() + Duration::from_millis(100);
         let mut until = || (Instant::now() >= deadline).then_some(9);
         let started = Instant::now();
-        // On the way out that line is offered for [`STALL`] and then
-        // given up on, which is what the warning here is.
-        let quiet = QuietStderr::new();
+        // A caught signal: the user is waiting, so that line is offered
+        // for [`HURRY`] and then given up on, which is what the warning
+        // here is.
+        let quiet = StderrOn::null();
         let code = pump(
             &[(read_end.as_fd(), dest.as_fd(), FD_NAMES[1])],
             sink.as_fd(),
             &mut until,
+            &AtomicBool::new(true),
         )
         .unwrap();
         drop(quiet);
         assert_eq!(code, 9);
         // Parking would be for good; anything bounded is not that.
         assert!(
-            started.elapsed() < DRAIN + STALL + Duration::from_secs(1),
+            started.elapsed() < DRAIN + HURRY + Duration::from_secs(1),
             "the pump parked in a write"
         );
     }
@@ -1518,12 +1821,13 @@ mod tests {
             }
             d.store(true, Ordering::SeqCst);
         });
-        let quiet = QuietStderr::new();
+        let quiet = StderrOn::null();
         let mut until = || done.load(Ordering::SeqCst).then_some(3);
         let code = pump(
             &[(read_end.as_fd(), gone.as_fd(), FD_NAMES[1])],
             sink.as_fd(),
             &mut until,
+            &AtomicBool::new(false),
         )
         .unwrap();
         drop(quiet);
@@ -1589,7 +1893,7 @@ mod tests {
         let (host_out, test_out) = UnixStream::pair().unwrap();
         let host_out = OwnedFd::from(host_out);
         write(&slave, b"last words\n").unwrap();
-        let winch = AtomicBool::new(false);
+        let (winch, hurry) = (AtomicBool::new(false), AtomicBool::new(false));
         let mut until = || Some(7);
         let started = Instant::now();
         let sink = null_stdio().unwrap();
@@ -1600,7 +1904,10 @@ mod tests {
             FD_NAMES[1],
             sink.as_fd(),
             &mut until,
-            &winch,
+            &Caught {
+                winch: &winch,
+                stop: &hurry,
+            },
         )
         .unwrap();
         assert_eq!(end, RelayEnd::Exited(7));
@@ -1652,6 +1959,7 @@ mod tests {
             ],
             sink.as_fd(),
             &mut until,
+            &AtomicBool::new(false),
         )
         .unwrap();
         assert_eq!(code, 5);
@@ -1673,6 +1981,7 @@ mod tests {
             &[(read_end.as_fd(), host_out.as_fd(), FD_NAMES[1])],
             sink.as_fd(),
             &mut until,
+            &AtomicBool::new(false),
         )
         .unwrap();
         assert_eq!(code, 0);

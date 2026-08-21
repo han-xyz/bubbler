@@ -2103,6 +2103,72 @@ fn real_bwrap_exec_stops_on_a_signal_and_gives_the_terminal_back() {
 }
 
 #[test]
+fn real_bwrap_exec_stops_on_a_signal_with_the_terminal_wedged() {
+    let Some((tmp, init)) = live_instance("t") else {
+        return;
+    };
+    let run = bubbler_live(tmp.path(), &init)
+        .args(["run", "t", "--", "/usr/bin/sleep", "30"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let sock = tmp.path().join("run/bubbler/t/init.sock");
+    if !wait_until(
+        || UnixStream::connect(&sock).is_ok(),
+        Duration::from_secs(10),
+    ) {
+        fail_with(run, "the instance never accepted a connection");
+    }
+    let pty = test_pty();
+    let before = modes(pty.slave.as_fd());
+    // Nothing ever reads this terminal, so the command floods it until
+    // every buffer between the two is full and bubbler is left holding
+    // the rest. Its own stderr is that same terminal, so the warning
+    // about output it has to drop has nowhere to go either: writing it
+    // is what would park the relay, with the signals unanswered and only
+    // SIGKILL left.
+    let mut exec = bubbler_live(tmp.path(), &init)
+        .args(["exec", "t", "--", "/usr/bin/seq", "1", "200000"])
+        .stdin(pty.stdio())
+        .stdout(pty.stdio())
+        .stderr(pty.stdio())
+        .spawn()
+        .unwrap();
+    assert!(
+        wait_until(|| is_raw(pty.slave.as_fd()), Duration::from_secs(10)),
+        "the exec never put the terminal in raw mode"
+    );
+    // Long enough for the flood to have filled everything downstream.
+    std::thread::sleep(Duration::from_millis(500));
+    kill_process(Pid::from_child(&exec), Signal::TERM).unwrap();
+    let mut status = None;
+    let stopped = wait_until(
+        || {
+            status = exec.try_wait().expect("waiting for the exec");
+            status.is_some()
+        },
+        Duration::from_secs(2),
+    );
+    if !stopped {
+        let _ = exec.kill();
+        panic!("the exec did not stop within two seconds of SIGTERM");
+    }
+    assert_eq!(status.and_then(|s| s.code()), Some(128 + 15));
+    assert_eq!(modes(pty.slave.as_fd()), before);
+
+    let mut run = run;
+    kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
+    assert!(
+        wait_until(
+            || run.try_wait().expect("waiting for the run").is_some(),
+            Duration::from_secs(8)
+        ),
+        "the run did not stop after SIGTERM"
+    );
+}
+
+#[test]
 fn real_bwrap_run_gives_the_terminal_back_after_a_hangup() {
     let Some((tmp, init)) = live_instance("t") else {
         return;

@@ -194,6 +194,13 @@ pub fn run_in(
     let sink = tty::null_stdio()?;
     let mut received: Option<io::Result<i32>> = None;
     let mut signalled: Option<i32> = None;
+    // Latched for the relay, which reads it while handing over the last
+    // of the output: a signal means the user is waiting for bubbler.
+    let stopping = AtomicBool::new(false);
+    let caught = tty::Caught {
+        winch: &winch,
+        stop: &stopping,
+    };
     let end = {
         let mut until = || {
             if status_ready(stream) {
@@ -212,6 +219,7 @@ pub fn run_in(
                 0 => None,
                 sig => {
                     signalled = Some(sig as i32);
+                    stopping.store(true, Ordering::SeqCst);
                     Some(128 + sig as i32)
                 }
             }
@@ -233,7 +241,7 @@ pub fn run_in(
                     out_name,
                     sink.as_fd(),
                     &mut until,
-                    &winch,
+                    &caught,
                 )?
             }
             None if !pipes.is_empty() => {
@@ -241,7 +249,7 @@ pub fn run_in(
                     .iter()
                     .map(|(read, i)| (read.as_fd(), host[*i].as_fd(), tty::FD_NAMES[*i]))
                     .collect();
-                tty::pump(&ends, sink.as_fd(), &mut until)?;
+                tty::pump(&ends, sink.as_fd(), &mut until, &stopping)?;
                 RelayEnd::Exited(0)
             }
             // Nothing of ours to move: the status is all this waits for.
