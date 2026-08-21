@@ -356,6 +356,23 @@ impl BwrapArgs {
         }
     }
 
+    /// Forbid nested user namespaces (`bwrap(1)` `--disable-userns`,
+    /// phase 1). Idempotent, and it emits `--unshare-user` with the flag:
+    /// bwrap refuses `--disable-userns` without it, and `--unshare-all`
+    /// does not count, since that asks for the user namespace only if the
+    /// host has unprivileged ones.
+    pub fn disable_userns(&mut self) {
+        let flags = [OsStr::new("--unshare-user"), OsStr::new("--disable-userns")];
+        if self
+            .namespaces
+            .iter()
+            .any(|i| matches!(i, Item::Arg(a) if a == flags[1]))
+        {
+            return;
+        }
+        push(&mut self.namespaces, flags);
+    }
+
     /// Hold the sandbox at startup until the launcher lets it go
     /// (`bwrap(1)` `--block-fd`, phase 1). Only a sandbox whose identity
     /// bubbler still has to publish waits, and it waits before it execs.
@@ -394,6 +411,21 @@ impl BwrapArgs {
         push(
             &mut self.binds,
             [OsStr::new("--dev-bind"), src.as_os_str(), dst.as_os_str()],
+        );
+    }
+
+    /// Like [`BwrapArgs::dev_bind`] but skipped by bwrap when the source
+    /// has gone (`bwrap(1)` `--dev-bind-try`). For nodes enumerated while
+    /// the argv is built: hardware unplugged in the moment between that
+    /// and the exec must not fail the launch.
+    pub fn dev_bind_try(&mut self, src: &Path, dst: &Path) {
+        push(
+            &mut self.binds,
+            [
+                OsStr::new("--dev-bind-try"),
+                src.as_os_str(),
+                dst.as_os_str(),
+            ],
         );
     }
 
@@ -729,7 +761,7 @@ mod tests {
 
     #[test]
     fn ntsync_is_bound_only_where_the_host_has_the_node() {
-        let host = FakeHost::default().with("/dev/ntsync", crate::host::fake::char_dev());
+        let host = FakeHost::default().with("/dev/ntsync", crate::host::fake::char_type());
         let argv = BwrapArgs::baseline(&env(), Path::new("/i/home"), &host)
             .finish(&["sh".into()], &mut Counter::new())
             .unwrap();
@@ -753,7 +785,7 @@ mod tests {
 
     #[test]
     fn the_proxy_sandbox_gets_no_ntsync() {
-        let host = FakeHost::default().with("/dev/ntsync", crate::host::fake::char_dev());
+        let host = FakeHost::default().with("/dev/ntsync", crate::host::fake::char_type());
         let argv = BwrapArgs::proxy_baseline(
             Path::new("/run/user/1000/bus"),
             Path::new("/run/user/1000/bubbler/t/dbus"),
@@ -953,6 +985,27 @@ mod tests {
         // Phase 1, and after --info-fd: bwrap writes the info it is blocked
         // for before it reads the block fd.
         assert_eq!(&s[7..11], &["--info-fd", "3", "--block-fd", "4"], "{s:?}");
+    }
+
+    #[test]
+    fn disabling_user_namespaces_adds_two_phase_one_flags_and_nothing_else() {
+        let plain = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default())
+            .finish(&["sh".into()], &mut Counter::new())
+            .unwrap();
+        let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default());
+        args.disable_userns();
+        args.disable_userns();
+        let hardened = args.finish(&["sh".into()], &mut Counter::new()).unwrap();
+        let s = strs(&hardened);
+        // Phase 1, and `--unshare-user` with it: bwrap refuses
+        // `--disable-userns` on its own, and `--unshare-all` is not enough.
+        assert_eq!(&s[9..11], &["--unshare-user", "--disable-userns"], "{s:?}");
+        let rest: Vec<&str> = s
+            .iter()
+            .copied()
+            .filter(|a| *a != "--unshare-user" && *a != "--disable-userns")
+            .collect();
+        assert_eq!(rest, strs(&plain), "nothing else about the sandbox moved");
     }
 
     #[test]

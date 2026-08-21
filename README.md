@@ -67,7 +67,10 @@ bare node per `--grant`; the grants are `wayland`, `x11`, `network`, `dri`,
 `pipewire`, `pulseaudio`, `dbus`, `portals`, `notify`, `tray` and `gamepad`,
 and anything with arguments needs a real instance. The bundles are checked as
 they are in a config file, so `--grant tray` without `--grant dbus` is refused
-rather than silently dropped. The sandbox lives in
+rather than silently dropped. A grant the profile already made is not repeated,
+properties and all: `--grant gamepad` on a profile carrying
+`gamepad hidraw=#true` keeps the `hidraw` node rather than narrowing it to the
+bare one. The sandbox lives in
 `$XDG_DATA_HOME/bubbler/try/<pid>/`, never appears in `list`, and is removed
 when the command exits whatever its status; `--keep <name>` renames it into an
 instance instead, refusing a name that is taken. Directories left behind by a
@@ -107,6 +110,8 @@ file order does not affect the generated argv.
     pipewire                         # $XDG_RUNTIME_DIR/pipewire-0
     pulseaudio                       # $XDG_RUNTIME_DIR/pulse/native, sets PULSE_SERVER
     gamepad                          # /dev/input, and the sysfs that names it
+                                     #   hidraw=#true adds /dev/hidraw*,
+                                     #   uinput=#true adds /dev/uinput
     home-share "Downloads"           # $HOME/Downloads at /home/bubbler/Downloads
     home-share "Projects/x" mode=rw
     path-share "/kioxia/Steam"       # a host path, at that same path inside
@@ -124,6 +129,7 @@ file order does not affect the generated argv.
     tray                             # talk to org.kde.StatusNotifierWatcher
     mpris name="firefox.*"           # own org.mpris.MediaPlayer2.firefox.*
     tty "pty"                        # terminal: "pty", "passthrough" or "none"
+    userns "allow"                   # nested user namespaces: "allow" or "disable"
     seccomp {                        # changes to the default syscall denylist
         allow "perf_event_open"
         deny "unshare" errno="EPERM"
@@ -201,6 +207,35 @@ battery state, the attributes of every block and tty device, and
 are readable even with no `network` grant. `/run/udev/data` hands over udev's
 database, which is the identity of every device on the machine. The wide bind
 is emitted after `dri`'s narrower ones, and bwrap takes both.
+
+`gamepad hidraw=#true` adds every `/dev/hidraw*` node the host has when the
+sandbox starts. Those are the raw HID interfaces SDL's hidapi backend drives
+the popular controllers through; without them SDL falls back to evdev, which
+`SDL_JOYSTICK_HIDAPI=0` also forces. There is no `/dev/hidraw` directory to
+bind, so unlike `/dev/input` this list is frozen at launch: a device plugged in
+afterwards has no hidraw node inside until the instance is restarted.
+`/sys/class/hidraw` is bound read-only with it when the host has it.
+
+The glob is **every** HID device on the machine, not the controllers: on this
+host `/dev/hidraw0` is a keyboard. As with `/dev/input`, what stops a sandbox
+from using one is the permissions on the node. Arch's stock
+`70-uaccess.rules` hands the logged-in user an ACL on security tokens
+(FIDO/U2F, `ID_SECURITY_TOKEN`), hardware wallets, 3D mice and AV control
+devices, and Steam's `60-steam-input.rules` adds one per supported controller —
+so a sandbox with `hidraw=#true` can speak to your security key or your
+hardware wallet whenever one is plugged in. Compare `ls -l /dev/hidraw*` and
+`getfacl /dev/hidraw*` with `id` before granting it.
+
+`gamepad uinput=#true` adds `/dev/uinput`, which is how Steam Input creates its
+virtual controllers — and how anything creates a virtual keyboard. A sandbox
+holding it can type into your session, which is outside the sandbox by design
+rather than a hole in it, so every launch prints `bubbler: warning: gamepad
+uinput=#true: the sandbox can create virtual input devices and type into your
+session`. On Arch the node is `0660 root:root` with a `uaccess` ACL from
+Steam's udev rules, which the wiki itself notes lets any logged-in user create
+globally available input devices; grant it only to a profile you would trust
+with your keyboard. A host whose `/dev/uinput` is missing (the `uinput` module
+not loaded) is an error, not a quietly weaker sandbox.
 
 `env` keys must look like `[A-Za-z_][A-Za-z0-9_]*`, and each key may appear
 only once. `env` values and `command` arguments may not contain NUL, a newline
@@ -625,6 +660,34 @@ inside a sandbox dies on its first syscall. Anything shipping 32-bit code,
 Steam and some Wine setups among them, needs `seccomp { disable }` until a
 libseccomp backend can add the second architecture to the filter.
 
+## User namespaces
+
+    userns "disable"                 # "allow" is the default
+
+The baseline unshares every namespace, but `--unshare-all` still leaves the
+sandbox able to create *new* user namespaces, and a process inside one of those
+holds full capabilities there — which is how the mount and pid namespaces
+become reachable again. `userns "disable"` closes that one door: bubbler emits
+`--unshare-user --disable-userns` in the namespace phase, and `unshare -U`
+inside then fails with `ENOSPC`. The explicit `--unshare-user` is part of it
+because bwrap refuses `--disable-userns` without one, and `--unshare-all` does
+not count: it asks for the user namespace only if the host offers unprivileged
+ones. So with `userns "disable"` a host without them fails to start the sandbox
+at all instead of starting it without a user namespace.
+
+What it costs: Firefox loses its own inner sandbox — it still runs, and says so
+with `Sandbox: CanCreateUserNamespace() clone() failure: ENOSPC` — and Chromium,
+which falls back to a user-namespace sandbox inside bwrap because its suid
+helper is blocked there, is expected to lose that layer as well. Anything that
+nests a container breaks outright — Steam, whose pressure-vessel
+runs its own bubblewrap for every Proton game, plus `unshare`, podman and
+flatpak inside the sandbox. The node applies to the app's own sandbox: the
+`xdg-dbus-proxy` sidecar is built from the same baseline as always, since
+nothing of the application runs in it. It is also unavailable exactly where it would be
+wanted most: `bwrap(1)` says the flag "doesn't work in the setuid version of
+bubblewrap", which is the version a kernel without unprivileged user namespaces
+needs. No shipped profile sets it.
+
 ## Baseline
 
 Every sandbox gets: all namespaces unshared, no network, read-only `/usr` and
@@ -675,8 +738,9 @@ binding the tree under it.
   sysfs topology alongside the node.
 - `dri` binds the NVIDIA device nodes but not `/etc/OpenCL` or `/etc/nvidia`,
   so compute and vendor application profiles need an `etc-share` of their own.
-- `gamepad` grants no `/dev/hidraw*`, so a controller SDL would drive through
-  hidapi falls back to evdev; `SDL_JOYSTICK_HIDAPI=0` makes that explicit.
+- `gamepad hidraw=#true` binds the `/dev/hidraw*` nodes that exist at launch
+  and there is no directory to bind instead, so a device plugged in later is
+  invisible to hidapi until the instance restarts; evdev still sees it.
 - `/etc/machine-id` is bound in, so every instance shares one stable
   identifier with the host.
 - No desktop entries.

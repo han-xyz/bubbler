@@ -4,7 +4,7 @@
 
 use std::ffi::{OsStr, OsString};
 
-use crate::config::{BusRule, InstanceConfig, Service, ShareMode};
+use crate::config::{BusRule, InstanceConfig, Service, ShareMode, Userns};
 use crate::error::ConfigError;
 use crate::seccomp::{Errno, SeccompConfig};
 use crate::tty::TtyMode;
@@ -31,6 +31,9 @@ pub fn nodes(cfg: &InstanceConfig) -> Result<Vec<String>, ConfigError> {
     if cfg.tty != TtyMode::default() {
         out.push(tty(cfg.tty));
     }
+    if cfg.userns != Userns::default() {
+        out.push(userns(cfg.userns));
+    }
     if cfg.seccomp != SeccompConfig::default() {
         out.push(seccomp(&cfg.seccomp));
     }
@@ -54,7 +57,16 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
         Service::Portals => "portals".to_owned(),
         Service::Notify => "notify".to_owned(),
         Service::Tray => "tray".to_owned(),
-        Service::Gamepad => "gamepad".to_owned(),
+        Service::Gamepad { hidraw, uinput } => {
+            let mut node = String::from("gamepad");
+            // `#false` is the default, so only a granted class is written.
+            for (name, on) in [("hidraw", hidraw), ("uinput", uinput)] {
+                if *on {
+                    node.push_str(&format!(" {name}=#true"));
+                }
+            }
+            node
+        }
         Service::HomeShare { path, mode } => {
             let path = text("home-share", "path", path.as_os_str())?;
             let mut node = format!("home-share {}", quote(path));
@@ -111,6 +123,15 @@ pub fn tty(mode: TtyMode) -> String {
         TtyMode::None => "none",
     };
     format!("tty {}", quote(name))
+}
+
+/// The `userns` node for `mode`.
+pub fn userns(mode: Userns) -> String {
+    let name = match mode {
+        Userns::Allow => "allow",
+        Userns::Disable => "disable",
+    };
+    format!("userns {}", quote(name))
 }
 
 /// The `seccomp` block for `cfg`, including an empty one.
@@ -227,9 +248,10 @@ mod tests {
             portals
             notify
             tray
-            gamepad
+            gamepad hidraw=#true uinput=#true
             mpris name="firefox.*"
             tty "passthrough"
+            userns "disable"
             seccomp {
                 allow "perf_event_open" "keyctl"
                 deny "unshare" errno="EPERM"
@@ -245,6 +267,17 @@ mod tests {
         round_trip("dbus\nportals");
         round_trip("tty \"none\"");
         round_trip("seccomp { disable; }");
+        round_trip("gamepad");
+        round_trip("gamepad hidraw=#true");
+        round_trip("gamepad uinput=#true");
+    }
+
+    #[test]
+    fn defaults_are_left_out_rather_than_written_back() {
+        // `userns "allow"` and a `gamepad` with both properties off are
+        // the defaults, so the canonical form of each is the shorter node.
+        let cfg = parse("gamepad uinput=#false\nuserns \"allow\"").unwrap();
+        assert_eq!(render(&cfg).unwrap(), "gamepad\n");
     }
 
     #[test]

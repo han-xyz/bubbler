@@ -38,6 +38,35 @@ pub const RESERVED_ETC: &[&str] = &[
     "gshadow", "gshadow-", "gshadow+",
 ];
 
+/// Whether the sandbox may create user namespaces of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Userns {
+    /// The baseline's `--unshare-all`, which leaves nested user
+    /// namespaces working: a browser's own sandbox and Steam's
+    /// pressure-vessel both need them.
+    #[default]
+    Allow,
+    /// `--unshare-user --disable-userns`: the sandbox cannot create a
+    /// further user namespace, and so cannot regain inside it the
+    /// capabilities that make mount and pid namespaces reachable again.
+    Disable,
+}
+
+impl FromStr for Userns {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "allow" => Ok(Self::Allow),
+            "disable" => Ok(Self::Disable),
+            _ => Err(ConfigError::BadArgument {
+                node: "userns".to_owned(),
+                reason: format!("expected `allow` or `disable`, got `{s}`"),
+            }),
+        }
+    }
+}
+
 /// Whether a shared path is writable inside the sandbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShareMode {
@@ -125,7 +154,14 @@ pub enum Service {
     /// Game controllers: the `/dev/input` device nodes, which are every
     /// input device the host has, plus the sysfs and udev database entries
     /// that identify them.
-    Gamepad,
+    Gamepad {
+        /// Also bind every `/dev/hidraw*` node, which is what a controller
+        /// driven through hidapi rather than evdev takes.
+        hidraw: bool,
+        /// Also bind `/dev/uinput`: the sandbox can create virtual input
+        /// devices for the whole session.
+        uinput: bool,
+    },
     /// Own `org.mpris.MediaPlayer2.<name>` so media keys and player
     /// controls reach the app. Requires [`Service::Dbus`].
     Mpris {
@@ -151,6 +187,9 @@ pub struct InstanceConfig {
     /// Changes to the default seccomp denylist; empty unless a `seccomp`
     /// node relaxes or extends it.
     pub seccomp: SeccompConfig,
+    /// Whether the sandbox may nest user namespaces; `allow` unless a
+    /// `userns` node says otherwise.
+    pub userns: Userns,
 }
 
 /// One profile layer as written: the same nodes an instance config may
@@ -164,6 +203,9 @@ pub struct RawProfile {
     /// Whether a `tty` node was written. [`InstanceConfig::tty`] cannot
     /// say, and a layer without the node must not override the one below.
     pub tty_set: bool,
+    /// Whether a `userns` node was written, for the same reason
+    /// [`RawProfile::tty_set`] exists.
+    pub userns_set: bool,
 }
 
 /// Parse KDL v2 text into an [`InstanceConfig`]. `include` is rejected:
@@ -186,13 +228,14 @@ fn parse_doc(text: &str, profile: bool) -> Result<RawProfile, ConfigError> {
     let mut cfg = InstanceConfig::default();
     let mut includes: Vec<String> = Vec::new();
     let mut seen_tty = false;
+    let mut seen_userns = false;
     let mut seen_seccomp = false;
     for node in doc.nodes() {
         let name = node.name().value();
         reject_types(node)?;
         match name {
             "wayland" | "x11" | "network" | "dri" | "pipewire" | "pulseaudio" | "portals"
-            | "notify" | "tray" | "gamepad" => {
+            | "notify" | "tray" => {
                 reject_entries(node)?;
                 let svc = match name {
                     "wayland" => Service::Wayland,
@@ -204,7 +247,6 @@ fn parse_doc(text: &str, profile: bool) -> Result<RawProfile, ConfigError> {
                     "portals" => Service::Portals,
                     "notify" => Service::Notify,
                     "tray" => Service::Tray,
-                    "gamepad" => Service::Gamepad,
                     // Unreachable through the arm above, and an error
                     // rather than a fallback: a name added to that list
                     // and forgotten here would otherwise grant whichever
@@ -251,6 +293,18 @@ fn parse_doc(text: &str, profile: bool) -> Result<RawProfile, ConfigError> {
                 }
                 cfg.services.push(parse_dbus(node)?);
             }
+            "gamepad" => {
+                // By variant: two `gamepad` nodes differing only in their
+                // properties would leave the device list to file order.
+                if cfg
+                    .services
+                    .iter()
+                    .any(|s| matches!(s, Service::Gamepad { .. }))
+                {
+                    return Err(ConfigError::Duplicate(name.to_owned()));
+                }
+                cfg.services.push(parse_gamepad(node)?);
+            }
             "mpris" => {
                 if cfg
                     .services
@@ -267,6 +321,13 @@ fn parse_doc(text: &str, profile: bool) -> Result<RawProfile, ConfigError> {
                 }
                 seen_tty = true;
                 cfg.tty = parse_tty(node)?;
+            }
+            "userns" => {
+                if seen_userns {
+                    return Err(ConfigError::Duplicate(name.to_owned()));
+                }
+                seen_userns = true;
+                cfg.userns = parse_userns(node)?;
             }
             "seccomp" => {
                 if seen_seccomp {
@@ -301,6 +362,7 @@ fn parse_doc(text: &str, profile: bool) -> Result<RawProfile, ConfigError> {
         config: cfg,
         includes,
         tty_set: seen_tty,
+        userns_set: seen_userns,
     })
 }
 
@@ -673,6 +735,57 @@ fn validate_relative(node: &KdlNode, s: &str) -> Result<PathBuf, ConfigError> {
     Ok(p.components().collect())
 }
 
+/// `gamepad [hidraw=#true] [uinput=#true]`: the bare node is the evdev
+/// grant, and each property adds one more class of device node to it.
+fn parse_gamepad(node: &KdlNode) -> Result<Service, ConfigError> {
+    let mut hidraw: Option<bool> = None;
+    let mut uinput: Option<bool> = None;
+    for e in node.entries() {
+        let Some(prop) = e.name().map(|n| n.value()) else {
+            return Err(bad(node, "takes no arguments"));
+        };
+        let slot = match prop {
+            "hidraw" => &mut hidraw,
+            "uinput" => &mut uinput,
+            _ => {
+                return Err(ConfigError::UnknownProperty {
+                    node: node.name().value().to_owned(),
+                    prop: prop.to_owned(),
+                });
+            }
+        };
+        // Written twice, the two entries disagree about a device class
+        // and the winner would be a matter of their order in the line.
+        if slot.is_some() {
+            return Err(ConfigError::Duplicate(format!(
+                "{} {prop}",
+                node.name().value()
+            )));
+        }
+        *slot = Some(
+            e.value()
+                .as_bool()
+                .ok_or_else(|| bad(node, &format!("{prop} must be #true or #false")))?,
+        );
+    }
+    if node.children().is_some() {
+        return Err(bad(node, "takes no children"));
+    }
+    Ok(Service::Gamepad {
+        hidraw: hidraw.unwrap_or(false),
+        uinput: uinput.unwrap_or(false),
+    })
+}
+
+/// `userns "allow"|"disable"`, the same shape `tty` has.
+fn parse_userns(node: &KdlNode) -> Result<Userns, ConfigError> {
+    let arg = one_string_arg(node)?;
+    if node.children().is_some() {
+        return Err(bad(node, "takes no children"));
+    }
+    Userns::from_str(arg)
+}
+
 /// `tty "pty"|"passthrough"|"none"`. The name of the mode is the whole
 /// node: an unknown one is an error, never a silent fallback to the
 /// default, which would give the sandbox a terminal the file refused it.
@@ -855,6 +968,99 @@ mod tests {
             parse("tty \"pty\"\ntty \"none\""),
             Err(ConfigError::Duplicate(n)) if n == "tty"
         ));
+    }
+
+    #[test]
+    fn user_namespaces_are_allowed_unless_the_file_disables_them() {
+        assert_eq!(parse("").unwrap().userns, Userns::Allow);
+        assert_eq!(parse("userns \"allow\"").unwrap().userns, Userns::Allow);
+        assert_eq!(parse("userns \"disable\"").unwrap().userns, Userns::Disable);
+        assert!(matches!(
+            parse("userns \"off\""),
+            Err(ConfigError::BadArgument { node, .. }) if node == "userns"
+        ));
+        assert!(matches!(
+            parse("userns"),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("userns \"allow\" \"disable\""),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("userns \"disable\" { x; }"),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("userns \"allow\"\nuserns \"disable\""),
+            Err(ConfigError::Duplicate(n)) if n == "userns"
+        ));
+    }
+
+    #[test]
+    fn userns_set_says_whether_the_node_was_written() {
+        assert!(!parse_profile("wayland").unwrap().userns_set);
+        let raw = parse_profile("userns \"allow\"").unwrap();
+        assert!(raw.userns_set);
+        assert_eq!(raw.config.userns, Userns::Allow);
+    }
+
+    #[test]
+    fn gamepad_device_classes_are_properties_that_default_to_false() {
+        assert_eq!(
+            parse("gamepad").unwrap().services,
+            vec![Service::Gamepad {
+                hidraw: false,
+                uinput: false
+            }]
+        );
+        assert_eq!(
+            parse("gamepad hidraw=#true").unwrap().services,
+            vec![Service::Gamepad {
+                hidraw: true,
+                uinput: false
+            }]
+        );
+        assert_eq!(
+            parse("gamepad uinput=#true hidraw=#false")
+                .unwrap()
+                .services,
+            vec![Service::Gamepad {
+                hidraw: false,
+                uinput: true
+            }]
+        );
+        assert!(matches!(
+            parse("gamepad foo=#true"),
+            Err(ConfigError::UnknownProperty { node, prop })
+                if node == "gamepad" && prop == "foo"
+        ));
+        assert!(matches!(
+            parse("gamepad hidraw=\"yes\""),
+            Err(ConfigError::BadArgument { node, .. }) if node == "gamepad"
+        ));
+        assert!(matches!(
+            parse("gamepad \"hidraw\""),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        // One grant however the two nodes differ: a second one would
+        // otherwise decide the device list by file order.
+        assert!(matches!(
+            parse("gamepad\ngamepad uinput=#true"),
+            Err(ConfigError::Duplicate(n)) if n == "gamepad"
+        ));
+        // Same for one property written twice, whichever way round.
+        for text in [
+            "gamepad uinput=#true uinput=#false",
+            "gamepad uinput=#false uinput=#true",
+            "gamepad hidraw=#true uinput=#true hidraw=#true",
+        ] {
+            assert!(
+                matches!(parse(text), Err(ConfigError::Duplicate(ref n)) if n.contains(' ')),
+                "{text}: {:?}",
+                parse(text)
+            );
+        }
     }
 
     #[test]
@@ -1329,7 +1535,10 @@ command "b""#
             vec![
                 Service::Dbus { rules: vec![] },
                 Service::Tray,
-                Service::Gamepad
+                Service::Gamepad {
+                    hidraw: false,
+                    uinput: false
+                }
             ]
         );
         assert!(matches!(

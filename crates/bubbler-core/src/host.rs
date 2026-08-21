@@ -102,6 +102,14 @@ pub(crate) mod fake {
         }
     }
 
+    /// A character device `FileType`. `mknod` needs privileges the tests
+    /// do not have, so it is read from `/dev/null`.
+    pub fn char_type() -> FileType {
+        std::fs::metadata("/dev/null")
+            .expect("/dev/null exists wherever these tests can run")
+            .file_type()
+    }
+
     /// Real `FileType` values (there is no constructor), obtained once from a temp dir.
     pub fn types() -> (FileType, FileType, FileType) {
         use std::os::unix::net::UnixListener;
@@ -111,11 +119,5 @@ pub(crate) mod fake {
         let _l = UnixListener::bind(tmp.path().join("s")).unwrap();
         let t = |n: &str| std::fs::metadata(tmp.path().join(n)).unwrap().file_type();
         (t("f"), t("d"), t("s"))
-    }
-
-    /// A char-device `FileType`, taken from `/dev/null`: creating a device
-    /// node needs privileges the tests do not have.
-    pub fn char_dev() -> FileType {
-        std::fs::metadata("/dev/null").unwrap().file_type()
     }
 }

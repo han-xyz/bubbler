@@ -9,7 +9,7 @@ use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::config::{self, InstanceConfig, RawProfile, Service, ShareMode};
+use crate::config::{self, InstanceConfig, RawProfile, Service, ShareMode, Userns};
 use crate::env::Env;
 use crate::error::ProfileError;
 use crate::instance::is_plain_name;
@@ -441,6 +441,7 @@ struct Merged {
     services: Vec<(Service, Src)>,
     env: Vec<(String, String, Src)>,
     tty: Option<(TtyMode, Src)>,
+    userns: Option<(Userns, Src)>,
     seccomp: SeccompConfig,
     seccomp_src: Option<Src>,
     command: Option<(Vec<OsString>, Src)>,
@@ -461,6 +462,11 @@ impl Merged {
         }
         if raw.tty_set {
             self.tty = Some((raw.config.tty, src.clone()));
+        }
+        // A restriction, not a grant: the including layer decides it, the
+        // same way `tty` works, so a profile can lift what it includes.
+        if raw.userns_set {
+            self.userns = Some((raw.config.userns, src.clone()));
         }
         if let Some(argv) = &raw.config.command {
             self.command = Some((argv.clone(), src.clone()));
@@ -518,6 +524,24 @@ impl Merged {
                     return Ok(());
                 }
             }
+            Service::Gamepad { hidraw, uinput } => {
+                if let Some((held_hidraw, held_uinput, held_src)) =
+                    self.services.iter_mut().find_map(|(s, src)| match s {
+                        Service::Gamepad {
+                            hidraw: h,
+                            uinput: u,
+                        } => Some((h, u, src)),
+                        _ => None,
+                    })
+                {
+                    // Each property is a grant of its own, so they add up
+                    // rather than the last layer deciding both.
+                    *held_hidraw |= *hidraw;
+                    *held_uinput |= *uinput;
+                    *held_src = src.clone();
+                    return Ok(());
+                }
+            }
             Service::Mpris { .. } => {
                 if let Some(slot) = self
                     .services
@@ -538,7 +562,6 @@ impl Merged {
             | Service::Portals
             | Service::Notify
             | Service::Tray
-            | Service::Gamepad
             | Service::EtcShare { .. } => {
                 if self.services.iter().any(|(s, _)| s == svc) {
                     return Ok(());
@@ -600,6 +623,11 @@ impl Merged {
             && *mode != TtyMode::default()
         {
             origins.push((kdl_out::tty(*mode), src));
+        }
+        if let Some((mode, src)) = &self.userns
+            && *mode != Userns::default()
+        {
+            origins.push((kdl_out::userns(*mode), src));
         }
         if let Some(src) = &self.seccomp_src
             && self.seccomp != SeccompConfig::default()
@@ -754,7 +782,10 @@ mod tests {
         );
         assert!(cfg("vesktop").services.contains(&Service::Tray));
         let steam = cfg("steam");
-        assert!(steam.services.contains(&Service::Gamepad));
+        assert!(steam.services.contains(&Service::Gamepad {
+            hidraw: false,
+            uinput: false
+        }));
         // The 32-bit runtime would be killed by a filter built for this
         // architecture alone.
         assert!(steam.seccomp.disable);
@@ -902,6 +933,65 @@ mod tests {
             &[],
         );
         assert_eq!(r.resolve("app").unwrap().config.tty, TtyMode::None);
+    }
+
+    #[test]
+    fn userns_follows_the_including_layer_and_gamepad_properties_are_unioned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(
+            tmp.path(),
+            &[
+                (
+                    "app",
+                    "include \"base\"\nuserns \"allow\"\ngamepad uinput=#true\n",
+                ),
+                ("base", "userns \"disable\"\ngamepad hidraw=#true\n"),
+            ],
+            &[],
+        );
+        let cfg = r.resolve("app").unwrap().config;
+        // A restriction, so the including layer decides it outright.
+        assert_eq!(cfg.userns, Userns::Allow);
+        // Device classes are grants, and grants only ever add up.
+        assert_eq!(
+            cfg.services,
+            vec![Service::Gamepad {
+                hidraw: true,
+                uinput: true
+            }]
+        );
+
+        // A layer without the node leaves the one below alone.
+        let r = resolver(
+            tmp.path(),
+            &[
+                ("app", "include \"base\"\ngamepad\n"),
+                ("base", "userns \"disable\"\ngamepad hidraw=#true\n"),
+            ],
+            &[],
+        );
+        let resolved = r.resolve("app").unwrap();
+        assert_eq!(resolved.config.userns, Userns::Disable);
+        assert_eq!(
+            resolved.config.services,
+            vec![Service::Gamepad {
+                hidraw: true,
+                uinput: false
+            }]
+        );
+        assert!(
+            resolved.text.contains("userns \"disable\""),
+            "{}",
+            resolved.text
+        );
+        assert!(
+            resolved.text.contains("gamepad hidraw=#true"),
+            "{}",
+            resolved.text
+        );
+        // The flattened text and the origins are built from two lists in
+        // the same order, so the new node must sit in both the same way.
+        assert_eq!(resolved.text, kdl_out::render(&resolved.config).unwrap());
     }
 
     #[test]

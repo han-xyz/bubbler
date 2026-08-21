@@ -63,14 +63,17 @@ pub fn apply_all(
             // Bound after the loop, so its whole-`/sys/devices` bind always
             // follows the PCI roots `dri` binds under it rather than
             // depending on the order of the two nodes in the file.
-            Service::Gamepad => {}
+            Service::Gamepad { .. } => {}
             // Rule-only bundles: they reach the sandbox through the proxy
             // the launcher starts, not through bwrap arguments.
             Service::Notify | Service::Tray | Service::Mpris { .. } => {}
         }
     }
-    if services.contains(&Service::Gamepad) {
-        gamepad(args, host)?;
+    if let Some(Service::Gamepad { hidraw, uinput }) = services
+        .iter()
+        .find(|s| matches!(s, Service::Gamepad { .. }))
+    {
+        gamepad(args, host, *hidraw, *uinput)?;
     }
     for (dst, src, mode) in shares {
         match mode {
@@ -322,11 +325,16 @@ fn dri(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
 /// Game controllers: `/dev/input` with device access, plus the `/sys`
 /// entries that identify a device and the udev database where the host
 /// has one. `/dev/input` is every input device, keyboards included.
-fn gamepad(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
+/// `hidraw` and `uinput` add the device classes those properties name.
+fn gamepad(
+    args: &mut BwrapArgs,
+    host: &dyn Host,
+    hidraw: bool,
+    uinput: bool,
+) -> Result<(), LaunchError> {
     // The directory, not the nodes it holds today, exactly as flatpak's
     // `--device=input`: a node bound one by one freezes the device list at
     // start, while the directory shows a controller plugged in later.
-    // Never `/dev/uinput`, which is input injection into the host session.
     let dev = require_dir(host, "gamepad", PathBuf::from("/dev/input"))?;
     args.dev_bind(&dev, &dev);
     // `/sys/class/input` entries are symlinks into `/sys/devices`, and a
@@ -342,17 +350,80 @@ fn gamepad(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
     match host.file_type(&udev) {
         // A host with no udev database is not an error; libudev and SDL
         // both fall back to reading the device directory itself.
+        None => {}
+        Some(t) if t.is_dir() => args.ro_bind(&udev, &udev),
+        Some(_) => {
+            return Err(LaunchError::WrongType {
+                service: "gamepad",
+                path: udev,
+                expected: "a directory",
+            });
+        }
+    }
+    if hidraw {
+        gamepad_hidraw(args, host)?;
+    }
+    if uinput {
+        gamepad_uinput(args, host)?;
+    }
+    Ok(())
+}
+
+/// The `/dev/hidraw*` nodes the host has right now, plus the sysfs class
+/// directory that names them.
+// There is no `/dev/hidraw` directory to bind instead, so the list is
+// whatever is plugged in when the sandbox starts: a device connected
+// later has no node inside. Nothing is refused when there are none —
+// hidraw nodes come and go with the hardware, and every one of them is a
+// HID device, not only a controller.
+fn gamepad_hidraw(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
+    let dev = Path::new("/dev");
+    for name in host.list_dir(dev) {
+        if !name.as_encoded_bytes().starts_with(b"hidraw") {
+            continue;
+        }
+        let p = dev.join(&name);
+        // A name is not a node: only the character devices are bound.
+        if host.file_type(&p).is_some_and(|t| t.is_char_device()) {
+            // `-try`: the node is one this loop found a moment ago, and a
+            // device unplugged before the exec must not fail the launch.
+            args.dev_bind_try(&p, &p);
+        }
+    }
+    let class = PathBuf::from("/sys/class/hidraw");
+    match host.file_type(&class) {
+        // A missing class directory is tolerated, like `/run/udev`: the
+        // nodes above are what a device is opened through.
         None => Ok(()),
         Some(t) if t.is_dir() => {
-            args.ro_bind(&udev, &udev);
+            args.ro_bind(&class, &class);
             Ok(())
         }
         Some(_) => Err(LaunchError::WrongType {
             service: "gamepad",
-            path: udev,
+            path: class,
             expected: "a directory",
         }),
     }
+}
+
+/// `/dev/uinput`, which is how a process creates input devices for the
+/// whole session. Warned about on every launch: the grant reaches out of
+/// the sandbox, so it is never a quiet one.
+fn gamepad_uinput(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
+    let p = require(
+        host,
+        "gamepad",
+        PathBuf::from("/dev/uinput"),
+        "a character device",
+        |t| t.is_char_device(),
+    )?;
+    args.dev_bind(&p, &p);
+    eprintln!(
+        "bubbler: warning: gamepad uinput=#true: the sandbox can create \
+         virtual input devices and type into your session"
+    );
+    Ok(())
 }
 
 /// Bind the PipeWire socket at the same path; clients find it through
@@ -764,7 +835,7 @@ mod tests {
                     Sock => sock,
                     File => file,
                     Dir => dir,
-                    Char => fake::char_dev(),
+                    Char => fake::char_type(),
                 },
             );
         }
@@ -1748,6 +1819,11 @@ mod tests {
             .position(|w| w.iter().map(String::as_str).eq(seq.iter().copied()))
     }
 
+    /// A `gamepad` grant with the two device-class properties as given.
+    fn pad(hidraw: bool, uinput: bool) -> Service {
+        Service::Gamepad { hidraw, uinput }
+    }
+
     fn gamepad_host() -> Vec<(&'static str, Kind)> {
         vec![
             ("/dev/input", Dir),
@@ -1759,7 +1835,7 @@ mod tests {
 
     #[test]
     fn gamepad_binds_the_input_directory_and_the_sysfs_around_it() {
-        let a = argv(&[Service::Gamepad], &env(), &gamepad_host()).unwrap();
+        let a = argv(&[pad(false, false)], &env(), &gamepad_host()).unwrap();
         assert!(has_seq(&a, &["--dev-bind", "/dev/input", "/dev/input"]));
         assert!(has_seq(
             &a,
@@ -1777,7 +1853,7 @@ mod tests {
             .into_iter()
             .filter(|(p, _)| *p != "/run/udev")
             .collect();
-        let a = argv(&[Service::Gamepad], &env(), &host).unwrap();
+        let a = argv(&[pad(false, false)], &env(), &host).unwrap();
         assert!(has_seq(&a, &["--dev-bind", "/dev/input", "/dev/input"]));
         assert!(!a.iter().any(|s| s.contains("udev")), "{a:?}");
     }
@@ -1796,7 +1872,7 @@ mod tests {
                 .collect();
             assert!(
                 matches!(
-                    argv(&[Service::Gamepad], &env(), &host),
+                    argv(&[pad(false, false)], &env(), &host),
                     Err(LaunchError::WrongType {
                         service: "gamepad",
                         expected: "a directory",
@@ -1811,9 +1887,92 @@ mod tests {
             .filter(|(p, _)| *p != "/sys/class/input")
             .collect();
         assert!(matches!(
-            argv(&[Service::Gamepad], &env(), &host),
+            argv(&[pad(false, false)], &env(), &host),
             Err(LaunchError::MissingResource {
                 service: "gamepad",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn gamepad_hidraw_binds_the_character_nodes_it_finds_in_order() {
+        let mut host = gamepad_host();
+        host.extend([
+            ("/dev/hidraw3", Char),
+            ("/dev/hidraw0", Char),
+            ("/dev/hidraw7", Char),
+            // Neither is a device node, however the name reads.
+            ("/dev/hidrawdir", Dir),
+            ("/dev/hidraw-note", File),
+            ("/sys/class/hidraw", Dir),
+        ]);
+        let a = argv(&[pad(true, false)], &env(), &host).unwrap();
+        let at = |n: &str| {
+            seq_at(&a, &["--dev-bind-try", n, n])
+                .unwrap_or_else(|| panic!("{n} is not bound: {a:?}"))
+        };
+        assert!(at("/dev/hidraw0") < at("/dev/hidraw3"), "{a:?}");
+        assert!(at("/dev/hidraw3") < at("/dev/hidraw7"), "{a:?}");
+        assert!(has_seq(
+            &a,
+            &["--ro-bind", "/sys/class/hidraw", "/sys/class/hidraw"]
+        ));
+        assert!(!a.iter().any(|s| s.contains("hidrawdir")), "{a:?}");
+        assert!(!a.iter().any(|s| s.contains("hidraw-note")), "{a:?}");
+        assert!(!a.iter().any(|s| s.contains("uinput")), "{a:?}");
+        // The property is what adds them: the bare grant on this same
+        // host binds no hidraw node at all.
+        let bare = argv(&[pad(false, false)], &env(), &host).unwrap();
+        assert!(!bare.iter().any(|s| s.contains("hidraw")), "{bare:?}");
+    }
+
+    #[test]
+    fn gamepad_hidraw_on_a_host_with_no_hid_devices_still_builds() {
+        // Nodes come and go with the hardware, so an empty glob is a host
+        // with nothing plugged in, not a broken config.
+        let a = argv(&[pad(true, false)], &env(), &gamepad_host()).unwrap();
+        assert!(!a.iter().any(|s| s.contains("hidraw")), "{a:?}");
+        let mut host = gamepad_host();
+        host.push(("/sys/class/hidraw", File));
+        assert!(matches!(
+            argv(&[pad(true, false)], &env(), &host),
+            Err(LaunchError::WrongType {
+                service: "gamepad",
+                expected: "a directory",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn gamepad_uinput_binds_the_injection_node_only_when_asked_for() {
+        let mut host = gamepad_host();
+        host.push(("/dev/uinput", Char));
+        let a = argv(&[pad(false, true)], &env(), &host).unwrap();
+        assert!(has_seq(&a, &["--dev-bind", "/dev/uinput", "/dev/uinput"]));
+        let bare = argv(&[pad(false, false)], &env(), &host).unwrap();
+        assert!(!bare.iter().any(|s| s.contains("uinput")), "{bare:?}");
+    }
+
+    #[test]
+    fn gamepad_uinput_refuses_a_node_that_is_missing_or_not_a_device() {
+        // The grant is explicit, so a host that cannot honour it is an
+        // error rather than a sandbox quietly without the node.
+        assert!(matches!(
+            argv(&[pad(false, true)], &env(), &gamepad_host()),
+            Err(LaunchError::MissingResource {
+                service: "gamepad",
+                ..
+            })
+        ));
+        let mut host = gamepad_host();
+        host.push(("/dev/uinput", File));
+        assert!(matches!(
+            argv(&[pad(false, true)], &env(), &host),
+            Err(LaunchError::WrongType {
+                service: "gamepad",
+                expected: "a character device",
                 ..
             })
         ));
@@ -1829,8 +1988,8 @@ mod tests {
             ("/sys/devices/pci0000:00", Dir),
         ]);
         for order in [
-            [Service::Dri, Service::Gamepad],
-            [Service::Gamepad, Service::Dri],
+            [Service::Dri, pad(false, false)],
+            [pad(false, false), Service::Dri],
         ] {
             let a = argv(&order, &env(), &host).unwrap();
             let pci = seq_at(

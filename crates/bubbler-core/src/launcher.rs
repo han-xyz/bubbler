@@ -20,6 +20,7 @@ use signal_hook::SigId;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 
 use crate::bwrap::{BwrapArgs, FdAllocator};
+use crate::config::Userns;
 use crate::env::Env;
 use crate::error::{ConfigError, LaunchError};
 use crate::host::{Host, RealHost};
@@ -217,14 +218,29 @@ pub fn build_argv(
     alloc: &mut dyn FdAllocator,
     ctty: bool,
 ) -> Result<Vec<OsString>, LaunchError> {
+    build_argv_on(env, inst, command, alloc, ctty, &RealHost)
+}
+
+/// [`build_argv`] against one view of the host, so a test can state which
+/// device nodes and sockets the sandbox is built from.
+fn build_argv_on(
+    env: &Env,
+    inst: &Instance,
+    command: Option<&[OsString]>,
+    alloc: &mut dyn FdAllocator,
+    ctty: bool,
+    host: &dyn Host,
+) -> Result<Vec<OsString>, LaunchError> {
     let command = resolve_command(inst, command)?;
-    let host = RealHost;
     let plan = dbus::plan(&inst.config.services, &inst.name);
     let ctx = service::ServiceCtx {
         instance_runtime: instance_runtime_dir(env, &inst.name),
         dbus: plan.as_ref(),
     };
-    let mut args = BwrapArgs::baseline(env, &inst.home(), &host);
+    let mut args = BwrapArgs::baseline(env, &inst.home(), host);
+    if inst.config.userns == Userns::Disable {
+        args.disable_userns();
+    }
     if ctty {
         args.ctty();
     }
@@ -239,9 +255,9 @@ pub fn build_argv(
         env,
         &inst.name,
     )?;
-    service::apply_all(&inst.config.services, env, &mut args, &host, &ctx)?;
+    service::apply_all(&inst.config.services, env, &mut args, host, &ctx)?;
     service::apply_env(&inst.config.env, &mut args)?;
-    args.bind_init(&init_bin::locate(env, &host)?);
+    args.bind_init(&init_bin::locate(env, host)?);
     args.finish(command, alloc)
 }
 
@@ -1194,6 +1210,89 @@ mod tests {
 
     fn strs(v: &[OsString]) -> Vec<String> {
         v.iter().map(|s| s.to_string_lossy().into_owned()).collect()
+    }
+
+    /// A host holding the stand-in supervisor binary and everything
+    /// `gamepad hidraw=#true uinput=#true` looks for, so a device grant
+    /// can be checked without the machine the tests run on having one.
+    fn device_host(tmp: &Path) -> crate::host::fake::FakeHost {
+        let (file, dir, _) = crate::host::fake::types();
+        let mut host = crate::host::fake::FakeHost::default()
+            .with(&tmp.join("bubbler-init").display().to_string(), file);
+        for p in [
+            "/dev/input",
+            "/sys/class/input",
+            "/sys/devices",
+            "/sys/class/hidraw",
+        ] {
+            host = host.with(p, dir);
+        }
+        for p in ["/dev/hidraw0", "/dev/uinput"] {
+            host = host.with(p, crate::host::fake::char_type());
+        }
+        host
+    }
+
+    fn device_argv(tmp: &Path, e: &Env, kdl: &str) -> Vec<String> {
+        let argv = build_argv_on(
+            e,
+            &inst(tmp, kdl),
+            None,
+            &mut DryRunAlloc::default(),
+            false,
+            &device_host(tmp),
+        )
+        .unwrap();
+        strs(&argv)
+    }
+
+    #[test]
+    fn the_userns_node_reaches_the_namespace_phase() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let plain = device_argv(tmp.path(), &e, "command \"x\"");
+        assert!(!plain.iter().any(|a| a == "--unshare-user"), "{plain:?}");
+        assert!(!plain.iter().any(|a| a == "--disable-userns"), "{plain:?}");
+
+        let a = device_argv(tmp.path(), &e, "userns \"disable\"\ncommand \"x\"");
+        let at = a
+            .iter()
+            .position(|s| s == "--unshare-user")
+            .unwrap_or_else(|| panic!("{a:?}"));
+        assert_eq!(a[at + 1], "--disable-userns", "{a:?}");
+        // Phase 1: ahead of the filesystem skeleton the baseline lays down.
+        let skeleton = a
+            .iter()
+            .position(|s| s == "--ro-bind")
+            .unwrap_or_else(|| panic!("{a:?}"));
+        assert!(at < skeleton, "{a:?}");
+    }
+
+    #[test]
+    fn gamepad_device_properties_reach_the_argv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let bare = device_argv(tmp.path(), &e, "gamepad\ncommand \"x\"");
+        assert!(!bare.iter().any(|a| a.contains("hidraw")), "{bare:?}");
+        assert!(!bare.iter().any(|a| a.contains("uinput")), "{bare:?}");
+
+        let a = device_argv(
+            tmp.path(),
+            &e,
+            "gamepad hidraw=#true uinput=#true\ncommand \"x\"",
+        );
+        let has = |seq: &[&str]| a.windows(seq.len()).any(|w| w == seq);
+        // The nodes are enumerated as the argv is built, so they are
+        // bound with the `-try` form; `/dev/uinput` was asked for by name.
+        assert!(
+            has(&["--dev-bind-try", "/dev/hidraw0", "/dev/hidraw0"]),
+            "{a:?}"
+        );
+        assert!(
+            has(&["--ro-bind", "/sys/class/hidraw", "/sys/class/hidraw"]),
+            "{a:?}"
+        );
+        assert!(has(&["--dev-bind", "/dev/uinput", "/dev/uinput"]), "{a:?}");
     }
 
     #[test]
