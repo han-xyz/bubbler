@@ -1,0 +1,40 @@
+// bubbler profile: code
+//
+// This profile shares ~/Projects, so `mkdir ~/Projects` — or edit the
+// `home-share` node to the tree you keep code in — before the first run:
+// a share whose source is missing is an error, not a quieter sandbox.
+//
+// VS Code keeps its own multi-process sandbox inside bubbler's. Arch's
+// /usr/share/code/chrome-sandbox is NOT setuid, unlike
+// /usr/lib/electron*/chrome-sandbox, so Electron takes the user-namespace
+// path directly — which means `userns "disable"` would break it and must
+// never be added here.
+//
+// No `env ELECTRON_OZONE_PLATFORM_HINT`: Electron 42 (VS Code 1.133)
+// selects the Wayland ozone platform on its own, measured with the hint
+// absent. Extra flags go in the private home's code-flags.conf, which
+// /usr/bin/code reads from $XDG_CONFIG_HOME.
+//
+// This is a code editor, not a build box. Nothing here reaches the host:
+// no `org.freedesktop.Flatpak` (the flathub manifest's host-Spawn escape
+// hatch), no host filesystem, no ssh-agent socket. A remote or container
+// extension will not work, and git over SSH needs a key in the private
+// home rather than your agent.
+//
+// `talk "org.freedesktop.secrets"` is the Secret Storage API extensions
+// keep their tokens in. It has no per-application partitioning, so VS
+// Code can read every secret in the login keyring through it; drop the
+// rule if you would rather it could not.
+//
+// A checkout outside the home is named explicitly, e.g.
+//     path-share "/kioxia/src" mode=rw
+wayland
+dri
+network
+dbus {
+    talk "org.freedesktop.secrets"
+}
+portals
+notify
+home-share "Projects" mode=rw
+command "code"

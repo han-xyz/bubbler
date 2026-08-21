@@ -1,0 +1,32 @@
+// bubbler profile: kitty
+//
+// A terminal emulator allocates its own pseudoterminals. bwrap's
+// `--dev /dev` gives every sandbox a private devpts instance with its own
+// index space (measured), so this needs no grant of its own and never a
+// bind of the host's /dev/pts — which would hand over the host's ptys.
+//
+// The `tty` node is about how *bubbler's* stdio reaches your terminal and
+// is unrelated to the ptys kitty makes for its own children; `tty "none"`
+// is a reasonable setting for a GUI launch.
+//
+// `dbus` and `portals` are not decoration: without them kitty's
+// org.freedesktop.portal.Settings read is refused and it cannot follow
+// the desktop colour scheme (measured). It still starts either way.
+//
+// Never share kitty's remote-control socket out of the sandbox. `kitten @`
+// includes `launch`, so a reachable socket is command execution across
+// the boundary, in whichever direction it was shared.
+//
+// No `network`. The only part of kitty that wants one is the update
+// check, which swallows the failure and reports version 0.0.0, so it
+// degrades silently rather than stopping anything.
+//
+// A shell inside this sandbox sees only the private home. Share what you
+// want to work on, e.g.
+//     home-share "Projects" mode=rw
+wayland
+dri
+dbus
+portals
+notify
+command "kitty"

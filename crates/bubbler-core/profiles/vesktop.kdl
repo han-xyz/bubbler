@@ -1,4 +1,12 @@
 // bubbler profile: vesktop
+//
+// ~/Downloads is what an attachment is dragged out to or saved into;
+// flathub grants the same directory for exactly that. Pictures and
+// Videos stay out — sending a file is the portal file chooser's job.
+//
+// Extra Electron flags go in the private home's vesktop-flags.conf,
+// which /usr/bin/vesktop reads from $XDG_CONFIG_HOME. That wrapper also
+// sets ELECTRON_OZONE_PLATFORM_HINT itself, so no `env` node here does.
 wayland
 dri
 pipewire
@@ -7,4 +15,5 @@ dbus
 portals
 notify
 tray
+home-share "Downloads" mode=rw
 command "vesktop"

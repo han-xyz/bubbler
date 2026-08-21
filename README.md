@@ -64,9 +64,9 @@ inside it.
 `try` runs one command in a sandbox without creating an instance. Its config is
 the flattened profile (`generic` unless `--profile` says otherwise) plus one
 bare node per `--grant`; the grants are `wayland`, `x11`, `network`, `dri`,
-`pipewire`, `pulseaudio`, `dbus`, `portals`, `notify`, `tray` and `gamepad`,
-and anything with arguments needs a real instance — `system-bus` among them,
-since it is not a grant without rules. The bundles are checked as
+`pipewire`, `pulseaudio`, `dbus`, `portals`, `notify`, `tray`, `gamepad` and
+`hidraw`, and anything with arguments needs a real instance — `system-bus`
+among them, since it is not a grant without rules. The bundles are checked as
 they are in a config file, so `--grant tray` without `--grant dbus` is refused
 rather than silently dropped. A grant the profile already made is not repeated,
 properties and all: `--grant gamepad` on a profile carrying
@@ -111,8 +111,9 @@ file order does not affect the generated argv.
     pipewire                         # $XDG_RUNTIME_DIR/pipewire-0
     pulseaudio                       # $XDG_RUNTIME_DIR/pulse/native, sets PULSE_SERVER
     gamepad                          # /dev/input, and the sysfs that names it
-                                     #   hidraw=#true adds /dev/hidraw*,
+                                     #   hidraw=#true is the `hidraw` grant,
                                      #   uinput=#true adds /dev/uinput
+    hidraw                           # every /dev/hidraw* node, /sys/class/hidraw
     home-share "Downloads"           # $HOME/Downloads at /home/bubbler/Downloads
     home-share "Projects/x" mode=rw
     path-share "/kioxia/Steam"       # a host path, at that same path inside
@@ -162,7 +163,14 @@ entries are relative symlinks into those roots, so it adds only `version`)
 read-only — that is the sysfs attributes of every PCI device on the machine,
 not just the GPU. `pipewire` and `pulseaudio` hand the sandbox the session's
 audio socket directly, which is capture as well as playback: everything the
-session exposes, including the microphone, with no portal in between.
+session exposes, including the microphone, with no portal in between. An ALSA
+client reaches the same server through `/etc/alsa`, which the baseline binds:
+those files are where pipewire-alsa defines the `default` PCM, and without them
+alsa-lib falls back to a hardware card whose `/dev/snd` nodes no sandbox has.
+Only `/etc/alsa` is on the allowlist, not `/etc/asound.conf`, so a system-wide
+override of yours does not reach the sandbox; an `.asoundrc` in the private home
+does. `/dev/snd` itself is never bound, so an application that opens the
+hardware directly still has nothing to open.
 
 `dri` also hands over the proprietary NVIDIA stack where the host has it:
 every `/dev/nvidia*` char device with device access, and every
@@ -213,23 +221,8 @@ are readable even with no `network` grant. `/run/udev/data` hands over udev's
 database, which is the identity of every device on the machine. The wide bind
 is emitted after `dri`'s narrower ones, and bwrap takes both.
 
-`gamepad hidraw=#true` adds every `/dev/hidraw*` node the host has when the
-sandbox starts. Those are the raw HID interfaces SDL's hidapi backend drives
-the popular controllers through; without them SDL falls back to evdev, which
-`SDL_JOYSTICK_HIDAPI=0` also forces. There is no `/dev/hidraw` directory to
-bind, so unlike `/dev/input` this list is frozen at launch: a device plugged in
-afterwards has no hidraw node inside until the instance is restarted.
-`/sys/class/hidraw` is bound read-only with it when the host has it.
-
-The glob is **every** HID device on the machine, not the controllers: on this
-host `/dev/hidraw0` is a keyboard. As with `/dev/input`, what stops a sandbox
-from using one is the permissions on the node. Arch's stock
-`70-uaccess.rules` hands the logged-in user an ACL on security tokens
-(FIDO/U2F, `ID_SECURITY_TOKEN`), hardware wallets, 3D mice and AV control
-devices, and Steam's `60-steam-input.rules` adds one per supported controller —
-so a sandbox with `hidraw=#true` can speak to your security key or your
-hardware wallet whenever one is plugged in. Compare `ls -l /dev/hidraw*` and
-`getfacl /dev/hidraw*` with `id` before granting it.
+Raw HID devices are the `hidraw` grant below, which `gamepad hidraw=#true`
+is the older spelling of; a config holding both binds them once.
 
 `gamepad uinput=#true` adds `/dev/uinput`, which is how Steam Input creates its
 virtual controllers — and how anything creates a virtual keyboard. A sandbox
@@ -241,6 +234,34 @@ Steam's udev rules, which the wiki itself notes lets any logged-in user create
 globally available input devices; grant it only to a profile you would trust
 with your keyboard. A host whose `/dev/uinput` is missing (the `uinput` module
 not loaded) is an error, not a quietly weaker sandbox.
+
+### hidraw
+
+`hidraw` binds every `/dev/hidraw*` node the host has when the sandbox starts,
+with device access, plus `/sys/class/hidraw` read-only where the host has it.
+Those are the raw HID interfaces: a FIDO security key, a hardware wallet, a 3D
+mouse, and the controllers SDL's hidapi backend drives — without them SDL falls
+back to evdev, which `SDL_JOYSTICK_HIDAPI=0` also forces. `gamepad
+hidraw=#true` is the same grant written the older way, and a config with both
+nodes binds the devices once. Unlike `gamepad` it hands over no `/dev/input`,
+so an application that speaks to a FIDO key or a hardware wallet is not handed
+every keyboard on the machine as well.
+
+There is no `/dev/hidraw` directory to bind, so unlike `/dev/input` this list is
+frozen at launch: a device plugged in afterwards has no hidraw node inside
+until the instance is restarted. A key plugged in on demand is the common case,
+so that, and not the permission surface, is the real cost of the grant.
+
+The glob is **every** HID device on the machine, not the one you meant: on this
+host `/dev/hidraw0` is a keyboard. What stops a sandbox from using one is the
+permissions on the node. Arch's stock `70-uaccess.rules` hands the logged-in
+user an ACL on security tokens (FIDO/U2F, `ID_SECURITY_TOKEN`), hardware
+wallets, 3D mice and AV control devices, and Steam's `60-steam-input.rules`
+adds one per supported controller — so a sandbox with `hidraw` can speak to
+your security key or your hardware wallet whenever one is plugged in. Compare
+`ls -l /dev/hidraw*` and `getfacl /dev/hidraw*` with `id` before granting it.
+
+### env and command
 
 `env` keys must look like `[A-Za-z_][A-Za-z0-9_]*`, and each key may appear
 only once. `env` values and `command` arguments may not contain NUL, a newline
@@ -364,14 +385,18 @@ Every one is Wayland-first; only the two gaming profiles grant `x11`.
 
     alacritty     wayland
     chromium      wayland dri pipewire network dbus portals notify, ~/Downloads rw
+    code          wayland dri network dbus portals notify, ~/Projects rw
     firefox       wayland dri pipewire pulseaudio network dbus portals notify mpris, ~/Downloads rw
     generic       nothing beyond the baseline
+    keepassxc     wayland dbus portals notify tray, ~/Documents rw
+    kitty         wayland dri dbus portals notify
     libreoffice   wayland dri dbus portals, ~/Documents rw, SAL_USE_VCLPLUGIN=gtk3
     lutris        wayland x11 dri pipewire network dbus portals notify tray gamepad system-bus, ~/Games rw, seccomp disabled
     mpv           wayland dri pipewire, ~/Videos
+    spotify       wayland dri pipewire network dbus notify tray mpris
     steam         wayland x11 dri pipewire network dbus notify tray gamepad system-bus, seccomp disabled
     thunderbird   wayland network dri dbus portals notify, ~/Downloads rw
-    vesktop       wayland dri pipewire network dbus portals notify tray
+    vesktop       wayland dri pipewire network dbus portals notify tray, ~/Downloads rw
 
 `SAL_USE_VCLPLUGIN=gtk3` is there because bubbler clears the environment,
 leaving LibreOffice's VCL plugin to an autodetection with nothing to go on.
@@ -382,10 +407,38 @@ sets, so `MOZ_ENABLE_WAYLAND=1` is gone from both profiles — write
 `org.mozilla.firefox.*` instead, which is the remote-instance protocol a
 second `firefox` reaches the running one through.
 
-`chromium` and `vesktop` keep their own namespace sandbox: it nests inside
-bubbler's, and the setuid helper they would otherwise use simply falls back to
-it, so neither needs `--no-sandbox`. On a kernel with unprivileged user
-namespaces turned off, that nesting is what breaks first.
+`chromium`, `code` and `vesktop` keep their own namespace sandbox: it nests
+inside bubbler's, so none of them needs `--no-sandbox`. Where a package ships a
+setuid `chrome-sandbox` helper the namespace path is taken instead of it; Arch's
+`code` ships that helper without the setuid bit at all, so it never had another
+path. On a kernel with unprivileged user namespaces turned off, that nesting is
+what breaks first. None of the
+three may carry `userns "disable"`, and none of them needs an ozone hint:
+Electron picks the Wayland backend on its own, and Arch's `vesktop` wrapper
+sets the variable anyway.
+
+`keepassxc` is the one profile written mostly out of what it does **not**
+grant, and each omission is a comment in the profile saying how to add it back.
+No `network`: a database opens without one, and the grant is your password
+manager's process reaching the internet. No `own "org.freedesktop.secrets"`:
+that name makes the sandbox the Secret Service for the whole session, so every
+libsecret client in it — `code` among them, which is granted `talk` on that
+same name — would store its secrets there. It is an outward grant rather than a
+confinement. No `hidraw`, which would not help anyway: KeePassXC drives a
+YubiKey through libusb and a smart card through pcsclite, and bubbler grants
+neither. Browser integration does not work from a sandbox yet either (see
+"Known gaps").
+
+`spotify` owns `org.mpris.MediaPlayer2.spotify` exactly, not as a prefix, and
+its tray icon is the same one-rule `tray` grant as everywhere else. It has no
+`portals`, because there is no file chooser to speak of; add `portals` and a
+`home-share "Music"` for local files. `kitty` needs no grant for the
+pseudoterminals it makes: `--dev` gives each sandbox a private devpts instance
+with an index space of its own, and the host's `/dev/pts` is never bound. Its
+`dbus` and `portals` are what the `org.freedesktop.portal.Settings` read takes,
+without which it cannot follow the desktop colour scheme. Never share kitty's
+remote-control socket across the boundary — `kitten @` includes `launch`, so a
+reachable socket is command execution in whichever direction it was shared.
 
 `steam` and `lutris` are the two that grant `x11`, and that is the weak point
 of both: X11 has no isolation between clients, so a sandbox on your display can
@@ -811,11 +864,11 @@ loaded simply has no node, and then nothing is bound.
 (`crates/bubbler-core/src/bwrap.rs`) are bound, and only those that exist on
 the host — `ld.so.cache`, `ld.so.conf`, `ld.so.conf.d`, `fonts`, `localtime`,
 `machine-id`, `nsswitch.conf`, `hosts`, `host.conf`, `ssl`, `ca-certificates`,
-`mime.types`, `xdg`, `gtk-3.0`, `gtk-4.0`, `pulse`, `pipewire`, `drirc`,
-`vulkan`, `glvnd`, `egl`, `vdpau_wrapper.cfg`, `os-release`. `passwd` and
-`group` are generated: the sandbox sees the user `bubbler` (holding the host's
-uid and gid) and `nobody`, never the host's accounts, and `USER` and `LOGNAME`
-are `bubbler` as well.
+`mime.types`, `xdg`, `gtk-3.0`, `gtk-4.0`, `pulse`, `pipewire`, `alsa`,
+`drirc`, `vulkan`, `glvnd`, `egl`, `vdpau_wrapper.cfg`, `os-release`. `passwd`
+and `group` are generated: the sandbox sees the user `bubbler` (holding the
+host's uid and gid) and `nobody`, never the host's accounts, and `USER` and
+`LOGNAME` are `bubbler` as well.
 
 `x11` remaps any Xauthority file to `/home/bubbler/.Xauthority`, but it stays
 a compatibility grant: X11 offers no isolation between clients. Sockets and
@@ -837,9 +890,16 @@ binding the tree under it.
   sysfs topology alongside the node.
 - `dri` binds the NVIDIA device nodes but not `/etc/OpenCL` or `/etc/nvidia`,
   so compute and vendor application profiles need an `etc-share` of their own.
-- `gamepad hidraw=#true` binds the `/dev/hidraw*` nodes that exist at launch
-  and there is no directory to bind instead, so a device plugged in later is
-  invisible to hidapi until the instance restarts; evdev still sees it.
+- `hidraw` binds the `/dev/hidraw*` nodes that exist at launch and there is no
+  directory to bind instead, so a device plugged in later is invisible to
+  hidapi until the instance restarts; evdev still sees it.
+- No raw-USB grant (`/dev/bus/usb` and its sysfs) and no pcsclite socket, so a
+  challenge-response YubiKey or a smart card reader cannot be reached from a
+  sandbox; `hidraw` is a different device class and no substitute.
+- No shared per-app runtime directory, so KeePassXC's browser integration
+  cannot work: the proxy socket it serves lives in the sandbox's own
+  `$XDG_RUNTIME_DIR`, the browser is in another sandbox or on the host, and
+  `path-share` refuses that directory by design.
 - `/etc/machine-id` is bound in, so every instance shares one stable
   identifier with the host.
 - No desktop entries.

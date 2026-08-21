@@ -21,11 +21,15 @@ use crate::tty::TtyMode;
 pub const NAMES: &[&str] = &[
     "alacritty",
     "chromium",
+    "code",
     "firefox",
     "generic",
+    "keepassxc",
+    "kitty",
     "libreoffice",
     "lutris",
     "mpv",
+    "spotify",
     "steam",
     "thunderbird",
     "vesktop",
@@ -50,11 +54,15 @@ pub fn lookup(name: &str) -> Option<&'static str> {
     match name {
         "alacritty" => Some(include_str!("../profiles/alacritty.kdl")),
         "chromium" => Some(include_str!("../profiles/chromium.kdl")),
+        "code" => Some(include_str!("../profiles/code.kdl")),
         "firefox" => Some(include_str!("../profiles/firefox.kdl")),
         "generic" => Some(include_str!("../profiles/generic.kdl")),
+        "keepassxc" => Some(include_str!("../profiles/keepassxc.kdl")),
+        "kitty" => Some(include_str!("../profiles/kitty.kdl")),
         "libreoffice" => Some(include_str!("../profiles/libreoffice.kdl")),
         "lutris" => Some(include_str!("../profiles/lutris.kdl")),
         "mpv" => Some(include_str!("../profiles/mpv.kdl")),
+        "spotify" => Some(include_str!("../profiles/spotify.kdl")),
         "steam" => Some(include_str!("../profiles/steam.kdl")),
         "thunderbird" => Some(include_str!("../profiles/thunderbird.kdl")),
         "vesktop" => Some(include_str!("../profiles/vesktop.kdl")),
@@ -572,6 +580,7 @@ impl Merged {
             | Service::Portals
             | Service::Notify
             | Service::Tray
+            | Service::Hidraw
             | Service::EtcShare { .. } => {
                 if self.services.iter().any(|(s, _)| s == svc) {
                     return Ok(());
@@ -893,6 +902,135 @@ mod tests {
         }
 
         assert!(matches!(r.resolve("nope"), Err(ProfileError::NotFound(n)) if n == "nope"));
+    }
+
+    #[test]
+    fn the_desktop_profiles_grant_what_their_apps_need_and_nothing_wider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(tmp.path(), &[], &[]);
+        let cfg = |n: &str| r.resolve(n).unwrap().config;
+        let home_share = |p: &str, mode| Service::HomeShare {
+            path: PathBuf::from(p),
+            mode,
+        };
+        let talk = |n: &str| BusRule::Talk(n.to_owned());
+
+        let kp = cfg("keepassxc");
+        assert_eq!(kp.command, Some(vec![OsString::from("keepassxc")]));
+        assert!(kp.services.contains(&Service::Dbus {
+            rules: vec![
+                BusRule::Own("org.keepassxc.KeePassXC.*".to_owned()),
+                talk("org.freedesktop.ScreenSaver"),
+            ],
+        }));
+        assert!(
+            kp.services
+                .contains(&home_share("Documents", ShareMode::ReadWrite))
+        );
+        for s in [Service::Portals, Service::Notify, Service::Tray] {
+            assert!(kp.services.contains(&s), "{s:?}");
+        }
+        // A database needs no network, no HID device and no session-wide
+        // secrets name; each of the three is a comment in the profile
+        // rather than a grant, and each would be a real widening.
+        assert!(!kp.services.contains(&Service::Network));
+        assert!(!kp.services.contains(&Service::Hidraw));
+        assert!(
+            !kp.services.iter().any(|s| matches!(
+                s,
+                Service::Dbus { rules } if rules.contains(&BusRule::Own("org.freedesktop.secrets".to_owned()))
+            )),
+            "{:?}",
+            kp.services
+        );
+
+        let code = cfg("code");
+        assert_eq!(code.command, Some(vec![OsString::from("code")]));
+        assert!(code.services.contains(&Service::Dbus {
+            rules: vec![talk("org.freedesktop.secrets")],
+        }));
+        assert!(
+            code.services
+                .contains(&home_share("Projects", ShareMode::ReadWrite))
+        );
+        for s in [
+            Service::Wayland,
+            Service::Dri,
+            Service::Network,
+            Service::Portals,
+            Service::Notify,
+        ] {
+            assert!(code.services.contains(&s), "{s:?}");
+        }
+        // Electron 42 picks the Wayland backend on its own, so an ozone
+        // hint here would be a variable nobody reads.
+        assert!(code.env.is_empty(), "{:?}", code.env);
+
+        let sp = cfg("spotify");
+        assert_eq!(sp.command, Some(vec![OsString::from("spotify")]));
+        assert!(sp.services.contains(&Service::Dbus {
+            rules: vec![
+                talk("org.freedesktop.ScreenSaver"),
+                talk("org.gnome.SettingsDaemon.MediaKeys"),
+            ],
+        }));
+        assert!(sp.services.contains(&Service::Mpris {
+            name: "spotify".to_owned()
+        }));
+        for s in [Service::Pipewire, Service::Notify, Service::Tray] {
+            assert!(sp.services.contains(&s), "{s:?}");
+        }
+        // No file chooser to speak of, and no directory opened for one.
+        assert!(!sp.services.contains(&Service::Portals));
+        assert!(
+            !sp.services
+                .iter()
+                .any(|s| matches!(s, Service::HomeShare { .. })),
+            "{:?}",
+            sp.services
+        );
+
+        let kitty = cfg("kitty");
+        assert_eq!(kitty.command, Some(vec![OsString::from("kitty")]));
+        for s in [
+            Service::Wayland,
+            Service::Dri,
+            Service::Dbus { rules: Vec::new() },
+            Service::Portals,
+            Service::Notify,
+        ] {
+            assert!(kitty.services.contains(&s), "{s:?}");
+        }
+        // A terminal makes its own ptys in the private devpts `--dev`
+        // gives it; the host's is never bound.
+        assert!(
+            !kitty
+                .services
+                .iter()
+                .any(|s| matches!(s, Service::PathShare { .. })),
+            "{:?}",
+            kitty.services
+        );
+
+        // Vesktop saves attachments through a directory it can write.
+        assert!(
+            cfg("vesktop")
+                .services
+                .contains(&home_share("Downloads", ShareMode::ReadWrite))
+        );
+    }
+
+    #[test]
+    fn hidraw_written_in_two_layers_is_merged_into_one_node() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(
+            tmp.path(),
+            &[],
+            &[("app", "include \"base\"\nhidraw\n"), ("base", "hidraw\n")],
+        );
+        let resolved = r.resolve("app").unwrap();
+        assert_eq!(resolved.config.services, vec![Service::Hidraw]);
+        assert_eq!(resolved.text, "hidraw\n");
     }
 
     #[test]

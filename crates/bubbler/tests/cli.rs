@@ -818,6 +818,119 @@ fn real_bwrap_gamepad_hidraw_shows_the_host_hidraw_nodes() {
 }
 
 #[test]
+fn real_bwrap_hidraw_binds_the_nodes_without_the_input_tree() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let host = host_hidraw_nodes();
+    if host.is_empty() {
+        eprintln!("skipping: this host has no /dev/hidraw* nodes");
+        return;
+    }
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "hidraw\n").unwrap();
+
+    let out = bubbler_live(tmp.path(), &init)
+        .args([
+            "run",
+            "t",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            "ls -1 /dev | grep '^hidraw'; echo ---; ls /dev/input 2>/dev/null | head -1",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (listing, rest) = stdout
+        .split_once("---\n")
+        .unwrap_or_else(|| panic!("{stdout}"));
+    let mut inside: Vec<String> = listing.lines().map(str::to_owned).collect();
+    inside.sort_unstable();
+    assert_eq!(inside, host, "{stdout}");
+    // The point of the grant against `gamepad hidraw=#true`: the HID
+    // nodes without every keyboard and mouse the host has.
+    assert_eq!(rest.trim(), "", "{stdout}");
+}
+
+#[test]
+fn real_bwrap_alsa_configuration_reaches_the_sandbox() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    if !Path::new("/etc/alsa").is_dir() {
+        eprintln!("skipping: this host has no /etc/alsa directory");
+        return;
+    }
+    let tmp = setup();
+    bubbler_dbus(tmp.path(), &init)
+        .args(["create", "alsacfg"])
+        .status()
+        .unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/alsacfg/config.kdl");
+    // The runtime dir is the session's own here, so the socket the
+    // `pipewire` grant binds is the one alsa-lib is routed to.
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    let sound = runtime.is_some_and(|d| d.join("pipewire-0").exists());
+    std::fs::write(&cfg, if sound { "pipewire\n" } else { "" }).unwrap();
+
+    let out = bubbler_dbus(tmp.path(), &init)
+        .args([
+            "run",
+            "alsacfg",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            "ls /etc/alsa/conf.d",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    let listing = String::from_utf8_lossy(&out.stdout);
+    // The symlinks in there point into the read-only /usr, so they
+    // resolve inside; an empty directory would mean the tmpfs won.
+    assert!(!listing.trim().is_empty(), "{listing}");
+
+    // `default` is the pipewire PCM those files define. Without them
+    // alsa-lib falls back to the hardware card, which no sandbox has.
+    if sound && Path::new("/usr/bin/aplay").is_file() {
+        let out = bubbler_dbus(tmp.path(), &init)
+            .args(["run", "alsacfg", "--", "/usr/bin/aplay", "-L"])
+            .output()
+            .unwrap();
+        let pcms = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            pcms.lines().any(|l| l == "default"),
+            "{pcms}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // The instance's runtime state is in the session's own runtime dir
+    // rather than under the test root, so it is deleted rather than left
+    // for the temporary directory to take with it.
+    let out = bubbler_dbus(tmp.path(), &init)
+        .args(["delete", "alsacfg", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn real_bwrap_gamepad_uinput_binds_the_node_and_says_so() {
     if !require_bwrap() {
         return;
@@ -2338,6 +2451,7 @@ fn try_rejects_bad_grants_and_cleans_up_a_failed_start() {
         "notify",
         "tray",
         "gamepad",
+        "hidraw",
     ] {
         assert!(err.contains(grant), "{grant} missing from {err}");
     }

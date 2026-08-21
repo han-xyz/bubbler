@@ -41,6 +41,7 @@ pub const GRANTS: &[&str] = &[
     "notify",
     "tray",
     "gamepad",
+    "hidraw",
 ];
 
 /// Directory holding all instances.
@@ -208,6 +209,7 @@ fn grant_service(name: &str) -> Option<Service> {
             hidraw: false,
             uinput: false,
         },
+        "hidraw" => Service::Hidraw,
         _ => return None,
     })
 }
@@ -866,6 +868,30 @@ mod tests {
             ));
         }
         assert!(!try_root(&env).exists() || try_root(&env).read_dir().unwrap().next().is_none());
+    }
+
+    #[test]
+    fn hidraw_is_a_grant_of_its_own_beside_the_gamepad_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut env = env(tmp.path());
+        env.runtime_dir = tmp.path().join("run");
+        let eph = Instance::ephemeral(&env, "generic", &["hidraw"]).unwrap();
+        assert_eq!(eph.instance.config.services, vec![Service::Hidraw]);
+        drop(eph);
+        // The older spelling is a different node, so a profile carrying
+        // it does not swallow the grant; the launcher binds once.
+        let mut cfg = config::parse("gamepad hidraw=#true").unwrap();
+        with_grants(&mut cfg, &["hidraw"]).unwrap();
+        assert_eq!(
+            cfg.services,
+            vec![
+                Service::Gamepad {
+                    hidraw: true,
+                    uinput: false
+                },
+                Service::Hidraw
+            ]
+        );
     }
 
     #[test]
