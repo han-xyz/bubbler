@@ -5,6 +5,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 
 use crate::env::{Env, SANDBOX_HOME};
@@ -105,6 +106,7 @@ pub const ETC_ALLOWLIST: &[&str] = &[
     "vulkan",
     "glvnd",
     "egl",
+    "vdpau_wrapper.cfg",
     "os-release",
 ];
 
@@ -130,13 +132,14 @@ impl BwrapArgs {
     /// The restrictions every sandbox gets: all namespaces unshared, no
     /// network, read-only `/usr` `/opt`, an `/etc` that is an allowlist
     /// ([`ETC_ALLOWLIST`]) over a tmpfs plus a synthetic passwd and group,
-    /// empty `/tmp` `/var` `/run`, a private home at [`SANDBOX_HOME`], an
-    /// empty `$XDG_RUNTIME_DIR` at the same path as on the host and mode
-    /// 0700 (`--perms` applies to the next operation only, so it must
+    /// empty `/tmp` `/var` `/run`, `/dev/ntsync` where the host has that
+    /// node, a private home at [`SANDBOX_HOME`], an empty
+    /// `$XDG_RUNTIME_DIR` at the same path as on the host and mode 0700
+    /// (`--perms` applies to the next operation only, so it must
     /// immediately precede `--dir`), the private home as the working
     /// directory, an `--info-fd` the sandbox pid is reported on, cleared
-    /// environment with only locale/terminal
-    /// passthrough and the fixed user name. Services relax
+    /// environment with only locale/terminal passthrough and the fixed
+    /// user name. Services relax
     /// this explicitly. `--unshare-all` uses bwrap's `-try` semantics for
     /// the user namespace (`bwrap(1)`), so on a host without unprivileged
     /// user namespaces the sandbox may start without one; to be revisited.
@@ -206,6 +209,20 @@ impl BwrapArgs {
             &mut a.skeleton,
             [o("--proc"), o("/proc"), o("--dev"), o("/dev")],
         );
+        // Wine's and Proton's synchronisation primitive, which flatpak binds
+        // with no permission of its own: the objects it makes belong to the
+        // process that opened it, so there is no host state behind it. The
+        // deliberate trade is that every sandbox reaches the ntsync driver's
+        // ioctl surface (`drivers/misc/ntsync`, kernel 6.14 and later) rather
+        // than Wine falling back to slow sync. The bind follows `--dev`,
+        // which would otherwise hide it.
+        let ntsync = Path::new("/dev/ntsync");
+        if host.file_type(ntsync).is_some_and(|t| t.is_char_device()) {
+            push(
+                &mut a.skeleton,
+                [o("--dev-bind"), ntsync.as_os_str(), ntsync.as_os_str()],
+            );
+        }
         push(
             &mut a.skeleton,
             [
@@ -711,6 +728,43 @@ mod tests {
     }
 
     #[test]
+    fn ntsync_is_bound_only_where_the_host_has_the_node() {
+        let host = FakeHost::default().with("/dev/ntsync", crate::host::fake::char_dev());
+        let argv = BwrapArgs::baseline(&env(), Path::new("/i/home"), &host)
+            .finish(&["sh".into()], &mut Counter::new())
+            .unwrap();
+        let s = strs(&argv);
+        let dev = s
+            .windows(2)
+            .position(|w| w == ["--dev", "/dev"])
+            .expect("the baseline always mounts /dev");
+        assert_eq!(
+            &s[dev + 2..dev + 5],
+            &["--dev-bind", "/dev/ntsync", "/dev/ntsync"],
+            "the bind has to follow the --dev that would otherwise hide it: {s:?}"
+        );
+
+        let wrong_type = FakeHost::default().with("/dev/ntsync", crate::host::fake::types().0);
+        let argv = BwrapArgs::baseline(&env(), Path::new("/i/home"), &wrong_type)
+            .finish(&["sh".into()], &mut Counter::new())
+            .unwrap();
+        assert!(!strs(&argv).contains(&"/dev/ntsync"));
+    }
+
+    #[test]
+    fn the_proxy_sandbox_gets_no_ntsync() {
+        let host = FakeHost::default().with("/dev/ntsync", crate::host::fake::char_dev());
+        let argv = BwrapArgs::proxy_baseline(
+            Path::new("/run/user/1000/bus"),
+            Path::new("/run/user/1000/bubbler/t/dbus"),
+            &host,
+        )
+        .finish_plain(&["xdg-dbus-proxy".into()], &mut Counter::new())
+        .unwrap();
+        assert!(!strs(&argv).contains(&"/dev/ntsync"));
+    }
+
+    #[test]
     fn proxy_baseline_argv_is_exact() {
         let (f, d, _) = crate::host::fake::types();
         let host = FakeHost::default()
@@ -809,6 +863,7 @@ mod tests {
         let host = FakeHost::default()
             .with("/etc/hosts", f)
             .with("/etc/fonts", d)
+            .with("/etc/vdpau_wrapper.cfg", f)
             .with("/etc/shadow", f);
         let argv = BwrapArgs::baseline(&env(), Path::new("/i/home"), &host)
             .finish(&["sh".into()], &mut Counter::new())
@@ -824,6 +879,12 @@ mod tests {
             s.windows(3)
                 .any(|w| w == ["--ro-bind", "/etc/fonts", "/etc/fonts"])
         );
+        assert!(s.windows(3).any(|w| w
+            == [
+                "--ro-bind",
+                "/etc/vdpau_wrapper.cfg",
+                "/etc/vdpau_wrapper.cfg"
+            ]));
         assert!(!s.contains(&"/etc/shadow"));
         assert!(!s.windows(3).any(|w| w == ["--ro-bind", "/etc", "/etc"]));
         assert!(pos("/etc/hosts") > pos("--tmpfs"));
