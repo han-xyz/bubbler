@@ -6,6 +6,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::config::{self, InstanceConfig, RawProfile, Service, ShareMode};
@@ -167,6 +168,33 @@ impl Resolver {
         &self.system_dir
     }
 
+    /// Path of `name` in the user layer, ready for an editor to open: the
+    /// directory exists, and a name the user layer does not hold yet is
+    /// written with a starting point. An existing file is never touched.
+    pub fn edit_path(&self, name: &str) -> Result<PathBuf, ProfileError> {
+        if !is_plain_name(name) {
+            return Err(ProfileError::InvalidName(name.to_owned()));
+        }
+        let below = self.lookup(name)?.iter().any(|l| l.origin != Origin::User);
+        fs::create_dir_all(&self.user_dir)
+            .map_err(|e| ProfileError::Io(self.user_dir.clone(), e))?;
+        let path = self.user_dir.join(format!("{name}.kdl"));
+        // `create_new`: asking and writing are one operation, so a profile
+        // that appears in between is opened as it is rather than replaced.
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => f
+                .write_all(starter(name, below).as_bytes())
+                .map_err(|e| ProfileError::Io(path.clone(), e))?,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(ProfileError::Io(path, e)),
+        }
+        Ok(path)
+    }
+
     /// Every layer holding `name`, user first, then system, then built-in.
     /// A name that is not a plain profile name matches nothing rather than
     /// reaching a file outside the two directories.
@@ -324,6 +352,55 @@ fn names_in(dir: &Path) -> Result<Vec<String>, ProfileError> {
     }
     names.sort();
     Ok(names)
+}
+
+/// What a new user profile holds when no layer below carries the name:
+/// the same commented examples the `generic` profile is written with. An
+/// empty file would say nothing about what a profile may grant.
+const TEMPLATE: &str = "\
+// Grants a new instance is seeded with, e.g.:
+//   wayland
+//   network
+//   home-share \"Downloads\" mode=rw
+// and a default command:
+//   command \"foot\"
+";
+
+/// The text `edit_path` writes for a profile the user layer does not hold
+/// yet: an `include` of the layer below, so editing extends the shipped
+/// profile instead of forking it, or [`TEMPLATE`] when there is none.
+fn starter(name: &str, below: bool) -> String {
+    // The name passed the profile name grammar, so it holds no quote,
+    // backslash or newline that would need escaping here.
+    let body = if below {
+        format!("include \"{name}\"\n")
+    } else {
+        TEMPLATE.to_owned()
+    };
+    format!("// bubbler profile: {name} (user layer)\n{body}")
+}
+
+/// The flattened profile as `bubbler profile show` prints it: the header
+/// a seeded `config.kdl` carries, then every node under a `// from:`
+/// comment naming the layer that contributed it. Consecutive nodes from
+/// one layer share the comment. Lines are `OsString` because a profile
+/// path need not be UTF-8.
+pub fn show(name: &str, resolved: &Resolved) -> Vec<OsString> {
+    let mut out = vec![OsString::from(format!("// bubbler profile: {name}"))];
+    let mut last: Option<&NodeOrigin> = None;
+    for node in &resolved.origins {
+        if last.is_none_or(|p| (p.origin, &p.path) != (node.origin, &node.path)) {
+            let mut line = OsString::from("// from: ");
+            match &node.path {
+                Some(p) => line.push(p),
+                None => line.push("built-in"),
+            }
+            out.push(line);
+        }
+        out.push(OsString::from(&node.node));
+        last = Some(node);
+    }
+    out
 }
 
 /// The layer one merged node came from.
@@ -959,5 +1036,119 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let r = resolver(tmp.path(), &[("a", "include \"gone\"\n")], &[]);
         assert!(matches!(r.resolve("a"), Err(ProfileError::NotFound(n)) if n == "gone"));
+    }
+
+    /// `show` as a single string, for tests whose paths are all UTF-8.
+    fn shown(name: &str, r: &Resolver) -> String {
+        let mut out = String::new();
+        for line in show(name, &r.resolve(name).unwrap()) {
+            out.push_str(&line.into_string().unwrap());
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn show_names_the_layer_each_run_of_nodes_came_from() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(
+            tmp.path(),
+            &[("a", "include \"b\"\nnetwork\ncommand \"a\"\n")],
+            &[("b", "wayland\ndri\n")],
+        );
+        assert_eq!(
+            shown("a", &r),
+            format!(
+                "// bubbler profile: a\n\
+                 // from: {system}/b.kdl\n\
+                 wayland\n\
+                 dri\n\
+                 // from: {user}/a.kdl\n\
+                 network\n\
+                 command \"a\"\n",
+                system = r.system_dir().display(),
+                user = r.user_dir().display(),
+            )
+        );
+    }
+
+    #[test]
+    fn show_of_a_built_in_says_so_and_a_profile_granting_nothing_is_its_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(tmp.path(), &[], &[]);
+        assert_eq!(shown("generic", &r), "// bubbler profile: generic\n");
+        let alacritty = shown("alacritty", &r);
+        assert!(
+            alacritty.starts_with("// bubbler profile: alacritty\n// from: built-in\n"),
+            "{alacritty}"
+        );
+        assert_eq!(alacritty.matches("// from:").count(), 1, "{alacritty}");
+        // Every run of the same layer is one comment, and the nodes are
+        // the flattened text itself.
+        let resolved = r.resolve("alacritty").unwrap();
+        let nodes: String =
+            alacritty
+                .lines()
+                .filter(|l| !l.starts_with("//"))
+                .fold(String::new(), |mut s, l| {
+                    s.push_str(l);
+                    s.push('\n');
+                    s
+                });
+        assert_eq!(nodes, resolved.text);
+    }
+
+    #[test]
+    fn edit_path_seeds_an_include_of_the_layer_below() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(tmp.path(), &[], &[("only-system", "dri\n")]);
+        for name in ["firefox", "only-system"] {
+            let path = r.edit_path(name).unwrap();
+            assert_eq!(path, r.user_dir().join(format!("{name}.kdl")));
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                format!("// bubbler profile: {name} (user layer)\ninclude \"{name}\"\n")
+            );
+            // What it seeds must resolve, or the editor opens a file that
+            // is already broken.
+            assert!(r.resolve(name).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn edit_path_seeds_a_template_when_no_layer_below_holds_the_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(tmp.path(), &[], &[]);
+        let path = r.edit_path("mine").unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text,
+            format!("// bubbler profile: mine (user layer)\n{TEMPLATE}")
+        );
+        // A template of commented examples only, so the profile resolves
+        // to the same baseline `generic` does.
+        assert!(!text.contains("include"), "{text}");
+        assert_eq!(r.resolve("mine").unwrap().text, "");
+    }
+
+    #[test]
+    fn edit_path_never_touches_a_profile_that_is_already_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(tmp.path(), &[("mine", "network\n")], &[]);
+        let path = r.edit_path("mine").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "network\n");
+    }
+
+    #[test]
+    fn edit_path_refuses_a_name_that_could_name_a_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(tmp.path(), &[], &[]);
+        for bad in ["../escape", "/etc/passwd", "a/b", "", ".", "..", "-x"] {
+            assert!(
+                matches!(r.edit_path(bad), Err(ProfileError::InvalidName(n)) if n == bad),
+                "{bad}"
+            );
+        }
+        assert!(!r.user_dir().join("escape.kdl").exists());
     }
 }

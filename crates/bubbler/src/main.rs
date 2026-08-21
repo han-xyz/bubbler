@@ -115,6 +115,32 @@ enum Cmd {
         /// Instance name.
         name: String,
     },
+    /// Show or edit one profile.
+    Profile {
+        #[command(subcommand)]
+        cmd: ProfileCmd,
+    },
+    /// Re-seed an instance's config.kdl from its profile, keeping `home/`.
+    Reseed {
+        /// Instance name.
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProfileCmd {
+    /// Print the profile flattened through its layers, each node under
+    /// the layer it came from.
+    Show {
+        /// Profile name.
+        name: String,
+    },
+    /// Open your layer's copy in $VISUAL or $EDITOR, then re-resolve it.
+    /// A name you do not have yet is written with a starting point first.
+    Edit {
+        /// Profile name.
+        name: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -144,6 +170,41 @@ fn print_lines(lines: &[&OsStr], what: &str) -> Result<i32> {
         Ok(()) => Ok(0),
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(0),
         Err(e) => Err(e).with_context(|| format!("writing {what}")),
+    }
+}
+
+/// Open `path` in `$VISUAL`, else `$EDITOR`, and wait. `Some(code)` is a
+/// non-zero editor exit to propagate as bubbler's own.
+fn run_editor(path: &Path) -> Result<Option<i32>> {
+    let editor = host_env::editor().context("neither VISUAL nor EDITOR is set")?;
+    // $VISUAL/$EDITOR is split into argv, never passed to a shell.
+    let mut parts = editor
+        .as_bytes()
+        .split(u8::is_ascii_whitespace)
+        .filter(|p| !p.is_empty());
+    let program = parts.next().context("VISUAL or EDITOR is blank")?;
+    let status = Command::new(OsStr::from_bytes(program))
+        .args(parts.map(OsStr::from_bytes))
+        .arg(path)
+        .status()
+        .with_context(|| format!("running editor {}", String::from_utf8_lossy(program)))?;
+    Ok((!status.success()).then(|| launcher::exit_code(status)))
+}
+
+/// Exit code for a file the editor has just left: 0 when it parses again,
+/// 1 after naming what is still wrong with it. The file is kept either
+/// way, since only its author knows what it was meant to say.
+fn recheck<T, E>(path: &Path, result: Result<T, E>) -> i32
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    match result {
+        Ok(_) => 0,
+        Err(e) => {
+            let e = anyhow::Error::new(e).context(format!("{} still has errors", path.display()));
+            eprintln!("bubbler: {e:#}");
+            1
+        }
     }
 }
 
@@ -292,30 +353,36 @@ fn real_main() -> Result<i32> {
         Cmd::Edit { name } => {
             let path = instance::config_path_checked(&env, &name)
                 .with_context(|| format!("opening instance `{name}`"))?;
-            let editor = host_env::editor().context("neither VISUAL nor EDITOR is set")?;
-            // $VISUAL/$EDITOR is split into argv, never passed to a shell.
-            let mut parts = editor
-                .as_bytes()
-                .split(u8::is_ascii_whitespace)
-                .filter(|p| !p.is_empty());
-            let program = parts.next().context("VISUAL or EDITOR is blank")?;
-            let status = Command::new(OsStr::from_bytes(program))
-                .args(parts.map(OsStr::from_bytes))
-                .arg(&path)
-                .status()
-                .with_context(|| format!("running editor {}", String::from_utf8_lossy(program)))?;
-            if !status.success() {
-                return Ok(launcher::exit_code(status));
+            if let Some(code) = run_editor(&path)? {
+                return Ok(code);
             }
-            match Instance::open(&env, &name) {
-                Ok(_) => Ok(0),
-                Err(e) => {
-                    let e = anyhow::Error::new(e)
-                        .context(format!("{} still has errors", path.display()));
-                    eprintln!("bubbler: {e:#}");
-                    Ok(1)
+            Ok(recheck(&path, Instance::open(&env, &name)))
+        }
+        Cmd::Profile { cmd } => match cmd {
+            ProfileCmd::Show { name } => {
+                let resolved = profile::Resolver::new(&env)
+                    .resolve(&name)
+                    .with_context(|| format!("resolving profile `{name}`"))?;
+                let lines = profile::show(&name, &resolved);
+                let lines: Vec<&OsStr> = lines.iter().map(OsString::as_os_str).collect();
+                print_lines(&lines, "the profile")
+            }
+            ProfileCmd::Edit { name } => {
+                let profiles = profile::Resolver::new(&env);
+                let path = profiles
+                    .edit_path(&name)
+                    .with_context(|| format!("opening profile `{name}`"))?;
+                if let Some(code) = run_editor(&path)? {
+                    return Ok(code);
                 }
+                Ok(recheck(&path, profiles.resolve(&name)))
             }
+        },
+        Cmd::Reseed { name } => {
+            let inst = Instance::reseed(&env, &name)
+                .with_context(|| format!("reseeding instance `{name}`"))?;
+            let path = inst.config_path();
+            print_lines(&[path.as_os_str()], "the config path")
         }
     }
 }

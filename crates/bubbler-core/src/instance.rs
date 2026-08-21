@@ -17,6 +17,12 @@ use crate::profile;
 
 const CONFIG_FILE: &str = "config.kdl";
 
+/// Where `reseed` keeps the `config.kdl` it replaces.
+const BACKUP_FILE: &str = "config.kdl.bak";
+
+/// First line of a seeded `config.kdl`, followed by the profile name.
+const HEADER: &str = "// bubbler profile: ";
+
 /// Service names [`Instance::ephemeral`] accepts as grants: the bare
 /// config nodes, which take no arguments. Anything else needs a config
 /// file and therefore a real instance.
@@ -195,9 +201,17 @@ fn seed(
     };
     // The name passed the profile name grammar to resolve at all, so it
     // holds no newline that could end the header comment early.
-    let text = format!("// bubbler profile: {profile_name}\n{body}");
+    let text = format!("{HEADER}{profile_name}\n{body}");
     let config = config::parse(&text)?;
     Ok((text, config))
+}
+
+/// The profile name the first line records, if that line is the header
+/// [`seed`] writes and what follows it is a profile name. A hand-written
+/// config without it names no profile to re-flatten.
+fn profile_header(text: &str) -> Option<&str> {
+    let name = text.lines().next()?.strip_prefix(HEADER)?.trim_end();
+    is_plain_name(name).then_some(name)
 }
 
 /// The pid a sweepable directory is named after: decimal digits only, so
@@ -429,6 +443,35 @@ impl Instance {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(InstanceError::Io(run, e)),
         }
+    }
+
+    /// Re-flatten the profile named in `config.kdl`'s header into that
+    /// file, keeping the private `home/`. What it replaces is kept beside
+    /// it as `config.kdl.bak`, overwriting an older backup.
+    pub fn reseed(env: &Env, name: &str) -> Result<Self, InstanceError> {
+        let cfg_path = config_path_checked(env, name)?;
+        // A running sandbox was built from the file as it stands, and
+        // bwrap cannot be told about a bind after the fact: rewriting it
+        // now would describe grants that sandbox does not have.
+        if crate::exec::connect(env, name)
+            .map_err(InstanceError::Probe)?
+            .is_some()
+        {
+            return Err(InstanceError::AlreadyRunning(name.to_owned()));
+        }
+        let text = fs::read_to_string(&cfg_path).map_err(io_err(&cfg_path))?;
+        let profile_name = profile_header(&text)
+            .ok_or_else(|| InstanceError::NoProfileHeader(cfg_path.clone()))?;
+        let (fresh, config) = seed(env, profile_name, &[])?;
+        let dir = instances_root(env).join(name);
+        let backup = dir.join(BACKUP_FILE);
+        fs::copy(&cfg_path, &backup).map_err(io_err(&backup))?;
+        fs::write(&cfg_path, &fresh).map_err(io_err(&cfg_path))?;
+        Ok(Self {
+            name: name.to_owned(),
+            dir,
+            config,
+        })
     }
 
     /// Whether `s` is among the granted services.
@@ -771,5 +814,106 @@ mod tests {
         };
         assert!(!dir.exists());
         assert!(run.is_dir());
+    }
+
+    #[test]
+    fn only_the_header_seed_writes_names_a_profile() {
+        assert_eq!(
+            profile_header("// bubbler profile: ff\nwayland\n"),
+            Some("ff")
+        );
+        assert_eq!(profile_header("// bubbler profile: ff"), Some("ff"));
+        assert_eq!(profile_header("// bubbler profile: ff \n"), Some("ff"));
+        for bad in [
+            "",
+            "wayland\n",
+            "// bubbler profile:\n",
+            "// bubbler profile: \n",
+            "//bubbler profile: ff\n",
+            "// bubbler profile: ../escape\n",
+            "wayland\n// bubbler profile: ff\n",
+        ] {
+            assert_eq!(profile_header(bad), None, "{bad:?}");
+        }
+    }
+
+    /// Write `text` as the user layer's profile `name`.
+    fn user_profile(env: &Env, name: &str, text: &str) {
+        let dir = env.config_home.join("bubbler").join("profiles");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{name}.kdl")), text).unwrap();
+    }
+
+    #[test]
+    fn reseed_rewrites_from_the_profile_and_keeps_the_old_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut env = env(tmp.path());
+        env.runtime_dir = tmp.path().join("run");
+        user_profile(&env, "app", "wayland\n");
+        let inst = Instance::create(&env, "a", "app").unwrap();
+        let before = fs::read_to_string(inst.config_path()).unwrap();
+        fs::write(inst.home().join("data"), b"kept").unwrap();
+
+        user_profile(&env, "app", "wayland\nnetwork\n");
+        let after = Instance::reseed(&env, "a").unwrap();
+        assert!(after.config.services.contains(&Service::Network));
+        assert_eq!(
+            fs::read_to_string(after.config_path()).unwrap(),
+            "// bubbler profile: app\nwayland\nnetwork\n"
+        );
+        assert_eq!(
+            fs::read_to_string(after.dir.join(BACKUP_FILE)).unwrap(),
+            before
+        );
+        // The private home is the point of reseeding rather than
+        // recreating: nothing in it is touched.
+        assert_eq!(
+            fs::read_to_string(after.home().join("data")).unwrap(),
+            "kept"
+        );
+
+        // A second reseed overwrites the backup rather than refusing.
+        user_profile(&env, "app", "dri\n");
+        let after = Instance::reseed(&env, "a").unwrap();
+        assert!(after.config.services.contains(&Service::Dri));
+        assert!(
+            fs::read_to_string(after.dir.join(BACKUP_FILE))
+                .unwrap()
+                .contains("network")
+        );
+    }
+
+    #[test]
+    fn reseed_needs_a_header_and_an_instance_that_is_not_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut env = env(tmp.path());
+        env.runtime_dir = tmp.path().join("run");
+        assert!(matches!(
+            Instance::reseed(&env, "gone"),
+            Err(InstanceError::NotFound(_))
+        ));
+        let inst = Instance::create(&env, "a", "generic").unwrap();
+        fs::write(inst.config_path(), "wayland\n").unwrap();
+        assert!(matches!(
+            Instance::reseed(&env, "a"),
+            Err(InstanceError::NoProfileHeader(p)) if p == inst.config_path()
+        ));
+        assert!(!inst.dir.join(BACKUP_FILE).exists());
+
+        // Something answering on the control socket is what "running"
+        // means to every other subcommand, so it is what is bound here.
+        let sock = crate::exec::socket_path(&env, "a");
+        fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        fs::write(inst.config_path(), "// bubbler profile: generic\n").unwrap();
+        assert!(matches!(
+            Instance::reseed(&env, "a"),
+            Err(InstanceError::AlreadyRunning(n)) if n == "a"
+        ));
+        assert_eq!(
+            fs::read_to_string(inst.config_path()).unwrap(),
+            "// bubbler profile: generic\n"
+        );
+        assert!(!inst.dir.join(BACKUP_FILE).exists());
     }
 }

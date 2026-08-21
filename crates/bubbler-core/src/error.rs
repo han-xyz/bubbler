@@ -78,6 +78,14 @@ pub enum ProfileError {
         /// The second layer's version, with where it came from.
         b: String,
     },
+    /// A name that is not one path component of the profile name grammar.
+    /// Only `bubbler profile edit` reaches this: looking such a name up is
+    /// [`ProfileError::NotFound`], since no layer can hold it.
+    #[error(
+        "invalid profile name `{0}`: use letters, digits, `.`, `_` and `-`, \
+         not starting with `-`, and not `.` or `..`"
+    )]
+    InvalidName(String),
     /// Filesystem failure at a specific path.
     #[error("{0}")]
     Io(PathBuf, #[source] io::Error),
@@ -106,6 +114,18 @@ pub enum InstanceError {
     /// The instance path is a symlink; bubbler never deletes through one.
     #[error("{0} is a symlink; refusing to delete through it")]
     IsSymlink(PathBuf),
+    /// `reseed` while the instance is running. The live sandbox was built
+    /// from `config.kdl` as it stands, so rewriting it now would describe
+    /// grants that sandbox does not have.
+    #[error("instance `{0}` is running; stop it before reseeding")]
+    AlreadyRunning(String),
+    /// `config.kdl` carries no `// bubbler profile: <name>` header, so
+    /// there is no profile to re-flatten it from.
+    #[error("{0} has no `// bubbler profile: <name>` header to reseed from")]
+    NoProfileHeader(PathBuf),
+    /// Asking the instance's control socket whether it is running failed.
+    #[error("checking whether the instance is running")]
+    Probe(#[source] LaunchError),
     /// Filesystem failure at a specific path.
     #[error("{0}")]
     Io(PathBuf, #[source] io::Error),
