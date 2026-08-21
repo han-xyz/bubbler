@@ -438,6 +438,8 @@ impl Merged {
             | Service::Pulseaudio
             | Service::Portals
             | Service::Notify
+            | Service::Tray
+            | Service::Gamepad
             | Service::EtcShare { .. } => {
                 if self.services.iter().any(|(s, _)| s == svc) {
                     return Ok(());

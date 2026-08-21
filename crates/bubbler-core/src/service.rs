@@ -60,10 +60,17 @@ pub fn apply_all(
             // Bound below, once every share has been resolved: two
             // overlapping shares must be refused before either is emitted.
             Service::PathShare { .. } => {}
+            // Bound after the loop, so its whole-`/sys/devices` bind always
+            // follows the PCI roots `dri` binds under it rather than
+            // depending on the order of the two nodes in the file.
+            Service::Gamepad => {}
             // Rule-only bundles: they reach the sandbox through the proxy
             // the launcher starts, not through bwrap arguments.
-            Service::Notify | Service::Mpris { .. } => {}
+            Service::Notify | Service::Tray | Service::Mpris { .. } => {}
         }
+    }
+    if services.contains(&Service::Gamepad) {
+        gamepad(args, host)?;
     }
     for (dst, src, mode) in shares {
         match mode {
@@ -277,6 +284,42 @@ fn dri(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
         });
     }
     Ok(())
+}
+
+/// Game controllers: `/dev/input` with device access, plus the `/sys`
+/// entries that identify a device and the udev database where the host
+/// has one. `/dev/input` is every input device, keyboards included.
+fn gamepad(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
+    // The directory, not the nodes it holds today, exactly as flatpak's
+    // `--device=input`: a node bound one by one freezes the device list at
+    // start, while the directory shows a controller plugged in later.
+    // Never `/dev/uinput`, which is input injection into the host session.
+    let dev = require_dir(host, "gamepad", PathBuf::from("/dev/input"))?;
+    args.dev_bind(&dev, &dev);
+    // `/sys/class/input` entries are symlinks into `/sys/devices`, and a
+    // bluetooth or virtual controller lives outside the PCI roots `dri`
+    // exposes, so the whole tree is bound read-only.
+    for p in ["/sys/class/input", "/sys/devices"] {
+        let p = require_dir(host, "gamepad", PathBuf::from(p))?;
+        args.ro_bind(&p, &p);
+    }
+    // Identification only: the udev monitor is a netlink socket, which
+    // delivers no uevents in the sandbox's own network namespace.
+    let udev = PathBuf::from("/run/udev");
+    match host.file_type(&udev) {
+        // A host with no udev database is not an error; libudev and SDL
+        // both fall back to reading the device directory itself.
+        None => Ok(()),
+        Some(t) if t.is_dir() => {
+            args.ro_bind(&udev, &udev);
+            Ok(())
+        }
+        Some(_) => Err(LaunchError::WrongType {
+            service: "gamepad",
+            path: udev,
+            expected: "a directory",
+        }),
+    }
 }
 
 /// Bind the PipeWire socket at the same path; clients find it through
@@ -1545,6 +1588,125 @@ mod tests {
             ),
             Err(LaunchError::MissingResource { service: "dri", .. })
         ));
+    }
+
+    /// Where `seq` starts in `argv`, for the tests that care which of two
+    /// binds bwrap applies first.
+    fn seq_at(argv: &[String], seq: &[&str]) -> Option<usize> {
+        argv.windows(seq.len())
+            .position(|w| w.iter().map(String::as_str).eq(seq.iter().copied()))
+    }
+
+    fn gamepad_host() -> Vec<(&'static str, Kind)> {
+        vec![
+            ("/dev/input", Dir),
+            ("/sys/class/input", Dir),
+            ("/sys/devices", Dir),
+            ("/run/udev", Dir),
+        ]
+    }
+
+    #[test]
+    fn gamepad_binds_the_input_directory_and_the_sysfs_around_it() {
+        let a = argv(&[Service::Gamepad], &env(), &gamepad_host()).unwrap();
+        assert!(has_seq(&a, &["--dev-bind", "/dev/input", "/dev/input"]));
+        assert!(has_seq(
+            &a,
+            &["--ro-bind", "/sys/class/input", "/sys/class/input"]
+        ));
+        assert!(has_seq(&a, &["--ro-bind", "/sys/devices", "/sys/devices"]));
+        assert!(has_seq(&a, &["--ro-bind", "/run/udev", "/run/udev"]));
+        // Writing to `/dev/uinput` is synthetic input into the host session.
+        assert!(!a.iter().any(|s| s.contains("uinput")), "{a:?}");
+    }
+
+    #[test]
+    fn gamepad_without_a_udev_database_still_builds() {
+        let host: Vec<_> = gamepad_host()
+            .into_iter()
+            .filter(|(p, _)| *p != "/run/udev")
+            .collect();
+        let a = argv(&[Service::Gamepad], &env(), &host).unwrap();
+        assert!(has_seq(&a, &["--dev-bind", "/dev/input", "/dev/input"]));
+        assert!(!a.iter().any(|s| s.contains("udev")), "{a:?}");
+    }
+
+    #[test]
+    fn gamepad_refuses_a_source_that_is_not_a_directory() {
+        for wrong in [
+            "/dev/input",
+            "/sys/class/input",
+            "/sys/devices",
+            "/run/udev",
+        ] {
+            let host: Vec<_> = gamepad_host()
+                .into_iter()
+                .map(|(p, k)| if p == wrong { (p, File) } else { (p, k) })
+                .collect();
+            assert!(
+                matches!(
+                    argv(&[Service::Gamepad], &env(), &host),
+                    Err(LaunchError::WrongType {
+                        service: "gamepad",
+                        expected: "a directory",
+                        ..
+                    })
+                ),
+                "{wrong}"
+            );
+        }
+        let host: Vec<_> = gamepad_host()
+            .into_iter()
+            .filter(|(p, _)| *p != "/sys/class/input")
+            .collect();
+        assert!(matches!(
+            argv(&[Service::Gamepad], &env(), &host),
+            Err(LaunchError::MissingResource {
+                service: "gamepad",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn gamepad_binds_sysfs_devices_after_the_pci_roots_whatever_the_file_order() {
+        let mut host = gamepad_host();
+        host.extend([
+            ("/dev/dri", Dir),
+            ("/sys/dev/char", Dir),
+            ("/sys/devices/system/cpu", Dir),
+            ("/sys/devices/pci0000:00", Dir),
+        ]);
+        for order in [
+            [Service::Dri, Service::Gamepad],
+            [Service::Gamepad, Service::Dri],
+        ] {
+            let a = argv(&order, &env(), &host).unwrap();
+            let pci = seq_at(
+                &a,
+                &[
+                    "--ro-bind",
+                    "/sys/devices/pci0000:00",
+                    "/sys/devices/pci0000:00",
+                ],
+            )
+            .expect("dri binds the PCI root");
+            let all = seq_at(&a, &["--ro-bind", "/sys/devices", "/sys/devices"])
+                .expect("gamepad binds the device tree");
+            assert!(pci < all, "{order:?}: {a:?}");
+        }
+    }
+
+    #[test]
+    fn tray_adds_no_bwrap_arguments() {
+        let bare = argv(&[Service::Dbus { rules: vec![] }], &env(), &[]).unwrap();
+        let with_tray = argv(
+            &[Service::Dbus { rules: vec![] }, Service::Tray],
+            &env(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(bare, with_tray);
     }
 
     #[test]

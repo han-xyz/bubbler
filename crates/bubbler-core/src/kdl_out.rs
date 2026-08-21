@@ -53,6 +53,8 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
         Service::Pulseaudio => "pulseaudio".to_owned(),
         Service::Portals => "portals".to_owned(),
         Service::Notify => "notify".to_owned(),
+        Service::Tray => "tray".to_owned(),
+        Service::Gamepad => "gamepad".to_owned(),
         Service::HomeShare { path, mode } => {
             let path = text("home-share", "path", path.as_os_str())?;
             let mut node = format!("home-share {}", quote(path));
@@ -224,6 +226,8 @@ mod tests {
             }
             portals
             notify
+            tray
+            gamepad
             mpris name="firefox.*"
             tty "passthrough"
             seccomp {

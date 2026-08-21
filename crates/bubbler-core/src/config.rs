@@ -119,6 +119,13 @@ pub enum Service {
     Portals,
     /// Talk to `org.freedesktop.Notifications`. Requires [`Service::Dbus`].
     Notify,
+    /// Talk to `org.kde.StatusNotifierWatcher`, which is what registering
+    /// a tray icon takes. Requires [`Service::Dbus`].
+    Tray,
+    /// Game controllers: the `/dev/input` device nodes, which are every
+    /// input device the host has, plus the sysfs and udev database entries
+    /// that identify them.
+    Gamepad,
     /// Own `org.mpris.MediaPlayer2.<name>` so media keys and player
     /// controls reach the app. Requires [`Service::Dbus`].
     Mpris {
@@ -185,7 +192,7 @@ fn parse_doc(text: &str, profile: bool) -> Result<RawProfile, ConfigError> {
         reject_types(node)?;
         match name {
             "wayland" | "x11" | "network" | "dri" | "pipewire" | "pulseaudio" | "portals"
-            | "notify" => {
+            | "notify" | "tray" | "gamepad" => {
                 reject_entries(node)?;
                 let svc = match name {
                     "wayland" => Service::Wayland,
@@ -195,6 +202,8 @@ fn parse_doc(text: &str, profile: bool) -> Result<RawProfile, ConfigError> {
                     "pipewire" => Service::Pipewire,
                     "portals" => Service::Portals,
                     "notify" => Service::Notify,
+                    "tray" => Service::Tray,
+                    "gamepad" => Service::Gamepad,
                     _ => Service::Pulseaudio,
                 };
                 if cfg.services.contains(&svc) {
@@ -306,6 +315,7 @@ fn bundle_without_dbus(services: &[Service]) -> Option<&'static str> {
     services.iter().find_map(|s| match s {
         Service::Portals => Some("portals"),
         Service::Notify => Some("notify"),
+        Service::Tray => Some("tray"),
         Service::Mpris { .. } => Some("mpris"),
         _ => None,
     })
@@ -1276,6 +1286,43 @@ command "b""#
             parse("notify\ndbus").unwrap().services,
             vec![Service::Notify, Service::Dbus { rules: vec![] }]
         );
+    }
+
+    #[test]
+    fn tray_and_gamepad_are_bare_grants() {
+        let cfg = parse("dbus\ntray\ngamepad").unwrap();
+        assert_eq!(
+            cfg.services,
+            vec![
+                Service::Dbus { rules: vec![] },
+                Service::Tray,
+                Service::Gamepad
+            ]
+        );
+        assert!(matches!(
+            parse("dbus\ntray\ntray"),
+            Err(ConfigError::Duplicate(n)) if n == "tray"
+        ));
+        assert!(matches!(
+            parse("gamepad\ngamepad"),
+            Err(ConfigError::Duplicate(n)) if n == "gamepad"
+        ));
+        assert!(matches!(
+            parse("tray"),
+            Err(ConfigError::BadArgument { node, reason })
+                if node == "tray" && reason == "requires dbus"
+        ));
+        // `gamepad` is device access, not a set of proxy rules, so it
+        // stands on its own.
+        assert!(parse("gamepad").is_ok());
+        assert!(matches!(
+            parse("dbus\ntray \"x\""),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("gamepad { hidraw; }"),
+            Err(ConfigError::BadArgument { .. })
+        ));
     }
 
     #[test]

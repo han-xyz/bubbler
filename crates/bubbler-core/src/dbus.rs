@@ -75,6 +75,14 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
                 &mut rules,
                 "--talk=org.freedesktop.Notifications".to_owned(),
             ),
+            // The watcher is all a tray icon takes: an item registers on
+            // the app's own unique name, and the calls the host makes back
+            // into it are incoming, which the proxy does not filter
+            // (`xdg-dbus-proxy(1)`).
+            Service::Tray => push(
+                &mut rules,
+                "--talk=org.kde.StatusNotifierWatcher".to_owned(),
+            ),
             Service::Mpris { name } => {
                 push(&mut rules, format!("--own=org.mpris.MediaPlayer2.{name}"));
             }
@@ -322,6 +330,14 @@ mod tests {
             p.flatpak_info,
             b"[Application]\nname=org.bubbler.ff\n\n[Instance]\ninstance-id=bubbler-ff\n".to_vec()
         );
+    }
+
+    #[test]
+    fn tray_grants_only_the_status_notifier_watcher() {
+        let p =
+            plan(&[Service::Dbus { rules: vec![] }, Service::Tray], "t").expect("dbus is granted");
+        assert_eq!(strs(&p.rules), vec!["--talk=org.kde.StatusNotifierWatcher"]);
+        assert!(!p.portals);
     }
 
     #[test]

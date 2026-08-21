@@ -97,6 +97,7 @@ file order does not affect the generated argv.
     dri                              # GPU: /dev/dri and the PCI devices' sysfs
     pipewire                         # $XDG_RUNTIME_DIR/pipewire-0
     pulseaudio                       # $XDG_RUNTIME_DIR/pulse/native, sets PULSE_SERVER
+    gamepad                          # /dev/input, and the sysfs that names it
     home-share "Downloads"           # $HOME/Downloads at /home/bubbler/Downloads
     home-share "Projects/x" mode=rw
     path-share "/kioxia/Steam"       # a host path, at that same path inside
@@ -111,6 +112,7 @@ file order does not affect the generated argv.
     }
     portals                          # XDG portal rules plus /.flatpak-info
     notify                           # talk to org.freedesktop.Notifications
+    tray                             # talk to org.kde.StatusNotifierWatcher
     mpris name="firefox.*"           # own org.mpris.MediaPlayer2.firefox.*
     tty "pty"                        # terminal: "pty", "passthrough" or "none"
     seccomp {                        # changes to the default syscall denylist
@@ -137,6 +139,22 @@ device on the machine, not just the GPU. `pipewire` and `pulseaudio` hand the
 sandbox the session's audio socket directly, which is capture as well as
 playback: everything the session exposes, including the microphone, with no
 portal in between.
+
+`gamepad` binds `/dev/input` with device access and `/sys/class/input`,
+`/sys/devices` and `/run/udev` (when the host has it) read-only, which is what
+a controller takes to be found and identified. It is the directory that is
+bound, not the nodes in it, so a controller plugged in later shows up too —
+though the application has to be watching the directory, which SDL only does
+when it can tell it is sandboxed, from the `/.flatpak-info` that `portals`
+writes. `/dev/input` is **every** input device the machine has, keyboards
+included. On Arch the `event*` nodes are `0660 root:input` while a controller
+also gets an ACL for the logged-in user from udev's `uaccess` tag, so an
+ordinary user's sandbox opens the controller and not the keyboard — but a user
+who is in the group `input` turns `gamepad` into a keylogger grant, because the
+sandbox keeps the host's supplementary groups. `/dev/uinput` is never bound:
+writing to it injects input into the host session. `gamepad` also binds the
+whole `/sys/devices` tree, which is wider than `dri`'s PCI roots and contains
+them; the wider bind is emitted after them, and bwrap takes both.
 
 `env` keys must look like `[A-Za-z_][A-Za-z0-9_]*`, and each key may appear
 only once. `env` values and `command` arguments may not contain NUL, a newline
@@ -231,8 +249,9 @@ the same `home-share` or `path-share` path in two modes is an error rather
 than a silent choice of `ro` or `rw`. `command`, `tty` and `mpris` from the including file
 replace the included one, `env` replaces by key, `dbus` rules and `seccomp`
 lists are unioned, and `seccomp { disable }` in any layer disables the
-filter. `portals`, `notify` and `mpris` need `dbus` in the merged result, not
-in every layer, so a layer may add `notify` to a `dbus` it includes.
+filter. `portals`, `notify`, `tray` and `mpris` need `dbus` in the merged
+result, not in every layer, so a layer may add `notify` to a `dbus` it
+includes.
 
 `create` and `try` write the flattened result, so `config.kdl` is one screen
 that says everything the sandbox will be granted. Flattening keeps no
@@ -273,17 +292,29 @@ proxy keeps serving after the move: it listens on the socket, not on the path.
 The host bus is `$DBUS_SESSION_BUS_ADDRESS` when it is a `unix:path=`
 address, else `$XDG_RUNTIME_DIR/bus`, and must be a socket. Everything the
 sandbox may reach is a rule: the `dbus` children above, plus the bundles
-`portals`, `notify` and `mpris`, each of which needs `dbus`. `portals` also
-puts a `/.flatpak-info` in the sandbox giving it the application id
-`org.bubbler.<name>`, which is what portals and the proxy identify it by. A
-`.` in the name becomes `_`, since only the last element of an id may hold a
-`-` and xdg-desktop-portal refuses every operation of a sandbox whose id it
-cannot parse; a leading digit is prefixed with `_`, which the portal would
-take but flatpak's own name check would not. The rules it grants are `--talk`
-for `org.freedesktop.portal.Desktop`, `.Documents` and `.FileChooser` plus the
-`--call`/`--broadcast` pair from the `xdg-dbus-proxy(1)` examples; the spawn
-portal (`org.freedesktop.portal.Flatpak`), which starts processes outside the
+`portals`, `notify`, `tray` and `mpris`, each of which needs `dbus`.
+`portals` also puts a `/.flatpak-info` in the sandbox giving it the
+application id `org.bubbler.<name>`, which is what portals and the proxy
+identify it by. A `.` in the name becomes `_`, since only the last element
+of an id may hold a `-` and xdg-desktop-portal refuses every operation of a
+sandbox whose id it cannot parse; a leading digit is prefixed with `_`,
+which the portal would take but flatpak's own name check would not. The
+rules it grants are `--talk` for `org.freedesktop.portal.Desktop`,
+`.Documents` and `.FileChooser` plus the `--call`/`--broadcast` pair from
+the `xdg-dbus-proxy(1)` examples; the spawn portal
+(`org.freedesktop.portal.Flatpak`), which starts processes outside the
 sandbox, is not among them.
+
+`tray` is one rule, `--talk=org.kde.StatusNotifierWatcher`: an app registers
+its icon with the watcher and serves the item itself on its own unique name,
+and what the host's tray then calls back into the app is incoming, which the
+proxy does not filter. Nothing needs `own`. The wildcard is a dot-namespace
+one, so `own "org.kde.StatusNotifierItem-*"` is not a pattern but a literal
+name that never matches, and an app that really needs a well-known item name
+must write that exact name. Never `own "org.kde.*"`: it covers the watcher's
+own name, and a sandbox that owns it can impersonate the tray and collect
+every other application's items.
+
 `BUBBLER_DBUS_LOG=1` runs the proxy with `--log`, so every filtered message is
 printed to bubbler's stderr.
 
@@ -497,6 +528,8 @@ binding the tree under it.
 - The seccomp filter holds one architecture, so 32-bit binaries inside are
   killed rather than filtered; see "Seccomp".
 - No proprietary nvidia driver; `dri` covers the open stack.
+- `gamepad` grants no `/dev/hidraw*`, so a controller SDL would drive through
+  hidapi falls back to evdev; `SDL_JOYSTICK_HIDAPI=0` makes that explicit.
 - `/etc/machine-id` is bound in, so every instance shares one stable
   identifier with the host.
 - No desktop entries.

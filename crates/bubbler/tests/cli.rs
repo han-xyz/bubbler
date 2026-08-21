@@ -458,6 +458,61 @@ fn real_bwrap_path_share_reads_the_host_and_mode_rw_writes_through() {
 }
 
 #[test]
+fn real_bwrap_gamepad_shows_the_host_input_nodes_and_no_uinput() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    if !Path::new("/dev/input").is_dir() {
+        eprintln!("skipping: this host has no /dev/input directory");
+        return;
+    }
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "gamepad\n").unwrap();
+
+    let out = bubbler_live(tmp.path(), &init)
+        .args([
+            "run",
+            "t",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            "ls -1 /dev/input; echo ---; test -e /dev/uinput && echo uinput; \
+             test -r /run/udev/data && echo udev; true",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (listing, rest) = stdout
+        .split_once("---\n")
+        .unwrap_or_else(|| panic!("{stdout}"));
+
+    let mut inside: Vec<&str> = listing.lines().collect();
+    let mut host: Vec<String> = std::fs::read_dir("/dev/input")
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    inside.sort_unstable();
+    host.sort_unstable();
+    assert_eq!(inside, host, "{stdout}");
+
+    // The sandbox may not inject input into the host session.
+    assert!(!rest.contains("uinput"), "{stdout}");
+    assert_eq!(
+        rest.contains("udev"),
+        Path::new("/run/udev/data").is_dir(),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn real_bwrap_runs_true_and_propagates_exit_code() {
     if !require_bwrap() {
         return;
