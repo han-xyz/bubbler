@@ -424,10 +424,11 @@ pub fn lint_config(ctx: &Context, path: &Path) -> Result<Report, LintError> {
     lint_text(ctx, Where::File(path.to_path_buf()), text)
 }
 
-/// Lint one config already in hand. A file the parser rejects is a failed
-/// run rather than a clean report, unless a check already said what is
-/// wrong with it — `own` on the system bus is refused by both.
-fn lint_text(ctx: &Context, at: Where, text: String) -> Result<Report, LintError> {
+/// Lint one config already in hand, which is what an editor holding an
+/// unsaved buffer has. A file the parser rejects is a failed run rather
+/// than a clean report, unless a check already said what is wrong with
+/// it — `own` on the system bus is refused by both.
+pub fn lint_text(ctx: &Context, at: Where, text: String) -> Result<Report, LintError> {
     let source = Source::read(at, text)?;
     let report = run(ctx, std::slice::from_ref(&source));
     if !explains_a_parse_failure(&report) {

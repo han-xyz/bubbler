@@ -42,6 +42,41 @@ pub const RESERVED_ETC: &[&str] = &[
     "gshadow", "gshadow-", "gshadow+",
 ];
 
+/// Every top-level node a `config.kdl` may hold, in the order the
+/// README documents them. The parser resolves a node name against this
+/// list before it reaches a match arm and
+/// [`crate::catalogue::GRANTS`] describes each entry, so what bubbler
+/// takes and what bubbler documents are one list. `include` is not here:
+/// it is the one node only a profile layer takes.
+pub const NODES: &[&str] = &[
+    "wayland",
+    "x11",
+    "network",
+    "dri",
+    "pipewire",
+    "pulseaudio",
+    "gamepad",
+    "hidraw",
+    "camera",
+    "home-share",
+    "path-share",
+    "etc-share",
+    "app-runtime",
+    "dbus",
+    "system-bus",
+    "portals",
+    "notify",
+    "tray",
+    "mpris",
+    "tty",
+    "userns",
+    "seccomp",
+    "env",
+    "lint-allow",
+    "desktop",
+    "command",
+];
+
 /// Whether the sandbox may create user namespaces of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Userns {
@@ -239,6 +274,36 @@ pub enum Service {
     },
 }
 
+impl Service {
+    /// The KDL node this grant is written as, which is what
+    /// [`crate::catalogue::GRANTS`] is keyed by. Every variant is named
+    /// here: a grant whose node the catalogue cannot look up is one
+    /// nothing can explain to the user.
+    pub fn node_name(&self) -> &'static str {
+        match self {
+            Self::Wayland => "wayland",
+            Self::X11 => "x11",
+            Self::Network(_) => "network",
+            Self::Dri => "dri",
+            Self::Pipewire => "pipewire",
+            Self::Pulseaudio => "pulseaudio",
+            Self::HomeShare { .. } => "home-share",
+            Self::PathShare { .. } => "path-share",
+            Self::EtcShare { .. } => "etc-share",
+            Self::Dbus { .. } => "dbus",
+            Self::SystemBus { .. } => "system-bus",
+            Self::Portals => "portals",
+            Self::Notify => "notify",
+            Self::Tray => "tray",
+            Self::Gamepad { .. } => "gamepad",
+            Self::Hidraw => "hidraw",
+            Self::Camera { .. } => "camera",
+            Self::Mpris { .. } => "mpris",
+            Self::AppRuntime { .. } => "app-runtime",
+        }
+    }
+}
+
 /// Parsed `config.kdl`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InstanceConfig {
@@ -260,6 +325,10 @@ pub struct InstanceConfig {
     pub userns: Userns,
     /// Lint findings this file has accepted, in file order.
     pub lint_allows: Vec<LintAllow>,
+    /// Basename of the desktop entry `bubbler desktop` writes this
+    /// instance's launcher entry from, where the command's own entry is
+    /// not named after it.
+    pub desktop: Option<String>,
 }
 
 /// One profile layer as written: the same nodes an instance config may
@@ -335,6 +404,12 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
     for node in doc.nodes() {
         let name = node.name().value();
         reject_types(node)?;
+        // Resolved against the table rather than by falling off the end
+        // of the match: an arm added without an entry there is a node
+        // the catalogue never describes, and the two lists would drift.
+        if !NODES.contains(&name) && name != "include" {
+            return Err(ConfigError::UnknownNode(name.to_owned()));
+        }
         match name {
             "wayland" | "x11" | "dri" | "pipewire" | "pulseaudio" | "portals" | "notify"
             | "tray" | "hidraw" => {
@@ -499,6 +574,12 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
                     return Err(bad(node, "include is only valid in profiles"));
                 }
                 includes.push(parse_include(node)?);
+            }
+            "desktop" => {
+                if cfg.desktop.is_some() {
+                    return Err(ConfigError::Duplicate(name.to_owned()));
+                }
+                cfg.desktop = Some(parse_desktop(node)?);
             }
             "command" => {
                 if cfg.command.is_some() {
@@ -1409,6 +1490,29 @@ fn deny_errno(node: &KdlNode) -> Result<Errno, ConfigError> {
         };
     }
     Ok(errno)
+}
+
+/// `desktop "<name>.desktop"`: the basename of the vendor entry an
+/// instance's launcher entry is written from. A basename and not a path,
+/// because the entry is looked up in the XDG application directories; a
+/// path here would name a file outside them that nothing re-checks.
+fn parse_desktop(node: &KdlNode) -> Result<String, ConfigError> {
+    let name = one_string_arg(node)?;
+    if node.children().is_some() {
+        return Err(bad(node, "takes no children"));
+    }
+    let plain = name
+        .strip_suffix(".desktop")
+        .is_some_and(|stem| !stem.is_empty() && !stem.contains('/') && stem != "." && stem != "..");
+    if !plain || forbidden_byte(name).is_some() {
+        // Not echoed back: the value is config text and may hold the
+        // control bytes the error message would then carry.
+        return Err(bad(
+            node,
+            "expects the file name of a desktop entry, such as \"org.example.App.desktop\"",
+        ));
+    }
+    Ok(name.to_owned())
 }
 
 fn parse_command(node: &KdlNode) -> Result<Vec<OsString>, ConfigError> {
@@ -2898,5 +3002,102 @@ command "b""#
         let raw = parse_profile("tty \"pty\"").unwrap();
         assert!(raw.tty_set);
         assert_eq!(raw.config.tty, TtyMode::Pty);
+    }
+
+    #[test]
+    fn the_node_table_is_the_list_of_nodes_the_parser_takes() {
+        // Every name in the table reaches an arm of its own: a name the
+        // table holds and the parser does not would be a node the
+        // catalogue describes and no config can hold.
+        for node in NODES {
+            let err = parse(node).err();
+            assert!(
+                !matches!(err, Some(ConfigError::UnknownNode(_))),
+                "`{node}` is in NODES and the parser does not take it"
+            );
+        }
+        assert!(matches!(
+            parse("teleport"),
+            Err(ConfigError::UnknownNode(n)) if n == "teleport"
+        ));
+        // `include` is the one node only a profile takes, so it is not in
+        // the table an instance config is measured against.
+        assert!(!NODES.contains(&"include"));
+        assert!(parse_profile("include \"generic\"").is_ok());
+        let mut sorted = NODES.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), NODES.len(), "NODES holds a name twice");
+    }
+
+    #[test]
+    fn every_grant_knows_the_node_it_is_written_as() {
+        for (text, node) in [
+            ("wayland", "wayland"),
+            ("x11", "x11"),
+            ("network \"host\"", "network"),
+            ("dri", "dri"),
+            ("pipewire", "pipewire"),
+            ("pulseaudio", "pulseaudio"),
+            ("home-share \"Downloads\"", "home-share"),
+            ("path-share \"/mnt/data\"", "path-share"),
+            ("etc-share \"vulkan\"", "etc-share"),
+            ("app-runtime \"org.example.App\"", "app-runtime"),
+            ("dbus", "dbus"),
+            (
+                "system-bus { talk \"org.freedesktop.UPower\" }",
+                "system-bus",
+            ),
+            ("portals", "portals"),
+            ("notify", "notify"),
+            ("tray", "tray"),
+            ("gamepad", "gamepad"),
+            ("hidraw", "hidraw"),
+            ("camera", "camera"),
+            ("mpris name=\"x\"", "mpris"),
+        ] {
+            let cfg = parse_profile(text)
+                .unwrap_or_else(|e| panic!("{text}: {e}"))
+                .config;
+            let [svc] = cfg.services.as_slice() else {
+                panic!("{text} granted no single service");
+            };
+            assert_eq!(svc.node_name(), node, "{text}");
+            assert!(NODES.contains(&svc.node_name()), "{node} is not in NODES");
+        }
+    }
+
+    #[test]
+    fn the_desktop_node_names_one_entry_file_and_nothing_else() {
+        assert_eq!(parse("").unwrap().desktop, None);
+        assert_eq!(
+            parse("desktop \"org.mozilla.Thunderbird.desktop\"")
+                .unwrap()
+                .desktop
+                .as_deref(),
+            Some("org.mozilla.Thunderbird.desktop")
+        );
+        // A path, a name that is not an entry, and every shape that is
+        // not one string: each would name a file the lookup would have to
+        // guess at.
+        for text in [
+            "desktop \"/usr/share/applications/kitty.desktop\"",
+            "desktop \"sub/kitty.desktop\"",
+            "desktop \"kitty\"",
+            "desktop \".desktop\"",
+            "desktop \"..desktop\"",
+            "desktop \"\"",
+            "desktop",
+            "desktop \"a.desktop\" \"b.desktop\"",
+            "desktop name=\"a.desktop\"",
+            "desktop \"a.desktop\" { x; }",
+            "desktop 1",
+        ] {
+            assert!(parse(text).is_err(), "{text}");
+        }
+        assert!(matches!(
+            parse("desktop \"a.desktop\"\ndesktop \"b.desktop\""),
+            Err(ConfigError::Duplicate(n)) if n == "desktop"
+        ));
     }
 }

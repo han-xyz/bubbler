@@ -571,6 +571,38 @@ impl Instance {
         }
     }
 
+    /// Write `config` back to `config.kdl`, keeping the headers the file
+    /// carries: the profile it was seeded from, so `reseed` still knows
+    /// where to re-flatten it from, and the config version, so no later
+    /// run warns about meanings this file has just been written against.
+    /// What it replaces is kept beside it as `config.kdl.bak`, and the
+    /// rename is atomic, so a reader sees one whole config or the other.
+    ///
+    /// Comments and layout are not kept: the file is rendered from the
+    /// config, which holds the grants and not the text around them.
+    pub fn save(&self, config: &InstanceConfig) -> Result<(), InstanceError> {
+        let cfg_path = self.config_path();
+        let held = fs::read_to_string(&cfg_path).map_err(io_err(&cfg_path))?;
+        let mut text = String::new();
+        // A profile is only named where the file already named one: a
+        // header invented here would send `reseed` to somebody else's
+        // profile. The name passed the profile grammar to be read as a
+        // header at all, so it holds no newline of its own.
+        if let Some(profile_name) = profile_header(&held) {
+            text.push_str(&format!("{PROFILE_HEADER}{profile_name}\n"));
+        }
+        text.push_str(&format!("{CONFIG_HEADER}{CONFIG_VERSION}\n"));
+        text.push_str(&kdl_out::render(config)?);
+        // Read back before anything is written, the way a seed is: a file
+        // the parser would refuse is an instance that cannot be opened
+        // again, and the checks across nodes (`camera` needs `portals`)
+        // are only made here.
+        config::parse(&text)?;
+        let backup = self.dir.join(BACKUP_FILE);
+        fs::copy(&cfg_path, &backup).map_err(io_err(&backup))?;
+        write_atomic(&cfg_path, &text)
+    }
+
     /// Re-flatten the profile named in `config.kdl`'s header into that
     /// file, keeping the private `home/`. What it replaces is kept beside
     /// it as `config.kdl.bak`, overwriting an older backup.
@@ -749,6 +781,95 @@ mod tests {
             panic!("a name whose proxy socket is truncated was accepted");
         };
         assert_eq!(path, longest(&name));
+    }
+
+    #[test]
+    fn save_keeps_the_headers_and_the_file_it_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = env(tmp.path());
+        let inst = Instance::create(&env, "ff", "firefox").unwrap();
+        let seeded = fs::read_to_string(inst.config_path()).unwrap();
+        let mut edited = inst.config.clone();
+        edited.services.push(Service::X11);
+        edited.desktop = Some("firefox.desktop".to_owned());
+        inst.save(&edited).unwrap();
+
+        let text = fs::read_to_string(inst.config_path()).unwrap();
+        let mut lines = text.lines();
+        assert_eq!(
+            lines.next(),
+            Some(format!("{PROFILE_HEADER}firefox").as_str())
+        );
+        assert_eq!(
+            lines.next(),
+            Some(format!("{CONFIG_HEADER}{CONFIG_VERSION}").as_str())
+        );
+        let reopened = Instance::open(&env, "ff").unwrap();
+        assert_eq!(reopened.config, edited);
+        // The version header is what stops every later run warning about
+        // the meanings the file was written against.
+        assert_eq!(reopened.config_version, Some(CONFIG_VERSION));
+        assert!(reopened.migration_warning().is_none());
+        // What it replaced is kept beside it, and the temporary file the
+        // rename went through is gone.
+        assert_eq!(
+            fs::read_to_string(inst.dir.join(BACKUP_FILE)).unwrap(),
+            seeded
+        );
+        assert!(!inst.dir.join(TEMP_FILE).exists());
+
+        // The profile header survived, so the instance can still be
+        // re-flattened from the profile it came from.
+        let reseeded = Instance::reseed(&env, "ff").unwrap();
+        assert_eq!(reseeded.config, inst.config);
+        assert!(reseeded.migration_warning().is_none());
+    }
+
+    #[test]
+    fn save_writes_no_profile_header_where_the_file_named_no_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = env(tmp.path());
+        let inst = Instance::create(&env, "hand", "generic").unwrap();
+        // A config written by hand, with neither header.
+        fs::write(
+            inst.config_path(),
+            "wayland
+",
+        )
+        .unwrap();
+        let inst = Instance::open(&env, "hand").unwrap();
+        assert_eq!(inst.config_version, None);
+        inst.save(&inst.config).unwrap();
+        let text = fs::read_to_string(inst.config_path()).unwrap();
+        // No profile is invented for it: there is none to re-flatten from,
+        // and a header naming one would send `reseed` to the wrong file.
+        assert_eq!(text, format!("{CONFIG_HEADER}{CONFIG_VERSION}\nwayland\n"));
+        assert!(matches!(
+            Instance::reseed(&env, "hand"),
+            Err(InstanceError::NoProfileHeader(_))
+        ));
+    }
+
+    #[test]
+    fn save_refuses_a_config_it_could_not_read_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = env(tmp.path());
+        let inst = Instance::create(&env, "c", "generic").unwrap();
+        let seeded = fs::read_to_string(inst.config_path()).unwrap();
+        // `camera` without `portals` renders, and the parser refuses it:
+        // saved, the instance could not be opened again.
+        let broken = InstanceConfig {
+            services: vec![Service::Camera { nodes: false }],
+            ..InstanceConfig::default()
+        };
+        assert!(matches!(
+            inst.save(&broken),
+            Err(InstanceError::Config(config::ConfigError::BadArgument { ref node, .. }))
+                if node == "camera"
+        ));
+        // Nothing was touched: not the config, and no backup of it either.
+        assert_eq!(fs::read_to_string(inst.config_path()).unwrap(), seeded);
+        assert!(!inst.dir.join(BACKUP_FILE).exists());
     }
 
     #[test]

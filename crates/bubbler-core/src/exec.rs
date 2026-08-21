@@ -52,6 +52,18 @@ pub fn connect(env: &Env, name: &str) -> Result<Option<UnixStream>, LaunchError>
     }
 }
 
+/// Whether an instance is running, without sending it anything and
+/// without touching the socket: the connection is opened and dropped.
+///
+/// Unlike [`connect`], a socket left over from a dead run is left where
+/// it is — this is the probe a caller may make on every redraw, and
+/// unlinking belongs to the paths that are about to bind the path again.
+/// Anything that is not a connection answered by a listener counts as
+/// not running, since nothing could be exec'd through it either.
+pub fn is_live(env: &Env, name: &str) -> bool {
+    UnixStream::connect(socket_path(env, name)).is_ok()
+}
+
 /// Poll with no wait at all: the relay asks between its own reads and
 /// must never park here.
 const NOW: Timespec = Timespec {
@@ -334,6 +346,31 @@ mod tests {
         drop(UnixListener::bind(&path).unwrap());
         assert!(connect(&e, "t").unwrap().is_none());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn liveness_asks_nothing_and_leaves_a_stale_socket_where_it_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        // Nothing there at all.
+        assert!(!is_live(&e, "t"));
+
+        let path = instance_dir(tmp.path(), "t").join(SOCKET_NAME);
+        let listener = UnixListener::bind(&path).unwrap();
+        assert!(is_live(&e, "t"));
+        // Nothing was sent: the supervisor accepts a connection that is
+        // already closed, and no request ever arrives on it.
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 1];
+        assert_eq!(std::io::Read::read(&mut stream, &mut buf).unwrap(), 0);
+        drop(stream);
+
+        // A socket file a killed run left behind is not a live instance,
+        // and unlike `connect` this probe leaves it for the next start to
+        // clear: it may be polled on every redraw.
+        drop(listener);
+        assert!(!is_live(&e, "t"));
+        assert!(path.exists());
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //! invocation. Nothing in this crate knows about the CLI.
 
 pub mod bwrap;
+pub mod catalogue;
 pub mod config;
 pub mod dbus;
 pub mod env;

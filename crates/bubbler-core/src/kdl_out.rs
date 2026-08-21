@@ -42,6 +42,9 @@ pub fn nodes(cfg: &InstanceConfig) -> Result<Vec<String>, ConfigError> {
     if cfg.seccomp != SeccompConfig::default() {
         out.push(seccomp(&cfg.seccomp));
     }
+    if let Some(name) = &cfg.desktop {
+        out.push(desktop(name));
+    }
     if let Some(argv) = &cfg.command {
         out.push(command(argv)?);
     }
@@ -251,6 +254,12 @@ pub fn seccomp(cfg: &SeccompConfig) -> String {
     node
 }
 
+/// The `desktop` node naming the entry an instance's launcher entry is
+/// written from.
+pub fn desktop(name: &str) -> String {
+    format!("desktop {}", quote(name))
+}
+
 /// The `command` node for `argv`.
 pub fn command(argv: &[OsString]) -> Result<String, ConfigError> {
     let mut node = String::from("command");
@@ -384,6 +393,7 @@ mod tests {
             }
             env MOZ_ENABLE_WAYLAND="1"
             env A="b"
+            desktop "firefox.desktop"
             command "firefox" "--new-window"
             "#,
         );
@@ -501,6 +511,18 @@ mod tests {
                 "command \"x\""
             ]
         );
+    }
+
+    #[test]
+    fn the_desktop_hint_is_written_beside_the_command_it_names_the_entry_for() {
+        let cfg = parse("command \"kitty\"\ndesktop \"kitty.desktop\"\nwayland").unwrap();
+        assert_eq!(
+            nodes(&cfg).unwrap(),
+            vec!["wayland", "desktop \"kitty.desktop\"", "command \"kitty\""]
+        );
+        // No node where the config names no entry: the lookup then goes
+        // by the command, which is what most instances need.
+        assert_eq!(render(&parse("wayland").unwrap()).unwrap(), "wayland\n");
     }
 
     #[test]

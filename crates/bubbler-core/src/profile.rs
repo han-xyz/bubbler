@@ -535,6 +535,7 @@ struct Merged {
     seccomp: SeccompConfig,
     seccomp_src: Option<Src>,
     command: Option<(Vec<OsString>, Src)>,
+    desktop: Option<(String, Src)>,
     lint_allows: Vec<(LintAllow, Src)>,
 }
 
@@ -568,6 +569,11 @@ impl Merged {
         }
         if let Some(argv) = &raw.config.command {
             self.command = Some((argv.clone(), src.clone()));
+        }
+        // One file, not a set: the including layer replaces it, the way
+        // it replaces the command the entry would launch.
+        if let Some(name) = &raw.config.desktop {
+            self.desktop = Some((name.clone(), src.clone()));
         }
         let sec = &raw.config.seccomp;
         if *sec != SeccompConfig::default() {
@@ -789,6 +795,9 @@ impl Merged {
             && self.seccomp != SeccompConfig::default()
         {
             origins.push((kdl_out::seccomp(&self.seccomp), src));
+        }
+        if let Some((name, src)) = &self.desktop {
+            origins.push((kdl_out::desktop(name), src));
         }
         if let Some((argv, src)) = &self.command {
             origins.push((kdl_out::command(argv).map_err(bad)?, src));
@@ -1419,6 +1428,60 @@ mod tests {
             &[],
         );
         assert_eq!(r.resolve("app").unwrap().config.tty, TtyMode::None);
+    }
+
+    #[test]
+    fn the_desktop_entry_is_one_name_the_including_layer_decides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(
+            tmp.path(),
+            &[
+                (
+                    "app",
+                    "include \"base\"\ncommand \"thunderbird\"\n\
+                     desktop \"org.mozilla.Thunderbird.desktop\"\n",
+                ),
+                ("base", "desktop \"base.desktop\"\n"),
+            ],
+            &[],
+        );
+        let resolved = r.resolve("app").unwrap();
+        // One file, not a set: the including layer replaces it, the way
+        // `command` works.
+        assert_eq!(
+            resolved.config.desktop.as_deref(),
+            Some("org.mozilla.Thunderbird.desktop")
+        );
+        // The flattened text and its per-node origins are the emitter's
+        // order, so the hint lands with the nodes rather than beside them.
+        assert_eq!(
+            resolved.text,
+            kdl_out::render(&resolved.config).unwrap(),
+            "{}",
+            resolved.text
+        );
+        assert!(
+            resolved
+                .origins
+                .iter()
+                .any(|o| o.node == "desktop \"org.mozilla.Thunderbird.desktop\""),
+            "{:?}",
+            resolved.origins
+        );
+
+        // A layer without the node leaves the one below alone.
+        let r = resolver(
+            tmp.path(),
+            &[
+                ("app", "include \"base\"\nwayland\n"),
+                ("base", "desktop \"base.desktop\"\n"),
+            ],
+            &[],
+        );
+        assert_eq!(
+            r.resolve("app").unwrap().config.desktop.as_deref(),
+            Some("base.desktop")
+        );
     }
 
     #[test]

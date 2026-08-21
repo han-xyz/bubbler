@@ -303,6 +303,7 @@ file order does not affect the generated argv.
     }
     env MOZ_ENABLE_WAYLAND="1"       # extra variables, KEY="value", repeatable
     lint-allow "x11-without-reason" reason="no Wayland backend"
+    desktop "org.mozilla.Thunderbird.desktop"
     command "firefox"
 
 Every source must exist and be of the expected type when the argv is built; a
@@ -698,7 +699,7 @@ so every run of it prints a warning naming the change and both ways out of it.
 header; `bubbler edit <name>` keeps whatever was written by hand and stamps the
 header too, since a file you have just read through means what it says.
 
-### env and command
+### env, command and desktop
 
 `env` keys must look like `[A-Za-z_][A-Za-z0-9_]*`, and each key may appear
 only once. `env` values and `command` arguments may not contain NUL, a newline
@@ -707,6 +708,15 @@ variables the sandbox owns are rejected: `HOME`, `PATH`, `XDG_RUNTIME_DIR`,
 `USER`, `LOGNAME`, `WAYLAND_DISPLAY`, `DISPLAY`, `XAUTHORITY`,
 `XDG_SESSION_TYPE`, `PULSE_SERVER`, `DBUS_SESSION_BUS_ADDRESS`,
 `DBUS_SYSTEM_BUS_ADDRESS`.
+
+`desktop "<name>.desktop"` names the desktop entry `bubbler desktop` copies an
+instance's menu entry from. It grants nothing and nothing at launch reads it:
+it is there for the applications whose vendor entry is not named after their
+command, where the lookup would otherwise have to guess — `thunderbird` ships
+`org.mozilla.Thunderbird.desktop`, `keepassxc` ships
+`org.keepassxc.KeePassXC.desktop`. The value is a file name and not a path,
+since the entry is looked up in the usual application directories, and a
+profile may carry it like any other node.
 
 ## Host paths
 
