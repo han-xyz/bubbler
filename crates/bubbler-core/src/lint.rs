@@ -58,6 +58,18 @@ const BUNDLE_WITHOUT_DBUS: Check = Check {
     id: "bundle-without-dbus",
     severity: Severity::Error,
 };
+const CAMERA_NODES_NONE_PRESENT: Check = Check {
+    id: "camera-nodes-none-present",
+    severity: Severity::Note,
+};
+const CAMERA_NODES_NO_HOTPLUG: Check = Check {
+    id: "camera-nodes-no-hotplug",
+    severity: Severity::Note,
+};
+const CAMERA_WITHOUT_PORTALS: Check = Check {
+    id: "camera-without-portals",
+    severity: Severity::Error,
+};
 const COMMAND_NOT_FOUND: Check = Check {
     id: "command-not-found",
     severity: Severity::Note,
@@ -148,6 +160,9 @@ const X11_WITHOUT_REASON: Check = Check {
 /// errors rather than silently accepting nothing.
 pub const CHECKS: &[Check] = &[
     BUNDLE_WITHOUT_DBUS,
+    CAMERA_NODES_NONE_PRESENT,
+    CAMERA_NODES_NO_HOTPLUG,
+    CAMERA_WITHOUT_PORTALS,
     COMMAND_NOT_FOUND,
     DBUS_WITHOUT_RULES,
     DUP_NAME_POLICY,
@@ -351,6 +366,7 @@ const BUNDLES: &[&str] = &["portals", "notify", "tray", "mpris"];
 /// the parse failure unexplained and the run has to report that instead.
 const PARSER_EQUIVALENT: &[&str] = &[
     BUNDLE_WITHOUT_DBUS.id,
+    CAMERA_WITHOUT_PORTALS.id,
     DUP_NAME_POLICY.id,
     OWN_ON_SYSTEM_BUS.id,
 ];
@@ -696,12 +712,59 @@ fn arg(node: &KdlNode) -> Option<&str> {
         .and_then(|e| e.value().as_string())
 }
 
+/// What a `camera nodes=#true` costs that the portal half does not: a
+/// device list frozen at launch, and, on a host with no camera, nothing
+/// to bind at all.
+fn camera_nodes(ctx: &Context, i: usize, node: &KdlNode, f: &mut Findings) {
+    let dev = Path::new("/dev");
+    let present = ctx.host.list_dir(dev).into_iter().any(|name| {
+        let bytes = name.as_encoded_bytes();
+        (bytes.starts_with(b"video") || bytes.starts_with(b"media"))
+            && ctx
+                .host
+                .file_type(&dev.join(&name))
+                .is_some_and(|t| t.is_char_device())
+    });
+    if !present {
+        f.push(
+            i,
+            node,
+            &CAMERA_NODES_NONE_PRESENT,
+            "`camera nodes=#true` and this host has no `/dev/video*` or `/dev/media*` node, \
+             so the device half of the grant binds nothing"
+                .to_owned(),
+            "the portal half needs no node in the sandbox; drop `nodes=#true` unless the \
+             application is a plain V4L2 client",
+        );
+    }
+    f.push(
+        i,
+        node,
+        &CAMERA_NODES_NO_HOTPLUG,
+        "`camera nodes=#true` binds the nodes this host has at launch: a camera plugged in \
+         later has no node inside, and with a network namespace of its own the sandbox is \
+         never told about one either"
+            .to_owned(),
+        "restart the instance after plugging a camera in; the portal half follows hotplug \
+         in the host daemon instead",
+    );
+}
+
 /// The node's `key=` property as a string.
 fn prop<'a>(node: &'a KdlNode, key: &str) -> Option<&'a str> {
     node.entries()
         .iter()
         .find(|e| e.name().is_some_and(|n| n.value() == key))
         .and_then(|e| e.value().as_string())
+}
+
+/// The node's `key=` property as a boolean, which is what the device
+/// properties of `gamepad` and `camera` are written as.
+fn flag(node: &KdlNode, key: &str) -> Option<bool> {
+    node.entries()
+        .iter()
+        .find(|e| e.name().is_some_and(|n| n.value() == key))
+        .and_then(|e| e.value().as_bool())
 }
 
 /// The bus name a rule child names: the whole argument for a policy rule,
@@ -760,6 +823,7 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, f: &mut Findings) {
                     );
                 }
             }
+            "camera" if flag(node, "nodes") == Some(true) => camera_nodes(ctx, i, node, f),
             "dbus" => dbus_node(i, node, f),
             "system-bus" => system_bus(i, node, f),
             "mpris" if prop(node, "name").is_some_and(|n| n == "*") => f.push(
@@ -1120,6 +1184,18 @@ fn across_layers(ctx: &Context, sources: &[Source], f: &mut Findings) {
 
     if !has_portals {
         for (i, source) in sources.iter().enumerate() {
+            for node in top(source, "camera") {
+                f.push(
+                    i,
+                    node,
+                    &CAMERA_WITHOUT_PORTALS,
+                    "`camera` is a portal grant and no layer grants `portals`, so the \
+                     sandbox has no `/.flatpak-info` and the portal reads it as an \
+                     ordinary process of yours"
+                        .to_owned(),
+                    "add `portals` (and the `dbus` that carries it), or drop this node",
+                );
+            }
             for (_, rule) in bus_rules(source) {
                 let Some(name) = rule_name(rule).filter(|n| n.starts_with(PORTAL_PREFIX)) else {
                     continue;
@@ -1324,6 +1400,48 @@ mod tests {
                 &["x11\nlint-allow \"x11-without-reason\" reason=\"no Wayland backend\""],
             );
             assert_eq!(ids(&allowed), [] as [&str; 0]);
+        });
+    }
+
+    #[test]
+    fn a_camera_grant_is_measured_against_the_portal_and_the_host() {
+        let (file, dir, _) = fake::types();
+        let with_camera = FakeHost::default()
+            .with("/usr/bin/foot", file)
+            .with("/dev", dir)
+            .with("/dev/video0", fake::char_type());
+        with(&with_camera, |ctx| {
+            // The portal is the grant; the device nodes are an extra on
+            // top of it, and neither works without `/.flatpak-info`.
+            assert_eq!(ids(&lint(ctx, &["camera"])), ["camera-without-portals"]);
+            assert_eq!(lint(ctx, &["camera"]).findings[0].severity, Severity::Error);
+            // The `portals` may be written in another layer.
+            assert_eq!(
+                ids(&lint(ctx, &["dbus\nportals", "camera"])),
+                [] as [&str; 0]
+            );
+            // A host with a camera: only the frozen device list is worth
+            // saying, and the bare grant carries neither note.
+            assert_eq!(
+                ids(&lint(ctx, &["dbus\nportals\ncamera nodes=#true"])),
+                ["camera-nodes-no-hotplug"]
+            );
+            assert_eq!(
+                ids(&lint(ctx, &["dbus\nportals\ncamera nodes=#false"])),
+                [] as [&str; 0]
+            );
+        });
+        with(&host(), |ctx| {
+            // No node on this host, so the device half binds nothing.
+            let report = lint(ctx, &["dbus\nportals\ncamera nodes=#true"]);
+            assert_eq!(
+                ids(&report),
+                ["camera-nodes-none-present", "camera-nodes-no-hotplug"]
+            );
+            assert!(
+                report.findings.iter().all(|f| f.severity == Severity::Note),
+                "{report:#?}"
+            );
         });
     }
 

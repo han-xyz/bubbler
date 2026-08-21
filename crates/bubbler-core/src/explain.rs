@@ -287,6 +287,12 @@ fn rules_of(index: usize, rules: &[(usize, String)]) -> Vec<String> {
         .collect()
 }
 
+/// What a `camera` node grants that no bwrap argument shows. The Camera
+/// interface is on `org.freedesktop.portal.Desktop`, which the `portals`
+/// rules already talk to, so the node adds no rule of its own either and
+/// would otherwise render as a grant that did nothing.
+const CAMERA_PORTAL: &str = "org.freedesktop.portal.Camera, carried by the portals bundle";
+
 /// What a `seccomp` node did to the default denylist, which is the whole
 /// grant of one that disables the filter and loads no program at all.
 fn seccomp_lines(cfg: &SeccompConfig) -> Vec<String> {
@@ -342,6 +348,11 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
             match g.origin {
                 Origin::Service(i) if view.cfg.services.get(i).is_some_and(carries_rules) => {
                     out.extend(listed(n == 0, rules_of(i, view.rules)));
+                }
+                Origin::Service(i)
+                    if matches!(view.cfg.services.get(i), Some(Service::Camera { .. })) =>
+                {
+                    out.extend(listed(n == 0, vec![CAMERA_PORTAL.to_owned()]));
                 }
                 Origin::Seccomp => out.extend(listed(n == 0, seccomp_lines(&view.cfg.seccomp))),
                 _ => {}
@@ -573,6 +584,69 @@ bwrap
     -- true
 
 27 arguments in 7 groups, 4 hidden (--explain=full); 6 D-Bus rules to the proxy (--proxy)";
+
+    #[test]
+    fn a_camera_grant_shows_the_portal_it_reaches_the_sandbox_through() {
+        let bare = cfg("dbus\nportals\ncamera\ncommand \"true\"");
+        let lines = Lines {
+            services: vec![Some(1), Some(2), Some(3)],
+            ..Lines::default()
+        };
+        let bare_rules = rules(&bare, "t");
+        let render_with = |items: &[Explained]| {
+            render(
+                items,
+                &View {
+                    title: "bwrap",
+                    cfg: &bare,
+                    source: Source {
+                        file: "config.kdl",
+                        lines: &lines,
+                    },
+                    rules: &bare_rules,
+                    proxy: false,
+                    full: false,
+                },
+            )
+            .unwrap()
+        };
+        // The bare grant is the whole of what the node did, and without
+        // the line it would render as a grant that reached nothing.
+        let out = render_with(&[item(Origin::Command, &["--", "true"], None)]);
+        assert!(
+            out.contains(&format!("    rule-only: {CAMERA_PORTAL}")),
+            "{out:#?}"
+        );
+        assert!(out.iter().any(|l| l.starts_with("  camera ")), "{out:#?}");
+
+        // With `nodes=#true` the binds are the node's arguments and the
+        // portal is what it grants beside them.
+        let with_nodes = cfg("dbus\nportals\ncamera nodes=#true\ncommand \"true\"");
+        let node_rules = rules(&with_nodes, "t");
+        let out = render(
+            &[item(
+                Origin::Service(2),
+                &["--dev-bind-try", "/dev/video0", "/dev/video0"],
+                None,
+            )],
+            &View {
+                title: "bwrap",
+                cfg: &with_nodes,
+                source: Source {
+                    file: "config.kdl",
+                    lines: &lines,
+                },
+                rules: &node_rules,
+                proxy: false,
+                full: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            out.contains(&format!("    rules: {CAMERA_PORTAL}")),
+            "{out:#?}"
+        );
+    }
 
     #[test]
     fn full_lists_the_baseline_and_hides_nothing() {

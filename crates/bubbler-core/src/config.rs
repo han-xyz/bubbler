@@ -203,6 +203,18 @@ pub enum Service {
     /// hardware wallet or a controller driven through hidapi is opened
     /// through. `gamepad hidraw=#true` grants the same thing.
     Hidraw,
+    /// Cameras through `org.freedesktop.portal.Camera`, which needs no
+    /// device in the sandbox: the portal opens the node in the host
+    /// daemon and hands back a connected PipeWire socket. Requires
+    /// [`Service::Portals`], whose `/.flatpak-info` is what earns the
+    /// instance a permission of its own rather than the blanket one
+    /// every unsandboxed process on the machine shares.
+    Camera {
+        /// Also bind the V4L2 device nodes, for the plain V4L2 clients
+        /// that will never speak the portal. Every `/dev/video*` and
+        /// `/dev/media*` the host has, a virtual camera among them.
+        nodes: bool,
+    },
     /// Own `org.mpris.MediaPlayer2.<name>` so media keys and player
     /// controls reach the app. Requires [`Service::Dbus`].
     Mpris {
@@ -381,6 +393,17 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
                 }
                 cfg.services.push(parse_gamepad(node)?);
             }
+            "camera" => {
+                // By variant, for the same reason `gamepad` is.
+                if cfg
+                    .services
+                    .iter()
+                    .any(|s| matches!(s, Service::Camera { .. }))
+                {
+                    return Err(ConfigError::Duplicate(name.to_owned()));
+                }
+                cfg.services.push(parse_camera(node)?);
+            }
             "system-bus" => {
                 if cfg
                     .services
@@ -465,6 +488,12 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
             reason: "requires dbus".to_owned(),
         });
     }
+    if !profile && camera_without_portals(&cfg.services) {
+        return Err(ConfigError::BadArgument {
+            node: "camera".to_owned(),
+            reason: "requires portals".to_owned(),
+        });
+    }
     Ok((
         RawProfile {
             config: cfg,
@@ -506,6 +535,16 @@ fn bundle_without_dbus(services: &[Service]) -> Option<&'static str> {
         Service::Mpris { .. } => Some("mpris"),
         _ => None,
     })
+}
+
+/// Whether a `camera` node is granted with no `portals` to carry it.
+/// The portal is the whole of the bare grant and half of `nodes=#true`,
+/// and without `/.flatpak-info` the portal reads the sandbox as an
+/// ordinary process: the permission it stores is then the blanket one
+/// every unsandboxed process on the machine shares, not this instance's.
+fn camera_without_portals(services: &[Service]) -> bool {
+    services.iter().any(|s| matches!(s, Service::Camera { .. }))
+        && !services.contains(&Service::Portals)
 }
 
 fn bad(node: &KdlNode, reason: &str) -> ConfigError {
@@ -993,6 +1032,42 @@ fn parse_gamepad(node: &KdlNode) -> Result<Service, ConfigError> {
     Ok(Service::Gamepad {
         hidraw: hidraw.unwrap_or(false),
         uinput: uinput.unwrap_or(false),
+    })
+}
+
+/// `camera [nodes=#true]`: the bare node is the portal grant, which
+/// binds nothing, and the property adds the V4L2 device nodes to it.
+fn parse_camera(node: &KdlNode) -> Result<Service, ConfigError> {
+    let mut nodes: Option<bool> = None;
+    for e in node.entries() {
+        let Some(prop) = e.name().map(|n| n.value()) else {
+            return Err(bad(node, "takes no arguments"));
+        };
+        if prop != "nodes" {
+            return Err(ConfigError::UnknownProperty {
+                node: node.name().value().to_owned(),
+                prop: prop.to_owned(),
+            });
+        }
+        // Written twice, the two entries disagree about the device nodes
+        // and the winner would be a matter of their order in the line.
+        if nodes.is_some() {
+            return Err(ConfigError::Duplicate(format!(
+                "{} {prop}",
+                node.name().value()
+            )));
+        }
+        nodes = Some(
+            e.value()
+                .as_bool()
+                .ok_or_else(|| bad(node, &format!("{prop} must be #true or #false")))?,
+        );
+    }
+    if node.children().is_some() {
+        return Err(bad(node, "takes no children"));
+    }
+    Ok(Service::Camera {
+        nodes: nodes.unwrap_or(false),
     })
 }
 
@@ -1925,6 +2000,69 @@ command "b""#
             parse("notify\ndbus").unwrap().services,
             vec![Service::Notify, Service::Dbus { rules: vec![] }]
         );
+    }
+
+    #[test]
+    fn camera_is_a_portal_grant_with_an_optional_device_property() {
+        let cfg = parse("dbus\nportals\ncamera").unwrap();
+        assert_eq!(cfg.services.last(), Some(&Service::Camera { nodes: false }));
+        assert_eq!(
+            parse("dbus\nportals\ncamera nodes=#true")
+                .unwrap()
+                .services
+                .last(),
+            Some(&Service::Camera { nodes: true })
+        );
+        assert_eq!(
+            parse("dbus\nportals\ncamera nodes=#false")
+                .unwrap()
+                .services
+                .last(),
+            Some(&Service::Camera { nodes: false })
+        );
+        // The portal is what carries the grant, and without
+        // `/.flatpak-info` the sandbox falls into the blanket permission
+        // every unsandboxed process on the machine shares.
+        assert!(matches!(
+            parse("dbus\ncamera"),
+            Err(ConfigError::BadArgument { node, reason })
+                if node == "camera" && reason == "requires portals"
+        ));
+        assert!(matches!(
+            parse("dbus\ncamera nodes=#true"),
+            Err(ConfigError::BadArgument { node, reason })
+                if node == "camera" && reason == "requires portals"
+        ));
+        // A profile layer may take its `portals` from an include, so the
+        // requirement is checked on the flattened config only.
+        assert!(parse_profile("camera").is_ok());
+        assert!(matches!(
+            parse("dbus\nportals\ncamera foo=#true"),
+            Err(ConfigError::UnknownProperty { node, prop })
+                if node == "camera" && prop == "foo"
+        ));
+        assert!(matches!(
+            parse("dbus\nportals\ncamera nodes=\"yes\""),
+            Err(ConfigError::BadArgument { node, .. }) if node == "camera"
+        ));
+        assert!(matches!(
+            parse("dbus\nportals\ncamera \"nodes\""),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        assert!(matches!(
+            parse("dbus\nportals\ncamera { nodes; }"),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        // By variant, like `gamepad`: two nodes differing only in the
+        // property would leave the device binds to file order.
+        assert!(matches!(
+            parse("dbus\nportals\ncamera\ncamera nodes=#true"),
+            Err(ConfigError::Duplicate(n)) if n == "camera"
+        ));
+        assert!(matches!(
+            parse("dbus\nportals\ncamera nodes=#true nodes=#false"),
+            Err(ConfigError::Duplicate(n)) if n == "camera nodes"
+        ));
     }
 
     #[test]
