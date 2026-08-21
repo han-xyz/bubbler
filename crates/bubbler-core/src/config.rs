@@ -200,11 +200,16 @@ fn parse_doc(text: &str, profile: bool) -> Result<RawProfile, ConfigError> {
                     "network" => Service::Network,
                     "dri" => Service::Dri,
                     "pipewire" => Service::Pipewire,
+                    "pulseaudio" => Service::Pulseaudio,
                     "portals" => Service::Portals,
                     "notify" => Service::Notify,
                     "tray" => Service::Tray,
                     "gamepad" => Service::Gamepad,
-                    _ => Service::Pulseaudio,
+                    // Unreachable through the arm above, and an error
+                    // rather than a fallback: a name added to that list
+                    // and forgotten here would otherwise grant whichever
+                    // service the fallback named.
+                    other => return Err(ConfigError::UnknownNode(other.to_owned())),
                 };
                 if cfg.services.contains(&svc) {
                     return Err(ConfigError::Duplicate(name.to_owned()));
@@ -1315,6 +1320,11 @@ command "b""#
         // `gamepad` is device access, not a set of proxy rules, so it
         // stands on its own.
         assert!(parse("gamepad").is_ok());
+        // A bare node nothing answers to is never some other grant.
+        assert!(matches!(
+            parse("joystick"),
+            Err(ConfigError::UnknownNode(n)) if n == "joystick"
+        ));
         assert!(matches!(
             parse("dbus\ntray \"x\""),
             Err(ConfigError::BadArgument { .. })

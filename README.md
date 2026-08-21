@@ -141,20 +141,36 @@ playback: everything the session exposes, including the microphone, with no
 portal in between.
 
 `gamepad` binds `/dev/input` with device access and `/sys/class/input`,
-`/sys/devices` and `/run/udev` (when the host has it) read-only, which is what
-a controller takes to be found and identified. It is the directory that is
-bound, not the nodes in it, so a controller plugged in later shows up too —
-though the application has to be watching the directory, which SDL only does
-when it can tell it is sandboxed, from the `/.flatpak-info` that `portals`
-writes. `/dev/input` is **every** input device the machine has, keyboards
-included. On Arch the `event*` nodes are `0660 root:input` while a controller
-also gets an ACL for the logged-in user from udev's `uaccess` tag, so an
-ordinary user's sandbox opens the controller and not the keyboard — but a user
-who is in the group `input` turns `gamepad` into a keylogger grant, because the
-sandbox keeps the host's supplementary groups. `/dev/uinput` is never bound:
-writing to it injects input into the host session. `gamepad` also binds the
-whole `/sys/devices` tree, which is wider than `dri`'s PCI roots and contains
-them; the wider bind is emitted after them, and bwrap takes both.
+`/sys/devices` and `/run/udev` (when the host has it) read-only, which is
+what a controller takes to be found and identified. It is the directory that
+is bound, not the nodes in it, so a controller plugged in later shows up
+too — though the application has to be watching the directory, which SDL only
+does when it can tell it is sandboxed, from the `/.flatpak-info` that
+`portals` writes. `/dev/uinput` is never bound: writing to it injects input
+into the host session.
+
+That bind is read-write. bwrap has no read-only device bind and flatpak's
+`--device=input` takes the same posture, so an application inside can
+`EVIOCGRAB` a device away from the session, upload force-feedback effects to
+it and remap its keycodes. And `/dev/input` is **every** input device the
+machine has, keyboards included; what stops a sandbox from reading yours is
+the permissions on the nodes, not bubbler. On Arch `event*` is
+`0660 root:input`, and a controller carries an extra ACL for the logged-in
+user from udev's `uaccess` tag, so an ordinary user's sandbox opens the
+controller and not the keyboard. Any group that owns an input node undoes that — Arch's
+`input`, but also vendor groups such as `openrazer` — because the sandbox
+keeps the host's supplementary groups, and a keyboard node your user can open
+is a keylogger grant. Compare `ls -l /dev/input` with `id` before granting
+`gamepad`.
+
+The `/sys` side is wide too. `/sys/devices` is the whole device tree, which
+contains `dri`'s PCI roots and much more: DMI vendor, board and BIOS strings
+(the serial numbers among them stay root-only), ACPI, platform, thermal and
+battery state, the attributes of every block and tty device, and
+`/sys/devices/virtual/net/*`, where interface names and live traffic counters
+are readable even with no `network` grant. `/run/udev/data` hands over udev's
+database, which is the identity of every device on the machine. The wide bind
+is emitted after `dri`'s narrower ones, and bwrap takes both.
 
 `env` keys must look like `[A-Za-z_][A-Za-z0-9_]*`, and each key may appear
 only once. `env` values and `command` arguments may not contain NUL, a newline

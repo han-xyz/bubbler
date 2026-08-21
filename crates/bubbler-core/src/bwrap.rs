@@ -371,7 +371,8 @@ impl BwrapArgs {
 
     /// Bind a host path "allowing device access" (`bwrap(1)` `--dev-bind`,
     /// phase 4), which device nodes such as `/dev/dri/renderD128` need.
-    /// bwrap has no read-only form of it, so only the `dri` service uses it.
+    /// bwrap has no read-only form of it, so the two services that bind
+    /// device directories, `dri` and `gamepad`, both grant write access.
     pub fn dev_bind(&mut self, src: &Path, dst: &Path) {
         push(
             &mut self.binds,
