@@ -216,6 +216,170 @@ fn include_in_an_instance_config_is_an_error() {
 }
 
 #[test]
+fn profile_show_flattens_and_names_the_layer_each_node_came_from() {
+    let tmp = setup();
+    let user = write_profile(tmp.path(), "user", "app", "include \"base\"\nnetwork\n");
+    let system = write_profile(tmp.path(), "system", "base", "wayland\ncommand \"x\"\n");
+    let out = bubbler(tmp.path())
+        .args(["profile", "show", "app"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!(
+            "// bubbler profile: app\n// from: {system}\nwayland\n// from: {user}\nnetwork\n\
+             // from: {system}\ncommand \"x\"\n",
+            system = system.display(),
+            user = user.display(),
+        )
+    );
+
+    let out = bubbler(tmp.path())
+        .args(["profile", "show", "generic"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "// bubbler profile: generic\n"
+    );
+
+    let out = bubbler(tmp.path())
+        .args(["profile", "show", "nope"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unknown profile `nope`"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn profile_edit_seeds_the_user_layer_and_rechecks_it() {
+    let tmp = setup();
+    let path = tmp.path().join("config/bubbler/profiles/firefox.kdl");
+    let out = bubbler(tmp.path())
+        .env("EDITOR", "/usr/bin/true")
+        .args(["profile", "edit", "firefox"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The layer below is the built-in, so the seed extends it.
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "// bubbler profile: firefox (user layer)\ninclude \"firefox\"\n"
+    );
+
+    // A name no layer holds gets commented examples instead, and both
+    // seeds resolve.
+    let out = bubbler(tmp.path())
+        .env("EDITOR", "/usr/bin/true")
+        .args(["profile", "edit", "mine"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mine =
+        std::fs::read_to_string(tmp.path().join("config/bubbler/profiles/mine.kdl")).unwrap();
+    assert!(
+        mine.starts_with("// bubbler profile: mine (user layer)\n"),
+        "{mine}"
+    );
+    assert!(!mine.contains("include"), "{mine}");
+
+    // A broken profile is reported and kept, exactly as `edit` does.
+    let bad = tmp.path().join("bad-editor");
+    write_script(&bad, "#!/usr/bin/sh\nprintf 'bogus\\n' >> \"$1\"\n");
+    let out = bubbler(tmp.path())
+        .env("EDITOR", &bad)
+        .args(["profile", "edit", "firefox"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("still has errors"), "{err}");
+    assert!(err.contains("unknown node `bogus`"), "{err}");
+    assert!(
+        std::fs::read_to_string(&path).unwrap().ends_with("bogus\n"),
+        "the file must be kept as the editor left it"
+    );
+
+    // An editor that fails hands its own exit code back, and the file it
+    // did not finish is left alone.
+    let out = bubbler(tmp.path())
+        .env("EDITOR", "/usr/bin/false")
+        .args(["profile", "edit", "firefox"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(std::fs::read_to_string(&path).unwrap().ends_with("bogus\n"));
+}
+
+#[test]
+fn reseed_rewrites_the_config_from_the_profile_and_backs_it_up() {
+    let tmp = setup();
+    write_profile(tmp.path(), "user", "app", "wayland\n");
+    let out = bubbler(tmp.path())
+        .args(["create", "a", "--profile", "app"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cfg = tmp.path().join("data/bubbler/instances/a/config.kdl");
+    let before = std::fs::read_to_string(&cfg).unwrap();
+
+    write_profile(
+        tmp.path(),
+        "user",
+        "app",
+        "wayland\nnetwork\ncommand \"sh\"\n",
+    );
+    let out = bubbler(tmp.path()).args(["reseed", "a"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}\n", cfg.display())
+    );
+    assert_eq!(
+        std::fs::read_to_string(&cfg).unwrap(),
+        "// bubbler profile: app\nwayland\nnetwork\ncommand \"sh\"\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("data/bubbler/instances/a/config.kdl.bak"))
+            .unwrap(),
+        before
+    );
+
+    // A config nothing seeded names no profile to re-flatten.
+    std::fs::write(&cfg, "wayland\n").unwrap();
+    let out = bubbler(tmp.path()).args(["reseed", "a"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("has no `// bubbler profile:"), "{err}");
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), "wayland\n");
+}
+
+#[test]
 fn run_without_command_fails_with_message() {
     let tmp = setup();
     bubbler(tmp.path()).args(["create", "t"]).status().unwrap();

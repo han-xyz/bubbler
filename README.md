@@ -15,7 +15,10 @@ seccomp denylist. See "Known gaps" below.
     bubbler create ff                     # --profile defaults to `generic`
     bubbler profiles                      # profile names, one per line
     bubbler profiles --origin             # and which layer each comes from
+    bubbler profile show firefox          # one profile, flattened, layer by layer
+    bubbler profile edit firefox          # your copy of it, in $VISUAL or $EDITOR
     bubbler edit ff                       # open config.kdl, then re-check it
+    bubbler reseed ff                     # re-flatten its profile, keeping home/
     bubbler run ff                        # uses `command` from config.kdl
     bubbler run ff -- firefox --version   # or run something else inside
     bubbler run ff --dry-run              # print the bwrap argv, do not launch
@@ -245,6 +248,42 @@ instance came from:
 
 Editing an instance never edits the profile, and editing a profile never
 changes an instance that was already seeded from it.
+
+### Managing profiles and instances
+
+    bubbler profile show firefox   # the flattened profile, layer by layer
+    bubbler profile edit firefox   # your copy of it, in $VISUAL or $EDITOR
+    bubbler reseed ff              # re-flatten ff's profile into its config
+
+`profile show` prints the profile exactly as `create` would seed it, each run
+of nodes under a `// from:` comment naming the file it came from, or
+`built-in` for one compiled in:
+
+    // bubbler profile: app
+    // from: /usr/share/bubbler/profiles/base.kdl
+    wayland
+    // from: /home/you/.config/bubbler/profiles/app.kdl
+    network
+
+`profile edit` opens `$XDG_CONFIG_HOME/bubbler/profiles/<name>.kdl`, creating
+the directory if it is missing, under the same editor rules as `edit`. A name
+your layer does not hold yet is written first: `include "<name>"` when a lower
+layer has that name, so your copy extends the shipped profile instead of
+forking it, and commented examples when no layer does. A profile that is
+already there is opened as it is. When the editor exits 0 the profile is
+resolved again and any error printed; the file is kept as you saved it either
+way.
+
+`reseed` re-flattens the profile named in the first line of an instance's
+`config.kdl` and writes it back, keeping the private `home/` — it is how an
+existing instance picks up a profile you have since edited. The file it
+replaces is kept beside it as `config.kdl.bak`, overwriting an older backup,
+so a reseed that dropped an edit of yours can be undone. A config without the
+`// bubbler profile: <name>` header names no profile to reseed from, and that
+is an error. It refuses while the instance is running: that sandbox was built
+from the file as it stands, bwrap cannot be told about a bind after the fact,
+and a `config.kdl` describing grants the running sandbox does not have would
+be a lie about what is confined.
 
 ## D-Bus
 
