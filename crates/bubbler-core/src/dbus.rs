@@ -1,7 +1,7 @@
-//! What the filtering session-bus sidecar needs: the proxy's rule list,
+//! What the filtering D-Bus sidecar needs: the proxy's rule list per bus,
 //! the `.flatpak-info` portals identify the sandbox by, where portals look
-//! that identity up, and where the filtered socket lives. The sandbox
-//! never reaches the host bus itself.
+//! that identity up, and where the filtered sockets live. The sandbox
+//! never reaches a host bus itself.
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
@@ -10,9 +10,28 @@ use std::path::{Path, PathBuf};
 use crate::config::{BusRule, Service};
 use crate::env::Env;
 
-/// Program that filters the session bus; found on `PATH` inside the
-/// proxy sandbox.
+/// Program that filters the buses; found on `PATH` inside the proxy
+/// sandbox. One process serves every bus an instance is granted.
 pub const PROXY_BIN: &str = "xdg-dbus-proxy";
+
+/// File name of the session bus socket, in the proxy's directory and in
+/// the instance's after the launcher moves it.
+pub const SESSION_SOCKET: &str = "bus";
+
+/// File name of the system bus socket, in the same two directories.
+pub const SYSTEM_SOCKET: &str = "system";
+
+/// Config node that grants the session bus, for errors about its socket.
+pub const SESSION_NODE: &str = "dbus";
+
+/// Config node that grants the system bus, for errors about its socket.
+pub const SYSTEM_NODE: &str = "system-bus";
+
+/// Where a system bus socket lives: the host's when no address overrides
+/// it, and the path the filtered one is bound at inside the sandbox.
+// libdbus and libsystemd both compile in this path, so a sandbox that has
+// the socket there needs no environment variable to find it.
+pub const SYSTEM_BUS_PATH: &str = "/run/dbus/system_bus_socket";
 
 /// Where portals expect the sandbox identity file.
 pub const FLATPAK_INFO: &str = "/.flatpak-info";
@@ -39,12 +58,23 @@ const PORTAL_RULES: &[&str] = &[
     "--broadcast=org.freedesktop.portal.*=@/org/freedesktop/portal/*",
 ];
 
-/// Everything the launcher needs to run one instance's proxy.
+/// One bus the proxy filters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Section {
+    /// `xdg-dbus-proxy` policy arguments for this bus, deduplicated,
+    /// explicit rules first and bundles after them.
+    pub rules: Vec<OsString>,
+}
+
+/// Everything the launcher needs to run one instance's proxy. One process
+/// serves both buses (`xdg-dbus-proxy(1)`: options apply to the address
+/// they follow), so a plan exists as soon as either is granted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
-    /// `xdg-dbus-proxy` policy arguments, deduplicated, explicit `dbus`
-    /// rules first and bundles after them.
-    pub rules: Vec<OsString>,
+    /// The session bus, when `dbus` is granted.
+    pub session: Option<Section>,
+    /// The system bus, when `system-bus` is granted.
+    pub system: Option<Section>,
     /// Contents of `/.flatpak-info` for the proxy, and for the sandbox
     /// itself when `portals` is granted.
     pub flatpak_info: Vec<u8>,
@@ -52,48 +82,87 @@ pub struct Plan {
     pub portals: bool,
 }
 
-/// The proxy plan for `services`, or `None` when `dbus` is not granted
+impl Plan {
+    /// The buses the proxy serves, in the order it is told to bind them:
+    /// each socket's file name — the one it has in the proxy's directory
+    /// and, once the launcher has moved it, in the instance's — with the
+    /// config node that granted it, so a failure names what to change.
+    pub fn buses(&self) -> Vec<(&'static str, &'static str)> {
+        let mut out = Vec::new();
+        if self.session.is_some() {
+            out.push((SESSION_SOCKET, SESSION_NODE));
+        }
+        if self.system.is_some() {
+            out.push((SYSTEM_SOCKET, SYSTEM_NODE));
+        }
+        out
+    }
+}
+
+/// The proxy plan for `services`, or `None` when neither bus is granted
 /// and no proxy runs at all. `instance` is a validated instance name.
 pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
-    let explicit = services.iter().find_map(|s| match s {
+    let session = services.iter().find_map(|s| match s {
         Service::Dbus { rules } => Some(rules),
         _ => None,
-    })?;
+    });
+    let system = services.iter().find_map(|s| match s {
+        Service::SystemBus { rules } => Some(rules),
+        _ => None,
+    });
+    if session.is_none() && system.is_none() {
+        return None;
+    }
     let portals = services.contains(&Service::Portals);
-    let mut rules = Vec::new();
-    for rule in explicit {
-        push(&mut rules, render(rule));
-    }
-    for s in services {
-        match s {
-            Service::Portals => {
-                for r in PORTAL_RULES {
-                    push(&mut rules, (*r).to_owned());
+    let session = session.map(|explicit| {
+        let mut rules = explicit_rules(explicit);
+        // Bundles are sets of session-bus rules; the system bus never
+        // gets one, and its own list is the whole confinement.
+        for s in services {
+            match s {
+                Service::Portals => {
+                    for r in PORTAL_RULES {
+                        push(&mut rules, (*r).to_owned());
+                    }
                 }
+                Service::Notify => push(
+                    &mut rules,
+                    "--talk=org.freedesktop.Notifications".to_owned(),
+                ),
+                // The watcher is all a tray icon takes: an item registers
+                // on the app's own unique name, and the calls the host
+                // makes back into it are incoming, which the proxy does
+                // not filter (`xdg-dbus-proxy(1)`).
+                Service::Tray => push(
+                    &mut rules,
+                    "--talk=org.kde.StatusNotifierWatcher".to_owned(),
+                ),
+                Service::Mpris { name } => {
+                    push(&mut rules, format!("--own=org.mpris.MediaPlayer2.{name}"));
+                }
+                _ => {}
             }
-            Service::Notify => push(
-                &mut rules,
-                "--talk=org.freedesktop.Notifications".to_owned(),
-            ),
-            // The watcher is all a tray icon takes: an item registers on
-            // the app's own unique name, and the calls the host makes back
-            // into it are incoming, which the proxy does not filter
-            // (`xdg-dbus-proxy(1)`).
-            Service::Tray => push(
-                &mut rules,
-                "--talk=org.kde.StatusNotifierWatcher".to_owned(),
-            ),
-            Service::Mpris { name } => {
-                push(&mut rules, format!("--own=org.mpris.MediaPlayer2.{name}"));
-            }
-            _ => {}
         }
-    }
+        Section { rules }
+    });
+    let system = system.map(|explicit| Section {
+        rules: explicit_rules(explicit),
+    });
     Some(Plan {
-        rules,
+        session,
+        system,
         flatpak_info: flatpak_info(instance, portals),
         portals,
     })
+}
+
+/// The config's own rules for one bus, in file order.
+fn explicit_rules(rules: &[BusRule]) -> Vec<OsString> {
+    let mut out = Vec::new();
+    for rule in rules {
+        push(&mut out, render(rule));
+    }
+    out
 }
 
 /// Append `rule` unless it is already there: the proxy takes repeats, but
@@ -189,17 +258,18 @@ pub fn socket_dir(instance_runtime: &Path) -> PathBuf {
     instance_runtime.join("dbus")
 }
 
-/// Where the proxy creates the filtered socket, in [`socket_dir`]: the
-/// one path the proxy sandbox can write to.
-pub fn proxy_bus_path(instance_runtime: &Path) -> PathBuf {
-    socket_dir(instance_runtime).join("bus")
+/// Where the proxy creates one filtered socket, in [`socket_dir`]: the
+/// one path the proxy sandbox can write to. `socket` is [`SESSION_SOCKET`]
+/// or [`SYSTEM_SOCKET`].
+pub fn proxy_bus_path(instance_runtime: &Path, socket: &str) -> PathBuf {
+    socket_dir(instance_runtime).join(socket)
 }
 
-/// Where the sandbox's bus bind comes from: the socket after the launcher
+/// Where a sandbox's bus bind comes from: the socket after the launcher
 /// has checked it and moved it out of [`socket_dir`]. The proxy cannot
 /// reach this path, so nothing can be swapped for it once it is there.
-pub fn app_bus_path(instance_runtime: &Path) -> PathBuf {
-    instance_runtime.join("bus")
+pub fn app_bus_path(instance_runtime: &Path, socket: &str) -> PathBuf {
+    instance_runtime.join(socket)
 }
 
 /// Host session bus socket: the `unix:path=` of `$DBUS_SESSION_BUS_ADDRESS`
@@ -210,6 +280,17 @@ pub fn host_bus(env: &Env) -> PathBuf {
         .as_deref()
         .and_then(unix_path)
         .unwrap_or_else(|| env.runtime_dir.join("bus"))
+}
+
+/// Host system bus socket: the `unix:path=` of `$DBUS_SYSTEM_BUS_ADDRESS`
+/// when it names one, else [`SYSTEM_BUS_PATH`], which is what libdbus and
+/// libsystemd fall back to. The caller must still check that the result
+/// is a socket.
+pub fn host_system_bus(env: &Env) -> PathBuf {
+    env.dbus_system_address
+        .as_deref()
+        .and_then(unix_path)
+        .unwrap_or_else(|| PathBuf::from(SYSTEM_BUS_PATH))
 }
 
 /// Path out of a `unix:path=<path>[,<key>=<value>]...` D-Bus address.
@@ -231,33 +312,45 @@ pub fn proxy_program(env: &Env) -> PathBuf {
 }
 
 /// Argv of the proxy itself, run inside its own sandbox: it connects to
-/// `host_bus`, serves the filtered socket in the `dbus/` subdirectory of
-/// `instance_runtime` and exits when `ready_fd` is closed
-/// (`xdg-dbus-proxy(1)`).
+/// each granted host bus, serves the filtered socket for it in the
+/// `dbus/` subdirectory of `instance_runtime` and exits when `ready_fd`
+/// is closed (`xdg-dbus-proxy(1)`).
+///
+/// `session_bus` and `system_bus` are the host sockets the launcher has
+/// resolved for the sections the plan holds. A section given no socket is
+/// left out rather than pointed somewhere else; the sandbox's bind of it
+/// then fails, since the proxy never creates it.
 pub fn proxy_command(
     program: &Path,
     plan: &Plan,
-    host_bus: &Path,
+    session_bus: Option<&Path>,
+    system_bus: Option<&Path>,
     instance_runtime: &Path,
     log: bool,
     ready_fd: &OsStr,
 ) -> Vec<OsString> {
     let mut fd = OsString::from("--fd=");
     fd.push(ready_fd);
-    let mut address = OsString::from("unix:path=");
-    address.push(host_bus);
-    // The address and the socket path must precede the per-proxy options.
-    let mut argv = vec![
-        program.as_os_str().to_os_string(),
-        fd,
-        address,
-        proxy_bus_path(instance_runtime).into_os_string(),
-        OsString::from("--filter"),
-    ];
-    if log {
-        argv.push(OsString::from("--log"));
+    let mut argv = vec![program.as_os_str().to_os_string(), fd];
+    for (section, host, socket) in [
+        (plan.session.as_ref(), session_bus, SESSION_SOCKET),
+        (plan.system.as_ref(), system_bus, SYSTEM_SOCKET),
+    ] {
+        let (Some(section), Some(host)) = (section, host) else {
+            continue;
+        };
+        let mut address = OsString::from("unix:path=");
+        address.push(host);
+        // The address and the socket path must precede the options of
+        // that bus: an option applies to the address before it.
+        argv.push(address);
+        argv.push(proxy_bus_path(instance_runtime, socket).into_os_string());
+        argv.push(OsString::from("--filter"));
+        if log {
+            argv.push(OsString::from("--log"));
+        }
+        argv.extend(section.rules.iter().cloned());
     }
-    argv.extend(plan.rules.iter().cloned());
     argv
 }
 
@@ -269,6 +362,16 @@ mod tests {
         v.iter()
             .map(|s| s.to_str().expect("test rules are ASCII"))
             .collect()
+    }
+
+    /// The session bus's rules; the plan under test grants that bus.
+    fn session(p: &Plan) -> Vec<&str> {
+        strs(&p.session.as_ref().expect("dbus is granted").rules)
+    }
+
+    /// The system bus's rules; the plan under test grants that bus.
+    fn system(p: &Plan) -> Vec<&str> {
+        strs(&p.system.as_ref().expect("system-bus is granted").rules)
     }
 
     fn env() -> Env {
@@ -285,6 +388,7 @@ mod tests {
             passthrough: vec![],
             init_override: None,
             dbus_address: None,
+            dbus_system_address: None,
             dbus_log: false,
             seccomp_log: false,
             test_allow_path: None,
@@ -294,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn no_dbus_means_no_proxy() {
+    fn no_bus_means_no_proxy() {
         assert!(plan(&[Service::Wayland], "t").is_none());
         assert!(plan(&[], "t").is_none());
     }
@@ -314,7 +418,7 @@ mod tests {
         )
         .expect("dbus is granted");
         assert_eq!(
-            strs(&p.rules),
+            session(&p),
             vec![
                 "--talk=org.freedesktop.portal.Desktop",
                 "--talk=org.freedesktop.portal.Documents",
@@ -336,7 +440,8 @@ mod tests {
     fn tray_grants_only_the_status_notifier_watcher() {
         let p =
             plan(&[Service::Dbus { rules: vec![] }, Service::Tray], "t").expect("dbus is granted");
-        assert_eq!(strs(&p.rules), vec!["--talk=org.kde.StatusNotifierWatcher"]);
+        assert_eq!(session(&p), vec!["--talk=org.kde.StatusNotifierWatcher"]);
+        assert!(p.system.is_none());
         assert!(!p.portals);
     }
 
@@ -357,7 +462,7 @@ mod tests {
         )
         .expect("dbus is granted");
         assert_eq!(
-            strs(&p.rules),
+            session(&p),
             vec!["--see=a.b", "--talk=org.freedesktop.Notifications"]
         );
     }
@@ -378,7 +483,7 @@ mod tests {
         )
         .expect("dbus is granted");
         assert_eq!(
-            strs(&p.rules),
+            session(&p),
             vec![
                 "--see=a.b",
                 "--talk=-c.d",
@@ -440,6 +545,7 @@ mod tests {
     #[test]
     fn without_portals_the_flatpak_info_is_the_application_section_only() {
         let p = plan(&[Service::Dbus { rules: vec![] }], "t").expect("dbus is granted");
+        assert!(p.session.is_some() && p.system.is_none());
         assert!(!p.portals);
         assert_eq!(
             p.flatpak_info,
@@ -489,11 +595,14 @@ mod tests {
         let argv = proxy_command(
             Path::new(PROXY_BIN),
             &p,
-            Path::new("/run/user/1000/bus"),
+            Some(Path::new("/run/user/1000/bus")),
+            None,
             Path::new("/run/user/1000/bubbler/t"),
             false,
             OsStr::new("4"),
         );
+        // The session-only invocation is what it was before the system
+        // bus existed: a config without `system-bus` runs the same proxy.
         assert_eq!(
             strs(&argv),
             vec![
@@ -508,11 +617,140 @@ mod tests {
         let logged = proxy_command(
             Path::new(PROXY_BIN),
             &p,
-            Path::new("/run/user/1000/bus"),
+            Some(Path::new("/run/user/1000/bus")),
+            None,
             Path::new("/run/user/1000/bubbler/t"),
             true,
             OsStr::new("4"),
         );
         assert_eq!(logged[5], OsString::from("--log"));
+    }
+
+    #[test]
+    fn the_system_bus_alone_is_a_plan_and_a_proxy_of_its_own() {
+        let p = plan(
+            &[Service::SystemBus {
+                rules: vec![BusRule::Talk("org.freedesktop.UPower".into())],
+            }],
+            "t",
+        )
+        .expect("system-bus is granted");
+        assert!(p.session.is_none());
+        assert_eq!(system(&p), vec!["--talk=org.freedesktop.UPower"]);
+        assert_eq!(p.buses(), vec![(SYSTEM_SOCKET, SYSTEM_NODE)]);
+        // No session address and no session socket: the proxy is told
+        // about the one bus the config granted.
+        assert_eq!(
+            strs(&proxy_command(
+                Path::new(PROXY_BIN),
+                &p,
+                None,
+                Some(Path::new(SYSTEM_BUS_PATH)),
+                Path::new("/run/user/1000/bubbler/t"),
+                false,
+                OsStr::new("4"),
+            )),
+            vec![
+                "xdg-dbus-proxy",
+                "--fd=4",
+                "unix:path=/run/dbus/system_bus_socket",
+                "/run/user/1000/bubbler/t/dbus/system",
+                "--filter",
+                "--talk=org.freedesktop.UPower",
+            ]
+        );
+    }
+
+    #[test]
+    fn both_buses_are_one_proxy_with_the_session_pair_first() {
+        let p = plan(
+            &[
+                Service::Dbus {
+                    rules: vec![BusRule::Talk("ca.desrt.dconf".into())],
+                },
+                Service::Notify,
+                Service::SystemBus {
+                    rules: vec![
+                        BusRule::Talk("org.freedesktop.UPower".into()),
+                        BusRule::See("org.freedesktop.UDisks2".into()),
+                    ],
+                },
+            ],
+            "t",
+        )
+        .expect("both buses are granted");
+        // A bundle is a session-bus rule set; the system section holds
+        // only what the node wrote.
+        assert_eq!(
+            session(&p),
+            vec![
+                "--talk=ca.desrt.dconf",
+                "--talk=org.freedesktop.Notifications"
+            ]
+        );
+        assert_eq!(
+            system(&p),
+            vec![
+                "--talk=org.freedesktop.UPower",
+                "--see=org.freedesktop.UDisks2"
+            ]
+        );
+        assert_eq!(
+            p.buses(),
+            vec![(SESSION_SOCKET, SESSION_NODE), (SYSTEM_SOCKET, SYSTEM_NODE)]
+        );
+        assert_eq!(
+            strs(&proxy_command(
+                Path::new(PROXY_BIN),
+                &p,
+                Some(Path::new("/run/user/1000/bus")),
+                Some(Path::new(SYSTEM_BUS_PATH)),
+                Path::new("/run/user/1000/bubbler/t"),
+                true,
+                OsStr::new("4"),
+            )),
+            vec![
+                "xdg-dbus-proxy",
+                "--fd=4",
+                "unix:path=/run/user/1000/bus",
+                "/run/user/1000/bubbler/t/dbus/bus",
+                "--filter",
+                "--log",
+                "--talk=ca.desrt.dconf",
+                "--talk=org.freedesktop.Notifications",
+                "unix:path=/run/dbus/system_bus_socket",
+                "/run/user/1000/bubbler/t/dbus/system",
+                "--filter",
+                "--log",
+                "--talk=org.freedesktop.UPower",
+                "--see=org.freedesktop.UDisks2",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_system_bus_address_falls_back_to_the_compiled_in_path() {
+        let mut e = env();
+        assert_eq!(host_system_bus(&e), PathBuf::from(SYSTEM_BUS_PATH));
+        e.dbus_system_address = Some("unix:path=/tmp/other,guid=deadbeef".into());
+        assert_eq!(host_system_bus(&e), PathBuf::from("/tmp/other"));
+        for ignored in [
+            "tcp:host=localhost,port=1",
+            "unix:abstract=/x",
+            "",
+            "unix:path=",
+        ] {
+            e.dbus_system_address = Some(ignored.into());
+            assert_eq!(
+                host_system_bus(&e),
+                PathBuf::from(SYSTEM_BUS_PATH),
+                "{ignored}"
+            );
+        }
+        // The two addresses are read from their own variables.
+        e.dbus_address = Some("unix:path=/tmp/session".into());
+        e.dbus_system_address = None;
+        assert_eq!(host_bus(&e), PathBuf::from("/tmp/session"));
+        assert_eq!(host_system_bus(&e), PathBuf::from(SYSTEM_BUS_PATH));
     }
 }

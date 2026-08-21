@@ -119,8 +119,8 @@ pub fn bubbler_live(root: &Path, init: &Path) -> Command {
     c
 }
 
-/// [`bubbler_live`] with the session's real `XDG_RUNTIME_DIR` and
-/// `DBUS_SESSION_BUS_ADDRESS`, which a proxied bus needs; HOME and
+/// [`bubbler_live`] with the session's real `XDG_RUNTIME_DIR` and bus
+/// addresses, which a proxied bus needs; HOME and
 /// XDG_DATA_HOME stay under `root`. Instance runtime state therefore
 /// lands in the real runtime dir, so such tests need distinctive names.
 pub fn bubbler_dbus(root: &Path, init: &Path) -> Command {
@@ -128,8 +128,10 @@ pub fn bubbler_dbus(root: &Path, init: &Path) -> Command {
     if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
         c.env("XDG_RUNTIME_DIR", dir);
     }
-    if let Some(addr) = std::env::var_os("DBUS_SESSION_BUS_ADDRESS") {
-        c.env("DBUS_SESSION_BUS_ADDRESS", addr);
+    for var in ["DBUS_SESSION_BUS_ADDRESS", "DBUS_SYSTEM_BUS_ADDRESS"] {
+        if let Some(addr) = std::env::var_os(var) {
+            c.env(var, addr);
+        }
     }
     c
 }
@@ -140,16 +142,58 @@ fn has_program(program: &str) -> bool {
     Command::new(program).arg("--version").output().is_ok()
 }
 
+/// The path a `unix:path=` D-Bus address in `var` names, if it names one.
+fn unix_path(var: &str) -> Option<PathBuf> {
+    let address = std::env::var_os(var)?;
+    let rest = address.as_bytes().strip_prefix(b"unix:path=")?.to_vec();
+    let end = rest.iter().position(|b| *b == b',').unwrap_or(rest.len());
+    Some(PathBuf::from(OsStr::from_bytes(&rest[..end])))
+}
+
 /// The host session bus socket, resolved the way bubbler resolves it.
 pub fn host_bus() -> Option<PathBuf> {
-    let from_address = std::env::var_os("DBUS_SESSION_BUS_ADDRESS").and_then(|a| {
-        let rest = a.as_bytes().strip_prefix(b"unix:path=")?.to_vec();
-        let end = rest.iter().position(|b| *b == b',').unwrap_or(rest.len());
-        Some(PathBuf::from(OsStr::from_bytes(&rest[..end])))
-    });
-    from_address
+    unix_path("DBUS_SESSION_BUS_ADDRESS")
         .or_else(|| std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("bus")))
         .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.file_type().is_socket()))
+}
+
+/// The host system bus socket, resolved the way bubbler resolves it.
+pub fn host_system_bus() -> Option<PathBuf> {
+    unix_path("DBUS_SYSTEM_BUS_ADDRESS")
+        .or_else(|| Some(PathBuf::from(bubbler_core::dbus::SYSTEM_BUS_PATH)))
+        .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.file_type().is_socket()))
+}
+
+/// Whether the host *system* bus has an owner for `name` right now.
+pub fn system_owns(name: &str) -> bool {
+    Command::new("dbus-send")
+        .args([
+            "--system",
+            "--print-reply",
+            "--dest=org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus.NameHasOwner",
+            &format!("string:{name}"),
+        ])
+        .output()
+        .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("true"))
+}
+
+/// Returns false (after printing why) when a proxied system bus cannot be
+/// tested here: no bwrap, no `xdg-dbus-proxy` or `dbus-send`, or no
+/// system bus socket on the host.
+pub fn require_system_bus() -> bool {
+    if !require_bwrap() {
+        return false;
+    }
+    let proxy = has_program("xdg-dbus-proxy");
+    let send = has_program("dbus-send");
+    let bus = host_system_bus();
+    if !proxy || !send || bus.is_none() {
+        eprintln!("skipping: xdg-dbus-proxy={proxy} dbus-send={send} system-bus={bus:?}");
+        return false;
+    }
+    true
 }
 
 /// Whether the session bus has an owner for `name` right now. Asking

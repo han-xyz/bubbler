@@ -27,6 +27,7 @@ pub const RESERVED_ENV: &[&str] = &[
     "XDG_SESSION_TYPE",
     "PULSE_SERVER",
     "DBUS_SESSION_BUS_ADDRESS",
+    "DBUS_SYSTEM_BUS_ADDRESS",
 ];
 
 /// `/etc` entries `etc-share` may not name: the sandbox generates its own
@@ -112,6 +113,14 @@ pub enum Service {
     /// reaches only what `rules` allow, never the host bus itself.
     Dbus {
         /// Proxy filter rules, in file order; repeats are harmless.
+        rules: Vec<BusRule>,
+    },
+    /// The system bus, filtered by the same `xdg-dbus-proxy` sidecar. The
+    /// `rules` list is the whole confinement: behind a granted name the
+    /// sandbox is an ordinary process of the user, since the bus sees the
+    /// proxy's credentials and not the sandbox's.
+    SystemBus {
+        /// Proxy filter rules, in file order; never an `own`.
         rules: Vec<BusRule>,
     },
     /// The XDG desktop portal rule bundle plus the `/.flatpak-info` file
@@ -250,6 +259,16 @@ fn parse_doc(text: &str, profile: bool) -> Result<RawProfile, ConfigError> {
                     return Err(ConfigError::Duplicate(name.to_owned()));
                 }
                 cfg.services.push(parse_dbus(node)?);
+            }
+            "system-bus" => {
+                if cfg
+                    .services
+                    .iter()
+                    .any(|s| matches!(s, Service::SystemBus { .. }))
+                {
+                    return Err(ConfigError::Duplicate(name.to_owned()));
+                }
+                cfg.services.push(parse_system_bus(node)?);
             }
             "mpris" => {
                 if cfg
@@ -481,10 +500,32 @@ fn is_name_element(s: &str) -> bool {
 /// `dbus` itself is bare; every rule is a child node. Names are checked
 /// here so a typo cannot become a silent hole in the proxy filter.
 fn parse_dbus(node: &KdlNode) -> Result<Service, ConfigError> {
+    Ok(Service::Dbus {
+        rules: parse_bus_rules(node, true)?,
+    })
+}
+
+/// `system-bus { see|talk|call|broadcast "<name>" }`: the children `dbus`
+/// takes minus `own`, and at least one of them, since a bus that answers
+/// nothing is not what the node was written for.
+fn parse_system_bus(node: &KdlNode) -> Result<Service, ConfigError> {
+    let rules = parse_bus_rules(node, false)?;
+    if rules.is_empty() {
+        return Err(bad(
+            node,
+            "expects at least one `see`, `talk`, `call` or `broadcast` rule",
+        ));
+    }
+    Ok(Service::SystemBus { rules })
+}
+
+/// The rule children both bus nodes take, `own` among them only when
+/// `own_allowed`.
+fn parse_bus_rules(node: &KdlNode, own_allowed: bool) -> Result<Vec<BusRule>, ConfigError> {
     reject_arguments(node)?;
     let mut rules = Vec::new();
     let Some(children) = node.children() else {
-        return Ok(Service::Dbus { rules });
+        return Ok(rules);
     };
     for child in children.nodes() {
         reject_types(child)?;
@@ -495,6 +536,9 @@ fn parse_dbus(node: &KdlNode) -> Result<Service, ConfigError> {
         let arg = one_string_arg(child)?;
         rules.push(match kind {
             "see" | "talk" | "own" => {
+                if kind == "own" && !own_allowed {
+                    return Err(bad(node, "own is not allowed on the system bus"));
+                }
                 let name = bus_name(child, arg)?;
                 match kind {
                     "see" => BusRule::See(name),
@@ -523,7 +567,7 @@ fn parse_dbus(node: &KdlNode) -> Result<Service, ConfigError> {
             other => return Err(ConfigError::UnknownNode(other.to_owned())),
         });
     }
-    Ok(Service::Dbus { rules })
+    Ok(rules)
 }
 
 /// The value is not echoed back: it is arbitrary text and may hold the
@@ -1150,6 +1194,19 @@ command "b""#
             parse("env PULSE_SERVER=\"x\""),
             Err(ConfigError::BadArgument { .. })
         ));
+        // Either bus address would point a client at a socket bubbler
+        // did not filter.
+        for key in ["DBUS_SESSION_BUS_ADDRESS", "DBUS_SYSTEM_BUS_ADDRESS"] {
+            assert!(
+                matches!(
+                    parse(&format!(
+                        "env {key}=\"unix:path=/run/dbus/system_bus_socket\""
+                    )),
+                    Err(ConfigError::BadArgument { .. })
+                ),
+                "{key}"
+            );
+        }
         assert!(matches!(
             parse("env \"A=1\""),
             Err(ConfigError::BadArgument { .. })
@@ -1311,6 +1368,102 @@ command "b""#
                 ]
             }]
         );
+    }
+
+    #[test]
+    fn the_system_bus_takes_the_dbus_children_except_own() {
+        let cfg = parse(
+            r#"
+            system-bus {
+                see "org.freedesktop.NetworkManager"
+                talk "org.freedesktop.UPower"
+                call "org.freedesktop.UDisks2=org.freedesktop.DBus.ObjectManager.GetManagedObjects@/org/freedesktop/UDisks2"
+                broadcast "org.freedesktop.UDisks2=@/org/freedesktop/UDisks2"
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.services,
+            vec![Service::SystemBus {
+                rules: vec![
+                    BusRule::See("org.freedesktop.NetworkManager".into()),
+                    BusRule::Talk("org.freedesktop.UPower".into()),
+                    BusRule::Call(
+                        "org.freedesktop.UDisks2".into(),
+                        "org.freedesktop.DBus.ObjectManager.GetManagedObjects@/org/freedesktop/UDisks2"
+                            .into()
+                    ),
+                    BusRule::Broadcast(
+                        "org.freedesktop.UDisks2".into(),
+                        "@/org/freedesktop/UDisks2".into()
+                    ),
+                ]
+            }]
+        );
+    }
+
+    #[test]
+    fn the_system_bus_refuses_own_and_an_empty_node() {
+        // The name would be owned with the proxy's credentials, which are
+        // the user's own, so the message says so rather than parsing it.
+        let Err(ConfigError::BadArgument { node, reason }) =
+            parse("system-bus { own \"org.example.App\" }")
+        else {
+            panic!("own was accepted on the system bus");
+        };
+        assert_eq!(node, "system-bus");
+        assert!(reason.contains("own"), "{reason}");
+        // A bus that answers nothing is a node the user did not mean.
+        for text in ["system-bus", "system-bus {}", "system-bus { }"] {
+            assert!(
+                matches!(parse(text), Err(ConfigError::BadArgument { node, .. }) if node == "system-bus"),
+                "{text}"
+            );
+        }
+        assert!(matches!(
+            parse("system-bus { talk \"a.b\" }\nsystem-bus { talk \"c.d\" }"),
+            Err(ConfigError::Duplicate(n)) if n == "system-bus"
+        ));
+    }
+
+    #[test]
+    fn the_system_bus_stands_on_its_own_and_beside_the_session_one() {
+        // The two buses are independent: a sandbox may have UPower and no
+        // session bus at all.
+        assert_eq!(
+            parse("system-bus { talk \"org.freedesktop.UPower\" }")
+                .unwrap()
+                .services,
+            vec![Service::SystemBus {
+                rules: vec![BusRule::Talk("org.freedesktop.UPower".into())]
+            }]
+        );
+        assert_eq!(
+            parse("dbus\nsystem-bus { talk \"org.freedesktop.UPower\" }")
+                .unwrap()
+                .services,
+            vec![
+                Service::Dbus { rules: vec![] },
+                Service::SystemBus {
+                    rules: vec![BusRule::Talk("org.freedesktop.UPower".into())]
+                }
+            ]
+        );
+        // A bundle is a set of session-bus rules; the system bus does not
+        // carry one.
+        assert!(matches!(
+            parse("system-bus { talk \"a.b\" }\nnotify"),
+            Err(ConfigError::BadArgument { node, .. }) if node == "notify"
+        ));
+        for text in [
+            "system-bus \"x\" { talk \"a.b\" }",
+            "system-bus foo=1 { talk \"a.b\" }",
+            "system-bus { talk \"a b\" }",
+            "system-bus { hidraw \"a.b\" }",
+        ] {
+            assert!(parse(text).is_err(), "{text}");
+        }
     }
 
     #[test]

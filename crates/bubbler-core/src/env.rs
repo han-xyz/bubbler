@@ -54,6 +54,10 @@ pub struct Env {
     /// `$DBUS_SESSION_BUS_ADDRESS` as the host set it; only a
     /// `unix:path=` address names a socket bubbler can proxy.
     pub dbus_address: Option<OsString>,
+    /// `$DBUS_SYSTEM_BUS_ADDRESS` as the host set it; only a `unix:path=`
+    /// address names a socket bubbler can proxy, and the compiled-in
+    /// `/run/dbus/system_bus_socket` is used when it names none.
+    pub dbus_system_address: Option<OsString>,
     /// `$BUBBLER_DBUS_LOG=1`: run the D-Bus proxy with `--log`, which
     /// prints every filtered message to bubbler's stderr.
     pub dbus_log: bool,

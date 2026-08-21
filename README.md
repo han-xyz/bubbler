@@ -65,7 +65,8 @@ inside it.
 the flattened profile (`generic` unless `--profile` says otherwise) plus one
 bare node per `--grant`; the grants are `wayland`, `x11`, `network`, `dri`,
 `pipewire`, `pulseaudio`, `dbus`, `portals`, `notify`, `tray` and `gamepad`,
-and anything with arguments needs a real instance. The bundles are checked as
+and anything with arguments needs a real instance — `system-bus` among them,
+since it is not a grant without rules. The bundles are checked as
 they are in a config file, so `--grant tray` without `--grant dbus` is refused
 rather than silently dropped. The sandbox lives in
 `$XDG_DATA_HOME/bubbler/try/<pid>/`, never appears in `list`, and is removed
@@ -118,6 +119,9 @@ file order does not affect the generated argv.
         own "org.example.App"
         call "org.freedesktop.portal.Desktop=org.freedesktop.portal.Settings.Read@/org/freedesktop/portal/desktop"
         broadcast "org.freedesktop.portal.Desktop=@/org/freedesktop/portal/desktop"
+    }
+    system-bus {                     # system bus through the same proxy
+        talk "org.freedesktop.UPower"
     }
     portals                          # XDG portal rules plus /.flatpak-info
     notify                           # talk to org.freedesktop.Notifications
@@ -190,7 +194,8 @@ only once. `env` values and `command` arguments may not contain NUL, a newline
 or a carriage return — a newline would forge a line in `--dry-run` output. The
 variables the sandbox owns are rejected: `HOME`, `PATH`, `XDG_RUNTIME_DIR`,
 `USER`, `LOGNAME`, `WAYLAND_DISPLAY`, `DISPLAY`, `XAUTHORITY`,
-`XDG_SESSION_TYPE`, `PULSE_SERVER`, `DBUS_SESSION_BUS_ADDRESS`.
+`XDG_SESSION_TYPE`, `PULSE_SERVER`, `DBUS_SESSION_BUS_ADDRESS`,
+`DBUS_SYSTEM_BUS_ADDRESS`.
 
 ## Host paths
 
@@ -276,8 +281,8 @@ single chain through it would.
 Merging is by node: grants are unioned, identical share nodes collapse, and
 the same `home-share` or `path-share` path in two modes is an error rather
 than a silent choice of `ro` or `rw`. `command`, `tty` and `mpris` from the including file
-replace the included one, `env` replaces by key, `dbus` rules and `seccomp`
-lists are unioned, and `seccomp { disable }` in any layer disables the
+replace the included one, `env` replaces by key, `dbus` and `system-bus`
+rules and `seccomp` lists are unioned, and `seccomp { disable }` in any layer disables the
 filter. `portals`, `notify`, `tray` and `mpris` need `dbus` in the merged
 result, not in every layer, so a layer may add `notify` to a `dbus` it
 includes.
@@ -387,15 +392,16 @@ be a lie about what is confined.
 `dbus` never binds the session bus itself. bubbler starts an `xdg-dbus-proxy`
 in a sandbox of its own — no network, no home, read-only `/usr`, an `/etc`
 holding at most `ld.so.cache`, `ld.so.conf`, `ld.so.conf.d` and
-`nsswitch.conf`, the host bus socket read-only and the instance's `dbus/`
-subdirectory read-write — and binds the filtered socket it serves at
+`nsswitch.conf`, the host socket of each granted bus read-only and the
+instance's `dbus/` subdirectory read-write — and binds the filtered socket it
+serves at
 `$XDG_RUNTIME_DIR/bus` inside the sandbox, with `DBUS_SESSION_BUS_ADDRESS`
 pointing there. The start waits up to five seconds for the proxy to report
 that it has bound its socket and is accepting connections, and fails if it
 does not; the proxy exits with the sandbox. `--dry-run` prints that bind
 without starting anything.
 
-The proxy creates its socket in `$XDG_RUNTIME_DIR/bubbler/<name>/dbus/`, and
+The proxy creates its sockets in `$XDG_RUNTIME_DIR/bubbler/<name>/dbus/`, and
 that directory is the only writable path in the proxy's own sandbox. The
 instance directory above it is never bound there: it holds the control socket
 `init.sock`, and reaching that socket means running commands inside the app.
@@ -433,7 +439,7 @@ own name, and a sandbox that owns it can impersonate the tray and collect
 every other application's items.
 
 `BUBBLER_DBUS_LOG=1` runs the proxy with `--log`, so every filtered message is
-printed to bubbler's stderr.
+printed to bubbler's stderr, for each bus the instance is granted.
 
 `portals` also publishes the instance's identity on the host, as
 `$XDG_RUNTIME_DIR/.flatpak/bubbler-<name>/bwrapinfo.json`: bwrap's own
@@ -454,6 +460,53 @@ A rule grants exactly as much as it reads, and the globs are wide: `own
 "org.*"` claims every well-known name under `org.`, and `mpris name="*"` owns
 the whole `org.mpris.MediaPlayer2.` tree, so the sandbox can impersonate any
 player on the session bus. Name the application, not a prefix.
+
+### The system bus
+
+`system-bus` is the same proxy, filtering the host system bus:
+
+    system-bus {
+        talk "org.freedesktop.UPower"
+        talk "org.freedesktop.UDisks2"
+        see  "org.freedesktop.NetworkManager"
+    }
+
+It takes the `dbus` children except `own`, needs at least one of them, and
+does not need or imply `dbus` — the two buses are independent, and a sandbox
+may have UPower and no session bus at all. When both are granted, one
+`xdg-dbus-proxy` process serves both: options apply to the address they
+follow, so each bus has its own rule list. There is **no default name**; a
+sandbox reaches nothing on the system bus that the node does not write.
+
+The filtered socket is bound at `/run/dbus/system_bus_socket`, which is what
+libdbus and libsystemd compile in, so no environment variable is set and
+`DBUS_SYSTEM_BUS_ADDRESS` is one of the variables `env` may not set. The host
+socket is `$DBUS_SYSTEM_BUS_ADDRESS` when it is a `unix:path=` address, else
+`/run/dbus/system_bus_socket`, and must resolve to a socket. Everything the launcher
+does with the session socket it does with this one: the proxy writes it in
+`dbus/`, bubbler moves it to `$XDG_RUNTIME_DIR/bubbler/<name>/system` without
+following symlinks, checks it really is a socket, and only then does the
+sandbox bind it.
+
+**The `talk` list is the entire confinement, and it is a weaker boundary than
+the session bus.** The system bus sees the *proxy's* connection, not the
+sandbox: `busctl --system list` attributes it to `xdg-dbus-proxy`, running as
+your user in your session, and the sandbox's uid, pid namespace and
+`/.flatpak-info` never reach `dbus-broker` or polkit. So behind a granted name
+the sandbox is judged as an ordinary local process of yours — a method whose
+polkit action is `auth_admin` pops a password prompt on your desktop, with
+nothing on it to say which sandbox asked. `own` is refused by the parser for
+the same reason: a name owned that way would be owned with your credentials.
+Grant one name at a time, and prefer a portal (`portals` covers
+`org.freedesktop.portal.Inhibit`, and PipeWire gets realtime priority from
+`RLIMIT_RTPRIO` and `org.freedesktop.portal.Realtime` before it would ask
+rtkit) over opening a system service.
+
+Two things carry over from the session bus. The wildcard is a dot-namespace
+one, so `talk "org.freedesktop.*"` matches `org.freedesktop.UPower` but not
+`org.freedesktopFoo`. And filtering applies to outgoing calls and signals and
+to incoming broadcasts only: a call *from* a system daemon into the sandbox
+needs no rule.
 
 ## Terminal
 
@@ -635,9 +688,8 @@ binding the tree under it.
 
 ## Known gaps
 
-- No system bus, no accessibility bus, no document-portal FUSE mount: `dbus`
-  covers the session bus only, so a portal that hands back a `/run/user/<uid>/doc`
-  path gives the sandbox nothing it can open.
+- No accessibility bus, no document-portal FUSE mount, so a portal that hands
+  back a `/run/user/<uid>/doc` path gives the sandbox nothing it can open.
 - Descriptors handed to a command through `exec` are reachable by the
   sandboxed application through `/proc` — exec is a convenience channel, not
   a boundary. What the sandbox can still do with the terminal it is given is
@@ -657,14 +709,19 @@ Instances live in `$XDG_DATA_HOME/bubbler/instances/<name>/` (by default under
 `~/.local/share`), each holding a `config.kdl` and the private `home/`. Every
 run except `--dry-run` also creates `$XDG_RUNTIME_DIR/bubbler/<name>/`, mode
 0700, reusing one left over from an earlier run, and binds the control socket
-`init.sock` in it; a `dbus` grant adds the subdirectory `dbus/` the proxy
-creates its socket in and the checked socket `bus` beside it, and a `portals`
-grant adds `$XDG_RUNTIME_DIR/.flatpak/bubbler-<name>/`, creating `.flatpak/`
-if it is missing. Everything a run makes there is removed again when it ends.
+`init.sock` in it; a `dbus` or `system-bus` grant adds the subdirectory
+`dbus/` the proxy creates its sockets in and the checked socket `bus` and/or
+`system` beside it, and a `portals` grant adds
+`$XDG_RUNTIME_DIR/.flatpak/bubbler-<name>/`, creating `.flatpak/` if it is
+missing. Everything a run makes there is removed again when it ends.
 `HOME` and `XDG_RUNTIME_DIR` must be set and non-empty. Your profiles live in
 `$XDG_CONFIG_HOME/bubbler/profiles/` (by default under `~/.config`) and the
 system's in `/usr/share/bubbler/profiles/`, or wherever
 `$BUBBLER_PROFILE_DIR` points instead.
+
+Those socket paths have to fit the 107 bytes a Unix socket address holds, so
+`create` and `try` refuse a name that would make one longer instead of letting
+the kernel truncate it silently and the connection fail somewhere else.
 
 The `bubbler-init` binary is taken from `$BUBBLER_INIT` if set (it must be a
 regular file), else from next to the `bubbler` binary, else from

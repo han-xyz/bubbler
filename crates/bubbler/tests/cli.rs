@@ -12,7 +12,8 @@ use bubbler_core::profile::NAMES;
 use bubbler_core::seccomp::{DEFAULT_ENOSYS, DEFAULT_EPERM, syscall_number};
 use common::{
     bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, kill_group, real_init, require_bwrap,
-    require_dbus, require_portal, require_python, require_tray, test_pty,
+    require_dbus, require_portal, require_python, require_system_bus, require_tray, system_owns,
+    test_pty,
 };
 use rustix::fs::{OFlags, fcntl_getfl};
 use rustix::process::{Pid, Signal, kill_process};
@@ -1260,6 +1261,123 @@ fn real_portal_identity_lives_exactly_as_long_as_the_run() {
         dir.parent().is_some_and(Path::is_dir),
         "the .flatpak directory itself was removed"
     );
+}
+
+#[test]
+fn real_system_bus_answers_for_the_names_it_grants_and_no_others() {
+    if !require_system_bus() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    if !system_owns("org.freedesktop.UPower") {
+        eprintln!("skipping: the host system bus has no org.freedesktop.UPower");
+        return;
+    }
+    let tmp = setup();
+    let name = "bubbler-test-system-bus";
+    let _leftovers = dbus_instance(
+        tmp.path(),
+        &init,
+        name,
+        "system-bus { talk \"org.freedesktop.UPower\" }\ncommand \"true\"\n",
+    );
+
+    let out = bubbler_dbus(tmp.path(), &init)
+        .args([
+            "run",
+            name,
+            "--",
+            "/usr/bin/dbus-send",
+            "--system",
+            "--print-reply",
+            "--dest=org.freedesktop.UPower",
+            "/org/freedesktop/UPower",
+            "org.freedesktop.UPower.EnumerateDevices",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(s.contains("array"), "stdout: {s}stderr: {err}");
+
+    // A name the host bus does own and no rule grants: the proxy answers
+    // for it instead of letting the call through.
+    if !system_owns("org.freedesktop.login1") {
+        eprintln!("skipping the denial half: the host has no org.freedesktop.login1");
+        return;
+    }
+    let out = bubbler_dbus(tmp.path(), &init)
+        .args([
+            "run",
+            name,
+            "--",
+            "/usr/bin/dbus-send",
+            "--system",
+            "--print-reply",
+            "--dest=org.freedesktop.login1",
+            "/org/freedesktop/login1",
+            "org.freedesktop.DBus.Peer.Ping",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "the ungranted name answered");
+    assert!(
+        err.contains("AccessDenied") || err.contains("ServiceUnknown"),
+        "{err}"
+    );
+}
+
+#[test]
+fn real_system_bus_needs_no_session_bus_and_is_absent_without_the_node() {
+    if !require_system_bus() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    // The socket, the address and the session bus are three separate
+    // things: the system bus grant brings the first and neither other.
+    const PROBE: &str = r#"test -S /run/dbus/system_bus_socket || { echo NOSOCKET; exit 1; }
+test -z "$DBUS_SESSION_BUS_ADDRESS" || { echo SESSIONADDR; exit 1; }
+test -z "$DBUS_SYSTEM_BUS_ADDRESS" || { echo SYSTEMADDR; exit 1; }
+test ! -e "$XDG_RUNTIME_DIR/bus" || { echo SESSIONSOCKET; exit 1; }
+echo OK"#;
+    let name = "bubbler-test-system-bus-alone";
+    let _leftovers = dbus_instance(
+        tmp.path(),
+        &init,
+        name,
+        "system-bus { talk \"org.freedesktop.UPower\" }\ncommand \"true\"\n",
+    );
+    let out = bubbler_dbus(tmp.path(), &init)
+        .args(["run", name, "--", "/usr/bin/sh", "-c", PROBE])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "stdout: {s}stderr: {err}");
+    assert!(s.contains("OK"), "stdout: {s}stderr: {err}");
+
+    // And without the node the sandbox has no system bus at all, whether
+    // or not it has a session one.
+    let bare = "bubbler-test-system-bus-none";
+    let _bare = dbus_instance(tmp.path(), &init, bare, "dbus\ncommand \"true\"\n");
+    let out = bubbler_dbus(tmp.path(), &init)
+        .args([
+            "run",
+            bare,
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            r#"test ! -e /run/dbus/system_bus_socket || { echo LEAK; exit 1; }"#,
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "stdout: {s}stderr: {err}");
+    assert!(!s.contains("LEAK"), "stdout: {s}stderr: {err}");
 }
 
 #[test]

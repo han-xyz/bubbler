@@ -270,20 +270,30 @@ fn apply_seccomp(
 }
 
 /// Complete bwrap argv (without the program name) for the D-Bus proxy
-/// sidecar of one instance. `alloc` keeps the read end of the pipe the
-/// proxy reports readiness on.
+/// sidecar of one instance. `session_bus` and `system_bus` are the host
+/// sockets of the buses the plan grants, already type-checked; `alloc`
+/// keeps the read end of the pipe the proxy reports readiness on.
 pub fn proxy_argv(
     env: &Env,
     plan: &dbus::Plan,
-    host_bus: &Path,
+    session_bus: Option<&Path>,
+    system_bus: Option<&Path>,
     dir: &Path,
     host: &dyn Host,
     alloc: &mut dyn FdAllocator,
 ) -> Result<Vec<OsString>, LaunchError> {
     let ready = alloc.ready_pipe().map_err(LaunchError::Data)?;
     let program = dbus::proxy_program(env);
-    let command = dbus::proxy_command(&program, plan, host_bus, dir, env.dbus_log, &ready);
-    let mut args = BwrapArgs::proxy_baseline(host_bus, &dbus::socket_dir(dir), host);
+    let command = dbus::proxy_command(
+        &program,
+        plan,
+        session_bus,
+        system_bus,
+        dir,
+        env.dbus_log,
+        &ready,
+    );
+    let mut args = BwrapArgs::proxy_baseline(session_bus, system_bus, &dbus::socket_dir(dir), host);
     // The sidecar has no `seccomp` node of its own: an instance may relax
     // its own filter, never the one around the process holding its bus.
     for program in seccomp::compile(&seccomp::RuleSet::default_set(), env.seccomp_log)? {
@@ -385,12 +395,31 @@ pub fn start_proxy(
     plan: &dbus::Plan,
     host: &dyn Host,
 ) -> Result<ProxyHandle, LaunchError> {
-    let host_bus = service::require_socket(host, "dbus", dbus::host_bus(env))?;
+    // Only the buses the plan grants are resolved: probing the other one
+    // would fail a run over a socket it never asked for.
+    let session_bus = plan
+        .session
+        .as_ref()
+        .map(|_| service::require_socket(host, "dbus", dbus::host_bus(env)))
+        .transpose()?;
+    let system_bus = plan
+        .system
+        .as_ref()
+        .map(|_| service::require_socket(host, "system-bus", dbus::host_system_bus(env)))
+        .transpose()?;
     // The proxy gets this directory and nothing else of the instance's
     // runtime state, so it is created here rather than bound from above.
     mkdir_private(&dbus::socket_dir(dir))?;
     let mut alloc = RealAlloc::sidecar();
-    let argv = proxy_argv(env, plan, &host_bus, dir, host, &mut alloc)?;
+    let argv = proxy_argv(
+        env,
+        plan,
+        session_bus.as_deref(),
+        system_bus.as_deref(),
+        dir,
+        host,
+        &mut alloc,
+    )?;
     let child = Command::new("bwrap")
         .args(&argv)
         .spawn()
@@ -444,27 +473,29 @@ fn open_dir(path: &Path) -> Result<OwnedFd, LaunchError> {
 // change after this. `O_NOFOLLOW` then makes a symlink fail with ELOOP
 // instead of being followed, since `stat` through a path would report the
 // type of the target and bwrap would bind that target.
-fn adopt_proxy_bus(dir: &Path) -> Result<FileGuard, LaunchError> {
+// `node` is the config node that granted this bus, so a failure names what
+// the user would have to change rather than the sidecar that failed.
+fn adopt_proxy_bus(dir: &Path, socket: &str, node: &'static str) -> Result<FileGuard, LaunchError> {
     let from = open_dir(&dbus::socket_dir(dir))?;
     let to = open_dir(dir)?;
-    let path = dbus::app_bus_path(dir);
-    rustix::fs::renameat(&from, "bus", &to, "bus").map_err(|e| match e {
+    let path = dbus::app_bus_path(dir, socket);
+    rustix::fs::renameat(&from, socket, &to, socket).map_err(|e| match e {
         Errno::NOENT => LaunchError::MissingResource {
-            service: "dbus",
-            path: dbus::proxy_bus_path(dir),
+            service: node,
+            path: dbus::proxy_bus_path(dir, socket),
         },
         e => LaunchError::Io(path.clone(), e.into()),
     })?;
     // Whatever was moved is bubbler's to remove from here on, socket or not.
     let guard = FileGuard(path.clone());
     let wrong_type = || LaunchError::WrongType {
-        service: "dbus",
+        service: node,
         path: path.clone(),
         expected: "a socket",
     };
     let bus = rustix::fs::openat(
         &to,
-        "bus",
+        socket,
         OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
@@ -478,7 +509,7 @@ fn adopt_proxy_bus(dir: &Path) -> Result<FileGuard, LaunchError> {
         // A directory cannot be unlinked as a file, and one left at this
         // name would fail the rename of every later start of the instance.
         if kind == rustix::fs::FileType::Directory {
-            remove_moved_dir(&to, &path);
+            remove_moved_dir(&to, socket, &path);
         }
         return Err(wrong_type());
     }
@@ -487,8 +518,8 @@ fn adopt_proxy_bus(dir: &Path) -> Result<FileGuard, LaunchError> {
 
 /// Remove a directory the proxy planted where its socket belongs. Whatever
 /// it holds goes with it: after the move nothing but bubbler can reach it.
-fn remove_moved_dir(inst: &OwnedFd, path: &Path) {
-    if rustix::fs::unlinkat(inst, "bus", AtFlags::REMOVEDIR).is_err() {
+fn remove_moved_dir(inst: &OwnedFd, socket: &str, path: &Path) {
+    if rustix::fs::unlinkat(inst, socket, AtFlags::REMOVEDIR).is_err() {
         let _ = std::fs::remove_dir_all(path);
     }
 }
@@ -992,12 +1023,16 @@ pub fn run(
         Some(plan) => Some(start_proxy(env, &dir, plan, &RealHost)?),
         None => None,
     };
-    // Between the proxy's ready byte and the sandbox's bind the socket is
-    // moved where the proxy cannot reach it, and only then checked.
-    let _bus = match &plan {
-        Some(_) => Some(adopt_proxy_bus(&dir)?),
-        None => None,
-    };
+    // Between the proxy's ready byte and the sandbox's bind each socket
+    // is moved where the proxy cannot reach it, and only then checked. The
+    // guards stay in scope for the whole run; each removes its socket
+    // when it drops.
+    let mut buses: Vec<FileGuard> = Vec::new();
+    if let Some(plan) = &plan {
+        for (socket, node) in plan.buses() {
+            buses.push(adopt_proxy_bus(&dir, socket, node)?);
+        }
+    }
     let host = tty::host_stdio()?;
     let is_tty = tty::host_is_tty();
     let mut stdio = tty::plan(mode, is_tty);
@@ -1176,6 +1211,7 @@ mod tests {
             passthrough: vec![],
             init_override: Some(init),
             dbus_address: None,
+            dbus_system_address: None,
             dbus_log: false,
             seccomp_log: false,
             test_allow_path: None,
@@ -1336,7 +1372,8 @@ mod tests {
         let argv = proxy_argv(
             &e,
             &plan,
-            Path::new("/run/user/1000/bus"),
+            Some(Path::new("/run/user/1000/bus")),
+            None,
             Path::new("/run/user/1000/bubbler/t"),
             &FakeHost::default(),
             &mut DryRunAlloc::default(),
@@ -1399,6 +1436,121 @@ mod tests {
     }
 
     #[test]
+    fn a_system_bus_proxy_sees_that_socket_and_no_session_one() {
+        use crate::config::{BusRule, Service};
+        use crate::host::fake::FakeHost;
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let plan = dbus::plan(
+            &[Service::SystemBus {
+                rules: vec![BusRule::Talk("org.freedesktop.UPower".into())],
+            }],
+            "t",
+        )
+        .expect("system-bus is granted");
+        let argv = strs(
+            &proxy_argv(
+                &e,
+                &plan,
+                None,
+                Some(Path::new(dbus::SYSTEM_BUS_PATH)),
+                Path::new("/run/user/1000/bubbler/t"),
+                &FakeHost::default(),
+                &mut DryRunAlloc::default(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            argv.windows(3).any(|w| w
+                == [
+                    "--ro-bind",
+                    "/run/dbus/system_bus_socket",
+                    "/run/dbus/system_bus_socket",
+                ]),
+            "{argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "/run/user/1000/bus"),
+            "the proxy reaches a session bus nothing granted: {argv:?}"
+        );
+        assert_eq!(
+            &argv[argv.len() - 6..],
+            &[
+                "xdg-dbus-proxy",
+                "--fd=3",
+                "unix:path=/run/dbus/system_bus_socket",
+                "/run/user/1000/bubbler/t/dbus/system",
+                "--filter",
+                "--talk=org.freedesktop.UPower",
+            ]
+        );
+    }
+
+    #[test]
+    fn both_buses_run_in_one_proxy_sandbox() {
+        use crate::config::{BusRule, Service};
+        use crate::host::fake::FakeHost;
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let plan = dbus::plan(
+            &[
+                Service::Dbus { rules: vec![] },
+                Service::SystemBus {
+                    rules: vec![BusRule::Talk("org.freedesktop.UPower".into())],
+                },
+            ],
+            "t",
+        )
+        .expect("both buses are granted");
+        assert_eq!(
+            plan.buses(),
+            vec![
+                (dbus::SESSION_SOCKET, dbus::SESSION_NODE),
+                (dbus::SYSTEM_SOCKET, dbus::SYSTEM_NODE)
+            ]
+        );
+        let argv = strs(
+            &proxy_argv(
+                &e,
+                &plan,
+                Some(Path::new("/run/user/1000/bus")),
+                Some(Path::new(dbus::SYSTEM_BUS_PATH)),
+                Path::new("/run/user/1000/bubbler/t"),
+                &FakeHost::default(),
+                &mut DryRunAlloc::default(),
+            )
+            .unwrap(),
+        );
+        // One sandbox, one process, two addresses: the second pair's
+        // options apply to it alone (`xdg-dbus-proxy(1)`).
+        assert_eq!(
+            argv.iter().filter(|a| *a == "xdg-dbus-proxy").count(),
+            1,
+            "{argv:?}"
+        );
+        assert_eq!(
+            &argv[argv.len() - 9..],
+            &[
+                "xdg-dbus-proxy",
+                "--fd=3",
+                "unix:path=/run/user/1000/bus",
+                "/run/user/1000/bubbler/t/dbus/bus",
+                "--filter",
+                "unix:path=/run/dbus/system_bus_socket",
+                "/run/user/1000/bubbler/t/dbus/system",
+                "--filter",
+                "--talk=org.freedesktop.UPower",
+            ]
+        );
+        // Still the one writable path, whatever the bus count.
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--bind").count(),
+            1,
+            "{argv:?}"
+        );
+    }
+
+    #[test]
     fn the_proxy_never_sees_the_instances_control_socket() {
         use crate::config::Service;
         use crate::host::fake::FakeHost;
@@ -1410,7 +1562,8 @@ mod tests {
             &proxy_argv(
                 &e,
                 &plan,
-                Path::new("/run/user/1000/bus"),
+                Some(Path::new("/run/user/1000/bus")),
+                None,
                 dir,
                 &FakeHost::default(),
                 &mut DryRunAlloc::default(),
@@ -1429,7 +1582,9 @@ mod tests {
         );
         // Where the checked socket is moved to; naming it here would give
         // the proxy the path the sandbox actually binds.
-        let app_bus = dbus::app_bus_path(dir).display().to_string();
+        let app_bus = dbus::app_bus_path(dir, dbus::SESSION_SOCKET)
+            .display()
+            .to_string();
         assert!(
             !argv.contains(&app_bus),
             "the proxy names the socket the sandbox binds: {argv:?}"
@@ -1453,7 +1608,8 @@ mod tests {
             &proxy_argv(
                 &e,
                 &plan,
-                Path::new("/run/user/1000/bus"),
+                Some(Path::new("/run/user/1000/bus")),
+                None,
                 Path::new("/run/user/1000/bubbler/t"),
                 &FakeHost::default(),
                 &mut DryRunAlloc::default(),
@@ -1478,7 +1634,8 @@ mod tests {
             &proxy_argv(
                 &e,
                 &plan,
-                Path::new("/run/user/1000/bus"),
+                Some(Path::new("/run/user/1000/bus")),
+                None,
                 Path::new("/run/user/1000/bubbler/t"),
                 &host,
                 &mut DryRunAlloc::default(),
@@ -1497,7 +1654,8 @@ mod tests {
             proxy_argv(
                 &e,
                 &plan,
-                Path::new("/run/user/1000/bus"),
+                Some(Path::new("/run/user/1000/bus")),
+                None,
                 Path::new("/run/user/1000/bubbler/t"),
                 &FakeHost::default(),
                 &mut DryRunAlloc::default(),
@@ -1550,33 +1708,49 @@ mod tests {
 
     #[test]
     fn a_proxied_socket_is_moved_out_of_the_proxys_reach() {
+        // Both buses are adopted by the same rule; only the file name
+        // differs.
+        for socket in [dbus::SESSION_SOCKET, dbus::SYSTEM_SOCKET] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
+            std::fs::create_dir(dbus::socket_dir(dir)).unwrap();
+            let listener = UnixListener::bind(dbus::proxy_bus_path(dir, socket)).unwrap();
+            let guard = adopt_proxy_bus(dir, socket, dbus::SESSION_NODE).unwrap();
+            let moved = std::fs::symlink_metadata(dbus::app_bus_path(dir, socket)).unwrap();
+            assert!(std::os::unix::fs::FileTypeExt::is_socket(
+                &moved.file_type()
+            ));
+            assert!(!dbus::proxy_bus_path(dir, socket).exists());
+            // The proxy serves the socket it bound, not the path it bound
+            // it at.
+            assert!(UnixStream::connect(dbus::app_bus_path(dir, socket)).is_ok());
+            drop(listener);
+            drop(guard);
+            assert!(
+                !dbus::app_bus_path(dir, socket).exists(),
+                "{socket}: the socket outlived the run"
+            );
+        }
+        // A failure names the node the user would have to look at.
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path();
-        std::fs::create_dir(dbus::socket_dir(dir)).unwrap();
-        let listener = UnixListener::bind(dbus::proxy_bus_path(dir)).unwrap();
-        let guard = adopt_proxy_bus(dir).unwrap();
-        let moved = std::fs::symlink_metadata(dbus::app_bus_path(dir)).unwrap();
-        assert!(std::os::unix::fs::FileTypeExt::is_socket(
-            &moved.file_type()
+        std::fs::create_dir(dbus::socket_dir(tmp.path())).unwrap();
+        assert!(matches!(
+            adopt_proxy_bus(tmp.path(), dbus::SYSTEM_SOCKET, dbus::SYSTEM_NODE),
+            Err(LaunchError::MissingResource {
+                service: "system-bus",
+                ..
+            })
         ));
-        assert!(!dbus::proxy_bus_path(dir).exists());
-        // The proxy serves the socket it bound, not the path it bound it at.
-        assert!(UnixStream::connect(dbus::app_bus_path(dir)).is_ok());
-        drop(listener);
-        drop(guard);
-        assert!(
-            !dbus::app_bus_path(dir).exists(),
-            "the socket outlived the run"
-        );
     }
 
     #[test]
     fn anything_but_a_socket_in_the_proxys_directory_stops_the_run() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
+        let socket = dbus::SESSION_SOCKET;
         std::fs::create_dir(dbus::socket_dir(dir)).unwrap();
         assert!(matches!(
-            adopt_proxy_bus(dir),
+            adopt_proxy_bus(dir, socket, dbus::SESSION_NODE),
             Err(LaunchError::MissingResource {
                 service: "dbus",
                 ..
@@ -1584,9 +1758,9 @@ mod tests {
         ));
         // A symlink is the attack: `stat` through it would report the type
         // of its target, and bwrap would bind that target.
-        std::os::unix::fs::symlink("/etc", dbus::proxy_bus_path(dir)).unwrap();
+        std::os::unix::fs::symlink("/etc", dbus::proxy_bus_path(dir, socket)).unwrap();
         assert!(matches!(
-            adopt_proxy_bus(dir),
+            adopt_proxy_bus(dir, socket, dbus::SESSION_NODE),
             Err(LaunchError::WrongType {
                 service: "dbus",
                 expected: "a socket",
@@ -1595,38 +1769,45 @@ mod tests {
         ));
         // Moved out of the proxy's reach first, so a refused run leaves
         // nothing of it behind either.
-        assert!(!dbus::app_bus_path(dir).exists(), "the symlink was kept");
         assert!(
-            !dbus::proxy_bus_path(dir).exists(),
+            !dbus::app_bus_path(dir, socket).exists(),
+            "the symlink was kept"
+        );
+        assert!(
+            !dbus::proxy_bus_path(dir, socket).exists(),
             "the symlink was left in place"
         );
-        std::fs::write(dbus::proxy_bus_path(dir), b"").unwrap();
+        std::fs::write(dbus::proxy_bus_path(dir, socket), b"").unwrap();
         assert!(matches!(
-            adopt_proxy_bus(dir),
+            adopt_proxy_bus(dir, socket, dbus::SESSION_NODE),
             Err(LaunchError::WrongType {
                 service: "dbus",
                 expected: "a socket",
                 ..
             })
         ));
-        assert!(!dbus::app_bus_path(dir).exists());
+        assert!(!dbus::app_bus_path(dir, socket).exists());
         // A directory is refused like anything else, and removed with what
         // is in it: `remove_file` cannot take one, and one left at this
         // name would fail the rename of every later start.
-        std::fs::create_dir(dbus::proxy_bus_path(dir)).unwrap();
-        std::fs::write(dbus::proxy_bus_path(dir).join("x"), b"").unwrap();
+        std::fs::create_dir(dbus::proxy_bus_path(dir, socket)).unwrap();
+        std::fs::write(dbus::proxy_bus_path(dir, socket).join("x"), b"").unwrap();
         assert!(matches!(
-            adopt_proxy_bus(dir),
+            adopt_proxy_bus(dir, socket, dbus::SESSION_NODE),
             Err(LaunchError::WrongType {
                 service: "dbus",
                 expected: "a socket",
                 ..
             })
         ));
-        assert!(!dbus::app_bus_path(dir).exists(), "the directory was kept");
+        assert!(
+            !dbus::app_bus_path(dir, socket).exists(),
+            "the directory was kept"
+        );
         // And the next honest start works.
-        let listener = UnixListener::bind(dbus::proxy_bus_path(dir)).unwrap();
-        adopt_proxy_bus(dir).expect("a socket after a refused directory");
+        let listener = UnixListener::bind(dbus::proxy_bus_path(dir, socket)).unwrap();
+        adopt_proxy_bus(dir, socket, dbus::SESSION_NODE)
+            .expect("a socket after a refused directory");
         drop(listener);
     }
 

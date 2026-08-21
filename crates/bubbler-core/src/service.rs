@@ -56,6 +56,7 @@ pub fn apply_all(
             Service::Pulseaudio => pulseaudio(env, args, host)?,
             Service::EtcShare { name } => etc_share(args, host, name)?,
             Service::Dbus { .. } => dbus_socket(env, args, ctx),
+            Service::SystemBus { .. } => system_bus_socket(args, ctx),
             Service::Portals => portals(args, ctx)?,
             // Bound below, once every share has been resolved: two
             // overlapping shares must be refused before either is emitted.
@@ -351,10 +352,27 @@ fn pulseaudio(env: &Env, args: &mut BwrapArgs, host: &dyn Host) -> Result<(), La
 /// argv with no proxy running at all.
 fn dbus_socket(env: &Env, args: &mut BwrapArgs, ctx: &ServiceCtx) {
     let inside = env.runtime_dir.join("bus");
-    args.ro_bind(&dbus::app_bus_path(&ctx.instance_runtime), &inside);
+    args.ro_bind(
+        &dbus::app_bus_path(&ctx.instance_runtime, dbus::SESSION_SOCKET),
+        &inside,
+    );
     let mut address = OsString::from("unix:path=");
     address.push(inside.as_os_str());
     args.setenv(OsStr::new("DBUS_SESSION_BUS_ADDRESS"), &address);
+}
+
+/// Bind the socket the same proxy serves for the system bus at the path
+/// every client library compiles in, so no environment variable points at
+/// it. `/run` is a tmpfs this builder creates and the bind comes after it.
+///
+/// The source is not probed here for the same reason [`dbus_socket`]'s is
+/// not: it exists only once the launcher has moved the proxy's socket out
+/// of the proxy's reach.
+fn system_bus_socket(args: &mut BwrapArgs, ctx: &ServiceCtx) {
+    args.ro_bind(
+        &dbus::app_bus_path(&ctx.instance_runtime, dbus::SYSTEM_SOCKET),
+        Path::new(dbus::SYSTEM_BUS_PATH),
+    );
 }
 
 /// Bind the `/.flatpak-info` portals identify the sandbox by. The bytes
@@ -362,10 +380,13 @@ fn dbus_socket(env: &Env, args: &mut BwrapArgs, ctx: &ServiceCtx) {
 /// Without a plan there is no proxy and no bus, so the grant is refused
 /// rather than quietly dropped; the parser rejects that config already.
 fn portals(args: &mut BwrapArgs, ctx: &ServiceCtx) -> Result<(), LaunchError> {
-    let plan = ctx.dbus.ok_or(LaunchError::BadValue {
-        service: "portals",
-        reason: "requires dbus".to_owned(),
-    })?;
+    let plan = ctx
+        .dbus
+        .filter(|p| p.session.is_some())
+        .ok_or(LaunchError::BadValue {
+            service: "portals",
+            reason: "requires dbus".to_owned(),
+        })?;
     args.ro_bind_data(
         plan.flatpak_info.clone(),
         Path::new(dbus::FLATPAK_INFO),
@@ -690,6 +711,7 @@ mod tests {
             passthrough: vec![],
             init_override: None,
             dbus_address: None,
+            dbus_system_address: None,
             dbus_log: false,
             seccomp_log: false,
             test_allow_path: None,
@@ -1829,6 +1851,64 @@ mod tests {
                 .filter(|s| *s == "/run/user/1000/bubbler/t/bus")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn the_system_bus_is_bound_where_every_client_library_looks() {
+        let a = argv(
+            &[Service::SystemBus {
+                rules: vec![crate::config::BusRule::Talk(
+                    "org.freedesktop.UPower".into(),
+                )],
+            }],
+            &env(),
+            &[],
+        )
+        .unwrap();
+        // The instance directory, not the proxy's `dbus/` subdirectory:
+        // the launcher moves the socket there once it has proved it is one.
+        assert!(
+            has_seq(
+                &a,
+                &[
+                    "--ro-bind",
+                    "/run/user/1000/bubbler/t/system",
+                    "/run/dbus/system_bus_socket"
+                ]
+            ),
+            "{a:?}"
+        );
+        assert!(
+            !a.iter()
+                .any(|s| s == "/run/user/1000/bubbler/t/dbus/system"),
+            "the sandbox binds a path the proxy can still write to: {a:?}"
+        );
+        // No environment variable: libdbus and libsystemd compile that
+        // path in, and a variable a profile could see would name the
+        // unfiltered host bus just as well.
+        assert!(!a.iter().any(|s| s == "DBUS_SYSTEM_BUS_ADDRESS"), "{a:?}");
+        // Nothing of the session bus comes with it.
+        assert!(
+            !a.iter().any(|s| s == "/run/user/1000/bubbler/t/bus"),
+            "{a:?}"
+        );
+        assert!(!a.iter().any(|s| s == "DBUS_SESSION_BUS_ADDRESS"), "{a:?}");
+        // The bind comes after the `--tmpfs /run` that would hide it.
+        let tmpfs = a
+            .windows(2)
+            .position(|w| w == ["--tmpfs", "/run"])
+            .expect("the baseline puts a tmpfs over /run");
+        let bind = a
+            .iter()
+            .position(|s| s == "/run/dbus/system_bus_socket")
+            .expect("checked above");
+        assert!(tmpfs < bind, "{a:?}");
+        // Without the node nothing is bound there at all.
+        let bare = argv(&[Service::Dbus { rules: vec![] }], &env(), &[]).unwrap();
+        assert!(
+            !bare.iter().any(|s| s == "/run/dbus/system_bus_socket"),
+            "{bare:?}"
         );
     }
 
