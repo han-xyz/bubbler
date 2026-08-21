@@ -50,12 +50,33 @@ const FILES: &[(&str, &str)] = &[
         "The instance's private home, bound over /home/bubbler inside the sandbox.",
     ),
     (
+        "$XDG_DATA_HOME/bubbler/instances/<name>/last-run.log",
+        "What the last run with no terminal wrote to stderr: bubbler's warnings, its \
+         sidecars' and the application's. Mode 0600, never over a mebibyte, and printed by \
+         `bubbler log`.",
+    ),
+    (
+        "$XDG_DATA_HOME/applications/",
+        "Where `bubbler desktop` writes launcher entries, as bubbler-<name>.desktop or, with \
+         --replace, under the application's own file name.",
+    ),
+    (
         "$XDG_DATA_HOME/bubbler/try/<pid>/",
         "A throwaway sandbox. Removed when the command exits, and swept by pid on the next try.",
     ),
     (
         "$XDG_CONFIG_HOME/bubbler/profiles/<name>.kdl",
         "Your profile layer, which overrides the two below it.",
+    ),
+    (
+        "$XDG_CONFIG_HOME/bubbler/wraps.kdl",
+        "The shim registry `wrap` writes: which instance each name in the shim directory \
+         opens.",
+    ),
+    (
+        "~/.local/bin/<name>",
+        "A shim: a symlink to the bubbler binary that opens the instance the registry maps \
+         that name to.",
     ),
     (
         "/usr/share/bubbler/profiles/<name>.kdl",
@@ -87,7 +108,13 @@ const ENVIRONMENT: &[(&str, &str)] = &[
     ),
     (
         "XDG_DATA_HOME, XDG_CONFIG_HOME",
-        "Where instances and your profile layer live; the XDG defaults apply.",
+        "Where instances and your profile layer live; the XDG defaults apply. \
+         XDG_DATA_HOME also holds the applications directory `desktop` writes entries to.",
+    ),
+    (
+        "XDG_DATA_DIRS",
+        "Where `desktop` looks for the application's own entry, under XDG_DATA_HOME's copy \
+         of the same name; /usr/local/share:/usr/share when it is unset.",
     ),
     (
         "WAYLAND_DISPLAY, DISPLAY, XAUTHORITY",
@@ -195,6 +222,11 @@ const CHECK_LINES: &[(&str, &str)] = &[
     (
         "command-not-found",
         "The `command` node names a program that is not on this host's PATH.",
+    ),
+    (
+        "desktop-entry-missing",
+        "The `desktop` node names an entry no application directory on this host holds, so \
+         `bubbler desktop` has nothing to copy.",
     ),
     (
         "dbus-without-rules",

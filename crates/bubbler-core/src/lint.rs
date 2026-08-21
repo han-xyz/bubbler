@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use kdl::{KdlDocument, KdlNode};
 
 use crate::config;
+use crate::desktop;
 use crate::env::Env;
 use crate::error::LintError;
 use crate::host::Host;
@@ -76,6 +77,13 @@ const CAMERA_WITHOUT_PORTALS: Check = Check {
 };
 const COMMAND_NOT_FOUND: Check = Check {
     id: "command-not-found",
+    severity: Severity::Note,
+};
+// A hint is a file name, and a host that does not have the application
+// does not have its entry either, so this is a note like
+// `command-not-found` rather than a warning.
+const DESKTOP_ENTRY_MISSING: Check = Check {
+    id: "desktop-entry-missing",
     severity: Severity::Note,
 };
 const DBUS_WITHOUT_RULES: Check = Check {
@@ -178,6 +186,7 @@ pub const CHECKS: &[Check] = &[
     CAMERA_WITHOUT_PORTALS,
     COMMAND_NOT_FOUND,
     DBUS_WITHOUT_RULES,
+    DESKTOP_ENTRY_MISSING,
     DUP_NAME_POLICY,
     ENV_LOOKS_SECRET,
     HOME_SHARE_SENSITIVE,
@@ -1343,6 +1352,27 @@ fn across_layers(ctx: &Context, sources: &[Source], f: &mut Findings) {
              otherwise fix the `command` node",
         );
     }
+    if let Some((i, node, name)) =
+        last(sources, "desktop").and_then(|(i, n)| arg(n).map(|a| (i, n, a)))
+        && !entry_exists(ctx, name)
+    {
+        f.push(
+            i,
+            node,
+            &DESKTOP_ENTRY_MISSING,
+            format!("no `{name}` in this host's application directories"),
+            "`bubbler desktop` has nothing to copy until the application is \
+             installed; otherwise fix the `desktop` node",
+        );
+    }
+}
+
+/// Whether an application directory holds the entry a `desktop` node
+/// names. Probed rather than read: only its existence decides this.
+fn entry_exists(ctx: &Context, name: &str) -> bool {
+    desktop::Dirs::from_env(ctx.env)
+        .lookup()
+        .any(|dir| ctx.host.file_type(&dir.join(name)).is_some())
 }
 
 /// Whether a command starts a sandbox of its own, by basename.
@@ -1389,6 +1419,10 @@ mod tests {
             home: PathBuf::from("/home/han"),
             data_home: PathBuf::from("/home/han/.local/share"),
             config_home: PathBuf::from("/home/han/.config"),
+            data_dirs: crate::env::DEFAULT_DATA_DIRS
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
             runtime_dir: PathBuf::from("/run/user/1000"),
             uid: 1000,
             gid: 1000,
@@ -2053,6 +2087,32 @@ mod tests {
     }
 
     #[test]
+    fn a_desktop_hint_naming_no_entry_on_this_host_is_a_note() {
+        let (file, _, _) = fake::types();
+        let system = host().with("/usr/share/applications/org.example.App.desktop", file);
+        with(&system, |ctx| {
+            let report = lint(ctx, &["desktop \"org.example.Other.desktop\""]);
+            assert_eq!(ids(&report), ["desktop-entry-missing"]);
+            assert_eq!(report.findings[0].severity, Severity::Note);
+            assert_eq!(
+                ids(&lint(ctx, &["desktop \"org.example.App.desktop\""])),
+                [] as [&str; 0]
+            );
+        });
+        // The user's own applications directory counts too.
+        let mine = host().with(
+            "/home/han/.local/share/applications/org.example.Mine.desktop",
+            file,
+        );
+        with(&mine, |ctx| {
+            assert_eq!(
+                ids(&lint(ctx, &["desktop \"org.example.Mine.desktop\""])),
+                [] as [&str; 0]
+            );
+        });
+    }
+
+    #[test]
     fn a_command_this_host_does_not_have_is_a_note() {
         with(&host(), |ctx| {
             let report = lint(ctx, &["command \"keepassxc\""]);
@@ -2218,6 +2278,9 @@ mod tests {
             if let Some(argv) = &cfg.command {
                 let argv0 = argv[0].to_str().expect("built-in commands hold UTF-8");
                 add(&Path::new("/usr/bin").join(argv0), file);
+            }
+            if let Some(entry) = &cfg.desktop {
+                add(&Path::new("/usr/share/applications").join(entry), file);
             }
             let ctx = Context {
                 env: &e,

@@ -9,6 +9,10 @@ use std::path::PathBuf;
 /// names its owner `bubbler`, so the host user name stays hidden too.
 pub const SANDBOX_HOME: &str = "/home/bubbler";
 
+/// Where a desktop entry is looked up when `$XDG_DATA_DIRS` is unset,
+/// as the XDG base directory specification names them.
+pub const DEFAULT_DATA_DIRS: &[&str] = &["/usr/local/share", "/usr/share"];
+
 /// Environment variables copied from the host into the sandbox when set:
 /// terminal and locale. `LC_*` is not listed here; [`is_passthrough`] is
 /// the whole policy. `TZ` may name a path, so this is not a value-only list.
@@ -32,6 +36,10 @@ pub struct Env {
     /// `$XDG_CONFIG_HOME` (or `$HOME/.config`); the user's profile layer
     /// lives in `bubbler/profiles/` under it.
     pub config_home: PathBuf,
+    /// `$XDG_DATA_DIRS` (or `/usr/local/share:/usr/share`), in precedence
+    /// order; where an application's own desktop entry is looked up,
+    /// under `$XDG_DATA_HOME`'s copy of the same name.
+    pub data_dirs: Vec<PathBuf>,
     /// `$XDG_RUNTIME_DIR`; required, sockets live here.
     pub runtime_dir: PathBuf,
     /// Real user id; unchanged inside the sandbox, so synthetic

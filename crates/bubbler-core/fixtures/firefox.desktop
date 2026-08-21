@@ -1,0 +1,37 @@
+# Excerpt of Arch firefox 153.0.4-1 /usr/share/applications/firefox.desktop:
+# the unlocalized keys of its [Desktop Entry] group except Comment,
+# GenericName, Keywords and X-GNOME-FullName; three of its 440 localized
+# names; and all three action groups, three locales each.
+[Desktop Entry]
+Version=1.0
+Type=Application
+Exec=/usr/lib/firefox/firefox %u
+Terminal=false
+X-MultipleArgs=false
+Icon=firefox
+StartupWMClass=firefox
+DBusActivatable=false
+Categories=GNOME;GTK;Network;WebBrowser;
+MimeType=application/json;application/pdf;application/rdf+xml;application/rss+xml;application/x-xpinstall;application/xhtml+xml;application/xml;audio/flac;audio/ogg;audio/webm;image/avif;image/gif;image/jpeg;image/png;image/svg+xml;image/webp;text/html;text/xml;video/ogg;video/webm;x-scheme-handler/chrome;x-scheme-handler/http;x-scheme-handler/https;x-scheme-handler/mailto;
+StartupNotify=true
+Actions=new-window;new-private-window;open-profile-manager;
+Name=Firefox
+Name[de]=Firefox
+Name[fr]=Firefox
+[Desktop Action new-window]
+Exec=/usr/lib/firefox/firefox --new-window %u
+Name=New Window
+Name[de]=Neues Fenster
+Name[fr]=Nouvelle fenêtre
+
+[Desktop Action new-private-window]
+Exec=/usr/lib/firefox/firefox --private-window %u
+Name=New Private Window
+Name[de]=Neues privates Fenster
+Name[fr]=Nouvelle fenêtre privée
+
+[Desktop Action open-profile-manager]
+Exec=/usr/lib/firefox/firefox --ProfileManager
+Name=Open Profile Manager
+Name[de]=Profilverwaltung öffnen
+Name[fr]=Ouvrir le gestionnaire de profils

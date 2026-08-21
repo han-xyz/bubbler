@@ -304,6 +304,10 @@ mod tests {
             home: "/home/han".into(),
             data_home: "/home/han/.local/share".into(),
             config_home: "/home/han/.config".into(),
+            data_dirs: crate::env::DEFAULT_DATA_DIRS
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
             runtime_dir: runtime_dir.to_path_buf(),
             uid: 1000,
             gid: 1000,

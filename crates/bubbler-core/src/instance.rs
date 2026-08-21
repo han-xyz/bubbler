@@ -678,6 +678,10 @@ mod tests {
             home: "/home/han".into(),
             data_home: data_home.to_path_buf(),
             config_home: data_home.join("config"),
+            data_dirs: crate::env::DEFAULT_DATA_DIRS
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
             runtime_dir: "/run/user/1000".into(),
             uid: 1000,
             gid: 1000,

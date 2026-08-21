@@ -5,4 +5,7 @@ dbus
 portals
 home-share "Documents" mode=rw
 env SAL_USE_VCLPLUGIN="gtk3"
+// The start centre, not one of the seven per-document entries that run
+// the same command with a `--writer`-style argument.
+desktop "libreoffice-startcenter.desktop"
 command "libreoffice"

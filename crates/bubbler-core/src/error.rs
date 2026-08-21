@@ -325,3 +325,91 @@ pub enum WrapError {
     #[error(transparent)]
     Instance(#[from] InstanceError),
 }
+
+/// Failures while generating, writing or removing a desktop entry.
+#[derive(Debug, Error)]
+pub enum DesktopError {
+    /// The instance has neither a `command` to look an entry up by nor a
+    /// `desktop` node naming one.
+    #[error(
+        "instance `{0}` has no `command` node, so there is no application to \
+         find an entry for; name one with `desktop \"<name>.desktop\"`"
+    )]
+    NoCommand(String),
+    /// The `desktop` node names an entry no application directory holds.
+    #[error("no `{name}` in {}", .dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", "))]
+    HintNotFound {
+        /// The file name the `desktop` node asked for.
+        name: String,
+        /// The directories that were searched, in lookup order.
+        dirs: Vec<PathBuf>,
+    },
+    /// Nothing in the application directories launches this command.
+    #[error(
+        "no desktop entry runs `{command}`; name one with `desktop \
+         \"<name>.desktop\"` in the instance's config.kdl"
+    )]
+    NotFound {
+        /// Basename of the command that was searched for.
+        command: String,
+    },
+    /// More than one entry launches this command, and guessing between
+    /// them would pick an application's helper entry as often as its own.
+    #[error(
+        "{n} desktop entries run `{command}`: {}; name one with `desktop \
+         \"<name>.desktop\"` in the instance's config.kdl",
+        .candidates.join(", "), n = .candidates.len()
+    )]
+    Ambiguous {
+        /// Basename of the command that was searched for.
+        command: String,
+        /// File names of the entries that matched, in lookup order.
+        candidates: Vec<String>,
+    },
+    /// The source file has no `[Desktop Entry]` group, so it is not a
+    /// desktop entry at all.
+    #[error("no `[Desktop Entry]` group")]
+    NoEntryGroup,
+    /// The source file's `[Desktop Entry]` group has no `Exec` key, so
+    /// there is no command line to wrap: a `Link` or `Directory` entry.
+    #[error("no `Exec` key in its `[Desktop Entry]` group")]
+    NoExec,
+    /// The source says it is to be treated as if it were not there, so a
+    /// copy of it would be an entry that does nothing.
+    #[error("it carries `Hidden=true`, which means the entry is not to be used at all")]
+    Hidden,
+    /// The source is itself a generated entry. Patching it again would
+    /// suffix the name twice and wrap the wrapper.
+    #[error("it is bubbler's own entry for instance `{0}`, not an application's")]
+    Generated(String),
+    /// A desktop entry is UTF-8 by specification; this file is not.
+    #[error("{0} is not UTF-8, so it is not a desktop entry")]
+    NotUtf8(PathBuf),
+    /// The path of the `bubbler` binary is not UTF-8, so it cannot go
+    /// into a file that is.
+    #[error("the path of this bubbler binary is not UTF-8, so no entry can name it")]
+    ProgramNotUtf8,
+    /// The target exists and carries no marker of bubbler's, so bubbler
+    /// did not write it and will not overwrite it.
+    #[error("{0} exists and is not bubbler's; move it aside first")]
+    Foreign(PathBuf),
+    /// The target is bubbler's entry for a different instance.
+    #[error("{path} is the entry of instance `{instance}`; remove that one first")]
+    OtherInstance {
+        /// The target path.
+        path: PathBuf,
+        /// The instance the file there belongs to.
+        instance: String,
+    },
+    /// `--remove` found no entry of this instance's.
+    #[error("no desktop entry of instance `{instance}` in {}", .dir.display())]
+    NotGenerated {
+        /// The instance whose entry was looked for.
+        instance: String,
+        /// The directory that was searched.
+        dir: PathBuf,
+    },
+    /// Filesystem failure at a specific path.
+    #[error("{0}")]
+    Io(PathBuf, #[source] io::Error),
+}

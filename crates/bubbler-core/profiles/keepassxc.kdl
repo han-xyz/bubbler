@@ -48,4 +48,5 @@ portals
 notify
 tray
 home-share "Documents" mode=rw
+desktop "org.keepassxc.KeePassXC.desktop"
 command "keepassxc"

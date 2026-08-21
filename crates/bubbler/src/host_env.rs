@@ -7,7 +7,7 @@ use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use bubbler_core::env::{Env, is_passthrough};
+use bubbler_core::env::{DEFAULT_DATA_DIRS, Env, is_passthrough};
 use rustix::fs::{Mode, OFlags};
 use rustix::io::fcntl_getfd;
 
@@ -69,6 +69,16 @@ pub fn from_process() -> Result<Env> {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".config"));
+    // Every entry is a directory of its own, so an empty one would be
+    // the current directory, which is not a data directory of anybody's.
+    let data_dirs: Vec<PathBuf> = env::var_os("XDG_DATA_DIRS")
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            env::split_paths(&v)
+                .filter(|d| !d.as_os_str().is_empty())
+                .collect()
+        })
+        .unwrap_or_else(|| DEFAULT_DATA_DIRS.iter().map(PathBuf::from).collect());
     let runtime_dir = PathBuf::from(
         env::var_os("XDG_RUNTIME_DIR")
             .filter(|v| !v.is_empty())
@@ -80,6 +90,7 @@ pub fn from_process() -> Result<Env> {
         home,
         data_home,
         config_home,
+        data_dirs,
         runtime_dir,
         uid: rustix::process::getuid().as_raw(),
         gid: rustix::process::getgid().as_raw(),
