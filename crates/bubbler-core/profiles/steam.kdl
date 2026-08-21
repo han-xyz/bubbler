@@ -36,6 +36,9 @@
 // The host side is multilib 32-bit GL and Vulkan drivers and an
 // en_US.UTF-8 locale; the locale reaches the sandbox through LANG and the
 // read-only /usr, with nothing to bind for it.
+lint-allow "x11-without-reason" reason="steamwebhelper is an X11/CEF client with no Wayland support"
+lint-allow "seccomp-disabled" reason="the client is a 32-bit i386 binary the one-architecture filter kills rather than filters"
+lint-allow "own-too-wide" reason="com.steampowered.* is Steam's own name space, and the client claims several names under it"
 wayland
 x11
 dri

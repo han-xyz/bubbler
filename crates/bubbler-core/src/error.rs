@@ -223,3 +223,18 @@ pub enum LaunchError {
     #[error(transparent)]
     Config(#[from] ConfigError),
 }
+
+/// Failures that stop a lint run before it has an answer, as opposed to
+/// the findings a run reports.
+#[derive(Debug, Error)]
+pub enum LintError {
+    /// The profile could not be resolved through its layers.
+    #[error(transparent)]
+    Profile(#[from] ProfileError),
+    /// A layer, or the config itself, is not something bubbler parses.
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    /// Filesystem failure at a specific path.
+    #[error("{0}")]
+    Io(PathBuf, #[source] io::Error),
+}

@@ -693,6 +693,18 @@ fn fixed_root(path: &Path, env: &Env) -> Option<PathBuf> {
         .find(|root| nested(path, root) && !(on_media && root.as_path() == Path::new("/run")))
 }
 
+/// Why `path-share "<written>"` would be refused for meeting a reserved
+/// root, if it would. The launcher raises the same sentence as an error
+/// when it builds the argv; the linter reports it against the node, on a
+/// source that need not exist yet.
+pub(crate) fn reserved_reason(host: &dyn Host, env: &Env, written: &Path) -> Option<String> {
+    let src = host
+        .canonicalize(written)
+        .unwrap_or_else(|| written.to_path_buf());
+    let (root, end) = denied_root(host, env, &src, written)?;
+    Some(denied_reason(written, &src, &root, end))
+}
+
 /// Why a share was refused, naming the end that met the root.
 fn denied_reason(written: &Path, src: &Path, root: &Path, end: End) -> String {
     match end {
@@ -1342,6 +1354,9 @@ mod tests {
             }
             fn canonicalize(&self, _: &Path) -> Option<PathBuf> {
                 None
+            }
+            fn is_mountpoint(&self, p: &Path) -> Option<bool> {
+                self.0.is_mountpoint(p)
             }
         }
         let e = env();

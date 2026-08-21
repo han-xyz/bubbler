@@ -13,8 +13,10 @@ use anyhow::{Context, Result, bail};
 use bubbler_core::config::Service;
 use bubbler_core::error::{ConfigError, LaunchError};
 use bubbler_core::exec;
+use bubbler_core::host::RealHost;
 use bubbler_core::instance::{self, Instance};
 use bubbler_core::launcher;
+use bubbler_core::lint;
 use bubbler_core::profile;
 use bubbler_core::tty::{self, TtyMode};
 use clap::{Parser, Subcommand};
@@ -115,7 +117,7 @@ enum Cmd {
         /// Instance name.
         name: String,
     },
-    /// Show or edit one profile.
+    /// Show, edit or lint one profile.
     Profile {
         #[command(subcommand)]
         cmd: ProfileCmd,
@@ -125,6 +127,25 @@ enum Cmd {
         /// Instance name.
         name: String,
     },
+    /// Check an instance's config.kdl for grants wider than it likely means.
+    Lint {
+        /// Instance name.
+        name: String,
+        #[command(flatten)]
+        opts: LintOpts,
+    },
+}
+
+/// How a lint run reports and what it makes of a warning. Shared by
+/// `bubbler lint` and `bubbler profile lint`.
+#[derive(clap::Args)]
+struct LintOpts {
+    /// Print findings as JSON, one object per finding plus a summary.
+    #[arg(long, value_name = "FORMAT", value_parser = ["json"])]
+    format: Option<String>,
+    /// Exit 2 rather than 1 when the run found only warnings.
+    #[arg(long, value_name = "WHAT", value_parser = ["warnings"])]
+    deny: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -140,6 +161,18 @@ enum ProfileCmd {
     Edit {
         /// Profile name.
         name: String,
+    },
+    /// Check a profile, flattened through its layers, for grants wider
+    /// than it likely means.
+    Lint {
+        /// Profile name; leave it out with `--all`.
+        #[arg(required_unless_present = "all")]
+        name: Option<String>,
+        /// Lint every profile name any layer holds.
+        #[arg(long, conflicts_with = "name")]
+        all: bool,
+        #[command(flatten)]
+        opts: LintOpts,
     },
 }
 
@@ -217,6 +250,43 @@ where
     }
 }
 
+/// Print a report and return the exit code it earns. The text form goes
+/// out byte for byte, since a profile path need not be UTF-8.
+fn report(report: &lint::Report, opts: &LintOpts) -> Result<i32> {
+    let code = lint::exit_code(report, opts.deny.as_deref() == Some("warnings"));
+    if opts.format.as_deref() == Some("json") {
+        // Through the same writer as everything else, so a reader that
+        // leaves early (`| head`) is a normal end here too.
+        let json = lint::render_json(report);
+        let lines: Vec<&OsStr> = json.lines().map(OsStr::new).collect();
+        print_lines(&lines, "the lint report")?;
+        return Ok(code);
+    }
+    let lines = lint::render_text(report);
+    let lines: Vec<&OsStr> = lines.iter().map(OsString::as_os_str).collect();
+    print_lines(&lines, "the lint report")?;
+    Ok(code)
+}
+
+/// The errors and warnings of a lint run on stderr, prefixed so they are
+/// plainly bubbler's and plainly not the command's own output. Notes are
+/// left out, the exit code is untouched, and a run that could not be made
+/// at all says nothing: this rides along with another command, and must
+/// never be what fails it.
+fn warn_lint(result: Result<lint::Report, bubbler_core::error::LintError>) {
+    let Ok(report) = result else {
+        return;
+    };
+    for finding in &report.findings {
+        if finding.severity == lint::Severity::Note {
+            continue;
+        }
+        for line in lint::render_finding(finding) {
+            eprintln!("bubbler: lint: {}", line.to_string_lossy());
+        }
+    }
+}
+
 fn real_main() -> Result<i32> {
     // Before anything else opens a descriptor.
     host_env::fill_closed_stdio()?;
@@ -226,6 +296,13 @@ fn real_main() -> Result<i32> {
         Cmd::Create { name, profile } => {
             let inst = Instance::create(&env, &name, &profile)
                 .with_context(|| format!("creating instance `{name}`"))?;
+            let path = host_env::search_path();
+            let ctx = lint::Context {
+                env: &env,
+                host: &RealHost,
+                search_path: &path,
+            };
+            warn_lint(lint::lint_config(&ctx, &inst.config_path()));
             print_lines(&[inst.dir.as_os_str()], "the instance directory")
         }
         Cmd::Run {
@@ -366,7 +443,19 @@ fn real_main() -> Result<i32> {
             if let Some(code) = run_editor(&program, &args, &path)? {
                 return Ok(code);
             }
-            Ok(recheck(&path, Instance::open(&env, &name)))
+            let code = recheck(&path, Instance::open(&env, &name));
+            // A config edited by hand is the likeliest place for an `x11`
+            // or a share of `.ssh`, so it is linted like a profile is.
+            if code == 0 {
+                let search = host_env::search_path();
+                let ctx = lint::Context {
+                    env: &env,
+                    host: &RealHost,
+                    search_path: &search,
+                };
+                warn_lint(lint::lint_config(&ctx, &path));
+            }
+            Ok(code)
         }
         Cmd::Profile { cmd } => match cmd {
             ProfileCmd::Show { name } => {
@@ -389,14 +478,83 @@ fn real_main() -> Result<i32> {
                 if let Some(code) = run_editor(&program, &args, &path)? {
                     return Ok(code);
                 }
-                Ok(recheck(&path, profiles.resolve(&name)))
+                let code = recheck(&path, profiles.resolve(&name));
+                if code == 0 {
+                    let search = host_env::search_path();
+                    let ctx = lint::Context {
+                        env: &env,
+                        host: &RealHost,
+                        search_path: &search,
+                    };
+                    warn_lint(lint::lint_profile(&ctx, &profiles, &name));
+                }
+                Ok(code)
+            }
+            ProfileCmd::Lint { name, all, opts } => {
+                let profiles = profile::Resolver::new(&env);
+                let search = host_env::search_path();
+                let ctx = lint::Context {
+                    env: &env,
+                    host: &RealHost,
+                    search_path: &search,
+                };
+                let found = match (name.as_deref(), all) {
+                    (Some(name), false) => lint::lint_profile(&ctx, &profiles, name),
+                    // `--all` is the CI entry point, so one profile that
+                    // cannot be read stops the whole run rather than
+                    // being counted as clean.
+                    (None, true) => lint::lint_all(&ctx, &profiles),
+                    // clap refuses a name together with `--all` and
+                    // refuses neither, so this is out of reach from the
+                    // command line.
+                    _ => bail!("`profile lint` takes a profile name or `--all`, not both"),
+                };
+                let found = match found {
+                    Ok(found) => found,
+                    Err(e) => {
+                        let what = name.as_deref().unwrap_or("every profile");
+                        let e = anyhow::Error::new(e).context(format!("linting {what}"));
+                        eprintln!("bubbler: {e:#}");
+                        return Ok(3);
+                    }
+                };
+                report(&found, &opts)
             }
         },
         Cmd::Reseed { name } => {
             let inst = Instance::reseed(&env, &name)
                 .with_context(|| format!("reseeding instance `{name}`"))?;
-            let path = inst.config_path();
-            print_lines(&[path.as_os_str()], "the config path")
+            let config = inst.config_path();
+            let path = host_env::search_path();
+            let ctx = lint::Context {
+                env: &env,
+                host: &RealHost,
+                search_path: &path,
+            };
+            warn_lint(lint::lint_config(&ctx, &config));
+            print_lines(&[config.as_os_str()], "the config path")
+        }
+        Cmd::Lint { name, opts } => {
+            let path = host_env::search_path();
+            let ctx = lint::Context {
+                env: &env,
+                host: &RealHost,
+                search_path: &path,
+            };
+            // Every way the run itself can fail is exit 3: "this file is
+            // not one bubbler reads" is a different answer from "this
+            // config grants too much", and CI has to tell them apart.
+            let found = instance::config_path_checked(&env, &name)
+                .map_err(anyhow::Error::new)
+                .and_then(|config| Ok(lint::lint_config(&ctx, &config)?));
+            match found {
+                Ok(found) => report(&found, &opts),
+                Err(e) => {
+                    let e = e.context(format!("linting instance `{name}`"));
+                    eprintln!("bubbler: {e:#}");
+                    Ok(3)
+                }
+            }
         }
     }
 }

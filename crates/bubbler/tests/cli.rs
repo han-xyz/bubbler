@@ -3598,3 +3598,187 @@ fn real_bwrap_seccomp_covers_the_dbus_proxy_sandbox() {
         "a bwrap of instance `seccp` outlived the run"
     );
 }
+
+/// Exit code of a bubbler run, with its stdout and stderr as text.
+fn run(tmp: &Path, args: &[&str]) -> (i32, String, String) {
+    let out = bubbler(tmp).args(args).output().unwrap();
+    (
+        out.status
+            .code()
+            .expect("bubbler exits rather than signals"),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn profile_lint_warns_with_a_line_and_a_lint_allow_node_accepts_it() {
+    let tmp = setup();
+    let path = write_profile(tmp.path(), "user", "risky", "x11\ncommand \"sh\"\n");
+    let (code, out, _) = run(tmp.path(), &["profile", "lint", "risky"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        out.contains(&format!(
+            "{}:1:1: warning[x11-without-reason]",
+            path.display()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains("1 layer linted, 0 errors, 1 warning, 0 notes"),
+        "{out}"
+    );
+    // The same warning is an error for a CI job that asks for it.
+    let (code, _, _) = run(
+        tmp.path(),
+        &["profile", "lint", "risky", "--deny", "warnings"],
+    );
+    assert_eq!(code, 2);
+    write_profile(
+        tmp.path(),
+        "user",
+        "risky",
+        "x11\nlint-allow \"x11-without-reason\" reason=\"measured: no Wayland backend\"\n\
+         command \"sh\"\n",
+    );
+    let (code, out, _) = run(
+        tmp.path(),
+        &["profile", "lint", "risky", "--deny", "warnings"],
+    );
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out, "1 layer linted, 0 errors, 0 warnings, 0 notes\n");
+}
+
+#[test]
+fn profile_lint_all_reads_every_layer_once_and_json_carries_the_counts() {
+    let tmp = setup();
+    make_builtin_share_sources(tmp.path());
+    let (code, out, err) = run(
+        tmp.path(),
+        &["profile", "lint", "--all", "--format", "json"],
+    );
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(out.contains("\"errors\": 0, \"warnings\": 0"), "{out}");
+    assert!(
+        out.contains(&format!("\"layers\": {}", NAMES.len())),
+        "{out}"
+    );
+    // Two profiles over one base read that base twice; it is one layer,
+    // and its `x11` is one finding.
+    write_profile(tmp.path(), "user", "base", "x11\ncommand \"sh\"\n");
+    write_profile(tmp.path(), "user", "a", "include \"base\"\n");
+    write_profile(tmp.path(), "user", "b", "include \"base\"\n");
+    let (code, out, err) = run(tmp.path(), &["profile", "lint", "--all"]);
+    assert_eq!(code, 1, "{out}{err}");
+    assert_eq!(
+        out.matches("warning[x11-without-reason]").count(),
+        1,
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "{} layers linted, 0 errors, 1 warning",
+            NAMES.len() + 3
+        )),
+        "{out}"
+    );
+    // A name no layer holds is a run that could not be made, not a
+    // profile that lints clean.
+    let (code, _, err) = run(tmp.path(), &["profile", "lint", "nosuch"]);
+    assert_eq!(code, 3);
+    assert!(err.contains("unknown profile `nosuch`"), "{err}");
+}
+
+/// Every `home-share` source the built-in profiles name, created under
+/// the test's home. A missing source is an error, so a host without them
+/// is not what a built-in profile lint measures. Read from the profiles
+/// themselves, so one added later needs no edit here.
+fn make_builtin_share_sources(root: &Path) {
+    for name in NAMES {
+        let text = bubbler_core::profile::lookup(name).expect("NAMES lists built-ins");
+        let cfg = bubbler_core::config::parse_profile(text).unwrap().config;
+        for s in &cfg.services {
+            if let bubbler_core::config::Service::HomeShare { path, .. } = s {
+                std::fs::create_dir_all(root.join("home").join(path)).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn a_finding_never_stands_in_for_a_layer_that_does_not_parse() {
+    let tmp = setup();
+    // The share error is real and says nothing about `bluetooth`, so the
+    // run reports the parse failure rather than a verdict built on half
+    // the profile.
+    write_profile(tmp.path(), "user", "base", "home-share \"NoSuchDir\"\n");
+    write_profile(tmp.path(), "user", "app", "include \"base\"\nbluetooth\n");
+    let (code, out, err) = run(tmp.path(), &["profile", "lint", "app"]);
+    assert_eq!(code, 3, "{out}{err}");
+    assert!(err.contains("unknown node `bluetooth`"), "{err}");
+}
+
+#[test]
+fn editing_an_instance_config_lints_it_afterwards() {
+    let tmp = setup();
+    run(tmp.path(), &["create", "t"]);
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "x11\nhome-share \".ssh\"\n").unwrap();
+    std::fs::create_dir_all(tmp.path().join("home/.ssh")).unwrap();
+    let out = bubbler(tmp.path())
+        .env("EDITOR", "/usr/bin/true")
+        .args(["edit", "t"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(
+        err.contains("bubbler: lint: ") && err.contains("x11-without-reason"),
+        "{err}"
+    );
+    assert!(err.contains("home-share-sensitive"), "{err}");
+}
+
+#[test]
+fn create_and_reseed_print_the_findings_without_failing() {
+    let tmp = setup();
+    write_profile(tmp.path(), "user", "generic", "x11\ncommand \"sh\"\n");
+    let (code, out, err) = run(tmp.path(), &["create", "t"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.trim().ends_with("instances/t"), "{out}");
+    assert!(
+        err.contains("bubbler: lint: ") && err.contains("warning[x11-without-reason]"),
+        "{err}"
+    );
+    assert!(err.contains("bubbler: lint:   help: "), "{err}");
+    let (code, _, err) = run(tmp.path(), &["reseed", "t"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("warning[x11-without-reason]"), "{err}");
+}
+
+#[test]
+fn lint_on_an_instance_reads_its_own_config() {
+    let tmp = setup();
+    run(tmp.path(), &["create", "t"]);
+    let (code, out, err) = run(tmp.path(), &["lint", "t"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "x11\n").unwrap();
+    let (code, out, _) = run(tmp.path(), &["lint", "t"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        out.contains(&format!(
+            "{}:1:1: warning[x11-without-reason]",
+            cfg.display()
+        )),
+        "{out}"
+    );
+    // A config bubbler cannot read at all, and an instance that is not
+    // there, are both "the lint could not run" rather than a verdict.
+    std::fs::write(&cfg, "bluetooth\n").unwrap();
+    let (code, _, err) = run(tmp.path(), &["lint", "t"]);
+    assert_eq!(code, 3, "{err}");
+    assert!(err.contains("unknown node `bluetooth`"), "{err}");
+    let (code, _, _) = run(tmp.path(), &["lint", "nosuch"]);
+    assert_eq!(code, 3);
+}

@@ -9,7 +9,11 @@ use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::config::{self, BusRule, InstanceConfig, RawProfile, Service, ShareMode, Userns};
+use kdl::KdlDocument;
+
+use crate::config::{
+    self, BusRule, ConfigError, InstanceConfig, LintAllow, RawProfile, Service, ShareMode, Userns,
+};
 use crate::env::Env;
 use crate::error::ProfileError;
 use crate::instance::is_plain_name;
@@ -94,6 +98,8 @@ impl fmt::Display for Origin {
 /// One layer holding a profile of a given name, with its text unparsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layer {
+    /// Profile name this layer holds.
+    pub name: String,
     /// Which layer this is.
     pub origin: Origin,
     /// File the text was read from; `None` for a built-in.
@@ -104,10 +110,10 @@ pub struct Layer {
 
 impl Layer {
     /// How this layer is named in an error message.
-    fn label(&self, name: &str) -> String {
+    fn label(&self) -> String {
         match &self.path {
             Some(p) => p.display().to_string(),
-            None => format!("built-in profile `{name}`"),
+            None => format!("built-in profile `{}`", self.name),
         }
     }
 }
@@ -243,6 +249,7 @@ impl Resolver {
             let path = dir.join(&file);
             match fs::read_to_string(&path) {
                 Ok(text) => out.push(Layer {
+                    name: name.to_owned(),
                     origin,
                     path: Some(path),
                     text,
@@ -253,6 +260,7 @@ impl Resolver {
         }
         if let Some(text) = lookup(name) {
             out.push(Layer {
+                name: name.to_owned(),
                 origin: Origin::BuiltIn,
                 path: None,
                 text: text.to_owned(),
@@ -291,24 +299,45 @@ impl Resolver {
     pub fn resolve(&self, name: &str) -> Result<Resolved, ProfileError> {
         let mut acc = Merged::default();
         let mut chain = Vec::new();
-        self.expand(name, 0, &mut acc, &mut chain)?;
+        let mut done = Vec::new();
+        self.expand(name, 0, &mut Visit::Merge(&mut acc), &mut chain, &mut done)?;
         acc.finish(name)
     }
 
-    /// Merge the `skip`th layer of `name`, its `include`s first.
+    /// Every layer [`Resolver::resolve`] would merge, in merge order.
+    /// A layer whose nodes the parser rejects is still returned: the
+    /// linter has more to say about such a file than "it does not parse",
+    /// and the layers under it are reached through its `include` nodes.
+    pub fn layers(&self, name: &str) -> Result<Vec<Layer>, ProfileError> {
+        let mut out = Vec::new();
+        let mut chain = Vec::new();
+        let mut done = Vec::new();
+        self.expand(
+            name,
+            0,
+            &mut Visit::Collect(&mut out),
+            &mut chain,
+            &mut done,
+        )?;
+        Ok(out)
+    }
+
+    /// Visit the `skip`th layer of `name`, its `include`s first. `done`
+    /// carries the layers already visited across the whole traversal.
     fn expand(
         &self,
         name: &str,
         skip: usize,
-        acc: &mut Merged,
+        visit: &mut Visit<'_>,
         chain: &mut Vec<LayerId>,
+        done: &mut Vec<LayerId>,
     ) -> Result<(), ProfileError> {
         let layers = self.lookup(name)?;
         let below = layers.len().saturating_sub(skip + 1);
         let Some(layer) = layers.into_iter().nth(skip) else {
             return Err(ProfileError::NotFound(name.to_owned()));
         };
-        let label = layer.label(name);
+        let label = layer.label();
         let id = match &layer.path {
             Some(p) => LayerId::File(p.clone()),
             None => LayerId::BuiltIn(name.to_owned()),
@@ -316,27 +345,44 @@ impl Resolver {
         if chain.contains(&id) {
             return Err(ProfileError::Cycle(chain_labels(chain, &id)));
         }
-        // A layer two branches both include is merged once, at the first
+        // A layer two branches both include is visited once, at the first
         // place it is reached: merging it again would put its nodes over
         // the nearer layer that included it, and a diamond of includes
         // would cost a re-read per path through it.
-        if acc.done.contains(&id) {
+        if done.contains(&id) {
             return Ok(());
         }
         if chain.len() >= MAX_DEPTH {
             return Err(ProfileError::TooDeep(chain_labels(chain, &id)));
         }
-        let raw = config::parse_profile(&layer.text).map_err(|source| ProfileError::Parse {
-            origin: label.clone(),
-            source,
-        })?;
+        let collecting = matches!(visit, Visit::Collect(_));
+        let raw = match config::parse_profile(&layer.text) {
+            Ok(raw) => Some(raw),
+            Err(source) if !collecting => {
+                return Err(ProfileError::Parse {
+                    origin: label,
+                    source,
+                });
+            }
+            Err(_) => None,
+        };
+        let includes = match &raw {
+            Some(raw) => raw.includes.clone(),
+            // A layer the parser rejects still names the layers under it,
+            // and a caller that collects has to reach them before it can
+            // say what is wrong where.
+            None => includes_of(&layer.text).map_err(|source| ProfileError::Parse {
+                origin: label.clone(),
+                source,
+            })?,
+        };
         chain.push(id);
-        for inc in &raw.includes {
+        for inc in &includes {
             // `include "<own name>"` names the layer below this one, which
             // is how a user profile extends the built-in of the same name
             // instead of forking it.
             if inc != name {
-                self.expand(inc, 0, acc, chain)?;
+                self.expand(inc, 0, visit, chain, done)?;
                 continue;
             }
             // Saying so beats `NotFound` on a name the file itself has:
@@ -345,19 +391,53 @@ impl Resolver {
             if below == 0 {
                 return Err(ProfileError::SelfIncludeAtBottom(label));
             }
-            self.expand(inc, skip + 1, acc, chain)?;
+            self.expand(inc, skip + 1, visit, chain, done)?;
         }
-        let src = Src {
-            origin: layer.origin,
-            path: layer.path.clone(),
-            label,
-        };
-        acc.merge(&raw, &src)?;
+        match visit {
+            Visit::Merge(acc) => {
+                let src = Src {
+                    origin: layer.origin,
+                    path: layer.path.clone(),
+                    label,
+                };
+                // `None` only where the arm above returned already.
+                if let Some(raw) = &raw {
+                    acc.merge(raw, &src)?;
+                }
+            }
+            Visit::Collect(out) => out.push(layer),
+        }
         if let Some(id) = chain.pop() {
-            acc.done.push(id);
+            done.push(id);
         }
         Ok(())
     }
+}
+
+/// What a traversal does with each layer it reaches.
+enum Visit<'a> {
+    /// Merge it into the flattened configuration.
+    Merge(&'a mut Merged),
+    /// Keep it as it was read, for a caller that reads it itself.
+    Collect(&'a mut Vec<Layer>),
+}
+
+/// The `include` names of a layer whose nodes the parser rejected, read
+/// straight from its KDL. Only the shape `parse_profile` accepts is
+/// followed, so a malformed `include` node names no layer at all rather
+/// than the wrong one.
+fn includes_of(text: &str) -> Result<Vec<String>, ConfigError> {
+    let doc = KdlDocument::parse(text)?;
+    Ok(doc
+        .nodes()
+        .iter()
+        .filter(|n| n.name().value() == "include" && n.children().is_none())
+        .filter_map(|n| match n.entries() {
+            [e] if e.name().is_none() => e.value().as_string(),
+            _ => None,
+        })
+        .map(str::to_owned)
+        .collect())
 }
 
 /// Profile names in `dir`: every readable `<name>.kdl` whose name is a
@@ -455,14 +535,22 @@ struct Merged {
     seccomp: SeccompConfig,
     seccomp_src: Option<Src>,
     command: Option<(Vec<OsString>, Src)>,
-    /// Layers already merged, so a shared one is read and merged once.
-    done: Vec<LayerId>,
+    lint_allows: Vec<(LintAllow, Src)>,
 }
 
 impl Merged {
     fn merge(&mut self, raw: &RawProfile, src: &Src) -> Result<(), ProfileError> {
         for svc in &raw.config.services {
             self.add_service(svc, src)?;
+        }
+        // Union by id, the later layer's reason winning, so a profile
+        // that includes another can restate why it accepts a finding
+        // without the included layer's wording overriding it.
+        for allow in &raw.config.lint_allows {
+            match self.lint_allows.iter_mut().find(|(a, _)| a.id == allow.id) {
+                Some(slot) => *slot = (allow.clone(), src.clone()),
+                None => self.lint_allows.push((allow.clone(), src.clone())),
+            }
         }
         for (key, value) in &raw.config.env {
             match self.env.iter_mut().find(|(k, _, _)| k == key) {
@@ -632,6 +720,9 @@ impl Merged {
         // Same order as `kdl_out::nodes`, so the nodes and their origins
         // stay in step; a unit test holds the two together.
         let mut origins = Vec::new();
+        for (allow, src) in &self.lint_allows {
+            origins.push((kdl_out::lint_allow(allow), src));
+        }
         for (svc, src) in &self.services {
             origins.push((kdl_out::service(svc).map_err(bad)?, src));
         }
@@ -1630,6 +1721,74 @@ mod tests {
         let r = resolver(tmp.path(), &[("mine", "network\n")], &[]);
         let path = r.edit_path("mine").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "network\n");
+    }
+
+    #[test]
+    fn accepted_findings_are_unioned_by_id_with_the_nearer_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(
+            tmp.path(),
+            &[(
+                "app",
+                "include \"base\"\nlint-allow \"x11-without-reason\" reason=\"mine\"\n",
+            )],
+            &[(
+                "base",
+                "x11\nlint-allow \"x11-without-reason\" reason=\"theirs\"\n\
+                 lint-allow \"tty-passthrough\" reason=\"base\"\n",
+            )],
+        );
+        let resolved = r.resolve("app").unwrap();
+        assert_eq!(
+            resolved.config.lint_allows,
+            vec![
+                LintAllow {
+                    id: "x11-without-reason".to_owned(),
+                    reason: "mine".to_owned(),
+                },
+                LintAllow {
+                    id: "tty-passthrough".to_owned(),
+                    reason: "base".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn layers_are_the_files_resolve_would_merge_in_merge_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(
+            tmp.path(),
+            &[("app", "include \"base\"\nnetwork\n")],
+            &[("base", "wayland\n")],
+        );
+        let layers = r.layers("app").unwrap();
+        assert_eq!(
+            layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
+            ["base", "app"]
+        );
+        assert_eq!(layers[1].origin, Origin::User);
+    }
+
+    #[test]
+    fn a_layer_the_parser_rejects_is_still_collected_with_the_ones_under_it() {
+        // The linter has more to say about such a file than "it does not
+        // parse", and the layers it includes have to be reached anyway.
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(
+            tmp.path(),
+            &[(
+                "app",
+                "include \"base\"\nsystem-bus {\n    own \"org.example.App\"\n}\n",
+            )],
+            &[("base", "wayland\n")],
+        );
+        assert!(r.resolve("app").is_err());
+        let layers = r.layers("app").unwrap();
+        assert_eq!(
+            layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
+            ["base", "app"]
+        );
     }
 
     #[test]

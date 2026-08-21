@@ -137,3 +137,16 @@ pub fn editor() -> Option<OsString> {
         .filter(|v| !v.is_empty())
         .or_else(|| env::var_os("EDITOR").filter(|v| !v.is_empty()))
 }
+
+/// `$PATH` split into directories, which is where the linter's
+/// `command-not-found` check looks for a profile's command. An unset or
+/// empty `$PATH` searches nothing rather than the current directory.
+pub fn search_path() -> Vec<PathBuf> {
+    env::var_os("PATH")
+        .map(|p| {
+            env::split_paths(&p)
+                .filter(|d| !d.as_os_str().is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}

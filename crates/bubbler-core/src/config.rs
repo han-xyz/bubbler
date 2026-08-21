@@ -77,6 +77,18 @@ pub enum ShareMode {
     ReadWrite,
 }
 
+/// One accepted lint finding: the check it silences and why. Only
+/// warnings and notes can be silenced; an error names something the file
+/// cannot do, and there is nothing to accept about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LintAllow {
+    /// A check id from [`crate::lint::CHECKS`].
+    pub id: String,
+    /// Why this file accepts the finding. Required: the reason is the
+    /// whole value of writing the node down.
+    pub reason: String,
+}
+
 /// One rule for the filtering D-Bus proxy. `See`, `Talk` and `Own` are the
 /// three policy levels for a well-known name; `Call` and `Broadcast` pair a
 /// name with an `[METHOD][@PATH]` rule narrowing it to single methods,
@@ -219,6 +231,8 @@ pub struct InstanceConfig {
     /// Whether the sandbox may nest user namespaces; `allow` unless a
     /// `userns` node says otherwise.
     pub userns: Userns,
+    /// Lint findings this file has accepted, in file order.
+    pub lint_allows: Vec<LintAllow>,
 }
 
 /// One profile layer as written: the same nodes an instance config may
@@ -377,6 +391,13 @@ fn parse_doc(text: &str, profile: bool) -> Result<RawProfile, ConfigError> {
                 cfg.seccomp = parse_seccomp(node)?;
             }
             "env" => parse_env(node, &mut cfg.env)?,
+            "lint-allow" => {
+                let allow = parse_lint_allow(node)?;
+                if cfg.lint_allows.iter().any(|a| a.id == allow.id) {
+                    return Err(ConfigError::Duplicate(format!("{name} \"{}\"", allow.id)));
+                }
+                cfg.lint_allows.push(allow);
+            }
             "include" => {
                 if !profile {
                     return Err(bad(node, "include is only valid in profiles"));
@@ -746,6 +767,77 @@ fn forbidden_byte(s: &str) -> Option<&'static str> {
         b'\n' => Some("a newline"),
         b'\r' => Some("a carriage return"),
         _ => None,
+    })
+}
+
+/// `lint-allow "<check-id>" reason="<text>"`. The id is resolved against
+/// the check table, so a typo cannot leave a finding un-silenced and the
+/// file's author none the wiser; an id whose check reports an error is
+/// refused for the same reason, since nothing would ever silence it.
+fn parse_lint_allow(node: &KdlNode) -> Result<LintAllow, ConfigError> {
+    let mut id: Option<&str> = None;
+    let mut reason: Option<&str> = None;
+    for e in node.entries() {
+        match e.name().map(|n| n.value()) {
+            None => {
+                if id.is_some() {
+                    return Err(bad(node, "expects exactly one check id argument"));
+                }
+                id = Some(
+                    e.value()
+                        .as_string()
+                        .ok_or_else(|| bad(node, "check id must be a string"))?,
+                );
+            }
+            Some("reason") => {
+                reason = Some(
+                    e.value()
+                        .as_string()
+                        .ok_or_else(|| bad(node, "reason must be a string"))?,
+                );
+            }
+            Some(p) => {
+                return Err(ConfigError::UnknownProperty {
+                    node: node.name().value().to_owned(),
+                    prop: p.to_owned(),
+                });
+            }
+        }
+    }
+    if node.children().is_some() {
+        return Err(bad(node, "takes no children"));
+    }
+    let id = id.ok_or_else(|| bad(node, "expects exactly one check id argument"))?;
+    let Some(check) = crate::lint::check(id) else {
+        // The id is echoed back only after the table has recognised the
+        // shape of it: a plain kebab-case word carries no control bytes.
+        let shape = id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        return Err(match shape {
+            true => bad(node, &format!("`{id}` is not a lint check")),
+            false => bad(
+                node,
+                "expects a lint check id such as \"x11-without-reason\"",
+            ),
+        });
+    };
+    if check.severity == crate::lint::Severity::Error {
+        return Err(bad(
+            node,
+            &format!("`{id}` reports an error, and an error cannot be accepted away"),
+        ));
+    }
+    let reason = reason.ok_or_else(|| bad(node, "expects a reason=\"...\" property"))?;
+    if reason.trim().is_empty() {
+        return Err(bad(node, "reason must say why the finding is accepted"));
+    }
+    if let Some(what) = forbidden_byte(reason) {
+        return Err(bad(node, &format!("reason contains {what}")));
+    }
+    Ok(LintAllow {
+        id: id.to_owned(),
+        reason: reason.to_owned(),
     })
 }
 
@@ -2102,6 +2194,46 @@ command "b""#
         assert!(matches!(
             parse("notify"),
             Err(ConfigError::BadArgument { node, .. }) if node == "notify"
+        ));
+    }
+
+    #[test]
+    fn lint_allow_names_a_check_and_says_why() {
+        let cfg =
+            parse("lint-allow \"x11-without-reason\" reason=\"the client has no Wayland backend\"")
+                .unwrap();
+        assert_eq!(
+            cfg.lint_allows,
+            vec![LintAllow {
+                id: "x11-without-reason".to_owned(),
+                reason: "the client has no Wayland backend".to_owned(),
+            }]
+        );
+        assert!(parse("").unwrap().lint_allows.is_empty());
+    }
+
+    #[test]
+    fn lint_allow_refuses_what_it_could_never_silence() {
+        // A typo, a check that reports an error, and a node that names no
+        // check at all: each would be a suppression that suppresses
+        // nothing, and nothing would ever say so.
+        for text in [
+            "lint-allow \"x11-without-reasons\" reason=\"typo\"",
+            "lint-allow \"bundle-without-dbus\" reason=\"no\"",
+            "lint-allow reason=\"nothing to allow\"",
+            "lint-allow \"x11-without-reason\"",
+            "lint-allow \"x11-without-reason\" reason=\"  \"",
+            "lint-allow \"x11-without-reason\" \"seccomp-disabled\" reason=\"two\"",
+            "lint-allow \"x11-without-reason\" why=\"wrong property\"",
+            "lint-allow \"x11-without-reason\" reason=\"r\" { x; }",
+        ] {
+            assert!(parse(text).is_err(), "{text}");
+        }
+        assert!(matches!(
+            parse(
+                "lint-allow \"x11-without-reason\" reason=\"a\"\nlint-allow \"x11-without-reason\" reason=\"b\""
+            ),
+            Err(ConfigError::Duplicate(_))
         ));
     }
 

@@ -4,7 +4,7 @@
 
 use std::ffi::{OsStr, OsString};
 
-use crate::config::{BusRule, InstanceConfig, Service, ShareMode, Userns};
+use crate::config::{BusRule, InstanceConfig, LintAllow, Service, ShareMode, Userns};
 use crate::error::ConfigError;
 use crate::seccomp::{Errno, SeccompConfig};
 use crate::tty::TtyMode;
@@ -24,6 +24,10 @@ pub fn render(cfg: &InstanceConfig) -> Result<String, ConfigError> {
 /// where it came from. A block node is one multi-line string.
 pub fn nodes(cfg: &InstanceConfig) -> Result<Vec<String>, ConfigError> {
     let mut out = Vec::new();
+    // Ahead of the grants: a finding the file has accepted is about the
+    // file, and reading it first says what the nodes below were allowed
+    // to be.
+    out.extend(cfg.lint_allows.iter().map(lint_allow));
     for s in &cfg.services {
         out.push(service(s)?);
     }
@@ -144,6 +148,11 @@ fn bus_block(name: &str, rules: &[BusRule]) -> String {
     node
 }
 
+/// One `lint-allow "<id>" reason="<text>"` node.
+pub fn lint_allow(a: &LintAllow) -> String {
+    format!("lint-allow {} reason={}", quote(&a.id), quote(&a.reason))
+}
+
 /// One `env KEY="value"` node.
 pub fn env(key: &str, value: &str) -> String {
     format!("env {key}={}", quote(value))
@@ -261,6 +270,8 @@ mod tests {
         round_trip("");
         round_trip(
             r#"
+            lint-allow "x11-without-reason" reason="the client has no Wayland backend"
+            lint-allow "seccomp-disabled" reason="32-bit client"
             wayland
             x11
             network
@@ -408,6 +419,18 @@ mod tests {
                 "env B=\"2\"",
                 "env A=\"1\"",
                 "command \"x\""
+            ]
+        );
+    }
+
+    #[test]
+    fn an_accepted_finding_is_written_above_the_grant_it_is_about() {
+        let cfg = parse("x11\nlint-allow \"x11-without-reason\" reason=\"no Wayland\"").unwrap();
+        assert_eq!(
+            nodes(&cfg).unwrap(),
+            vec![
+                "lint-allow \"x11-without-reason\" reason=\"no Wayland\"",
+                "x11"
             ]
         );
     }
