@@ -1,6 +1,7 @@
 //! bubbler command line: create, run, edit, delete and list sandbox instances.
 
 mod host_env;
+mod manpage;
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
@@ -21,7 +22,7 @@ use bubbler_core::launcher;
 use bubbler_core::lint;
 use bubbler_core::profile;
 use bubbler_core::tty::{self, TtyMode};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
 /// `--tty` takes the names the config's `tty` node takes; clap already
 /// says which value was rejected, so only the reason is passed on.
@@ -61,6 +62,12 @@ struct Explaining {
 /// bubblewrap-based application sandbox.
 #[derive(Parser)]
 #[command(name = "bubbler", version, about)]
+#[command(long_about = "\
+bubbler runs an application inside a bubblewrap sandbox that starts with
+nothing and is widened one grant at a time. An instance is a named sandbox
+with its own private home and its own config.kdl; a profile seeds that config
+once and never edits it again. Every grant is a node in that file, and every
+node is documented in bubbler-config(5), which `bubbler man --config` prints.")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -69,6 +76,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Create a new instance from a profile (user, system or built-in layers).
+    #[command(long_about = "\
+Create a new instance: a directory holding a config.kdl seeded from the
+profile, flattened through the user, system and built-in layers, and an empty
+private home. The directory it made is printed. Editing the instance never
+edits the profile it came from, and `reseed` is the way back to it.")]
     Create {
         /// Instance name: letters, digits, `.`, `_`, `-`; not `.`, `..`
         /// or a name starting with `-`.
@@ -78,6 +90,13 @@ enum Cmd {
         profile: String,
     },
     /// Run a command inside an instance's sandbox.
+    #[command(long_about = "\
+Run the instance's `command`, or the command given after `--`, inside its
+sandbox. An instance that is already running is not started a second time: the
+command is executed inside the running sandbox instead, with the grants that
+sandbox was started with, and configuration changes apply on the next start.
+`--dry-run` prints the bwrap argv and launches nothing; `--explain` prints
+that same argv grouped under the config node each argument came from.")]
     Run {
         /// Instance name.
         name: String,
@@ -111,6 +130,13 @@ enum Cmd {
         command: Vec<OsString>,
     },
     /// Run a command in a throwaway sandbox, without creating an instance.
+    #[command(long_about = "\
+Run one command in a sandbox that is thrown away afterwards. Its config is the
+flattened profile plus one bare node per `--grant`, checked the way a config
+file is, so a bundle without the `dbus` that carries it is refused rather than
+quietly dropped. The sandbox lives under $XDG_DATA_HOME/bubbler/try/<pid>,
+never appears in `list`, and is removed when the command exits whatever its
+status; `--keep <name>` renames it into an instance instead.")]
     Try {
         /// Profile to seed the throwaway config from.
         #[arg(long, default_value = "generic")]
@@ -149,6 +175,13 @@ enum Cmd {
         command: Vec<OsString>,
     },
     /// Run a command inside an already running instance.
+    #[command(long_about = "\
+Run a command inside a sandbox that is already running, through the control
+socket of the `bubbler-init` supervisor in it. The command joins that sandbox
+as it was started, so what it may reach is what the sandbox was given, not
+what its config.kdl says now. Descriptors handed to an exec'd command are
+reachable by the sandboxed application through /proc, so exec is a convenience
+channel and not a boundary.")]
     Exec {
         /// Instance name.
         name: String,
@@ -161,8 +194,18 @@ enum Cmd {
         command: Vec<OsString>,
     },
     /// List instances.
+    #[command(long_about = "\
+Print the name of every instance, one per line, sorted by name. A directory
+without a config.kdl in it, or under a name bubbler would not have created, is
+passed over rather than listed. The throwaway sandboxes `try` makes never
+appear here.")]
     List,
     /// List profiles from every layer: user, system and built-in.
+    #[command(long_about = "\
+Print the name of every profile any layer holds — yours, the system's, and the
+built-in library — one per line, each name once however many layers carry it.
+`--origin` adds the layer a name resolves to and the file it is read from, tab
+separated, with `-` for a built-in, which has no file.")]
     Profiles {
         /// Also print the layer each name resolves to and the file it is
         /// read from, tab separated; `-` for a built-in.
@@ -170,6 +213,10 @@ enum Cmd {
         origin: bool,
     },
     /// Delete an instance and its private home. Irreversible.
+    #[command(long_about = "\
+Delete an instance: its config.kdl, its private home and any runtime directory
+left behind. This is irreversible, so it does nothing without `--yes`. An
+instance path that is a symlink is refused outright rather than followed.")]
     Delete {
         /// Instance name.
         name: String,
@@ -178,26 +225,71 @@ enum Cmd {
         yes: bool,
     },
     /// Open an instance's config.kdl in $VISUAL or $EDITOR, then re-check it.
+    #[command(long_about = "\
+Open the instance's config.kdl in $VISUAL, else $EDITOR, split into an argv
+with no shell in between, so quotes and $VAR in those variables are not
+expanded. A non-zero editor exit is propagated and the file is left alone.
+Afterwards the file is parsed again and any error printed; the file is kept
+either way, since only its author knows what it was meant to say. A config
+that parses is then linted, a hand-edited file being where a grant wider than
+it means tends to appear.")]
     Edit {
         /// Instance name.
         name: String,
     },
     /// Show, edit or lint one profile.
+    #[command(long_about = "\
+Show, edit or lint one profile. Profiles come in three layers — yours under
+$XDG_CONFIG_HOME/bubbler/profiles, the system's, and the library built into
+the binary — and compose with `include`, which resolves at the next layer
+down. A profile only ever seeds an instance: changing one never changes an
+instance already created from it.")]
     Profile {
         #[command(subcommand)]
         cmd: ProfileCmd,
     },
     /// Re-seed an instance's config.kdl from its profile, keeping `home/`.
+    #[command(long_about = "\
+Flatten the instance's profile again and write it over the instance's
+config.kdl, keeping the private home as it is. Edits made to that config are
+lost, which is the point: this is how an instance picks up a profile that has
+changed. The file it replaces is copied to config.kdl.bak first, and the fresh
+one is linted afterwards. An instance that is running is refused: bwrap cannot
+be told about a bind after the fact, so a rewritten config would describe
+grants that sandbox does not have.")]
     Reseed {
         /// Instance name.
         name: String,
     },
     /// Check an instance's config.kdl for grants wider than it likely means.
+    #[command(long_about = "\
+Measure an instance's config.kdl against what a sandbox is meant to give away.
+Nothing is launched and no file is edited. Findings name the file and line
+that has to change and carry an indented `help:` line with the fix. Exit 0
+clean (notes fail nothing), 1 warnings, 2 errors, 3 when the run could not be
+made at all — a file that does not parse is deliberately a different answer
+from a file that grants too much. The checks are listed in bubbler-config(5).")]
     Lint {
         /// Instance name.
         name: String,
         #[command(flatten)]
         opts: LintOpts,
+    },
+    /// Print bubbler's manual pages in roff.
+    #[command(long_about = "\
+Print bubbler's own manual page, bubbler(1), as roff on stdout: the synopsis
+and options of every subcommand, the files a run reads and writes, and the
+environment it honours, all rendered from the command tree this binary was
+built with. `--config` prints bubbler-config(5) instead — every config node
+with its grammar, what it grants and what granting it costs, and every lint
+check by id — generated from the same catalogue the rest of bubbler explains
+grants from. A packager writes `bubbler man > bubbler.1` and `bubbler man
+--config > bubbler-config.5` against the binary it is installing beside them.")]
+    Man {
+        /// Print `bubbler-config(5)`, the config.kdl page, instead of
+        /// `bubbler(1)`.
+        #[arg(long)]
+        config: bool,
     },
 }
 
@@ -217,18 +309,35 @@ struct LintOpts {
 enum ProfileCmd {
     /// Print the profile flattened through its layers, each node under
     /// the layer it came from.
+    #[command(long_about = "\
+Print the profile as bubbler reads it: flattened through its layers, with
+every node under the layer it came from, so an `include` and an override are
+visible as such rather than as one merged file.")]
     Show {
         /// Profile name.
         name: String,
     },
     /// Open your layer's copy in $VISUAL or $EDITOR, then re-resolve it.
     /// A name you do not have yet is written with a starting point first.
+    #[command(long_about = "\
+Open your layer's copy of the profile in $VISUAL, else $EDITOR, and resolve it
+again afterwards. A name your layer does not hold yet is written first with a
+starting point in it, so overriding a built-in profile means writing a profile
+of your own rather than changing one in place. A profile that parses is linted
+afterwards, as an instance config is after `edit`.")]
     Edit {
         /// Profile name.
         name: String,
     },
     /// Check a profile, flattened through its layers, for grants wider
     /// than it likely means.
+    #[command(long_about = "\
+Measure a profile, flattened through its layers, against what a sandbox is
+meant to give away. Spans come from the file rather than from the flattened
+result, so a finding names the layer that has to change even when the grant is
+three `include`s deep. `--all` lints every name any layer holds and is the CI
+entry point: one layer that cannot be read stops the run rather than counting
+as clean. The checks are listed in bubbler-config(5).")]
     Lint {
         /// Profile name; leave it out with `--all`.
         #[arg(required_unless_present = "all")]
@@ -727,6 +836,15 @@ fn real_main() -> Result<i32> {
             };
             warn_lint(lint::lint_config(&ctx, &config));
             print_lines(&[config.as_os_str()], "the config path")
+        }
+        Cmd::Man { config } => {
+            let version = format!("bubbler {}", env!("CARGO_PKG_VERSION"));
+            let lines = match config {
+                true => manpage::config_page(&version),
+                false => manpage::page(Cli::command(), &version),
+            };
+            let lines: Vec<&OsStr> = lines.iter().map(OsString::as_os_str).collect();
+            print_lines(&lines, "the man page")
         }
         Cmd::Lint { name, opts } => {
             let path = host_env::search_path();

@@ -14,8 +14,8 @@ use bubbler_core::profile::NAMES;
 use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
     PYTHON, bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, bwrap_alive, kill_group, real_init,
-    require_bwrap, require_dbus, require_pasta, require_portal, require_python, require_system_bus,
-    require_tray, system_owns, test_pty,
+    require_bwrap, require_dbus, require_groff, require_pasta, require_portal, require_python,
+    require_system_bus, require_tray, system_owns, test_pty,
 };
 use rustix::fs::{OFlags, fcntl_getfl};
 use rustix::process::{Pid, Signal, kill_process};
@@ -5137,4 +5137,163 @@ fn edit_warns_about_the_flip_before_it_stamps_the_version() {
     );
     // And having been stamped, it is the last time.
     assert!(!edit().contains("isolated network namespace"));
+}
+
+/// Every command and subcommand the CLI takes, as the man page has to
+/// name them. Written out rather than derived: the page is the promise
+/// bubbler makes to a reader, and a subcommand added without a word
+/// about it in the page is the drift this asserts against.
+const COMMANDS: &[&str] = &[
+    "bubbler create",
+    "bubbler run",
+    "bubbler try",
+    "bubbler exec",
+    "bubbler list",
+    "bubbler profiles",
+    "bubbler delete",
+    "bubbler edit",
+    "bubbler profile",
+    "bubbler profile show",
+    "bubbler profile edit",
+    "bubbler profile lint",
+    "bubbler reseed",
+    "bubbler lint",
+    "bubbler man",
+];
+
+/// Roff as the reader sees it: the escapes a page is written with are
+/// not what it says, and what it says is what these tests are about.
+fn rendered(roff: &str) -> String {
+    roff.replace(r"\*(Aq", "'")
+        .replace(r"\(em", "\u{2014}")
+        .replace(r"\fB", "")
+        .replace(r"\fI", "")
+        .replace(r"\fR", "")
+        .replace(r"\-", "-")
+        .replace(r"\&", "")
+}
+
+#[test]
+fn man_renders_the_page_and_a_section_for_every_subcommand() {
+    let tmp = setup();
+    let out = bubbler(tmp.path()).arg("man").output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    let roff = String::from_utf8_lossy(&out.stdout);
+    assert!(roff.contains("\n.TH BUBBLER 1 "), "{:?}", &roff[..60]);
+    for name in COMMANDS {
+        // The heading of that command's own section: a page that named a
+        // subcommand only in the top-level synopsis would document none
+        // of its options.
+        let heading = format!(".SS {name}");
+        assert!(
+            roff.lines().any(|l| l == heading),
+            "no section for `{name}`"
+        );
+    }
+    // The sections clap knows nothing about and a man page is for.
+    for section in [".SH FILES", ".SH ENVIRONMENT", ".SH \"SEE ALSO\""] {
+        assert!(roff.contains(section), "no {section}");
+    }
+}
+
+#[test]
+fn man_config_names_every_grant_and_every_lint_check() {
+    let tmp = setup();
+    let out = bubbler(tmp.path())
+        .args(["man", "--config"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    let roff = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        roff.contains("\n.TH BUBBLER-CONFIG 5 "),
+        "{:?}",
+        &roff[..60]
+    );
+    let text = rendered(&roff);
+    for grant in bubbler_core::catalogue::GRANTS {
+        assert!(
+            text.contains(grant.node),
+            "the config page never names `{}`",
+            grant.node
+        );
+        assert!(
+            text.contains(grant.summary),
+            "the config page never summarises `{}`",
+            grant.node
+        );
+        assert!(
+            text.contains(grant.grammar),
+            "the config page never says how `{}` is written",
+            grant.node
+        );
+    }
+    for check in bubbler_core::lint::CHECKS {
+        assert!(
+            text.contains(check.id),
+            "the config page never names the check `{}`",
+            check.id
+        );
+    }
+}
+
+#[test]
+fn man_exits_zero_when_nothing_is_reading() {
+    let tmp = setup();
+    for args in [&["man"][..], &["man", "--config"][..]] {
+        // The read end is closed before the child is started, so the
+        // very first write is a broken pipe rather than a race with the
+        // pipe's buffer.
+        let (reader, writer) = rustix::pipe::pipe().unwrap();
+        drop(reader);
+        let child = bubbler(tmp.path())
+            .args(args)
+            .stdout(Stdio::from(writer))
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{args:?}: {err}");
+        assert!(err.is_empty(), "{args:?}: {err}");
+    }
+}
+
+#[test]
+fn groff_reads_both_pages_without_a_complaint() {
+    if !require_groff() {
+        return;
+    }
+    let tmp = setup();
+    for args in [&["man"][..], &["man", "--config"][..]] {
+        let page = bubbler(tmp.path()).args(args).output().unwrap();
+        assert!(
+            page.status.success(),
+            "{}",
+            String::from_utf8_lossy(&page.stderr)
+        );
+        // `-z` renders nothing and only reports. `-ww` rather than
+        // `-wall`, which leaves out the one category hand-written roff
+        // gets wrong: a macro or string that is not defined. groff exits
+        // 0 having warned, so what it said is the assertion.
+        let mut groff = Command::new("groff")
+            .args(["-man", "-ww", "-z"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        groff
+            .stdin
+            .take()
+            .expect("stdin was piped")
+            .write_all(&page.stdout)
+            .unwrap();
+        let out = groff.wait_with_output().unwrap();
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{args:?}: groff failed: {said}");
+        assert!(said.is_empty(), "{args:?}: {said}");
+    }
 }
