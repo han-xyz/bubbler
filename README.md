@@ -21,6 +21,9 @@ with `include`. See "Known gaps" below.
     bubbler profiles --origin             # and which layer each comes from
     bubbler profile show firefox          # one profile, flattened, layer by layer
     bubbler profile edit firefox          # your copy of it, in $VISUAL or $EDITOR
+    bubbler profile lint firefox          # check it for grants wider than it means
+    bubbler profile lint --all            # every profile every layer holds
+    bubbler lint ff                       # the same checks on an instance's config
     bubbler edit ff                       # open config.kdl, then re-check it
     bubbler reseed ff                     # re-flatten its profile, keeping home/
     bubbler run ff                        # uses `command` from config.kdl
@@ -141,6 +144,7 @@ file order does not affect the generated argv.
         disable
     }
     env MOZ_ENABLE_WAYLAND="1"       # extra variables, KEY="value", repeatable
+    lint-allow "x11-without-reason" reason="no Wayland backend"
     command "firefox"
 
 Every source must exist and be of the expected type when the argv is built; a
@@ -490,6 +494,7 @@ bubbler cannot mount (see "Known gaps").
 
     bubbler profile show firefox   # the flattened profile, layer by layer
     bubbler profile edit firefox   # your copy of it, in $VISUAL or $EDITOR
+    bubbler profile lint firefox   # check it, see "Linting"
     bubbler reseed ff              # re-flatten ff's profile into its config
 
 `profile show` prints the nodes `create` would seed, each run of them under a
@@ -535,6 +540,88 @@ is an error. It refuses while the instance is running: that sandbox was built
 from the file as it stands, bwrap cannot be told about a bind after the fact,
 and a `config.kdl` describing grants the running sandbox does not have would
 be a lie about what is confined.
+
+## Linting
+
+    bubbler profile lint firefox           # one profile, flattened through its layers
+    bubbler profile lint --all             # every name any layer holds
+    bubbler lint ff                        # an instance's own config.kdl
+    bubbler profile lint --all --deny warnings --format json
+
+`lint` reads what a file grants and measures it against what a sandbox is
+meant to give away. It never launches anything and never edits a file.
+Findings come out in the shape an editor's error parser already reads, with an
+indented `help:` line carrying the fix:
+
+    /home/you/.config/bubbler/profiles/app.kdl:3:1: warning[own-too-wide]: `own "org.*"` claims every well-known name under `org.`
+      help: name the application itself, e.g. `own "org.example.App.*"`
+    built-in:mpv: note[command-not-found]: `mpv` is not on this host's PATH
+      help: a profile may be written for software you have not installed; otherwise fix the `command` node
+
+    2 layers linted, 0 errors, 1 warning, 1 note
+
+Spans come from the file, not from the flattened profile, so a finding names
+the layer that has to change even when the grant is three `include`s deep. A
+built-in layer has no path, so it reports as `built-in:<name>` with no line.
+`--format json` prints one object per finding — `{file, line, col, severity,
+check, message, help}` — and a summary object, for a tool that should not have
+to parse text.
+
+Exit codes: 0 clean (notes are fine), 1 warnings, 2 errors, 3 the lint could
+not be run at all — a layer that does not parse, a file that cannot be read, a
+name no layer holds. `--deny warnings` turns 1 into 2 for CI. "Does not parse"
+is deliberately a different code from "grants too much".
+
+**Errors** say the file will not do what it says: `bundle-without-dbus` (a
+`portals`/`notify`/`tray`/`mpris` bundle no layer gives a `dbus` to carry),
+`share-source-missing` (a `home-share`, `path-share` or `etc-share` source
+this host does not have, or has as something other than a directory or a
+regular file), `path-share-reserved` (a root bubbler never shares),
+`dup-name-policy` (one bus name given two policies by two layers),
+`own-on-system-bus`.
+
+**Warnings** say the file grants more than it probably means to:
+`x11-without-reason`, `seccomp-disabled`, `userns-disabled-with-nested-sandbox`
+(`userns "disable"` under a command known to nest a sandbox of its own — the
+list of such commands is a heuristic), `own-too-wide` (an `own` ending in `*`
+with fewer than three name elements before it, so `org.kde.*` warns and
+`org.mozilla.firefox.*` does not), `mpris-wildcard`, `system-bus-polkit-name`
+(a `talk` on a system service whose privileged actions polkit judges as you),
+`home-share-sensitive` (`.ssh`, `.gnupg`, `.config`, `.local`, `.cache` and
+the like), `path-share-mountpoint` (a whole mounted filesystem, `mode=rw`),
+`path-share-socket` (a socket, or the directory one sits in — a shared control
+socket is command execution across the boundary), `dbus-without-rules`,
+`env-looks-secret` (an underscore-separated word of the name is `TOKEN`,
+`SECRET`, `PASSWORD`, `APIKEY`, `PAT` and the like, or the value starts
+`ghp_`/`sk-`/`AKIA` — whole words, so `TOKENIZERS_PARALLELISM` is not one),
+`tty-passthrough`, `portal-talk-without-portals` (a portal rule is inert
+without `/.flatpak-info`, which is worse than wrong).
+
+**Notes** are information and fail nothing: `ozone-hint-unnecessary`,
+`command-not-found`.
+
+A warning or a note is accepted with a `lint-allow` node, which takes a check
+id and a required reason:
+
+    x11
+    lint-allow "x11-without-reason" reason="steamwebhelper is an X11/CEF client"
+
+The node holds for the whole flattened profile, not for one line, and a
+`lint-allow` in your layer accepts a finding about a built-in one. An id no
+check has is a parse error, so a typo cannot leave a finding un-accepted with
+nothing to say so; an id whose check reports an *error* is a parse error too,
+since an error names something the file cannot do and nothing would ever
+silence it. `steam` and `lutris` carry the nodes for their `x11` and
+`seccomp { disable }` grants, with the reason each of their comments already
+gives; every shipped profile lints clean on a host that has what it shares.
+
+`create`, `reseed`, `edit` and `profile edit` run the lint themselves at the
+end and print any errors and warnings — never notes — to stderr, prefixed
+`bubbler: lint:`. It is advice, not a gate: the exit code is untouched and
+nothing is blocked.
+
+`profile lint --all` reads a base profile once however many profiles
+`include` it, so a layer and anything found in it are counted once.
 
 ## D-Bus
 

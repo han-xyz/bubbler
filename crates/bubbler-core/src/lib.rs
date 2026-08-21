@@ -12,6 +12,7 @@ pub mod init_bin;
 pub mod instance;
 pub mod kdl_out;
 pub mod launcher;
+pub mod lint;
 pub mod profile;
 pub mod seccomp;
 pub mod service;

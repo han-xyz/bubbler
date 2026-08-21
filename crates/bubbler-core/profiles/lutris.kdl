@@ -28,6 +28,8 @@
 // it (`mkdir ~/Games`) or edit the node to the directory you use. A prefix
 // or library outside the home is named explicitly, e.g.
 //   path-share "/kioxia/Games" mode=rw
+lint-allow "x11-without-reason" reason="every Wine or Proton game Lutris starts is an X11 client"
+lint-allow "seccomp-disabled" reason="umu, Proton and 32-bit DXVK make i386 syscalls the one-architecture filter kills"
 wayland
 x11
 dri
