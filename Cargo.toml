@@ -17,5 +17,5 @@ rustix = { version = "1", features = ["fs", "process", "net", "pipe", "event", "
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 signal-hook = "0.3"
-seccompiler = "0.5"
+libseccomp = "0.4"
 tempfile = "3"

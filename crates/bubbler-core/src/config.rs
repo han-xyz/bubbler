@@ -1134,8 +1134,8 @@ fn parse_tty(node: &KdlNode) -> Result<TtyMode, ConfigError> {
 }
 
 /// `seccomp` itself is bare; every rule is a child node. Names are resolved
-/// against the build architecture's table here, so a typo cannot silently
-/// leave a syscall allowed the profile meant to deny.
+/// by libseccomp here, so a typo cannot silently leave a syscall allowed
+/// the profile meant to deny.
 fn parse_seccomp(node: &KdlNode) -> Result<SeccompConfig, ConfigError> {
     reject_arguments(node)?;
     let mut cfg = SeccompConfig::default();
@@ -1161,9 +1161,9 @@ fn parse_seccomp(node: &KdlNode) -> Result<SeccompConfig, ConfigError> {
                 let errno = deny_errno(child)?;
                 for name in syscall_names(child)? {
                     if name == "prctl" {
-                        // bwrap(1): every stacked seccomp program except
-                        // possibly the last must allow PR_SET_SECCOMP.
-                        return Err(bad(child, "bwrap needs prctl to install the filter"));
+                        // glibc and Chromium call `prctl` for themselves,
+                        // so denying it breaks the sandbox from within.
+                        return Err(bad(child, "glibc and Chromium need prctl"));
                     }
                     cfg.deny.push((name, errno));
                 }
@@ -1217,7 +1217,7 @@ fn syscall_name(node: &KdlNode, s: &str) -> Result<String, ConfigError> {
     if syscall_number(s).is_none() {
         return Err(bad(
             node,
-            &format!("`{s}` is not a syscall on this architecture"),
+            &format!("`{s}` is not a syscall name libseccomp knows"),
         ));
     }
     Ok(s.to_owned())
@@ -2418,12 +2418,10 @@ command "b""#
     }
 
     #[test]
-    fn a_syscall_the_build_architecture_lacks_is_an_error_not_a_skip() {
+    fn a_syscall_no_architecture_in_the_filter_has_is_an_error_not_a_skip() {
         for text in [
             r#"seccomp { allow "nosuchcall" }"#,
             r#"seccomp { deny "nosuchcall" }"#,
-            // 32-bit x86 only, so unknown on every architecture bubbler builds for.
-            r#"seccomp { allow "vm86old" }"#,
         ] {
             assert!(
                 matches!(parse(text), Err(ConfigError::BadArgument { node, .. }) if node == "allow" || node == "deny"),
@@ -2431,6 +2429,10 @@ command "b""#
             );
         }
         assert!(parse(r#"seccomp { allow "keyctl" "clone3" }"#).is_ok());
+        // `vm86old` is i386-only, and the filter carries i386 on x86_64,
+        // so naming it there is a rule rather than a mistake.
+        #[cfg(target_arch = "x86_64")]
+        assert!(parse(r#"seccomp { allow "vm86old" }"#).is_ok());
     }
 
     #[test]

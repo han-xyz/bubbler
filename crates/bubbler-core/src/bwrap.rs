@@ -80,8 +80,9 @@ enum Kind {
         /// cBPF as `struct sock_filter` bytes; bwrap rejects a length that
         /// is not a multiple of eight.
         program: Vec<u8>,
-        /// The error this program answers with, for [`Explained::note`].
-        errno: &'static str,
+        /// The architectures the program answers for, for
+        /// [`Explained::note`].
+        arches: &'static str,
     },
 }
 
@@ -473,19 +474,19 @@ impl BwrapArgs {
         });
     }
 
-    /// Load one compiled seccomp program into the sandbox (`bwrap(1)`
-    /// `--add-seccomp-fd`, phase 1). Repeatable: bwrap loads every program
-    /// given, in order, which is how one denylist can answer with more
-    /// than one error.
-    // `bwrap(1)`: all of them "except possibly the last, must allow use of
-    // the PR_SET_SECCOMP prctl", which is why the config refuses
-    // `deny "prctl"`. Placed after `--info-fd` and `--block-fd` only for
+    /// Load the compiled seccomp program into the sandbox (`bwrap(1)`
+    /// `--add-seccomp-fd`, phase 1). One filter answers for every
+    /// architecture and every error, so a sandbox needs exactly one call.
+    // The config refuses `deny "prctl"` because glibc and Chromium call
+    // it for themselves — thread names, `PR_SET_NO_NEW_PRIVS`, the
+    // renderer's own seccomp — so denying it breaks the sandbox from the
+    // inside. Placed after `--info-fd` and `--block-fd` only for
     // readability; bwrap orders seccomp fds among themselves, not against
     // other flags.
-    pub fn add_seccomp(&mut self, program: Vec<u8>, errno: &'static str) {
+    pub fn add_seccomp(&mut self, program: Vec<u8>, arches: &'static str) {
         self.namespaces.push(Item {
             origin: self.origin,
-            kind: Kind::Seccomp { program, errno },
+            kind: Kind::Seccomp { program, arches },
         });
     }
 
@@ -701,11 +702,11 @@ impl BwrapArgs {
                         Some("pipe: the sandbox waits on it until bubbler lets it go".to_owned()),
                     )
                 }
-                Kind::Seccomp { program, errno } => {
+                Kind::Seccomp { program, arches } => {
                     let fd = alloc.data(&program).map_err(LaunchError::Data)?;
                     (
                         vec!["--add-seccomp-fd".into(), fd],
-                        Some(format!("{errno} program, {} bytes", program.len())),
+                        Some(format!("filter, {} bytes, {arches}", program.len())),
                     )
                 }
             };
@@ -1322,11 +1323,10 @@ mod tests {
     }
 
     #[test]
-    fn seccomp_programs_follow_the_info_and_block_fds_in_phase_one() {
+    fn the_seccomp_program_follows_the_info_and_block_fds_in_phase_one() {
         let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default());
         args.block_until_released();
-        args.add_seccomp(b"12345678".to_vec(), "EPERM");
-        args.add_seccomp(b"87654321".to_vec(), "ENOSYS");
+        args.add_seccomp(b"12345678".to_vec(), "x86_64 + i386");
         let mut rec = Recorder {
             seen: Vec::new(),
             next: Counter::new(),
@@ -1334,23 +1334,14 @@ mod tests {
         let finished = args.finish(&["sh".into()], &mut rec).unwrap();
         let s = strs(&finished);
         assert_eq!(
-            &s[7..15],
-            &[
-                "--info-fd",
-                "3",
-                "--block-fd",
-                "4",
-                "--add-seccomp-fd",
-                "5",
-                "--add-seccomp-fd",
-                "6",
-            ],
+            &s[7..13],
+            &["--info-fd", "3", "--block-fd", "4", "--add-seccomp-fd", "5",],
             "{s:?}"
         );
         assert_eq!(
-            rec.seen[..2],
-            [b"12345678".to_vec(), b"87654321".to_vec()],
-            "the programs are the first data the allocator is handed"
+            rec.seen[..1],
+            [b"12345678".to_vec()],
+            "the program is the first data the allocator is handed"
         );
     }
 

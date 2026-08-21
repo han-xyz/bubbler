@@ -311,10 +311,10 @@ fn build_args_on<'a>(
     Ok((args, command))
 }
 
-/// Load `set` into the sandbox as one program per error it uses, or say
-/// on stderr that this instance runs unfiltered. A profile asking for no
-/// filter is honoured, but never silently — and one whose `allow` list
-/// leaves nothing to deny asked for the same thing the long way round.
+/// Load `set` into the sandbox as one filter, or say on stderr that this
+/// instance runs unfiltered. A profile asking for no filter is honoured,
+/// but never silently — and one whose `allow` list leaves nothing to deny
+/// asked for the same thing the long way round.
 fn apply_seccomp(
     args: &mut BwrapArgs,
     set: Option<seccomp::RuleSet>,
@@ -325,13 +325,11 @@ fn apply_seccomp(
         eprintln!("bubbler: seccomp disabled for instance {instance}");
         return Ok(());
     };
-    let programs = seccomp::compile(&set, env.seccomp_log)?;
-    if programs.is_empty() {
+    let Some(program) = seccomp::compile(&set, env.seccomp_log)? else {
         eprintln!("bubbler: seccomp has no rules left for instance {instance}");
-    }
-    for program in programs {
-        args.add_seccomp(program.bytes, program.errno.name());
-    }
+        return Ok(());
+    };
+    args.add_seccomp(program.bytes, program.arches);
     Ok(())
 }
 
@@ -418,8 +416,8 @@ fn proxy_args(
     // The sidecar has no `seccomp` node of its own: an instance may relax
     // its own filter, never the one around the process holding its bus.
     args.tag(Origin::Seccomp);
-    for program in seccomp::compile(&seccomp::RuleSet::default_set(), env.seccomp_log)? {
-        args.add_seccomp(program.bytes, program.errno.name());
+    if let Some(program) = seccomp::compile(&seccomp::RuleSet::default_set(), env.seccomp_log)? {
+        args.add_seccomp(program.bytes, program.arches);
     }
     // The proxy reads this to decide it is talking for a sandboxed app;
     // without `portals` it is only the `[Application]` section.
@@ -1541,7 +1539,7 @@ mod tests {
         // node, next to the file that identity is written from.
         assert_eq!(
             line(&items, Origin::Service(1)),
-            "--block-fd 4 --perms 0644 --ro-bind-data 9 /.flatpak-info"
+            "--block-fd 4 --perms 0644 --ro-bind-data 8 /.flatpak-info"
         );
         // `notify` is a rule for the proxy and nothing for bwrap.
         assert_eq!(line(&items, Origin::Service(2)), "");
@@ -1556,15 +1554,12 @@ mod tests {
             line(&items, Origin::Userns),
             "--unshare-user --disable-userns"
         );
-        assert_eq!(
-            line(&items, Origin::Seccomp),
-            "--add-seccomp-fd 5 --add-seccomp-fd 6"
-        );
+        assert_eq!(line(&items, Origin::Seccomp), "--add-seccomp-fd 5");
         assert_eq!(line(&items, Origin::Env(0)), "--setenv FOO bar");
         assert_eq!(
             line(&items, Origin::Init),
             format!(
-                "--ro-bind {init} /run/bubbler-init -- /run/bubbler-init --socket-fd 10",
+                "--ro-bind {init} /run/bubbler-init -- /run/bubbler-init --socket-fd 9",
                 init = tmp.path().join("bubbler-init").display()
             )
         );
@@ -1660,7 +1655,7 @@ mod tests {
             "pipe: bwrap reports the sandbox pid on it"
         );
         assert!(
-            note("--add-seccomp-fd").starts_with("EPERM program, "),
+            note("--add-seccomp-fd").starts_with("filter, "),
             "{items:?}"
         );
         assert_eq!(note("--perms"), "generated file, 88 bytes");
@@ -1682,7 +1677,7 @@ mod tests {
         assert_eq!(items[0].origin, Origin::Baseline);
         assert_eq!(
             line(&items, Origin::Identity),
-            "--perms 0644 --ro-bind-data 6 /.flatpak-info"
+            "--perms 0644 --ro-bind-data 5 /.flatpak-info"
         );
         // One element per line: the sidecar's argv is its rule list, and
         // each rule is grouped under the node that asked for it.
@@ -1795,11 +1790,11 @@ mod tests {
             a.windows(3)
                 .any(|w| w == ["--ro-bind", init.as_str(), INIT_INSIDE])
         );
-        // Fd 3 went to the info pipe and 4 and 5 to the two seccomp
-        // programs, 6 and 7 to the baseline passwd and group.
+        // Fd 3 went to the info pipe, 4 to the seccomp filter and 5 and
+        // 6 to the baseline passwd and group.
         assert_eq!(
             &a[a.len() - 6..],
-            &["--", INIT_INSIDE, "--socket-fd", "8", "--", "foot"]
+            &["--", INIT_INSIDE, "--socket-fd", "7", "--", "foot"]
         );
     }
 
@@ -2030,8 +2025,6 @@ mod tests {
                 "--new-session",
                 "--add-seccomp-fd",
                 "4",
-                "--add-seccomp-fd",
-                "5",
                 "--ro-bind",
                 "/usr",
                 "/usr",
@@ -2064,7 +2057,7 @@ mod tests {
                 "--perms",
                 "0644",
                 "--ro-bind-data",
-                "6",
+                "5",
                 "/.flatpak-info",
                 "--clearenv",
                 "--",
@@ -2631,28 +2624,20 @@ mod tests {
     }
 
     #[test]
-    fn the_default_denylist_reaches_the_argv_as_two_seccomp_fds() {
+    fn the_default_denylist_reaches_the_argv_as_one_seccomp_fd() {
         let tmp = tempfile::tempdir().unwrap();
         let e = env(tmp.path());
         let i = inst(tmp.path(), "command \"foot\"");
         let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default(), false).unwrap());
         // Straight after the info fd, and before the filesystem phase.
         assert_eq!(
-            &a[7..14],
-            &[
-                "--info-fd",
-                "3",
-                "--add-seccomp-fd",
-                "4",
-                "--add-seccomp-fd",
-                "5",
-                "--ro-bind",
-            ],
+            &a[7..12],
+            &["--info-fd", "3", "--add-seccomp-fd", "4", "--ro-bind"],
             "{a:?}"
         );
         assert_eq!(
             &a[a.len() - 6..],
-            &["--", INIT_INSIDE, "--socket-fd", "8", "--", "foot"]
+            &["--", INIT_INSIDE, "--socket-fd", "7", "--", "foot"]
         );
     }
 
@@ -2667,12 +2652,14 @@ mod tests {
 
     #[test]
     fn allowing_every_denied_syscall_leaves_no_program_to_load() {
-        use crate::seccomp::{DEFAULT_ENOSYS, DEFAULT_EPERM, syscall_number};
-        // A name this architecture never had is a config error, so only
-        // the ones it has can be allowed back.
-        let names: Vec<String> = DEFAULT_EPERM
+        use crate::seccomp::{RuleSet, syscall_number};
+        // A name no architecture in the filter has is a config error, so
+        // only the ones it does can be allowed back.
+        let set = RuleSet::default_set();
+        let names: Vec<String> = set
+            .eperm
             .iter()
-            .chain(DEFAULT_ENOSYS)
+            .chain(&set.enosys)
             .filter(|n| syscall_number(n).is_some())
             .map(|n| format!("\"{n}\""))
             .collect();
