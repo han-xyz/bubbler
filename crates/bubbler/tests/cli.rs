@@ -192,6 +192,117 @@ fn home_share_through_a_symlink_out_of_the_home_is_refused() {
     );
 }
 
+/// `path-share` is refused for everything outside `$BUBBLER_TEST_ALLOW_PATH`
+/// here, because a temporary directory lives under the denied `/tmp`.
+#[test]
+fn path_share_binds_a_host_path_only_with_the_test_hook() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let shared = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(
+        &cfg,
+        format!(
+            "path-share \"{}\"\ncommand \"true\"\n",
+            shared.path().display()
+        ),
+    )
+    .unwrap();
+
+    let out = bubbler(tmp.path())
+        .env("BUBBLER_TEST_ALLOW_PATH", shared.path())
+        .args(["run", "t", "--dry-run"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(&format!(
+            "--ro-bind\n{p}\n{p}\n",
+            p = shared.path().display()
+        )),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--dry-run"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("/tmp"), "{err}");
+
+    // The hook adds one root; it does not switch the denylist off.
+    let out = bubbler(tmp.path())
+        .env("BUBBLER_TEST_ALLOW_PATH", other.path())
+        .args(["run", "t", "--dry-run"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("/tmp"), "{err}");
+}
+
+#[test]
+fn real_bwrap_path_share_reads_the_host_and_mode_rw_writes_through() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let shared = tempfile::tempdir().unwrap();
+    let ro = shared.path().join("ro");
+    let rw = shared.path().join("rw");
+    std::fs::create_dir(&ro).unwrap();
+    std::fs::create_dir(&rw).unwrap();
+    std::fs::write(ro.join("hello.txt"), b"from the host\n").unwrap();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(
+        &cfg,
+        format!(
+            "path-share \"{}\"\npath-share \"{}\" mode=rw\n",
+            ro.display(),
+            rw.display()
+        ),
+    )
+    .unwrap();
+
+    let out = bubbler_live(tmp.path(), &init)
+        .env("BUBBLER_TEST_ALLOW_PATH", shared.path())
+        .args([
+            "run",
+            "t",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            &format!(
+                "cat {ro}/hello.txt; touch {ro}/nope.txt 2>/dev/null || echo READONLY; \
+                 echo written > {rw}/out.txt",
+                ro = ro.display(),
+                rw = rw.display()
+            ),
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "from the host\nREADONLY\n"
+    );
+    assert!(!ro.join("nope.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(rw.join("out.txt")).unwrap(),
+        "written\n"
+    );
+}
+
 #[test]
 fn real_bwrap_runs_true_and_propagates_exit_code() {
     if !require_bwrap() {

@@ -98,6 +98,8 @@ file order does not affect the generated argv.
     pulseaudio                       # $XDG_RUNTIME_DIR/pulse/native, sets PULSE_SERVER
     home-share "Downloads"           # $HOME/Downloads at /home/bubbler/Downloads
     home-share "Projects/x" mode=rw
+    path-share "/kioxia/Steam"       # a host path, at that same path inside
+    path-share "/mnt/data" mode=rw
     etc-share "vulkan"               # /etc/vulkan read-only; one path component
     dbus {                           # session bus through a filtering proxy
         see "org.freedesktop.ScreenSaver"
@@ -125,9 +127,10 @@ missing one is an error rather than a silently weaker sandbox. That covers
 home directory: a symlink pointing elsewhere is refused, not followed.
 `etc-share` is confined to `/etc` the same way, and cannot name the account
 files (`passwd`, `group`, `shadow`, `gshadow` and their `-`/`+` variants),
-which the sandbox generates itself. `network` needs `/etc/resolv.conf` (the
-tmpfs over `/etc` would otherwise hide it). `dri` binds `/dev/dri` read-write
-and exposes `/sys/dev/char`, `/sys/devices/system/cpu` and every
+which the sandbox generates itself. `path-share` reaches outside the home and
+has rules of its own, under "Host paths". `network` needs `/etc/resolv.conf`
+(the tmpfs over `/etc` would otherwise hide it). `dri` binds `/dev/dri`
+read-write and exposes `/sys/dev/char`, `/sys/devices/system/cpu` and every
 `/sys/devices/pci*` root read-only — that is the sysfs attributes of every PCI
 device on the machine, not just the GPU. `pipewire` and `pulseaudio` hand the
 sandbox the session's audio socket directly, which is capture as well as
@@ -140,6 +143,41 @@ or a carriage return — a newline would forge a line in `--dry-run` output. The
 variables the sandbox owns are rejected: `HOME`, `PATH`, `XDG_RUNTIME_DIR`,
 `USER`, `LOGNAME`, `WAYLAND_DISPLAY`, `DISPLAY`, `XAUTHORITY`,
 `XDG_SESSION_TYPE`, `PULSE_SERVER`, `DBUS_SESSION_BUS_ADDRESS`.
+
+## Host paths
+
+`path-share "<absolute path>" [mode=rw]` binds a host path outside your home at
+that same path inside the sandbox: `/kioxia/Steam` stays `/kioxia/Steam`, and
+bwrap creates the directories above it. The node is repeatable, read-only
+unless `mode=rw`, and a whole mountpoint is a fine target.
+
+The path is resolved before anything is bound, and what it resolves to must not
+be one of the paths the sandbox is built out of: `/`, `/proc`, `/sys`, `/dev`,
+`/etc`, `/usr`, `/opt`, `/home`, your home directory, `/tmp`, `/var`, `/run`,
+`$XDG_RUNTIME_DIR`, or `$XDG_DATA_HOME/bubbler`, where the instances live.
+Being one of them, being inside one, or containing one is refused, and the
+error names the root that stopped it. So a share of `/kioxia` is refused if
+`$XDG_DATA_HOME` is on that disk: a sandbox that can write another instance's
+`config.kdl` grants itself anything on the next run. `/etc` and your home have
+typed grants of their own (`etc-share`, `home-share`), and the rest of that
+list is what the baseline replaces. The one carve-out is `/run/media` and
+everything under it, where udisks mounts removable media. `/mnt`, `/media`,
+`/srv` and top-level mountpoints of your own are allowed.
+
+Resolving first is also what stops a symlink from smuggling a denied directory
+in: `path-share "/mnt/link"` with `/mnt/link -> /etc` is refused naming `/etc`.
+The flip side is that what gets bound is the link's target under the name you
+wrote, so the sandbox sees a directory where the host has a symlink.
+
+Two `path-share`s may not overlap — neither the paths as written nor what they
+resolve to. bwrap applies binds in the order it is given them, so a share
+nested inside another would either fail outright or silently hide the other;
+refusing both orders is what keeps file order irrelevant.
+
+`$BUBBLER_TEST_ALLOW_PATH=<dir>` adds one more allowed root; it must be
+absolute. It exists so tests can share a temporary directory under the
+otherwise denied `/tmp`, and it adds a root rather than switching the denylist
+off.
 
 ## D-Bus
 
@@ -412,7 +450,8 @@ The `bubbler-init` binary is taken from `$BUBBLER_INIT` if set (it must be a
 regular file), else from next to the `bubbler` binary, else from
 `/usr/lib/bubbler/bubbler-init`. `$BUBBLER_DBUS_PROXY` likewise replaces the
 `xdg-dbus-proxy` on `PATH` with a regular file bound into the proxy sandbox at
-its own path; it exists for tests and debugging.
+its own path; it exists for tests and debugging, as does the
+`$BUBBLER_TEST_ALLOW_PATH` described under "Host paths".
 
 ## Build
 

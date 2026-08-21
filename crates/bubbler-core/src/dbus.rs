@@ -278,6 +278,7 @@ mod tests {
             dbus_address: None,
             dbus_log: false,
             seccomp_log: false,
+            test_allow_path: None,
             proxy_override: None,
         }
     }

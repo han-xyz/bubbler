@@ -93,6 +93,15 @@ pub enum Service {
         /// Read-only unless `mode=rw`.
         mode: ShareMode,
     },
+    /// Bind a host path outside the home at that same path inside the
+    /// sandbox. Reserved roots (`/etc`, `/home`, `/run`, ...) are refused
+    /// when the sandbox is built, not here.
+    PathShare {
+        /// Absolute, as written in the file; no `..`.
+        path: PathBuf,
+        /// Read-only unless `mode=rw`.
+        mode: ShareMode,
+    },
     /// Bind one host `/etc` entry read-only at the same path, on top of
     /// the baseline `/etc` allowlist.
     EtcShare {
@@ -165,7 +174,18 @@ pub fn parse(text: &str) -> Result<InstanceConfig, ConfigError> {
                 }
                 cfg.services.push(svc);
             }
-            "home-share" => cfg.services.push(parse_home_share(node)?),
+            "home-share" => {
+                let (path, mode) = parse_share(node, validate_relative)?;
+                cfg.services.push(Service::HomeShare { path, mode });
+            }
+            "path-share" => {
+                let (path, mode) = parse_share(node, validate_absolute)?;
+                let svc = Service::PathShare { path, mode };
+                if cfg.services.contains(&svc) {
+                    return Err(ConfigError::Duplicate(name.to_owned()));
+                }
+                cfg.services.push(svc);
+            }
             "etc-share" => {
                 let svc = parse_etc_share(node)?;
                 if cfg.services.contains(&svc) {
@@ -280,7 +300,13 @@ fn reject_arguments(node: &KdlNode) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn parse_home_share(node: &KdlNode) -> Result<Service, ConfigError> {
+/// `<node> "<path>" [mode=ro|rw]`, the shape `home-share` and
+/// `path-share` have in common; `validate` decides which paths the node
+/// accepts and normalises them.
+fn parse_share(
+    node: &KdlNode,
+    validate: fn(&KdlNode, &str) -> Result<PathBuf, ConfigError>,
+) -> Result<(PathBuf, ShareMode), ConfigError> {
     let mut path: Option<PathBuf> = None;
     let mut mode = ShareMode::ReadOnly;
     for e in node.entries() {
@@ -293,7 +319,7 @@ fn parse_home_share(node: &KdlNode) -> Result<Service, ConfigError> {
                     .value()
                     .as_string()
                     .ok_or_else(|| bad(node, "path must be a string"))?;
-                path = Some(validate_relative(node, s)?);
+                path = Some(validate(node, s)?);
             }
             Some("mode") => {
                 mode = match e.value().as_string() {
@@ -314,7 +340,7 @@ fn parse_home_share(node: &KdlNode) -> Result<Service, ConfigError> {
         return Err(bad(node, "takes no children"));
     }
     let path = path.ok_or_else(|| bad(node, "expects exactly one path argument"))?;
-    Ok(Service::HomeShare { path, mode })
+    Ok((path, mode))
 }
 
 fn parse_etc_share(node: &KdlNode) -> Result<Service, ConfigError> {
@@ -543,6 +569,22 @@ fn parse_env(node: &KdlNode, out: &mut Vec<(String, String)>) -> Result<(), Conf
         return Err(bad(node, "takes no children"));
     }
     Ok(())
+}
+
+/// Only absolute paths whose every other component is a normal name. The
+/// path is bound at what it says, so `..` in it would name one thing here
+/// and another inside the sandbox.
+fn validate_absolute(node: &KdlNode, s: &str) -> Result<PathBuf, ConfigError> {
+    let p = Path::new(s);
+    let mut comps = p.components();
+    if comps.next() != Some(Component::RootDir) || !comps.all(|c| matches!(c, Component::Normal(_)))
+    {
+        return Err(bad(
+            node,
+            "path must be absolute and contain no `.` or `..` component",
+        ));
+    }
+    Ok(p.components().collect())
 }
 
 /// Only plain relative paths: every component must be a normal name.
@@ -910,6 +952,84 @@ command "b""#
             };
             assert_eq!(path.to_str().unwrap(), "a/b");
         }
+    }
+
+    #[test]
+    fn path_share_takes_an_absolute_path_and_mode() {
+        let cfg = parse("path-share \"/kioxia/Steam\"\npath-share \"/mnt/data\" mode=rw").unwrap();
+        assert_eq!(
+            cfg.services,
+            vec![
+                Service::PathShare {
+                    path: "/kioxia/Steam".into(),
+                    mode: ShareMode::ReadOnly
+                },
+                Service::PathShare {
+                    path: "/mnt/data".into(),
+                    mode: ShareMode::ReadWrite
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn path_share_rejects_relative_and_parent_paths() {
+        for text in [
+            r#"path-share "kioxia""#,
+            r#"path-share "./kioxia""#,
+            r#"path-share "../kioxia""#,
+            r#"path-share "/a/../b""#,
+            r#"path-share """#,
+        ] {
+            assert!(
+                matches!(parse(text), Err(ConfigError::BadArgument { .. })),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_share_rejects_bad_mode_missing_and_extra_arguments() {
+        for text in [
+            r#"path-share "/a" mode=wx"#,
+            "path-share",
+            "path-share 3",
+            r#"path-share "/a" "/b""#,
+            r#"path-share (t)"/a""#,
+            "path-share \"/a\" {\n    mode\n}",
+        ] {
+            assert!(
+                matches!(parse(text), Err(ConfigError::BadArgument { .. })),
+                "{text}"
+            );
+        }
+        assert!(matches!(
+            parse(r#"path-share "/a" ro=#true"#),
+            Err(ConfigError::UnknownProperty { .. })
+        ));
+    }
+
+    #[test]
+    fn path_share_normalises_path_and_rejects_the_same_node_twice() {
+        // `PathBuf` compares component-wise, so assert on the stored bytes.
+        for text in [
+            r#"path-share "//kioxia/Steam""#,
+            r#"path-share "/kioxia/./Steam""#,
+            r#"path-share "/kioxia/Steam/""#,
+        ] {
+            let services = parse(text).unwrap().services;
+            let [Service::PathShare { path, .. }] = &services[..] else {
+                panic!("expected exactly one path-share, got {services:?}");
+            };
+            assert_eq!(path.to_str().unwrap(), "/kioxia/Steam");
+        }
+        assert!(matches!(
+            parse("path-share \"/a\"\npath-share \"/a/\""),
+            Err(ConfigError::Duplicate(n)) if n == "path-share"
+        ));
+        // Two modes for one path is not the same node; the launcher
+        // rejects it as an overlap, with both paths named.
+        assert!(parse("path-share \"/a\"\npath-share \"/a\" mode=rw").is_ok());
     }
 
     #[test]

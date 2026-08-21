@@ -88,10 +88,29 @@ pub fn from_process() -> Result<Env> {
         dbus_address: env::var_os("DBUS_SESSION_BUS_ADDRESS").filter(|v| !v.is_empty()),
         dbus_log: env::var_os("BUBBLER_DBUS_LOG").is_some_and(|v| v == "1"),
         seccomp_log: env::var_os("BUBBLER_SECCOMP_LOG").is_some_and(|v| v == "1"),
+        test_allow_path: test_allow_path()?,
         proxy_override: env::var_os("BUBBLER_DBUS_PROXY")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from),
     })
+}
+
+/// `$BUBBLER_TEST_ALLOW_PATH`: the one extra root `path-share` accepts,
+/// for tests and debugging. It must be absolute, and is resolved here so
+/// it compares against the canonical source of a share; a path that does
+/// not exist is kept as written and therefore matches nothing.
+fn test_allow_path() -> Result<Option<PathBuf>> {
+    let Some(value) = env::var_os("BUBBLER_TEST_ALLOW_PATH").filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        anyhow::bail!(
+            "BUBBLER_TEST_ALLOW_PATH must be an absolute path, not `{}`",
+            path.display()
+        );
+    }
+    Ok(Some(std::fs::canonicalize(&path).unwrap_or(path)))
 }
 
 /// The user's editor: `$VISUAL`, else `$EDITOR`. An empty value counts as

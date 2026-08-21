@@ -33,8 +33,9 @@ pub struct ServiceCtx<'a> {
 
 /// Apply every service to `args`. `host` reports the type of a host path
 /// with symlinks followed, so tests run without real sockets. A
-/// [`Service::HomeShare`] `path` must be relative and normalised, exactly
-/// as the parser leaves it.
+/// [`Service::HomeShare`] `path` must be relative and a
+/// [`Service::PathShare`] `path` absolute, both normalised, exactly as the
+/// parser leaves them.
 pub fn apply_all(
     services: &[Service],
     env: &Env,
@@ -43,6 +44,7 @@ pub fn apply_all(
     ctx: &ServiceCtx,
 ) -> Result<(), LaunchError> {
     let has_x11 = services.contains(&Service::X11);
+    let shares = path_shares(services, env, host)?;
     for s in services {
         match s {
             Service::Wayland => wayland(env, args, host, !has_x11)?,
@@ -55,9 +57,18 @@ pub fn apply_all(
             Service::EtcShare { name } => etc_share(args, host, name)?,
             Service::Dbus { .. } => dbus_socket(env, args, ctx),
             Service::Portals => portals(args, ctx)?,
+            // Bound below, once every share has been resolved: two
+            // overlapping shares must be refused before either is emitted.
+            Service::PathShare { .. } => {}
             // Rule-only bundles: they reach the sandbox through the proxy
             // the launcher starts, not through bwrap arguments.
             Service::Notify | Service::Mpris { .. } => {}
+        }
+    }
+    for (dst, src, mode) in shares {
+        match mode {
+            ShareMode::ReadOnly => args.ro_bind(&src, dst),
+            ShareMode::ReadWrite => args.bind(&src, dst),
         }
     }
     Ok(())
@@ -325,16 +336,32 @@ pub fn apply_env(pairs: &[(String, String)], args: &mut BwrapArgs) -> Result<(),
     Ok(())
 }
 
+/// The canonical form of a host path a config named, probed for
+/// existence. Canonical is what the caller must bind: binding the path as
+/// written would mount whatever a symlink on it points at instead, and it
+/// is also the only form a policy check can be made on.
+fn resolve_source(
+    host: &dyn Host,
+    service: &'static str,
+    src: &Path,
+) -> Result<PathBuf, LaunchError> {
+    let Some(real) = host.canonicalize(src) else {
+        return Err(LaunchError::MissingResource {
+            service,
+            path: src.to_path_buf(),
+        });
+    };
+    require_exists(host, service, real)
+}
+
 /// Resolve `src` and require that it stays under `root`; both are
 /// canonicalised, so a symlink cannot turn a grant inside `root` into a
-/// bind of something outside it. Returns the canonical source, which is
-/// what the caller must bind: binding the path as written would mount
-/// whatever the symlink points at instead.
+/// bind of something outside it. Returns the canonical source.
 fn confine(
     host: &dyn Host,
     service: &'static str,
     root: &Path,
-    src: PathBuf,
+    src: &Path,
     outside: &str,
 ) -> Result<PathBuf, LaunchError> {
     let root = host
@@ -343,16 +370,127 @@ fn confine(
             service,
             path: root.to_path_buf(),
         })?;
-    let Some(real) = host.canonicalize(&src) else {
-        return Err(LaunchError::MissingResource { service, path: src });
-    };
+    let real = resolve_source(host, service, src)?;
     if !real.starts_with(&root) {
         return Err(LaunchError::BadValue {
             service,
             reason: format!("{} resolves outside {outside}", src.display()),
         });
     }
-    require_exists(host, service, real)
+    Ok(real)
+}
+
+/// Host roots `path-share` never binds, whatever the config says. The
+/// baseline owns `/proc`, `/dev`, `/etc`, `/tmp`, `/var` and `/run`;
+/// `/usr` and `/opt` are already read-only mounts a phase-4 bind cannot
+/// nest inside; `/home` is what the private home replaces. flatpak
+/// refuses the same set in `dont_export_in` (`flatpak-exports.c`), and
+/// for the same reason: a share of one of these takes the sandbox apart.
+const DENIED_ROOTS: &[&str] = &[
+    "/proc", "/sys", "/dev", "/etc", "/usr", "/opt", "/home", "/tmp", "/var", "/run",
+];
+
+/// Removable media, mounted here by udisks, is a real share target, so it
+/// is carved out of the `/run` denial. flatpak exposes the same path
+/// (`flatpak-context.c`).
+const MEDIA_ROOT: &str = "/run/media";
+
+/// The reserved root a canonical path collides with: it is that root, is
+/// inside it, or is one of its ancestors. An ancestor is refused because
+/// binding it would cover the root with a mount of its own.
+fn denied_root(canonical: &Path, env: &Env) -> Option<PathBuf> {
+    if let Some(allow) = env.test_allow_path.as_deref()
+        && canonical.starts_with(allow)
+    {
+        return None;
+    }
+    if canonical.starts_with(MEDIA_ROOT) {
+        return None;
+    }
+    // `/` is an ancestor of every root and every path is inside it, so
+    // only sharing `/` itself is what the entry can mean.
+    if canonical == Path::new("/") {
+        return Some(PathBuf::from("/"));
+    }
+    DENIED_ROOTS
+        .iter()
+        .map(PathBuf::from)
+        .chain([
+            env.home.clone(),
+            env.runtime_dir.clone(),
+            env.data_home.join("bubbler"),
+        ])
+        .find(|root| canonical.starts_with(root) || root.starts_with(canonical))
+}
+
+/// Whether two paths are the same or one contains the other, compared
+/// component-wise so `/kioxiaa` is not inside `/kioxia`.
+fn nested(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+
+/// Every `path-share` as (written destination, canonical source, mode),
+/// with the reserved roots and the overlap rule applied. bwrap applies
+/// binds in the order given, so two shares that nest would either fail
+/// (a read-only parent bound first) or silently hide one another; both
+/// break the promise that file order does not matter, so they are an
+/// error before any of them is emitted.
+fn path_shares<'a>(
+    services: &'a [Service],
+    env: &Env,
+    host: &dyn Host,
+) -> Result<Vec<(&'a Path, PathBuf, ShareMode)>, LaunchError> {
+    let mut shares: Vec<(&Path, PathBuf, ShareMode)> = Vec::new();
+    for s in services {
+        let Service::PathShare { path, mode } = s else {
+            continue;
+        };
+        let src = resolve_source(host, "path-share", path)?;
+        if let Some(root) = denied_root(&src, env) {
+            let target = if src == root {
+                format!("{}", root.display())
+            } else {
+                format!("{}, which overlaps {}", src.display(), root.display())
+            };
+            return Err(LaunchError::BadValue {
+                service: "path-share",
+                reason: if src == *path {
+                    format!("bubbler never shares {target}")
+                } else {
+                    format!(
+                        "{} resolves to {target}, which bubbler never shares",
+                        path.display()
+                    )
+                },
+            });
+        }
+        shares.push((path.as_path(), src, *mode));
+    }
+    for (i, (a_dst, a_src, _)) in shares.iter().enumerate() {
+        for (b_dst, b_src, _) in &shares[i + 1..] {
+            if !nested(a_dst, b_dst) && !nested(a_src, b_src) {
+                continue;
+            }
+            let where_ = if nested(a_dst, b_dst) {
+                String::new()
+            } else {
+                format!(
+                    " (they resolve to {} and {})",
+                    a_src.display(),
+                    b_src.display()
+                )
+            };
+            return Err(LaunchError::BadValue {
+                service: "path-share",
+                reason: format!(
+                    "{} and {} overlap{where_}; one share cannot contain another",
+                    a_dst.display(),
+                    b_dst.display()
+                ),
+            });
+        }
+    }
+    Ok(shares)
 }
 
 /// Bind `$HOME/<path>` to `/home/bubbler/<path>`. The host path must exist,
@@ -371,7 +509,7 @@ fn home_share(
         host,
         "home-share",
         &env.home,
-        env.home.join(rel),
+        &env.home.join(rel),
         "the home directory",
     )?;
     let dst = Path::new(SANDBOX_HOME).join(rel);
@@ -389,7 +527,7 @@ fn home_share(
 fn etc_share(args: &mut BwrapArgs, host: &dyn Host, name: &OsStr) -> Result<(), LaunchError> {
     let etc = Path::new("/etc");
     let dst = etc.join(name);
-    let src = confine(host, "etc-share", etc, dst.clone(), "/etc")?;
+    let src = confine(host, "etc-share", etc, &dst, "/etc")?;
     args.ro_bind(&src, &dst);
     Ok(())
 }
@@ -424,6 +562,7 @@ mod tests {
             dbus_address: None,
             dbus_log: false,
             seccomp_log: false,
+            test_allow_path: None,
             proxy_override: None,
         }
     }
@@ -910,6 +1049,193 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    fn share(path: &str, mode: ShareMode) -> Service {
+        Service::PathShare {
+            path: path.into(),
+            mode,
+        }
+    }
+
+    #[test]
+    fn path_share_refuses_every_reserved_root() {
+        let mut e = env();
+        // Off the home so the ancestors of the instance directory are
+        // denied by that root alone, not by `/home`.
+        e.data_home = "/kioxia/xdg".into();
+        let cases: &[(&str, &str)] = &[
+            ("/", "/"),
+            ("/proc", "/proc"),
+            ("/proc/1", "/proc"),
+            ("/sys", "/sys"),
+            ("/sys/class", "/sys"),
+            ("/dev", "/dev"),
+            ("/dev/dri", "/dev"),
+            ("/etc", "/etc"),
+            ("/etc/ssl", "/etc"),
+            ("/usr", "/usr"),
+            ("/usr/share", "/usr"),
+            ("/opt", "/opt"),
+            ("/opt/thing", "/opt"),
+            ("/home", "/home"),
+            ("/home/other", "/home"),
+            ("/home/han", "/home"),
+            ("/home/han/Downloads", "/home"),
+            ("/tmp", "/tmp"),
+            ("/tmp/x", "/tmp"),
+            ("/var", "/var"),
+            ("/var/lib", "/var"),
+            ("/run", "/run"),
+            ("/run/user", "/run"),
+            ("/run/user/1000", "/run"),
+            ("/run/user/1000/bus", "/run"),
+            ("/kioxia", "/kioxia/xdg/bubbler"),
+            ("/kioxia/xdg", "/kioxia/xdg/bubbler"),
+            ("/kioxia/xdg/bubbler", "/kioxia/xdg/bubbler"),
+            ("/kioxia/xdg/bubbler/instances/t", "/kioxia/xdg/bubbler"),
+        ];
+        for (path, root) in cases {
+            let r = argv(&[share(path, ShareMode::ReadOnly)], &e, &[(path, Dir)]);
+            assert!(
+                matches!(&r, Err(LaunchError::BadValue { service: "path-share", reason })
+                    if reason.contains(root)),
+                "{path} should be refused naming {root}, got {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_share_allows_mountpoints_and_removable_media() {
+        for path in [
+            "/kioxia/Steam",
+            "/kioxia",
+            "/mnt/x",
+            "/media/x",
+            "/srv/x",
+            "/run/media",
+            "/run/media/han/usb",
+        ] {
+            let a = argv(&[share(path, ShareMode::ReadOnly)], &env(), &[(path, Dir)])
+                .unwrap_or_else(|e| panic!("{path} should be allowed, got {e:?}"));
+            assert!(has_seq(&a, &["--ro-bind", path, path]), "{path}: {a:?}");
+        }
+    }
+
+    #[test]
+    fn path_share_binds_the_canonical_source_at_the_written_path() {
+        let a = argv_linked(
+            &[share("/kioxia/Steam", ShareMode::ReadWrite)],
+            &env(),
+            &[("/kioxia/Steam", Dir), ("/mnt/big/steam", Dir)],
+            &[("/kioxia/Steam", "/mnt/big/steam")],
+        )
+        .unwrap();
+        assert!(has_seq(&a, &["--bind", "/mnt/big/steam", "/kioxia/Steam"]));
+    }
+
+    #[test]
+    fn path_share_through_a_symlink_into_a_reserved_root_is_refused() {
+        let r = argv_linked(
+            &[share("/kioxia/link", ShareMode::ReadOnly)],
+            &env(),
+            &[("/kioxia/link", Dir), ("/etc", Dir)],
+            &[("/kioxia/link", "/etc")],
+        );
+        assert!(
+            matches!(&r, Err(LaunchError::BadValue { service: "path-share", reason })
+                if reason.contains("/etc")),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn path_share_missing_source_fails() {
+        assert!(matches!(
+            argv(&[share("/kioxia/Steam", ShareMode::ReadOnly)], &env(), &[]),
+            Err(LaunchError::MissingResource {
+                service: "path-share",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn path_share_accepts_a_regular_file() {
+        let a = argv(
+            &[share("/kioxia/notes.txt", ShareMode::ReadOnly)],
+            &env(),
+            &[("/kioxia/notes.txt", File)],
+        )
+        .unwrap();
+        assert!(has_seq(
+            &a,
+            &["--ro-bind", "/kioxia/notes.txt", "/kioxia/notes.txt"]
+        ));
+    }
+
+    #[test]
+    fn path_share_test_hook_allows_exactly_one_extra_root() {
+        let mut e = env();
+        e.test_allow_path = Some("/tmp/bubbler-test".into());
+        for path in ["/tmp/bubbler-test", "/tmp/bubbler-test/data"] {
+            let a = argv(&[share(path, ShareMode::ReadWrite)], &e, &[(path, Dir)])
+                .unwrap_or_else(|err| panic!("{path} should be allowed, got {err:?}"));
+            assert!(has_seq(&a, &["--bind", path, path]), "{path}: {a:?}");
+        }
+        for path in ["/tmp/other", "/tmp", "/etc"] {
+            let r = argv(&[share(path, ShareMode::ReadOnly)], &e, &[(path, Dir)]);
+            assert!(
+                matches!(&r, Err(LaunchError::BadValue { .. })),
+                "{path}: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_share_overlapping_shares_are_refused() {
+        let both = |a: &str, b: &str| {
+            argv(
+                &[
+                    share(a, ShareMode::ReadOnly),
+                    share(b, ShareMode::ReadWrite),
+                ],
+                &env(),
+                &[(a, Dir), (b, Dir)],
+            )
+        };
+        for (a, b) in [
+            ("/kioxia/Steam", "/kioxia/Steam"),
+            ("/kioxia", "/kioxia/Steam"),
+            ("/kioxia/Steam", "/kioxia"),
+        ] {
+            let r = both(a, b);
+            assert!(
+                matches!(&r, Err(LaunchError::BadValue { service: "path-share", reason })
+                    if reason.contains(a) && reason.contains(b)),
+                "{a} and {b}: {r:?}"
+            );
+        }
+        assert!(both("/kioxia/a", "/kioxia/b").is_ok());
+        assert!(both("/kioxia/a", "/kioxiaa").is_ok());
+    }
+
+    #[test]
+    fn path_share_overlap_is_checked_on_the_resolved_source_too() {
+        let r = argv_linked(
+            &[
+                share("/mnt/link", ShareMode::ReadOnly),
+                share("/kioxia/Steam", ShareMode::ReadOnly),
+            ],
+            &env(),
+            &[("/mnt/link", Dir), ("/kioxia/Steam", Dir)],
+            &[("/mnt/link", "/kioxia/Steam")],
+        );
+        assert!(
+            matches!(&r, Err(LaunchError::BadValue { service: "path-share", reason })
+                if reason.contains("/mnt/link") && reason.contains("/kioxia/Steam")),
+            "{r:?}"
+        );
     }
 
     #[test]
