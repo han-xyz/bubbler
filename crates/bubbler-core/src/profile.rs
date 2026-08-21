@@ -20,6 +20,12 @@ use crate::tty::TtyMode;
 /// Names of all built-in profiles, sorted.
 pub const NAMES: &[&str] = &["alacritty", "firefox", "generic"];
 
+/// First line of a seeded `config.kdl`, and of a profile `profile edit`
+/// writes, followed by the profile name. It is what `reseed` reads back
+/// to know which profile to flatten again, so the three places that write
+/// it must write the same bytes.
+pub(crate) const PROFILE_HEADER: &str = "// bubbler profile: ";
+
 /// Where the system profile layer lives unless `$BUBBLER_PROFILE_DIR`
 /// names another directory.
 pub const SYSTEM_DIR: &str = "/usr/share/bubbler/profiles";
@@ -377,7 +383,7 @@ fn starter(name: &str, below: bool) -> String {
     } else {
         TEMPLATE.to_owned()
     };
-    format!("// bubbler profile: {name} (user layer)\n{body}")
+    format!("{PROFILE_HEADER}{name} (user layer)\n{body}")
 }
 
 /// The flattened profile as `bubbler profile show` prints it: the header
@@ -386,7 +392,7 @@ fn starter(name: &str, below: bool) -> String {
 /// one layer share the comment. Lines are `OsString` because a profile
 /// path need not be UTF-8.
 pub fn show(name: &str, resolved: &Resolved) -> Vec<OsString> {
-    let mut out = vec![OsString::from(format!("// bubbler profile: {name}"))];
+    let mut out = vec![OsString::from(format!("{PROFILE_HEADER}{name}"))];
     let mut last: Option<&NodeOrigin> = None;
     for node in &resolved.origins {
         if last.is_none_or(|p| (p.origin, &p.path) != (node.origin, &node.path)) {

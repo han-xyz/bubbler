@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::Mode;
@@ -13,15 +14,16 @@ use crate::config::{self, InstanceConfig, Service};
 use crate::env::Env;
 use crate::error::InstanceError;
 use crate::kdl_out;
-use crate::profile;
+use crate::profile::{self, PROFILE_HEADER};
 
 const CONFIG_FILE: &str = "config.kdl";
 
 /// Where `reseed` keeps the `config.kdl` it replaces.
 const BACKUP_FILE: &str = "config.kdl.bak";
 
-/// First line of a seeded `config.kdl`, followed by the profile name.
-const HEADER: &str = "// bubbler profile: ";
+/// Where `reseed` builds the new `config.kdl` before it takes the old
+/// one's place.
+const TEMP_FILE: &str = "config.kdl.new";
 
 /// Service names [`Instance::ephemeral`] accepts as grants: the bare
 /// config nodes, which take no arguments. Anything else needs a config
@@ -36,6 +38,8 @@ pub const GRANTS: &[&str] = &[
     "dbus",
     "portals",
     "notify",
+    "tray",
+    "gamepad",
 ];
 
 /// Directory holding all instances.
@@ -115,6 +119,32 @@ fn io_err(path: &Path) -> impl FnOnce(io::Error) -> InstanceError + '_ {
     move |e| InstanceError::Io(path.to_path_buf(), e)
 }
 
+/// Put `text` at `path` in one step: it is written to a sibling file and
+/// renamed over `path`, and `rename(2)` within one directory replaces the
+/// name atomically. A reader therefore sees either the whole old config
+/// or the whole new one, never the half-written file a crashed or failing
+/// write would leave under a name bubbler treats as a complete config.
+fn write_atomic(path: &Path, text: &str) -> Result<(), InstanceError> {
+    // Same directory as `path`, which is what makes the rename atomic
+    // rather than a copy across filesystems.
+    let tmp = path.with_file_name(TEMP_FILE);
+    let written = (|| -> io::Result<()> {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        // The rename only orders the *name* change; without this the
+        // contents may still be unwritten when it happens, so a crash
+        // could leave the new name over an empty file.
+        f.sync_all()
+    })();
+    if let Err(e) = written {
+        // Cleanup on the way out: the error being reported is the write's,
+        // and a leftover temporary file is not part of any sandbox.
+        let _ = fs::remove_file(&tmp);
+        return Err(InstanceError::Io(tmp, e));
+    }
+    fs::rename(&tmp, path).map_err(io_err(path))
+}
+
 /// Lay out an instance directory: `dir` itself (never overwriting one),
 /// a private `home/` and `config.kdl` holding `text`. `name` only names
 /// the instance in the "already exists" error.
@@ -144,6 +174,8 @@ fn grant_service(name: &str) -> Option<Service> {
         "dbus" => Service::Dbus { rules: Vec::new() },
         "portals" => Service::Portals,
         "notify" => Service::Notify,
+        "tray" => Service::Tray,
+        "gamepad" => Service::Gamepad,
         _ => return None,
     })
 }
@@ -201,7 +233,7 @@ fn seed(
     };
     // The name passed the profile name grammar to resolve at all, so it
     // holds no newline that could end the header comment early.
-    let text = format!("{HEADER}{profile_name}\n{body}");
+    let text = format!("{PROFILE_HEADER}{profile_name}\n{body}");
     let config = config::parse(&text)?;
     Ok((text, config))
 }
@@ -210,7 +242,11 @@ fn seed(
 /// [`seed`] writes and what follows it is a profile name. A hand-written
 /// config without it names no profile to re-flatten.
 fn profile_header(text: &str) -> Option<&str> {
-    let name = text.lines().next()?.strip_prefix(HEADER)?.trim_end();
+    let name = text
+        .lines()
+        .next()?
+        .strip_prefix(PROFILE_HEADER)?
+        .trim_end();
     is_plain_name(name).then_some(name)
 }
 
@@ -466,7 +502,7 @@ impl Instance {
         let dir = instances_root(env).join(name);
         let backup = dir.join(BACKUP_FILE);
         fs::copy(&cfg_path, &backup).map_err(io_err(&backup))?;
-        fs::write(&cfg_path, &fresh).map_err(io_err(&cfg_path))?;
+        write_atomic(&cfg_path, &fresh)?;
         Ok(Self {
             name: name.to_owned(),
             dir,
@@ -715,12 +751,19 @@ mod tests {
         assert!(services.contains(&Service::Network));
         assert_eq!(services.iter().filter(|s| **s == Service::Dri).count(), 1);
         drop(eph);
-        // `portals` without `dbus` is rejected by the parser as usual, and
-        // nothing is created for a config that cannot run.
-        assert!(matches!(
-            Instance::ephemeral(&env, "generic", &["portals"]),
-            Err(InstanceError::Config(_))
-        ));
+        let eph = Instance::ephemeral(&env, "generic", &["gamepad", "dbus", "tray"]).unwrap();
+        let services = &eph.instance.config.services;
+        assert!(services.contains(&Service::Gamepad));
+        assert!(services.contains(&Service::Tray));
+        drop(eph);
+        // A bundle grant without `dbus` is rejected by the parser as
+        // usual, and nothing is created for a config that cannot run.
+        for grant in ["portals", "tray"] {
+            assert!(matches!(
+                Instance::ephemeral(&env, "generic", &[grant]),
+                Err(InstanceError::Config(_))
+            ));
+        }
         assert!(!try_root(&env).exists() || try_root(&env).read_dir().unwrap().next().is_none());
     }
 
@@ -881,6 +924,16 @@ mod tests {
                 .unwrap()
                 .contains("network")
         );
+
+        // The new config is renamed into place from a sibling file, which
+        // must not still be there afterwards: a `config.kdl.new` left in
+        // the instance directory is a config bubbler would never read.
+        let mut left: Vec<_> = fs::read_dir(&after.dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        left.sort();
+        assert_eq!(left, [CONFIG_FILE, BACKUP_FILE, "home"]);
     }
 
     #[test]

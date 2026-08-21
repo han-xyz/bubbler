@@ -264,6 +264,23 @@ fn profile_show_flattens_and_names_the_layer_each_node_came_from() {
 fn profile_edit_seeds_the_user_layer_and_rechecks_it() {
     let tmp = setup();
     let path = tmp.path().join("config/bubbler/profiles/firefox.kdl");
+
+    // No editor to run means no starting point written: the editor is
+    // resolved first, so a host with neither variable set is left exactly
+    // as it was rather than holding a profile nobody asked to create.
+    let out = bubbler(tmp.path())
+        .args(["profile", "edit", "firefox"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("EDITOR"), "{err}");
+    assert!(!path.exists(), "{err}");
+    assert!(
+        !tmp.path().join("config/bubbler/profiles").exists(),
+        "{err}"
+    );
+
     let out = bubbler(tmp.path())
         .env("EDITOR", "/usr/bin/true")
         .args(["profile", "edit", "firefox"])
@@ -299,6 +316,21 @@ fn profile_edit_seeds_the_user_layer_and_rechecks_it() {
         "{mine}"
     );
     assert!(!mine.contains("include"), "{mine}");
+
+    // A blank editor is also caught before the file is written.
+    let out = bubbler(tmp.path())
+        .env("EDITOR", "   ")
+        .args(["profile", "edit", "never"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("blank"), "{err}");
+    assert!(
+        !tmp.path()
+            .join("config/bubbler/profiles/never.kdl")
+            .exists()
+    );
 
     // A broken profile is reported and kept, exactly as `edit` does.
     let bad = tmp.path().join("bad-editor");
@@ -1864,17 +1896,23 @@ fn try_rejects_bad_grants_and_cleans_up_a_failed_start() {
         "dbus",
         "portals",
         "notify",
+        "tray",
+        "gamepad",
     ] {
         assert!(err.contains(grant), "{grant} missing from {err}");
     }
 
-    let out = bubbler(tmp.path())
-        .args(["try", "--grant", "portals", "--", "/usr/bin/true"])
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(1));
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("requires dbus"), "{err}");
+    // A bundle grant is refused by the same parse check whether it comes
+    // from a config file or from `--grant`.
+    for grant in ["portals", "tray"] {
+        let out = bubbler(tmp.path())
+            .args(["try", "--grant", grant, "--", "/usr/bin/true"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("requires dbus"), "{grant}: {err}");
+    }
 
     // No command anywhere: the failure happens after the directory exists,
     // so it also shows the guard cleaning up.

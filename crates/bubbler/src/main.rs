@@ -173,21 +173,30 @@ fn print_lines(lines: &[&OsStr], what: &str) -> Result<i32> {
     }
 }
 
-/// Open `path` in `$VISUAL`, else `$EDITOR`, and wait. `Some(code)` is a
-/// non-zero editor exit to propagate as bubbler's own.
-fn run_editor(path: &Path) -> Result<Option<i32>> {
+/// Program and arguments from `$VISUAL`, else `$EDITOR`. The value is
+/// split into argv and never passed to a shell, so quotes and `$VAR` in
+/// it are not expanded. Resolved before anything is opened or written:
+/// `profile edit` creates the file it is about to edit, and a host with
+/// no editor set must be told so rather than left with a new profile.
+fn editor_argv() -> Result<(OsString, Vec<OsString>)> {
     let editor = host_env::editor().context("neither VISUAL nor EDITOR is set")?;
-    // $VISUAL/$EDITOR is split into argv, never passed to a shell.
     let mut parts = editor
         .as_bytes()
         .split(u8::is_ascii_whitespace)
-        .filter(|p| !p.is_empty());
+        .filter(|p| !p.is_empty())
+        .map(|p| OsStr::from_bytes(p).to_owned());
     let program = parts.next().context("VISUAL or EDITOR is blank")?;
-    let status = Command::new(OsStr::from_bytes(program))
-        .args(parts.map(OsStr::from_bytes))
+    Ok((program, parts.collect()))
+}
+
+/// Open `path` in the editor [`editor_argv`] resolved and wait.
+/// `Some(code)` is a non-zero editor exit to propagate as bubbler's own.
+fn run_editor(program: &OsStr, args: &[OsString], path: &Path) -> Result<Option<i32>> {
+    let status = Command::new(program)
+        .args(args)
         .arg(path)
         .status()
-        .with_context(|| format!("running editor {}", String::from_utf8_lossy(program)))?;
+        .with_context(|| format!("running editor {}", program.to_string_lossy()))?;
     Ok((!status.success()).then(|| launcher::exit_code(status)))
 }
 
@@ -351,9 +360,10 @@ fn real_main() -> Result<i32> {
             Ok(0)
         }
         Cmd::Edit { name } => {
+            let (program, args) = editor_argv()?;
             let path = instance::config_path_checked(&env, &name)
                 .with_context(|| format!("opening instance `{name}`"))?;
-            if let Some(code) = run_editor(&path)? {
+            if let Some(code) = run_editor(&program, &args, &path)? {
                 return Ok(code);
             }
             Ok(recheck(&path, Instance::open(&env, &name)))
@@ -368,11 +378,15 @@ fn real_main() -> Result<i32> {
                 print_lines(&lines, "the profile")
             }
             ProfileCmd::Edit { name } => {
+                // Before `edit_path`, which writes a starting point for a
+                // profile the user layer does not hold yet: an editor that
+                // cannot be resolved must leave nothing behind.
+                let (program, args) = editor_argv()?;
                 let profiles = profile::Resolver::new(&env);
                 let path = profiles
                     .edit_path(&name)
                     .with_context(|| format!("opening profile `{name}`"))?;
-                if let Some(code) = run_editor(&path)? {
+                if let Some(code) = run_editor(&program, &args, &path)? {
                     return Ok(code);
                 }
                 Ok(recheck(&path, profiles.resolve(&name)))

@@ -60,8 +60,10 @@ inside it.
 `try` runs one command in a sandbox without creating an instance. Its config is
 the flattened profile (`generic` unless `--profile` says otherwise) plus one
 bare node per `--grant`; the grants are `wayland`, `x11`, `network`, `dri`,
-`pipewire`, `pulseaudio`, `dbus`, `portals` and `notify`, and anything with
-arguments needs a real instance. The sandbox lives in
+`pipewire`, `pulseaudio`, `dbus`, `portals`, `notify`, `tray` and `gamepad`,
+and anything with arguments needs a real instance. The bundles are checked as
+they are in a config file, so `--grant tray` without `--grant dbus` is refused
+rather than silently dropped. The sandbox lives in
 `$XDG_DATA_HOME/bubbler/try/<pid>/`, never appears in `list`, and is removed
 when the command exits whatever its status; `--keep <name>` renames it into an
 instance instead, refusing a name that is taken. Directories left behind by a
@@ -290,15 +292,20 @@ changes an instance that was already seeded from it.
     bubbler profile edit firefox   # your copy of it, in $VISUAL or $EDITOR
     bubbler reseed ff              # re-flatten ff's profile into its config
 
-`profile show` prints the profile exactly as `create` would seed it, each run
-of nodes under a `// from:` comment naming the file it came from, or
-`built-in` for one compiled in:
+`profile show` prints the nodes `create` would seed, each run of them under a
+`// from:` comment naming the file it came from, or `built-in` for one
+compiled in:
 
     // bubbler profile: app
     // from: /usr/share/bubbler/profiles/base.kdl
     wayland
     // from: /home/you/.config/bubbler/profiles/app.kdl
     network
+
+It shows the flattening, not the file, so the comments a profile is written
+with are not in it: a profile that grants nothing — `generic` — is its header
+and nothing else, where `create` seeds the instance with commented examples
+to start from.
 
 `profile edit` opens `$XDG_CONFIG_HOME/bubbler/profiles/<name>.kdl`, creating
 the directory if it is missing, under the same editor rules as `edit`. A name
@@ -311,9 +318,14 @@ way.
 
 `reseed` re-flattens the profile named in the first line of an instance's
 `config.kdl` and writes it back, keeping the private `home/` — it is how an
-existing instance picks up a profile you have since edited. The file it
-replaces is kept beside it as `config.kdl.bak`, overwriting an older backup,
-so a reseed that dropped an edit of yours can be undone. A config without the
+existing instance picks up a profile you have since edited. It replaces the
+whole config rather than merging into it: grants you added by hand, and the
+ones `try --keep --grant` wrote in, are dropped, because the profile is the
+only thing being flattened. The file it replaces is kept beside it as
+`config.kdl.bak`, overwriting an older backup, so a reseed that dropped an
+edit of yours can be undone. The new config is written to a sibling file and
+renamed over the old one, so an interrupted reseed leaves the config it
+started from rather than half of a new one. A config without the
 `// bubbler profile: <name>` header names no profile to reseed from, and that
 is an error. It refuses while the instance is running: that sandbox was built
 from the file as it stands, bwrap cannot be told about a bind after the fact,
