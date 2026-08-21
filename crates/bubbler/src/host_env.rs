@@ -96,10 +96,10 @@ pub fn from_process() -> Result<Env> {
 }
 
 /// `$BUBBLER_TEST_ALLOW_PATH`: the one extra root `path-share` accepts,
-/// for tests and debugging. It must be absolute and name a directory
-/// below the root, and is resolved here so it compares against the
-/// canonical source of a share; a path that does not exist is kept as
-/// written and therefore matches nothing.
+/// at both ends of a share, for tests and debugging. It must be absolute
+/// and not `/`, and is resolved here so it compares against the canonical
+/// source; a path that does not exist is kept as written and therefore
+/// matches nothing.
 fn test_allow_path() -> Result<Option<PathBuf>> {
     let Some(value) = env::var_os("BUBBLER_TEST_ALLOW_PATH").filter(|v| !v.is_empty()) else {
         return Ok(None);

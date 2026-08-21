@@ -421,25 +421,23 @@ enum End {
 }
 
 /// The roots the environment names, each in resolved form as well: with a
-/// symlinked `$HOME` or `$XDG_DATA_HOME` only the resolved form matches
-/// the canonical source of a share, and only the written form matches its
-/// destination. A root that does not resolve is kept as written.
+/// symlink anywhere on the way to one of them, only the resolved form
+/// matches the canonical source of a share, and only the written form
+/// matches its destination. The instance store is resolved on its own as
+/// well as under a resolved `$XDG_DATA_HOME`, since either link alone
+/// moves it. A root that does not resolve is kept as written.
 fn env_roots(host: &dyn Host, env: &Env) -> Vec<PathBuf> {
     let data_home = host
         .canonicalize(&env.data_home)
         .unwrap_or_else(|| env.data_home.clone());
-    let mut roots = vec![
+    let named = [
         env.home.clone(),
         env.runtime_dir.clone(),
         env.data_home.join("bubbler"),
         data_home.join("bubbler"),
     ];
-    for named in [&env.home, &env.runtime_dir] {
-        if let Some(real) = host.canonicalize(named) {
-            roots.push(real);
-        }
-    }
-    roots
+    let resolved: Vec<PathBuf> = named.iter().filter_map(|p| host.canonicalize(p)).collect();
+    named.into_iter().chain(resolved).collect()
 }
 
 /// The reserved root a share meets, at either end: the path is that root,
@@ -453,6 +451,11 @@ fn denied_root(
     canonical: &Path,
     written: &Path,
 ) -> Option<(PathBuf, End)> {
+    // Sharing the root itself is refused before anything else, so that
+    // the message names `/` rather than whichever root lies under it.
+    if canonical == Path::new("/") || written == Path::new("/") {
+        return Some((PathBuf::from("/"), End::Source));
+    }
     let roots = env_roots(host, env);
     for (path, end) in [(canonical, End::Source), (written, End::Destination)] {
         if let Some(root) = roots.iter().find(|root| nested(path, root)) {
@@ -479,7 +482,8 @@ fn fixed_root(path: &Path, env: &Env) -> Option<PathBuf> {
         return None;
     }
     // `/` is an ancestor of every root and every path is inside it, so
-    // only sharing `/` itself is what the entry can mean.
+    // only sharing `/` itself is what the entry can mean. `denied_root`
+    // already refused it; the check stays so this function stands alone.
     if path == Path::new("/") {
         return Some(PathBuf::from("/"));
     }
@@ -1143,9 +1147,11 @@ mod tests {
     #[test]
     fn path_share_refuses_every_reserved_root() {
         let mut e = env();
-        // Off the home so the ancestors of the instance directory are
-        // denied by that root alone, not by `/home`.
+        // Off the home so the ancestors of the instance store are denied
+        // by that root alone, not by `/home`.
         e.data_home = "/kioxia/xdg".into();
+        // Each row is (share, the root that must stop it): a fixed root, or
+        // the more specific one the environment names where there is one.
         let cases: &[(&str, &str)] = &[
             ("/", "/"),
             ("/proc", "/proc"),
@@ -1160,29 +1166,51 @@ mod tests {
             ("/usr/share", "/usr"),
             ("/opt", "/opt"),
             ("/opt/thing", "/opt"),
-            ("/home", "/home"),
+            ("/home", "/home/han"),
             ("/home/other", "/home"),
-            ("/home/han", "/home"),
-            ("/home/han/Downloads", "/home"),
+            ("/home/han", "/home/han"),
+            ("/home/han/Downloads", "/home/han"),
             ("/tmp", "/tmp"),
             ("/tmp/x", "/tmp"),
             ("/var", "/var"),
             ("/var/lib", "/var"),
-            ("/run", "/run"),
-            ("/run/user", "/run"),
-            ("/run/user/1000", "/run"),
-            ("/run/user/1000/bus", "/run"),
+            ("/run", "/run/user/1000"),
+            ("/run/user", "/run/user/1000"),
+            ("/run/user/1000", "/run/user/1000"),
+            ("/run/user/1000/bus", "/run/user/1000"),
             ("/kioxia", "/kioxia/xdg/bubbler"),
             ("/kioxia/xdg", "/kioxia/xdg/bubbler"),
             ("/kioxia/xdg/bubbler", "/kioxia/xdg/bubbler"),
             ("/kioxia/xdg/bubbler/instances/t", "/kioxia/xdg/bubbler"),
         ];
         for (path, root) in cases {
+            let want = if path == root {
+                format!("bubbler never shares {root}")
+            } else {
+                format!("bubbler never shares {path}, which overlaps {root}")
+            };
             let r = argv(&[share(path, ShareMode::ReadOnly)], &e, &[(path, Dir)]);
             assert!(
                 matches!(&r, Err(LaunchError::BadValue { service: "path-share", reason })
-                    if reason.contains(root)),
-                "{path} should be refused naming {root}, got {r:?}"
+                    if *reason == want),
+                "{path} should be refused with `{want}`, got {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_share_resolves_the_instance_store_itself() {
+        for path in ["/kioxia", "/kioxia/bubbler", "/kioxia/bubbler/instances"] {
+            let r = argv_linked(
+                &[share(path, ShareMode::ReadWrite)],
+                &env(),
+                &[(path, Dir)],
+                &[("/home/han/.local/share/bubbler", "/kioxia/bubbler")],
+            );
+            assert!(
+                matches!(&r, Err(LaunchError::BadValue { service: "path-share", reason })
+                    if reason.contains("/kioxia/bubbler")),
+                "{path}: {r:?}"
             );
         }
     }

@@ -161,11 +161,13 @@ when what you wrote is a symlink. Those paths are `/`, `/proc`, `/sys`, `/dev`,
 them, being inside one, or containing one is refused, and the error names the
 root that stopped it. So a share of `/kioxia` is refused if `$XDG_DATA_HOME` is
 on that disk: a sandbox that can write another instance's `config.kdl` grants
-itself anything on the next run. The three roots your environment names are
-compared resolved as well as as written, so a symlinked home or data directory
-cannot be shared under its real name either. `/etc` and your home have typed
-grants of their own (`etc-share`, `home-share`), and the rest of that list is
-what the baseline replaces. The one carve-out is `/run/media` and everything
+itself anything on the next run. All three roots your environment names — your
+home, `$XDG_RUNTIME_DIR` and the instance store `$XDG_DATA_HOME/bubbler`, the
+store itself as well as the directory above it — are compared both as written
+and as resolved, so a symlinked home or a symlinked instance store cannot be
+shared under its real name either. `/etc` and your home have typed grants of
+their own (`etc-share`, `home-share`), and the rest of that list is what the
+baseline replaces. The one carve-out is `/run/media` and everything
 under it, where udisks mounts removable media — though not when your instances
 live there. `/mnt`, `/media`, `/srv` and top-level mountpoints of your own are
 allowed.

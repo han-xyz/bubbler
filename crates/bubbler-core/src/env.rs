@@ -58,9 +58,11 @@ pub struct Env {
     /// have denied to the audit log instead of denying it, which is how a
     /// profile's `seccomp` node is worked out. Not a sandbox at all.
     pub seccomp_log: bool,
-    /// `$BUBBLER_TEST_ALLOW_PATH`: one host directory `path-share` may
-    /// share on top of its denylist, canonical. A test and debugging
-    /// hook; nothing shipped sets it.
+    /// `$BUBBLER_TEST_ALLOW_PATH`: one extra path `path-share` accepts at
+    /// either end, on top of the fixed roots of its denylist; it never
+    /// lifts the roots named here. Absolute, not `/`, and resolved so it
+    /// compares against a canonical source. A test and debugging hook;
+    /// nothing shipped sets it.
     pub test_allow_path: Option<PathBuf>,
     /// `$BUBBLER_DBUS_PROXY`: host path of the proxy binary to run
     /// instead of the one on `PATH`. A test and debugging hook; it must
