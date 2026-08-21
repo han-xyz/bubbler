@@ -186,6 +186,11 @@ pub enum Service {
         /// devices for the whole session.
         uinput: bool,
     },
+    /// Every `/dev/hidraw*` node the host has at launch, plus
+    /// `/sys/class/hidraw`: the raw HID interfaces a security key, a
+    /// hardware wallet or a controller driven through hidapi is opened
+    /// through. `gamepad hidraw=#true` grants the same thing.
+    Hidraw,
     /// Own `org.mpris.MediaPlayer2.<name>` so media keys and player
     /// controls reach the app. Requires [`Service::Dbus`].
     Mpris {
@@ -259,7 +264,7 @@ fn parse_doc(text: &str, profile: bool) -> Result<RawProfile, ConfigError> {
         reject_types(node)?;
         match name {
             "wayland" | "x11" | "network" | "dri" | "pipewire" | "pulseaudio" | "portals"
-            | "notify" | "tray" => {
+            | "notify" | "tray" | "hidraw" => {
                 reject_entries(node)?;
                 let svc = match name {
                     "wayland" => Service::Wayland,
@@ -271,6 +276,7 @@ fn parse_doc(text: &str, profile: bool) -> Result<RawProfile, ConfigError> {
                     "portals" => Service::Portals,
                     "notify" => Service::Notify,
                     "tray" => Service::Tray,
+                    "hidraw" => Service::Hidraw,
                     // Unreachable through the arm above, and an error
                     // rather than a fallback: a name added to that list
                     // and forgotten here would otherwise grant whichever
@@ -1198,6 +1204,31 @@ mod tests {
             parse("pipewire foo=bar"),
             Err(ConfigError::UnknownProperty { .. })
         ));
+    }
+
+    #[test]
+    fn hidraw_is_a_flag_node_and_coexists_with_the_gamepad_alias() {
+        let cfg = parse("hidraw").unwrap();
+        assert_eq!(cfg.services, vec![Service::Hidraw]);
+        assert!(matches!(parse("hidraw\nhidraw"), Err(ConfigError::Duplicate(n)) if n == "hidraw"));
+        assert!(matches!(
+            parse("hidraw 1"),
+            Err(ConfigError::BadArgument { .. })
+        ));
+        // `gamepad hidraw=#true` is the older spelling of the same grant,
+        // so a config holding both is one grant written twice, not a
+        // duplicate node.
+        let cfg = parse("hidraw\ngamepad hidraw=#true").unwrap();
+        assert_eq!(
+            cfg.services,
+            vec![
+                Service::Hidraw,
+                Service::Gamepad {
+                    hidraw: true,
+                    uinput: false
+                }
+            ]
+        );
     }
 
     #[test]

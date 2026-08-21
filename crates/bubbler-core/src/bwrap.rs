@@ -102,6 +102,7 @@ pub const ETC_ALLOWLIST: &[&str] = &[
     "gtk-4.0",
     "pulse",
     "pipewire",
+    "alsa",
     "drirc",
     "vulkan",
     "glvnd",
@@ -981,6 +982,27 @@ mod tests {
         assert!(
             s.windows(3)
                 .any(|w| w == ["--setenv", "LOGNAME", "bubbler"])
+        );
+    }
+
+    #[test]
+    fn the_alsa_configuration_is_in_the_baseline_etc() {
+        // alsa-lib reads `/etc/alsa/conf.d`, never `/usr/share/alsa`
+        // directly, and pipewire-alsa's `99-pipewire-default.conf` there
+        // is what makes `default` the sound server. Without the entry an
+        // ALSA client under `pipewire` falls back to the hardware card,
+        // whose `/dev/snd` nodes no sandbox has (measured:
+        // `cannot find card '0'`).
+        let (_, d, _) = crate::host::fake::types();
+        let host = FakeHost::default().with("/etc/alsa", d);
+        let argv = BwrapArgs::baseline(&env(), Path::new("/i/home"), &host)
+            .finish(&["sh".into()], &mut Counter::new())
+            .unwrap();
+        let s = strs(&argv);
+        assert!(
+            s.windows(3)
+                .any(|w| w == ["--ro-bind", "/etc/alsa", "/etc/alsa"]),
+            "{s:?}"
         );
     }
 

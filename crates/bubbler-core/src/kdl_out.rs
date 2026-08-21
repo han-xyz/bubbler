@@ -57,6 +57,7 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
         Service::Portals => "portals".to_owned(),
         Service::Notify => "notify".to_owned(),
         Service::Tray => "tray".to_owned(),
+        Service::Hidraw => "hidraw".to_owned(),
         Service::Gamepad { hidraw, uinput } => {
             let mut node = String::from("gamepad");
             // `#false` is the default, so only a granted class is written.
@@ -311,6 +312,10 @@ mod tests {
         round_trip("gamepad");
         round_trip("gamepad hidraw=#true");
         round_trip("gamepad uinput=#true");
+        round_trip("hidraw");
+        // The bare grant and the older `gamepad` spelling of it are two
+        // nodes, and both have to survive a round trip unchanged.
+        round_trip("hidraw\ngamepad hidraw=#true");
     }
 
     #[test]

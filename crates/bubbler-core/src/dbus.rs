@@ -151,6 +151,7 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
                 | Service::Pipewire
                 | Service::Pulseaudio
                 | Service::Gamepad { .. }
+                | Service::Hidraw
                 | Service::HomeShare { .. }
                 | Service::PathShare { .. }
                 | Service::EtcShare { .. }

@@ -1,0 +1,37 @@
+// bubbler profile: spotify
+//
+// `mpris name="spotify"` is the exact name, not a prefix: the app's own
+// id is com.spotify.Client but the player name it publishes is
+// org.mpris.MediaPlayer2.spotify, which is why flathub has to name it
+// explicitly too. A `*` here would own every player on the bus.
+//
+// The tray icon is libayatana-appindicator, which registers with
+// StatusNotifierWatcher — `tray` is one rule and the item itself is
+// served on the app's own unique name, so nothing needs `own`.
+//
+// No `talk "org.freedesktop.secrets"`, which firejail's profile grants:
+// a music player's session token is adequately kept in its own config
+// file in the private home, and the rule would let it talk to whatever
+// process holds every password you have.
+//
+// `org.gnome.SettingsDaemon.MediaKeys` is GNOME's media-key grab, which
+// the client asks for by that name; on any other desktop nothing owns it
+// and the rule is inert. `org.freedesktop.ScreenSaver` is CEF's
+// power-save blocker, which also tries `org.freedesktop.PowerManagement`
+// — both names are in /opt/spotify/libcef.so, so add the second if the
+// screen blanks during playback.
+//
+// No `portals`: Spotify has no file chooser to speak of. Add it, with
+// `home-share "Music"`, if you use local files.
+wayland
+dri
+pipewire
+network
+dbus {
+    talk "org.freedesktop.ScreenSaver"
+    talk "org.gnome.SettingsDaemon.MediaKeys"
+}
+notify
+tray
+mpris name="spotify"
+command "spotify"

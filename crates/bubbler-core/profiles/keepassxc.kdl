@@ -1,0 +1,41 @@
+// bubbler profile: keepassxc
+//
+// No `network`: KeePassXC needs none to open a database. firejail's
+// profile agrees and goes further with `net none`. The flathub manifest
+// grants `--share=network` for favicon download alone; add `network`
+// yourself if you use that feature, and understand that it is your
+// password database's process reaching the internet.
+//
+// No `own "org.freedesktop.secrets"`. That rule, added to the `dbus`
+// block below, makes this sandbox the Secret Service for the whole
+// session: every application that stores a password through libsecret
+// stores it here. It is an outward grant rather than a confinement (see
+// the README), and first owner wins, so a host keyring already holding
+// the name only makes the request fail. Add it if you mean to replace
+// that keyring:
+//     own "org.freedesktop.secrets"
+//
+// No `hidraw`, and it would not help: KeePassXC reaches a YubiKey
+// through libusb (/dev/bus/usb plus /sys/bus/usb) and a smart card
+// through pcsclite — the binary links both libraries and holds no
+// hidraw string at all. bubbler has no raw-USB grant yet, so
+// challenge-response unlocking does not work from this sandbox; see
+// "Known gaps".
+//
+// Browser integration does not work from here yet: the proxy socket is
+// inside the sandbox and the browser is outside it. See "Known gaps".
+//
+// The database lives in the private home unless you share the directory
+// holding it; `home-share "Documents" mode=rw` is a starting point, and
+// a database on another disk is named explicitly, e.g.
+//     path-share "/kioxia/keepass" mode=rw
+wayland
+dbus {
+    own "org.keepassxc.KeePassXC.*"
+    talk "org.freedesktop.ScreenSaver"
+}
+portals
+notify
+tray
+home-share "Documents" mode=rw
+command "keepassxc"

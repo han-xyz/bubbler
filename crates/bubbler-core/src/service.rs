@@ -65,16 +65,36 @@ pub fn apply_all(
             // follows the PCI roots `dri` binds under it rather than
             // depending on the order of the two nodes in the file.
             Service::Gamepad { .. } => {}
+            // Bound after the loop with `gamepad hidraw=#true`, which is
+            // the same grant written the older way: one bind, whether the
+            // config holds one node or both.
+            Service::Hidraw => {}
             // Rule-only bundles: they reach the sandbox through the proxy
             // the launcher starts, not through bwrap arguments.
             Service::Notify | Service::Tray | Service::Mpris { .. } => {}
         }
     }
-    if let Some(Service::Gamepad { hidraw, uinput }) = services
-        .iter()
-        .find(|s| matches!(s, Service::Gamepad { .. }))
-    {
-        gamepad(args, host, *hidraw, *uinput)?;
+    let pad = services.iter().find_map(|s| match s {
+        Service::Gamepad { hidraw, uinput } => Some((*hidraw, *uinput)),
+        _ => None,
+    });
+    // One grant however it is written, and the name is the node an error
+    // points at: the bare one when the config holds both.
+    let hidraw_node = match (
+        services.contains(&Service::Hidraw),
+        pad.is_some_and(|(h, _)| h),
+    ) {
+        (true, _) => Some("hidraw"),
+        (false, true) => Some("gamepad"),
+        (false, false) => None,
+    };
+    match pad {
+        Some((_, uinput)) => gamepad(args, host, hidraw_node, uinput)?,
+        None => {
+            if let Some(node) = hidraw_node {
+                hidraw(args, host, node)?;
+            }
+        }
     }
     for (dst, src, mode) in shares {
         match mode {
@@ -334,11 +354,12 @@ fn dri(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
 /// Game controllers: `/dev/input` with device access, plus the `/sys`
 /// entries that identify a device and the udev database where the host
 /// has one. `/dev/input` is every input device, keyboards included.
-/// `hidraw` and `uinput` add the device classes those properties name.
+/// `hidraw` names the node the raw HID devices were granted by, when they
+/// were; `uinput` adds the injection node.
 fn gamepad(
     args: &mut BwrapArgs,
     host: &dyn Host,
-    hidraw: bool,
+    hidraw: Option<&'static str>,
     uinput: bool,
 ) -> Result<(), LaunchError> {
     // The directory, not the nodes it holds today, exactly as flatpak's
@@ -369,8 +390,8 @@ fn gamepad(
             });
         }
     }
-    if hidraw {
-        gamepad_hidraw(args, host)?;
+    if let Some(node) = hidraw {
+        self::hidraw(args, host, node)?;
     }
     if uinput {
         gamepad_uinput(args, host)?;
@@ -379,13 +400,15 @@ fn gamepad(
 }
 
 /// The `/dev/hidraw*` nodes the host has right now, plus the sysfs class
-/// directory that names them.
+/// directory that names them. `service` is the node this was granted
+/// by — `hidraw` or the older `gamepad hidraw=#true` — so an error
+/// names the line the user wrote.
 // There is no `/dev/hidraw` directory to bind instead, so the list is
 // whatever is plugged in when the sandbox starts: a device connected
 // later has no node inside. Nothing is refused when there are none —
 // hidraw nodes come and go with the hardware, and every one of them is a
 // HID device, not only a controller.
-fn gamepad_hidraw(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
+fn hidraw(args: &mut BwrapArgs, host: &dyn Host, service: &'static str) -> Result<(), LaunchError> {
     let dev = Path::new("/dev");
     for name in host.list_dir(dev) {
         if !name.as_encoded_bytes().starts_with(b"hidraw") {
@@ -409,7 +432,7 @@ fn gamepad_hidraw(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchErr
             Ok(())
         }
         Some(_) => Err(LaunchError::WrongType {
-            service: "gamepad",
+            service,
             path: class,
             expected: "a directory",
         }),
@@ -2003,6 +2026,68 @@ mod tests {
             argv(&[pad(true, false)], &env(), &host),
             Err(LaunchError::WrongType {
                 service: "gamepad",
+                expected: "a directory",
+                ..
+            })
+        ));
+    }
+
+    /// The `/dev/hidraw*` nodes a host with HID devices has.
+    fn hidraw_host() -> Vec<(&'static str, Kind)> {
+        vec![
+            ("/dev/hidraw3", Char),
+            ("/dev/hidraw0", Char),
+            ("/sys/class/hidraw", Dir),
+        ]
+    }
+
+    #[test]
+    fn the_bare_hidraw_grant_binds_the_nodes_without_the_input_tree() {
+        let a = argv(&[Service::Hidraw], &env(), &hidraw_host()).unwrap();
+        assert!(has_seq(
+            &a,
+            &["--dev-bind-try", "/dev/hidraw0", "/dev/hidraw0"]
+        ));
+        assert!(has_seq(
+            &a,
+            &["--dev-bind-try", "/dev/hidraw3", "/dev/hidraw3"]
+        ));
+        assert!(has_seq(
+            &a,
+            &["--ro-bind", "/sys/class/hidraw", "/sys/class/hidraw"]
+        ));
+        // The whole point of the grant: no keyboards, no `/sys/devices`.
+        assert!(!a.iter().any(|s| s.contains("/dev/input")), "{a:?}");
+        assert!(!a.iter().any(|s| s.contains("/sys/devices")), "{a:?}");
+    }
+
+    #[test]
+    fn hidraw_and_the_gamepad_property_are_the_same_grant_bound_once() {
+        let mut host = gamepad_host();
+        host.extend(hidraw_host());
+        let bare = argv(&[pad(false, false), Service::Hidraw], &env(), &host).unwrap();
+        let prop = argv(&[pad(true, false)], &env(), &host).unwrap();
+        assert_eq!(bare, prop);
+        // Written both ways in one config the nodes are bound once, not
+        // twice: two `--dev-bind-try` of one node would be a second
+        // mount over the first.
+        let both = argv(&[pad(true, false), Service::Hidraw], &env(), &host).unwrap();
+        assert_eq!(both, prop);
+        assert_eq!(
+            both.iter().filter(|s| *s == "/dev/hidraw0").count(),
+            2,
+            "{both:?}"
+        );
+    }
+
+    #[test]
+    fn the_bare_hidraw_grant_names_itself_when_the_sysfs_class_is_wrong() {
+        // The error names the node the user wrote, so `hidraw` and
+        // `gamepad hidraw=#true` each point at their own line.
+        assert!(matches!(
+            argv(&[Service::Hidraw], &env(), &[("/sys/class/hidraw", File)]),
+            Err(LaunchError::WrongType {
+                service: "hidraw",
                 expected: "a directory",
                 ..
             })
