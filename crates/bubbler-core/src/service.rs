@@ -63,6 +63,7 @@ pub fn apply_all(
             Service::Dbus { .. } => dbus_socket(env, args, ctx),
             Service::SystemBus { .. } => system_bus_socket(args, ctx),
             Service::Portals => portals(args, ctx)?,
+            Service::Camera { nodes } => camera(services, args, host, *nodes)?,
             // Bound below, once every share has been resolved: two
             // overlapping shares must be refused before either is emitted.
             Service::PathShare { .. } => {}
@@ -451,6 +452,98 @@ fn hidraw(args: &mut BwrapArgs, host: &dyn Host, service: &'static str) -> Resul
             expected: "a directory",
         }),
     }
+}
+
+/// Cameras. The bare grant reaches the sandbox through the portal on the
+/// bus and produces no argument at all; `nodes` adds the device half.
+///
+/// Without `portals` there is no `/.flatpak-info`, so the portal reads
+/// the sandbox as an ordinary process of the user and the permission it
+/// would store is the blanket one every unsandboxed process shares. The
+/// grant is refused here rather than quietly downgraded; the parser
+/// rejects that config already.
+fn camera(
+    services: &[Service],
+    args: &mut BwrapArgs,
+    host: &dyn Host,
+    nodes: bool,
+) -> Result<(), LaunchError> {
+    if !services.contains(&Service::Portals) {
+        return Err(LaunchError::BadValue {
+            service: "camera",
+            reason: "requires portals".to_owned(),
+        });
+    }
+    if nodes {
+        // `gamepad` binds `/run/udev` too, and after this: emitting it
+        // twice would mount it twice for one database.
+        let udev = !services
+            .iter()
+            .any(|s| matches!(s, Service::Gamepad { .. }));
+        camera_nodes(args, host, udev)?;
+    }
+    Ok(())
+}
+
+/// The V4L2 device nodes for a `camera nodes=#true`, plus the sysfs
+/// directories that name them and the udev database that identifies
+/// them. `udev` is false where another grant binds `/run/udev` already.
+/// Every one is emitted only where the host has it: a machine with no
+/// camera has none of them, and the portal half of the grant works
+/// either way, so a missing node is not a failed launch.
+// `/dev/media*` is bound beside `/dev/video*` because a UVC camera's
+// controls are a media controller device, not a V4L2 one.
+//
+// `/dev/v4l/by-id` and `by-path` hold relative symlinks (`../../video0`,
+// as udev writes them) onto the nodes bound above, so they resolve
+// inside. The `/sys` entries do not: `/sys/class/video4linux/videoN` and
+// `/sys/bus/media/devices/*` point into `/sys/devices`, which this grant
+// deliberately does not bind, so sysfs enumeration finds nothing. What
+// works inside is opening `/dev/videoN` directly.
+fn camera_nodes(args: &mut BwrapArgs, host: &dyn Host, udev: bool) -> Result<(), LaunchError> {
+    let dev = Path::new("/dev");
+    for name in host.list_dir(dev) {
+        let bytes = name.as_encoded_bytes();
+        if !bytes.starts_with(b"video") && !bytes.starts_with(b"media") {
+            continue;
+        }
+        let p = dev.join(&name);
+        // A name is not a node: only the character devices are bound.
+        if host.file_type(&p).is_some_and(|t| t.is_char_device()) {
+            // `-try`: the node is one this loop found a moment ago, and a
+            // camera unplugged before the exec must not fail the launch.
+            args.dev_bind_try(&p, &p);
+        }
+    }
+    // Identification only. `/run/udev/data` is a database read at
+    // enumeration time; the udev monitor behind it is a netlink socket,
+    // which delivers no uevents in the sandbox's own network namespace.
+    let dirs: &[&str] = match udev {
+        true => &[
+            "/dev/v4l",
+            "/sys/class/video4linux",
+            "/sys/bus/media",
+            "/run/udev",
+        ],
+        false => &["/dev/v4l", "/sys/class/video4linux", "/sys/bus/media"],
+    };
+    for p in dirs {
+        let p = PathBuf::from(*p);
+        match host.file_type(&p) {
+            // A host with none of them is a host with no camera, which
+            // the portal half of the grant does not need.
+            None => {}
+            Some(t) if t.is_dir() => args.ro_bind(&p, &p),
+            Some(_) => {
+                return Err(LaunchError::WrongType {
+                    service: "camera",
+                    path: p,
+                    expected: "a directory",
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `/dev/uinput`, which is how a process creates input devices for the
@@ -1927,6 +2020,170 @@ mod tests {
             ),
             Err(LaunchError::MissingResource { service: "dri", .. })
         ));
+    }
+
+    /// A host with two cameras: the V4L2 nodes, the media controller
+    /// that comes with a UVC device, the persistent-name directory udev
+    /// fills, and the two `/sys` entries that name them.
+    fn camera_host() -> Vec<(&'static str, Kind)> {
+        vec![
+            ("/dev/media0", Char),
+            ("/dev/video0", Char),
+            ("/dev/video1", Char),
+            // A name is not a node, and neither of these is bound.
+            ("/dev/videodev", Dir),
+            ("/dev/mediahub", File),
+            ("/dev/v4l", Dir),
+            ("/sys/class/video4linux", Dir),
+            ("/sys/bus/media", Dir),
+            ("/run/udev", Dir),
+        ]
+    }
+
+    /// The `dbus` and `portals` a `camera` grant requires.
+    fn camera_base() -> Vec<Service> {
+        vec![Service::Dbus { rules: vec![] }, Service::Portals]
+    }
+
+    /// The binds a `camera` node adds on top of the grants it requires,
+    /// so a test names what that node emitted and nothing else.
+    fn camera_binds(nodes: bool, existing: &[(&str, Kind)]) -> Result<Vec<String>, LaunchError> {
+        let base_argv = argv(&camera_base(), &env(), existing)?;
+        let mut with = camera_base();
+        with.push(Service::Camera { nodes });
+        let full_argv = argv(&with, &env(), existing)?;
+        let base = binds(&base_argv);
+        let full = binds(&full_argv);
+        assert!(
+            full.starts_with(&base),
+            "a camera bind landed before the grants it requires: {full:?}"
+        );
+        Ok(full[base.len()..].iter().map(|s| (*s).to_owned()).collect())
+    }
+
+    #[test]
+    fn camera_nodes_bind_the_device_nodes_and_the_sysfs_that_names_them() {
+        assert_eq!(
+            camera_binds(true, &camera_host()).unwrap(),
+            [
+                "--dev-bind-try",
+                "/dev/media0",
+                "/dev/media0",
+                "--dev-bind-try",
+                "/dev/video0",
+                "/dev/video0",
+                "--dev-bind-try",
+                "/dev/video1",
+                "/dev/video1",
+                // Relative symlinks onto the nodes above, so this comes
+                // after them rather than before.
+                "--ro-bind",
+                "/dev/v4l",
+                "/dev/v4l",
+                "--ro-bind",
+                "/sys/class/video4linux",
+                "/sys/class/video4linux",
+                "--ro-bind",
+                "/sys/bus/media",
+                "/sys/bus/media",
+                "--ro-bind",
+                "/run/udev",
+                "/run/udev",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bare_camera_binds_nothing_even_where_the_host_has_a_camera() {
+        // The whole grant is the portal on the bus, which is rules and
+        // not arguments: the sandbox never sees a device node.
+        assert!(
+            camera_binds(false, &camera_host()).unwrap().is_empty(),
+            "a bare camera grant reached the filesystem"
+        );
+    }
+
+    #[test]
+    fn camera_nodes_on_a_host_with_no_camera_is_not_a_failed_launch() {
+        // Emit-when-present: a host with no camera has no node, no class
+        // directory and, without systemd-udevd, no database either.
+        assert!(camera_binds(true, &[]).unwrap().is_empty());
+        // The directories the host does have are still bound.
+        assert_eq!(
+            camera_binds(true, &[("/sys/bus/media", Dir), ("/run/udev", Dir)]).unwrap(),
+            [
+                "--ro-bind",
+                "/sys/bus/media",
+                "/sys/bus/media",
+                "--ro-bind",
+                "/run/udev",
+                "/run/udev",
+            ]
+        );
+    }
+
+    #[test]
+    fn camera_refuses_a_path_that_is_not_a_directory() {
+        for path in [
+            "/dev/v4l",
+            "/sys/class/video4linux",
+            "/sys/bus/media",
+            "/run/udev",
+        ] {
+            assert!(
+                matches!(
+                    camera_binds(true, &[(path, File)]),
+                    Err(LaunchError::WrongType {
+                        service: "camera",
+                        expected: "a directory",
+                        ..
+                    })
+                ),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn camera_without_portals_is_refused_rather_than_downgraded() {
+        // The parser refuses that config, so this is the backstop for a
+        // caller building an `InstanceConfig` by hand: without
+        // `/.flatpak-info` the portal reads the sandbox as an ordinary
+        // process and the permission it stores is everyone's.
+        for nodes in [false, true] {
+            assert!(
+                matches!(
+                    argv(&[Service::Camera { nodes }], &env(), &camera_host()),
+                    Err(LaunchError::BadValue {
+                        service: "camera",
+                        ..
+                    })
+                ),
+                "nodes={nodes}"
+            );
+        }
+    }
+
+    #[test]
+    fn camera_leaves_the_udev_database_to_gamepad_where_both_are_granted() {
+        let mut services = camera_base();
+        services.push(Service::Gamepad {
+            hidraw: false,
+            uinput: false,
+        });
+        services.push(Service::Camera { nodes: true });
+        let mut host = camera_host();
+        host.extend(gamepad_host());
+        let a = argv(&services, &env(), &host).unwrap();
+        // One database, one mount: `gamepad` binds it after the loop, so
+        // `camera` leaves it to that node rather than mounting it twice.
+        assert_eq!(
+            binds(&a).iter().filter(|b| **b == "/run/udev").count(),
+            2,
+            "{:?}",
+            binds(&a)
+        );
+        assert!(has_seq(&a, &["--ro-bind", "/dev/v4l", "/dev/v4l"]));
     }
 
     /// Where `seq` starts in `argv`, for the tests that care which of two

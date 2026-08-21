@@ -73,14 +73,17 @@ inside it.
 `try` runs one command in a sandbox without creating an instance. Its config is
 the flattened profile (`generic` unless `--profile` says otherwise) plus one
 bare node per `--grant`; the grants are `wayland`, `x11`, `network`, `dri`,
-`pipewire`, `pulseaudio`, `dbus`, `portals`, `notify`, `tray`, `gamepad` and
-`hidraw`, and anything with arguments needs a real instance — `system-bus`
-among them, since it is not a grant without rules. The bundles are checked as
-they are in a config file, so `--grant tray` without `--grant dbus` is refused
-rather than silently dropped. A grant the profile already made is not repeated,
-properties and all: `--grant gamepad` on a profile carrying
-`gamepad hidraw=#true` keeps the `hidraw` node rather than narrowing it to the
-bare one. The sandbox lives in
+`pipewire`, `pulseaudio`, `dbus`, `portals`, `notify`, `tray`, `gamepad`,
+`hidraw` and `camera`, and anything with arguments needs a real instance —
+`system-bus` among them, since it is not a grant without rules. The bundles are
+checked as they are in a config file, so `--grant tray` without `--grant dbus`
+is refused rather than silently dropped, and `--grant camera` needs
+`--grant portals` (and the `--grant dbus` that carries it) the same way. A
+grant the profile already made is not repeated, properties and all:
+`--grant gamepad` on a profile carrying `gamepad hidraw=#true` keeps the
+`hidraw` node rather than narrowing it to the bare one, and `--grant camera` on
+a profile carrying `camera nodes=#true` likewise leaves the device half in
+place. The sandbox lives in
 `$XDG_DATA_HOME/bubbler/try/<pid>/`, never appears in `list`, and is removed
 when the command exits whatever its status; `--keep <name>` renames it into an
 instance instead, refusing a name that is taken. Directories left behind by a
@@ -222,6 +225,9 @@ file order does not affect the generated argv.
                                      #   hidraw=#true is the `hidraw` grant,
                                      #   uinput=#true adds /dev/uinput
     hidraw                           # every /dev/hidraw* node, /sys/class/hidraw
+    camera                           # cameras through the portal; binds nothing
+    camera nodes=#true               #   also /dev/video*, /dev/media*, /dev/v4l,
+                                     #   their sysfs and /run/udev
     home-share "Downloads"           # $HOME/Downloads at /home/bubbler/Downloads
     home-share "Projects/x" mode=rw
     path-share "/kioxia/Steam"       # a host path, at that same path inside
@@ -369,6 +375,81 @@ wallets, 3D mice and AV control devices, and Steam's `60-steam-input.rules`
 adds one per supported controller — so a sandbox with `hidraw` can speak to
 your security key or your hardware wallet whenever one is plugged in. Compare
 `ls -l /dev/hidraw*` and `getfacl /dev/hidraw*` with `id` before granting it.
+
+### camera
+
+`camera` grants cameras through `org.freedesktop.portal.Camera`, and binds
+nothing at all. The portal opens `/dev/videoN` in the host's PipeWire daemon
+and hands the sandbox an already-connected socket over the bus; frames come
+back as memfds. So the sandbox needs no device node, no `/sys` bind and no
+`pipewire` grant — only the `portals` the node requires, which is why `camera`
+without `portals` is a parse error rather than a warning.
+
+That requirement is not bookkeeping. `xdg-desktop-portal` decides camera access
+from a permission store keyed by the app id it reads out of `/.flatpak-info`,
+which is the file `portals` writes. With one, each instance holds its own
+revocable permission under `org.bubbler.<instance>`; without one the caller has
+no app id at all and falls into the blanket entry that every unsandboxed
+process on the machine shares. `--explain` shows the grant as a rule-only line,
+since the whole of it is on the bus rather than in the argv.
+
+Two host-side conditions apply and neither is bubbler's to fix: the portal
+needs an `org.freedesktop.impl.portal.Access` backend, which
+`xdg-desktop-portal-gtk` and `-kde` provide and `xdg-desktop-portal-hyprland`
+alone does not, and MIPI/libcamera cameras need `pipewire-libcamera`.
+
+Applications opt in too. Firefox reads the portal behind
+`media.webrtc.camera.allow-pipewire`, which is false by default and only read
+at startup; Chromium behind `chrome://flags/#enable-webrtc-pipewire-camera`,
+also off by default — not to be confused with the screen-sharing
+`enable-webrtc-pipewire-capturer`, which is already on. OBS ships a
+"Camera (PipeWire)" source. Plain V4L2 consumers — mpv, ffmpeg, VLC,
+`v4l2-ctl`, Cheese, OBS's classic source — will never speak it.
+
+`camera nodes=#true` is for those. It also binds every `/dev/video*` and
+`/dev/media*` character device the host has at launch with device access, and
+`/dev/v4l`, `/sys/class/video4linux`, `/sys/bus/media` and `/run/udev`
+read-only where the host has them. Each is emitted only where it exists, so the
+property adds nothing on a machine with no camera rather than failing the
+launch. The media nodes are bound beside the video ones because a UVC camera's
+controls are a media controller device; `/dev/v4l/by-id` and `by-path` are the
+persistent names udev writes, as relative symlinks (`../../video0`) onto the
+nodes bound above, so they resolve inside. `/run/udev` is bound once even when
+`gamepad` asks for it too. The two paths reach the same devices — a
+v4l2loopback or OBS virtual camera among them, since Arch's `70-uaccess.rules`
+keys on the `video4linux` and `media` subsystems and nothing further — but the
+portal is strictly the narrower of the two.
+
+Permissions on the nodes are what stop a sandbox from opening one: `/dev/video*`
+is `0660 root:video`, plus an ACL for the logged-in user from that `uaccess`
+tag. On a seat with no `uaccess` — a headless machine, a session logind does
+not own — the grant produces a node the sandbox cannot read.
+
+The device list is frozen at launch: there is no `/dev/video` directory to bind
+instead, so a camera plugged in later has no node inside, and with a network
+namespace of its own the sandbox is not told about one either — the udev
+monitor is a netlink socket, and its notifications do not cross a network
+namespace. `/run/udev/data` still names the devices that were there when the
+sandbox started. The portal path has neither problem: the watching happens in
+the host daemon, and node changes arrive as traffic on the socket it already
+handed over.
+
+The `/sys` half is names, not a working sysfs. Both
+`/sys/class/video4linux/videoN` and the entries under `/sys/bus/media` are
+relative symlinks into `/sys/devices`, which this grant does **not** bind — nor
+`/sys/dev/char`, which libudev resolves a device number through. Those are
+`gamepad`'s and `dri`'s wide binds and no part of a camera grant, so anything
+that enumerates through sysfs — libudev, and therefore GStreamer's
+`v4l2src`/device monitor and the pickers built on it — finds nothing inside and
+shows no device. What does work is opening `/dev/videoN` (or a `/dev/v4l/by-id`
+name) directly, which is what mpv, ffmpeg and `v4l2-ctl` do. If a libudev
+consumer has to work, add `gamepad` or `dri` for the tree it reads, and know
+what those grants cost — or use the portal, which needs none of it.
+
+**Neither path has been tested against a real camera.** The machine bubbler is
+developed on has none, so the portal call, the PipeWire fd crossing
+`xdg-dbus-proxy` and the device binds have unit and argv coverage and no frame
+has ever come through. Treat `camera` as untested on real hardware.
 
 ### env and command
 
@@ -683,7 +764,9 @@ is deliberately a different code from "grants too much".
 this host does not have, or has as something other than a directory or a
 regular file), `path-share-reserved` (a root bubbler never shares),
 `dup-name-policy` (one bus name given two policies by two layers),
-`own-on-system-bus`.
+`own-on-system-bus`, `camera-without-portals` (a `camera` grant no layer gives
+a `portals` to carry, so the portal reads the sandbox as an ordinary process
+of yours).
 
 **Warnings** say the file grants more than it probably means to:
 `x11-without-reason`, `seccomp-disabled`, `userns-disabled-with-nested-sandbox`
@@ -706,7 +789,10 @@ socket is command execution across the boundary), `dbus-without-rules`,
 without `/.flatpak-info`, which is worse than wrong).
 
 **Notes** are information and fail nothing: `ozone-hint-unnecessary`,
-`command-not-found`, `secrets-access` (`talk`/`own` of
+`command-not-found`, `camera-nodes-none-present` (`camera nodes=#true` on a
+host with no `/dev/video*` or `/dev/media*`, so that half of the grant binds
+nothing), `camera-nodes-no-hotplug` (the node list is frozen at launch and an
+own network namespace delivers no uevents), `secrets-access` (`talk`/`own` of
 `org.freedesktop.secrets` on the session bus reaches the whole login keyring:
 the Secret Service API partitions nothing between the applications that call
 it), `lint-allow-unused` (a `lint-allow` node that accepts nothing, which is a
@@ -1107,6 +1193,9 @@ binding the tree under it.
   `path-share` refuses that directory by design.
 - `/etc/machine-id` is bound in, so every instance shares one stable
   identifier with the host.
+- `camera` has never been exercised against a real camera: this machine has
+  none, so neither the portal call nor the device binds are more than unit and
+  argv tested; see "camera".
 - No desktop entries.
 
 ## Files

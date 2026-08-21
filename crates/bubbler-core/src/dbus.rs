@@ -173,6 +173,10 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
                 | Service::Pulseaudio
                 | Service::Gamepad { .. }
                 | Service::Hidraw
+                // `camera` adds no rule of its own: the Camera interface
+                // lives on `org.freedesktop.portal.Desktop`, which the
+                // `portals` bundle above already talks to.
+                | Service::Camera { .. }
                 | Service::HomeShare { .. }
                 | Service::PathShare { .. }
                 | Service::EtcShare { .. }

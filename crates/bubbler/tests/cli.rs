@@ -1178,6 +1178,115 @@ fn real_bwrap_hidraw_binds_the_nodes_without_the_input_tree() {
     assert_eq!(rest.trim(), "", "{stdout}");
 }
 
+/// Host `/dev` entries named `video*` or `media*` that really are
+/// character devices, sorted: what `camera nodes=#true` binds. Empty on
+/// a host with no camera, which is the case the emit-when-present rule
+/// is about.
+fn host_camera_nodes() -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir("/dev")
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    n.starts_with("video") || n.starts_with("media")
+                })
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_char_device()))
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort_unstable();
+    names
+}
+
+/// The directories `camera nodes=#true` binds where the host has them.
+const CAMERA_DIRS: [&str; 4] = [
+    "/dev/v4l",
+    "/sys/class/video4linux",
+    "/sys/bus/media",
+    "/run/udev",
+];
+
+/// What both halves of the test ask the sandbox: the camera device nodes
+/// it can see, then `/.flatpak-info` and whichever of [`CAMERA_DIRS`]
+/// reached it.
+const CAMERA_PROBE: &str = "ls -1 /dev | grep -E '^(video|media)' | tr '\\n' ' '; echo; \
+     echo ---; test -f /.flatpak-info && echo flatpak-info; \
+     for d in /dev/v4l /sys/class/video4linux /sys/bus/media /run/udev; do \
+     test -d \"$d\" && echo \"$d\"; done; true";
+
+#[test]
+fn real_dbus_camera_binds_no_device_and_nodes_only_bind_what_is_there() {
+    if !require_dbus() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+
+    // The bare grant is the portal and nothing else: no device node, no
+    // sysfs, no udev database, on a host with a camera or without one.
+    let out = bubbler_dbus(tmp.path(), &init)
+        .args([
+            "try",
+            "--grant",
+            "dbus",
+            "--grant",
+            "portals",
+            "--grant",
+            "camera",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            CAMERA_PROBE,
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (nodes, rest) = stdout
+        .split_once("---\n")
+        .unwrap_or_else(|| panic!("{stdout}"));
+    assert_eq!(nodes.trim(), "", "{stdout}");
+    // `/.flatpak-info` is what earns the instance a camera permission of
+    // its own instead of the blanket one every unsandboxed process
+    // shares, so the bare grant is worth nothing without it.
+    assert!(rest.contains("flatpak-info"), "{stdout}");
+    for d in CAMERA_DIRS {
+        assert!(
+            !rest.contains(d),
+            "{d} reached a bare camera grant: {stdout}"
+        );
+    }
+
+    // `nodes=#true` adds the device nodes the host has at launch and
+    // says nothing about the ones it does not: on a machine with no
+    // camera that half of the grant binds nothing at all.
+    let name = "bubbler-test-camera";
+    let _leftovers = dbus_instance(
+        tmp.path(),
+        &init,
+        name,
+        "dbus\nportals\ncamera nodes=#true\n",
+    );
+    let out = bubbler_dbus(tmp.path(), &init)
+        .args(["run", name, "--", "/usr/bin/sh", "-c", CAMERA_PROBE])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (nodes, rest) = stdout
+        .split_once("---\n")
+        .unwrap_or_else(|| panic!("{stdout}"));
+    let mut inside: Vec<String> = nodes.split_whitespace().map(str::to_owned).collect();
+    inside.sort_unstable();
+    assert_eq!(inside, host_camera_nodes(), "{stdout}");
+    for d in CAMERA_DIRS {
+        assert_eq!(rest.contains(d), Path::new(d).is_dir(), "{d}: {stdout}");
+    }
+}
+
 #[test]
 fn real_bwrap_alsa_configuration_reaches_the_sandbox() {
     if !require_bwrap() {
@@ -2769,6 +2878,7 @@ fn try_rejects_bad_grants_and_cleans_up_a_failed_start() {
         "tray",
         "gamepad",
         "hidraw",
+        "camera",
     ] {
         assert!(err.contains(grant), "{grant} missing from {err}");
     }
@@ -2784,6 +2894,24 @@ fn try_rejects_bad_grants_and_cleans_up_a_failed_start() {
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(err.contains("requires dbus"), "{grant}: {err}");
     }
+
+    // `camera` is a portal grant, so it is refused until the portals
+    // that carry it are granted too.
+    let out = bubbler(tmp.path())
+        .args([
+            "try",
+            "--grant",
+            "dbus",
+            "--grant",
+            "camera",
+            "--",
+            "/usr/bin/true",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("requires portals"), "{err}");
 
     // No command anywhere: the failure happens after the directory exists,
     // so it also shows the guard cleaning up.

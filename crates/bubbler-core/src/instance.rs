@@ -42,6 +42,7 @@ pub const GRANTS: &[&str] = &[
     "tray",
     "gamepad",
     "hidraw",
+    "camera",
 ];
 
 /// Directory holding all instances.
@@ -210,6 +211,7 @@ fn grant_service(name: &str) -> Option<Service> {
             uinput: false,
         },
         "hidraw" => Service::Hidraw,
+        "camera" => Service::Camera { nodes: false },
         _ => return None,
     })
 }
@@ -232,6 +234,12 @@ fn with_grants(cfg: &mut InstanceConfig, grants: &[&str]) -> Result<(), Instance
                 .services
                 .iter()
                 .any(|s| matches!(s, Service::Gamepad { .. })),
+            // Same for `camera`, whose `nodes` property a config may
+            // already carry.
+            Service::Camera { .. } => cfg
+                .services
+                .iter()
+                .any(|s| matches!(s, Service::Camera { .. })),
             other => cfg.services.contains(other),
         };
         if !held {
@@ -867,6 +875,24 @@ mod tests {
                 Err(InstanceError::Config(_))
             ));
         }
+        // `camera` is granted the same way, and takes the `portals` that
+        // carry it rather than binding a device node of its own.
+        assert!(matches!(
+            Instance::ephemeral(&env, "generic", &["camera"]),
+            Err(InstanceError::Config(_))
+        ));
+        assert!(matches!(
+            Instance::ephemeral(&env, "generic", &["dbus", "camera"]),
+            Err(InstanceError::Config(_))
+        ));
+        let eph = Instance::ephemeral(&env, "generic", &["dbus", "portals", "camera"]).unwrap();
+        assert!(
+            eph.instance
+                .config
+                .services
+                .contains(&Service::Camera { nodes: false })
+        );
+        drop(eph);
         assert!(!try_root(&env).exists() || try_root(&env).read_dir().unwrap().next().is_none());
     }
 
@@ -909,6 +935,20 @@ mod tests {
             }]
         );
         assert_eq!(kdl_out::render(&cfg).unwrap(), "gamepad hidraw=#true\n");
+    }
+
+    #[test]
+    fn a_camera_grant_leaves_a_device_grant_in_the_config_alone() {
+        // The parser takes one `camera` node, so a bare grant on top of
+        // `nodes=#true` must not narrow what the config already granted.
+        let mut cfg = config::parse("dbus\nportals\ncamera nodes=#true").unwrap();
+        with_grants(&mut cfg, &["camera"]).unwrap();
+        assert_eq!(cfg.services.last(), Some(&Service::Camera { nodes: true }));
+        assert!(
+            kdl_out::render(&cfg)
+                .unwrap()
+                .contains("camera nodes=#true\n")
+        );
     }
 
     #[test]

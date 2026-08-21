@@ -636,6 +636,21 @@ impl Merged {
                     return Ok(());
                 }
             }
+            Service::Camera { nodes } => {
+                if let Some((held_nodes, held_src)) =
+                    self.services.iter_mut().find_map(|(s, src)| match s {
+                        Service::Camera { nodes: held } => Some((held, src)),
+                        _ => None,
+                    })
+                {
+                    // The device half is a grant of its own on top of the
+                    // portal, so it adds up rather than the last layer
+                    // deciding it.
+                    *held_nodes |= *nodes;
+                    *held_src = src.clone();
+                    return Ok(());
+                }
+            }
             Service::SystemBus { rules } => {
                 if let Some((held_rules, held_src)) =
                     self.services.iter_mut().find_map(|(s, src)| match s {

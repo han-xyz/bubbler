@@ -62,6 +62,11 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
         Service::Notify => "notify".to_owned(),
         Service::Tray => "tray".to_owned(),
         Service::Hidraw => "hidraw".to_owned(),
+        Service::Camera { nodes } => match nodes {
+            // `#false` is the default, so only the device grant is written.
+            true => "camera nodes=#true".to_owned(),
+            false => "camera".to_owned(),
+        },
         Service::Gamepad { hidraw, uinput } => {
             let mut node = String::from("gamepad");
             // `#false` is the default, so only a granted class is written.
@@ -300,6 +305,7 @@ mod tests {
             notify
             tray
             gamepad hidraw=#true uinput=#true
+            camera nodes=#true
             mpris name="firefox.*"
             tty "passthrough"
             userns "disable"
@@ -327,6 +333,8 @@ mod tests {
         // The bare grant and the older `gamepad` spelling of it are two
         // nodes, and both have to survive a round trip unchanged.
         round_trip("hidraw\ngamepad hidraw=#true");
+        round_trip("dbus\nportals\ncamera");
+        round_trip("dbus\nportals\ncamera nodes=#true");
     }
 
     #[test]
@@ -335,6 +343,8 @@ mod tests {
         // the defaults, so the canonical form of each is the shorter node.
         let cfg = parse("gamepad uinput=#false\nuserns \"allow\"").unwrap();
         assert_eq!(render(&cfg).unwrap(), "gamepad\n");
+        let cfg = parse("dbus\nportals\ncamera nodes=#false").unwrap();
+        assert_eq!(render(&cfg).unwrap(), "dbus\nportals\ncamera\n");
     }
 
     #[test]
