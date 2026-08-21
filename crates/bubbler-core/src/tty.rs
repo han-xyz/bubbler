@@ -1196,7 +1196,13 @@ mod tests {
     fn fill(fd: BorrowedFd<'_>) {
         let flags = fcntl_getfl(fd).unwrap();
         fcntl_setfl(fd, flags | OFlags::NONBLOCK).unwrap();
-        while write(fd, &[b'x'; 4096]).is_ok() {}
+        // A 4096-byte write is refused while room for fewer is left, so
+        // stopping there leaves a destination these tests take for full
+        // with up to that much still free.
+        let chunk = [b'x'; 4096];
+        for unit in [chunk.len(), 1] {
+            while write(fd, &chunk[..unit]).is_ok() {}
+        }
         fcntl_setfl(fd, flags).unwrap();
     }
 
@@ -1721,7 +1727,11 @@ mod tests {
 
     #[test]
     fn a_terminal_taking_a_little_at_a_time_is_not_a_stalled_one() {
-        const HELD: usize = 8192;
+        // Several times what a pty holds, so how long the hand-over
+        // takes is set by the rate the terminal is read at below and not
+        // by the buffer a pty frees at a time. Under [`PENDING_MAX`], so
+        // the relay holds all of it rather than slowing the sandbox.
+        const HELD: usize = 48 * 1024;
         let Pty { master, slave } = pty_pair();
         let Pty {
             master: host_master,
@@ -1737,19 +1747,19 @@ mod tests {
             let mut buf = [0u8; 4096];
             let deadline = Instant::now() + Duration::from_secs(60);
             while Instant::now() < deadline {
-                // 256 bytes every 200 ms while the relay hands over what
-                // it holds. A pty frees its write room a buffer at a
-                // time, so `write` goes on failing for seconds at a
-                // stretch with the terminal not stuck in the least; then
-                // as fast as it likes, since what is being tested is
-                // what the relay handed over, not how long this takes.
+                // 2048 bytes every 100 ms while the relay hands over
+                // what it holds. A pty frees its write room a buffer at
+                // a time, so `write` goes on failing for a stretch with
+                // the terminal not stuck in the least; then as fast as
+                // it likes, since what is being tested is what the relay
+                // handed over, not how long this takes.
                 let slow = !d.load(Ordering::SeqCst);
                 let want = match slow {
-                    true => 256,
+                    true => 2048,
                     false => buf.len(),
                 };
                 if slow {
-                    thread::sleep(Duration::from_millis(200));
+                    thread::sleep(Duration::from_millis(100));
                 }
                 let mut fds = [PollFd::from_borrowed_fd(host_master.as_fd(), PollFlags::IN)];
                 if poll(&mut fds, Some(&timespec(Duration::from_millis(200)))).is_err() {
@@ -1793,8 +1803,11 @@ mod tests {
         );
         // And it really was handed over against a `write` that kept
         // failing: a run that never had to wait proves nothing here.
+        // The terminal above is read at 20 KiB/s at the most, so no
+        // clock is being raced: handing [`HELD`] over takes 1.7 s and up
+        // here, and a slower machine only makes that longer.
         assert!(
-            waited > Duration::from_secs(2),
+            waited > Duration::from_secs(1),
             "the terminal took it all at once in {waited:?}"
         );
     }
