@@ -3,7 +3,6 @@
 
 use std::fs;
 use std::io;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::Mode;
@@ -13,6 +12,7 @@ use rustix::process::{Pid, test_kill_process};
 use crate::config::{self, InstanceConfig, NetworkConfig, Service};
 use crate::env::Env;
 use crate::error::InstanceError;
+use crate::fsutil;
 use crate::kdl_out;
 use crate::profile::{self, PROFILE_HEADER};
 use crate::{dbus, exec, launcher};
@@ -30,10 +30,6 @@ pub const CONFIG_VERSION: u32 = 2;
 
 /// Where `reseed` keeps the `config.kdl` it replaces.
 const BACKUP_FILE: &str = "config.kdl.bak";
-
-/// Where `reseed` builds the new `config.kdl` before it takes the old
-/// one's place.
-const TEMP_FILE: &str = "config.kdl.new";
 
 /// Service names [`Instance::ephemeral`] accepts as grants: the bare
 /// config nodes, which take no arguments. Anything else needs a config
@@ -162,30 +158,10 @@ fn io_err(path: &Path) -> impl FnOnce(io::Error) -> InstanceError + '_ {
     move |e| InstanceError::Io(path.to_path_buf(), e)
 }
 
-/// Put `text` at `path` in one step: it is written to a sibling file and
-/// renamed over `path`, and `rename(2)` within one directory replaces the
-/// name atomically. A reader therefore sees either the whole old config
-/// or the whole new one, never the half-written file a crashed or failing
-/// write would leave under a name bubbler treats as a complete config.
+/// [`fsutil::write_atomic`] as an [`InstanceError`]: a config is
+/// replaced whole or not at all.
 fn write_atomic(path: &Path, text: &str) -> Result<(), InstanceError> {
-    // Same directory as `path`, which is what makes the rename atomic
-    // rather than a copy across filesystems.
-    let tmp = path.with_file_name(TEMP_FILE);
-    let written = (|| -> io::Result<()> {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(text.as_bytes())?;
-        // The rename only orders the *name* change; without this the
-        // contents may still be unwritten when it happens, so a crash
-        // could leave the new name over an empty file.
-        f.sync_all()
-    })();
-    if let Err(e) = written {
-        // Cleanup on the way out: the error being reported is the write's,
-        // and a leftover temporary file is not part of any sandbox.
-        let _ = fs::remove_file(&tmp);
-        return Err(InstanceError::Io(tmp, e));
-    }
-    fs::rename(&tmp, path).map_err(io_err(path))
+    fsutil::write_atomic(path, text).map_err(|(at, e)| InstanceError::Io(at, e))
 }
 
 /// Lay out an instance directory: `dir` itself (never overwriting one),
@@ -816,7 +792,12 @@ mod tests {
             fs::read_to_string(inst.dir.join(BACKUP_FILE)).unwrap(),
             seeded
         );
-        assert!(!inst.dir.join(TEMP_FILE).exists());
+        let mut left: Vec<_> = fs::read_dir(&inst.dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        left.sort();
+        assert_eq!(left, [CONFIG_FILE, BACKUP_FILE, "home"]);
 
         // The profile header survived, so the instance can still be
         // re-flattened from the profile it came from.

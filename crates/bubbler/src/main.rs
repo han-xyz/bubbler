@@ -21,6 +21,7 @@ use bubbler_core::launcher;
 use bubbler_core::lint;
 use bubbler_core::profile;
 use bubbler_core::tty::{self, TtyMode};
+use bubbler_core::wrap;
 use clap::{Parser, Subcommand, ValueEnum};
 
 /// `--tty` takes the names the config's `tty` node takes; clap already
@@ -160,6 +161,14 @@ enum Cmd {
         #[arg(last = true, required = true)]
         command: Vec<OsString>,
     },
+    /// Run a command in an instance, the way shims and desktop entries do.
+    Open {
+        /// Instance name.
+        name: String,
+        /// Command to run; replaces the config's `command`.
+        #[arg(last = true)]
+        command: Vec<OsString>,
+    },
     /// List instances.
     List,
     /// List profiles from every layer: user, system and built-in.
@@ -198,6 +207,24 @@ enum Cmd {
         name: String,
         #[command(flatten)]
         opts: LintOpts,
+    },
+    /// Put a shim for an instance on `PATH`, in ~/.local/bin.
+    Wrap {
+        /// Instance the shim opens; leave it out with `--list`.
+        #[arg(required_unless_present = "list")]
+        name: Option<String>,
+        /// Name the shim takes, instead of the instance's own. It
+        /// intercepts every use of that name resolved through `PATH`.
+        #[arg(long = "as", value_name = "NAME", conflicts_with = "list")]
+        as_name: Option<String>,
+        /// Print every shim: name, instance, path and `ok` or `broken`.
+        #[arg(long, conflicts_with = "name")]
+        list: bool,
+    },
+    /// Remove a shim and the registry line naming it.
+    Unwrap {
+        /// Shim name, as `wrap --list` prints it.
+        name: String,
     },
 }
 
@@ -420,10 +447,54 @@ fn warn_migration(inst: &Instance) {
     }
 }
 
+/// The `bubbler open` command line this process stands for, when it was
+/// started through a PATH shim. `argv[0]` is the only place the name it
+/// was called by survives — `current_exe()` reads `/proc/self/exe` and so
+/// resolves the symlink — and it is caller-controlled, so the name is a
+/// key into the registry bubbler wrote and never an instance name in its
+/// own right. A name the registry does not hold is not a shim, and the
+/// ordinary CLI runs.
+fn shim_dispatch(argv: &[OsString]) -> Result<Option<Vec<OsString>>> {
+    let Some(name) = wrap::shim_name(argv.first().map(OsString::as_os_str)) else {
+        return Ok(None);
+    };
+    // Read here rather than in `real_main`, so `bubbler --help` on a host
+    // without `$XDG_RUNTIME_DIR` still answers.
+    let env = host_env::from_process()?;
+    let Some(found) = wrap::lookup(&env, &name).context("reading the shim registry")? else {
+        return Ok(None);
+    };
+    let inst = Instance::open(&env, &found.instance)
+        .with_context(|| format!("opening instance `{}` for shim `{name}`", found.instance))?;
+    // The instance's own command first: `open` reads what follows `--` as
+    // the whole command, so passing only the shim's arguments would run
+    // the URL as a program.
+    let mut args = launcher::resolve_command(&inst, None)
+        .with_context(|| format!("shim `{name}`"))?
+        .to_vec();
+    args.extend(argv.iter().skip(1).cloned());
+    Ok(Some(wrap::open_argv(&found.instance, &args)))
+}
+
 fn real_main() -> Result<i32> {
     // Before anything else opens a descriptor.
     host_env::fill_closed_stdio()?;
-    let cli = Cli::parse();
+    // Before the parser: clap ignores `argv[0]`, so a shim named after a
+    // subcommand would otherwise be read as that subcommand.
+    let argv: Vec<OsString> = std::env::args_os().collect();
+    let shim = shim_dispatch(&argv)?;
+    let cli = match &shim {
+        Some(argv) => {
+            // The one hook the shim tests have: what a shim resolved to,
+            // without starting the sandbox it names.
+            if std::env::var_os("BUBBLER_WRAP_DRY_RUN").is_some_and(|v| v == "1") {
+                let lines: Vec<&OsStr> = argv.iter().map(OsString::as_os_str).collect();
+                return print_lines(&lines, "the shim command line");
+            }
+            Cli::parse_from(argv)
+        }
+        None => Cli::parse(),
+    };
     let env = host_env::from_process()?;
     match cli.cmd {
         Cmd::Create { name, profile } => {
@@ -584,6 +655,21 @@ fn real_main() -> Result<i32> {
             launcher::exec(&env, &name, &command, mode)
                 .with_context(|| format!("executing in instance `{name}`"))
         }
+        // Task 1 replaces this with the live-instance exec path and the
+        // last-run log; a shim only needs it to start the sandbox.
+        Cmd::Open { name, command } => {
+            let inst = Instance::open(&env, &name).with_context(|| {
+                format!(
+                    "opening instance `{name}` ({})",
+                    instance::config_path(&env, &name).display()
+                )
+            })?;
+            warn_migration(&inst);
+            let command = (!command.is_empty()).then_some(command.as_slice());
+            let mode = inst.config.tty;
+            launcher::run(&env, &inst, command, mode)
+                .with_context(|| format!("running instance `{name}`"))
+        }
         Cmd::List => {
             let names = Instance::list(&env).context("listing instances")?;
             let lines: Vec<&OsStr> = names.iter().map(OsStr::new).collect();
@@ -614,6 +700,20 @@ fn real_main() -> Result<i32> {
                 bail!("refusing to delete `{name}` without --yes (this removes its private home)");
             }
             Instance::delete(&env, &name).with_context(|| format!("deleting instance `{name}`"))?;
+            // Named, not removed: a shim is a file on the user's `PATH`,
+            // and `delete` taking one away is a surprise `unwrap` is for.
+            match wrap::load(&env) {
+                Ok(wraps) => {
+                    for w in wraps.iter().filter(|w| w.instance == name) {
+                        eprintln!(
+                            "bubbler: note: shim `{shim}` still opens `{name}`; \
+                             `bubbler unwrap {shim}` removes it",
+                            shim = w.name
+                        );
+                    }
+                }
+                Err(e) => eprintln!("bubbler: warning: reading the shim registry: {e}"),
+            }
             Ok(0)
         }
         Cmd::Edit { name } => {
@@ -749,6 +849,66 @@ fn real_main() -> Result<i32> {
                     Ok(3)
                 }
             }
+        }
+        Cmd::Wrap {
+            name,
+            as_name,
+            list,
+        } => {
+            // The symlink target and the yardstick for "is this ours":
+            // `current_exe` resolves through any shim this was itself
+            // started by, so it always names the real binary.
+            let bubbler = std::env::current_exe().context("locating the bubbler binary")?;
+            if list {
+                let entries = wrap::list(&env, &bubbler).context("listing shims")?;
+                // Built as bytes rather than formatted into a String: the
+                // shim path need not be UTF-8.
+                let lines: Vec<OsString> = entries
+                    .iter()
+                    .map(|e| {
+                        let mut line =
+                            OsString::from(format!("{}\t{}\t", e.wrap.name, e.wrap.instance));
+                        line.push(&e.path);
+                        line.push(format!("\t{}", e.state));
+                        line
+                    })
+                    .collect();
+                let lines: Vec<&OsStr> = lines.iter().map(OsString::as_os_str).collect();
+                return print_lines(&lines, "the shim list");
+            }
+            // clap requires one of the two, so this is out of reach from
+            // the command line.
+            let name = name.context("`wrap` takes an instance name or `--list`")?;
+            let shim = as_name.clone().unwrap_or_else(|| name.clone());
+            let made = wrap::add(&env, &name, &shim, &bubbler)
+                .with_context(|| format!("wrapping instance `{name}` as `{shim}`"))?;
+            if made.adopted {
+                eprintln!(
+                    "bubbler: note: {} was already a bubbler shim the registry did not \
+                     name; it opens `{name}` from now on",
+                    made.path.display()
+                );
+            }
+            // Only for a name the user chose: a shim named after the
+            // instance shadows nothing, which is why it is the default.
+            if as_name.is_some() {
+                eprintln!(
+                    "bubbler: note: `{shim}` now starts this sandbox wherever PATH resolves it, \
+                     the bare-name `Exec=` lines of desktop entries included"
+                );
+            }
+            if let Some(warning) =
+                wrap::path_warning(&wrap::shim_dir(&env), &shim, &host_env::search_path())
+            {
+                eprintln!("bubbler: warning: {warning}");
+            }
+            print_lines(&[made.path.as_os_str()], "the shim path")
+        }
+        Cmd::Unwrap { name } => {
+            let bubbler = std::env::current_exe().context("locating the bubbler binary")?;
+            let path = wrap::remove(&env, &name, &bubbler)
+                .with_context(|| format!("removing shim `{name}`"))?;
+            print_lines(&[path.as_os_str()], "the shim path")
         }
     }
 }

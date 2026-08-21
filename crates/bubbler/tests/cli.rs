@@ -5138,3 +5138,309 @@ fn edit_warns_about_the_flip_before_it_stamps_the_version() {
     // And having been stamped, it is the last time.
     assert!(!edit().contains("isolated network namespace"));
 }
+
+/// An instance whose config runs `/usr/bin/true`, which is all a shim
+/// needs: dispatch reads the `command` node and never starts anything.
+fn wrapped_instance(root: &Path, name: &str) -> PathBuf {
+    let out = bubbler(root).args(["create", name]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cfg = root
+        .join("data/bubbler/instances")
+        .join(name)
+        .join("config.kdl");
+    std::fs::write(&cfg, "command \"/usr/bin/true\"\n").unwrap();
+    root.join("home/.local/bin").join(name)
+}
+
+#[test]
+fn a_shim_is_a_symlink_that_dispatches_to_open() {
+    let tmp = setup();
+    let link = wrapped_instance(tmp.path(), "ff");
+    let out = bubbler(tmp.path()).args(["wrap", "ff"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}\n", link.display())
+    );
+    assert_eq!(
+        std::fs::read_link(&link).unwrap(),
+        Path::new(env!("CARGO_BIN_EXE_bubbler"))
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("config/bubbler/wraps.kdl")).unwrap(),
+        "// bubbler wraps: 1\nwrap \"ff\" instance=\"ff\"\n"
+    );
+
+    // Called through the link, bubbler becomes `open` on that instance,
+    // with the instance's own command ahead of the shim's arguments.
+    let out = common::shim(tmp.path(), &link)
+        .env("BUBBLER_WRAP_DRY_RUN", "1")
+        .args(["https://example.invalid", "--version"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "bubbler\nopen\nff\n--\n/usr/bin/true\nhttps://example.invalid\n--version\n"
+    );
+}
+
+#[test]
+fn a_name_the_registry_does_not_hold_is_the_ordinary_cli() {
+    let tmp = setup();
+    wrapped_instance(tmp.path(), "ff");
+    let link = tmp.path().join("home/.local/bin/zzz");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_bubbler"), &link).unwrap();
+    let out = common::shim(tmp.path(), &link)
+        .arg("list")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ff\n");
+}
+
+#[test]
+fn wrap_list_reports_the_shim_that_is_gone_as_broken() {
+    let tmp = setup();
+    let link = wrapped_instance(tmp.path(), "ff");
+    bubbler(tmp.path()).args(["wrap", "ff"]).status().unwrap();
+    let list = || {
+        let out = bubbler(tmp.path())
+            .args(["wrap", "--list"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert_eq!(list(), format!("ff\tff\t{}\tok\n", link.display()));
+    std::fs::remove_file(&link).unwrap();
+    assert_eq!(list(), format!("ff\tff\t{}\tbroken\n", link.display()));
+}
+
+#[test]
+fn wrap_refuses_a_reserved_name_and_a_file_that_is_not_ours() {
+    let tmp = setup();
+    wrapped_instance(tmp.path(), "ff");
+    for name in ["bubbler", "bwrap", "xdg-dbus-proxy", "pasta", "passt"] {
+        let out = bubbler(tmp.path())
+            .args(["wrap", "ff", "--as", name])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{name} was accepted");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("refusing to name a shim"),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let out = bubbler(tmp.path())
+        .args(["wrap", "ff", "--as", "a/b"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("invalid shim name"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let bin = tmp.path().join("home/.local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("ff"), b"#!/bin/sh\n").unwrap();
+    let out = bubbler(tmp.path()).args(["wrap", "ff"]).output().unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is not a bubbler shim"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(bin.join("ff")).unwrap(),
+        "#!/bin/sh\n"
+    );
+}
+
+#[test]
+fn unwrap_removes_the_shim_and_the_registry_line() {
+    let tmp = setup();
+    let link = wrapped_instance(tmp.path(), "ff");
+    bubbler(tmp.path()).args(["wrap", "ff"]).status().unwrap();
+    let out = bubbler(tmp.path()).args(["unwrap", "ff"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(std::fs::symlink_metadata(&link).is_err());
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("config/bubbler/wraps.kdl")).unwrap(),
+        "// bubbler wraps: 1\n"
+    );
+    let out = bubbler(tmp.path()).args(["unwrap", "ff"]).output().unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no shim named `ff`"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_shim_directory_off_the_path_is_warned_about_and_a_renamed_shim_says_what_it_takes() {
+    let tmp = setup();
+    wrapped_instance(tmp.path(), "ff");
+    // The test PATH is `/usr/bin:/bin`, so the shim directory is never on it.
+    let out = bubbler(tmp.path()).args(["wrap", "ff"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("is not on your PATH"), "{err}");
+    assert!(!err.contains("note:"), "{err}");
+
+    let out = bubbler(tmp.path())
+        .args(["wrap", "ff", "--as", "firefox"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("wherever PATH resolves it"), "{err}");
+
+    // A real program earlier on PATH is what the shim would lose to.
+    let out = bubbler(tmp.path())
+        .args(["wrap", "ff", "--as", "true"])
+        .env(
+            "PATH",
+            format!("/usr/bin:{}", tmp.path().join("home/.local/bin").display()),
+        )
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("/usr/bin/true comes first"), "{err}");
+}
+
+#[test]
+fn twelve_wraps_at_once_leave_twelve_lines_and_twelve_links() {
+    let tmp = setup();
+    wrapped_instance(tmp.path(), "ff");
+    // Spawned before any is waited on, so the read-modify-write of the
+    // registry really does overlap: without a lock across it, the last
+    // writer wins and the other eleven entries are gone.
+    let names: Vec<String> = (0..12).map(|i| format!("shim{i}")).collect();
+    let running: Vec<Child> = names
+        .iter()
+        .map(|name| {
+            bubbler(tmp.path())
+                .args(["wrap", "ff", "--as", name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for mut child in running {
+        assert!(child.wait().unwrap().success());
+    }
+    let text = std::fs::read_to_string(tmp.path().join("config/bubbler/wraps.kdl")).unwrap();
+    let lines = text.lines().filter(|l| l.starts_with("wrap ")).count();
+    let mut links: Vec<_> = std::fs::read_dir(tmp.path().join("home/.local/bin"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    links.sort();
+    assert_eq!(lines, 12, "{text}");
+    assert_eq!(links.len(), 12, "{links:?}");
+    for name in &names {
+        assert!(text.contains(&format!("wrap \"{name}\"")), "{text}");
+    }
+}
+
+#[test]
+fn a_shim_starts_a_real_sandbox() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else {
+        return;
+    };
+    let tmp = setup();
+    let link = wrapped_instance(tmp.path(), "sh");
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/sh/config.kdl"),
+        "command \"/usr/bin/id\"\n",
+    )
+    .unwrap();
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["wrap", "sh"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // No dry-run hook: this is the symlink, dispatch, `open` and bwrap,
+    // reporting the uid the sandbox actually runs as.
+    let out = common::shim(tmp.path(), &link)
+        .env("BUBBLER_INIT", &init)
+        .arg("-u")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        rustix::process::getuid().as_raw().to_string()
+    );
+}
+
+#[test]
+fn deleting_an_instance_names_the_shims_left_pointing_at_it() {
+    let tmp = setup();
+    wrapped_instance(tmp.path(), "ff");
+    bubbler(tmp.path())
+        .args(["wrap", "ff", "--as", "firefox"])
+        .status()
+        .unwrap();
+    let out = bubbler(tmp.path())
+        .args(["delete", "ff", "--yes"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    // Named, not removed: the file on the user's PATH is theirs to keep.
+    assert!(err.contains("shim `firefox` still opens `ff`"), "{err}");
+    assert!(tmp.path().join("home/.local/bin/firefox").exists());
+    let out = bubbler(tmp.path())
+        .args(["wrap", "--list"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).ends_with("\tbroken\n"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}

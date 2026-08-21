@@ -244,3 +244,65 @@ pub enum LintError {
     #[error("{0}")]
     Io(PathBuf, #[source] io::Error),
 }
+
+/// Failures while reading, writing or placing a `PATH` shim.
+#[derive(Debug, Error)]
+pub enum WrapError {
+    /// A shim name outside the grammar instance names use, so it could
+    /// name a path outside the shim directory, or a command nobody can
+    /// type.
+    #[error(
+        "invalid shim name `{0}`: use letters, digits, `.`, `_` and `-`, \
+         not starting with `-`, and not `.` or `..`"
+    )]
+    InvalidName(String),
+    /// A name bubbler resolves through `PATH` itself.
+    #[error(
+        "refusing to name a shim `{0}`: bubbler runs that program itself, \
+         so the shim would shadow the real one"
+    )]
+    Reserved(String),
+    /// The registry already maps the name to another instance.
+    #[error("`{name}` already opens instance `{instance}`; run `bubbler unwrap {name}` first")]
+    NameTaken {
+        /// The shim name that is taken.
+        name: String,
+        /// The instance it already opens.
+        instance: String,
+    },
+    /// The instance has no `command`, so a shim would have nothing to
+    /// run: what a shim hands `open` is that command plus whatever the
+    /// user typed after it.
+    #[error("instance `{0}` has no `command` to run; add one to its config.kdl first")]
+    NoCommand(String),
+    /// `unwrap` on a name the registry does not hold.
+    #[error("no shim named `{0}`")]
+    NotWrapped(String),
+    /// Something that is not one of bubbler's shims already has that
+    /// path. bubbler never moves it aside or deletes it.
+    #[error("{0} exists and is not a bubbler shim; move it aside first")]
+    Occupied(PathBuf),
+    /// The registry is not KDL at all.
+    #[error("{path}: invalid KDL")]
+    Parse {
+        /// The registry's path.
+        path: PathBuf,
+        /// What the parser rejected.
+        #[source]
+        source: kdl::KdlError,
+    },
+    /// The registry parses but says something bubbler would not write.
+    #[error("{path}: {reason}")]
+    Malformed {
+        /// The registry's path.
+        path: PathBuf,
+        /// What is wrong with it.
+        reason: String,
+    },
+    /// Filesystem failure at a specific path.
+    #[error("{0}")]
+    Io(PathBuf, #[source] io::Error),
+    /// The instance a shim would open cannot be reached.
+    #[error(transparent)]
+    Instance(#[from] InstanceError),
+}

@@ -37,6 +37,10 @@ every bwrap argument under the node that produced it. See "Known gaps" below.
     bubbler run ff --explain              # the same argv, grouped under its nodes
     bubbler run ff --tty none             # no terminal inside at all
     bubbler exec ff -- firefox --version  # run inside the instance already running
+    bubbler open ff -- firefox https://x  # run a command or URL in the instance
+    bubbler wrap ff                       # ~/.local/bin/ff starts that sandbox
+    bubbler wrap --list                   # every shim, and whether it still works
+    bubbler unwrap ff                     # remove it again
     bubbler try -- id                     # throwaway sandbox, nothing kept
     bubbler try --profile firefox --grant network -- firefox --version
     bubbler try --keep scratch -- sh      # keep it afterwards as instance `scratch`
@@ -988,6 +992,75 @@ from the file as it stands, bwrap cannot be told about a bind after the fact,
 and a `config.kdl` describing grants the running sandbox does not have would
 be a lie about what is confined.
 
+## PATH shims
+
+    bubbler wrap ff                  # ~/.local/bin/ff opens instance `ff`
+    bubbler wrap ff --as firefox     # under the application's own name instead
+    bubbler wrap --list              # name, instance, path, ok|broken
+    bubbler unwrap ff                # the shim and its registry line
+
+A shim is a symlink in `~/.local/bin` pointing at the bubbler binary. Started
+through it, bubbler reads the name it was called by out of `argv[0]`, looks it
+up in `$XDG_CONFIG_HOME/bubbler/wraps.kdl` and becomes `bubbler open
+<instance> -- <the instance's command> <your arguments>`, so `ff
+https://example.com` opens that URL in the sandbox (join behaviour lands with
+`open`). There is no extra process and no script to keep in step: the symlink
+*is* bubbler.
+
+`argv[0]` is the caller's to choose — `exec -a firefox …` sets it to anything —
+so the name is a key into a file bubbler wrote, never a name turned into an
+instance: a name the registry does not hold runs the ordinary CLI. It is also
+the only source, since `current_exe()` reads `/proc/self/exe` and so resolves
+the symlink back to the real binary.
+
+**The default name is the instance's, not the application's.** `bubbler wrap
+ff` puts `ff` on `PATH`, and typing `firefox` still starts the real one.
+`--as firefox` is how you ask for the other thing, and it prints a note when
+you do, because a shim intercepts more than what you type: of the 109 `Exec=`
+lines under `/usr/share/applications` on the desktop this was measured on, 75
+name a bare command for `PATH` to resolve, so wrapping `code` also changes what
+the VS Code menu entry starts — no desktop file edited, and nothing to see. A
+desktop entry that says in its own name what it is is the explicit way to say
+that.
+
+`~/.local/bin` is not on Arch's default `PATH`: the whole of `/etc/profile`'s
+contribution is `/usr/local/sbin`, `/usr/local/bin` and `/usr/bin`, and nothing
+under `/etc/profile.d` adds to it. So `wrap` says so rather than leaving behind
+a file that can never run, and says so again when a directory earlier on your
+`PATH` already holds that name.
+
+Refused, in every case naming the path and changing nothing: the names bubbler
+resolves itself (`bubbler`, `bubbler-init`, `bwrap`, `xdg-dbus-proxy`, `pasta`,
+`passt`) — wrapping `bubbler` is a loop, and the rest would break every sandbox
+on the machine; anything outside the instance name grammar, so no `/`, no
+spaces and no control characters; an instance with no `command`, which would
+leave the shim nothing to run; a name another instance already holds; and any
+existing path that is not a shim of bubbler's own. "bubbler's own" is a symlink
+pointing at a file named `bubbler`, so a package upgrade that moves the binary
+does not turn your shims into strangers, and a symlink somebody aimed elsewhere
+never becomes one. bubbler never moves a file aside and never deletes what it
+did not create, so `unwrap` on a name someone has since put their own file
+under drops the registry line and leaves the file alone.
+
+`wrap --list` prints one tab-separated line per shim: name, instance, path, and
+`ok` or `broken`. `broken` is anything that would not run — the link deleted by
+hand, a file of that name that is not one of bubbler's symlinks, a bubbler
+binary that has moved, or an instance that has been deleted — and `bubbler wrap
+<instance>` writes it again. `delete` names the shims left pointing at the
+instance it removed rather than deleting them for you: they are files on your
+`PATH`, and taking them away is `unwrap`'s job.
+
+Two `wrap`s at once cannot lose each other's entry: the read-modify-write of
+the registry is held under a `flock(2)` on `wraps.kdl.lock` beside it, and the
+file itself is replaced by a rename, so a reader sees one whole registry or the
+other.
+
+Nothing inside a sandbox can reach a shim: the sandbox's `PATH` is `/usr/bin`,
+its home is `/home/bubbler`, and no shim directory is ever bound in. The one
+footgun left is wrapping a program bubbler itself runs on the host — `edit`
+execs `$VISUAL`/`$EDITOR` with no shell, so a wrapped `nvim` would open
+`config.kdl` inside a sandbox that has no bind for it.
+
 ## Linting
 
     bubbler profile lint firefox           # one profile, flattened through its layers
@@ -1525,7 +1598,8 @@ using it.
 `HOME` and `XDG_RUNTIME_DIR` must be set and non-empty. Your profiles live in
 `$XDG_CONFIG_HOME/bubbler/profiles/` (by default under `~/.config`) and the
 system's in `/usr/share/bubbler/profiles/`, or wherever
-`$BUBBLER_PROFILE_DIR` points instead.
+`$BUBBLER_PROFILE_DIR` points instead. `wrap` keeps its registry beside them in
+`$XDG_CONFIG_HOME/bubbler/wraps.kdl` and its symlinks in `~/.local/bin/`.
 
 Those socket paths have to fit the 107 bytes a Unix socket address holds, so
 `create` and `try` refuse a name that would make one longer instead of letting
@@ -1535,8 +1609,11 @@ The `bubbler-init` binary is taken from `$BUBBLER_INIT` if set (it must be a
 regular file), else from next to the `bubbler` binary, else from
 `/usr/lib/bubbler/bubbler-init`. `$BUBBLER_DBUS_PROXY` likewise replaces the
 `xdg-dbus-proxy` on `PATH` with a regular file bound into the proxy sandbox at
-its own path; it exists for tests and debugging, as does the
-`$BUBBLER_TEST_ALLOW_PATH` described under "Host paths".
+its own path; it exists for tests and debugging, as do the
+`$BUBBLER_TEST_ALLOW_PATH` described under "Host paths" and
+`$BUBBLER_WRAP_DRY_RUN=1`, which makes a shim print the `bubbler open` command
+line it resolved to, one argument per line, and exit without starting
+anything.
 
 ## Build
 
