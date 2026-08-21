@@ -93,21 +93,39 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
             if rules.is_empty() {
                 return Ok("dbus".to_owned());
             }
-            let mut node = String::from("dbus {\n");
-            for r in rules {
-                let (kind, arg) = match r {
-                    BusRule::See(n) => ("see", n.clone()),
-                    BusRule::Talk(n) => ("talk", n.clone()),
-                    BusRule::Own(n) => ("own", n.clone()),
-                    BusRule::Call(n, rule) => ("call", format!("{n}={rule}")),
-                    BusRule::Broadcast(n, rule) => ("broadcast", format!("{n}={rule}")),
-                };
-                node.push_str(&format!("    {kind} {}\n", quote(&arg)));
+            bus_block("dbus", rules)
+        }
+        Service::SystemBus { rules } => {
+            // Unlike `dbus`, the parser refuses the node without rules, so
+            // an empty one would render KDL that no longer reads back.
+            if rules.is_empty() {
+                return Err(ConfigError::BadArgument {
+                    node: "system-bus".to_owned(),
+                    reason: "has no rules, and a system bus without one is not a config \
+                             bubbler parses"
+                        .to_owned(),
+                });
             }
-            node.push('}');
-            node
+            bus_block("system-bus", rules)
         }
     })
+}
+
+/// A bus node with its rule children, one per line.
+fn bus_block(name: &str, rules: &[BusRule]) -> String {
+    let mut node = format!("{name} {{\n");
+    for r in rules {
+        let (kind, arg) = match r {
+            BusRule::See(n) => ("see", n.clone()),
+            BusRule::Talk(n) => ("talk", n.clone()),
+            BusRule::Own(n) => ("own", n.clone()),
+            BusRule::Call(n, rule) => ("call", format!("{n}={rule}")),
+            BusRule::Broadcast(n, rule) => ("broadcast", format!("{n}={rule}")),
+        };
+        node.push_str(&format!("    {kind} {}\n", quote(&arg)));
+    }
+    node.push('}');
+    node
 }
 
 /// One `env KEY="value"` node.
@@ -245,6 +263,12 @@ mod tests {
                 call "org.freedesktop.portal.Desktop=org.freedesktop.portal.Settings.Read@/org/freedesktop/portal/desktop"
                 broadcast "org.freedesktop.portal.Desktop=@/org/freedesktop/portal/desktop"
             }
+            system-bus {
+                see "org.freedesktop.NetworkManager"
+                talk "org.freedesktop.UPower"
+                call "org.freedesktop.UDisks2=org.freedesktop.DBus.ObjectManager.GetManagedObjects@/org/freedesktop/UDisks2"
+                broadcast "org.freedesktop.UDisks2=@/org/freedesktop/UDisks2"
+            }
             portals
             notify
             tray
@@ -265,6 +289,8 @@ mod tests {
         );
         // A `dbus` grant with no rules is a node of its own shape.
         round_trip("dbus\nportals");
+        // The system bus needs neither the session bus nor a bundle.
+        round_trip("system-bus { talk \"org.freedesktop.UPower\" }");
         round_trip("tty \"none\"");
         round_trip("seccomp { disable; }");
         round_trip("gamepad");
@@ -314,6 +340,20 @@ mod tests {
             ..InstanceConfig::default()
         };
         assert!(render(&cfg).is_err());
+    }
+
+    #[test]
+    fn a_system_bus_without_rules_is_refused_rather_than_written() {
+        // The parser refuses it too, so writing the node out would produce
+        // a profile that cannot be read back.
+        let cfg = InstanceConfig {
+            services: vec![Service::SystemBus { rules: vec![] }],
+            ..InstanceConfig::default()
+        };
+        assert!(matches!(
+            render(&cfg),
+            Err(ConfigError::BadArgument { node, .. }) if node == "system-bus"
+        ));
     }
 
     #[test]

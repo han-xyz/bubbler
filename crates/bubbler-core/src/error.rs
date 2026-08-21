@@ -125,6 +125,10 @@ pub enum InstanceError {
     /// there is no profile to re-flatten it from.
     #[error("{0} has no `// bubbler profile: <name>` header to reseed from")]
     NoProfileHeader(PathBuf),
+    /// The instance's runtime socket paths are longer than a
+    /// `sockaddr_un` holds, so the kernel would truncate them silently.
+    #[error("{0} is longer than the 107 bytes a Unix socket path may have; use a shorter name")]
+    SocketPathTooLong(PathBuf),
     /// Asking the instance's control socket whether it is running failed.
     #[error("checking whether the instance is running")]
     Probe(#[source] LaunchError),

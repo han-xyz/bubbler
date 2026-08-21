@@ -271,15 +271,21 @@ impl BwrapArgs {
     /// The sandbox the D-Bus proxy sidecar runs in: the same namespace
     /// restrictions as [`BwrapArgs::baseline`], a read-only `/usr` and a
     /// minimal `/etc` ([`PROXY_ETC`]) so the proxy binary can start, no
-    /// home, no runtime dir of its own, and exactly two paths from the
-    /// session: the host bus socket read-only and `socket_dir`
-    /// read-write, which is where it creates the filtered socket. The
-    /// environment is cleared; the bus address is an argument.
+    /// home, no runtime dir of its own, and only these paths from the
+    /// session: the host socket of each bus it was asked for, read-only,
+    /// and `socket_dir` read-write, which is where it creates the
+    /// filtered sockets. The environment is cleared; the addresses are
+    /// arguments.
     ///
     /// `socket_dir` is a directory of its own, never the instance's
     /// runtime directory: that one holds the supervisor's control socket,
     /// and a process that reaches it can run commands inside the app.
-    pub fn proxy_baseline(host_bus: &Path, socket_dir: &Path, host: &dyn Host) -> Self {
+    pub fn proxy_baseline(
+        host_bus: Option<&Path>,
+        host_system_bus: Option<&Path>,
+        socket_dir: &Path,
+        host: &dyn Host,
+    ) -> Self {
         let mut a = Self {
             namespaces: Vec::new(),
             skeleton: Vec::new(),
@@ -327,10 +333,14 @@ impl BwrapArgs {
                 o("/tmp"),
             ],
         );
-        push(
-            &mut a.skeleton,
-            [o("--ro-bind"), host_bus.as_os_str(), host_bus.as_os_str()],
-        );
+        // Only the buses this proxy was asked for: a socket bound here
+        // that no section names is a host bus the proxy could still reach.
+        for bus in [host_bus, host_system_bus].into_iter().flatten() {
+            push(
+                &mut a.skeleton,
+                [o("--ro-bind"), bus.as_os_str(), bus.as_os_str()],
+            );
+        }
         // Read-write because the proxy has to create its socket here, and
         // nothing else of the session is in this directory.
         push(
@@ -572,6 +582,7 @@ mod tests {
             passthrough: vec![("TERM".into(), "foot".into())],
             init_override: None,
             dbus_address: None,
+            dbus_system_address: None,
             dbus_log: false,
             seccomp_log: false,
             test_allow_path: None,
@@ -787,7 +798,8 @@ mod tests {
     fn the_proxy_sandbox_gets_no_ntsync() {
         let host = FakeHost::default().with("/dev/ntsync", crate::host::fake::char_type());
         let argv = BwrapArgs::proxy_baseline(
-            Path::new("/run/user/1000/bus"),
+            Some(Path::new("/run/user/1000/bus")),
+            None,
             Path::new("/run/user/1000/bubbler/t/dbus"),
             &host,
         )
@@ -805,7 +817,8 @@ mod tests {
             .with("/etc/nsswitch.conf", f)
             .with("/etc/hosts", f);
         let argv = BwrapArgs::proxy_baseline(
-            Path::new("/run/user/1000/bus"),
+            Some(Path::new("/run/user/1000/bus")),
+            None,
             Path::new("/run/user/1000/bubbler/t/dbus"),
             &host,
         )
@@ -861,12 +874,47 @@ mod tests {
             ],
             "an /etc entry that is not in PROXY_ETC must not appear"
         );
+        // Without the section there is no bind of the host system bus,
+        // and with it the two sockets are bound in argv order.
+        assert!(!argv.iter().any(|a| a == "/run/dbus/system_bus_socket"));
+        let both = BwrapArgs::proxy_baseline(
+            Some(Path::new("/run/user/1000/bus")),
+            Some(Path::new("/run/dbus/system_bus_socket")),
+            Path::new("/run/user/1000/bubbler/t/dbus"),
+            &host,
+        )
+        .finish_plain(&["xdg-dbus-proxy".into()], &mut Counter::new())
+        .unwrap();
+        assert!(
+            strs(&both).windows(6).any(|w| w
+                == [
+                    "--ro-bind",
+                    "/run/user/1000/bus",
+                    "/run/user/1000/bus",
+                    "--ro-bind",
+                    "/run/dbus/system_bus_socket",
+                    "/run/dbus/system_bus_socket",
+                ]),
+            "{:?}",
+            strs(&both)
+        );
+        // A system-only proxy never sees the session bus.
+        let system_only = BwrapArgs::proxy_baseline(
+            None,
+            Some(Path::new("/run/dbus/system_bus_socket")),
+            Path::new("/run/user/1000/bubbler/t/dbus"),
+            &host,
+        )
+        .finish_plain(&["xdg-dbus-proxy".into()], &mut Counter::new())
+        .unwrap();
+        assert!(!system_only.iter().any(|a| a == "/run/user/1000/bus"));
     }
 
     #[test]
     fn proxy_sandbox_takes_the_flatpak_info_data_file() {
         let mut args = BwrapArgs::proxy_baseline(
-            Path::new("/run/user/1000/bus"),
+            Some(Path::new("/run/user/1000/bus")),
+            None,
             Path::new("/run/user/1000/bubbler/t/dbus"),
             &FakeHost::default(),
         );

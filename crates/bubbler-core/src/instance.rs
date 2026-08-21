@@ -15,6 +15,7 @@ use crate::env::Env;
 use crate::error::InstanceError;
 use crate::kdl_out;
 use crate::profile::{self, PROFILE_HEADER};
+use crate::{dbus, exec};
 
 const CONFIG_FILE: &str = "config.kdl";
 
@@ -113,6 +114,34 @@ fn validate_name(name: &str) -> Result<(), InstanceError> {
     } else {
         Err(InstanceError::InvalidName(name.to_owned()))
     }
+}
+
+/// Bytes a `sockaddr_un` holds, the terminating NUL among them
+/// (`unix(7)`).
+const SUN_PATH_MAX: usize = 108;
+
+/// Refuse a name whose runtime sockets would not fit a `sockaddr_un`.
+/// The kernel truncates a longer path without saying so, and what the
+/// user then sees is a client failing on a path that is not the one
+/// bubbler printed. Checked where the instance is created, so the name is
+/// still the user's to change.
+// Every socket an instance can have, longest first: the proxy binds its
+// own in the `dbus/` subdirectory, one level deeper than the path the
+// launcher then moves it to, so those are the longest of all.
+fn check_socket_paths(env: &Env, name: &str) -> Result<(), InstanceError> {
+    let runtime = env.runtime_dir.join("bubbler").join(name);
+    for path in [
+        dbus::proxy_bus_path(&runtime, dbus::SYSTEM_SOCKET),
+        dbus::proxy_bus_path(&runtime, dbus::SESSION_SOCKET),
+        runtime.join(exec::SOCKET_NAME),
+        dbus::app_bus_path(&runtime, dbus::SYSTEM_SOCKET),
+        dbus::app_bus_path(&runtime, dbus::SESSION_SOCKET),
+    ] {
+        if path.as_os_str().as_encoded_bytes().len() + 1 > SUN_PATH_MAX {
+            return Err(InstanceError::SocketPathTooLong(path));
+        }
+    }
+    Ok(())
 }
 
 fn io_err(path: &Path) -> impl FnOnce(io::Error) -> InstanceError + '_ {
@@ -382,6 +411,7 @@ impl Instance {
     /// layers. Fails if the directory already exists; never overwrites.
     pub fn create(env: &Env, name: &str, profile_name: &str) -> Result<Self, InstanceError> {
         validate_name(name)?;
+        check_socket_paths(env, name)?;
         let (text, config) = seed(env, profile_name, &[])?;
         let dir = instances_root(env).join(name);
         make_dir(&dir, name, &text)?;
@@ -404,6 +434,7 @@ impl Instance {
         let (text, config) = seed(env, profile_name, grants)?;
         let pid = std::process::id();
         let name = format!("try-{pid}");
+        check_socket_paths(env, &name)?;
         let dir = try_root(env).join(pid.to_string());
         let runtime = env.runtime_dir.join("bubbler").join(&name);
         // Only this process can be the live owner of try/<own pid>, so a
@@ -543,6 +574,7 @@ mod tests {
             passthrough: vec![],
             init_override: None,
             dbus_address: None,
+            dbus_system_address: None,
             dbus_log: false,
             seccomp_log: false,
             test_allow_path: None,
@@ -563,6 +595,54 @@ mod tests {
         let opened = Instance::open(&env, "ff").unwrap();
         assert_eq!(opened.dir, inst.dir);
         assert_eq!(Instance::list(&env).unwrap(), vec!["ff".to_string()]);
+    }
+
+    #[test]
+    fn a_name_whose_runtime_sockets_would_be_truncated_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        // `/run/user/1000/bubbler/`, and the longest path below it is the
+        // proxy's own system bus socket.
+        let prefix = e.runtime_dir.join("bubbler").join("").as_os_str().len();
+        assert_eq!(prefix, 23);
+        let longest = |name: &str| {
+            dbus::proxy_bus_path(
+                &e.runtime_dir.join("bubbler").join(name),
+                dbus::SYSTEM_SOCKET,
+            )
+        };
+        let fits = 107 - prefix - "/dbus/system".len();
+        let name = "a".repeat(fits);
+        assert_eq!(longest(&name).as_os_str().len(), 107);
+        assert!(Instance::create(&e, &name, "generic").is_ok(), "{fits}");
+
+        let name = "b".repeat(fits + 1);
+        let Err(InstanceError::SocketPathTooLong(path)) = Instance::create(&e, &name, "generic")
+        else {
+            panic!("a name one byte too long was accepted");
+        };
+        assert_eq!(path, longest(&name));
+        // And nothing was created for it.
+        assert!(!instances_root(&e).join(&name).exists());
+
+        // A 74-character name leaves the control socket 107 bytes and the
+        // proxy's socket two over, which is how a live proxy came to bind
+        // a truncated `.../dbus/syst`.
+        let name = "c".repeat(74);
+        assert_eq!(
+            e.runtime_dir
+                .join("bubbler")
+                .join(&name)
+                .join(exec::SOCKET_NAME)
+                .as_os_str()
+                .len(),
+            107
+        );
+        let Err(InstanceError::SocketPathTooLong(path)) = Instance::create(&e, &name, "generic")
+        else {
+            panic!("a name whose proxy socket is truncated was accepted");
+        };
+        assert_eq!(path, longest(&name));
     }
 
     #[test]

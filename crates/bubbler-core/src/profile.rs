@@ -542,6 +542,22 @@ impl Merged {
                     return Ok(());
                 }
             }
+            Service::SystemBus { rules } => {
+                if let Some((held_rules, held_src)) =
+                    self.services.iter_mut().find_map(|(s, src)| match s {
+                        Service::SystemBus { rules: held } => Some((held, src)),
+                        _ => None,
+                    })
+                {
+                    for r in rules {
+                        if !held_rules.contains(r) {
+                            held_rules.push(r.clone());
+                        }
+                    }
+                    *held_src = src.clone();
+                    return Ok(());
+                }
+            }
             Service::Mpris { .. } => {
                 if let Some(slot) = self
                     .services
@@ -705,6 +721,7 @@ mod tests {
             passthrough: vec![],
             init_override: None,
             dbus_address: None,
+            dbus_system_address: None,
             dbus_log: false,
             seccomp_log: false,
             test_allow_path: None,
@@ -1098,6 +1115,49 @@ mod tests {
         assert_eq!(node, "path-share \"/kioxia/Steam\"");
         assert!(a.contains("mode=rw") && a.contains("b.kdl"), "{a}");
         assert!(b.contains("mode=ro") && b.contains("a.kdl"), "{b}");
+    }
+
+    #[test]
+    fn system_bus_rules_union_across_layers_and_stay_off_the_session_bus() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(
+            tmp.path(),
+            &[(
+                "a",
+                "include \"b\"\ndbus { talk \"org.a.B\" }\n                 system-bus { talk \"org.freedesktop.UPower\"; see \"org.freedesktop.NM\" }\n",
+            )],
+            &[(
+                "b",
+                "system-bus { talk \"org.freedesktop.UPower\"; talk \"org.freedesktop.UDisks2\" }\n",
+            )],
+        );
+        let cfg = &r.resolve("a").unwrap().config;
+        let Some(Service::SystemBus { rules }) = cfg
+            .services
+            .iter()
+            .find(|s| matches!(s, Service::SystemBus { .. }))
+        else {
+            panic!("{:?}", cfg.services)
+        };
+        // The lower layer first, and a rule both layers wrote once.
+        assert_eq!(
+            *rules,
+            vec![
+                BusRule::Talk("org.freedesktop.UPower".to_owned()),
+                BusRule::Talk("org.freedesktop.UDisks2".to_owned()),
+                BusRule::See("org.freedesktop.NM".to_owned()),
+            ]
+        );
+        // The two nodes are separate grants; neither takes the other's
+        // rules.
+        let Some(Service::Dbus { rules }) = cfg
+            .services
+            .iter()
+            .find(|s| matches!(s, Service::Dbus { .. }))
+        else {
+            panic!("{:?}", cfg.services)
+        };
+        assert_eq!(*rules, vec![BusRule::Talk("org.a.B".to_owned())]);
     }
 
     #[test]

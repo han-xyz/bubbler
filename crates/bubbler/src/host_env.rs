@@ -92,6 +92,7 @@ pub fn from_process() -> Result<Env> {
             .filter(|v| !v.is_empty())
             .map(PathBuf::from),
         dbus_address: env::var_os("DBUS_SESSION_BUS_ADDRESS").filter(|v| !v.is_empty()),
+        dbus_system_address: env::var_os("DBUS_SYSTEM_BUS_ADDRESS").filter(|v| !v.is_empty()),
         dbus_log: env::var_os("BUBBLER_DBUS_LOG").is_some_and(|v| v == "1"),
         seccomp_log: env::var_os("BUBBLER_SECCOMP_LOG").is_some_and(|v| v == "1"),
         test_allow_path: test_allow_path()?,
