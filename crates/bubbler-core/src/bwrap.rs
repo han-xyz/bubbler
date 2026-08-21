@@ -12,11 +12,57 @@ use crate::env::{Env, SANDBOX_HOME};
 use crate::error::LaunchError;
 use crate::host::Host;
 
-/// One entry of a phase: either a literal argument or a generated file
-/// that only becomes arguments once an fd has been allocated for it.
+/// Which decision put an argument in the argv. Rendering one takes the
+/// config it indexes into, so it stays a tag here and text elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// [`BwrapArgs::baseline`] or [`BwrapArgs::proxy_baseline`]: what
+    /// every sandbox is restricted to before a grant relaxes it.
+    Baseline,
+    /// A compiled seccomp program.
+    Seccomp,
+    /// A `userns "disable"` node.
+    Userns,
+    /// `--ctty`, decided by the terminal mode rather than by the config.
+    Ctty,
+    /// The `/.flatpak-info` document that names the sandbox to the proxy.
+    Identity,
+    /// Index into the instance config's `services`, in file order.
+    Service(usize),
+    /// Index into the instance config's `env`, in file order.
+    Env(usize),
+    /// The `bubbler-init` bind and the supervisor's own arguments.
+    Init,
+    /// The program the sandbox runs, after the final `--`.
+    Command,
+}
+
+/// One operation of a bwrap argv with the decision that produced it and,
+/// for an argument bwrap reads a generated fd from, what is behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Explained {
+    /// What put these arguments in the argv.
+    pub origin: Origin,
+    /// The argv elements of this one operation, in order.
+    pub args: Vec<OsString>,
+    /// What an fd number in `args` refers to, for a reader who cannot
+    /// see the pipe or the memfd behind it.
+    pub note: Option<String>,
+}
+
+/// One entry of a phase with the origin that pushed it.
 #[derive(Debug, Clone)]
-enum Item {
-    Arg(OsString),
+struct Item {
+    origin: Origin,
+    kind: Kind,
+}
+
+/// Either the literal arguments of one operation or a generated file that
+/// only becomes arguments once an fd has been allocated for it.
+#[derive(Debug, Clone)]
+enum Kind {
+    /// The elements of one operation, e.g. `--ro-bind SRC DST`.
+    Args(Vec<OsString>),
     /// Content written to an fd by the allocator at `finish` time and
     /// bound read-only at `dest` with `mode`.
     Data {
@@ -34,6 +80,8 @@ enum Item {
         /// cBPF as `struct sock_filter` bytes; bwrap rejects a length that
         /// is not a multiple of eight.
         program: Vec<u8>,
+        /// The error this program answers with, for [`Explained::note`].
+        errno: &'static str,
     },
 }
 
@@ -76,10 +124,26 @@ pub struct BwrapArgs {
     env: Vec<Item>,
     /// `--ctty` in the supervisor's own argv, not a bwrap flag.
     ctty: bool,
+    /// Tag every following push carries. Set once per phase of work by
+    /// [`BwrapArgs::tag`], so the dozens of `ro_bind`/`setenv` call sites
+    /// need no origin argument of their own.
+    origin: Origin,
 }
 
-fn push<const N: usize>(v: &mut Vec<Item>, parts: [&OsStr; N]) {
-    v.extend(parts.iter().map(|p| Item::Arg(p.to_os_string())));
+/// Whether one item is an operation `flag` leads, for the two phase-1
+/// flags that must not be emitted twice. Only the head is compared: a
+/// value further along could be anything, `--share-net` included.
+fn holds(item: &Item, flag: &OsStr) -> bool {
+    matches!(&item.kind, Kind::Args(a) if a.first().is_some_and(|p| p == flag))
+}
+
+/// One operation: the parts become one line of an explanation and stay
+/// separate elements of the argv.
+fn push<const N: usize>(v: &mut Vec<Item>, origin: Origin, parts: [&OsStr; N]) {
+    v.push(Item {
+        origin,
+        kind: Kind::Args(parts.iter().map(|p| p.to_os_string()).collect()),
+    });
 }
 
 /// Host `/etc` entries bound read-only when they exist. Everything else in
@@ -152,64 +216,71 @@ impl BwrapArgs {
             binds: Vec::new(),
             env: Vec::new(),
             ctty: false,
+            origin: Origin::Baseline,
         };
         let o = OsStr::new;
-        push(
-            &mut a.namespaces,
-            [
-                o("--unshare-all"),
-                o("--die-with-parent"),
-                o("--new-session"),
-                o("--hostname"),
-                o("bubbler"),
-                // bwrap keeps the working directory it was started in when
-                // that path also exists inside, so without --chdir a sandbox
-                // started from, say, /tmp would run there instead of in the
-                // private home.
-                o("--chdir"),
-                o(SANDBOX_HOME),
-            ],
-        );
+        let b = Origin::Baseline;
+        for flag in [
+            o("--unshare-all"),
+            o("--die-with-parent"),
+            o("--new-session"),
+        ] {
+            push(&mut a.namespaces, b, [flag]);
+        }
+        push(&mut a.namespaces, b, [o("--hostname"), o("bubbler")]);
+        // bwrap keeps the working directory it was started in when that
+        // path also exists inside, so without --chdir a sandbox started
+        // from, say, /tmp would run there instead of in the private home.
+        push(&mut a.namespaces, b, [o("--chdir"), o(SANDBOX_HOME)]);
         // bwrap reports the sandbox pid here; the launcher needs it to
         // signal the supervisor, since bwrap forwards no signals itself.
-        a.namespaces.push(Item::InfoFd);
+        a.namespaces.push(Item {
+            origin: b,
+            kind: Kind::InfoFd,
+        });
 
-        push(&mut a.skeleton, [o("--ro-bind"), o("/usr"), o("/usr")]);
+        push(&mut a.skeleton, b, [o("--ro-bind"), o("/usr"), o("/usr")]);
         for (target, link) in [
             ("usr/bin", "/bin"),
             ("usr/lib", "/lib"),
             ("usr/lib64", "/lib64"),
             ("usr/bin", "/sbin"),
         ] {
-            push(&mut a.skeleton, [o("--symlink"), o(target), o(link)]);
+            push(&mut a.skeleton, b, [o("--symlink"), o(target), o(link)]);
         }
-        push(&mut a.skeleton, [o("--ro-bind-try"), o("/opt"), o("/opt")]);
+        push(
+            &mut a.skeleton,
+            b,
+            [o("--ro-bind-try"), o("/opt"), o("/opt")],
+        );
         // The tmpfs has to precede the entry binds and the data files, or it
         // would hide them: bwrap applies filesystem operations in argv order.
-        push(&mut a.skeleton, [o("--tmpfs"), o("/etc")]);
+        push(&mut a.skeleton, b, [o("--tmpfs"), o("/etc")]);
         for name in ETC_ALLOWLIST {
             let p = Path::new("/etc").join(name);
             if host.file_type(&p).is_some() {
                 push(
                     &mut a.skeleton,
+                    b,
                     [o("--ro-bind"), p.as_os_str(), p.as_os_str()],
                 );
             }
         }
-        a.skeleton.push(Item::Data {
-            content: passwd_content(env.uid, env.gid),
-            dest: "/etc/passwd".into(),
-            mode: "0644".into(),
-        });
-        a.skeleton.push(Item::Data {
-            content: group_content(env.gid),
-            dest: "/etc/group".into(),
-            mode: "0644".into(),
-        });
-        push(
-            &mut a.skeleton,
-            [o("--proc"), o("/proc"), o("--dev"), o("/dev")],
-        );
+        for (content, dest) in [
+            (passwd_content(env.uid, env.gid), "/etc/passwd"),
+            (group_content(env.gid), "/etc/group"),
+        ] {
+            a.skeleton.push(Item {
+                origin: b,
+                kind: Kind::Data {
+                    content,
+                    dest: dest.into(),
+                    mode: "0644".into(),
+                },
+            });
+        }
+        push(&mut a.skeleton, b, [o("--proc"), o("/proc")]);
+        push(&mut a.skeleton, b, [o("--dev"), o("/dev")]);
         // Wine's and Proton's synchronisation primitive, which flatpak binds
         // with no permission of its own: the objects it makes belong to the
         // process that opened it, so there is no host state behind it. The
@@ -221,27 +292,24 @@ impl BwrapArgs {
         if host.file_type(ntsync).is_some_and(|t| t.is_char_device()) {
             push(
                 &mut a.skeleton,
+                b,
                 [o("--dev-bind"), ntsync.as_os_str(), ntsync.as_os_str()],
             );
         }
+        for dir in [o("/tmp"), o("/var"), o("/run")] {
+            push(&mut a.skeleton, b, [o("--tmpfs"), dir]);
+        }
         push(
             &mut a.skeleton,
-            [
-                o("--tmpfs"),
-                o("/tmp"),
-                o("--tmpfs"),
-                o("/var"),
-                o("--tmpfs"),
-                o("/run"),
-            ],
-        );
-        push(
-            &mut a.skeleton,
+            b,
             [o("--bind"), instance_home.as_os_str(), o(SANDBOX_HOME)],
         );
 
+        // `--perms` applies to the next operation only, so it stays part
+        // of the same operation as the `--dir` it sets the mode of.
         push(
             &mut a.runtime_dir,
+            b,
             [
                 o("--perms"),
                 o("0700"),
@@ -250,22 +318,23 @@ impl BwrapArgs {
             ],
         );
 
-        push(&mut a.env, [o("--clearenv")]);
+        push(&mut a.env, b, [o("--clearenv")]);
         for (k, v) in &env.passthrough {
-            push(&mut a.env, [o("--setenv"), k, v]);
+            push(&mut a.env, b, [o("--setenv"), k, v]);
         }
-        push(&mut a.env, [o("--setenv"), o("HOME"), o(SANDBOX_HOME)]);
-        push(&mut a.env, [o("--setenv"), o("PATH"), o("/usr/bin")]);
+        push(&mut a.env, b, [o("--setenv"), o("HOME"), o(SANDBOX_HOME)]);
+        push(&mut a.env, b, [o("--setenv"), o("PATH"), o("/usr/bin")]);
         push(
             &mut a.env,
+            b,
             [
                 o("--setenv"),
                 o("XDG_RUNTIME_DIR"),
                 env.runtime_dir.as_os_str(),
             ],
         );
-        push(&mut a.env, [o("--setenv"), o("USER"), o("bubbler")]);
-        push(&mut a.env, [o("--setenv"), o("LOGNAME"), o("bubbler")]);
+        push(&mut a.env, b, [o("--setenv"), o("USER"), o("bubbler")]);
+        push(&mut a.env, b, [o("--setenv"), o("LOGNAME"), o("bubbler")]);
         a
     }
 
@@ -294,51 +363,46 @@ impl BwrapArgs {
             binds: Vec::new(),
             env: Vec::new(),
             ctty: false,
+            origin: Origin::Baseline,
         };
         let o = OsStr::new;
-        push(
-            &mut a.namespaces,
-            [
-                o("--unshare-all"),
-                o("--die-with-parent"),
-                o("--new-session"),
-            ],
-        );
-        push(&mut a.skeleton, [o("--ro-bind"), o("/usr"), o("/usr")]);
+        let b = Origin::Baseline;
+        for flag in [
+            o("--unshare-all"),
+            o("--die-with-parent"),
+            o("--new-session"),
+        ] {
+            push(&mut a.namespaces, b, [flag]);
+        }
+        push(&mut a.skeleton, b, [o("--ro-bind"), o("/usr"), o("/usr")]);
         for (target, link) in [
             ("usr/bin", "/bin"),
             ("usr/lib", "/lib"),
             ("usr/lib64", "/lib64"),
             ("usr/bin", "/sbin"),
         ] {
-            push(&mut a.skeleton, [o("--symlink"), o(target), o(link)]);
+            push(&mut a.skeleton, b, [o("--symlink"), o(target), o(link)]);
         }
-        push(&mut a.skeleton, [o("--tmpfs"), o("/etc")]);
+        push(&mut a.skeleton, b, [o("--tmpfs"), o("/etc")]);
         for name in PROXY_ETC {
             let p = Path::new("/etc").join(name);
             if host.file_type(&p).is_some() {
                 push(
                     &mut a.skeleton,
+                    b,
                     [o("--ro-bind"), p.as_os_str(), p.as_os_str()],
                 );
             }
         }
-        push(
-            &mut a.skeleton,
-            [
-                o("--proc"),
-                o("/proc"),
-                o("--dev"),
-                o("/dev"),
-                o("--tmpfs"),
-                o("/tmp"),
-            ],
-        );
+        push(&mut a.skeleton, b, [o("--proc"), o("/proc")]);
+        push(&mut a.skeleton, b, [o("--dev"), o("/dev")]);
+        push(&mut a.skeleton, b, [o("--tmpfs"), o("/tmp")]);
         // Only the buses this proxy was asked for: a socket bound here
         // that no section names is a host bus the proxy could still reach.
         for bus in [host_bus, host_system_bus].into_iter().flatten() {
             push(
                 &mut a.skeleton,
+                b,
                 [o("--ro-bind"), bus.as_os_str(), bus.as_os_str()],
             );
         }
@@ -346,9 +410,10 @@ impl BwrapArgs {
         // nothing else of the session is in this directory.
         push(
             &mut a.skeleton,
+            b,
             [o("--bind"), socket_dir.as_os_str(), socket_dir.as_os_str()],
         );
-        push(&mut a.env, [o("--clearenv")]);
+        push(&mut a.env, b, [o("--clearenv")]);
         a
     }
 
@@ -358,13 +423,27 @@ impl BwrapArgs {
     /// `--unshare-all`, which bwrap requires.
     pub fn share_net(&mut self) {
         let flag = OsStr::new("--share-net");
-        if !self
-            .namespaces
-            .iter()
-            .any(|i| matches!(i, Item::Arg(a) if a == flag))
-        {
-            self.namespaces.insert(1, Item::Arg(flag.to_os_string()));
+        if !self.namespaces.iter().any(|i| holds(i, flag)) {
+            self.namespaces.insert(
+                1,
+                Item {
+                    origin: self.origin,
+                    kind: Kind::Args(vec![flag.to_os_string()]),
+                },
+            );
         }
+    }
+
+    /// Tag every argument pushed from here on with `origin`. The caller
+    /// stamps it once per phase of work; nothing else has to know.
+    pub fn tag(&mut self, origin: Origin) {
+        self.origin = origin;
+    }
+
+    /// The tag in force, for a service that hands part of its work to
+    /// another node's grant and has to put its own back afterwards.
+    pub fn origin(&self) -> Origin {
+        self.origin
     }
 
     /// Forbid nested user namespaces (`bwrap(1)` `--disable-userns`,
@@ -374,14 +453,12 @@ impl BwrapArgs {
     /// host has unprivileged ones.
     pub fn disable_userns(&mut self) {
         let flags = [OsStr::new("--unshare-user"), OsStr::new("--disable-userns")];
-        if self
-            .namespaces
-            .iter()
-            .any(|i| matches!(i, Item::Arg(a) if a == flags[1]))
-        {
+        // The pair is one operation, and nothing else emits its head, so
+        // `--unshare-user` there is what says it has already been added.
+        if self.namespaces.iter().any(|i| holds(i, flags[0])) {
             return;
         }
-        push(&mut self.namespaces, flags);
+        push(&mut self.namespaces, self.origin, flags);
     }
 
     /// Hold the sandbox at startup until the launcher lets it go
@@ -390,7 +467,10 @@ impl BwrapArgs {
     // After `--info-fd`, which bwrap writes before it reads this one: the
     // identity is built out of that document.
     pub fn block_until_released(&mut self) {
-        self.namespaces.push(Item::BlockFd);
+        self.namespaces.push(Item {
+            origin: self.origin,
+            kind: Kind::BlockFd,
+        });
     }
 
     /// Load one compiled seccomp program into the sandbox (`bwrap(1)`
@@ -402,14 +482,18 @@ impl BwrapArgs {
     // `deny "prctl"`. Placed after `--info-fd` and `--block-fd` only for
     // readability; bwrap orders seccomp fds among themselves, not against
     // other flags.
-    pub fn add_seccomp(&mut self, program: Vec<u8>) {
-        self.namespaces.push(Item::Seccomp { program });
+    pub fn add_seccomp(&mut self, program: Vec<u8>, errno: &'static str) {
+        self.namespaces.push(Item {
+            origin: self.origin,
+            kind: Kind::Seccomp { program, errno },
+        });
     }
 
     /// Read-only bind of a host path (phase 4).
     pub fn ro_bind(&mut self, src: &Path, dst: &Path) {
         push(
             &mut self.binds,
+            self.origin,
             [OsStr::new("--ro-bind"), src.as_os_str(), dst.as_os_str()],
         );
     }
@@ -421,6 +505,7 @@ impl BwrapArgs {
     pub fn dev_bind(&mut self, src: &Path, dst: &Path) {
         push(
             &mut self.binds,
+            self.origin,
             [OsStr::new("--dev-bind"), src.as_os_str(), dst.as_os_str()],
         );
     }
@@ -432,6 +517,7 @@ impl BwrapArgs {
     pub fn dev_bind_try(&mut self, src: &Path, dst: &Path) {
         push(
             &mut self.binds,
+            self.origin,
             [
                 OsStr::new("--dev-bind-try"),
                 src.as_os_str(),
@@ -444,6 +530,7 @@ impl BwrapArgs {
     pub fn bind(&mut self, src: &Path, dst: &Path) {
         push(
             &mut self.binds,
+            self.origin,
             [OsStr::new("--bind"), src.as_os_str(), dst.as_os_str()],
         );
     }
@@ -457,10 +544,13 @@ impl BwrapArgs {
     /// Bind `content` read-only at `dest` with `mode` (phase 4). The bytes
     /// are handed to the fd allocator in `finish`.
     pub fn ro_bind_data(&mut self, content: Vec<u8>, dest: &Path, mode: &str) {
-        self.binds.push(Item::Data {
-            content,
-            dest: dest.to_path_buf(),
-            mode: mode.into(),
+        self.binds.push(Item {
+            origin: self.origin,
+            kind: Kind::Data {
+                content,
+                dest: dest.to_path_buf(),
+                mode: mode.into(),
+            },
         });
     }
 
@@ -473,7 +563,11 @@ impl BwrapArgs {
 
     /// Set a variable inside the sandbox (phase 5, after `--clearenv`).
     pub fn setenv(&mut self, key: &OsStr, value: &OsStr) {
-        push(&mut self.env, [OsStr::new("--setenv"), key, value]);
+        push(
+            &mut self.env,
+            self.origin,
+            [OsStr::new("--setenv"), key, value],
+        );
     }
 
     /// Concatenate the phases, resolve data items through `alloc` (which
@@ -485,20 +579,44 @@ impl BwrapArgs {
         command: &[OsString],
         alloc: &mut dyn FdAllocator,
     ) -> Result<Vec<OsString>, LaunchError> {
+        Ok(flatten(self.finish_explained(command, alloc)?))
+    }
+
+    /// [`BwrapArgs::finish`] with every operation kept apart and tagged
+    /// with what produced it. Flattening the result is the argv again,
+    /// element for element.
+    pub fn finish_explained(
+        self,
+        command: &[OsString],
+        alloc: &mut dyn FdAllocator,
+    ) -> Result<Vec<Explained>, LaunchError> {
         let ctty = self.ctty;
         let mut out = self.emit(alloc)?;
         let socket = alloc.init_socket().map_err(LaunchError::Data)?;
-        out.extend([
-            OsString::from("--"),
-            INIT_INSIDE.into(),
-            "--socket-fd".into(),
-            socket,
-        ]);
+        out.push(Explained {
+            origin: Origin::Init,
+            args: vec![
+                OsString::from("--"),
+                INIT_INSIDE.into(),
+                "--socket-fd".into(),
+                socket,
+            ],
+            note: Some("socket: the exec channel bubbler-init serves".to_owned()),
+        });
         if ctty {
-            out.push("--ctty".into());
+            out.push(Explained {
+                origin: Origin::Ctty,
+                args: vec!["--ctty".into()],
+                note: None,
+            });
         }
-        out.push("--".into());
-        out.extend_from_slice(command);
+        let mut args = vec![OsString::from("--")];
+        args.extend_from_slice(command);
+        out.push(Explained {
+            origin: Origin::Command,
+            args,
+            note: None,
+        });
         Ok(out)
     }
 
@@ -510,13 +628,34 @@ impl BwrapArgs {
         command: &[OsString],
         alloc: &mut dyn FdAllocator,
     ) -> Result<Vec<OsString>, LaunchError> {
-        let mut out = self.emit(alloc)?;
+        let mut out = flatten(self.emit(alloc)?);
         out.push(OsString::from("--"));
         out.extend_from_slice(command);
         Ok(out)
     }
 
-    fn emit(self, alloc: &mut dyn FdAllocator) -> Result<Vec<OsString>, LaunchError> {
+    /// [`BwrapArgs::finish_plain`] with every operation kept apart and
+    /// tagged, `command` carrying an origin per element: a sidecar's argv
+    /// is its rule list, and each rule belongs to the node that asked for
+    /// it. Flattening the arguments is [`BwrapArgs::finish_plain`] again.
+    pub fn finish_plain_explained(
+        self,
+        command: &[(OsString, Origin)],
+        alloc: &mut dyn FdAllocator,
+    ) -> Result<Vec<Explained>, LaunchError> {
+        let mut out = self.emit(alloc)?;
+        let separator = (OsString::from("--"), Origin::Command);
+        for (arg, origin) in std::iter::once(&separator).chain(command) {
+            out.push(Explained {
+                origin: *origin,
+                args: vec![arg.clone()],
+                note: None,
+            });
+        }
+        Ok(out)
+    }
+
+    fn emit(self, alloc: &mut dyn FdAllocator) -> Result<Vec<Explained>, LaunchError> {
         let mut out = Vec::new();
         for item in [
             self.namespaces,
@@ -528,39 +667,61 @@ impl BwrapArgs {
         .into_iter()
         .flatten()
         {
-            match item {
-                Item::Arg(a) => out.push(a),
-                Item::Data {
+            let (args, note) = match item.kind {
+                Kind::Args(a) => (a, None),
+                Kind::Data {
                     content,
                     dest,
                     mode,
                 } => {
                     let fd = alloc.data(&content).map_err(LaunchError::Data)?;
                     // `--perms` applies to the next operation only.
-                    out.extend([
-                        "--perms".into(),
-                        mode,
-                        "--ro-bind-data".into(),
-                        fd,
-                        dest.into_os_string(),
-                    ]);
+                    (
+                        vec![
+                            "--perms".into(),
+                            mode,
+                            "--ro-bind-data".into(),
+                            fd,
+                            dest.into_os_string(),
+                        ],
+                        Some(format!("generated file, {} bytes", content.len())),
+                    )
                 }
-                Item::InfoFd => {
+                Kind::InfoFd => {
                     let fd = alloc.info_pipe().map_err(LaunchError::Data)?;
-                    out.extend(["--info-fd".into(), fd]);
+                    (
+                        vec!["--info-fd".into(), fd],
+                        Some("pipe: bwrap reports the sandbox pid on it".to_owned()),
+                    )
                 }
-                Item::BlockFd => {
+                Kind::BlockFd => {
                     let fd = alloc.block_pipe().map_err(LaunchError::Data)?;
-                    out.extend(["--block-fd".into(), fd]);
+                    (
+                        vec!["--block-fd".into(), fd],
+                        Some("pipe: the sandbox waits on it until bubbler lets it go".to_owned()),
+                    )
                 }
-                Item::Seccomp { program } => {
+                Kind::Seccomp { program, errno } => {
                     let fd = alloc.data(&program).map_err(LaunchError::Data)?;
-                    out.extend(["--add-seccomp-fd".into(), fd]);
+                    (
+                        vec!["--add-seccomp-fd".into(), fd],
+                        Some(format!("{errno} program, {} bytes", program.len())),
+                    )
                 }
-            }
+            };
+            out.push(Explained {
+                origin: item.origin,
+                args,
+                note,
+            });
         }
         Ok(out)
     }
+}
+
+/// The argv again: the operations concatenated, element for element.
+fn flatten(items: Vec<Explained>) -> Vec<OsString> {
+    items.into_iter().flat_map(|i| i.args).collect()
 }
 
 #[cfg(test)]
@@ -1164,8 +1325,8 @@ mod tests {
     fn seccomp_programs_follow_the_info_and_block_fds_in_phase_one() {
         let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default());
         args.block_until_released();
-        args.add_seccomp(b"12345678".to_vec());
-        args.add_seccomp(b"87654321".to_vec());
+        args.add_seccomp(b"12345678".to_vec(), "EPERM");
+        args.add_seccomp(b"87654321".to_vec(), "ENOSYS");
         let mut rec = Recorder {
             seen: Vec::new(),
             next: Counter::new(),

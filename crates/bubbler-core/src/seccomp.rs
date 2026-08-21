@@ -102,6 +102,27 @@ pub enum Errno {
     Enosys,
 }
 
+impl Errno {
+    /// The name as `errno(3)` writes it, for messages about the program
+    /// that answers with it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Eperm => "EPERM",
+            Self::Enosys => "ENOSYS",
+        }
+    }
+}
+
+/// One compiled filter with the error every syscall it matches gets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Program {
+    /// The error this program answers with.
+    pub errno: Errno,
+    /// cBPF as `struct sock_filter` bytes; bwrap rejects a length that is
+    /// not a multiple of eight.
+    pub bytes: Vec<u8>,
+}
+
 /// A profile's `seccomp` node: holes punched in the default denylist,
 /// extra syscalls denied, or no filter at all.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -208,14 +229,19 @@ fn take_note(log: bool, noted: &AtomicBool) -> bool {
 /// error it uses (`EPERM` first, then `ENOSYS`). Everything not named is
 /// allowed, names this architecture never had are skipped, and `log`
 /// turns matches into audit log entries instead of errors.
-pub fn compile(set: &RuleSet, log: bool) -> Result<Vec<Vec<u8>>, LaunchError> {
+pub fn compile(set: &RuleSet, log: bool) -> Result<Vec<Program>, LaunchError> {
     let note = take_note(log, &NOTED);
     let groups = [
-        (&set.eperm, OsErrno::PERM, set.ioctl_eperm.as_slice()),
-        (&set.enosys, OsErrno::NOSYS, &[][..]),
+        (
+            &set.eperm,
+            Errno::Eperm,
+            OsErrno::PERM,
+            set.ioctl_eperm.as_slice(),
+        ),
+        (&set.enosys, Errno::Enosys, OsErrno::NOSYS, &[][..]),
     ];
     let mut out = Vec::new();
-    for (names, errno, ioctl) in groups {
+    for (names, kind, errno, ioctl) in groups {
         let rules = rules_for(names, ioctl, note)?;
         if rules.is_empty() {
             continue;
@@ -231,7 +257,10 @@ pub fn compile(set: &RuleSet, log: bool) -> Result<Vec<Vec<u8>>, LaunchError> {
         let program: BpfProgram = filter
             .try_into()
             .map_err(|e: seccompiler::BackendError| LaunchError::Seccomp(e.to_string()))?;
-        out.push(program_bytes(&program));
+        out.push(Program {
+            errno: kind,
+            bytes: program_bytes(&program),
+        });
     }
     Ok(out)
 }
@@ -1573,14 +1602,14 @@ mod tests {
     fn the_default_set_compiles_to_two_programs_of_a_known_size() {
         let programs = compile(&RuleSet::default_set(), false).unwrap();
         assert_eq!(programs.len(), 2);
-        assert_eq!(instructions(&programs[0]).len(), EPERM_LEN);
-        assert_eq!(instructions(&programs[1]).len(), ENOSYS_LEN);
+        assert_eq!(instructions(&programs[0].bytes).len(), EPERM_LEN);
+        assert_eq!(instructions(&programs[1].bytes).len(), ENOSYS_LEN);
     }
 
     #[test]
     fn a_program_starts_with_the_architecture_check() {
         let programs = compile(&RuleSet::default_set(), false).unwrap();
-        let first = instructions(&programs[0])[0];
+        let first = instructions(&programs[0].bytes)[0];
         // BPF_LD | BPF_W | BPF_ABS of `seccomp_data.arch`, at offset 4.
         assert_eq!(first, (0x0020, 0, 0, 4));
     }
@@ -1588,7 +1617,7 @@ mod tests {
     #[test]
     fn the_ioctl_rules_compare_the_low_word_of_argument_one() {
         let programs = compile(&RuleSet::default_set(), false).unwrap();
-        let eperm = instructions(&programs[0]);
+        let eperm = instructions(&programs[0].bytes);
         // `seccomp_data.args[1]` starts at offset 16 + 1 * 8 = 24; the
         // mask is loaded against its low half.
         for value in DEFAULT_IOCTL_EPERM {
@@ -1608,8 +1637,8 @@ mod tests {
             ..SeccompConfig::default()
         };
         let programs = compile(&RuleSet::with(&cfg).unwrap(), false).unwrap();
-        assert_eq!(instructions(&programs[0]).len(), EPERM_LEN - 5);
-        assert_eq!(instructions(&programs[1]).len(), ENOSYS_LEN);
+        assert_eq!(instructions(&programs[0].bytes).len(), EPERM_LEN - 5);
+        assert_eq!(instructions(&programs[1].bytes).len(), ENOSYS_LEN);
     }
 
     #[test]
@@ -1619,7 +1648,7 @@ mod tests {
             ..SeccompConfig::default()
         };
         let programs = compile(&RuleSet::with(&cfg).unwrap(), false).unwrap();
-        assert_eq!(instructions(&programs[0]).len(), EPERM_LEN - 14);
+        assert_eq!(instructions(&programs[0].bytes).len(), EPERM_LEN - 14);
     }
 
     #[test]
@@ -1633,7 +1662,7 @@ mod tests {
         let programs = compile(&set, false).unwrap();
         // The blanket rule replaces the argument-filtered pair, and the
         // syscall appears once: -14 for the pair, +5 for the name.
-        assert_eq!(instructions(&programs[0]).len(), EPERM_LEN - 14 + 5);
+        assert_eq!(instructions(&programs[0].bytes).len(), EPERM_LEN - 14 + 5);
     }
 
     #[test]
@@ -1645,7 +1674,7 @@ mod tests {
         };
         let programs = compile(&set, false).unwrap();
         // 5 + 1 * 5: the blanket rule only, no argument comparison.
-        assert_eq!(instructions(&programs[0]).len(), 10);
+        assert_eq!(instructions(&programs[0].bytes).len(), 10);
     }
 
     #[test]
@@ -1656,7 +1685,7 @@ mod tests {
         };
         let programs = compile(&RuleSet::with(&cfg).unwrap(), false).unwrap();
         assert_eq!(programs.len(), 1);
-        assert_eq!(instructions(&programs[0]).len(), EPERM_LEN);
+        assert_eq!(instructions(&programs[0].bytes).len(), EPERM_LEN);
         assert!(compile(&RuleSet::default(), false).unwrap().is_empty());
     }
 
@@ -1669,7 +1698,7 @@ mod tests {
         };
         let programs = compile(&set, false).unwrap();
         let names = ABSENT_HERE.iter().filter(|n| **n == "vm86old").count();
-        assert_eq!(instructions(&programs[0]).len(), 5 + (2 - names) * 5);
+        assert_eq!(instructions(&programs[0].bytes).len(), 5 + (2 - names) * 5);
     }
 
     #[test]
@@ -1689,11 +1718,11 @@ mod tests {
         let logged = compile(&set, true).unwrap();
         assert_eq!(quiet.len(), logged.len());
         for (q, l) in quiet.iter().zip(&logged) {
-            assert_eq!(q.len(), l.len());
+            assert_eq!(q.bytes.len(), l.bytes.len());
             assert_ne!(q, l, "the match action must differ");
         }
         // SECCOMP_RET_LOG, and no SECCOMP_RET_ERRNO with EPERM in it.
-        let ks: Vec<u32> = instructions(&logged[0]).iter().map(|i| i.3).collect();
+        let ks: Vec<u32> = instructions(&logged[0].bytes).iter().map(|i| i.3).collect();
         assert!(ks.contains(&0x7ffc_0000));
         assert!(!ks.contains(&(0x0005_0000 | 1)));
     }

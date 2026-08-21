@@ -29,6 +29,7 @@ with `include`. See "Known gaps" below.
     bubbler run ff                        # uses `command` from config.kdl
     bubbler run ff -- firefox --version   # or run something else inside
     bubbler run ff --dry-run              # print the bwrap argv, do not launch
+    bubbler run ff --explain              # the same argv, grouped under its nodes
     bubbler run ff --tty none             # no terminal inside at all
     bubbler exec ff -- firefox --version  # run inside the instance already running
     bubbler try -- id                     # throwaway sandbox, nothing kept
@@ -40,7 +41,9 @@ with `include`. See "Known gaps" below.
 `create` prints the directory it made. `--dry-run` prints `bwrap` and then one
 argv element per line, byte for byte, so it can be diffed; an element
 containing a newline would be ambiguous in that framing. It builds the argv
-only: nothing is launched and no runtime directory is created.
+only: nothing is launched and no runtime directory is created. `--explain`
+prints the same argv under the node each argument came from (see "Explaining
+an argv").
 
 Every sandbox runs under `bubbler-init`, a small supervisor bound in at
 `/run/bubbler-init`. It serves a control socket in the instance's runtime
@@ -101,6 +104,95 @@ refuses outright if the instance path is a symlink rather than following it.
 Instance names are letters, digits, `.`, `_` and `-`; they cannot start with
 `-`, cannot be `.` or `..`, and cannot look like `try-<digits>`, which is the
 shape `try` gives its own sandboxes and sweeps by pid.
+
+## Explaining an argv
+
+`--explain` prints the argv grouped under the node each argument came from. It
+implies `--dry-run`: nothing is launched, no runtime directory is made, and the
+file descriptor numbers are the ones a dry run prints.
+
+    bubbler run ff --explain               # groups, with the baseline summed up
+    bubbler run ff --explain=full          # every argument, the baseline included
+    bubbler run ff --explain --proxy       # the D-Bus proxy sidecar's argv instead
+    bubbler run ff --explain --format json # one object per operation, nothing elided
+    bubbler try --profile firefox --explain
+
+    bwrap
+
+      baseline                                       138 arguments
+        --unshare-all
+        --die-with-parent
+        --new-session
+        --hostname bubbler
+        --chdir /home/bubbler
+        --info-fd 3  (pipe: bwrap reports the sandbox pid on it)
+        ... 129 more (--explain=full)
+
+      network                         config.kdl:6   4 arguments
+        --share-net
+        --ro-bind /etc/resolv.conf /etc/resolv.conf
+
+      portals                         config.kdl:10  7 arguments
+        --block-fd 4  (pipe: the sandbox waits on it until bubbler lets it go)
+        --perms 0644 --ro-bind-data 9 /.flatpak-info  (generated file, 69 bytes)
+        rules: --talk=org.freedesktop.portal.Desktop
+               --talk=org.freedesktop.portal.Documents
+               --talk=org.freedesktop.portal.FileChooser
+               --call=org.freedesktop.portal.*=*
+               --broadcast=org.freedesktop.portal.*=@/org/freedesktop/portal/*
+
+      notify                          config.kdl:11  0 arguments
+        rule-only: --talk=org.freedesktop.Notifications
+
+      seccomp                                        4 arguments
+        --add-seccomp-fd 5  (EPERM program, 1672 bytes)
+        --add-seccomp-fd 6  (ENOSYS program, 360 bytes)
+
+      wayland                         config.kdl:2   9 arguments
+        --ro-bind /run/user/1000/wayland-1 /run/user/1000/wayland-1
+        --setenv WAYLAND_DISPLAY wayland-1
+        --setenv XDG_SESSION_TYPE wayland
+
+      init                                           7 arguments
+        --ro-bind /usr/lib/bubbler/bubbler-init /run/bubbler-init
+        -- /run/bubbler-init --socket-fd 10  (socket: the exec channel bubbler-init serves)
+
+      command                                        2 arguments
+        -- firefox
+
+    231 arguments in 14 groups, 129 hidden (--explain=full); 8 D-Bus rules to the proxy (--proxy)
+
+A group sits where the node's *first* argument is emitted and gathers every
+later one it contributed, whichever phase that came from: `network` is placed by
+the `--share-net` inserted into phase 1 and its `/etc/resolv.conf` bind from
+phase 4 is listed with it, though 130 baseline arguments separate the two in the
+argv. The listing is therefore neither file order nor argv order, and it is not
+the order of record: `--dry-run` is, and so is `--format json`, which stays in
+true argv order.
+
+Every generated descriptor says what is behind it: the error a seccomp program
+answers with, the size of a `--ro-bind-data`, which pipe an `--info-fd` or
+`--block-fd` is, and which socket the supervisor is handed. A node whose grant
+is D-Bus rules rather than bwrap arguments lists those rules instead — under
+`rule-only:` when it contributes nothing else, `rules:` when it also has
+arguments — and `--explain --proxy` explains the sidecar's own argv, where the
+same rules are grouped under the nodes that asked for them.
+
+Line numbers are those of the instance's own `config.kdl`, the flattened file
+`create` wrote, not of the profile layer a node was written in; under
+`bubbler try` they are the throwaway instance's copy. `profile show` is what
+prints a node with the layer it came from.
+
+This is a reading format, not a diffing one: it joins the elements of an
+operation onto one line and stops listing the baseline after its first arguments
+(`--explain=full` lists all of it). `--dry-run` on its own remains the
+byte-exact, one-element-per-line form. `--format json` elides nothing; an
+argument that is not UTF-8 is written there with the replacement character,
+since JSON has no byte strings.
+
+`--explain` attributes, it does not justify: "why is `/etc/ssl` in there" is
+answered with "the baseline", and why the baseline holds it is this README's
+job.
 
 ## Config (KDL)
 
@@ -995,9 +1087,10 @@ binding the tree under it.
 
 Instances live in `$XDG_DATA_HOME/bubbler/instances/<name>/` (by default under
 `~/.local/share`), each holding a `config.kdl` and the private `home/`. Every
-run except `--dry-run` also creates `$XDG_RUNTIME_DIR/bubbler/<name>/`, mode
-0700, reusing one left over from an earlier run, and binds the control socket
-`init.sock` in it; a `dbus` or `system-bus` grant adds the subdirectory
+run except a dry run or an explanation also creates
+`$XDG_RUNTIME_DIR/bubbler/<name>/`, mode 0700, reusing one left over from an
+earlier run, and binds the control socket `init.sock` in it; a `dbus` or
+`system-bus` grant adds the subdirectory
 `dbus/` the proxy creates its sockets in and the checked socket `bus` and/or
 `system` beside it, and a `portals` grant adds
 `$XDG_RUNTIME_DIR/.flatpak/bubbler-<name>/`, creating `.flatpak/` if it is

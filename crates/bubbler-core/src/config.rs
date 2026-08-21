@@ -254,7 +254,30 @@ pub struct RawProfile {
 /// Parse KDL v2 text into an [`InstanceConfig`]. `include` is rejected:
 /// an instance config must grant what it says on one screen.
 pub fn parse(text: &str) -> Result<InstanceConfig, ConfigError> {
-    Ok(parse_doc(text, false)?.config)
+    Ok(parse_doc(text, false)?.0.config)
+}
+
+/// Where the nodes of a config are, counting from one. A line is `None`
+/// only where a node's span falls outside the text it was parsed from,
+/// which the parser's own spans are not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Lines {
+    /// Line of each granted service, parallel to
+    /// [`InstanceConfig::services`].
+    pub services: Vec<Option<u32>>,
+    /// Line of each variable, parallel to [`InstanceConfig::env`]; one
+    /// `env` node setting several of them gives them all its own line.
+    pub env: Vec<Option<u32>>,
+    /// Line of the `userns` node, if the file has one.
+    pub userns: Option<u32>,
+    /// Line of the `seccomp` node, if the file has one.
+    pub seccomp: Option<u32>,
+}
+
+/// Where the nodes of the config [`parse`] returns were written, so
+/// `--explain` can name the line an argument came from.
+pub fn node_lines(text: &str) -> Result<Lines, ConfigError> {
+    Ok(parse_doc(text, false)?.1)
 }
 
 /// Parse one profile layer, which may also `include` other profiles.
@@ -263,12 +286,21 @@ pub fn parse(text: &str) -> Result<InstanceConfig, ConfigError> {
 /// error here: the `dbus` grant may come from an included layer. The
 /// resolver applies that check to the merged result.
 pub fn parse_profile(text: &str) -> Result<RawProfile, ConfigError> {
-    parse_doc(text, true)
+    Ok(parse_doc(text, true)?.0)
 }
 
-fn parse_doc(text: &str, profile: bool) -> Result<RawProfile, ConfigError> {
+/// Line number, counting from one, of the byte at `offset` in `text`.
+fn line_at(text: &str, offset: usize) -> Option<u32> {
+    let before = text.get(..offset)?;
+    u32::try_from(before.bytes().filter(|b| *b == b'\n').count() + 1).ok()
+}
+
+/// The parsed layer and where its nodes are: `--explain` names the node
+/// a bwrap argument came from.
+fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigError> {
     let doc: KdlDocument = KdlDocument::parse(text)?;
     let mut cfg = InstanceConfig::default();
+    let mut lines = Lines::default();
     let mut includes: Vec<String> = Vec::new();
     let mut seen_tty = false;
     let mut seen_userns = false;
@@ -412,6 +444,20 @@ fn parse_doc(text: &str, profile: bool) -> Result<RawProfile, ConfigError> {
             }
             other => return Err(ConfigError::UnknownNode(other.to_owned())),
         }
+        // What a node granted is counted rather than recorded per arm, so
+        // a node added to the match above is placed without being listed
+        // a second time here; only the two that grant nothing are named.
+        let grew = lines.services.len() < cfg.services.len() || lines.env.len() < cfg.env.len();
+        if grew || matches!(name, "userns" | "seccomp") {
+            let line = line_at(text, node.span().offset());
+            lines.services.resize(cfg.services.len(), line);
+            lines.env.resize(cfg.env.len(), line);
+            match name {
+                "userns" => lines.userns = line,
+                "seccomp" => lines.seccomp = line,
+                _ => {}
+            }
+        }
     }
     if !profile && let Some(node) = bundle_without_dbus(&cfg.services) {
         return Err(ConfigError::BadArgument {
@@ -419,12 +465,15 @@ fn parse_doc(text: &str, profile: bool) -> Result<RawProfile, ConfigError> {
             reason: "requires dbus".to_owned(),
         });
     }
-    Ok(RawProfile {
-        config: cfg,
-        includes,
-        tty_set: seen_tty,
-        userns_set: seen_userns,
-    })
+    Ok((
+        RawProfile {
+            config: cfg,
+            includes,
+            tty_set: seen_tty,
+            userns_set: seen_userns,
+        },
+        lines,
+    ))
 }
 
 /// `include "<profile>"`: one string argument, repeatable. The name is
@@ -1112,6 +1161,31 @@ fn parse_command(node: &KdlNode) -> Result<Vec<OsString>, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_node_is_paired_with_the_line_it_is_on() {
+        let text = "// a comment\nwayland\n\nnetwork\ntty \"none\"\n\
+                    home-share \"Downloads\" mode=rw\nenv A=\"1\" B=\"2\"\n\
+                    userns \"disable\"\nseccomp {\n    disable\n}\ncommand \"true\"\n";
+        let cfg = parse(text).unwrap();
+        let lines = node_lines(text).unwrap();
+        assert_eq!(lines.services.len(), cfg.services.len());
+        assert_eq!(lines.services, vec![Some(2), Some(4), Some(6)]);
+        // One node setting two variables gives both its own line.
+        assert_eq!(lines.env, vec![Some(7), Some(7)]);
+        assert_eq!(lines.userns, Some(8));
+        assert_eq!(lines.seccomp, Some(9));
+        // A node that grants nothing takes no place in the lists.
+        let bare = node_lines("tty \"none\"\ncommand \"x\"").unwrap();
+        assert_eq!(bare, Lines::default());
+        // A block node is reported at the line it opens on.
+        assert_eq!(
+            node_lines("wayland\ndbus {\n    talk \"org.a.B\"\n}\n")
+                .unwrap()
+                .services,
+            vec![Some(1), Some(2)]
+        );
+    }
 
     #[test]
     fn the_terminal_mode_is_a_private_pty_unless_the_file_says_otherwise() {

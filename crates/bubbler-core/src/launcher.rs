@@ -19,8 +19,8 @@ use rustix::process::{Pid, Signal, kill_process, test_kill_process};
 use signal_hook::SigId;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 
-use crate::bwrap::{BwrapArgs, FdAllocator};
-use crate::config::Userns;
+use crate::bwrap::{BwrapArgs, Explained, FdAllocator, Origin};
+use crate::config::{Service, Userns};
 use crate::env::Env;
 use crate::error::{ConfigError, LaunchError};
 use crate::host::{Host, RealHost};
@@ -231,6 +231,44 @@ fn build_argv_on(
     ctty: bool,
     host: &dyn Host,
 ) -> Result<Vec<OsString>, LaunchError> {
+    let (args, command) = build_args_on(env, inst, command, ctty, host)?;
+    args.finish(command, alloc)
+}
+
+/// Every argument of an instance's argv with the node that produced it,
+/// numbering fds the way [`build_argv`] does under `--dry-run`. Nothing
+/// is created: an explanation describes a launch, it does not perform one.
+pub fn explain(
+    env: &Env,
+    inst: &Instance,
+    command: Option<&[OsString]>,
+    ctty: bool,
+) -> Result<Vec<Explained>, LaunchError> {
+    explain_on(env, inst, command, ctty, &RealHost)
+}
+
+/// [`explain`] against one view of the host, so a test can state which
+/// sockets and device nodes the explanation is built from.
+fn explain_on(
+    env: &Env,
+    inst: &Instance,
+    command: Option<&[OsString]>,
+    ctty: bool,
+    host: &dyn Host,
+) -> Result<Vec<Explained>, LaunchError> {
+    let (args, command) = build_args_on(env, inst, command, ctty, host)?;
+    args.finish_explained(command, &mut DryRunAlloc::default())
+}
+
+/// The builder and the command behind [`build_argv`], before the fds are
+/// numbered: what the argv and the explanation of it are both made from.
+fn build_args_on<'a>(
+    env: &Env,
+    inst: &'a Instance,
+    command: Option<&'a [OsString]>,
+    ctty: bool,
+    host: &dyn Host,
+) -> Result<(BwrapArgs, &'a [OsString]), LaunchError> {
     let command = resolve_command(inst, command)?;
     let plan = dbus::plan(&inst.config.services, &inst.name);
     let ctx = service::ServiceCtx {
@@ -239,6 +277,7 @@ fn build_argv_on(
     };
     let mut args = BwrapArgs::baseline(env, &inst.home(), host);
     if inst.config.userns == Userns::Disable {
+        args.tag(Origin::Userns);
         args.disable_userns();
     }
     if ctty {
@@ -246,9 +285,19 @@ fn build_argv_on(
     }
     // A portal call is answered by the identity bubbler publishes from
     // bwrap's own info document, so the app waits until that file is there.
-    if plan.as_ref().is_some_and(|p| p.portals) {
+    // The plan asks for portals only where a `portals` node granted them,
+    // which is the node the wait belongs to.
+    if let Some(i) = inst
+        .config
+        .services
+        .iter()
+        .position(|s| *s == Service::Portals)
+        && plan.as_ref().is_some_and(|p| p.portals)
+    {
+        args.tag(Origin::Service(i));
         args.block_until_released();
     }
+    args.tag(Origin::Seccomp);
     apply_seccomp(
         &mut args,
         seccomp::RuleSet::with(&inst.config.seccomp),
@@ -257,8 +306,9 @@ fn build_argv_on(
     )?;
     service::apply_all(&inst.config.services, env, &mut args, host, &ctx)?;
     service::apply_env(&inst.config.env, &mut args)?;
+    args.tag(Origin::Init);
     args.bind_init(&init_bin::locate(env, host)?);
-    args.finish(command, alloc)
+    Ok((args, command))
 }
 
 /// Load `set` into the sandbox as one program per error it uses, or say
@@ -280,7 +330,7 @@ fn apply_seccomp(
         eprintln!("bubbler: seccomp has no rules left for instance {instance}");
     }
     for program in programs {
-        args.add_seccomp(program);
+        args.add_seccomp(program.bytes, program.errno.name());
     }
     Ok(())
 }
@@ -298,9 +348,58 @@ pub fn proxy_argv(
     host: &dyn Host,
     alloc: &mut dyn FdAllocator,
 ) -> Result<Vec<OsString>, LaunchError> {
+    let (args, command) = proxy_args(env, plan, session_bus, system_bus, dir, host, alloc)?;
+    let plain: Vec<OsString> = command.into_iter().map(|(arg, _)| arg).collect();
+    args.finish_plain(&plain, alloc)
+}
+
+/// Every argument of the sidecar's argv with what produced it, or `None`
+/// when the instance grants no bus and so starts no proxy. The host bus
+/// socket is not probed here, as nothing is started: `--dry-run` builds
+/// the app's bus bind from a socket that does not exist yet either.
+pub fn explain_proxy(env: &Env, inst: &Instance) -> Result<Option<Vec<Explained>>, LaunchError> {
+    let Some(plan) = dbus::plan(&inst.config.services, &inst.name) else {
+        return Ok(None);
+    };
+    let session = plan
+        .session
+        .as_ref()
+        .map(|_| dbus::host_bus(env))
+        .transpose()?;
+    let system = plan
+        .system
+        .as_ref()
+        .map(|_| dbus::host_system_bus(env))
+        .transpose()?;
+    let dir = instance_runtime_dir(env, &inst.name);
+    let mut alloc = DryRunAlloc::default();
+    let (args, command) = proxy_args(
+        env,
+        &plan,
+        session.as_deref(),
+        system.as_deref(),
+        &dir,
+        &RealHost,
+        &mut alloc,
+    )?;
+    Ok(Some(args.finish_plain_explained(&command, &mut alloc)?))
+}
+
+/// The builder and the command behind [`proxy_argv`], each command
+/// element with the node that asked for it. `alloc` numbers the ready
+/// pipe first, which is where the sidecar's fd numbering starts.
+fn proxy_args(
+    env: &Env,
+    plan: &dbus::Plan,
+    session_bus: Option<&Path>,
+    system_bus: Option<&Path>,
+    dir: &Path,
+    host: &dyn Host,
+    alloc: &mut dyn FdAllocator,
+) -> Result<(BwrapArgs, Vec<(OsString, Origin)>), LaunchError> {
     let ready = alloc.ready_pipe().map_err(LaunchError::Data)?;
     let program = dbus::proxy_program(env);
-    let command = dbus::proxy_command(
+    let command = dbus::proxy_command_nodes(
         &program,
         plan,
         session_bus,
@@ -309,14 +408,22 @@ pub fn proxy_argv(
         env.dbus_log,
         &ready,
     );
+    // A rule belongs to the node that asked for it; the proxy's own
+    // invocation is the command it is.
+    let command: Vec<(OsString, Origin)> = command
+        .into_iter()
+        .map(|(arg, node)| (arg, node.map_or(Origin::Command, Origin::Service)))
+        .collect();
     let mut args = BwrapArgs::proxy_baseline(session_bus, system_bus, &dbus::socket_dir(dir), host);
     // The sidecar has no `seccomp` node of its own: an instance may relax
     // its own filter, never the one around the process holding its bus.
+    args.tag(Origin::Seccomp);
     for program in seccomp::compile(&seccomp::RuleSet::default_set(), env.seccomp_log)? {
-        args.add_seccomp(program);
+        args.add_seccomp(program.bytes, program.errno.name());
     }
     // The proxy reads this to decide it is talking for a sandboxed app;
     // without `portals` it is only the `[Application]` section.
+    args.tag(Origin::Identity);
     args.ro_bind_data(
         plan.flatpak_info.clone(),
         Path::new(dbus::FLATPAK_INFO),
@@ -325,10 +432,11 @@ pub fn proxy_argv(
     // An overriding binary is not on the sandbox's `PATH`, so it is bound
     // in at its own path; the packaged proxy needs no bind.
     if env.proxy_override.is_some() {
+        args.tag(Origin::Command);
         let program = service::require_file(host, "dbus", program)?;
         args.ro_bind(&program, &program);
     }
-    args.finish_plain(&command, alloc)
+    Ok((args, command))
 }
 
 /// A running proxy sidecar. Dropping every end of its `--fd` pipe that
@@ -1280,6 +1388,238 @@ mod tests {
         )
         .unwrap();
         strs(&argv)
+    }
+
+    /// A host with everything the origin tests grant: the stand-in
+    /// supervisor, a home to share and `/etc/resolv.conf` for `network`.
+    fn share_host(tmp: &Path) -> crate::host::fake::FakeHost {
+        let (file, dir, _) = crate::host::fake::types();
+        crate::host::fake::FakeHost::default()
+            .with(&tmp.join("bubbler-init").display().to_string(), file)
+            .with(&tmp.join("home").display().to_string(), dir)
+            .with(&tmp.join("home/Downloads").display().to_string(), dir)
+            .with("/etc/resolv.conf", file)
+    }
+
+    fn explained(tmp: &Path, e: &Env, kdl: &str) -> Vec<Explained> {
+        explain_on(e, &inst(tmp, kdl), None, false, &share_host(tmp)).unwrap()
+    }
+
+    /// The one line each origin owns, for an assertion that reads like the
+    /// output does.
+    fn line(items: &[Explained], origin: Origin) -> String {
+        strs(
+            &items
+                .iter()
+                .filter(|i| i.origin == origin)
+                .flat_map(|i| i.args.clone())
+                .collect::<Vec<_>>(),
+        )
+        .join(" ")
+    }
+
+    #[test]
+    fn an_explanation_flattens_back_to_the_argv_it_explains() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let kdl = "dbus\nportals\nnotify\nhome-share \"Downloads\"\nuserns \"disable\"\n\
+                   env FOO=\"bar\"\ncommand \"true\"";
+        let items = explained(tmp.path(), &e, kdl);
+        let flat: Vec<OsString> = items.iter().flat_map(|i| i.args.clone()).collect();
+        let argv = build_argv_on(
+            &e,
+            &inst(tmp.path(), kdl),
+            None,
+            &mut DryRunAlloc::default(),
+            false,
+            &share_host(tmp.path()),
+        )
+        .unwrap();
+        assert_eq!(flat, argv);
+    }
+
+    #[test]
+    fn every_argument_is_attributed_to_the_node_that_asked_for_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let items = explained(
+            tmp.path(),
+            &e,
+            "dbus\nportals\nnotify\nhome-share \"Downloads\"\nuserns \"disable\"\n\
+             env FOO=\"bar\"\ncommand \"true\"",
+        );
+        let run = tmp.path().join("run");
+        assert_eq!(
+            line(&items, Origin::Service(0)),
+            format!(
+                "--ro-bind {run}/bubbler/t/bus {run}/bus \
+                 --setenv DBUS_SESSION_BUS_ADDRESS unix:path={run}/bus",
+                run = run.display()
+            )
+        );
+        // The wait for the identity document belongs to the `portals`
+        // node, next to the file that identity is written from.
+        assert_eq!(
+            line(&items, Origin::Service(1)),
+            "--block-fd 4 --perms 0644 --ro-bind-data 9 /.flatpak-info"
+        );
+        // `notify` is a rule for the proxy and nothing for bwrap.
+        assert_eq!(line(&items, Origin::Service(2)), "");
+        assert_eq!(
+            line(&items, Origin::Service(3)),
+            format!(
+                "--ro-bind {home}/Downloads /home/bubbler/Downloads",
+                home = tmp.path().join("home").display()
+            )
+        );
+        assert_eq!(
+            line(&items, Origin::Userns),
+            "--unshare-user --disable-userns"
+        );
+        assert_eq!(
+            line(&items, Origin::Seccomp),
+            "--add-seccomp-fd 5 --add-seccomp-fd 6"
+        );
+        assert_eq!(line(&items, Origin::Env(0)), "--setenv FOO bar");
+        assert_eq!(
+            line(&items, Origin::Init),
+            format!(
+                "--ro-bind {init} /run/bubbler-init -- /run/bubbler-init --socket-fd 10",
+                init = tmp.path().join("bubbler-init").display()
+            )
+        );
+        assert_eq!(line(&items, Origin::Command), "-- true");
+        // Nothing else is left over: what is not a grant is the baseline.
+        let untagged: Vec<&Explained> = items
+            .iter()
+            .filter(|i| {
+                !matches!(
+                    i.origin,
+                    Origin::Baseline
+                        | Origin::Seccomp
+                        | Origin::Userns
+                        | Origin::Service(_)
+                        | Origin::Env(_)
+                        | Origin::Init
+                        | Origin::Command
+                )
+            })
+            .collect();
+        assert!(untagged.is_empty(), "{untagged:?}");
+    }
+
+    /// A grant that finds nothing to bind on this host contributes no
+    /// argument, and is still a group of the explanation rather than
+    /// missing from it.
+    #[test]
+    fn a_grant_that_binds_nothing_here_is_still_explained() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        // `share_host` holds no `/dev/hidraw*` and no `/sys/class/hidraw`.
+        let kdl = "hidraw\ncommand \"true\"";
+        let items = explained(tmp.path(), &e, kdl);
+        assert_eq!(line(&items, Origin::Service(0)), "");
+        let cfg = crate::config::parse(kdl).unwrap();
+        let lines = crate::config::node_lines(kdl).unwrap();
+        let out = crate::explain::render(
+            &items,
+            &crate::explain::View {
+                title: "bwrap",
+                cfg: &cfg,
+                source: crate::explain::Source {
+                    file: "config.kdl",
+                    lines: &lines,
+                },
+                rules: &[],
+                proxy: false,
+                full: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            out.iter()
+                .any(|l| l.starts_with("  hidraw ") && l.ends_with("0 arguments")),
+            "{out:?}"
+        );
+    }
+
+    /// `--share-net` is inserted into phase 1, far from the bind the same
+    /// node contributes, and must still be attributed to that node.
+    #[test]
+    fn the_network_node_owns_the_share_net_it_inserts_into_phase_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let items = explained(
+            tmp.path(),
+            &e,
+            "home-share \"Downloads\"\nnetwork\ncommand \"true\"",
+        );
+        assert_eq!(
+            line(&items, Origin::Service(1)),
+            "--share-net --ro-bind /etc/resolv.conf /etc/resolv.conf"
+        );
+        let first = items.first().expect("the argv is never empty");
+        assert_eq!(first.origin, Origin::Baseline);
+        assert_eq!(first.args, [OsString::from("--unshare-all")]);
+    }
+
+    #[test]
+    fn a_generated_fd_says_what_is_behind_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let items = explained(tmp.path(), &e, "command \"true\"");
+        let note = |flag: &str| {
+            items
+                .iter()
+                .find(|i| i.args[0] == flag)
+                .and_then(|i| i.note.clone())
+                .unwrap_or_else(|| panic!("no {flag} in {items:?}"))
+        };
+        assert_eq!(
+            note("--info-fd"),
+            "pipe: bwrap reports the sandbox pid on it"
+        );
+        assert!(
+            note("--add-seccomp-fd").starts_with("EPERM program, "),
+            "{items:?}"
+        );
+        assert_eq!(note("--perms"), "generated file, 88 bytes");
+        assert_eq!(note("--"), "socket: the exec channel bubbler-init serves");
+    }
+
+    #[test]
+    fn the_proxy_argv_is_explained_only_where_there_is_a_proxy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        assert!(
+            explain_proxy(&e, &inst(tmp.path(), "wayland\ncommand \"true\""))
+                .unwrap()
+                .is_none()
+        );
+        let items = explain_proxy(&e, &inst(tmp.path(), "dbus\nnotify\ncommand \"true\""))
+            .unwrap()
+            .expect("a `dbus` node starts a proxy");
+        assert_eq!(items[0].origin, Origin::Baseline);
+        assert_eq!(
+            line(&items, Origin::Identity),
+            "--perms 0644 --ro-bind-data 6 /.flatpak-info"
+        );
+        // One element per line: the sidecar's argv is its rule list, and
+        // each rule is grouped under the node that asked for it.
+        assert_eq!(
+            line(&items, Origin::Service(1)),
+            "--talk=org.freedesktop.Notifications"
+        );
+        let own: Vec<String> = items
+            .iter()
+            .filter(|i| i.origin == Origin::Command)
+            .map(|i| i.args[0].to_string_lossy().into_owned())
+            .collect();
+        assert!(own.contains(&"--filter".to_owned()), "{own:?}");
+        assert!(
+            !own.iter().any(|a| a.starts_with("--talk=")),
+            "a rule is not the proxy's own argument: {own:?}"
+        );
     }
 
     #[test]

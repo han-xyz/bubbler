@@ -12,7 +12,7 @@ use std::fs::FileType;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Component, Path, PathBuf};
 
-use crate::bwrap::BwrapArgs;
+use crate::bwrap::{BwrapArgs, Origin};
 use crate::config::{RESERVED_ENV, Service, ShareMode};
 use crate::dbus;
 use crate::env::{Env, SANDBOX_HOME};
@@ -36,6 +36,10 @@ pub struct ServiceCtx<'a> {
 /// [`Service::HomeShare`] `path` must be relative and a
 /// [`Service::PathShare`] `path` absolute, both normalised, exactly as the
 /// parser leaves them.
+///
+/// Every argument a service adds is tagged with the position of its node
+/// in `services`, including the two bound after the loop: the tag is set
+/// here, so no service has to carry one.
 pub fn apply_all(
     services: &[Service],
     env: &Env,
@@ -45,7 +49,8 @@ pub fn apply_all(
 ) -> Result<(), LaunchError> {
     let has_x11 = services.contains(&Service::X11);
     let shares = path_shares(services, env, host)?;
-    for s in services {
+    for (i, s) in services.iter().enumerate() {
+        args.tag(Origin::Service(i));
         match s {
             Service::Wayland => wayland(env, args, host, !has_x11)?,
             Service::X11 => x11(env, args, host)?,
@@ -74,29 +79,33 @@ pub fn apply_all(
             Service::Notify | Service::Tray | Service::Mpris { .. } => {}
         }
     }
-    let pad = services.iter().find_map(|s| match s {
-        Service::Gamepad { hidraw, uinput } => Some((*hidraw, *uinput)),
+    let pad = services.iter().enumerate().find_map(|(i, s)| match s {
+        Service::Gamepad { hidraw, uinput } => Some((i, *hidraw, *uinput)),
         _ => None,
     });
     // One grant however it is written, and the name is the node an error
-    // points at: the bare one when the config holds both.
-    let hidraw_node = match (
-        services.contains(&Service::Hidraw),
-        pad.is_some_and(|(h, _)| h),
-    ) {
-        (true, _) => Some("hidraw"),
-        (false, true) => Some("gamepad"),
-        (false, false) => None,
+    // points at: the bare one when the config holds both. Its arguments
+    // are attributed to that same node.
+    let bare = services.iter().position(|s| *s == Service::Hidraw);
+    let hidraw_node = match (bare, pad.is_some_and(|(_, h, _)| h)) {
+        (Some(i), _) => Some(("hidraw", Origin::Service(i))),
+        (None, true) => pad.map(|(i, _, _)| ("gamepad", Origin::Service(i))),
+        (None, false) => None,
     };
     match pad {
-        Some((_, uinput)) => gamepad(args, host, hidraw_node, uinput)?,
+        Some((i, _, uinput)) => {
+            args.tag(Origin::Service(i));
+            gamepad(args, host, hidraw_node, uinput)?;
+        }
         None => {
-            if let Some(node) = hidraw_node {
+            if let Some((node, origin)) = hidraw_node {
+                args.tag(origin);
                 hidraw(args, host, node)?;
             }
         }
     }
-    for (dst, src, mode) in shares {
+    for (i, dst, src, mode) in shares {
+        args.tag(Origin::Service(i));
         match mode {
             ShareMode::ReadOnly => args.ro_bind(&src, dst),
             ShareMode::ReadWrite => args.bind(&src, dst),
@@ -359,9 +368,12 @@ fn dri(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
 fn gamepad(
     args: &mut BwrapArgs,
     host: &dyn Host,
-    hidraw: Option<&'static str>,
+    hidraw: Option<(&'static str, Origin)>,
     uinput: bool,
 ) -> Result<(), LaunchError> {
+    // The `hidraw` binds may belong to a `hidraw` node of its own, so the
+    // tag this was called with is put back before the rest of the grant.
+    let pad = args.origin();
     // The directory, not the nodes it holds today, exactly as flatpak's
     // `--device=input`: a node bound one by one freezes the device list at
     // start, while the directory shows a controller plugged in later.
@@ -390,8 +402,10 @@ fn gamepad(
             });
         }
     }
-    if let Some(node) = hidraw {
+    if let Some((node, origin)) = hidraw {
+        args.tag(origin);
         self::hidraw(args, host, node)?;
+        args.tag(pad);
     }
     if uinput {
         gamepad_uinput(args, host)?;
@@ -536,7 +550,8 @@ fn portals(args: &mut BwrapArgs, ctx: &ServiceCtx) -> Result<(), LaunchError> {
 /// [`crate::config::InstanceConfig`] by hand cannot override what the
 /// sandbox sets.
 pub fn apply_env(pairs: &[(String, String)], args: &mut BwrapArgs) -> Result<(), LaunchError> {
-    for (k, v) in pairs {
+    for (i, (k, v)) in pairs.iter().enumerate() {
+        args.tag(Origin::Env(i));
         if RESERVED_ENV.contains(&k.as_str()) {
             return Err(LaunchError::BadValue {
                 service: "env",
@@ -737,19 +752,19 @@ fn nested(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
 }
 
-/// Every `path-share` as (written destination, canonical source, mode),
-/// with the reserved roots and the overlap rule applied. bwrap applies
-/// binds in the order given, so two shares whose destinations nest would
-/// either fail (a read-only parent bound first) or silently hide one
-/// another; sharing one host tree twice is refused with them, so that
-/// file order stays irrelevant either way.
+/// Every `path-share` as (position in `services`, written destination,
+/// canonical source, mode), with the reserved roots and the overlap rule
+/// applied. bwrap applies binds in the order given, so two shares whose
+/// destinations nest would either fail (a read-only parent bound first)
+/// or silently hide one another; sharing one host tree twice is refused
+/// with them, so that file order stays irrelevant either way.
 fn path_shares<'a>(
     services: &'a [Service],
     env: &Env,
     host: &dyn Host,
-) -> Result<Vec<(&'a Path, PathBuf, ShareMode)>, LaunchError> {
-    let mut shares: Vec<(&Path, PathBuf, ShareMode)> = Vec::new();
-    for s in services {
+) -> Result<Vec<(usize, &'a Path, PathBuf, ShareMode)>, LaunchError> {
+    let mut shares: Vec<(usize, &Path, PathBuf, ShareMode)> = Vec::new();
+    for (i, s) in services.iter().enumerate() {
         let Service::PathShare { path, mode } = s else {
             continue;
         };
@@ -760,10 +775,10 @@ fn path_shares<'a>(
                 reason: denied_reason(path, &src, &root, end),
             });
         }
-        shares.push((path.as_path(), src, *mode));
+        shares.push((i, path.as_path(), src, *mode));
     }
-    for (i, (a_dst, a_src, _)) in shares.iter().enumerate() {
-        for (b_dst, b_src, _) in &shares[i + 1..] {
+    for (i, (_, a_dst, a_src, _)) in shares.iter().enumerate() {
+        for (_, b_dst, b_src, _) in &shares[i + 1..] {
             let destinations = nested(a_dst, b_dst);
             if !destinations && !nested(a_src, b_src) {
                 continue;

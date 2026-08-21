@@ -59,12 +59,23 @@ const PORTAL_RULES: &[&str] = &[
     "--broadcast=org.freedesktop.portal.*=@/org/freedesktop/portal/*",
 ];
 
+/// One policy argument with the node that asked for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rule {
+    /// The argument as `xdg-dbus-proxy` takes it, e.g. `--talk=org.a.B`.
+    pub arg: OsString,
+    /// Position in the instance config's `services` of the node that
+    /// contributed it: the bus node for its own rules, the bundle's node
+    /// for a bundle's. A repeat keeps the first node that asked.
+    pub node: usize,
+}
+
 /// One bus the proxy filters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Section {
     /// `xdg-dbus-proxy` policy arguments for this bus, deduplicated,
     /// explicit rules first and bundles after them.
-    pub rules: Vec<OsString>,
+    pub rules: Vec<Rule>,
 }
 
 /// Everything the launcher needs to run one instance's proxy. One process
@@ -103,32 +114,33 @@ impl Plan {
 /// The proxy plan for `services`, or `None` when neither bus is granted
 /// and no proxy runs at all. `instance` is a validated instance name.
 pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
-    let session = services.iter().find_map(|s| match s {
-        Service::Dbus { rules } => Some(rules),
+    let session = services.iter().enumerate().find_map(|(i, s)| match s {
+        Service::Dbus { rules } => Some((i, rules)),
         _ => None,
     });
-    let system = services.iter().find_map(|s| match s {
-        Service::SystemBus { rules } => Some(rules),
+    let system = services.iter().enumerate().find_map(|(i, s)| match s {
+        Service::SystemBus { rules } => Some((i, rules)),
         _ => None,
     });
     if session.is_none() && system.is_none() {
         return None;
     }
     let portals = services.contains(&Service::Portals);
-    let session = session.map(|explicit| {
-        let mut rules = explicit_rules(explicit);
+    let session = session.map(|(node, explicit)| {
+        let mut rules = explicit_rules(explicit, node);
         // Bundles are sets of session-bus rules; the system bus never
         // gets one, and its own list is the whole confinement.
-        for s in services {
+        for (i, s) in services.iter().enumerate() {
             match s {
                 Service::Portals => {
                     for r in PORTAL_RULES {
-                        push(&mut rules, (*r).to_owned());
+                        push(&mut rules, (*r).to_owned(), i);
                     }
                 }
                 Service::Notify => push(
                     &mut rules,
                     "--talk=org.freedesktop.Notifications".to_owned(),
+                    i,
                 ),
                 // The watcher is all a tray icon takes: an item registers
                 // on the app's own unique name, and the calls the host
@@ -137,9 +149,14 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
                 Service::Tray => push(
                     &mut rules,
                     "--talk=org.kde.StatusNotifierWatcher".to_owned(),
+                    i,
                 ),
                 Service::Mpris { name } => {
-                    push(&mut rules, format!("--own=org.mpris.MediaPlayer2.{name}"));
+                    push(
+                        &mut rules,
+                        format!("--own=org.mpris.MediaPlayer2.{name}"),
+                        i,
+                    );
                 }
                 // Every other grant is listed rather than caught by a
                 // wildcard: a new bundle must be given its rules here, and
@@ -161,8 +178,8 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
         }
         Section { rules }
     });
-    let system = system.map(|explicit| Section {
-        rules: explicit_rules(explicit),
+    let system = system.map(|(node, explicit)| Section {
+        rules: explicit_rules(explicit, node),
     });
     Some(Plan {
         session,
@@ -172,21 +189,22 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
     })
 }
 
-/// The config's own rules for one bus, in file order.
-fn explicit_rules(rules: &[BusRule]) -> Vec<OsString> {
+/// The config's own rules for one bus, in file order, all of them the
+/// bus node's own.
+fn explicit_rules(rules: &[BusRule], node: usize) -> Vec<Rule> {
     let mut out = Vec::new();
     for rule in rules {
-        push(&mut out, render(rule));
+        push(&mut out, render(rule), node);
     }
     out
 }
 
 /// Append `rule` unless it is already there: the proxy takes repeats, but
 /// a deduplicated list is what the user can compare against the config.
-fn push(rules: &mut Vec<OsString>, rule: String) {
-    let rule = OsString::from(rule);
-    if !rules.contains(&rule) {
-        rules.push(rule);
+fn push(rules: &mut Vec<Rule>, rule: String, node: usize) {
+    let arg = OsString::from(rule);
+    if !rules.iter().any(|r| r.arg == arg) {
+        rules.push(Rule { arg, node });
     }
 }
 
@@ -375,9 +393,35 @@ pub fn proxy_command(
     log: bool,
     ready_fd: &OsStr,
 ) -> Vec<OsString> {
+    proxy_command_nodes(
+        program,
+        plan,
+        session_bus,
+        system_bus,
+        instance_runtime,
+        log,
+        ready_fd,
+    )
+    .into_iter()
+    .map(|(arg, _)| arg)
+    .collect()
+}
+
+/// [`proxy_command`] with the node behind each element: a rule carries
+/// the position in the config's `services` of the node that asked for it,
+/// and the proxy's own invocation carries none.
+pub fn proxy_command_nodes(
+    program: &Path,
+    plan: &Plan,
+    session_bus: Option<&Path>,
+    system_bus: Option<&Path>,
+    instance_runtime: &Path,
+    log: bool,
+    ready_fd: &OsStr,
+) -> Vec<(OsString, Option<usize>)> {
     let mut fd = OsString::from("--fd=");
     fd.push(ready_fd);
-    let mut argv = vec![program.as_os_str().to_os_string(), fd];
+    let mut argv = vec![(program.as_os_str().to_os_string(), None), (fd, None)];
     for (section, host, socket) in [
         (plan.session.as_ref(), session_bus, SESSION_SOCKET),
         (plan.system.as_ref(), system_bus, SYSTEM_SOCKET),
@@ -389,13 +433,16 @@ pub fn proxy_command(
         address.push(host);
         // The address and the socket path must precede the options of
         // that bus: an option applies to the address before it.
-        argv.push(address);
-        argv.push(proxy_bus_path(instance_runtime, socket).into_os_string());
-        argv.push(OsString::from("--filter"));
+        argv.push((address, None));
+        argv.push((
+            proxy_bus_path(instance_runtime, socket).into_os_string(),
+            None,
+        ));
+        argv.push((OsString::from("--filter"), None));
         if log {
-            argv.push(OsString::from("--log"));
+            argv.push((OsString::from("--log"), None));
         }
-        argv.extend(section.rules.iter().cloned());
+        argv.extend(section.rules.iter().map(|r| (r.arg.clone(), Some(r.node))));
     }
     argv
 }
@@ -410,14 +457,21 @@ mod tests {
             .collect()
     }
 
+    fn args(rules: &[Rule]) -> Vec<&str> {
+        rules
+            .iter()
+            .map(|r| r.arg.to_str().expect("test rules are ASCII"))
+            .collect()
+    }
+
     /// The session bus's rules; the plan under test grants that bus.
     fn session(p: &Plan) -> Vec<&str> {
-        strs(&p.session.as_ref().expect("dbus is granted").rules)
+        args(&p.session.as_ref().expect("dbus is granted").rules)
     }
 
     /// The system bus's rules; the plan under test grants that bus.
     fn system(p: &Plan) -> Vec<&str> {
-        strs(&p.system.as_ref().expect("system-bus is granted").rules)
+        args(&p.system.as_ref().expect("system-bus is granted").rules)
     }
 
     fn env() -> Env {
@@ -480,6 +534,55 @@ mod tests {
             p.flatpak_info,
             b"[Application]\nname=org.bubbler.ff\n\n[Instance]\ninstance-id=bubbler-ff\n".to_vec()
         );
+    }
+
+    /// Every rule names the node that asked for it, which is what
+    /// `--explain --proxy` groups them under.
+    #[test]
+    fn each_rule_carries_the_node_that_contributed_it() {
+        let services = [
+            Service::Wayland,
+            Service::Dbus {
+                rules: vec![BusRule::Own("org.a.B".into())],
+            },
+            Service::Notify,
+            Service::SystemBus {
+                rules: vec![BusRule::Talk("org.freedesktop.UDisks2".into())],
+            },
+        ];
+        let p = plan(&services, "t").expect("dbus is granted");
+        let nodes: Vec<(&str, usize)> = p
+            .session
+            .as_ref()
+            .expect("dbus is granted")
+            .rules
+            .iter()
+            .map(|r| (r.arg.to_str().expect("ASCII"), r.node))
+            .collect();
+        assert_eq!(
+            nodes,
+            vec![
+                ("--own=org.a.B", 1),
+                ("--talk=org.freedesktop.Notifications", 2),
+            ]
+        );
+        let system = &p.system.as_ref().expect("system-bus is granted").rules;
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0].node, 3);
+        // A rule two nodes ask for keeps the first that did.
+        let p = plan(
+            &[
+                Service::Dbus {
+                    rules: vec![BusRule::Talk("org.freedesktop.Notifications".into())],
+                },
+                Service::Notify,
+            ],
+            "t",
+        )
+        .expect("dbus is granted");
+        let rules = &p.session.as_ref().expect("dbus is granted").rules;
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].node, 0);
     }
 
     #[test]
