@@ -257,22 +257,27 @@ pty hangs up with bubbler — the same as after a detach, not a signal
 delivered to the command.
 
 Either way, the output the sandbox has already produced is handed over
-before bubbler leaves, however long your terminal takes to accept it — up
-to ten seconds, and only for as long as it keeps taking any of it. A
-terminal that has gone five seconds without taking a byte or reporting
-itself ready for one is given up on, and so is the rest of the output a
-fifth of a second after a signal, since by then you are waiting for
-bubbler rather than for it. Either way bubbler says how much it dropped,
-and never waits for that message to be read: a terminal that has stopped
-reading would otherwise take the whole run with it.
+before bubbler leaves, however long your terminal takes to accept it. One
+ten-second window covers the whole hand-over, whatever it is being handed
+to; a terminal that has gone five seconds without taking a single byte is
+given up on inside it, and so is the rest of the output a fifth of a
+second after a signal, since by then you are waiting for bubbler rather
+than for it.
+
+bubbler tries to say how much it dropped, but that message is best-effort
+and never waited for: when your stderr is the same terminal that has
+stopped reading, there is nowhere to put it and it is skipped rather than
+written, because waiting for it would take the whole run down with it.
 
 SIGKILL cannot be caught, and neither can anything else that takes bubbler
 down without letting it unwind — a hang-up it never gets to act on
 included. All those can leave behind is your terminal still in raw mode,
 with no echo and no line editing; `reset`, or `stty sane`, puts it right.
-Nothing else of yours is touched: bubbler opens its own descriptor for the
-output it writes, so the non-blocking flag it needs never reaches the one
-your shell holds.
+No descriptor of yours is left changed: bubbler opens one of its own for
+the output it relays, so the non-blocking flag it needs never reaches
+the descriptor your shell holds, and where it cannot open one — a
+redirect to a socket, say — it writes without setting the flag at all
+rather than set it on something you share.
 
 The pty is allocated on the host, so its name inside is not its name outside.
 `/proc/self/fd/0` still reads back a host `/dev/pts/N`, a path the sandbox's

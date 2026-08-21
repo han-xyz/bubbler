@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use rustix::event::{Nsecs, PollFd, PollFlags, Secs, Timespec, poll};
 use rustix::fs::{FileType, Mode, OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::io::{Errno, read, write};
+use rustix::net::SendFlags;
 use rustix::pty::{OpenptFlags, grantpt, ioctl_tiocgptpeer, openpt, unlockpt};
 use rustix::termios::{
     LocalModes, OptionalActions, SpecialCodeIndex, Termios, isatty, tcgetattr, tcgetwinsize,
@@ -43,9 +44,10 @@ const DRAIN: Duration = Duration::from_millis(200);
 
 /// How long a destination that is taking nothing at all is still waited
 /// for before what is left is given up on. A terminal frees its write
-/// room a buffer at a time, so a reader taking a little at a time leaves
-/// `write` failing for a while without being stuck: readiness counts as
-/// movement, and only the two together running out mean a stall.
+/// room a buffer at a time, so `write` keeps failing for a while with
+/// nothing wrong: measured here, a pty read 256 bytes at a time refuses
+/// for 2.0 s at 5 reads a second and 4.5 s at 2, so a second of it means
+/// nothing and five is the first length that does.
 const STALL: Duration = Duration::from_secs(5);
 
 /// The whole of what handing over one destination's last output may
@@ -423,8 +425,9 @@ fn reopen(fd: BorrowedFd<'_>) -> Option<OwnedFd> {
 /// only `SIGKILL` can end.
 struct Warn {
     fd: Option<OwnedFd>,
-    /// fd 2's own flags, when the duplicate had to change them.
-    saved: Option<OFlags>,
+    /// Whether `fd` is a description bubbler opened for itself, and so
+    /// one whose non-blocking flag is nobody else's business.
+    own: bool,
 }
 
 impl Warn {
@@ -432,64 +435,46 @@ impl Warn {
         let Ok(dup) = std::io::stderr().as_fd().try_clone_to_owned() else {
             return Self {
                 fd: None,
-                saved: None,
+                own: false,
             };
         };
-        if let Some(own) = reopen(dup.as_fd()) {
-            return Self {
+        match reopen(dup.as_fd()) {
+            Some(own) => Self {
                 fd: Some(own),
-                saved: None,
-            };
-        }
-        // No second description to be had. A seekable fd takes a write
-        // without blocking anyway, so it is left exactly as it is.
-        if seekable(dup.as_fd()) {
-            return Self {
+                own: true,
+            },
+            // A seekable fd 2 (`2> log`), a socket, or a terminal on a
+            // system without `/proc`. Its flags stay exactly as the
+            // caller left them; `say` works around that instead.
+            None => Self {
                 fd: Some(dup),
-                saved: None,
-            };
-        }
-        // What is left is a socket, or a terminal on a system without
-        // `/proc`. The flag has to go on the description fd 2 shares,
-        // and comes off again when the relay is done with it.
-        let saved = fcntl_getfl(&dup).ok();
-        if let Some(flags) = saved {
-            // A failed set is the same case as no flag at all: the
-            // warning is dropped below rather than written.
-            let _ = fcntl_setfl(&dup, flags | OFlags::NONBLOCK);
-        }
-        Self {
-            fd: Some(dup),
-            saved,
+                own: false,
+            },
         }
     }
 
-    /// Say `msg`, or drop it. Never blocks, never fails a run, and never
-    /// waits for a terminal that has stopped reading.
+    /// Say `msg`, or drop it. Never blocks and never fails a run.
     fn say(&self, msg: &str) {
         let Some(fd) = &self.fd else {
             return;
         };
-        if self.saved.is_some() {
-            // The flag went on a description bubbler does not own alone
-            // and may not have taken at all, so this asks first. Not a
-            // guarantee — a ready destination can still take only part
-            // of a message — but the last resort behind the flag.
-            let mut fds = [PollFd::from_borrowed_fd(fd.as_fd(), PollFlags::OUT)];
-            if !poll(&mut fds, Some(&NOW)).is_ok_and(|n| n > 0) {
-                return;
-            }
+        if self.own {
+            let _ = write(fd, msg.as_bytes());
+            return;
         }
-        let _ = write(fd, msg.as_bytes());
-    }
-}
-
-impl Drop for Warn {
-    fn drop(&mut self) {
-        if let (Some(fd), Some(flags)) = (&self.fd, self.saved) {
-            // Nothing to report and nothing to do about it, as for the
-            // destinations: this is the way out of a run.
-            let _ = fcntl_setfl(fd, flags);
+        // fd 2 as the caller left it: making it non-blocking would make
+        // it non-blocking for the shell that shares the description, so
+        // instead a socket is told not to wait for this one message,
+        // which touches nothing...
+        match rustix::net::send(fd, msg.as_bytes(), SendFlags::DONTWAIT) {
+            Err(Errno::NOTSOCK) => {}
+            _ => return,
+        }
+        // ...and anything else is written only when it says it is ready,
+        // which for a seekable fd 2 it always is.
+        let mut fds = [PollFd::from_borrowed_fd(fd.as_fd(), PollFlags::OUT)];
+        if poll(&mut fds, Some(&NOW)).is_ok_and(|n| n > 0) {
+            let _ = write(fd, msg.as_bytes());
         }
     }
 }
@@ -625,14 +610,14 @@ impl<'a> Out<'a> {
     /// taking it: this is the end of the command's output, and a
     /// deadline is no reason to drop it.
     ///
-    /// Bounded three ways, none of which ever blocks: [`FLUSH_MAX`] for
-    /// the whole of it, [`STALL`] without either a write getting through
-    /// or the host reporting itself writable, and [`HURRY`] from the
-    /// moment `stop` says the user is waiting for bubbler to be gone.
-    fn finish(&mut self, stop: &AtomicBool) {
-        let start = Instant::now();
-        let mut moved = start;
-        let mut hurried = stop.load(Ordering::SeqCst).then_some(start);
+    /// Bounded three ways, none of which ever blocks: `by`, which is one
+    /// [`FLUSH_MAX`] shared by every destination of a hand-over rather
+    /// than one each; [`STALL`] without a single byte getting through;
+    /// and [`HURRY`] from the moment `stop` says the user is waiting for
+    /// bubbler to be gone.
+    fn finish(&mut self, stop: &AtomicBool, by: Instant) {
+        let mut moved = Instant::now();
+        let mut hurried = stop.load(Ordering::SeqCst).then_some(moved);
         while self.open && !self.pending.is_empty() {
             let held = self.pending.len();
             self.flush();
@@ -650,18 +635,13 @@ impl<'a> Out<'a> {
                 self.give_up("bubbler is stopping");
                 return;
             }
-            if now.duration_since(moved) >= STALL || now.duration_since(start) >= FLUSH_MAX {
+            if now.duration_since(moved) >= STALL || now >= by {
                 self.give_up("it stopped being taken");
                 return;
             }
-            // Readiness counts as movement: a terminal frees its write
-            // room a buffer at a time, so a reader taking a little at a
-            // time leaves `write` failing for longer than a stall would
-            // allow while never actually being stuck.
             let mut fds = [PollFd::from_borrowed_fd(self.fd, PollFlags::OUT)];
-            if poll(&mut fds, Some(&TICK_TIMESPEC)).is_ok_and(|n| n > 0) {
-                moved = Instant::now();
-            }
+            // A failed wait only costs a turn; the bounds above end this.
+            let _ = poll(&mut fds, Some(&TICK_TIMESPEC));
         }
     }
 
@@ -810,7 +790,7 @@ pub fn relay(
                         // What the sandbox has already written is the
                         // user's to see, detach or not.
                         out.relax();
-                        out.finish(caught.stop);
+                        out.finish(caught.stop, Instant::now() + FLUSH_MAX);
                         return Ok(RelayEnd::Detached);
                     }
                 }
@@ -886,7 +866,7 @@ fn drain(master: BorrowedFd<'_>, out: &mut Out<'_>, mut reading: bool, stop: &At
     // what has already been read: that is the end of the command's
     // output, and it is handed over for as long as the host is taking it
     // and the user is not waiting.
-    out.finish(stop);
+    out.finish(stop, Instant::now() + FLUSH_MAX);
 }
 
 /// Copy each pipe to the fd next to it until `until` reports an exit and
@@ -931,9 +911,11 @@ pub fn pump(
             && ((!open.contains(&true) && !waiting) || Instant::now() >= deadline)
         {
             // As in the relay: the deadline ends the reading, and what
-            // was read is handed over while the host is taking it.
+            // was read is handed over while the host is taking it. One
+            // deadline for the hand-over, not one for each pipe.
+            let by = Instant::now() + FLUSH_MAX;
             for out in &mut outs {
-                out.finish(stop);
+                out.finish(stop, by);
             }
             return Ok(code);
         }
@@ -1642,6 +1624,52 @@ mod tests {
         assert!(reopen(read_end.as_fd()).is_none());
         // What is already open for writing gains nothing it did not have.
         assert!(reopen(write_end.as_fd()).is_some());
+    }
+
+    #[test]
+    fn a_warning_leaves_the_stderr_it_was_given_exactly_as_it_was() {
+        let (mine, theirs) = UnixStream::pair().unwrap();
+        let theirs = OwnedFd::from(theirs);
+        // A socket has no second description to be had, so this is the
+        // case where a warning has to make do with fd 2 as it stands.
+        assert!(reopen(theirs.as_fd()).is_none());
+        let before = fcntl_getfl(&theirs).unwrap();
+        let probe = theirs.try_clone().unwrap();
+        let moved = StderrOn::at(theirs);
+        let warn = Warn::new();
+        warn.say("bubbler: a word about the output\n");
+        let after = fcntl_getfl(&probe).unwrap();
+        drop(moved);
+        assert_eq!(
+            after, before,
+            "the warning changed the flags of the caller's own stderr"
+        );
+        // And it was said all the same: nothing here is bought with it.
+        let mut buf = [0u8; 64];
+        let n = read(&mine, &mut buf).unwrap();
+        assert!(buf[..n].starts_with(b"bubbler: "), "{:?}", &buf[..n]);
+    }
+
+    #[test]
+    fn a_file_destination_is_written_at_the_offset_it_had() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        let file = rustix::fs::open(
+            &path,
+            OFlags::CREATE | OFlags::WRONLY | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .unwrap();
+        write(&file, b"HEAD").unwrap();
+        // A second description of a regular file starts at offset 0 and
+        // writes over what is already there, so it is never taken.
+        assert!(reopen(file.as_fd()).is_none());
+        let Pty { master, slave } = pty_pair();
+        let r = spawn_relay(master, None, file);
+        write(&slave, b"TAIL\n").unwrap();
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(finish(r), RelayEnd::Exited(0));
+        assert_eq!(std::fs::read(&path).unwrap(), b"HEADTAIL\n");
     }
 
     #[test]

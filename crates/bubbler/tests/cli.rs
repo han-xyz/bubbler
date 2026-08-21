@@ -2,6 +2,7 @@ mod common;
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -2107,10 +2108,13 @@ fn real_bwrap_exec_stops_on_a_signal_with_the_terminal_wedged() {
     let Some((tmp, init)) = live_instance("t") else {
         return;
     };
+    // Its own process group, so a test that gives up on it can end the
+    // bubbler and the bwrap under it instead of leaving them running.
     let run = bubbler_live(tmp.path(), &init)
         .args(["run", "t", "--", "/usr/bin/sleep", "30"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()
         .unwrap();
     let sock = tmp.path().join("run/bubbler/t/init.sock");
@@ -2118,6 +2122,7 @@ fn real_bwrap_exec_stops_on_a_signal_with_the_terminal_wedged() {
         || UnixStream::connect(&sock).is_ok(),
         Duration::from_secs(10),
     ) {
+        kill_group(&run);
         fail_with(run, "the instance never accepted a connection");
     }
     let pty = test_pty();
@@ -2152,6 +2157,7 @@ fn real_bwrap_exec_stops_on_a_signal_with_the_terminal_wedged() {
     );
     if !stopped {
         let _ = exec.kill();
+        kill_group(&run);
         panic!("the exec did not stop within two seconds of SIGTERM");
     }
     assert_eq!(status.and_then(|s| s.code()), Some(128 + 15));
