@@ -10,16 +10,18 @@ use std::process::{Command, ExitCode};
 use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
-use bubbler_core::config::Service;
+use bubbler_core::config::{self, Service};
+use bubbler_core::env::Env;
 use bubbler_core::error::{ConfigError, LaunchError};
 use bubbler_core::exec;
+use bubbler_core::explain;
 use bubbler_core::host::RealHost;
 use bubbler_core::instance::{self, Instance};
 use bubbler_core::launcher;
 use bubbler_core::lint;
 use bubbler_core::profile;
 use bubbler_core::tty::{self, TtyMode};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// `--tty` takes the names the config's `tty` node takes; clap already
 /// says which value was rejected, so only the reason is passed on.
@@ -28,6 +30,32 @@ fn tty_mode(s: &str) -> Result<TtyMode, String> {
         ConfigError::BadArgument { reason, .. } => reason,
         other => other.to_string(),
     })
+}
+
+/// How much of the argv `--explain` prints.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Explain {
+    /// Every group, with the baseline summed up after its first
+    /// arguments. The default.
+    Groups,
+    /// Every argument, the baseline included.
+    Full,
+}
+
+/// How `--explain` writes what it found.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Format {
+    /// Groups for reading, in emit order.
+    Text,
+    /// One object per operation, nothing elided.
+    Json,
+}
+
+/// The `--explain` flags `run` and `try` share.
+struct Explaining {
+    mode: Explain,
+    format: Format,
+    proxy: bool,
 }
 
 /// bubblewrap-based application sandbox.
@@ -56,6 +84,24 @@ enum Cmd {
         /// Print the bwrap argv, one element per line, instead of running.
         #[arg(long)]
         dry_run: bool,
+        /// Print the argv grouped under the node each argument came
+        /// from, instead of running; `full` also lists the baseline.
+        #[arg(long, value_name = "MODE", value_enum, num_args = 0..=1,
+              default_missing_value = "groups")]
+        explain: Option<Explain>,
+        /// With `--explain`: explain the D-Bus proxy sidecar's argv
+        /// instead of the sandbox's.
+        #[arg(long, requires = "explain")]
+        proxy: bool,
+        /// With `--explain`: `text` to read, `json` for tooling.
+        #[arg(
+            long,
+            value_name = "FORMAT",
+            value_enum,
+            default_value = "text",
+            requires = "explain"
+        )]
+        format: Format,
         /// Terminal the sandbox gets: `pty`, `passthrough` or `none`;
         /// overrides the instance's `tty` node.
         #[arg(long, value_name = "MODE", value_parser = tty_mode)]
@@ -73,8 +119,27 @@ enum Cmd {
         #[arg(long = "grant", value_name = "SERVICE")]
         grants: Vec<String>,
         /// Keep the sandbox afterwards as an instance with this name.
-        #[arg(long, value_name = "NAME")]
+        // Nothing runs under `--explain`, so there is nothing to keep.
+        #[arg(long, value_name = "NAME", conflicts_with = "explain")]
         keep: Option<String>,
+        /// Print the argv grouped under the node each argument came
+        /// from, instead of running; `full` also lists the baseline.
+        #[arg(long, value_name = "MODE", value_enum, num_args = 0..=1,
+              default_missing_value = "groups")]
+        explain: Option<Explain>,
+        /// With `--explain`: explain the D-Bus proxy sidecar's argv
+        /// instead of the sandbox's.
+        #[arg(long, requires = "explain")]
+        proxy: bool,
+        /// With `--explain`: `text` to read, `json` for tooling.
+        #[arg(
+            long,
+            value_name = "FORMAT",
+            value_enum,
+            default_value = "text",
+            requires = "explain"
+        )]
+        format: Format,
         /// Terminal the sandbox gets: `pty`, `passthrough` or `none`;
         /// overrides the profile's `tty` node.
         #[arg(long, value_name = "MODE", value_parser = tty_mode)]
@@ -206,6 +271,66 @@ fn print_lines(lines: &[&OsStr], what: &str) -> Result<i32> {
     }
 }
 
+/// Print the argv of `inst` with every argument under the node it came
+/// from, or, with `--proxy`, the argv of its D-Bus proxy sidecar. Nothing
+/// is started: `--explain` is a `--dry-run` with a different framing.
+fn explain(
+    env: &Env,
+    inst: &Instance,
+    command: Option<&[OsString]>,
+    ctty: bool,
+    opts: &Explaining,
+) -> Result<i32> {
+    let (title, items) = match opts.proxy {
+        true => (
+            "bwrap  (the D-Bus proxy sidecar)",
+            launcher::explain_proxy(env, inst)
+                .context("building the proxy's bwrap arguments")?
+                .with_context(|| {
+                    format!(
+                        "instance `{}` grants no bus, so it starts no proxy sidecar",
+                        inst.name
+                    )
+                })?,
+        ),
+        false => (
+            "bwrap",
+            launcher::explain(env, inst, command, ctty).context("building bwrap arguments")?,
+        ),
+    };
+    let path = inst.config_path();
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let mut lines = config::node_lines(&text)
+        .with_context(|| format!("locating the nodes of {}", path.display()))?;
+    // The file is read a second time here, so a config edited in between
+    // is reported without line numbers rather than with wrong ones.
+    if lines.services.len() != inst.config.services.len()
+        || lines.env.len() != inst.config.env.len()
+    {
+        lines = config::Lines::default();
+    }
+    let rules = explain::rules(&inst.config, &inst.name);
+    let view = explain::View {
+        title,
+        cfg: &inst.config,
+        source: explain::Source {
+            file: "config.kdl",
+            lines: &lines,
+        },
+        rules: &rules,
+        proxy: opts.proxy,
+        full: opts.mode == Explain::Full,
+    };
+    let rendered = match opts.format {
+        Format::Text => explain::render(&items, &view),
+        Format::Json => explain::render_json(&items, &view).map(|j| vec![j]),
+    }
+    .context("rendering the explanation")?;
+    let lines: Vec<&OsStr> = rendered.iter().map(OsStr::new).collect();
+    print_lines(&lines, "the explanation")
+}
+
 /// Program and arguments from `$VISUAL`, else `$EDITOR`. The value is
 /// split into argv and never passed to a shell, so quotes and `$VAR` in
 /// it are not expanded. Resolved before anything is opened or written:
@@ -308,6 +433,9 @@ fn real_main() -> Result<i32> {
         Cmd::Run {
             name,
             dry_run,
+            explain: explain_mode,
+            proxy,
+            format,
             tty,
             command,
         } => {
@@ -319,13 +447,26 @@ fn real_main() -> Result<i32> {
             })?;
             let command = (!command.is_empty()).then_some(command.as_slice());
             let mode = tty.unwrap_or(inst.config.tty);
+            // A dry run and an explanation both describe a fresh start
+            // and never touch a live instance, so the liveness check is
+            // skipped for both. The argv still depends on this terminal:
+            // `--ctty` is there exactly when a real run would allocate a
+            // pty for the sandbox's stdin.
+            let ctty = tty::plan(mode, tty::host_is_tty()).ctty();
+            if let Some(mode) = explain_mode {
+                return explain(
+                    &env,
+                    &inst,
+                    command,
+                    ctty,
+                    &Explaining {
+                        mode,
+                        format,
+                        proxy,
+                    },
+                );
+            }
             if dry_run {
-                // A dry run describes a fresh start and never touches a
-                // live instance, so the liveness check is skipped here.
-                // The argv still depends on this terminal: `--ctty` is
-                // there exactly when a real run would allocate a pty for
-                // the sandbox's stdin.
-                let ctty = tty::plan(mode, tty::host_is_tty()).ctty();
                 let argv = launcher::build_argv(
                     &env,
                     &inst,
@@ -359,12 +500,35 @@ fn real_main() -> Result<i32> {
             profile,
             grants,
             keep,
+            explain: explain_mode,
+            proxy,
+            format,
             tty,
             command,
         } => {
             let grants: Vec<&str> = grants.iter().map(String::as_str).collect();
             let mut eph = Instance::ephemeral(&env, &profile, &grants)
                 .context("creating a throwaway sandbox")?;
+            if let Some(mode) = explain_mode {
+                let command = (!command.is_empty()).then_some(command.as_slice());
+                let tty_mode = tty.unwrap_or(eph.instance.config.tty);
+                let ctty = tty::plan(tty_mode, tty::host_is_tty()).ctty();
+                let code = explain(
+                    &env,
+                    &eph.instance,
+                    command,
+                    ctty,
+                    &Explaining {
+                        mode,
+                        format,
+                        proxy,
+                    },
+                );
+                // The sandbox directory must outlive the explanation:
+                // dropping the guard is what removes it.
+                drop(eph);
+                return code;
+            }
             if let Some(name) = &keep {
                 eph.keep_as(&env, name)
                     .with_context(|| format!("keeping the sandbox as instance `{name}`"))?;

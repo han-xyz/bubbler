@@ -7,6 +7,7 @@ pub mod dbus;
 pub mod env;
 pub mod error;
 pub mod exec;
+pub mod explain;
 pub mod host;
 pub mod init_bin;
 pub mod instance;

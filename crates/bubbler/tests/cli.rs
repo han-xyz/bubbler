@@ -448,6 +448,249 @@ fn run_without_command_fails_with_message() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("no command"));
 }
 
+/// An instance whose grants need nothing of this host: the D-Bus socket
+/// is bound from a path the launcher would create, and `notify` is a rule
+/// for the proxy rather than an argument.
+fn explainable(tmp: &Path) -> PathBuf {
+    bubbler(tmp).args(["create", "t"]).status().unwrap();
+    std::fs::create_dir_all(tmp.join("home/Downloads")).unwrap();
+    let cfg = tmp.join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(
+        &cfg,
+        "dbus\nportals\nnotify\nhome-share \"Downloads\" mode=rw\nuserns \"disable\"\n\
+         env FOO=\"bar\"\ncommand \"true\"\n",
+    )
+    .unwrap();
+    cfg
+}
+
+#[test]
+fn explain_puts_every_argument_under_the_node_it_came_from() {
+    let tmp = setup();
+    explainable(tmp.path());
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--explain"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(s.starts_with("bwrap\n\n  baseline "), "{s}");
+    // The fd numbers are the ones `--dry-run` prints, and each says what
+    // is behind it.
+    assert!(
+        s.contains("    --info-fd 3  (pipe: bwrap reports the sandbox pid on it)\n"),
+        "{s}"
+    );
+    assert!(
+        s.contains("    --block-fd 4  (pipe: the sandbox waits on it until bubbler lets it go)\n"),
+        "{s}"
+    );
+    assert!(
+        s.contains("    --add-seccomp-fd 5  (EPERM program, "),
+        "{s}"
+    );
+    assert!(
+        s.contains("    --add-seccomp-fd 6  (ENOSYS program, "),
+        "{s}"
+    );
+    assert!(
+        s.contains("--ro-bind-data 9 /.flatpak-info  (generated file, "),
+        "{s}"
+    );
+    assert!(
+        s.contains("--socket-fd 10  (socket: the exec channel bubbler-init serves)"),
+        "{s}"
+    );
+    // Each granted node is named with the line it is on, `notify` too,
+    // though it contributes no argument at all.
+    for (node, line) in [
+        ("dbus", 1),
+        ("portals", 2),
+        ("notify", 3),
+        ("home-share \"Downloads\" mode=rw", 4),
+    ] {
+        assert!(
+            s.contains(&format!("  {node} ")) && s.contains(&format!("config.kdl:{line}")),
+            "{node}: {s}"
+        );
+    }
+    // A node whose whole grant is proxy rules lists them, and a node
+    // that has both lists them under its arguments.
+    assert!(
+        s.contains("  0 arguments\n    rule-only: --talk=org.freedesktop.Notifications\n"),
+        "{s}"
+    );
+    assert!(
+        s.contains(
+            "    rules: --talk=org.freedesktop.portal.Desktop\n           \
+             --talk=org.freedesktop.portal.Documents\n"
+        ),
+        "{s}"
+    );
+    assert!(s.contains("\n  userns "), "{s}");
+    assert!(s.contains("\n    --unshare-user --disable-userns\n"), "{s}");
+    assert!(s.contains("\n  env FOO "), "{s}");
+    assert!(
+        s.contains(&format!(
+            "    --bind {}/Downloads /home/bubbler/Downloads\n",
+            tmp.path().join("home").display()
+        )),
+        "{s}"
+    );
+    assert!(s.contains(" more (--explain=full)\n"), "{s}");
+    assert!(
+        s.ends_with("; 6 D-Bus rules to the proxy (--proxy)\n"),
+        "{s}"
+    );
+}
+
+#[test]
+fn explain_full_lists_the_baseline_and_json_elides_nothing() {
+    let tmp = setup();
+    explainable(tmp.path());
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--explain=full"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(s.contains("\n    --symlink usr/bin /bin\n"), "{s}");
+    assert!(!s.contains("(--explain=full)"), "{s}");
+
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--explain", "--format", "json"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(s.starts_with("[\n  {\"origin\": "), "{s}");
+    assert!(s.ends_with("]\n"), "{s}");
+    assert!(
+        s.contains(
+            "{\"origin\": {\"kind\": \"service\", \"node\": \
+             \"home-share \\\"Downloads\\\" mode=rw\", \"index\": 3, \"line\": 4}"
+        ),
+        "{s}"
+    );
+    assert!(
+        s.contains("\"note\": \"pipe: bwrap reports the sandbox pid on it\""),
+        "{s}"
+    );
+    // Nothing is left out: one object per operation of the whole argv.
+    let dry = bubbler(tmp.path())
+        .args(["run", "t", "--dry-run"])
+        .output()
+        .unwrap();
+    let elements = String::from_utf8_lossy(&dry.stdout).lines().count() - 1;
+    let quoted: usize = s
+        .lines()
+        .filter(|l| l.starts_with("  {"))
+        .map(|l| {
+            let args = l
+                .split("\"args\": [")
+                .nth(1)
+                .and_then(|a| a.split("], \"note\"").next())
+                .unwrap_or_default();
+            args.matches(", ").count() + 1
+        })
+        .sum();
+    assert_eq!(quoted, elements, "{s}");
+}
+
+#[test]
+fn explain_proxy_explains_the_sidecar_and_says_when_there_is_none() {
+    let tmp = setup();
+    explainable(tmp.path());
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--explain", "--proxy"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(s.starts_with("bwrap  (the D-Bus proxy sidecar)\n"), "{s}");
+    // The sidecar's rules are its command, one per line.
+    assert!(s.contains("\n    --filter\n"), "{s}");
+    assert!(
+        s.contains("\n    --talk=org.freedesktop.Notifications\n"),
+        "{s}"
+    );
+    assert!(s.contains("\n  identity "), "{s}");
+    // Each rule is grouped under the node that asked for it, with the
+    // line that node is on; a grant that gave the sidecar nothing is not
+    // a group of this argv.
+    assert!(
+        s.contains(
+            "\n  notify    config.kdl:3  1 argument\n    --talk=org.freedesktop.Notifications\n"
+        ),
+        "{s}"
+    );
+    assert!(
+        s.contains("\n  portals   config.kdl:2  5 arguments\n"),
+        "{s}"
+    );
+    assert!(!s.contains("home-share"), "{s}");
+    assert!(!s.contains("rule-only"), "{s}");
+
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "command \"true\"\n").unwrap();
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--explain", "--proxy"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("starts no proxy sidecar"), "{err}");
+
+    // `--proxy` is about an explanation and means nothing without one.
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--proxy"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn try_explains_a_throwaway_sandbox_without_running_it() {
+    let tmp = setup();
+    write_profile(tmp.path(), "user", "app", "network\ncommand \"true\"\n");
+    let out = bubbler(tmp.path())
+        .args(["try", "--profile", "app", "--explain"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(s.contains("\n  network "), "{s}");
+    assert!(s.contains("\n    --share-net\n"), "{s}");
+    assert!(s.contains("config.kdl:2"), "{s}");
+    // The throwaway directory is gone again, and no instance was left.
+    let out = bubbler(tmp.path()).arg("list").output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    let left = std::fs::read_dir(tmp.path().join("data/bubbler/try"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(left, 0);
+}
+
 // `network` binds /etc/resolv.conf, so this test needs one on the host.
 #[test]
 fn network_share_and_home_share_appear_in_dry_run() {
