@@ -2868,6 +2868,33 @@ fn invalid_config_names_the_file_once() {
     );
 }
 
+/// The input the fuzzer found in `kdl` 6.7.1: the parser descends into
+/// `{` by recursion, so a file of nothing but open braces overflowed the
+/// stack and aborted bubbler — with a core dump and no message — on
+/// every path that reads a configuration.
+#[test]
+fn a_configuration_nested_past_the_bound_is_refused_wherever_it_is_read() {
+    let tmp = setup();
+    let evil = format!("a {}", "{".repeat(1400));
+    let profile = write_profile(tmp.path(), "system", "evil", &evil);
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, &evil).unwrap();
+    for (args, file) in [
+        (vec!["profile", "show", "evil"], &profile),
+        (vec!["profile", "lint", "evil"], &profile),
+        (vec!["create", "e", "--profile", "evil"], &profile),
+        (vec!["run", "t", "--dry-run"], &cfg),
+    ] {
+        let out = bubbler(tmp.path()).args(&args).output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        // An abort has no exit code at all, which is what this had.
+        assert!(out.status.code().is_some_and(|c| c != 0), "{args:?}: {err}");
+        assert!(err.contains(&file.display().to_string()), "{args:?}: {err}");
+        assert!(err.contains("nested deeper than 64"), "{args:?}: {err}");
+    }
+}
+
 #[test]
 fn instance_name_cannot_start_with_a_dash() {
     let tmp = setup();
@@ -4903,6 +4930,38 @@ try:
 except OSError as e:
     print('BLOCKED', type(e).__name__)
 ";
+
+/// The user namespace pasta is handed is taken from the sandbox's
+/// network namespace, which cannot be raced: what it replaced was a
+/// `/proc/<child-pid>/ns/user` open that had to happen before bwrap
+/// moved the sandbox into a nested user namespace. Twenty runs in a
+/// row, because a race is something a single run wins.
+#[test]
+fn twenty_isolated_runs_in_a_row_all_reach_their_sidecar() {
+    if !require_bwrap() || !require_pasta() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/t/config.kdl"),
+        "network
+",
+    )
+    .unwrap();
+    for run in 1..=20 {
+        let out = bubbler_live(tmp.path(), &init)
+            .args(["run", "t", "--", "/usr/bin/true"])
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "run {run} of 20: {err}");
+    }
+}
 
 #[test]
 fn real_pasta_hides_the_host_loopback_that_network_host_still_reaches() {

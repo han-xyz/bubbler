@@ -37,6 +37,25 @@ pub enum ConfigError {
     /// Neither the config nor the CLI supplied a command to run.
     #[error("no command: add a `command` node to the config or pass one after `--`")]
     MissingCommand,
+    /// Larger than [`crate::config::MAX_BYTES`], and so refused before
+    /// the parser sees it.
+    #[error("configuration is {bytes} bytes; bubbler parses at most {max}")]
+    TooLarge {
+        /// Size of the text that was offered.
+        bytes: usize,
+        /// The bound it passed, [`crate::config::MAX_BYTES`].
+        max: usize,
+    },
+    /// `{` nested deeper than [`crate::config::MAX_NESTING`]. The KDL
+    /// parser descends by recursion, so a file deep enough overflows the
+    /// stack and aborts the process instead of failing to parse.
+    #[error("`{{` nested deeper than {max} at line {line}")]
+    TooDeep {
+        /// Line the bound was passed on, counting from one.
+        line: u32,
+        /// The bound it passed, [`crate::config::MAX_NESTING`].
+        max: usize,
+    },
 }
 
 /// Failures while resolving a profile through its layers.

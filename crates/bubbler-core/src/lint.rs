@@ -543,7 +543,7 @@ struct Source {
 
 impl Source {
     fn read(at: Where, text: String) -> Result<Self, LintError> {
-        let doc = KdlDocument::parse(&text).map_err(config::ConfigError::from)?;
+        let doc = config::parse_document(&text)?;
         Ok(Self { at, text, doc })
     }
 

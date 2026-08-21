@@ -1505,6 +1505,12 @@ binding the tree under it.
 - `camera` has never been exercised against a real camera: this machine has
   none, so neither the portal call nor the device binds are more than unit and
   argv tested; see "camera".
+- The `kdl` crate parses `{` by recursing, so a deeply nested profile or
+  `config.kdl` would overflow the stack and abort bubbler with no diagnostic
+  at all. bubbler pre-checks every configuration it reads and refuses one
+  larger than 1 MiB or nested deeper than 64 braces, naming the file; the
+  check counts braces outside strings and comments and is not a parser, and
+  the recursion itself is upstream's (`kdl` 6.7.1).
 - No desktop entries.
 
 ## Files

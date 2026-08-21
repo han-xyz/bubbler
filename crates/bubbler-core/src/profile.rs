@@ -9,8 +9,6 @@ use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use kdl::KdlDocument;
-
 use crate::config::{
     self, BusRule, ConfigError, InstanceConfig, LintAllow, RawProfile, Service, ShareMode, Userns,
 };
@@ -427,7 +425,7 @@ enum Visit<'a> {
 /// followed, so a malformed `include` node names no layer at all rather
 /// than the wrong one.
 fn includes_of(text: &str) -> Result<Vec<String>, ConfigError> {
-    let doc = KdlDocument::parse(text)?;
+    let doc = config::parse_document(text)?;
     Ok(doc
         .nodes()
         .iter()

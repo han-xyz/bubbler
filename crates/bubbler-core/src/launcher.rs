@@ -3,9 +3,9 @@
 //! process-spawning code in the crate; it never goes through a shell, and
 //! every sidecar is killed on every way out of a run.
 
-use std::ffi::OsString;
+use std::ffi::{OsString, c_void};
 use std::io::{self, Seek, SeekFrom, Write};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use rustix::event::{Nsecs, PollFd, PollFlags, Secs, Timespec, poll};
 use rustix::fs::{AtFlags, MemfdFlags, Mode, OFlags};
 use rustix::io::{Errno, FdFlags, fcntl_dupfd_cloexec, fcntl_setfd};
+use rustix::ioctl::{self, Opcode};
 use rustix::process::{Pid, Signal, kill_process, test_kill_process};
 use signal_hook::SigId;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
@@ -711,6 +712,59 @@ fn same_namespace(a: &Path, b: &Path) -> Result<bool, LaunchError> {
     Ok(read(a)? == read(b)?)
 }
 
+/// `NS_GET_USERNS` as `linux/nsfs.h` defines it, `_IO(0xb7, 0x1)`: it
+/// answers with a descriptor for the user namespace that owns the
+/// namespace its argument descriptor names (`ioctl_ns(2)`).
+const NS_GET_USERNS: Opcode = ioctl::opcode::none(0xb7, 0x1);
+
+/// The `NS_GET_USERNS` call. Neither `NoArg` nor `Getter` describes it:
+/// it takes no argument and answers with an open descriptor as its
+/// return value, which `NoArg` throws away and `Getter` would read out
+/// of a buffer the kernel never writes into.
+struct NsGetUserns;
+
+// SAFETY: `NS_GET_USERNS` takes no argument and writes nothing into
+// userspace — hence the null pointer and `IS_MUTATING = false` — and on
+// success its return value is a newly opened descriptor, which is what
+// `output_from_ptr` makes of it.
+unsafe impl ioctl::Ioctl for NsGetUserns {
+    type Output = OwnedFd;
+
+    const IS_MUTATING: bool = false;
+
+    fn opcode(&self) -> Opcode {
+        NS_GET_USERNS
+    }
+
+    fn as_ptr(&mut self) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+
+    unsafe fn output_from_ptr(
+        out: ioctl::IoctlOutput,
+        _: *mut c_void,
+    ) -> rustix::io::Result<Self::Output> {
+        // SAFETY: the caller hands over the return value of an `ioctl`
+        // that succeeded, which for this opcode is a descriptor the
+        // kernel has just opened and nothing else owns.
+        Ok(unsafe { OwnedFd::from_raw_fd(out) })
+    }
+}
+
+/// The user namespace that owns the network namespace `netns` names.
+///
+/// Asked of the namespace rather than of a pid: bwrap moves the sandbox
+/// into a nested user namespace shortly after reporting `child-pid`, so
+/// `/proc/<pid>/ns/user` names whichever namespace the process is in by
+/// the time the path is resolved, while the user namespace that owns a
+/// network namespace is fixed when the namespace is created
+/// (`ioctl_ns(2)`, `namespaces(7)`).
+fn owning_userns(netns: BorrowedFd<'_>) -> rustix::io::Result<OwnedFd> {
+    // SAFETY: `NsGetUserns` describes what `NS_GET_USERNS` does, and it
+    // is made on a descriptor of an nsfs file, which is what `netns` is.
+    unsafe { ioctl::ioctl(netns, NsGetUserns) }
+}
+
 /// Start pasta on the sandbox's network namespace and wait until it has
 /// configured it. `child_pid` is the `child-pid` bwrap reported, and the
 /// sandbox must still be held at its `--block-fd`: until this returns the
@@ -722,26 +776,23 @@ fn same_namespace(a: &Path, b: &Path) -> Result<bool, LaunchError> {
 /// `/proc/self/fd/...`, so the paths name bubbler's process — which is
 /// why both descriptors have to stay open across the spawn.
 fn start_pasta(env: &Env, cfg: &NetworkConfig, child_pid: i32) -> Result<PastaHandle, LaunchError> {
-    // Opened here and not left to pasta: bwrap moves the sandbox into a
-    // nested user namespace shortly after reporting `child-pid`, and only
-    // the outer one owns the network namespace. Measured on bwrap 0.11.2:
-    // resolving the path this late works 3 times in 8, opening it now
-    // works 20 times in 20.
-    let ns_path = PathBuf::from(format!("/proc/{child_pid}/ns/user"));
-    let userns = rustix::fs::open(&ns_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
-        .map_err(|e| LaunchError::Io(ns_path, e.into()))?;
+    // The network namespace is what bubbler is really naming here: it is
+    // the one pasta configures, and its owning user namespace is fixed,
+    // where the pid's own `ns/user` is whatever bwrap has moved it into
+    // by the time a path is resolved.
+    let net_path = PathBuf::from(format!("/proc/{child_pid}/ns/net"));
+    let netns = rustix::fs::open(&net_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+        .map_err(|e| LaunchError::Io(net_path.clone(), e.into()))?;
     // The pid comes from bwrap's info document, and a sandbox that died
     // in the meantime leaves it to be handed out again. pasta configures
     // the network namespace of whatever holds the pid *now*, so a
     // sandbox that is not in a namespace of its own is not the sandbox.
-    if same_namespace(
-        &PathBuf::from(format!("/proc/{child_pid}/ns/net")),
-        Path::new("/proc/self/ns/net"),
-    )? {
+    if same_namespace(&net_path, Path::new("/proc/self/ns/net"))? {
         return Err(LaunchError::Network(
             "sandbox pid reused; refusing to configure the host network namespace".to_owned(),
         ));
     }
+    let userns = owning_userns(netns.as_fd()).map_err(|e| LaunchError::Io(net_path, e.into()))?;
     let (ready, done) = rustix::pipe::pipe().map_err(|e| LaunchError::Data(e.into()))?;
     for fd in [&ready, &done] {
         fcntl_setfd(fd, FdFlags::CLOEXEC).map_err(|e| LaunchError::Data(e.into()))?;
@@ -1649,6 +1700,7 @@ pub fn exec(env: &Env, name: &str, argv: &[OsString], mode: TtyMode) -> Result<i
 mod tests {
     use super::*;
     use crate::bwrap::INIT_INSIDE;
+    use std::io::BufRead;
     use std::os::unix::net::UnixStream;
 
     /// An `Env` whose `$BUBBLER_INIT` points at a stand-in binary, so
@@ -2962,5 +3014,100 @@ mod tests {
         );
         let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default(), false).unwrap());
         assert!(!a.iter().any(|x| x == "--add-seccomp-fd"), "{a:?}");
+    }
+
+    /// A child in the shape bwrap leaves a sandbox in: a network
+    /// namespace owned by one user namespace, with the process itself
+    /// moved on into a nested user namespace that owns nothing. Comes
+    /// back with the link of the owning namespace, which the child
+    /// reports before it moves. `None`, with a printed reason, where
+    /// this host cannot make one.
+    fn nested_child() -> Option<(Child, String)> {
+        let child = Command::new("unshare")
+            .args([
+                "--user",
+                "--map-root-user",
+                "--net",
+                "/usr/bin/sh",
+                "-c",
+                "readlink /proc/self/ns/user; \
+                 exec unshare --user /usr/bin/sh -c 'echo ready; exec sleep 30'",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+        let mut child = match child {
+            Ok(child) => child,
+            Err(e) => {
+                eprintln!("skipping: unshare(1) could not be started: {e}");
+                return None;
+            }
+        };
+        let said: Vec<String> = child
+            .stdout
+            .take()
+            .map(|out| {
+                std::io::BufReader::new(out)
+                    .lines()
+                    .map_while(Result::ok)
+                    .take(2)
+                    .collect()
+            })
+            .unwrap_or_default();
+        match said.as_slice() {
+            [owner, ready] if ready == "ready" => Some((child, owner.clone())),
+            _ => {
+                eprintln!("skipping: nested user namespaces are unavailable here");
+                let _ = child.kill();
+                let _ = child.wait();
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn the_ns_get_userns_opcode_is_the_one_the_header_defines() {
+        // `linux/nsfs.h`: `#define NSIO 0xb7` and
+        // `#define NS_GET_USERNS _IO(NSIO, 0x1)`.
+        assert_eq!(NS_GET_USERNS, 0xb701);
+    }
+
+    #[test]
+    fn the_user_namespace_comes_from_the_network_namespace_it_owns() {
+        let Some((mut child, owner)) = nested_child() else {
+            return;
+        };
+        let netns = rustix::fs::open(
+            format!("/proc/{}/ns/net", child.id()),
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let userns = owning_userns(netns.as_fd()).unwrap();
+        // The kernel opens it close-on-exec (`open_related_ns` in
+        // `fs/nsfs.c`), so a namespace descriptor is not something the
+        // sidecars bubbler spawns inherit.
+        assert!(
+            rustix::io::fcntl_getfd(&userns)
+                .unwrap()
+                .contains(FdFlags::CLOEXEC)
+        );
+        let link = |p: String| {
+            std::fs::read_link(p)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+        let got = link(format!("/proc/self/fd/{}", userns.as_raw_fd()));
+        // A namespace link reads as `<type>:[<inode>]`, and the inode is
+        // the namespace's identity (`namespaces(7)`).
+        assert_eq!(got, owner, "not the namespace that owns the netns");
+        // The path this replaced, and the reason it was a race: by now
+        // the child is in a user namespace of its own, which owns
+        // nothing and gives pasta no authority over the netns.
+        assert_ne!(got, link(format!("/proc/{}/ns/user", child.id())));
+        assert_ne!(got, link("/proc/self/ns/user".to_owned()));
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

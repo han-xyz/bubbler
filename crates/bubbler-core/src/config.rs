@@ -17,6 +17,24 @@ pub use crate::tty::TtyMode;
 use crate::dbus;
 use crate::seccomp::syscall_number;
 
+/// Largest configuration bubbler hands to the KDL parser. A profile or
+/// a `config.kdl` is a screenful of grants; a megabyte is already far
+/// past anything a person writes.
+pub const MAX_BYTES: usize = 1024 * 1024;
+
+/// Deepest `{`…`}` nesting bubbler hands to the KDL parser. The deepest
+/// node bubbler defines is two levels (`network { dns { … } }`), so this
+/// is room to spare for a config that means something.
+///
+/// Measured against `kdl` 6.7.1 on x86_64, parsing well-formed nesting
+/// until the process aborts: 1348 levels on the 8 MiB stack a main
+/// thread has in a release build, 253 in a debug build, and 61 on the
+/// 2 MiB stack of a spawned thread in a debug build. bubbler reads
+/// configurations on its main thread, where the bound leaves a factor of
+/// four even unoptimised; a library user parsing on a small thread stack
+/// in a debug build has less.
+pub const MAX_NESTING: usize = 64;
+
 /// Keys `env` may not set: the sandbox owns them.
 pub const RESERVED_ENV: &[&str] = &[
     "HOME",
@@ -385,6 +403,125 @@ pub fn parse_profile(text: &str) -> Result<RawProfile, ConfigError> {
     Ok(parse_doc(text, true)?.0)
 }
 
+/// Parse KDL text through the one bound bubbler puts on the parser.
+///
+/// Every configuration bubbler reads is parsed here. `kdl` 6 descends
+/// into `{` by recursion, so a file nested deeply enough overflows the
+/// stack and aborts the process instead of returning an error, and the
+/// text is measured before the parser is handed it.
+///
+/// The measurement is a pre-check and not a parser: it counts `{` and
+/// `}` outside strings and comments and decides nothing about what the
+/// document means. Text it accepts may still be invalid KDL.
+pub fn parse_document(text: &str) -> Result<KdlDocument, ConfigError> {
+    check_bounds(text)?;
+    Ok(KdlDocument::parse(text)?)
+}
+
+/// Refuse text past [`MAX_BYTES`] or [`MAX_NESTING`]. Counting the
+/// braces by hand is the point: see [`parse_document`].
+fn check_bounds(text: &str) -> Result<(), ConfigError> {
+    if text.len() > MAX_BYTES {
+        return Err(ConfigError::TooLarge {
+            bytes: text.len(),
+            max: MAX_BYTES,
+        });
+    }
+    let b = text.as_bytes();
+    let mut depth: usize = 0;
+    let mut i = 0;
+    while i < b.len() {
+        i = match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'/') => line_comment_end(b, i),
+            b'/' if b.get(i + 1) == Some(&b'*') => block_comment_end(b, i),
+            b'"' => string_end(b, i, 0),
+            // `#` opens a raw string (`#"…"#`) and also the keywords
+            // `#true`, `#null` and their kin, which hold no braces.
+            b'#' => {
+                let hashes = b[i..].iter().take_while(|c| **c == b'#').count();
+                if b.get(i + hashes) == Some(&b'"') {
+                    string_end(b, i + hashes, hashes)
+                } else {
+                    i + hashes
+                }
+            }
+            b'{' => {
+                depth += 1;
+                if depth > MAX_NESTING {
+                    return Err(ConfigError::TooDeep {
+                        line: line_at(text, i).unwrap_or(0),
+                        max: MAX_NESTING,
+                    });
+                }
+                i + 1
+            }
+            // A `}` too many is the parser's to reject, not this
+            // count's: it says nothing about how deep the file goes.
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                i + 1
+            }
+            _ => i + 1,
+        };
+    }
+    Ok(())
+}
+
+/// Index of the newline that ends the `//` comment at `at`, or the end
+/// of the text.
+fn line_comment_end(b: &[u8], at: usize) -> usize {
+    match b[at..].iter().position(|c| *c == b'\n') {
+        Some(n) => at + n,
+        None => b.len(),
+    }
+}
+
+/// Index just past the `/* */` comment at `at`. KDL nests them, so the
+/// first `*/` does not always end one.
+fn block_comment_end(b: &[u8], at: usize) -> usize {
+    let mut open: usize = 1;
+    let mut i = at + 2;
+    while i + 1 < b.len() {
+        match (b[i], b[i + 1]) {
+            (b'/', b'*') => {
+                open += 1;
+                i += 2;
+            }
+            (b'*', b'/') => {
+                open -= 1;
+                i += 2;
+                if open == 0 {
+                    return i;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    b.len()
+}
+
+/// Index just past the string whose opening quote is at `quote`, opened
+/// by `hashes` `#` before it. A quoted string ends at the first `"` that
+/// is not escaped; a raw string has no escapes and ends at a `"`
+/// followed by at least as many `#` as opened it.
+fn string_end(b: &[u8], quote: usize, hashes: usize) -> usize {
+    let mut i = quote + 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' if hashes == 0 => i += 2,
+            b'"' => {
+                let after = i + 1;
+                if b[after..].iter().take_while(|c| **c == b'#').count() >= hashes {
+                    return after + hashes;
+                }
+                i = after;
+            }
+            _ => i += 1,
+        }
+    }
+    b.len()
+}
+
 /// Line number, counting from one, of the byte at `offset` in `text`.
 fn line_at(text: &str, offset: usize) -> Option<u32> {
     let before = text.get(..offset)?;
@@ -394,7 +531,7 @@ fn line_at(text: &str, offset: usize) -> Option<u32> {
 /// The parsed layer and where its nodes are: `--explain` names the node
 /// a bwrap argument came from.
 fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigError> {
-    let doc: KdlDocument = KdlDocument::parse(text)?;
+    let doc: KdlDocument = parse_document(text)?;
     let mut cfg = InstanceConfig::default();
     let mut lines = Lines::default();
     let mut includes: Vec<String> = Vec::new();
@@ -3099,5 +3236,87 @@ command "b""#
             parse("desktop \"a.desktop\"\ndesktop \"b.desktop\""),
             Err(ConfigError::Duplicate(n)) if n == "desktop"
         ));
+    }
+
+    /// Nesting the KDL parser would recurse into the stack on. The
+    /// minimised input from the fuzzer: a node and nothing but open
+    /// braces, which aborted the process before the bound existed.
+    fn brace_bomb(n: usize) -> String {
+        format!("a {}", "{".repeat(n))
+    }
+
+    /// `n` levels of well-formed children, which the parser accepts as
+    /// far as the bound lets it reach.
+    fn nested(n: usize) -> String {
+        let mut s = String::new();
+        for _ in 0..n {
+            s.push_str("a {\n");
+        }
+        for _ in 0..n {
+            s.push_str("}\n");
+        }
+        s
+    }
+
+    #[test]
+    fn nesting_past_the_bound_is_refused_before_the_parser_recurses() {
+        let evil = brace_bomb(1400);
+        assert!(matches!(parse(&evil), Err(ConfigError::TooDeep { .. })));
+        assert!(matches!(
+            parse_profile(&evil),
+            Err(ConfigError::TooDeep { .. })
+        ));
+        assert!(matches!(
+            node_lines(&evil),
+            Err(ConfigError::TooDeep { .. })
+        ));
+    }
+
+    #[test]
+    fn the_bound_admits_its_own_depth_and_stops_one_past_it() {
+        // The bound itself, not a parse of it: a test runs on a 2 MiB
+        // thread stack, which an unoptimised `kdl` 6.7.1 overflows at 62
+        // levels — the very headroom [`MAX_NESTING`] documents having on
+        // the main thread bubbler parses on.
+        assert!(check_bounds(&nested(MAX_NESTING)).is_ok());
+        assert!(matches!(
+            check_bounds(&nested(MAX_NESTING + 1)),
+            Err(ConfigError::TooDeep { line, max })
+                if line == u32::try_from(MAX_NESTING).unwrap() + 1 && max == MAX_NESTING
+        ));
+        // And the whole way through: `parse` refuses it rather than
+        // reaching the parser with it.
+        assert!(matches!(
+            parse_profile(&nested(MAX_NESTING + 1)),
+            Err(ConfigError::TooDeep { .. })
+        ));
+    }
+
+    #[test]
+    fn a_configuration_past_the_size_bound_is_refused_unparsed() {
+        let big = "// filler\n".repeat(MAX_BYTES / 10 + 1);
+        assert!(big.len() > MAX_BYTES);
+        assert!(matches!(
+            parse(&big),
+            Err(ConfigError::TooLarge { bytes, max }) if bytes == big.len() && max == MAX_BYTES
+        ));
+    }
+
+    #[test]
+    fn the_pre_check_counts_braces_outside_strings_and_comments() {
+        let braces = "{".repeat(MAX_NESTING * 4);
+        // A profile that grants what it says still parses, however many
+        // braces its text holds where nesting is not what they mean.
+        for text in [
+            format!("// {braces}\ncommand \"true\"\n"),
+            format!("/* {braces} */\ncommand \"true\"\n"),
+            format!("/* /* {braces} */ */\ncommand \"true\"\n"),
+            format!("command \"{braces}\"\n"),
+            format!("command #\"{braces}\"#\n"),
+            format!("command \"\"\"\n{braces}\n\"\"\"\n"),
+            "dbus {\n    talk \"org.a.B\"\n}\ncommand \"true\"\n".to_owned(),
+        ] {
+            assert!(parse(&text).is_ok(), "{text}");
+        }
     }
 }
