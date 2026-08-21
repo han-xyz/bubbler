@@ -28,6 +28,7 @@
 //
 // A checkout outside the home is named explicitly, e.g.
 //     path-share "/kioxia/src" mode=rw
+lint-allow "secrets-access" reason="extensions keep their tokens in the Secret Storage API, which is this bus name"
 wayland
 dri
 network

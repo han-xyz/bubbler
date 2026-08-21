@@ -78,6 +78,10 @@ const HOME_SHARE_SENSITIVE: Check = Check {
     id: "home-share-sensitive",
     severity: Severity::Warning,
 };
+const LINT_ALLOW_UNUSED: Check = Check {
+    id: "lint-allow-unused",
+    severity: Severity::Note,
+};
 const MPRIS_WILDCARD: Check = Check {
     id: "mpris-wildcard",
     severity: Severity::Warning,
@@ -114,6 +118,10 @@ const SECCOMP_DISABLED: Check = Check {
     id: "seccomp-disabled",
     severity: Severity::Warning,
 };
+const SECRETS_ACCESS: Check = Check {
+    id: "secrets-access",
+    severity: Severity::Note,
+};
 const SHARE_SOURCE_MISSING: Check = Check {
     id: "share-source-missing",
     severity: Severity::Error,
@@ -145,6 +153,7 @@ pub const CHECKS: &[Check] = &[
     DUP_NAME_POLICY,
     ENV_LOOKS_SECRET,
     HOME_SHARE_SENSITIVE,
+    LINT_ALLOW_UNUSED,
     MPRIS_WILDCARD,
     OWN_ON_SYSTEM_BUS,
     OWN_TOO_WIDE,
@@ -154,6 +163,7 @@ pub const CHECKS: &[Check] = &[
     PATH_SHARE_SOCKET,
     PORTAL_TALK_WITHOUT_PORTALS,
     SECCOMP_DISABLED,
+    SECRETS_ACCESS,
     SHARE_SOURCE_MISSING,
     SYSTEM_BUS_POLKIT_NAME,
     TTY_PASSTHROUGH,
@@ -273,21 +283,22 @@ const NESTERS: &[&str] = &[
     "signal-desktop",
 ];
 
-/// Home directories the private home exists to keep out: keys, secrets
-/// and the configuration of every other application. firejail blacklists
-/// the same set for every profile it ships.
-const SENSITIVE_HOME: &[&str] = &[
+/// Home directories the private home exists to keep out, together with
+/// everything under them: one key file out of `.ssh` is the key. firejail
+/// blacklists the same set for every profile it ships.
+const SENSITIVE_TREE: &[&str] = &[
     ".ssh",
     ".gnupg",
     ".pki",
     ".password-store",
     ".local/share/keyrings",
-    ".config",
-    ".local",
-    ".local/share",
     ".mozilla",
-    ".cache",
 ];
+
+/// Home directories that are sensitive whole and not one subdirectory at
+/// a time: they hold every application's state, and an application's own
+/// share of its own directory under them is what a profile is for.
+const SENSITIVE_ROOT: &[&str] = &[".config", ".local", ".local/share", ".cache"];
 
 /// System-bus names whose interesting methods are behind an `auth_admin`
 /// polkit action, which polkit judges against the proxy's credentials —
@@ -323,6 +334,10 @@ const SECRET_PAIRS: &[[&str; 2]] = &[["API", "KEY"], ["ACCESS", "KEY"], ["SECRET
 
 /// Prefixes of credentials that are recognisable on sight.
 const SECRET_VALUES: &[&str] = &["ghp_", "sk-", "AKIA"];
+
+/// The Secret Service name: one session-bus name for every secret the
+/// login keyring holds, with no partitioning between applications.
+const SECRETS_NAME: &str = "org.freedesktop.secrets";
 
 /// The prefix every XDG desktop portal name starts with.
 const PORTAL_PREFIX: &str = "org.freedesktop.portal.";
@@ -570,12 +585,18 @@ fn run(ctx: &Context, sources: &[Source]) -> Report {
         .flat_map(|s| top(s, "lint-allow"))
         .filter_map(arg)
         .collect();
+    unused_allows(sources, &mut f);
     let mut items = f.0;
     items.sort_by_key(|p| (p.layer, p.offset));
     let findings = items
         .into_iter()
         .filter_map(|p| {
-            if p.check.severity != Severity::Error && allowed.contains(&p.check.id) {
+            // A `lint-allow` that accepts nothing cannot be accepted
+            // away: the node doing the accepting would be the unused one.
+            if p.check.severity != Severity::Error
+                && p.check.id != LINT_ALLOW_UNUSED.id
+                && allowed.contains(&p.check.id)
+            {
                 return None;
             }
             let source = &sources[p.layer];
@@ -594,6 +615,37 @@ fn run(ctx: &Context, sources: &[Source]) -> Report {
     Report {
         findings,
         layers: sources.iter().map(|s| s.at.clone()).collect(),
+    }
+}
+
+/// Report every `lint-allow` node that accepted nothing: no check of any
+/// layer reported the id it names. Errors are never accepted, so naming
+/// one is naming nothing — but the parser refuses those ids already.
+///
+/// Read from the findings collected so far, which is why this runs last.
+fn unused_allows(sources: &[Source], f: &mut Findings) {
+    let silenced: Vec<&'static str> =
+        f.0.iter()
+            .filter(|p| p.check.severity != Severity::Error)
+            .map(|p| p.check.id)
+            .collect();
+    for (i, source) in sources.iter().enumerate() {
+        for node in top(source, "lint-allow") {
+            let Some(id) = arg(node) else {
+                continue;
+            };
+            if silenced.contains(&id) {
+                continue;
+            }
+            f.push(
+                i,
+                node,
+                &LINT_ALLOW_UNUSED,
+                format!("`lint-allow \"{id}\"` accepts nothing: no layer reports `{id}`"),
+                "drop the node; a suppression that silences nothing outlives what it was \
+                 written for",
+            );
+        }
     }
 }
 
@@ -708,11 +760,7 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, f: &mut Findings) {
                     );
                 }
             }
-            "dbus" => {
-                for rule in kids(node).filter(|r| r.name().value() == "own") {
-                    own_too_wide(i, rule, f);
-                }
-            }
+            "dbus" => dbus_node(i, node, f),
             "system-bus" => system_bus(i, node, f),
             "mpris" if prop(node, "name").is_some_and(|n| n == "*") => f.push(
                 i,
@@ -773,17 +821,24 @@ fn home_share(ctx: &Context, i: usize, node: &KdlNode, f: &mut Findings) {
     let Some(path) = arg(node) else {
         return;
     };
-    if SENSITIVE_HOME
+    let sensitive = SENSITIVE_TREE
         .iter()
-        .any(|s| Path::new(s) == Path::new(path))
-    {
+        .find(|s| Path::new(path).starts_with(s))
+        .or_else(|| {
+            SENSITIVE_ROOT
+                .iter()
+                .find(|s| Path::new(**s) == Path::new(path))
+        });
+    if let Some(root) = sensitive {
+        let what = match Path::new(root) == Path::new(path) {
+            true => "shares a directory the private home exists to keep out".to_owned(),
+            false => format!("is under `{root}`, which the private home exists to keep out"),
+        };
         f.push(
             i,
             node,
             &HOME_SHARE_SENSITIVE,
-            format!(
-                "`home-share \"{path}\"` shares a directory the private home exists to keep out"
-            ),
+            format!("`home-share \"{path}\"` {what}"),
             "share the directory the app works in, not the one holding your keys, \
              sessions or other applications' configuration",
         );
@@ -930,6 +985,31 @@ fn kind(ty: std::fs::FileType) -> &'static str {
     }
 }
 
+/// The session bus's own rules: a name claimed more widely than the app
+/// owns, and the one name that is every secret the keyring holds.
+fn dbus_node(i: usize, node: &KdlNode, f: &mut Findings) {
+    for rule in kids(node) {
+        let level = rule.name().value();
+        if level == "own" {
+            own_too_wide(i, rule, f);
+        }
+        if !matches!(level, "talk" | "own") || rule_name(rule) != Some(SECRETS_NAME) {
+            continue;
+        }
+        f.push(
+            i,
+            rule,
+            &SECRETS_ACCESS,
+            format!(
+                "`{level} \"{SECRETS_NAME}\"` reaches the whole login keyring: the Secret \
+                 Service API partitions nothing between the applications that call it"
+            ),
+            "keep the app's secrets in the private home, or accept it with \
+             `lint-allow \"secrets-access\" reason=\"...\"`",
+        );
+    }
+}
+
 fn own_too_wide(i: usize, rule: &KdlNode, f: &mut Findings) {
     let Some(name) = arg(rule) else {
         return;
@@ -1060,7 +1140,7 @@ fn across_layers(ctx: &Context, sources: &[Source], f: &mut Findings) {
 
     // Keyed by bus as well as name: the two proxies are separate, so one
     // name may hold a different policy on each.
-    let mut policies: Vec<(&str, String, &str, OsString)> = Vec::new();
+    let mut policies: Vec<(&str, String, &str, usize)> = Vec::new();
     for (i, source) in sources.iter().enumerate() {
         for (bus, rule) in bus_rules(source) {
             let level = match rule.name().value() {
@@ -1075,18 +1155,25 @@ fn across_layers(ctx: &Context, sources: &[Source], f: &mut Findings) {
                 .find(|(b, n, _, _)| *b == bus && n == name)
                 .filter(|(_, _, was, _)| *was != level)
             {
-                Some((_, _, was, whence)) => f.push(
-                    i,
-                    rule,
-                    &DUP_NAME_POLICY,
-                    format!(
-                        "`{name}` is granted as `{was}` in {} and as `{level}` here; \
-                         one name takes one policy",
-                        whence.to_string_lossy()
-                    ),
-                    "keep the narrower of the two",
-                ),
-                None => policies.push((bus, name.to_owned(), level, source.at.label())),
+                Some((_, _, was, whence)) => {
+                    // Naming the layer only says something when it is
+                    // another one; both rules in one file are read there.
+                    let both = match *whence == i {
+                        true => format!("as `{was}` and as `{level}` twice in this file"),
+                        false => format!(
+                            "as `{was}` in {} and as `{level}` here",
+                            sources[*whence].at.label().to_string_lossy()
+                        ),
+                    };
+                    f.push(
+                        i,
+                        rule,
+                        &DUP_NAME_POLICY,
+                        format!("`{name}` is granted {both}; one name takes one policy"),
+                        "keep the narrower of the two",
+                    );
+                }
+                None => policies.push((bus, name.to_owned(), level, i)),
             }
         }
     }
@@ -1320,7 +1407,9 @@ mod tests {
         let (_, dir, _) = fake::types();
         let host = host()
             .with("/home/han/.ssh", dir)
+            .with("/home/han/.ssh/keys", dir)
             .with("/home/han/.local/share", dir)
+            .with("/home/han/.config/app", dir)
             .with("/home/han/Downloads", dir);
         with(&host, |ctx| {
             assert_eq!(
@@ -1331,8 +1420,77 @@ mod tests {
                 ids(&lint(ctx, &["home-share \".local/share\""])),
                 ["home-share-sensitive"]
             );
+            // A tree of keys is sensitive one directory at a time; the
+            // directories that hold every application's state are not,
+            // since one application's own is what a profile shares.
+            let report = lint(ctx, &["home-share \".ssh/keys\""]);
+            assert_eq!(ids(&report), ["home-share-sensitive"]);
+            assert!(report.findings[0].message.contains("`.ssh`"), "{report:?}");
+            assert_eq!(
+                ids(&lint(ctx, &["home-share \".config/app\" mode=rw"])),
+                [] as [&str; 0]
+            );
             assert_eq!(
                 ids(&lint(ctx, &["home-share \"Downloads\" mode=rw"])),
+                [] as [&str; 0]
+            );
+        });
+    }
+
+    #[test]
+    fn a_lint_allow_that_accepts_nothing_is_a_note() {
+        with(&host(), |ctx| {
+            let report = lint(ctx, &["lint-allow \"x11-without-reason\" reason=\"none\""]);
+            assert_eq!(ids(&report), ["lint-allow-unused"]);
+            assert_eq!(report.findings[0].severity, Severity::Note);
+            // One that does accept a finding says nothing, in its own
+            // layer or in another.
+            assert_eq!(
+                ids(&lint(
+                    ctx,
+                    &["x11\nlint-allow \"x11-without-reason\" reason=\"m\""]
+                )),
+                [] as [&str; 0]
+            );
+            assert_eq!(
+                ids(&lint(
+                    ctx,
+                    &["lint-allow \"x11-without-reason\" reason=\"m\"", "x11"]
+                )),
+                [] as [&str; 0]
+            );
+            // The note is not suppressible by a node of its own: that
+            // node would be the unused one.
+            assert_eq!(
+                ids(&lint(
+                    ctx,
+                    &["lint-allow \"lint-allow-unused\" reason=\"no\""]
+                )),
+                ["lint-allow-unused"]
+            );
+        });
+    }
+
+    #[test]
+    fn reaching_the_secret_service_is_a_note() {
+        with(&host(), |ctx| {
+            for rule in ["talk", "own"] {
+                let text = format!("dbus {{\n    {rule} \"org.freedesktop.secrets\"\n}}");
+                let report = lint(ctx, &[&text]);
+                assert_eq!(ids(&report), ["secrets-access"], "{text}");
+                assert_eq!(report.findings[0].severity, Severity::Note);
+                assert!(
+                    report.findings[0].message.contains("login keyring"),
+                    "{report:?}"
+                );
+            }
+            // The name lives on the session bus; the same string on the
+            // system bus reaches no keyring.
+            assert_eq!(
+                ids(&lint(
+                    ctx,
+                    &["system-bus {\n    talk \"org.freedesktop.secrets\"\n}"]
+                )),
                 [] as [&str; 0]
             );
         });
@@ -1577,6 +1735,17 @@ mod tests {
                 report.findings[0].message.contains("/p/0.kdl"),
                 "{report:?}"
             );
+            // One layer holding both is the same error without a second
+            // file to name.
+            let report = lint(
+                ctx,
+                &["dbus {\n    see \"org.example.App\"\n    talk \"org.example.App\"\n}"],
+            );
+            assert_eq!(ids(&report), ["dup-name-policy"]);
+            assert!(
+                report.findings[0].message.contains("twice in this file"),
+                "{report:?}"
+            );
             // The same policy twice is a repeat, not a conflict, and the
             // two buses are separate filters.
             assert_eq!(
@@ -1648,7 +1817,9 @@ mod tests {
                 ctx,
                 &["notify\nlint-allow \"bundle-without-dbus\" reason=\"no\""],
             );
-            assert_eq!(ids(&report), ["bundle-without-dbus"]);
+            // The error stands, and the node that tried to accept it is
+            // reported as accepting nothing.
+            assert_eq!(ids(&report), ["bundle-without-dbus", "lint-allow-unused"]);
             assert!(config::parse("lint-allow \"bundle-without-dbus\" reason=\"no\"").is_err());
         });
     }

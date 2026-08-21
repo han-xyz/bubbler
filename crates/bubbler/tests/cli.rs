@@ -665,6 +665,80 @@ fn explain_proxy_explains_the_sidecar_and_says_when_there_is_none() {
     assert_eq!(out.status.code(), Some(2));
 }
 
+/// One sidecar filters both buses, and `xdg-dbus-proxy` applies an option
+/// to the address before it. So the explanation reads one bus at a time —
+/// each address under the node that granted that bus, and the rule groups
+/// between the two addresses are the ones that bus carries.
+#[test]
+fn explain_proxy_reads_the_two_buses_one_at_a_time() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(
+        &cfg,
+        "dbus {\n    own \"com.steampowered.Steam\"\n}\nnotify\ntray\n\
+         system-bus {\n    talk \"org.freedesktop.UPower\"\n}\n\
+         seccomp {\n    disable\n}\ncommand \"true\"\n",
+    )
+    .unwrap();
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--explain", "--proxy"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let headers: Vec<&str> = s
+        .lines()
+        .filter(|l| l.starts_with("  ") && l.contains(" argument"))
+        .map(|l| l.split_whitespace().next().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        headers,
+        [
+            "baseline",
+            "seccomp",
+            "identity",
+            "command",
+            "dbus",
+            "notify",
+            "tray",
+            "system-bus"
+        ],
+        "{s}"
+    );
+    // The proxy's own invocation is what is left over once each bus has
+    // its address, its socket and the options that apply to them.
+    assert!(s.contains("\n  command "), "{s}");
+    assert!(s.contains("\n    --fd=3\n"), "{s}");
+    assert!(
+        s.contains(&format!(
+            "\n  dbus        config.kdl:1  4 arguments\n    unix:path={}/bus\n",
+            tmp.path().join("run").display()
+        )),
+        "{s}"
+    );
+    assert!(
+        s.contains(
+            "\n  system-bus  config.kdl:6  4 arguments\n    \
+             unix:path=/run/dbus/system_bus_socket\n"
+        ),
+        "{s}"
+    );
+    assert_eq!(s.matches("\n    --filter\n").count(), 2, "{s}");
+    // The sidecar's filter is the default set, whatever the `seccomp`
+    // node of this config says, so that group names no line of it.
+    let seccomp = s
+        .lines()
+        .find(|l| l.starts_with("  seccomp "))
+        .unwrap_or_default();
+    assert!(seccomp.contains("arguments"), "{s}");
+    assert!(!seccomp.contains("config.kdl"), "{s}");
+}
+
 #[test]
 fn try_explains_a_throwaway_sandbox_without_running_it() {
     let tmp = setup();
@@ -3906,6 +3980,9 @@ fn profile_lint_all_reads_every_layer_once_and_json_carries_the_counts() {
         out.contains(&format!("\"layers\": {}", NAMES.len())),
         "{out}"
     );
+    // Every `lint-allow` a built-in profile carries still accepts a
+    // finding: one that stopped doing so is a note of its own.
+    assert!(!out.contains("lint-allow-unused"), "{out}");
     // Two profiles over one base read that base twice; it is one layer,
     // and its `x11` is one finding.
     write_profile(tmp.path(), "user", "base", "x11\ncommand \"sh\"\n");

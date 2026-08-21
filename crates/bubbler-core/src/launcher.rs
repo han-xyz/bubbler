@@ -1610,14 +1610,21 @@ mod tests {
             line(&items, Origin::Service(1)),
             "--talk=org.freedesktop.Notifications"
         );
+        // An option of the sidecar applies to the address before it, so
+        // the address and the options over it belong to the node that
+        // granted that bus, not to the proxy's own invocation.
+        let bus = line(&items, Origin::Service(0));
+        assert!(bus.contains(" --filter"), "{bus}");
+        assert!(bus.starts_with("unix:path="), "{bus}");
         let own: Vec<String> = items
             .iter()
             .filter(|i| i.origin == Origin::Command)
             .map(|i| i.args[0].to_string_lossy().into_owned())
             .collect();
-        assert!(own.contains(&"--filter".to_owned()), "{own:?}");
+        assert!(own.iter().any(|a| a.starts_with("--fd=")), "{own:?}");
         assert!(
-            !own.iter().any(|a| a.starts_with("--talk=")),
+            !own.iter()
+                .any(|a| a.starts_with("--talk=") || a == "--filter"),
             "a rule is not the proxy's own argument: {own:?}"
         );
     }

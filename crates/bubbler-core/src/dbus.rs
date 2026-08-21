@@ -73,6 +73,10 @@ pub struct Rule {
 /// One bus the proxy filters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Section {
+    /// Position in the instance config's `services` of the node that
+    /// granted this bus. The address, the socket and the options that
+    /// apply to them are that node's, as its rules are.
+    pub node: usize,
     /// `xdg-dbus-proxy` policy arguments for this bus, deduplicated,
     /// explicit rules first and bundles after them.
     pub rules: Vec<Rule>,
@@ -176,9 +180,10 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
                 | Service::SystemBus { .. } => {}
             }
         }
-        Section { rules }
+        Section { node, rules }
     });
     let system = system.map(|(node, explicit)| Section {
+        node,
         rules: explicit_rules(explicit, node),
     });
     Some(Plan {
@@ -432,15 +437,18 @@ pub fn proxy_command_nodes(
         let mut address = OsString::from("unix:path=");
         address.push(host);
         // The address and the socket path must precede the options of
-        // that bus: an option applies to the address before it.
-        argv.push((address, None));
+        // that bus: an option applies to the address before it. All of
+        // them are the granting node's, so an explanation reads one bus
+        // at a time instead of both addresses in one group.
+        let node = Some(section.node);
+        argv.push((address, node));
         argv.push((
             proxy_bus_path(instance_runtime, socket).into_os_string(),
-            None,
+            node,
         ));
-        argv.push((OsString::from("--filter"), None));
+        argv.push((OsString::from("--filter"), node));
         if log {
-            argv.push((OsString::from("--log"), None));
+            argv.push((OsString::from("--log"), node));
         }
         argv.extend(section.rules.iter().map(|r| (r.arg.clone(), Some(r.node))));
     }
@@ -778,6 +786,50 @@ mod tests {
             OsStr::new("4"),
         );
         assert_eq!(logged[5], OsString::from("--log"));
+    }
+
+    /// Each bus's address, socket and options carry the node that granted
+    /// that bus, and not the proxy's own invocation: an option applies to
+    /// the address before it, so an explanation has to read one bus at a
+    /// time rather than one `command` group holding both addresses.
+    #[test]
+    fn each_bus_pair_carries_the_node_that_granted_that_bus() {
+        let p = plan(
+            &[
+                Service::Dbus { rules: vec![] },
+                Service::Notify,
+                Service::SystemBus {
+                    rules: vec![BusRule::Talk("org.freedesktop.UPower".into())],
+                },
+            ],
+            "t",
+        )
+        .expect("both buses are granted");
+        let argv = proxy_command_nodes(
+            Path::new(PROXY_BIN),
+            &p,
+            Some(Path::new("/run/user/1000/bus")),
+            Some(Path::new(SYSTEM_BUS_PATH)),
+            Path::new("/run/user/1000/bubbler/t"),
+            false,
+            OsStr::new("4"),
+        );
+        let nodes: Vec<Option<usize>> = argv.iter().map(|(_, node)| *node).collect();
+        assert_eq!(
+            nodes,
+            [
+                None,    // xdg-dbus-proxy
+                None,    // --fd=4
+                Some(0), // unix:path=<session bus>
+                Some(0), // <the socket it is served on>
+                Some(0), // --filter
+                Some(1), // --talk=org.freedesktop.Notifications
+                Some(2), // unix:path=<system bus>
+                Some(2),
+                Some(2), // --filter
+                Some(2), // --talk=org.freedesktop.UPower
+            ]
+        );
     }
 
     #[test]

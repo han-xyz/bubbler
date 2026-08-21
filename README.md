@@ -5,13 +5,16 @@ combining bubblejail's explicit instances and resource grants with a profile
 library in the spirit of firejail. bubbler itself is unprivileged; `bwrap`
 does the namespace work.
 
-Status: milestone 6 — a profile library (`alacritty`, `chromium`, `firefox`,
-`libreoffice`, `lutris`, `mpv`, `steam`, `thunderbird` and `vesktop`)
-over GPU, sound, a private home, host paths through `path-share`, game
-controllers through `gamepad`, a filtered session and system bus with portals,
-notifications and `tray`, a terminal of their own and a seccomp denylist.
-Profiles come in three layers — yours, the system's, built-in — and compose
-with `include`. See "Known gaps" below.
+Status: milestone 7 — a library of 14 profiles (`alacritty`, `chromium`,
+`code`, `firefox`, `generic`, `keepassxc`, `kitty`, `libreoffice`, `lutris`,
+`mpv`, `spotify`, `steam`, `thunderbird`, `vesktop`) over GPU, sound, a private
+home, host paths through `path-share`, game controllers through `gamepad`, a
+filtered session and system bus with portals, notifications and `tray`, a
+terminal of their own and a seccomp denylist. Profiles come in three layers —
+yours, the system's, built-in — and compose with `include`. `bubbler lint`
+measures a profile or an instance config against what a sandbox is meant to
+give away, and `--dry-run --explain` puts every bwrap argument under the node
+that produced it. See "Known gaps" below.
 
 ## Usage
 
@@ -175,8 +178,18 @@ answers with, the size of a `--ro-bind-data`, which pipe an `--info-fd` or
 `--block-fd` is, and which socket the supervisor is handed. A node whose grant
 is D-Bus rules rather than bwrap arguments lists those rules instead — under
 `rule-only:` when it contributes nothing else, `rules:` when it also has
-arguments — and `--explain --proxy` explains the sidecar's own argv, where the
-same rules are grouped under the nodes that asked for them.
+arguments. A `seccomp` node reads the same way, since what it changed is not
+an argument either: `rules: allow ptrace` under the programs it did load, and
+`rule-only: filter disabled` for a `seccomp { disable }`, which loads none and
+would otherwise be missing from the listing altogether.
+
+`--explain --proxy` explains the sidecar's own argv, where those rules are
+grouped under the nodes that asked for them and each bus's address, socket and
+`--filter` under the node that granted that bus: an `xdg-dbus-proxy` option
+applies to the address before it, so the listing reads one bus at a time —
+`dbus`, the session-bus rule groups, then `system-bus` and its own. The
+sidecar's seccomp group carries no line of the config: its filter is the
+default set whatever the instance's `seccomp` node says.
 
 Line numbers are those of the instance's own `config.kdl`, the flattened file
 `create` wrote, not of the profile layer a node was written in; under
@@ -679,8 +692,11 @@ list of such commands is a heuristic), `own-too-wide` (an `own` ending in `*`
 with fewer than three name elements before it, so `org.kde.*` warns and
 `org.mozilla.firefox.*` does not), `mpris-wildcard`, `system-bus-polkit-name`
 (a `talk` on a system service whose privileged actions polkit judges as you),
-`home-share-sensitive` (`.ssh`, `.gnupg`, `.config`, `.local`, `.cache` and
-the like), `path-share-mountpoint` (a whole mounted filesystem, `mode=rw`),
+`home-share-sensitive` (`.ssh`, `.gnupg`, `.pki`, `.password-store`,
+`.local/share/keyrings` and `.mozilla`, those four with everything under them,
+and `.config`, `.local`, `.local/share` and `.cache` whole — a share of one
+application's own directory under those is what a profile is for),
+`path-share-mountpoint` (a whole mounted filesystem, `mode=rw`),
 `path-share-socket` (a socket, or the directory one sits in — a shared control
 socket is command execution across the boundary), `dbus-without-rules`,
 `env-looks-secret` (an underscore-separated word of the name is `TOKEN`,
@@ -690,7 +706,12 @@ socket is command execution across the boundary), `dbus-without-rules`,
 without `/.flatpak-info`, which is worse than wrong).
 
 **Notes** are information and fail nothing: `ozone-hint-unnecessary`,
-`command-not-found`.
+`command-not-found`, `secrets-access` (`talk`/`own` of
+`org.freedesktop.secrets` on the session bus reaches the whole login keyring:
+the Secret Service API partitions nothing between the applications that call
+it), `lint-allow-unused` (a `lint-allow` node that accepts nothing, which is a
+suppression outliving what it was written for — and the one check no
+`lint-allow` silences, since that node would be the unused one).
 
 A warning or a note is accepted with a `lint-allow` node, which takes a check
 id and a required reason:
@@ -704,8 +725,9 @@ check has is a parse error, so a typo cannot leave a finding un-accepted with
 nothing to say so; an id whose check reports an *error* is a parse error too,
 since an error names something the file cannot do and nothing would ever
 silence it. `steam` and `lutris` carry the nodes for their `x11` and
-`seccomp { disable }` grants, with the reason each of their comments already
-gives; every shipped profile lints clean on a host that has what it shares.
+`seccomp { disable }` grants and `code` for its Secret Storage rule, with the
+reason each of their comments already gives; every shipped profile lints clean
+on a host that has what it shares.
 
 `create`, `reseed`, `edit` and `profile edit` run the lint themselves at the
 end and print any errors and warnings — never notes — to stderr, prefixed

@@ -7,7 +7,7 @@
 use std::ffi::OsStr;
 
 use crate::bwrap::{Explained, Origin};
-use crate::config::{InstanceConfig, Lines, Service};
+use crate::config::{InstanceConfig, Lines, SeccompConfig, Service};
 use crate::dbus;
 use crate::error::ConfigError;
 use crate::kdl_out;
@@ -157,6 +157,17 @@ fn label(origin: Origin, cfg: &InstanceConfig) -> Result<String, ConfigError> {
     }))
 }
 
+/// Where the node behind `origin` was written, in this view. The
+/// sidecar's filter is never the config's: it gets the default rule set
+/// whatever a `seccomp` node says, so that group names no line of the
+/// file it did not come from.
+fn source(origin: Origin, view: &View) -> String {
+    match view.proxy && origin == Origin::Seccomp {
+        true => String::new(),
+        false => view.source.of(origin),
+    }
+}
+
 /// Groups in emit order: a group appears where its first argument does.
 /// In the sandbox's own argv a granted service that produced no argument
 /// at all keeps its place among the services around it, so that a grant
@@ -170,13 +181,35 @@ fn groups<'a>(items: &'a [Explained], view: &View) -> Result<Vec<Group<'a>>, Con
             None => out.push(Group {
                 origin: item.origin,
                 label: label(item.origin, view.cfg)?,
-                source: view.source.of(item.origin),
+                source: source(item.origin, view),
                 items: vec![item],
             }),
         }
     }
     if view.proxy {
         return Ok(out);
+    }
+    // A `seccomp` node that leaves nothing to load — `disable`, or an
+    // `allow` list that empties the denylist — produced no argument to be
+    // found under, and that is the one worth seeing. It belongs where the
+    // filter is loaded, which is after the baseline and ahead of the
+    // grants.
+    if view.cfg.seccomp != SeccompConfig::default()
+        && !out.iter().any(|g| g.origin == Origin::Seccomp)
+    {
+        let at = out
+            .iter()
+            .position(|g| !matches!(g.origin, Origin::Baseline | Origin::Userns))
+            .unwrap_or(out.len());
+        out.insert(
+            at,
+            Group {
+                origin: Origin::Seccomp,
+                label: label(Origin::Seccomp, view.cfg)?,
+                source: source(Origin::Seccomp, view),
+                items: Vec::new(),
+            },
+        );
     }
     let first_service = out
         .iter()
@@ -203,7 +236,7 @@ fn groups<'a>(items: &'a [Explained], view: &View) -> Result<Vec<Group<'a>>, Con
             Group {
                 origin,
                 label: label(origin, view.cfg)?,
-                source: view.source.of(origin),
+                source: source(origin, view),
                 items: Vec::new(),
             },
         );
@@ -228,18 +261,49 @@ fn operation(item: &Explained) -> String {
     line
 }
 
-/// The rules of the node at `index`, each on its own line under a lead-in
-/// naming what they are: they are the whole grant of a node that
-/// contributes no argument, and easy to miss under one that does.
-fn rule_lines(index: usize, empty: bool, rules: &[(usize, String)]) -> Vec<String> {
+/// What a node granted that is not an argument, each on its own line
+/// under a lead-in naming what it is: it is the whole grant of a node
+/// that contributes no argument, and easy to miss under one that does.
+fn listed(empty: bool, items: Vec<String>) -> Vec<String> {
     let lead = if empty { "rule-only: " } else { "rules: " };
     let mut out = Vec::new();
-    for (_, rule) in rules.iter().filter(|(node, _)| *node == index) {
+    for item in items {
         let prefix = match out.is_empty() {
             true => lead.to_owned(),
             false => " ".repeat(lead.chars().count()),
         };
-        out.push(format!("    {prefix}{rule}"));
+        out.push(format!("    {prefix}{item}"));
+    }
+    out
+}
+
+/// The D-Bus proxy rules of the node at `index`, in the order the proxy
+/// is given them.
+fn rules_of(index: usize, rules: &[(usize, String)]) -> Vec<String> {
+    rules
+        .iter()
+        .filter(|(node, _)| *node == index)
+        .map(|(_, rule)| rule.clone())
+        .collect()
+}
+
+/// What a `seccomp` node did to the default denylist, which is the whole
+/// grant of one that disables the filter and loads no program at all.
+fn seccomp_lines(cfg: &SeccompConfig) -> Vec<String> {
+    if cfg.disable {
+        return vec!["filter disabled".to_owned()];
+    }
+    let mut out = Vec::new();
+    if !cfg.allow.is_empty() {
+        out.push(format!("allow {}", cfg.allow.join(", ")));
+    }
+    if !cfg.deny.is_empty() {
+        let deny: Vec<String> = cfg
+            .deny
+            .iter()
+            .map(|(name, errno)| format!("{name} ({})", errno.name()))
+            .collect();
+        out.push(format!("deny {}", deny.join(", ")));
     }
     out
 }
@@ -273,12 +337,15 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
             out.push(format!("    {}", operation(item)));
         }
         // Only in the sandbox's own argv: in the sidecar's the rules are
-        // the arguments listed above.
-        if let Origin::Service(i) = g.origin
-            && !view.proxy
-            && view.cfg.services.get(i).is_some_and(carries_rules)
-        {
-            out.extend(rule_lines(i, n == 0, view.rules));
+        // the arguments listed above, and its filter is not the config's.
+        if !view.proxy {
+            match g.origin {
+                Origin::Service(i) if view.cfg.services.get(i).is_some_and(carries_rules) => {
+                    out.extend(listed(n == 0, rules_of(i, view.rules)));
+                }
+                Origin::Seccomp => out.extend(listed(n == 0, seccomp_lines(&view.cfg.seccomp))),
+                _ => {}
+            }
         }
         out.push(String::new());
     }
@@ -324,9 +391,7 @@ pub fn render_json(items: &[Explained], view: &View) -> Result<String, ConfigErr
         };
         // The same `<file>:<line>` the text form heads a group with, split
         // back into the number alone.
-        let line = view
-            .source
-            .of(item.origin)
+        let line = source(item.origin, view)
             .rsplit(':')
             .next()
             .and_then(|l| l.parse::<u32>().ok());
@@ -680,6 +745,67 @@ bwrap
         assert_eq!(out[2], "  seccomp                2 arguments");
         assert_eq!(out[5], "  userns   config.kdl:2  2 arguments");
         assert_eq!(out[8], "  env A    config.kdl:1  3 arguments");
+    }
+
+    /// A `seccomp` node is a node of the file like any other, and the one
+    /// that loads no program at all is the one worth seeing.
+    #[test]
+    fn a_seccomp_node_that_loads_nothing_is_still_a_group() {
+        let cfg = cfg("wayland\nseccomp {\n    disable\n}\ncommand \"true\"");
+        let items = [
+            item(Origin::Baseline, &["--unshare-all"], None),
+            item(Origin::Service(0), &["--ro-bind", "/run/w", "/run/w"], None),
+            item(Origin::Command, &["--", "true"], None),
+        ];
+        let lines = Lines {
+            services: vec![Some(1)],
+            seccomp: Some(2),
+            ..Lines::default()
+        };
+        let out = render(
+            &items,
+            &View {
+                title: "bwrap",
+                cfg: &cfg,
+                source: Source {
+                    file: "config.kdl",
+                    lines: &lines,
+                },
+                rules: &[],
+                proxy: false,
+                full: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(out[5], "  seccomp   config.kdl:2  0 arguments");
+        assert_eq!(out[6], "    rule-only: filter disabled");
+        assert_eq!(out[8], "  wayland   config.kdl:1  3 arguments");
+    }
+
+    /// What a `seccomp` node changed, under the arguments it did produce.
+    #[test]
+    fn a_seccomp_node_that_changes_the_filter_says_what_it_changed() {
+        let cfg = cfg("seccomp {\n    allow \"ptrace\" \"perf_event_open\"\n    \
+             deny \"read\" errno=\"ENOSYS\"\n}\ncommand \"true\"");
+        let items = [item(Origin::Seccomp, &["--add-seccomp-fd", "4"], None)];
+        let out = render(
+            &items,
+            &View {
+                title: "bwrap",
+                cfg: &cfg,
+                source: Source {
+                    file: "config.kdl",
+                    lines: &Lines::default(),
+                },
+                rules: &[],
+                proxy: false,
+                full: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(out[3], "    --add-seccomp-fd 4");
+        assert_eq!(out[4], "    rules: allow ptrace, perf_event_open");
+        assert_eq!(out[5], "           deny read (ENOSYS)");
     }
 
     #[test]
