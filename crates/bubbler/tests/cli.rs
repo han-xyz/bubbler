@@ -5662,3 +5662,347 @@ fn groff_reads_both_pages_without_a_complaint() {
         assert!(said.is_empty(), "{args:?}: {said}");
     }
 }
+
+/// A vendor-style entry in one of the test root's own applications
+/// directories: `user` is what `$XDG_DATA_HOME` points at, `system` what
+/// `$XDG_DATA_DIRS` does. No test ever reads or writes the user's real
+/// `~/.local/share/applications`.
+fn write_entry(root: &Path, layer: &str, name: &str, text: &str) -> PathBuf {
+    let dir = match layer {
+        "user" => root.join("data/applications"),
+        _ => root.join("share/applications"),
+    };
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+#[test]
+fn a_desktop_entry_is_written_refreshed_and_removed_without_touching_anything_else() {
+    let tmp = setup();
+    // A command no application on this host is named after, so the
+    // lookup can only find the entry this test writes.
+    write_profile(
+        tmp.path(),
+        "user",
+        "app",
+        "wayland\ncommand \"bubbler-test-app\"\n",
+    );
+    // In a `$XDG_DATA_DIRS` directory, the way a packaged application
+    // installs its entry.
+    let vendor = write_entry(
+        tmp.path(),
+        "system",
+        "bubbler-test-app.desktop",
+        "[Desktop Entry]\nType=Application\nName=Test App\nName[de]=Test-Anwendung\n\
+         Exec=bubbler-test-app %U\nDBusActivatable=true\nActions=new;\n\n\
+         [Desktop Action new]\nName=New\nExec=bubbler-test-app --new\n",
+    );
+    bubbler(tmp.path())
+        .args(["create", "t", "--profile", "app"])
+        .status()
+        .unwrap();
+
+    let out = bubbler(tmp.path()).args(["desktop", "t"]).output().unwrap();
+    let written = tmp.path().join("data/applications/bubbler-t.desktop");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}\n", written.display()),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let entry = std::fs::read_to_string(&written).unwrap();
+    assert!(entry.contains("\nName=Test App (Bubbler)\n"), "{entry}");
+    assert!(
+        entry.contains("\nName[de]=Test-Anwendung (Bubbler)\n"),
+        "{entry}"
+    );
+    assert!(entry.contains("\nX-Bubbler-Instance=t\n"), "{entry}");
+    // The key that would have the session bus start the application
+    // outside the sandbox, with nothing printed anywhere.
+    assert!(entry.contains("\nDBusActivatable=false\n"), "{entry}");
+    assert!(!entry.contains("DBusActivatable=true"), "{entry}");
+    for exec in ["-- bubbler-test-app %U", "-- bubbler-test-app --new"] {
+        assert!(entry.contains(exec), "{exec}\n{entry}");
+    }
+    // The `Exec` names a bubbler a launcher can find: this test binary is
+    // not on PATH, so the entry has to name it where it is.
+    let program = format!("Exec={} open t --", env!("CARGO_BIN_EXE_bubbler"));
+    assert!(entry.contains(&program), "{program}\n{entry}");
+    if Command::new("desktop-file-validate")
+        .arg(&written)
+        .output()
+        .is_ok()
+    {
+        let out = Command::new("desktop-file-validate")
+            .arg(&written)
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(!said.contains("error:"), "{said}");
+    }
+
+    // The application's own entry is untouched.
+    assert!(
+        std::fs::read_to_string(&vendor)
+            .unwrap()
+            .contains("Name=Test App\n")
+    );
+    // `--replace` writes the vendor's file name into the user's own
+    // directory, and refuses when a file that is not bubbler's is there.
+    let planted = write_entry(
+        tmp.path(),
+        "user",
+        "bubbler-test-app.desktop",
+        "[Desktop Entry]\nType=Application\nName=Mine\nExec=bubbler-test-app\n",
+    );
+    let out = bubbler(tmp.path())
+        .args(["desktop", "t", "--replace"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(
+        err.contains("is not bubbler's; move it aside first"),
+        "{err}"
+    );
+    assert!(
+        std::fs::read_to_string(&planted)
+            .unwrap()
+            .contains("Name=Mine")
+    );
+    std::fs::remove_file(&planted).unwrap();
+
+    // `--refresh` rewrites what bubbler wrote and reports each path.
+    std::fs::write(&written, "[Desktop Entry]\nExec=x\nX-Bubbler-Instance=t\n").unwrap();
+    let out = bubbler(tmp.path())
+        .args(["desktop", "--refresh"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}\n", written.display()),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        std::fs::read_to_string(&written)
+            .unwrap()
+            .contains("Name=Test App (Bubbler)")
+    );
+
+    // `--remove` takes bubbler's entry and nothing else in the directory.
+    let out = bubbler(tmp.path())
+        .args(["desktop", "t", "--remove"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!written.exists());
+    assert!(vendor.is_file());
+}
+
+#[test]
+fn desktop_print_writes_nothing_and_an_unresolvable_entry_names_the_node_to_add() {
+    let tmp = setup();
+    write_profile(tmp.path(), "user", "app", "command \"bubbler-test-app\"\n");
+    bubbler(tmp.path())
+        .args(["create", "t", "--profile", "app"])
+        .status()
+        .unwrap();
+    // Nothing on this host runs `bubbler-test-app`, so the error is the
+    // one that tells the user which node fixes it.
+    let out = bubbler(tmp.path())
+        .args(["desktop", "t", "--print"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(
+        err.contains("no desktop entry runs `bubbler-test-app`"),
+        "{err}"
+    );
+    assert!(err.contains("`desktop \"<name>.desktop\"`"), "{err}");
+
+    write_entry(
+        tmp.path(),
+        "system",
+        "org.example.App.desktop",
+        "[Desktop Entry]\nType=Application\nName=App\nExec=bubbler-test-app %U\n",
+    );
+    let out = bubbler(tmp.path())
+        .args(["desktop", "t", "--print"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Name=App (Bubbler)"), "{text}");
+    // Printing is a preview: bubbler's own directory is not even made.
+    assert!(!tmp.path().join("data/applications").exists());
+}
+
+#[test]
+fn open_without_a_terminal_leaves_its_errors_in_the_log_that_log_prints() {
+    let tmp = setup();
+    write_profile(tmp.path(), "user", "app", "command \"/usr/bin/true\"\n");
+    bubbler(tmp.path())
+        .args(["create", "t", "--profile", "app"])
+        .status()
+        .unwrap();
+    // `$BUBBLER_INIT` names the stand-in file `setup` writes, so the run
+    // fails at a point every host reaches the same way.
+    std::fs::remove_file(tmp.path().join("bubbler-init")).unwrap();
+    let out = bubbler(tmp.path()).args(["open", "t"]).output().unwrap();
+    assert!(!out.status.success());
+    // Nothing reached the caller's stderr: it went to the log, the error
+    // this run ended with included.
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+
+    let log = tmp.path().join("data/bubbler/instances/t/last-run.log");
+    let mode = std::fs::metadata(&log).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "the log is readable by others");
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(text.contains("bubbler-init"), "{text}");
+
+    let out = bubbler(tmp.path()).args(["log", "t"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), text);
+
+    // Each run starts the log again rather than growing it forever.
+    let out = bubbler(tmp.path()).args(["open", "t"]).output().unwrap();
+    assert!(!out.status.success());
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), text);
+
+    let out = bubbler(tmp.path()).args(["log", "other"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("instance `other` not found"), "{err}");
+}
+
+#[test]
+fn real_bwrap_open_execs_into_a_live_instance_and_starts_one_that_is_not() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    write_profile(tmp.path(), "user", "app", "command \"/usr/bin/sleep\"\n");
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t", "--profile", "app"])
+        .status()
+        .unwrap();
+    let home = tmp.path().join("data/bubbler/instances/t/home");
+
+    // Not live: `open` starts the sandbox, which is what a launcher does.
+    let marker = home.join("started");
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["open", "t", "--", "/usr/bin/touch", "/home/bubbler/started"])
+        .output()
+        .unwrap();
+    let said = std::fs::read_to_string(tmp.path().join("data/bubbler/instances/t/last-run.log"))
+        .unwrap_or_default();
+    assert!(out.status.success(), "{said}");
+    assert!(marker.is_file(), "the sandbox never ran: {said}");
+
+    let mut run = bubbler_live(tmp.path(), &init)
+        .args(["run", "t", "--", "/usr/bin/sleep", "30"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let sock = tmp.path().join("run/bubbler/t/init.sock");
+    if !wait_until(
+        || UnixStream::connect(&sock).is_ok(),
+        Duration::from_secs(10),
+    ) {
+        fail_with(run, "the instance never accepted a connection");
+    }
+
+    // Live: the command is handed to the sandbox that is already running,
+    // which is how a second click on a menu entry reaches the open window.
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["open", "t", "--", "/usr/bin/touch", "/home/bubbler/execed"])
+        .output()
+        .unwrap();
+    // Nothing on stderr: with no terminal anywhere, what bubbler had to
+    // say went to the log, and it added to the log of the run it went
+    // into rather than emptying it under a sandbox that is still writing.
+    let log = tmp.path().join("data/bubbler/instances/t/last-run.log");
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(out.status.success(), "{text}");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+    assert!(home.join("execed").is_file(), "{text}");
+    assert!(text.contains("executing inside it"), "{text}");
+
+    kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
+    let _ = run.wait();
+}
+
+#[test]
+fn an_entry_the_validator_rejects_is_written_and_reported() {
+    if Command::new("desktop-file-validate").output().is_err() {
+        eprintln!("skipping: desktop-file-validate is not installed");
+        return;
+    }
+    let tmp = setup();
+    write_profile(tmp.path(), "user", "app", "command \"bubbler-test-app\"\n");
+    // The application's own entry names an action group it does not have,
+    // which is an error in the copy bubbler writes as much as in it.
+    write_entry(
+        tmp.path(),
+        "system",
+        "bubbler-test-app.desktop",
+        "[Desktop Entry]\nType=Application\nName=App\nExec=bubbler-test-app\nActions=nope;\n",
+    );
+    bubbler(tmp.path())
+        .args(["create", "t", "--profile", "app"])
+        .status()
+        .unwrap();
+    let out = bubbler(tmp.path()).args(["desktop", "t"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("warning:") && err.contains("nope"), "{err}");
+    assert!(
+        tmp.path()
+            .join("data/applications/bubbler-t.desktop")
+            .is_file()
+    );
+}
+
+#[test]
+fn a_config_that_does_not_parse_reaches_the_log_of_the_run_it_stopped() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "bluetooth\n").unwrap();
+    // The log is opened before the config is read, so the reason a
+    // launcher-started run never began is in it rather than nowhere.
+    let out = bubbler(tmp.path()).args(["open", "t"]).output().unwrap();
+    assert!(!out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+    let out = bubbler(tmp.path()).args(["log", "t"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("unknown node `bluetooth`"), "{text}");
+
+    // A log that cannot be opened costs the record and not the run: a
+    // symlink is never bubbler's file, and the warning names what is
+    // being given up.
+    std::fs::write(&cfg, "command \"/usr/bin/true\"\n").unwrap();
+    let log = tmp.path().join("data/bubbler/instances/t/last-run.log");
+    let elsewhere = tmp.path().join("elsewhere");
+    std::fs::remove_file(&log).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &log).unwrap();
+    let out = bubbler(tmp.path()).args(["open", "t"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("no log for this run"), "{err}");
+    assert!(err.contains("last-run.log"), "{err}");
+    assert!(!elsewhere.exists(), "the symlink was followed");
+    // The run went ahead: what stopped it is the missing supervisor.
+    assert!(err.contains("bubbler-init"), "{err}");
+}

@@ -157,6 +157,10 @@ impl RealAlloc {
     /// to exactly one of them. They are `CLOEXEC` at rest, so the window
     /// in which they can be inherited is the one spawn they were built
     /// for.
+    ///
+    /// That window is process-wide, so only one thread may spawn while it
+    /// is open. bubbler's only other thread is the last-run log's copier,
+    /// and it starts no process at all ([`crate::run_log`]).
     fn inheritable(&self, on: bool) -> io::Result<()> {
         let flags = match on {
             true => FdFlags::empty(),
@@ -1712,6 +1716,10 @@ mod tests {
             home: tmp.join("home"),
             data_home: tmp.join("data"),
             config_home: tmp.join("config"),
+            data_dirs: crate::env::DEFAULT_DATA_DIRS
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
             runtime_dir: tmp.join("run"),
             uid: 1000,
             gid: 1000,

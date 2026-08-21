@@ -1,3 +1,4 @@
 // bubbler profile: alacritty
 wayland
+desktop "Alacritty.desktop"
 command "alacritty"

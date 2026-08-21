@@ -523,6 +523,10 @@ mod tests {
             home: tmp.path().join("home"),
             data_home: tmp.path().join("data"),
             config_home: tmp.path().join("config"),
+            data_dirs: crate::env::DEFAULT_DATA_DIRS
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
             runtime_dir: tmp.path().join("run"),
             uid: 1000,
             gid: 1000,

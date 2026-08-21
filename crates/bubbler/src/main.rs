@@ -6,12 +6,13 @@ mod manpage;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
 use bubbler_core::config::{self, Service};
+use bubbler_core::desktop;
 use bubbler_core::env::Env;
 use bubbler_core::error::{ConfigError, LaunchError};
 use bubbler_core::exec;
@@ -21,6 +22,7 @@ use bubbler_core::instance::{self, Instance};
 use bubbler_core::launcher;
 use bubbler_core::lint;
 use bubbler_core::profile;
+use bubbler_core::run_log;
 use bubbler_core::tty::{self, TtyMode};
 use bubbler_core::wrap;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -195,12 +197,62 @@ channel and not a boundary.")]
         command: Vec<OsString>,
     },
     /// Run a command in an instance, the way shims and desktop entries do.
+    #[command(long_about = "\
+Run a command in an instance, starting the sandbox when it is not running and
+executing into it when it is, which is what a desktop entry and a PATH shim
+call. A URL or a file handed to a running application therefore reaches the
+window that is already open. The command replaces the config's `command`; with
+no terminal anywhere, the sandbox is given none either (`tty \"none\"`) and
+bubbler's own stderr, the sidecars' and the application's go to the instance's
+last-run.log, which `bubbler log` prints.")]
     Open {
         /// Instance name.
         name: String,
         /// Command to run; replaces the config's `command`.
         #[arg(last = true)]
         command: Vec<OsString>,
+    },
+    /// Print what the instance's last run without a terminal wrote.
+    #[command(long_about = "\
+Print the instance's last-run.log, byte for byte: what bubbler, its sidecars
+and the application wrote to stderr during the last run that had no terminal
+to write to. Such a run empties it first and one that executes into a running
+instance adds to it; it is never larger than a mebibyte, and mode 0600. An
+instance that has only ever been run from a terminal has none.")]
+    Log {
+        /// Instance name.
+        name: String,
+    },
+    /// Write, print or remove an instance's launcher entry.
+    #[command(long_about = "\
+Write a launcher entry that starts the instance, copied from the application's
+own .desktop file and patched only where it has to be: the names gain a
+` (Bubbler)` suffix, every Exec (the main one and each action's) runs `bubbler
+open <instance>` around the application's own command line, TryExec names this
+binary, DBusActivatable is forced false so no launcher can bypass Exec through
+the session bus, and X-Bubbler-Instance records whose entry it is. Everything
+else is copied through. Which file is copied comes from the config's `desktop`
+node, else <command>.desktop, else the one entry whose Exec runs the command.
+A file bubbler did not write is never written over.")]
+    Desktop {
+        /// Instance name; leave it out with `--refresh`.
+        #[arg(required_unless_present = "refresh")]
+        name: Option<String>,
+        /// Take over the application's own entry, by writing one of the
+        /// same file name: a user entry shadows the system's, so the
+        /// menu keeps one entry and it is the sandboxed one.
+        #[arg(long, conflicts_with_all = ["remove", "refresh"])]
+        replace: bool,
+        /// Delete the entries written for this instance, and nothing else.
+        #[arg(long, conflicts_with_all = ["print", "refresh"])]
+        remove: bool,
+        /// Write the entry to stdout and touch no file.
+        #[arg(long, conflicts_with = "refresh")]
+        print: bool,
+        /// Rewrite every entry bubbler has written, for every instance:
+        /// re-copies each application's file and re-resolves this binary.
+        #[arg(long, conflicts_with = "name")]
+        refresh: bool,
     },
     /// List instances.
     #[command(long_about = "\
@@ -378,13 +430,19 @@ as clean. The checks are listed in bubbler-config(5).")]
 }
 
 fn main() -> ExitCode {
-    match real_main() {
+    // The guard lives here and not inside the run so that the error a
+    // failed run ends with is written to the log as well; `open` is the
+    // only subcommand that ever fills it in.
+    let mut log = None;
+    let code = match real_main(&mut log) {
         Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
         Err(e) => {
             eprintln!("bubbler: {e:#}");
             ExitCode::from(1)
         }
-    }
+    };
+    drop(log);
+    code
 }
 
 fn write_lines(out: &mut dyn Write, lines: &[&OsStr]) -> io::Result<()> {
@@ -401,6 +459,19 @@ fn write_lines(out: &mut dyn Write, lines: &[&OsStr]) -> io::Result<()> {
 /// failure.
 fn print_lines(lines: &[&OsStr], what: &str) -> Result<i32> {
     match write_lines(&mut io::stdout().lock(), lines) {
+        Ok(()) => Ok(0),
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(0),
+        Err(e) => Err(e).with_context(|| format!("writing {what}")),
+    }
+}
+
+/// Print bytes as they are: a log and a desktop entry are files, and
+/// what is in them is not this command's to reword. A reader that left
+/// early (`| head`) is a normal end here too.
+fn print_bytes(bytes: &[u8], what: &str) -> Result<i32> {
+    let mut out = io::stdout().lock();
+    let written = out.write_all(bytes).and_then(|()| out.flush());
+    match written {
         Ok(()) => Ok(0),
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(0),
         Err(e) => Err(e).with_context(|| format!("writing {what}")),
@@ -465,6 +536,104 @@ fn explain(
     .context("rendering the explanation")?;
     let lines: Vec<&OsStr> = rendered.iter().map(OsStr::new).collect();
     print_lines(&lines, "the explanation")
+}
+
+/// The entry an instance's launcher entry is generated from, and where
+/// it goes. Split out because `--refresh` builds the same thing for an
+/// entry whose path is already decided.
+fn build_entry(
+    dirs: &desktop::Dirs,
+    inst: &Instance,
+    program: &Path,
+    replace: bool,
+) -> Result<(PathBuf, String)> {
+    let source = desktop::source(dirs, &inst.name, &inst.config)
+        .with_context(|| format!("finding the desktop entry instance `{}` is for", inst.name))?;
+    let entry = desktop::render(&source, &inst.name, program)
+        .with_context(|| format!("reading {}", source.display()))?;
+    Ok((desktop::target(dirs, &inst.name, &source, replace), entry))
+}
+
+/// Re-generate every entry bubbler has written: a new bubbler path, a
+/// changed config or an updated application file all reach the menu
+/// through this. Each entry is rewritten where it already is, so an entry
+/// written with `--replace` keeps shadowing the application's.
+fn refresh_entries(env: &Env, dirs: &desktop::Dirs, program: &Path) -> Result<i32> {
+    let entries = desktop::generated(dirs);
+    if entries.is_empty() {
+        eprintln!(
+            "bubbler: no entry of bubbler's in {}; `bubbler desktop <instance>` writes one",
+            dirs.user.display()
+        );
+        return Ok(0);
+    }
+    let mut written = Vec::new();
+    let mut failed = 0;
+    for (path, name) in entries {
+        let done = Instance::open(env, &name)
+            .with_context(|| format!("opening instance `{name}`"))
+            .and_then(|inst| {
+                // The file name stays as it is: whether this entry
+                // shadows the application's was decided when it was
+                // written, and a refresh is not the place to change it.
+                let (_, entry) = build_entry(dirs, &inst, program, false)?;
+                desktop::write(&path, &entry, &name)
+                    .with_context(|| format!("writing {}", path.display()))?;
+                warn_invalid(&path);
+                Ok(())
+            });
+        match done {
+            Ok(()) => written.push(path),
+            Err(e) => {
+                failed += 1;
+                let e = e.context(format!("refreshing {}", path.display()));
+                eprintln!("bubbler: {e:#}");
+            }
+        }
+    }
+    update_desktop_db(&dirs.user);
+    let lines: Vec<&OsStr> = written.iter().map(|p| p.as_os_str()).collect();
+    print_lines(&lines, "the refreshed entries")?;
+    Ok(i32::from(failed > 0))
+}
+
+/// The log a run without a terminal writes, or `None` after saying why
+/// there is none: a log that cannot be opened — a symlink where the file
+/// belongs, a full disk — is a lost record, and losing the record is not
+/// a reason to refuse the sandbox the user asked for.
+fn open_log(path: &Path, truncate: bool) -> Option<run_log::Redirect> {
+    match run_log::redirect(path, truncate) {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            let e = anyhow::Error::new(e);
+            eprintln!("bubbler: warning: no log for this run: {e:#}");
+            None
+        }
+    }
+}
+
+/// What `desktop-file-validate` rejects about an entry just written, as
+/// warnings: the file is on disk either way, since what it says about an
+/// application's own copied keys is not bubbler's to correct.
+fn warn_invalid(path: &Path) {
+    for line in desktop::validate(path) {
+        eprintln!("bubbler: warning: {line}");
+    }
+}
+
+/// Rebuild the launcher's MIME cache after the applications directory has
+/// changed. A missing tool is a warning: it costs the entry its place in
+/// "Open With" lists, and nothing else about it.
+fn update_desktop_db(dir: &Path) {
+    match desktop::update_database(dir) {
+        Ok(true) => {}
+        Ok(false) => eprintln!(
+            "bubbler: warning: update-desktop-database is not installed \
+             (package desktop-file-utils), so the entry may not be offered \
+             as a handler for the file types it claims"
+        ),
+        Err(e) => eprintln!("bubbler: warning: {e}"),
+    }
 }
 
 /// Program and arguments from `$VISUAL`, else `$EDITOR`. The value is
@@ -585,7 +754,7 @@ fn shim_dispatch(argv: &[OsString]) -> Result<Option<Vec<OsString>>> {
     Ok(Some(wrap::open_argv(&found.instance, &args)))
 }
 
-fn real_main() -> Result<i32> {
+fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
     // Before anything else opens a descriptor.
     host_env::fill_closed_stdio()?;
     // Before the parser: clap ignores `argv[0]`, so a shim named after a
@@ -764,9 +933,21 @@ fn real_main() -> Result<i32> {
             launcher::exec(&env, &name, &command, mode)
                 .with_context(|| format!("executing in instance `{name}`"))
         }
-        // Task 1 replaces this with the live-instance exec path and the
-        // last-run log; a shim only needs it to start the sandbox.
         Cmd::Open { name, command } => {
+            // The instance directory is found before its config is read,
+            // because a config that does not parse is exactly the failure
+            // a run nobody is watching has to leave a record of.
+            let config = instance::config_path_checked(&env, &name)
+                .with_context(|| format!("opening instance `{name}`"))?;
+            // Before the log is opened, so a stale socket is cleared and
+            // the answer decides whether this run empties the log or adds
+            // to what the run it is executing into wrote.
+            let stream = exec::connect(&env, &name)
+                .with_context(|| format!("connecting to instance `{name}`"))?;
+            let is_tty = tty::host_is_tty();
+            if !is_tty[2] {
+                *log = open_log(&config.with_file_name(run_log::LOG_FILE), stream.is_none());
+            }
             let inst = Instance::open(&env, &name).with_context(|| {
                 format!(
                     "opening instance `{name}` ({})",
@@ -775,9 +956,78 @@ fn real_main() -> Result<i32> {
             })?;
             warn_migration(&inst);
             let command = (!command.is_empty()).then_some(command.as_slice());
-            let mode = inst.config.tty;
+            // A launcher starts its children with no terminal at all, so
+            // there is none to hand over or to stand in for; the sandbox
+            // gets pipes bubbler reads, which is what puts the
+            // application's own stderr in the log.
+            let mode = match is_tty.iter().any(|t| *t) {
+                true => inst.config.tty,
+                false => TtyMode::None,
+            };
+            if let Some(stream) = stream {
+                eprintln!(
+                    "bubbler: instance `{name}` is running; executing inside it \
+                     (config changes apply after restart)"
+                );
+                let command = launcher::resolve_command(&inst, command)?;
+                return exec::run_in(&stream, command, mode)
+                    .with_context(|| format!("executing in instance `{name}`"));
+            }
+            if inst.has_service(&Service::X11) {
+                eprintln!("bubbler: warning: x11 grants no isolation between X clients");
+            }
             launcher::run(&env, &inst, command, mode)
                 .with_context(|| format!("running instance `{name}`"))
+        }
+        Cmd::Log { name } => {
+            let config = instance::config_path_checked(&env, &name)
+                .with_context(|| format!("opening instance `{name}`"))?;
+            let path = config.with_file_name(run_log::LOG_FILE);
+            let text = run_log::read(&path)
+                .with_context(|| format!("reading {}", path.display()))?
+                .with_context(|| {
+                    format!(
+                        "instance `{name}` has no {}: it is written by a run with no \
+                         terminal, which is how a desktop entry or a shim starts one",
+                        run_log::LOG_FILE
+                    )
+                })?;
+            print_bytes(&text, "the log")
+        }
+        Cmd::Desktop {
+            name,
+            replace,
+            remove,
+            print,
+            refresh,
+        } => {
+            let dirs = desktop::Dirs::from_env(&env);
+            let exe = std::env::current_exe().context("finding this bubbler binary")?;
+            let program = desktop::program(&exe, &host_env::search_path());
+            if refresh {
+                return refresh_entries(&env, &dirs, &program);
+            }
+            // clap requires a name without `--refresh` and refuses one
+            // with it, so this is out of reach from the command line.
+            let name = name.context("`desktop` takes an instance name or `--refresh`")?;
+            if remove {
+                let gone = desktop::remove(&dirs, &name)
+                    .with_context(|| format!("removing the desktop entry of `{name}`"))?;
+                update_desktop_db(&dirs.user);
+                let lines: Vec<&OsStr> = gone.iter().map(|p| p.as_os_str()).collect();
+                return print_lines(&lines, "the removed entries");
+            }
+            let inst = Instance::open(&env, &name)
+                .with_context(|| format!("opening instance `{name}`"))?;
+            let (target, entry) = build_entry(&dirs, &inst, &program, replace)?;
+            if print {
+                return print_bytes(entry.as_bytes(), "the desktop entry");
+            }
+            desktop::write(&target, &entry, &name)
+                .with_context(|| format!("writing {}", target.display()))?;
+            warn_invalid(&target);
+            update_desktop_db(&dirs.user);
+            print_lines(&[target.as_os_str()], "the entry path")
         }
         Cmd::List => {
             let names = Instance::list(&env).context("listing instances")?;

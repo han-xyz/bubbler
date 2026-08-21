@@ -37,7 +37,12 @@ every bwrap argument under the node that produced it. See "Known gaps" below.
     bubbler run ff --explain              # the same argv, grouped under its nodes
     bubbler run ff --tty none             # no terminal inside at all
     bubbler exec ff -- firefox --version  # run inside the instance already running
-    bubbler open ff -- firefox https://x  # run a command or URL in the instance
+    bubbler open ff                       # exec into it if it is running, else run
+    bubbler open ff -- firefox https://a  # hand a URL to the one already running
+    bubbler log ff                        # what its last run without a terminal said
+    bubbler desktop ff                    # a menu entry that starts the sandbox
+    bubbler desktop ff --replace          # …that shadows the application's own entry
+    bubbler desktop --refresh             # rewrite every entry bubbler has written
     bubbler wrap ff                       # ~/.local/bin/ff starts that sandbox
     bubbler wrap --list                   # every shim, and whether it still works
     bubbler unwrap ff                     # remove it again
@@ -66,6 +71,17 @@ apply on the next start. An exec'd process is given whatever the terminal
 mode decides on (see "Terminal"), and descriptors passed to exec'd commands
 are reachable by the sandboxed application through `/proc`: exec is a
 convenience channel, not a boundary.
+
+`open` is what a menu entry or a shim calls: it execs into the instance when
+it is running and starts it when it is not, so a URL opens in the window that
+is already there. Started without a terminal it takes `tty "none"` (see
+"Terminal") and writes bubbler's own stderr — its warnings, a sidecar's
+errors, the application's own output — to `last-run.log` in the instance
+directory, which `bubbler log` prints. The log is opened before the config is
+read, so a `config.kdl` that stopped the run is in it too, and a log that
+cannot be opened at all — a symlink where the file belongs — costs the record
+rather than the run: bubbler says so and starts the sandbox anyway. See
+"Desktop entries".
 
 A run is a chain of processes; `bubbler` waits at the top of it and returns the
 command's status.
@@ -860,6 +876,12 @@ Every one is Wayland-first; only the two gaming profiles grant `x11`.
     thunderbird   wayland network dri dbus portals notify, ~/Downloads rw
     vesktop       wayland dri pipewire network dbus portals notify tray, ~/Downloads rw
 
+Five carry a `desktop` node, because their application's entry is not named
+after its command: `alacritty` (`Alacritty.desktop`), `keepassxc`, `lutris`
+and `thunderbird` (reverse-DNS names), and `libreoffice`, whose command is run
+by eight entries — the start centre is the one meant. The rest resolve by file
+name; `mpv`'s does too, once mpv is installed. See "Desktop entries".
+
 `SAL_USE_VCLPLUGIN=gtk3` is there because bubbler clears the environment,
 leaving LibreOffice's VCL plugin to an autodetection with nothing to go on.
 The Mozilla apps need no variable of their own: Gecko has defaulted to Wayland
@@ -1003,6 +1025,87 @@ from the file as it stands, bwrap cannot be told about a bind after the fact,
 and a `config.kdl` describing grants the running sandbox does not have would
 be a lie about what is confined.
 
+## Desktop entries
+
+    bubbler desktop ff              # ~/.local/share/applications/bubbler-ff.desktop
+    bubbler desktop ff --replace    # …/firefox.desktop, shadowing the application's
+    bubbler desktop ff --print      # print the entry instead, touching nothing
+    bubbler desktop ff --remove     # delete the entries written for ff
+    bubbler desktop --refresh       # rewrite every entry bubbler has written
+
+`desktop` copies the application's own `.desktop` file and changes five things
+in the copy: every `Name` and `Name[xx]` gains ` (Bubbler)`, so the entry is
+marked in every locale rather than in English; every `Exec` — the main one and
+each `[Desktop Action]`'s — becomes `bubbler open <instance> -- <the
+application's own command line>`; `TryExec` names bubbler; `DBusActivatable`
+is set to `false`; and `X-Bubbler-Instance=<instance>` is added. Everything
+else is copied through untouched — every group, every key, every locale, the
+comments and the blank lines — including keys bubbler knows nothing about.
+
+The field codes (`%u`, `%F`, `%i`, …) stay exactly where the application put
+them, which is at the end, which is where `bubbler open` collects its command.
+Nothing is quoted around them: a field code inside a quoted argument has no
+defined meaning.
+
+Which entry is copied is decided in this order: the instance's `desktop
+"<name>.desktop"` node, then `<command>.desktop`, then the one entry whose
+`Exec` runs `<command>`. All three look in `$XDG_DATA_HOME/applications` first
+and then in the `applications` directory of every `$XDG_DATA_DIRS` entry
+(`/usr/local/share` and `/usr/share` when that variable is unset), which is
+where a launcher looks, so a flatpak export or a Nix profile on that list is
+found too. The search skips entries a launcher does not display
+(`NoDisplay=true`, `Hidden=true`), since those are an application's
+MIME-handler-only entries, and entries bubbler wrote itself. Two candidates
+are an error listing both rather than a guess — that is what the `desktop`
+node is for, and five shipped profiles carry one. A `desktop` node naming a
+`Hidden=true` entry is refused outright: that key means the file is to be
+treated as if it were not there, so a copy of it would be an entry that does
+nothing.
+
+`Exec` names `bubbler` bare only when `PATH` resolves that name to the running
+binary, and the binary's own path otherwise. This matters more than it looks:
+GLib refuses to build an application entry at all when the `Exec` program or
+the `TryExec` cannot be found, so an entry naming a `bubbler` that has since
+moved does not fail loudly — it silently vanishes from the menu.
+`bubbler desktop --refresh` rewrites every entry bubbler has written, with the
+binary re-resolved and each application's file copied again.
+
+**bubbler never writes over a file it did not write.** The default entry is a
+second one, `bubbler-<instance>.desktop`, beside the application's.
+`--replace` writes the application's own file name into your applications
+directory instead, where it shadows the system entry: a user entry wins over a
+system one of the same name, so the menu keeps one entry, `mimeapps.list`
+defaults keep resolving to it, and window matching by `app_id` keeps working.
+Either way, a file already there that carries no `X-Bubbler-Instance` of this
+instance's is refused with its path — move it aside yourself. There is no
+`--force` and no backup file; deleting bubbler's entry is what brings the
+application's own back. `--remove` deletes the entries carrying this
+instance's marker and nothing else.
+
+After writing or removing, `update-desktop-database` is run on the directory
+if it is installed, which is what puts the entry in "Open With" lists; a
+missing one is a warning. `desktop-file-validate`, when installed, is run on
+the result and the errors it reports are printed as warnings — its hints and
+warnings about the application's own keys are not, since bubbler copied them.
+`mimeapps.list` is never touched: `xdg-mime default <entry> <type>` is the
+documented way to make the sandboxed entry a default for a type it did not
+already handle.
+
+Three limits worth knowing before clicking:
+
+- **`%f` and `%F` hand over host paths the sandbox cannot see.** They expand
+  to `/home/you/…`, and the sandbox's home is `/home/bubbler` with the host's
+  never bound; the specification even allows a temporary copy under `/tmp`.
+  Only files under a `home-share` or `path-share` resolve. `%u` needs no
+  mount and is better where the application offers it.
+- **Two URLs at once may lose one.** A `%u` or `%f` entry is started once per
+  argument, and two `bubbler open` processes that both find the instance
+  stopped will both try to start it; one of them loses.
+- **D-Bus activation is only closed for this entry.** `DBusActivatable=false`
+  stops a launcher from ignoring `Exec` and asking the session bus to start
+  the application unsandboxed. Anything that activates the application's bus
+  name directly still starts the host copy: shadowing that would mean owning
+  `$XDG_DATA_HOME/dbus-1/services` too, which bubbler does not do.
 ## PATH shims
 
     bubbler wrap ff                  # ~/.local/bin/ff opens instance `ff`
@@ -1014,9 +1117,9 @@ A shim is a symlink in `~/.local/bin` pointing at the bubbler binary. Started
 through it, bubbler reads the name it was called by out of `argv[0]`, looks it
 up in `$XDG_CONFIG_HOME/bubbler/wraps.kdl` and becomes `bubbler open
 <instance> -- <the instance's command> <your arguments>`, so `ff
-https://example.com` opens that URL in the sandbox (join behaviour lands with
-`open`). There is no extra process and no script to keep in step: the symlink
-*is* bubbler.
+https://example.com` opens that URL in the sandbox — in the window that is
+already open when one is, since that is what `open` does. There is no extra
+process and no script to keep in step: the symlink *is* bubbler.
 
 `argv[0]` is the caller's to choose — `exec -a firefox …` sets it to anything —
 so the name is a key into a file bubbler wrote, never a name turned into an
@@ -1140,7 +1243,9 @@ application runtime directory granted `mode=rw`, so the sandbox can replace the
 sockets everything else naming that id connects to), `network-host`
 (`network "host"`, the one mode that puts the sandbox on the host's network
 stack), `ozone-hint-unnecessary`,
-`command-not-found`, `camera-nodes-none-present` (`camera nodes=#true` on a
+`command-not-found`, `desktop-entry-missing` (a `desktop` node naming an entry
+no application directory here holds, which is what a profile for software you
+have not installed looks like), `camera-nodes-none-present` (`camera nodes=#true` on a
 host with no `/dev/video*` or `/dev/media*`, so that half of the grant binds
 nothing), `camera-nodes-no-hotplug` (the node list is frozen at launch, and
 under an isolated network namespace no uevent reaches the sandbox either —
@@ -1595,12 +1700,21 @@ binding the tree under it.
   larger than 1 MiB or nested deeper than 64 braces, naming the file; the
   check counts braces outside strings and comments and is not a parser, and
   the recursion itself is upstream's (`kdl` 6.7.1).
-- No desktop entries.
+- A generated desktop entry closes D-Bus activation for itself only, and its
+  `%f` file arguments are host paths the sandbox cannot open; both are under
+  "Desktop entries".
 
 ## Files
 
 Instances live in `$XDG_DATA_HOME/bubbler/instances/<name>/` (by default under
-`~/.local/share`), each holding a `config.kdl` and the private `home/`. Every
+`~/.local/share`), each holding a `config.kdl` and the private `home/`, plus a
+`last-run.log` once a run without a terminal has left one there — mode 0600,
+emptied by each run that starts a sandbox, added to by one that execs into a
+running instance, and never over a mebibyte: the cap is measured against the
+file before every write, so two bubblers writing to it cannot between them
+push it over. Desktop entries are written to `$XDG_DATA_HOME/applications/`,
+which together with the shim directory below is all bubbler ever writes to
+outside its own state. Every
 run except a dry run or an explanation also creates
 `$XDG_RUNTIME_DIR/bubbler/<name>/`, mode 0700, reusing one left over from an
 earlier run, and binds the control socket `init.sock` in it; a `dbus` or

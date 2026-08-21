@@ -10,12 +10,11 @@ description = "Library core of bubbler: config model, services, bwrap argument b
 bubbler-init.workspace = true
 kdl.workspace = true
 thiserror.workspace = true
-rustix.workspace = true
+# `stdio` for the last-run log, which points fd 2 at a file for a run
+# nobody is watching a terminal for.
+rustix = { workspace = true, features = ["stdio"] }
 signal-hook.workspace = true
 libseccomp.workspace = true
 
 [dev-dependencies]
-# `stdio` is only ever used to quiet fd 2 while a test makes the relay
-# report a destination that refuses its output.
-rustix = { workspace = true, features = ["stdio"] }
 tempfile.workspace = true

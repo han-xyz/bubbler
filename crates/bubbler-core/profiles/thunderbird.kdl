@@ -6,4 +6,5 @@ dbus
 portals
 notify
 home-share "Downloads" mode=rw
+desktop "org.mozilla.Thunderbird.desktop"
 command "thunderbird"

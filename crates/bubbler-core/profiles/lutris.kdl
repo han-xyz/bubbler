@@ -48,4 +48,5 @@ system-bus {
     call "org.freedesktop.UDisks2=org.freedesktop.DBus.ObjectManager.GetManagedObjects@/org/freedesktop/UDisks2"
 }
 home-share "Games" mode=rw
+desktop "net.lutris.Lutris.desktop"
 command "lutris"
