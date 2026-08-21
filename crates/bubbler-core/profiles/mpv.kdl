@@ -1,0 +1,6 @@
+// bubbler profile: mpv
+wayland
+dri
+pipewire
+home-share "Videos"
+command "mpv"

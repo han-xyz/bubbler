@@ -18,7 +18,17 @@ use crate::seccomp::SeccompConfig;
 use crate::tty::TtyMode;
 
 /// Names of all built-in profiles, sorted.
-pub const NAMES: &[&str] = &["alacritty", "firefox", "generic"];
+pub const NAMES: &[&str] = &[
+    "alacritty",
+    "chromium",
+    "firefox",
+    "generic",
+    "libreoffice",
+    "mpv",
+    "steam",
+    "thunderbird",
+    "vesktop",
+];
 
 /// First line of a seeded `config.kdl`, and of a profile `profile edit`
 /// writes, followed by the profile name. It is what `reseed` reads back
@@ -38,8 +48,14 @@ pub const MAX_DEPTH: usize = 8;
 pub fn lookup(name: &str) -> Option<&'static str> {
     match name {
         "alacritty" => Some(include_str!("../profiles/alacritty.kdl")),
+        "chromium" => Some(include_str!("../profiles/chromium.kdl")),
         "firefox" => Some(include_str!("../profiles/firefox.kdl")),
         "generic" => Some(include_str!("../profiles/generic.kdl")),
+        "libreoffice" => Some(include_str!("../profiles/libreoffice.kdl")),
+        "mpv" => Some(include_str!("../profiles/mpv.kdl")),
+        "steam" => Some(include_str!("../profiles/steam.kdl")),
+        "thunderbird" => Some(include_str!("../profiles/thunderbird.kdl")),
+        "vesktop" => Some(include_str!("../profiles/vesktop.kdl")),
         _ => None,
     }
 }
@@ -708,6 +724,51 @@ mod tests {
             ff.env
                 .contains(&("MOZ_ENABLE_WAYLAND".to_owned(), "1".to_owned()))
         );
+        // One grant per profile the app does not work without, so a
+        // profile edited into something weaker is caught here and not by
+        // whoever runs it.
+        let cfg = |n: &str| r.resolve(n).unwrap().config;
+        let home_share = |p: &str, mode| Service::HomeShare {
+            path: PathBuf::from(p),
+            mode,
+        };
+        assert!(
+            cfg("mpv")
+                .services
+                .contains(&home_share("Videos", ShareMode::ReadOnly))
+        );
+        assert!(
+            cfg("thunderbird")
+                .env
+                .contains(&("MOZ_ENABLE_WAYLAND".to_owned(), "1".to_owned()))
+        );
+        assert!(
+            cfg("libreoffice")
+                .env
+                .contains(&("SAL_USE_VCLPLUGIN".to_owned(), "gtk3".to_owned()))
+        );
+        assert!(
+            cfg("chromium")
+                .services
+                .contains(&home_share("Downloads", ShareMode::ReadWrite))
+        );
+        assert!(cfg("vesktop").services.contains(&Service::Tray));
+        let steam = cfg("steam");
+        assert!(steam.services.contains(&Service::Gamepad));
+        // The 32-bit runtime would be killed by a filter built for this
+        // architecture alone.
+        assert!(steam.seccomp.disable);
+        for n in [
+            "chromium",
+            "libreoffice",
+            "mpv",
+            "steam",
+            "thunderbird",
+            "vesktop",
+        ] {
+            assert_eq!(cfg(n).command, Some(vec![OsString::from(n)]), "{n}");
+        }
+
         assert!(matches!(r.resolve("nope"), Err(ProfileError::NotFound(n)) if n == "nope"));
     }
 
@@ -729,10 +790,12 @@ mod tests {
         );
         let entries = r.list().unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["alacritty", "firefox", "generic", "only-system"]
-        );
+        // Every built-in, each named once however many layers hold it,
+        // plus the one only the system layer has.
+        let mut expected: Vec<&str> = NAMES.to_vec();
+        expected.push("only-system");
+        expected.sort_unstable();
+        assert_eq!(names, expected);
         let by = |n: &str| entries.iter().find(|e| e.name == n).unwrap().clone();
         assert_eq!(by("firefox").origin, Origin::User);
         assert_eq!(by("firefox").path, Some(r.user_dir().join("firefox.kdl")));

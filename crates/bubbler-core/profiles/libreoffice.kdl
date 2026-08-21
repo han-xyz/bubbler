@@ -1,0 +1,8 @@
+// bubbler profile: libreoffice
+wayland
+dri
+dbus
+portals
+home-share "Documents" mode=rw
+env SAL_USE_VCLPLUGIN="gtk3"
+command "libreoffice"

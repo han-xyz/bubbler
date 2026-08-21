@@ -1,0 +1,10 @@
+// bubbler profile: vesktop
+wayland
+dri
+pipewire
+network
+dbus
+portals
+notify
+tray
+command "vesktop"

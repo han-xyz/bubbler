@@ -1,0 +1,10 @@
+// bubbler profile: thunderbird
+wayland
+network
+dri
+dbus
+portals
+notify
+home-share "Downloads" mode=rw
+env MOZ_ENABLE_WAYLAND="1"
+command "thunderbird"

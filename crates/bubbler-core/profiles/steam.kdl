@@ -1,0 +1,24 @@
+// bubbler profile: steam
+// Partial: this grants what bubbler has, which is not all Steam wants.
+// Missing is the system bus (UPower, and UDisks2 for Wine), which bubbler
+// has no service for, along with /dev/ntsync, /dev/hugepages, /dev/fuse
+// and /dev/snd. The 32-bit runtime is what `seccomp { disable }` is here
+// for: the filter is generated for this architecture alone and kills a
+// process that makes an i386 syscall. Steam also wants the multilib
+// 32-bit GL and Vulkan drivers and an en_US.UTF-8 locale on the host, and
+// a library folder outside the private home has to be named, e.g.
+//   path-share "/kioxia/Steam" mode=rw
+wayland
+dri
+pipewire
+network
+dbus
+portals
+notify
+tray
+gamepad
+home-share ".steam" mode=rw
+seccomp {
+    disable
+}
+command "steam"

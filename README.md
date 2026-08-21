@@ -5,9 +5,10 @@ combining bubblejail's explicit instances and resource grants with a profile
 library in the spirit of firejail. bubbler itself is unprivileged; `bwrap`
 does the namespace work.
 
-Status: milestone 4 — the `alacritty` and `firefox` profiles run, with GPU,
-sound, a private home, a filtered session bus, a terminal of their own and a
-seccomp denylist. See "Known gaps" below.
+Status: milestone 4 — a profile library (`alacritty`, `chromium`, `firefox`,
+`libreoffice`, `mpv`, `thunderbird` and `vesktop`, plus a partial `steam`)
+over GPU, sound, a private home, a filtered session bus, a terminal of their
+own and a seccomp denylist. See "Known gaps" below.
 
 ## Usage
 
@@ -285,6 +286,44 @@ instance came from:
 
 Editing an instance never edits the profile, and editing a profile never
 changes an instance that was already seeded from it.
+
+### Built-in profiles
+
+Every one is Wayland-first; none grants `x11`. `~/name` below is a
+`home-share`, read-only unless it says `rw`.
+
+    alacritty     wayland
+    chromium      wayland dri pipewire network dbus portals notify, ~/Downloads rw
+    firefox       wayland dri pipewire pulseaudio network dbus portals notify mpris, ~/Downloads rw
+    generic       nothing beyond the baseline
+    libreoffice   wayland dri dbus portals, ~/Documents rw, SAL_USE_VCLPLUGIN=gtk3
+    mpv           wayland dri pipewire, ~/Videos
+    steam         wayland dri pipewire network dbus portals notify tray gamepad, ~/.steam rw, seccomp disabled — partial
+    thunderbird   wayland network dri dbus portals notify, ~/Downloads rw, MOZ_ENABLE_WAYLAND=1
+    vesktop       wayland dri pipewire network dbus portals notify tray
+
+The toolkit variables are there because bubbler clears the environment, so
+nothing is left for the toolkit to detect: `MOZ_ENABLE_WAYLAND=1` for the
+Mozilla apps and `SAL_USE_VCLPLUGIN=gtk3` for LibreOffice, whose VCL plugin
+would otherwise be chosen by an autodetection with nothing to go on.
+
+`chromium` and `vesktop` keep their own namespace sandbox: it nests inside
+bubbler's, and the setuid helper they would otherwise use simply falls back to
+it, so neither needs `--no-sandbox`. On a kernel with unprivileged user
+namespaces turned off, that nesting is what breaks first.
+
+`steam` is partial, and its own first lines say so. bubbler has no system bus
+service, so UPower and the UDisks2 that Wine looks for are out of reach, and
+`/dev/ntsync`, `/dev/hugepages`, `/dev/fuse` and `/dev/snd` are not bound
+either. Its `seccomp { disable }` is not a preference: the Steam runtime is
+32-bit and bubbler's filter holds one architecture, which kills such a process
+rather than filtering it. A library folder outside the private home needs a
+`path-share` of its own, which the profile carries as a commented example to
+edit.
+
+Opening an arbitrary file from inside — LibreOffice's or Thunderbird's file
+chooser — goes through the portal, and the path it hands back today is one
+bubbler cannot mount (see "Known gaps").
 
 ### Managing profiles and instances
 

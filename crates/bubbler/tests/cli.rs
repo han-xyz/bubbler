@@ -8,6 +8,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use bubbler_core::bwrap::ETC_ALLOWLIST;
+use bubbler_core::profile::NAMES;
 use bubbler_core::seccomp::{DEFAULT_ENOSYS, DEFAULT_EPERM, syscall_number};
 use common::{
     bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, kill_group, real_init, require_bwrap,
@@ -92,10 +93,8 @@ fn profiles_lists_builtins_and_firefox_seeds_gpu_and_toolkit_env() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        "alacritty\nfirefox\ngeneric\n"
-    );
+    let builtins: String = NAMES.iter().map(|n| format!("{n}\n")).collect();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), builtins);
 
     let out = bubbler(tmp.path())
         .args(["create", "ff", "--profile", "firefox"])
@@ -140,24 +139,31 @@ fn profiles_list_every_layer_and_origin_names_the_file() {
     );
     let system = write_profile(tmp.path(), "system", "editor", "wayland\ncommand \"vi\"\n");
 
+    // Every built-in plus the one name only the system layer holds, each
+    // listed once whichever layers carry it.
+    let mut names: Vec<&str> = NAMES.to_vec();
+    names.push("editor");
+    names.sort_unstable();
+
     let out = bubbler(tmp.path()).arg("profiles").output().unwrap();
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "alacritty\neditor\nfirefox\ngeneric\n"
+        names.iter().map(|n| format!("{n}\n")).collect::<String>()
     );
 
     let out = bubbler(tmp.path())
         .args(["profiles", "--origin"])
         .output()
         .unwrap();
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        format!(
-            "alacritty\tbuilt-in\t-\neditor\tsystem\t{}\nfirefox\tuser\t{}\ngeneric\tbuilt-in\t-\n",
-            system.display(),
-            user.display()
-        )
-    );
+    let expected: String = names
+        .iter()
+        .map(|n| match *n {
+            "editor" => format!("editor\tsystem\t{}\n", system.display()),
+            "firefox" => format!("firefox\tuser\t{}\n", user.display()),
+            _ => format!("{n}\tbuilt-in\t-\n"),
+        })
+        .collect();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
 }
 
 #[test]

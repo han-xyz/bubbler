@@ -1,0 +1,10 @@
+// bubbler profile: chromium
+wayland
+dri
+pipewire
+network
+dbus
+portals
+notify
+home-share "Downloads" mode=rw
+command "chromium"
