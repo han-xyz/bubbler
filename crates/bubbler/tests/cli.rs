@@ -1,6 +1,7 @@
 mod common;
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -26,6 +27,22 @@ fn setup() -> tempfile::TempDir {
     // regular file for argv building, which is all a dry run needs.
     std::fs::write(tmp.path().join("bubbler-init"), b"").unwrap();
     tmp
+}
+
+/// Whether this host has the `/dev/ntsync` node the baseline binds. The
+/// kernel module is not loaded everywhere, so both answers are normal.
+fn has_ntsync() -> bool {
+    std::fs::metadata("/dev/ntsync").is_ok_and(|m| m.file_type().is_char_device())
+}
+
+/// The baseline's `/dev/ntsync` bind as `--dry-run` prints it, empty where
+/// the host has no such node.
+fn ntsync_bind() -> &'static str {
+    if has_ntsync() {
+        "--dev-bind\n/dev/ntsync\n/dev/ntsync\n"
+    } else {
+        ""
+    }
 }
 
 #[test]
@@ -60,12 +77,13 @@ fn create_list_and_dry_run() {
          --symlink\nusr/lib64\n/lib64\n--symlink\nusr/bin\n/sbin\n\
          --ro-bind-try\n/opt\n/opt\n--tmpfs\n/etc\n";
     let expected_suffix = format!(
-        "--proc\n/proc\n--dev\n/dev\n--tmpfs\n/tmp\n--tmpfs\n/var\n--tmpfs\n/run\n\
+        "--proc\n/proc\n--dev\n/dev\n{ntsync}--tmpfs\n/tmp\n--tmpfs\n/var\n--tmpfs\n/run\n\
          --bind\n{home}\n/home/bubbler\n--perms\n0700\n--dir\n{run}\n\
          --ro-bind\n{init}\n/run/bubbler-init\n--clearenv\n--setenv\nTERM\ndumb\n\
          --setenv\nHOME\n/home/bubbler\n--setenv\nPATH\n/usr/bin\n--setenv\nXDG_RUNTIME_DIR\n{run}\n\
          --setenv\nUSER\nbubbler\n--setenv\nLOGNAME\nbubbler\n\
          --\n/run/bubbler-init\n--socket-fd\n8\n--\n/usr/bin/true\n",
+        ntsync = ntsync_bind(),
         home = home.display(),
         run = run.display(),
         init = tmp.path().join("bubbler-init").display()
@@ -711,6 +729,114 @@ fn real_bwrap_gamepad_shows_the_host_input_nodes_and_no_uinput() {
         rest.contains("udev"),
         Path::new("/run/udev/data").is_dir(),
         "{stdout}"
+    );
+}
+
+#[test]
+fn real_bwrap_dri_hands_over_the_hosts_nvidia_stack() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    if !Path::new("/dev/nvidiactl").exists() {
+        eprintln!("skipping: this host has no NVIDIA device nodes");
+        return;
+    }
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "dri\n").unwrap();
+
+    let out = bubbler_live(tmp.path(), &init)
+        .args([
+            "run",
+            "t",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            "ls -1 /dev | grep '^nvidia'; echo ---; cat /sys/module/nvidia/initstate; \
+             command -v nvidia-smi >/dev/null && { nvidia-smi -L || echo NVML-FAILED; }; true",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (listing, rest) = stdout
+        .split_once("---\n")
+        .unwrap_or_else(|| panic!("{stdout}"));
+
+    // Every char device, and only those: `/dev/nvidia-caps` holds MIG
+    // capability files, which nothing outside MIG reads. The listing is
+    // taken before nvidia-smi runs, because NVML creates that directory
+    // for itself inside the sandbox's own `/dev` tmpfs.
+    let mut host: Vec<String> = std::fs::read_dir("/dev")
+        .unwrap()
+        .map(|e| e.unwrap())
+        .filter(|e| {
+            e.file_name().to_string_lossy().starts_with("nvidia")
+                && e.file_type().unwrap().is_char_device()
+        })
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    let mut inside: Vec<String> = listing.lines().map(str::to_owned).collect();
+    inside.sort_unstable();
+    host.sort_unstable();
+    assert_eq!(inside, host, "{stdout}");
+    assert!(!inside.iter().any(|n| n == "nvidia-caps"), "{stdout}");
+
+    // What libnvidia-glvnd and NVML gate on; without it both take the Mesa
+    // fallback instead.
+    assert!(rest.starts_with("live\n"), "{stdout}");
+    assert!(!rest.contains("NVML-FAILED"), "{stdout}");
+    if Command::new("nvidia-smi")
+        .arg("-L")
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        assert!(rest.contains("GPU 0:"), "{stdout}");
+    }
+}
+
+#[test]
+fn real_bwrap_ntsync_is_bound_exactly_where_the_host_has_it() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["run", "t", "--dry-run", "--", "/usr/bin/true"])
+        .output()
+        .unwrap();
+    let argv = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(argv.contains("/dev/ntsync"), has_ntsync(), "{argv}");
+
+    let out = bubbler_live(tmp.path(), &init)
+        .args([
+            "run",
+            "t",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            "test -c /dev/ntsync && echo ntsync; true",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).contains("ntsync"),
+        has_ntsync(),
+        "a sandbox gets the node when the host has it, and nothing when it does not"
     );
 }
 

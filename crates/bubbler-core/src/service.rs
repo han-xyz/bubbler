@@ -252,9 +252,10 @@ fn x11(env: &Env, args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchErr
     Ok(())
 }
 
-/// GPU access: `/dev/dri`, bound read-write because bwrap has no
-/// read-only device bind, plus the `/sys` paths a userspace driver reads;
-/// a PCI root exposes every PCI device's attributes, not only the GPU's.
+/// GPU access: `/dev/dri` and whichever NVIDIA nodes the host has, bound
+/// read-write because bwrap has no read-only device bind, plus the `/sys`
+/// paths a userspace driver reads; a PCI root exposes every PCI device's
+/// attributes, not only the GPU's.
 fn dri(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
     // Paths from Arch wiki Bubblewrap/Examples and bubblejail
     // `direct_rendering`; PCI roots are enumerated so no unrelated
@@ -282,6 +283,38 @@ fn dri(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
             service: "dri",
             path: devices.join("pci*"),
         });
+    }
+    // The NVIDIA nodes are created by the setuid `nvidia-modprobe` a udev
+    // rule runs, and a sandbox has `NoNewPrivs` set, so a node missing at
+    // launch can never appear later: bind what the host has, fail over
+    // nothing. The char-device check keeps the `/dev/nvidia-caps`
+    // directory out: those are MIG capability files, and nothing outside
+    // MIG reads them.
+    // `file_type` follows symlinks, but `/dev` and `/sys/module` are
+    // root-owned, so a `nvidia*` symlink there is the host's decision.
+    let dev_dir = Path::new("/dev");
+    for name in host.list_dir(dev_dir) {
+        if !name.as_encoded_bytes().starts_with(b"nvidia") {
+            continue;
+        }
+        let p = dev_dir.join(&name);
+        if host.file_type(&p).is_some_and(|t| t.is_char_device()) {
+            args.dev_bind(&p, &p);
+        }
+    }
+    // libnvidia-glvnd and NVML read `/sys/module/nvidia/initstate` and fall
+    // back to Mesa when it is missing (verified on driver 610). The other
+    // `nvidia_*` module directories cost nothing and are what bubblejail
+    // binds for CUDA.
+    let modules = Path::new("/sys/module");
+    for name in host.list_dir(modules) {
+        if !name.as_encoded_bytes().starts_with(b"nvidia") {
+            continue;
+        }
+        let p = modules.join(&name);
+        if host.file_type(&p).is_some_and(|t| t.is_dir()) {
+            args.ro_bind(&p, &p);
+        }
     }
     Ok(())
 }
@@ -672,9 +705,10 @@ mod tests {
         Sock,
         File,
         Dir,
+        Char,
     }
 
-    use Kind::{Dir, File, Sock};
+    use Kind::{Char, Dir, File, Sock};
 
     fn env() -> Env {
         Env {
@@ -730,6 +764,7 @@ mod tests {
                     Sock => sock,
                     File => file,
                     Dir => dir,
+                    Char => fake::char_dev(),
                 },
             );
         }
@@ -754,6 +789,20 @@ mod tests {
     fn has_seq(argv: &[String], seq: &[&str]) -> bool {
         argv.windows(seq.len())
             .any(|w| w.iter().map(String::as_str).eq(seq.iter().copied()))
+    }
+
+    /// The service binds alone (phase 4): what lies between the runtime
+    /// directory of phase 3 and the `--clearenv` that opens phase 5.
+    fn binds(argv: &[String]) -> Vec<&str> {
+        let dir = argv
+            .iter()
+            .position(|a| a == "--dir")
+            .expect("phase 3 always emits --dir");
+        let env = argv
+            .iter()
+            .position(|a| a == "--clearenv")
+            .expect("phase 5 always opens with --clearenv");
+        argv[dir + 2..env].iter().map(String::as_str).collect()
     }
 
     #[test]
@@ -1563,6 +1612,108 @@ mod tests {
         ));
         assert!(!a.contains(&"/sys/devices/virtual".to_string()));
         assert!(!a.contains(&"/sys/devices".to_string()));
+    }
+
+    #[test]
+    fn dri_binds_the_nvidia_nodes_and_the_module_directories() {
+        let a = argv(
+            &[Service::Dri],
+            &env(),
+            &[
+                ("/dev/dri", Dir),
+                ("/sys/dev/char", Dir),
+                ("/sys/devices/system/cpu", Dir),
+                ("/sys/devices/pci0000:00", Dir),
+                ("/dev/nvidia0", Char),
+                ("/dev/nvidiactl", Char),
+                ("/dev/nvidia-modeset", Char),
+                ("/dev/nvidia-uvm", Char),
+                ("/dev/nvidia-uvm-tools", Char),
+                ("/dev/nvidia-caps", Dir),
+                ("/sys/module/nvidia", Dir),
+                ("/sys/module/nvidia_drm", Dir),
+                ("/sys/module/nvidia_uvm", Dir),
+                ("/sys/module/amdgpu", Dir),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            binds(&a),
+            vec![
+                "--dev-bind",
+                "/dev/dri",
+                "/dev/dri",
+                "--ro-bind",
+                "/sys/dev/char",
+                "/sys/dev/char",
+                "--ro-bind",
+                "/sys/devices/system/cpu",
+                "/sys/devices/system/cpu",
+                "--ro-bind",
+                "/sys/devices/pci0000:00",
+                "/sys/devices/pci0000:00",
+                "--dev-bind",
+                "/dev/nvidia-modeset",
+                "/dev/nvidia-modeset",
+                "--dev-bind",
+                "/dev/nvidia-uvm",
+                "/dev/nvidia-uvm",
+                "--dev-bind",
+                "/dev/nvidia-uvm-tools",
+                "/dev/nvidia-uvm-tools",
+                "--dev-bind",
+                "/dev/nvidia0",
+                "/dev/nvidia0",
+                "--dev-bind",
+                "/dev/nvidiactl",
+                "/dev/nvidiactl",
+                "--ro-bind",
+                "/sys/module/nvidia",
+                "/sys/module/nvidia",
+                "--ro-bind",
+                "/sys/module/nvidia_drm",
+                "/sys/module/nvidia_drm",
+                "--ro-bind",
+                "/sys/module/nvidia_uvm",
+                "/sys/module/nvidia_uvm",
+            ],
+            "the /dev/nvidia-caps directory and unrelated module directories stay out"
+        );
+    }
+
+    #[test]
+    fn dri_adds_nothing_on_a_host_without_the_nvidia_stack() {
+        let a = argv(
+            &[Service::Dri],
+            &env(),
+            &[
+                ("/dev/dri", Dir),
+                ("/sys/dev/char", Dir),
+                ("/sys/devices/system/cpu", Dir),
+                ("/sys/devices/pci0000:00", Dir),
+                ("/sys/module/amdgpu", Dir),
+                // A directory named like a node is not one.
+                ("/dev/nvidia-caps", Dir),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            binds(&a),
+            vec![
+                "--dev-bind",
+                "/dev/dri",
+                "/dev/dri",
+                "--ro-bind",
+                "/sys/dev/char",
+                "/sys/dev/char",
+                "--ro-bind",
+                "/sys/devices/system/cpu",
+                "/sys/devices/system/cpu",
+                "--ro-bind",
+                "/sys/devices/pci0000:00",
+                "/sys/devices/pci0000:00",
+            ]
+        );
     }
 
     #[test]

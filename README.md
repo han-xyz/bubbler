@@ -103,7 +103,7 @@ file order does not affect the generated argv.
     wayland                          # the host Wayland socket
     x11                              # X socket and Xauthority
     network                          # network namespace shared, plus /etc/resolv.conf
-    dri                              # GPU: /dev/dri and the PCI devices' sysfs
+    dri                              # GPU: /dev/dri, NVIDIA nodes, the PCI devices' sysfs
     pipewire                         # $XDG_RUNTIME_DIR/pipewire-0
     pulseaudio                       # $XDG_RUNTIME_DIR/pulse/native, sets PULSE_SERVER
     gamepad                          # /dev/input, and the sysfs that names it
@@ -152,6 +152,23 @@ device on the machine, not just the GPU. `pipewire` and `pulseaudio` hand the
 sandbox the session's audio socket directly, which is capture as well as
 playback: everything the session exposes, including the microphone, with no
 portal in between.
+
+`dri` also hands over the proprietary NVIDIA stack where the host has it:
+every `/dev/nvidia*` char device with device access, and every
+`/sys/module/nvidia*` directory read-only. NVML and libglvnd read
+`/sys/module/nvidia/initstate` and fall back to Mesa without it. All of it is
+emitted only when it exists — the nodes are made by the setuid
+`nvidia-modprobe` a udev rule runs, which a sandbox can never do for itself,
+so a node missing at launch stays missing. The `/dev/nvidia-caps` directory
+is not bound: those are MIG capability files, which nothing outside MIG reads
+(`nvidia-cap1` is root-only, `nvidia-cap2` is world-readable).
+`/proc/driver/nvidia` needs no bind, the baseline `--proc` already shows it.
+`dri` sets no environment: `DRI_PRIME`, `__NV_PRIME_RENDER_OFFLOAD`,
+`__GLX_VENDOR_LIBRARY_NAME` and their kind pick a GPU on a hybrid machine,
+which is a profile's `env` decision, not a service's. Compute is one gap:
+`/etc/OpenCL` and `/etc/nvidia` are not in the `/etc` allowlist, so OpenCL
+needs `etc-share "OpenCL"` and the NVIDIA application profiles need
+`etc-share "nvidia"`.
 
 `gamepad` binds `/dev/input` with device access and `/sys/class/input`,
 `/sys/devices` and `/run/udev` (when the host has it) read-only, which is
@@ -321,10 +338,10 @@ namespaces turned off, that nesting is what breaks first.
 
 `steam` is partial, and its own first lines say so. bubbler has no system bus
 service, so UPower and the UDisks2 that Wine looks for are out of reach, and
-`/dev/ntsync`, `/dev/hugepages`, `/dev/fuse` and `/dev/snd` are not bound
-either. Its `seccomp { disable }` is not a preference: the Steam runtime is
-32-bit and bubbler's filter holds one architecture, which kills such a process
-rather than filtering it. A library folder outside the private home needs a
+`/dev/hugepages`, `/dev/fuse` and `/dev/snd` are not bound either. Its
+`seccomp { disable }` is not a preference: the Steam runtime is 32-bit and
+bubbler's filter holds one architecture, which kills such a process rather
+than filtering it. A library folder outside the private home needs a
 `path-share` of its own, which the profile carries as a commented example to
 edit.
 
@@ -617,15 +634,25 @@ the working directory, and a cleared environment (only the locale and terminal
 variables — `TERM`, `LANG`, `LANGUAGE`, `COLORTERM`, `TZ`, `LC_*` — are
 carried over). Grants only add to that.
 
+`/dev/ntsync` is bound too, on a host that has the node — the one device the
+baseline hands over, and a deliberate widening of it. It is the kernel's
+Windows-style synchronisation primitive (`drivers/misc/ntsync`, kernel 6.14 and
+later), which Wine and Proton fall back to much slower sync without, and the
+objects made through it belong to the process that opened it, so there is no
+host state behind it to leak. The tradeoff is that every sandbox, not only a
+gaming one, gets that driver's ioctl surface to reach; flatpak makes the same
+trade and binds it with no permission of its own. A kernel without the module
+loaded simply has no node, and then nothing is bound.
+
 `/etc` is an allowlist over a tmpfs: only the entries in `ETC_ALLOWLIST`
 (`crates/bubbler-core/src/bwrap.rs`) are bound, and only those that exist on
 the host — `ld.so.cache`, `ld.so.conf`, `ld.so.conf.d`, `fonts`, `localtime`,
 `machine-id`, `nsswitch.conf`, `hosts`, `host.conf`, `ssl`, `ca-certificates`,
 `mime.types`, `xdg`, `gtk-3.0`, `gtk-4.0`, `pulse`, `pipewire`, `drirc`,
-`vulkan`, `glvnd`, `egl`, `os-release`. `passwd` and `group` are generated:
-the sandbox sees the user `bubbler` (holding the host's uid and gid) and
-`nobody`, never the host's accounts, and `USER` and `LOGNAME` are `bubbler`
-as well.
+`vulkan`, `glvnd`, `egl`, `vdpau_wrapper.cfg`, `os-release`. `passwd` and
+`group` are generated: the sandbox sees the user `bubbler` (holding the host's
+uid and gid) and `nobody`, never the host's accounts, and `USER` and `LOGNAME`
+are `bubbler` as well.
 
 `x11` remaps any Xauthority file to `/home/bubbler/.Xauthority`, but it stays
 a compatibility grant: X11 offers no isolation between clients. Sockets and
@@ -644,7 +671,10 @@ binding the tree under it.
   under "Terminal".
 - The seccomp filter holds one architecture, so 32-bit binaries inside are
   killed rather than filtered; see "Seccomp".
-- No proprietary nvidia driver; `dri` covers the open stack.
+- AMD compute (ROCm/OpenCL via `/dev/kfd`) is not supported yet; it needs its
+  sysfs topology alongside the node.
+- `dri` binds the NVIDIA device nodes but not `/etc/OpenCL` or `/etc/nvidia`,
+  so compute and vendor application profiles need an `etc-share` of their own.
 - `gamepad` grants no `/dev/hidraw*`, so a controller SDL would drive through
   hidapi falls back to evdev; `SDL_JOYSTICK_HIDAPI=0` makes that explicit.
 - `/etc/machine-id` is bound in, so every instance shares one stable

@@ -112,4 +112,10 @@ pub(crate) mod fake {
         let t = |n: &str| std::fs::metadata(tmp.path().join(n)).unwrap().file_type();
         (t("f"), t("d"), t("s"))
     }
+
+    /// A char-device `FileType`, taken from `/dev/null`: creating a device
+    /// node needs privileges the tests do not have.
+    pub fn char_dev() -> FileType {
+        std::fs::metadata("/dev/null").unwrap().file_type()
+    }
 }
