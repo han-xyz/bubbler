@@ -732,6 +732,162 @@ fn real_bwrap_gamepad_shows_the_host_input_nodes_and_no_uinput() {
     );
 }
 
+/// Host `/dev` entries named `hidraw*` that really are character
+/// devices, sorted: what the `hidraw` property is expected to bind.
+fn host_hidraw_nodes() -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir("/dev")
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with("hidraw"))
+                .filter(|e| {
+                    e.file_type()
+                        .is_ok_and(|t| std::os::unix::fs::FileTypeExt::is_char_device(&t))
+                })
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort_unstable();
+    names
+}
+
+#[test]
+fn real_bwrap_gamepad_hidraw_shows_the_host_hidraw_nodes() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    if !Path::new("/dev/input").is_dir() {
+        eprintln!("skipping: this host has no /dev/input directory");
+        return;
+    }
+    let host = host_hidraw_nodes();
+    if host.is_empty() {
+        eprintln!("skipping: this host has no /dev/hidraw* nodes");
+        return;
+    }
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "gamepad hidraw=#true\n").unwrap();
+
+    let out = bubbler_live(tmp.path(), &init)
+        .args([
+            "run",
+            "t",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            "ls -1 /dev | grep '^hidraw'; echo ---; test -d /sys/class/hidraw && echo sysfs; true",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (listing, rest) = stdout
+        .split_once("---\n")
+        .unwrap_or_else(|| panic!("{stdout}"));
+    let mut inside: Vec<String> = listing.lines().map(str::to_owned).collect();
+    inside.sort_unstable();
+    assert_eq!(inside, host, "{stdout}");
+    assert_eq!(
+        rest.contains("sysfs"),
+        Path::new("/sys/class/hidraw").is_dir(),
+        "{stdout}"
+    );
+
+    // Without the property the same host nodes stay outside.
+    std::fs::write(&cfg, "gamepad\n").unwrap();
+    let out = bubbler_live(tmp.path(), &init)
+        .args([
+            "run",
+            "t",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            "ls -1 /dev | grep -c '^hidraw' || true",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0");
+}
+
+#[test]
+fn real_bwrap_gamepad_uinput_binds_the_node_and_says_so() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    if !Path::new("/dev/input").is_dir() || !Path::new("/dev/uinput").exists() {
+        eprintln!("skipping: this host has no /dev/input directory or no /dev/uinput");
+        return;
+    }
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "gamepad uinput=#true\n").unwrap();
+
+    let out = bubbler_live(tmp.path(), &init)
+        .args([
+            "run",
+            "t",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            "test -c /dev/uinput && echo injection",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "injection\n");
+    // A grant this wide is never a quiet one.
+    assert!(err.contains("uinput"), "{err}");
+}
+
+#[test]
+fn real_bwrap_userns_disable_stops_a_nested_user_namespace() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    if !Path::new("/usr/bin/unshare").is_file() {
+        eprintln!("skipping: this host has no /usr/bin/unshare");
+        return;
+    }
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    let probe = "/usr/bin/unshare -U /usr/bin/true 2>/dev/null && echo NESTED || echo REFUSED";
+    let run = |text: &str| {
+        std::fs::write(&cfg, text).unwrap();
+        let out = bubbler_live(tmp.path(), &init)
+            .args(["run", "t", "--", "/usr/bin/sh", "-c", probe])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    // The default keeps bwrap's own semantics: a nested user namespace,
+    // which Steam's pressure-vessel and a browser's inner sandbox need.
+    assert_eq!(run(""), "NESTED\n");
+    assert_eq!(run("userns \"disable\"\n"), "REFUSED\n");
+}
+
 #[test]
 fn real_bwrap_dri_hands_over_the_hosts_nvidia_stack() {
     if !require_bwrap() {

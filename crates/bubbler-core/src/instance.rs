@@ -175,7 +175,10 @@ fn grant_service(name: &str) -> Option<Service> {
         "portals" => Service::Portals,
         "notify" => Service::Notify,
         "tray" => Service::Tray,
-        "gamepad" => Service::Gamepad,
+        "gamepad" => Service::Gamepad {
+            hidraw: false,
+            uinput: false,
+        },
         _ => return None,
     })
 }
@@ -192,6 +195,12 @@ fn with_grants(cfg: &mut InstanceConfig, grants: &[&str]) -> Result<(), Instance
                 .services
                 .iter()
                 .any(|s| matches!(s, Service::Dbus { .. })),
+            // A `gamepad` already in the config may carry properties this
+            // bare grant does not, and the parser takes one node only.
+            Service::Gamepad { .. } => cfg
+                .services
+                .iter()
+                .any(|s| matches!(s, Service::Gamepad { .. })),
             other => cfg.services.contains(other),
         };
         if !held {
@@ -753,7 +762,10 @@ mod tests {
         drop(eph);
         let eph = Instance::ephemeral(&env, "generic", &["gamepad", "dbus", "tray"]).unwrap();
         let services = &eph.instance.config.services;
-        assert!(services.contains(&Service::Gamepad));
+        assert!(services.contains(&Service::Gamepad {
+            hidraw: false,
+            uinput: false
+        }));
         assert!(services.contains(&Service::Tray));
         drop(eph);
         // A bundle grant without `dbus` is rejected by the parser as
@@ -765,6 +777,23 @@ mod tests {
             ));
         }
         assert!(!try_root(&env).exists() || try_root(&env).read_dir().unwrap().next().is_none());
+    }
+
+    #[test]
+    fn a_grant_the_config_already_made_keeps_its_properties() {
+        // The parser takes one `gamepad` node, so a bare grant on top of
+        // a node carrying properties must leave that node alone rather
+        // than add a second, narrower one.
+        let mut cfg = config::parse("gamepad hidraw=#true").unwrap();
+        with_grants(&mut cfg, &["gamepad"]).unwrap();
+        assert_eq!(
+            cfg.services,
+            vec![Service::Gamepad {
+                hidraw: true,
+                uinput: false
+            }]
+        );
+        assert_eq!(kdl_out::render(&cfg).unwrap(), "gamepad hidraw=#true\n");
     }
 
     #[test]
