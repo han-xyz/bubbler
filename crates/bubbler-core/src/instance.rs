@@ -163,6 +163,19 @@ fn with_grants(cfg: &mut InstanceConfig, grants: &[&str]) -> Result<(), Instance
     Ok(())
 }
 
+/// What a `config.kdl` holds when its profile grants nothing: the same
+/// examples the `generic` profile is written with. A flattened profile
+/// keeps no comments, so without this `bubbler edit` on a fresh instance
+/// would open a file holding only its header.
+const STARTER: &str = "\
+// Baseline sandbox only. Add grants below, e.g.:
+//   wayland
+//   network
+//   home-share \"Downloads\"
+// and a default command:
+//   command \"foot\"
+";
+
 /// The flattened profile as the text a new instance's `config.kdl` holds:
 /// a header naming the profile it came from, then the canonical KDL of the
 /// merged result plus one bare node per grant. The text is parsed back, so
@@ -174,12 +187,15 @@ fn seed(
 ) -> Result<(String, InstanceConfig), InstanceError> {
     let mut cfg = profile::Resolver::new(env).resolve(profile_name)?.config;
     with_grants(&mut cfg, grants)?;
+    let rendered = kdl_out::render(&cfg)?;
+    let body = if rendered.is_empty() {
+        STARTER
+    } else {
+        rendered.as_str()
+    };
     // The name passed the profile name grammar to resolve at all, so it
     // holds no newline that could end the header comment early.
-    let text = format!(
-        "// bubbler profile: {profile_name}\n{}",
-        kdl_out::render(&cfg)?
-    );
+    let text = format!("// bubbler profile: {profile_name}\n{body}");
     let config = config::parse(&text)?;
     Ok((text, config))
 }
@@ -685,6 +701,23 @@ mod tests {
         assert_eq!(config::parse(&text).unwrap(), inst.config);
         // What was written is what a later `open` sees.
         assert_eq!(Instance::open(&env, "ff").unwrap().config, inst.config);
+    }
+
+    #[test]
+    fn a_profile_that_grants_nothing_is_seeded_with_the_starter_comments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = env(tmp.path());
+        // `generic` flattens to no nodes, so the file would otherwise hold
+        // its header and nothing an editor could work from.
+        let inst = Instance::create(&env, "g", "generic").unwrap();
+        let text = fs::read_to_string(inst.config_path()).unwrap();
+        assert!(text.contains("//   home-share \"Downloads\""), "{text}");
+        assert_eq!(config::parse(&text).unwrap(), InstanceConfig::default());
+
+        // A profile with a node of its own is written as itself.
+        let inst = Instance::create(&env, "ff", "firefox").unwrap();
+        let text = fs::read_to_string(inst.config_path()).unwrap();
+        assert!(!text.contains("//   home-share"), "{text}");
     }
 
     #[test]

@@ -218,22 +218,28 @@ reach a file outside those two directories.
     env MOZ_ENABLE_WAYLAND="0"
 
 `include "<own name>"` resolves at the *next layer down*, which is how a
-profile of yours extends the shipped one instead of forking it. Includes may
-nest 8 deep, they resolve depth first before the including file's own nodes,
-and a chain that comes back to a file it already read is an error naming the
-chain.
+profile of yours extends the shipped one instead of forking it; in the last
+layer that holds the name there is nothing below it, and that is an error.
+Includes may nest 8 deep, they resolve depth first before the including
+file's own nodes, and a chain that comes back to a file it already read is an
+error naming the chain. A layer that two includes both reach is read and
+merged once, where it is first reached, so a diamond grants exactly what a
+single chain through it would.
 
 Merging is by node: grants are unioned, identical share nodes collapse, and
-the same `home-share` path in two modes is an error rather than a silent
-choice of `ro` or `rw`. `command`, `tty` and `mpris` from the including file
+the same `home-share` or `path-share` path in two modes is an error rather
+than a silent choice of `ro` or `rw`. `command`, `tty` and `mpris` from the including file
 replace the included one, `env` replaces by key, `dbus` rules and `seccomp`
 lists are unioned, and `seccomp { disable }` in any layer disables the
 filter. `portals`, `notify` and `mpris` need `dbus` in the merged result, not
 in every layer, so a layer may add `notify` to a `dbus` it includes.
 
 `create` and `try` write the flattened result, so `config.kdl` is one screen
-that says everything the sandbox will be granted. Its first line records
-where it came from:
+that says everything the sandbox will be granted. Flattening keeps no
+comments, so a profile that grants nothing — `generic` — is seeded as the
+same commented examples it is written with, and `bubbler edit` on a fresh
+instance has something to start from. The first line records where the
+instance came from:
 
     // bubbler profile: firefox
 

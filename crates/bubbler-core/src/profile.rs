@@ -243,9 +243,12 @@ impl Resolver {
         acc: &mut Merged,
         chain: &mut Vec<LayerId>,
     ) -> Result<(), ProfileError> {
-        let Some(layer) = self.lookup(name)?.into_iter().nth(skip) else {
+        let layers = self.lookup(name)?;
+        let below = layers.len().saturating_sub(skip + 1);
+        let Some(layer) = layers.into_iter().nth(skip) else {
             return Err(ProfileError::NotFound(name.to_owned()));
         };
+        let label = layer.label(name);
         let id = match &layer.path {
             Some(p) => LayerId::File(p.clone()),
             None => LayerId::BuiltIn(name.to_owned()),
@@ -264,7 +267,7 @@ impl Resolver {
             return Err(ProfileError::TooDeep(chain_labels(chain, &id)));
         }
         let raw = config::parse_profile(&layer.text).map_err(|source| ProfileError::Parse {
-            origin: layer.label(name),
+            origin: label.clone(),
             source,
         })?;
         chain.push(id);
@@ -272,13 +275,22 @@ impl Resolver {
             // `include "<own name>"` names the layer below this one, which
             // is how a user profile extends the built-in of the same name
             // instead of forking it.
-            let below = if inc == name { skip + 1 } else { 0 };
-            self.expand(inc, below, acc, chain)?;
+            if inc != name {
+                self.expand(inc, 0, acc, chain)?;
+                continue;
+            }
+            // Saying so beats `NotFound` on a name the file itself has:
+            // the profile exists, it is this layer, and there is nothing
+            // under it to extend.
+            if below == 0 {
+                return Err(ProfileError::SelfIncludeAtBottom(label));
+            }
+            self.expand(inc, skip + 1, acc, chain)?;
         }
         let src = Src {
             origin: layer.origin,
             path: layer.path.clone(),
-            label: layer.label(name),
+            label,
         };
         acc.merge(&raw, &src)?;
         if let Some(id) = chain.pop() {
@@ -376,20 +388,18 @@ impl Merged {
 
     /// Add one grant. Repeats of the same grant collapse; a share of the
     /// same path in two modes is a conflict rather than a silent choice.
+    /// Every variant is listed: a new grant must be given a merge rule
+    /// here, since collapsing one that carries a mode would pick a
+    /// privilege level nobody wrote.
     fn add_service(&mut self, svc: &Service, src: &Src) -> Result<(), ProfileError> {
         match svc {
-            Service::HomeShare { path, mode } => {
-                if let Some((held_mode, held_src)) =
-                    self.services.iter().find_map(|(s, src)| match s {
-                        Service::HomeShare { path: p, mode: m } if p == path => Some((*m, src)),
-                        _ => None,
-                    })
-                {
-                    if held_mode != *mode {
-                        let node =
-                            kdl_out::service(svc).unwrap_or_else(|_| "home-share".to_owned());
-                        return Err(mode_conflict(&node, held_mode, held_src, *mode, src));
-                    }
+            Service::HomeShare { .. } => {
+                if self.holds_share(svc, src, "home-share", home_share)? {
+                    return Ok(());
+                }
+            }
+            Service::PathShare { .. } => {
+                if self.holds_share(svc, src, "path-share", path_share)? {
                     return Ok(());
                 }
             }
@@ -420,7 +430,15 @@ impl Merged {
                     return Ok(());
                 }
             }
-            _ => {
+            Service::Wayland
+            | Service::X11
+            | Service::Network
+            | Service::Dri
+            | Service::Pipewire
+            | Service::Pulseaudio
+            | Service::Portals
+            | Service::Notify
+            | Service::EtcShare { .. } => {
                 if self.services.iter().any(|(s, _)| s == svc) {
                     return Ok(());
                 }
@@ -428,6 +446,35 @@ impl Merged {
         }
         self.services.push((svc.clone(), src.clone()));
         Ok(())
+    }
+
+    /// Whether a share of the same kind and path is already merged, after
+    /// checking the two modes agree. `same` selects the shares of one
+    /// kind, so `home-share "x"` is never measured against
+    /// `path-share "/x"`; `name` names the node when its path is not text
+    /// a KDL file could hold.
+    fn holds_share(
+        &self,
+        svc: &Service,
+        src: &Src,
+        name: &str,
+        same: fn(&Service) -> Option<(&Path, ShareMode)>,
+    ) -> Result<bool, ProfileError> {
+        let Some((path, mode)) = same(svc) else {
+            return Ok(false);
+        };
+        let held = self
+            .services
+            .iter()
+            .find_map(|(s, s_src)| same(s).filter(|&(p, _)| p == path).map(|(_, m)| (m, s_src)));
+        let Some((held_mode, held_src)) = held else {
+            return Ok(false);
+        };
+        if held_mode != mode {
+            let node = kdl_out::service(svc).unwrap_or_else(|_| name.to_owned());
+            return Err(mode_conflict(&node, held_mode, held_src, mode, src));
+        }
+        Ok(true)
     }
 
     /// The flattened profile: its config, its canonical KDL, and where
@@ -479,6 +526,22 @@ impl Merged {
                 })
                 .collect(),
         })
+    }
+}
+
+/// The path and mode of a `home-share` node, and nothing else.
+fn home_share(s: &Service) -> Option<(&Path, ShareMode)> {
+    match s {
+        Service::HomeShare { path, mode } => Some((path, *mode)),
+        _ => None,
+    }
+}
+
+/// The path and mode of a `path-share` node, and nothing else.
+fn path_share(s: &Service) -> Option<(&Path, ShareMode)> {
+    match s {
+        Service::PathShare { path, mode } => Some((path, *mode)),
+        _ => None,
     }
 }
 
@@ -653,9 +716,15 @@ mod tests {
             .find(|o| o.node == "wayland")
             .unwrap();
         assert_eq!(wayland.origin, Origin::BuiltIn);
-        // Self-include at the deepest layer has nothing below it.
+        // Self-include at the deepest layer has nothing below it, and
+        // says that rather than calling a profile that exists unknown.
         let r = resolver(tmp.path(), &[("solo", "include \"solo\"\n")], &[]);
-        assert!(matches!(r.resolve("solo"), Err(ProfileError::NotFound(n)) if n == "solo"));
+        let err = r.resolve("solo").unwrap_err();
+        let ProfileError::SelfIncludeAtBottom(origin) = &err else {
+            panic!("{err:?}")
+        };
+        assert!(origin.ends_with("solo.kdl"), "{origin}");
+        assert!(err.to_string().contains("has no layer below"), "{err}");
     }
 
     #[test]
@@ -726,11 +795,13 @@ mod tests {
             tmp.path(),
             &[(
                 "a",
-                "include \"b\"\nwayland\nhome-share \"D\"\nhome-share \"E\" mode=rw\netc-share \"vulkan\"\n",
+                "include \"b\"\nwayland\nhome-share \"D\"\nhome-share \"E\" mode=rw\n\
+                 path-share \"/kioxia/Steam\"\netc-share \"vulkan\"\n",
             )],
             &[(
                 "b",
-                "wayland\nnetwork\nhome-share \"D\"\nhome-share \"E\" mode=rw\netc-share \"vulkan\"\n",
+                "wayland\nnetwork\nhome-share \"D\"\nhome-share \"E\" mode=rw\n\
+                 path-share \"/kioxia/Steam\"\netc-share \"vulkan\"\n",
             )],
         );
         let cfg = r.resolve("a").unwrap().config;
@@ -746,6 +817,10 @@ mod tests {
                 Service::HomeShare {
                     path: "E".into(),
                     mode: ShareMode::ReadWrite
+                },
+                Service::PathShare {
+                    path: "/kioxia/Steam".into(),
+                    mode: ShareMode::ReadOnly
                 },
                 Service::EtcShare {
                     name: "vulkan".into()
@@ -765,6 +840,22 @@ mod tests {
         assert_eq!(node, "home-share \"D\" mode=rw");
         assert!(a.contains("mode=ro") && a.contains("b.kdl"), "{a}");
         assert!(b.contains("mode=rw") && b.contains("a.kdl"), "{b}");
+
+        // `path-share` carries a mode too, so it needs the same rule: a
+        // layer that collapsed the pair would hand out `rw` or take it
+        // away, and neither is what either file asked for.
+        let r = resolver(
+            tmp.path(),
+            &[("a", "include \"b\"\npath-share \"/kioxia/Steam\"\n")],
+            &[("b", "path-share \"/kioxia/Steam\" mode=rw\n")],
+        );
+        let err = r.resolve("a").unwrap_err();
+        let ProfileError::Conflict { node, a, b } = &err else {
+            panic!("{err:?}")
+        };
+        assert_eq!(node, "path-share \"/kioxia/Steam\"");
+        assert!(a.contains("mode=rw") && a.contains("b.kdl"), "{a}");
+        assert!(b.contains("mode=ro") && b.contains("a.kdl"), "{b}");
     }
 
     #[test]

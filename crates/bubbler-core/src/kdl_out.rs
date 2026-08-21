@@ -212,6 +212,8 @@ mod tests {
             pulseaudio
             home-share "Downloads"
             home-share "Projects/x" mode=rw
+            path-share "/kioxia/Steam"
+            path-share "/mnt/data" mode=rw
             etc-share "vulkan"
             dbus {
                 see "org.freedesktop.ScreenSaver"

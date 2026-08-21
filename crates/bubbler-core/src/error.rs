@@ -61,6 +61,12 @@ pub enum ProfileError {
         #[source]
         source: ConfigError,
     },
+    /// `include "<own name>"` in the last layer that holds the name: the
+    /// include asks for the layer below, and there is none. Distinct from
+    /// [`ProfileError::NotFound`], which would name a profile that plainly
+    /// exists.
+    #[error("`{0}`: include of its own name has no layer below")]
+    SelfIncludeAtBottom(String),
     /// Two layers grant the same path in ways that cannot both hold.
     /// Taking either silently would be a privilege change nobody wrote.
     #[error("`{node}` is granted as {a} and as {b}")]
