@@ -60,6 +60,7 @@ pub fn apply_all(
             Service::Pipewire => pipewire(env, args, host)?,
             Service::Pulseaudio => pulseaudio(env, args, host)?,
             Service::EtcShare { name } => etc_share(args, host, name)?,
+            Service::AppRuntime { id, mode } => app_runtime(env, args, id, *mode),
             Service::Dbus { .. } => dbus_socket(env, args, ctx),
             Service::SystemBus { .. } => system_bus_socket(args, ctx),
             Service::Portals => portals(args, ctx)?,
@@ -935,6 +936,32 @@ fn etc_share(args: &mut BwrapArgs, host: &dyn Host, name: &OsStr) -> Result<(), 
     let src = confine(host, "etc-share", etc, &dst, "/etc")?;
     args.ro_bind(&src, &dst);
     Ok(())
+}
+
+/// Where one `app-runtime` id's directory lives, on the host and inside
+/// the sandbox alike. The same path on both sides is the whole point:
+/// KeePassXC, and every other user of the convention, computes
+/// `$XDG_RUNTIME_DIR/app/<id>` from its own environment and would look
+/// somewhere else if bubbler moved it.
+pub(crate) fn app_runtime_dir(env: &Env, id: &str) -> PathBuf {
+    env.runtime_dir.join("app").join(id)
+}
+
+/// Bind the shared directory of one application id at that same path.
+/// Only the leaf is bound, never `app/` and never the runtime directory,
+/// so no id reaches another one's directory or `bubbler/`, where every
+/// instance's control socket is.
+///
+/// The source is not probed here: the launcher creates it and checks it
+/// with `O_NOFOLLOW` right before the sandbox starts, which is the only
+/// order in which the check means anything. Nothing is probed on a
+/// `--dry-run` either, where no directory has been created.
+fn app_runtime(env: &Env, args: &mut BwrapArgs, id: &str, mode: ShareMode) {
+    let dir = app_runtime_dir(env, id);
+    match mode {
+        ShareMode::ReadOnly => args.ro_bind(&dir, &dir),
+        ShareMode::ReadWrite => args.bind(&dir, &dir),
+    }
 }
 
 #[cfg(test)]
@@ -2652,6 +2679,71 @@ mod tests {
             ),
             "{a:?}"
         );
+    }
+
+    #[test]
+    fn app_runtime_binds_one_leaf_at_the_same_path_in_and_out() {
+        // No host entry in the fake tree: the launcher creates the
+        // directory, so nothing here probes for it.
+        let a = argv(
+            &[
+                Service::AppRuntime {
+                    id: "org.keepassxc.KeePassXC".to_owned(),
+                    mode: ShareMode::ReadOnly,
+                },
+                Service::AppRuntime {
+                    id: "com.discordapp.Discord".to_owned(),
+                    mode: ShareMode::ReadWrite,
+                },
+            ],
+            &env(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            binds(&a),
+            [
+                "--ro-bind",
+                "/run/user/1000/app/org.keepassxc.KeePassXC",
+                "/run/user/1000/app/org.keepassxc.KeePassXC",
+                "--bind",
+                "/run/user/1000/app/com.discordapp.Discord",
+                "/run/user/1000/app/com.discordapp.Discord",
+            ]
+        );
+        // Never the parent and never the runtime directory: `app/` holds
+        // every other id, and `bubbler/` under the runtime dir holds each
+        // instance's control socket.
+        for whole in ["/run/user/1000/app", "/run/user/1000"] {
+            assert!(
+                !has_seq(&a, &["--ro-bind", whole, whole])
+                    && !has_seq(&a, &["--bind", whole, whole]),
+                "{a:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_runtime_follows_the_runtime_directory_the_environment_names() {
+        let mut e = env();
+        e.runtime_dir = "/run/user/1001".into();
+        let a = argv(
+            &[Service::AppRuntime {
+                id: "org.example.App".to_owned(),
+                mode: ShareMode::ReadOnly,
+            }],
+            &e,
+            &[],
+        )
+        .unwrap();
+        assert!(has_seq(
+            &a,
+            &[
+                "--ro-bind",
+                "/run/user/1001/app/org.example.App",
+                "/run/user/1001/app/org.example.App"
+            ]
+        ));
     }
 
     #[test]

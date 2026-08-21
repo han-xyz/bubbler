@@ -98,6 +98,14 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
         Service::EtcShare { name } => {
             format!("etc-share {}", quote(text("etc-share", "name", name)?))
         }
+        Service::AppRuntime { id, mode } => {
+            let mut node = format!("app-runtime {}", quote(id));
+            // `ro` is the default, so only `rw` has to be written out.
+            if *mode == ShareMode::ReadWrite {
+                node.push_str(" mode=rw");
+            }
+            node
+        }
         Service::Mpris { name } => format!("mpris name={}", quote(name)),
         Service::Dbus { rules } => {
             if rules.is_empty() {
@@ -288,6 +296,8 @@ mod tests {
             path-share "/kioxia/Steam"
             path-share "/mnt/data" mode=rw
             etc-share "vulkan"
+            app-runtime "org.keepassxc.KeePassXC"
+            app-runtime "com.discordapp.Discord" mode=rw
             dbus {
                 see "org.freedesktop.ScreenSaver"
                 talk "ca.desrt.dconf"
@@ -345,6 +355,9 @@ mod tests {
         assert_eq!(render(&cfg).unwrap(), "gamepad\n");
         let cfg = parse("dbus\nportals\ncamera nodes=#false").unwrap();
         assert_eq!(render(&cfg).unwrap(), "dbus\nportals\ncamera\n");
+        // `mode=ro` likewise: the node without it grants the same thing.
+        let cfg = parse("app-runtime \"org.example.App\" mode=ro").unwrap();
+        assert_eq!(render(&cfg).unwrap(), "app-runtime \"org.example.App\"\n");
     }
 
     #[test]

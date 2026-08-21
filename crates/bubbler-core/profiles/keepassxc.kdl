@@ -22,14 +22,24 @@
 // challenge-response unlocking does not work from this sandbox; see
 // "Known gaps".
 //
-// Browser integration does not work from here yet: the proxy socket is
-// inside the sandbox and the browser is outside it. See "Known gaps".
+// Browser integration works through `app-runtime`: KeePassXC serves
+// `org.keepassxc.KeePassXC.BrowserServer` in
+// $XDG_RUNTIME_DIR/app/org.keepassxc.KeePassXC, which is the same path
+// on the host and in every sandbox naming that id, so a browser on the
+// host or in its own bubbler instance reaches it. `mode=rw` because this
+// is the side that creates the socket; the browser side wants the
+// default `ro`. Everything else granted that id can replace what is in
+// the directory, so treat the id as one trust domain: KeePassXC's own
+// associate/identification keys are what authenticate a client, not the
+// socket.
 //
 // The database lives in the private home unless you share the directory
 // holding it; `home-share "Documents" mode=rw` is a starting point, and
 // a database on another disk is named explicitly, e.g.
 //     path-share "/kioxia/keepass" mode=rw
+lint-allow "app-runtime-rw" reason="this is the side that serves the browser socket"
 wayland
+app-runtime "org.keepassxc.KeePassXC" mode=rw
 dbus {
     own "org.keepassxc.KeePassXC.*"
     talk "org.freedesktop.ScreenSaver"

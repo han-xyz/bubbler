@@ -12,6 +12,7 @@ pub use crate::error::ConfigError;
 pub use crate::seccomp::{Errno, SeccompConfig};
 pub use crate::tty::TtyMode;
 
+use crate::dbus;
 use crate::seccomp::syscall_number;
 
 /// Keys `env` may not set: the sandbox owns them.
@@ -222,6 +223,17 @@ pub enum Service {
         /// element.
         name: String,
     },
+    /// Share `$XDG_RUNTIME_DIR/app/<id>` with everything else that names
+    /// the same id: the directory applications serve their own sockets
+    /// in, so one sandbox can reach another's. One id is one trust
+    /// domain; nothing about the boundary tells the peers apart.
+    AppRuntime {
+        /// Reverse-DNS application id, the directory's name under `app/`.
+        id: String,
+        /// Read-only unless `mode=rw`. `connect()` works either way, so
+        /// only a sandbox that *serves* a socket needs `rw`.
+        mode: ShareMode,
+    },
 }
 
 /// Parsed `config.kdl`.
@@ -347,7 +359,7 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
                 cfg.services.push(svc);
             }
             "home-share" => {
-                let (path, mode) = parse_share(node, validate_relative)?;
+                let (path, mode) = parse_share(node, "path", validate_relative)?;
                 // The path alone, not the path and the mode: nothing
                 // downstream chooses between two modes for one home path,
                 // so file order would decide how wide the share is.
@@ -361,12 +373,26 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
                 cfg.services.push(Service::HomeShare { path, mode });
             }
             "path-share" => {
-                let (path, mode) = parse_share(node, validate_absolute)?;
+                let (path, mode) = parse_share(node, "path", validate_absolute)?;
                 let svc = Service::PathShare { path, mode };
                 if cfg.services.contains(&svc) {
                     return Err(ConfigError::Duplicate(name.to_owned()));
                 }
                 cfg.services.push(svc);
+            }
+            "app-runtime" => {
+                let (id, mode) = parse_share(node, "id", validate_app_id)?;
+                // The id alone: one directory cannot be bound twice, so
+                // two modes for one id would leave the width of the
+                // grant to file order.
+                if cfg
+                    .services
+                    .iter()
+                    .any(|s| matches!(s, Service::AppRuntime { id: held, .. } if *held == id))
+                {
+                    return Err(ConfigError::Duplicate(name.to_owned()));
+                }
+                cfg.services.push(Service::AppRuntime { id, mode });
             }
             "etc-share" => {
                 let svc = parse_etc_share(node)?;
@@ -585,26 +611,27 @@ fn reject_arguments(node: &KdlNode) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// `<node> "<path>" [mode=ro|rw]`, the shape `home-share` and
-/// `path-share` have in common; `validate` decides which paths the node
-/// accepts and normalises them.
-fn parse_share(
+/// `<node> "<value>" [mode=ro|rw]`, the shape `home-share`, `path-share`
+/// and `app-runtime` have in common; `validate` decides which values the
+/// node accepts and normalises them, and `what` names them in its errors.
+fn parse_share<T>(
     node: &KdlNode,
-    validate: fn(&KdlNode, &str) -> Result<PathBuf, ConfigError>,
-) -> Result<(PathBuf, ShareMode), ConfigError> {
-    let mut path: Option<PathBuf> = None;
+    what: &str,
+    validate: fn(&KdlNode, &str) -> Result<T, ConfigError>,
+) -> Result<(T, ShareMode), ConfigError> {
+    let mut value: Option<T> = None;
     let mut mode = ShareMode::ReadOnly;
     for e in node.entries() {
         match e.name().map(|n| n.value()) {
             None => {
-                if path.is_some() {
-                    return Err(bad(node, "expects exactly one path argument"));
+                if value.is_some() {
+                    return Err(bad(node, &format!("expects exactly one {what} argument")));
                 }
                 let s = e
                     .value()
                     .as_string()
-                    .ok_or_else(|| bad(node, "path must be a string"))?;
-                path = Some(validate(node, s)?);
+                    .ok_or_else(|| bad(node, &format!("{what} must be a string")))?;
+                value = Some(validate(node, s)?);
             }
             Some("mode") => {
                 mode = match e.value().as_string() {
@@ -624,8 +651,23 @@ fn parse_share(
     if node.children().is_some() {
         return Err(bad(node, "takes no children"));
     }
-    let path = path.ok_or_else(|| bad(node, "expects exactly one path argument"))?;
-    Ok((path, mode))
+    let value = value.ok_or_else(|| bad(node, &format!("expects exactly one {what} argument")))?;
+    Ok((value, mode))
+}
+
+/// The id of an `app-runtime` node. Validated as an application id
+/// because that is what every consumer of the `app/` convention writes:
+/// it rules out `.`, `..`, anything holding `/`, and every single-element
+/// name, so an id can never name one of bubbler's own runtime children.
+fn validate_app_id(node: &KdlNode, s: &str) -> Result<String, ConfigError> {
+    if !dbus::is_valid_app_id(s) {
+        return Err(bad(
+            node,
+            "expects an application id such as \"org.example.App\": at least two \
+             `.`-separated elements of letters, digits and `_`, `-` allowed in the last",
+        ));
+    }
+    Ok(s.to_owned())
 }
 
 fn parse_etc_share(node: &KdlNode) -> Result<Service, ConfigError> {
@@ -1672,6 +1714,89 @@ command "b""#
         // Two modes for one path is not the same node; the launcher
         // rejects it as an overlap, with both paths named.
         assert!(parse("path-share \"/a\"\npath-share \"/a\" mode=rw").is_ok());
+    }
+
+    #[test]
+    fn app_runtime_takes_an_application_id_and_mode() {
+        let cfg = parse(
+            "app-runtime \"org.keepassxc.KeePassXC\"\napp-runtime \"com.discordapp.Discord\" mode=rw",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.services,
+            vec![
+                Service::AppRuntime {
+                    id: "org.keepassxc.KeePassXC".to_owned(),
+                    mode: ShareMode::ReadOnly
+                },
+                Service::AppRuntime {
+                    id: "com.discordapp.Discord".to_owned(),
+                    mode: ShareMode::ReadWrite
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn app_runtime_rejects_an_id_that_could_name_another_runtime_entry() {
+        // The first four are the names that would matter: `bubbler` holds
+        // every instance's control socket, and the rest are traversal.
+        for text in [
+            r#"app-runtime "bubbler""#,
+            r#"app-runtime "..""#,
+            r#"app-runtime "../bubbler""#,
+            r#"app-runtime "org.a/../../bubbler""#,
+            r#"app-runtime ".flatpak""#,
+            r#"app-runtime """#,
+            r#"app-runtime "org.example.App!""#,
+            r#"app-runtime "org.exa-mple.App""#,
+        ] {
+            assert!(
+                matches!(parse(text), Err(ConfigError::BadArgument { node, .. }) if node == "app-runtime"),
+                "{text}"
+            );
+        }
+        // A `-` is allowed in the last element only, which is what the
+        // portal's own grammar says.
+        assert!(parse(r#"app-runtime "org.example.App-1""#).is_ok());
+    }
+
+    #[test]
+    fn app_runtime_rejects_bad_mode_missing_and_extra_arguments() {
+        for text in [
+            r#"app-runtime "org.example.App" mode=wx"#,
+            "app-runtime",
+            "app-runtime 3",
+            r#"app-runtime "org.example.App" "org.example.Other""#,
+            r#"app-runtime (t)"org.example.App""#,
+            "app-runtime \"org.example.App\" {\n    mode\n}",
+        ] {
+            assert!(
+                matches!(parse(text), Err(ConfigError::BadArgument { .. })),
+                "{text}"
+            );
+        }
+        assert!(matches!(
+            parse(r#"app-runtime "org.example.App" rw=#true"#),
+            Err(ConfigError::UnknownProperty { .. })
+        ));
+    }
+
+    #[test]
+    fn app_runtime_rejects_one_id_twice_whatever_the_modes() {
+        for text in [
+            "app-runtime \"org.example.App\"\napp-runtime \"org.example.App\"",
+            "app-runtime \"org.example.App\"\napp-runtime \"org.example.App\" mode=rw",
+            "app-runtime \"org.example.App\" mode=rw\napp-runtime \"org.example.App\"",
+        ] {
+            assert!(
+                matches!(parse(text), Err(ConfigError::Duplicate(n)) if n == "app-runtime"),
+                "{text}"
+            );
+        }
+        assert!(
+            parse("app-runtime \"org.example.App\"\napp-runtime \"org.example.Other\"").is_ok()
+        );
     }
 
     #[test]

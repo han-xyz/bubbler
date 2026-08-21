@@ -54,6 +54,10 @@ pub struct Check {
 
 /// Each check as a constant the code that reports it names, so a
 /// finding cannot carry an id no table holds.
+const APP_RUNTIME_RW: Check = Check {
+    id: "app-runtime-rw",
+    severity: Severity::Note,
+};
 const BUNDLE_WITHOUT_DBUS: Check = Check {
     id: "bundle-without-dbus",
     severity: Severity::Error,
@@ -159,6 +163,7 @@ const X11_WITHOUT_REASON: Check = Check {
 /// so a check taken out of this table makes the profiles naming it
 /// errors rather than silently accepting nothing.
 pub const CHECKS: &[Check] = &[
+    APP_RUNTIME_RW,
     BUNDLE_WITHOUT_DBUS,
     CAMERA_NODES_NONE_PRESENT,
     CAMERA_NODES_NO_HOTPLUG,
@@ -826,6 +831,18 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, f: &mut Findings) {
             "camera" if flag(node, "nodes") == Some(true) => camera_nodes(ctx, i, node, f),
             "dbus" => dbus_node(i, node, f),
             "system-bus" => system_bus(i, node, f),
+            "app-runtime" if prop(node, "mode") == Some("rw") => f.push(
+                i,
+                node,
+                &APP_RUNTIME_RW,
+                format!(
+                    "`app-runtime \"{}\" mode=rw` lets the sandbox replace the sockets \
+                     everything else sharing that id connects to",
+                    arg(node).unwrap_or_default()
+                ),
+                "leave the default `ro` unless this sandbox is the one serving the socket; \
+                 `ro` still allows connect()",
+            ),
             "mpris" if prop(node, "name").is_some_and(|n| n == "*") => f.push(
                 i,
                 node,
@@ -1504,6 +1521,37 @@ mod tests {
             ] {
                 assert_eq!(ids(&lint(ctx, &[text])), [] as [&str; 0], "{text}");
             }
+        });
+    }
+
+    #[test]
+    fn a_writable_app_runtime_share_is_a_note() {
+        with(&host(), |ctx| {
+            let report = lint(ctx, &["app-runtime \"org.keepassxc.KeePassXC\" mode=rw"]);
+            assert_eq!(ids(&report), ["app-runtime-rw"]);
+            assert_eq!(report.findings[0].severity, Severity::Note);
+            assert!(
+                report.findings[0]
+                    .message
+                    .contains("org.keepassxc.KeePassXC"),
+                "{report:?}"
+            );
+            // The default is read-only, which cannot take a socket away
+            // from anyone, so it says nothing. Neither does the linter
+            // look for the directory: bubbler creates it at launch.
+            assert_eq!(
+                ids(&lint(ctx, &["app-runtime \"org.keepassxc.KeePassXC\""])),
+                [] as [&str; 0]
+            );
+            // And the note is one a profile may accept.
+            assert_eq!(
+                ids(&lint(
+                    ctx,
+                    &["app-runtime \"org.keepassxc.KeePassXC\" mode=rw\n\
+                         lint-allow \"app-runtime-rw\" reason=\"it serves the socket\""]
+                )),
+                [] as [&str; 0]
+            );
         });
     }
 

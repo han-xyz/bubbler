@@ -606,6 +606,11 @@ impl Merged {
                     return Ok(());
                 }
             }
+            Service::AppRuntime { .. } => {
+                if self.holds_share(svc, src, "app-runtime", app_runtime)? {
+                    return Ok(());
+                }
+            }
             Service::Dbus { rules } => {
                 if let Some((held_rules, held_src)) =
                     self.services.iter_mut().find_map(|(s, src)| match s {
@@ -694,25 +699,26 @@ impl Merged {
         Ok(())
     }
 
-    /// Whether a share of the same kind and path is already merged, after
+    /// Whether a share of the same kind and key is already merged, after
     /// checking the two modes agree. `same` selects the shares of one
     /// kind, so `home-share "x"` is never measured against
-    /// `path-share "/x"`; `name` names the node when its path is not text
-    /// a KDL file could hold.
-    fn holds_share(
+    /// `path-share "/x"`; `name` names the node when its key is not text
+    /// a KDL file could hold. The key is a path for the two share nodes
+    /// and the id for `app-runtime`.
+    fn holds_share<K: PartialEq + ?Sized>(
         &self,
         svc: &Service,
         src: &Src,
         name: &str,
-        same: fn(&Service) -> Option<(&Path, ShareMode)>,
+        same: fn(&Service) -> Option<(&K, ShareMode)>,
     ) -> Result<bool, ProfileError> {
-        let Some((path, mode)) = same(svc) else {
+        let Some((key, mode)) = same(svc) else {
             return Ok(false);
         };
         let held = self
             .services
             .iter()
-            .find_map(|(s, s_src)| same(s).filter(|&(p, _)| p == path).map(|(_, m)| (m, s_src)));
+            .find_map(|(s, s_src)| same(s).filter(|&(k, _)| k == key).map(|(_, m)| (m, s_src)));
         let Some((held_mode, held_src)) = held else {
             return Ok(false);
         };
@@ -826,6 +832,14 @@ fn home_share(s: &Service) -> Option<(&Path, ShareMode)> {
 fn path_share(s: &Service) -> Option<(&Path, ShareMode)> {
     match s {
         Service::PathShare { path, mode } => Some((path, *mode)),
+        _ => None,
+    }
+}
+
+/// The id and mode of an `app-runtime` node, and nothing else.
+fn app_runtime(s: &Service) -> Option<(&str, ShareMode)> {
+    match s {
+        Service::AppRuntime { id, mode } => Some((id, *mode)),
         _ => None,
     }
 }
@@ -1451,6 +1465,49 @@ mod tests {
             panic!("{err:?}")
         };
         assert_eq!(node, "path-share \"/kioxia/Steam\"");
+        assert!(a.contains("mode=rw") && a.contains("b.kdl"), "{a}");
+        assert!(b.contains("mode=ro") && b.contains("a.kdl"), "{b}");
+
+        // `app-runtime` is keyed by its id rather than a path, and one
+        // id is one directory: two modes for it would decide by layer
+        // order whether the sandbox may serve sockets there.
+        let r = resolver(
+            tmp.path(),
+            &[(
+                "a",
+                "include \"b\"\napp-runtime \"org.keepassxc.KeePassXC\" mode=rw\n\
+                 app-runtime \"org.example.Other\"\n",
+            )],
+            &[("b", "app-runtime \"org.keepassxc.KeePassXC\" mode=rw\n")],
+        );
+        // The same id in the same mode is one grant, and an unrelated id
+        // beside it is a second.
+        assert_eq!(
+            r.resolve("a").unwrap().config.services,
+            vec![
+                Service::AppRuntime {
+                    id: "org.keepassxc.KeePassXC".to_owned(),
+                    mode: ShareMode::ReadWrite
+                },
+                Service::AppRuntime {
+                    id: "org.example.Other".to_owned(),
+                    mode: ShareMode::ReadOnly
+                },
+            ]
+        );
+        let r = resolver(
+            tmp.path(),
+            &[(
+                "a",
+                "include \"b\"\napp-runtime \"org.keepassxc.KeePassXC\"\n",
+            )],
+            &[("b", "app-runtime \"org.keepassxc.KeePassXC\" mode=rw\n")],
+        );
+        let err = r.resolve("a").unwrap_err();
+        let ProfileError::Conflict { node, a, b } = &err else {
+            panic!("{err:?}")
+        };
+        assert_eq!(node, "app-runtime \"org.keepassxc.KeePassXC\"");
         assert!(a.contains("mode=rw") && a.contains("b.kdl"), "{a}");
         assert!(b.contains("mode=ro") && b.contains("a.kdl"), "{b}");
     }

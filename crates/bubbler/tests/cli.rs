@@ -1,7 +1,8 @@
 mod common;
 
+use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -12,7 +13,7 @@ use bubbler_core::bwrap::ETC_ALLOWLIST;
 use bubbler_core::profile::NAMES;
 use bubbler_core::seccomp::{DEFAULT_ENOSYS, DEFAULT_EPERM, syscall_number};
 use common::{
-    bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, bwrap_alive, kill_group, real_init,
+    PYTHON, bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, bwrap_alive, kill_group, real_init,
     require_bwrap, require_dbus, require_portal, require_python, require_system_bus, require_tray,
     system_owns, test_pty,
 };
@@ -763,6 +764,222 @@ fn try_explains_a_throwaway_sandbox_without_running_it() {
         .map(|d| d.count())
         .unwrap_or(0);
     assert_eq!(left, 0);
+}
+
+/// The socket both sides of the `app-runtime` integration tests use,
+/// relative to the shared directory.
+const SHARED_SOCKET: &str = "s.sock";
+
+/// Server for the `app-runtime` integration test: binds a socket in the
+/// shared directory, then reports what each of two peers sends.
+const SHARED_SERVER: &str = "\
+import os, socket, sys
+p = os.environ['XDG_RUNTIME_DIR'] + '/app/org.bubbler.test/s.sock'
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(p)
+s.listen(2)
+print('listening', flush=True)
+for _ in range(2):
+    c, _ = s.accept()
+    print('got ' + c.recv(64).decode(), flush=True)
+";
+
+/// Client for the same test, in a sandbox holding the directory `ro`.
+const SHARED_CLIENT: &str = "\
+import os, socket
+p = os.environ['XDG_RUNTIME_DIR'] + '/app/org.bubbler.test/s.sock'
+c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+c.connect(p)
+c.sendall(b'from-sandbox')
+";
+
+#[test]
+fn app_runtime_binds_only_the_leaf_and_explain_names_the_node() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(
+        &cfg,
+        "app-runtime \"org.keepassxc.KeePassXC\"\n\
+         app-runtime \"org.example.Other\" mode=rw\ncommand \"true\"\n",
+    )
+    .unwrap();
+    let run = tmp.path().join("run");
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--dry-run"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let leaf = |id: &str| run.join("app").join(id).display().to_string();
+    assert!(
+        s.contains(&format!(
+            "--ro-bind\n{a}\n{a}\n",
+            a = leaf("org.keepassxc.KeePassXC")
+        )),
+        "{s}"
+    );
+    assert!(
+        s.contains(&format!(
+            "--bind\n{a}\n{a}\n",
+            a = leaf("org.example.Other")
+        )),
+        "{s}"
+    );
+    // Never the parent: `app/` holds every other id.
+    assert!(
+        !s.contains(&format!("\n{a}\n{a}\n", a = run.join("app").display())),
+        "{s}"
+    );
+    // A dry run describes a launch rather than performing one, so it
+    // creates nothing on the host either.
+    assert!(!run.join("app").exists());
+
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--explain"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains("  app-runtime \"org.keepassxc.KeePassXC\" "),
+        "{s}"
+    );
+    assert!(
+        s.contains("  app-runtime \"org.example.Other\" mode=rw "),
+        "{s}"
+    );
+    assert!(s.contains("config.kdl:1"), "{s}");
+    assert!(s.contains("config.kdl:2"), "{s}");
+}
+
+#[test]
+fn app_runtime_refuses_a_symlink_where_the_directory_belongs() {
+    let tmp = setup();
+    write_profile(
+        tmp.path(),
+        "user",
+        "shared",
+        "app-runtime \"org.bubbler.test\"\ncommand \"true\"\n",
+    );
+    let app = tmp.path().join("run/app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::os::unix::fs::symlink("/etc", app.join("org.bubbler.test")).unwrap();
+    let out = bubbler(tmp.path())
+        .args(["try", "--profile", "shared"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("app-runtime"), "{err}");
+    assert!(err.contains("to be a directory"), "{err}");
+}
+
+#[test]
+fn real_bwrap_app_runtime_carries_a_byte_between_two_sandboxes_and_the_host() {
+    if !require_bwrap() || !require_python() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    write_profile(
+        tmp.path(),
+        "user",
+        "shared-rw",
+        "app-runtime \"org.bubbler.test\" mode=rw\n",
+    );
+    write_profile(
+        tmp.path(),
+        "user",
+        "shared-ro",
+        "app-runtime \"org.bubbler.test\"\n",
+    );
+    // Created by hand at 0755 first, the way a native application leaves
+    // it (Qt's `mkpath` honours the umask): bubbler must adopt it rather
+    // than fail or widen it.
+    let dir = tmp.path().join("run/app/org.bubbler.test");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut server = bubbler_live(tmp.path(), &init)
+        .args([
+            "try",
+            "--profile",
+            "shared-rw",
+            "--",
+            PYTHON,
+            "-c",
+            SHARED_SERVER,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let sock = dir.join(SHARED_SOCKET);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !std::fs::symlink_metadata(&sock).is_ok_and(|m| m.file_type().is_socket()) {
+        if Instant::now() >= deadline || server.try_wait().unwrap().is_some() {
+            kill_group(&server);
+            let out = server.wait_with_output().unwrap();
+            panic!(
+                "no socket in the shared directory: {} {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // The mode the host set is still the mode the directory has.
+    assert_eq!(
+        std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+
+    // A second sandbox holding the same id read-only: `connect()` works
+    // through a `--ro-bind`, which is why `ro` is the default.
+    let out = bubbler_live(tmp.path(), &init)
+        .args([
+            "try",
+            "--profile",
+            "shared-ro",
+            "--",
+            PYTHON,
+            "-c",
+            SHARED_CLIENT,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And the host, which is the KeePassXC-in-a-sandbox shape: the
+    // directory is one host directory, so an unsandboxed peer reaches it.
+    let mut stream = UnixStream::connect(&sock).unwrap();
+    stream.write_all(b"from-host").unwrap();
+    drop(stream);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while server.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            kill_group(&server);
+            panic!("the server sandbox did not finish");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = server.wait_with_output().unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("got from-sandbox"), "{s}");
+    assert!(s.contains("got from-host"), "{s}");
+    // The shared directory outlives the runs: it is a rendezvous, and a
+    // peer of another instance may still be serving in it.
+    assert!(dir.is_dir());
 }
 
 // `network` binds /etc/resolv.conf, so this test needs one on the host.

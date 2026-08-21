@@ -1,4 +1,9 @@
 // bubbler profile: firefox
+//
+// For KeePassXC browser integration, uncomment the line below and
+// grant the same id to `keepassxc` (it ships it already). Read-only
+// is enough: this side only connects to the socket KeePassXC serves.
+//   app-runtime "org.keepassxc.KeePassXC"
 wayland
 dri
 pipewire
