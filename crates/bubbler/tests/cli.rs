@@ -110,10 +110,109 @@ fn profiles_lists_builtins_and_firefox_seeds_gpu_and_toolkit_env() {
     // config is asserted on.
     let cfg =
         std::fs::read_to_string(tmp.path().join("data/bubbler/instances/ff/config.kdl")).unwrap();
+    assert!(cfg.starts_with("// bubbler profile: firefox\n"), "{cfg}");
     assert!(
         cfg.contains("dri\n") && cfg.contains("MOZ_ENABLE_WAYLAND"),
         "{cfg}"
     );
+}
+
+/// Write `text` as profile `name` in one of the layers under `root`.
+fn write_profile(root: &Path, layer: &str, name: &str, text: &str) -> PathBuf {
+    let dir = match layer {
+        "user" => root.join("config/bubbler/profiles"),
+        _ => root.join("profiles"),
+    };
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{name}.kdl"));
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+#[test]
+fn profiles_list_every_layer_and_origin_names_the_file() {
+    let tmp = setup();
+    let user = write_profile(
+        tmp.path(),
+        "user",
+        "firefox",
+        "include \"firefox\"\nnetwork\n",
+    );
+    let system = write_profile(tmp.path(), "system", "editor", "wayland\ncommand \"vi\"\n");
+
+    let out = bubbler(tmp.path()).arg("profiles").output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "alacritty\neditor\nfirefox\ngeneric\n"
+    );
+
+    let out = bubbler(tmp.path())
+        .args(["profiles", "--origin"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!(
+            "alacritty\tbuilt-in\t-\neditor\tsystem\t{}\nfirefox\tuser\t{}\ngeneric\tbuilt-in\t-\n",
+            system.display(),
+            user.display()
+        )
+    );
+}
+
+#[test]
+fn a_user_profile_including_the_built_in_seeds_the_union() {
+    let tmp = setup();
+    write_profile(
+        tmp.path(),
+        "user",
+        "firefox",
+        "include \"firefox\"\nx11\nenv MOZ_ENABLE_WAYLAND=\"0\"\n",
+    );
+    let out = bubbler(tmp.path())
+        .args(["create", "ff", "--profile", "firefox"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cfg =
+        std::fs::read_to_string(tmp.path().join("data/bubbler/instances/ff/config.kdl")).unwrap();
+    // The built-in's grants, the user layer's extra one, and its override
+    // of one key rather than a second `env` node for it.
+    assert!(cfg.contains("\nwayland\n"), "{cfg}");
+    assert!(cfg.contains("\nx11\n"), "{cfg}");
+    assert!(cfg.contains("env MOZ_ENABLE_WAYLAND=\"0\"\n"), "{cfg}");
+    assert!(!cfg.contains("\"1\""), "{cfg}");
+}
+
+#[test]
+fn a_broken_layer_is_reported_and_never_falls_through() {
+    let tmp = setup();
+    let path = write_profile(tmp.path(), "user", "generic", "bluetooth\n");
+    let out = bubbler(tmp.path()).args(["create", "t"]).output().unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains(&path.display().to_string()), "{err}");
+    assert!(err.contains("unknown node `bluetooth`"), "{err}");
+    assert!(!tmp.path().join("data/bubbler/instances/t").exists());
+}
+
+#[test]
+fn include_in_an_instance_config_is_an_error() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "include \"generic\"\n").unwrap();
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--dry-run", "--", "/usr/bin/true"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("include is only valid in profiles"), "{err}");
 }
 
 #[test]

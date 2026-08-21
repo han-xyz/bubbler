@@ -52,7 +52,8 @@ pub fn fill_closed_stdio() -> Result<()> {
 /// empty `$HOME` or `$XDG_RUNTIME_DIR` is an error: both are needed for
 /// any sandbox, and an empty one would silently become a relative path.
 /// `$BUBBLER_INIT` and `$BUBBLER_DBUS_PROXY` override where the
-/// `bubbler-init` and `xdg-dbus-proxy` binaries are taken from.
+/// `bubbler-init` and `xdg-dbus-proxy` binaries are taken from, and
+/// `$BUBBLER_PROFILE_DIR` where the system profile layer is read from.
 pub fn from_process() -> Result<Env> {
     let home = PathBuf::from(
         env::var_os("HOME")
@@ -63,6 +64,10 @@ pub fn from_process() -> Result<Env> {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".local/share"));
+    let config_home = env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
     let runtime_dir = PathBuf::from(
         env::var_os("XDG_RUNTIME_DIR")
             .filter(|v| !v.is_empty())
@@ -73,6 +78,7 @@ pub fn from_process() -> Result<Env> {
     Ok(Env {
         home,
         data_home,
+        config_home,
         runtime_dir,
         uid: rustix::process::getuid().as_raw(),
         gid: rustix::process::getgid().as_raw(),
@@ -88,6 +94,9 @@ pub fn from_process() -> Result<Env> {
         dbus_address: env::var_os("DBUS_SESSION_BUS_ADDRESS").filter(|v| !v.is_empty()),
         dbus_log: env::var_os("BUBBLER_DBUS_LOG").is_some_and(|v| v == "1"),
         seccomp_log: env::var_os("BUBBLER_SECCOMP_LOG").is_some_and(|v| v == "1"),
+        profile_dir_override: env::var_os("BUBBLER_PROFILE_DIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from),
         proxy_override: env::var_os("BUBBLER_DBUS_PROXY")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from),

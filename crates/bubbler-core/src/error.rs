@@ -39,6 +39,44 @@ pub enum ConfigError {
     MissingCommand,
 }
 
+/// Failures while resolving a profile through its layers.
+#[derive(Debug, Error)]
+pub enum ProfileError {
+    /// No layer holds a profile of that name. A name that could name a
+    /// path is never looked up and lands here too.
+    #[error("unknown profile `{0}`")]
+    NotFound(String),
+    /// The `include` chain came back to a layer it had already read.
+    #[error("include cycle: {}", .0.join(" -> "))]
+    Cycle(Vec<String>),
+    /// The `include` chain is longer than [`crate::profile::MAX_DEPTH`].
+    #[error("include nesting deeper than {max}: {chain}", max = crate::profile::MAX_DEPTH, chain = .0.join(" -> "))]
+    TooDeep(Vec<String>),
+    /// One layer, or the flattened result, did not parse.
+    #[error("{origin}: {source}")]
+    Parse {
+        /// The layer's path, or which built-in or flattened profile it was.
+        origin: String,
+        /// What the parser rejected.
+        #[source]
+        source: ConfigError,
+    },
+    /// Two layers grant the same path in ways that cannot both hold.
+    /// Taking either silently would be a privilege change nobody wrote.
+    #[error("`{node}` is granted as {a} and as {b}")]
+    Conflict {
+        /// The node both layers name, without the conflicting part.
+        node: String,
+        /// The first layer's version, with where it came from.
+        a: String,
+        /// The second layer's version, with where it came from.
+        b: String,
+    },
+    /// Filesystem failure at a specific path.
+    #[error("{0}")]
+    Io(PathBuf, #[source] io::Error),
+}
+
 /// Failures while creating, opening or listing instances.
 #[derive(Debug, Error)]
 pub enum InstanceError {
@@ -56,9 +94,6 @@ pub enum InstanceError {
          which `bubbler try` reserves"
     )]
     InvalidName(String),
-    /// Unknown profile name passed to `create`.
-    #[error("unknown profile `{0}`")]
-    UnknownProfile(String),
     /// A grant name that is not one of the bare service nodes.
     #[error("unknown grant `{0}`: valid grants are {names}", names = crate::instance::GRANTS.join(", "))]
     InvalidGrant(String),
@@ -71,6 +106,9 @@ pub enum InstanceError {
     /// The instance's `config.kdl` is invalid.
     #[error(transparent)]
     Config(#[from] ConfigError),
+    /// The profile the instance is seeded from could not be resolved.
+    #[error(transparent)]
+    Profile(#[from] ProfileError),
 }
 
 /// Failures while turning a config into a running sandbox.

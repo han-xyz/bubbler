@@ -58,6 +58,7 @@ mod tests {
         Env {
             home: "/home/han".into(),
             data_home: "/home/han/.local/share".into(),
+            config_home: "/home/han/.config".into(),
             runtime_dir: "/run/user/1000".into(),
             uid: 1000,
             gid: 1000,
@@ -69,6 +70,7 @@ mod tests {
             dbus_address: None,
             dbus_log: false,
             seccomp_log: false,
+            profile_dir_override: None,
             proxy_override: None,
         }
     }

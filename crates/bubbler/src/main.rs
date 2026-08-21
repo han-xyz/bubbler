@@ -5,6 +5,7 @@ mod host_env;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::process::{Command, ExitCode};
 use std::str::FromStr;
 
@@ -42,7 +43,7 @@ enum Cmd {
         /// Instance name: letters, digits, `.`, `_`, `-`; not `.`, `..`
         /// or a name starting with `-`.
         name: String,
-        /// Built-in profile to seed config.kdl from.
+        /// Profile to seed config.kdl from, flattened through its layers.
         #[arg(long, default_value = "generic")]
         profile: String,
     },
@@ -63,7 +64,7 @@ enum Cmd {
     },
     /// Run a command in a throwaway sandbox, without creating an instance.
     Try {
-        /// Built-in profile to seed the throwaway config from.
+        /// Profile to seed the throwaway config from.
         #[arg(long, default_value = "generic")]
         profile: String,
         /// Grant one service on top of the profile; repeatable.
@@ -94,8 +95,13 @@ enum Cmd {
     },
     /// List instances.
     List,
-    /// List built-in profiles.
-    Profiles,
+    /// List profiles from every layer: user, system and built-in.
+    Profiles {
+        /// Also print the layer each name resolves to and the file it is
+        /// read from, tab separated; `-` for a built-in.
+        #[arg(long)]
+        origin: bool,
+    },
     /// Delete an instance and its private home. Irreversible.
     Delete {
         /// Instance name.
@@ -256,8 +262,24 @@ fn real_main() -> Result<i32> {
             let lines: Vec<&OsStr> = names.iter().map(OsStr::new).collect();
             print_lines(&lines, "the instance list")
         }
-        Cmd::Profiles => {
-            let lines: Vec<&OsStr> = profile::NAMES.iter().map(OsStr::new).collect();
+        Cmd::Profiles { origin } => {
+            let entries = profile::Resolver::new(&env)
+                .list()
+                .context("listing profiles")?;
+            // Paths are not UTF-8, so the origin line is built as bytes
+            // rather than formatted into a String.
+            let lines: Vec<OsString> = entries
+                .iter()
+                .map(|e| {
+                    if !origin {
+                        return OsString::from(&e.name);
+                    }
+                    let mut line = OsString::from(format!("{}\t{}\t", e.name, e.origin));
+                    line.push(e.path.as_deref().map_or(Path::new("-"), |p| p));
+                    line
+                })
+                .collect();
+            let lines: Vec<&OsStr> = lines.iter().map(OsString::as_os_str).collect();
             print_lines(&lines, "the profile list")
         }
         Cmd::Delete { name, yes } => {

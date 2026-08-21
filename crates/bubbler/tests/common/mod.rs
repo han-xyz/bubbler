@@ -57,8 +57,9 @@ pub fn real_init() -> Option<PathBuf> {
     None
 }
 
-/// A `bubbler` Command with an isolated HOME, XDG_DATA_HOME and
-/// XDG_RUNTIME_DIR under `root`, a known TERM, and `$BUBBLER_INIT`
+/// A `bubbler` Command with an isolated HOME, XDG_DATA_HOME,
+/// XDG_CONFIG_HOME, XDG_RUNTIME_DIR and profile directory under `root`,
+/// a known TERM, and `$BUBBLER_INIT`
 /// pointing at the stand-in `root/bubbler-init`, so argv assertions do
 /// not depend on where the test binary lives. Tests that really start a
 /// sandbox override it with [`real_init`].
@@ -74,7 +75,11 @@ fn isolate(c: &mut Command, root: &Path) {
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", root.join("home"))
         .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_RUNTIME_DIR", root.join("run"))
+        // Both profile layers point into the test root, so a profile
+        // installed on the host cannot change what a test resolves.
+        .env("BUBBLER_PROFILE_DIR", root.join("profiles"))
         .env("BUBBLER_INIT", root.join("bubbler-init"))
         .env("TERM", "dumb");
 }

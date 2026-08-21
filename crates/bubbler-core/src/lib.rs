@@ -10,6 +10,7 @@ pub mod exec;
 pub mod host;
 pub mod init_bin;
 pub mod instance;
+pub mod kdl_out;
 pub mod launcher;
 pub mod profile;
 pub mod seccomp;
