@@ -413,8 +413,10 @@ fn reopen(fd: BorrowedFd<'_>) -> Option<OwnedFd> {
     .ok()
 }
 
-/// Where a relay's warnings go: a description of fd 2 that only the
-/// relay holds, non-blocking, opened once when the relay starts.
+/// Where a run's warnings go while it waits: a description of fd 2 that
+/// only bubbler holds, non-blocking, opened once when the wait starts.
+/// The relay makes one for the output it had to discard, and the
+/// launcher one for the sidecar it noticed the end of.
 ///
 /// A warning about output the host would not take must never be written
 /// to a host that would not take it — with the destination re-opened, fd
@@ -423,7 +425,7 @@ fn reopen(fd: BorrowedFd<'_>) -> Option<OwnedFd> {
 /// and the signals for good. So a warning that will not go through at
 /// once is dropped: truncated output is worth a word, never a run that
 /// only `SIGKILL` can end.
-struct Warn {
+pub(crate) struct Warn {
     fd: Option<OwnedFd>,
     /// Whether `fd` is a description bubbler opened for itself, and so
     /// one whose non-blocking flag is nobody else's business.
@@ -431,7 +433,9 @@ struct Warn {
 }
 
 impl Warn {
-    fn new() -> Self {
+    /// Open the description this run's warnings go to. One per run: the
+    /// flags on it are nobody else's.
+    pub(crate) fn new() -> Self {
         let Ok(dup) = std::io::stderr().as_fd().try_clone_to_owned() else {
             return Self {
                 fd: None,
@@ -454,7 +458,7 @@ impl Warn {
     }
 
     /// Say `msg`, or drop it. Never blocks and never fails a run.
-    fn say(&self, msg: &str) {
+    pub(crate) fn say(&self, msg: &str) {
         let Some(fd) = &self.fd else {
             return;
         };

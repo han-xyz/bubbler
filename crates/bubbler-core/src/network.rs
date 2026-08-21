@@ -117,11 +117,13 @@ impl NetworkConfig {
 /// host, so the file is generated rather than bound. Under `"host"` the
 /// host's file is right as it stands unless `dns` children replace it,
 /// and under `"none"` nothing is written at all: there is no network to
-/// carry a query, whatever the node names.
+/// carry a query. The parser refuses a `dns` child there, so that last
+/// case is this function standing on its own rather than a config.
 pub fn resolv_conf(cfg: &NetworkConfig) -> Option<Vec<u8>> {
     let servers: Vec<IpAddr> = match (cfg.mode, cfg.dns.is_empty()) {
         // Nothing to resolve with and nothing to resolve for: a `dns`
-        // child under `none` names a server no sandbox can reach.
+        // child under `none` names a server no sandbox can reach, which
+        // is why the parser refuses one.
         (Mode::None, _) => return None,
         (_, false) => cfg.dns.clone(),
         (Mode::Isolated, true) => vec![DNS_FORWARD],
@@ -401,7 +403,8 @@ mod tests {
     }
 
     /// `none` is no network, so there is nothing a nameserver could be
-    /// reached over and no file worth writing.
+    /// reached over and no file worth writing. The parser refuses such a
+    /// node; this holds for a config built in code as well.
     #[test]
     fn network_none_writes_no_resolver_even_with_a_dns_child() {
         let cfg = NetworkConfig {

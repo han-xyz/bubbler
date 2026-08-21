@@ -1055,11 +1055,11 @@ fn validate_relative(node: &KdlNode, s: &str) -> Result<PathBuf, ConfigError> {
 /// which is the default; the two spellings name the host's namespace and
 /// no namespace at all.
 ///
-/// `dns` is valid in every mode, since it only says what the sandbox's
-/// resolver file holds. The other two children configure the pasta
-/// sidecar, and only the isolated mode has one — under the others they
-/// are refused rather than ignored, which would leave a config granting
-/// less than it says.
+/// `dns` says what the sandbox's resolver file holds, so it belongs to
+/// the two modes that have a network to carry a query; under `none` it
+/// is refused. The other two children configure the pasta sidecar, and
+/// only the isolated mode has one. None of the three is ignored where it
+/// cannot apply: that would leave a config granting less than it says.
 fn parse_network(node: &KdlNode) -> Result<Service, ConfigError> {
     let mut cfg = NetworkConfig::default();
     let mut seen_mode = false;
@@ -1125,6 +1125,13 @@ fn parse_network(node: &KdlNode) -> Result<Service, ConfigError> {
             }
             other => return Err(ConfigError::UnknownNode(other.to_owned())),
         }
+    }
+    if cfg.mode == NetworkMode::None && !cfg.dns.is_empty() {
+        return Err(bad(
+            node,
+            "`dns` names a resolver the sandbox would have to reach over a network, \
+             and `none` grants none",
+        ));
     }
     if cfg.mode != NetworkMode::Isolated {
         if !cfg.forwards.is_empty() {
@@ -1676,14 +1683,23 @@ mod tests {
     }
 
     /// The mode×child matrix: `dns` describes a file and is valid
-    /// everywhere; the other two configure the sidecar only the isolated
-    /// mode runs, and are refused rather than ignored under the others.
+    /// wherever there is a network to reach a resolver over; the other
+    /// two configure the sidecar only the isolated mode runs. Each is
+    /// refused rather than ignored where it cannot apply.
     #[test]
     fn sidecar_children_need_the_isolated_mode() {
-        for mode in ["", " \"host\"", " \"none\""] {
+        for mode in ["", " \"host\""] {
             let text = format!("network{mode} {{\n    dns \"1.1.1.1\"\n}}");
             assert!(parse(&text).is_ok(), "{text}");
         }
+        // `none` is no network, so a nameserver named under it is a
+        // server nothing in the sandbox could ever send a query to.
+        let text = "network \"none\" {\n    dns \"1.1.1.1\"\n}";
+        assert!(
+            matches!(parse(text), Err(ConfigError::BadArgument { node, .. }) if node == "network"),
+            "{:?}",
+            parse(text)
+        );
         for child in ["allow-port 80", "no-ipv6"] {
             let ok = format!("network {{\n    {child}\n}}");
             assert!(parse(&ok).is_ok(), "{ok}");
@@ -1718,8 +1734,8 @@ mod tests {
 
     /// pasta refuses a loopback `--dns-forward`, and for the same reason
     /// a loopback resolver in an isolated namespace names the sandbox
-    /// itself. Under the other two modes the loopback is the host's own
-    /// and a stub resolver there is the normal case.
+    /// itself. Under `host` the loopback is the host's own and a stub
+    /// resolver there is the normal case.
     #[test]
     fn a_loopback_resolver_is_refused_only_where_it_would_be_the_sandbox() {
         for addr in ["127.0.0.1", "127.0.0.53", "::1"] {
@@ -1729,10 +1745,8 @@ mod tests {
                 "{isolated}: {:?}",
                 parse(&isolated)
             );
-            for mode in ["\"host\"", "\"none\""] {
-                let text = format!("network {mode} {{\n    dns \"{addr}\"\n}}");
-                assert!(parse(&text).is_ok(), "{text}");
-            }
+            let text = format!("network \"host\" {{\n    dns \"{addr}\"\n}}");
+            assert!(parse(&text).is_ok(), "{text}");
         }
         assert!(parse("network {\n    dns \"1.1.1.1\"\n}").is_ok());
     }

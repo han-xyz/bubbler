@@ -647,8 +647,10 @@ impl Instance {
         (old && bare).then(|| {
             format!(
                 "`network` now means an isolated network namespace; run \
-                 `bubbler reseed {}` or write `network \"host\"` to keep the old behaviour",
-                self.name
+                 `bubbler reseed {name}` to write the config again from its profile, or \
+                 `bubbler edit {name}` to keep your own edits and record the version, \
+                 or write `network \"host\"` to keep the old behaviour",
+                name = self.name
             )
         })
     }
@@ -842,7 +844,10 @@ mod tests {
             assert_eq!(warning.is_some(), warns, "{text:?}");
             if let Some(w) = warning {
                 assert!(w.contains("isolated network namespace"), "{w}");
+                // Both ways out: one re-flattens the profile over the
+                // file, the other keeps what was written by hand.
                 assert!(w.contains("bubbler reseed e"), "{w}");
+                assert!(w.contains("bubbler edit e"), "{w}");
                 assert!(w.contains("network \"host\""), "{w}");
             }
         }

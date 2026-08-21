@@ -4736,6 +4736,64 @@ fn a_sandbox_whose_network_cannot_be_connected_never_runs() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "");
 }
 
+/// A sidecar that dies mid-run leaves the sandbox with a namespace
+/// connected to nothing. The run says so once and keeps going: an
+/// application that has lost its network still has whatever it has not
+/// written out.
+#[test]
+fn a_pasta_that_dies_mid_run_is_reported_once_and_the_sandbox_runs_on() {
+    if !require_bwrap() || !require_python() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    let mut run = pasta_case(tmp.path(), &init, "network\n")
+        .args(["run", "t", "--", "/usr/bin/sleep", "30"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let sock = tmp.path().join("run/bubbler/t/init.sock");
+    if !wait_until(
+        || UnixStream::connect(&sock).is_ok(),
+        Duration::from_secs(10),
+    ) {
+        fail_with(run, "the isolated instance never started");
+    }
+    let pid: i32 = std::fs::read_to_string(tmp.path().join("pasta.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    kill_process(
+        Pid::from_raw(pid).expect("the sidecar has a pid"),
+        Signal::KILL,
+    )
+    .unwrap();
+    // bubbler is the only process that can reap it, and it reaps it as it
+    // notices: a pid that is gone is a notice that has been printed.
+    if !wait_until(|| !pid_alive(pid), Duration::from_secs(10)) {
+        fail_with(run, "the run never noticed the dead sidecar");
+    }
+    assert!(
+        run.try_wait().unwrap().is_none(),
+        "the run ended with the sidecar"
+    );
+    assert!(UnixStream::connect(&sock).is_ok(), "the sandbox is gone");
+    kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
+    let out = run.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("pasta exited (signal: 9"), "{err}");
+    assert_eq!(
+        err.matches("the sandbox has lost its network").count(),
+        1,
+        "{err}"
+    );
+}
+
 #[test]
 fn a_missing_pasta_names_the_package_and_the_host_mode() {
     if !require_bwrap() {
@@ -4785,7 +4843,10 @@ fn a_config_written_before_the_flip_warns_on_every_run() {
     };
     let err = warns("network\ncommand \"true\"\n");
     assert!(err.contains("isolated network namespace"), "{err}");
+    // Both ways out are named: one re-flattens the profile over the
+    // file, the other keeps the edits already in it.
     assert!(err.contains("bubbler reseed t"), "{err}");
+    assert!(err.contains("bubbler edit t"), "{err}");
     // A file that records the version, or names the mode, says what it
     // means and is left alone.
     for quiet in [

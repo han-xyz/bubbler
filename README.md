@@ -66,11 +66,39 @@ command's status.
 
     bubbler ─┬─ bwrap ── bwrap (pid 1 in the sandbox, reaps orphans)
              │              └─ bubbler-init (pid 2) ── your command
-             └─ bwrap ── bwrap ── xdg-dbus-proxy    (only with `dbus`)
+             ├─ bwrap ── bwrap ── xdg-dbus-proxy    (only with `dbus`)
+             └─ pasta                               (only with an isolated
+                                                     `network`; not sandboxed)
 
 Each `bwrap` leaves a reaper as pid 1 of its own pid namespace. The proxy's
 sandbox is a sibling of the app's, started by `bubbler` and invisible from
 inside it.
+
+**pasta is the one sidecar bubbler does not wrap.** bubbler starts it as your
+user, outside every sandbox, and hands it a descriptor for the sandbox's outer
+user namespace, which pasta joins in order to configure the network namespace
+that hangs off it. Joining one grants "all capabilities in that namespace,
+regardless of its user and group IDs" (`setns(2)`), and a capability in a user
+namespace permits privileged operations only "on resources governed by that
+namespace" (`user_namespaces(7)`). So a pasta that has been taken over owns the
+sandboxed application — it *is* that sandbox's network, and it holds root over
+the namespaces the sandbox is built from — and owns nothing beyond what your
+own account already has: your uid created that namespace, so the descriptor
+hands over no authority you did not have.
+
+Running it under bwrap would not add any: it would *remove* what pasta needs.
+bwrap would put pasta in a user namespace of its own, and a process can only
+join a *descendant* of the namespace it is in (`setns(2)`) — the sandbox's
+namespace would then be a sibling, so pasta could no longer reach the thing it
+exists to configure. What it does instead is isolate itself: it `pivot_root()`s
+into an empty filesystem "for stricter isolation", and a `pivot_root()` that
+fails fails the whole start, since bubbler passes no `--chroot-fallback`
+(`pasta(1)`). Measured on a bubbler run on this host, the sidecar also runs
+with `NoNewPrivs: 1`, one seccomp filter (`Seccomp: 2`) and a `/proc/<pid>` its
+own user may not read — `PR_SET_DUMPABLE` off, which is also why the two paths
+bubbler hands it name bubbler's descriptors rather than pasta's own. This is a
+recorded decision, not an oversight: the alternative is not a sandboxed pasta
+but no isolated network namespace at all.
 
 `try` runs one command in a sandbox without creating an instance. Its config is
 the flattened profile (`generic` unless `--profile` says otherwise) plus one
@@ -637,25 +665,37 @@ translation rule nothing points at is one more route to the host for no gain.
 For the same reason `dns` may not name a loopback address under the isolated
 mode — that is the sandbox's own loopback, not the host's — and the parser
 refuses it; under `network "host"` a stub resolver there is the normal case and
-is accepted. `network "none"` writes no resolver file at all, whatever `dns`
-says: there is no network to carry the query. Only `network "host"` with no
-`dns` child binds the host's own `/etc/resolv.conf`, which is what it always
-did.
+is accepted. Under `network "none"` a `dns` child is refused outright: there is
+no network to carry the query, so it would name a resolver nothing in the
+sandbox could reach. Only `network "host"` with no `dns` child binds the host's
+own `/etc/resolv.conf`, which is what it always did.
 
 pasta is a hard requirement of the isolated mode, not a preference: a private
 namespace with connectivity has no other unprivileged route (a veth pair needs
 `CAP_NET_ADMIN` in the initial user namespace, which is real root). A missing
 `pasta` is an error naming the `passt` package and `network "host"`, never a
-quiet fall back to the host namespace — which would undo the whole grant. The
+quiet fall back to the host namespace — which would undo the whole grant. It is
+the one sidecar bubbler does not wrap in a sandbox of its own; what that means
+for the trust boundary is under "A run is a chain of processes" above. The
 sidecar is killed on every way out of a run, and a sandbox whose namespace
 cannot be connected is stopped where it stands rather than started without the
 network it was granted: it waits at bwrap's `--block-fd` until pasta reports
 that the namespace is configured.
 
+Two things are checked around that. Before pasta is started, bubbler compares
+the network namespace of the pid bwrap reported with its own: a sandbox that
+died in between leaves that pid to be handed out again, and pasta would then
+configure the network namespace of whatever holds it now — the host's. Equal
+namespaces stop the run instead. And a pasta that dies *during* a run is
+reported once, as `pasta exited (<status>); the sandbox has lost its network`;
+the application keeps running without one, since a lost network is no reason to
+throw away what it has not written out yet.
+
 A config written before this — one with no `// bubbler config: 2` header line
 and a bare `network` node — asks for a different sandbox now than it did then,
-so every run of it prints a warning naming the change. `bubbler reseed <name>`
-re-flattens the profile and writes the header; `bubbler edit <name>` writes the
+so every run of it prints a warning naming the change and both ways out of it.
+`bubbler reseed <name>` writes the config again from its profile and stamps the
+header; `bubbler edit <name>` keeps whatever was written by hand and stamps the
 header too, since a file you have just read through means what it says.
 
 ### env and command
@@ -1008,8 +1048,10 @@ sockets everything else naming that id connects to), `network-host`
 stack), `ozone-hint-unnecessary`,
 `command-not-found`, `camera-nodes-none-present` (`camera nodes=#true` on a
 host with no `/dev/video*` or `/dev/media*`, so that half of the grant binds
-nothing), `camera-nodes-no-hotplug` (the node list is frozen at launch and an
-own network namespace delivers no uevents), `secrets-access` (`talk`/`own` of
+nothing), `camera-nodes-no-hotplug` (the node list is frozen at launch, and
+under an isolated network namespace no uevent reaches the sandbox either —
+that second half is dropped under `network "host"`), `secrets-access`
+(`talk`/`own` of
 `org.freedesktop.secrets` on the session bus reaches the whole login keyring:
 the Secret Service API partitions nothing between the applications that call
 it), `lint-allow-unused` (a `lint-allow` node that accepts nothing, which is a

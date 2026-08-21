@@ -314,7 +314,7 @@ mod tests {
             "network \"none\"\n",
             "network {\n    dns \"1.1.1.1\"\n}\n",
             "network \"host\" {\n    dns \"1.1.1.1\"\n    dns \"9.9.9.9\"\n}\n",
-            "network \"none\" {\n    dns \"::1\"\n}\n",
+            "network \"host\" {\n    dns \"::1\"\n}\n",
             "network {\n    allow-port 8080\n}\n",
             "network {\n    allow-port 53 udp=#true\n}\n",
             "network {\n    no-ipv6\n}\n",

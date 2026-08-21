@@ -606,8 +606,12 @@ impl Findings {
 /// dropped: they name something the file cannot do.
 fn run(ctx: &Context, sources: &[Source]) -> Report {
     let mut f = Findings::default();
+    // Read across the layers, since the node a per-layer finding depends
+    // on may be written in another file than the node it is about. The
+    // last layer that names the mode is the one the merge keeps.
+    let host_net = last(sources, "network").is_some_and(|(_, n)| arg(n) == Some("host"));
     for (i, source) in sources.iter().enumerate() {
-        per_layer(ctx, i, source, &mut f);
+        per_layer(ctx, i, source, host_net, &mut f);
     }
     across_layers(ctx, sources, &mut f);
     let allowed: Vec<&str> = sources
@@ -728,8 +732,10 @@ fn arg(node: &KdlNode) -> Option<&str> {
 
 /// What a `camera nodes=#true` costs that the portal half does not: a
 /// device list frozen at launch, and, on a host with no camera, nothing
-/// to bind at all.
-fn camera_nodes(ctx: &Context, i: usize, node: &KdlNode, f: &mut Findings) {
+/// to bind at all. `host_net` is whether the merged config puts the
+/// sandbox on the host's network namespace, which decides whether a
+/// uevent about a camera plugged in later can reach it at all.
+fn camera_nodes(ctx: &Context, i: usize, node: &KdlNode, host_net: bool, f: &mut Findings) {
     let dev = Path::new("/dev");
     let present = ctx.host.list_dir(dev).into_iter().any(|name| {
         let bytes = name.as_encoded_bytes();
@@ -751,14 +757,27 @@ fn camera_nodes(ctx: &Context, i: usize, node: &KdlNode, f: &mut Findings) {
              application is a plain V4L2 client",
         );
     }
+    // The uevent half holds only where the namespace does: a udev
+    // monitor is a `NETLINK_KOBJECT_UEVENT` socket, which receives from
+    // its own network namespace alone (`netlink(7)`), and measured on
+    // this host a listener sharing the host's namespace saw every
+    // uevent while one under `--unshare-net` saw none. The frozen list
+    // is what stays true under either mode.
+    let unheard = match host_net {
+        true => "",
+        false => {
+            ", and with a network namespace of its own the sandbox is never told \
+                  about one either"
+        }
+    };
     f.push(
         i,
         node,
         &CAMERA_NODES_NO_HOTPLUG,
-        "`camera nodes=#true` binds the nodes this host has at launch: a camera plugged in \
-         later has no node inside, and with a network namespace of its own the sandbox is \
-         never told about one either"
-            .to_owned(),
+        format!(
+            "`camera nodes=#true` binds the nodes this host has at launch: a camera \
+             plugged in later has no node inside{unheard}"
+        ),
         "restart the instance after plugging a camera in; the portal half follows hotplug \
          in the host daemon instead",
     );
@@ -791,8 +810,9 @@ fn rule_name(node: &KdlNode) -> Option<&str> {
     }
 }
 
-/// Checks that need one layer and nothing else.
-fn per_layer(ctx: &Context, i: usize, source: &Source, f: &mut Findings) {
+/// Checks that need one layer and nothing else, apart from `host_net`:
+/// the merged mode a `camera` message reads differently under.
+fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut Findings) {
     for node in source.doc.nodes() {
         match node.name().value() {
             "x11" => f.push(
@@ -847,7 +867,9 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, f: &mut Findings) {
                     );
                 }
             }
-            "camera" if flag(node, "nodes") == Some(true) => camera_nodes(ctx, i, node, f),
+            "camera" if flag(node, "nodes") == Some(true) => {
+                camera_nodes(ctx, i, node, host_net, f);
+            }
             "dbus" => dbus_node(i, node, f),
             "system-bus" => system_bus(i, node, f),
             "app-runtime" if prop(node, "mode") == Some("rw") => f.push(
@@ -1490,6 +1512,31 @@ mod tests {
                 ids(&lint(ctx, &["dbus\nportals\ncamera nodes=#false"])),
                 [] as [&str; 0]
             );
+            // The device list is frozen whatever the network is, but
+            // only a namespace of its own keeps the uevent from the
+            // sandbox — and the mode may be named in another layer.
+            let isolated = lint(ctx, &["dbus\nportals\ncamera nodes=#true"]);
+            assert!(
+                isolated.findings[0]
+                    .message
+                    .contains("never told about one"),
+                "{isolated:#?}"
+            );
+            for layers in [
+                &["dbus\nportals\ncamera nodes=#true\nnetwork \"host\""][..],
+                &["network \"host\"", "dbus\nportals\ncamera nodes=#true"][..],
+            ] {
+                let report = lint(ctx, layers);
+                let camera = report
+                    .findings
+                    .iter()
+                    .find(|f| f.id == "camera-nodes-no-hotplug")
+                    .expect("the frozen list is reported whatever the network is");
+                assert!(
+                    !camera.message.contains("never told about one"),
+                    "{camera:#?}"
+                );
+            }
         });
         with(&host(), |ctx| {
             // No node on this host, so the device half binds nothing.

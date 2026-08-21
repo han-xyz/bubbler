@@ -147,12 +147,34 @@ impl RealAlloc {
         self.fds.push(fd);
         OsString::from(n.to_string())
     }
+
+    /// Clear `CLOEXEC` on every fd the next spawn is meant to inherit, or
+    /// put it back once that spawn has happened.
+    ///
+    /// bubbler spawns more than one process per run — the D-Bus proxy
+    /// before the sandbox, pasta after it — and each of these fds belongs
+    /// to exactly one of them. They are `CLOEXEC` at rest, so the window
+    /// in which they can be inherited is the one spawn they were built
+    /// for.
+    fn inheritable(&self, on: bool) -> io::Result<()> {
+        let flags = match on {
+            true => FdFlags::empty(),
+            false => FdFlags::CLOEXEC,
+        };
+        for fd in &self.fds {
+            fcntl_setfd(fd, flags)?;
+        }
+        Ok(())
+    }
 }
 
 impl FdAllocator for RealAlloc {
     fn data(&mut self, content: &[u8]) -> io::Result<OsString> {
-        // No `MFD_CLOEXEC`: bwrap is a child process and must inherit the fd.
-        let fd = rustix::fs::memfd_create("bubbler-data", MemfdFlags::empty())?;
+        // `MFD_CLOEXEC` and cleared again only around the spawn this argv
+        // was built for ([`RealAlloc::inheritable`]): a data file holds
+        // the sandbox's `/etc/passwd`, its `/.flatpak-info` and its
+        // resolver, and no sidecar of the run has any use for one.
+        let fd = rustix::fs::memfd_create("bubbler-data", MemfdFlags::CLOEXEC)?;
         let mut f = std::fs::File::from(fd);
         f.write_all(content)?;
         f.seek(SeekFrom::Start(0))?;
@@ -570,6 +592,7 @@ pub fn start_proxy(
         host,
         &mut alloc,
     )?;
+    alloc.inheritable(true).map_err(LaunchError::Data)?;
     let child = Command::new("bwrap")
         .args(&argv)
         .spawn()
@@ -585,9 +608,7 @@ pub fn start_proxy(
     };
     // The instance's own bwrap must not inherit these: a second holder of
     // the ready pipe would keep the proxy alive after the run has ended.
-    for fd in &handle.alloc.fds {
-        fcntl_setfd(fd, FdFlags::CLOEXEC).map_err(|e| LaunchError::Data(e.into()))?;
-    }
+    handle.alloc.inheritable(false).map_err(LaunchError::Data)?;
     let ProxyHandle { child, alloc, .. } = &mut handle;
     let ready = alloc
         .ready_read
@@ -620,6 +641,33 @@ fn abort_sandbox(child: &mut Child, sandbox: Option<i32>) {
 #[derive(Debug)]
 struct PastaHandle {
     child: Child,
+    /// Set once the run has reaped the sidecar, which is both what makes
+    /// the notice below appear once and what stops the pid from being
+    /// signalled after it has stopped being pasta's.
+    exited: bool,
+}
+
+impl PastaHandle {
+    /// Say, once, that the sidecar is gone. The sandbox keeps running:
+    /// its namespace is simply no longer connected to anything, and
+    /// killing an application over a lost network would lose whatever it
+    /// has not written out.
+    // Through the relay's own warning channel and not `eprintln!`: this
+    // runs inside the loop that answers the exit check and the signals,
+    // and one blocking write to a terminal that has stopped reading
+    // would park that loop for good.
+    fn check(&mut self, warn: &tty::Warn) {
+        if self.exited {
+            return;
+        }
+        let Ok(Some(status)) = self.child.try_wait() else {
+            return;
+        };
+        self.exited = true;
+        warn.say(&format!(
+            "bubbler: warning: pasta exited ({status}); the sandbox has lost its network\n"
+        ));
+    }
 }
 
 impl Drop for PastaHandle {
@@ -628,6 +676,14 @@ impl Drop for PastaHandle {
     /// does not pass `--no-netns-quit`), but a sidecar with a route out of
     /// the host must not be left to a condition bubbler does not control.
     fn drop(&mut self) {
+        // A sidecar that has already been reaped — by the run's own
+        // check, or by the readiness wait giving up on it — is not
+        // signalled: that pid names whatever the kernel has handed it to
+        // since. `try_wait` answers from the status it cached the first
+        // time, so a reaping anywhere in the run is caught here.
+        if self.exited || matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
         if let Some(pid) = i32::try_from(self.child.id()).ok().and_then(Pid::from_raw) {
             let _ = kill_process(pid, Signal::TERM);
         }
@@ -645,6 +701,14 @@ impl Drop for PastaHandle {
             std::thread::sleep(POLL);
         }
     }
+}
+
+/// Whether two `/proc/<pid>/ns/<type>` links name the same namespace.
+/// The link is compared, not the path: `ns/net` reads as `net:[<inode>]`
+/// and the inode is the namespace's identity (`namespaces(7)`).
+fn same_namespace(a: &Path, b: &Path) -> Result<bool, LaunchError> {
+    let read = |p: &Path| std::fs::read_link(p).map_err(|e| LaunchError::Io(p.to_path_buf(), e));
+    Ok(read(a)? == read(b)?)
 }
 
 /// Start pasta on the sandbox's network namespace and wait until it has
@@ -666,6 +730,18 @@ fn start_pasta(env: &Env, cfg: &NetworkConfig, child_pid: i32) -> Result<PastaHa
     let ns_path = PathBuf::from(format!("/proc/{child_pid}/ns/user"));
     let userns = rustix::fs::open(&ns_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
         .map_err(|e| LaunchError::Io(ns_path, e.into()))?;
+    // The pid comes from bwrap's info document, and a sandbox that died
+    // in the meantime leaves it to be handed out again. pasta configures
+    // the network namespace of whatever holds the pid *now*, so a
+    // sandbox that is not in a namespace of its own is not the sandbox.
+    if same_namespace(
+        &PathBuf::from(format!("/proc/{child_pid}/ns/net")),
+        Path::new("/proc/self/ns/net"),
+    )? {
+        return Err(LaunchError::Network(
+            "sandbox pid reused; refusing to configure the host network namespace".to_owned(),
+        ));
+    }
     let (ready, done) = rustix::pipe::pipe().map_err(|e| LaunchError::Data(e.into()))?;
     for fd in [&ready, &done] {
         fcntl_setfd(fd, FdFlags::CLOEXEC).map_err(|e| LaunchError::Data(e.into()))?;
@@ -703,7 +779,10 @@ fn start_pasta(env: &Env, cfg: &NetworkConfig, child_pid: i32) -> Result<PastaHa
             _ => LaunchError::Spawn(e),
         })?;
     // From here on every exit path stops pasta through the handle.
-    let mut handle = PastaHandle { child };
+    let mut handle = PastaHandle {
+        child,
+        exited: false,
+    };
     if !wait_ready(&ready, &mut handle.child, Instant::now() + PASTA_READY) {
         return Err(LaunchError::Network(
             "pasta did not configure the namespace".to_owned(),
@@ -1167,17 +1246,38 @@ fn stdio_for(target: StdioTarget, pty: Option<&Pty>) -> Result<Stdio, LaunchErro
     }
 }
 
-/// Forward a caught signal to the sandbox and report the exit code once
-/// bwrap has one. The single place a run learns that it is over.
-fn check_exit(
-    child: &mut Child,
-    stop: &AtomicBool,
+/// What every wait loop watches besides the sandbox process itself: the
+/// signal flags, the supervisor a stop is forwarded to, and the sidecar
+/// whose own exit the run has to notice.
+struct Watch<'a> {
+    /// Set by the signal handler; cleared as the run acts on it.
+    stop: &'a AtomicBool,
+    /// The process inside the sandbox a SIGTERM goes to, if it was found.
     supervisor: Option<Pid>,
-    stopping: &AtomicBool,
-) -> io::Result<Option<i32>> {
+    /// Latched once a stop has been seen, for as long as the run lasts.
+    stopping: &'a AtomicBool,
+    /// The pasta sidecar, where the run has one.
+    pasta: &'a mut Option<PastaHandle>,
+    /// Where a word about the sidecar goes without blocking the loop.
+    warn: &'a tty::Warn,
+}
+
+/// Forward a caught signal to the sandbox and report the exit code once
+/// bwrap has one. The single place a run learns that it is over, and so
+/// the one place the sidecar is checked on as well.
+fn check_exit(child: &mut Child, w: &mut Watch<'_>) -> io::Result<Option<i32>> {
     if let Some(status) = child.try_wait()? {
         return Ok(Some(exit_code(status)));
     }
+    if let Some(pasta) = w.pasta.as_mut() {
+        pasta.check(w.warn);
+    }
+    let Watch {
+        stop,
+        supervisor,
+        stopping,
+        ..
+    } = w;
     if stop.swap(false, Ordering::SeqCst) {
         // Latched, unlike `stop` itself: from here on the user is
         // waiting, and the relay hands over what it holds accordingly.
@@ -1199,12 +1299,10 @@ fn check_exit(
 /// error left in `failed` for the caller to return.
 fn until_exit<'a>(
     child: &'a mut Child,
-    stop: &'a AtomicBool,
-    supervisor: Option<Pid>,
-    stopping: &'a AtomicBool,
+    w: &'a mut Watch<'_>,
     failed: &'a mut Option<io::Error>,
 ) -> impl FnMut() -> Option<i32> + 'a {
-    move || match check_exit(child, stop, supervisor, stopping) {
+    move || match check_exit(child, w) {
         Ok(code) => code,
         Err(e) => {
             *failed = Some(e);
@@ -1215,16 +1313,9 @@ fn until_exit<'a>(
 
 /// Wait for a sandbox that has no terminal and no pipes of ours: nothing
 /// to move, so the loop only watches for the exit and for signals.
-fn wait_plain(
-    child: &mut Child,
-    stop: &AtomicBool,
-    supervisor: Option<Pid>,
-    stopping: &AtomicBool,
-) -> Result<i32, LaunchError> {
+fn wait_plain(child: &mut Child, w: &mut Watch<'_>) -> Result<i32, LaunchError> {
     loop {
-        if let Some(code) =
-            check_exit(child, stop, supervisor, stopping).map_err(LaunchError::Spawn)?
-        {
+        if let Some(code) = check_exit(child, w).map_err(LaunchError::Spawn)? {
             return Ok(code);
         }
         std::thread::sleep(POLL);
@@ -1235,15 +1326,14 @@ fn wait_plain(
 /// and stderr, which is all `tty "none"` needs.
 fn wait_pumping(
     child: &mut Child,
-    stop: &AtomicBool,
-    supervisor: Option<Pid>,
-    stopping: &AtomicBool,
+    w: &mut Watch<'_>,
     pipes: &[(BorrowedFd<'_>, BorrowedFd<'_>, &str)],
     sink: BorrowedFd<'_>,
 ) -> Result<i32, LaunchError> {
     let mut failed = None;
+    let stopping = w.stopping;
     let code = {
-        let mut until = until_exit(child, stop, supervisor, stopping, &mut failed);
+        let mut until = until_exit(child, w, &mut failed);
         tty::pump(pipes, sink, &mut until, stopping)?
     };
     match failed {
@@ -1272,8 +1362,7 @@ struct RelayEnds<'a> {
 /// cannot fill it and block.
 fn wait_relaying(
     child: &mut Child,
-    stop: &AtomicBool,
-    supervisor: Option<Pid>,
+    w: &mut Watch<'_>,
     caught: &tty::Caught<'_>,
     master: BorrowedFd<'_>,
     ends: RelayEnds<'_>,
@@ -1281,7 +1370,7 @@ fn wait_relaying(
 ) -> Result<i32, LaunchError> {
     let mut failed = None;
     let end = {
-        let mut until = until_exit(child, stop, supervisor, caught.stop, &mut failed);
+        let mut until = until_exit(child, w, &mut failed);
         tty::relay(
             master,
             ends.input,
@@ -1305,7 +1394,7 @@ fn wait_relaying(
                 guard.restore();
             }
             eprintln!("{}", tty::DETACHED_NOTE);
-            let mut until = until_exit(child, stop, supervisor, caught.stop, &mut failed);
+            let mut until = until_exit(child, w, &mut failed);
             match tty::relay(
                 master,
                 None,
@@ -1350,8 +1439,6 @@ pub fn run(
         UnixListener::bind(&sock_path).map_err(|e| LaunchError::Io(sock_path.clone(), e))?;
     let _socket_guard = FileGuard(sock_path.clone());
     let inherited = fcntl_dupfd_cloexec(listener.as_fd(), 3).map_err(io_at)?;
-    // bwrap must inherit exactly this one fd; everything else stays CLOEXEC.
-    fcntl_setfd(&inherited, FdFlags::empty()).map_err(io_at)?;
     let mut alloc = RealAlloc::new(inherited.as_raw_fd());
     // A run with nothing to run must fail before a sidecar is started.
     resolve_command(inst, command)?;
@@ -1417,6 +1504,11 @@ pub fn run(
         true => Some(RawGuard::new(host[0].as_fd())?),
         false => None,
     };
+    // The sandbox's own fds are inheritable for exactly this spawn: the
+    // proxy was started before it and pasta is started after it, and the
+    // instance's control socket in particular is neither one's to hold.
+    alloc.inheritable(true).map_err(LaunchError::Data)?;
+    fcntl_setfd(&inherited, FdFlags::empty()).map_err(io_at)?;
     let mut child = Command::new("bwrap")
         .args(&argv)
         .stdin(stdio_for(stdio.fds[0], stdio.pty.as_ref())?)
@@ -1427,6 +1519,7 @@ pub fn run(
             io::ErrorKind::NotFound => LaunchError::BwrapMissing,
             _ => LaunchError::Spawn(e),
         })?;
+    alloc.inheritable(false).map_err(LaunchError::Data)?;
     // The sandbox holds the listening socket and the info pipe now; bubbler
     // keeping copies would make a dead instance look live and hide the EOF.
     drop(inherited);
@@ -1458,7 +1551,7 @@ pub fn run(
     // and one let go before its namespace is connected would start with
     // no network at all. A sandbox that cannot be connected is stopped
     // where it stands rather than run without what it was granted.
-    let _pasta = match isolated {
+    let mut pasta = match isolated {
         Some(cfg) => {
             let started = match info.as_ref() {
                 Some((child_pid, _)) => start_pasta(env, cfg, *child_pid),
@@ -1494,6 +1587,14 @@ pub fn run(
         winch: &winch,
         stop: &stopping,
     };
+    let warn = tty::Warn::new();
+    let mut watch = Watch {
+        stop: &stop,
+        supervisor,
+        stopping: &stopping,
+        pasta: &mut pasta,
+        warn: &warn,
+    };
     let code = match &master {
         Some(master) => {
             let out = tty::output_fd(&stdio, &host);
@@ -1512,8 +1613,7 @@ pub fn run(
             };
             wait_relaying(
                 &mut child,
-                &stop,
-                supervisor,
+                &mut watch,
                 &caught,
                 master.as_fd(),
                 ends,
@@ -1525,16 +1625,9 @@ pub fn run(
                 .iter()
                 .map(|(read, i)| (read.as_fd(), host[*i].as_fd(), tty::FD_NAMES[*i]))
                 .collect();
-            wait_pumping(
-                &mut child,
-                &stop,
-                supervisor,
-                &stopping,
-                &ends,
-                sink.as_fd(),
-            )
+            wait_pumping(&mut child, &mut watch, &ends, sink.as_fd())
         }
-        None => wait_plain(&mut child, &stop, supervisor, &stopping),
+        None => wait_plain(&mut child, &mut watch),
     }?;
     // bwrap copies the data files out of the fds while it starts, so they
     // must stay open until it has exited.
@@ -2705,17 +2798,22 @@ mod tests {
     }
 
     #[test]
-    fn real_alloc_data_is_readable_from_the_start_and_inheritable() {
+    fn real_alloc_data_is_readable_from_the_start_and_inheritable_for_one_spawn() {
         use std::io::Read;
         let mut alloc = RealAlloc::new(7);
         let fd = alloc.data(b"hello").unwrap();
         assert_eq!(alloc.init_socket().unwrap(), OsString::from("7"));
         assert_eq!(alloc.fds.len(), 1);
         assert_eq!(fd, OsString::from(alloc.fds[0].as_raw_fd().to_string()));
-        assert_eq!(
-            rustix::io::fcntl_getfd(&alloc.fds[0]).unwrap(),
-            FdFlags::empty()
-        );
+        let flags = || rustix::io::fcntl_getfd(&alloc.fds[0]).unwrap();
+        // At rest the file is closed on exec, so the sidecars the run
+        // spawns around the sandbox — the proxy before it, pasta after
+        // it — never inherit the sandbox's `/etc/passwd` or its resolver.
+        assert_eq!(flags(), FdFlags::CLOEXEC);
+        alloc.inheritable(true).unwrap();
+        assert_eq!(flags(), FdFlags::empty());
+        alloc.inheritable(false).unwrap();
+        assert_eq!(flags(), FdFlags::CLOEXEC);
         // A dup shares the file offset, so this reads what bwrap would read.
         let mut got = String::new();
         std::fs::File::from(alloc.fds[0].try_clone().unwrap())
@@ -2759,6 +2857,31 @@ mod tests {
         let mut got = String::new();
         std::fs::File::from(read).read_to_string(&mut got).unwrap();
         assert_eq!(got, "{}");
+    }
+
+    /// The namespace is the inode the link names, so a reused pid is
+    /// caught by comparing what the two links read as and never by the
+    /// paths, which always differ.
+    #[test]
+    fn the_namespace_check_compares_what_the_links_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let link = |name: &str, target: &str| {
+            let p = tmp.path().join(name);
+            std::os::unix::fs::symlink(target, &p).unwrap();
+            p
+        };
+        let mine = link("mine", "net:[4026531840]");
+        let same = link("same", "net:[4026531840]");
+        let other = link("other", "net:[4026532567]");
+        assert!(same_namespace(&mine, &same).unwrap());
+        assert!(!same_namespace(&mine, &other).unwrap());
+        assert!(!same_namespace(&other, &same).unwrap());
+        // A link that cannot be read is never a match: a pid the run
+        // cannot ask about is one it must not hand to pasta either.
+        assert!(same_namespace(&mine, &tmp.path().join("gone")).is_err());
+        // And against the real thing: bubbler is in its own namespace.
+        let me = Path::new("/proc/self/ns/net");
+        assert!(same_namespace(me, me).unwrap());
     }
 
     #[test]
