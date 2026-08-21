@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/bubbler-core", "crates/bubbler", "crates/bubbler-init"]
 
 [workspace.package]
-version = "0.7.1"
+version = "0.8.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/han-xyz/bubbler"
