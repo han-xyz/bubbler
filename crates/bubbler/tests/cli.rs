@@ -6006,3 +6006,60 @@ fn a_config_that_does_not_parse_reaches_the_log_of_the_run_it_stopped() {
     // The run went ahead: what stopped it is the missing supervisor.
     assert!(err.contains("bubbler-init"), "{err}");
 }
+
+/// A stand-in for the terminal editor: `bubbler ui` execs whatever is
+/// named `bubbler-ui`, so a script that says which copy it is proves
+/// which one was found.
+fn fake_ui(path: &Path, says: &str, code: u8) {
+    std::fs::write(path, format!("#!/bin/sh\necho '{says}'\nexit {code}\n")).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn ui_runs_the_editor_beside_it_before_the_one_on_the_path() {
+    let tmp = setup();
+    let root = tmp.path();
+    // A copy of the binary, so what is "beside it" is the test's to
+    // decide: the built binary's own directory holds the real editor.
+    let beside = root.join("beside");
+    let on_path = root.join("on-path");
+    std::fs::create_dir_all(&beside).unwrap();
+    std::fs::create_dir_all(&on_path).unwrap();
+    let bubbler = beside.join("bubbler");
+    std::fs::copy(env!("CARGO_BIN_EXE_bubbler"), &bubbler).unwrap();
+    let ui = || {
+        let mut c = Command::new(&bubbler);
+        c.arg("ui")
+            .env_clear()
+            .env("PATH", &on_path)
+            .env("HOME", root.join("home"))
+            .env("XDG_RUNTIME_DIR", root.join("run"));
+        c
+    };
+
+    // With no editor anywhere, the way to get one.
+    let out = ui().output().unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("bubbler-ui"), "{err}");
+    assert!(err.contains("separate binary"), "{err}");
+
+    // Then the one on PATH.
+    fake_ui(&on_path.join("bubbler-ui"), "the editor on PATH", 7);
+    let out = ui().output().unwrap();
+    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "the editor on PATH"
+    );
+
+    // And a copy beside the binary wins, so a pair built or unpacked
+    // together stay a pair.
+    fake_ui(&beside.join("bubbler-ui"), "the editor beside it", 9);
+    let out = ui().output().unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "the editor beside it"
+    );
+}

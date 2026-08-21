@@ -6,6 +6,7 @@ mod manpage;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::str::FromStr;
@@ -354,6 +355,15 @@ from a file that grants too much. The checks are listed in bubbler-config(5).")]
         /// Shim name, as `wrap --list` prints it.
         name: String,
     },
+    /// Edit instances in a terminal editor, with what each grant costs.
+    #[command(long_about = "\
+Start `bubbler-ui`, the terminal editor for instances: the grants of an instance
+on the left, what granting each one costs and what the linter makes of it on the
+right, and a key for every subcommand here. It is a separate binary, so the
+command line never carries its dependencies; this subcommand runs the copy
+beside this binary, else the first on PATH, and says how to install it when
+there is none. Everything it does, it does by running this binary.")]
+    Ui,
     /// Print bubbler's manual pages in roff.
     #[command(long_about = "\
 Print bubbler's own manual page, bubbler(1), as roff on stdout: the synopsis
@@ -634,6 +644,28 @@ fn update_desktop_db(dir: &Path) {
         ),
         Err(e) => eprintln!("bubbler: warning: {e}"),
     }
+}
+
+/// File name of the terminal editor `bubbler ui` starts.
+const UI_BINARY: &str = "bubbler-ui";
+
+/// Whether `path` is a file a `PATH` search would run.
+fn executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// Where the terminal editor is: beside this binary first, so a pair
+/// built or unpacked together stay a pair, then the first on `$PATH`.
+fn ui_binary(exe: &Path, search_path: &[PathBuf]) -> Option<PathBuf> {
+    let sibling = exe.parent().map(|dir| dir.join(UI_BINARY));
+    if let Some(sibling) = sibling.filter(|p| executable(p)) {
+        return Some(sibling);
+    }
+    search_path
+        .iter()
+        .map(|dir| dir.join(UI_BINARY))
+        .find(|candidate| executable(candidate))
 }
 
 /// Program and arguments from `$VISUAL`, else `$EDITOR`. The value is
@@ -1186,6 +1218,22 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             };
             warn_lint(lint::lint_config(&ctx, &config));
             print_lines(&[config.as_os_str()], "the config path")
+        }
+        Cmd::Ui => {
+            let exe = std::env::current_exe().context("finding this bubbler binary")?;
+            let editor = ui_binary(&exe, &host_env::search_path()).with_context(|| {
+                format!(
+                    "no `{UI_BINARY}` beside {} or on PATH; it is a separate binary, \
+                     installed as /usr/bin/{UI_BINARY} or with \
+                     `cargo install --path crates/{UI_BINARY}`",
+                    exe.display()
+                )
+            })?;
+            // Replaces this process: the editor owns the terminal from
+            // here, and a bubbler waiting on it would be a process in the
+            // way of every signal the terminal sends.
+            let e = Command::new(&editor).exec();
+            Err(e).with_context(|| format!("running {}", editor.display()))
         }
         Cmd::Man { config } => {
             let version = format!("bubbler {}", env!("CARGO_PKG_VERSION"));

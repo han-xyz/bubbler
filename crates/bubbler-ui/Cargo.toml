@@ -1,0 +1,21 @@
+[package]
+name = "bubbler-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "terminal editor for bubbler instances: what a grant costs, next to the toggle"
+
+[[bin]]
+name = "bubbler-ui"
+path = "src/main.rs"
+
+[dependencies]
+bubbler-core.workspace = true
+anyhow.workspace = true
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "layout-cache"] }
+rustix.workspace = true
+signal-hook.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

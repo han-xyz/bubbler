@@ -51,6 +51,7 @@ every bwrap argument under the node that produced it. See "Known gaps" below.
     bubbler try --keep scratch -- sh      # keep it afterwards as instance `scratch`
     bubbler list
     bubbler delete ff --yes               # instance and private home; irreversible
+    bubbler ui                            # the terminal editor, if it is installed
     bubbler man                           # bubbler(1) as roff, on stdout
     bubbler man --config                  # bubbler-config(5): every node, every check
 
@@ -1175,6 +1176,87 @@ footgun left is wrapping a program bubbler itself runs on the host — `edit`
 execs `$VISUAL`/`$EDITOR` with no shell, so a wrapped `nvim` would open
 `config.kdl` inside a sandbox that has no bind for it.
 
+## Terminal editor
+
+    bubbler ui                       # start it
+    bubbler-ui                       # the same thing, on its own
+
+`config.kdl` is a list of grants whose meanings are the rest of this README,
+and the editor exists to put that text next to the toggle. The centre of it is
+one instance's grants: every node the config holds, then every node it could,
+with what granting each one costs and what `bubbler lint` makes of it — of the
+buffer as edited, not of the file on disk — in the pane beside it. `!` marks a
+grant that reaches wider than its name, `!!` one that gives the sandbox power
+outside itself.
+
+It is a **separate binary**. The command line links no terminal UI toolkit: by
+`cargo tree -e normal`, `bubbler`'s tree is 42 crates and the editor's is 76,
+and `bubbler ui` runs the `bubbler-ui` beside it, else the first on `$PATH`,
+and says how to install one when there is none.
+
+Everything it does, it does by running `bubbler`. There is no second path into
+a sandbox: `r` runs `bubbler run <instance> --tty none`, `x` runs `bubbler exec
+…`, `e` runs `bubbler edit …`, and each is built as an argv with no shell
+anywhere. `run` and `open` are started detached: a process group of their own, so a `^C`
+meant for the editor is not sent to them, and `/dev/null` for stdio, so they
+hold no descriptor of this terminal. It is a new process group and not a new
+session — they stay in the editor's session, under its controlling terminal —
+and the state column catches up on the next second's probe. `exec`, `try` and
+the editors take the terminal instead: the editor leaves raw mode and the
+alternate screen first, and takes them back when the command exits, without
+asking the terminal anything on the way in or out.
+
+Whatever it ran, what is in the buffer stays in it: the list is read again
+afterwards, unsaved edits are kept, and the status line says so.
+
+`q` leaves and `Esc` goes back one screen. `^C` does nothing while the editor
+is up: the terminal is in raw mode, so every key reaches the editor rather
+than the shell.
+
+Keys, with `?` for the full list on every screen:
+
+| screen | keys |
+|---|---|
+| instances | `Enter` grants, `r` run, `o` open, `x` exec, `t` try, `n` new, `d` delete, `R` reseed, `e` `$EDITOR`, `l` lint, `L` last-run log, `D` desktop entry, `W` shim, `X` explain, `p` profiles, `^R` re-read |
+| grants | `Space` grant or revoke, `Enter` write the node as KDL, `e` `$EDITOR`, `s` save, `u` undo, `l` lint, `X` explain, `Esc` back |
+| profiles | `Enter` show it flattened, `c` create an instance from it, `e` `$EDITOR` on your layer, `l` lint |
+| viewer | `j`/`k` scroll, `f` every argument, `p` the proxy's argv |
+
+`Space` grants a node that means something on its own and revokes any node at
+all. Everything else is `Enter`, which opens the node as one line of KDL —
+`home-share "Downloads" mode=rw` — parsed by the parser that reads the file, so
+a line the editor accepts is a line bubbler accepts, and one it refuses stays on
+screen with the reason under it. A block node is valid KDL on one line too, so
+`dbus { talk "ca.desrt.dconf" }` goes in the same field; `e` drops to `$EDITOR`
+when a node is better read as a file, which is the escape hatch for anything
+the editor cannot express.
+
+The two prompts that take a command line — `x` and `t` — split it the way a
+shell splits a simple one and no further: spaces separate arguments, `"` holds
+a run of them together, `\` escapes the next character, and nothing at all is
+expanded, since nothing here reaches a shell. `t` takes
+`<profile> [bare grant ...] [keep=<instance>] [-- <command ...>]`, so a profile
+with no `command` node of its own can still be given one.
+
+`s` writes the file through the same path `reseed` does: the profile header and
+the config version are kept, `config.kdl.bak` is written first, and what was
+rendered is parsed again before it replaces anything. **Comments are not kept**
+— the file is rendered from the config, exactly as `create` and `reseed` render
+it — and the status line says so. `u` goes back to the config as last written.
+Saving while the sandbox is running is allowed and says what `bubbler edit`
+says: bwrap cannot be told about a bind after the fact, so it applies on the
+next start.
+
+The terminal comes back three ways: the ordinary one, a panic — the hook
+restores it before the message — and `SIGINT`, `SIGTERM` or `SIGHUP`, which set
+a flag the loop reads rather than touching the terminal from a signal handler.
+There are no threads: one `poll` with a one-second timeout is the whole
+scheduler, and the only thing a tick does is probe each instance's control
+socket, which never unlinks a stale one.
+
+Not in it: profile editing (`e` drops to `$EDITOR`), a run monitor, mouse
+support and `bubbler man`.
+
 ## Linting
 
     bubbler profile lint firefox           # one profile, flattened through its layers
@@ -1749,6 +1831,12 @@ anything.
 ## Build
 
     cargo build --release
+    cargo build --release -p bubbler -p bubbler-init   # without the editor
+
+The workspace builds three binaries: `bubbler`, the `bubbler-init` supervisor
+bound into every sandbox, and `bubbler-ui`, the terminal editor. Only the last
+of them links a terminal UI toolkit (see "Terminal editor"), so leaving it out
+is a `-p` away and costs nothing else.
 
 Links `libseccomp.so` — the `libseccomp` package on Arch, `libseccomp-dev` on
 Debian for the linker symlink. It is bubbler's only C dependency; everything
@@ -1772,10 +1860,17 @@ every shipped profile that has one.
 
     install -Dm755 target/release/bubbler      /usr/bin/bubbler
     install -Dm755 target/release/bubbler-init /usr/lib/bubbler/bubbler-init
+    install -Dm755 target/release/bubbler-ui   /usr/bin/bubbler-ui
     target/release/bubbler man          > /usr/share/man/man1/bubbler.1
     target/release/bubbler man --config > /usr/share/man/man5/bubbler-config.5
 
 That is the whole install set, and each path is one the code itself names.
+
+`bubbler-ui` is the terminal editor (see "Terminal editor") and is optional:
+`bubbler ui` looks for it beside the `bubbler` binary and then on `$PATH`, and
+a build without it is a command line that says where to get one. Splitting it
+off is what keeps the tree of the binary that starts sandboxes at 42 crates
+against the editor's 76.
 
 `bubbler-init` is deliberately not in `/usr/bin`. It is the supervisor bubbler
 binds into every sandbox, not a command to type. bubbler looks for it in
