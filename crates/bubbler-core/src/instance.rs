@@ -958,7 +958,13 @@ mod tests {
         for g in GRANTS {
             assert!(grant_service(g).is_some(), "{g}");
         }
-        assert!(grant_service("home-share").is_none());
+        // A node that takes an argument is not a grant: `--grant` writes
+        // a bare node, and `app-runtime` without its id would name no
+        // directory.
+        for named in ["home-share", "app-runtime"] {
+            assert!(grant_service(named).is_none(), "{named}");
+            assert!(!GRANTS.contains(&named), "{named}");
+        }
     }
 
     #[test]

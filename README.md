@@ -233,6 +233,9 @@ file order does not affect the generated argv.
     path-share "/kioxia/Steam"       # a host path, at that same path inside
     path-share "/mnt/data" mode=rw
     etc-share "vulkan"               # /etc/vulkan read-only; one path component
+    app-runtime "org.example.App"    # $XDG_RUNTIME_DIR/app/<id>, shared with
+                                     #   every sandbox naming that id;
+                                     #   mode=rw to serve a socket there
     dbus {                           # session bus through a filtering proxy
         see "org.freedesktop.ScreenSaver"
         talk "ca.desrt.dconf"
@@ -270,9 +273,11 @@ share whose width depends on which line came first; a share below another
 `etc-share` is confined to `/etc` the same way, and cannot name the account
 files (`passwd`, `group`, `shadow`, `gshadow` and their `-`/`+` variants),
 which the sandbox generates itself. `path-share` reaches outside the home and
-has rules of its own, under "Host paths". `network` needs `/etc/resolv.conf`
-(the tmpfs over `/etc` would otherwise hide it). `dri` binds `/dev/dri`
-read-write and exposes `/sys/dev/char`, `/sys/devices/system/cpu`, every
+has rules of its own, under "Host paths"; `app-runtime` shares one directory
+under `$XDG_RUNTIME_DIR` and has a section of its own below. `network` needs
+`/etc/resolv.conf` (the tmpfs over `/etc` would otherwise hide it). `dri`
+binds `/dev/dri` read-write and exposes `/sys/dev/char`,
+`/sys/devices/system/cpu`, every
 `/sys/devices/pci*` root and, where the host has it, `/sys/class/drm` (whose
 entries are relative symlinks into those roots, so it adds only `version`)
 read-only — that is the sysfs attributes of every PCI device on the machine,
@@ -450,6 +455,98 @@ what those grants cost — or use the portal, which needs none of it.
 developed on has none, so the portal call, the PipeWire fd crossing
 `xdg-dbus-proxy` and the device binds have unit and argv coverage and no frame
 has ever come through. Treat `camera` as untested on real hardware.
+### app-runtime
+
+`app-runtime "<id>" [mode=rw]` shares `$XDG_RUNTIME_DIR/app/<id>` — **the same
+path on the host and inside every sandbox that names the id**. That is the
+directory applications already serve their own sockets in: a stock KeePassXC
+puts `org.keepassxc.KeePassXC.BrowserServer` in
+`$XDG_RUNTIME_DIR/app/org.keepassxc.KeePassXC` whether or not flatpak is
+installed, and computes that path from `$XDG_RUNTIME_DIR` at both ends. So a
+sandboxed KeePassXC and a browser — in its own instance or on the host — meet
+there:
+
+    # keepassxc's config.kdl (the built-in profile ships this)
+    app-runtime "org.keepassxc.KeePassXC" mode=rw
+    # the browser's, on the other side
+    app-runtime "org.keepassxc.KeePassXC"
+
+Only the leaf `app/<id>` is ever bound, never `app/` itself and never
+`$XDG_RUNTIME_DIR`, which is where every instance's control socket lives.
+bubbler creates the directory before the sandbox starts, never the sandbox, and
+opens it `O_NOFOLLOW` to refuse a symlink planted where it belongs; a directory
+that is already there is reused whatever its mode, because a native application
+creates it 0755 and `$XDG_RUNTIME_DIR` itself is 0700. It is not removed when
+the run ends: it is a rendezvous, and another instance's peer may still be
+serving in it.
+
+The id is an application id — at least two `.`-separated elements of letters,
+digits and `_`, with `-` allowed in the last — which is both the convention
+every consumer follows and the reason an id can never name `bubbler`, `..` or a
+path with a `/` in it. The node is repeatable, and one id may be granted once
+per config.
+
+`ro` is the default and is what a client wants: `connect()` works through a
+read-only bind, so a sandbox that only talks to a socket needs no write access.
+`mode=rw` is for the side that *serves*, and it is a real grant — that sandbox
+can unlink the socket others connect to and bind its own, or leave a symlink
+that the peer then resolves on its own side of the boundary. `bubbler lint`
+notes it as `app-runtime-rw`.
+
+Four things this does not give you:
+
+- **No peer authentication.** `SO_PEERCRED` reports pid 0 across the boundary
+  (there is no such pid in the reader's namespace) and the uid is yours on both
+  sides, so a server cannot tell its peers apart. KeePassXC's own
+  associate/identification keys are what authenticate a browser; a protocol
+  with no such layer has none.
+- **One id is one trust domain.** Every instance granted the same id, and every
+  unsandboxed process of yours, can read, write, replace and delete everything
+  in that directory. There is no way to make a rendezvous only the "right"
+  sandboxes can reach — the name *is* the rendezvous.
+- **Not Discord rich presence.** Discord's clients look for `discord-ipc-N` at
+  the top of `$XDG_RUNTIME_DIR`, not under `app/`, so this does not carry it.
+- **Do not point `TMPDIR` at it.** Everything the application writes would
+  become something a co-tenant of the id can replace or redirect.
+
+#### KeePassXC-Browser, both sides under bubbler
+
+The grant carries the socket; the browser still has to be told about the proxy
+that speaks to it. That is one file, and nothing in bubbler writes it for you,
+because KeePassXC's own installer writes into *its* private home rather than
+the browser's.
+
+Grant the id on both sides — `keepassxc` ships
+`app-runtime "org.keepassxc.KeePassXC" mode=rw` already, and `firefox` and
+`chromium` carry the read-only line commented out, so uncomment it (or run
+`bubbler edit firefox` and add it):
+
+    app-runtime "org.keepassxc.KeePassXC"
+
+Then put the native messaging manifest in the browser instance's private home,
+which is an ordinary host directory —
+`$XDG_DATA_HOME/bubbler/instances/<name>/home/.mozilla/native-messaging-hosts/org.keepassxc.keepassxc_browser.json`
+for Firefox, `…/home/.config/chromium/NativeMessagingHosts/` for Chromium:
+
+    {
+        "allowed_extensions": ["keepassxc-browser@keepassxc.org"],
+        "description": "KeePassXC integration with native messaging support",
+        "name": "org.keepassxc.keepassxc_browser",
+        "path": "/usr/bin/keepassxc-proxy",
+        "type": "stdio"
+    }
+
+`path` must be absolute and `type` must be `"stdio"`; `/usr/bin/keepassxc-proxy`
+is a normal distribution file, and since `/usr` is read-only bound into every
+sandbox the browser can already execute it. If KeePassXC's own "browser
+integration" installer has run on the host, that file is already at
+`~/.mozilla/native-messaging-hosts/` and can simply be copied. The flatpak
+wrapper script the manifest names in a flatpak install is not used here.
+
+One file under `/usr/lib/mozilla/native-messaging-hosts/` (or
+`/usr/lib64/…`) is Firefox's documented system-wide location and serves every
+instance and the host browser at once, at the cost of needing root; bubbler
+never writes there.
 
 ### env and command
 
@@ -578,7 +675,7 @@ Every one is Wayland-first; only the two gaming profiles grant `x11`.
     code          wayland dri network dbus portals notify, ~/Projects rw
     firefox       wayland dri pipewire pulseaudio network dbus portals notify mpris, ~/Downloads rw
     generic       nothing beyond the baseline
-    keepassxc     wayland dbus portals notify tray, ~/Documents rw
+    keepassxc     wayland dbus portals notify tray app-runtime rw, ~/Documents rw
     kitty         wayland dri dbus portals notify
     libreoffice   wayland dri dbus portals, ~/Documents rw, SAL_USE_VCLPLUGIN=gtk3
     lutris        wayland x11 dri pipewire network dbus portals notify tray gamepad system-bus, ~/Games rw, seccomp disabled
@@ -616,8 +713,12 @@ libsecret client in it — `code` among them, which is granted `talk` on that
 same name — would store its secrets there. It is an outward grant rather than a
 confinement. No `hidraw`, which would not help anyway: KeePassXC drives a
 YubiKey through libusb and a smart card through pcsclite, and bubbler grants
-neither. Browser integration does not work from a sandbox yet either (see
-"Known gaps").
+neither. Browser integration does work: the profile grants
+`app-runtime "org.keepassxc.KeePassXC" mode=rw` so the socket it serves is
+reachable from the host or from another instance — `firefox` and `chromium`
+carry the matching read-only line commented out. Installing the native
+messaging manifest is still yours to do; "KeePassXC-Browser, both sides under
+bubbler" under "app-runtime" is the whole procedure.
 
 `spotify` owns `org.mpris.MediaPlayer2.spotify` exactly, not as a prefix, and
 its tray icon is the same one-rule `tray` grant as everywhere else. It has no
@@ -788,7 +889,9 @@ socket is command execution across the boundary), `dbus-without-rules`,
 `tty-passthrough`, `portal-talk-without-portals` (a portal rule is inert
 without `/.flatpak-info`, which is worse than wrong).
 
-**Notes** are information and fail nothing: `ozone-hint-unnecessary`,
+**Notes** are information and fail nothing: `app-runtime-rw` (a shared
+application runtime directory granted `mode=rw`, so the sandbox can replace the
+sockets everything else naming that id connects to), `ozone-hint-unnecessary`,
 `command-not-found`, `camera-nodes-none-present` (`camera nodes=#true` on a
 host with no `/dev/video*` or `/dev/media*`, so that half of the grant binds
 nothing), `camera-nodes-no-hotplug` (the node list is frozen at launch and an
@@ -1187,10 +1290,11 @@ binding the tree under it.
 - No raw-USB grant (`/dev/bus/usb` and its sysfs) and no pcsclite socket, so a
   challenge-response YubiKey or a smart card reader cannot be reached from a
   sandbox; `hidraw` is a different device class and no substitute.
-- No shared per-app runtime directory, so KeePassXC's browser integration
-  cannot work: the proxy socket it serves lives in the sandbox's own
-  `$XDG_RUNTIME_DIR`, the browser is in another sandbox or on the host, and
-  `path-share` refuses that directory by design.
+- `app-runtime` does not carry Discord rich presence: those clients look for
+  `discord-ipc-N` at the top of `$XDG_RUNTIME_DIR`, which no sandbox shares.
+- Nothing installs a browser's native messaging manifest into an instance's
+  private home, so KeePassXC browser integration still needs that file put in
+  place by hand.
 - `/etc/machine-id` is bound in, so every instance shares one stable
   identifier with the host.
 - `camera` has never been exercised against a real camera: this machine has
@@ -1209,7 +1313,10 @@ earlier run, and binds the control socket `init.sock` in it; a `dbus` or
 `dbus/` the proxy creates its sockets in and the checked socket `bus` and/or
 `system` beside it, and a `portals` grant adds
 `$XDG_RUNTIME_DIR/.flatpak/bubbler-<name>/`, creating `.flatpak/` if it is
-missing. Everything a run makes there is removed again when it ends.
+missing. Everything a run makes there is removed again when it ends, with one
+exception: an `app-runtime` grant creates `$XDG_RUNTIME_DIR/app/<id>` (and
+`app/` above it) and leaves it, since a peer of another instance may still be
+using it.
 `HOME` and `XDG_RUNTIME_DIR` must be set and non-empty. Your profiles live in
 `$XDG_CONFIG_HOME/bubbler/profiles/` (by default under `~/.config`) and the
 system's in `/usr/share/bubbler/profiles/`, or wherever

@@ -181,7 +181,8 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
                 | Service::PathShare { .. }
                 | Service::EtcShare { .. }
                 | Service::Dbus { .. }
-                | Service::SystemBus { .. } => {}
+                | Service::SystemBus { .. }
+                | Service::AppRuntime { .. } => {}
             }
         }
         Section { node, rules }

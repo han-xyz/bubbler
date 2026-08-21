@@ -678,6 +678,83 @@ pub fn prepare_runtime_dir(env: &Env, inst: &Instance) -> Result<PathBuf, Launch
     Ok(dir)
 }
 
+/// Create the host directory behind every `app-runtime` grant and check
+/// it is one, so the bind the argv names has a source before bwrap runs.
+/// Only bubbler ever creates these, never a sandbox: `app/<id>` is a
+/// rendezvous, and whoever creates it decides what the others bind.
+///
+/// An existing directory is reused whatever its mode — on a host running
+/// a native KeePassXC it is already there at 0755, and `$XDG_RUNTIME_DIR`
+/// being 0700 is what keeps it private.
+///
+/// Both levels are opened `O_NOFOLLOW|O_DIRECTORY` and the leaf is made
+/// and checked relative to the `app` descriptor, so neither a symlink at
+/// `app` nor one at `app/<id>` can move the source somewhere else while
+/// the destination path stays the one the config named. No sandbox can
+/// plant either — only the leaf is ever bound, so `app` itself is not a
+/// directory any sandbox holds — but the check is what makes that
+/// property something bubbler enforces rather than assumes.
+///
+/// The check is point-in-time: bwrap resolves the source path again when
+/// it mounts, and the descriptors here are closed rather than handed to
+/// it, because bwrap binds by path and has no fd form. That window is
+/// not a hole. Nothing a sandbox controls can write `app/`, and a host
+/// process that could is already the same uid as bubbler — it owns the
+/// account and needs no swapped symlink to reach anything.
+fn prepare_app_runtime(env: &Env, services: &[Service]) -> Result<(), LaunchError> {
+    let ids: Vec<&str> = services
+        .iter()
+        .filter_map(|s| match s {
+            Service::AppRuntime { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    // Both levels 0700, the way `prepare_runtime_dir` makes its own: the
+    // order in the caller is not what should decide whether they are.
+    mkdir_private(&env.runtime_dir)?;
+    let app = env.runtime_dir.join("app");
+    mkdir_private(&app)?;
+    let at = open_dir_nofollow(rustix::fs::CWD, &app, &app)?;
+    for id in ids {
+        let dir = service::app_runtime_dir(env, id);
+        // `mkdir` reports EEXIST for a symlink too, since it does not
+        // follow the last component, so the probe below is where one is
+        // caught.
+        match rustix::fs::mkdirat(&at, id, Mode::RWXU) {
+            Ok(()) | Err(Errno::EXIST) => {}
+            Err(e) => return Err(LaunchError::Io(dir, e.into())),
+        }
+        open_dir_nofollow(&at, id, &dir)?;
+    }
+    Ok(())
+}
+
+/// Open `path` under `at` as a directory without following a symlink in
+/// its last component. `named` is the whole path, for the error only.
+fn open_dir_nofollow<P: rustix::path::Arg>(
+    at: impl AsFd,
+    path: P,
+    named: &Path,
+) -> Result<OwnedFd, LaunchError> {
+    rustix::fs::openat(
+        at,
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| match e {
+        Errno::LOOP | Errno::NOTDIR => LaunchError::WrongType {
+            service: "app-runtime",
+            path: named.to_path_buf(),
+            expected: "a directory",
+        },
+        e => LaunchError::Io(named.to_path_buf(), e.into()),
+    })
+}
+
 /// Process exit code to propagate: the child's code, or `128 + signal`.
 pub fn exit_code(status: ExitStatus) -> i32 {
     if let Some(c) = status.code() {
@@ -1170,6 +1247,9 @@ pub fn run(
     {
         stdio.pty = Some(tty::allocate(host[i].as_fd())?);
     }
+    // Before the argv is built, for the same reason the proxy is: a bind
+    // whose source is not there is a failed start, not a warning.
+    prepare_app_runtime(env, &inst.config.services)?;
     let argv = build_argv(env, inst, command, &mut alloc, stdio.ctty())?;
     let stop = Arc::new(AtomicBool::new(false));
     // What `stop` becomes once a run has seen it: `stop` is cleared as
@@ -1782,6 +1862,123 @@ mod tests {
             0o700
         );
         prepare_runtime_dir(&e, &i).unwrap();
+    }
+
+    #[test]
+    fn app_runtime_dirs_are_created_once_and_reused_whatever_their_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let svcs = vec![
+            Service::AppRuntime {
+                id: "org.keepassxc.KeePassXC".to_owned(),
+                mode: crate::config::ShareMode::ReadWrite,
+            },
+            Service::AppRuntime {
+                id: "org.example.Other".to_owned(),
+                mode: crate::config::ShareMode::ReadOnly,
+            },
+        ];
+        prepare_app_runtime(&e, &svcs).unwrap();
+        let one = tmp.path().join("run/app/org.keepassxc.KeePassXC");
+        assert!(one.is_dir());
+        assert!(tmp.path().join("run/app/org.example.Other").is_dir());
+        // A native application creates the directory at 0755 (Qt's
+        // `mkpath`), and bubbler reuses it rather than fighting over the
+        // mode: `$XDG_RUNTIME_DIR` being 0700 is what keeps it private.
+        std::fs::set_permissions(&one, std::fs::Permissions::from_mode(0o755)).unwrap();
+        prepare_app_runtime(&e, &svcs).unwrap();
+        assert_eq!(
+            std::fs::metadata(&one).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn an_app_runtime_id_that_is_not_a_directory_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("run/app")).unwrap();
+        // A symlink where the directory belongs would bind whatever it
+        // points at, resolved on the host's side of the boundary.
+        std::os::unix::fs::symlink("/etc", tmp.path().join("run/app/org.example.App")).unwrap();
+        let svcs = vec![Service::AppRuntime {
+            id: "org.example.App".to_owned(),
+            mode: crate::config::ShareMode::ReadOnly,
+        }];
+        assert!(matches!(
+            prepare_app_runtime(&e, &svcs),
+            Err(LaunchError::WrongType {
+                service: "app-runtime",
+                ..
+            })
+        ));
+        std::fs::remove_file(tmp.path().join("run/app/org.example.App")).unwrap();
+        std::fs::write(tmp.path().join("run/app/org.example.App"), b"").unwrap();
+        assert!(matches!(
+            prepare_app_runtime(&e, &svcs),
+            Err(LaunchError::WrongType {
+                service: "app-runtime",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn an_app_parent_that_is_not_a_directory_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("run")).unwrap();
+        // `mkdir` reports EEXIST for a plain file too, so the probe of
+        // the parent is the only thing between this and an `openat` that
+        // would fail somewhere less legible.
+        std::fs::write(tmp.path().join("run/app"), b"").unwrap();
+        assert!(matches!(
+            prepare_app_runtime(
+                &e,
+                &[Service::AppRuntime {
+                    id: "org.example.App".to_owned(),
+                    mode: crate::config::ShareMode::ReadOnly,
+                }]
+            ),
+            Err(LaunchError::WrongType {
+                service: "app-runtime",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn an_app_parent_that_is_a_symlink_is_refused_before_any_id_is_made() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("run")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("elsewhere")).unwrap();
+        // `app` pointing away would make every id resolve outside the
+        // runtime directory while the sandbox binds the path the config
+        // named.
+        std::os::unix::fs::symlink(tmp.path().join("elsewhere"), tmp.path().join("run/app"))
+            .unwrap();
+        let svcs = vec![Service::AppRuntime {
+            id: "org.example.App".to_owned(),
+            mode: crate::config::ShareMode::ReadOnly,
+        }];
+        assert!(matches!(
+            prepare_app_runtime(&e, &svcs),
+            Err(LaunchError::WrongType {
+                service: "app-runtime",
+                ..
+            })
+        ));
+        assert!(!tmp.path().join("elsewhere/org.example.App").exists());
+    }
+
+    #[test]
+    fn a_config_without_app_runtime_creates_no_app_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        prepare_app_runtime(&e, &[Service::Wayland]).unwrap();
+        assert!(!tmp.path().join("run/app").exists());
     }
 
     #[test]
