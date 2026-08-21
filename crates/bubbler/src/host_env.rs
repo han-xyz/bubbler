@@ -96,9 +96,10 @@ pub fn from_process() -> Result<Env> {
 }
 
 /// `$BUBBLER_TEST_ALLOW_PATH`: the one extra root `path-share` accepts,
-/// for tests and debugging. It must be absolute, and is resolved here so
-/// it compares against the canonical source of a share; a path that does
-/// not exist is kept as written and therefore matches nothing.
+/// for tests and debugging. It must be absolute and name a directory
+/// below the root, and is resolved here so it compares against the
+/// canonical source of a share; a path that does not exist is kept as
+/// written and therefore matches nothing.
 fn test_allow_path() -> Result<Option<PathBuf>> {
     let Some(value) = env::var_os("BUBBLER_TEST_ALLOW_PATH").filter(|v| !v.is_empty()) else {
         return Ok(None);
@@ -110,7 +111,13 @@ fn test_allow_path() -> Result<Option<PathBuf>> {
             path.display()
         );
     }
-    Ok(Some(std::fs::canonicalize(&path).unwrap_or(path)))
+    let path = std::fs::canonicalize(&path).unwrap_or(path);
+    // `/` would allow every share the denylist exists to refuse, which is
+    // more than a debugging hook is ever meant to hand out.
+    if path == Path::new("/") {
+        anyhow::bail!("BUBBLER_TEST_ALLOW_PATH cannot be `/`");
+    }
+    Ok(Some(path))
 }
 
 /// The user's editor: `$VISUAL`, else `$EDITOR`. An empty value counts as

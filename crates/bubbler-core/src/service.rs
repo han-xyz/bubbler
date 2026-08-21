@@ -119,6 +119,19 @@ fn require_dir(
     require(host, service, path, "a directory", |t| t.is_dir())
 }
 
+/// The source must be a tree or a file to bind: a socket or a device node
+/// under a shared path is a grant of its own kind, never a side effect of
+/// sharing a path.
+fn require_dir_or_file(
+    host: &dyn Host,
+    service: &'static str,
+    path: PathBuf,
+) -> Result<PathBuf, LaunchError> {
+    require(host, service, path, "a directory or a regular file", |t| {
+        t.is_dir() || t.is_file()
+    })
+}
+
 /// The source may be of any type; only used where the user named the path
 /// in the config rather than the environment naming it.
 fn require_exists(
@@ -336,14 +349,16 @@ pub fn apply_env(pairs: &[(String, String)], args: &mut BwrapArgs) -> Result<(),
     Ok(())
 }
 
-/// The canonical form of a host path a config named, probed for
-/// existence. Canonical is what the caller must bind: binding the path as
-/// written would mount whatever a symlink on it points at instead, and it
-/// is also the only form a policy check can be made on.
+/// The canonical form of a host path a config named, accepted only if
+/// `probe` allows its type. Canonical is what the caller must bind:
+/// binding the path as written would mount whatever a symlink on it
+/// points at instead, and it is also the only form a policy check can be
+/// made on.
 fn resolve_source(
     host: &dyn Host,
     service: &'static str,
     src: &Path,
+    probe: fn(&dyn Host, &'static str, PathBuf) -> Result<PathBuf, LaunchError>,
 ) -> Result<PathBuf, LaunchError> {
     let Some(real) = host.canonicalize(src) else {
         return Err(LaunchError::MissingResource {
@@ -351,7 +366,7 @@ fn resolve_source(
             path: src.to_path_buf(),
         });
     };
-    require_exists(host, service, real)
+    probe(host, service, real)
 }
 
 /// Resolve `src` and require that it stays under `root`; both are
@@ -370,7 +385,7 @@ fn confine(
             service,
             path: root.to_path_buf(),
         })?;
-    let real = resolve_source(host, service, src)?;
+    let real = resolve_source(host, service, src, require_exists)?;
     if !real.starts_with(&root) {
         return Err(LaunchError::BadValue {
             service,
@@ -395,32 +410,110 @@ const DENIED_ROOTS: &[&str] = &[
 /// (`flatpak-context.c`).
 const MEDIA_ROOT: &str = "/run/media";
 
-/// The reserved root a canonical path collides with: it is that root, is
-/// inside it, or is one of its ancestors. An ancestor is refused because
-/// binding it would cover the root with a mount of its own.
-fn denied_root(canonical: &Path, env: &Env) -> Option<PathBuf> {
-    if let Some(allow) = env.test_allow_path.as_deref()
-        && canonical.starts_with(allow)
-    {
-        return None;
+/// Which end of a share met a reserved root: the host path it resolves
+/// to, or the path inside the sandbox it would be bound at.
+#[derive(Clone, Copy)]
+enum End {
+    /// The canonical source.
+    Source,
+    /// The path as written, which is where the bind lands.
+    Destination,
+}
+
+/// The roots the environment names, each in resolved form as well: with a
+/// symlinked `$HOME` or `$XDG_DATA_HOME` only the resolved form matches
+/// the canonical source of a share, and only the written form matches its
+/// destination. A root that does not resolve is kept as written.
+fn env_roots(host: &dyn Host, env: &Env) -> Vec<PathBuf> {
+    let data_home = host
+        .canonicalize(&env.data_home)
+        .unwrap_or_else(|| env.data_home.clone());
+    let mut roots = vec![
+        env.home.clone(),
+        env.runtime_dir.clone(),
+        env.data_home.join("bubbler"),
+        data_home.join("bubbler"),
+    ];
+    for named in [&env.home, &env.runtime_dir] {
+        if let Some(real) = host.canonicalize(named) {
+            roots.push(real);
+        }
     }
-    if canonical.starts_with(MEDIA_ROOT) {
+    roots
+}
+
+/// The reserved root a share meets, at either end: the path is that root,
+/// is inside it, or is one of its ancestors. An ancestor is refused
+/// because binding it would cover the root with a mount of its own. The
+/// roots the environment names are checked first and on both ends, so
+/// neither the `/run/media` carve-out nor the test hook can lift them.
+fn denied_root(
+    host: &dyn Host,
+    env: &Env,
+    canonical: &Path,
+    written: &Path,
+) -> Option<(PathBuf, End)> {
+    let roots = env_roots(host, env);
+    for (path, end) in [(canonical, End::Source), (written, End::Destination)] {
+        if let Some(root) = roots.iter().find(|root| nested(path, root)) {
+            return Some((root.clone(), end));
+        }
+    }
+    // A bind landing on the private home would cover what the instance
+    // keeps there, whatever the host path it came from.
+    if nested(written, Path::new(SANDBOX_HOME)) {
+        return Some((PathBuf::from(SANDBOX_HOME), End::Destination));
+    }
+    fixed_root(canonical, env)
+        .map(|root| (root, End::Source))
+        .or_else(|| fixed_root(written, env).map(|root| (root, End::Destination)))
+}
+
+/// The fixed reserved root a path meets. `$BUBBLER_TEST_ALLOW_PATH` lifts
+/// all of them for one subtree, and `/run/media` is carved out of `/run`
+/// alone.
+fn fixed_root(path: &Path, env: &Env) -> Option<PathBuf> {
+    if let Some(allow) = env.test_allow_path.as_deref()
+        && path.starts_with(allow)
+    {
         return None;
     }
     // `/` is an ancestor of every root and every path is inside it, so
     // only sharing `/` itself is what the entry can mean.
-    if canonical == Path::new("/") {
+    if path == Path::new("/") {
         return Some(PathBuf::from("/"));
     }
+    let on_media = path.starts_with(MEDIA_ROOT);
     DENIED_ROOTS
         .iter()
         .map(PathBuf::from)
-        .chain([
-            env.home.clone(),
-            env.runtime_dir.clone(),
-            env.data_home.join("bubbler"),
-        ])
-        .find(|root| canonical.starts_with(root) || root.starts_with(canonical))
+        .find(|root| nested(path, root) && !(on_media && root.as_path() == Path::new("/run")))
+}
+
+/// Why a share was refused, naming the end that met the root.
+fn denied_reason(written: &Path, src: &Path, root: &Path, end: End) -> String {
+    match end {
+        End::Destination => format!(
+            "{} would be bound over {}, which bubbler never shares",
+            written.display(),
+            root.display()
+        ),
+        End::Source => {
+            let target = if src == root {
+                root.display().to_string()
+            } else {
+                format!("{}, which overlaps {}", src.display(), root.display())
+            };
+            if src == written {
+                format!("bubbler never shares {target}")
+            } else {
+                format!(
+                    "{} resolves to {target}, which bubbler never shares",
+                    written.display()
+                )
+            }
+        }
+    }
 }
 
 /// Whether two paths are the same or one contains the other, compared
@@ -431,10 +524,10 @@ fn nested(a: &Path, b: &Path) -> bool {
 
 /// Every `path-share` as (written destination, canonical source, mode),
 /// with the reserved roots and the overlap rule applied. bwrap applies
-/// binds in the order given, so two shares that nest would either fail
-/// (a read-only parent bound first) or silently hide one another; both
-/// break the promise that file order does not matter, so they are an
-/// error before any of them is emitted.
+/// binds in the order given, so two shares whose destinations nest would
+/// either fail (a read-only parent bound first) or silently hide one
+/// another; sharing one host tree twice is refused with them, so that
+/// file order stays irrelevant either way.
 fn path_shares<'a>(
     services: &'a [Service],
     env: &Env,
@@ -445,33 +538,22 @@ fn path_shares<'a>(
         let Service::PathShare { path, mode } = s else {
             continue;
         };
-        let src = resolve_source(host, "path-share", path)?;
-        if let Some(root) = denied_root(&src, env) {
-            let target = if src == root {
-                format!("{}", root.display())
-            } else {
-                format!("{}, which overlaps {}", src.display(), root.display())
-            };
+        let src = resolve_source(host, "path-share", path, require_dir_or_file)?;
+        if let Some((root, end)) = denied_root(host, env, &src, path) {
             return Err(LaunchError::BadValue {
                 service: "path-share",
-                reason: if src == *path {
-                    format!("bubbler never shares {target}")
-                } else {
-                    format!(
-                        "{} resolves to {target}, which bubbler never shares",
-                        path.display()
-                    )
-                },
+                reason: denied_reason(path, &src, &root, end),
             });
         }
         shares.push((path.as_path(), src, *mode));
     }
     for (i, (a_dst, a_src, _)) in shares.iter().enumerate() {
         for (b_dst, b_src, _) in &shares[i + 1..] {
-            if !nested(a_dst, b_dst) && !nested(a_src, b_src) {
+            let destinations = nested(a_dst, b_dst);
+            if !destinations && !nested(a_src, b_src) {
                 continue;
             }
-            let where_ = if nested(a_dst, b_dst) {
+            let where_ = if destinations {
                 String::new()
             } else {
                 format!(
@@ -1172,6 +1254,102 @@ mod tests {
             &a,
             &["--ro-bind", "/kioxia/notes.txt", "/kioxia/notes.txt"]
         ));
+    }
+
+    #[test]
+    fn path_share_compares_the_environment_roots_resolved() {
+        let mut e = env();
+        e.home = "/link/home".into();
+        e.data_home = "/link/xdg".into();
+        for path in ["/real/home", "/real/home/Downloads", "/real/xdg/bubbler"] {
+            let r = argv_linked(
+                &[share(path, ShareMode::ReadWrite)],
+                &e,
+                &[(path, Dir)],
+                &[("/link/home", "/real/home"), ("/link/xdg", "/real/xdg")],
+            );
+            assert!(
+                matches!(
+                    &r,
+                    Err(LaunchError::BadValue {
+                        service: "path-share",
+                        ..
+                    })
+                ),
+                "{path}: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_share_environment_roots_outlast_the_carve_out_and_the_hook() {
+        let mut e = env();
+        e.data_home = "/run/media/disk/xdg".into();
+        for hook in [None, Some(PathBuf::from("/run/media/disk"))] {
+            e.test_allow_path = hook.clone();
+            let r = argv(
+                &[share("/run/media/disk", ShareMode::ReadWrite)],
+                &e,
+                &[("/run/media/disk", Dir)],
+            );
+            assert!(
+                matches!(&r, Err(LaunchError::BadValue { service: "path-share", reason })
+                    if reason.contains("/run/media/disk/xdg/bubbler")),
+                "hook {hook:?}: {r:?}"
+            );
+        }
+        e.test_allow_path = None;
+        let a = argv(
+            &[share("/run/media/other", ShareMode::ReadOnly)],
+            &e,
+            &[("/run/media/other", Dir)],
+        )
+        .unwrap();
+        assert!(has_seq(
+            &a,
+            &["--ro-bind", "/run/media/other", "/run/media/other"]
+        ));
+    }
+
+    #[test]
+    fn path_share_refuses_a_destination_on_a_reserved_root() {
+        let mut e = env();
+        // The hook lifts the fixed roots for `/home`, so what is left to
+        // refuse these is the destination check itself.
+        e.test_allow_path = Some("/home".into());
+        for dst in ["/home/bubbler/x", "/home/han/x"] {
+            let r = argv_linked(
+                &[share(dst, ShareMode::ReadWrite)],
+                &e,
+                &[(dst, Dir), ("/kioxia/data", Dir)],
+                &[(dst, "/kioxia/data")],
+            );
+            assert!(
+                matches!(&r, Err(LaunchError::BadValue { service: "path-share", reason })
+                    if reason.contains(dst)),
+                "{dst}: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_share_refuses_a_source_that_is_not_a_tree_or_a_file() {
+        let r = argv(
+            &[share("/kioxia/sock", ShareMode::ReadOnly)],
+            &env(),
+            &[("/kioxia/sock", Sock)],
+        );
+        assert!(
+            matches!(
+                &r,
+                Err(LaunchError::WrongType {
+                    service: "path-share",
+                    expected: "a directory or a regular file",
+                    ..
+                })
+            ),
+            "{r:?}"
+        );
     }
 
     #[test]

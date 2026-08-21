@@ -245,6 +245,61 @@ fn path_share_binds_a_host_path_only_with_the_test_hook() {
     assert!(err.contains("/tmp"), "{err}");
 }
 
+/// The reserved roots are compared resolved: with `$HOME` reached through
+/// a symlink, the real home must still be refused.
+#[test]
+fn path_share_of_a_symlinked_home_or_data_dir_is_refused() {
+    let tmp = setup();
+    std::fs::create_dir_all(tmp.path().join("real/home")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("real/data/bubbler")).unwrap();
+    std::os::unix::fs::symlink(tmp.path().join("real"), tmp.path().join("link")).unwrap();
+    let home = tmp.path().join("link/home");
+    let data = tmp.path().join("link/data");
+    bubbler(tmp.path())
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", &data)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    let cfg = data.join("bubbler/instances/t/config.kdl");
+    for path in [tmp.path().join("real/home"), tmp.path().join("real/data")] {
+        std::fs::write(
+            &cfg,
+            format!(
+                "path-share \"{}\" mode=rw\ncommand \"true\"\n",
+                path.display()
+            ),
+        )
+        .unwrap();
+        let out = bubbler(tmp.path())
+            .env("HOME", &home)
+            .env("XDG_DATA_HOME", &data)
+            .env("BUBBLER_TEST_ALLOW_PATH", tmp.path())
+            .args(["run", "t", "--dry-run"])
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{}: {err}", path.display());
+        assert!(err.contains("never shares"), "{err}");
+    }
+}
+
+#[test]
+fn test_allow_path_must_be_an_absolute_path_below_the_root() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    for value in ["relative/dir", "/"] {
+        let out = bubbler(tmp.path())
+            .env("BUBBLER_TEST_ALLOW_PATH", value)
+            .args(["run", "t", "--dry-run", "--", "/usr/bin/true"])
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{value}: {err}");
+        assert!(err.contains("BUBBLER_TEST_ALLOW_PATH"), "{value}: {err}");
+    }
+}
+
 #[test]
 fn real_bwrap_path_share_reads_the_host_and_mode_rw_writes_through() {
     if !require_bwrap() {

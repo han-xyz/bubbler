@@ -151,33 +151,42 @@ that same path inside the sandbox: `/kioxia/Steam` stays `/kioxia/Steam`, and
 bwrap creates the directories above it. The node is repeatable, read-only
 unless `mode=rw`, and a whole mountpoint is a fine target.
 
-The path is resolved before anything is bound, and what it resolves to must not
-be one of the paths the sandbox is built out of: `/`, `/proc`, `/sys`, `/dev`,
+The path is resolved before anything is bound, and it must be a directory or a
+regular file. Neither end of the share may touch a path the sandbox is built
+out of — not what it resolves to, and not the path it is bound at, which differ
+when what you wrote is a symlink. Those paths are `/`, `/proc`, `/sys`, `/dev`,
 `/etc`, `/usr`, `/opt`, `/home`, your home directory, `/tmp`, `/var`, `/run`,
-`$XDG_RUNTIME_DIR`, or `$XDG_DATA_HOME/bubbler`, where the instances live.
-Being one of them, being inside one, or containing one is refused, and the
-error names the root that stopped it. So a share of `/kioxia` is refused if
-`$XDG_DATA_HOME` is on that disk: a sandbox that can write another instance's
-`config.kdl` grants itself anything on the next run. `/etc` and your home have
-typed grants of their own (`etc-share`, `home-share`), and the rest of that
-list is what the baseline replaces. The one carve-out is `/run/media` and
-everything under it, where udisks mounts removable media. `/mnt`, `/media`,
-`/srv` and top-level mountpoints of your own are allowed.
+`$XDG_RUNTIME_DIR`, `$XDG_DATA_HOME/bubbler` where the instances live, and
+`/home/bubbler`, the private home, on the side that is bound at. Being one of
+them, being inside one, or containing one is refused, and the error names the
+root that stopped it. So a share of `/kioxia` is refused if `$XDG_DATA_HOME` is
+on that disk: a sandbox that can write another instance's `config.kdl` grants
+itself anything on the next run. The three roots your environment names are
+compared resolved as well as as written, so a symlinked home or data directory
+cannot be shared under its real name either. `/etc` and your home have typed
+grants of their own (`etc-share`, `home-share`), and the rest of that list is
+what the baseline replaces. The one carve-out is `/run/media` and everything
+under it, where udisks mounts removable media — though not when your instances
+live there. `/mnt`, `/media`, `/srv` and top-level mountpoints of your own are
+allowed.
 
 Resolving first is also what stops a symlink from smuggling a denied directory
 in: `path-share "/mnt/link"` with `/mnt/link -> /etc` is refused naming `/etc`.
 The flip side is that what gets bound is the link's target under the name you
 wrote, so the sandbox sees a directory where the host has a symlink.
 
-Two `path-share`s may not overlap — neither the paths as written nor what they
-resolve to. bwrap applies binds in the order it is given them, so a share
-nested inside another would either fail outright or silently hide the other;
-refusing both orders is what keeps file order irrelevant.
+Two `path-share`s may not overlap. Where the paths as written nest, bwrap
+applies binds in the order it is given them, so one of them would either fail
+outright or silently hide the other depending on that order; refusing keeps
+file order irrelevant. Where only the resolved sources overlap — two names for
+one host tree, bound at unrelated places — bwrap would accept it, and bubbler
+refuses it anyway so that one host tree has one place inside the sandbox.
 
 `$BUBBLER_TEST_ALLOW_PATH=<dir>` adds one more allowed root; it must be
-absolute. It exists so tests can share a temporary directory under the
-otherwise denied `/tmp`, and it adds a root rather than switching the denylist
-off.
+absolute and cannot be `/`. It exists so tests can share a temporary directory
+under the otherwise denied `/tmp`. It adds a root rather than switching the
+denylist off, and it cannot lift the ones your environment names: your home,
+`$XDG_RUNTIME_DIR` and the instance directory stay refused.
 
 ## D-Bus
 
