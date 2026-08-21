@@ -1166,6 +1166,7 @@ mod tests {
         Env {
             home: tmp.join("home"),
             data_home: tmp.join("data"),
+            config_home: tmp.join("config"),
             runtime_dir: tmp.join("run"),
             uid: 1000,
             gid: 1000,
@@ -1178,6 +1179,7 @@ mod tests {
             dbus_log: false,
             seccomp_log: false,
             test_allow_path: None,
+            profile_dir_override: None,
             proxy_override: None,
         }
     }

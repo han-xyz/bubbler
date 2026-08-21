@@ -12,6 +12,7 @@ use rustix::process::{Pid, test_kill_process};
 use crate::config::{self, InstanceConfig, Service};
 use crate::env::Env;
 use crate::error::InstanceError;
+use crate::kdl_out;
 use crate::profile;
 
 const CONFIG_FILE: &str = "config.kdl";
@@ -82,18 +83,22 @@ fn is_try_name(name: &str) -> bool {
         .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
 }
 
-// A leading `-` is rejected as well: such a name is a valid directory but
-// every CLI that takes it would read it as an option.
-fn validate_name(name: &str) -> Result<(), InstanceError> {
-    let ok = !name.is_empty()
+/// The name grammar instances and profiles share: `[A-Za-z0-9._-]+`, not
+/// `.` or `..`, and not starting with `-`. Such a name is one path
+/// component that cannot traverse out of a directory, and no CLI that
+/// takes it reads it as an option.
+pub fn is_plain_name(name: &str) -> bool {
+    !name.is_empty()
         && name != "."
         && name != ".."
         && !name.starts_with('-')
-        && !is_try_name(name)
         && name
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-');
-    if ok {
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+}
+
+fn validate_name(name: &str) -> Result<(), InstanceError> {
+    if is_plain_name(name) && !is_try_name(name) {
         Ok(())
     } else {
         Err(InstanceError::InvalidName(name.to_owned()))
@@ -121,24 +126,62 @@ fn make_dir(dir: &Path, name: &str, text: &str) -> Result<(), InstanceError> {
     fs::write(&cfg_path, text).map_err(io_err(&cfg_path))
 }
 
-/// Profile text plus one bare node per grant. A grant the text already
-/// has as a bare line is skipped: the parser rejects duplicates.
-fn with_grants(text: &str, grants: &[&str]) -> Result<String, InstanceError> {
-    let mut out = text.to_owned();
+/// The service one [`GRANTS`] name adds.
+fn grant_service(name: &str) -> Option<Service> {
+    Some(match name {
+        "wayland" => Service::Wayland,
+        "x11" => Service::X11,
+        "network" => Service::Network,
+        "dri" => Service::Dri,
+        "pipewire" => Service::Pipewire,
+        "pulseaudio" => Service::Pulseaudio,
+        "dbus" => Service::Dbus { rules: Vec::new() },
+        "portals" => Service::Portals,
+        "notify" => Service::Notify,
+        _ => return None,
+    })
+}
+
+/// Add one bare service node per grant. A grant the config already holds
+/// is skipped: the parser rejects a duplicate.
+fn with_grants(cfg: &mut InstanceConfig, grants: &[&str]) -> Result<(), InstanceError> {
     for g in grants {
-        if !GRANTS.contains(g) {
-            return Err(InstanceError::InvalidGrant((*g).to_owned()));
+        let svc = grant_service(g).ok_or_else(|| InstanceError::InvalidGrant((*g).to_owned()))?;
+        // Two `dbus` nodes hold different rules, so that grant is
+        // recognised by its variant rather than by value.
+        let held = match &svc {
+            Service::Dbus { .. } => cfg
+                .services
+                .iter()
+                .any(|s| matches!(s, Service::Dbus { .. })),
+            other => cfg.services.contains(other),
+        };
+        if !held {
+            cfg.services.push(svc);
         }
-        if out.lines().any(|l| l.trim() == *g) {
-            continue;
-        }
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push_str(g);
-        out.push('\n');
     }
-    Ok(out)
+    Ok(())
+}
+
+/// The flattened profile as the text a new instance's `config.kdl` holds:
+/// a header naming the profile it came from, then the canonical KDL of the
+/// merged result plus one bare node per grant. The text is parsed back, so
+/// nothing is written that bubbler would then refuse to open.
+fn seed(
+    env: &Env,
+    profile_name: &str,
+    grants: &[&str],
+) -> Result<(String, InstanceConfig), InstanceError> {
+    let mut cfg = profile::Resolver::new(env).resolve(profile_name)?.config;
+    with_grants(&mut cfg, grants)?;
+    // The name passed the profile name grammar to resolve at all, so it
+    // holds no newline that could end the header comment early.
+    let text = format!(
+        "// bubbler profile: {profile_name}\n{}",
+        kdl_out::render(&cfg)?
+    );
+    let config = config::parse(&text)?;
+    Ok((text, config))
 }
 
 /// The pid a sweepable directory is named after: decimal digits only, so
@@ -260,15 +303,13 @@ impl Instance {
         self.dir.join(CONFIG_FILE)
     }
 
-    /// Create a new instance seeded from a built-in profile. Fails if the
-    /// directory already exists; never overwrites.
+    /// Create a new instance seeded from a profile, flattened through its
+    /// layers. Fails if the directory already exists; never overwrites.
     pub fn create(env: &Env, name: &str, profile_name: &str) -> Result<Self, InstanceError> {
         validate_name(name)?;
-        let text = profile::lookup(profile_name)
-            .ok_or_else(|| InstanceError::UnknownProfile(profile_name.to_owned()))?;
-        let config = config::parse(text)?;
+        let (text, config) = seed(env, profile_name, &[])?;
         let dir = instances_root(env).join(name);
-        make_dir(&dir, name, text)?;
+        make_dir(&dir, name, &text)?;
         Ok(Self {
             name: name.to_owned(),
             dir,
@@ -276,19 +317,16 @@ impl Instance {
         })
     }
 
-    /// Create a throwaway instance seeded from a profile plus one bare
-    /// node per grant, named `try-<pid>` so its runtime directory is its
-    /// own. The guard removes it again when it drops.
+    /// Create a throwaway instance seeded from a flattened profile plus
+    /// one bare node per grant, named `try-<pid>` so its runtime directory
+    /// is its own. The guard removes it again when it drops.
     pub fn ephemeral(
         env: &Env,
         profile_name: &str,
         grants: &[&str],
     ) -> Result<Ephemeral, InstanceError> {
         sweep_stale(env);
-        let text = profile::lookup(profile_name)
-            .ok_or_else(|| InstanceError::UnknownProfile(profile_name.to_owned()))?;
-        let text = with_grants(text, grants)?;
-        let config = config::parse(&text)?;
+        let (text, config) = seed(env, profile_name, grants)?;
         let pid = std::process::id();
         let name = format!("try-{pid}");
         let dir = try_root(env).join(pid.to_string());
@@ -391,6 +429,7 @@ mod tests {
         Env {
             home: "/home/han".into(),
             data_home: data_home.to_path_buf(),
+            config_home: data_home.join("config"),
             runtime_dir: "/run/user/1000".into(),
             uid: 1000,
             gid: 1000,
@@ -403,6 +442,7 @@ mod tests {
             dbus_log: false,
             seccomp_log: false,
             test_allow_path: None,
+            profile_dir_override: Some(data_home.join("profiles")),
             proxy_override: None,
         }
     }
@@ -475,7 +515,9 @@ mod tests {
         }
         assert!(matches!(
             Instance::create(&env, "ok", "nope"),
-            Err(InstanceError::UnknownProfile(_))
+            Err(InstanceError::Profile(
+                crate::error::ProfileError::NotFound(_)
+            ))
         ));
         // Only that exact shape is reserved.
         for ok in ["try", "try-", "try-x", "try-1a", "tryout"] {
@@ -621,6 +663,28 @@ mod tests {
             Err(InstanceError::Config(_))
         ));
         assert!(!try_root(&env).exists() || try_root(&env).read_dir().unwrap().next().is_none());
+    }
+
+    #[test]
+    fn every_listed_grant_names_a_service() {
+        // The list is what the error message offers; a name on it that no
+        // service answers to would be an offer bubbler cannot keep.
+        for g in GRANTS {
+            assert!(grant_service(g).is_some(), "{g}");
+        }
+        assert!(grant_service("home-share").is_none());
+    }
+
+    #[test]
+    fn a_created_config_names_the_profile_it_was_flattened_from() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = env(tmp.path());
+        let inst = Instance::create(&env, "ff", "firefox").unwrap();
+        let text = fs::read_to_string(inst.config_path()).unwrap();
+        assert!(text.starts_with("// bubbler profile: firefox\n"), "{text}");
+        assert_eq!(config::parse(&text).unwrap(), inst.config);
+        // What was written is what a later `open` sees.
+        assert_eq!(Instance::open(&env, "ff").unwrap().config, inst.config);
     }
 
     #[test]

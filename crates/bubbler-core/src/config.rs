@@ -146,10 +146,38 @@ pub struct InstanceConfig {
     pub seccomp: SeccompConfig,
 }
 
-/// Parse KDL v2 text into an [`InstanceConfig`].
+/// One profile layer as written: the same nodes an instance config may
+/// hold, plus the `include` names layered underneath it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RawProfile {
+    /// The layer's own nodes.
+    pub config: InstanceConfig,
+    /// Profile names to resolve and merge under this layer, in file order.
+    pub includes: Vec<String>,
+    /// Whether a `tty` node was written. [`InstanceConfig::tty`] cannot
+    /// say, and a layer without the node must not override the one below.
+    pub tty_set: bool,
+}
+
+/// Parse KDL v2 text into an [`InstanceConfig`]. `include` is rejected:
+/// an instance config must grant what it says on one screen.
 pub fn parse(text: &str) -> Result<InstanceConfig, ConfigError> {
+    Ok(parse_doc(text, false)?.config)
+}
+
+/// Parse one profile layer, which may also `include` other profiles.
+///
+/// A bundle node (`portals`, `notify`, `mpris`) without `dbus` is not an
+/// error here: the `dbus` grant may come from an included layer. The
+/// resolver applies that check to the merged result.
+pub fn parse_profile(text: &str) -> Result<RawProfile, ConfigError> {
+    parse_doc(text, true)
+}
+
+fn parse_doc(text: &str, profile: bool) -> Result<RawProfile, ConfigError> {
     let doc: KdlDocument = KdlDocument::parse(text)?;
     let mut cfg = InstanceConfig::default();
+    let mut includes: Vec<String> = Vec::new();
     let mut seen_tty = false;
     let mut seen_seccomp = false;
     for node in doc.nodes() {
@@ -224,6 +252,12 @@ pub fn parse(text: &str) -> Result<InstanceConfig, ConfigError> {
                 cfg.seccomp = parse_seccomp(node)?;
             }
             "env" => parse_env(node, &mut cfg.env)?,
+            "include" => {
+                if !profile {
+                    return Err(bad(node, "include is only valid in profiles"));
+                }
+                includes.push(parse_include(node)?);
+            }
             "command" => {
                 if cfg.command.is_some() {
                     return Err(ConfigError::Duplicate(name.to_owned()));
@@ -233,13 +267,28 @@ pub fn parse(text: &str) -> Result<InstanceConfig, ConfigError> {
             other => return Err(ConfigError::UnknownNode(other.to_owned())),
         }
     }
-    if let Some(node) = bundle_without_dbus(&cfg.services) {
+    if !profile && let Some(node) = bundle_without_dbus(&cfg.services) {
         return Err(ConfigError::BadArgument {
             node: node.to_owned(),
             reason: "requires dbus".to_owned(),
         });
     }
-    Ok(cfg)
+    Ok(RawProfile {
+        config: cfg,
+        includes,
+        tty_set: seen_tty,
+    })
+}
+
+/// `include "<profile>"`: one string argument, repeatable. The name is
+/// checked against the profile directories by the resolver, which is
+/// where a name that cannot be looked up is a `NotFound`.
+fn parse_include(node: &KdlNode) -> Result<String, ConfigError> {
+    let name = one_string_arg(node)?;
+    if node.children().is_some() {
+        return Err(bad(node, "takes no children"));
+    }
+    Ok(name.to_owned())
 }
 
 /// Two `dbus` nodes hold different rules, so the grant is recognised by
@@ -1491,5 +1540,48 @@ command "b""#
             parse(r#"seccomp { deny "read" foo="x" }"#),
             Err(ConfigError::UnknownProperty { .. })
         ));
+    }
+
+    #[test]
+    fn include_is_a_profile_node_only() {
+        let raw = parse_profile("include \"gui\"\nwayland\ninclude \"audio\"").unwrap();
+        assert_eq!(raw.includes, vec!["gui".to_string(), "audio".to_string()]);
+        assert_eq!(raw.config.services, vec![Service::Wayland]);
+        assert!(!raw.tty_set);
+
+        let err = parse("include \"gui\"").unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::BadArgument { node, .. } if node == "include"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("only valid in profiles"), "{err}");
+
+        for text in [
+            "include",
+            "include \"a\" \"b\"",
+            "include name=\"a\"",
+            "include \"a\" { x; }",
+        ] {
+            assert!(parse_profile(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_profile_layer_may_leave_the_dbus_grant_to_a_lower_one() {
+        // The bundle check belongs to the merged result, not to a layer
+        // that only adds `notify` on top of an included `dbus`.
+        assert!(parse_profile("include \"base\"\nnotify").is_ok());
+        assert!(matches!(
+            parse("notify"),
+            Err(ConfigError::BadArgument { node, .. }) if node == "notify"
+        ));
+    }
+
+    #[test]
+    fn tty_set_says_whether_the_node_was_written() {
+        assert!(!parse_profile("wayland").unwrap().tty_set);
+        let raw = parse_profile("tty \"pty\"").unwrap();
+        assert!(raw.tty_set);
+        assert_eq!(raw.config.tty, TtyMode::Pty);
     }
 }

@@ -11,9 +11,10 @@ seccomp denylist. See "Known gaps" below.
 
 ## Usage
 
-    bubbler create ff --profile firefox   # seed config.kdl from a built-in profile
+    bubbler create ff --profile firefox   # seed config.kdl from a profile
     bubbler create ff                     # --profile defaults to `generic`
-    bubbler profiles                      # built-in profile names, one per line
+    bubbler profiles                      # profile names, one per line
+    bubbler profiles --origin             # and which layer each comes from
     bubbler edit ff                       # open config.kdl, then re-check it
     bubbler run ff                        # uses `command` from config.kdl
     bubbler run ff -- firefox --version   # or run something else inside
@@ -54,8 +55,8 @@ sandbox is a sibling of the app's, started by `bubbler` and invisible from
 inside it.
 
 `try` runs one command in a sandbox without creating an instance. Its config is
-the profile text (`generic` unless `--profile` says otherwise) plus one bare
-node per `--grant`; the grants are `wayland`, `x11`, `network`, `dri`,
+the flattened profile (`generic` unless `--profile` says otherwise) plus one
+bare node per `--grant`; the grants are `wayland`, `x11`, `network`, `dri`,
 `pipewire`, `pulseaudio`, `dbus`, `portals` and `notify`, and anything with
 arguments needs a real instance. The sandbox lives in
 `$XDG_DATA_HOME/bubbler/try/<pid>/`, never appears in `list`, and is removed
@@ -189,6 +190,55 @@ absolute and cannot be `/`. It exists so tests can share a temporary directory
 under the otherwise denied `/tmp`. It adds a root rather than switching the
 denylist off, and it cannot lift the ones your environment names: your home,
 `$XDG_RUNTIME_DIR` and the instance directory stay refused.
+
+## Profiles
+
+A profile seeds a new instance's `config.kdl`. It is the same KDL as an
+instance config, with one node an instance config may not use: `include`.
+Profiles come from three layers, and the first that holds the name wins:
+
+    $XDG_CONFIG_HOME/bubbler/profiles/<name>.kdl   # yours
+    /usr/share/bubbler/profiles/<name>.kdl         # the system's
+    built-in                                       # compiled into bubbler
+
+`$BUBBLER_PROFILE_DIR` replaces the middle directory. A layer that does not
+parse is an error naming the file — bubbler never falls through to a looser
+layer below it. Profile names use the instance name grammar
+(`[A-Za-z0-9._-]+`, not `.` or `..`, not starting with `-`), so no name can
+reach a file outside those two directories.
+
+    bubbler profiles            # every name from every layer, deduplicated
+    bubbler profiles --origin   # name<TAB>user|system|built-in<TAB>path or -
+
+`include "<name>"` layers another profile underneath this one:
+
+    // ~/.config/bubbler/profiles/firefox.kdl
+    include "firefox"           // the layer below: the built-in firefox
+    home-share "Pictures"
+    env MOZ_ENABLE_WAYLAND="0"
+
+`include "<own name>"` resolves at the *next layer down*, which is how a
+profile of yours extends the shipped one instead of forking it. Includes may
+nest 8 deep, they resolve depth first before the including file's own nodes,
+and a chain that comes back to a file it already read is an error naming the
+chain.
+
+Merging is by node: grants are unioned, identical share nodes collapse, and
+the same `home-share` path in two modes is an error rather than a silent
+choice of `ro` or `rw`. `command`, `tty` and `mpris` from the including file
+replace the included one, `env` replaces by key, `dbus` rules and `seccomp`
+lists are unioned, and `seccomp { disable }` in any layer disables the
+filter. `portals`, `notify` and `mpris` need `dbus` in the merged result, not
+in every layer, so a layer may add `notify` to a `dbus` it includes.
+
+`create` and `try` write the flattened result, so `config.kdl` is one screen
+that says everything the sandbox will be granted. Its first line records
+where it came from:
+
+    // bubbler profile: firefox
+
+Editing an instance never edits the profile, and editing a profile never
+changes an instance that was already seeded from it.
 
 ## D-Bus
 
@@ -455,7 +505,10 @@ run except `--dry-run` also creates `$XDG_RUNTIME_DIR/bubbler/<name>/`, mode
 creates its socket in and the checked socket `bus` beside it, and a `portals`
 grant adds `$XDG_RUNTIME_DIR/.flatpak/bubbler-<name>/`, creating `.flatpak/`
 if it is missing. Everything a run makes there is removed again when it ends.
-`HOME` and `XDG_RUNTIME_DIR` must be set and non-empty.
+`HOME` and `XDG_RUNTIME_DIR` must be set and non-empty. Your profiles live in
+`$XDG_CONFIG_HOME/bubbler/profiles/` (by default under `~/.config`) and the
+system's in `/usr/share/bubbler/profiles/`, or wherever
+`$BUBBLER_PROFILE_DIR` points instead.
 
 The `bubbler-init` binary is taken from `$BUBBLER_INIT` if set (it must be a
 regular file), else from next to the `bubbler` binary, else from

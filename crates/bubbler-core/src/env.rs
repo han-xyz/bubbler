@@ -29,6 +29,9 @@ pub struct Env {
     pub home: PathBuf,
     /// `$XDG_DATA_HOME` (or `$HOME/.local/share`); instances live under it.
     pub data_home: PathBuf,
+    /// `$XDG_CONFIG_HOME` (or `$HOME/.config`); the user's profile layer
+    /// lives in `bubbler/profiles/` under it.
+    pub config_home: PathBuf,
     /// `$XDG_RUNTIME_DIR`; required, sockets live here.
     pub runtime_dir: PathBuf,
     /// Real user id; unchanged inside the sandbox, so synthetic
@@ -64,6 +67,9 @@ pub struct Env {
     /// compares against a canonical source. A test and debugging hook;
     /// nothing shipped sets it.
     pub test_allow_path: Option<PathBuf>,
+    /// `$BUBBLER_PROFILE_DIR`: directory holding the system profile
+    /// layer, replacing `/usr/share/bubbler/profiles`.
+    pub profile_dir_override: Option<PathBuf>,
     /// `$BUBBLER_DBUS_PROXY`: host path of the proxy binary to run
     /// instead of the one on `PATH`. A test and debugging hook; it must
     /// be a regular file and is bound into the proxy sandbox at its own
