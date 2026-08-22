@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bubbler_init::{proto, wire};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::io::Errno;
+use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType, socket_with};
 use rustix::pipe::PipeFlags;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 
@@ -52,16 +54,62 @@ pub fn connect(env: &Env, name: &str) -> Result<Option<UnixStream>, LaunchError>
     }
 }
 
+/// Longest a liveness probe waits for a connection the listener has
+/// queued but not yet accepted. A probe may be made on every redraw, so
+/// it is bounded; a supervisor that has not accepted within it is still
+/// counted as running, since it answered the connect.
+const PROBE_WAIT: Timespec = Timespec {
+    tv_sec: 0,
+    tv_nsec: 200_000_000,
+};
+
 /// Whether an instance is running, without sending it anything and
 /// without touching the socket: the connection is opened and dropped.
+///
+/// Never parks. The connect is made on a non-blocking socket, so a
+/// supervisor whose backlog is full — `AF_UNIX` answers `EAGAIN` rather
+/// than queueing — is read as running instead of holding the caller
+/// until it accepts, and a connection that is queued is waited on for
+/// 200 ms at most.
 ///
 /// Unlike [`connect`], a socket left over from a dead run is left where
 /// it is — this is the probe a caller may make on every redraw, and
 /// unlinking belongs to the paths that are about to bind the path again.
-/// Anything that is not a connection answered by a listener counts as
-/// not running, since nothing could be exec'd through it either.
+/// Anything that is not a connection a listener answered counts as not
+/// running, since nothing could be exec'd through it either.
 pub fn is_live(env: &Env, name: &str) -> bool {
-    UnixStream::connect(socket_path(env, name)).is_ok()
+    let path = socket_path(env, name);
+    let Ok(addr) = SocketAddrUnix::new(&path) else {
+        return false;
+    };
+    let Ok(sock) = socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+        None,
+    ) else {
+        return false;
+    };
+    match rustix::net::connect(&sock, &addr) {
+        Ok(()) => true,
+        // The backlog is full: a listener is there and is not taking
+        // connections this instant, which is running rather than gone.
+        Err(Errno::AGAIN) => true,
+        // Queued. Waiting for the accept is the only part that could
+        // block, so it is the part that is bounded.
+        Err(Errno::INPROGRESS) => {
+            let mut fds = [PollFd::new(&sock, PollFlags::OUT)];
+            match poll(&mut fds, Some(&PROBE_WAIT)) {
+                // Still queued after the wait: something is holding it,
+                // which is not the same as nothing being there.
+                Ok(0) => true,
+                Ok(_) => matches!(rustix::net::sockopt::socket_error(&sock), Ok(Ok(()))),
+                Err(_) => false,
+            }
+        }
+        // No socket, or one a dead run left behind.
+        Err(_) => false,
+    }
 }
 
 /// Poll with no wait at all: the relay asks between its own reads and
@@ -375,6 +423,45 @@ mod tests {
         drop(listener);
         assert!(!is_live(&e, "t"));
         assert!(path.exists());
+    }
+
+    #[test]
+    fn a_listener_that_is_not_accepting_answers_the_probe_anyway() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let path = instance_dir(tmp.path(), "t").join(SOCKET_NAME);
+        let addr = SocketAddrUnix::new(&path).unwrap();
+        let listener = socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .unwrap();
+        rustix::net::bind(&listener, &addr).unwrap();
+        // The smallest backlog there is, and then a connection sitting in
+        // it that nothing will ever accept: the next connect is refused a
+        // place in the queue rather than queued.
+        rustix::net::listen(&listener, 0).unwrap();
+        let queued = socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+            None,
+        )
+        .unwrap();
+        // Whether this one is queued or already refused a place, the
+        // listener is there either way, which is what the probe answers.
+        let _ = rustix::net::connect(&queued, &addr);
+        let start = Instant::now();
+        assert!(is_live(&e, "t"));
+        // A blocking connect would have waited here for an accept that
+        // never comes; this one is bounded by `PROBE_WAIT`.
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "the probe waited {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

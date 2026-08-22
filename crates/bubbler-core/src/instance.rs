@@ -280,10 +280,11 @@ fn seed(
     Ok((text, config))
 }
 
-/// The profile name the first line records, if that line is the header
-/// [`seed`] writes and what follows it is a profile name. A hand-written
-/// config without it names no profile to re-flatten.
-fn profile_header(text: &str) -> Option<&str> {
+/// The profile name the first line records, if that line is the header a
+/// seeded config carries and what follows it is a profile name. A config
+/// written by hand without it names no profile to re-flatten, and no
+/// profile for an instance list to show either.
+pub fn profile_header(text: &str) -> Option<&str> {
     let name = text
         .lines()
         .next()?
