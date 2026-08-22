@@ -41,11 +41,11 @@ Notes worth knowing:
   `mv ~/.local/share/Steam ~/.local/share/bubbler/instances/steam/home/.local/share/`.
   A library outside the home needs a `path-share` (commented example in the
   profile). Steam Input's virtual controllers need `gamepad hidraw=#true
-  uinput=#true` — read [Devices](Devices) first.
+  uinput=#true` — read [Devices](Devices.md) first.
 - **lutris**: keeps `portals`; drop it if a Proton/umu game complains about Flatpak.
 - **keepassxc**: no `network`, no `own "org.freedesktop.secrets"`, no `hidraw`;
   each omission is a comment saying how to add it back. Browser integration
-  via `app-runtime` — see [Sharing Files](Sharing-Files).
+  via `app-runtime` — see [Sharing Files](Sharing-Files.md).
 - **chromium / code / vesktop**: keep their own nested namespace sandbox; no
   `--no-sandbox`, no `userns "disable"`.
 - **firefox / thunderbird**: Wayland by default; `env MOZ_ENABLE_WAYLAND="0"` for Xwayland.

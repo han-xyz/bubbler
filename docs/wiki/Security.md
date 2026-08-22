@@ -69,7 +69,7 @@ sets it.
 
 ## Baseline
 
-See [Configuration](Configuration#baseline-every-sandbox). Two deliberate
+See [Configuration](Configuration.md#baseline-every-sandbox). Two deliberate
 widenings: `/dev/ntsync` (Wine/Proton sync; per-process objects, no host
 state) and `/etc/machine-id` (every instance shares one identifier with the
 host).

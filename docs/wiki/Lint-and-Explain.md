@@ -76,4 +76,4 @@ arguments: D-Bus `rules:`, `rule-only:` for nodes contributing nothing else,
 Groups sit where a node's first argument appears, so the listing is neither
 file order nor argv order; `--dry-run` and `--format json` are the order of
 record. `--explain` attributes, it does not justify: why the baseline holds
-`/etc/ssl` is the [Security](Security) page's job.
+`/etc/ssl` is the [Security](Security.md) page's job.

@@ -2,8 +2,10 @@
 
 ## Install
 
-**Arch Linux (AUR):** `bubbler` (release) or `bubbler-git`. Both split off
-`bubbler-ui`, the optional terminal editor.
+**Arch Linux:** AUR packages `bubbler` / `bubbler-git` (with `bubbler-ui`
+split off) are prepared but **not published yet** — AUR account registration
+is down at the moment, so they cannot be uploaded. Build from source until
+then.
 
 **From source:**
 
@@ -47,7 +49,7 @@ share source is an error, never a silently weaker sandbox.
 
 No profile for your application? `bubbler create x` uses `generic` (baseline
 only), then `bubbler edit x` to add grants, or `bubbler ui` to toggle them.
-See [Configuration](Configuration).
+See [Configuration](Configuration.md).
 
 ## Try without keeping anything
 

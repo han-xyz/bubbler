@@ -45,7 +45,7 @@ etc-share "OpenCL"                // needed for OpenCL; `nvidia` for NVIDIA app 
 
 Cannot name the account files (`passwd`, `group`, `shadow`, …), which the
 sandbox generates. The baseline already binds the common entries — see
-[Configuration](Configuration#baseline-every-sandbox).
+[Configuration](Configuration.md#baseline-every-sandbox).
 
 ## app-runtime
 

@@ -15,19 +15,19 @@ bubbler desktop ff                    # add a menu entry that starts it
 
 | Page | What it covers |
 |---|---|
-| [Getting Started](Getting-Started) | Install, dependencies, first instance |
-| [Commands](Commands) | Every subcommand, one line each |
-| [Configuration](Configuration) | `config.kdl`: every node and what it grants |
-| [Profiles](Profiles) | The 14 built-in profiles, layers, `include`, your own |
-| [Sharing Files](Sharing-Files) | `home-share`, `path-share`, `etc-share`, `app-runtime` |
-| [Devices](Devices) | GPU, audio, gamepad, hidraw, camera |
-| [Network](Network) | Isolated namespace via pasta, inbound ports, outbound filtering |
-| [D-Bus](D-Bus) | Session and system bus through `xdg-dbus-proxy`, portals, tray |
-| [Desktop Entries and Shims](Desktop-Entries-and-Shims) | `bubbler desktop`, `bubbler wrap`, `bubbler open` |
-| [Terminal](Terminal) | `tty` modes, detaching, the `bubbler-ui` editor |
-| [Lint and Explain](Lint-and-Explain) | `bubbler lint`, `lint-allow`, `--dry-run --explain` |
-| [Security](Security) | Baseline, seccomp, user namespaces, threat model, known gaps |
-| [Development](Development) | Build, checks, fuzzing, CI |
+| [Getting Started](Getting-Started.md) | Install, dependencies, first instance |
+| [Commands](Commands.md) | Every subcommand, one line each |
+| [Configuration](Configuration.md) | `config.kdl`: every node and what it grants |
+| [Profiles](Profiles.md) | The 14 built-in profiles, layers, `include`, your own |
+| [Sharing Files](Sharing-Files.md) | `home-share`, `path-share`, `etc-share`, `app-runtime` |
+| [Devices](Devices.md) | GPU, audio, gamepad, hidraw, camera |
+| [Network](Network.md) | Isolated namespace via pasta, inbound ports, outbound filtering |
+| [D-Bus](D-Bus.md) | Session and system bus through `xdg-dbus-proxy`, portals, tray |
+| [Desktop Entries and Shims](Desktop-Entries-and-Shims.md) | `bubbler desktop`, `bubbler wrap`, `bubbler open` |
+| [Terminal](Terminal.md) | `tty` modes, detaching, the `bubbler-ui` editor |
+| [Lint and Explain](Lint-and-Explain.md) | `bubbler lint`, `lint-allow`, `--dry-run --explain` |
+| [Security](Security.md) | Baseline, seccomp, user namespaces, threat model, known gaps |
+| [Development](Development.md) | Build, checks, fuzzing, CI |
 
 ## Where things live
 

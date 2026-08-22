@@ -69,7 +69,8 @@ self-hosted runner).
 | `docs/threat-model.md` | long-form threat model |
 | `contrib/apparmor/` | untested AppArmor profile |
 
-Packaging (AUR `bubbler`, `bubbler-git`) lives in repositories of its own.
+Packaging (AUR `bubbler`, `bubbler-git`) lives in repositories of its own;
+not published yet while AUR registration is down.
 
 ## License
 
