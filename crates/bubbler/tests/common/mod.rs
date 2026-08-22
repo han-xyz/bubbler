@@ -1,6 +1,7 @@
 //! Shared helpers for CLI integration tests.
 
 use std::ffi::OsStr;
+use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
@@ -14,7 +15,10 @@ use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::io::Errno;
 use rustix::process::{Pid, Signal, kill_process_group};
 use rustix::termios::Winsize;
-use rustix::thread::{UnshareFlags, unshare_unsafe};
+use rustix::thread::{
+    CapabilitySet, UnshareFlags, capabilities, configure_capability_in_ambient_set,
+    set_capabilities, unshare_unsafe,
+};
 
 /// Say why a test is being skipped, where a default `cargo test` will
 /// show it.
@@ -49,6 +53,7 @@ const SLEEP: &str = "/usr/bin/sleep";
 static USERNS: OnceLock<Option<String>> = OnceLock::new();
 static BWRAP: OnceLock<Option<String>> = OnceLock::new();
 static PASTA: OnceLock<Option<String>> = OnceLock::new();
+static NFT: OnceLock<Option<String>> = OnceLock::new();
 
 /// Run `probe` once, then print its reason on *every* call that finds it
 /// negative: a skipped test that says nothing is indistinguishable from
@@ -189,6 +194,74 @@ pub fn require_python() -> bool {
         say(&format!("skipping: {PYTHON} is not installed"));
     }
     ok
+}
+
+/// Returns false (after printing why) when the outbound ruleset cannot be
+/// installed here.
+///
+/// The probe installs one, in a namespace of its own, rather than running
+/// `nft --version`: the ruleset bubbler generates needs `nft_reject_inet`
+/// and the conntrack match, and a host that loads no modules
+/// (`kernel.modules_disabled`) or a container that forbids the netlink
+/// has the binary and none of what it needs.
+pub fn require_nft() -> bool {
+    require_userns() && probed(&NFT, nft_installs_a_ruleset)
+}
+
+/// The shape bubbler installs, cut down to the rules that need something
+/// of the kernel: the reject statement, the conntrack match and the
+/// ICMPv6 types.
+const PROBE_RULESET: &str = "table inet bubblerprobe {
+	chain out {
+		type filter hook output priority 0; policy drop;
+		oifname \"lo\" accept
+		ct state established,related accept
+		icmpv6 type { nd-router-solicit, nd-neighbor-solicit } accept
+		reject with icmpx admin-prohibited
+	}
+}
+";
+
+/// One real install, in a user and network namespace the child makes for
+/// itself, which is thrown away with it.
+fn nft_installs_a_ruleset() -> Option<String> {
+    let mut c = Command::new("nft");
+    c.arg("-f")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    // SAFETY: as in `namespace_holder`, plus the capability calls the
+    // launcher makes for the same reason: capabilities do not survive
+    // `execve`, so without the ambient set `nft` would exec with nothing
+    // and the probe would report every host as unable. `capget`,
+    // `capset` and `prctl` are bare syscalls that allocate nothing.
+    unsafe {
+        c.pre_exec(|| {
+            unshare_unsafe(UnshareFlags::NEWUSER | UnshareFlags::NEWNET)?;
+            let mut caps = capabilities(None)?;
+            caps.inheritable |= CapabilitySet::NET_ADMIN;
+            set_capabilities(None, caps)?;
+            configure_capability_in_ambient_set(CapabilitySet::NET_ADMIN, true)?;
+            Ok(())
+        });
+    }
+    let mut child = match c.spawn() {
+        Ok(c) => c,
+        Err(e) => return Some(format!("nft is not installed (package `nftables`): {e}")),
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(PROBE_RULESET.as_bytes());
+    }
+    match child.wait_with_output() {
+        Ok(o) if o.status.success() => None,
+        Ok(o) => Some(format!(
+            "nft installs no ruleset here ({}): {}",
+            o.status,
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => Some(format!("nft did not run: {e}")),
+    }
 }
 
 /// Returns false (after printing why) when the man pages cannot be

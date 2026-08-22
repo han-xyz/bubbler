@@ -6,7 +6,7 @@ use std::ffi::{OsStr, OsString};
 
 use crate::config::{BusRule, InstanceConfig, LintAllow, Service, ShareMode, Userns};
 use crate::error::ConfigError;
-use crate::network::{Mode as NetworkMode, NetworkConfig};
+use crate::network::{Mode as NetworkMode, NetworkConfig, Outbound};
 use crate::seccomp::{Errno, SeccompConfig};
 use crate::tty::TtyMode;
 
@@ -158,11 +158,22 @@ fn network(cfg: &NetworkConfig) -> String {
         NetworkMode::Host => node.push_str(" \"host\""),
         NetworkMode::None => node.push_str(" \"none\""),
     }
-    let mut kids: Vec<String> = cfg
-        .dns
-        .iter()
-        .map(|ip| format!("dns {}", quote(&ip.to_string())))
-        .collect();
+    let mut kids: Vec<String> = Vec::new();
+    // The switch first: it is what decides whether the `allow-out` lines
+    // below it are rules or a parse error.
+    if cfg.outbound == Outbound::Deny {
+        kids.push("outbound \"deny\"".to_owned());
+    }
+    kids.extend(
+        cfg.dns
+            .iter()
+            .map(|ip| format!("dns {}", quote(&ip.to_string()))),
+    );
+    // Rendered by the node itself, so the file a config is written back
+    // as and the message that names a duplicate cannot disagree.
+    for a in &cfg.allow_out {
+        kids.push(format!("allow-out {a}"));
+    }
     for f in &cfg.forwards {
         let udp = if f.udp { " udp=#true" } else { "" };
         kids.push(format!("allow-port {}{udp}", f.port));
@@ -327,6 +338,15 @@ mod tests {
             "network {\n    allow-port 8080\n}\n",
             "network {\n    allow-port 53 udp=#true\n}\n",
             "network {\n    no-ipv6\n}\n",
+            "network {\n    outbound \"deny\"\n}\n",
+            "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\"\n}\n",
+            "network {\n    outbound \"deny\"\n    allow-out \"140.82.112.0/20\" port=443 \
+             proto=\"tcp\"\n}\n",
+            "network {\n    outbound \"deny\"\n    allow-out \"2606:4700::/32\" port=853\n}\n",
+            "network {\n    outbound \"deny\"\n    allow-out \"10.0.0.0/8\" proto=\"udp\"\n}\n",
+            "network {\n    outbound \"deny\"\n    dns \"1.1.1.1\"\n    \
+             allow-out \"1.1.1.1\" port=53\n    allow-port 8080\n    \
+             allow-port 53 udp=#true\n    no-ipv6\n}\n",
             "network {\n    dns \"1.1.1.1\"\n    allow-port 8080\n    \
              allow-port 53 udp=#true\n    no-ipv6\n}\n",
         ] {

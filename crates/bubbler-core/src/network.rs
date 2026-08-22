@@ -7,6 +7,13 @@
 //! userspace connection to the outside, and that is `pasta` from the
 //! `passt` package.
 //!
+//! Outbound filtering lives here too: `outbound "deny"` turns the
+//! `allow-out` children into the nftables ruleset the launcher installs
+//! in the sandbox's own network namespace. Rules are generated from
+//! typed values and from nothing else — an address that reached `nft -f
+//! -` as a string would be command injection into a process holding
+//! `CAP_NET_ADMIN` over the sandbox's namespaces.
+//!
 //! pasta's own defaults are wrong for a sandbox, which is why every
 //! invocation here carries the same six `none` values. `pasta(1)`: port
 //! forwarding "default is none for passt and auto for pasta", and in auto
@@ -19,6 +26,7 @@
 //! be rid of them.
 
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -87,6 +95,220 @@ pub struct Forward {
     pub udp: bool,
 }
 
+/// Which destinations the sandbox may open a connection to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Outbound {
+    /// Every destination the namespace can route to, which is what a
+    /// `network` grant has always meant.
+    #[default]
+    Allow,
+    /// Only the sandbox's own loopback, its resolver and what
+    /// [`AllowOut`] names; everything else is rejected by an nftables
+    /// ruleset the launcher installs in the sandbox's own network
+    /// namespace, where the sandbox itself can neither read nor flush it.
+    Deny,
+}
+
+impl FromStr for Outbound {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "allow" => Ok(Self::Allow),
+            "deny" => Ok(Self::Deny),
+            _ => Err(ConfigError::BadArgument {
+                node: "outbound".to_owned(),
+                reason: format!("expected `allow` or `deny`, got `{s}`"),
+            }),
+        }
+    }
+}
+
+/// A transport protocol an `allow-out` can be narrowed to. Nothing else
+/// is reachable under [`Outbound::Deny`]: ICMP included, so `ping` does
+/// not answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Proto {
+    /// TCP.
+    Tcp,
+    /// UDP.
+    Udp,
+}
+
+impl Proto {
+    /// The word both nftables and the config spell it with.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+}
+
+impl FromStr for Proto {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "tcp" => Ok(Self::Tcp),
+            "udp" => Ok(Self::Udp),
+            _ => Err(ConfigError::BadArgument {
+                node: "allow-out".to_owned(),
+                reason: format!("proto must be \"tcp\" or \"udp\", got `{s}`"),
+            }),
+        }
+    }
+}
+
+/// One destination an `allow-out` names: a single address, or a network
+/// with its prefix length.
+///
+/// The host bits of a prefix must be clear. `nft` would take
+/// `1.1.1.1/24` and quietly mean `1.1.0.0/24`, which is a rule allowing
+/// 256 addresses where its author wrote one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cidr {
+    addr: IpAddr,
+    prefix: u8,
+}
+
+impl Cidr {
+    /// The address, which is the network address where the prefix covers
+    /// more than one.
+    pub fn addr(&self) -> IpAddr {
+        self.addr
+    }
+
+    /// How many leading bits of [`Cidr::addr`] the rule matches on.
+    pub fn prefix(&self) -> u8 {
+        self.prefix
+    }
+
+    /// Whether this destination is reached over IPv6, which is the half
+    /// of the stack `no-ipv6` takes away.
+    pub fn is_ipv6(&self) -> bool {
+        self.addr.is_ipv6()
+    }
+
+    /// The nftables address family keyword this destination matches in:
+    /// the table is `inet`, so each rule names its own.
+    fn family(&self) -> &'static str {
+        match self.addr {
+            IpAddr::V4(_) => "ip",
+            IpAddr::V6(_) => "ip6",
+        }
+    }
+
+    /// The widest prefix of this address family.
+    fn bits(addr: IpAddr) -> u8 {
+        match addr {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        }
+    }
+
+    /// Whether every bit below the prefix is zero.
+    fn is_network_address(addr: IpAddr, prefix: u8) -> bool {
+        if prefix == Self::bits(addr) {
+            return true;
+        }
+        match addr {
+            IpAddr::V4(a) => u32::from(a) & (u32::MAX >> prefix) == 0,
+            IpAddr::V6(a) => u128::from(a) & (u128::MAX >> prefix) == 0,
+        }
+    }
+}
+
+impl FromStr for Cidr {
+    type Err = ConfigError;
+
+    /// `<address>` or `<address>/<prefix-length>`, v4 or v6. The value is
+    /// never echoed back: it is arbitrary text and may hold the control
+    /// bytes the error message would then carry.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let bad = |reason: &str| ConfigError::BadArgument {
+            node: "allow-out".to_owned(),
+            reason: reason.to_owned(),
+        };
+        let (addr, len) = match s.split_once('/') {
+            Some((addr, len)) => (addr, Some(len)),
+            None => (s, None),
+        };
+        let addr = IpAddr::from_str(addr).map_err(|_| {
+            bad("expects an address or a prefix, such as \"1.1.1.1\" or \"140.82.112.0/20\"")
+        })?;
+        // An IPv4-mapped address is an IPv4 destination wearing IPv6
+        // notation: the packet leaves as IPv4 and an `ip6 daddr` rule
+        // never matches it, so the rule would be silently inert.
+        if let IpAddr::V6(v6) = addr
+            && v6.to_ipv4_mapped().is_some()
+        {
+            return Err(bad(
+                "an IPv4-mapped address names an IPv4 destination, which an IPv6 rule \
+                 never matches; write the address in its IPv4 form",
+            ));
+        }
+        let prefix = match len {
+            None => Self::bits(addr),
+            Some(len) => len
+                .parse::<u8>()
+                .ok()
+                .filter(|n| *n <= Self::bits(addr))
+                .ok_or_else(|| bad("prefix length is out of range for the address family"))?,
+        };
+        if !Self::is_network_address(addr, prefix) {
+            return Err(bad(
+                "the bits below the prefix must be zero, or the rule covers a network its \
+                 author did not write",
+            ));
+        }
+        Ok(Self { addr, prefix })
+    }
+}
+
+impl fmt::Display for Cidr {
+    /// The prefix length is written only where it narrows anything, so a
+    /// single address renders as itself.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.prefix == Self::bits(self.addr) {
+            true => write!(f, "{}", self.addr),
+            false => write!(f, "{}/{}", self.addr, self.prefix),
+        }
+    }
+}
+
+/// One `allow-out` child: a destination the sandbox may reach under
+/// [`Outbound::Deny`], optionally narrowed to one port and one protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllowOut {
+    /// The address or network.
+    pub dest: Cidr,
+    /// The destination port, or every port.
+    pub port: Option<u16>,
+    /// The protocol, or both TCP and UDP.
+    pub proto: Option<Proto>,
+}
+
+impl fmt::Display for AllowOut {
+    /// The child as a config writes it: the destination quoted, then only
+    /// the properties that narrow it. One rendering, so the emitter and
+    /// the messages that name a rule cannot describe it differently.
+    ///
+    /// The quotes need no escaping: a [`Cidr`] renders as an [`IpAddr`]
+    /// and a prefix length, which is hex digits, dots, colons and a
+    /// slash.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "\"{}\"", self.dest)?;
+        if let Some(port) = self.port {
+            write!(f, " port={port}")?;
+        }
+        if let Some(proto) = self.proto {
+            write!(f, " proto=\"{}\"", proto.keyword())?;
+        }
+        Ok(())
+    }
+}
+
 /// The whole `network` node: its mode and what its children asked for.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NetworkConfig {
@@ -100,6 +322,11 @@ pub struct NetworkConfig {
     pub forwards: Vec<Forward>,
     /// Drop IPv6 (`pasta -4`). Only [`Mode::Isolated`] has a pasta.
     pub no_ipv6: bool,
+    /// Whether outbound traffic is filtered at all. Only
+    /// [`Mode::Isolated`] has a namespace of bubbler's to filter.
+    pub outbound: Outbound,
+    /// Destinations reachable under [`Outbound::Deny`], in file order.
+    pub allow_out: Vec<AllowOut>,
 }
 
 impl NetworkConfig {
@@ -120,21 +347,123 @@ impl NetworkConfig {
 /// carry a query. The parser refuses a `dns` child there, so that last
 /// case is this function standing on its own rather than a config.
 pub fn resolv_conf(cfg: &NetworkConfig) -> Option<Vec<u8>> {
-    let servers: Vec<IpAddr> = match (cfg.mode, cfg.dns.is_empty()) {
-        // Nothing to resolve with and nothing to resolve for: a `dns`
-        // child under `none` names a server no sandbox can reach, which
-        // is why the parser refuses one.
-        (Mode::None, _) => return None,
-        (_, false) => cfg.dns.clone(),
-        (Mode::Isolated, true) => vec![DNS_FORWARD],
-        (Mode::Host, true) => return None,
-    };
     let mut out = String::new();
-    for s in servers {
+    for s in resolvers(cfg)? {
         out.push_str(&format!("nameserver {s}\n"));
     }
     Some(out.into_bytes())
 }
+
+/// The nameservers this sandbox queries, or `None` where the host's own
+/// `/etc/resolv.conf` is bound instead. The one place that decides them,
+/// because the outbound ruleset has to accept exactly these addresses:
+/// a resolver the filter did not open makes every lookup fail and every
+/// failure look like a network outage.
+fn resolvers(cfg: &NetworkConfig) -> Option<Vec<IpAddr>> {
+    match (cfg.mode, cfg.dns.is_empty()) {
+        // Nothing to resolve with and nothing to resolve for: a `dns`
+        // child under `none` names a server no sandbox can reach, which
+        // is why the parser refuses one.
+        (Mode::None, _) => None,
+        (_, false) => Some(cfg.dns.clone()),
+        (Mode::Isolated, true) => Some(vec![DNS_FORWARD]),
+        (Mode::Host, true) => None,
+    }
+}
+
+/// The nftables ruleset an `outbound "deny"` is, as `nft -f -` takes it,
+/// or `None` where nothing is filtered.
+///
+/// Built from typed values only: every address is an [`IpAddr`] and
+/// every port a `u16` before it is rendered here, since this text is fed
+/// to a process holding `CAP_NET_ADMIN` over the sandbox's namespaces.
+///
+/// The chain is `inet` so that IPv6 falls under the same policy — an
+/// `ip` table would leave it wide open and read identically in `nft list
+/// ruleset` to anyone not looking at the family. `policy drop` is the
+/// backstop under the trailing `reject`, since an nftables base chain
+/// takes only `accept` or `drop` as its policy; what a blocked
+/// application actually sees is the reject, measured on this host as
+/// `EHOSTUNREACH` for IPv4 and `EACCES` for IPv6 immediately, and
+/// `EPERM` out of `sendto` for UDP, rather than the connect timeout a
+/// silent drop would give it.
+///
+/// `oifname "lo" accept` opens the sandbox's own loopback, and it is
+/// safe only because [`pasta_argv`] passes `-T none -U none`: pasta's
+/// outbound forwarding would put a socket of pasta's on that loopback
+/// and splice it to the host, which never becomes a packet and so is
+/// never seen by netfilter.
+pub fn ruleset(cfg: &NetworkConfig) -> Option<String> {
+    if cfg.outbound != Outbound::Deny || !cfg.is_isolated() {
+        return None;
+    }
+    let mut rules = vec![
+        "oifname \"lo\" accept".to_owned(),
+        "ct state established,related accept".to_owned(),
+    ];
+    // Neighbour discovery is how an IPv6 stack finds its router and its
+    // neighbours, and the sandbox sends it like any other packet: without
+    // this rule the policy below stops IPv6 before any `allow-out` over
+    // it could ever match, so a v6 destination would be dead however it
+    // was written. Listed in nftables' own order, which is what `nft list
+    // ruleset` prints back. `no-ipv6` leaves the namespace no IPv6
+    // address at all, and then the rule would match nothing.
+    if !cfg.no_ipv6 {
+        rules.push(
+            "icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, \
+             nd-neighbor-advert } accept"
+                .to_owned(),
+        );
+    }
+    for ip in resolvers(cfg).unwrap_or_default() {
+        let dest = Cidr {
+            addr: ip,
+            prefix: Cidr::bits(ip),
+        };
+        for proto in [Proto::Udp, Proto::Tcp] {
+            rules.push(format!(
+                "{} daddr {dest} {} dport 53 accept",
+                dest.family(),
+                proto.keyword()
+            ));
+        }
+    }
+    for allowed in &cfg.allow_out {
+        rules.extend(allow_out_rules(allowed));
+    }
+    rules.push("reject with icmpx admin-prohibited".to_owned());
+    let mut out = String::from("table inet bubbler {\n\tchain out {\n");
+    out.push_str("\t\ttype filter hook output priority 0; policy drop;\n");
+    for rule in rules {
+        out.push_str(&format!("\t\t{rule}\n"));
+    }
+    out.push_str("\t}\n}\n");
+    Some(out)
+}
+
+/// The one or two rules one `allow-out` becomes: a child that names no
+/// protocol means TCP and UDP, and nothing else.
+fn allow_out_rules(allowed: &AllowOut) -> Vec<String> {
+    let protos: &[Proto] = match allowed.proto {
+        Some(Proto::Tcp) => &[Proto::Tcp],
+        Some(Proto::Udp) => &[Proto::Udp],
+        None => &[Proto::Tcp, Proto::Udp],
+    };
+    protos
+        .iter()
+        .map(|proto| {
+            let head = format!("{} daddr {}", allowed.dest.family(), allowed.dest);
+            match allowed.port {
+                Some(port) => format!("{head} {} dport {port} accept", proto.keyword()),
+                None => format!("{head} meta l4proto {} accept", proto.keyword()),
+            }
+        })
+        .collect()
+}
+
+/// The binary that installs the ruleset, as it is looked up on `PATH`.
+/// Arch ships it in `nftables`, which is not part of `base`.
+pub const NFT_BIN: &str = "nft";
 
 /// Where pasta finds the sandbox. Each is a path pasta opens for itself,
 /// so they are the caller's to keep valid until it has started.
@@ -164,6 +493,18 @@ pub struct Attach<'a> {
 /// into the host (see the module documentation). `--foreground` is load
 /// bearing too — a backgrounded pasta is not bubbler's child any more and
 /// could not be killed when the run ends.
+///
+/// `-T none` and `-U none` are load bearing for [`ruleset`] as well.
+/// pasta forwards a local connection by creating a socket in the other
+/// namespace and `splice(2)`ing between the two (`pasta(1)`, handling of
+/// local traffic), so such traffic is never a packet and netfilter never
+/// sees it: with outbound forwarding on, an application could reach a
+/// host service through the namespace's own loopback, which the ruleset
+/// has to accept for the sandbox's own sake. Measured: with pasta's
+/// defaults a host service on `127.0.0.1` answers inside the sandbox
+/// while the same ruleset is installed. `allow-port` (`-t`/`-u`) does
+/// not reopen it — pasta binds those on the *host* and connects into the
+/// namespace, which is a direction an application cannot ride outwards.
 pub fn pasta_argv(cfg: &NetworkConfig, at: Attach) -> Vec<OsString> {
     let o = |s: &str| OsString::from(s);
     let mut argv = vec![
@@ -299,6 +640,7 @@ mod tests {
                 },
             ],
             no_ipv6: true,
+            ..NetworkConfig::default()
         };
         let a = argv(&cfg);
         // The node named its own resolver, so pasta translates nothing.
@@ -413,6 +755,270 @@ mod tests {
             ..NetworkConfig::default()
         };
         assert_eq!(resolv_conf(&cfg), None);
+    }
+
+    fn cidr(s: &str) -> Cidr {
+        Cidr::from_str(s).expect(s)
+    }
+
+    fn denying(allow_out: Vec<AllowOut>) -> NetworkConfig {
+        NetworkConfig {
+            outbound: Outbound::Deny,
+            allow_out,
+            ..NetworkConfig::default()
+        }
+    }
+
+    /// The golden ruleset. Every line of it is a policy decision: the
+    /// family, the loopback opening, the resolver accepts the generator
+    /// adds by itself, and the reject that turns a block into an
+    /// immediate error rather than a timeout.
+    #[test]
+    fn the_ruleset_is_the_golden_text_nft_is_fed() {
+        let cfg = denying(vec![
+            AllowOut {
+                dest: cidr("1.1.1.1"),
+                port: Some(443),
+                proto: Some(Proto::Tcp),
+            },
+            AllowOut {
+                dest: cidr("140.82.112.0/20"),
+                port: None,
+                proto: None,
+            },
+            AllowOut {
+                dest: cidr("2606:4700:4700::1111"),
+                port: Some(853),
+                proto: None,
+            },
+            AllowOut {
+                dest: cidr("192.168.0.0/16"),
+                port: None,
+                proto: Some(Proto::Udp),
+            },
+        ]);
+        assert_eq!(
+            ruleset(&cfg).unwrap(),
+            "table inet bubbler {
+\tchain out {
+\t\ttype filter hook output priority 0; policy drop;
+\t\toifname \"lo\" accept
+\t\tct state established,related accept
+\t\ticmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } accept
+\t\tip daddr 169.254.1.1 udp dport 53 accept
+\t\tip daddr 169.254.1.1 tcp dport 53 accept
+\t\tip daddr 1.1.1.1 tcp dport 443 accept
+\t\tip daddr 140.82.112.0/20 meta l4proto tcp accept
+\t\tip daddr 140.82.112.0/20 meta l4proto udp accept
+\t\tip6 daddr 2606:4700:4700::1111 tcp dport 853 accept
+\t\tip6 daddr 2606:4700:4700::1111 udp dport 853 accept
+\t\tip daddr 192.168.0.0/16 meta l4proto udp accept
+\t\treject with icmpx admin-prohibited
+\t}
+}
+"
+        );
+    }
+
+    /// Without neighbour discovery an IPv6 stack never finds its router,
+    /// so every v6 `allow-out` under it would be a rule nothing could
+    /// reach. `no-ipv6` takes the address away instead, and then the rule
+    /// has nothing to match.
+    #[test]
+    fn ipv6_neighbour_discovery_is_open_unless_the_node_dropped_ipv6() {
+        const ND: &str = "icmpv6 type { nd-router-solicit, nd-router-advert, \
+                          nd-neighbor-solicit, nd-neighbor-advert } accept";
+        let cfg = denying(vec![AllowOut {
+            dest: cidr("2606:4700:4700::1111"),
+            port: Some(443),
+            proto: Some(Proto::Tcp),
+        }]);
+        let rules = ruleset(&cfg).unwrap();
+        assert!(rules.contains(ND), "{rules}");
+        // Ahead of every accept the config asked for: discovery has to
+        // work before an address of the config can be reached over it.
+        let nd = rules.find(ND).unwrap();
+        let dest = rules.find("ip6 daddr 2606:4700:4700::1111").unwrap();
+        assert!(nd < dest, "{rules}");
+        let no_v6 = NetworkConfig {
+            no_ipv6: true,
+            ..denying(Vec::new())
+        };
+        assert!(!ruleset(&no_v6).unwrap().contains("icmpv6"), "{no_v6:?}");
+    }
+
+    /// One rendering for the emitter and for every message that names a
+    /// rule, so the two cannot describe the same child differently.
+    #[test]
+    fn a_destination_writes_itself_the_way_a_config_does() {
+        let one = |port, proto| {
+            AllowOut {
+                dest: cidr("1.1.1.1"),
+                port,
+                proto,
+            }
+            .to_string()
+        };
+        assert_eq!(one(None, None), "\"1.1.1.1\"");
+        assert_eq!(one(Some(443), None), "\"1.1.1.1\" port=443");
+        assert_eq!(one(None, Some(Proto::Udp)), "\"1.1.1.1\" proto=\"udp\"");
+        assert_eq!(
+            one(Some(443), Some(Proto::Tcp)),
+            "\"1.1.1.1\" port=443 proto=\"tcp\""
+        );
+        assert_eq!(
+            AllowOut {
+                dest: cidr("2606:4700::/32"),
+                port: None,
+                proto: None,
+            }
+            .to_string(),
+            "\"2606:4700::/32\""
+        );
+    }
+
+    /// The resolver the filter opens is the one the generated
+    /// `/etc/resolv.conf` names, whichever of the two decided it. A
+    /// ruleset that forgot it would break every lookup and look like a
+    /// network outage.
+    #[test]
+    fn the_ruleset_opens_exactly_the_resolvers_resolv_conf_names() {
+        let picked = denying(Vec::new());
+        assert_eq!(resolv_conf(&picked).unwrap(), b"nameserver 169.254.1.1\n");
+        let rules = ruleset(&picked).unwrap();
+        assert!(
+            rules.contains("ip daddr 169.254.1.1 udp dport 53 accept"),
+            "{rules}"
+        );
+        assert!(
+            rules.contains("ip daddr 169.254.1.1 tcp dport 53 accept"),
+            "{rules}"
+        );
+
+        let named = NetworkConfig {
+            dns: vec![IpAddr::from([9, 9, 9, 9]), "2620:fe::fe".parse().unwrap()],
+            ..denying(Vec::new())
+        };
+        let rules = ruleset(&named).unwrap();
+        assert!(!rules.contains("169.254.1.1"), "{rules}");
+        for line in [
+            "ip daddr 9.9.9.9 udp dport 53 accept",
+            "ip daddr 9.9.9.9 tcp dport 53 accept",
+            "ip6 daddr 2620:fe::fe udp dport 53 accept",
+            "ip6 daddr 2620:fe::fe tcp dport 53 accept",
+        ] {
+            assert!(rules.contains(line), "{line} missing from {rules}");
+        }
+    }
+
+    /// The loopback accept and pasta's forwarding options are one
+    /// decision, measured: with `-T auto` an application reaches a host
+    /// service through the namespace's own loopback, pasta splices it,
+    /// and no packet ever reaches the chain. Whoever relaxes one of these
+    /// flags has to come past this test.
+    #[test]
+    fn the_loopback_accept_is_coupled_to_pastas_forwarding_being_off() {
+        let cfg = denying(vec![AllowOut {
+            dest: cidr("1.1.1.1"),
+            port: None,
+            proto: None,
+        }]);
+        assert!(ruleset(&cfg).unwrap().contains("oifname \"lo\" accept"));
+        let a = argv(&cfg);
+        for flag in ["-T", "-U", "--map-host-loopback", "--map-guest-addr"] {
+            let i = a.iter().position(|x| x == flag).expect(flag);
+            assert_eq!(a[i + 1], "none", "{flag} must stay none while lo is open");
+        }
+    }
+
+    /// Only the isolated mode has a namespace of bubbler's to filter, and
+    /// only `outbound "deny"` filters it. The parser refuses the other
+    /// combinations; this holds for a config built in code as well.
+    #[test]
+    fn nothing_is_installed_without_an_isolated_deny() {
+        assert_eq!(ruleset(&NetworkConfig::default()), None);
+        for mode in [Mode::Host, Mode::None] {
+            let cfg = NetworkConfig {
+                mode,
+                ..denying(vec![AllowOut {
+                    dest: cidr("1.1.1.1"),
+                    port: None,
+                    proto: None,
+                }])
+            };
+            assert_eq!(ruleset(&cfg), None, "{mode:?}");
+        }
+        assert_eq!(
+            ruleset(&NetworkConfig {
+                outbound: Outbound::Allow,
+                allow_out: vec![AllowOut {
+                    dest: cidr("1.1.1.1"),
+                    port: None,
+                    proto: None,
+                }],
+                ..NetworkConfig::default()
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn a_destination_is_an_address_or_a_network_written_canonically() {
+        assert_eq!(cidr("1.1.1.1").to_string(), "1.1.1.1");
+        assert_eq!(cidr("1.1.1.1/32").to_string(), "1.1.1.1");
+        assert_eq!(cidr("140.82.112.0/20").to_string(), "140.82.112.0/20");
+        assert_eq!(cidr("0.0.0.0/0").to_string(), "0.0.0.0/0");
+        assert_eq!(
+            cidr("2606:4700:4700::1111").to_string(),
+            "2606:4700:4700::1111"
+        );
+        assert_eq!(cidr("2606:4700::/32").to_string(), "2606:4700::/32");
+        assert_eq!(cidr("::/0").to_string(), "::/0");
+        assert_eq!(cidr("1.1.1.1").addr(), IpAddr::from([1, 1, 1, 1]));
+        assert_eq!(cidr("140.82.112.0/20").prefix(), 20);
+    }
+
+    /// A prefix with host bits set is refused rather than silently
+    /// widened: `nft` reads `1.1.1.1/24` as `1.1.0.0/24`, which allows
+    /// 256 addresses where its author wrote one.
+    #[test]
+    fn a_destination_with_bits_below_its_prefix_is_refused() {
+        for bad in [
+            "1.1.1.1/24",
+            "1.1.1.1/0",
+            "2606:4700:4700::1111/32",
+            "1.1.1.1/33",
+            "2606:4700::/129",
+            "1.1.1.1/",
+            "1.1.1.1/-1",
+            "1.1.1.1/x",
+            "not-an-address",
+            "",
+            "1.1.1.1/24/24",
+            "example.com",
+            // An IPv4 destination in IPv6 notation: the packet leaves as
+            // IPv4 and no `ip6 daddr` rule would ever match it.
+            "::ffff:1.1.1.1",
+            "::ffff:101:101",
+            "::ffff:0:0/96",
+        ] {
+            assert!(Cidr::from_str(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn outbound_and_proto_names_are_the_written_ones() {
+        assert_eq!(Outbound::from_str("allow").unwrap(), Outbound::Allow);
+        assert_eq!(Outbound::from_str("deny").unwrap(), Outbound::Deny);
+        assert_eq!(Outbound::default(), Outbound::Allow);
+        assert_eq!(Proto::from_str("tcp").unwrap(), Proto::Tcp);
+        assert_eq!(Proto::from_str("udp").unwrap(), Proto::Udp);
+        for bad in ["", "DENY", "reject", "drop"] {
+            assert!(Outbound::from_str(bad).is_err(), "{bad}");
+        }
+        for bad in ["", "TCP", "icmp", "sctp", "any"] {
+            assert!(Proto::from_str(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

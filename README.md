@@ -299,7 +299,11 @@ file order does not affect the generated argv.
     network {                        # children; `dns` in any of the three
         dns "1.1.1.1"                #   generated /etc/resolv.conf
         allow-port 8080              #   host 127.0.0.1:8080 reaches the sandbox
-        allow-port 5353 udp=#true    #   isolated mode only, like no-ipv6
+        allow-port 5353 udp=#true    #   isolated mode only, like the rest
+        outbound "deny"              #   filter outbound traffic (default "allow")
+        allow-out "1.1.1.1"          #   any port, tcp and udp
+        allow-out "140.82.112.0/20" port=443 proto="tcp"
+        allow-out "2606:4700:4700::1111" port=853
         no-ipv6
     }
     dri                              # GPU: /dev/dri, NVIDIA nodes, the PCI devices' sysfs
@@ -687,12 +691,116 @@ forward rather than a TCP one. pasta delivers such a connection to the
 namespace's public address, so the server inside must listen on `0.0.0.0` and
 not on its own loopback. `no-ipv6` is pasta's `-4`.
 
-**Outbound traffic is all or nothing.** pasta has no destination filtering and
-the passt project has no plans for any, so there is no `allow-host` here and
-nothing pretending to be one. A future version could install nftables rules in
-the sandbox's own namespace from the launcher side — the sandbox itself could
-not flush them — but a host allowlist by name breaks on every CDN, so it would
-be an address policy and not a name one.
+`outbound "deny"` narrows what the sandbox may reach to the addresses the
+config names. pasta has no destination filtering of its own, so the filter is
+an nftables ruleset bubbler installs in the sandbox's own network namespace:
+
+    table inet bubbler {
+      chain out {
+        type filter hook output priority 0; policy drop;
+        oifname "lo" accept
+        ct state established,related accept
+        icmpv6 type { nd-router-solicit, nd-router-advert,
+                      nd-neighbor-solicit, nd-neighbor-advert } accept
+        ip daddr 169.254.1.1 udp dport 53 accept
+        ip daddr 169.254.1.1 tcp dport 53 accept
+        <one or two rules per allow-out>
+        reject with icmpx admin-prohibited
+      }
+    }
+
+`--explain` prints the ruleset a run would install, and the shipped profiles
+install none: `outbound` is opt-in per instance and defaults to `"allow"`.
+
+**Neighbour discovery is open, and it has to be.** It is how an IPv6 stack finds
+its router and its neighbours, and the sandbox sends it like any other packet.
+Measured with the rule taken out: an `allow-out` naming a v6 address fails five
+times out of five with `EHOSTUNREACH` after three seconds, because the sandbox
+never resolves its own gateway — IPv6 is dead under the filter whatever the
+config says. With the rule the filtered namespace behaves exactly as an
+unfiltered one does. `no-ipv6` leaves the namespace no IPv6 address at all, and
+then the rule is left out with it, along with the refusal below.
+
+`allow-out "<address>[/<prefix>]"` takes a v4 or v6 address or network, with an
+optional `port=` and an optional `proto="tcp"|"udp"`; a child that names neither
+means every port over TCP and UDP, and nothing else — ICMP included, so `ping`
+does not answer under a filter. The bits below a prefix must be zero:
+`nft` would read `1.1.1.1/24` as `1.1.0.0/24` and allow 256 addresses where its
+author wrote one, so bubbler refuses it instead. Two more nodes are refused for
+being rules that could never match: an IPv4-mapped address (`::ffff:1.1.1.1`),
+which names an IPv4 destination that no `ip6` rule ever sees, and an IPv6
+`allow-out` or `dns` under `no-ipv6`, which takes the address family away. The **resolver** is opened by
+bubbler, not by you: whatever `/etc/resolv.conf` ends up naming — the generated
+`169.254.1.1` or a `dns` child — is accepted on UDP and TCP port 53, since a
+filter that broke name resolution would look like a network outage rather than
+a policy. The table is `inet`, so IPv6 falls under the same policy; an `ip`
+table would leave it open and read identically in `nft list ruleset` to anyone
+not looking at the family.
+
+**It filters by address, and it cannot filter by name.** `allow-out
+"api.example.com"` does not exist and will not: a name would have to be
+resolved once at launch into a set of addresses, and a CDN, an Anycast pool or
+a DNS failover answers with different ones later — the connection then dies
+mid-run, refused by the sandbox's own firewall rather than by the peer, which
+is a worse failure than not offering it. `bubbler lint` says the same thing as
+the `outbound-deny` note.
+
+**What a blocked destination looks like.** A trailing `reject` rather than a
+drop, so the application gets an error instead of hanging for its own connect
+timeout — tens of seconds in a browser, forever in something with no timeout at
+all. Measured on this host: TCP over IPv4 fails with `EHOSTUNREACH` ("No route
+to host") and UDP with `EPERM` straight out of `sendto`, both in under a
+millisecond; TCP over IPv6 fails with `EACCES` after about a second, since the
+kernel matches the ICMPv6 error to the socket only on the first SYN
+retransmit. `policy drop` is only the backstop under that rule: an nftables base
+chain takes `accept` or `drop` as a policy and nothing else.
+
+**The sandbox cannot read the rules, let alone flush them.** They live in the
+user namespace that owns the sandbox's network namespace, and bwrap puts the
+application in a *nested* one; `user_namespaces(7)` grants privileged
+operations on a non-user namespace only to a process holding the capability in
+the namespace that owns it. Measured from inside a filtered sandbox: `nft list
+ruleset` fails with `Operation not permitted` before it can even read the
+table. Creating its own user and network namespace does not help either — that
+namespace is a child, and it is empty.
+
+**`oifname "lo" accept` is safe only because pasta forwards nothing.** The
+sandbox's own loopback has to work, and pasta's `-T`/`-U` port forwarding would
+put a socket of pasta's on that loopback and `splice(2)` it to the host —
+traffic that never becomes a packet and that netfilter therefore never sees.
+Measured: with pasta's defaults a host service on `127.0.0.1` answers inside
+the sandbox while this ruleset is installed. bubbler passes `-T none -U none`
+on every run and a unit test holds the two together, so whoever relaxes one has
+to come past it. `allow-port` does not reopen it: pasta binds those on the
+*host* and connects into the namespace, a direction an application cannot ride
+outwards.
+
+The rules are installed by spawning `nft -f -` — a short-lived child that
+enters the sandbox's owning user namespace and its network namespace, and is
+fed the ruleset on stdin. It runs after bwrap reports the sandbox pid, before
+pasta and before the sandbox is let go of its `--block-fd`, so the namespace
+has a policy before it has a route and the application has not executed an
+instruction either way. If it fails for any reason — a ruleset nftables
+refuses, a five-second silence, a missing package — the run is stopped: a
+sandbox that asked to be filtered never runs unfiltered. `nftables` is
+therefore a runtime dependency of `outbound "deny"` and of nothing else — on
+Arch it is not part of `base` — and a host without it is told which package to
+install rather than given the network it did not ask for.
+
+That child holds **CAP_NET_ADMIN and nothing else**. Capabilities do not survive
+`execve`, so the one it needs is put in the ambient set, which does; and
+`SECBIT_NOROOT` stops the kernel from adding the rest, since bwrap's own nested
+user namespace maps bubbler to uid 0 and a uid-0 exec would otherwise come up
+with the full set. Measured both ways, and pinned by a test: with the securebit
+the child's `CapEff` is `0000000000001000`, without it `000001ffffffffff`. As
+with pasta, the capability is one in the *sandbox's* user namespace, which your
+own account created, so it is authority over the sandbox and over nothing else.
+
+An `outbound "deny"` in one layer cannot be dropped by a layer above it. A
+profile that filters and an `include` of it under a bare `network` node is a
+conflict `bubbler` refuses by name, rather than a merge in which the plain node
+wins and the sandbox quietly gets the whole internet back. Adding destinations
+from above is fine, and they add up.
 
 `/etc/resolv.conf` is **generated**, not bound: an isolated namespace can never
 reach a resolver on the host's loopback, which is exactly what the host file
@@ -1334,7 +1442,8 @@ without `/.flatpak-info`, which is worse than wrong).
 application runtime directory granted `mode=rw`, so the sandbox can replace the
 sockets everything else naming that id connects to), `network-host`
 (`network "host"`, the one mode that puts the sandbox on the host's network
-stack), `ozone-hint-unnecessary`,
+stack), `outbound-deny` (an address policy, not a name one),
+`ozone-hint-unnecessary`,
 `command-not-found`, `desktop-entry-missing` (a `desktop` node naming an entry
 no application directory here holds, which is what a profile for software you
 have not installed looks like), `camera-nodes-none-present` (`camera nodes=#true` on a
@@ -1890,7 +1999,8 @@ rather than silent, but it is still a downgrade.
 
 Requires `bwrap` at runtime and a kernel with user namespaces, plus `pasta`
 (the `passt` package) for any profile with an isolated `network` — which is
-every shipped profile that has one.
+every shipped profile that has one — and `nft` (the `nftables` package) for a
+config that writes `outbound "deny"`, which no shipped profile does.
 
 ## Checks
 

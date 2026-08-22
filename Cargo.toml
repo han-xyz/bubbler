@@ -28,7 +28,7 @@ bubbler-core = { path = "crates/bubbler-core", version = "0.9.0" }
 bubbler-init = { path = "crates/bubbler-init", version = "0.9.0" }
 kdl = "6"
 thiserror = "2"
-rustix = { version = "1", features = ["fs", "process", "net", "pipe", "event", "pty", "termios"] }
+rustix = { version = "1", features = ["fs", "process", "net", "pipe", "event", "pty", "termios", "thread"] }
 clap = { version = "4", features = ["derive"] }
 clap_mangen = "0.3"
 anyhow = "1"

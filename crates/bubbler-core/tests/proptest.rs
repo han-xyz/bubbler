@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use bubbler_core::config::{
-    BusRule, Errno, InstanceConfig, LintAllow, NetworkConfig, NetworkMode, SeccompConfig, Service,
-    ShareMode, TtyMode, Userns,
+    AllowOut, BusRule, Cidr, Errno, InstanceConfig, LintAllow, NetworkConfig, NetworkMode,
+    Outbound, Proto, SeccompConfig, Service, ShareMode, TtyMode, Userns,
 };
 use bubbler_core::env::{DEFAULT_DATA_DIRS, Env};
 use bubbler_core::error::{DesktopError, ProfileError};
@@ -50,6 +50,15 @@ const APP_IDS: &[&str] = &["org.example.App", "com.example.Player"];
 /// Resolver addresses that are not loopback: an isolated namespace's
 /// loopback is its own, and the parser refuses one there.
 const RESOLVERS: &[&str] = &["1.1.1.1", "9.9.9.9", "2606:4700:4700::1111"];
+
+/// Addresses and networks in the shape `allow-out` takes, v4 and v6.
+const DESTINATIONS: &[&str] = &[
+    "1.1.1.1",
+    "140.82.112.0/20",
+    "10.0.0.0/8",
+    "2606:4700:4700::1111",
+    "2606:4700::/32",
+];
 
 fn share_mode() -> impl Strategy<Value = ShareMode> {
     prop_oneof![Just(ShareMode::ReadOnly), Just(ShareMode::ReadWrite)]
@@ -220,8 +229,12 @@ fn bus_services() -> impl Strategy<Value = Vec<Service>> {
 }
 
 /// `network`, with only the children its mode has somewhere to put:
-/// `allow-port` and `no-ipv6` configure the pasta sidecar, which only
-/// the isolated namespace runs, and `none` has no network to resolve on.
+/// `allow-port`, `no-ipv6` and the outbound filter configure the sandbox's
+/// own namespace, which only the isolated mode has, and `none` has no
+/// network to resolve on. Two more rules the parser holds and this has to
+/// as well: `allow-out` is only a rule under `outbound "deny"`, and
+/// `no-ipv6` leaves no IPv6 for a v6 address of either kind to be reached
+/// over.
 fn network_service() -> impl Strategy<Value = Option<Service>> {
     prop::option::of(
         (
@@ -229,8 +242,17 @@ fn network_service() -> impl Strategy<Value = Option<Service>> {
             prop::collection::vec(prop::sample::select(RESOLVERS), 0..2),
             prop::collection::vec((1024u16..9000, any::<bool>()), 0..2),
             any::<bool>(),
+            any::<bool>(),
+            prop::collection::vec(
+                (
+                    prop::sample::select(DESTINATIONS),
+                    prop::option::of(1u16..9000),
+                    0u8..3,
+                ),
+                0..3,
+            ),
         )
-            .prop_map(|(mode, dns, forwards, no_ipv6)| {
+            .prop_map(|(mode, dns, forwards, no_ipv6, deny, allow_out)| {
                 let mode = match mode {
                     0 => NetworkMode::Isolated,
                     1 => NetworkMode::Host,
@@ -255,6 +277,31 @@ fn network_service() -> impl Strategy<Value = Option<Service>> {
                         }
                     }
                     cfg.no_ipv6 = no_ipv6;
+                    if no_ipv6 {
+                        cfg.dns.retain(|ip| ip.is_ipv4());
+                    }
+                    if deny {
+                        cfg.outbound = Outbound::Deny;
+                        for (dest, port, proto) in allow_out {
+                            let dest =
+                                Cidr::from_str(dest).expect("the table holds literal destinations");
+                            if no_ipv6 && dest.is_ipv6() {
+                                continue;
+                            }
+                            let rule = AllowOut {
+                                dest,
+                                port,
+                                proto: match proto {
+                                    0 => None,
+                                    1 => Some(Proto::Tcp),
+                                    _ => Some(Proto::Udp),
+                                },
+                            };
+                            if !cfg.allow_out.contains(&rule) {
+                                cfg.allow_out.push(rule);
+                            }
+                        }
+                    }
                 }
                 Service::Network(cfg)
             }),
