@@ -1,9 +1,9 @@
 # bubbler threat model
 
 What bubbler defends, what it does not, and where each answer is written
-down and pinned by a test. Every mechanism below links the README section
+down and pinned by a test. Every mechanism below links the manual section
 that describes it and the test that would fail if the behaviour changed.
-Read it as the companion to the README's "Known gaps": that list is what
+Read it as the companion to the manual's "Known gaps": that list is what
 is missing, this is what the parts that exist are worth.
 
 The rule this document is held to: a claim with no test beside it is a
@@ -42,8 +42,8 @@ defend against one. What it does instead is make the grant *visible*:
 `bubbler lint` measures a config against what a sandbox gives away and
 `--dry-run --explain` puts every bwrap argument under the node that asked
 for it, so a profile cannot grant something the tooling does not name.
-([Linting](../README.md#linting), [Explaining an
-argv](../README.md#explaining-an-argv); `every_argument_is_attributed_to_the_node_that_asked_for_it`,
+([Linting](manual.md#linting), [Explaining an
+argv](manual.md#explaining-an-argv); `every_argument_is_attributed_to_the_node_that_asked_for_it`,
 `every_builtin_profile_lints_clean`,
 `a_finding_never_stands_in_for_a_layer_that_does_not_parse`.)
 
@@ -68,8 +68,8 @@ Four processes sit beside a sandbox, and they are not one kind of thing:
 | `pasta` | on the host, **not sandboxed**, holding the sandbox's outer user namespace | **No, in one direction.** A pasta that has been taken over *is* that sandbox's network and holds root over the namespaces the sandbox is built from. It owns nothing beyond what your own account already has: your uid created that namespace. Wrapping it in bwrap would not add anything — it would remove the very thing pasta needs, since a process can only join a descendant of its own user namespace. |
 | `nft` | on the host, entering the sandbox's user and network namespaces to install the ruleset | **Not a party to one.** It builds the network boundary rather than standing in it: it runs before pasta and before the sandbox is let go of its `--block-fd`, so the namespace has a policy before it has a route and before the application has run an instruction either way. Nothing the sandbox controls reaches it — the ruleset is generated from typed values and handed over on stdin, and its argv is two fixed arguments. It holds CAP_NET_ADMIN in the sandbox's user namespace and no other capability anywhere: the capability crosses `execve` through the ambient set, and `SECBIT_NOROOT` with `_LOCKED` stops the uid-0 that bwrap's nested user namespace maps bubbler to from being handed the full set. It exits before the run begins, and one that stops answering is killed rather than left holding that capability. |
 
-([A run is a chain of processes](../README.md#usage),
-[D-Bus](../README.md#d-bus), [network](../README.md#network);
+([A run is a chain of processes](manual.md#usage),
+[D-Bus](manual.md#d-bus), [network](manual.md#network);
 `the_proxy_never_sees_the_instances_control_socket`,
 `a_proxied_socket_is_moved_out_of_the_proxys_reach`,
 `proxy_argv_runs_the_proxy_in_its_own_sandbox`,
@@ -98,8 +98,8 @@ separation is deliberately given up:
 - `/etc/machine-id` is bound in, so every instance shares one stable
   identifier with the host.
 
-([app-runtime](../README.md#app-runtime), [Host
-paths](../README.md#host-paths), [Known gaps](../README.md#known-gaps);
+([app-runtime](manual.md#app-runtime), [Host
+paths](manual.md#host-paths), [Known gaps](manual.md#known-gaps);
 `path_share_resolves_the_instance_store_itself`,
 `path_share_compares_the_environment_roots_resolved`,
 `path_share_refuses_the_profile_layer_under_a_relocated_config_home`,
@@ -132,7 +132,7 @@ global order.
 **Does not defend:** anything you bind in. `home-share`, `path-share`,
 `etc-share` and `dri` are grants, and a grant is what it says it is.
 
-[Baseline](../README.md#baseline) ·
+[Baseline](manual.md#baseline) ·
 `baseline_argv_is_exact`, `etc_is_an_allowlist_of_existing_entries`,
 `service_binds_come_after_runtime_dir_and_before_env`,
 `real_bwrap_home_is_fixed_and_private`,
@@ -148,7 +148,7 @@ refused instead of binding the tree under it.
 **Does not defend:** a value that really does name a socket of the right
 type is bound, whatever it is a socket for.
 
-[Baseline](../README.md#baseline) ·
+[Baseline](manual.md#baseline) ·
 `wayland_display_must_name_a_socket`,
 `wayland_display_that_is_not_one_component_is_rejected`,
 `wayland_socket_path_of_the_wrong_type_fails`,
@@ -180,7 +180,7 @@ capability model. Everything unnamed is allowed, and `unshare`, `setns`,
 among them so Firefox and Chromium can build their own inner sandbox. A
 kernel bug behind an allowed syscall is a kernel bug in the sandbox.
 
-[Seccomp](../README.md#seccomp) ·
+[Seccomp](manual.md#seccomp) ·
 `real_bwrap_seccomp_denies_the_default_list_and_nothing_else`,
 `the_default_set_compiles_to_one_program_of_a_known_size`,
 `the_ioctl_rules_compare_the_request_argument_once_per_architecture`,
@@ -203,7 +203,7 @@ nested user namespace cannot undo bwrap's read-only binds, which is why
 this is a default rather than a hole; `bubbler lint` warns when the node
 is set under a command known to nest.
 
-[User namespaces](../README.md#user-namespaces) ·
+[User namespaces](manual.md#user-namespaces) ·
 `real_bwrap_userns_disable_stops_a_nested_user_namespace`,
 `disabling_user_namespaces_adds_two_phase_one_flags_and_nothing_else`,
 `disabling_user_namespaces_under_a_nesting_command_is_a_warning`
@@ -231,8 +231,8 @@ the bus makes it; `bubbler lint` warns about the wide ones (a name owned
 beyond the application, every media-player name, polkit-backed system
 services, the secret service).
 
-[D-Bus](../README.md#d-bus), [The system
-bus](../README.md#the-system-bus) ·
+[D-Bus](manual.md#d-bus), [The system
+bus](manual.md#the-system-bus) ·
 `real_dbus_hides_names_the_rules_do_not_grant`,
 `a_proxied_socket_is_moved_out_of_the_proxys_reach`,
 `a_proxy_that_swaps_its_socket_for_a_symlink_never_reaches_the_sandbox`,
@@ -264,7 +264,7 @@ endpoint, `docker0`, a second NIC — is reachable from inside exactly as
 from any other machine on that network. Outbound traffic is all or
 nothing in this tree. `network "host"` gives all of it back on purpose.
 
-[network](../README.md#network) ·
+[network](manual.md#network) ·
 `pasta_argv_is_the_hardened_invocation`,
 `every_hardening_flag_is_present_whatever_the_node_asked_for`,
 `the_namespace_check_compares_what_the_links_name`,
@@ -303,7 +303,7 @@ session you do not trust. `tty "passthrough"` gives up the rest as well:
 the sandbox holds your terminal's descriptors and reaches it through
 `/dev/console`.
 
-[Terminal](../README.md#terminal) ·
+[Terminal](manual.md#terminal) ·
 `real_bwrap_run_from_a_terminal_gives_the_sandbox_a_terminal_of_its_own`,
 `real_bwrap_run_writes_nothing_to_a_terminal_it_does_not_own`,
 `a_host_that_never_reads_holds_the_sandbox_back_instead_of_the_relay`,
@@ -330,7 +330,7 @@ single-user machine the party who could change it is you. And the flip
 side of resolving first is that what gets bound is the link's *target*
 under the name you wrote.
 
-[Host paths](../README.md#host-paths) ·
+[Host paths](manual.md#host-paths) ·
 `path_share_refuses_every_reserved_root`,
 `path_share_through_a_symlink_into_a_reserved_root_is_refused`,
 `path_share_overlapping_shares_are_refused`,
@@ -353,7 +353,7 @@ socket its peers connect to and bind its own, or leave a symlink the peer
 then resolves on its own side of the boundary. That is the grant, not a
 bug; `bubbler lint` notes it as `app-runtime-rw`.
 
-[app-runtime](../README.md#app-runtime) ·
+[app-runtime](manual.md#app-runtime) ·
 `app_runtime_rejects_an_id_that_could_name_another_runtime_entry`,
 `app_runtime_refuses_a_symlink_where_the_directory_belongs`,
 `an_app_parent_that_is_a_symlink_is_refused_before_any_id_is_made`,
@@ -371,9 +371,9 @@ bytes cannot extend the deadline.
 
 **Does not defend:** descriptors passed to an exec'd command are
 reachable by the sandboxed application through `/proc`. `exec` is a
-convenience channel, not a boundary, and the README says so.
+convenience channel, not a boundary, and the manual says so.
 
-[Usage](../README.md#usage), [Known gaps](../README.md#known-gaps) ·
+[Usage](manual.md#usage), [Known gaps](manual.md#known-gaps) ·
 `rejects_empty_truncated_and_oversize`,
 `request_without_fds_is_rejected`,
 `an_incoming_request_larger_than_the_cap_is_rejected`,
@@ -402,8 +402,8 @@ name is refused.
 **Does not defend:** the entry is a command line you can edit afterwards,
 and `%f` arguments in it are host paths the sandbox cannot open.
 
-[Desktop entries](../README.md#desktop-entries), [PATH
-shims](../README.md#path-shims) ·
+[Desktop entries](manual.md#desktop-entries), [PATH
+shims](manual.md#path-shims) ·
 `a_symlink_planted_where_the_entry_is_built_is_never_written_through`,
 `only_bubblers_own_entry_for_this_instance_is_overwritten`,
 `the_keys_that_bypass_the_sandbox_are_forced_even_where_they_are_absent`,
@@ -424,8 +424,8 @@ output is refused.
 
 **Does not defend:** a profile you chose to install. See "The attacker".
 
-[Profiles](../README.md#profiles), [Known
-gaps](../README.md#known-gaps) ·
+[Profiles](manual.md#profiles), [Known
+gaps](manual.md#known-gaps) ·
 `nesting_past_the_bound_is_refused_before_the_parser_recurses`,
 `a_configuration_past_the_size_bound_is_refused_unparsed`,
 `a_configuration_nested_past_the_bound_is_refused_wherever_it_is_read`,
@@ -448,7 +448,7 @@ Stated so nobody has to infer them.
   client can read any other's input and windows. The grant exists for
   compatibility, `bubbler lint` warns on it, `bubbler run` warns again
   before a real run, and only the two gaming profiles ship it.
-  ([Baseline](../README.md#baseline), [Linting](../README.md#linting);
+  ([Baseline](manual.md#baseline), [Linting](manual.md#linting);
   `x11_is_a_warning_a_lint_allow_node_accepts`,
   `x11_warns_before_a_real_run`,
   `only_the_gaming_profiles_grant_x11_and_none_disables_user_namespaces`.)

@@ -1,0 +1,66 @@
+# Getting Started
+
+## Install
+
+**Arch Linux (AUR):** `bubbler` (release) or `bubbler-git`. Both split off
+`bubbler-ui`, the optional terminal editor.
+
+**From source:**
+
+```
+cargo build --release --locked
+install -Dm755 target/release/bubbler      /usr/bin/bubbler
+install -Dm755 target/release/bubbler-init /usr/lib/bubbler/bubbler-init
+install -Dm755 target/release/bubbler-ui   /usr/bin/bubbler-ui      # optional
+target/release/bubbler man          > /usr/share/man/man1/bubbler.1
+target/release/bubbler man --config > /usr/share/man/man5/bubbler-config.5
+```
+
+`bubbler-init` is the supervisor bound into every sandbox, not a command;
+keep it out of `/usr/bin`. Build needs Rust 1.95+ and `libseccomp`.
+
+## Runtime dependencies
+
+| Package (Arch) | Needed for |
+|---|---|
+| `bubblewrap` | everything |
+| `libseccomp` | everything (linked) |
+| `xdg-dbus-proxy` | any `dbus` or `system-bus` grant — most profiles |
+| `passt` | isolated `network` — every shipped profile with a network |
+| `nftables` | `outbound "deny"` only |
+| `xdg-desktop-portal` + a backend | `portals`, `camera` |
+
+Also a kernel with unprivileged user namespaces.
+
+## First instance
+
+```
+bubbler create ff --profile firefox   # prints the instance directory
+bubbler run ff                        # runs `command` from config.kdl
+bubbler run ff --dry-run              # print the bwrap argv instead
+bubbler desktop ff                    # menu entry "Firefox (Bubbler)"
+bubbler wrap ff                       # ~/.local/bin/ff starts it
+```
+
+The profile needs `~/Downloads` to exist (it is a `home-share`); a missing
+share source is an error, never a silently weaker sandbox.
+
+No profile for your application? `bubbler create x` uses `generic` (baseline
+only), then `bubbler edit x` to add grants, or `bubbler ui` to toggle them.
+See [Configuration](Configuration).
+
+## Try without keeping anything
+
+```
+bubbler try -- id
+bubbler try --profile firefox --grant network -- firefox --version
+bubbler try --keep scratch -- sh      # keep it afterwards as instance `scratch`
+```
+
+## Remove
+
+```
+bubbler delete ff --yes    # instance and its private home, irreversible
+bubbler unwrap ff          # the shim
+bubbler desktop ff --remove
+```
