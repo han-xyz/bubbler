@@ -17,37 +17,81 @@ use crate::app::{App, Dialog, Screen, Viewer};
 use crate::detail::Detail;
 use crate::store::Row as InstanceRow;
 
-/// What the bottom line offers on each screen, and the whole list `?`
-/// shows. Two of them because a footer that does not fit its terminal
-/// says nothing at all, and the full list is a screen of its own.
-const KEYS: [(Screen, &str, &str, &str); 4] = [
-    (
-        Screen::Instances,
-        "instances",
-        "Enter grants  r run  o open  x exec  d delete  e edit  l lint  ? more  q quit",
-        "Enter grants  r run  o open  x exec  t try  n new  d delete  R reseed  e edit  \
-         l lint  L log  D desktop  W wrap  X explain  p profiles  ^R reload  q quit",
-    ),
-    (
-        Screen::Detail,
-        "grants",
-        "Space grant  Enter write it  e $EDITOR  s save  u undo  ? more  Esc back",
-        "Space grant or revoke  Enter write the node as KDL  e $EDITOR on config.kdl  \
-         s save  u undo  l lint  X explain  Esc back",
-    ),
-    (
-        Screen::Profiles,
-        "profiles",
-        "Enter show  c create an instance  e $EDITOR  l lint  Esc back",
-        "Enter show it flattened  c create an instance from it  e $EDITOR on your layer  \
-         l lint  Esc back",
-    ),
-    (
-        Screen::Viewer,
-        "viewer",
-        "j/k scroll  f full  p proxy  Esc back",
-        "j/k scroll  g/G ends  f every argument  p the D-Bus proxy's argv  Esc back",
-    ),
+/// What one screen offers. Two lists because a footer that does not fit
+/// its terminal says nothing at all, and the full list is a screen of
+/// its own; the full one is pairs rather than one string so that `?` can
+/// lay it out in columns that keep a key beside what it does.
+struct Keys {
+    screen: Screen,
+    name: &'static str,
+    footer: &'static str,
+    full: &'static [(&'static str, &'static str)],
+}
+
+const KEYS: [Keys; 4] = [
+    Keys {
+        screen: Screen::Instances,
+        name: "instances",
+        footer: "Enter grants  r run  o open  x exec  d delete  e edit  l lint  ? more  q quit",
+        full: &[
+            ("Enter", "grants"),
+            ("r", "run"),
+            ("o", "open"),
+            ("x", "exec"),
+            ("t", "try"),
+            ("n", "new"),
+            ("d", "delete"),
+            ("R", "reseed"),
+            ("e", "edit"),
+            ("l", "lint"),
+            ("L", "log"),
+            ("D", "desktop"),
+            ("W", "wrap"),
+            ("X", "explain"),
+            ("p", "profiles"),
+            ("^R", "reload"),
+            ("q", "quit"),
+        ],
+    },
+    Keys {
+        screen: Screen::Detail,
+        name: "grants",
+        footer: "Space grant  Enter write it  e $EDITOR  s save  u undo  ? more  Esc back",
+        full: &[
+            ("Space", "grant or revoke"),
+            ("Enter", "write the node as KDL"),
+            ("e", "$EDITOR on config.kdl"),
+            ("s", "save"),
+            ("u", "undo"),
+            ("l", "lint"),
+            ("X", "explain"),
+            ("Esc", "back"),
+        ],
+    },
+    Keys {
+        screen: Screen::Profiles,
+        name: "profiles",
+        footer: "Enter show  c create an instance  e $EDITOR  l lint  Esc back",
+        full: &[
+            ("Enter", "show it flattened"),
+            ("c", "create an instance from it"),
+            ("e", "$EDITOR on your layer"),
+            ("l", "lint"),
+            ("Esc", "back"),
+        ],
+    },
+    Keys {
+        screen: Screen::Viewer,
+        name: "viewer",
+        footer: "j/k scroll  f full  p proxy  Esc back",
+        full: &[
+            ("j/k", "scroll"),
+            ("g/G", "ends"),
+            ("f", "every argument"),
+            ("p", "the D-Bus proxy's argv"),
+            ("Esc", "back"),
+        ],
+    },
 ];
 
 /// Colour of a grant's row: the levels the catalogue draws, so an
@@ -124,7 +168,7 @@ impl App {
         };
         Paragraph::new(Line::from(vec![
             Span::styled("bubbler", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(format!("  {what}")),
+            Span::raw(format!(" — {what}")),
         ]))
     }
 
@@ -134,8 +178,8 @@ impl App {
         }
         let keys = KEYS
             .iter()
-            .find(|(screen, ..)| *screen == self.screen())
-            .map_or("", |(.., keys, _)| *keys);
+            .find(|keys| keys.screen == self.screen())
+            .map_or("", |keys| keys.footer);
         Paragraph::new(Line::from(keys).dim())
     }
 }
@@ -153,14 +197,14 @@ fn count(n: usize, what: &str) -> String {
 fn title(detail: &Detail) -> String {
     let mut title = detail.name().to_owned();
     if let Some(profile) = &detail.profile {
-        title.push_str(&format!("  ({profile})"));
+        title.push_str(&format!(" ({profile})"));
     }
     title.push_str(match detail.live {
-        true => "  ● running",
-        false => "  ○ stopped",
+        true => " ● running",
+        false => " ○ stopped",
     });
     if detail.dirty() {
-        title.push_str("  — modified, `s` writes it");
+        title.push_str(" — modified, `s` writes it");
     }
     title
 }
@@ -445,8 +489,42 @@ pub fn cursor(app: &App, area: Rect) -> Option<Position> {
     })
 }
 
+/// One screen's keys as aligned columns, as wide as the overlay holds.
+/// Columns rather than one run-on line because wrapping a run-on line
+/// breaks wherever the width lands — between `D` and `desktop` at 100
+/// columns — and a key with someone else's description under it is
+/// worse than no list at all. No line starts with a space, so the
+/// paragraph's `trim` leaves the columns where they are.
+fn key_grid(keys: &[(&str, &str)], width: u16) -> Vec<String> {
+    const GAP: usize = 2;
+    let key_width = keys
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(0);
+    let what_width = keys
+        .iter()
+        .map(|(_, w)| w.chars().count())
+        .max()
+        .unwrap_or(0);
+    let cell = key_width + 1 + what_width;
+    let columns = ((usize::from(width) + GAP) / (cell + GAP)).max(1);
+    keys.chunks(columns)
+        .map(|row| {
+            row.iter()
+                .map(|(key, what)| format!("{key:<key_width$} {what:<what_width$}"))
+                .collect::<Vec<_>>()
+                .join(&" ".repeat(GAP))
+                .trim_end()
+                .to_owned()
+        })
+        .collect()
+}
+
 /// Every key of every screen, over whatever is under it.
 fn help(area: Rect, buf: &mut Buffer) {
+    let block = Block::bordered().title_top("keys");
+    let inner = block.inner(area);
     let mut lines = vec![
         Line::styled(
             "bubbler-ui — every action is a `bubbler` command line",
@@ -454,12 +532,12 @@ fn help(area: Rect, buf: &mut Buffer) {
         ),
         Line::from(""),
     ];
-    for (_, name, _, keys) in KEYS {
+    for keys in KEYS {
         lines.push(Line::styled(
-            name.to_owned(),
+            keys.name.to_owned(),
             Style::default().add_modifier(Modifier::BOLD),
         ));
-        lines.push(Line::from(keys.to_owned()));
+        lines.extend(key_grid(keys.full, inner.width).into_iter().map(Line::from));
         lines.push(Line::from(""));
     }
     lines.push(Line::styled(
@@ -472,8 +550,6 @@ fn help(area: Rect, buf: &mut Buffer) {
         Style::default().dim(),
     ));
     lines.push(Line::styled("any key closes this", Style::default().dim()));
-    let block = Block::bordered().title_top("keys");
-    let inner = block.inner(area);
     Clear.render(area, buf);
     block.render(area, buf);
     Paragraph::new(Text::from(lines))
@@ -540,7 +616,7 @@ mod tests {
         assert_eq!(
             screen(&app, 80, 8),
             [
-                "bubbler  1 instance",
+                "bubbler — 1 instance",
                 "  NAME             PROFILE        STATE    GRANTS                    LINT",
                 "> ff               generic        ○ stop   wayland x11 home-share    2 warnings",
                 "",
@@ -560,7 +636,7 @@ mod tests {
         assert_eq!(
             screen(&app, 80, 14),
             [
-                "bubbler  ff  (generic)  ○ stopped",
+                "bubbler — ff (generic) ○ stopped",
                 "┌grants────────────────────────────┐┌what it grants────────────────────────────┐",
                 "│●    wayland                      ││x11  (outward)                            │",
                 "│● !! x11                          ││x11                                       │",
@@ -591,7 +667,7 @@ mod tests {
         assert_eq!(
             screen(&app, 80, 14),
             [
-                "bubbler  ff  (generic)  ○ stopped",
+                "bubbler — ff (generic) ○ stopped",
                 "┌grants────────────────────────────┐┌what it grants────────────────────────────┐",
                 "│●    wayland                      ││x11  (outward)                            │",
                 "│● !! x11                          ││x11                                       │",
@@ -621,7 +697,7 @@ mod tests {
         assert_eq!(
             screen(&app, 80, 8),
             [
-                "bubbler  lint ff",
+                "bubbler — lint ff",
                 "┌lint ff───────────────────────────────────────────────────────────────────────┐",
                 "│one                                                                           │",
                 "│two                                                                           │",
@@ -633,13 +709,101 @@ mod tests {
         );
     }
 
+    /// A key and what it does, on one line with only spaces between
+    /// them: `line` holds `key` at a word boundary, then a gap, then
+    /// the description.
+    fn beside(line: &str, key: &str, what: &str) -> bool {
+        line.match_indices(key).any(|(at, _)| {
+            let before = at == 0 || line.as_bytes()[at - 1] == b' ';
+            let rest = &line[at + key.len()..];
+            before && rest.starts_with(' ') && rest.trim_start().starts_with(what)
+        })
+    }
+
+    /// The overlay at the width it used to break at: the keys of a
+    /// screen stand in columns, so no line ends on a key whose
+    /// description starts the next one.
+    #[test]
+    fn the_help_overlay_stands_every_key_beside_what_it_does() {
+        let (_tmp, mut app) = list_editor();
+        app.help = true;
+        assert_eq!(
+            screen(&app, 100, 30),
+            [
+                "┌keys──────────────────────────────────────────────────────────────────────────────────────────────┐",
+                "│bubbler-ui — every action is a `bubbler` command line                                             │",
+                "│                                                                                                  │",
+                "│instances                                                                                         │",
+                "│Enter grants    r     run       o     open      x     exec      t     try       n     new         │",
+                "│d     delete    R     reseed    e     edit      l     lint      L     log       D     desktop     │",
+                "│W     wrap      X     explain   p     profiles  ^R    reload    q     quit                        │",
+                "│                                                                                                  │",
+                "│grants                                                                                            │",
+                "│Space grant or revoke        Enter write the node as KDL  e     $EDITOR on config.kdl             │",
+                "│s     save                   u     undo                   l     lint                              │",
+                "│X     explain                Esc   back                                                           │",
+                "│                                                                                                  │",
+                "│profiles                                                                                          │",
+                "│Enter show it flattened           c     create an instance from it                                │",
+                "│e     $EDITOR on your layer       l     lint                                                      │",
+                "│Esc   back                                                                                        │",
+                "│                                                                                                  │",
+                "│viewer                                                                                            │",
+                "│j/k scroll                  g/G ends                    f   every argument                        │",
+                "│p   the D-Bus proxy's argv  Esc back                                                              │",
+                "│                                                                                                  │",
+                "│run and open start detached; exec, try and the editors take the terminal                          │",
+                "│`q` leaves and `Esc` goes back one screen; `^C` does nothing while this is up, since the terminal │",
+                "│is raw and every key reaches the editor                                                           │",
+                "│any key closes this                                                                               │",
+                "│                                                                                                  │",
+                "│                                                                                                  │",
+                "│                                                                                                  │",
+                "└──────────────────────────────────────────────────────────────────────────────────────────────────┘",
+            ]
+        );
+    }
+
+    /// And at the widths either side of it: every key still has its own
+    /// description after it, and no row is wider than the overlay, which
+    /// is what would wrap one in two.
+    #[test]
+    fn the_help_overlay_holds_together_at_every_width() {
+        let (_tmp, mut app) = list_editor();
+        app.help = true;
+        for width in [80u16, 100, 140] {
+            let drawn = screen(&app, width, 30);
+            for line in &drawn {
+                assert!(
+                    line.chars().count() <= usize::from(width),
+                    "{width}: `{line}` is wider than the terminal"
+                );
+            }
+            // Without the overlay's own border, which is no boundary
+            // between one cell and the next.
+            let rows: Vec<String> = drawn
+                .iter()
+                .map(|line| line.replace('\u{2502}', " "))
+                .collect();
+            for keys in KEYS {
+                for (key, what) in keys.full {
+                    assert!(
+                        rows.iter().any(|line| beside(line, key, what)),
+                        "{width}: `{key} {what}` of {} is split up in {drawn:#?}",
+                        keys.name
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn an_empty_store_says_how_to_fill_it() {
         let (_tmp, app) = editor(&[]);
         assert_eq!(
             screen(&app, 80, 8),
             [
-                "bubbler  0 instances",
+                "bubbler — 0 instances",
                 "No instances yet.",
                 "",
                 "`p` lists the profiles; `c` on one creates an instance from it.",
