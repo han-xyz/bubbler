@@ -86,9 +86,12 @@ separation is deliberately given up:
   across the boundary. The name *is* the rendezvous.
 - A `path-share` that reaches `$XDG_DATA_HOME/bubbler` is a total break:
   a sandbox that can write another instance's `config.kdl` grants itself
-  anything on that instance's next run. That is why the denylist exists,
-  why it compares the roots your environment names both as written and as
-  resolved, and why the `$BUBBLER_TEST_ALLOW_PATH` hook cannot lift them.
+  anything on that instance's next run. `$XDG_CONFIG_HOME/bubbler`, where
+  your own profile layer lives, is the same break one seeding later: a
+  profile written there is the config of every instance created from it.
+  That is why the denylist exists, why it compares the roots your
+  environment names both as written and as resolved, and why the
+  `$BUBBLER_TEST_ALLOW_PATH` hook cannot lift them.
 - `/etc/machine-id` is bound in, so every instance shares one stable
   identifier with the host.
 
@@ -96,6 +99,7 @@ separation is deliberately given up:
 paths](../README.md#host-paths), [Known gaps](../README.md#known-gaps);
 `path_share_resolves_the_instance_store_itself`,
 `path_share_compares_the_environment_roots_resolved`,
+`path_share_refuses_the_profile_layer_under_a_relocated_config_home`,
 `path_share_environment_roots_outlast_the_carve_out_and_the_hook`.)
 
 ### 4. bubbler ↔ the host it runs on — not a boundary

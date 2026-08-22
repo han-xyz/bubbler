@@ -880,16 +880,19 @@ regular file. Neither end of the share may touch a path the sandbox is built
 out of — not what it resolves to, and not the path it is bound at, which differ
 when what you wrote is a symlink. Those paths are `/`, `/proc`, `/sys`, `/dev`,
 `/etc`, `/usr`, `/opt`, `/home`, your home directory, `/tmp`, `/var`, `/run`,
-`$XDG_RUNTIME_DIR`, `$XDG_DATA_HOME/bubbler` where the instances live, and
+`$XDG_RUNTIME_DIR`, `$XDG_DATA_HOME/bubbler` where the instances live,
+`$XDG_CONFIG_HOME/bubbler` where your own profile layer lives, and
 `/home/bubbler`, the private home, on the side that is bound at. Being one of
 them, being inside one, or containing one is refused, and the error names the
 root that stopped it. So a share of `/kioxia` is refused if `$XDG_DATA_HOME` is
 on that disk: a sandbox that can write another instance's `config.kdl` grants
-itself anything on the next run. All three roots your environment names — your
-home, `$XDG_RUNTIME_DIR` and the instance store `$XDG_DATA_HOME/bubbler`, the
-store itself as well as the directory above it — are compared both as written
-and as resolved, so a symlinked home or a symlinked instance store cannot be
-shared under its real name either. `/etc` and your home have typed grants of
+itself anything on the next run, and one that can write a profile grants itself
+that on every instance seeded from it afterwards. All four roots your
+environment names — your home, `$XDG_RUNTIME_DIR`, the instance store
+`$XDG_DATA_HOME/bubbler` and the profile layer `$XDG_CONFIG_HOME/bubbler`, each
+of them as well as the directory above it — are compared both as written and as
+resolved, so a symlinked home or a symlinked instance store cannot be shared
+under its real name either. `/etc` and your home have typed grants of
 their own (`etc-share`, `home-share`), and the rest of that list is what the
 baseline replaces. The one carve-out is `/run/media` and everything
 under it, where udisks mounts removable media — though not when your instances
@@ -912,7 +915,7 @@ refuses it anyway so that one host tree has one place inside the sandbox.
 absolute and cannot be `/`. It exists so tests can share a temporary directory
 under the otherwise denied `/tmp`. It adds a root rather than switching the
 denylist off, and it cannot lift the ones your environment names: your home,
-`$XDG_RUNTIME_DIR` and the instance directory stay refused.
+`$XDG_RUNTIME_DIR`, the instance directory and the profile layer stay refused.
 
 ## Profiles
 

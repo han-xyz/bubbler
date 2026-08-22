@@ -746,18 +746,26 @@ enum End {
 /// The roots the environment names, each in resolved form as well: with a
 /// symlink anywhere on the way to one of them, only the resolved form
 /// matches the canonical source of a share, and only the written form
-/// matches its destination. The instance store is resolved on its own as
-/// well as under a resolved `$XDG_DATA_HOME`, since either link alone
-/// moves it. A root that does not resolve is kept as written.
+/// matches its destination. The instance store and the profile layer are
+/// resolved on their own as well as under a resolved `$XDG_DATA_HOME` or
+/// `$XDG_CONFIG_HOME`, since either link alone moves them. A root that
+/// does not resolve is kept as written.
 fn env_roots(host: &dyn Host, env: &Env) -> Vec<PathBuf> {
-    let data_home = host
-        .canonicalize(&env.data_home)
-        .unwrap_or_else(|| env.data_home.clone());
+    let under = |dir: &Path| {
+        host.canonicalize(dir)
+            .unwrap_or_else(|| dir.to_path_buf())
+            .join("bubbler")
+    };
     let named = [
         env.home.clone(),
         env.runtime_dir.clone(),
         env.data_home.join("bubbler"),
-        data_home.join("bubbler"),
+        under(&env.data_home),
+        // The user's profile layer. A sandbox that can write a profile
+        // there writes the config of every instance seeded from it
+        // afterwards, which is the break the instance store is denied for.
+        env.config_home.join("bubbler"),
+        under(&env.config_home),
     ];
     let resolved: Vec<PathBuf> = named.iter().filter_map(|p| host.canonicalize(p)).collect();
     named.into_iter().chain(resolved).collect()
@@ -1762,6 +1770,64 @@ mod tests {
                 "{path}: {r:?}"
             );
         }
+    }
+
+    /// The user's profile layer lives in `$XDG_CONFIG_HOME/bubbler`, and
+    /// a sandbox that can write a profile there writes the config of
+    /// every instance seeded from it afterwards — the same total break
+    /// as reaching the instance store. Denied wherever the environment
+    /// puts it, as written and as resolved.
+    #[test]
+    fn path_share_refuses_the_profile_layer_under_a_relocated_config_home() {
+        let mut e = env();
+        // Outside the home, so `/home/han` is not what stops these.
+        e.config_home = "/kioxia/cfg".into();
+        let cases: &[(&str, Kind)] = &[
+            ("/kioxia", Dir),
+            ("/kioxia/cfg", Dir),
+            ("/kioxia/cfg/bubbler", Dir),
+            ("/kioxia/cfg/bubbler/profiles/firefox.kdl", File),
+        ];
+        for (path, kind) in cases {
+            let r = argv(&[share(path, ShareMode::ReadOnly)], &e, &[(path, *kind)]);
+            assert!(
+                matches!(&r, Err(LaunchError::BadValue { service: "path-share", reason })
+                    if reason.contains("/kioxia/cfg/bubbler")),
+                "{path}: {r:?}"
+            );
+        }
+        // A neighbour of the layer is still shareable: the root is the
+        // layer, not the directory the environment happens to name.
+        let a = argv(
+            &[share("/kioxia/cfg/notes", ShareMode::ReadOnly)],
+            &e,
+            &[("/kioxia/cfg/notes", Dir)],
+        )
+        .unwrap();
+        assert!(has_seq(
+            &a,
+            &["--ro-bind", "/kioxia/cfg/notes", "/kioxia/cfg/notes"]
+        ));
+
+        // And with a symlink on the way to it, the resolved source is
+        // compared too, the way the instance store is.
+        e.config_home = "/link/cfg".into();
+        let r = argv_linked(
+            &[share("/real/cfg/bubbler", ShareMode::ReadWrite)],
+            &e,
+            &[("/real/cfg/bubbler", Dir)],
+            &[("/link/cfg", "/real/cfg")],
+        );
+        assert!(
+            matches!(
+                &r,
+                Err(LaunchError::BadValue {
+                    service: "path-share",
+                    ..
+                })
+            ),
+            "{r:?}"
+        );
     }
 
     #[test]
