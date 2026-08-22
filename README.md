@@ -2172,6 +2172,13 @@ is expected to fail the `bwrap` line — Docker's default seccomp profile denies
 a self-hosted runner. `sandbox-probe` is what tells you which of the two you
 are looking at.
 
+## Acknowledgements
+
+Thanks to [bubblejail](https://github.com/igo95862/bubblejail) and
+[firejail](https://github.com/netblue30/firejail) for the inspiration, and to
+[bubblewrap](https://github.com/containers/bubblewrap) for doing the namespace
+work.
+
 ## License
 
 GPL-3.0-or-later. See `LICENSE`.
