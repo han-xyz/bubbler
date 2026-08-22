@@ -1907,3 +1907,25 @@ with a `dbus` or `system-bus` grant, which is most of them, `pasta` (the
 start. Nothing here depends on a shell: bubbler ships no completions.
 
 Packaging lives in a repository of its own, not in this one.
+
+## CI
+
+`.github/workflows/ci.yml` runs on every push to `master` and on pull requests
+at <https://github.com/han-xyz/bubbler>. Four jobs, each in an `archlinux:latest`
+container that installs its toolchain with rustup: `check` runs the four
+checks (`cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`,
+`cargo doc --no-deps` under `RUSTDOCFLAGS=-D warnings`, `cargo test
+--workspace`), `deny` runs `cargo deny check` against `deny.toml`, `msrv`
+type-checks the workspace with the 1.95 toolchain that `rust-version` pins,
+and `sandbox-probe` installs `bubblewrap`, `passt`, `libseccomp` and `nftables`
+and prints whether `unshare -Urn` and `bwrap --unshare-all` actually work on
+that runner.
+
+That last job is the one to read first. Tests that need a real sandbox probe
+for one and return early with a printed reason when they cannot have it, so a
+green `check` does not by itself mean a sandbox was ever built. A hosted runner
+is expected to fail the `bwrap` line — Docker's default seccomp profile denies
+`pivot_root`, `mount` and `umount2` — which leaves the real-sandbox coverage to
+a self-hosted runner. `sandbox-probe` is what tells you which of the two you
+are looking at.
+
