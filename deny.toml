@@ -1,0 +1,87 @@
+# cargo-deny configuration for bubbler.  Run: cargo deny check
+#
+# Not one of the four per-commit checks: it needs the network for the
+# advisory database.  CI and every release run it.
+#
+# The graph is the workspace's.  `fuzz/` is excluded from the workspace,
+# so libFuzzer and its dependencies are not checked here -- nothing they
+# reach is shipped or linked into a binary a user runs.
+
+[graph]
+# bubblewrap is Linux-only, so evaluating Windows/UEFI cfgs is pure noise:
+# it would drag windows-sys and its kin into the licence and advisory
+# graph for code that can never be built here.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+db-urls = ["https://github.com/RustSec/advisory-db"]
+# A yanked crate in a committed lockfile is a supply-chain smell.
+yanked = "deny"
+# "all" also flags unmaintained crates deep in the transitive graph, not
+# just direct dependencies.  A tree this size can afford the strictness.
+unmaintained = "all"
+unsound = "all"
+# Fail if the local advisory DB is older than 30 days, so a stale CI
+# cache cannot silently turn this check into a no-op.
+maximum-db-staleness = "P30D"
+ignore = []
+
+[licenses]
+# bubbler is GPL-3.0-or-later.  Every licence below is one-way compatible
+# with GPLv3: permissive inbound code may be combined into a GPLv3 work.
+# Anything not listed here fails the check.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",  # rustix, linux-raw-sys
+    "BSL-1.0",                         # ryu, via ratatui
+    "Unicode-3.0",                     # unicode-ident data tables
+    "Zlib",                            # foldhash, via ratatui
+    "GPL-3.0-or-later",                # bubbler's own crates
+]
+confidence-threshold = 0.8
+# Dev-dependencies run on a developer's machine under `cargo test`, and
+# build scripts run at build time, so hold both to the shipped standard.
+include-dev = true
+include-build = true
+exceptions = []
+unused-allowed-license = "warn"
+
+[licenses.private]
+ignore = true
+registries = []
+
+[bans]
+# Warn, not deny: the terminal editor's tree carries three duplicates
+# bubbler cannot resolve from here (`syn` 2 beside 3, `unicode-width` 0.1
+# beside 0.2 via `miette`, two `hashbrown`s).  Kept visible so the count
+# is read at each release rather than silently growing.
+multiple-versions = "warn"
+# A "*" requirement means "whatever crates.io had that day", which
+# defeats the committed lockfile on every `cargo update`.
+wildcards = "deny"
+# Does not exempt the workspace's own path deps: they are publishable,
+# so they carry a `version` key instead.
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+allow-workspace = false
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

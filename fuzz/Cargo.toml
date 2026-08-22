@@ -1,0 +1,66 @@
+[package]
+name = "bubbler-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bubbler-core = { path = "../crates/bubbler-core" }
+bubbler-init = { path = "../crates/bubbler-init" }
+tempfile = "3"
+
+# Every target is its own binary, and none of them is a test or a
+# benchmark: `cargo fuzz` links each one against libFuzzer's own `main`.
+[[bin]]
+name = "config_parse"
+path = "fuzz_targets/config_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kdl_roundtrip"
+path = "fuzz_targets/kdl_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "profile_resolve"
+path = "fuzz_targets/profile_resolve.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "desktop_patch"
+path = "fuzz_targets/desktop_patch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "init_wire"
+path = "fuzz_targets/init_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "seccomp_names"
+path = "fuzz_targets/seccomp_names.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wrap_registry"
+path = "fuzz_targets/wrap_registry.rs"
+test = false
+doc = false
+bench = false
