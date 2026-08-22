@@ -81,8 +81,10 @@ convenience channel, not a boundary.
 
 `open` is what a menu entry or a shim calls: it execs into the instance when
 it is running and starts it when it is not, so a URL opens in the window that
-is already there. Started without a terminal it takes `tty "none"` (see
-"Terminal") and writes bubbler's own stderr — its warnings, a sidecar's
+is already there. A terminal on any of its three standard descriptors is
+somebody watching, and the sandbox gets the terminal its `tty` node asks for;
+with none on any of them, which is how a launcher starts its children, it
+takes `tty "none"` (see "Terminal") and writes bubbler's own stderr — its warnings, a sidecar's
 errors, the application's own output — to `last-run.log` in the instance
 directory, which `bubbler log` prints. The log is opened before the config is
 read, so a `config.kdl` that stopped the run is in it too, and a log that
@@ -1057,17 +1059,19 @@ defined meaning.
 Which entry is copied is decided in this order: the instance's `desktop
 "<name>.desktop"` node, then `<command>.desktop`, then the one entry whose
 `Exec` runs `<command>`. All three look in `$XDG_DATA_HOME/applications` first
-and then in the `applications` directory of every `$XDG_DATA_DIRS` entry
-(`/usr/local/share` and `/usr/share` when that variable is unset), which is
-where a launcher looks, so a flatpak export or a Nix profile on that list is
-found too. The search skips entries a launcher does not display
-(`NoDisplay=true`, `Hidden=true`), since those are an application's
-MIME-handler-only entries, and entries bubbler wrote itself. Two candidates
-are an error listing both rather than a guess — that is what the `desktop`
-node is for, and five shipped profiles carry one. A `desktop` node naming a
-`Hidden=true` entry is refused outright: that key means the file is to be
-treated as if it were not there, so a copy of it would be an entry that does
-nothing.
+and then in the `applications` directory of every absolute `$XDG_DATA_DIRS`
+entry (`/usr/local/share` and `/usr/share` when that variable is unset; a
+relative entry is ignored, as the XDG base directory specification asks),
+which is where a launcher looks, so a flatpak export or a Nix profile on that
+list is found too. Entries bubbler wrote itself are never a source, and neither is one
+a launcher does not display (`NoDisplay=true`), which is what an application's
+MIME-handler-only entries are: both the scan and the `<command>.desktop`
+lookup pass over them. A `desktop` node is the exception, since that is you
+naming the file you mean. Two candidates are an error listing both rather than
+a guess — that is what the `desktop` node is for, and five shipped profiles
+carry one. An entry carrying `Hidden=true` is refused wherever it is reached:
+that key means the file is to be treated as if it were not there, so a copy of
+it would be an entry that does nothing.
 
 `Exec` names `bubbler` bare only when `PATH` resolves that name to the running
 binary, and the binary's own path otherwise. This matters more than it looks:

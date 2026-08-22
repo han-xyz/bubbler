@@ -552,8 +552,10 @@ impl Instance {
     /// carries: the profile it was seeded from, so `reseed` still knows
     /// where to re-flatten it from, and the config version, so no later
     /// run warns about meanings this file has just been written against.
-    /// What it replaces is kept beside it as `config.kdl.bak`, and the
-    /// rename is atomic, so a reader sees one whole config or the other.
+    /// What it replaces is kept beside it as `config.kdl.bak`. Both files
+    /// are written through [`fsutil::write_atomic`]: the rename is atomic,
+    /// so a reader sees one whole config or the other, and a symlink left
+    /// under either name is replaced rather than written through.
     ///
     /// Comments and layout are not kept: the file is rendered from the
     /// config, which holds the grants and not the text around them.
@@ -575,14 +577,14 @@ impl Instance {
         // again, and the checks across nodes (`camera` needs `portals`)
         // are only made here.
         config::parse(&text)?;
-        let backup = self.dir.join(BACKUP_FILE);
-        fs::copy(&cfg_path, &backup).map_err(io_err(&backup))?;
+        write_atomic(&self.dir.join(BACKUP_FILE), &held)?;
         write_atomic(&cfg_path, &text)
     }
 
     /// Re-flatten the profile named in `config.kdl`'s header into that
     /// file, keeping the private `home/`. What it replaces is kept beside
-    /// it as `config.kdl.bak`, overwriting an older backup.
+    /// it as `config.kdl.bak`, replacing an older backup and whatever else
+    /// is sitting under that name, the way [`Instance::save`] does.
     pub fn reseed(env: &Env, name: &str) -> Result<Self, InstanceError> {
         let cfg_path = config_path_checked(env, name)?;
         // A running sandbox was built from the file as it stands, and
@@ -599,8 +601,7 @@ impl Instance {
             .ok_or_else(|| InstanceError::NoProfileHeader(cfg_path.clone()))?;
         let (fresh, config) = seed(env, profile_name, &[])?;
         let dir = instances_root(env).join(name);
-        let backup = dir.join(BACKUP_FILE);
-        fs::copy(&cfg_path, &backup).map_err(io_err(&backup))?;
+        write_atomic(&dir.join(BACKUP_FILE), &text)?;
         write_atomic(&cfg_path, &fresh)?;
         Ok(Self {
             name: name.to_owned(),
@@ -809,6 +810,32 @@ mod tests {
         let reseeded = Instance::reseed(&env, "ff").unwrap();
         assert_eq!(reseeded.config, inst.config);
         assert!(reseeded.migration_warning().is_none());
+    }
+
+    #[test]
+    fn a_backup_never_writes_through_a_symlink_left_under_its_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = env(tmp.path());
+        let inst = Instance::create(&env, "ff", "firefox").unwrap();
+        let seeded = fs::read_to_string(inst.config_path()).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        let backup = inst.dir.join(BACKUP_FILE);
+        std::os::unix::fs::symlink(&elsewhere, &backup).unwrap();
+        let mut edited = inst.config.clone();
+        edited.services.push(Service::X11);
+        inst.save(&edited).unwrap();
+        assert!(!elsewhere.exists(), "the backup was written through a link");
+        assert!(!fs::symlink_metadata(&backup).unwrap().is_symlink());
+        assert_eq!(fs::read_to_string(&backup).unwrap(), seeded);
+
+        // `reseed` keeps the same copy under the same name, so it is the
+        // same link to refuse to follow.
+        let saved = fs::read_to_string(inst.config_path()).unwrap();
+        fs::remove_file(&backup).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &backup).unwrap();
+        Instance::reseed(&env, "ff").unwrap();
+        assert!(!elsewhere.exists(), "the backup was written through a link");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), saved);
     }
 
     #[test]

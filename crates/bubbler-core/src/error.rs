@@ -301,14 +301,16 @@ pub enum WrapError {
     /// path. bubbler never moves it aside or deletes it.
     #[error("{0} exists and is not a bubbler shim; move it aside first")]
     Occupied(PathBuf),
-    /// The registry is not KDL at all.
+    /// The registry is not KDL bubbler will parse: a syntax error, or
+    /// text past the bounds `crate::config::parse_document` holds the
+    /// parser to.
     #[error("{path}: invalid KDL")]
     Parse {
         /// The registry's path.
         path: PathBuf,
         /// What the parser rejected.
         #[source]
-        source: kdl::KdlError,
+        source: ConfigError,
     },
     /// The registry parses but says something bubbler would not write.
     #[error("{path}: {reason}")]

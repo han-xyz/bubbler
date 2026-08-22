@@ -196,12 +196,13 @@ fn command_name(config: &InstanceConfig) -> Option<&OsStr> {
 ///
 /// Entries bubbler generated are never a source; neither are entries a
 /// launcher does not display, which is what an application's
-/// MIME-handler-only entries are. Two candidates are an error rather than
-/// a guess: `lutris` matches its own entry and its URL handler, and only
+/// MIME-handler-only entries are — a `desktop` node excepted, since that
+/// is the user naming the file. Two candidates are an error rather than a
+/// guess: `lutris` matches its own entry and its URL handler, and only
 /// the user knows which one the instance is for.
 pub fn source(dirs: &Dirs, name: &str, config: &InstanceConfig) -> Result<PathBuf, DesktopError> {
     if let Some(hint) = &config.desktop {
-        return find(dirs, OsStr::new(hint)).ok_or_else(|| DesktopError::HintNotFound {
+        return find(dirs, OsStr::new(hint), false).ok_or_else(|| DesktopError::HintNotFound {
             name: hint.clone(),
             dirs: dirs.lookup().map(Path::to_path_buf).collect(),
         });
@@ -209,7 +210,7 @@ pub fn source(dirs: &Dirs, name: &str, config: &InstanceConfig) -> Result<PathBu
     let command = command_name(config).ok_or_else(|| DesktopError::NoCommand(name.to_owned()))?;
     let mut exact = command.to_os_string();
     exact.push(".desktop");
-    if let Some(path) = find(dirs, &exact) {
+    if let Some(path) = find(dirs, &exact, true) {
         return Ok(path);
     }
     let mut candidates = scan(dirs, command);
@@ -230,10 +231,18 @@ pub fn source(dirs: &Dirs, name: &str, config: &InstanceConfig) -> Result<PathBu
 }
 
 /// The first directory holding `file` as an entry bubbler did not write.
-fn find(dirs: &Dirs, file: &OsStr) -> Option<PathBuf> {
-    dirs.lookup()
-        .map(|d| d.join(file))
-        .find(|p| std::fs::read_to_string(p).is_ok_and(|t| owner(&t).is_none()))
+/// With `shown`, an entry a launcher does not display is passed over as
+/// well, which is what the `<command>.desktop` step wants: a name that
+/// happens to match a MIME-handler-only entry is the same wrong answer
+/// there as in the scan. A `desktop` hint sets it false, because that is
+/// the user naming the file they mean.
+fn find(dirs: &Dirs, file: &OsStr, shown: bool) -> Option<PathBuf> {
+    dirs.lookup().map(|d| d.join(file)).find(|p| {
+        std::fs::read_to_string(p).is_ok_and(|t| {
+            let head = head(&t);
+            head.marker.is_none() && !(shown && head.no_display)
+        })
+    })
 }
 
 /// Every entry whose `Exec` runs `command`, in lookup order, one per file
@@ -329,7 +338,7 @@ pub fn patch(text: &str, instance: &str, program: &Path) -> Result<String, Deskt
         };
         if let Some(name) = header(body) {
             if group.as_deref() == Some("Desktop Entry") {
-                out.extend(added(&present, instance, program, eol));
+                push_added(&mut out, &present, instance, program, eol);
             }
             group = Some(name.to_owned());
             out.push(line.to_owned());
@@ -359,13 +368,25 @@ pub fn patch(text: &str, instance: &str, program: &Path) -> Result<String, Deskt
         }
     }
     if group.as_deref() == Some("Desktop Entry") {
-        out.extend(added(&present, instance, program, eol));
+        push_added(&mut out, &present, instance, program, eol);
     }
     let mut text = out.join("\n");
     if trailing {
         text.push('\n');
     }
     Ok(text)
+}
+
+/// Put the keys bubbler adds at the end of the `[Desktop Entry]` group's
+/// own lines, before the blank lines the vendor left between it and what
+/// follows: a key written after that separator reads as the next group's,
+/// and the blank line is the vendor's layout, which is copied through.
+fn push_added(out: &mut Vec<String>, present: &Present, instance: &str, program: &str, eol: &str) {
+    let at = out
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map_or(0, |i| i + 1);
+    out.splice(at..at, added(present, instance, program, eol));
 }
 
 /// The keys the source did not carry, written at the end of its
@@ -706,6 +727,28 @@ X-Bubbler-Instance=kt
     }
 
     #[test]
+    fn the_keys_bubbler_adds_land_inside_the_group_and_not_after_it() {
+        // A blank line separates one group from the next, so a key put
+        // after it reads as the next group's — and a key of the entry
+        // group written under `[Desktop Action new]` is not the entry's.
+        let source = "[Desktop Entry]\nType=Application\nName=A\nExec=a\n\n\
+                      [Desktop Action new]\nName=New\nExec=a --new\n";
+        let out = patch(source, "i", Path::new("/usr/bin/bubbler")).unwrap();
+        assert_eq!(
+            out,
+            "[Desktop Entry]\nType=Application\nName=A (Bubbler)\n\
+             Exec=/usr/bin/bubbler open i -- a\nTryExec=/usr/bin/bubbler\n\
+             DBusActivatable=false\nX-Bubbler-Instance=i\n\n\
+             [Desktop Action new]\nName=New\nExec=/usr/bin/bubbler open i -- a --new\n"
+        );
+        // At the end of the file the blank lines separate the group from
+        // nothing, and they stay where the vendor left them all the same.
+        let source = "[Desktop Entry]\nType=Application\nName=A\nExec=a\n\n\n";
+        let out = patch(source, "i", Path::new("/usr/bin/bubbler")).unwrap();
+        assert!(out.ends_with("X-Bubbler-Instance=i\n\n\n"), "{out:?}");
+    }
+
+    #[test]
     fn an_entry_a_launcher_is_told_to_ignore_is_refused() {
         // `Hidden=true` is "strictly equivalent to the .desktop file not
         // existing at all", so a copy of one would be an entry that is
@@ -850,6 +893,34 @@ X-Bubbler-Instance=kt
             source(&dirs, "i", &cfg),
             Err(DesktopError::HintNotFound { name, .. }) if name == "nothere.desktop"
         ));
+    }
+
+    #[test]
+    fn an_entry_a_launcher_hides_is_no_source_unless_the_hint_names_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = dirs(tmp.path());
+        let system = tmp.path().join("system");
+        // The `<command>.desktop` step is a lookup by name rather than a
+        // scan, and a MIME-handler-only entry named after the command is
+        // the same wrong answer there as it is in the scan.
+        put(
+            &system,
+            "l.desktop",
+            "[Desktop Entry]\nExec=l %f\nNoDisplay=true\n",
+        );
+        let shown = put(
+            &system,
+            "net.example.L.desktop",
+            "[Desktop Entry]\nExec=l %U\n",
+        );
+        assert_eq!(source(&dirs, "i", &config("l")).unwrap(), shown);
+        // A `desktop` node is the user naming the file they mean, so it
+        // reaches even the entry nothing would have found on its own.
+        let cfg = InstanceConfig {
+            desktop: Some("l.desktop".to_owned()),
+            ..config("l")
+        };
+        assert_eq!(source(&dirs, "i", &cfg).unwrap(), system.join("l.desktop"));
     }
 
     #[test]

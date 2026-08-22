@@ -829,7 +829,12 @@ impl App {
                 self.dialog = None;
                 Some(Action::capture(
                     format!("create {value}"),
-                    args(&["create", &value, "--profile", &profile]),
+                    // `--` closes the option list, so what was typed is
+                    // the instance name whatever it starts with: a
+                    // leading `-` is then refused by the CLI's own name
+                    // grammar, which says why, rather than as a flag it
+                    // has never heard of.
+                    args(&["create", "--profile", &profile, "--", &value]),
                 ))
             }
             Prompt::Node => {
@@ -875,11 +880,13 @@ impl App {
             },
             Prompt::Wrap(name) => {
                 self.dialog = None;
-                let mut argv = args(&["wrap", &name]);
+                let mut argv = args(&["wrap"]);
                 if value != name {
                     argv.push("--as".into());
                     argv.push(OsString::from(&value));
                 }
+                argv.push("--".into());
+                argv.push(OsString::from(&name));
                 Some(Action::capture(format!("wrap {name}"), argv))
             }
         }
@@ -1193,8 +1200,35 @@ mod tests {
             typed(&mut app, "first")
         }
         .unwrap();
-        assert_eq!(argv(&create)[..2], ["create", "first"]);
-        assert_eq!(argv(&create)[2], "--profile");
+        let create = argv(&create);
+        assert_eq!(create[..2], ["create", "--profile"]);
+        assert_eq!(create[create.len() - 2..], ["--", "first"]);
+    }
+
+    #[test]
+    fn a_name_typed_into_a_prompt_reaches_the_cli_as_a_name_and_not_a_flag() {
+        // `--` closes the option list, so what was typed is the
+        // positional argument whatever it starts with: without it clap
+        // reads `-x` as a flag it has never heard of and refuses the run
+        // rather than saying the name is not one.
+        let (_tmp, mut app) = app();
+        press(&mut app, 'n');
+        press(&mut app, 'c');
+        let create = argv(&typed(&mut app, "-x").unwrap());
+        assert_eq!(create[0], "create");
+        assert_eq!(create[create.len() - 2..], ["--", "-x"]);
+    }
+
+    #[test]
+    fn a_shim_name_typed_into_a_prompt_reaches_the_cli_the_same_way() {
+        let (_tmp, mut app) = app();
+        press(&mut app, 'W');
+        clear(&mut app);
+        let wrap = argv(&typed(&mut app, "-y").unwrap());
+        assert_eq!(wrap[0], "wrap");
+        assert_eq!(wrap[wrap.len() - 2..], ["--", "ff"]);
+        assert!(wrap.contains(&"--as".to_owned()), "{wrap:?}");
+        assert!(wrap.contains(&"-y".to_owned()), "{wrap:?}");
     }
 
     /// Put the detail screen's cursor on `node`, as the keys do.

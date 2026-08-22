@@ -2896,6 +2896,21 @@ fn a_configuration_nested_past_the_bound_is_refused_wherever_it_is_read() {
         let bound = format!("nested deeper than {}", bubbler_core::config::MAX_NESTING);
         assert!(err.contains(&bound), "{args:?}: {err}");
     }
+    // The shim registry is read on every start under a shim name, so it
+    // is the same stack and needs the same bound. Far past it, because
+    // what a bound is worth is what it does to the input nobody sized.
+    let registry = tmp.path().join("config/bubbler/wraps.kdl");
+    std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+    std::fs::write(&registry, "wrap ".to_owned() + &"{".repeat(20000)).unwrap();
+    let out = bubbler(tmp.path())
+        .args(["wrap", "--list"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.code().is_some_and(|c| c != 0), "{err}");
+    assert!(err.contains(&registry.display().to_string()), "{err}");
+    let bound = format!("nested deeper than {}", bubbler_core::config::MAX_NESTING);
+    assert!(err.contains(&bound), "{err}");
 }
 
 #[test]
@@ -5548,6 +5563,30 @@ fn rendered(roff: &str) -> String {
 }
 
 #[test]
+fn the_long_help_of_a_shim_says_what_it_takes_over() {
+    let tmp = setup();
+    let out = bubbler(tmp.path())
+        .args(["wrap", "--help"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    // The three things a reader has to know before putting a name of
+    // their own on PATH, and the three the README spends a section on.
+    assert!(text.contains("argv[0]"), "what a shim is:\n{text}");
+    assert!(text.contains("PATH"), "the PATH caveat:\n{text}");
+    assert!(text.contains("~/.local/bin"), "where it lands:\n{text}");
+    for reserved in ["bubbler-init", "bwrap", "xdg-dbus-proxy", "pasta"] {
+        assert!(text.contains(reserved), "reserved `{reserved}`:\n{text}");
+    }
+    let out = bubbler(tmp.path())
+        .args(["unwrap", "--help"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("never deletes"), "{text}");
+}
+
+#[test]
 fn man_renders_the_page_and_a_section_for_every_subcommand() {
     let tmp = setup();
     let out = bubbler(tmp.path()).arg("man").output().unwrap();
@@ -6014,6 +6053,32 @@ fn a_config_that_does_not_parse_reaches_the_log_of_the_run_it_stopped() {
     assert!(!elsewhere.exists(), "the symlink was followed");
     // The run went ahead: what stopped it is the missing supervisor.
     assert!(err.contains("bubbler-init"), "{err}");
+}
+
+#[test]
+fn open_with_a_terminal_on_any_descriptor_leaves_the_log_alone() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "bluetooth\n").unwrap();
+    // Only stdin is a terminal, which is still somebody watching: the
+    // run says what stopped it where they can see it instead of taking
+    // the log over, the way the sandbox is given a terminal too.
+    let pty = test_pty();
+    let out = bubbler(tmp.path())
+        .args(["open", "t"])
+        .stdin(pty.stdio())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("unknown node `bluetooth`"), "{err}");
+    assert!(
+        !tmp.path()
+            .join("data/bubbler/instances/t/last-run.log")
+            .exists(),
+        "the log was taken over with a terminal on stdin"
+    );
 }
 
 /// A stand-in for the terminal editor: `bubbler ui` execs whatever is

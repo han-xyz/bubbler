@@ -202,10 +202,12 @@ channel and not a boundary.")]
 Run a command in an instance, starting the sandbox when it is not running and
 executing into it when it is, which is what a desktop entry and a PATH shim
 call. A URL or a file handed to a running application therefore reaches the
-window that is already open. The command replaces the config's `command`; with
-no terminal anywhere, the sandbox is given none either (`tty \"none\"`) and
-bubbler's own stderr, the sidecars' and the application's go to the instance's
-last-run.log, which `bubbler log` prints.")]
+window that is already open. The command replaces the config's `command`. A
+terminal on any of bubbler's three standard descriptors is somebody watching,
+and the sandbox gets the terminal its `tty` node asks for; with none on any of
+them — which is how a launcher starts its children — the sandbox is given none
+either (`tty \"none\"`) and bubbler's own stderr, the sidecars' and the
+application's go to the instance's last-run.log, which `bubbler log` prints.")]
     Open {
         /// Instance name.
         name: String,
@@ -338,6 +340,26 @@ from a file that grants too much. The checks are listed in bubbler-config(5).")]
         opts: LintOpts,
     },
     /// Put a shim for an instance on `PATH`, in ~/.local/bin.
+    #[command(long_about = "\
+Put a shim for an instance in ~/.local/bin: a symlink to the bubbler binary,
+which reads the name it was called by out of argv[0], looks it up in the
+registry and becomes `bubbler open <instance> -- <the instance's command>
+<your arguments>`. There is no wrapper script and no second process; the
+symlink is bubbler.
+
+The shim takes the instance's name unless `--as` gives it the application's,
+and `--as` is the one that intercepts: everything that resolves that name
+through `PATH` reaches the sandbox, a menu entry running a bare `code`
+included, with no desktop file edited and nothing to see. ~/.local/bin is not
+on Arch's default `PATH`, so wrap says so rather than leaving a file that can
+never run, and says so again when a directory earlier on `PATH` already holds
+the name.
+
+Refused, naming the path and changing nothing: `bubbler`, `bubbler-init`,
+`bwrap`, `xdg-dbus-proxy`, `pasta` and `passt`, which bubbler resolves through
+`PATH` itself; anything outside the instance name grammar; an instance with no
+`command` to run; a name another instance already holds; and any existing path
+that is not a shim of bubbler's own.")]
     Wrap {
         /// Instance the shim opens; leave it out with `--list`.
         #[arg(required_unless_present = "list")]
@@ -351,6 +373,12 @@ from a file that grants too much. The checks are listed in bubbler-config(5).")]
         list: bool,
     },
     /// Remove a shim and the registry line naming it.
+    #[command(long_about = "\
+Remove a shim from ~/.local/bin and the line naming it from the registry. The
+instance stays as it is; `delete` is what removes that. bubbler never deletes
+what it did not create, so a name somebody has since put their own file under
+loses its registry line and keeps the file: what is deleted is a symlink
+pointing at a file named `bubbler`, and nothing else.")]
     Unwrap {
         /// Shim name, as `wrap --list` prints it.
         name: String,
@@ -976,8 +1004,14 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             // to what the run it is executing into wrote.
             let stream = exec::connect(&env, &name)
                 .with_context(|| format!("connecting to instance `{name}`"))?;
-            let is_tty = tty::host_is_tty();
-            if !is_tty[2] {
+            // A launcher starts its children with no terminal at all, so
+            // one on any of the three descriptors means somebody is
+            // watching: the run keeps its own stderr and the sandbox is
+            // given a terminal. With none anywhere there is nothing to
+            // hand over or to stand in for, the sandbox gets pipes
+            // bubbler reads, and every stderr goes to the log.
+            let watched = tty::host_is_tty().iter().any(|t| *t);
+            if !watched {
                 *log = open_log(&config.with_file_name(run_log::LOG_FILE), stream.is_none());
             }
             let inst = Instance::open(&env, &name).with_context(|| {
@@ -988,11 +1022,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             })?;
             warn_migration(&inst);
             let command = (!command.is_empty()).then_some(command.as_slice());
-            // A launcher starts its children with no terminal at all, so
-            // there is none to hand over or to stand in for; the sandbox
-            // gets pipes bubbler reads, which is what puts the
-            // application's own stderr in the log.
-            let mode = match is_tty.iter().any(|t| *t) {
+            let mode = match watched {
                 true => inst.config.tty,
                 false => TtyMode::None,
             };

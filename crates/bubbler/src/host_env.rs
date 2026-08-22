@@ -69,16 +69,7 @@ pub fn from_process() -> Result<Env> {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".config"));
-    // Every entry is a directory of its own, so an empty one would be
-    // the current directory, which is not a data directory of anybody's.
-    let data_dirs: Vec<PathBuf> = env::var_os("XDG_DATA_DIRS")
-        .filter(|v| !v.is_empty())
-        .map(|v| {
-            env::split_paths(&v)
-                .filter(|d| !d.as_os_str().is_empty())
-                .collect()
-        })
-        .unwrap_or_else(|| DEFAULT_DATA_DIRS.iter().map(PathBuf::from).collect());
+    let data_dirs = data_dirs(env::var_os("XDG_DATA_DIRS"));
     let runtime_dir = PathBuf::from(
         env::var_os("XDG_RUNTIME_DIR")
             .filter(|v| !v.is_empty())
@@ -118,6 +109,23 @@ pub fn from_process() -> Result<Env> {
             .filter(|v| !v.is_empty())
             .map(PathBuf::from),
     })
+}
+
+/// `$XDG_DATA_DIRS` split into directories, or [`DEFAULT_DATA_DIRS`]
+/// when it is unset or empty, which is what the XDG base directory
+/// specification asks for.
+///
+/// A relative entry is dropped rather than resolved: that specification
+/// says every path in these variables must be absolute and that an
+/// implementation meeting a relative one is to consider it invalid and
+/// ignore it. An empty entry means the current directory and goes the
+/// same way. What it would otherwise cost is a launcher entry read from
+/// wherever the process happened to be started.
+fn data_dirs(value: Option<OsString>) -> Vec<PathBuf> {
+    value
+        .filter(|v| !v.is_empty())
+        .map(|v| env::split_paths(&v).filter(|d| d.is_absolute()).collect())
+        .unwrap_or_else(|| DEFAULT_DATA_DIRS.iter().map(PathBuf::from).collect())
 }
 
 /// `$BUBBLER_TEST_ALLOW_PATH`: the one extra root `path-share` accepts,
@@ -164,4 +172,28 @@ pub fn search_path() -> Vec<PathBuf> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_relative_data_directory_is_ignored_and_only_an_unset_list_defaults() {
+        let default: Vec<PathBuf> = DEFAULT_DATA_DIRS.iter().map(PathBuf::from).collect();
+        assert_eq!(data_dirs(None), default);
+        assert_eq!(data_dirs(Some(OsString::from(""))), default);
+        assert_eq!(
+            data_dirs(Some(OsString::from(
+                "/opt/share:share:../share::/usr/share"
+            ))),
+            vec![PathBuf::from("/opt/share"), PathBuf::from("/usr/share")],
+            "a relative or empty entry is dropped, the absolute ones kept in order"
+        );
+        // A list that names nothing absolute names nowhere to look. The
+        // defaults are for a variable nobody set, not for one whose every
+        // entry the specification says to ignore.
+        assert!(data_dirs(Some(OsString::from("share:../share"))).is_empty());
+        assert!(data_dirs(Some(OsString::from(":"))).is_empty());
+    }
 }

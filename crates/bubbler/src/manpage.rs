@@ -42,8 +42,9 @@ const FILES: &[(&str, &str)] = &[
     ),
     (
         "$XDG_DATA_HOME/bubbler/instances/<name>/config.kdl.bak",
-        "That config as it stood before the last `reseed`, copied before the fresh one is \
-         written.",
+        "That config as it stood before whatever last replaced it: a `reseed`, or a save \
+         from `bubbler ui`. Written beside the fresh one, over the backup an earlier \
+         replacement left.",
     ),
     (
         "$XDG_DATA_HOME/bubbler/instances/<name>/home/",
@@ -115,7 +116,8 @@ const ENVIRONMENT: &[(&str, &str)] = &[
     (
         "XDG_DATA_DIRS",
         "Where `desktop` looks for the application's own entry, under XDG_DATA_HOME's copy \
-         of the same name; /usr/local/share:/usr/share when it is unset.",
+         of the same name; /usr/local/share:/usr/share when it is unset. A relative entry \
+         is ignored, as the XDG base directory specification asks.",
     ),
     (
         "WAYLAND_DISPLAY, DISPLAY, XAUTHORITY",
@@ -560,6 +562,19 @@ mod tests {
         names.sort();
         names.dedup();
         names
+    }
+
+    /// The backup is written from two places, and a reader who finds one
+    /// of them there has no reason to look for the other: the page is
+    /// where both are named.
+    #[test]
+    fn the_backup_file_names_everything_that_writes_it() {
+        let (_, what) = FILES
+            .iter()
+            .find(|(path, _)| path.ends_with("config.kdl.bak"))
+            .expect("the backup has a FILES entry");
+        assert!(what.contains("reseed"), "{what}");
+        assert!(what.contains("bubbler ui"), "{what}");
     }
 
     /// The page promises what bubbler reads from the environment, and

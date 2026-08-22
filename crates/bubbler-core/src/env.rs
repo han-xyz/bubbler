@@ -38,7 +38,9 @@ pub struct Env {
     pub config_home: PathBuf,
     /// `$XDG_DATA_DIRS` (or `/usr/local/share:/usr/share`), in precedence
     /// order; where an application's own desktop entry is looked up,
-    /// under `$XDG_DATA_HOME`'s copy of the same name.
+    /// under `$XDG_DATA_HOME`'s copy of the same name. Absolute: the XDG
+    /// base directory specification says a relative entry is invalid, and
+    /// the binary drops it before filling this in.
     pub data_dirs: Vec<PathBuf>,
     /// `$XDG_RUNTIME_DIR`; required, sockets live here.
     pub runtime_dir: PathBuf,

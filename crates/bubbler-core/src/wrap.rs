@@ -13,9 +13,9 @@ use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use kdl::KdlDocument;
 use rustix::fs::{FlockOperation, Mode, OFlags, flock};
 
+use crate::config;
 use crate::env::Env;
 use crate::error::WrapError;
 use crate::instance::{self, Instance};
@@ -429,8 +429,12 @@ fn write(env: &Env, text: &str) -> Result<(), WrapError> {
 /// Parse the registry. Every deviation is an error: a name bubbler would
 /// not have written is a file somebody else edited, and dispatch builds
 /// an instance path out of what it says.
+///
+/// Through [`config::parse_document`], because this is the same recursive
+/// KDL parser every other configuration goes through, and it is read on
+/// every start under a shim name.
 fn parse(path: &Path, text: &str) -> Result<Vec<Wrap>, WrapError> {
-    let doc = KdlDocument::parse(text).map_err(|source| WrapError::Parse {
+    let doc = config::parse_document(text).map_err(|source| WrapError::Parse {
         path: path.to_path_buf(),
         source,
     })?;
@@ -507,7 +511,9 @@ fn parse(path: &Path, text: &str) -> Result<Vec<Wrap>, WrapError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::MAX_NESTING;
     use crate::env::Env;
+    use crate::error::ConfigError;
 
     /// A test root holding a fake bubbler binary, an instance store and
     /// the config home the registry lives in.
@@ -834,6 +840,26 @@ mod tests {
         fs::write(&path, "wrap \"ff\" instance=\n").unwrap();
         let e = load(&r.env).unwrap_err();
         assert!(matches!(e, WrapError::Parse { .. }), "{e}");
+    }
+
+    #[test]
+    fn a_registry_nested_past_the_bound_is_an_error_and_not_an_abort() {
+        let r = root();
+        let path = registry_path(&r.env);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let deep = format!("wrap {}\n", "{".repeat(MAX_NESTING + 1));
+        fs::write(&path, &deep).unwrap();
+        let e = load(&r.env).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                WrapError::Parse {
+                    source: ConfigError::TooDeep { max, .. },
+                    ..
+                } if max == MAX_NESTING
+            ),
+            "{e}"
+        );
     }
 
     #[test]
