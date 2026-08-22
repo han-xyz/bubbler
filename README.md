@@ -2172,3 +2172,6 @@ is expected to fail the `bwrap` line — Docker's default seccomp profile denies
 a self-hosted runner. `sandbox-probe` is what tells you which of the two you
 are looking at.
 
+## License
+
+GPL-3.0-or-later. See `LICENSE`.
