@@ -66,13 +66,16 @@ Four processes sit beside a sandbox, and they are not one kind of thing:
 | `xdg-dbus-proxy` | its own bwrap sandbox, sibling of the app's | **Yes.** It is a filter, it sees only the host bus socket read-only and the instance's `dbus/` subdirectory read-write, and the socket it serves is moved out of its reach before anything is bound. |
 | `bubbler-init` | *inside* the sandbox, as pid 2 | **No.** It is the supervisor, not a guard: it shares the sandbox with the application. What it holds — the listening control socket — is kept from the application by being an inherited descriptor with no path, `CLOEXEC` in the only process that has it, and `PR_SET_DUMPABLE` off so `/proc/<init>/fd` cannot be walked. |
 | `pasta` | on the host, **not sandboxed**, holding the sandbox's outer user namespace | **No, in one direction.** A pasta that has been taken over *is* that sandbox's network and holds root over the namespaces the sandbox is built from. It owns nothing beyond what your own account already has: your uid created that namespace. Wrapping it in bwrap would not add anything — it would remove the very thing pasta needs, since a process can only join a descendant of its own user namespace. |
-| `nft` | on the host, entering the sandbox's namespaces to install rules | Not in this tree yet: outbound filtering lands in Task 1 of this milestone, which merges next. This row gets its answer, and the test that pins it, then. |
+| `nft` | on the host, entering the sandbox's user and network namespaces to install the ruleset | **Not a party to one.** It builds the network boundary rather than standing in it: it runs before pasta and before the sandbox is let go of its `--block-fd`, so the namespace has a policy before it has a route and before the application has run an instruction either way. Nothing the sandbox controls reaches it — the ruleset is generated from typed values and handed over on stdin, and its argv is two fixed arguments. It holds CAP_NET_ADMIN in the sandbox's user namespace and no other capability anywhere: the capability crosses `execve` through the ambient set, and `SECBIT_NOROOT` with `_LOCKED` stops the uid-0 that bwrap's nested user namespace maps bubbler to from being handed the full set. It exits before the run begins, and one that stops answering is killed rather than left holding that capability. |
 
 ([A run is a chain of processes](../README.md#usage),
 [D-Bus](../README.md#d-bus), [network](../README.md#network);
 `the_proxy_never_sees_the_instances_control_socket`,
 `a_proxied_socket_is_moved_out_of_the_proxys_reach`,
-`proxy_argv_runs_the_proxy_in_its_own_sandbox`.)
+`proxy_argv_runs_the_proxy_in_its_own_sandbox`,
+`the_nft_child_holds_cap_net_admin_and_is_fed_the_ruleset`,
+`the_ruleset_is_the_golden_text_nft_is_fed`,
+`outbound_deny_filters_what_no_allow_out_names_and_the_sandbox_cannot_undo_it`.)
 
 ### 3. Instance ↔ instance
 
