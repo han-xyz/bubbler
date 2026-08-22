@@ -6443,6 +6443,36 @@ fn open_with_a_terminal_on_any_descriptor_leaves_the_log_alone() {
     );
 }
 
+/// A log is the sandbox's own output, so printing it is bubbler handing
+/// a terminal whatever the application wrote — an OSC 52 in it writes
+/// the clipboard of whoever reads the log. On a terminal the control
+/// characters are shown; down a pipe the log is the log, since what is
+/// on the other end is a tool.
+#[test]
+fn log_shows_a_terminal_the_control_bytes_and_a_pipe_the_log_itself() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    const WRITTEN: &[u8] = b"\x1b]52;c;aGk=\x07done\n";
+    let log = tmp.path().join("data/bubbler/instances/t/last-run.log");
+    std::fs::write(&log, WRITTEN).unwrap();
+
+    let pty = test_pty();
+    let mut child = bubbler(tmp.path())
+        .args(["log", "t"])
+        .stdout(pty.stdio())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let shown = pty.read_until(Duration::from_secs(10), |s| s.contains("done\n"));
+    assert_eq!(child.wait().unwrap().code(), Some(0));
+    assert_eq!(shown, "^[]52;c;aGk=^Gdone\n");
+    assert!(!shown.contains('\x1b'), "an escape reached the terminal");
+
+    let out = bubbler(tmp.path()).args(["log", "t"]).output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(out.stdout, WRITTEN);
+}
+
 /// A stand-in for the terminal editor: `bubbler ui` execs whatever is
 /// named `bubbler-ui`, so a script that says which copy it is proves
 /// which one was found.

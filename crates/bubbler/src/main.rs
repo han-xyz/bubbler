@@ -3,8 +3,9 @@
 mod host_env;
 mod manpage;
 
+use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -24,6 +25,7 @@ use bubbler_core::launcher;
 use bubbler_core::lint;
 use bubbler_core::profile;
 use bubbler_core::run_log;
+use bubbler_core::safe_text;
 use bubbler_core::tty::{self, TtyMode};
 use bubbler_core::wrap;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -483,9 +485,20 @@ fn main() -> ExitCode {
     code
 }
 
-fn write_lines(out: &mut dyn Write, lines: &[&OsStr]) -> io::Result<()> {
+/// Bytes bubbler is about to echo, made safe when they are going to a
+/// terminal that would act on the control characters in them. A pipe
+/// gets them as they are: the reader there is a tool, and `bubbler log |
+/// grep` has to match what the run really wrote.
+fn echoed(bytes: &[u8], terminal: bool) -> Cow<'_, [u8]> {
+    match terminal {
+        true => Cow::Owned(safe_text::render(bytes)),
+        false => Cow::Borrowed(bytes),
+    }
+}
+
+fn write_lines(out: &mut dyn Write, lines: &[&OsStr], terminal: bool) -> io::Result<()> {
     for l in lines {
-        out.write_all(l.as_bytes())?;
+        out.write_all(&echoed(l.as_bytes(), terminal))?;
         out.write_all(b"\n")?;
     }
     out.flush()
@@ -496,16 +509,18 @@ fn write_lines(out: &mut dyn Write, lines: &[&OsStr]) -> io::Result<()> {
 /// reader that closed the pipe early (`| head`) is a normal end, not a
 /// failure.
 fn print_lines(lines: &[&OsStr], what: &str) -> Result<i32> {
-    match write_lines(&mut io::stdout().lock(), lines) {
+    let mut out = io::stdout().lock();
+    let terminal = out.is_terminal();
+    match write_lines(&mut out, lines, terminal) {
         Ok(()) => Ok(0),
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(0),
         Err(e) => Err(e).with_context(|| format!("writing {what}")),
     }
 }
 
-/// Print bytes as they are: a log and a desktop entry are files, and
-/// what is in them is not this command's to reword. A reader that left
-/// early (`| head`) is a normal end here too.
+/// Print bytes as they are: a desktop entry is a file, and what is in
+/// it is not this command's to reword. A reader that left early
+/// (`| head`) is a normal end here too.
 fn print_bytes(bytes: &[u8], what: &str) -> Result<i32> {
     let mut out = io::stdout().lock();
     let written = out.write_all(bytes).and_then(|()| out.flush());
@@ -514,6 +529,14 @@ fn print_bytes(bytes: &[u8], what: &str) -> Result<i32> {
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(0),
         Err(e) => Err(e).with_context(|| format!("writing {what}")),
     }
+}
+
+/// Print bytes a sandbox wrote, with what a terminal would act on
+/// rendered rather than sent ([`safe_text`]). A log replayed to a
+/// terminal is the sandbox writing to it a second time, with the user
+/// reading rather than watching.
+fn print_echoed_bytes(bytes: &[u8], what: &str) -> Result<i32> {
+    print_bytes(&echoed(bytes, io::stdout().is_terminal()), what)
 }
 
 /// Print the argv of `inst` with every argument under the node it came
@@ -767,12 +790,16 @@ fn warn_lint(result: Result<lint::Report, bubbler_core::error::LintError>) {
     let Ok(report) = result else {
         return;
     };
+    let terminal = io::stderr().is_terminal();
     for finding in &report.findings {
         if finding.severity == lint::Severity::Note {
             continue;
         }
         for line in lint::render_finding(finding) {
-            eprintln!("bubbler: lint: {}", line.to_string_lossy());
+            // A finding quotes the config it read, and that file is not
+            // always the reader's own.
+            let line = echoed(line.as_bytes(), terminal);
+            eprintln!("bubbler: lint: {}", String::from_utf8_lossy(&line));
         }
     }
 }
@@ -1054,7 +1081,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                         run_log::LOG_FILE
                     )
                 })?;
-            print_bytes(&text, "the log")
+            print_echoed_bytes(&text, "the log")
         }
         Cmd::Desktop {
             name,

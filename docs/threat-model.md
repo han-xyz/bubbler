@@ -280,6 +280,14 @@ the speed of your terminal. Discarding happens only at the hand-over on
 the way out, inside a ten-second window with a five-second stall rule.
 No descriptor of yours is left with its flags changed.
 
+Reading a record of that output is not replaying it: `bubbler log`
+renders the control characters — C0 and `DEL` as `^[`, C1 and bytes that
+are not UTF-8 as `\x9b` — whenever its stdout is a terminal, so an OSC 52
+a sandbox left in `last-run.log` cannot write the clipboard of whoever
+reads it. A pipe gets the log byte for byte, since the reader there is a
+tool. The same rendering covers what `--explain` and `lint` echo out of a
+config that need not be yours.
+
 **Does not defend:** what is inherent to any relay. The application reads
 what you type into that session and can emit escape sequences your
 emulator parses — title changes, OSC 52 clipboard writes, query sequences
@@ -295,7 +303,9 @@ the sandbox holds your terminal's descriptors and reaches it through
 `output_the_host_cannot_take_is_discarded_and_the_pty_kept_empty`,
 `a_warning_leaves_the_stderr_it_was_given_exactly_as_it_was`,
 `the_guard_enters_raw_mode_and_restores_the_terminal`,
-`allowing_ioctl_is_what_takes_back_the_tiocsti_rules`
+`allowing_ioctl_is_what_takes_back_the_tiocsti_rules`,
+`log_shows_a_terminal_the_control_bytes_and_a_pipe_the_log_itself`,
+`a_terminal_is_shown_the_control_characters_instead_of_acting_on_them`
 
 ### Host paths
 

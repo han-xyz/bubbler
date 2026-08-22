@@ -89,8 +89,10 @@ errors, the application's own output — to `last-run.log` in the instance
 directory, which `bubbler log` prints. The log is opened before the config is
 read, so a `config.kdl` that stopped the run is in it too, and a log that
 cannot be opened at all — a symlink where the file belongs — costs the record
-rather than the run: bubbler says so and starts the sandbox anyway. See
-"Desktop entries".
+rather than the run: bubbler says so and starts the sandbox anyway. Printed to a
+terminal, the log has its control characters shown (`^[`) rather than sent, so
+reading what a sandbox wrote is not letting it write to your terminal a second
+time; down a pipe it is the log, byte for byte. See "Desktop entries".
 
 A run is a chain of processes; `bubbler` waits at the top of it and returns the
 command's status.

@@ -20,6 +20,7 @@ pub mod lint;
 pub mod network;
 pub mod profile;
 pub mod run_log;
+pub mod safe_text;
 pub mod seccomp;
 pub mod service;
 pub mod tty;
