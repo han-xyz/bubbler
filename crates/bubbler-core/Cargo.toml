@@ -2,6 +2,7 @@
 name = "bubbler-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Library core of bubbler: config model, services, bwrap argument builder, launcher"
@@ -18,3 +19,6 @@ libseccomp.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Property tests over generated configs and include graphs: hand-rolled
+# generators would be a worse shrinker than proptest's.
+proptest.workspace = true

@@ -1864,6 +1864,90 @@ Requires `bwrap` at runtime and a kernel with user namespaces, plus `pasta`
 (the `passt` package) for any profile with an isolated `network` — which is
 every shipped profile that has one.
 
+## Checks
+
+Four commands, all clean before every commit:
+
+    cargo fmt --all
+    cargo clippy --all-targets -- -D warnings
+    cargo test
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+
+**Rust 1.95 or newer**, pinned as `rust-version` in the workspace manifest.
+Edition 2024 alone would need only 1.85; the floor is `kdl` 6, and writing it
+down buys one clear error on an older toolchain instead of a spray of syntax
+failures. It is a recent floor: bubbler does not build on Debian stable's
+rustc, and `kdl` is the single crate to reconsider if that ever matters.
+
+`cargo test` includes the property tests in
+`crates/bubbler-core/tests/proptest.rs`, which are three claims about generated
+input rather than about a written-down example:
+
+- every configuration the emitter writes, the parser reads back as the same
+  grants — a round trip that loses or widens one would be a sandbox that
+  differs from the file describing it, and nothing else in the suite looks for
+  that;
+- a patched desktop entry is refused a second patch, so a launcher entry can
+  never end up starting a sandbox inside a sandbox;
+- the `include` resolver answers on any graph of layers, cycles and chains
+  past the depth limit included, instead of recursing until the stack ends.
+
+A fifth check needs the network for the RustSec advisory database, so it runs
+in CI and at each release rather than per commit:
+
+    cargo deny check          # configured in deny.toml
+
+Four things at once: advisories (a yanked or unmaintained crate anywhere in the
+graph fails, not only a vulnerable one), a licence allowlist where every entry
+is one-way compatible with bubbler's GPL-3.0-or-later, crates.io as the only
+permitted source, and a ban on wildcard version requirements. Two versions of
+one crate is a warning rather than an error: the editor's tree carries three
+(`syn`, `unicode-width`, `hashbrown`), which is what ratatui costs, and the
+number is worth reading at each release rather than blocking on.
+
+## Fuzzing
+
+`fuzz/` is a [cargo-fuzz](https://rust-fuzz.github.io/book/) crate, excluded
+from the workspace: libFuzzer wants a nightly compiler, and the four checks
+above run on stable. It is a tool for the maintainer to reach for when a parser
+changes, not part of CI.
+
+    cargo install cargo-fuzz
+    cargo +nightly fuzz run config_parse \
+        fuzz/corpus/config_parse fuzz/seeds/config_parse -- -max_total_time=60
+
+Seven targets, each an entry point that reads bytes bubbler did not write:
+
+| Target | What it feeds |
+|---|---|
+| `config_parse` | `config.kdl` and profile-layer text |
+| `kdl_roundtrip` | parse -> render -> parse, asserting the grants are equal |
+| `profile_resolve` | layer files split out of the input, then flattened |
+| `desktop_patch` | a `.desktop` file a packager shipped |
+| `init_wire` | the in-sandbox supervisor's exec request decoder |
+| `seccomp_names` | syscall names, through `libseccomp` to a compiled filter |
+| `wrap_registry` | `wraps.kdl`, and the `argv[0]` a shim is dispatched on |
+
+`fuzz/seeds/<target>/` holds the starting inputs, and is committed: the
+fourteen shipped profiles for the two KDL targets, the desktop fixtures for the
+patcher, hand-written bytes for the rest. The first two sets are symlinks into
+the tree rather than copies, so a profile that changes changes the seed with
+it. Random bytes barely reach past the KDL tokenizer, so seeding is what makes
+those targets worth running at all. The working corpus (`fuzz/corpus/`) and any
+crash artifacts are not committed.
+
+The targets also build and run on stable, without a nightly toolchain:
+
+    cd fuzz && cargo build --release
+    ./target/release/config_parse -max_total_time=60 seeds/config_parse
+
+That is worth knowing and worth being honest about. Stable has no sanitizer
+coverage, so libFuzzer says as much on startup and degrades to an unguided
+mutation loop: it executes the harness at full speed and catches a crash, but
+it does not grow an input across generations, which is the part that finds
+anything a unit test would not have. Use it to check a target still works; use
+nightly to actually fuzz.
+
 ## Installing
 
     cargo build --release --locked

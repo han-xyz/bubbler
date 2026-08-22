@@ -2,6 +2,7 @@
 name = "bubbler"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "bubblewrap-based application sandbox with instances and resource services"

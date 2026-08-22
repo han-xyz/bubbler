@@ -2,6 +2,7 @@
 name = "bubbler-init"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Minimal in-sandbox supervisor for bubbler: runs the command, serves exec requests"

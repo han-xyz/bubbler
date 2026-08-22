@@ -1,0 +1,2 @@
+wrap "ff" instance="firefox"
+wrap "kitty" instance="term"
