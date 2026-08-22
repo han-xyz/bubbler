@@ -307,8 +307,7 @@ fn x11(env: &Env, args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchErr
 /// paths a userspace driver reads; a PCI root exposes every PCI device's
 /// attributes, not only the GPU's.
 fn dri(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
-    // Paths from Arch wiki Bubblewrap/Examples and bubblejail
-    // `direct_rendering`; PCI roots are enumerated so no unrelated
+    // Paths from Arch wiki Bubblewrap/Examples; PCI roots are enumerated so no unrelated
     // `/sys/devices` subtree is exposed.
     let dev = require_dir(host, "dri", PathBuf::from("/dev/dri"))?;
     args.dev_bind(&dev, &dev);
@@ -362,8 +361,7 @@ fn dri(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
     }
     // libnvidia-glvnd and NVML read `/sys/module/nvidia/initstate` and fall
     // back to Mesa when it is missing (verified on driver 610). The other
-    // `nvidia_*` module directories cost nothing and are what bubblejail
-    // binds for CUDA.
+    // `nvidia_*` module directories cost nothing and cover CUDA.
     let modules = Path::new("/sys/module");
     for name in host.list_dir(modules) {
         if !name.as_encoded_bytes().starts_with(b"nvidia") {

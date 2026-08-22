@@ -1,8 +1,8 @@
 # bubbler
 
 Application sandboxing on top of [bubblewrap](https://github.com/containers/bubblewrap),
-combining bubblejail's explicit instances and resource grants with a profile
-library in the spirit of firejail. bubbler itself is unprivileged; `bwrap`
+with named instances, explicit resource grants, and a profile library for
+common applications. bubbler itself is unprivileged; `bwrap`
 does the namespace work.
 
 Status: milestone 10 — a library of 14 profiles (`alacritty`, `chromium`,

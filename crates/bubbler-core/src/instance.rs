@@ -1,5 +1,5 @@
 //! Named instances: a directory with `config.kdl` and a private `home/`.
-//! Layout follows bubblejail: `$XDG_DATA_HOME/bubbler/instances/<name>/`.
+//! Layout: `$XDG_DATA_HOME/bubbler/instances/<name>/`.
 
 use std::fs;
 use std::io;
