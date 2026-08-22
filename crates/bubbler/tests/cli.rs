@@ -13,9 +13,10 @@ use bubbler_core::bwrap::ETC_ALLOWLIST;
 use bubbler_core::profile::NAMES;
 use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
-    PYTHON, bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, bwrap_alive, kill_group, real_init,
-    require_bwrap, require_dbus, require_groff, require_nft, require_pasta, require_portal,
-    require_python, require_system_bus, require_tray, say, system_owns, test_pty,
+    PYTHON, bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, bwrap_alive, kill_group,
+    output_past_a_busy_exec, real_init, require_bwrap, require_dbus, require_groff, require_nft,
+    require_pasta, require_portal, require_python, require_system_bus, require_tray, say,
+    system_owns, test_pty,
 };
 use rustix::fs::{OFlags, fcntl_getfl};
 use rustix::process::{Pid, Signal, kill_process};
@@ -3113,12 +3114,12 @@ fn edit_prefers_visual_and_passes_editor_arguments() {
     );
     let mut visual = script.clone().into_os_string();
     visual.push(" --flag");
-    let out = bubbler(tmp.path())
-        .env("VISUAL", &visual)
-        .env("EDITOR", "/usr/bin/false")
-        .args(["edit", "t"])
-        .output()
-        .unwrap();
+    let out = output_past_a_busy_exec(
+        bubbler(tmp.path())
+            .env("VISUAL", &visual)
+            .env("EDITOR", "/usr/bin/false")
+            .args(["edit", "t"]),
+    );
     assert!(
         out.status.success(),
         "{}",
@@ -4819,11 +4820,18 @@ fn a_pasta_that_dies_mid_run_is_reported_once_and_the_sandbox_runs_on() {
     ) {
         fail_with(run, "the isolated instance never started");
     }
-    let pid: i32 = std::fs::read_to_string(tmp.path().join("pasta.pid"))
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    // The control socket is bound and listening before bwrap is started
+    // at all, so connecting to it says nothing about the sidecar beside
+    // it: the pid file is what says the stand-in pasta has run.
+    let pidfile = tmp.path().join("pasta.pid");
+    let read_pid = || {
+        let text = std::fs::read_to_string(&pidfile).ok()?;
+        text.trim().parse::<i32>().ok()
+    };
+    if !wait_until(|| read_pid().is_some(), Duration::from_secs(10)) {
+        fail_with(run, "the sidecar never wrote its pid");
+    }
+    let pid = read_pid().expect("the pid file was just read");
     kill_process(
         Pid::from_raw(pid).expect("the sidecar has a pid"),
         Signal::KILL,
@@ -6504,7 +6512,7 @@ fn ui_runs_the_editor_beside_it_before_the_one_on_the_path() {
     };
 
     // With no editor anywhere, the way to get one.
-    let out = ui().output().unwrap();
+    let out = output_past_a_busy_exec(&mut ui());
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("bubbler-ui"), "{err}");
@@ -6512,7 +6520,7 @@ fn ui_runs_the_editor_beside_it_before_the_one_on_the_path() {
 
     // Then the one on PATH.
     fake_ui(&on_path.join("bubbler-ui"), "the editor on PATH", 7);
-    let out = ui().output().unwrap();
+    let out = output_past_a_busy_exec(&mut ui());
     assert_eq!(out.status.code(), Some(7));
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
@@ -6522,7 +6530,7 @@ fn ui_runs_the_editor_beside_it_before_the_one_on_the_path() {
     // And a copy beside the binary wins, so a pair built or unpacked
     // together stay a pair.
     fake_ui(&beside.join("bubbler-ui"), "the editor beside it", 9);
-    let out = ui().output().unwrap();
+    let out = output_past_a_busy_exec(&mut ui());
     assert_eq!(out.status.code(), Some(9));
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),

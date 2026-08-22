@@ -7,7 +7,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -291,6 +291,37 @@ pub fn real_init() -> Option<PathBuf> {
     }
     say(&format!("skipping: {} is not built", path.display()));
     None
+}
+
+/// How long a program this test wrote is given to stop being busy.
+const TXTBSY_LIMIT: Duration = Duration::from_secs(30);
+
+/// Run `cmd` and hand back its output, waiting out an `ETXTBSY` on a
+/// program the test wrote moments earlier.
+///
+/// A test binary spawns children from many threads at once, and one that
+/// forked while such a file was still open for writing holds that
+/// descriptor until it execs — an `execve` of the file fails until then,
+/// however long ago the writer closed it. It reaches a test as the
+/// spawn's own error, or, where bubbler is the one exec'ing, as that
+/// error in bubbler's stderr. Neither is anything about what is under
+/// test, and both are gone within a scheduling turn.
+pub fn output_past_a_busy_exec(cmd: &mut Command) -> Output {
+    let busy = format!("os error {}", Errno::TXTBSY.raw_os_error());
+    let deadline = Instant::now() + TXTBSY_LIMIT;
+    loop {
+        match cmd.output() {
+            Ok(out) if !String::from_utf8_lossy(&out.stderr).contains(&busy) => return out,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {}
+            Err(e) => panic!("running {cmd:?}: {e}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{cmd:?} was still busy after {TXTBSY_LIMIT:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// A `bubbler` Command with an isolated HOME, XDG_DATA_HOME,

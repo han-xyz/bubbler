@@ -1825,13 +1825,15 @@ mod tests {
         fill(dest.as_fd());
         write(&write_end, b"output the host cannot take\n").unwrap();
         let sink = null_stdio().unwrap();
+        // A caught signal: the user is waiting, so that line is offered
+        // for [`HURRY`] and then given up on, which is what the warning
+        // here is. Taken before the clock starts: [`StderrOn`] waits on a
+        // lock every sibling test with a warning of its own holds in
+        // turn, and the wait for it is not the pump's time.
+        let quiet = StderrOn::null();
         let deadline = Instant::now() + Duration::from_millis(100);
         let mut until = || (Instant::now() >= deadline).then_some(9);
         let started = Instant::now();
-        // A caught signal: the user is waiting, so that line is offered
-        // for [`HURRY`] and then given up on, which is what the warning
-        // here is.
-        let quiet = StderrOn::null();
         let code = pump(
             &[(read_end.as_fd(), dest.as_fd(), FD_NAMES[1])],
             sink.as_fd(),
@@ -1841,7 +1843,10 @@ mod tests {
         .unwrap();
         drop(quiet);
         assert_eq!(code, 9);
-        // Parking would be for good; anything bounded is not that.
+        // Parking would be for good; anything bounded is not that. The
+        // pump takes 500 ms here — the deadline above, then [`DRAIN`],
+        // then [`HURRY`] — and 1.4 s is under the 5.3 s a hand-over that
+        // ignored the hurry and waited out [`STALL`] would take.
         assert!(
             started.elapsed() < DRAIN + HURRY + Duration::from_secs(1),
             "the pump parked in a write"
