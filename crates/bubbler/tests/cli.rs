@@ -6416,13 +6416,27 @@ fn a_config_that_does_not_parse_reaches_the_log_of_the_run_it_stopped() {
     let elsewhere = tmp.path().join("elsewhere");
     std::fs::remove_file(&log).unwrap();
     std::os::unix::fs::symlink(&elsewhere, &log).unwrap();
-    let out = bubbler(tmp.path()).args(["open", "t"]).output().unwrap();
+    let mut cmd = bubbler(tmp.path());
+    cmd.args(["open", "t"]);
+    // With a sandbox available the run completes; without one, what
+    // stops it is bwrap or the missing supervisor, never the log.
+    let sandboxed = require_bwrap();
+    if let (true, Some(init)) = (sandboxed, real_init()) {
+        cmd.env("BUBBLER_INIT", init);
+    }
+    let out = cmd.output().unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("no log for this run"), "{err}");
     assert!(err.contains("last-run.log"), "{err}");
     assert!(!elsewhere.exists(), "the symlink was followed");
-    // The run went ahead: what stopped it is the missing supervisor.
-    assert!(err.contains("bubbler-init"), "{err}");
+    if sandboxed && real_init().is_some() {
+        assert!(out.status.success(), "{err}");
+    } else {
+        assert!(
+            err.contains("bubbler-init") || err.contains("bwrap"),
+            "{err}"
+        );
+    }
 }
 
 #[test]
