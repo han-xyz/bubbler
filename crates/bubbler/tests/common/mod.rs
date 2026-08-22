@@ -7,24 +7,174 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::io::Errno;
 use rustix::process::{Pid, Signal, kill_process_group};
 use rustix::termios::Winsize;
+use rustix::thread::{UnshareFlags, unshare_unsafe};
+
+/// Say why a test is being skipped, where a default `cargo test` will
+/// show it.
+///
+/// Not `eprintln!`: libtest installs a capture that holds everything the
+/// `print!` family writes until the run asks for `--nocapture` or the
+/// test fails, and a skip nobody sees is a skip nobody acts on. The
+/// capture is a Rust-side handle, so writing to descriptor 2 itself goes
+/// straight out beside libtest's own progress line.
+pub fn say(line: &str) {
+    let text = format!("{line}\n");
+    let mut rest = text.as_bytes();
+    while !rest.is_empty() {
+        match rustix::io::write(rustix::stdio::stderr(), rest) {
+            Ok(0) => return,
+            Ok(n) => rest = &rest[n..],
+            Err(Errno::INTR) => {}
+            Err(_) => return,
+        }
+    }
+}
+
+/// The two host binaries the probes below run. Named absolutely: a probe
+/// that resolved them on `PATH` would be measuring the `PATH` a test set
+/// rather than the host.
+const TRUE: &str = "/usr/bin/true";
+const SLEEP: &str = "/usr/bin/sleep";
+
+/// Each probe's verdict, kept so a suite of dozens of guarded tests pays
+/// for it once. `None` is "this works here"; `Some(reason)` is what to
+/// print instead of running.
+static USERNS: OnceLock<Option<String>> = OnceLock::new();
+static BWRAP: OnceLock<Option<String>> = OnceLock::new();
+static PASTA: OnceLock<Option<String>> = OnceLock::new();
+
+/// Run `probe` once, then print its reason on *every* call that finds it
+/// negative: a skipped test that says nothing is indistinguishable from
+/// one that ran.
+fn probed(cache: &OnceLock<Option<String>>, probe: impl FnOnce() -> Option<String>) -> bool {
+    match cache.get_or_init(probe) {
+        None => true,
+        Some(why) => {
+            say(&format!("skipping: {why}"));
+            false
+        }
+    }
+}
+
+/// A child process that has made itself a user and a network namespace,
+/// for whatever wants to attach to one. The namespaces are made between
+/// fork and exec, and `spawn` reports a failure there as a failed spawn,
+/// so a handle coming back means they exist.
+fn namespace_holder(program: &str, args: &[&str]) -> std::io::Result<Child> {
+    let mut c = Command::new(program);
+    c.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: the closure runs in the child between fork and exec, where
+    // only async-signal-safe work is allowed; `unshare` is a bare syscall
+    // that allocates nothing and takes no lock. The child is
+    // single-threaded there, so the new namespaces surprise no other
+    // thread of it — which is the hazard `unshare_unsafe` is named for.
+    unsafe {
+        c.pre_exec(|| {
+            unshare_unsafe(UnshareFlags::NEWUSER | UnshareFlags::NEWNET).map_err(Into::into)
+        });
+    }
+    c.spawn()
+}
+
+/// Returns false (after printing why) when this kernel will not give an
+/// unprivileged process a user namespace of its own.
+///
+/// Probed by creating one rather than by looking for
+/// `/proc/self/ns/user`: that path is there in every container, whether
+/// or not the container's own policy lets the syscall behind it through.
+pub fn require_userns() -> bool {
+    probed(&USERNS, || {
+        match namespace_holder(TRUE, &[]).and_then(|mut c| c.wait()) {
+            Ok(s) if s.success() => None,
+            Ok(s) => Some(format!("a user namespace of its own left `true` at {s}")),
+            Err(e) => Some(format!("this kernel gives no user namespace: {e}")),
+        }
+    })
+}
 
 /// Returns false (after printing why) when real bwrap runs cannot work
-/// here: no `bwrap` on PATH or no user namespaces.
+/// here.
+///
+/// The probe builds a sandbox — the namespaces, `/proc` and `/dev` every
+/// bubbler run asks for — instead of running `bwrap --version`. A
+/// container can have bwrap installed and a seccomp or LSM policy that
+/// refuses the mounts under it, and a probe that only looked for the
+/// binary would turn that host's forty-odd guarded tests into failures
+/// rather than skips.
 pub fn require_bwrap() -> bool {
-    let has_bwrap = Command::new("bwrap")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success());
-    let has_userns = Path::new("/proc/self/ns/user").exists();
-    if !has_bwrap || !has_userns {
-        eprintln!("skipping: bwrap={has_bwrap} userns={has_userns}");
+    require_userns()
+        && probed(&BWRAP, || {
+            let out = Command::new("bwrap")
+                .args([
+                    "--unshare-all",
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--proc",
+                    "/proc",
+                    "--dev",
+                    "/dev",
+                    "--",
+                    TRUE,
+                ])
+                .output();
+            match out {
+                Ok(o) if o.status.success() => None,
+                Ok(o) => Some(format!(
+                    "bwrap builds no sandbox here ({}): {}",
+                    o.status,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                )),
+                Err(e) => Some(format!("bwrap did not run: {e}")),
+            }
+        })
+}
+
+/// Returns false (after printing why) when the real pasta sidecar cannot
+/// be started here.
+///
+/// The probe is the launcher's own move: hold a network namespace open in
+/// a child, hand pasta a path to that child's user namespace, and let it
+/// configure the namespace by pid. A `pasta --version` would pass on a
+/// host where joining the namespace is what fails.
+pub fn require_pasta() -> bool {
+    require_userns() && probed(&PASTA, pasta_attaches)
+}
+
+/// One real attach, torn down again. pasta goes to the background once
+/// the namespace is configured, so the foreground exit status is the
+/// verdict; killing the holder is what ends the sidecar behind it.
+fn pasta_attaches() -> Option<String> {
+    let mut holder = match namespace_holder(SLEEP, &["60"]) {
+        Ok(c) => c,
+        Err(e) => return Some(format!("no namespace for pasta to attach to: {e}")),
+    };
+    let pid = holder.id();
+    let attached = Command::new("pasta")
+        .args(["--config-net", "--quiet", "-t", "none", "-u", "none"])
+        .arg("--userns")
+        .arg(format!("/proc/{pid}/ns/user"))
+        .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .status();
+    let _ = holder.kill();
+    let _ = holder.wait();
+    match attached {
+        Ok(s) if s.success() => None,
+        Ok(s) => Some(format!("pasta configured no namespace here ({s})")),
+        Err(e) => Some(format!("pasta is not installed (package `passt`): {e}")),
     }
-    has_bwrap && has_userns
 }
 
 /// Interpreter the fake `xdg-dbus-proxy` fixtures are written in; their
@@ -36,20 +186,7 @@ pub const PYTHON: &str = "/usr/bin/python3";
 pub fn require_python() -> bool {
     let ok = Path::new(PYTHON).is_file();
     if !ok {
-        eprintln!("skipping: {PYTHON} is not installed");
-    }
-    ok
-}
-
-/// Returns false (after printing why) when the real pasta sidecar cannot
-/// be started here, because the `passt` package is not installed.
-pub fn require_pasta() -> bool {
-    let ok = Command::new("pasta")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if !ok {
-        eprintln!("skipping: pasta is not installed (package `passt`)");
+        say(&format!("skipping: {PYTHON} is not installed"));
     }
     ok
 }
@@ -62,7 +199,7 @@ pub fn require_groff() -> bool {
         .output()
         .is_ok_and(|o| o.status.success());
     if !ok {
-        eprintln!("skipping: groff is not installed");
+        say("skipping: groff is not installed");
     }
     ok
 }
@@ -79,7 +216,7 @@ pub fn real_init() -> Option<PathBuf> {
     if path.is_file() {
         return Some(path);
     }
-    eprintln!("skipping: {} is not built", path.display());
+    say(&format!("skipping: {} is not built", path.display()));
     None
 }
 
@@ -233,7 +370,9 @@ pub fn require_system_bus() -> bool {
     let send = has_program("dbus-send");
     let bus = host_system_bus();
     if !proxy || !send || bus.is_none() {
-        eprintln!("skipping: xdg-dbus-proxy={proxy} dbus-send={send} system-bus={bus:?}");
+        say(&format!(
+            "skipping: xdg-dbus-proxy={proxy} dbus-send={send} system-bus={bus:?}"
+        ));
         return false;
     }
     true
@@ -264,7 +403,7 @@ pub fn require_portal() -> bool {
     }
     let desktop = bus_name_has_owner("org.freedesktop.portal.Desktop");
     if !desktop {
-        eprintln!("skipping: no org.freedesktop.portal.Desktop on the session bus");
+        say("skipping: no org.freedesktop.portal.Desktop on the session bus");
     }
     desktop
 }
@@ -277,7 +416,7 @@ pub fn require_tray() -> bool {
     }
     let watcher = bus_name_has_owner("org.kde.StatusNotifierWatcher");
     if !watcher {
-        eprintln!("skipping: no org.kde.StatusNotifierWatcher on the session bus");
+        say("skipping: no org.kde.StatusNotifierWatcher on the session bus");
     }
     watcher
 }
@@ -293,7 +432,9 @@ pub fn require_dbus() -> bool {
     let send = has_program("dbus-send");
     let bus = host_bus();
     if !proxy || !send || bus.is_none() {
-        eprintln!("skipping: xdg-dbus-proxy={proxy} dbus-send={send} bus={bus:?}");
+        say(&format!(
+            "skipping: xdg-dbus-proxy={proxy} dbus-send={send} bus={bus:?}"
+        ));
         return false;
     }
     true
