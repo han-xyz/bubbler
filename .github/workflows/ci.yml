@@ -1,0 +1,111 @@
+# GitHub Actions for https://github.com/han-xyz/bubbler.
+#
+# Every job builds its own container from `archlinux:latest`, since bubbler's
+# users are on Arch and its runtime dependencies are Arch package names.  Two
+# things that are easy to trip over:
+#   - `nodejs` is installed before the first `uses:` step so the file also runs
+#     on runners that do not inject Node into a job container.
+#   - Arch does not support partial upgrades, so package installs are always
+#     `pacman -Syu <pkg>` and never `pacman -Sy <pkg>`.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # The four checks the conventions ask for before every commit.
+  check:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    steps:
+      - name: system packages
+        run: |
+          pacman -Syu --noconfirm --needed \
+            nodejs git gcc pkgconf rustup \
+            libseccomp bubblewrap passt nftables python3
+      - name: rust stable
+        # rustup rather than the `rust` package: the same mechanism as the msrv
+        # job, and it is rustup that guarantees clippy and rustfmt are there.
+        run: |
+          rustup default stable
+          rustup component add clippy rustfmt
+          cargo --version
+      - uses: actions/checkout@v5
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+      # Tests that need a real sandbox probe for one at runtime and return
+      # early with a printed reason when they cannot have it, so a runner
+      # without usable user namespaces reports skips rather than failures.
+      # That holds only because those probes launch bwrap for real instead of
+      # looking at /proc/self/ns/user, which exists in every container
+      # (crates/bubbler/tests/common/mod.rs).  `sandbox-probe` below is what
+      # says which of the two a green run here was.
+      - run: cargo test --workspace --locked
+
+  # Advisories, licences, bans and sources against deny.toml.
+  deny:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    steps:
+      - name: system packages
+        run: pacman -Syu --noconfirm --needed nodejs git gcc pkgconf rustup
+      - run: rustup default stable
+      - uses: actions/checkout@v5
+      - name: cargo-deny
+        # The packaged binary when the repositories have one, otherwise build
+        # it, which costs a couple of minutes.
+        run: |
+          pacman -S --noconfirm --needed cargo-deny \
+            || cargo install --locked cargo-deny
+      - run: cargo deny --workspace check
+
+  # The floor declared as `rust-version` in Cargo.toml; kdl is what sets it.
+  msrv:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    steps:
+      - name: system packages
+        run: |
+          pacman -Syu --noconfirm --needed \
+            nodejs git gcc pkgconf rustup libseccomp
+      - run: rustup toolchain install 1.95 --profile minimal
+      - uses: actions/checkout@v5
+      - run: cargo +1.95 check --workspace --all-targets --locked
+
+  # Diagnostic only, and deliberately unable to turn the run red: it reports
+  # whether this runner can build a sandbox at all, which is what decides
+  # whether `check` ran the real-bwrap tests or skipped them.  A hosted runner
+  # is expected to fail the bwrap line -- Docker's default seccomp profile
+  # denies pivot_root, mount and umount2 -- and the real-sandbox coverage then
+  # has to come from a self-hosted runner.
+  sandbox-probe:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    steps:
+      - name: can this runner build a sandbox?
+        continue-on-error: true
+        run: |
+          pacman -Syu --noconfirm --needed bubblewrap passt libseccomp nftables
+          printf 'max_user_namespaces: '
+          cat /proc/sys/user/max_user_namespaces || echo unreadable
+          unshare -Urn true \
+            && echo "unshare -Urn: OK" || echo "unshare -Urn: FAIL"
+          bwrap --unshare-all --ro-bind / / -- /bin/true \
+            && echo "bwrap: OK" || echo "bwrap: FAIL"
+          pasta --version || echo "pasta: missing"
+          nft --version || echo "nft: missing"
+          exit 0
