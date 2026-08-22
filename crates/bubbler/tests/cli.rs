@@ -15,7 +15,7 @@ use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
     PYTHON, bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, bwrap_alive, kill_group, real_init,
     require_bwrap, require_dbus, require_groff, require_pasta, require_portal, require_python,
-    require_system_bus, require_tray, system_owns, test_pty,
+    require_system_bus, require_tray, say, system_owns, test_pty,
 };
 use rustix::fs::{OFlags, fcntl_getfl};
 use rustix::process::{Pid, Signal, kill_process};
@@ -1221,7 +1221,7 @@ fn real_bwrap_gamepad_shows_the_host_input_nodes_and_no_uinput() {
     }
     let Some(init) = real_init() else { return };
     if !Path::new("/dev/input").is_dir() {
-        eprintln!("skipping: this host has no /dev/input directory");
+        say("skipping: this host has no /dev/input directory");
         return;
     }
     let tmp = setup();
@@ -1295,12 +1295,12 @@ fn real_bwrap_gamepad_hidraw_shows_the_host_hidraw_nodes() {
     }
     let Some(init) = real_init() else { return };
     if !Path::new("/dev/input").is_dir() {
-        eprintln!("skipping: this host has no /dev/input directory");
+        say("skipping: this host has no /dev/input directory");
         return;
     }
     let host = host_hidraw_nodes();
     if host.is_empty() {
-        eprintln!("skipping: this host has no /dev/hidraw* nodes");
+        say("skipping: this host has no /dev/hidraw* nodes");
         return;
     }
     let tmp = setup();
@@ -1361,7 +1361,7 @@ fn real_bwrap_hidraw_binds_the_nodes_without_the_input_tree() {
     let Some(init) = real_init() else { return };
     let host = host_hidraw_nodes();
     if host.is_empty() {
-        eprintln!("skipping: this host has no /dev/hidraw* nodes");
+        say("skipping: this host has no /dev/hidraw* nodes");
         return;
     }
     let tmp = setup();
@@ -1513,7 +1513,7 @@ fn real_bwrap_alsa_configuration_reaches_the_sandbox() {
     }
     let Some(init) = real_init() else { return };
     if !Path::new("/etc/alsa").is_dir() {
-        eprintln!("skipping: this host has no /etc/alsa directory");
+        say("skipping: this host has no /etc/alsa directory");
         return;
     }
     let tmp = setup();
@@ -1582,7 +1582,7 @@ fn real_bwrap_gamepad_uinput_binds_the_node_and_says_so() {
     }
     let Some(init) = real_init() else { return };
     if !Path::new("/dev/input").is_dir() || !Path::new("/dev/uinput").exists() {
-        eprintln!("skipping: this host has no /dev/input directory or no /dev/uinput");
+        say("skipping: this host has no /dev/input directory or no /dev/uinput");
         return;
     }
     let tmp = setup();
@@ -1618,7 +1618,7 @@ fn real_bwrap_userns_disable_stops_a_nested_user_namespace() {
     }
     let Some(init) = real_init() else { return };
     if !Path::new("/usr/bin/unshare").is_file() {
-        eprintln!("skipping: this host has no /usr/bin/unshare");
+        say("skipping: this host has no /usr/bin/unshare");
         return;
     }
     let tmp = setup();
@@ -1627,7 +1627,12 @@ fn real_bwrap_userns_disable_stops_a_nested_user_namespace() {
         .status()
         .unwrap();
     let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
-    let probe = "/usr/bin/unshare -U /usr/bin/true 2>/dev/null && echo NESTED || echo REFUSED";
+    // The error is kept rather than discarded: `--disable-userns` works by
+    // setting the namespace limit to zero, so the refusal is ENOSPC, and
+    // that errno is what tells it apart from a host with no unprivileged
+    // user namespaces at all — which would fail the same command with
+    // EPERM and make this test pass for the wrong reason.
+    let probe = "/usr/bin/unshare -U /usr/bin/true 2>&1 && echo NESTED || echo REFUSED";
     let run = |text: &str| {
         std::fs::write(&cfg, text).unwrap();
         let out = bubbler_live(tmp.path(), &init)
@@ -1644,7 +1649,13 @@ fn real_bwrap_userns_disable_stops_a_nested_user_namespace() {
     // The default keeps bwrap's own semantics: a nested user namespace,
     // which Steam's pressure-vessel and a browser's inner sandbox need.
     assert_eq!(run(""), "NESTED\n");
-    assert_eq!(run("userns \"disable\"\n"), "REFUSED\n");
+    let refused = run("userns \"disable\"\n");
+    assert!(refused.ends_with("REFUSED\n"), "{refused}");
+    assert!(
+        refused.contains("No space left on device"),
+        "ENOSPC is what the namespace limit produces, not a host without \
+         unprivileged user namespaces: {refused}"
+    );
 }
 
 #[test]
@@ -1654,7 +1665,7 @@ fn real_bwrap_dri_hands_over_the_hosts_nvidia_stack() {
     }
     let Some(init) = real_init() else { return };
     if !Path::new("/dev/nvidiactl").exists() {
-        eprintln!("skipping: this host has no NVIDIA device nodes");
+        say("skipping: this host has no NVIDIA device nodes");
         return;
     }
     let tmp = setup();
@@ -2091,7 +2102,7 @@ fn real_dbus_hides_names_the_rules_do_not_grant() {
     }
     let Some(init) = real_init() else { return };
     if !host_owns("org.freedesktop.Notifications") {
-        eprintln!("skipping: the host session bus has no org.freedesktop.Notifications");
+        say("skipping: the host session bus has no org.freedesktop.Notifications");
         return;
     }
     let tmp = setup();
@@ -2163,7 +2174,7 @@ fn real_dbus_notify_reaches_the_notification_service() {
     }
     let Some(init) = real_init() else { return };
     if !host_owns("org.freedesktop.Notifications") {
-        eprintln!("skipping: the host session bus has no org.freedesktop.Notifications");
+        say("skipping: the host session bus has no org.freedesktop.Notifications");
         return;
     }
     let tmp = setup();
@@ -2310,7 +2321,7 @@ fn real_system_bus_answers_for_the_names_it_grants_and_no_others() {
     }
     let Some(init) = real_init() else { return };
     if !system_owns("org.freedesktop.UPower") {
-        eprintln!("skipping: the host system bus has no org.freedesktop.UPower");
+        say("skipping: the host system bus has no org.freedesktop.UPower");
         return;
     }
     let tmp = setup();
@@ -2344,7 +2355,7 @@ fn real_system_bus_answers_for_the_names_it_grants_and_no_others() {
     // A name the host bus does own and no rule grants: the proxy answers
     // for it instead of letting the call through.
     if !system_owns("org.freedesktop.login1") {
-        eprintln!("skipping the denial half: the host has no org.freedesktop.login1");
+        say("skipping the denial half: the host has no org.freedesktop.login1");
         return;
     }
     let out = bubbler_dbus(tmp.path(), &init)
@@ -4253,7 +4264,7 @@ fn real_bwrap_seccomp_leaves_threads_and_installed_programs_running() {
         "/usr/bin/chromium",
     ] {
         if !Path::new(program).is_file() {
-            eprintln!("skipping: {program} is not installed");
+            say(&format!("skipping: {program} is not installed"));
             continue;
         }
         let out = bubbler_live(tmp.path(), &init)
@@ -4325,14 +4336,14 @@ fn build_i386_probe(dir: &Path) -> Option<PathBuf> {
     match built {
         Ok(out) if out.status.success() => Some(binary),
         Ok(out) => {
-            eprintln!(
+            say(&format!(
                 "skipping: `gcc -m32 -static` failed: {}",
                 String::from_utf8_lossy(&out.stderr)
-            );
+            ));
             None
         }
         Err(e) => {
-            eprintln!("skipping: gcc is not usable here: {e}");
+            say(&format!("skipping: gcc is not usable here: {e}"));
             None
         }
     }
@@ -4341,7 +4352,7 @@ fn build_i386_probe(dir: &Path) -> Option<PathBuf> {
 #[test]
 fn real_bwrap_seccomp_filters_a_32_bit_binary_instead_of_killing_it() {
     if ARCHES != "x86_64 + i386" {
-        eprintln!("skipping: this filter carries no second architecture");
+        say("skipping: this filter carries no second architecture");
         return;
     }
     let Some((tmp, init)) = live_instance("secc32") else {
@@ -4920,7 +4931,7 @@ fn host_is_online() -> bool {
     let addr = "1.1.1.1:443".parse().unwrap();
     let ok = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(3)).is_ok();
     if !ok {
-        eprintln!("skipping: this host cannot reach 1.1.1.1:443");
+        say("skipping: this host cannot reach 1.1.1.1:443");
     }
     ok
 }
@@ -5995,7 +6006,7 @@ fn real_bwrap_open_execs_into_a_live_instance_and_starts_one_that_is_not() {
 #[test]
 fn an_entry_the_validator_rejects_is_written_and_reported() {
     if Command::new("desktop-file-validate").output().is_err() {
-        eprintln!("skipping: desktop-file-validate is not installed");
+        say("skipping: desktop-file-validate is not installed");
         return;
     }
     let tmp = setup();
@@ -6136,4 +6147,43 @@ fn ui_runs_the_editor_beside_it_before_the_one_on_the_path() {
         String::from_utf8_lossy(&out.stdout).trim(),
         "the editor beside it"
     );
+}
+
+/// The guarded test this one runs again in a child of itself. Any of the
+/// forty-odd would do; this is the smallest.
+const GUARDED: &str = "real_bwrap_runs_true_and_propagates_exit_code";
+
+/// A probe is only worth something if the host it says no on then *skips*
+/// the tests behind it — a green run that names what it did not cover —
+/// rather than failing them. There is no such host here, so one is made:
+/// this test binary is run again, on one test, with a `PATH` carrying a
+/// `bwrap` that exits 1 and then with one carrying no `bwrap` at all.
+///
+/// The child is run the way anyone runs the suite, with no `--nocapture`:
+/// the reason has to reach the terminal of an ordinary `cargo test` or
+/// the skip is silent, which is what [`common::say`] writing to
+/// descriptor 2 itself is for.
+#[test]
+fn a_host_without_a_working_bwrap_skips_the_guarded_tests_rather_than_failing_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let failing = tmp.path().join("failing");
+    let empty = tmp.path().join("empty");
+    std::fs::create_dir(&failing).unwrap();
+    std::fs::create_dir(&empty).unwrap();
+    let fake = failing.join("bwrap");
+    std::fs::write(&fake, "#!/usr/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    for path in [&failing, &empty] {
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", GUARDED, "--test-threads=1"])
+            .env("PATH", path)
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        let all = format!("{}{err}", String::from_utf8_lossy(&out.stdout));
+        assert!(out.status.success(), "{}: {all}", path.display());
+        assert!(err.contains("skipping: "), "{}: {all}", path.display());
+        assert!(all.contains("1 passed"), "{}: {all}", path.display());
+    }
 }

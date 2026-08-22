@@ -1755,6 +1755,34 @@ cookie files named by the environment must really be of that type, so a
 `WAYLAND_DISPLAY` or `XAUTHORITY` naming a directory is refused instead of
 binding the tree under it.
 
+## Threat model
+
+`docs/threat-model.md` is the long form: the assets, the attacker — one
+compromised application inside one sandbox, or a profile someone talked you
+into installing — the four trust boundaries, and what each mechanism above
+defends and what it does not, every claim against the section that describes
+it and the test that would fail if it changed.
+
+The short form: the boundary bubbler builds is between your account and the
+application. It is not a boundary against root, not one against your own
+processes outside a sandbox — anything running as your uid can read the
+instance store and connect to a live instance's control socket — and `x11` is
+not a boundary at all.
+
+bubbler itself is unprivileged and unconfined: it can do whatever your account
+can. `contrib/apparmor/usr.bin.bubbler` is an AppArmor profile that would narrow
+that to bubbler's own directories — for as long as bubbler stays inside it,
+which `bubbler edit` running your `$EDITOR` does not — offered as a courtesy to
+packagers on distributions that mediate user namespaces through AppArmor. **It has never been
+loaded.** The kernel here has AppArmor compiled in but left out of its LSM list,
+so the module never initialises, and `apparmor_parser` — which ships in the same
+`apparmor` package — is not installed here either, so that file has not even
+been syntax-checked, let alone exercised. It ships in complain mode, nothing in
+bubbler installs or reads it, and `allow userns create,` is the line to keep if
+you narrow it: without it every `bubbler run` on Ubuntu 23.10 and later fails at
+the uid map, because bwrap inherits the profile wherever the distribution loaded
+none of its own.
+
 ## Known gaps
 
 - No accessibility bus, no document-portal FUSE mount, so a portal that hands
@@ -1878,6 +1906,16 @@ Edition 2024 alone would need only 1.85; the floor is `kdl` 6, and writing it
 down buys one clear error on an older toolchain instead of a spray of syntax
 failures. It is a recent floor: bubbler does not build on Debian stable's
 rustc, and `kdl` is the single crate to reconsider if that ever matters.
+
+The suite starts real sandboxes wherever it can, and every test that needs one
+is guarded by a probe that does the thing it is a probe for: a user namespace
+that has to be created, a `bwrap --unshare-all --ro-bind / / --proc /proc --dev
+/dev` that has to build a sandbox, a pasta that has to attach to a namespace.
+A host that cannot sandbox — a container whose policy refuses the mounts, say —
+skips those tests, with the reason on stderr, instead of failing them, so the
+run stays green and says what it did not cover. Run it as `cargo test
+--workspace`: `cargo test -p bubbler` alone does not build `bubbler-init`, and
+the tests that need the real supervisor skip for that reason too.
 
 `cargo test` includes the property tests in
 `crates/bubbler-core/tests/proptest.rs`, which are three claims about generated

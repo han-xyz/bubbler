@@ -16,3 +16,7 @@ rustix.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# `thread` for `unshare(2)`: the probes prove a user namespace can be made
+# here by making one. `stdio` to write a skip reason to descriptor 2 past
+# libtest's capture. Neither is a feature the binary itself needs.
+rustix = { workspace = true, features = ["thread", "stdio"] }

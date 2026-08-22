@@ -1,0 +1,131 @@
+# AppArmor profile for bubbler — contrib, and never loaded by bubbler
+# itself. Install it as /etc/apparmor.d/usr.bin.bubbler if you want it.
+#
+# UNTESTED. It was written against apparmor.d(5) and the AppArmor page of
+# the Arch wiki on a machine whose kernel has CONFIG_SECURITY_APPARMOR=y
+# but whose CONFIG_LSM string leaves apparmor out, so the module never
+# initialises, and without the apparmor package there is no
+# apparmor_parser to syntax-check it with either. No line below has been
+# parsed, loaded or exercised. Treat it as a starting
+# point for a packager, not as a profile that is known to work.
+#
+# Needs AppArmor 4.0 or newer, for the `abi <abi/4.0>` below and for the
+# fine-grained `unix` rules; the `userns` rule is 4.0 as well.
+#
+# It is not a privilege boundary either way. bubbler is unprivileged and
+# is not setuid: it can only do what your account can already do, so this
+# profile buys blast radius and nothing more — a bubbler that has been
+# taken over cannot read ~/.ssh or write outside the directories below,
+# for as long as it stays inside this profile. `bubbler edit` execs your
+# $VISUAL/$EDITOR with `Pux`, which leaves that editor under its own
+# profile or unconfined, so an attacker who can choose what bubbler runs
+# there is out of this profile again. Narrow that rule or drop it if the
+# claim is to hold.
+#
+# Ships in complain mode on purpose: a mistake here is then a log line
+# rather than a sandbox that will not start. Enforce it with
+# `aa-enforce /etc/apparmor.d/usr.bin.bubbler` once your own logs are
+# quiet. Note that deny rules bite even in complain mode, which is why
+# there are none.
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+profile bubbler /usr/bin/bubbler flags=(complain,attach_disconnected,mediate_deleted) {
+  include <abstractions/base>
+  include <abstractions/nameservice>
+
+  # Mandatory rather than prudent. With the `Pix` transitions below, bwrap
+  # runs under *this* profile on every host that has no bwrap profile of
+  # its own, so bwrap's unshare(CLONE_NEWUSER) is checked against these
+  # rules. Leave this line out and every `bubbler run` on a kernel that
+  # mediates user namespaces through AppArmor (Ubuntu 23.10 and later)
+  # fails with `bwrap: setting up uid map: Permission denied`.
+  allow userns create,
+
+  # bwrap builds the sandbox under this profile wherever it inherits it,
+  # and AppArmor mediates the mount operations it does so with. Wide, and
+  # the reason to keep this profile in complain mode until a packager has
+  # narrowed it against real logs.
+  mount,
+  umount,
+  pivot_root,
+
+  # None of these are bubbler's: it has no libcap dependency and
+  # manipulates no capability anywhere. They are what bwrap and pasta hold
+  # *inside the user namespace they made*, and AppArmor mediates a
+  # capability wherever it is exercised — so with the `Pix` transitions
+  # below putting both under this profile, the profile is where they have
+  # to be granted. bwrap: the mounts and the pivot above, plus the uid and
+  # gid map it writes. pasta: configuring the sandbox's network namespace.
+  capability sys_admin sys_chroot setuid setgid net_admin,
+
+  /usr/bin/bubbler mr,
+  /usr/** r,
+  /etc/** r,
+
+  # Everything bubbler writes: profiles, instances and their private
+  # homes, the desktop entries and PATH shims it generates, and the
+  # per-run runtime state. `app/` is the app-runtime rendezvous and
+  # `.flatpak/` the identity directory a portals grant needs.
+  owner @{HOME}/.config/bubbler/{,**} rw,
+  owner @{HOME}/.local/share/bubbler/{,**} rwk,
+  owner @{HOME}/.local/share/applications/{,*.desktop} rw,
+  owner @{HOME}/.local/bin/{,*} rw,
+  owner @{run}/user/@{uid}/bubbler/{,**} rw,
+  owner @{run}/user/@{uid}/app/{,**} rw,
+  owner @{run}/user/@{uid}/.flatpak/{,**} rw,
+
+  # The host buses, which only the xdg-dbus-proxy sidecar ever reads
+  # through; bubbler opens them to check that they are sockets.
+  owner @{run}/user/@{uid}/bus rw,
+  /run/dbus/system_bus_socket rw,
+
+  # Cross-process /proc reads: the child pid bwrap reports, the reaper's
+  # children, and the namespaces pasta is pointed at.
+  @{PROC}/@{pid}/{comm,cmdline} r,
+  @{PROC}/@{pid}/task/@{pid}/children r,
+  @{PROC}/@{pid}/ns/{user,net} r,
+  @{PROC}/@{pid}/fd/ r,
+
+  # The likeliest thing to break once either side is confined: bubbler
+  # hands pasta paths of the form /proc/<bubbler-pid>/fd/N, so pasta must
+  # be allowed to read bubbler's own /proc entry. apparmor.d(5) requires
+  # *both* profiles to grant it, so a pasta profile needs the mirror of
+  # this pair or the isolated network stops working.
+  ptrace (read,readby) peer=bubbler,
+  ptrace (read,readby) peer=pasta,
+
+  signal (send) set=(term,kill,int,hup) peer=bubbler,
+  signal (send) set=(term,kill,int,hup) peer=pasta,
+  signal (send) set=(term,kill,int,hup) peer=unconfined,
+
+  # The control socket every instance is exec'd through, and the sidecar
+  # sockets around it.
+  unix (create,bind,listen,accept,connect,send,receive) type=stream,
+
+  # `Pix`, not `Px`: `Px` denies the exec outright when the named profile
+  # is not loaded, which would turn a distribution that ships no profile
+  # for these into a bubbler that cannot start a sandbox at all. `Pix`
+  # prefers a loaded profile — Ubuntu's `bwrap-userns-restrict` for bwrap
+  # — and falls back to inheriting this one.
+  /usr/bin/bwrap Pixr,
+  /usr/bin/{pasta,passt} Pixr,
+  /usr/bin/xdg-dbus-proxy Pixr,
+  /usr/{bin,sbin}/nft Pixr,
+  /usr/lib/bubbler/bubbler-init Pixr,
+  /usr/bin/bubbler-ui Pixr,
+  # The supervisor is exec'd by bwrap at the path it is bound to inside
+  # the sandbox, not at the host path above, and an inherited profile
+  # still mediates that exec.
+  /run/bubbler-init Pixr,
+
+  # $VISUAL / $EDITOR, which `bubbler edit` runs directly. Named one by
+  # one rather than as `/usr/bin/* Ux,`: a glob that also matched the
+  # programs above would give one path expression two exec modes, which
+  # the parser refuses. Add yours here or in the local include.
+  /usr/bin/{vi,vim,nvim,nano,emacs,emacsclient,helix,hx,micro,kak,ed} Pux,
+
+  include if exists <local/bubbler>
+}
