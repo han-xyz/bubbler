@@ -10,7 +10,9 @@ use std::str::FromStr;
 use kdl::{KdlDocument, KdlNode};
 
 pub use crate::error::ConfigError;
-pub use crate::network::{Forward, Mode as NetworkMode, NetworkConfig};
+pub use crate::network::{
+    AllowOut, Cidr, Forward, Mode as NetworkMode, NetworkConfig, Outbound, Proto,
+};
 pub use crate::seccomp::{Errno, SeccompConfig};
 pub use crate::tty::TtyMode;
 
@@ -1270,18 +1272,23 @@ fn validate_relative(node: &KdlNode, s: &str) -> Result<PathBuf, ConfigError> {
 }
 
 /// `network ["host"|"none"] { dns "<ip>"; allow-port <n> [udp=#true];
+/// outbound "deny"; allow-out "<ip>[/<len>]" [port=<n>] [proto="tcp"];
 /// no-ipv6 }`. The bare node is the sandbox's own network namespace,
 /// which is the default; the two spellings name the host's namespace and
 /// no namespace at all.
 ///
 /// `dns` says what the sandbox's resolver file holds, so it belongs to
 /// the two modes that have a network to carry a query; under `none` it
-/// is refused. The other two children configure the pasta sidecar, and
-/// only the isolated mode has one. None of the three is ignored where it
-/// cannot apply: that would leave a config granting less than it says.
+/// is refused. The other children configure the sandbox's own namespace
+/// — the pasta sidecar and the nftables ruleset in it — and only the
+/// isolated mode has one. None of them is ignored where it cannot apply:
+/// that would leave a config granting less than it says. `allow-out`
+/// without `outbound "deny"` is refused for the same reason from the
+/// other side: it would name rules nothing installs.
 fn parse_network(node: &KdlNode) -> Result<Service, ConfigError> {
     let mut cfg = NetworkConfig::default();
     let mut seen_mode = false;
+    let mut seen_outbound = false;
     for e in node.entries() {
         if let Some(p) = e.name() {
             return Err(ConfigError::UnknownProperty {
@@ -1342,6 +1349,20 @@ fn parse_network(node: &KdlNode) -> Result<Service, ConfigError> {
                 }
                 cfg.no_ipv6 = true;
             }
+            "outbound" => {
+                if seen_outbound {
+                    return Err(ConfigError::Duplicate("outbound".to_owned()));
+                }
+                seen_outbound = true;
+                cfg.outbound = Outbound::from_str(one_string_arg(child)?)?;
+            }
+            "allow-out" => {
+                let allowed = parse_allow_out(child)?;
+                if cfg.allow_out.contains(&allowed) {
+                    return Err(ConfigError::Duplicate(format!("allow-out {allowed}")));
+                }
+                cfg.allow_out.push(allowed);
+            }
             other => return Err(ConfigError::UnknownNode(other.to_owned())),
         }
     }
@@ -1367,8 +1388,86 @@ fn parse_network(node: &KdlNode) -> Result<Service, ConfigError> {
                  network namespace runs",
             ));
         }
+        if seen_outbound || !cfg.allow_out.is_empty() {
+            return Err(bad(
+                node,
+                "`outbound` filters the sandbox's own network namespace, which `host` \
+                 and `none` do not have; rules under `host` would land on the host's \
+                 own ruleset",
+            ));
+        }
+    }
+    if cfg.no_ipv6
+        && (cfg.dns.iter().any(IpAddr::is_ipv6) || cfg.allow_out.iter().any(|a| a.dest.is_ipv6()))
+    {
+        return Err(bad(
+            node,
+            "`no-ipv6` leaves the sandbox no IPv6 address, so an IPv6 `dns` or \
+             `allow-out` under it names something nothing in the sandbox could reach",
+        ));
+    }
+    if cfg.outbound != Outbound::Deny && !cfg.allow_out.is_empty() {
+        return Err(bad(
+            node,
+            "`allow-out` names destinations that are only a rule under \
+             `outbound \"deny\"`; without it nothing is filtered and nothing is \
+             installed",
+        ));
     }
     Ok(Service::Network(cfg))
+}
+
+/// `allow-out "<ip>[/<len>]" [port=<n>] [proto="tcp"|"udp"]`: one
+/// destination, every port and both protocols unless the properties
+/// narrow it.
+fn parse_allow_out(node: &KdlNode) -> Result<AllowOut, ConfigError> {
+    let mut dest: Option<Cidr> = None;
+    let mut port: Option<u16> = None;
+    let mut proto: Option<Proto> = None;
+    for e in node.entries() {
+        match e.name().map(|n| n.value()) {
+            None => {
+                if dest.is_some() {
+                    return Err(bad(node, "expects exactly one destination argument"));
+                }
+                let s = e
+                    .value()
+                    .as_string()
+                    .ok_or_else(|| bad(node, "destination must be a quoted address"))?;
+                dest = Some(Cidr::from_str(s)?);
+            }
+            Some("port") => {
+                if port.is_some() {
+                    return Err(ConfigError::Duplicate("allow-out port".to_owned()));
+                }
+                port = Some(
+                    e.value()
+                        .as_integer()
+                        .and_then(|n| u16::try_from(n).ok())
+                        .filter(|n| *n != 0)
+                        .ok_or_else(|| bad(node, "expects a port number from 1 to 65535"))?,
+                );
+            }
+            Some("proto") => {
+                if proto.is_some() {
+                    return Err(ConfigError::Duplicate("allow-out proto".to_owned()));
+                }
+                let s = e
+                    .value()
+                    .as_string()
+                    .ok_or_else(|| bad(node, "proto must be \"tcp\" or \"udp\""))?;
+                proto = Some(Proto::from_str(s)?);
+            }
+            Some(p) => {
+                return Err(ConfigError::UnknownProperty {
+                    node: node.name().value().to_owned(),
+                    prop: p.to_owned(),
+                });
+            }
+        }
+    }
+    let dest = dest.ok_or_else(|| bad(node, "expects exactly one destination argument"))?;
+    Ok(AllowOut { dest, port, proto })
 }
 
 /// `dns "<ip>"`. The value is not echoed back: it is arbitrary text and
@@ -1895,7 +1994,7 @@ mod tests {
     fn network_children_are_dns_allow_port_and_no_ipv6() {
         let cfg = parse(
             "network {\n    dns \"1.1.1.1\"\n    dns \"2606:4700:4700::1111\"\n    \
-             allow-port 8080\n    allow-port 5353 udp=#true\n    no-ipv6\n}",
+             allow-port 8080\n    allow-port 5353 udp=#true\n}",
         )
         .unwrap();
         let Some(Service::Network(net)) = cfg.services.first() else {
@@ -1921,7 +2020,42 @@ mod tests {
                 }
             ]
         );
+        assert!(!net.no_ipv6);
+        // Its own node: `no-ipv6` and the IPv6 resolver above cannot
+        // both hold, which the next test is about.
+        let cfg = parse("network {\n    no-ipv6\n}").unwrap();
+        let Some(Service::Network(net)) = cfg.services.first() else {
+            panic!("{:?}", cfg.services)
+        };
         assert!(net.no_ipv6);
+    }
+
+    /// `no-ipv6` is pasta's `-4`, which leaves the namespace no IPv6
+    /// address: a v6 resolver or destination under it names something
+    /// nothing in the sandbox could reach, so it is refused rather than
+    /// written into a ruleset nothing can match.
+    #[test]
+    fn no_ipv6_refuses_the_ipv6_addresses_it_would_make_unreachable() {
+        for text in [
+            "network {\n    dns \"2606:4700:4700::1111\"\n    no-ipv6\n}",
+            "network {\n    no-ipv6\n    outbound \"deny\"\n    \
+             allow-out \"2606:4700:4700::1111\"\n}",
+            "network {\n    no-ipv6\n    outbound \"deny\"\n    allow-out \"2606:4700::/32\"\n}",
+        ] {
+            assert!(
+                matches!(parse(text), Err(ConfigError::BadArgument { node, .. }) if node == "network"),
+                "{text}: {:?}",
+                parse(text)
+            );
+        }
+        // The v4 halves of the same nodes are what `no-ipv6` leaves.
+        assert!(
+            parse(
+                "network {\n    dns \"1.1.1.1\"\n    no-ipv6\n    outbound \"deny\"\n    \
+                 allow-out \"1.1.1.1\"\n}"
+            )
+            .is_ok()
+        );
     }
 
     /// The mode×child matrix: `dns` describes a file and is valid
@@ -1974,6 +2108,119 @@ mod tests {
         assert!(parse("network {\n    allow-port 65535\n}").is_ok());
     }
 
+    #[test]
+    fn outbound_deny_takes_allow_out_children_with_ports_and_protocols() {
+        let cfg = parse(
+            "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\"\n    \
+             allow-out \"140.82.112.0/20\" port=443 proto=\"tcp\"\n    \
+             allow-out \"2606:4700:4700::1111\" port=853\n    \
+             allow-out \"10.0.0.0/8\" proto=\"udp\"\n}",
+        )
+        .unwrap();
+        let Some(Service::Network(net)) = cfg.services.first() else {
+            panic!("{:?}", cfg.services)
+        };
+        assert_eq!(net.outbound, Outbound::Deny);
+        let cidr = |s: &str| Cidr::from_str(s).unwrap();
+        assert_eq!(
+            net.allow_out,
+            vec![
+                AllowOut {
+                    dest: cidr("1.1.1.1"),
+                    port: None,
+                    proto: None,
+                },
+                AllowOut {
+                    dest: cidr("140.82.112.0/20"),
+                    port: Some(443),
+                    proto: Some(Proto::Tcp),
+                },
+                AllowOut {
+                    dest: cidr("2606:4700:4700::1111"),
+                    port: Some(853),
+                    proto: None,
+                },
+                AllowOut {
+                    dest: cidr("10.0.0.0/8"),
+                    port: None,
+                    proto: Some(Proto::Udp),
+                },
+            ]
+        );
+        // The default, and the spelling that says so on purpose.
+        assert_eq!(
+            parse("network").unwrap().services.first(),
+            Some(&Service::Network(NetworkConfig::default()))
+        );
+        assert!(parse("network {\n    outbound \"allow\"\n}").is_ok());
+    }
+
+    /// A rule nothing installs is a config that grants less than it
+    /// says, so `allow-out` needs its switch; and there is no namespace
+    /// of bubbler's to filter outside the isolated mode, where rules
+    /// would land on the host's own ruleset.
+    #[test]
+    fn outbound_needs_the_isolated_mode_and_allow_out_needs_outbound_deny() {
+        let inert = "network {\n    allow-out \"1.1.1.1\"\n}";
+        assert!(
+            matches!(parse(inert), Err(ConfigError::BadArgument { node, .. }) if node == "network"),
+            "{:?}",
+            parse(inert)
+        );
+        let inert = "network {\n    outbound \"allow\"\n    allow-out \"1.1.1.1\"\n}";
+        assert!(parse(inert).is_err(), "{inert}");
+        for child in [
+            "outbound \"deny\"",
+            "outbound \"allow\"",
+            "allow-out \"1.1.1.1\"",
+        ] {
+            for mode in ["\"host\"", "\"none\""] {
+                let text = format!("network {mode} {{\n    {child}\n}}");
+                assert!(
+                    matches!(parse(&text), Err(ConfigError::BadArgument { node, .. }) if node == "network"),
+                    "{text}: {:?}",
+                    parse(&text)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn outbound_and_allow_out_arguments_are_checked() {
+        for bad in [
+            "network {\n    outbound\n}",
+            "network {\n    outbound \"drop\"\n}",
+            "network {\n    outbound \"deny\" \"allow\"\n}",
+            "network {\n    outbound #true\n}",
+            "network {\n    outbound \"deny\"\n    outbound \"deny\"\n}",
+            "network {\n    outbound \"deny\"\n    allow-out\n}",
+            "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\" \"9.9.9.9\"\n}",
+            "network {\n    outbound \"deny\"\n    allow-out 1\n}",
+            "network {\n    outbound \"deny\"\n    allow-out \"example.com\"\n}",
+            "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1/24\"\n}",
+            "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1/33\"\n}",
+            "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\" port=0\n}",
+            "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\" port=65536\n}",
+            "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\" port=\"443\"\n}",
+            "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\" proto=\"icmp\"\n}",
+            "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\" proto=#true\n}",
+            "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\" ports=443\n}",
+            "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\" { x }\n}",
+            "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\"\n    allow-out \"1.1.1.1\"\n}",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        // Narrowing the same address twice is two rules, not a duplicate.
+        assert!(
+            parse(
+                "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\" port=443\n    \
+                 allow-out \"1.1.1.1\" port=80\n}"
+            )
+            .is_ok()
+        );
+        assert!(parse("network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1/32\"\n}").is_ok());
+    }
+
     /// pasta refuses a loopback `--dns-forward`, and for the same reason
     /// a loopback resolver in an isolated namespace names the sandbox
     /// itself. Under `host` the loopback is the host's own and a stub
@@ -2006,6 +2253,23 @@ mod tests {
                 "allow-port 80",
             ),
             ("network {\n    no-ipv6\n    no-ipv6\n}", "no-ipv6"),
+            (
+                "network {\n    outbound \"deny\"\n    outbound \"deny\"\n}",
+                "outbound",
+            ),
+            // The whole child is named, not only its address: two rules
+            // differing in a port are two rules, so a message that left
+            // the port out would name something the file does not hold.
+            (
+                "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\" port=443 \
+                 proto=\"tcp\"\n    allow-out \"1.1.1.1\" port=443 proto=\"tcp\"\n}",
+                "allow-out \"1.1.1.1\" port=443 proto=\"tcp\"",
+            ),
+            (
+                "network {\n    outbound \"deny\"\n    allow-out \"2606:4700::/32\"\n    \
+                 allow-out \"2606:4700::/32\"\n}",
+                "allow-out \"2606:4700::/32\"",
+            ),
         ] {
             assert!(
                 matches!(parse(text), Err(ConfigError::Duplicate(ref n)) if n == name),
@@ -2015,6 +2279,13 @@ mod tests {
         }
         // One port over two protocols is two grants, not a repeat.
         assert!(parse("network {\n    allow-port 80\n    allow-port 80 udp=#true\n}").is_ok());
+        assert!(
+            parse(
+                "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\" port=443 \
+                 proto=\"tcp\"\n    allow-out \"1.1.1.1\" port=443 proto=\"udp\"\n}"
+            )
+            .is_ok()
+        );
     }
 
     #[test]

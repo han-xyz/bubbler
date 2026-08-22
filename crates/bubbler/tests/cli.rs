@@ -14,8 +14,8 @@ use bubbler_core::profile::NAMES;
 use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
     PYTHON, bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, bwrap_alive, kill_group, real_init,
-    require_bwrap, require_dbus, require_groff, require_pasta, require_portal, require_python,
-    require_system_bus, require_tray, say, system_owns, test_pty,
+    require_bwrap, require_dbus, require_groff, require_nft, require_pasta, require_portal,
+    require_python, require_system_bus, require_tray, say, system_owns, test_pty,
 };
 use rustix::fs::{OFlags, fcntl_getfl};
 use rustix::process::{Pid, Signal, kill_process};
@@ -4936,6 +4936,19 @@ fn host_is_online() -> bool {
     ok
 }
 
+/// Whether this host reaches the public internet over IPv6, which is
+/// what a positive IPv6 test through the sandbox needs: pasta copies the
+/// host's own configuration into the namespace, so a host with no global
+/// IPv6 address gives the sandbox none either.
+fn host_has_ipv6() -> bool {
+    let addr = "[2606:4700:4700::1111]:443".parse().unwrap();
+    let ok = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(3)).is_ok();
+    if !ok {
+        say("skipping the IPv6 half: this host has no route to 2606:4700:4700::1111");
+    }
+    ok
+}
+
 /// A python snippet run inside instance `name`, as its whole output.
 fn in_sandbox(root: &std::path::Path, init: &std::path::Path, name: &str, py: &str) -> String {
     let out = bubbler_live(root, init)
@@ -5196,6 +5209,344 @@ fn real_pasta_keeps_serving_an_instance_that_is_exec_ed_into() {
     );
     kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
     let _ = run.wait();
+}
+
+/// What a filtered sandbox is allowed to reach, and how everything else
+/// fails. Every rendering the generator has — a bare address, a port and
+/// protocol, a v4 prefix and a v6 literal — goes through the real `nft`
+/// here, so a form the golden pins but nftables would refuse fails this
+/// test rather than a user's run.
+#[test]
+fn outbound_deny_filters_what_no_allow_out_names_and_the_sandbox_cannot_undo_it() {
+    if !require_bwrap() || !require_python() || !require_pasta() || !require_nft() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/t/config.kdl"),
+        "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\" port=443 proto=\"tcp\"\n    \
+         allow-out \"192.168.0.0/16\" proto=\"udp\"\n    \
+         allow-out \"2606:4700:4700::1111\" port=443 proto=\"tcp\"\n    \
+         allow-out \"2606:4700::/32\" port=853\n}\n",
+    )
+    .unwrap();
+    let out = in_sandbox(tmp.path(), &init, "t", OUTBOUND_PROBE);
+    let line = |name: &str| {
+        out.lines()
+            .find_map(|l| l.strip_prefix(name))
+            .unwrap_or_else(|| panic!("{name} missing from {out}"))
+            .trim()
+            .to_owned()
+    };
+    // A blocked destination fails immediately and by name, not by
+    // timeout: the trailing `reject` is what turns a hang into an error
+    // the application can print. Measured on this host: EHOSTUNREACH for
+    // TCP (nft translates `icmpx admin-prohibited` to ICMP
+    // host-prohibited) and EPERM straight out of `sendto` for UDP.
+    for probe in ["tcp-blocked-port:", "tcp-blocked-host:"] {
+        let got = line(probe);
+        assert!(!got.starts_with("CONNECTED"), "{probe} {got}");
+        assert!(!got.starts_with("TIMEOUT"), "{probe} {got}");
+        let secs: f64 = got.rsplit(' ').next().unwrap().parse().unwrap();
+        assert!(secs < 1.0, "{probe} took {secs}s; a reject is immediate");
+    }
+    assert!(line("udp-blocked:").starts_with("EPERM"), "{out}");
+    // IPv6 is rejected too, and by the same rule: the table is `inet`, so
+    // a v6 destination no `allow-out` names falls to the same reject. It
+    // arrives as EACCES rather than EHOSTUNREACH, and about a second
+    // late: the ICMPv6 error is matched to the socket only after the
+    // first SYN retransmit. Measured at 1.02-1.05 s over ten runs, so the
+    // bound here is what separates it from a silent drop's timeout.
+    let blocked6 = line("tcp6-blocked:");
+    assert!(blocked6.starts_with("EACCES"), "{out}");
+    let secs: f64 = blocked6.rsplit(' ').next().unwrap().parse().unwrap();
+    assert!(
+        secs < 3.0,
+        "blocked IPv6 took {secs}s; a reject is not a timeout"
+    );
+    // The rules live in the user namespace that owns the sandbox's
+    // network namespace, and the sandbox is in a nested one: it cannot
+    // even read them, let alone flush them.
+    assert!(
+        line("nft-list:").contains("Operation not permitted"),
+        "{out}"
+    );
+    assert!(
+        line("nft-flush:").contains("Operation not permitted"),
+        "{out}"
+    );
+    if !host_is_online() {
+        return;
+    }
+    assert!(line("tcp-allowed:").starts_with("CONNECTED"), "{out}");
+    // The IPv6 half only where the host has IPv6 at all: pasta copies the
+    // host's configuration into the namespace, so a host without a global
+    // address gives the sandbox none and neither answer would be about
+    // the filter. What the ruleset has to get right for this to work at
+    // all is the neighbour discovery accept — without it the sandbox
+    // never resolves its own gateway and every v6 destination fails with
+    // EHOSTUNREACH after three seconds, `allow-out` or not.
+    if host_has_ipv6() {
+        assert!(line("tcp6-allowed:").starts_with("CONNECTED"), "{out}");
+    }
+    // The resolver is opened by the generator, never by the user: an
+    // `outbound "deny"` that broke name resolution would look like a
+    // network outage rather than a policy.
+    assert!(line("dns:").starts_with("ANSWERED"), "{out}");
+}
+
+/// The probe [`outbound_deny_filters_what_no_allow_out_names_and_the_sandbox_cannot_undo_it`]
+/// runs inside the sandbox: one line per destination, each ending in the
+/// seconds it took.
+const OUTBOUND_PROBE: &str = "\
+import socket, time, errno, subprocess
+
+def tcp(host, port):
+    t0 = time.monotonic()
+    s = socket.socket(); s.settimeout(4)
+    try:
+        s.connect((host, port)); return 'CONNECTED'
+    except socket.timeout: return 'TIMEOUT'
+    except OSError as e: return errno.errorcode.get(e.errno, e.errno)
+    finally:
+        s.close()
+        globals()['took'] = time.monotonic() - t0
+
+def tcp6(host, port):
+    t0 = time.monotonic()
+    s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM); s.settimeout(6)
+    try:
+        s.connect((host, port)); return 'CONNECTED'
+    except socket.timeout: return 'TIMEOUT'
+    except OSError as e: return errno.errorcode.get(e.errno, e.errno)
+    finally:
+        s.close()
+        globals()['took'] = time.monotonic() - t0
+
+def dns(server):
+    q = b'\\xab\\xcd\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00'
+    for lab in b'example.com'.split(b'.'):
+        q += bytes([len(lab)]) + lab
+    q += b'\\x00\\x00\\x01\\x00\\x01'
+    t0 = time.monotonic()
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(4)
+    try:
+        s.sendto(q, (server, 53)); s.recvfrom(512); return 'ANSWERED'
+    except socket.timeout: return 'TIMEOUT'
+    except OSError as e: return errno.errorcode.get(e.errno, e.errno)
+    finally:
+        s.close()
+        globals()['took'] = time.monotonic() - t0
+
+def say(name, what):
+    print('%s %s %.3f' % (name, what, took), flush=True)
+
+say('tcp-allowed:', tcp('1.1.1.1', 443))
+say('tcp-blocked-port:', tcp('1.1.1.1', 80))
+say('tcp-blocked-host:', tcp('8.8.8.8', 443))
+say('tcp6-allowed:', tcp6('2606:4700:4700::1111', 443))
+say('tcp6-blocked:', tcp6('2001:4860:4860::8888', 443))
+say('dns:', dns('169.254.1.1'))
+say('udp-blocked:', dns('8.8.8.8'))
+for name, argv in [('nft-list:', ['list', 'ruleset']), ('nft-flush:', ['flush', 'ruleset'])]:
+    done = subprocess.run(['nft'] + argv, capture_output=True, text=True)
+    print(name, done.stderr.replace('\\n', ' ').strip(), flush=True)
+";
+
+/// What the process holding CAP_NET_ADMIN over the sandbox's namespaces
+/// is allowed to do, and what it is fed.
+///
+/// A stand-in `nft` on `PATH` writes its own `/proc/self/status` and the
+/// ruleset it was given, so both halves of the hand-off are checked
+/// without needing nftables installed. The capability set is the point:
+/// bwrap's own nested user namespace maps bubbler to uid 0, and a uid-0
+/// exec is handed the full set unless `SECBIT_NOROOT` says otherwise.
+#[test]
+fn the_nft_child_holds_cap_net_admin_and_is_fed_the_ruleset() {
+    if !require_bwrap() || !require_python() || !require_pasta() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let path = tmp.path().join("fakenft");
+    std::fs::create_dir_all(&path).unwrap();
+    for bin in ["bwrap", "pasta"] {
+        std::os::unix::fs::symlink(format!("/usr/bin/{bin}"), path.join(bin)).unwrap();
+    }
+    let status = tmp.path().join("nft.status");
+    let stdin = tmp.path().join("nft.stdin");
+    std::fs::write(
+        path.join("nft"),
+        format!(
+            "#!{PYTHON}\n\
+             import sys\n\
+             open({stdin:?}, 'wb').write(sys.stdin.buffer.read())\n\
+             open({status:?}, 'w').write(open('/proc/self/status').read())\n",
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        path.join("nft"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/t/config.kdl"),
+        "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\" port=443 proto=\"tcp\"\n}\n",
+    )
+    .unwrap();
+    let out = bubbler_live(tmp.path(), &init)
+        .env("PATH", &path)
+        .args(["run", "t", "--", "/usr/bin/true"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let fed = std::fs::read_to_string(&stdin).unwrap();
+    assert!(fed.starts_with("table inet bubbler {\n"), "{fed}");
+    assert!(
+        fed.contains("\n\t\ticmpv6 type { nd-router-solicit"),
+        "{fed}"
+    );
+    assert!(
+        fed.contains("\n\t\tip daddr 1.1.1.1 tcp dport 443 accept\n"),
+        "{fed}"
+    );
+    let status = std::fs::read_to_string(&status).unwrap();
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .unwrap_or_else(|| panic!("{name} missing from {status}"))
+            .trim()
+            .to_owned()
+    };
+    // CAP_NET_ADMIN is bit 12, and it is the only bit set: not the full
+    // set a uid-0 exec would otherwise be given, and not an empty one,
+    // which is what an exec without the ambient set would have.
+    const ONLY_NET_ADMIN: &str = "0000000000001000";
+    assert_eq!(field("CapEff:"), ONLY_NET_ADMIN, "{status}");
+    assert_eq!(field("CapPrm:"), ONLY_NET_ADMIN, "{status}");
+    assert_eq!(field("CapAmb:"), ONLY_NET_ADMIN, "{status}");
+}
+
+/// `nftables` is an optional dependency: only a config that filters needs
+/// it, and a host without it is told which package to install rather than
+/// given a sandbox with the unfiltered network it did not ask for.
+#[test]
+fn outbound_deny_without_nft_on_path_names_the_package_and_starts_nothing() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    // A PATH holding what a run needs and nothing else; `nft` is what it
+    // is missing.
+    let path = tmp.path().join("nonft");
+    std::fs::create_dir_all(&path).unwrap();
+    std::os::unix::fs::symlink("/usr/bin/bwrap", path.join("bwrap")).unwrap();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/t/config.kdl"),
+        "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\"\n}\n",
+    )
+    .unwrap();
+    let out = bubbler_live(tmp.path(), &init)
+        .env("PATH", &path)
+        .args(["run", "t", "--", "/usr/bin/true"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("nftables"), "{err}");
+    assert!(err.contains("`nft` is not on PATH"), "{err}");
+}
+
+/// The ruleset is a grant that is neither a bwrap argument nor a D-Bus
+/// rule, so `--explain` is the only place a reader can see what a run
+/// will actually enforce.
+#[test]
+fn explain_lists_the_outbound_ruleset_under_the_network_node() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/t/config.kdl"),
+        "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\" port=443 proto=\"tcp\"\n}\n\
+         command \"true\"\n",
+    )
+    .unwrap();
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--explain"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(s.contains("\n    ruleset: table inet bubbler {\n"), "{s}");
+    for line in [
+        "type filter hook output priority 0; policy drop;",
+        "oifname \"lo\" accept",
+        "ip daddr 169.254.1.1 udp dport 53 accept",
+        "ip daddr 1.1.1.1 tcp dport 443 accept",
+        "reject with icmpx admin-prohibited",
+    ] {
+        assert!(s.contains(line), "{line} missing from {s}");
+    }
+    // Nothing to install, nothing to show.
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/t/config.kdl"),
+        "network\ncommand \"true\"\n",
+    )
+    .unwrap();
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--explain"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("sidecar: pasta"), "{s}");
+    assert!(!s.contains("ruleset:"), "{s}");
+}
+
+/// Under `network "host"` there is no namespace of bubbler's to filter
+/// and the rules would land on the host's own ruleset, so the parser
+/// refuses the node rather than the launcher discovering it later.
+#[test]
+fn outbound_under_the_host_mode_is_a_config_error() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    for text in [
+        "network \"host\" {\n    outbound \"deny\"\n}\ncommand \"true\"\n",
+        "network \"none\" {\n    outbound \"deny\"\n}\ncommand \"true\"\n",
+        "network {\n    allow-out \"1.1.1.1\"\n}\ncommand \"true\"\n",
+    ] {
+        std::fs::write(&cfg, text).unwrap();
+        let out = bubbler(tmp.path())
+            .args(["run", "t", "--dry-run"])
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{text}: {err}");
+        assert!(err.contains("network"), "{text}: {err}");
+    }
 }
 
 #[test]

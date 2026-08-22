@@ -266,7 +266,12 @@ fn operation(item: &Explained) -> String {
 /// under a lead-in naming what it is: it is the whole grant of a node
 /// that contributes no argument, and easy to miss under one that does.
 fn listed(empty: bool, items: Vec<String>) -> Vec<String> {
-    let lead = if empty { "rule-only: " } else { "rules: " };
+    under(if empty { "rule-only: " } else { "rules: " }, items)
+}
+
+/// `items` under a lead-in, the first line carrying it and the rest
+/// aligned beneath.
+fn under(lead: &str, items: Vec<String>) -> Vec<String> {
     let mut out = Vec::new();
     for item in items {
         let prefix = match out.is_empty() {
@@ -276,6 +281,20 @@ fn listed(empty: bool, items: Vec<String>) -> Vec<String> {
         out.push(format!("    {prefix}{item}"));
     }
     out
+}
+
+/// The outbound ruleset, exactly as `nft -f -` is fed it. A grant that
+/// is neither a bwrap argument nor a D-Bus rule, so nothing else in this
+/// view would show it; the nesting is kept, with each tab widened to
+/// four columns so a terminal shows what the file holds.
+fn ruleset_lines(cfg: &NetworkConfig) -> Vec<String> {
+    let Some(text) = network::ruleset(cfg) else {
+        return Vec::new();
+    };
+    under(
+        "ruleset: ",
+        text.lines().map(|l| l.replace('\t', "    ")).collect(),
+    )
 }
 
 /// The pasta argv an isolated `network` node is served by. The two
@@ -380,6 +399,7 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
                     // connects the namespace is the process below.
                     Some(Service::Network(cfg)) if cfg.is_isolated() => {
                         out.push(sidecar_line(cfg));
+                        out.extend(ruleset_lines(cfg));
                     }
                     _ => {}
                 },

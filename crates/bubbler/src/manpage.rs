@@ -264,6 +264,11 @@ const CHECK_LINES: &[(&str, &str)] = &[
          stack, loopback services and abstract sockets included.",
     ),
     (
+        "outbound-deny",
+        "`outbound \"deny\"` filters the sandbox's own network namespace by address: a \
+         name that resolves to an address no `allow-out` covers is refused.",
+    ),
+    (
         "own-on-system-bus",
         "An `own` rule on the system bus, where the bus sees the proxy's credentials, so \
          the name would be owned as you.",

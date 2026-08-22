@@ -81,9 +81,13 @@ pub static GRANTS: &[Grant] = &[
                `network \"host\"` gives it the host's namespace instead: loopback services, \
                abstract unix sockets, which have no permission checks at all, and the \
                host's interfaces, addresses and VPN tunnels. `allow-port` opens a path \
-               from the host's loopback back into the sandbox.",
+               from the host's loopback back into the sandbox. `outbound \"deny\"` narrows \
+               the isolated namespace to the addresses `allow-out` names, by address and \
+               never by name.",
         risk: Risk::Wide,
-        grammar: "network [\"host\"|\"none\"] { dns \"<ip>\"; allow-port <n> [udp=#true]; no-ipv6 }",
+        grammar: "network [\"host\"|\"none\"] { dns \"<ip>\"; allow-port <n> [udp=#true]; \
+                  outbound \"deny\"; allow-out \"<ip>[/<len>]\" [port=<n>] \
+                  [proto=\"tcp\"|\"udp\"]; no-ipv6 }",
     },
     Grant {
         node: "dri",

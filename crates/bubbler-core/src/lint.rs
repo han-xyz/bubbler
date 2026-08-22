@@ -114,6 +114,13 @@ const NETWORK_HOST: Check = Check {
     id: "network-host",
     severity: Severity::Note,
 };
+// Information, not a warning: the filter is what the config asked for,
+// and what it cannot do is a property of address filtering rather than a
+// mistake in the file.
+const OUTBOUND_DENY: Check = Check {
+    id: "outbound-deny",
+    severity: Severity::Note,
+};
 const OWN_ON_SYSTEM_BUS: Check = Check {
     id: "own-on-system-bus",
     severity: Severity::Error,
@@ -193,6 +200,7 @@ pub const CHECKS: &[Check] = &[
     LINT_ALLOW_UNUSED,
     MPRIS_WILDCARD,
     NETWORK_HOST,
+    OUTBOUND_DENY,
     OWN_ON_SYSTEM_BUS,
     OWN_TOO_WIDE,
     OZONE_HINT_UNNECESSARY,
@@ -853,6 +861,22 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                 "drop the argument for the sandbox's own network namespace, unless the app \
                  needs the LAN or a service on the host's loopback",
             ),
+            "network"
+                if kids(node).any(|c| c.name().value() == "outbound" && arg(c) == Some("deny")) =>
+            {
+                f.push(
+                    i,
+                    node,
+                    &OUTBOUND_DENY,
+                    "`outbound \"deny\"` filters by address: the sandbox reaches its \
+                     resolver, its own loopback and the `allow-out` destinations, and \
+                     nothing else"
+                        .to_owned(),
+                    "an address policy, not a name one — a host that answers with a \
+                     different address, as a CDN does, is refused by the sandbox's own \
+                     firewall rather than by the peer",
+                );
+            }
             "seccomp" if kids(node).any(|c| c.name().value() == "disable") => f.push(
                 i,
                 node,
@@ -1480,6 +1504,27 @@ mod tests {
     fn host() -> FakeHost {
         let (file, _, _) = fake::types();
         FakeHost::default().with("/usr/bin/foot", file)
+    }
+
+    /// The filter is a note, not a warning: it is what the config asked
+    /// for, and what it says is what address filtering cannot do.
+    #[test]
+    fn outbound_deny_is_a_note_naming_what_an_address_policy_misses() {
+        with(&host(), |ctx| {
+            let report = lint(
+                ctx,
+                &["network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\" port=443\n}"],
+            );
+            assert_eq!(ids(&report), ["outbound-deny"]);
+            assert_eq!(report.findings[0].severity, Severity::Note);
+            assert!(
+                report.findings[0].help.contains("address policy"),
+                "{report:?}"
+            );
+            for clean in ["network", "network {\n    outbound \"allow\"\n}"] {
+                assert_eq!(ids(&lint(ctx, &[clean])), [] as [&str; 0], "{clean}");
+            }
+        });
     }
 
     /// Only the host namespace is a finding: the isolated default is

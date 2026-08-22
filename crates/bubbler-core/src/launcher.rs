@@ -7,7 +7,7 @@ use std::ffi::{OsString, c_void};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -15,10 +15,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rustix::event::{Nsecs, PollFd, PollFlags, Secs, Timespec, poll};
-use rustix::fs::{AtFlags, MemfdFlags, Mode, OFlags};
+use rustix::fs::{Access, AtFlags, MemfdFlags, Mode, OFlags};
 use rustix::io::{Errno, FdFlags, fcntl_dupfd_cloexec, fcntl_setfd};
 use rustix::ioctl::{self, Opcode};
 use rustix::process::{Pid, Signal, kill_process, test_kill_process};
+use rustix::thread::{
+    CapabilitiesSecureBits, CapabilitySet, LinkNameSpaceType, capabilities,
+    configure_capability_in_ambient_set, move_into_link_name_space, set_capabilities,
+    set_capabilities_secure_bits,
+};
 use signal_hook::SigId;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 
@@ -51,6 +56,10 @@ const PASTA_READY: Duration = Duration::from_secs(5);
 
 /// How long pasta may take to leave after SIGTERM before it is killed.
 const PASTA_STOP: Duration = Duration::from_secs(1);
+
+/// How long `nft` has to install the outbound ruleset. Measured at 1.5 ms
+/// on this host, so this is a bound on a hang and not on the work.
+const NFT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long the supervisor has to appear inside the sandbox before the
 /// run goes on without a pid to signal.
@@ -708,12 +717,19 @@ impl Drop for PastaHandle {
     }
 }
 
-/// Whether two `/proc/<pid>/ns/<type>` links name the same namespace.
-/// The link is compared, not the path: `ns/net` reads as `net:[<inode>]`
-/// and the inode is the namespace's identity (`namespaces(7)`).
-fn same_namespace(a: &Path, b: &Path) -> Result<bool, LaunchError> {
-    let read = |p: &Path| std::fs::read_link(p).map_err(|e| LaunchError::Io(p.to_path_buf(), e));
-    Ok(read(a)? == read(b)?)
+/// Whether the namespace `held` names is the one at `path`.
+///
+/// Compared by the identity of the nsfs file — device and inode — which
+/// is what `namespaces(7)` gives as the test for two processes being in
+/// the same namespace. Asked of the descriptor the run already holds
+/// rather than of `/proc/<pid>/ns/net` a second time: resolving that path
+/// again can land on a namespace the descriptor never named, which is the
+/// pid reuse this check exists to catch.
+fn same_namespace(held: BorrowedFd<'_>, path: &Path) -> Result<bool, LaunchError> {
+    let theirs =
+        rustix::fs::stat(path).map_err(|e| LaunchError::Io(path.to_path_buf(), e.into()))?;
+    let ours = rustix::fs::fstat(held).map_err(|e| LaunchError::Data(e.into()))?;
+    Ok((ours.st_dev, ours.st_ino) == (theirs.st_dev, theirs.st_ino))
 }
 
 /// `NS_GET_USERNS` as `linux/nsfs.h` defines it, `_IO(0xb7, 0x1)`: it
@@ -769,6 +785,184 @@ fn owning_userns(netns: BorrowedFd<'_>) -> rustix::io::Result<OwnedFd> {
     unsafe { ioctl::ioctl(netns, NsGetUserns) }
 }
 
+/// The sandbox's network namespace, and the user namespace that owns it.
+/// Both are needed twice — once to install the outbound ruleset, once to
+/// hand pasta the namespace it configures — and both must stay open
+/// across those spawns, so they are opened once and passed around.
+struct SandboxNs {
+    /// `/proc/<child-pid>/ns/net`, held open so the pid cannot be reused
+    /// out from under the two spawns that follow.
+    net: OwnedFd,
+    /// The user namespace that owns [`SandboxNs::net`], which is where a
+    /// process holds the capabilities to configure it.
+    user: OwnedFd,
+}
+
+/// Open the sandbox's network namespace and the user namespace that owns
+/// it, refusing a pid that is no longer a sandbox of bubbler's.
+///
+/// The pid comes from bwrap's info document, and a sandbox that died in
+/// the meantime leaves it to be handed out again: `nft` and pasta both
+/// act on the network namespace of whatever holds the pid *now*, so a
+/// pid that is not in a namespace of its own is not the sandbox, and
+/// acting on it would mean acting on the host's own network.
+fn sandbox_namespaces(child_pid: i32) -> Result<SandboxNs, LaunchError> {
+    let net_path = PathBuf::from(format!("/proc/{child_pid}/ns/net"));
+    let net = rustix::fs::open(&net_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+        .map_err(|e| LaunchError::Io(net_path.clone(), e.into()))?;
+    if same_namespace(net.as_fd(), Path::new("/proc/self/ns/net"))? {
+        return Err(LaunchError::Network(
+            "sandbox pid reused; refusing to configure the host network namespace".to_owned(),
+        ));
+    }
+    let user = owning_userns(net.as_fd()).map_err(|e| LaunchError::Io(net_path, e.into()))?;
+    Ok(SandboxNs { net, user })
+}
+
+/// Install the `outbound "deny"` ruleset in the sandbox's own network
+/// namespace, or do nothing where the config filters nothing.
+///
+/// Runs before pasta and before the sandbox is let go of its
+/// `--block-fd`, so the namespace has a policy before it has a route and
+/// the application has not run an instruction either way. A failure here
+/// stops the run: a sandbox that asked to be filtered and was not would
+/// be a sandbox with a wider network than its config says.
+///
+/// `nft` is spawned rather than linked: the alternatives pull in either
+/// `libnftnl` or `bindgen` for a text format that is stable and one
+/// process away. It is handed the ruleset on stdin, and the ruleset is
+/// built from typed values in [`network::ruleset`] — a user string
+/// reaching this argv would be command injection into a process holding
+/// `CAP_NET_ADMIN` over the sandbox's namespaces.
+fn install_rules(cfg: &NetworkConfig, ns: &SandboxNs) -> Result<(), LaunchError> {
+    let Some(text) = network::ruleset(cfg) else {
+        return Ok(());
+    };
+    let (user, net) = (ns.user.as_raw_fd(), ns.net.as_raw_fd());
+    let mut cmd = Command::new(network::NFT_BIN);
+    cmd.arg("-f")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        // `nft`'s own diagnostics go where bubbler's do, never to the
+        // caller's stdout: that is the argv audit trail.
+        .stderr(Stdio::inherit());
+    // SAFETY: the closure runs in the forked child between `fork` and
+    // `execve`, where only async-signal-safe calls are allowed. Every
+    // call in it is one syscall through rustix and allocates nothing:
+    // `setns` twice, `capget`/`capset`, and `prctl` twice. The two
+    // descriptors are valid there because `fork` copies the descriptor
+    // table and the parent holds `ns` open across the spawn, so
+    // `borrow_raw` borrows descriptors nothing has closed.
+    //
+    // What the exec'd `nft` ends up holding, and why each step is
+    // needed. The user namespace is entered first: entering the network
+    // namespace takes the capabilities the user namespace grants
+    // (`setns(2)`). Capabilities do not survive `execve`, so
+    // CAP_NET_ADMIN goes into the inheritable and then the ambient set,
+    // which is what carries it across (`capabilities(7)`); without it
+    // the exec would depend on what the owning user namespace happens to
+    // map this uid to. `SECBIT_NOROOT` then stops the kernel from
+    // handing a uid-0 exec the full set on top of that — bwrap's own
+    // nested user namespace maps bubbler to 0 — and `_LOCKED` keeps the
+    // child from undoing it. `nft` therefore runs with CAP_NET_ADMIN in
+    // the sandbox's user namespace and no other capability anywhere.
+    unsafe {
+        cmd.pre_exec(move || {
+            let user = BorrowedFd::borrow_raw(user);
+            let net = BorrowedFd::borrow_raw(net);
+            move_into_link_name_space(user, Some(LinkNameSpaceType::User))?;
+            move_into_link_name_space(net, Some(LinkNameSpaceType::Network))?;
+            let mut caps = capabilities(None)?;
+            caps.inheritable |= CapabilitySet::NET_ADMIN;
+            set_capabilities(None, caps)?;
+            configure_capability_in_ambient_set(CapabilitySet::NET_ADMIN, true)?;
+            set_capabilities_secure_bits(
+                CapabilitiesSecureBits::NO_ROOT | CapabilitiesSecureBits::NO_ROOT_LOCKED,
+            )?;
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().map_err(|e| match e.kind() {
+        // Only a `nft` that is really missing gets the message naming the
+        // package. A `pre_exec` closure that failed comes back as a spawn
+        // failure too, and telling somebody to install what they already
+        // have would cost them the actual reason.
+        io::ErrorKind::NotFound if on_path(network::NFT_BIN).is_none() => LaunchError::BadValue {
+            service: "network",
+            reason: format!(
+                "`{}` is not on PATH; install the `nftables` package, or drop \
+                 `outbound \"deny\"` to leave the sandbox network unfiltered",
+                network::NFT_BIN
+            ),
+        },
+        _ => LaunchError::Network(format!("starting `{}`: {e}", network::NFT_BIN)),
+    })?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .expect("stdin is piped, so the child always has one");
+    let written = stdin.write_all(text.as_bytes());
+    // Closed before the wait, or `nft` would sit on a read that never
+    // ends and the wait below would spend its whole deadline. The write
+    // itself is not on a deadline: it is bounded by the pipe buffer, and
+    // a ruleset larger than that with an `nft` that reads none of it
+    // leaves bubbler waiting — with the sandbox still held at its
+    // `--block-fd`, so a hang here is a run that never starts rather than
+    // one that starts unfiltered.
+    drop(stdin);
+    let deadline = Instant::now() + NFT_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Err(e) => return Err(LaunchError::Network(format!("waiting for `nft`: {e}"))),
+            Ok(None) => {}
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(POLL);
+    };
+    // A sidecar holding CAP_NET_ADMIN over the sandbox's namespaces is
+    // not left running because it stopped answering.
+    let Some(status) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(LaunchError::Network(format!(
+            "`{}` did not install the outbound ruleset within {} seconds",
+            network::NFT_BIN,
+            NFT_TIMEOUT.as_secs()
+        )));
+    };
+    if !status.success() {
+        return Err(LaunchError::Network(format!(
+            "`{}` refused the outbound ruleset ({status})",
+            network::NFT_BIN
+        )));
+    }
+    written.map_err(|e| LaunchError::Network(format!("writing the outbound ruleset: {e}")))?;
+    Ok(())
+}
+
+/// Where `bin` is found on `$PATH`, if anywhere.
+///
+/// Only ever asked on the way to an error message, which is why the
+/// library reads the environment here at all: a failed spawn has to be
+/// able to tell a package that is not installed from a failure of
+/// bubbler's own, and the two arrive as the same `NotFound`.
+fn on_path(bin: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| {
+        if dir.as_os_str().is_empty() {
+            return None;
+        }
+        let candidate = dir.join(bin);
+        rustix::fs::access(&candidate, Access::EXEC_OK)
+            .is_ok()
+            .then_some(candidate)
+    })
+}
+
 /// Start pasta on the sandbox's network namespace and wait until it has
 /// configured it. `child_pid` is the `child-pid` bwrap reported, and the
 /// sandbox must still be held at its `--block-fd`: until this returns the
@@ -779,24 +973,13 @@ fn owning_userns(netns: BorrowedFd<'_>) -> rustix::io::Result<OwnedFd> {
 /// (`pasta(1)`, self-isolation), and a non-dumpable process cannot open
 /// `/proc/self/fd/...`, so the paths name bubbler's process — which is
 /// why both descriptors have to stay open across the spawn.
-fn start_pasta(env: &Env, cfg: &NetworkConfig, child_pid: i32) -> Result<PastaHandle, LaunchError> {
-    // The network namespace is what bubbler is really naming here: it is
-    // the one pasta configures, and its owning user namespace is fixed,
-    // where the pid's own `ns/user` is whatever bwrap has moved it into
-    // by the time a path is resolved.
-    let net_path = PathBuf::from(format!("/proc/{child_pid}/ns/net"));
-    let netns = rustix::fs::open(&net_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
-        .map_err(|e| LaunchError::Io(net_path.clone(), e.into()))?;
-    // The pid comes from bwrap's info document, and a sandbox that died
-    // in the meantime leaves it to be handed out again. pasta configures
-    // the network namespace of whatever holds the pid *now*, so a
-    // sandbox that is not in a namespace of its own is not the sandbox.
-    if same_namespace(&net_path, Path::new("/proc/self/ns/net"))? {
-        return Err(LaunchError::Network(
-            "sandbox pid reused; refusing to configure the host network namespace".to_owned(),
-        ));
-    }
-    let userns = owning_userns(netns.as_fd()).map_err(|e| LaunchError::Io(net_path, e.into()))?;
+fn start_pasta(
+    env: &Env,
+    cfg: &NetworkConfig,
+    child_pid: i32,
+    ns: &SandboxNs,
+) -> Result<PastaHandle, LaunchError> {
+    let userns = &ns.user;
     let (ready, done) = rustix::pipe::pipe().map_err(|e| LaunchError::Data(e.into()))?;
     for fd in [&ready, &done] {
         fcntl_setfd(fd, FdFlags::CLOEXEC).map_err(|e| LaunchError::Data(e.into()))?;
@@ -1609,7 +1792,13 @@ pub fn run(
     let mut pasta = match isolated {
         Some(cfg) => {
             let started = match info.as_ref() {
-                Some((child_pid, _)) => start_pasta(env, cfg, *child_pid),
+                // The ruleset first: a namespace gets its policy before
+                // it gets a route, so there is no window in which the
+                // sandbox is connected and unfiltered.
+                Some((child_pid, _)) => sandbox_namespaces(*child_pid).and_then(|ns| {
+                    install_rules(cfg, &ns)?;
+                    start_pasta(env, cfg, *child_pid, &ns)
+                }),
                 None => Err(LaunchError::Network(
                     "bwrap reported no sandbox pid for pasta to attach to".to_owned(),
                 )),
@@ -2919,29 +3108,27 @@ mod tests {
         assert_eq!(got, "{}");
     }
 
-    /// The namespace is the inode the link names, so a reused pid is
-    /// caught by comparing what the two links read as and never by the
-    /// paths, which always differ.
+    /// A namespace is the identity of its nsfs file, and the check is
+    /// asked of the descriptor the run already holds rather than of a
+    /// path resolved a second time — which is where a reused pid would
+    /// slip through.
     #[test]
-    fn the_namespace_check_compares_what_the_links_name() {
-        let tmp = tempfile::tempdir().unwrap();
-        let link = |name: &str, target: &str| {
-            let p = tmp.path().join(name);
-            std::os::unix::fs::symlink(target, &p).unwrap();
-            p
-        };
-        let mine = link("mine", "net:[4026531840]");
-        let same = link("same", "net:[4026531840]");
-        let other = link("other", "net:[4026532567]");
-        assert!(same_namespace(&mine, &same).unwrap());
-        assert!(!same_namespace(&mine, &other).unwrap());
-        assert!(!same_namespace(&other, &same).unwrap());
-        // A link that cannot be read is never a match: a pid the run
-        // cannot ask about is one it must not hand to pasta either.
-        assert!(same_namespace(&mine, &tmp.path().join("gone")).is_err());
-        // And against the real thing: bubbler is in its own namespace.
-        let me = Path::new("/proc/self/ns/net");
-        assert!(same_namespace(me, me).unwrap());
+    fn the_namespace_check_compares_the_held_descriptor_by_identity() {
+        let (me, user) = (
+            Path::new("/proc/self/ns/net"),
+            Path::new("/proc/self/ns/user"),
+        );
+        if !me.exists() || !user.exists() {
+            return;
+        }
+        let held = rustix::fs::open(me, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).unwrap();
+        assert!(same_namespace(held.as_fd(), me).unwrap());
+        // Another namespace of the same process: a different inode on the
+        // same filesystem, so the device alone would not tell them apart.
+        assert!(!same_namespace(held.as_fd(), user).unwrap());
+        // A path the run cannot ask about is never a match: a pid it
+        // cannot check is one it must not act on either.
+        assert!(same_namespace(held.as_fd(), Path::new("/proc/self/ns/nonesuch")).is_err());
     }
 
     #[test]

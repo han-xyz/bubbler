@@ -10,7 +10,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::config::{
-    self, BusRule, ConfigError, InstanceConfig, LintAllow, RawProfile, Service, ShareMode, Userns,
+    self, BusRule, ConfigError, InstanceConfig, LintAllow, Outbound, RawProfile, Service,
+    ShareMode, Userns,
 };
 use crate::env::Env;
 use crate::error::ProfileError;
@@ -638,6 +639,26 @@ impl Merged {
                     // it; the children are grants of their own, so they add
                     // up rather than being replaced wholesale.
                     held.mode = cfg.mode;
+                    // `outbound` is not the mode: a filter, once a layer
+                    // has asked for one, is a floor. A layer above it
+                    // that says nothing about `outbound` — which is every
+                    // bare `network` node — would otherwise turn the
+                    // filter off by omission, and widening a sandbox by
+                    // omission is the one thing a merge must never do.
+                    // Turning it *on* from above is fine, and unions.
+                    if held.outbound == Outbound::Deny && cfg.outbound != Outbound::Deny {
+                        return Err(ProfileError::Conflict {
+                            node: "network".to_owned(),
+                            a: format!("outbound \"deny\" in {}", held_src.label),
+                            b: format!(
+                                "a `network` node without it in {}; write \
+                                 `outbound \"deny\"` there too, or do not include the layer \
+                                 that filters",
+                                src.label
+                            ),
+                        });
+                    }
+                    held.outbound = cfg.outbound;
                     for ip in &cfg.dns {
                         if !held.dns.contains(ip) {
                             held.dns.push(*ip);
@@ -646,6 +667,11 @@ impl Merged {
                     for f in &cfg.forwards {
                         if !held.forwards.contains(f) {
                             held.forwards.push(*f);
+                        }
+                    }
+                    for a in &cfg.allow_out {
+                        if !held.allow_out.contains(a) {
+                            held.allow_out.push(*a);
                         }
                     }
                     held.no_ipv6 |= cfg.no_ipv6;
@@ -1385,6 +1411,60 @@ mod tests {
             resolved.text,
             "network \"host\" {\n    dns \"1.1.1.1\"\n}\n"
         );
+    }
+
+    /// `outbound` is a choice the including layer makes, like the mode;
+    /// the destinations are grants and add up. A layer that turns the
+    /// filter *off* while a layer below it lists destinations is refused
+    /// on the re-read rather than flattened into rules nothing installs.
+    #[test]
+    fn outbound_comes_from_the_including_layer_and_the_destinations_add_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(
+            tmp.path(),
+            &[
+                (
+                    "base",
+                    "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\" port=443\n}\n",
+                ),
+                (
+                    "app",
+                    "include \"base\"\nnetwork {\n    outbound \"deny\"\n    \
+                     allow-out \"1.1.1.1\" port=443\n    allow-out \"9.9.9.9\"\n}\n",
+                ),
+                ("open", "include \"base\"\nnetwork\n"),
+            ],
+            &[],
+        );
+        let resolved = r.resolve("app").unwrap();
+        let [Service::Network(net)] = resolved.config.services.as_slice() else {
+            panic!("{:?}", resolved.config.services)
+        };
+        assert_eq!(net.outbound, crate::network::Outbound::Deny);
+        assert_eq!(
+            net.allow_out
+                .iter()
+                .map(|a| (a.dest.to_string(), a.port))
+                .collect::<Vec<_>>(),
+            vec![
+                ("1.1.1.1".to_owned(), Some(443)),
+                ("9.9.9.9".to_owned(), None)
+            ]
+        );
+        assert_eq!(
+            resolved.text,
+            "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\" port=443\n    \
+             allow-out \"9.9.9.9\"\n}\n"
+        );
+        // A layer above one that filters cannot drop the filter by
+        // saying nothing, which is what a bare `network` node says.
+        let err = r.resolve("open").unwrap_err();
+        let ProfileError::Conflict { node, a, b } = &err else {
+            panic!("{err:?}")
+        };
+        assert_eq!(node, "network");
+        assert!(a.contains("outbound \"deny\""), "{a}");
+        assert!(b.contains("without it"), "{b}");
     }
 
     /// A merge that would grant a forward into a namespace the mode does
