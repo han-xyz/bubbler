@@ -1890,6 +1890,30 @@ fn fail_with(mut run: Child, what: &str) -> ! {
 }
 
 #[test]
+fn test_processes_never_inherit_the_callers_stdin() {
+    // Under `makepkg` on a desktop the caller's stdin is a terminal, and a
+    // bubbler that inherits one takes it: raw mode on the user's
+    // terminal, and SIGTTOU stopping any bubbler in a process group of
+    // its own. `isolate` gives every test process /dev/null instead;
+    // a test that wants a terminal hands one over explicitly.
+    let tmp = setup();
+    let out = bubbler_in_sh(
+        tmp.path(),
+        Path::new("/nonexistent"),
+        "readlink /proc/self/fd/0",
+    )
+    .stdout(Stdio::piped())
+    // `spawn`, not `output`: `output` pipes stdin itself, which is the
+    // default every other spawn in this file does not get.
+    .spawn()
+    .unwrap()
+    .wait_with_output()
+    .unwrap();
+    let fd0 = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(fd0.trim(), "/dev/null", "{fd0:?}");
+}
+
+#[test]
 fn real_bwrap_exec_round_trip() {
     if !require_bwrap() {
         return;

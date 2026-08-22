@@ -4,8 +4,9 @@
 //! any of them waits for one back.
 
 use std::fs;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -90,7 +91,8 @@ fn handing_the_terminal_over_and_taking_it_back_asks_the_terminal_nothing() {
 
     let (master, slave) = terminal();
     let stdio = || Stdio::from(slave.try_clone().unwrap());
-    let mut child = Command::new(&editor)
+    let mut child = Command::new(&editor);
+    child
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", "xterm-256color")
@@ -101,9 +103,27 @@ fn handing_the_terminal_over_and_taking_it_back_asks_the_terminal_nothing() {
         .env("BUBBLER_PROFILE_DIR", root.join("profiles"))
         .stdin(stdio())
         .stdout(stdio())
-        .stderr(stdio())
-        .spawn()
-        .unwrap();
+        .stderr(stdio());
+    // Its own session, with this pty as its controlling terminal. crossterm
+    // opens `/dev/tty` for raw mode and the window size and falls back to
+    // stdout only when there is none, so an editor left in the runner's
+    // session would size itself off, and put raw mode on, whatever
+    // terminal `cargo test` was started from — under `makepkg` the user's
+    // own — and draw nothing on the pty this test reads.
+    //
+    // SAFETY: runs in the forked child before execve, where only
+    // async-signal-safe work is allowed: `setsid` and `ioctl(TIOCSCTTY)`
+    // are single syscalls that allocate nothing. fd 0 is the pty by then,
+    // since stdio is installed before these callbacks, and is never closed.
+    unsafe {
+        let stdin = BorrowedFd::borrow_raw(0);
+        child.pre_exec(move || {
+            rustix::process::setsid()?;
+            rustix::process::ioctl_tiocsctty(stdin)?;
+            Ok(())
+        });
+    }
+    let mut child = child.spawn().unwrap();
     drop(slave);
     let mut out = Vec::new();
     pump(&master, &mut out, Duration::from_millis(800));

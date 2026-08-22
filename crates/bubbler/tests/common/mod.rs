@@ -337,8 +337,15 @@ pub fn bubbler(root: &Path) -> Command {
 }
 
 /// The isolated environment every test process gets, whatever the program.
+///
+/// stdin is `/dev/null` unless a test hands over a terminal of its own:
+/// inherited, it is whatever started `cargo test`, and under `makepkg`
+/// on a desktop that is the user's terminal. bubbler would then take it
+/// into raw mode, and one started in a process group of its own would be
+/// stopped by `SIGTTOU` the moment it touched it.
 fn isolate(c: &mut Command, root: &Path) {
-    c.env_clear()
+    c.stdin(Stdio::null())
+        .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", root.join("home"))
         .env("XDG_DATA_HOME", root.join("data"))
