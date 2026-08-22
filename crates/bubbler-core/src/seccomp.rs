@@ -569,7 +569,9 @@ mod tests {
     fn instructions(program: &[u8]) -> Vec<(u16, u8, u8, u32)> {
         assert_eq!(program.len() % 8, 0, "a sock_filter is eight bytes");
         program
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|c| {
                 (
                     u16::from_le_bytes([c[0], c[1]]),
