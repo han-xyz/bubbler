@@ -87,7 +87,8 @@ const FILES: &[(&str, &str)] = &[
     (
         "$XDG_RUNTIME_DIR/bubbler/<name>/",
         "Runtime state of a running instance, mode 0700: the supervisor's init.sock, and the \
-         D-Bus proxy's sockets where a bus is granted. Removed when the run ends.",
+         D-Bus proxy's sockets where a bus is granted. Every socket in it goes when the run \
+         ends; the directory itself is left for the next run to reuse.",
     ),
     (
         "$XDG_RUNTIME_DIR/.flatpak/bubbler-<name>/",

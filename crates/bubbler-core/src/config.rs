@@ -29,11 +29,12 @@ pub const MAX_BYTES: usize = 1024 * 1024;
 /// Measured against `kdl` 6.7.1 on x86_64, parsing well-formed nesting
 /// until the process aborts: 1348 levels on the 8 MiB stack a main
 /// thread has in a release build, 253 in a debug build, and 61 on the
-/// 2 MiB stack of a spawned thread in a debug build. bubbler reads
-/// configurations on its main thread, where the bound leaves a factor of
-/// four even unoptimised; a library user parsing on a small thread stack
-/// in a debug build has less.
-pub const MAX_NESTING: usize = 64;
+/// 2 MiB stack of a spawned thread in a debug build. The bound sits
+/// under the smallest of those rather than under the largest: bubbler
+/// parses on its main thread, but a library user parsing on a thread of
+/// its own in a debug build is the case that has the least room, and
+/// this is a bound the parser survives there too.
+pub const MAX_NESTING: usize = 32;
 
 /// Keys `env` may not set: the sandbox owns them.
 pub const RESERVED_ENV: &[&str] = &[
@@ -3274,11 +3275,12 @@ command "b""#
 
     #[test]
     fn the_bound_admits_its_own_depth_and_stops_one_past_it() {
-        // The bound itself, not a parse of it: a test runs on a 2 MiB
-        // thread stack, which an unoptimised `kdl` 6.7.1 overflows at 62
-        // levels — the very headroom [`MAX_NESTING`] documents having on
-        // the main thread bubbler parses on.
-        assert!(check_bounds(&nested(MAX_NESTING)).is_ok());
+        // The parser and not the pre-check alone: this runs on the 2 MiB
+        // stack a spawned thread has, where an unoptimised `kdl` 6.7.1
+        // overflows at 62 levels. A bound the parser survives even there
+        // is what [`MAX_NESTING`] is for, so a rise past what that stack
+        // takes aborts this test rather than someone's process.
+        assert!(parse_document(&nested(MAX_NESTING)).is_ok());
         assert!(matches!(
             check_bounds(&nested(MAX_NESTING + 1)),
             Err(ConfigError::TooDeep { line, max })

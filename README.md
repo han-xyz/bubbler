@@ -5,7 +5,7 @@ combining bubblejail's explicit instances and resource grants with a profile
 library in the spirit of firejail. bubbler itself is unprivileged; `bwrap`
 does the namespace work.
 
-Status: milestone 8 — a library of 14 profiles (`alacritty`, `chromium`,
+Status: milestone 9 — a library of 14 profiles (`alacritty`, `chromium`,
 `code`, `firefox`, `generic`, `keepassxc`, `kitty`, `libreoffice`, `lutris`,
 `mpv`, `spotify`, `steam`, `thunderbird`, `vesktop`) over GPU, sound, a private
 home, host paths through `path-share`, a runtime directory shared between
@@ -16,7 +16,13 @@ own through pasta and a seccomp filter that covers 32-bit binaries as well as
 64-bit. Profiles come in three layers — yours, the system's, built-in — and
 compose with `include`. `bubbler lint` measures a profile or an instance config
 against what a sandbox is meant to give away, and `--dry-run --explain` puts
-every bwrap argument under the node that produced it. See "Known gaps" below.
+every bwrap argument under the node that produced it. `bubbler open` starts an
+instance or hands a URL to the one already running, and keeps what a launch
+with no terminal printed where `bubbler log` finds it; `bubbler desktop` writes
+the menu entry that calls it, `bubbler wrap` the `~/.local/bin` shim. `bubbler
+man` prints both manual pages, and `bubbler ui` opens the terminal editor
+`bubbler-ui`, which is every subcommand over a list of instances and their
+grants. See "Known gaps" below.
 
 ## Usage
 
@@ -1779,7 +1785,7 @@ binding the tree under it.
 - The `kdl` crate parses `{` by recursing, so a deeply nested profile or
   `config.kdl` would overflow the stack and abort bubbler with no diagnostic
   at all. bubbler pre-checks every configuration it reads and refuses one
-  larger than 1 MiB or nested deeper than 64 braces, naming the file; the
+  larger than 1 MiB or nested deeper than 32 braces, naming the file; the
   check counts braces outside strings and comments and is not a parser, and
   the recursion itself is upstream's (`kdl` 6.7.1).
 - A generated desktop entry closes D-Bus activation for itself only, and its

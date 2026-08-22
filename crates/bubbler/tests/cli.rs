@@ -2891,7 +2891,10 @@ fn a_configuration_nested_past_the_bound_is_refused_wherever_it_is_read() {
         // An abort has no exit code at all, which is what this had.
         assert!(out.status.code().is_some_and(|c| c != 0), "{args:?}: {err}");
         assert!(err.contains(&file.display().to_string()), "{args:?}: {err}");
-        assert!(err.contains("nested deeper than 64"), "{args:?}: {err}");
+        // The bound as the constant holds it: a message naming a depth
+        // the parser no longer stops at would be a lie to whoever hit it.
+        let bound = format!("nested deeper than {}", bubbler_core::config::MAX_NESTING);
+        assert!(err.contains(&bound), "{args:?}: {err}");
     }
 }
 
@@ -5513,6 +5516,9 @@ const COMMANDS: &[&str] = &[
     "bubbler run",
     "bubbler try",
     "bubbler exec",
+    "bubbler open",
+    "bubbler log",
+    "bubbler desktop",
     "bubbler list",
     "bubbler profiles",
     "bubbler delete",
@@ -5523,6 +5529,9 @@ const COMMANDS: &[&str] = &[
     "bubbler profile lint",
     "bubbler reseed",
     "bubbler lint",
+    "bubbler wrap",
+    "bubbler unwrap",
+    "bubbler ui",
     "bubbler man",
 ];
 

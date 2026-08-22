@@ -306,11 +306,16 @@ fn more_stalled_clients_than_the_table_holds_drops_the_oldest() {
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
     let mut byte = [0u8; 1];
-    assert_eq!(
-        std::io::Read::read(&mut &*oldest, &mut byte).unwrap(),
-        0,
-        "the oldest stalled connection was kept"
-    );
+    // Closed is closed, whichever way it reaches this end: an orderly
+    // EOF when the supervisor had already read the prefix this client
+    // sent, and ECONNRESET when it had not, since closing a socket with
+    // unread bytes in it sends an RST instead. Which of the two the read
+    // sees is a race with the supervisor's own poll.
+    match std::io::Read::read(&mut &*oldest, &mut byte) {
+        Ok(0) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("the oldest stalled connection was kept: {other:?}"),
+    }
     assert_eq!(
         ExitStatus::from_raw(exec(&sock, &["/usr/bin/true"])).code(),
         Some(0)

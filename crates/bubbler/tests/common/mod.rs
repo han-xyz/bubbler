@@ -106,10 +106,6 @@ fn isolate(c: &mut Command, root: &Path) {
         // desktop entry installed on this host cannot be what a test
         // resolves, and nothing a test writes lands outside it.
         .env("XDG_DATA_DIRS", root.join("share"))
-        // The system data layer points into the test root too, so a
-        // desktop entry installed on this host cannot be what a test
-        // resolves, and nothing a test writes lands outside it.
-        .env("XDG_DATA_DIRS", root.join("share"))
         .env("XDG_RUNTIME_DIR", root.join("run"))
         // Both profile layers point into the test root, so a profile
         // installed on the host cannot change what a test resolves.
