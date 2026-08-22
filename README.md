@@ -5,16 +5,17 @@ combining bubblejail's explicit instances and resource grants with a profile
 library in the spirit of firejail. bubbler itself is unprivileged; `bwrap`
 does the namespace work.
 
-Status: milestone 9 — a library of 14 profiles (`alacritty`, `chromium`,
+Status: milestone 10 — a library of 14 profiles (`alacritty`, `chromium`,
 `code`, `firefox`, `generic`, `keepassxc`, `kitty`, `libreoffice`, `lutris`,
 `mpv`, `spotify`, `steam`, `thunderbird`, `vesktop`) over GPU, sound, a private
 home, host paths through `path-share`, a runtime directory shared between
 sandboxes through `app-runtime`, game controllers through `gamepad`, a camera
 through the portal, a filtered session and system bus with portals,
 notifications and `tray`, a terminal of their own, a network namespace of their
-own through pasta and a seccomp filter that covers 32-bit binaries as well as
-64-bit. Profiles come in three layers — yours, the system's, built-in — and
-compose with `include`. `bubbler lint` measures a profile or an instance config
+own through pasta with outbound filtering through an nftables ruleset installed
+in it, and a seccomp filter that covers 32-bit binaries as well as 64-bit.
+Profiles come in three layers — yours, the system's, built-in — and compose
+with `include`. `bubbler lint` measures a profile or an instance config
 against what a sandbox is meant to give away, and `--dry-run --explain` puts
 every bwrap argument under the node that produced it. `bubbler open` starts an
 instance or hands a URL to the one already running, and keeps what a launch
@@ -22,7 +23,12 @@ with no terminal printed where `bubbler log` finds it; `bubbler desktop` writes
 the menu entry that calls it, `bubbler wrap` the `~/.local/bin` shim. `bubbler
 man` prints both manual pages, and `bubbler ui` opens the terminal editor
 `bubbler-ui`, which is every subcommand over a list of instances and their
-grants. See "Known gaps" below.
+grants. `docs/threat-model.md` says what each mechanism defends and what it
+does not, `fuzz/` holds seven cargo-fuzz targets beside the property tests over
+the same parsers, `cargo deny check` guards the dependency tree,
+`.github/workflows/ci.yml` runs the lot, and `contrib/apparmor/usr.bin.bubbler`
+is an AppArmor profile for packagers that has never been loaded here. See
+"Known gaps" below.
 
 ## Usage
 
