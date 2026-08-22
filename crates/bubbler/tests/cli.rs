@@ -5952,6 +5952,27 @@ fn the_long_help_of_a_shim_says_what_it_takes_over() {
 }
 
 #[test]
+fn man_needs_no_session_environment() {
+    // A package build renders the pages under fakeroot, where no session
+    // manager has set XDG_RUNTIME_DIR or HOME.
+    let tmp = setup();
+    for args in [&["man"][..], &["man", "--config"][..]] {
+        let out = bubbler(tmp.path())
+            .args(args)
+            .env_remove("XDG_RUNTIME_DIR")
+            .env_remove("HOME")
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{args:?}: {err}");
+        assert!(
+            out.stdout.starts_with(b".") || out.stdout.starts_with(b"'"),
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
 fn man_renders_the_page_and_a_section_for_every_subcommand() {
     let tmp = setup();
     let out = bubbler(tmp.path()).arg("man").output().unwrap();

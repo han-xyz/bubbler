@@ -841,6 +841,17 @@ fn shim_dispatch(argv: &[OsString]) -> Result<Option<Vec<OsString>>> {
     Ok(Some(wrap::open_argv(&found.instance, &args)))
 }
 
+/// `bubbler man [--config]`: the page is built from the parser alone.
+fn print_man(config: bool) -> Result<i32> {
+    let version = format!("bubbler {}", env!("CARGO_PKG_VERSION"));
+    let lines = match config {
+        true => manpage::config_page(&version),
+        false => manpage::page(Cli::command(), &version),
+    };
+    let lines: Vec<&OsStr> = lines.iter().map(OsString::as_os_str).collect();
+    print_lines(&lines, "the man page")
+}
+
 fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
     // Before anything else opens a descriptor.
     host_env::fill_closed_stdio()?;
@@ -860,6 +871,12 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
         }
         None => Cli::parse(),
     };
+    // Before the environment is read: the page is built from the parser
+    // alone, and a package build renders it under fakeroot, where no
+    // session manager has set XDG_RUNTIME_DIR.
+    if let Cmd::Man { config } = cli.cmd {
+        return print_man(config);
+    }
     let env = host_env::from_process()?;
     match cli.cmd {
         Cmd::Create { name, profile } => {
@@ -1292,15 +1309,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             let e = Command::new(&editor).exec();
             Err(e).with_context(|| format!("running {}", editor.display()))
         }
-        Cmd::Man { config } => {
-            let version = format!("bubbler {}", env!("CARGO_PKG_VERSION"));
-            let lines = match config {
-                true => manpage::config_page(&version),
-                false => manpage::page(Cli::command(), &version),
-            };
-            let lines: Vec<&OsStr> = lines.iter().map(OsString::as_os_str).collect();
-            print_lines(&lines, "the man page")
-        }
+        Cmd::Man { config } => print_man(config),
         Cmd::Lint { name, opts } => {
             let path = host_env::search_path();
             let ctx = lint::Context {
