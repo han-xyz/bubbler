@@ -386,13 +386,27 @@ pub fn kill_group(child: &Child) {
 /// A run that has ended must leave none: bubbler tears its sandboxes down
 /// itself, and `--die-with-parent` is only the backstop behind that.
 pub fn bwrap_alive(needle: &str) -> bool {
-    let out = Command::new("pgrep")
-        .args(["-a", "-f", needle])
-        .output()
-        .expect("pgrep is part of procps-ng, which these tests need");
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .any(|l| l.contains("bwrap"))
+    process_running("bwrap", needle)
+}
+
+/// Whether some process has `program` and `needle` in its command line.
+/// Read from `/proc` directly: `pgrep` is procps-ng, which a clean build
+/// chroot does not have.
+pub fn process_running(program: &str, needle: &str) -> bool {
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    procs
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+        })
+        .filter_map(|e| std::fs::read(e.path().join("cmdline")).ok())
+        .map(|raw| String::from_utf8_lossy(&raw).replace('\0', " "))
+        .any(|line| line.contains(program) && line.contains(needle))
 }
 
 /// [`bubbler`] pointed at the real supervisor binary, for tests that

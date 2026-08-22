@@ -122,10 +122,15 @@ fn main_exit_terminates_leftover_execs() {
 /// What the sandbox must see when its stdio is a terminal: its own
 /// session, and `/dev/tty` resolving to that terminal.
 const TTY_PROBE: &str = concat!(
-    r#"test "$(ps -o sid= -p $$ | tr -d ' ')" = "$$" && echo LEADER; "#,
-    // `ps -o tty=` names the controlling terminal from the kernel, and
-    // prints `?` when there is none; fd 0 is the pty that was handed in.
-    r#"test "$(readlink /proc/self/fd/0)" = "/dev/$(ps -o tty= -p $$ | tr -d ' ')" && echo CTTY"#
+    // Fields 6 and 7 of /proc/<pid>/stat are the session id and the
+    // controlling terminal's device number; `ps` is not in a clean
+    // chroot (procps-ng is a dependency of base, not base-devel).
+    r#"read -r _ _ _ _ _ sid tty _ < /proc/$$/stat; "#,
+    r#"test "$sid" = "$$" && echo LEADER; "#,
+    // tty_nr packs major/minor the same way `stat -c %t:%T` prints them
+    // (minor bits 0-7 and 20-31, major bits 8-19); 0 means none.
+    r#"maj=$(( (tty >> 8) & 0xfff )); min=$(( (tty & 0xff) | ((tty >> 12) & 0xfff00) )); "#,
+    r#"test "$tty" != 0 && test "$(printf %x:%x $maj $min)" = "$(stat -c %t:%T "$(readlink /proc/self/fd/0)")" && echo CTTY"#
 );
 
 /// Read a pty master to the end; the last slave closing reports `EIO`.

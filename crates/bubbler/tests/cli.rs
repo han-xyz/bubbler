@@ -14,9 +14,9 @@ use bubbler_core::profile::NAMES;
 use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
     PYTHON, bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, bwrap_alive, kill_group,
-    output_past_a_busy_exec, real_init, require_bwrap, require_dbus, require_groff, require_nft,
-    require_pasta, require_portal, require_python, require_system_bus, require_tray, say,
-    system_owns, test_pty,
+    output_past_a_busy_exec, process_running, real_init, require_bwrap, require_dbus,
+    require_groff, require_nft, require_pasta, require_portal, require_python, require_system_bus,
+    require_tray, say, system_owns, test_pty,
 };
 use rustix::fs::{OFlags, fcntl_getfl};
 use rustix::process::{Pid, Signal, kill_process};
@@ -2044,14 +2044,7 @@ fn host_owns(name: &str) -> bool {
 
 /// Whether any `xdg-dbus-proxy` still has `needle` in its argv.
 fn proxy_running_for(needle: &str) -> bool {
-    match Command::new("pgrep")
-        .args(["-f", &format!("xdg-dbus-proxy.*{needle}")])
-        .output()
-    {
-        Ok(o) => o.status.success(),
-        // No pgrep: the assertion cannot be made, so it does not fail.
-        Err(_) => false,
-    }
+    process_running("xdg-dbus-proxy", needle)
 }
 
 /// Instance whose runtime state lands in the session's real runtime dir,
@@ -3703,7 +3696,9 @@ fn real_bwrap_run_reads_a_pipe_on_stdin_while_the_terminal_takes_the_output() {
 /// What an exec'd command must see of the terminal it was given: its own
 /// session, and the window size of the user's terminal.
 const EXEC_PROBE: &str = concat!(
-    r#"test "$(ps -o sid= -p $$ | tr -d ' ')" = "$$" && echo LEADER; "#,
+    // Field 6 of /proc/<pid>/stat is the session id; `ps` is not in a
+    // clean build chroot.
+    r#"read -r _ _ _ _ _ sid _ < /proc/$$/stat; test "$sid" = "$$" && echo LEADER; "#,
     r#"echo "size $(stty size)""#,
 );
 
