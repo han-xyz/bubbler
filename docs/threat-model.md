@@ -130,11 +130,16 @@ under it — so the builder emits in fixed phases and no service controls
 global order.
 
 **Does not defend:** anything you bind in. `home-share`, `path-share`,
-`etc-share` and `dri` are grants, and a grant is what it says it is.
+`etc-share` and `dri` are grants, and a grant is what it says it is. A
+`portals` grant binds the instance's document-portal view at
+`$XDG_RUNTIME_DIR/doc`: what the host chooser exported for this app id, with
+the portal's per-document mode bits, and nothing of the mount's other apps.
 
 [Baseline](manual.md#baseline) ·
 `baseline_argv_is_exact`, `etc_is_an_allowlist_of_existing_entries`,
 `service_binds_come_after_runtime_dir_and_before_env`,
+`portals_binds_this_instances_document_portal_view_read_write`,
+`portals_without_a_document_portal_mount_binds_nothing_there`,
 `real_bwrap_home_is_fixed_and_private`,
 `real_bwrap_etc_is_allowlisted_and_user_is_bubbler`
 

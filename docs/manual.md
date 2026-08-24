@@ -1103,8 +1103,9 @@ sandbox type into your session, and `hidraw` hands it every HID device on the
 machine, security keys and hardware wallets among them.
 
 Opening an arbitrary file from inside — LibreOffice's or Thunderbird's file
-chooser — goes through the portal, and the path it hands back today is one
-bubbler cannot mount (see "Known gaps").
+chooser — goes through the portal, which exports what you pick into the
+instance's own document-portal view, and the path it hands back opens there
+(see "D-Bus").
 
 ### Managing profiles and instances
 
@@ -1541,6 +1542,22 @@ the `xdg-dbus-proxy(1)` examples; the spawn portal
 (`org.freedesktop.portal.Flatpak`), which starts processes outside the
 sandbox, is not among them.
 
+The grant also binds this instance's own view of the document portal: host
+`$XDG_RUNTIME_DIR/doc/by-app/org.bubbler.<name>` at `$XDG_RUNTIME_DIR/doc`
+inside. A file chooser hands the application a path of the form
+`/run/user/<uid>/doc/<id>/<name>`, which lives on the `fuse.portal` mount
+`xdg-document-portal` makes; without that bind there is nothing there to
+open. Only the app id's own subtree is bound, never the mount root, which
+holds every other application's documents as well. The bind is read-write
+because the portal's own FUSE decides the mode per document: one this app id
+has no WRITE grant on has `0222` stripped from its bits and is refused an
+open for writing, so a read-only bind would take away nothing but the writes
+the user did grant. A host with no such mount — the portal not running — is
+not an error: the launch binds nothing there and prints `bubbler: warning:
+portals: no document portal at /run/user/<uid>/doc, so a file picked in a
+portal dialog cannot be opened inside`. Files under a `home-share` or
+`path-share` are reachable either way.
+
 `tray` is one rule, `--talk=org.kde.StatusNotifierWatcher`: an app registers
 its icon with the watcher and serves the item itself on its own unique name,
 and what the host's tray then calls back into the app is incoming, which the
@@ -1909,8 +1926,7 @@ none of its own.
 
 ## Known gaps
 
-- No accessibility bus, no document-portal FUSE mount, so a portal that hands
-  back a `/run/user/<uid>/doc` path gives the sandbox nothing it can open.
+- No accessibility bus.
 - Descriptors handed to a command through `exec` are reachable by the
   sandboxed application through `/proc` — exec is a convenience channel, not
   a boundary. What the sandbox can still do with the terminal it is given is

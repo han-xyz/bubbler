@@ -76,7 +76,7 @@ host).
 
 ## Known gaps
 
-- No accessibility bus; no document-portal FUSE mount.
+- No accessibility bus.
 - AMD compute (`/dev/kfd` + sysfs topology) unsupported; NVIDIA compute needs
   `etc-share "OpenCL"`/`"nvidia"`.
 - `hidraw` and `camera nodes=#true` device lists are frozen at launch.

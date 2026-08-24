@@ -54,7 +54,7 @@ command "firefox"
 | `etc-share` | one `/etc` entry | not the account files |
 | `app-runtime` | `$XDG_RUNTIME_DIR/app/<id>` | same dir for every sandbox naming the id, no peer auth |
 | `dbus` / `system-bus` | filtered bus via proxy | rules are the whole confinement |
-| `portals` | portal names + app id `org.bubbler.<inst>` | Steam's runtime misreads `/.flatpak-info` |
+| `portals` | portal names + app id `org.bubbler.<inst>`; binds the instance's document-portal view at `$XDG_RUNTIME_DIR/doc` | Steam's runtime misreads `/.flatpak-info` |
 | `notify`, `tray`, `mpris` | one bus rule each | need `dbus` in the merged result |
 | `seccomp` | edit the default denylist | `disable` prints a warning each run |
 | `userns "disable"` | no nested user namespaces | breaks Firefox/Chromium inner sandbox, Steam, podman |

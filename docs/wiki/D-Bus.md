@@ -40,9 +40,17 @@ so `xdg-desktop-portal` can verify the caller, and holds the app at
 (`org.freedesktop.portal.Flatpak`) is not granted. Needs `xdg-desktop-portal`
 and a backend on the host.
 
-Known gap: no document-portal FUSE mount, so a file chooser handing back a
-`/run/user/<uid>/doc/…` path gives the sandbox nothing it can open. Files under
-a `home-share`/`path-share` work.
+The instance's own view of the document portal, host
+`$XDG_RUNTIME_DIR/doc/by-app/org.bubbler.<instance>`, is bound read-write at
+`$XDG_RUNTIME_DIR/doc` inside: a file picked in the host's chooser appears as
+`/run/user/<uid>/doc/<id>/<name>`, and the portal's own per-document
+permissions decide whether it is writable. Only that subtree is bound, never
+the mount root. Without xdg-document-portal running the launch warns
+(`no document portal at …`) and files picked in a dialog stay unreachable.
+Files under a `home-share`/`path-share` work either way.
+
+Known gap: a desktop entry's `%f`/`%U` arguments are host paths; they are
+not registered with the document portal, so they are unreachable inside.
 
 ## System bus
 
