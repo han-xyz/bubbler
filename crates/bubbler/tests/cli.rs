@@ -15,8 +15,8 @@ use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
     PYTHON, bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, bwrap_alive, kill_group,
     output_past_a_busy_exec, process_running, real_init, require_bwrap, require_dbus,
-    require_groff, require_nft, require_pasta, require_portal, require_python, require_system_bus,
-    require_tray, say, system_owns, test_pty,
+    require_document_portal, require_groff, require_nft, require_pasta, require_portal,
+    require_python, require_system_bus, require_tray, say, system_owns, test_pty,
 };
 use rustix::fs::{OFlags, fcntl_getfl};
 use rustix::process::{Pid, Signal, kill_process};
@@ -2330,6 +2330,54 @@ fn real_portal_identity_lives_exactly_as_long_as_the_run() {
         dir.parent().is_some_and(Path::is_dir),
         "the .flatpak directory itself was removed"
     );
+}
+
+#[test]
+fn real_portals_bind_the_document_view_and_nothing_above_it() {
+    if !require_document_portal() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let name = "bubbler-test-doc-portal";
+    let _leftovers = dbus_instance(tmp.path(), &init, name, "dbus\nportals\ncommand \"true\"\n");
+    let run = std::env::var_os("XDG_RUNTIME_DIR").unwrap();
+    let doc = PathBuf::from(run).join("doc");
+    let out = bubbler_dbus(tmp.path(), &init)
+        .args(["run", name, "--", "/usr/bin/ls", "-a"])
+        .arg(&doc)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    // The by-app view lists document ids only; the mount root would list `by-app`.
+    assert!(
+        !s.lines().any(|l| l == "by-app"),
+        "stdout: {s}stderr: {err}"
+    );
+    assert!(!err.contains("no document portal"), "{err}");
+}
+
+#[test]
+fn portals_without_a_document_portal_warns_once_and_still_runs() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/t/config.kdl"),
+        "dbus\nportals\ncommand \"true\"\n",
+    )
+    .unwrap();
+    // `setup()` points $XDG_RUNTIME_DIR at an empty temp dir: no mount there.
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--dry-run"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert_eq!(err.matches("no document portal at").count(), 1, "{err}");
+    let argv = String::from_utf8_lossy(&out.stdout);
+    assert!(!argv.contains("/doc/by-app/"), "{argv}");
 }
 
 #[test]

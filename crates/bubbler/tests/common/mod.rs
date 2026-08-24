@@ -533,6 +533,29 @@ pub fn require_portal() -> bool {
     desktop
 }
 
+/// Returns false (after printing why) when the document portal cannot be
+/// tested here: no proxied session bus, or nothing mounted at
+/// `$XDG_RUNTIME_DIR/doc`.
+pub fn require_document_portal() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if !require_dbus() {
+        return false;
+    }
+    let Some(run) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) else {
+        say("skipping: XDG_RUNTIME_DIR unset");
+        return false;
+    };
+    let doc = run.join("doc");
+    let mounted = match (std::fs::metadata(&doc), std::fs::metadata(&run)) {
+        (Ok(d), Ok(r)) => d.is_dir() && d.dev() != r.dev(),
+        _ => false,
+    };
+    if !mounted {
+        say("skipping: nothing mounted at $XDG_RUNTIME_DIR/doc");
+    }
+    mounted
+}
+
 /// Returns false (after printing why) when tray calls cannot be tested
 /// here: no proxied session bus, or no running StatusNotifier watcher.
 pub fn require_tray() -> bool {
