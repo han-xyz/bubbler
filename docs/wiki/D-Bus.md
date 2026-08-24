@@ -49,7 +49,7 @@ the mount root. Without xdg-document-portal running the launch warns
 (`no document portal at …`) and files picked in a dialog stay unreachable.
 Files under a `home-share`/`path-share` work either way.
 
-Known gap: a desktop entry's `%f`/`%U` arguments are host paths; they are
+Known gap: a desktop entry's `%f`/`%F` arguments are host paths; they are
 not registered with the document portal, so they are unreachable inside.
 
 ## System bus
