@@ -96,6 +96,9 @@ pub struct Plan {
     pub flatpak_info: Vec<u8>,
     /// Whether the `portals` bundle was granted.
     pub portals: bool,
+    /// `org.bubbler.<instance>`: the id portals file this sandbox's
+    /// permissions and documents under.
+    pub app_id: String,
 }
 
 impl Plan {
@@ -196,6 +199,7 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
         system,
         flatpak_info: flatpak_info(instance, portals),
         portals,
+        app_id: app_id(instance),
     })
 }
 

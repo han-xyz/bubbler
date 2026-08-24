@@ -64,7 +64,7 @@ pub fn apply_all(
             Service::AppRuntime { id, mode } => app_runtime(env, args, id, *mode),
             Service::Dbus { .. } => dbus_socket(env, args, ctx),
             Service::SystemBus { .. } => system_bus_socket(args, ctx),
-            Service::Portals => portals(args, ctx)?,
+            Service::Portals => portals(env, args, host, ctx)?,
             Service::Camera { nodes } => camera(services, args, host, *nodes)?,
             // Bound below, once every share has been resolved: two
             // overlapping shares must be refused before either is emitted.
@@ -631,11 +631,25 @@ fn system_bus_socket(args: &mut BwrapArgs, ctx: &ServiceCtx) {
     );
 }
 
-/// Bind the `/.flatpak-info` portals identify the sandbox by. The bytes
-/// come from the launcher's plan, which hands the proxy the same file.
-/// Without a plan there is no proxy and no bus, so the grant is refused
-/// rather than quietly dropped; the parser rejects that config already.
-fn portals(args: &mut BwrapArgs, ctx: &ServiceCtx) -> Result<(), LaunchError> {
+/// Bind `/.flatpak-info` so portals know the sandbox, and this instance's
+/// own view of the document portal — `$XDG_RUNTIME_DIR/doc/by-app/<app id>`
+/// on the host — at `$XDG_RUNTIME_DIR/doc`, the path the portal hands back
+/// for a picked file. Read-write: the portal strips write permission from
+/// every document it did not grant WRITE, so the bind adds no policy. Only
+/// the per-app subtree is bound; the mount root holds every app's
+/// documents. Without a mount there (no xdg-document-portal) the launch
+/// warns and runs with the identity file alone.
+///
+/// The bytes of `/.flatpak-info` come from the launcher's plan, which
+/// hands the proxy the same file. Without a plan there is no proxy and no
+/// bus, so the grant is refused rather than quietly dropped; the parser
+/// rejects that config already.
+fn portals(
+    env: &Env,
+    args: &mut BwrapArgs,
+    host: &dyn Host,
+    ctx: &ServiceCtx,
+) -> Result<(), LaunchError> {
     let plan = ctx
         .dbus
         .filter(|p| p.session.is_some())
@@ -648,6 +662,20 @@ fn portals(args: &mut BwrapArgs, ctx: &ServiceCtx) -> Result<(), LaunchError> {
         Path::new(dbus::FLATPAK_INFO),
         "0644",
     );
+    let doc = env.runtime_dir.join("doc");
+    // `by-app/<app id>` itself is never probed: the FUSE creates it on
+    // the first lookup, so it is absent until something asks for it.
+    let mounted =
+        host.file_type(&doc).is_some_and(|t| t.is_dir()) && host.is_mountpoint(&doc) == Some(true);
+    if mounted {
+        args.bind(&doc.join("by-app").join(&plan.app_id), &doc);
+    } else {
+        eprintln!(
+            "bubbler: warning: portals: no document portal at {}, so a file \
+             picked in a portal dialog cannot be opened inside",
+            doc.display()
+        );
+    }
     Ok(())
 }
 
@@ -991,15 +1019,17 @@ mod tests {
     use crate::host::fake::{self, FakeHost};
     use std::ffi::OsString;
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     enum Kind {
         Sock,
         File,
         Dir,
         Char,
+        /// A directory another filesystem is mounted on.
+        Mount,
     }
 
-    use Kind::{Char, Dir, File, Sock};
+    use Kind::{Char, Dir, File, Mount, Sock};
 
     fn env() -> Env {
         Env {
@@ -1055,15 +1085,13 @@ mod tests {
         let (file, dir, sock) = fake::types();
         let mut host = FakeHost::default();
         for (p, k) in existing {
-            host = host.with(
-                p,
-                match k {
-                    Sock => sock,
-                    File => file,
-                    Dir => dir,
-                    Char => fake::char_type(),
-                },
-            );
+            host = match k {
+                Sock => host.with(p, sock),
+                File => host.with(p, file),
+                Dir => host.with(p, dir),
+                Char => host.with(p, fake::char_type()),
+                Mount => host.with(p, dir).mount(p),
+            };
         }
         for (from, to) in links {
             host = host.link(from, to);
@@ -2830,6 +2858,59 @@ mod tests {
             ),
             "{a:?}"
         );
+    }
+
+    #[test]
+    fn portals_binds_this_instances_document_portal_view_read_write() {
+        let a = argv(
+            &[Service::Dbus { rules: vec![] }, Service::Portals],
+            &env(),
+            &[("/run/user/1000/doc", Mount)],
+        )
+        .unwrap();
+        assert!(
+            has_seq(
+                &a,
+                &[
+                    "--bind",
+                    "/run/user/1000/doc/by-app/org.bubbler.t",
+                    "/run/user/1000/doc",
+                ]
+            ),
+            "{a:?}"
+        );
+        // Only the by-app view: the whole mount would show every app's documents.
+        assert!(
+            !has_seq(&a, &["--bind", "/run/user/1000/doc", "/run/user/1000/doc"]),
+            "{a:?}"
+        );
+    }
+
+    #[test]
+    fn portals_without_a_document_portal_mount_binds_nothing_there() {
+        for existing in [&[][..], &[("/run/user/1000/doc", Dir)][..]] {
+            let a = argv(
+                &[Service::Dbus { rules: vec![] }, Service::Portals],
+                &env(),
+                existing,
+            )
+            .unwrap();
+            assert!(
+                !a.iter().any(|s| s == "/run/user/1000/doc"),
+                "{existing:?}: {a:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dbus_alone_never_binds_the_document_portal() {
+        let a = argv(
+            &[Service::Dbus { rules: vec![] }],
+            &env(),
+            &[("/run/user/1000/doc", Mount)],
+        )
+        .unwrap();
+        assert!(!a.iter().any(|s| s == "/run/user/1000/doc"), "{a:?}");
     }
 
     #[test]
