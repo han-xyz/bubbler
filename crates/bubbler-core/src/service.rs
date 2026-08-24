@@ -664,7 +664,9 @@ fn portals(
     );
     let doc = env.runtime_dir.join("doc");
     // `by-app/<app id>` itself is never probed: the FUSE creates it on
-    // the first lookup, so it is absent until something asks for it.
+    // the first lookup for any valid app id (xdg-desktop-portal,
+    // document-portal/document-portal-fuse.c, `ensure_by_app_inode`), so
+    // it is absent until something asks for it.
     let mounted =
         host.file_type(&doc).is_some_and(|t| t.is_dir()) && host.is_mountpoint(&doc) == Some(true);
     if mounted {

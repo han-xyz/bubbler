@@ -1,7 +1,8 @@
 # Sharing Files
 
 The sandbox's home is `/home/bubbler`, a private directory under the instance.
-Nothing of your real home is visible unless shared.
+Nothing of your real home is visible unless shared here — or picked by you in
+a portal file chooser under `portals` (see [D-Bus](D-Bus.md#portals)).
 
 ## home-share
 

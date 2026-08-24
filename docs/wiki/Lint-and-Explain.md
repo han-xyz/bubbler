@@ -64,9 +64,10 @@ arguments: D-Bus `rules:`, `rule-only:` for nodes contributing nothing else,
 `sidecar: pasta …` and the nft ruleset under `network`.
 
 ```
-  portals                         config.kdl:11  7 arguments
+  portals                         config.kdl:11  10 arguments
     --block-fd 4  (pipe: the sandbox waits on it until bubbler lets it go)
     --perms 0644 --ro-bind-data 9 /.flatpak-info  (generated file, 69 bytes)
+    --bind /run/user/1000/doc/by-app/org.bubbler.ff /run/user/1000/doc
     rules: --talk=org.freedesktop.portal.Desktop
            ...
   seccomp                                        2 arguments

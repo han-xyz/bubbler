@@ -216,9 +216,10 @@ file descriptor numbers are the ones a dry run prints.
         --info-fd 3  (pipe: bwrap reports the sandbox pid on it)
         ... 129 more (--explain=full)
 
-      portals                         config.kdl:11  7 arguments
+      portals                         config.kdl:11  10 arguments
         --block-fd 4  (pipe: the sandbox waits on it until bubbler lets it go)
         --perms 0644 --ro-bind-data 9 /.flatpak-info  (generated file, 69 bytes)
+        --bind /run/user/1000/doc/by-app/org.bubbler.ff /run/user/1000/doc
         rules: --talk=org.freedesktop.portal.Desktop
                --talk=org.freedesktop.portal.Documents
                --talk=org.freedesktop.portal.FileChooser
