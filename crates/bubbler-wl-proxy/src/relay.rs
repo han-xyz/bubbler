@@ -21,7 +21,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use rustix::event::{PollFd, PollFlags, poll};
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::io::Errno;
 use rustix::net::{
     AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
@@ -29,7 +29,7 @@ use rustix::net::{
     accept_with, connect, recvmsg, sendmsg, socket_with,
 };
 
-use crate::audit::Audit;
+use crate::audit::{Audit, Kind};
 use crate::objects::ObjectError;
 use crate::policy::{Action, Connection, Incoming, Policy};
 use crate::wire::{self, Header, WireError};
@@ -50,9 +50,21 @@ const MAX_MESSAGE_FDS: usize = 4;
 /// side that feeds it. A peer that does not read is not a reason to grow.
 const MAX_QUEUE: usize = 4 << 20;
 
+/// Bytes every connection of one sandbox may have waiting between them. The
+/// per-direction cap bounds one connection; this bounds a client that opens
+/// many, and the connection holding the most is the one that gives way.
+const MAX_TOTAL_QUEUE: usize = 64 << 20;
+
 /// Connections one proxy serves at a time. A toolkit opens one per process;
 /// past this the listener is left alone and the kernel's backlog holds them.
 const MAX_CONNECTIONS: usize = 256;
+
+/// How long the loop waits before accepting again after running out of
+/// descriptors. Retrying at once would spin against a table that is full.
+const BACKOFF: Timespec = Timespec {
+    tv_sec: 0,
+    tv_nsec: 100_000_000,
+};
 
 /// One message waiting to be written, with the descriptors it owns.
 #[derive(Debug)]
@@ -72,6 +84,21 @@ struct Side {
     out: VecDeque<Frame>,
     out_bytes: usize,
     eof: bool,
+}
+
+/// Which connection and which of its two sides one entry of the poll array
+/// stands for, since an entry is only there when it has something to wait for.
+#[derive(Debug, Clone, Copy)]
+enum Slot {
+    Listener,
+    Client(usize),
+    Server(usize),
+}
+
+/// Whether an error means the process is out of descriptors, in which case
+/// asking again at once would only spin.
+fn out_of_descriptors(err: Errno) -> bool {
+    err == Errno::MFILE || err == Errno::NFILE
 }
 
 /// One client and the upstream connection opened for it.
@@ -96,6 +123,9 @@ struct Relay {
     policy: Policy,
     audit: Audit,
     conns: Vec<Conn>,
+    /// Set when `accept` ran out of descriptors: the next round waits instead
+    /// of asking again, and clears it.
+    backoff: bool,
 }
 
 /// Serve `listener` — an inherited, listening, non-blocking Unix socket —
@@ -110,15 +140,18 @@ pub fn run(listener: OwnedFd, upstream: PathBuf, policy: Policy, audit: Audit) -
         policy,
         audit,
         conns: Vec::new(),
+        backoff: false,
     };
     loop {
         if let Err(err) = relay.step() {
             // The log is where the launcher looks, and it may be the only
             // place left: with `--log-fd 2` this process's own stderr is that
             // same descriptor, and it is closed as the relay unwinds.
-            relay
-                .audit
-                .line(Instant::now(), &format!("bubbler-wl-proxy: stopped: {err}"));
+            relay.audit.line(
+                Kind::Close,
+                Instant::now(),
+                &format!("bubbler-wl-proxy: stopped: {err}"),
+            );
             return Err(err);
         }
     }
@@ -164,6 +197,9 @@ fn flush(side: &mut Side) -> io::Result<()> {
         }
         let iov = [IoSlice::new(&frame.data[frame.off..])];
         let sent = match sendmsg(&side.fd, &iov, &mut cmsg, SendFlags::NOSIGNAL) {
+            // Nothing went out, so neither did the ancillary data: the frame
+            // keeps its descriptors and is tried again on the next `POLLOUT`.
+            Ok(0) => break,
             Ok(sent) => sent,
             Err(Errno::AGAIN) | Err(Errno::INTR) => break,
             Err(err) => return Err(err.into()),
@@ -207,11 +243,26 @@ impl Conn {
     }
 
     /// Whether everything this connection still had to say has been said.
+    ///
+    /// The half-close arms are deliberate: a peer that has gone still leaves
+    /// what it already sent to be delivered, so the connection lives until
+    /// the queue aimed at the side that is *still there* is empty. It never
+    /// waits on a queue aimed at the side that hung up — nobody is left to
+    /// read that one — and it never waits on a peer that will not read, since
+    /// that peer hanging up is itself what ends the connection.
     fn finished(&self) -> bool {
         self.broken
+            // Refused: the client gets its `wl_display.error`, then nothing.
             || (self.closing && self.client.out.is_empty())
+            // The client has gone: deliver what it already asked for.
             || (self.client.eof && self.server.out.is_empty())
+            // The compositor has gone: deliver what it already said.
             || (self.server.eof && self.client.out.is_empty())
+    }
+
+    /// Bytes this connection has waiting in both directions.
+    fn queued(&self) -> usize {
+        self.client.out_bytes + self.server.out_bytes
     }
 
     /// One round of work for this connection. An error names a protocol fault
@@ -358,6 +409,13 @@ fn receive(side: &mut Side) -> Result<(), String> {
             if msg.flags.contains(ReturnFlags::CTRUNC) {
                 return Err("the peer sent more descriptors than one message may carry".into());
             }
+            // No message owns more than two descriptors, so a queue this deep
+            // is a peer sending descriptors nothing will ever claim. Left to
+            // grow it would empty this process's table and take some other
+            // connection down with a misleading reason.
+            if side.fds.len() > MAX_FDS {
+                return Err("the peer sent more descriptors than its messages can own".into());
+            }
             Ok(())
         }
         Err(Errno::AGAIN) | Err(Errno::INTR) => {
@@ -377,34 +435,61 @@ fn receive(side: &mut Side) -> Result<(), String> {
 impl Relay {
     /// Wait for something to happen, then serve every connection that has.
     fn step(&mut self) -> io::Result<()> {
-        let listening = self.conns.len() < MAX_CONNECTIONS;
+        let backing_off = self.backoff;
+        let listening = self.conns.len() < MAX_CONNECTIONS && !backing_off;
+        let mut slots = Vec::with_capacity(1 + self.conns.len() * 2);
         let mut polled = Vec::with_capacity(1 + self.conns.len() * 2);
         if listening {
+            slots.push(Slot::Listener);
             polled.push(PollFd::from_borrowed_fd(
                 self.listener.as_fd(),
                 PollFlags::IN,
             ));
         }
-        for conn in &self.conns {
-            polled.push(PollFd::from_borrowed_fd(
-                conn.client.fd.as_fd(),
-                conn.flags(true),
-            ));
-            polled.push(PollFd::from_borrowed_fd(
-                conn.server.fd.as_fd(),
-                conn.flags(false),
-            ));
+        for (index, conn) in self.conns.iter().enumerate() {
+            // A descriptor with nothing left to wait for is left out of the
+            // array altogether. `POLLHUP` and `POLLERR` are reported whatever
+            // the mask asks for, so a side that has hung up would wake `poll`
+            // at once, every round, for as long as the other side still had
+            // bytes queued — a loop at 100 % of a core, doing nothing.
+            for (client, slot) in [(true, Slot::Client(index)), (false, Slot::Server(index))] {
+                let flags = conn.flags(client);
+                if flags.is_empty() {
+                    continue;
+                }
+                let side = match client {
+                    true => &conn.client,
+                    false => &conn.server,
+                };
+                slots.push(slot);
+                polled.push(PollFd::from_borrowed_fd(side.fd.as_fd(), flags));
+            }
         }
-        match poll(&mut polled, None) {
-            Ok(_) => {}
-            Err(Errno::INTR) => return Ok(()),
-            Err(err) => return Err(err.into()),
+        let timeout = backing_off.then_some(BACKOFF);
+        // An empty array with no timeout would be a wait for nothing. It only
+        // happens when every connection is already finished, and those are
+        // reaped below, which is what puts the listener back in the array.
+        if !polled.is_empty() || timeout.is_some() {
+            match poll(&mut polled, timeout.as_ref()) {
+                Ok(_) => {}
+                Err(Errno::INTR) => return Ok(()),
+                Err(err) => return Err(err.into()),
+            }
         }
-        let revents: Vec<PollFlags> = polled.iter().map(PollFd::revents).collect();
+        self.backoff = false;
+
+        let mut ready = vec![(PollFlags::empty(), PollFlags::empty()); self.conns.len()];
+        let mut waiting = false;
+        for (slot, fd) in slots.iter().zip(polled.iter()) {
+            match slot {
+                Slot::Listener => waiting = fd.revents().intersects(PollFlags::IN),
+                Slot::Client(index) => ready[*index].0 = fd.revents(),
+                Slot::Server(index) => ready[*index].1 = fd.revents(),
+            }
+        }
         drop(polled);
 
         let now = Instant::now();
-        let first = usize::from(listening);
         let Self {
             policy,
             audit,
@@ -413,23 +498,51 @@ impl Relay {
         } = self;
         let mut dead = Vec::new();
         for (index, conn) in conns.iter_mut().enumerate() {
-            let client = revents[first + index * 2];
-            let server = revents[first + index * 2 + 1];
+            let (client, server) = ready[index];
             match conn.service(client, server, policy, audit, now) {
                 Ok(()) if !conn.finished() => {}
                 Ok(()) => dead.push(index),
                 Err(why) => {
-                    audit.line(now, &format!("bubbler-wl-proxy: connection closed: {why}"));
+                    audit.line(
+                        Kind::Close,
+                        now,
+                        &format!("bubbler-wl-proxy: connection closed: {why}"),
+                    );
                     dead.push(index);
                 }
             }
         }
+        // One sandbox, many connections: the per-direction cap bounds each of
+        // them, this bounds the lot. The connection holding the most is the
+        // one that took the total over, and is the one that goes.
+        let total: usize = conns.iter().map(Conn::queued).sum();
+        if total > MAX_TOTAL_QUEUE {
+            let fattest = conns
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !dead.contains(index))
+                .max_by_key(|(_, conn)| conn.queued())
+                .map(|(index, _)| index);
+            if let Some(index) = fattest {
+                audit.line(
+                    Kind::Close,
+                    now,
+                    &format!(
+                        "bubbler-wl-proxy: connection closed: the sandbox has queued \
+                         {total} bytes across its connections"
+                    ),
+                );
+                dead.push(index);
+            }
+        }
         // Dropping a connection closes its sockets and everything still queued
         // on it, descriptors included.
+        dead.sort_unstable();
+        dead.dedup();
         for index in dead.into_iter().rev() {
             conns.remove(index);
         }
-        if listening && revents[0].intersects(PollFlags::IN) {
+        if waiting {
             self.accept(now);
         }
         Ok(())
@@ -443,8 +556,10 @@ impl Relay {
                 match accept_with(&self.listener, SocketFlags::CLOEXEC | SocketFlags::NONBLOCK) {
                     Ok(client) => client,
                     Err(Errno::AGAIN) | Err(Errno::INTR) => return,
+                    Err(err) if out_of_descriptors(err) => return self.wait_for_descriptors(now),
                     Err(err) => {
                         self.audit.line(
+                            Kind::Close,
                             now,
                             &format!("bubbler-wl-proxy: connection closed: accept failed: {err}"),
                         );
@@ -453,7 +568,9 @@ impl Relay {
                 };
             match self.dial() {
                 Ok(server) => self.conns.push(Conn::new(client, server)),
+                Err(err) if out_of_descriptors(err) => return self.wait_for_descriptors(now),
                 Err(err) => self.audit.line(
+                    Kind::Close,
                     now,
                     &format!("bubbler-wl-proxy: connection closed: no upstream socket: {err}"),
                 ),
@@ -461,8 +578,21 @@ impl Relay {
         }
     }
 
+    /// Out of descriptors: say so once and leave the listener out of the next
+    /// round, so the loop waits rather than asking again immediately. The
+    /// connections already open keep being served throughout, and one of them
+    /// ending is what frees the descriptors this needs.
+    fn wait_for_descriptors(&mut self, now: Instant) {
+        self.backoff = true;
+        self.audit.line(
+            Kind::Close,
+            now,
+            "bubbler-wl-proxy: connection refused: out of descriptors",
+        );
+    }
+
     /// Open one connection to the socket the sandbox is really talking to.
-    fn dial(&self) -> io::Result<OwnedFd> {
+    fn dial(&self) -> Result<OwnedFd, Errno> {
         let socket = socket_with(
             AddressFamily::UNIX,
             SocketType::STREAM,
@@ -475,7 +605,7 @@ impl Relay {
             // A connection the kernel could not finish at once finishes on
             // the first write, which is queued like any other.
             Err(Errno::INPROGRESS) | Err(Errno::AGAIN) => Ok(socket),
-            Err(err) => Err(err.into()),
+            Err(err) => Err(err),
         }
     }
 }
@@ -484,7 +614,9 @@ impl Relay {
 mod tests {
     use std::cell::RefCell;
     use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
     use std::rc::Rc;
+    use std::time::Duration;
 
     use rustix::net::socketpair;
 
@@ -606,6 +738,157 @@ mod tests {
             .position(|m| m.name == name)
             .unwrap_or_else(|| panic!("{interface}.{name}"));
         u16::try_from(at).expect("an opcode fits")
+    }
+
+    #[test]
+    fn a_hung_up_upstream_with_a_client_that_never_reads_does_not_spin() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let listen = dir.path().join("listen");
+        let upstream = dir.path().join("upstream");
+        let listener = std::os::unix::net::UnixListener::bind(&listen).expect("a listener");
+        listener.set_nonblocking(true).expect("non-blocking");
+        let compositor = std::os::unix::net::UnixListener::bind(&upstream).expect("an upstream");
+
+        // A compositor that says a great deal and then hangs up. One mebibyte
+        // is under the queue cap, so all of it is read: what the client's own
+        // socket cannot hold stays queued in the proxy, which is the state
+        // that used to spin.
+        let flood = std::thread::spawn(move || {
+            let (mut stream, _) = compositor.accept().expect("the proxy dials");
+            let delete_id = opcode("wl_display", false, "delete_id");
+            let one = wire::encode(1, delete_id, &[Arg::Uint(0xFF00_0001)]).expect("encodes");
+            let mut batch = Vec::new();
+            while batch.len() < 60 * 1024 {
+                batch.extend_from_slice(&one);
+            }
+            let mut sent = 0;
+            while sent < 1 << 20 {
+                if stream.write_all(&batch).is_err() {
+                    break;
+                }
+                sent += batch.len();
+            }
+        });
+
+        let client = UnixStream::connect(&listen).expect("the proxy is listening");
+        let tid = rustix::thread::gettid().as_raw_nonzero().get();
+        let watcher = std::thread::spawn(move || {
+            // Per thread, not per process: `cargo test` runs the rest of the
+            // suite in threads beside this one.
+            let cpu = |tid: i32| -> f64 {
+                let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat"))
+                    .expect("the relay thread's stat");
+                let tail = stat.rsplit_once(')').expect("a stat line").1;
+                let fields: Vec<&str> = tail.split_whitespace().collect();
+                let ticks: u64 = fields[11].parse::<u64>().expect("utime")
+                    + fields[12].parse::<u64>().expect("stime");
+                ticks as f64 / 100.0
+            };
+            // Let the flood be read and the queue jam, then watch a whole
+            // second of a loop that should be asleep in `poll`.
+            std::thread::sleep(Duration::from_millis(1200));
+            let before = cpu(tid);
+            std::thread::sleep(Duration::from_millis(1000));
+            let burned = cpu(tid) - before;
+            // Dropping the client is what ends the connection: the queue
+            // aimed at it can never be delivered.
+            drop(client);
+            burned
+        });
+
+        let mut relay = Relay {
+            listener: OwnedFd::from(listener),
+            upstream,
+            policy: Policy::new(Gate::Paste, false),
+            audit: Audit::new(Box::new(std::io::sink())),
+            conns: Vec::new(),
+            backoff: false,
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut served = false;
+        while Instant::now() < deadline {
+            relay.step().expect("the relay keeps going");
+            served |= !relay.conns.is_empty();
+            if served && relay.conns.is_empty() {
+                break;
+            }
+        }
+        assert!(served, "the proxy never accepted the client");
+        assert!(
+            relay.conns.is_empty(),
+            "the connection outlived both of its peers"
+        );
+        let burned = watcher.join().expect("the watcher");
+        flood.join().expect("the compositor");
+        println!("{burned:.2} CPU-seconds over one second of waiting");
+        assert!(
+            burned < 0.20,
+            "the loop burned {burned:.2} CPU-seconds in one second of waiting"
+        );
+    }
+
+    #[test]
+    fn a_flood_of_descriptors_nothing_will_claim_ends_the_connection() {
+        let mut wired = wired(Gate::Paste);
+        let (read, write) = rustix::pipe::pipe().expect("a pipe");
+        let sync = opcode("wl_display", true, "sync");
+        // Two batches, each of descriptors riding on a request that owns none.
+        // The queue only grows, and the second batch takes it past the cap.
+        for (round, id) in [(0u32, 2u32), (1, 3)] {
+            let message = wire::encode(1, sync, &[Arg::NewId(id)]).expect("encodes");
+            let carried = [write.as_fd(); 130];
+            let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(130))];
+            let mut cmsg = SendAncillaryBuffer::new(&mut space);
+            assert!(cmsg.push(SendAncillaryMessage::ScmRights(&carried)));
+            sendmsg(
+                &wired.client,
+                &[IoSlice::new(&message)],
+                &mut cmsg,
+                SendFlags::NOSIGNAL,
+            )
+            .expect("the client sends a batch");
+            let outcome = wired.step();
+            match round {
+                0 => assert_eq!(outcome, Ok(()), "130 descriptors is under the cap"),
+                _ => assert_eq!(
+                    outcome,
+                    Err("the peer sent more descriptors than its messages can own".to_owned())
+                ),
+            }
+        }
+        drop((read, write));
+    }
+
+    #[test]
+    fn an_empty_descriptor_table_is_waited_out_not_spun_on() {
+        assert!(out_of_descriptors(Errno::MFILE));
+        assert!(out_of_descriptors(Errno::NFILE));
+        assert!(!out_of_descriptors(Errno::CONNABORTED));
+        assert!(!out_of_descriptors(Errno::AGAIN));
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let listener =
+            std::os::unix::net::UnixListener::bind(dir.path().join("listen")).expect("a listener");
+        listener.set_nonblocking(true).expect("non-blocking");
+        let mut relay = Relay {
+            listener: OwnedFd::from(listener),
+            upstream: dir.path().join("upstream"),
+            policy: Policy::new(Gate::Paste, false),
+            audit: Audit::new(Box::new(std::io::sink())),
+            conns: Vec::new(),
+            backoff: false,
+        };
+        relay.wait_for_descriptors(Instant::now());
+        assert!(relay.backoff);
+        // The round that honours it waits on its timeout with the listener
+        // out of the array, and clears the flag as it goes.
+        let waited = Instant::now();
+        relay.step().expect("the loop keeps going");
+        assert!(!relay.backoff);
+        assert!(
+            waited.elapsed() >= Duration::from_millis(50),
+            "the loop did not wait at all"
+        );
     }
 
     #[test]

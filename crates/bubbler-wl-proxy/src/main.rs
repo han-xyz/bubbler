@@ -15,11 +15,12 @@
 use std::ffi::OsString;
 use std::io;
 use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
-use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
+use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd, retry_on_intr};
+use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType, connect, socket_with};
 
 use bubbler_wl_proxy::audit::Audit;
 use bubbler_wl_proxy::policy::{Gate, Policy};
@@ -138,12 +139,33 @@ fn serve(args: Args) -> io::Result<()> {
         Some(fd) => Audit::to_fd(adopt(fd)?),
         None => Audit::to_stderr(),
     };
+    // Reached once before the launcher is told anything: a proxy that cannot
+    // talk to the compositor should fail the launch, not accept every
+    // connection and close it again.
+    if let Err(err) = probe(&args.upstream) {
+        return Err(io::Error::other(format!(
+            "cannot reach the upstream socket {}: {err}",
+            args.upstream.display()
+        )));
+    }
     if let Some(fd) = args.ready_fd {
         let ready = adopt(fd)?;
-        rustix::io::write(&ready, &[0])?;
+        retry_on_intr(|| rustix::io::write(&ready, &[0]))?;
     }
     let policy = Policy::new(args.gate, args.fallback_deny);
     relay::run(listener, args.upstream, policy, audit)
+}
+
+/// Open and drop one connection to `upstream`, to prove it answers.
+fn probe(upstream: &Path) -> Result<(), rustix::io::Errno> {
+    let socket = socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC,
+        None,
+    )?;
+    let address = SocketAddrUnix::new(upstream)?;
+    retry_on_intr(|| connect(&socket, &address))
 }
 
 /// Take ownership of a descriptor the launcher passed by number, and keep it
@@ -313,5 +335,16 @@ mod tests {
     #[test]
     fn a_number_that_names_nothing_is_not_adopted() {
         assert!(adopt(9999).is_err());
+    }
+
+    #[test]
+    fn an_upstream_that_does_not_answer_is_found_before_the_launcher_waits() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("wayland");
+        assert!(probe(&path).is_err(), "nothing is listening there yet");
+        let listener = UnixListener::bind(&path).expect("a listener");
+        probe(&path).expect("a listening socket answers");
+        drop(listener);
+        assert!(probe(&path).is_err(), "the socket has gone again");
     }
 }

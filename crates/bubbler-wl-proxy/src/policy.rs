@@ -19,7 +19,7 @@ use std::ffi::CString;
 use std::os::fd::OwnedFd;
 use std::time::{Duration, Instant};
 
-use crate::audit::Audit;
+use crate::audit::{Audit, Kind};
 use crate::objects::{ObjectError, Objects};
 use crate::tables::{self, Interface, Message};
 use crate::wire::{self, Arg};
@@ -87,7 +87,6 @@ pub struct Policy {
     gate: Gate,
     fallback_deny: bool,
     last_input: Option<Instant>,
-    started: Instant,
 }
 
 /// What one global the compositor advertised is, as this connection was told
@@ -153,7 +152,6 @@ impl Policy {
             gate,
             fallback_deny,
             last_input: None,
-            started: Instant::now(),
         }
     }
 
@@ -213,23 +211,29 @@ impl Policy {
         };
         if self.gate == Gate::Open {
             audit.line(
+                Kind::Gate,
                 now,
                 &format!("bubbler-wl-proxy: clipboard read allowed (open): {iface}, {mime}"),
             );
             return Action::Forward;
         }
-        // With no input yet the age is counted from the proxy's own start, so
-        // the line still says how long the sandbox has been quiet.
-        let since = now.saturating_duration_since(self.last_input.unwrap_or(self.started));
-        if self.last_input.is_some() && since <= GATE_WINDOW {
+        let age = self
+            .last_input
+            .map(|last| now.saturating_duration_since(last));
+        if age.is_some_and(|age| age <= GATE_WINDOW) {
             return Action::Forward;
         }
+        // A sandbox that has had no input at all is the case this gate exists
+        // for, and saying so is more use than an age counted from a start the
+        // reader cannot see.
+        let why = match age {
+            Some(age) => format!("no input for {} ms", age.as_millis()),
+            None => "no input since the proxy started".to_owned(),
+        };
         audit.line(
+            Kind::Gate,
             now,
-            &format!(
-                "bubbler-wl-proxy: clipboard read denied ({iface}, {mime}): no input for {} ms",
-                since.as_millis()
-            ),
+            &format!("bubbler-wl-proxy: clipboard read denied ({iface}, {mime}): {why}"),
         );
         drop_message(msg)
     }
@@ -366,7 +370,11 @@ fn drop_message(msg: &mut Incoming<'_>) -> Action {
 /// Refuse the request with a `wl_display.error` naming `object`, and say so in
 /// the log — the connection is about to end, so this is the only record.
 fn refuse(object: u32, why: &str, audit: &mut Audit, now: Instant) -> Action {
-    audit.line(now, &format!("bubbler-wl-proxy: connection closed: {why}"));
+    audit.line(
+        Kind::Close,
+        now,
+        &format!("bubbler-wl-proxy: connection closed: {why}"),
+    );
     Action::Refuse {
         error: display_error(object, why),
     }
@@ -393,6 +401,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
+    use crate::objects::SERVER_ID_BASE;
 
     /// A log the test can read back.
     #[derive(Clone, Default)]
@@ -585,6 +594,25 @@ mod tests {
     }
 
     #[test]
+    fn the_privileged_list_is_sorted_so_the_search_cannot_fail_open() {
+        let mut sorted = PRIVILEGED.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(sorted.as_slice(), PRIVILEGED);
+        sorted.dedup();
+        assert_eq!(sorted.len(), PRIVILEGED.len(), "a name appears twice");
+        for name in PRIVILEGED {
+            assert_eq!(
+                PRIVILEGED.binary_search(name),
+                Ok(PRIVILEGED
+                    .iter()
+                    .position(|it| it == name)
+                    .expect("present")),
+                "{name} is not where a binary search looks"
+            );
+        }
+    }
+
+    #[test]
     fn the_four_gated_offers_are_sorted_and_in_the_tables() {
         let mut sorted = GATED_OFFERS.to_vec();
         sorted.sort_unstable();
@@ -744,13 +772,13 @@ mod tests {
             assert_eq!(action, Action::Drop, "{iface}");
             let mut buf = [0u8; 8];
             assert_eq!(read.read(&mut buf).expect("the read end is open"), 0);
-            assert!(
-                proxy
-                    .log
-                    .text()
-                    .contains(&format!("clipboard read denied ({iface}, text/plain)")),
-                "{}",
-                proxy.log.text()
+            assert_eq!(
+                proxy.log.text(),
+                format!(
+                    "bubbler-wl-proxy: clipboard read denied ({iface}, text/plain): \
+                     no input since the proxy started\n"
+                ),
+                "{iface}"
             );
         }
     }
@@ -805,6 +833,63 @@ mod tests {
             "bubbler-wl-proxy: clipboard read allowed (open): \
              wl_data_offer, text/plain;charset=utf-8\n"
         );
+    }
+
+    #[test]
+    fn an_offer_the_compositor_created_is_gated_like_any_other() {
+        let mut proxy = proxy();
+        // The chain a real client walks: manager and seat from the registry,
+        // then a data device, then the offer the compositor pushes at it.
+        proxy.advertise(5, "wl_data_device_manager", 3);
+        assert_eq!(
+            proxy.bind(5, "wl_data_device_manager", 3, 3),
+            Action::Forward
+        );
+        proxy.advertise(6, "wl_seat", 4);
+        assert_eq!(proxy.bind(6, "wl_seat", 4, 4), Action::Forward);
+        let mut args = vec![Arg::NewId(5), Arg::Object(4)];
+        assert_eq!(
+            proxy
+                .send(
+                    true,
+                    3,
+                    "wl_data_device_manager",
+                    "get_data_device",
+                    &mut args,
+                    &mut Vec::new()
+                )
+                .expect("accountable"),
+            Action::Forward
+        );
+        let offer = SERVER_ID_BASE + 1;
+        let mut args = vec![Arg::NewId(offer)];
+        assert_eq!(
+            proxy
+                .send(
+                    false,
+                    5,
+                    "wl_data_device",
+                    "data_offer",
+                    &mut args,
+                    &mut Vec::new()
+                )
+                .expect("accountable"),
+            Action::Forward
+        );
+        assert_eq!(
+            proxy.conn.objects.interface(offer).map(|i| i.name),
+            Some("wl_data_offer"),
+            "the offer was not recorded from the event that created it"
+        );
+
+        let (denied, mut read) = proxy.receive(offer, "wl_data_offer", "text/plain");
+        assert_eq!(denied, Action::Drop);
+        let mut buf = [0u8; 8];
+        assert_eq!(read.read(&mut buf).expect("the read end is open"), 0);
+
+        proxy.input("wl_keyboard", "key", 1);
+        let (allowed, _read) = proxy.receive(offer, "wl_data_offer", "text/plain");
+        assert_eq!(allowed, Action::Forward);
     }
 
     #[test]
