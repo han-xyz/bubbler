@@ -49,6 +49,8 @@ use wayrs_protocols::security_context_v1::WpSecurityContextManagerV1;
 
 use crate::config::{Clipboard, WaylandMode};
 use crate::env::Env;
+use crate::error::LaunchError;
+use crate::host::Host;
 
 /// Sandbox engine name bubbler identifies itself to compositors by. It
 /// pairs with the application id: the two together name an application.
@@ -66,6 +68,9 @@ pub const SOCKET_NAME: &str = "wayland";
 /// is where the clipboard gate applies.
 pub const CONTEXT_SOCKET_NAME: &str = "wayland-context";
 
+/// File name of the proxy binary.
+pub const PROXY_NAME: &str = "bubbler-wl-proxy";
+
 /// Where the Wayland proxy is installed, beside `bubbler-init`. Not a
 /// `PATH` name like the D-Bus proxy's: the binary is bubbler's own, and
 /// a run must not pick up whatever else on a `PATH` answers to the name.
@@ -76,12 +81,45 @@ pub const PROXY_BIN: &str = "/usr/lib/bubbler/bubbler-wl-proxy";
 // the proxy forwards.
 include!("../../bubbler-wl-proxy/src/privileged.rs");
 
-/// The proxy binary to run: `$BUBBLER_WL_PROXY` when it is set, else
-/// [`PROXY_BIN`] where the package installs it.
-pub fn proxy_program(env: &Env) -> PathBuf {
-    env.wl_proxy_override
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(PROXY_BIN))
+/// Host path of the proxy binary: [`Env::wl_proxy_override`]
+/// (`$BUBBLER_WL_PROXY`), else next to the running executable, else
+/// [`PROXY_BIN`]. The same order `bubbler-init` is found in, and for the
+/// same reason: a build tree runs what it just built without being told
+/// where it is.
+///
+/// Must be a regular file; an override that is not one is an error,
+/// never a silent fallback to another binary. A run cannot go on
+/// without it — the application would connect to a socket nothing
+/// accepts on — so this fails the launch rather than warning.
+pub fn locate_proxy(env: &Env, host: &dyn Host) -> Result<PathBuf, LaunchError> {
+    if let Some(p) = &env.wl_proxy_override {
+        return check_proxy(p.clone(), host);
+    }
+    if let Some(sibling) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(PROXY_NAME)))
+        && host.file_type(&sibling).is_some_and(|t| t.is_file())
+    {
+        return Ok(sibling);
+    }
+    check_proxy(PathBuf::from(PROXY_BIN), host)
+}
+
+/// `Ok` for a regular file, `WrongType` for anything else that exists
+/// and `MissingResource` for nothing at all.
+fn check_proxy(path: PathBuf, host: &dyn Host) -> Result<PathBuf, LaunchError> {
+    match host.file_type(&path) {
+        Some(t) if t.is_file() => Ok(path),
+        Some(_) => Err(LaunchError::WrongType {
+            service: "wayland",
+            path,
+            expected: "a regular file",
+        }),
+        None => Err(LaunchError::MissingResource {
+            service: "wayland",
+            path,
+        }),
+    }
 }
 
 /// Which Wayland socket a run binds into the sandbox.
@@ -389,18 +427,64 @@ mod tests {
         }
     }
 
-    /// The installed path unless the environment names another binary,
-    /// which is what a build tree and the integration tests run.
     #[test]
-    fn the_proxy_is_the_installed_one_unless_the_environment_says_otherwise() {
+    fn an_override_wins_and_must_be_a_regular_file() {
+        let (file, dir, _) = crate::host::fake::types();
+        let host = crate::host::fake::FakeHost::default()
+            .with("/build/bubbler-wl-proxy", file)
+            .with("/build/adir", dir);
         assert_eq!(
-            proxy_program(&env(None)),
-            PathBuf::from("/usr/lib/bubbler/bubbler-wl-proxy")
-        );
-        assert_eq!(
-            proxy_program(&env(Some("/build/bubbler-wl-proxy".into()))),
+            locate_proxy(&env(Some("/build/bubbler-wl-proxy".into())), &host).unwrap(),
             PathBuf::from("/build/bubbler-wl-proxy")
         );
+        assert!(matches!(
+            locate_proxy(&env(Some("/build/adir".into())), &host),
+            Err(LaunchError::WrongType {
+                service: "wayland",
+                expected: "a regular file",
+                ..
+            })
+        ));
+        assert!(matches!(
+            locate_proxy(&env(Some("/build/gone".into())), &host),
+            Err(LaunchError::MissingResource {
+                service: "wayland",
+                ..
+            })
+        ));
+    }
+
+    /// A run cannot serve the grant without the binary, so the last
+    /// resort failing is a failed launch and not a warning.
+    #[test]
+    fn without_an_override_the_installed_path_is_the_last_resort() {
+        let (file, _, _) = crate::host::fake::types();
+        let host = crate::host::fake::FakeHost::default().with(PROXY_BIN, file);
+        assert_eq!(
+            locate_proxy(&env(None), &host).unwrap(),
+            PathBuf::from(PROXY_BIN)
+        );
+        assert!(matches!(
+            locate_proxy(&env(None), &crate::host::fake::FakeHost::default()),
+            Err(LaunchError::MissingResource { service: "wayland", path }) if path == Path::new(PROXY_BIN)
+        ));
+    }
+
+    /// A build tree runs what it just built: the copy beside the running
+    /// `bubbler` wins over an installed one, so nothing has to be told
+    /// where it is.
+    #[test]
+    fn a_sibling_of_the_running_binary_is_preferred_over_the_installed_one() {
+        let (file, _, _) = crate::host::fake::types();
+        let sibling = std::env::current_exe()
+            .expect("a test binary has a path")
+            .parent()
+            .expect("and a directory")
+            .join(PROXY_NAME);
+        let host = crate::host::fake::FakeHost::default()
+            .with(&sibling.to_string_lossy(), file)
+            .with(PROXY_BIN, file);
+        assert_eq!(locate_proxy(&env(None), &host).unwrap(), sibling);
     }
 
     /// Pinned: the list is a denylist, and an entry lost to an edit is a

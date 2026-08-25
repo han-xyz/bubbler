@@ -87,7 +87,7 @@ arguments of `bubbler-init` rather than of bwrap.
     --ro-bind /run/user/1000/bubbler/ff/wayland /run/user/1000/wayland-1
     --setenv WAYLAND_DISPLAY wayland-1
     security-context: engine=org.bubbler app=org.bubbler.ff instance=bubbler-ff
-    sidecar: bubbler-wl-proxy listener /run/user/1000/bubbler/ff/wayland → /run/user/1000/bubbler/ff/wayland-context, gate paste
+    sidecar: bubbler-wl-proxy listener /run/user/1000/bubbler/ff/wayland → upstream /run/user/1000/bubbler/ff/wayland-context, gate paste
   init                                           7 arguments
     --ro-bind /usr/lib/bubbler/bubbler-init /run/bubbler-init
     -- /run/bubbler-init --socket-fd 10  (socket: the exec channel bubbler-init serves)

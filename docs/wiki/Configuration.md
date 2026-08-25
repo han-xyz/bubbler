@@ -47,7 +47,7 @@ command "firefox"
 
 | Node | Grants | Watch out |
 |---|---|---|
-| `wayland` | bubbler's own socket, registered with the compositor as a security context; `WAYLAND_DISPLAY` | which globals a sandboxed client loses is the compositor's policy; a compositor without the protocol gets the session socket and a warning |
+| `wayland` | bubbler's own socket, registered with the compositor as a security context and served through `bubbler-wl-proxy`, which forwards a clipboard read only just after a key, button or touch of yours; `clipboard="open"` forwards every read and logs it instead; `WAYLAND_DISPLAY` | which globals a sandboxed client loses is the compositor's policy; on a compositor without the protocol the proxy dials the session socket and hides the privileged interfaces itself, and the run prints a note; `clipboard="open"` needs a `lint-allow` reason |
 | `wayland "host"` | the session's socket, with every global | the compositor cannot tell the sandbox from your session; lint warns |
 | `x11` | a rootful Xwayland started inside the sandbox on its first X client, `DISPLAY=:0`; `wm="<program>"` starts a window manager inside with it | needs `wayland` and `dri`; one compositor window, and no window manager unless `wm=` names one bubbler does not ship |
 | `x11 "host"` | the session's X socket, Xauthority at `/home/bubbler/.Xauthority` | X11 clients can keylog each other; lint warns |

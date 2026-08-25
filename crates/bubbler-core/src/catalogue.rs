@@ -65,8 +65,10 @@ pub static GRANTS: &[Grant] = &[
                proxy of bubbler's, which forwards a clipboard read only just after a \
                key, button or touch of yours, so a sandbox cannot poll the selection \
                in the background for whatever you copy next; `clipboard=\"open\"` \
-               forwards every read and logs it instead, and lint warns. A compositor \
-               without the protocol gets the host socket and a warning. `wayland \
+               forwards every read and logs it instead, and lint warns. On a compositor \
+               without the protocol the proxy connects to the session socket and \
+               hides the privileged interfaces in the compositor's place, and the \
+               run prints a note saying so. `wayland \
                \"host\"` binds the session socket as it is, with no proxy in front of \
                it; lint warns. Xwayland clients (`x11`) bypass all of this.",
         risk: Risk::Narrow,

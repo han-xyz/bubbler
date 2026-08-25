@@ -300,10 +300,13 @@ pub fn real_init() -> Option<PathBuf> {
     None
 }
 
-/// The Wayland proxy binary beside the test's own, or `None` (after
-/// printing why) when the workspace has not built it. A run with a
-/// sandboxed `wayland` grant starts it, so a test that starts one needs
-/// it as much as it needs the supervisor.
+/// The Wayland proxy binary beside the `bubbler` under test, or `None`
+/// (after printing why) when the workspace has not built it.
+///
+/// No test hands the path over: `wayland::locate_proxy` looks beside the
+/// running `bubbler` before it looks at the installed path, and that is
+/// this very file. The probe is here so a suite run before the binary is
+/// built skips rather than fails on a missing sidecar.
 pub fn real_wl_proxy() -> Option<PathBuf> {
     let path = Path::new(env!("CARGO_BIN_EXE_bubbler"))
         .parent()
@@ -474,12 +477,6 @@ pub fn bubbler_wayland(root: &Path, init: &Path) -> Command {
         if let Some(value) = std::env::var_os(var) {
             c.env(var, value);
         }
-    }
-    // The application reaches the compositor through the proxy, so a
-    // sandboxed `wayland` run needs the built binary and not the
-    // installed one, which a build tree has no reason to have.
-    if let Some(proxy) = real_wl_proxy() {
-        c.env("BUBBLER_WL_PROXY", proxy);
     }
     c
 }

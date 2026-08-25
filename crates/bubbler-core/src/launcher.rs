@@ -126,6 +126,9 @@ pub struct RealAlloc {
     /// [`FdAllocator::listener`] hands it over. Handed out once: a
     /// number given twice would be closed twice.
     pub listen: Option<OwnedFd>,
+    /// Which of `fds` that socket became, so bubbler's own copy can be
+    /// closed again once the sidecar holding it has been spawned.
+    listen_fd: Option<RawFd>,
     /// Read end of the ready pipe, once [`FdAllocator::ready_pipe`] made one.
     pub ready_read: Option<OwnedFd>,
     /// Read end of the info pipe bwrap reports the sandbox pid on.
@@ -145,6 +148,7 @@ impl RealAlloc {
             fds: Vec::new(),
             socket: Some(socket),
             listen: None,
+            listen_fd: None,
             ready_read: None,
             info_read: None,
             info_write: None,
@@ -159,6 +163,7 @@ impl RealAlloc {
             fds: Vec::new(),
             socket: None,
             listen: None,
+            listen_fd: None,
             ready_read: None,
             info_read: None,
             info_write: None,
@@ -180,6 +185,15 @@ impl RealAlloc {
         let n = fd.as_raw_fd();
         self.fds.push(fd);
         OsString::from(n.to_string())
+    }
+
+    /// Close bubbler's own copy of the listening socket, once the
+    /// sidecar that accepts on it has been spawned. Nothing to do where
+    /// no listener was handed over.
+    fn close_listener(&mut self) {
+        if let Some(fd) = self.listen_fd.take() {
+            self.fds.retain(|held| held.as_raw_fd() != fd);
+        }
     }
 
     /// Clear `CLOEXEC` on every fd the next spawn is meant to inherit, or
@@ -241,7 +255,10 @@ impl FdAllocator for RealAlloc {
     /// so it is inheritable for exactly the one spawn it was built for.
     fn listener(&mut self) -> io::Result<OsString> {
         match self.listen.take() {
-            Some(fd) => Ok(self.keep(fd)),
+            Some(fd) => {
+                self.listen_fd = Some(fd.as_raw_fd());
+                Ok(self.keep(fd))
+            }
             None => Err(io::Error::other("this sidecar has no listening socket")),
         }
     }
@@ -637,7 +654,7 @@ fn wl_proxy_args(
 ) -> Result<(BwrapArgs, Vec<(OsString, Origin)>), LaunchError> {
     let listen = alloc.listener().map_err(LaunchError::Data)?;
     let ready = alloc.ready_pipe().map_err(LaunchError::Data)?;
-    let program = wayland::proxy_program(env);
+    let program = wayland::locate_proxy(env, host)?;
     let command: Vec<(OsString, Origin)> = plan
         .command_nodes(&program, node, &listen, &ready)
         .into_iter()
@@ -651,11 +668,12 @@ fn wl_proxy_args(
     if let Some(program) = seccomp::compile(&seccomp::RuleSet::default_set(), env.seccomp_log)? {
         args.add_seccomp(program.bytes, program.arches);
     }
-    // An overriding binary is not under the `/usr` this sandbox has, so
-    // it is bound in at its own path; the packaged proxy needs no bind.
-    if env.wl_proxy_override.is_some() {
+    // A binary out of a build tree — an override, or the one beside a
+    // `bubbler` that is not installed — is bound in at its own path.
+    // One under the read-only `/usr` this sandbox already has needs no
+    // bind, and bwrap would refuse a destination in there anyway.
+    if !program.starts_with("/usr") {
         args.tag(Origin::Command);
-        let program = service::require_file(host, "wayland", program)?;
         args.ro_bind(&program, &program);
     }
     Ok((args, command))
@@ -761,21 +779,28 @@ impl Drop for WaylandHandle {
     /// inside it down with it; nothing else can, since the proxy holds
     /// no pipe of bubbler's it could see hang up.
     fn drop(&mut self) {
-        if let Some(pid) = i32::try_from(self.child.id()).ok().and_then(Pid::from_raw) {
-            let _ = kill_process(pid, Signal::TERM);
-        }
-        let deadline = Instant::now() + WL_PROXY_STOP;
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) | Err(_) => break,
-                Ok(None) => {}
+        // A sidecar that has already been reaped — by the readiness wait
+        // giving up on it — is not signalled: that pid names whatever the
+        // kernel has handed it to since. `try_wait` answers from the
+        // status it cached the first time, so a reaping anywhere in the
+        // run is caught here.
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            if let Some(pid) = i32::try_from(self.child.id()).ok().and_then(Pid::from_raw) {
+                let _ = kill_process(pid, Signal::TERM);
             }
-            if Instant::now() >= deadline {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-                break;
+            let deadline = Instant::now() + WL_PROXY_STOP;
+            loop {
+                match self.child.try_wait() {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) => {}
+                }
+                if Instant::now() >= deadline {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    break;
+                }
+                std::thread::sleep(POLL);
             }
-            std::thread::sleep(POLL);
         }
         self.alloc.fds.clear();
         self.alloc.ready_read.take();
@@ -830,6 +855,11 @@ pub fn start_wayland(
             );
             // The session's socket is bound into the proxy's sandbox, so
             // it is type-checked like every other bind source.
+            // The probe follows symlinks, as the bind does and as
+            // `wayland "host"` always has: the name is one component
+            // under `$XDG_RUNTIME_DIR`, which is the user's own 0700
+            // directory, so whatever could plant a link there is already
+            // the user.
             let session = service::require_socket(host, "wayland", env.runtime_dir.join(display))?;
             ProxyPlan::fallback(dir, session, clipboard)
         }
@@ -863,9 +893,15 @@ pub fn start_wayland(
         _socket: socket,
         _context: context,
     };
-    // The instance's own bwrap must not inherit these: a second holder of
-    // the listening socket would keep the application's connections from
-    // ever reaching the proxy's `accept`.
+    // bubbler's own copy of the listening socket goes as soon as the
+    // proxy has it. Nothing of bubbler's may be able to accept on the
+    // sandbox's display socket, and a second holder would also keep the
+    // kernel queueing connections in the backlog after the sidecar had
+    // died — the application would wait on a socket nothing answers
+    // instead of being refused outright.
+    handle.alloc.close_listener();
+    // What is left is CLOEXEC again before the instance's own bwrap is
+    // spawned: the ready pipe belongs to this one spawn and no other.
     handle.alloc.inheritable(false).map_err(LaunchError::Data)?;
     let WaylandHandle { child, alloc, .. } = &mut handle;
     let ready = alloc
@@ -3000,6 +3036,41 @@ mod tests {
         assert!(!socket.exists(), "the socket outlived the run");
     }
 
+    /// A sidecar that failed to start has already been reaped by the
+    /// readiness wait, and the handle must not signal that pid: by then
+    /// the kernel may have handed it to something else.
+    ///
+    /// That the signal is not sent cannot be observed from inside this
+    /// process — a `kill` of a reaped pid is an ignored `ESRCH` — so
+    /// what is pinned is the guard's precondition and its effect on the
+    /// drop: the child is already `Some` before the handle is built, and
+    /// the drop neither waits for it nor takes the kill deadline.
+    #[test]
+    fn a_reaped_proxy_is_not_signalled_when_the_handle_drops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("wayland");
+        std::fs::write(&socket, b"").unwrap();
+        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        // What the readiness wait does to a sidecar that exits instead of
+        // reporting: it is reaped here, and the pid stops being its own.
+        let deadline = Instant::now() + PROXY_READY;
+        while !matches!(child.try_wait(), Ok(Some(_))) {
+            assert!(Instant::now() < deadline, "/usr/bin/true never exited");
+            std::thread::sleep(POLL);
+        }
+        let handle = WaylandHandle {
+            child,
+            alloc: RealAlloc::sidecar(),
+            _close: None,
+            _socket: FileGuard(socket.clone()),
+            _context: None,
+        };
+        let started = Instant::now();
+        drop(handle);
+        assert!(started.elapsed() < POLL, "the drop waited on a reaped pid");
+        assert!(!socket.exists(), "the socket outlived the run");
+    }
+
     /// Pinned: the sandbox the Wayland proxy runs in and the argv it is
     /// run with are the contract with `bubbler-wl-proxy`. Nothing of the
     /// session is in here but the socket it forwards to — the socket it
@@ -3012,14 +3083,11 @@ mod tests {
         let e = env(tmp.path());
         let dir = Path::new("/run/user/1000/bubbler/t");
         let plan = ProxyPlan::context(dir, Clipboard::Paste);
-        let argv = wl_proxy_argv(
-            &e,
-            &plan,
-            0,
-            &FakeHost::default(),
-            &mut DryRunAlloc::default(),
-        )
-        .unwrap();
+        // A host holding the packaged proxy and nothing else, so this is
+        // the installed layout's argv and not this build tree's.
+        let (file, _, _) = crate::host::fake::types();
+        let host = FakeHost::default().with(wayland::PROXY_BIN, file);
+        let argv = wl_proxy_argv(&e, &plan, 0, &host, &mut DryRunAlloc::default()).unwrap();
         assert_eq!(
             strs(&argv),
             vec![
@@ -3082,16 +3150,9 @@ mod tests {
         let e = env(tmp.path());
         let dir = Path::new("/run/user/1000/bubbler/t");
         let plan = ProxyPlan::fallback(dir, "/run/user/1000/wayland-1".into(), Clipboard::Open);
-        let argv = strs(
-            &wl_proxy_argv(
-                &e,
-                &plan,
-                0,
-                &FakeHost::default(),
-                &mut DryRunAlloc::default(),
-            )
-            .unwrap(),
-        );
+        let (file, _, _) = crate::host::fake::types();
+        let host = FakeHost::default().with(wayland::PROXY_BIN, file);
+        let argv = strs(&wl_proxy_argv(&e, &plan, 0, &host, &mut DryRunAlloc::default()).unwrap());
         let tail: Vec<&str> = argv
             .iter()
             .skip_while(|a| *a != "--")

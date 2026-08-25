@@ -616,7 +616,13 @@ fn explain_wl_proxy_explains_the_sidecar_and_says_when_there_is_none() {
     bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
     let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
     std::fs::write(&cfg, "wayland clipboard=\"open\"\ncommand \"true\"\n").unwrap();
+    // A stand-in binary named by `$BUBBLER_WL_PROXY`, so the argv is
+    // this test's and not whatever the workspace has built beside the
+    // `bubbler` it is running.
+    let proxy = tmp.path().join("bubbler-wl-proxy");
+    std::fs::write(&proxy, b"").unwrap();
     let out = bubbler(tmp.path())
+        .env("BUBBLER_WL_PROXY", &proxy)
         .args(["run", "t", "--explain=full", "--wl-proxy"])
         .output()
         .unwrap();
@@ -639,10 +645,22 @@ fn explain_wl_proxy_explains_the_sidecar_and_says_when_there_is_none() {
         "{s}"
     );
     assert!(
-        s.contains("\n    /usr/lib/bubbler/bubbler-wl-proxy\n    --listen-fd\n    3\n"),
+        s.contains(&format!(
+            "\n    {proxy}\n    --listen-fd\n    3\n",
+            proxy = proxy.display()
+        )),
         "{s}"
     );
     assert!(s.contains("\n    --ready-fd\n    4\n"), "{s}");
+    // Out of a build tree, so it is bound in at its own path; one under
+    // the read-only `/usr` the sidecar already has needs no bind.
+    assert!(
+        s.contains(&format!(
+            "\n    --ro-bind {proxy} {proxy}\n",
+            proxy = proxy.display()
+        )),
+        "{s}"
+    );
     // The gate is the node's, so it is grouped under it with its line.
     assert!(
         s.contains(
@@ -660,6 +678,7 @@ fn explain_wl_proxy_explains_the_sidecar_and_says_when_there_is_none() {
     // `wayland "host"` is the raw socket and starts no proxy.
     std::fs::write(&cfg, "wayland \"host\"\ncommand \"true\"\n").unwrap();
     let out = bubbler(tmp.path())
+        .env("BUBBLER_WL_PROXY", &proxy)
         .args(["run", "t", "--explain", "--wl-proxy"])
         .output()
         .unwrap();
@@ -719,7 +738,7 @@ fn wayland_dry_run_binds_the_socket_the_proxy_serves() {
     assert!(
         s.contains(&format!(
             "\n    sidecar: bubbler-wl-proxy listener {run}/bubbler/t/wayland \
-             → {run}/bubbler/t/wayland-context, gate paste\n",
+             → upstream {run}/bubbler/t/wayland-context, gate paste\n",
             run = run.display()
         )),
         "{s}"
@@ -3505,9 +3524,10 @@ fn real_wayland_binds_bubblers_own_socket_not_the_hosts() {
         "wayland\ncommand \"true\"\n",
     );
     assert_ne!(inside, host_ino, "the sandbox got the host socket: {err}");
-    // A compositor without the manager binds the session's socket and
-    // says so here, so an absent warning is the run stating that the
-    // inode above differs because a context was registered.
+    // The sandbox binds the proxy's socket either way, so the inode
+    // above differing does not by itself say a context was registered.
+    // A compositor without the manager says so here, and its absence is
+    // the run stating that the proxy's upstream is a context socket.
     assert!(!err.contains("no wp_security_context_manager_v1"), "{err}");
 }
 
@@ -3648,6 +3668,36 @@ fn real_wayland_proxy_serves_the_only_socket_the_sandbox_sees() {
     assert!(!bwrap_alive(&upstream), "the proxy outlived the run: {log}");
     assert!(!leftovers.runtime.join("wayland").exists(), "{log}");
     assert!(!leftovers.runtime.join("wayland-context").exists(), "{log}");
+}
+
+/// A sidecar that exits instead of reporting stops the launch, and says
+/// which binary did it. The run must not go on: the application would
+/// connect to a socket nothing accepts on.
+///
+/// This is also the path the handle's reaped-pid guard is on — the
+/// readiness wait reaps the sidecar, and the drop that follows must not
+/// signal that pid.
+#[test]
+fn real_wayland_a_proxy_that_will_not_start_stops_the_run() {
+    if !require_security_context() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let name = "bubbler-test-wl-dead";
+    let _leftovers = wayland_instance(tmp.path(), &init, name, "wayland\ncommand \"true\"\n");
+    let out = bubbler_wayland(tmp.path(), &init)
+        // A binary that exits 1 at once, under the `/usr` the sidecar
+        // has, so the failure is the proxy's start and not a missing
+        // bind source.
+        .env("BUBBLER_WL_PROXY", "/usr/bin/false")
+        .args(["run", name, "--", "/usr/bin/true"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("bubbler-wl-proxy did not start"), "{err}");
+    assert!(err.contains("it exited"), "{err}");
 }
 
 /// The registry the application is offered is the proxy's: fewer globals

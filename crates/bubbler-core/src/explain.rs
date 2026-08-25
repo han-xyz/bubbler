@@ -338,13 +338,19 @@ fn sidecar_line(cfg: &NetworkConfig) -> String {
 /// sandbox, so nothing else in this view would show it.
 fn wl_sidecar_line(plan: &wayland::ProxyPlan) -> String {
     let mut line = format!(
-        "    sidecar: bubbler-wl-proxy listener {} → {}, gate {}",
+        "    sidecar: bubbler-wl-proxy listener {} → upstream {}, gate {}",
         plan.listener.display(),
         plan.upstream.display(),
         plan.gate()
     );
+    // The count is the denylist's length, not a measurement: how many of
+    // those a compositor actually offers is only known once a client has
+    // read the registry, which an explanation never does.
     if !plan.context {
-        line.push_str(", hides privileged globals");
+        line.push_str(&format!(
+            ", hides {} privileged globals",
+            wayland::PRIVILEGED.len()
+        ));
     }
     line
 }
@@ -432,11 +438,13 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
                         out.push(sidecar_line(cfg));
                         out.extend(ruleset_lines(cfg));
                     }
-                    // Which socket the one `--ro-bind` names is the whole
-                    // difference between the two modes. No probe is run
-                    // for an explanation, so this is what a run gets on a
-                    // compositor that implements the protocol; one that
-                    // does not says so on stderr and binds the session's.
+                    // The one `--ro-bind` names the proxy's own socket
+                    // whatever the compositor answered; only what the
+                    // proxy connects to changes. No probe is run for an
+                    // explanation, so the sidecar line below is what a
+                    // run gets on a compositor that implements the
+                    // protocol; one that does not says so on stderr and
+                    // has the proxy dial the session's socket instead.
                     Some(Service::Wayland(WaylandMode::Sandboxed { .. })) => {
                         out.push(format!(
                             "    security-context: engine={} app={} instance={}",
@@ -737,12 +745,12 @@ bwrap
             (
                 wayland::ProxyPlan::context(dir, Clipboard::Paste),
                 "    sidecar: bubbler-wl-proxy listener \
-                 /run/user/1000/bubbler/t/wayland → /run/user/1000/bubbler/t/wayland-context, gate paste",
+                 /run/user/1000/bubbler/t/wayland → upstream /run/user/1000/bubbler/t/wayland-context, gate paste",
             ),
             (
                 wayland::ProxyPlan::fallback(dir, session, Clipboard::Open),
                 "    sidecar: bubbler-wl-proxy listener \
-                 /run/user/1000/bubbler/t/wayland → /run/user/1000/wayland-1, gate open, hides privileged globals",
+                 /run/user/1000/bubbler/t/wayland → upstream /run/user/1000/wayland-1, gate open, hides 31 privileged globals",
             ),
         ] {
             let cfg = cfg("wayland\ncommand \"true\"");

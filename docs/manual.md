@@ -247,7 +247,7 @@ file descriptor numbers are the ones a dry run prints.
         --setenv WAYLAND_DISPLAY wayland-1
         --setenv XDG_SESSION_TYPE wayland
         security-context: engine=org.bubbler app=org.bubbler.ff instance=bubbler-ff
-        sidecar: bubbler-wl-proxy listener /run/user/1000/bubbler/ff/wayland → /run/user/1000/bubbler/ff/wayland-context, gate paste
+        sidecar: bubbler-wl-proxy listener /run/user/1000/bubbler/ff/wayland → upstream /run/user/1000/bubbler/ff/wayland-context, gate paste
 
       network                         config.kdl:7   5 arguments
         --perms 0644 --ro-bind-data 8 /etc/resolv.conf  (generated file, 23 bytes)
@@ -2649,7 +2649,11 @@ off is what keeps the tree of the binary that starts sandboxes at 42 crates
 against the editor's 76.
 
 `bubbler-init` is deliberately not in `/usr/bin`. It is the supervisor bubbler
-binds into every sandbox, not a command to type. bubbler looks for it in
+binds into every sandbox, not a command to type. `bubbler-wl-proxy`, the
+sidecar in front of a sandboxed `wayland` socket, is beside it for the same
+reason and is found the same way (`$BUBBLER_WL_PROXY`, then next to the running
+`bubbler`, then `/usr/lib/bubbler/bubbler-wl-proxy`), so a build tree runs what
+it just built. bubbler looks for the supervisor in
 `$BUBBLER_INIT`, then next to the running `bubbler`, then at
 `/usr/lib/bubbler/bubbler-init`; a copy in `/usr/bin` would be found by the
 second of those and work fine, which is the point — it buys nothing, and it
