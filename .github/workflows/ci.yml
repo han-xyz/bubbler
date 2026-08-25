@@ -109,4 +109,5 @@ jobs:
             && echo "bwrap: OK" || echo "bwrap: FAIL"
           pasta --version || echo "pasta: missing"
           nft --version || echo "nft: missing"
+          Xwayland -version || echo "Xwayland: missing"
           exit 0

@@ -121,12 +121,13 @@ const ENVIRONMENT: &[(&str, &str)] = &[
     ),
     (
         "WAYLAND_DISPLAY, DISPLAY, XAUTHORITY",
-        "Which session sockets the `wayland` and `x11` grants bind. These are untrusted \
-         input: WAYLAND_DISPLAY must be a single path component under XDG_RUNTIME_DIR and \
-         must be a socket, DISPLAY must be a local display like `:0`, and XAUTHORITY must \
-         be a regular file, $HOME/.Xauthority being the default. The file type is probed, \
-         never mere existence, so a variable naming a directory is refused rather than \
-         bound.",
+        "Which session sockets the `wayland` and `x11 \"host\"` grants bind; a bare `x11` \
+         reads neither DISPLAY nor XAUTHORITY, the server being its own. These are \
+         untrusted input: WAYLAND_DISPLAY must be a single path component under \
+         XDG_RUNTIME_DIR and must be a socket, DISPLAY must be a local display like `:0`, \
+         and XAUTHORITY must be a regular file, $HOME/.Xauthority being the default. The \
+         file type is probed, never mere existence, so a variable naming a directory is \
+         refused rather than bound.",
     ),
     (
         "DBUS_SESSION_BUS_ADDRESS, DBUS_SYSTEM_BUS_ADDRESS",

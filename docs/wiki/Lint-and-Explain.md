@@ -77,15 +77,23 @@ bwrap.
            ...
   seccomp                                        2 arguments
     --add-seccomp-fd 5  (filter, 896 bytes, x86_64 + i386)
-  wayland                         config.kdl:3   9 arguments
+  wayland                         config.kdl:3   6 arguments
     --ro-bind /run/user/1000/bubbler/ff/wayland /run/user/1000/wayland-1
     --setenv WAYLAND_DISPLAY wayland-1
-    --setenv XDG_SESSION_TYPE wayland
     security-context: engine=org.bubbler app=org.bubbler.ff instance=bubbler-ff
+  init                                           7 arguments
+    --ro-bind /usr/lib/bubbler/bubbler-init /run/bubbler-init
+    -- /run/bubbler-init --socket-fd 10  (socket: the exec channel bubbler-init serves)
   x11                             config.kdl:5   17 arguments
     --setenv DISPLAY :0
     --helper /usr/bin/Xwayland :0 -noreset -nolisten tcp -nolisten local -ac -hidpi -decorate -geometry 1280x720 --  (nested Xwayland, started by bubbler-init; -displayfd is added at run time)
 ```
+
+That config has an `x11` node, which is why its `wayland` group carries no
+`--setenv XDG_SESSION_TYPE wayland`: bubbler claims a Wayland session only for
+a sandbox with no X display in it. The `x11` group sits after `init` because
+its first argument is a `--setenv`, and the environment phase comes after every
+bind — the one that puts `bubbler-init` in place included.
 
 Groups sit where a node's first argument appears, so the listing is neither
 file order nor argv order; `--dry-run` and `--format json` are the order of

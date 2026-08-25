@@ -14,7 +14,8 @@ unprivileged and unconfined. Long form with every claim pinned to a test:
 ## Process chain
 
 ```
-bubbler ─┬─ bwrap ── bwrap (pid 1 inside, reaps) ── bubbler-init (pid 2) ── your command
+bubbler ─┬─ bwrap ── bwrap (pid 1 inside, reaps) ── bubbler-init (pid 2) ─┬─ your command
+         │                                                                └─ Xwayland (only with a bare x11)
          ├─ bwrap ── bwrap ── xdg-dbus-proxy        (only with dbus / system-bus)
          └─ pasta                                   (only with isolated network; not sandboxed)
 ```

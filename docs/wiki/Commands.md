@@ -42,7 +42,8 @@ bubbler man [--config]                  bubbler(1) / bubbler-config(5) as roff o
   bubbler returns the command's exit status.
 - `try` grants are bare nodes only: `wayland x11 network dri pipewire pulseaudio
   dbus portals notify tray gamepad hidraw camera`. Bundles are checked as in a
-  file (`--grant tray` needs `--grant dbus`).
+  file (`--grant tray` needs `--grant dbus`, `--grant x11` needs
+  `--grant wayland --grant dri` for the X server it starts inside).
 - `edit` splits `$VISUAL`/`$EDITOR` on whitespace; no shell, no expansion.
 - Instance names: `[A-Za-z0-9._-]`, not starting with `-`, not `try-<digits>`.
 - Environment: `HOME` and `XDG_RUNTIME_DIR` must be set. `BUBBLER_PROFILE_DIR`

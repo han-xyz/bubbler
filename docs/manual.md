@@ -108,7 +108,9 @@ A run is a chain of processes; `bubbler` waits at the top of it and returns the
 command's status.
 
     bubbler ─┬─ bwrap ── bwrap (pid 1 in the sandbox, reaps orphans)
-             │              └─ bubbler-init (pid 2) ── your command
+             │              └─ bubbler-init (pid 2) ─┬─ your command
+             │                                       └─ Xwayland (only with a
+             │                                                    bare `x11`)
              ├─ bwrap ── bwrap ── xdg-dbus-proxy    (only with `dbus`)
              └─ pasta                               (only with an isolated
                                                      `network`; not sandboxed)
@@ -369,7 +371,7 @@ file order does not affect the generated argv.
         disable
     }
     env MOZ_ENABLE_WAYLAND="1"       # extra variables, KEY="value", repeatable
-    lint-allow "x11-without-reason" reason="no Wayland backend"
+    lint-allow "x11-without-reason" reason="the session's window manager"
     desktop "org.mozilla.Thunderbird.desktop"
     command "firefox"
 
@@ -558,10 +560,13 @@ The command line is fixed but for the window:
 
     /usr/bin/Xwayland :0 -noreset -nolisten tcp -nolisten local -ac -hidpi -decorate -geometry 1280x720
 
-`-noreset` keeps the server up when its last client exits, so a launcher that
-restarts its own interface does not take the display down with it. `-nolisten
-tcp` keeps the display off the network and `-nolisten local` off the abstract
-socket namespace, which is where the second listener would be: an abstract unix
+`-noreset` prevents the server reset that closing the last client connection
+would otherwise trigger: a reset frees every remaining client's resources and
+returns the server to its initial state, which is what a launcher restarting
+its own interface would pay. The server keeps running either way — `-terminate`
+is the flag that would end it, and bubbler passes none. `-nolisten tcp` keeps
+the display off the network and `-nolisten local` off the abstract socket
+namespace, which is where the second listener would be: an abstract unix
 socket is addressed by name in a network namespace and ignores the mount
 namespace entirely, so under `network "host"` every process on the host could
 reach it. What is left is the filesystem socket at `/tmp/.X11-unix/X0` in the
@@ -631,6 +636,15 @@ on its main window with nothing to move them. A `fullscreen=#true` config does
 not get the note, having asked for the single full-output window already.
 Starting a window manager inside is out of scope: it would be one more process
 in the sandbox and which one is a matter of taste, not of the boundary.
+
+The server writes its own startup noise to the sandbox's stderr, which is
+yours: `_XSERVTransmkdir: ERROR: euid != 0,directory /tmp/.X11-unix will not be
+created.` is the first line of every run and is harmless: the directory and
+its socket are there all the same, `/tmp/.X11-unix/X0` in the sandbox's own
+`/tmp`. xkbcomp warnings about the session's keymap follow it, under a line
+saying that errors from xkbcomp are not fatal to the X server. Neither is a
+failed launch — the display number on `-displayfd` is the only thing that
+decides that.
 
 Measured here on Xwayland 24.1.13, Hyprland 0.56.2 and an RTX 4070 SUPER: a
 client inside the nested server saw 26 extensions, GLX among them with direct
