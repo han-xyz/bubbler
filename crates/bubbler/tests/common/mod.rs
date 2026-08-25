@@ -482,6 +482,35 @@ pub fn require_security_context() -> bool {
     }
 }
 
+/// Returns false (after printing why) when the host holds nothing to
+/// build a nested X server's arguments from: no `/dev/dri` for the `dri`
+/// grant the mode needs beside it, or no `Xwayland` for the supervisor to
+/// start. Both are read from the host — `/usr` and `/dev` are bound from
+/// it — so even a dry run refuses a server that is not installed there.
+pub fn require_nested_x11_host() -> bool {
+    if !Path::new("/dev/dri").is_dir() {
+        say("skipping: this host has no /dev/dri");
+        return false;
+    }
+    let server = Path::new(bubbler_core::config::XWAYLAND);
+    if !server.is_file() {
+        say(&format!(
+            "skipping: {} is not installed (package `xorg-xwayland`)",
+            server.display()
+        ));
+        return false;
+    }
+    true
+}
+
+/// Returns false (after printing why) when a real nested X server cannot
+/// be tested here: the sandbox's own Wayland socket is what the server
+/// draws in, so this is [`require_security_context`] and the host files
+/// [`require_nested_x11_host`] probes.
+pub fn require_nested_x11() -> bool {
+    require_security_context() && require_nested_x11_host()
+}
+
 /// Whether `program` is on `PATH`. Only the spawn is checked: `dbus-send`
 /// exits 1 on `--version` even when it is installed.
 fn has_program(program: &str) -> bool {

@@ -15,9 +15,9 @@ use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
     PYTHON, bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, bubbler_wayland, bwrap_alive,
     kill_group, output_past_a_busy_exec, process_running, real_init, require_bwrap, require_dbus,
-    require_document_portal, require_groff, require_nft, require_pasta, require_portal,
-    require_python, require_security_context, require_system_bus, require_tray, say, system_owns,
-    test_pty,
+    require_document_portal, require_groff, require_nested_x11, require_nested_x11_host,
+    require_nft, require_pasta, require_portal, require_python, require_security_context,
+    require_system_bus, require_tray, say, system_owns, test_pty,
 };
 use rustix::fs::{OFlags, fcntl_getfl};
 use rustix::process::{Pid, Signal, kill_process};
@@ -2819,6 +2819,52 @@ fn x11_warns_before_a_real_run() {
     assert!(!String::from_utf8_lossy(&out.stderr).contains("x11 \"host\" grants no isolation"));
 }
 
+/// The nested mode's whole server command line reaches the supervisor:
+/// `--helper`, the argv, and the `--` that closes it, all before the `--`
+/// the sandbox's own command follows. The words are the contract with
+/// `bubbler-init`, so a dry run is where a user can read them.
+#[test]
+fn a_nested_x11_dry_run_hands_the_supervisor_the_server_argv() {
+    if !require_nested_x11_host() {
+        return;
+    }
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/t/config.kdl"),
+        "wayland\ndri\nx11\ncommand \"/usr/bin/true\"\n",
+    )
+    .unwrap();
+    // The bare `wayland` grant binds a socket this run would listen on
+    // itself, so the name need not point at anything yet.
+    let out = bubbler(tmp.path())
+        .env("WAYLAND_DISPLAY", "wayland-0")
+        .args(["run", "t", "--dry-run"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    let s = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = s.lines().collect();
+    let tail = [
+        "--helper",
+        "/usr/bin/Xwayland",
+        ":0",
+        "-noreset",
+        "-nolisten",
+        "tcp",
+        "-ac",
+        "-hidpi",
+        "-decorate",
+        "-geometry",
+        "1280x720",
+        "--",
+        "--",
+        "/usr/bin/true",
+    ];
+    assert_eq!(lines[lines.len() - tail.len()..], tail, "{s}");
+}
+
 #[test]
 fn empty_required_vars_are_rejected() {
     let tmp = setup();
@@ -3008,6 +3054,108 @@ fn real_wayland_host_binds_the_host_socket() {
         "wayland \"host\"\ncommand \"true\"\n",
     );
     assert_eq!(inside, host_ino, "{err}");
+}
+
+/// The X client this test runs inside the sandbox. Read from the host's
+/// `/usr`, which is bound read-only, so a host without it has none
+/// inside either.
+const XDPYINFO: &str = "/usr/bin/xdpyinfo";
+
+/// The config a nested `x11` needs: the compositor connection the server
+/// draws its window in, and the render node it draws with.
+const NESTED_X11: &str = "wayland\ndri\nx11\ncommand \"true\"\n";
+
+/// The point of the nested mode: the sandbox gets an X display of its
+/// own, served by an Xwayland the supervisor started inside it, with the
+/// GLX the `dri` grant beside it is what makes possible.
+#[test]
+fn real_nested_x11_serves_a_private_display() {
+    if !require_nested_x11() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    if !Path::new(XDPYINFO).is_file() {
+        say(&format!("skipping: {XDPYINFO} is not installed"));
+        return;
+    }
+    let tmp = setup();
+    let name = "bubbler-test-x11-nested";
+    let _leftovers = wayland_instance(tmp.path(), &init, name, NESTED_X11);
+
+    let out = bubbler_wayland(tmp.path(), &init)
+        .args(["run", name, "--", XDPYINFO])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let s = String::from_utf8_lossy(&out.stdout);
+    // The display the grant fixes, reported by a client that connected to
+    // it: the server was up before the command ran.
+    assert!(s.contains("name of display:    :0"), "{s}{err}");
+    // GLX is in the extension list only where the server found a render
+    // device, which is the `dri` grant reaching the nested display.
+    assert!(s.lines().any(|l| l.trim() == "GLX"), "{s}{err}");
+}
+
+/// `exec` children are what a nested display is for: a browser started
+/// later has to reach the same server, so the supervisor hands them the
+/// `DISPLAY` it set for the command.
+#[test]
+fn real_nested_x11_exec_children_see_the_display() {
+    if !require_nested_x11() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let name = "bubbler-test-x11-exec";
+    let _leftovers = wayland_instance(tmp.path(), &init, name, NESTED_X11);
+
+    let mut run = bubbler_wayland(tmp.path(), &init)
+        .args(["run", name, "--", "/usr/bin/sleep", "20"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The supervisor accepts connections only once the display is up, so
+    // the first `exec` that works is also the first that could have been
+    // handed a `DISPLAY`.
+    let mut inside = None;
+    if !wait_until(
+        || {
+            let out = bubbler_wayland(tmp.path(), &init)
+                .args(["exec", name, "--", "/usr/bin/env"])
+                .output()
+                .expect("running bubbler exec");
+            if out.status.success() {
+                inside = Some(String::from_utf8_lossy(&out.stdout).into_owned());
+            }
+            inside.is_some()
+        },
+        Duration::from_secs(10),
+    ) {
+        fail_with(run, "no exec child ran inside the instance");
+    }
+    let env = inside.expect("set by the poll above");
+    assert!(env.lines().any(|l| l == "DISPLAY=:0"), "{env}");
+
+    kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
+    let mut status = None;
+    assert!(
+        wait_until(
+            || {
+                status = run.try_wait().expect("waiting for the run process");
+                status.is_some()
+            },
+            Duration::from_secs(10)
+        ),
+        "the run did not stop after SIGTERM"
+    );
+    // The instance is gone with it: the supervisor tears the display
+    // helper down on every exit, so nothing of it outlives the run.
+    let sock = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").expect("checked by the guard"))
+        .join("bubbler")
+        .join(name)
+        .join("init.sock");
+    assert!(!sock.exists(), "the control socket outlived the run");
 }
 
 /// `--explain` describes the run a compositor with the protocol gives,
@@ -3417,6 +3565,21 @@ fn try_rejects_bad_grants_and_cleans_up_a_failed_start() {
         .map(|e| e.unwrap().file_name())
         .collect();
     assert!(left.is_empty(), "{left:?}");
+}
+
+/// A bare `--grant x11` is the nested server, which has nowhere to draw
+/// without a compositor connection and nothing to draw with without a
+/// render node. The refusal names both, so the fix is in the message.
+#[test]
+fn try_grant_x11_alone_names_the_requirement() {
+    let tmp = setup();
+    let out = bubbler(tmp.path())
+        .args(["try", "--grant", "x11", "--", "/usr/bin/true"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "{err}");
+    assert!(err.contains("requires wayland and dri"), "{err}");
 }
 
 #[test]
