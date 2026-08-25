@@ -99,6 +99,10 @@ pub struct Env {
     /// the one on `PATH`, for an isolated `network`. A test and debugging
     /// hook, like `$BUBBLER_DBUS_PROXY`; nothing shipped sets it.
     pub pasta_override: Option<PathBuf>,
+    /// `$BUBBLER_WL_PROXY`: host path of the Wayland proxy binary to run
+    /// instead of the installed one, which is what a build tree runs its
+    /// own from. A test and debugging hook; it must be a regular file.
+    pub wl_proxy_override: Option<PathBuf>,
 }
 
 #[cfg(test)]

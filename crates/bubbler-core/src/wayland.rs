@@ -48,6 +48,7 @@ use wayrs_client::{ConnectError, Connection};
 use wayrs_protocols::security_context_v1::WpSecurityContextManagerV1;
 
 use crate::config::WaylandMode;
+use crate::env::Env;
 
 /// Sandbox engine name bubbler identifies itself to compositors by. It
 /// pairs with the application id: the two together name an application.
@@ -57,6 +58,24 @@ pub const ENGINE: &str = "org.bubbler";
 /// runtime directory. The name inside the sandbox is the host's
 /// `$WAYLAND_DISPLAY`; this one is never seen by the application.
 pub const SOCKET_NAME: &str = "wayland";
+
+/// Where the Wayland proxy is installed, beside `bubbler-init`. Not a
+/// `PATH` name like the D-Bus proxy's: the binary is bubbler's own, and
+/// a run must not pick up whatever else on a `PATH` answers to the name.
+pub const PROXY_BIN: &str = "/usr/lib/bubbler/bubbler-wl-proxy";
+
+// The proxy's own file rather than a copy kept in step by hand: a name
+// in one list and not the other would be a global core calls hidden and
+// the proxy forwards.
+include!("../../bubbler-wl-proxy/src/privileged.rs");
+
+/// The proxy binary to run: `$BUBBLER_WL_PROXY` when it is set, else
+/// [`PROXY_BIN`] where the package installs it.
+pub fn proxy_program(env: &Env) -> PathBuf {
+    env.wl_proxy_override
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(PROXY_BIN))
+}
 
 /// Which Wayland socket a run binds into the sandbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,10 +203,10 @@ pub fn plan(
         (WaylandMode::Host, _) => WaylandPlan::Raw {
             reason: RawReason::ConfigHost,
         },
-        (WaylandMode::Sandboxed, Some(false)) => WaylandPlan::Raw {
+        (WaylandMode::Sandboxed { .. }, Some(false)) => WaylandPlan::Raw {
             reason: RawReason::NoManager,
         },
-        (WaylandMode::Sandboxed, Some(true) | None) => WaylandPlan::Context {
+        (WaylandMode::Sandboxed { .. }, Some(true) | None) => WaylandPlan::Context {
             socket: socket_path(instance_runtime),
         },
     }
@@ -249,6 +268,78 @@ mod tests {
     use crate::config::WaylandMode;
     use std::path::Path;
 
+    fn env(wl_proxy_override: Option<PathBuf>) -> Env {
+        Env {
+            home: "/home/han".into(),
+            data_home: "/home/han/.local/share".into(),
+            config_home: "/home/han/.config".into(),
+            data_dirs: crate::env::DEFAULT_DATA_DIRS
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
+            runtime_dir: "/run/user/1000".into(),
+            uid: 1000,
+            gid: 1000,
+            wayland_display: None,
+            display: None,
+            xauthority: None,
+            passthrough: vec![],
+            init_override: None,
+            dbus_address: None,
+            dbus_system_address: None,
+            at_spi_bus_address: None,
+            dbus_log: false,
+            seccomp_log: false,
+            test_allow_path: None,
+            profile_dir_override: None,
+            proxy_override: None,
+            pasta_override: None,
+            wl_proxy_override,
+        }
+    }
+
+    /// The installed path unless the environment names another binary,
+    /// which is what a build tree and the integration tests run.
+    #[test]
+    fn the_proxy_is_the_installed_one_unless_the_environment_says_otherwise() {
+        assert_eq!(
+            proxy_program(&env(None)),
+            PathBuf::from("/usr/lib/bubbler/bubbler-wl-proxy")
+        );
+        assert_eq!(
+            proxy_program(&env(Some("/build/bubbler-wl-proxy".into()))),
+            PathBuf::from("/build/bubbler-wl-proxy")
+        );
+    }
+
+    /// Pinned: the list is a denylist, and an entry lost to an edit is a
+    /// privileged global handed to a sandbox on a compositor that does
+    /// not hide it itself. A duplicate would hide the loss of another.
+    #[test]
+    fn the_privileged_list_is_the_measured_one_sorted_and_unique() {
+        assert_eq!(PRIVILEGED.len(), 31);
+        let mut sorted = PRIVILEGED.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.as_slice(), PRIVILEGED);
+        // The clipboard managers a sandbox must not reach without focus,
+        // and the capture and injection protocols beside them.
+        for name in [
+            "zwlr_data_control_manager_v1",
+            "ext_data_control_manager_v1",
+            "zwlr_screencopy_manager_v1",
+            "zwp_virtual_keyboard_manager_v1",
+            "wp_security_context_manager_v1",
+        ] {
+            assert!(PRIVILEGED.contains(&name), "{name}");
+        }
+        // The application side of the protocols the class does not
+        // cover: hiding these would break input methods and windows.
+        for name in ["zwp_text_input_manager_v3", "xdg_wm_base", "wl_seat"] {
+            assert!(!PRIVILEGED.contains(&name), "{name}");
+        }
+    }
+
     #[test]
     fn plan_follows_mode_and_probe() {
         let rt = Path::new("/run/user/1000/bubbler/t");
@@ -259,13 +350,13 @@ mod tests {
             }
         ));
         assert!(matches!(
-            plan(WaylandMode::Sandboxed, Some(false), rt),
+            plan(WaylandMode::default(), Some(false), rt),
             WaylandPlan::Raw {
                 reason: RawReason::NoManager
             }
         ));
         for probe in [Some(true), None] {
-            match plan(WaylandMode::Sandboxed, probe, rt) {
+            match plan(WaylandMode::default(), probe, rt) {
                 WaylandPlan::Context { socket } => assert_eq!(socket, rt.join("wayland")),
                 other => panic!("{other:?}"),
             }

@@ -163,9 +163,9 @@ const ENVIRONMENT: &[(&str, &str)] = &[
          and $VAR in them are not expanded. VISUAL wins.",
     ),
     (
-        "BUBBLER_INIT, BUBBLER_DBUS_PROXY, BUBBLER_PASTA",
-        "Replace the bubbler-init, xdg-dbus-proxy and pasta binaries a run uses; each must \
-         name a regular file. For tests and debugging.",
+        "BUBBLER_INIT, BUBBLER_DBUS_PROXY, BUBBLER_WL_PROXY, BUBBLER_PASTA",
+        "Replace the bubbler-init, xdg-dbus-proxy, bubbler-wl-proxy and pasta binaries a \
+         run uses; each must name a regular file. For tests and debugging.",
     ),
     (
         "BUBBLER_PROFILE_DIR",
@@ -341,6 +341,12 @@ const CHECK_LINES: &[(&str, &str)] = &[
         "userns-disabled-with-nested-sandbox",
         "`userns \"disable\"` under a command known to start a sandbox of its own; the \
          list of such commands is a heuristic.",
+    ),
+    (
+        "wayland-clipboard-open",
+        "`wayland clipboard=\"open\"` with no `lint-allow` reason: the proxy forwards \
+         every clipboard read the sandbox asks for and only logs it, rather than \
+         forwarding one that follows a key, button or touch of yours.",
     ),
     (
         "wayland-host",

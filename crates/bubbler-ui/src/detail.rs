@@ -515,7 +515,7 @@ mod tests {
     fn the_rows_are_the_rendered_config_line_for_line() {
         let mut cfg = InstanceConfig {
             services: vec![
-                Service::Wayland(WaylandMode::Sandboxed),
+                Service::Wayland(WaylandMode::default()),
                 Service::HomeShare {
                     path: "Downloads".into(),
                     mode: ShareMode::ReadWrite,

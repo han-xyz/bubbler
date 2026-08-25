@@ -833,12 +833,13 @@ mod tests {
             profile_dir_override: None,
             proxy_override: None,
             pasta_override: None,
+            wl_proxy_override: None,
         }
     }
 
     #[test]
     fn no_bus_means_no_proxy() {
-        assert!(plan(&[Service::Wayland(WaylandMode::Sandboxed)], "t").is_none());
+        assert!(plan(&[Service::Wayland(WaylandMode::default())], "t").is_none());
         assert!(plan(&[], "t").is_none());
     }
 
@@ -880,7 +881,7 @@ mod tests {
     #[test]
     fn each_rule_carries_the_node_that_contributed_it() {
         let services = [
-            Service::Wayland(WaylandMode::Sandboxed),
+            Service::Wayland(WaylandMode::default()),
             Service::Dbus {
                 rules: vec![BusRule::Own("org.a.B".into())],
             },

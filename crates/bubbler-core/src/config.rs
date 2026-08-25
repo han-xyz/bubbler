@@ -133,16 +133,44 @@ impl FromStr for Userns {
 
 /// What `wayland` binds: bubbler's own socket registered with the
 /// compositor as a security context, or the host's socket as it is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaylandMode {
     /// A `wp_security_context_v1` listener the compositor treats as
     /// sandboxed, falling back to the host socket with a warning where
-    /// the compositor offers none.
-    #[default]
-    Sandboxed,
+    /// the compositor offers none. The application reaches it through
+    /// bubbler's own proxy, which is where `clipboard` applies.
+    Sandboxed {
+        /// Whether a clipboard read has to follow input of the user's.
+        clipboard: Clipboard,
+    },
     /// The host's socket: the compositor cannot tell the sandbox from
     /// the session (`wayland "host"`).
     Host,
+}
+
+impl Default for WaylandMode {
+    /// The security context with the paste gate on, which is what the
+    /// bare `wayland` node grants.
+    fn default() -> Self {
+        Self::Sandboxed {
+            clipboard: Clipboard::Paste,
+        }
+    }
+}
+
+/// What the Wayland proxy does with a clipboard read the application
+/// asks for: the selection, the primary selection and a drag-and-drop
+/// offer alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Clipboard {
+    /// Forwarded only just after input of the user's — a key, a pointer
+    /// button or a touch — so an application that polls the selection in
+    /// the background while it holds focus reads nothing.
+    #[default]
+    Paste,
+    /// Forwarded whenever the application asks, each read logged
+    /// (`wayland clipboard="open"`). Audit, not a gate.
+    Open,
 }
 
 impl FromStr for WaylandMode {
@@ -785,28 +813,6 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
                 cfg.services.push(parse_dbus(node)?);
             }
             "wayland" => {
-                if node.children().is_some() {
-                    return Err(bad(node, "takes no children"));
-                }
-                let mut mode = WaylandMode::default();
-                let mut seen_mode = false;
-                for e in node.entries() {
-                    if let Some(p) = e.name() {
-                        return Err(ConfigError::UnknownProperty {
-                            node: name.to_owned(),
-                            prop: p.value().to_owned(),
-                        });
-                    }
-                    if seen_mode {
-                        return Err(bad(node, "expects at most one mode argument"));
-                    }
-                    seen_mode = true;
-                    let s = e
-                        .value()
-                        .as_string()
-                        .ok_or_else(|| bad(node, "mode must be \"host\""))?;
-                    mode = WaylandMode::from_str(s)?;
-                }
                 // By variant, like `network`: two `wayland` nodes differ
                 // in mode, and which socket the config asks for would be
                 // a matter of their order in the file.
@@ -817,7 +823,7 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
                 {
                     return Err(ConfigError::Duplicate(name.to_owned()));
                 }
-                cfg.services.push(Service::Wayland(mode));
+                cfg.services.push(Service::Wayland(parse_wayland(node)?));
             }
             "x11" => {
                 // By variant, and before the node itself is read, like
@@ -1804,6 +1810,69 @@ fn parse_geometry(s: &str) -> Option<String> {
     Some(format!("{}x{}", positive(w)?, positive(h)?))
 }
 
+/// `wayland ["host"] [clipboard="open"]`: the bare node is the security
+/// context, and the property is the one thing about the proxy in front
+/// of it a config decides. A property with `"host"` is an error rather
+/// than a value dropped quietly: there is no proxy on the session's
+/// socket, so a gate written there would be one nothing applies.
+fn parse_wayland(node: &KdlNode) -> Result<WaylandMode, ConfigError> {
+    if node.children().is_some() {
+        return Err(bad(node, "takes no children"));
+    }
+    let mut host = false;
+    let mut seen_mode = false;
+    let mut clipboard: Option<Clipboard> = None;
+    for e in node.entries() {
+        let Some(prop) = e.name().map(|n| n.value()) else {
+            if seen_mode {
+                return Err(bad(node, "expects at most one mode argument"));
+            }
+            seen_mode = true;
+            let s = e
+                .value()
+                .as_string()
+                .ok_or_else(|| bad(node, "mode must be \"host\""))?;
+            // `FromStr` takes the one mode name, and its error names it.
+            host = matches!(WaylandMode::from_str(s)?, WaylandMode::Host);
+            continue;
+        };
+        if prop != "clipboard" {
+            return Err(ConfigError::UnknownProperty {
+                node: node.name().value().to_owned(),
+                prop: prop.to_owned(),
+            });
+        }
+        // Written twice, the two entries disagree about the gate and the
+        // winner would be a matter of their order in the line.
+        if clipboard.is_some() {
+            return Err(ConfigError::Duplicate(format!(
+                "{} {prop}",
+                node.name().value()
+            )));
+        }
+        let s = e
+            .value()
+            .as_string()
+            .ok_or_else(|| bad(node, "clipboard must be \"open\""))?;
+        // Only the way out of the default: the gate is what the proxy is
+        // for, and `clipboard="paste"` would be a second spelling of the
+        // bare node for the emitter to choose between.
+        if s != "open" {
+            return Err(bad(node, &format!("expected `open`, got `{s}`")));
+        }
+        clipboard = Some(Clipboard::Open);
+    }
+    if host {
+        if clipboard.is_some() {
+            return Err(bad(node, "\"host\" takes no properties"));
+        }
+        return Ok(WaylandMode::Host);
+    }
+    Ok(WaylandMode::Sandboxed {
+        clipboard: clipboard.unwrap_or_default(),
+    })
+}
+
 /// `x11 ["host"] [geometry="WxH"] [fullscreen=#true] [grab=#true]
 /// [wm="<program>"]`: the bare node is a nested Xwayland the properties
 /// describe the window of. A property with `"host"` is an error rather
@@ -2309,7 +2378,7 @@ mod tests {
         assert_eq!(
             cfg.services,
             vec![
-                Service::Wayland(WaylandMode::Sandboxed),
+                Service::Wayland(WaylandMode::default()),
                 Service::Dri,
                 Service::X11(X11Mode::Nested(NestedX11::default())),
                 Service::Network(NetworkConfig::default()),
@@ -2339,7 +2408,7 @@ mod tests {
         let bare = parse("wayland\ncommand \"true\"").unwrap();
         assert!(
             bare.services
-                .contains(&Service::Wayland(WaylandMode::Sandboxed))
+                .contains(&Service::Wayland(WaylandMode::default()))
         );
         for bad in [
             "wayland \"other\"",
@@ -2352,6 +2421,51 @@ mod tests {
         assert!(matches!(
             parse("wayland\nwayland \"host\"\ncommand \"true\""),
             Err(ConfigError::Duplicate(n)) if n == "wayland"
+        ));
+    }
+
+    /// The one property, which only ever turns the gate off: a value the
+    /// parser dropped quietly would be a sandbox reading the clipboard
+    /// on its own, and one it rewrote would not survive being written
+    /// back to the file.
+    #[test]
+    fn wayland_clipboard_takes_open_and_nothing_else() {
+        let cfg = parse("wayland clipboard=\"open\"\ncommand \"true\"").unwrap();
+        assert!(
+            cfg.services
+                .contains(&Service::Wayland(WaylandMode::Sandboxed {
+                    clipboard: Clipboard::Open
+                }))
+        );
+        assert_eq!(
+            WaylandMode::default(),
+            WaylandMode::Sandboxed {
+                clipboard: Clipboard::Paste
+            }
+        );
+        for bad in [
+            "wayland clipboard=\"paste\"",
+            "wayland clipboard=\"off\"",
+            "wayland clipboard=#true",
+            "wayland clipboard=1",
+        ] {
+            assert!(parse(&format!("{bad}\ncommand \"true\"")).is_err(), "{bad}");
+        }
+        // There is no proxy on the session socket, so a gate written
+        // beside `"host"` would be one nothing applies.
+        assert!(matches!(
+            parse("wayland \"host\" clipboard=\"open\"\ncommand \"true\""),
+            Err(ConfigError::BadArgument { node, reason })
+                if node == "wayland" && reason.contains("takes no properties")
+        ));
+        assert!(matches!(
+            parse("wayland clipboard=\"open\" clipboard=\"open\"\ncommand \"true\""),
+            Err(ConfigError::Duplicate(n)) if n == "wayland clipboard"
+        ));
+        assert!(matches!(
+            parse("wayland gate=\"open\"\ncommand \"true\""),
+            Err(ConfigError::UnknownProperty { node, prop })
+                if node == "wayland" && prop == "gate"
         ));
     }
 
@@ -3906,7 +4020,7 @@ command "b""#
         assert_eq!(raw.includes, vec!["gui".to_string(), "audio".to_string()]);
         assert_eq!(
             raw.config.services,
-            vec![Service::Wayland(WaylandMode::Sandboxed)]
+            vec![Service::Wayland(WaylandMode::default())]
         );
         assert!(!raw.tty_set);
 

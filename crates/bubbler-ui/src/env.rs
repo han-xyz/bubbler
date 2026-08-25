@@ -60,6 +60,7 @@ pub fn from_process() -> Result<Env> {
         profile_dir_override: var_path("BUBBLER_PROFILE_DIR"),
         proxy_override: None,
         pasta_override: None,
+        wl_proxy_override: None,
     })
 }
 

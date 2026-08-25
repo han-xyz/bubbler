@@ -1842,7 +1842,7 @@ pub fn run(
     // back to the session's. The handle holds the context open for the
     // whole run.
     let (_wayland, wayland_probe) = match wayland_mode(&inst.config.services) {
-        Some(WaylandMode::Sandboxed) => match start_wayland(env, &dir, &inst.name)? {
+        Some(WaylandMode::Sandboxed { .. }) => match start_wayland(env, &dir, &inst.name)? {
             Some(handle) => (Some(handle), Some(true)),
             None => (None, Some(false)),
         },
@@ -2086,6 +2086,7 @@ mod tests {
             profile_dir_override: None,
             proxy_override: None,
             pasta_override: None,
+            wl_proxy_override: None,
         }
     }
 
@@ -2678,7 +2679,7 @@ mod tests {
     fn a_config_without_app_runtime_creates_no_app_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let e = env(tmp.path());
-        prepare_app_runtime(&e, &[Service::Wayland(WaylandMode::Sandboxed)]).unwrap();
+        prepare_app_runtime(&e, &[Service::Wayland(WaylandMode::default())]).unwrap();
         assert!(!tmp.path().join("run/app").exists());
     }
 

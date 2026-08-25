@@ -188,7 +188,7 @@ fn grant_service(name: &str) -> Option<Service> {
     Some(match name {
         // Always the security context: `--grant wayland` is not where a
         // user asks for the session's own socket.
-        "wayland" => Service::Wayland(WaylandMode::Sandboxed),
+        "wayland" => Service::Wayland(WaylandMode::default()),
         // The sandbox's own server: `--grant x11` is not where a user
         // asks for the session's display, and it needs `--grant wayland
         // --grant dri` with it, which the config check names.
@@ -719,6 +719,7 @@ mod tests {
             profile_dir_override: Some(data_home.join("profiles")),
             proxy_override: None,
             pasta_override: None,
+            wl_proxy_override: None,
         }
     }
 
@@ -1214,7 +1215,7 @@ mod tests {
             "{services:?}"
         );
         assert!(services.contains(&Service::X11(X11Mode::Host)));
-        assert!(services.contains(&Service::Wayland(WaylandMode::Sandboxed)));
+        assert!(services.contains(&Service::Wayland(WaylandMode::default())));
         drop(eph);
         // The same where the layer below wrote the other mode: the grant
         // is held, and the bare one neither doubles it nor rewrites it.

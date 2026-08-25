@@ -177,6 +177,10 @@ const USERNS_DISABLED_WITH_NESTED_SANDBOX: Check = Check {
     id: "userns-disabled-with-nested-sandbox",
     severity: Severity::Warning,
 };
+const WAYLAND_CLIPBOARD_OPEN: Check = Check {
+    id: "wayland-clipboard-open",
+    severity: Severity::Warning,
+};
 const WAYLAND_HOST: Check = Check {
     id: "wayland-host",
     severity: Severity::Warning,
@@ -225,6 +229,7 @@ pub const CHECKS: &[Check] = &[
     SYSTEM_BUS_POLKIT_NAME,
     TTY_PASSTHROUGH,
     USERNS_DISABLED_WITH_NESTED_SANDBOX,
+    WAYLAND_CLIPBOARD_OPEN,
     WAYLAND_HOST,
     X11_NESTED_NO_WM,
     X11_WITHOUT_REASON,
@@ -905,7 +910,22 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                     .to_owned(),
                 "drop the argument for a security-context socket, or accept it with \
                  `lint-allow \"wayland-host\" reason=\"...\"` naming the privileged protocol \
-                 the application needs",
+                 the application needs; no clipboard proxy runs in front of the session \
+                 socket either, so a focused read is not gated with it",
+            ),
+            "wayland" if prop(node, "clipboard") == Some("open") => f.push(
+                i,
+                node,
+                &WAYLAND_CLIPBOARD_OPEN,
+                "`clipboard=\"open\"` turns the paste gate off: the sandbox may read the \
+                 selection and the primary selection whenever it holds keyboard focus, \
+                 with no keystroke of yours behind the read, and the proxy only logs it"
+                    .to_owned(),
+                "drop the property so a read is forwarded only just after a key, button or \
+                 touch of yours — the gate is what stops an application polling the \
+                 clipboard in the background for whatever you copy next — or accept it \
+                 with `lint-allow \"wayland-clipboard-open\" reason=\"...\"` naming what \
+                 reads the clipboard unattended",
             ),
             "network"
                 if kids(node).any(|c| c.name().value() == "outbound" && arg(c) == Some("deny")) =>
@@ -1510,6 +1530,7 @@ mod tests {
             profile_dir_override: None,
             proxy_override: None,
             pasta_override: None,
+            wl_proxy_override: None,
         }
     }
 
@@ -1588,6 +1609,37 @@ mod tests {
                 ctx,
                 &["wayland \"host\"\nlint-allow \"wayland-host\" \
                    reason=\"needs zwlr_layer_shell_v1\""],
+            );
+            assert_eq!(ids(&allowed), [] as [&str; 0]);
+            // The proxy is part of what the argument gives up, and the
+            // help is where a reader is told so.
+            assert!(
+                report.findings[0].help.contains("clipboard proxy"),
+                "{report:?}"
+            );
+        });
+    }
+
+    /// The property is a warning of its own, and the help says what the
+    /// gate it turns off was for: a reader who is told only that the
+    /// clipboard is open has no way to weigh it.
+    #[test]
+    fn wayland_clipboard_open_is_a_warning_the_bare_node_does_not_raise() {
+        with(&host(), |ctx| {
+            let report = lint(ctx, &["wayland clipboard=\"open\""]);
+            assert_eq!(ids(&report), ["wayland-clipboard-open"]);
+            assert_eq!(report.findings[0].severity, Severity::Warning);
+            assert!(
+                report.findings[0].help.contains("in the background"),
+                "{report:?}"
+            );
+            assert_eq!(ids(&lint(ctx, &["wayland"])), [] as [&str; 0]);
+            let allowed = lint(
+                ctx,
+                &[
+                    "wayland clipboard=\"open\"\nlint-allow \"wayland-clipboard-open\" \
+                   reason=\"a clipboard manager of its own\"",
+                ],
             );
             assert_eq!(ids(&allowed), [] as [&str; 0]);
         });

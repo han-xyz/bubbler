@@ -74,7 +74,7 @@ fn rel_path() -> impl Strategy<Value = PathBuf> {
 fn flag_services() -> impl Strategy<Value = Vec<Service>> {
     prop::collection::vec(any::<bool>(), 6).prop_map(|on| {
         [
-            Service::Wayland(WaylandMode::Sandboxed),
+            Service::Wayland(WaylandMode::default()),
             // `"host"`: every subset of this list has to parse, and the
             // nested default requires `wayland` and `dri` behind it.
             Service::X11(X11Mode::Host),
@@ -591,5 +591,6 @@ fn env(root: &Path, system: &Path) -> Env {
         profile_dir_override: Some(system.to_path_buf()),
         proxy_override: None,
         pasta_override: None,
+        wl_proxy_override: None,
     }
 }

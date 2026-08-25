@@ -35,6 +35,7 @@ pub fn env(root: &Path) -> Env {
         profile_dir_override: Some(root.join("profiles")),
         proxy_override: None,
         pasta_override: None,
+        wl_proxy_override: None,
     }
 }
 

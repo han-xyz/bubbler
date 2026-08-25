@@ -5,7 +5,8 @@
 use std::ffi::{OsStr, OsString};
 
 use crate::config::{
-    BusRule, InstanceConfig, LintAllow, NestedX11, Service, ShareMode, Userns, WaylandMode, X11Mode,
+    BusRule, Clipboard, InstanceConfig, LintAllow, NestedX11, Service, ShareMode, Userns,
+    WaylandMode, X11Mode,
 };
 use crate::error::ConfigError;
 use crate::network::{Mode as NetworkMode, NetworkConfig, Outbound};
@@ -58,7 +59,12 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
     // A new `Service` variant must be given a rendering here: a grant the
     // emitter drops would be a sandbox weaker than the profile it came from.
     Ok(match s {
-        Service::Wayland(WaylandMode::Sandboxed) => "wayland".to_owned(),
+        Service::Wayland(WaylandMode::Sandboxed { clipboard }) => match clipboard {
+            // The default is the bare node: a property that says what the
+            // node says already is one more thing to keep in step.
+            Clipboard::Paste => "wayland".to_owned(),
+            Clipboard::Open => "wayland clipboard=\"open\"".to_owned(),
+        },
         Service::Wayland(WaylandMode::Host) => "wayland \"host\"".to_owned(),
         Service::X11(X11Mode::Nested(n)) => x11(n),
         Service::X11(X11Mode::Host) => "x11 \"host\"".to_owned(),
@@ -384,14 +390,22 @@ mod tests {
         }
     }
 
-    /// Both modes, since the emitter is what a saved config and `reseed`
-    /// are written from: a dropped `"host"` would tighten the grant
-    /// behind the user's back, and a dropped bare node widen it.
+    /// Both modes and the gate, since the emitter is what a saved config
+    /// and `reseed` are written from: a dropped `"host"` would tighten
+    /// the grant behind the user's back, a dropped bare node widen it,
+    /// and a dropped `clipboard="open"` turn a gate back on under an
+    /// application that was configured without one.
     #[test]
     fn both_wayland_modes_round_trip() {
         for (text, mode) in [
-            ("wayland\n", WaylandMode::Sandboxed),
+            ("wayland\n", WaylandMode::default()),
             ("wayland \"host\"\n", WaylandMode::Host),
+            (
+                "wayland clipboard=\"open\"\n",
+                WaylandMode::Sandboxed {
+                    clipboard: Clipboard::Open,
+                },
+            ),
         ] {
             round_trip(text);
             // Canonical already: what the emitter writes is the input.

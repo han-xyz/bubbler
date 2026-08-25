@@ -416,7 +416,7 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
                     // for an explanation, so this is what a run gets on a
                     // compositor that implements the protocol; one that
                     // does not says so on stderr and binds the session's.
-                    Some(Service::Wayland(WaylandMode::Sandboxed)) => out.push(format!(
+                    Some(Service::Wayland(WaylandMode::Sandboxed { .. })) => out.push(format!(
                         "    security-context: engine={} app={} instance={}",
                         wayland::ENGINE,
                         dbus::app_id(view.instance),

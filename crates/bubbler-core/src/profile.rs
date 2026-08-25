@@ -940,7 +940,7 @@ fn mode_conflict(node: &str, a: ShareMode, a_src: &Src, b: ShareMode, b_src: &Sr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BusRule, NestedX11, NetworkConfig, WaylandMode, X11Mode};
+    use crate::config::{BusRule, Clipboard, NestedX11, NetworkConfig, WaylandMode, X11Mode};
 
     fn env(root: &Path) -> Env {
         Env {
@@ -968,6 +968,7 @@ mod tests {
             profile_dir_override: Some(root.join("system")),
             proxy_override: None,
             pasta_override: None,
+            wl_proxy_override: None,
         }
     }
 
@@ -1164,7 +1165,7 @@ mod tests {
                 .contains(&home_share("Projects", ShareMode::ReadWrite))
         );
         for s in [
-            Service::Wayland(WaylandMode::Sandboxed),
+            Service::Wayland(WaylandMode::default()),
             Service::Dri,
             Service::Network(NetworkConfig::default()),
             Service::Portals,
@@ -1203,7 +1204,7 @@ mod tests {
         let kitty = cfg("kitty");
         assert_eq!(kitty.command, Some(vec![OsString::from("kitty")]));
         for s in [
-            Service::Wayland(WaylandMode::Sandboxed),
+            Service::Wayland(WaylandMode::default()),
             Service::Dri,
             Service::Dbus { rules: Vec::new() },
             Service::Portals,
@@ -1341,7 +1342,7 @@ mod tests {
         let cfg = &resolved.config;
         assert!(
             cfg.services
-                .contains(&Service::Wayland(WaylandMode::Sandboxed))
+                .contains(&Service::Wayland(WaylandMode::default()))
         );
         assert!(
             cfg.services
@@ -1385,12 +1386,27 @@ mod tests {
             (
                 "wayland \"host\"\n",
                 "include \"base\"\nwayland\n",
-                WaylandMode::Sandboxed,
+                WaylandMode::default(),
             ),
             (
                 "wayland\n",
                 "include \"base\"\nwayland \"host\"\n",
                 WaylandMode::Host,
+            ),
+            // The gate travels with the mode: a layer that writes the
+            // bare node over `clipboard="open"` gets the gate back,
+            // rather than a node whose property came from below it.
+            (
+                "wayland clipboard=\"open\"\n",
+                "include \"base\"\nwayland\n",
+                WaylandMode::default(),
+            ),
+            (
+                "wayland\n",
+                "include \"base\"\nwayland clipboard=\"open\"\n",
+                WaylandMode::Sandboxed {
+                    clipboard: Clipboard::Open,
+                },
             ),
         ] {
             let r = resolver(tmp.path(), &[("base", base), ("app", app)], &[]);
@@ -1437,7 +1453,7 @@ mod tests {
             assert_eq!(
                 cfg.services,
                 vec![
-                    Service::Wayland(WaylandMode::Sandboxed),
+                    Service::Wayland(WaylandMode::default()),
                     Service::Dri,
                     Service::X11(want)
                 ],
@@ -1598,7 +1614,7 @@ mod tests {
         assert_eq!(
             cfg.services,
             vec![
-                Service::Wayland(WaylandMode::Sandboxed),
+                Service::Wayland(WaylandMode::default()),
                 Service::Network(NetworkConfig::default())
             ]
         );
@@ -1782,7 +1798,7 @@ mod tests {
         assert_eq!(
             cfg.services,
             vec![
-                Service::Wayland(WaylandMode::Sandboxed),
+                Service::Wayland(WaylandMode::default()),
                 Service::Network(NetworkConfig::default()),
                 Service::HomeShare {
                     path: "D".into(),
@@ -2044,7 +2060,7 @@ mod tests {
         assert_eq!(
             cfg.services,
             vec![
-                Service::Wayland(WaylandMode::Sandboxed),
+                Service::Wayland(WaylandMode::default()),
                 Service::Network(NetworkConfig::default()),
                 Service::Dri
             ]

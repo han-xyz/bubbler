@@ -806,6 +806,7 @@ mod tests {
             profile_dir_override: None,
             proxy_override: None,
             pasta_override: None,
+            wl_proxy_override: None,
         }
     }
 

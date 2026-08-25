@@ -550,6 +550,7 @@ mod tests {
             profile_dir_override: Some(tmp.path().join("profiles")),
             proxy_override: None,
             pasta_override: None,
+            wl_proxy_override: None,
         };
         // Named `bubbler`, since that is what a shim points at.
         let bubbler = tmp.path().join("bin").join("bubbler");

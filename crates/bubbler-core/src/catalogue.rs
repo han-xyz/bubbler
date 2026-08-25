@@ -61,11 +61,16 @@ pub static GRANTS: &[Grant] = &[
                security context, and the compositor hides its privileged globals from \
                clients on it: screen capture, reading the clipboard without focus, input \
                injection, overlays and window management, exactly which being the \
-               compositor's policy. A compositor without the protocol gets the host \
-               socket and a warning. `wayland \"host\"` binds the session socket as it \
-               is; lint warns. Xwayland clients (`x11`) bypass all of this.",
+               compositor's policy. The application reaches that socket through a \
+               proxy of bubbler's, which forwards a clipboard read only just after a \
+               key, button or touch of yours, so a sandbox cannot poll the selection \
+               in the background for whatever you copy next; `clipboard=\"open\"` \
+               forwards every read and logs it instead, and lint warns. A compositor \
+               without the protocol gets the host socket and a warning. `wayland \
+               \"host\"` binds the session socket as it is, with no proxy in front of \
+               it; lint warns. Xwayland clients (`x11`) bypass all of this.",
         risk: Risk::Narrow,
-        grammar: "wayland [\"host\"]",
+        grammar: "wayland [\"host\"] [clipboard=\"open\"]",
     },
     Grant {
         node: "x11",
