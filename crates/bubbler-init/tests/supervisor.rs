@@ -271,6 +271,72 @@ fn stop(init: &mut std::process::Child) {
     wait_within(init, PATIENT);
 }
 
+/// How long the guard below gives a run to end on its own. Longer than
+/// the grace the supervisor gives a command that ignores SIGTERM, so a
+/// run that is stopping is reaped by the supervisor rather than orphaned
+/// by the kill that ends the wait.
+const GUARD_LIMIT: Duration = Duration::from_secs(10);
+
+/// A supervisor whose run is ended when this drops, whether the test got
+/// to the end or an assertion took it out from under. A run left behind
+/// is not only the supervisor: it holds a fake X server, a window
+/// manager and a command that sleeps for half a minute, all of them on a
+/// temporary tree the test has already deleted.
+struct Supervisor {
+    init: std::process::Child,
+}
+
+type Guarded = (Supervisor, PathBuf, tempfile::TempDir);
+
+impl Supervisor {
+    /// The process itself, for the tests that signal it by hand or ask
+    /// whether the run is still going.
+    fn child(&mut self) -> &mut std::process::Child {
+        &mut self.init
+    }
+
+    /// End the run with SIGTERM and wait it out, as `stop` does.
+    fn stop(&mut self) {
+        stop(&mut self.init);
+    }
+
+    /// Wait for a run that ends on its own, as `wait_within` does.
+    fn wait_within(&mut self, limit: Duration) -> ExitStatus {
+        wait_within(&mut self.init, limit)
+    }
+}
+
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        // Reaped already, by a wait the test made: the pid is no longer
+        // this run's to signal.
+        if matches!(self.init.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        let _ = rustix::process::kill_process(
+            rustix::process::Pid::from_child(&self.init),
+            rustix::process::Signal::TERM,
+        );
+        let t = Instant::now();
+        while t.elapsed() < GUARD_LIMIT {
+            if matches!(self.init.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Nothing here may panic: this runs while a failing assertion is
+        // unwinding, and a second panic aborts the whole test binary.
+        let _ = self.init.kill();
+        let _ = self.init.wait();
+    }
+}
+
+/// Start a supervisor that is ended for the test whatever happens to it.
+fn start_guarded(cmd: &[&str], opts: Opts<'_>) -> Guarded {
+    let (init, sock, tmp) = start_with(cmd, opts);
+    (Supervisor { init }, sock, tmp)
+}
+
 #[test]
 fn the_main_command_given_a_terminal_leads_its_own_session_and_owns_it() {
     let (master, slave) = pty_pair();
@@ -382,24 +448,17 @@ fn a_stalled_client_cannot_hold_up_the_supervisor() {
         "second exec waited {:?}",
         t.elapsed()
     );
-    let t = Instant::now();
     rustix::process::kill_process(
         rustix::process::Pid::from_child(&init),
         rustix::process::Signal::TERM,
     )
     .unwrap();
-    let status = loop {
-        if let Some(s) = init.try_wait().unwrap() {
-            break s;
-        }
-        assert!(
-            t.elapsed() < Duration::from_millis(200),
-            "init took {:?} to honour SIGTERM",
-            t.elapsed()
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    assert_eq!(status.code(), Some(143));
+    // What the stalled client must not do is keep the signal from being
+    // honoured at all, so the bound here is a hang detector and not a
+    // measurement: this suite runs its tests as threads of one process,
+    // several of them sitting out a five second grace, and a loaded host
+    // takes far longer to get round to the exit than the path itself does.
+    assert_eq!(wait_within(&mut init, PATIENT).code(), Some(143));
     drop(stalled);
 }
 
@@ -551,6 +610,20 @@ fn wm_script(dir: &Path, name: &str, body: &str) -> PathBuf {
     write_script(dir, name, &text, true)
 }
 
+/// Write the instance command that records the descriptors it inherited
+/// and then stays up, so the rest of a test can go on asking the run
+/// questions after it has answered this one. The listing is taken before
+/// the file it goes into is opened, as the window manager's is: an
+/// argument is evaluated after the call it is passed to, so that file's
+/// own descriptor would otherwise be in it.
+fn fd_recording_command(dir: &Path) -> PathBuf {
+    let text = format!(
+        "#!{PYTHON}\nimport os, sys, time\n{FD_LIST}\
+         seen = _fds()\nopen(sys.argv[0] + \".fds\", \"w\").write(seen)\ntime.sleep(30)\n"
+    );
+    write_script(dir, "command", &text, true)
+}
+
 /// A file standing in for the supervisor's whole stdio, so its messages
 /// are readable and none of them reach the terminal the tests run from.
 fn stdio_file(path: &Path) -> OwnedFd {
@@ -655,7 +728,25 @@ fn assert_gone(pid: i32) {
 /// succeeds while no server exists: the supervisor is listening, so the
 /// connection waits in the queue for the server it just woke.
 fn x_connect(path: &Path) -> UnixStream {
-    let client = UnixStream::connect(path).unwrap();
+    // The socket file is there from the `bind`, which is a step before
+    // the `listen`; a connection landing in that window is refused
+    // outright. So a refusal is retried rather than failed on, and only
+    // one that goes on being refused is the bug this would report.
+    let t = Instant::now();
+    let client = loop {
+        match UnixStream::connect(path) {
+            Ok(client) => break client,
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                assert!(
+                    t.elapsed() < Duration::from_secs(5),
+                    "{} refused every connection",
+                    path.display()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("connecting to {}: {e}", path.display()),
+        }
+    };
     client
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -682,7 +773,7 @@ fn the_x_server_is_not_started_until_a_client_connects() {
     let run = format!("env > {}; exec sleep 30", seen.display());
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
-    let (mut init, sock, _tmp) = start_with(
+    let (mut init, sock, _tmp) = start_guarded(
         &["/usr/bin/sh", "-c", &run],
         Opts {
             stdio: Some(&fd),
@@ -716,7 +807,7 @@ fn the_x_server_is_not_started_until_a_client_connects() {
     let client = x_connect(&xsock);
     assert_eq!(served_byte(&client), b'X');
     let pid = pid_of(&script);
-    stop(&mut init);
+    init.stop();
     assert_gone(pid);
 }
 
@@ -733,7 +824,7 @@ fn the_window_manager_starts_with_the_server_and_the_shutdown_runs_inwards() {
     let quit = dir.path().join("quit");
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
-    let (mut init, _sock, _tmp) = start_with(
+    let (mut init, _sock, _tmp) = start_guarded(
         &[cmd.to_str().unwrap(), quit.to_str().unwrap()],
         Opts {
             stdio: Some(&fd),
@@ -760,7 +851,7 @@ fn the_window_manager_starts_with_the_server_and_the_shutdown_runs_inwards() {
     let server_pid = pid_of(&script);
     let wm_pid = pid_of(&wm);
     std::fs::write(&quit, b"").unwrap();
-    let status = wait_within(&mut init, Duration::from_secs(10));
+    let status = init.wait_within(Duration::from_secs(10));
     assert_eq!(status.code(), Some(0));
     assert_gone(wm_pid);
     assert_gone(server_pid);
@@ -785,11 +876,12 @@ fn no_child_but_the_server_inherits_the_display_socket() {
     let dir = tempfile::tempdir().unwrap();
     let script = server_script(dir.path(), "xserver.py", SERVES_AND_STAYS);
     let wm = wm_script(dir.path(), "fake-wm", WM_STAYS);
+    let cmd = fd_recording_command(dir.path());
     let xsock = dir.path().join("X0");
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
-    let (mut init, sock, _tmp) = start_with(
-        &["/usr/bin/sleep", "30"],
+    let (mut init, sock, _tmp) = start_guarded(
+        &[cmd.to_str().unwrap()],
         Opts {
             stdio: Some(&fd),
             x11: Some(&[PYTHON, script.to_str().unwrap()]),
@@ -799,6 +891,14 @@ fn no_child_but_the_server_inherits_the_display_socket() {
         },
     );
     wait_for_path(&xsock);
+    // Both sockets are open before the command is: the one requests
+    // arrive on and the one the display is bound to. It is handed
+    // neither, and keeps nothing but the stdio the run was given.
+    assert_eq!(
+        wait_for_file(&beside(&cmd, ".fds")),
+        "0 1 2",
+        "the command inherited more than its stdio"
+    );
     let client = x_connect(&xsock);
     assert_eq!(served_byte(&client), b'X');
     // The socket is handed to the server on a duplicate, so the window
@@ -818,7 +918,7 @@ fn no_child_but_the_server_inherits_the_display_socket() {
         "0 1 2",
         "an exec'd child inherited more than the stdio it was sent"
     );
-    stop(&mut init);
+    init.stop();
 }
 
 #[test]
@@ -831,7 +931,7 @@ fn a_window_manager_that_cannot_be_started_is_logged_and_the_command_runs_on() {
     let xsock = dir.path().join("X0");
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
-    let (mut init, sock, _tmp) = start_with(
+    let (mut init, sock, _tmp) = start_guarded(
         &["/usr/bin/sleep", "30"],
         Opts {
             stdio: Some(&fd),
@@ -851,8 +951,11 @@ fn a_window_manager_that_cannot_be_started_is_logged_and_the_command_runs_on() {
         ExitStatus::from_raw(exec(&sock, &["/usr/bin/true"])).code(),
         Some(0)
     );
-    assert!(init.try_wait().unwrap().is_none(), "the run was abandoned");
-    stop(&mut init);
+    assert!(
+        init.child().try_wait().unwrap().is_none(),
+        "the run was abandoned"
+    );
+    init.stop();
 }
 
 #[test]
@@ -866,7 +969,7 @@ fn a_window_manager_that_exits_is_reported_once_and_the_command_runs_on() {
     let xsock = dir.path().join("X0");
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
-    let (mut init, sock, _tmp) = start_with(
+    let (mut init, sock, _tmp) = start_guarded(
         &["/usr/bin/sleep", "30"],
         Opts {
             stdio: Some(&fd),
@@ -890,8 +993,11 @@ fn a_window_manager_that_exits_is_reported_once_and_the_command_runs_on() {
         ExitStatus::from_raw(exec(&sock, &["/usr/bin/true"])).code(),
         Some(0)
     );
-    assert!(init.try_wait().unwrap().is_none(), "the run was abandoned");
-    stop(&mut init);
+    assert!(
+        init.child().try_wait().unwrap().is_none(),
+        "the run was abandoned"
+    );
+    init.stop();
 }
 
 #[test]
@@ -904,7 +1010,7 @@ fn a_server_that_exits_after_serving_terminates_the_command() {
     let xsock = dir.path().join("X0");
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
-    let (mut init, _sock, _tmp) = start_with(
+    let (mut init, _sock, _tmp) = start_guarded(
         &["/usr/bin/sleep", "30"],
         Opts {
             stdio: Some(&fd),
@@ -916,7 +1022,7 @@ fn a_server_that_exits_after_serving_terminates_the_command() {
     wait_for_path(&xsock);
     let client = x_connect(&xsock);
     assert_eq!(served_byte(&client), b'X');
-    let status = wait_within(&mut init, Duration::from_secs(10));
+    let status = init.wait_within(Duration::from_secs(10));
     assert_eq!(status.code(), Some(143));
     let err = std::fs::read_to_string(&log).unwrap();
     assert!(
@@ -936,7 +1042,7 @@ fn a_command_that_ignores_the_signal_is_killed_when_the_display_goes() {
     let xsock = dir.path().join("X0");
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
-    let (mut init, _sock, _tmp) = start_with(
+    let (mut init, _sock, _tmp) = start_guarded(
         &[cmd.to_str().unwrap()],
         Opts {
             stdio: Some(&fd),
@@ -949,7 +1055,7 @@ fn a_command_that_ignores_the_signal_is_killed_when_the_display_goes() {
     let client = x_connect(&xsock);
     assert_eq!(served_byte(&client), b'X');
     let t = Instant::now();
-    let status = wait_within(&mut init, Duration::from_secs(12));
+    let status = init.wait_within(Duration::from_secs(12));
     // The grace is the whole point: SIGTERM was ignored, so the run ends
     // on the SIGKILL that follows it instead of never ending at all.
     assert!(
@@ -976,7 +1082,7 @@ fn a_second_stop_does_not_buy_the_command_another_grace() {
     let xsock = dir.path().join("X0");
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
-    let (mut init, _sock, _tmp) = start_with(
+    let (mut init, _sock, _tmp) = start_guarded(
         &[cmd.to_str().unwrap()],
         Opts {
             stdio: Some(&fd),
@@ -995,14 +1101,11 @@ fn a_second_stop_does_not_buy_the_command_another_grace() {
     // to the first event, or every later signal postpones the SIGKILL.
     std::thread::sleep(Duration::from_secs(2));
     rustix::process::kill_process(
-        rustix::process::Pid::from_child(&init),
+        rustix::process::Pid::from_child(init.child()),
         rustix::process::Signal::TERM,
     )
     .unwrap();
-    assert_eq!(
-        wait_within(&mut init, Duration::from_secs(12)).code(),
-        Some(137)
-    );
+    assert_eq!(init.wait_within(Duration::from_secs(12)).code(), Some(137));
     assert!(
         deadline_set.elapsed() < Duration::from_millis(6500),
         "the second signal bought another grace: {:?}",
@@ -1021,7 +1124,7 @@ fn a_client_that_connects_while_stopping_wakes_nothing() {
     let xsock = dir.path().join("X0");
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
-    let (mut init, _sock, _tmp) = start_with(
+    let (mut init, _sock, _tmp) = start_guarded(
         &[cmd.to_str().unwrap()],
         Opts {
             stdio: Some(&fd),
@@ -1032,7 +1135,7 @@ fn a_client_that_connects_while_stopping_wakes_nothing() {
     );
     wait_for_path(&xsock);
     rustix::process::kill_process(
-        rustix::process::Pid::from_child(&init),
+        rustix::process::Pid::from_child(init.child()),
         rustix::process::Signal::TERM,
     )
     .unwrap();
@@ -1040,10 +1143,7 @@ fn a_client_that_connects_while_stopping_wakes_nothing() {
     // whole grace still to run. Starting a server and a window manager
     // for those few seconds is work whose only end is killing them again.
     let _client = x_connect(&xsock);
-    assert_eq!(
-        wait_within(&mut init, Duration::from_secs(12)).code(),
-        Some(137)
-    );
+    assert_eq!(init.wait_within(Duration::from_secs(12)).code(), Some(137));
     assert!(
         !beside(&script, ".pid").exists(),
         "a display was started for a run that was already ending"
@@ -1061,7 +1161,7 @@ fn an_exec_is_refused_once_the_run_is_stopping() {
     let xsock = dir.path().join("X0");
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
-    let (mut init, sock, _tmp) = start_with(
+    let (mut init, sock, _tmp) = start_guarded(
         &[cmd.to_str().unwrap()],
         Opts {
             stdio: Some(&fd),
@@ -1089,10 +1189,7 @@ fn an_exec_is_refused_once_the_run_is_stopping() {
     let told = std::fs::read_to_string(&seen).unwrap();
     assert!(told.contains("stopping"), "the client was told {told:?}");
     // And the run still ends exactly as it did without the request.
-    assert_eq!(
-        wait_within(&mut init, Duration::from_secs(12)).code(),
-        Some(137)
-    );
+    assert_eq!(init.wait_within(Duration::from_secs(12)).code(), Some(137));
 }
 
 #[test]
@@ -1101,7 +1198,7 @@ fn a_server_that_cannot_be_spawned_terminates_the_command() {
     let xsock = dir.path().join("X0");
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
-    let (mut init, _sock, _tmp) = start_with(
+    let (mut init, _sock, _tmp) = start_guarded(
         &["/usr/bin/sleep", "30"],
         Opts {
             stdio: Some(&fd),
@@ -1112,7 +1209,7 @@ fn a_server_that_cannot_be_spawned_terminates_the_command() {
     );
     wait_for_path(&xsock);
     let client = x_connect(&xsock);
-    let status = wait_within(&mut init, Duration::from_secs(10));
+    let status = init.wait_within(Duration::from_secs(10));
     assert_eq!(status.code(), Some(143));
     let err = std::fs::read_to_string(&log).unwrap();
     assert!(err.contains("Xwayland did not start"), "stderr was {err:?}");
