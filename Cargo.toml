@@ -4,6 +4,7 @@ members = [
     "crates/bubbler-core",
     "crates/bubbler",
     "crates/bubbler-init",
+    "crates/bubbler-wl-proxy",
     "crates/bubbler-ui",
 ]
 # The fuzz targets link against libFuzzer and need a nightly compiler,
@@ -26,6 +27,7 @@ repository = "https://github.com/han-xyz/bubbler"
 # `workspace.package.version` at each release.
 bubbler-core = { path = "crates/bubbler-core", version = "0.15.0" }
 bubbler-init = { path = "crates/bubbler-init", version = "0.15.0" }
+bubbler-wl-proxy = { path = "crates/bubbler-wl-proxy", version = "0.15.0" }
 kdl = "6"
 thiserror = "2"
 rustix = { version = "1", features = ["fs", "process", "net", "pipe", "event", "pty", "termios", "thread"] }
@@ -36,5 +38,8 @@ signal-hook = "0.3"
 libseccomp = "0.4"
 wayrs-client = "1"
 wayrs-protocols = { version = "0.14", features = ["security-context-v1"] }
+# Build-time only: the wl-proxy generates its interface tables from the XML
+# the wayrs crates ship, so the tables track the versions Cargo.lock pins.
+wayrs-proto-parser = "3"
 tempfile = "3"
 proptest = "1"

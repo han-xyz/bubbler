@@ -150,6 +150,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bubbler-wl-proxy"
+version = "0.15.0"
+dependencies = [
+ "thiserror",
+ "wayrs-proto-parser",
+]
+
+[[package]]
 name = "by_address"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
