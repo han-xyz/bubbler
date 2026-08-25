@@ -173,20 +173,6 @@ pub enum Clipboard {
     Open,
 }
 
-impl FromStr for WaylandMode {
-    type Err = ConfigError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "host" => Ok(Self::Host),
-            _ => Err(ConfigError::BadArgument {
-                node: "wayland".to_owned(),
-                reason: format!("expected `host`, got `{s}`"),
-            }),
-        }
-    }
-}
-
 /// Absolute path of the X server bubbler starts inside the sandbox.
 /// A host binary under the read-only `/usr`, so the sandbox holds no
 /// copy of its own and cannot replace it.
@@ -1832,8 +1818,10 @@ fn parse_wayland(node: &KdlNode) -> Result<WaylandMode, ConfigError> {
                 .value()
                 .as_string()
                 .ok_or_else(|| bad(node, "mode must be \"host\""))?;
-            // `FromStr` takes the one mode name, and its error names it.
-            host = matches!(WaylandMode::from_str(s)?, WaylandMode::Host);
+            if s != "host" {
+                return Err(bad(node, &format!("expected `host`, got `{s}`")));
+            }
+            host = true;
             continue;
         };
         if prop != "clipboard" {

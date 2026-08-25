@@ -913,20 +913,6 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                  the application needs; no clipboard proxy runs in front of the session \
                  socket either, so a focused read is not gated with it",
             ),
-            "wayland" if prop(node, "clipboard") == Some("open") => f.push(
-                i,
-                node,
-                &WAYLAND_CLIPBOARD_OPEN,
-                "`clipboard=\"open\"` turns the paste gate off: the sandbox may read the \
-                 selection and the primary selection whenever it holds keyboard focus, \
-                 with no keystroke of yours behind the read, and the proxy only logs it"
-                    .to_owned(),
-                "drop the property so a read is forwarded only just after a key, button or \
-                 touch of yours — the gate is what stops an application polling the \
-                 clipboard in the background for whatever you copy next — or accept it \
-                 with `lint-allow \"wayland-clipboard-open\" reason=\"...\"` naming what \
-                 reads the clipboard unattended",
-            ),
             "network"
                 if kids(node).any(|c| c.name().value() == "outbound" && arg(c) == Some("deny")) =>
             {
@@ -1412,6 +1398,28 @@ fn across_layers(ctx: &Context, sources: &[Source], f: &mut Findings) {
         }
     }
 
+    // The last layer that names the mode is the one the merge keeps, so a
+    // bare `wayland` written over `clipboard="open"` leaves the gate on
+    // and nothing to report.
+    if let Some((i, node)) = last(sources, "wayland")
+        && prop(node, "clipboard") == Some("open")
+    {
+        f.push(
+            i,
+            node,
+            &WAYLAND_CLIPBOARD_OPEN,
+            "`clipboard=\"open\"` turns the paste gate off: the sandbox may read the \
+             selection and the primary selection whenever it holds keyboard focus, with \
+             no keystroke of yours behind the read, and the proxy only logs it"
+                .to_owned(),
+            "drop the property so a read is forwarded only just after a key, button or \
+             touch of yours — the gate is what stops an application polling the \
+             clipboard in the background for whatever you copy next — or accept it with \
+             `lint-allow \"wayland-clipboard-open\" reason=\"...\"` naming what reads \
+             the clipboard unattended",
+        );
+    }
+
     let command = last(sources, "command").and_then(|(i, n)| arg(n).map(|a| (i, n, a)));
     if let Some((i, node, disable)) =
         last(sources, "userns").map(|(i, n)| (i, n, arg(n) == Some("disable")))
@@ -1622,7 +1630,10 @@ mod tests {
 
     /// The property is a warning of its own, and the help says what the
     /// gate it turns off was for: a reader who is told only that the
-    /// clipboard is open has no way to weigh it.
+    /// clipboard is open has no way to weigh it. Read off the node the
+    /// merge keeps, so a layer that writes the bare node over a
+    /// profile's `clipboard="open"` is not warned about a gate it turned
+    /// back on.
     #[test]
     fn wayland_clipboard_open_is_a_warning_the_bare_node_does_not_raise() {
         with(&host(), |ctx| {
@@ -1642,6 +1653,15 @@ mod tests {
                 ],
             );
             assert_eq!(ids(&allowed), [] as [&str; 0]);
+            // The layer above decides the mode, in both directions.
+            assert_eq!(
+                ids(&lint(ctx, &["wayland clipboard=\"open\"", "wayland"])),
+                [] as [&str; 0]
+            );
+            assert_eq!(
+                ids(&lint(ctx, &["wayland", "wayland clipboard=\"open\""])),
+                ["wayland-clipboard-open"]
+            );
         });
     }
 

@@ -692,6 +692,7 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Clipboard;
 
     fn env(data_home: &Path) -> Env {
         Env {
@@ -1227,6 +1228,17 @@ mod tests {
                 Service::Wayland(WaylandMode::Host),
                 Service::X11(X11Mode::Host)
             ]
+        );
+        // And where the mode carries a property: the bare grant would
+        // otherwise turn a gate the config asked to be off back on,
+        // which is a change the user did not write.
+        let mut cfg = config::parse("wayland clipboard=\"open\"").unwrap();
+        with_grants(&mut cfg, &["wayland"]).unwrap();
+        assert_eq!(
+            cfg.services,
+            vec![Service::Wayland(WaylandMode::Sandboxed {
+                clipboard: Clipboard::Open
+            })]
         );
         let eph = Instance::ephemeral(&env, "generic", &["gamepad", "dbus", "tray"]).unwrap();
         let services = &eph.instance.config.services;
