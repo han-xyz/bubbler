@@ -2,29 +2,36 @@ use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use bubbler_init::{proto, wire};
 
-type Started = (std::process::Child, std::path::PathBuf, tempfile::TempDir);
+type Started = (std::process::Child, PathBuf, tempfile::TempDir);
 
-fn start(cmd: &[&str]) -> Started {
-    start_with(cmd, false, None, None)
-}
-
-/// Start the supervisor on an inherited listening socket. `ctty` stands
-/// for bubbler passing `--ctty`: the terminal on fd 0 is a pty bubbler
+/// Everything bubbler may pass the supervisor beyond the command itself.
+/// `ctty` stands for `--ctty`: the terminal on fd 0 is a pty bubbler
 /// allocated, so the main command may take it over. `stdio` is what all
 /// three of its descriptors become; without one it gets `/dev/null`, so
-/// no test ever hands it the terminal it is run from. `helper` is the
-/// display helper argv bubbler passes as `--helper <argv...> --`.
-fn start_with(
-    cmd: &[&str],
+/// no test ever hands it the terminal it is run from. `x11` is the X
+/// server argv passed as `--x11 <argv...> --`, `x11_socket` the socket
+/// the supervisor binds for it, and `wm` the window manager program.
+#[derive(Default)]
+struct Opts<'a> {
     ctty: bool,
-    stdio: Option<&OwnedFd>,
-    helper: Option<&[&str]>,
-) -> Started {
+    stdio: Option<&'a OwnedFd>,
+    x11: Option<&'a [&'a str]>,
+    x11_socket: Option<&'a Path>,
+    wm: Option<&'a Path>,
+}
+
+fn start(cmd: &[&str]) -> Started {
+    start_with(cmd, Opts::default())
+}
+
+/// Start the supervisor on an inherited listening socket.
+fn start_with(cmd: &[&str], opts: Opts<'_>) -> Started {
     let tmp = tempfile::tempdir().unwrap();
     let sock = tmp.path().join("init.sock");
     let listener = UnixListener::bind(&sock).unwrap();
@@ -34,13 +41,19 @@ fn start_with(
     let mut init = Command::new(env!("CARGO_BIN_EXE_bubbler-init"));
     init.arg("--socket-fd")
         .arg(inherited.as_raw_fd().to_string());
-    if ctty {
+    if opts.ctty {
         init.arg("--ctty");
     }
-    if let Some(argv) = helper {
-        init.arg("--helper").args(argv).arg("--");
+    if let Some(argv) = opts.x11 {
+        init.arg("--x11").args(argv).arg("--");
     }
-    match stdio {
+    if let Some(path) = opts.x11_socket {
+        init.arg("--x11-socket").arg(path);
+    }
+    if let Some(wm) = opts.wm {
+        init.arg("--wm").arg(wm);
+    }
+    match opts.stdio {
         Some(fd) => {
             init.stdin(Stdio::from(fd.try_clone().unwrap()))
                 .stdout(Stdio::from(fd.try_clone().unwrap()))
@@ -68,18 +81,14 @@ fn pty_pair() -> (OwnedFd, OwnedFd) {
     (master, slave)
 }
 
-fn exec(sock: &std::path::Path, argv: &[&str]) -> i32 {
+fn exec(sock: &Path, argv: &[&str]) -> i32 {
     let null = std::fs::File::open("/dev/null").unwrap();
     exec_with_stdout(sock, argv, null.as_fd())
 }
 
 /// Exec a command whose stdout is `out`, so the test can read back what
 /// it printed; stdin and stderr are `/dev/null`.
-fn exec_with_stdout(
-    sock: &std::path::Path,
-    argv: &[&str],
-    out: std::os::fd::BorrowedFd<'_>,
-) -> i32 {
+fn exec_with_stdout(sock: &Path, argv: &[&str], out: std::os::fd::BorrowedFd<'_>) -> i32 {
     let s = UnixStream::connect(sock).unwrap();
     let null = std::fs::File::open("/dev/null").unwrap();
     let refs: Vec<&std::ffi::OsStr> = argv.iter().map(std::ffi::OsStr::new).collect();
@@ -169,7 +178,7 @@ fn read_to_end(fd: std::os::fd::BorrowedFd<'_>) -> String {
 /// Exec the probe with a fresh pty as its stdio; returns its status and
 /// everything it printed to that pty. `ctty` is the request flag asking
 /// for that pty to become the command's controlling terminal.
-fn exec_on_a_pty(sock: &std::path::Path, ctty: bool) -> (i32, String) {
+fn exec_on_a_pty(sock: &Path, ctty: bool) -> (i32, String) {
     let (master, slave) = pty_pair();
     let s = UnixStream::connect(sock).unwrap();
     let argv = [
@@ -198,8 +207,14 @@ fn stop(init: &mut std::process::Child) {
 #[test]
 fn the_main_command_given_a_terminal_leads_its_own_session_and_owns_it() {
     let (master, slave) = pty_pair();
-    let (mut init, _sock, _tmp) =
-        start_with(&["/usr/bin/sh", "-c", TTY_PROBE], true, Some(&slave), None);
+    let (mut init, _sock, _tmp) = start_with(
+        &["/usr/bin/sh", "-c", TTY_PROBE],
+        Opts {
+            ctty: true,
+            stdio: Some(&slave),
+            ..Opts::default()
+        },
+    );
     // Only the supervisor's copies are left, so the master reads to EIO
     // as soon as the run is over.
     drop(slave);
@@ -226,7 +241,13 @@ fn an_exec_request_may_ask_for_the_terminal_it_sends() {
 fn without_the_request_flag_a_terminal_is_left_to_whoever_owns_it() {
     // `--ctty` covers the instance's own command only: an exec whose fd 0
     // may be the user's own terminal must not take it over.
-    let (mut init, sock, _tmp) = start_with(&["/usr/bin/sleep", "30"], true, None, None);
+    let (mut init, sock, _tmp) = start_with(
+        &["/usr/bin/sleep", "30"],
+        Opts {
+            ctty: true,
+            ..Opts::default()
+        },
+    );
     std::thread::sleep(Duration::from_millis(200));
     let (_, out) = exec_on_a_pty(&sock, false);
     assert!(!out.contains("LEADER"), "took a session anyway: {out:?}");
@@ -355,53 +376,72 @@ fn more_stalled_clients_than_the_table_holds_drops_the_oldest() {
     drop(stalled);
 }
 
-/// Interpreter the fake display helpers are written in; the tests below
-/// skip when it is not installed, as the fixtures elsewhere do.
+/// Interpreter the fake X servers are written in; the tests below skip
+/// when it is not installed, as the fixtures elsewhere do.
 const PYTHON: &str = "/usr/bin/python3";
 
-/// Returns false (after printing why) when the fake helpers cannot run here.
+/// Returns false (after printing why) when the fake servers cannot run here.
 fn require_python() -> bool {
-    let ok = std::path::Path::new(PYTHON).is_file();
+    let ok = Path::new(PYTHON).is_file();
     if !ok {
         println!("skipping: {PYTHON} is not installed");
     }
     ok
 }
 
-/// What every fake helper does before it differs: find `-displayfd N` in
-/// its own argv the way Xwayland does, and leave its pid beside the
-/// script so the test can tell whether it is still running.
-const HELPER_PRELUDE: &str = r#"import os, sys, time
+/// What every fake X server does before it differs: find `-listenfd N` in
+/// its own argv the way Xwayland does, record its pid beside the script
+/// so a test can tell whether it was started at all, and accept on the
+/// inherited socket the connection that woke it.
+const SERVER_PRELUDE: &str = r#"import os, socket, sys, time
 argv = sys.argv[1:]
-fd = int(argv[argv.index("-displayfd") + 1])
+fd = int(argv[argv.index("-listenfd") + 1])
+open(sys.argv[0] + ".pid", "w").write(str(os.getpid()))
+listener = socket.fromfd(fd, socket.AF_UNIX, socket.SOCK_STREAM)
+conn, _ = listener.accept()
+conn.sendall(b"X")
+"#;
+
+/// A server that serves its first client and stays up, as Xwayland does.
+const SERVES_AND_STAYS: &str = "time.sleep(30)\n";
+/// A server that serves its first client and then loses the display.
+const SERVES_AND_DIES: &str = "sys.exit(0)\n";
+
+/// A window manager that records the display it was handed and stays up.
+const WM_STAYS: &str = r#"#!/usr/bin/python3
+import os, sys, time
+open(sys.argv[0] + ".pid", "w").write(str(os.getpid()))
+open(sys.argv[0] + ".display", "w").write(os.environ.get("DISPLAY", "none"))
+time.sleep(30)
+"#;
+/// A window manager that is there but does not stay.
+const WM_EXITS: &str = r#"#!/usr/bin/python3
+import os, sys
 open(sys.argv[0] + ".pid", "w").write(str(os.getpid()))
 "#;
 
-/// A helper that reports display 0 and then stays up, as Xwayland does.
-const REPORTS_AND_STAYS: &str = r#"os.write(fd, b"0\n")
-time.sleep(30)
-"#;
-/// A helper that comes up but never reports a display.
-const NEVER_REPORTS: &str = "time.sleep(30)\n";
-/// A helper that fails before it can report anything.
-const DIES_AT_ONCE: &str = "sys.exit(1)\n";
-/// A helper that reports a display and then loses it.
-const REPORTS_AND_DIES: &str = r#"os.write(fd, b"0\n")
-time.sleep(0.5)
-"#;
-
-/// Write one fake helper into `dir` and return its path.
-fn helper_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+/// Write one fake X server into `dir` and return its path. It is run
+/// through the interpreter, so `--x11` carries more than one word.
+fn server_script(dir: &Path, name: &str, body: &str) -> PathBuf {
     let path = dir.join(name);
     let mut f = std::fs::File::create(&path).unwrap();
-    f.write_all(HELPER_PRELUDE.as_bytes()).unwrap();
+    f.write_all(SERVER_PRELUDE.as_bytes()).unwrap();
     f.write_all(body.as_bytes()).unwrap();
+    path
+}
+
+/// Write one fake window manager into `dir`, executable and with its own
+/// interpreter line: `--wm` names one program and nothing in front of it.
+fn wm_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     path
 }
 
 /// A file standing in for the supervisor's whole stdio, so its messages
 /// are readable and none of them reach the terminal the tests run from.
-fn stdio_file(path: &std::path::Path) -> OwnedFd {
+fn stdio_file(path: &Path) -> OwnedFd {
     OwnedFd::from(
         std::fs::File::options()
             .read(true)
@@ -414,7 +454,7 @@ fn stdio_file(path: &std::path::Path) -> OwnedFd {
 }
 
 /// Wait for a file to hold something and return it.
-fn wait_for_file(path: &std::path::Path) -> String {
+fn wait_for_file(path: &Path) -> String {
     let t = Instant::now();
     loop {
         if let Ok(s) = std::fs::read_to_string(path)
@@ -431,45 +471,106 @@ fn wait_for_file(path: &std::path::Path) -> String {
     }
 }
 
-/// The pid a fake helper recorded for itself.
-fn helper_pid(script: &std::path::Path) -> i32 {
-    let mut pidfile = script.as_os_str().to_owned();
-    pidfile.push(".pid");
-    wait_for_file(std::path::Path::new(&pidfile))
-        .trim()
-        .parse()
-        .unwrap()
-}
-
-/// Fail unless the helper has left the process table. It is the
-/// supervisor's own child, so it is reaped there and the entry goes with it.
-fn assert_gone(pid: i32) {
-    let path = std::path::PathBuf::from(format!("/proc/{pid}"));
+/// Wait for a path to exist, whatever it holds; the display socket is
+/// bound before the command runs, so a client may connect at once.
+fn wait_for_path(path: &Path) {
     let t = Instant::now();
-    while path.exists() {
+    while !path.exists() {
         assert!(
-            t.elapsed() < Duration::from_secs(3),
-            "the helper ({pid}) was left running"
+            t.elapsed() < Duration::from_secs(5),
+            "{} never appeared",
+            path.display()
         );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
 
+/// Wait for the supervisor's stderr to carry `needle`, and hand back all
+/// of it, so a failing assertion can show what was logged instead.
+fn wait_for_log(log: &Path, needle: &str) -> String {
+    let t = Instant::now();
+    loop {
+        let text = std::fs::read_to_string(log).unwrap_or_default();
+        if text.contains(needle) {
+            return text;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "{needle:?} was never logged; stderr was {text:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Where a fake server or window manager records its own pid.
+fn pidfile(script: &Path) -> PathBuf {
+    let mut path = script.as_os_str().to_owned();
+    path.push(".pid");
+    PathBuf::from(path)
+}
+
+/// The pid a fake server or window manager recorded for itself.
+fn pid_of(script: &Path) -> i32 {
+    wait_for_file(&pidfile(script)).trim().parse().unwrap()
+}
+
+/// Fail unless the process has left the process table. It is the
+/// supervisor's own child, so it is reaped there and the entry goes with it.
+fn assert_gone(pid: i32) {
+    let path = PathBuf::from(format!("/proc/{pid}"));
+    let t = Instant::now();
+    while path.exists() {
+        assert!(
+            t.elapsed() < Duration::from_secs(3),
+            "the process ({pid}) was left running"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Connect to the socket the supervisor bound for the display. This
+/// succeeds while no server exists: the supervisor is listening, so the
+/// connection waits in the queue for the server it just woke.
+fn x_connect(path: &Path) -> UnixStream {
+    let client = UnixStream::connect(path).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    client
+}
+
+/// The byte the fake server sends once it has accepted, so a test can
+/// tell that the connection was served by the server and not by init.
+fn served_byte(client: &UnixStream) -> u8 {
+    let mut byte = [0u8; 1];
+    std::io::Read::read_exact(&mut &*client, &mut byte).unwrap();
+    byte[0]
+}
+
 #[test]
-fn a_helper_that_reports_a_display_is_started_first_and_the_command_sees_it() {
+fn the_x_server_is_not_started_until_a_client_connects() {
     if !require_python() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let script = helper_script(dir.path(), "reports.py", REPORTS_AND_STAYS);
+    let script = server_script(dir.path(), "xserver.py", SERVES_AND_STAYS);
+    let xsock = dir.path().join("X0");
     let seen = dir.path().join("cmd.env");
     let run = format!("env > {}; exec sleep 30", seen.display());
+    let log = dir.path().join("init.log");
+    let fd = stdio_file(&log);
     let (mut init, sock, _tmp) = start_with(
         &["/usr/bin/sh", "-c", &run],
-        false,
-        None,
-        Some(&[PYTHON, script.to_str().unwrap()]),
+        Opts {
+            stdio: Some(&fd),
+            x11: Some(&[PYTHON, script.to_str().unwrap()]),
+            x11_socket: Some(&xsock),
+            ..Opts::default()
+        },
     );
+    wait_for_path(&xsock);
+    // The display is in the environment from the command's first line,
+    // long before anything has connected to it.
     let env = wait_for_file(&seen);
     assert!(
         env.lines().any(|l| l == "DISPLAY=:0"),
@@ -484,87 +585,160 @@ fn a_helper_that_reports_a_display_is_started_first_and_the_command_sees_it() {
         env.lines().any(|l| l == "DISPLAY=:0"),
         "the exec'd child saw no display: {env:?}"
     );
-    let pid = helper_pid(&script);
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        !pidfile(&script).exists(),
+        "the server was started with no client to serve"
+    );
+    let client = x_connect(&xsock);
+    assert_eq!(served_byte(&client), b'X');
+    let pid = pid_of(&script);
     stop(&mut init);
     assert_gone(pid);
 }
 
 #[test]
-fn a_helper_that_never_reports_is_a_startup_failure() {
+fn the_window_manager_starts_with_the_server_and_both_stop_with_the_command() {
     if !require_python() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let script = helper_script(dir.path(), "mute.py", NEVER_REPORTS);
-    let marker = dir.path().join("the-command-ran");
-    let log = dir.path().join("init.log");
-    let fd = stdio_file(&log);
-    let t = Instant::now();
-    let (mut init, _sock, _tmp) = start_with(
-        &["/usr/bin/touch", marker.to_str().unwrap()],
-        false,
-        Some(&fd),
-        Some(&[PYTHON, script.to_str().unwrap()]),
-    );
-    let pid = helper_pid(&script);
-    let status = init.wait().unwrap();
-    assert!(
-        t.elapsed() >= Duration::from_secs(10) && t.elapsed() < Duration::from_secs(15),
-        "gave up after {:?}",
-        t.elapsed()
-    );
-    assert_eq!(status.code(), Some(2));
-    let err = std::fs::read_to_string(&log).unwrap();
-    assert!(err.contains("Xwayland did not start"), "stderr was {err:?}");
-    assert!(!marker.exists(), "the command ran without a display");
-    assert_gone(pid);
-}
-
-#[test]
-fn a_helper_that_dies_before_reporting_is_a_startup_failure() {
-    if !require_python() {
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let script = helper_script(dir.path(), "doomed.py", DIES_AT_ONCE);
-    let marker = dir.path().join("the-command-ran");
+    let script = server_script(dir.path(), "xserver.py", SERVES_AND_STAYS);
+    let wm = wm_script(dir.path(), "fake-wm", WM_STAYS);
+    let xsock = dir.path().join("X0");
+    let quit = dir.path().join("quit");
+    let run = format!("while [ ! -e {} ]; do sleep 0.05; done", quit.display());
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
     let (mut init, _sock, _tmp) = start_with(
-        &["/usr/bin/touch", marker.to_str().unwrap()],
-        false,
-        Some(&fd),
-        Some(&[PYTHON, script.to_str().unwrap()]),
+        &["/usr/bin/sh", "-c", &run],
+        Opts {
+            stdio: Some(&fd),
+            x11: Some(&[PYTHON, script.to_str().unwrap()]),
+            x11_socket: Some(&xsock),
+            wm: Some(&wm),
+            ..Opts::default()
+        },
     );
-    let pid = helper_pid(&script);
-    let t = Instant::now();
-    let status = init.wait().unwrap();
+    wait_for_path(&xsock);
+    let mut display = wm.as_os_str().to_owned();
+    display.push(".display");
+    let display = PathBuf::from(display);
+    std::thread::sleep(Duration::from_millis(300));
     assert!(
-        t.elapsed() < Duration::from_secs(9),
-        "waited the full timeout"
+        !display.exists(),
+        "the window manager ran with no server to manage"
     );
-    assert_eq!(status.code(), Some(2));
-    let err = std::fs::read_to_string(&log).unwrap();
-    assert!(err.contains("Xwayland did not start"), "stderr was {err:?}");
-    assert!(!marker.exists(), "the command ran without a display");
-    assert_gone(pid);
+    let client = x_connect(&xsock);
+    assert_eq!(served_byte(&client), b'X');
+    assert_eq!(
+        wait_for_file(&display),
+        ":0",
+        "the window manager saw the wrong display"
+    );
+    let server_pid = pid_of(&script);
+    let wm_pid = pid_of(&wm);
+    std::fs::write(&quit, b"").unwrap();
+    assert_eq!(init.wait().unwrap().code(), Some(0));
+    assert_gone(wm_pid);
+    assert_gone(server_pid);
 }
 
 #[test]
-fn a_helper_dying_while_the_command_runs_terminates_the_command() {
+fn a_window_manager_that_cannot_be_started_is_logged_and_the_command_runs_on() {
     if !require_python() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let script = helper_script(dir.path(), "quitter.py", REPORTS_AND_DIES);
+    let script = server_script(dir.path(), "xserver.py", SERVES_AND_STAYS);
+    let xsock = dir.path().join("X0");
+    let log = dir.path().join("init.log");
+    let fd = stdio_file(&log);
+    let (mut init, sock, _tmp) = start_with(
+        &["/usr/bin/sleep", "30"],
+        Opts {
+            stdio: Some(&fd),
+            x11: Some(&[PYTHON, script.to_str().unwrap()]),
+            x11_socket: Some(&xsock),
+            wm: Some(Path::new("nosuchwm")),
+            ..Opts::default()
+        },
+    );
+    wait_for_path(&xsock);
+    let client = x_connect(&xsock);
+    assert_eq!(served_byte(&client), b'X');
+    wait_for_log(&log, "bubbler-init: wm nosuchwm: ");
+    // A window manager is a convenience; the display it would have
+    // managed is up and the command is still using it.
+    assert_eq!(
+        ExitStatus::from_raw(exec(&sock, &["/usr/bin/true"])).code(),
+        Some(0)
+    );
+    assert!(init.try_wait().unwrap().is_none(), "the run was abandoned");
+    stop(&mut init);
+}
+
+#[test]
+fn a_window_manager_that_exits_is_reported_once_and_the_command_runs_on() {
+    if !require_python() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let script = server_script(dir.path(), "xserver.py", SERVES_AND_STAYS);
+    let wm = wm_script(dir.path(), "fake-wm", WM_EXITS);
+    let xsock = dir.path().join("X0");
+    let log = dir.path().join("init.log");
+    let fd = stdio_file(&log);
+    let (mut init, sock, _tmp) = start_with(
+        &["/usr/bin/sleep", "30"],
+        Opts {
+            stdio: Some(&fd),
+            x11: Some(&[PYTHON, script.to_str().unwrap()]),
+            x11_socket: Some(&xsock),
+            wm: Some(&wm),
+            ..Opts::default()
+        },
+    );
+    wait_for_path(&xsock);
+    let client = x_connect(&xsock);
+    assert_eq!(served_byte(&client), b'X');
+    let line = format!("bubbler-init: wm {} exited", wm.display());
+    wait_for_log(&log, &line);
+    // Reported once and not restarted: the loop would otherwise say it
+    // again on every tick.
+    std::thread::sleep(Duration::from_millis(300));
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(text.matches(&line).count(), 1, "stderr was {text:?}");
+    assert_eq!(
+        ExitStatus::from_raw(exec(&sock, &["/usr/bin/true"])).code(),
+        Some(0)
+    );
+    assert!(init.try_wait().unwrap().is_none(), "the run was abandoned");
+    stop(&mut init);
+}
+
+#[test]
+fn a_server_that_exits_after_serving_terminates_the_command() {
+    if !require_python() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let script = server_script(dir.path(), "xserver.py", SERVES_AND_DIES);
+    let xsock = dir.path().join("X0");
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
     let (mut init, _sock, _tmp) = start_with(
         &["/usr/bin/sleep", "30"],
-        false,
-        Some(&fd),
-        Some(&[PYTHON, script.to_str().unwrap()]),
+        Opts {
+            stdio: Some(&fd),
+            x11: Some(&[PYTHON, script.to_str().unwrap()]),
+            x11_socket: Some(&xsock),
+            ..Opts::default()
+        },
     );
+    wait_for_path(&xsock);
+    let client = x_connect(&xsock);
+    assert_eq!(served_byte(&client), b'X');
     let t = Instant::now();
     let status = init.wait().unwrap();
     assert!(
@@ -578,4 +752,35 @@ fn a_helper_dying_while_the_command_runs_terminates_the_command() {
         err.contains("Xwayland exited; stopping the command"),
         "stderr was {err:?}"
     );
+}
+
+#[test]
+fn a_server_that_cannot_be_spawned_terminates_the_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let xsock = dir.path().join("X0");
+    let log = dir.path().join("init.log");
+    let fd = stdio_file(&log);
+    let (mut init, _sock, _tmp) = start_with(
+        &["/usr/bin/sleep", "30"],
+        Opts {
+            stdio: Some(&fd),
+            x11: Some(&["/nonexistent/bubbler-test-xserver"]),
+            x11_socket: Some(&xsock),
+            ..Opts::default()
+        },
+    );
+    wait_for_path(&xsock);
+    let client = x_connect(&xsock);
+    let status = init.wait().unwrap();
+    assert_eq!(status.code(), Some(143));
+    let err = std::fs::read_to_string(&log).unwrap();
+    assert!(err.contains("Xwayland did not start"), "stderr was {err:?}");
+    // The client that waited for a server that never came is let go when
+    // the supervisor closes the socket, either way a closed socket reads.
+    let mut byte = [0u8; 1];
+    match std::io::Read::read(&mut &client, &mut byte) {
+        Ok(0) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("the waiting client was left connected: {other:?}"),
+    }
 }

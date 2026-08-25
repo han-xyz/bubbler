@@ -1,8 +1,8 @@
 //! In-sandbox supervisor: runs the command, serves exec requests on the
 //! inherited socket, forwards SIGTERM/SIGINT, exits with the command's status.
-//! With `--helper` it also runs a display helper (Xwayland) before the
-//! command, hands the command and every exec'd child the display it
-//! reports, and stops it last.
+//! With `--x11` it also owns the display socket: the command runs at once with
+//! `DISPLAY` set, and the nested X server (plus the `--wm` window manager) is
+//! started on the first client that connects and stopped last.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -10,14 +10,16 @@ use std::io::Write;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rustix::event::{Nsecs, PollFd, PollFlags, Timespec, poll};
-use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
-use rustix::pipe::{PipeFlags, pipe_with};
+use rustix::fs::Mode;
+use rustix::io::{Errno, FdFlags, fcntl_dupfd_cloexec, fcntl_getfd, fcntl_setfd};
+use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 use rustix::process::{DumpableBehavior, Pid, Signal, kill_process, set_dumpable_behavior};
 
 use bubbler_init::{proto, wire};
@@ -35,36 +37,43 @@ const GRACE: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Raw wait status for a command that could not be executed, as a shell reports it.
 const NOT_EXECUTABLE: i32 = 127 << 8;
-/// How long the display helper gets to report its display number. A
-/// helper that is slower than this is one the command cannot use anyway.
-const HELPER_READY: Duration = Duration::from_secs(10);
-/// Longest first line a display helper may write. A helper that streams
-/// anything else at the pipe is broken, and its output is not init's to
-/// buffer without a bound.
-const MAX_DISPLAY_LINE: usize = 64;
 /// Connections whose request has not arrived in full. The oldest is
 /// dropped to make room, so stalled clients cannot grow the table.
 const MAX_PENDING: usize = 16;
+/// The display socket inside the sandbox, and the display every process
+/// there is pointed at. The server is always started as `:0`.
+const X11_SOCKET: &str = "/tmp/.X11-unix/X0";
+const DISPLAY: &str = ":0";
+/// Clients the display socket queues before the server has taken it
+/// over. Only the first one has to wait for a server to start at all.
+const X11_BACKLOG: i32 = 16;
+/// The one usage line, so a grammar error always names the whole grammar.
+const USAGE: &str = "bubbler-init: usage: --socket-fd N [--ctty] \
+[--x11 argv... --] [--x11-socket path] [--wm program] -- cmd...";
 
 struct Args {
     socket_fd: i32,
     ctty: bool,
-    helper: Option<Vec<OsString>>,
+    x11: Option<Vec<OsString>>,
+    x11_socket: PathBuf,
+    wm: Option<OsString>,
     command: Vec<OsString>,
 }
 
-/// The display helper and the display it reported. It is started before
-/// the command and stopped after it, so nothing inside the sandbox is
-/// ever pointed at a display that is not there.
-struct Helper {
-    child: Child,
-    display: OsString,
-    /// Init's end of the `-displayfd` pipe, held open until the helper is
-    /// gone. Xserver(1) documents only the write ("will write the display
-    /// number back on this file descriptor as a newline-terminated
-    /// string"), not that the server then closes it, so init keeps its end
-    /// rather than leave a later write facing EPIPE.
-    _display_pipe: OwnedFd,
+/// The nested X server, the socket bound for it and the window manager
+/// that goes with it. The socket listens from before the command starts,
+/// so a client may connect while there is no server yet; that connection
+/// is what starts one, and the server accepts it itself.
+struct X11 {
+    argv: Vec<OsString>,
+    wm: Option<OsString>,
+    listener: UnixListener,
+    /// Set on the first connection and never cleared: the server owns the
+    /// socket from then on, so init neither polls nor accepts it again,
+    /// and a server that failed to start is not started a second time.
+    started: bool,
+    server: Option<Child>,
+    wm_child: Option<Child>,
 }
 
 /// A command run for a client, with the connection waiting for its status.
@@ -80,32 +89,42 @@ struct Pending {
     deadline: Instant,
 }
 
-/// Parse `--socket-fd N [--ctty] [--helper argv... --] -- cmd...`;
-/// anything else is a usage error. The helper argv ends at its own bare
-/// `--`, so it may hold any words, including the command's own.
+/// Parse `--socket-fd N [--ctty] [--x11 argv... --] [--x11-socket path]
+/// [--wm program] -- cmd...`; anything else is a usage error.
 fn parse_args() -> Option<Args> {
     parse_from(std::env::args_os().skip(1))
 }
 
-/// The grammar itself, over any argv but this process's own.
+/// The grammar itself, over any argv but this process's own. The X server
+/// argv ends at its own bare `--`, so it may hold any words, including the
+/// command's own. `--x11-socket` overrides the path init binds for the
+/// display; it exists for this crate's own tests, which run on a host
+/// where `/tmp/.X11-unix/X0` is the session's own display, and bubbler
+/// never passes it.
 fn parse_from(mut it: impl Iterator<Item = OsString>) -> Option<Args> {
     let mut socket_fd = None;
     let mut ctty = false;
-    let mut helper = None;
+    let mut x11 = None;
+    let mut x11_socket = None;
+    let mut wm = None;
     let mut command = Vec::new();
     while let Some(a) = it.next() {
         match a.to_str() {
             Some("--socket-fd") => socket_fd = it.next()?.to_str()?.parse().ok(),
             Some("--ctty") => ctty = true,
-            // A second one would silently replace the first, and a helper
+            // A second one would silently replace the first, and a server
             // that is dropped here is a display nothing ever starts.
-            Some("--helper") if helper.is_none() => {
+            Some("--x11") if x11.is_none() => {
                 let argv: Vec<OsString> = it.by_ref().take_while(|w| w != "--").collect();
                 if argv.is_empty() {
                     return None;
                 }
-                helper = Some(argv);
+                x11 = Some(argv);
             }
+            Some("--x11-socket") if x11_socket.is_none() => {
+                x11_socket = Some(PathBuf::from(it.next()?));
+            }
+            Some("--wm") if wm.is_none() => wm = Some(it.next()?),
             Some("--") => {
                 command.extend(it);
                 break;
@@ -113,13 +132,20 @@ fn parse_from(mut it: impl Iterator<Item = OsString>) -> Option<Args> {
             _ => return None,
         }
     }
+    // Both only mean something with a display to serve: without one they
+    // are a caller that believes it asked for a nested server and did not.
+    if x11.is_none() && (x11_socket.is_some() || wm.is_some()) {
+        return None;
+    }
     if command.is_empty() {
         return None;
     }
     Some(Args {
         socket_fd: socket_fd?,
         ctty,
-        helper,
+        x11,
+        x11_socket: x11_socket.unwrap_or_else(|| PathBuf::from(X11_SOCKET)),
+        wm,
         command,
     })
 }
@@ -200,8 +226,8 @@ fn serve(
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    // The helper's display is init's to hand out: an exec'd child gets
-    // the same one the instance's own command was started with.
+    // The display is init's to hand out: an exec'd child gets the same
+    // one the instance's own command was started with.
     if let Some(d) = display {
         command.env("DISPLAY", d);
     }
@@ -294,106 +320,95 @@ fn shutdown(execs: &mut Vec<Exec>) {
     execs.clear();
 }
 
-/// Kill a helper that never became usable and reap it, so a failed
-/// startup leaves no process behind, then hand back why it failed.
-fn abandon(child: &mut Child, reason: String) -> String {
-    let _ = child.kill();
-    let _ = child.wait();
-    reason
+/// Bind the socket the nested X server will inherit. It is listening
+/// before the command runs, so the first client waits in its queue
+/// instead of failing to connect while the server is still starting.
+fn bind_x11(path: &Path) -> Result<UnixListener, String> {
+    if let Some(dir) = path.parent() {
+        match rustix::fs::mkdir(dir, Mode::from_raw_mode(0o1777)) {
+            Ok(()) | Err(Errno::EXIST) => {}
+            Err(e) => return Err(format!("cannot create {}: {e}", dir.display())),
+        }
+        // umask clears bits from the mode `mkdir` was given, and the
+        // socket directory is world-writable with the sticky bit on a
+        // host. Only for the real one: a path a test chose is its own.
+        if path == Path::new(X11_SOCKET) {
+            rustix::fs::chmod(dir, Mode::from_raw_mode(0o1777))
+                .map_err(|e| format!("cannot set the mode of {}: {e}", dir.display()))?;
+        }
+    }
+    let addr = SocketAddrUnix::new(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let sock = rustix::net::socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC,
+        None,
+    )
+    .map_err(|e| format!("cannot create the socket: {e}"))?;
+    rustix::net::bind(&sock, &addr).map_err(|e| format!("cannot bind {}: {e}", path.display()))?;
+    rustix::net::listen(&sock, X11_BACKLOG)
+        .map_err(|e| format!("cannot listen on {}: {e}", path.display()))?;
+    Ok(UnixListener::from(sock))
 }
 
-/// Start the display helper and wait for the display number it writes to
-/// `-displayfd`. That write end is the only descriptor the helper
-/// inherits beyond stdio, and init drops its own copy right after the
-/// spawn, so the pipe reports EOF as soon as the helper is gone.
-fn start_helper(argv: &[OsString], stop: &AtomicBool) -> Result<Helper, String> {
-    let (program, rest) = argv.split_first().ok_or("no helper to run")?;
-    let (r, w) = pipe_with(PipeFlags::CLOEXEC)
-        .map_err(|e| format!("cannot create the display pipe: {e}"))?;
-    let mut launch = Command::new(program);
-    launch
+/// Hand the listening socket to the X server. The connection that woke
+/// init is deliberately left in the queue: the server accepts it on the
+/// very descriptor it inherits, so the client that waited is served by
+/// the server it woke, on the socket it already connected to.
+fn start_x11(x: &mut X11) -> Result<(), String> {
+    let (program, rest) = x.argv.split_first().ok_or("no server to run")?;
+    // A duplicate carries the socket across this one exec, so the
+    // listener init keeps stays CLOEXEC and no later child inherits it.
+    let handed = fcntl_dupfd_cloexec(&x.listener, 3)
+        .map_err(|e| format!("cannot duplicate the socket: {e}"))?;
+    fcntl_setfd(&handed, FdFlags::empty()).map_err(|e| format!("cannot pass the socket: {e}"))?;
+    let child = Command::new(program)
         .args(rest)
-        .arg("-displayfd")
-        .arg(w.as_raw_fd().to_string());
-    // The helper is the one process that may have this fd, and it is
-    // spawned on the next line, so no other child can inherit it.
-    fcntl_setfd(&w, FdFlags::empty()).map_err(|e| format!("cannot pass the display pipe: {e}"))?;
-    let spawned = launch.spawn();
-    drop(w);
-    let mut child = spawned.map_err(|e| format!("{}: {e}", program.to_string_lossy()))?;
-    let deadline = Instant::now() + HELPER_READY;
-    let mut line = Vec::new();
-    let mut buf = [0u8; 32];
-    loop {
-        let mut fds = [PollFd::new(&r, PollFlags::IN)];
-        let _ = poll(&mut fds, Some(&TICK_TIMESPEC));
-        if !fds[0].revents().is_empty() {
-            match rustix::io::read(&r, &mut buf) {
-                Ok(0) => {
-                    let why = "the display pipe closed with no display number".to_string();
-                    return Err(abandon(&mut child, why));
-                }
-                Ok(n) if line.len() + n <= MAX_DISPLAY_LINE => {
-                    line.extend_from_slice(&buf[..n]);
-                }
-                Ok(_) => {
-                    let why = "it wrote more than a display number".to_string();
-                    return Err(abandon(&mut child, why));
-                }
-                Err(e) if e == rustix::io::Errno::INTR || e == rustix::io::Errno::AGAIN => {}
-                Err(e) => {
-                    return Err(abandon(&mut child, format!("cannot read the display: {e}")));
-                }
-            }
-        }
-        if let Some(end) = line.iter().position(|&b| b == b'\n') {
-            let text = String::from_utf8_lossy(&line[..end]);
-            return match text.trim().parse::<u32>() {
-                Ok(n) => Ok(Helper {
-                    child,
-                    display: OsString::from(format!(":{n}")),
-                    _display_pipe: r,
-                }),
-                Err(_) => Err(abandon(
-                    &mut child,
-                    format!("it reported {text:?}, not a display number"),
-                )),
-            };
-        }
-        // The read above drains the pipe first, so a helper that reported
-        // a display and exited at once is still a success.
-        if let Ok(Some(status)) = child.try_wait() {
-            let why = format!("it exited before reporting a display ({status})");
-            return Err(abandon(&mut child, why));
-        }
-        if Instant::now() >= deadline {
-            let why = format!("no display number after {}s", HELPER_READY.as_secs());
-            return Err(abandon(&mut child, why));
-        }
-        // A signal during the wait ends the run here: the command has not
-        // been spawned, so there is nothing to stop but the helper.
-        if stop.load(Ordering::SeqCst) {
-            let why = "it was stopped before it was ready".to_string();
-            return Err(abandon(&mut child, why));
-        }
+        .arg("-listenfd")
+        .arg(handed.as_raw_fd().to_string())
+        .spawn()
+        .map_err(|e| format!("{}: {e}", program.to_string_lossy()))?;
+    x.server = Some(child);
+    Ok(())
+}
+
+/// Start the window manager beside the server. It is a convenience and
+/// not a display: one that is missing or that exits is reported, and the
+/// command keeps running on a server that simply manages nothing.
+fn start_wm(x: &mut X11) {
+    let Some(wm) = x.wm.as_ref() else { return };
+    match Command::new(wm).env("DISPLAY", DISPLAY).spawn() {
+        Ok(child) => x.wm_child = Some(child),
+        Err(e) => eprintln!("bubbler-init: wm {}: {e}", wm.to_string_lossy()),
     }
 }
 
-/// SIGTERM the helper and SIGKILL whatever outlives the grace, then reap
-/// it. Only ever called once the command and every exec'd child are
-/// gone: nothing may lose its display while it is still drawing on it.
-fn stop_helper(helper: Option<&mut Helper>) {
-    let Some(h) = helper else { return };
-    let _ = kill_process(Pid::from_child(&h.child), Signal::TERM);
+/// SIGTERM one child and SIGKILL whatever outlives the grace, then reap it.
+fn stop_child(child: &mut Child) {
+    let _ = kill_process(Pid::from_child(child), Signal::TERM);
     let deadline = Instant::now() + GRACE;
     while Instant::now() < deadline {
-        if !matches!(h.child.try_wait(), Ok(None)) {
+        if !matches!(child.try_wait(), Ok(None)) {
             return;
         }
         std::thread::sleep(TICK);
     }
-    let _ = h.child.kill();
-    let _ = h.child.wait();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Stop the window manager and then the server. Only ever called once
+/// the command and every exec'd child are gone: nothing may lose its
+/// display while it is still drawing on it, and the window manager is
+/// never left managing a server that has already exited.
+fn stop_x11(x11: Option<&mut X11>) {
+    let Some(x) = x11 else { return };
+    if let Some(wm) = x.wm_child.as_mut() {
+        stop_child(wm);
+    }
+    if let Some(server) = x.server.as_mut() {
+        stop_child(server);
+    }
 }
 
 /// The command's exit code, or 128 + signal when a signal killed it.
@@ -406,8 +421,8 @@ fn code_of(status: ExitStatus) -> u8 {
 }
 
 fn main() -> ExitCode {
-    let Some(args) = parse_args() else {
-        eprintln!("bubbler-init: usage: --socket-fd N [--ctty] [--helper argv... --] -- cmd...");
+    let Some(mut args) = parse_args() else {
+        eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
     let Some(listener) = listener_from_fd(args.socket_fd) else {
@@ -433,23 +448,29 @@ fn main() -> ExitCode {
         }
     }
     let Some((program, rest)) = args.command.split_first() else {
-        eprintln!("bubbler-init: usage: --socket-fd N [--ctty] [--helper argv... --] -- cmd...");
+        eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
-    // Before the command, so a display the command needs is listening
-    // and its number known by the time the command's first line runs.
-    let mut helper = match args.helper.as_deref().map(|a| start_helper(a, &stop)) {
-        Some(Ok(h)) => Some(h),
-        Some(Err(reason)) => {
-            eprintln!("bubbler-init: Xwayland did not start: {reason}");
-            return ExitCode::from(2);
-        }
+    // Before the command, so the display it is about to be pointed at is
+    // one it can connect to from its first line, server or no server.
+    let mut x11 = match args.x11.take() {
+        Some(argv) => match bind_x11(&args.x11_socket) {
+            Ok(listener) => Some(X11 {
+                argv,
+                wm: args.wm.take(),
+                listener,
+                started: false,
+                server: None,
+                wm_child: None,
+            }),
+            Err(reason) => {
+                eprintln!("bubbler-init: cannot bind the display socket: {reason}");
+                return ExitCode::from(2);
+            }
+        },
         None => None,
     };
-    // A copy of the display, so the loop below can drop a helper that
-    // died without the command's own environment changing under it.
-    let display = helper.as_ref().map(|h| h.display.clone());
-    let display = display.as_deref();
+    let display = x11.as_ref().map(|_| OsStr::new(DISPLAY));
     let mut launch = Command::new(program);
     launch.args(rest);
     if let Some(d) = display {
@@ -464,7 +485,7 @@ fn main() -> ExitCode {
         Ok(child) => child,
         Err(e) => {
             eprintln!("bubbler-init: {}: {e}", program.to_string_lossy());
-            stop_helper(helper.as_mut());
+            stop_x11(x11.as_mut());
             return ExitCode::from(127);
         }
     };
@@ -482,20 +503,34 @@ fn main() -> ExitCode {
         if let Ok(Some(status)) = command.try_wait() {
             reap(&mut execs);
             shutdown(&mut execs);
-            stop_helper(helper.as_mut());
+            stop_x11(x11.as_mut());
             return ExitCode::from(code_of(status));
         }
-        // A helper that exits takes the display with it: the command
-        // cannot draw any more, so it is stopped instead of left blind.
-        // Checked after the command's own exit, so the two going down
-        // together is not reported as the helper stopping the command.
-        if helper
-            .as_mut()
-            .is_some_and(|h| matches!(h.child.try_wait(), Ok(Some(_))))
-        {
-            eprintln!("bubbler-init: Xwayland exited; stopping the command");
-            let _ = kill_process(Pid::from_child(&command), Signal::TERM);
-            helper = None;
+        if let Some(x) = x11.as_mut() {
+            // A server that exits takes the display with it: the command
+            // cannot draw any more, so it is stopped instead of left
+            // blind. Checked after the command's own exit, so the two
+            // going down together is not reported as the server stopping
+            // the command.
+            if x.server
+                .as_mut()
+                .is_some_and(|s| matches!(s.try_wait(), Ok(Some(_))))
+            {
+                eprintln!("bubbler-init: Xwayland exited; stopping the command");
+                let _ = kill_process(Pid::from_child(&command), Signal::TERM);
+                x.server = None;
+            }
+            // Said once: the child is dropped here and never started
+            // again, so the next tick has nothing left to report.
+            if x.wm_child
+                .as_mut()
+                .is_some_and(|w| matches!(w.try_wait(), Ok(Some(_))))
+            {
+                if let Some(name) = x.wm.as_ref() {
+                    eprintln!("bubbler-init: wm {} exited", name.to_string_lossy());
+                }
+                x.wm_child = None;
+            }
         }
         reap(&mut execs);
         if kill_at.is_some_and(|at| Instant::now() >= at) {
@@ -503,10 +538,15 @@ fn main() -> ExitCode {
             signal_execs(&execs, Signal::KILL);
             kill_at = None;
         }
-        // The listener and every half-read request in one poll set: a
-        // client that stops mid-request delays nothing but itself.
-        let mut fds = Vec::with_capacity(1 + pending.len());
+        // The listener, the display socket while nothing serves it, and
+        // every half-read request in one poll set: a client that stops
+        // mid-request delays nothing but itself.
+        let waking = x11.as_ref().filter(|x| !x.started).map(|x| &x.listener);
+        let mut fds = Vec::with_capacity(2 + pending.len());
         fds.push(PollFd::new(&listener, PollFlags::IN));
+        if let Some(l) = waking {
+            fds.push(PollFd::new(l, PollFlags::IN));
+        }
         fds.extend(
             pending
                 .iter()
@@ -514,7 +554,14 @@ fn main() -> ExitCode {
         );
         let polled = poll(&mut fds, Some(&TICK_TIMESPEC));
         let accept = fds[0].revents().contains(PollFlags::IN);
-        let mut ready: Vec<bool> = fds[1..].iter().map(|f| !f.revents().is_empty()).collect();
+        // The display socket takes the slot after the control listener
+        // while it is still init's to watch; the pending ones follow both.
+        let x_slot = usize::from(waking.is_some());
+        let wake_x11 = x_slot == 1 && fds[1].revents().contains(PollFlags::IN);
+        let mut ready: Vec<bool> = fds[1 + x_slot..]
+            .iter()
+            .map(|f| !f.revents().is_empty())
+            .collect();
         drop(fds);
         match polled {
             Ok(0) => {}
@@ -526,6 +573,19 @@ fn main() -> ExitCode {
                 continue;
             }
             Ok(_) => {}
+        }
+        // The first client to connect is what starts the server, and the
+        // window manager goes up with it: neither exists in a sandbox
+        // whose command never speaks X11.
+        if wake_x11 && let Some(x) = x11.as_mut() {
+            x.started = true;
+            match start_x11(x) {
+                Ok(()) => start_wm(x),
+                Err(reason) => {
+                    eprintln!("bubbler-init: Xwayland did not start: {reason}");
+                    let _ = kill_process(Pid::from_child(&command), Signal::TERM);
+                }
+            }
         }
         read_pending(&mut pending, &mut ready, &mut execs, display);
         // Dropping the connection is the whole answer to a client that
@@ -559,41 +619,41 @@ mod tests {
     }
 
     #[test]
-    fn the_helper_argv_ends_at_its_own_terminator() {
+    fn the_server_argv_ends_at_its_own_terminator() {
         let a = parse(&[
             "--socket-fd",
             "3",
             "--ctty",
-            "--helper",
+            "--x11",
             "Xwayland",
             ":0",
             "--",
             "--",
             "/usr/bin/true",
-            "--helper",
+            "--x11",
         ])
         .unwrap();
         assert_eq!(a.socket_fd, 3);
         assert!(a.ctty);
-        assert_eq!(a.helper.unwrap(), ["Xwayland", ":0"]);
-        assert_eq!(a.command, ["/usr/bin/true", "--helper"]);
+        assert_eq!(a.x11.unwrap(), ["Xwayland", ":0"]);
+        assert_eq!(a.command, ["/usr/bin/true", "--x11"]);
     }
 
     #[test]
-    fn a_helper_without_an_argv_is_a_usage_error() {
-        assert!(parse(&["--socket-fd", "3", "--helper", "--", "--", "/usr/bin/true"]).is_none());
+    fn a_server_without_an_argv_is_a_usage_error() {
+        assert!(parse(&["--socket-fd", "3", "--x11", "--", "--", "/usr/bin/true"]).is_none());
     }
 
     #[test]
-    fn a_helper_argv_that_is_never_terminated_is_a_usage_error() {
-        // The helper swallows the words the command would have been.
-        assert!(parse(&["--socket-fd", "3", "--helper", "Xwayland", "/usr/bin/true"]).is_none());
+    fn a_server_argv_that_is_never_terminated_is_a_usage_error() {
+        // The server swallows the words the command would have been.
+        assert!(parse(&["--socket-fd", "3", "--x11", "Xwayland", "/usr/bin/true"]).is_none());
         // One `--` short: what follows it is neither a flag nor a command.
         assert!(
             parse(&[
                 "--socket-fd",
                 "3",
-                "--helper",
+                "--x11",
                 "Xwayland",
                 "--",
                 "/usr/bin/true"
@@ -603,14 +663,14 @@ mod tests {
     }
 
     #[test]
-    fn a_second_helper_is_a_usage_error() {
+    fn a_second_server_is_a_usage_error() {
         let words = [
             "--socket-fd",
             "3",
-            "--helper",
+            "--x11",
             "Xwayland",
             "--",
-            "--helper",
+            "--x11",
             "Xephyr",
             "--",
             "--",
@@ -620,10 +680,108 @@ mod tests {
     }
 
     #[test]
-    fn no_helper_is_the_usual_grammar() {
+    fn no_display_is_the_usual_grammar() {
         let a = parse(&["--socket-fd", "4", "--", "/usr/bin/true"]).unwrap();
-        assert!(a.helper.is_none());
+        assert!(a.x11.is_none());
+        assert!(a.wm.is_none());
         assert!(!a.ctty);
         assert_eq!(a.command, ["/usr/bin/true"]);
+    }
+
+    #[test]
+    fn the_window_manager_follows_the_server_argv() {
+        let a = parse(&[
+            "--socket-fd",
+            "3",
+            "--x11",
+            "Xwayland",
+            "--",
+            "--wm",
+            "twm",
+            "--",
+            "/usr/bin/true",
+        ])
+        .unwrap();
+        assert_eq!(a.x11.unwrap(), ["Xwayland"]);
+        assert_eq!(a.wm.unwrap(), "twm");
+        assert_eq!(a.command, ["/usr/bin/true"]);
+    }
+
+    #[test]
+    fn a_window_manager_without_a_server_is_a_usage_error() {
+        assert!(parse(&["--socket-fd", "3", "--wm", "twm", "--", "/usr/bin/true"]).is_none());
+    }
+
+    #[test]
+    fn a_second_window_manager_is_a_usage_error() {
+        let words = [
+            "--socket-fd",
+            "3",
+            "--x11",
+            "Xwayland",
+            "--",
+            "--wm",
+            "twm",
+            "--wm",
+            "openbox",
+            "--",
+            "/usr/bin/true",
+        ];
+        assert!(parse(&words).is_none());
+    }
+
+    #[test]
+    fn the_socket_path_is_the_display_zero_socket_unless_a_test_says_otherwise() {
+        let a = parse(&[
+            "--socket-fd",
+            "3",
+            "--x11",
+            "Xwayland",
+            "--",
+            "--",
+            "/usr/bin/true",
+        ])
+        .unwrap();
+        assert_eq!(a.x11_socket, Path::new(X11_SOCKET));
+        let a = parse(&[
+            "--socket-fd",
+            "3",
+            "--x11",
+            "Xwayland",
+            "--",
+            "--x11-socket",
+            "/tmp/probe/X0",
+            "--",
+            "/usr/bin/true",
+        ])
+        .unwrap();
+        assert_eq!(a.x11_socket, Path::new("/tmp/probe/X0"));
+    }
+
+    #[test]
+    fn a_socket_path_without_a_server_is_a_usage_error() {
+        let words = [
+            "--socket-fd",
+            "3",
+            "--x11-socket",
+            "/tmp/probe/X0",
+            "--",
+            "/usr/bin/true",
+        ];
+        assert!(parse(&words).is_none());
+    }
+
+    #[test]
+    fn the_helper_flag_the_display_socket_replaced_is_rejected() {
+        let words = [
+            "--socket-fd",
+            "3",
+            "--helper",
+            "Xwayland",
+            "--",
+            "--",
+            "/usr/bin/true",
+        ];
+        assert!(parse(&words).is_none());
     }
 }
