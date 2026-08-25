@@ -62,7 +62,7 @@ command "firefox"
 | `dbus` / `system-bus` | filtered bus via proxy | rules are the whole confinement |
 | `portals` | portal names + app id `org.bubbler.<inst>`; binds the instance's document-portal view at `$XDG_RUNTIME_DIR/doc` | Steam's runtime misreads `/.flatpak-info` |
 | `a11y` | the session's accessibility bus, proxied as a third bus; `AT_SPI_BUS_ADDRESS` | a screen reader reads this app's widgets; needs `dbus`, and `dbus-send` to find the bus |
-| `notify`, `tray`, `mpris`, `input-method` | one or two bus rules each | need `dbus` in the merged result, as `portals` and `a11y` do |
+| `notify`, `tray`, `mpris`, `input-method` | one or two bus rules each; `IBUS_USE_PORTAL` for `input-method` | need `dbus` in the merged result, as `portals` and `a11y` do |
 | `seccomp` | edit the default denylist | `disable` prints a warning each run |
 | `userns "disable"` | no nested user namespaces | breaks Firefox/Chromium inner sandbox, Steam, podman |
 | `env` | extra variables | `HOME`, `PATH`, `DISPLAY` and the like are refused |

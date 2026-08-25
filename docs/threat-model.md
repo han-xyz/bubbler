@@ -66,7 +66,7 @@ Five processes come with a sandbox, and they are not one kind of thing:
 
 | Sidecar | Where it runs | Is it a boundary? |
 |---|---|---|
-| `xdg-dbus-proxy` | its own bwrap sandbox, sibling of the app's | **Yes.** It is a filter, it sees only the host bus socket read-only and the instance's `dbus/` subdirectory read-write, and the socket it serves is moved out of its reach before anything is bound. |
+| `xdg-dbus-proxy` | its own bwrap sandbox, sibling of the app's | **Yes.** It is a filter, it sees only the host bus sockets read-only — up to three of them — and the instance's `dbus/` subdirectory read-write, and the socket it serves is moved out of its reach before anything is bound. |
 | `bubbler-init` | *inside* the sandbox, as pid 2 | **No.** It is the supervisor, not a guard: it shares the sandbox with the application. What it holds — the listening control socket — is kept from the application by being an inherited descriptor with no path, `CLOEXEC` in the only process that has it, and `PR_SET_DUMPABLE` off so `/proc/<init>/fd` cannot be walked. |
 | `Xwayland` | *inside* the sandbox, started by `bubbler-init`, only with a bare `x11` | **No.** It is the sandbox's own X server rather than a guard in front of one: every client on it is a process of this instance, and X11 isolates none of them from each other. What it replaces is the session's display — it reaches the compositor on the instance's own Wayland socket and listens nowhere but `/tmp/.X11-unix/X0` in the sandbox's private `/tmp`. See "X11" below. |
 | `pasta` | on the host, **not sandboxed**, holding the sandbox's outer user namespace | **No, in one direction.** A pasta that has been taken over *is* that sandbox's network and holds root over the namespaces the sandbox is built from. It owns nothing beyond what your own account already has: your uid created that namespace. Wrapping it in bwrap would not add anything — it would remove the very thing pasta needs, since a process can only join a descendant of its own user namespace. |
@@ -349,12 +349,12 @@ registered, and notifies the listeners that exist. None of the calls
 above is among them, and every destination but the registry is refused.
 Measured inside a `dbus a11y` sandbox against this host's own bus:
 `Registry.GetRegisteredEvents` and
-`DeviceEventController.GetKeystrokeListeners` answer and `Socket.Embed`
-reaches the registry — the error it comes back with is the registry's,
-about an argument `dbus-send` cannot type — while
+`DeviceEventController.GetKeystrokeListeners` answer, while
 `RegisterKeystrokeListener` and `GenerateKeyboardEvent` come back
 `org.freedesktop.DBus.Error.AccessDenied` from the proxy, which the
-registry never sees.
+registry never sees. `Socket.Embed` reaches the registry, which drops a
+caller whose `(so)` argument `dbus-send` cannot type: the answer is
+`org.freedesktop.DBus.Error.NoReply`, not a proxy refusal.
 
 **Does not defend:** the grant itself. An assistive tool on the host
 reads this application's widgets, labels and text — that is what a screen
@@ -387,10 +387,11 @@ rules whatever it names.
 `org.freedesktop.portal.Fcitx` and `org.freedesktop.portal.IBus`, which
 carry the per-client text-input interface and nothing else. The daemons'
 own names are not granted, and the proxy's name filtering is what makes
-the client libraries fall back to the portal one. Behind the daemon name
-are `Exit`, `Restart`, `SetConfig`, `SetAddonsState`, `SetCurrentIM` and
-`SetLogRule`: reconfiguring or stopping the input method of every
-application in the session.
+the client libraries fall back to the portal one. Behind a daemon name is
+what the portal one leaves out: fcitx5's carries `Exit`, `Restart`,
+`SetConfig`, `SetAddonsState`, `SetCurrentIM` and `SetLogRule`,
+reconfiguring or stopping the input method of every application in the
+session.
 
 **Does not defend:** what an input method is. The daemon receives the keys
 typed into this application's text fields, and the sandbox is one more of

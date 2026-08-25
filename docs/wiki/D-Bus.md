@@ -89,8 +89,9 @@ network namespace to reach one through.
 
 `--explain --proxy` on an `a11y` config resolves that address too — it is part
 of the proxy argv that view prints — so it asks `org.a11y.Bus` when the
-variable is unset, and fails without a session bus. Plain `--explain` and `--dry-run` still speak
-to nothing: they print the bind of the socket the sidecar would serve.
+variable is unset, and fails without a session bus. Plain `--explain` and
+`--dry-run` still speak to nothing: they print the bind of the socket the
+sidecar would serve.
 
 The node takes no children. Nine fixed rules are the whole of what the sandbox
 may ask that bus:
@@ -111,7 +112,8 @@ The app registers itself and reports its own events. Not in that list, and so
 refused: `RegisterKeystrokeListener` (every keystroke of every accessible
 application), `GenerateKeyboardEvent` and `GenerateMouseEvent` (input injected
 into your session), and any destination but the registry — which is how every
-*other* application on that bus is read. See [Security](Security.md#accessibility-bus).
+*other* application on that bus is read. See
+[Security](Security.md#accessibility-bus).
 
 Measured here, in a `dbus a11y` sandbox against this host's bus:
 `Registry.GetRegisteredEvents` and `DeviceEventController.GetKeystrokeListeners`

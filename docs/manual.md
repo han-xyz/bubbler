@@ -1101,7 +1101,7 @@ or a carriage return — a newline would forge a line in `--dry-run` output. The
 variables the sandbox owns are rejected: `HOME`, `PATH`, `XDG_RUNTIME_DIR`,
 `USER`, `LOGNAME`, `WAYLAND_DISPLAY`, `DISPLAY`, `XAUTHORITY`,
 `XDG_SESSION_TYPE`, `PULSE_SERVER`, `DBUS_SESSION_BUS_ADDRESS`,
-`DBUS_SYSTEM_BUS_ADDRESS`.
+`DBUS_SYSTEM_BUS_ADDRESS`, `AT_SPI_BUS_ADDRESS`, `IBUS_USE_PORTAL`.
 
 `desktop "<name>.desktop"` names the desktop entry `bubbler desktop` copies an
 instance's menu entry from. It grants nothing and nothing at launch reads it:
@@ -1892,7 +1892,7 @@ needs no rule.
 how a screen reader, a magnifier or an on-screen keyboard reads an
 application, and without it a sandbox is invisible to them. archwiki
 Accessibility says a Gtk-, Qt- or Gecko-based application "should work out of
-the box" and appear in `accerciser` "with a deeply nested tree structure of
+the box" and appear in `accerciser` with "a deeply nested tree structure of
 children"; a sandbox without this grant cannot appear there at all, since
 nothing binds that socket and the session proxy has no rule for it.
 
@@ -1952,7 +1952,9 @@ Inside the sandbox the filtered socket is bound read-only at
 `$XDG_RUNTIME_DIR/at-spi/bus` and `AT_SPI_BUS_ADDRESS` is set to `unix:path=`
 that path, which is what every at-spi2 client reads before it asks any bus for
 an address. The host's own accessibility socket is bound only into the proxy's
-sandbox, never into the application's.
+sandbox, never into the application's. `AT_SPI_BUS_ADDRESS` is a reserved `env`
+key, so no config can point a client at another one — see "env, command and
+desktop".
 
 `--dry-run` and a plain `--explain` still speak to nothing: they print the bind
 of the socket the sidecar would serve, which does not exist yet either way.
@@ -2021,10 +2023,10 @@ of the SDL2 library":
 archwiki IBus "Integration" gives `GTK_IM_MODULE=wayland`, `QT_IM_MODULE=ibus`
 and `XMODIFIERS=@im=ibus` for a Wayland session, and `GTK_IM_MODULE=ibus` with
 the same two for X11. `env` is emitted after every variable a grant sets, so a
-profile layers these on top; `AT_SPI_BUS_ADDRESS` and `IBUS_USE_PORTAL` are not
-in the reserved list either, and a profile that sets them replaces what the
-grant set, which for the accessibility bus is a path the sandbox has nothing
-bound at.
+profile layers these on top. `AT_SPI_BUS_ADDRESS` and `IBUS_USE_PORTAL` are
+refused there like the two bus addresses: what the grant points them at is the
+only socket of that kind the sandbox has, so a config setting them could only
+aim a client away from it, at a path with nothing bound.
 
 ## Terminal
 
@@ -2374,10 +2376,9 @@ outside its own state. Every
 run except a dry run or an explanation also creates
 `$XDG_RUNTIME_DIR/bubbler/<name>/`, mode 0700, reusing one left over from an
 earlier run, and binds the control socket `init.sock` in it; a `dbus`,
-`system-bus` or `a11y` grant adds the subdirectory
-`dbus/` the proxy creates its sockets in and the checked sockets `bus`,
-`system` and `a11y` — one per granted bus — beside it, and a `portals` grant
-adds
+`system-bus` or `a11y` grant adds the subdirectory `dbus/` the proxy creates
+its sockets in and the checked sockets `bus`, `system` and `a11y` — one per
+granted bus — beside it, and a `portals` grant adds
 `$XDG_RUNTIME_DIR/.flatpak/bubbler-<name>/`, creating `.flatpak/` if it is
 missing. Everything a run makes there is removed again when it ends, with one
 exception: an `app-runtime` grant creates `$XDG_RUNTIME_DIR/app/<id>` (and
@@ -2565,9 +2566,10 @@ with a `dbus` or `system-bus` grant, which is most of them, `pasta` (the
 `passt` package) for an isolated `network`, and `libseccomp`. An `a11y` grant
 also needs `dbus-send`, from the `dbus` package, to ask the session where its
 accessibility bus is, and an accessibility bus to find — `at-spi2-core`. An
-`input-method` grant reaches something only where fcitx5 or IBus is running. Portals need
-`xdg-desktop-portal` and a backend for your desktop; neither is bubbler's to
-start. Nothing here depends on a shell: bubbler ships no completions.
+`input-method` grant reaches something only where fcitx5 or IBus is running.
+Portals need `xdg-desktop-portal` and a backend for your desktop; neither is
+bubbler's to start. Nothing here depends on a shell: bubbler ships no
+completions.
 
 Packaging lives in a repository of its own, not in this one.
 

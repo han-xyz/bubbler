@@ -60,12 +60,12 @@ with `lint-allow "wayland-host" reason="…"`. No shipped profile grants it.
 
 `--dry-run` and `--explain` never talk to the compositor: they assume the
 security context and print it, so the argv they show is what a run builds where
-the protocol is there. One thing an explanation does ask for: `--explain
---proxy` on an `a11y` config resolves the accessibility bus address, which is
-part of the proxy argv it prints. `x11 "host"` bypasses all
-of it — those X clients reach a server which is a client of your session, not
-of this socket. A bare `x11` does not: the Xwayland it starts is a client of
-this one, like anything else inside.
+the protocol is there. `x11 "host"` bypasses all of it — those X clients reach
+a server which is a client of your session, not of this socket. A bare `x11`
+does not: the Xwayland it starts is a client of this one, like anything else
+inside. One thing an explanation does ask for: `--explain --proxy` on an `a11y`
+config resolves the accessibility bus address, which is part of the proxy argv
+it prints.
 
 ## X11
 
@@ -152,10 +152,10 @@ where a screen reader has to work, not by default.
 `org.freedesktop.portal.IBus`, which carry the per-client text-input interface
 only. The IM daemon receives the keys typed into this application's text
 fields — that is what an input method is — and the sandbox is one more client
-of it. The daemons' own names are not granted: those carry `Exit`, `Restart`,
-`SetConfig`, `SetCurrentIM` and `SetAddonsState`, which reconfigure or stop the
-input method for every application in the session. On Wayland the compositor's
-own text-input path needs no grant at all.
+of it. The daemons' own names are not granted: fcitx5's carries `Exit`,
+`Restart`, `SetConfig`, `SetCurrentIM` and `SetAddonsState`, which reconfigure
+or stop the input method for every application in the session. On Wayland the
+compositor's own text-input path needs no grant at all.
 
 ## Seccomp
 
