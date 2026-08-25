@@ -125,6 +125,9 @@ pub struct BwrapArgs {
     env: Vec<Item>,
     /// `--ctty` in the supervisor's own argv, not a bwrap flag.
     ctty: bool,
+    /// The argv of a program the supervisor starts before the command,
+    /// with the node that asked for it. Also not a bwrap flag.
+    helper: Option<(Origin, Vec<OsString>)>,
     /// Tag every following push carries. Set once per phase of work by
     /// [`BwrapArgs::tag`], so the dozens of `ro_bind`/`setenv` call sites
     /// need no origin argument of their own.
@@ -217,6 +220,7 @@ impl BwrapArgs {
             binds: Vec::new(),
             env: Vec::new(),
             ctty: false,
+            helper: None,
             origin: Origin::Baseline,
         };
         let o = OsStr::new;
@@ -364,6 +368,7 @@ impl BwrapArgs {
             binds: Vec::new(),
             env: Vec::new(),
             ctty: false,
+            helper: None,
             origin: Origin::Baseline,
         };
         let o = OsStr::new;
@@ -562,6 +567,18 @@ impl BwrapArgs {
         self.ctty = true;
     }
 
+    /// Have the supervisor start `argv` and wait for its display before
+    /// the command runs: `--helper <argv…> --` in `bubbler-init`'s own
+    /// arguments, and only there — a sandbox has one display server at
+    /// most, and a sidecar has none.
+    pub fn helper(&mut self, argv: Vec<OsString>) {
+        // Two servers in one sandbox is a bug in the caller, not a
+        // configuration a user can write: the second would replace the
+        // first silently, so the first is kept.
+        debug_assert!(self.helper.is_none(), "a second helper argv");
+        self.helper.get_or_insert((self.origin, argv));
+    }
+
     /// Set a variable inside the sandbox (phase 5, after `--clearenv`).
     pub fn setenv(&mut self, key: &OsStr, value: &OsStr) {
         push(
@@ -592,6 +609,7 @@ impl BwrapArgs {
         alloc: &mut dyn FdAllocator,
     ) -> Result<Vec<Explained>, LaunchError> {
         let ctty = self.ctty;
+        let helper = self.helper.clone();
         let mut out = self.emit(alloc)?;
         let socket = alloc.init_socket().map_err(LaunchError::Data)?;
         out.push(Explained {
@@ -609,6 +627,21 @@ impl BwrapArgs {
                 origin: Origin::Ctty,
                 args: vec!["--ctty".into()],
                 note: None,
+            });
+        }
+        if let Some((origin, argv)) = helper {
+            let mut args = vec![OsString::from("--helper")];
+            args.extend(argv);
+            // The supervisor reads the helper's argv up to this `--`; the
+            // command's own follows it.
+            args.push(OsString::from("--"));
+            out.push(Explained {
+                origin,
+                args,
+                note: Some(
+                    "nested Xwayland, started by bubbler-init; -displayfd is added at run time"
+                        .to_owned(),
+                ),
             });
         }
         let mut args = vec![OsString::from("--")];
@@ -1310,6 +1343,37 @@ mod tests {
             &s[s.len() - 7..],
             &["--", INIT_INSIDE, "--socket-fd", "6", "--ctty", "--", "sh"]
         );
+    }
+
+    /// The helper is the supervisor's argument, not bwrap's: it follows
+    /// the switches of the supervisor, ends with the `--` that closes it,
+    /// and keeps the origin of the node that asked for a server. A
+    /// sidecar runs no supervisor, so it never carries one.
+    #[test]
+    fn the_helper_argv_follows_the_supervisor_switches_and_keeps_its_origin() {
+        let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default());
+        args.ctty();
+        args.tag(Origin::Service(2));
+        args.helper(vec!["/usr/bin/Xwayland".into(), ":0".into()]);
+        args.tag(Origin::Baseline);
+        let explained = args
+            .clone()
+            .finish_explained(&["sh".into()], &mut Counter::new())
+            .unwrap();
+        let helper = &explained[explained.len() - 2];
+        assert_eq!(helper.origin, Origin::Service(2));
+        assert_eq!(
+            strs(&helper.args),
+            ["--helper", "/usr/bin/Xwayland", ":0", "--"]
+        );
+        assert_eq!(
+            helper.note.as_deref(),
+            Some("nested Xwayland, started by bubbler-init; -displayfd is added at run time")
+        );
+        let plain = args
+            .finish_plain(&["sh".into()], &mut Counter::new())
+            .unwrap();
+        assert!(!strs(&plain).contains(&"--helper"), "{plain:?}");
     }
 
     #[test]

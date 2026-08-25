@@ -13,7 +13,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::{Component, Path, PathBuf};
 
 use crate::bwrap::{BwrapArgs, Origin};
-use crate::config::{RESERVED_ENV, Service, ShareMode, X11Mode};
+use crate::config::{self, RESERVED_ENV, Service, ShareMode, X11Mode};
 use crate::dbus;
 use crate::env::{Env, SANDBOX_HOME};
 use crate::error::LaunchError;
@@ -309,12 +309,18 @@ fn x11(
     host: &dyn Host,
     mode: &X11Mode,
 ) -> Result<(), LaunchError> {
-    if let X11Mode::Nested(_) = mode {
+    if let X11Mode::Nested(nested) = mode {
+        // Probed on the host because that is where the binary is read
+        // from: `/usr` is bound read-only, so a sandbox without
+        // `xorg-xwayland` installed outside has no server to start, and
+        // failing here beats a `DISPLAY` that names nothing.
+        require_file(host, "x11", PathBuf::from(config::XWAYLAND))?;
         // The display number is fixed: the server is the only one in
         // this sandbox, and `exec` children take the variable from the
         // supervisor that started it. Nothing is bound and no cookie is
         // handed over — an X client inside reaches no other display.
         args.setenv(OsStr::new("DISPLAY"), OsStr::new(":0"));
+        args.helper(nested.xwayland_argv());
         return Ok(());
     }
     let display = env.display.as_deref().ok_or(LaunchError::MissingEnv {
@@ -1416,9 +1422,9 @@ mod tests {
 
     /// The nested server runs inside the sandbox, so nothing of the
     /// host's display is bound for it and no cookie is handed over:
-    /// `DISPLAY` is the whole of what the grant emits, and it holds even
-    /// where the session has no X server at all. (The Xwayland itself is
-    /// started by the supervisor, which is a later piece.)
+    /// `DISPLAY` and the server's own argv are the whole of what the
+    /// grant emits, and they hold even where the session has no X server
+    /// at all.
     #[test]
     fn nested_x11_binds_nothing_and_only_names_the_display() {
         let mut e = env();
@@ -1427,6 +1433,7 @@ mod tests {
             &[Service::X11(X11Mode::default())],
             &e,
             &[
+                ("/usr/bin/Xwayland", File),
                 ("/tmp/.X11-unix/X0", Sock),
                 ("/run/user/1000/Xauthority", File),
             ],
@@ -1439,6 +1446,47 @@ mod tests {
             !a.contains(&"/run/user/1000/Xauthority".to_owned()),
             "{a:?}"
         );
+    }
+
+    /// The supervisor is handed the server's command line, ended by a
+    /// `--` of its own so the sandbox's command still follows it: these
+    /// words are the argv `bubbler-init` runs, `-displayfd` aside.
+    #[test]
+    fn nested_x11_hands_the_supervisor_the_server_argv() {
+        let a = argv(
+            &[Service::X11(X11Mode::default())],
+            &env(),
+            &[("/usr/bin/Xwayland", File)],
+        )
+        .unwrap();
+        let tail = [
+            "--helper",
+            "/usr/bin/Xwayland",
+            ":0",
+            "-noreset",
+            "-nolisten",
+            "tcp",
+            "-ac",
+            "-hidpi",
+            "-decorate",
+            "-geometry",
+            "1280x720",
+            "--",
+            "--",
+            "x",
+        ];
+        assert_eq!(a[a.len() - tail.len()..], tail, "{a:?}");
+    }
+
+    /// A host without `xorg-xwayland` has no server to nest, and the run
+    /// is refused before it starts rather than leaving the sandbox with a
+    /// `DISPLAY` that names nothing.
+    #[test]
+    fn nested_x11_without_xwayland_on_the_host_fails() {
+        assert!(matches!(
+            argv(&[Service::X11(X11Mode::default())], &env(), &[]),
+            Err(LaunchError::MissingResource { service: "x11", .. })
+        ));
     }
 
     #[test]

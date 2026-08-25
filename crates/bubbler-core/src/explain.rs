@@ -7,7 +7,7 @@
 use std::ffi::OsStr;
 
 use crate::bwrap::{Explained, Origin};
-use crate::config::{InstanceConfig, Lines, SeccompConfig, Service, WaylandMode};
+use crate::config::{InstanceConfig, Lines, SeccompConfig, Service, WaylandMode, X11Mode};
 use crate::dbus;
 use crate::error::ConfigError;
 use crate::kdl_out;
@@ -419,6 +419,12 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
                     Some(Service::Wayland(WaylandMode::Host)) => {
                         out.push("    raw socket: wayland \"host\"".to_owned());
                     }
+                    // The nested mode needs no line of its own: the argv
+                    // it hands the supervisor is an argument above, and
+                    // that one carries the explanation.
+                    Some(Service::X11(X11Mode::Host)) => {
+                        out.push("    raw socket: x11 \"host\"".to_owned());
+                    }
                     _ => {}
                 },
                 Origin::Seccomp => out.extend(listed(n == 0, seccomp_lines(&view.cfg.seccomp))),
@@ -683,6 +689,73 @@ bwrap
         .unwrap();
         assert!(
             out.contains(&"    raw socket: wayland \"host\"".to_owned()),
+            "{out:#?}"
+        );
+    }
+
+    /// Which X server an `x11` grant runs is not in its arguments
+    /// either: the nested one is a display variable plus the argv the
+    /// supervisor starts, and the note is what says so.
+    #[test]
+    fn an_x11_grant_shows_the_server_it_runs() {
+        let nested = cfg("wayland\ndri\nx11\ncommand \"true\"");
+        let lines = Lines::default();
+        let render_with = |cfg: &InstanceConfig, items: &[Explained]| {
+            render(
+                items,
+                &View {
+                    title: "bwrap",
+                    instance: "t",
+                    cfg,
+                    source: Source {
+                        file: "config.kdl",
+                        lines: &lines,
+                    },
+                    rules: &[],
+                    proxy: false,
+                    full: false,
+                },
+            )
+            .unwrap()
+        };
+        let out = render_with(
+            &nested,
+            &[
+                item(Origin::Service(2), &["--setenv", "DISPLAY", ":0"], None),
+                item(
+                    Origin::Service(2),
+                    &["--helper", "/usr/bin/Xwayland", ":0", "--"],
+                    Some(
+                        "nested Xwayland, started by bubbler-init; -displayfd is added at run time",
+                    ),
+                ),
+            ],
+        );
+        let at = out
+            .iter()
+            .position(|l| l.starts_with("  x11 "))
+            .unwrap_or_else(|| panic!("{out:#?}"));
+        assert_eq!(
+            &out[at + 1..at + 3],
+            [
+                "    --setenv DISPLAY :0".to_owned(),
+                "    --helper /usr/bin/Xwayland :0 --  (nested Xwayland, started by \
+                 bubbler-init; -displayfd is added at run time)"
+                    .to_owned(),
+            ],
+            "{out:#?}"
+        );
+        let host = cfg("x11 \"host\"\ncommand \"true\"");
+        let out = render_with(
+            &host,
+            &[item(
+                Origin::Service(0),
+                &["--ro-bind", "/tmp/.X11-unix/X0", "/tmp/.X11-unix/X0"],
+                None,
+            )],
+        );
+        assert!(
+            out.contains(&"    raw socket: x11 \"host\"".to_owned()),
             "{out:#?}"
         );
     }
