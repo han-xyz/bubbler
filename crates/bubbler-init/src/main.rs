@@ -621,7 +621,9 @@ fn main() -> ExitCode {
         // poll reported: the display socket was in the set from before
         // the signal, and the client that woke it must not start a server
         // anyway. A signal pending before `poll` returns has run its
-        // handler by the time this reads the flag, so the two cannot cross.
+        // handler by the time this reads the flag, so the two cannot
+        // cross: init spawns no threads, so that handler is this thread's
+        // own, run on its way out of the syscall.
         if stop.swap(false, Ordering::SeqCst) {
             begin_stop(&command, &execs, &mut stopping);
         }
