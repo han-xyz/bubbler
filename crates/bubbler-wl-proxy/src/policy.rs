@@ -197,6 +197,13 @@ impl Policy {
         if action == Action::Forward {
             conn.objects
                 .new_id_from(msg.from_client, msg.object, msg.opcode, msg.args)?;
+            // The client's destructor retires the object as it goes past: the
+            // id keeps decoding, because events for it may still be in
+            // flight, but a server-range id stops counting against the live
+            // cap the moment the client is done with it.
+            if msg.from_client && msg.message.is_destructor {
+                conn.objects.destroy(msg.object);
+            }
         }
         Ok(action)
     }
@@ -940,6 +947,90 @@ mod tests {
             .expect("accountable");
         assert_eq!(action, Action::Forward);
         assert!(proxy.conn.objects.get(3).is_none());
+    }
+
+    /// The destructor is a request like any other on the wire, so the map only
+    /// hears it here. Without this the server-range zombies stay at zero, the
+    /// cap the header promises never engages, and every offer a compositor
+    /// pushes at a long-lived client counts against the live objects forever.
+    #[test]
+    fn a_destructor_the_client_sends_retires_the_object() {
+        let mut proxy = proxy();
+        map(&mut proxy.conn, 5, "wl_data_device", 3);
+        let offer = SERVER_ID_BASE + 1;
+        let mut args = vec![Arg::NewId(offer)];
+        assert_eq!(
+            proxy
+                .send(
+                    false,
+                    5,
+                    "wl_data_device",
+                    "data_offer",
+                    &mut args,
+                    &mut Vec::new()
+                )
+                .expect("accountable"),
+            Action::Forward
+        );
+        let live = proxy.conn.objects.live();
+        assert_eq!(proxy.conn.objects.get(offer).map(|e| e.zombie), Some(false));
+
+        assert_eq!(
+            proxy
+                .send(
+                    true,
+                    offer,
+                    "wl_data_offer",
+                    "destroy",
+                    &mut Vec::new(),
+                    &mut Vec::new()
+                )
+                .expect("accountable"),
+            Action::Forward
+        );
+        // Retired, and still decodable: an event the compositor sent for the
+        // offer before it heard the destroy is still on its way.
+        assert_eq!(proxy.conn.objects.get(offer).map(|e| e.zombie), Some(true));
+        assert_eq!(
+            proxy.conn.objects.interface(offer).map(|i| i.name),
+            Some("wl_data_offer")
+        );
+        assert_eq!(
+            proxy.conn.objects.live(),
+            live - 1,
+            "a destroyed server id still counts against the live cap"
+        );
+
+        // A client id the same destructor retires keeps its slot: nothing but
+        // `wl_display.delete_id` drops one, and that is unchanged.
+        assert_eq!(
+            proxy
+                .send(
+                    true,
+                    5,
+                    "wl_data_device",
+                    "release",
+                    &mut Vec::new(),
+                    &mut Vec::new()
+                )
+                .expect("accountable"),
+            Action::Forward
+        );
+        assert_eq!(proxy.conn.objects.get(5).map(|e| e.zombie), Some(true));
+        assert_eq!(proxy.conn.objects.live(), live - 1);
+        let mut args = vec![Arg::Uint(5)];
+        proxy
+            .send(
+                false,
+                1,
+                "wl_display",
+                "delete_id",
+                &mut args,
+                &mut Vec::new(),
+            )
+            .expect("accountable");
+        assert!(proxy.conn.objects.get(5).is_none());
+        assert_eq!(proxy.conn.objects.live(), live - 2);
     }
 
     #[test]

@@ -41,6 +41,9 @@ pub struct Message {
     pub name: &'static str,
     /// First interface version in which this message exists.
     pub since: u32,
+    /// Whether the XML marks this message `type="destructor"`: the one
+    /// that ends the object it is sent to.
+    pub is_destructor: bool,
     /// Argument kinds in wire order; `wl_registry.bind` carries the interface
     /// name and version of its untyped `new_id` as the `String` and `Uint`
     /// ahead of it, exactly as libwayland encodes them.
@@ -204,6 +207,27 @@ mod tests {
             listener.args.iter().filter(|a| **a == ArgKind::Fd).count(),
             2
         );
+    }
+
+    #[test]
+    fn a_destructor_is_marked_and_nothing_else_is() {
+        let offer = lookup("wl_data_offer").expect("wl_data_offer is in the table");
+        let destroy = offer
+            .requests
+            .iter()
+            .find(|m| m.name == "destroy")
+            .expect("wl_data_offer.destroy");
+        assert!(destroy.is_destructor);
+        let receive = offer
+            .requests
+            .iter()
+            .find(|m| m.name == "receive")
+            .expect("wl_data_offer.receive");
+        assert!(!receive.is_destructor);
+        // An event may be a destructor too, and the tables say so; only a
+        // request is acted on, in `Policy::apply`.
+        let callback = lookup("wl_callback").expect("wl_callback is in the table");
+        assert!(callback.event(0).is_some_and(|m| m.is_destructor));
     }
 
     #[test]

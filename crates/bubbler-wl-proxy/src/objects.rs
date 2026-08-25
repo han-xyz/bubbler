@@ -82,7 +82,8 @@ pub struct Entry {
     /// Index of the interface in [`tables::INTERFACES`].
     pub interface: usize,
     /// Version the object was created with, never above the version the
-    /// tables describe, so a `since` check cannot run past their end.
+    /// tables describe: a higher one would have opcodes past the end of
+    /// the message lists here.
     pub version: u32,
     /// The client asked for this object to be destroyed. The id stays
     /// resolvable until `wl_display.delete_id` releases it.
@@ -144,7 +145,7 @@ impl Objects {
             version: version.min(max),
             zombie: false,
         };
-        let live = self.map.len() - self.server_zombies;
+        let live = self.live();
         match self.map.entry(id) {
             // The server reuses an id of its own as soon as it drops the
             // object; the client has to wait for `wl_display.delete_id`.
@@ -188,6 +189,12 @@ impl Objects {
     /// Whether no id at all is mapped, which a live connection never is.
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+
+    /// How many ids count against [`MAX_OBJECTS`]: every client id plus
+    /// every server id the client has not destroyed.
+    pub fn live(&self) -> usize {
+        self.map.len() - self.server_zombies
     }
 
     /// Record the object `wl_registry.bind` creates.

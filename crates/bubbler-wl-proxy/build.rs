@@ -32,6 +32,7 @@ fn die(msg: impl AsRef<str>) -> ! {
 struct Msg {
     name: String,
     since: u32,
+    is_destructor: bool,
     args: Vec<&'static str>,
     new_id_interface: Option<String>,
 }
@@ -421,6 +422,9 @@ fn message(msg: &wayrs_proto_parser::Message<'_>) -> Msg {
     Msg {
         name: plain(&msg.name),
         since: msg.since,
+        // The XML's `type="destructor"`: the request that ends the object,
+        // which is the only thing the proxy has to tell apart from the rest.
+        is_destructor: msg.kind.as_deref() == Some("destructor"),
         args,
         new_id_interface,
     }
@@ -470,8 +474,8 @@ fn render(ifaces: &BTreeMap<String, Iface>, display: usize) -> String {
 /// Render one `Message` literal into `out`.
 fn render_message(out: &mut String, msg: &Msg) {
     out.push_str(&format!(
-        "Message {{ name: \"{}\", since: {}, args: &[",
-        msg.name, msg.since
+        "Message {{ name: \"{}\", since: {}, is_destructor: {}, args: &[",
+        msg.name, msg.since, msg.is_destructor
     ));
     for (i, arg) in msg.args.iter().enumerate() {
         if i > 0 {
