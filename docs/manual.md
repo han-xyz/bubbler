@@ -2696,6 +2696,12 @@ none of its own.
   proxy cannot parse and therefore hides from the sandbox. Three interfaces went
   that way on this host; two of them have current replacements the sandbox does
   get. Refreshing the tables means bumping those crates; see "wayland".
+- The fallback denylist lets `zwp_keyboard_shortcuts_inhibit_manager_v1`
+  through: it takes the compositor's own key combinations only while a surface
+  of the sandbox's own has focus, which is what a VM or a remote-desktop window
+  needs. On a compositor that reserves no combination for itself, a fullscreen
+  window holding it is a keyboard trap, and getting out of one is the
+  compositor's policy and not bubbler's; see "wayland".
 - `x11 "host"` bypasses the Wayland security context: those clients speak to a
   server that is a client of your session's own socket, so what a compositor
   withholds from a sandboxed client it does not withhold there; see "wayland".
@@ -2806,8 +2812,10 @@ the tests that need the real supervisor skip for that reason too.
 
 With `$WAYLAND_DISPLAY` set the Wayland tests are as real as the rest: they run
 against your own compositor, mapping a window and taking the focus for a
-moment, and they read the selection and put it back in its plainest flavour, so
-an image or an HTML selection comes back as its text form.
+moment, and they take the selection and give it back with one flavour on it —
+its plainest text form, or its first content type where it had no text, so an
+HTML selection comes back as text and an image-only one as the image. What was
+serving it does not come back: a selection has one owner, and the test took it.
 
 `cargo test` includes the property tests in
 `crates/bubbler-core/tests/proptest.rs`, which are three claims about generated

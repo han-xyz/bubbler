@@ -248,7 +248,14 @@ hidden is the compositor's policy and not bubbler's — bubbler attaches the
 metadata and the compositor does every bit of the enforcing, so the grant
 is worth what the compositor implements. On the fallback path the list is
 bubbler's own and is a denylist, so a privileged protocol no one has added
-to it reaches the sandbox. `wayland "host"` asks for the session socket
+to it reaches the sandbox. One is left through deliberately:
+`zwp_keyboard_shortcuts_inhibit_manager_v1` suppresses the compositor's own
+key combinations only while a surface of the client's own has focus, which
+is what a VM or a remote-desktop window inside a sandbox needs — but a
+fullscreen window holding it is a keyboard trap on a compositor that
+reserves no combination for itself, and the way out of one is the
+compositor's policy rather than anything bubbler can do.
+`wayland "host"` asks for the session socket
 outright, with no context and no proxy at all (lint `wayland-host`). The
 session's Xwayland is outside all of it: `x11 "host"` reaches a server that
 is an ordinary client of your session, though a bare `x11` starts one on

@@ -120,10 +120,11 @@ the threat model say exactly how wide. Known gaps are listed under
 
 Sandbox tests probe for a working `bwrap` and skip with a reason where there
 is none. With `$WAYLAND_DISPLAY` set the Wayland tests run against your own
-compositor: they map a window and take the focus for a moment, and they read
-the selection and put it back in its plainest flavour, so an image or an HTML
-selection comes back as its text form. `cargo deny check`, cargo-fuzz targets
-under `fuzz/`, and the CI workflow are described under
+compositor: they map a window and take the focus for a moment, and they take
+the selection and give it back with one flavour on it — its plainest text form,
+or its first content type where it had no text, so an HTML selection comes back
+as text and an image-only one as the image. `cargo deny check`, cargo-fuzz
+targets under `fuzz/`, and the CI workflow are described under
 [Development](docs/wiki/Development.md).
 
 ## Acknowledgements

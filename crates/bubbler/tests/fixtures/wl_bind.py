@@ -38,8 +38,9 @@ BOUND = 4
 SYNC = 5
 
 #: Interface asked for when none is named. It is in the proxy's tables and
-#: on the class's privileged list, so a compositor that offers it at all
-#: offers it to unsandboxed clients only.
+#: on bubbler's denylist, and a compositor with a security context is not
+#: expected to hand it to a sandboxed client either, so binding it is
+#: binding something this connection was never offered.
 DEFAULT_INTERFACE = "zwlr_data_control_manager_v1"
 
 

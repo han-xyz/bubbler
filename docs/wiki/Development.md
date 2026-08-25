@@ -33,8 +33,9 @@ did not cover. `crates/bubbler-core/tests/proptest.rs` holds the property
 tests: emitter/parser round trip, desktop patch idempotence, include resolver
 never recursing past the stack. With `$WAYLAND_DISPLAY` set the Wayland tests
 run against your own compositor: they map a window and take the focus for a
-moment, and they read the selection and put it back in its plainest flavour, so
-an image or an HTML selection comes back as its text form.
+moment, and they take the selection and give it back with one flavour on it —
+its plainest text form, or its first content type where it had no text, so an
+HTML selection comes back as text and an image-only one as the image.
 
 ## Fuzzing
 
