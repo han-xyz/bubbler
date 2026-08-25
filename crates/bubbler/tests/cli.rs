@@ -13,10 +13,11 @@ use bubbler_core::bwrap::ETC_ALLOWLIST;
 use bubbler_core::profile::NAMES;
 use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
-    PYTHON, bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, bwrap_alive, kill_group,
-    output_past_a_busy_exec, process_running, real_init, require_bwrap, require_dbus,
+    PYTHON, bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, bubbler_wayland, bwrap_alive,
+    kill_group, output_past_a_busy_exec, process_running, real_init, require_bwrap, require_dbus,
     require_document_portal, require_groff, require_nft, require_pasta, require_portal,
-    require_python, require_system_bus, require_tray, say, system_owns, test_pty,
+    require_python, require_security_context, require_system_bus, require_tray, say, system_owns,
+    test_pty,
 };
 use rustix::fs::{OFlags, fcntl_getfl};
 use rustix::process::{Pid, Signal, kill_process};
@@ -2089,10 +2090,15 @@ impl Drop for RuntimeLeftovers {
 }
 
 fn dbus_instance(tmp: &Path, init: &Path, name: &str, config: &str) -> RuntimeLeftovers {
-    let out = bubbler_dbus(tmp, init)
-        .args(["create", name])
-        .output()
-        .unwrap();
+    session_instance(bubbler_dbus(tmp, init), tmp, name, config)
+}
+
+/// An instance created with `create`, given `config`, and cleaned out of
+/// the real runtime dir again when the guard drops. `create` is the
+/// command that creates it, which decides what of the session the run
+/// sees.
+fn session_instance(mut create: Command, tmp: &Path, name: &str, config: &str) -> RuntimeLeftovers {
+    let out = create.args(["create", name]).output().unwrap();
     assert!(
         out.status.success(),
         "{}",
@@ -2915,6 +2921,131 @@ fn wayland_display_must_name_a_socket() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{err}");
     assert!(err.contains("notasocket"), "{err}");
+}
+
+/// A `wayland` instance whose runtime state lands in the session's real
+/// runtime dir, so a run can reach the compositor there.
+fn wayland_instance(tmp: &Path, init: &Path, name: &str, config: &str) -> RuntimeLeftovers {
+    session_instance(bubbler_wayland(tmp, init), tmp, name, config)
+}
+
+/// `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY` on the host: the session's own
+/// socket, and the path the sandbox sees a socket at whichever mode
+/// serves it.
+fn host_wayland_socket() -> PathBuf {
+    let run = std::env::var_os("XDG_RUNTIME_DIR").expect("checked by require_security_context");
+    let display = std::env::var_os("WAYLAND_DISPLAY").expect("checked by require_security_context");
+    PathBuf::from(run).join(display)
+}
+
+/// The inode of `path`. A bind mount carries the source file's inode, so
+/// the number tells bubbler's own socket from the session's without
+/// connecting to either.
+fn socket_ino(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        .ino()
+}
+
+/// What a real run of `config` finds at `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`
+/// inside the sandbox: the inode of the socket bound there, and what the
+/// run said on stderr. The instance is removed again before this returns.
+fn wayland_ino_inside(tmp: &Path, init: &Path, name: &str, config: &str) -> (u64, String) {
+    let _leftovers = wayland_instance(tmp, init, name, config);
+    let out = bubbler_wayland(tmp, init)
+        .args(["run", name, "--", "/usr/bin/stat", "-L", "-c", "%i"])
+        .arg(host_wayland_socket())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let s = String::from_utf8_lossy(&out.stdout);
+    let ino = s.trim().parse().unwrap_or_else(|e| panic!("{s:?}: {e}"));
+    (ino, err)
+}
+
+/// The whole point of the grant: the application is handed a socket of
+/// this run's, which the compositor accepts on as a security context, and
+/// not the session's, which every client shares.
+#[test]
+fn real_wayland_binds_bubblers_own_socket_not_the_hosts() {
+    if !require_security_context() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let host_ino = socket_ino(&host_wayland_socket());
+    let (inside, err) = wayland_ino_inside(
+        tmp.path(),
+        &init,
+        "bubbler-test-wl-ctx",
+        "wayland\ncommand \"true\"\n",
+    );
+    assert_ne!(inside, host_ino, "the sandbox got the host socket: {err}");
+    // A compositor without the manager binds the session's socket and
+    // says so here, so an absent warning is the run stating that the
+    // inode above differs because a context was registered.
+    assert!(!err.contains("no wp_security_context_manager_v1"), "{err}");
+}
+
+/// `wayland "host"` is the opt-out, and opting out has to reach the
+/// sandbox: the session's own socket, the same file by inode.
+#[test]
+fn real_wayland_host_binds_the_host_socket() {
+    if !require_security_context() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let host_ino = socket_ino(&host_wayland_socket());
+    let (inside, err) = wayland_ino_inside(
+        tmp.path(),
+        &init,
+        "bubbler-test-wl-host",
+        "wayland \"host\"\ncommand \"true\"\n",
+    );
+    assert_eq!(inside, host_ino, "{err}");
+}
+
+/// `--explain` describes the run a compositor with the protocol gives,
+/// and asks no compositor anything: here `$WAYLAND_DISPLAY` names a
+/// socket that does not exist, so a connection attempt would fail.
+#[test]
+fn explain_names_the_security_context_without_asking_the_compositor() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/t/config.kdl"),
+        "wayland\ncommand \"true\"\n",
+    )
+    .unwrap();
+    let out = bubbler(tmp.path())
+        .env("WAYLAND_DISPLAY", "wayland-0")
+        .args(["run", "t", "--explain"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run = tmp.path().join("run");
+    assert!(
+        s.contains(&format!(
+            "    --ro-bind {}/bubbler/t/wayland {}/wayland-0\n",
+            run.display(),
+            run.display()
+        )),
+        "{s}"
+    );
+    assert!(
+        s.contains(
+            "    security-context: engine=org.bubbler app=org.bubbler.t instance=bubbler-t\n"
+        ),
+        "{s}"
+    );
 }
 
 #[test]

@@ -441,6 +441,47 @@ pub fn bubbler_dbus(root: &Path, init: &Path) -> Command {
     c
 }
 
+/// [`bubbler_live`] with the session's real `XDG_RUNTIME_DIR` and
+/// `WAYLAND_DISPLAY`, which a security context needs: the run connects to
+/// the compositor itself. Instance runtime state therefore lands in the
+/// real runtime dir, so such tests need distinctive names.
+pub fn bubbler_wayland(root: &Path, init: &Path) -> Command {
+    let mut c = bubbler_live(root, init);
+    for var in ["XDG_RUNTIME_DIR", "WAYLAND_DISPLAY"] {
+        if let Some(value) = std::env::var_os(var) {
+            c.env(var, value);
+        }
+    }
+    c
+}
+
+/// Returns false (after printing why) when a Wayland security context
+/// cannot be tested here: no bwrap, no `WAYLAND_DISPLAY`, or a compositor
+/// that offers no `wp_security_context_manager_v1`.
+///
+/// The probe is the launcher's own: `probe` connects over the very
+/// environment a test hands the run through [`bubbler_wayland`].
+pub fn require_security_context() -> bool {
+    if !require_bwrap() {
+        return false;
+    }
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        say("skipping: WAYLAND_DISPLAY unset");
+        return false;
+    }
+    match bubbler_core::wayland::probe() {
+        Ok(true) => true,
+        Ok(false) => {
+            say("skipping: the compositor offers no wp_security_context_manager_v1");
+            false
+        }
+        Err(e) => {
+            say(&format!("skipping: {e}"));
+            false
+        }
+    }
+}
+
 /// Whether `program` is on `PATH`. Only the spawn is checked: `dbus-send`
 /// exits 1 on `--version` even when it is installed.
 fn has_program(program: &str) -> bool {
