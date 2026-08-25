@@ -16,6 +16,11 @@ thiserror.workspace = true
 rustix = { workspace = true, features = ["stdio"] }
 signal-hook.workspace = true
 libseccomp.workspace = true
+# Wayland client in pure Rust, no libwayland: the security-context
+# handshake is six requests, but the wire format with its fd passing is
+# not worth hand-rolling.
+wayrs-client.workspace = true
+wayrs-protocols.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

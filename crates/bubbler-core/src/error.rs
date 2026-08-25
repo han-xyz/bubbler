@@ -244,6 +244,12 @@ pub enum LaunchError {
     /// not be forwarded into the sandbox.
     #[error("installing signal handlers")]
     Signal(#[source] io::Error),
+    /// The compositor refused, or could not be asked for, the Wayland
+    /// security context the `wayland` grant registers the sandbox as.
+    /// The run stops rather than fall back to the session socket, which
+    /// would be a weaker sandbox than the configuration asked for.
+    #[error(transparent)]
+    Wayland(#[from] crate::wayland::WaylandError),
     /// Command resolution failed (config had no `command` and none given).
     #[error(transparent)]
     Config(#[from] ConfigError),

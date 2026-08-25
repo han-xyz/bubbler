@@ -34,5 +34,7 @@ clap_mangen = "0.3"
 anyhow = "1"
 signal-hook = "0.3"
 libseccomp = "0.4"
+wayrs-client = "1"
+wayrs-protocols = { version = "0.14", features = ["security-context-v1"] }
 tempfile = "3"
 proptest = "1"
