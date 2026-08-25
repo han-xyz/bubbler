@@ -33,7 +33,7 @@ own variable (`$BUBBLER_INIT`, `$BUBBLER_WL_PROXY`), then beside the running
 | `bubblewrap` | everything |
 | `libseccomp` | everything (linked) |
 | `bubbler-wl-proxy` (not a package — installed above) | every sandboxed `wayland`; the run stops if it is missing or will not start |
-| `xdg-dbus-proxy` | any `dbus` or `system-bus` grant — most profiles |
+| `xdg-dbus-proxy` | any `dbus` or `system-bus` grant — of the shipped profiles, `chromium`, `code` and `firefox`; no profile grants `system-bus` |
 | `passt` | isolated `network` — every shipped profile with a network |
 | `nftables` | `outbound "deny"` only |
 | `xdg-desktop-portal` + a backend | `portals`, `camera` |

@@ -941,6 +941,8 @@ fn mode_conflict(node: &str, a: ShareMode, a_src: &Src, b: ShareMode, b_src: &Sr
 mod tests {
     use super::*;
     use crate::config::{BusRule, Clipboard, NestedX11, NetworkConfig, WaylandMode, X11Mode};
+    use crate::host::fake::{self, FakeHost};
+    use crate::lint;
 
     fn env(root: &Path) -> Env {
         Env {
@@ -1004,20 +1006,11 @@ mod tests {
                 "{n}"
             );
         }
-        let ff = r.resolve("firefox").unwrap().config;
-        assert!(ff.services.contains(&Service::Dri));
-        assert!(ff.services.contains(&Service::Portals));
         // Gecko picks Wayland on its own since Firefox 121, so the profile
-        // sets nothing.
+        // sets nothing. What it grants is pinned node for node in
+        // `the_desktop_profiles_grant_what_their_apps_need_and_nothing_wider`.
+        let ff = r.resolve("firefox").unwrap().config;
         assert!(ff.env.is_empty(), "{:?}", ff.env);
-        // Sound is the PulseAudio socket, which is what a libpulse client
-        // opens; `pipewire` binds the native socket the screen-share
-        // portal hands frames over, and is left to whoever shares a
-        // screen. The bus carries no rule of its own: the remote-instance
-        // name the profile used to own is an opt-in in its header.
-        assert!(ff.services.contains(&Service::Pulseaudio));
-        assert!(!ff.services.contains(&Service::Pipewire));
-        assert!(ff.services.contains(&Service::Dbus { rules: Vec::new() }));
         // One grant per profile the app does not work without, so a
         // profile edited into something weaker is caught here and not by
         // whoever runs it.
@@ -1036,11 +1029,6 @@ mod tests {
             cfg("libreoffice")
                 .env
                 .contains(&("SAL_USE_VCLPLUGIN".to_owned(), "gtk3".to_owned()))
-        );
-        assert!(
-            cfg("chromium")
-                .services
-                .contains(&home_share("Downloads", ShareMode::ReadWrite))
         );
         assert!(cfg("vesktop").services.contains(&Service::Pulseaudio));
         let steam = cfg("steam");
@@ -1178,6 +1166,186 @@ mod tests {
             cfg("vesktop").services,
             vec![wayland(), Service::Dri, Service::Pulseaudio, network()]
         );
+
+        // A browser draws, plays, fetches, and saves what it downloads
+        // into one directory; the portal is its file chooser. The
+        // remote-instance bus name, the media keys, the notifications and
+        // the screen sharing are opt-ins, and the bus it does carry holds
+        // no rule of its own.
+        let ff = cfg("firefox");
+        assert_eq!(
+            ff.services,
+            vec![
+                wayland(),
+                Service::Dri,
+                Service::Pulseaudio,
+                network(),
+                Service::Dbus { rules: Vec::new() },
+                Service::Portals,
+                home_share("Downloads", ShareMode::ReadWrite),
+            ]
+        );
+        // Chromium needs the same set: the two differ in their opt-ins,
+        // not in what it takes to run them.
+        assert_eq!(cfg("chromium").services, ff.services);
+
+        // Mail is a network and somewhere to save an attachment. Gecko
+        // composites in software without `dri`, and the GPU, the portal
+        // chooser and the new-mail notifications are opt-ins.
+        assert_eq!(
+            cfg("thunderbird").services,
+            vec![
+                wayland(),
+                network(),
+                home_share("Downloads", ShareMode::ReadWrite),
+            ]
+        );
+
+        // A document editor is a display and the documents. It keeps one
+        // `env` node, because bubbler clears the environment and VCL then
+        // has nothing to autodetect from.
+        let lo = cfg("libreoffice");
+        assert_eq!(
+            lo.services,
+            vec![wayland(), home_share("Documents", ShareMode::ReadWrite)]
+        );
+        assert_eq!(
+            lo.env,
+            vec![("SAL_USE_VCLPLUGIN".to_owned(), "gtk3".to_owned())]
+        );
+    }
+
+    /// The node entries of a header's `Bare by design. Add:` block: the
+    /// lines three spaces in, with a `{ … }` entry read to its closing
+    /// brace. Prose sits five spaces in and is skipped, so what comes
+    /// back is what a reader selects and pastes, character for character.
+    fn opt_in_nodes(text: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut lines = text
+            .lines()
+            .skip_while(|l| *l != "// Bare by design. Add:")
+            .skip(1)
+            .map_while(|l| l.strip_prefix("//"));
+        while let Some(body) = lines.next() {
+            let Some(entry) = body.strip_prefix("   ") else {
+                continue;
+            };
+            if entry.starts_with(' ') {
+                continue;
+            }
+            let mut node = entry.to_owned();
+            if entry.ends_with('{') {
+                for body in lines.by_ref() {
+                    let inner = body.strip_prefix("   ").unwrap_or(body);
+                    node.push('\n');
+                    node.push_str(inner);
+                    if inner.trim() == "}" {
+                        break;
+                    }
+                }
+            }
+            out.push(node);
+        }
+        out
+    }
+
+    /// Paste `nodes` into `profile` the way a reader does: appended, but
+    /// a block node replacing the bare node of the same name where the
+    /// profile already grants one, since a config holds one `dbus` node
+    /// and the two headers that need it say so. Also reports whether a
+    /// node was replaced.
+    fn paste(profile: &str, nodes: &[String]) -> (String, bool) {
+        let mut text = profile.to_owned();
+        let mut replaced = false;
+        for node in nodes {
+            let name: String = node
+                .chars()
+                .take_while(|c| !matches!(c, ' ' | '\n' | '{'))
+                .collect();
+            let bare = format!("\n{name}\n");
+            if node.contains('{') && text.contains(&bare) {
+                text = text.replacen(&bare, "\n", 1);
+                replaced = true;
+            }
+            text.push_str(node);
+            text.push('\n');
+        }
+        (text, replaced)
+    }
+
+    /// A `Bare by design. Add:` block is text a reader pastes into a
+    /// config, so every block is pasted into its own profile here and the
+    /// result has to parse as a config and lint clean. An entry that
+    /// stops fitting the profile it sits in — a `dbus` block beside the
+    /// bare `dbus` already granted, a bundle whose `dbus` went missing, a
+    /// `lint-allow` naming a check nothing raises any more — fails here
+    /// rather than in somebody's editor.
+    #[test]
+    fn every_opt_in_a_header_lists_pastes_back_into_its_own_profile() {
+        let (file, dir, _) = fake::types();
+        let search_path = [PathBuf::from("/usr/bin")];
+        for name in NAMES {
+            let text = lookup(name).expect("NAMES lists built-in profiles");
+            let nodes = opt_in_nodes(text);
+            assert_eq!(
+                nodes.is_empty(),
+                !text.contains("// Bare by design. Add:"),
+                "{name}: the block and what this test reads out of it disagree"
+            );
+            let (pasted, replaced) = paste(text, &nodes);
+            // The reader is told which node a block replaces; this does
+            // the same, so the two cannot drift apart.
+            assert!(
+                !replaced || text.contains("in place of the bare `dbus` node above"),
+                "{name} replaces a node its header does not name"
+            );
+            let cfg = config::parse(&pasted)
+                .unwrap_or_else(|err| panic!("{name} with its opt-ins pasted in: {err}"));
+
+            // The host is built from what the pasted config asks for, so
+            // the run measures the grants and not this machine.
+            let tmp = tempfile::tempdir().unwrap();
+            let e = env(tmp.path());
+            let mut host = FakeHost::default();
+            {
+                let mut add = |p: &Path, t| {
+                    host = std::mem::take(&mut host)
+                        .with(p.to_str().expect("built-in profiles hold UTF-8 paths"), t);
+                };
+                for s in &cfg.services {
+                    match s {
+                        Service::HomeShare { path, .. } => add(&e.home.join(path), dir),
+                        Service::PathShare { path, .. } => add(path, dir),
+                        Service::EtcShare { name } => add(&Path::new("/etc").join(name), dir),
+                        _ => {}
+                    }
+                }
+                if let Some(argv) = &cfg.command {
+                    let argv0 = argv[0].to_str().expect("built-in commands hold UTF-8");
+                    add(&Path::new("/usr/bin").join(argv0), file);
+                }
+                if let Some(entry) = &cfg.desktop {
+                    add(&Path::new("/usr/share/applications").join(entry), file);
+                }
+            }
+            let r = resolver(tmp.path(), &[(name, pasted.as_str())], &[]);
+            let ctx = lint::Context {
+                env: &e,
+                host: &host,
+                search_path: &search_path,
+            };
+            let report =
+                lint::lint_profile(&ctx, &r, name).unwrap_or_else(|err| panic!("{name}: {err}"));
+            assert_eq!(
+                report
+                    .findings
+                    .iter()
+                    .map(|f| format!("{}[{}]: {}", f.severity, f.id, f.message))
+                    .collect::<Vec<_>>(),
+                Vec::<String>::new(),
+                "{name} with its opt-ins pasted in does not lint clean"
+            );
+        }
     }
 
     #[test]

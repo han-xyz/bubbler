@@ -1551,11 +1551,15 @@ ask for the session's display with `x11 "host"`. `~/name` below is a
 Sound is `pulseaudio` in every profile that has any, and `pipewire` only in
 `mpv`. That is not a preference: `pulseaudio` binds
 `$XDG_RUNTIME_DIR/pulse/native` and sets `PULSE_SERVER` to it, which is the
-path a libpulse client takes, and the applications here are libpulse clients —
-`libpulse` is in the Arch dependencies of `firefox` and `chromium`, and
-`/opt/spotify/spotify`, `/opt/spotify/libcef.so` and `/usr/lib/electron40/electron`
-each carry `libpulse.so.0` for the dlopen. On a PipeWire host that socket is
-the one pipewire-pulse serves, so nothing is lost by taking it. `pipewire`
+path a libpulse client takes, and most of the applications here are measured
+libpulse clients: `libpulse` is in the Arch dependencies of `firefox` and
+`chromium`, and `/opt/spotify/spotify`, `/opt/spotify/libcef.so` and
+`/usr/lib/electron40/electron` each carry `libpulse.so.0` for the dlopen. On a
+PipeWire host that socket is the one pipewire-pulse serves, so nothing is lost
+by taking it. `steam` and `lutris` are the unmeasured half of that claim — the
+client fetches its own runtime on first run, and Wine is not installed on the
+machine this was written on — so both headers say so and name the fix: if a
+game is silent, add `pipewire` beside the `pulseaudio`. `pipewire`
 binds `pipewire-0`, the native socket, which is what a client speaking the
 PipeWire protocol itself uses (mpv) and what the portal hands a screen or
 camera stream over — which is why the profiles that could share a screen list

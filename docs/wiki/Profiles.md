@@ -46,6 +46,9 @@ CEF ones open `libpulse.so.0` themselves; that grant binds
 PipeWire host. `pipewire` binds `pipewire-0`, the native socket — what a client
 that speaks PipeWire itself takes (`mpv`), and what the portal hands a screen
 or camera stream over. Either socket carries capture as well as playback.
+`steam` and `lutris` are the unmeasured half: the client downloads its own
+runtime on first run and Wine was not installed when this was written, so both
+headers say so — if a game is silent, add `pipewire` beside the `pulseaudio`.
 
 Notes worth knowing:
 

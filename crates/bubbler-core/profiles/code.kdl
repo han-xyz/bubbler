@@ -16,10 +16,11 @@
 // /usr/bin/code reads from $XDG_CONFIG_HOME.
 //
 // This is a code editor, not a build box. Nothing here reaches the host:
-// no `org.freedesktop.Flatpak` (the flathub manifest's host-Spawn escape
-// hatch), no host filesystem, no ssh-agent socket. A remote or container
-// extension will not work, and git over SSH needs a key in the private
-// home rather than your agent.
+// no host filesystem, no ssh-agent socket, and no bus name that runs a
+// command outside the sandbox — `org.freedesktop.Flatpak` is one such
+// name, and granting it would make the sandbox a shell on the host. A
+// remote or container extension will not work, and git over SSH needs a
+// key in the private home rather than your agent.
 //
 // A checkout outside the home is named explicitly, e.g.
 //     path-share "/kioxia/src" mode=rw
@@ -36,10 +37,12 @@
 //       talk "org.freedesktop.secrets"
 //   }
 //   lint-allow "secrets-access" reason="extensions keep their tokens in the Secret Storage API, which is this bus name"
-//     — the Secret Storage API extensions keep their tokens in. Without
-//       it an extension that signs in asks again every start. It has no
-//       per-application partitioning, so the rule also lets VS Code read
-//       every other secret in the login keyring.
+//     — the block goes in place of the bare `dbus` node above, since one
+//       config carries one `dbus` node. The name is the Secret Storage
+//       API that extensions keep their tokens in; without it, one that
+//       signs in asks again every start. It has no per-application
+//       partitioning, so the rule also lets VS Code read every other
+//       secret in the login keyring.
 //   notify
 //     — desktop notifications, the ones an extension or an update raises.
 //       Needs `dbus`.
