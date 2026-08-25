@@ -12,7 +12,7 @@ use std::str::FromStr;
 
 use bubbler_core::config::{
     AllowOut, BusRule, Cidr, Errno, InstanceConfig, LintAllow, NetworkConfig, NetworkMode,
-    Outbound, Proto, SeccompConfig, Service, ShareMode, TtyMode, Userns, WaylandMode,
+    Outbound, Proto, SeccompConfig, Service, ShareMode, TtyMode, Userns, WaylandMode, X11Mode,
 };
 use bubbler_core::env::{DEFAULT_DATA_DIRS, Env};
 use bubbler_core::error::{DesktopError, ProfileError};
@@ -75,7 +75,9 @@ fn flag_services() -> impl Strategy<Value = Vec<Service>> {
     prop::collection::vec(any::<bool>(), 6).prop_map(|on| {
         [
             Service::Wayland(WaylandMode::Sandboxed),
-            Service::X11,
+            // `"host"`: every subset of this list has to parse, and the
+            // nested default requires `wayland` and `dri` behind it.
+            Service::X11(X11Mode::Host),
             Service::Dri,
             Service::Pipewire,
             Service::Pulseaudio,

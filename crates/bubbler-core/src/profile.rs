@@ -746,8 +746,19 @@ impl Merged {
                     return Ok(());
                 }
             }
-            Service::X11
-            | Service::Dri
+            Service::X11(_) => {
+                if let Some(slot) = self
+                    .services
+                    .iter_mut()
+                    .find(|(s, _)| matches!(s, Service::X11(_)))
+                {
+                    // A server, not a set: the including layer replaces
+                    // it, mode and window together.
+                    *slot = (svc.clone(), src.clone());
+                    return Ok(());
+                }
+            }
+            Service::Dri
             | Service::Pipewire
             | Service::Pulseaudio
             | Service::Portals
@@ -927,7 +938,7 @@ fn mode_conflict(node: &str, a: ShareMode, a_src: &Src, b: ShareMode, b_src: &Sr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BusRule, NetworkConfig, WaylandMode};
+    use crate::config::{BusRule, NestedX11, NetworkConfig, WaylandMode, X11Mode};
 
     fn env(root: &Path) -> Env {
         Env {
@@ -1032,7 +1043,7 @@ mod tests {
         // steamwebhelper is an X11 client. The 32-bit runtime needs no
         // `seccomp` node any more: the default filter carries i386.
         assert_eq!(steam.seccomp, SeccompConfig::default());
-        assert!(steam.services.contains(&Service::X11));
+        assert!(steam.services.contains(&Service::X11(X11Mode::Host)));
         // UDisks2 is enumeration only in both gaming profiles: `talk`
         // would hand the sandbox loop-setup, mount and LUKS methods,
         // which polkit judges as the user.
@@ -1071,7 +1082,7 @@ mod tests {
         );
 
         let lutris = cfg("lutris");
-        assert!(lutris.services.contains(&Service::X11));
+        assert!(lutris.services.contains(&Service::X11(X11Mode::Host)));
         assert_eq!(lutris.seccomp, SeccompConfig::default());
         assert!(
             lutris
@@ -1236,7 +1247,7 @@ mod tests {
         let mut x11: Vec<&str> = Vec::new();
         for n in NAMES {
             let cfg = r.resolve(n).unwrap().config;
-            if cfg.services.contains(&Service::X11) {
+            if cfg.services.iter().any(|s| matches!(s, Service::X11(_))) {
                 x11.push(n);
             }
             // Proton, umu and pressure-vessel nest their own bubblewrap,
@@ -1382,6 +1393,52 @@ mod tests {
             let r = resolver(tmp.path(), &[("base", base), ("app", app)], &[]);
             let cfg = r.resolve("app").unwrap().config;
             assert_eq!(cfg.services, vec![Service::Wayland(want)], "{app}");
+        }
+    }
+
+    /// A server, not a set: the including layer decides which one and
+    /// what its window is, and it may tighten as well as widen. Merging
+    /// the properties field by field would hand a layer a window no
+    /// file asked for.
+    #[test]
+    fn x11_mode_is_replaced_by_the_including_layer_in_both_directions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let full = NestedX11 {
+            geometry: NestedX11::default().geometry,
+            fullscreen: true,
+            grab: false,
+        };
+        // The display stack the nested server needs, in the layer below:
+        // the requirement is on the flattened config, not on one file.
+        let stack = "wayland\ndri\n";
+        for (base, app, want) in [
+            ("x11\n", "include \"base\"\nx11 \"host\"\n", X11Mode::Host),
+            (
+                "x11 \"host\"\n",
+                "include \"base\"\nx11\n",
+                X11Mode::Nested(NestedX11::default()),
+            ),
+            (
+                "x11\n",
+                "include \"base\"\nx11 fullscreen=#true\n",
+                X11Mode::Nested(full),
+            ),
+        ] {
+            let r = resolver(
+                tmp.path(),
+                &[("base", &format!("{stack}{base}")), ("app", app)],
+                &[],
+            );
+            let cfg = r.resolve("app").unwrap().config;
+            assert_eq!(
+                cfg.services,
+                vec![
+                    Service::Wayland(WaylandMode::Sandboxed),
+                    Service::Dri,
+                    Service::X11(want)
+                ],
+                "{app}"
+            );
         }
     }
 
@@ -2112,7 +2169,7 @@ mod tests {
             )],
             &[(
                 "base",
-                "x11\nlint-allow \"x11-without-reason\" reason=\"theirs\"\n\
+                "x11 \"host\"\nlint-allow \"x11-without-reason\" reason=\"theirs\"\n\
                  lint-allow \"tty-passthrough\" reason=\"base\"\n",
             )],
         );

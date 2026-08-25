@@ -13,7 +13,7 @@ use std::process::{Command, ExitCode};
 use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
-use bubbler_core::config::{self, Service};
+use bubbler_core::config::{self, Service, X11Mode};
 use bubbler_core::desktop;
 use bubbler_core::env::Env;
 use bubbler_core::error::{ConfigError, LaunchError};
@@ -956,8 +956,8 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                 return exec::run_in(&stream, command, mode)
                     .with_context(|| format!("executing in instance `{name}`"));
             }
-            if inst.has_service(&Service::X11) {
-                eprintln!("bubbler: warning: x11 grants no isolation between X clients");
+            if inst.has_service(&Service::X11(X11Mode::Host)) {
+                eprintln!("bubbler: warning: x11 \"host\" grants no isolation between X clients");
             }
             launcher::run(&env, &inst, command, mode)
                 .with_context(|| format!("running instance `{name}`"))
@@ -999,8 +999,8 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                 eph.keep_as(&env, name)
                     .with_context(|| format!("keeping the sandbox as instance `{name}`"))?;
             }
-            if eph.instance.has_service(&Service::X11) {
-                eprintln!("bubbler: warning: x11 grants no isolation between X clients");
+            if eph.instance.has_service(&Service::X11(X11Mode::Host)) {
+                eprintln!("bubbler: warning: x11 \"host\" grants no isolation between X clients");
             }
             let command = (!command.is_empty()).then_some(command.as_slice());
             let mode = tty.unwrap_or(eph.instance.config.tty);
@@ -1080,8 +1080,8 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                 return exec::run_in(&stream, command, mode)
                     .with_context(|| format!("executing in instance `{name}`"));
             }
-            if inst.has_service(&Service::X11) {
-                eprintln!("bubbler: warning: x11 grants no isolation between X clients");
+            if inst.has_service(&Service::X11(X11Mode::Host)) {
+                eprintln!("bubbler: warning: x11 \"host\" grants no isolation between X clients");
             }
             launcher::run(&env, &inst, command, mode)
                 .with_context(|| format!("running instance `{name}`"))

@@ -169,7 +169,7 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
                 // wildcard: a new bundle must be given its rules here, and
                 // a wildcard would silently give it none.
                 Service::Wayland(_)
-                | Service::X11
+                | Service::X11(_)
                 | Service::Network { .. }
                 | Service::Dri
                 | Service::Pipewire

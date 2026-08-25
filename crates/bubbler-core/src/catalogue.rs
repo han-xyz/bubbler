@@ -69,13 +69,16 @@ pub static GRANTS: &[Grant] = &[
     },
     Grant {
         node: "x11",
-        summary: "the X socket and an Xauthority cookie",
-        cost: "X11 has no isolation between clients: a sandbox on your display can keylog \
-               every other client on it, Xwayland included, read their windows and take \
-               the clipboard. A compatibility grant, not a safe one; `bubbler lint` warns \
-               about it unless the config says why it is there.",
+        summary: "an X server of the sandbox's own, or the session's",
+        cost: "Bare, bubbler starts a rootful Xwayland inside the sandbox as a client of \
+               the instance's Wayland socket: X clients see only that server, in one \
+               compositor window with no window manager (needs `wayland` and `dri`). \
+               `\"host\"` binds the session's X socket and cookie instead: X11 has no \
+               isolation between clients, so a sandbox on your display can keylog every \
+               other client, Xwayland included, and the security context does not apply; \
+               lint warns unless the config says why.",
         risk: Risk::Outward,
-        grammar: "x11",
+        grammar: "x11 [\"host\"] [geometry=\"WxH\"] [fullscreen=#true] [grab=#true]",
     },
     Grant {
         node: "network",
@@ -340,7 +343,7 @@ mod tests {
     /// gets (`camera` needs `portals`) are not what is under test here.
     const SAMPLES: &[(&str, &str)] = &[
         ("wayland", "wayland \"host\""),
-        ("x11", "x11"),
+        ("x11", "x11 \"host\""),
         ("network", "network \"host\""),
         ("dri", "dri"),
         ("pipewire", "pipewire"),

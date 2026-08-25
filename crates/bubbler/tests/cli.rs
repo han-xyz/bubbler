@@ -2806,17 +2806,17 @@ fn x11_warns_before_a_real_run() {
     let tmp = setup();
     bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
     let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
-    std::fs::write(&cfg, "x11\ncommand \"/usr/bin/true\"\n").unwrap();
+    std::fs::write(&cfg, "x11 \"host\"\ncommand \"/usr/bin/true\"\n").unwrap();
     let out = bubbler(tmp.path()).args(["run", "t"]).output().unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("x11 grants no isolation"), "{err}");
+    assert!(err.contains("x11 \"host\" grants no isolation"), "{err}");
     // $DISPLAY is cleared here, so the run fails after the warning is out.
     assert_eq!(out.status.code(), Some(1), "{err}");
     let out = bubbler(tmp.path())
         .args(["run", "t", "--dry-run"])
         .output()
         .unwrap();
-    assert!(!String::from_utf8_lossy(&out.stderr).contains("x11 grants no isolation"));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("x11 \"host\" grants no isolation"));
 }
 
 #[test]
@@ -4707,7 +4707,12 @@ fn run(tmp: &Path, args: &[&str]) -> (i32, String, String) {
 #[test]
 fn profile_lint_warns_with_a_line_and_a_lint_allow_node_accepts_it() {
     let tmp = setup();
-    let path = write_profile(tmp.path(), "user", "risky", "x11\ncommand \"sh\"\n");
+    let path = write_profile(
+        tmp.path(),
+        "user",
+        "risky",
+        "x11 \"host\"\ncommand \"sh\"\n",
+    );
     let (code, out, _) = run(tmp.path(), &["profile", "lint", "risky"]);
     assert_eq!(code, 1, "{out}");
     assert!(
@@ -4731,8 +4736,8 @@ fn profile_lint_warns_with_a_line_and_a_lint_allow_node_accepts_it() {
         tmp.path(),
         "user",
         "risky",
-        "x11\nlint-allow \"x11-without-reason\" reason=\"measured: no Wayland backend\"\n\
-         command \"sh\"\n",
+        "x11 \"host\"\nlint-allow \"x11-without-reason\" reason=\"measured: no Wayland \
+         backend\"\ncommand \"sh\"\n",
     );
     let (code, out, _) = run(
         tmp.path(),
@@ -4761,7 +4766,7 @@ fn profile_lint_all_reads_every_layer_once_and_json_carries_the_counts() {
     assert!(!out.contains("lint-allow-unused"), "{out}");
     // Two profiles over one base read that base twice; it is one layer,
     // and its `x11` is one finding.
-    write_profile(tmp.path(), "user", "base", "x11\ncommand \"sh\"\n");
+    write_profile(tmp.path(), "user", "base", "x11 \"host\"\ncommand \"sh\"\n");
     write_profile(tmp.path(), "user", "a", "include \"base\"\n");
     write_profile(tmp.path(), "user", "b", "include \"base\"\n");
     let (code, out, err) = run(tmp.path(), &["profile", "lint", "--all"]);
@@ -4832,7 +4837,7 @@ fn editing_an_instance_config_lints_it_afterwards() {
     let tmp = setup();
     run(tmp.path(), &["create", "t"]);
     let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
-    std::fs::write(&cfg, "x11\nhome-share \".ssh\"\n").unwrap();
+    std::fs::write(&cfg, "x11 \"host\"\nhome-share \".ssh\"\n").unwrap();
     std::fs::create_dir_all(tmp.path().join("home/.ssh")).unwrap();
     let out = bubbler(tmp.path())
         .env("EDITOR", "/usr/bin/true")
@@ -4851,7 +4856,12 @@ fn editing_an_instance_config_lints_it_afterwards() {
 #[test]
 fn create_and_reseed_print_the_findings_without_failing() {
     let tmp = setup();
-    write_profile(tmp.path(), "user", "generic", "x11\ncommand \"sh\"\n");
+    write_profile(
+        tmp.path(),
+        "user",
+        "generic",
+        "x11 \"host\"\ncommand \"sh\"\n",
+    );
     let (code, out, err) = run(tmp.path(), &["create", "t"]);
     assert_eq!(code, 0, "{err}");
     assert!(out.trim().ends_with("instances/t"), "{out}");
@@ -4872,7 +4882,7 @@ fn lint_on_an_instance_reads_its_own_config() {
     let (code, out, err) = run(tmp.path(), &["lint", "t"]);
     assert_eq!(code, 0, "{out}{err}");
     let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
-    std::fs::write(&cfg, "x11\n").unwrap();
+    std::fs::write(&cfg, "x11 \"host\"\n").unwrap();
     let (code, out, _) = run(tmp.path(), &["lint", "t"]);
     assert_eq!(code, 1, "{out}");
     assert!(

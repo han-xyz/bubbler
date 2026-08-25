@@ -181,6 +181,13 @@ const WAYLAND_HOST: Check = Check {
     id: "wayland-host",
     severity: Severity::Warning,
 };
+// A note, not a warning: the nested server gives up nothing outside the
+// sandbox, but a user who writes `x11` for an application with several
+// windows gets them stacked in one frame with nothing to move them.
+const X11_NESTED_NO_WM: Check = Check {
+    id: "x11-nested-no-wm",
+    severity: Severity::Note,
+};
 const X11_WITHOUT_REASON: Check = Check {
     id: "x11-without-reason",
     severity: Severity::Warning,
@@ -219,6 +226,7 @@ pub const CHECKS: &[Check] = &[
     TTY_PASSTHROUGH,
     USERNS_DISABLED_WITH_NESTED_SANDBOX,
     WAYLAND_HOST,
+    X11_NESTED_NO_WM,
     X11_WITHOUT_REASON,
 ];
 
@@ -838,16 +846,26 @@ fn rule_name(node: &KdlNode) -> Option<&str> {
 fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut Findings) {
     for node in source.doc.nodes() {
         match node.name().value() {
-            "x11" => f.push(
+            "x11" if arg(node) == Some("host") => f.push(
                 i,
                 node,
                 &X11_WITHOUT_REASON,
-                "`x11` gives no isolation between X clients: any of them can read another's \
-                 input and windows, and Xwayland clients also bypass the Wayland security \
-                 context"
+                "`x11 \"host\"` hands over the session X socket: every X client can read \
+                 every other's input and windows, Xwayland included, and the compositor's \
+                 security context does not apply"
                     .to_owned(),
-                "prefer `wayland`, or accept it with \
-                 `lint-allow \"x11-without-reason\" reason=\"...\"`",
+                "drop the argument for a nested Xwayland inside the sandbox, or accept it \
+                 with `lint-allow \"x11-without-reason\" reason=\"...\"`",
+            ),
+            "x11" => f.push(
+                i,
+                node,
+                &X11_NESTED_NO_WM,
+                "the nested X server has no window manager: X windows are undecorated and \
+                 unmanaged inside one compositor window"
+                    .to_owned(),
+                "`fullscreen=#true grab=#true` for games; `x11 \"host\"` where an \
+                 application needs the session's window manager",
             ),
             "tty" if arg(node) == Some("passthrough") => f.push(
                 i,
@@ -1587,18 +1605,25 @@ mod tests {
         });
     }
 
+    /// The session's socket is the warning; the server the sandbox runs
+    /// for itself gives nothing away and is a note about what it cannot
+    /// do. Both are accepted by a `lint-allow` naming them.
     #[test]
-    fn x11_is_a_warning_a_lint_allow_node_accepts() {
+    fn x11_host_is_a_warning_and_the_nested_default_is_a_note() {
         with(&host(), |ctx| {
-            let report = lint(ctx, &["x11"]);
+            let report = lint(ctx, &["x11 \"host\""]);
             assert_eq!(ids(&report), ["x11-without-reason"]);
             assert_eq!(report.findings[0].severity, Severity::Warning);
+            let nested = lint(ctx, &["x11 fullscreen=#true"]);
+            assert_eq!(ids(&nested), ["x11-nested-no-wm"]);
+            assert_eq!(nested.findings[0].severity, Severity::Note);
             assert_eq!(ids(&lint(ctx, &["wayland"])), [] as [&str; 0]);
-            let allowed = lint(
-                ctx,
-                &["x11\nlint-allow \"x11-without-reason\" reason=\"no Wayland backend\""],
-            );
-            assert_eq!(ids(&allowed), [] as [&str; 0]);
+            for text in [
+                "x11 \"host\"\nlint-allow \"x11-without-reason\" reason=\"no Wayland backend\"",
+                "x11\nlint-allow \"x11-nested-no-wm\" reason=\"one fullscreen game\"",
+            ] {
+                assert_eq!(ids(&lint(ctx, &[text])), [] as [&str; 0], "{text}");
+            }
         });
     }
 
@@ -1677,7 +1702,7 @@ mod tests {
             let report = lint(
                 ctx,
                 &[
-                    "x11",
+                    "x11 \"host\"",
                     "lint-allow \"x11-without-reason\" reason=\"measured\"",
                 ],
             );
@@ -1821,14 +1846,17 @@ mod tests {
             assert_eq!(
                 ids(&lint(
                     ctx,
-                    &["x11\nlint-allow \"x11-without-reason\" reason=\"m\""]
+                    &["x11 \"host\"\nlint-allow \"x11-without-reason\" reason=\"m\""]
                 )),
                 [] as [&str; 0]
             );
             assert_eq!(
                 ids(&lint(
                     ctx,
-                    &["lint-allow \"x11-without-reason\" reason=\"m\"", "x11"]
+                    &[
+                        "lint-allow \"x11-without-reason\" reason=\"m\"",
+                        "x11 \"host\""
+                    ]
                 )),
                 [] as [&str; 0]
             );
@@ -2229,7 +2257,7 @@ mod tests {
         with(&host(), |ctx| {
             let report = lint(
                 ctx,
-                &["wayland\n  x11\ndbus {\n    own \"org.kde.*\"\n}\ntty \"passthrough\""],
+                &["wayland\n  x11 \"host\"\ndbus {\n    own \"org.kde.*\"\n}\ntty \"passthrough\""],
             );
             assert_eq!(
                 ids(&report),
@@ -2248,8 +2276,11 @@ mod tests {
     #[test]
     fn a_built_in_layer_has_no_line_to_point_at() {
         with(&host(), |ctx| {
-            let source = Source::read(Where::BuiltIn("steam".to_owned()), "x11".to_owned())
-                .expect("valid KDL");
+            let source = Source::read(
+                Where::BuiltIn("steam".to_owned()),
+                "x11 \"host\"".to_owned(),
+            )
+            .expect("valid KDL");
             let report = run(ctx, std::slice::from_ref(&source));
             assert_eq!(
                 (report.findings[0].line, report.findings[0].col),
@@ -2257,9 +2288,9 @@ mod tests {
             );
             assert_eq!(
                 render_finding(&report.findings[0])[0].to_string_lossy(),
-                "built-in:steam: warning[x11-without-reason]: `x11` gives no isolation between \
-                 X clients: any of them can read another's input and windows, and Xwayland \
-                 clients also bypass the Wayland security context"
+                "built-in:steam: warning[x11-without-reason]: `x11 \"host\"` hands over the \
+                 session X socket: every X client can read every other's input and windows, \
+                 Xwayland included, and the compositor's security context does not apply"
             );
         });
     }
@@ -2272,10 +2303,10 @@ mod tests {
         with(&host(), |ctx| {
             let note = lint(ctx, &["command \"keepassxc\""]);
             assert_eq!(exit_code(&note, true), 0);
-            let warning = lint(ctx, &["x11"]);
+            let warning = lint(ctx, &["x11 \"host\""]);
             assert_eq!(exit_code(&warning, false), 1);
             assert_eq!(exit_code(&warning, true), 2);
-            let error = lint(ctx, &["x11\nnotify"]);
+            let error = lint(ctx, &["x11 \"host\"\nnotify"]);
             assert_eq!(exit_code(&error, false), 2);
         });
     }
@@ -2283,7 +2314,7 @@ mod tests {
     #[test]
     fn the_text_report_is_the_shape_an_editor_parses() {
         with(&host(), |ctx| {
-            let report = lint(ctx, &["x11\ncommand \"keepassxc\""]);
+            let report = lint(ctx, &["x11 \"host\"\ncommand \"keepassxc\""]);
             let lines: Vec<String> = render_text(&report)
                 .iter()
                 .map(|l| l.to_string_lossy().into_owned())
@@ -2291,12 +2322,12 @@ mod tests {
             assert_eq!(
                 lines,
                 vec![
-                    "/p/0.kdl:1:1: warning[x11-without-reason]: `x11` gives no isolation between \
-                     X clients: any of them can read another's input and windows, and Xwayland \
-                     clients also bypass the Wayland security context"
+                    "/p/0.kdl:1:1: warning[x11-without-reason]: `x11 \"host\"` hands over the \
+                     session X socket: every X client can read every other's input and windows, \
+                     Xwayland included, and the compositor's security context does not apply"
                         .to_owned(),
-                    "  help: prefer `wayland`, or accept it with `lint-allow \
-                     \"x11-without-reason\" reason=\"...\"`"
+                    "  help: drop the argument for a nested Xwayland inside the sandbox, or \
+                     accept it with `lint-allow \"x11-without-reason\" reason=\"...\"`"
                         .to_owned(),
                     "/p/0.kdl:2:1: note[command-not-found]: `keepassxc` is not on this host's PATH"
                         .to_owned(),
@@ -2441,7 +2472,7 @@ mod tests {
         let (e, r) = profiles(
             tmp.path(),
             &[
-                ("base", "x11\ncommand \"foot\"\n"),
+                ("base", "x11 \"host\"\ncommand \"foot\"\n"),
                 ("a", "include \"base\"\n"),
                 ("b", "include \"base\"\n"),
             ],

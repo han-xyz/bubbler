@@ -669,7 +669,9 @@ mod tests {
         let (_tmp, env) = fixture::store(&[("ff", "generic")]);
         let mut detail = Detail::open(&env, "ff", false).unwrap();
         select(&mut detail, "x11");
-        detail.toggle(&env);
+        // The session's socket, which is the mode a finding is about: a
+        // nested server needs `wayland` and `dri` under it.
+        detail.apply(&env, "x11 \"host\"").unwrap();
         select(&mut detail, "x11");
         let row = detail.row().unwrap().clone();
         let findings = detail.findings_of(&row);

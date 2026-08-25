@@ -1283,12 +1283,16 @@ mod tests {
         let (_tmp, mut app) = app();
         assert_eq!(app.store.row("ff").unwrap().lint, Some([0, 0, 0]));
         app.on_key(key(KeyCode::Enter));
-        on_node(&mut app, "x11");
-        press(&mut app, ' ');
+        // The display stack the nested X server is a client of, then the
+        // server: `x11` on its own is a config that does not parse.
+        for node in ["wayland", "dri", "x11"] {
+            on_node(&mut app, node);
+            press(&mut app, ' ');
+        }
         press(&mut app, 's');
         let row = app.store.row("ff").expect("still listed");
         assert!(row.grants.contains(&"x11"), "{:?}", row.grants);
-        assert_eq!(row.lint, Some([0, 1, 0]), "the warning x11 earns");
+        assert_eq!(row.lint, Some([0, 0, 1]), "the note a nested x11 earns");
     }
 
     #[test]

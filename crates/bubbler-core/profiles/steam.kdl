@@ -2,6 +2,8 @@
 //
 // The client is a 32-bit i386 binary and its UI (steamwebhelper) is an
 // X11/CEF client with no Wayland support, so this profile needs `x11`.
+// `"host"` rather than the nested server bubbler starts by default: the
+// client opens several windows and there is no window manager inside.
 // The Arch wiki's own bwrap example carries an accuracy dispute over
 // exactly that forwarding: an X11 client can keylog and inject into every
 // other X11 client, Xwayland included.
@@ -45,10 +47,10 @@
 // crosses it; `network "host"` brings them back, and hands Steam every
 // service on the host's loopback and every host abstract unix socket
 // along with them.
-lint-allow "x11-without-reason" reason="steamwebhelper is an X11/CEF client with no Wayland support"
+lint-allow "x11-without-reason" reason="steamwebhelper is an X11/CEF client with many windows that want the session's window manager"
 lint-allow "own-too-wide" reason="com.steampowered.* is Steam's own name space, and the client claims several names under it"
 wayland
-x11
+x11 "host"
 dri
 pipewire
 network

@@ -602,7 +602,7 @@ mod tests {
         std::fs::write(
             bubbler_core::instance::config_path(&app.env, "ff"),
             "// bubbler profile: generic\n// bubbler config: 2\n\
-             wayland\nx11\nhome-share \"Downloads\" mode=rw\n",
+             wayland\nx11 \"host\"\nhome-share \"Downloads\" mode=rw\n",
         )
         .unwrap();
         app.reload();
@@ -639,23 +639,28 @@ mod tests {
                 "bubbler — ff (generic) ○ stopped",
                 "┌grants────────────────────────────┐┌what it grants────────────────────────────┐",
                 "│●    wayland                      ││x11  (outward)                            │",
-                "│● !! x11                          ││x11                                       │",
-                "│● !  home-share \"Downloads\" mode=r││                                          │",
-                "│○ !  network                      ││the X socket and an Xauthority cookie     │",
-                "│○ !  dri                          ││                                          │",
-                "│○ !  pipewire                     ││X11 has no isolation between clients: a   │",
-                "│○ !  pulseaudio                   ││sandbox on your display can keylog every  │",
-                "│○ !! gamepad                      ││other client on it, Xwayland included,    │",
-                "│○ !  hidraw                       ││read their windows and take the clipboard.│",
-                "│○ !  camera                       ││A compatibility grant, not a safe one;    │",
+                "│● !! x11 \"host\"                   ││x11 [\"host\"] [geometry=\"WxH\"]             │",
+                "│● !  home-share \"Downloads\" mode=r││[fullscreen=#true] [grab=#true]           │",
+                "│○ !  network                      ││                                          │",
+                "│○ !  dri                          ││an X server of the sandbox's own, or the  │",
+                "│○ !  pipewire                     ││session's                                 │",
+                "│○ !  pulseaudio                   ││                                          │",
+                "│○ !! gamepad                      ││Bare, bubbler starts a rootful Xwayland   │",
+                "│○ !  hidraw                       ││inside the sandbox as a client of the     │",
+                "│○ !  camera                       ││instance's Wayland socket: X clients see  │",
                 "└──────────────────────────────────┘└──────────────────────────────────────────┘",
                 "Space grant  Enter write it  e $EDITOR  s save  u undo  ? more  Esc back",
             ]
         );
-        // And, further down the same pane, what the linter makes of it.
-        let tall = screen(&app, 80, 24).join(" ");
+        // And, further down the same pane, what the linter makes of it:
+        // further than it was, the cost of this node having grown a
+        // second server to describe.
+        let tall = screen(&app, 80, 32).join(" ");
         assert!(tall.contains("warning[x11-without-reason]"), "{tall}");
-        assert!(tall.contains("help: prefer `wayland`"), "{tall}");
+        assert!(
+            tall.contains("help: drop the argument for a nested"),
+            "{tall}"
+        );
     }
 
     #[test]
@@ -670,15 +675,15 @@ mod tests {
                 "bubbler — ff (generic) ○ stopped",
                 "┌grants────────────────────────────┐┌what it grants────────────────────────────┐",
                 "│●    wayland                      ││x11  (outward)                            │",
-                "│● !! x11                          ││x11                                       │",
+                "│● !! x11 \"host\"                   ││x11 [\"host\"] [geometry=\"WxH\"]             │",
                 "│●┌x11 in `ff`───────────────────────────────────────────────────────────────┐ │",
-                "│○│x11                                                                       │ │",
+                "│○│x11 \"host\"                                                                │ │",
                 "│○│                                                                          │ │",
-                "│○│x11                                                                       │ │",
+                "│○│x11 [\"host\"] [geometry=\"WxH\"] [fullscreen=#true] [grab=#true]             │ │",
                 "│○│Enter writes it, Esc leaves it alone                                      │ │",
                 "│○└──────────────────────────────────────────────────────────────────────────┘ │",
-                "│○ !  hidraw                       ││read their windows and take the clipboard.│",
-                "│○ !  camera                       ││A compatibility grant, not a safe one;    │",
+                "│○ !  hidraw                       ││inside the sandbox as a client of the     │",
+                "│○ !  camera                       ││instance's Wayland socket: X clients see  │",
                 "└──────────────────────────────────┘└──────────────────────────────────────────┘",
                 "Space grant  Enter write it  e $EDITOR  s save  u undo  ? more  Esc back",
             ]
@@ -686,7 +691,7 @@ mod tests {
         // The cursor sits at the end of what is written, inside the field.
         assert_eq!(
             cursor(&app, Rect::new(0, 0, 80, 14)),
-            Some(Position { x: 6, y: 5 })
+            Some(Position { x: 13, y: 5 })
         );
     }
 

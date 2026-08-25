@@ -4,7 +4,9 @@
 
 use std::ffi::{OsStr, OsString};
 
-use crate::config::{BusRule, InstanceConfig, LintAllow, Service, ShareMode, Userns, WaylandMode};
+use crate::config::{
+    BusRule, InstanceConfig, LintAllow, NestedX11, Service, ShareMode, Userns, WaylandMode, X11Mode,
+};
 use crate::error::ConfigError;
 use crate::network::{Mode as NetworkMode, NetworkConfig, Outbound};
 use crate::seccomp::{Errno, SeccompConfig};
@@ -58,7 +60,8 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
     Ok(match s {
         Service::Wayland(WaylandMode::Sandboxed) => "wayland".to_owned(),
         Service::Wayland(WaylandMode::Host) => "wayland \"host\"".to_owned(),
-        Service::X11 => "x11".to_owned(),
+        Service::X11(X11Mode::Nested(n)) => x11(n),
+        Service::X11(X11Mode::Host) => "x11 \"host\"".to_owned(),
         Service::Network(cfg) => network(cfg),
         Service::Dri => "dri".to_owned(),
         Service::Pipewire => "pipewire".to_owned(),
@@ -147,6 +150,23 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
             bus_block("system-bus", rules)
         }
     })
+}
+
+/// `x11` and only the properties that differ from the window a bare
+/// node describes: a default written out would be read back as the same
+/// server, and the shortest spelling is the one a user wrote.
+fn x11(n: &NestedX11) -> String {
+    let mut node = String::from("x11");
+    if n.geometry != NestedX11::default().geometry {
+        node.push_str(&format!(" geometry={}", quote(&n.geometry)));
+    }
+    // `#false` is the default, so only what the node turns on is written.
+    for (name, on) in [("fullscreen", n.fullscreen), ("grab", n.grab)] {
+        if on {
+            node.push_str(&format!(" {name}=#true"));
+        }
+    }
+    node
 }
 
 /// The `network` node: its mode where it is not the default, then one
@@ -373,6 +393,32 @@ mod tests {
         }
     }
 
+    /// Both modes and every property, since the emitter is what a saved
+    /// config and `reseed` are written from: a dropped `"host"` would
+    /// tighten the grant behind the user's back, a dropped bare node
+    /// widen it, and a dropped property hand a game a windowed server.
+    #[test]
+    fn both_x11_modes_and_their_properties_round_trip() {
+        for (text, svc) in [
+            ("x11\n", Service::X11(X11Mode::Nested(NestedX11::default()))),
+            (
+                "x11 geometry=\"1920x1080\" fullscreen=#true grab=#true\n",
+                Service::X11(X11Mode::Nested(NestedX11 {
+                    geometry: "1920x1080".to_owned(),
+                    fullscreen: true,
+                    grab: true,
+                })),
+            ),
+            ("x11 \"host\"\n", Service::X11(X11Mode::Host)),
+        ] {
+            let cfg = format!("wayland\ndri\n{text}");
+            round_trip(&cfg);
+            // Canonical already: what the emitter writes is the input.
+            assert_eq!(render(&parse(&cfg).unwrap()).unwrap(), cfg);
+            assert_eq!(service(&svc).unwrap(), text.trim_end());
+        }
+    }
+
     #[test]
     fn every_builtin_profile_round_trips() {
         for name in crate::profile::NAMES {
@@ -564,12 +610,13 @@ mod tests {
 
     #[test]
     fn an_accepted_finding_is_written_above_the_grant_it_is_about() {
-        let cfg = parse("x11\nlint-allow \"x11-without-reason\" reason=\"no Wayland\"").unwrap();
+        let cfg =
+            parse("x11 \"host\"\nlint-allow \"x11-without-reason\" reason=\"no Wayland\"").unwrap();
         assert_eq!(
             nodes(&cfg).unwrap(),
             vec![
                 "lint-allow \"x11-without-reason\" reason=\"no Wayland\"",
-                "x11"
+                "x11 \"host\""
             ]
         );
     }

@@ -336,9 +336,14 @@ const CHECK_LINES: &[(&str, &str)] = &[
          the sandbox from your session and its privileged globals stay reachable.",
     ),
     (
+        "x11-nested-no-wm",
+        "A nested `x11` server, which has no window manager: the X windows inside are \
+         undecorated and unmanaged.",
+    ),
+    (
         "x11-without-reason",
-        "An `x11` grant with no `lint-allow` reason: X clients are not isolated from one \
-         another.",
+        "An `x11 \"host\"` grant with no `lint-allow` reason: the session's X clients are \
+         not isolated from one another.",
     ),
 ];
 

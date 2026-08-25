@@ -3,8 +3,10 @@
 // Lutris itself is a GTK app, but every Wine or Proton game it starts is
 // an X11 client — Wine's X11 driver takes precedence over its Wayland one
 // whenever DISPLAY is set (Arch wiki, Wine#Wayland) — so this profile
-// grants `x11`, with the isolation caveat that carries: X11 clients can
-// keylog and inject into each other.
+// grants `x11 "host"`, with the isolation caveat that carries: X11
+// clients can keylog and inject into each other. The nested server
+// bubbler starts by default has no window manager, which is what a game
+// that maps and resizes its own windows expects.
 //
 // umu, Proton and DXVK's 32-bit path make i386 syscalls; the default
 // filter carries i386 as well as x86_64, so they are filtered rather than
@@ -28,9 +30,9 @@
 // it (`mkdir ~/Games`) or edit the node to the directory you use. A prefix
 // or library outside the home is named explicitly, e.g.
 //   path-share "/kioxia/Games" mode=rw
-lint-allow "x11-without-reason" reason="every Wine or Proton game Lutris starts is an X11 client"
+lint-allow "x11-without-reason" reason="Wine and Proton games are X11 clients that want a real window manager"
 wayland
-x11
+x11 "host"
 dri
 pipewire
 network

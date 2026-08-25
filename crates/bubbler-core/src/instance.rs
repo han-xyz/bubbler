@@ -9,7 +9,7 @@ use rustix::fs::Mode;
 use rustix::io::Errno;
 use rustix::process::{Pid, test_kill_process};
 
-use crate::config::{self, InstanceConfig, NetworkConfig, Service, WaylandMode};
+use crate::config::{self, InstanceConfig, NetworkConfig, Service, WaylandMode, X11Mode};
 use crate::env::Env;
 use crate::error::InstanceError;
 use crate::fsutil;
@@ -187,7 +187,10 @@ fn grant_service(name: &str) -> Option<Service> {
         // Always the security context: `--grant wayland` is not where a
         // user asks for the session's own socket.
         "wayland" => Service::Wayland(WaylandMode::Sandboxed),
-        "x11" => Service::X11,
+        // The sandbox's own server: `--grant x11` is not where a user
+        // asks for the session's display, and it needs `--grant wayland
+        // --grant dri` with it, which the config check names.
+        "x11" => Service::X11(X11Mode::default()),
         "network" => Service::Network(NetworkConfig::default()),
         "dri" => Service::Dri,
         "pipewire" => Service::Pipewire,
@@ -774,7 +777,7 @@ mod tests {
         let inst = Instance::create(&env, "ff", "firefox").unwrap();
         let seeded = fs::read_to_string(inst.config_path()).unwrap();
         let mut edited = inst.config.clone();
-        edited.services.push(Service::X11);
+        edited.services.push(Service::X11(X11Mode::default()));
         edited.desktop = Some("firefox.desktop".to_owned());
         inst.save(&edited).unwrap();
 
@@ -824,7 +827,7 @@ mod tests {
         let backup = inst.dir.join(BACKUP_FILE);
         std::os::unix::fs::symlink(&elsewhere, &backup).unwrap();
         let mut edited = inst.config.clone();
-        edited.services.push(Service::X11);
+        edited.services.push(Service::X11(X11Mode::default()));
         inst.save(&edited).unwrap();
         assert!(!elsewhere.exists(), "the backup was written through a link");
         assert!(!fs::symlink_metadata(&backup).unwrap().is_symlink());

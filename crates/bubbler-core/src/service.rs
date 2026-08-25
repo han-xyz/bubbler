@@ -13,7 +13,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::{Component, Path, PathBuf};
 
 use crate::bwrap::{BwrapArgs, Origin};
-use crate::config::{RESERVED_ENV, Service, ShareMode};
+use crate::config::{RESERVED_ENV, Service, ShareMode, X11Mode};
 use crate::dbus;
 use crate::env::{Env, SANDBOX_HOME};
 use crate::error::LaunchError;
@@ -51,13 +51,13 @@ pub fn apply_all(
     host: &dyn Host,
     ctx: &ServiceCtx,
 ) -> Result<(), LaunchError> {
-    let has_x11 = services.contains(&Service::X11);
+    let has_x11 = services.iter().any(|s| matches!(s, Service::X11(_)));
     let shares = path_shares(services, env, host)?;
     for (i, s) in services.iter().enumerate() {
         args.tag(Origin::Service(i));
         match s {
             Service::Wayland(_) => wayland(env, args, host, !has_x11, ctx.wayland)?,
-            Service::X11 => x11(env, args, host)?,
+            Service::X11(mode) => x11(env, args, host, mode)?,
             Service::Network(cfg) => network(args, host, cfg)?,
             Service::HomeShare { path, mode } => home_share(env, args, host, path, *mode)?,
             Service::Dri => dri(args, host)?,
@@ -296,12 +296,27 @@ pub fn x11_display_number(display: &OsStr) -> Option<u32> {
     num.parse().ok()
 }
 
-/// Bind the X11 socket at the same path (Arch wiki: binding to a different
-/// display number may not work) and any Xauthority file at the fixed inner
-/// path `/home/bubbler/.Xauthority`, so the host location stays hidden.
-/// The `$HOME/.Xauthority` fallback follows libX11's default, not the wiki,
-/// and is used only when it is a regular file.
-fn x11(env: &Env, args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
+/// `x11 "host"` binds the session's X11 socket at the same path (Arch
+/// wiki: binding to a different display number may not work) and any
+/// Xauthority file at the fixed inner path `/home/bubbler/.Xauthority`,
+/// so the host location stays hidden. The `$HOME/.Xauthority` fallback
+/// follows libX11's default, not the wiki, and is used only when it is a
+/// regular file. The nested mode binds nothing of the host's: the server
+/// is started inside the sandbox and `DISPLAY` names it.
+fn x11(
+    env: &Env,
+    args: &mut BwrapArgs,
+    host: &dyn Host,
+    mode: &X11Mode,
+) -> Result<(), LaunchError> {
+    if let X11Mode::Nested(_) = mode {
+        // The display number is fixed: the server is the only one in
+        // this sandbox, and `exec` children take the variable from the
+        // supervisor that started it. Nothing is bound and no cookie is
+        // handed over — an X client inside reaches no other display.
+        args.setenv(OsStr::new("DISPLAY"), OsStr::new(":0"));
+        return Ok(());
+    }
     let display = env.display.as_deref().ok_or(LaunchError::MissingEnv {
         service: "x11",
         var: "DISPLAY",
@@ -1364,7 +1379,7 @@ mod tests {
     #[test]
     fn x11_binds_socket_and_xauthority() {
         let a = argv(
-            &[Service::X11],
+            &[Service::X11(X11Mode::Host)],
             &env(),
             &[
                 ("/tmp/.X11-unix/X0", Sock),
@@ -1399,12 +1414,39 @@ mod tests {
         assert!(!a.contains(&"XDG_SESSION_TYPE".to_string()));
     }
 
+    /// The nested server runs inside the sandbox, so nothing of the
+    /// host's display is bound for it and no cookie is handed over:
+    /// `DISPLAY` is the whole of what the grant emits, and it holds even
+    /// where the session has no X server at all. (The Xwayland itself is
+    /// started by the supervisor, which is a later piece.)
+    #[test]
+    fn nested_x11_binds_nothing_and_only_names_the_display() {
+        let mut e = env();
+        e.display = None;
+        let a = argv(
+            &[Service::X11(X11Mode::default())],
+            &e,
+            &[
+                ("/tmp/.X11-unix/X0", Sock),
+                ("/run/user/1000/Xauthority", File),
+            ],
+        )
+        .unwrap();
+        assert!(has_seq(&a, &["--setenv", "DISPLAY", ":0"]));
+        assert!(!a.iter().any(|w| w.contains(".X11-unix")), "{a:?}");
+        assert!(!a.contains(&"XAUTHORITY".to_owned()), "{a:?}");
+        assert!(
+            !a.contains(&"/run/user/1000/Xauthority".to_owned()),
+            "{a:?}"
+        );
+    }
+
     #[test]
     fn x11_falls_back_to_home_xauthority_or_none() {
         let mut e = env();
         e.xauthority = None;
         let a = argv(
-            &[Service::X11],
+            &[Service::X11(X11Mode::Host)],
             &e,
             &[("/tmp/.X11-unix/X0", Sock), ("/home/han/.Xauthority", File)],
         )
@@ -1421,7 +1463,12 @@ mod tests {
             &a,
             &["--setenv", "XAUTHORITY", "/home/bubbler/.Xauthority"]
         ));
-        let a = argv(&[Service::X11], &e, &[("/tmp/.X11-unix/X0", Sock)]).unwrap();
+        let a = argv(
+            &[Service::X11(X11Mode::Host)],
+            &e,
+            &[("/tmp/.X11-unix/X0", Sock)],
+        )
+        .unwrap();
         assert!(!a.contains(&"XAUTHORITY".to_string()));
     }
 
@@ -1430,7 +1477,7 @@ mod tests {
         let mut e = env();
         e.xauthority = None;
         let a = argv(
-            &[Service::X11],
+            &[Service::X11(X11Mode::Host)],
             &e,
             &[("/tmp/.X11-unix/X0", Sock), ("/home/han/.Xauthority", Dir)],
         )
@@ -1442,7 +1489,11 @@ mod tests {
     #[test]
     fn x11_set_but_missing_xauthority_fails() {
         assert!(matches!(
-            argv(&[Service::X11], &env(), &[("/tmp/.X11-unix/X0", Sock)]),
+            argv(
+                &[Service::X11(X11Mode::Host)],
+                &env(),
+                &[("/tmp/.X11-unix/X0", Sock)]
+            ),
             Err(LaunchError::MissingResource { service: "x11", .. })
         ));
     }
@@ -1453,7 +1504,7 @@ mod tests {
         e.xauthority = Some("/".into());
         assert!(matches!(
             argv(
-                &[Service::X11],
+                &[Service::X11(X11Mode::Host)],
                 &e,
                 &[("/tmp/.X11-unix/X0", Sock), ("/", Dir)]
             ),
@@ -1468,7 +1519,11 @@ mod tests {
     #[test]
     fn x11_socket_that_is_not_a_socket_fails() {
         assert!(matches!(
-            argv(&[Service::X11], &env(), &[("/tmp/.X11-unix/X0", File)]),
+            argv(
+                &[Service::X11(X11Mode::Host)],
+                &env(),
+                &[("/tmp/.X11-unix/X0", File)]
+            ),
             Err(LaunchError::WrongType {
                 service: "x11",
                 expected: "a socket",
@@ -1561,7 +1616,7 @@ mod tests {
         let mut e = env();
         e.display = None;
         assert!(matches!(
-            argv(&[Service::X11], &e, &[]),
+            argv(&[Service::X11(X11Mode::Host)], &e, &[]),
             Err(LaunchError::MissingEnv {
                 service: "x11",
                 var: "DISPLAY"
@@ -1572,7 +1627,10 @@ mod tests {
     #[test]
     fn wayland_and_x11_together_do_not_claim_wayland_session() {
         let a = argv(
-            &[Service::Wayland(WaylandMode::Sandboxed), Service::X11],
+            &[
+                Service::Wayland(WaylandMode::Sandboxed),
+                Service::X11(X11Mode::Host),
+            ],
             &env(),
             &[
                 ("/run/user/1000/wayland-1", Sock),

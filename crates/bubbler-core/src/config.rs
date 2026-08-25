@@ -155,6 +155,91 @@ impl FromStr for WaylandMode {
     }
 }
 
+/// Absolute path of the X server bubbler starts inside the sandbox.
+/// A host binary under the read-only `/usr`, so the sandbox holds no
+/// copy of its own and cannot replace it.
+pub const XWAYLAND: &str = "/usr/bin/Xwayland";
+
+/// The window the nested X server draws itself in, as one Wayland
+/// client of the sandbox's own compositor connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NestedX11 {
+    /// `<width>x<height>` of the window, `1280x720` unless the node
+    /// says otherwise. Ignored when `fullscreen` is set.
+    pub geometry: String,
+    /// Take the whole output instead of a window, dropping the
+    /// decorations with it.
+    pub fullscreen: bool,
+    /// Keep keyboard and pointer inside the server's window
+    /// (`-host-grab`, released with Ctrl+Shift).
+    pub grab: bool,
+}
+
+impl Default for NestedX11 {
+    fn default() -> Self {
+        Self {
+            geometry: "1280x720".to_owned(),
+            fullscreen: false,
+            grab: false,
+        }
+    }
+}
+
+impl NestedX11 {
+    /// The Xwayland command line, in the order the server takes it.
+    /// `-nolisten tcp` keeps the display off the network and `-noreset`
+    /// stops a client's exit from resetting the server; `-ac` is the
+    /// access control X11 has no use for here, the display being the
+    /// sandbox's own. The `-displayfd` the supervisor reads the display
+    /// number from is appended when it starts the server, not here.
+    pub fn xwayland_argv(&self) -> Vec<OsString> {
+        let mut argv: Vec<OsString> = [
+            XWAYLAND,
+            ":0",
+            "-noreset",
+            "-nolisten",
+            "tcp",
+            "-ac",
+            "-hidpi",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        // A fullscreen server has no window to decorate or to size.
+        if self.fullscreen {
+            argv.push(OsString::from("-fullscreen"));
+        } else {
+            argv.push(OsString::from("-decorate"));
+            argv.push(OsString::from("-geometry"));
+            argv.push(OsString::from(&self.geometry));
+        }
+        if self.grab {
+            argv.push(OsString::from("-host-grab"));
+        }
+        argv
+    }
+}
+
+/// Which X server an `x11` grant means: one the sandbox runs for itself,
+/// or the session's own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum X11Mode {
+    /// A rootful Xwayland started inside the sandbox by `bubbler-init`,
+    /// which is a Wayland client of the instance's own socket: the X
+    /// clients inside see no display but this one.
+    Nested(NestedX11),
+    /// The session's X socket and Xauthority cookie (`x11 "host"`):
+    /// every X client on the display can read every other's input and
+    /// windows, this sandbox included.
+    Host,
+}
+
+impl Default for X11Mode {
+    fn default() -> Self {
+        Self::Nested(NestedX11::default())
+    }
+}
+
 /// Whether a shared path is writable inside the sandbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShareMode {
@@ -217,9 +302,10 @@ pub enum Service {
     /// Access to the compositor: a security-context socket by default,
     /// the host socket under `wayland "host"`.
     Wayland(WaylandMode),
-    /// Access to the host X11 socket. X11 offers no isolation between
-    /// clients; this is a compatibility grant, not a safe one.
-    X11,
+    /// An X display: a nested Xwayland of the sandbox's own by default,
+    /// the session's socket and cookie under `x11 "host"`, which offers
+    /// no isolation between X clients.
+    X11(X11Mode),
     /// A network namespace, and what it is connected to: the sandbox's
     /// own by default, the host's under `network "host"`.
     Network(NetworkConfig),
@@ -332,7 +418,7 @@ impl Service {
     pub fn node_name(&self) -> &'static str {
         match self {
             Self::Wayland(_) => "wayland",
-            Self::X11 => "x11",
+            Self::X11(_) => "x11",
             Self::Network(_) => "network",
             Self::Dri => "dri",
             Self::Pipewire => "pipewire",
@@ -580,11 +666,9 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
             return Err(ConfigError::UnknownNode(name.to_owned()));
         }
         match name {
-            "x11" | "dri" | "pipewire" | "pulseaudio" | "portals" | "notify" | "tray"
-            | "hidraw" => {
+            "dri" | "pipewire" | "pulseaudio" | "portals" | "notify" | "tray" | "hidraw" => {
                 reject_entries(node)?;
                 let svc = match name {
-                    "x11" => Service::X11,
                     "dri" => Service::Dri,
                     "pipewire" => Service::Pipewire,
                     "pulseaudio" => Service::Pulseaudio,
@@ -686,6 +770,16 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
                     return Err(ConfigError::Duplicate(name.to_owned()));
                 }
                 cfg.services.push(Service::Wayland(mode));
+            }
+            "x11" => {
+                // By variant, and before the node itself is read, like
+                // `network`: two `x11` nodes differ in mode or window,
+                // and which server the config asks for would be a matter
+                // of their order in the file.
+                if cfg.services.iter().any(|s| matches!(s, Service::X11(_))) {
+                    return Err(ConfigError::Duplicate(name.to_owned()));
+                }
+                cfg.services.push(Service::X11(parse_x11(node)?));
             }
             "network" => {
                 // By variant, like `gamepad`: two `network` nodes differ
@@ -819,6 +913,12 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
             reason: "requires portals".to_owned(),
         });
     }
+    if !profile && nested_x11_without_display_stack(&cfg.services) {
+        return Err(ConfigError::BadArgument {
+            node: "x11".to_owned(),
+            reason: "requires wayland and dri".to_owned(),
+        });
+    }
     Ok((
         RawProfile {
             config: cfg,
@@ -870,6 +970,19 @@ fn bundle_without_dbus(services: &[Service]) -> Option<&'static str> {
 fn camera_without_portals(services: &[Service]) -> bool {
     services.iter().any(|s| matches!(s, Service::Camera { .. }))
         && !services.contains(&Service::Portals)
+}
+
+/// Whether a nested `x11` is granted without what the server it starts
+/// needs: the Xwayland inside is a Wayland client, and it renders
+/// through glamor, which has no software path here — without `wayland`
+/// it has nothing to connect to and without `dri` it dies on the first
+/// frame, so the display the config promises would never exist.
+fn nested_x11_without_display_stack(services: &[Service]) -> bool {
+    services
+        .iter()
+        .any(|s| matches!(s, Service::X11(X11Mode::Nested(_))))
+        && !(services.iter().any(|s| matches!(s, Service::Wayland(_)))
+            && services.contains(&Service::Dri))
 }
 
 fn bad(node: &KdlNode, reason: &str) -> ConfigError {
@@ -1626,6 +1739,105 @@ fn parse_gamepad(node: &KdlNode) -> Result<Service, ConfigError> {
     })
 }
 
+/// `<width>x<height>`, both positive decimals, as Xwayland's
+/// `-geometry` takes it. Returns the canonical spelling: a value the
+/// parser accepted and rewrote differently would not survive being
+/// written back to the config file.
+fn parse_geometry(s: &str) -> Option<String> {
+    let (w, h) = s.split_once('x')?;
+    // No sign, no leading zero, no unit: `-1`, `01` and `1280px` are all
+    // things Xwayland would read as something else.
+    let positive = |part: &str| match part.bytes().all(|b| b.is_ascii_digit()) {
+        true if !part.starts_with('0') => part.parse::<u32>().ok(),
+        _ => None,
+    };
+    Some(format!("{}x{}", positive(w)?, positive(h)?))
+}
+
+/// `x11 ["host"] [geometry="WxH"] [fullscreen=#true] [grab=#true]`: the
+/// bare node is a nested Xwayland the properties describe the window of.
+/// A property with `"host"` is an error rather than a value dropped
+/// quietly: the session's server is not this sandbox's to size.
+fn parse_x11(node: &KdlNode) -> Result<X11Mode, ConfigError> {
+    if node.children().is_some() {
+        return Err(bad(node, "takes no children"));
+    }
+    let mut host = false;
+    let mut seen_mode = false;
+    let mut geometry: Option<String> = None;
+    let mut fullscreen: Option<bool> = None;
+    let mut grab: Option<bool> = None;
+    for e in node.entries() {
+        let Some(prop) = e.name().map(|n| n.value()) else {
+            if seen_mode {
+                return Err(bad(node, "expects at most one mode argument"));
+            }
+            seen_mode = true;
+            let s = e
+                .value()
+                .as_string()
+                .ok_or_else(|| bad(node, "mode must be \"host\""))?;
+            if s != "host" {
+                return Err(bad(node, &format!("expected `host`, got `{s}`")));
+            }
+            host = true;
+            continue;
+        };
+        // Written twice, the two entries disagree about the window and
+        // the winner would be a matter of their order in the line.
+        let dup = || ConfigError::Duplicate(format!("{} {prop}", node.name().value()));
+        match prop {
+            "geometry" => {
+                if geometry.is_some() {
+                    return Err(dup());
+                }
+                let s = e
+                    .value()
+                    .as_string()
+                    .ok_or_else(|| bad(node, "geometry must be a string like \"1280x720\""))?;
+                geometry = Some(parse_geometry(s).ok_or_else(|| {
+                    bad(
+                        node,
+                        &format!("geometry must be `<width>x<height>`, got `{s}`"),
+                    )
+                })?);
+            }
+            "fullscreen" | "grab" => {
+                let slot = match prop {
+                    "fullscreen" => &mut fullscreen,
+                    _ => &mut grab,
+                };
+                if slot.is_some() {
+                    return Err(dup());
+                }
+                *slot = Some(
+                    e.value()
+                        .as_bool()
+                        .ok_or_else(|| bad(node, &format!("{prop} must be #true or #false")))?,
+                );
+            }
+            other => {
+                return Err(ConfigError::UnknownProperty {
+                    node: node.name().value().to_owned(),
+                    prop: other.to_owned(),
+                });
+            }
+        }
+    }
+    let default = NestedX11::default();
+    if host {
+        if geometry.is_some() || fullscreen.is_some() || grab.is_some() {
+            return Err(bad(node, "\"host\" takes no properties"));
+        }
+        return Ok(X11Mode::Host);
+    }
+    Ok(X11Mode::Nested(NestedX11 {
+        geometry: geometry.unwrap_or(default.geometry),
+        fullscreen: fullscreen.unwrap_or(default.fullscreen),
+        grab: grab.unwrap_or(default.grab),
+    }))
+}
+
 /// `camera [nodes=#true]`: the bare node is the portal grant, which
 /// binds nothing, and the property adds the V4L2 device nodes to it.
 fn parse_camera(node: &KdlNode) -> Result<Service, ConfigError> {
@@ -2002,6 +2214,7 @@ mod tests {
         let cfg = parse(
             r#"
             wayland
+            dri
             x11
             network
             home-share "Downloads"
@@ -2014,7 +2227,8 @@ mod tests {
             cfg.services,
             vec![
                 Service::Wayland(WaylandMode::Sandboxed),
-                Service::X11,
+                Service::Dri,
+                Service::X11(X11Mode::Nested(NestedX11::default())),
                 Service::Network(NetworkConfig::default()),
                 Service::HomeShare {
                     path: "Downloads".into(),
@@ -2056,6 +2270,117 @@ mod tests {
             parse("wayland\nwayland \"host\"\ncommand \"true\""),
             Err(ConfigError::Duplicate(n)) if n == "wayland"
         ));
+    }
+
+    /// The bare node with its properties, the one mode name it takes,
+    /// and what neither of them accepts. A second `x11` node is a
+    /// duplicate whatever the two modes say: which X server the config
+    /// asks for would otherwise be a matter of file order.
+    #[test]
+    fn x11_parses_nested_properties_and_host_and_refuses_the_rest() {
+        let base = "wayland\ndri\ncommand \"true\"\n";
+        let d = parse(&format!("x11\n{base}")).unwrap();
+        assert!(
+            d.services
+                .contains(&Service::X11(X11Mode::Nested(NestedX11::default())))
+        );
+        let p = parse(&format!(
+            "x11 geometry=\"1920x1080\" fullscreen=#true grab=#true\n{base}"
+        ))
+        .unwrap();
+        assert!(
+            p.services
+                .contains(&Service::X11(X11Mode::Nested(NestedX11 {
+                    geometry: "1920x1080".into(),
+                    fullscreen: true,
+                    grab: true
+                })))
+        );
+        let h = parse(&format!("x11 \"host\"\n{base}")).unwrap();
+        assert!(h.services.contains(&Service::X11(X11Mode::Host)));
+        for bad in [
+            "x11 \"other\"",
+            "x11 \"host\" grab=#true",
+            "x11 geometry=\"wide\"",
+            "x11 geometry=\"0x10\"",
+            "x11 geometry=1920",
+            "x11 fullscreen=1",
+            "x11 foo=#true",
+            "x11 { a }",
+        ] {
+            assert!(parse(&format!("{bad}\n{base}")).is_err(), "{bad}");
+        }
+        assert!(matches!(
+            parse(&format!("x11\nx11 \"host\"\n{base}")),
+            Err(ConfigError::Duplicate(n)) if n == "x11"
+        ));
+    }
+
+    /// The server inside is a Wayland client and needs the GPU nodes to
+    /// render, so a nested `x11` without either would start nothing:
+    /// the file is refused rather than left to fail at launch. A profile
+    /// layer may take both from an include, so only the flattened
+    /// config an instance runs is checked.
+    #[test]
+    fn nested_x11_requires_wayland_and_dri_on_the_flattened_config() {
+        for cfg in [
+            "x11\ncommand \"true\"",
+            "x11\nwayland\ncommand \"true\"",
+            "x11\ndri\ncommand \"true\"",
+        ] {
+            assert!(
+                matches!(parse(cfg), Err(ConfigError::BadArgument { node, reason })
+                    if node == "x11" && reason == "requires wayland and dri"),
+                "{cfg}"
+            );
+        }
+        assert!(parse("x11 \"host\"\ncommand \"true\"").is_ok());
+        assert!(parse_profile("x11").is_ok());
+    }
+
+    /// The argv is the contract with Xwayland, and the flags are fixed
+    /// so the display cannot be listened on TCP or the server reset by a
+    /// client: only the window the properties describe changes.
+    #[test]
+    fn xwayland_argv_is_fixed_and_ordered() {
+        let w = NestedX11::default().xwayland_argv();
+        assert_eq!(
+            w,
+            [
+                "/usr/bin/Xwayland",
+                ":0",
+                "-noreset",
+                "-nolisten",
+                "tcp",
+                "-ac",
+                "-hidpi",
+                "-decorate",
+                "-geometry",
+                "1280x720"
+            ]
+            .map(OsString::from)
+        );
+        let f = NestedX11 {
+            geometry: "1x1".into(),
+            fullscreen: true,
+            grab: true,
+        }
+        .xwayland_argv();
+        assert_eq!(
+            f,
+            [
+                "/usr/bin/Xwayland",
+                ":0",
+                "-noreset",
+                "-nolisten",
+                "tcp",
+                "-ac",
+                "-hidpi",
+                "-fullscreen",
+                "-host-grab"
+            ]
+            .map(OsString::from)
+        );
     }
 
     /// The three modes, and what a bare node means now.

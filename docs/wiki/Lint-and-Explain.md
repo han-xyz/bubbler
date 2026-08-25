@@ -32,12 +32,12 @@ advice (exit code untouched).
 **Notes** (information): `app-runtime-rw`, `network-host`, `outbound-deny`,
 `ozone-hint-unnecessary`, `command-not-found`, `desktop-entry-missing`,
 `camera-nodes-none-present`, `camera-nodes-no-hotplug`, `secrets-access`,
-`lint-allow-unused`.
+`lint-allow-unused`, `x11-nested-no-wm`.
 
 Accept a warning or note with a reason:
 
 ```kdl
-x11
+x11 "host"
 lint-allow "x11-without-reason" reason="steamwebhelper is an X11/CEF client"
 ```
 
