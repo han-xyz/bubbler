@@ -62,8 +62,11 @@ descriptor (seccomp filter size and architectures, `--ro-bind-data` size,
 which pipe an `--info-fd`/`--block-fd` is), and grants that are not bwrap
 arguments: D-Bus `rules:`, `rule-only:` for nodes contributing nothing else,
 which socket a `wayland` node binds (`security-context:` for a bare grant,
-`raw socket: wayland "host"` for the session's own), `sidecar: pasta …` and the
-nft ruleset under `network`.
+`raw socket: wayland "host"` for the session's own), `raw socket: x11 "host"`
+for a session X display, `sidecar: pasta …` and the nft ruleset under
+`network`. A nested `x11` needs no such line: the `--helper` argument is the
+Xwayland command line itself, an argument of `bubbler-init` rather than of
+bwrap.
 
 ```
   portals                         config.kdl:11  10 arguments
@@ -79,6 +82,9 @@ nft ruleset under `network`.
     --setenv WAYLAND_DISPLAY wayland-1
     --setenv XDG_SESSION_TYPE wayland
     security-context: engine=org.bubbler app=org.bubbler.ff instance=bubbler-ff
+  x11                             config.kdl:5   17 arguments
+    --setenv DISPLAY :0
+    --helper /usr/bin/Xwayland :0 -noreset -nolisten tcp -nolisten local -ac -hidpi -decorate -geometry 1280x720 --  (nested Xwayland, started by bubbler-init; -displayfd is added at run time)
 ```
 
 Groups sit where a node's first argument appears, so the listing is neither

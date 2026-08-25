@@ -6,7 +6,8 @@ The boundary is between **your account and one application**. It is not a
 boundary against root, not against your own unsandboxed processes (anything
 running as your uid can read the instance store and connect to a live
 instance's control socket). On the display, `wayland` is a boundary the
-compositor enforces (below) and `x11` is none at all. bubbler itself is
+compositor enforces and a bare `x11` an X server of the sandbox's own behind
+it (both below); `x11 "host"` is no boundary at all. bubbler itself is
 unprivileged and unconfined. Long form with every claim pinned to a test:
 [`docs/threat-model.md`](https://github.com/han-xyz/bubbler/blob/master/docs/threat-model.md).
 
@@ -58,8 +59,58 @@ with `lint-allow "wayland-host" reason="…"`. No shipped profile grants it.
 
 `--dry-run` and `--explain` never talk to the compositor: they assume the
 security context and print it, so the argv they show is what a run builds where
-the protocol is there. `x11` bypasses all of it — an Xwayland client reaches the
-X server, and Xwayland is a client of your session, not of this socket.
+the protocol is there. `x11 "host"` bypasses all of it — those X clients reach a
+server which is a client of your session, not of this socket. A bare `x11` does
+not: the Xwayland it starts is a client of this one, like anything else inside.
+
+## X11
+
+A bare `x11` starts a rootful `Xwayland` **inside** the sandbox, as one more
+Wayland client of whichever socket the `wayland` grant bound. X11 still has no
+isolation between the clients of one server — but the only clients on this one
+are the sandbox's own. Nothing of the session's X display is bound: no socket,
+no cookie. `-nolisten tcp` keeps the display off the network and `-nolisten
+local` off the abstract socket namespace, which no mount namespace covers and
+`network "host"` would share with the whole host; the one way in is the
+filesystem socket `/tmp/.X11-unix/X0`, in the sandbox's private `/tmp`.
+`DISPLAY` is `:0`, and `bubbler-init` starts the server before the command and
+stops it after, so `exec` children reach the same display.
+
+```kdl
+x11                              // one 1280x720 decorated window
+x11 geometry="1920x1080"
+x11 fullscreen=#true grab=#true  // games: the whole output, input held inside
+```
+
+The server is a Wayland client that renders through glamor, so the grant needs
+`wayland` (either mode) and `dri` in the merged config; a config without them
+is refused rather than promising a display that dies on its first frame. What
+runs is the host's `/usr/bin/Xwayland` (`xorg-xwayland`), read from the
+read-only `/usr` and probed while the argv is built. Measured here on Xwayland
+24.1.13, Hyprland 0.56.2 and an NVIDIA card: a client inside the nested server
+saw 26 extensions, GLX with direct rendering among them, plus MIT-SHM, XInput,
+XKEYBOARD and XTEST.
+
+There is no window manager in there: X windows are undecorated, unmanaged and
+stacked in the one compositor window the server draws. `bubbler lint` says so
+as the note `x11-nested-no-wm`, which a `fullscreen=#true` config does not get,
+having asked for the one full-output window already. `grab=#true` holds pointer
+and keyboard inside it (Ctrl+Shift releases them).
+
+`x11 "host"` is the other mode: the session's `/tmp/.X11-unix/X<n>` socket and
+whichever Xauthority cookie `$XAUTHORITY` or `~/.Xauthority` names, remapped to
+`/home/bubbler/.Xauthority` so the host path stays hidden. That is no boundary
+at all — every X client on your display can read every other's input and
+windows, this sandbox included and Xwayland with it, and the compositor's
+security context does not reach an X client. `bubbler lint` warns
+(`x11-without-reason`); accept it with `lint-allow "x11-without-reason"
+reason="…"`. `steam` and `lutris` ship it because their windows want the
+session's window manager.
+
+The X SECURITY extension's untrusted mode is not offered as a third choice: an
+untrusted client is granted `XC-MISC` and `BIG-REQUESTS` and nothing else
+(`SecurityTrustedExtensions`, xserver `Xext/security.c`), which leaves no GLX,
+no XInput and no MIT-SHM for an application to draw with.
 
 ## Seccomp
 
@@ -115,7 +166,9 @@ host).
 
 ## Known gaps
 
-- `x11`: Xwayland clients bypass the Wayland security context.
+- `x11 "host"`: no isolation between the X clients on your display, and no
+  Wayland security context on the session's Xwayland. The nested default runs
+  without a window manager.
 - No accessibility bus.
 - AMD compute (`/dev/kfd` + sysfs topology) unsupported; NVIDIA compute needs
   `etc-share "OpenCL"`/`"nvidia"`.

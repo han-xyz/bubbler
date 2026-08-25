@@ -12,8 +12,8 @@ built-in                                  compiled into bubbler
 
 ## Built-in profiles
 
-Wayland-first; only the two gaming profiles grant `x11`. `~/name` is a
-`home-share`, read-only unless `rw`.
+Wayland-first; only the two gaming profiles grant `x11`, and both take the
+`"host"` mode. `~/name` is a `home-share`, read-only unless `rw`.
 
 | Profile | Grants |
 |---|---|
@@ -25,10 +25,10 @@ Wayland-first; only the two gaming profiles grant `x11`. `~/name` is a
 | `keepassxc` | wayland dbus portals notify tray app-runtime rw, ~/Documents rw |
 | `kitty` | wayland dri dbus portals notify |
 | `libreoffice` | wayland dri dbus portals, ~/Documents rw, `SAL_USE_VCLPLUGIN=gtk3` |
-| `lutris` | wayland x11 dri pipewire network dbus portals notify tray gamepad system-bus, ~/Games rw |
+| `lutris` | wayland `x11 "host"` dri pipewire network dbus portals notify tray gamepad system-bus, ~/Games rw |
 | `mpv` | wayland dri pipewire, ~/Videos |
 | `spotify` | wayland dri pipewire network dbus notify tray mpris |
-| `steam` | wayland x11 dri pipewire network dbus notify tray gamepad system-bus |
+| `steam` | wayland `x11 "host"` dri pipewire network dbus notify tray gamepad system-bus |
 | `thunderbird` | wayland network dri dbus portals notify, ~/Downloads rw |
 | `vesktop` | wayland dri pipewire network dbus portals notify tray, ~/Downloads rw |
 
@@ -43,6 +43,12 @@ Notes worth knowing:
   profile). Steam Input's virtual controllers need `gamepad hidraw=#true
   uinput=#true` — read [Devices](Devices.md) first.
 - **lutris**: keeps `portals`; drop it if a Proton/umu game complains about Flatpak.
+- **steam and lutris**: both write `x11 "host"` and a `lint-allow` saying why —
+  steamwebhelper opens many windows and Wine's X11 driver wants a real window
+  manager, and the nested server a bare `x11` starts has none. That is the weak
+  point of both profiles: on the session's display no X client is isolated from
+  any other. A single fullscreen game is worth trying as `x11 fullscreen=#true
+  grab=#true` instead; see [Security](Security.md#x11).
 - **keepassxc**: no `network`, no `own "org.freedesktop.secrets"`, no `hidraw`;
   each omission is a comment saying how to add it back. Browser integration
   via `app-runtime` — see [Sharing Files](Sharing-Files.md).
@@ -71,7 +77,9 @@ depth-first, and a cycle is an error naming the chain.
 
 **Merge rules:** grants union; same share path in two modes is an error;
 `command`, `tty`, `userns`, `mpris` from the including file replace the
-included; `env` replaces by key; `dbus`/`system-bus`/`seccomp` lists union;
+included; `wayland` and `x11` replace as well, being one mode each and the
+`x11` window properties with it; `env` replaces by key;
+`dbus`/`system-bus`/`seccomp` lists union;
 `seccomp { disable }` anywhere disables; `outbound "deny"` below cannot be
 undone above. `portals`/`notify`/`tray`/`mpris` need `dbus` in the merged
 result, not in every layer.

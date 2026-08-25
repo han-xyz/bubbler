@@ -85,15 +85,17 @@ published yet — AUR account registration is currently down. From source:
 Build needs Rust 1.95+ and `libseccomp` (2.5.4+). Runtime: `bubblewrap` and a
 kernel with user namespaces; `xdg-dbus-proxy` for `dbus`/`system-bus`;
 `passt` (pasta) for an isolated `network`; `nftables` for `outbound "deny"`;
-`xdg-desktop-portal` with a backend for `portals` and `camera`.
+`xdg-desktop-portal` with a backend for `portals` and `camera`;
+`xorg-xwayland` for the X server a bare `x11` runs inside the sandbox.
 See [Getting Started](docs/wiki/Getting-Started.md).
 
 ## What it is not
 
 A boundary between your account and one application — not against root, not
-against your other processes, and `x11` is no boundary at all. Grants are as
-wide as their names suggest and sometimes wider (`gamepad` is every input
-device your user can open; `pipewire` is the microphone too); the wiki's
+against your other processes, and `x11 "host"` is no boundary at all (a bare
+`x11` runs an X server of the sandbox's own instead). Grants are as wide as
+their names suggest and sometimes wider (`gamepad` is every input device your
+user can open; `pipewire` is the microphone too); the wiki's
 [Devices](docs/wiki/Devices.md) and [Security](docs/wiki/Security.md) pages and
 the threat model say exactly how wide. Known gaps are listed under
 [Security](docs/wiki/Security.md#known-gaps).

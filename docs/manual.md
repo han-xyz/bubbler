@@ -151,7 +151,9 @@ bare node per `--grant`; the grants are `wayland`, `x11`, `network`, `dri`,
 `system-bus` among them, since it is not a grant without rules. The bundles are
 checked as they are in a config file, so `--grant tray` without `--grant dbus`
 is refused rather than silently dropped, and `--grant camera` needs
-`--grant portals` (and the `--grant dbus` that carries it) the same way. A
+`--grant portals` (and the `--grant dbus` that carries it) the same way.
+`--grant x11` needs `--grant wayland --grant dri`, without which the X server
+it starts inside has nothing to draw in or with. A
 grant the profile already made is not repeated, properties and all:
 `--grant gamepad` on a profile carrying `gamepad hidraw=#true` keeps the
 `hidraw` node rather than narrowing it to the bare one, and `--grant camera` on
@@ -308,7 +310,11 @@ file order does not affect the generated argv.
 
     wayland                          # a socket the compositor treats as sandboxed
     wayland "host"                   # the session's own socket instead
-    x11                              # X socket and Xauthority
+    x11                              # a rootful Xwayland inside the sandbox:
+                                     #   1280x720, decorated, DISPLAY=:0
+    x11 geometry="1920x1080"         # the window that server draws itself in
+    x11 fullscreen=#true grab=#true  # a whole output; input held inside it
+    x11 "host"                       # the session's X socket and cookie instead
     network                          # the sandbox's own network namespace,
                                      #   connected by a pasta sidecar
     network "host"                   # the host's namespace instead
@@ -525,10 +531,137 @@ under `--explain` its group carries a `security-context:` line naming the three
 strings. A real run is the only thing that probes, and the only thing that
 falls back.
 
-`x11` bypasses all of it. An Xwayland client speaks the X protocol to a server
+`x11 "host"` bypasses all of it. Those clients speak the X protocol to a server
 which is itself an ordinary client of your session, connected on the session's
-socket rather than through this one, so no security context reaches it — and
-X11 offers no isolation between its own clients either.
+socket rather than through this one, so no security context reaches them — and
+X11 offers no isolation between its own clients either. A bare `x11` bypasses
+nothing: the server it starts is a client of this socket, as sandboxed as the
+application talking to it, which is the next section.
+
+### x11
+
+A bare `x11` binds nothing of your X session. `bubbler-init` starts a rootful
+`Xwayland` inside the sandbox before the command, and that server is one more
+client of whichever socket the `wayland` grant bound — the security-context one
+for a bare `wayland`, the session's under `wayland "host"`. The display the
+application then talks to is the sandbox's own: the socket the server creates
+is in the private `/tmp` every sandbox gets, its MIT-SHM segments are in the
+private `/dev/shm`, and the only clients on it are processes of this instance.
+X11 still offers no isolation between the clients of one server, and that has
+not changed; what changed is who else is on the server.
+
+`DISPLAY` is `:0`, set with `--setenv` so a dry run shows it, and the
+supervisor hands the same value to every `exec` child rather than letting one
+inherit whatever your terminal had.
+
+The command line is fixed but for the window:
+
+    /usr/bin/Xwayland :0 -noreset -nolisten tcp -nolisten local -ac -hidpi -decorate -geometry 1280x720
+
+`-noreset` keeps the server up when its last client exits, so a launcher that
+restarts its own interface does not take the display down with it. `-nolisten
+tcp` keeps the display off the network and `-nolisten local` off the abstract
+socket namespace, which is where the second listener would be: an abstract unix
+socket is addressed by name in a network namespace and ignores the mount
+namespace entirely, so under `network "host"` every process on the host could
+reach it. What is left is the filesystem socket at `/tmp/.X11-unix/X0` in the
+sandbox's private `/tmp`, which is the only way in. `-ac` then turns off the
+access control X11 would apply on it: no cookie is generated and none is
+needed, the reachable set being the sandbox itself. `-hidpi` has the server
+follow the scale of the output it is on. `bubbler-init` appends
+`-displayfd <fd>` at run time, which is how it learns the display is up; the
+words `--dry-run` prints are the rest of what runs.
+
+The three properties describe that window and nothing else:
+
+    x11                              # 1280x720, decorated
+    x11 geometry="1920x1080"         # <width>x<height>, both non-zero
+    x11 fullscreen=#true grab=#true  # a whole output; input held inside it
+
+`fullscreen` (`-fullscreen`) takes an output instead of a window and drops
+`-decorate` with it, there being nothing left to decorate, and `geometry` goes
+unused. `grab` (`-host-grab`) inhibits the compositor's own keyboard shortcuts
+and confines the pointer to the server's window — what a game wants, and what
+Ctrl+Shift releases; Xwayland's manual page notes that it leans on the
+shortcut-inhibit and pointer-constraint protocols and does nothing under a
+compositor offering neither. `x11 "host"` takes none of the three: a property
+describing a window bubbler never opens is a parse error rather than a line
+with no effect.
+
+The server is a Wayland client that renders through glamor, and glamor has no
+software path here, so the flattened config must carry a `wayland` (either
+mode) and a `dri`, or nothing starts at all:
+
+    bad argument for `x11`: requires wayland and dri
+
+`bubbler try --grant x11` therefore wants `--grant wayland --grant dri` beside
+it. What runs is the host's `/usr/bin/Xwayland`, out of the read-only `/usr`
+every sandbox has — the `xorg-xwayland` package — probed while the argv is
+built, so a host without it fails with ``service `x11` needs
+`/usr/bin/Xwayland` which does not exist`` rather than handing the application
+a `DISPLAY` that names nothing.
+
+Under `--explain` the grant is those two lines:
+
+      x11                             config.kdl:5   17 arguments
+        --setenv DISPLAY :0
+        --helper /usr/bin/Xwayland :0 -noreset -nolisten tcp -nolisten local -ac -hidpi -decorate -geometry 1280x720 --  (nested Xwayland, started by bubbler-init; -displayfd is added at run time)
+
+`--helper <argv…> --` is an argument of `bubbler-init` and not of bwrap: the
+supervisor reads the server's command line up to that `--`, and the sandbox's
+own command follows the next one. It starts the server first and waits up to
+ten seconds for a display number on the pipe. A server that reports none,
+exits first, or writes something else is a failed launch and the command is
+never started:
+
+    bubbler-init: Xwayland did not start: it exited before reporting a display (exit status: 1)
+
+with exit code 2. A server that dies while the command runs takes the display
+with it, so the supervisor stops the command as well (`bubbler-init: Xwayland
+exited; stopping the command`) and still reports the command's own status. In
+the other direction the server goes last: the command exits, every `exec` child
+is shut down, and only then does Xwayland get its SIGTERM, five seconds and a
+SIGKILL. Nothing outlives the run and there is nothing to clean up on the host,
+the socket having been in a `/tmp` that goes with the sandbox.
+
+There is no window manager in there, which is what the lint note
+`x11-nested-no-wm` says: X windows are undecorated, unmanaged and stacked in
+the one compositor window, so an application that opens dialogs gets them piled
+on its main window with nothing to move them. A `fullscreen=#true` config does
+not get the note, having asked for the single full-output window already.
+Starting a window manager inside is out of scope: it would be one more process
+in the sandbox and which one is a matter of taste, not of the boundary.
+
+Measured here on Xwayland 24.1.13, Hyprland 0.56.2 and an RTX 4070 SUPER: a
+client inside the nested server saw 26 extensions, GLX among them with direct
+rendering, plus MIT-SHM, XInput, XKEYBOARD and XTEST. `dri` is not optional for
+that — without it Xwayland dies in glamor during startup, `-glamor off`
+included.
+
+`x11 "host"` is the older behaviour, kept: the session's `/tmp/.X11-unix/X<n>`
+bound at the same path inside (a different display number may not work), and
+whatever Xauthority the environment names — `$XAUTHORITY`, else
+`$HOME/.Xauthority` when that is a regular file, which is libX11's default and
+not the wiki's — remapped to `/home/bubbler/.Xauthority` so the host path stays
+hidden. That grant is no boundary at all: every X client on your display can
+read every other's input and windows, this sandbox included, and the
+compositor's security context does not reach an X client. `bubbler lint` warns
+(`x11-without-reason`), `bubbler run` warns again before a real run —
+
+    bubbler: warning: x11 "host" grants no isolation between X clients
+
+— and `steam` and `lutris` are the two shipped profiles carrying it, each with
+a `lint-allow` naming the window manager their applications want as the reason.
+
+The X SECURITY extension's untrusted mode is not offered as a third one. An
+untrusted client is granted `XC-MISC` and `BIG-REQUESTS` and nothing else
+(`SecurityTrustedExtensions` in the X server's `Xext/security.c`), so it has no
+GLX, no RENDER, no XInput, no XKEYBOARD and no MIT-SHM: a mode in which the
+applications that need `x11` do not run is not a mode.
+
+The mode is one value and not a set, so a layer that includes another replaces
+its `x11` node whole, window properties and all, in either direction, and the
+lint reads the result.
 
 ### hidraw
 
@@ -1065,8 +1198,9 @@ changes an instance that was already seeded from it.
 
 ### Built-in profiles
 
-Every one is Wayland-first; only the two gaming profiles grant `x11`.
-`~/name` below is a `home-share`, read-only unless it says `rw`.
+Every one is Wayland-first; only the two gaming profiles grant `x11`, and both
+ask for the session's display with `x11 "host"`. `~/name` below is a
+`home-share`, read-only unless it says `rw`.
 
     alacritty     wayland
     chromium      wayland dri pipewire network dbus portals notify, ~/Downloads rw
@@ -1076,10 +1210,10 @@ Every one is Wayland-first; only the two gaming profiles grant `x11`.
     keepassxc     wayland dbus portals notify tray app-runtime rw, ~/Documents rw
     kitty         wayland dri dbus portals notify
     libreoffice   wayland dri dbus portals, ~/Documents rw, SAL_USE_VCLPLUGIN=gtk3
-    lutris        wayland x11 dri pipewire network dbus portals notify tray gamepad system-bus, ~/Games rw
+    lutris        wayland x11 "host" dri pipewire network dbus portals notify tray gamepad system-bus, ~/Games rw
     mpv           wayland dri pipewire, ~/Videos
     spotify       wayland dri pipewire network dbus notify tray mpris
-    steam         wayland x11 dri pipewire network dbus notify tray gamepad system-bus
+    steam         wayland x11 "host" dri pipewire network dbus notify tray gamepad system-bus
     thunderbird   wayland network dri dbus portals notify, ~/Downloads rw
     vesktop       wayland dri pipewire network dbus portals notify tray, ~/Downloads rw
 
@@ -1135,14 +1269,19 @@ without which it cannot follow the desktop colour scheme. Never share kitty's
 remote-control socket across the boundary — `kitten @` includes `launch`, so a
 reachable socket is command execution in whichever direction it was shared.
 
-`steam` and `lutris` are the two that grant `x11`, and that is the weak point
-of both: X11 has no isolation between clients, so a sandbox on your display can
-keylog every other client on it, Xwayland included. They have it because Steam's
-UI (steamwebhelper) is an X11/CEF client with no Wayland support and because
-Wine's X11 driver takes precedence over its Wayland one for every game Lutris
-starts. Neither carries a `seccomp` node any more: the Steam runtime,
-umu/Proton and DXVK's 32-bit path are i386, and the default filter now covers
-i386 alongside x86_64, so they are filtered rather than killed. Neither
+`steam` and `lutris` are the two that grant `x11`, and both write it as
+`x11 "host"`, which is the weak point of both: X11 has no isolation between
+clients, so a sandbox on your display can keylog every other client on it,
+Xwayland included. They ask for the session's display rather than the nested
+one because Steam's UI (steamwebhelper) is an X11/CEF client with no Wayland
+support whose many windows want a real window manager, and because Wine's X11
+driver takes precedence over its Wayland one for every game Lutris starts, with
+the same want. The nested server has no window manager at all, so it is the
+better fit for a single fullscreen game (`x11 fullscreen=#true grab=#true`)
+and the worse one for a launcher; each profile says so in the `lint-allow`
+reason it carries. Neither carries a `seccomp` node any more: the Steam
+runtime, umu/Proton and DXVK's 32-bit path are i386, and the default filter now
+covers i386 alongside x86_64, so they are filtered rather than killed. Neither
 may ever carry `userns "disable"` — pressure-vessel nests its own bubblewrap for
 every Proton game. On the system bus `steam` talks to UPower, and both grant
 UDisks2 enumeration alone — `see` plus the one `GetManagedObjects` call Wine
@@ -1506,7 +1645,9 @@ a `portals` to carry, so the portal reads the sandbox as an ordinary process
 of yours).
 
 **Warnings** say the file grants more than it probably means to:
-`x11-without-reason`, `seccomp-disabled`, `userns-disabled-with-nested-sandbox`
+`x11-without-reason` (an `x11 "host"` grant with no `lint-allow` reason; the
+nested default never warns), `seccomp-disabled`,
+`userns-disabled-with-nested-sandbox`
 (`userns "disable"` under a command known to nest a sandbox of its own — the
 list of such commands is a heuristic), `own-too-wide` (an `own` ending in `*`
 with fewer than three name elements before it, so `org.kde.*` warns and
@@ -1549,12 +1690,15 @@ that second half is dropped under `network "host"`), `secrets-access`
 the Secret Service API partitions nothing between the applications that call
 it), `lint-allow-unused` (a `lint-allow` node that accepts nothing, which is a
 suppression outliving what it was written for — and the one check no
-`lint-allow` silences, since that node would be the unused one).
+`lint-allow` silences, since that node would be the unused one),
+`x11-nested-no-wm` (a nested `x11` without `fullscreen=#true`: the server it
+starts has no window manager, so the X windows inside are undecorated and
+unmanaged in the one compositor window it draws).
 
 A warning or a note is accepted with a `lint-allow` node, which takes a check
 id and a required reason:
 
-    x11
+    x11 "host"
     lint-allow "x11-without-reason" reason="steamwebhelper is an X11/CEF client"
 
 The node holds for the whole flattened profile, not for one line, and a
@@ -1967,8 +2111,9 @@ and `group` are generated: the sandbox sees the user `bubbler` (holding the
 host's uid and gid) and `nobody`, never the host's accounts, and `USER` and
 `LOGNAME` are `bubbler` as well.
 
-`x11` remaps any Xauthority file to `/home/bubbler/.Xauthority`, but it stays
-a compatibility grant: X11 offers no isolation between clients. Sockets and
+`x11 "host"` remaps any Xauthority file to `/home/bubbler/.Xauthority`, but it
+stays a compatibility grant: X11 offers no isolation between clients. A bare
+`x11` reads neither variable — it starts a server of its own. Sockets and
 cookie files named by the environment must really be of that type, so a
 `WAYLAND_DISPLAY` or `XAUTHORITY` naming a directory is refused instead of
 binding the tree under it.
@@ -1985,7 +2130,8 @@ The short form: the boundary bubbler builds is between your account and the
 application. It is not a boundary against root, not one against your own
 processes outside a sandbox — anything running as your uid can read the
 instance store and connect to a live instance's control socket. On the display,
-`wayland` is a boundary the compositor enforces and `x11` is none at all.
+`wayland` is a boundary the compositor enforces and a bare `x11` an X server of
+the sandbox's own behind it; `x11 "host"` is no boundary at all.
 
 bubbler itself is unprivileged and unconfined: it can do whatever your account
 can. `contrib/apparmor/usr.bin.bubbler` is an AppArmor profile that would narrow
@@ -2037,9 +2183,11 @@ none of its own.
 - A generated desktop entry closes D-Bus activation for itself only, and its
   `%f` file arguments are host paths the sandbox cannot open; both are under
   "Desktop entries".
-- `x11` bypasses the Wayland security context: an Xwayland client is a client
-  of your session's own socket, so what a compositor withholds from a
-  sandboxed client it does not withhold there; see "wayland".
+- `x11 "host"` bypasses the Wayland security context: those clients speak to a
+  server that is a client of your session's own socket, so what a compositor
+  withholds from a sandboxed client it does not withhold there; see "wayland".
+- The nested `x11` server runs without a window manager, so an application
+  with more than one window gets them undecorated and stacked; see "x11".
 
 ## Files
 

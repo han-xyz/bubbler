@@ -186,15 +186,60 @@ and not bubbler's — bubbler attaches the metadata and the compositor does
 every bit of the enforcing, so the grant is worth what the compositor
 implements. A compositor with no `wp_security_context_manager_v1` gets the
 session socket and a warning on every launch, and `wayland "host"` asks
-for that socket outright (lint `wayland-host`). Xwayland clients are
-outside all of it: `x11` reaches a server that is an ordinary client of
-your session. A focused client is still handed the selection through the
-core `wl_data_device`, as any application is.
+for that socket outright (lint `wayland-host`). The session's Xwayland is
+outside all of it: `x11 "host"` reaches a server that is an ordinary
+client of your session, though a bare `x11` starts one on this socket
+(below). A focused client is still handed the selection through the core
+`wl_data_device`, as any application is.
 
 [wayland](manual.md#wayland) ·
 `wayland_context_binds_bubblers_socket_at_the_host_name`,
 `wayland_raw_binds_the_host_socket_for_either_reason`,
 `real_wayland_binds_bubblers_own_socket_not_the_hosts`
+
+### X11
+
+**Defends:** a bare `x11` binds nothing of the session's X display — no
+socket, no cookie, and neither `DISPLAY` nor `XAUTHORITY` is read.
+`bubbler-init` starts a rootful Xwayland inside the sandbox instead, as
+one more Wayland client of the socket the `wayland` grant bound, so what
+the compositor sees is a sandboxed client like any other and what the
+application talks to is a display of the sandbox's own: the server's
+socket is in the private `/tmp`, its shared memory in the private
+`/dev/shm`, and `DISPLAY` is `:0` for the command and for every `exec`
+child. The only way to that server is `/tmp/.X11-unix/X0` inside that
+private `/tmp` — `-nolisten tcp` keeps it off the network and `-nolisten
+local` off the abstract socket namespace, which a mount namespace does
+not cover and `network "host"` would share with every host process. X11's
+lack of isolation between clients therefore reaches no further than this
+sandbox. Measured here on Xwayland 24.1.13, Hyprland 0.56.2 and an NVIDIA
+card: a client inside saw 26 extensions, GLX with direct rendering among
+them.
+
+**Does not defend:** the sandbox's own processes against each other.
+There is one server and X11 isolates nothing on it, so the command and
+its `exec` children read each other's input and windows. Nothing manages
+those windows either — no window manager runs inside, so they are
+undecorated and stacked in the server's one compositor window (lint note
+`x11-nested-no-wm`). The server is the host's `/usr/bin/Xwayland` and
+cannot start without `wayland` and `dri`, so the grant carries a GPU
+grant's cost with it. `x11 "host"` defends nothing at all: it binds the
+session's socket and cookie, where every X client reads every other's
+input and windows and no security context applies — lint
+`x11-without-reason`, a warning before every real run, and the two gaming
+profiles are the only ones shipping it.
+
+[x11](manual.md#x11) ·
+`x11_parses_nested_properties_and_host_and_refuses_the_rest`,
+`nested_x11_requires_wayland_and_dri_on_the_flattened_config`,
+`x11_host_is_a_warning_and_the_nested_default_is_a_note`,
+`nested_x11_binds_nothing_and_only_names_the_display`,
+`nested_x11_hands_the_supervisor_the_server_argv`,
+`nested_x11_without_xwayland_on_the_host_fails`,
+`a_helper_that_reports_a_display_is_started_first_and_the_command_sees_it`,
+`a_helper_that_never_reports_is_a_startup_failure`,
+`real_nested_x11_serves_a_private_display`,
+`real_nested_x11_exec_children_see_the_display`
 
 ### seccomp
 
@@ -485,13 +530,14 @@ Stated so nobody has to infer them.
   uid outside a sandbox can read the instance store, connect to
   `init.sock`, ptrace bubbler, and replace the binary on your `PATH`.
   bubbler protects you from the *application*, not from your account.
-- **No defence for `x11`.** X11 offers no isolation between clients: any
-  client can read any other's input and windows, and an Xwayland client
-  is outside the Wayland security context as well. The grant exists for
-  compatibility, `bubbler lint` warns on it, `bubbler run` warns again
-  before a real run, and only the two gaming profiles ship it.
-  ([Baseline](manual.md#baseline), [Linting](manual.md#linting);
-  `x11_is_a_warning_a_lint_allow_node_accepts`,
+- **No defence for `x11 "host"`.** The session's display offers no
+  isolation between clients: any client can read any other's input and
+  windows, and an Xwayland client is outside the Wayland security context
+  as well. The mode exists for compatibility, `bubbler lint` warns on it,
+  `bubbler run` warns again before a real run, and only the two gaming
+  profiles ship it. A bare `x11` is the nested server above instead.
+  ([x11](manual.md#x11), [Linting](manual.md#linting);
+  `x11_host_is_a_warning_and_the_nested_default_is_a_note`,
   `x11_warns_before_a_real_run`,
   `only_the_gaming_profiles_grant_x11_and_none_disables_user_namespaces`.)
 - **No defence against the kernel.** seccomp narrows the surface; a bug

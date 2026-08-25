@@ -30,7 +30,7 @@ jobs:
         run: |
           pacman -Syu --noconfirm --needed \
             nodejs git gcc pkgconf rustup \
-            libseccomp bubblewrap passt nftables python3
+            libseccomp bubblewrap passt nftables python3 xorg-xwayland
       - name: rust stable
         # rustup rather than the `rust` package: the same mechanism as the msrv
         # job, and it is rustup that guarantees clippy and rustfmt are there.
@@ -99,7 +99,8 @@ jobs:
       - name: can this runner build a sandbox?
         continue-on-error: true
         run: |
-          pacman -Syu --noconfirm --needed bubblewrap passt libseccomp nftables
+          pacman -Syu --noconfirm --needed \
+            bubblewrap passt libseccomp nftables xorg-xwayland
           printf 'max_user_namespaces: '
           cat /proc/sys/user/max_user_namespaces || echo unreadable
           unshare -Urn true \

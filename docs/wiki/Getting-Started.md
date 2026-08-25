@@ -31,6 +31,7 @@ keep it out of `/usr/bin`. Build needs Rust 1.95+ and `libseccomp`.
 | `passt` | isolated `network` — every shipped profile with a network |
 | `nftables` | `outbound "deny"` only |
 | `xdg-desktop-portal` + a backend | `portals`, `camera` |
+| `xorg-xwayland` | a bare `x11` — the X server that runs inside the sandbox |
 
 Also a kernel with unprivileged user namespaces.
 

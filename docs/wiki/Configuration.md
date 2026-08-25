@@ -8,7 +8,8 @@ with the expected type, or the run is refused.
 // bubbler profile: firefox
 wayland                          // socket the compositor treats as sandboxed
 wayland "host"                   // the session socket as it is; lint warns
-x11                              // X socket + Xauthority (no isolation between clients)
+x11                              // nested Xwayland; geometry= fullscreen= grab=
+x11 "host"                       // session X socket + cookie; lint warns
 network                          // own namespace via pasta; see Network
 network "host"                   // host's namespace
 dri                              // GPU: /dev/dri, NVIDIA nodes, PCI sysfs
@@ -32,7 +33,7 @@ tty "pty"                        // pty | passthrough | none
 userns "allow"                   // allow | disable nested user namespaces
 seccomp { allow "perf_event_open"; deny "unshare" }
 env MOZ_ENABLE_WAYLAND="0"       // repeatable, one key each
-lint-allow "x11-without-reason" reason="no Wayland backend"
+lint-allow "x11-without-reason" reason="the session's window manager"
 desktop "org.mozilla.Thunderbird.desktop"   // which entry `bubbler desktop` copies
 command "firefox"
 ```
@@ -43,7 +44,8 @@ command "firefox"
 |---|---|---|
 | `wayland` | bubbler's own socket, registered with the compositor as a security context; `WAYLAND_DISPLAY` | which globals a sandboxed client loses is the compositor's policy; a compositor without the protocol gets the session socket and a warning |
 | `wayland "host"` | the session's socket, with every global | the compositor cannot tell the sandbox from your session; lint warns |
-| `x11` | X socket, Xauthority at `/home/bubbler/.Xauthority` | X11 clients can keylog each other; lint warns |
+| `x11` | a rootful Xwayland started inside the sandbox, `DISPLAY=:0` | needs `wayland` and `dri`; one compositor window, no window manager |
+| `x11 "host"` | the session's X socket, Xauthority at `/home/bubbler/.Xauthority` | X11 clients can keylog each other; lint warns |
 | `network` | own namespace, internet via pasta | LAN/mDNS and host loopback unreachable; see [Network](Network.md) |
 | `network "host"` | host's network stack | host loopback services and abstract sockets exposed |
 | `dri` | `/dev/dri` rw, NVIDIA nodes, `/sys/devices/pci*`, `/sys/class/drm` | sysfs of **every** PCI device |
