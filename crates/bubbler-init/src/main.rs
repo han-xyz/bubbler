@@ -550,9 +550,6 @@ fn main() -> ExitCode {
     let mut pending: Vec<Pending> = Vec::new();
     let mut stopping = Stopping::default();
     loop {
-        if stop.swap(false, Ordering::SeqCst) {
-            begin_stop(&command, &execs, &mut stopping);
-        }
         if let Ok(Some(status)) = command.try_wait() {
             reap(&mut execs);
             shutdown(&mut execs);
@@ -619,11 +616,21 @@ fn main() -> ExitCode {
             .map(|f| !f.revents().is_empty())
             .collect();
         drop(fds);
+        // Taken here and nowhere else, so a stop that arrived while this
+        // set was being built or polled is acted on before anything that
+        // poll reported: the display socket was in the set from before
+        // the signal, and the client that woke it must not start a server
+        // anyway. A signal pending before `poll` returns has run its
+        // handler by the time this reads the flag, so the two cannot cross.
+        if stop.swap(false, Ordering::SeqCst) {
+            begin_stop(&command, &execs, &mut stopping);
+        }
         match polled {
             Ok(0) => {}
-            // Every poll error is retried on purpose: EINTR means a signal was
-            // delivered and the next tick acts on it, and no other error is a
-            // reason to abandon a command that is still running.
+            // Every poll error is retried on purpose: EINTR means a signal
+            // was delivered, whose flag the line above has just read, and no
+            // other error is a reason to abandon a command that is still
+            // running.
             Err(_) => {
                 std::thread::sleep(TICK);
                 continue;
@@ -632,8 +639,13 @@ fn main() -> ExitCode {
         }
         // The first client to connect is what starts the server, and the
         // window manager goes up with it: neither exists in a sandbox
-        // whose command never speaks X11.
-        if wake_x11 && let Some(x) = x11.as_mut() {
+        // whose command never speaks X11. Nor in one that is ending: the
+        // socket leaves the poll set when the run is asked to stop, but a
+        // wake already in hand can be older than the asking.
+        if wake_x11
+            && !stopping.asked
+            && let Some(x) = x11.as_mut()
+        {
             x.started = true;
             match start_x11(x) {
                 Ok(()) => start_wm(x),
