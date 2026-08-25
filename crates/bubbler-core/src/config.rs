@@ -52,6 +52,8 @@ pub const RESERVED_ENV: &[&str] = &[
     "PULSE_SERVER",
     "DBUS_SESSION_BUS_ADDRESS",
     "DBUS_SYSTEM_BUS_ADDRESS",
+    "AT_SPI_BUS_ADDRESS",
+    "IBUS_USE_PORTAL",
 ];
 
 /// `/etc` entries `etc-share` may not name: the sandbox generates its own
@@ -3109,9 +3111,17 @@ command "b""#
             parse("env PULSE_SERVER=\"x\""),
             Err(ConfigError::BadArgument { .. })
         ));
-        // Either bus address would point a client at a socket bubbler
-        // did not filter.
-        for key in ["DBUS_SESSION_BUS_ADDRESS", "DBUS_SYSTEM_BUS_ADDRESS"] {
+        // Each of these points a client at a socket: the two bus
+        // addresses at a bus bubbler did not filter, the accessibility
+        // one at a registry outside the sandbox, and `IBUS_USE_PORTAL`
+        // at the direct ibus socket instead of the portal name the
+        // grant proxies.
+        for key in [
+            "DBUS_SESSION_BUS_ADDRESS",
+            "DBUS_SYSTEM_BUS_ADDRESS",
+            "AT_SPI_BUS_ADDRESS",
+            "IBUS_USE_PORTAL",
+        ] {
             assert!(
                 matches!(
                     parse(&format!(

@@ -2658,8 +2658,11 @@ fn real_a11y_lets_the_app_register_and_nothing_else() {
 /// A hidden name and an unowned one both answer `false`, so the answer
 /// alone proves nothing on a host running no input method. What tells
 /// them apart is who replied: the proxy makes up the answer for a name
-/// no rule grants, and such a reply carries no sender, while a granted
-/// name's question is passed to the bus and comes back from it.
+/// no rule grants, and such a reply carries no sender, while the two
+/// granted portal names' `NameHasOwner` calls are passed on and come
+/// back from the bus. A `Peer.Ping` to a daemon's own name then shows
+/// the same wall from the other side: a call to a hidden name is
+/// refused by the proxy instead of being answered by the bus.
 #[test]
 fn real_input_method_hides_the_daemons_main_names() {
     if !require_dbus() {
@@ -2710,10 +2713,10 @@ fn real_input_method_hides_the_daemons_main_names() {
     }
 
     // A call *to* a hidden name is no more the bus's to answer than a
-    // question about it. Measured on this host: the proxy makes up a
-    // bare `ServiceUnknown` for it, while the bus's own answer for a
-    // name it knows and nobody owns says the name is not activatable —
-    // the sentence that tells the two apart, and never appears here.
+    // question about it. The proxy synthesizes the refusal and has no
+    // prose to put in it, so the message body is the error name over
+    // again; a bus answering for itself puts a sentence about the name
+    // there instead, which is what tells the two apart.
     let out = bubbler_dbus(tmp.path(), &init)
         .args([
             "run",
@@ -2730,12 +2733,9 @@ fn real_input_method_hides_the_daemons_main_names() {
         .unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert_ne!(out.status.code(), Some(0), "the hidden name answered");
+    let unknown = "org.freedesktop.DBus.Error.ServiceUnknown";
     assert!(
-        err.contains("org.freedesktop.DBus.Error.ServiceUnknown"),
-        "{err}"
-    );
-    assert!(
-        !err.contains("not activatable"),
+        err.contains(&format!("Error {unknown}: {unknown}")),
         "the call reached the bus: {err}"
     );
 

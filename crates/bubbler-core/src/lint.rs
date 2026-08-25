@@ -1283,7 +1283,7 @@ fn across_layers(ctx: &Context, sources: &[Source], f: &mut Findings) {
                     node,
                     &BUNDLE_WITHOUT_DBUS,
                     format!(
-                        "`{name}` is a set of proxy rules and no layer grants `dbus` to carry them"
+                        "`{name}` is carried by the D-Bus proxy and no layer grants `dbus` to start it"
                     ),
                     "add a `dbus` node, or drop this one",
                 );

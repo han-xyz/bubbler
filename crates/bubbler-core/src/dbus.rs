@@ -74,6 +74,17 @@ const PORTAL_RULES: &[&str] = &[
     "--broadcast=org.freedesktop.portal.*=@/org/freedesktop/portal/*",
 ];
 
+/// Rules the `input-method` grant gets: both portal names, whichever
+/// daemon the session runs. The client libraries watch for the name and
+/// use it when the daemon's own name is not visible, which is what the
+/// proxy's filtering leaves them.
+// Not the daemons' own names: fcitx5's carries `Exit`, `SetConfig` and
+// their kin, which reconfigure the daemon for the whole session.
+const INPUT_METHOD_RULES: &[&str] = &[
+    "--talk=org.freedesktop.portal.Fcitx",
+    "--talk=org.freedesktop.portal.IBus",
+];
+
 /// Rules the `a11y` grant gets on the accessibility bus, which is the
 /// whole of what a sandboxed client may ask that bus for: registering
 /// the application with the AT-SPI registry, and reading back what is
@@ -208,15 +219,9 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
                     "--talk=org.kde.StatusNotifierWatcher".to_owned(),
                     i,
                 ),
-                // Both portal names, whichever daemon the session runs:
-                // the client libraries watch for the name and use it when
-                // the daemon's own name is not visible, which is what the
-                // proxy's filtering leaves them. The daemons' own names
-                // carry `Exit`, `SetConfig` and their kin, and are not
-                // granted.
                 Service::InputMethod => {
-                    for name in ["Fcitx", "IBus"] {
-                        push(&mut rules, format!("--talk=org.freedesktop.portal.{name}"), i);
+                    for r in INPUT_METHOD_RULES {
+                        push(&mut rules, (*r).to_owned(), i);
                     }
                 }
                 // Its rules are its own bus's, below: nothing of the
@@ -439,7 +444,7 @@ pub fn host_a11y_bus(env: &Env) -> Result<PathBuf, LaunchError> {
         A11Y_NODE,
     )? {
         Some(path) => Ok(path),
-        None => ask_a11y_bus(Path::new(DBUS_SEND)),
+        None => ask_a11y_bus(Path::new(DBUS_SEND), env),
     }
 }
 
@@ -447,22 +452,29 @@ pub fn host_a11y_bus(env: &Env) -> Result<PathBuf, LaunchError> {
 /// `GetAddress` call on the session bus, spawned with one argument per
 /// element and no shell anywhere. `program` is [`DBUS_SEND`] resolved on
 /// `PATH` in every run; only a test hands it a path of its own.
-fn ask_a11y_bus(program: &Path) -> Result<PathBuf, LaunchError> {
-    let out = Command::new(program)
-        .args([
-            "--session",
-            "--print-reply",
-            "--dest=org.a11y.Bus",
-            "/org/a11y/bus",
-            "org.a11y.Bus.GetAddress",
-        ])
-        .output()
-        .map_err(|e| match e.kind() {
-            io::ErrorKind::NotFound => LaunchError::A11y(format!(
-                "`{DBUS_SEND}` not found on PATH; install the `dbus` package"
-            )),
-            _ => LaunchError::A11y(format!("running `{DBUS_SEND}`: {e}")),
-        })?;
+///
+/// The question goes to the bus `env` names rather than to whatever
+/// `$DBUS_SESSION_BUS_ADDRESS` this process happens to have inherited:
+/// the address that comes back is the one the sandbox is given, and it
+/// must name the same session as the socket the `dbus` grant proxies.
+fn ask_a11y_bus(program: &Path, env: &Env) -> Result<PathBuf, LaunchError> {
+    let mut command = Command::new(program);
+    command.args([
+        "--session",
+        "--print-reply",
+        "--dest=org.a11y.Bus",
+        "/org/a11y/bus",
+        "org.a11y.Bus.GetAddress",
+    ]);
+    if let Some(session_bus) = env.dbus_address.as_deref() {
+        command.env("DBUS_SESSION_BUS_ADDRESS", session_bus);
+    }
+    let out = command.output().map_err(|e| match e.kind() {
+        io::ErrorKind::NotFound => LaunchError::A11y(format!(
+            "`{DBUS_SEND}` not found on PATH; install the `dbus` package"
+        )),
+        _ => LaunchError::A11y(format!("running `{DBUS_SEND}`: {e}")),
+    })?;
     if !out.status.success() {
         return Err(LaunchError::A11y(format!(
             "org.a11y.Bus did not answer GetAddress{}",
@@ -1364,6 +1376,7 @@ mod tests {
             format!(
                 "#!/bin/sh\n\
                  printf '%s\\n' \"$@\" > {dir}/argv\n\
+                 printf '%s\\n' \"$DBUS_SESSION_BUS_ADDRESS\" > {dir}/session\n\
                  cat {dir}/stdout\n\
                  cat {dir}/stderr >&2\n\
                  exit {code}\n",
@@ -1449,7 +1462,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let program = fake_dbus_send(tmp.path(), GET_ADDRESS_REPLY.as_bytes(), b"", 0);
         assert_eq!(
-            ask_a11y_bus(&program).unwrap(),
+            ask_a11y_bus(&program, &env()).unwrap(),
             PathBuf::from("/run/user/1000/at-spi/bus_0")
         );
         // The whole of what bubbler asks the session bus for: one method
@@ -1458,6 +1471,22 @@ mod tests {
             std::fs::read_to_string(tmp.path().join("argv")).unwrap(),
             "--session\n--print-reply\n--dest=org.a11y.Bus\n/org/a11y/bus\n\
              org.a11y.Bus.GetAddress\n"
+        );
+    }
+
+    #[test]
+    fn the_session_bus_asked_is_the_one_the_env_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let program = fake_dbus_send(tmp.path(), GET_ADDRESS_REPLY.as_bytes(), b"", 0);
+        let mut e = env();
+        // Not the address this test process inherited: the accessibility
+        // bus has to be the one belonging to the session whose socket the
+        // `dbus` grant proxies.
+        e.dbus_address = Some("unix:path=/tmp/from-the-env".into());
+        ask_a11y_bus(&program, &e).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("session")).unwrap(),
+            "unix:path=/tmp/from-the-env\n"
         );
     }
 
@@ -1473,7 +1502,7 @@ mod tests {
             b"Error org.freedesktop.DBus.Error.ServiceUnknown: \x1b]52;c;aGk=\x07\nmore\n",
             1,
         );
-        let Err(LaunchError::A11y(msg)) = ask_a11y_bus(&program) else {
+        let Err(LaunchError::A11y(msg)) = ask_a11y_bus(&program, &env()) else {
             panic!("a failed call was accepted");
         };
         assert!(msg.contains("org.a11y.Bus"), "{msg}");
@@ -1500,7 +1529,7 @@ mod tests {
         let abstract_reply = "method return sender=:1.2 reply_serial=2\n   \
              string \"unix:abstract=/tmp/dbus-Ab3\"\n";
         let program = fake_dbus_send(tmp.path(), abstract_reply.as_bytes(), b"", 0);
-        let Err(LaunchError::A11y(msg)) = ask_a11y_bus(&program) else {
+        let Err(LaunchError::A11y(msg)) = ask_a11y_bus(&program, &env()) else {
             panic!("an abstract address was accepted");
         };
         assert!(msg.contains("unix:path="), "{msg}");
@@ -1510,7 +1539,7 @@ mod tests {
 
         let other = tempfile::tempdir().unwrap();
         let program = fake_dbus_send(other.path(), b"method return sender=:1.2\n", b"", 0);
-        let Err(LaunchError::A11y(msg)) = ask_a11y_bus(&program) else {
+        let Err(LaunchError::A11y(msg)) = ask_a11y_bus(&program, &env()) else {
             panic!("a reply holding no address was accepted");
         };
         assert!(msg.contains("org.a11y.Bus"), "{msg}");
@@ -1519,7 +1548,7 @@ mod tests {
     #[test]
     fn a_missing_dbus_send_names_the_program_and_its_package() {
         let tmp = tempfile::tempdir().unwrap();
-        let Err(LaunchError::A11y(msg)) = ask_a11y_bus(&tmp.path().join(DBUS_SEND)) else {
+        let Err(LaunchError::A11y(msg)) = ask_a11y_bus(&tmp.path().join(DBUS_SEND), &env()) else {
             panic!("a missing program was accepted");
         };
         assert!(msg.contains(DBUS_SEND), "{msg}");
