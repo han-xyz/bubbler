@@ -248,7 +248,7 @@ file descriptor numbers are the ones a dry run prints.
       command                                        2 arguments
         -- firefox
 
-    230 arguments in 14 groups, 129 hidden (--explain=full); 8 D-Bus rules to the proxy (--proxy)
+    233 arguments in 14 groups, 129 hidden (--explain=full); 8 D-Bus rules to the proxy (--proxy)
 
 A group sits where the node's *first* argument is emitted and gathers every
 later one it contributed, whichever phase that came from: `network "host"` is
