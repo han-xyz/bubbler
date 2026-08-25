@@ -148,7 +148,12 @@ the portal's per-document mode bits, and nothing of the mount's other apps.
 **Defends:** `WAYLAND_DISPLAY`, `XAUTHORITY` and `DISPLAY` are untrusted
 input. Their shape is validated (one path component) and the *file type*
 is probed, never mere existence, so a variable naming a directory is
-refused instead of binding the tree under it.
+refused instead of binding the tree under it. `WAYLAND_DISPLAY` is checked
+in both the values it has — the run's own and the process environment's,
+which the Wayland client reads itself — before the launcher connects to
+the compositor. `WAYLAND_SOCKET` is refused when set at all: the client
+would adopt the descriptor number it names as its connection and close it
+with the connection.
 
 **Does not defend:** a value that really does name a socket of the right
 type is bound, whatever it is a socket for.
@@ -156,6 +161,8 @@ type is bound, whatever it is a socket for.
 [Baseline](manual.md#baseline) ·
 `wayland_display_must_name_a_socket`,
 `wayland_display_that_is_not_one_component_is_rejected`,
+`a_display_name_that_is_a_path_is_refused_before_the_compositor`,
+`an_inherited_connection_is_refused`,
 `wayland_socket_path_of_the_wrong_type_fails`,
 `x11_socket_that_is_not_a_socket_fails`,
 `x11_xauthority_at_a_directory_fails`

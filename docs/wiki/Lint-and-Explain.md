@@ -61,8 +61,9 @@ per group, the config line, the argument count, what is behind each generated
 descriptor (seccomp filter size and architectures, `--ro-bind-data` size,
 which pipe an `--info-fd`/`--block-fd` is), and grants that are not bwrap
 arguments: D-Bus `rules:`, `rule-only:` for nodes contributing nothing else,
-`security-context:` under `wayland`, `sidecar: pasta …` and the nft ruleset
-under `network`.
+which socket a `wayland` node binds (`security-context:` for a bare grant,
+`raw socket: wayland "host"` for the session's own), `sidecar: pasta …` and the
+nft ruleset under `network`.
 
 ```
   portals                         config.kdl:11  10 arguments

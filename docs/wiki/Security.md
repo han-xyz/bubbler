@@ -115,6 +115,7 @@ host).
 
 ## Known gaps
 
+- `x11`: Xwayland clients bypass the Wayland security context.
 - No accessibility bus.
 - AMD compute (`/dev/kfd` + sysfs topology) unsupported; NVIDIA compute needs
   `etc-share "OpenCL"`/`"nvidia"`.

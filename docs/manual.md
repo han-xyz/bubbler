@@ -260,9 +260,11 @@ is not the order of record: `--dry-run` is, and so is `--format json`, which
 stays in true argv order.
 
 A grant that is not only bwrap arguments says so under its own group: a `dbus`
-node lists the `rules:` it hands the proxy, and an isolated `network` lists the
-`sidecar:` argv pasta is started with — neither is in the argv, and `--dry-run`
-prints the sandbox's argv alone.
+node lists the `rules:` it hands the proxy, an isolated `network` lists the
+`sidecar:` argv pasta is started with, and a `wayland` node says which socket
+the one bind is — `security-context:` with the three strings a bare grant
+registers, `raw socket: wayland "host"` for the session's own — none of which
+is in the argv, and `--dry-run` prints the sandbox's argv alone.
 
 Every generated descriptor says what is behind it: the size of the seccomp
 filter and the architectures it carries, the size of a `--ro-bind-data`, which
@@ -501,7 +503,12 @@ binds the session socket instead.
 
 A compositor bubbler cannot reach at all — nothing answering on
 `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY` — stops the run instead, the way a missing
-bind source does everywhere else.
+bind source does everywhere else. So does a run started with `$WAYLAND_SOCKET`
+set: `$WAYLAND_SOCKET is set; bubbler must be started without an inherited
+compositor connection`, because the client would take that value as a
+descriptor number, adopt it as the connection and close it when the connection
+drops, and nothing says the number is not one this run opened for itself. That
+client is pure Rust (`wayrs`); bubbler links no libwayland.
 
 `wayland "host"` asks for that socket outright, with every global the compositor
 offers, which is what an application that drives one of those protocols itself
@@ -1977,8 +1984,8 @@ it and the test that would fail if it changed.
 The short form: the boundary bubbler builds is between your account and the
 application. It is not a boundary against root, not one against your own
 processes outside a sandbox — anything running as your uid can read the
-instance store and connect to a live instance's control socket — and `x11` is
-not a boundary at all.
+instance store and connect to a live instance's control socket. On the display,
+`wayland` is a boundary the compositor enforces and `x11` is none at all.
 
 bubbler itself is unprivileged and unconfined: it can do whatever your account
 can. `contrib/apparmor/usr.bin.bubbler` is an AppArmor profile that would narrow
