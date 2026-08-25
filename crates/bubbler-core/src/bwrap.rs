@@ -604,12 +604,12 @@ impl BwrapArgs {
     /// with what produced it. Flattening the result is the argv again,
     /// element for element.
     pub fn finish_explained(
-        self,
+        mut self,
         command: &[OsString],
         alloc: &mut dyn FdAllocator,
     ) -> Result<Vec<Explained>, LaunchError> {
         let ctty = self.ctty;
-        let helper = self.helper.clone();
+        let helper = self.helper.take();
         let mut out = self.emit(alloc)?;
         let socket = alloc.init_socket().map_err(LaunchError::Data)?;
         out.push(Explained {

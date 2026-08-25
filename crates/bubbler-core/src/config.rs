@@ -187,18 +187,26 @@ impl Default for NestedX11 {
 
 impl NestedX11 {
     /// The Xwayland command line, in the order the server takes it.
-    /// `-nolisten tcp` keeps the display off the network and `-noreset`
-    /// stops a client's exit from resetting the server; `-ac` is the
-    /// access control X11 has no use for here, the display being the
-    /// sandbox's own. The `-displayfd` the supervisor reads the display
-    /// number from is appended when it starts the server, not here.
+    /// The two `-nolisten` flags leave the display reachable only over
+    /// the socket inside the sandbox and `-noreset` stops a client's exit
+    /// from resetting the server; `-ac` is the access control X11 has no
+    /// use for here, the display being the sandbox's own. The
+    /// `-displayfd` the supervisor reads the display number from is
+    /// appended when it starts the server, not here.
     pub fn xwayland_argv(&self) -> Vec<OsString> {
+        // `Xserver(1)`: `-nolisten local` drops the abstract socket the
+        // server would otherwise also answer on. An abstract name belongs
+        // to the network namespace and ignores the mount namespace, so
+        // under `network "host"` it is a host-wide address: a host client
+        // could reach this server, which `-ac` lets anyone use.
         let mut argv: Vec<OsString> = [
             XWAYLAND,
             ":0",
             "-noreset",
             "-nolisten",
             "tcp",
+            "-nolisten",
+            "local",
             "-ac",
             "-hidpi",
         ]
@@ -2339,8 +2347,9 @@ mod tests {
     }
 
     /// The argv is the contract with Xwayland, and the flags are fixed
-    /// so the display cannot be listened on TCP or the server reset by a
-    /// client: only the window the properties describe changes.
+    /// so the display is listened on neither TCP nor an abstract socket
+    /// and the server is not reset by a client: only the window the
+    /// properties describe changes.
     #[test]
     fn xwayland_argv_is_fixed_and_ordered() {
         let w = NestedX11::default().xwayland_argv();
@@ -2352,6 +2361,8 @@ mod tests {
                 "-noreset",
                 "-nolisten",
                 "tcp",
+                "-nolisten",
+                "local",
                 "-ac",
                 "-hidpi",
                 "-decorate",
@@ -2374,6 +2385,8 @@ mod tests {
                 "-noreset",
                 "-nolisten",
                 "tcp",
+                "-nolisten",
+                "local",
                 "-ac",
                 "-hidpi",
                 "-fullscreen",

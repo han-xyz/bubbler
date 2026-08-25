@@ -1466,6 +1466,8 @@ mod tests {
             "-noreset",
             "-nolisten",
             "tcp",
+            "-nolisten",
+            "local",
             "-ac",
             "-hidpi",
             "-decorate",

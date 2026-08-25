@@ -419,12 +419,12 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
                     Some(Service::Wayland(WaylandMode::Host)) => {
                         out.push("    raw socket: wayland \"host\"".to_owned());
                     }
-                    // The nested mode needs no line of its own: the argv
-                    // it hands the supervisor is an argument above, and
-                    // that one carries the explanation.
                     Some(Service::X11(X11Mode::Host)) => {
                         out.push("    raw socket: x11 \"host\"".to_owned());
                     }
+                    // The nested mode needs no line of its own: the argv
+                    // it hands the supervisor is an argument above, and
+                    // that one carries the explanation.
                     _ => {}
                 },
                 Origin::Seccomp => out.extend(listed(n == 0, seccomp_lines(&view.cfg.seccomp))),
