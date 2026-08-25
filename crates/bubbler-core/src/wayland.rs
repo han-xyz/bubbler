@@ -475,7 +475,7 @@ mod tests {
     /// not hide it itself. A duplicate would hide the loss of another.
     #[test]
     fn the_privileged_denylist_is_pinned_sorted_and_unique() {
-        assert_eq!(PRIVILEGED.len(), 39);
+        assert_eq!(PRIVILEGED.len(), 40);
         let mut sorted = PRIVILEGED.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
@@ -492,6 +492,7 @@ mod tests {
             "zwp_xwayland_keyboard_grab_manager_v1",
             "ext_transient_seat_manager_v1",
             "xx_input_method_manager_v2",
+            "ext_idle_notifier_v1",
             "wp_security_context_manager_v1",
         ] {
             assert!(PRIVILEGED.contains(&name), "{name}");

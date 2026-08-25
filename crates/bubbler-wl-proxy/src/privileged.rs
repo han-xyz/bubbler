@@ -1,16 +1,22 @@
 /// Wayland interfaces the proxy hides from a sandbox when the
 /// compositor has no `wp_security_context_v1` to hide them itself:
 /// screen capture, clipboard management without focus, input injection
-/// and keyboard grabs, session lock, overlays, foreign-toplevel and
-/// output control.
+/// and keyboard grabs, session lock, overlays, output control, and the
+/// protocols that watch the session rather than the client's own window
+/// — foreign-toplevel listing, idle notification.
 ///
-/// The names were read off what Hyprland 0.56 withholds from a
+/// The names started as what Hyprland 0.56 withholds from a
 /// security-context client (31 of the 71 interfaces the same session
-/// offers a plain one), then audited against the proxy's tables for the
-/// protocols of that kind other compositors implement and Hyprland does
-/// not. It is a denylist and nothing more: a privileged protocol nobody
-/// has written down here is advertised to the sandbox on the fallback
-/// path, and adding it is the only thing that hides it.
+/// offers a plain one); nine more came from reading every global the
+/// proxy's tables describe against that same class — protocols another
+/// compositor implements, or that Hyprland hands a sandboxed client
+/// anyway. It is a denylist and nothing more: a privileged protocol
+/// nobody has written down here is advertised to the sandbox on the
+/// fallback path, and adding it is the only thing that hides it.
+///
+/// The other side of that audit is `tables::ALLOWED_GLOBALS`, which
+/// names every global this list deliberately lets through, so a new one
+/// fails a test instead of reaching a sandbox unexamined.
 ///
 /// Sorted, so a name added out of place is a diff a reader can follow.
 /// Included by both `bubbler-wl-proxy` and `bubbler-core`, so the
@@ -19,6 +25,7 @@ pub const PRIVILEGED: &[&str] = &[
     "ext_data_control_manager_v1",
     "ext_foreign_toplevel_image_capture_source_manager_v1",
     "ext_foreign_toplevel_list_v1",
+    "ext_idle_notifier_v1",
     "ext_image_copy_capture_manager_v1",
     "ext_output_image_capture_source_manager_v1",
     "ext_session_lock_manager_v1",

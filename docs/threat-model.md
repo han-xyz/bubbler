@@ -235,11 +235,13 @@ That last check is the one that matters: hiding a global from
 `wl_registry.global` does not stop a client naming it by number, and a
 draft that only withheld advertisements was bound straight through by
 exactly that route while this was being built. On a compositor with no
-security context the proxy applies a denylist of its own — 39 interface
-names: the 31 Hyprland withholds from a sandboxed client, plus the
-protocols of that kind other compositors implement, found by reading
-every interface the proxy's tables describe — and the launch says so with
-a note.
+security context the proxy applies a denylist of its own — 40 interface
+names: the 31 Hyprland withholds from a sandboxed client, plus nine of
+the same class found by reading every global the proxy's tables describe,
+whether another compositor implements it or Hyprland hands it to a
+sandboxed client anyway — and the launch says so with a note. What the
+list lets through is written down too, so a protocol bump that brings a
+new global fails a test rather than reaching a sandbox unexamined.
 
 **Does not defend:** on the security-context path, which globals are
 hidden is the compositor's policy and not bubbler's — bubbler attaches the

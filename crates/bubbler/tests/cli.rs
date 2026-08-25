@@ -3710,9 +3710,16 @@ fn real_wayland_a_proxy_that_will_not_start_stops_the_run() {
     assert!(err.contains("it exited"), "{err}");
 }
 
+/// Names on bubbler's denylist that this compositor offers a
+/// security-context client anyway. The denylist is bubbler's own and only
+/// the fallback path applies it; here the compositor's policy decides, and
+/// Hyprland hands a sandboxed client the idle notifier that bubbler hides
+/// when there is no context to hide it.
+const CONTEXT_OFFERS_ANYWAY: &[&str] = &["ext_idle_notifier_v1"];
+
 /// The registry the application is offered is the proxy's: fewer globals
-/// than the session hands a plain client, and none of the privileged
-/// ones the class names.
+/// than the session hands a plain client, and none of the privileged ones
+/// this compositor withholds from a security-context client.
 #[test]
 fn real_wayland_proxy_hands_the_application_a_smaller_registry() {
     if !require_security_context() || !require_python() {
@@ -3749,6 +3756,9 @@ fn real_wayland_proxy_hands_the_application_a_smaller_registry() {
         inside.len()
     ));
     for name in bubbler_core::wayland::PRIVILEGED {
+        if CONTEXT_OFFERS_ANYWAY.contains(name) {
+            continue;
+        }
         assert!(
             !inside.iter().any(|g| g == name),
             "{name} reached the sandbox"

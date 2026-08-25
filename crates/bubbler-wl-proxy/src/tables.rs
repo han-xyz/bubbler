@@ -113,9 +113,72 @@ pub fn by_index(index: usize) -> Option<&'static Interface> {
     INTERFACES.get(index)
 }
 
+/// The globals the fallback denylist lets a sandbox bind: every interface in
+/// [`INTERFACES`] that no other interface's `new_id` creates and that the
+/// `PRIVILEGED` denylist does not hide. Ordinary application protocols — the
+/// client's own surfaces, buffers, input and windows — the two legacy shells,
+/// and `wl_display`, which nothing creates either and which object 1 always
+/// is.
+///
+/// Written down so a `wayrs-protocols` bump cannot quietly widen what the
+/// fallback path offers. A global in neither list fails
+/// `every_bindable_global_is_denied_or_written_down`, and that failure is the
+/// moment someone decides whether the new protocol is privileged.
+pub const ALLOWED_GLOBALS: &[&str] = &[
+    "ext_background_effect_manager_v1",
+    "wl_compositor",
+    "wl_data_device_manager",
+    "wl_display",
+    "wl_output",
+    "wl_seat",
+    "wl_shell",
+    "wl_shm",
+    "wl_subcompositor",
+    "wp_alpha_modifier_v1",
+    "wp_color_manager_v1",
+    "wp_color_representation_manager_v1",
+    "wp_commit_timing_manager_v1",
+    "wp_cursor_shape_manager_v1",
+    "wp_fifo_manager_v1",
+    "wp_fractional_scale_manager_v1",
+    "wp_linux_drm_syncobj_manager_v1",
+    "wp_presentation",
+    "wp_single_pixel_buffer_manager_v1",
+    "wp_tearing_control_manager_v1",
+    "wp_viewporter",
+    "xdg_activation_v1",
+    "xdg_system_bell_v1",
+    "xdg_toplevel_drag_manager_v1",
+    "xdg_toplevel_icon_manager_v1",
+    "xdg_toplevel_tag_manager_v1",
+    "xdg_wm_base",
+    "xdg_wm_dialog_v1",
+    "xx_session_manager_v1",
+    "zwp_idle_inhibit_manager_v1",
+    "zwp_input_timestamps_manager_v1",
+    "zwp_keyboard_shortcuts_inhibit_manager_v1",
+    "zwp_linux_dmabuf_v1",
+    "zwp_linux_explicit_synchronization_v1",
+    "zwp_pointer_constraints_v1",
+    "zwp_pointer_gestures_v1",
+    "zwp_primary_selection_device_manager_v1",
+    "zwp_relative_pointer_manager_v1",
+    "zwp_tablet_manager_v1",
+    "zwp_tablet_manager_v2",
+    "zwp_text_input_manager_v1",
+    "zwp_text_input_manager_v3",
+    "zxdg_decoration_manager_v1",
+    "zxdg_exporter_v1",
+    "zxdg_exporter_v2",
+    "zxdg_importer_v1",
+    "zxdg_importer_v2",
+    "zxdg_shell_v6",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::PRIVILEGED;
 
     #[test]
     fn the_table_is_sorted_so_a_lookup_is_a_binary_search() {
@@ -207,6 +270,50 @@ mod tests {
             listener.args.iter().filter(|a| **a == ArgKind::Fd).count(),
             2
         );
+    }
+
+    /// An interface no other interface creates is one a client binds straight
+    /// off the registry, so on the fallback path it is either hidden or handed
+    /// over. Both lists are held against the generated tables here: a bump of
+    /// the protocol XML that brings a new global fails this test rather than
+    /// offering it to every sandbox.
+    #[test]
+    fn every_bindable_global_is_denied_or_written_down() {
+        let mut sorted = ALLOWED_GLOBALS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(sorted.as_slice(), ALLOWED_GLOBALS, "not sorted");
+        sorted.dedup();
+        assert_eq!(sorted.len(), ALLOWED_GLOBALS.len(), "a name appears twice");
+
+        let created: std::collections::HashSet<&str> = INTERFACES
+            .iter()
+            .flat_map(|iface| iface.requests.iter().chain(iface.events))
+            .filter_map(|msg| msg.new_id_interface)
+            .collect();
+        let globals: Vec<&str> = INTERFACES
+            .iter()
+            .map(|iface| iface.name)
+            .filter(|name| !created.contains(name))
+            .collect();
+        assert!(globals.len() > 50, "only {} globals", globals.len());
+        for name in &globals {
+            let hidden = PRIVILEGED.binary_search(name).is_ok();
+            let allowed = ALLOWED_GLOBALS.binary_search(name).is_ok();
+            assert!(
+                hidden || allowed,
+                "{name} is a global the tables describe and neither list \
+                 mentions: hide it in PRIVILEGED or write it into ALLOWED_GLOBALS"
+            );
+            assert!(!(hidden && allowed), "{name} is in both lists");
+        }
+        // The other direction: a protocol the XML dropped or renamed leaves a
+        // name here that says a decision was made about nothing.
+        for name in ALLOWED_GLOBALS {
+            assert!(
+                globals.contains(name),
+                "{name} is no longer a global of the tables"
+            );
+        }
     }
 
     #[test]

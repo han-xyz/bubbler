@@ -100,12 +100,14 @@ application. A bare `x11`'s Xwayland is an ordinary client of the same socket,
 decoded and gated like anything else inside.
 
 A compositor that implements none of this gets the session socket as the
-proxy's upstream — the proxy then hides 39 privileged interfaces itself, a
+proxy's upstream — the proxy then hides 40 privileged interfaces itself, a
 denylist of bubbler's own: the 31 Hyprland withholds from a security-context
-client, plus the protocols of that kind other compositors implement, found by
-reading every interface the proxy's tables describe. Being a denylist and not
-the whole class of privileged protocols, a protocol nobody has written into it
-reaches the sandbox on this path. The fallback is announced once per launch:
+client, plus nine of the same class found by reading every global the proxy's
+tables describe. Being a denylist and not the whole class of privileged
+protocols, a protocol nobody has written into it reaches the sandbox on this
+path; what it does let through is written down beside it, so a protocol bump
+that brings a new global fails a test. The fallback is announced once per
+launch:
 
 ```
 bubbler: note: wayland: no wp_security_context_manager_v1; the proxy hides the privileged globals instead

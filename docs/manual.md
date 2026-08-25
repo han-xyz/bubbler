@@ -520,7 +520,7 @@ sway a denylist of what it may not — so the security context is worth what the
 compositor implements, and bubbler attaches the metadata and nothing else. What
 the proxy withholds on top of that is bubbler's: every global whose interface
 its tables cannot describe, on either path, and on a compositor with no
-`wp_security_context_manager_v1` a denylist of 39 privileged interface names,
+`wp_security_context_manager_v1` a denylist of 40 privileged interface names,
 applied in the compositor's place. Both are described below.
 
 Measured here on Hyprland 0.56.2: `wayland-info` counted 73 globals over 71
@@ -735,18 +735,19 @@ and the launcher says so once per launch.
 
     bubbler: note: wayland: no wp_security_context_manager_v1; the proxy hides the privileged globals instead
 
-On that path the proxy adds a denylist of its own: 39 interface names — screen
+On that path the proxy adds a denylist of its own: 40 interface names — screen
 capture and export-dmabuf, both data-control managers, virtual keyboard and
 pointer, the input-method protocols, the input-inhibit and Xwayland keyboard
 grabs, transient seats, layer-shell, foreign-toplevel and workspace listing,
-session lock, global shortcuts, gamma and output control, and the security
-context manager itself. The 31 names Hyprland withholds from a security-context
-client are where it started; the rest came from reading every interface the
-proxy's tables describe, for the protocols of that kind other compositors
-implement. It stays a denylist and not "the class of privileged protocols": one
+idle notification, session lock, global shortcuts, gamma and output control,
+and the security context manager itself. The 31 names Hyprland withholds from a
+security-context client are where it started; the other nine came from reading
+every global the proxy's tables describe against the same class — protocols
+another compositor implements, or that Hyprland hands a sandboxed client
+anyway. It stays a denylist and not "the class of privileged protocols": one
 nobody has written into it is advertised to the sandbox on this path, and a line
 in `PRIVILEGED` is the only thing that hides it. The sidecar line of an
-explanation gains `, hides 39 privileged globals` on that path, which is the
+explanation gains `, hides 40 privileged globals` on that path, which is the
 length of the denylist and not a count of what a given compositor offers — an
 explanation never probes, so one printed from the command line always describes
 the security-context path.

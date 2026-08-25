@@ -750,7 +750,7 @@ bwrap
             (
                 wayland::ProxyPlan::fallback(dir, session, Clipboard::Open),
                 "    sidecar: bubbler-wl-proxy listener \
-                 /run/user/1000/bubbler/t/wayland → upstream /run/user/1000/wayland-1, gate open, hides 39 privileged globals",
+                 /run/user/1000/bubbler/t/wayland → upstream /run/user/1000/wayland-1, gate open, hides 40 privileged globals",
             ),
         ] {
             let cfg = cfg("wayland\ncommand \"true\"");
