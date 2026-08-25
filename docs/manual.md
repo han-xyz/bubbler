@@ -2024,9 +2024,12 @@ archwiki IBus "Integration" gives `GTK_IM_MODULE=wayland`, `QT_IM_MODULE=ibus`
 and `XMODIFIERS=@im=ibus` for a Wayland session, and `GTK_IM_MODULE=ibus` with
 the same two for X11. `env` is emitted after every variable a grant sets, so a
 profile layers these on top. `AT_SPI_BUS_ADDRESS` and `IBUS_USE_PORTAL` are
-refused there like the two bus addresses: what the grant points them at is the
-only socket of that kind the sandbox has, so a config setting them could only
-aim a client away from it, at a path with nothing bound.
+refused there like the two bus addresses: the address names the only
+accessibility socket the sandbox has, and the flag is what makes an IBus
+client look for the portal name at all, so a config setting either could only
+aim a client away from what the grant provides. That also means `input-method`
+is the one way to reach the IBus portal: a hand-written `talk` rule with
+`env IBUS_USE_PORTAL="1"` is a parse error.
 
 ## Terminal
 
