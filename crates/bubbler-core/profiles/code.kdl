@@ -21,11 +21,6 @@
 // extension will not work, and git over SSH needs a key in the private
 // home rather than your agent.
 //
-// `talk "org.freedesktop.secrets"` is the Secret Storage API extensions
-// keep their tokens in. It has no per-application partitioning, so VS
-// Code can read every secret in the login keyring through it; drop the
-// rule if you would rather it could not.
-//
 // A checkout outside the home is named explicitly, e.g.
 //     path-share "/kioxia/src" mode=rw
 //
@@ -35,14 +30,23 @@
 // `network { allow-port 3000 }` to publish a port of the sandbox on the
 // host's loopback — the server inside must listen on 0.0.0.0, not on its
 // own loopback — or write `network "host"` to share the host's stack.
-lint-allow "secrets-access" reason="extensions keep their tokens in the Secret Storage API, which is this bus name"
+//
+// Bare by design. Add:
+//   dbus {
+//       talk "org.freedesktop.secrets"
+//   }
+//   lint-allow "secrets-access" reason="extensions keep their tokens in the Secret Storage API, which is this bus name"
+//     — the Secret Storage API extensions keep their tokens in. Without
+//       it an extension that signs in asks again every start. It has no
+//       per-application partitioning, so the rule also lets VS Code read
+//       every other secret in the login keyring.
+//   notify
+//     — desktop notifications, the ones an extension or an update raises.
+//       Needs `dbus`.
 wayland
 dri
 network
-dbus {
-    talk "org.freedesktop.secrets"
-}
+dbus
 portals
-notify
 home-share "Projects" mode=rw
 command "code"

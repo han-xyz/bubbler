@@ -9,29 +9,30 @@
 // is unrelated to the ptys kitty makes for its own children; `tty "none"`
 // is a reasonable setting for a GUI launch.
 //
-// `dbus` and `portals` are not decoration: without them kitty's
-// org.freedesktop.portal.Settings read is refused and it cannot follow
-// the desktop colour scheme (measured). It still starts either way.
-//
-// kitty logs `Could not move child process into a systemd scope` per child:
-// that is its StartTransientUnit call on org.freedesktop.systemd1, a name
-// the proxy does not carry. Harmless — the child runs anyway — and a `talk`
-// for it would let the sandbox start user units outside the sandbox.
-//
 // Never share kitty's remote-control socket out of the sandbox. `kitten @`
 // includes `launch`, so a reachable socket is command execution across
 // the boundary, in whichever direction it was shared.
 //
-// No `network`. The only part of kitty that wants one is the update
-// check, which swallows the failure and reports version 0.0.0, so it
-// degrades silently rather than stopping anything.
-//
 // A shell inside this sandbox sees only the private home. Share what you
 // want to work on, e.g.
 //     home-share "Projects" mode=rw
+//
+// Bare by design. Add:
+//   dbus
+//   portals
+//     — kitty's org.freedesktop.portal.Settings read, without which it
+//       cannot follow the desktop colour scheme (measured). It starts
+//       either way. With `dbus` in place kitty also logs `Could not move
+//       child process into a systemd scope` per child: that is its
+//       StartTransientUnit call on org.freedesktop.systemd1, a name the
+//       proxy does not carry. Harmless, and a `talk` for it would let the
+//       sandbox start user units outside the sandbox.
+//   notify
+//     — desktop notifications, kitty's own and any a program inside sends
+//       through it. Needs `dbus`.
+//   network
+//     — the only part of kitty that wants one is the update check, which
+//       swallows the failure and reports version 0.0.0.
 wayland
 dri
-dbus
-portals
-notify
 command "kitty"

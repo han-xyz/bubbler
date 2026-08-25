@@ -8,47 +8,61 @@
 // bubbler starts by default has no window manager, which is what a game
 // that maps and resizes its own windows expects.
 //
+// Sound is `pulseaudio`. The grant binds $XDG_RUNTIME_DIR/pulse/native —
+// the socket PipeWire's pulse server holds on a PipeWire host — and sets
+// PULSE_SERVER to it, which is the path a libpulse client takes, as Wine
+// and the Proton runtimes are. That socket carries capture as well as
+// playback, so it is the microphone too. Not measured here: if a game is
+// silent, add `pipewire` beside it.
+//
 // umu, Proton and DXVK's 32-bit path make i386 syscalls; the default
 // filter carries i386 as well as x86_64, so they are filtered rather than
 // killed. Never add `userns "disable"` — those runtimes nest
 // pressure-vessel's own bubblewrap.
-//
-// GameMode is optional on the host: the D-Bus name below simply resolves
-// to nothing when gamemoded is not installed.
-//
-// `portals` stays because Lutris calls them itself. Not measured here: a
-// Proton or umu game brings pressure-vessel, the same steam-runtime-tools
-// that refuses to run where /.flatpak-info exists (see `steam`), so drop
-// the grant if a game stops with a Flatpak complaint.
-//
-// The system bus grants UDisks2 enumeration only: `see` plus the one
-// ObjectManager call Wine builds its drive list from. `talk` would reach
-// loop setup, mount and LUKS unlock, which polkit judges as the user.
 //
 // ~/Games is Lutris's own convention for the install directory, and a
 // missing share source is an error rather than a skipped bind, so create
 // it (`mkdir ~/Games`) or edit the node to the directory you use. A prefix
 // or library outside the home is named explicitly, e.g.
 //   path-share "/kioxia/Games" mode=rw
+//
+// Bare by design. Add:
+//   dbus {
+//       own "net.lutris.Lutris"
+//       talk "com.feralinteractive.GameMode"
+//       talk "org.freedesktop.ScreenSaver"
+//   }
+//     — Lutris's own name (a second `lutris` and the lutris:// handler
+//       reach the running one through it), the GameMode daemon, which
+//       simply resolves to nothing where gamemoded is not installed, and
+//       the screensaver blocker a running game holds.
+//   portals
+//     — Lutris calls the portals itself, for the file chooser among other
+//       things. Not measured: a Proton or umu game brings
+//       pressure-vessel, the same steam-runtime-tools that refuses to run
+//       where /.flatpak-info exists (see `steam`), so this grant is also
+//       what to drop first if a game stops with a Flatpak complaint.
+//       Needs `dbus`.
+//   system-bus {
+//       see "org.freedesktop.UDisks2"
+//       call "org.freedesktop.UDisks2=org.freedesktop.DBus.ObjectManager.GetManagedObjects@/org/freedesktop/UDisks2"
+//   }
+//     — the drive list Wine builds from UDisks2: `see` plus that one
+//       ObjectManager call, and no more. A `talk` there would reach loop
+//       setup, mount and LUKS unlock, which polkit judges as you.
+//   notify
+//     — install and download notifications. Needs `dbus`.
+//   tray
+//     — the tray icon. Needs `dbus`.
+//   pipewire
+//     — a game speaking PipeWire itself, and the screen-share portal.
 lint-allow "x11-without-reason" reason="Wine and Proton games are X11 clients that want a window manager; a nested x11 with wm= is the alternative"
 wayland
 x11 "host"
 dri
-pipewire
+pulseaudio
 network
-dbus {
-    own "net.lutris.Lutris"
-    talk "com.feralinteractive.GameMode"
-    talk "org.freedesktop.ScreenSaver"
-}
-portals
-notify
-tray
 gamepad
-system-bus {
-    see "org.freedesktop.UDisks2"
-    call "org.freedesktop.UDisks2=org.freedesktop.DBus.ObjectManager.GetManagedObjects@/org/freedesktop/UDisks2"
-}
 home-share "Games" mode=rw
 desktop "net.lutris.Lutris.desktop"
 command "lutris"

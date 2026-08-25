@@ -8,6 +8,14 @@
 // exactly that forwarding: an X11 client can keylog and inject into every
 // other X11 client, Xwayland included.
 //
+// Sound is `pulseaudio`. The grant binds $XDG_RUNTIME_DIR/pulse/native —
+// the socket PipeWire's pulse server holds on a PipeWire host — and sets
+// PULSE_SERVER to it, which is the path a libpulse client takes; the
+// client's CEF layer and the runtime it downloads are libpulse clients.
+// That socket carries capture as well as playback, so it is the
+// microphone too. Not measured here, because the client fetches its own
+// runtime on first run: if a game is silent, add `pipewire` beside it.
+//
 // The default filter covers i386 as well as x86_64, so the 32-bit client
 // and its games are filtered rather than killed, and `modify_ldt` stays
 // allowed for the 16-bit and Wine code that needs it. Measured: the
@@ -23,10 +31,6 @@
 // service and exits 71, so steam.sh stops before the client starts
 // (measured). Steam brings its own file browser; a path outside the
 // private home is shared below instead.
-//
-// UDisks2 is `see` plus the one ObjectManager call Wine enumerates
-// drives with. `talk` would reach every UDisks2 method — loop setup,
-// mount, LUKS unlock — and polkit judges the proxy as the user.
 //
 // Steam builds its own ~/.steam and ~/.local/share/Steam in the private
 // home on first run. The host's are not shared, because ~/.steam is a
@@ -47,24 +51,39 @@
 // crosses it; `network "host"` brings them back, and hands Steam every
 // service on the host's loopback and every host abstract unix socket
 // along with them.
+//
+// Bare by design. Add:
+//   dbus {
+//       own "com.steampowered.*"
+//       talk "org.freedesktop.ScreenSaver"
+//       talk "org.freedesktop.PowerManagement"
+//   }
+//   lint-allow "own-too-wide" reason="com.steampowered.* is Steam's own name space, and the client claims several names under it"
+//     — the names the client claims for itself (steam:// URL handling
+//       among them) and the two power-save blockers it holds while a game
+//       runs.
+//   system-bus {
+//       talk "org.freedesktop.UPower"
+//       see "org.freedesktop.UDisks2"
+//       call "org.freedesktop.UDisks2=org.freedesktop.DBus.ObjectManager.GetManagedObjects@/org/freedesktop/UDisks2"
+//   }
+//     — the power state the client reads from UPower, and the drive list
+//       Wine builds from UDisks2: `see` plus that one call, and
+//       no more. A `talk` there would reach loop setup, mount and LUKS
+//       unlock, which polkit judges as you.
+//   notify
+//     — the friend and download notifications. Needs `dbus`.
+//   tray
+//     — the tray icon, and with it the client's "minimise to tray".
+//       Needs `dbus`.
+//   pipewire
+//     — a game or the client speaking PipeWire itself, and the
+//       screen-share portal, which `portals` above rules out anyway.
 lint-allow "x11-without-reason" reason="steamwebhelper is an X11/CEF client with many windows; a nested x11 needs a wm= naming a window manager this host has"
-lint-allow "own-too-wide" reason="com.steampowered.* is Steam's own name space, and the client claims several names under it"
 wayland
 x11 "host"
 dri
-pipewire
+pulseaudio
 network
-dbus {
-    own "com.steampowered.*"
-    talk "org.freedesktop.ScreenSaver"
-    talk "org.freedesktop.PowerManagement"
-}
-notify
-tray
 gamepad
-system-bus {
-    talk "org.freedesktop.UPower"
-    see "org.freedesktop.UDisks2"
-    call "org.freedesktop.UDisks2=org.freedesktop.DBus.ObjectManager.GetManagedObjects@/org/freedesktop/UDisks2"
-}
 command "steam"

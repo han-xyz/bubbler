@@ -107,7 +107,7 @@ fn create_list_and_dry_run() {
 }
 
 #[test]
-fn profiles_lists_builtins_and_firefox_seeds_gpu_and_its_bus_name() {
+fn profiles_lists_builtins_and_firefox_seeds_gpu_and_its_downloads_share() {
     let tmp = setup();
     let out = bubbler(tmp.path()).arg("profiles").output().unwrap();
     assert!(
@@ -133,9 +133,13 @@ fn profiles_lists_builtins_and_firefox_seeds_gpu_and_its_bus_name() {
         std::fs::read_to_string(tmp.path().join("data/bubbler/instances/ff/config.kdl")).unwrap();
     assert!(cfg.starts_with("// bubbler profile: firefox\n"), "{cfg}");
     assert!(
-        cfg.contains("dri\n") && cfg.contains("own \"org.mozilla.firefox.*\""),
+        cfg.contains("dri\n") && cfg.contains("home-share \"Downloads\" mode=rw\n"),
         "{cfg}"
     );
+    // The profile is bare: the bus name a second `firefox` reaches the
+    // running one through is an opt-in its header spells out, not a grant
+    // every instance starts with.
+    assert!(!cfg.contains("org.mozilla.firefox"), "{cfg}");
 }
 
 /// Write `text` as profile `name` in one of the layers under `root`.
@@ -195,7 +199,7 @@ fn a_user_profile_including_the_built_in_seeds_the_union() {
         tmp.path(),
         "user",
         "libreoffice",
-        "include \"libreoffice\"\nx11\nenv SAL_USE_VCLPLUGIN=\"qt6\"\n",
+        "include \"libreoffice\"\nx11\ndri\nenv SAL_USE_VCLPLUGIN=\"qt6\"\n",
     );
     let out = bubbler(tmp.path())
         .args(["create", "lo", "--profile", "libreoffice"])
@@ -208,10 +212,12 @@ fn a_user_profile_including_the_built_in_seeds_the_union() {
     );
     let cfg =
         std::fs::read_to_string(tmp.path().join("data/bubbler/instances/lo/config.kdl")).unwrap();
-    // The built-in's grants, the user layer's extra one, and its override
-    // of one key rather than a second `env` node for it.
+    // The built-in's grants, the user layer's extra ones — a nested X
+    // server takes `dri` with it — and its override of one key rather
+    // than a second `env` node for it.
     assert!(cfg.contains("\nwayland\n"), "{cfg}");
     assert!(cfg.contains("\nx11\n"), "{cfg}");
+    assert!(cfg.contains("\ndri\n"), "{cfg}");
     assert!(cfg.contains("env SAL_USE_VCLPLUGIN=\"qt6\"\n"), "{cfg}");
     assert!(!cfg.contains("gtk3"), "{cfg}");
 }

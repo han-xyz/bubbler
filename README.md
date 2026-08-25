@@ -44,13 +44,11 @@ with commented examples to start from. Full list: [Commands](docs/wiki/Commands.
     // bubbler profile: firefox
     wayland                          // security-context socket, proxied; "host" for the session's
     dri
-    pipewire
+    pulseaudio                       // pulse/native; `pipewire` binds the native socket instead
     network                          // own namespace via pasta; "host" for the host's
     home-share "Downloads" mode=rw
-    dbus { own "org.mozilla.firefox.*" }
+    dbus                             // the session bus through a filtering sidecar
     portals
-    notify
-    mpris name="firefox.*"
     command "firefox"
 
 Every grant is one node; unknown nodes are errors; a share whose source is
@@ -70,6 +68,11 @@ Reference: [Configuration](docs/wiki/Configuration.md).
 
     alacritty  chromium  code  firefox  generic  keepassxc  kitty
     libreoffice  lutris  mpv  spotify  steam  thunderbird  vesktop
+
+Each ships what its application needs to *run* and nothing else; everything it
+can also be given — a tray icon, notifications, media keys, screen sharing, a
+browser rendezvous — is written out in the profile's own header comment, as the
+node to paste in and what it hands over.
 
 Three layers — `~/.config/bubbler/profiles/`, `/usr/share/bubbler/profiles/`,
 built-in — and `bubbler profile edit firefox` starts your layer as

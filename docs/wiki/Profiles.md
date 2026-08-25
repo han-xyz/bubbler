@@ -12,25 +12,40 @@ built-in                                  compiled into bubbler
 
 ## Built-in profiles
 
+Every profile carries what the application needs to *run* and nothing else.
+Whatever else it can be given — a bus, notifications, a tray icon, screen
+sharing, a browser rendezvous — is listed in the profile's own header comment,
+node for node, ready to paste in (`bubbler profile edit <name>`). Read the
+header before adding one: each entry says what the grant buys and what it hands
+over.
+
 Wayland-first; only the two gaming profiles grant `x11`, and both take the
 `"host"` mode. `~/name` is a `home-share`, read-only unless `rw`.
 
 | Profile | Grants |
 |---|---|
 | `alacritty` | wayland |
-| `chromium` | wayland dri pipewire network dbus portals notify, ~/Downloads rw |
-| `code` | wayland dri network dbus portals notify, ~/Projects rw |
-| `firefox` | wayland dri pipewire pulseaudio network dbus portals notify mpris, ~/Downloads rw |
+| `chromium` | wayland dri pulseaudio network dbus portals, ~/Downloads rw |
+| `code` | wayland dri network dbus portals, ~/Projects rw |
+| `firefox` | wayland dri pulseaudio network dbus portals, ~/Downloads rw |
 | `generic` | nothing beyond the baseline (commented examples to start from) |
-| `keepassxc` | wayland dbus portals notify tray app-runtime rw, ~/Documents rw |
-| `kitty` | wayland dri dbus portals notify |
-| `libreoffice` | wayland dri dbus portals, ~/Documents rw, `SAL_USE_VCLPLUGIN=gtk3` |
-| `lutris` | wayland `x11 "host"` dri pipewire network dbus portals notify tray gamepad system-bus, ~/Games rw |
+| `keepassxc` | wayland, ~/Documents rw |
+| `kitty` | wayland dri |
+| `libreoffice` | wayland, ~/Documents rw, `SAL_USE_VCLPLUGIN=gtk3` |
+| `lutris` | wayland `x11 "host"` dri pulseaudio network gamepad, ~/Games rw |
 | `mpv` | wayland dri pipewire, ~/Videos |
-| `spotify` | wayland dri pipewire network dbus notify tray mpris |
-| `steam` | wayland `x11 "host"` dri pipewire network dbus notify tray gamepad system-bus |
-| `thunderbird` | wayland network dri dbus portals notify, ~/Downloads rw |
-| `vesktop` | wayland dri pipewire network dbus portals notify tray, ~/Downloads rw |
+| `spotify` | wayland dri pulseaudio network |
+| `steam` | wayland `x11 "host"` dri pulseaudio network gamepad |
+| `thunderbird` | wayland network, ~/Downloads rw |
+| `vesktop` | wayland dri pulseaudio network |
+
+**Sound is `pulseaudio` almost everywhere.** Firefox and Chromium list
+`libpulse` in their Arch dependencies, and Spotify, Electron applications and
+CEF ones open `libpulse.so.0` themselves; that grant binds
+`$XDG_RUNTIME_DIR/pulse/native`, which PipeWire's pulse server holds on a
+PipeWire host. `pipewire` binds `pipewire-0`, the native socket — what a client
+that speaks PipeWire itself takes (`mpv`), and what the portal hands a screen
+or camera stream over. Either socket carries capture as well as playback.
 
 Notes worth knowing:
 
@@ -42,7 +57,12 @@ Notes worth knowing:
   A library outside the home needs a `path-share` (commented example in the
   profile). Steam Input's virtual controllers need `gamepad hidraw=#true
   uinput=#true` — read [Devices](Devices.md) first.
-- **lutris**: keeps `portals`; drop it if a Proton/umu game complains about Flatpak.
+- **steam and lutris**: neither reaches a bus. The names each client claims,
+  the GameMode and screensaver rules, and the UDisks2 enumeration Wine builds
+  its drive list from (`see` plus one `GetManagedObjects` call, never `talk`)
+  are opt-ins in the two headers. `lutris` also lists `portals`, which Lutris
+  itself calls — a Proton or umu game may then hit the same Flatpak complaint
+  `steam` avoids.
 - **steam and lutris**: both write `x11 "host"` and a `lint-allow` saying why —
   steamwebhelper opens many windows and Wine's X11 driver wants a real window
   manager, and a bare `x11` starts a server with none. That is the weak point of
@@ -51,9 +71,10 @@ Notes worth knowing:
   `x11 geometry="2560x1440" wm="openbox"` (with `openbox` installed) is worth
   trying in place of it, as is `x11 fullscreen=#true grab=#true` for a single
   fullscreen game; see [Security](Security.md#x11).
-- **keepassxc**: no `network`, no `own "org.freedesktop.secrets"`, no `hidraw`;
-  each omission is a comment saying how to add it back. Browser integration
-  via `app-runtime` — see [Sharing Files](Sharing-Files.md).
+- **keepassxc**: a display and `~/Documents`, nothing more — no network, no bus
+  name, no `hidraw`. Browser integration is the `app-runtime` opt-in its header
+  spells out, with the matching read-only line in `firefox` and `chromium`; see
+  [Sharing Files](Sharing-Files.md).
 - **chromium / code / vesktop**: keep their own nested namespace sandbox; no
   `--no-sandbox`, no `userns "disable"`.
 - **firefox / thunderbird**: Wayland by default; `env MOZ_ENABLE_WAYLAND="0"` for Xwayland.

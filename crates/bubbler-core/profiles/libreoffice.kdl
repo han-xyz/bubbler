@@ -1,8 +1,25 @@
 // bubbler profile: libreoffice
+//
+// SAL_USE_VCLPLUGIN is set because bubbler clears the environment, which
+// leaves LibreOffice's VCL plugin to an autodetection with nothing to go
+// on.
+//
+// Documents live in ~/Documents and in the private home. A directory on
+// another disk is named explicitly, e.g.
+//     path-share "/kioxia/docs" mode=rw
+//
+// Bare by design. Add:
+//   dri
+//     — the GPU. Without it LibreOffice draws in software, which is what
+//       it did by default for most of its life.
+//   dbus
+//   portals
+//     — the file chooser that reaches outside the shared directories: the
+//       portal runs it on the host and exports what you pick into this
+//       instance's document view, and the path it hands back opens there.
+//       Without them the chooser is the one inside the sandbox and sees
+//       the private home and ~/Documents.
 wayland
-dri
-dbus
-portals
 home-share "Documents" mode=rw
 env SAL_USE_VCLPLUGIN="gtk3"
 // The start centre, not one of the seven per-document entries that run

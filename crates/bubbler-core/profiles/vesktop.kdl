@@ -1,19 +1,34 @@
 // bubbler profile: vesktop
 //
-// ~/Downloads is what an attachment is dragged out to or saved into;
-// flathub grants the same directory for exactly that. Pictures and
-// Videos stay out — sending a file is the portal file chooser's job.
+// Sound is `pulseaudio`: Vesktop is Electron, whose audio backend opens
+// libpulse.so.0 (the string is in /usr/lib/electron40/electron), and the
+// socket that grant binds is the one it looks for, for the microphone in
+// a call as well as for playback. `pipewire` binds only pipewire-0, the
+// native socket, which Electron uses for screen capture rather than for
+// sound.
 //
 // Extra Electron flags go in the private home's vesktop-flags.conf,
 // which /usr/bin/vesktop reads from $XDG_CONFIG_HOME. That wrapper also
 // sets ELECTRON_OZONE_PLATFORM_HINT itself, so no `env` node here does.
+//
+// Bare by design. Add:
+//   dbus
+//   portals
+//     — the file chooser for sending a file, and the source picker for
+//       screen sharing.
+//   pipewire
+//     — screen and window sharing in a call: the portal picks the source
+//       and hands the stream over PipeWire, so both grants are needed.
+//   home-share "Downloads" mode=rw
+//     — where an attachment is dragged out to or saved into. Sending a
+//       file is the portal file chooser's job, so Pictures and Videos
+//       need no share of their own.
+//   notify
+//     — message notifications. Needs `dbus`.
+//   tray
+//     — the tray icon, and with it "close to tray". Needs `dbus`.
 wayland
 dri
-pipewire
+pulseaudio
 network
-dbus
-portals
-notify
-tray
-home-share "Downloads" mode=rw
 command "vesktop"

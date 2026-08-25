@@ -68,8 +68,11 @@ naming the same id, Discord rich presence (those sockets live at the top of
 
 ### KeePassXC-Browser, both sides sandboxed
 
-1. `keepassxc` already grants the id `mode=rw`; in the browser instance
-   uncomment the `app-runtime "org.keepassxc.KeePassXC"` line (`bubbler edit ff`).
+1. Grant the id on both sides — no shipped profile does, and both headers
+   list the line to paste: `app-runtime "org.keepassxc.KeePassXC" mode=rw`
+   with `lint-allow "app-runtime-rw"` in the KeePassXC instance
+   (`bubbler edit kp`), the read-only line in the browser's
+   (`bubbler edit ff`).
 2. Put the native messaging manifest in the browser's private home:
    `~/.local/share/bubbler/instances/ff/home/.mozilla/native-messaging-hosts/org.keepassxc.keepassxc_browser.json`
    (Chromium: `…/home/.config/chromium/NativeMessagingHosts/`):

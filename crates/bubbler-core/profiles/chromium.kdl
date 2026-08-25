@@ -1,20 +1,33 @@
 // bubbler profile: chromium
 //
-// For KeePassXC browser integration, uncomment the line below and
-// grant the same id to `keepassxc` (it ships it already). Read-only
-// is enough: this side only connects to the socket KeePassXC serves.
-//   app-runtime "org.keepassxc.KeePassXC"
+// Sound is `pulseaudio`: Chromium is a libpulse client (`libpulse` is in
+// the Arch package's Depends) and reaches the server through
+// $XDG_RUNTIME_DIR/pulse/native, which is what that grant binds.
+// `pipewire` binds only pipewire-0, the native socket, and is what the
+// screen-share portal hands frames over. Either socket carries capture
+// as well as playback: this is the microphone too.
 //
 // `network` is the sandbox's own network namespace. Chromecast discovery
 // is mDNS on the LAN and pasta does not bridge, so casting does not find
 // anything; `network "host"` brings it back, together with every service
 // on the host's loopback.
+//
+// Bare by design. Add:
+//   pipewire
+//     — screen and window sharing: the portal picks the source and hands
+//       the stream over PipeWire, so both grants are needed.
+//   notify
+//     — desktop notifications a page asks for. Needs `dbus`.
+//   app-runtime "org.keepassxc.KeePassXC"
+//     — KeePassXC browser integration. Grant the same id in the
+//       `keepassxc` instance (it lists the line in its own header).
+//       Read-only is enough: this side only connects to the socket
+//       KeePassXC serves.
 wayland
 dri
-pipewire
+pulseaudio
 network
 dbus
 portals
-notify
 home-share "Downloads" mode=rw
 command "chromium"

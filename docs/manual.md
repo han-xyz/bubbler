@@ -1096,7 +1096,7 @@ installed, and computes that path from `$XDG_RUNTIME_DIR` at both ends. So a
 sandboxed KeePassXC and a browser — in its own instance or on the host — meet
 there:
 
-    # keepassxc's config.kdl (the built-in profile ships this)
+    # keepassxc's config.kdl (its profile lists the line in the header)
     app-runtime "org.keepassxc.KeePassXC" mode=rw
     # the browser's, on the other side
     app-runtime "org.keepassxc.KeePassXC"
@@ -1146,10 +1146,12 @@ that speaks to it. That is one file, and nothing in bubbler writes it for you,
 because KeePassXC's own installer writes into *its* private home rather than
 the browser's.
 
-Grant the id on both sides — `keepassxc` ships
-`app-runtime "org.keepassxc.KeePassXC" mode=rw` already, and `firefox` and
-`chromium` carry the read-only line commented out, so uncomment it (or run
-`bubbler edit firefox` and add it):
+Grant the id on both sides. No shipped profile carries it, because a password
+manager and a browser each run without it: `keepassxc`'s header lists
+`app-runtime "org.keepassxc.KeePassXC" mode=rw` with the `lint-allow
+"app-runtime-rw"` that goes with it, `firefox` and `chromium` list the
+read-only line, and each is pasted into that instance's config
+(`bubbler edit kp`, `bubbler edit ff`) or into your own profile layer:
 
     app-runtime "org.keepassxc.KeePassXC"
 
@@ -1520,24 +1522,45 @@ changes an instance that was already seeded from it.
 
 ### Built-in profiles
 
+Every profile carries what its application needs to *run* and nothing beyond
+that. A bus, notifications, a tray icon, screen sharing, media keys, a browser
+rendezvous — each is written out in the profile's own header comment, as the
+node to paste in, with what it buys and what it hands over. So the shipped set
+is the floor, `bubbler profile edit <name>` is where you raise it, and nothing
+is granted because an application "usually" wants it.
+
 Every one is Wayland-first; only the two gaming profiles grant `x11`, and both
 ask for the session's display with `x11 "host"`. `~/name` below is a
 `home-share`, read-only unless it says `rw`.
 
     alacritty     wayland
-    chromium      wayland dri pipewire network dbus portals notify, ~/Downloads rw
-    code          wayland dri network dbus portals notify, ~/Projects rw
-    firefox       wayland dri pipewire pulseaudio network dbus portals notify mpris, ~/Downloads rw
+    chromium      wayland dri pulseaudio network dbus portals, ~/Downloads rw
+    code          wayland dri network dbus portals, ~/Projects rw
+    firefox       wayland dri pulseaudio network dbus portals, ~/Downloads rw
     generic       nothing beyond the baseline
-    keepassxc     wayland dbus portals notify tray app-runtime rw, ~/Documents rw
-    kitty         wayland dri dbus portals notify
-    libreoffice   wayland dri dbus portals, ~/Documents rw, SAL_USE_VCLPLUGIN=gtk3
-    lutris        wayland x11 "host" dri pipewire network dbus portals notify tray gamepad system-bus, ~/Games rw
+    keepassxc     wayland, ~/Documents rw
+    kitty         wayland dri
+    libreoffice   wayland, ~/Documents rw, SAL_USE_VCLPLUGIN=gtk3
+    lutris        wayland x11 "host" dri pulseaudio network gamepad, ~/Games rw
     mpv           wayland dri pipewire, ~/Videos
-    spotify       wayland dri pipewire network dbus notify tray mpris
-    steam         wayland x11 "host" dri pipewire network dbus notify tray gamepad system-bus
-    thunderbird   wayland network dri dbus portals notify, ~/Downloads rw
-    vesktop       wayland dri pipewire network dbus portals notify tray, ~/Downloads rw
+    spotify       wayland dri pulseaudio network
+    steam         wayland x11 "host" dri pulseaudio network gamepad
+    thunderbird   wayland network, ~/Downloads rw
+    vesktop       wayland dri pulseaudio network
+
+Sound is `pulseaudio` in every profile that has any, and `pipewire` only in
+`mpv`. That is not a preference: `pulseaudio` binds
+`$XDG_RUNTIME_DIR/pulse/native` and sets `PULSE_SERVER` to it, which is the
+path a libpulse client takes, and the applications here are libpulse clients —
+`libpulse` is in the Arch dependencies of `firefox` and `chromium`, and
+`/opt/spotify/spotify`, `/opt/spotify/libcef.so` and `/usr/lib/electron40/electron`
+each carry `libpulse.so.0` for the dlopen. On a PipeWire host that socket is
+the one pipewire-pulse serves, so nothing is lost by taking it. `pipewire`
+binds `pipewire-0`, the native socket, which is what a client speaking the
+PipeWire protocol itself uses (mpv) and what the portal hands a screen or
+camera stream over — which is why the profiles that could share a screen list
+`pipewire` as an opt-in beside their `portals`. Either socket carries capture
+as well as playback, so either is the microphone.
 
 Five carry a `desktop` node, because their application's entry is not named
 after its command: `alacritty` (`Alacritty.desktop`), `keepassxc`, `lutris`
@@ -1550,9 +1573,11 @@ leaving LibreOffice's VCL plugin to an autodetection with nothing to go on.
 The Mozilla apps need no variable of their own: Gecko has defaulted to Wayland
 since Firefox 121 and takes it from the `WAYLAND_DISPLAY` the `wayland` grant
 sets, so `MOZ_ENABLE_WAYLAND=1` is gone from both profiles — write
-`env MOZ_ENABLE_WAYLAND="0"` to go back to Xwayland. `firefox` owns
-`org.mozilla.firefox.*` instead, which is the remote-instance protocol a
-second `firefox` reaches the running one through.
+`env MOZ_ENABLE_WAYLAND="0"` to go back to Xwayland. `firefox` no longer owns
+`org.mozilla.firefox.*` either: that name is the remote-instance protocol a
+second `firefox` reaches the running one through, which is a convenience
+rather than a condition of starting, so it is the `dbus { own … }` block its
+header lists.
 
 `chromium`, `code` and `vesktop` keep their own namespace sandbox: it nests
 inside bubbler's, so none of them needs `--no-sandbox`. Where a package ships a
@@ -1564,30 +1589,34 @@ three may carry `userns "disable"`, and none of them needs an ozone hint:
 Electron picks the Wayland backend on its own, and Arch's `vesktop` wrapper
 sets the variable anyway.
 
-`keepassxc` is the one profile written mostly out of what it does **not**
-grant, and each omission is a comment in the profile saying how to add it back.
-No `network`: a database opens without one, and the grant is your password
+`keepassxc` is the shortest profile of the set: a display and `~/Documents`.
+No `network` — a database opens without one, and the grant is your password
 manager's process reaching the internet. No `own "org.freedesktop.secrets"`:
 that name makes the sandbox the Secret Service for the whole session, so every
-libsecret client in it — `code` among them, which is granted `talk` on that
-same name — would store its secrets there. It is an outward grant rather than a
-confinement. No `hidraw`, which would not help anyway: KeePassXC drives a
-YubiKey through libusb and a smart card through pcsclite, and bubbler grants
-neither. Browser integration does work: the profile grants
-`app-runtime "org.keepassxc.KeePassXC" mode=rw` so the socket it serves is
-reachable from the host or from another instance — `firefox` and `chromium`
-carry the matching read-only line commented out. Installing the native
-messaging manifest is still yours to do; "KeePassXC-Browser, both sides under
-bubbler" under "app-runtime" is the whole procedure.
+libsecret client in it would store its secrets there. It is an outward grant
+rather than a confinement. No `hidraw`, which would not help anyway: KeePassXC
+drives a YubiKey through libusb and a smart card through pcsclite, and bubbler
+grants neither. Browser integration is not in the profile either, but it is one
+line away: the header carries the
+`app-runtime "org.keepassxc.KeePassXC" mode=rw` node and its `lint-allow`, and
+`firefox` and `chromium` carry the matching read-only line, so the socket
+KeePassXC serves is reachable from another instance once both sides name the
+id. Installing the native messaging manifest is still yours to do;
+"KeePassXC-Browser, both sides under bubbler" under "app-runtime" is the whole
+procedure.
 
-`spotify` owns `org.mpris.MediaPlayer2.spotify` exactly, not as a prefix, and
-its tray icon is the same one-rule `tray` grant as everywhere else. It has no
-`portals`, because there is no file chooser to speak of; add `portals` and a
-`home-share "Music"` for local files. `kitty` needs no grant for the
-pseudoterminals it makes: `--dev` gives each sandbox a private devpts instance
-with an index space of its own, and the host's `/dev/pts` is never bound. Its
-`dbus` and `portals` are what the `org.freedesktop.portal.Settings` read takes,
-without which it cannot follow the desktop colour scheme. Never share kitty's
+`spotify` and `vesktop` end up the same four nodes — display, GPU, the
+PulseAudio socket, a network — because that is what playing and calling take.
+The media keys (`mpris name="spotify"`, the exact name and not a prefix: the
+player name is `org.mpris.MediaPlayer2.spotify` while the app id is
+`com.spotify.Client`, and a `*` would own every player on the bus), the tray
+icon, the notifications, the screen sharing (`pipewire` plus `portals`) and
+Vesktop's `~/Downloads` are opt-ins in their headers. `kitty` is two nodes and
+needs no grant for the pseudoterminals it makes: `--dev` gives each sandbox a
+private devpts instance with an index space of its own, and the host's
+`/dev/pts` is never bound. Its `dbus` and `portals` opt-in is what the
+`org.freedesktop.portal.Settings` read takes, without which it cannot follow
+the desktop colour scheme — it starts either way. Never share kitty's
 remote-control socket across the boundary — `kitten @` includes `launch`, so a
 reachable socket is command execution in whichever direction it was shared.
 
@@ -1608,22 +1637,29 @@ is what the `lint-allow` reason each of them carries names. Neither carries a
 runtime, umu/Proton and DXVK's 32-bit path are i386, and the default filter now
 covers i386 alongside x86_64, so they are filtered rather than killed. Neither
 may ever carry `userns "disable"` — pressure-vessel nests its own bubblewrap for
-every Proton game. On the system bus `steam` talks to UPower, and both grant
-UDisks2 enumeration alone — `see` plus the one `GetManagedObjects` call Wine
-builds its drive list from — because a `talk` there would also hand the
-sandbox loop setup, mount and LUKS unlock, which polkit judges as you; widen
-it yourself if a game needs more.
-`/dev/hugepages`, `/dev/fuse` and `/dev/snd` are still not bound.
+every Proton game. `/dev/hugepages`, `/dev/fuse` and `/dev/snd` are still not
+bound.
 
-`steam` is also the one profile with no `portals`, and that is not an
-oversight: the grant writes `/.flatpak-info`, Steam's own runtime reads that
-file as "I am the unofficial Steam Flatpak", and
+Neither gaming profile reaches a bus at all now. What their headers list, and
+what each is worth: the names the client claims for itself
+(`own "com.steampowered.*"` with its `own-too-wide` allow, `own
+"net.lutris.Lutris"`), the power-save blockers a running game holds
+(`org.freedesktop.ScreenSaver`, `org.freedesktop.PowerManagement`), GameMode
+for Lutris — inert where `gamemoded` is not installed — and on the system bus
+UPower plus UDisks2 enumeration: `see` and the one `GetManagedObjects` call
+Wine builds its drive list from, never a `talk`, which would also hand the
+sandbox loop setup, mount and LUKS unlock, judged by polkit as you. `notify`
+and `tray` are there too, one rule each.
+
+`steam` is also the one profile that must not be given `portals`, and that is
+not an oversight: the grant writes `/.flatpak-info`, Steam's own runtime reads
+that file as "I am the unofficial Steam Flatpak", and
 `steam-runtime-check-requirements` then exits 71 demanding the flatpak-portal
 service, which stops `steam.sh` before the client starts. Steam has its own
 file browser, so what it costs is the screencast and file-chooser portals.
-`lutris` keeps `portals` because Lutris itself calls them, but a Proton or umu
-game brings the same steam-runtime-tools along, so drop the grant there too if
-one stops with a Flatpak complaint.
+`lutris` lists `portals` in its header because Lutris itself calls them, but a
+Proton or umu game brings the same steam-runtime-tools along, so that is the
+grant to drop first if one stops with a Flatpak complaint.
 
 `steam` does not share the host's `~/.steam`. That is not a data directory but
 seven absolute symlinks into the host home, which dangle inside a sandbox whose
@@ -1641,10 +1677,12 @@ read what those two properties grant under "Config" first: `uinput` lets the
 sandbox type into your session, and `hidraw` hands it every HID device on the
 machine, security keys and hardware wallets among them.
 
-Opening an arbitrary file from inside — LibreOffice's or Thunderbird's file
-chooser — goes through the portal, which exports what you pick into the
-instance's own document-portal view, and the path it hands back opens there
-(see "D-Bus").
+Opening an arbitrary file from outside the shared directories — LibreOffice's
+or Thunderbird's file chooser — is what the `dbus` and `portals` pair in those
+two headers is for: the portal runs the chooser on the host, exports what you
+pick into the instance's own document-portal view, and the path it hands back
+opens there (see "D-Bus"). Without them the chooser is the one inside the
+sandbox, and it sees the private home and the shared directory.
 
 ### Managing profiles and instances
 

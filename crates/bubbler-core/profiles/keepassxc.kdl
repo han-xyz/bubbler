@@ -1,18 +1,19 @@
 // bubbler profile: keepassxc
 //
-// No `network`: KeePassXC needs none to open a database. firejail's
-// profile agrees and goes further with `net none`. The flathub manifest
-// grants `--share=network` for favicon download alone; add `network`
-// yourself if you use that feature, and understand that it is your
+// A password manager needs a display and the database. That is what this
+// grants: no network, no bus, no runtime directory shared with anything.
+//
+// No `network`: KeePassXC needs none to open a database. Downloading a
+// site's favicon into an entry is the one feature that wants one; add
+// `network` yourself if you use it, and understand that it is your
 // password database's process reaching the internet.
 //
-// No `own "org.freedesktop.secrets"`. That rule, added to the `dbus`
-// block below, makes this sandbox the Secret Service for the whole
-// session: every application that stores a password through libsecret
-// stores it here. It is an outward grant rather than a confinement (see
-// the README), and first owner wins, so a host keyring already holding
-// the name only makes the request fail. Add it if you mean to replace
-// that keyring:
+// No `own "org.freedesktop.secrets"`. That rule makes this sandbox the
+// Secret Service for the whole session: every application that stores a
+// password through libsecret stores it here. It is an outward grant
+// rather than a confinement (see the README), and first owner wins, so a
+// host keyring already holding the name only makes the request fail. Add
+// it, inside a `dbus` block, if you mean to replace that keyring:
 //     own "org.freedesktop.secrets"
 //
 // No `hidraw`, and it would not help: KeePassXC reaches a YubiKey
@@ -22,31 +23,42 @@
 // challenge-response unlocking does not work from this sandbox; see
 // "Known gaps".
 //
-// Browser integration works through `app-runtime`: KeePassXC serves
-// `org.keepassxc.KeePassXC.BrowserServer` in
-// $XDG_RUNTIME_DIR/app/org.keepassxc.KeePassXC, which is the same path
-// on the host and in every sandbox naming that id, so a browser on the
-// host or in its own bubbler instance reaches it. `mode=rw` because this
-// is the side that creates the socket; the browser side wants the
-// default `ro`. Everything else granted that id can replace what is in
-// the directory, so treat the id as one trust domain: KeePassXC's own
-// associate/identification keys are what authenticate a client, not the
-// socket.
-//
 // The database lives in the private home unless you share the directory
-// holding it; `home-share "Documents" mode=rw` is a starting point, and
-// a database on another disk is named explicitly, e.g.
+// holding it; `home-share "Documents" mode=rw` is the starting point
+// below, and a database on another disk is named explicitly, e.g.
 //     path-share "/kioxia/keepass" mode=rw
-lint-allow "app-runtime-rw" reason="this is the side that serves the browser socket"
+//
+// Bare by design. Add:
+//   app-runtime "org.keepassxc.KeePassXC" mode=rw
+//   lint-allow "app-runtime-rw" reason="this is the side that serves the browser socket"
+//     — browser integration. KeePassXC serves
+//       `org.keepassxc.KeePassXC.BrowserServer` in
+//       $XDG_RUNTIME_DIR/app/org.keepassxc.KeePassXC, which is the same
+//       path on the host and in every sandbox naming that id, so a
+//       browser on the host or in its own bubbler instance reaches it.
+//       `mode=rw` because this is the side that creates the socket; the
+//       browser side wants the default `ro`. Everything else granted
+//       that id can replace what is in the directory, so treat the id as
+//       one trust domain: KeePassXC's own associate/identification keys
+//       are what authenticate a client, not the socket.
+//   dbus {
+//       own "org.keepassxc.KeePassXC.*"
+//       talk "org.freedesktop.ScreenSaver"
+//   }
+//     — the org.keepassxc.KeePassXC.MainWindow interface a second
+//       `keepassxc` and the desktop reach this one through, and the
+//       screensaver's ActiveChanged signal, which is how "lock databases
+//       when the session is locked" hears about the lock.
+//   portals
+//     — the file chooser that reaches outside the shared directories,
+//       for a database or a key file kept elsewhere. Needs `dbus`.
+//   notify
+//     — the "database saved" and "entry copied" notifications. Needs
+//       `dbus`.
+//   tray
+//     — the tray icon, and with it "minimise to tray" instead of exit.
+//       Needs `dbus`.
 wayland
-app-runtime "org.keepassxc.KeePassXC" mode=rw
-dbus {
-    own "org.keepassxc.KeePassXC.*"
-    talk "org.freedesktop.ScreenSaver"
-}
-portals
-notify
-tray
 home-share "Documents" mode=rw
 desktop "org.keepassxc.KeePassXC.desktop"
 command "keepassxc"

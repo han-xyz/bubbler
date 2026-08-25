@@ -1008,12 +1008,16 @@ mod tests {
         assert!(ff.services.contains(&Service::Dri));
         assert!(ff.services.contains(&Service::Portals));
         // Gecko picks Wayland on its own since Firefox 121, so the profile
-        // sets nothing; the owned name is the remote-instance protocol,
-        // which a second `firefox` needs to reach the running one.
+        // sets nothing.
         assert!(ff.env.is_empty(), "{:?}", ff.env);
-        assert!(ff.services.contains(&Service::Dbus {
-            rules: vec![BusRule::Own("org.mozilla.firefox.*".to_owned())],
-        }));
+        // Sound is the PulseAudio socket, which is what a libpulse client
+        // opens; `pipewire` binds the native socket the screen-share
+        // portal hands frames over, and is left to whoever shares a
+        // screen. The bus carries no rule of its own: the remote-instance
+        // name the profile used to own is an opt-in in its header.
+        assert!(ff.services.contains(&Service::Pulseaudio));
+        assert!(!ff.services.contains(&Service::Pipewire));
+        assert!(ff.services.contains(&Service::Dbus { rules: Vec::new() }));
         // One grant per profile the app does not work without, so a
         // profile edited into something weaker is caught here and not by
         // whoever runs it.
@@ -1038,7 +1042,7 @@ mod tests {
                 .services
                 .contains(&home_share("Downloads", ShareMode::ReadWrite))
         );
-        assert!(cfg("vesktop").services.contains(&Service::Tray));
+        assert!(cfg("vesktop").services.contains(&Service::Pulseaudio));
         let steam = cfg("steam");
         assert!(steam.services.contains(&Service::Gamepad {
             hidraw: false,
@@ -1048,27 +1052,19 @@ mod tests {
         // `seccomp` node any more: the default filter carries i386.
         assert_eq!(steam.seccomp, SeccompConfig::default());
         assert!(steam.services.contains(&Service::X11(X11Mode::Host)));
-        // UDisks2 is enumeration only in both gaming profiles: `talk`
-        // would hand the sandbox loop-setup, mount and LUKS methods,
-        // which polkit judges as the user.
-        let enumerate_udisks = || {
-            vec![
-                BusRule::See("org.freedesktop.UDisks2".to_owned()),
-                BusRule::Call(
-                    "org.freedesktop.UDisks2".to_owned(),
-                    "org.freedesktop.DBus.ObjectManager.GetManagedObjects\
-                     @/org/freedesktop/UDisks2"
-                        .to_owned(),
-                ),
-            ]
-        };
-        let mut steam_bus = vec![BusRule::Talk("org.freedesktop.UPower".to_owned())];
-        steam_bus.extend(enumerate_udisks());
-        assert!(
-            steam
-                .services
-                .contains(&Service::SystemBus { rules: steam_bus })
-        );
+        // Neither gaming profile reaches a bus at all. The names each
+        // client claims for itself, and the UDisks2 enumeration Wine
+        // builds a drive list from, are opt-ins their headers spell out
+        // node for node; a run starts without them.
+        for n in ["steam", "lutris"] {
+            let services = cfg(n).services;
+            assert!(
+                !services
+                    .iter()
+                    .any(|s| matches!(s, Service::Dbus { .. } | Service::SystemBus { .. })),
+                "{n}: {services:?}"
+            );
+        }
         // `portals` would write /.flatpak-info, which Steam's own runtime
         // reads as being the unofficial Steam Flatpak: it then refuses to
         // start without a flatpak-portal service to talk to.
@@ -1093,9 +1089,6 @@ mod tests {
                 .services
                 .contains(&home_share("Games", ShareMode::ReadWrite))
         );
-        assert!(lutris.services.contains(&Service::SystemBus {
-            rules: enumerate_udisks()
-        }));
 
         for n in [
             "chromium",
@@ -1112,6 +1105,11 @@ mod tests {
         assert!(matches!(r.resolve("nope"), Err(ProfileError::NotFound(n)) if n == "nope"));
     }
 
+    /// The desktop profiles are bare: a display, what the application
+    /// draws and plays with, and the one directory it works in. A bus,
+    /// notifications, a tray icon and the rest are opt-ins their headers
+    /// list node for node, so this pins the whole grant set of each
+    /// rather than a few nodes of it.
     #[test]
     fn the_desktop_profiles_grant_what_their_apps_need_and_nothing_wider() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1121,113 +1119,64 @@ mod tests {
             path: PathBuf::from(p),
             mode,
         };
-        let talk = |n: &str| BusRule::Talk(n.to_owned());
+        let wayland = || Service::Wayland(WaylandMode::default());
+        let network = || Service::Network(NetworkConfig::default());
 
+        // A password manager opens a database on a display. Everything it
+        // does not carry — no network, no bus name, no HID device, no
+        // runtime directory shared with a browser — is a comment in the
+        // profile saying what adding it back buys and costs.
         let kp = cfg("keepassxc");
         assert_eq!(kp.command, Some(vec![OsString::from("keepassxc")]));
-        assert!(kp.services.contains(&Service::Dbus {
-            rules: vec![
-                BusRule::Own("org.keepassxc.KeePassXC.*".to_owned()),
-                talk("org.freedesktop.ScreenSaver"),
-            ],
-        }));
-        assert!(
-            kp.services
-                .contains(&home_share("Documents", ShareMode::ReadWrite))
-        );
-        for s in [Service::Portals, Service::Notify, Service::Tray] {
-            assert!(kp.services.contains(&s), "{s:?}");
-        }
-        // A database needs no network, no HID device and no session-wide
-        // secrets name; each of the three is a comment in the profile
-        // rather than a grant, and each would be a real widening.
-        assert!(
-            !kp.services
-                .contains(&Service::Network(NetworkConfig::default()))
-        );
-        assert!(!kp.services.contains(&Service::Hidraw));
-        assert!(
-            !kp.services.iter().any(|s| matches!(
-                s,
-                Service::Dbus { rules } if rules.contains(&BusRule::Own("org.freedesktop.secrets".to_owned()))
-            )),
-            "{:?}",
-            kp.services
+        assert_eq!(
+            kp.services,
+            vec![wayland(), home_share("Documents", ShareMode::ReadWrite)]
         );
 
+        // An editor draws, fetches and opens files. The Secret Storage
+        // API, which has no per-application partitioning and so hands
+        // over every secret in the login keyring, is an opt-in.
         let code = cfg("code");
         assert_eq!(code.command, Some(vec![OsString::from("code")]));
-        assert!(code.services.contains(&Service::Dbus {
-            rules: vec![talk("org.freedesktop.secrets")],
-        }));
-        assert!(
-            code.services
-                .contains(&home_share("Projects", ShareMode::ReadWrite))
+        assert_eq!(
+            code.services,
+            vec![
+                wayland(),
+                Service::Dri,
+                network(),
+                Service::Dbus { rules: Vec::new() },
+                Service::Portals,
+                home_share("Projects", ShareMode::ReadWrite),
+            ]
         );
-        for s in [
-            Service::Wayland(WaylandMode::default()),
-            Service::Dri,
-            Service::Network(NetworkConfig::default()),
-            Service::Portals,
-            Service::Notify,
-        ] {
-            assert!(code.services.contains(&s), "{s:?}");
-        }
         // Electron 42 picks the Wayland backend on its own, so an ozone
         // hint here would be a variable nobody reads.
         assert!(code.env.is_empty(), "{:?}", code.env);
 
+        // A music player needs the sound socket its CEF layer opens and
+        // the network it streams over; the media keys, the tray icon and
+        // the power-save names are opt-ins.
         let sp = cfg("spotify");
         assert_eq!(sp.command, Some(vec![OsString::from("spotify")]));
-        assert!(sp.services.contains(&Service::Dbus {
-            rules: vec![
-                talk("org.freedesktop.ScreenSaver"),
-                talk("org.gnome.SettingsDaemon.MediaKeys"),
-            ],
-        }));
-        assert!(sp.services.contains(&Service::Mpris {
-            name: "spotify".to_owned()
-        }));
-        for s in [Service::Pipewire, Service::Notify, Service::Tray] {
-            assert!(sp.services.contains(&s), "{s:?}");
-        }
-        // No file chooser to speak of, and no directory opened for one.
-        assert!(!sp.services.contains(&Service::Portals));
-        assert!(
-            !sp.services
-                .iter()
-                .any(|s| matches!(s, Service::HomeShare { .. })),
-            "{:?}",
-            sp.services
+        assert_eq!(
+            sp.services,
+            vec![wayland(), Service::Dri, Service::Pulseaudio, network()]
         );
 
+        // A terminal makes its own ptys in the private devpts `--dev`
+        // gives it; the host's is never bound, and it asks for nothing
+        // else. The portal read it follows the colour scheme with is an
+        // opt-in.
         let kitty = cfg("kitty");
         assert_eq!(kitty.command, Some(vec![OsString::from("kitty")]));
-        for s in [
-            Service::Wayland(WaylandMode::default()),
-            Service::Dri,
-            Service::Dbus { rules: Vec::new() },
-            Service::Portals,
-            Service::Notify,
-        ] {
-            assert!(kitty.services.contains(&s), "{s:?}");
-        }
-        // A terminal makes its own ptys in the private devpts `--dev`
-        // gives it; the host's is never bound.
-        assert!(
-            !kitty
-                .services
-                .iter()
-                .any(|s| matches!(s, Service::PathShare { .. })),
-            "{:?}",
-            kitty.services
-        );
+        assert_eq!(kitty.services, vec![wayland(), Service::Dri]);
 
-        // Vesktop saves attachments through a directory it can write.
-        assert!(
-            cfg("vesktop")
-                .services
-                .contains(&home_share("Downloads", ShareMode::ReadWrite))
+        // The same shape for a chat client: a call takes sound and a
+        // network, and screen sharing is `pipewire` plus `portals` on
+        // top, as its header says.
+        assert_eq!(
+            cfg("vesktop").services,
+            vec![wayland(), Service::Dri, Service::Pulseaudio, network()]
         );
     }
 

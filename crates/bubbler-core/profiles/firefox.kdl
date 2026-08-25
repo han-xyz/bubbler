@@ -1,24 +1,45 @@
 // bubbler profile: firefox
 //
-// For KeePassXC browser integration, uncomment the line below and
-// grant the same id to `keepassxc` (it ships it already). Read-only
-// is enough: this side only connects to the socket KeePassXC serves.
-//   app-runtime "org.keepassxc.KeePassXC"
+// Sound is `pulseaudio`: Firefox is a libpulse client (`libpulse` is in
+// the Arch package's Depends) and reaches the server through
+// $XDG_RUNTIME_DIR/pulse/native, which is what that grant binds.
+// `pipewire` binds only pipewire-0, the native socket, and is what the
+// screen-share portal hands frames over. Either socket carries capture
+// as well as playback: this is the microphone too.
 //
 // `network` is the sandbox's own network namespace. Chromecast discovery
 // is mDNS on the LAN and pasta does not bridge, so casting does not find
 // anything; `network "host"` brings it back, together with every service
 // on the host's loopback.
+//
+// Gecko has defaulted to Wayland since Firefox 121 and takes the display
+// from the `wayland` grant, so no `env` node sets MOZ_ENABLE_WAYLAND;
+// `env MOZ_ENABLE_WAYLAND="0"` goes back to Xwayland.
+//
+// Bare by design. Add:
+//   pipewire
+//     — screen and window sharing: the portal picks the source and hands
+//       the stream over PipeWire, so both grants are needed.
+//   dbus {
+//       own "org.mozilla.firefox.*"
+//   }
+//     — the remote-instance protocol, which a second `firefox` reaches
+//       the running one through instead of starting beside it.
+//   notify
+//     — desktop notifications a page asks for. Needs `dbus`.
+//   mpris name="firefox.*"
+//     — media keys and the desktop's player controls for a tab that is
+//       playing. Needs `dbus`.
+//   app-runtime "org.keepassxc.KeePassXC"
+//     — KeePassXC browser integration. Grant the same id in the
+//       `keepassxc` instance (it lists the line in its own header).
+//       Read-only is enough: this side only connects to the socket
+//       KeePassXC serves.
 wayland
 dri
-pipewire
 pulseaudio
 network
-dbus {
-    own "org.mozilla.firefox.*"
-}
+dbus
 portals
-notify
-mpris name="firefox.*"
 home-share "Downloads" mode=rw
 command "firefox"

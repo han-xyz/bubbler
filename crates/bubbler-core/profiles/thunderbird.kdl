@@ -1,10 +1,27 @@
 // bubbler profile: thunderbird
+//
+// Mail and an attachment saved into ~/Downloads. Everything else — the
+// profile, the message store, the address book — lives in the private
+// home.
+//
+// Gecko has defaulted to Wayland since Firefox 121 and takes the display
+// from the `wayland` grant, so no `env` node sets MOZ_ENABLE_WAYLAND;
+// `env MOZ_ENABLE_WAYLAND="0"` goes back to Xwayland.
+//
+// Bare by design. Add:
+//   dri
+//     — the GPU. Without it Gecko composites in software, which is enough
+//       for a mail window and slower for a video in one.
+//   dbus
+//   portals
+//     — the file chooser that reaches outside the shared directories: the
+//       portal runs it on the host and exports what you pick into this
+//       instance's document view. Without them the chooser is the one
+//       inside the sandbox and sees the private home and ~/Downloads.
+//   notify
+//     — new-mail notifications and calendar alarms. Needs `dbus`.
 wayland
 network
-dri
-dbus
-portals
-notify
 home-share "Downloads" mode=rw
 desktop "org.mozilla.Thunderbird.desktop"
 command "thunderbird"
