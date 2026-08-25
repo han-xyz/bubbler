@@ -499,6 +499,7 @@ fn a_helper_that_never_reports_is_a_startup_failure() {
     let marker = dir.path().join("the-command-ran");
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
+    let t = Instant::now();
     let (mut init, _sock, _tmp) = start_with(
         &["/usr/bin/touch", marker.to_str().unwrap()],
         false,
@@ -506,10 +507,9 @@ fn a_helper_that_never_reports_is_a_startup_failure() {
         Some(&[PYTHON, script.to_str().unwrap()]),
     );
     let pid = helper_pid(&script);
-    let t = Instant::now();
     let status = init.wait().unwrap();
     assert!(
-        t.elapsed() >= Duration::from_secs(9) && t.elapsed() < Duration::from_secs(25),
+        t.elapsed() >= Duration::from_secs(10) && t.elapsed() < Duration::from_secs(15),
         "gave up after {:?}",
         t.elapsed()
     );

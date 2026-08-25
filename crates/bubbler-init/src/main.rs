@@ -59,6 +59,12 @@ struct Args {
 struct Helper {
     child: Child,
     display: OsString,
+    /// Init's end of the `-displayfd` pipe, held open until the helper is
+    /// gone. Xserver(1) documents only the write ("will write the display
+    /// number back on this file descriptor as a newline-terminated
+    /// string"), not that the server then closes it, so init keeps its end
+    /// rather than leave a later write facing EPIPE.
+    _display_pipe: OwnedFd,
 }
 
 /// A command run for a client, with the connection waiting for its status.
@@ -78,7 +84,11 @@ struct Pending {
 /// anything else is a usage error. The helper argv ends at its own bare
 /// `--`, so it may hold any words, including the command's own.
 fn parse_args() -> Option<Args> {
-    let mut it = std::env::args_os().skip(1);
+    parse_from(std::env::args_os().skip(1))
+}
+
+/// The grammar itself, over any argv but this process's own.
+fn parse_from(mut it: impl Iterator<Item = OsString>) -> Option<Args> {
     let mut socket_fd = None;
     let mut ctty = false;
     let mut helper = None;
@@ -87,7 +97,9 @@ fn parse_args() -> Option<Args> {
         match a.to_str() {
             Some("--socket-fd") => socket_fd = it.next()?.to_str()?.parse().ok(),
             Some("--ctty") => ctty = true,
-            Some("--helper") => {
+            // A second one would silently replace the first, and a helper
+            // that is dropped here is a display nothing ever starts.
+            Some("--helper") if helper.is_none() => {
                 let argv: Vec<OsString> = it.by_ref().take_while(|w| w != "--").collect();
                 if argv.is_empty() {
                     return None;
@@ -294,7 +306,7 @@ fn abandon(child: &mut Child, reason: String) -> String {
 /// `-displayfd`. That write end is the only descriptor the helper
 /// inherits beyond stdio, and init drops its own copy right after the
 /// spawn, so the pipe reports EOF as soon as the helper is gone.
-fn start_helper(argv: &[OsString]) -> Result<Helper, String> {
+fn start_helper(argv: &[OsString], stop: &AtomicBool) -> Result<Helper, String> {
     let (program, rest) = argv.split_first().ok_or("no helper to run")?;
     let (r, w) = pipe_with(PipeFlags::CLOEXEC)
         .map_err(|e| format!("cannot create the display pipe: {e}"))?;
@@ -340,6 +352,7 @@ fn start_helper(argv: &[OsString]) -> Result<Helper, String> {
                 Ok(n) => Ok(Helper {
                     child,
                     display: OsString::from(format!(":{n}")),
+                    _display_pipe: r,
                 }),
                 Err(_) => Err(abandon(
                     &mut child,
@@ -355,6 +368,12 @@ fn start_helper(argv: &[OsString]) -> Result<Helper, String> {
         }
         if Instant::now() >= deadline {
             let why = format!("no display number after {}s", HELPER_READY.as_secs());
+            return Err(abandon(&mut child, why));
+        }
+        // A signal during the wait ends the run here: the command has not
+        // been spawned, so there is nothing to stop but the helper.
+        if stop.load(Ordering::SeqCst) {
+            let why = "it was stopped before it was ready".to_string();
             return Err(abandon(&mut child, why));
         }
     }
@@ -419,7 +438,7 @@ fn main() -> ExitCode {
     };
     // Before the command, so a display the command needs is listening
     // and its number known by the time the command's first line runs.
-    let mut helper = match args.helper.as_deref().map(start_helper) {
+    let mut helper = match args.helper.as_deref().map(|a| start_helper(a, &stop)) {
         Some(Ok(h)) => Some(h),
         Some(Err(reason)) => {
             eprintln!("bubbler-init: Xwayland did not start: {reason}");
@@ -445,6 +464,7 @@ fn main() -> ExitCode {
         Ok(child) => child,
         Err(e) => {
             eprintln!("bubbler-init: {}: {e}", program.to_string_lossy());
+            stop_helper(helper.as_mut());
             return ExitCode::from(127);
         }
     };
@@ -459,8 +479,16 @@ fn main() -> ExitCode {
             signal_execs(&execs, Signal::TERM);
             kill_at = Some(Instant::now() + GRACE);
         }
+        if let Ok(Some(status)) = command.try_wait() {
+            reap(&mut execs);
+            shutdown(&mut execs);
+            stop_helper(helper.as_mut());
+            return ExitCode::from(code_of(status));
+        }
         // A helper that exits takes the display with it: the command
         // cannot draw any more, so it is stopped instead of left blind.
+        // Checked after the command's own exit, so the two going down
+        // together is not reported as the helper stopping the command.
         if helper
             .as_mut()
             .is_some_and(|h| matches!(h.child.try_wait(), Ok(Some(_))))
@@ -468,12 +496,6 @@ fn main() -> ExitCode {
             eprintln!("bubbler-init: Xwayland exited; stopping the command");
             let _ = kill_process(Pid::from_child(&command), Signal::TERM);
             helper = None;
-        }
-        if let Ok(Some(status)) = command.try_wait() {
-            reap(&mut execs);
-            shutdown(&mut execs);
-            stop_helper(helper.as_mut());
-            return ExitCode::from(code_of(status));
         }
         reap(&mut execs);
         if kill_at.is_some_and(|at| Instant::now() >= at) {
@@ -525,5 +547,83 @@ fn main() -> ExitCode {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(words: &[&str]) -> Option<Args> {
+        parse_from(words.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn the_helper_argv_ends_at_its_own_terminator() {
+        let a = parse(&[
+            "--socket-fd",
+            "3",
+            "--ctty",
+            "--helper",
+            "Xwayland",
+            ":0",
+            "--",
+            "--",
+            "/usr/bin/true",
+            "--helper",
+        ])
+        .unwrap();
+        assert_eq!(a.socket_fd, 3);
+        assert!(a.ctty);
+        assert_eq!(a.helper.unwrap(), ["Xwayland", ":0"]);
+        assert_eq!(a.command, ["/usr/bin/true", "--helper"]);
+    }
+
+    #[test]
+    fn a_helper_without_an_argv_is_a_usage_error() {
+        assert!(parse(&["--socket-fd", "3", "--helper", "--", "--", "/usr/bin/true"]).is_none());
+    }
+
+    #[test]
+    fn a_helper_argv_that_is_never_terminated_is_a_usage_error() {
+        // The helper swallows the words the command would have been.
+        assert!(parse(&["--socket-fd", "3", "--helper", "Xwayland", "/usr/bin/true"]).is_none());
+        // One `--` short: what follows it is neither a flag nor a command.
+        assert!(
+            parse(&[
+                "--socket-fd",
+                "3",
+                "--helper",
+                "Xwayland",
+                "--",
+                "/usr/bin/true"
+            ])
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_second_helper_is_a_usage_error() {
+        let words = [
+            "--socket-fd",
+            "3",
+            "--helper",
+            "Xwayland",
+            "--",
+            "--helper",
+            "Xephyr",
+            "--",
+            "--",
+            "/usr/bin/true",
+        ];
+        assert!(parse(&words).is_none());
+    }
+
+    #[test]
+    fn no_helper_is_the_usual_grammar() {
+        let a = parse(&["--socket-fd", "4", "--", "/usr/bin/true"]).unwrap();
+        assert!(a.helper.is_none());
+        assert!(!a.ctty);
+        assert_eq!(a.command, ["/usr/bin/true"]);
     }
 }
