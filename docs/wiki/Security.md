@@ -95,8 +95,10 @@ XKEYBOARD and XTEST.
 There is no window manager in there: X windows are undecorated, unmanaged and
 stacked in the one compositor window the server draws. `bubbler lint` says so
 as the note `x11-nested-no-wm`, which a `fullscreen=#true` config does not get,
-having asked for the one full-output window already. `grab=#true` holds pointer
-and keyboard inside it (Ctrl+Shift releases them).
+having asked for the one full-output window already. Keyboard focus follows the
+pointer, so a window that fills only part of the root loses input when the
+pointer leaves it; in-game fullscreen or `fullscreen=#true grab=#true` makes it
+stable. `grab=#true` holds pointer and keyboard inside (Ctrl+Shift releases them).
 
 `x11 "host"` is the other mode: the session's `/tmp/.X11-unix/X<n>` socket and
 whichever Xauthority cookie `$XAUTHORITY` or `~/.Xauthority` names, remapped to

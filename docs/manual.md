@@ -632,8 +632,13 @@ the socket having been in a `/tmp` that goes with the sandbox.
 There is no window manager in there, which is what the lint note
 `x11-nested-no-wm` says: X windows are undecorated, unmanaged and stacked in
 the one compositor window, so an application that opens dialogs gets them piled
-on its main window with nothing to move them. A `fullscreen=#true` config does
-not get the note, having asked for the single full-output window already.
+on its main window with nothing to move them. Keyboard focus follows the
+pointer too, as X does without a window manager: while the pointer is over the
+root rather than a window, keys go nowhere, and a game that fills only part of
+the root loses input whenever the pointer leaves it. Fullscreen in the game, or
+`fullscreen=#true grab=#true`, is what makes input stable. A `fullscreen=#true`
+config does not get the note, having asked for the single full-output window
+already.
 Starting a window manager inside is out of scope: it would be one more process
 in the sandbox and which one is a matter of taste, not of the boundary.
 
