@@ -56,6 +56,7 @@ bubbler run ff --dry-run                 # `bwrap` then one argv element per lin
 bubbler run ff --explain                 # grouped under the node that produced each argument
 bubbler run ff --explain=full            # baseline included
 bubbler run ff --explain --proxy         # the xdg-dbus-proxy sidecar's argv
+bubbler run ff --explain --wl-proxy      # the bubbler-wl-proxy sidecar's argv
 bubbler run ff --explain --format json   # one object per operation, true argv order
 bubbler try --profile firefox --explain
 ```
@@ -65,7 +66,8 @@ per group, the config line, the argument count, what is behind each generated
 descriptor (seccomp filter size and architectures, `--ro-bind-data` size,
 which pipe an `--info-fd`/`--block-fd` is), and grants that are not bwrap
 arguments: D-Bus `rules:`, `rule-only:` for nodes contributing nothing else,
-which socket a `wayland` node binds (`security-context:` for a bare grant,
+which socket a `wayland` node binds (`security-context:` plus the
+`sidecar: bubbler-wl-proxy …` line for a bare grant,
 `raw socket: wayland "host"` for the session's own), `raw socket: x11 "host"`
 for a session X display, `sidecar: pasta …` and the nft ruleset under
 `network`. A nested `x11` needs no such line: the `--x11` argument is the
@@ -85,6 +87,7 @@ arguments of `bubbler-init` rather than of bwrap.
     --ro-bind /run/user/1000/bubbler/ff/wayland /run/user/1000/wayland-1
     --setenv WAYLAND_DISPLAY wayland-1
     security-context: engine=org.bubbler app=org.bubbler.ff instance=bubbler-ff
+    sidecar: bubbler-wl-proxy listener /run/user/1000/bubbler/ff/wayland → /run/user/1000/bubbler/ff/wayland-context, gate paste
   init                                           7 arguments
     --ro-bind /usr/lib/bubbler/bubbler-init /run/bubbler-init
     -- /run/bubbler-init --socket-fd 10  (socket: the exec channel bubbler-init serves)

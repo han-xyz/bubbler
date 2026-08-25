@@ -47,11 +47,16 @@ data-control is reading the clipboard without focus, while the core
 `wl_data_device` hands a focused client the selection as it does for any
 application.
 
-A compositor that implements none of this gets the session socket and one
-warning per launch:
+The application reaches that socket through `bubbler-wl-proxy`, a sidecar in a
+bwrap of its own that decodes every message before forwarding it; the sandbox
+connects to `<instance runtime>/wayland` and the proxy to the socket above.
+
+A compositor that implements none of this gets the session socket as the
+proxy's upstream — the proxy then hides the privileged interfaces itself — and
+one note per launch:
 
 ```
-bubbler: warning: wayland: the compositor offers no wp_security_context_manager_v1, binding the host socket
+bubbler: note: wayland: no wp_security_context_manager_v1; the proxy hides the privileged globals instead
 ```
 
 `wayland "host"` asks for the session socket outright, with every global the

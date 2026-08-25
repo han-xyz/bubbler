@@ -300,6 +300,22 @@ pub fn real_init() -> Option<PathBuf> {
     None
 }
 
+/// The Wayland proxy binary beside the test's own, or `None` (after
+/// printing why) when the workspace has not built it. A run with a
+/// sandboxed `wayland` grant starts it, so a test that starts one needs
+/// it as much as it needs the supervisor.
+pub fn real_wl_proxy() -> Option<PathBuf> {
+    let path = Path::new(env!("CARGO_BIN_EXE_bubbler"))
+        .parent()
+        .expect("a cargo binary always has a parent directory")
+        .join("bubbler-wl-proxy");
+    if path.is_file() {
+        return Some(path);
+    }
+    say(&format!("skipping: {} is not built", path.display()));
+    None
+}
+
 /// How long a program this test wrote is given to stop being busy.
 const TXTBSY_LIMIT: Duration = Duration::from_secs(30);
 
@@ -459,6 +475,12 @@ pub fn bubbler_wayland(root: &Path, init: &Path) -> Command {
             c.env(var, value);
         }
     }
+    // The application reaches the compositor through the proxy, so a
+    // sandboxed `wayland` run needs the built binary and not the
+    // installed one, which a build tree has no reason to have.
+    if let Some(proxy) = real_wl_proxy() {
+        c.env("BUBBLER_WL_PROXY", proxy);
+    }
     c
 }
 
@@ -474,6 +496,11 @@ pub fn require_security_context() -> bool {
     }
     if std::env::var_os("WAYLAND_DISPLAY").is_none() {
         say("skipping: WAYLAND_DISPLAY unset");
+        return false;
+    }
+    // Every sandboxed `wayland` run puts the proxy in front of the
+    // socket, so a run cannot be tested without it.
+    if real_wl_proxy().is_none() {
         return false;
     }
     match bubbler_core::wayland::probe() {

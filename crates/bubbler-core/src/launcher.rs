@@ -35,7 +35,7 @@ use crate::error::{ConfigError, LaunchError};
 use crate::host::{Host, RealHost};
 use crate::instance::Instance;
 use crate::tty::{self, Pty, RawGuard, RelayEnd, StdioTarget, TtyMode};
-use crate::wayland::WaylandError;
+use crate::wayland::{ProxyPlan, WaylandError};
 use crate::{dbus, exec, init_bin, network, seccomp, service, wayland};
 
 /// How often a running sandbox is checked for having exited.
@@ -51,6 +51,10 @@ const PROXY_READY: Duration = Duration::from_secs(5);
 /// How long a proxy may take to leave after its ready pipe is closed
 /// before it is killed.
 const PROXY_STOP: Duration = Duration::from_secs(1);
+
+/// How long the Wayland proxy may take to leave after SIGTERM before it
+/// is killed.
+const WL_PROXY_STOP: Duration = Duration::from_secs(5);
 
 /// How long pasta has to report that it has configured the sandbox's
 /// network namespace.
@@ -98,6 +102,9 @@ impl FdAllocator for DryRunAlloc {
     fn ready_pipe(&mut self) -> io::Result<OsString> {
         self.bump()
     }
+    fn listener(&mut self) -> io::Result<OsString> {
+        self.bump()
+    }
     fn info_pipe(&mut self) -> io::Result<OsString> {
         self.bump()
     }
@@ -115,6 +122,10 @@ pub struct RealAlloc {
     /// The listening control socket, already dup'ed without `CLOEXEC`;
     /// `None` for a sidecar, which serves no exec channel.
     pub socket: Option<RawFd>,
+    /// The listening socket a sidecar accepts the application on, until
+    /// [`FdAllocator::listener`] hands it over. Handed out once: a
+    /// number given twice would be closed twice.
+    pub listen: Option<OwnedFd>,
     /// Read end of the ready pipe, once [`FdAllocator::ready_pipe`] made one.
     pub ready_read: Option<OwnedFd>,
     /// Read end of the info pipe bwrap reports the sandbox pid on.
@@ -133,6 +144,7 @@ impl RealAlloc {
         Self {
             fds: Vec::new(),
             socket: Some(socket),
+            listen: None,
             ready_read: None,
             info_read: None,
             info_write: None,
@@ -146,10 +158,20 @@ impl RealAlloc {
         Self {
             fds: Vec::new(),
             socket: None,
+            listen: None,
             ready_read: None,
             info_read: None,
             info_write: None,
             block_write: None,
+        }
+    }
+
+    /// Allocate for a sidecar that accepts on a socket bubbler has
+    /// already bound and listened on, which it inherits by number.
+    pub fn sidecar_listening(listener: OwnedFd) -> Self {
+        Self {
+            listen: Some(listener),
+            ..Self::sidecar()
         }
     }
 
@@ -212,6 +234,16 @@ impl FdAllocator for RealAlloc {
         fcntl_setfd(&read, FdFlags::CLOEXEC)?;
         self.ready_read = Some(read);
         Ok(self.keep(write))
+    }
+
+    /// The socket bubbler bound and listened on for this sidecar, handed
+    /// over by number. It is kept with the other inherited descriptors,
+    /// so it is inheritable for exactly the one spawn it was built for.
+    fn listener(&mut self) -> io::Result<OsString> {
+        match self.listen.take() {
+            Some(fd) => Ok(self.keep(fd)),
+            None => Err(io::Error::other("this sidecar has no listening socket")),
+        }
     }
 
     /// bwrap inherits the write end and reports the sandbox pid on it.
@@ -281,7 +313,7 @@ pub fn build_argv(
     alloc: &mut dyn FdAllocator,
     ctty: bool,
 ) -> Result<Vec<OsString>, LaunchError> {
-    build_argv_on(env, inst, command, alloc, ctty, &RealHost, None)
+    build_argv_on(env, inst, command, alloc, ctty, &RealHost)
 }
 
 /// [`build_argv`] against one view of the host, so a test can state which
@@ -293,9 +325,8 @@ fn build_argv_on(
     alloc: &mut dyn FdAllocator,
     ctty: bool,
     host: &dyn Host,
-    wayland_probe: Option<bool>,
 ) -> Result<Vec<OsString>, LaunchError> {
-    let (args, command) = build_args_on(env, inst, command, ctty, host, wayland_probe)?;
+    let (args, command) = build_args_on(env, inst, command, ctty, host)?;
     args.finish(command, alloc)
 }
 
@@ -320,30 +351,30 @@ fn explain_on(
     ctty: bool,
     host: &dyn Host,
 ) -> Result<Vec<Explained>, LaunchError> {
-    let (args, command) = build_args_on(env, inst, command, ctty, host, None)?;
+    let (args, command) = build_args_on(env, inst, command, ctty, host)?;
     args.finish_explained(command, &mut DryRunAlloc::default())
 }
 
 /// The builder and the command behind [`build_argv`], before the fds are
 /// numbered: what the argv and the explanation of it are both made from.
 ///
-/// `wayland_probe` is what the compositor answered about
-/// `wp_security_context_manager_v1`, and is `None` where nothing asked it:
-/// `--dry-run` and `--explain` never connect, so they describe the run a
-/// supporting compositor gets.
+/// Nothing here asks the compositor anything. A sandboxed `wayland`
+/// binds the socket bubbler's own proxy accepts on however the
+/// compositor answered about `wp_security_context_manager_v1`; that
+/// answer decides only what the proxy connects to, which is the
+/// sidecar's argv and not this one.
 fn build_args_on<'a>(
     env: &Env,
     inst: &'a Instance,
     command: Option<&'a [OsString]>,
     ctty: bool,
     host: &dyn Host,
-    wayland_probe: Option<bool>,
 ) -> Result<(BwrapArgs, &'a [OsString]), LaunchError> {
     let command = resolve_command(inst, command)?;
     let plan = dbus::plan(&inst.config.services, &inst.name);
     let instance_runtime = instance_runtime_dir(env, &inst.name);
-    let wayland_plan = wayland_mode(&inst.config.services)
-        .map(|m| wayland::plan(m, wayland_probe, &instance_runtime));
+    let wayland_plan =
+        wayland_mode(&inst.config.services).map(|m| wayland::plan(m, &instance_runtime));
     let ctx = service::ServiceCtx {
         instance_runtime,
         dbus: plan.as_ref(),
@@ -533,6 +564,103 @@ fn proxy_args(
     Ok((args, command))
 }
 
+/// Where a `wayland` grant sits in the config, which is what the
+/// sidecar's arguments are attributed to.
+fn wayland_node(services: &[Service]) -> Option<usize> {
+    services
+        .iter()
+        .position(|s| matches!(s, Service::Wayland(_)))
+}
+
+/// Complete bwrap argv (without the program name) for the Wayland proxy
+/// sidecar of one instance. `plan` says which sockets it serves and
+/// connects to; `alloc` hands over the listening socket and keeps the
+/// read end of the pipe the proxy reports readiness on.
+pub fn wl_proxy_argv(
+    env: &Env,
+    plan: &ProxyPlan,
+    node: usize,
+    host: &dyn Host,
+    alloc: &mut dyn FdAllocator,
+) -> Result<Vec<OsString>, LaunchError> {
+    let (args, command) = wl_proxy_args(env, plan, node, host, alloc)?;
+    let plain: Vec<OsString> = command.into_iter().map(|(arg, _)| arg).collect();
+    args.finish_plain(&plain, alloc)
+}
+
+/// Every argument of the Wayland sidecar's argv with what produced it,
+/// or `None` when the instance grants no sandboxed `wayland` and so
+/// starts no proxy. Nothing is probed and nothing is started: like the
+/// D-Bus proxy's, this is the argv a run would build, described.
+pub fn explain_wayland_proxy(
+    env: &Env,
+    inst: &Instance,
+) -> Result<Option<Vec<Explained>>, LaunchError> {
+    let (Some(plan), Some(node)) = (
+        wl_proxy_plan(env, inst),
+        wayland_node(&inst.config.services),
+    ) else {
+        return Ok(None);
+    };
+    let mut alloc = DryRunAlloc::default();
+    let (args, command) = wl_proxy_args(env, &plan, node, &RealHost, &mut alloc)?;
+    Ok(Some(args.finish_plain_explained(&command, &mut alloc)?))
+}
+
+/// How an explanation describes the Wayland proxy of `inst`, or `None`
+/// where the instance grants no sandboxed `wayland`.
+///
+/// The compositor is not asked anything — `--dry-run` and `--explain`
+/// connect to nothing — so this is the run a compositor that implements
+/// `wp_security_context_manager_v1` gets. One that does not says so on
+/// stderr and has the proxy hide the privileged globals instead.
+pub fn wl_proxy_plan(env: &Env, inst: &Instance) -> Option<ProxyPlan> {
+    match wayland_mode(&inst.config.services) {
+        Some(WaylandMode::Sandboxed { clipboard }) => Some(ProxyPlan::context(
+            &instance_runtime_dir(env, &inst.name),
+            clipboard,
+        )),
+        Some(WaylandMode::Host) | None => None,
+    }
+}
+
+/// The builder and the command behind [`wl_proxy_argv`], each command
+/// element with the node that asked for it. `alloc` numbers the
+/// listening socket first and the ready pipe second, which is the order
+/// the proxy's own arguments name them in.
+fn wl_proxy_args(
+    env: &Env,
+    plan: &ProxyPlan,
+    node: usize,
+    host: &dyn Host,
+    alloc: &mut dyn FdAllocator,
+) -> Result<(BwrapArgs, Vec<(OsString, Origin)>), LaunchError> {
+    let listen = alloc.listener().map_err(LaunchError::Data)?;
+    let ready = alloc.ready_pipe().map_err(LaunchError::Data)?;
+    let program = wayland::proxy_program(env);
+    let command: Vec<(OsString, Origin)> = plan
+        .command_nodes(&program, node, &listen, &ready)
+        .into_iter()
+        .map(|(arg, node)| (arg, node.map_or(Origin::Command, Origin::Service)))
+        .collect();
+    let mut args = BwrapArgs::wl_proxy_baseline(&plan.upstream, host);
+    // The sidecar has no `seccomp` node of its own: an instance may relax
+    // its own filter, never the one around the process holding its
+    // connection to the compositor.
+    args.tag(Origin::Seccomp);
+    if let Some(program) = seccomp::compile(&seccomp::RuleSet::default_set(), env.seccomp_log)? {
+        args.add_seccomp(program.bytes, program.arches);
+    }
+    // An overriding binary is not under the `/usr` this sandbox has, so
+    // it is bound in at its own path; the packaged proxy needs no bind.
+    if env.wl_proxy_override.is_some() {
+        args.tag(Origin::Command);
+        let program = service::require_file(host, "wayland", program)?;
+        args.ro_bind(&program, &program);
+    }
+    Ok((args, command))
+}
+
 /// A running proxy sidecar. Dropping every end of its `--fd` pipe that
 /// bubbler holds is what makes `xdg-dbus-proxy` exit, so the handle must
 /// outlive the sandbox that uses the socket.
@@ -604,27 +732,70 @@ fn wait_ready(ready: &OwnedFd, child: &mut Child, deadline: Instant) -> bool {
     }
 }
 
-/// A run's own Wayland socket, which the compositor accepts on as a
-/// security context. Dropping the handle is what ends that context: the
+/// A run's Wayland sidecar: the proxy the application connects to, the
+/// socket it accepts on, and, where the compositor took one, the
+/// security context it forwards through.
+///
+/// Dropping the handle stops the proxy and ends the context — the
 /// compositor stops accepting when the write end of the close pipe hangs
-/// up, so it must outlive the sandbox connecting through the socket.
+/// up — so it must outlive the sandbox connecting through the socket.
 #[derive(Debug)]
 pub struct WaylandHandle {
-    /// Write end of the pipe handed to the compositor as `close_fd`.
-    _close: OwnedFd,
-    /// Removes the listening socket when the run ends.
+    /// The proxy sidecar, in its own bwrap.
+    child: Child,
+    /// Holds the proxy's listening socket and both ends of its ready
+    /// pipe; clearing it is what closes them.
+    alloc: RealAlloc,
+    /// Write end of the pipe handed to the compositor as `close_fd`;
+    /// `None` where the compositor offers no security context.
+    _close: Option<OwnedFd>,
+    /// Removes the socket the application connects to when the run ends.
     _socket: FileGuard,
+    /// Removes the socket the compositor accepts on, where there is one.
+    _context: Option<FileGuard>,
 }
 
-/// Bind this run's own Wayland socket and register it with the compositor
-/// as a security context for the instance, so the application is a
-/// sandboxed client and the compositor withholds the privileged globals
-/// from it. `Ok(None)` when the compositor implements no security
-/// context: the run says so once and binds the session's socket instead.
+impl Drop for WaylandHandle {
+    /// Stop the proxy: SIGTERM, then SIGKILL if it is still there. The
+    /// signal goes to bwrap, whose `--die-with-parent` takes the proxy
+    /// inside it down with it; nothing else can, since the proxy holds
+    /// no pipe of bubbler's it could see hang up.
+    fn drop(&mut self) {
+        if let Some(pid) = i32::try_from(self.child.id()).ok().and_then(Pid::from_raw) {
+            let _ = kill_process(pid, Signal::TERM);
+        }
+        let deadline = Instant::now() + WL_PROXY_STOP;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => {}
+            }
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                break;
+            }
+            std::thread::sleep(POLL);
+        }
+        self.alloc.fds.clear();
+        self.alloc.ready_read.take();
+    }
+}
+
+/// Bind the socket this run's application connects to and put
+/// `bubbler-wl-proxy` in front of it, so every message the application
+/// sends the compositor is decoded and judged before it is forwarded and
+/// a clipboard read has to follow input of the user's.
 ///
-/// Called before the argv is built, like the D-Bus proxy: the answer
-/// decides which socket the argv names, and the socket has to be there
-/// for bwrap to bind. The handle must outlive the sandbox.
+/// Where the compositor implements `wp_security_context_v1` the proxy
+/// forwards through a second socket registered as a security context for
+/// the instance, so the compositor withholds the privileged globals as
+/// well; where it does not, the proxy connects to the session's own
+/// socket and hides those globals itself. `Ok(None)` only for
+/// `wayland "host"`, which asks for the session's socket outright.
+///
+/// Called before the argv is built, like the D-Bus proxy: the socket has
+/// to be there for bwrap to bind. The handle must outlive the sandbox.
 ///
 /// Nothing is connected to before the environment it would be connected
 /// through has been checked: wayrs reads `$WAYLAND_DISPLAY` and
@@ -632,41 +803,114 @@ pub struct WaylandHandle {
 pub fn start_wayland(
     env: &Env,
     dir: &Path,
-    instance: &str,
+    inst: &Instance,
+    host: &dyn Host,
 ) -> Result<Option<WaylandHandle>, LaunchError> {
+    let (Some(WaylandMode::Sandboxed { clipboard }), Some(node)) = (
+        wayland_mode(&inst.config.services),
+        wayland_node(&inst.config.services),
+    ) else {
+        return Ok(None);
+    };
     // The same check the bind makes, made before the connection rather
     // than after it: a display name that is a path would otherwise pick
     // the endpoint this run hands its listening socket to. Both values
     // go through it: the bind takes the name from `env`, and wayrs reads
     // the process environment itself, which nothing here can hand a
     // string of its own.
-    service::wayland_display(env)?;
+    let display = service::wayland_display(env)?;
     service::check_wayland_display(std::env::var_os("WAYLAND_DISPLAY").as_deref())?;
     wayland::refuse_inherited(std::env::var_os("WAYLAND_SOCKET").as_deref())?;
-    if !wayland::probe()? {
-        eprintln!(
-            "bubbler: warning: wayland: the compositor offers no \
-             wp_security_context_manager_v1, binding the host socket"
-        );
-        return Ok(None);
+    let plan = match wayland::probe()? {
+        true => ProxyPlan::context(dir, clipboard),
+        false => {
+            eprintln!(
+                "bubbler: note: wayland: no wp_security_context_manager_v1; \
+                 the proxy hides the privileged globals instead"
+            );
+            // The session's socket is bound into the proxy's sandbox, so
+            // it is type-checked like every other bind source.
+            let session = service::require_socket(host, "wayland", env.runtime_dir.join(display))?;
+            ProxyPlan::fallback(dir, session, clipboard)
+        }
+    };
+    // The compositor is accepting before the proxy can dial: the context
+    // is what makes the connection behind it a sandboxed client's.
+    let (close, context) = match plan.context {
+        true => {
+            let (close, guard) = bind_context(dir, &inst.name)?;
+            (Some(close), Some(guard))
+        }
+        false => (None, None),
+    };
+    let listener = bind_listener(&plan.listener)?;
+    let socket = FileGuard(plan.listener.clone());
+    let mut alloc = RealAlloc::sidecar_listening(listener.into());
+    let argv = wl_proxy_argv(env, &plan, node, host, &mut alloc)?;
+    alloc.inheritable(true).map_err(LaunchError::Data)?;
+    let child = Command::new("bwrap")
+        .args(&argv)
+        .spawn()
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => LaunchError::BwrapMissing,
+            _ => LaunchError::Spawn(e),
+        })?;
+    // From here on every exit path stops the proxy through the handle.
+    let mut handle = WaylandHandle {
+        child,
+        alloc,
+        _close: close,
+        _socket: socket,
+        _context: context,
+    };
+    // The instance's own bwrap must not inherit these: a second holder of
+    // the listening socket would keep the application's connections from
+    // ever reaching the proxy's `accept`.
+    handle.alloc.inheritable(false).map_err(LaunchError::Data)?;
+    let WaylandHandle { child, alloc, .. } = &mut handle;
+    let ready = alloc
+        .ready_read
+        .as_ref()
+        .ok_or_else(|| LaunchError::Data(io::Error::other("no ready pipe was allocated")))?;
+    if !wait_ready(ready, child, Instant::now() + PROXY_READY) {
+        let what = match child.try_wait() {
+            Ok(Some(status)) => format!("it exited ({status})"),
+            _ => format!("it did not report a listening socket within {PROXY_READY:?}"),
+        };
+        return Err(WaylandError::ProxyNotReady(what).into());
     }
-    let path = wayland::socket_path(dir);
-    // A socket left behind by a run that was killed before its guard ran.
-    // Only a missing file is nothing to do: anything else here is this
-    // instance's own 0700 directory refusing, which the bind would not
-    // survive either.
-    if let Err(e) = std::fs::remove_file(&path)
+    Ok(Some(handle))
+}
+
+/// Bind and listen on `path`, removing a socket an earlier run was
+/// killed before its guard could.
+///
+/// Only a missing file is nothing to do: anything else here is this
+/// instance's own 0700 directory refusing, which the bind would not
+/// survive either.
+fn bind_listener(path: &Path) -> Result<UnixListener, LaunchError> {
+    if let Err(e) = std::fs::remove_file(path)
         && e.kind() != io::ErrorKind::NotFound
     {
-        return Err(WaylandError::Listen(path, e).into());
+        return Err(WaylandError::Listen(path.to_path_buf(), e).into());
     }
-    let listener = UnixListener::bind(&path).map_err(|e| WaylandError::Listen(path.clone(), e))?;
+    UnixListener::bind(path).map_err(|e| WaylandError::Listen(path.to_path_buf(), e).into())
+}
+
+/// Bind the socket the compositor accepts on and register it as a
+/// security context for the instance, so a client arriving through it is
+/// a sandboxed one. The write end of the close pipe and the guard that
+/// removes the socket are the run's to hold: the context lasts exactly
+/// as long as they do.
+fn bind_context(dir: &Path, instance: &str) -> Result<(OwnedFd, FileGuard), LaunchError> {
+    let path = wayland::context_socket_path(dir);
+    let listener = bind_listener(&path)?;
     // From here the socket is this run's to remove, however the handshake
     // below goes.
-    let socket = FileGuard(path);
-    // Close-on-exec on both ends: the sandbox connects through the socket,
-    // and a copy of the write end inside it would keep the compositor
-    // accepting for as long as anything in there held it.
+    let guard = FileGuard(path);
+    // Close-on-exec on both ends: nothing but this process may hold the
+    // write end, or the compositor would keep accepting for as long as
+    // whatever inherited it lived.
     let (close_read, close_write) =
         pipe_with(PipeFlags::CLOEXEC).map_err(|e| WaylandError::Pipe(e.into()))?;
     wayland::create_context(
@@ -675,10 +919,7 @@ pub fn start_wayland(
         &dbus::app_id(instance),
         &dbus::flatpak_instance_id(instance),
     )?;
-    Ok(Some(WaylandHandle {
-        _close: close_write,
-        _socket: socket,
-    }))
+    Ok((close_write, guard))
 }
 
 /// Start the filtering D-Bus proxy for an instance in its own sandbox and
@@ -1836,20 +2077,13 @@ pub fn run(
             buses.push(adopt_proxy_bus(&dir, socket, node)?);
         }
     }
-    // Before the argv is built, for the same reason the proxy is, and
-    // with the answer the argv is built from: a compositor that takes the
-    // context is served this run's own socket, one that does not is fallen
-    // back to the session's. The handle holds the context open for the
-    // whole run.
-    let (_wayland, wayland_probe) = match wayland_mode(&inst.config.services) {
-        Some(WaylandMode::Sandboxed { .. }) => match start_wayland(env, &dir, &inst.name)? {
-            Some(handle) => (Some(handle), Some(true)),
-            None => (None, Some(false)),
-        },
-        // `wayland "host"` asks for the session's socket outright, and
-        // without the grant there is nothing to ask the compositor about.
-        Some(WaylandMode::Host) | None => (None, None),
-    };
+    // Before the argv is built, for the same reason the D-Bus proxy is:
+    // the socket the sandbox binds is the one this sidecar accepts on,
+    // and a bind of a socket nothing is listening on is a failed start.
+    // The handle holds the proxy and the security context open for the
+    // whole run. `wayland "host"` asks for the session's socket outright,
+    // and without the grant there is nothing to start.
+    let _wayland = start_wayland(env, &dir, inst, &RealHost)?;
     let host = tty::host_stdio()?;
     let is_tty = tty::host_is_tty();
     let mut stdio = tty::plan(mode, is_tty);
@@ -1866,15 +2100,7 @@ pub fn run(
     // Before the argv is built, for the same reason the proxy is: a bind
     // whose source is not there is a failed start, not a warning.
     prepare_app_runtime(env, &inst.config.services)?;
-    let argv = build_argv_on(
-        env,
-        inst,
-        command,
-        &mut alloc,
-        stdio.ctty(),
-        &RealHost,
-        wayland_probe,
-    )?;
+    let argv = build_argv_on(env, inst, command, &mut alloc, stdio.ctty(), &RealHost)?;
     let stop = Arc::new(AtomicBool::new(false));
     // What `stop` becomes once a run has seen it: `stop` is cleared as
     // the signal is acted on, this stays set for the rest of the run.
@@ -2132,7 +2358,6 @@ mod tests {
             &mut DryRunAlloc::default(),
             false,
             &device_host(tmp),
-            None,
         )
         .unwrap();
         strs(&argv)
@@ -2181,7 +2406,6 @@ mod tests {
             &mut DryRunAlloc::default(),
             false,
             &share_host(tmp.path()),
-            None,
         )
         .unwrap();
         assert_eq!(flat, argv);
@@ -2264,9 +2488,10 @@ mod tests {
         let dir = tmp.path().join("t");
         std::fs::create_dir(&dir).unwrap();
         let mut e = env(tmp.path());
+        let app = inst(tmp.path(), "wayland\ncommand \"true\"");
         for bad in ["../wayland-1", "/run/user/1000/wayland-1"] {
             e.wayland_display = Some(bad.into());
-            let err = start_wayland(&e, &dir, "t").expect_err(bad);
+            let err = start_wayland(&e, &dir, &app, &RealHost).expect_err(bad);
             assert!(
                 matches!(
                     err,
@@ -2280,12 +2505,34 @@ mod tests {
         }
         e.wayland_display = None;
         assert!(matches!(
-            start_wayland(&e, &dir, "t"),
+            start_wayland(&e, &dir, &app, &RealHost),
             Err(LaunchError::MissingEnv {
                 service: "wayland",
                 var: "WAYLAND_DISPLAY"
             })
         ));
+        assert!(!wayland::socket_path(&dir).exists());
+        assert!(!wayland::context_socket_path(&dir).exists());
+    }
+
+    /// Without the grant, and with `wayland "host"`, there is nothing to
+    /// start: the compositor is not connected to and no socket is bound.
+    #[test]
+    fn a_run_without_a_sandboxed_wayland_grant_starts_no_proxy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        std::fs::create_dir(&dir).unwrap();
+        let mut e = env(tmp.path());
+        // A name a bind would refuse, so a run that got as far as the
+        // check would fail rather than pass quietly.
+        e.wayland_display = Some("../wayland-1".into());
+        for kdl in ["command \"true\"", "wayland \"host\"\ncommand \"true\""] {
+            let app = inst(tmp.path(), kdl);
+            assert!(
+                start_wayland(&e, &dir, &app, &RealHost).unwrap().is_none(),
+                "{kdl}"
+            );
+        }
         assert!(!wayland::socket_path(&dir).exists());
     }
 
@@ -2313,6 +2560,7 @@ mod tests {
                     lines: &lines,
                 },
                 rules: &[],
+                wl_proxy: None,
                 proxy: false,
                 full: false,
             },
@@ -2703,6 +2951,222 @@ mod tests {
         assert!(matches!(
             exec(&e, "t", &[OsString::from("/usr/bin/true")], TtyMode::Passthrough),
             Err(LaunchError::NotRunning(n)) if n == "t"
+        ));
+    }
+
+    /// The proxy is stopped with the run: dropping the handle signals
+    /// the sidecar, waits for it and takes the application's socket
+    /// with it.
+    ///
+    /// A stand-in child rather than the proxy itself: what is under test
+    /// is the handle, and a run that reaches a real proxy needs a
+    /// compositor. The child's stdout is a pipe nothing else holds, so
+    /// its read end reports end of file exactly when the child is gone —
+    /// which no reused pid can fake.
+    #[test]
+    fn dropping_the_wayland_handle_stops_the_proxy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("wayland");
+        std::fs::write(&socket, b"").unwrap();
+        let (read, write) = rustix::pipe::pipe().unwrap();
+        let child = Command::new("/usr/bin/sleep")
+            .arg("600")
+            .stdout(Stdio::from(write))
+            .spawn()
+            .unwrap();
+        let handle = WaylandHandle {
+            child,
+            alloc: RealAlloc::sidecar(),
+            _close: None,
+            _socket: FileGuard(socket.clone()),
+            _context: None,
+        };
+        let started = Instant::now();
+        drop(handle);
+        assert!(
+            started.elapsed() < WL_PROXY_STOP,
+            "the drop waited out the kill deadline"
+        );
+        let slice = Timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
+        assert!(
+            poll(&mut [PollFd::new(&read, PollFlags::IN)], Some(&slice)).unwrap() > 0,
+            "the stand-in proxy is still running"
+        );
+        let mut byte = [0u8; 1];
+        assert_eq!(rustix::io::read(&read, &mut byte).unwrap(), 0);
+        assert!(!socket.exists(), "the socket outlived the run");
+    }
+
+    /// Pinned: the sandbox the Wayland proxy runs in and the argv it is
+    /// run with are the contract with `bubbler-wl-proxy`. Nothing of the
+    /// session is in here but the socket it forwards to — the socket it
+    /// accepts on arrives as descriptor 3 and is bound nowhere.
+    #[test]
+    fn wl_proxy_argv_runs_the_proxy_in_its_own_sandbox() {
+        use crate::config::Clipboard;
+        use crate::host::fake::FakeHost;
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let dir = Path::new("/run/user/1000/bubbler/t");
+        let plan = ProxyPlan::context(dir, Clipboard::Paste);
+        let argv = wl_proxy_argv(
+            &e,
+            &plan,
+            0,
+            &FakeHost::default(),
+            &mut DryRunAlloc::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            strs(&argv),
+            vec![
+                "--unshare-all",
+                "--die-with-parent",
+                "--new-session",
+                "--add-seccomp-fd",
+                "5",
+                "--ro-bind",
+                "/usr",
+                "/usr",
+                "--symlink",
+                "usr/bin",
+                "/bin",
+                "--symlink",
+                "usr/lib",
+                "/lib",
+                "--symlink",
+                "usr/lib64",
+                "/lib64",
+                "--symlink",
+                "usr/bin",
+                "/sbin",
+                "--tmpfs",
+                "/etc",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--tmpfs",
+                "/tmp",
+                "--ro-bind",
+                "/run/user/1000/bubbler/t/wayland-context",
+                "/run/user/1000/bubbler/t/wayland-context",
+                "--clearenv",
+                "--",
+                "/usr/lib/bubbler/bubbler-wl-proxy",
+                "--listen-fd",
+                "3",
+                "--upstream",
+                "/run/user/1000/bubbler/t/wayland-context",
+                "--gate",
+                "paste",
+                "--log-fd",
+                "2",
+                "--ready-fd",
+                "4",
+            ]
+        );
+    }
+
+    /// Without a security context the proxy is pointed at the session's
+    /// own socket — the only one it can then reach — and told to hide
+    /// the privileged globals itself. `clipboard="open"` is the gate.
+    #[test]
+    fn the_fallback_proxy_dials_the_session_socket_and_denies() {
+        use crate::config::Clipboard;
+        use crate::host::fake::FakeHost;
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let dir = Path::new("/run/user/1000/bubbler/t");
+        let plan = ProxyPlan::fallback(dir, "/run/user/1000/wayland-1".into(), Clipboard::Open);
+        let argv = strs(
+            &wl_proxy_argv(
+                &e,
+                &plan,
+                0,
+                &FakeHost::default(),
+                &mut DryRunAlloc::default(),
+            )
+            .unwrap(),
+        );
+        let tail: Vec<&str> = argv
+            .iter()
+            .skip_while(|a| *a != "--")
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            tail,
+            [
+                "--",
+                "/usr/lib/bubbler/bubbler-wl-proxy",
+                "--listen-fd",
+                "3",
+                "--upstream",
+                "/run/user/1000/wayland-1",
+                "--gate",
+                "open",
+                "--fallback-deny",
+                "--log-fd",
+                "2",
+                "--ready-fd",
+                "4",
+            ]
+        );
+        assert!(
+            argv.windows(3).any(|w| w
+                == [
+                    "--ro-bind",
+                    "/run/user/1000/wayland-1",
+                    "/run/user/1000/wayland-1"
+                ]),
+            "{argv:?}"
+        );
+        // The security-context socket is never bound: there is none.
+        assert!(
+            !argv.iter().any(|a| a.ends_with("wayland-context")),
+            "{argv:?}"
+        );
+    }
+
+    /// An overriding binary is not under the `/usr` the sidecar has, so
+    /// it is bound in at its own path, and a name that is not a file is
+    /// refused rather than handed to bwrap.
+    #[test]
+    fn an_overridden_proxy_binary_is_bound_into_its_own_sandbox() {
+        use crate::config::Clipboard;
+        use crate::host::fake::FakeHost;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut e = env(tmp.path());
+        e.wl_proxy_override = Some("/build/bubbler-wl-proxy".into());
+        let plan = ProxyPlan::context(Path::new("/run/user/1000/bubbler/t"), Clipboard::Paste);
+        let (file, _, _) = crate::host::fake::types();
+        let host = FakeHost::default().with("/build/bubbler-wl-proxy", file);
+        let argv = strs(&wl_proxy_argv(&e, &plan, 0, &host, &mut DryRunAlloc::default()).unwrap());
+        assert!(
+            argv.windows(3).any(|w| w
+                == [
+                    "--ro-bind",
+                    "/build/bubbler-wl-proxy",
+                    "/build/bubbler-wl-proxy"
+                ]),
+            "{argv:?}"
+        );
+        assert!(argv.contains(&"/build/bubbler-wl-proxy".to_owned()));
+        assert!(matches!(
+            wl_proxy_argv(
+                &e,
+                &plan,
+                0,
+                &FakeHost::default(),
+                &mut DryRunAlloc::default()
+            ),
+            Err(LaunchError::MissingResource {
+                service: "wayland",
+                ..
+            })
         ));
     }
 

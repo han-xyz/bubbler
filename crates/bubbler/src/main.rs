@@ -63,6 +63,7 @@ struct Explaining {
     mode: Explain,
     format: Format,
     proxy: bool,
+    wl_proxy: bool,
 }
 
 /// bubblewrap-based application sandbox.
@@ -118,6 +119,10 @@ that same argv grouped under the config node each argument came from.")]
         /// instead of the sandbox's.
         #[arg(long, requires = "explain")]
         proxy: bool,
+        /// With `--explain`: explain the Wayland proxy sidecar's argv
+        /// instead of the sandbox's.
+        #[arg(long, requires = "explain", conflicts_with = "proxy")]
+        wl_proxy: bool,
         /// With `--explain`: `text` to read, `json` for tooling.
         #[arg(
             long,
@@ -163,6 +168,10 @@ status; `--keep <name>` renames it into an instance instead.")]
         /// instead of the sandbox's.
         #[arg(long, requires = "explain")]
         proxy: bool,
+        /// With `--explain`: explain the Wayland proxy sidecar's argv
+        /// instead of the sandbox's.
+        #[arg(long, requires = "explain", conflicts_with = "proxy")]
+        wl_proxy: bool,
         /// With `--explain`: `text` to read, `json` for tooling.
         #[arg(
             long,
@@ -540,8 +549,9 @@ fn print_echoed_bytes(bytes: &[u8], what: &str) -> Result<i32> {
 }
 
 /// Print the argv of `inst` with every argument under the node it came
-/// from, or, with `--proxy`, the argv of its D-Bus proxy sidecar. Nothing
-/// is started: `--explain` is a `--dry-run` with a different framing.
+/// from, or, with `--proxy` or `--wl-proxy`, the argv of one of its
+/// sidecars. Nothing is started: `--explain` is a `--dry-run` with a
+/// different framing.
 fn explain(
     env: &Env,
     inst: &Instance,
@@ -549,8 +559,8 @@ fn explain(
     ctty: bool,
     opts: &Explaining,
 ) -> Result<i32> {
-    let (title, items) = match opts.proxy {
-        true => (
+    let (title, items) = match (opts.proxy, opts.wl_proxy) {
+        (true, _) => (
             "bwrap  (the D-Bus proxy sidecar)",
             launcher::explain_proxy(env, inst)
                 .context("building the proxy's bwrap arguments")?
@@ -561,7 +571,19 @@ fn explain(
                     )
                 })?,
         ),
-        false => (
+        (_, true) => (
+            "bwrap  (the Wayland proxy sidecar)",
+            launcher::explain_wayland_proxy(env, inst)
+                .context("building the Wayland proxy's bwrap arguments")?
+                .with_context(|| {
+                    format!(
+                        "instance `{}` grants no sandboxed wayland, so it starts no \
+                         Wayland proxy sidecar",
+                        inst.name
+                    )
+                })?,
+        ),
+        _ => (
             "bwrap",
             launcher::explain(env, inst, command, ctty).context("building bwrap arguments")?,
         ),
@@ -579,6 +601,7 @@ fn explain(
         lines = config::Lines::default();
     }
     let rules = explain::rules(&inst.config, &inst.name);
+    let wl_proxy = launcher::wl_proxy_plan(env, inst);
     let view = explain::View {
         title,
         instance: &inst.name,
@@ -588,7 +611,8 @@ fn explain(
             lines: &lines,
         },
         rules: &rules,
-        proxy: opts.proxy,
+        wl_proxy: wl_proxy.as_ref(),
+        proxy: opts.proxy || opts.wl_proxy,
         full: opts.mode == Explain::Full,
     };
     let rendered = match opts.format {
@@ -897,6 +921,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             dry_run,
             explain: explain_mode,
             proxy,
+            wl_proxy,
             format,
             tty,
             command,
@@ -929,6 +954,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                         mode,
                         format,
                         proxy,
+                        wl_proxy,
                     },
                 );
             }
@@ -968,6 +994,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             keep,
             explain: explain_mode,
             proxy,
+            wl_proxy,
             format,
             tty,
             command,
@@ -988,6 +1015,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                         mode,
                         format,
                         proxy,
+                        wl_proxy,
                     },
                 );
                 // The sandbox directory must outlive the explanation:

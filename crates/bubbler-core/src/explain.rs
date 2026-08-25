@@ -65,6 +65,10 @@ pub struct View<'a> {
     /// The D-Bus proxy rules each node contributes, as [`rules`] collects
     /// them, so a node whose whole grant is rules can show them.
     pub rules: &'a [(usize, String)],
+    /// How the Wayland proxy is run for this instance, which no argument
+    /// of the sandbox's own argv shows; `None` where the config grants
+    /// no sandboxed `wayland` and so starts none.
+    pub wl_proxy: Option<&'a wayland::ProxyPlan>,
     /// The sidecar's argv rather than the sandbox's: its groups are the
     /// rules themselves, and a grant that contributes neither an argument
     /// nor a rule to it is not a group of it.
@@ -328,6 +332,23 @@ fn sidecar_line(cfg: &NetworkConfig) -> String {
     line
 }
 
+/// The Wayland proxy a bare `wayland` node is served by: which socket
+/// the application connects to, which the proxy forwards to, and what it
+/// does with a clipboard read. None of it is a bwrap argument of the
+/// sandbox, so nothing else in this view would show it.
+fn wl_sidecar_line(plan: &wayland::ProxyPlan) -> String {
+    let mut line = format!(
+        "    sidecar: bubbler-wl-proxy listener {} → {}, gate {}",
+        plan.listener.display(),
+        plan.upstream.display(),
+        plan.gate()
+    );
+    if !plan.context {
+        line.push_str(", hides privileged globals");
+    }
+    line
+}
+
 /// The D-Bus proxy rules of the node at `index`, in the order the proxy
 /// is given them.
 fn rules_of(index: usize, rules: &[(usize, String)]) -> Vec<String> {
@@ -416,12 +437,15 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
                     // for an explanation, so this is what a run gets on a
                     // compositor that implements the protocol; one that
                     // does not says so on stderr and binds the session's.
-                    Some(Service::Wayland(WaylandMode::Sandboxed { .. })) => out.push(format!(
-                        "    security-context: engine={} app={} instance={}",
-                        wayland::ENGINE,
-                        dbus::app_id(view.instance),
-                        dbus::flatpak_instance_id(view.instance)
-                    )),
+                    Some(Service::Wayland(WaylandMode::Sandboxed { .. })) => {
+                        out.push(format!(
+                            "    security-context: engine={} app={} instance={}",
+                            wayland::ENGINE,
+                            dbus::app_id(view.instance),
+                            dbus::flatpak_instance_id(view.instance)
+                        ));
+                        out.extend(view.wl_proxy.map(wl_sidecar_line));
+                    }
                     Some(Service::Wayland(WaylandMode::Host)) => {
                         out.push("    raw socket: wayland \"host\"".to_owned());
                     }
@@ -538,10 +562,10 @@ fn quote_os(s: &OsStr) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ShareMode;
+    use crate::config::{Clipboard, ShareMode};
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStrExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn item(origin: Origin, args: &[&str], note: Option<&str>) -> Explained {
         Explained {
@@ -618,6 +642,7 @@ mod tests {
                     lines: &lines,
                 },
                 rules: &rules,
+                wl_proxy: None,
                 proxy: false,
                 full: false,
             },
@@ -688,6 +713,7 @@ bwrap
                     lines: &lines,
                 },
                 rules: &[],
+                wl_proxy: None,
                 proxy: false,
                 full: false,
             },
@@ -697,6 +723,57 @@ bwrap
             out.contains(&"    raw socket: wayland \"host\"".to_owned()),
             "{out:#?}"
         );
+    }
+
+    /// The proxy in front of a sandboxed `wayland` is a process, not an
+    /// argument, so it is a line of its own: which socket the
+    /// application reaches, which the proxy forwards to, and what it
+    /// does with a clipboard read.
+    #[test]
+    fn a_sandboxed_wayland_grant_names_the_proxy_in_front_of_it() {
+        let dir = Path::new("/run/user/1000/bubbler/t");
+        let session = PathBuf::from("/run/user/1000/wayland-1");
+        for (plan, expected) in [
+            (
+                wayland::ProxyPlan::context(dir, Clipboard::Paste),
+                "    sidecar: bubbler-wl-proxy listener \
+                 /run/user/1000/bubbler/t/wayland → /run/user/1000/bubbler/t/wayland-context, gate paste",
+            ),
+            (
+                wayland::ProxyPlan::fallback(dir, session, Clipboard::Open),
+                "    sidecar: bubbler-wl-proxy listener \
+                 /run/user/1000/bubbler/t/wayland → /run/user/1000/wayland-1, gate open, hides privileged globals",
+            ),
+        ] {
+            let cfg = cfg("wayland\ncommand \"true\"");
+            let lines = Lines::default();
+            let out = render(
+                &[item(
+                    Origin::Service(0),
+                    &["--ro-bind", "/run/t/wayland", "/run/wayland-1"],
+                    None,
+                )],
+                &View {
+                    title: "bwrap",
+                    instance: "t",
+                    cfg: &cfg,
+                    source: Source {
+                        file: "config.kdl",
+                        lines: &lines,
+                    },
+                    rules: &[],
+                    wl_proxy: Some(&plan),
+                    proxy: false,
+                    full: false,
+                },
+            )
+            .unwrap();
+            assert!(out.contains(&expected.to_owned()), "{out:#?}");
+            // Beneath the identity the compositor is given, which is the
+            // other half of what the one bind does not show.
+            let at = |needle: &str| out.iter().position(|l| l.starts_with(needle));
+            assert!(at("    security-context:") < at("    sidecar:"), "{out:#?}");
+        }
     }
 
     /// Which X server an `x11` grant runs is not in its arguments
@@ -719,6 +796,7 @@ bwrap
                         lines: &lines,
                     },
                     rules: &[],
+                    wl_proxy: None,
                     proxy: false,
                     full: false,
                 },
@@ -817,6 +895,7 @@ bwrap
                     lines: &lines,
                 },
                 rules: &rules,
+                wl_proxy: None,
                 proxy: false,
                 full: false,
             },
@@ -868,6 +947,7 @@ bwrap
                         lines: &lines,
                     },
                     rules: &bare_rules,
+                    wl_proxy: None,
                     proxy: false,
                     full: false,
                 },
@@ -902,6 +982,7 @@ bwrap
                     lines: &lines,
                 },
                 rules: &node_rules,
+                wl_proxy: None,
                 proxy: false,
                 full: false,
             },
@@ -927,6 +1008,7 @@ bwrap
                     lines: &Lines::default(),
                 },
                 rules: &[],
+                wl_proxy: None,
                 proxy: false,
                 full: true,
             },
@@ -969,6 +1051,7 @@ bwrap
                     lines: &lines,
                 },
                 rules: &[],
+                wl_proxy: None,
                 proxy: false,
                 full: false,
             },
@@ -1011,6 +1094,7 @@ bwrap
                 lines: &lines,
             },
             rules: &rules,
+            wl_proxy: None,
             proxy: true,
             full: true,
         };
@@ -1043,6 +1127,7 @@ bwrap
                     lines: &lines,
                 },
                 rules: &[],
+                wl_proxy: None,
                 proxy: false,
                 full: false,
             },
@@ -1081,6 +1166,7 @@ bwrap
                     lines: &lines,
                 },
                 rules: &[],
+                wl_proxy: None,
                 proxy: false,
                 full: false,
             },
@@ -1117,6 +1203,7 @@ bwrap
                     lines: &lines,
                 },
                 rules: &[],
+                wl_proxy: None,
                 proxy: false,
                 full: false,
             },
@@ -1144,6 +1231,7 @@ bwrap
                     lines: &Lines::default(),
                 },
                 rules: &[],
+                wl_proxy: None,
                 proxy: false,
                 full: false,
             },
@@ -1200,6 +1288,7 @@ bwrap
                     lines: &lines,
                 },
                 rules: &[],
+                wl_proxy: None,
                 proxy: false,
                 full: false,
             },

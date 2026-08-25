@@ -252,9 +252,9 @@ pub(crate) fn wayland_display(env: &Env) -> Result<&OsStr, LaunchError> {
 }
 
 /// Bind a Wayland socket at `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`, which
-/// must be a plain socket name: the run's own listening socket when the
-/// compositor took a security context for it, the session's own socket
-/// otherwise. Arch wiki (Bubblewrap/Examples) pattern.
+/// must be a plain socket name: the socket bubbler's own proxy accepts
+/// on for a sandboxed grant, the session's own socket for
+/// `wayland "host"`. Arch wiki (Bubblewrap/Examples) pattern.
 /// `XDG_SESSION_TYPE=wayland` only when X11 is not also granted, so
 /// toolkits do not get mixed signals.
 fn wayland(
@@ -269,7 +269,7 @@ fn wayland(
     match plan {
         // The launcher creates this one after the argv is built, like the
         // proxied bus socket, so there is nothing here to probe.
-        Some(WaylandPlan::Context { socket }) => args.ro_bind(socket, &inside),
+        Some(WaylandPlan::Proxy { socket }) => args.ro_bind(socket, &inside),
         // A missing plan is read as the session's socket: a caller that
         // built the context by hand must not get a bind of a socket
         // nobody is going to create.
@@ -1127,7 +1127,6 @@ mod tests {
     use super::*;
     use crate::config::{NestedX11, WaylandMode};
     use crate::host::fake::{self, FakeHost};
-    use crate::wayland::RawReason;
     use std::ffi::OsString;
 
     #[derive(Clone, Copy, Debug)]
@@ -1340,12 +1339,12 @@ mod tests {
         assert!(wayland_display(&e).is_err());
     }
 
-    /// The launcher's own socket is bound at the host socket's name, and
-    /// is not probed: it is created after the argv is built. The name is
+    /// The proxy's own socket is bound at the host socket's name, and is
+    /// not probed: it is created after the argv is built. The name is
     /// still validated, so a plan cannot smuggle a path past that check.
     #[test]
     fn wayland_context_binds_bubblers_socket_at_the_host_name() {
-        let plan = WaylandPlan::Context {
+        let plan = WaylandPlan::Proxy {
             socket: "/run/user/1000/bubbler/t/wayland".into(),
         };
         let a = argv_wayland(&plan, &env(), &[]).unwrap();
@@ -1375,29 +1374,27 @@ mod tests {
         ));
     }
 
-    /// Either way of ending up on the session's socket binds the host's
-    /// own, and still requires it to be there and to be a socket.
+    /// `wayland "host"` binds the session's own socket, and still
+    /// requires it to be there and to be a socket.
     #[test]
-    fn wayland_raw_binds_the_host_socket_for_either_reason() {
-        for reason in [RawReason::ConfigHost, RawReason::NoManager] {
-            let plan = WaylandPlan::Raw { reason };
-            let a = argv_wayland(&plan, &env(), &[("/run/user/1000/wayland-1", Sock)]).unwrap();
-            assert!(
-                has_seq(
-                    &a,
-                    &[
-                        "--ro-bind",
-                        "/run/user/1000/wayland-1",
-                        "/run/user/1000/wayland-1"
-                    ]
-                ),
-                "{a:?}"
-            );
-            assert!(
-                argv_wayland(&plan, &env(), &[]).is_err(),
-                "raw still requires the host socket"
-            );
-        }
+    fn wayland_host_binds_the_session_socket() {
+        let plan = WaylandPlan::Host;
+        let a = argv_wayland(&plan, &env(), &[("/run/user/1000/wayland-1", Sock)]).unwrap();
+        assert!(
+            has_seq(
+                &a,
+                &[
+                    "--ro-bind",
+                    "/run/user/1000/wayland-1",
+                    "/run/user/1000/wayland-1"
+                ]
+            ),
+            "{a:?}"
+        );
+        assert!(
+            argv_wayland(&plan, &env(), &[]).is_err(),
+            "the host socket is still required to be there"
+        );
     }
 
     #[test]

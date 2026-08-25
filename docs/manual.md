@@ -211,6 +211,7 @@ file descriptor numbers are the ones a dry run prints.
     bubbler run ff --explain               # groups, with the baseline summed up
     bubbler run ff --explain=full          # every argument, the baseline included
     bubbler run ff --explain --proxy       # the D-Bus proxy sidecar's argv instead
+    bubbler run ff --explain --wl-proxy    # the Wayland proxy sidecar's argv instead
     bubbler run ff --explain --format json # one object per operation, nothing elided
     bubbler try --profile firefox --explain
 
@@ -246,6 +247,7 @@ file descriptor numbers are the ones a dry run prints.
         --setenv WAYLAND_DISPLAY wayland-1
         --setenv XDG_SESSION_TYPE wayland
         security-context: engine=org.bubbler app=org.bubbler.ff instance=bubbler-ff
+        sidecar: bubbler-wl-proxy listener /run/user/1000/bubbler/ff/wayland → /run/user/1000/bubbler/ff/wayland-context, gate paste
 
       network                         config.kdl:7   5 arguments
         --perms 0644 --ro-bind-data 8 /etc/resolv.conf  (generated file, 23 bytes)
@@ -272,8 +274,11 @@ A grant that is not only bwrap arguments says so under its own group: a `dbus`
 node lists the `rules:` it hands the proxy, an isolated `network` lists the
 `sidecar:` argv pasta is started with, and a `wayland` node says which socket
 the one bind is — `security-context:` with the three strings a bare grant
-registers, `raw socket: wayland "host"` for the session's own — none of which
-is in the argv, and `--dry-run` prints the sandbox's argv alone.
+registers plus the `sidecar:` line naming the proxy in front of it, its two
+sockets and its gate, `raw socket: wayland "host"` for the session's own — none
+of which is in the argv, and `--dry-run` prints the sandbox's argv alone.
+`--explain --proxy` prints the D-Bus proxy's own argv and `--explain --wl-proxy`
+the Wayland proxy's.
 
 Every generated descriptor says what is behind it: the size of the seccomp
 filter and the architectures it carries, the size of a `--ro-bind-data`, which
@@ -512,11 +517,20 @@ connection to it is gone, until the descriptor it was given as `close_fd` hangs
 up. bubbler holds the write end of that pipe for the length of the run, so the
 context ends when the run does and the socket file goes with it.
 
-A compositor that implements none of this — no `wp_security_context_manager_v1`
-in its globals — is not a failed run: the launcher says so once per launch and
-binds the session socket instead.
+The application does not connect to that socket itself. bubbler binds a second
+one beside it — `<instance runtime>/wayland`, which is what the sandbox sees —
+and runs `bubbler-wl-proxy` between the two in a bwrap of its own, so every
+message the application sends the compositor is decoded and judged first, and
+where a clipboard read is gated on input of the user's. The sidecar is started
+before the sandbox and stopped with it, and `bubbler run … --explain --wl-proxy`
+prints the bwrap argv it runs under.
 
-    bubbler: warning: wayland: the compositor offers no wp_security_context_manager_v1, binding the host socket
+A compositor that implements none of this — no `wp_security_context_manager_v1`
+in its globals — is not a failed run: the proxy connects to the session socket
+instead and hides the privileged interfaces itself, in the compositor's place,
+and the launcher says so once per launch.
+
+    bubbler: note: wayland: no wp_security_context_manager_v1; the proxy hides the privileged globals instead
 
 A compositor bubbler cannot reach at all — nothing answering on
 `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY` — stops the run instead, the way a missing
@@ -2621,6 +2635,7 @@ nightly to actually fuzz.
 
     install -Dm755 target/release/bubbler      /usr/bin/bubbler
     install -Dm755 target/release/bubbler-init /usr/lib/bubbler/bubbler-init
+    install -Dm755 target/release/bubbler-wl-proxy /usr/lib/bubbler/bubbler-wl-proxy
     install -Dm755 target/release/bubbler-ui   /usr/bin/bubbler-ui
     target/release/bubbler man          > /usr/share/man/man1/bubbler.1
     target/release/bubbler man --config > /usr/share/man/man5/bubbler-config.5

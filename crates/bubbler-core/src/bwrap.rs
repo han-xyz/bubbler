@@ -103,6 +103,9 @@ pub trait FdAllocator {
     fn init_socket(&mut self) -> io::Result<OsString>;
     /// Fd a sidecar reports readiness on; the allocator keeps the other end.
     fn ready_pipe(&mut self) -> io::Result<OsString>;
+    /// Fd of a listening socket bubbler bound for a sidecar to accept
+    /// the application's connections on.
+    fn listener(&mut self) -> io::Result<OsString>;
     /// Fd bwrap reports the sandbox pid on; the allocator keeps the read end.
     fn info_pipe(&mut self) -> io::Result<OsString>;
     /// Fd the sandbox is held at until released; the allocator keeps the
@@ -344,25 +347,17 @@ impl BwrapArgs {
         a
     }
 
-    /// The sandbox the D-Bus proxy sidecar runs in: the same namespace
+    /// What every sidecar sandbox starts from: the same namespace
     /// restrictions as [`BwrapArgs::baseline`], a read-only `/usr` and a
-    /// minimal `/etc` ([`PROXY_ETC`]) so the proxy binary can start, no
-    /// home, no runtime dir of its own, and only these paths from the
-    /// session: the host socket of each bus it was asked for, read-only,
-    /// and `socket_dir` read-write, which is where it creates the
-    /// filtered sockets. The environment is cleared; the addresses are
-    /// arguments.
+    /// minimal `/etc` ([`PROXY_ETC`]) so the sidecar binary can start,
+    /// no home and no runtime dir of its own. The environment is
+    /// cleared; whatever a sidecar needs to reach is an argument of it.
     ///
-    /// `socket_dir` is a directory of its own, never the instance's
-    /// runtime directory: that one holds the supervisor's control socket,
+    /// Nothing of the session is here. Each sidecar adds the one or two
+    /// paths it serves, and nothing else: the instance's runtime
+    /// directory in particular holds the supervisor's control socket,
     /// and a process that reaches it can run commands inside the app.
-    pub fn proxy_baseline(
-        host_bus: Option<&Path>,
-        host_system_bus: Option<&Path>,
-        host_a11y_bus: Option<&Path>,
-        socket_dir: &Path,
-        host: &dyn Host,
-    ) -> Self {
+    fn sidecar_baseline(host: &dyn Host) -> Self {
         let mut a = Self {
             namespaces: Vec::new(),
             skeleton: Vec::new(),
@@ -405,6 +400,28 @@ impl BwrapArgs {
         push(&mut a.skeleton, b, [o("--proc"), o("/proc")]);
         push(&mut a.skeleton, b, [o("--dev"), o("/dev")]);
         push(&mut a.skeleton, b, [o("--tmpfs"), o("/tmp")]);
+        push(&mut a.env, b, [o("--clearenv")]);
+        a
+    }
+
+    /// The sandbox the D-Bus proxy sidecar runs in: the sidecar baseline
+    /// plus the host socket of each bus it was asked for, read-only, and
+    /// `socket_dir` read-write, which is where it creates the filtered
+    /// sockets. The addresses are arguments, not environment.
+    ///
+    /// `socket_dir` is a directory of its own, never the instance's
+    /// runtime directory: that one holds the supervisor's control socket,
+    /// and a process that reaches it can run commands inside the app.
+    pub fn proxy_baseline(
+        host_bus: Option<&Path>,
+        host_system_bus: Option<&Path>,
+        host_a11y_bus: Option<&Path>,
+        socket_dir: &Path,
+        host: &dyn Host,
+    ) -> Self {
+        let mut a = Self::sidecar_baseline(host);
+        let o = OsStr::new;
+        let b = Origin::Baseline;
         // Only the buses this proxy was asked for: a socket bound here
         // that no section names is a host bus the proxy could still reach.
         for bus in [host_bus, host_system_bus, host_a11y_bus]
@@ -424,7 +441,28 @@ impl BwrapArgs {
             b,
             [o("--bind"), socket_dir.as_os_str(), socket_dir.as_os_str()],
         );
-        push(&mut a.env, b, [o("--clearenv")]);
+        a
+    }
+
+    /// The sandbox the Wayland proxy sidecar runs in: the sidecar
+    /// baseline plus `upstream`, the compositor socket it forwards the
+    /// application's connection to, read-only and at its own path.
+    ///
+    /// That socket is the only thing of the session in here. The socket
+    /// the proxy accepts the application on is not bound at all: it is
+    /// handed over as a descriptor, so the proxy can neither reach the
+    /// directory it lives in nor create anything beside it.
+    pub fn wl_proxy_baseline(upstream: &Path, host: &dyn Host) -> Self {
+        let mut a = Self::sidecar_baseline(host);
+        push(
+            &mut a.skeleton,
+            Origin::Baseline,
+            [
+                OsStr::new("--ro-bind"),
+                upstream.as_os_str(),
+                upstream.as_os_str(),
+            ],
+        );
         a
     }
 
@@ -838,6 +876,9 @@ mod tests {
         fn ready_pipe(&mut self) -> io::Result<OsString> {
             self.bump()
         }
+        fn listener(&mut self) -> io::Result<OsString> {
+            self.bump()
+        }
         fn info_pipe(&mut self) -> io::Result<OsString> {
             self.bump()
         }
@@ -863,6 +904,9 @@ mod tests {
         fn ready_pipe(&mut self) -> io::Result<OsString> {
             self.next.bump()
         }
+        fn listener(&mut self) -> io::Result<OsString> {
+            self.next.bump()
+        }
         fn info_pipe(&mut self) -> io::Result<OsString> {
             self.next.bump()
         }
@@ -881,6 +925,9 @@ mod tests {
             Err(io::Error::other("nope"))
         }
         fn ready_pipe(&mut self) -> io::Result<OsString> {
+            Err(io::Error::other("nope"))
+        }
+        fn listener(&mut self) -> io::Result<OsString> {
             Err(io::Error::other("nope"))
         }
         fn info_pipe(&mut self) -> io::Result<OsString> {

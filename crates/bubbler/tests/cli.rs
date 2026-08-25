@@ -607,6 +607,125 @@ fn explain_full_lists_the_baseline_and_json_elides_nothing() {
     assert_eq!(quoted, elements, "{s}");
 }
 
+/// The Wayland sidecar is explained the way the D-Bus one is: its own
+/// argv, the gate under the node that decided it, and a clear refusal
+/// where the instance starts none.
+#[test]
+fn explain_wl_proxy_explains_the_sidecar_and_says_when_there_is_none() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "wayland clipboard=\"open\"\ncommand \"true\"\n").unwrap();
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--explain=full", "--wl-proxy"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run = tmp.path().join("run");
+    assert!(s.starts_with("bwrap  (the Wayland proxy sidecar)\n"), "{s}");
+    // The one socket of the session it can reach, and the argv that
+    // makes it forward to it.
+    assert!(
+        s.contains(&format!(
+            "\n    --ro-bind {run}/bubbler/t/wayland-context \
+             {run}/bubbler/t/wayland-context\n",
+            run = run.display()
+        )),
+        "{s}"
+    );
+    assert!(
+        s.contains("\n    /usr/lib/bubbler/bubbler-wl-proxy\n    --listen-fd\n    3\n"),
+        "{s}"
+    );
+    assert!(s.contains("\n    --ready-fd\n    4\n"), "{s}");
+    // The gate is the node's, so it is grouped under it with its line.
+    assert!(
+        s.contains(
+            "\n  wayland clipboard=\"open\"  config.kdl:1  2 arguments\n    --gate\n    open\n"
+        ),
+        "{s}"
+    );
+    // The socket the application connects to is handed over as a
+    // descriptor, so the proxy cannot reach the directory it is in.
+    assert!(
+        !s.contains(&format!("{run}/bubbler/t/wayland\n", run = run.display())),
+        "{s}"
+    );
+
+    // `wayland "host"` is the raw socket and starts no proxy.
+    std::fs::write(&cfg, "wayland \"host\"\ncommand \"true\"\n").unwrap();
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--explain", "--wl-proxy"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("starts no"), "{err}");
+
+    // One sidecar at a time, and neither without an explanation.
+    for args in [
+        ["run", "t", "--wl-proxy"].as_slice(),
+        ["run", "t", "--explain", "--proxy", "--wl-proxy"].as_slice(),
+    ] {
+        let out = bubbler(tmp.path()).args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+    }
+}
+
+/// The socket a sandboxed `wayland` binds is the one the proxy accepts
+/// on, under the instance's own runtime directory. The security-context
+/// socket beside it is bubbler's: it is never bound into the sandbox.
+#[test]
+fn wayland_dry_run_binds_the_socket_the_proxy_serves() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "wayland\ncommand \"true\"\n").unwrap();
+    let out = bubbler(tmp.path())
+        .env("WAYLAND_DISPLAY", "wayland-1")
+        .args(["run", "t", "--dry-run"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run = tmp.path().join("run");
+    assert!(
+        s.contains(&format!(
+            "--ro-bind\n{run}/bubbler/t/wayland\n{run}/wayland-1\n",
+            run = run.display()
+        )),
+        "{s}"
+    );
+    assert!(s.contains("--setenv\nWAYLAND_DISPLAY\nwayland-1\n"), "{s}");
+    assert!(!s.contains("wayland-context"), "{s}");
+
+    // The explanation of the same argv names the proxy in front of it,
+    // which no argument of the sandbox's own shows.
+    let out = bubbler(tmp.path())
+        .env("WAYLAND_DISPLAY", "wayland-1")
+        .args(["run", "t", "--explain"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains(&format!(
+            "\n    sidecar: bubbler-wl-proxy listener {run}/bubbler/t/wayland \
+             → {run}/bubbler/t/wayland-context, gate paste\n",
+            run = run.display()
+        )),
+        "{s}"
+    );
+}
+
 #[test]
 fn explain_proxy_explains_the_sidecar_and_says_when_there_is_none() {
     let tmp = setup();
@@ -3411,6 +3530,172 @@ fn real_wayland_host_binds_the_host_socket() {
     assert_eq!(inside, host_ino, "{err}");
 }
 
+/// A pure-python `wl_registry` dump: connect to
+/// `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`, ask for the registry, and print
+/// one interface name per line once the roundtrip comes back.
+///
+/// Hand-rolled wire, so the sandbox needs nothing but python: the
+/// compositor answers `get_registry` with every global it offers that
+/// client before it answers the `sync` after it, which is what makes the
+/// listing complete.
+const WL_GLOBALS: &str = "\
+import os, socket, struct, sys
+p = os.path.join(os.environ['XDG_RUNTIME_DIR'], os.environ['WAYLAND_DISPLAY'])
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(p)
+def msg(oid, op, body):
+    return struct.pack('<II', oid, ((8 + len(body)) << 16) | op) + body
+s.sendall(msg(1, 1, struct.pack('<I', 2)))
+s.sendall(msg(1, 0, struct.pack('<I', 3)))
+buf = b''
+names = []
+while True:
+    d = s.recv(4096)
+    if not d:
+        sys.exit('the compositor closed the connection')
+    buf += d
+    while len(buf) >= 8:
+        oid, head = struct.unpack('<II', buf[:8])
+        size = head >> 16
+        op = head & 0xffff
+        if size < 8 or len(buf) < size:
+            break
+        body = buf[8:size]
+        buf = buf[size:]
+        if oid == 2 and op == 0:
+            n = struct.unpack('<I', body[4:8])[0]
+            names.append(body[8:8 + n - 1].decode())
+        elif oid == 3 and op == 0:
+            print('\\n'.join(sorted(names)))
+            sys.exit(0)
+";
+
+/// Every global a client of `socket` is offered, listed by [`WL_GLOBALS`]
+/// run on the host.
+fn host_globals() -> Vec<String> {
+    let out = Command::new(PYTHON)
+        .args(["-c", WL_GLOBALS])
+        .env(
+            "XDG_RUNTIME_DIR",
+            std::env::var_os("XDG_RUNTIME_DIR").expect("checked by require_security_context"),
+        )
+        .env(
+            "WAYLAND_DISPLAY",
+            std::env::var_os("WAYLAND_DISPLAY").expect("checked by require_security_context"),
+        )
+        .output()
+        .expect("running the global lister");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The proxy sits between the application and the compositor: the
+/// sandbox is handed one socket under its runtime directory and nothing
+/// else, while bubbler holds two on the host — the one the application
+/// connects to and the one the compositor accepts on.
+#[test]
+fn real_wayland_proxy_serves_the_only_socket_the_sandbox_sees() {
+    if !require_security_context() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let name = "bubbler-test-wl-sockets";
+    let leftovers = wayland_instance(tmp.path(), &init, name, "wayland\ncommand \"true\"\n");
+    let run = background_run(tmp.path(), &init, name);
+
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").expect("checked above");
+    let runtime = runtime.to_str().expect("a UTF-8 runtime dir");
+    let display = std::env::var_os("WAYLAND_DISPLAY").expect("checked above");
+    let display = display.to_str().expect("a UTF-8 display name");
+    let inside = exec_in(tmp.path(), &init, name, &["/usr/bin/ls", runtime]);
+    let listed = String::from_utf8_lossy(&inside.stdout);
+    assert_eq!(
+        listed.lines().collect::<Vec<_>>(),
+        [display],
+        "the sandbox sees more than the socket it was given: {}",
+        run.said()
+    );
+
+    // On the host, beside the run's own control socket: the socket the
+    // proxy accepts on, and the one the compositor accepts on.
+    let host: Vec<String> = std::fs::read_dir(&leftovers.runtime)
+        .expect("the instance runtime directory")
+        .map(|e| e.expect("a directory entry").file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .collect();
+    for want in ["wayland", "wayland-context"] {
+        assert!(host.contains(&want.to_owned()), "{host:?}");
+    }
+
+    // The sidecar is stopped with the run. The needle is this instance's
+    // own upstream path, which no other run's proxy carries.
+    let upstream = leftovers.runtime.join("wayland-context");
+    let upstream = upstream.display().to_string();
+    assert!(
+        bwrap_alive(&upstream),
+        "the proxy was not running: {}",
+        run.said()
+    );
+    let log = run.stop();
+    assert!(!bwrap_alive(&upstream), "the proxy outlived the run: {log}");
+    assert!(!leftovers.runtime.join("wayland").exists(), "{log}");
+    assert!(!leftovers.runtime.join("wayland-context").exists(), "{log}");
+}
+
+/// The registry the application is offered is the proxy's: fewer globals
+/// than the session hands a plain client, and none of the privileged
+/// ones the class names.
+#[test]
+fn real_wayland_proxy_hands_the_application_a_smaller_registry() {
+    if !require_security_context() || !require_python() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let name = "bubbler-test-wl-globals";
+    let _leftovers = wayland_instance(tmp.path(), &init, name, "wayland\ncommand \"true\"\n");
+    let out = bubbler_wayland(tmp.path(), &init)
+        .args(["run", name, "--", PYTHON, "-c", WL_GLOBALS])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let inside: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let host = host_globals();
+    assert!(
+        !inside.is_empty(),
+        "the sandbox saw no globals at all: {err}"
+    );
+    assert!(
+        inside.len() < host.len(),
+        "{} globals inside, {} on the host",
+        inside.len(),
+        host.len()
+    );
+    say(&format!(
+        "wayland globals: {} on the host, {} through the proxy",
+        host.len(),
+        inside.len()
+    ));
+    for name in bubbler_core::wayland::PRIVILEGED {
+        assert!(
+            !inside.iter().any(|g| g == name),
+            "{name} reached the sandbox"
+        );
+    }
+}
+
 /// The X client this test runs inside the sandbox. Read from the host's
 /// `/usr`, which is bound read-only, so a host without it has none
 /// inside either.
@@ -3594,12 +3879,13 @@ impl Drop for BackgroundRun {
 /// A run of `name` in the background, on a command that outlives the
 /// test's questions, and answering `exec` before this returns.
 ///
-/// The command is `sleep` and not an X client: the first connection is
-/// what starts the server, so a test that means to look at a sandbox
-/// with no server in it must not bring one itself. Waiting for the exec
-/// channel is what makes that look mean anything — an empty answer from
-/// a sandbox that is not up yet would prove nothing.
-fn nested_x11_run(tmp: &Path, init: &Path, name: &str) -> BackgroundRun {
+/// The command is `sleep` and nothing that would connect to a display:
+/// a nested X server is started by the first client, so a test that
+/// means to look at a sandbox with no server in it must not bring one
+/// itself. Waiting for the exec channel is what makes that look mean
+/// anything — an empty answer from a sandbox that is not up yet would
+/// prove nothing.
+fn background_run(tmp: &Path, init: &Path, name: &str) -> BackgroundRun {
     let log = tmp.join(format!("{name}.err"));
     let run = BackgroundRun {
         run: Some(
@@ -3641,7 +3927,7 @@ fn real_nested_x11_starts_the_server_on_the_first_client() {
     let tmp = setup();
     let name = "bubbler-test-x11-lazy";
     let _leftovers = wayland_instance(tmp.path(), &init, name, NESTED_X11);
-    let run = nested_x11_run(tmp.path(), &init, name);
+    let run = background_run(tmp.path(), &init, name);
 
     // The command itself, found by the same lister a moment before it is
     // asked about the server: an empty answer below is then this sandbox
@@ -3713,7 +3999,7 @@ fn real_nested_x11_wm_exiting_is_logged_not_fatal() {
         name,
         "wayland\ndri\nx11 wm=\"true\"\ncommand \"true\"\n",
     );
-    let run = nested_x11_run(tmp.path(), &init, name);
+    let run = background_run(tmp.path(), &init, name);
 
     // The window manager is started beside the server, on the first
     // connection, so the run needs a client before it has one to report
@@ -3771,7 +4057,7 @@ fn real_nested_x11_missing_wm_is_logged_not_fatal() {
         name,
         "wayland\ndri\nx11 wm=\"nosuchwm\"\ncommand \"true\"\n",
     );
-    let run = nested_x11_run(tmp.path(), &init, name);
+    let run = background_run(tmp.path(), &init, name);
 
     // The window manager is started beside the server, on the first
     // connection, so the run needs a client before it has one to report

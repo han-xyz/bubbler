@@ -37,7 +37,7 @@
 //! using for something else. The launcher refuses to run rather than
 //! connect that way; see [`refuse_inherited`].
 
-use std::ffi::{CString, OsStr};
+use std::ffi::{CString, OsStr, OsString};
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -47,17 +47,24 @@ use wayrs_client::proxy::Proxy;
 use wayrs_client::{ConnectError, Connection};
 use wayrs_protocols::security_context_v1::WpSecurityContextManagerV1;
 
-use crate::config::WaylandMode;
+use crate::config::{Clipboard, WaylandMode};
 use crate::env::Env;
 
 /// Sandbox engine name bubbler identifies itself to compositors by. It
 /// pairs with the application id: the two together name an application.
 pub const ENGINE: &str = "org.bubbler";
 
-/// File name of bubbler's own listening socket under the instance's
-/// runtime directory. The name inside the sandbox is the host's
-/// `$WAYLAND_DISPLAY`; this one is never seen by the application.
+/// File name of the socket the application connects to, under the
+/// instance's runtime directory. bubbler's own proxy accepts on it; the
+/// name inside the sandbox is the host's `$WAYLAND_DISPLAY`, and this
+/// one is never seen by the application.
 pub const SOCKET_NAME: &str = "wayland";
+
+/// File name of the socket the compositor accepts on as this run's
+/// security context, beside [`SOCKET_NAME`]. Only the proxy connects to
+/// it: the application reaches the compositor through the proxy, which
+/// is where the clipboard gate applies.
+pub const CONTEXT_SOCKET_NAME: &str = "wayland-context";
 
 /// Where the Wayland proxy is installed, beside `bubbler-init`. Not a
 /// `PATH` name like the D-Bus proxy's: the binary is bubbler's own, and
@@ -80,28 +87,110 @@ pub fn proxy_program(env: &Env) -> PathBuf {
 /// Which Wayland socket a run binds into the sandbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WaylandPlan {
-    /// bubbler's own listening socket, registered with the compositor as
-    /// a security context, so the sandbox is a restricted client.
-    Context {
-        /// Host path of the socket the launcher binds and listens on.
+    /// bubbler's own listening socket, which its Wayland proxy accepts
+    /// the application on. What the proxy connects to in turn — the
+    /// security-context socket, or the session's where the compositor
+    /// offers no context — is [`ProxyPlan`] and no concern of the
+    /// sandbox's: either way the application sees this one socket.
+    Proxy {
+        /// Host path of the socket the proxy accepts on.
         socket: PathBuf,
     },
     /// The session's own socket, with every global the compositor
-    /// offers, and why it came to that.
-    Raw {
-        /// What made this a raw socket rather than a security context.
-        reason: RawReason,
-    },
+    /// offers and no proxy in front of it, because the configuration
+    /// asked for it (`wayland "host"`).
+    Host,
 }
 
-/// Why a run binds the session socket rather than a security context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RawReason {
-    /// The configuration asked for it with `wayland "host"`.
-    ConfigHost,
-    /// The compositor offers no `wp_security_context_manager_v1`, so
-    /// there is nothing to register with.
-    NoManager,
+/// How the Wayland proxy is run for one instance: which socket it
+/// accepts the application on, which it connects to for it, and what it
+/// does with a clipboard read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyPlan {
+    /// Host path the application connects to, which the sandbox binds
+    /// at the host's display name.
+    pub listener: PathBuf,
+    /// Host path the proxy connects to on the application's behalf.
+    pub upstream: PathBuf,
+    /// Whether the compositor accepts on `upstream` as a security
+    /// context. Without one the proxy hides the privileged globals
+    /// itself, which is what `--fallback-deny` asks of it.
+    pub context: bool,
+    /// Whether a clipboard read has to follow input of the user's.
+    pub clipboard: Clipboard,
+}
+
+impl ProxyPlan {
+    /// The plan for a compositor that took the security context: the
+    /// proxy connects to [`CONTEXT_SOCKET_NAME`], which the compositor
+    /// accepts on, and the compositor withholds the privileged globals
+    /// by itself.
+    pub fn context(instance_runtime: &Path, clipboard: Clipboard) -> Self {
+        Self {
+            listener: socket_path(instance_runtime),
+            upstream: context_socket_path(instance_runtime),
+            context: true,
+            clipboard,
+        }
+    }
+
+    /// The plan for a compositor that offers no
+    /// `wp_security_context_manager_v1`: the proxy connects to the
+    /// session's own socket at `session` and applies bubbler's own
+    /// [`PRIVILEGED`] denylist in the compositor's place.
+    pub fn fallback(instance_runtime: &Path, session: PathBuf, clipboard: Clipboard) -> Self {
+        Self {
+            listener: socket_path(instance_runtime),
+            upstream: session,
+            context: false,
+            clipboard,
+        }
+    }
+
+    /// What the gate is called on the proxy's command line.
+    pub fn gate(&self) -> &'static str {
+        match self.clipboard {
+            Clipboard::Paste => "paste",
+            Clipboard::Open => "open",
+        }
+    }
+
+    /// The proxy's own argv, `program` first, each element with the
+    /// index of the `wayland` node behind it or `None` where it is the
+    /// invocation itself. `listen_fd` numbers the listening socket the
+    /// proxy adopts and accepts on, `ready_fd` the pipe it writes one
+    /// byte to once it is listening.
+    ///
+    /// `--log-fd 2` is the proxy's own stderr, which is bubbler's: an
+    /// audit line belongs in the run's log beside everything else the
+    /// run said.
+    pub fn command_nodes(
+        &self,
+        program: &Path,
+        node: usize,
+        listen_fd: &OsStr,
+        ready_fd: &OsStr,
+    ) -> Vec<(OsString, Option<usize>)> {
+        let o = |s: &str| OsString::from(s);
+        let mut argv = vec![
+            (program.as_os_str().to_os_string(), None),
+            (o("--listen-fd"), None),
+            (listen_fd.to_os_string(), None),
+            (o("--upstream"), None),
+            (self.upstream.clone().into_os_string(), None),
+            // The one element of the invocation a node decides.
+            (o("--gate"), Some(node)),
+            (o(self.gate()), Some(node)),
+        ];
+        if !self.context {
+            argv.push((o("--fallback-deny"), None));
+        }
+        for arg in ["--log-fd", "2", "--ready-fd"] {
+            argv.push((o(arg), None));
+        }
+        argv.push((ready_fd.to_os_string(), None));
+        argv
+    }
 }
 
 /// Failures of the security-context handshake, named by the step that
@@ -139,6 +228,11 @@ pub enum WaylandError {
     /// Raised by the launcher, which holds its write end.
     #[error("creating the pipe that ends the security context")]
     Pipe(#[source] io::Error),
+    /// The proxy sidecar did not report that it is accepting
+    /// connections, so the application would connect to a socket nothing
+    /// is listening on. The string says what happened to it instead.
+    #[error("bubbler-wl-proxy did not start; {0}")]
+    ProxyNotReady(String),
     /// A compositor connection was inherited through `$WAYLAND_SOCKET`.
     /// bubbler refuses it rather than let wayrs adopt a descriptor
     /// number this process may already be using for the run's own files.
@@ -177,6 +271,13 @@ pub fn socket_path(instance_runtime: &Path) -> PathBuf {
     instance_runtime.join(SOCKET_NAME)
 }
 
+/// Where the socket the compositor accepts on goes:
+/// [`CONTEXT_SOCKET_NAME`] beside [`socket_path`], in the same
+/// directory only bubbler can write to.
+pub fn context_socket_path(instance_runtime: &Path) -> PathBuf {
+    instance_runtime.join(CONTEXT_SOCKET_NAME)
+}
+
 /// Refuses an inherited compositor connection, given whatever
 /// `$WAYLAND_SOCKET` holds. wayrs would take the value as a descriptor
 /// number, use it as the connection and close it when the connection
@@ -189,24 +290,14 @@ pub fn refuse_inherited(socket: Option<&OsStr>) -> Result<(), WaylandError> {
     }
 }
 
-/// Which socket a run binds, from the configured mode and what [`probe`]
-/// found. `manager_present` is `None` when nothing asked the compositor
-/// — `--dry-run` and `--explain` never connect — and the answer is then
-/// the security context, which is what a real run builds on a compositor
-/// that supports it.
-pub fn plan(
-    mode: WaylandMode,
-    manager_present: Option<bool>,
-    instance_runtime: &Path,
-) -> WaylandPlan {
-    match (mode, manager_present) {
-        (WaylandMode::Host, _) => WaylandPlan::Raw {
-            reason: RawReason::ConfigHost,
-        },
-        (WaylandMode::Sandboxed { .. }, Some(false)) => WaylandPlan::Raw {
-            reason: RawReason::NoManager,
-        },
-        (WaylandMode::Sandboxed { .. }, Some(true) | None) => WaylandPlan::Context {
+/// Which socket a run binds, from the configured mode alone. What the
+/// compositor answered about `wp_security_context_manager_v1` does not
+/// enter into it: a sandboxed `wayland` connects to bubbler's proxy
+/// either way, and the answer decides only what the proxy connects to.
+pub fn plan(mode: WaylandMode, instance_runtime: &Path) -> WaylandPlan {
+    match mode {
+        WaylandMode::Host => WaylandPlan::Host,
+        WaylandMode::Sandboxed { .. } => WaylandPlan::Proxy {
             socket: socket_path(instance_runtime),
         },
     }
@@ -265,7 +356,7 @@ pub fn create_context(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::WaylandMode;
+    use crate::config::{Clipboard, WaylandMode};
     use std::path::Path;
 
     fn env(wl_proxy_override: Option<PathBuf>) -> Env {
@@ -340,27 +431,117 @@ mod tests {
         }
     }
 
+    /// The mode alone decides it: a sandboxed grant connects to the
+    /// proxy whatever the compositor answered, and `"host"` to the
+    /// session.
     #[test]
-    fn plan_follows_mode_and_probe() {
+    fn plan_follows_the_mode() {
         let rt = Path::new("/run/user/1000/bubbler/t");
-        assert!(matches!(
-            plan(WaylandMode::Host, Some(true), rt),
-            WaylandPlan::Raw {
-                reason: RawReason::ConfigHost
-            }
-        ));
-        assert!(matches!(
-            plan(WaylandMode::default(), Some(false), rt),
-            WaylandPlan::Raw {
-                reason: RawReason::NoManager
-            }
-        ));
-        for probe in [Some(true), None] {
-            match plan(WaylandMode::default(), probe, rt) {
-                WaylandPlan::Context { socket } => assert_eq!(socket, rt.join("wayland")),
-                other => panic!("{other:?}"),
-            }
+        assert_eq!(plan(WaylandMode::Host, rt), WaylandPlan::Host);
+        for mode in [
+            WaylandMode::default(),
+            WaylandMode::Sandboxed {
+                clipboard: Clipboard::Open,
+            },
+        ] {
+            assert_eq!(
+                plan(mode, rt),
+                WaylandPlan::Proxy {
+                    socket: rt.join("wayland")
+                }
+            );
         }
+    }
+
+    /// The two sockets are siblings and distinct: the application's is
+    /// the one the sandbox binds, the compositor's the one the proxy
+    /// connects to.
+    #[test]
+    fn the_application_and_the_compositor_get_different_sockets() {
+        let rt = Path::new("/run/user/1000/bubbler/t");
+        assert_eq!(socket_path(rt), rt.join("wayland"));
+        assert_eq!(context_socket_path(rt), rt.join("wayland-context"));
+        assert_ne!(socket_path(rt), context_socket_path(rt));
+    }
+
+    /// Pinned: this argv is the contract with `bubbler-wl-proxy`, and
+    /// the gate is the one element the config decides.
+    #[test]
+    fn the_proxy_command_is_the_argv_the_binary_parses() {
+        let rt = Path::new("/run/user/1000/bubbler/t");
+        let plan = ProxyPlan::context(rt, Clipboard::Paste);
+        assert_eq!(plan.gate(), "paste");
+        let argv = plan.command_nodes(Path::new("/wl"), 2, OsStr::new("3"), OsStr::new("4"));
+        let flat: Vec<String> = argv
+            .iter()
+            .map(|(a, _)| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            flat,
+            [
+                "/wl",
+                "--listen-fd",
+                "3",
+                "--upstream",
+                "/run/user/1000/bubbler/t/wayland-context",
+                "--gate",
+                "paste",
+                "--log-fd",
+                "2",
+                "--ready-fd",
+                "4",
+            ]
+        );
+        // Only the gate is a node's; the rest is the invocation.
+        let nodes: Vec<Option<usize>> = argv.iter().map(|(_, n)| *n).collect();
+        assert_eq!(
+            nodes,
+            [
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(2),
+                Some(2),
+                None,
+                None,
+                None,
+                None
+            ]
+        );
+    }
+
+    /// Without a security context the proxy connects to the session's
+    /// own socket and is told to hide the privileged globals itself.
+    #[test]
+    fn the_fallback_plan_denies_and_dials_the_session() {
+        let rt = Path::new("/run/user/1000/bubbler/t");
+        let plan = ProxyPlan::fallback(rt, "/run/user/1000/wayland-1".into(), Clipboard::Open);
+        assert!(!plan.context);
+        assert_eq!(plan.gate(), "open");
+        let argv = plan.command_nodes(Path::new("/wl"), 0, OsStr::new("3"), OsStr::new("4"));
+        let flat: Vec<String> = argv
+            .iter()
+            .map(|(a, _)| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            flat,
+            [
+                "/wl",
+                "--listen-fd",
+                "3",
+                "--upstream",
+                "/run/user/1000/wayland-1",
+                "--gate",
+                "open",
+                "--fallback-deny",
+                "--log-fd",
+                "2",
+                "--ready-fd",
+                "4",
+            ]
+        );
     }
 
     #[test]
