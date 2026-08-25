@@ -3181,6 +3181,45 @@ fn a_nested_x11_dry_run_hands_the_supervisor_the_server_argv() {
     assert_eq!(lines[lines.len() - tail.len()..], tail, "{s}");
 }
 
+/// `wm=` rides on the same command line, between the `--` that closes
+/// the server argv and the `--` the sandbox's command follows. The
+/// program is passed on as written: it is looked up on the sandbox's
+/// PATH, by the supervisor, and never resolved against the host's.
+#[test]
+fn a_nested_x11_dry_run_names_the_window_manager_after_the_server_argv() {
+    if !require_nested_x11_host() {
+        return;
+    }
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/t/config.kdl"),
+        "wayland\ndri\nx11 wm=\"twm\"\ncommand \"/usr/bin/true\"\n",
+    )
+    .unwrap();
+    let out = bubbler(tmp.path())
+        .env("WAYLAND_DISPLAY", "wayland-0")
+        .args(["run", "t", "--dry-run"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    let s = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = s.lines().collect();
+    // The last words of the server argv are in the tail as well, so what
+    // is pinned is where `--wm` sits: after the argv, not inside it.
+    let tail = [
+        "-geometry",
+        "1280x720",
+        "--",
+        "--wm",
+        "twm",
+        "--",
+        "/usr/bin/true",
+    ];
+    assert_eq!(lines[lines.len() - tail.len()..], tail, "{s}");
+}
+
 #[test]
 fn empty_required_vars_are_rejected() {
     let tmp = setup();

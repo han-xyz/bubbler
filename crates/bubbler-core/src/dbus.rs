@@ -42,7 +42,7 @@ pub const A11Y_NODE: &str = "a11y";
 
 /// Program that asks the session bus where the accessibility bus is,
 /// from the `dbus` package. It is spawned directly, never through a
-/// shell, and only ever for the one call [`host_a11y_bus`] makes.
+/// shell, and only ever for the one call [`guarded_host_a11y_bus`] makes.
 pub const DBUS_SEND: &str = "dbus-send";
 
 /// Where a system bus socket lives: the host's when no address overrides
@@ -404,10 +404,11 @@ pub fn app_bus_path(instance_runtime: &Path, socket: &str) -> PathBuf {
 }
 
 /// Host session bus socket: the `unix:path=` of `$DBUS_SESSION_BUS_ADDRESS`
-/// when it is set, else `$XDG_RUNTIME_DIR/bus`. Unguarded, and the caller
-/// must still check that the result is a socket: anything that hands the
-/// path to the proxy goes through [`guarded_host_bus`] instead.
-pub fn host_bus(env: &Env) -> Result<PathBuf, LaunchError> {
+/// when it is set, else `$XDG_RUNTIME_DIR/bus`. Unguarded, and
+/// crate-private for it: outside this crate the session bus is reachable
+/// only through [`guarded_host_bus`], so the guard is not a step a
+/// caller can leave out.
+pub(crate) fn host_bus(env: &Env) -> Result<PathBuf, LaunchError> {
     Ok(address_path(
         env.dbus_address.as_deref(),
         "DBUS_SESSION_BUS_ADDRESS",
@@ -416,21 +417,22 @@ pub fn host_bus(env: &Env) -> Result<PathBuf, LaunchError> {
     .unwrap_or_else(|| env.runtime_dir.join("bus")))
 }
 
-/// [`host_bus`] refused when it lands in bubbler's own runtime
-/// directory. The proxy paths resolve the session bus through this and
-/// never through [`host_bus`].
+/// The host session bus address, refused when it lands in bubbler's own
+/// runtime directory. A run and a dry run both resolve the bus through
+/// here; the unguarded resolver behind it is crate-private.
 pub fn guarded_host_bus(host: &dyn Host, env: &Env) -> Result<PathBuf, LaunchError> {
     outside_our_runtime(host, env, SESSION_NODE, host_bus(env)?)
 }
 
-/// [`host_system_bus`] refused when it lands in bubbler's own runtime
-/// directory.
+/// The host system bus address, refused when it lands in bubbler's own
+/// runtime directory. The unguarded resolver behind it is crate-private.
 pub fn guarded_host_system_bus(host: &dyn Host, env: &Env) -> Result<PathBuf, LaunchError> {
     outside_our_runtime(host, env, SYSTEM_NODE, host_system_bus(env)?)
 }
 
-/// [`host_a11y_bus`] refused when it lands in bubbler's own runtime
-/// directory. The bus is asked for its address first, as a run does.
+/// The host accessibility bus address, refused when it lands in
+/// bubbler's own runtime directory. The bus is asked for its address
+/// first, as a run does; the unguarded resolver is crate-private.
 pub fn guarded_host_a11y_bus(host: &dyn Host, env: &Env) -> Result<PathBuf, LaunchError> {
     outside_our_runtime(host, env, A11Y_NODE, host_a11y_bus(env)?)
 }
@@ -523,10 +525,10 @@ fn lexical(path: &Path) -> PathBuf {
 
 /// Host system bus socket: the `unix:path=` of `$DBUS_SYSTEM_BUS_ADDRESS`
 /// when it is set, else [`SYSTEM_BUS_PATH`], which is what libdbus and
-/// libsystemd fall back to. Unguarded, and the caller must still check
-/// that the result is a socket: [`guarded_host_system_bus`] is what the
-/// proxy paths use.
-pub fn host_system_bus(env: &Env) -> Result<PathBuf, LaunchError> {
+/// libsystemd fall back to. Unguarded, and crate-private for it: outside
+/// this crate the system bus is reachable only through
+/// [`guarded_host_system_bus`].
+pub(crate) fn host_system_bus(env: &Env) -> Result<PathBuf, LaunchError> {
     Ok(address_path(
         env.dbus_system_address.as_deref(),
         "DBUS_SYSTEM_BUS_ADDRESS",
@@ -539,15 +541,15 @@ pub fn host_system_bus(env: &Env) -> Result<PathBuf, LaunchError> {
 /// `$AT_SPI_BUS_ADDRESS` when the session set one, else the address
 /// `org.a11y.Bus` answers `GetAddress` with on the session bus. That is
 /// the order at-spi2's own clients ask in, so bubbler proxies the bus
-/// the applications on this host are already on. Unguarded, and the
-/// caller must still check that the result is a socket:
-/// [`guarded_host_a11y_bus`] is what the proxy paths use.
+/// the applications on this host are already on. Unguarded, and
+/// crate-private for it: outside this crate the accessibility bus is
+/// reachable only through [`guarded_host_a11y_bus`].
 ///
 /// Every failure stops the run instead of dropping the grant: an `a11y`
 /// sandbox whose socket has no bus behind it looks to the application
 /// like a broken toolkit and to the user like a sandbox that quietly
 /// gave them less than the config asked for.
-pub fn host_a11y_bus(env: &Env) -> Result<PathBuf, LaunchError> {
+pub(crate) fn host_a11y_bus(env: &Env) -> Result<PathBuf, LaunchError> {
     match address_path(
         env.at_spi_bus_address.as_deref(),
         "AT_SPI_BUS_ADDRESS",
@@ -702,11 +704,11 @@ pub fn proxy_program(env: &Env) -> PathBuf {
 /// command, so a section without a socket is not pointed anywhere else.
 #[derive(Debug, Clone, Copy)]
 pub struct HostBuses<'a> {
-    /// Session bus, from [`host_bus`].
+    /// Session bus, from [`guarded_host_bus`].
     pub session: Option<&'a Path>,
-    /// System bus, from [`host_system_bus`].
+    /// System bus, from [`guarded_host_system_bus`].
     pub system: Option<&'a Path>,
-    /// Accessibility bus, from [`host_a11y_bus`].
+    /// Accessibility bus, from [`guarded_host_a11y_bus`].
     pub a11y: Option<&'a Path>,
 }
 
