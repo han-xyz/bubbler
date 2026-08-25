@@ -584,10 +584,14 @@ open(sys.argv[0] + ".stamp", "w").write(str(time.monotonic_ns()))
 "#;
 /// A command that will not take SIGTERM for an answer. It gives up after
 /// a minute all the same, so a supervisor that fails to escalate does not
-/// leave it behind for the rest of the day.
+/// leave it behind for the rest of the day. The file it writes is what
+/// says the handler is installed; until then the default disposition is
+/// still in place, and the interpreter takes long enough to start that a
+/// loaded host reaches it after the run has been asked to stop.
 const COMMAND_IGNORES_TERM: &str = r#"#!/usr/bin/python3
-import signal, time
+import signal, sys, time
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
+open(sys.argv[0] + ".ready", "w").write("deaf")
 time.sleep(60)
 "#;
 
@@ -694,6 +698,14 @@ fn wait_for_log(log: &Path, needle: &str) -> String {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Wait until the command that ignores SIGTERM has installed its handler.
+/// Every test that uses it is about what the supervisor does with a
+/// command it cannot stop politely, and a run stopped before that line
+/// would kill it with the first signal instead.
+fn wait_until_deaf(cmd: &Path) {
+    wait_for_file(&beside(cmd, ".ready"));
 }
 
 /// A file a fixture wrote beside itself.
@@ -1061,6 +1073,7 @@ fn a_command_that_ignores_the_signal_is_killed_when_the_display_goes() {
         },
     );
     wait_for_path(&xsock);
+    wait_until_deaf(&cmd);
     let client = x_connect(&xsock);
     assert_eq!(served_byte(&client), b'X');
     let t = Instant::now();
@@ -1101,6 +1114,7 @@ fn a_second_stop_does_not_buy_the_command_another_grace() {
         },
     );
     wait_for_path(&xsock);
+    wait_until_deaf(&cmd);
     let client = x_connect(&xsock);
     assert_eq!(served_byte(&client), b'X');
     wait_for_log(&log, "Xwayland exited; stopping the command");
@@ -1143,6 +1157,7 @@ fn a_client_that_connects_while_stopping_wakes_nothing() {
         },
     );
     wait_for_path(&xsock);
+    wait_until_deaf(&cmd);
     rustix::process::kill_process(
         rustix::process::Pid::from_child(init.child()),
         rustix::process::Signal::TERM,
