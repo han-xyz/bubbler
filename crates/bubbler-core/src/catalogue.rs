@@ -70,7 +70,9 @@ pub static GRANTS: &[Grant] = &[
                hides the privileged interfaces in the compositor's place, and the \
                run prints a note saying so. `wayland \
                \"host\"` binds the session socket as it is, with no proxy in front of \
-               it; lint warns. Xwayland clients (`x11`) bypass all of this.",
+               it; lint warns. `x11 \"host\"` bypasses all of this, its server being a \
+               client of your session; a bare `x11`'s Xwayland is a client of this \
+               socket like any other and is filtered and gated with it.",
         risk: Risk::Narrow,
         grammar: "wayland [\"host\"] [clipboard=\"open\"]",
     },
