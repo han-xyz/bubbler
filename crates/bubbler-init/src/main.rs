@@ -1,10 +1,13 @@
 //! In-sandbox supervisor: runs the command, serves exec requests on the
 //! inherited socket, forwards SIGTERM/SIGINT, exits with the command's status.
+//! With `--helper` it also runs a display helper (Xwayland) before the
+//! command, hands the command and every exec'd child the display it
+//! reports, and stops it last.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::Write;
-use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
@@ -14,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use rustix::event::{Nsecs, PollFd, PollFlags, Timespec, poll};
 use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
+use rustix::pipe::{PipeFlags, pipe_with};
 use rustix::process::{DumpableBehavior, Pid, Signal, kill_process, set_dumpable_behavior};
 
 use bubbler_init::{proto, wire};
@@ -31,6 +35,13 @@ const GRACE: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Raw wait status for a command that could not be executed, as a shell reports it.
 const NOT_EXECUTABLE: i32 = 127 << 8;
+/// How long the display helper gets to report its display number. A
+/// helper that is slower than this is one the command cannot use anyway.
+const HELPER_READY: Duration = Duration::from_secs(10);
+/// Longest first line a display helper may write. A helper that streams
+/// anything else at the pipe is broken, and its output is not init's to
+/// buffer without a bound.
+const MAX_DISPLAY_LINE: usize = 64;
 /// Connections whose request has not arrived in full. The oldest is
 /// dropped to make room, so stalled clients cannot grow the table.
 const MAX_PENDING: usize = 16;
@@ -38,7 +49,16 @@ const MAX_PENDING: usize = 16;
 struct Args {
     socket_fd: i32,
     ctty: bool,
+    helper: Option<Vec<OsString>>,
     command: Vec<OsString>,
+}
+
+/// The display helper and the display it reported. It is started before
+/// the command and stopped after it, so nothing inside the sandbox is
+/// ever pointed at a display that is not there.
+struct Helper {
+    child: Child,
+    display: OsString,
 }
 
 /// A command run for a client, with the connection waiting for its status.
@@ -54,16 +74,26 @@ struct Pending {
     deadline: Instant,
 }
 
-/// Parse `--socket-fd N [--ctty] -- cmd...`; anything else is a usage error.
+/// Parse `--socket-fd N [--ctty] [--helper argv... --] -- cmd...`;
+/// anything else is a usage error. The helper argv ends at its own bare
+/// `--`, so it may hold any words, including the command's own.
 fn parse_args() -> Option<Args> {
     let mut it = std::env::args_os().skip(1);
     let mut socket_fd = None;
     let mut ctty = false;
+    let mut helper = None;
     let mut command = Vec::new();
     while let Some(a) = it.next() {
         match a.to_str() {
             Some("--socket-fd") => socket_fd = it.next()?.to_str()?.parse().ok(),
             Some("--ctty") => ctty = true,
+            Some("--helper") => {
+                let argv: Vec<OsString> = it.by_ref().take_while(|w| w != "--").collect();
+                if argv.is_empty() {
+                    return None;
+                }
+                helper = Some(argv);
+            }
             Some("--") => {
                 command.extend(it);
                 break;
@@ -77,6 +107,7 @@ fn parse_args() -> Option<Args> {
     Some(Args {
         socket_fd: socket_fd?,
         ctty,
+        helper,
         command,
     })
 }
@@ -134,7 +165,13 @@ fn take_ctty(command: &mut Command) {
 /// spawning nothing. Whether the command takes fd 0 as its controlling
 /// terminal is the request's own flag, not the instance's `--ctty`: the
 /// client knows which of the fds it just sent is a pty it allocated.
-fn serve(stream: UnixStream, request: &proto::Request, fds: Vec<OwnedFd>, execs: &mut Vec<Exec>) {
+fn serve(
+    stream: UnixStream,
+    request: &proto::Request,
+    fds: Vec<OwnedFd>,
+    execs: &mut Vec<Exec>,
+    display: Option<&OsStr>,
+) {
     let Some((program, rest)) = request.argv.split_first() else {
         return;
     };
@@ -151,6 +188,11 @@ fn serve(stream: UnixStream, request: &proto::Request, fds: Vec<OwnedFd>, execs:
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+    // The helper's display is init's to hand out: an exec'd child gets
+    // the same one the instance's own command was started with.
+    if let Some(d) = display {
+        command.env("DISPLAY", d);
+    }
     if terminal {
         take_ctty(&mut command);
     }
@@ -172,7 +214,12 @@ fn serve(stream: UnixStream, request: &proto::Request, fds: Vec<OwnedFd>, execs:
 /// Take one read step on every connection `poll` reported, spawning the
 /// commands whose requests are now whole. `ready` is parallel to
 /// `pending` and shrinks with it.
-fn read_pending(pending: &mut Vec<Pending>, ready: &mut Vec<bool>, execs: &mut Vec<Exec>) {
+fn read_pending(
+    pending: &mut Vec<Pending>,
+    ready: &mut Vec<bool>,
+    execs: &mut Vec<Exec>,
+    display: Option<&OsStr>,
+) {
     let mut i = 0;
     while i < pending.len() {
         if !ready.get(i).copied().unwrap_or(false) {
@@ -185,7 +232,7 @@ fn read_pending(pending: &mut Vec<Pending>, ready: &mut Vec<bool>, execs: &mut V
             Ok(Some((request, fds))) => {
                 let p = pending.remove(i);
                 ready.remove(i);
-                serve(p.stream, &request, fds, execs);
+                serve(p.stream, &request, fds, execs, display);
             }
             // A malformed request or a hangup closes the connection.
             Err(_) => {
@@ -235,6 +282,101 @@ fn shutdown(execs: &mut Vec<Exec>) {
     execs.clear();
 }
 
+/// Kill a helper that never became usable and reap it, so a failed
+/// startup leaves no process behind, then hand back why it failed.
+fn abandon(child: &mut Child, reason: String) -> String {
+    let _ = child.kill();
+    let _ = child.wait();
+    reason
+}
+
+/// Start the display helper and wait for the display number it writes to
+/// `-displayfd`. That write end is the only descriptor the helper
+/// inherits beyond stdio, and init drops its own copy right after the
+/// spawn, so the pipe reports EOF as soon as the helper is gone.
+fn start_helper(argv: &[OsString]) -> Result<Helper, String> {
+    let (program, rest) = argv.split_first().ok_or("no helper to run")?;
+    let (r, w) = pipe_with(PipeFlags::CLOEXEC)
+        .map_err(|e| format!("cannot create the display pipe: {e}"))?;
+    let mut launch = Command::new(program);
+    launch
+        .args(rest)
+        .arg("-displayfd")
+        .arg(w.as_raw_fd().to_string());
+    // The helper is the one process that may have this fd, and it is
+    // spawned on the next line, so no other child can inherit it.
+    fcntl_setfd(&w, FdFlags::empty()).map_err(|e| format!("cannot pass the display pipe: {e}"))?;
+    let spawned = launch.spawn();
+    drop(w);
+    let mut child = spawned.map_err(|e| format!("{}: {e}", program.to_string_lossy()))?;
+    let deadline = Instant::now() + HELPER_READY;
+    let mut line = Vec::new();
+    let mut buf = [0u8; 32];
+    loop {
+        let mut fds = [PollFd::new(&r, PollFlags::IN)];
+        let _ = poll(&mut fds, Some(&TICK_TIMESPEC));
+        if !fds[0].revents().is_empty() {
+            match rustix::io::read(&r, &mut buf) {
+                Ok(0) => {
+                    let why = "the display pipe closed with no display number".to_string();
+                    return Err(abandon(&mut child, why));
+                }
+                Ok(n) if line.len() + n <= MAX_DISPLAY_LINE => {
+                    line.extend_from_slice(&buf[..n]);
+                }
+                Ok(_) => {
+                    let why = "it wrote more than a display number".to_string();
+                    return Err(abandon(&mut child, why));
+                }
+                Err(e) if e == rustix::io::Errno::INTR || e == rustix::io::Errno::AGAIN => {}
+                Err(e) => {
+                    return Err(abandon(&mut child, format!("cannot read the display: {e}")));
+                }
+            }
+        }
+        if let Some(end) = line.iter().position(|&b| b == b'\n') {
+            let text = String::from_utf8_lossy(&line[..end]);
+            return match text.trim().parse::<u32>() {
+                Ok(n) => Ok(Helper {
+                    child,
+                    display: OsString::from(format!(":{n}")),
+                }),
+                Err(_) => Err(abandon(
+                    &mut child,
+                    format!("it reported {text:?}, not a display number"),
+                )),
+            };
+        }
+        // The read above drains the pipe first, so a helper that reported
+        // a display and exited at once is still a success.
+        if let Ok(Some(status)) = child.try_wait() {
+            let why = format!("it exited before reporting a display ({status})");
+            return Err(abandon(&mut child, why));
+        }
+        if Instant::now() >= deadline {
+            let why = format!("no display number after {}s", HELPER_READY.as_secs());
+            return Err(abandon(&mut child, why));
+        }
+    }
+}
+
+/// SIGTERM the helper and SIGKILL whatever outlives the grace, then reap
+/// it. Only ever called once the command and every exec'd child are
+/// gone: nothing may lose its display while it is still drawing on it.
+fn stop_helper(helper: Option<&mut Helper>) {
+    let Some(h) = helper else { return };
+    let _ = kill_process(Pid::from_child(&h.child), Signal::TERM);
+    let deadline = Instant::now() + GRACE;
+    while Instant::now() < deadline {
+        if !matches!(h.child.try_wait(), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(TICK);
+    }
+    let _ = h.child.kill();
+    let _ = h.child.wait();
+}
+
 /// The command's exit code, or 128 + signal when a signal killed it.
 fn code_of(status: ExitStatus) -> u8 {
     let code = status
@@ -246,7 +388,7 @@ fn code_of(status: ExitStatus) -> u8 {
 
 fn main() -> ExitCode {
     let Some(args) = parse_args() else {
-        eprintln!("bubbler-init: usage: --socket-fd N [--ctty] -- cmd...");
+        eprintln!("bubbler-init: usage: --socket-fd N [--ctty] [--helper argv... --] -- cmd...");
         return ExitCode::from(2);
     };
     let Some(listener) = listener_from_fd(args.socket_fd) else {
@@ -272,11 +414,28 @@ fn main() -> ExitCode {
         }
     }
     let Some((program, rest)) = args.command.split_first() else {
-        eprintln!("bubbler-init: usage: --socket-fd N [--ctty] -- cmd...");
+        eprintln!("bubbler-init: usage: --socket-fd N [--ctty] [--helper argv... --] -- cmd...");
         return ExitCode::from(2);
     };
+    // Before the command, so a display the command needs is listening
+    // and its number known by the time the command's first line runs.
+    let mut helper = match args.helper.as_deref().map(start_helper) {
+        Some(Ok(h)) => Some(h),
+        Some(Err(reason)) => {
+            eprintln!("bubbler-init: Xwayland did not start: {reason}");
+            return ExitCode::from(2);
+        }
+        None => None,
+    };
+    // A copy of the display, so the loop below can drop a helper that
+    // died without the command's own environment changing under it.
+    let display = helper.as_ref().map(|h| h.display.clone());
+    let display = display.as_deref();
     let mut launch = Command::new(program);
     launch.args(rest);
+    if let Some(d) = display {
+        launch.env("DISPLAY", d);
+    }
     // `--ctty` is bubbler saying the terminal on fd 0 is a pty slave it
     // allocated for this sandbox, and not the user's own terminal.
     if args.ctty && rustix::termios::isatty(std::io::stdin()) {
@@ -300,9 +459,20 @@ fn main() -> ExitCode {
             signal_execs(&execs, Signal::TERM);
             kill_at = Some(Instant::now() + GRACE);
         }
+        // A helper that exits takes the display with it: the command
+        // cannot draw any more, so it is stopped instead of left blind.
+        if helper
+            .as_mut()
+            .is_some_and(|h| matches!(h.child.try_wait(), Ok(Some(_))))
+        {
+            eprintln!("bubbler-init: Xwayland exited; stopping the command");
+            let _ = kill_process(Pid::from_child(&command), Signal::TERM);
+            helper = None;
+        }
         if let Ok(Some(status)) = command.try_wait() {
             reap(&mut execs);
             shutdown(&mut execs);
+            stop_helper(helper.as_mut());
             return ExitCode::from(code_of(status));
         }
         reap(&mut execs);
@@ -335,7 +505,7 @@ fn main() -> ExitCode {
             }
             Ok(_) => {}
         }
-        read_pending(&mut pending, &mut ready, &mut execs);
+        read_pending(&mut pending, &mut ready, &mut execs, display);
         // Dropping the connection is the whole answer to a client that
         // ran out of time: nothing was spawned for it.
         let now = Instant::now();

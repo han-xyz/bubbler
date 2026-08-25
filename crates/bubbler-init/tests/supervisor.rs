@@ -10,15 +10,21 @@ use bubbler_init::{proto, wire};
 type Started = (std::process::Child, std::path::PathBuf, tempfile::TempDir);
 
 fn start(cmd: &[&str]) -> Started {
-    start_with(cmd, false, None)
+    start_with(cmd, false, None, None)
 }
 
 /// Start the supervisor on an inherited listening socket. `ctty` stands
 /// for bubbler passing `--ctty`: the terminal on fd 0 is a pty bubbler
 /// allocated, so the main command may take it over. `stdio` is what all
 /// three of its descriptors become; without one it gets `/dev/null`, so
-/// no test ever hands it the terminal it is run from.
-fn start_with(cmd: &[&str], ctty: bool, stdio: Option<&OwnedFd>) -> Started {
+/// no test ever hands it the terminal it is run from. `helper` is the
+/// display helper argv bubbler passes as `--helper <argv...> --`.
+fn start_with(
+    cmd: &[&str],
+    ctty: bool,
+    stdio: Option<&OwnedFd>,
+    helper: Option<&[&str]>,
+) -> Started {
     let tmp = tempfile::tempdir().unwrap();
     let sock = tmp.path().join("init.sock");
     let listener = UnixListener::bind(&sock).unwrap();
@@ -30,6 +36,9 @@ fn start_with(cmd: &[&str], ctty: bool, stdio: Option<&OwnedFd>) -> Started {
         .arg(inherited.as_raw_fd().to_string());
     if ctty {
         init.arg("--ctty");
+    }
+    if let Some(argv) = helper {
+        init.arg("--helper").args(argv).arg("--");
     }
     match stdio {
         Some(fd) => {
@@ -60,10 +69,21 @@ fn pty_pair() -> (OwnedFd, OwnedFd) {
 }
 
 fn exec(sock: &std::path::Path, argv: &[&str]) -> i32 {
+    let null = std::fs::File::open("/dev/null").unwrap();
+    exec_with_stdout(sock, argv, null.as_fd())
+}
+
+/// Exec a command whose stdout is `out`, so the test can read back what
+/// it printed; stdin and stderr are `/dev/null`.
+fn exec_with_stdout(
+    sock: &std::path::Path,
+    argv: &[&str],
+    out: std::os::fd::BorrowedFd<'_>,
+) -> i32 {
     let s = UnixStream::connect(sock).unwrap();
     let null = std::fs::File::open("/dev/null").unwrap();
     let refs: Vec<&std::ffi::OsStr> = argv.iter().map(std::ffi::OsStr::new).collect();
-    wire::send_request(&s, &refs, 0, [null.as_fd(), null.as_fd(), null.as_fd()]).unwrap();
+    wire::send_request(&s, &refs, 0, [null.as_fd(), out, null.as_fd()]).unwrap();
     wire::recv_status(&s).unwrap()
 }
 
@@ -178,7 +198,8 @@ fn stop(init: &mut std::process::Child) {
 #[test]
 fn the_main_command_given_a_terminal_leads_its_own_session_and_owns_it() {
     let (master, slave) = pty_pair();
-    let (mut init, _sock, _tmp) = start_with(&["/usr/bin/sh", "-c", TTY_PROBE], true, Some(&slave));
+    let (mut init, _sock, _tmp) =
+        start_with(&["/usr/bin/sh", "-c", TTY_PROBE], true, Some(&slave), None);
     // Only the supervisor's copies are left, so the master reads to EIO
     // as soon as the run is over.
     drop(slave);
@@ -205,7 +226,7 @@ fn an_exec_request_may_ask_for_the_terminal_it_sends() {
 fn without_the_request_flag_a_terminal_is_left_to_whoever_owns_it() {
     // `--ctty` covers the instance's own command only: an exec whose fd 0
     // may be the user's own terminal must not take it over.
-    let (mut init, sock, _tmp) = start_with(&["/usr/bin/sleep", "30"], true, None);
+    let (mut init, sock, _tmp) = start_with(&["/usr/bin/sleep", "30"], true, None, None);
     std::thread::sleep(Duration::from_millis(200));
     let (_, out) = exec_on_a_pty(&sock, false);
     assert!(!out.contains("LEADER"), "took a session anyway: {out:?}");
@@ -332,4 +353,229 @@ fn more_stalled_clients_than_the_table_holds_drops_the_oldest() {
     .unwrap();
     init.wait().unwrap();
     drop(stalled);
+}
+
+/// Interpreter the fake display helpers are written in; the tests below
+/// skip when it is not installed, as the fixtures elsewhere do.
+const PYTHON: &str = "/usr/bin/python3";
+
+/// Returns false (after printing why) when the fake helpers cannot run here.
+fn require_python() -> bool {
+    let ok = std::path::Path::new(PYTHON).is_file();
+    if !ok {
+        println!("skipping: {PYTHON} is not installed");
+    }
+    ok
+}
+
+/// What every fake helper does before it differs: find `-displayfd N` in
+/// its own argv the way Xwayland does, and leave its pid beside the
+/// script so the test can tell whether it is still running.
+const HELPER_PRELUDE: &str = r#"import os, sys, time
+argv = sys.argv[1:]
+fd = int(argv[argv.index("-displayfd") + 1])
+open(sys.argv[0] + ".pid", "w").write(str(os.getpid()))
+"#;
+
+/// A helper that reports display 0 and then stays up, as Xwayland does.
+const REPORTS_AND_STAYS: &str = r#"os.write(fd, b"0\n")
+time.sleep(30)
+"#;
+/// A helper that comes up but never reports a display.
+const NEVER_REPORTS: &str = "time.sleep(30)\n";
+/// A helper that fails before it can report anything.
+const DIES_AT_ONCE: &str = "sys.exit(1)\n";
+/// A helper that reports a display and then loses it.
+const REPORTS_AND_DIES: &str = r#"os.write(fd, b"0\n")
+time.sleep(0.5)
+"#;
+
+/// Write one fake helper into `dir` and return its path.
+fn helper_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(HELPER_PRELUDE.as_bytes()).unwrap();
+    f.write_all(body.as_bytes()).unwrap();
+    path
+}
+
+/// A file standing in for the supervisor's whole stdio, so its messages
+/// are readable and none of them reach the terminal the tests run from.
+fn stdio_file(path: &std::path::Path) -> OwnedFd {
+    OwnedFd::from(
+        std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .unwrap(),
+    )
+}
+
+/// Wait for a file to hold something and return it.
+fn wait_for_file(path: &std::path::Path) -> String {
+    let t = Instant::now();
+    loop {
+        if let Ok(s) = std::fs::read_to_string(path)
+            && !s.is_empty()
+        {
+            return s;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "{} never appeared",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The pid a fake helper recorded for itself.
+fn helper_pid(script: &std::path::Path) -> i32 {
+    let mut pidfile = script.as_os_str().to_owned();
+    pidfile.push(".pid");
+    wait_for_file(std::path::Path::new(&pidfile))
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// Fail unless the helper has left the process table. It is the
+/// supervisor's own child, so it is reaped there and the entry goes with it.
+fn assert_gone(pid: i32) {
+    let path = std::path::PathBuf::from(format!("/proc/{pid}"));
+    let t = Instant::now();
+    while path.exists() {
+        assert!(
+            t.elapsed() < Duration::from_secs(3),
+            "the helper ({pid}) was left running"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_helper_that_reports_a_display_is_started_first_and_the_command_sees_it() {
+    if !require_python() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let script = helper_script(dir.path(), "reports.py", REPORTS_AND_STAYS);
+    let seen = dir.path().join("cmd.env");
+    let run = format!("env > {}; exec sleep 30", seen.display());
+    let (mut init, sock, _tmp) = start_with(
+        &["/usr/bin/sh", "-c", &run],
+        false,
+        None,
+        Some(&[PYTHON, script.to_str().unwrap()]),
+    );
+    let env = wait_for_file(&seen);
+    assert!(
+        env.lines().any(|l| l == "DISPLAY=:0"),
+        "the command saw no display: {env:?}"
+    );
+    let out = dir.path().join("exec.env");
+    let file = std::fs::File::create(&out).unwrap();
+    let st = exec_with_stdout(&sock, &["/usr/bin/env"], file.as_fd());
+    assert_eq!(ExitStatus::from_raw(st).code(), Some(0));
+    let env = std::fs::read_to_string(&out).unwrap();
+    assert!(
+        env.lines().any(|l| l == "DISPLAY=:0"),
+        "the exec'd child saw no display: {env:?}"
+    );
+    let pid = helper_pid(&script);
+    stop(&mut init);
+    assert_gone(pid);
+}
+
+#[test]
+fn a_helper_that_never_reports_is_a_startup_failure() {
+    if !require_python() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let script = helper_script(dir.path(), "mute.py", NEVER_REPORTS);
+    let marker = dir.path().join("the-command-ran");
+    let log = dir.path().join("init.log");
+    let fd = stdio_file(&log);
+    let (mut init, _sock, _tmp) = start_with(
+        &["/usr/bin/touch", marker.to_str().unwrap()],
+        false,
+        Some(&fd),
+        Some(&[PYTHON, script.to_str().unwrap()]),
+    );
+    let pid = helper_pid(&script);
+    let t = Instant::now();
+    let status = init.wait().unwrap();
+    assert!(
+        t.elapsed() >= Duration::from_secs(9) && t.elapsed() < Duration::from_secs(25),
+        "gave up after {:?}",
+        t.elapsed()
+    );
+    assert_eq!(status.code(), Some(2));
+    let err = std::fs::read_to_string(&log).unwrap();
+    assert!(err.contains("Xwayland did not start"), "stderr was {err:?}");
+    assert!(!marker.exists(), "the command ran without a display");
+    assert_gone(pid);
+}
+
+#[test]
+fn a_helper_that_dies_before_reporting_is_a_startup_failure() {
+    if !require_python() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let script = helper_script(dir.path(), "doomed.py", DIES_AT_ONCE);
+    let marker = dir.path().join("the-command-ran");
+    let log = dir.path().join("init.log");
+    let fd = stdio_file(&log);
+    let (mut init, _sock, _tmp) = start_with(
+        &["/usr/bin/touch", marker.to_str().unwrap()],
+        false,
+        Some(&fd),
+        Some(&[PYTHON, script.to_str().unwrap()]),
+    );
+    let pid = helper_pid(&script);
+    let t = Instant::now();
+    let status = init.wait().unwrap();
+    assert!(
+        t.elapsed() < Duration::from_secs(9),
+        "waited the full timeout"
+    );
+    assert_eq!(status.code(), Some(2));
+    let err = std::fs::read_to_string(&log).unwrap();
+    assert!(err.contains("Xwayland did not start"), "stderr was {err:?}");
+    assert!(!marker.exists(), "the command ran without a display");
+    assert_gone(pid);
+}
+
+#[test]
+fn a_helper_dying_while_the_command_runs_terminates_the_command() {
+    if !require_python() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let script = helper_script(dir.path(), "quitter.py", REPORTS_AND_DIES);
+    let log = dir.path().join("init.log");
+    let fd = stdio_file(&log);
+    let (mut init, _sock, _tmp) = start_with(
+        &["/usr/bin/sleep", "30"],
+        false,
+        Some(&fd),
+        Some(&[PYTHON, script.to_str().unwrap()]),
+    );
+    let t = Instant::now();
+    let status = init.wait().unwrap();
+    assert!(
+        t.elapsed() < Duration::from_secs(10),
+        "the command outlived the display by {:?}",
+        t.elapsed()
+    );
+    assert_eq!(status.code(), Some(143));
+    let err = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        err.contains("Xwayland exited; stopping the command"),
+        "stderr was {err:?}"
+    );
 }
