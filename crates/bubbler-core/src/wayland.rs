@@ -19,7 +19,8 @@
 //!   hangup, so the write end of a pipe held for the run's lifetime ends
 //!   the context when the run ends.
 //!
-//! Metadata is set at most once each and nothing may follow `commit`, so
+//! Metadata is set at most once each and nothing but `destroy` may
+//! follow `commit`, so
 //! the handshake is one-shot: bind the manager, create the listener, set
 //! the three strings, commit, destroy, roundtrip.
 //!
@@ -84,8 +85,17 @@ pub enum RawReason {
 pub enum WaylandError {
     /// No connection to the compositor: the environment names none, or
     /// the socket refused it.
-    #[error("connecting to the compositor at $WAYLAND_DISPLAY")]
-    Connect(#[source] io::Error),
+    // No `{source}` in the message: the cause is chained below, and
+    // printing it here too shows it twice.
+    #[error("connecting to the compositor at {display}")]
+    Connect {
+        /// What `$WAYLAND_DISPLAY` named when the attempt was made, or
+        /// the literal `$WAYLAND_DISPLAY` when it was unset.
+        display: String,
+        /// What the connection attempt failed with.
+        #[source]
+        source: io::Error,
+    },
     /// The compositor does not implement the protocol. Not an error on
     /// its own — the launcher falls back to the session socket — but
     /// [`create_context`] reports it, since by then the global was
@@ -102,9 +112,21 @@ pub enum WaylandError {
     Listen(PathBuf, #[source] io::Error),
 }
 
+impl WaylandError {
+    // Every connection failure is tagged with the display the process
+    // environment named, since that is the input the user can act on.
+    fn connect(source: io::Error) -> Self {
+        let display = std::env::var_os("WAYLAND_DISPLAY").map_or_else(
+            || "$WAYLAND_DISPLAY".to_owned(),
+            |d| d.to_string_lossy().into_owned(),
+        );
+        Self::Connect { display, source }
+    }
+}
+
 impl From<ConnectError> for WaylandError {
     fn from(e: ConnectError) -> Self {
-        Self::Connect(match e {
+        Self::connect(match e {
             ConnectError::NotEnoughEnvVars => {
                 io::Error::other("WAYLAND_DISPLAY or XDG_RUNTIME_DIR unset")
             }
@@ -141,7 +163,7 @@ pub fn plan(
 /// here means there is no compositor to talk to at all.
 pub fn probe() -> Result<bool, WaylandError> {
     let mut conn = Connection::<()>::connect()?;
-    conn.blocking_roundtrip().map_err(WaylandError::Connect)?;
+    conn.blocking_roundtrip().map_err(WaylandError::connect)?;
     let manager = WpSecurityContextManagerV1::INTERFACE.name;
     Ok(conn
         .globals()
@@ -164,7 +186,7 @@ pub fn create_context(
     instance_id: &str,
 ) -> Result<(), WaylandError> {
     let mut conn = Connection::<()>::connect()?;
-    conn.blocking_roundtrip().map_err(WaylandError::Connect)?;
+    conn.blocking_roundtrip().map_err(WaylandError::connect)?;
     let manager = conn
         .bind_singleton::<WpSecurityContextManagerV1>(1..=1)
         .map_err(|_| WaylandError::NoManager)?;
@@ -176,9 +198,13 @@ pub fn create_context(
     ctx.commit(&mut conn);
     ctx.destroy(&mut conn);
     manager.destroy(&mut conn);
-    // The requests are only queued until something flushes them, and a
-    // roundtrip is also where a protocol error comes back.
-    conn.blocking_roundtrip().map_err(WaylandError::Connect)?;
+    // The requests are only queued until something flushes them, and this
+    // roundtrip is where the compositor's verdict comes back: a rejected
+    // fd, rejected metadata or a nested context arrives as `wl_display.error`,
+    // which wayrs raises out of the roundtrip. The connection stood, so
+    // that is a protocol failure, not a connection one.
+    conn.blocking_roundtrip()
+        .map_err(|e| WaylandError::Protocol(e.to_string()))?;
     Ok(())
 }
 
@@ -209,6 +235,22 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn connect_errors_carry_their_cause() {
+        let e = WaylandError::from(ConnectError::NotEnoughEnvVars);
+        assert!(e.to_string().contains("connecting to the compositor at"));
+        let cause = std::error::Error::source(&e).expect("Connect chains its cause");
+        assert!(
+            cause
+                .to_string()
+                .contains("WAYLAND_DISPLAY or XDG_RUNTIME_DIR unset")
+        );
+
+        let e = WaylandError::from(ConnectError::Io(io::Error::other("boom")));
+        let cause = std::error::Error::source(&e).expect("Connect chains its cause");
+        assert!(cause.to_string().contains("boom"));
     }
 
     #[test]
