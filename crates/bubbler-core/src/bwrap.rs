@@ -125,9 +125,10 @@ pub struct BwrapArgs {
     env: Vec<Item>,
     /// `--ctty` in the supervisor's own argv, not a bwrap flag.
     ctty: bool,
-    /// The argv of a program the supervisor starts before the command,
-    /// with the node that asked for it. Also not a bwrap flag.
-    helper: Option<(Origin, Vec<OsString>)>,
+    /// The argv of the nested X server the supervisor starts on the
+    /// first X connection, an optional window manager to start with it,
+    /// and the node that asked for them. Also not bwrap flags.
+    x11: Option<(Origin, Vec<OsString>, Option<OsString>)>,
     /// Tag every following push carries. Set once per phase of work by
     /// [`BwrapArgs::tag`], so the dozens of `ro_bind`/`setenv` call sites
     /// need no origin argument of their own.
@@ -220,7 +221,7 @@ impl BwrapArgs {
             binds: Vec::new(),
             env: Vec::new(),
             ctty: false,
-            helper: None,
+            x11: None,
             origin: Origin::Baseline,
         };
         let o = OsStr::new;
@@ -369,7 +370,7 @@ impl BwrapArgs {
             binds: Vec::new(),
             env: Vec::new(),
             ctty: false,
-            helper: None,
+            x11: None,
             origin: Origin::Baseline,
         };
         let o = OsStr::new;
@@ -571,16 +572,17 @@ impl BwrapArgs {
         self.ctty = true;
     }
 
-    /// Have the supervisor start `argv` and wait for its display before
-    /// the command runs: `--helper <argv…> --` in `bubbler-init`'s own
+    /// Have the supervisor own the display socket and start `argv` on
+    /// the first client that connects, with `wm` alongside it:
+    /// `--x11 <argv…> --` and `--wm <program>` in `bubbler-init`'s own
     /// arguments, and only there — a sandbox has one display server at
     /// most, and a sidecar has none.
-    pub fn helper(&mut self, argv: Vec<OsString>) {
+    pub fn x11_server(&mut self, argv: Vec<OsString>, wm: Option<OsString>) {
         // Two servers in one sandbox is a bug in the caller, not a
         // configuration a user can write: the second would replace the
         // first silently, so the first is kept.
-        debug_assert!(self.helper.is_none(), "a second helper argv");
-        self.helper.get_or_insert((self.origin, argv));
+        debug_assert!(self.x11.is_none(), "a second X server argv");
+        self.x11.get_or_insert((self.origin, argv, wm));
     }
 
     /// Set a variable inside the sandbox (phase 5, after `--clearenv`).
@@ -613,7 +615,7 @@ impl BwrapArgs {
         alloc: &mut dyn FdAllocator,
     ) -> Result<Vec<Explained>, LaunchError> {
         let ctty = self.ctty;
-        let helper = self.helper.take();
+        let x11 = self.x11.take();
         let mut out = self.emit(alloc)?;
         let socket = alloc.init_socket().map_err(LaunchError::Data)?;
         out.push(Explained {
@@ -633,20 +635,30 @@ impl BwrapArgs {
                 note: None,
             });
         }
-        if let Some((origin, argv)) = helper {
-            let mut args = vec![OsString::from("--helper")];
+        if let Some((origin, argv, wm)) = x11 {
+            let mut args = vec![OsString::from("--x11")];
             args.extend(argv);
-            // The supervisor reads the helper's argv up to this `--`; the
-            // command's own follows it.
+            // The supervisor reads the server's argv up to this `--`; the
+            // window manager and the command's own argv follow it.
             args.push(OsString::from("--"));
             out.push(Explained {
                 origin,
                 args,
                 note: Some(
-                    "nested Xwayland, started by bubbler-init; -displayfd is added at run time"
+                    "nested Xwayland, started by bubbler-init on the first X connection; \
+                     -listenfd is added at run time"
                         .to_owned(),
                 ),
             });
+            if let Some(wm) = wm {
+                out.push(Explained {
+                    origin,
+                    args: vec![OsString::from("--wm"), wm],
+                    note: Some(
+                        "window manager inside the sandbox, started with the server".to_owned(),
+                    ),
+                });
+            }
         }
         let mut args = vec![OsString::from("--")];
         args.extend_from_slice(command);
@@ -1402,35 +1414,74 @@ mod tests {
         );
     }
 
-    /// The helper is the supervisor's argument, not bwrap's: it follows
-    /// the switches of the supervisor, ends with the `--` that closes it,
-    /// and keeps the origin of the node that asked for a server. A
-    /// sidecar runs no supervisor, so it never carries one.
+    /// The server argv is the supervisor's argument, not bwrap's: it
+    /// follows the switches of the supervisor, ends with the `--` that
+    /// closes it, and keeps the origin of the node that asked for a
+    /// display. A sidecar runs no supervisor, so it never carries one.
     #[test]
-    fn the_helper_argv_follows_the_supervisor_switches_and_keeps_its_origin() {
+    fn the_x11_argv_follows_the_supervisor_switches_and_keeps_its_origin() {
         let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default());
         args.ctty();
         args.tag(Origin::Service(2));
-        args.helper(vec!["/usr/bin/Xwayland".into(), ":0".into()]);
+        args.x11_server(vec!["/usr/bin/Xwayland".into(), ":0".into()], None);
         args.tag(Origin::Baseline);
         let explained = args
             .clone()
             .finish_explained(&["sh".into()], &mut Counter::new())
             .unwrap();
-        let helper = &explained[explained.len() - 2];
-        assert_eq!(helper.origin, Origin::Service(2));
+        let server = &explained[explained.len() - 2];
+        assert_eq!(server.origin, Origin::Service(2));
         assert_eq!(
-            strs(&helper.args),
-            ["--helper", "/usr/bin/Xwayland", ":0", "--"]
+            strs(&server.args),
+            ["--x11", "/usr/bin/Xwayland", ":0", "--"]
         );
         assert_eq!(
-            helper.note.as_deref(),
-            Some("nested Xwayland, started by bubbler-init; -displayfd is added at run time")
+            server.note.as_deref(),
+            Some(
+                "nested Xwayland, started by bubbler-init on the first X connection; \
+                 -listenfd is added at run time"
+            )
         );
         let plain = args
             .finish_plain(&["sh".into()], &mut Counter::new())
             .unwrap();
-        assert!(!strs(&plain).contains(&"--helper"), "{plain:?}");
+        assert!(!strs(&plain).contains(&"--x11"), "{plain:?}");
+    }
+
+    /// A window manager is one more argument of the supervisor's, after
+    /// the `--` that closes the server argv and before the command's
+    /// own: the words of the server's command line stay the server's.
+    #[test]
+    fn a_window_manager_follows_the_server_argv_it_is_not_part_of() {
+        let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default());
+        args.tag(Origin::Service(2));
+        args.x11_server(
+            vec!["/usr/bin/Xwayland".into(), ":0".into()],
+            Some("openbox".into()),
+        );
+        args.tag(Origin::Baseline);
+        let explained = args
+            .finish_explained(&["sh".into()], &mut Counter::new())
+            .unwrap();
+        let wm = &explained[explained.len() - 2];
+        assert_eq!(wm.origin, Origin::Service(2));
+        assert_eq!(strs(&wm.args), ["--wm", "openbox"]);
+        assert_eq!(
+            wm.note.as_deref(),
+            Some("window manager inside the sandbox, started with the server")
+        );
+        let flat = flatten(explained);
+        let tail = [
+            "--x11",
+            "/usr/bin/Xwayland",
+            ":0",
+            "--",
+            "--wm",
+            "openbox",
+            "--",
+            "sh",
+        ];
+        assert_eq!(strs(&flat[flat.len() - tail.len()..]), tail, "{flat:?}");
     }
 
     #[test]

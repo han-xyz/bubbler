@@ -413,6 +413,33 @@ pub fn host_bus(env: &Env) -> Result<PathBuf, LaunchError> {
     .unwrap_or_else(|| env.runtime_dir.join("bus")))
 }
 
+/// Refuse a resolved host bus path that lies under bubbler's own
+/// runtime directory, naming `node` as the grant that rejected it. Those
+/// directories hold the instances' control sockets and the proxy's own
+/// output: a bus address pointing there would have the proxy connect to
+/// a sandbox's exec channel or to a socket it is about to serve itself,
+/// and the address is host environment, which is untrusted input.
+pub fn refuse_bubbler_runtime(
+    env: &Env,
+    node: &'static str,
+    path: PathBuf,
+) -> Result<PathBuf, LaunchError> {
+    // The path as the address resolves to, not as canonicalised: the
+    // type probe that follows uses `stat`, so a symlink whose target is
+    // in here still passes. Both paths are under the user's own
+    // `$XDG_RUNTIME_DIR`, where planting such a link means being the
+    // user already; what this refuses is an address that names bubbler's
+    // own sockets outright.
+    if path.starts_with(env.runtime_dir.join("bubbler")) {
+        return Err(LaunchError::BadValue {
+            service: node,
+            reason: "the host bus address names a socket under bubbler's own runtime directory"
+                .to_owned(),
+        });
+    }
+    Ok(path)
+}
+
 /// Host system bus socket: the `unix:path=` of `$DBUS_SYSTEM_BUS_ADDRESS`
 /// when it is set, else [`SYSTEM_BUS_PATH`], which is what libdbus and
 /// libsystemd fall back to. The caller must still check that the result

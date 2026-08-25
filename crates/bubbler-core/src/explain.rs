@@ -701,7 +701,8 @@ bwrap
 
     /// Which X server an `x11` grant runs is not in its arguments
     /// either: the nested one is a display variable plus the argv the
-    /// supervisor starts, and the note is what says so.
+    /// supervisor starts on the first X connection, with the window
+    /// manager beside it, and the notes are what say so.
     #[test]
     fn an_x11_grant_shows_the_server_it_runs() {
         let nested = cfg("wayland\ndri\nx11\ncommand \"true\"");
@@ -730,10 +731,16 @@ bwrap
                 item(Origin::Service(2), &["--setenv", "DISPLAY", ":0"], None),
                 item(
                     Origin::Service(2),
-                    &["--helper", "/usr/bin/Xwayland", ":0", "--"],
+                    &["--x11", "/usr/bin/Xwayland", ":0", "--"],
                     Some(
-                        "nested Xwayland, started by bubbler-init; -displayfd is added at run time",
+                        "nested Xwayland, started by bubbler-init on the first X connection; \
+                         -listenfd is added at run time",
                     ),
+                ),
+                item(
+                    Origin::Service(2),
+                    &["--wm", "openbox"],
+                    Some("window manager inside the sandbox, started with the server"),
                 ),
             ],
         );
@@ -742,11 +749,13 @@ bwrap
             .position(|l| l.starts_with("  x11 "))
             .unwrap_or_else(|| panic!("{out:#?}"));
         assert_eq!(
-            &out[at + 1..at + 3],
+            &out[at + 1..at + 4],
             [
                 "    --setenv DISPLAY :0".to_owned(),
-                "    --helper /usr/bin/Xwayland :0 --  (nested Xwayland, started by \
-                 bubbler-init; -displayfd is added at run time)"
+                "    --x11 /usr/bin/Xwayland :0 --  (nested Xwayland, started by bubbler-init \
+                 on the first X connection; -listenfd is added at run time)"
+                    .to_owned(),
+                "    --wm openbox  (window manager inside the sandbox, started with the server)"
                     .to_owned(),
             ],
             "{out:#?}"

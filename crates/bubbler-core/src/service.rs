@@ -322,7 +322,14 @@ fn x11(
         // supervisor that started it. Nothing is bound and no cookie is
         // handed over — an X client inside reaches no other display.
         args.setenv(OsStr::new("DISPLAY"), OsStr::new(":0"));
-        args.helper(nested.xwayland_argv());
+        // The window manager is not probed on the host: the supervisor
+        // resolves it on the sandbox's own `PATH`, and a name that
+        // resolves to nothing there is a line in its log rather than a
+        // launch that fails.
+        args.x11_server(
+            nested.xwayland_argv(),
+            nested.wm.as_deref().map(OsString::from),
+        );
         return Ok(());
     }
     let display = env.display.as_deref().ok_or(LaunchError::MissingEnv {
@@ -1118,7 +1125,7 @@ fn app_runtime(env: &Env, args: &mut BwrapArgs, id: &str, mode: ShareMode) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::WaylandMode;
+    use crate::config::{NestedX11, WaylandMode};
     use crate::host::fake::{self, FakeHost};
     use crate::wayland::RawReason;
     use std::ffi::OsString;
@@ -1498,7 +1505,9 @@ mod tests {
 
     /// The supervisor is handed the server's command line, ended by a
     /// `--` of its own so the sandbox's command still follows it: these
-    /// words are the argv `bubbler-init` runs, `-displayfd` aside.
+    /// words are the argv `bubbler-init` runs, `-listenfd` aside. A
+    /// window manager the node names follows that `--` as an argument
+    /// of the supervisor's, never as a flag of the server's.
     #[test]
     fn nested_x11_hands_the_supervisor_the_server_argv() {
         let a = argv(
@@ -1508,7 +1517,7 @@ mod tests {
         )
         .unwrap();
         let tail = [
-            "--helper",
+            "--x11",
             "/usr/bin/Xwayland",
             ":0",
             "-noreset",
@@ -1528,6 +1537,20 @@ mod tests {
             "x",
         ];
         assert_eq!(a[a.len() - tail.len()..], tail, "{a:?}");
+        let wm = argv(
+            &[Service::X11(X11Mode::Nested(NestedX11 {
+                wm: Some("openbox".to_owned()),
+                ..NestedX11::default()
+            }))],
+            &env(),
+            &[("/usr/bin/Xwayland", File)],
+        )
+        .unwrap();
+        assert_eq!(wm[wm.len() - 4..], ["--wm", "openbox", "--", "x"], "{wm:?}");
+        // The name is the supervisor's argument alone; the server argv
+        // ends before it, at its own `--`.
+        assert_eq!(wm[wm.len() - 5], "--", "{wm:?}");
+        assert!(!wm.contains(&"-wm".to_owned()), "{wm:?}");
     }
 
     /// A host without `xorg-xwayland` has no server to nest, and the run

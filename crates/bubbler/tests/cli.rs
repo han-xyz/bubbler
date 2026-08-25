@@ -3132,7 +3132,7 @@ fn x11_warns_before_a_real_run() {
 }
 
 /// The nested mode's whole server command line reaches the supervisor:
-/// `--helper`, the argv, and the `--` that closes it, all before the `--`
+/// `--x11`, the argv, and the `--` that closes it, all before the `--`
 /// the sandbox's own command follows. The words are the contract with
 /// `bubbler-init`, so a dry run is where a user can read them.
 #[test]
@@ -3159,7 +3159,7 @@ fn a_nested_x11_dry_run_hands_the_supervisor_the_server_argv() {
     let s = String::from_utf8_lossy(&out.stdout);
     let lines: Vec<&str> = s.lines().collect();
     let tail = [
-        "--helper",
+        "--x11",
         "/usr/bin/Xwayland",
         ":0",
         "-noreset",

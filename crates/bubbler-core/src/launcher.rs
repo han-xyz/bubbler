@@ -453,17 +453,17 @@ pub fn explain_proxy(env: &Env, inst: &Instance) -> Result<Option<Vec<Explained>
     let session = plan
         .session
         .as_ref()
-        .map(|_| dbus::host_bus(env))
+        .map(|_| dbus::refuse_bubbler_runtime(env, "dbus", dbus::host_bus(env)?))
         .transpose()?;
     let system = plan
         .system
         .as_ref()
-        .map(|_| dbus::host_system_bus(env))
+        .map(|_| dbus::refuse_bubbler_runtime(env, "system-bus", dbus::host_system_bus(env)?))
         .transpose()?;
     let a11y = plan
         .a11y
         .as_ref()
-        .map(|_| dbus::host_a11y_bus(env))
+        .map(|_| dbus::refuse_bubbler_runtime(env, dbus::A11Y_NODE, dbus::host_a11y_bus(env)?))
         .transpose()?;
     let dir = instance_runtime_dir(env, &inst.name);
     let mut alloc = DryRunAlloc::default();
@@ -695,12 +695,19 @@ pub fn start_proxy(
     let session_bus = plan
         .session
         .as_ref()
-        .map(|_| service::require_socket(host, "dbus", dbus::host_bus(env)?))
+        .map(|_| {
+            let path = dbus::refuse_bubbler_runtime(env, "dbus", dbus::host_bus(env)?)?;
+            service::require_socket(host, "dbus", path)
+        })
         .transpose()?;
     let system_bus = plan
         .system
         .as_ref()
-        .map(|_| service::require_socket(host, "system-bus", dbus::host_system_bus(env)?))
+        .map(|_| {
+            let path =
+                dbus::refuse_bubbler_runtime(env, "system-bus", dbus::host_system_bus(env)?)?;
+            service::require_socket(host, "system-bus", path)
+        })
         .transpose()?;
     // Resolved before the proxy starts, like the other two: the address
     // is what the session says its accessibility bus is, and asking for
@@ -709,7 +716,11 @@ pub fn start_proxy(
     let a11y_bus = plan
         .a11y
         .as_ref()
-        .map(|_| service::require_socket(host, dbus::A11Y_NODE, dbus::host_a11y_bus(env)?))
+        .map(|_| {
+            let path =
+                dbus::refuse_bubbler_runtime(env, dbus::A11Y_NODE, dbus::host_a11y_bus(env)?)?;
+            service::require_socket(host, dbus::A11Y_NODE, path)
+        })
         .transpose()?;
     // The proxy gets this directory and nothing else of the instance's
     // runtime state, so it is created here rather than bound from above.
@@ -2987,6 +2998,84 @@ mod tests {
                     .count(),
             dbus::A11Y_RULES.len(),
             "{bus}"
+        );
+    }
+
+    /// The bus addresses are host environment, so each resolved path is
+    /// measured against bubbler's own runtime directory before anything
+    /// is bound: a socket under it is an instance's control socket or a
+    /// proxy's own output, and proxying one would hand the sandbox the
+    /// channel that runs commands inside another.
+    #[test]
+    fn a_host_bus_address_under_bubblers_runtime_directory_is_refused() {
+        use crate::host::fake::{self, FakeHost};
+        let tmp = tempfile::tempdir().unwrap();
+        // The session bus is resolved and probed before the other two,
+        // so it has to be a socket for their guard to be reached at all.
+        let (_, _, sock) = fake::types();
+        let host = FakeHost::default().with("/run/user/1000/bus", sock);
+        let inside = OsString::from(format!(
+            "unix:path={}",
+            tmp.path().join("run/bubbler/t/init.sock").display()
+        ));
+        type Set = fn(&mut Env, OsString);
+        let cases: [(&str, &str, Set); 3] = [
+            ("dbus\ncommand \"true\"", "dbus", |e, a| {
+                e.dbus_address = Some(a)
+            }),
+            (
+                "dbus\nsystem-bus { talk \"org.freedesktop.UPower\" }\ncommand \"true\"",
+                "system-bus",
+                |e, a| e.dbus_system_address = Some(a),
+            ),
+            ("dbus\na11y\ncommand \"true\"", dbus::A11Y_NODE, |e, a| {
+                e.at_spi_bus_address = Some(a)
+            }),
+        ];
+        for (kdl, node, set) in cases {
+            let mut e = env(tmp.path());
+            // The other addresses stay outside the directory, so the
+            // failure can only be the bus under test.
+            e.dbus_address = Some("unix:path=/run/user/1000/bus".into());
+            set(&mut e, inside.clone());
+            let cfg = inst(tmp.path(), kdl);
+            let plan = dbus::plan(&cfg.config.services, "t").expect("a `dbus` node starts a proxy");
+            let dir = instance_runtime_dir(&e, "t");
+            // Both paths into the proxy, since a run resolves the
+            // addresses again rather than reading the explanation.
+            for got in [
+                start_proxy(&e, &dir, &plan, &host).map(|_| ()),
+                explain_proxy(&e, &cfg).map(|_| ()),
+            ] {
+                match got {
+                    Err(LaunchError::BadValue { service, reason }) => {
+                        assert_eq!(service, node);
+                        assert_eq!(
+                            reason,
+                            "the host bus address names a socket under bubbler's own \
+                             runtime directory"
+                        );
+                    }
+                    other => panic!("{node}: {other:?}"),
+                }
+            }
+        }
+        // The addresses a session normally sets are outside it, and the
+        // guard leaves them alone.
+        let mut e = env(tmp.path());
+        e.dbus_address = Some("unix:path=/run/user/1000/bus".into());
+        e.dbus_system_address = Some("unix:path=/run/dbus/system_bus_socket".into());
+        e.at_spi_bus_address = Some("unix:path=/run/user/1000/at-spi/bus_0".into());
+        assert!(
+            explain_proxy(
+                &e,
+                &inst(
+                    tmp.path(),
+                    "dbus\nsystem-bus { talk \"org.freedesktop.UPower\" }\na11y\ncommand \"true\"",
+                )
+            )
+            .unwrap()
+            .is_some()
         );
     }
 
