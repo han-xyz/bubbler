@@ -3474,6 +3474,239 @@ fn real_nested_x11_exec_children_see_the_display() {
         .join("init.sock");
     assert!(!sock.exists(), "the control socket outlived the run");
 }
+/// The process lister the assertions below ask inside the sandbox. It is
+/// procps-ng, read from the host's `/usr` like everything else in there,
+/// so a host without it has none inside either.
+const PGREP: &str = "/usr/bin/pgrep";
+
+/// Returns false (after printing why) when `program` is not installed on
+/// this host, which is where the sandbox reads its `/usr` from.
+fn require_host_program(program: &str) -> bool {
+    let ok = Path::new(program).is_file();
+    if !ok {
+        say(&format!("skipping: {program} is not installed"));
+    }
+    ok
+}
+
+/// One `exec` child of a running instance, which is also one client of
+/// its display.
+fn exec_in(tmp: &Path, init: &Path, name: &str, argv: &[&str]) -> std::process::Output {
+    bubbler_wayland(tmp, init)
+        .args(["exec", name, "--"])
+        .args(argv)
+        .output()
+        .expect("running bubbler exec")
+}
+
+/// A run of `name` in the background, on a command that outlives the
+/// test's questions, and answering `exec` before this returns.
+///
+/// The command is `sleep` and not an X client: the first connection is
+/// what starts the server, so a test that means to look at a sandbox
+/// with no server in it must not bring one itself. Waiting for the exec
+/// channel is what makes that look mean anything — an empty answer from
+/// a sandbox that is not up yet would prove nothing.
+fn nested_x11_run(tmp: &Path, init: &Path, name: &str) -> Child {
+    let run = bubbler_wayland(tmp, init)
+        .args(["run", name, "--", "/usr/bin/sleep", "30"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    if !wait_until(
+        || {
+            exec_in(tmp, init, name, &["/usr/bin/true"])
+                .status
+                .success()
+        },
+        Duration::from_secs(10),
+    ) {
+        fail_with(run, "no exec child ran inside the instance");
+    }
+    run
+}
+
+/// SIGTERM a background run, wait for it, and hand back everything it
+/// said. The supervisor logs on that stderr, and a pipe is only read to
+/// the end once the run holding its other end is gone.
+fn stop_run(mut run: Child) -> String {
+    kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
+    if !wait_until(
+        || {
+            run.try_wait()
+                .expect("waiting for the run process")
+                .is_some()
+        },
+        Duration::from_secs(10),
+    ) {
+        fail_with(run, "the run did not stop after SIGTERM");
+    }
+    let out = run.wait_with_output().expect("waiting for the run process");
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// Lazy start, seen from inside: a sandbox that is up and answering
+/// `exec` holds no X server at all, the first client is what starts one,
+/// and one is all it starts.
+#[test]
+fn real_nested_x11_starts_the_server_on_the_first_client() {
+    if !require_nested_x11() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    if !require_host_program(XDPYINFO) || !require_host_program(PGREP) {
+        return;
+    }
+    let tmp = setup();
+    let name = "bubbler-test-x11-lazy";
+    let _leftovers = wayland_instance(tmp.path(), &init, name, NESTED_X11);
+    let run = nested_x11_run(tmp.path(), &init, name);
+
+    // The command itself, found by the same lister a moment before it is
+    // asked about the server: an empty answer below is then this sandbox
+    // holding no server, and not this lister seeing nothing at all.
+    let command = exec_in(tmp.path(), &init, name, &[PGREP, "-x", "sleep"]);
+    let found = String::from_utf8_lossy(&command.stdout);
+    assert_eq!(found.lines().count(), 1, "{found}");
+
+    // The instance has a pid namespace of its own, so this lists what
+    // runs inside it and nothing of the host — not the compositor's own
+    // Xwayland, and not another test's.
+    let before = exec_in(tmp.path(), &init, name, &[PGREP, "-x", "Xwayland"]);
+    let listed = String::from_utf8_lossy(&before.stdout);
+    assert!(
+        listed.trim().is_empty(),
+        "a server was running before any client asked for one: {listed}"
+    );
+    // pgrep's own "nothing matched", which is also this saying that
+    // pgrep ran rather than that the exec failed.
+    assert_eq!(before.status.code(), Some(1), "{listed}");
+
+    // This client's connection is what wakes the server, and the server
+    // it wakes is the one that serves it: the socket it is already
+    // connected to is the one handed over.
+    let info = exec_in(tmp.path(), &init, name, &[XDPYINFO]);
+    let err = String::from_utf8_lossy(&info.stderr);
+    assert_eq!(info.status.code(), Some(0), "{err}");
+    let shown = String::from_utf8_lossy(&info.stdout);
+    assert!(shown.contains("name of display:    :0"), "{shown}{err}");
+
+    // One server, still there after the client that woke it has gone:
+    // the display belongs to the instance and not to its first client.
+    let after = exec_in(tmp.path(), &init, name, &[PGREP, "-x", "Xwayland"]);
+    let running = String::from_utf8_lossy(&after.stdout);
+    assert_eq!(running.lines().count(), 1, "{running}");
+
+    let said = stop_run(run);
+    assert!(!said.contains("did not start"), "{said}");
+}
+
+/// A window manager is a convenience the display does not depend on: one
+/// that leaves is reported once, and the server keeps serving.
+#[test]
+fn real_nested_x11_wm_exiting_is_logged_not_fatal() {
+    if !require_nested_x11() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    if !require_host_program(XDPYINFO) {
+        return;
+    }
+    let tmp = setup();
+    let name = "bubbler-test-x11-wm-exits";
+    // `true` is a window manager that manages nothing and exits at once,
+    // which is the shape of the failure this pins.
+    let _leftovers = wayland_instance(
+        tmp.path(),
+        &init,
+        name,
+        "wayland\ndri\nx11 wm=\"true\"\ncommand \"true\"\n",
+    );
+    let run = nested_x11_run(tmp.path(), &init, name);
+
+    let info = exec_in(tmp.path(), &init, name, &[XDPYINFO]);
+    let err = String::from_utf8_lossy(&info.stderr);
+    assert_eq!(info.status.code(), Some(0), "{err}");
+    let shown = String::from_utf8_lossy(&info.stdout);
+    assert!(shown.contains("name of display:    :0"), "{shown}{err}");
+
+    let said = stop_run(run);
+    assert!(said.contains("bubbler-init: wm true exited"), "{said}");
+}
+
+/// A window manager that is not installed is the same kind of news: the
+/// name is resolved inside, where the host cannot check it, so a miss is
+/// reported and the run carries on unmanaged.
+#[test]
+fn real_nested_x11_missing_wm_is_logged_not_fatal() {
+    if !require_nested_x11() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    if !require_host_program(XDPYINFO) {
+        return;
+    }
+    let tmp = setup();
+    let name = "bubbler-test-x11-wm-missing";
+    let _leftovers = wayland_instance(
+        tmp.path(),
+        &init,
+        name,
+        "wayland\ndri\nx11 wm=\"nosuchwm\"\ncommand \"true\"\n",
+    );
+    let run = nested_x11_run(tmp.path(), &init, name);
+
+    let info = exec_in(tmp.path(), &init, name, &[XDPYINFO]);
+    let err = String::from_utf8_lossy(&info.stderr);
+    assert_eq!(info.status.code(), Some(0), "{err}");
+    let shown = String::from_utf8_lossy(&info.stdout);
+    assert!(shown.contains("name of display:    :0"), "{shown}{err}");
+
+    let said = stop_run(run);
+    assert!(said.contains("bubbler-init: wm nosuchwm:"), "{said}");
+}
+
+/// Every instance's control socket lives under `$XDG_RUNTIME_DIR/bubbler`,
+/// and a session bus address naming one would point the proxy at a
+/// sandbox's exec channel. The address is host environment, which is
+/// untrusted input, so the run refuses it — before it has bound
+/// anything, which is why this needs no bus on the host at all.
+#[test]
+fn a_bus_address_under_bubblers_runtime_directory_is_refused() {
+    let tmp = setup();
+    let out = bubbler(tmp.path())
+        .args(["create", "guarded"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/guarded/config.kdl"),
+        "dbus\ncommand \"true\"\n",
+    )
+    .unwrap();
+
+    // The path an instance named `x` would keep its exec channel at. It
+    // need not exist: what is refused is where the address points.
+    let sock = tmp.path().join("run/bubbler/x/init.sock");
+    let out = bubbler(tmp.path())
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}", sock.display()),
+        )
+        .args(["run", "guarded"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "{err}");
+    assert!(
+        err.contains("service `dbus`: the host bus address names a socket under bubbler's own runtime directory"),
+        "{err}"
+    );
+}
 
 /// `--explain` describes the run a compositor with the protocol gives,
 /// and asks no compositor anything: here `$WAYLAND_DISPLAY` names a
