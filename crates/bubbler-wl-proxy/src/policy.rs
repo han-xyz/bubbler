@@ -162,6 +162,10 @@ impl Policy {
 
     /// Record user input at `now`: from here a clipboard read is forwarded for
     /// [`GATE_WINDOW`].
+    ///
+    /// What arms it: `wl_keyboard.key` pressed, `wl_pointer.button` either
+    /// way, and `wl_touch.down` or `.up` — the release of each, because that
+    /// is where a drag ends and where a paste is asked for.
     pub fn arm(&mut self, now: Instant) {
         self.last_input = Some(now);
     }
@@ -248,16 +252,18 @@ impl Policy {
                     conn.objects.delete_id(*id);
                 }
             }
-            // `state` is argument 3 of both, and 1 is pressed. A pointer
-            // button arms on release as well: letting go of the mouse over a
-            // paste target is user input by any reading.
+            // `state` is argument 3 of a key, and 1 is pressed. Both ends of
+            // a press arm otherwise: letting go of the mouse over a paste
+            // target is user input by any reading, and a touch drag *drops*
+            // on `up`, which a long drag would otherwise reach the gate a
+            // second or more after the `down` that started it.
             ("wl_keyboard", "key") => {
                 if let Some(Arg::Uint(1)) = msg.args.get(3) {
                     self.arm(now);
                 }
             }
             ("wl_pointer", "button") => self.arm(now),
-            ("wl_touch", "down") => self.arm(now),
+            ("wl_touch", "down" | "up") => self.arm(now),
             _ => {}
         }
         Action::Forward
@@ -464,6 +470,11 @@ mod tests {
                 .position(|m| m.name == name)
                 .unwrap_or_else(|| panic!("{iface}.{name} in the tables"));
             let opcode = u16::try_from(at).expect("an opcode fits");
+            assert_eq!(
+                args.len(),
+                list[at].args.len(),
+                "{iface}.{name} does not take these arguments"
+            );
             let mut msg = Incoming {
                 from_client,
                 object,
@@ -536,8 +547,8 @@ mod tests {
         fn input(&mut self, iface: &str, name: &str, state: u32) {
             let object = 90;
             map(&mut self.conn, object, iface, 1);
-            let mut args = match name {
-                "down" => vec![
+            let mut args = match (iface, name) {
+                ("wl_touch", "down") => vec![
                     Arg::Uint(1),
                     Arg::Uint(0),
                     Arg::Object(0),
@@ -545,6 +556,7 @@ mod tests {
                     Arg::Fixed(0),
                     Arg::Fixed(0),
                 ],
+                ("wl_touch", "up") => vec![Arg::Uint(1), Arg::Uint(0), Arg::Int(0)],
                 _ => vec![Arg::Uint(1), Arg::Uint(0), Arg::Uint(30), Arg::Uint(state)],
             };
             let action = self
@@ -790,6 +802,8 @@ mod tests {
             ("wl_pointer", "button", 1),
             ("wl_pointer", "button", 0),
             ("wl_touch", "down", 0),
+            // A touch drag drops on the release, not on the press.
+            ("wl_touch", "up", 0),
         ] {
             let mut proxy = proxy();
             proxy.input(iface, name, state);
