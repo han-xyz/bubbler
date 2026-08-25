@@ -2549,7 +2549,10 @@ fn real_a11y_lets_the_app_register_and_nothing_else() {
     let tmp = setup();
     let name = "bubbler-test-a11y";
     let _leftovers = dbus_instance(tmp.path(), &init, name, "dbus\na11y\ncommand \"true\"\n");
-    let run = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").expect("checked by require_a11y"));
+    let run = PathBuf::from(
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .expect("the session runtime dir, the one dbus_instance placed this instance in"),
+    );
     let address = format!("unix:path={}", run.join("at-spi").join("bus").display());
 
     // What every at-spi2 client reads before it asks any bus for an
@@ -2582,18 +2585,46 @@ fn real_a11y_lets_the_app_register_and_nothing_else() {
             .unwrap();
         (
             out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
             String::from_utf8_lossy(&out.stderr).into_owned(),
         )
     };
 
-    let (code, err) = call(
+    // Two granted calls the registry answers with no arguments at all,
+    // one on each object the refused calls below are made on. An empty
+    // array coming back is the socket, the sandbox and the rules all
+    // working, which no failure of the `Embed` case could stand in for.
+    for (object, method) in [
+        (
+            "/org/a11y/atspi/registry",
+            "org.a11y.atspi.Registry.GetRegisteredEvents",
+        ),
+        (
+            "/org/a11y/atspi/registry/deviceeventcontroller",
+            "org.a11y.atspi.DeviceEventController.GetKeystrokeListeners",
+        ),
+    ] {
+        let (code, out, err) = call(object, method, &[]);
+        assert_eq!(code, Some(0), "{method}: {err}");
+        assert!(
+            out.contains("array"),
+            "{method}: stdout: {out}stderr: {err}"
+        );
+    }
+
+    // Registration itself. `dbus-send` cannot type the `(so)` struct
+    // `Embed` takes, so the registry drops the caller instead of
+    // answering — the very reply the raw host bus gives outside any
+    // sandbox. That refusal is the registry's own, and only a call that
+    // reached it can be refused that way.
+    let (code, _out, err) = call(
         "/org/a11y/atspi/accessible/root",
         "org.a11y.atspi.Socket.Embed",
         &["string:x", "objpath:/y"],
     );
     assert!(
-        code == Some(0) || !err.contains("AccessDenied"),
-        "the proxy refused the registration call: {err}"
+        code == Some(0) || err.contains("org.freedesktop.DBus.Error.NoReply"),
+        "the registration call was not the registry's to answer: {err}"
     );
 
     // Every keystroke of every accessible application, and injection
@@ -2608,7 +2639,7 @@ fn real_a11y_lets_the_app_register_and_nothing_else() {
             &[][..],
         ),
     ] {
-        let (code, err) = call(
+        let (code, _out, err) = call(
             "/org/a11y/atspi/registry/deviceeventcontroller",
             method,
             args,
@@ -2678,6 +2709,36 @@ fn real_input_method_hides_the_daemons_main_names() {
         assert!(s.contains("sender=org.freedesktop.DBus"), "{portal}: {s}");
     }
 
+    // A call *to* a hidden name is no more the bus's to answer than a
+    // question about it. Measured on this host: the proxy makes up a
+    // bare `ServiceUnknown` for it, while the bus's own answer for a
+    // name it knows and nobody owns says the name is not activatable —
+    // the sentence that tells the two apart, and never appears here.
+    let out = bubbler_dbus(tmp.path(), &init)
+        .args([
+            "run",
+            name,
+            "--",
+            "/usr/bin/dbus-send",
+            "--session",
+            "--print-reply",
+            "--dest=org.fcitx.Fcitx5",
+            "/org/freedesktop/portal/inputmethod",
+            "org.freedesktop.DBus.Peer.Ping",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "the hidden name answered");
+    assert!(
+        err.contains("org.freedesktop.DBus.Error.ServiceUnknown"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("not activatable"),
+        "the call reached the bus: {err}"
+    );
+
     let out = bubbler_dbus(tmp.path(), &init)
         .args(["run", name, "--", "/usr/bin/env"])
         .output()
@@ -2696,7 +2757,7 @@ fn real_input_method_hides_the_daemons_main_names() {
 /// install rather than a sandbox whose bus is quietly missing.
 #[test]
 fn a11y_without_dbus_send_on_path_names_the_package() {
-    if !require_a11y() {
+    if !require_dbus() {
         return;
     }
     let Some(init) = real_init() else { return };
@@ -2729,8 +2790,9 @@ fn a11y_without_dbus_send_on_path_names_the_package() {
 /// creates; the host address is the sidecar's business, and building an
 /// argv starts no sidecar.
 ///
-/// `PATH` is an empty directory, so a `dbus-send` spawned to find that
-/// address could not run: exit 0 is the proof that none was.
+/// The only program on `PATH` is a `dbus-send` that leaves a file behind
+/// when it runs, so the marker's absence afterwards is the proof that
+/// nothing asked any bus for the address.
 #[test]
 fn a11y_dry_run_builds_the_bind_without_asking_any_bus() {
     let tmp = setup();
@@ -2740,16 +2802,26 @@ fn a11y_dry_run_builds_the_bind_without_asking_any_bus() {
         "dbus\na11y\ncommand \"true\"\n",
     )
     .unwrap();
-    let empty = tmp.path().join("no-programs");
-    std::fs::create_dir_all(&empty).unwrap();
+    let path = tmp.path().join("only-dbus-send");
+    std::fs::create_dir_all(&path).unwrap();
+    let marker = tmp.path().join("asked-a-bus");
+    // The marker is written with a redirection and not `touch`: this
+    // directory is the whole of the script's own `PATH` too, so a
+    // stand-in that called any program would leave nothing behind and
+    // the assertion below would hold however often it ran.
+    write_script(
+        &path.join("dbus-send"),
+        &format!("#!/bin/sh\n: > \"{}\"\n", marker.display()),
+    );
 
     let out = bubbler(tmp.path())
-        .env("PATH", &empty)
+        .env("PATH", &path)
         .args(["run", "t", "--dry-run"])
         .output()
         .unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(!marker.exists(), "the dry run spawned dbus-send");
     let argv = String::from_utf8_lossy(&out.stdout);
     // `setup()` points $XDG_RUNTIME_DIR at an empty temp dir, so both
     // paths are the test's own.
