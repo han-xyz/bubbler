@@ -18,7 +18,7 @@ every claim pinned to a test:
 bubbler ─┬─ bwrap ── bwrap (pid 1 inside, reaps) ── bubbler-init (pid 2) ─┬─ your command
          │                                                                ├─ Xwayland (a bare x11, on its first X client)
          │                                                                └─ a window manager (only with wm=)
-         ├─ bwrap ── bwrap ── bubbler-wl-proxy      (with a bare wayland)
+         ├─ bwrap ── bwrap ── bubbler-wl-proxy      (with a sandboxed wayland)
          ├─ bwrap ── bwrap ── xdg-dbus-proxy        (only with dbus / system-bus)
          └─ pasta                                   (only with isolated network; not sandboxed)
 ```
@@ -30,17 +30,21 @@ channel, not a boundary. `--die-with-parent` is the backstop for everything.
 
 ## Wayland
 
-`wayland` binds a socket of bubbler's own,
-`$XDG_RUNTIME_DIR/bubbler/<inst>/wayland`, at the session's `WAYLAND_DISPLAY`
-name inside, and registers it with the compositor through
+A sandboxed `wayland` grant binds two sockets of bubbler's own, and the sandbox
+is given one of them. `$XDG_RUNTIME_DIR/bubbler/<inst>/wayland-context` is the
+one bubbler listens on and registers with the compositor through
 `wp_security_context_v1` (wayland-protocols staging): engine `org.bubbler`,
-app id `org.bubbler.<inst>`, instance id `bubbler-<inst>`. Clients arriving on
-it are marked as sandboxed, and the compositor withholds its privileged globals
-from them — screen capture, clipboard management, input injection, overlays,
-window management on Hyprland and sway. Which globals those are is the
-compositor's policy on this path, not bubbler's; bubbler only attaches the
-metadata. Only on the fallback below does the list become bubbler's own. The
-compositor stops accepting on the socket when the run ends.
+app id `org.bubbler.<inst>`, instance id `bubbler-<inst>`. The sandbox does not
+connect to it and cannot reach it. What is bound inside, at the session's
+`WAYLAND_DISPLAY` name, is the second socket,
+`$XDG_RUNTIME_DIR/bubbler/<inst>/wayland`, which `bubbler-wl-proxy` serves; the
+context socket is the proxy's upstream. Clients arriving over it are marked as
+sandboxed, and the compositor withholds its privileged globals from them —
+screen capture, clipboard management, input injection, overlays, window
+management on Hyprland and sway. Which globals those are is the compositor's
+policy on this path, not bubbler's; bubbler only attaches the metadata. Only on
+the fallback below does the list become bubbler's own. The compositor stops
+accepting on the context socket when the run ends.
 
 Measured on Hyprland 0.56.2: `wayland-info` counted 73 globals over 71
 interfaces on the host and 38 over 37 inside. Thirty-one of those interfaces the
@@ -50,10 +54,8 @@ foreign-toplevel and workspace listing, session-lock, and the security context
 manager itself, so a sandbox cannot nest another one. The other three the proxy
 below hides, its tables having no description for them.
 
-The application reaches that socket through `bubbler-wl-proxy`, a sidecar in a
-bwrap of its own: the sandbox connects to `<instance runtime>/wayland`, the
-proxy to `<instance runtime>/wayland-context` above. The listening socket is
-handed to it as an inherited descriptor, so the upstream socket is the only
+The sidecar runs in a bwrap of its own. The listener it serves is handed to it
+as an inherited descriptor rather than a path, so `wayland-context` is the only
 thing of the run bound into its sandbox — no home, no network, no instance
 runtime directory, the default seccomp filter. `bubbler run … --explain
 --wl-proxy` prints that argv. Missing or unable to start, it stops the run:

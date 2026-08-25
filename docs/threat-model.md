@@ -67,7 +67,7 @@ Seven processes can come with a sandbox, and they are not one kind of thing:
 | Sidecar | Where it runs | Is it a boundary? |
 |---|---|---|
 | `xdg-dbus-proxy` | its own bwrap sandbox, sibling of the app's | **Yes.** It is a filter, it sees only the host bus sockets read-only — up to three of them — and the instance's `dbus/` subdirectory read-write, and the socket it serves is moved out of its reach before anything is bound. |
-| `bubbler-wl-proxy` | its own bwrap sandbox, sibling of the app's, in front of every bare `wayland` | **Yes.** It is the only thing listening on the socket the sandbox connects to, and it forwards nothing it could not decode: every message is parsed against generated interface tables and re-encoded from what was parsed. It sees all of the sandbox's display traffic in both directions and holds two descriptors — the app-facing listener, handed in by number, and its connection to the compositor. The upstream socket is the one thing of the run bound into its sandbox: no home, no network, no instance runtime directory, no `init.sock`, default seccomp. It does not see what a clipboard read returns; those bytes travel on a descriptor it passes through without reading. |
+| `bubbler-wl-proxy` | its own bwrap sandbox, sibling of the app's, in front of every sandboxed `wayland` (bare or `clipboard="open"`) | **Yes.** It is the only thing listening on the socket the sandbox connects to, and it forwards nothing it could not decode: every message is parsed against generated interface tables and re-encoded from what was parsed. It sees all of the sandbox's display traffic in both directions. What it holds is the app-facing listener, handed in by number, one connection to the compositor for each of the up to 256 client connections it accepts, and two more descriptors the launcher passes — the audit log and the readiness pipe. The `wayland-context` socket it dials is the one thing of the run bound into its sandbox: no home, no network, no instance runtime directory, no `init.sock`, default seccomp. It does not see what a clipboard read returns; those bytes travel on a descriptor it passes through without reading. |
 | `bubbler-init` | *inside* the sandbox, as pid 2 | **No.** It is the supervisor, not a guard: it shares the sandbox with the application. What it holds — the listening control socket — is kept from the application by being an inherited descriptor with no path, `CLOEXEC` in the only process that has it, and `PR_SET_DUMPABLE` off so `/proc/<init>/fd` cannot be walked. |
 | `Xwayland` | *inside* the sandbox, started by `bubbler-init` on the first X connection, only with a bare `x11` | **No.** It is the sandbox's own X server rather than a guard in front of one: every client on it is a process of this instance, and X11 isolates none of them from each other. What it replaces is the session's display — it reaches the compositor on the instance's own Wayland socket and listens nowhere but `/tmp/.X11-unix/X0` in the sandbox's private `/tmp`, a socket `bubbler-init` binds and hands over rather than one the server opens. A command that never speaks X11 never starts it. See "X11" below. |
 | a window manager | *inside* the sandbox, started by `bubbler-init` with the server, only with `x11 wm="…"` | **No.** It is a sibling of the application under `bubbler-init`, resolved on the sandbox's own `PATH`, with the same access to that X server as the application it manages and no more reach into it than any other sibling has. Arch enables the Yama LSM with `kernel.yama.ptrace_scope` at 1 (restricted), which stops a `ptrace` on a tracee outside a restricted scope unless the tracer is privileged or holds `CAP_SYS_PTRACE`; the kernel's Yama document defines that scope as the tracer's own descendants, `PR_SET_PTRACER` being the opt-in, and two siblings are outside each other's. bubbler ships none and probes none; a name that resolves to nothing is a log line. |
@@ -322,13 +322,15 @@ Refusing a `bind` of a hidden global belongs here too, because the two
 data-control protocols are how a client reads the selection *without*
 focus. Under the security context the compositor never advertises them;
 the proxy additionally refuses them by number, and a sandbox that asks
-gets its connection closed. What is left is measured. The same fixture,
-one host and one sandbox, with `secret` on the selection: a data-control
-client reads 6 bytes on the host and finds no manager inside, and a client
-with no surface is offered nothing in either place, because the compositor
-sends `wl_data_device.selection` only to whoever has keyboard focus. A
-sandbox reaches the selection only as a window you can see, and only when
-the gate is open.
+gets its connection closed. What is left is measured, and
+`real_wayland_proxy_leaves_no_headless_clipboard_path` is what pins it:
+with `secret` on the selection, a data-control client reads 6 bytes on the
+host and finds no manager inside, and a client with no surface is offered
+nothing inside, because the compositor sends `wl_data_device.selection`
+only to whoever has keyboard focus. (A surfaceless client is offered
+nothing on the host either, for the same reason; that half is a hand
+measurement, not part of the test.) A sandbox reaches the selection only
+as a window you can see, and only when the gate is open.
 
 **Does not defend:** an application you are typing into. Your keystrokes
 are exactly what arm the gate, so a focused editor, terminal or browser can
@@ -344,12 +346,20 @@ all. Nothing here stops the sandbox *writing* the selection, and nothing
 here is a boundary against a compositor's own bugs. There is no per-MIME
 policy and no prompt.
 
-**Hard limits.** The proxy is bounded rather than trusting: 253 descriptors
-queued per side, which is Linux's own maximum for one `recvmsg`; 4 MiB of
-bytes queued per direction and 64 MiB across all of one instance's
-connections; 65 536 live object ids; 256 connections. Past any of them that
-one connection is closed with a `connection closed: …` line and the rest
-keep running. The gate window is one second and the audit log is one line a
+**Hard limits.** The proxy is bounded rather than trusting, and the
+bounds do not all do the same thing. Three of them end one connection,
+with a `connection closed: …` line naming which and why while every other
+connection carries on: 253 descriptors waiting on one side, which is
+Linux's own maximum for a single `recvmsg` and far past the two any
+message owns; 64 MiB of bytes queued across all of one sandbox's
+connections at once, where the connection holding the most is the one
+that gives way; and 65 536 live object ids on a connection. The other two
+apply back-pressure instead. 4 MiB queued in one direction stops the
+proxy reading the side that feeds it until the far side drains, and
+nothing is lost. 256 connections is where the proxy stops accepting, the
+kernel's backlog holding the rest until a connection ends.
+
+The gate window is one second and the audit log is one line a
 second per kind — gate lines and closures budgeted apart, so a `receive` in
 a loop cannot push the line that says why a connection ended out of the
 record — with what a burst swallowed counted onto the next line. The
