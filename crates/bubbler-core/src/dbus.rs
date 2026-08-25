@@ -442,11 +442,22 @@ pub fn guarded_host_a11y_bus(host: &dyn Host, env: &Env) -> Result<PathBuf, Laun
 /// sandbox's exec channel or to a socket it is about to serve itself,
 /// and the address is host environment, which is untrusted input.
 ///
-/// Both sides are compared in the resolved form [`resolve`] gives, so
-/// neither a symlink nor a `..` in the address walks in. Resolving reads
-/// the filesystem, which is why the caller passes its [`Host`]: an
-/// explanation resolves the same way a run does, or it would describe a
-/// run that is refused.
+/// Caught: an address that names such a socket, whether it spells the
+/// path out, reaches it through a symlink, or walks into it with `..`.
+/// Both sides are compared in the form [`resolve`] gives, and that
+/// resolved path is what comes back, so the caller stats and connects to
+/// the path this checked rather than to a name that can be repointed
+/// in between.
+///
+/// Not caught: a hard link to one of those sockets, or a
+/// `$XDG_RUNTIME_DIR` that names a different directory altogether. Both
+/// need the uid that already owns the runtime directory and every socket
+/// in it, which is the user's own; bubbler does not defend a user
+/// against themselves. What this defends is the address — a stale,
+/// copied or hostile value in an otherwise sane environment.
+///
+/// Resolving reads the filesystem, which is why the caller passes its
+/// [`Host`]: an explanation resolves the same way a run does.
 fn outside_our_runtime(
     host: &dyn Host,
     env: &Env,
@@ -454,7 +465,8 @@ fn outside_our_runtime(
     path: PathBuf,
 ) -> Result<PathBuf, LaunchError> {
     let ours = resolve(host, &env.runtime_dir.join(RUNTIME_SUBDIR));
-    if resolve(host, &path).starts_with(&ours) {
+    let path = resolve(host, &path);
+    if path.starts_with(&ours) {
         return Err(LaunchError::BadValue {
             service: node,
             reason: "the host bus address names a socket under bubbler's own runtime directory"
@@ -470,6 +482,12 @@ fn outside_our_runtime(
 /// explanation of a run resolves before anything is created. What no
 /// lookup answers is folded lexically, so a `..` is never left in place
 /// for a prefix comparison to walk past.
+///
+/// Where neither the socket nor its directory exists, only that lexical
+/// form is left, and a link that would be followed later is not followed
+/// here: an explanation can describe a bus the run it describes goes on
+/// to refuse. An explanation is not a run, and the run is the one that
+/// has to be right.
 fn resolve(host: &dyn Host, path: &Path) -> PathBuf {
     if let Some(real) = host.canonicalize(path) {
         return lexical(&real);
@@ -1112,6 +1130,35 @@ mod tests {
             assert_eq!(service, "dbus");
             assert!(reason.contains("DBUS_SESSION_BUS_ADDRESS"), "{reason}");
         }
+    }
+
+    /// The guard hands back the path it checked, so what a run stats
+    /// and what the proxy connects to is the socket the comparison was
+    /// made on rather than the name the address reached it by.
+    #[test]
+    fn a_guarded_bus_path_comes_back_resolved() {
+        use crate::host::fake::FakeHost;
+        let mut e = env();
+        e.dbus_address = Some("unix:path=/run/user/1000/link/bus".into());
+        let elsewhere = FakeHost::default().link("/run/user/1000/link", "/run/user/1000/real");
+        assert_eq!(
+            guarded_host_bus(&elsewhere, &e).unwrap(),
+            PathBuf::from("/run/user/1000/real/bus")
+        );
+        // The same address is refused when the link ends in bubbler's
+        // own directory: the name it took to get there is not what is
+        // compared.
+        let ours = FakeHost::default().link("/run/user/1000/link", "/run/user/1000/bubbler/t");
+        assert!(
+            matches!(
+                guarded_host_bus(&ours, &e),
+                Err(LaunchError::BadValue {
+                    service: SESSION_NODE,
+                    ..
+                })
+            ),
+            "the link into bubbler's own directory was accepted"
+        );
     }
 
     #[test]
