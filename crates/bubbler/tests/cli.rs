@@ -6,7 +6,7 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use bubbler_core::bwrap::ETC_ALLOWLIST;
@@ -15,7 +15,7 @@ use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
     PYTHON, bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, bubbler_wayland, bwrap_alive,
     kill_group, output_past_a_busy_exec, process_running, real_init, require_a11y, require_bwrap,
-    require_dbus, require_document_portal, require_groff, require_nested_x11,
+    require_dbus, require_document_portal, require_groff, require_host_program, require_nested_x11,
     require_nested_x11_host, require_nft, require_pasta, require_portal, require_python,
     require_security_context, require_system_bus, require_tray, say, system_owns, test_pty,
 };
@@ -3474,29 +3474,82 @@ fn real_nested_x11_exec_children_see_the_display() {
         .join("init.sock");
     assert!(!sock.exists(), "the control socket outlived the run");
 }
+
 /// The process lister the assertions below ask inside the sandbox. It is
 /// procps-ng, read from the host's `/usr` like everything else in there,
 /// so a host without it has none inside either.
 const PGREP: &str = "/usr/bin/pgrep";
 
-/// Returns false (after printing why) when `program` is not installed on
-/// this host, which is where the sandbox reads its `/usr` from.
-fn require_host_program(program: &str) -> bool {
-    let ok = Path::new(program).is_file();
-    if !ok {
-        say(&format!("skipping: {program} is not installed"));
-    }
-    ok
-}
+/// How long a background run is given to start, to say something, or to
+/// stop. Every wait around one is bounded: a test that goes wrong has to
+/// fail rather than hang.
+const RUN_LIMIT: Duration = Duration::from_secs(10);
 
 /// One `exec` child of a running instance, which is also one client of
 /// its display.
-fn exec_in(tmp: &Path, init: &Path, name: &str, argv: &[&str]) -> std::process::Output {
+fn exec_in(tmp: &Path, init: &Path, name: &str, argv: &[&str]) -> Output {
     bubbler_wayland(tmp, init)
         .args(["exec", name, "--"])
         .args(argv)
         .output()
         .expect("running bubbler exec")
+}
+
+/// A run left going in the background, with its stderr — the
+/// supervisor's log — in a file the test can read while it goes.
+///
+/// The run is ended when this drops, whether the test finished or an
+/// assertion took it out from under: a leaked run is a sandbox, a server
+/// and a thirty-second `sleep` outliving the instance directory and the
+/// temporary tree they were built from.
+struct BackgroundRun {
+    /// The `bubbler run` process, taken out once it has been waited for.
+    run: Option<Child>,
+    /// Where its stderr is being written.
+    log: PathBuf,
+}
+
+impl BackgroundRun {
+    /// Everything the run has said so far. A file and not a pipe, so a
+    /// line can be waited for while the run is still going rather than
+    /// read out of it once the run has ended — which is a wait on the
+    /// run itself, and no wait here is unbounded.
+    fn said(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// Stop the run the way a user's SIGTERM would and hand back its
+    /// whole log. Fails the test if it had to be killed instead.
+    fn stop(mut self) -> String {
+        assert!(
+            self.end(),
+            "the run did not stop after SIGTERM: {}",
+            self.said()
+        );
+        self.said()
+    }
+
+    /// SIGTERM, wait the stop out, SIGKILL whatever is left. False when
+    /// it took the kill.
+    fn end(&mut self) -> bool {
+        let Some(mut run) = self.run.take() else {
+            return true;
+        };
+        let _ = kill_process(Pid::from_child(&run), Signal::TERM);
+        let stopped = wait_until(|| run.try_wait().is_ok_and(|s| s.is_some()), RUN_LIMIT);
+        if !stopped {
+            let _ = run.kill();
+            // Nothing to wait for: a killed process is reaped at once.
+            let _ = run.wait();
+        }
+        stopped
+    }
+}
+
+impl Drop for BackgroundRun {
+    fn drop(&mut self) {
+        self.end();
+    }
 }
 
 /// A run of `name` in the background, on a command that outlives the
@@ -3507,42 +3560,31 @@ fn exec_in(tmp: &Path, init: &Path, name: &str, argv: &[&str]) -> std::process::
 /// with no server in it must not bring one itself. Waiting for the exec
 /// channel is what makes that look mean anything — an empty answer from
 /// a sandbox that is not up yet would prove nothing.
-fn nested_x11_run(tmp: &Path, init: &Path, name: &str) -> Child {
-    let run = bubbler_wayland(tmp, init)
-        .args(["run", name, "--", "/usr/bin/sleep", "30"])
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    if !wait_until(
-        || {
-            exec_in(tmp, init, name, &["/usr/bin/true"])
-                .status
-                .success()
-        },
-        Duration::from_secs(10),
-    ) {
-        fail_with(run, "no exec child ran inside the instance");
-    }
+fn nested_x11_run(tmp: &Path, init: &Path, name: &str) -> BackgroundRun {
+    let log = tmp.join(format!("{name}.err"));
+    let run = BackgroundRun {
+        run: Some(
+            bubbler_wayland(tmp, init)
+                .args(["run", name, "--", "/usr/bin/sleep", "30"])
+                .stderr(std::fs::File::create(&log).unwrap())
+                .spawn()
+                .unwrap(),
+        ),
+        log,
+    };
+    assert!(
+        wait_until(
+            || {
+                exec_in(tmp, init, name, &["/usr/bin/true"])
+                    .status
+                    .success()
+            },
+            RUN_LIMIT,
+        ),
+        "no exec child ran inside the instance: {}",
+        run.said()
+    );
     run
-}
-
-/// SIGTERM a background run, wait for it, and hand back everything it
-/// said. The supervisor logs on that stderr, and a pipe is only read to
-/// the end once the run holding its other end is gone.
-fn stop_run(mut run: Child) -> String {
-    kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
-    if !wait_until(
-        || {
-            run.try_wait()
-                .expect("waiting for the run process")
-                .is_some()
-        },
-        Duration::from_secs(10),
-    ) {
-        fail_with(run, "the run did not stop after SIGTERM");
-    }
-    let out = run.wait_with_output().expect("waiting for the run process");
-    String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
 /// Lazy start, seen from inside: a sandbox that is up and answering
@@ -3578,9 +3620,17 @@ fn real_nested_x11_starts_the_server_on_the_first_client() {
         listed.trim().is_empty(),
         "a server was running before any client asked for one: {listed}"
     );
-    // pgrep's own "nothing matched", which is also this saying that
-    // pgrep ran rather than that the exec failed.
-    assert_eq!(before.status.code(), Some(1), "{listed}");
+    // What proves the lister ran is the control call above; this is
+    // pgrep's own "nothing matched". A `bubbler exec` that failed would
+    // exit non-zero with an empty stdout too, and is told apart by its
+    // stderr: bubbler explains itself there, pgrep finding nothing says
+    // nothing at all.
+    let complaint = String::from_utf8_lossy(&before.stderr);
+    assert_eq!(before.status.code(), Some(1), "{listed}{complaint}");
+    assert!(
+        complaint.is_empty(),
+        "the exec failed rather than the pgrep: {complaint}"
+    );
 
     // This client's connection is what wakes the server, and the server
     // it wakes is the one that serves it: the socket it is already
@@ -3597,7 +3647,9 @@ fn real_nested_x11_starts_the_server_on_the_first_client() {
     let running = String::from_utf8_lossy(&after.stdout);
     assert_eq!(running.lines().count(), 1, "{running}");
 
-    let said = stop_run(run);
+    // Stopped here and not at the end of the scope, so a run that has to
+    // be killed rather than asked fails this test.
+    let said = run.stop();
     assert!(!said.contains("did not start"), "{said}");
 }
 
@@ -3624,14 +3676,40 @@ fn real_nested_x11_wm_exiting_is_logged_not_fatal() {
     );
     let run = nested_x11_run(tmp.path(), &init, name);
 
+    // The window manager is started beside the server, on the first
+    // connection, so the run needs a client before it has one to report
+    // on. This client is the one that wakes it and not the probe: what
+    // it woke is asked below, once the report is in.
+    let woke = exec_in(tmp.path(), &init, name, &[XDPYINFO]);
+    assert_eq!(
+        woke.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&woke.stderr)
+    );
+    // Waited for, not assumed: the supervisor notices on its own tick,
+    // which need not have fallen before that client returned.
+    assert!(
+        wait_until(
+            || run.said().contains("bubbler-init: wm true exited"),
+            RUN_LIMIT
+        ),
+        "{}",
+        run.said()
+    );
+
+    // The display once the window manager is gone: still there, still
+    // serving, which is what makes the line above news and not a
+    // failure.
     let info = exec_in(tmp.path(), &init, name, &[XDPYINFO]);
     let err = String::from_utf8_lossy(&info.stderr);
     assert_eq!(info.status.code(), Some(0), "{err}");
     let shown = String::from_utf8_lossy(&info.stdout);
     assert!(shown.contains("name of display:    :0"), "{shown}{err}");
 
-    let said = stop_run(run);
-    assert!(said.contains("bubbler-init: wm true exited"), "{said}");
+    // Stopped here and not at the end of the scope, so a run that has to
+    // be killed rather than asked fails this test.
+    run.stop();
 }
 
 /// A window manager that is not installed is the same kind of news: the
@@ -3656,14 +3734,40 @@ fn real_nested_x11_missing_wm_is_logged_not_fatal() {
     );
     let run = nested_x11_run(tmp.path(), &init, name);
 
+    // The window manager is started beside the server, on the first
+    // connection, so the run needs a client before it has one to report
+    // on. This client is the one that wakes it and not the probe: what
+    // it woke is asked below, once the report is in.
+    let woke = exec_in(tmp.path(), &init, name, &[XDPYINFO]);
+    assert_eq!(
+        woke.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&woke.stderr)
+    );
+    // Waited for, not assumed: the supervisor notices on its own tick,
+    // which need not have fallen before that client returned.
+    assert!(
+        wait_until(
+            || run.said().contains("bubbler-init: wm nosuchwm:"),
+            RUN_LIMIT
+        ),
+        "{}",
+        run.said()
+    );
+
+    // The display once the window manager is gone: still there, still
+    // serving, which is what makes the line above news and not a
+    // failure.
     let info = exec_in(tmp.path(), &init, name, &[XDPYINFO]);
     let err = String::from_utf8_lossy(&info.stderr);
     assert_eq!(info.status.code(), Some(0), "{err}");
     let shown = String::from_utf8_lossy(&info.stdout);
     assert!(shown.contains("name of display:    :0"), "{shown}{err}");
 
-    let said = stop_run(run);
-    assert!(said.contains("bubbler-init: wm nosuchwm:"), "{said}");
+    // Stopped here and not at the end of the scope, so a run that has to
+    // be killed rather than asked fails this test.
+    run.stop();
 }
 
 /// Every instance's control socket lives under `$XDG_RUNTIME_DIR/bubbler`,

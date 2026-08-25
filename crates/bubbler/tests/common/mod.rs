@@ -189,9 +189,16 @@ pub const PYTHON: &str = "/usr/bin/python3";
 /// Returns false (after printing why) when the fake-proxy fixtures cannot
 /// run here, because that interpreter is not installed.
 pub fn require_python() -> bool {
-    let ok = Path::new(PYTHON).is_file();
+    require_host_program(PYTHON)
+}
+
+/// Returns false (after printing why) when `program` is not installed on
+/// this host, which is also where a sandbox reads its `/usr` from: a
+/// host without it has none inside either.
+pub fn require_host_program(program: &str) -> bool {
+    let ok = Path::new(program).is_file();
     if !ok {
-        say(&format!("skipping: {PYTHON} is not installed"));
+        say(&format!("skipping: {program} is not installed"));
     }
     ok
 }
