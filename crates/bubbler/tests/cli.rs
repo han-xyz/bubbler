@@ -3779,6 +3779,14 @@ const FIXTURE_LIMIT: &str = "--timeout=15";
 /// The clipboard tool that owns the selection while these tests read it.
 const WL_COPY: &str = "/usr/bin/wl-copy";
 
+/// Its other half, which is how a test learns what it is about to take
+/// away so it can put it back.
+const WL_PASTE: &str = "/usr/bin/wl-paste";
+
+/// What [`WL_READ`] prints in place of a byte count on an interpreter too
+/// old for the descriptor passing it needs.
+const OLD_PYTHON: &str = "OLD_PYTHON";
+
 /// Hyprland's control tool: the one thing here that can put a key into a
 /// window other than the one the user is typing in.
 const HYPRCTL: &str = "/usr/bin/hyprctl";
@@ -3820,14 +3828,29 @@ fn fixture_inside(tmp: &Path, init: &Path, name: &str, source: &str, args: &[&st
         .expect("running a wayland fixture in a sandbox")
 }
 
-/// Put [`SECRET`] on the session's selection, and say so if that failed.
+/// One clipboard tool, with none of the harness's descriptors on it.
 ///
-/// `wl-copy` leaves a process behind to serve what it copied, as every
-/// clipboard owner must; the next copy replaces it and the session
-/// outlives it.
+/// `wl-copy` goes to the background to serve what it copied, as every
+/// clipboard owner must, and a daemon holding the pipe `cargo test` is
+/// writing its output down is a `cargo test | cat` that never reaches end
+/// of file. Every spawn of these two therefore starts from `/dev/null`.
+///
+/// A caller that needs one of the three back asks for it: `Command::output`
+/// only fills in the slots that were left alone, so an explicit null here
+/// would otherwise reach it as empty output rather than as captured bytes.
+fn clipboard_tool(program: &str) -> Command {
+    let mut c = Command::new(program);
+    session_wayland(&mut c)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    c
+}
+
+/// Put [`SECRET`] on the session's selection, and say so if that failed.
 fn selection_holds_the_secret() -> bool {
-    let mut c = Command::new(WL_COPY);
-    let held = session_wayland(c.arg(SECRET))
+    let held = clipboard_tool(WL_COPY)
+        .arg(SECRET)
         .status()
         .is_ok_and(|s| s.success());
     if !held {
@@ -3836,7 +3859,36 @@ fn selection_holds_the_secret() -> bool {
     held
 }
 
-/// Own the session's selection until the returned file is dropped.
+/// What is on the selection right now: the first type `wl-paste` lists and
+/// the bytes under it, or `None` when there is nothing on it.
+///
+/// `--list-types` first because a plain `wl-paste` fails on a selection
+/// that is not text, and a test must not conclude the user's clipboard was
+/// empty because it could not read an image.
+fn selection_now() -> Option<(String, Vec<u8>)> {
+    let types = clipboard_tool(WL_PASTE)
+        .arg("--list-types")
+        .stdout(Stdio::piped())
+        .output()
+        .ok()?;
+    if !types.status.success() {
+        return None;
+    }
+    let listed = String::from_utf8_lossy(&types.stdout);
+    let mime = listed.lines().next()?.trim().to_owned();
+    if mime.is_empty() {
+        return None;
+    }
+    let held = clipboard_tool(WL_PASTE)
+        .args(["--no-newline", "--type", &mime])
+        .stdout(Stdio::piped())
+        .output()
+        .ok()?;
+    held.status.success().then_some((mime, held.stdout))
+}
+
+/// The session's selection, owned by one test at a time and given back the
+/// way it was found.
 ///
 /// There is one of it, and a `wl-copy` from one test is the offer another
 /// is halfway through reading: the compositor drops an offer whose source
@@ -3845,7 +3897,40 @@ fn selection_holds_the_secret() -> bool {
 /// two `cargo test` processes on one login share the selection exactly as
 /// two threads of one do, and the kernel drops a `flock` when its holder
 /// exits, so a suite that crashed leaves nothing stale behind.
-fn hold_the_selection() -> std::fs::File {
+struct Selection {
+    /// The lock file, whose open description is the lock.
+    _lock: std::fs::File,
+    /// What was on the selection before this test took it.
+    previous: Option<(String, Vec<u8>)>,
+}
+
+impl Drop for Selection {
+    /// Give the user their clipboard back. This runs before any field of
+    /// the struct is dropped, so it still holds the lock and cannot race
+    /// the next test's copy — and it runs on the way out of a failed
+    /// assertion, which is exactly when the selection would otherwise be
+    /// left saying `secret`.
+    ///
+    /// Only the bytes come back, not the application that was serving
+    /// them: a selection has one owner, and this test took it.
+    fn drop(&mut self) {
+        let Some((mime, bytes)) = &self.previous else {
+            let _ = clipboard_tool(WL_COPY).arg("--clear").status();
+            return;
+        };
+        let mut copy = clipboard_tool(WL_COPY);
+        let Ok(mut child) = copy.args(["--type", mime]).stdin(Stdio::piped()).spawn() else {
+            return;
+        };
+        if let Some(mut feed) = child.stdin.take() {
+            let _ = feed.write_all(bytes);
+        }
+        let _ = child.wait();
+    }
+}
+
+/// Take the selection: the lock first, then a look at what was on it.
+fn hold_the_selection() -> Selection {
     let path = PathBuf::from(
         std::env::var_os("XDG_RUNTIME_DIR").expect("checked by require_security_context"),
     )
@@ -3853,15 +3938,26 @@ fn hold_the_selection() -> std::fs::File {
     let lock = std::fs::File::create(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     flock(&lock, FlockOperation::LockExclusive)
         .expect("an exclusive lock on a file this process has just created");
-    lock
+    // Under the lock: whatever is on it now is the user's, and no other
+    // test may replace it between this look and the copy that follows.
+    let previous = selection_now();
+    Selection {
+        _lock: lock,
+        previous,
+    }
 }
 
 /// The guards every clipboard test here shares: a compositor the proxy can
-/// sit in front of, python for the fixture, and `wl-copy` holding
-/// something worth reading. The lock is taken before that copy and held
-/// for as long as the returned file lives, which is the whole test.
-fn clipboard_ready() -> Option<(tempfile::TempDir, PathBuf, std::fs::File)> {
-    if !require_security_context() || !require_python() || !require_host_program(WL_COPY) {
+/// sit in front of, python for the fixture, and the two clipboard tools —
+/// one to hold something worth reading, one to put back what was there.
+/// The selection is taken before the copy and given back when the returned
+/// guard drops, which is the end of the test.
+fn clipboard_ready() -> Option<(tempfile::TempDir, PathBuf, Selection)> {
+    if !require_security_context()
+        || !require_python()
+        || !require_host_program(WL_COPY)
+        || !require_host_program(WL_PASTE)
+    {
         return None;
     }
     let init = real_init()?;
@@ -3872,20 +3968,44 @@ fn clipboard_ready() -> Option<(tempfile::TempDir, PathBuf, std::fs::File)> {
     Some((setup(), init, selection))
 }
 
-/// What the clipboard fixture printed, with what the run said beside it.
+/// What a clipboard fixture printed, or `None` (after saying why) when
+/// this host could not put the test in a position to make its claim.
 ///
-/// `None` (after saying why) when the compositor offered the sandboxed
-/// window no selection at all: that is a focus policy, not something these
-/// tests can make a claim about.
+/// `NO_OFFER` is a failure, not a skip, whenever a client on the host can
+/// still read the selection with no window at all: there is one to be
+/// offered, and a focused window that was not offered it is a break in the
+/// path these tests exist to watch. It is a skip only where that host read
+/// comes up empty too, which is a session with nothing on the clipboard
+/// rather than a proxy that lost it.
+fn selection_verdict(printed: &str, log: &str) -> Option<String> {
+    if printed == OLD_PYTHON {
+        say("skipping: the sandbox's python is older than 3.9");
+        return None;
+    }
+    if printed != "NO_OFFER" {
+        return Some(printed.to_owned());
+    }
+    let host = fixture_on_host(WL_READ, &["--data-control", FIXTURE_LIMIT]);
+    let host = String::from_utf8_lossy(&host.stdout).trim().to_owned();
+    assert_ne!(
+        host,
+        SECRET.len().to_string(),
+        "a client on the host read the selection, and the sandboxed \
+         window was offered none:\n{log}"
+    );
+    say(&format!(
+        "skipping: nothing on this session's selection to offer (a host client read {host:?})"
+    ));
+    None
+}
+
+/// [`selection_verdict`] for a run that has ended, with what it said
+/// beside it.
 fn selection_read(out: &Output) -> (Option<String>, String) {
     let log = String::from_utf8_lossy(&out.stderr).into_owned();
     assert_eq!(out.status.code(), Some(0), "{log}");
     let printed = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    if printed == "NO_OFFER" {
-        say("skipping: the compositor offered the sandboxed window no selection");
-        return (None, log);
-    }
-    (Some(printed), log)
+    (selection_verdict(&printed, &log), log)
 }
 
 /// The rule the proxy exists for. The application has a window, so the
@@ -3987,6 +4107,14 @@ fn real_wayland_proxy_opens_the_gate_for_a_keystroke() {
         "the sandbox mapped no window: {}",
         run.said()
     );
+    // Not just the window: the offer as well. The gate opens for one
+    // second, and a key sent before the compositor had offered this client
+    // the selection would have gone stale by the time it could be read.
+    assert!(
+        wait_until(|| run.said().contains("offered:"), RUN_LIMIT),
+        "the sandboxed window was never offered the selection: {}",
+        run.said()
+    );
     let sent = hyprctl(&["dispatch", "sendshortcut", &format!(",v,title:^({name})$")]);
     assert!(
         sent.status.success(),
@@ -4009,11 +4137,10 @@ fn real_wayland_proxy_opens_the_gate_for_a_keystroke() {
     assert!(ended, "the run did not end after the key: {}", run.said());
     let said = run.said();
     let printed = std::fs::read_to_string(&read).unwrap_or_default();
-    if printed.trim() == "NO_OFFER" {
-        say("skipping: the compositor offered the sandboxed window no selection");
+    let Some(read) = selection_verdict(printed.trim(), &said) else {
         return;
-    }
-    assert_eq!(printed.trim(), SECRET.len().to_string(), "{printed}{said}");
+    };
+    assert_eq!(read, SECRET.len().to_string(), "{said}");
     assert!(!said.contains("clipboard read denied"), "{said}");
 }
 
@@ -4049,23 +4176,41 @@ fn hyprctl_sees(title: &str) -> bool {
             .any(|line| line.trim() == format!("title: {title}"))
 }
 
-/// A global on the host that a sandbox must not reach, as its numeric name
-/// and its interface.
+/// A global a sandbox must not reach, as a numeric name and an interface.
 ///
-/// The number is the compositor's own and the same on every connection, so
-/// it is exactly what an application inside a sandbox would name.
-fn host_privileged_global() -> Option<(String, String)> {
+/// The real thing where the compositor advertises one: the number is the
+/// compositor's own and the same on every connection, so it is exactly
+/// what an application inside a sandbox would name. Otherwise one past the
+/// largest name the host hands out, which no connection was offered
+/// either.
+fn hidden_global() -> (u32, String) {
     let out = fixture_on_host(WL_BIND, &["--dump", FIXTURE_LIMIT]);
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    String::from_utf8_lossy(&out.stdout)
+    let listed = String::from_utf8_lossy(&out.stdout);
+    let offered: Vec<(u32, &str)> = listed
         .lines()
         .filter_map(|line| line.split_once(' '))
+        .filter_map(|(name, interface)| Some((name.parse().ok()?, interface)))
+        .collect();
+    let largest = offered
+        .iter()
+        .map(|(name, _)| *name)
+        .max()
+        .unwrap_or_else(|| panic!("the host registry listed no globals:\n{listed}"));
+    match offered
+        .iter()
         .find(|(_, interface)| bubbler_core::wayland::PRIVILEGED.contains(interface))
-        .map(|(name, interface)| (name.to_owned(), interface.to_owned()))
+    {
+        Some((name, interface)) => (*name, (*interface).to_owned()),
+        None => {
+            say("no privileged global on this compositor: binding an unoffered name instead");
+            (largest + 1, HIDDEN_INTERFACE.to_owned())
+        }
+    }
 }
 
 /// Keeping a global out of the registry is not on its own enough to keep a
@@ -4085,27 +4230,31 @@ fn real_wayland_proxy_refuses_a_hidden_bind() {
     // The real thing where the compositor has one; otherwise the fixture's
     // own fallback, one past the largest name it was offered, which is a
     // name it certainly never saw either.
-    let (number, interface) = match host_privileged_global() {
-        Some((number, interface)) => (Some(number), interface),
-        None => {
-            say(
-                "this compositor advertises nothing on the privileged list: binding an unoffered name instead",
-            );
-            (None, HIDDEN_INTERFACE.to_owned())
-        }
-    };
-    let mut args = vec![FIXTURE_LIMIT.to_owned(), format!("--interface={interface}")];
-    args.extend(number.map(|number| format!("--name={number}")));
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = fixture_inside(tmp.path(), &init, name, WL_BIND, &args);
+    let (number, interface) = hidden_global();
+    let out = fixture_inside(
+        tmp.path(),
+        &init,
+        name,
+        WL_BIND,
+        &[
+            FIXTURE_LIMIT,
+            &format!("--interface={interface}"),
+            &format!("--name={number}"),
+        ],
+    );
     let log = String::from_utf8_lossy(&out.stderr);
     let said = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "{log}");
-    assert!(
-        said.contains(&format!(
-            "refused: bind of hidden global {interface} (name "
-        )) && said.contains("refused by the sandbox proxy"),
-        "the bind was not refused: {said}{log}"
+    // The refusal quotes back every part of what was asked for: which
+    // interface, at which number, at which version. Version 1 is what the
+    // fixture binds at.
+    assert_eq!(
+        said.trim(),
+        format!(
+            "refused: bind of hidden global {interface} (name {number}, v1) \
+             refused by the sandbox proxy"
+        ),
+        "the bind was not refused as expected: {log}"
     );
     assert!(
         log.contains("bubbler-wl-proxy: connection closed: bind of hidden global"),

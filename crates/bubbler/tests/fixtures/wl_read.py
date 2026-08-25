@@ -9,8 +9,9 @@ reachable from inside a sandbox, where the data-control protocols the
 `--data-control` mode uses are hidden.
 
 One line on stdout: the byte count, `NO_OFFER` when the selection never
-arrived, `NO_KEY` when `--after-key` was waited out, or `NO_MANAGER` when
-`--data-control` found neither protocol. Everything else is stderr.
+arrived, `NO_KEY` when `--after-key` was waited out, `NO_MANAGER` when
+`--data-control` found neither protocol, or `OLD_PYTHON` on an interpreter
+below 3.9. Everything else is stderr.
 
     wl_read.py [--no-window] [--after-key] [--data-control]
                [--mime=TYPE] [--timeout=SECONDS] [--title=NAME]
@@ -42,6 +43,11 @@ TITLE = "bubbler-wl-read"
 #: The data-control managers, newest first. Outside a sandbox one of them
 #: is there; inside bubbler's security context both are hidden.
 CONTROL_MANAGERS = ("ext_data_control_manager_v1", "zwlr_data_control_manager_v1")
+
+#: Printed in place of a byte count where the interpreter is older than the
+#: descriptor passing this needs (`socket.send_fds`, 3.9). The caller reads
+#: it as a reason to skip rather than as a failed read.
+OLD_PYTHON = "OLD_PYTHON"
 
 
 def string(text):
@@ -257,6 +263,9 @@ def option(args, name, fallback):
 
 
 def main(args):
+    if sys.version_info < (3, 9):
+        print(OLD_PYTHON)
+        return 0
     client = Client(time.monotonic() + float(option(args, "timeout", "5")))
     client.roundtrip()
     if "--data-control" in args:
@@ -273,7 +282,7 @@ def main(args):
     if not client.until(lambda: client.offer is not None):
         print("NO_OFFER")
         return 0
-    print("offered:", " ".join(client.mimes), file=sys.stderr)
+    print("offered:", " ".join(client.mimes), file=sys.stderr, flush=True)
     if "--after-key" in args and not client.until(lambda: client.pressed):
         print("NO_KEY")
         return 0

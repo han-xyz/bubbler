@@ -117,6 +117,8 @@ def main(args):
         for name in sorted(offered):
             print(name, offered[name])
         return 0
+    if not offered:
+        sys.exit("the compositor offered this connection no globals at all")
     interface = option(args, "interface", DEFAULT_INTERFACE)
     # One past the largest name in hand is a name this connection was
     # certainly never offered, whether or not the compositor has a global
