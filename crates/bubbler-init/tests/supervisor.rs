@@ -42,7 +42,9 @@ fn spawn_locked(
     listener: Option<&UnixListener>,
     build: impl FnOnce(Option<std::os::fd::RawFd>) -> Command,
 ) -> std::process::Child {
-    let _one_at_a_time = SPAWN.lock().unwrap();
+    // A test that panicked while holding it poisoned nothing: the lock
+    // guards a window in this process, not any state worth distrusting.
+    let _one_at_a_time = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
     let inherited = listener.map(|l| {
         let fd = rustix::io::fcntl_dupfd_cloexec(l.as_fd(), 3).unwrap();
         rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty()).unwrap();
@@ -1005,6 +1007,46 @@ fn a_second_stop_does_not_buy_the_command_another_grace() {
         deadline_set.elapsed() < Duration::from_millis(6500),
         "the second signal bought another grace: {:?}",
         deadline_set.elapsed()
+    );
+}
+
+#[test]
+fn a_client_that_connects_while_stopping_wakes_nothing() {
+    if !require_python() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let script = server_script(dir.path(), "xserver.py", SERVES_AND_STAYS);
+    let cmd = write_script(dir.path(), "deaf", COMMAND_IGNORES_TERM, true);
+    let xsock = dir.path().join("X0");
+    let log = dir.path().join("init.log");
+    let fd = stdio_file(&log);
+    let (mut init, _sock, _tmp) = start_with(
+        &[cmd.to_str().unwrap()],
+        Opts {
+            stdio: Some(&fd),
+            x11: Some(&[PYTHON, script.to_str().unwrap()]),
+            x11_socket: Some(&xsock),
+            ..Opts::default()
+        },
+    );
+    wait_for_path(&xsock);
+    rustix::process::kill_process(
+        rustix::process::Pid::from_child(&init),
+        rustix::process::Signal::TERM,
+    )
+    .unwrap();
+    // The command ignores SIGTERM, so this connection arrives with the
+    // whole grace still to run. Starting a server and a window manager
+    // for those few seconds is work whose only end is killing them again.
+    let _client = x_connect(&xsock);
+    assert_eq!(
+        wait_within(&mut init, Duration::from_secs(12)).code(),
+        Some(137)
+    );
+    assert!(
+        !beside(&script, ".pid").exists(),
+        "a display was started for a run that was already ending"
     );
 }
 

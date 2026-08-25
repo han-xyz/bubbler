@@ -89,6 +89,8 @@ struct Stopping {
     /// Set by the first stop event and never cleared. From then on no new
     /// exec'd child is started: one spawned now could only be killed
     /// moments later, without the SIGTERM every other child was given.
+    /// Nor is the X server, which a client connecting during the grace
+    /// would otherwise wake for the seconds it has left.
     asked: bool,
     /// Cleared once the SIGKILL has gone out.
     kill_at: Option<Instant>,
@@ -588,8 +590,14 @@ fn main() -> ExitCode {
         }
         // The listener, the display socket while nothing serves it, and
         // every half-read request in one poll set: a client that stops
-        // mid-request delays nothing but itself.
-        let waking = x11.as_ref().filter(|x| !x.started).map(|x| &x.listener);
+        // mid-request delays nothing but itself. The display socket
+        // leaves that set once the run is ending, so a client connecting
+        // during the grace wakes nothing — and so that the loop does not
+        // spin on a connection it has decided not to answer.
+        let waking = x11
+            .as_ref()
+            .filter(|x| !x.started && !stopping.asked)
+            .map(|x| &x.listener);
         let mut fds = Vec::with_capacity(2 + pending.len());
         fds.push(PollFd::new(&listener, PollFlags::IN));
         if let Some(l) = waking {
