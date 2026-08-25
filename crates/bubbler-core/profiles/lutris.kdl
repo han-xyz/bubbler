@@ -30,7 +30,7 @@
 // it (`mkdir ~/Games`) or edit the node to the directory you use. A prefix
 // or library outside the home is named explicitly, e.g.
 //   path-share "/kioxia/Games" mode=rw
-lint-allow "x11-without-reason" reason="Wine and Proton games are X11 clients that want a real window manager"
+lint-allow "x11-without-reason" reason="Wine and Proton games are X11 clients that want a window manager; a nested x11 with wm= is the alternative"
 wayland
 x11 "host"
 dri

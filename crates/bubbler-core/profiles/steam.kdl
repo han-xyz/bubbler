@@ -47,7 +47,7 @@
 // crosses it; `network "host"` brings them back, and hands Steam every
 // service on the host's loopback and every host abstract unix socket
 // along with them.
-lint-allow "x11-without-reason" reason="steamwebhelper is an X11/CEF client with many windows that want the session's window manager"
+lint-allow "x11-without-reason" reason="steamwebhelper is an X11/CEF client with many windows; a nested x11 needs a wm= naming a window manager this host has"
 lint-allow "own-too-wide" reason="com.steampowered.* is Steam's own name space, and the client claims several names under it"
 wayland
 x11 "host"

@@ -134,7 +134,10 @@ const ENVIRONMENT: &[(&str, &str)] = &[
         "The buses the proxy connects to, defaulting to $XDG_RUNTIME_DIR/bus and \
          /run/dbus/system_bus_socket. Both must resolve to a socket, and an address \
          bubbler cannot bind (`tcp:`, `unix:abstract=`) fails the run naming the variable \
-         rather than falling back to a bus the session is not on.",
+         rather than falling back to a bus the session is not on. An address that \
+         resolves under $XDG_RUNTIME_DIR/bubbler/ is refused as well: that directory \
+         holds an instance's control socket and the socket the proxy itself serves, and \
+         neither is a host bus.",
     ),
     (
         "AT_SPI_BUS_ADDRESS",
