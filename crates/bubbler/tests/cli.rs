@@ -3847,44 +3847,155 @@ fn clipboard_tool(program: &str) -> Command {
     c
 }
 
+/// How long the selection is given to become what it was just set to.
+///
+/// `wl-copy` forks to the background to serve what it copied, so the
+/// process a caller waited for is gone before the compositor has
+/// necessarily handed the selection over. Every copy here is followed by a
+/// wait for the result, because letting go of the lock inside that gap is
+/// how the next test comes to believe the clipboard was empty — and a
+/// `--clear` on that belief is the user's clipboard gone.
+const SELECTION_SETTLE: Duration = Duration::from_secs(5);
+
+/// Wait until the selection reads back as `want`, or until the deadline.
+/// `None` is a selection with nothing on it.
+fn selection_settles(want: Option<&[u8]>) -> bool {
+    wait_until(
+        || match (selection_now(), want) {
+            (Held::Bytes(_, back), Some(want)) => back == want,
+            (Held::Empty, None) => true,
+            _ => false,
+        },
+        SELECTION_SETTLE,
+    )
+}
+
 /// Put [`SECRET`] on the session's selection, and say so if that failed.
 fn selection_holds_the_secret() -> bool {
-    let held = clipboard_tool(WL_COPY)
+    let copied = clipboard_tool(WL_COPY)
         .arg(SECRET)
         .status()
         .is_ok_and(|s| s.success());
+    let held = copied && selection_settles(Some(SECRET.as_bytes()));
     if !held {
         say("skipping: wl-copy put nothing on the selection");
     }
     held
 }
 
-/// What is on the selection right now: the first type `wl-paste` lists and
-/// the bytes under it, or `None` when there is nothing on it.
+/// The types a selection is read and put back through, best first.
+///
+/// Not simply the first one listed: rich text advertises `text/html`
+/// ahead of its plain fallback, so a selection copied out of a browser
+/// would come back as markup pasted into a plain-text field. Plain text
+/// loses the styling, which is the smaller lie of the two.
+const RESTORE_TYPES: &[&str] = &[
+    "text/plain;charset=utf-8",
+    "text/plain",
+    "UTF8_STRING",
+    "STRING",
+    "TEXT",
+];
+
+/// X11 selection bookkeeping, which Xwayland advertises beside the content
+/// and lists first. Never what to read, whatever order it comes in.
+const NOT_CONTENT: &[&str] = &["TARGETS", "TIMESTAMP", "MULTIPLE", "SAVE_TARGETS"];
+
+/// What the selection is holding, as far as a test can tell.
+enum Held {
+    /// Nothing on it.
+    Empty,
+    /// This type, and the bytes under it.
+    Bytes(String, Vec<u8>),
+    /// Something is on it that could not be read back. A test must not
+    /// take a selection it has no way of returning.
+    Unreadable(String),
+}
+
+/// The type to read a selection through, out of everything `wl-paste`
+/// listed for it.
+fn restore_type(types: &[&str]) -> Option<String> {
+    let best = RESTORE_TYPES
+        .iter()
+        .find(|want| types.contains(*want))
+        .or_else(|| types.iter().find(|kind| !NOT_CONTENT.contains(*kind)))?;
+    Some((*best).to_owned())
+}
+
+/// Which flavour of a selection is the one to put back.
+///
+/// The first type listed is not it, and the host cannot always be made to
+/// produce the shapes that show why: a browser leads with `text/html`,
+/// whose bytes are markup where the plain flavour beside it holds the text
+/// a plain paste expects, and a selection bridged from an X11 client leads
+/// with the protocol talking about itself.
+#[test]
+fn a_selection_is_put_back_through_its_plainest_flavour() {
+    let rich = ["text/html", "text/plain", "TEXT"];
+    assert_eq!(restore_type(&rich).as_deref(), Some("text/plain"));
+
+    let charset = ["text/html", "text/plain", "text/plain;charset=utf-8"];
+    assert_eq!(
+        restore_type(&charset).as_deref(),
+        Some("text/plain;charset=utf-8")
+    );
+
+    let x11 = [
+        "TIMESTAMP",
+        "TARGETS",
+        "MULTIPLE",
+        "SAVE_TARGETS",
+        "UTF8_STRING",
+    ];
+    assert_eq!(restore_type(&x11).as_deref(), Some("UTF8_STRING"));
+
+    // Nothing text-shaped on it: whatever it is, as long as it is content.
+    let image = ["TARGETS", "image/png"];
+    assert_eq!(restore_type(&image).as_deref(), Some("image/png"));
+
+    // Bookkeeping and nothing else is a selection no test may take.
+    assert_eq!(restore_type(&["TARGETS", "TIMESTAMP"]), None);
+    assert_eq!(restore_type(&[]), None);
+}
+
+/// What is on the selection right now.
 ///
 /// `--list-types` first because a plain `wl-paste` fails on a selection
 /// that is not text, and a test must not conclude the user's clipboard was
 /// empty because it could not read an image.
-fn selection_now() -> Option<(String, Vec<u8>)> {
-    let types = clipboard_tool(WL_PASTE)
+fn selection_now() -> Held {
+    let Ok(types) = clipboard_tool(WL_PASTE)
         .arg("--list-types")
         .stdout(Stdio::piped())
         .output()
-        .ok()?;
+    else {
+        return Held::Unreadable("wl-paste did not run".to_owned());
+    };
+    // A selection with nothing on it is what `wl-paste` exits non-zero
+    // for; it is the one case where there is nothing to give back.
     if !types.status.success() {
-        return None;
+        return Held::Empty;
     }
     let listed = String::from_utf8_lossy(&types.stdout);
-    let mime = listed.lines().next()?.trim().to_owned();
-    if mime.is_empty() {
-        return None;
+    let types: Vec<&str> = listed
+        .lines()
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty())
+        .collect();
+    if types.is_empty() {
+        return Held::Empty;
     }
-    let held = clipboard_tool(WL_PASTE)
+    let Some(mime) = restore_type(&types) else {
+        return Held::Unreadable(format!("only bookkeeping types on it: {types:?}"));
+    };
+    match clipboard_tool(WL_PASTE)
         .args(["--no-newline", "--type", &mime])
         .stdout(Stdio::piped())
         .output()
-        .ok()?;
-    held.status.success().then_some((mime, held.stdout))
+    {
+        Ok(out) if out.status.success() => Held::Bytes(mime, out.stdout),
+        _ => Held::Unreadable(format!("wl-paste read nothing as {mime}")),
+    }
 }
 
 /// The session's selection, owned by one test at a time and given back the
@@ -3900,7 +4011,8 @@ fn selection_now() -> Option<(String, Vec<u8>)> {
 struct Selection {
     /// The lock file, whose open description is the lock.
     _lock: std::fs::File,
-    /// What was on the selection before this test took it.
+    /// What was on the selection before this test took it, in the one
+    /// flavour [`restore_type`] picked. `None` only where it was empty.
     previous: Option<(String, Vec<u8>)>,
 }
 
@@ -3911,11 +4023,15 @@ impl Drop for Selection {
     /// assertion, which is exactly when the selection would otherwise be
     /// left saying `secret`.
     ///
-    /// Only the bytes come back, not the application that was serving
-    /// them: a selection has one owner, and this test took it.
+    /// Only the bytes come back, in one flavour, and not the application
+    /// that was serving them: a selection has one owner, and this test
+    /// took it. Where none of the flavours could be read, the test skipped
+    /// rather than take it, so `--clear` here is only ever an empty
+    /// selection put back the way it was found.
     fn drop(&mut self) {
         let Some((mime, bytes)) = &self.previous else {
             let _ = clipboard_tool(WL_COPY).arg("--clear").status();
+            selection_settles(None);
             return;
         };
         let mut copy = clipboard_tool(WL_COPY);
@@ -3926,11 +4042,21 @@ impl Drop for Selection {
             let _ = feed.write_all(bytes);
         }
         let _ = child.wait();
+        // Still under the lock, which is what the lock is for: the next
+        // test must not look at the selection while this is on its way.
+        // Nothing to be done about a restore that never lands, but the
+        // wait is bounded, so a session that lost its compositor does not
+        // hang the suite here.
+        selection_settles(Some(bytes));
     }
 }
 
 /// Take the selection: the lock first, then a look at what was on it.
-fn hold_the_selection() -> Selection {
+///
+/// `None` (after saying why) when something is on it that cannot be read
+/// back. Taking a selection a test has no way of returning would cost the
+/// user their clipboard, which no assertion is worth.
+fn hold_the_selection() -> Option<Selection> {
     let path = PathBuf::from(
         std::env::var_os("XDG_RUNTIME_DIR").expect("checked by require_security_context"),
     )
@@ -3940,11 +4066,20 @@ fn hold_the_selection() -> Selection {
         .expect("an exclusive lock on a file this process has just created");
     // Under the lock: whatever is on it now is the user's, and no other
     // test may replace it between this look and the copy that follows.
-    let previous = selection_now();
-    Selection {
+    let previous = match selection_now() {
+        Held::Empty => None,
+        Held::Bytes(mime, bytes) => Some((mime, bytes)),
+        Held::Unreadable(why) => {
+            say(&format!(
+                "skipping: this session's selection cannot be put back ({why})"
+            ));
+            return None;
+        }
+    };
+    Some(Selection {
         _lock: lock,
         previous,
-    }
+    })
 }
 
 /// The guards every clipboard test here shares: a compositor the proxy can
@@ -3961,7 +4096,7 @@ fn clipboard_ready() -> Option<(tempfile::TempDir, PathBuf, Selection)> {
         return None;
     }
     let init = real_init()?;
-    let selection = hold_the_selection();
+    let selection = hold_the_selection()?;
     if !selection_holds_the_secret() {
         return None;
     }
@@ -4227,9 +4362,6 @@ fn real_wayland_proxy_refuses_a_hidden_bind() {
     let tmp = setup();
     let name = &instance_name("wl-bind");
     let _leftovers = wayland_instance(tmp.path(), &init, name, "wayland\ncommand \"true\"\n");
-    // The real thing where the compositor has one; otherwise the fixture's
-    // own fallback, one past the largest name it was offered, which is a
-    // name it certainly never saw either.
     let (number, interface) = hidden_global();
     let out = fixture_inside(
         tmp.path(),
@@ -4284,9 +4416,16 @@ fn real_wayland_proxy_leaves_no_headless_clipboard_path() {
     );
     let log = String::from_utf8_lossy(&control.stderr);
     assert_eq!(control.status.code(), Some(0), "{log}");
+    let printed = String::from_utf8_lossy(&control.stdout);
+    let printed = printed.trim();
+    // The same interpreter runs every leg of this test, so one look is
+    // enough for all three.
+    if printed == OLD_PYTHON {
+        say("skipping: the sandbox's python is older than 3.9");
+        return;
+    }
     assert_eq!(
-        String::from_utf8_lossy(&control.stdout).trim(),
-        "NO_MANAGER",
+        printed, "NO_MANAGER",
         "a data-control protocol reached the sandbox:\n{log}"
     );
 

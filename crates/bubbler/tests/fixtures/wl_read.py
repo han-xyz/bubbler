@@ -276,8 +276,14 @@ def main(args):
         client.data_device(manager, 0, 1, 0)
     else:
         seat = client.data_device("wl_data_device_manager", 0, 5, 1)
-        if "--no-window" not in args:
+        # Only where a key is what this waits for. A keyboard nothing ever
+        # reads still delivers `wl_keyboard.key` to the connection, and
+        # that is what opens the gate — so a run meant to prove a read was
+        # denied must not hold one, or a user typing anywhere near it
+        # would arm the proxy on its behalf.
+        if "--after-key" in args:
             client.keyboard(seat)
+        if "--no-window" not in args:
             client.map_window(option(args, "title", TITLE))
     if not client.until(lambda: client.offer is not None):
         print("NO_OFFER")
