@@ -570,7 +570,7 @@ mod tests {
         items.extend([
             item(
                 Origin::Service(0),
-                &["--ro-bind", "/run/wayland-1", "/run/wayland-1"],
+                &["--ro-bind", "/run/t/wayland", "/run/wayland-1"],
                 None,
             ),
             item(
@@ -629,7 +629,7 @@ bwrap
     ... 4 more (--explain=full)
 
   wayland                         config.kdl:1  6 arguments
-    --ro-bind /run/wayland-1 /run/wayland-1
+    --ro-bind /run/t/wayland /run/wayland-1
     --setenv WAYLAND_DISPLAY wayland-1
     security-context: engine=org.bubbler app=org.bubbler.t instance=bubbler-t
 

@@ -2111,8 +2111,10 @@ fn session_instance(mut create: Command, tmp: &Path, name: &str, config: &str) -
         config,
     )
     .unwrap();
-    let run_dir =
-        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").expect("checked by require_dbus"));
+    let run_dir = PathBuf::from(
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .expect("the session runtime dir, checked by the caller's guard"),
+    );
     RuntimeLeftovers {
         runtime: run_dir.join("bubbler").join(name),
         flatpak: run_dir.join(".flatpak").join(format!("bubbler-{name}")),

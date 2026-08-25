@@ -625,8 +625,12 @@ pub fn start_wayland(
 ) -> Result<Option<WaylandHandle>, LaunchError> {
     // The same check the bind makes, made before the connection rather
     // than after it: a display name that is a path would otherwise pick
-    // the endpoint this run hands its listening socket to.
+    // the endpoint this run hands its listening socket to. Both values
+    // go through it: the bind takes the name from `env`, and wayrs reads
+    // the process environment itself, which nothing here can hand a
+    // string of its own.
     service::wayland_display(env)?;
+    service::check_wayland_display(std::env::var_os("WAYLAND_DISPLAY").as_deref())?;
     wayland::refuse_inherited(std::env::var_os("WAYLAND_SOCKET").as_deref())?;
     if !wayland::probe()? {
         eprintln!(

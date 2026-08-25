@@ -843,11 +843,11 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                 node,
                 &X11_WITHOUT_REASON,
                 "`x11` gives no isolation between X clients: any of them can read another's \
-                 input and windows"
+                 input and windows, and Xwayland clients also bypass the Wayland security \
+                 context"
                     .to_owned(),
                 "prefer `wayland`, or accept it with \
-                 `lint-allow \"x11-without-reason\" reason=\"...\"`; Xwayland clients also \
-                 bypass the Wayland security context",
+                 `lint-allow \"x11-without-reason\" reason=\"...\"`",
             ),
             "tty" if arg(node) == Some("passthrough") => f.push(
                 i,
@@ -872,8 +872,8 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                 node,
                 &WAYLAND_HOST,
                 "`wayland \"host\"` hands over the session socket: the compositor cannot tell \
-                 this sandbox from your session, so screen capture, clipboard snooping and \
-                 input injection stay open to it"
+                 this sandbox from your session, so screen capture, reading the clipboard \
+                 without focus and input injection stay open to it"
                     .to_owned(),
                 "drop the argument for a security-context socket, or accept it with \
                  `lint-allow \"wayland-host\" reason=\"...\"` naming the privileged protocol \
@@ -2258,7 +2258,8 @@ mod tests {
             assert_eq!(
                 render_finding(&report.findings[0])[0].to_string_lossy(),
                 "built-in:steam: warning[x11-without-reason]: `x11` gives no isolation between \
-                 X clients: any of them can read another's input and windows"
+                 X clients: any of them can read another's input and windows, and Xwayland \
+                 clients also bypass the Wayland security context"
             );
         });
     }
@@ -2291,11 +2292,11 @@ mod tests {
                 lines,
                 vec![
                     "/p/0.kdl:1:1: warning[x11-without-reason]: `x11` gives no isolation between \
-                     X clients: any of them can read another's input and windows"
+                     X clients: any of them can read another's input and windows, and Xwayland \
+                     clients also bypass the Wayland security context"
                         .to_owned(),
                     "  help: prefer `wayland`, or accept it with `lint-allow \
-                     \"x11-without-reason\" reason=\"...\"`; Xwayland clients also bypass \
-                     the Wayland security context"
+                     \"x11-without-reason\" reason=\"...\"`"
                         .to_owned(),
                     "/p/0.kdl:2:1: note[command-not-found]: `keepassxc` is not on this host's PATH"
                         .to_owned(),

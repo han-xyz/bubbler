@@ -215,19 +215,16 @@ fn network(args: &mut BwrapArgs, host: &dyn Host, cfg: &NetworkConfig) -> Result
     Ok(())
 }
 
-/// The compositor socket's name from `$WAYLAND_DISPLAY`, refused unless
-/// it is exactly one path component: the value is untrusted host input,
-/// and an absolute or `..` name would otherwise decide what a bind
-/// mounts, or what endpoint the launcher hands its listening socket to.
-/// Everything that uses the value goes through here first.
-pub(crate) fn wayland_display(env: &Env) -> Result<&OsStr, LaunchError> {
-    let display = env
-        .wayland_display
-        .as_deref()
-        .ok_or(LaunchError::MissingEnv {
-            service: "wayland",
-            var: "WAYLAND_DISPLAY",
-        })?;
+/// A compositor socket's name, refused unless it is exactly one path
+/// component: `$WAYLAND_DISPLAY` is untrusted host input, and an
+/// absolute or `..` name would otherwise decide what a bind mounts, or
+/// what endpoint the launcher hands its listening socket to. Everything
+/// that uses the value goes through here first.
+pub(crate) fn check_wayland_display(value: Option<&OsStr>) -> Result<&OsStr, LaunchError> {
+    let display = value.ok_or(LaunchError::MissingEnv {
+        service: "wayland",
+        var: "WAYLAND_DISPLAY",
+    })?;
     let mut comps = Path::new(display).components();
     if !matches!(
         (comps.next(), comps.next()),
@@ -242,6 +239,14 @@ pub(crate) fn wayland_display(env: &Env) -> Result<&OsStr, LaunchError> {
         });
     }
     Ok(display)
+}
+
+/// [`check_wayland_display`] on the run's [`Env`], the value every bind
+/// takes the socket name from. The launcher checks the process
+/// environment's own value separately: the Wayland client reads that one
+/// itself, and the two need not be the same string.
+pub(crate) fn wayland_display(env: &Env) -> Result<&OsStr, LaunchError> {
+    check_wayland_display(env.wayland_display.as_deref())
 }
 
 /// Bind a Wayland socket at `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`, which
@@ -1212,13 +1217,16 @@ mod tests {
         assert!(has_seq(&a, &["--setenv", "XDG_SESSION_TYPE", "wayland"]));
     }
 
-    /// The shape check is the helper's, not the bind's: the launcher
-    /// calls it before it connects to the compositor with the same value,
-    /// so it has to refuse on its own.
+    /// The shape check is the value's, not the bind's: the launcher runs
+    /// the process environment's own `$WAYLAND_DISPLAY` through it before
+    /// it connects to the compositor, so it has to refuse on a bare
+    /// string with no [`Env`] around it.
     #[test]
     fn wayland_display_is_a_socket_name_or_nothing() {
-        let mut e = env();
-        assert_eq!(wayland_display(&e).unwrap(), OsStr::new("wayland-1"));
+        assert_eq!(
+            check_wayland_display(Some(OsStr::new("wayland-1"))).unwrap(),
+            OsStr::new("wayland-1")
+        );
         for bad in [
             "/run/user/1000/wayland-1",
             "../wayland-1",
@@ -1227,8 +1235,7 @@ mod tests {
             "..",
             "",
         ] {
-            e.wayland_display = Some(bad.into());
-            let err = wayland_display(&e).expect_err(bad);
+            let err = check_wayland_display(Some(OsStr::new(bad))).expect_err(bad);
             assert!(
                 matches!(
                     err,
@@ -1240,14 +1247,20 @@ mod tests {
                 "{bad}: {err:?}"
             );
         }
-        e.wayland_display = None;
         assert!(matches!(
-            wayland_display(&e),
+            check_wayland_display(None),
             Err(LaunchError::MissingEnv {
                 service: "wayland",
                 var: "WAYLAND_DISPLAY"
             })
         ));
+        // The wrapper is the same check on the value the bind uses.
+        let mut e = env();
+        assert_eq!(wayland_display(&e).unwrap(), OsStr::new("wayland-1"));
+        e.wayland_display = Some("../wayland-1".into());
+        assert!(wayland_display(&e).is_err());
+        e.wayland_display = None;
+        assert!(wayland_display(&e).is_err());
     }
 
     /// The launcher's own socket is bound at the host socket's name, and
