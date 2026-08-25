@@ -1195,6 +1195,7 @@ fn an_exec_is_refused_once_the_run_is_stopping() {
         },
     );
     wait_for_path(&xsock);
+    wait_until_deaf(&cmd);
     let client = x_connect(&xsock);
     assert_eq!(served_byte(&client), b'X');
     // The command ignores SIGTERM, so the whole grace is still ahead: a
