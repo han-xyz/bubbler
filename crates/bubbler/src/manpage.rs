@@ -87,9 +87,11 @@ const FILES: &[(&str, &str)] = &[
     ),
     (
         "$XDG_RUNTIME_DIR/bubbler/<name>/",
-        "Runtime state of a running instance, mode 0700: the supervisor's init.sock, and the \
-         D-Bus proxy's sockets where a bus is granted. Every socket in it goes when the run \
-         ends; the directory itself is left for the next run to reuse.",
+        "Runtime state of a running instance, mode 0700: the supervisor's init.sock, the \
+         D-Bus proxy's sockets where a bus is granted, and, where wayland is, the socket \
+         `wayland` the application connects to and the `wayland-context` the compositor \
+         accepts on. Every socket in it goes when the run ends; the directory itself is \
+         left for the next run to reuse.",
     ),
     (
         "$XDG_RUNTIME_DIR/.flatpak/bubbler-<name>/",
@@ -99,6 +101,11 @@ const FILES: &[(&str, &str)] = &[
     (
         "/usr/lib/bubbler/bubbler-init",
         "The supervisor that runs as pid 2 in every sandbox, bound in at /run/bubbler-init.",
+    ),
+    (
+        "/usr/lib/bubbler/bubbler-wl-proxy",
+        "The Wayland proxy a `wayland` grant runs beside the sandbox: it serves the socket \
+         the application connects to and gates the clipboard on it.",
     ),
 ];
 

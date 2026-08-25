@@ -119,8 +119,12 @@ the threat model say exactly how wide. Known gaps are listed under
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
 Sandbox tests probe for a working `bwrap` and skip with a reason where there
-is none. `cargo deny check`, cargo-fuzz targets under `fuzz/`, and the CI
-workflow are described under [Development](docs/wiki/Development.md).
+is none. With `$WAYLAND_DISPLAY` set the Wayland tests run against your own
+compositor: they map a window and take the focus for a moment, and they read
+the selection and put it back in its plainest flavour, so an image or an HTML
+selection comes back as its text form. `cargo deny check`, cargo-fuzz targets
+under `fuzz/`, and the CI workflow are described under
+[Development](docs/wiki/Development.md).
 
 ## Acknowledgements
 

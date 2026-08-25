@@ -31,7 +31,10 @@ sandbox probe for one (create a userns, run a real `bwrap`, attach pasta) and
 skip with a printed reason on a host that cannot — a green run says what it
 did not cover. `crates/bubbler-core/tests/proptest.rs` holds the property
 tests: emitter/parser round trip, desktop patch idempotence, include resolver
-never recursing past the stack.
+never recursing past the stack. With `$WAYLAND_DISPLAY` set the Wayland tests
+run against your own compositor: they map a window and take the focus for a
+moment, and they read the selection and put it back in its plainest flavour, so
+an image or an HTML selection comes back as its text form.
 
 ## Fuzzing
 

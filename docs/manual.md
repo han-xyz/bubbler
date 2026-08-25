@@ -2803,6 +2803,11 @@ run stays green and says what it did not cover. Run it as `cargo test
 --workspace`: `cargo test -p bubbler` alone does not build `bubbler-init`, and
 the tests that need the real supervisor skip for that reason too.
 
+With `$WAYLAND_DISPLAY` set the Wayland tests are as real as the rest: they run
+against your own compositor, mapping a window and taking the focus for a
+moment, and they read the selection and put it back in its plainest flavour, so
+an image or an HTML selection comes back as its text form.
+
 `cargo test` includes the property tests in
 `crates/bubbler-core/tests/proptest.rs`, which are three claims about generated
 input rather than about a written-down example:

@@ -27,7 +27,6 @@ repository = "https://github.com/han-xyz/bubbler"
 # `workspace.package.version` at each release.
 bubbler-core = { path = "crates/bubbler-core", version = "0.15.0" }
 bubbler-init = { path = "crates/bubbler-init", version = "0.15.0" }
-bubbler-wl-proxy = { path = "crates/bubbler-wl-proxy", version = "0.15.0" }
 kdl = "6"
 thiserror = "2"
 rustix = { version = "1", features = ["fs", "process", "net", "pipe", "event", "pty", "termios", "thread"] }
