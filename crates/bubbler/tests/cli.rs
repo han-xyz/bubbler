@@ -7458,6 +7458,16 @@ fn outbound_deny_filters_what_no_allow_out_names_and_the_sandbox_cannot_undo_it(
 /// The probe [`outbound_deny_filters_what_no_allow_out_names_and_the_sandbox_cannot_undo_it`]
 /// runs inside the sandbox: one line per destination, each ending in the
 /// seconds it took.
+///
+/// `dns` asks up to three times because one UDP query is not a fair test
+/// of a resolver: the reply crosses whatever the host's own DNS path is,
+/// and a single lost packet there is not a finding about the ruleset.
+/// `resolv.conf(5)` gives the glibc resolver two attempts of five seconds
+/// each for that reason. Measured while the suites ran in parallel: about
+/// one query in twenty went unanswered — from the host directly, with no
+/// sandbox in the path, as often and at the same moments as from inside
+/// one. The TCP probes need nothing of the sort; the kernel already
+/// retransmits a lost SYN within their timeout.
 const OUTBOUND_PROBE: &str = "\
 import socket, time, errno, subprocess
 
@@ -7483,19 +7493,22 @@ def tcp6(host, port):
         s.close()
         globals()['took'] = time.monotonic() - t0
 
-def dns(server):
+def dns(server, tries=3):
     q = b'\\xab\\xcd\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00'
     for lab in b'example.com'.split(b'.'):
         q += bytes([len(lab)]) + lab
     q += b'\\x00\\x00\\x01\\x00\\x01'
     t0 = time.monotonic()
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(4)
     try:
-        s.sendto(q, (server, 53)); s.recvfrom(512); return 'ANSWERED'
-    except socket.timeout: return 'TIMEOUT'
-    except OSError as e: return errno.errorcode.get(e.errno, e.errno)
+        for _ in range(tries):
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(2)
+            try:
+                s.sendto(q, (server, 53)); s.recvfrom(512); return 'ANSWERED'
+            except socket.timeout: continue
+            except OSError as e: return errno.errorcode.get(e.errno, e.errno)
+            finally: s.close()
+        return 'TIMEOUT'
     finally:
-        s.close()
         globals()['took'] = time.monotonic() - t0
 
 def say(name, what):
