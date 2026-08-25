@@ -231,6 +231,13 @@ pub enum LaunchError {
     /// nothing would look like a broken application.
     #[error("connecting the sandbox network namespace: {0}")]
     Network(String),
+    /// The accessibility bus could not be found: `$AT_SPI_BUS_ADDRESS`
+    /// named no socket bubbler can bind, `dbus-send` is missing, or
+    /// `org.a11y.Bus` did not answer with a `unix:path=` address. An
+    /// `a11y` sandbox stops here rather than start with a socket that
+    /// has no bus behind it.
+    #[error("finding the accessibility bus: {0}")]
+    A11y(String),
     /// Nothing listens on the instance's control socket.
     #[error("instance `{0}` is not running")]
     NotRunning(String),

@@ -4,8 +4,10 @@
 //! never reaches a host bus itself.
 
 use std::ffi::{OsStr, OsString};
+use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::config::{BusRule, Service};
 use crate::env::Env;
@@ -35,6 +37,11 @@ pub const A11Y_SOCKET: &str = "a11y";
 /// Config node that grants the accessibility bus, for errors about its
 /// socket.
 pub const A11Y_NODE: &str = "a11y";
+
+/// Program that asks the session bus where the accessibility bus is,
+/// from the `dbus` package. It is spawned directly, never through a
+/// shell, and only ever for the one call [`host_a11y_bus`] makes.
+pub const DBUS_SEND: &str = "dbus-send";
 
 /// Where a system bus socket lives: the host's when no address overrides
 /// it, and the path the filtered one is bound at inside the sandbox.
@@ -414,6 +421,113 @@ pub fn host_system_bus(env: &Env) -> Result<PathBuf, LaunchError> {
     .unwrap_or_else(|| PathBuf::from(SYSTEM_BUS_PATH)))
 }
 
+/// Host accessibility bus socket: the `unix:path=` of
+/// `$AT_SPI_BUS_ADDRESS` when the session set one, else the address
+/// `org.a11y.Bus` answers `GetAddress` with on the session bus. That is
+/// the order at-spi2's own clients ask in, so bubbler proxies the bus
+/// the applications on this host are already on. The caller must still
+/// check that the result is a socket.
+///
+/// Every failure stops the run instead of dropping the grant: an `a11y`
+/// sandbox whose socket has no bus behind it looks to the application
+/// like a broken toolkit and to the user like a sandbox that quietly
+/// gave them less than the config asked for.
+pub fn host_a11y_bus(env: &Env) -> Result<PathBuf, LaunchError> {
+    match address_path(
+        env.at_spi_bus_address.as_deref(),
+        "AT_SPI_BUS_ADDRESS",
+        A11Y_NODE,
+    )? {
+        Some(path) => Ok(path),
+        None => ask_a11y_bus(Path::new(DBUS_SEND)),
+    }
+}
+
+/// The socket `org.a11y.Bus` hands out, asked with `program`: one
+/// `GetAddress` call on the session bus, spawned with one argument per
+/// element and no shell anywhere. `program` is [`DBUS_SEND`] resolved on
+/// `PATH` in every run; only a test hands it a path of its own.
+fn ask_a11y_bus(program: &Path) -> Result<PathBuf, LaunchError> {
+    let out = Command::new(program)
+        .args([
+            "--session",
+            "--print-reply",
+            "--dest=org.a11y.Bus",
+            "/org/a11y/bus",
+            "org.a11y.Bus.GetAddress",
+        ])
+        .output()
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => LaunchError::A11y(format!(
+                "`{DBUS_SEND}` not found on PATH; install the `dbus` package"
+            )),
+            _ => LaunchError::A11y(format!("running `{DBUS_SEND}`: {e}")),
+        })?;
+    if !out.status.success() {
+        return Err(LaunchError::A11y(format!(
+            "org.a11y.Bus did not answer GetAddress{}",
+            stderr_note(&out.stderr)
+        )));
+    }
+    let address = parse_get_address_reply(&out.stdout).ok_or_else(|| {
+        LaunchError::A11y("org.a11y.Bus answered GetAddress with no address".to_owned())
+    })?;
+    // The address is not echoed, for the reason `address_path` does not
+    // echo the variable's either: it is host input, and an address may
+    // hold anything.
+    unix_path(&address).ok_or_else(|| {
+        LaunchError::A11y(
+            "the address org.a11y.Bus returned is not a `unix:path=<path>` socket".to_owned(),
+        )
+    })
+}
+
+/// The address in a `dbus-send --print-reply` reply: the value of its
+/// one `string "..."` line. `None` when the output holds no such line,
+/// and `None` when it holds more than one — `GetAddress` answers with a
+/// single string, and a reply with two is an answer to some other
+/// question that picking from would be a guess.
+///
+/// Bytes throughout: a socket path need not be UTF-8, and a lossy
+/// reading of one names a different file than the bus is on.
+fn parse_get_address_reply(stdout: &[u8]) -> Option<OsString> {
+    let mut found = None;
+    for line in stdout.split(|b| *b == b'\n') {
+        let Some(rest) = line.trim_ascii().strip_prefix(b"string \"") else {
+            continue;
+        };
+        let Some(value) = rest.strip_suffix(b"\"") else {
+            continue;
+        };
+        if found.is_some() {
+            return None;
+        }
+        found = Some(OsStr::from_bytes(value).to_owned());
+    }
+    found
+}
+
+/// The first line of a failed `dbus-send`'s standard error, as a note to
+/// hang on the error message. It is another program's output, so the
+/// control characters in it are shown rather than sent to whatever
+/// terminal reads the message, and only a line's worth of it is kept.
+fn stderr_note(stderr: &[u8]) -> String {
+    /// Characters of the line the message carries; a D-Bus error name
+    /// and its text fit, a program printing something else does not get
+    /// to fill the terminal with it.
+    const KEPT: usize = 200;
+
+    let line = stderr.split(|b| *b == b'\n').next().unwrap_or_default();
+    let rendered = String::from_utf8(crate::safe_text::render(line))
+        .expect("the rendering escapes every byte that is not text");
+    let text = rendered.trim();
+    match (text.is_empty(), text.char_indices().nth(KEPT)) {
+        (true, _) => String::new(),
+        (false, Some((cut, _))) => format!(": {}...", &text[..cut]),
+        (false, None) => format!(": {text}"),
+    }
+}
+
 /// The socket a `DBUS_*_BUS_ADDRESS` names: `None` when the variable is
 /// unset or empty, so the caller's default path applies. A transport
 /// bubbler cannot bind (`tcp:`, `unix:abstract=`) is an error naming the
@@ -537,6 +651,7 @@ pub fn proxy_command_nodes(
 mod tests {
     use super::*;
     use crate::config::WaylandMode;
+    use std::os::unix::ffi::OsStringExt;
 
     fn strs(v: &[OsString]) -> Vec<&str> {
         v.iter()
@@ -580,6 +695,7 @@ mod tests {
             init_override: None,
             dbus_address: None,
             dbus_system_address: None,
+            at_spi_bus_address: None,
             dbus_log: false,
             seccomp_log: false,
             test_allow_path: None,
@@ -1096,5 +1212,190 @@ mod tests {
         e.dbus_system_address = None;
         assert_eq!(host_bus(&e).unwrap(), PathBuf::from("/tmp/session"));
         assert_eq!(host_system_bus(&e).unwrap(), PathBuf::from(SYSTEM_BUS_PATH));
+    }
+
+    /// What this host's `dbus-send` printed for the call `host_a11y_bus`
+    /// makes, captured 2026-08-25 on a session running at-spi2.
+    const GET_ADDRESS_REPLY: &str = concat!(
+        "method return time=1787654118.642581 sender=:1.20 -> ",
+        "destination=:1.229719 serial=27 reply_serial=2\n",
+        "   string \"unix:path=/run/user/1000/at-spi/bus_0\"\n"
+    );
+
+    /// A fake `dbus-send` in `dir`: it writes its argv to `dir/argv`,
+    /// prints `stdout` and `stderr` and exits with `code`. Its output is
+    /// handed to it in files so that nothing in the reply has to survive
+    /// a trip through shell quoting.
+    fn fake_dbus_send(dir: &Path, stdout: &[u8], stderr: &[u8], code: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(dir.join("stdout"), stdout).unwrap();
+        std::fs::write(dir.join("stderr"), stderr).unwrap();
+        let program = dir.join(DBUS_SEND);
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$@\" > {dir}/argv\n\
+                 cat {dir}/stdout\n\
+                 cat {dir}/stderr >&2\n\
+                 exit {code}\n",
+                dir = dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A file written and then run by a process with threads in it
+        // comes back `ETXTBSY` now and again: another thread's spawn
+        // forked while this write's descriptor was open, and the fork
+        // holds it until its own exec closes it. Taking the miss here
+        // keeps it out of the test that follows.
+        for _ in 0..100 {
+            match Command::new(&program).output() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                _ => break,
+            }
+        }
+        program
+    }
+
+    #[test]
+    fn the_address_is_the_one_quoted_string_a_reply_holds() {
+        assert_eq!(
+            parse_get_address_reply(GET_ADDRESS_REPLY.as_bytes()),
+            Some(OsString::from("unix:path=/run/user/1000/at-spi/bus_0"))
+        );
+        // A socket path is bytes, and a lossy reading of it would name
+        // another file than the one the bus is on.
+        let mut reply = b"method return sender=:1.2\n   string \"unix:path=/run/".to_vec();
+        reply.extend_from_slice(b"\xff\"\n");
+        assert_eq!(
+            parse_get_address_reply(&reply),
+            Some(OsString::from_vec(b"unix:path=/run/\xff".to_vec()))
+        );
+        for none in [
+            "",
+            "method return time=1 sender=:1.20 -> destination=:1.3 serial=3 reply_serial=2\n",
+            // What a failed call prints; it is on stderr, but a reply
+            // that holds no address is not one to guess at either.
+            "Error org.freedesktop.DBus.Error.ServiceUnknown: The name is not activatable\n",
+            // GetAddress answers with one string. Two is a reply to
+            // some other question, and picking one of them is a guess.
+            "   string \"unix:path=/a\"\n   string \"unix:path=/b\"\n",
+            "   string unix:path=/a\n",
+            "   strings \"unix:path=/a\"\n",
+        ] {
+            assert_eq!(parse_get_address_reply(none.as_bytes()), None, "{none:?}");
+        }
+    }
+
+    #[test]
+    fn a_set_at_spi_address_is_the_answer_and_only_a_unix_path_is_one() {
+        let mut e = env();
+        // Not this host's a11y socket: had the variable been ignored and
+        // the bus asked instead, the answer would be that one.
+        e.at_spi_bus_address = Some("unix:path=/tmp/from-the-variable,guid=deadbeef".into());
+        assert_eq!(
+            host_a11y_bus(&e).unwrap(),
+            PathBuf::from("/tmp/from-the-variable")
+        );
+        // `unix:abstract=` is what at-spi's own launcher may hand out,
+        // and it names no file the proxy sandbox could bind.
+        for bad in [
+            "tcp:host=localhost,port=1",
+            "unix:abstract=/x",
+            "unix:path=",
+        ] {
+            e.at_spi_bus_address = Some(bad.into());
+            let Err(LaunchError::BadValue { service, reason }) = host_a11y_bus(&e) else {
+                panic!("{bad} was accepted");
+            };
+            assert_eq!(service, A11Y_NODE);
+            assert!(reason.contains("AT_SPI_BUS_ADDRESS"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn without_the_variable_the_bus_is_asked_with_one_fixed_invocation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let program = fake_dbus_send(tmp.path(), GET_ADDRESS_REPLY.as_bytes(), b"", 0);
+        assert_eq!(
+            ask_a11y_bus(&program).unwrap(),
+            PathBuf::from("/run/user/1000/at-spi/bus_0")
+        );
+        // The whole of what bubbler asks the session bus for: one method
+        // on one object of one name.
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("argv")).unwrap(),
+            "--session\n--print-reply\n--dest=org.a11y.Bus\n/org/a11y/bus\n\
+             org.a11y.Bus.GetAddress\n"
+        );
+    }
+
+    #[test]
+    fn a_bus_that_does_not_answer_is_a_launch_error_naming_the_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        // dbus-send prints the D-Bus error and exits 1. Its output is
+        // another program's, so the control sequences in it are shown
+        // rather than sent to whatever terminal reads the message.
+        let program = fake_dbus_send(
+            tmp.path(),
+            b"",
+            b"Error org.freedesktop.DBus.Error.ServiceUnknown: \x1b]52;c;aGk=\x07\nmore\n",
+            1,
+        );
+        let Err(LaunchError::A11y(msg)) = ask_a11y_bus(&program) else {
+            panic!("a failed call was accepted");
+        };
+        assert!(msg.contains("org.a11y.Bus"), "{msg}");
+        assert!(
+            msg.contains("Error org.freedesktop.DBus.Error.ServiceUnknown"),
+            "{msg}"
+        );
+        assert!(msg.contains("^[]52;c;aGk=^G"), "{msg}");
+        assert!(!msg.contains('\x1b'), "{msg}");
+        assert!(!msg.contains("more"), "{msg}");
+        assert!(
+            LaunchError::A11y(msg)
+                .to_string()
+                .starts_with("finding the accessibility bus: "),
+        );
+    }
+
+    #[test]
+    fn an_answer_that_is_no_unix_socket_is_refused_and_never_echoed() {
+        let tmp = tempfile::tempdir().unwrap();
+        // What at-spi-bus-launcher reports when it listens on an
+        // abstract socket: a bus that exists and that the proxy sandbox,
+        // with no network namespace of the host's, cannot reach.
+        let abstract_reply = "method return sender=:1.2 reply_serial=2\n   \
+             string \"unix:abstract=/tmp/dbus-Ab3\"\n";
+        let program = fake_dbus_send(tmp.path(), abstract_reply.as_bytes(), b"", 0);
+        let Err(LaunchError::A11y(msg)) = ask_a11y_bus(&program) else {
+            panic!("an abstract address was accepted");
+        };
+        assert!(msg.contains("unix:path="), "{msg}");
+        // The address is host input; the message says what was wrong
+        // with it, not what it held.
+        assert!(!msg.contains("dbus-Ab3"), "{msg}");
+
+        let other = tempfile::tempdir().unwrap();
+        let program = fake_dbus_send(other.path(), b"method return sender=:1.2\n", b"", 0);
+        let Err(LaunchError::A11y(msg)) = ask_a11y_bus(&program) else {
+            panic!("a reply holding no address was accepted");
+        };
+        assert!(msg.contains("org.a11y.Bus"), "{msg}");
+    }
+
+    #[test]
+    fn a_missing_dbus_send_names_the_program_and_its_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        let Err(LaunchError::A11y(msg)) = ask_a11y_bus(&tmp.path().join(DBUS_SEND)) else {
+            panic!("a missing program was accepted");
+        };
+        assert!(msg.contains(DBUS_SEND), "{msg}");
+        assert!(msg.contains("PATH"), "{msg}");
+        assert!(msg.contains("dbus"), "{msg}");
     }
 }

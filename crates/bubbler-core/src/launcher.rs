@@ -2042,6 +2042,7 @@ mod tests {
             init_override: Some(init),
             dbus_address: None,
             dbus_system_address: None,
+            at_spi_bus_address: None,
             dbus_log: false,
             seccomp_log: false,
             test_allow_path: None,

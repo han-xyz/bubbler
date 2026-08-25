@@ -137,6 +137,14 @@ const ENVIRONMENT: &[(&str, &str)] = &[
          rather than falling back to a bus the session is not on.",
     ),
     (
+        "AT_SPI_BUS_ADDRESS",
+        "Where the accessibility bus the `a11y` grant proxies is, read before anything is \
+         asked of the session: when it is unset, bubbler asks org.a11y.Bus for the address \
+         with dbus-send, from the `dbus` package. It is untrusted like the D-Bus \
+         addresses, must be a `unix:path=` address, and a bus that cannot be found fails \
+         the run rather than dropping the grant.",
+    ),
+    (
         "TERM, LANG, LANGUAGE, COLORTERM, TZ, LC_*",
         "The only variables of yours a sandbox is given: the environment inside is cleared, \
          and everything else in yours stops at the boundary.",

@@ -68,6 +68,12 @@ pub struct Env {
     /// address names a socket bubbler can proxy, and the compiled-in
     /// `/run/dbus/system_bus_socket` is used when it names none.
     pub dbus_system_address: Option<OsString>,
+    /// `$AT_SPI_BUS_ADDRESS` as the host set it: where the session says
+    /// its accessibility bus is, which is what at-spi2's own clients
+    /// read before they ask `org.a11y.Bus`. Untrusted like the D-Bus
+    /// addresses, and only a `unix:path=` address names a socket bubbler
+    /// can proxy.
+    pub at_spi_bus_address: Option<OsString>,
     /// `$BUBBLER_DBUS_LOG=1`: run the D-Bus proxy with `--log`, which
     /// prints every filtered message to bubbler's stderr.
     pub dbus_log: bool,
