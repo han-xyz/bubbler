@@ -419,19 +419,18 @@ fn apply_seccomp(
 }
 
 /// Complete bwrap argv (without the program name) for the D-Bus proxy
-/// sidecar of one instance. `session_bus` and `system_bus` are the host
-/// sockets of the buses the plan grants, already type-checked; `alloc`
-/// keeps the read end of the pipe the proxy reports readiness on.
+/// sidecar of one instance. `buses` holds the host socket of each bus
+/// the plan grants, already type-checked; `alloc` keeps the read end of
+/// the pipe the proxy reports readiness on.
 pub fn proxy_argv(
     env: &Env,
     plan: &dbus::Plan,
-    session_bus: Option<&Path>,
-    system_bus: Option<&Path>,
+    buses: dbus::HostBuses<'_>,
     dir: &Path,
     host: &dyn Host,
     alloc: &mut dyn FdAllocator,
 ) -> Result<Vec<OsString>, LaunchError> {
-    let (args, command) = proxy_args(env, plan, session_bus, system_bus, dir, host, alloc)?;
+    let (args, command) = proxy_args(env, plan, buses, dir, host, alloc)?;
     let plain: Vec<OsString> = command.into_iter().map(|(arg, _)| arg).collect();
     args.finish_plain(&plain, alloc)
 }
@@ -440,6 +439,13 @@ pub fn proxy_argv(
 /// when the instance grants no bus and so starts no proxy. The host bus
 /// socket is not probed here, as nothing is started: `--dry-run` builds
 /// the app's bus bind from a socket that does not exist yet either.
+///
+/// Each address is resolved the way a run would resolve it, since an
+/// argv without them is not the argv that would be run. For the
+/// accessibility bus that means reading `$AT_SPI_BUS_ADDRESS` and, when
+/// the session set none, asking `org.a11y.Bus` where its socket is —
+/// the one question this view asks anything. The sandbox's own argv
+/// asks nothing: it binds the socket the sidecar will serve.
 pub fn explain_proxy(env: &Env, inst: &Instance) -> Result<Option<Vec<Explained>>, LaunchError> {
     let Some(plan) = dbus::plan(&inst.config.services, &inst.name) else {
         return Ok(None);
@@ -454,13 +460,21 @@ pub fn explain_proxy(env: &Env, inst: &Instance) -> Result<Option<Vec<Explained>
         .as_ref()
         .map(|_| dbus::host_system_bus(env))
         .transpose()?;
+    let a11y = plan
+        .a11y
+        .as_ref()
+        .map(|_| dbus::host_a11y_bus(env))
+        .transpose()?;
     let dir = instance_runtime_dir(env, &inst.name);
     let mut alloc = DryRunAlloc::default();
     let (args, command) = proxy_args(
         env,
         &plan,
-        session.as_deref(),
-        system.as_deref(),
+        dbus::HostBuses {
+            session: session.as_deref(),
+            system: system.as_deref(),
+            a11y: a11y.as_deref(),
+        },
         &dir,
         &RealHost,
         &mut alloc,
@@ -474,30 +488,27 @@ pub fn explain_proxy(env: &Env, inst: &Instance) -> Result<Option<Vec<Explained>
 fn proxy_args(
     env: &Env,
     plan: &dbus::Plan,
-    session_bus: Option<&Path>,
-    system_bus: Option<&Path>,
+    buses: dbus::HostBuses<'_>,
     dir: &Path,
     host: &dyn Host,
     alloc: &mut dyn FdAllocator,
 ) -> Result<(BwrapArgs, Vec<(OsString, Origin)>), LaunchError> {
     let ready = alloc.ready_pipe().map_err(LaunchError::Data)?;
     let program = dbus::proxy_program(env);
-    let command = dbus::proxy_command_nodes(
-        &program,
-        plan,
-        session_bus,
-        system_bus,
-        dir,
-        env.dbus_log,
-        &ready,
-    );
+    let command = dbus::proxy_command_nodes(&program, plan, buses, dir, env.dbus_log, &ready);
     // A rule belongs to the node that asked for it; the proxy's own
     // invocation is the command it is.
     let command: Vec<(OsString, Origin)> = command
         .into_iter()
         .map(|(arg, node)| (arg, node.map_or(Origin::Command, Origin::Service)))
         .collect();
-    let mut args = BwrapArgs::proxy_baseline(session_bus, system_bus, &dbus::socket_dir(dir), host);
+    let mut args = BwrapArgs::proxy_baseline(
+        buses.session,
+        buses.system,
+        buses.a11y,
+        &dbus::socket_dir(dir),
+        host,
+    );
     // The sidecar has no `seccomp` node of its own: an instance may relax
     // its own filter, never the one around the process holding its bus.
     args.tag(Origin::Seccomp);
@@ -691,6 +702,15 @@ pub fn start_proxy(
         .as_ref()
         .map(|_| service::require_socket(host, "system-bus", dbus::host_system_bus(env)?))
         .transpose()?;
+    // Resolved before the proxy starts, like the other two: the address
+    // is what the session says its accessibility bus is, and asking for
+    // it after the sandbox is up would be asking on behalf of a bus that
+    // is already meant to be serving.
+    let a11y_bus = plan
+        .a11y
+        .as_ref()
+        .map(|_| service::require_socket(host, dbus::A11Y_NODE, dbus::host_a11y_bus(env)?))
+        .transpose()?;
     // The proxy gets this directory and nothing else of the instance's
     // runtime state, so it is created here rather than bound from above.
     mkdir_private(&dbus::socket_dir(dir))?;
@@ -698,8 +718,11 @@ pub fn start_proxy(
     let argv = proxy_argv(
         env,
         plan,
-        session_bus.as_deref(),
-        system_bus.as_deref(),
+        dbus::HostBuses {
+            session: session_bus.as_deref(),
+            system: system_bus.as_deref(),
+            a11y: a11y_bus.as_deref(),
+        },
         dir,
         host,
         &mut alloc,
@@ -2679,8 +2702,11 @@ mod tests {
         let argv = proxy_argv(
             &e,
             &plan,
-            Some(Path::new("/run/user/1000/bus")),
-            None,
+            dbus::HostBuses {
+                session: Some(Path::new("/run/user/1000/bus")),
+                system: None,
+                a11y: None,
+            },
             Path::new("/run/user/1000/bubbler/t"),
             &FakeHost::default(),
             &mut DryRunAlloc::default(),
@@ -2757,8 +2783,11 @@ mod tests {
             &proxy_argv(
                 &e,
                 &plan,
-                None,
-                Some(Path::new(dbus::SYSTEM_BUS_PATH)),
+                dbus::HostBuses {
+                    session: None,
+                    system: Some(Path::new(dbus::SYSTEM_BUS_PATH)),
+                    a11y: None,
+                },
                 Path::new("/run/user/1000/bubbler/t"),
                 &FakeHost::default(),
                 &mut DryRunAlloc::default(),
@@ -2818,8 +2847,11 @@ mod tests {
             &proxy_argv(
                 &e,
                 &plan,
-                Some(Path::new("/run/user/1000/bus")),
-                Some(Path::new(dbus::SYSTEM_BUS_PATH)),
+                dbus::HostBuses {
+                    session: Some(Path::new("/run/user/1000/bus")),
+                    system: Some(Path::new(dbus::SYSTEM_BUS_PATH)),
+                    a11y: None,
+                },
                 Path::new("/run/user/1000/bubbler/t"),
                 &FakeHost::default(),
                 &mut DryRunAlloc::default(),
@@ -2855,6 +2887,109 @@ mod tests {
         );
     }
 
+    /// The third bus of the one sidecar: its host socket in the proxy's
+    /// sandbox, its address in the proxy's command, and the nine rules
+    /// behind the `--filter` of that address.
+    #[test]
+    fn the_a11y_bus_is_the_third_bus_of_the_one_proxy() {
+        use crate::config::{BusRule, Service};
+        use crate::host::fake::FakeHost;
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let plan = dbus::plan(
+            &[
+                Service::Dbus { rules: vec![] },
+                Service::SystemBus {
+                    rules: vec![BusRule::Talk("org.freedesktop.UPower".into())],
+                },
+                Service::A11y,
+            ],
+            "t",
+        )
+        .expect("three buses are granted");
+        assert_eq!(
+            plan.buses(),
+            vec![
+                (dbus::SESSION_SOCKET, dbus::SESSION_NODE),
+                (dbus::SYSTEM_SOCKET, dbus::SYSTEM_NODE),
+                (dbus::A11Y_SOCKET, dbus::A11Y_NODE),
+            ]
+        );
+        let argv = strs(
+            &proxy_argv(
+                &e,
+                &plan,
+                dbus::HostBuses {
+                    session: Some(Path::new("/run/user/1000/bus")),
+                    system: Some(Path::new(dbus::SYSTEM_BUS_PATH)),
+                    a11y: Some(Path::new("/run/user/1000/at-spi/bus_0")),
+                },
+                Path::new("/run/user/1000/bubbler/t"),
+                &FakeHost::default(),
+                &mut DryRunAlloc::default(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            argv.windows(3).any(|w| w
+                == [
+                    "--ro-bind",
+                    "/run/user/1000/at-spi/bus_0",
+                    "/run/user/1000/at-spi/bus_0",
+                ]),
+            "{argv:?}"
+        );
+        assert_eq!(
+            argv.iter().filter(|a| *a == "xdg-dbus-proxy").count(),
+            1,
+            "{argv:?}"
+        );
+        let mut expected = vec![
+            "unix:path=/run/user/1000/at-spi/bus_0",
+            "/run/user/1000/bubbler/t/dbus/a11y",
+            "--filter",
+        ];
+        expected.extend_from_slice(dbus::A11Y_RULES);
+        assert_eq!(&argv[argv.len() - expected.len()..], expected, "{argv:?}");
+        // Still the one writable path, whatever the bus count.
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--bind").count(),
+            1,
+            "{argv:?}"
+        );
+    }
+
+    /// `--explain --proxy` reads the sidecar it would start, so the
+    /// third bus is in it. The address comes from the variable at-spi2's
+    /// own clients read first, which is why this explanation asks no bus
+    /// anything.
+    #[test]
+    fn the_explained_proxy_argv_holds_the_accessibility_bus() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut e = env(tmp.path());
+        e.at_spi_bus_address = Some("unix:path=/run/user/1000/at-spi/bus_0".into());
+        let items = explain_proxy(&e, &inst(tmp.path(), "dbus\na11y\ncommand \"true\""))
+            .unwrap()
+            .expect("a `dbus` node starts a proxy");
+        let dir = tmp.path().join("run/bubbler/t/dbus").display().to_string();
+        let bus = line(&items, Origin::Service(1));
+        assert!(
+            bus.starts_with(&format!(
+                "unix:path=/run/user/1000/at-spi/bus_0 {dir}/a11y --filter --call="
+            )),
+            "{bus}"
+        );
+        assert_eq!(
+            bus.split(' ').filter(|a| a.starts_with("--call=")).count()
+                + bus
+                    .split(' ')
+                    .filter(|a| a.starts_with("--broadcast="))
+                    .count(),
+            dbus::A11Y_RULES.len(),
+            "{bus}"
+        );
+    }
+
     #[test]
     fn the_proxy_never_sees_the_instances_control_socket() {
         use crate::config::Service;
@@ -2867,8 +3002,11 @@ mod tests {
             &proxy_argv(
                 &e,
                 &plan,
-                Some(Path::new("/run/user/1000/bus")),
-                None,
+                dbus::HostBuses {
+                    session: Some(Path::new("/run/user/1000/bus")),
+                    system: None,
+                    a11y: None,
+                },
                 dir,
                 &FakeHost::default(),
                 &mut DryRunAlloc::default(),
@@ -2913,8 +3051,11 @@ mod tests {
             &proxy_argv(
                 &e,
                 &plan,
-                Some(Path::new("/run/user/1000/bus")),
-                None,
+                dbus::HostBuses {
+                    session: Some(Path::new("/run/user/1000/bus")),
+                    system: None,
+                    a11y: None,
+                },
                 Path::new("/run/user/1000/bubbler/t"),
                 &FakeHost::default(),
                 &mut DryRunAlloc::default(),
@@ -2939,8 +3080,11 @@ mod tests {
             &proxy_argv(
                 &e,
                 &plan,
-                Some(Path::new("/run/user/1000/bus")),
-                None,
+                dbus::HostBuses {
+                    session: Some(Path::new("/run/user/1000/bus")),
+                    system: None,
+                    a11y: None,
+                },
                 Path::new("/run/user/1000/bubbler/t"),
                 &host,
                 &mut DryRunAlloc::default(),
@@ -2959,8 +3103,11 @@ mod tests {
             proxy_argv(
                 &e,
                 &plan,
-                Some(Path::new("/run/user/1000/bus")),
-                None,
+                dbus::HostBuses {
+                    session: Some(Path::new("/run/user/1000/bus")),
+                    system: None,
+                    a11y: None,
+                },
                 Path::new("/run/user/1000/bubbler/t"),
                 &FakeHost::default(),
                 &mut DryRunAlloc::default(),

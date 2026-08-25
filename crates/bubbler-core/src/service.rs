@@ -83,8 +83,8 @@ pub fn apply_all(
             // Rule-only bundles: they reach the sandbox through the proxy
             // the launcher starts, not through bwrap arguments.
             Service::Notify | Service::Tray | Service::Mpris { .. } => {}
-            // Task 3: bind and env.
-            Service::A11y | Service::InputMethod => {}
+            Service::A11y => a11y(env, args, ctx)?,
+            Service::InputMethod => input_method(args),
         }
     }
     let pad = services.iter().enumerate().find_map(|(i, s)| match s {
@@ -684,6 +684,51 @@ fn system_bus_socket(args: &mut BwrapArgs, ctx: &ServiceCtx) {
         &dbus::app_bus_path(&ctx.instance_runtime, dbus::SYSTEM_SOCKET),
         Path::new(dbus::SYSTEM_BUS_PATH),
     );
+}
+
+/// Bind the socket the same proxy serves for the accessibility bus at
+/// `$XDG_RUNTIME_DIR/at-spi/bus` and name it in `AT_SPI_BUS_ADDRESS`,
+/// which is where at-spi2's own clients look before they ask any bus for
+/// an address (`atspi-misc.c`). The host's accessibility socket is never
+/// bound; only the filtered one is, and what it filters is the fixed
+/// [`dbus::A11Y_RULES`].
+///
+/// The source is not probed here for the same reason [`dbus_socket`]'s is
+/// not: it exists only once the launcher has moved the proxy's socket out
+/// of the proxy's reach.
+///
+/// Without a plan holding that bus nothing ever creates the socket, so
+/// the grant is refused rather than quietly dropped; the parser rejects
+/// that config already.
+fn a11y(env: &Env, args: &mut BwrapArgs, ctx: &ServiceCtx) -> Result<(), LaunchError> {
+    if !ctx.dbus.is_some_and(|p| p.a11y.is_some()) {
+        return Err(LaunchError::BadValue {
+            service: dbus::A11Y_NODE,
+            reason: "requires dbus".to_owned(),
+        });
+    }
+    let inside = env.runtime_dir.join("at-spi").join("bus");
+    args.ro_bind(
+        &dbus::app_bus_path(&ctx.instance_runtime, dbus::A11Y_SOCKET),
+        &inside,
+    );
+    let mut address = OsString::from("unix:path=");
+    address.push(inside.as_os_str());
+    args.setenv(OsStr::new("AT_SPI_BUS_ADDRESS"), &address);
+    Ok(())
+}
+
+/// Point the IBus client library at the sandboxed portal name instead of
+/// the daemon's own; fcitx5's Qt and GTK clients watch for their portal
+/// name by themselves. The rules that make either name reachable are the
+/// plan's, and neither daemon's main name — which carries `Exit`,
+/// `SetConfig` and their kin — is among them.
+// `ibusbus.c`: the library uses the portal when `IBUS_USE_PORTAL` is set
+// or `/.flatpak-info` exists. bubbler sets no IM module variable: the
+// toolkits pick the Wayland text-input protocol by themselves, and an
+// Xwayland application needs a profile's `env` to say which module.
+fn input_method(args: &mut BwrapArgs) {
+    args.setenv(OsStr::new("IBUS_USE_PORTAL"), OsStr::new("1"));
 }
 
 /// Bind `/.flatpak-info` so portals know the sandbox, and this instance's
@@ -3128,6 +3173,83 @@ mod tests {
             !bare.iter().any(|s| s == "/run/dbus/system_bus_socket"),
             "{bare:?}"
         );
+    }
+
+    #[test]
+    fn a11y_binds_the_proxied_bus_where_at_spi_clients_look_for_it() {
+        let a = argv(
+            &[Service::Dbus { rules: vec![] }, Service::A11y],
+            &env(),
+            &[],
+        )
+        .unwrap();
+        // The instance directory, not the proxy's `dbus/` subdirectory:
+        // the launcher moves the socket there once it has proved it is one.
+        assert!(
+            has_seq(
+                &a,
+                &[
+                    "--ro-bind",
+                    "/run/user/1000/bubbler/t/a11y",
+                    "/run/user/1000/at-spi/bus"
+                ]
+            ),
+            "{a:?}"
+        );
+        assert!(
+            !a.iter().any(|s| s == "/run/user/1000/bubbler/t/dbus/a11y"),
+            "the sandbox binds a path the proxy can still write to: {a:?}"
+        );
+        // What every at-spi2 client reads before it asks a bus anything,
+        // pointed at the filtered socket rather than the session's.
+        assert!(
+            has_seq(
+                &a,
+                &[
+                    "--setenv",
+                    "AT_SPI_BUS_ADDRESS",
+                    "unix:path=/run/user/1000/at-spi/bus"
+                ]
+            ),
+            "{a:?}"
+        );
+        // Without the node neither the bind nor the variable is there.
+        let bare = argv(&[Service::Dbus { rules: vec![] }], &env(), &[]).unwrap();
+        assert!(!bare.iter().any(|s| s == "AT_SPI_BUS_ADDRESS"), "{bare:?}");
+        assert!(!bare.iter().any(|s| s.contains("at-spi")), "{bare:?}");
+    }
+
+    #[test]
+    fn a11y_without_a_bus_is_refused_rather_than_downgraded() {
+        // The parser refuses that config, so this is the backstop for a
+        // caller building an `InstanceConfig` by hand: no plan means no
+        // proxy, and the bind would name a socket nothing ever creates.
+        assert!(
+            matches!(
+                argv(&[Service::A11y], &env(), &[]),
+                Err(LaunchError::BadValue {
+                    service: "a11y",
+                    ..
+                })
+            ),
+            "a11y without dbus is a grant that reaches nothing"
+        );
+    }
+
+    #[test]
+    fn input_method_is_the_portal_variable_and_no_bind_at_all() {
+        let a = argv(
+            &[Service::Dbus { rules: vec![] }, Service::InputMethod],
+            &env(),
+            &[],
+        )
+        .unwrap();
+        // The client libraries take the sandboxed portal name from this;
+        // the rules that make that name reachable are the plan's.
+        assert!(has_seq(&a, &["--setenv", "IBUS_USE_PORTAL", "1"]), "{a:?}");
+        let bare = argv(&[Service::Dbus { rules: vec![] }], &env(), &[]).unwrap();
+        assert!(!bare.iter().any(|s| s == "IBUS_USE_PORTAL"), "{bare:?}");
+        assert_eq!(binds(&a), binds(&bare), "{a:?}");
     }
 
     #[test]

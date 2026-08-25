@@ -358,6 +358,7 @@ impl BwrapArgs {
     pub fn proxy_baseline(
         host_bus: Option<&Path>,
         host_system_bus: Option<&Path>,
+        host_a11y_bus: Option<&Path>,
         socket_dir: &Path,
         host: &dyn Host,
     ) -> Self {
@@ -405,7 +406,10 @@ impl BwrapArgs {
         push(&mut a.skeleton, b, [o("--tmpfs"), o("/tmp")]);
         // Only the buses this proxy was asked for: a socket bound here
         // that no section names is a host bus the proxy could still reach.
-        for bus in [host_bus, host_system_bus].into_iter().flatten() {
+        for bus in [host_bus, host_system_bus, host_a11y_bus]
+            .into_iter()
+            .flatten()
+        {
             push(
                 &mut a.skeleton,
                 b,
@@ -1002,6 +1006,7 @@ mod tests {
         let argv = BwrapArgs::proxy_baseline(
             Some(Path::new("/run/user/1000/bus")),
             None,
+            None,
             Path::new("/run/user/1000/bubbler/t/dbus"),
             &host,
         )
@@ -1020,6 +1025,7 @@ mod tests {
             .with("/etc/hosts", f);
         let argv = BwrapArgs::proxy_baseline(
             Some(Path::new("/run/user/1000/bus")),
+            None,
             None,
             Path::new("/run/user/1000/bubbler/t/dbus"),
             &host,
@@ -1082,6 +1088,7 @@ mod tests {
         let both = BwrapArgs::proxy_baseline(
             Some(Path::new("/run/user/1000/bus")),
             Some(Path::new("/run/dbus/system_bus_socket")),
+            None,
             Path::new("/run/user/1000/bubbler/t/dbus"),
             &host,
         )
@@ -1104,6 +1111,7 @@ mod tests {
         let system_only = BwrapArgs::proxy_baseline(
             None,
             Some(Path::new("/run/dbus/system_bus_socket")),
+            None,
             Path::new("/run/user/1000/bubbler/t/dbus"),
             &host,
         )
@@ -1112,10 +1120,58 @@ mod tests {
         assert!(!system_only.iter().any(|a| a == "/run/user/1000/bus"));
     }
 
+    /// The accessibility bus is one more host socket the proxy connects
+    /// to, bound read-only like the other two and only where the plan
+    /// holds that bus: a socket bound for a bus no section names is a
+    /// host bus the proxy could still reach.
+    #[test]
+    fn the_a11y_host_socket_is_bound_only_where_that_bus_is_proxied() {
+        let argv = BwrapArgs::proxy_baseline(
+            Some(Path::new("/run/user/1000/bus")),
+            None,
+            Some(Path::new("/run/user/1000/at-spi/bus_0")),
+            Path::new("/run/user/1000/bubbler/t/dbus"),
+            &FakeHost::default(),
+        )
+        .finish_plain(&["xdg-dbus-proxy".into()], &mut Counter::new())
+        .unwrap();
+        let s = strs(&argv);
+        assert!(
+            s.windows(6).any(|w| w
+                == [
+                    "--ro-bind",
+                    "/run/user/1000/bus",
+                    "/run/user/1000/bus",
+                    "--ro-bind",
+                    "/run/user/1000/at-spi/bus_0",
+                    "/run/user/1000/at-spi/bus_0",
+                ]),
+            "{s:?}"
+        );
+        // The socket the proxy serves for it is created in the one
+        // writable bind, not bound in from the host.
+        assert!(!s.iter().any(|a| a.ends_with("/dbus/a11y")), "{s:?}");
+        let without = BwrapArgs::proxy_baseline(
+            Some(Path::new("/run/user/1000/bus")),
+            None,
+            None,
+            Path::new("/run/user/1000/bubbler/t/dbus"),
+            &FakeHost::default(),
+        )
+        .finish_plain(&["xdg-dbus-proxy".into()], &mut Counter::new())
+        .unwrap();
+        assert!(
+            !strs(&without).iter().any(|a| a.contains("at-spi")),
+            "{:?}",
+            strs(&without)
+        );
+    }
+
     #[test]
     fn proxy_sandbox_takes_the_flatpak_info_data_file() {
         let mut args = BwrapArgs::proxy_baseline(
             Some(Path::new("/run/user/1000/bus")),
+            None,
             None,
             Path::new("/run/user/1000/bubbler/t/dbus"),
             &FakeHost::default(),

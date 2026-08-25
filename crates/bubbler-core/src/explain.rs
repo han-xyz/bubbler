@@ -777,7 +777,28 @@ bwrap
         };
         let rules = rules(&cfg, "t");
         let out = render(
-            &[item(Origin::Command, &["--", "true"], None)],
+            &[
+                item(
+                    Origin::Service(1),
+                    &["--ro-bind", "/run/t/a11y", "/run/at-spi/bus"],
+                    None,
+                ),
+                item(
+                    Origin::Service(1),
+                    &[
+                        "--setenv",
+                        "AT_SPI_BUS_ADDRESS",
+                        "unix:path=/run/at-spi/bus",
+                    ],
+                    None,
+                ),
+                item(
+                    Origin::Service(2),
+                    &["--setenv", "IBUS_USE_PORTAL", "1"],
+                    None,
+                ),
+                item(Origin::Command, &["--", "true"], None),
+            ],
             &View {
                 title: "bwrap",
                 instance: "t",
@@ -792,17 +813,28 @@ bwrap
             },
         )
         .unwrap();
-        // The accessibility bus is not the session bus, and its rules
-        // are still the `a11y` node's.
+        // The bind and the variable are what the argv shows of either
+        // grant; the rules under them are the rest of what they are.
+        // The accessibility rules are the `a11y` node's, and none of
+        // them is on the session bus.
         assert!(
-            out.iter().any(|l| l.contains(
-                "rule-only: --call=org.a11y.atspi.Registry=org.a11y.atspi.Socket.Embed@"
-            )),
+            out.iter().any(|l| l
+                .contains("rules: --call=org.a11y.atspi.Registry=org.a11y.atspi.Socket.Embed@")),
+            "{out:#?}"
+        );
+        let a11y = out
+            .iter()
+            .filter(|l| l.contains("org.a11y.atspi.Registry"))
+            .count();
+        assert_eq!(a11y, dbus::A11Y_RULES.len(), "{out:#?}");
+        assert!(
+            out.iter()
+                .any(|l| l.contains("rules: --talk=org.freedesktop.portal.Fcitx")),
             "{out:#?}"
         );
         assert!(
             out.iter()
-                .any(|l| l.contains("rule-only: --talk=org.freedesktop.portal.Fcitx")),
+                .any(|l| l.trim() == "--talk=org.freedesktop.portal.IBus"),
             "{out:#?}"
         );
     }

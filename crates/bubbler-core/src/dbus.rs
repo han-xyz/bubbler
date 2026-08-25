@@ -383,8 +383,8 @@ pub fn socket_dir(instance_runtime: &Path) -> PathBuf {
 }
 
 /// Where the proxy creates one filtered socket, in [`socket_dir`]: the
-/// one path the proxy sandbox can write to. `socket` is [`SESSION_SOCKET`]
-/// or [`SYSTEM_SOCKET`].
+/// one path the proxy sandbox can write to. `socket` is [`SESSION_SOCKET`],
+/// [`SYSTEM_SOCKET`] or [`A11Y_SOCKET`].
 pub fn proxy_bus_path(instance_runtime: &Path, socket: &str) -> PathBuf {
     socket_dir(instance_runtime).join(socket)
 }
@@ -572,36 +572,43 @@ pub fn proxy_program(env: &Env) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(PROXY_BIN))
 }
 
+/// The host socket of each bus a plan grants, as the launcher resolved
+/// them. One named value rather than three arguments of one type:
+/// which socket serves which bus is the whole of the confinement, and a
+/// call site that swapped two would hand an application one bus behind
+/// another bus's rules. `None` leaves that bus out of the proxy's
+/// command, so a section without a socket is not pointed anywhere else.
+#[derive(Debug, Clone, Copy)]
+pub struct HostBuses<'a> {
+    /// Session bus, from [`host_bus`].
+    pub session: Option<&'a Path>,
+    /// System bus, from [`host_system_bus`].
+    pub system: Option<&'a Path>,
+    /// Accessibility bus, from [`host_a11y_bus`].
+    pub a11y: Option<&'a Path>,
+}
+
 /// Argv of the proxy itself, run inside its own sandbox: it connects to
 /// each granted host bus, serves the filtered socket for it in the
 /// `dbus/` subdirectory of `instance_runtime` and exits when `ready_fd`
 /// is closed (`xdg-dbus-proxy(1)`).
 ///
-/// `session_bus` and `system_bus` are the host sockets the launcher has
-/// resolved for the sections the plan holds. A section given no socket is
-/// left out rather than pointed somewhere else; the sandbox's bind of it
-/// then fails, since the proxy never creates it.
+/// `buses` holds the host socket of each section the plan carries. A
+/// section given no socket is left out rather than pointed somewhere
+/// else; the sandbox's bind of it then fails, since the proxy never
+/// creates it.
 pub fn proxy_command(
     program: &Path,
     plan: &Plan,
-    session_bus: Option<&Path>,
-    system_bus: Option<&Path>,
+    buses: HostBuses<'_>,
     instance_runtime: &Path,
     log: bool,
     ready_fd: &OsStr,
 ) -> Vec<OsString> {
-    proxy_command_nodes(
-        program,
-        plan,
-        session_bus,
-        system_bus,
-        instance_runtime,
-        log,
-        ready_fd,
-    )
-    .into_iter()
-    .map(|(arg, _)| arg)
-    .collect()
+    proxy_command_nodes(program, plan, buses, instance_runtime, log, ready_fd)
+        .into_iter()
+        .map(|(arg, _)| arg)
+        .collect()
 }
 
 /// [`proxy_command`] with the node behind each element: a rule carries
@@ -610,8 +617,7 @@ pub fn proxy_command(
 pub fn proxy_command_nodes(
     program: &Path,
     plan: &Plan,
-    session_bus: Option<&Path>,
-    system_bus: Option<&Path>,
+    buses: HostBuses<'_>,
     instance_runtime: &Path,
     log: bool,
     ready_fd: &OsStr,
@@ -620,8 +626,9 @@ pub fn proxy_command_nodes(
     fd.push(ready_fd);
     let mut argv = vec![(program.as_os_str().to_os_string(), None), (fd, None)];
     for (section, host, socket) in [
-        (plan.session.as_ref(), session_bus, SESSION_SOCKET),
-        (plan.system.as_ref(), system_bus, SYSTEM_SOCKET),
+        (plan.session.as_ref(), buses.session, SESSION_SOCKET),
+        (plan.system.as_ref(), buses.system, SYSTEM_SOCKET),
+        (plan.a11y.as_ref(), buses.a11y, A11Y_SOCKET),
     ] {
         let (Some(section), Some(host)) = (section, host) else {
             continue;
@@ -1010,8 +1017,11 @@ mod tests {
         let argv = proxy_command(
             Path::new(PROXY_BIN),
             &p,
-            Some(Path::new("/run/user/1000/bus")),
-            None,
+            HostBuses {
+                session: Some(Path::new("/run/user/1000/bus")),
+                system: None,
+                a11y: None,
+            },
             Path::new("/run/user/1000/bubbler/t"),
             false,
             OsStr::new("4"),
@@ -1032,13 +1042,122 @@ mod tests {
         let logged = proxy_command(
             Path::new(PROXY_BIN),
             &p,
-            Some(Path::new("/run/user/1000/bus")),
-            None,
+            HostBuses {
+                session: Some(Path::new("/run/user/1000/bus")),
+                system: None,
+                a11y: None,
+            },
             Path::new("/run/user/1000/bubbler/t"),
             true,
             OsStr::new("4"),
         );
         assert_eq!(logged[5], OsString::from("--log"));
+    }
+
+    /// One process, three buses: each address is followed by the socket
+    /// it is served on, its own `--filter` and the rules of that bus
+    /// alone. An option applies to the address before it
+    /// (`xdg-dbus-proxy(1)`), so the nine accessibility rules standing
+    /// after the third address are what the application may ask the
+    /// AT-SPI registry; the same nine after the session address would
+    /// name a session-bus service and leave the accessibility bus
+    /// filtered by nothing.
+    #[test]
+    fn the_a11y_bus_is_a_third_address_and_its_rules_follow_its_own_filter() {
+        let p = plan(
+            &[
+                Service::Dbus { rules: vec![] },
+                Service::SystemBus {
+                    rules: vec![BusRule::Talk("org.freedesktop.UPower".into())],
+                },
+                Service::A11y,
+            ],
+            "t",
+        )
+        .expect("three buses are granted");
+        let argv = proxy_command(
+            Path::new(PROXY_BIN),
+            &p,
+            HostBuses {
+                session: Some(Path::new("/run/user/1000/bus")),
+                system: Some(Path::new(SYSTEM_BUS_PATH)),
+                a11y: Some(Path::new("/run/user/1000/at-spi/bus_0")),
+            },
+            Path::new("/run/user/1000/bubbler/t"),
+            false,
+            OsStr::new("4"),
+        );
+        let mut expected = vec![
+            "xdg-dbus-proxy",
+            "--fd=4",
+            "unix:path=/run/user/1000/bus",
+            "/run/user/1000/bubbler/t/dbus/bus",
+            "--filter",
+            "unix:path=/run/dbus/system_bus_socket",
+            "/run/user/1000/bubbler/t/dbus/system",
+            "--filter",
+            "--talk=org.freedesktop.UPower",
+            "unix:path=/run/user/1000/at-spi/bus_0",
+            "/run/user/1000/bubbler/t/dbus/a11y",
+            "--filter",
+        ];
+        expected.extend_from_slice(A11Y_RULES);
+        let s = strs(&argv);
+        assert_eq!(s, expected);
+        let third = s
+            .iter()
+            .position(|a| *a == "unix:path=/run/user/1000/at-spi/bus_0")
+            .expect("the third address is in the argv");
+        assert!(
+            s[..third].iter().all(|a| !a.contains("org.a11y.atspi")),
+            "an accessibility rule applies to a bus before the a11y one: {s:?}"
+        );
+        // Every element of that bus is the `a11y` node's, rules included.
+        let nodes = proxy_command_nodes(
+            Path::new(PROXY_BIN),
+            &p,
+            HostBuses {
+                session: Some(Path::new("/run/user/1000/bus")),
+                system: Some(Path::new(SYSTEM_BUS_PATH)),
+                a11y: Some(Path::new("/run/user/1000/at-spi/bus_0")),
+            },
+            Path::new("/run/user/1000/bubbler/t"),
+            false,
+            OsStr::new("4"),
+        );
+        let tail = &nodes[nodes.len() - (3 + A11Y_RULES.len())..];
+        assert!(tail.iter().all(|(_, node)| *node == Some(2)), "{tail:?}");
+    }
+
+    /// A bus the caller resolved no socket for is left out rather than
+    /// pointed at another one: an explanation of an argv builds the
+    /// same command without a proxy running.
+    #[test]
+    fn an_a11y_section_without_a_host_socket_is_no_bus_at_all() {
+        let p =
+            plan(&[Service::Dbus { rules: vec![] }, Service::A11y], "t").expect("dbus is granted");
+        let argv = proxy_command(
+            Path::new(PROXY_BIN),
+            &p,
+            HostBuses {
+                session: Some(Path::new("/run/user/1000/bus")),
+                system: None,
+                a11y: None,
+            },
+            Path::new("/run/user/1000/bubbler/t"),
+            false,
+            OsStr::new("4"),
+        );
+        assert_eq!(
+            strs(&argv),
+            vec![
+                "xdg-dbus-proxy",
+                "--fd=4",
+                "unix:path=/run/user/1000/bus",
+                "/run/user/1000/bubbler/t/dbus/bus",
+                "--filter",
+            ]
+        );
     }
 
     /// Each bus's address, socket and options carry the node that granted
@@ -1061,8 +1180,11 @@ mod tests {
         let argv = proxy_command_nodes(
             Path::new(PROXY_BIN),
             &p,
-            Some(Path::new("/run/user/1000/bus")),
-            Some(Path::new(SYSTEM_BUS_PATH)),
+            HostBuses {
+                session: Some(Path::new("/run/user/1000/bus")),
+                system: Some(Path::new(SYSTEM_BUS_PATH)),
+                a11y: None,
+            },
             Path::new("/run/user/1000/bubbler/t"),
             false,
             OsStr::new("4"),
@@ -1103,8 +1225,11 @@ mod tests {
             strs(&proxy_command(
                 Path::new(PROXY_BIN),
                 &p,
-                None,
-                Some(Path::new(SYSTEM_BUS_PATH)),
+                HostBuses {
+                    session: None,
+                    system: Some(Path::new(SYSTEM_BUS_PATH)),
+                    a11y: None,
+                },
                 Path::new("/run/user/1000/bubbler/t"),
                 false,
                 OsStr::new("4"),
@@ -1162,8 +1287,11 @@ mod tests {
             strs(&proxy_command(
                 Path::new(PROXY_BIN),
                 &p,
-                Some(Path::new("/run/user/1000/bus")),
-                Some(Path::new(SYSTEM_BUS_PATH)),
+                HostBuses {
+                    session: Some(Path::new("/run/user/1000/bus")),
+                    system: Some(Path::new(SYSTEM_BUS_PATH)),
+                    a11y: None,
+                },
                 Path::new("/run/user/1000/bubbler/t"),
                 true,
                 OsStr::new("4"),
