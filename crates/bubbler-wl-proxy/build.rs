@@ -6,10 +6,14 @@
 //!
 //! The packages are located through `cargo metadata`, so the XML always comes
 //! from the exact versions Cargo.lock pins.
+//!
+//! XML this parser cannot read, and two stable files that describe one
+//! interface differently, fail the build on purpose: the remedy is to pin the
+//! `wayrs-*` versions, not to let the proxy guess which layout a client meant.
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -89,25 +93,38 @@ fn main() {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let parsed = parse_file(file, &source);
         let mut conflict = None;
-        let mut newer: Vec<&str> = Vec::new();
-        for (name, iface) in &parsed {
-            let Some(old) = ifaces.get(name) else {
-                continue;
-            };
-            let (kept, dropped) = if iface.version > old.version {
-                (iface, old)
-            } else {
-                (old, iface)
-            };
-            if !supersedes(kept, dropped) {
-                conflict.get_or_insert(format!(
-                    "{name} v{} is not the same protocol as v{} from {}",
-                    iface.version, old.version, old.source
-                ));
-            } else if !identical(old, iface) {
-                newer.push(name);
+        let mut kept: Vec<(String, String)> = Vec::new();
+        // The file is folded into its own map first: one XML file may name an
+        // interface twice, and that copy passes the same test as any other.
+        let mut own: BTreeMap<String, Iface> = BTreeMap::new();
+        for (name, iface) in parse_file(file, &source) {
+            match own.get(&name) {
+                None => {
+                    own.insert(name, iface);
+                }
+                Some(old) => match check(&name, old, &iface) {
+                    Err(why) => {
+                        conflict.get_or_insert(why);
+                    }
+                    Ok(note) => {
+                        let takes = iface.version > old.version;
+                        kept.extend(note);
+                        if takes {
+                            own.insert(name, iface);
+                        }
+                    }
+                },
+            }
+        }
+        for (name, iface) in &own {
+            if let Some(old) = ifaces.get(name) {
+                match check(name, old, iface) {
+                    Err(why) => {
+                        conflict.get_or_insert(why);
+                    }
+                    Ok(note) => kept.extend(note),
+                }
             }
         }
         // Two files that describe one interface differently cannot both be
@@ -121,13 +138,16 @@ fn main() {
             println!("cargo:warning={source} dropped whole: {why}");
             continue;
         }
-        if !newer.is_empty() {
+        if !kept.is_empty() {
+            let names: Vec<&str> = kept.iter().map(|(name, _)| name.as_str()).collect();
+            let from: BTreeSet<&str> = kept.iter().map(|(_, from)| from.as_str()).collect();
             println!(
-                "cargo:warning={source}: kept the newer copy of {}",
-                newer.join(", ")
+                "cargo:warning=kept {} from {}, dropped the copy in {source}",
+                names.join(", "),
+                from.into_iter().collect::<Vec<_>>().join(" and ")
             );
         }
-        for (name, iface) in parsed {
+        for (name, iface) in own {
             if ifaces
                 .get(&name)
                 .is_none_or(|old| iface.version > old.version)
@@ -200,14 +220,46 @@ fn package_dir(meta: &str, name: &str) -> PathBuf {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    if base != format!("{name}-{version}") {
+    // The package's own manifest is the authority; the directory name is the
+    // fallback, because a vendored crate or a path dependency sits in a
+    // directory named after the package alone, or after nothing in particular.
+    let named = manifest_field(&manifest, "name").as_deref() == Some(name);
+    let versioned = manifest_field(&manifest, "version").as_deref() == Some(version.as_str());
+    let plausible = base == format!("{name}-{version}") || base == name;
+    if !((named && versioned) || plausible) {
         die(format!(
-            "{name}: `cargo metadata` gave {}, which is not {name}-{version}; the metadata \
-             field order changed and the scan in build.rs must be replaced",
-            dir.display()
+            "{name}: `cargo metadata` gave {}, whose manifest is not {name} {version}; the \
+             metadata field order changed and the scan in build.rs must be replaced",
+            manifest.display()
         ));
     }
     dir
+}
+
+/// The `[package]` value of `key` in a Cargo.toml, read line by line — enough
+/// for `name` and `version`, and no TOML parser in the build graph. `None`
+/// when the file cannot be read or inherits the value from a workspace.
+fn manifest_field(manifest: &Path, key: &str) -> Option<String> {
+    let text = fs::read_to_string(manifest).ok()?;
+    let mut in_package = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(key)
+            && let Some(rest) = rest.trim_start().strip_prefix('=')
+            && let Some(rest) = rest.trim_start().strip_prefix('"')
+            && let Some(end) = rest.find('"')
+        {
+            return Some(rest[..end].to_owned());
+        }
+    }
+    None
 }
 
 /// Decode the JSON string that starts at `s`, just past its opening quote.
@@ -273,19 +325,41 @@ fn parse_file(file: &Path, source: &str) -> Vec<(String, Iface)> {
 }
 
 /// Whether `kept` can stand in for `dropped` on the wire: no fewer messages,
-/// and the same name and arguments at every opcode `dropped` uses. Anything
-/// else is two protocols wearing one name.
+/// and the very same message — name, `since`, arguments and the interface it
+/// creates — at every opcode `dropped` uses. Anything else is two protocols
+/// wearing one name, and a divergence in what a message creates would put the
+/// wrong interface on a new object id.
 fn supersedes(kept: &Iface, dropped: &Iface) -> bool {
     fn prefix(kept: &[Msg], dropped: &[Msg]) -> bool {
         kept.len() >= dropped.len()
             && kept
                 .iter()
                 .zip(dropped)
-                .all(|(kept, dropped)| kept.name == dropped.name && kept.args == dropped.args)
+                .all(|(kept, dropped)| kept == dropped)
     }
     kept.version >= dropped.version
         && prefix(&kept.requests, &dropped.requests)
         && prefix(&kept.events, &dropped.events)
+}
+
+/// Compare two copies of the interface `name`.
+///
+/// `Err` is a conflict: neither copy may stand for the other. `Ok` carries the
+/// name and the file of the copy that is kept, and only when the two differ —
+/// an identical copy is not worth a word.
+fn check(name: &str, old: &Iface, new: &Iface) -> Result<Option<(String, String)>, String> {
+    let (kept, dropped) = if new.version > old.version {
+        (new, old)
+    } else {
+        (old, new)
+    };
+    if !supersedes(kept, dropped) {
+        return Err(format!(
+            "{name} v{} from {} is not the same protocol as v{} from {}",
+            dropped.version, dropped.source, kept.version, kept.source
+        ));
+    }
+    Ok((!identical(old, new)).then(|| (name.to_owned(), kept.source.clone())))
 }
 
 /// Whether two copies of an interface would generate the same table, in which

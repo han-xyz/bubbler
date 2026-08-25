@@ -289,11 +289,14 @@ mod tests {
     #[test]
     fn a_string_is_nul_terminated_and_padded_to_a_word() {
         let three = encode(1, 0, &[Arg::String(cstr("abc"))]).expect("encodes");
-        assert_eq!(&three[HEADER..], &[4, 0, 0, 0, b'a', b'b', b'c', 0]);
+        assert_eq!(
+            &three[HEADER..],
+            &[&4u32.to_ne_bytes()[..], b"abc\0"].concat()
+        );
         let four = encode(1, 0, &[Arg::String(cstr("abcd"))]).expect("encodes");
         assert_eq!(
             &four[HEADER..],
-            &[5, 0, 0, 0, b'a', b'b', b'c', b'd', 0, 0, 0, 0]
+            &[&5u32.to_ne_bytes()[..], b"abcd\0\0\0\0"].concat()
         );
         assert_eq!(
             decode(&four, &[ArgKind::String]).expect("decodes").0,
@@ -304,13 +307,13 @@ mod tests {
     #[test]
     fn a_null_string_and_an_empty_array_are_a_bare_length() {
         let null = encode(1, 0, &[Arg::String(None)]).expect("encodes");
-        assert_eq!(&null[HEADER..], &[0, 0, 0, 0]);
+        assert_eq!(&null[HEADER..], &0u32.to_ne_bytes());
         assert_eq!(
             decode(&null, &[ArgKind::String]).expect("decodes").0,
             vec![Arg::String(None)]
         );
         let empty = encode(1, 0, &[Arg::Array(Vec::new())]).expect("encodes");
-        assert_eq!(&empty[HEADER..], &[0, 0, 0, 0]);
+        assert_eq!(&empty[HEADER..], &0u32.to_ne_bytes());
         assert_eq!(
             decode(&empty, &[ArgKind::Array]).expect("decodes").0,
             vec![Arg::Array(Vec::new())]
@@ -320,7 +323,10 @@ mod tests {
     #[test]
     fn an_array_is_padded_but_keeps_its_length() {
         let odd = encode(1, 0, &[Arg::Array(vec![9, 8, 7])]).expect("encodes");
-        assert_eq!(&odd[HEADER..], &[3, 0, 0, 0, 9, 8, 7, 0]);
+        assert_eq!(
+            &odd[HEADER..],
+            &[&3u32.to_ne_bytes()[..], &[9, 8, 7, 0]].concat()
+        );
         assert_eq!(
             decode(&odd, &[ArgKind::Array]).expect("decodes").0,
             vec![Arg::Array(vec![9, 8, 7])]
@@ -406,10 +412,13 @@ mod tests {
         let bytes = encode(2, 0, &args).expect("encodes");
         // Header, then the new id and the size: the fd takes no wire bytes.
         assert_eq!(bytes.len(), HEADER + 8);
-        assert_eq!(
-            bytes,
-            vec![2, 0, 0, 0, 0, 0, 16, 0, 3, 0, 0, 0, 0, 16, 0, 0]
-        );
+        // Object 2; size 16 in the word's high half, opcode 0 in its low
+        // half; then the new id and the pool size.
+        let want: Vec<u8> = [2u32, 16 << 16, 3, 4096]
+            .iter()
+            .flat_map(|word| word.to_ne_bytes())
+            .collect();
+        assert_eq!(bytes, want);
         let (got, used) = decode(&bytes, create_pool.args).expect("decodes");
         assert_eq!(got, args);
         assert_eq!(used, bytes.len());

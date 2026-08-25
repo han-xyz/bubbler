@@ -10,9 +10,11 @@
 //!
 //! `wl_display.delete_id` names client ids only, so an id from the server's
 //! range leaves the map only when the server reuses it. The relay must not
-//! wait for such an id to disappear, and the cap does not count server-range
-//! zombies: how many there are is the compositor's decision, not the
-//! sandboxed client's.
+//! wait for such an id to disappear, and the live cap does not count
+//! server-range zombies: how many there are is the compositor's decision.
+//! It is the client's doing that they exist at all, though — every server
+//! object answers a request the client made — so those zombies have a cap of
+//! their own, and the map is bounded either way.
 
 use std::collections::hash_map::Entry as MapEntry;
 use std::collections::{HashMap, HashSet};
@@ -27,8 +29,11 @@ pub const SERVER_ID_BASE: u32 = 0xFF00_0000;
 
 /// Most objects one connection may have mapped at once, counting every client
 /// id and every live server id. A client picks its own ids, so without a cap
-/// it also picks how much memory the proxy spends on it; server-range zombies
-/// are left out of the count because only the compositor creates them.
+/// it also picks how much memory the proxy spends on it.
+///
+/// Server-range zombies are counted separately against the same number, since
+/// only the compositor decides when it reuses one of its ids; the map
+/// therefore holds at most twice this many entries.
 pub const MAX_OBJECTS: usize = 1 << 16;
 
 /// Why an id could not be recorded. Each one means the connection has stopped
@@ -67,7 +72,7 @@ pub enum ObjectError {
     #[error("global {0} is hidden from this connection")]
     HiddenGlobal(u32),
     /// The cap on mapped objects is reached.
-    #[error("more than {MAX_OBJECTS} objects are mapped")]
+    #[error("more than {MAX_OBJECTS} objects are mapped, or as many are dead server ids")]
     TooManyObjects,
 }
 
@@ -151,7 +156,9 @@ impl Objects {
                 slot.insert(entry);
                 Ok(())
             }
-            MapEntry::Vacant(_) if live >= MAX_OBJECTS => Err(ObjectError::TooManyObjects),
+            MapEntry::Vacant(_) if live >= MAX_OBJECTS || self.server_zombies >= MAX_OBJECTS => {
+                Err(ObjectError::TooManyObjects)
+            }
             MapEntry::Vacant(slot) => {
                 slot.insert(entry);
                 Ok(())
@@ -170,7 +177,10 @@ impl Objects {
             .and_then(|entry| tables::by_index(entry.interface))
     }
 
-    /// How many ids are mapped, zombies included: what the cap counts.
+    /// How many ids are mapped, zombies included. This is not what the cap
+    /// counts: [`MAX_OBJECTS`] bounds the live objects (every client id plus
+    /// every server id that is not a zombie) and, separately, the server-range
+    /// zombies, so this can reach twice that.
     pub fn len(&self) -> usize {
         self.map.len()
     }
@@ -548,7 +558,7 @@ mod tests {
             )
             .expect("the device");
         let offer = event("wl_data_device", "data_offer");
-        for n in 0..MAX_OBJECTS as u32 {
+        for n in 0..MAX_OBJECTS as u32 - 1 {
             let id = SERVER_ID_BASE + n;
             objects
                 .new_id_from(false, 4, offer, &[Arg::NewId(id)])
@@ -559,6 +569,27 @@ mod tests {
         // The client's own ids still fit: how many dead offers the compositor
         // leaves behind is not the sandboxed client's doing.
         assert_eq!(objects.bind(1, index("wl_compositor"), 1, 5), Ok(()));
+        // They are not unbounded either. One more dead offer fills the second
+        // cap, and the next object of any kind is refused.
+        let last = SERVER_ID_BASE + MAX_OBJECTS as u32;
+        objects
+            .new_id_from(false, 4, offer, &[Arg::NewId(last)])
+            .expect("one more offer");
+        assert!(objects.destroy(last));
+        assert_eq!(
+            objects.new_id_from(false, 4, offer, &[Arg::NewId(last + 1)]),
+            Err(ObjectError::TooManyObjects)
+        );
+        assert_eq!(
+            objects.bind(1, index("wl_compositor"), 1, 6),
+            Err(ObjectError::TooManyObjects)
+        );
+        // Reusing a dead id is still allowed: it frees the slot it holds.
+        assert_eq!(
+            objects.new_id_from(false, 4, offer, &[Arg::NewId(last)]),
+            Ok(Some(last))
+        );
+        assert_eq!(objects.bind(1, index("wl_compositor"), 1, 6), Ok(()));
     }
 
     #[test]
