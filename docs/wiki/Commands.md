@@ -49,4 +49,6 @@ bubbler man [--config]                  bubbler(1) / bubbler-config(5) as roff o
 - Environment: `HOME` and `XDG_RUNTIME_DIR` must be set. `BUBBLER_PROFILE_DIR`
   replaces the system profile layer; `BUBBLER_DBUS_LOG=1` logs every filtered
   D-Bus message; `BUBBLER_SECCOMP_LOG=1` logs denied syscalls instead of
-  denying them (for profile writing only).
+  denying them (for profile writing only). With `a11y`, `AT_SPI_BUS_ADDRESS`
+  is where bubbler looks for the accessibility bus before it asks
+  `org.a11y.Bus` with `dbus-send`.

@@ -86,7 +86,9 @@ Build needs Rust 1.95+ and `libseccomp` (2.5.4+). Runtime: `bubblewrap` and a
 kernel with user namespaces; `xdg-dbus-proxy` for `dbus`/`system-bus`;
 `passt` (pasta) for an isolated `network`; `nftables` for `outbound "deny"`;
 `xdg-desktop-portal` with a backend for `portals` and `camera`;
-`xorg-xwayland` for the X server a bare `x11` runs inside the sandbox.
+`xorg-xwayland` for the X server a bare `x11` runs inside the sandbox;
+`at-spi2-core` and the `dbus` package's `dbus-send` for `a11y`, and fcitx5 or
+IBus running for `input-method` to reach anything.
 See [Getting Started](docs/wiki/Getting-Started.md).
 
 ## What it is not

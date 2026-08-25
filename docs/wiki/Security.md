@@ -60,9 +60,12 @@ with `lint-allow "wayland-host" reason="…"`. No shipped profile grants it.
 
 `--dry-run` and `--explain` never talk to the compositor: they assume the
 security context and print it, so the argv they show is what a run builds where
-the protocol is there. `x11 "host"` bypasses all of it — those X clients reach a
-server which is a client of your session, not of this socket. A bare `x11` does
-not: the Xwayland it starts is a client of this one, like anything else inside.
+the protocol is there. One thing an explanation does ask for: `--explain
+--proxy` on an `a11y` config resolves the accessibility bus address, which is
+part of the proxy argv it prints. `x11 "host"` bypasses all
+of it — those X clients reach a server which is a client of your session, not
+of this socket. A bare `x11` does not: the Xwayland it starts is a client of
+this one, like anything else inside.
 
 ## X11
 
@@ -114,6 +117,45 @@ The X SECURITY extension's untrusted mode is not offered as a third choice: an
 untrusted client is granted `XC-MISC` and `BIG-REQUESTS` and nothing else
 (`SecurityTrustedExtensions`, xserver `Xext/security.c`), which leaves no GLX,
 no XInput and no MIT-SHM for an application to draw with.
+
+## Accessibility bus
+
+The raw AT-SPI bus is X11-class. It is a peer bus with no per-client policy,
+and its registry offers every client on it `RegisterKeystrokeListener` — every
+keystroke of every accessible application, which is how a screen reader's
+global shortcuts work — `GenerateKeyboardEvent` and `GenerateMouseEvent`, which
+inject input into your session, and the desktop object tree, which is every
+other application's widgets and text. Binding that socket into a sandbox would
+hand it the session's input.
+
+`a11y` binds a filtered socket instead. The instance's one `xdg-dbus-proxy`
+serves the accessibility bus as a third address behind its own `--filter`, with
+[nine fixed rules](D-Bus.md#accessibility-bus) and nothing from the config: the
+application embeds itself in the registry, unembeds, reads back which events
+are registered, and notifies listeners of its own. None of the calls above is
+among them. What the assistive tool does back to the sandbox needs no rule at
+all — a call *into* it is incoming, and `xdg-dbus-proxy` filters what the
+client sends.
+
+Measured here, inside a `dbus a11y` sandbox: `Registry.GetRegisteredEvents` and
+`DeviceEventController.GetKeystrokeListeners` answer, while
+`RegisterKeystrokeListener` and `GenerateKeyboardEvent` come back
+`Error org.freedesktop.DBus.Error.AccessDenied` from the proxy.
+
+The grant is still real in the other direction, and that is its point: an
+assistive tool on the host reads this application's widgets and text. Grant it
+where a screen reader has to work, not by default.
+
+## Input methods
+
+`input-method` grants the two portal names, `org.freedesktop.portal.Fcitx` and
+`org.freedesktop.portal.IBus`, which carry the per-client text-input interface
+only. The IM daemon receives the keys typed into this application's text
+fields — that is what an input method is — and the sandbox is one more client
+of it. The daemons' own names are not granted: those carry `Exit`, `Restart`,
+`SetConfig`, `SetCurrentIM` and `SetAddonsState`, which reconfigure or stop the
+input method for every application in the session. On Wayland the compositor's
+own text-input path needs no grant at all.
 
 ## Seccomp
 
@@ -172,7 +214,8 @@ host).
 - `x11 "host"`: no isolation between the X clients on your display, and no
   Wayland security context on the session's Xwayland. The nested default runs
   without a window manager.
-- No accessibility bus.
+- `input-method` has never been exercised against a running fcitx5 or IBus:
+  neither is installed on this machine.
 - AMD compute (`/dev/kfd` + sysfs topology) unsupported; NVIDIA compute needs
   `etc-share "OpenCL"`/`"nvidia"`.
 - `hidraw` and `camera nodes=#true` device lists are frozen at launch.

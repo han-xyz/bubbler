@@ -14,10 +14,11 @@ Status: milestone 10 — a library of 14 profiles (`alacritty`, `chromium`,
 `mpv`, `spotify`, `steam`, `thunderbird`, `vesktop`) over GPU, sound, a private
 home, host paths through `path-share`, a runtime directory shared between
 sandboxes through `app-runtime`, game controllers through `gamepad`, a camera
-through the portal, a filtered session and system bus with portals,
-notifications and `tray`, a terminal of their own, a network namespace of their
-own through pasta with outbound filtering through an nftables ruleset installed
-in it, and a seccomp filter that covers 32-bit binaries as well as 64-bit.
+through the portal, a filtered session, system and accessibility bus with
+portals, notifications, `tray` and input methods, a terminal of their own, a
+network namespace of their own through pasta with outbound filtering through an
+nftables ruleset installed in it, and a seccomp filter that covers 32-bit
+binaries as well as 64-bit.
 Profiles come in three layers — yours, the system's, built-in — and compose
 with `include`. `bubbler lint` measures a profile or an instance config
 against what a sandbox is meant to give away, and `--dry-run --explain` puts
@@ -148,12 +149,13 @@ but no isolated network namespace at all.
 `try` runs one command in a sandbox without creating an instance. Its config is
 the flattened profile (`generic` unless `--profile` says otherwise) plus one
 bare node per `--grant`; the grants are `wayland`, `x11`, `network`, `dri`,
-`pipewire`, `pulseaudio`, `dbus`, `portals`, `notify`, `tray`, `gamepad`,
-`hidraw` and `camera`, and anything with arguments needs a real instance —
-`system-bus` among them, since it is not a grant without rules. The bundles are
-checked as they are in a config file, so `--grant tray` without `--grant dbus`
-is refused rather than silently dropped, and `--grant camera` needs
-`--grant portals` (and the `--grant dbus` that carries it) the same way.
+`pipewire`, `pulseaudio`, `dbus`, `portals`, `notify`, `tray`, `a11y`,
+`input-method`, `gamepad`, `hidraw` and `camera`, and anything with arguments
+needs a real instance — `system-bus` among them, since it is not a grant
+without rules. The bundles are checked as they are in a config file, so
+`--grant tray` without `--grant dbus` is refused rather than silently dropped,
+and `--grant camera` needs `--grant portals` (and the `--grant dbus` that
+carries it) the same way.
 `--grant x11` needs `--grant wayland --grant dri`, without which the X server
 it starts inside has nothing to draw in or with. A
 grant the profile already made is not repeated, properties and all:
@@ -363,6 +365,8 @@ file order does not affect the generated argv.
     notify                           # talk to org.freedesktop.Notifications
     tray                             # talk to org.kde.StatusNotifierWatcher
     mpris name="firefox.*"           # own org.mpris.MediaPlayer2.firefox.*
+    a11y                             # the accessibility bus, through the proxy
+    input-method                     # the fcitx5 and IBus portal names
     tty "pty"                        # terminal: "pty", "passthrough" or "none"
     userns "allow"                   # nested user namespaces: "allow" or "disable"
     seccomp {                        # changes to the default syscall denylist
@@ -531,7 +535,10 @@ result.
 assumes the security context: the bind source is the instance's own socket, and
 under `--explain` its group carries a `security-context:` line naming the three
 strings. A real run is the only thing that probes, and the only thing that
-falls back.
+falls back. An explanation asks nothing of anything, with one exception: on a
+config with `a11y`, `--explain --proxy` prints the proxy's argv, and the
+accessibility bus address is part of that argv, so it is resolved the way a run
+resolves it — see "The accessibility bus".
 
 `x11 "host"` bypasses all of it. Those clients speak the X protocol to a server
 which is itself an ordinary client of your session, connected on the session's
@@ -1199,9 +1206,9 @@ rather than the last layer deciding both, `dbus` and `system-bus` rules and
 `seccomp` lists are unioned, and `seccomp { disable }` in any layer disables
 the filter. One bus name may not end up with two policies — `talk` in one
 layer and `see` in another — which is an error naming the name, as it is
-inside a single node. `portals`, `notify`, `tray` and `mpris` need `dbus` in
-the merged result, not in every layer, so a layer may add `notify` to a
-`dbus` it includes.
+inside a single node. `portals`, `notify`, `tray`, `mpris`, `a11y` and
+`input-method` need `dbus` in the merged result, not in every layer, so a layer
+may add `notify` to a `dbus` it includes.
 
 `create` and `try` write the flattened result, so `config.kdl` is one screen
 that says everything the sandbox will be granted. Flattening keeps no
@@ -1656,8 +1663,8 @@ name no layer holds. `--deny warnings` turns 1 into 2 for CI. "Does not parse"
 is deliberately a different code from "grants too much".
 
 **Errors** say the file will not do what it says: `bundle-without-dbus` (a
-`portals`/`notify`/`tray`/`mpris` bundle no layer gives a `dbus` to carry),
-`path-share-reserved` (a root bubbler never shares),
+`portals`/`notify`/`tray`/`mpris`/`a11y`/`input-method` grant no layer gives a
+`dbus` to carry), `path-share-reserved` (a root bubbler never shares),
 `dup-name-policy` (one bus name given two policies by two layers),
 `own-on-system-bus`, `camera-without-portals` (a `camera` grant no layer gives
 a `portals` to carry, so the portal reads the sandbox as an ordinary process
@@ -1768,8 +1775,9 @@ The host bus is `$DBUS_SESSION_BUS_ADDRESS` when it is set, else
 holding a transport bubbler cannot bind — `tcp:`, `unix:abstract=` — fails the
 run naming the variable instead of falling back to the default socket, which
 would filter a bus the session is not on; unset or empty is that default.
-Everything the sandbox may reach is a rule: the `dbus` children above, plus the bundles
-`portals`, `notify`, `tray` and `mpris`, each of which needs `dbus`.
+Everything the sandbox may reach is a rule: the `dbus` children above, plus the
+bundles `portals`, `notify`, `tray`, `mpris` and `input-method`, and the `a11y`
+grant whose rules are on a bus of its own — each of which needs `dbus`.
 `portals` also puts a `/.flatpak-info` in the sandbox giving it the
 application id `org.bubbler.<name>`, which is what portals and the proxy
 identify it by. A `.` in the name becomes `_`, since only the last element
@@ -1877,6 +1885,146 @@ one, so `talk "org.freedesktop.*"` matches `org.freedesktop.UPower` but not
 `org.freedesktopFoo`. And filtering applies to outgoing calls and signals and
 to incoming broadcasts only: a call *from* a system daemon into the sandbox
 needs no rule.
+
+### The accessibility bus
+
+`a11y` grants the session's accessibility bus, the one AT-SPI runs on: it is
+how a screen reader, a magnifier or an on-screen keyboard reads an
+application, and without it a sandbox is invisible to them. archwiki
+Accessibility says a Gtk-, Qt- or Gecko-based application "should work out of
+the box" and appear in `accerciser` "with a deeply nested tree structure of
+children"; a sandbox without this grant cannot appear there at all, since
+nothing binds that socket and the session proxy has no rule for it.
+
+Handing the sandbox that bus as it stands would be the same mistake as binding
+the session's X11 socket. It is a peer bus with no per-client policy, and what
+is on it is offered to whatever connects: at-spi2-core's `DeviceEventController`
+carries `RegisterKeystrokeListener`, which is how a screen reader's global keys
+work and which is every keystroke of every accessible application in the
+session, and `GenerateKeyboardEvent` and `GenerateMouseEvent`, which type and
+click into that session; the registry and the desktop object tree behind it are
+every other application's widgets, labels and text.
+
+So it is proxied like the other two buses, and by the same process. The
+accessibility bus is a **third address** on the instance's one
+`xdg-dbus-proxy`: an option applies to the address before it
+(`xdg-dbus-proxy(1)`), so that address gets a `--filter` of its own and rules
+of its own, and nothing of this grant lands on the session bus. The rules are
+fixed — the node takes no children — because there is no other subset of that
+bus worth offering:
+
+    --call=org.a11y.atspi.Registry=org.a11y.atspi.Socket.Embed@/org/a11y/atspi/accessible/root
+    --call=org.a11y.atspi.Registry=org.a11y.atspi.Socket.Unembed@/org/a11y/atspi/accessible/root
+    --call=org.a11y.atspi.Registry=org.a11y.atspi.Registry.GetRegisteredEvents@/org/a11y/atspi/registry
+    --call=org.a11y.atspi.Registry=org.a11y.atspi.DeviceEventController.GetKeystrokeListeners@/org/a11y/atspi/registry/deviceeventcontroller
+    --call=org.a11y.atspi.Registry=org.a11y.atspi.DeviceEventController.GetDeviceEventListeners@/org/a11y/atspi/registry/deviceeventcontroller
+    --call=org.a11y.atspi.Registry=org.a11y.atspi.DeviceEventController.NotifyListenersSync@/org/a11y/atspi/registry/deviceeventcontroller
+    --call=org.a11y.atspi.Registry=org.a11y.atspi.DeviceEventController.NotifyListenersAsync@/org/a11y/atspi/registry/deviceeventcontroller
+    --broadcast=org.a11y.atspi.Registry=org.a11y.atspi.Registry.EventListenerRegistered@/org/a11y/atspi/registry
+    --broadcast=org.a11y.atspi.Registry=org.a11y.atspi.Registry.EventListenerDeregistered@/org/a11y/atspi/registry
+
+That is the application registering itself with the registry, unregistering,
+reading back which events are registered so a toolkit knows whether to emit
+them, and notifying the listeners that exist. Every destination but the
+registry is refused, which is what keeps the sandbox away from the other
+applications on that bus, and the two `Register`/`Generate` families above are
+not in the list at all. What the assistive tool does in the other direction
+needs no rule: a call *into* the sandbox is incoming, and `xdg-dbus-proxy`
+filters only what the client sends — the property `tray` already relies on.
+
+The bus is found the way at-spi2's own clients find it: `$AT_SPI_BUS_ADDRESS`
+if the session set one, else `org.a11y.Bus.GetAddress` on the session bus,
+asked with `dbus-send` (the `dbus` package) spawned with one argument per
+element and no shell anywhere, and the reply read for its one `string "…"`
+line. Asking in that order means the bus bubbler proxies is the one the
+applications on this host are already on. The address has to be a `unix:path=`
+one: at-spi's launcher can report a `unix:abstract=` address instead, and the
+proxy's own sandbox has no host network namespace, so there would be nothing
+there to connect to — that is refused with a message saying so, as `tcp:` is on
+the other two buses. Every failure — no `dbus-send` on `PATH`, no
+`org.a11y.Bus` answering, an answer that is not a socket path — stops the run
+naming the step rather than dropping the grant: a socket with no bus behind it
+looks to the application like a broken toolkit and to you like a sandbox that
+quietly gave less than the config asked for. The address itself is never echoed
+back in an error, being host input like any other.
+
+Inside the sandbox the filtered socket is bound read-only at
+`$XDG_RUNTIME_DIR/at-spi/bus` and `AT_SPI_BUS_ADDRESS` is set to `unix:path=`
+that path, which is what every at-spi2 client reads before it asks any bus for
+an address. The host's own accessibility socket is bound only into the proxy's
+sandbox, never into the application's.
+
+`--dry-run` and a plain `--explain` still speak to nothing: they print the bind
+of the socket the sidecar would serve, which does not exist yet either way.
+`--explain --proxy` is the exception — the argv it prints for the proxy is
+built *from* the host address, so it resolves that address the way a run would,
+and on a session with no `org.a11y.Bus` it fails instead of printing a
+placeholder.
+
+Measured here, inside a `dbus a11y` sandbox on a session running at-spi2:
+`Registry.GetRegisteredEvents` and `DeviceEventController.GetKeystrokeListeners`
+answer with an empty array, while
+`DeviceEventController.RegisterKeystrokeListener` and
+`DeviceEventController.GenerateKeyboardEvent` come back
+`Error org.freedesktop.DBus.Error.AccessDenied` — the proxy's refusal, before
+the registry sees them.
+
+To check the grant on your own desktop, install `accerciser` and look for the
+sandboxed application's tree in it (archwiki Accessibility). Two kinds of
+application need more than the grant, and both are the profile's business
+rather than bubbler's: a Chromium- or Electron-based one needs the environment
+variable `ACCESSIBILITY_ENABLED=1` and the argument
+`--force-renderer-accessibility`, and a Java one needs the ATK bridge
+installed (archwiki Accessibility). `env` and `command` are where those go.
+
+### Input methods
+
+`input-method` is the D-Bus half of typing through fcitx5 or IBus. It grants
+two session-bus rules, `--talk=org.freedesktop.portal.Fcitx` and
+`--talk=org.freedesktop.portal.IBus`, and sets `IBUS_USE_PORTAL=1` in the
+sandbox. Both names are granted whichever daemon the session runs, since the
+grant costs nothing where the name has no owner: the Qt and GTK client
+libraries watch for their portal name and use it when the daemon's own name is
+not visible, which is exactly what the proxy's name filtering leaves them, and
+the IBus client library takes the portal when `IBUS_USE_PORTAL` is set.
+
+Those two names are the daemons' sandboxed entry points, and they carry the
+per-client text-input interface and nothing else. The daemons' own names are
+deliberately not granted: fcitx5's carries `Exit`, `Restart`, `SetConfig`,
+`SetAddonsState`, `SetCurrentIM`, `SetLogRule` and `OpenWaylandConnection` —
+reconfiguring or stopping the input method for every application in the
+session, which is tampering and denial of service rather than keylogging, since
+an input context belongs to one client.
+
+On Wayland the grant is often unnecessary. archwiki Fcitx5 "Wayland": the
+native *text-input* protocol "usually yields better results than input method
+modules", GTK and Qt "utilize *text-input* if no other IM module is explicitly
+specified", and so it is "generally recommended to only use IM modules in
+Xwayland applications". That path is the compositor's and needs nothing from
+bubbler. The bus path is for the rest: an Xwayland client (a bare `x11` starts
+one inside), an application with an IM module set, or a *text-input-v1* client
+where the compositor speaks v3.
+
+bubbler sets no IM-module variable itself, because which one is right depends
+on the application and the toolkit, and a wrong one takes away the working
+Wayland path. A profile sets them with `env`. archwiki Fcitx5 "IM modules"
+gives `GTK_IM_MODULE=fcitx` and `QT_IM_MODULE=fcitx`, "globally if using X11"
+or "for each Xwayland application" on a Wayland compositor with *text-input*
+support, plus `SDL_IM_MODULE=fcitx` for "some games that use a specific version
+of the SDL2 library":
+
+    input-method
+    env GTK_IM_MODULE="fcitx"
+    env QT_IM_MODULE="fcitx"
+    env SDL_IM_MODULE="fcitx"
+
+archwiki IBus "Integration" gives `GTK_IM_MODULE=wayland`, `QT_IM_MODULE=ibus`
+and `XMODIFIERS=@im=ibus` for a Wayland session, and `GTK_IM_MODULE=ibus` with
+the same two for X11. `env` is emitted after every variable a grant sets, so a
+profile layers these on top; `AT_SPI_BUS_ADDRESS` and `IBUS_USE_PORTAL` are not
+in the reserved list either, and a profile that sets them replaces what the
+grant set, which for the accessibility bus is a path the sandbox has nothing
+bound at.
 
 ## Terminal
 
@@ -2168,7 +2316,11 @@ none of its own.
 
 ## Known gaps
 
-- No accessibility bus.
+- The `input-method` grant has never been exercised against a running input
+  method: neither fcitx5 nor IBus is installed on this machine. What is proven
+  inside a real sandbox is the proxy's half — the daemons' own names have no
+  owner there, the two portal names resolve, and `IBUS_USE_PORTAL=1` is in the
+  environment — and no daemon has ever answered. See "Input methods".
 - Descriptors handed to a command through `exec` are reachable by the
   sandboxed application through `/proc` — exec is a convenience channel, not
   a boundary. What the sandbox can still do with the terminal it is given is
@@ -2221,10 +2373,11 @@ which together with the shim directory below is all bubbler ever writes to
 outside its own state. Every
 run except a dry run or an explanation also creates
 `$XDG_RUNTIME_DIR/bubbler/<name>/`, mode 0700, reusing one left over from an
-earlier run, and binds the control socket `init.sock` in it; a `dbus` or
-`system-bus` grant adds the subdirectory
-`dbus/` the proxy creates its sockets in and the checked socket `bus` and/or
-`system` beside it, and a `portals` grant adds
+earlier run, and binds the control socket `init.sock` in it; a `dbus`,
+`system-bus` or `a11y` grant adds the subdirectory
+`dbus/` the proxy creates its sockets in and the checked sockets `bus`,
+`system` and `a11y` — one per granted bus — beside it, and a `portals` grant
+adds
 `$XDG_RUNTIME_DIR/.flatpak/bubbler-<name>/`, creating `.flatpak/` if it is
 missing. Everything a run makes there is removed again when it ends, with one
 exception: an `app-runtime` grant creates `$XDG_RUNTIME_DIR/app/<id>` (and
@@ -2409,7 +2562,10 @@ upgrade. It is the administrator's, and bubbler ships nothing in it.
 
 At runtime bubbler needs `bwrap` (bubblewrap), `xdg-dbus-proxy` for any profile
 with a `dbus` or `system-bus` grant, which is most of them, `pasta` (the
-`passt` package) for an isolated `network`, and `libseccomp`. Portals need
+`passt` package) for an isolated `network`, and `libseccomp`. An `a11y` grant
+also needs `dbus-send`, from the `dbus` package, to ask the session where its
+accessibility bus is, and an accessibility bus to find — `at-spi2-core`. An
+`input-method` grant reaches something only where fcitx5 or IBus is running. Portals need
 `xdg-desktop-portal` and a backend for your desktop; neither is bubbler's to
 start. Nothing here depends on a shell: bubbler ships no completions.
 

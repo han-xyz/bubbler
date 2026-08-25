@@ -81,8 +81,8 @@ included; `wayland` and `x11` replace as well, being one mode each and the
 `x11` window properties with it; `env` replaces by key;
 `dbus`/`system-bus`/`seccomp` lists union;
 `seccomp { disable }` anywhere disables; `outbound "deny"` below cannot be
-undone above. `portals`/`notify`/`tray`/`mpris` need `dbus` in the merged
-result, not in every layer.
+undone above. `portals`/`notify`/`tray`/`mpris`/`a11y`/`input-method` need
+`dbus` in the merged result, not in every layer.
 
 ## Instances and profiles
 

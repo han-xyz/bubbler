@@ -22,7 +22,7 @@ bubbler desktop ff                    # add a menu entry that starts it
 | [Sharing Files](Sharing-Files.md) | `home-share`, `path-share`, `etc-share`, `app-runtime` |
 | [Devices](Devices.md) | GPU, audio, gamepad, hidraw, camera |
 | [Network](Network.md) | Isolated namespace via pasta, inbound ports, outbound filtering |
-| [D-Bus](D-Bus.md) | Session and system bus through `xdg-dbus-proxy`, portals, tray |
+| [D-Bus](D-Bus.md) | Session, system and accessibility bus through `xdg-dbus-proxy`, portals, tray, input methods |
 | [Desktop Entries and Shims](Desktop-Entries-and-Shims.md) | `bubbler desktop`, `bubbler wrap`, `bubbler open` |
 | [Terminal](Terminal.md) | `tty` modes, detaching, the `bubbler-ui` editor |
 | [Lint and Explain](Lint-and-Explain.md) | `bubbler lint`, `lint-allow`, `--dry-run --explain` |

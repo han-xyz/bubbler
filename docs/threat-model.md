@@ -20,6 +20,9 @@ In the order an attacker would want them:
   service, the portal, every application that owns a name.
 - The Wayland or X11 display, the input devices behind it, and the
   clipboard.
+- The accessibility bus: the text and widgets of every accessible
+  application, and the keystroke-listener and input-injection calls its
+  registry offers any client that connects.
 - The host network namespace: loopback services, abstract unix sockets,
   the interface and listening-socket table, VPN tunnels.
 - Other instances — their `config.kdl` (which decides what the *next* run
@@ -328,6 +331,83 @@ bus](manual.md#the-system-bus) ·
 `the_proxy_never_sees_the_instances_control_socket`,
 `real_system_bus_answers_for_the_names_it_grants_and_no_others`,
 `reaching_the_secret_service_is_a_note`
+
+### Accessibility bus
+
+**Defends:** the accessibility bus is proxied, never bound. It is a peer
+bus with no policy of its own, and it offers every client on it
+`RegisterKeystrokeListener` — every keystroke of every accessible
+application, which is how a screen reader's global keys work —
+`GenerateKeyboardEvent` and `GenerateMouseEvent`, which inject input into
+the session, and the object tree of every other application registered on
+it. That is what makes the raw socket the same class of grant as the
+session's X11 one. `a11y` gives the sandbox a third address on the
+instance's own `xdg-dbus-proxy`, behind a `--filter` of its own, carrying
+nine fixed rules and nothing from the config: the application registers
+itself with the AT-SPI registry, unregisters, reads back which events are
+registered, and notifies the listeners that exist. None of the calls
+above is among them, and every destination but the registry is refused.
+Measured inside a `dbus a11y` sandbox against this host's own bus:
+`Registry.GetRegisteredEvents` and
+`DeviceEventController.GetKeystrokeListeners` answer and `Socket.Embed`
+reaches the registry — the error it comes back with is the registry's,
+about an argument `dbus-send` cannot type — while
+`RegisterKeystrokeListener` and `GenerateKeyboardEvent` come back
+`org.freedesktop.DBus.Error.AccessDenied` from the proxy, which the
+registry never sees.
+
+**Does not defend:** the grant itself. An assistive tool on the host
+reads this application's widgets, labels and text — that is what a screen
+reader is, and a call *into* the sandbox is incoming, which
+`xdg-dbus-proxy` does not filter. Nothing here distinguishes Orca from
+anything else running as your uid. The bus address is host input like
+`$DBUS_SESSION_BUS_ADDRESS`: it comes from `$AT_SPI_BUS_ADDRESS` or from
+`org.a11y.Bus`, must be a `unix:path=` socket, and is proxied under these
+rules whatever it names.
+
+[The accessibility bus](manual.md#the-accessibility-bus),
+[D-Bus](manual.md#d-bus) ·
+`real_a11y_lets_the_app_register_and_nothing_else`,
+`a11y_without_dbus_send_on_path_names_the_package`,
+`a11y_dry_run_builds_the_bind_without_asking_any_bus`,
+`a11y_is_a_third_bus_with_the_fixed_allowlist`,
+`the_a11y_bus_is_a_third_address_and_its_rules_follow_its_own_filter`,
+`the_a11y_bus_is_the_third_bus_of_the_one_proxy`,
+`the_a11y_host_socket_is_bound_only_where_that_bus_is_proxied`,
+`a11y_binds_the_proxied_bus_where_at_spi_clients_look_for_it`,
+`an_a11y_section_without_a_host_socket_is_no_bus_at_all`,
+`a11y_without_a_bus_is_refused_rather_than_downgraded`,
+`a_set_at_spi_address_is_the_answer_and_only_a_unix_path_is_one`,
+`an_answer_that_is_no_unix_socket_is_refused_and_never_echoed`,
+`a_bus_that_does_not_answer_is_a_launch_error_naming_the_step`
+
+### Input methods
+
+**Defends:** `input-method` grants the two portal names,
+`org.freedesktop.portal.Fcitx` and `org.freedesktop.portal.IBus`, which
+carry the per-client text-input interface and nothing else. The daemons'
+own names are not granted, and the proxy's name filtering is what makes
+the client libraries fall back to the portal one. Behind the daemon name
+are `Exit`, `Restart`, `SetConfig`, `SetAddonsState`, `SetCurrentIM` and
+`SetLogRule`: reconfiguring or stopping the input method of every
+application in the session.
+
+**Does not defend:** what an input method is. The daemon receives the keys
+typed into this application's text fields, and the sandbox is one more of
+its clients — a compromised application can feed it anything, and a
+compromised daemon reads what is typed into everything it serves,
+sandboxed or not. Contexts are per client, so this is not a path to
+another application's keys. Neither daemon is installed on this host, so
+what is proven inside a real sandbox is that their own names have no
+owner there while the two portal names resolve — not a round trip
+through a running input method.
+
+[Input methods](manual.md#input-methods) ·
+`real_input_method_hides_the_daemons_main_names`,
+`input_method_talks_the_two_portal_names_only`,
+`input_method_is_the_portal_variable_and_no_bind_at_all`,
+`a11y_and_input_method_are_bare_nodes_that_need_dbus`,
+`the_a11y_and_input_method_grants_show_the_rules_they_are`
 
 ### Network
 
