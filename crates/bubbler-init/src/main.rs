@@ -82,6 +82,18 @@ struct Exec {
     stream: UnixStream,
 }
 
+/// The end of the run: whether anything has asked for it, and the moment
+/// whatever ignored SIGTERM is SIGKILLed.
+#[derive(Default)]
+struct Stopping {
+    /// Set by the first stop event and never cleared. From then on no new
+    /// exec'd child is started: one spawned now could only be killed
+    /// moments later, without the SIGTERM every other child was given.
+    asked: bool,
+    /// Cleared once the SIGKILL has gone out.
+    kill_at: Option<Instant>,
+}
+
 /// An accepted connection whose request is still arriving.
 struct Pending {
     stream: UnixStream,
@@ -199,16 +211,27 @@ fn take_ctty(command: &mut Command) {
     }
 }
 
+/// Turn a request down: say why on the connection's own stderr, and
+/// answer the status a shell reports for a command it could not run.
+fn refuse(stream: &UnixStream, report: Option<OwnedFd>, why: &str) {
+    if let Some(fd) = report {
+        let _ = writeln!(File::from(fd), "bubbler-init: {why}");
+    }
+    let _ = wire::send_status(stream, NOT_EXECUTABLE);
+}
+
 /// Execute one received request; a malformed one closes the connection,
 /// spawning nothing. Whether the command takes fd 0 as its controlling
 /// terminal is the request's own flag, not the instance's `--ctty`: the
 /// client knows which of the fds it just sent is a pty it allocated.
+/// Once the run is stopping nothing new is started at all.
 fn serve(
     stream: UnixStream,
     request: &proto::Request,
     fds: Vec<OwnedFd>,
     execs: &mut Vec<Exec>,
     display: Option<&OsStr>,
+    stopping: bool,
 ) {
     let Some((program, rest)) = request.argv.split_first() else {
         return;
@@ -218,6 +241,11 @@ fn serve(
         return;
     };
     let report = stderr.try_clone().ok();
+    if stopping {
+        let why = format!("stopping; {} was not run", program.to_string_lossy());
+        refuse(&stream, report, &why);
+        return;
+    }
     let terminal = request.ctty() && rustix::termios::isatty(&stdin);
     // argv[0] is resolved through PATH as seen inside the sandbox.
     let mut command = Command::new(program);
@@ -236,16 +264,11 @@ fn serve(
     }
     match command.spawn() {
         Ok(child) => execs.push(Exec { child, stream }),
-        Err(e) => {
-            if let Some(fd) = report {
-                let _ = writeln!(
-                    File::from(fd),
-                    "bubbler-init: {}: {e}",
-                    program.to_string_lossy()
-                );
-            }
-            let _ = wire::send_status(&stream, NOT_EXECUTABLE);
-        }
+        Err(e) => refuse(
+            &stream,
+            report,
+            &format!("{}: {e}", program.to_string_lossy()),
+        ),
     }
 }
 
@@ -257,6 +280,7 @@ fn read_pending(
     ready: &mut Vec<bool>,
     execs: &mut Vec<Exec>,
     display: Option<&OsStr>,
+    stopping: bool,
 ) {
     let mut i = 0;
     while i < pending.len() {
@@ -270,7 +294,7 @@ fn read_pending(
             Ok(Some((request, fds))) => {
                 let p = pending.remove(i);
                 ready.remove(i);
-                serve(p.stream, &request, fds, execs, display);
+                serve(p.stream, &request, fds, execs, display, stopping);
             }
             // A malformed request or a hangup closes the connection.
             Err(_) => {
@@ -319,11 +343,15 @@ fn signal_execs(execs: &[Exec], sig: Signal) {
 /// set the deadline at which whatever ignored it is SIGKILLed. The
 /// deadline is the point: a command that traps SIGTERM would otherwise
 /// keep the sandbox alive for as long as it liked.
-fn begin_stop(command: &Child, execs: &[Exec], kill_at: &mut Option<Instant>) {
+fn begin_stop(command: &Child, execs: &[Exec], stopping: &mut Stopping) {
     // Nothing here is reaped until the loop exits, so every pid is still its own.
     let _ = kill_process(Pid::from_child(command), Signal::TERM);
     signal_execs(execs, Signal::TERM);
-    *kill_at = Some(Instant::now() + GRACE);
+    stopping.asked = true;
+    // The first deadline is the deadline. A second stop event asking for
+    // its own grace is how a command that ignores SIGTERM would earn one
+    // more of them for every signal it is sent.
+    stopping.kill_at = stopping.kill_at.or(Some(Instant::now() + GRACE));
 }
 
 /// SIGTERM the remaining exec'd children and SIGKILL whatever outlives the grace.
@@ -518,10 +546,10 @@ fn main() -> ExitCode {
 
     let mut execs: Vec<Exec> = Vec::new();
     let mut pending: Vec<Pending> = Vec::new();
-    let mut kill_at: Option<Instant> = None;
+    let mut stopping = Stopping::default();
     loop {
         if stop.swap(false, Ordering::SeqCst) {
-            begin_stop(&command, &execs, &mut kill_at);
+            begin_stop(&command, &execs, &mut stopping);
         }
         if let Ok(Some(status)) = command.try_wait() {
             reap(&mut execs);
@@ -537,7 +565,7 @@ fn main() -> ExitCode {
             // the command.
             if x.server.as_mut().is_some_and(|s| has_exited(s, "Xwayland")) {
                 eprintln!("bubbler-init: Xwayland exited; stopping the command");
-                begin_stop(&command, &execs, &mut kill_at);
+                begin_stop(&command, &execs, &mut stopping);
                 x.server = None;
             }
             // Said once: the child is dropped here and never started
@@ -553,10 +581,10 @@ fn main() -> ExitCode {
             }
         }
         reap(&mut execs);
-        if kill_at.is_some_and(|at| Instant::now() >= at) {
+        if stopping.kill_at.is_some_and(|at| Instant::now() >= at) {
             let _ = kill_process(Pid::from_child(&command), Signal::KILL);
             signal_execs(&execs, Signal::KILL);
-            kill_at = None;
+            stopping.kill_at = None;
         }
         // The listener, the display socket while nothing serves it, and
         // every half-read request in one poll set: a client that stops
@@ -603,11 +631,17 @@ fn main() -> ExitCode {
                 Ok(()) => start_wm(x),
                 Err(reason) => {
                     eprintln!("bubbler-init: Xwayland did not start: {reason}");
-                    begin_stop(&command, &execs, &mut kill_at);
+                    begin_stop(&command, &execs, &mut stopping);
                 }
             }
         }
-        read_pending(&mut pending, &mut ready, &mut execs, display);
+        read_pending(
+            &mut pending,
+            &mut ready,
+            &mut execs,
+            display,
+            stopping.asked,
+        );
         // Dropping the connection is the whole answer to a client that
         // ran out of time: nothing was spawned for it.
         let now = Instant::now();

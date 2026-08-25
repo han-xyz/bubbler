@@ -26,11 +26,34 @@ struct Opts<'a> {
     wm: Option<&'a Path>,
 }
 
-/// One spawn at a time. Clearing CLOEXEC is a change to the whole
-/// process, so a supervisor forked while another test sits between that
-/// and its own `exec` inherits that test's socket — and hands it on to
-/// every child it spawns itself. Every spawn in this file takes it.
+/// One spawn at a time; see `spawn_locked`, which is the only thing that
+/// takes it.
 static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Spawn a supervisor with the process to ourselves. `listener`, when
+/// given, is duplicated with CLOEXEC cleared so the supervisor inherits
+/// it, and `build` is handed that descriptor's number to name in the
+/// argv it returns. Clearing CLOEXEC is a change to the whole process,
+/// and `cargo test` runs these tests as threads of one: any other spawn
+/// in flight would inherit the descriptor too, and hand it on to every
+/// child of its own. So the lock is held from the duplicate to its
+/// close, and every spawn in this file goes through here.
+fn spawn_locked(
+    listener: Option<&UnixListener>,
+    build: impl FnOnce(Option<std::os::fd::RawFd>) -> Command,
+) -> std::process::Child {
+    let _one_at_a_time = SPAWN.lock().unwrap();
+    let inherited = listener.map(|l| {
+        let fd = rustix::io::fcntl_dupfd_cloexec(l.as_fd(), 3).unwrap();
+        rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty()).unwrap();
+        fd
+    });
+    let mut command = build(inherited.as_ref().map(AsRawFd::as_raw_fd));
+    let child = command.spawn().unwrap();
+    // Closed before the lock goes, or the window it guards is still open.
+    drop(inherited);
+    child
+}
 
 fn start(cmd: &[&str]) -> Started {
     start_with(cmd, Opts::default())
@@ -41,39 +64,37 @@ fn start_with(cmd: &[&str], opts: Opts<'_>) -> Started {
     let tmp = tempfile::tempdir().unwrap();
     let sock = tmp.path().join("init.sock");
     let listener = UnixListener::bind(&sock).unwrap();
-    let one_at_a_time = SPAWN.lock().unwrap();
-    // The listener must be inherited: clear CLOEXEC on a dup.
-    let inherited = rustix::io::fcntl_dupfd_cloexec(listener.as_fd(), 3).unwrap();
-    rustix::io::fcntl_setfd(&inherited, rustix::io::FdFlags::empty()).unwrap();
-    let mut init = Command::new(env!("CARGO_BIN_EXE_bubbler-init"));
-    init.arg("--socket-fd")
-        .arg(inherited.as_raw_fd().to_string());
-    if opts.ctty {
-        init.arg("--ctty");
-    }
-    if let Some(argv) = opts.x11 {
-        init.arg("--x11").args(argv).arg("--");
-    }
-    if let Some(path) = opts.x11_socket {
-        init.arg("--x11-socket").arg(path);
-    }
-    if let Some(wm) = opts.wm {
-        init.arg("--wm").arg(wm);
-    }
-    match opts.stdio {
-        Some(fd) => {
-            init.stdin(Stdio::from(fd.try_clone().unwrap()))
-                .stdout(Stdio::from(fd.try_clone().unwrap()))
-                .stderr(Stdio::from(fd.try_clone().unwrap()));
+    let child = spawn_locked(Some(&listener), |fd| {
+        let mut init = Command::new(env!("CARGO_BIN_EXE_bubbler-init"));
+        init.arg("--socket-fd").arg(
+            fd.expect("a listener was handed over, so it has a number")
+                .to_string(),
+        );
+        if opts.ctty {
+            init.arg("--ctty");
         }
-        None => {
-            init.stdin(Stdio::null()).stdout(Stdio::null());
+        if let Some(argv) = opts.x11 {
+            init.arg("--x11").args(argv).arg("--");
         }
-    }
-    let child = init.arg("--").args(cmd).spawn().unwrap();
-    // Closed before the lock goes, or the window it guards is still open.
-    drop(inherited);
-    drop(one_at_a_time);
+        if let Some(path) = opts.x11_socket {
+            init.arg("--x11-socket").arg(path);
+        }
+        if let Some(wm) = opts.wm {
+            init.arg("--wm").arg(wm);
+        }
+        match opts.stdio {
+            Some(fd) => {
+                init.stdin(Stdio::from(fd.try_clone().unwrap()))
+                    .stdout(Stdio::from(fd.try_clone().unwrap()))
+                    .stderr(Stdio::from(fd.try_clone().unwrap()));
+            }
+            None => {
+                init.stdin(Stdio::null()).stdout(Stdio::null());
+            }
+        }
+        init.arg("--").args(cmd);
+        init
+    });
     drop(listener);
     (child, sock, tmp)
 }
@@ -92,16 +113,29 @@ fn pty_pair() -> (OwnedFd, OwnedFd) {
 
 fn exec(sock: &Path, argv: &[&str]) -> i32 {
     let null = std::fs::File::open("/dev/null").unwrap();
-    exec_with_stdout(sock, argv, null.as_fd())
+    exec_with(sock, argv, null.as_fd(), null.as_fd())
 }
 
 /// Exec a command whose stdout is `out`, so the test can read back what
 /// it printed; stdin and stderr are `/dev/null`.
 fn exec_with_stdout(sock: &Path, argv: &[&str], out: std::os::fd::BorrowedFd<'_>) -> i32 {
+    let null = std::fs::File::open("/dev/null").unwrap();
+    exec_with(sock, argv, out, null.as_fd())
+}
+
+/// Exec a command with `out` for its stdout and `err` for its stderr —
+/// which is where the supervisor writes what it did with the request,
+/// and so where a refusal is read back from. Stdin is `/dev/null`.
+fn exec_with(
+    sock: &Path,
+    argv: &[&str],
+    out: std::os::fd::BorrowedFd<'_>,
+    err: std::os::fd::BorrowedFd<'_>,
+) -> i32 {
     let s = UnixStream::connect(sock).unwrap();
     let null = std::fs::File::open("/dev/null").unwrap();
     let refs: Vec<&std::ffi::OsStr> = argv.iter().map(std::ffi::OsStr::new).collect();
-    wire::send_request(&s, &refs, 0, [null.as_fd(), out, null.as_fd()]).unwrap();
+    wire::send_request(&s, &refs, 0, [null.as_fd(), out, err]).unwrap();
     wire::recv_status(&s).unwrap()
 }
 
@@ -138,7 +172,7 @@ fn main_exit_code_propagates_and_bad_request_is_ignored() {
     let s = UnixStream::connect(&sock).unwrap();
     (&s).write_all(b"garbage").unwrap();
     drop(s);
-    let status = init.wait().unwrap();
+    let status = wait_within(&mut init, PATIENT);
     assert_eq!(status.code(), Some(7));
 }
 
@@ -154,7 +188,7 @@ fn main_exit_terminates_leftover_execs() {
     wire::send_request(&s, &argv, 0, [null.as_fd(); 3]).unwrap();
     let st = wire::recv_status(&s).unwrap();
     assert_eq!(ExitStatus::from_raw(st).signal(), Some(15));
-    assert_eq!(init.wait().unwrap().code(), Some(0));
+    assert_eq!(wait_within(&mut init, PATIENT).code(), Some(0));
 }
 
 /// What the sandbox must see when its stdio is a terminal: its own
@@ -204,13 +238,35 @@ fn exec_on_a_pty(sock: &Path, ctty: bool) -> (i32, String) {
     (status, read_to_end(master.as_fd()))
 }
 
+/// Wait for the supervisor to exit, but never longer than `limit`. A run
+/// that outlives what it was supposed to end with is the regression these
+/// tests guard, and a test that hangs on it hides it instead of reporting
+/// it. `PATIENT` is for the runs that end on their own, where the bound is
+/// only there so a hang is a failure.
+const PATIENT: Duration = Duration::from_secs(30);
+
+fn wait_within(init: &mut std::process::Child, limit: Duration) -> ExitStatus {
+    let t = Instant::now();
+    loop {
+        if let Some(status) = init.try_wait().unwrap() {
+            return status;
+        }
+        if t.elapsed() >= limit {
+            let _ = init.kill();
+            let _ = init.wait();
+            panic!("the supervisor was still running after {limit:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn stop(init: &mut std::process::Child) {
     rustix::process::kill_process(
         rustix::process::Pid::from_child(init),
         rustix::process::Signal::TERM,
     )
     .unwrap();
-    init.wait().unwrap();
+    wait_within(init, PATIENT);
 }
 
 #[test]
@@ -227,7 +283,7 @@ fn the_main_command_given_a_terminal_leads_its_own_session_and_owns_it() {
     // Only the supervisor's copies are left, so the master reads to EIO
     // as soon as the run is over.
     drop(slave);
-    assert_eq!(init.wait().unwrap().code(), Some(0));
+    assert_eq!(wait_within(&mut init, PATIENT).code(), Some(0));
     let out = read_to_end(master.as_fd());
     assert!(out.contains("LEADER"), "not a session leader: {out:?}");
     assert!(out.contains("CTTY"), "/dev/tty is not its own pty: {out:?}");
@@ -269,12 +325,7 @@ fn unexecutable_request_reports_127() {
     let (mut init, sock, _tmp) = start(&["/usr/bin/sleep", "30"]);
     let st = exec(&sock, &["/nonexistent/bubbler-test-command"]);
     assert_eq!(ExitStatus::from_raw(st).code(), Some(127));
-    rustix::process::kill_process(
-        rustix::process::Pid::from_child(&init),
-        rustix::process::Signal::TERM,
-    )
-    .unwrap();
-    init.wait().unwrap();
+    stop(&mut init);
 }
 
 /// Promise `len` payload bytes with the three fds attached, then send nothing.
@@ -295,15 +346,19 @@ fn send_prefix_and_fds(stream: &UnixStream, len: u32) {
 
 #[test]
 fn a_closed_socket_fd_is_a_usage_error_not_an_abort() {
-    let one_at_a_time = SPAWN.lock().unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_bubbler-init"))
-        .arg("--socket-fd")
-        .arg("99")
-        .arg("--")
-        .arg("/usr/bin/true")
-        .output()
-        .unwrap();
-    drop(one_at_a_time);
+    // No listener to inherit: 99 is a number nothing has open.
+    let init = spawn_locked(None, |_| {
+        let mut init = Command::new(env!("CARGO_BIN_EXE_bubbler-init"));
+        init.arg("--socket-fd")
+            .arg("99")
+            .arg("--")
+            .arg("/usr/bin/true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        init
+    });
+    let out = init.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(2), "aborted instead of exiting 2");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("socket fd"), "stderr was {err:?}");
@@ -378,12 +433,7 @@ fn more_stalled_clients_than_the_table_holds_drops_the_oldest() {
         ExitStatus::from_raw(exec(&sock, &["/usr/bin/true"])).code(),
         Some(0)
     );
-    rustix::process::kill_process(
-        rustix::process::Pid::from_child(&init),
-        rustix::process::Signal::TERM,
-    )
-    .unwrap();
-    init.wait().unwrap();
+    stop(&mut init);
     drop(stalled);
 }
 
@@ -595,24 +645,6 @@ fn assert_gone(pid: i32) {
             t.elapsed() < Duration::from_secs(3),
             "the process ({pid}) was left running"
         );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-/// Wait for the supervisor to exit, but never longer than `limit`. A run
-/// that outlives its display is the regression these tests guard, and a
-/// test that hangs on it hides it instead of reporting it.
-fn wait_within(init: &mut std::process::Child, limit: Duration) -> ExitStatus {
-    let t = Instant::now();
-    loop {
-        if let Some(status) = init.try_wait().unwrap() {
-            return status;
-        }
-        if t.elapsed() >= limit {
-            let _ = init.kill();
-            let _ = init.wait();
-            panic!("the supervisor was still running after {limit:?}");
-        }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -928,6 +960,96 @@ fn a_command_that_ignores_the_signal_is_killed_when_the_display_goes() {
     assert!(
         err.contains("Xwayland exited; stopping the command"),
         "stderr was {err:?}"
+    );
+}
+
+#[test]
+fn a_second_stop_does_not_buy_the_command_another_grace() {
+    if !require_python() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let script = server_script(dir.path(), "xserver.py", SERVES_AND_DIES);
+    let cmd = write_script(dir.path(), "deaf", COMMAND_IGNORES_TERM, true);
+    let xsock = dir.path().join("X0");
+    let log = dir.path().join("init.log");
+    let fd = stdio_file(&log);
+    let (mut init, _sock, _tmp) = start_with(
+        &[cmd.to_str().unwrap()],
+        Opts {
+            stdio: Some(&fd),
+            x11: Some(&[PYTHON, script.to_str().unwrap()]),
+            x11_socket: Some(&xsock),
+            ..Opts::default()
+        },
+    );
+    wait_for_path(&xsock);
+    let client = x_connect(&xsock);
+    assert_eq!(served_byte(&client), b'X');
+    wait_for_log(&log, "Xwayland exited; stopping the command");
+    let deadline_set = Instant::now();
+    // A second stop event partway through the grace. The command ignores
+    // both signals, so what is being measured is the deadline: it belongs
+    // to the first event, or every later signal postpones the SIGKILL.
+    std::thread::sleep(Duration::from_secs(2));
+    rustix::process::kill_process(
+        rustix::process::Pid::from_child(&init),
+        rustix::process::Signal::TERM,
+    )
+    .unwrap();
+    assert_eq!(
+        wait_within(&mut init, Duration::from_secs(12)).code(),
+        Some(137)
+    );
+    assert!(
+        deadline_set.elapsed() < Duration::from_millis(6500),
+        "the second signal bought another grace: {:?}",
+        deadline_set.elapsed()
+    );
+}
+
+#[test]
+fn an_exec_is_refused_once_the_run_is_stopping() {
+    if !require_python() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let script = server_script(dir.path(), "xserver.py", SERVES_AND_DIES);
+    let cmd = write_script(dir.path(), "deaf", COMMAND_IGNORES_TERM, true);
+    let xsock = dir.path().join("X0");
+    let log = dir.path().join("init.log");
+    let fd = stdio_file(&log);
+    let (mut init, sock, _tmp) = start_with(
+        &[cmd.to_str().unwrap()],
+        Opts {
+            stdio: Some(&fd),
+            x11: Some(&[PYTHON, script.to_str().unwrap()]),
+            x11_socket: Some(&xsock),
+            ..Opts::default()
+        },
+    );
+    wait_for_path(&xsock);
+    let client = x_connect(&xsock);
+    assert_eq!(served_byte(&client), b'X');
+    // The command ignores SIGTERM, so the whole grace is still ahead: a
+    // request arriving in it must not start a child that the deadline
+    // would then SIGKILL without ever having asked it to stop.
+    wait_for_log(&log, "Xwayland exited; stopping the command");
+    let null = std::fs::File::open("/dev/null").unwrap();
+    let seen = dir.path().join("exec.err");
+    let file = std::fs::File::create(&seen).unwrap();
+    let st = exec_with(&sock, &["/usr/bin/true"], null.as_fd(), file.as_fd());
+    assert_eq!(
+        ExitStatus::from_raw(st).code(),
+        Some(127),
+        "the request was served while the run was ending"
+    );
+    let told = std::fs::read_to_string(&seen).unwrap();
+    assert!(told.contains("stopping"), "the client was told {told:?}");
+    // And the run still ends exactly as it did without the request.
+    assert_eq!(
+        wait_within(&mut init, Duration::from_secs(12)).code(),
+        Some(137)
     );
 }
 
