@@ -153,6 +153,8 @@ dependencies = [
 name = "bubbler-wl-proxy"
 version = "0.15.0"
 dependencies = [
+ "rustix",
+ "tempfile",
  "thiserror",
  "wayrs-proto-parser",
 ]

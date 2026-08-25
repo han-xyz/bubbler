@@ -15,7 +15,11 @@ name = "bubbler-wl-proxy"
 path = "src/main.rs"
 
 [dependencies]
+rustix.workspace = true
 thiserror.workspace = true
 
 [build-dependencies]
 wayrs-proto-parser.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
