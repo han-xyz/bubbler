@@ -68,9 +68,9 @@ arguments: D-Bus `rules:`, `rule-only:` for nodes contributing nothing else,
 which socket a `wayland` node binds (`security-context:` for a bare grant,
 `raw socket: wayland "host"` for the session's own), `raw socket: x11 "host"`
 for a session X display, `sidecar: pasta …` and the nft ruleset under
-`network`. A nested `x11` needs no such line: the `--helper` argument is the
-Xwayland command line itself, an argument of `bubbler-init` rather than of
-bwrap.
+`network`. A nested `x11` needs no such line: the `--x11` argument is the
+Xwayland command line itself, and `--wm` the window manager's name, both
+arguments of `bubbler-init` rather than of bwrap.
 
 ```
   portals                         config.kdl:11  10 arguments
@@ -88,9 +88,10 @@ bwrap.
   init                                           7 arguments
     --ro-bind /usr/lib/bubbler/bubbler-init /run/bubbler-init
     -- /run/bubbler-init --socket-fd 10  (socket: the exec channel bubbler-init serves)
-  x11                             config.kdl:5   17 arguments
+  x11 wm="openbox"                config.kdl:5   21 arguments
     --setenv DISPLAY :0
-    --helper /usr/bin/Xwayland :0 -noreset -nolisten tcp -nolisten local -ac -hidpi -decorate -geometry 1280x720 --  (nested Xwayland, started by bubbler-init; -displayfd is added at run time)
+    --x11 /usr/bin/Xwayland :0 -noreset -nolisten tcp -nolisten local -nolisten unix -ac -hidpi -decorate -geometry 1280x720 --  (nested Xwayland, started by bubbler-init on the first X connection; -listenfd is added at run time)
+    --wm openbox  (window manager inside the sandbox, started with the server)
 ```
 
 That config has an `x11` node, which is why its `wayland` group carries no

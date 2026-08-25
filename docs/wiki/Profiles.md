@@ -45,10 +45,12 @@ Notes worth knowing:
 - **lutris**: keeps `portals`; drop it if a Proton/umu game complains about Flatpak.
 - **steam and lutris**: both write `x11 "host"` and a `lint-allow` saying why —
   steamwebhelper opens many windows and Wine's X11 driver wants a real window
-  manager, and the nested server a bare `x11` starts has none. That is the weak
-  point of both profiles: on the session's display no X client is isolated from
-  any other. A single fullscreen game is worth trying as `x11 fullscreen=#true
-  grab=#true` instead; see [Security](Security.md#x11).
+  manager, and a bare `x11` starts a server with none. That is the weak point of
+  both profiles: on the session's display no X client is isolated from any
+  other. The nested server takes a window manager of its own, so
+  `x11 geometry="2560x1440" wm="openbox"` (with `openbox` installed) is worth
+  trying in place of it, as is `x11 fullscreen=#true grab=#true` for a single
+  fullscreen game; see [Security](Security.md#x11).
 - **keepassxc**: no `network`, no `own "org.freedesktop.secrets"`, no `hidraw`;
   each omission is a comment saying how to add it back. Browser integration
   via `app-runtime` — see [Sharing Files](Sharing-Files.md).

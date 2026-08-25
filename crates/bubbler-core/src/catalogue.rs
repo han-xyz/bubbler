@@ -71,15 +71,15 @@ pub static GRANTS: &[Grant] = &[
         node: "x11",
         summary: "an X server of the sandbox's own, or the session's",
         cost: "Bare, bubbler starts a rootful Xwayland inside the sandbox as a client of \
-               the instance's Wayland socket: X clients see only that server, in one \
-               compositor window with no window manager (needs `wayland` and `dri`). \
-               `\"host\"` binds the session's X socket and cookie instead: X11 has no \
-               isolation between clients, so a sandbox on your display can keylog every \
-               other client, Xwayland included, and the security context does not apply; \
-               lint warns unless the config says why. The nested server starts on the \
-               first X connection, so an instance whose command never speaks X runs \
-               without one; a window manager named with `wm=` runs inside the sandbox as \
-               one more sandboxed process, resolved on the sandbox's `PATH`.",
+               the instance's Wayland socket, on the first X connection, so an instance \
+               whose command never speaks X runs no server at all: X clients see only \
+               that one, in one compositor window (needs `wayland` and `dri`). Nothing \
+               manages those windows unless `wm=` names a program, which the supervisor \
+               resolves on the sandbox's `PATH` and runs inside as one more sandboxed \
+               process. `\"host\"` binds the session's X socket and cookie instead: X11 \
+               has no isolation between clients, so a sandbox on your display can keylog \
+               every other client, Xwayland included, and the security context does not \
+               apply; lint warns unless the config says why.",
         risk: Risk::Outward,
         grammar: "x11 [\"host\"] [geometry=\"WxH\"] [fullscreen=#true] [grab=#true] \
                   [wm=\"<program>\"]",

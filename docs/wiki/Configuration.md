@@ -8,7 +8,10 @@ with the expected type, or the run is refused.
 // bubbler profile: firefox
 wayland                          // socket the compositor treats as sandboxed
 wayland "host"                   // the session socket as it is; lint warns
-x11                              // nested Xwayland; geometry= fullscreen= grab=
+x11                              // nested Xwayland, on its first X client
+x11 geometry="2560x1440"         // the window that server draws itself in
+x11 fullscreen=#true grab=#true  // a whole output; input held inside (games)
+x11 wm="openbox"                 // a window manager inside, with the server
 x11 "host"                       // session X socket + cookie; lint warns
 network                          // own namespace via pasta; see Network
 network "host"                   // host's namespace
@@ -46,7 +49,7 @@ command "firefox"
 |---|---|---|
 | `wayland` | bubbler's own socket, registered with the compositor as a security context; `WAYLAND_DISPLAY` | which globals a sandboxed client loses is the compositor's policy; a compositor without the protocol gets the session socket and a warning |
 | `wayland "host"` | the session's socket, with every global | the compositor cannot tell the sandbox from your session; lint warns |
-| `x11` | a rootful Xwayland started inside the sandbox, `DISPLAY=:0` | needs `wayland` and `dri`; one compositor window, no window manager |
+| `x11` | a rootful Xwayland started inside the sandbox on its first X client, `DISPLAY=:0`; `wm="<program>"` starts a window manager inside with it | needs `wayland` and `dri`; one compositor window, and no window manager unless `wm=` names one bubbler does not ship |
 | `x11 "host"` | the session's X socket, Xauthority at `/home/bubbler/.Xauthority` | X11 clients can keylog each other; lint warns |
 | `network` | own namespace, internet via pasta | LAN/mDNS and host loopback unreachable; see [Network](Network.md) |
 | `network "host"` | host's network stack | host loopback services and abstract sockets exposed |

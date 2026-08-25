@@ -62,13 +62,14 @@ and the one the mechanism table covers.
 
 ### 2. Sandbox ↔ sidecars
 
-Five processes come with a sandbox, and they are not one kind of thing:
+Six processes can come with a sandbox, and they are not one kind of thing:
 
 | Sidecar | Where it runs | Is it a boundary? |
 |---|---|---|
 | `xdg-dbus-proxy` | its own bwrap sandbox, sibling of the app's | **Yes.** It is a filter, it sees only the host bus sockets read-only — up to three of them — and the instance's `dbus/` subdirectory read-write, and the socket it serves is moved out of its reach before anything is bound. |
 | `bubbler-init` | *inside* the sandbox, as pid 2 | **No.** It is the supervisor, not a guard: it shares the sandbox with the application. What it holds — the listening control socket — is kept from the application by being an inherited descriptor with no path, `CLOEXEC` in the only process that has it, and `PR_SET_DUMPABLE` off so `/proc/<init>/fd` cannot be walked. |
-| `Xwayland` | *inside* the sandbox, started by `bubbler-init`, only with a bare `x11` | **No.** It is the sandbox's own X server rather than a guard in front of one: every client on it is a process of this instance, and X11 isolates none of them from each other. What it replaces is the session's display — it reaches the compositor on the instance's own Wayland socket and listens nowhere but `/tmp/.X11-unix/X0` in the sandbox's private `/tmp`. See "X11" below. |
+| `Xwayland` | *inside* the sandbox, started by `bubbler-init` on the first X connection, only with a bare `x11` | **No.** It is the sandbox's own X server rather than a guard in front of one: every client on it is a process of this instance, and X11 isolates none of them from each other. What it replaces is the session's display — it reaches the compositor on the instance's own Wayland socket and listens nowhere but `/tmp/.X11-unix/X0` in the sandbox's private `/tmp`, a socket `bubbler-init` binds and hands over rather than one the server opens. A command that never speaks X11 never starts it. See "X11" below. |
+| a window manager | *inside* the sandbox, started by `bubbler-init` with the server, only with `x11 wm="…"` | **No.** It is a sibling of the application under `bubbler-init`, resolved on the sandbox's own `PATH`, with the same access to that X server as the application it manages and no more reach into it than any other sibling has: Arch's default `kernel.yama.ptrace_scope` of 1 restricts ptrace to a tracer's own descendants, and neither of these two is the other's. bubbler ships none and probes none; a name that resolves to nothing is a log line. |
 | `pasta` | on the host, **not sandboxed**, holding the sandbox's outer user namespace | **No, in one direction.** A pasta that has been taken over *is* that sandbox's network and holds root over the namespaces the sandbox is built from. It owns nothing beyond what your own account already has: your uid created that namespace. Wrapping it in bwrap would not add anything — it would remove the very thing pasta needs, since a process can only join a descendant of its own user namespace. |
 | `nft` | on the host, entering the sandbox's user and network namespaces to install the ruleset | **Not a party to one.** It builds the network boundary rather than standing in it: it runs before pasta and before the sandbox is let go of its `--block-fd`, so the namespace has a policy before it has a route and before the application has run an instruction either way. Nothing the sandbox controls reaches it — the ruleset is generated from typed values and handed over on stdin, and its argv is two fixed arguments. It holds CAP_NET_ADMIN in the sandbox's user namespace and no other capability anywhere: the capability crosses `execve` through the ambient set, and `SECBIT_NOROOT` with `_LOCKED` stops the uid-0 that bwrap's nested user namespace maps bubbler to from being handed the full set. It exits before the run begins, and one that stops answering is killed rather than left holding that capability. |
 
@@ -77,7 +78,8 @@ Five processes come with a sandbox, and they are not one kind of thing:
 `the_proxy_never_sees_the_instances_control_socket`,
 `a_proxied_socket_is_moved_out_of_the_proxys_reach`,
 `proxy_argv_runs_the_proxy_in_its_own_sandbox`,
-`a_helper_that_reports_a_display_is_started_first_and_the_command_sees_it`,
+`the_x_server_is_not_started_until_a_client_connects`,
+`the_window_manager_starts_with_the_server_and_the_shutdown_runs_inwards`,
 `the_nft_child_holds_cap_net_admin_and_is_fed_the_ruleset`,
 `the_ruleset_is_the_golden_text_nft_is_fed`,
 `outbound_deny_filters_what_no_allow_out_names_and_the_sandbox_cannot_undo_it`.)
@@ -160,17 +162,43 @@ the compositor. `WAYLAND_SOCKET` is refused when set at all: the client
 would adopt the descriptor number it names as its connection and close it
 with the connection.
 
-**Does not defend:** a value that really does name a socket of the right
-type is bound, whatever it is a socket for.
+The three bus addresses — `$DBUS_SESSION_BUS_ADDRESS`,
+`$DBUS_SYSTEM_BUS_ADDRESS` and `$AT_SPI_BUS_ADDRESS` — are guarded on the
+path as well as the type. Each is resolved first (the socket itself
+canonicalised when it exists, else its parent, else a lexical fold of
+`.` and `..`), and one that lands under `$XDG_RUNTIME_DIR/bubbler/` is
+refused before anything is probed or bound: ``service `<node>`: the host
+bus address names a socket under bubbler's own runtime directory``,
+naming `dbus`, `system-bus` or `a11y`. That directory holds the instances'
+own control sockets, and a proxy aimed at one would be filtering
+something that is not a bus. The resolved path is what is returned and
+bound, so the comparison and the bind are made on the same path and a
+symlink cannot be repointed between them.
 
-[Baseline](manual.md#baseline) ·
+**Does not defend:** a value that really does name a socket of the right
+type is bound, whatever it is a socket for. The bus guard compares paths,
+so it does not see a *hard link* to a control socket made elsewhere, and
+its reference side is `$XDG_RUNTIME_DIR/bubbler/` rather than a
+`/run/user/<uid>` derived from the kernel — a `$XDG_RUNTIME_DIR` pointing
+somewhere else moves both sides at once. Both need the uid that already
+owns that directory and every socket in it, which is the attacker this
+model does not have: the guard is against a misdirected address in an
+otherwise sane environment. `--explain --proxy` runs the same guard, but
+where neither the socket nor its parent exists yet only the lexical form
+is left to resolve, so an explanation can describe a bus the run it
+describes goes on to refuse.
+
+[Baseline](manual.md#baseline), [D-Bus](manual.md#d-bus) ·
 `wayland_display_must_name_a_socket`,
 `wayland_display_that_is_not_one_component_is_rejected`,
 `a_display_name_that_is_a_path_is_refused_before_the_compositor`,
 `an_inherited_connection_is_refused`,
 `wayland_socket_path_of_the_wrong_type_fails`,
 `x11_socket_that_is_not_a_socket_fails`,
-`x11_xauthority_at_a_directory_fails`
+`x11_xauthority_at_a_directory_fails`,
+`launcher::tests::a_host_bus_address_under_bubblers_runtime_directory_is_refused`,
+`dbus::tests::a_guarded_bus_path_comes_back_resolved`,
+`a_bus_address_under_bubblers_runtime_directory_is_refused`
 
 ### Wayland
 
@@ -206,33 +234,54 @@ client of your session, though a bare `x11` starts one on this socket
 
 **Defends:** a bare `x11` binds nothing of the session's X display — no
 socket, no cookie, and neither `DISPLAY` nor `XAUTHORITY` is read.
-`bubbler-init` starts a rootful Xwayland inside the sandbox instead, as
-one more Wayland client of the socket the `wayland` grant bound, so what
-the compositor sees is a sandboxed client like any other and what the
-application talks to is a display of the sandbox's own: the server's
-socket is in the private `/tmp`, its shared memory in the private
-`/dev/shm`, and `DISPLAY` is `:0` for the command and for every `exec`
-child. The only way to that server is `/tmp/.X11-unix/X0` inside that
-private `/tmp` — `-nolisten tcp` keeps it off the network and `-nolisten
+`bubbler-init` owns the display instead. It binds `/tmp/.X11-unix/X0`
+itself before the command runs and sets `DISPLAY=:0` for the command and
+for every `exec` child; a rootful Xwayland is started on the first
+connection to that socket, inheriting it through `-listenfd`, as one more
+Wayland client of the socket the `wayland` grant bound. What the
+compositor sees is a sandboxed client like any other, and what the
+application talks to is a display of the sandbox's own: that socket is in
+the private `/tmp`, its shared memory in the private `/dev/shm`, and the
+only clients on it are processes of this instance. It is also the only
+way in — `-nolisten tcp` keeps the server off the network, `-nolisten
 local` off the abstract socket namespace, which a mount namespace does
-not cover and `network "host"` would share with every host process. X11's
-lack of isolation between clients therefore reaches no further than this
-sandbox. Measured here on Xwayland 24.1.13, Hyprland 0.56.2 and an NVIDIA
-card: a client inside saw 26 extensions, GLX with direct rendering among
-them.
+not cover and `network "host"` would share with every host process, and
+`-nolisten unix` off a path socket of its own, the supervisor's being the
+one it is handed. X11's lack of isolation between clients therefore
+reaches no further than this sandbox, and a command that never speaks X11
+never starts a server at all. Measured here on Xwayland 24.1.13,
+Hyprland 0.56.2 and an NVIDIA card: a client inside saw 26 extensions,
+GLX with direct rendering among them.
+
+The `mkdir`, `chmod 1777` and `bind` on `/tmp/.X11-unix` would be a
+time-of-check race if `/tmp` were shared with anything: it is not. Every
+sandbox gets a private tmpfs, empty at start, and the only writers in it
+are this instance's own processes — which are exactly who the display is
+for. On a shared `/tmp` that sequence would need `O_NOFOLLOW`/`mkdirat`
+discipline instead.
 
 **Does not defend:** the sandbox's own processes against each other.
-There is one server and X11 isolates nothing on it, so the command and
-its `exec` children read each other's input and windows. Nothing manages
-those windows either — no window manager runs inside, so they are
+There is one server and X11 isolates nothing on it, so the command, its
+`exec` children and a window manager read each other's input and windows.
+Without `wm=` nothing manages those windows at all, so they are
 undecorated and stacked in the server's one compositor window (lint note
-`x11-nested-no-wm`). The server is the host's `/usr/bin/Xwayland` and
-cannot start without `wayland` and `dri`, so the grant carries a GPU
-grant's cost with it. `x11 "host"` defends nothing at all: it binds the
-session's socket and cookie, where every X client reads every other's
-input and windows and no security context applies — lint
-`x11-without-reason`, a warning before every real run, and the two gaming
-profiles are the only ones shipping it.
+`x11-nested-no-wm`); with it, the named program is resolved on the
+sandbox's own `PATH` and started by `bubbler-init` right after the server
+— a sibling of the application, not a layer over it. What the two share
+is the X server, where X11 isolates nothing; being siblings gains them
+nothing beyond it, since Arch's default `kernel.yama.ptrace_scope` of 1
+restricts ptrace to a tracer's own descendants and neither of them is the
+other's. That is the host's setting rather than bubbler's, and `ptrace`
+is deliberately not on the seccomp denylist. bubbler ships no window
+manager and probes none on the host: a name that resolves to nothing, or
+a program that exits, is a log line rather than a failed run.
+The server is the host's `/usr/bin/Xwayland` and cannot start without
+`wayland` and `dri`, so the grant carries a GPU grant's cost with it.
+`x11 "host"` defends nothing at all: it binds the session's socket and
+cookie, where every X client reads every other's input and windows and no
+security context applies — lint `x11-without-reason`, a warning before
+every real run, and the two gaming profiles are the only ones shipping
+it.
 
 [x11](manual.md#x11) ·
 `x11_parses_nested_properties_and_host_and_refuses_the_rest`,
@@ -241,10 +290,22 @@ profiles are the only ones shipping it.
 `nested_x11_binds_nothing_and_only_names_the_display`,
 `nested_x11_hands_the_supervisor_the_server_argv`,
 `nested_x11_without_xwayland_on_the_host_fails`,
-`a_helper_that_reports_a_display_is_started_first_and_the_command_sees_it`,
-`a_helper_that_never_reports_is_a_startup_failure`,
+`the_x_server_is_not_started_until_a_client_connects`,
+`no_child_but_the_server_inherits_the_display_socket`,
+`the_window_manager_starts_with_the_server_and_the_shutdown_runs_inwards`,
+`a_window_manager_that_cannot_be_started_is_logged_and_the_command_runs_on`,
+`a_window_manager_that_exits_is_reported_once_and_the_command_runs_on`,
+`a_server_that_cannot_be_spawned_terminates_the_command`,
+`a_server_that_exits_after_serving_terminates_the_command`,
+`a_command_that_ignores_the_signal_is_killed_when_the_display_goes`,
+`a_second_stop_does_not_buy_the_command_another_grace`,
+`a_client_that_connects_while_stopping_wakes_nothing`,
+`an_exec_is_refused_once_the_run_is_stopping`,
 `real_nested_x11_serves_a_private_display`,
-`real_nested_x11_exec_children_see_the_display`
+`real_nested_x11_exec_children_see_the_display`,
+`real_nested_x11_starts_the_server_on_the_first_client`,
+`real_nested_x11_wm_exiting_is_logged_not_fatal`,
+`real_nested_x11_missing_wm_is_logged_not_fatal`
 
 ### seccomp
 
@@ -536,7 +597,12 @@ sandbox only as an inherited descriptor, so no path to it exists inside;
 `bubbler-init` sets `CLOEXEC` on it at once and makes itself
 non-dumpable. The wire decoder refuses an empty, truncated or oversized
 request and one that carries no descriptors, and a client that trickles
-bytes cannot extend the deadline.
+bytes cannot extend the deadline. Once the run is stopping — the command
+gone, the display gone, or a SIGTERM to `bubbler-init` — a request is
+turned down rather than served (`bubbler-init: stopping; <program> was
+not run`, exit 127), so nothing is spawned into a sandbox that is being
+torn down and no child reaches the SIGKILL deadline without having been
+asked to stop first.
 
 **Does not defend:** descriptors passed to an exec'd command are
 reachable by the sandboxed application through `/proc`. `exec` is a
@@ -549,6 +615,7 @@ convenience channel, not a boundary, and the manual says so.
 `a_truncated_payload_times_out_instead_of_hanging`,
 `a_trickling_client_cannot_extend_the_deadline`,
 `a_stale_socket_is_unlinked_so_a_fresh_start_can_bind`,
+`an_exec_is_refused_once_the_run_is_stopping`,
 `real_bwrap_exec_round_trip`
 
 ### Desktop entries and PATH shims

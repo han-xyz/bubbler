@@ -110,8 +110,11 @@ command's status.
 
     bubbler ─┬─ bwrap ── bwrap (pid 1 in the sandbox, reaps orphans)
              │              └─ bubbler-init (pid 2) ─┬─ your command
-             │                                       └─ Xwayland (only with a
-             │                                                    bare `x11`)
+             │                                       ├─ Xwayland (a bare `x11`,
+             │                                       │            on its first
+             │                                       │            X client)
+             │                                       └─ a window manager (only
+             │                                                    with `wm=`)
              ├─ bwrap ── bwrap ── xdg-dbus-proxy    (only with `dbus`)
              └─ pasta                               (only with an isolated
                                                      `network`; not sandboxed)
@@ -314,10 +317,12 @@ file order does not affect the generated argv.
 
     wayland                          # a socket the compositor treats as sandboxed
     wayland "host"                   # the session's own socket instead
-    x11                              # a rootful Xwayland inside the sandbox:
+    x11                              # a rootful Xwayland inside the sandbox,
+                                     #   started by its first X client:
                                      #   1280x720, decorated, DISPLAY=:0
     x11 geometry="1920x1080"         # the window that server draws itself in
     x11 fullscreen=#true grab=#true  # a whole output; input held inside it
+    x11 wm="openbox"                 # a window manager inside, with the server
     x11 "host"                       # the session's X socket and cookie instead
     network                          # the sandbox's own network namespace,
                                      #   connected by a pasta sidecar
@@ -549,46 +554,63 @@ application talking to it, which is the next section.
 
 ### x11
 
-A bare `x11` binds nothing of your X session. `bubbler-init` starts a rootful
-`Xwayland` inside the sandbox before the command, and that server is one more
-client of whichever socket the `wayland` grant bound — the security-context one
-for a bare `wayland`, the session's under `wayland "host"`. The display the
-application then talks to is the sandbox's own: the socket the server creates
-is in the private `/tmp` every sandbox gets, its MIT-SHM segments are in the
+A bare `x11` binds nothing of your X session. `bubbler-init` binds the display
+socket itself — `/tmp/.X11-unix/X0`, in the private `/tmp` every sandbox gets —
+and starts the command straight away; the rootful `Xwayland` behind that socket
+goes up when the first client connects to it. That server is one more client of
+whichever socket the `wayland` grant bound — the security-context one for a
+bare `wayland`, the session's under `wayland "host"`. The display the
+application talks to is the sandbox's own: its MIT-SHM segments are in the
 private `/dev/shm`, and the only clients on it are processes of this instance.
 X11 still offers no isolation between the clients of one server, and that has
 not changed; what changed is who else is on the server.
 
+Nothing about that display is eager. The socket is listening before the command
+runs, so a client that arrives before the server exists waits in its queue
+instead of failing to connect; the supervisor hands that listening descriptor
+to Xwayland as `-listenfd <fd>` and deliberately leaves the queued connection
+where it is, so the server accepts it on the very descriptor it inherited and
+the client that woke it is the client it serves. Measured here, that first
+client waits about 0.2 s and nothing after it waits at all. A command that
+never speaks X11 never wakes a server: no Xwayland process and no empty window
+of one in your session, which is what an instance granted `x11` for the
+occasional X client used to cost whether or not one ever appeared.
+
 `DISPLAY` is `:0`, set with `--setenv` so a dry run shows it, and the
 supervisor hands the same value to every `exec` child rather than letting one
-inherit whatever your terminal had.
+inherit whatever your terminal had. It is set from the first instruction the
+command runs, server or no server: `:0` is that socket, and the socket is bound
+before the command is spawned.
 
 The command line is fixed but for the window:
 
-    /usr/bin/Xwayland :0 -noreset -nolisten tcp -nolisten local -ac -hidpi -decorate -geometry 1280x720
+    /usr/bin/Xwayland :0 -noreset -nolisten tcp -nolisten local -nolisten unix -ac -hidpi -decorate -geometry 1280x720
 
 `-noreset` prevents the server reset that closing the last client connection
 would otherwise trigger: a reset frees every remaining client's resources and
 returns the server to its initial state, which is what a launcher restarting
 its own interface would pay. The server keeps running either way — `-terminate`
-is the flag that would end it, and bubbler passes none. `-nolisten tcp` keeps
-the display off the network and `-nolisten local` off the abstract socket
-namespace, which is where the second listener would be: an abstract unix
-socket is addressed by name in a network namespace and ignores the mount
-namespace entirely, so under `network "host"` every process on the host could
-reach it. What is left is the filesystem socket at `/tmp/.X11-unix/X0` in the
-sandbox's private `/tmp`, which is the only way in. `-ac` then turns off the
-access control X11 would apply on it: no cookie is generated and none is
-needed, the reachable set being the sandbox itself. `-hidpi` has the server
-follow the scale of the output it is on. `bubbler-init` appends
-`-displayfd <fd>` at run time, which is how it learns the display is up; the
-words `--dry-run` prints are the rest of what runs.
+is the flag that would end it, and bubbler passes none. The three `-nolisten`
+flags name transports `Xserver(1)` would otherwise listen on: `tcp` keeps the
+display off the network; `local` keeps it off the abstract socket namespace,
+which is where the second listener would be, an abstract unix socket being
+addressed by name in a network namespace and ignoring the mount namespace
+entirely, so under `network "host"` every process on the host could reach it;
+and `unix` keeps the server from opening a path socket of its own, that being
+the one `bubbler-init` has already bound and is handing over. What is left is
+that one filesystem socket at `/tmp/.X11-unix/X0`, which is the only way in.
+`-ac` then turns off the access control X11 would apply on it: no cookie is
+generated and none is needed, the reachable set being the sandbox itself.
+`-hidpi` has the server follow the scale of the output it is on. `-listenfd
+<fd>` is appended at run time and names the descriptor the socket arrives on;
+the words `--dry-run` prints are the rest of what runs.
 
-The three properties describe that window and nothing else:
+Three properties describe that window, and a fourth names a program:
 
     x11                              # 1280x720, decorated
     x11 geometry="1920x1080"         # <width>x<height>, both non-zero
     x11 fullscreen=#true grab=#true  # a whole output; input held inside it
+    x11 wm="openbox"                 # a window manager inside, with the server
 
 `fullscreen` (`-fullscreen`) takes an output instead of a window and drops
 `-decorate` with it, there being nothing left to decorate, and `geometry` goes
@@ -596,9 +618,10 @@ unused. `grab` (`-host-grab`) inhibits the compositor's own keyboard shortcuts
 and confines the pointer to the server's window — what a game wants, and what
 Ctrl+Shift releases; Xwayland's manual page notes that it leans on the
 shortcut-inhibit and pointer-constraint protocols and does nothing under a
-compositor offering neither. `x11 "host"` takes none of the three: a property
-describing a window bubbler never opens is a parse error rather than a line
-with no effect.
+compositor offering neither. `x11 "host"` takes none of the four: a property
+describing a window bubbler never opens, or a window manager for a display that
+is not this sandbox's to manage, is a parse error rather than a line with no
+effect.
 
 The server is a Wayland client that renders through glamor, and glamor has no
 software path here, so the flattened config must carry a `wayland` (either
@@ -613,50 +636,87 @@ built, so a host without it fails with ``service `x11` needs
 `/usr/bin/Xwayland` which does not exist`` rather than handing the application
 a `DISPLAY` that names nothing.
 
-Under `--explain` the grant is those two lines:
+Under `--explain` the grant is those lines:
 
-      x11                             config.kdl:5   17 arguments
+      x11 geometry="2560x1440" wm="openbox"  config.kdl:4  21 arguments
         --setenv DISPLAY :0
-        --helper /usr/bin/Xwayland :0 -noreset -nolisten tcp -nolisten local -ac -hidpi -decorate -geometry 1280x720 --  (nested Xwayland, started by bubbler-init; -displayfd is added at run time)
+        --x11 /usr/bin/Xwayland :0 -noreset -nolisten tcp -nolisten local -nolisten unix -ac -hidpi -decorate -geometry 2560x1440 --  (nested Xwayland, started by bubbler-init on the first X connection; -listenfd is added at run time)
+        --wm openbox  (window manager inside the sandbox, started with the server)
 
-`--helper <argv…> --` is an argument of `bubbler-init` and not of bwrap: the
-supervisor reads the server's command line up to that `--`, and the sandbox's
-own command follows the next one. It starts the server first and waits up to
-ten seconds for a display number on the pipe. A server that reports none,
-exits first, or writes something else is a failed launch and the command is
-never started:
+`--x11 <argv…> --` and `--wm <program>` are arguments of `bubbler-init` and not
+of bwrap: the supervisor reads the server's command line up to that `--`, then
+the window manager's name, and the sandbox's own command follows the last one.
 
-    bubbler-init: Xwayland did not start: it exited before reporting a display (exit status: 1)
+`wm=` is one program name — no `/`, no whitespace, no leading `-` — resolved on
+the sandbox's own `PATH`, and the supervisor starts it immediately after the
+server on that same first connection, so the window manager is lazy too and is
+never itself the client that wakes the server. An ICCCM window manager
+reparents the windows that already exist when it starts, so the client that
+woke the server is managed even though its first window came first. bubbler
+ships no window manager and probes none on the host: a name that resolves to
+nothing inside is a log line rather than a failed launch,
 
-with exit code 2. A server that dies while the command runs takes the display
-with it, so the supervisor stops the command as well (`bubbler-init: Xwayland
-exited; stopping the command`) and still reports the command's own status. In
-the other direction the server goes last: the command exits, every `exec` child
-is shut down, and only then does Xwayland get its SIGTERM, five seconds and a
-SIGKILL. Nothing outlives the run and there is nothing to clean up on the host,
-the socket having been in a `/tmp` that goes with the sandbox.
+    bubbler-init: wm nosuchwm: No such file or directory (os error 2)
 
-There is no window manager in there, which is what the lint note
+as is one that starts and then exits, said once and never restarted:
+
+    bubbler-init: wm true exited
+
+Both leave the display serving and the command running. The archwiki's "Window
+manager" page is the list to pick from: `xorg-twm` (twm, Xorg's own
+default/fallback since 1989), `openbox`, `jwm` and `icewm` are in the official
+repositories, and `matchbox-window-manager` (AUR) shows one window at a time,
+which is close to what a single-window game wants. Whichever it is, it is
+inside the boundary: one more process of this instance, with the same access to
+the X server as the application it manages. A Steam-shaped instance writes it as
+
+    x11 geometry="2560x1440" wm="openbox"
+
+There is one server, so it stopping is the display going away. A server that
+cannot be spawned at all takes the command with it —
+
+    bubbler-init: Xwayland did not start: <error>
+
+— and so does one that dies later (`bubbler-init: Xwayland exited; stopping the
+command`); the run still reports the command's own status. From that moment the
+supervisor is *stopping*: the command and every `exec` child are sent SIGTERM,
+whatever is still there five seconds later is SIGKILLed, and the deadline
+belongs to the first stop event rather than being renewed by the next. A
+`bubbler exec` arriving inside that grace is refused rather than started,
+
+    bubbler-init: stopping; xterm was not run
+
+on the request's own stderr with exit code 127, and a client connecting to the
+display socket during it wakes nothing: a run that is ending does not start a
+server. A SIGTERM to `bubbler-init` from outside is the same stop, by the same
+rules.
+
+In the other direction the display goes last: the command exits, every `exec`
+child is shut down, then the window manager, and only then does Xwayland get
+its SIGTERM, five seconds and a SIGKILL. Nothing outlives the run and there is
+nothing to clean up on the host, the socket having been in a `/tmp` that goes
+with the sandbox. The one failure that happens before any of this is the socket
+itself:
+
+    bubbler-init: cannot bind the display socket: <reason>
+
+with exit code 2, printed before the command is spawned, so nothing has run.
+
+Without `wm=` there is no window manager in there, which is what the lint note
 `x11-nested-no-wm` says: X windows are undecorated, unmanaged and stacked in
 the one compositor window, so an application that opens dialogs gets them piled
 on its main window with nothing to move them. Keyboard focus follows the
 pointer too, as X does without a window manager: while the pointer is over the
 root rather than a window, keys go nowhere, and a game that fills only part of
 the root loses input whenever the pointer leaves it. Fullscreen in the game, or
-`fullscreen=#true grab=#true`, is what makes input stable. A `fullscreen=#true`
-config does not get the note, having asked for the single full-output window
-already.
-Starting a window manager inside is out of scope: it would be one more process
-in the sandbox and which one is a matter of taste, not of the boundary.
+`fullscreen=#true grab=#true`, is what makes input stable. Neither a
+`fullscreen=#true` config nor a `wm=` one gets the note: the first has asked
+for the single full-output window already, the second has named the manager.
 
 The server writes its own startup noise to the sandbox's stderr, which is
-yours: `_XSERVTransmkdir: ERROR: euid != 0,directory /tmp/.X11-unix will not be
-created.` is the first line of every run and is harmless: the directory and
-its socket are there all the same, `/tmp/.X11-unix/X0` in the sandbox's own
-`/tmp`. xkbcomp warnings about the session's keymap follow it, under a line
-saying that errors from xkbcomp are not fatal to the X server. Neither is a
-failed launch — the display number on `-displayfd` is the only thing that
-decides that.
+yours: xkbcomp warnings about the session's keymap, under a line saying that
+errors from xkbcomp are not fatal to the X server. They are not fatal to the
+run either — only a server that fails to start or exits stops the command.
 
 Measured here on Xwayland 24.1.13, Hyprland 0.56.2 and an RTX 4070 SUPER: a
 client inside the nested server saw 26 extensions, GLX among them with direct
@@ -1302,10 +1362,13 @@ Xwayland included. They ask for the session's display rather than the nested
 one because Steam's UI (steamwebhelper) is an X11/CEF client with no Wayland
 support whose many windows want a real window manager, and because Wine's X11
 driver takes precedence over its Wayland one for every game Lutris starts, with
-the same want. The nested server has no window manager at all, so it is the
-better fit for a single fullscreen game (`x11 fullscreen=#true grab=#true`)
-and the worse one for a launcher; each profile says so in the `lint-allow`
-reason it carries. Neither carries a `seccomp` node any more: the Steam
+the same want. The nested server has no window manager unless the config names
+one, so it is ready as it is for a single fullscreen game (`x11
+fullscreen=#true grab=#true`) and wants a `wm=` for a launcher: `x11
+geometry="2560x1440" wm="openbox"`, with `openbox` installed, is what to try in
+place of either profile's `x11 "host"` before accepting that grant's cost. Each
+profile says so in the `lint-allow` reason it carries. Neither carries a
+`seccomp` node any more: the Steam
 runtime, umu/Proton and DXVK's 32-bit path are i386, and the default filter now
 covers i386 alongside x86_64, so they are filtered rather than killed. Neither
 may ever carry `userns "disable"` — pressure-vessel nests its own bubblewrap for
@@ -1717,9 +1780,9 @@ the Secret Service API partitions nothing between the applications that call
 it), `lint-allow-unused` (a `lint-allow` node that accepts nothing, which is a
 suppression outliving what it was written for — and the one check no
 `lint-allow` silences, since that node would be the unused one),
-`x11-nested-no-wm` (a nested `x11` without `fullscreen=#true`: the server it
-starts has no window manager, so the X windows inside are undecorated and
-unmanaged in the one compositor window it draws).
+`x11-nested-no-wm` (a nested `x11` with neither `fullscreen=#true` nor `wm=`:
+the server it starts has no window manager, so the X windows inside are
+undecorated and unmanaged in the one compositor window it draws).
 
 A warning or a note is accepted with a `lint-allow` node, which takes a check
 id and a required reason:
@@ -1774,7 +1837,27 @@ The host bus is `$DBUS_SESSION_BUS_ADDRESS` when it is set, else
 `$XDG_RUNTIME_DIR/bus`, and must be a socket. Either bus address variable
 holding a transport bubbler cannot bind — `tcp:`, `unix:abstract=` — fails the
 run naming the variable instead of falling back to the default socket, which
-would filter a bus the session is not on; unset or empty is that default.
+would filter a bus the session is not on; unset or empty is that default. An
+address naming a socket under `$XDG_RUNTIME_DIR/bubbler/` is refused outright,
+before anything is probed or bound:
+
+    service `dbus`: the host bus address names a socket under bubbler's own runtime directory
+
+That is bubbler's own runtime directory, where an instance's control socket
+lives — the one `bubbler exec` connects to — and a proxy pointed at it would be
+filtering something that is not a bus. All three addresses are guarded
+(`dbus`, `system-bus` and the accessibility bus under `a11y`, each named in the
+message as the node it belongs to), and each is resolved before it is compared:
+symlinks followed, `..` folded, and the resolved path is what is bound, so the
+comparison and the bind are made on the same path. The guard is against a
+misdirected address — stale, copied, or hostile in an otherwise sane
+environment — and not against your own uid, which owns that directory and every
+socket in it either way. `--explain --proxy` applies the same guard, so an
+explanation and a run agree; the one gap is an address whose socket and whose
+parent directory are both absent, where only the lexical form is left to
+resolve and a link that a run would follow is not followed, so an explanation
+can describe a bus the run it describes goes on to refuse.
+
 Everything the sandbox may reach is a rule: the `dbus` children above, plus the
 bundles `portals`, `notify`, `tray`, `mpris` and `input-method`, and the `a11y`
 grant whose rules are on a bus of its own — each of which needs `dbus`.
@@ -2362,8 +2445,10 @@ none of its own.
 - `x11 "host"` bypasses the Wayland security context: those clients speak to a
   server that is a client of your session's own socket, so what a compositor
   withholds from a sandboxed client it does not withhold there; see "wayland".
-- The nested `x11` server runs without a window manager, so an application
-  with more than one window gets them undecorated and stacked; see "x11".
+- bubbler ships no window manager, so a nested `x11` has one only where the
+  host has a `wm=` program installed and the config names it; without that an
+  application with more than one window gets them undecorated and stacked; see
+  "x11".
 
 ## Files
 

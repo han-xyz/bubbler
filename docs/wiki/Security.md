@@ -15,7 +15,8 @@ unprivileged and unconfined. Long form with every claim pinned to a test:
 
 ```
 bubbler ─┬─ bwrap ── bwrap (pid 1 inside, reaps) ── bubbler-init (pid 2) ─┬─ your command
-         │                                                                └─ Xwayland (only with a bare x11)
+         │                                                                ├─ Xwayland (a bare x11, on its first X client)
+         │                                                                └─ a window manager (only with wm=)
          ├─ bwrap ── bwrap ── xdg-dbus-proxy        (only with dbus / system-bus)
          └─ pasta                                   (only with isolated network; not sandboxed)
 ```
@@ -73,17 +74,25 @@ A bare `x11` starts a rootful `Xwayland` **inside** the sandbox, as one more
 Wayland client of whichever socket the `wayland` grant bound. X11 still has no
 isolation between the clients of one server — but the only clients on this one
 are the sandbox's own. Nothing of the session's X display is bound: no socket,
-no cookie. `-nolisten tcp` keeps the display off the network and `-nolisten
+no cookie. `-nolisten tcp` keeps the display off the network, `-nolisten
 local` off the abstract socket namespace, which no mount namespace covers and
-`network "host"` would share with the whole host; the one way in is the
-filesystem socket `/tmp/.X11-unix/X0`, in the sandbox's private `/tmp`.
-`DISPLAY` is `:0`, and `bubbler-init` starts the server before the command and
-stops it after, so `exec` children reach the same display.
+`network "host"` would share with the whole host, and `-nolisten unix` off a
+path socket of the server's own; the one way in is the filesystem socket
+`/tmp/.X11-unix/X0`, in the sandbox's private `/tmp`.
+
+`bubbler-init` binds that socket itself and sets `DISPLAY=:0` before the
+command runs, so the command and every `exec` child have a display from their
+first instruction — and starts Xwayland with `-listenfd` only when a client
+connects to it. A sandbox whose command never speaks X11 runs no X server at
+all; the first client that does waits about 0.2 s for one. The server is
+stopped after the command and every `exec` child, and its socket goes with the
+sandbox's `/tmp`.
 
 ```kdl
 x11                              // one 1280x720 decorated window
 x11 geometry="1920x1080"
 x11 fullscreen=#true grab=#true  // games: the whole output, input held inside
+x11 wm="openbox"                 // a window manager inside, with the server
 ```
 
 The server is a Wayland client that renders through glamor, so the grant needs
@@ -95,13 +104,28 @@ read-only `/usr` and probed while the argv is built. Measured here on Xwayland
 saw 26 extensions, GLX with direct rendering among them, plus MIT-SHM, XInput,
 XKEYBOARD and XTEST.
 
-There is no window manager in there: X windows are undecorated, unmanaged and
-stacked in the one compositor window the server draws. `bubbler lint` says so
-as the note `x11-nested-no-wm`, which a `fullscreen=#true` config does not get,
-having asked for the one full-output window already. Keyboard focus follows the
-pointer, so a window that fills only part of the root loses input when the
-pointer leaves it; in-game fullscreen or `fullscreen=#true grab=#true` makes it
-stable. `grab=#true` holds pointer and keyboard inside (Ctrl+Shift releases them).
+There is no window manager in there unless `wm=` names one: without it X
+windows are undecorated, unmanaged and stacked in the one compositor window the
+server draws. `bubbler lint` says so as the note `x11-nested-no-wm`, which
+neither a `fullscreen=#true` config nor a `wm=` one gets — the first has asked
+for the one full-output window already, the second has named the manager.
+Keyboard focus follows the pointer, so a window that fills only part of the root
+loses input when the pointer leaves it; in-game fullscreen or `fullscreen=#true
+grab=#true` makes it stable. `grab=#true` holds pointer and keyboard inside
+(Ctrl+Shift releases them).
+
+`wm=` takes one program name — no `/`, no whitespace, no leading `-` — resolved
+on the sandbox's own `PATH` and started right after the server on that first
+connection, so it is never itself the client that wakes the server; an ICCCM
+window manager reparents windows that already exist, so the client that woke it
+is managed anyway. bubbler ships none: a missing one, or one that exits, is a
+log line and not a failed run, and the display keeps serving. The archwiki's
+[Window manager](https://wiki.archlinux.org/title/Window_manager) list is where
+to pick from — `xorg-twm`, `openbox`, `jwm` and `icewm` are in the official
+repositories, `matchbox-window-manager` (AUR) shows one window at a time. It
+runs **inside** the boundary: one more process of this instance, with the same
+access to the X server as the application it manages. `x11 "host"` takes no
+`wm=`; that display is not this sandbox's to manage.
 
 `x11 "host"` is the other mode: the session's `/tmp/.X11-unix/X<n>` socket and
 whichever Xauthority cookie `$XAUTHORITY` or `~/.Xauthority` names, remapped to
@@ -110,8 +134,9 @@ at all — every X client on your display can read every other's input and
 windows, this sandbox included and Xwayland with it, and the compositor's
 security context does not reach an X client. `bubbler lint` warns
 (`x11-without-reason`); accept it with `lint-allow "x11-without-reason"
-reason="…"`. `steam` and `lutris` ship it because their windows want the
-session's window manager.
+reason="…"`. `steam` and `lutris` ship it because their windows want a
+window manager; `x11 geometry="…" wm="…"` on the nested server is the thing to
+try before accepting that.
 
 The X SECURITY extension's untrusted mode is not offered as a third choice: an
 untrusted client is granted `XC-MISC` and `BIG-REQUESTS` and nothing else
@@ -213,7 +238,8 @@ host).
 
 - `x11 "host"`: no isolation between the X clients on your display, and no
   Wayland security context on the session's Xwayland. The nested default runs
-  without a window manager.
+  without a window manager; bubbler ships none, so `wm=` needs one installed
+  on the host.
 - `input-method` has never been exercised against a running fcitx5 or IBus:
   neither is installed on this machine.
 - AMD compute (`/dev/kfd` + sysfs topology) unsupported; NVIDIA compute needs
