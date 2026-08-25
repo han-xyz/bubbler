@@ -7,12 +7,15 @@
 
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::io::Read;
+use std::fs::File;
+use std::io::{Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, Stdio};
 use std::time::{Duration, Instant};
+
+use rustix::fs::{FlockOperation, flock};
 
 use bubbler_wl_proxy::policy::PRIVILEGED;
 use bubbler_wl_proxy::tables::{self, Interface};
@@ -24,6 +27,35 @@ const PATIENCE: Duration = Duration::from_secs(5);
 
 /// The value the clipboard test copies and tries to read back.
 const SECRET: &str = "bubbler-clipboard-probe";
+
+/// The clipboard tool that owns the selection while the gate is tested.
+const WL_COPY: &str = "wl-copy";
+
+/// Its other half: how the test learns what it is about to take away, so it
+/// can put it back.
+const WL_PASTE: &str = "wl-paste";
+
+/// The types a selection is read and put back through, best first. Not simply
+/// the first one listed: rich text advertises `text/html` ahead of its plain
+/// fallback, and a selection copied out of a browser would come back as markup
+/// pasted into a plain-text field.
+const RESTORE_TYPES: &[&str] = &[
+    "text/plain;charset=utf-8",
+    "text/plain",
+    "UTF8_STRING",
+    "STRING",
+    "TEXT",
+];
+
+/// X11 selection bookkeeping, which Xwayland advertises beside the content and
+/// lists first. Never what to read, whatever order it comes in.
+const NOT_CONTENT: &[&str] = &["TARGETS", "TIMESTAMP", "MULTIPLE", "SAVE_TARGETS"];
+
+/// How long the selection is given to become what it was just set to.
+/// `wl-copy` forks to the background to serve what it copied, so the process a
+/// caller waited for is gone before the compositor has necessarily handed the
+/// selection over.
+const SELECTION_SETTLE: Duration = Duration::from_secs(5);
 
 /// The compositor's own socket, or `None` with a printed reason.
 fn host_socket() -> Option<PathBuf> {
@@ -289,6 +321,7 @@ impl Client {
 /// Run a program, killing it if it outlives `wait`, and answer its stdout.
 fn bounded(command: &mut Command, wait: Duration) -> Option<Vec<u8>> {
     let mut child = command
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -422,23 +455,206 @@ fn binding_a_global_the_proxy_hid_is_refused_by_name() {
     );
 }
 
+/// One clipboard tool on the session's own display, with none of the
+/// harness's descriptors on it.
+///
+/// `wl-copy` goes to the background to serve what it copied, as every
+/// clipboard owner must, and a daemon holding the pipe `cargo test` is writing
+/// its output down is a `cargo test | cat` that never reaches end of file.
+/// A caller that needs one of the three back asks for it.
+fn clipboard_tool(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+/// What the selection is holding, as far as this test can tell.
+enum Held {
+    /// Nothing on it.
+    Empty,
+    /// This type, and the bytes under it.
+    Bytes(String, Vec<u8>),
+    /// Something is on it that could not be read back. A test must not take a
+    /// selection it has no way of giving back.
+    Unreadable(String),
+}
+
+/// The type to read a selection through, out of everything `wl-paste` listed.
+fn restore_type(types: &[&str]) -> Option<String> {
+    let best = RESTORE_TYPES
+        .iter()
+        .find(|want| types.contains(*want))
+        .or_else(|| types.iter().find(|kind| !NOT_CONTENT.contains(*kind)))?;
+    Some((*best).to_owned())
+}
+
+/// What is on the selection right now.
+///
+/// `--list-types` first because a plain `wl-paste` fails on a selection that is
+/// not text, and a test must not conclude the user's clipboard was empty
+/// because it could not read an image.
+fn selection_now() -> Held {
+    let Ok(listed) = clipboard_tool(WL_PASTE)
+        .arg("--list-types")
+        .stdout(Stdio::piped())
+        .output()
+    else {
+        return Held::Unreadable("wl-paste did not run".to_owned());
+    };
+    // A selection with nothing on it is what `wl-paste` exits non-zero for.
+    if !listed.status.success() {
+        return Held::Empty;
+    }
+    let text = String::from_utf8_lossy(&listed.stdout);
+    let types: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty())
+        .collect();
+    if types.is_empty() {
+        return Held::Empty;
+    }
+    let Some(mime) = restore_type(&types) else {
+        return Held::Unreadable(format!("only bookkeeping types on it: {types:?}"));
+    };
+    match clipboard_tool(WL_PASTE)
+        .args(["--no-newline", "--type", &mime])
+        .stdout(Stdio::piped())
+        .output()
+    {
+        Ok(out) if out.status.success() => Held::Bytes(mime, out.stdout),
+        _ => Held::Unreadable(format!("wl-paste read nothing as {mime}")),
+    }
+}
+
+/// Wait until the selection reads back as `want`, or until the deadline.
+/// `None` is a selection with nothing on it.
+fn selection_settles(want: Option<&[u8]>) -> bool {
+    let deadline = Instant::now() + SELECTION_SETTLE;
+    loop {
+        let settled = match (selection_now(), want) {
+            (Held::Bytes(_, back), Some(want)) => back == want,
+            (Held::Empty, None) => true,
+            _ => false,
+        };
+        if settled {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The session's selection, owned by one test at a time and given back the way
+/// it was found.
+///
+/// There is one of it, and a `wl-copy` from one test is the offer another is
+/// halfway through reading. A file lock and not a `Mutex` because two
+/// `cargo test` processes on one login share the selection exactly as two
+/// threads of one do — this crate's suite and the CLI crate's take the same
+/// lock — and the kernel drops a `flock` when its holder exits, so a suite
+/// that crashed leaves nothing stale behind. The same reasoning, and the same
+/// lock file, as `crates/bubbler/tests/cli.rs`; a test crate cannot share code
+/// with another without a dependency between them.
+struct Selection {
+    /// The lock file, whose open description is the lock.
+    _lock: File,
+    /// What was on the selection before this test took it, in the one flavour
+    /// [`restore_type`] picked. `None` only where it was empty.
+    previous: Option<(String, Vec<u8>)>,
+}
+
+impl Drop for Selection {
+    /// Give the user their clipboard back. This runs before any field of the
+    /// struct is dropped, so it still holds the lock and cannot race the next
+    /// test's copy — and it runs on the way out of a failed assertion, which
+    /// is exactly when the selection would otherwise be left saying `secret`.
+    ///
+    /// Where the selection could not be read, the test skipped rather than
+    /// take it, so `--clear` here is only ever an empty selection put back the
+    /// way it was found.
+    fn drop(&mut self) {
+        let Some((mime, bytes)) = &self.previous else {
+            let _ = clipboard_tool(WL_COPY).arg("--clear").status();
+            selection_settles(None);
+            return;
+        };
+        let Ok(mut child) = clipboard_tool(WL_COPY)
+            .args(["--type", mime])
+            .stdin(Stdio::piped())
+            .spawn()
+        else {
+            return;
+        };
+        if let Some(mut feed) = child.stdin.take() {
+            let _ = feed.write_all(bytes);
+        }
+        let _ = child.wait();
+        // Still under the lock, which is what the lock is for: the next test
+        // must not look at the selection while this is on its way.
+        selection_settles(Some(bytes));
+    }
+}
+
+/// Take the selection: the lock first, then a look at what was on it.
+///
+/// `None` (after printing why) when something is on it that cannot be read
+/// back. Taking a selection with no way of returning it would cost the user
+/// their clipboard, which no assertion is worth.
+fn hold_the_selection() -> Option<Selection> {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")?;
+    let path = Path::new(&dir).join("bubbler-test-selection.lock");
+    let lock = File::create(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+    flock(&lock, FlockOperation::LockExclusive)
+        .expect("an exclusive lock on a file this process has just created");
+    // Under the lock: whatever is on it now is the user's, and no other test
+    // may replace it between this look and the copy that follows.
+    let previous = match selection_now() {
+        Held::Empty => None,
+        Held::Bytes(mime, bytes) => Some((mime, bytes)),
+        Held::Unreadable(why) => {
+            println!("skipped: this session's selection cannot be put back ({why})");
+            return None;
+        }
+    };
+    Some(Selection {
+        _lock: lock,
+        previous,
+    })
+}
+
 #[test]
 fn the_gate_decides_whether_a_paste_reads_anything() {
     let Some(host) = host_socket() else { return };
-    if !have("wl-copy") || !have("wl-paste") {
+    if !have(WL_COPY) || !have(WL_PASTE) {
         println!("skipped: wl-clipboard is not installed");
         return;
     }
-    // wl-copy stays in the background as the owner of the selection until it
-    // is replaced, which the end of this test does.
-    assert!(
-        bounded(Command::new("wl-copy").arg("--").arg(SECRET), PATIENCE).is_some(),
-        "wl-copy did not take the selection"
-    );
+    // Held for the whole test, and given back when it drops — including on
+    // the way out of a failed assertion below.
+    let Some(_selection) = hold_the_selection() else {
+        return;
+    };
+    // `wl-copy` forks to serve what it copied, so the selection is not the
+    // test's until it reads back as such.
+    let copied = clipboard_tool(WL_COPY)
+        .arg("--")
+        .arg(SECRET)
+        .status()
+        .is_ok_and(|status| status.success());
+    if !copied || !selection_settles(Some(SECRET.as_bytes())) {
+        println!("skipped: wl-copy put nothing on the selection");
+        return;
+    }
 
     let open = Proxy::start(&host, "open", false);
     let read = bounded(
-        Command::new("wl-paste")
+        Command::new(WL_PASTE)
             .arg("--no-newline")
             .env("XDG_RUNTIME_DIR", open.dir.path())
             .env("WAYLAND_DISPLAY", "wayland"),
@@ -449,7 +665,7 @@ fn the_gate_decides_whether_a_paste_reads_anything() {
 
     let mut paste = Proxy::start(&host, "paste", false);
     let denied = bounded(
-        Command::new("wl-paste")
+        Command::new(WL_PASTE)
             .arg("--no-newline")
             .env("XDG_RUNTIME_DIR", paste.dir.path())
             .env("WAYLAND_DISPLAY", "wayland"),
@@ -466,6 +682,4 @@ fn the_gate_decides_whether_a_paste_reads_anything() {
         log.contains("clipboard read denied"),
         "no audit line: {log:?}"
     );
-
-    let _ = bounded(Command::new("wl-copy").arg("--clear"), PATIENCE);
 }
