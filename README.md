@@ -42,7 +42,7 @@ with commented examples to start from. Full list: [Commands](docs/wiki/Commands.
 ## Config
 
     // bubbler profile: firefox
-    wayland                          // security-context socket; "host" for the session's
+    wayland                          // security-context socket, proxied; "host" for the session's
     dri
     pipewire
     network                          // own namespace via pasta; "host" for the host's
@@ -54,10 +54,16 @@ with commented examples to start from. Full list: [Commands](docs/wiki/Commands.
     command "firefox"
 
 Every grant is one node; unknown nodes are errors; a share whose source is
-missing is an error, never a weaker sandbox. The baseline every sandbox gets:
-all namespaces unshared, no network, read-only `/usr`, an `/etc` allowlist,
-a private home at `/home/bubbler`, a cleared environment, `--new-session`,
-`--die-with-parent`, and a seccomp denylist covering x86_64 and i386.
+missing is an error, never a weaker sandbox. A bare `wayland` puts
+`bubbler-wl-proxy` in front of the compositor socket: it decodes every message,
+refuses a bind of a global the sandbox was never offered, and forwards a
+clipboard read only within a second of a key, button or touch of yours, so an
+application cannot poll the selection in the background for whatever you copy
+next (`wayland clipboard="open"` drops that gate and lint warns). The baseline
+every sandbox gets: all namespaces unshared, no network, read-only `/usr`, an
+`/etc` allowlist, a private home at `/home/bubbler`, a cleared environment,
+`--new-session`, `--die-with-parent`, and a seccomp denylist covering x86_64
+and i386.
 Reference: [Configuration](docs/wiki/Configuration.md).
 
 ## Profiles

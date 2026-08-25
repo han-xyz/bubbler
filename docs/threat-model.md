@@ -62,11 +62,12 @@ and the one the mechanism table covers.
 
 ### 2. Sandbox ↔ sidecars
 
-Six processes can come with a sandbox, and they are not one kind of thing:
+Seven processes can come with a sandbox, and they are not one kind of thing:
 
 | Sidecar | Where it runs | Is it a boundary? |
 |---|---|---|
 | `xdg-dbus-proxy` | its own bwrap sandbox, sibling of the app's | **Yes.** It is a filter, it sees only the host bus sockets read-only — up to three of them — and the instance's `dbus/` subdirectory read-write, and the socket it serves is moved out of its reach before anything is bound. |
+| `bubbler-wl-proxy` | its own bwrap sandbox, sibling of the app's, in front of every bare `wayland` | **Yes.** It is the only thing listening on the socket the sandbox connects to, and it forwards nothing it could not decode: every message is parsed against generated interface tables and re-encoded from what was parsed. It sees all of the sandbox's display traffic in both directions and holds two descriptors — the app-facing listener, handed in by number, and its connection to the compositor. The upstream socket is the one thing of the run bound into its sandbox: no home, no network, no instance runtime directory, no `init.sock`, default seccomp. It does not see what a clipboard read returns; those bytes travel on a descriptor it passes through without reading. |
 | `bubbler-init` | *inside* the sandbox, as pid 2 | **No.** It is the supervisor, not a guard: it shares the sandbox with the application. What it holds — the listening control socket — is kept from the application by being an inherited descriptor with no path, `CLOEXEC` in the only process that has it, and `PR_SET_DUMPABLE` off so `/proc/<init>/fd` cannot be walked. |
 | `Xwayland` | *inside* the sandbox, started by `bubbler-init` on the first X connection, only with a bare `x11` | **No.** It is the sandbox's own X server rather than a guard in front of one: every client on it is a process of this instance, and X11 isolates none of them from each other. What it replaces is the session's display — it reaches the compositor on the instance's own Wayland socket and listens nowhere but `/tmp/.X11-unix/X0` in the sandbox's private `/tmp`, a socket `bubbler-init` binds and hands over rather than one the server opens. A command that never speaks X11 never starts it. See "X11" below. |
 | a window manager | *inside* the sandbox, started by `bubbler-init` with the server, only with `x11 wm="…"` | **No.** It is a sibling of the application under `bubbler-init`, resolved on the sandbox's own `PATH`, with the same access to that X server as the application it manages and no more reach into it than any other sibling has. Arch enables the Yama LSM with `kernel.yama.ptrace_scope` at 1 (restricted), which stops a `ptrace` on a tracee outside a restricted scope unless the tracer is privileged or holds `CAP_SYS_PTRACE`; the kernel's Yama document defines that scope as the tracer's own descendants, `PR_SET_PTRACER` being the opt-in, and two siblings are outside each other's. bubbler ships none and probes none; a name that resolves to nothing is a log line. |
@@ -78,6 +79,9 @@ Six processes can come with a sandbox, and they are not one kind of thing:
 `the_proxy_never_sees_the_instances_control_socket`,
 `a_proxied_socket_is_moved_out_of_the_proxys_reach`,
 `proxy_argv_runs_the_proxy_in_its_own_sandbox`,
+`wl_proxy_argv_runs_the_proxy_in_its_own_sandbox`,
+`real_wayland_proxy_serves_the_only_socket_the_sandbox_sees`,
+`real_wayland_a_proxy_that_will_not_start_stops_the_run`,
 `the_x_server_is_not_started_until_a_client_connects`,
 `the_window_manager_starts_with_the_server_and_the_shutdown_runs_inwards`,
 `the_nft_child_holds_cap_net_admin_and_is_fed_the_ruleset`,
@@ -205,31 +209,171 @@ describes goes on to refuse.
 
 **Defends:** a `wayland` grant binds a socket bubbler listens on itself,
 registered with the compositor through `wp_security_context_v1` as engine
-`org.bubbler`, app id `org.bubbler.<inst>`, instance id `bubbler-<inst>`,
-and bound into the sandbox at the session's `WAYLAND_DISPLAY` name. A
-client on it is one the compositor knows to be sandboxed, and the
-compositor withholds its privileged globals from such a client. Measured
-on Hyprland 0.56.2: 40 globals inside against 71 on the host, without
-screencopy, either data-control manager, the virtual keyboard and pointer
-protocols, layer-shell, foreign-toplevel, session-lock, or the security
-context manager itself. Recording the screen, reading the clipboard
-without focus and injecting input into the session are what those cost.
+`org.bubbler`, app id `org.bubbler.<inst>`, instance id `bubbler-<inst>`.
+A client on it is one the compositor knows to be sandboxed, and the
+compositor withholds its privileged globals from such a client. The
+sandbox does not connect to that socket: it connects to a second one
+beside it, `<instance runtime>/wayland`, which `bubbler-wl-proxy` serves
+and which is bound into the sandbox at the session's `WAYLAND_DISPLAY`
+name; the security-context socket is the proxy's upstream. Measured on
+Hyprland 0.56.2: `wayland-info` counted 73 globals over 71 interfaces on
+the host and 38 over 37 inside. Thirty-one interfaces are the
+compositor's doing — screencopy and image-copy-capture, both data-control
+managers, the virtual keyboard and pointer protocols, layer-shell,
+foreign-toplevel and workspace listing, session-lock, global shortcuts,
+gamma and output control, and the security context manager itself, so a
+sandbox cannot create a context of its own. Recording the screen, reading
+the clipboard without focus and injecting input into the session are what
+those cost.
 
-**Does not defend:** which globals are hidden is the compositor's policy
-and not bubbler's — bubbler attaches the metadata and the compositor does
-every bit of the enforcing, so the grant is worth what the compositor
-implements. A compositor with no `wp_security_context_manager_v1` gets the
-session socket and a warning on every launch, and `wayland "host"` asks
-for that socket outright (lint `wayland-host`). The session's Xwayland is
-outside all of it: `x11 "host"` reaches a server that is an ordinary
-client of your session, though a bare `x11` starts one on this socket
-(below). A focused client is still handed the selection through the core
-`wl_data_device`, as any application is.
+The other three interfaces are the proxy's: it hides every global whose
+interface its tables cannot describe, clamps an advertised version down to
+the version the tables know, and refuses a `wl_registry.bind` of a global
+this connection was never offered — hidden, unknown, or above the version
+it saw — with a synthesised `wl_display.error` and a closed connection.
+That last check is the one that matters: hiding a global from
+`wl_registry.global` does not stop a client naming it by number, and a
+draft that only withheld advertisements was bound straight through by
+exactly that route while this was being built. On a compositor with no
+security context the
+proxy applies a denylist of its own — 31 interface names, read off what
+Hyprland withholds from a sandboxed client and written down as the class
+rather than as one compositor's policy — and the launch says so with a
+note.
+
+**Does not defend:** on the security-context path, which globals are
+hidden is the compositor's policy and not bubbler's — bubbler attaches the
+metadata and the compositor does every bit of the enforcing, so the grant
+is worth what the compositor implements. On the fallback path the list is
+bubbler's own and is a denylist, so a privileged protocol no one has added
+to it reaches the sandbox. `wayland "host"` asks for the session socket
+outright, with no context and no proxy at all (lint `wayland-host`). The
+session's Xwayland is outside all of it: `x11 "host"` reaches a server that
+is an ordinary client of your session, though a bare `x11` starts one on
+this socket (below) which the proxy filters and gates like anything else.
+
+The proxy is also not a shield in front of the compositor. Everything it
+can parse it re-encodes and forwards, so a message that is well formed and
+hostile arrives exactly as it would have without a proxy; what it removes
+is what it could not parse and what it was told to refuse, not exploit
+attempts inside protocols it does understand. A compositor's own bugs are
+the compositor's. And the sidecar is what the compositor sees: peer
+credentials on the connection are the proxy's, so a window the sandbox maps
+is attributed to the `bubbler-wl-proxy` process and a window rule keyed on
+a pid names the sidecar.
 
 [wayland](manual.md#wayland) ·
 `wayland_context_binds_bubblers_socket_at_the_host_name`,
-`wayland_raw_binds_the_host_socket_for_either_reason`,
-`real_wayland_binds_bubblers_own_socket_not_the_hosts`
+`wayland_host_binds_the_session_socket`,
+`the_application_and_the_compositor_get_different_sockets`,
+`the_fallback_proxy_dials_the_session_socket_and_denies`,
+`the_privileged_list_is_the_measured_one_sorted_and_unique`,
+`policy::tests::a_global_the_tables_do_not_describe_is_hidden_and_remembered`,
+`policy::tests::a_privileged_global_is_hidden_only_under_the_fallback`,
+`policy::tests::an_advertised_version_above_the_tables_is_rewritten`,
+`policy::tests::binding_a_hidden_global_by_its_number_is_refused`,
+`policy::tests::binding_a_global_that_was_never_advertised_is_refused`,
+`policy::tests::binding_above_the_advertised_version_is_refused`,
+`policy::tests::binding_a_name_under_another_interface_is_refused`,
+`a_sandboxed_wayland_grant_names_the_proxy_in_front_of_it`,
+`real_wayland_binds_bubblers_own_socket_not_the_hosts`,
+`real_wayland_proxy_hands_the_application_a_smaller_registry`,
+`real_wayland_proxy_refuses_a_hidden_bind`
+
+### Clipboard
+
+The clipboard is not a buffer somewhere: on both Xorg and Wayland its
+content is held by the program that copied it, and nothing is copied
+until it is pasted — close that program and the content is gone unless a
+clipboard manager kept its own copy (archwiki, "Clipboard"). A read is
+therefore a live request, made by a client, that something has to answer,
+which is what makes it a thing a proxy can see and refuse. There are two
+of them per session: PRIMARY, the currently selected text, and CLIPBOARD,
+what an explicit copy put there (same source).
+
+**Defends:** a sandboxed application that is mapped and focused is handed
+the selection by the compositor as core protocol — `wl_data_device.selection`
+arrives immediately before keyboard focus and again on every selection
+change while it has focus — and may `receive` it at any time the offer is
+valid, with no paste and no keystroke behind the read. No compositor gates
+that per client; the security context does not touch it, because reading
+the selection *with* focus is not a privileged protocol. `bubbler-wl-proxy`
+gates it instead. A `receive` on `wl_data_offer`,
+`zwp_primary_selection_offer_v1`, `zwlr_data_control_offer_v1` or
+`ext_data_control_offer_v1` is forwarded only within one second of real
+user input — a `wl_keyboard.key` the compositor reported as pressed, a
+`wl_pointer.button` in either direction, or a `wl_touch.down` — seen on any
+connection of that instance. Outside the window the request is not
+forwarded and the descriptor it carried is closed, so the client reads end
+of file exactly as if the selection had been empty, and one line goes to
+the audit log:
+
+```
+bubbler-wl-proxy: clipboard read denied (wl_data_offer, text/plain): no input since the proxy started
+```
+
+What that stops is background polling: an application reading whatever you
+copy next while your attention is elsewhere. The state is per instance
+rather than per connection on purpose — a multi-process toolkit reads the
+selection on a connection that never held keyboard focus, and gating each
+connection on its own input would deny every one of them.
+
+Refusing a `bind` of a hidden global belongs here too, because the two
+data-control protocols are how a client reads the selection *without*
+focus. Under the security context the compositor never advertises them;
+the proxy additionally refuses them by number, and a sandbox that asks
+gets its connection closed. What is left is measured. The same fixture,
+one host and one sandbox, with `secret` on the selection: a data-control
+client reads 6 bytes on the host and finds no manager inside, and a client
+with no surface is offered nothing in either place, because the compositor
+sends `wl_data_device.selection` only to whoever has keyboard focus. A
+sandbox reaches the selection only as a window you can see, and only when
+the gate is open.
+
+**Does not defend:** an application you are typing into. Your keystrokes
+are exactly what arm the gate, so a focused editor, terminal or browser can
+read the selection within one second of any key you press in it — the gate
+stops a background reader, not a foreground one waiting for you to type.
+Nothing that travels on a passed descriptor is inspected: the selection's
+bytes go down a pipe the compositor writes and the client reads, and the
+proxy judges the request that carries the pipe, never what comes back
+through it. `wayland clipboard="open"` turns the gate off entirely, leaving
+only an audit line per read (lint `wayland-clipboard-open`, which wants a
+`lint-allow` reason), and `wayland "host"` has no proxy in front of it at
+all. Nothing here stops the sandbox *writing* the selection, and nothing
+here is a boundary against a compositor's own bugs. There is no per-MIME
+policy and no prompt.
+
+**Hard limits.** The proxy is bounded rather than trusting: 253 descriptors
+queued per side, which is Linux's own maximum for one `recvmsg`; 4 MiB of
+bytes queued per direction and 64 MiB across all of one instance's
+connections; 65 536 live object ids; 256 connections. Past any of them that
+one connection is closed with a `connection closed: …` line and the rest
+keep running. The gate window is one second and the audit log is one line a
+second per kind — gate lines and closures budgeted apart, so a `receive` in
+a loop cannot push the line that says why a connection ended out of the
+record — with what a burst swallowed counted onto the next line. The
+upstream socket is dialled once before the run starts, bounded at two
+seconds, so a compositor that is not answering stops the launch rather than
+every connection inside it.
+
+[wayland](manual.md#wayland) ·
+`real_wayland_proxy_denies_a_background_read`,
+`real_wayland_proxy_open_allows_the_read`,
+`real_wayland_proxy_opens_the_gate_for_a_keystroke`,
+`real_wayland_proxy_refuses_a_hidden_bind`,
+`real_wayland_proxy_leaves_no_headless_clipboard_path`,
+`policy::tests::a_clipboard_read_without_input_is_denied_on_every_offer`,
+`policy::tests::every_arming_event_opens_the_gate`,
+`policy::tests::a_key_release_does_not_open_the_gate`,
+`policy::tests::the_gate_closes_again_one_millisecond_past_the_window`,
+`policy::tests::an_open_gate_forwards_the_read_and_says_so`,
+`policy::tests::an_offer_the_compositor_created_is_gated_like_any_other`,
+`policy::tests::the_four_gated_offers_are_sorted_and_in_the_tables`,
+`policy::tests::the_privileged_list_is_sorted_so_the_search_cannot_fail_open`,
+`relay::tests::a_hung_up_upstream_with_a_client_that_never_reads_does_not_spin`,
+`wayland_clipboard_takes_open_and_nothing_else`,
+`wayland_clipboard_open_is_a_warning_the_bare_node_does_not_raise`
 
 ### X11
 

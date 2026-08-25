@@ -27,7 +27,7 @@ advice (exit code untouched).
 `mpris-wildcard`, `system-bus-polkit-name`, `home-share-sensitive`,
 `path-share-mountpoint`, `path-share-socket`, `share-source-missing`,
 `dbus-without-rules`, `env-looks-secret`, `tty-passthrough`,
-`portal-talk-without-portals`, `wayland-host`.
+`portal-talk-without-portals`, `wayland-host`, `wayland-clipboard-open`.
 
 **Notes** (information): `app-runtime-rw`, `network-host`, `outbound-deny`,
 `ozone-hint-unnecessary`, `command-not-found`, `desktop-entry-missing`,
@@ -37,6 +37,14 @@ advice (exit code untouched).
 `x11-nested-no-wm` is about the windows inside a nested `x11` server, so a
 config that already asks for the whole output with `fullscreen=#true`, or names
 a window manager to run inside with `wm="twm"`, never gets it.
+
+`wayland-clipboard-open` is about `wayland clipboard="open"`, which turns the
+paste gate off: the sandbox may then read the selection whenever it holds
+keyboard focus, with no keystroke of yours behind the read, and the proxy only
+logs it. Accept it with a `lint-allow` naming what reads the clipboard
+unattended. A bare `wayland` never raises it, and neither does a
+`clipboard="open"` a later layer has replaced with the bare node — the check
+reads the merged mode, not each layer.
 
 Accept a warning or note with a reason:
 
@@ -102,6 +110,24 @@ That config has an `x11` node, which is why its `wayland` group carries no
 a sandbox with no X display in it. The `x11` group sits after `init` because
 its first argument is a `--setenv`, and the environment phase comes after every
 bind — the one that puts `bubbler-init` in place included.
+
+`--explain --wl-proxy` renders the Wayland proxy's own sandbox instead. Its
+`baseline` and `seccomp` groups carry no config line — the sidecar's filter is
+the default set whatever the instance's `seccomp` node says — its `command`
+group holds the proxy's argv (`--listen-fd`, `--upstream`, `--log-fd`,
+`--ready-fd`, and a `--ro-bind` of the binary itself unless it is the installed
+one, already under the read-only `/usr`), and the one part of the argv the
+config decides is grouped under the `wayland` node that decided it:
+
+```
+  wayland   config.kdl:3  2 arguments
+    --gate
+    paste
+```
+
+`--proxy` and `--wl-proxy` each render one sidecar and cannot be combined;
+either without `--explain` is a usage error. A config that starts no such
+sidecar says so instead of printing an empty view.
 
 Groups sit where a node's first argument appears, so the listing is neither
 file order nor argv order; `--dry-run` and `--format json` are the order of

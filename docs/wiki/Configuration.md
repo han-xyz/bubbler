@@ -6,8 +6,10 @@ with the expected type, or the run is refused.
 
 ```kdl
 // bubbler profile: firefox
-wayland                          // socket the compositor treats as sandboxed
-wayland "host"                   // the session socket as it is; lint warns
+wayland                          // socket the compositor treats as sandboxed,
+                                 //   proxied; a clipboard read needs your input
+wayland clipboard="open"         // the same socket, the paste gate off; lint warns
+wayland "host"                   // the session socket as it is, unproxied; lint warns
 x11                              // nested Xwayland, on its first X client
 x11 geometry="2560x1440"         // the window that server draws itself in
 x11 fullscreen=#true grab=#true  // a whole output; input held inside (games)

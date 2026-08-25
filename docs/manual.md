@@ -115,11 +115,12 @@ command's status.
              │                                       │            X client)
              │                                       └─ a window manager (only
              │                                                            with `wm=`)
+             ├─ bwrap ── bwrap ── bubbler-wl-proxy  (with a bare `wayland`)
              ├─ bwrap ── bwrap ── xdg-dbus-proxy    (only with `dbus`)
              └─ pasta                               (only with an isolated
                                                      `network`; not sandboxed)
 
-Each `bwrap` leaves a reaper as pid 1 of its own pid namespace. The proxy's
+Each `bwrap` leaves a reaper as pid 1 of its own pid namespace. Either proxy's
 sandbox is a sibling of the app's, started by `bubbler` and invisible from
 inside it.
 
@@ -299,6 +300,16 @@ applies to the address before it, so the listing reads one bus at a time —
 sidecar's seccomp group carries no line of the config: its filter is the
 default set whatever the instance's `seccomp` node says.
 
+`--explain --wl-proxy` does the same for the Wayland proxy. Its filter is the
+default set for the same reason, and the one part of its argv the config
+decides — `--gate paste` or `--gate open` — is grouped under the `wayland` node
+that decided it, with that node's line number. The two flags cannot be combined:
+each renders one sidecar's argv, and `--proxy --wl-proxy` together is a usage
+error, as is either without `--explain`. A config with no sidecar of that kind
+says so rather than printing an empty view:
+
+    bubbler: instance `wlopen` grants no sandboxed wayland, so it starts no Wayland proxy sidecar
+
 Line numbers are those of the instance's own `config.kdl`, the flattened file
 `create` wrote, not of the profile layer a node was written in; under
 `bubbler try` they are the throwaway instance's copy. `profile show` is what
@@ -320,8 +331,10 @@ job.
 One top-level node per grant, plus `command`. Unknown nodes are errors, and
 file order does not affect the generated argv.
 
-    wayland                          # a socket the compositor treats as sandboxed
-    wayland "host"                   # the session's own socket instead
+    wayland                          # a socket the compositor treats as sandboxed,
+                                     #   behind a proxy that gates clipboard reads
+    wayland clipboard="open"         # the same socket, the gate off; lint warns
+    wayland "host"                   # the session's own socket instead, no proxy
     x11                              # a rootful Xwayland inside the sandbox,
                                      #   started by its first X client:
                                      #   1280x720, decorated, DISPLAY=:0
@@ -500,17 +513,18 @@ an allowlist of what a sandboxed client may bind, sway a denylist of what it may
 not — so what a bare `wayland` grant costs is what the compositor implements.
 bubbler attaches the metadata and nothing else.
 
-Measured here on Hyprland 0.56.2: a client inside saw 40 globals where one on
-the host saw 71. Missing from the sandbox's list were the screencopy manager
-(recording the screen with no portal in between), both data-control managers,
-the virtual keyboard and virtual pointer protocols (typing and clicking into
-your session), layer-shell (drawing over everything), foreign-toplevel (listing
-and controlling other windows), session-lock, and
-`wp_security_context_manager_v1` itself — the protocol hides it from sandboxed
-clients, so a sandbox cannot create a context of its own. What the data-control
-managers cost an application is reading the clipboard without focus: copy and
-paste through the focused window is the core `wl_data_device`, which is not
-privileged, and works inside as it does anywhere.
+Measured here on Hyprland 0.56.2: `wayland-info` counted 73 globals over 71
+interfaces on the host and 38 over 37 inside a bare `wayland` sandbox. Thirty-one
+of those interfaces the compositor withholds from a security-context client —
+the screencopy manager (recording the screen with no portal in between), both
+data-control managers, the virtual keyboard and virtual pointer protocols
+(typing and clicking into your session), layer-shell (drawing over everything),
+foreign-toplevel and workspace listing, session-lock, and
+`wp_security_context_manager_v1` itself, so a sandbox cannot create a context of
+its own. The other three are the proxy's doing and are described below. What the
+data-control managers cost an application is reading the clipboard without
+focus; reading it *with* focus is the core `wl_data_device`, which is not
+privileged on any compositor and is what the proxy gates instead.
 
 The compositor keeps accepting connections on that socket after bubbler's own
 connection to it is gone, until the descriptor it was given as `close_fd` hangs
@@ -518,12 +532,173 @@ up. bubbler holds the write end of that pipe for the length of the run, so the
 context ends when the run does and the socket file goes with it.
 
 The application does not connect to that socket itself. bubbler binds a second
-one beside it — `<instance runtime>/wayland`, which is what the sandbox sees —
-and runs `bubbler-wl-proxy` between the two in a bwrap of its own, so every
-message the application sends the compositor is decoded and judged first, and
-where a clipboard read is gated on input of the user's. The sidecar is started
-before the sandbox and stopped with it, and `bubbler run … --explain --wl-proxy`
-prints the bwrap argv it runs under.
+one beside it — `<instance runtime>/wayland`, which is what the sandbox sees at
+the session's display name — moves the security-context socket to `<instance
+runtime>/wayland-context`, and runs `bubbler-wl-proxy` between the two in a
+bwrap of its own. The sidecar is started before the sandbox and stopped with it.
+The listening socket reaches it as an inherited descriptor rather than a path,
+so the only thing of this run bound into that sandbox is the upstream socket,
+read-only: the proxy can reach neither the instance's runtime directory nor the
+`init.sock` in it. It gets the read-only `/usr`, the `/etc` allowlist every
+sidecar gets, a private `/proc`, `/dev` and `/tmp`, a cleared environment and
+the default seccomp filter — the instance's own `seccomp` node never reaches it.
+`bubbler run … --explain --wl-proxy` prints that argv:
+
+    bwrap  (the Wayland proxy sidecar)
+
+      baseline                42 arguments
+        --unshare-all
+        --die-with-parent
+        --new-session
+        --ro-bind /usr /usr
+        --symlink usr/bin /bin
+        ... 33 more (--explain=full)
+
+      seccomp                 2 arguments
+        --add-seccomp-fd 5  (filter, 896 bytes, x86_64 + i386)
+
+      command                 13 arguments
+        --ro-bind /home/han/Projects/bubbler/target/debug/bubbler-wl-proxy /home/han/Projects/bubbler/target/debug/bubbler-wl-proxy
+        --
+        /home/han/Projects/bubbler/target/debug/bubbler-wl-proxy
+        --listen-fd
+        3
+        --upstream
+        /run/user/1000/bubbler/try-631049/wayland-context
+        --log-fd
+        2
+        --ready-fd
+        4
+
+      wayland   config.kdl:3  2 arguments
+        --gate
+        paste
+
+    59 arguments in 4 groups, 33 hidden (--explain=full)
+
+That was printed from a build tree, which is why the binary is bound in at its
+own path; an installed one sits under the read-only `/usr` the sidecar already
+has and needs no bind. The descriptor numbers are a dry run's, as everywhere
+else under `--explain`.
+
+The binary is `$BUBBLER_WL_PROXY` if that is set, else the one beside the
+running `bubbler`, else `/usr/lib/bubbler/bubbler-wl-proxy` — the same order
+`bubbler-init` is looked up in, so a build tree runs what it just built. One
+found outside `/usr` is bound into the sidecar's sandbox at its own path; an
+installed one is already under the read-only `/usr` that sandbox has. A
+`wayland` grant with no proxy to run is a failed run and not a weaker one:
+
+    bubbler: running a throwaway sandbox: bubbler-wl-proxy did not start; it exited (exit status: 1)
+
+Before it reports itself ready the proxy dials the upstream socket once, so a
+compositor that is not answering stops the launch rather than every connection
+inside it. That probe is bounded at two seconds — a Unix socket whose accept
+queue is full answers `EAGAIN` rather than blocking, so the dial is retried
+every 50 ms until the deadline — and the launcher then reports
+`bubbler-wl-proxy: cannot reach the upstream socket <path>: timed out after
+2 s`.
+
+What the proxy does with the wire is decode it. Every message is read against a
+table of interfaces and message signatures generated at build time from the
+protocol XML the `wayrs` crates ship, and what is forwarded is *re-encoded*
+from the arguments the policy saw rather than copied through, so the far side
+reads exactly what this proxy parsed and judged. An interface the tables do not
+describe is one the proxy cannot read a single message for, so its globals are
+never advertised; a global advertised at a version above the tables' is clamped
+to the version they describe, because a client that bound the higher one would
+send opcodes past the end of the message list. Three interfaces went that way
+on this host — `wl_drm`, `org_kde_kwin_server_decoration_manager` and
+`hyprland_surface_manager_v1` — and the first two have current replacements
+present inside (`zwp_linux_dmabuf_v1`, `zxdg_decoration_manager_v1`) while
+nothing here binds the third.
+
+Hiding the advertisement is not enough on its own: `wl_registry.bind` names a
+global by a number, and a client can name one it was never shown. So `bind` is
+checked against what this connection was actually offered — a name it never
+saw, an interface that is not the one that name was advertised under, or a
+version above what it was offered is refused with a synthesised
+`wl_display.error` and the connection is closed. Asking inside a sandbox for
+the number `zwlr_data_control_manager_v1` has on this host:
+
+    refused: bind of hidden global zwlr_data_control_manager_v1 (name 38, v1) refused by the sandbox proxy
+    bubbler-wl-proxy: connection closed: bind of hidden global zwlr_data_control_manager_v1 (name 38, v1) refused by the sandbox proxy
+
+The proxy is also what a hostile client would try to exhaust, so it is bounded
+in every direction: 253 descriptors queued per side, which is Linux's own
+maximum for one `recvmsg`; 4 MiB of bytes queued per direction and 64 MiB
+across all of one instance's connections; 65 536 live object ids; 256
+connections. Past any of them that connection is closed with a
+`bubbler-wl-proxy: connection closed: …` line, and the others keep running.
+
+**The paste gate.** This is the rule the proxy exists for. A `receive` request
+on `wl_data_offer`, `zwp_primary_selection_offer_v1`,
+`zwlr_data_control_offer_v1` or `ext_data_control_offer_v1` is forwarded only
+within one second of real user input: a `wl_keyboard.key` the compositor
+reported as pressed, a `wl_pointer.button` in either direction, or a
+`wl_touch.down`. The window is one second and the state is per instance rather
+than per connection — an application with helper processes reads the selection
+on a connection that never held keyboard focus, and gating each connection on
+its own input would deny every multi-process toolkit. Outside the window the
+request is not forwarded and the descriptor it carried is closed, so the client
+reads end of file, exactly as if the selection had been empty, and one line
+goes to the log. Run with `secret` on the session's selection, a client that
+maps a window, takes focus, is offered the selection and reads it:
+
+    0
+    bubbler-wl-proxy: clipboard read denied (wl_data_offer, text/plain): no input since the proxy started
+
+Once something has armed the gate the tail counts the gap instead — `no input
+for <n> ms`, the same refusal either way. Audit lines go to bubbler's own
+stderr, which for a run without a terminal is `last-run.log` (see "Terminal"),
+and are rate-limited to one a second: gate lines and connection-closed lines
+have a budget each, counted apart so a
+`receive` in a tight loop cannot spend the log's whole allowance and push the
+line that says why a connection ended out of the record. What a burst swallowed
+rides on the next line of its kind as a count.
+
+Be clear about what that is worth. It stops an application reading the
+selection *in the background*: mapped, focused, handed the offer by the
+compositor, and reading it while your attention is elsewhere — which is the
+case this exists for, and which needs no paste and no keystroke. It does not
+stop an application you are typing into. The keystrokes you send it are exactly
+what arms the gate, so a focused editor or terminal can read the selection
+within a second of any key you press in it. And it inspects nothing that
+travels on a passed descriptor: the selection's bytes go down a pipe the
+compositor writes and the client reads, and the proxy's decision is made on the
+request that carries the pipe, never on what comes back through it.
+
+An application whose job *is* the clipboard can have the gate off:
+
+    wayland clipboard="open"
+
+The proxy stays in front of the socket and everything above still applies —
+only the gate goes. Every `receive` is forwarded, and every one is logged
+rather than counted:
+
+    6
+    bubbler-wl-proxy: clipboard read allowed (open): wl_data_offer, text/plain
+
+`bubbler lint` warns about it (`wayland-clipboard-open`) and takes a
+`lint-allow "wayland-clipboard-open" reason="…"` naming what reads the
+clipboard unattended. There is no third value. `clipboard="paste"` is refused
+rather than accepted as the default written out, because the emitter renders
+the default as the bare `wayland` node and a second spelling would be a round
+trip the file does not survive unchanged; and `wayland "host"` with any
+`clipboard=` is refused too — no proxy runs on the session socket, so a gate
+written there would be one nothing applies.
+
+One thing the sidecar costs: the compositor reads its peer's credentials from
+the connection (`SO_PEERCRED`), and the peer is the proxy. A window the
+sandboxed application maps is therefore attributed to the `bubbler-wl-proxy`
+process rather than to the application — measured here, `hyprctl clients`
+reported the sidecar's pid for the sandbox's own window. Compositor window
+rules keyed on a pid, and any tool that maps windows back to processes, see the
+sidecar; rules keyed on the application id, the class or the title are
+unaffected.
+
+A bare `x11` changes none of this. The Xwayland it starts inside the sandbox is
+an ordinary client of `<instance runtime>/wayland`, decoded, filtered and gated
+exactly like the application beside it.
 
 A compositor that implements none of this — no `wp_security_context_manager_v1`
 in its globals — is not a failed run: the proxy connects to the session socket
@@ -531,6 +706,18 @@ instead and hides the privileged interfaces itself, in the compositor's place,
 and the launcher says so once per launch.
 
     bubbler: note: wayland: no wp_security_context_manager_v1; the proxy hides the privileged globals instead
+
+On that path the proxy adds a denylist of its own: 31 interface names, the
+class of protocols a compositor hides from a sandboxed client — screen capture,
+both data-control managers, virtual keyboard and pointer, layer-shell,
+foreign-toplevel and workspace listing, session lock, global shortcuts, gamma
+and output control, and the security context manager itself. It is bubbler's
+list rather than any one compositor's policy, and on this host it is exactly
+the set Hyprland withholds from a security-context client. The sidecar line of
+an explanation gains `, hides 31 privileged globals` on that path, which is the
+length of the denylist and not a count of what a given compositor offers — an
+explanation never probes, so one printed from the command line always describes
+the security-context path.
 
 A compositor bubbler cannot reach at all — nothing answering on
 `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY` — stops the run instead, the way a missing
@@ -543,12 +730,14 @@ client is pure Rust (`wayrs`); bubbler links no libwayland.
 
 `wayland "host"` asks for that socket outright, with every global the compositor
 offers, which is what an application that drives one of those protocols itself
-needs — a screen recorder, a clipboard manager, a bar. `bubbler lint` warns
-about it (`wayland-host`) and takes a `lint-allow` node naming the protocol as
-the reason. No shipped profile grants it. The mode is one value and not a set,
-so a layer that includes another replaces it in either direction, tightening
-`"host"` to the security context or widening it back; the lint reads the
-result.
+needs — a screen recorder, a clipboard manager, a bar. No proxy runs in front of
+it either: the sandbox connects to the session socket directly, so nothing
+decodes what it sends and no clipboard read is gated, focused or not. `bubbler
+lint` warns about it (`wayland-host`) and takes a `lint-allow` node naming the
+protocol as the reason. No shipped profile grants it. The mode is one value and
+not a set, so a layer that includes another replaces it in either direction,
+tightening `"host"` to the security context or widening it back; the lint reads
+the result.
 
 `--dry-run` and `--explain` never speak to the compositor, so what they print
 assumes the security context: the bind source is the instance's own socket, and
@@ -2401,8 +2590,9 @@ The short form: the boundary bubbler builds is between your account and the
 application. It is not a boundary against root, not one against your own
 processes outside a sandbox — anything running as your uid can read the
 instance store and connect to a live instance's control socket. On the display,
-`wayland` is a boundary the compositor enforces and a bare `x11` an X server of
-the sandbox's own behind it; `x11 "host"` is no boundary at all.
+`wayland` is a boundary the compositor enforces with a proxy of bubbler's in
+front of it, and a bare `x11` an X server of the sandbox's own behind that;
+`x11 "host"` is no boundary at all.
 
 bubbler itself is unprivileged and unconfined: it can do whatever your account
 can. `contrib/apparmor/usr.bin.bubbler` is an AppArmor profile that would narrow
@@ -2458,6 +2648,21 @@ none of its own.
 - A generated desktop entry closes D-Bus activation for itself only, and its
   `%f` file arguments are host paths the sandbox cannot open; both are under
   "Desktop entries".
+- The clipboard gate stops a *background* read, not a focused application. The
+  keystrokes you type into a sandboxed window are exactly what arms it, so an
+  application you are working in can read the selection within a second of any
+  key you press in it, and `clipboard="open"` drops the gate entirely. Nothing
+  travelling on a passed descriptor is inspected either — the proxy judges the
+  request that carries the pipe, not the bytes that come back; see "wayland".
+- A window a sandboxed application maps is attributed by the compositor to the
+  `bubbler-wl-proxy` sidecar, whose credentials the connection carries.
+  Compositor window rules keyed on a pid, and any tool that maps windows back to
+  processes, name the sidecar rather than the application; see "wayland".
+- The proxy's interface tables are generated at build time from the protocol XML
+  the `wayrs` crates ship, so a protocol newer than those crates is one the
+  proxy cannot parse and therefore hides from the sandbox. Three interfaces went
+  that way on this host; two of them have current replacements the sandbox does
+  get. Refreshing the tables means bumping those crates; see "wayland".
 - `x11 "host"` bypasses the Wayland security context: those clients speak to a
   server that is a client of your session's own socket, so what a compositor
   withholds from a sandboxed client it does not withhold there; see "wayland".
@@ -2479,10 +2684,12 @@ which together with the shim directory below is all bubbler ever writes to
 outside its own state. Every
 run except a dry run or an explanation also creates
 `$XDG_RUNTIME_DIR/bubbler/<name>/`, mode 0700, reusing one left over from an
-earlier run, and binds the control socket `init.sock` in it; a `dbus`,
-`system-bus` or `a11y` grant adds the subdirectory `dbus/` the proxy creates
-its sockets in and the checked sockets `bus`, `system` and `a11y` — one per
-granted bus — beside it, and a `portals` grant adds
+earlier run, and binds the control socket `init.sock` in it; a bare `wayland`
+grant adds `wayland`, the socket the sandbox connects to and `bubbler-wl-proxy`
+serves, and beside it `wayland-context` where the compositor accepts the
+security context; a `dbus`, `system-bus` or `a11y` grant adds the subdirectory
+`dbus/` the proxy creates its sockets in and the checked sockets `bus`,
+`system` and `a11y` — one per granted bus — beside it, and a `portals` grant adds
 `$XDG_RUNTIME_DIR/.flatpak/bubbler-<name>/`, creating `.flatpak/` if it is
 missing. Everything a run makes there is removed again when it ends, with one
 exception: an `app-runtime` grant creates `$XDG_RUNTIME_DIR/app/<id>` (and
@@ -2500,7 +2707,9 @@ the kernel truncate it silently and the connection fail somewhere else.
 
 The `bubbler-init` binary is taken from `$BUBBLER_INIT` if set (it must be a
 regular file), else from next to the `bubbler` binary, else from
-`/usr/lib/bubbler/bubbler-init`. `$BUBBLER_DBUS_PROXY` likewise replaces the
+`/usr/lib/bubbler/bubbler-init`; `bubbler-wl-proxy` is looked up the same way,
+from `$BUBBLER_WL_PROXY`, then next to `bubbler`, then
+`/usr/lib/bubbler/bubbler-wl-proxy`. `$BUBBLER_DBUS_PROXY` likewise replaces the
 `xdg-dbus-proxy` on `PATH` with a regular file bound into the proxy sandbox at
 its own path; it exists for tests and debugging, as do the
 `$BUBBLER_TEST_ALLOW_PATH` described under "Host paths" and
@@ -2511,12 +2720,13 @@ anything.
 ## Build
 
     cargo build --release
-    cargo build --release -p bubbler -p bubbler-init   # without the editor
+    cargo build --release -p bubbler -p bubbler-init -p bubbler-wl-proxy   # no editor
 
-The workspace builds three binaries: `bubbler`, the `bubbler-init` supervisor
-bound into every sandbox, and `bubbler-ui`, the terminal editor. Only the last
-of them links a terminal UI toolkit (see "Terminal editor"), so leaving it out
-is a `-p` away and costs nothing else.
+The workspace builds four binaries: `bubbler`, the `bubbler-init` supervisor
+bound into every sandbox, the `bubbler-wl-proxy` sidecar every sandboxed
+`wayland` grant runs behind, and `bubbler-ui`, the terminal editor. Only the
+last of them links a terminal UI toolkit (see "Terminal editor"), so leaving it
+out is a `-p` away and costs nothing else; the other three are not optional.
 
 Links `libseccomp.so` — the `libseccomp` package on Arch, `libseccomp-dev` on
 Debian for the linker symlink. It is bubbler's only C dependency; everything
