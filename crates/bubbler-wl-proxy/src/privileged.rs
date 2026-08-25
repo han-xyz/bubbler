@@ -1,11 +1,16 @@
 /// Wayland interfaces the proxy hides from a sandbox when the
 /// compositor has no `wp_security_context_v1` to hide them itself:
-/// screen capture, clipboard management without focus, input injection,
-/// session lock, overlays, foreign-toplevel and output control. The
-/// class of privileged protocols, not one compositor's policy — the
-/// names were read off what Hyprland 0.56 withholds from a
+/// screen capture, clipboard management without focus, input injection
+/// and keyboard grabs, session lock, overlays, foreign-toplevel and
+/// output control.
+///
+/// The names were read off what Hyprland 0.56 withholds from a
 /// security-context client (31 of the 71 interfaces the same session
-/// offers a plain one), which is the class spelled out.
+/// offers a plain one), then audited against the proxy's tables for the
+/// protocols of that kind other compositors implement and Hyprland does
+/// not. It is a denylist and nothing more: a privileged protocol nobody
+/// has written down here is advertised to the sandbox on the fallback
+/// path, and adding it is the only thing that hides it.
 ///
 /// Sorted, so a name added out of place is a diff a reader can follow.
 /// Included by both `bubbler-wl-proxy` and `bubbler-core`, so the
@@ -17,6 +22,7 @@ pub const PRIVILEGED: &[&str] = &[
     "ext_image_copy_capture_manager_v1",
     "ext_output_image_capture_source_manager_v1",
     "ext_session_lock_manager_v1",
+    "ext_transient_seat_manager_v1",
     "ext_workspace_manager_v1",
     "hyprland_ctm_control_manager_v1",
     "hyprland_focus_grab_manager_v1",
@@ -31,15 +37,22 @@ pub const PRIVILEGED: &[&str] = &[
     "wp_pointer_warp_v1",
     "wp_security_context_manager_v1",
     "xwayland_shell_v1",
+    "xx_input_method_manager_v2",
     "zwlr_data_control_manager_v1",
+    "zwlr_export_dmabuf_manager_v1",
     "zwlr_foreign_toplevel_manager_v1",
     "zwlr_gamma_control_manager_v1",
+    "zwlr_input_inhibit_manager_v1",
     "zwlr_layer_shell_v1",
     "zwlr_output_manager_v1",
     "zwlr_output_power_manager_v1",
     "zwlr_screencopy_manager_v1",
     "zwlr_virtual_pointer_manager_v1",
+    "zwp_fullscreen_shell_v1",
     "zwp_input_method_manager_v2",
+    "zwp_input_method_v1",
+    "zwp_input_panel_v1",
     "zwp_virtual_keyboard_manager_v1",
+    "zwp_xwayland_keyboard_grab_manager_v1",
     "zxdg_output_manager_v1",
 ];

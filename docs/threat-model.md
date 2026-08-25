@@ -235,11 +235,11 @@ That last check is the one that matters: hiding a global from
 `wl_registry.global` does not stop a client naming it by number, and a
 draft that only withheld advertisements was bound straight through by
 exactly that route while this was being built. On a compositor with no
-security context the
-proxy applies a denylist of its own — 31 interface names, read off what
-Hyprland withholds from a sandboxed client and written down as the class
-rather than as one compositor's policy — and the launch says so with a
-note.
+security context the proxy applies a denylist of its own — 39 interface
+names: the 31 Hyprland withholds from a sandboxed client, plus the
+protocols of that kind other compositors implement, found by reading
+every interface the proxy's tables describe — and the launch says so with
+a note.
 
 **Does not defend:** on the security-context path, which globals are
 hidden is the compositor's policy and not bubbler's — bubbler attaches the
@@ -267,7 +267,7 @@ a pid names the sidecar.
 `wayland_host_binds_the_session_socket`,
 `the_application_and_the_compositor_get_different_sockets`,
 `the_fallback_proxy_dials_the_session_socket_and_denies`,
-`the_privileged_list_is_the_measured_one_sorted_and_unique`,
+`the_privileged_denylist_is_pinned_sorted_and_unique`,
 `policy::tests::a_global_the_tables_do_not_describe_is_hidden_and_remembered`,
 `policy::tests::a_privileged_global_is_hidden_only_under_the_fallback`,
 `policy::tests::an_advertised_version_above_the_tables_is_rewritten`,

@@ -474,24 +474,29 @@ mod tests {
     /// privileged global handed to a sandbox on a compositor that does
     /// not hide it itself. A duplicate would hide the loss of another.
     #[test]
-    fn the_privileged_list_is_the_measured_one_sorted_and_unique() {
-        assert_eq!(PRIVILEGED.len(), 31);
+    fn the_privileged_denylist_is_pinned_sorted_and_unique() {
+        assert_eq!(PRIVILEGED.len(), 39);
         let mut sorted = PRIVILEGED.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.as_slice(), PRIVILEGED);
         // The clipboard managers a sandbox must not reach without focus,
-        // and the capture and injection protocols beside them.
+        // and the capture, injection and grab protocols beside them.
         for name in [
             "zwlr_data_control_manager_v1",
             "ext_data_control_manager_v1",
             "zwlr_screencopy_manager_v1",
+            "zwlr_export_dmabuf_manager_v1",
             "zwp_virtual_keyboard_manager_v1",
+            "zwlr_input_inhibit_manager_v1",
+            "zwp_xwayland_keyboard_grab_manager_v1",
+            "ext_transient_seat_manager_v1",
+            "xx_input_method_manager_v2",
             "wp_security_context_manager_v1",
         ] {
             assert!(PRIVILEGED.contains(&name), "{name}");
         }
-        // The application side of the protocols the class does not
+        // The application side of the protocols the denylist does not
         // cover: hiding these would break input methods and windows.
         for name in ["zwp_text_input_manager_v3", "xdg_wm_base", "wl_seat"] {
             assert!(!PRIVILEGED.contains(&name), "{name}");
