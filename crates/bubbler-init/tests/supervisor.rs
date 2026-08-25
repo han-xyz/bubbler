@@ -57,11 +57,9 @@ fn spawn_locked(
     child
 }
 
-fn start(cmd: &[&str]) -> Started {
-    start_with(cmd, Opts::default())
-}
-
-/// Start the supervisor on an inherited listening socket.
+/// Start the supervisor on an inherited listening socket. Every test
+/// goes through `start_guarded` below instead, which hands what this
+/// returns to a guard that ends the run whatever becomes of the test.
 fn start_with(cmd: &[&str], opts: Opts<'_>) -> Started {
     let tmp = tempfile::tempdir().unwrap();
     let sock = tmp.path().join("init.sock");
@@ -143,7 +141,7 @@ fn exec_with(
 
 #[test]
 fn exec_returns_status_and_sigterm_stops_everything() {
-    let (mut init, sock, _tmp) = start(&["/usr/bin/sleep", "30"]);
+    let (mut init, sock) = start(&["/usr/bin/sleep", "30"]);
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(
         ExitStatus::from_raw(exec(&sock, &["/usr/bin/true"])).code(),
@@ -152,13 +150,13 @@ fn exec_returns_status_and_sigterm_stops_everything() {
     let st = exec(&sock, &["/usr/bin/sh", "-c", "exit 3"]);
     assert_eq!(ExitStatus::from_raw(st).code(), Some(3));
     rustix::process::kill_process(
-        rustix::process::Pid::from_child(&init),
+        rustix::process::Pid::from_child(init.child()),
         rustix::process::Signal::TERM,
     )
     .unwrap();
     let t = Instant::now();
     let status = loop {
-        if let Some(s) = init.try_wait().unwrap() {
+        if let Some(s) = init.child().try_wait().unwrap() {
             break s;
         }
         assert!(t.elapsed() < Duration::from_secs(8), "init did not exit");
@@ -169,18 +167,18 @@ fn exec_returns_status_and_sigterm_stops_everything() {
 
 #[test]
 fn main_exit_code_propagates_and_bad_request_is_ignored() {
-    let (mut init, sock, _tmp) = start(&["/usr/bin/sh", "-c", "sleep 0.5; exit 7"]);
+    let (mut init, sock) = start(&["/usr/bin/sh", "-c", "sleep 0.5; exit 7"]);
     std::thread::sleep(Duration::from_millis(100));
     let s = UnixStream::connect(&sock).unwrap();
     (&s).write_all(b"garbage").unwrap();
     drop(s);
-    let status = wait_within(&mut init, PATIENT);
+    let status = init.wait_within(PATIENT);
     assert_eq!(status.code(), Some(7));
 }
 
 #[test]
 fn main_exit_terminates_leftover_execs() {
-    let (mut init, sock, _tmp) = start(&["/usr/bin/sh", "-c", "sleep 0.3"]);
+    let (mut init, sock) = start(&["/usr/bin/sh", "-c", "sleep 0.3"]);
     let s = UnixStream::connect(&sock).unwrap();
     let null = std::fs::File::open("/dev/null").unwrap();
     let argv = [
@@ -190,7 +188,7 @@ fn main_exit_terminates_leftover_execs() {
     wire::send_request(&s, &argv, 0, [null.as_fd(); 3]).unwrap();
     let st = wire::recv_status(&s).unwrap();
     assert_eq!(ExitStatus::from_raw(st).signal(), Some(15));
-    assert_eq!(wait_within(&mut init, PATIENT).code(), Some(0));
+    assert_eq!(init.wait_within(PATIENT).code(), Some(0));
 }
 
 /// What the sandbox must see when its stdio is a terminal: its own
@@ -271,22 +269,28 @@ fn stop(init: &mut std::process::Child) {
     wait_within(init, PATIENT);
 }
 
-/// How long the guard below gives a run to end on its own. Longer than
-/// the grace the supervisor gives a command that ignores SIGTERM, so a
-/// run that is stopping is reaped by the supervisor rather than orphaned
-/// by the kill that ends the wait.
-const GUARD_LIMIT: Duration = Duration::from_secs(10);
+/// How long the guard below gives a run to end on its own. A shutdown
+/// chains up to four of the supervisor's five second graces — the
+/// command, the exec'd children, the window manager, then the server —
+/// so a shorter wait would end in a kill that orphans whatever the
+/// supervisor had not reached yet, which is the leak the guard is for.
+const GUARD_LIMIT: Duration = Duration::from_secs(25);
 
 /// A supervisor whose run is ended when this drops, whether the test got
 /// to the end or an assertion took it out from under. A run left behind
 /// is not only the supervisor: it holds a fake X server, a window
-/// manager and a command that sleeps for half a minute, all of them on a
-/// temporary tree the test has already deleted.
+/// manager and a command that sleeps for half a minute.
 struct Supervisor {
     init: std::process::Child,
+    /// The tree the run was started on. It is held here rather than by
+    /// the test because a struct drops its fields after its own `Drop`
+    /// has run, where the locals of a test unwinding out of a failed
+    /// assertion drop in reverse: the directory would go first, out from
+    /// under a run still using it.
+    _tmp: tempfile::TempDir,
 }
 
-type Guarded = (Supervisor, PathBuf, tempfile::TempDir);
+type Guarded = (Supervisor, PathBuf);
 
 impl Supervisor {
     /// The process itself, for the tests that signal it by hand or ask
@@ -334,13 +338,18 @@ impl Drop for Supervisor {
 /// Start a supervisor that is ended for the test whatever happens to it.
 fn start_guarded(cmd: &[&str], opts: Opts<'_>) -> Guarded {
     let (init, sock, tmp) = start_with(cmd, opts);
-    (Supervisor { init }, sock, tmp)
+    (Supervisor { init, _tmp: tmp }, sock)
+}
+
+/// The same, for a run that needs nothing beyond its command.
+fn start(cmd: &[&str]) -> Guarded {
+    start_guarded(cmd, Opts::default())
 }
 
 #[test]
 fn the_main_command_given_a_terminal_leads_its_own_session_and_owns_it() {
     let (master, slave) = pty_pair();
-    let (mut init, _sock, _tmp) = start_with(
+    let (mut init, _sock) = start_guarded(
         &["/usr/bin/sh", "-c", TTY_PROBE],
         Opts {
             ctty: true,
@@ -351,7 +360,7 @@ fn the_main_command_given_a_terminal_leads_its_own_session_and_owns_it() {
     // Only the supervisor's copies are left, so the master reads to EIO
     // as soon as the run is over.
     drop(slave);
-    assert_eq!(wait_within(&mut init, PATIENT).code(), Some(0));
+    assert_eq!(init.wait_within(PATIENT).code(), Some(0));
     let out = read_to_end(master.as_fd());
     assert!(out.contains("LEADER"), "not a session leader: {out:?}");
     assert!(out.contains("CTTY"), "/dev/tty is not its own pty: {out:?}");
@@ -361,20 +370,20 @@ fn the_main_command_given_a_terminal_leads_its_own_session_and_owns_it() {
 fn an_exec_request_may_ask_for_the_terminal_it_sends() {
     // No `--ctty`: the flag on the request is what decides, because only
     // the client knows the pty on fd 0 is one it allocated.
-    let (mut init, sock, _tmp) = start(&["/usr/bin/sleep", "30"]);
+    let (mut init, sock) = start(&["/usr/bin/sleep", "30"]);
     std::thread::sleep(Duration::from_millis(200));
     let (status, out) = exec_on_a_pty(&sock, true);
     assert!(out.contains("LEADER"), "not a session leader: {out:?}");
     assert!(out.contains("CTTY"), "/dev/tty is not its own pty: {out:?}");
     assert_eq!(ExitStatus::from_raw(status).code(), Some(0), "{out:?}");
-    stop(&mut init);
+    init.stop();
 }
 
 #[test]
 fn without_the_request_flag_a_terminal_is_left_to_whoever_owns_it() {
     // `--ctty` covers the instance's own command only: an exec whose fd 0
     // may be the user's own terminal must not take it over.
-    let (mut init, sock, _tmp) = start_with(
+    let (mut init, sock) = start_guarded(
         &["/usr/bin/sleep", "30"],
         Opts {
             ctty: true,
@@ -385,15 +394,15 @@ fn without_the_request_flag_a_terminal_is_left_to_whoever_owns_it() {
     let (_, out) = exec_on_a_pty(&sock, false);
     assert!(!out.contains("LEADER"), "took a session anyway: {out:?}");
     assert!(!out.contains("CTTY"), "took the terminal anyway: {out:?}");
-    stop(&mut init);
+    init.stop();
 }
 
 #[test]
 fn unexecutable_request_reports_127() {
-    let (mut init, sock, _tmp) = start(&["/usr/bin/sleep", "30"]);
+    let (mut init, sock) = start(&["/usr/bin/sleep", "30"]);
     let st = exec(&sock, &["/nonexistent/bubbler-test-command"]);
     assert_eq!(ExitStatus::from_raw(st).code(), Some(127));
-    stop(&mut init);
+    init.stop();
 }
 
 /// Promise `len` payload bytes with the three fds attached, then send nothing.
@@ -434,7 +443,7 @@ fn a_closed_socket_fd_is_a_usage_error_not_an_abort() {
 
 #[test]
 fn a_stalled_client_cannot_hold_up_the_supervisor() {
-    let (mut init, sock, _tmp) = start(&["/usr/bin/sleep", "30"]);
+    let (mut init, sock) = start(&["/usr/bin/sleep", "30"]);
     std::thread::sleep(Duration::from_millis(200));
     let stalled = UnixStream::connect(&sock).unwrap();
     send_prefix_and_fds(&stalled, 64);
@@ -449,7 +458,7 @@ fn a_stalled_client_cannot_hold_up_the_supervisor() {
         t.elapsed()
     );
     rustix::process::kill_process(
-        rustix::process::Pid::from_child(&init),
+        rustix::process::Pid::from_child(init.child()),
         rustix::process::Signal::TERM,
     )
     .unwrap();
@@ -458,13 +467,13 @@ fn a_stalled_client_cannot_hold_up_the_supervisor() {
     // measurement: this suite runs its tests as threads of one process,
     // several of them sitting out a five second grace, and a loaded host
     // takes far longer to get round to the exit than the path itself does.
-    assert_eq!(wait_within(&mut init, PATIENT).code(), Some(143));
+    assert_eq!(init.wait_within(PATIENT).code(), Some(143));
     drop(stalled);
 }
 
 #[test]
 fn more_stalled_clients_than_the_table_holds_drops_the_oldest() {
-    let (mut init, sock, _tmp) = start(&["/usr/bin/sleep", "30"]);
+    let (mut init, sock) = start(&["/usr/bin/sleep", "30"]);
     std::thread::sleep(Duration::from_millis(200));
     // One more than the supervisor keeps: the first connection makes room
     // for the last instead of the table growing without bound.
@@ -494,7 +503,7 @@ fn more_stalled_clients_than_the_table_holds_drops_the_oldest() {
         ExitStatus::from_raw(exec(&sock, &["/usr/bin/true"])).code(),
         Some(0)
     );
-    stop(&mut init);
+    init.stop();
     drop(stalled);
 }
 
@@ -773,7 +782,7 @@ fn the_x_server_is_not_started_until_a_client_connects() {
     let run = format!("env > {}; exec sleep 30", seen.display());
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
-    let (mut init, sock, _tmp) = start_guarded(
+    let (mut init, sock) = start_guarded(
         &["/usr/bin/sh", "-c", &run],
         Opts {
             stdio: Some(&fd),
@@ -824,7 +833,7 @@ fn the_window_manager_starts_with_the_server_and_the_shutdown_runs_inwards() {
     let quit = dir.path().join("quit");
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
-    let (mut init, _sock, _tmp) = start_guarded(
+    let (mut init, _sock) = start_guarded(
         &[cmd.to_str().unwrap(), quit.to_str().unwrap()],
         Opts {
             stdio: Some(&fd),
@@ -880,7 +889,7 @@ fn no_child_but_the_server_inherits_the_display_socket() {
     let xsock = dir.path().join("X0");
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
-    let (mut init, sock, _tmp) = start_guarded(
+    let (mut init, sock) = start_guarded(
         &[cmd.to_str().unwrap()],
         Opts {
             stdio: Some(&fd),
@@ -931,7 +940,7 @@ fn a_window_manager_that_cannot_be_started_is_logged_and_the_command_runs_on() {
     let xsock = dir.path().join("X0");
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
-    let (mut init, sock, _tmp) = start_guarded(
+    let (mut init, sock) = start_guarded(
         &["/usr/bin/sleep", "30"],
         Opts {
             stdio: Some(&fd),
@@ -969,7 +978,7 @@ fn a_window_manager_that_exits_is_reported_once_and_the_command_runs_on() {
     let xsock = dir.path().join("X0");
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
-    let (mut init, sock, _tmp) = start_guarded(
+    let (mut init, sock) = start_guarded(
         &["/usr/bin/sleep", "30"],
         Opts {
             stdio: Some(&fd),
@@ -1010,7 +1019,7 @@ fn a_server_that_exits_after_serving_terminates_the_command() {
     let xsock = dir.path().join("X0");
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
-    let (mut init, _sock, _tmp) = start_guarded(
+    let (mut init, _sock) = start_guarded(
         &["/usr/bin/sleep", "30"],
         Opts {
             stdio: Some(&fd),
@@ -1042,7 +1051,7 @@ fn a_command_that_ignores_the_signal_is_killed_when_the_display_goes() {
     let xsock = dir.path().join("X0");
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
-    let (mut init, _sock, _tmp) = start_guarded(
+    let (mut init, _sock) = start_guarded(
         &[cmd.to_str().unwrap()],
         Opts {
             stdio: Some(&fd),
@@ -1082,7 +1091,7 @@ fn a_second_stop_does_not_buy_the_command_another_grace() {
     let xsock = dir.path().join("X0");
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
-    let (mut init, _sock, _tmp) = start_guarded(
+    let (mut init, _sock) = start_guarded(
         &[cmd.to_str().unwrap()],
         Opts {
             stdio: Some(&fd),
@@ -1124,7 +1133,7 @@ fn a_client_that_connects_while_stopping_wakes_nothing() {
     let xsock = dir.path().join("X0");
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
-    let (mut init, _sock, _tmp) = start_guarded(
+    let (mut init, _sock) = start_guarded(
         &[cmd.to_str().unwrap()],
         Opts {
             stdio: Some(&fd),
@@ -1161,7 +1170,7 @@ fn an_exec_is_refused_once_the_run_is_stopping() {
     let xsock = dir.path().join("X0");
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
-    let (mut init, sock, _tmp) = start_guarded(
+    let (mut init, sock) = start_guarded(
         &[cmd.to_str().unwrap()],
         Opts {
             stdio: Some(&fd),
@@ -1198,7 +1207,7 @@ fn a_server_that_cannot_be_spawned_terminates_the_command() {
     let xsock = dir.path().join("X0");
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
-    let (mut init, _sock, _tmp) = start_guarded(
+    let (mut init, _sock) = start_guarded(
         &["/usr/bin/sleep", "30"],
         Opts {
             stdio: Some(&fd),
