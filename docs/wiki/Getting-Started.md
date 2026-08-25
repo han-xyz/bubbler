@@ -19,8 +19,12 @@ target/release/bubbler man          > /usr/share/man/man1/bubbler.1
 target/release/bubbler man --config > /usr/share/man/man5/bubbler-config.5
 ```
 
-`bubbler-init` is the supervisor bound into every sandbox, not a command;
-keep it out of `/usr/bin`. Build needs Rust 1.95+ and `libseccomp`.
+`bubbler-init`, the supervisor bound into every sandbox, and
+`bubbler-wl-proxy`, the sidecar in front of a sandboxed `wayland` socket, are
+not commands to type; keep both out of `/usr/bin`. Each is looked for in its
+own variable (`$BUBBLER_INIT`, `$BUBBLER_WL_PROXY`), then beside the running
+`bubbler`, then under `/usr/lib/bubbler/`. Build needs Rust 1.95+ and
+`libseccomp`.
 
 ## Runtime dependencies
 
@@ -28,6 +32,7 @@ keep it out of `/usr/bin`. Build needs Rust 1.95+ and `libseccomp`.
 |---|---|
 | `bubblewrap` | everything |
 | `libseccomp` | everything (linked) |
+| `bubbler-wl-proxy` (not a package — installed above) | every sandboxed `wayland`; the run stops if it is missing or will not start |
 | `xdg-dbus-proxy` | any `dbus` or `system-bus` grant — most profiles |
 | `passt` | isolated `network` — every shipped profile with a network |
 | `nftables` | `outbound "deny"` only |

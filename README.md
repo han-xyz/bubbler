@@ -84,7 +84,9 @@ published yet — AUR account registration is currently down. From source:
     target/release/bubbler man --config > /usr/share/man/man5/bubbler-config.5
 
 Build needs Rust 1.95+ and `libseccomp` (2.5.4+). Runtime: `bubblewrap` and a
-kernel with user namespaces; `xdg-dbus-proxy` for `dbus`/`system-bus`;
+kernel with user namespaces; `bubbler-wl-proxy` from the set above in front of
+every sandboxed `wayland`, which is not optional — a run stops without it;
+`xdg-dbus-proxy` for `dbus`/`system-bus`;
 `passt` (pasta) for an isolated `network`; `nftables` for `outbound "deny"`;
 `xdg-desktop-portal` with a backend for `portals` and `camera`;
 `xorg-xwayland` for the X server a bare `x11` runs inside the sandbox;

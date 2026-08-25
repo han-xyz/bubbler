@@ -30,7 +30,8 @@ jobs:
         run: |
           pacman -Syu --noconfirm --needed \
             nodejs git gcc pkgconf rustup \
-            libseccomp bubblewrap passt nftables python3 xorg-xwayland
+            libseccomp bubblewrap passt nftables python3 xorg-xwayland \
+            wl-clipboard
       - name: rust stable
         # rustup rather than the `rust` package: the same mechanism as the msrv
         # job, and it is rustup that guarantees clippy and rustfmt are there.
@@ -51,6 +52,11 @@ jobs:
       # looking at /proc/self/ns/user, which exists in every container
       # (crates/bubbler/tests/common/mod.rs).  `sandbox-probe` below is what
       # says which of the two a green run here was.
+      #
+      # `--workspace` is also what builds `bubbler-wl-proxy` next to the
+      # `bubbler` under test, which is where the launcher looks for it; the
+      # clipboard tests want `wl-copy` (wl-clipboard) holding a selection and
+      # a compositor to read it from, so on a hosted runner they skip too.
       - run: cargo test --workspace --locked
 
   # Advisories, licences, bans and sources against deny.toml.
@@ -100,7 +106,7 @@ jobs:
         continue-on-error: true
         run: |
           pacman -Syu --noconfirm --needed \
-            bubblewrap passt libseccomp nftables xorg-xwayland
+            bubblewrap passt libseccomp nftables xorg-xwayland wl-clipboard
           printf 'max_user_namespaces: '
           cat /proc/sys/user/max_user_namespaces || echo unreadable
           unshare -Urn true \
@@ -110,4 +116,8 @@ jobs:
           pasta --version || echo "pasta: missing"
           nft --version || echo "nft: missing"
           Xwayland -version || echo "Xwayland: missing"
+          wl-copy --version || echo "wl-copy: missing"
+          # No compositor here means every `wayland` test skipped, the
+          # clipboard gate's among them: they all connect for real.
+          echo "WAYLAND_DISPLAY: ${WAYLAND_DISPLAY:-unset}"
           exit 0

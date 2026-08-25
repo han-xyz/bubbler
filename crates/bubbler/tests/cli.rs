@@ -19,7 +19,7 @@ use common::{
     require_nested_x11_host, require_nft, require_pasta, require_portal, require_python,
     require_security_context, require_system_bus, require_tray, say, system_owns, test_pty,
 };
-use rustix::fs::{OFlags, fcntl_getfl};
+use rustix::fs::{FlockOperation, OFlags, fcntl_getfl, flock};
 use rustix::process::{Pid, Signal, kill_process};
 use rustix::termios::{ControlModes, InputModes, LocalModes, OutputModes, tcgetattr};
 
@@ -1621,7 +1621,7 @@ fn real_dbus_camera_binds_no_device_and_nodes_only_bind_what_is_there() {
     // `nodes=#true` adds the device nodes the host has at launch and
     // says nothing about the ones it does not: on a machine with no
     // camera that half of the grant binds nothing at all.
-    let name = "bubbler-test-camera";
+    let name = &instance_name("camera");
     let _leftovers = dbus_instance(
         tmp.path(),
         &init,
@@ -2210,6 +2210,17 @@ fn proxy_running_for(needle: &str) -> bool {
     process_running("xdg-dbus-proxy", needle)
 }
 
+/// An instance name no other test process can also be using.
+///
+/// A real run's state lands in the session's own
+/// `$XDG_RUNTIME_DIR/bubbler/`, which every `cargo test` on this login
+/// shares. Two suites running at once under one name is one of them
+/// finding the other's live instance and `exec`ing into it, and the
+/// tear-down that follows takes down a sandbox the other is still using.
+fn instance_name(stem: &str) -> String {
+    format!("bubbler-test-{stem}-{}", std::process::id())
+}
+
 /// Instance whose runtime state lands in the session's real runtime dir,
 /// removed again so a bus test leaves nothing behind.
 struct RuntimeLeftovers {
@@ -2270,7 +2281,7 @@ fn real_dbus_hides_names_the_rules_do_not_grant() {
         return;
     }
     let tmp = setup();
-    let name = "bubbler-test-dbus-bare";
+    let name = &instance_name("dbus-bare");
     let leftovers = dbus_instance(tmp.path(), &init, name, "dbus\ncommand \"true\"\n");
 
     let out = bubbler_dbus(tmp.path(), &init)
@@ -2308,7 +2319,7 @@ fn real_dbus_run_ends_as_soon_as_the_command_does() {
     }
     let Some(init) = real_init() else { return };
     let tmp = setup();
-    let name = "bubbler-test-dbus-timing";
+    let name = &instance_name("dbus-timing");
     let _leftovers = dbus_instance(tmp.path(), &init, name, "dbus\ncommand \"/usr/bin/true\"\n");
 
     let started = Instant::now();
@@ -2342,7 +2353,7 @@ fn real_dbus_notify_reaches_the_notification_service() {
         return;
     }
     let tmp = setup();
-    let name = "bubbler-test-dbus-notify";
+    let name = &instance_name("dbus-notify");
     let _leftovers = dbus_instance(tmp.path(), &init, name, "dbus\nnotify\ncommand \"true\"\n");
 
     let out = bubbler_dbus(tmp.path(), &init)
@@ -2375,7 +2386,7 @@ fn real_dbus_tray_reaches_the_status_notifier_watcher() {
     }
     let Some(init) = real_init() else { return };
     let tmp = setup();
-    let name = "bubbler-test-dbus-tray";
+    let name = &instance_name("dbus-tray");
     let _leftovers = dbus_instance(tmp.path(), &init, name, "dbus\ntray\ncommand \"true\"\n");
 
     // A property read on the watcher's own object: the one call the
@@ -2409,7 +2420,7 @@ fn real_portal_answers_a_call_that_needs_the_app_identity() {
     }
     let Some(init) = real_init() else { return };
     let tmp = setup();
-    let name = "bubbler-test-portal-read";
+    let name = &instance_name("portal-read");
     let _leftovers = dbus_instance(tmp.path(), &init, name, "dbus\nportals\ncommand \"true\"\n");
 
     // Settings.ReadAll goes through the portal's app-info lookup, unlike
@@ -2442,7 +2453,7 @@ fn real_portal_identity_lives_exactly_as_long_as_the_run() {
     }
     let Some(init) = real_init() else { return };
     let tmp = setup();
-    let name = "bubbler-test-portal-identity";
+    let name = &instance_name("portal-identity");
     let leftovers = dbus_instance(tmp.path(), &init, name, "dbus\nportals\ncommand \"true\"\n");
     let dir = leftovers.flatpak.clone();
     let info = dir.join("bwrapinfo.json");
@@ -2485,7 +2496,7 @@ fn real_portals_bind_the_document_view_and_nothing_above_it() {
     }
     let Some(init) = real_init() else { return };
     let tmp = setup();
-    let name = "bubbler-test-doc-portal";
+    let name = &instance_name("doc-portal");
     let _leftovers = dbus_instance(tmp.path(), &init, name, "dbus\nportals\ncommand \"true\"\n");
     let run = std::env::var_os("XDG_RUNTIME_DIR").unwrap();
     let doc = PathBuf::from(run).join("doc");
@@ -2537,7 +2548,7 @@ fn real_system_bus_answers_for_the_names_it_grants_and_no_others() {
         return;
     }
     let tmp = setup();
-    let name = "bubbler-test-system-bus";
+    let name = &instance_name("system-bus");
     let _leftovers = dbus_instance(
         tmp.path(),
         &init,
@@ -2606,7 +2617,7 @@ test -z "$DBUS_SESSION_BUS_ADDRESS" || { echo SESSIONADDR; exit 1; }
 test -z "$DBUS_SYSTEM_BUS_ADDRESS" || { echo SYSTEMADDR; exit 1; }
 test ! -e "$XDG_RUNTIME_DIR/bus" || { echo SESSIONSOCKET; exit 1; }
 echo OK"#;
-    let name = "bubbler-test-system-bus-alone";
+    let name = &instance_name("system-bus-alone");
     let _leftovers = dbus_instance(
         tmp.path(),
         &init,
@@ -2624,7 +2635,7 @@ echo OK"#;
 
     // And without the node the sandbox has no system bus at all, whether
     // or not it has a session one.
-    let bare = "bubbler-test-system-bus-none";
+    let bare = &instance_name("system-bus-none");
     let _bare = dbus_instance(tmp.path(), &init, bare, "dbus\ncommand \"true\"\n");
     let out = bubbler_dbus(tmp.path(), &init)
         .args([
@@ -2650,7 +2661,7 @@ fn real_dbus_leaves_the_instance_runtime_directory_empty() {
     }
     let Some(init) = real_init() else { return };
     let tmp = setup();
-    let name = "bubbler-test-dbus-leftovers";
+    let name = &instance_name("dbus-leftovers");
     let leftovers = dbus_instance(tmp.path(), &init, name, "dbus\ncommand \"/usr/bin/true\"\n");
     let out = bubbler_dbus(tmp.path(), &init)
         .args(["run", name])
@@ -2685,7 +2696,7 @@ fn real_a11y_lets_the_app_register_and_nothing_else() {
     }
     let Some(init) = real_init() else { return };
     let tmp = setup();
-    let name = "bubbler-test-a11y";
+    let name = &instance_name("a11y");
     let _leftovers = dbus_instance(tmp.path(), &init, name, "dbus\na11y\ncommand \"true\"\n");
     let run = PathBuf::from(
         std::env::var_os("XDG_RUNTIME_DIR")
@@ -2808,7 +2819,7 @@ fn real_input_method_hides_the_daemons_main_names() {
     }
     let Some(init) = real_init() else { return };
     let tmp = setup();
-    let name = "bubbler-test-input-method";
+    let name = &instance_name("input-method");
     let _leftovers = dbus_instance(
         tmp.path(),
         &init,
@@ -2909,7 +2920,7 @@ fn a11y_without_dbus_send_on_path_names_the_package() {
     for bin in ["bwrap", "xdg-dbus-proxy"] {
         std::os::unix::fs::symlink(format!("/usr/bin/{bin}"), path.join(bin)).unwrap();
     }
-    let name = "bubbler-test-a11y-nosend";
+    let name = &instance_name("a11y-nosend");
     let _leftovers = dbus_instance(tmp.path(), &init, name, "dbus\na11y\ncommand \"true\"\n");
 
     let out = bubbler_dbus(tmp.path(), &init)
@@ -3520,7 +3531,7 @@ fn real_wayland_binds_bubblers_own_socket_not_the_hosts() {
     let (inside, err) = wayland_ino_inside(
         tmp.path(),
         &init,
-        "bubbler-test-wl-ctx",
+        &instance_name("wl-ctx"),
         "wayland\ncommand \"true\"\n",
     );
     assert_ne!(inside, host_ino, "the sandbox got the host socket: {err}");
@@ -3544,7 +3555,7 @@ fn real_wayland_host_binds_the_host_socket() {
     let (inside, err) = wayland_ino_inside(
         tmp.path(),
         &init,
-        "bubbler-test-wl-host",
+        &instance_name("wl-host"),
         "wayland \"host\"\ncommand \"true\"\n",
     );
     assert_eq!(inside, host_ino, "{err}");
@@ -3593,16 +3604,8 @@ while True:
 /// Every global a client of `socket` is offered, listed by [`WL_GLOBALS`]
 /// run on the host.
 fn host_globals() -> Vec<String> {
-    let out = Command::new(PYTHON)
-        .args(["-c", WL_GLOBALS])
-        .env(
-            "XDG_RUNTIME_DIR",
-            std::env::var_os("XDG_RUNTIME_DIR").expect("checked by require_security_context"),
-        )
-        .env(
-            "WAYLAND_DISPLAY",
-            std::env::var_os("WAYLAND_DISPLAY").expect("checked by require_security_context"),
-        )
+    let mut c = Command::new(PYTHON);
+    let out = session_wayland(c.args(["-c", WL_GLOBALS]))
         .output()
         .expect("running the global lister");
     assert!(
@@ -3627,7 +3630,7 @@ fn real_wayland_proxy_serves_the_only_socket_the_sandbox_sees() {
     }
     let Some(init) = real_init() else { return };
     let tmp = setup();
-    let name = "bubbler-test-wl-sockets";
+    let name = &instance_name("wl-sockets");
     let leftovers = wayland_instance(tmp.path(), &init, name, "wayland\ncommand \"true\"\n");
     let run = background_run(tmp.path(), &init, name);
 
@@ -3665,7 +3668,14 @@ fn real_wayland_proxy_serves_the_only_socket_the_sandbox_sees() {
         run.said()
     );
     let log = run.stop();
-    assert!(!bwrap_alive(&upstream), "the proxy outlived the run: {log}");
+    // Bounded rather than immediate: bwrap's own children carry its argv,
+    // and they are still in `/proc` for a moment after the bwrap bubbler
+    // waited for has been reaped. None of them may outlive the run, which
+    // is what a deadline says and an instant look does not.
+    assert!(
+        wait_until(|| !bwrap_alive(&upstream), RUN_LIMIT),
+        "the proxy outlived the run: {log}"
+    );
     assert!(!leftovers.runtime.join("wayland").exists(), "{log}");
     assert!(!leftovers.runtime.join("wayland-context").exists(), "{log}");
 }
@@ -3684,7 +3694,7 @@ fn real_wayland_a_proxy_that_will_not_start_stops_the_run() {
     }
     let Some(init) = real_init() else { return };
     let tmp = setup();
-    let name = "bubbler-test-wl-dead";
+    let name = &instance_name("wl-dead");
     let _leftovers = wayland_instance(tmp.path(), &init, name, "wayland\ncommand \"true\"\n");
     let out = bubbler_wayland(tmp.path(), &init)
         // A binary that exits 1 at once, under the `/usr` the sidecar
@@ -3710,7 +3720,7 @@ fn real_wayland_proxy_hands_the_application_a_smaller_registry() {
     }
     let Some(init) = real_init() else { return };
     let tmp = setup();
-    let name = "bubbler-test-wl-globals";
+    let name = &instance_name("wl-globals");
     let _leftovers = wayland_instance(tmp.path(), &init, name, "wayland\ncommand \"true\"\n");
     let out = bubbler_wayland(tmp.path(), &init)
         .args(["run", name, "--", PYTHON, "-c", WL_GLOBALS])
@@ -3746,6 +3756,423 @@ fn real_wayland_proxy_hands_the_application_a_smaller_registry() {
     }
 }
 
+/// The clipboard client the tests below run inside a sandbox: it maps a
+/// window, waits for the selection the compositor then offers it, asks for
+/// that offer over a pipe and prints how many bytes came back.
+///
+/// It travels as `python3 -c`, so nothing of the test tree has to be bound
+/// into a sandbox for it to be reachable there.
+const WL_READ: &str = include_str!("fixtures/wl_read.py");
+
+/// The client that binds a global by a number it was never offered.
+const WL_BIND: &str = include_str!("fixtures/wl_bind.py");
+
+/// What these tests put on the selection. Its length is what a read that
+/// went through has to return.
+const SECRET: &str = "secret";
+
+/// How long a fixture waits on the compositor, in its own argument's form.
+/// Well past anything measured here — a window is mapped and focused in
+/// under a second — and well inside the harness's own patience.
+const FIXTURE_LIMIT: &str = "--timeout=15";
+
+/// The clipboard tool that owns the selection while these tests read it.
+const WL_COPY: &str = "/usr/bin/wl-copy";
+
+/// Hyprland's control tool: the one thing here that can put a key into a
+/// window other than the one the user is typing in.
+const HYPRCTL: &str = "/usr/bin/hyprctl";
+
+/// The interface asked for when this compositor advertises nothing on the
+/// privileged list. It is in the proxy's tables, so a refusal is the
+/// policy's answer and not the codec's.
+const HIDDEN_INTERFACE: &str = "zwlr_data_control_manager_v1";
+
+/// The session variables a host-side Wayland client needs. Both are there:
+/// [`require_security_context`] is what every caller has run first.
+fn session_wayland(cmd: &mut Command) -> &mut Command {
+    cmd.env(
+        "XDG_RUNTIME_DIR",
+        std::env::var_os("XDG_RUNTIME_DIR").expect("checked by require_security_context"),
+    )
+    .env(
+        "WAYLAND_DISPLAY",
+        std::env::var_os("WAYLAND_DISPLAY").expect("checked by require_security_context"),
+    )
+}
+
+/// One of the python fixtures, run on the host as any other client of the
+/// session would be.
+fn fixture_on_host(source: &str, args: &[&str]) -> Output {
+    let mut c = Command::new(PYTHON);
+    session_wayland(c.args(["-c", source]).args(args))
+        .output()
+        .expect("running a wayland fixture")
+}
+
+/// One of the python fixtures, run inside `name`, which is where it meets
+/// the proxy.
+fn fixture_inside(tmp: &Path, init: &Path, name: &str, source: &str, args: &[&str]) -> Output {
+    bubbler_wayland(tmp, init)
+        .args(["run", name, "--", PYTHON, "-c", source])
+        .args(args)
+        .output()
+        .expect("running a wayland fixture in a sandbox")
+}
+
+/// Put [`SECRET`] on the session's selection, and say so if that failed.
+///
+/// `wl-copy` leaves a process behind to serve what it copied, as every
+/// clipboard owner must; the next copy replaces it and the session
+/// outlives it.
+fn selection_holds_the_secret() -> bool {
+    let mut c = Command::new(WL_COPY);
+    let held = session_wayland(c.arg(SECRET))
+        .status()
+        .is_ok_and(|s| s.success());
+    if !held {
+        say("skipping: wl-copy put nothing on the selection");
+    }
+    held
+}
+
+/// Own the session's selection until the returned file is dropped.
+///
+/// There is one of it, and a `wl-copy` from one test is the offer another
+/// is halfway through reading: the compositor drops an offer whose source
+/// has been replaced, and the read then returns nothing for a reason that
+/// has nothing to do with the gate. A file lock and not a `Mutex` because
+/// two `cargo test` processes on one login share the selection exactly as
+/// two threads of one do, and the kernel drops a `flock` when its holder
+/// exits, so a suite that crashed leaves nothing stale behind.
+fn hold_the_selection() -> std::fs::File {
+    let path = PathBuf::from(
+        std::env::var_os("XDG_RUNTIME_DIR").expect("checked by require_security_context"),
+    )
+    .join("bubbler-test-selection.lock");
+    let lock = std::fs::File::create(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    flock(&lock, FlockOperation::LockExclusive)
+        .expect("an exclusive lock on a file this process has just created");
+    lock
+}
+
+/// The guards every clipboard test here shares: a compositor the proxy can
+/// sit in front of, python for the fixture, and `wl-copy` holding
+/// something worth reading. The lock is taken before that copy and held
+/// for as long as the returned file lives, which is the whole test.
+fn clipboard_ready() -> Option<(tempfile::TempDir, PathBuf, std::fs::File)> {
+    if !require_security_context() || !require_python() || !require_host_program(WL_COPY) {
+        return None;
+    }
+    let init = real_init()?;
+    let selection = hold_the_selection();
+    if !selection_holds_the_secret() {
+        return None;
+    }
+    Some((setup(), init, selection))
+}
+
+/// What the clipboard fixture printed, with what the run said beside it.
+///
+/// `None` (after saying why) when the compositor offered the sandboxed
+/// window no selection at all: that is a focus policy, not something these
+/// tests can make a claim about.
+fn selection_read(out: &Output) -> (Option<String>, String) {
+    let log = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(0), "{log}");
+    let printed = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if printed == "NO_OFFER" {
+        say("skipping: the compositor offered the sandboxed window no selection");
+        return (None, log);
+    }
+    (Some(printed), log)
+}
+
+/// The rule the proxy exists for. The application has a window, so the
+/// compositor offers it the selection like any other client — and the read
+/// it makes without the user having touched anything is refused all the
+/// same, with nothing but end of file to show for it.
+#[test]
+fn real_wayland_proxy_denies_a_background_read() {
+    let Some((tmp, init, _selection)) = clipboard_ready() else {
+        return;
+    };
+    let name = &instance_name("wl-deny");
+    let _leftovers = wayland_instance(tmp.path(), &init, name, "wayland\ncommand \"true\"\n");
+    let out = fixture_inside(
+        tmp.path(),
+        &init,
+        name,
+        WL_READ,
+        &[FIXTURE_LIMIT, &format!("--title={name}")],
+    );
+    let (read, log) = selection_read(&out);
+    let Some(read) = read else { return };
+    assert_eq!(read, "0", "the sandbox read the selection:\n{log}");
+    // The reason's tail is not pinned here: a key the user pressed a
+    // moment before makes it "no input for N ms", which is the same
+    // refusal. Which line it is exactly is a unit test's business.
+    assert!(
+        log.contains(
+            "bubbler-wl-proxy: clipboard read denied (wl_data_offer, text/plain): no input"
+        ),
+        "{log}"
+    );
+}
+
+/// `clipboard="open"` is the opt-out for an application whose own paste is
+/// not a keystroke away, and opting out has to reach the proxy: the same
+/// read, the whole selection, and a line on the log for every one of them.
+#[test]
+fn real_wayland_proxy_open_allows_the_read() {
+    let Some((tmp, init, _selection)) = clipboard_ready() else {
+        return;
+    };
+    let name = &instance_name("wl-open");
+    let _leftovers = wayland_instance(
+        tmp.path(),
+        &init,
+        name,
+        "wayland clipboard=\"open\"\ncommand \"true\"\n",
+    );
+    let out = fixture_inside(
+        tmp.path(),
+        &init,
+        name,
+        WL_READ,
+        &[FIXTURE_LIMIT, &format!("--title={name}")],
+    );
+    let (read, log) = selection_read(&out);
+    let Some(read) = read else { return };
+    assert_eq!(read, SECRET.len().to_string(), "{log}");
+    assert!(
+        log.contains("bubbler-wl-proxy: clipboard read allowed (open): wl_data_offer, text/plain"),
+        "{log}"
+    );
+}
+
+/// The other half of the gate: a key pressed in the sandbox's own window
+/// opens it, and the read that follows goes through with nothing on the
+/// log. Without this the gate would be indistinguishable from a clipboard
+/// that never works.
+#[test]
+fn real_wayland_proxy_opens_the_gate_for_a_keystroke() {
+    let Some((tmp, init, _selection)) = clipboard_ready() else {
+        return;
+    };
+    if !require_hyprctl() {
+        return;
+    }
+    // The window is named after the instance, which no other test process
+    // shares: `sendshortcut` picks a window by title, and two of one name
+    // are two the compositor cannot tell apart.
+    let name = &instance_name("wl-arm");
+    let _leftovers = wayland_instance(tmp.path(), &init, name, "wayland\ncommand \"true\"\n");
+    let read = tmp.path().join("arm.out");
+    let log = tmp.path().join("arm.err");
+    let child = bubbler_wayland(tmp.path(), &init)
+        .args(["run", name, "--", PYTHON, "-c", WL_READ])
+        .args(["--after-key", FIXTURE_LIMIT])
+        .arg(format!("--title={name}"))
+        .stdout(std::fs::File::create(&read).unwrap())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    let mut run = BackgroundRun {
+        run: Some(child),
+        log,
+    };
+    assert!(
+        wait_until(|| hyprctl_sees(name), RUN_LIMIT),
+        "the sandbox mapped no window: {}",
+        run.said()
+    );
+    let sent = hyprctl(&["dispatch", "sendshortcut", &format!(",v,title:^({name})$")]);
+    assert!(
+        sent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sent.stderr)
+    );
+    let ended = wait_until(
+        || {
+            run.run
+                .as_mut()
+                .is_some_and(|c| c.try_wait().is_ok_and(|s| s.is_some()))
+        },
+        RUN_LIMIT,
+    );
+    if ended {
+        // Waited for already: the guard behind this must not signal a pid
+        // that has been reaped and could name something else by now.
+        run.run.take();
+    }
+    assert!(ended, "the run did not end after the key: {}", run.said());
+    let said = run.said();
+    let printed = std::fs::read_to_string(&read).unwrap_or_default();
+    if printed.trim() == "NO_OFFER" {
+        say("skipping: the compositor offered the sandboxed window no selection");
+        return;
+    }
+    assert_eq!(printed.trim(), SECRET.len().to_string(), "{printed}{said}");
+    assert!(!said.contains("clipboard read denied"), "{said}");
+}
+
+/// Returns false (after printing why) when no Hyprland is answering. Its
+/// control tool is what sends a key into a window the test is not typing
+/// in; another compositor's equivalent is not portable, so the arming half
+/// of the gate is only tested where this one is.
+fn require_hyprctl() -> bool {
+    if !require_host_program(HYPRCTL) {
+        return false;
+    }
+    let up = hyprctl(&["version"]).status.success();
+    if !up {
+        say("skipping: no Hyprland instance for hyprctl to talk to");
+    }
+    up
+}
+
+/// One `hyprctl` call over the session it is already part of.
+fn hyprctl(args: &[&str]) -> Output {
+    let mut c = Command::new(HYPRCTL);
+    session_wayland(c.args(args))
+        .output()
+        .expect("running hyprctl")
+}
+
+/// Whether the compositor has a window with exactly this title right now.
+fn hyprctl_sees(title: &str) -> bool {
+    let out = hyprctl(&["clients"]);
+    out.status.success()
+        && String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|line| line.trim() == format!("title: {title}"))
+}
+
+/// A global on the host that a sandbox must not reach, as its numeric name
+/// and its interface.
+///
+/// The number is the compositor's own and the same on every connection, so
+/// it is exactly what an application inside a sandbox would name.
+fn host_privileged_global() -> Option<(String, String)> {
+    let out = fixture_on_host(WL_BIND, &["--dump", FIXTURE_LIMIT]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .find(|(_, interface)| bubbler_core::wayland::PRIVILEGED.contains(interface))
+        .map(|(name, interface)| (name.to_owned(), interface.to_owned()))
+}
+
+/// Keeping a global out of the registry is not on its own enough to keep a
+/// client away from it: the numeric name belongs to the compositor and is
+/// the same for every connection, so an application can ask for one it was
+/// never shown. The proxy checks the name against what this connection was
+/// actually offered, and ends the connection when it was not.
+#[test]
+fn real_wayland_proxy_refuses_a_hidden_bind() {
+    if !require_security_context() || !require_python() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let name = &instance_name("wl-bind");
+    let _leftovers = wayland_instance(tmp.path(), &init, name, "wayland\ncommand \"true\"\n");
+    // The real thing where the compositor has one; otherwise the fixture's
+    // own fallback, one past the largest name it was offered, which is a
+    // name it certainly never saw either.
+    let (number, interface) = match host_privileged_global() {
+        Some((number, interface)) => (Some(number), interface),
+        None => {
+            say(
+                "this compositor advertises nothing on the privileged list: binding an unoffered name instead",
+            );
+            (None, HIDDEN_INTERFACE.to_owned())
+        }
+    };
+    let mut args = vec![FIXTURE_LIMIT.to_owned(), format!("--interface={interface}")];
+    args.extend(number.map(|number| format!("--name={number}")));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = fixture_inside(tmp.path(), &init, name, WL_BIND, &args);
+    let log = String::from_utf8_lossy(&out.stderr);
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{log}");
+    assert!(
+        said.contains(&format!(
+            "refused: bind of hidden global {interface} (name "
+        )) && said.contains("refused by the sandbox proxy"),
+        "the bind was not refused: {said}{log}"
+    );
+    assert!(
+        log.contains("bubbler-wl-proxy: connection closed: bind of hidden global"),
+        "{log}"
+    );
+}
+
+/// What makes the gate above worth having: inside a sandbox there is no
+/// way to reach the selection except as a window the user can see. The
+/// data-control protocols, which read it with no surface and no focus, are
+/// not offered there — and they are on the host, which is what says it is
+/// bubbler that took them away.
+#[test]
+fn real_wayland_proxy_leaves_no_headless_clipboard_path() {
+    let Some((tmp, init, _selection)) = clipboard_ready() else {
+        return;
+    };
+    let name = &instance_name("wl-headless");
+    let _leftovers = wayland_instance(tmp.path(), &init, name, "wayland\ncommand \"true\"\n");
+
+    let control = fixture_inside(
+        tmp.path(),
+        &init,
+        name,
+        WL_READ,
+        &["--data-control", FIXTURE_LIMIT],
+    );
+    let log = String::from_utf8_lossy(&control.stderr);
+    assert_eq!(control.status.code(), Some(0), "{log}");
+    assert_eq!(
+        String::from_utf8_lossy(&control.stdout).trim(),
+        "NO_MANAGER",
+        "a data-control protocol reached the sandbox:\n{log}"
+    );
+
+    // The core clipboard is there, and useless without a window: a client
+    // the user cannot see is never offered the selection to begin with.
+    let blind = fixture_inside(
+        tmp.path(),
+        &init,
+        name,
+        WL_READ,
+        &["--no-window", "--timeout=2"],
+    );
+    let log = String::from_utf8_lossy(&blind.stderr);
+    assert_eq!(blind.status.code(), Some(0), "{log}");
+    assert_eq!(
+        String::from_utf8_lossy(&blind.stdout).trim(),
+        "NO_OFFER",
+        "a surfaceless client was offered the selection:\n{log}"
+    );
+
+    let host = fixture_on_host(WL_READ, &["--data-control", FIXTURE_LIMIT]);
+    let log = String::from_utf8_lossy(&host.stderr);
+    assert_eq!(host.status.code(), Some(0), "{log}");
+    let read = String::from_utf8_lossy(&host.stdout);
+    if read.trim() == "NO_MANAGER" {
+        say("skipping the host half: this compositor offers no data-control protocol");
+        return;
+    }
+    assert_eq!(
+        read.trim(),
+        SECRET.len().to_string(),
+        "the same client read nothing on the host either:\n{log}"
+    );
+}
+
 /// The X client this test runs inside the sandbox. Read from the host's
 /// `/usr`, which is bound read-only, so a host without it has none
 /// inside either.
@@ -3769,7 +4196,7 @@ fn real_nested_x11_serves_a_private_display() {
         return;
     }
     let tmp = setup();
-    let name = "bubbler-test-x11-nested";
+    let name = &instance_name("x11-nested");
     let _leftovers = wayland_instance(tmp.path(), &init, name, NESTED_X11);
 
     let out = bubbler_wayland(tmp.path(), &init)
@@ -3797,7 +4224,7 @@ fn real_nested_x11_exec_children_see_the_display() {
     }
     let Some(init) = real_init() else { return };
     let tmp = setup();
-    let name = "bubbler-test-x11-exec";
+    let name = &instance_name("x11-exec");
     let _leftovers = wayland_instance(tmp.path(), &init, name, NESTED_X11);
 
     let mut run = bubbler_wayland(tmp.path(), &init)
@@ -3975,7 +4402,7 @@ fn real_nested_x11_starts_the_server_on_the_first_client() {
         return;
     }
     let tmp = setup();
-    let name = "bubbler-test-x11-lazy";
+    let name = &instance_name("x11-lazy");
     let _leftovers = wayland_instance(tmp.path(), &init, name, NESTED_X11);
     let run = background_run(tmp.path(), &init, name);
 
@@ -4040,7 +4467,7 @@ fn real_nested_x11_wm_exiting_is_logged_not_fatal() {
         return;
     }
     let tmp = setup();
-    let name = "bubbler-test-x11-wm-exits";
+    let name = &instance_name("x11-wm-exits");
     // `true` is a window manager that manages nothing and exits at once,
     // which is the shape of the failure this pins.
     let _leftovers = wayland_instance(
@@ -4100,7 +4527,7 @@ fn real_nested_x11_missing_wm_is_logged_not_fatal() {
         return;
     }
     let tmp = setup();
-    let name = "bubbler-test-x11-wm-missing";
+    let name = &instance_name("x11-wm-missing");
     let _leftovers = wayland_instance(
         tmp.path(),
         &init,
