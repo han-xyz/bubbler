@@ -35,7 +35,10 @@ pub const SOCKET_NAME: &str = "init.sock";
 /// `$XDG_RUNTIME_DIR/bubbler/<name>/init.sock`. `name` is an instance
 /// name the caller has already validated.
 pub fn socket_path(env: &Env, name: &str) -> PathBuf {
-    env.runtime_dir.join("bubbler").join(name).join(SOCKET_NAME)
+    env.runtime_dir
+        .join(crate::launcher::RUNTIME_SUBDIR)
+        .join(name)
+        .join(SOCKET_NAME)
 }
 
 /// Connect to a live instance. `Ok(None)` when nothing listens; a refused

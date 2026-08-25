@@ -453,17 +453,17 @@ pub fn explain_proxy(env: &Env, inst: &Instance) -> Result<Option<Vec<Explained>
     let session = plan
         .session
         .as_ref()
-        .map(|_| dbus::refuse_bubbler_runtime(env, "dbus", dbus::host_bus(env)?))
+        .map(|_| dbus::guarded_host_bus(&RealHost, env))
         .transpose()?;
     let system = plan
         .system
         .as_ref()
-        .map(|_| dbus::refuse_bubbler_runtime(env, "system-bus", dbus::host_system_bus(env)?))
+        .map(|_| dbus::guarded_host_system_bus(&RealHost, env))
         .transpose()?;
     let a11y = plan
         .a11y
         .as_ref()
-        .map(|_| dbus::refuse_bubbler_runtime(env, dbus::A11Y_NODE, dbus::host_a11y_bus(env)?))
+        .map(|_| dbus::guarded_host_a11y_bus(&RealHost, env))
         .transpose()?;
     let dir = instance_runtime_dir(env, &inst.name);
     let mut alloc = DryRunAlloc::default();
@@ -696,17 +696,16 @@ pub fn start_proxy(
         .session
         .as_ref()
         .map(|_| {
-            let path = dbus::refuse_bubbler_runtime(env, "dbus", dbus::host_bus(env)?)?;
-            service::require_socket(host, "dbus", path)
+            let path = dbus::guarded_host_bus(host, env)?;
+            service::require_socket(host, dbus::SESSION_NODE, path)
         })
         .transpose()?;
     let system_bus = plan
         .system
         .as_ref()
         .map(|_| {
-            let path =
-                dbus::refuse_bubbler_runtime(env, "system-bus", dbus::host_system_bus(env)?)?;
-            service::require_socket(host, "system-bus", path)
+            let path = dbus::guarded_host_system_bus(host, env)?;
+            service::require_socket(host, dbus::SYSTEM_NODE, path)
         })
         .transpose()?;
     // Resolved before the proxy starts, like the other two: the address
@@ -717,8 +716,7 @@ pub fn start_proxy(
         .a11y
         .as_ref()
         .map(|_| {
-            let path =
-                dbus::refuse_bubbler_runtime(env, dbus::A11Y_NODE, dbus::host_a11y_bus(env)?)?;
+            let path = dbus::guarded_host_a11y_bus(host, env)?;
             service::require_socket(host, dbus::A11Y_NODE, path)
         })
         .transpose()?;
@@ -1236,10 +1234,15 @@ fn remove_moved_dir(inst: &OwnedFd, socket: &str, path: &Path) {
     }
 }
 
+/// The one directory bubbler owns under `$XDG_RUNTIME_DIR`. Every
+/// instance's runtime state is a subdirectory of it, which is why a host
+/// bus address that resolves into it is refused.
+pub const RUNTIME_SUBDIR: &str = "bubbler";
+
 /// `$XDG_RUNTIME_DIR/bubbler/<name>`: an instance's runtime state on the
 /// host. `name` is an instance name the caller has already validated.
 pub fn instance_runtime_dir(env: &Env, name: &str) -> PathBuf {
-    env.runtime_dir.join("bubbler").join(name)
+    env.runtime_dir.join(RUNTIME_SUBDIR).join(name)
 }
 
 /// Create `dir` with mode 0700, tolerating one that already exists. Only
@@ -1260,7 +1263,7 @@ pub fn prepare_runtime_dir(env: &Env, inst: &Instance) -> Result<PathBuf, Launch
     // narrowed afterwards; a missing $XDG_RUNTIME_DIR is created, but its
     // parent is not, since that would mean the session has no runtime dir.
     mkdir_private(&env.runtime_dir)?;
-    mkdir_private(&env.runtime_dir.join("bubbler"))?;
+    mkdir_private(&env.runtime_dir.join(RUNTIME_SUBDIR))?;
     let dir = instance_runtime_dir(env, &inst.name);
     mkdir_private(&dir)?;
     Ok(dir)
@@ -3010,13 +3013,23 @@ mod tests {
     fn a_host_bus_address_under_bubblers_runtime_directory_is_refused() {
         use crate::host::fake::{self, FakeHost};
         let tmp = tempfile::tempdir().unwrap();
+        // Real directories and a real link, because the explanation
+        // resolves through the host it runs on; the fake host used for a
+        // run is told about the same link.
+        let run = tmp.path().join("run");
+        std::fs::create_dir_all(run.join("bubbler/t")).unwrap();
+        std::fs::create_dir_all(run.join("systemd")).unwrap();
+        std::os::unix::fs::symlink(run.join("bubbler/t"), run.join("link")).unwrap();
+        let path = |p: &Path| p.display().to_string();
         // The session bus is resolved and probed before the other two,
         // so it has to be a socket for their guard to be reached at all.
         let (_, _, sock) = fake::types();
-        let host = FakeHost::default().with("/run/user/1000/bus", sock);
+        let host = FakeHost::default()
+            .with("/run/user/1000/bus", sock)
+            .link(&path(&run.join("link")), &path(&run.join("bubbler/t")));
         let inside = OsString::from(format!(
             "unix:path={}",
-            tmp.path().join("run/bubbler/t/init.sock").display()
+            path(&run.join("bubbler/t/init.sock"))
         ));
         type Set = fn(&mut Env, OsString);
         let cases: [(&str, &str, Set); 3] = [
@@ -3058,6 +3071,35 @@ mod tests {
                     }
                     other => panic!("{node}: {other:?}"),
                 }
+            }
+        }
+        // Spelling the same directory through a `..` or a link is the
+        // same address, so both are resolved before the comparison
+        // rather than after it.
+        for sneaky in [
+            run.join("systemd/../bubbler/t/init.sock"),
+            run.join("link/init.sock"),
+        ] {
+            let mut e = env(tmp.path());
+            e.dbus_address = Some(OsString::from(format!("unix:path={}", path(&sneaky))));
+            let cfg = inst(tmp.path(), "dbus\ncommand \"true\"");
+            let plan = dbus::plan(&cfg.config.services, "t").expect("a `dbus` node starts a proxy");
+            let dir = instance_runtime_dir(&e, "t");
+            for got in [
+                start_proxy(&e, &dir, &plan, &host).map(|_| ()),
+                explain_proxy(&e, &cfg).map(|_| ()),
+            ] {
+                assert!(
+                    matches!(
+                        got,
+                        Err(LaunchError::BadValue {
+                            service: "dbus",
+                            ..
+                        })
+                    ),
+                    "{}: {got:?}",
+                    path(&sneaky)
+                );
             }
         }
         // The addresses a session normally sets are outside it, and the

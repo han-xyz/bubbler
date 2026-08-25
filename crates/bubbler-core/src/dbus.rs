@@ -6,12 +6,14 @@
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use crate::config::{BusRule, Service};
 use crate::env::Env;
 use crate::error::LaunchError;
+use crate::host::Host;
+use crate::launcher::RUNTIME_SUBDIR;
 
 /// Program that filters the buses; found on `PATH` inside the proxy
 /// sandbox. One process serves every bus an instance is granted.
@@ -402,8 +404,9 @@ pub fn app_bus_path(instance_runtime: &Path, socket: &str) -> PathBuf {
 }
 
 /// Host session bus socket: the `unix:path=` of `$DBUS_SESSION_BUS_ADDRESS`
-/// when it is set, else `$XDG_RUNTIME_DIR/bus`. The caller must still
-/// check that the result is a socket.
+/// when it is set, else `$XDG_RUNTIME_DIR/bus`. Unguarded, and the caller
+/// must still check that the result is a socket: anything that hands the
+/// path to the proxy goes through [`guarded_host_bus`] instead.
 pub fn host_bus(env: &Env) -> Result<PathBuf, LaunchError> {
     Ok(address_path(
         env.dbus_address.as_deref(),
@@ -413,24 +416,45 @@ pub fn host_bus(env: &Env) -> Result<PathBuf, LaunchError> {
     .unwrap_or_else(|| env.runtime_dir.join("bus")))
 }
 
-/// Refuse a resolved host bus path that lies under bubbler's own
-/// runtime directory, naming `node` as the grant that rejected it. Those
+/// [`host_bus`] refused when it lands in bubbler's own runtime
+/// directory. The proxy paths resolve the session bus through this and
+/// never through [`host_bus`].
+pub fn guarded_host_bus(host: &dyn Host, env: &Env) -> Result<PathBuf, LaunchError> {
+    outside_our_runtime(host, env, SESSION_NODE, host_bus(env)?)
+}
+
+/// [`host_system_bus`] refused when it lands in bubbler's own runtime
+/// directory.
+pub fn guarded_host_system_bus(host: &dyn Host, env: &Env) -> Result<PathBuf, LaunchError> {
+    outside_our_runtime(host, env, SYSTEM_NODE, host_system_bus(env)?)
+}
+
+/// [`host_a11y_bus`] refused when it lands in bubbler's own runtime
+/// directory. The bus is asked for its address first, as a run does.
+pub fn guarded_host_a11y_bus(host: &dyn Host, env: &Env) -> Result<PathBuf, LaunchError> {
+    outside_our_runtime(host, env, A11Y_NODE, host_a11y_bus(env)?)
+}
+
+/// Refuse a host bus path that resolves into bubbler's own runtime
+/// directory, naming `node` as the grant that rejected it. Those
 /// directories hold the instances' control sockets and the proxy's own
-/// output: a bus address pointing there would have the proxy connect to
-/// a sandbox's exec channel or to a socket it is about to serve itself,
+/// output: an address pointing there would have the proxy connect to a
+/// sandbox's exec channel or to a socket it is about to serve itself,
 /// and the address is host environment, which is untrusted input.
-pub fn refuse_bubbler_runtime(
+///
+/// Both sides are compared in the resolved form [`resolve`] gives, so
+/// neither a symlink nor a `..` in the address walks in. Resolving reads
+/// the filesystem, which is why the caller passes its [`Host`]: an
+/// explanation resolves the same way a run does, or it would describe a
+/// run that is refused.
+fn outside_our_runtime(
+    host: &dyn Host,
     env: &Env,
     node: &'static str,
     path: PathBuf,
 ) -> Result<PathBuf, LaunchError> {
-    // The path as the address resolves to, not as canonicalised: the
-    // type probe that follows uses `stat`, so a symlink whose target is
-    // in here still passes. Both paths are under the user's own
-    // `$XDG_RUNTIME_DIR`, where planting such a link means being the
-    // user already; what this refuses is an address that names bubbler's
-    // own sockets outright.
-    if path.starts_with(env.runtime_dir.join("bubbler")) {
+    let ours = resolve(host, &env.runtime_dir.join(RUNTIME_SUBDIR));
+    if resolve(host, &path).starts_with(&ours) {
         return Err(LaunchError::BadValue {
             service: node,
             reason: "the host bus address names a socket under bubbler's own runtime directory"
@@ -440,10 +464,50 @@ pub fn refuse_bubbler_runtime(
     Ok(path)
 }
 
+/// `path` with links and `..` taken out: the host's own canonical form
+/// where the path exists, else its directory's canonical form with the
+/// file name joined back on — a bus socket need not exist yet, and the
+/// explanation of a run resolves before anything is created. What no
+/// lookup answers is folded lexically, so a `..` is never left in place
+/// for a prefix comparison to walk past.
+fn resolve(host: &dyn Host, path: &Path) -> PathBuf {
+    if let Some(real) = host.canonicalize(path) {
+        return lexical(&real);
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(dir), Some(name)) => match host.canonicalize(dir) {
+            Some(real) => lexical(&real).join(name),
+            None => lexical(path),
+        },
+        _ => lexical(path),
+    }
+}
+
+/// `path` with `.` dropped and every `..` folded into the component
+/// before it. Purely textual: it is what is left when the filesystem
+/// cannot answer, and it is applied to a canonical path too, which by
+/// definition has neither component.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            // `pop` on a root or an empty path keeps it, which is the
+            // same place `..` leads there.
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Host system bus socket: the `unix:path=` of `$DBUS_SYSTEM_BUS_ADDRESS`
 /// when it is set, else [`SYSTEM_BUS_PATH`], which is what libdbus and
-/// libsystemd fall back to. The caller must still check that the result
-/// is a socket.
+/// libsystemd fall back to. Unguarded, and the caller must still check
+/// that the result is a socket: [`guarded_host_system_bus`] is what the
+/// proxy paths use.
 pub fn host_system_bus(env: &Env) -> Result<PathBuf, LaunchError> {
     Ok(address_path(
         env.dbus_system_address.as_deref(),
@@ -457,8 +521,9 @@ pub fn host_system_bus(env: &Env) -> Result<PathBuf, LaunchError> {
 /// `$AT_SPI_BUS_ADDRESS` when the session set one, else the address
 /// `org.a11y.Bus` answers `GetAddress` with on the session bus. That is
 /// the order at-spi2's own clients ask in, so bubbler proxies the bus
-/// the applications on this host are already on. The caller must still
-/// check that the result is a socket.
+/// the applications on this host are already on. Unguarded, and the
+/// caller must still check that the result is a socket:
+/// [`guarded_host_a11y_bus`] is what the proxy paths use.
 ///
 /// Every failure stops the run instead of dropping the grant: an `a11y`
 /// sandbox whose socket has no bus behind it looks to the application

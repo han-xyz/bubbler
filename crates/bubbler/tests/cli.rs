@@ -3405,8 +3405,8 @@ fn real_nested_x11_serves_a_private_display() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{err}");
     let s = String::from_utf8_lossy(&out.stdout);
-    // The display the grant fixes, reported by a client that connected to
-    // it: the server was up before the command ran.
+    // The display the grant fixes, reported by the client whose own
+    // connection is what started the server.
     assert!(s.contains("name of display:    :0"), "{s}{err}");
     // GLX is in the extension list only where the server found a render
     // device, which is the `dri` grant reaching the nested display.
@@ -3431,9 +3431,9 @@ fn real_nested_x11_exec_children_see_the_display() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    // The supervisor accepts connections only once the display is up, so
-    // the first `exec` that works is also the first that could have been
-    // handed a `DISPLAY`.
+    // The supervisor serves the exec channel from the start, and the
+    // display variable is set before any server exists, so the first
+    // `exec` that works already carries it.
     let mut inside = None;
     if !wait_until(
         || {
@@ -3466,7 +3466,8 @@ fn real_nested_x11_exec_children_see_the_display() {
         "the run did not stop after SIGTERM"
     );
     // The instance is gone with it: the supervisor tears the display
-    // helper down on every exit, so nothing of it outlives the run.
+    // socket and anything it started down on every exit, so nothing of
+    // it outlives the run.
     let sock = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").expect("checked by the guard"))
         .join("bubbler")
         .join(name)

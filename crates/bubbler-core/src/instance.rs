@@ -365,7 +365,7 @@ fn sweep_dir(dir: &Path, prefix: &str) {
 /// name that is not a pid is not swept.
 pub fn sweep_stale(env: &Env) {
     sweep_dir(&try_root(env), "");
-    sweep_dir(&env.runtime_dir.join("bubbler"), "try-");
+    sweep_dir(&env.runtime_dir.join(launcher::RUNTIME_SUBDIR), "try-");
 }
 
 /// A throwaway instance under `try/<pid>`, removed when this guard drops
@@ -558,7 +558,7 @@ impl Instance {
             return Err(InstanceError::IsSymlink(dir));
         }
         fs::remove_dir_all(&dir).map_err(io_err(&dir))?;
-        let run = env.runtime_dir.join("bubbler").join(name);
+        let run = env.runtime_dir.join(launcher::RUNTIME_SUBDIR).join(name);
         match fs::remove_dir_all(&run) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
