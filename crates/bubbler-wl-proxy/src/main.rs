@@ -14,21 +14,32 @@
 
 use std::ffi::OsString;
 use std::io;
-use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
-use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd, retry_on_intr};
+use rustix::io::{Errno, FdFlags, fcntl_getfd, fcntl_setfd, retry_on_intr};
 use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType, connect, socket_with};
 
-use bubbler_wl_proxy::audit::Audit;
+use bubbler_wl_proxy::audit::{Audit, Kind};
 use bubbler_wl_proxy::policy::{Gate, Policy};
 use bubbler_wl_proxy::relay;
 
 /// The one usage line, so a grammar error always names the whole grammar.
 const USAGE: &str = "bubbler-wl-proxy: usage: --listen-fd N --upstream PATH \
 --gate paste|open [--fallback-deny] [--log-fd N] [--ready-fd N]";
+
+/// How long the upstream socket has to answer the one connection the proxy
+/// makes before saying it is up. A compositor that never accepts must fail
+/// the launch, not hold it open.
+const PROBE: Duration = Duration::from_secs(2);
+
+/// How long to wait before trying the upstream again while its accept queue
+/// is full — the one answer a Unix socket gives that is worth retrying.
+const RETRY: Duration = Duration::from_millis(50);
 
 /// What the launcher asked for.
 #[derive(Debug, PartialEq, Eq)]
@@ -54,12 +65,34 @@ fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
-    match serve(args) {
-        Ok(()) => ExitCode::SUCCESS,
+    // The log is opened first, so every failure after this point reaches the
+    // launcher's own record and not just a stderr it may not be reading. A log
+    // descriptor that cannot be opened is the one failure with nowhere else to
+    // go.
+    let mut audit = match args.log_fd.map(adopt).transpose() {
+        Ok(Some(log)) => Audit::to_fd(log),
+        Ok(None) => Audit::to_stderr(),
         Err(err) => {
             eprintln!("bubbler-wl-proxy: {err}");
-            ExitCode::FAILURE
+            return ExitCode::from(1);
         }
+    };
+    let listener = match prepare(&args) {
+        Ok(listener) => listener,
+        Err(err) => {
+            audit.line(
+                Kind::Close,
+                Instant::now(),
+                &format!("bubbler-wl-proxy: {err}"),
+            );
+            return ExitCode::from(1);
+        }
+    };
+    let policy = Policy::new(args.gate, args.fallback_deny);
+    // A relay that stops says so on the same log before it returns.
+    match relay::run(listener, args.upstream, policy, audit) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(_) => ExitCode::from(1),
     }
 }
 
@@ -119,9 +152,9 @@ fn number(word: OsString) -> Option<i32> {
     }
 }
 
-/// Adopt the listener, open the log, say the proxy is up, and relay until the
-/// launcher stops the run.
-fn serve(args: Args) -> io::Result<()> {
+/// Adopt the listener, reach the compositor once, and tell the launcher the
+/// socket will answer. Everything that can fail before the loop fails here.
+fn prepare(args: &Args) -> io::Result<OwnedFd> {
     let listener = adopt(args.listen_fd)?;
     if !rustix::net::sockopt::socket_acceptconn(&listener)? {
         return Err(io::Error::other(format!(
@@ -135,10 +168,6 @@ fn serve(args: Args) -> io::Result<()> {
     let flags = fcntl_getfl(&listener)?;
     fcntl_setfl(&listener, flags | OFlags::NONBLOCK)?;
 
-    let audit = match args.log_fd {
-        Some(fd) => Audit::to_fd(adopt(fd)?),
-        None => Audit::to_stderr(),
-    };
     // Reached once before the launcher is told anything: a proxy that cannot
     // talk to the compositor should fail the launch, not accept every
     // connection and close it again.
@@ -152,20 +181,60 @@ fn serve(args: Args) -> io::Result<()> {
         let ready = adopt(fd)?;
         retry_on_intr(|| rustix::io::write(&ready, &[0]))?;
     }
-    let policy = Policy::new(args.gate, args.fallback_deny);
-    relay::run(listener, args.upstream, policy, audit)
+    Ok(listener)
 }
 
-/// Open and drop one connection to `upstream`, to prove it answers.
-fn probe(upstream: &Path) -> Result<(), rustix::io::Errno> {
-    let socket = socket_with(
-        AddressFamily::UNIX,
-        SocketType::STREAM,
-        SocketFlags::CLOEXEC,
-        None,
-    )?;
+/// Open and drop one connection to `upstream`, to prove it answers, giving up
+/// after [`PROBE`].
+///
+/// Nothing here may block without a bound: this runs before the readiness
+/// byte, and a compositor that has wedged with a full accept queue would
+/// otherwise hold the whole launch open. A Unix socket answers a full queue
+/// with `EAGAIN` on a socket that is not connecting at all, so that answer is
+/// retried on a fresh socket rather than waited on.
+fn probe(upstream: &Path) -> io::Result<()> {
     let address = SocketAddrUnix::new(upstream)?;
-    retry_on_intr(|| connect(&socket, &address))
+    let deadline = Instant::now() + PROBE;
+    loop {
+        let socket = socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+            None,
+        )?;
+        match retry_on_intr(|| connect(&socket, &address)) {
+            Ok(()) => return Ok(()),
+            Err(Errno::INPROGRESS) => return finish(&socket, deadline),
+            Err(Errno::AGAIN) => {}
+            Err(err) => return Err(err.into()),
+        }
+        if Instant::now() + RETRY >= deadline {
+            return Err(timed_out());
+        }
+        std::thread::sleep(RETRY);
+    }
+}
+
+/// Wait for a connection the kernel could not finish at once.
+fn finish(socket: &OwnedFd, deadline: Instant) -> io::Result<()> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    let timeout = Timespec {
+        tv_sec: left.as_secs().try_into().unwrap_or(i64::MAX),
+        tv_nsec: left.subsec_nanos().into(),
+    };
+    let mut polled = [PollFd::from_borrowed_fd(socket.as_fd(), PollFlags::OUT)];
+    if retry_on_intr(|| poll(&mut polled, Some(&timeout)))? == 0 {
+        return Err(timed_out());
+    }
+    match rustix::net::sockopt::socket_error(socket)? {
+        Ok(()) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// The one failure the upstream socket cannot report itself.
+fn timed_out() -> io::Error {
+    io::Error::other(format!("timed out after {} s", PROBE.as_secs()))
 }
 
 /// Take ownership of a descriptor the launcher passed by number, and keep it
@@ -335,6 +404,33 @@ mod tests {
     #[test]
     fn a_number_that_names_nothing_is_not_adopted() {
         assert!(adopt(9999).is_err());
+    }
+
+    #[test]
+    fn an_upstream_that_never_accepts_gives_up_inside_the_bound() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("wayland");
+        // The smallest accept queue there is, filled by one connection that
+        // nobody will ever take: every further connect answers `EAGAIN`, which
+        // is the shape a wedged compositor has.
+        let listener = socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("a socket");
+        let address = SocketAddrUnix::new(&path).expect("an address");
+        rustix::net::bind(&listener, &address).expect("bound");
+        rustix::net::listen(&listener, 0).expect("listening");
+        let _filler = std::os::unix::net::UnixStream::connect(&path).expect("the queue takes one");
+
+        let start = Instant::now();
+        let err = probe(&path).expect_err("a queue nobody drains never answers");
+        let waited = start.elapsed();
+        assert!(err.to_string().contains("timed out after 2 s"), "{err}");
+        assert!(waited >= PROBE - RETRY, "gave up after only {waited:?}");
+        assert!(waited < PROBE * 2, "held the launch open for {waited:?}");
     }
 
     #[test]

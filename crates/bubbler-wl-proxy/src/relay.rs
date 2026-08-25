@@ -126,6 +126,9 @@ struct Relay {
     /// Set when `accept` ran out of descriptors: the next round waits instead
     /// of asking again, and clears it.
     backoff: bool,
+    /// Set for as long as that lasts, so the log says so once when it starts
+    /// and not once per round of waiting.
+    refusing: bool,
 }
 
 /// Serve `listener` — an inherited, listening, non-blocking Unix socket —
@@ -141,6 +144,7 @@ pub fn run(listener: OwnedFd, upstream: PathBuf, policy: Policy, audit: Audit) -
         audit,
         conns: Vec::new(),
         backoff: false,
+        refusing: false,
     };
     loop {
         if let Err(err) = relay.step() {
@@ -254,8 +258,12 @@ impl Conn {
         self.broken
             // Refused: the client gets its `wl_display.error`, then nothing.
             || (self.closing && self.client.out.is_empty())
-            // The client has gone: deliver what it already asked for.
-            || (self.client.eof && self.server.out.is_empty())
+            // The client has said its last word: deliver what it already
+            // asked for, and what has already been said back to it — a client
+            // that shut only its writing side is still listening. What the
+            // compositor says *after* this is not waited for, or a client that
+            // merely closed would hold the connection open for ever.
+            || (self.client.eof && self.server.out.is_empty() && self.client.out.is_empty())
             // The compositor has gone: deliver what it already said.
             || (self.server.eof && self.client.out.is_empty())
     }
@@ -368,6 +376,9 @@ impl Conn {
                 }
                 Action::Drop => {}
                 Action::Refuse { error } => {
+                    // The refusal is a `wl_display.error`, which only ever
+                    // goes back to a client: `src` must be the client's side.
+                    debug_assert!(from_client, "the compositor was refused");
                     if !error.is_empty() {
                         src.out_bytes += error.len();
                         src.out.push_back(Frame {
@@ -515,12 +526,17 @@ impl Relay {
         // One sandbox, many connections: the per-direction cap bounds each of
         // them, this bounds the lot. The connection holding the most is the
         // one that took the total over, and is the one that goes.
-        let total: usize = conns.iter().map(Conn::queued).sum();
-        if total > MAX_TOTAL_QUEUE {
-            let fattest = conns
+        let live = || {
+            conns
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| !dead.contains(index))
+        };
+        // Connections already closed this round are about to give their bytes
+        // back, so counting them would close a second one for nothing.
+        let total: usize = live().map(|(_, conn)| conn.queued()).sum();
+        if total > MAX_TOTAL_QUEUE {
+            let fattest = live()
                 .max_by_key(|(_, conn)| conn.queued())
                 .map(|(index, _)| index);
             if let Some(index) = fattest {
@@ -567,7 +583,12 @@ impl Relay {
                     }
                 };
             match self.dial() {
-                Ok(server) => self.conns.push(Conn::new(client, server)),
+                Ok(server) => {
+                    // A connection got in, so the shortage is over: the next
+                    // one says so again if it comes back.
+                    self.refusing = false;
+                    self.conns.push(Conn::new(client, server));
+                }
                 Err(err) if out_of_descriptors(err) => return self.wait_for_descriptors(now),
                 Err(err) => self.audit.line(
                     Kind::Close,
@@ -584,11 +605,14 @@ impl Relay {
     /// ending is what frees the descriptors this needs.
     fn wait_for_descriptors(&mut self, now: Instant) {
         self.backoff = true;
-        self.audit.line(
-            Kind::Close,
-            now,
-            "bubbler-wl-proxy: connection refused: out of descriptors",
-        );
+        if !self.refusing {
+            self.refusing = true;
+            self.audit.line(
+                Kind::Close,
+                now,
+                "bubbler-wl-proxy: connection refused: out of descriptors",
+            );
+        }
     }
 
     /// Open one connection to the socket the sandbox is really talking to.
@@ -803,6 +827,7 @@ mod tests {
             audit: Audit::new(Box::new(std::io::sink())),
             conns: Vec::new(),
             backoff: false,
+            refusing: false,
         };
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut served = false;
@@ -870,16 +895,28 @@ mod tests {
         let listener =
             std::os::unix::net::UnixListener::bind(dir.path().join("listen")).expect("a listener");
         listener.set_nonblocking(true).expect("non-blocking");
+        let log = Buf::default();
         let mut relay = Relay {
             listener: OwnedFd::from(listener),
             upstream: dir.path().join("upstream"),
             policy: Policy::new(Gate::Paste, false),
-            audit: Audit::new(Box::new(std::io::sink())),
+            audit: Audit::new(Box::new(log.clone())),
             conns: Vec::new(),
             backoff: false,
+            refusing: false,
         };
-        relay.wait_for_descriptors(Instant::now());
+        let start = Instant::now();
+        relay.wait_for_descriptors(start);
         assert!(relay.backoff);
+        // Once per shortage, not once per round of waiting it out. The rounds
+        // are spread past the log's own rate limit, so only the episode itself
+        // can be what keeps the second and third line out.
+        relay.wait_for_descriptors(start + Duration::from_secs(5));
+        relay.wait_for_descriptors(start + Duration::from_secs(10));
+        assert_eq!(
+            log.text(),
+            "bubbler-wl-proxy: connection refused: out of descriptors\n"
+        );
         // The round that honours it waits on its timeout with the listener
         // out of the array, and clears the flag as it goes.
         let waited = Instant::now();
@@ -938,6 +975,32 @@ mod tests {
         rustix::io::write(&wired.client, &message[5..]).expect("the client writes");
         wired.step().expect("the whole message is forwarded");
         assert_eq!(wired.read_server(), message);
+    }
+
+    #[test]
+    fn a_client_that_has_said_its_last_word_still_gets_the_answer() {
+        let mut wired = wired(Gate::Paste);
+        // The compositor has something to say...
+        let delete_id = opcode("wl_display", false, "delete_id");
+        let event = wire::encode(1, delete_id, &[Arg::Uint(3)]).expect("encodes");
+        rustix::io::write(&wired.server, &event).expect("the compositor writes");
+        // ...to a client that has stopped talking but is still listening.
+        rustix::net::shutdown(&wired.client, rustix::net::Shutdown::Write)
+            .expect("the client shuts its writing side");
+
+        wired.step().expect("a half close is not a fault");
+        assert!(wired.conn.client.eof, "the half close was not noticed");
+        let mut buf = [0u8; 64];
+        let read = rustix::io::read(&wired.client, &mut buf[..]).expect("the client reads");
+        assert_eq!(
+            &buf[..read],
+            event.as_slice(),
+            "the answer was dropped instead of delivered"
+        );
+        assert!(
+            wired.conn.finished(),
+            "and only then does the connection end"
+        );
     }
 
     #[test]
