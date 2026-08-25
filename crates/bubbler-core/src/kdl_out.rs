@@ -446,6 +446,15 @@ mod tests {
                 })),
             ),
             (
+                "x11 geometry=\"1920x1080\" fullscreen=#true grab=#true\n",
+                Service::X11(X11Mode::Nested(NestedX11 {
+                    geometry: "1920x1080".to_owned(),
+                    fullscreen: true,
+                    grab: true,
+                    wm: None,
+                })),
+            ),
+            (
                 "x11 geometry=\"1920x1080\" fullscreen=#true grab=#true wm=\"twm\"\n",
                 Service::X11(X11Mode::Nested(NestedX11 {
                     geometry: "1920x1080".to_owned(),

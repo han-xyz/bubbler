@@ -1865,15 +1865,20 @@ fn parse_x11(node: &KdlNode) -> Result<X11Mode, ConfigError> {
                 // One program name, resolved on the sandbox's own `PATH`:
                 // a path would name a host binary the sandbox may not
                 // hold, and a name with whitespace in it would be an
-                // argument list the supervisor does not split.
+                // argument list the supervisor does not split. A leading
+                // `-` is refused because the name is passed to
+                // `bubbler-init` as the argument of `--wm`: a value that
+                // reads as a switch would be one.
                 if s.is_empty()
+                    || s.starts_with('-')
                     || s.contains('/')
                     || s.chars().any(|c| c.is_whitespace() || c == '\0')
                 {
                     return Err(bad(
                         node,
                         &format!(
-                            "wm must be one program name: no `/`, whitespace or NUL, got `{s}`"
+                            "wm must be one program name: no leading `-`, no `/`, \
+                             whitespace or NUL, got `{s}`"
                         ),
                     ));
                 }
@@ -2396,6 +2401,11 @@ mod tests {
             "x11 wm=\"/usr/bin/openbox\"",
             "x11 wm=\"a b\"",
             "x11 wm=\"a\\u{0}b\"",
+            // The name is `--wm`'s argument in the supervisor's own
+            // command line, so a name that reads as a switch is refused
+            // before it can become one.
+            "x11 wm=\"-fullscreen\"",
+            "x11 wm=\"--socket-fd\"",
             "x11 wm=1",
             "x11 wm=\"a\" wm=\"b\"",
             "x11 geometry=\"wide\"",

@@ -641,21 +641,21 @@ mod tests {
                 "│●    wayland                      ││x11  (outward)                            │",
                 "│● !! x11 \"host\"                   ││x11 [\"host\"] [geometry=\"WxH\"]             │",
                 "│● !  home-share \"Downloads\" mode=r││[fullscreen=#true] [grab=#true]           │",
-                "│○ !  network                      ││                                          │",
-                "│○ !  dri                          ││an X server of the sandbox's own, or the  │",
-                "│○ !  pipewire                     ││session's                                 │",
-                "│○ !  pulseaudio                   ││                                          │",
-                "│○ !! gamepad                      ││Bare, bubbler starts a rootful Xwayland   │",
-                "│○ !  hidraw                       ││inside the sandbox as a client of the     │",
-                "│○ !  camera                       ││instance's Wayland socket: X clients see  │",
+                "│○ !  network                      ││[wm=\"<program>\"]                          │",
+                "│○ !  dri                          ││                                          │",
+                "│○ !  pipewire                     ││an X server of the sandbox's own, or the  │",
+                "│○ !  pulseaudio                   ││session's                                 │",
+                "│○ !! gamepad                      ││                                          │",
+                "│○ !  hidraw                       ││Bare, bubbler starts a rootful Xwayland   │",
+                "│○ !  camera                       ││inside the sandbox as a client of the     │",
                 "└──────────────────────────────────┘└──────────────────────────────────────────┘",
                 "Space grant  Enter write it  e $EDITOR  s save  u undo  ? more  Esc back",
             ]
         );
         // And, further down the same pane, what the linter makes of it:
         // further than it was, the cost of this node having grown a
-        // second server to describe.
-        let tall = screen(&app, 80, 32).join(" ");
+        // second server, a lazy start and a window manager to describe.
+        let tall = screen(&app, 80, 40).join(" ");
         assert!(tall.contains("warning[x11-without-reason]"), "{tall}");
         assert!(
             tall.contains("help: drop the argument for a nested"),
@@ -679,11 +679,14 @@ mod tests {
                 "│●┌x11 in `ff`───────────────────────────────────────────────────────────────┐ │",
                 "│○│x11 \"host\"                                                                │ │",
                 "│○│                                                                          │ │",
-                "│○│x11 [\"host\"] [geometry=\"WxH\"] [fullscreen=#true] [grab=#true]             │ │",
+                // The grammar is one line and the field clips it, as it
+                // clips `seccomp`'s: what the prompt is for is the node
+                // above, and the whole grammar is in the pane behind it.
+                "│○│x11 [\"host\"] [geometry=\"WxH\"] [fullscreen=#true] [grab=#true] [wm=\"<progra│ │",
                 "│○│Enter writes it, Esc leaves it alone                                      │ │",
                 "│○└──────────────────────────────────────────────────────────────────────────┘ │",
-                "│○ !  hidraw                       ││inside the sandbox as a client of the     │",
-                "│○ !  camera                       ││instance's Wayland socket: X clients see  │",
+                "│○ !  hidraw                       ││Bare, bubbler starts a rootful Xwayland   │",
+                "│○ !  camera                       ││inside the sandbox as a client of the     │",
                 "└──────────────────────────────────┘└──────────────────────────────────────────┘",
                 "Space grant  Enter write it  e $EDITOR  s save  u undo  ? more  Esc back",
             ]
