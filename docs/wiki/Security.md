@@ -5,8 +5,9 @@
 The boundary is between **your account and one application**. It is not a
 boundary against root, not against your own unsandboxed processes (anything
 running as your uid can read the instance store and connect to a live
-instance's control socket), and `x11` is not a boundary at all. bubbler itself
-is unprivileged and unconfined. Long form with every claim pinned to a test:
+instance's control socket). On the display, `wayland` is a boundary the
+compositor enforces (below) and `x11` is none at all. bubbler itself is
+unprivileged and unconfined. Long form with every claim pinned to a test:
 [`docs/threat-model.md`](https://github.com/han-xyz/bubbler/blob/master/docs/threat-model.md).
 
 ## Process chain
@@ -21,6 +22,44 @@ bubbler ─┬─ bwrap ── bwrap (pid 1 inside, reaps) ── bubbler-init (
 handed in as an inherited fd, so nothing inside reaches its path. Descriptors
 passed through `exec` are reachable via `/proc` — exec is a convenience
 channel, not a boundary. `--die-with-parent` is the backstop for everything.
+
+## Wayland
+
+`wayland` binds a socket of bubbler's own,
+`$XDG_RUNTIME_DIR/bubbler/<inst>/wayland`, at the session's `WAYLAND_DISPLAY`
+name inside, and registers it with the compositor through
+`wp_security_context_v1` (wayland-protocols staging): engine `org.bubbler`,
+app id `org.bubbler.<inst>`, instance id `bubbler-<inst>`. Clients arriving on
+it are marked as sandboxed, and the compositor withholds its privileged globals
+from them — screen capture, clipboard management, input injection, overlays,
+window management on Hyprland and sway. Which globals those are is the
+compositor's policy, not bubbler's; bubbler only attaches the metadata. The
+compositor stops accepting on the socket when the run ends.
+
+Measured on Hyprland 0.56.2: a sandboxed client saw 40 globals against 71 on the
+host. Hidden were screencopy, both data-control managers, virtual keyboard and
+pointer, layer-shell, foreign-toplevel, session-lock, and the security context
+manager itself — a sandbox cannot nest another one. Copy and paste still works:
+data-control is reading the clipboard without focus, while the core
+`wl_data_device` hands a focused client the selection as it does for any
+application.
+
+A compositor that implements none of this gets the session socket and one
+warning per launch:
+
+```
+bubbler: warning: wayland: the compositor offers no wp_security_context_manager_v1, binding the host socket
+```
+
+`wayland "host"` asks for the session socket outright, with every global the
+compositor offers — today's behaviour, and what the sandbox needs if it drives
+one of those protocols itself. `bubbler lint` warns (`wayland-host`); accept it
+with `lint-allow "wayland-host" reason="…"`. No shipped profile grants it.
+
+`--dry-run` and `--explain` never talk to the compositor: they assume the
+security context and print it, so the argv they show is what a run builds where
+the protocol is there. `x11` bypasses all of it — an Xwayland client reaches the
+X server, and Xwayland is a client of your session, not of this socket.
 
 ## Seccomp
 

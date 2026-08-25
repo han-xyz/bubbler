@@ -6,7 +6,8 @@ with the expected type, or the run is refused.
 
 ```kdl
 // bubbler profile: firefox
-wayland                          // host Wayland socket
+wayland                          // socket the compositor treats as sandboxed
+wayland "host"                   // the session socket as it is; lint warns
 x11                              // X socket + Xauthority (no isolation between clients)
 network                          // own namespace via pasta; see Network
 network "host"                   // host's namespace
@@ -40,7 +41,8 @@ command "firefox"
 
 | Node | Grants | Watch out |
 |---|---|---|
-| `wayland` | host Wayland socket, `WAYLAND_DISPLAY` | — |
+| `wayland` | bubbler's own socket, registered with the compositor as a security context; `WAYLAND_DISPLAY` | which globals a sandboxed client loses is the compositor's policy; a compositor without the protocol gets the session socket and a warning |
+| `wayland "host"` | the session's socket, with every global | the compositor cannot tell the sandbox from your session; lint warns |
 | `x11` | X socket, Xauthority at `/home/bubbler/.Xauthority` | X11 clients can keylog each other; lint warns |
 | `network` | own namespace, internet via pasta | LAN/mDNS and host loopback unreachable; see [Network](Network.md) |
 | `network "host"` | host's network stack | host loopback services and abstract sockets exposed |

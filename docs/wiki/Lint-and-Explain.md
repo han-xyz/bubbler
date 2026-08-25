@@ -61,7 +61,8 @@ per group, the config line, the argument count, what is behind each generated
 descriptor (seccomp filter size and architectures, `--ro-bind-data` size,
 which pipe an `--info-fd`/`--block-fd` is), and grants that are not bwrap
 arguments: D-Bus `rules:`, `rule-only:` for nodes contributing nothing else,
-`sidecar: pasta …` and the nft ruleset under `network`.
+`security-context:` under `wayland`, `sidecar: pasta …` and the nft ruleset
+under `network`.
 
 ```
   portals                         config.kdl:11  10 arguments
@@ -72,6 +73,11 @@ arguments: D-Bus `rules:`, `rule-only:` for nodes contributing nothing else,
            ...
   seccomp                                        2 arguments
     --add-seccomp-fd 5  (filter, 896 bytes, x86_64 + i386)
+  wayland                         config.kdl:3   9 arguments
+    --ro-bind /run/user/1000/bubbler/ff/wayland /run/user/1000/wayland-1
+    --setenv WAYLAND_DISPLAY wayland-1
+    --setenv XDG_SESSION_TYPE wayland
+    security-context: engine=org.bubbler app=org.bubbler.ff instance=bubbler-ff
 ```
 
 Groups sit where a node's first argument appears, so the listing is neither

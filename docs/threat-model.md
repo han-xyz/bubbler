@@ -160,6 +160,35 @@ type is bound, whatever it is a socket for.
 `x11_socket_that_is_not_a_socket_fails`,
 `x11_xauthority_at_a_directory_fails`
 
+### Wayland
+
+**Defends:** a `wayland` grant binds a socket bubbler listens on itself,
+registered with the compositor through `wp_security_context_v1` as engine
+`org.bubbler`, app id `org.bubbler.<inst>`, instance id `bubbler-<inst>`,
+and bound into the sandbox at the session's `WAYLAND_DISPLAY` name. A
+client on it is one the compositor knows to be sandboxed, and the
+compositor withholds its privileged globals from such a client. Measured
+on Hyprland 0.56.2: 40 globals inside against 71 on the host, without
+screencopy, either data-control manager, the virtual keyboard and pointer
+protocols, layer-shell, foreign-toplevel, session-lock, or the security
+context manager itself. Recording the screen, reading the clipboard
+without focus and injecting input into the session are what those cost.
+
+**Does not defend:** which globals are hidden is the compositor's policy
+and not bubbler's — bubbler attaches the metadata and the compositor does
+every bit of the enforcing, so the grant is worth what the compositor
+implements. A compositor with no `wp_security_context_manager_v1` gets the
+session socket and a warning on every launch, and `wayland "host"` asks
+for that socket outright (lint `wayland-host`). Xwayland clients are
+outside all of it: `x11` reaches a server that is an ordinary client of
+your session. A focused client is still handed the selection through the
+core `wl_data_device`, as any application is.
+
+[wayland](manual.md#wayland) ·
+`wayland_context_binds_bubblers_socket_at_the_host_name`,
+`wayland_raw_binds_the_host_socket_for_either_reason`,
+`real_wayland_binds_bubblers_own_socket_not_the_hosts`
+
 ### seccomp
 
 **Defends:** a denylist compiled at launch and handed to bwrap as one
@@ -450,7 +479,8 @@ Stated so nobody has to infer them.
   `init.sock`, ptrace bubbler, and replace the binary on your `PATH`.
   bubbler protects you from the *application*, not from your account.
 - **No defence for `x11`.** X11 offers no isolation between clients: any
-  client can read any other's input and windows. The grant exists for
+  client can read any other's input and windows, and an Xwayland client
+  is outside the Wayland security context as well. The grant exists for
   compatibility, `bubbler lint` warns on it, `bubbler run` warns again
   before a real run, and only the two gaming profiles ship it.
   ([Baseline](manual.md#baseline), [Linting](manual.md#linting);

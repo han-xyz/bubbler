@@ -59,11 +59,11 @@ pub static GRANTS: &[Grant] = &[
         summary: "a Wayland socket the compositor treats as sandboxed",
         cost: "By default bubbler registers its own socket with the compositor as a \
                security context, and the compositor hides its privileged globals from \
-               clients on it: screen capture, clipboard snooping, input injection, \
-               overlays and window management, exactly which being the compositor's \
-               policy. A compositor without the protocol gets the host socket and a \
-               warning. `wayland \"host\"` binds the session socket as it is; lint warns. \
-               Xwayland clients (`x11`) bypass all of this.",
+               clients on it: screen capture, reading the clipboard without focus, input \
+               injection, overlays and window management, exactly which being the \
+               compositor's policy. A compositor without the protocol gets the host \
+               socket and a warning. `wayland \"host\"` binds the session socket as it \
+               is; lint warns. Xwayland clients (`x11`) bypass all of this.",
         risk: Risk::Narrow,
         grammar: "wayland [\"host\"]",
     },

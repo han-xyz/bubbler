@@ -233,9 +233,10 @@ file descriptor numbers are the ones a dry run prints.
         --add-seccomp-fd 5  (filter, 896 bytes, x86_64 + i386)
 
       wayland                         config.kdl:3   9 arguments
-        --ro-bind /run/user/1000/wayland-1 /run/user/1000/wayland-1
+        --ro-bind /run/user/1000/bubbler/ff/wayland /run/user/1000/wayland-1
         --setenv WAYLAND_DISPLAY wayland-1
         --setenv XDG_SESSION_TYPE wayland
+        security-context: engine=org.bubbler app=org.bubbler.ff instance=bubbler-ff
 
       network                         config.kdl:7   5 arguments
         --perms 0644 --ro-bind-data 8 /etc/resolv.conf  (generated file, 23 bytes)
@@ -303,7 +304,8 @@ job.
 One top-level node per grant, plus `command`. Unknown nodes are errors, and
 file order does not affect the generated argv.
 
-    wayland                          # the host Wayland socket
+    wayland                          # a socket the compositor treats as sandboxed
+    wayland "host"                   # the session's own socket instead
     x11                              # X socket and Xauthority
     network                          # the sandbox's own network namespace,
                                      #   connected by a pasta sidecar
@@ -455,6 +457,71 @@ Steam's udev rules, which the wiki itself notes lets any logged-in user create
 globally available input devices; grant it only to a profile you would trust
 with your keyboard. A host whose `/dev/uinput` is missing (the `uinput` module
 not loaded) is an error, not a quietly weaker sandbox.
+
+### wayland
+
+`wayland` on its own does not hand the application the session's compositor
+socket. The launcher binds and listens on a socket of its own,
+`$XDG_RUNTIME_DIR/bubbler/<inst>/wayland`, and gives the compositor that
+listening descriptor through `wp_security_context_v1` (wayland-protocols,
+staging) together with three strings: sandbox engine `org.bubbler`, application
+id `org.bubbler.<inst>`, instance id `bubbler-<inst>`. That socket is what the
+sandbox gets, bound at the session's own `WAYLAND_DISPLAY` name, so nothing
+inside has to know it is not the session's. A client connecting through it is
+one the compositor knows to be sandboxed, and the compositor withholds its
+privileged globals from such a client: screen capture, clipboard management,
+input injection, overlays and window management on Hyprland and sway. Which
+globals those are is the compositor's policy and not bubbler's — Hyprland keeps
+an allowlist of what a sandboxed client may bind, sway a denylist of what it may
+not — so what a bare `wayland` grant costs is what the compositor implements.
+bubbler attaches the metadata and nothing else.
+
+Measured here on Hyprland 0.56.2: a client inside saw 40 globals where one on
+the host saw 71. Missing from the sandbox's list were the screencopy manager
+(recording the screen with no portal in between), both data-control managers,
+the virtual keyboard and virtual pointer protocols (typing and clicking into
+your session), layer-shell (drawing over everything), foreign-toplevel (listing
+and controlling other windows), session-lock, and
+`wp_security_context_manager_v1` itself — the protocol hides it from sandboxed
+clients, so a sandbox cannot create a context of its own. What the data-control
+managers cost an application is reading the clipboard without focus: copy and
+paste through the focused window is the core `wl_data_device`, which is not
+privileged, and works inside as it does anywhere.
+
+The compositor keeps accepting connections on that socket after bubbler's own
+connection to it is gone, until the descriptor it was given as `close_fd` hangs
+up. bubbler holds the write end of that pipe for the length of the run, so the
+context ends when the run does and the socket file goes with it.
+
+A compositor that implements none of this — no `wp_security_context_manager_v1`
+in its globals — is not a failed run: the launcher says so once per launch and
+binds the session socket instead.
+
+    bubbler: warning: wayland: the compositor offers no wp_security_context_manager_v1, binding the host socket
+
+A compositor bubbler cannot reach at all — nothing answering on
+`$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY` — stops the run instead, the way a missing
+bind source does everywhere else.
+
+`wayland "host"` asks for that socket outright, with every global the compositor
+offers, which is what an application that drives one of those protocols itself
+needs — a screen recorder, a clipboard manager, a bar. `bubbler lint` warns
+about it (`wayland-host`) and takes a `lint-allow` node naming the protocol as
+the reason. No shipped profile grants it. The mode is one value and not a set,
+so a layer that includes another replaces it in either direction, tightening
+`"host"` to the security context or widening it back; the lint reads the
+result.
+
+`--dry-run` and `--explain` never speak to the compositor, so what they print
+assumes the security context: the bind source is the instance's own socket, and
+under `--explain` its group carries a `security-context:` line naming the three
+strings. A real run is the only thing that probes, and the only thing that
+falls back.
+
+`x11` bypasses all of it. An Xwayland client speaks the X protocol to a server
+which is itself an ordinary client of your session, connected on the session's
+socket rather than through this one, so no security context reaches it — and
+X11 offers no isolation between its own clients either.
 
 ### hidraw
 
@@ -1453,7 +1520,9 @@ outright rather than skipping the bind), `dbus-without-rules`,
 `SECRET`, `PASSWORD`, `APIKEY`, `PAT` and the like, or the value starts
 `ghp_`/`sk-`/`AKIA` — whole words, so `TOKENIZERS_PARALLELISM` is not one),
 `tty-passthrough`, `portal-talk-without-portals` (a portal rule is inert
-without `/.flatpak-info`, which is worse than wrong).
+without `/.flatpak-info`, which is worse than wrong), `wayland-host`
+(`wayland "host"`, the session's own compositor socket, which the compositor
+cannot tell from your session).
 
 **Notes** are information and fail nothing: `app-runtime-rw` (a shared
 application runtime directory granted `mode=rw`, so the sandbox can replace the
@@ -1961,6 +2030,9 @@ none of its own.
 - A generated desktop entry closes D-Bus activation for itself only, and its
   `%f` file arguments are host paths the sandbox cannot open; both are under
   "Desktop entries".
+- `x11` bypasses the Wayland security context: an Xwayland client is a client
+  of your session's own socket, so what a compositor withholds from a
+  sandboxed client it does not withhold there; see "wayland".
 
 ## Files
 

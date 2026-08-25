@@ -42,7 +42,7 @@ with commented examples to start from. Full list: [Commands](docs/wiki/Commands.
 ## Config
 
     // bubbler profile: firefox
-    wayland
+    wayland                          // security-context socket; "host" for the session's
     dri
     pipewire
     network                          // own namespace via pasta; "host" for the host's
