@@ -177,6 +177,10 @@ const USERNS_DISABLED_WITH_NESTED_SANDBOX: Check = Check {
     id: "userns-disabled-with-nested-sandbox",
     severity: Severity::Warning,
 };
+const WAYLAND_HOST: Check = Check {
+    id: "wayland-host",
+    severity: Severity::Warning,
+};
 const X11_WITHOUT_REASON: Check = Check {
     id: "x11-without-reason",
     severity: Severity::Warning,
@@ -214,6 +218,7 @@ pub const CHECKS: &[Check] = &[
     SYSTEM_BUS_POLKIT_NAME,
     TTY_PASSTHROUGH,
     USERNS_DISABLED_WITH_NESTED_SANDBOX,
+    WAYLAND_HOST,
     X11_WITHOUT_REASON,
 ];
 
@@ -841,7 +846,8 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                  input and windows"
                     .to_owned(),
                 "prefer `wayland`, or accept it with \
-                 `lint-allow \"x11-without-reason\" reason=\"...\"`",
+                 `lint-allow \"x11-without-reason\" reason=\"...\"`; Xwayland clients also \
+                 bypass the Wayland security context",
             ),
             "tty" if arg(node) == Some("passthrough") => f.push(
                 i,
@@ -860,6 +866,18 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                     .to_owned(),
                 "drop the argument for the sandbox's own network namespace, unless the app \
                  needs the LAN or a service on the host's loopback",
+            ),
+            "wayland" if arg(node) == Some("host") => f.push(
+                i,
+                node,
+                &WAYLAND_HOST,
+                "`wayland \"host\"` hands over the session socket: the compositor cannot tell \
+                 this sandbox from your session, so screen capture, clipboard snooping and \
+                 input injection stay open to it"
+                    .to_owned(),
+                "drop the argument for a security-context socket, or accept it with \
+                 `lint-allow \"wayland-host\" reason=\"...\"` naming the privileged protocol \
+                 the application needs",
             ),
             "network"
                 if kids(node).any(|c| c.name().value() == "outbound" && arg(c) == Some("deny")) =>
@@ -1524,6 +1542,25 @@ mod tests {
             for clean in ["network", "network {\n    outbound \"allow\"\n}"] {
                 assert_eq!(ids(&lint(ctx, &[clean])), [] as [&str; 0], "{clean}");
             }
+        });
+    }
+
+    /// A warning where `network "host"` is a note: what the argument
+    /// gives up is the compositor's own enforcement, and nothing else in
+    /// the sandbox stands in for it.
+    #[test]
+    fn wayland_host_is_a_warning_and_the_bare_node_is_not() {
+        with(&host(), |ctx| {
+            let report = lint(ctx, &["wayland \"host\""]);
+            assert_eq!(ids(&report), ["wayland-host"]);
+            assert_eq!(report.findings[0].severity, Severity::Warning);
+            assert_eq!(ids(&lint(ctx, &["wayland"])), [] as [&str; 0]);
+            let allowed = lint(
+                ctx,
+                &["wayland \"host\"\nlint-allow \"wayland-host\" \
+                   reason=\"needs zwlr_layer_shell_v1\""],
+            );
+            assert_eq!(ids(&allowed), [] as [&str; 0]);
         });
     }
 
@@ -2257,7 +2294,8 @@ mod tests {
                      X clients: any of them can read another's input and windows"
                         .to_owned(),
                     "  help: prefer `wayland`, or accept it with `lint-allow \
-                     \"x11-without-reason\" reason=\"...\"`"
+                     \"x11-without-reason\" reason=\"...\"`; Xwayland clients also bypass \
+                     the Wayland security context"
                         .to_owned(),
                     "/p/0.kdl:2:1: note[command-not-found]: `keepassxc` is not on this host's PATH"
                         .to_owned(),

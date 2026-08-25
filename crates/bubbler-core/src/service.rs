@@ -53,7 +53,9 @@ pub fn apply_all(
     for (i, s) in services.iter().enumerate() {
         args.tag(Origin::Service(i));
         match s {
-            Service::Wayland => wayland(env, args, host, !has_x11)?,
+            // The mode chooses which socket the launcher hands over, and
+            // no launcher hands one over yet: both bind the host's.
+            Service::Wayland(_) => wayland(env, args, host, !has_x11)?,
             Service::X11 => x11(env, args, host)?,
             Service::Network(cfg) => network(args, host, cfg)?,
             Service::HomeShare { path, mode } => home_share(env, args, host, path, *mode)?,
@@ -1018,6 +1020,7 @@ fn app_runtime(env: &Env, args: &mut BwrapArgs, id: &str, mode: ShareMode) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::WaylandMode;
     use crate::host::fake::{self, FakeHost};
     use std::ffi::OsString;
 
@@ -1135,7 +1138,7 @@ mod tests {
     #[test]
     fn wayland_binds_socket_and_sets_env() {
         let a = argv(
-            &[Service::Wayland],
+            &[Service::Wayland(WaylandMode::Sandboxed)],
             &env(),
             &[("/run/user/1000/wayland-1", Sock)],
         )
@@ -1155,7 +1158,7 @@ mod tests {
     #[test]
     fn wayland_missing_socket_or_env_fails() {
         assert!(matches!(
-            argv(&[Service::Wayland], &env(), &[]),
+            argv(&[Service::Wayland(WaylandMode::Sandboxed)], &env(), &[]),
             Err(LaunchError::MissingResource {
                 service: "wayland",
                 ..
@@ -1164,7 +1167,7 @@ mod tests {
         let mut e = env();
         e.wayland_display = None;
         assert!(matches!(
-            argv(&[Service::Wayland], &e, &[]),
+            argv(&[Service::Wayland(WaylandMode::Sandboxed)], &e, &[]),
             Err(LaunchError::MissingEnv {
                 service: "wayland",
                 var: "WAYLAND_DISPLAY"
@@ -1177,7 +1180,7 @@ mod tests {
         for kind in [File, Dir] {
             assert!(matches!(
                 argv(
-                    &[Service::Wayland],
+                    &[Service::Wayland(WaylandMode::Sandboxed)],
                     &env(),
                     &[("/run/user/1000/wayland-1", kind)]
                 ),
@@ -1312,7 +1315,7 @@ mod tests {
         e.wayland_display = Some("/run/user/1000/wayland-1".into());
         assert!(matches!(
             argv(
-                &[Service::Wayland],
+                &[Service::Wayland(WaylandMode::Sandboxed)],
                 &e,
                 &[("/run/user/1000/wayland-1", Sock)]
             ),
@@ -1324,7 +1327,7 @@ mod tests {
         e.wayland_display = Some("nested/wayland-1".into());
         assert!(matches!(
             argv(
-                &[Service::Wayland],
+                &[Service::Wayland(WaylandMode::Sandboxed)],
                 &e,
                 &[("/run/user/1000/nested/wayland-1", Sock)]
             ),
@@ -1343,7 +1346,7 @@ mod tests {
             assert!(
                 matches!(
                     argv(
-                        &[Service::Wayland],
+                        &[Service::Wayland(WaylandMode::Sandboxed)],
                         &e,
                         &[
                             ("/run/user/1000", Dir),
@@ -1366,7 +1369,11 @@ mod tests {
         let mut e = env();
         e.wayland_display = Some("dconf".into());
         assert!(matches!(
-            argv(&[Service::Wayland], &e, &[("/run/user/1000/dconf", Dir)]),
+            argv(
+                &[Service::Wayland(WaylandMode::Sandboxed)],
+                &e,
+                &[("/run/user/1000/dconf", Dir)]
+            ),
             Err(LaunchError::WrongType {
                 service: "wayland",
                 expected: "a socket",
@@ -1397,7 +1404,7 @@ mod tests {
     #[test]
     fn wayland_and_x11_together_do_not_claim_wayland_session() {
         let a = argv(
-            &[Service::Wayland, Service::X11],
+            &[Service::Wayland(WaylandMode::Sandboxed), Service::X11],
             &env(),
             &[
                 ("/run/user/1000/wayland-1", Sock),
@@ -3004,7 +3011,14 @@ mod tests {
         let host = FakeHost::default().with("/run/user/1000/wayland-1", sock);
         let e = env();
         let mut args = BwrapArgs::baseline(&e, Path::new("/i/home"), &host);
-        apply_all(&[Service::Wayland], &e, &mut args, &host, &argv_ctx(&None)).unwrap();
+        apply_all(
+            &[Service::Wayland(WaylandMode::Sandboxed)],
+            &e,
+            &mut args,
+            &host,
+            &argv_ctx(&None),
+        )
+        .unwrap();
         apply_env(&[("MOZ_ENABLE_WAYLAND".into(), "1".into())], &mut args).unwrap();
         let a = strs(
             &args

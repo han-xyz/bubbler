@@ -4,7 +4,7 @@
 
 use std::ffi::{OsStr, OsString};
 
-use crate::config::{BusRule, InstanceConfig, LintAllow, Service, ShareMode, Userns};
+use crate::config::{BusRule, InstanceConfig, LintAllow, Service, ShareMode, Userns, WaylandMode};
 use crate::error::ConfigError;
 use crate::network::{Mode as NetworkMode, NetworkConfig, Outbound};
 use crate::seccomp::{Errno, SeccompConfig};
@@ -56,7 +56,8 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
     // A new `Service` variant must be given a rendering here: a grant the
     // emitter drops would be a sandbox weaker than the profile it came from.
     Ok(match s {
-        Service::Wayland => "wayland".to_owned(),
+        Service::Wayland(WaylandMode::Sandboxed) => "wayland".to_owned(),
+        Service::Wayland(WaylandMode::Host) => "wayland \"host\"".to_owned(),
         Service::X11 => "x11".to_owned(),
         Service::Network(cfg) => network(cfg),
         Service::Dri => "dri".to_owned(),
@@ -353,6 +354,22 @@ mod tests {
             round_trip(text);
             // Canonical already: what the emitter writes is the input.
             assert_eq!(render(&parse(text).unwrap()).unwrap(), text);
+        }
+    }
+
+    /// Both modes, since the emitter is what a saved config and `reseed`
+    /// are written from: a dropped `"host"` would tighten the grant
+    /// behind the user's back, and a dropped bare node widen it.
+    #[test]
+    fn both_wayland_modes_round_trip() {
+        for (text, mode) in [
+            ("wayland\n", WaylandMode::Sandboxed),
+            ("wayland \"host\"\n", WaylandMode::Host),
+        ] {
+            round_trip(text);
+            // Canonical already: what the emitter writes is the input.
+            assert_eq!(render(&parse(text).unwrap()).unwrap(), text);
+            assert_eq!(service(&Service::Wayland(mode)).unwrap(), text.trim_end());
         }
     }
 

@@ -493,7 +493,7 @@ impl Builder {
 mod tests {
     use super::*;
     use crate::fixture;
-    use bubbler_core::config::ShareMode;
+    use bubbler_core::config::{ShareMode, WaylandMode};
     use bubbler_core::lint::Severity;
 
     /// Errors, warnings and notes the buffer has as it stands.
@@ -515,7 +515,7 @@ mod tests {
     fn the_rows_are_the_rendered_config_line_for_line() {
         let mut cfg = InstanceConfig {
             services: vec![
-                Service::Wayland,
+                Service::Wayland(WaylandMode::Sandboxed),
                 Service::HomeShare {
                     path: "Downloads".into(),
                     mode: ShareMode::ReadWrite,

@@ -331,6 +331,11 @@ const CHECK_LINES: &[(&str, &str)] = &[
          list of such commands is a heuristic.",
     ),
     (
+        "wayland-host",
+        "`wayland \"host\"` binds the session's own socket, so the compositor cannot tell \
+         the sandbox from your session and its privileged globals stay reachable.",
+    ),
+    (
         "x11-without-reason",
         "An `x11` grant with no `lint-allow` reason: X clients are not isolated from one \
          another.",

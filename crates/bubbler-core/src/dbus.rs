@@ -168,7 +168,7 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
                 // Every other grant is listed rather than caught by a
                 // wildcard: a new bundle must be given its rules here, and
                 // a wildcard would silently give it none.
-                Service::Wayland
+                Service::Wayland(_)
                 | Service::X11
                 | Service::Network { .. }
                 | Service::Dri
@@ -467,6 +467,7 @@ pub fn proxy_command_nodes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::WaylandMode;
 
     fn strs(v: &[OsString]) -> Vec<&str> {
         v.iter()
@@ -521,7 +522,7 @@ mod tests {
 
     #[test]
     fn no_bus_means_no_proxy() {
-        assert!(plan(&[Service::Wayland], "t").is_none());
+        assert!(plan(&[Service::Wayland(WaylandMode::Sandboxed)], "t").is_none());
         assert!(plan(&[], "t").is_none());
     }
 
@@ -563,7 +564,7 @@ mod tests {
     #[test]
     fn each_rule_carries_the_node_that_contributed_it() {
         let services = [
-            Service::Wayland,
+            Service::Wayland(WaylandMode::Sandboxed),
             Service::Dbus {
                 rules: vec![BusRule::Own("org.a.B".into())],
             },

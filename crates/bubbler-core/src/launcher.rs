@@ -1893,6 +1893,7 @@ pub fn exec(env: &Env, name: &str, argv: &[OsString], mode: TtyMode) -> Result<i
 mod tests {
     use super::*;
     use crate::bwrap::INIT_INSIDE;
+    use crate::config::WaylandMode;
     use std::io::BufRead;
     use std::os::unix::net::UnixStream;
 
@@ -2479,7 +2480,7 @@ mod tests {
     fn a_config_without_app_runtime_creates_no_app_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let e = env(tmp.path());
-        prepare_app_runtime(&e, &[Service::Wayland]).unwrap();
+        prepare_app_runtime(&e, &[Service::Wayland(WaylandMode::Sandboxed)]).unwrap();
         assert!(!tmp.path().join("run/app").exists());
     }
 

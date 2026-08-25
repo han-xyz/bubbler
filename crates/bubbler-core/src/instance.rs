@@ -9,7 +9,7 @@ use rustix::fs::Mode;
 use rustix::io::Errno;
 use rustix::process::{Pid, test_kill_process};
 
-use crate::config::{self, InstanceConfig, NetworkConfig, Service};
+use crate::config::{self, InstanceConfig, NetworkConfig, Service, WaylandMode};
 use crate::env::Env;
 use crate::error::InstanceError;
 use crate::fsutil;
@@ -184,7 +184,9 @@ fn make_dir(dir: &Path, name: &str, text: &str) -> Result<(), InstanceError> {
 /// The service one [`GRANTS`] name adds.
 fn grant_service(name: &str) -> Option<Service> {
     Some(match name {
-        "wayland" => Service::Wayland,
+        // Always the security context: `--grant wayland` is not where a
+        // user asks for the session's own socket.
+        "wayland" => Service::Wayland(WaylandMode::Sandboxed),
         "x11" => Service::X11,
         "network" => Service::Network(NetworkConfig::default()),
         "dri" => Service::Dri,

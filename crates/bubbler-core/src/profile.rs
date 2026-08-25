@@ -735,8 +735,18 @@ impl Merged {
                     return Ok(());
                 }
             }
-            Service::Wayland
-            | Service::X11
+            Service::Wayland(_) => {
+                if let Some(slot) = self
+                    .services
+                    .iter_mut()
+                    .find(|(s, _)| matches!(s, Service::Wayland(_)))
+                {
+                    // A mode, not a set: the including layer replaces it.
+                    *slot = (svc.clone(), src.clone());
+                    return Ok(());
+                }
+            }
+            Service::X11
             | Service::Dri
             | Service::Pipewire
             | Service::Pulseaudio
@@ -917,7 +927,7 @@ fn mode_conflict(node: &str, a: ShareMode, a_src: &Src, b: ShareMode, b_src: &Sr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BusRule, NetworkConfig};
+    use crate::config::{BusRule, NetworkConfig, WaylandMode};
 
     fn env(root: &Path) -> Env {
         Env {
@@ -1140,7 +1150,7 @@ mod tests {
                 .contains(&home_share("Projects", ShareMode::ReadWrite))
         );
         for s in [
-            Service::Wayland,
+            Service::Wayland(WaylandMode::Sandboxed),
             Service::Dri,
             Service::Network(NetworkConfig::default()),
             Service::Portals,
@@ -1179,7 +1189,7 @@ mod tests {
         let kitty = cfg("kitty");
         assert_eq!(kitty.command, Some(vec![OsString::from("kitty")]));
         for s in [
-            Service::Wayland,
+            Service::Wayland(WaylandMode::Sandboxed),
             Service::Dri,
             Service::Dbus { rules: Vec::new() },
             Service::Portals,
@@ -1315,7 +1325,10 @@ mod tests {
         );
         let resolved = r.resolve("firefox").unwrap();
         let cfg = &resolved.config;
-        assert!(cfg.services.contains(&Service::Wayland));
+        assert!(
+            cfg.services
+                .contains(&Service::Wayland(WaylandMode::Sandboxed))
+        );
         assert!(
             cfg.services
                 .contains(&Service::Network(NetworkConfig::default()))
@@ -1346,6 +1359,30 @@ mod tests {
         };
         assert!(origin.ends_with("solo.kdl"), "{origin}");
         assert!(err.to_string().contains("has no layer below"), "{err}");
+    }
+
+    /// A mode, not a set: the including layer decides it, and it may
+    /// tighten as well as widen. A merge that only ever widened would
+    /// hand the layer above a socket it did not ask for.
+    #[test]
+    fn wayland_mode_is_replaced_by_the_including_layer_in_both_directions() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (base, app, want) in [
+            (
+                "wayland \"host\"\n",
+                "include \"base\"\nwayland\n",
+                WaylandMode::Sandboxed,
+            ),
+            (
+                "wayland\n",
+                "include \"base\"\nwayland \"host\"\n",
+                WaylandMode::Host,
+            ),
+        ] {
+            let r = resolver(tmp.path(), &[("base", base), ("app", app)], &[]);
+            let cfg = r.resolve("app").unwrap().config;
+            assert_eq!(cfg.services, vec![Service::Wayland(want)], "{app}");
+        }
     }
 
     /// The mode is one choice and the including layer makes it; the
@@ -1499,7 +1536,10 @@ mod tests {
         let cfg = r.resolve("app").unwrap().config;
         assert_eq!(
             cfg.services,
-            vec![Service::Wayland, Service::Network(NetworkConfig::default())]
+            vec![
+                Service::Wayland(WaylandMode::Sandboxed),
+                Service::Network(NetworkConfig::default())
+            ]
         );
         assert_eq!(cfg.command.unwrap(), vec![OsString::from("app")]);
         assert_eq!(cfg.tty, TtyMode::None);
@@ -1681,7 +1721,7 @@ mod tests {
         assert_eq!(
             cfg.services,
             vec![
-                Service::Wayland,
+                Service::Wayland(WaylandMode::Sandboxed),
                 Service::Network(NetworkConfig::default()),
                 Service::HomeShare {
                     path: "D".into(),
@@ -1943,7 +1983,7 @@ mod tests {
         assert_eq!(
             cfg.services,
             vec![
-                Service::Wayland,
+                Service::Wayland(WaylandMode::Sandboxed),
                 Service::Network(NetworkConfig::default()),
                 Service::Dri
             ]

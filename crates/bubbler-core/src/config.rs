@@ -127,6 +127,34 @@ impl FromStr for Userns {
     }
 }
 
+/// What `wayland` binds: bubbler's own socket registered with the
+/// compositor as a security context, or the host's socket as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WaylandMode {
+    /// A `wp_security_context_v1` listener the compositor treats as
+    /// sandboxed, falling back to the host socket with a warning where
+    /// the compositor offers none.
+    #[default]
+    Sandboxed,
+    /// The host's socket: the compositor cannot tell the sandbox from
+    /// the session (`wayland "host"`).
+    Host,
+}
+
+impl FromStr for WaylandMode {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "host" => Ok(Self::Host),
+            _ => Err(ConfigError::BadArgument {
+                node: "wayland".to_owned(),
+                reason: format!("expected `host`, got `{s}`"),
+            }),
+        }
+    }
+}
+
 /// Whether a shared path is writable inside the sandbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShareMode {
@@ -186,8 +214,9 @@ impl BusRule {
 /// builder's phases decide argv order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Service {
-    /// Access to the host Wayland socket.
-    Wayland,
+    /// Access to the compositor: a security-context socket by default,
+    /// the host socket under `wayland "host"`.
+    Wayland(WaylandMode),
     /// Access to the host X11 socket. X11 offers no isolation between
     /// clients; this is a compatibility grant, not a safe one.
     X11,
@@ -302,7 +331,7 @@ impl Service {
     /// nothing can explain to the user.
     pub fn node_name(&self) -> &'static str {
         match self {
-            Self::Wayland => "wayland",
+            Self::Wayland(_) => "wayland",
             Self::X11 => "x11",
             Self::Network(_) => "network",
             Self::Dri => "dri",
@@ -551,11 +580,10 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
             return Err(ConfigError::UnknownNode(name.to_owned()));
         }
         match name {
-            "wayland" | "x11" | "dri" | "pipewire" | "pulseaudio" | "portals" | "notify"
-            | "tray" | "hidraw" => {
+            "x11" | "dri" | "pipewire" | "pulseaudio" | "portals" | "notify" | "tray"
+            | "hidraw" => {
                 reject_entries(node)?;
                 let svc = match name {
-                    "wayland" => Service::Wayland,
                     "x11" => Service::X11,
                     "dri" => Service::Dri,
                     "pipewire" => Service::Pipewire,
@@ -623,6 +651,41 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
                     return Err(ConfigError::Duplicate(name.to_owned()));
                 }
                 cfg.services.push(parse_dbus(node)?);
+            }
+            "wayland" => {
+                if node.children().is_some() {
+                    return Err(bad(node, "takes no children"));
+                }
+                let mut mode = WaylandMode::default();
+                let mut seen_mode = false;
+                for e in node.entries() {
+                    if let Some(p) = e.name() {
+                        return Err(ConfigError::UnknownProperty {
+                            node: name.to_owned(),
+                            prop: p.value().to_owned(),
+                        });
+                    }
+                    if seen_mode {
+                        return Err(bad(node, "expects at most one mode argument"));
+                    }
+                    seen_mode = true;
+                    let s = e
+                        .value()
+                        .as_string()
+                        .ok_or_else(|| bad(node, "mode must be \"host\""))?;
+                    mode = WaylandMode::from_str(s)?;
+                }
+                // By variant, like `network`: two `wayland` nodes differ
+                // in mode, and which socket the config asks for would be
+                // a matter of their order in the file.
+                if cfg
+                    .services
+                    .iter()
+                    .any(|s| matches!(s, Service::Wayland(_)))
+                {
+                    return Err(ConfigError::Duplicate(name.to_owned()));
+                }
+                cfg.services.push(Service::Wayland(mode));
             }
             "network" => {
                 // By variant, like `gamepad`: two `network` nodes differ
@@ -1950,7 +2013,7 @@ mod tests {
         assert_eq!(
             cfg.services,
             vec![
-                Service::Wayland,
+                Service::Wayland(WaylandMode::Sandboxed),
                 Service::X11,
                 Service::Network(NetworkConfig::default()),
                 Service::HomeShare {
@@ -1967,6 +2030,32 @@ mod tests {
             cfg.command.unwrap(),
             vec![OsString::from("foot"), "-e".into(), "fish".into()]
         );
+    }
+
+    /// The bare node and the one mode name it takes. A second `wayland`
+    /// node is a duplicate whatever the two modes say: which socket the
+    /// config asks for would otherwise be a matter of file order.
+    #[test]
+    fn wayland_host_parses_and_anything_else_is_refused() {
+        let cfg = parse("wayland \"host\"\ncommand \"true\"").unwrap();
+        assert!(cfg.services.contains(&Service::Wayland(WaylandMode::Host)));
+        let bare = parse("wayland\ncommand \"true\"").unwrap();
+        assert!(
+            bare.services
+                .contains(&Service::Wayland(WaylandMode::Sandboxed))
+        );
+        for bad in [
+            "wayland \"other\"",
+            "wayland 1",
+            "wayland foo=\"host\"",
+            "wayland { x }",
+        ] {
+            assert!(parse(&format!("{bad}\ncommand \"true\"")).is_err(), "{bad}");
+        }
+        assert!(matches!(
+            parse("wayland\nwayland \"host\"\ncommand \"true\""),
+            Err(ConfigError::Duplicate(n)) if n == "wayland"
+        ));
     }
 
     /// The three modes, and what a bare node means now.
@@ -3334,7 +3423,10 @@ command "b""#
     fn include_is_a_profile_node_only() {
         let raw = parse_profile("include \"gui\"\nwayland\ninclude \"audio\"").unwrap();
         assert_eq!(raw.includes, vec!["gui".to_string(), "audio".to_string()]);
-        assert_eq!(raw.config.services, vec![Service::Wayland]);
+        assert_eq!(
+            raw.config.services,
+            vec![Service::Wayland(WaylandMode::Sandboxed)]
+        );
         assert!(!raw.tty_set);
 
         let err = parse("include \"gui\"").unwrap_err();
