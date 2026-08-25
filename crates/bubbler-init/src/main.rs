@@ -293,11 +293,37 @@ fn reap(execs: &mut Vec<Exec>) {
     });
 }
 
+/// Whether a child is gone. `try_wait` fails only where init cannot learn
+/// the child's fate at all, and a process it can no longer account for is
+/// treated as gone: assuming it is still up is what would leave the
+/// command drawing on a display that is not there.
+fn has_exited(child: &mut Child, what: &str) -> bool {
+    match child.try_wait() {
+        Ok(None) => false,
+        Ok(Some(_)) => true,
+        Err(e) => {
+            eprintln!("bubbler-init: cannot wait for {what}: {e}");
+            true
+        }
+    }
+}
+
 /// Signal every exec'd child. They are unreaped here, so their pids are still theirs.
 fn signal_execs(execs: &[Exec], sig: Signal) {
     for e in execs {
         let _ = kill_process(Pid::from_child(&e.child), sig);
     }
+}
+
+/// Ask the run to end: SIGTERM the command and every exec'd child, and
+/// set the deadline at which whatever ignored it is SIGKILLed. The
+/// deadline is the point: a command that traps SIGTERM would otherwise
+/// keep the sandbox alive for as long as it liked.
+fn begin_stop(command: &Child, execs: &[Exec], kill_at: &mut Option<Instant>) {
+    // Nothing here is reaped until the loop exits, so every pid is still its own.
+    let _ = kill_process(Pid::from_child(command), Signal::TERM);
+    signal_execs(execs, Signal::TERM);
+    *kill_at = Some(Instant::now() + GRACE);
 }
 
 /// SIGTERM the remaining exec'd children and SIGKILL whatever outlives the grace.
@@ -495,10 +521,7 @@ fn main() -> ExitCode {
     let mut kill_at: Option<Instant> = None;
     loop {
         if stop.swap(false, Ordering::SeqCst) {
-            // The command is unreaped until the loop exits, so its pid is still its own.
-            let _ = kill_process(Pid::from_child(&command), Signal::TERM);
-            signal_execs(&execs, Signal::TERM);
-            kill_at = Some(Instant::now() + GRACE);
+            begin_stop(&command, &execs, &mut kill_at);
         }
         if let Ok(Some(status)) = command.try_wait() {
             reap(&mut execs);
@@ -512,19 +535,16 @@ fn main() -> ExitCode {
             // blind. Checked after the command's own exit, so the two
             // going down together is not reported as the server stopping
             // the command.
-            if x.server
-                .as_mut()
-                .is_some_and(|s| matches!(s.try_wait(), Ok(Some(_))))
-            {
+            if x.server.as_mut().is_some_and(|s| has_exited(s, "Xwayland")) {
                 eprintln!("bubbler-init: Xwayland exited; stopping the command");
-                let _ = kill_process(Pid::from_child(&command), Signal::TERM);
+                begin_stop(&command, &execs, &mut kill_at);
                 x.server = None;
             }
             // Said once: the child is dropped here and never started
             // again, so the next tick has nothing left to report.
             if x.wm_child
                 .as_mut()
-                .is_some_and(|w| matches!(w.try_wait(), Ok(Some(_))))
+                .is_some_and(|w| has_exited(w, "the window manager"))
             {
                 if let Some(name) = x.wm.as_ref() {
                     eprintln!("bubbler-init: wm {} exited", name.to_string_lossy());
@@ -583,7 +603,7 @@ fn main() -> ExitCode {
                 Ok(()) => start_wm(x),
                 Err(reason) => {
                     eprintln!("bubbler-init: Xwayland did not start: {reason}");
-                    let _ = kill_process(Pid::from_child(&command), Signal::TERM);
+                    begin_stop(&command, &execs, &mut kill_at);
                 }
             }
         }

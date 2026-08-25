@@ -26,6 +26,12 @@ struct Opts<'a> {
     wm: Option<&'a Path>,
 }
 
+/// One spawn at a time. Clearing CLOEXEC is a change to the whole
+/// process, so a supervisor forked while another test sits between that
+/// and its own `exec` inherits that test's socket — and hands it on to
+/// every child it spawns itself. Every spawn in this file takes it.
+static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn start(cmd: &[&str]) -> Started {
     start_with(cmd, Opts::default())
 }
@@ -35,6 +41,7 @@ fn start_with(cmd: &[&str], opts: Opts<'_>) -> Started {
     let tmp = tempfile::tempdir().unwrap();
     let sock = tmp.path().join("init.sock");
     let listener = UnixListener::bind(&sock).unwrap();
+    let one_at_a_time = SPAWN.lock().unwrap();
     // The listener must be inherited: clear CLOEXEC on a dup.
     let inherited = rustix::io::fcntl_dupfd_cloexec(listener.as_fd(), 3).unwrap();
     rustix::io::fcntl_setfd(&inherited, rustix::io::FdFlags::empty()).unwrap();
@@ -64,8 +71,10 @@ fn start_with(cmd: &[&str], opts: Opts<'_>) -> Started {
         }
     }
     let child = init.arg("--").args(cmd).spawn().unwrap();
-    drop(listener);
+    // Closed before the lock goes, or the window it guards is still open.
     drop(inherited);
+    drop(one_at_a_time);
+    drop(listener);
     (child, sock, tmp)
 }
 
@@ -286,6 +295,7 @@ fn send_prefix_and_fds(stream: &UnixStream, len: u32) {
 
 #[test]
 fn a_closed_socket_fd_is_a_usage_error_not_an_abort() {
+    let one_at_a_time = SPAWN.lock().unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_bubbler-init"))
         .arg("--socket-fd")
         .arg("99")
@@ -293,6 +303,7 @@ fn a_closed_socket_fd_is_a_usage_error_not_an_abort() {
         .arg("/usr/bin/true")
         .output()
         .unwrap();
+    drop(one_at_a_time);
     assert_eq!(out.status.code(), Some(2), "aborted instead of exiting 2");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("socket fd"), "stderr was {err:?}");
@@ -389,54 +400,103 @@ fn require_python() -> bool {
     ok
 }
 
+/// Lists the descriptors a fixture inherited, minus the one the listing
+/// itself opened: `os.listdir` holds a descriptor on the directory while
+/// it reads it, and that one is closed again — so its `/proc/self/fd`
+/// link is already gone — by the time the entries are looked at.
+const FD_LIST: &str = r#"def _fds():
+    out = []
+    for e in os.listdir("/proc/self/fd"):
+        try:
+            os.readlink("/proc/self/fd/" + e)
+        except OSError:
+            continue
+        out.append(int(e))
+    return " ".join(str(n) for n in sorted(out))
+"#;
+
+/// Records when a fixture was asked to stop, so a test can put the
+/// supervisor's shutdown steps in order. `time.monotonic_ns` reads
+/// CLOCK_MONOTONIC, which every process on the host shares.
+const STAMPS_ON_TERM: &str = r#"def _bye(*_):
+    open(sys.argv[0] + ".stamp", "w").write(str(time.monotonic_ns()))
+    sys.exit(0)
+signal.signal(signal.SIGTERM, _bye)
+"#;
+
 /// What every fake X server does before it differs: find `-listenfd N` in
-/// its own argv the way Xwayland does, record its pid beside the script
-/// so a test can tell whether it was started at all, and accept on the
-/// inherited socket the connection that woke it.
-const SERVER_PRELUDE: &str = r#"import os, socket, sys, time
+/// its own argv the way Xwayland does, and record its pid beside the
+/// script so a test can tell whether it was started at all.
+const SERVER_HEAD: &str = r#"import os, signal, socket, sys, time
 argv = sys.argv[1:]
 fd = int(argv[argv.index("-listenfd") + 1])
 open(sys.argv[0] + ".pid", "w").write(str(os.getpid()))
-listener = socket.fromfd(fd, socket.AF_UNIX, socket.SOCK_STREAM)
+"#;
+/// Accepting on the inherited socket the connection that woke it, which
+/// is the whole point: the supervisor never accepted it.
+const SERVER_ACCEPT: &str = r#"listener = socket.fromfd(fd, socket.AF_UNIX, socket.SOCK_STREAM)
 conn, _ = listener.accept()
 conn.sendall(b"X")
 "#;
-
 /// A server that serves its first client and stays up, as Xwayland does.
 const SERVES_AND_STAYS: &str = "time.sleep(30)\n";
 /// A server that serves its first client and then loses the display.
 const SERVES_AND_DIES: &str = "sys.exit(0)\n";
 
-/// A window manager that records the display it was handed and stays up.
-const WM_STAYS: &str = r#"#!/usr/bin/python3
-import os, sys, time
+/// What every fake window manager records: its pid, the descriptors it
+/// inherited and the display it was handed.
+const WM_RECORDS: &str = r#"seen = _fds()
 open(sys.argv[0] + ".pid", "w").write(str(os.getpid()))
+open(sys.argv[0] + ".fds", "w").write(seen)
 open(sys.argv[0] + ".display", "w").write(os.environ.get("DISPLAY", "none"))
-time.sleep(30)
 "#;
+/// A window manager that stays up, as one managing windows would.
+const WM_STAYS: &str = "time.sleep(30)\n";
 /// A window manager that is there but does not stay.
-const WM_EXITS: &str = r#"#!/usr/bin/python3
-import os, sys
-open(sys.argv[0] + ".pid", "w").write(str(os.getpid()))
+const WM_EXITS: &str = "";
+
+/// A command that runs until the test lets it stop, and records when it did.
+const COMMAND_WAITS: &str = r#"#!/usr/bin/python3
+import os, sys, time
+while not os.path.exists(sys.argv[1]):
+    time.sleep(0.02)
+open(sys.argv[0] + ".stamp", "w").write(str(time.monotonic_ns()))
+"#;
+/// A command that will not take SIGTERM for an answer. It gives up after
+/// a minute all the same, so a supervisor that fails to escalate does not
+/// leave it behind for the rest of the day.
+const COMMAND_IGNORES_TERM: &str = r#"#!/usr/bin/python3
+import signal, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+time.sleep(60)
 "#;
 
-/// Write one fake X server into `dir` and return its path. It is run
-/// through the interpreter, so `--x11` carries more than one word.
-fn server_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+/// Write one fixture into `dir` and return its path. Only the ones the
+/// supervisor names on their own — the window manager and the command —
+/// have to be executable; the X server is run through the interpreter,
+/// so `--x11` carries more than one word.
+fn write_script(dir: &Path, name: &str, body: &str, executable: bool) -> PathBuf {
     let path = dir.join(name);
-    let mut f = std::fs::File::create(&path).unwrap();
-    f.write_all(SERVER_PRELUDE.as_bytes()).unwrap();
-    f.write_all(body.as_bytes()).unwrap();
+    std::fs::write(&path, body).unwrap();
+    if executable {
+        let mode = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+        std::fs::set_permissions(&path, mode).unwrap();
+    }
     path
 }
 
-/// Write one fake window manager into `dir`, executable and with its own
-/// interpreter line: `--wm` names one program and nothing in front of it.
+/// Write one fake X server into `dir` and return its path.
+fn server_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let text = format!("{SERVER_HEAD}{STAMPS_ON_TERM}{SERVER_ACCEPT}{body}");
+    write_script(dir, name, &text, false)
+}
+
+/// Write one fake window manager into `dir` and return its path.
 fn wm_script(dir: &Path, name: &str, body: &str) -> PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, body).unwrap();
-    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    path
+    let text = format!(
+        "#!{PYTHON}\nimport os, signal, sys, time\n{FD_LIST}{STAMPS_ON_TERM}{WM_RECORDS}{body}"
+    );
+    write_script(dir, name, &text, true)
 }
 
 /// A file standing in for the supervisor's whole stdio, so its messages
@@ -502,16 +562,27 @@ fn wait_for_log(log: &Path, needle: &str) -> String {
     }
 }
 
-/// Where a fake server or window manager records its own pid.
-fn pidfile(script: &Path) -> PathBuf {
+/// A file a fixture wrote beside itself.
+fn beside(script: &Path, suffix: &str) -> PathBuf {
     let mut path = script.as_os_str().to_owned();
-    path.push(".pid");
+    path.push(suffix);
     PathBuf::from(path)
 }
 
-/// The pid a fake server or window manager recorded for itself.
+/// The pid a fixture recorded for itself.
 fn pid_of(script: &Path) -> i32 {
-    wait_for_file(&pidfile(script)).trim().parse().unwrap()
+    wait_for_file(&beside(script, ".pid"))
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// When a fixture was asked to stop, on the clock they all share.
+fn stamp_of(script: &Path) -> u128 {
+    wait_for_file(&beside(script, ".stamp"))
+        .trim()
+        .parse()
+        .unwrap()
 }
 
 /// Fail unless the process has left the process table. It is the
@@ -524,6 +595,24 @@ fn assert_gone(pid: i32) {
             t.elapsed() < Duration::from_secs(3),
             "the process ({pid}) was left running"
         );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Wait for the supervisor to exit, but never longer than `limit`. A run
+/// that outlives its display is the regression these tests guard, and a
+/// test that hangs on it hides it instead of reporting it.
+fn wait_within(init: &mut std::process::Child, limit: Duration) -> ExitStatus {
+    let t = Instant::now();
+    loop {
+        if let Some(status) = init.try_wait().unwrap() {
+            return status;
+        }
+        if t.elapsed() >= limit {
+            let _ = init.kill();
+            let _ = init.wait();
+            panic!("the supervisor was still running after {limit:?}");
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -587,7 +676,7 @@ fn the_x_server_is_not_started_until_a_client_connects() {
     );
     std::thread::sleep(Duration::from_secs(1));
     assert!(
-        !pidfile(&script).exists(),
+        !beside(&script, ".pid").exists(),
         "the server was started with no client to serve"
     );
     let client = x_connect(&xsock);
@@ -598,20 +687,20 @@ fn the_x_server_is_not_started_until_a_client_connects() {
 }
 
 #[test]
-fn the_window_manager_starts_with_the_server_and_both_stop_with_the_command() {
+fn the_window_manager_starts_with_the_server_and_the_shutdown_runs_inwards() {
     if !require_python() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
     let script = server_script(dir.path(), "xserver.py", SERVES_AND_STAYS);
     let wm = wm_script(dir.path(), "fake-wm", WM_STAYS);
+    let cmd = write_script(dir.path(), "command", COMMAND_WAITS, true);
     let xsock = dir.path().join("X0");
     let quit = dir.path().join("quit");
-    let run = format!("while [ ! -e {} ]; do sleep 0.05; done", quit.display());
     let log = dir.path().join("init.log");
     let fd = stdio_file(&log);
     let (mut init, _sock, _tmp) = start_with(
-        &["/usr/bin/sh", "-c", &run],
+        &[cmd.to_str().unwrap(), quit.to_str().unwrap()],
         Opts {
             stdio: Some(&fd),
             x11: Some(&[PYTHON, script.to_str().unwrap()]),
@@ -621,9 +710,7 @@ fn the_window_manager_starts_with_the_server_and_both_stop_with_the_command() {
         },
     );
     wait_for_path(&xsock);
-    let mut display = wm.as_os_str().to_owned();
-    display.push(".display");
-    let display = PathBuf::from(display);
+    let display = beside(&wm, ".display");
     std::thread::sleep(Duration::from_millis(300));
     assert!(
         !display.exists(),
@@ -639,9 +726,65 @@ fn the_window_manager_starts_with_the_server_and_both_stop_with_the_command() {
     let server_pid = pid_of(&script);
     let wm_pid = pid_of(&wm);
     std::fs::write(&quit, b"").unwrap();
-    assert_eq!(init.wait().unwrap().code(), Some(0));
+    let status = wait_within(&mut init, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
     assert_gone(wm_pid);
     assert_gone(server_pid);
+    // Command, then window manager, then server: nothing is left drawing
+    // on a display that has already gone.
+    let (command, wm, server) = (stamp_of(&cmd), stamp_of(&wm), stamp_of(&script));
+    assert!(
+        command < wm,
+        "the window manager was stopped first ({command} vs {wm})"
+    );
+    assert!(
+        wm < server,
+        "the server was stopped before its window manager ({wm} vs {server})"
+    );
+}
+
+#[test]
+fn no_child_but_the_server_inherits_the_display_socket() {
+    if !require_python() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let script = server_script(dir.path(), "xserver.py", SERVES_AND_STAYS);
+    let wm = wm_script(dir.path(), "fake-wm", WM_STAYS);
+    let xsock = dir.path().join("X0");
+    let log = dir.path().join("init.log");
+    let fd = stdio_file(&log);
+    let (mut init, sock, _tmp) = start_with(
+        &["/usr/bin/sleep", "30"],
+        Opts {
+            stdio: Some(&fd),
+            x11: Some(&[PYTHON, script.to_str().unwrap()]),
+            x11_socket: Some(&xsock),
+            wm: Some(&wm),
+            ..Opts::default()
+        },
+    );
+    wait_for_path(&xsock);
+    let client = x_connect(&xsock);
+    assert_eq!(served_byte(&client), b'X');
+    // The socket is handed to the server on a duplicate, so the window
+    // manager spawned right after it has nothing above its own stdio.
+    assert_eq!(
+        wait_for_file(&beside(&wm, ".fds")),
+        "0 1 2",
+        "the window manager inherited more than its stdio"
+    );
+    let out = dir.path().join("exec.fds");
+    let file = std::fs::File::create(&out).unwrap();
+    let program = format!("import os\n{FD_LIST}print(_fds())\n");
+    let st = exec_with_stdout(&sock, &[PYTHON, "-c", &program], file.as_fd());
+    assert_eq!(ExitStatus::from_raw(st).code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap().trim(),
+        "0 1 2",
+        "an exec'd child inherited more than the stdio it was sent"
+    );
+    stop(&mut init);
 }
 
 #[test]
@@ -739,14 +882,48 @@ fn a_server_that_exits_after_serving_terminates_the_command() {
     wait_for_path(&xsock);
     let client = x_connect(&xsock);
     assert_eq!(served_byte(&client), b'X');
-    let t = Instant::now();
-    let status = init.wait().unwrap();
+    let status = wait_within(&mut init, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(143));
+    let err = std::fs::read_to_string(&log).unwrap();
     assert!(
-        t.elapsed() < Duration::from_secs(10),
-        "the command outlived the display by {:?}",
+        err.contains("Xwayland exited; stopping the command"),
+        "stderr was {err:?}"
+    );
+}
+
+#[test]
+fn a_command_that_ignores_the_signal_is_killed_when_the_display_goes() {
+    if !require_python() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let script = server_script(dir.path(), "xserver.py", SERVES_AND_DIES);
+    let cmd = write_script(dir.path(), "deaf", COMMAND_IGNORES_TERM, true);
+    let xsock = dir.path().join("X0");
+    let log = dir.path().join("init.log");
+    let fd = stdio_file(&log);
+    let (mut init, _sock, _tmp) = start_with(
+        &[cmd.to_str().unwrap()],
+        Opts {
+            stdio: Some(&fd),
+            x11: Some(&[PYTHON, script.to_str().unwrap()]),
+            x11_socket: Some(&xsock),
+            ..Opts::default()
+        },
+    );
+    wait_for_path(&xsock);
+    let client = x_connect(&xsock);
+    assert_eq!(served_byte(&client), b'X');
+    let t = Instant::now();
+    let status = wait_within(&mut init, Duration::from_secs(12));
+    // The grace is the whole point: SIGTERM was ignored, so the run ends
+    // on the SIGKILL that follows it instead of never ending at all.
+    assert!(
+        t.elapsed() > Duration::from_secs(4),
+        "the escalation took {:?}",
         t.elapsed()
     );
-    assert_eq!(status.code(), Some(143));
+    assert_eq!(status.code(), Some(137), "not the exit of a killed command");
     let err = std::fs::read_to_string(&log).unwrap();
     assert!(
         err.contains("Xwayland exited; stopping the command"),
@@ -771,7 +948,7 @@ fn a_server_that_cannot_be_spawned_terminates_the_command() {
     );
     wait_for_path(&xsock);
     let client = x_connect(&xsock);
-    let status = init.wait().unwrap();
+    let status = wait_within(&mut init, Duration::from_secs(10));
     assert_eq!(status.code(), Some(143));
     let err = std::fs::read_to_string(&log).unwrap();
     assert!(err.contains("Xwayland did not start"), "stderr was {err:?}");
