@@ -25,13 +25,19 @@
 //! the three strings, commit, destroy, roundtrip.
 //!
 //! [`probe`] and [`create_context`] connect over `$WAYLAND_DISPLAY` in
-//! `$XDG_RUNTIME_DIR`, read from the process environment by wayrs — the
-//! same values [`crate::env::Env`] validated, since the launcher is that
-//! process. wayrs also honours `$WAYLAND_SOCKET`, an inherited connection
-//! fd; nothing starts bubbler with one, and the sandbox never sees
-//! bubbler's environment.
+//! `$XDG_RUNTIME_DIR`, which wayrs reads from the process environment
+//! itself. Nothing here can check that value, so the launcher validates
+//! its shape — one path component — before calling in; an absolute or
+//! `..` name would otherwise steer the connection, and the listening fd
+//! with it, at an endpoint of the caller's choosing.
+//!
+//! wayrs also honours `$WAYLAND_SOCKET`, a connection *file descriptor*
+//! inherited from a parent, which it adopts and closes with the
+//! connection — a number that may well be a descriptor this process is
+//! using for something else. The launcher refuses to run rather than
+//! connect that way; see [`refuse_inherited`].
 
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -110,6 +116,17 @@ pub enum WaylandError {
     /// created. Raised by the launcher, which binds it.
     #[error("creating the listening socket {0}")]
     Listen(PathBuf, #[source] io::Error),
+    /// The pipe whose hangup ends the context could not be created.
+    /// Raised by the launcher, which holds its write end.
+    #[error("creating the pipe that ends the security context")]
+    Pipe(#[source] io::Error),
+    /// A compositor connection was inherited through `$WAYLAND_SOCKET`.
+    /// bubbler refuses it rather than let wayrs adopt a descriptor
+    /// number this process may already be using for the run's own files.
+    #[error(
+        "$WAYLAND_SOCKET is set; bubbler must be started without an inherited compositor connection"
+    )]
+    InheritedSocket,
 }
 
 impl WaylandError {
@@ -135,6 +152,24 @@ impl From<ConnectError> for WaylandError {
     }
 }
 
+/// Where a run's own listening socket goes: [`SOCKET_NAME`] under the
+/// instance's runtime directory, which only bubbler can write to.
+pub fn socket_path(instance_runtime: &Path) -> PathBuf {
+    instance_runtime.join(SOCKET_NAME)
+}
+
+/// Refuses an inherited compositor connection, given whatever
+/// `$WAYLAND_SOCKET` holds. wayrs would take the value as a descriptor
+/// number, use it as the connection and close it when the connection
+/// drops; nothing says that descriptor is not one this run opened for
+/// itself, and a closed control socket is a broken run.
+pub fn refuse_inherited(socket: Option<&OsStr>) -> Result<(), WaylandError> {
+    match socket {
+        Some(_) => Err(WaylandError::InheritedSocket),
+        None => Ok(()),
+    }
+}
+
 /// Which socket a run binds, from the configured mode and what [`probe`]
 /// found. `manager_present` is `None` when nothing asked the compositor
 /// — `--dry-run` and `--explain` never connect — and the answer is then
@@ -153,7 +188,7 @@ pub fn plan(
             reason: RawReason::NoManager,
         },
         (WaylandMode::Sandboxed, Some(true) | None) => WaylandPlan::Context {
-            socket: instance_runtime.join(SOCKET_NAME),
+            socket: socket_path(instance_runtime),
         },
     }
 }
@@ -259,5 +294,20 @@ mod tests {
         assert!(e.to_string().contains("wp_security_context_manager_v1"));
         let e = WaylandError::Listen("/x".into(), std::io::Error::other("boom"));
         assert!(e.to_string().contains("/x"));
+        let e = WaylandError::Pipe(std::io::Error::other("boom"));
+        assert!(e.to_string().contains("ends the security context"));
+    }
+
+    /// The value is not read here but passed in, so the rule can be
+    /// tested without a process-wide environment a parallel test shares.
+    #[test]
+    fn an_inherited_connection_is_refused() {
+        assert!(refuse_inherited(None).is_ok());
+        for set in ["", "5", "not a number"] {
+            let e = refuse_inherited(Some(OsStr::new(set)))
+                .expect_err("$WAYLAND_SOCKET set at all is a refusal");
+            assert!(matches!(e, WaylandError::InheritedSocket), "{e:?}");
+            assert!(e.to_string().contains("$WAYLAND_SOCKET is set"));
+        }
     }
 }

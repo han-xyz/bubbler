@@ -614,7 +614,20 @@ pub struct WaylandHandle {
 /// Called before the argv is built, like the D-Bus proxy: the answer
 /// decides which socket the argv names, and the socket has to be there
 /// for bwrap to bind. The handle must outlive the sandbox.
-pub fn start_wayland(dir: &Path, instance: &str) -> Result<Option<WaylandHandle>, LaunchError> {
+///
+/// Nothing is connected to before the environment it would be connected
+/// through has been checked: wayrs reads `$WAYLAND_DISPLAY` and
+/// `$WAYLAND_SOCKET` itself, and both are untrusted host input.
+pub fn start_wayland(
+    env: &Env,
+    dir: &Path,
+    instance: &str,
+) -> Result<Option<WaylandHandle>, LaunchError> {
+    // The same check the bind makes, made before the connection rather
+    // than after it: a display name that is a path would otherwise pick
+    // the endpoint this run hands its listening socket to.
+    service::wayland_display(env)?;
+    wayland::refuse_inherited(std::env::var_os("WAYLAND_SOCKET").as_deref())?;
     if !wayland::probe()? {
         eprintln!(
             "bubbler: warning: wayland: the compositor offers no \
@@ -622,7 +635,7 @@ pub fn start_wayland(dir: &Path, instance: &str) -> Result<Option<WaylandHandle>
         );
         return Ok(None);
     }
-    let path = dir.join(wayland::SOCKET_NAME);
+    let path = wayland::socket_path(dir);
     // A socket left behind by a run that was killed before its guard ran.
     // Only a missing file is nothing to do: anything else here is this
     // instance's own 0700 directory refusing, which the bind would not
@@ -635,12 +648,12 @@ pub fn start_wayland(dir: &Path, instance: &str) -> Result<Option<WaylandHandle>
     let listener = UnixListener::bind(&path).map_err(|e| WaylandError::Listen(path.clone(), e))?;
     // From here the socket is this run's to remove, however the handshake
     // below goes.
-    let socket = FileGuard(path.clone());
+    let socket = FileGuard(path);
     // Close-on-exec on both ends: the sandbox connects through the socket,
     // and a copy of the write end inside it would keep the compositor
     // accepting for as long as anything in there held it.
     let (close_read, close_write) =
-        pipe_with(PipeFlags::CLOEXEC).map_err(|e| WaylandError::Listen(path, e.into()))?;
+        pipe_with(PipeFlags::CLOEXEC).map_err(|e| WaylandError::Pipe(e.into()))?;
     wayland::create_context(
         listener.into(),
         close_read,
@@ -1788,7 +1801,7 @@ pub fn run(
     // back to the session's. The handle holds the context open for the
     // whole run.
     let (_wayland, wayland_probe) = match wayland_mode(&inst.config.services) {
-        Some(WaylandMode::Sandboxed) => match start_wayland(&dir, &inst.name)? {
+        Some(WaylandMode::Sandboxed) => match start_wayland(env, &dir, &inst.name)? {
             Some(handle) => (Some(handle), Some(true)),
             None => (None, Some(false)),
         },
@@ -2196,6 +2209,41 @@ mod tests {
             })
             .collect();
         assert!(untagged.is_empty(), "{untagged:?}");
+    }
+
+    /// The display name decides what the launcher connects to, so it is
+    /// refused before anything is: the case runs on a host with no
+    /// compositor at all and must still fail on the name, and on this
+    /// host it must fail without leaving a socket behind.
+    #[test]
+    fn a_display_name_that_is_a_path_is_refused_before_the_compositor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        std::fs::create_dir(&dir).unwrap();
+        let mut e = env(tmp.path());
+        for bad in ["../wayland-1", "/run/user/1000/wayland-1"] {
+            e.wayland_display = Some(bad.into());
+            let err = start_wayland(&e, &dir, "t").expect_err(bad);
+            assert!(
+                matches!(
+                    err,
+                    LaunchError::BadValue {
+                        service: "wayland",
+                        ..
+                    }
+                ),
+                "{bad}: {err:?}"
+            );
+        }
+        e.wayland_display = None;
+        assert!(matches!(
+            start_wayland(&e, &dir, "t"),
+            Err(LaunchError::MissingEnv {
+                service: "wayland",
+                var: "WAYLAND_DISPLAY"
+            })
+        ));
+        assert!(!wayland::socket_path(&dir).exists());
     }
 
     /// A grant that finds nothing to bind on this host contributes no

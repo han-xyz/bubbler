@@ -215,19 +215,12 @@ fn network(args: &mut BwrapArgs, host: &dyn Host, cfg: &NetworkConfig) -> Result
     Ok(())
 }
 
-/// Bind a Wayland socket at `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`, which
-/// must be a plain socket name: the run's own listening socket when the
-/// compositor took a security context for it, the session's own socket
-/// otherwise. Arch wiki (Bubblewrap/Examples) pattern.
-/// `XDG_SESSION_TYPE=wayland` only when X11 is not also granted, so
-/// toolkits do not get mixed signals.
-fn wayland(
-    env: &Env,
-    args: &mut BwrapArgs,
-    host: &dyn Host,
-    claim_session: bool,
-    plan: Option<&WaylandPlan>,
-) -> Result<(), LaunchError> {
+/// The compositor socket's name from `$WAYLAND_DISPLAY`, refused unless
+/// it is exactly one path component: the value is untrusted host input,
+/// and an absolute or `..` name would otherwise decide what a bind
+/// mounts, or what endpoint the launcher hands its listening socket to.
+/// Everything that uses the value goes through here first.
+pub(crate) fn wayland_display(env: &Env) -> Result<&OsStr, LaunchError> {
     let display = env
         .wayland_display
         .as_deref()
@@ -248,6 +241,23 @@ fn wayland(
             ),
         });
     }
+    Ok(display)
+}
+
+/// Bind a Wayland socket at `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`, which
+/// must be a plain socket name: the run's own listening socket when the
+/// compositor took a security context for it, the session's own socket
+/// otherwise. Arch wiki (Bubblewrap/Examples) pattern.
+/// `XDG_SESSION_TYPE=wayland` only when X11 is not also granted, so
+/// toolkits do not get mixed signals.
+fn wayland(
+    env: &Env,
+    args: &mut BwrapArgs,
+    host: &dyn Host,
+    claim_session: bool,
+    plan: Option<&WaylandPlan>,
+) -> Result<(), LaunchError> {
+    let display = wayland_display(env)?;
     let inside = env.runtime_dir.join(display);
     match plan {
         // The launcher creates this one after the argv is built, like the
@@ -1200,6 +1210,44 @@ mod tests {
         ));
         assert!(has_seq(&a, &["--setenv", "WAYLAND_DISPLAY", "wayland-1"]));
         assert!(has_seq(&a, &["--setenv", "XDG_SESSION_TYPE", "wayland"]));
+    }
+
+    /// The shape check is the helper's, not the bind's: the launcher
+    /// calls it before it connects to the compositor with the same value,
+    /// so it has to refuse on its own.
+    #[test]
+    fn wayland_display_is_a_socket_name_or_nothing() {
+        let mut e = env();
+        assert_eq!(wayland_display(&e).unwrap(), OsStr::new("wayland-1"));
+        for bad in [
+            "/run/user/1000/wayland-1",
+            "../wayland-1",
+            "a/b",
+            ".",
+            "..",
+            "",
+        ] {
+            e.wayland_display = Some(bad.into());
+            let err = wayland_display(&e).expect_err(bad);
+            assert!(
+                matches!(
+                    err,
+                    LaunchError::BadValue {
+                        service: "wayland",
+                        ..
+                    }
+                ),
+                "{bad}: {err:?}"
+            );
+        }
+        e.wayland_display = None;
+        assert!(matches!(
+            wayland_display(&e),
+            Err(LaunchError::MissingEnv {
+                service: "wayland",
+                var: "WAYLAND_DISPLAY"
+            })
+        ));
     }
 
     /// The launcher's own socket is bound at the host socket's name, and
