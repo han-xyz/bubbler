@@ -639,6 +639,23 @@ pub fn require_tray() -> bool {
     watcher
 }
 
+/// Returns false (after printing why) when the accessibility bus cannot
+/// be tested here: no proxied session bus, or nothing owning
+/// `org.a11y.Bus` to answer `GetAddress` with the host socket's path.
+///
+/// [`require_dbus`] has already looked for `dbus-send`, which is the
+/// program the launcher itself runs to ask that name.
+pub fn require_a11y() -> bool {
+    if !require_dbus() {
+        return false;
+    }
+    let bus = bus_name_has_owner("org.a11y.Bus");
+    if !bus {
+        say("skipping: no org.a11y.Bus on the session bus");
+    }
+    bus
+}
+
 /// Returns false (after printing why) when a proxied session bus cannot
 /// be tested here: no bwrap, no `xdg-dbus-proxy` or `dbus-send`, or no
 /// session bus on the host.

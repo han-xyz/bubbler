@@ -14,10 +14,10 @@ use bubbler_core::profile::NAMES;
 use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
     PYTHON, bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, bubbler_wayland, bwrap_alive,
-    kill_group, output_past_a_busy_exec, process_running, real_init, require_bwrap, require_dbus,
-    require_document_portal, require_groff, require_nested_x11, require_nested_x11_host,
-    require_nft, require_pasta, require_portal, require_python, require_security_context,
-    require_system_bus, require_tray, say, system_owns, test_pty,
+    kill_group, output_past_a_busy_exec, process_running, real_init, require_a11y, require_bwrap,
+    require_dbus, require_document_portal, require_groff, require_nested_x11,
+    require_nested_x11_host, require_nft, require_pasta, require_portal, require_python,
+    require_security_context, require_system_bus, require_tray, say, system_owns, test_pty,
 };
 use rustix::fs::{OFlags, fcntl_getfl};
 use rustix::process::{Pid, Signal, kill_process};
@@ -2530,6 +2530,246 @@ fn real_dbus_leaves_the_instance_runtime_directory_empty() {
         .map(|e| e.unwrap().file_name())
         .collect();
     assert!(left.is_empty(), "{left:?}");
+}
+
+/// The accessibility grant on the real bus, from the application's side:
+/// the address it reads, the registration call it must be able to make,
+/// and the two calls the proxy refuses it.
+///
+/// The registry answers `Embed` only for a well-formed `(so)`, and
+/// `dbus-send` cannot type one, so the reply here is the registry's
+/// complaint. That is the assertion anyway: what matters is *whose*
+/// error it is — a proxy denial never reaches the registry at all.
+#[test]
+fn real_a11y_lets_the_app_register_and_nothing_else() {
+    if !require_a11y() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let name = "bubbler-test-a11y";
+    let _leftovers = dbus_instance(tmp.path(), &init, name, "dbus\na11y\ncommand \"true\"\n");
+    let run = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").expect("checked by require_a11y"));
+    let address = format!("unix:path={}", run.join("at-spi").join("bus").display());
+
+    // What every at-spi2 client reads before it asks any bus for an
+    // address: the socket the proxy serves, never the host's own.
+    let out = bubbler_dbus(tmp.path(), &init)
+        .args(["run", name, "--", "/usr/bin/env"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(
+        s.lines()
+            .any(|l| l == format!("AT_SPI_BUS_ADDRESS={address}")),
+        "stdout: {s}stderr: {err}"
+    );
+
+    let call = |object: &str, method: &str, args: &[&str]| {
+        let out = bubbler_dbus(tmp.path(), &init)
+            .args(["run", name, "--", "/usr/bin/dbus-send"])
+            .arg(format!("--bus={address}"))
+            .args([
+                "--print-reply",
+                "--dest=org.a11y.atspi.Registry",
+                object,
+                method,
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    let (code, err) = call(
+        "/org/a11y/atspi/accessible/root",
+        "org.a11y.atspi.Socket.Embed",
+        &["string:x", "objpath:/y"],
+    );
+    assert!(
+        code == Some(0) || !err.contains("AccessDenied"),
+        "the proxy refused the registration call: {err}"
+    );
+
+    // Every keystroke of every accessible application, and injection
+    // into the session, are what this bus otherwise hands out.
+    for (method, args) in [
+        (
+            "org.a11y.atspi.DeviceEventController.GenerateKeyboardEvent",
+            &["int32:0", "string:x", "uint32:0"][..],
+        ),
+        (
+            "org.a11y.atspi.DeviceEventController.RegisterKeystrokeListener",
+            &[][..],
+        ),
+    ] {
+        let (code, err) = call(
+            "/org/a11y/atspi/registry/deviceeventcontroller",
+            method,
+            args,
+        );
+        assert_ne!(code, Some(0), "{method} was answered");
+        assert!(
+            err.contains("org.freedesktop.DBus.Error.AccessDenied"),
+            "{method}: {err}"
+        );
+    }
+}
+
+/// `input-method` opens the two sandboxed portal names and neither
+/// daemon's own, whose interfaces are `Exit`, `SetConfig` and their kin.
+///
+/// A hidden name and an unowned one both answer `false`, so the answer
+/// alone proves nothing on a host running no input method. What tells
+/// them apart is who replied: the proxy makes up the answer for a name
+/// no rule grants, and such a reply carries no sender, while a granted
+/// name's question is passed to the bus and comes back from it.
+#[test]
+fn real_input_method_hides_the_daemons_main_names() {
+    if !require_dbus() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let name = "bubbler-test-input-method";
+    let _leftovers = dbus_instance(
+        tmp.path(),
+        &init,
+        name,
+        "dbus\ninput-method\ncommand \"true\"\n",
+    );
+
+    let owner = |bus_name: &str| {
+        let out = bubbler_dbus(tmp.path(), &init)
+            .args([
+                "run",
+                name,
+                "--",
+                "/usr/bin/dbus-send",
+                "--session",
+                "--print-reply",
+                "--dest=org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus.NameHasOwner",
+                &format!("string:{bus_name}"),
+            ])
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.status.code(), Some(0), "{bus_name}: {err}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    for main in ["org.fcitx.Fcitx5", "org.freedesktop.IBus"] {
+        let s = owner(main);
+        assert!(s.contains("boolean false"), "{main}: {s}");
+        assert!(s.contains("sender=(null sender)"), "{main}: {s}");
+    }
+    for portal in [
+        "org.freedesktop.portal.Fcitx",
+        "org.freedesktop.portal.IBus",
+    ] {
+        let s = owner(portal);
+        assert!(s.contains("sender=org.freedesktop.DBus"), "{portal}: {s}");
+    }
+
+    let out = bubbler_dbus(tmp.path(), &init)
+        .args(["run", name, "--", "/usr/bin/env"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(
+        s.lines().any(|l| l == "IBUS_USE_PORTAL=1"),
+        "stdout: {s}stderr: {err}"
+    );
+}
+
+/// The host's accessibility address is asked of `org.a11y.Bus` with
+/// `dbus-send`, so a host without that program gets the package to
+/// install rather than a sandbox whose bus is quietly missing.
+#[test]
+fn a11y_without_dbus_send_on_path_names_the_package() {
+    if !require_a11y() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    // Everything the run resolves on `PATH` except the one program under
+    // test. The address cannot come from anywhere else: a test child is
+    // given the session's bus addresses and never its
+    // `AT_SPI_BUS_ADDRESS`.
+    let path = tmp.path().join("nosend");
+    std::fs::create_dir_all(&path).unwrap();
+    for bin in ["bwrap", "xdg-dbus-proxy"] {
+        std::os::unix::fs::symlink(format!("/usr/bin/{bin}"), path.join(bin)).unwrap();
+    }
+    let name = "bubbler-test-a11y-nosend";
+    let _leftovers = dbus_instance(tmp.path(), &init, name, "dbus\na11y\ncommand \"true\"\n");
+
+    let out = bubbler_dbus(tmp.path(), &init)
+        .env("PATH", &path)
+        .args(["run", name])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "the run found a bus: {err}");
+    assert!(err.contains("dbus-send"), "{err}");
+    assert!(err.contains("install the `dbus` package"), "{err}");
+}
+
+/// A dry run of that same config asks no bus anything. The application's
+/// argv names the socket the proxy will serve, which the launcher
+/// creates; the host address is the sidecar's business, and building an
+/// argv starts no sidecar.
+///
+/// `PATH` is an empty directory, so a `dbus-send` spawned to find that
+/// address could not run: exit 0 is the proof that none was.
+#[test]
+fn a11y_dry_run_builds_the_bind_without_asking_any_bus() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/t/config.kdl"),
+        "dbus\na11y\ncommand \"true\"\n",
+    )
+    .unwrap();
+    let empty = tmp.path().join("no-programs");
+    std::fs::create_dir_all(&empty).unwrap();
+
+    let out = bubbler(tmp.path())
+        .env("PATH", &empty)
+        .args(["run", "t", "--dry-run"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let argv = String::from_utf8_lossy(&out.stdout);
+    // `setup()` points $XDG_RUNTIME_DIR at an empty temp dir, so both
+    // paths are the test's own.
+    let run = tmp.path().join("run");
+    let inside = run.join("at-spi").join("bus");
+    assert!(
+        argv.contains(&format!(
+            "--ro-bind\n{}\n{}\n",
+            run.join("bubbler").join("t").join("a11y").display(),
+            inside.display()
+        )),
+        "{argv}"
+    );
+    assert!(
+        argv.contains(&format!(
+            "--setenv\nAT_SPI_BUS_ADDRESS\nunix:path={}\n",
+            inside.display()
+        )),
+        "{argv}"
+    );
 }
 
 /// A stand-in for `xdg-dbus-proxy` that puts a symlink where its socket
