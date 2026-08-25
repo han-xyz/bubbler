@@ -144,6 +144,23 @@ mod tests {
     }
 
     #[test]
+    fn one_interface_never_has_two_layouts() {
+        let mut names: Vec<&str> = INTERFACES.iter().map(|iface| iface.name).collect();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            INTERFACES.len(),
+            "an interface name appears twice"
+        );
+        // xdg-shell-unstable-v5 gives `xdg_surface` a different layout, so
+        // that whole file is dropped rather than merged: the stable interface
+        // stands, and the v5 shell global is not in the table to be bound.
+        let surface = lookup("xdg_surface").expect("xdg_surface is in the table");
+        assert_eq!(surface.request(1).map(|m| m.name), Some("get_toplevel"));
+        assert!(lookup("xdg_shell").is_none());
+    }
+
+    #[test]
     fn a_typed_new_id_names_the_interface_it_creates() {
         let display = by_index(WL_DISPLAY_INDEX).expect("wl_display is in the table");
         let sync = display.request(0).expect("wl_display.sync");

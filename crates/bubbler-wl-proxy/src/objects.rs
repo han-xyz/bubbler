@@ -7,20 +7,28 @@
 //! in flight, and a proxy that forgot the id would fail to decode them and
 //! kill the connection. And the map is capped, because its size is otherwise
 //! chosen by the client on the other side.
+//!
+//! `wl_display.delete_id` names client ids only, so an id from the server's
+//! range leaves the map only when the server reuses it. The relay must not
+//! wait for such an id to disappear, and the cap does not count server-range
+//! zombies: how many there are is the compositor's decision, not the
+//! sandboxed client's.
 
 use std::collections::hash_map::Entry as MapEntry;
 use std::collections::{HashMap, HashSet};
 
-use crate::tables::{self, Interface, Message, WL_DISPLAY_INDEX};
+use crate::tables::{self, Interface, WL_DISPLAY_INDEX};
 use crate::wire::Arg;
 
 /// First object id the server allocates. Everything below it is the client's
-/// to allocate, sequentially, starting at 1.
+/// to allocate, sequentially, starting at 1. An id at or above it is released
+/// by the server reusing it, never by `wl_display.delete_id`.
 pub const SERVER_ID_BASE: u32 = 0xFF00_0000;
 
-/// Most objects one connection may have mapped at once, zombies included.
-/// A client picks its own ids, so without a cap it also picks how much memory
-/// the proxy spends on it.
+/// Most objects one connection may have mapped at once, counting every client
+/// id and every live server id. A client picks its own ids, so without a cap
+/// it also picks how much memory the proxy spends on it; server-range zombies
+/// are left out of the count because only the compositor creates them.
 pub const MAX_OBJECTS: usize = 1 << 16;
 
 /// Why an id could not be recorded. Each one means the connection has stopped
@@ -44,6 +52,10 @@ pub enum ObjectError {
     /// path through [`Objects::bind`].
     #[error("the interface of this new object is only known from the message itself")]
     UntypedNewId,
+    /// The sender used an opcode the object's interface does not have, which
+    /// means the proxy cannot know the message's shape.
+    #[error("{0} has no message with opcode {1} on this side")]
+    NoSuchMessage(&'static str, u16),
     /// The interface index does not name an entry of the generated tables.
     #[error("interface {0} is not in the tables")]
     UnknownInterface(usize),
@@ -77,6 +89,8 @@ pub struct Entry {
 pub struct Objects {
     map: HashMap<u32, Entry>,
     hidden_globals: HashSet<u32>,
+    /// Destroyed objects in the server's range, which the cap does not count.
+    server_zombies: usize,
 }
 
 impl Default for Objects {
@@ -99,6 +113,7 @@ impl Objects {
         Self {
             map: HashMap::from([(1, display)]),
             hidden_globals: HashSet::new(),
+            server_zombies: 0,
         }
     }
 
@@ -124,12 +139,15 @@ impl Objects {
             version: version.min(max),
             zombie: false,
         };
-        let live = self.map.len();
+        let live = self.map.len() - self.server_zombies;
         match self.map.entry(id) {
             // The server reuses an id of its own as soon as it drops the
             // object; the client has to wait for `wl_display.delete_id`.
             MapEntry::Occupied(_) if from_client => Err(ObjectError::InUse(id)),
             MapEntry::Occupied(mut slot) => {
+                if slot.get().zombie {
+                    self.server_zombies -= 1;
+                }
                 slot.insert(entry);
                 Ok(())
             }
@@ -185,15 +203,22 @@ impl Objects {
     /// id. The new object inherits its parent's version, capped at the
     /// version the tables describe for its own interface.
     ///
-    /// `from_client` is the side that sent the message and decides which id
-    /// range the new id must come from.
+    /// `from_client` is the side that sent the message: it picks the request
+    /// or the event list `opcode` indexes, and the id range the new id must
+    /// come from.
     pub fn new_id_from(
         &mut self,
         from_client: bool,
         parent: u32,
-        msg: &Message,
+        opcode: u16,
         args: &[Arg],
     ) -> Result<Option<u32>, ObjectError> {
+        let entry = self.get(parent).ok_or(ObjectError::Unmapped(parent))?;
+        let iface = tables::by_index(entry.interface)
+            .ok_or(ObjectError::UnknownInterface(entry.interface))?;
+        let msg = iface
+            .message(from_client, opcode)
+            .ok_or(ObjectError::NoSuchMessage(iface.name, opcode))?;
         let new_id = args.iter().find_map(|arg| match arg {
             Arg::NewId(id) => Some(*id),
             _ => None,
@@ -205,11 +230,7 @@ impl Objects {
             return Err(ObjectError::UntypedNewId);
         };
         let interface = tables::index_of(name).ok_or(ObjectError::MissingInterface(name))?;
-        let version = self
-            .get(parent)
-            .ok_or(ObjectError::Unmapped(parent))?
-            .version;
-        self.record(from_client, new_id, interface, version)?;
+        self.record(from_client, new_id, interface, entry.version)?;
         Ok(Some(new_id))
     }
 
@@ -218,6 +239,9 @@ impl Objects {
     pub fn destroy(&mut self, id: u32) -> bool {
         match self.map.get_mut(&id) {
             Some(entry) => {
+                if !entry.zombie && id >= SERVER_ID_BASE {
+                    self.server_zombies += 1;
+                }
                 entry.zombie = true;
                 true
             }
@@ -228,7 +252,15 @@ impl Objects {
     /// Release `id` on `wl_display.delete_id`: the only place an id is
     /// dropped, and the point from which the client may reuse it.
     pub fn delete_id(&mut self, id: u32) -> bool {
-        self.map.remove(&id).is_some()
+        match self.map.remove(&id) {
+            Some(entry) => {
+                if entry.zombie && id >= SERVER_ID_BASE {
+                    self.server_zombies -= 1;
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     /// Keep global `name` from being bound, because its advertisement was not
@@ -256,22 +288,27 @@ mod tests {
         tables::index_of(name).unwrap_or_else(|| panic!("{name} is in the tables"))
     }
 
-    fn request(interface: &str, name: &str) -> &'static Message {
-        tables::lookup(interface)
-            .unwrap_or_else(|| panic!("{interface} is in the tables"))
-            .requests
+    fn opcode(interface: &str, from_client: bool, name: &str) -> u16 {
+        let iface =
+            tables::lookup(interface).unwrap_or_else(|| panic!("{interface} is in the tables"));
+        let list = if from_client {
+            iface.requests
+        } else {
+            iface.events
+        };
+        let at = list
             .iter()
-            .find(|m| m.name == name)
-            .unwrap_or_else(|| panic!("{interface}.{name} is in the tables"))
+            .position(|m| m.name == name)
+            .unwrap_or_else(|| panic!("{interface}.{name} is in the tables"));
+        u16::try_from(at).unwrap_or_else(|_| panic!("{interface}.{name} has an opcode"))
     }
 
-    fn event(interface: &str, name: &str) -> &'static Message {
-        tables::lookup(interface)
-            .unwrap_or_else(|| panic!("{interface} is in the tables"))
-            .events
-            .iter()
-            .find(|m| m.name == name)
-            .unwrap_or_else(|| panic!("{interface}.{name} is in the tables"))
+    fn request(interface: &str, name: &str) -> u16 {
+        opcode(interface, true, name)
+    }
+
+    fn event(interface: &str, name: &str) -> u16 {
+        opcode(interface, false, name)
     }
 
     #[test]
@@ -385,20 +422,27 @@ mod tests {
     #[test]
     fn an_untyped_new_id_has_to_go_through_bind() {
         let mut objects = Objects::new();
-        let bind = request("wl_registry", "bind");
+        objects
+            .new_id_from(
+                true,
+                1,
+                request("wl_display", "get_registry"),
+                &[Arg::NewId(2)],
+            )
+            .expect("the registry");
         let args = [
             Arg::Uint(9),
             Arg::String(Some(c"wl_compositor".into())),
             Arg::Uint(6),
-            Arg::NewId(2),
+            Arg::NewId(3),
         ];
         assert_eq!(
-            objects.new_id_from(true, 1, bind, &args),
+            objects.new_id_from(true, 2, request("wl_registry", "bind"), &args),
             Err(ObjectError::UntypedNewId)
         );
-        assert_eq!(objects.bind(9, index("wl_compositor"), 6, 2), Ok(()));
-        assert_eq!(objects.interface(2).map(|i| i.name), Some("wl_compositor"));
-        assert_eq!(objects.get(2).map(|e| e.version), Some(6));
+        assert_eq!(objects.bind(9, index("wl_compositor"), 6, 3), Ok(()));
+        assert_eq!(objects.interface(3).map(|i| i.name), Some("wl_compositor"));
+        assert_eq!(objects.get(3).map(|e| e.version), Some(6));
     }
 
     #[test]
@@ -469,6 +513,52 @@ mod tests {
             .new_id_from(false, 5, offer, &[Arg::NewId(id)])
             .expect("the same id again, as the server recycles it");
         assert_eq!(objects.get(id).map(|e| e.zombie), Some(false));
+    }
+
+    #[test]
+    fn an_opcode_the_interface_does_not_have_is_refused() {
+        let mut objects = Objects::new();
+        assert_eq!(
+            objects.new_id_from(true, 1, 9, &[Arg::NewId(2)]),
+            Err(ObjectError::NoSuchMessage("wl_display", 9))
+        );
+        // The side decides which list the opcode indexes: 0 is `sync` as a
+        // request and `error` as an event, and only one of them creates.
+        assert_eq!(objects.new_id_from(false, 1, 0, &[]), Ok(None));
+        assert_eq!(
+            objects.new_id_from(true, 1, 0, &[Arg::NewId(2)]),
+            Ok(Some(2))
+        );
+        assert_eq!(objects.interface(2).map(|i| i.name), Some("wl_callback"));
+    }
+
+    #[test]
+    fn zombies_the_compositor_made_do_not_fill_the_cap() {
+        let mut objects = Objects::new();
+        objects
+            .bind(1, index("wl_data_device_manager"), 3, 2)
+            .expect("the manager");
+        objects.bind(2, index("wl_seat"), 3, 3).expect("a seat");
+        objects
+            .new_id_from(
+                true,
+                2,
+                request("wl_data_device_manager", "get_data_device"),
+                &[Arg::NewId(4), Arg::Object(3)],
+            )
+            .expect("the device");
+        let offer = event("wl_data_device", "data_offer");
+        for n in 0..MAX_OBJECTS as u32 {
+            let id = SERVER_ID_BASE + n;
+            objects
+                .new_id_from(false, 4, offer, &[Arg::NewId(id)])
+                .unwrap_or_else(|e| panic!("offer {n}: {e}"));
+            assert!(objects.destroy(id));
+        }
+        assert!(objects.len() > MAX_OBJECTS);
+        // The client's own ids still fit: how many dead offers the compositor
+        // leaves behind is not the sandboxed client's doing.
+        assert_eq!(objects.bind(1, index("wl_compositor"), 1, 5), Ok(()));
     }
 
     #[test]

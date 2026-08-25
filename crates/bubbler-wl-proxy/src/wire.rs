@@ -1,6 +1,13 @@
 //! The Wayland wire format: an 8-byte header, then arguments laid out by the
 //! message's signature.
 //!
+//! The wire is native-endian: libwayland and every Rust client read and write
+//! machine order, and the socket never leaves the machine.
+//!
+//! The size field is 16 bits and a message is a whole number of 4-byte words,
+//! so one message declares at most 65532 bytes. A relay's read buffer has to
+//! hold a maximal message, or a message that large can never be completed.
+//!
 //! Everything here is byte-exact on purpose. The relay decodes a message,
 //! decides what to do with it, and re-encodes it; if the two halves disagreed
 //! by a byte the compositor and the client would see different messages.
@@ -82,8 +89,8 @@ impl Header {
         let Some(head) = buf.get(..HEADER) else {
             return Err(WireError::NeedMore);
         };
-        let object = u32::from_le_bytes([head[0], head[1], head[2], head[3]]);
-        let word = u32::from_le_bytes([head[4], head[5], head[6], head[7]]);
+        let object = u32::from_ne_bytes([head[0], head[1], head[2], head[3]]);
+        let word = u32::from_ne_bytes([head[4], head[5], head[6], head[7]]);
         let opcode = (word & 0xFFFF) as u16;
         let size = (word >> 16) as u16;
         if usize::from(size) < HEADER || !size.is_multiple_of(4) {
@@ -98,8 +105,8 @@ impl Header {
 
     /// The 8 bytes of this header.
     pub fn encode(&self) -> [u8; HEADER] {
-        let object = self.object.to_le_bytes();
-        let word = ((u32::from(self.size) << 16) | u32::from(self.opcode)).to_le_bytes();
+        let object = self.object.to_ne_bytes();
+        let word = ((u32::from(self.size) << 16) | u32::from(self.opcode)).to_ne_bytes();
         [
             object[0], object[1], object[2], object[3], word[0], word[1], word[2], word[3],
         ]
@@ -111,7 +118,7 @@ fn take_word(body: &[u8], at: &mut usize) -> Result<u32, WireError> {
     let end = at.checked_add(4).ok_or(WireError::Truncated)?;
     let word = body.get(*at..end).ok_or(WireError::Truncated)?;
     *at = end;
-    Ok(u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+    Ok(u32::from_ne_bytes([word[0], word[1], word[2], word[3]]))
 }
 
 /// Read `len` bytes of `body` and step `at` past them and their padding.
@@ -132,7 +139,7 @@ fn take_bytes<'a>(body: &'a [u8], at: &mut usize, len: usize) -> Result<&'a [u8]
 /// Append a length prefix and the bytes it counts, padded to a whole word.
 fn put_bytes(body: &mut Vec<u8>, bytes: &[u8]) -> Result<(), WireError> {
     let len = u32::try_from(bytes.len()).map_err(|_| WireError::TooLarge(bytes.len()))?;
-    body.extend_from_slice(&len.to_le_bytes());
+    body.extend_from_slice(&len.to_ne_bytes());
     body.extend_from_slice(bytes);
     let pad = (4 - bytes.len() % 4) % 4;
     body.resize(body.len() + pad, 0);
@@ -194,11 +201,11 @@ pub fn encode(object: u32, opcode: u16, args: &[Arg]) -> Result<Vec<u8>, WireErr
     let mut body = Vec::new();
     for arg in args {
         match arg {
-            Arg::Int(value) | Arg::Fixed(value) => body.extend_from_slice(&value.to_le_bytes()),
+            Arg::Int(value) | Arg::Fixed(value) => body.extend_from_slice(&value.to_ne_bytes()),
             Arg::Uint(value) | Arg::Object(value) | Arg::NewId(value) => {
-                body.extend_from_slice(&value.to_le_bytes());
+                body.extend_from_slice(&value.to_ne_bytes());
             }
-            Arg::String(None) => body.extend_from_slice(&0u32.to_le_bytes()),
+            Arg::String(None) => body.extend_from_slice(&0u32.to_ne_bytes()),
             Arg::String(Some(text)) => put_bytes(&mut body, text.as_bytes_with_nul())?,
             Arg::Array(bytes) => put_bytes(&mut body, bytes)?,
             Arg::Fd => {}
@@ -352,7 +359,7 @@ mod tests {
     fn a_size_no_message_can_have_is_refused() {
         for size in [0u16, 4, 7, 9, 10] {
             let mut buf = vec![1, 0, 0, 0];
-            buf.extend_from_slice(&((u32::from(size) << 16) | 3).to_le_bytes());
+            buf.extend_from_slice(&((u32::from(size) << 16) | 3).to_ne_bytes());
             buf.resize(64, 0);
             assert_eq!(Header::decode(&buf), Err(WireError::BadSize(size)));
             assert_eq!(decode(&buf, &[]), Err(WireError::BadSize(size)));
@@ -384,6 +391,29 @@ mod tests {
     fn a_message_too_long_for_the_size_field_is_refused() {
         let huge = Arg::Array(vec![0; usize::from(u16::MAX)]);
         assert!(matches!(encode(1, 0, &[huge]), Err(WireError::TooLarge(_))));
+    }
+
+    #[test]
+    fn a_pool_carries_its_fd_beside_the_message_and_not_in_it() {
+        let shm = tables::lookup("wl_shm").expect("the table has it");
+        let create_pool = shm.request(0).expect("wl_shm.create_pool");
+        assert_eq!(create_pool.name, "create_pool");
+        assert_eq!(
+            create_pool.args,
+            &[ArgKind::NewId, ArgKind::Fd, ArgKind::Int]
+        );
+        let args = vec![Arg::NewId(3), Arg::Fd, Arg::Int(4096)];
+        let bytes = encode(2, 0, &args).expect("encodes");
+        // Header, then the new id and the size: the fd takes no wire bytes.
+        assert_eq!(bytes.len(), HEADER + 8);
+        assert_eq!(
+            bytes,
+            vec![2, 0, 0, 0, 0, 0, 16, 0, 3, 0, 0, 0, 0, 16, 0, 0]
+        );
+        let (got, used) = decode(&bytes, create_pool.args).expect("decodes");
+        assert_eq!(got, args);
+        assert_eq!(used, bytes.len());
+        assert_eq!(fd_count(create_pool.args), 1);
     }
 
     #[test]

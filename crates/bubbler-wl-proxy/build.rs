@@ -24,6 +24,7 @@ fn die(msg: impl AsRef<str>) -> ! {
 }
 
 /// One message of one interface, already reduced to what the table holds.
+#[derive(PartialEq, Eq)]
 struct Msg {
     name: String,
     since: u32,
@@ -84,39 +85,53 @@ fn main() {
 
     let mut ifaces: BTreeMap<String, Iface> = BTreeMap::new();
     for file in &files {
-        let text = fs::read_to_string(file)
-            .unwrap_or_else(|e| die(format!("cannot read {}: {e}", file.display())));
-        let proto = parse_protocol(&text)
-            .unwrap_or_else(|e| die(format!("cannot parse {}: {e}", file.display())));
         let source = file
             .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
+            .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        for parsed in proto.interfaces {
-            let name = plain(&parsed.name);
-            let iface = Iface {
-                version: parsed.version,
-                requests: parsed.requests.iter().map(message).collect(),
-                events: parsed.events.iter().map(message).collect(),
-                source: source.clone(),
+        let parsed = parse_file(file, &source);
+        let mut conflict = None;
+        let mut newer: Vec<&str> = Vec::new();
+        for (name, iface) in &parsed {
+            let Some(old) = ifaces.get(name) else {
+                continue;
             };
-            let takes = match ifaces.get(&name) {
-                None => true,
-                Some(old) => {
-                    let takes = iface.version > old.version;
-                    let (kept, dropped) = if takes {
-                        ((iface.version, &iface.source), (old.version, &old.source))
-                    } else {
-                        ((old.version, &old.source), (iface.version, &iface.source))
-                    };
-                    println!(
-                        "cargo:warning=duplicate interface {name}: kept v{} from {}, ignored v{} from {}",
-                        kept.0, kept.1, dropped.0, dropped.1
-                    );
-                    takes
-                }
+            let (kept, dropped) = if iface.version > old.version {
+                (iface, old)
+            } else {
+                (old, iface)
             };
-            if takes {
+            if !supersedes(kept, dropped) {
+                conflict.get_or_insert(format!(
+                    "{name} v{} is not the same protocol as v{} from {}",
+                    iface.version, old.version, old.source
+                ));
+            } else if !identical(old, iface) {
+                newer.push(name);
+            }
+        }
+        // Two files that describe one interface differently cannot both be
+        // trusted: the proxy would decode an object with one layout while the
+        // compositor used the other. The whole unstable file goes, its own
+        // globals included, so nothing from it can be advertised or bound.
+        if let Some(why) = conflict {
+            if !is_unstable(file) {
+                die(format!("{source}: {why}"));
+            }
+            println!("cargo:warning={source} dropped whole: {why}");
+            continue;
+        }
+        if !newer.is_empty() {
+            println!(
+                "cargo:warning={source}: kept the newer copy of {}",
+                newer.join(", ")
+            );
+        }
+        for (name, iface) in parsed {
+            if ifaces
+                .get(&name)
+                .is_none_or(|old| iface.version > old.version)
+            {
                 ifaces.insert(name, iface);
             }
         }
@@ -157,12 +172,20 @@ fn cargo_metadata(manifest: &Path) -> String {
 /// silently pointing the tables at the wrong sources.
 fn package_dir(meta: &str, name: &str) -> PathBuf {
     let anchor = format!("{{\"name\":\"{name}\",\"version\":\"");
-    let from = meta.find(&anchor).unwrap_or_else(|| {
+    let hits: Vec<usize> = meta.match_indices(&anchor).map(|(at, _)| at).collect();
+    let [from] = hits[..] else {
+        if hits.is_empty() {
+            die(format!(
+                "{name} is not in `cargo metadata`: it must stay a dependency of the workspace \
+                 (bubbler-core) or become a build-dependency of bubbler-wl-proxy"
+            ));
+        }
         die(format!(
-            "{name} is not in `cargo metadata`: it must stay a dependency of the workspace \
-             (bubbler-core) or become a build-dependency of bubbler-wl-proxy"
-        ))
-    });
+            "`cargo metadata` reports {} copies of {name}; the tables must come from one version",
+            hits.len()
+        ));
+    };
+    let version = json_string(&meta[from + anchor.len()..]);
     let key = "\"manifest_path\":\"";
     let rest = &meta[from..];
     let at = rest
@@ -177,10 +200,10 @@ fn package_dir(meta: &str, name: &str) -> PathBuf {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    if !base.starts_with(name) {
+    if base != format!("{name}-{version}") {
         die(format!(
-            "{name}: `cargo metadata` gave {}, which is not that package's directory; \
-             the metadata field order changed and the scan in build.rs must be replaced",
+            "{name}: `cargo metadata` gave {}, which is not {name}-{version}; the metadata \
+             field order changed and the scan in build.rs must be replaced",
             dir.display()
         ));
     }
@@ -228,10 +251,63 @@ fn collect_xml(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Every interface of one XML file, in the order the file declares them.
+fn parse_file(file: &Path, source: &str) -> Vec<(String, Iface)> {
+    let text = fs::read_to_string(file)
+        .unwrap_or_else(|e| die(format!("cannot read {}: {e}", file.display())));
+    let proto = parse_protocol(&text)
+        .unwrap_or_else(|e| die(format!("cannot parse {}: {e}", file.display())));
+    proto
+        .interfaces
+        .iter()
+        .map(|parsed| {
+            let iface = Iface {
+                version: parsed.version,
+                requests: parsed.requests.iter().map(message).collect(),
+                events: parsed.events.iter().map(message).collect(),
+                source: source.to_owned(),
+            };
+            (plain(&parsed.name), iface)
+        })
+        .collect()
+}
+
+/// Whether `kept` can stand in for `dropped` on the wire: no fewer messages,
+/// and the same name and arguments at every opcode `dropped` uses. Anything
+/// else is two protocols wearing one name.
+fn supersedes(kept: &Iface, dropped: &Iface) -> bool {
+    fn prefix(kept: &[Msg], dropped: &[Msg]) -> bool {
+        kept.len() >= dropped.len()
+            && kept
+                .iter()
+                .zip(dropped)
+                .all(|(kept, dropped)| kept.name == dropped.name && kept.args == dropped.args)
+    }
+    kept.version >= dropped.version
+        && prefix(&kept.requests, &dropped.requests)
+        && prefix(&kept.events, &dropped.events)
+}
+
+/// Whether two copies of an interface would generate the same table, in which
+/// case the duplicate is not worth a word.
+fn identical(one: &Iface, other: &Iface) -> bool {
+    one.version == other.version && one.requests == other.requests && one.events == other.events
+}
+
+/// Whether the file describes an unstable protocol. Its interfaces are the
+/// ones that give way when a stable file describes the same name differently.
+fn is_unstable(file: &Path) -> bool {
+    file.components().any(|part| part.as_os_str() == "unstable")
+        || file
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().contains("unstable"))
+}
+
 /// Turn one parsed message into its table row.
 fn message(msg: &wayrs_proto_parser::Message<'_>) -> Msg {
     let mut args = Vec::new();
     let mut new_id_interface = None;
+    let mut new_ids = 0;
     for arg in &msg.args {
         match &arg.arg_type {
             ArgType::Int => args.push("Int"),
@@ -245,12 +321,7 @@ fn message(msg: &wayrs_proto_parser::Message<'_>) -> Msg {
             ArgType::Array => args.push("Array"),
             ArgType::Fd => args.push("Fd"),
             ArgType::NewId { iface: Some(iface) } => {
-                if new_id_interface.is_some() {
-                    die(format!(
-                        "{} creates more than one object; the table has room for one",
-                        msg.name
-                    ));
-                }
+                new_ids += 1;
                 new_id_interface = Some(plain(iface));
                 args.push("NewId");
             }
@@ -258,11 +329,20 @@ fn message(msg: &wayrs_proto_parser::Message<'_>) -> Msg {
             // the version on the wire ahead of the id, and the tables spell
             // that out so the decoder needs no special case.
             ArgType::NewId { iface: None } => {
+                new_ids += 1;
                 args.push("String");
                 args.push("Uint");
                 args.push("NewId");
             }
         }
+    }
+    // The table has one `new_id_interface` per message, and the object map
+    // registers one id per message; a second one would go unrecorded.
+    if new_ids > 1 {
+        die(format!(
+            "{} creates {new_ids} objects; the table has room for one",
+            msg.name
+        ));
     }
     Msg {
         name: plain(&msg.name),
