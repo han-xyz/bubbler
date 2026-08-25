@@ -655,17 +655,21 @@ on `wl_data_offer`, `zwp_primary_selection_offer_v1`,
 `zwlr_data_control_offer_v1` or `ext_data_control_offer_v1` is forwarded only
 within one second of real user input: a `wl_keyboard.key` the compositor
 reported as pressed, a `wl_pointer.button` in either direction, or a
-`wl_touch.down`. The window is one second and the state is per instance rather
-than per connection — an application with helper processes reads the selection
-on a connection that never held keyboard focus, and gating each connection on
-its own input would deny every multi-process toolkit. A drag-and-drop offer is
-a `wl_data_offer` like any other and goes through the same gate, which costs
-nothing in practice: a drop is a pointer button release, `wl_pointer.button`
-arms in either direction, so the `receive` that follows a drop is inside the
-window it opened. Outside the window the
-request is not forwarded and the descriptor it carried is closed, so the client
-reads end of file, exactly as if the selection had been empty, and one line
-goes to the log. Run with `secret` on the session's selection, a client that
+`wl_touch.down` or `wl_touch.up`. Both ends of a press arm, and deliberately:
+letting go of the mouse over a paste target is user input by any reading, and a
+touch drag *drops* on the `up`, which a long one would otherwise reach the gate
+a second or more after the `down` that started it. The window is one second and
+the state is per instance rather than per connection — an application with
+helper processes reads the selection on a connection that never held keyboard
+focus, and gating each connection on its own input would deny every
+multi-process toolkit. A drag-and-drop offer is a `wl_data_offer` like any other
+and goes through the same gate, which costs nothing: a drop is a button or
+touch release, and the release is what arms, so the `receive` that follows a
+drop is inside the window that release opened however long the drag itself
+took. Outside the window the request is not forwarded and the descriptor it
+carried is closed, so the client reads end of file, exactly as if the selection
+had been empty, and one line goes to the log. Run with `secret` on the
+session's selection, a client that
 maps a window, takes focus, is offered the selection and reads it:
 
     0

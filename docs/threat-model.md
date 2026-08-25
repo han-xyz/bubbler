@@ -302,8 +302,11 @@ gates it instead. A `receive` on `wl_data_offer`,
 `zwp_primary_selection_offer_v1`, `zwlr_data_control_offer_v1` or
 `ext_data_control_offer_v1` is forwarded only within one second of real
 user input — a `wl_keyboard.key` the compositor reported as pressed, a
-`wl_pointer.button` in either direction, or a `wl_touch.down` — seen on any
-connection of that instance. Outside the window the request is not
+`wl_pointer.button` in either direction, or a `wl_touch.down` or
+`wl_touch.up` — seen on any connection of that instance. Both ends of a
+press arm, so a drag that ends over a paste target arms on the release
+that ends it rather than only on the press that began it, however long
+the drag took. Outside the window the request is not
 forwarded and the descriptor it carried is closed, so the client reads end
 of file exactly as if the selection had been empty, and one line goes to
 the audit log:

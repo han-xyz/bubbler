@@ -77,9 +77,10 @@ refused: bind of hidden global zwlr_data_control_manager_v1 (name 38, v1) refuse
 **The paste gate.** `receive` on `wl_data_offer`,
 `zwp_primary_selection_offer_v1` and the two data-control offers is forwarded
 only within one second of a `wl_keyboard.key` press, a `wl_pointer.button` or a
-`wl_touch.down` seen on any of that instance's connections. Otherwise the
-descriptor is closed — the client reads end of file, as if the selection were
-empty — and a line goes to the log (at most one a second):
+`wl_touch.down` or `.up` — both ends of a press arm, so a drag arms on the
+release that drops it — seen on any of that instance's connections. Otherwise
+the descriptor is closed — the client reads end of file, as if the selection
+were empty — and a line goes to the log (at most one a second):
 
 ```
 bubbler-wl-proxy: clipboard read denied (wl_data_offer, text/plain): no input since the proxy started
