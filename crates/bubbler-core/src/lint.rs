@@ -857,7 +857,10 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                 "drop the argument for a nested Xwayland inside the sandbox, or accept it \
                  with `lint-allow \"x11-without-reason\" reason=\"...\"`",
             ),
-            "x11" => f.push(
+            // Nothing to say to a config that already asks for the whole
+            // output: a fullscreen server has one window and the help
+            // would be telling it to do what it does.
+            "x11" if flag(node, "fullscreen") != Some(true) => f.push(
                 i,
                 node,
                 &X11_NESTED_NO_WM,
@@ -1614,9 +1617,15 @@ mod tests {
             let report = lint(ctx, &["x11 \"host\""]);
             assert_eq!(ids(&report), ["x11-without-reason"]);
             assert_eq!(report.findings[0].severity, Severity::Warning);
-            let nested = lint(ctx, &["x11 fullscreen=#true"]);
+            let nested = lint(ctx, &["x11 geometry=\"1920x1080\""]);
             assert_eq!(ids(&nested), ["x11-nested-no-wm"]);
             assert_eq!(nested.findings[0].severity, Severity::Note);
+            // A server that fills the output has no windows to manage,
+            // so there is nothing left to say about it.
+            assert_eq!(
+                ids(&lint(ctx, &["x11 fullscreen=#true grab=#true"])),
+                [] as [&str; 0]
+            );
             assert_eq!(ids(&lint(ctx, &["wayland"])), [] as [&str; 0]);
             for text in [
                 "x11 \"host\"\nlint-allow \"x11-without-reason\" reason=\"no Wayland backend\"",

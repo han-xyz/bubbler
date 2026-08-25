@@ -239,6 +239,15 @@ fn with_grants(cfg: &mut InstanceConfig, grants: &[&str]) -> Result<(), Instance
                 .services
                 .iter()
                 .any(|s| matches!(s, Service::Network { .. })),
+            // And for the two display grants, whose mode the bare grant
+            // does not carry either: `--grant x11` on a profile holding
+            // `x11 "host"` would otherwise write a second node the
+            // parser refuses.
+            Service::Wayland(_) => cfg
+                .services
+                .iter()
+                .any(|s| matches!(s, Service::Wayland(_))),
+            Service::X11(_) => cfg.services.iter().any(|s| matches!(s, Service::X11(_))),
             other => cfg.services.contains(other),
         };
         if !held {
@@ -1186,6 +1195,33 @@ mod tests {
         assert!(services.contains(&Service::Network(NetworkConfig::default())));
         assert_eq!(services.iter().filter(|s| **s == Service::Dri).count(), 1);
         drop(eph);
+        // A grant whose node carries a mode is held whichever mode the
+        // profile wrote it in: a second node would be a duplicate, and
+        // the bare grant must not quietly replace `"host"` either.
+        let eph = Instance::ephemeral(&env, "steam", &["x11", "wayland"]).unwrap();
+        let services = &eph.instance.config.services;
+        assert_eq!(
+            services
+                .iter()
+                .filter(|s| matches!(s, Service::X11(_) | Service::Wayland(_)))
+                .count(),
+            2,
+            "{services:?}"
+        );
+        assert!(services.contains(&Service::X11(X11Mode::Host)));
+        assert!(services.contains(&Service::Wayland(WaylandMode::Sandboxed)));
+        drop(eph);
+        // The same where the layer below wrote the other mode: the grant
+        // is held, and the bare one neither doubles it nor rewrites it.
+        let mut cfg = config::parse("wayland \"host\"\nx11 \"host\"").unwrap();
+        with_grants(&mut cfg, &["wayland", "x11"]).unwrap();
+        assert_eq!(
+            cfg.services,
+            vec![
+                Service::Wayland(WaylandMode::Host),
+                Service::X11(X11Mode::Host)
+            ]
+        );
         let eph = Instance::ephemeral(&env, "generic", &["gamepad", "dbus", "tray"]).unwrap();
         let services = &eph.instance.config.services;
         assert!(services.contains(&Service::Gamepad {

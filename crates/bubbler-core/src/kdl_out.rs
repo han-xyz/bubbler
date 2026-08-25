@@ -402,6 +402,35 @@ mod tests {
         for (text, svc) in [
             ("x11\n", Service::X11(X11Mode::Nested(NestedX11::default()))),
             (
+                "x11 geometry=\"1920x1080\"\n",
+                Service::X11(X11Mode::Nested(NestedX11 {
+                    geometry: "1920x1080".to_owned(),
+                    ..NestedX11::default()
+                })),
+            ),
+            (
+                "x11 fullscreen=#true\n",
+                Service::X11(X11Mode::Nested(NestedX11 {
+                    fullscreen: true,
+                    ..NestedX11::default()
+                })),
+            ),
+            (
+                "x11 grab=#true\n",
+                Service::X11(X11Mode::Nested(NestedX11 {
+                    grab: true,
+                    ..NestedX11::default()
+                })),
+            ),
+            (
+                "x11 geometry=\"1920x1080\" fullscreen=#true\n",
+                Service::X11(X11Mode::Nested(NestedX11 {
+                    geometry: "1920x1080".to_owned(),
+                    fullscreen: true,
+                    grab: false,
+                })),
+            ),
+            (
                 "x11 geometry=\"1920x1080\" fullscreen=#true grab=#true\n",
                 Service::X11(X11Mode::Nested(NestedX11 {
                     geometry: "1920x1080".to_owned(),

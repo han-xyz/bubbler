@@ -1824,13 +1824,13 @@ fn parse_x11(node: &KdlNode) -> Result<X11Mode, ConfigError> {
             }
         }
     }
-    let default = NestedX11::default();
     if host {
         if geometry.is_some() || fullscreen.is_some() || grab.is_some() {
             return Err(bad(node, "\"host\" takes no properties"));
         }
         return Ok(X11Mode::Host);
     }
+    let default = NestedX11::default();
     Ok(X11Mode::Nested(NestedX11 {
         geometry: geometry.unwrap_or(default.geometry),
         fullscreen: fullscreen.unwrap_or(default.fullscreen),
