@@ -581,6 +581,7 @@ fn explain(
     let rules = explain::rules(&inst.config, &inst.name);
     let view = explain::View {
         title,
+        instance: &inst.name,
         cfg: &inst.config,
         source: explain::Source {
             file: "config.kdl",

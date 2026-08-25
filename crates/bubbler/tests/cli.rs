@@ -2892,7 +2892,21 @@ fn wayland_display_must_name_a_socket() {
     assert_eq!(out.status.code(), Some(1), "{err}");
     assert!(err.contains("only a plain socket name"), "{err}");
 
+    // The bare grant binds the socket this run would listen on itself,
+    // which nothing has created yet: the host's name is only the one it
+    // takes inside, and a dry-run asks the compositor nothing.
     std::fs::write(tmp.path().join("run/notasocket"), "").unwrap();
+    let out = bubbler(tmp.path())
+        .env("WAYLAND_DISPLAY", "notasocket")
+        .args(["run", "t", "--dry-run"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+
+    // `wayland "host"` hands over the session's own socket, so what the
+    // name points at has to be one.
+    std::fs::write(&cfg, "wayland \"host\"\ncommand \"true\"\n").unwrap();
     let out = bubbler(tmp.path())
         .env("WAYLAND_DISPLAY", "notasocket")
         .args(["run", "t", "--dry-run"])

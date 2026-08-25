@@ -7,11 +7,12 @@
 use std::ffi::OsStr;
 
 use crate::bwrap::{Explained, Origin};
-use crate::config::{InstanceConfig, Lines, SeccompConfig, Service};
+use crate::config::{InstanceConfig, Lines, SeccompConfig, Service, WaylandMode};
 use crate::dbus;
 use crate::error::ConfigError;
 use crate::kdl_out;
 use crate::network::{self, NetworkConfig};
+use crate::wayland;
 
 /// Arguments of the baseline listed before the rest is summed up. The
 /// baseline is the same in every sandbox and the longest group by far.
@@ -56,6 +57,9 @@ pub struct View<'a> {
     pub title: &'a str,
     /// The config the origins index into.
     pub cfg: &'a InstanceConfig,
+    /// Instance the config belongs to, for the identities a grant carries
+    /// that no argument of it shows. A validated instance name.
+    pub instance: &'a str,
     /// Where that config's nodes are.
     pub source: Source<'a>,
     /// The D-Bus proxy rules each node contributes, as [`rules`] collects
@@ -401,6 +405,20 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
                         out.push(sidecar_line(cfg));
                         out.extend(ruleset_lines(cfg));
                     }
+                    // Which socket the one `--ro-bind` names is the whole
+                    // difference between the two modes. No probe is run
+                    // for an explanation, so this is what a run gets on a
+                    // compositor that implements the protocol; one that
+                    // does not says so on stderr and binds the session's.
+                    Some(Service::Wayland(WaylandMode::Sandboxed)) => out.push(format!(
+                        "    security-context: engine={} app={} instance={}",
+                        wayland::ENGINE,
+                        dbus::app_id(view.instance),
+                        dbus::flatpak_instance_id(view.instance)
+                    )),
+                    Some(Service::Wayland(WaylandMode::Host)) => {
+                        out.push("    raw socket: wayland \"host\"".to_owned());
+                    }
                     _ => {}
                 },
                 Origin::Seccomp => out.extend(listed(n == 0, seccomp_lines(&view.cfg.seccomp))),
@@ -581,6 +599,7 @@ mod tests {
             &items,
             &View {
                 title: "bwrap",
+                instance: "t",
                 cfg: &cfg,
                 source: Source {
                     file: "config.kdl",
@@ -612,6 +631,7 @@ bwrap
   wayland                         config.kdl:1  6 arguments
     --ro-bind /run/wayland-1 /run/wayland-1
     --setenv WAYLAND_DISPLAY wayland-1
+    security-context: engine=org.bubbler app=org.bubbler.t instance=bubbler-t
 
   dbus                            config.kdl:2  3 arguments
     --ro-bind /run/t/bus /run/bus
@@ -634,6 +654,39 @@ bwrap
 
 27 arguments in 7 groups, 4 hidden (--explain=full); 6 D-Bus rules to the proxy (--proxy)";
 
+    /// Which socket a `wayland` grant binds is not visible in its
+    /// arguments — both are one `--ro-bind` — so the mode is a line of
+    /// its own, in the bare node's case the identity a run registers.
+    #[test]
+    fn a_wayland_grant_says_which_socket_it_binds() {
+        let cfg = cfg("wayland \"host\"\ncommand \"true\"");
+        let lines = Lines::default();
+        let out = render(
+            &[item(
+                Origin::Service(0),
+                &["--ro-bind", "/run/wayland-1", "/run/wayland-1"],
+                None,
+            )],
+            &View {
+                title: "bwrap",
+                instance: "t",
+                cfg: &cfg,
+                source: Source {
+                    file: "config.kdl",
+                    lines: &lines,
+                },
+                rules: &[],
+                proxy: false,
+                full: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            out.contains(&"    raw socket: wayland \"host\"".to_owned()),
+            "{out:#?}"
+        );
+    }
+
     #[test]
     fn a_camera_grant_shows_the_portal_it_reaches_the_sandbox_through() {
         let bare = cfg("dbus\nportals\ncamera\ncommand \"true\"");
@@ -647,6 +700,7 @@ bwrap
                 items,
                 &View {
                     title: "bwrap",
+                    instance: "t",
                     cfg: &bare,
                     source: Source {
                         file: "config.kdl",
@@ -680,6 +734,7 @@ bwrap
             )],
             &View {
                 title: "bwrap",
+                instance: "t",
                 cfg: &with_nodes,
                 source: Source {
                     file: "config.kdl",
@@ -704,6 +759,7 @@ bwrap
             &baseline(),
             &View {
                 title: "bwrap",
+                instance: "t",
                 cfg: &cfg,
                 source: Source {
                     file: "config.kdl",
@@ -745,6 +801,7 @@ bwrap
             &items,
             &View {
                 title: "bwrap",
+                instance: "t",
                 cfg: &cfg,
                 source: Source {
                     file: "config.kdl",
@@ -786,6 +843,7 @@ bwrap
         let rules = rules(&cfg, "t");
         let view = View {
             title: "bwrap",
+            instance: "t",
             cfg: &cfg,
             source: Source {
                 file: "config.kdl",
@@ -817,6 +875,7 @@ bwrap
             &items,
             &View {
                 title: "bwrap",
+                instance: "t",
                 cfg: &cfg,
                 source: Source {
                     file: "config.kdl",
@@ -854,6 +913,7 @@ bwrap
             &items,
             &View {
                 title: "bwrap",
+                instance: "t",
                 cfg: &cfg,
                 source: Source {
                     file: "config.kdl",
@@ -889,6 +949,7 @@ bwrap
             &items,
             &View {
                 title: "bwrap",
+                instance: "t",
                 cfg: &cfg,
                 source: Source {
                     file: "config.kdl",
@@ -915,6 +976,7 @@ bwrap
             &items,
             &View {
                 title: "bwrap",
+                instance: "t",
                 cfg: &cfg,
                 source: Source {
                     file: "config.kdl",
@@ -970,6 +1032,7 @@ bwrap
             &items,
             &View {
                 title: "bwrap",
+                instance: "t",
                 cfg: &cfg,
                 source: Source {
                     file: "config.kdl",

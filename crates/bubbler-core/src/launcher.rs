@@ -18,6 +18,7 @@ use rustix::event::{Nsecs, PollFd, PollFlags, Secs, Timespec, poll};
 use rustix::fs::{Access, AtFlags, MemfdFlags, Mode, OFlags};
 use rustix::io::{Errno, FdFlags, fcntl_dupfd_cloexec, fcntl_setfd};
 use rustix::ioctl::{self, Opcode};
+use rustix::pipe::{PipeFlags, pipe_with};
 use rustix::process::{Pid, Signal, kill_process, test_kill_process};
 use rustix::thread::{
     CapabilitiesSecureBits, CapabilitySet, LinkNameSpaceType, capabilities,
@@ -28,13 +29,14 @@ use signal_hook::SigId;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 
 use crate::bwrap::{BwrapArgs, Explained, FdAllocator, Origin};
-use crate::config::{NetworkConfig, Service, Userns};
+use crate::config::{NetworkConfig, Service, Userns, WaylandMode};
 use crate::env::Env;
 use crate::error::{ConfigError, LaunchError};
 use crate::host::{Host, RealHost};
 use crate::instance::Instance;
 use crate::tty::{self, Pty, RawGuard, RelayEnd, StdioTarget, TtyMode};
-use crate::{dbus, exec, init_bin, network, seccomp, service};
+use crate::wayland::WaylandError;
+use crate::{dbus, exec, init_bin, network, seccomp, service, wayland};
 
 /// How often a running sandbox is checked for having exited.
 const POLL: Duration = Duration::from_millis(100);
@@ -243,6 +245,14 @@ fn network_of(services: &[Service]) -> Option<&NetworkConfig> {
     })
 }
 
+/// How the config's `wayland` grant is to be served, if it has one.
+fn wayland_mode(services: &[Service]) -> Option<WaylandMode> {
+    services.iter().find_map(|s| match s {
+        Service::Wayland(mode) => Some(*mode),
+        _ => None,
+    })
+}
+
 /// The command to run: the CLI's if it gave one, else the config's.
 pub fn resolve_command<'a>(
     inst: &'a Instance,
@@ -271,7 +281,7 @@ pub fn build_argv(
     alloc: &mut dyn FdAllocator,
     ctty: bool,
 ) -> Result<Vec<OsString>, LaunchError> {
-    build_argv_on(env, inst, command, alloc, ctty, &RealHost)
+    build_argv_on(env, inst, command, alloc, ctty, &RealHost, None)
 }
 
 /// [`build_argv`] against one view of the host, so a test can state which
@@ -283,8 +293,9 @@ fn build_argv_on(
     alloc: &mut dyn FdAllocator,
     ctty: bool,
     host: &dyn Host,
+    wayland_probe: Option<bool>,
 ) -> Result<Vec<OsString>, LaunchError> {
-    let (args, command) = build_args_on(env, inst, command, ctty, host)?;
+    let (args, command) = build_args_on(env, inst, command, ctty, host, wayland_probe)?;
     args.finish(command, alloc)
 }
 
@@ -309,24 +320,34 @@ fn explain_on(
     ctty: bool,
     host: &dyn Host,
 ) -> Result<Vec<Explained>, LaunchError> {
-    let (args, command) = build_args_on(env, inst, command, ctty, host)?;
+    let (args, command) = build_args_on(env, inst, command, ctty, host, None)?;
     args.finish_explained(command, &mut DryRunAlloc::default())
 }
 
 /// The builder and the command behind [`build_argv`], before the fds are
 /// numbered: what the argv and the explanation of it are both made from.
+///
+/// `wayland_probe` is what the compositor answered about
+/// `wp_security_context_manager_v1`, and is `None` where nothing asked it:
+/// `--dry-run` and `--explain` never connect, so they describe the run a
+/// supporting compositor gets.
 fn build_args_on<'a>(
     env: &Env,
     inst: &'a Instance,
     command: Option<&'a [OsString]>,
     ctty: bool,
     host: &dyn Host,
+    wayland_probe: Option<bool>,
 ) -> Result<(BwrapArgs, &'a [OsString]), LaunchError> {
     let command = resolve_command(inst, command)?;
     let plan = dbus::plan(&inst.config.services, &inst.name);
+    let instance_runtime = instance_runtime_dir(env, &inst.name);
+    let wayland_plan = wayland_mode(&inst.config.services)
+        .map(|m| wayland::plan(m, wayland_probe, &instance_runtime));
     let ctx = service::ServiceCtx {
-        instance_runtime: instance_runtime_dir(env, &inst.name),
+        instance_runtime,
         dbus: plan.as_ref(),
+        wayland: wayland_plan.as_ref(),
     };
     let mut args = BwrapArgs::baseline(env, &inst.home(), host);
     if inst.config.userns == Userns::Disable {
@@ -570,6 +591,66 @@ fn wait_ready(ready: &OwnedFd, child: &mut Child, deadline: Instant) -> bool {
             return false;
         }
     }
+}
+
+/// A run's own Wayland socket, which the compositor accepts on as a
+/// security context. Dropping the handle is what ends that context: the
+/// compositor stops accepting when the write end of the close pipe hangs
+/// up, so it must outlive the sandbox connecting through the socket.
+#[derive(Debug)]
+pub struct WaylandHandle {
+    /// Write end of the pipe handed to the compositor as `close_fd`.
+    _close: OwnedFd,
+    /// Removes the listening socket when the run ends.
+    _socket: FileGuard,
+}
+
+/// Bind this run's own Wayland socket and register it with the compositor
+/// as a security context for the instance, so the application is a
+/// sandboxed client and the compositor withholds the privileged globals
+/// from it. `Ok(None)` when the compositor implements no security
+/// context: the run says so once and binds the session's socket instead.
+///
+/// Called before the argv is built, like the D-Bus proxy: the answer
+/// decides which socket the argv names, and the socket has to be there
+/// for bwrap to bind. The handle must outlive the sandbox.
+pub fn start_wayland(dir: &Path, instance: &str) -> Result<Option<WaylandHandle>, LaunchError> {
+    if !wayland::probe()? {
+        eprintln!(
+            "bubbler: warning: wayland: the compositor offers no \
+             wp_security_context_manager_v1, binding the host socket"
+        );
+        return Ok(None);
+    }
+    let path = dir.join(wayland::SOCKET_NAME);
+    // A socket left behind by a run that was killed before its guard ran.
+    // Only a missing file is nothing to do: anything else here is this
+    // instance's own 0700 directory refusing, which the bind would not
+    // survive either.
+    if let Err(e) = std::fs::remove_file(&path)
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        return Err(WaylandError::Listen(path, e).into());
+    }
+    let listener = UnixListener::bind(&path).map_err(|e| WaylandError::Listen(path.clone(), e))?;
+    // From here the socket is this run's to remove, however the handshake
+    // below goes.
+    let socket = FileGuard(path.clone());
+    // Close-on-exec on both ends: the sandbox connects through the socket,
+    // and a copy of the write end inside it would keep the compositor
+    // accepting for as long as anything in there held it.
+    let (close_read, close_write) =
+        pipe_with(PipeFlags::CLOEXEC).map_err(|e| WaylandError::Listen(path, e.into()))?;
+    wayland::create_context(
+        listener.into(),
+        close_read,
+        &dbus::app_id(instance),
+        &dbus::flatpak_instance_id(instance),
+    )?;
+    Ok(Some(WaylandHandle {
+        _close: close_write,
+        _socket: socket,
+    }))
 }
 
 /// Start the filtering D-Bus proxy for an instance in its own sandbox and
@@ -1352,7 +1433,9 @@ fn supervisor_pid(reaper: i32, child: &mut Child, deadline: Instant) -> Option<P
 }
 
 /// Removes one of the run's own files when it leaves, on every path: the
-/// control socket, and the proxied bus socket once it has been moved.
+/// control socket, the proxied bus socket once it has been moved, and the
+/// Wayland socket the compositor accepts on.
+#[derive(Debug)]
 struct FileGuard(PathBuf);
 
 impl Drop for FileGuard {
@@ -1699,6 +1782,20 @@ pub fn run(
             buses.push(adopt_proxy_bus(&dir, socket, node)?);
         }
     }
+    // Before the argv is built, for the same reason the proxy is, and
+    // with the answer the argv is built from: a compositor that takes the
+    // context is served this run's own socket, one that does not is fallen
+    // back to the session's. The handle holds the context open for the
+    // whole run.
+    let (_wayland, wayland_probe) = match wayland_mode(&inst.config.services) {
+        Some(WaylandMode::Sandboxed) => match start_wayland(&dir, &inst.name)? {
+            Some(handle) => (Some(handle), Some(true)),
+            None => (None, Some(false)),
+        },
+        // `wayland "host"` asks for the session's socket outright, and
+        // without the grant there is nothing to ask the compositor about.
+        Some(WaylandMode::Host) | None => (None, None),
+    };
     let host = tty::host_stdio()?;
     let is_tty = tty::host_is_tty();
     let mut stdio = tty::plan(mode, is_tty);
@@ -1715,7 +1812,15 @@ pub fn run(
     // Before the argv is built, for the same reason the proxy is: a bind
     // whose source is not there is a failed start, not a warning.
     prepare_app_runtime(env, &inst.config.services)?;
-    let argv = build_argv(env, inst, command, &mut alloc, stdio.ctty())?;
+    let argv = build_argv_on(
+        env,
+        inst,
+        command,
+        &mut alloc,
+        stdio.ctty(),
+        &RealHost,
+        wayland_probe,
+    )?;
     let stop = Arc::new(AtomicBool::new(false));
     // What `stop` becomes once a run has seen it: `stop` is cleared as
     // the signal is acted on, this stays set for the rest of the run.
@@ -1971,6 +2076,7 @@ mod tests {
             &mut DryRunAlloc::default(),
             false,
             &device_host(tmp),
+            None,
         )
         .unwrap();
         strs(&argv)
@@ -2019,6 +2125,7 @@ mod tests {
             &mut DryRunAlloc::default(),
             false,
             &share_host(tmp.path()),
+            None,
         )
         .unwrap();
         assert_eq!(flat, argv);
@@ -2108,6 +2215,7 @@ mod tests {
             &items,
             &crate::explain::View {
                 title: "bwrap",
+                instance: "t",
                 cfg: &cfg,
                 source: crate::explain::Source {
                     file: "config.kdl",
