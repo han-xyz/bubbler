@@ -418,11 +418,74 @@ fn viewer(viewer: &Viewer, area: Rect, buf: &mut Buffer) {
         .render(area, buf);
 }
 
+/// A hint split at the places a row may break: the spaces between its
+/// tokens, and never the ones inside a quoted token. `home-share
+/// "<path under $HOME>"` holds spaces of its own, and half of a path is
+/// the grammar of nothing.
+fn tokens(hint: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut quoted = false;
+    let mut start = 0;
+    for (at, c) in hint.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            ' ' if !quoted => {
+                if at > start {
+                    tokens.push(&hint[start..at]);
+                }
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < hint.len() {
+        tokens.push(&hint[start..]);
+    }
+    tokens
+}
+
+/// `hint` as rows no wider than `width`, filled a token at a time. A
+/// token wider than the row takes a row of its own rather than being
+/// cut in two; an empty hint is still one row, so a prompt keeps its
+/// shape.
+fn wrapped(hint: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut row = String::new();
+    for token in tokens(hint) {
+        if row.is_empty() {
+            row.push_str(token);
+        } else if row.chars().count() + 1 + token.chars().count() <= width {
+            row.push(' ');
+            row.push_str(token);
+        } else {
+            rows.push(std::mem::take(&mut row));
+            row.push_str(token);
+        }
+    }
+    rows.push(row);
+    rows
+}
+
+/// How tall a dialog stands: its border and what it holds. A prompt
+/// holds the field, a blank line, its grammar — as many rows as the
+/// width leaves it — and the line saying which key writes it.
+fn dialog_height(dialog: &Dialog, width: u16) -> u16 {
+    match dialog {
+        Dialog::Ask { hint, .. } => {
+            let rows = wrapped(hint, usize::from(width.saturating_sub(2))).len();
+            u16::try_from(rows).unwrap_or(u16::MAX).saturating_add(5)
+        }
+        Dialog::Choose { .. } => 6,
+    }
+}
+
 /// Where a dialog goes: the middle of the screen, wide enough for a node
-/// and tall enough for the question, the field and its grammar.
-fn dialog_area(area: Rect) -> Rect {
+/// and tall enough for the question, the field and every row of its
+/// grammar.
+fn dialog_area(dialog: &Dialog, area: Rect) -> Rect {
     let width = area.width.saturating_sub(4).clamp(20, 76);
-    let height = 6.min(area.height);
+    let height = dialog_height(dialog, width).min(area.height);
     Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -433,7 +496,7 @@ fn dialog_area(area: Rect) -> Rect {
 
 /// The prompt or the question over the screen.
 fn dialog(dialog: &Dialog, area: Rect, buf: &mut Buffer) {
-    let area = dialog_area(area);
+    let area = dialog_area(dialog, area);
     Clear.render(area, buf);
     match dialog {
         Dialog::Ask {
@@ -443,16 +506,17 @@ fn dialog(dialog: &Dialog, area: Rect, buf: &mut Buffer) {
             let inner = block.inner(area);
             block.render(area, buf);
             let (value, _) = input.view(usize::from(inner.width));
-            Paragraph::new(Text::from(vec![
-                Line::from(value.to_owned()),
-                Line::from(""),
-                Line::styled(hint.clone(), Style::default().dim()),
-                Line::styled(
-                    "Enter writes it, Esc leaves it alone",
-                    Style::default().dim(),
-                ),
-            ]))
-            .render(inner, buf);
+            let mut lines = vec![Line::from(value.to_owned()), Line::from("")];
+            lines.extend(
+                wrapped(hint, usize::from(inner.width))
+                    .into_iter()
+                    .map(|row| Line::styled(row, Style::default().dim())),
+            );
+            lines.push(Line::styled(
+                "Enter writes it, Esc leaves it alone",
+                Style::default().dim(),
+            ));
+            Paragraph::new(Text::from(lines)).render(inner, buf);
         }
         Dialog::Choose { question, choices } => {
             let block = Block::bordered().title_top("confirm");
@@ -478,10 +542,11 @@ fn dialog(dialog: &Dialog, area: Rect, buf: &mut Buffer) {
 /// Where the terminal cursor belongs, which is inside the prompt's field
 /// and nowhere else.
 pub fn cursor(app: &App, area: Rect) -> Option<Position> {
-    let Some(Dialog::Ask { input, .. }) = &app.dialog else {
+    let dialog = app.dialog.as_ref()?;
+    let Dialog::Ask { input, .. } = dialog else {
         return None;
     };
-    let inner = dialog_area(area).inner(ratatui::layout::Margin::new(1, 1));
+    let inner = dialog_area(dialog, area).inner(ratatui::layout::Margin::new(1, 1));
     let (_, at) = input.view(usize::from(inner.width));
     Some(Position {
         x: inner.x + u16::try_from(at).unwrap_or(0),
@@ -675,14 +740,15 @@ mod tests {
                 "bubbler — ff (generic) ○ stopped",
                 "┌grants────────────────────────────┐┌what it grants────────────────────────────┐",
                 "│●    wayland                      ││x11  (outward)                            │",
-                "│● !! x11 \"host\"                   ││x11 [\"host\"] [geometry=\"WxH\"]             │",
                 "│●┌x11 in `ff`───────────────────────────────────────────────────────────────┐ │",
-                "│○│x11 \"host\"                                                                │ │",
+                "│●│x11 \"host\"                                                                │ │",
                 "│○│                                                                          │ │",
-                // The grammar is one line and the field clips it, as it
-                // clips `seccomp`'s: what the prompt is for is the node
-                // above, and the whole grammar is in the pane behind it.
-                "│○│x11 [\"host\"] [geometry=\"WxH\"] [fullscreen=#true] [grab=#true] [wm=\"<progra│ │",
+                // The grammar wraps at the spaces between its tokens
+                // instead of stopping at the field's edge, and the
+                // prompt stands a row taller for it: the last token is
+                // `[wm="<program>"]`, not the half of it that fit.
+                "│○│x11 [\"host\"] [geometry=\"WxH\"] [fullscreen=#true] [grab=#true]             │ │",
+                "│○│[wm=\"<program>\"]                                                          │ │",
                 "│○│Enter writes it, Esc leaves it alone                                      │ │",
                 "│○└──────────────────────────────────────────────────────────────────────────┘ │",
                 "│○ !  hidraw                       ││Bare, bubbler starts a rootful Xwayland   │",
@@ -694,8 +760,127 @@ mod tests {
         // The cursor sits at the end of what is written, inside the field.
         assert_eq!(
             cursor(&app, Rect::new(0, 0, 80, 14)),
-            Some(Position { x: 13, y: 5 })
+            Some(Position { x: 13, y: 4 })
         );
+    }
+
+    /// A quoted token holds spaces of its own, and the wrap breaks
+    /// between tokens only: half a path is the grammar of nothing. A
+    /// token wider than the row still takes a row of its own.
+    #[test]
+    fn wrapping_a_grammar_never_breaks_a_quoted_token() {
+        let grammar = bubbler_core::catalogue::grant("home-share")
+            .expect("the catalogue holds home-share")
+            .grammar;
+        assert_eq!(
+            wrapped(grammar, 24),
+            ["home-share", "\"<path under $HOME>\"", "[mode=ro|rw]"]
+        );
+        assert_eq!(wrapped(grammar, 8), wrapped(grammar, 24));
+        assert_eq!(wrapped("", 40), [""]);
+    }
+
+    /// The rows the open dialog holds, without the border it stands in.
+    /// What is behind it draws the same grammar, so only what the prompt
+    /// itself puts on the screen says whether the prompt clipped it.
+    fn dialog_rows(app: &App, width: u16, height: u16) -> Vec<String> {
+        let dialog = app.dialog.as_ref().expect("a dialog is open");
+        let inner = dialog_area(dialog, Rect::new(0, 0, width, height))
+            .inner(ratatui::layout::Margin::new(1, 1));
+        screen(app, width, height)
+            .into_iter()
+            .skip(usize::from(inner.y))
+            .take(usize::from(inner.height))
+            .map(|line| {
+                line.chars()
+                    .skip(usize::from(inner.x))
+                    .take(usize::from(inner.width))
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// The prompt for `node`, open over the detail screen.
+    fn prompt_for(node: &str) -> (tempfile::TempDir, App) {
+        let (tmp, mut app) = list_editor();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let detail = app.detail.as_mut().expect("the detail screen is open");
+        detail.selected = detail
+            .rows
+            .iter()
+            .position(|row| row.node == node)
+            .expect("the catalogue holds the node");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        (tmp, app)
+    }
+
+    /// The two grammars that outgrew 80 columns. Every token of them
+    /// stands whole in the prompt, `[wm="<program>"]` and `disable }`
+    /// included: a grammar cut mid-token is the grammar of nothing.
+    const LONG_GRAMMARS: [(&str, &[&str]); 2] = [
+        (
+            "x11",
+            &[
+                "x11",
+                "[\"host\"]",
+                "[geometry=\"WxH\"]",
+                "[fullscreen=#true]",
+                "[grab=#true]",
+                "[wm=\"<program>\"]",
+            ],
+        ),
+        (
+            "seccomp",
+            &[
+                "seccomp",
+                "{",
+                "allow",
+                "\"<syscall>\";",
+                "deny",
+                "\"<syscall>\"",
+                "[errno=\"EPERM\"|\"ENOSYS\"];",
+                "disable",
+                "}",
+            ],
+        ),
+    ];
+
+    #[test]
+    fn a_prompt_wraps_a_long_grammar_rather_than_cutting_a_token_in_two() {
+        for (node, tokens) in LONG_GRAMMARS {
+            let (_tmp, app) = prompt_for(node);
+            let rows = dialog_rows(&app, 80, 24).join("\n");
+            for token in tokens {
+                assert!(
+                    rows.contains(token),
+                    "{node}: `{token}` is cut off in\n{rows}"
+                );
+            }
+        }
+    }
+
+    /// The same prompt on a terminal too narrow for the grammar twice
+    /// over: it wraps into more rows, and the narrowest ones it cannot
+    /// hold at all still draw rather than panic.
+    #[test]
+    fn a_prompt_wraps_on_a_narrow_terminal_as_well() {
+        for (node, tokens) in LONG_GRAMMARS {
+            let (_tmp, app) = prompt_for(node);
+            let rows = dialog_rows(&app, 40, 16).join("\n");
+            for token in tokens {
+                assert!(
+                    rows.contains(token),
+                    "{node}: `{token}` is cut off in\n{rows}"
+                );
+            }
+            for (width, height) in [(40u16, 8u16), (24, 12), (20, 6)] {
+                let drawn = screen(&app, width, height);
+                assert_eq!(drawn.len(), usize::from(height));
+                assert!(cursor(&app, Rect::new(0, 0, width, height)).is_some());
+            }
+        }
     }
 
     #[test]
