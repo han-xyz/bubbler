@@ -3167,6 +3167,8 @@ fn a_nested_x11_dry_run_hands_the_supervisor_the_server_argv() {
         "tcp",
         "-nolisten",
         "local",
+        "-nolisten",
+        "unix",
         "-ac",
         "-hidpi",
         "-decorate",

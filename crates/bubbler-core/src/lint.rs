@@ -823,6 +823,14 @@ fn prop<'a>(node: &'a KdlNode, key: &str) -> Option<&'a str> {
         .and_then(|e| e.value().as_string())
 }
 
+/// Whether a nested `x11` node has already answered the question the
+/// no-window-manager note asks: a fullscreen server has the one window
+/// there is nothing to arrange in, and `wm=` names the program that
+/// arranges the rest. Neither leaves anything for the note to say.
+fn x11_manages_its_windows(node: &KdlNode) -> bool {
+    flag(node, "fullscreen") == Some(true) || prop(node, "wm").is_some()
+}
+
 /// The node's `key=` property as a boolean, which is what the device
 /// properties of `gamepad` and `camera` are written as.
 fn flag(node: &KdlNode, key: &str) -> Option<bool> {
@@ -858,17 +866,15 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                 "drop the argument for a nested Xwayland inside the sandbox, or accept it \
                  with `lint-allow \"x11-without-reason\" reason=\"...\"`",
             ),
-            // Nothing to say to a config that already asks for the whole
-            // output: a fullscreen server has one window and the help
-            // would be telling it to do what it does.
-            "x11" if flag(node, "fullscreen") != Some(true) => f.push(
+            "x11" if !x11_manages_its_windows(node) => f.push(
                 i,
                 node,
                 &X11_NESTED_NO_WM,
                 "the nested X server has no window manager: X windows are undecorated and \
                  unmanaged inside one compositor window"
                     .to_owned(),
-                "`fullscreen=#true grab=#true` for games; `x11 \"host\"` where an \
+                "`wm=\"twm\"` runs a window manager inside the sandbox; \
+                 `fullscreen=#true grab=#true` for games; `x11 \"host\"` where an \
                  application needs the session's window manager",
             ),
             "tty" if arg(node) == Some("passthrough") => f.push(
@@ -1623,10 +1629,18 @@ mod tests {
             assert_eq!(ids(&nested), ["x11-nested-no-wm"]);
             assert_eq!(nested.findings[0].severity, Severity::Note);
             // A server that fills the output has no windows to manage,
-            // so there is nothing left to say about it.
-            assert_eq!(
-                ids(&lint(ctx, &["x11 fullscreen=#true grab=#true"])),
-                [] as [&str; 0]
+            // so there is nothing left to say about it, and a config
+            // that names a window manager has already done something
+            // about it.
+            for quiet in ["x11 fullscreen=#true grab=#true", "x11 wm=\"twm\""] {
+                assert_eq!(ids(&lint(ctx, &[quiet])), [] as [&str; 0], "{quiet}");
+            }
+            // The help names the property that silences it, so a reader
+            // who wants a managed window has the fix in the finding.
+            assert!(
+                nested.findings[0].help.contains("wm=\"twm\""),
+                "{}",
+                nested.findings[0].help
             );
             assert_eq!(ids(&lint(ctx, &["wayland"])), [] as [&str; 0]);
             for text in [

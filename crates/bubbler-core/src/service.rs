@@ -1516,6 +1516,8 @@ mod tests {
             "tcp",
             "-nolisten",
             "local",
+            "-nolisten",
+            "unix",
             "-ac",
             "-hidpi",
             "-decorate",

@@ -76,9 +76,13 @@ pub static GRANTS: &[Grant] = &[
                `\"host\"` binds the session's X socket and cookie instead: X11 has no \
                isolation between clients, so a sandbox on your display can keylog every \
                other client, Xwayland included, and the security context does not apply; \
-               lint warns unless the config says why.",
+               lint warns unless the config says why. The nested server starts on the \
+               first X connection, so an instance whose command never speaks X runs \
+               without one; a window manager named with `wm=` runs inside the sandbox as \
+               one more sandboxed process, resolved on the sandbox's `PATH`.",
         risk: Risk::Outward,
-        grammar: "x11 [\"host\"] [geometry=\"WxH\"] [fullscreen=#true] [grab=#true]",
+        grammar: "x11 [\"host\"] [geometry=\"WxH\"] [fullscreen=#true] [grab=#true] \
+                  [wm=\"<program>\"]",
     },
     Grant {
         node: "network",

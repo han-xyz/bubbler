@@ -346,9 +346,9 @@ const CHECK_LINES: &[(&str, &str)] = &[
     ),
     (
         "x11-nested-no-wm",
-        "A nested `x11` server without `fullscreen=#true`, which has no window manager: \
-         the X windows inside are undecorated and unmanaged in the one compositor window \
-         the server draws.",
+        "A nested `x11` server with neither `fullscreen=#true` nor `wm=`, which has no \
+         window manager: the X windows inside are undecorated and unmanaged in the one \
+         compositor window the server draws.",
     ),
     (
         "x11-without-reason",

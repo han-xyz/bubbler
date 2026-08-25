@@ -1410,6 +1410,7 @@ mod tests {
             geometry: NestedX11::default().geometry,
             fullscreen: true,
             grab: false,
+            wm: None,
         };
         // The display stack the nested server needs, in the layer below:
         // the requirement is on the flattened config, not on one file.

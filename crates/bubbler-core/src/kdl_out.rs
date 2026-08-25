@@ -168,6 +168,11 @@ fn x11(n: &NestedX11) -> String {
             node.push_str(&format!(" {name}=#true"));
         }
     }
+    // A dropped `wm=` would give the instance back the unmanaged server
+    // the user wrote the property to be rid of.
+    if let Some(wm) = &n.wm {
+        node.push_str(&format!(" wm={}", quote(wm)));
+    }
     node
 }
 
@@ -425,19 +430,28 @@ mod tests {
                 })),
             ),
             (
+                "x11 wm=\"openbox\"\n",
+                Service::X11(X11Mode::Nested(NestedX11 {
+                    wm: Some("openbox".to_owned()),
+                    ..NestedX11::default()
+                })),
+            ),
+            (
                 "x11 geometry=\"1920x1080\" fullscreen=#true\n",
                 Service::X11(X11Mode::Nested(NestedX11 {
                     geometry: "1920x1080".to_owned(),
                     fullscreen: true,
                     grab: false,
+                    wm: None,
                 })),
             ),
             (
-                "x11 geometry=\"1920x1080\" fullscreen=#true grab=#true\n",
+                "x11 geometry=\"1920x1080\" fullscreen=#true grab=#true wm=\"twm\"\n",
                 Service::X11(X11Mode::Nested(NestedX11 {
                     geometry: "1920x1080".to_owned(),
                     fullscreen: true,
                     grab: true,
+                    wm: Some("twm".to_owned()),
                 })),
             ),
             ("x11 \"host\"\n", Service::X11(X11Mode::Host)),

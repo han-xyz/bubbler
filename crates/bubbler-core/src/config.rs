@@ -177,6 +177,10 @@ pub struct NestedX11 {
     /// Keep keyboard and pointer inside the server's window
     /// (`-host-grab`, released with Ctrl+Shift).
     pub grab: bool,
+    /// A window manager to run inside the sandbox alongside the server,
+    /// named as a program the sandbox's `PATH` resolves. Without one the
+    /// X windows are undecorated and unmanaged.
+    pub wm: Option<String>,
 }
 
 impl Default for NestedX11 {
@@ -185,24 +189,30 @@ impl Default for NestedX11 {
             geometry: "1280x720".to_owned(),
             fullscreen: false,
             grab: false,
+            wm: None,
         }
     }
 }
 
 impl NestedX11 {
     /// The Xwayland command line, in the order the server takes it.
-    /// The two `-nolisten` flags leave the display reachable only over
-    /// the socket inside the sandbox and `-noreset` stops a client's exit
+    /// The three `-nolisten` flags leave the display reachable only over
+    /// the socket `bubbler-init` owns and `-noreset` stops a client's exit
     /// from resetting the server; `-ac` is the access control X11 has no
-    /// use for here, the display being the sandbox's own. The
-    /// `-displayfd` the supervisor reads the display number from is
-    /// appended when it starts the server, not here.
+    /// use for here, the display being the sandbox's own. The `-listenfd`
+    /// that hands the server that socket is appended when the supervisor
+    /// starts it, not here. The window manager, if the config names one,
+    /// is a program of the supervisor's and never a flag of the server's.
     pub fn xwayland_argv(&self) -> Vec<OsString> {
         // `Xserver(1)`: `-nolisten local` drops the abstract socket the
         // server would otherwise also answer on. An abstract name belongs
         // to the network namespace and ignores the mount namespace, so
         // under `network "host"` it is a host-wide address: a host client
         // could reach this server, which `-ac` lets anyone use.
+        // `-nolisten unix` drops the server's own path socket: the
+        // supervisor binds `/tmp/.X11-unix/X0` before the server exists
+        // and hands it over with `-listenfd`, so a second socket of the
+        // server's own would only take the name away from that one.
         let mut argv: Vec<OsString> = [
             XWAYLAND,
             ":0",
@@ -211,6 +221,8 @@ impl NestedX11 {
             "tcp",
             "-nolisten",
             "local",
+            "-nolisten",
+            "unix",
             "-ac",
             "-hidpi",
         ]
@@ -1792,10 +1804,11 @@ fn parse_geometry(s: &str) -> Option<String> {
     Some(format!("{}x{}", positive(w)?, positive(h)?))
 }
 
-/// `x11 ["host"] [geometry="WxH"] [fullscreen=#true] [grab=#true]`: the
-/// bare node is a nested Xwayland the properties describe the window of.
-/// A property with `"host"` is an error rather than a value dropped
-/// quietly: the session's server is not this sandbox's to size.
+/// `x11 ["host"] [geometry="WxH"] [fullscreen=#true] [grab=#true]
+/// [wm="<program>"]`: the bare node is a nested Xwayland the properties
+/// describe the window of. A property with `"host"` is an error rather
+/// than a value dropped quietly: the session's server is not this
+/// sandbox's to size, nor its windows this sandbox's to manage.
 fn parse_x11(node: &KdlNode) -> Result<X11Mode, ConfigError> {
     if node.children().is_some() {
         return Err(bad(node, "takes no children"));
@@ -1805,6 +1818,7 @@ fn parse_x11(node: &KdlNode) -> Result<X11Mode, ConfigError> {
     let mut geometry: Option<String> = None;
     let mut fullscreen: Option<bool> = None;
     let mut grab: Option<bool> = None;
+    let mut wm: Option<String> = None;
     for e in node.entries() {
         let Some(prop) = e.name().map(|n| n.value()) else {
             if seen_mode {
@@ -1840,6 +1854,31 @@ fn parse_x11(node: &KdlNode) -> Result<X11Mode, ConfigError> {
                     )
                 })?);
             }
+            "wm" => {
+                if wm.is_some() {
+                    return Err(dup());
+                }
+                let s = e
+                    .value()
+                    .as_string()
+                    .ok_or_else(|| bad(node, "wm must be a string like \"twm\""))?;
+                // One program name, resolved on the sandbox's own `PATH`:
+                // a path would name a host binary the sandbox may not
+                // hold, and a name with whitespace in it would be an
+                // argument list the supervisor does not split.
+                if s.is_empty()
+                    || s.contains('/')
+                    || s.chars().any(|c| c.is_whitespace() || c == '\0')
+                {
+                    return Err(bad(
+                        node,
+                        &format!(
+                            "wm must be one program name: no `/`, whitespace or NUL, got `{s}`"
+                        ),
+                    ));
+                }
+                wm = Some(s.to_owned());
+            }
             "fullscreen" | "grab" => {
                 let slot = match prop {
                     "fullscreen" => &mut fullscreen,
@@ -1863,7 +1902,7 @@ fn parse_x11(node: &KdlNode) -> Result<X11Mode, ConfigError> {
         }
     }
     if host {
-        if geometry.is_some() || fullscreen.is_some() || grab.is_some() {
+        if geometry.is_some() || fullscreen.is_some() || grab.is_some() || wm.is_some() {
             return Err(bad(node, "\"host\" takes no properties"));
         }
         return Ok(X11Mode::Host);
@@ -1873,6 +1912,7 @@ fn parse_x11(node: &KdlNode) -> Result<X11Mode, ConfigError> {
         geometry: geometry.unwrap_or(default.geometry),
         fullscreen: fullscreen.unwrap_or(default.fullscreen),
         grab: grab.unwrap_or(default.grab),
+        wm,
     }))
 }
 
@@ -2331,7 +2371,16 @@ mod tests {
                 .contains(&Service::X11(X11Mode::Nested(NestedX11 {
                     geometry: "1920x1080".into(),
                     fullscreen: true,
-                    grab: true
+                    grab: true,
+                    wm: None
+                })))
+        );
+        let w = parse(&format!("x11 wm=\"openbox\"\n{base}")).unwrap();
+        assert!(
+            w.services
+                .contains(&Service::X11(X11Mode::Nested(NestedX11 {
+                    wm: Some("openbox".to_owned()),
+                    ..NestedX11::default()
                 })))
         );
         let h = parse(&format!("x11 \"host\"\n{base}")).unwrap();
@@ -2339,6 +2388,16 @@ mod tests {
         for bad in [
             "x11 \"other\"",
             "x11 \"host\" grab=#true",
+            // A program name looked up on the sandbox's `PATH`: a path,
+            // an argument list or an empty name would each name nothing
+            // the supervisor can run.
+            "x11 \"host\" wm=\"twm\"",
+            "x11 wm=\"\"",
+            "x11 wm=\"/usr/bin/openbox\"",
+            "x11 wm=\"a b\"",
+            "x11 wm=\"a\\u{0}b\"",
+            "x11 wm=1",
+            "x11 wm=\"a\" wm=\"b\"",
             "x11 geometry=\"wide\"",
             "x11 geometry=\"0x10\"",
             "x11 geometry=1920",
@@ -2393,6 +2452,8 @@ mod tests {
                 "tcp",
                 "-nolisten",
                 "local",
+                "-nolisten",
+                "unix",
                 "-ac",
                 "-hidpi",
                 "-decorate",
@@ -2401,10 +2462,13 @@ mod tests {
             ]
             .map(OsString::from)
         );
+        // The window manager is the supervisor's to start, not a flag
+        // the server takes: it never reaches this argv.
         let f = NestedX11 {
             geometry: "1x1".into(),
             fullscreen: true,
             grab: true,
+            wm: Some("twm".to_owned()),
         }
         .xwayland_argv();
         assert_eq!(
@@ -2417,6 +2481,8 @@ mod tests {
                 "tcp",
                 "-nolisten",
                 "local",
+                "-nolisten",
+                "unix",
                 "-ac",
                 "-hidpi",
                 "-fullscreen",

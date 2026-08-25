@@ -34,6 +34,10 @@ advice (exit code untouched).
 `camera-nodes-none-present`, `camera-nodes-no-hotplug`, `secrets-access`,
 `lint-allow-unused`, `x11-nested-no-wm`.
 
+`x11-nested-no-wm` is about the windows inside a nested `x11` server, so a
+config that already asks for the whole output with `fullscreen=#true`, or names
+a window manager to run inside with `wm="twm"`, never gets it.
+
 Accept a warning or note with a reason:
 
 ```kdl
