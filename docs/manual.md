@@ -114,7 +114,7 @@ command's status.
              │                                       │            on its first
              │                                       │            X client)
              │                                       └─ a window manager (only
-             │                                                    with `wm=`)
+             │                                                            with `wm=`)
              ├─ bwrap ── bwrap ── xdg-dbus-proxy    (only with `dbus`)
              └─ pasta                               (only with an isolated
                                                      `network`; not sandboxed)
@@ -647,14 +647,14 @@ Under `--explain` the grant is those lines:
 of bwrap: the supervisor reads the server's command line up to that `--`, then
 the window manager's name, and the sandbox's own command follows the last one.
 
-`wm=` is one program name — no `/`, no whitespace, no leading `-` — resolved on
-the sandbox's own `PATH`, and the supervisor starts it immediately after the
-server on that same first connection, so the window manager is lazy too and is
-never itself the client that wakes the server. An ICCCM window manager
-reparents the windows that already exist when it starts, so the client that
-woke the server is managed even though its first window came first. bubbler
-ships no window manager and probes none on the host: a name that resolves to
-nothing inside is a log line rather than a failed launch,
+`wm=` is one program name — non-empty, no `/`, no whitespace, no NUL, no
+leading `-` — resolved on the sandbox's own `PATH`, and the supervisor starts
+it immediately after the server on that same first connection, so the window
+manager is lazy too and is never itself the client that wakes the server. An
+ICCCM window manager reparents the windows that already exist when it starts,
+so the client that woke the server is managed even though its first window came
+first. bubbler ships no window manager and probes none on the host: a name that
+resolves to nothing inside is a log line rather than a failed launch,
 
     bubbler-init: wm nosuchwm: No such file or directory (os error 2)
 
@@ -1366,8 +1366,8 @@ the same want. The nested server has no window manager unless the config names
 one, so it is ready as it is for a single fullscreen game (`x11
 fullscreen=#true grab=#true`) and wants a `wm=` for a launcher: `x11
 geometry="2560x1440" wm="openbox"`, with `openbox` installed, is what to try in
-place of either profile's `x11 "host"` before accepting that grant's cost. Each
-profile says so in the `lint-allow` reason it carries. Neither carries a
+place of either profile's `x11 "host"` before accepting that grant's cost — and
+is what the `lint-allow` reason each of them carries names. Neither carries a
 `seccomp` node any more: the Steam
 runtime, umu/Proton and DXVK's 32-bit path are i386, and the default filter now
 covers i386 alongside x86_64, so they are filtered rather than killed. Neither
@@ -1843,9 +1843,11 @@ before anything is probed or bound:
 
     service `dbus`: the host bus address names a socket under bubbler's own runtime directory
 
-That is bubbler's own runtime directory, where an instance's control socket
-lives — the one `bubbler exec` connects to — and a proxy pointed at it would be
-filtering something that is not a bus. All three addresses are guarded
+That is bubbler's own runtime directory. It holds an instance's control socket,
+the one `bubbler exec` connects to, and the bus socket the proxy serves at
+`<name>/bus`, so the guard catches an address naming the exec channel and one
+naming a socket this very proxy is about to serve. Neither is a bus the session
+is on. All three addresses are guarded
 (`dbus`, `system-bus` and the accessibility bus under `a11y`, each named in the
 message as the node it belongs to), and each is resolved before it is compared:
 symlinks followed, `..` folded, and the resolved path is what is bound, so the

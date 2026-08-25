@@ -114,9 +114,10 @@ loses input when the pointer leaves it; in-game fullscreen or `fullscreen=#true
 grab=#true` makes it stable. `grab=#true` holds pointer and keyboard inside
 (Ctrl+Shift releases them).
 
-`wm=` takes one program name — no `/`, no whitespace, no leading `-` — resolved
-on the sandbox's own `PATH` and started right after the server on that first
-connection, so it is never itself the client that wakes the server; an ICCCM
+`wm=` takes one program name — non-empty, no `/`, no whitespace, no NUL, no
+leading `-` — resolved on the sandbox's own `PATH` and started right after the
+server on that first connection, so it is never itself the client that wakes
+the server; an ICCCM
 window manager reparents windows that already exist, so the client that woke it
 is managed anyway. bubbler ships none: a missing one, or one that exits, is a
 log line and not a failed run, and the display keeps serving. The archwiki's

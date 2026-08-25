@@ -69,7 +69,7 @@ Six processes can come with a sandbox, and they are not one kind of thing:
 | `xdg-dbus-proxy` | its own bwrap sandbox, sibling of the app's | **Yes.** It is a filter, it sees only the host bus sockets read-only — up to three of them — and the instance's `dbus/` subdirectory read-write, and the socket it serves is moved out of its reach before anything is bound. |
 | `bubbler-init` | *inside* the sandbox, as pid 2 | **No.** It is the supervisor, not a guard: it shares the sandbox with the application. What it holds — the listening control socket — is kept from the application by being an inherited descriptor with no path, `CLOEXEC` in the only process that has it, and `PR_SET_DUMPABLE` off so `/proc/<init>/fd` cannot be walked. |
 | `Xwayland` | *inside* the sandbox, started by `bubbler-init` on the first X connection, only with a bare `x11` | **No.** It is the sandbox's own X server rather than a guard in front of one: every client on it is a process of this instance, and X11 isolates none of them from each other. What it replaces is the session's display — it reaches the compositor on the instance's own Wayland socket and listens nowhere but `/tmp/.X11-unix/X0` in the sandbox's private `/tmp`, a socket `bubbler-init` binds and hands over rather than one the server opens. A command that never speaks X11 never starts it. See "X11" below. |
-| a window manager | *inside* the sandbox, started by `bubbler-init` with the server, only with `x11 wm="…"` | **No.** It is a sibling of the application under `bubbler-init`, resolved on the sandbox's own `PATH`, with the same access to that X server as the application it manages and no more reach into it than any other sibling has: Arch's default `kernel.yama.ptrace_scope` of 1 restricts ptrace to a tracer's own descendants, and neither of these two is the other's. bubbler ships none and probes none; a name that resolves to nothing is a log line. |
+| a window manager | *inside* the sandbox, started by `bubbler-init` with the server, only with `x11 wm="…"` | **No.** It is a sibling of the application under `bubbler-init`, resolved on the sandbox's own `PATH`, with the same access to that X server as the application it manages and no more reach into it than any other sibling has. Arch enables the Yama LSM with `kernel.yama.ptrace_scope` at 1 (restricted), which stops a `ptrace` on a tracee outside a restricted scope unless the tracer is privileged or holds `CAP_SYS_PTRACE`; the kernel's Yama document defines that scope as the tracer's own descendants, `PR_SET_PTRACER` being the opt-in, and two siblings are outside each other's. bubbler ships none and probes none; a name that resolves to nothing is a log line. |
 | `pasta` | on the host, **not sandboxed**, holding the sandbox's outer user namespace | **No, in one direction.** A pasta that has been taken over *is* that sandbox's network and holds root over the namespaces the sandbox is built from. It owns nothing beyond what your own account already has: your uid created that namespace. Wrapping it in bwrap would not add anything — it would remove the very thing pasta needs, since a process can only join a descendant of its own user namespace. |
 | `nft` | on the host, entering the sandbox's user and network namespaces to install the ruleset | **Not a party to one.** It builds the network boundary rather than standing in it: it runs before pasta and before the sandbox is let go of its `--block-fd`, so the namespace has a policy before it has a route and before the application has run an instruction either way. Nothing the sandbox controls reaches it — the ruleset is generated from typed values and handed over on stdin, and its argv is two fixed arguments. It holds CAP_NET_ADMIN in the sandbox's user namespace and no other capability anywhere: the capability crosses `execve` through the ambient set, and `SECBIT_NOROOT` with `_LOCKED` stops the uid-0 that bwrap's nested user namespace maps bubbler to from being handed the full set. It exits before the run begins, and one that stops answering is killed rather than left holding that capability. |
 
@@ -169,11 +169,12 @@ canonicalised when it exists, else its parent, else a lexical fold of
 `.` and `..`), and one that lands under `$XDG_RUNTIME_DIR/bubbler/` is
 refused before anything is probed or bound: ``service `<node>`: the host
 bus address names a socket under bubbler's own runtime directory``,
-naming `dbus`, `system-bus` or `a11y`. That directory holds the instances'
-own control sockets, and a proxy aimed at one would be filtering
-something that is not a bus. The resolved path is what is returned and
-bound, so the comparison and the bind are made on the same path and a
-symlink cannot be repointed between them.
+naming `dbus`, `system-bus` or `a11y`. That directory holds an instance's
+control socket — the one `bubbler exec` connects to — and the bus socket
+the proxy itself serves, so the guard catches an address naming the exec
+channel and one naming a socket this very proxy is about to serve.
+Neither is a host bus. The resolved path is the one returned and bound,
+so the path compared and the path bound are the same string.
 
 **Does not defend:** a value that really does name a socket of the right
 type is bound, whatever it is a socket for. The bus guard compares paths,
@@ -269,10 +270,15 @@ undecorated and stacked in the server's one compositor window (lint note
 sandbox's own `PATH` and started by `bubbler-init` right after the server
 — a sibling of the application, not a layer over it. What the two share
 is the X server, where X11 isolates nothing; being siblings gains them
-nothing beyond it, since Arch's default `kernel.yama.ptrace_scope` of 1
-restricts ptrace to a tracer's own descendants and neither of them is the
-other's. That is the host's setting rather than bubbler's, and `ptrace`
-is deliberately not on the seccomp denylist. bubbler ships no window
+nothing beyond it on an Arch host at its default. Arch enables the Yama
+LSM with `kernel.yama.ptrace_scope` at 1 (restricted), which stops a
+tracer from `ptrace`-ing a tracee outside a restricted scope unless the
+tracer is privileged or holds `CAP_SYS_PTRACE`; the kernel's Yama
+document, which the wiki links, defines that scope as the tracer's own
+descendants, with `PR_SET_PTRACER` as the tracee's opt-in for anything
+else. Neither of these two is the other's descendant. That is the host's
+setting rather than bubbler's, and `ptrace` is not on bubbler's seccomp
+denylist. bubbler ships no window
 manager and probes none on the host: a name that resolves to nothing, or
 a program that exits, is a log line rather than a failed run.
 The server is the host's `/usr/bin/Xwayland` and cannot start without
@@ -497,7 +503,7 @@ nothing in this tree. `network "host"` gives all of it back on purpose.
 [network](manual.md#network) ·
 `pasta_argv_is_the_hardened_invocation`,
 `every_hardening_flag_is_present_whatever_the_node_asked_for`,
-`the_namespace_check_compares_what_the_links_name`,
+`the_namespace_check_compares_the_held_descriptor_by_identity`,
 `the_user_namespace_comes_from_the_network_namespace_it_owns`,
 `a_sandbox_whose_network_cannot_be_connected_never_runs`,
 `real_pasta_hides_the_host_loopback_that_network_host_still_reaches`,
@@ -597,12 +603,11 @@ sandbox only as an inherited descriptor, so no path to it exists inside;
 `bubbler-init` sets `CLOEXEC` on it at once and makes itself
 non-dumpable. The wire decoder refuses an empty, truncated or oversized
 request and one that carries no descriptors, and a client that trickles
-bytes cannot extend the deadline. Once the run is stopping — the command
-gone, the display gone, or a SIGTERM to `bubbler-init` — a request is
-turned down rather than served (`bubbler-init: stopping; <program> was
-not run`, exit 127), so nothing is spawned into a sandbox that is being
-torn down and no child reaches the SIGKILL deadline without having been
-asked to stop first.
+bytes cannot extend the deadline. Once the run is stopping — the display
+gone, or a SIGTERM to `bubbler-init` — a request is turned down rather
+than served (`bubbler-init: stopping; <program> was not run`, exit 127),
+so nothing is spawned into a sandbox that is being torn down and no child
+reaches the SIGKILL deadline without having been asked to stop first.
 
 **Does not defend:** descriptors passed to an exec'd command are
 reachable by the sandboxed application through `/proc`. `exec` is a

@@ -87,6 +87,20 @@ cannot be found fails the run naming the step, never silently drops the grant;
 a `unix:abstract=` address is refused, since the proxy's sandbox has no host
 network namespace to reach one through.
 
+All three host bus addresses — `$DBUS_SESSION_BUS_ADDRESS`,
+`$DBUS_SYSTEM_BUS_ADDRESS` and `$AT_SPI_BUS_ADDRESS` — are also refused when
+they name a socket under `$XDG_RUNTIME_DIR/bubbler/`, before anything is probed
+or bound: ``service `dbus`: the host bus address names a socket under bubbler's
+own runtime directory``, with the node it belongs to (`dbus`, `system-bus` or
+`a11y`) in the message. That directory holds an instance's control socket, the
+one `bubbler exec` connects to, and the bus socket the proxy itself serves, and
+neither is a bus the session is on. Each address is resolved before it is
+compared — symlinks followed, `..` folded — and the resolved path is the one
+bound, so the path compared and the path bound are the same. Where neither the
+socket nor its parent directory exists yet only the lexical form is left, so
+`--explain --proxy` can describe a bus that the run it describes goes on to
+refuse.
+
 `--explain --proxy` on an `a11y` config resolves that address too — it is part
 of the proxy argv that view prints — so it asks `org.a11y.Bus` when the
 variable is unset, and fails without a session bus. Plain `--explain` and
