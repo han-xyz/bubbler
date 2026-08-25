@@ -205,8 +205,8 @@ const CHECK_LINES: &[(&str, &str)] = &[
     ),
     (
         "bundle-without-dbus",
-        "A `portals`, `notify`, `tray` or `mpris` bundle that no layer gives a `dbus` to \
-         carry its rules.",
+        "A `portals`, `notify`, `tray`, `mpris`, `a11y` or `input-method` grant that no \
+         layer gives a `dbus` to carry its rules.",
     ),
     (
         "camera-nodes-none-present",

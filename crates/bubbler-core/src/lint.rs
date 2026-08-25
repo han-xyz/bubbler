@@ -401,8 +401,9 @@ const SECRETS_NAME: &str = "org.freedesktop.secrets";
 /// The prefix every XDG desktop portal name starts with.
 const PORTAL_PREFIX: &str = "org.freedesktop.portal.";
 
-/// The bundle nodes, which are sets of proxy rules and nothing else.
-const BUNDLES: &[&str] = &["portals", "notify", "tray", "mpris"];
+/// The nodes the proxy carries: rules on the session bus, or on the
+/// accessibility bus the same proxy serves.
+const BUNDLES: &[&str] = &["portals", "notify", "tray", "mpris", "a11y", "input-method"];
 
 /// Checks that name exactly what the parser or the resolver refuses. A
 /// report whose errors are all from this set has already said why the
@@ -2103,6 +2104,12 @@ mod tests {
             // The `dbus` node may be in any layer, which is exactly the
             // case one file alone cannot check.
             assert_eq!(ids(&lint(ctx, &["dbus", "notify"])), [] as [&str; 0]);
+            // The accessibility bus and the input-method names are the
+            // same case: rules with no proxy to carry them.
+            for node in ["a11y", "input-method"] {
+                assert_eq!(ids(&lint(ctx, &[node])), ["bundle-without-dbus"], "{node}");
+                assert_eq!(ids(&lint(ctx, &["dbus", node])), [] as [&str; 0], "{node}");
+            }
         });
     }
 

@@ -83,6 +83,8 @@ pub fn apply_all(
             // Rule-only bundles: they reach the sandbox through the proxy
             // the launcher starts, not through bwrap arguments.
             Service::Notify | Service::Tray | Service::Mpris { .. } => {}
+            // Task 3: bind and env.
+            Service::A11y | Service::InputMethod => {}
         }
     }
     let pad = services.iter().enumerate().find_map(|(i, s)| match s {

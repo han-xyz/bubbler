@@ -82,12 +82,16 @@ pub fn rules(cfg: &InstanceConfig, instance: &str) -> Vec<(usize, String)> {
     let Some(plan) = dbus::plan(&cfg.services, instance) else {
         return Vec::new();
     };
-    [plan.session.as_ref(), plan.system.as_ref()]
-        .into_iter()
-        .flatten()
-        .flat_map(|s| &s.rules)
-        .map(|r| (r.node, r.arg.to_string_lossy().into_owned()))
-        .collect()
+    [
+        plan.session.as_ref(),
+        plan.system.as_ref(),
+        plan.a11y.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .flat_map(|s| &s.rules)
+    .map(|r| (r.node, r.arg.to_string_lossy().into_owned()))
+    .collect()
 }
 
 /// One node's arguments. Arguments of one origin are collected into a
@@ -120,6 +124,8 @@ fn carries_rules(s: &Service) -> bool {
             | Service::Notify
             | Service::Tray
             | Service::Mpris { .. }
+            | Service::A11y
+            | Service::InputMethod
     )
 }
 
@@ -756,6 +762,47 @@ bwrap
         );
         assert!(
             out.contains(&"    raw socket: x11 \"host\"".to_owned()),
+            "{out:#?}"
+        );
+    }
+
+    /// Neither node puts an argument in the argv, so without the rules
+    /// beneath them both would render as grants that reached nothing.
+    #[test]
+    fn the_a11y_and_input_method_grants_show_the_rules_they_are() {
+        let cfg = cfg("dbus\na11y\ninput-method\ncommand \"true\"");
+        let lines = Lines {
+            services: vec![Some(1), Some(2), Some(3)],
+            ..Lines::default()
+        };
+        let rules = rules(&cfg, "t");
+        let out = render(
+            &[item(Origin::Command, &["--", "true"], None)],
+            &View {
+                title: "bwrap",
+                instance: "t",
+                cfg: &cfg,
+                source: Source {
+                    file: "config.kdl",
+                    lines: &lines,
+                },
+                rules: &rules,
+                proxy: false,
+                full: false,
+            },
+        )
+        .unwrap();
+        // The accessibility bus is not the session bus, and its rules
+        // are still the `a11y` node's.
+        assert!(
+            out.iter().any(|l| l.contains(
+                "rule-only: --call=org.a11y.atspi.Registry=org.a11y.atspi.Socket.Embed@"
+            )),
+            "{out:#?}"
+        );
+        assert!(
+            out.iter()
+                .any(|l| l.contains("rule-only: --talk=org.freedesktop.portal.Fcitx")),
             "{out:#?}"
         );
     }

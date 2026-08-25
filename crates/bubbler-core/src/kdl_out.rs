@@ -69,6 +69,8 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
         Service::Portals => "portals".to_owned(),
         Service::Notify => "notify".to_owned(),
         Service::Tray => "tray".to_owned(),
+        Service::A11y => "a11y".to_owned(),
+        Service::InputMethod => "input-method".to_owned(),
         Service::Hidraw => "hidraw".to_owned(),
         Service::Camera { nodes } => match nodes {
             // `#false` is the default, so only the device grant is written.
@@ -495,6 +497,8 @@ mod tests {
             gamepad hidraw=#true uinput=#true
             camera nodes=#true
             mpris name="firefox.*"
+            a11y
+            input-method
             tty "passthrough"
             userns "disable"
             seccomp {
@@ -524,6 +528,8 @@ mod tests {
         round_trip("hidraw\ngamepad hidraw=#true");
         round_trip("dbus\nportals\ncamera");
         round_trip("dbus\nportals\ncamera nodes=#true");
+        round_trip("dbus\na11y");
+        round_trip("dbus\ninput-method");
     }
 
     #[test]

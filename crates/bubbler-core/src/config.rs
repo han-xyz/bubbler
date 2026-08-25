@@ -89,6 +89,8 @@ pub const NODES: &[&str] = &[
     "notify",
     "tray",
     "mpris",
+    "a11y",
+    "input-method",
     "tty",
     "userns",
     "seccomp",
@@ -405,6 +407,25 @@ pub enum Service {
         /// element.
         name: String,
     },
+    /// The session's accessibility bus, a third bus filtered by the same
+    /// proxy: the sandbox registers itself with the AT-SPI registry and
+    /// answers the screen readers, magnifiers and on-screen keyboards
+    /// that read it, since a call *into* the sandbox is incoming and
+    /// unfiltered. The registry's `RegisterKeystrokeListener`,
+    /// `GenerateKeyboardEvent`, `GenerateMouseEvent` and `RegisterEvent`
+    /// are deliberately left out of its rules: they are every keystroke
+    /// of every accessible application and input injected into the
+    /// session, which is what makes the raw bus X11-class. Requires
+    /// [`Service::Dbus`].
+    A11y,
+    /// Talk to the two sandboxed input-method portal names,
+    /// `org.freedesktop.portal.Fcitx` and `org.freedesktop.portal.IBus`,
+    /// which carry the per-client text-input interface and nothing else.
+    /// The daemons' own names are deliberately not granted: they hold
+    /// the configuration and lifecycle methods (`Exit`, `Restart`,
+    /// `SetConfig`, `SetCurrentIM`), which is tampering and denial of
+    /// service for the whole session. Requires [`Service::Dbus`].
+    InputMethod,
     /// Share `$XDG_RUNTIME_DIR/app/<id>` with everything else that names
     /// the same id: the directory applications serve their own sockets
     /// in, so one sandbox can reach another's. One id is one trust
@@ -443,6 +464,8 @@ impl Service {
             Self::Hidraw => "hidraw",
             Self::Camera { .. } => "camera",
             Self::Mpris { .. } => "mpris",
+            Self::A11y => "a11y",
+            Self::InputMethod => "input-method",
             Self::AppRuntime { .. } => "app-runtime",
         }
     }
@@ -674,7 +697,8 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
             return Err(ConfigError::UnknownNode(name.to_owned()));
         }
         match name {
-            "dri" | "pipewire" | "pulseaudio" | "portals" | "notify" | "tray" | "hidraw" => {
+            "dri" | "pipewire" | "pulseaudio" | "portals" | "notify" | "tray" | "hidraw"
+            | "a11y" | "input-method" => {
                 reject_entries(node)?;
                 let svc = match name {
                     "dri" => Service::Dri,
@@ -684,6 +708,8 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
                     "notify" => Service::Notify,
                     "tray" => Service::Tray,
                     "hidraw" => Service::Hidraw,
+                    "a11y" => Service::A11y,
+                    "input-method" => Service::InputMethod,
                     // Unreachable through the arm above, and an error
                     // rather than a fallback: a name added to that list
                     // and forgotten here would otherwise grant whichever
@@ -966,6 +992,8 @@ fn bundle_without_dbus(services: &[Service]) -> Option<&'static str> {
         Service::Notify => Some("notify"),
         Service::Tray => Some("tray"),
         Service::Mpris { .. } => Some("mpris"),
+        Service::A11y => Some("a11y"),
+        Service::InputMethod => Some("input-method"),
         _ => None,
     })
 }
@@ -3489,6 +3517,35 @@ command "b""#
             parse("gamepad { hidraw; }"),
             Err(ConfigError::BadArgument { .. })
         ));
+    }
+
+    #[test]
+    fn a11y_and_input_method_are_bare_nodes_that_need_dbus() {
+        let c = parse("dbus\na11y\ninput-method\ncommand \"true\"").unwrap();
+        assert!(c.services.contains(&Service::A11y) && c.services.contains(&Service::InputMethod));
+        for node in ["a11y", "input-method"] {
+            // Both are carried by the proxy, so both need the bus node
+            // that starts it.
+            assert!(
+                matches!(
+                    parse(&format!("{node}\ncommand \"true\"")),
+                    Err(ConfigError::BadArgument { node: n, reason })
+                        if n == node && reason == "requires dbus"
+                ),
+                "{node}"
+            );
+            assert!(
+                matches!(
+                    parse(&format!("dbus\n{node}\n{node}\ncommand \"true\"")),
+                    Err(ConfigError::Duplicate(n)) if n == node
+                ),
+                "{node}"
+            );
+            assert!(
+                parse(&format!("dbus\n{node} x=1\ncommand \"true\"")).is_err(),
+                "{node}"
+            );
+        }
     }
 
     #[test]

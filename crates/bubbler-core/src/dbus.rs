@@ -28,6 +28,14 @@ pub const SESSION_NODE: &str = "dbus";
 /// Config node that grants the system bus, for errors about its socket.
 pub const SYSTEM_NODE: &str = "system-bus";
 
+/// File name of the accessibility bus socket, in the same two
+/// directories.
+pub const A11Y_SOCKET: &str = "a11y";
+
+/// Config node that grants the accessibility bus, for errors about its
+/// socket.
+pub const A11Y_NODE: &str = "a11y";
+
 /// Where a system bus socket lives: the host's when no address overrides
 /// it, and the path the filtered one is bound at inside the sandbox.
 // libdbus and libsystemd both compile in this path, so a sandbox that has
@@ -59,6 +67,32 @@ const PORTAL_RULES: &[&str] = &[
     "--broadcast=org.freedesktop.portal.*=@/org/freedesktop/portal/*",
 ];
 
+/// Rules the `a11y` grant gets on the accessibility bus, which is the
+/// whole of what a sandboxed client may ask that bus for: registering
+/// the application with the AT-SPI registry, and reading back what is
+/// registered so a toolkit knows whether to emit its events.
+///
+/// `RegisterKeystrokeListener`, `GenerateKeyboardEvent`,
+/// `GenerateMouseEvent` and `RegisterEvent` are deliberately absent. The
+/// bus is a peer bus with no policy of its own and offers them to every
+/// client: they are every keystroke of every accessible application and
+/// input injected into the session, which is what makes the raw bus the
+/// same class of grant as the X11 socket. What a screen reader does to
+/// the sandbox needs no rule here — calls *into* it are incoming, and
+/// `xdg-dbus-proxy(1)` filters only what the client sends.
+// The set flatpak grants a sandboxed client (`flatpak-run-dbus.c`).
+pub const A11Y_RULES: &[&str] = &[
+    "--call=org.a11y.atspi.Registry=org.a11y.atspi.Socket.Embed@/org/a11y/atspi/accessible/root",
+    "--call=org.a11y.atspi.Registry=org.a11y.atspi.Socket.Unembed@/org/a11y/atspi/accessible/root",
+    "--call=org.a11y.atspi.Registry=org.a11y.atspi.Registry.GetRegisteredEvents@/org/a11y/atspi/registry",
+    "--call=org.a11y.atspi.Registry=org.a11y.atspi.DeviceEventController.GetKeystrokeListeners@/org/a11y/atspi/registry/deviceeventcontroller",
+    "--call=org.a11y.atspi.Registry=org.a11y.atspi.DeviceEventController.GetDeviceEventListeners@/org/a11y/atspi/registry/deviceeventcontroller",
+    "--call=org.a11y.atspi.Registry=org.a11y.atspi.DeviceEventController.NotifyListenersSync@/org/a11y/atspi/registry/deviceeventcontroller",
+    "--call=org.a11y.atspi.Registry=org.a11y.atspi.DeviceEventController.NotifyListenersAsync@/org/a11y/atspi/registry/deviceeventcontroller",
+    "--broadcast=org.a11y.atspi.Registry=org.a11y.atspi.Registry.EventListenerRegistered@/org/a11y/atspi/registry",
+    "--broadcast=org.a11y.atspi.Registry=org.a11y.atspi.Registry.EventListenerDeregistered@/org/a11y/atspi/registry",
+];
+
 /// One policy argument with the node that asked for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rule {
@@ -83,14 +117,18 @@ pub struct Section {
 }
 
 /// Everything the launcher needs to run one instance's proxy. One process
-/// serves both buses (`xdg-dbus-proxy(1)`: options apply to the address
-/// they follow), so a plan exists as soon as either is granted.
+/// serves every granted bus (`xdg-dbus-proxy(1)`: options apply to the
+/// address they follow), so a plan exists as soon as one is granted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     /// The session bus, when `dbus` is granted.
     pub session: Option<Section>,
     /// The system bus, when `system-bus` is granted.
     pub system: Option<Section>,
+    /// The session's accessibility bus, when `a11y` is granted. Its
+    /// rules are [`A11Y_RULES`], never the config's: the node takes no
+    /// children and the bus has no other safe subset.
+    pub a11y: Option<Section>,
     /// Contents of `/.flatpak-info` for the proxy, and for the sandbox
     /// itself when `portals` is granted.
     pub flatpak_info: Vec<u8>,
@@ -114,12 +152,16 @@ impl Plan {
         if self.system.is_some() {
             out.push((SYSTEM_SOCKET, SYSTEM_NODE));
         }
+        if self.a11y.is_some() {
+            out.push((A11Y_SOCKET, A11Y_NODE));
+        }
         out
     }
 }
 
-/// The proxy plan for `services`, or `None` when neither bus is granted
-/// and no proxy runs at all. `instance` is a validated instance name.
+/// The proxy plan for `services`, or `None` when no bus is granted and no
+/// proxy runs at all. `a11y` is never the only bus: the parser refuses
+/// the node without `dbus`. `instance` is a validated instance name.
 pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
     let session = services.iter().enumerate().find_map(|(i, s)| match s {
         Service::Dbus { rules } => Some((i, rules)),
@@ -132,6 +174,7 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
     if session.is_none() && system.is_none() {
         return None;
     }
+    let a11y = services.iter().position(|s| *s == Service::A11y);
     let portals = services.contains(&Service::Portals);
     let session = session.map(|(node, explicit)| {
         let mut rules = explicit_rules(explicit, node);
@@ -158,6 +201,22 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
                     "--talk=org.kde.StatusNotifierWatcher".to_owned(),
                     i,
                 ),
+                // Both portal names, whichever daemon the session runs:
+                // the client libraries watch for the name and use it when
+                // the daemon's own name is not visible, which is what the
+                // proxy's filtering leaves them. The daemons' own names
+                // carry `Exit`, `SetConfig` and their kin, and are not
+                // granted.
+                Service::InputMethod => {
+                    for name in ["Fcitx", "IBus"] {
+                        push(&mut rules, format!("--talk=org.freedesktop.portal.{name}"), i);
+                    }
+                }
+                // Its rules are its own bus's, below: nothing of the
+                // grant belongs on the session bus, since the address of
+                // the accessibility bus is resolved before the sandbox
+                // starts rather than asked for from inside it.
+                Service::A11y => {}
                 Service::Mpris { name } => {
                     push(
                         &mut rules,
@@ -194,9 +253,19 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
         node,
         rules: explicit_rules(explicit, node),
     });
+    // A fixed set, with no user rules to merge: the node takes no
+    // children, and every rule is the granting node's.
+    let a11y = a11y.map(|node| {
+        let mut rules = Vec::new();
+        for r in A11Y_RULES {
+            push(&mut rules, (*r).to_owned(), node);
+        }
+        Section { node, rules }
+    });
     Some(Plan {
         session,
         system,
+        a11y,
         flatpak_info: flatpak_info(instance, portals),
         portals,
         app_id: app_id(instance),
@@ -615,6 +684,59 @@ mod tests {
         assert_eq!(session(&p), vec!["--talk=org.kde.StatusNotifierWatcher"]);
         assert!(p.system.is_none());
         assert!(!p.portals);
+    }
+
+    /// The two sandboxed portal names and nothing else: the daemons' own
+    /// names carry their configuration interfaces, which this is not.
+    #[test]
+    fn input_method_talks_the_two_portal_names_only() {
+        let p = plan(
+            &[Service::Dbus { rules: vec![] }, Service::InputMethod],
+            "t",
+        )
+        .expect("dbus is granted");
+        assert_eq!(
+            session(&p),
+            vec![
+                "--talk=org.freedesktop.portal.Fcitx",
+                "--talk=org.freedesktop.portal.IBus"
+            ]
+        );
+        let rules = &p.session.as_ref().expect("dbus is granted").rules;
+        assert!(rules.iter().all(|r| r.node == 1));
+        // The rules are the whole grant: no bus of its own.
+        assert!(p.a11y.is_none());
+    }
+
+    /// The accessibility bus is a section of its own, with the fixed
+    /// rule set and nothing of the config's in it.
+    #[test]
+    fn a11y_is_a_third_bus_with_the_fixed_allowlist() {
+        let p =
+            plan(&[Service::Dbus { rules: vec![] }, Service::A11y], "t").expect("dbus is granted");
+        let a = p.a11y.as_ref().expect("a11y is granted");
+        assert_eq!(a.node, 1);
+        assert!(a.rules.iter().all(|r| r.node == 1));
+        let rules = args(&a.rules);
+        assert_eq!(rules, A11Y_RULES);
+        // What the grant is for: the app registers itself with the
+        // registry and reads back what is registered.
+        assert!(rules.iter().any(|r| r.contains("Socket.Embed@")));
+        // What the same bus would otherwise offer it: every keystroke of
+        // every accessible application, and input injection into the
+        // session.
+        assert!(!rules.iter().any(|r| {
+            r.contains("RegisterKeystrokeListener")
+                || r.contains("GenerateKeyboardEvent")
+                || r.contains("GenerateMouseEvent")
+                || r.contains("RegisterEvent")
+        }));
+        // Nothing of it reaches the session bus.
+        assert!(session(&p).is_empty());
+        assert_eq!(
+            p.buses(),
+            vec![(SESSION_SOCKET, SESSION_NODE), (A11Y_SOCKET, A11Y_NODE)]
+        );
     }
 
     #[test]

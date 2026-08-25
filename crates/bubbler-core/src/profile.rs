@@ -764,6 +764,8 @@ impl Merged {
             | Service::Portals
             | Service::Notify
             | Service::Tray
+            | Service::A11y
+            | Service::InputMethod
             | Service::Hidraw
             | Service::EtcShare { .. } => {
                 if self.services.iter().any(|(s, _)| s == svc) {

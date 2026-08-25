@@ -256,6 +256,30 @@ pub static GRANTS: &[Grant] = &[
         grammar: "mpris name=\"<suffix>\"",
     },
     Grant {
+        node: "a11y",
+        summary: "the session's accessibility bus, which is how a screen reader reads this app",
+        cost: "Assistive tools on the host can read and drive this app\'s widgets; the app \
+               can register itself and nothing else: the keystroke listener and \
+               input-injection calls the same bus offers are not in its rules, so it \
+               cannot read what you type into your other windows or type into them. The \
+               bus itself has no per-client policy, which is why the rule set is fixed \
+               and the node takes nothing. Requires `dbus`.",
+        risk: Risk::Narrow,
+        grammar: "a11y",
+    },
+    Grant {
+        node: "input-method",
+        summary: "fcitx5 and IBus over their sandboxed portal names",
+        cost: "The input method daemon gets the keys typed into this app\'s text fields, \
+               through the portal name that carries no configuration or control \
+               interface: the daemons\' own names, which can reconfigure, restart or stop \
+               them for the whole session, are not granted. On Wayland the compositor \
+               already handles input methods with no grant at all; this is the bus path \
+               that toolkit IM modules and Xwayland clients take. Requires `dbus`.",
+        risk: Risk::Narrow,
+        grammar: "input-method",
+    },
+    Grant {
         node: "tty",
         summary: "how the sandbox's stdio reaches your terminal",
         cost: "`pty` is the default: bubbler allocates a pseudoterminal, relays it, and the \
@@ -364,6 +388,8 @@ mod tests {
         ("notify", "notify"),
         ("tray", "tray"),
         ("mpris", "mpris name=\"example\""),
+        ("a11y", "a11y"),
+        ("input-method", "input-method"),
         ("tty", "tty \"none\""),
         ("userns", "userns \"disable\""),
         ("seccomp", "seccomp { disable }"),

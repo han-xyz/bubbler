@@ -45,6 +45,8 @@ pub const GRANTS: &[&str] = &[
     "portals",
     "notify",
     "tray",
+    "a11y",
+    "input-method",
     "gamepad",
     "hidraw",
     "camera",
@@ -199,6 +201,8 @@ fn grant_service(name: &str) -> Option<Service> {
         "portals" => Service::Portals,
         "notify" => Service::Notify,
         "tray" => Service::Tray,
+        "a11y" => Service::A11y,
+        "input-method" => Service::InputMethod,
         "gamepad" => Service::Gamepad {
             hidraw: false,
             uinput: false,
