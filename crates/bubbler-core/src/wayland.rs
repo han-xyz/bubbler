@@ -51,6 +51,7 @@ use crate::config::{Clipboard, WaylandMode};
 use crate::env::Env;
 use crate::error::LaunchError;
 use crate::host::Host;
+use crate::init_bin::{self, Found};
 
 /// Sandbox engine name bubbler identifies itself to compositors by. It
 /// pairs with the application id: the two together name an application.
@@ -81,45 +82,24 @@ pub const PROXY_BIN: &str = "/usr/lib/bubbler/bubbler-wl-proxy";
 // the proxy forwards.
 include!("../../bubbler-wl-proxy/src/privileged.rs");
 
-/// Host path of the proxy binary: [`Env::wl_proxy_override`]
-/// (`$BUBBLER_WL_PROXY`), else next to the running executable, else
-/// [`PROXY_BIN`]. The same order `bubbler-init` is found in, and for the
-/// same reason: a build tree runs what it just built without being told
-/// where it is.
+/// Host path of the proxy binary and where it was found:
+/// [`Env::wl_proxy_override`] (`$BUBBLER_WL_PROXY`), else next to the
+/// running executable, else [`PROXY_BIN`]. The same lookup
+/// `bubbler-init` gets, and for the same reason: a build tree runs what
+/// it just built without being told where it is.
 ///
-/// Must be a regular file; an override that is not one is an error,
-/// never a silent fallback to another binary. A run cannot go on
-/// without it — the application would connect to a socket nothing
-/// accepts on — so this fails the launch rather than warning.
-pub fn locate_proxy(env: &Env, host: &dyn Host) -> Result<PathBuf, LaunchError> {
-    if let Some(p) = &env.wl_proxy_override {
-        return check_proxy(p.clone(), host);
-    }
-    if let Some(sibling) = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(PROXY_NAME)))
-        && host.file_type(&sibling).is_some_and(|t| t.is_file())
-    {
-        return Ok(sibling);
-    }
-    check_proxy(PathBuf::from(PROXY_BIN), host)
-}
-
-/// `Ok` for a regular file, `WrongType` for anything else that exists
-/// and `MissingResource` for nothing at all.
-fn check_proxy(path: PathBuf, host: &dyn Host) -> Result<PathBuf, LaunchError> {
-    match host.file_type(&path) {
-        Some(t) if t.is_file() => Ok(path),
-        Some(_) => Err(LaunchError::WrongType {
-            service: "wayland",
-            path,
-            expected: "a regular file",
-        }),
-        None => Err(LaunchError::MissingResource {
-            service: "wayland",
-            path,
-        }),
-    }
+/// The [`Found`] half is what says whether the sidecar's sandbox has to
+/// bind the binary in. A run cannot go on without one — the application
+/// would connect to a socket nothing accepts on — so a missing binary
+/// fails the launch rather than warning.
+pub fn locate_proxy(env: &Env, host: &dyn Host) -> Result<(PathBuf, Found), LaunchError> {
+    init_bin::locate_binary(
+        env.wl_proxy_override.as_deref(),
+        PROXY_NAME,
+        PROXY_BIN,
+        "wayland",
+        host,
+    )
 }
 
 /// Which Wayland socket a run binds into the sandbox.
@@ -435,7 +415,7 @@ mod tests {
             .with("/build/adir", dir);
         assert_eq!(
             locate_proxy(&env(Some("/build/bubbler-wl-proxy".into())), &host).unwrap(),
-            PathBuf::from("/build/bubbler-wl-proxy")
+            (PathBuf::from("/build/bubbler-wl-proxy"), Found::Override)
         );
         assert!(matches!(
             locate_proxy(&env(Some("/build/adir".into())), &host),
@@ -462,7 +442,7 @@ mod tests {
         let host = crate::host::fake::FakeHost::default().with(PROXY_BIN, file);
         assert_eq!(
             locate_proxy(&env(None), &host).unwrap(),
-            PathBuf::from(PROXY_BIN)
+            (PathBuf::from(PROXY_BIN), Found::Installed)
         );
         assert!(matches!(
             locate_proxy(&env(None), &crate::host::fake::FakeHost::default()),
@@ -484,7 +464,10 @@ mod tests {
         let host = crate::host::fake::FakeHost::default()
             .with(&sibling.to_string_lossy(), file)
             .with(PROXY_BIN, file);
-        assert_eq!(locate_proxy(&env(None), &host).unwrap(), sibling);
+        assert_eq!(
+            locate_proxy(&env(None), &host).unwrap(),
+            (sibling, Found::Sibling)
+        );
     }
 
     /// Pinned: the list is a denylist, and an entry lost to an edit is a

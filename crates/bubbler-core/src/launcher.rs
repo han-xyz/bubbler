@@ -654,7 +654,7 @@ fn wl_proxy_args(
 ) -> Result<(BwrapArgs, Vec<(OsString, Origin)>), LaunchError> {
     let listen = alloc.listener().map_err(LaunchError::Data)?;
     let ready = alloc.ready_pipe().map_err(LaunchError::Data)?;
-    let program = wayland::locate_proxy(env, host)?;
+    let (program, found) = wayland::locate_proxy(env, host)?;
     let command: Vec<(OsString, Origin)> = plan
         .command_nodes(&program, node, &listen, &ready)
         .into_iter()
@@ -668,11 +668,12 @@ fn wl_proxy_args(
     if let Some(program) = seccomp::compile(&seccomp::RuleSet::default_set(), env.seccomp_log)? {
         args.add_seccomp(program.bytes, program.arches);
     }
-    // A binary out of a build tree — an override, or the one beside a
-    // `bubbler` that is not installed — is bound in at its own path.
-    // One under the read-only `/usr` this sandbox already has needs no
-    // bind, and bwrap would refuse a destination in there anyway.
-    if !program.starts_with("/usr") {
+    // Where the binary was found is what says whether it is reachable
+    // from in here: the installed one is under the read-only `/usr` this
+    // sandbox already has, and bwrap would refuse a destination in there
+    // anyway. An override or a build tree's copy is bound in at its own
+    // path.
+    if found != init_bin::Found::Installed {
         args.tag(Origin::Command);
         args.ro_bind(&program, &program);
     }
@@ -750,6 +751,18 @@ fn wait_ready(ready: &OwnedFd, child: &mut Child, deadline: Instant) -> bool {
     }
 }
 
+/// Whether `child` is still a process of this run's, and so still one to
+/// signal.
+///
+/// A sidecar that has already been reaped — by the run's own check, or
+/// by a readiness wait giving up on it — is not: that pid names whatever
+/// the kernel has handed it to since, and a signal would go to a
+/// stranger. `try_wait` answers from the status it cached the first
+/// time, so a reaping anywhere in the run is caught here.
+fn still_running(child: &mut Child) -> bool {
+    !matches!(child.try_wait(), Ok(Some(_)))
+}
+
 /// A run's Wayland sidecar: the proxy the application connects to, the
 /// socket it accepts on, and, where the compositor took one, the
 /// security context it forwards through.
@@ -779,12 +792,7 @@ impl Drop for WaylandHandle {
     /// inside it down with it; nothing else can, since the proxy holds
     /// no pipe of bubbler's it could see hang up.
     fn drop(&mut self) {
-        // A sidecar that has already been reaped — by the readiness wait
-        // giving up on it — is not signalled: that pid names whatever the
-        // kernel has handed it to since. `try_wait` answers from the
-        // status it cached the first time, so a reaping anywhere in the
-        // run is caught here.
-        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+        if still_running(&mut self.child) {
             if let Some(pid) = i32::try_from(self.child.id()).ok().and_then(Pid::from_raw) {
                 let _ = kill_process(pid, Signal::TERM);
             }
@@ -1097,12 +1105,10 @@ impl Drop for PastaHandle {
     /// does not pass `--no-netns-quit`), but a sidecar with a route out of
     /// the host must not be left to a condition bubbler does not control.
     fn drop(&mut self) {
-        // A sidecar that has already been reaped — by the run's own
-        // check, or by the readiness wait giving up on it — is not
-        // signalled: that pid names whatever the kernel has handed it to
-        // since. `try_wait` answers from the status it cached the first
-        // time, so a reaping anywhere in the run is caught here.
-        if self.exited || matches!(self.child.try_wait(), Ok(Some(_))) {
+        // A sidecar the run has already reaped is not signalled
+        // ([`still_running`]); `exited` is the run's own check having
+        // seen it go.
+        if self.exited || !still_running(&mut self.child) {
             return;
         }
         if let Some(pid) = i32::try_from(self.child.id()).ok().and_then(Pid::from_raw) {
@@ -3037,27 +3043,41 @@ mod tests {
     }
 
     /// A sidecar that failed to start has already been reaped by the
-    /// readiness wait, and the handle must not signal that pid: by then
+    /// readiness wait, and neither handle may signal that pid: by then
     /// the kernel may have handed it to something else.
     ///
-    /// That the signal is not sent cannot be observed from inside this
-    /// process — a `kill` of a reaped pid is an ignored `ESRCH` — so
-    /// what is pinned is the guard's precondition and its effect on the
-    /// drop: the child is already `Some` before the handle is built, and
-    /// the drop neither waits for it nor takes the kill deadline.
+    /// The decision itself is [`still_running`], and that is what this
+    /// asserts, because the drop's use of it is invisible from in here:
+    /// a `kill` of a reaped pid is an ignored `ESRCH`, so deleting the
+    /// guard changes nothing this process can see. A mutation of
+    /// `still_running` — a constant either way, or the `try_wait`
+    /// without its negation — fails one of the four assertions below.
     #[test]
     fn a_reaped_proxy_is_not_signalled_when_the_handle_drops() {
         let tmp = tempfile::tempdir().unwrap();
         let socket = tmp.path().join("wayland");
         std::fs::write(&socket, b"").unwrap();
+        let mut live = Command::new("/usr/bin/sleep").arg("600").spawn().unwrap();
+        assert!(
+            still_running(&mut live),
+            "a running sidecar is one to signal"
+        );
+        let _ = live.kill();
+        let _ = live.wait();
+        assert!(!still_running(&mut live), "and a killed one is not");
+
         let mut child = Command::new("/usr/bin/true").spawn().unwrap();
         // What the readiness wait does to a sidecar that exits instead of
         // reporting: it is reaped here, and the pid stops being its own.
         let deadline = Instant::now() + PROXY_READY;
-        while !matches!(child.try_wait(), Ok(Some(_))) {
+        while still_running(&mut child) {
             assert!(Instant::now() < deadline, "/usr/bin/true never exited");
             std::thread::sleep(POLL);
         }
+        assert!(
+            !still_running(&mut child),
+            "the cached status answers every later call"
+        );
         let handle = WaylandHandle {
             child,
             alloc: RealAlloc::sidecar(),

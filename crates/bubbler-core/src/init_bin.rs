@@ -1,11 +1,15 @@
-//! Where the host copy of `bubbler-init` is. Every sandbox runs under it,
-//! so a run that cannot find it fails before bwrap is spawned.
+//! Where the host copies of bubbler's own binaries are: the
+//! `bubbler-init` supervisor every sandbox runs under, and — through
+//! [`locate_binary`] — the `bubbler-wl-proxy` sidecar a sandboxed
+//! `wayland` is served through. A run that cannot find one fails before
+//! bwrap is spawned.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::env::Env;
 use crate::error::LaunchError;
 use crate::host::Host;
+use crate::service;
 
 /// File name of the supervisor binary.
 pub const NAME: &str = "bubbler-init";
@@ -13,39 +17,57 @@ pub const NAME: &str = "bubbler-init";
 /// Where a packaged bubbler installs the supervisor.
 pub const INSTALLED: &str = "/usr/lib/bubbler/bubbler-init";
 
-/// `Ok` for a regular file, `WrongType` for anything else that exists and
-/// `MissingResource` for nothing at all.
-fn check(path: PathBuf, host: &dyn Host) -> Result<PathBuf, LaunchError> {
-    match host.file_type(&path) {
-        Some(t) if t.is_file() => Ok(path),
-        Some(_) => Err(LaunchError::WrongType {
-            service: "init",
-            path,
-            expected: "a regular file",
-        }),
-        None => Err(LaunchError::MissingResource {
-            service: "init",
-            path,
-        }),
-    }
+/// Which of the three places a binary of bubbler's was found in.
+///
+/// It is what decides whether a sandbox that runs the binary has to have
+/// it bound in: the installed path is under the read-only `/usr` every
+/// sandbox already has, while an override and a build tree's copy are
+/// wherever the user put them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Found {
+    /// The environment named it (`$BUBBLER_INIT`, `$BUBBLER_WL_PROXY`).
+    Override,
+    /// Beside the running executable, which is what a build tree has.
+    Sibling,
+    /// Where the package installs it.
+    Installed,
 }
 
-/// Host path of `bubbler-init`: [`Env::init_override`] (`$BUBBLER_INIT`),
-/// else next to the running executable, else [`INSTALLED`]. Must be a
-/// regular file; an override that is not one is an error, never a
-/// silent fallback to another binary.
-pub fn locate(env: &Env, host: &dyn Host) -> Result<PathBuf, LaunchError> {
-    if let Some(p) = &env.init_override {
-        return check(p.clone(), host);
+/// Host path of one of bubbler's own binaries and where it was found:
+/// `over` when the environment names one, else `name` next to the
+/// running executable, else `installed`.
+///
+/// Must be a regular file; an override that is not one is an error,
+/// never a silent fallback to another binary. `service` names the grant
+/// a failure is reported against.
+pub fn locate_binary(
+    over: Option<&Path>,
+    name: &str,
+    installed: &str,
+    service: &'static str,
+    host: &dyn Host,
+) -> Result<(PathBuf, Found), LaunchError> {
+    if let Some(p) = over {
+        let path = service::require_file(host, service, p.to_path_buf())?;
+        return Ok((path, Found::Override));
     }
     if let Some(sibling) = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(NAME)))
+        .and_then(|exe| exe.parent().map(|dir| dir.join(name)))
         && host.file_type(&sibling).is_some_and(|t| t.is_file())
     {
-        return Ok(sibling);
+        return Ok((sibling, Found::Sibling));
     }
-    check(PathBuf::from(INSTALLED), host)
+    let path = service::require_file(host, service, PathBuf::from(installed))?;
+    Ok((path, Found::Installed))
+}
+
+/// Host path of `bubbler-init`: [`Env::init_override`] (`$BUBBLER_INIT`),
+/// else next to the running executable, else [`INSTALLED`]. Where it was
+/// found does not matter here — the supervisor is bound into every
+/// sandbox at [`crate::bwrap::INIT_INSIDE`] wherever it came from.
+pub fn locate(env: &Env, host: &dyn Host) -> Result<PathBuf, LaunchError> {
+    locate_binary(env.init_override.as_deref(), NAME, INSTALLED, "init", host).map(|(p, _)| p)
 }
 
 #[cfg(test)]
