@@ -388,6 +388,17 @@ const USB_ALL_GRANT: &str = "raw I/O to every USB device on this host, the direc
 const SMARTCARD_GRANT: &str = "every reader and card pcscd has, at the level of the APDUs a card \
                                answers; no device node is bound";
 
+/// Where usbfs puts a device, and so the path `service::usb` binds for
+/// one it matched: this directory, the bus number, the device number,
+/// each of the two zero-padded to [`USB_NODE_DIGITS`] decimal digits.
+/// The shape is written there and read back here, and
+/// [`usb_matched`] shows a path of any other shape as it is rather than
+/// reading numbers out of it that are not there.
+const USB_NODE_DIR: &str = "/dev/bus/usb/";
+
+/// Digits `service::usb` pads a bus or device number to.
+const USB_NODE_DIGITS: usize = 3;
+
 /// The devices a filtered `usb` node resolved to, as the ids the node
 /// named against the bus and device number they were found at.
 ///
@@ -397,15 +408,33 @@ const SMARTCARD_GRANT: &str = "every reader and card pcscd has, at the level of 
 /// than the operation in front of it, so a node bound with `-try` — as
 /// one whose device may be unplugged before the exec is — reads the
 /// same. A node that named a vendor alone matched every product of it,
-/// which is what the `*` stands for; one that matched nothing bound no
-/// such path, and the line then says what the launch said on stderr.
+/// which is what the `*` stands for.
+///
+/// A device path that is not [`USB_NODE_DIR`]`BBB/DDD` is listed as it
+/// is: the node did bind that device, and the no-match line below would
+/// be a false statement about this host. Only a node that bound no
+/// device at all gets that line, which is what the launch warned.
 fn usb_matched(vendor: &str, product: Option<&str>, items: &[&Explained]) -> Vec<String> {
     let id = format!("{vendor}:{}", product.unwrap_or("*"));
+    let padded = |n: &str| n.len() == USB_NODE_DIGITS && n.bytes().all(|b| b.is_ascii_digit());
     let found: Vec<String> = items
         .iter()
-        .filter_map(|i| i.args.get(1)?.to_str()?.strip_prefix("/dev/bus/usb/"))
-        .filter_map(|node| node.split_once('/'))
-        .map(|(bus, dev)| format!("{id} at bus {bus} device {dev}"))
+        .filter_map(|i| i.args.get(1)?.to_str())
+        // The device nodes only: the sysfs directory beside each of them
+        // is that same device again, and `/sys/bus/usb` is shared with
+        // the other filtered nodes.
+        .filter(|p| p.starts_with("/dev/"))
+        .map(|path| {
+            match path
+                .strip_prefix(USB_NODE_DIR)
+                .and_then(|rest| rest.split_once('/'))
+            {
+                Some((bus, dev)) if padded(bus) && padded(dev) => {
+                    format!("{id} at bus {bus} device {dev}")
+                }
+                _ => path.to_owned(),
+            }
+        })
         .collect();
     if !found.is_empty() {
         return found;
@@ -1159,9 +1188,18 @@ bwrap
             },
         )
         .unwrap();
-        assert!(
-            out.contains(&format!("    grants: {USB_ALL_GRANT}")),
-            "{out:#?}"
+        assert_eq!(
+            out.join("\n"),
+            format!(
+                "\
+bwrap
+
+  usb  3 arguments
+    --dev-bind /dev/bus/usb /dev/bus/usb
+    grants: {USB_ALL_GRANT}
+
+3 arguments in 1 group"
+            )
         );
     }
 
@@ -1262,25 +1300,79 @@ bwrap
         .unwrap();
         // The ids as the node wrote them, so a vendor-only node reads as
         // the every-product filter it is; the numbers come back out of
-        // the usbfs path the argument holds.
-        assert!(
-            out.contains(&"    matched: 1532:0531 at bus 001 device 004".to_owned()),
-            "{out:#?}"
+        // the usbfs paths the arguments hold, a second device of one
+        // node aligned under the first. The node that matched nothing
+        // produced no argument to be found under, and the line is its
+        // whole grant.
+        assert_eq!(
+            out.join("\n"),
+            "\
+bwrap
+
+  usb vendor=\"1532\" product=\"0531\"  config.kdl:1  9 arguments
+    --ro-bind /sys/bus/usb /sys/bus/usb
+    --dev-bind-try /dev/bus/usb/001/004 /dev/bus/usb/001/004
+    --ro-bind /sys/devices/pci0000:00/usb1/1-8 /sys/devices/pci0000:00/usb1/1-8
+    matched: 1532:0531 at bus 001 device 004
+
+  usb vendor=\"0b05\"                 config.kdl:2  12 arguments
+    --dev-bind-try /dev/bus/usb/001/003 /dev/bus/usb/001/003
+    --ro-bind /sys/devices/pci0000:00/usb1/1-7 /sys/devices/pci0000:00/usb1/1-7
+    --dev-bind-try /dev/bus/usb/005/002 /dev/bus/usb/005/002
+    --ro-bind /sys/devices/pci0000:00/usb5/5-1 /sys/devices/pci0000:00/usb5/5-1
+    matched: 0b05:* at bus 001 device 003
+             0b05:* at bus 005 device 002
+
+  usb vendor=\"ffff\" product=\"ffff\"  config.kdl:3  0 arguments
+    matched: no device matches vendor=ffff product=ffff
+
+21 arguments in 3 groups"
         );
-        // Two devices of one node, the second aligned under the first.
-        assert!(
-            out.contains(&"    matched: 0b05:* at bus 001 device 003".to_owned()),
-            "{out:#?}"
+    }
+
+    /// The shape `service::usb` writes a matched device's node in and
+    /// this module reads it back out of: `/dev/bus/usb/BBB/DDD`, both
+    /// numbers padded to three digits. A device path of any other shape
+    /// is listed as it is — the node did bind a device, and the no-match
+    /// line would be a false statement about the host — so a change to
+    /// the shape on either side shows up as a path here rather than as a
+    /// sandbox that looks empty.
+    ///
+    /// The end-to-end half of this, against the argv `service::usb`
+    /// really builds, is `explain_says_what_the_hardware_grants_reach`
+    /// in the CLI suite, which runs wherever the host has a USB device.
+    #[test]
+    fn a_usb_node_path_of_another_shape_is_listed_as_it_is() {
+        let bind = |path: &str| item(Origin::Service(0), &["--dev-bind-try", path, path], None);
+        // Written as `service::usb` writes it, out of the two numbers
+        // sysfs holds for a device.
+        let (busnum, devnum) = (1u16, 4u16);
+        let node = format!("{USB_NODE_DIR}{busnum:0USB_NODE_DIGITS$}/{devnum:0USB_NODE_DIGITS$}");
+        assert_eq!(node, "/dev/bus/usb/001/004");
+        let bound = bind(&node);
+        assert_eq!(
+            usb_matched("1532", Some("0531"), &[&bound]),
+            ["1532:0531 at bus 001 device 004"]
         );
-        assert!(
-            out.contains(&"             0b05:* at bus 005 device 002".to_owned()),
-            "{out:#?}"
+        // Anything else under `/dev` is a device this cannot name.
+        for other in [
+            "/dev/bus/usb/1/4",
+            "/dev/bus/usb/0001/0004",
+            "/dev/bus/usb/001",
+            "/dev/usbdev1.4",
+        ] {
+            let bound = bind(other);
+            assert_eq!(usb_matched("1532", Some("0531"), &[&bound]), [other]);
+        }
+        // A node that bound no device at all: the sysfs half is not one.
+        let sysfs = item(
+            Origin::Service(0),
+            &["--ro-bind", "/sys/bus/usb", "/sys/bus/usb"],
+            None,
         );
-        // The node that matched nothing is the one whose whole grant is
-        // this line: it produced no argument to be found under.
-        assert!(
-            out.contains(&"    matched: no device matches vendor=ffff product=ffff".to_owned()),
-            "{out:#?}"
+        assert_eq!(
+            usb_matched("1532", None, &[&sysfs]),
+            ["no device matches vendor=1532"]
         );
     }
 

@@ -1877,7 +1877,7 @@ fn real_bwrap_dri_hands_over_the_hosts_nvidia_stack() {
 
 /// One USB device as sysfs reports it: the two ids a filtered `usb` node
 /// is resolved against, and the numbers the usbfs node is named by.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct UsbDevice {
     vendor: String,
     product: String,
@@ -1926,12 +1926,26 @@ fn host_usb_devices() -> Vec<UsbDevice> {
     out
 }
 
-/// A device whose ids no other device here reports, so a node naming
-/// those two can match nothing else. `None`, with the skip printed,
-/// where every device shares its ids with another: two identical root
-/// hubs are the ordinary case.
-fn a_unique_usb_device() -> Option<UsbDevice> {
-    let all = host_usb_devices();
+/// Whether this host still has the devices `before` holds, with the
+/// skip printed when it does not.
+///
+/// A device plugged in or pulled out while the sandbox ran changes what
+/// belongs inside it, and a test that asserted through that would be
+/// reporting the hotplug as a broken bind. Read from sysfs, which is
+/// what the grant itself is resolved against.
+fn usb_unchanged(before: &[UsbDevice]) -> bool {
+    let same = host_usb_devices() == before;
+    if !same {
+        say("skipping: a USB device came or went while the sandbox ran");
+    }
+    same
+}
+
+/// A device in `all` whose ids no other device there reports, so a node
+/// naming those two can match nothing else. `None`, with the skip
+/// printed, where every device shares its ids with another: two
+/// identical root hubs are the ordinary case.
+fn a_unique_usb_device(all: &[UsbDevice]) -> Option<UsbDevice> {
     let one = all
         .iter()
         .find(|d| all.iter().filter(|o| o.id() == d.id()).count() == 1)
@@ -1962,22 +1976,25 @@ fn real_usb_lists_devices_inside() {
     }
     let Some(init) = real_init() else { return };
     let tmp = setup();
+    let before = host_usb_devices();
     let out = bubbler_live(tmp.path(), &init)
         .args(["try", "--grant", "usb", "--", LSUSB])
         .output()
         .unwrap();
+    // Before anything is asserted: the host's device list is the whole
+    // expectation, and one that changed under the run is a hotplug.
+    if !usb_unchanged(&before) {
+        return;
+    }
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{err}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.lines().any(|l| l.starts_with("Bus ")), "{stdout}");
-    // The host's own listing through the same program: the directory is
-    // bound, so neither side may hold a device the other does not.
-    let host = Command::new(LSUSB).output().unwrap();
-    assert_eq!(
-        lsusb_ids(&stdout),
-        lsusb_ids(&String::from_utf8_lossy(&host.stdout)),
-        "{stdout}"
-    );
+    // The directory is bound, so neither side may hold a device the
+    // other does not.
+    let mut host: Vec<String> = before.iter().map(UsbDevice::id).collect();
+    host.sort_unstable();
+    assert_eq!(lsusb_ids(&stdout), host, "{stdout}");
 }
 
 /// The filtered form is resolved against sysfs at launch and binds one
@@ -1988,7 +2005,8 @@ fn real_usb_filter_binds_only_the_named_device() {
         return;
     }
     let Some(init) = real_init() else { return };
-    let Some(device) = a_unique_usb_device() else {
+    let before = host_usb_devices();
+    let Some(device) = a_unique_usb_device(&before) else {
         return;
     };
     let tmp = setup();
@@ -2009,7 +2027,7 @@ fn real_usb_filter_binds_only_the_named_device() {
     )
     .unwrap();
 
-    let out = bubbler_live(tmp.path(), &init)
+    let listed = bubbler_live(tmp.path(), &init)
         .args([
             "run",
             name.as_str(),
@@ -2020,22 +2038,27 @@ fn real_usb_filter_binds_only_the_named_device() {
         ])
         .output()
         .unwrap();
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "{err}");
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        format!("{}\n", device.node())
-    );
-
     // libusb walks the same directory, so the listing inside is that one
     // device: the others' bus entries point at nodes which are not there.
-    let out = bubbler_live(tmp.path(), &init)
+    let inside = bubbler_live(tmp.path(), &init)
         .args(["run", name.as_str(), "--", LSUSB])
         .output()
         .unwrap();
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "{err}");
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Both runs first: the device numbers the node was resolved to are
+    // where the device was plugged in, so a hotplug under either run is
+    // a skip rather than a failure.
+    if !usb_unchanged(&before) {
+        return;
+    }
+    let err = String::from_utf8_lossy(&listed.stderr);
+    assert!(listed.status.success(), "{err}");
+    assert_eq!(
+        String::from_utf8_lossy(&listed.stdout),
+        format!("{}\n", device.node())
+    );
+    let err = String::from_utf8_lossy(&inside.stderr);
+    assert!(inside.status.success(), "{err}");
+    let stdout = String::from_utf8_lossy(&inside.stdout);
     assert_eq!(lsusb_ids(&stdout), vec![device.id()], "{stdout}");
 }
 
@@ -2202,8 +2225,18 @@ fn explain_says_what_the_hardware_grants_reach() {
         assert!(out.status.success(), "{config}: {err}");
         String::from_utf8_lossy(&out.stdout).into_owned()
     };
+    // Each grant is explained only where this host has what it binds,
+    // so a machine with USB devices and no AMD GPU still checks the
+    // parts it can. The probe above each says why; this says which part
+    // went unchecked, so a run of skips is readable.
+    let part = |name: &str, available: bool| {
+        if !available {
+            say(&format!("skipping: the {name} part of this explanation"));
+        }
+        available
+    };
 
-    if require_kfd() && Path::new("/dev/dri").is_dir() {
+    if part("compute", require_kfd() && Path::new("/dev/dri").is_dir()) {
         let out = explained("dri\ncompute\ncommand \"/usr/bin/true\"\n");
         assert!(
             out.contains("\n    --dev-bind /dev/kfd /dev/kfd\n"),
@@ -2214,18 +2247,28 @@ fn explain_says_what_the_hardware_grants_reach() {
             "{out}"
         );
     }
-    if Path::new("/dev/bus/usb").is_dir() {
+    if part("bare usb", Path::new("/dev/bus/usb").is_dir()) {
         let out = explained("usb\ncommand \"/usr/bin/true\"\n");
         assert!(
             out.contains("\n    grants: raw I/O to every USB device on this host"),
             "{out}"
         );
     }
-    if let Some(device) = a_unique_usb_device() {
+    let before = host_usb_devices();
+    let device = a_unique_usb_device(&before);
+    if part("filtered usb", device.is_some()) {
+        let device = device.expect("the part is guarded on there being one");
         let out = explained(&format!(
             "usb vendor=\"{}\" product=\"{}\"\ncommand \"/usr/bin/true\"\n",
             device.vendor, device.product
         ));
+        // The bus and device numbers are where the device is plugged in,
+        // so an explanation taken across a hotplug names another node.
+        if !usb_unchanged(&before) {
+            return;
+        }
+        // The shape `service::usb` binds and `explain::usb_matched`
+        // reads back, against a device this host really has.
         assert!(
             out.contains(&format!(
                 "\n    matched: {} at bus {:03} device {:03}\n",
@@ -2236,7 +2279,7 @@ fn explain_says_what_the_hardware_grants_reach() {
             "{out}"
         );
     }
-    if require_pcscd() {
+    if part("smartcard", require_pcscd()) {
         let out = explained("smartcard\ncommand \"/usr/bin/true\"\n");
         assert!(
             out.contains("\n    grants: every reader and card pcscd has"),
