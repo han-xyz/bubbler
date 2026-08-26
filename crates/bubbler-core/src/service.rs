@@ -80,6 +80,10 @@ pub fn apply_all(
             // the same grant written the older way: one bind, whether the
             // config holds one node or both.
             Service::Hidraw => {}
+            // Task 2: the device and socket binds of the three hardware
+            // grants. Listed here so the match stays exhaustive and the
+            // config side of them is usable on its own.
+            Service::Compute | Service::Usb { .. } | Service::Smartcard => {}
             // Rule-only bundles: they reach the sandbox through the proxy
             // the launcher starts, not through bwrap arguments.
             Service::Notify | Service::Tray | Service::Mpris { .. } => {}

@@ -76,10 +76,13 @@ pub const NODES: &[&str] = &[
     "x11",
     "network",
     "dri",
+    "compute",
     "pipewire",
     "pulseaudio",
     "gamepad",
     "hidraw",
+    "usb",
+    "smartcard",
     "camera",
     "home-share",
     "path-share",
@@ -351,6 +354,11 @@ pub enum Service {
     /// `/sys` entries a userspace driver reads to match a node to its
     /// hardware.
     Dri,
+    /// GPU compute on the AMD kernel driver: the `/dev/kfd` node every
+    /// AMD GPU on the machine is reached through, and the KFD and CPU
+    /// topology in `/sys` a compute runtime reads to find them. Requires
+    /// [`Service::Dri`], whose render nodes the topology names.
+    Compute,
     /// Access to the host PipeWire socket.
     Pipewire,
     /// Access to the host PulseAudio socket.
@@ -416,6 +424,23 @@ pub enum Service {
     /// hardware wallet or a controller driven through hidapi is opened
     /// through. `gamepad hidraw=#true` grants the same thing.
     Hidraw,
+    /// Raw USB device I/O: the `/dev/bus/usb` nodes a libusb client
+    /// opens, and the `/sys` descriptors it reads to find them. A bare
+    /// node is every device the host has at launch; the ids narrow it to
+    /// the devices that report them.
+    Usb {
+        /// `idVendor` as sysfs writes it: four lower-case hex digits.
+        /// `None` is every vendor, which is the bare node.
+        vendor: Option<String>,
+        /// `idProduct` in the same form, and never without a `vendor`:
+        /// a product id alone is that number from every vendor that ever
+        /// used it.
+        product: Option<String>,
+    },
+    /// Smart cards through the host's `pcscd`: its socket, and no device
+    /// node at all. The sandbox reaches every reader and card the daemon
+    /// has, at the level of the APDUs a card answers.
+    Smartcard,
     /// Cameras through `org.freedesktop.portal.Camera`, which needs no
     /// device in the sandbox: the portal opens the node in the host
     /// daemon and hands back a connected PipeWire socket. Requires
@@ -478,6 +503,7 @@ impl Service {
             Self::X11(_) => "x11",
             Self::Network(_) => "network",
             Self::Dri => "dri",
+            Self::Compute => "compute",
             Self::Pipewire => "pipewire",
             Self::Pulseaudio => "pulseaudio",
             Self::HomeShare { .. } => "home-share",
@@ -490,6 +516,8 @@ impl Service {
             Self::Tray => "tray",
             Self::Gamepad { .. } => "gamepad",
             Self::Hidraw => "hidraw",
+            Self::Usb { .. } => "usb",
+            Self::Smartcard => "smartcard",
             Self::Camera { .. } => "camera",
             Self::Mpris { .. } => "mpris",
             Self::A11y => "a11y",
@@ -725,11 +753,13 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
             return Err(ConfigError::UnknownNode(name.to_owned()));
         }
         match name {
-            "dri" | "pipewire" | "pulseaudio" | "portals" | "notify" | "tray" | "hidraw"
-            | "a11y" | "input-method" => {
+            "dri" | "compute" | "pipewire" | "pulseaudio" | "portals" | "notify" | "tray"
+            | "hidraw" | "smartcard" | "a11y" | "input-method" => {
                 reject_entries(node)?;
                 let svc = match name {
                     "dri" => Service::Dri,
+                    "compute" => Service::Compute,
+                    "smartcard" => Service::Smartcard,
                     "pipewire" => Service::Pipewire,
                     "pulseaudio" => Service::Pulseaudio,
                     "portals" => Service::Portals,
@@ -846,6 +876,36 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
                 }
                 cfg.services.push(parse_gamepad(node)?);
             }
+            "usb" => {
+                let svc = parse_usb(node)?;
+                if cfg.services.contains(&svc) {
+                    return Err(ConfigError::Duplicate(name.to_owned()));
+                }
+                // Repeatable, unlike the device grants above: two filters
+                // are two devices and add up. Overlapping is what they
+                // may not do — a node the other one covers grants
+                // nothing of its own, and would read as a limit the
+                // sandbox does not have.
+                if let Some(held) = cfg
+                    .services
+                    .iter()
+                    .find(|held| usb_covers(held, &svc) || usb_covers(&svc, held))
+                {
+                    let (wide, narrow) = match usb_covers(held, &svc) {
+                        true => (held, &svc),
+                        false => (&svc, held),
+                    };
+                    return Err(bad(
+                        node,
+                        &format!(
+                            "{} already covers {}, so the narrower node narrows nothing",
+                            usb_scope(wide),
+                            usb_scope(narrow)
+                        ),
+                    ));
+                }
+                cfg.services.push(svc);
+            }
             "camera" => {
                 // By variant, for the same reason `gamepad` is.
                 if cfg
@@ -953,6 +1013,13 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
             reason: "requires portals".to_owned(),
         });
     }
+    if !profile && cfg.services.contains(&Service::Compute) && !cfg.services.contains(&Service::Dri)
+    {
+        return Err(ConfigError::BadArgument {
+            node: "compute".to_owned(),
+            reason: "requires dri".to_owned(),
+        });
+    }
     if !profile && nested_x11_without_display_stack(&cfg.services) {
         return Err(ConfigError::BadArgument {
             node: "x11".to_owned(),
@@ -1012,6 +1079,50 @@ fn bundle_without_dbus(services: &[Service]) -> Option<&'static str> {
 fn camera_without_portals(services: &[Service]) -> bool {
     services.iter().any(|s| matches!(s, Service::Camera { .. }))
         && !services.contains(&Service::Portals)
+}
+
+/// Whether the `usb` grant `wide` covers every device `narrow` does,
+/// itself included: a node without a vendor is every device the host
+/// has, and a vendor without a product is every device of that vendor.
+/// Two nodes where this holds are one grant written twice, so a config
+/// holds only nodes that cover none of each other.
+pub(crate) fn usb_covers(wide: &Service, narrow: &Service) -> bool {
+    let (
+        Service::Usb {
+            vendor: wide_vendor,
+            product: wide_product,
+        },
+        Service::Usb {
+            vendor: narrow_vendor,
+            product: narrow_product,
+        },
+    ) = (wide, narrow)
+    else {
+        return false;
+    };
+    match (wide_vendor, wide_product) {
+        (None, _) => true,
+        (Some(v), None) => narrow_vendor.as_ref() == Some(v),
+        (Some(v), Some(p)) => {
+            narrow_vendor.as_ref() == Some(v) && narrow_product.as_ref() == Some(p)
+        }
+    }
+}
+
+/// What a `usb` node covers, in words, for an error that has to name
+/// which of two overlapping nodes is the wider.
+fn usb_scope(s: &Service) -> String {
+    match s {
+        Service::Usb {
+            vendor: Some(v),
+            product: Some(p),
+        } => format!("`usb` on device `{v}:{p}`"),
+        Service::Usb {
+            vendor: Some(v),
+            product: None,
+        } => format!("`usb` on every device of vendor `{v}`"),
+        _ => "a bare `usb`, which is every device,".to_owned(),
+    }
 }
 
 /// Whether a nested `x11` is granted without what the server it starts
@@ -1779,6 +1890,68 @@ fn parse_gamepad(node: &KdlNode) -> Result<Service, ConfigError> {
         hidraw: hidraw.unwrap_or(false),
         uinput: uinput.unwrap_or(false),
     })
+}
+
+/// `usb [vendor="xxxx" [product="xxxx"]]`: the bare node is every USB
+/// device the host has, and each property narrows it to the devices that
+/// report that id. `product` without `vendor` is refused: a product id
+/// alone is that number from every vendor that ever used it, which is a
+/// wider grant than the line reads as.
+fn parse_usb(node: &KdlNode) -> Result<Service, ConfigError> {
+    let mut vendor: Option<String> = None;
+    let mut product: Option<String> = None;
+    for e in node.entries() {
+        let Some(prop) = e.name().map(|n| n.value()) else {
+            return Err(bad(node, "takes no arguments"));
+        };
+        let slot = match prop {
+            "vendor" => &mut vendor,
+            "product" => &mut product,
+            _ => {
+                return Err(ConfigError::UnknownProperty {
+                    node: node.name().value().to_owned(),
+                    prop: prop.to_owned(),
+                });
+            }
+        };
+        // Written twice, the two entries name two devices and which one
+        // the grant covers would be a matter of their order in the line.
+        if slot.is_some() {
+            return Err(ConfigError::Duplicate(format!(
+                "{} {prop}",
+                node.name().value()
+            )));
+        }
+        let s = e
+            .value()
+            .as_string()
+            .ok_or_else(|| bad(node, &format!("{prop} must be a string like \"0bb4\"")))?;
+        *slot = Some(
+            usb_id(s)
+                .ok_or_else(|| bad(node, &format!("{prop} must be four hex digits, got `{s}`")))?,
+        );
+    }
+    if node.children().is_some() {
+        return Err(bad(node, "takes no children"));
+    }
+    if vendor.is_none() && product.is_some() {
+        return Err(bad(
+            node,
+            "product needs a vendor: a product id alone matches that number from every vendor",
+        ));
+    }
+    Ok(Service::Usb { vendor, product })
+}
+
+/// One USB id in the form sysfs writes it: exactly four hex digits,
+/// lower-cased. Returns the canonical spelling, since the value is
+/// compared against `idVendor`/`idProduct` byte for byte and is written
+/// back to the config file as the grant that was read.
+fn usb_id(s: &str) -> Option<String> {
+    match s.len() == 4 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        true => Some(s.to_ascii_lowercase()),
+        false => None,
+    }
 }
 
 /// `<width>x<height>`, both positive decimals, as Xwayland's
@@ -2979,6 +3152,154 @@ mod tests {
     }
 
     #[test]
+    fn compute_is_a_flag_node_that_needs_the_gpu_grant_beside_it() {
+        assert_eq!(
+            parse("dri\ncompute").unwrap().services,
+            vec![Service::Dri, Service::Compute]
+        );
+        // File order says nothing: the check reads the whole list.
+        assert_eq!(
+            parse("compute\ndri").unwrap().services,
+            vec![Service::Compute, Service::Dri]
+        );
+        assert!(matches!(
+            parse("compute"),
+            Err(ConfigError::BadArgument { node, reason })
+                if node == "compute" && reason == "requires dri"
+        ));
+        // An included layer may be the one that grants `dri`, so the
+        // check is the resolver's rather than every layer's.
+        assert!(parse_profile("compute").is_ok());
+        assert!(matches!(
+            parse("dri\ncompute\ncompute"),
+            Err(ConfigError::Duplicate(n)) if n == "compute"
+        ));
+        for text in [
+            "dri\ncompute \"all\"",
+            "dri\ncompute vendor=\"0bb4\"",
+            "dri\ncompute { x; }",
+        ] {
+            assert!(parse(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn smartcard_is_a_flag_node() {
+        assert_eq!(
+            parse("smartcard").unwrap().services,
+            vec![Service::Smartcard]
+        );
+        assert!(matches!(
+            parse("smartcard\nsmartcard"),
+            Err(ConfigError::Duplicate(n)) if n == "smartcard"
+        ));
+        for text in [
+            "smartcard \"pcscd\"",
+            "smartcard reader=\"0\"",
+            "smartcard { x; }",
+        ] {
+            assert!(parse(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn usb_filters_by_four_hex_digit_ids_and_is_repeatable() {
+        assert_eq!(
+            parse("usb").unwrap().services,
+            vec![Service::Usb {
+                vendor: None,
+                product: None
+            }]
+        );
+        // sysfs writes the ids in lower case and that is what the filter
+        // is compared against, so the config is normalised to it: one
+        // device is one grant however the user spelled its id.
+        assert_eq!(
+            parse("usb vendor=\"0BB4\"").unwrap().services,
+            vec![Service::Usb {
+                vendor: Some("0bb4".to_owned()),
+                product: None
+            }]
+        );
+        assert_eq!(
+            parse("usb vendor=\"0bb4\" product=\"0C8D\"")
+                .unwrap()
+                .services,
+            vec![Service::Usb {
+                vendor: Some("0bb4".to_owned()),
+                product: Some("0c8d".to_owned())
+            }]
+        );
+        // Two devices are two grants, so the node repeats: what the
+        // filters may not do is cover each other.
+        assert_eq!(
+            parse("usb vendor=\"0bb4\" product=\"0c8d\"\nusb vendor=\"0bb4\" product=\"0c8e\"")
+                .unwrap()
+                .services
+                .len(),
+            2
+        );
+        assert_eq!(
+            parse("usb vendor=\"0bb4\"\nusb vendor=\"1050\" product=\"0407\"")
+                .unwrap()
+                .services,
+            vec![
+                Service::Usb {
+                    vendor: Some("0bb4".to_owned()),
+                    product: None
+                },
+                Service::Usb {
+                    vendor: Some("1050".to_owned()),
+                    product: Some("0407".to_owned())
+                }
+            ]
+        );
+        // Anything that is not exactly four hex digits names no device
+        // in sysfs, and a product id alone names one number from every
+        // vendor that ever used it.
+        for text in [
+            "usb vendor=\"0bb\"",
+            "usb vendor=\"0bb44\"",
+            "usb vendor=\"zzzz\"",
+            "usb vendor=\"\"",
+            "usb vendor=\"0x0bb4\"",
+            "usb vendor=#true",
+            "usb product=\"0c8d\"",
+            "usb \"0bb4\"",
+            "usb serial=\"x\"",
+            "usb vendor=\"0bb4\" vendor=\"1050\"",
+            "usb vendor=\"0bb4\" product=\"0c8d\" product=\"0c8e\"",
+            "usb { x; }",
+        ] {
+            assert!(parse(text).is_err(), "{text}");
+        }
+        // The same device twice is one node written twice.
+        assert!(matches!(
+            parse("usb vendor=\"0bb4\"\nusb vendor=\"0bb4\""),
+            Err(ConfigError::Duplicate(n)) if n == "usb"
+        ));
+        assert!(matches!(parse("usb\nusb"), Err(ConfigError::Duplicate(n)) if n == "usb"));
+        // A node that covers another grants everything the narrower one
+        // does, so a file holding both would read as a limit the sandbox
+        // does not have. Both orders, and both widths: a bare node is
+        // every device, a vendor is every device of that vendor.
+        for text in [
+            "usb\nusb vendor=\"0bb4\"",
+            "usb vendor=\"0bb4\"\nusb",
+            "usb vendor=\"0bb4\"\nusb vendor=\"0bb4\" product=\"0c8d\"",
+            "usb vendor=\"0bb4\" product=\"0c8d\"\nusb vendor=\"0bb4\"",
+        ] {
+            assert!(
+                matches!(
+                    parse(text),
+                    Err(ConfigError::BadArgument { node, .. }) if node == "usb"
+                ),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
     fn duplicate_flag_service_is_an_error() {
         assert!(
             matches!(parse("wayland\nwayland"), Err(ConfigError::Duplicate(n)) if n == "wayland")
@@ -4121,8 +4442,12 @@ command "b""#
             ("x11", "x11"),
             ("network \"host\"", "network"),
             ("dri", "dri"),
+            ("compute", "compute"),
             ("pipewire", "pipewire"),
             ("pulseaudio", "pulseaudio"),
+            ("usb", "usb"),
+            ("usb vendor=\"0bb4\"", "usb"),
+            ("smartcard", "smartcard"),
             ("home-share \"Downloads\"", "home-share"),
             ("path-share \"/mnt/data\"", "path-share"),
             ("etc-share \"vulkan\"", "etc-share"),

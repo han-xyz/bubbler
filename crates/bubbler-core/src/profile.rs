@@ -697,6 +697,22 @@ impl Merged {
                     return Ok(());
                 }
             }
+            Service::Usb { .. } => {
+                // The wider node swallows the narrower rather than
+                // standing beside it — a bare `usb` is every device, a
+                // vendor is every device of that vendor — and the parser
+                // refuses a file holding both, which the flattened
+                // profile is parsed back as. Filters that cover none of
+                // each other are separate devices and add up.
+                if self
+                    .services
+                    .iter()
+                    .any(|(s, _)| config::usb_covers(s, svc))
+                {
+                    return Ok(());
+                }
+                self.services.retain(|(s, _)| !config::usb_covers(svc, s));
+            }
             Service::Camera { nodes } => {
                 if let Some((held_nodes, held_src)) =
                     self.services.iter_mut().find_map(|(s, src)| match s {
@@ -759,6 +775,8 @@ impl Merged {
                 }
             }
             Service::Dri
+            | Service::Compute
+            | Service::Smartcard
             | Service::Pipewire
             | Service::Pulseaudio
             | Service::Portals
@@ -1359,6 +1377,81 @@ mod tests {
         let resolved = r.resolve("app").unwrap();
         assert_eq!(resolved.config.services, vec![Service::Hidraw]);
         assert_eq!(resolved.text, "hidraw\n");
+    }
+
+    #[test]
+    fn usb_filters_from_two_layers_add_up_and_a_bare_node_swallows_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let usb = |vendor: &str, product: Option<&str>| Service::Usb {
+            vendor: Some(vendor.to_owned()),
+            product: product.map(str::to_owned),
+        };
+        // Two filters are two devices: the union, each written once.
+        let r = resolver(
+            tmp.path(),
+            &[],
+            &[
+                (
+                    "app",
+                    "include \"base\"\nusb vendor=\"1050\" product=\"0407\"\nusb vendor=\"0bb4\"\n",
+                ),
+                ("base", "usb vendor=\"0bb4\"\n"),
+            ],
+        );
+        let resolved = r.resolve("app").unwrap();
+        assert_eq!(
+            resolved.config.services,
+            vec![usb("0bb4", None), usb("1050", Some("0407"))]
+        );
+        assert_eq!(
+            resolved.text,
+            "usb vendor=\"0bb4\"\nusb vendor=\"1050\" product=\"0407\"\n"
+        );
+        // The wider node replaces the narrower whichever layer wrote it:
+        // a file holding both does not parse, and the flattened profile
+        // is parsed back.
+        for (app, base, left) in [
+            ("include \"base\"\nusb\n", "usb vendor=\"0bb4\"\n", "usb\n"),
+            ("include \"base\"\nusb vendor=\"0bb4\"\n", "usb\n", "usb\n"),
+            (
+                "include \"base\"\nusb vendor=\"0bb4\"\n",
+                "usb vendor=\"0bb4\" product=\"0c8d\"\n",
+                "usb vendor=\"0bb4\"\n",
+            ),
+            (
+                "include \"base\"\nusb vendor=\"0bb4\" product=\"0c8d\"\n",
+                "usb vendor=\"0bb4\"\n",
+                "usb vendor=\"0bb4\"\n",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let r = resolver(tmp.path(), &[], &[("app", app), ("base", base)]);
+            let resolved = r.resolve("app").unwrap();
+            assert_eq!(resolved.text, left, "{app}");
+        }
+    }
+
+    #[test]
+    fn compute_is_granted_when_an_included_layer_is_the_one_with_the_gpu() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(
+            tmp.path(),
+            &[],
+            &[("app", "include \"base\"\ncompute\n"), ("base", "dri\n")],
+        );
+        let resolved = r.resolve("app").unwrap();
+        assert_eq!(
+            resolved.config.services,
+            vec![Service::Dri, Service::Compute]
+        );
+        // Nothing under it grants the GPU: the flattened profile is
+        // parsed back, so the check no single layer could make lands here.
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(tmp.path(), &[], &[("app", "compute\n")]);
+        let Err(ProfileError::Parse { source, .. }) = r.resolve("app") else {
+            panic!("a profile granting compute without dri resolved");
+        };
+        assert!(source.to_string().contains("requires dri"), "{source}");
     }
 
     #[test]

@@ -173,6 +173,13 @@ const TTY_PASSTHROUGH: Check = Check {
     id: "tty-passthrough",
     severity: Severity::Warning,
 };
+// A warning rather than a note: the bare node is every USB device the
+// host has, and raw I/O to a device is more than any driver offers for
+// it. The filtered form is right there in the help text.
+const USB_ALL_DEVICES: Check = Check {
+    id: "usb-all-devices",
+    severity: Severity::Warning,
+};
 const USERNS_DISABLED_WITH_NESTED_SANDBOX: Check = Check {
     id: "userns-disabled-with-nested-sandbox",
     severity: Severity::Warning,
@@ -228,6 +235,7 @@ pub const CHECKS: &[Check] = &[
     SHARE_SOURCE_MISSING,
     SYSTEM_BUS_POLKIT_NAME,
     TTY_PASSTHROUGH,
+    USB_ALL_DEVICES,
     USERNS_DISABLED_WITH_NESTED_SANDBOX,
     WAYLAND_CLIPBOARD_OPEN,
     WAYLAND_HOST,
@@ -956,6 +964,19 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
             "camera" if flag(node, "nodes") == Some(true) => {
                 camera_nodes(ctx, i, node, host_net, f);
             }
+            "usb" if prop(node, "vendor").is_none() => f.push(
+                i,
+                node,
+                &USB_ALL_DEVICES,
+                "`usb` without a `vendor` is every USB device the host has at launch — the \
+                 raw interfaces of your keyboard and your security key among them — and \
+                 raw transfers are what a device is programmed through, not what its \
+                 driver offers"
+                    .to_owned(),
+                "`usb vendor=\"0bb4\" product=\"0c8d\"` scopes the grant to the device you \
+                 mean — `lsusb` prints the two ids — or accept it with \
+                 `lint-allow \"usb-all-devices\" reason=\"...\"`",
+            ),
             "dbus" => dbus_node(i, node, f),
             "system-bus" => system_bus(i, node, f),
             "app-runtime" if prop(node, "mode") == Some("rw") => f.push(
@@ -1661,6 +1682,38 @@ mod tests {
             assert_eq!(
                 ids(&lint(ctx, &["wayland", "wayland clipboard=\"open\""])),
                 ["wayland-clipboard-open"]
+            );
+        });
+    }
+
+    /// Only the bare node is a finding: a filtered one is the narrower
+    /// form the warning exists to point at, so warning about it too
+    /// would leave a reader nowhere to go.
+    #[test]
+    fn usb_warns_about_every_device_and_not_about_a_filtered_node() {
+        with(&host(), |ctx| {
+            let report = lint(ctx, &["usb"]);
+            assert_eq!(ids(&report), ["usb-all-devices"]);
+            assert_eq!(report.findings[0].severity, Severity::Warning);
+            // The help names the filtered form: a warning a reader cannot
+            // act on is one they can only suppress.
+            assert!(report.findings[0].help.contains("vendor="), "{report:?}");
+            for clean in [
+                "usb vendor=\"0bb4\"",
+                "usb vendor=\"0bb4\" product=\"0c8d\"",
+            ] {
+                assert_eq!(ids(&lint(ctx, &[clean])), [] as [&str; 0], "{clean}");
+            }
+            let allowed = lint(
+                ctx,
+                &["usb\nlint-allow \"usb-all-devices\" reason=\"flashes whatever is plugged in\""],
+            );
+            assert_eq!(ids(&allowed), [] as [&str; 0]);
+            // One finding per bare node, and the filtered ones beside it
+            // in another layer are still not findings of their own.
+            assert_eq!(
+                ids(&lint(ctx, &["usb vendor=\"0bb4\"", "usb"])),
+                ["usb-all-devices"]
             );
         });
     }

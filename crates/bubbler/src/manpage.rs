@@ -345,6 +345,11 @@ const CHECK_LINES: &[(&str, &str)] = &[
         "`tty \"passthrough\"` hands the sandbox this terminal's own descriptors.",
     ),
     (
+        "usb-all-devices",
+        "A bare `usb` grant: every USB device the host has at launch, opened for raw I/O, \
+         rather than the `vendor=`/`product=` form that names the device you mean.",
+    ),
+    (
         "userns-disabled-with-nested-sandbox",
         "`userns \"disable\"` under a command known to start a sandbox of its own; the \
          list of such commands is a heuristic.",

@@ -39,6 +39,7 @@ pub const GRANTS: &[&str] = &[
     "x11",
     "network",
     "dri",
+    "compute",
     "pipewire",
     "pulseaudio",
     "dbus",
@@ -49,6 +50,8 @@ pub const GRANTS: &[&str] = &[
     "input-method",
     "gamepad",
     "hidraw",
+    "usb",
+    "smartcard",
     "camera",
 ];
 
@@ -195,6 +198,10 @@ fn grant_service(name: &str) -> Option<Service> {
         "x11" => Service::X11(X11Mode::default()),
         "network" => Service::Network(NetworkConfig::default()),
         "dri" => Service::Dri,
+        // Needs `dri` beside it, which the config check names: a
+        // `--grant compute` on a profile without the GPU fails the parse
+        // that seeds the instance rather than granting half of it.
+        "compute" => Service::Compute,
         "pipewire" => Service::Pipewire,
         "pulseaudio" => Service::Pulseaudio,
         "dbus" => Service::Dbus { rules: Vec::new() },
@@ -208,6 +215,13 @@ fn grant_service(name: &str) -> Option<Service> {
             uinput: false,
         },
         "hidraw" => Service::Hidraw,
+        // The bare node: every USB device. `--grant` writes no property,
+        // and a filter is a line only a config file can carry.
+        "usb" => Service::Usb {
+            vendor: None,
+            product: None,
+        },
+        "smartcard" => Service::Smartcard,
         "camera" => Service::Camera { nodes: false },
         _ => return None,
     })
@@ -218,6 +232,20 @@ fn grant_service(name: &str) -> Option<Service> {
 fn with_grants(cfg: &mut InstanceConfig, grants: &[&str]) -> Result<(), InstanceError> {
     for g in grants {
         let svc = grant_service(g).ok_or_else(|| InstanceError::InvalidGrant((*g).to_owned()))?;
+        // `--grant usb` is the bare node, which is every USB device: it
+        // subsumes the filters a profile wrote rather than standing
+        // beside them, since the parser refuses a config holding both.
+        if matches!(svc, Service::Usb { .. }) {
+            cfg.services.retain(|s| {
+                !matches!(
+                    s,
+                    Service::Usb {
+                        vendor: Some(_),
+                        ..
+                    }
+                )
+            });
+        }
         // Two `dbus` nodes hold different rules, so that grant is
         // recognised by its variant rather than by value.
         let held = match &svc {
@@ -231,6 +259,12 @@ fn with_grants(cfg: &mut InstanceConfig, grants: &[&str]) -> Result<(), Instance
                 .services
                 .iter()
                 .any(|s| matches!(s, Service::Gamepad { .. })),
+            // Every filtered node is gone by now, so what is left to
+            // find is a bare one the config already had.
+            Service::Usb { .. } => cfg
+                .services
+                .iter()
+                .any(|s| matches!(s, Service::Usb { .. })),
             // Same for `camera`, whose `nodes` property a config may
             // already carry.
             Service::Camera { .. } => cfg
@@ -1330,6 +1364,27 @@ mod tests {
                 .unwrap()
                 .contains("camera nodes=#true\n")
         );
+    }
+
+    #[test]
+    fn a_bare_usb_grant_replaces_the_filters_a_profile_wrote() {
+        // The parser refuses a bare `usb` beside a filtered one, and the
+        // seeded config is parsed back, so the wider grant the user asked
+        // for on the command line is the one node that is left.
+        let mut cfg = config::parse("usb vendor=\"0bb4\"\nusb vendor=\"1050\"").unwrap();
+        with_grants(&mut cfg, &["usb"]).unwrap();
+        assert_eq!(
+            cfg.services,
+            vec![Service::Usb {
+                vendor: None,
+                product: None
+            }]
+        );
+        assert_eq!(kdl_out::render(&cfg).unwrap(), "usb\n");
+        // Asked for twice, or asked for on a config that already has it:
+        // one node either way.
+        with_grants(&mut cfg, &["usb"]).unwrap();
+        assert_eq!(kdl_out::render(&cfg).unwrap(), "usb\n");
     }
 
     #[test]

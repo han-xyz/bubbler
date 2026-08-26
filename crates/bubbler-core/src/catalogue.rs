@@ -119,6 +119,19 @@ pub static GRANTS: &[Grant] = &[
         grammar: "dri",
     },
     Grant {
+        node: "compute",
+        summary: "GPU compute on the AMD driver: /dev/kfd and the KFD topology in sysfs",
+        cost: "`/dev/kfd` is the one interface every AMD GPU on the machine is reached \
+               through, not the card you meant, and the grant adds the KFD topology and \
+               the CPU topology under `/sys/devices` to it. Requires `dri`, and against \
+               that grant it costs nothing new: a compute job reads and writes the same \
+               GPU memory the render nodes already reach, so what the two share is what \
+               another application has left on the card. A host with no `/dev/kfd` fails \
+               the launch rather than running without it.",
+        risk: Risk::Wide,
+        grammar: "compute",
+    },
+    Grant {
         node: "pipewire",
         summary: "the session's PipeWire socket",
         cost: "Capture as well as playback: everything the session exposes, the microphone \
@@ -154,6 +167,33 @@ pub static GRANTS: &[Grant] = &[
                list is frozen at launch, so a device plugged in later has no node inside.",
         risk: Risk::Wide,
         grammar: "hidraw",
+    },
+    Grant {
+        node: "usb",
+        summary: "raw USB device I/O: /dev/bus/usb and the sysfs descriptors libusb reads",
+        cost: "Bare, it is every USB device the host has at launch — the raw interface of \
+               your keyboard and of your security key among them — and raw I/O is what a \
+               device is programmed and read through rather than what its driver offers. \
+               `vendor=` and `product=` narrow it to the nodes whose sysfs reports those \
+               ids, which is the shape of the grant to prefer; the ids are what the \
+               device says about itself, though, so one that claims another's is inside \
+               the filter. Either way the list is frozen at launch and a device plugged \
+               in later has no node inside, and who may open a node stays the host's to \
+               decide: udev's `uaccess` ACL, or the group on the device.",
+        risk: Risk::Outward,
+        grammar: "usb [vendor=\"xxxx\" [product=\"xxxx\"]]",
+    },
+    Grant {
+        node: "smartcard",
+        summary: "the pcscd socket, which is how a smart card is spoken to",
+        cost: "Every reader and card the daemon has, addressed by APDU: while a card is \
+               unlocked the sandbox can ask it to sign or decrypt as you, and the PIN \
+               that unlocks it is typed into the application inside. No device node is \
+               bound — the socket is the whole grant — so what a card refuses without \
+               its PIN it still refuses. A host with no `pcscd` socket fails the launch \
+               rather than running without it.",
+        risk: Risk::Wide,
+        grammar: "smartcard",
     },
     Grant {
         node: "camera",
@@ -385,10 +425,13 @@ mod tests {
         ("x11", "x11 \"host\""),
         ("network", "network \"host\""),
         ("dri", "dri"),
+        ("compute", "compute"),
         ("pipewire", "pipewire"),
         ("pulseaudio", "pulseaudio"),
         ("gamepad", "gamepad uinput=#true"),
         ("hidraw", "hidraw"),
+        ("usb", "usb vendor=\"0bb4\" product=\"0c8d\""),
+        ("smartcard", "smartcard"),
         ("camera", "camera nodes=#true"),
         ("home-share", "home-share \"Downloads\" mode=rw"),
         ("path-share", "path-share \"/mnt/data\""),

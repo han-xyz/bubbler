@@ -70,6 +70,8 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
         Service::X11(X11Mode::Host) => "x11 \"host\"".to_owned(),
         Service::Network(cfg) => network(cfg),
         Service::Dri => "dri".to_owned(),
+        Service::Compute => "compute".to_owned(),
+        Service::Smartcard => "smartcard".to_owned(),
         Service::Pipewire => "pipewire".to_owned(),
         Service::Pulseaudio => "pulseaudio".to_owned(),
         Service::Portals => "portals".to_owned(),
@@ -78,6 +80,27 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
         Service::A11y => "a11y".to_owned(),
         Service::InputMethod => "input-method".to_owned(),
         Service::Hidraw => "hidraw".to_owned(),
+        Service::Usb { vendor, product } => {
+            // A product without a vendor is not a node the parser reads
+            // back: the id alone would be that number from every vendor.
+            let Some(vendor) = vendor else {
+                if let Some(product) = product {
+                    return Err(ConfigError::BadArgument {
+                        node: "usb".to_owned(),
+                        reason: format!(
+                            "filters product `{product}` with no vendor, and that is not a \
+                             config bubbler parses"
+                        ),
+                    });
+                }
+                return Ok("usb".to_owned());
+            };
+            let mut node = format!("usb vendor={}", quote(vendor));
+            if let Some(product) = product {
+                node.push_str(&format!(" product={}", quote(product)));
+            }
+            node
+        }
         Service::Camera { nodes } => match nodes {
             // `#false` is the default, so only the device grant is written.
             true => "camera nodes=#true".to_owned(),
@@ -506,8 +529,12 @@ mod tests {
             x11
             network
             dri
+            compute
             pipewire
             pulseaudio
+            usb vendor="0bb4"
+            usb vendor="1050" product="0407"
+            smartcard
             home-share "Downloads"
             home-share "Projects/x" mode=rw
             path-share "/kioxia/Steam"
@@ -563,6 +590,13 @@ mod tests {
         // The bare grant and the older `gamepad` spelling of it are two
         // nodes, and both have to survive a round trip unchanged.
         round_trip("hidraw\ngamepad hidraw=#true");
+        // Every shape the `usb` node has, and the bare one on its own:
+        // a dropped filter would widen the grant to every device.
+        round_trip("usb");
+        round_trip("usb vendor=\"0bb4\"");
+        round_trip("usb vendor=\"0bb4\" product=\"0c8d\"");
+        round_trip("smartcard");
+        round_trip("dri\ncompute");
         round_trip("dbus\nportals\ncamera");
         round_trip("dbus\nportals\ncamera nodes=#true");
         round_trip("dbus\na11y");
@@ -651,6 +685,24 @@ mod tests {
         };
         assert_eq!(node, "system-bus");
         assert!(reason.contains("org.example.App"), "{reason}");
+    }
+
+    #[test]
+    fn a_usb_product_without_its_vendor_is_refused_rather_than_written() {
+        // The parser refuses the half id, so writing the node out would
+        // produce a profile that cannot be read back.
+        let cfg = InstanceConfig {
+            services: vec![Service::Usb {
+                vendor: None,
+                product: Some("0c8d".to_owned()),
+            }],
+            ..InstanceConfig::default()
+        };
+        let Err(ConfigError::BadArgument { node, reason }) = render(&cfg) else {
+            panic!("a product id was written without its vendor");
+        };
+        assert_eq!(node, "usb");
+        assert!(reason.contains("0c8d"), "{reason}");
     }
 
     #[test]
