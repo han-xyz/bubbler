@@ -840,26 +840,26 @@ fn warn_migration(inst: &Instance) {
     }
 }
 
-/// The command the sandbox is given, with every host file among its
-/// arguments put where the sandbox will find it.
+/// The command line the sandbox is given, with every host file among its
+/// arguments put where the sandbox will find it, or `None` where the
+/// caller's own command is to be left as it is.
 ///
-/// `argv` is the whole command line, program included; the program is
-/// never a document. What each argument is decided to be is reported on
-/// stderr: a path that cannot be forwarded says why, and a `preview`
-/// (`--dry-run` or `--explain`) prints what a real run would ask for
-/// without asking for it. Failure is never fatal — an argument that
-/// could not be handed over is passed on as it was, and the run goes
-/// ahead with a warning naming the gap.
-fn forwarded_command(
+/// The plan is made over the whole resolved command line, program
+/// included; the program is never a document. What each argument is
+/// decided to be is reported on stderr, and a `preview` (`--dry-run` or
+/// `--explain`) prints what a real run would ask for without asking for
+/// it. Failure is never fatal — an argument that could not be handed
+/// over is passed on as it was, and the run goes ahead with a warning
+/// naming the gap. A command that resolves to nothing is left to fail
+/// where it always did.
+fn forwarded_or(
     env: &Env,
     inst: &Instance,
-    argv: &[OsString],
+    given: Option<&[OsString]>,
     preview: bool,
-) -> Vec<OsString> {
+) -> Option<Vec<OsString>> {
+    let argv = launcher::resolve_command(inst, given).ok()?;
     let planned = forward::plan_args(env, &inst.config, &inst.home(), argv, &RealHost);
-    for line in forward::warning_lines(&planned) {
-        eprintln!("bubbler: warning: {line}");
-    }
     let candidates: Vec<forward::Candidate> = planned
         .iter()
         .filter_map(|entry| match entry {
@@ -869,12 +869,23 @@ fn forwarded_command(
         .collect();
     let granted = inst.has_service(&Service::Portals);
     let mut forwards = Vec::new();
-    if !granted {
-        for candidate in &candidates {
-            eprintln!(
-                "bubbler: warning: {} is not visible inside; grant portals to forward files",
-                candidate.given.display()
-            );
+    match granted {
+        // Only where a file could have been forwarded is a path that was
+        // not one worth a word: without `portals` nothing was going that
+        // way anyway, and `/tmp/out.log` or `/dev/urandom` name a file
+        // the sandbox has its own of rather than a gap in it.
+        true => {
+            for line in forward::warning_lines(&planned) {
+                eprintln!("bubbler: warning: {line}");
+            }
+        }
+        false => {
+            for candidate in &candidates {
+                eprintln!(
+                    "bubbler: warning: {} is not visible inside; grant portals to forward files",
+                    candidate.given.display()
+                );
+            }
         }
     }
     if granted && !preview && !candidates.is_empty() {
@@ -886,15 +897,18 @@ fn forwarded_command(
                 for (candidate, answer) in candidates.iter().zip(answers) {
                     match answer {
                         Ok(forward) => forwards.push(forward),
-                        Err(e) => warn_not_forwarded(&candidate.given, &anyhow::Error::new(e)),
+                        Err(e) => eprintln!(
+                            "bubbler: warning: forwarding {} failed: {:#}",
+                            candidate.given.display(),
+                            anyhow::Error::new(e)
+                        ),
                     }
                 }
             }
-            Err(e) => {
-                for candidate in &candidates {
-                    warn_not_forwarded(&candidate.given, &e);
-                }
-            }
+            // One line, not one per file: the gap is the bus itself, and
+            // the error already names the address every file would have
+            // gone through.
+            Err(e) => eprintln!("bubbler: warning: no host file was forwarded: {e:#}"),
         }
     }
     if preview {
@@ -917,7 +931,7 @@ fn forwarded_command(
             eprintln!("{line}");
         }
     }
-    forward::rewrite(argv, &planned, &forwards)
+    Some(forward::rewrite(argv, &planned, &forwards))
 }
 
 /// A connection to the host session bus for the document portal call.
@@ -926,15 +940,7 @@ fn forwarded_command(
 /// here too.
 fn portal_session(env: &Env) -> Result<dbus_wire::Session> {
     let bus = dbus::guarded_host_bus(&RealHost, env).context("resolving the session bus")?;
-    dbus_wire::Session::connect(&bus).with_context(|| format!("connecting to {}", bus.display()))
-}
-
-/// One file the portal would not take, with the argument left as it was.
-fn warn_not_forwarded(path: &Path, e: &anyhow::Error) {
-    eprintln!(
-        "bubbler: warning: forwarding {} failed: {e:#}",
-        path.display()
-    );
+    Ok(dbus_wire::Session::connect(&bus)?)
 }
 
 /// The `bubbler open` command line this process stands for, when it was
@@ -1044,11 +1050,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             // `--ctty` is there exactly when a real run would allocate a
             // pty for the sandbox's stdin.
             let ctty = tty::plan(mode, tty::host_is_tty()).ctty();
-            // A command that resolves to nothing is left to fail where it
-            // did; forwarding is about the arguments of one that runs.
-            let forwarded = launcher::resolve_command(&inst, command).ok().map(|argv| {
-                forwarded_command(&env, &inst, argv, dry_run || explain_mode.is_some())
-            });
+            let forwarded = forwarded_or(&env, &inst, command, dry_run || explain_mode.is_some());
             let command = forwarded.as_deref().or(command);
             if let Some(mode) = explain_mode {
                 return explain(
@@ -1111,9 +1113,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             let given = (!command.is_empty()).then_some(command.as_slice());
             // Before `--keep`, which only records a name: the sandbox
             // runs, and asks the portal, under the one it was made with.
-            let forwarded = launcher::resolve_command(&eph.instance, given)
-                .ok()
-                .map(|argv| forwarded_command(&env, &eph.instance, argv, explain_mode.is_some()));
+            let forwarded = forwarded_or(&env, &eph.instance, given, explain_mode.is_some());
             let command = forwarded.as_deref().or(given);
             if let Some(mode) = explain_mode {
                 let tty_mode = tty.unwrap_or(eph.instance.config.tty);
@@ -1209,9 +1209,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             // Before the choice between a fresh run and the sandbox that
             // is already up: a file picked in a file manager reaches an
             // open window the same way it reaches a new one.
-            let forwarded = launcher::resolve_command(&inst, command)
-                .ok()
-                .map(|argv| forwarded_command(&env, &inst, argv, false));
+            let forwarded = forwarded_or(&env, &inst, command, false);
             let command = forwarded.as_deref().or(command);
             let mode = match watched {
                 true => inst.config.tty,

@@ -2664,6 +2664,140 @@ fn a_home_share_path_is_renamed_not_forwarded() {
 }
 
 #[test]
+fn a_path_the_sandbox_has_its_own_of_is_no_warning_without_portals() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    // Neither names a gap: a log that does not exist yet is written to
+    // the sandbox's own tmpfs `/tmp`, and `/dev/null` is its own device
+    // node. Without `portals` neither was going through the portal, so
+    // neither is worth a word.
+    let absent = format!("/tmp/bubbler-test-absent-{}.log", std::process::id());
+    let out = bubbler(tmp.path())
+        .args([
+            "run",
+            "t",
+            "--dry-run",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            "true",
+            "_",
+        ])
+        .args([&absent, "/dev/null"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(!err.contains("warning"), "{err}");
+    assert!(!err.contains("forward:"), "{err}");
+}
+
+#[test]
+fn without_portals_a_shared_path_is_still_renamed() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/t/config.kdl"),
+        "home-share \"Documents\"\ncommand \"true\"\n",
+    )
+    .unwrap();
+    let docs = tmp.path().join("home/Documents");
+    std::fs::create_dir_all(&docs).unwrap();
+    let file = host_file(&docs, "paper.pdf", b"%PDF-1.7\n");
+
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--dry-run", "--", "/usr/bin/cat"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    // The share is there whether or not `portals` is: the rename needs
+    // no portal, and it is the only thing the preview has to say.
+    assert!(
+        err.contains(&format!(
+            "visible: {} → /home/bubbler/Documents/paper.pdf",
+            file.display()
+        )),
+        "{err}"
+    );
+    assert!(!err.contains("forward:"), "{err}");
+    assert!(!err.contains("warning"), "{err}");
+    let argv = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        argv.lines()
+            .any(|l| l == "/home/bubbler/Documents/paper.pdf"),
+        "{argv}"
+    );
+    assert!(!argv.lines().any(|l| l == file.to_string_lossy()), "{argv}");
+}
+
+#[test]
+fn a_bus_that_cannot_be_reached_warns_once_and_the_run_goes_on() {
+    if !require_dbus() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let name = &instance_name("doc-nobus");
+    let leftovers = dbus_instance(tmp.path(), &init, name, "dbus\nportals\ncommand \"true\"\n");
+    let file = host_file(tmp.path(), "wanted.txt", b"never got there\n");
+
+    // Into a live instance, because `portals` requires `dbus`: a fresh
+    // run would fail on the proxy sidecar long before forwarding could be
+    // judged on its own, while an exec into a running sandbox needs the
+    // control socket and no bus at all.
+    let mut run = bubbler_dbus(tmp.path(), &init)
+        .args(["run", name, "--", "/usr/bin/sleep", "30"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let sock = leftovers.runtime.join("init.sock");
+    if !wait_until(
+        || UnixStream::connect(&sock).is_ok(),
+        Duration::from_secs(10),
+    ) {
+        fail_with(run, "the instance never accepted a connection");
+    }
+
+    let bus = tmp.path().join("run/nowhere/bus");
+    let out = bubbler_dbus(tmp.path(), &init)
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}", bus.display()),
+        )
+        .args(["open", name, "--", "/usr/bin/sh", "-c", "echo \"$1\"", "_"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    let said = run_log_of(tmp.path(), name);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{said}");
+    // One line for the bus, none per file, and the address is named.
+    assert_eq!(
+        said.matches("no host file was forwarded").count(),
+        1,
+        "{said}"
+    );
+    assert!(said.contains(&bus.display().to_string()), "{said}");
+    assert!(!said.contains("forwarding "), "{said}");
+    // The argument reached the sandbox as the host wrote it.
+    assert_eq!(s.trim(), file.to_string_lossy(), "stdout: {s}log: {said}");
+
+    kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
+    assert!(
+        wait_until(
+            || run
+                .try_wait()
+                .expect("waiting for the run process")
+                .is_some(),
+            Duration::from_secs(8)
+        ),
+        "the run did not stop after SIGTERM"
+    );
+}
+
+#[test]
 fn real_open_forwards_a_host_file() {
     if !require_document_portal() {
         return;
@@ -2758,6 +2892,12 @@ fn real_run_forwards_with_write_when_writable() {
     let out = append(&file, "third");
     let err = String::from_utf8_lossy(&out.stderr);
     assert_ne!(out.status.code(), Some(0), "{err}");
+    // The file reached the sandbox and the kernel refused the write:
+    // `Permission denied` on the document path, not a missing file and
+    // not a forwarding that never happened.
+    assert!(err.contains("Permission denied"), "{err}");
+    assert!(!err.contains("No such file"), "{err}");
+    assert!(!err.contains("forwarding "), "{err}");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "first\nsecond\n");
 }
 
