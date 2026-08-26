@@ -2544,6 +2544,272 @@ fn portals_without_a_document_portal_warns_once_and_still_runs() {
     assert!(!argv.contains("/doc/by-app/"), "{argv}");
 }
 
+/// A regular host file under `root`, named by a canonical path: a `/tmp`
+/// that is a symlink would otherwise have every message name the
+/// resolved file beside the argument, which is not what these pin.
+fn host_file(root: &Path, name: &str, body: &[u8]) -> PathBuf {
+    let path = root
+        .canonicalize()
+        .expect("the directory the file goes in")
+        .join(name);
+    std::fs::write(&path, body).expect("writing the host file");
+    path
+}
+
+/// `<instance>/last-run.log`, where a run nobody is watching puts what
+/// bubbler had to say. `open` from a test has no terminal anywhere, so
+/// this is its stderr.
+fn run_log_of(tmp: &Path, name: &str) -> String {
+    std::fs::read_to_string(
+        tmp.join("data/bubbler/instances")
+            .join(name)
+            .join("last-run.log"),
+    )
+    .unwrap_or_default()
+}
+
+#[test]
+fn dry_run_prints_the_forward_line() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/t/config.kdl"),
+        "dbus\nportals\ncommand \"true\"\n",
+    )
+    .unwrap();
+    let file = host_file(tmp.path(), "paper.pdf", b"%PDF-1.7\n");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--dry-run", "--", "/usr/bin/cat"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(
+        err.contains(&format!(
+            "forward: {} → $XDG_RUNTIME_DIR/doc/<id>/paper.pdf (read)",
+            file.display()
+        )),
+        "{err}"
+    );
+    // A dry run calls no portal, so the argument is still the host path.
+    let argv = String::from_utf8_lossy(&out.stdout);
+    assert!(argv.lines().any(|l| l == file.to_string_lossy()), "{argv}");
+}
+
+#[test]
+fn run_without_portals_warns_and_leaves_the_argument() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let file = host_file(tmp.path(), "notes.txt", b"nothing to see\n");
+
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--dry-run", "--", "/usr/bin/cat"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(
+        err.contains(&format!(
+            "bubbler: warning: {} is not visible inside; grant portals to forward files",
+            file.display()
+        )),
+        "{err}"
+    );
+    // Nothing is going anywhere, so nothing is explained as if it were.
+    assert!(!err.contains("forward:"), "{err}");
+    let argv = String::from_utf8_lossy(&out.stdout);
+    assert!(argv.lines().any(|l| l == file.to_string_lossy()), "{argv}");
+}
+
+#[test]
+fn a_home_share_path_is_renamed_not_forwarded() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/t/config.kdl"),
+        "dbus\nportals\nhome-share \"Documents\"\ncommand \"true\"\n",
+    )
+    .unwrap();
+    let docs = tmp.path().join("home/Documents");
+    std::fs::create_dir_all(&docs).unwrap();
+    let file = host_file(&docs, "paper.pdf", b"%PDF-1.7\n");
+
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--dry-run", "--", "/usr/bin/cat"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(
+        err.contains(&format!(
+            "visible: {} → /home/bubbler/Documents/paper.pdf",
+            file.display()
+        )),
+        "{err}"
+    );
+    // The share is already there: no portal grant is spent on it.
+    assert!(!err.contains("forward:"), "{err}");
+    let argv = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        argv.lines()
+            .any(|l| l == "/home/bubbler/Documents/paper.pdf"),
+        "{argv}"
+    );
+    assert!(!argv.lines().any(|l| l == file.to_string_lossy()), "{argv}");
+}
+
+#[test]
+fn real_open_forwards_a_host_file() {
+    if !require_document_portal() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let name = &instance_name("doc-forward");
+    let _leftovers = dbus_instance(tmp.path(), &init, name, "dbus\nportals\ncommand \"true\"\n");
+    let file = host_file(tmp.path(), "forwarded.txt", b"handed-over\n");
+
+    let out = bubbler_dbus(tmp.path(), &init)
+        .args(["open", name, "--", "/usr/bin/cat"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    // With no terminal anywhere, `open` puts its own stderr in the log.
+    let said = run_log_of(tmp.path(), name);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{said}");
+    assert!(s.contains("handed-over"), "stdout: {s}log: {said}");
+    assert!(!said.contains("warning"), "{said}");
+
+    // A registration lasts the portal's session, so a later run of the
+    // same instance still sees it — and sees only it.
+    let doc = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join("doc");
+    let out = bubbler_dbus(tmp.path(), &init)
+        .args(["run", name, "--", "/usr/bin/ls"])
+        .arg(&doc)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let ids: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert_eq!(ids.len(), 1, "ids: {ids:?}stderr: {err}");
+}
+
+#[test]
+fn real_run_forwards_with_write_when_writable() {
+    if !require_document_portal() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let name = &instance_name("doc-write");
+    let _leftovers = dbus_instance(tmp.path(), &init, name, "dbus\nportals\ncommand \"true\"\n");
+    let file = host_file(tmp.path(), "journal.txt", b"first\n");
+
+    let append = |file: &Path, line: &str| {
+        let mut c = bubbler_dbus(tmp.path(), &init);
+        c.args(["run", name, "--", "/usr/bin/sh", "-c"])
+            .arg(format!("echo {line} >> \"$1\""))
+            .arg("_")
+            .arg(file);
+        c.output().unwrap()
+    };
+
+    let out = append(&file, "second");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "first\nsecond\n");
+
+    // A file the user cannot write is exported read-only, and the write
+    // fails inside instead of reaching the host.
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let out = bubbler_dbus(tmp.path(), &init)
+        .args([
+            "run",
+            name,
+            "--dry-run",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            "true",
+            "_",
+        ])
+        .arg(&file)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(
+        err.contains(&format!(
+            "forward: {} → $XDG_RUNTIME_DIR/doc/<id>/journal.txt (read)",
+            file.display()
+        )),
+        "{err}"
+    );
+
+    let out = append(&file, "third");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "{err}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "first\nsecond\n");
+}
+
+#[test]
+fn real_open_into_a_running_instance_forwards_too() {
+    if !require_document_portal() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let name = &instance_name("doc-live");
+    let leftovers = dbus_instance(tmp.path(), &init, name, "dbus\nportals\ncommand \"true\"\n");
+    let file = host_file(tmp.path(), "live.txt", b"into-a-running-one\n");
+
+    let mut run = bubbler_dbus(tmp.path(), &init)
+        .args(["run", name, "--", "/usr/bin/sleep", "30"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let sock = leftovers.runtime.join("init.sock");
+    if !wait_until(
+        || UnixStream::connect(&sock).is_ok(),
+        Duration::from_secs(10),
+    ) {
+        fail_with(run, "the instance never accepted a connection");
+    }
+
+    let out = bubbler_dbus(tmp.path(), &init)
+        .args(["open", name, "--", "/usr/bin/cat"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    // The log is the one the live run is writing: `open` adds to it.
+    let said = run_log_of(tmp.path(), name);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{said}");
+    assert!(said.contains("executing inside it"), "{said}");
+    assert!(s.contains("into-a-running-one"), "stdout: {s}log: {said}");
+
+    kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
+    assert!(
+        wait_until(
+            || run
+                .try_wait()
+                .expect("waiting for the run process")
+                .is_some(),
+            Duration::from_secs(8)
+        ),
+        "the run did not stop after SIGTERM"
+    );
+}
+
 #[test]
 fn real_system_bus_answers_for_the_names_it_grants_and_no_others() {
     if !require_system_bus() {
