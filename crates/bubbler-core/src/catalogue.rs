@@ -126,10 +126,11 @@ pub static GRANTS: &[Grant] = &[
                topology a compute runtime reads to find the GPUs and the memory near \
                them: `/sys/class/kfd`, `/sys/devices/virtual/kfd` and \
                `/sys/devices/system/node` (`/sys/devices/system/cpu` comes with `dri` \
-               already). Requires `dri`, and against that grant it costs nothing new: \
-               `compute` reaches the same GPU through the same driver as `dri` and adds \
-               no capture risk `dri` did not already carry. A host with no `/dev/kfd` \
-               fails the launch rather than running without it.",
+               already). Requires `dri`: `compute` reaches the same GPUs through the \
+               same driver and adds no capture risk `dri` did not already carry, but \
+               where a render node is one card, `/dev/kfd` is every AMD GPU on the \
+               machine at once. A host with no `/dev/kfd` fails the launch rather than \
+               running without it.",
         risk: Risk::Wide,
         grammar: "compute",
     },

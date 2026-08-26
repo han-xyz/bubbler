@@ -538,7 +538,14 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
                     // above it; what they reach on this machine is not.
                     Some(Service::Compute) => out.push(format!("    grants: {COMPUTE_GRANT}")),
                     Some(Service::Smartcard) => out.push(format!("    grants: {SMARTCARD_GRANT}")),
-                    Some(Service::Usb { vendor: None, .. }) => {
+                    // Only a node with neither id is the bare grant. A
+                    // product without a vendor is half a filter, which
+                    // the parser refuses to write and which binds
+                    // nothing: it is explained as nothing too.
+                    Some(Service::Usb {
+                        vendor: None,
+                        product: None,
+                    }) => {
                         out.push(format!("    grants: {USB_ALL_GRANT}"));
                     }
                     Some(Service::Usb {
@@ -1200,6 +1207,45 @@ bwrap
 
 3 arguments in 1 group"
             )
+        );
+    }
+
+    /// A `usb` node holding a product and no vendor is half a filter,
+    /// which the parser refuses to write; the note for the bare grant is
+    /// not its note either. It never reaches that note: a group's label
+    /// is the node written back out, and writing this one is what says
+    /// no, before there is anything to put a note under.
+    #[test]
+    fn a_usb_node_with_a_product_and_no_vendor_is_not_the_bare_grant() {
+        let mut cfg = cfg("usb\ncommand \"true\"");
+        cfg.services[0] = Service::Usb {
+            vendor: None,
+            product: Some("0c8d".to_owned()),
+        };
+        let lines = Lines::default();
+        let out = render(
+            &[item(
+                Origin::Service(0),
+                &["--dev-bind", "/dev/bus/usb", "/dev/bus/usb"],
+                None,
+            )],
+            &View {
+                title: "bwrap",
+                instance: "t",
+                cfg: &cfg,
+                source: Source {
+                    file: "config.kdl",
+                    lines: &lines,
+                },
+                rules: &[],
+                wl_proxy: None,
+                proxy: false,
+                full: false,
+            },
+        );
+        assert!(
+            matches!(&out, Err(ConfigError::BadArgument { node, .. }) if node == "usb"),
+            "{out:?}"
         );
     }
 

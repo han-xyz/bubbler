@@ -774,10 +774,17 @@ fn usb(
         (None, Some(_)) => return Ok(()),
         (Some(vendor), _) => vendor,
     };
-    let first = services
-        .iter()
-        .position(|s| matches!(s, Service::Usb { .. }))
-        == Some(index);
+    // Among the filtered nodes only: a half-node binds nothing, so it
+    // would hand the bus directory to a node that never emits it.
+    let first = services.iter().position(|s| {
+        matches!(
+            s,
+            Service::Usb {
+                vendor: Some(_),
+                ..
+            }
+        )
+    }) == Some(index);
     if first {
         let bus = require_dir(host, "usb", bus.clone())?;
         args.ro_bind(&bus, &bus);
@@ -785,30 +792,22 @@ fn usb(
     // Keyed by the usbfs node, so the binds come out in a stable order
     // whatever order the bus directory was listed in, and a device seen
     // twice is bound once.
-    let mut found: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+    let mut found: BTreeMap<PathBuf, UsbMatch> = BTreeMap::new();
     let devices = bus.join("devices");
     for name in host.list_dir(&devices) {
         let entry = devices.join(&name);
         // An interface (`1-2:1.0`) carries no ids of its own, and neither
         // does an entry that has gone away mid-walk: both are passed
         // over rather than reported, the way an unplugged device is.
-        let Some(id) = sysfs_id(host, &entry, "idVendor") else {
+        let Some((its_vendor, its_product, busnum, devnum)) = usb_identity(host, &entry) else {
             continue;
         };
-        if id != vendor {
+        if its_vendor != vendor {
             continue;
         }
-        if let Some(product) = product
-            && sysfs_id(host, &entry, "idProduct").as_deref() != Some(product)
-        {
+        if product.is_some() && its_product.as_deref() != product {
             continue;
         }
-        let (Some(busnum), Some(devnum)) = (
-            sysfs_num(host, &entry, "busnum"),
-            sysfs_num(host, &entry, "devnum"),
-        ) else {
-            continue;
-        };
         let Some(dir) = host.canonicalize(&entry) else {
             continue;
         };
@@ -818,27 +817,64 @@ fn usb(
         if !dir.starts_with(SYS_DEVICES) {
             continue;
         }
-        found.insert(
-            PathBuf::from(format!("/dev/bus/usb/{busnum:03}/{devnum:03}")),
+        let matched = UsbMatch {
+            entry,
             dir,
-        );
+            vendor: its_vendor,
+            product: its_product,
+            busnum,
+            devnum,
+        };
+        found.insert(matched.node(), matched);
     }
     let mut bound = 0;
-    for (node, dir) in found {
-        // A device unplugged between the walk and here has neither its
-        // node nor its directory left: it is passed over rather than
-        // reported, so an unplug never fails the launch. A path that is
-        // still there but of the wrong type is a host anomaly and not an
-        // unplug, and is refused below.
-        if host.file_type(&node).is_none() || host.file_type(&dir).is_none() {
+    for (node, matched) in found {
+        // The kernel hands a device number to the next device as soon as
+        // it frees one, so the node this walk found can belong to
+        // something else by now: the entry's ids are read again and must
+        // be the ones that matched. What is checked is the sysfs
+        // identity and the type of the two paths; the node is opened by
+        // the sandbox later, and nothing here can hold it still.
+        if !matched.unchanged(host) {
+            matched.warn_gone();
             continue;
         }
-        // `file_type` follows symlinks, but `/dev/bus/usb` is the
-        // kernel's own directory, so a link there is the host's decision.
-        let node = require(host, "usb", node, "a character device", |t| {
-            t.is_char_device()
-        })?;
-        let dir = require_dir(host, "usb", dir)?;
+        let node = match host.file_type(&node) {
+            // Unplugged since the walk: passed over rather than
+            // reported, so an unplug never fails the launch. One stat
+            // for each path, so an unplug between two of them cannot
+            // turn into an error either.
+            None => {
+                matched.warn_gone();
+                continue;
+            }
+            // There and not a device: a host anomaly rather than an
+            // unplug. `file_type` follows symlinks, but `/dev/bus/usb` is
+            // the kernel's own directory, so a link there is the host's
+            // decision.
+            Some(t) if !t.is_char_device() => {
+                return Err(LaunchError::WrongType {
+                    service: "usb",
+                    path: node,
+                    expected: "a character device",
+                });
+            }
+            Some(_) => node,
+        };
+        let dir = match host.file_type(&matched.dir) {
+            None => {
+                matched.warn_gone();
+                continue;
+            }
+            Some(t) if !t.is_dir() => {
+                return Err(LaunchError::WrongType {
+                    service: "usb",
+                    path: matched.dir,
+                    expected: "a directory",
+                });
+            }
+            Some(_) => matched.dir,
+        };
         // `-try`: the node was there a moment ago, and a device unplugged
         // before the exec must not fail the launch either.
         args.dev_bind_try(&node, &node);
@@ -849,6 +885,71 @@ fn usb(
         warn_no_match(vendor, product);
     }
     Ok(())
+}
+
+/// A device a filtered `usb` node matched: where its attributes are
+/// read, what of the device tree is bound, and the identity that
+/// matched, which is checked again before anything is bound.
+struct UsbMatch {
+    /// `/sys/bus/usb/devices/<name>`: the symlink whose attributes say
+    /// which device this is.
+    entry: PathBuf,
+    /// The device's own directory in the device tree, which is bound.
+    dir: PathBuf,
+    vendor: String,
+    /// `None` only where the entry has no readable `idProduct`, which no
+    /// device of the kernel's has.
+    product: Option<String>,
+    busnum: u16,
+    devnum: u16,
+}
+
+impl UsbMatch {
+    /// The usbfs node this device is opened through: the bus and device
+    /// number, each zero-padded to three digits, as usbfs writes them.
+    fn node(&self) -> PathBuf {
+        PathBuf::from(format!(
+            "/dev/bus/usb/{:03}/{:03}",
+            self.busnum, self.devnum
+        ))
+    }
+
+    /// Whether the entry still describes this very device.
+    fn unchanged(&self, host: &dyn Host) -> bool {
+        usb_identity(host, &self.entry).is_some_and(|(vendor, product, busnum, devnum)| {
+            vendor == self.vendor
+                && product == self.product
+                && busnum == self.busnum
+                && devnum == self.devnum
+        })
+    }
+
+    /// Say that this device is not what is at its node any more:
+    /// unplugged, or replaced by another wearing the bus and device
+    /// number the kernel freed. Nothing of it is bound, and the launch
+    /// carries on.
+    fn warn_gone(&self) {
+        eprintln!(
+            "bubbler: warning: usb: {}:{} at bus {:03} device {:03} went away before the bind",
+            self.vendor,
+            self.product.as_deref().unwrap_or("*"),
+            self.busnum,
+            self.devnum
+        );
+    }
+}
+
+/// What a `usb` filter matches on, read from a `/sys/bus/usb/devices`
+/// entry: vendor id, product id, bus number, device number. `None` where
+/// the entry has no such attributes — an interface directory has none —
+/// or has stopped answering.
+fn usb_identity(host: &dyn Host, entry: &Path) -> Option<(String, Option<String>, u16, u16)> {
+    Some((
+        sysfs_id(host, entry, "idVendor")?,
+        sysfs_id(host, entry, "idProduct"),
+        sysfs_num(host, entry, "busnum")?,
+        sysfs_num(host, entry, "devnum")?,
+    ))
 }
 
 /// Say that a `usb` node bound nothing. Not a failure: the device it
@@ -1512,7 +1613,7 @@ mod tests {
     fn argv_with(
         services: &[Service],
         env: &Env,
-        host: &FakeHost,
+        host: &dyn Host,
         wayland: Option<&WaylandPlan>,
     ) -> Result<Vec<String>, LaunchError> {
         let plan = dbus::plan(services, "t");
@@ -3775,6 +3876,72 @@ mod tests {
         }
         let a = argv_with(&[usb_node(Some("0bb4"), Some("0c8d"))], &env(), &host, None).unwrap();
         assert!(only_the_bus(&a), "{:?}", binds(&a));
+    }
+
+    #[test]
+    fn a_device_that_changed_identity_between_the_walk_and_the_bind_is_passed_over() {
+        // The kernel gives a device number to the next device as soon as
+        // it frees one, so the node the walk matched can hold another
+        // device by the time the binds are built. Binding it would be
+        // raw I/O to a device the config never named.
+        struct Swapped {
+            inner: FakeHost,
+            path: PathBuf,
+            after: &'static str,
+            seen: std::cell::Cell<usize>,
+        }
+        impl Host for Swapped {
+            /// The first read is the walk's and answers what matched;
+            /// every read after it is the bind-time check.
+            fn read_small(&self, p: &Path) -> Option<Vec<u8>> {
+                if p == self.path {
+                    let seen = self.seen.get();
+                    self.seen.set(seen + 1);
+                    if seen > 0 {
+                        return Some(self.after.as_bytes().to_vec());
+                    }
+                }
+                self.inner.read_small(p)
+            }
+            fn file_type(&self, p: &Path) -> Option<FileType> {
+                self.inner.file_type(p)
+            }
+            fn list_dir(&self, p: &Path) -> Vec<OsString> {
+                self.inner.list_dir(p)
+            }
+            fn canonicalize(&self, p: &Path) -> Option<PathBuf> {
+                self.inner.canonicalize(p)
+            }
+            fn is_mountpoint(&self, p: &Path) -> Option<bool> {
+                self.inner.is_mountpoint(p)
+            }
+            fn writable(&self, p: &Path) -> bool {
+                Host::writable(&self.inner, p)
+            }
+        }
+        for (attribute, after) in [
+            ("idVendor", "1050\n"),
+            ("idProduct", "0002\n"),
+            ("devnum", "9\n"),
+        ] {
+            let mut inner = fake_host(&usb_host(), &usb_links());
+            for (p, bytes) in usb_ids() {
+                inner = inner.contents(p, bytes.as_bytes());
+            }
+            let host = Swapped {
+                inner,
+                path: PathBuf::from(format!("/sys/bus/usb/devices/1-2/{attribute}")),
+                after,
+                seen: std::cell::Cell::new(0),
+            };
+            let a =
+                argv_with(&[usb_node(Some("0bb4"), Some("0c8d"))], &env(), &host, None).unwrap();
+            assert!(
+                only_the_bus(&a),
+                "a device whose {attribute} changed was bound: {:?}",
+                binds(&a)
+            );
+        }
     }
 
     #[test]
