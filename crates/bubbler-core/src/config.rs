@@ -38,6 +38,25 @@ pub const MAX_BYTES: usize = 1024 * 1024;
 /// this is a bound the parser survives there too.
 pub const MAX_NESTING: usize = 32;
 
+/// Most `*` and `/` bubbler lets one `/* */` comment hold, nested
+/// comments included. `kdl` 6.7.1 reads a block comment by recursion
+/// (`commented_block` in its `v2_parser.rs`): once per `*`, per `/`,
+/// per nested comment and per run of other text between them, so a
+/// comment made of `/` overflows the stack from 2.5 KB of otherwise
+/// valid KDL. Seven lines of a starred box fit under this; no comment
+/// that says something holds more.
+///
+/// Measured against `kdl` 6.7.1 on x86_64 in a debug build, parsing
+/// until the process aborts: on the 8 MiB stack of a main thread, a run
+/// of `*` or `/` survives 2200 and aborts at 2500, and a mark between
+/// runs of text — two descents per mark, the worst shape — survives
+/// 1024 marks and aborts at 1500. On the 2 MiB stack of a spawned
+/// thread those are 512 and 256. The bound holds on the main thread
+/// bubbler parses on with room to spare in either shape; a library user
+/// parsing a comment this busy on a thread of its own is left the same
+/// margin only in the first.
+pub const MAX_COMMENT_MARKS: usize = 512;
+
 /// Keys `env` may not set: the sandbox owns them.
 pub const RESERVED_ENV: &[&str] = &[
     "HOME",
@@ -740,7 +759,16 @@ fn check_bounds(text: &str) -> Result<(), ConfigError> {
         let quoted = i < string_until;
         i = match b[i] {
             b'/' if !quoted && b.get(i + 1) == Some(&b'/') => line_comment_end(b, i),
-            b'/' if !quoted && b.get(i + 1) == Some(&b'*') => block_comment_end(b, i),
+            b'/' if !quoted && b.get(i + 1) == Some(&b'*') => {
+                let (end, marks) = block_comment_end(b, i);
+                if marks > MAX_COMMENT_MARKS {
+                    return Err(ConfigError::CommentTooBusy {
+                        line: line_at(text, i).unwrap_or(0),
+                        max: MAX_COMMENT_MARKS,
+                    });
+                }
+                end
+            }
             b'"' if !quoted => {
                 string_until = string_end(b, i, 0).unwrap_or(b.len());
                 i + 1
@@ -809,28 +837,40 @@ fn newline_len(b: &[u8], at: usize) -> Option<usize> {
     }
 }
 
-/// Index just past the `/* */` comment at `at`. KDL nests them, so the
-/// first `*/` does not always end one.
-fn block_comment_end(b: &[u8], at: usize) -> usize {
+/// Index just past the `/* */` comment at `at`, and how many `*` and
+/// `/` it holds between its own `/*` and `*/` — what the parser
+/// recurses on, and what [`MAX_COMMENT_MARKS`] bounds. KDL nests them,
+/// so the first `*/` does not always end one.
+fn block_comment_end(b: &[u8], at: usize) -> (usize, usize) {
     let mut open: usize = 1;
+    let mut marks: usize = 0;
     let mut i = at + 2;
     while i + 1 < b.len() {
         match (b[i], b[i + 1]) {
             (b'/', b'*') => {
                 open += 1;
+                marks += 2;
                 i += 2;
             }
             (b'*', b'/') => {
                 open -= 1;
                 i += 2;
                 if open == 0 {
-                    return i;
+                    return (i, marks);
                 }
+                marks += 2;
+            }
+            (b'*' | b'/', _) => {
+                marks += 1;
+                i += 1;
             }
             _ => i += 1,
         }
     }
-    b.len()
+    if matches!(b.get(i), Some(b'*' | b'/')) {
+        marks += 1;
+    }
+    (b.len(), marks)
 }
 
 /// Index just past the string whose opening quote is at `quote`, opened
@@ -1268,7 +1308,7 @@ fn slashdash_marks(text: &str) -> Vec<usize> {
         }
         let (next, opens) = match b[i] {
             b'/' if b.get(i + 1) == Some(&b'/') => (line_comment_end(b, i), false),
-            b'/' if b.get(i + 1) == Some(&b'*') => (block_comment_end(b, i), false),
+            b'/' if b.get(i + 1) == Some(&b'*') => (block_comment_end(b, i).0, false),
             b'\\' => (escline_end(b, i), false),
             b'"' => (string_end(b, i, 0).unwrap_or(i + 1), false),
             // `#` opens a raw string (`#"…"#`) and also the keywords
@@ -5057,6 +5097,75 @@ command "b""#
             check_bounds(&opens)
         );
         assert!(matches!(parse(&opens), Err(ConfigError::TooDeep { .. })));
+    }
+
+    #[test]
+    fn a_block_comment_is_bounded_before_the_parser_recurses_on_it() {
+        // kdl 6.7.1 reads a block comment by recursing once per `*` or
+        // `/` in it (`commented_block` in its `v2_parser.rs`), so a
+        // valid document with a busy enough comment aborted the process
+        // from a 2.5 KB file, and so did one that never closes.
+        for text in [
+            format!("/*{}*/\ncommand \"true\"\n", "/".repeat(2500)),
+            format!("/*{}*/\ncommand \"true\"\n", "/*".repeat(20_000)),
+            "/*".repeat(50_000),
+        ] {
+            assert!(
+                matches!(
+                    parse(&text),
+                    Err(ConfigError::CommentTooBusy { line: 1, max }) if max == MAX_COMMENT_MARKS
+                ),
+                "{:?}",
+                check_bounds(&text)
+            );
+        }
+    }
+
+    #[test]
+    fn the_comment_bound_admits_its_own_count_and_stops_one_past_it() {
+        let starred = |n: usize| format!("/*{}*/\ncommand \"true\"\n", "*".repeat(n));
+        assert!(check_bounds(&starred(MAX_COMMENT_MARKS)).is_ok());
+        assert!(matches!(
+            check_bounds(&starred(MAX_COMMENT_MARKS + 1)),
+            Err(ConfigError::CommentTooBusy { line: 1, max }) if max == MAX_COMMENT_MARKS
+        ));
+        // Per comment, not per file: two at the bound are fine.
+        let two = format!(
+            "{}{}",
+            starred(MAX_COMMENT_MARKS),
+            starred(MAX_COMMENT_MARKS)
+        );
+        assert!(check_bounds(&two).is_ok());
+        // A nested comment is four marks of the one it sits in.
+        let nested = |n: usize| {
+            format!(
+                "/*{}{}*/\ncommand \"true\"\n",
+                "/*".repeat(n),
+                "*/".repeat(n)
+            )
+        };
+        assert!(check_bounds(&nested(MAX_COMMENT_MARKS / 4)).is_ok());
+        assert!(matches!(
+            check_bounds(&nested(MAX_COMMENT_MARKS / 4 + 1)),
+            Err(ConfigError::CommentTooBusy { .. })
+        ));
+        // The line named is the one the comment opens on.
+        let later = format!(
+            "command \"true\"\n/* a\n{}*/\n",
+            "/".repeat(MAX_COMMENT_MARKS + 1)
+        );
+        assert!(matches!(
+            check_bounds(&later),
+            Err(ConfigError::CommentTooBusy { line: 2, .. })
+        ));
+        // And the parser, on the 2 MiB stack this thread has, in the
+        // shape that descends twice per mark, at a quarter of the bound:
+        // this thread takes 256 of those and the main thread 1024.
+        let mixed = format!(
+            "/*{}*/\ncommand \"true\"\n",
+            "* ".repeat(MAX_COMMENT_MARKS / 4)
+        );
+        assert!(parse(&mixed).is_ok());
     }
 
     #[test]

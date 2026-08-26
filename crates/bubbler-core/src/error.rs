@@ -56,6 +56,18 @@ pub enum ConfigError {
         /// The bound it passed, [`crate::config::MAX_NESTING`].
         max: usize,
     },
+    /// A `/* */` comment holding more than
+    /// [`crate::config::MAX_COMMENT_MARKS`] `*` or `/`. The KDL parser
+    /// reads a block comment by recursing once per one of those, so a
+    /// comment busy enough overflows the stack and aborts the process
+    /// instead of being skipped.
+    #[error("a block comment opened at line {line} holds more than {max} `*` or `/`")]
+    CommentTooBusy {
+        /// Line the comment opens on, counting from one.
+        line: u32,
+        /// The bound it passed, [`crate::config::MAX_COMMENT_MARKS`].
+        max: usize,
+    },
 }
 
 /// Failures while resolving a profile through its layers.
