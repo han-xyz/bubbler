@@ -1259,7 +1259,9 @@ mod tests {
         let (bus, server) = fake_bus(tmp.path(), move |stream| {
             server_start(&stream);
             let call = server_addfull(&stream);
-            assert_eq!(call.text(FIELD_DESTINATION), PORTAL_NAME);
+            // The unique name the lookup gave, so the call and its
+            // reply are bound to the one connection that answered.
+            assert_eq!(call.text(FIELD_DESTINATION), PORTAL_OWNER);
             assert_eq!(call.text(FIELD_PATH), PORTAL_PATH);
             assert_eq!(call.text(FIELD_INTERFACE), PORTAL_IFACE);
             assert_eq!(call.text(FIELD_MEMBER), "AddFull");
