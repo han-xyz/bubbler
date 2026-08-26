@@ -49,10 +49,19 @@ sandbox. `?` on any screen lists keys:
 | Screen | Keys |
 |---|---|
 | instances | `Enter` grants, `r` run, `o` open, `x` exec, `t` try, `n` new, `d` delete, `R` reseed, `e` `$EDITOR`, `l` lint, `L` log, `D` desktop entry, `W` shim, `X` explain, `p` profiles, `^R` re-read |
-| grants | `Space` grant/revoke, `Enter` edit the node as one line of KDL, `e` `$EDITOR`, `s` save, `u` undo, `l` lint, `X` explain, `Esc` back |
+| grants | `Space` grant / disable (keeps the line) / enable, `Enter` edit the node as one line of KDL, `Del` remove the entry (`Backspace` too), `e` `$EDITOR`, `s` save, `u` undo, `l` lint, `X` explain, `Esc` back |
 | profiles | `Enter` show flattened, `c` create instance, `e` edit your layer, `l` lint |
 | viewer | `j`/`k` scroll, `f` every argument, `p` the proxy's argv |
 
+`Space` on a granted node that carries an argument, a property or children
+writes it back as a `/-` line rather than dropping what it said (see
+[Configuration](Configuration.md#disabling-a-node)); a bare node such as `dri`
+is removed, since a `/-` line would keep nothing of it. Disabled entries are
+dimmed `○` rows in file order, and repeatable nodes (`home-share`,
+`path-share`, `etc-share`, `app-runtime`, `env`, `lint-allow`) keep a bare `○`
+row under their last entry that adds another.
+
 `s` writes through the same path as `reseed`: header kept, `config.kdl.bak`
-written first, **comments not kept**. `q` quits, `Esc` goes back, `^C` does
-nothing while the editor is up.
+written first, **comments not kept** (a `/-` line is an entry, not a comment,
+and is written back). `q` quits, `Esc` goes back, `^C` does nothing while the
+editor is up.

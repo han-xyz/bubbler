@@ -508,6 +508,43 @@ globally available input devices; grant it only to a profile you would trust
 with your keyboard. A host whose `/dev/uinput` is missing (the `uinput` module
 not loaded) is an error, not a quietly weaker sandbox.
 
+### Disabling a node
+
+A node whose line starts with `/-` is kept by the file and granted by nothing:
+
+    home-share "Downloads"
+    /-home-share "Music"             # kept, granted again when the `/-` goes
+    /-dbus {                         # a block keeps its children with it
+        talk "ca.desrt.dconf"
+    }
+    command "firefox"
+
+`/-` is KDL's own "skip the next node", so every reader of the format drops
+those lines and bubbler is the one that reads them back — as an entry that is
+turned off. Nothing downstream of the parser sees it: no bind in the argv, no
+line in `--explain`, no lint finding, and no bundle check firing for a grant
+that is not there. It takes no part in the duplicate check either, so
+`home-share "D"` may sit beside `/-home-share "D" mode=rw`, which is what
+trying the wider one for an evening looks like.
+
+What it is not is a comment. The line is parsed as the node it spells out, so
+it has to be one bubbler reads: `/-home-shre "x"` is `unknown node`, the same
+error the line without the `/-` would be, and `bubbler edit` refuses the file
+until it is fixed. That is the point of the form — a grant put aside is still
+checked against the bubbler in front of you, rather than rotting in a comment
+until the day it is pasted back in.
+
+Only a whole top-level node, and only at the start of its line. A `/-` further
+in — in front of an argument, a property, or a child of a `dbus` or `seccomp`
+block — is the plain KDL comment it has always been: dropped by the parser and
+never written back.
+
+`bubbler edit` and `bubbler ui` keep those lines, and `Space` in the editor is
+what writes one (see "Terminal editor"). `reseed` does not keep them: it writes
+the file again from the profile, as it does with everything the file held. A
+`/-` line in a profile — or in any layer under it — is read the same way and
+seeds a disabled entry into every instance made from it.
+
 ### wayland
 
 `wayland` on its own does not hand the application the session's compositor
@@ -2095,12 +2132,28 @@ Keys, with `?` for the full list on every screen:
 | screen | keys |
 |---|---|
 | instances | `Enter` grants, `r` run, `o` open, `x` exec, `t` try, `n` new, `d` delete, `R` reseed, `e` `$EDITOR`, `l` lint, `L` last-run log, `D` desktop entry, `W` shim, `X` explain, `p` profiles, `^R` re-read |
-| grants | `Space` grant or revoke, `Enter` write the node as KDL, `e` `$EDITOR`, `s` save, `u` undo, `l` lint, `X` explain, `Esc` back |
+| grants | `Space` grant / disable (keeps the line) / enable, `Enter` write the node as KDL, `Del` remove the entry (`Backspace` too), `e` `$EDITOR`, `s` save, `u` undo, `l` lint, `X` explain, `Esc` back |
 | profiles | `Enter` show it flattened, `c` create an instance from it, `e` `$EDITOR` on your layer, `l` lint |
 | viewer | `j`/`k` scroll, `f` every argument, `p` the proxy's argv |
 
-`Space` grants a node that means something on its own and revokes any node at
-all. Everything else is `Enter`, which opens the node as one line of KDL —
+`Space` is the three-way key. On a node the config does not hold it grants it,
+where the node means something on its own. On a granted node carrying anything
+beyond its name — an argument, a property, children — it writes the line back
+prefixed `/-`, which keeps what the node said instead of dropping it (see
+"Disabling a node"); a bare node such as `dri` or `portals` has nothing a `/-`
+line would keep, so that one is removed as before. On a `/-` line it grants the
+node again, in the place it had. Disabled entries are `○` rows with their text
+dimmed, in file order among the entries of their node, and the pane beside one
+says `disabled — Space enables, Delete removes`.
+
+`Delete`, and `Backspace` outside a prompt, takes the entry the row names out
+of the buffer, granted or disabled; `u` puts it back, `s` writes it away for
+good. The repeatable nodes — `home-share`, `path-share`, `etc-share`,
+`app-runtime`, `env`, `lint-allow` — keep a bare `○` row under their last
+entry, and `Enter` on it opens an empty prompt (`home-share `) that adds
+another, where `Enter` on an entry row edits that entry.
+
+Everything else is `Enter`, which opens the node as one line of KDL —
 `home-share "Downloads" mode=rw` — parsed by the parser that reads the file, so
 a line the editor accepts is a line bubbler accepts, and one it refuses stays on
 screen with the reason under it. A block node is valid KDL on one line too, so
@@ -2119,10 +2172,11 @@ with no `command` node of its own can still be given one.
 the config version are kept, `config.kdl.bak` is written first, and what was
 rendered is parsed again before it replaces anything. **Comments are not kept**
 — the file is rendered from the config, exactly as `create` and `reseed` render
-it — and the status line says so. `u` goes back to the config as last written.
-Saving while the sandbox is running is allowed and says what `bubbler edit`
-says: bwrap cannot be told about a bind after the fact, so it applies on the
-next start.
+it — and the status line says so. A `/-` line is not a comment to bubbler: it is
+an entry the config holds, and it is written back where it was. `u` goes back to
+the config as last written. Saving while the sandbox is running is allowed and
+says what `bubbler edit` says: bwrap cannot be told about a bind after the fact,
+so it applies on the next start.
 
 The terminal comes back three ways: the ordinary one, a panic — the hook
 restores it before the message — and `SIGINT`, `SIGTERM` or `SIGHUP`, which set

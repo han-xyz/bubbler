@@ -5736,6 +5736,108 @@ fn edit_prefers_visual_and_passes_editor_arguments() {
     );
 }
 
+/// An instance that keeps one share as a `/-` line. The path that line
+/// names is not on this host, so a run that read the line would refuse
+/// and a lint that read it would warn: what the tests below assert is
+/// silence, and this is what makes the silence mean something.
+fn with_a_disabled_share(tmp: &Path) -> PathBuf {
+    bubbler(tmp).args(["create", "t"]).status().unwrap();
+    std::fs::create_dir_all(tmp.join("home/Downloads")).unwrap();
+    let cfg = tmp.join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(
+        &cfg,
+        "// bubbler config: 2\nhome-share \"Downloads\"\n/-home-share \"Music\"\n\
+         command \"true\"\n",
+    )
+    .unwrap();
+    cfg
+}
+
+/// A `/-` line is a node the file keeps and nothing downstream of the
+/// parser sees: no bind in the argv, no finding, no line in `--explain`.
+#[test]
+fn a_disabled_node_is_neither_bound_nor_linted_nor_explained() {
+    let tmp = setup();
+    with_a_disabled_share(tmp.path());
+
+    let (code, out, err) = run(tmp.path(), &["run", "t", "--dry-run"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains(&format!(
+            "--ro-bind\n{}\n/home/bubbler/Downloads\n",
+            tmp.path().join("home/Downloads").display()
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("Music"), "{out}");
+
+    let (code, out, err) = run(tmp.path(), &["lint", "t"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(
+        !out.contains("Music") && !out.contains("share-source-missing"),
+        "{out}"
+    );
+
+    let (code, out, err) = run(tmp.path(), &["run", "t", "--explain"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("  home-share \"Downloads\" "), "{out}");
+    assert!(!out.contains("Music"), "{out}");
+}
+
+/// `edit`'s re-check reads a `/-` line as the node it spells out, so a
+/// valid one is accepted and the file keeps it exactly as written.
+#[test]
+fn edit_keeps_a_disabled_line_and_lints_nothing_about_it() {
+    let tmp = setup();
+    run(tmp.path(), &["create", "t"]);
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    let script = tmp.path().join("disabling-editor");
+    write_script(
+        &script,
+        "#!/usr/bin/sh\nprintf '/-x11 \"host\"\\n' >> \"$1\"\n",
+    );
+    let out = bubbler(tmp.path())
+        .env("EDITOR", &script)
+        .args(["edit", "t"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(!err.contains("x11"), "{err}");
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    assert!(text.ends_with("/-x11 \"host\"\n"), "{text}");
+
+    let (code, out, err) = run(tmp.path(), &["lint", "t"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(!out.contains("x11"), "{out}");
+}
+
+/// A disabled line is still a bubbler node: a misspelling is the same
+/// error it would be without the `/-`, and the file is left as the user
+/// wrote it.
+#[test]
+fn edit_refuses_a_disabled_line_that_names_no_node() {
+    let tmp = setup();
+    run(tmp.path(), &["create", "t"]);
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    let script = tmp.path().join("misspelling-editor");
+    write_script(
+        &script,
+        "#!/usr/bin/sh\nprintf '/-home-shre \"x\"\\n' >> \"$1\"\n",
+    );
+    let out = bubbler(tmp.path())
+        .env("EDITOR", &script)
+        .args(["edit", "t"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("still has errors"), "{err}");
+    assert!(err.contains("unknown node `home-shre`"), "{err}");
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    assert!(text.ends_with("/-home-shre \"x\"\n"), "{text}");
+}
+
 #[test]
 fn try_rejects_bad_grants_and_cleans_up_a_failed_start() {
     let tmp = setup();

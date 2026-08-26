@@ -45,6 +45,26 @@ desktop "org.mozilla.Thunderbird.desktop"   // which entry `bubbler desktop` cop
 command "firefox"
 ```
 
+## Disabling a node
+
+A node whose line starts with `/-` is kept by the file and granted by nothing:
+
+```kdl
+home-share "Downloads"
+/-home-share "Music"             // kept, not granted
+/-dbus { talk "ca.desrt.dconf" } // a block keeps its children with it
+```
+
+KDL drops the line and bubbler reads it back as an entry that is turned off:
+`run`, `--explain` and `lint` never see it, and it counts for neither the
+duplicate check nor the bundle checks. It is not a comment — the line is parsed
+as the node it spells out, so `/-home-shre "x"` is still `unknown node` — and it
+is only a whole top-level node at the start of its line; a `/-` in front of an
+argument or a child of a block is the ordinary KDL comment. `edit` and
+`bubbler ui` keep those lines (`Space` in the editor writes them), `reseed`
+writes the file again from the profile; a `/-` line in a profile seeds a
+disabled entry into every instance made from it.
+
 ## Grant reference
 
 | Node | Grants | Watch out |

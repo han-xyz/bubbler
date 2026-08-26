@@ -204,6 +204,15 @@ const CONFIG_DESCRIPTION: &[&str] = &[
      that was silently dropped is a sandbox that does not do what its file says. \
      The same file read by an older bubbler is why `// bubbler config: <n>` is \
      written at the top.",
+    "A node whose line starts with `/-` is one the file keeps and nothing grants: KDL \
+     drops it, and bubbler reads it back as an entry that is turned off. Nothing past \
+     the parser sees it — no bind, no lint finding, no line under --explain, and no \
+     part in the duplicate check — but it is parsed as the node it spells out, so a \
+     misspelled one is the error it would be without the `/-`. Only a whole top-level \
+     node, at the start of its line; a `/-` in front of an argument or a child of a \
+     block is the ordinary KDL comment. `bubbler edit` and `bubbler ui` keep those \
+     lines, and Space in the editor is what writes one; `reseed` writes the file again \
+     from the profile, which may carry `/-` lines of its own.",
     "A profile may `include` another, and the layers — yours, the system's, the \
      built-in library — are flattened before any of this is read. `bubbler profile \
      show <name>` prints the result with every node under the layer it came from.",

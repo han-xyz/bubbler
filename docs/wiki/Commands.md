@@ -49,6 +49,13 @@ bubbler man [--config]                  bubbler(1) / bubbler-config(5) as roff o
   warning naming the gap when they cannot; `exec` does not. See
   [Sharing Files](Sharing-Files.md#file-arguments).
 - `edit` splits `$VISUAL`/`$EDITOR` on whitespace; no shell, no expansion.
+- `ui` keys on the grants screen: `Space` grants a node, turns a granted one
+  that carries an argument, a property or children into a `/-` line the file
+  keeps, and grants a `/-` line back; `Delete` (`Backspace` too) removes the
+  entry the row names; `Enter` writes it as one line of KDL, and the bare `○`
+  row under a repeatable node's last entry adds another. `s` saves, `u` undoes.
+  See [Terminal](Terminal.md#bubbler-ui) and
+  [Configuration](Configuration.md#disabling-a-node).
 - Instance names: `[A-Za-z0-9._-]`, not starting with `-`, not `try-<digits>`.
 - Environment: `HOME` and `XDG_RUNTIME_DIR` must be set. `BUBBLER_PROFILE_DIR`
   replaces the system profile layer; `BUBBLER_DBUS_LOG=1` logs every filtered
