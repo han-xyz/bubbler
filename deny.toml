@@ -32,7 +32,19 @@ unsound = "all"
 # Fail if the local advisory DB is older than 30 days, so a stale CI
 # cache cannot silently turn this check into a no-op.
 maximum-db-staleness = "P30D"
-ignore = []
+# quick-xml 0.37 is reached only through wayrs-proto-parser (3.0.1, its
+# latest, pins quick-xml 0.37 even on main).  It runs in two places, both
+# at build time and both on XML that ships inside the pinned wayrs
+# crates: bubbler-wl-proxy's build.rs generating the proxy's tables, and
+# wayrs-scanner's proc macro generating bubbler-core's bindings.  No
+# bubbler binary links it and nothing parses XML at run time, so the
+# two advisories -- CPU and memory exhaustion on attacker-supplied XML --
+# have no input to act on here.  Drop these entries when wayrs-proto-parser
+# moves to quick-xml >= 0.41.
+ignore = [
+    { id = "RUSTSEC-2026-0194", reason = "build-time only, on XML vendored by the pinned wayrs crates" },
+    { id = "RUSTSEC-2026-0195", reason = "build-time only, on XML vendored by the pinned wayrs crates" },
+]
 
 [licenses]
 # bubbler is GPL-3.0-or-later.  Every licence below is one-way compatible
