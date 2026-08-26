@@ -11,6 +11,7 @@ pub mod env;
 pub mod error;
 pub mod exec;
 pub mod explain;
+pub mod forward;
 pub mod fsutil;
 pub mod host;
 pub mod init_bin;

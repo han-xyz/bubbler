@@ -19,6 +19,10 @@ pub trait Host {
     /// cannot be told here, so a caller reports nothing rather than
     /// guessing.
     fn is_mountpoint(&self, p: &Path) -> Option<bool>;
+    /// Whether the user may write `p`, with symlinks followed. A file the
+    /// user cannot write is forwarded to the document portal read-only,
+    /// so this decides what a sandbox is granted, not what it is told.
+    fn writable(&self, p: &Path) -> bool;
 }
 
 /// The real filesystem.
@@ -44,6 +48,12 @@ impl Host for RealHost {
             return Some(true);
         };
         Some(here.dev() != fs::metadata(parent).ok()?.dev())
+    }
+
+    /// `access(2)` tests the real uid and gid; bubbler is never setuid,
+    /// so those are the ids it would write the file with anyway.
+    fn writable(&self, p: &Path) -> bool {
+        rustix::fs::access(p, rustix::fs::Access::WRITE_OK).is_ok()
     }
 
     /// A directory that cannot be read yields an empty list, so a caller
@@ -72,6 +82,7 @@ pub(crate) mod fake {
         pub entries: BTreeMap<PathBuf, FileType>,
         pub links: BTreeMap<PathBuf, PathBuf>,
         pub mounts: BTreeSet<PathBuf>,
+        pub writable: BTreeSet<PathBuf>,
     }
 
     impl FakeHost {
@@ -87,6 +98,12 @@ pub(crate) mod fake {
 
         pub fn mount(mut self, p: &str) -> Self {
             self.mounts.insert(PathBuf::from(p));
+            self
+        }
+
+        /// Mark `p` writable by the user; every other path is read-only.
+        pub fn rw(mut self, p: &str) -> Self {
+            self.writable.insert(PathBuf::from(p));
             self
         }
     }
@@ -119,6 +136,11 @@ pub(crate) mod fake {
             self.entries
                 .contains_key(p)
                 .then(|| self.mounts.contains(p))
+        }
+        /// Only what [`FakeHost::rw`] named; the tests never touch the
+        /// permissions of a real file.
+        fn writable(&self, p: &Path) -> bool {
+            self.writable.contains(p)
         }
         fn list_dir(&self, p: &Path) -> Vec<OsString> {
             let mut v: Vec<OsString> = self

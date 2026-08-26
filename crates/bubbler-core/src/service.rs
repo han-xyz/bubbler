@@ -1970,6 +1970,9 @@ mod tests {
             fn is_mountpoint(&self, p: &Path) -> Option<bool> {
                 self.0.is_mountpoint(p)
             }
+            fn writable(&self, p: &Path) -> bool {
+                Host::writable(&self.0, p)
+            }
         }
         let e = env();
         let mut args = BwrapArgs::baseline(&e, Path::new("/i/home"), &host);
