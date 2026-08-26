@@ -705,6 +705,17 @@ pub fn parse_document(text: &str) -> Result<KdlDocument, ConfigError> {
 
 /// Refuse text past [`MAX_BYTES`] or [`MAX_NESTING`]. Counting the
 /// braces by hand is the point: see [`parse_document`].
+///
+/// A `{` inside a string is counted like any other. The parser recovers
+/// from a string it cannot read — a bad escape, a NUL, a multi-line body
+/// whose lines do not carry the indentation of its closing quotes — and
+/// reads what was written inside it as nodes, descending into every `{`
+/// there; a count that trusted the string would have cleared text the
+/// parser then recurses through, and that is a stack overflow, which
+/// aborts the process rather than failing. The cost is that a string
+/// holding more than [`MAX_NESTING`] unbalanced `{` is refused, and no
+/// configuration that grants anything writes one. Comments are still
+/// stepped over: KDL never reads one back as nodes.
 fn check_bounds(text: &str) -> Result<(), ConfigError> {
     if text.len() > MAX_BYTES {
         return Err(ConfigError::TooLarge {
@@ -719,20 +730,6 @@ fn check_bounds(text: &str) -> Result<(), ConfigError> {
         i = match b[i] {
             b'/' if b.get(i + 1) == Some(&b'/') => line_comment_end(b, i),
             b'/' if b.get(i + 1) == Some(&b'*') => block_comment_end(b, i),
-            // A string with no end is not a reason to stop counting:
-            // the parser recovers from it and reads what follows as
-            // configuration, so this has to count that too.
-            b'"' => string_end(b, i, 0).unwrap_or(i + 1),
-            // `#` opens a raw string (`#"…"#`) and also the keywords
-            // `#true`, `#null` and their kin, which hold no braces.
-            b'#' => {
-                let hashes = b[i..].iter().take_while(|c| **c == b'#').count();
-                if b.get(i + hashes) == Some(&b'"') {
-                    string_end(b, i + hashes, hashes).unwrap_or(i + hashes + 1)
-                } else {
-                    i + hashes
-                }
-            }
             b'{' => {
                 depth += 1;
                 if depth > MAX_NESTING {
@@ -813,7 +810,13 @@ fn block_comment_end(b: &[u8], at: usize) -> usize {
 }
 
 /// Index just past the string whose opening quote is at `quote`, opened
-/// by `hashes` `#` before it, or `None` where the string never ends. A
+/// by `hashes` `#` before it, or `None` where the string never ends.
+/// Read only by [`slashdash_marks`], which runs over text the parser has
+/// already accepted, so a string it steps over is one the parser read as
+/// a string too — unlike [`check_bounds`], which runs before the parse
+/// and trusts nothing.
+///
+/// A
 /// quoted string ends at the first `"` that is not escaped; a raw string
 /// has no escapes; either ends at a `"` followed by at least as many `#`
 /// as opened it. `"""` *and a newline* open the multi-line form, which
@@ -4572,20 +4575,37 @@ command "b""#
     }
 
     #[test]
-    fn the_pre_check_counts_braces_outside_strings_and_comments() {
+    fn the_pre_check_counts_braces_outside_comments() {
         let braces = "{".repeat(MAX_NESTING * 4);
         // A profile that grants what it says still parses, however many
-        // braces its text holds where nesting is not what they mean.
+        // braces its comments hold, and a string may hold them too as
+        // long as the file does not read as deeper than the bound.
         for text in [
             format!("// {braces}\ncommand \"true\"\n"),
             format!("/* {braces} */\ncommand \"true\"\n"),
             format!("/* /* {braces} */ */\ncommand \"true\"\n"),
-            format!("command \"{braces}\"\n"),
-            format!("command #\"{braces}\"#\n"),
-            format!("command \"\"\"\n{braces}\n\"\"\"\n"),
+            format!("command \"{}\"\n", "{".repeat(MAX_NESTING)),
+            format!("command #\"{}\"#\n", "{".repeat(MAX_NESTING)),
+            format!("command \"\"\"\n{}\n\"\"\"\n", "{".repeat(MAX_NESTING)),
+            // Balanced, so the file never reads as deep at all.
+            format!("command \"{}\"\n", "{}".repeat(MAX_NESTING * 4)),
             "dbus {\n    talk \"org.a.B\"\n}\ncommand \"true\"\n".to_owned(),
         ] {
             assert!(parse(&text).is_ok(), "{text}");
+        }
+        // Deliberately refused rather than trusted: the parser recovers
+        // from a string it cannot read and descends into the braces
+        // written inside it, so the count cannot skip them. No config
+        // that grants anything writes a string like this.
+        for text in [
+            format!("command \"{braces}\"\n"),
+            format!("command #\"{braces}\"#\n"),
+            format!("command \"\"\"\n{braces}\n\"\"\"\n"),
+        ] {
+            assert!(
+                matches!(parse(&text), Err(ConfigError::TooDeep { .. })),
+                "{text}"
+            );
         }
     }
 
@@ -4953,19 +4973,31 @@ command "b""#
             "command #\"x\n",
             // A comment KDL ends at a carriage return.
             "// c\r",
+            // Strings the parser cannot read and recovers from, reading
+            // what was written inside them as nodes: a bad escape, a
+            // NUL, and a multi-line body whose lines do not carry the
+            // indentation its closing quotes do, quoted and raw.
+            "command \"\\q",
+            "command \"\u{0}",
+            "command \"\"\"\n",
+            "command #\"\"\"\n",
         ] {
-            let deep = format!("{head}{}", "{".repeat(MAX_NESTING + 1));
-            assert!(
-                matches!(check_bounds(&deep), Err(ConfigError::TooDeep { .. })),
-                "{head:?}: {:?}",
-                check_bounds(&deep)
-            );
-            // And the whole way in, at a size a config file may have.
-            let big = format!("{head}{}", "{".repeat(200_000));
-            assert!(
-                matches!(parse(&big), Err(ConfigError::TooDeep { .. })),
-                "{head:?}"
-            );
+            // Closed or not, the braces are the parser's to read.
+            for tail in ["", "\"\n", "\n  \"\"\"\n", "\n  \"\"\"#\n"] {
+                let deep = format!("{head}{}{tail}", "{".repeat(MAX_NESTING + 1));
+                assert!(
+                    matches!(check_bounds(&deep), Err(ConfigError::TooDeep { .. })),
+                    "{head:?}{tail:?}: {:?}",
+                    check_bounds(&deep)
+                );
+                // And the whole way in, at a size a config file may
+                // have: past the count, this text aborts the process.
+                let big = format!("{head}{}{tail}", "{".repeat(200_000));
+                assert!(
+                    matches!(parse(&big), Err(ConfigError::TooDeep { .. })),
+                    "{head:?}{tail:?}"
+                );
+            }
         }
         // A block comment with no end is the one that needs no counting:
         // the parser reads the rest of the file as comment and says so.
