@@ -2,6 +2,10 @@
 
 ## bubbler lint
 
+A node commented out with `/-` at the start of its line is a disabled entry:
+lint checks that it is a valid node and otherwise reports nothing about it, and
+`--explain` never lists it (see Configuration → Disabling a node).
+
 ```
 bubbler profile lint firefox
 bubbler profile lint --all [--deny warnings] [--format json]

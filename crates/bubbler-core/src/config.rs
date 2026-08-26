@@ -61,10 +61,10 @@ pub const PARSER_STACK: usize = 512 << 20;
 /// braces in the text are at most N descents, however the parser reads
 /// them. Measured on x86_64, parsing well-formed nesting until the
 /// process aborts: 1348 levels on the 8 MiB stack a main thread has in
-/// a release build, 253 in a debug build, and 61 on the 2 MiB stack of
-/// a spawned thread in a debug build. The bound sits far under the
-/// smallest of those, so the children descents are a rounding error on
-/// the stack [`parse_document`] reserves.
+/// a release build, 253 in a debug build, and 61 on a 2 MiB stack in a
+/// debug build. The bound sits far under the smallest of those, and the
+/// parser runs on the stack [`parse_document`] reserves, where the
+/// children descents are a rounding error.
 pub const MAX_NESTING: usize = 32;
 
 /// Most `*` and `/` bubbler lets one `/* */` comment hold, nested
@@ -854,7 +854,7 @@ fn check_bounds(text: &str) -> Result<(), ConfigError> {
 /// of the text. KDL ends the comment at any of the newlines it reads,
 /// not only at a line feed: a file with carriage returns for line
 /// endings would otherwise be one comment to the end of the text, and
-/// what the count skipped the parser would still read.
+/// a `/-` line inside it would go unread.
 fn line_comment_end(b: &[u8], at: usize) -> usize {
     let mut i = at;
     while i < b.len() {

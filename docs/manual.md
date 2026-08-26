@@ -525,7 +525,10 @@ turned off. Nothing downstream of the parser sees it: no bind in the argv, no
 line in `--explain`, no lint finding, and no bundle check firing for a grant
 that is not there. It takes no part in the duplicate check either, so
 `home-share "D"` may sit beside `/-home-share "D" mode=rw`, which is what
-trying the wider one for an evening looks like.
+trying the wider one for an evening looks like. A `/-` line grants nothing,
+and it revokes nothing either: an enabled node of the same name, in this file
+or in a layer under it, still applies — `/-network` under a profile that
+grants `network` leaves the network on.
 
 What it is not is a comment. The line is parsed as the node it spells out, so
 it has to be one bubbler reads: `/-home-shre "x"` is `unknown node`, the same
@@ -2143,7 +2146,7 @@ prefixed `/-`, which keeps what the node said instead of dropping it (see
 "Disabling a node"); a bare node such as `dri` or `portals` has nothing a `/-`
 line would keep, so that one is removed as before. On a `/-` line it grants the
 node again, in the place it had. Disabled entries are `○` rows with their text
-dimmed, in file order among the entries of their node, and the pane beside one
+dimmed, in file order among the nodes written beside them, and the pane beside one
 says `disabled — Space enables, Delete removes`.
 
 `Delete`, and `Backspace` outside a prompt, takes the entry the row names out

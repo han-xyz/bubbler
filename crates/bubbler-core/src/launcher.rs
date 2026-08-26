@@ -210,8 +210,11 @@ impl RealAlloc {
     /// for.
     ///
     /// That window is process-wide, so only one thread may spawn while it
-    /// is open. bubbler's only other thread is the last-run log's copier,
-    /// and it starts no process at all ([`crate::run_log`]).
+    /// is open. bubbler's other threads are the last-run log's copier
+    /// ([`crate::run_log`]) and the KDL parser's
+    /// ([`crate::config::parse_document`]); neither opens a descriptor or
+    /// starts a process, and no configuration is parsed while the window
+    /// is open.
     fn inheritable(&self, on: bool) -> io::Result<()> {
         let flags = match on {
             true => FdFlags::empty(),

@@ -961,9 +961,7 @@ largest file admitted with more than twice the room to spare. The
 reservation is address space charged at spawn, not memory used: under a
 `ulimit -v` below about 520 MB, or `vm.overcommit_memory=2` with
 `Committed_AS` near `CommitLimit`, every configuration read fails with
-`cannot start the parser thread` — exit 1, never a crash. Counted braces, counted comment marks, and a reserved
-stack for the restarts: the two counts keep the deep recursions cheap, the
-reservation makes the wide one safe.
+`cannot start the parser thread` — exit 1, never a crash.
 Include cycles and depth are bounded, an unknown node is an error rather
 than a silent skip, and a value that could forge a line in `--dry-run`
 output is refused.

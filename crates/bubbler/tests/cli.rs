@@ -5740,17 +5740,15 @@ fn edit_prefers_visual_and_passes_editor_arguments() {
 /// names is not on this host, so a run that read the line would refuse
 /// and a lint that read it would warn: what the tests below assert is
 /// silence, and this is what makes the silence mean something.
-fn with_a_disabled_share(tmp: &Path) -> PathBuf {
+fn with_a_disabled_share(tmp: &Path) {
     bubbler(tmp).args(["create", "t"]).status().unwrap();
     std::fs::create_dir_all(tmp.join("home/Downloads")).unwrap();
-    let cfg = tmp.join("data/bubbler/instances/t/config.kdl");
     std::fs::write(
-        &cfg,
+        tmp.join("data/bubbler/instances/t/config.kdl"),
         "// bubbler config: 2\nhome-share \"Downloads\"\n/-home-share \"Music\"\n\
          command \"true\"\n",
     )
     .unwrap();
-    cfg
 }
 
 /// A `/-` line is a node the file keeps and nothing downstream of the

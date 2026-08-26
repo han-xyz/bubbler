@@ -65,6 +65,9 @@ argument or a child of a block is the ordinary KDL comment. `edit` and
 writes the file again from the profile; a `/-` line in a profile seeds a
 disabled entry into every instance made from it.
 
+A `/-` line grants nothing and revokes nothing: an enabled node of the same
+name, in the same file or in a layer under it, still applies.
+
 ## Grant reference
 
 | Node | Grants | Watch out |
