@@ -885,28 +885,55 @@ fn block_comment_end(b: &[u8], at: usize) -> (usize, usize) {
 /// [`slashdash_marks`] steps over what it spans, and runs over text the
 /// parser has already accepted, so a string it steps over is one the
 /// parser read as a string too. [`check_bounds`] runs before the parse
-/// and takes the span only for where a `}` closes nothing: a span that
-/// is wrong there over-counts, which is the direction that refuses.
+/// and takes the span for one thing: a `}` inside it closes nothing.
+/// Every `{` counts wherever it stands and every `/*` is measured, so
+/// the span can only err by ending before the parser's own string does
+/// and letting a `}` close what is still open; the multi-line rule
+/// below is what keeps it from that.
 ///
 /// A quoted string ends at the first `"` that is not escaped; a raw string
 /// has no escapes; either ends at a `"` followed by at least as many `#`
 /// as opened it. `"""` *and a newline* open the multi-line form, which
 /// holds lines of its own — a `"` among them ends nothing — and closes
-/// on the next `"""` carrying those hashes; without the newline the
-/// three quotes are an empty string and a quote, which is how
-/// `#"""a"#` holds `""a`.
+/// only on a `"""` carrying those hashes that stands on a line of its
+/// own after whitespace: kdl 6.7.1 reads one mid-line as body in a raw
+/// string and as an error in a quoted one, never as the end
+/// (`raw_string` and `quoted_string` in its `v2_parser.rs`). Without
+/// the newline the three quotes are an empty string and a quote, which
+/// is how `#"""a"#` holds `""a`.
 fn string_end(b: &[u8], quote: usize, hashes: usize) -> Option<usize> {
     let triple = b.get(quote..quote + 3) == Some(b"\"\"\"".as_slice())
         && newline_len(b, quote + 3).is_some();
     let mut i = quote + if triple { 3 } else { 1 };
+    // Where the line being read began: the multi-line form closes on a
+    // line holding nothing else before its quotes.
+    let mut line_start = i;
     while i < b.len() {
+        if let Some(n) = newline_len(b, i) {
+            i += n;
+            line_start = i;
+            continue;
+        }
         match b[i] {
-            b'\\' if hashes == 0 => i += 2,
+            // An escaped newline is still the newline the next line
+            // starts after, so only the `\` is stepped over there.
+            b'\\' if hashes == 0 => {
+                i += if newline_len(b, i + 1).is_some() {
+                    1
+                } else {
+                    2
+                }
+            }
             b'"' => {
-                // One quote inside the multi-line form is content, not
-                // the end of it: taking it as the end would leave the
-                // scan reading the rest of the string as configuration.
-                if triple && b.get(i..i + 3) != Some(b"\"\"\"".as_slice()) {
+                // One quote inside the multi-line form is content, and
+                // so are three with anything but whitespace before them
+                // on their line: taking either as the end would leave
+                // the scan reading the rest of the string as
+                // configuration.
+                if triple
+                    && (b.get(i..i + 3) != Some(b"\"\"\"".as_slice())
+                        || !only_spaces(&b[line_start..i]))
+                {
                     i += 1;
                     continue;
                 }
@@ -920,6 +947,29 @@ fn string_end(b: &[u8], quote: usize, hashes: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// Whether `b` is nothing but the whitespace kdl 6.7.1 lets stand
+/// before a multi-line string's closing quotes: its `UNICODE_SPACES`
+/// (`v2_parser.rs`), by the bytes UTF-8 writes them as.
+fn only_spaces(b: &[u8]) -> bool {
+    let mut i = 0;
+    while i < b.len() {
+        i += match b[i] {
+            b'\t' | b' ' => 1,
+            0xc2 if b.get(i + 1) == Some(&0xa0) => 2,
+            0xe1 if b.get(i + 1..i + 3) == Some(&[0x9a, 0x80]) => 3,
+            0xe2 if b.get(i + 1) == Some(&0x80)
+                && matches!(b.get(i + 2), Some(0x80..=0x8a | 0xaf)) =>
+            {
+                3
+            }
+            0xe2 if b.get(i + 1..i + 3) == Some(&[0x81, 0x9f]) => 3,
+            0xe3 if b.get(i + 1..i + 3) == Some(&[0x80, 0x80]) => 3,
+            _ => return false,
+        };
+    }
+    true
 }
 
 /// Line number, counting from one, of the byte at `offset` in `text`.
@@ -5104,6 +5154,24 @@ command "b""#
             check_bounds(&opens)
         );
         assert!(matches!(parse(&opens), Err(ConfigError::TooDeep { .. })));
+        // A multi-line string closes only on `"""` standing alone on
+        // its line: one mid-line is body (raw) or an error (quoted),
+        // and the parser reads the `}` after it as nothing that closes
+        // a node. A count that closed the string there let them close.
+        for string in ["#\"\"\"\na\"\"\"#", "\"\"\"\na\"\"\""] {
+            let midline = format!(
+                "{}x {string}{}\n",
+                "n {\n".repeat(MAX_NESTING),
+                "}".repeat(MAX_NESTING)
+            )
+            .repeat(20);
+            assert!(
+                matches!(check_bounds(&midline), Err(ConfigError::TooDeep { .. })),
+                "{string}: {:?}",
+                check_bounds(&midline)
+            );
+            assert!(matches!(parse(&midline), Err(ConfigError::TooDeep { .. })));
+        }
     }
 
     #[test]
