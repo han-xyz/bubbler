@@ -11,7 +11,7 @@ reachable from inside a sandbox, where the data-control protocols the
 One line on stdout: the byte count, `NO_OFFER` when the selection never
 arrived, `NO_KEY` when `--after-key` was waited out, `NO_MANAGER` when
 `--data-control` found neither protocol, or `OLD_PYTHON` on an interpreter
-below 3.9. Everything else is stderr.
+below 3.9. Everything else is stderr, `retried: N` among it.
 
     wl_read.py [--no-window] [--after-key] [--data-control]
                [--mime=TYPE] [--timeout=SECONDS] [--title=NAME]
@@ -48,6 +48,18 @@ CONTROL_MANAGERS = ("ext_data_control_manager_v1", "zwlr_data_control_manager_v1
 #: descriptor passing this needs (`socket.send_fds`, 3.9). The caller reads
 #: it as a reason to skip rather than as a failed read.
 OLD_PYTHON = "OLD_PYTHON"
+
+#: How many times an empty read is tried again, and how long each of those
+#: waits for the compositor to offer the selection afresh.
+#:
+#: An empty read has two causes that look identical from here: the gate
+#: refused it, or the offer died because keyboard focus moved while this
+#: window was mapped — a compositor sends the selection to the focused
+#: client only, and a read on the offer it left behind is answered with
+#: nothing at all. They are told apart by what follows: focus coming back
+#: brings a fresh `wl_data_device.selection`, and a refusal brings nothing.
+#: So the wait is short and bounded, and a refusal costs it once.
+RETRIES, RETRY_PATIENCE = 2, 1.0
 
 
 def string(text):
@@ -235,6 +247,18 @@ class Client:
         self.send(surface, 6)
         self.roundtrip()
 
+    def fresh_offer(self, patience):
+        """Wait for the compositor to offer the selection again, which is
+        what it does when this window is given focus back. False once
+        `patience` seconds have passed without one, so a read nothing will
+        replace is not waited out to the deadline."""
+        was, whole = self.offer, self.deadline
+        self.deadline = min(whole, time.monotonic() + patience)
+        try:
+            return self.until(lambda: self.offer not in (None, was))
+        finally:
+            self.deadline = whole
+
     def read_selection(self, mime):
         """Ask for the offer over a pipe and count what arrives. A denied
         read is the write end closed with nothing written, which reads
@@ -292,7 +316,15 @@ def main(args):
     if "--after-key" in args and not client.until(lambda: client.pressed):
         print("NO_KEY")
         return 0
-    print(client.read_selection(option(args, "mime", "text/plain")))
+    mime = option(args, "mime", "text/plain")
+    read = client.read_selection(mime)
+    retried = 0
+    while read == 0 and retried < RETRIES and client.fresh_offer(RETRY_PATIENCE):
+        retried += 1
+        read = client.read_selection(mime)
+    if retried:
+        print("retried:", retried, file=sys.stderr, flush=True)
+    print(read)
     return 0
 
 

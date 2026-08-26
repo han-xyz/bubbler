@@ -4475,6 +4475,12 @@ const SESSION_LOCK: &str = "bubbler-test-session.lock";
 /// login share the compositor exactly as two threads of one do, and the
 /// kernel drops a `flock` when its holder exits, so a suite that crashed
 /// leaves nothing stale behind.
+///
+/// Once per test, and never twice: an `flock` belongs to the open file
+/// description it was taken on, so a second call opens a second one and
+/// waits for the first — which is this thread — to let go. A test that
+/// needs the selection takes it through [`hold_the_selection`] and not
+/// again here.
 fn hold_the_session() -> std::fs::File {
     let path = PathBuf::from(
         std::env::var_os("XDG_RUNTIME_DIR").expect("checked by require_security_context"),
@@ -4997,45 +5003,22 @@ fn real_nested_x11_exec_children_see_the_display() {
     let name = &instance_name("x11-exec");
     let _leftovers = wayland_instance(tmp.path(), &init, name, NESTED_X11);
 
-    let mut run = bubbler_wayland(tmp.path(), &init)
-        .args(["run", name, "--", "/usr/bin/sleep", "20"])
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    // Ended when this drops, whatever an assertion below does, so no run
+    // outlives the lock this test is holding.
+    let run = background_run(tmp.path(), &init, name);
     // The supervisor serves the exec channel from the start, and the
-    // display variable is set before any server exists, so the first
-    // `exec` that works already carries it.
-    let mut inside = None;
-    if !wait_until(
-        || {
-            let out = bubbler_wayland(tmp.path(), &init)
-                .args(["exec", name, "--", "/usr/bin/env"])
-                .output()
-                .expect("running bubbler exec");
-            if out.status.success() {
-                inside = Some(String::from_utf8_lossy(&out.stdout).into_owned());
-            }
-            inside.is_some()
-        },
-        Duration::from_secs(10),
-    ) {
-        fail_with(run, "no exec child ran inside the instance");
-    }
-    let env = inside.expect("set by the poll above");
-    assert!(env.lines().any(|l| l == "DISPLAY=:0"), "{env}");
+    // display variable is set before any server exists. What made the run
+    // ready above was a `true`, which is no client of a display, so this
+    // is still an instance holding no server.
+    let inside = exec_in(tmp.path(), &init, name, &["/usr/bin/env"]);
+    let err = String::from_utf8_lossy(&inside.stderr);
+    assert_eq!(inside.status.code(), Some(0), "{err}");
+    let env = String::from_utf8_lossy(&inside.stdout);
+    assert!(env.lines().any(|l| l == "DISPLAY=:0"), "{env}{err}");
 
-    kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
-    let mut status = None;
-    assert!(
-        wait_until(
-            || {
-                status = run.try_wait().expect("waiting for the run process");
-                status.is_some()
-            },
-            Duration::from_secs(10)
-        ),
-        "the run did not stop after SIGTERM"
-    );
+    // Stopped here and not at the end of the scope, so a run that has to
+    // be killed rather than asked fails this test.
+    run.stop();
     // The instance is gone with it: the supervisor tears the display
     // socket and anything it started down on every exit, so nothing of
     // it outlives the run.
