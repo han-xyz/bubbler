@@ -5231,10 +5231,14 @@ command "b""#
                 );
             }
         }
-        // A block comment with no end is the one that needs no counting:
-        // the parser reads the rest of the file as comment and says so.
+        // A block comment with no end holds its braces like any other
+        // text: they count, and the file is refused for them, not for
+        // the comment.
         let commented = format!("/* c\r{}", "{".repeat(20_000));
-        assert!(parse(&commented).is_err());
+        assert!(matches!(
+            parse(&commented),
+            Err(ConfigError::TooDeep { line: 1, .. })
+        ));
     }
 
     #[test]
@@ -5324,30 +5328,31 @@ command "b""#
         // Four shapes that a count following the parser's own notion of
         // where strings and comments are let through, and that the
         // parser, recovering from a string it could not read, then
-        // descended into: two of any of them aborted a spawned thread
-        // and ten the main thread. Recovery cannot put a `{` or a `/*`
-        // into the text, so the count takes every one wherever it
-        // stands, and each of these is refused for its braces.
-        let open = "n {\n".repeat(MAX_NESTING);
-        let close = "}".repeat(MAX_NESTING);
+        // descended into. Recovery cannot put a `{` or a `/*` into the
+        // text, so the count takes every one wherever it stands: here
+        // the braces that push past the bound sit inside the string or
+        // comment each shape is about, where a count that trusted the
+        // shape did not look, and each is refused for them.
+        let open = "n {\n".repeat(MAX_NESTING - 8);
+        let inside = "{".repeat(9);
         for shape in [
-            format!("{open}x \"\"\"\n \\ \"\"\"\ny ##\"\"\"\n\"\"\"#\n{close}\n\"\"\"##\n"),
-            format!("{open}\"\n\"{close}"),
-            format!("{open}\"\"\"//\"{close}"),
-            format!("{open}x/*//\n"),
+            format!("{open}x \"\"\"\n \\ \"\"\"\ny ##\"\"\"\n\"\"\"#\n{inside}\n\"\"\"##\n"),
+            format!("{open}\"\n{inside}\""),
+            format!("{open}\"\"\"//{inside}\""),
+            format!("{open}x/*//{inside}\n"),
         ] {
-            let text = shape.repeat(10);
             assert!(
-                matches!(check_bounds(&text), Err(ConfigError::TooDeep { .. })),
+                matches!(check_bounds(&shape), Err(ConfigError::TooDeep { .. })),
                 "{shape:?}: {:?}",
-                check_bounds(&text)
+                check_bounds(&shape)
             );
             assert!(
-                matches!(parse(&text), Err(ConfigError::TooDeep { .. })),
+                matches!(parse(&shape), Err(ConfigError::TooDeep { .. })),
                 "{shape:?}"
             );
-            // And on the stack a spawned thread has, where two of the
-            // shape were enough.
+            // And from a thread with 2 MiB of stack: the caller's
+            // stack is not the one the parser runs on.
+            let text = shape.clone();
             let on_small = std::thread::Builder::new()
                 .stack_size(2 << 20)
                 .spawn(move || matches!(parse(&text), Err(ConfigError::TooDeep { .. })))
@@ -5417,13 +5422,9 @@ command "b""#
             check_bounds(&later),
             Err(ConfigError::CommentTooBusy { line: 2, .. })
         ));
-        // And the parser, on the 2 MiB stack this thread has, in the
-        // shape that descends twice per mark, at a quarter of the bound:
-        // this thread takes 256 of those and the main thread 1024.
-        let mixed = format!(
-            "/*{}*/\ncommand \"true\"\n",
-            "* ".repeat(MAX_COMMENT_MARKS / 4)
-        );
+        // And the parser, in the shape that descends twice per mark, at
+        // the bound itself: what the count admits, the parser reads.
+        let mixed = format!("/*{}*/\ncommand \"true\"\n", "* ".repeat(MAX_COMMENT_MARKS));
         assert!(parse(&mixed).is_ok());
     }
 
