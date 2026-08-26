@@ -122,12 +122,15 @@ pub static GRANTS: &[Grant] = &[
         node: "compute",
         summary: "GPU compute on the AMD driver: /dev/kfd and the KFD topology in sysfs",
         cost: "`/dev/kfd` is the one interface every AMD GPU on the machine is reached \
-               through, not the card you meant, and the grant adds the KFD topology and \
-               the CPU topology under `/sys/devices` to it. Requires `dri`, and against \
-               that grant it costs nothing new: a compute job reads and writes the same \
-               GPU memory the render nodes already reach, so what the two share is what \
-               another application has left on the card. A host with no `/dev/kfd` fails \
-               the launch rather than running without it.",
+               through, not the card you meant, and it is bound read-write beside the \
+               topology a compute runtime reads to find the GPUs and the memory near \
+               them: `/sys/class/kfd`, `/sys/devices/virtual/kfd` and \
+               `/sys/devices/system/node` (`/sys/devices/system/cpu` comes with `dri` \
+               already). Requires `dri`, and against that grant it costs nothing new: a \
+               compute job reads and writes the same GPU memory the render nodes already \
+               reach, so what the two share is what another application has left on the \
+               card. A host with no `/dev/kfd` fails the launch rather than running \
+               without it.",
         risk: Risk::Wide,
         grammar: "compute",
     },
@@ -171,15 +174,17 @@ pub static GRANTS: &[Grant] = &[
     Grant {
         node: "usb",
         summary: "raw USB device I/O: /dev/bus/usb and the sysfs descriptors libusb reads",
-        cost: "Bare, it is every USB device the host has at launch — the raw interface of \
-               your keyboard and of your security key among them — and raw I/O is what a \
+        cost: "Bare, the whole `/dev/bus/usb` directory is bound: every USB device the \
+               host has — the raw interface of your keyboard and of your security key \
+               among them — and, the directory being bound rather than the nodes in it, \
+               every device plugged in while the sandbox runs as well. Raw I/O is what a \
                device is programmed and read through rather than what its driver offers. \
                `vendor=` and `product=` narrow it to the nodes whose sysfs reports those \
-               ids, which is the shape of the grant to prefer; the ids are what the \
-               device says about itself, though, so one that claims another's is inside \
-               the filter. Either way the list is frozen at launch and a device plugged \
-               in later has no node inside, and who may open a node stays the host's to \
-               decide: udev's `uaccess` ACL, or the group on the device.",
+               ids, which is the shape of the grant to prefer; that list is resolved once \
+               at launch, so a matching device plugged in later has no node inside, and \
+               the ids are what the device says about itself, so one that claims \
+               another's is inside the filter. Who may open a node stays the host's to \
+               decide either way: udev's `uaccess` ACL, or the group on the device.",
         risk: Risk::Outward,
         grammar: "usb [vendor=\"xxxx\" [product=\"xxxx\"]]",
     },

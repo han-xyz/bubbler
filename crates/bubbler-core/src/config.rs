@@ -426,8 +426,9 @@ pub enum Service {
     Hidraw,
     /// Raw USB device I/O: the `/dev/bus/usb` nodes a libusb client
     /// opens, and the `/sys` descriptors it reads to find them. A bare
-    /// node is every device the host has at launch; the ids narrow it to
-    /// the devices that report them.
+    /// node is the whole directory, so what is plugged in later is
+    /// reachable too; the ids narrow it to the devices reporting them,
+    /// which are resolved once at launch.
     Usb {
         /// `idVendor` as sysfs writes it: four lower-case hex digits.
         /// `None` is every vendor, which is the bare node.
@@ -891,16 +892,12 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
                     .iter()
                     .find(|held| usb_covers(held, &svc) || usb_covers(&svc, held))
                 {
-                    let (wide, narrow) = match usb_covers(held, &svc) {
-                        true => (held, &svc),
-                        false => (&svc, held),
-                    };
                     return Err(bad(
                         node,
                         &format!(
-                            "{} already covers {}, so the narrower node narrows nothing",
-                            usb_scope(wide),
-                            usb_scope(narrow)
+                            "`{}` and `{}` overlap; keep the wider one",
+                            usb_node(held),
+                            usb_node(&svc)
                         ),
                     ));
                 }
@@ -1100,28 +1097,48 @@ pub(crate) fn usb_covers(wide: &Service, narrow: &Service) -> bool {
     else {
         return false;
     };
-    match (wide_vendor, wide_product) {
-        (None, _) => true,
-        (Some(v), None) => narrow_vendor.as_ref() == Some(v),
-        (Some(v), Some(p)) => {
-            narrow_vendor.as_ref() == Some(v) && narrow_product.as_ref() == Some(p)
+    // A product with no vendor is not a node the parser produces, and it
+    // stands for no set of devices at all: it covers nothing, and
+    // nothing covers it. Reading it as a bare node would make it the
+    // widest grant there is, which is the opposite of what it says.
+    let half =
+        |vendor: &Option<String>, product: &Option<String>| vendor.is_none() && product.is_some();
+    if half(wide_vendor, wide_product) || half(narrow_vendor, narrow_product) {
+        return false;
+    }
+    match wide_vendor {
+        None => true,
+        Some(v) => {
+            narrow_vendor.as_ref() == Some(v)
+                && (wide_product.is_none() || narrow_product == wide_product)
         }
     }
 }
 
-/// What a `usb` node covers, in words, for an error that has to name
-/// which of two overlapping nodes is the wider.
-fn usb_scope(s: &Service) -> String {
+/// One `usb` node written back as the line it was read from, for an
+/// error naming the two nodes that overlap. Every shape is written as
+/// what it holds, the `product` with no `vendor` the parser refuses
+/// included: writing that one as the bare node would name a grant far
+/// wider than it stands for.
+fn usb_node(s: &Service) -> String {
     match s {
         Service::Usb {
             vendor: Some(v),
             product: Some(p),
-        } => format!("`usb` on device `{v}:{p}`"),
+        } => format!("usb vendor=\"{v}\" product=\"{p}\""),
         Service::Usb {
             vendor: Some(v),
             product: None,
-        } => format!("`usb` on every device of vendor `{v}`"),
-        _ => "a bare `usb`, which is every device,".to_owned(),
+        } => format!("usb vendor=\"{v}\""),
+        Service::Usb {
+            vendor: None,
+            product: Some(p),
+        } => format!("usb product=\"{p}\""),
+        Service::Usb {
+            vendor: None,
+            product: None,
+        } => "usb".to_owned(),
+        other => other.node_name().to_owned(),
     }
 }
 
@@ -3151,6 +3168,33 @@ mod tests {
         );
     }
 
+    /// Which error a refused node has to raise. A line that is wrong in
+    /// two ways would otherwise be pinned by whichever check ran first,
+    /// and a message aimed at the wrong half of it is one a reader
+    /// cannot act on.
+    #[derive(Debug, Clone, Copy)]
+    enum Refusal {
+        /// An argument or a value the node cannot hold.
+        Argument,
+        /// A property name the node does not take.
+        Property,
+        /// The same grant, or the same property, written twice.
+        Duplicate,
+    }
+
+    /// Assert `text` is refused as `want`, naming `node`.
+    fn refused(text: &str, node: &str, want: Refusal) {
+        let err = parse(text).expect_err(text);
+        let named = match (&err, want) {
+            (ConfigError::BadArgument { node: n, .. }, Refusal::Argument) => n == node,
+            (ConfigError::UnknownProperty { node: n, .. }, Refusal::Property) => n == node,
+            // The duplicate of a property is reported as `<node> <prop>`.
+            (ConfigError::Duplicate(n), Refusal::Duplicate) => n.split(' ').next() == Some(node),
+            _ => false,
+        };
+        assert!(named, "{text}: expected {want:?} on `{node}`, got {err:?}");
+    }
+
     #[test]
     fn compute_is_a_flag_node_that_needs_the_gpu_grant_beside_it() {
         assert_eq!(
@@ -3174,12 +3218,12 @@ mod tests {
             parse("dri\ncompute\ncompute"),
             Err(ConfigError::Duplicate(n)) if n == "compute"
         ));
-        for text in [
-            "dri\ncompute \"all\"",
-            "dri\ncompute vendor=\"0bb4\"",
-            "dri\ncompute { x; }",
+        for (text, want) in [
+            ("dri\ncompute \"all\"", Refusal::Argument),
+            ("dri\ncompute vendor=\"0bb4\"", Refusal::Property),
+            ("dri\ncompute { x; }", Refusal::Argument),
         ] {
-            assert!(parse(text).is_err(), "{text}");
+            refused(text, "compute", want);
         }
     }
 
@@ -3193,12 +3237,12 @@ mod tests {
             parse("smartcard\nsmartcard"),
             Err(ConfigError::Duplicate(n)) if n == "smartcard"
         ));
-        for text in [
-            "smartcard \"pcscd\"",
-            "smartcard reader=\"0\"",
-            "smartcard { x; }",
+        for (text, want) in [
+            ("smartcard \"pcscd\"", Refusal::Argument),
+            ("smartcard reader=\"0\"", Refusal::Property),
+            ("smartcard { x; }", Refusal::Argument),
         ] {
-            assert!(parse(text).is_err(), "{text}");
+            refused(text, "smartcard", want);
         }
     }
 
@@ -3257,22 +3301,33 @@ mod tests {
         // Anything that is not exactly four hex digits names no device
         // in sysfs, and a product id alone names one number from every
         // vendor that ever used it.
-        for text in [
-            "usb vendor=\"0bb\"",
-            "usb vendor=\"0bb44\"",
-            "usb vendor=\"zzzz\"",
-            "usb vendor=\"\"",
-            "usb vendor=\"0x0bb4\"",
-            "usb vendor=#true",
-            "usb product=\"0c8d\"",
-            "usb \"0bb4\"",
-            "usb serial=\"x\"",
-            "usb vendor=\"0bb4\" vendor=\"1050\"",
-            "usb vendor=\"0bb4\" product=\"0c8d\" product=\"0c8e\"",
-            "usb { x; }",
+        for (text, want) in [
+            ("usb vendor=\"0bb\"", Refusal::Argument),
+            ("usb vendor=\"0bb44\"", Refusal::Argument),
+            ("usb vendor=\"zzzz\"", Refusal::Argument),
+            ("usb vendor=\"\"", Refusal::Argument),
+            ("usb vendor=\"0x0bb4\"", Refusal::Argument),
+            ("usb vendor=#true", Refusal::Argument),
+            ("usb product=\"0c8d\"", Refusal::Argument),
+            ("usb \"0bb4\"", Refusal::Argument),
+            ("usb serial=\"x\"", Refusal::Property),
+            ("usb vendor=\"0bb4\" vendor=\"1050\"", Refusal::Duplicate),
+            (
+                "usb vendor=\"0bb4\" product=\"0c8d\" product=\"0c8e\"",
+                Refusal::Duplicate,
+            ),
+            ("usb { x; }", Refusal::Argument),
         ] {
-            assert!(parse(text).is_err(), "{text}");
+            refused(text, "usb", want);
         }
+        // An id is text, not a number: KDL reads `1050` as an integer,
+        // and a leading zero — which half the vendor ids on a machine
+        // have — would be lost before the parser ever saw it.
+        assert!(matches!(
+            parse("usb vendor=1050"),
+            Err(ConfigError::BadArgument { node, reason })
+                if node == "usb" && reason.contains("must be a string")
+        ));
         // The same device twice is one node written twice.
         assert!(matches!(
             parse("usb vendor=\"0bb4\"\nusb vendor=\"0bb4\""),

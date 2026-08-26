@@ -346,8 +346,10 @@ const CHECK_LINES: &[(&str, &str)] = &[
     ),
     (
         "usb-all-devices",
-        "A bare `usb` grant: every USB device the host has at launch, opened for raw I/O, \
-         rather than the `vendor=`/`product=` form that names the device you mean.",
+        "A bare `usb` grant: the whole /dev/bus/usb directory, so every USB device the \
+         host has and every one plugged in while the sandbox runs, opened for raw I/O, \
+         rather than the `vendor=`/`product=` form, which names the device you mean and \
+         is resolved once at launch.",
     ),
     (
         "userns-disabled-with-nested-sandbox",

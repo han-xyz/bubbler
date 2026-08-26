@@ -968,13 +968,16 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                 i,
                 node,
                 &USB_ALL_DEVICES,
-                "`usb` without a `vendor` is every USB device the host has at launch — the \
-                 raw interfaces of your keyboard and your security key among them — and \
-                 raw transfers are what a device is programmed through, not what its \
-                 driver offers"
+                "`usb` without a `vendor` binds the whole `/dev/bus/usb` directory: every \
+                 USB device the host has — the raw interfaces of your keyboard and your \
+                 security key among them — and every one plugged in while the sandbox \
+                 runs, since the directory is bound rather than the nodes in it. Raw \
+                 transfers are what a device is programmed through, not what its driver \
+                 offers"
                     .to_owned(),
                 "`usb vendor=\"0bb4\" product=\"0c8d\"` scopes the grant to the device you \
-                 mean — `lsusb` prints the two ids — or accept it with \
+                 mean — `lsusb` prints the two ids — and is resolved at launch, so plug \
+                 the device in first; or accept the bare node with \
                  `lint-allow \"usb-all-devices\" reason=\"...\"`",
             ),
             "dbus" => dbus_node(i, node, f),

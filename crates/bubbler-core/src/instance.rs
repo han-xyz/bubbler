@@ -1300,6 +1300,15 @@ mod tests {
             Instance::ephemeral(&env, "generic", &["dbus", "camera"]),
             Err(InstanceError::Config(_))
         ));
+        // `compute` the same way: the render nodes its topology names
+        // are `dri`'s, so the grant is refused rather than half made.
+        assert!(matches!(
+            Instance::ephemeral(&env, "generic", &["compute"]),
+            Err(InstanceError::Config(_))
+        ));
+        let eph = Instance::ephemeral(&env, "generic", &["dri", "compute"]).unwrap();
+        assert!(eph.instance.config.services.contains(&Service::Compute));
+        drop(eph);
         let eph = Instance::ephemeral(&env, "generic", &["dbus", "portals", "camera"]).unwrap();
         assert!(
             eph.instance

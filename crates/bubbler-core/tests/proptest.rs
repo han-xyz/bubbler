@@ -72,22 +72,64 @@ fn rel_path() -> impl Strategy<Value = PathBuf> {
 
 /// The grants written as a bare node, each at most once.
 fn flag_services() -> impl Strategy<Value = Vec<Service>> {
-    prop::collection::vec(any::<bool>(), 6).prop_map(|on| {
-        [
+    prop::collection::vec(any::<bool>(), 8).prop_map(|on| {
+        let mut out: Vec<Service> = [
             Service::Wayland(WaylandMode::default()),
             // `"host"`: every subset of this list has to parse, and the
             // nested default requires `wayland` and `dri` behind it.
             Service::X11(X11Mode::Host),
             Service::Dri,
+            Service::Compute,
             Service::Pipewire,
             Service::Pulseaudio,
             Service::Hidraw,
+            Service::Smartcard,
         ]
         .into_iter()
         .zip(on)
         .filter_map(|(svc, on)| on.then_some(svc))
-        .collect()
+        .collect();
+        // `compute` reaches the GPUs through the render nodes `dri`
+        // binds, and the parser refuses it without them.
+        if !out.contains(&Service::Dri) {
+            out.retain(|s| *s != Service::Compute);
+        }
+        out
     })
+}
+
+/// `usb`, as the bare node or as up to three filters. The filters are
+/// made disjoint the way the parser demands: a node covering another —
+/// a vendor over one of its products — is refused, since the narrower
+/// of the two grants nothing of its own.
+fn usb_services() -> impl Strategy<Value = Vec<Service>> {
+    (
+        any::<bool>(),
+        prop::collection::vec(("[0-9a-f]{4}", prop::option::of("[0-9a-f]{4}")), 0..3),
+    )
+        .prop_map(|(bare, filters)| {
+            if bare {
+                return vec![Service::Usb {
+                    vendor: None,
+                    product: None,
+                }];
+            }
+            let mut out: Vec<(String, Option<String>)> = Vec::new();
+            for (vendor, product) in filters {
+                let overlaps = out.iter().any(|(v, p)| {
+                    *v == vendor && (p.is_none() || product.is_none() || *p == product)
+                });
+                if !overlaps {
+                    out.push((vendor, product));
+                }
+            }
+            out.into_iter()
+                .map(|(vendor, product)| Service::Usb {
+                    vendor: Some(vendor),
+                    product,
+                })
+                .collect()
+        })
 }
 
 /// The four grants that name a path or an id. Each list is made unique
@@ -394,6 +436,7 @@ fn instance_config() -> impl Strategy<Value = InstanceConfig> {
             bus_services(),
             network_service(),
             gamepad_service(),
+            usb_services(),
         ),
         lint_allows(),
         env_vars(),
@@ -409,7 +452,7 @@ fn instance_config() -> impl Strategy<Value = InstanceConfig> {
     )
         .prop_map(
             |(
-                (flags, shares, bus, network, gamepad),
+                (flags, shares, bus, network, gamepad, usb),
                 lint_allows,
                 env,
                 tty,
@@ -424,6 +467,7 @@ fn instance_config() -> impl Strategy<Value = InstanceConfig> {
                 services.extend(shares);
                 services.extend(network);
                 services.extend(gamepad);
+                services.extend(usb);
                 InstanceConfig {
                     services,
                     command,
