@@ -550,25 +550,31 @@ report the *target's* type and bwrap would bind that target. The system
 bus has no default name at all.
 
 Two calls bubbler makes for itself go on the host session bus rather
-than through the proxy — the accessibility bus address under `a11y`, and
-`Documents.AddFull` for a file argument — over an in-tree client, no
-program and no shell. Its trust rules: a call must name a destination; a
-well-known name is resolved to its unique name (`GetNameOwner`, and
-`StartServiceByName` where nobody holds it yet, then resolved again) and
-the message is addressed *there*; a reply is taken only when it carries
-the pending serial, is a reply type, and its `SENDER` is that owner — or
-is an error from `org.freedesktop.DBus`, the one name the bus stamps
-itself and no peer can forge. Signals, replies to other serials and
-message types the client does not know are skipped; one five-second
-budget covers the lookup, the activation and the call together, so a
-peer that always has another message to skip cannot outlast it; the
-decoder refuses what it cannot read exactly — padding that is not nul, a
-length that does not match its elements, an interior nul, a repeated
+than through the proxy — the accessibility bus address under `a11y`,
+and `Documents.AddFull` for a file argument — over an in-tree client,
+no program and no shell. Its trust rules: a call must name a
+destination; a well-known name is resolved to its unique name
+(`GetNameOwner`, and `StartServiceByName` where nobody holds it yet,
+then resolved again) and the message is addressed *there*; a reply is
+taken only when it carries the pending serial, is a reply type, and its
+`SENDER` is that owner — or is an error from `org.freedesktop.DBus`,
+the one name the bus stamps itself and no peer can forge. Signals,
+replies to other serials and message types the client does not know are
+skipped; the five-second budget is per call — one for the connect, the
+authentication and `Hello`, another for each call, covering that call's
+owner lookup, its activation and the call itself, so a peer that always
+has another message to skip cannot outlast it, and a bus that goes
+silent costs a forwarding run fifteen seconds at the outside (the
+connect plus one `AddFull` per permission set, of which there are at
+most two) and an `a11y` lookup ten, bounded rather than hung; the
+decoder refuses what it cannot read exactly — padding that is not nul,
+a length that does not match its elements, an interior nul, a repeated
 header field, a container nested past the limit — instead of guessing;
-and every descriptor a reply carries is closed on arrival, since bubbler
-passes descriptors out and never takes one back. The client is host-side
-code running as your uid on your own bus: it is bubbler talking to your
-session, not the sandbox, which reaches that bus only through the proxy.
+and every descriptor a reply carries is closed on arrival, since
+bubbler passes descriptors out and never takes one back. The client is
+host-side code running as your uid on your own bus: it is bubbler
+talking to your session, not the sandbox, which reaches that bus only
+through the proxy.
 
 **Does not defend:** what the rules grant. `talk` to a service is talk to
 that service, and a service reachable through the bus is as trusted as
@@ -807,15 +813,21 @@ the instance's app id and that whole view is bound at
 `$XDG_RUNTIME_DIR/doc` inside, so the application can list and reopen
 every document the same instance was handed earlier in the session, not
 only the one it was started for. That is the portal's design and the
-reason the view is per-app rather than the mount root. A symlink argument
-exports its *target* under the target's name: the link is what the
-desktop handed over and the file at the end of it is what the user meant,
-so an argument naming a link to a private file registers that file. And
-the client that makes the call is host-side code running as your uid on
-your own session bus — see "D-Bus" above. A `portals` sandbox holds a
-`--talk` rule for `org.freedesktop.portal.Documents` of its own besides,
-so what it may ask that portal for directly is the portal's policy for
-its app id rather than bubbler's.
+reason the view is per-app rather than the mount root. A symlink
+argument exports its *target* under the target's name: the link is what
+the desktop handed over and the file at the end of it is what the user
+meant, so an argument naming a link to a private file registers that
+file. Nor does it stop at what the baseline hides: the rule is that the
+file the user named enters, and a `/etc` path the allowlist does not
+carry is one of those — `/etc/passwd` inside is the synthetic two-line
+file bubbler writes over a tmpfs, and `run <inst> -- cat /etc/passwd`
+hands the sandbox the host's real one at a document path. Naming it is
+the choice; forwarding does not second-guess it. And the client that
+makes the call is host-side code running as your uid on your own
+session bus — see "D-Bus" above. A `portals` sandbox holds a `--talk`
+rule for `org.freedesktop.portal.Documents` of its own besides, so what
+it may ask that portal for directly is the portal's policy for its app
+id rather than bubbler's.
 
 [File arguments](manual.md#file-arguments),
 [D-Bus](manual.md#d-bus) ·

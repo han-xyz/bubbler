@@ -101,14 +101,14 @@ descriptors is somebody watching, and the sandbox gets the terminal its `tty`
 node asks for; with none on any of them, which is how a launcher starts its
 children, it takes `tty "none"` (see "Terminal") and writes bubbler's own
 stderr — its warnings, a sidecar's errors, the application's own output — to
-`last-run.log` in the instance
-directory, which `bubbler log` prints. The log is opened before the config is
-read, so a `config.kdl` that stopped the run is in it too, and a log that
-cannot be opened at all — a symlink where the file belongs — costs the record
-rather than the run: bubbler says so and starts the sandbox anyway. Printed to a
-terminal, the log has its control characters shown (`^[`) rather than sent, so
-reading what a sandbox wrote is not letting it write to your terminal a second
-time; down a pipe it is the log, byte for byte. See "Desktop entries".
+`last-run.log` in the instance directory, which `bubbler log` prints. The log
+is opened before the config is read, so a `config.kdl` that stopped the run is
+in it too, and a log that cannot be opened at all — a symlink where the file
+belongs — costs the record rather than the run: bubbler says so and starts the
+sandbox anyway. Printed to a terminal, the log has its control characters
+shown (`^[`) rather than sent, so reading what a sandbox wrote is not letting
+it write to your terminal a second time; down a pipe it is the log, byte for
+byte. See "Desktop entries".
 
 A run is a chain of processes; `bubbler` waits at the top of it and returns the
 command's status.
@@ -1566,6 +1566,24 @@ same way a share path is: what it resolves to depends on the symlinks along
 the way, and a path that says one file and opens another is not one to hand
 over.
 
+What *is* forwarded is the file the argument named, and that is not the set
+the baseline lets through. Only the `/etc` entries on the allowlist are visible
+inside; the rest of `/etc` is a tmpfs, and the `passwd` and `group` there are
+the synthetic ones bubbler writes. So `/etc/passwd` given as an argument is
+forwarded — the host's real file, at its document path, beside a sandbox
+`/etc/passwd` naming `bubbler` and `nobody` and nothing else:
+
+    $ bubbler run ff -- /usr/bin/sh -c 'head -2 "$1"; head -3 /etc/passwd' _ /etc/passwd
+    root:x:0:0::/root:/usr/bin/bash
+    bin:x:1:1::/:/usr/bin/nologin
+    bubbler:x:1000:1000:bubbler:/home/bubbler:/bin/sh
+    nobody:x:65534:65534:nobody:/:/bin/sh
+
+That is the rule and not a hole in it — a path on the command line is a file
+you chose to hand over, and forwarding asks what you named rather than what the
+baseline withholds — but it is worth knowing before a `%f` entry is wired up
+for a program you would not hand a host file to.
+
 Everything else is untouched and silent: relative paths, flags, bare words,
 `https://` and every other scheme, and a `file://` URI whose authority is
 neither empty nor `localhost`. Those are the command's own business.
@@ -2287,18 +2305,24 @@ through a program: the accessibility bus address under `a11y`
 (`org.a11y.Bus.GetAddress`) and the registration a file argument needs
 (`org.freedesktop.portal.Documents.AddFull`). bubbler speaks D-Bus itself for
 them — `EXTERNAL` authentication, `Hello`, one method call, one reply — on the
-address above, `$XDG_RUNTIME_DIR/bus` where the variable is unset. A well-known
-destination is resolved to its unique name first (`GetNameOwner`, and
-`StartServiceByName` where nobody holds it yet) and the message is addressed
-there, so a reply is taken only from that owner; the bus's own errors are the
-one exception, since `SENDER` is the bus's to write and no peer can forge it.
-Signals, replies to other calls and message types the client does not know are
-skipped, one five-second budget covers the lookup, the activation and the call
-together, the decoder refuses a message it cannot read exactly rather than
-guessing at it, and any descriptor a reply carries is closed on arrival —
-bubbler passes descriptors out and never takes one back. All of it runs
-host-side, as your user: it is bubbler talking to your session, not the
-sandbox.
+address above, `$XDG_RUNTIME_DIR/bus` where the variable is unset. A
+well-known destination is resolved to its unique name first (`GetNameOwner`,
+and `StartServiceByName` where nobody holds it yet) and the message is
+addressed there, so a reply is taken only from that owner; the bus's own
+errors are the one exception, since `SENDER` is the bus's to write and no peer
+can forge it. Signals, replies to other calls and message types the client
+does not know are skipped, the decoder refuses a message it cannot read
+exactly rather than guessing at it, and any descriptor a reply carries is
+closed on arrival — bubbler passes descriptors out and never takes one back.
+The five-second budget is *per call*: one covers the connect, the
+authentication and `Hello`, and each later call gets its own, covering that
+call's owner lookup, its activation and the call itself together, so a peer
+that always has another message to skip cannot outlast it. A bus that accepts
+a connection and then says nothing therefore costs a forwarding run at most
+fifteen seconds — the connect plus one `AddFull` per permission set, of which
+there are at most two — and an `a11y` lookup at most ten, the connect plus the
+one `GetAddress`. Bounded, never a hang. All of it runs host-side, as your
+user: it is bubbler talking to your session, not the sandbox.
 
 Everything the sandbox may reach is a rule: the `dbus` children above, plus the
 bundles `portals`, `notify`, `tray`, `mpris` and `input-method`, and the `a11y`
