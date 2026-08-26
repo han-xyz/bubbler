@@ -189,7 +189,14 @@ impl Detail {
                 let is = |r: &Row| r.node == node;
                 rows.iter()
                     .position(|r| is(r) && r.text == text && r.target == target)
-                    .or_else(|| rows.iter().position(|r| is(r) && r.text == text))
+                    // Only an entry is followed by what it says: the row
+                    // that writes the next entry says nothing either,
+                    // and a config the first `home-share` was just
+                    // written into holds both.
+                    .or_else(|| {
+                        rows.iter()
+                            .position(|r| is(r) && r.text.is_some() && r.text == text)
+                    })
                     .or_else(|| rows.iter().position(|r| is(r) && r.target == target))
                     .or_else(|| rows.iter().position(is))
             })
@@ -353,6 +360,10 @@ impl Detail {
         let rank = section_rank(&written);
         match (written, target) {
             (Node::Service(s), Target::Service(i)) => {
+                // An index is stale only between a change and the
+                // refresh that follows it, so this is an entry the
+                // buffer has lost rather than a line to write anywhere
+                // else; a panic here would leave the terminal raw.
                 let Some(slot) = self.buf.services.get_mut(i) else {
                     return;
                 };
@@ -360,6 +371,7 @@ impl Detail {
             }
             (Node::Service(s), _) => self.buf.services.push(s),
             (Node::Env(pairs), Target::Env(i)) => {
+                // An entry the buffer has lost, as above.
                 if i >= self.buf.env.len() {
                     return;
                 }
@@ -369,6 +381,7 @@ impl Detail {
             }
             (Node::Env(pairs), _) => self.buf.env.extend(pairs),
             (Node::LintAllow(allows), Target::LintAllow(i)) => {
+                // An entry the buffer has lost, as above.
                 if i >= self.buf.lint_allows.len() {
                     return;
                 }
@@ -498,7 +511,10 @@ impl Detail {
             Placed::Added(_) => format!("enabled `{node}`"),
             Placed::Replaced => format!("enabled `{node}` over the one it held"),
             Placed::Default => {
-                format!("enabled `{node}` — the default, so there is no line to write")
+                format!("enabled `{node}`: the default, so there is no line to write")
+            }
+            Placed::DefaultOver => {
+                format!("enabled `{node}`: the default, over the one it held, so no line remains")
             }
         }
     }
@@ -602,6 +618,9 @@ enum Placed {
     /// The value is the node's own default, which a file spells by
     /// leaving the node out: no line is written at all.
     Default,
+    /// The default was written over a granted value: the line that was
+    /// there is gone, and none takes its place.
+    DefaultOver,
 }
 
 impl Placed {
@@ -610,7 +629,8 @@ impl Placed {
     /// written is the default the file holds no line for.
     fn one_of(held: bool, bare: bool) -> Self {
         match (held, bare) {
-            (_, true) => Self::Default,
+            (true, true) => Self::DefaultOver,
+            (false, true) => Self::Default,
             (true, false) => Self::Replaced,
             (false, false) => Self::Added(1),
         }
@@ -620,7 +640,7 @@ impl Placed {
     fn count(&self) -> usize {
         match self {
             Self::Added(n) => *n,
-            Self::Replaced | Self::Default => 0,
+            Self::Replaced | Self::Default | Self::DefaultOver => 0,
         }
     }
 }
@@ -1389,9 +1409,64 @@ mod tests {
         select(&mut detail, "tty");
         assert_eq!(
             detail.toggle(&env),
-            "enabled `tty` — the default, so there is no line to write"
+            "enabled `tty`: the default, so there is no line to write"
         );
         assert_eq!(kdl_out::render(&detail.buf).unwrap(), "");
+    }
+
+    #[test]
+    fn the_cursor_lands_on_a_freshly_written_entry() {
+        let (_tmp, env, mut detail) = editing("wayland\n");
+        select(&mut detail, "home-share");
+        assert_eq!(detail.row().unwrap().target, Target::Absent);
+        detail.apply(&env, "home-share \"Downloads\"").unwrap();
+        let row = detail.row().expect("a row").clone();
+        assert_eq!(
+            row.target,
+            Target::Service(1),
+            "on the entry, not on the row that writes the next: {row:?}"
+        );
+        assert_eq!(row.text.as_deref(), Some("home-share \"Downloads\""));
+    }
+
+    #[test]
+    fn enabling_the_default_over_a_granted_value_says_both() {
+        let (_tmp, env, mut detail) = editing("userns \"disable\"\n/-userns \"allow\"\n");
+        select(&mut detail, "userns");
+        assert_eq!(detail.row().unwrap().target, Target::Userns);
+        detail.selected += 1;
+        assert_eq!(detail.row().unwrap().target, Target::Disabled(0));
+        assert_eq!(
+            detail.toggle(&env),
+            "enabled `userns`: the default, over the one it held, so no line remains",
+            "the hardening line went, and the line says so"
+        );
+        assert_eq!(detail.buf.userns, Userns::Allow);
+        assert_eq!(kdl_out::render(&detail.buf).unwrap(), "");
+    }
+
+    #[test]
+    fn a_line_that_writes_two_check_ids_keeps_the_disabled_one_below_both() {
+        let (_tmp, env, mut detail) = editing(
+            "lint-allow \"network-host\" reason=\"a\"\n\
+             /-lint-allow \"home-share-sensitive\" reason=\"b\"\n",
+        );
+        select(&mut detail, "lint-allow");
+        assert_eq!(detail.row().unwrap().target, Target::LintAllow(0));
+        detail
+            .apply(
+                &env,
+                "lint-allow \"x11-without-reason\" reason=\"c\"; \
+                 lint-allow \"dbus-without-rules\" reason=\"d\"",
+            )
+            .unwrap();
+        assert_eq!(
+            kdl_out::render(&detail.buf).unwrap(),
+            "lint-allow \"x11-without-reason\" reason=\"c\"\n\
+             lint-allow \"dbus-without-rules\" reason=\"d\"\n\
+             /-lint-allow \"home-share-sensitive\" reason=\"b\"\n",
+            "the `/-` line stayed below the entry it was read below"
+        );
     }
 
     #[test]
