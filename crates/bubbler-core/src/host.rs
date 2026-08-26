@@ -3,7 +3,12 @@
 
 use std::ffi::OsString;
 use std::fs::{self, FileType};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+/// How much of a file [`Host::read_small`] is willing to hold. A sysfs
+/// attribute is one page at most, and nothing bigger describes a device.
+pub const SMALL_READ: usize = 4096;
 
 /// Read-only view of the host filesystem used to decide what to bind.
 pub trait Host {
@@ -23,6 +28,11 @@ pub trait Host {
     /// user cannot write is forwarded to the document portal read-only,
     /// so this decides what a sandbox is granted, not what it is told.
     fn writable(&self, p: &Path) -> bool;
+    /// The bytes of `p` when there are at most [`SMALL_READ`] of them;
+    /// `None` when it cannot be read or holds more. For the sysfs
+    /// attributes a grant matches a device by, never for content the
+    /// sandbox is handed.
+    fn read_small(&self, p: &Path) -> Option<Vec<u8>>;
 }
 
 /// The real filesystem.
@@ -56,6 +66,20 @@ impl Host for RealHost {
         rustix::fs::access(p, rustix::fs::Access::WRITE_OK).is_ok()
     }
 
+    /// One byte over the cap is refused rather than truncated: a
+    /// truncated `idVendor` is a device id that matches the wrong
+    /// device. Sysfs reports every attribute as one page long and
+    /// answers with fewer bytes, so the size is read, not stat'd.
+    fn read_small(&self, p: &Path) -> Option<Vec<u8>> {
+        let mut buf = Vec::new();
+        fs::File::open(p)
+            .ok()?
+            .take(SMALL_READ as u64 + 1)
+            .read_to_end(&mut buf)
+            .ok()?;
+        (buf.len() <= SMALL_READ).then_some(buf)
+    }
+
     /// A directory that cannot be read yields an empty list, so a caller
     /// that needs an entry from it reports the entry missing rather than
     /// the I/O error: `dri` fails with `MissingResource`, never silently.
@@ -84,6 +108,7 @@ pub(crate) mod fake {
         pub mounts: BTreeSet<PathBuf>,
         pub writable: BTreeSet<PathBuf>,
         pub unresolved: BTreeSet<PathBuf>,
+        pub files: BTreeMap<PathBuf, Vec<u8>>,
     }
 
     impl FakeHost {
@@ -105,6 +130,13 @@ pub(crate) mod fake {
         /// Mark `p` writable by the user; every other path is read-only.
         pub fn rw(mut self, p: &str) -> Self {
             self.writable.insert(PathBuf::from(p));
+            self
+        }
+
+        /// Give `p` the bytes [`Host::read_small`] answers with; a path
+        /// with none reads as unreadable.
+        pub fn contents(mut self, p: &str, bytes: &[u8]) -> Self {
+            self.files.insert(PathBuf::from(p), bytes.to_vec());
             self
         }
 
@@ -155,6 +187,11 @@ pub(crate) mod fake {
         fn writable(&self, p: &Path) -> bool {
             self.writable.contains(p)
         }
+        /// The cap is applied here too, so a test can pin what a file
+        /// too big to hold does.
+        fn read_small(&self, p: &Path) -> Option<Vec<u8>> {
+            self.files.get(p).filter(|b| b.len() <= SMALL_READ).cloned()
+        }
         fn list_dir(&self, p: &Path) -> Vec<OsString> {
             let mut v: Vec<OsString> = self
                 .entries
@@ -198,5 +235,49 @@ pub(crate) mod fake {
         .unwrap();
         let t = |n: &str| std::fs::metadata(tmp.path().join(n)).unwrap().file_type();
         (t("f"), t("d"), t("s"), t("p"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_small_file_is_read_whole_and_a_bigger_one_not_at_all() {
+        let tmp = tempfile::tempdir().expect("a temp dir wherever these tests run");
+        let write = |name: &str, bytes: Vec<u8>| {
+            let p = tmp.path().join(name);
+            std::fs::write(&p, bytes).expect("the temp dir is writable");
+            p
+        };
+        let id = write("idVendor", b"0bb4\n".to_vec());
+        assert_eq!(RealHost.read_small(&id).as_deref(), Some(&b"0bb4\n"[..]));
+        // The cap is a limit, not a threshold: a file exactly that long
+        // is still read.
+        let edge = write("edge", vec![b'x'; SMALL_READ]);
+        assert_eq!(
+            RealHost.read_small(&edge).map(|b| b.len()),
+            Some(SMALL_READ)
+        );
+        // One byte over is refused rather than cut short, so no caller
+        // can compare against half a value.
+        let over = write("over", vec![b'x'; SMALL_READ + 1]);
+        assert_eq!(RealHost.read_small(&over), None);
+        assert_eq!(RealHost.read_small(&tmp.path().join("gone")), None);
+        // A directory opens and then refuses to be read.
+        assert_eq!(RealHost.read_small(tmp.path()), None);
+    }
+
+    #[test]
+    fn the_fake_host_holds_the_same_cap_as_the_real_one() {
+        let host = fake::FakeHost::default()
+            .contents("/sys/small", b"1\n")
+            .contents("/sys/over", &vec![b'x'; SMALL_READ + 1]);
+        assert_eq!(
+            host.read_small(Path::new("/sys/small")).as_deref(),
+            Some(&b"1\n"[..])
+        );
+        assert_eq!(host.read_small(Path::new("/sys/over")), None);
+        assert_eq!(host.read_small(Path::new("/sys/absent")), None);
     }
 }

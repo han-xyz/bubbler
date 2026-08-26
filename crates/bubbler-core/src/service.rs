@@ -7,6 +7,7 @@
 //! directory binds the whole tree under it, so `XAUTHORITY=/` would bind
 //! the host root.
 
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::FileType;
 use std::os::unix::fs::FileTypeExt;
@@ -80,10 +81,16 @@ pub fn apply_all(
             // the same grant written the older way: one bind, whether the
             // config holds one node or both.
             Service::Hidraw => {}
-            // Task 2: the device and socket binds of the three hardware
-            // grants. Listed here so the match stays exhaustive and the
-            // config side of them is usable on its own.
-            Service::Compute | Service::Usb { .. } | Service::Smartcard => {}
+            Service::Compute => compute(services, args, host)?,
+            Service::Usb { vendor, product } => usb(
+                services,
+                args,
+                host,
+                i,
+                vendor.as_deref(),
+                product.as_deref(),
+            )?,
+            Service::Smartcard => smartcard(args, host)?,
             // Rule-only bundles: they reach the sandbox through the proxy
             // the launcher starts, not through bwrap arguments.
             Service::Notify | Service::Tray | Service::Mpris { .. } => {}
@@ -441,6 +448,50 @@ fn dri(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
     Ok(())
 }
 
+/// AMD GPU compute: `/dev/kfd`, which is the one interface every AMD GPU
+/// on the machine is reached through, plus the KFD topology in `/sys`
+/// that names them and the CPU topology a compute runtime reads beside
+/// it. Bound read-write, because bwrap has no read-only device bind.
+///
+/// The topology is what turns a node into a device: `libhsakmt` reads
+/// `/sys/devices/virtual/kfd/kfd/topology` for the GPUs and their render
+/// minors, so a `/dev/kfd` without it is a node no runtime can use. The
+/// grant fails rather than binding half of itself.
+fn compute(services: &[Service], args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
+    let dev = require(
+        host,
+        "compute",
+        PathBuf::from("/dev/kfd"),
+        "a character device",
+        |t| t.is_char_device(),
+    )?;
+    args.dev_bind(&dev, &dev);
+    // `/sys/class/kfd/kfd` is a symlink into `/sys/devices/virtual/kfd`,
+    // which is bound before it so the link resolves inside.
+    //
+    // `dri` binds the CPU topology already, and one directory is one
+    // mount: the grant that is never granted without `dri` leaves it to
+    // the grant that can stand alone.
+    let dirs: &[&str] = match services.contains(&Service::Dri) {
+        true => &[
+            "/sys/devices/virtual/kfd",
+            "/sys/class/kfd",
+            "/sys/devices/system/node",
+        ],
+        false => &[
+            "/sys/devices/virtual/kfd",
+            "/sys/class/kfd",
+            "/sys/devices/system/node",
+            "/sys/devices/system/cpu",
+        ],
+    };
+    for p in dirs {
+        let p = require_dir(host, "compute", PathBuf::from(*p))?;
+        args.ro_bind(&p, &p);
+    }
+    Ok(())
+}
+
 /// Game controllers: `/dev/input` with device access, plus the `/sys`
 /// entries that identify a device and the udev database where the host
 /// has one. `/dev/input` is every input device, keyboards included.
@@ -642,6 +693,150 @@ fn gamepad_uinput(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchErr
         "bubbler: warning: gamepad uinput=#true: the sandbox can create \
          virtual input devices and type into your session"
     );
+    Ok(())
+}
+
+/// The USB bus in sysfs. Its `devices` directory is what an enumeration
+/// walks: one entry per device and per interface, each a symlink into
+/// `/sys/devices`.
+const USB_SYSFS: &str = "/sys/bus/usb";
+
+/// The socket `pcscd.socket` listens on, and the path libpcsclite
+/// connects to without being told.
+const PCSCD_SOCKET: &str = "/run/pcscd/pcscd.comm";
+
+/// Raw USB I/O. A bare grant is every device: the `/dev/bus/usb` tree
+/// with device access, the bus directory libusb enumerates, and the
+/// `/sys/devices` tree its entries are symlinks into.
+///
+/// With a `vendor` it is only the devices whose sysfs says so: their
+/// usbfs nodes and their own `/sys/devices` directories, resolved here
+/// and frozen — a device plugged in afterwards has no node inside. The
+/// bus directory is bound whole either way, because that is what an
+/// enumeration walks; the links in it that point at devices this grant
+/// did not bind dangle inside, which is what libusb sees for a device it
+/// may not touch.
+///
+/// `index` is this node's position among `services`: the bus directory
+/// is one directory and one mount however many nodes the config holds,
+/// so the first of them binds it for all.
+fn usb(
+    services: &[Service],
+    args: &mut BwrapArgs,
+    host: &dyn Host,
+    index: usize,
+    vendor: Option<&str>,
+    product: Option<&str>,
+) -> Result<(), LaunchError> {
+    let bus = PathBuf::from(USB_SYSFS);
+    let Some(vendor) = vendor else {
+        let dev = require_dir(host, "usb", PathBuf::from("/dev/bus/usb"))?;
+        args.dev_bind(&dev, &dev);
+        let bus = require_dir(host, "usb", bus)?;
+        args.ro_bind(&bus, &bus);
+        // `gamepad` binds the device tree too, and after this one: two
+        // mounts for one tree is what that node already avoids.
+        if !services
+            .iter()
+            .any(|s| matches!(s, Service::Gamepad { .. }))
+        {
+            let all = require_dir(host, "usb", PathBuf::from("/sys/devices"))?;
+            args.ro_bind(&all, &all);
+        }
+        return Ok(());
+    };
+    let first = services
+        .iter()
+        .position(|s| matches!(s, Service::Usb { .. }))
+        == Some(index);
+    if first {
+        let bus = require_dir(host, "usb", bus.clone())?;
+        args.ro_bind(&bus, &bus);
+    }
+    // Keyed by the usbfs node, so the binds come out in a stable order
+    // whatever order the bus directory was listed in, and a device seen
+    // twice is bound once.
+    let mut found: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+    let devices = bus.join("devices");
+    for name in host.list_dir(&devices) {
+        let entry = devices.join(&name);
+        // An interface (`1-2:1.0`) carries no ids of its own, and neither
+        // does an entry that has gone away mid-walk: both are passed
+        // over rather than reported, the way an unplugged device is.
+        let Some(id) = sysfs_id(host, &entry, "idVendor") else {
+            continue;
+        };
+        if id != vendor {
+            continue;
+        }
+        if let Some(product) = product
+            && sysfs_id(host, &entry, "idProduct").as_deref() != Some(product)
+        {
+            continue;
+        }
+        let (Some(busnum), Some(devnum)) = (
+            sysfs_num(host, &entry, "busnum"),
+            sysfs_num(host, &entry, "devnum"),
+        ) else {
+            continue;
+        };
+        let Some(dir) = host.canonicalize(&entry) else {
+            continue;
+        };
+        found.insert(
+            PathBuf::from(format!("/dev/bus/usb/{busnum:03}/{devnum:03}")),
+            dir,
+        );
+    }
+    if found.is_empty() {
+        // Not a failure: the device this names is one the user plugs in,
+        // and a sandbox that starts without it is what they asked for
+        // everywhere else in the config.
+        match product {
+            Some(product) => eprintln!(
+                "bubbler: warning: usb: no device matches vendor={vendor} product={product}"
+            ),
+            None => eprintln!("bubbler: warning: usb: no device matches vendor={vendor}"),
+        }
+        return Ok(());
+    }
+    for (node, dir) in found {
+        let node = require(host, "usb", node, "a character device", |t| {
+            t.is_char_device()
+        })?;
+        args.dev_bind(&node, &node);
+        let dir = require_dir(host, "usb", dir)?;
+        args.ro_bind(&dir, &dir);
+    }
+    Ok(())
+}
+
+/// A sysfs attribute as the lower-case text it holds, which is how a
+/// device id is written there and how the parser normalises the one in
+/// the config. `None` where the attribute is absent or unreadable.
+fn sysfs_id(host: &dyn Host, dir: &Path, name: &str) -> Option<String> {
+    let raw = host.read_small(&dir.join(name))?;
+    Some(std::str::from_utf8(&raw).ok()?.trim().to_ascii_lowercase())
+}
+
+/// A sysfs attribute as the number it holds. The usbfs path is built out
+/// of these two, so a value that is not a number yields no path at all
+/// rather than a name pasted into one.
+fn sysfs_num(host: &dyn Host, dir: &Path, name: &str) -> Option<u16> {
+    let raw = host.read_small(&dir.join(name))?;
+    std::str::from_utf8(&raw).ok()?.trim().parse().ok()
+}
+
+/// Smart cards through the host's `pcscd`: its socket, bound at the path
+/// libpcsclite connects to on its own, and no device node at all.
+///
+/// A host where the socket is missing has the daemon stopped — on a
+/// systemd host that is `pcscd.socket`, which the error names by the
+/// path it listens on. The launch fails rather than starting an
+/// application whose card reader would never appear.
+fn smartcard(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
+    let p = require_socket(host, "smartcard", PathBuf::from(PCSCD_SOCKET))?;
+    args.ro_bind(&p, &p);
     Ok(())
 }
 
@@ -1225,6 +1420,26 @@ mod tests {
         links: &[(&str, &str)],
         wayland: Option<&WaylandPlan>,
     ) -> Result<Vec<String>, LaunchError> {
+        argv_with(services, env, &fake_host(existing, links), wayland)
+    }
+
+    /// Services applied against a host that also answers with file
+    /// contents: the filtered `usb` grant reads the sysfs ids of every
+    /// device before it decides which nodes to bind.
+    fn argv_read(
+        services: &[Service],
+        existing: &[(&str, Kind)],
+        links: &[(&str, &str)],
+        contents: &[(&str, &str)],
+    ) -> Result<Vec<String>, LaunchError> {
+        let mut host = fake_host(existing, links);
+        for (p, bytes) in contents {
+            host = host.contents(p, bytes.as_bytes());
+        }
+        argv_with(services, &env(), &host, None)
+    }
+
+    fn fake_host(existing: &[(&str, Kind)], links: &[(&str, &str)]) -> FakeHost {
         let (file, dir, sock) = fake::types();
         let mut host = FakeHost::default();
         for (p, k) in existing {
@@ -1239,13 +1454,22 @@ mod tests {
         for (from, to) in links {
             host = host.link(from, to);
         }
+        host
+    }
+
+    fn argv_with(
+        services: &[Service],
+        env: &Env,
+        host: &FakeHost,
+        wayland: Option<&WaylandPlan>,
+    ) -> Result<Vec<String>, LaunchError> {
         let plan = dbus::plan(services, "t");
         let ctx = ServiceCtx {
             wayland,
             ..argv_ctx(&plan)
         };
-        let mut args = BwrapArgs::baseline(env, Path::new("/i/home"), &host);
-        apply_all(services, env, &mut args, &host, &ctx)?;
+        let mut args = BwrapArgs::baseline(env, Path::new("/i/home"), host);
+        apply_all(services, env, &mut args, host, &ctx)?;
         Ok(strs(&args.finish(
             &[OsString::from("x")],
             &mut crate::launcher::DryRunAlloc::default(),
@@ -1976,6 +2200,9 @@ mod tests {
             }
             fn writable(&self, p: &Path) -> bool {
                 Host::writable(&self.0, p)
+            }
+            fn read_small(&self, p: &Path) -> Option<Vec<u8>> {
+                self.0.read_small(p)
             }
         }
         let e = env();
@@ -3009,6 +3236,450 @@ mod tests {
             let all = seq_at(&a, &["--ro-bind", "/sys/devices", "/sys/devices"])
                 .expect("gamepad binds the device tree");
             assert!(pci < all, "{order:?}: {a:?}");
+        }
+    }
+
+    /// The KFD interface and the topology under it, as this host has
+    /// them: `/sys/class/kfd/kfd` is a symlink into
+    /// `/sys/devices/virtual/kfd`.
+    fn compute_host() -> Vec<(&'static str, Kind)> {
+        vec![
+            ("/dev/kfd", Char),
+            ("/sys/devices/virtual/kfd", Dir),
+            ("/sys/class/kfd", Dir),
+            ("/sys/devices/system/node", Dir),
+            ("/sys/devices/system/cpu", Dir),
+        ]
+    }
+
+    #[test]
+    fn compute_binds_the_kfd_node_and_the_topology_that_names_the_gpus() {
+        let a = argv(&[Service::Compute], &env(), &compute_host()).unwrap();
+        assert_eq!(
+            binds(&a),
+            [
+                "--dev-bind",
+                "/dev/kfd",
+                "/dev/kfd",
+                "--ro-bind",
+                "/sys/devices/virtual/kfd",
+                "/sys/devices/virtual/kfd",
+                "--ro-bind",
+                "/sys/class/kfd",
+                "/sys/class/kfd",
+                "--ro-bind",
+                "/sys/devices/system/node",
+                "/sys/devices/system/node",
+                "--ro-bind",
+                "/sys/devices/system/cpu",
+                "/sys/devices/system/cpu",
+            ]
+        );
+    }
+
+    #[test]
+    fn compute_without_the_kfd_node_fails_the_launch() {
+        let host: Vec<_> = compute_host()
+            .into_iter()
+            .filter(|(p, _)| *p != "/dev/kfd")
+            .collect();
+        assert!(matches!(
+            argv(&[Service::Compute], &env(), &host),
+            Err(LaunchError::MissingResource {
+                service: "compute",
+                path,
+            }) if path == Path::new("/dev/kfd")
+        ));
+        // A name where the node should be is not the node.
+        assert!(matches!(
+            argv(&[Service::Compute], &env(), &[("/dev/kfd", File)]),
+            Err(LaunchError::WrongType {
+                service: "compute",
+                expected: "a character device",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn compute_without_the_topology_fails_rather_than_running_blind() {
+        for missing in [
+            "/sys/devices/virtual/kfd",
+            "/sys/class/kfd",
+            "/sys/devices/system/node",
+            "/sys/devices/system/cpu",
+        ] {
+            let host: Vec<_> = compute_host()
+                .into_iter()
+                .filter(|(p, _)| *p != missing)
+                .collect();
+            assert!(
+                matches!(
+                    argv(&[Service::Compute], &env(), &host),
+                    Err(LaunchError::MissingResource {
+                        service: "compute",
+                        ref path,
+                    }) if path == Path::new(missing)
+                ),
+                "{missing} was not required"
+            );
+        }
+    }
+
+    #[test]
+    fn compute_leaves_the_cpu_topology_to_dri_where_both_are_granted() {
+        let mut host = compute_host();
+        host.extend([
+            ("/dev/dri", Dir),
+            ("/sys/dev/char", Dir),
+            ("/sys/devices/pci0000:00", Dir),
+        ]);
+        for order in [
+            [Service::Dri, Service::Compute],
+            [Service::Compute, Service::Dri],
+        ] {
+            let a = argv(&order, &env(), &host).unwrap();
+            // One directory, one mount: `dri` binds it for both, and
+            // `compute` is never granted without `dri` beside it.
+            assert_eq!(
+                binds(&a)
+                    .iter()
+                    .filter(|b| **b == "/sys/devices/system/cpu")
+                    .count(),
+                2,
+                "{order:?}: {:?}",
+                binds(&a)
+            );
+        }
+    }
+
+    const USB_1_2: &str = "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-2";
+    const USB_1_3: &str = "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-3";
+    const USB_1_4: &str = "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-4";
+
+    /// A host with three USB devices on bus 1: a hardware wallet at
+    /// `1-2`, another vendor's device at `1-3`, a second device of the
+    /// wallet's vendor at `1-4`, and the interface entry `1-2:1.0` the
+    /// kernel lists beside them.
+    fn usb_host() -> Vec<(&'static str, Kind)> {
+        vec![
+            ("/dev/bus/usb", Dir),
+            ("/dev/bus/usb/001/002", Char),
+            ("/dev/bus/usb/001/003", Char),
+            ("/dev/bus/usb/001/004", Char),
+            ("/sys/bus/usb", Dir),
+            ("/sys/bus/usb/devices", Dir),
+            ("/sys/bus/usb/devices/1-2", Dir),
+            ("/sys/bus/usb/devices/1-2:1.0", Dir),
+            ("/sys/bus/usb/devices/1-3", Dir),
+            ("/sys/bus/usb/devices/1-4", Dir),
+            ("/sys/devices", Dir),
+            (USB_1_2, Dir),
+            (USB_1_3, Dir),
+            (USB_1_4, Dir),
+        ]
+    }
+
+    /// What the `/sys/bus/usb/devices` entries are: symlinks into the
+    /// device tree, which is where the grant binds from.
+    fn usb_links() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("/sys/bus/usb/devices/1-2", USB_1_2),
+            ("/sys/bus/usb/devices/1-3", USB_1_3),
+            ("/sys/bus/usb/devices/1-4", USB_1_4),
+        ]
+    }
+
+    /// The attributes the filter reads. `1-4` has the lower device
+    /// number and the later name, so a bind order that follows the
+    /// sysfs listing is not the sorted one.
+    fn usb_ids() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("/sys/bus/usb/devices/1-2/idVendor", "0bb4\n"),
+            ("/sys/bus/usb/devices/1-2/idProduct", "0c8d\n"),
+            ("/sys/bus/usb/devices/1-2/busnum", "1\n"),
+            ("/sys/bus/usb/devices/1-2/devnum", "3\n"),
+            ("/sys/bus/usb/devices/1-3/idVendor", "1050\n"),
+            ("/sys/bus/usb/devices/1-3/idProduct", "0407\n"),
+            ("/sys/bus/usb/devices/1-3/busnum", "1\n"),
+            ("/sys/bus/usb/devices/1-3/devnum", "4\n"),
+            ("/sys/bus/usb/devices/1-4/idVendor", "0bb4\n"),
+            ("/sys/bus/usb/devices/1-4/idProduct", "0002\n"),
+            ("/sys/bus/usb/devices/1-4/busnum", "1\n"),
+            ("/sys/bus/usb/devices/1-4/devnum", "2\n"),
+            // An interface entry carries no ids of its own, so the walk
+            // passes over it without reading a device out of it.
+            ("/sys/bus/usb/devices/1-2:1.0/bInterfaceNumber", "00\n"),
+        ]
+    }
+
+    fn usb_node(vendor: Option<&str>, product: Option<&str>) -> Service {
+        Service::Usb {
+            vendor: vendor.map(str::to_owned),
+            product: product.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_bare_usb_binds_every_device_and_the_tree_that_names_them() {
+        let a = argv(&[usb_node(None, None)], &env(), &usb_host()).unwrap();
+        assert_eq!(
+            binds(&a),
+            [
+                "--dev-bind",
+                "/dev/bus/usb",
+                "/dev/bus/usb",
+                "--ro-bind",
+                "/sys/bus/usb",
+                "/sys/bus/usb",
+                "--ro-bind",
+                "/sys/devices",
+                "/sys/devices",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bare_usb_needs_the_usbfs_directory() {
+        let host: Vec<_> = usb_host()
+            .into_iter()
+            .filter(|(p, _)| !p.starts_with("/dev/bus/usb"))
+            .collect();
+        assert!(matches!(
+            argv(&[usb_node(None, None)], &env(), &host),
+            Err(LaunchError::MissingResource {
+                service: "usb",
+                path,
+            }) if path == Path::new("/dev/bus/usb")
+        ));
+    }
+
+    #[test]
+    fn a_bare_usb_leaves_the_device_tree_to_gamepad_where_both_are_granted() {
+        let mut host = usb_host();
+        host.extend(gamepad_host());
+        let a = argv(
+            &[
+                usb_node(None, None),
+                Service::Gamepad {
+                    hidraw: false,
+                    uinput: false,
+                },
+            ],
+            &env(),
+            &host,
+        )
+        .unwrap();
+        assert_eq!(
+            binds(&a).iter().filter(|b| **b == "/sys/devices").count(),
+            2,
+            "{:?}",
+            binds(&a)
+        );
+    }
+
+    #[test]
+    fn usb_with_both_ids_binds_the_one_node_that_reports_them() {
+        let a = argv_read(
+            &[usb_node(Some("0bb4"), Some("0c8d"))],
+            &usb_host(),
+            &usb_links(),
+            &usb_ids(),
+        )
+        .unwrap();
+        assert_eq!(
+            binds(&a),
+            [
+                "--ro-bind",
+                "/sys/bus/usb",
+                "/sys/bus/usb",
+                "--dev-bind",
+                "/dev/bus/usb/001/003",
+                "/dev/bus/usb/001/003",
+                "--ro-bind",
+                USB_1_2,
+                USB_1_2,
+            ]
+        );
+        // Not the whole tree, not the other vendor's device, and not the
+        // interface entry, which has no ids to match on.
+        assert!(!binds(&a).contains(&"/sys/devices"), "{:?}", binds(&a));
+        assert!(
+            !a.iter().any(|s| s.contains("1-3") || s.contains("1-2:1.0")),
+            "{a:?}"
+        );
+    }
+
+    #[test]
+    fn usb_with_a_vendor_alone_binds_every_device_of_that_vendor_in_order() {
+        let a = argv_read(
+            &[usb_node(Some("0bb4"), None)],
+            &usb_host(),
+            &usb_links(),
+            &usb_ids(),
+        )
+        .unwrap();
+        assert_eq!(
+            binds(&a),
+            [
+                "--ro-bind",
+                "/sys/bus/usb",
+                "/sys/bus/usb",
+                "--dev-bind",
+                "/dev/bus/usb/001/002",
+                "/dev/bus/usb/001/002",
+                "--ro-bind",
+                USB_1_4,
+                USB_1_4,
+                "--dev-bind",
+                "/dev/bus/usb/001/003",
+                "/dev/bus/usb/001/003",
+                "--ro-bind",
+                USB_1_2,
+                USB_1_2,
+            ]
+        );
+    }
+
+    #[test]
+    fn two_usb_nodes_share_one_bind_of_the_bus_directory() {
+        let a = argv_read(
+            &[
+                usb_node(Some("1050"), Some("0407")),
+                usb_node(Some("0bb4"), Some("0c8d")),
+            ],
+            &usb_host(),
+            &usb_links(),
+            &usb_ids(),
+        )
+        .unwrap();
+        assert_eq!(
+            binds(&a),
+            [
+                "--ro-bind",
+                "/sys/bus/usb",
+                "/sys/bus/usb",
+                "--dev-bind",
+                "/dev/bus/usb/001/004",
+                "/dev/bus/usb/001/004",
+                "--ro-bind",
+                USB_1_3,
+                USB_1_3,
+                "--dev-bind",
+                "/dev/bus/usb/001/003",
+                "/dev/bus/usb/001/003",
+                "--ro-bind",
+                USB_1_2,
+                USB_1_2,
+            ]
+        );
+    }
+
+    /// The warning itself goes to stderr, which a test in this process
+    /// cannot read back: what is pinned here is that the launch carries
+    /// on and that no device node reached the sandbox.
+    #[test]
+    fn usb_that_matches_no_device_warns_rather_than_failing() {
+        for node in [
+            usb_node(Some("dead"), None),
+            usb_node(Some("0bb4"), Some("beef")),
+        ] {
+            let a = argv_read(&[node], &usb_host(), &usb_links(), &usb_ids()).unwrap();
+            assert_eq!(binds(&a), ["--ro-bind", "/sys/bus/usb", "/sys/bus/usb"]);
+            assert!(!a.iter().any(|s| s.starts_with("/dev/bus/usb")), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn usb_ignores_an_entry_whose_ids_it_cannot_read() {
+        // Everything but the ids of the device that would match: an
+        // entry the walk cannot read is an entry it passes over.
+        for hidden in ["idVendor", "busnum", "devnum"] {
+            let ids: Vec<_> = usb_ids()
+                .into_iter()
+                .filter(|(p, _)| *p != format!("/sys/bus/usb/devices/1-2/{hidden}"))
+                .collect();
+            let a = argv_read(
+                &[usb_node(Some("0bb4"), Some("0c8d"))],
+                &usb_host(),
+                &usb_links(),
+                &ids,
+            )
+            .unwrap();
+            assert_eq!(
+                binds(&a),
+                ["--ro-bind", "/sys/bus/usb", "/sys/bus/usb"],
+                "{hidden} did not stop the match"
+            );
+        }
+    }
+
+    #[test]
+    fn usb_needs_the_node_the_ids_pointed_at_to_be_a_device() {
+        let host: Vec<_> = usb_host()
+            .into_iter()
+            .map(|(p, k)| match p {
+                "/dev/bus/usb/001/003" => (p, File),
+                _ => (p, k),
+            })
+            .collect();
+        assert!(matches!(
+            argv_read(
+                &[usb_node(Some("0bb4"), Some("0c8d"))],
+                &host,
+                &usb_links(),
+                &usb_ids(),
+            ),
+            Err(LaunchError::WrongType {
+                service: "usb",
+                expected: "a character device",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn smartcard_binds_the_daemon_socket_and_no_device() {
+        let a = argv(
+            &[Service::Smartcard],
+            &env(),
+            &[("/run/pcscd/pcscd.comm", Sock)],
+        )
+        .unwrap();
+        assert_eq!(
+            binds(&a),
+            [
+                "--ro-bind",
+                "/run/pcscd/pcscd.comm",
+                "/run/pcscd/pcscd.comm"
+            ]
+        );
+    }
+
+    #[test]
+    fn smartcard_without_a_running_daemon_fails_the_launch() {
+        assert!(matches!(
+            argv(&[Service::Smartcard], &env(), &[]),
+            Err(LaunchError::MissingResource {
+                service: "smartcard",
+                path,
+            }) if path == Path::new("/run/pcscd/pcscd.comm")
+        ));
+        // The socket is what pcscd listens on; a file or a directory of
+        // that name is not the daemon.
+        for kind in [File, Dir] {
+            assert!(matches!(
+                argv(
+                    &[Service::Smartcard],
+                    &env(),
+                    &[("/run/pcscd/pcscd.comm", kind)]
+                ),
+                Err(LaunchError::WrongType {
+                    service: "smartcard",
+                    expected: "a socket",
+                    ..
+                })
+            ));
         }
     }
 
