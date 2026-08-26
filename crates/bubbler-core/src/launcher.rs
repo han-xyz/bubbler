@@ -1,7 +1,9 @@
 //! Spawns bubblewrap and the sidecars a sandbox needs — the filtering
 //! D-Bus proxy and, for an isolated `network`, pasta. The only
-//! process-spawning code in the crate; it never goes through a shell, and
-//! every sidecar is killed on every way out of a run.
+//! process-spawning code in the crate; it never goes through a shell,
+//! every spawn is preceded by a [`fds::sweep`] so a child holds only the
+//! descriptors it was meant to, and every sidecar is killed on every way
+//! out of a run.
 
 use std::ffi::{OsString, c_void};
 use std::io::{self, Seek, SeekFrom, Write};
@@ -27,6 +29,8 @@ use rustix::thread::{
 };
 use signal_hook::SigId;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
+
+use bubbler_init::fds;
 
 use crate::bwrap::{BwrapArgs, Explained, FdAllocator, Origin};
 use crate::config::{NetworkConfig, Service, Userns, WaylandMode};
@@ -218,6 +222,40 @@ impl RealAlloc {
         }
         Ok(())
     }
+
+    /// Every descriptor the spawn this allocator was built for is meant to
+    /// inherit, which is what [`spawning`] keeps and marks the rest against.
+    ///
+    /// Three sources: the ones [`RealAlloc::inheritable`] opens the window
+    /// for, the control socket bubbler dup'ed for the sandbox, and the
+    /// write end of the info pipe — which is never close-on-exec at all,
+    /// because bwrap reports the sandbox pid on it and the caller closes
+    /// it by hand the moment bwrap has been started.
+    fn intended(&self) -> Vec<RawFd> {
+        let mut fds: Vec<RawFd> = self.fds.iter().map(AsRawFd::as_raw_fd).collect();
+        fds.extend(self.socket);
+        fds.extend(self.info_write.as_ref().map(AsRawFd::as_raw_fd));
+        fds
+    }
+}
+
+/// Mark every descriptor above stdio close-on-exec except the ones `keep`
+/// names, immediately before a spawn.
+///
+/// bubbler is started by whatever the user runs it from, and a shell, a
+/// terminal or a build system hands a process descriptors it never asked
+/// for — `makepkg` runs a `check()` with two of its own open. bwrap passes
+/// on every descriptor it holds, so without this each of those reaches the
+/// sandbox, the supervisor, every command exec'd in it, the D-Bus and
+/// Wayland proxies, pasta and the `nft` that holds CAP_NET_ADMIN over the
+/// sandbox's namespaces. Nothing is closed: bubbler's own descriptors stay
+/// open for the rest of the run and only stop crossing into children.
+///
+/// Like [`RealAlloc::inheritable`], the window is process-wide, so only
+/// one thread may spawn while it is open; bubbler's only other thread
+/// starts no process at all ([`crate::run_log`]).
+fn spawning(keep: &[RawFd]) -> Result<(), LaunchError> {
+    fds::sweep(keep, fds::Stray::Cloexec).map_err(LaunchError::Data)
 }
 
 impl FdAllocator for RealAlloc {
@@ -886,6 +924,7 @@ pub fn start_wayland(
     let mut alloc = RealAlloc::sidecar_listening(listener.into());
     let argv = wl_proxy_argv(env, &plan, node, host, &mut alloc)?;
     alloc.inheritable(true).map_err(LaunchError::Data)?;
+    spawning(&alloc.intended())?;
     let child = Command::new("bwrap")
         .args(&argv)
         .spawn()
@@ -1022,6 +1061,7 @@ pub fn start_proxy(
         &mut alloc,
     )?;
     alloc.inheritable(true).map_err(LaunchError::Data)?;
+    spawning(&alloc.intended())?;
     let child = Command::new("bwrap")
         .args(&argv)
         .spawn()
@@ -1296,6 +1336,9 @@ fn install_rules(cfg: &NetworkConfig, ns: &SandboxNs) -> Result<(), LaunchError>
             Ok(())
         });
     }
+    // Nothing above stdio: the namespaces are entered before the exec and
+    // the ruleset arrives on a pipe this spawn makes for itself.
+    spawning(&[])?;
     let mut child = cmd.spawn().map_err(|e| match e.kind() {
         // Only a `nft` that is really missing gets the message naming the
         // package. A `pre_exec` closure that failed comes back as a spawn
@@ -1412,6 +1455,10 @@ fn start_pasta(
         .as_fd()
         .try_clone_to_owned()
         .map_err(LaunchError::Data)?;
+    // Nothing above stdio here either: pasta opens the two descriptors
+    // through bubbler's own `/proc` entry rather than inheriting them, so
+    // marking them close-on-exec — which they already are — costs nothing.
+    spawning(&[])?;
     let child = Command::new(network::program(env))
         .args(&argv)
         .stdin(Stdio::null())
@@ -2174,6 +2221,7 @@ pub fn run(
     // instance's control socket in particular is neither one's to hold.
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     fcntl_setfd(&inherited, FdFlags::empty()).map_err(io_at)?;
+    spawning(&alloc.intended())?;
     let mut child = Command::new("bwrap")
         .args(&argv)
         .stdin(stdio_for(stdio.fds[0], stdio.pty.as_ref())?)
@@ -3999,6 +4047,28 @@ mod tests {
         assert_eq!(alloc.ready_pipe().unwrap(), OsString::from("6"));
         assert_eq!(alloc.info_pipe().unwrap(), OsString::from("7"));
         assert_eq!(alloc.block_pipe().unwrap(), OsString::from("8"));
+    }
+
+    #[test]
+    fn what_a_spawn_may_inherit_is_the_fds_the_socket_and_the_info_pipe() {
+        let mut alloc = RealAlloc::new(7);
+        assert_eq!(alloc.intended(), vec![7]);
+        alloc.data(b"a").unwrap();
+        alloc.block_pipe().unwrap();
+        alloc.info_pipe().unwrap();
+        let held: Vec<RawFd> = alloc.fds.iter().map(AsRawFd::as_raw_fd).collect();
+        let info = alloc
+            .info_write
+            .as_ref()
+            .expect("the info pipe was allocated")
+            .as_raw_fd();
+        // The write end of the info pipe is the one bwrap must inherit
+        // that `inheritable` never touches, so a sweep that went by
+        // `fds` alone would take the sandbox pid with it.
+        let mut want = held;
+        want.push(7);
+        want.push(info);
+        assert_eq!(alloc.intended(), want);
     }
 
     #[test]

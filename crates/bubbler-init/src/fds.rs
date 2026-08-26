@@ -105,10 +105,12 @@ fn strays(keep: &[RawFd]) -> io::Result<Vec<RawFd>> {
 mod tests {
     use super::*;
 
-    /// Only the listing is exercised here. A sweep is process-wide, and
-    /// these tests run as threads of one binary: closing or marking the
-    /// descriptors of the threads beside them is exactly what the contract
-    /// above forbids.
+    /// [`Stray::Close`] is never run for real in here. A sweep is
+    /// process-wide and these tests are threads of one binary, so closing
+    /// what this thread did not open is closing another thread's
+    /// descriptors — which is the contract above, not a case to exercise.
+    /// What that arm does with a number is what the supervisor's own
+    /// integration tests measure, in a process of its own.
     #[test]
     fn a_descriptor_this_process_opened_is_a_stray_unless_it_is_kept() {
         let file = std::fs::File::open("/dev/null").unwrap();
@@ -117,6 +119,24 @@ mod tests {
         assert!(
             !strays(&[fd]).unwrap().contains(&fd),
             "fd {fd} was listed although it was kept"
+        );
+    }
+
+    /// Marking is safe to do for real in this binary, where closing is
+    /// not: no test here starts a process, so no descriptor of a thread
+    /// beside this one is waiting to be inherited by anything.
+    #[test]
+    fn a_stray_is_marked_close_on_exec_and_a_kept_one_is_left_alone() {
+        let kept = std::fs::File::open("/dev/null").unwrap();
+        let stray = std::fs::File::open("/dev/null").unwrap();
+        fcntl_setfd(&kept, FdFlags::empty()).unwrap();
+        fcntl_setfd(&stray, FdFlags::empty()).unwrap();
+        sweep(&[kept.as_raw_fd()], Stray::Cloexec).unwrap();
+        assert_eq!(rustix::io::fcntl_getfd(&kept).unwrap(), FdFlags::empty());
+        assert_eq!(
+            rustix::io::fcntl_getfd(&stray).unwrap(),
+            FdFlags::CLOEXEC,
+            "a descriptor nobody named stayed inheritable"
         );
     }
 

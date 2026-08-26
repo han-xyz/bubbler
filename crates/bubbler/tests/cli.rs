@@ -14,7 +14,7 @@ use bubbler_core::profile::NAMES;
 use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
     PYTHON, bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, bubbler_wayland, bwrap_alive,
-    kill_group, output_past_a_busy_exec, process_running, real_init, require_a11y,
+    holders_of, kill_group, output_past_a_busy_exec, process_running, real_init, require_a11y,
     require_a11y_lookup, require_bwrap, require_dbus, require_document_portal, require_groff,
     require_host_program, require_nested_x11, require_nested_x11_host, require_nft, require_pasta,
     require_portal, require_python, require_security_context, require_system_bus, require_tray,
@@ -9183,6 +9183,78 @@ fn ui_runs_the_editor_beside_it_before_the_one_on_the_path() {
         String::from_utf8_lossy(&out.stdout).trim(),
         "the editor beside it"
     );
+}
+
+/// [`bubbler_in_sh`] with the session's runtime directory and bus
+/// address, as [`bubbler_dbus`] has them: a `dbus` grant needs both.
+fn bubbler_dbus_in_sh(root: &Path, init: &Path, script: &str) -> Command {
+    let mut c = bubbler_in_sh(root, init, script);
+    for var in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
+        if let Some(value) = std::env::var_os(var) {
+            c.env(var, value);
+        }
+    }
+    c
+}
+
+#[test]
+fn real_bwrap_run_hands_on_nothing_the_shell_that_started_it_left_open() {
+    // A `dbus` grant, so the run has a sidecar: the supervisor closes what
+    // it was not given, but a proxy is bwrap around `xdg-dbus-proxy` with
+    // no supervisor in it, and only the launcher can keep a stray out of
+    // one.
+    if !require_dbus() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let name = instance_name("strays");
+    let _leftovers = dbus_instance(tmp.path(), &init, &name, "dbus\n");
+    let stray = tmp.path().join("stray");
+    let listing = tmp.path().join("inside");
+    // A descriptor of the caller's own, opened and never mentioned: what
+    // `makepkg` does to a `check()`, and what a login shell or a service
+    // manager does to anything it starts. Opened by the shell rather than
+    // by a `pre_exec` of this suite's, so the window in which it is
+    // inheritable belongs to that shell and not to a test binary running
+    // its tests as threads of one process.
+    let script = format!(
+        "exec 7>{s}; exec \"$B\" run {name} -- \
+         /usr/bin/sh -c 'ls /proc/self/fd; sleep 30' >{o}",
+        s = stray.display(),
+        o = listing.display()
+    );
+    let mut run = bubbler_dbus_in_sh(tmp.path(), &init, &script)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = wait_until(
+        || std::fs::read_to_string(&listing).is_ok_and(|s| !s.trim().is_empty()),
+        Duration::from_secs(30),
+    );
+    if !started {
+        kill_group(&run);
+        fail_with(run, "the sandbox never listed its descriptors");
+    }
+    // Nobody but the process the shell exec'd bubbler into holds it —
+    // not the proxy, not bwrap, not the sandbox.
+    let holders = holders_of(&stray);
+    assert_eq!(
+        holders,
+        vec![run.id() as i32],
+        "{} was handed on by bubbler",
+        stray.display()
+    );
+    // And in the sandbox: its own stdio, and the handle `ls` has on the
+    // directory it is listing, which is the lowest number free to it.
+    let inside: Vec<String> = std::fs::read_to_string(&listing)
+        .unwrap()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(inside, ["0", "1", "2", "3"], "in the sandbox");
+    kill_group(&run);
+    let _ = run.wait();
 }
 
 /// The guarded test this one runs again in a child of itself. Any of the

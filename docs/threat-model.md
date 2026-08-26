@@ -180,6 +180,14 @@ channel and one naming a socket this very proxy is about to serve.
 Neither is a host bus. The resolved path is the one returned and bound,
 so the path compared and the path bound are the same string.
 
+The descriptors bubbler is started with are untrusted the same way: a
+shell, a terminal, a service manager or a build system leaves open what it
+likes — `makepkg` runs a `check()` with two of its own — and bwrap passes
+on every descriptor it holds, so before each spawn the launcher marks
+every descriptor above stdio close-on-exec except the ones that spawn was
+built to inherit, and the supervisor closes every one but the control
+socket its argv names before it starts anything at all.
+
 **Does not defend:** a value that really does name a socket of the right
 type is bound, whatever it is a socket for. The bus guard compares paths,
 so it does not see a *hard link* to a control socket made elsewhere, and
@@ -203,7 +211,9 @@ describes goes on to refuse.
 `x11_xauthority_at_a_directory_fails`,
 `launcher::tests::a_host_bus_address_under_bubblers_runtime_directory_is_refused`,
 `dbus::tests::a_guarded_bus_path_comes_back_resolved`,
-`a_bus_address_under_bubblers_runtime_directory_is_refused`
+`a_bus_address_under_bubblers_runtime_directory_is_refused`,
+`real_bwrap_run_hands_on_nothing_the_shell_that_started_it_left_open`,
+`no_descriptor_the_supervisor_was_not_given_reaches_anything_it_starts`
 
 ### Wayland
 

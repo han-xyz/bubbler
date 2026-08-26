@@ -442,6 +442,32 @@ pub fn process_running(program: &str, needle: &str) -> bool {
         .any(|line| line.contains(program) && line.contains(needle))
 }
 
+/// Every process of this user's holding a descriptor on `path`, by pid.
+///
+/// The whole of `/proc` is walked rather than one pid guessed at: a
+/// descriptor bubbler passed on by mistake could be held by the sandbox,
+/// its supervisor, a proxy sidecar or pasta, and this asks the host which
+/// of them has it. A directory or a link that cannot be read is one this
+/// user may not look into, or a process that exited mid-walk, and is
+/// skipped: neither is a holder this suite can be shown.
+pub fn holders_of(path: &Path) -> Vec<i32> {
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    procs
+        .flatten()
+        .filter_map(|e| e.file_name().to_string_lossy().parse::<i32>().ok())
+        .filter(|pid| {
+            let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+                return false;
+            };
+            fds.flatten()
+                .filter_map(|e| std::fs::read_link(e.path()).ok())
+                .any(|target| target == path)
+        })
+        .collect()
+}
+
 /// [`bubbler`] pointed at the real supervisor binary, for tests that
 /// start an actual sandbox instead of only building its argv.
 pub fn bubbler_live(root: &Path, init: &Path) -> Command {
