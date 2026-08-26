@@ -48,6 +48,11 @@ const DOC_DIR: &str = "doc";
 /// whatever they are on the host.
 const BASELINE_ROOTS: [&str; 2] = ["/usr", "/opt"];
 
+/// `sysfs`, as `statfs(2)` lists it. rustix names `PROC_SUPER_MAGIC`
+/// but not this one, and a bind mount of either filesystem answers to a
+/// path no prefix test would catch.
+const SYSFS_MAGIC: rustix::fs::FsWord = 0x6265_6572;
+
 /// Path prefixes never forwarded: they name kernel interfaces and the
 /// sandbox's own devices, not documents, and the sandbox has its own
 /// `/proc` and `/dev` already.
@@ -341,10 +346,12 @@ pub fn register(
 /// is worth calling even when nothing was registered. Arguments neither
 /// covers are copied as they were, `file://` URIs included.
 ///
-/// All three lists count positions the same way: `planned` must be the
-/// [`plan`] (or [`plan_args`]) of these same `args`, and `forwards` the
-/// [`register`] of the candidates in it. An index from another argument
-/// list is ignored rather than applied to the wrong argument.
+/// All three lists count positions the same way, and the caller must
+/// keep them that way: `planned` must be the [`plan`] (or
+/// [`plan_args`]) of these same `args`, and `forwards` the [`register`]
+/// of the candidates in it. An index from another argument list is
+/// applied to whatever sits at that position here — it names a
+/// position, not an argument — and only one past the end is dropped.
 pub fn rewrite(args: &[OsString], planned: &[Planned], forwards: &[Forward]) -> Vec<OsString> {
     debug_assert!(
         planned.len() <= args.len()
@@ -456,18 +463,24 @@ fn classify(index: usize, arg: &OsStr, visible: &[Root], host: &dyn Host) -> Pla
         .max_by_key(|root| root.host.components().count());
     if let Some(root) = root {
         return match (&root.inside, real.strip_prefix(&root.host)) {
-            // Joining an empty remainder would leave a trailing
-            // separator, and the root itself is the argument here.
-            (Some(inside), Ok(rest)) if rest.as_os_str().is_empty() => Planned::Rename {
-                arg_index: index,
-                inside: inside.clone(),
-                host: given,
-            },
-            (Some(inside), Ok(rest)) => Planned::Rename {
-                arg_index: index,
-                inside: inside.join(rest),
-                host: given,
-            },
+            (Some(inside), Ok(rest)) => {
+                // Joining an empty remainder would leave a trailing
+                // separator, and the root itself is the argument here.
+                let inside = match rest.as_os_str().is_empty() {
+                    true => inside.clone(),
+                    false => inside.join(rest),
+                };
+                match inside == given {
+                    // What the sandbox sees is what the argument
+                    // already says; there is nothing to rewrite.
+                    true => Planned::Skip(index, given, Skip::AlreadyVisible),
+                    false => Planned::Rename {
+                        arg_index: index,
+                        inside,
+                        host: given,
+                    },
+                }
+            }
             _ => Planned::Skip(index, given, Skip::AlreadyVisible),
         };
     }
@@ -539,15 +552,25 @@ fn visible_roots(
     // empty one is a prefix of every path — which would quietly forward
     // no file at all.
     roots.retain(|root| root.host.is_absolute());
-    // The bind resolves its source (`service.rs` confines the resolved
-    // path), so a share whose own source is a symlink is compared
-    // against the tree it really names. A root that resolves to nothing
-    // is left as written; nothing is under it either way.
-    for root in &mut roots {
-        if let Some(real) = host.canonicalize(&root.host) {
-            root.host = real;
-        }
-    }
+    // A bind resolves its source but mounts it at the path the config
+    // wrote (`service.rs` confines the resolved source and binds it at
+    // the written destination), so the written path is what the sandbox
+    // sees. A source that is a symlink is therefore a second root: the
+    // tree it really names, seen inside at the written path. A root
+    // that resolves to nothing keeps only its written form; nothing is
+    // under it either way.
+    let resolved: Vec<Root> = roots
+        .iter()
+        .filter_map(|root| {
+            let real = host.canonicalize(&root.host)?;
+            (real != root.host).then(|| Root {
+                host: real,
+                inside: Some(root.inside.clone().unwrap_or_else(|| root.host.clone())),
+            })
+        })
+        .collect();
+    roots.extend(resolved);
+    roots.retain(|root| root.host.is_absolute());
     roots
 }
 
@@ -692,9 +715,14 @@ fn open_path(path: &Path) -> Result<OwnedFd, ForwardError> {
     // Everything under `/proc` and `/sys` `fstat`s as a regular file, so
     // the type says nothing about it. `/proc/self/fd/<n>` names what the
     // descriptor is really open on, which is the one account of it a
-    // swap between the plan and the open cannot have changed.
+    // swap between the plan and the open cannot have changed, and
+    // `fstatfs` names the filesystem it is on whatever it is called.
     let real = opened_path(fd.as_fd()).map_err(failed)?;
-    if REFUSED_ROOTS.iter().any(|root| real.starts_with(root)) {
+    let magic = rustix::fs::fstatfs(&fd).map_err(failed)?.f_type;
+    if magic == rustix::fs::PROC_SUPER_MAGIC
+        || magic == SYSFS_MAGIC
+        || REFUSED_ROOTS.iter().any(|root| real.starts_with(root))
+    {
         return Err(ForwardError::Refused {
             path: path.to_path_buf(),
             real,
@@ -862,7 +890,13 @@ mod tests {
             .with("/home/han/Downloads/b.pdf", file)
             .with("/home/han/.ssh/id_rsa", file)
             .with("/data/inst/home", dir)
+            .link("/data/inst/home", "/pool/inst/home")
+            .with("/pool/inst/home/note.txt", file)
             .with("/srv/data/x.csv", file)
+            // The `path-share` source is a symlink: the sandbox sees the
+            // tree at `/srv/data`, which is where the bind puts it.
+            .link("/srv/data", "/mnt/pool/data")
+            .with("/mnt/pool/data/x.csv", file)
             .with("/data/inst/home/note.txt", file)
             .with("/usr/share/doc/manual.pdf", file)
             .with("/opt/vendor/manual.pdf", file)
@@ -996,6 +1030,17 @@ mod tests {
                 "rename /home/han/Documents → /home/bubbler/Documents",
             ),
             ("/data/inst/home", "rename /data/inst/home → /home/bubbler"),
+            // A share whose source is a symlink: the tree it names is
+            // seen at the written path, and the written path is already
+            // right.
+            (
+                "/mnt/pool/data/x.csv",
+                "rename /mnt/pool/data/x.csv → /srv/data/x.csv",
+            ),
+            (
+                "/pool/inst/home/note.txt",
+                "rename /pool/inst/home/note.txt → /home/bubbler/note.txt",
+            ),
         ];
         let args: Vec<&str> = cases.iter().map(|(arg, _)| *arg).collect();
         let out = planned(&args, &tree());
@@ -1079,6 +1124,21 @@ mod tests {
     }
 
     #[test]
+    fn a_root_that_does_not_resolve_is_still_a_root() {
+        let (file, dir, _) = types();
+        // The share source is there, but nothing about it resolves —
+        // what the real host answers for a path it cannot walk.
+        let host = tree()
+            .with("/home/han/Documents", dir)
+            .with("/home/han/Documents/report.pdf", file)
+            .unresolved("/home/han/Documents");
+        assert_eq!(
+            tag(&planned(&["/home/han/Documents/report.pdf"], &host)[0]),
+            "rename /home/han/Documents/report.pdf → /home/bubbler/Documents/report.pdf"
+        );
+    }
+
+    #[test]
     fn a_nul_in_a_uri_names_no_file() {
         assert_eq!(host_path(OsStr::new("file:///home/han/a%00b.pdf")), None);
     }
@@ -1098,6 +1158,7 @@ mod tests {
                 "/home/han/pics",
                 "/home/han/s.sock",
                 "/proc/self/exe",
+                "/home/han/Documents/../.ssh/id_rsa",
                 "/home/han/a.pdf",
                 "/srv/data/x.csv",
                 "./rel",
@@ -1111,6 +1172,7 @@ mod tests {
                 "/home/han/pics is a directory; grant path-share or home-share to expose it",
                 "/home/han/s.sock is not a regular file, not forwarded",
                 "/proc/self/exe is under /proc, /sys or /dev, not forwarded",
+                "/home/han/Documents/../.ssh/id_rsa contains `..`, not forwarded",
             ]
         );
     }
@@ -1121,6 +1183,7 @@ mod tests {
             &[
                 "/home/han/a.pdf",
                 "/home/han/theirs.pdf",
+                "/home/han/link.pdf",
                 "/home/han/Documents/report.pdf",
                 "/srv/data/x.csv",
                 "--flag",
@@ -1132,6 +1195,8 @@ mod tests {
             vec![
                 "forward: /home/han/a.pdf → $XDG_RUNTIME_DIR/doc/<id>/a.pdf (write)",
                 "forward: /home/han/theirs.pdf → $XDG_RUNTIME_DIR/doc/<id>/theirs.pdf (read)",
+                // The link is not what is exported; the file it names is.
+                "forward: /home/han/link.pdf (→ /home/han/a.pdf) → $XDG_RUNTIME_DIR/doc/<id>/a.pdf (write)",
                 "visible: /home/han/Documents/report.pdf → /home/bubbler/Documents/report.pdf",
             ]
         );

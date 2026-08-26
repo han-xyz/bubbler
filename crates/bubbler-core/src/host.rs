@@ -83,6 +83,7 @@ pub(crate) mod fake {
         pub links: BTreeMap<PathBuf, PathBuf>,
         pub mounts: BTreeSet<PathBuf>,
         pub writable: BTreeSet<PathBuf>,
+        pub unresolved: BTreeSet<PathBuf>,
     }
 
     impl FakeHost {
@@ -106,6 +107,14 @@ pub(crate) mod fake {
             self.writable.insert(PathBuf::from(p));
             self
         }
+
+        /// Make `canonicalize` answer `None` for `p` and everything
+        /// under it, the way the real host answers for a path that is
+        /// not there.
+        pub fn unresolved(mut self, p: &str) -> Self {
+            self.unresolved.insert(PathBuf::from(p));
+            self
+        }
     }
 
     impl Host for FakeHost {
@@ -113,8 +122,12 @@ pub(crate) mod fake {
             self.entries.get(p).copied()
         }
         /// Longest matching link prefix is replaced once; a path no link
-        /// covers is its own canonical form.
+        /// covers is its own canonical form, and one [`FakeHost::unresolved`]
+        /// covers has none at all.
         fn canonicalize(&self, p: &Path) -> Option<PathBuf> {
+            if self.unresolved.iter().any(|gone| p.starts_with(gone)) {
+                return None;
+            }
             let hit = self
                 .links
                 .iter()
