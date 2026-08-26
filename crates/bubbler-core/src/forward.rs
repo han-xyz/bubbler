@@ -262,28 +262,29 @@ pub fn register(
 ) -> Vec<Result<Forward, ForwardError>> {
     let mut done: Vec<Option<Result<Forward, ForwardError>>> =
         candidates.iter().map(|_| None).collect();
-    let mut open: Vec<(usize, OwnedFd)> = Vec::with_capacity(candidates.len());
+    let mut open: Vec<Opened> = Vec::with_capacity(candidates.len());
     for (index, candidate) in candidates.iter().enumerate() {
         match open_path(&candidate.host) {
-            Ok(fd) => open.push((index, fd)),
+            Ok((fd, name)) => open.push(Opened { index, fd, name }),
             Err(e) => done[index] = Some(Err(e)),
         }
     }
 
     let app_id = crate::dbus::app_id(instance);
-    // A refusal leaves the session usable; anything else leaves it
+    // A refusal leaves the session usable, and so does a call that
+    // never left this process; anything else leaves the connection
     // half-read, so the remaining groups are failed with the same
     // reason instead of being sent down a connection that is gone.
     let mut broken: Option<String> = None;
     for write in permission_sets(candidates) {
-        let group: Vec<&(usize, OwnedFd)> = open
+        let group: Vec<&Opened> = open
             .iter()
-            .filter(|(index, _)| candidates[*index].write == write)
+            .filter(|opened| candidates[opened.index].write == write)
             .collect();
         if group.is_empty() {
             continue;
         }
-        let fds: Vec<BorrowedFd<'_>> = group.iter().map(|(_, fd)| fd.as_fd()).collect();
+        let fds: Vec<BorrowedFd<'_>> = group.iter().map(|opened| opened.fd.as_fd()).collect();
         // A `h` on the wire is an index into the descriptors beside the
         // message, in the order they are sent.
         let indices: Vec<Value> = (0u32..).zip(&group).map(|(n, _)| Value::Fd(n)).collect();
@@ -295,37 +296,44 @@ pub fn register(
         ];
         let answer = match &broken {
             Some(reason) => Err(ForwardError::Bus(reason.clone())),
-            None => session
-                .call(
-                    PORTAL_NAME,
-                    PORTAL_PATH,
-                    PORTAL_IFACE,
-                    "AddFull",
-                    "ahusas",
-                    &body,
-                    &fds,
-                )
-                .map_err(|e| wire_reason(&e))
-                .and_then(|values| document_ids(&values, group.len())),
+            None => match session.call(
+                PORTAL_NAME,
+                PORTAL_PATH,
+                PORTAL_IFACE,
+                "AddFull",
+                "ahusas",
+                &body,
+                &fds,
+            ) {
+                Ok(values) => document_ids(&values, group.len()),
+                Err(e) => {
+                    if !matches!(e, WireError::Remote { .. }) && !before_sending(&e) {
+                        broken = Some(e.to_string());
+                    }
+                    Err(wire_reason(&e))
+                }
+            },
         };
-        if let Err(ForwardError::Bus(reason)) = &answer {
-            broken = Some(reason.clone());
-        }
         match &answer {
             Ok(ids) => {
-                for ((index, _), id) in group.iter().zip(ids) {
-                    let candidate = &candidates[*index];
-                    done[*index] = Some(Ok(Forward {
+                for (opened, id) in group.iter().zip(ids) {
+                    let candidate = &candidates[opened.index];
+                    done[opened.index] = Some(Ok(Forward {
                         arg_index: candidate.arg_index,
                         host: candidate.host.clone(),
-                        inside: env.runtime_dir.join(DOC_DIR).join(id).join(&candidate.name),
+                        // The name the descriptor has, not the one the
+                        // plan saw: the portal reads it off the
+                        // descriptor the same way, so a file renamed
+                        // since cannot leave a document path that opens
+                        // nothing.
+                        inside: env.runtime_dir.join(DOC_DIR).join(id).join(&opened.name),
                         write: candidate.write,
                     }));
                 }
             }
             Err(reason) => {
-                for (index, _) in &group {
-                    done[*index] = Some(Err(reason.again()));
+                for opened in &group {
+                    done[opened.index] = Some(Err(reason.again()));
                 }
             }
         }
@@ -531,47 +539,73 @@ fn visible_roots(
     host: &dyn Host,
 ) -> Vec<Root> {
     let same = |host: PathBuf| Root { host, inside: None };
-    let mut roots = vec![Root {
-        host: instance_home.to_path_buf(),
-        inside: Some(PathBuf::from(SANDBOX_HOME)),
-    }];
-    roots.extend(BASELINE_ROOTS.iter().map(|root| same(PathBuf::from(root))));
-    roots.extend(ETC_ALLOWLIST.iter().map(|name| same(etc(name))));
+    let mut roots: Vec<Root> = Vec::new();
+    add_root(
+        &mut roots,
+        host,
+        Root {
+            host: instance_home.to_path_buf(),
+            inside: Some(PathBuf::from(SANDBOX_HOME)),
+        },
+        |_| true,
+    );
+    for root in BASELINE_ROOTS {
+        add_root(&mut roots, host, same(PathBuf::from(root)), |_| true);
+    }
+    for name in ETC_ALLOWLIST {
+        add_root(&mut roots, host, same(etc(name)), |_| true);
+    }
     for service in &cfg.services {
         match service {
-            Service::HomeShare { path, .. } => roots.push(Root {
-                host: env.home.join(path),
-                inside: Some(Path::new(SANDBOX_HOME).join(path)),
-            }),
-            Service::PathShare { path, .. } => roots.push(same(path.clone())),
-            Service::EtcShare { name } => roots.push(same(etc(name))),
+            Service::HomeShare { path, .. } => add_root(
+                &mut roots,
+                host,
+                Root {
+                    host: env.home.join(path),
+                    inside: Some(Path::new(SANDBOX_HOME).join(path)),
+                },
+                // `home_share` confines the resolved source to the home
+                // directory and fails the launch when it leaves it.
+                |real| real.starts_with(&env.home),
+            ),
+            Service::PathShare { path, .. } => add_root(
+                &mut roots,
+                host,
+                same(path.clone()),
+                // The launcher refuses a `path-share` that meets a
+                // reserved root, so one never reaches a bind — and a
+                // source resolving to `/` or to the user's home would
+                // otherwise claim every argument as already visible.
+                |_| crate::service::reserved_reason(host, env, path).is_none(),
+            ),
+            Service::EtcShare { name } => add_root(&mut roots, host, same(etc(name)), |_| true),
             _ => {}
         }
     }
-    // A root that is not absolute compares against nothing, and an
-    // empty one is a prefix of every path — which would quietly forward
-    // no file at all.
-    roots.retain(|root| root.host.is_absolute());
-    // A bind resolves its source but mounts it at the path the config
-    // wrote (`service.rs` confines the resolved source and binds it at
-    // the written destination), so the written path is what the sandbox
-    // sees. A source that is a symlink is therefore a second root: the
-    // tree it really names, seen inside at the written path. A root
-    // that resolves to nothing keeps only its written form; nothing is
-    // under it either way.
-    let resolved: Vec<Root> = roots
-        .iter()
-        .filter_map(|root| {
-            let real = host.canonicalize(&root.host)?;
-            (real != root.host).then(|| Root {
-                host: real,
-                inside: Some(root.inside.clone().unwrap_or_else(|| root.host.clone())),
-            })
-        })
-        .collect();
-    roots.extend(resolved);
-    roots.retain(|root| root.host.is_absolute());
+    // A root that is not absolute compares against nothing, and `/` or
+    // an empty one is a prefix of every path — which would quietly
+    // forward no file at all.
+    roots.retain(|root| root.host.is_absolute() && root.host != Path::new("/"));
     roots
+}
+
+/// Add a root, and where its source resolves elsewhere the tree it
+/// really names as well: a bind resolves its source but mounts it at
+/// the path the config wrote (`service.rs`), so the sandbox sees that
+/// tree at the written path. `keep` is asked about the resolved source,
+/// and answers what the launcher would refuse before binding it at all.
+fn add_root(roots: &mut Vec<Root>, host: &dyn Host, root: Root, keep: impl FnOnce(&Path) -> bool) {
+    if let Some(real) = host.canonicalize(&root.host)
+        && real != root.host
+        && real != Path::new("/")
+        && keep(&real)
+    {
+        roots.push(Root {
+            host: real,
+            inside: Some(root.inside.clone().unwrap_or_else(|| root.host.clone())),
+        });
+    }
+    roots.push(root);
 }
 
 /// One entry of the host `/etc`. The rest of `/etc` inside is a tmpfs,
@@ -701,7 +735,7 @@ fn permission_text(write: bool) -> &'static str {
 /// are followed — the desktop handed us the link and the user means the
 /// file at the end of it — and the type is re-checked on the descriptor
 /// so a path that changed since [`plan`] cannot pass as a file.
-fn open_path(path: &Path) -> Result<OwnedFd, ForwardError> {
+fn open_path(path: &Path) -> Result<(OwnedFd, OsString), ForwardError> {
     let failed = |source: rustix::io::Errno| ForwardError::Open {
         path: path.to_path_buf(),
         source: source.into(),
@@ -728,7 +762,25 @@ fn open_path(path: &Path) -> Result<OwnedFd, ForwardError> {
             real,
         });
     }
-    Ok(fd)
+    // A regular file has a name; a descriptor whose path has none is
+    // not one this could export, so the candidate's own name is left to
+    // the portal to disagree with.
+    let name = real.file_name().map_or_else(
+        || OsString::from(path.file_name().unwrap_or_default()),
+        OsStr::to_os_string,
+    );
+    Ok((fd, name))
+}
+
+/// One candidate that opened: the descriptor the portal is handed and
+/// the name the file has now.
+struct Opened {
+    /// Position in the candidate list.
+    index: usize,
+    /// `O_PATH` descriptor of the file.
+    fd: OwnedFd,
+    /// Basename of what the descriptor is open on.
+    name: OsString,
 }
 
 /// The path `fd` is open on, as `/proc/self/fd/<n>` gives it. A file
@@ -766,6 +818,27 @@ fn document_ids(values: &[Value], expected: usize) -> Result<Vec<String>, Forwar
 /// nothing else.
 fn is_document_id(id: &str) -> bool {
     !id.is_empty() && id != "." && id != ".." && !id.contains('/') && !id.contains('\0')
+}
+
+/// Whether a wire failure happened before the call left this process,
+/// which leaves the connection exactly as it was. [`Session::call`]
+/// makes these checks in order before it sends anything: no
+/// destination, a connection that passes no descriptors, more
+/// descriptors than a message may carry, an index the call was not
+/// given, and the marshalling of the body. Everything else either sent
+/// bytes or read some, and is not a state to keep calling on.
+fn before_sending(e: &WireError) -> bool {
+    matches!(
+        e,
+        WireError::NoDestination
+            | WireError::NoFdPassing
+            | WireError::TooManyFds(_)
+            | WireError::FdIndex(_)
+            | WireError::BadSignature(_)
+            | WireError::Arity { .. }
+            | WireError::TypeMismatch { .. }
+            | WireError::Unsupported(_)
+    )
 }
 
 /// A wire failure as a reason one file did not make it. A refusal keeps
@@ -1135,6 +1208,46 @@ mod tests {
         assert_eq!(
             tag(&planned(&["/home/han/Documents/report.pdf"], &host)[0]),
             "rename /home/han/Documents/report.pdf → /home/bubbler/Documents/report.pdf"
+        );
+    }
+
+    #[test]
+    fn a_share_whose_source_is_refused_at_launch_is_no_root() {
+        // `/srv/escape` resolves to the whole filesystem and
+        // `/srv/store` to the user's home: `path-share` refuses both,
+        // so neither may rewrite an argument either.
+        let host = tree()
+            .link("/srv/escape", "/")
+            .link("/srv/store", "/home/han");
+        let cfg = InstanceConfig {
+            services: vec![
+                Service::PathShare {
+                    path: "/srv/escape".into(),
+                    mode: ShareMode::ReadOnly,
+                },
+                Service::PathShare {
+                    path: "/srv/store".into(),
+                    mode: ShareMode::ReadWrite,
+                },
+            ],
+            ..InstanceConfig::default()
+        };
+        let args = [OsString::from("/home/han/a.pdf")];
+        let out = plan(&env(), &cfg, Path::new(INSTANCE_HOME), &args, &host);
+        assert_eq!(tag(&out[0]), "forward /home/han/a.pdf as a.pdf (write)");
+    }
+
+    #[test]
+    fn a_home_share_that_leaves_the_home_is_no_root() {
+        // `home-share` confines its source to the home directory, so a
+        // source pointing out of it never becomes a rename root.
+        let (file, ..) = types();
+        let host = tree()
+            .link("/home/han/Documents", "/mnt/elsewhere")
+            .with("/mnt/elsewhere/report.pdf", file);
+        assert_eq!(
+            tag(&planned(&["/mnt/elsewhere/report.pdf"], &host)[0]),
+            "forward /mnt/elsewhere/report.pdf as report.pdf (read)"
         );
     }
 
@@ -1576,6 +1689,76 @@ mod tests {
             matches!(e, ForwardError::Refused { path, real }
                 if *path == link && real.starts_with("/proc")),
             "{e:?}"
+        );
+    }
+
+    #[test]
+    fn a_call_that_never_left_does_not_fail_the_other_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        // One descriptor past what a message may carry, so the call is
+        // refused here rather than on the bus; the writable file is a
+        // second group and must still go out.
+        let many: Vec<PathBuf> = (0..254)
+            .map(|n| file(tmp.path(), &format!("r{n}.pdf")))
+            .collect();
+        let writable = file(tmp.path(), "w.pdf");
+        let (bus, server) = fake_bus(tmp.path(), |stream| {
+            server_start(&stream);
+            let call = server_addfull(&stream);
+            assert_eq!(call.fds.len(), 1);
+            assert_eq!(
+                call.body[3],
+                Value::Array(vec![
+                    Value::Str("read".to_owned()),
+                    Value::Str("write".to_owned()),
+                ])
+            );
+            server_ids(&stream, &call, &["only"]);
+            server_end(&stream);
+        });
+        let mut candidates: Vec<Candidate> = many
+            .iter()
+            .enumerate()
+            .map(|(n, path)| candidate(n, path, false))
+            .collect();
+        candidates.push(candidate(many.len(), &writable, true));
+        let mut session = Session::connect(&bus).unwrap();
+        let out = register(&env(), "pdf", &candidates, &mut session);
+        drop(session);
+        server.join().unwrap();
+        for answer in &out[..many.len()] {
+            assert!(
+                matches!(answer.as_ref().unwrap_err(), ForwardError::Bus(_)),
+                "{answer:?}"
+            );
+        }
+        assert_eq!(
+            out[many.len()].as_ref().unwrap().inside,
+            PathBuf::from("/run/user/1000/doc/only/w.pdf")
+        );
+    }
+
+    #[test]
+    fn the_document_path_uses_the_name_the_descriptor_has() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A rename between the plan and the call: what the plan saw is
+        // now a link to the name the file has, and the portal reads the
+        // new name off the descriptor as this does.
+        let stale = tmp.path().join("old.pdf");
+        let renamed = file(tmp.path(), "new.pdf");
+        std::os::unix::fs::symlink(&renamed, &stale).unwrap();
+        let (bus, server) = fake_bus(tmp.path(), |stream| {
+            server_start(&stream);
+            let call = server_addfull(&stream);
+            server_ids(&stream, &call, &["a1b2"]);
+        });
+        let mut session = Session::connect(&bus).unwrap();
+        let out = register(&env(), "pdf", &[candidate(0, &stale, false)], &mut session);
+        drop(session);
+        server.join().unwrap();
+        assert_eq!(
+            out[0].as_ref().unwrap().inside,
+            PathBuf::from("/run/user/1000/doc/a1b2/new.pdf")
         );
     }
 
