@@ -228,15 +228,17 @@ pub static GRANTS: &[Grant] = &[
     },
     Grant {
         node: "portals",
-        summary: "the XDG portal rule bundle plus the /.flatpak-info portals identify the sandbox by",
+        summary: "the XDG portal rule bundle, the /.flatpak-info portals identify the sandbox by, and the document view file arguments land in",
         cost: "Portal operations run outside the sandbox: a file chooser runs on the host \
                and only the file you pick appears inside, under $XDG_RUNTIME_DIR/doc, \
                readable or writable as the portal granted it; `OpenURI` hands a link to \
-               a host application. Each one is the user's choice at the time, which is \
-               what makes this the narrow way to reach files, cameras and screencasts. \
-               Requires `dbus`; the spawn portal is not among the rules. Without a \
-               document portal on the host the launch warns and picked files stay \
-               unreachable.",
+               a host application. A host file named after the program on a `run`, `try` \
+               or `open` command line goes in the same way, read-only unless you could \
+               write it yourself, for this session only. Each one is the user's choice \
+               at the time, which is what makes this the narrow way to reach files, \
+               cameras and screencasts. Requires `dbus`; the spawn portal is not among \
+               the rules. Without a document portal on the host the launch warns and \
+               picked files stay unreachable.",
         risk: Risk::Narrow,
         grammar: "portals",
     },

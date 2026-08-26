@@ -105,6 +105,9 @@ Run the instance's `command`, or the command given after `--`, inside its
 sandbox. An instance that is already running is not started a second time: the
 command is executed inside the running sandbox instead, with the grants that
 sandbox was started with, and configuration changes apply on the next start.
+An argument after `--` that names a host file is registered with the document
+portal and handed in at $XDG_RUNTIME_DIR/doc/<id>/<name> when the config grants
+`portals`; without that grant it is left as it was and a warning names the gap.
 `--dry-run` prints the bwrap argv and launches nothing; `--explain` prints
 that same argv grouped under the config node each argument came from.")]
     Run {
@@ -150,7 +153,10 @@ flattened profile plus one bare node per `--grant`, checked the way a config
 file is, so a bundle without the `dbus` that carries it is refused rather than
 quietly dropped. The sandbox lives under $XDG_DATA_HOME/bubbler/try/<pid>,
 never appears in `list`, and is removed when the command exits whatever its
-status; `--keep <name>` renames it into an instance instead.")]
+status; `--keep <name>` renames it into an instance instead. An argument after
+`--` that names a host file is handed to the sandbox through the document
+portal when `--grant portals` is among the grants, and left as it was with a
+warning when it is not.")]
     Try {
         /// Profile to seed the throwaway config from.
         #[arg(long, default_value = "generic")]
@@ -216,7 +222,10 @@ channel and not a boundary.")]
 Run a command in an instance, starting the sandbox when it is not running and
 executing into it when it is, which is what a desktop entry and a PATH shim
 call. A URL or a file handed to a running application therefore reaches the
-window that is already open. The command replaces the config's `command`. A
+window that is already open. A file argument is a host path the sandbox has no
+mount for, so under `portals` it is registered with the document portal and the
+application is given that path instead, which is what makes opening a file from
+a file manager work. The command replaces the config's `command`. A
 terminal on any of bubbler's three standard descriptors is somebody watching,
 and the sandbox gets the terminal its `tty` node asks for; with none on any of
 them — which is how a launcher starts its children — the sandbox is given none
