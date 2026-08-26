@@ -487,7 +487,14 @@ fn main() -> ExitCode {
     // so everything else above stdio is something bwrap passed through
     // from whatever started bubbler; the display socket is bound here and
     // handed to the server on a duplicate of its own.
-    if let Err(e) = fds::sweep(&[args.socket_fd], fds::Stray::Close) {
+    //
+    // SAFETY: nothing above stdio has an owner in this process yet. Only
+    // the argv has been read, `parse_from` opens nothing, and every
+    // descriptor this program goes on to hold — the control socket, the
+    // display socket, a child's stdio — is created after this line. No
+    // other thread exists to race it either: init spawns none, and the
+    // first child of its own comes later.
+    if let Err(e) = unsafe { fds::close_strays(&[args.socket_fd]) } {
         eprintln!("bubbler-init: cannot close the descriptors it was not given: {e}");
         return ExitCode::from(2);
     }

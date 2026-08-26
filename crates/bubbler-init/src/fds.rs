@@ -7,10 +7,11 @@
 //! to the sandbox, so one nobody meant to give reaches the sandbox, its
 //! supervisor, every command exec'd in it and every sidecar of the run.
 //!
-//! A sweep is the answer at both ends: bubbler marks the strays
-//! close-on-exec before each spawn, so no child of a run sees them, and
-//! the supervisor closes them outright, since inside the sandbox they are
-//! the only descriptors of the host session left.
+//! A sweep is the answer at both ends, and the two halves are not equally
+//! safe. [`sweep_cloexec`] only marks, which no owner of a descriptor can
+//! be harmed by, so it is a safe function. [`close_strays`] closes numbers
+//! outright, which would be a double close and then a stolen descriptor
+//! for anything still holding one, so it is `unsafe` and has a contract.
 
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
@@ -25,48 +26,60 @@ const FD_DIR: &str = "/proc/self/fd";
 /// process is expected to have, which each spawn sets up for itself.
 const FIRST: RawFd = 3;
 
-/// What a sweep does with a descriptor above stdio that was not named.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Stray {
-    /// Close it. For a process that holds nothing above stdio of its own,
-    /// so an unasked-for descriptor is gone from it as well as from its
-    /// children.
-    Close,
-    /// Mark it close-on-exec. For a process with descriptors of its own
-    /// to keep: they stay open here and reach no child.
-    Cloexec,
-}
-
-/// Deal with every descriptor above stdio except the ones `keep` names.
+/// Mark every descriptor above stdio close-on-exec except the ones `keep`
+/// names, so the next spawn inherits only what it was built to.
 ///
-/// The caller must be the only thread opening or closing descriptors while
-/// this runs. It acts on numbers read from `/proc/self/fd` a moment
-/// earlier, and under [`Stray::Close`] a number another thread had closed
-/// and reopened in between would be that thread's descriptor being closed
-/// under it.
+/// Nothing is closed and no descriptor changes hands: an owner keeps its
+/// own, and a flag that was going to be set on it for the spawn anyway is
+/// set a moment earlier. For a process that has descriptors of its own to
+/// go on using — bubbler during a run.
 ///
-/// A descriptor that has gone away by itself is not an error: it is not
-/// one a child could inherit either.
-pub fn sweep(keep: &[RawFd], what: Stray) -> io::Result<()> {
+/// Only one thread may spawn while a sweep's result stands, since the
+/// flag is process-wide state, and a descriptor that has gone away by
+/// itself is not an error: it is not one a child could inherit either.
+pub fn sweep_cloexec(keep: &[RawFd]) -> io::Result<()> {
     for fd in strays(keep)? {
         // SAFETY: `fd` is a number this process's own `/proc/self/fd`
-        // listed as open, with stdio, the listing's own descriptor and
-        // everything `keep` names already taken out of it. Nothing else in
-        // this process may open or close descriptors while a sweep runs
-        // (the contract above), so the number still names what it named
-        // when the kernel reported it. `borrow_raw` closes nothing and the
-        // borrow ends with the `fcntl`; `close` takes a number this
-        // process owns and nothing else holds a handle to, since a stray
-        // is by definition a descriptor no part of bubbler asked for.
-        unsafe {
-            match what {
-                Stray::Close => rustix::io::close(fd),
-                Stray::Cloexec => match fcntl_setfd(BorrowedFd::borrow_raw(fd), FdFlags::CLOEXEC) {
-                    Ok(()) | Err(Errno::BADF) => {}
-                    Err(e) => return Err(e.into()),
-                },
-            }
+        // listed as open moments ago. `borrow_raw` closes nothing and the
+        // borrow ends with the `fcntl`, so nothing that owns that
+        // descriptor loses it or sees it change hands; the worst a number
+        // reused in between can cost is a close-on-exec flag on a
+        // descriptor that was about to be given one. A number that is not
+        // open at all answers `EBADF`, which is nothing to report.
+        match unsafe { fcntl_setfd(BorrowedFd::borrow_raw(fd), FdFlags::CLOEXEC) } {
+            Ok(()) | Err(Errno::BADF) => {}
+            Err(e) => return Err(e.into()),
         }
+    }
+    Ok(())
+}
+
+/// Close every descriptor above stdio except the ones `keep` names.
+///
+/// For a process that holds nothing above stdio of its own, so an
+/// unasked-for descriptor is gone from it as well as from its children —
+/// the supervisor at the top of `main`, where the sandbox's whole
+/// descriptor table is whatever bwrap passed through.
+///
+/// # Safety
+///
+/// The caller must own every descriptor above stdio that `keep` does not
+/// name, and must hold no `OwnedFd`, `File`, socket or other owning handle
+/// on any of them: this closes those numbers, and the owner would then
+/// close them a second time — onto whatever the kernel had handed the
+/// number to by then.
+///
+/// The caller must also be the only thread opening or closing descriptors
+/// while this runs. The numbers come from `/proc/self/fd` a moment
+/// earlier, and one that another thread had closed and reopened in between
+/// would be that thread's descriptor being closed under it.
+pub unsafe fn close_strays(keep: &[RawFd]) -> io::Result<()> {
+    for fd in strays(keep)? {
+        // SAFETY: the caller has promised that no handle of this process
+        // owns `fd` and that no other thread is opening or closing
+        // descriptors, so this number still names the stray the kernel
+        // reported and closing it is closing nothing anyone holds.
+        unsafe { rustix::io::close(fd) };
     }
     Ok(())
 }
@@ -105,12 +118,12 @@ fn strays(keep: &[RawFd]) -> io::Result<Vec<RawFd>> {
 mod tests {
     use super::*;
 
-    /// [`Stray::Close`] is never run for real in here. A sweep is
-    /// process-wide and these tests are threads of one binary, so closing
-    /// what this thread did not open is closing another thread's
-    /// descriptors — which is the contract above, not a case to exercise.
-    /// What that arm does with a number is what the supervisor's own
-    /// integration tests measure, in a process of its own.
+    /// [`close_strays`] is never run in here. A sweep is process-wide and
+    /// these tests are threads of one binary, so closing what this thread
+    /// did not open is closing another thread's descriptors — which is
+    /// that function's contract, not a case to exercise. What it does with
+    /// a number is what the supervisor's own integration tests measure, in
+    /// a process of its own.
     #[test]
     fn a_descriptor_this_process_opened_is_a_stray_unless_it_is_kept() {
         let file = std::fs::File::open("/dev/null").unwrap();
@@ -131,7 +144,7 @@ mod tests {
         let stray = std::fs::File::open("/dev/null").unwrap();
         fcntl_setfd(&kept, FdFlags::empty()).unwrap();
         fcntl_setfd(&stray, FdFlags::empty()).unwrap();
-        sweep(&[kept.as_raw_fd()], Stray::Cloexec).unwrap();
+        sweep_cloexec(&[kept.as_raw_fd()]).unwrap();
         assert_eq!(rustix::io::fcntl_getfd(&kept).unwrap(), FdFlags::empty());
         assert_eq!(
             rustix::io::fcntl_getfd(&stray).unwrap(),

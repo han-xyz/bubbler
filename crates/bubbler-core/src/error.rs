@@ -210,6 +210,12 @@ pub enum LaunchError {
     /// socket or a sidecar's ready pipe.
     #[error("preparing an fd for bwrap")]
     Data(#[source] io::Error),
+    /// Reading this process's own open descriptors, or marking the ones a
+    /// child must not inherit close-on-exec, failed. Nothing is spawned
+    /// after this: a child started anyway would hold whatever bubbler was
+    /// handed by the process that started it.
+    #[error("keeping inherited descriptors out of the child")]
+    Descriptors(#[source] io::Error),
     /// Spawning `bwrap` failed for a reason other than it being missing.
     #[error("failed to run bwrap")]
     Spawn(#[source] io::Error),

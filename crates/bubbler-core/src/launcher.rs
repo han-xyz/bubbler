@@ -1,9 +1,9 @@
 //! Spawns bubblewrap and the sidecars a sandbox needs — the filtering
 //! D-Bus proxy and, for an isolated `network`, pasta. The only
 //! process-spawning code in the crate; it never goes through a shell,
-//! every spawn is preceded by a [`fds::sweep`] so a child holds only the
-//! descriptors it was meant to, and every sidecar is killed on every way
-//! out of a run.
+//! every spawn is preceded by a [`fds::sweep_cloexec`] so a child holds
+//! only the descriptors it was meant to, and every sidecar is killed on
+//! every way out of a run.
 
 use std::ffi::{OsString, c_void};
 use std::io::{self, Seek, SeekFrom, Write};
@@ -231,6 +231,11 @@ impl RealAlloc {
     /// write end of the info pipe — which is never close-on-exec at all,
     /// because bwrap reports the sandbox pid on it and the caller closes
     /// it by hand the moment bwrap has been started.
+    ///
+    /// Only descriptors that are still open: a caller that closes one
+    /// takes it out of the allocator in the same breath, since a number
+    /// left here after its descriptor is gone would exempt from the next
+    /// sweep whatever the kernel had handed that number to since.
     fn intended(&self) -> Vec<RawFd> {
         let mut fds: Vec<RawFd> = self.fds.iter().map(AsRawFd::as_raw_fd).collect();
         fds.extend(self.socket);
@@ -255,7 +260,7 @@ impl RealAlloc {
 /// one thread may spawn while it is open; bubbler's only other thread
 /// starts no process at all ([`crate::run_log`]).
 fn spawning(keep: &[RawFd]) -> Result<(), LaunchError> {
-    fds::sweep(keep, fds::Stray::Cloexec).map_err(LaunchError::Data)
+    fds::sweep_cloexec(keep).map_err(LaunchError::Descriptors)
 }
 
 impl FdAllocator for RealAlloc {
@@ -871,6 +876,10 @@ impl Drop for WaylandHandle {
 /// Nothing is connected to before the environment it would be connected
 /// through has been checked: wayrs reads `$WAYLAND_DISPLAY` and
 /// `$WAYLAND_SOCKET` itself, and both are untrusted host input.
+///
+/// Marks every descriptor of the calling process above stdio that this
+/// spawn is not meant to hand over close-on-exec, so an embedder's own
+/// open files do not cross into the sandbox; none is closed.
 pub fn start_wayland(
     env: &Env,
     dir: &Path,
@@ -1008,6 +1017,10 @@ fn bind_context(dir: &Path, instance: &str) -> Result<(OwnedFd, FileGuard), Laun
 /// Start the filtering D-Bus proxy for an instance in its own sandbox and
 /// wait for it to report readiness, so the socket exists before the
 /// instance's own bwrap binds it. The handle must outlive the sandbox.
+///
+/// Marks every descriptor of the calling process above stdio that this
+/// spawn is not meant to hand over close-on-exec, so an embedder's own
+/// open files do not cross into the sandbox; none is closed.
 pub fn start_proxy(
     env: &Env,
     dir: &Path,
@@ -2128,6 +2141,10 @@ fn wait_relaying(
 /// in `pty` mode bubbler allocates one and relays, so the sandbox never
 /// holds a descriptor for the user's terminal. `AlreadyRunning` when the
 /// instance is live; that is an exec, which the caller decides on.
+///
+/// Marks every descriptor of the calling process above stdio that this
+/// spawn is not meant to hand over close-on-exec, so an embedder's own
+/// open files do not cross into the sandbox; none is closed.
 pub fn run(
     env: &Env,
     inst: &Instance,
@@ -2235,6 +2252,9 @@ pub fn run(
     alloc.inheritable(false).map_err(LaunchError::Data)?;
     // The sandbox holds the listening socket and the info pipe now; bubbler
     // keeping copies would make a dead instance look live and hide the EOF.
+    // Each number is given up with its descriptor, so nothing a later
+    // sweep is asked to spare is a number that has since been recycled.
+    alloc.socket.take();
     drop(inherited);
     drop(listener);
     drop(alloc.info_write.take());
@@ -4069,6 +4089,11 @@ mod tests {
         want.push(7);
         want.push(info);
         assert_eq!(alloc.intended(), want);
+        // What `run` does once bwrap holds the socket: the number goes
+        // with the descriptor, so a later spawn's sweep is never told to
+        // spare a number the kernel has handed on to something else.
+        alloc.socket.take();
+        assert!(!alloc.intended().contains(&7), "a closed number is spared");
     }
 
     #[test]

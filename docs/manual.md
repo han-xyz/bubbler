@@ -2784,6 +2784,14 @@ softens that: it is an ABI gate, not one of the rules. x32 binaries are
 vanishingly rare — Arch does not build any — but a 64-bit program can issue an
 x32 syscall on purpose, which is exactly the bypass this closes.
 
+A `deny` reaches the supervisor as well as the application. `bubbler-init`
+opens `/proc/self/fd` and reads it — `openat`, then `getdents64` — before
+it starts anything, to close the descriptors bwrap passed through from
+whatever started bubbler. A rule denying either kills the run there rather
+than only the app: with `deny "getdents64"` the supervisor prints
+`bubbler-init: cannot close the descriptors it was not given: Operation not
+permitted (os error 1)` and exits 2, and the command never runs at all.
+
 ## User namespaces
 
     userns "disable"                 # "allow" is the default
