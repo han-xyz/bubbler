@@ -740,7 +740,9 @@ pub fn parse_document(text: &str) -> Result<KdlDocument, ConfigError> {
 /// between them is refused; no configuration that grants anything
 /// writes one. Comments are stepped over, and only outside strings:
 /// KDL never reads a comment back as nodes, and a `/*` inside a string
-/// opens none — the braces after the string are the parser's.
+/// opens none — the braces after the string are the parser's. It is
+/// measured all the same: a string the parser cannot read is one it
+/// reads the inside of, and it recurses on that comment as on any.
 fn check_bounds(text: &str) -> Result<(), ConfigError> {
     if text.len() > MAX_BYTES {
         return Err(ConfigError::TooLarge {
@@ -758,7 +760,7 @@ fn check_bounds(text: &str) -> Result<(), ConfigError> {
         let quoted = i < string_until;
         i = match b[i] {
             b'/' if !quoted && b.get(i + 1) == Some(&b'/') => line_comment_end(b, i),
-            b'/' if !quoted && b.get(i + 1) == Some(&b'*') => {
+            b'/' if b.get(i + 1) == Some(&b'*') => {
                 let (end, marks) = block_comment_end(b, i);
                 if marks > MAX_COMMENT_MARKS {
                     return Err(ConfigError::CommentTooBusy {
@@ -766,7 +768,7 @@ fn check_bounds(text: &str) -> Result<(), ConfigError> {
                         max: MAX_COMMENT_MARKS,
                     });
                 }
-                end
+                if quoted { i + 1 } else { end }
             }
             b'"' if !quoted => {
                 string_until = string_end(b, i, 0).unwrap_or(b.len());
@@ -840,11 +842,17 @@ fn newline_len(b: &[u8], at: usize) -> Option<usize> {
 /// `/` it holds between its own `/*` and `*/` — what the parser
 /// recurses on, and what [`MAX_COMMENT_MARKS`] bounds. KDL nests them,
 /// so the first `*/` does not always end one.
+///
+/// One mark past the bound the walk stops and the end reported is the
+/// end of the text: [`check_bounds`] refuses the comment there, and
+/// [`slashdash_marks`], running over accepted text, never meets one.
+/// Walking on would let a string full of `/*`, each measured from
+/// where it stands, cost the square of its length.
 fn block_comment_end(b: &[u8], at: usize) -> (usize, usize) {
     let mut open: usize = 1;
     let mut marks: usize = 0;
     let mut i = at + 2;
-    while i + 1 < b.len() {
+    while i + 1 < b.len() && marks <= MAX_COMMENT_MARKS {
         match (b[i], b[i + 1]) {
             (b'/', b'*') => {
                 open += 1;
@@ -5096,6 +5104,38 @@ command "b""#
             check_bounds(&opens)
         );
         assert!(matches!(parse(&opens), Err(ConfigError::TooDeep { .. })));
+    }
+
+    #[test]
+    fn a_comment_inside_a_broken_string_is_measured_too() {
+        // The parser recovers from a string it cannot read and reads
+        // what was written inside it for real, a block comment included,
+        // recursing on that comment as on any other. A count that took
+        // the string's word for it left the comment unmeasured, and 824
+        // bytes aborted the process.
+        let busy = format!("/*{}*/", "*".repeat(800));
+        for text in [
+            format!("x \"\n{busy}\ncommand \"true\"\n"),
+            format!("x \"\\q{busy}\"\n"),
+            format!("x \"\u{0}{busy}\"\n"),
+            format!("x \"\"\"{busy}\"\n"),
+            format!("x #\"{busy}\n"),
+            // Closing quotes indented deeper than the body they close.
+            format!("x \"\"\"\n{busy}\n  \"\"\"\n"),
+        ] {
+            assert!(
+                matches!(
+                    check_bounds(&text),
+                    Err(ConfigError::CommentTooBusy { max, .. }) if max == MAX_COMMENT_MARKS
+                ),
+                "{text:?}: {:?}",
+                check_bounds(&text)
+            );
+            assert!(
+                matches!(parse(&text), Err(ConfigError::CommentTooBusy { .. })),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]
