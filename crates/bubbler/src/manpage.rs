@@ -246,6 +246,12 @@ const CHECK_LINES: &[(&str, &str)] = &[
         "The `command` node names a program that is not on this host's PATH.",
     ),
     (
+        "compute-without-dri",
+        "A `compute` grant no layer gives a `dri` to go with, so the render nodes its \
+         topology names are not in the sandbox. An instance config is refused outright; \
+         a profile hears it here.",
+    ),
+    (
         "desktop-entry-missing",
         "The `desktop` node names an entry no application directory on this host holds, so \
          `bubbler desktop` has nothing to copy.",

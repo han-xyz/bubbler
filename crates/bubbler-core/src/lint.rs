@@ -79,6 +79,13 @@ const COMMAND_NOT_FOUND: Check = Check {
     id: "command-not-found",
     severity: Severity::Note,
 };
+// An error like `camera-without-portals`: the instance parser refuses the
+// pair, and this is how a profile layer holding the half of it hears so
+// before anything is seeded from it.
+const COMPUTE_WITHOUT_DRI: Check = Check {
+    id: "compute-without-dri",
+    severity: Severity::Error,
+};
 // A hint is a file name, and a host that does not have the application
 // does not have its entry either, so this is a note like
 // `command-not-found` rather than a warning.
@@ -214,6 +221,7 @@ pub const CHECKS: &[Check] = &[
     CAMERA_NODES_NO_HOTPLUG,
     CAMERA_WITHOUT_PORTALS,
     COMMAND_NOT_FOUND,
+    COMPUTE_WITHOUT_DRI,
     DBUS_WITHOUT_RULES,
     DESKTOP_ENTRY_MISSING,
     DUP_NAME_POLICY,
@@ -425,6 +433,7 @@ const BUNDLES: &[&str] = &["portals", "notify", "tray", "mpris", "a11y", "input-
 const PARSER_EQUIVALENT: &[&str] = &[
     BUNDLE_WITHOUT_DBUS.id,
     CAMERA_WITHOUT_PORTALS.id,
+    COMPUTE_WITHOUT_DRI.id,
     DUP_NAME_POLICY.id,
     OWN_ON_SYSTEM_BUS.id,
 ];
@@ -1304,6 +1313,7 @@ fn system_bus(i: usize, node: &KdlNode, f: &mut Findings) {
 fn across_layers(ctx: &Context, sources: &[Source], f: &mut Findings) {
     let anywhere = |name: &str| sources.iter().any(|s| !top(s, name).is_empty());
     let has_dbus = anywhere("dbus");
+    let has_dri = anywhere("dri");
     let has_portals = anywhere("portals");
     let has_bundle = BUNDLES.iter().any(|b| anywhere(b));
 
@@ -1347,6 +1357,22 @@ fn across_layers(ctx: &Context, sources: &[Source], f: &mut Findings) {
                 "add `see`, `talk` or `own` rules or a bundle such as `portals`, \
                  or drop the node",
             );
+        }
+    }
+
+    if !has_dri {
+        for (i, source) in sources.iter().enumerate() {
+            for node in top(source, "compute") {
+                f.push(
+                    i,
+                    node,
+                    &COMPUTE_WITHOUT_DRI,
+                    "`compute` is the compute half of a GPU grant and no layer grants \
+                     `dri`, so the render nodes its topology names are not inside"
+                        .to_owned(),
+                    "add `dri`, or drop this node",
+                );
+            }
         }
     }
 
@@ -1777,6 +1803,24 @@ mod tests {
             ] {
                 assert_eq!(ids(&lint(ctx, &[text])), [] as [&str; 0], "{text}");
             }
+        });
+    }
+
+    #[test]
+    fn compute_is_measured_against_the_dri_it_needs() {
+        with(&host(), |ctx| {
+            // The instance parser refuses this pair outright; a profile
+            // layer holding the compute half hears it here instead, and
+            // before anything is seeded from it.
+            assert_eq!(ids(&lint(ctx, &["compute"])), ["compute-without-dri"]);
+            assert_eq!(
+                lint(ctx, &["compute"]).findings[0].severity,
+                Severity::Error
+            );
+            // The `dri` may be written in this file or in another layer.
+            assert_eq!(ids(&lint(ctx, &["dri\ncompute"])), [] as [&str; 0]);
+            assert_eq!(ids(&lint(ctx, &["dri", "compute"])), [] as [&str; 0]);
+            assert_eq!(ids(&lint(ctx, &["compute", "dri"])), [] as [&str; 0]);
         });
     }
 
