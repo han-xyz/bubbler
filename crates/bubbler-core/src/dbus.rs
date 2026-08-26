@@ -1551,12 +1551,14 @@ mod tests {
             server_start(&stream);
             let call = server_awaiting(&stream, "GetAddress", A11Y_OWNER);
             // The whole of what bubbler asks the accessibility bus for:
-            // one method on one object of one name.
+            // one method on one object of one name. The destination is
+            // the unique name the bus said owns `org.a11y.Bus`, so the
+            // call and its reply are bound to that one connection.
             assert_eq!(
                 call.texts(),
                 vec![
                     (FIELD_PATH, "/org/a11y/bus".to_owned()),
-                    (FIELD_DESTINATION, "org.a11y.Bus".to_owned()),
+                    (FIELD_DESTINATION, A11Y_OWNER.to_owned()),
                     (FIELD_INTERFACE, "org.a11y.Bus".to_owned()),
                     (FIELD_MEMBER, "GetAddress".to_owned()),
                 ]

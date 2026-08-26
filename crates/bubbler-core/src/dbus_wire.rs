@@ -74,6 +74,10 @@ const MAX_CALL_FDS: usize = 253;
 /// Descriptors a reply is given room to carry. Nothing bubbler calls
 /// answers with one; the room exists so a peer that sends some cannot
 /// leave them queued, and every one that arrives is closed at once.
+///
+/// A message carrying more than this fails closed: the kernel closes the
+/// ones that do not fit and sets `MSG_CTRUNC`, so fewer arrive than
+/// `UNIX_FDS` declares and [`Session::receive`] refuses the message.
 const MAX_REPLY_FDS: usize = 4;
 
 /// Longest authentication line accepted, so a peer that never sends
@@ -97,6 +101,12 @@ const FIELD_DESTINATION: u8 = 6;
 const FIELD_SENDER: u8 = 7;
 const FIELD_SIGNATURE: u8 = 8;
 const FIELD_UNIX_FDS: u8 = 9;
+
+/// What the bus answers `GetNameOwner` with when nobody holds the name:
+/// "If the requested name doesn't have an owner, returns a
+/// `org.freedesktop.DBus.Error.NameHasNoOwner` error." For an activatable
+/// name that only means it has not been started yet.
+const ERROR_NO_OWNER: &str = "org.freedesktop.DBus.Error.NameHasNoOwner";
 
 /// The bus's own name, object and interface: where `Hello` and `GetId`
 /// live.
@@ -1269,9 +1279,13 @@ impl Session {
         // to; the lookup is itself a call, to a name that needs none.
         let owner = self.owner_of(dest, deadline)?;
         let body = encode(sig, body)?;
+        // Addressed to the owner rather than to the well-known name: the
+        // peer that answers is then the one that was looked up, and a
+        // restart between the lookup and the call is an error from the
+        // bus instead of a call served by a different process.
         let mut fields = vec![
             (FIELD_PATH, Value::ObjectPath(path.to_owned())),
-            (FIELD_DESTINATION, Value::Str(dest.to_owned())),
+            (FIELD_DESTINATION, Value::Str(owner.clone())),
         ];
         // An empty interface is no interface: the member is left to be
         // resolved by the callee, which the specification allows for a
@@ -1313,8 +1327,17 @@ impl Session {
             // came from the name's owner. Anyone else on the bus — a
             // sandboxed instance with the `dbus` grant included — could
             // otherwise answer first and choose what bubbler believes.
+            //
+            // The bus itself is the exception, and only for an error:
+            // "when a method call message cannot be sent or received due
+            // to a security policy, the message bus should send an error
+            // reply", and it does the same for a peer that went away
+            // mid-call. `SENDER` "is controlled by the message bus, so
+            // it is as reliable and trustworthy as the message bus
+            // itself" — no peer can put the bus's name there.
             match reply.sender.as_deref() {
                 Some(sender) if sender == owner => {}
+                Some(sender) if sender == BUS_NAME && reply.kind == MSG_ERROR => {}
                 Some(_) => continue,
                 None => return Err(WireError::BadMessage("a reply with no sender")),
             }
@@ -1350,6 +1373,14 @@ impl Session {
     /// A unique name owns itself and the bus answers for its own name,
     /// so neither needs asking; every other destination is a well-known
     /// name whose owner the bus is asked for once per session.
+    ///
+    /// Asking first is what lets the reply be checked, but it also skips
+    /// the auto-starting a plain call would have done — and both names
+    /// bubbler calls (`org.a11y.Bus`,
+    /// `org.freedesktop.portal.Documents`) are activatable. So a name
+    /// with no owner is started explicitly and looked up again, inside
+    /// the same deadline. A name that still has no owner, or one the bus
+    /// cannot start, comes back as the bus's own error.
     fn owner_of(&mut self, dest: &str, deadline: Instant) -> Result<String, WireError> {
         if dest == BUS_NAME || dest.starts_with(':') {
             return Ok(dest.to_owned());
@@ -1357,6 +1388,19 @@ impl Session {
         if let Some((_, owner)) = self.owners.iter().find(|(name, _)| name == dest) {
             return Ok(owner.clone());
         }
+        let owner = match self.ask_owner(dest, deadline) {
+            Err(WireError::Remote { name, .. }) if name == ERROR_NO_OWNER => {
+                self.start_service(dest, deadline)?;
+                self.ask_owner(dest, deadline)?
+            }
+            other => other?,
+        };
+        self.owners.push((dest.to_owned(), owner.clone()));
+        Ok(owner)
+    }
+
+    /// `GetNameOwner`: the unique name that holds `dest` right now.
+    fn ask_owner(&mut self, dest: &str, deadline: Instant) -> Result<String, WireError> {
         let reply = self.call_by(
             BUS_NAME,
             BUS_PATH,
@@ -1375,8 +1419,27 @@ impl Session {
         if !owner.starts_with(':') {
             return Err(WireError::BadMessage("a name owner that is not unique"));
         }
-        self.owners.push((dest.to_owned(), owner.clone()));
         Ok(owner.clone())
+    }
+
+    /// `StartServiceByName(dest, 0)`: what auto-starting would have done.
+    ///
+    /// The result code is not read. It says the service was started or
+    /// was already running, and the specification itself notes that
+    /// neither is a guarantee it is still there — the lookup that
+    /// follows is what decides.
+    fn start_service(&mut self, dest: &str, deadline: Instant) -> Result<(), WireError> {
+        self.call_by(
+            BUS_NAME,
+            BUS_PATH,
+            BUS_INTERFACE,
+            "StartServiceByName",
+            "su",
+            &[Value::Str(dest.to_owned()), Value::Uint32(0)],
+            &[],
+            deadline,
+        )?;
+        Ok(())
     }
 
     /// The authentication handshake: the credentials nul byte and
@@ -1544,12 +1607,6 @@ impl Session {
     /// refused rather than read.
     fn receive(&mut self, deadline: Instant) -> Result<Message, WireError> {
         loop {
-            // First, so that a peer sending whole messages as fast as
-            // the socket takes them still runs out of deadline: nothing
-            // below ever blocks while there is something to read.
-            if Instant::now() >= deadline {
-                return Err(WireError::Timeout);
-            }
             if self.buf.len() >= FIXED_HEADER {
                 let (body_at, body_len) = frame(&self.buf)?;
                 let total = body_at + body_len;
@@ -1564,6 +1621,11 @@ impl Session {
                     }
                     return Ok(message);
                 }
+            }
+            // A message already whole is handed over above whatever the
+            // clock says; it is only reading more that has to give up.
+            if Instant::now() >= deadline {
+                return Err(WireError::Timeout);
             }
             self.fill(deadline)?;
         }
@@ -1954,8 +2016,9 @@ mod tests {
     use std::os::unix::net::UnixStream;
 
     use super::testing::{
-        fake_bus, reply_bytes, serial_of, server_auth, server_hello, server_line, server_message,
-        server_reply, server_send, signal_bytes,
+        fake_bus, reply_bytes, serial_of, server_auth, server_awaiting, server_call, server_error,
+        server_hello, server_line, server_message, server_reply, server_send, server_start,
+        signal_bytes,
     };
     use super::*;
 
@@ -3062,6 +3125,207 @@ mod tests {
         // the two together are past the total depth of 64.
         let (sig, bytes) = arrays_around_a_variant(32, 32);
         assert!(matches!(decode(&sig, &bytes), Err(WireError::Depth)));
+    }
+
+    /// A well-known name, which is what a call has to look up.
+    const A_NAME: &str = "org.example.Service";
+
+    #[test]
+    fn an_error_the_bus_sends_itself_answers_a_call_to_a_peer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, server) = fake_bus(tmp.path(), |stream| {
+            server_start(&stream);
+            let call = server_awaiting(&stream, "Ask", ":1.77");
+            // The peer went away between the lookup and the call, so the
+            // answer comes from the bus and not from the owner.
+            server_error(
+                &stream,
+                call.serial,
+                BUS_NAME,
+                "org.freedesktop.DBus.Error.ServiceUnknown",
+                "no such service",
+            );
+        });
+        let mut session = Session::connect(&path).unwrap();
+        let started = Instant::now();
+        let err = session
+            .call(A_NAME, "/org/a", "org.a", "Ask", "", &[], &[])
+            .unwrap_err();
+        match err {
+            WireError::Remote { name, .. } => {
+                assert_eq!(name, "org.freedesktop.DBus.Error.ServiceUnknown");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Answered, not waited out.
+        assert!(started.elapsed() < CALL_TIMEOUT, "{:?}", started.elapsed());
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn an_activatable_name_is_started_and_looked_up_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, server) = fake_bus(tmp.path(), |stream| {
+            server_start(&stream);
+            // Nobody holds the name yet, which for an activatable one
+            // only means it has not been started.
+            let call = server_call(&stream);
+            assert_eq!(call.text(FIELD_MEMBER), "GetNameOwner");
+            assert_eq!(call.body, vec![Value::Str(A_NAME.to_owned())]);
+            server_error(&stream, call.serial, BUS_NAME, ERROR_NO_OWNER, "no owner");
+            let call = server_call(&stream);
+            assert_eq!(call.text(FIELD_MEMBER), "StartServiceByName");
+            assert_eq!(call.signature, "su");
+            assert_eq!(
+                call.body,
+                vec![Value::Str(A_NAME.to_owned()), Value::Uint32(0)]
+            );
+            server_reply(&stream, 2, call.serial, BUS_NAME, "u", &[Value::Uint32(1)]);
+            let call = server_call(&stream);
+            assert_eq!(call.text(FIELD_MEMBER), "GetNameOwner");
+            server_reply(
+                &stream,
+                3,
+                call.serial,
+                BUS_NAME,
+                "s",
+                &[Value::Str(":1.77".to_owned())],
+            );
+            let call = server_call(&stream);
+            // Addressed to the owner the lookup named, not to the name.
+            assert_eq!(call.text(FIELD_DESTINATION), ":1.77");
+            assert_eq!(call.text(FIELD_MEMBER), "Ask");
+            server_reply(
+                &stream,
+                4,
+                call.serial,
+                ":1.77",
+                "s",
+                &[Value::Str("started".to_owned())],
+            );
+        });
+        let mut session = Session::connect(&path).unwrap();
+        let reply = session
+            .call(A_NAME, "/org/a", "org.a", "Ask", "", &[], &[])
+            .unwrap();
+        assert_eq!(reply, vec![Value::Str("started".to_owned())]);
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_name_the_bus_cannot_start_comes_back_as_the_bus_said() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, server) = fake_bus(tmp.path(), |stream| {
+            server_start(&stream);
+            let call = server_call(&stream);
+            server_error(&stream, call.serial, BUS_NAME, ERROR_NO_OWNER, "no owner");
+            let call = server_call(&stream);
+            assert_eq!(call.text(FIELD_MEMBER), "StartServiceByName");
+            server_error(
+                &stream,
+                call.serial,
+                BUS_NAME,
+                "org.freedesktop.DBus.Error.ServiceUnknown",
+                "not installed",
+            );
+        });
+        let mut session = Session::connect(&path).unwrap();
+        let err = session
+            .call(A_NAME, "/org/a", "org.a", "Ask", "", &[], &[])
+            .unwrap_err();
+        // Why it could not be started, not merely that nobody holds it.
+        match err {
+            WireError::Remote { name, .. } => {
+                assert_eq!(name, "org.freedesktop.DBus.Error.ServiceUnknown");
+            }
+            other => panic!("{other:?}"),
+        }
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_forged_answer_to_the_owner_lookup_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, server) = fake_bus(tmp.path(), |stream| {
+            server_start(&stream);
+            let call = server_call(&stream);
+            assert_eq!(call.text(FIELD_MEMBER), "GetNameOwner");
+            // A peer answers the lookup first, naming a connection of
+            // its choosing; only the bus may say who owns a name.
+            server_reply(
+                &stream,
+                2,
+                call.serial,
+                ":1.99",
+                "s",
+                &[Value::Str(":1.13".to_owned())],
+            );
+            server_reply(
+                &stream,
+                3,
+                call.serial,
+                BUS_NAME,
+                "s",
+                &[Value::Str(":1.77".to_owned())],
+            );
+            let call = server_call(&stream);
+            assert_eq!(call.text(FIELD_DESTINATION), ":1.77");
+            server_reply(
+                &stream,
+                4,
+                call.serial,
+                ":1.77",
+                "s",
+                &[Value::Str("real".to_owned())],
+            );
+        });
+        let mut session = Session::connect(&path).unwrap();
+        let reply = session
+            .call(A_NAME, "/org/a", "org.a", "Ask", "", &[], &[])
+            .unwrap();
+        assert_eq!(reply, vec![Value::Str("real".to_owned())]);
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_message_of_an_unknown_type_carrying_the_serial_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, server) = fake_bus(tmp.path(), |stream| {
+            server_start(&stream);
+            let call = server_awaiting(&stream, "Ask", ":1.77");
+            // Type 9 is not a type this specification has: "unknown
+            // types must be ignored", serial and sender notwithstanding.
+            server_send(
+                &stream,
+                9,
+                2,
+                &[
+                    (FIELD_REPLY_SERIAL, Value::Uint32(call.serial)),
+                    (FIELD_SENDER, Value::Str(":1.77".to_owned())),
+                ],
+                "s",
+                &[Value::Str("not a reply".to_owned())],
+            );
+            server_reply(
+                &stream,
+                3,
+                call.serial,
+                ":1.77",
+                "s",
+                &[Value::Str("the reply".to_owned())],
+            );
+        });
+        let mut session = Session::connect(&path).unwrap();
+        let reply = session
+            .call(A_NAME, "/org/a", "org.a", "Ask", "", &[], &[])
+            .unwrap();
+        assert_eq!(reply, vec![Value::Str("the reply".to_owned())]);
+        drop(session);
+        server.join().unwrap();
     }
 
     /// The session bus socket: `DBUS_SESSION_BUS_ADDRESS` when it names a
