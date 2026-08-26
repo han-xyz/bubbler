@@ -123,6 +123,20 @@ pub fn apply_all(
             }
         }
     }
+    // The device tree a bare `usb` grants, out here for the reason
+    // `gamepad`'s bind of it is: it covers every narrow bind under it —
+    // `dri`'s PCI roots, a filtered `usb` node's device directory — so it
+    // has to follow them whatever order the nodes are written in.
+    // `gamepad` binds the same tree, and one tree is one mount.
+    if pad.is_none()
+        && let Some(i) = services
+            .iter()
+            .position(|s| matches!(s, Service::Usb { vendor: None, .. }))
+    {
+        args.tag(Origin::Service(i));
+        let all = require_dir(host, "usb", PathBuf::from(SYS_DEVICES))?;
+        args.ro_bind(&all, &all);
+    }
     for (i, dst, src, mode) in shares {
         args.tag(Origin::Service(i));
         match mode {
@@ -698,16 +712,20 @@ fn gamepad_uinput(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchErr
 
 /// The USB bus in sysfs. Its `devices` directory is what an enumeration
 /// walks: one entry per device and per interface, each a symlink into
-/// `/sys/devices`.
+/// [`SYS_DEVICES`].
 const USB_SYSFS: &str = "/sys/bus/usb";
+
+/// The device tree every sysfs entry a device grant binds lives under.
+const SYS_DEVICES: &str = "/sys/devices";
 
 /// The socket `pcscd.socket` listens on, and the path libpcsclite
 /// connects to without being told.
 const PCSCD_SOCKET: &str = "/run/pcscd/pcscd.comm";
 
-/// Raw USB I/O. A bare grant is every device: the `/dev/bus/usb` tree
-/// with device access, the bus directory libusb enumerates, and the
-/// `/sys/devices` tree its entries are symlinks into.
+/// Raw USB I/O. A bare grant is every device: `/dev/bus/usb` bound as a
+/// directory, so one plugged in later is reachable inside too, the bus
+/// directory libusb enumerates, and the `/sys/devices` tree its entries
+/// are symlinks into, which [`apply_all`] binds after every service.
 ///
 /// With a `vendor` it is only the devices whose sysfs says so: their
 /// usbfs nodes and their own `/sys/devices` directories, resolved here
@@ -730,19 +748,14 @@ fn usb(
 ) -> Result<(), LaunchError> {
     let bus = PathBuf::from(USB_SYSFS);
     let Some(vendor) = vendor else {
+        // The directory, not the nodes in it, exactly as `gamepad` binds
+        // `/dev/input`: a device plugged in later has a node inside. The
+        // device tree the rest of the grant needs is bound after every
+        // service, beside `gamepad`'s bind of it.
         let dev = require_dir(host, "usb", PathBuf::from("/dev/bus/usb"))?;
         args.dev_bind(&dev, &dev);
         let bus = require_dir(host, "usb", bus)?;
         args.ro_bind(&bus, &bus);
-        // `gamepad` binds the device tree too, and after this one: two
-        // mounts for one tree is what that node already avoids.
-        if !services
-            .iter()
-            .any(|s| matches!(s, Service::Gamepad { .. }))
-        {
-            let all = require_dir(host, "usb", PathBuf::from("/sys/devices"))?;
-            args.ro_bind(&all, &all);
-        }
         return Ok(());
     };
     let first = services
@@ -783,6 +796,12 @@ fn usb(
         let Some(dir) = host.canonicalize(&entry) else {
             continue;
         };
+        // The entry is a symlink, and what it points at is what would be
+        // bound: one that resolves outside the device tree is not a
+        // device at all, so it is passed over rather than followed.
+        if !dir.starts_with(SYS_DEVICES) {
+            continue;
+        }
         found.insert(
             PathBuf::from(format!("/dev/bus/usb/{busnum:03}/{devnum:03}")),
             dir,
@@ -801,10 +820,14 @@ fn usb(
         return Ok(());
     }
     for (node, dir) in found {
+        // `file_type` follows symlinks, but `/dev/bus/usb` is the
+        // kernel's own directory, so a link there is the host's decision.
         let node = require(host, "usb", node, "a character device", |t| {
             t.is_char_device()
         })?;
-        args.dev_bind(&node, &node);
+        // `-try`: the node is one this walk found a moment ago, and a
+        // device unplugged before the exec must not fail the launch.
+        args.dev_bind_try(&node, &node);
         let dir = require_dir(host, "usb", dir)?;
         args.ro_bind(&dir, &dir);
     }
@@ -3334,23 +3357,44 @@ mod tests {
             ("/sys/dev/char", Dir),
             ("/sys/devices/pci0000:00", Dir),
         ]);
-        for order in [
-            [Service::Dri, Service::Compute],
-            [Service::Compute, Service::Dri],
-        ] {
-            let a = argv(&order, &env(), &host).unwrap();
-            // One directory, one mount: `dri` binds it for both, and
-            // `compute` is never granted without `dri` beside it.
-            assert_eq!(
-                binds(&a)
-                    .iter()
-                    .filter(|b| **b == "/sys/devices/system/cpu")
-                    .count(),
-                2,
-                "{order:?}: {:?}",
-                binds(&a)
-            );
-        }
+        let dri = [
+            "--dev-bind",
+            "/dev/dri",
+            "/dev/dri",
+            "--ro-bind",
+            "/sys/dev/char",
+            "/sys/dev/char",
+            "--ro-bind",
+            "/sys/devices/system/cpu",
+            "/sys/devices/system/cpu",
+            "--ro-bind",
+            "/sys/devices/pci0000:00",
+            "/sys/devices/pci0000:00",
+        ];
+        // One directory, one mount: the CPU topology is `dri`'s bind
+        // here, and `compute` is never granted without `dri` beside it.
+        let compute = [
+            "--dev-bind",
+            "/dev/kfd",
+            "/dev/kfd",
+            "--ro-bind",
+            "/sys/devices/virtual/kfd",
+            "/sys/devices/virtual/kfd",
+            "--ro-bind",
+            "/sys/class/kfd",
+            "/sys/class/kfd",
+            "--ro-bind",
+            "/sys/devices/system/node",
+            "/sys/devices/system/node",
+        ];
+        assert_eq!(
+            binds(&argv(&[Service::Dri, Service::Compute], &env(), &host).unwrap()),
+            [dri.as_slice(), compute.as_slice()].concat()
+        );
+        assert_eq!(
+            binds(&argv(&[Service::Compute, Service::Dri], &env(), &host).unwrap()),
+            [compute.as_slice(), dri.as_slice()].concat()
+        );
     }
 
     const USB_1_2: &str = "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-2";
@@ -3458,24 +3502,71 @@ mod tests {
     fn a_bare_usb_leaves_the_device_tree_to_gamepad_where_both_are_granted() {
         let mut host = usb_host();
         host.extend(gamepad_host());
-        let a = argv(
-            &[
-                usb_node(None, None),
-                Service::Gamepad {
-                    hidraw: false,
-                    uinput: false,
-                },
-            ],
-            &env(),
-            &host,
-        )
-        .unwrap();
-        assert_eq!(
-            binds(&a).iter().filter(|b| **b == "/sys/devices").count(),
-            2,
-            "{:?}",
-            binds(&a)
-        );
+        let pad = Service::Gamepad {
+            hidraw: false,
+            uinput: false,
+        };
+        // One tree, one mount, and the same argv whichever node is
+        // written first: both binds land after every service.
+        for order in [
+            [usb_node(None, None), pad.clone()],
+            [pad.clone(), usb_node(None, None)],
+        ] {
+            let a = argv(&order, &env(), &host).unwrap();
+            assert_eq!(
+                binds(&a),
+                [
+                    "--dev-bind",
+                    "/dev/bus/usb",
+                    "/dev/bus/usb",
+                    "--ro-bind",
+                    "/sys/bus/usb",
+                    "/sys/bus/usb",
+                    "--dev-bind",
+                    "/dev/input",
+                    "/dev/input",
+                    "--ro-bind",
+                    "/sys/class/input",
+                    "/sys/class/input",
+                    "--ro-bind",
+                    "/sys/devices",
+                    "/sys/devices",
+                    "--ro-bind",
+                    "/run/udev",
+                    "/run/udev",
+                ],
+                "{order:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_usb_binds_the_device_tree_after_the_pci_roots_whatever_the_file_order() {
+        let mut host = usb_host();
+        host.extend([
+            ("/dev/dri", Dir),
+            ("/sys/dev/char", Dir),
+            ("/sys/devices/system/cpu", Dir),
+            ("/sys/devices/pci0000:00", Dir),
+        ]);
+        for order in [
+            [Service::Dri, usb_node(None, None)],
+            [usb_node(None, None), Service::Dri],
+        ] {
+            let a = argv(&order, &env(), &host).unwrap();
+            let pci = seq_at(
+                &a,
+                &[
+                    "--ro-bind",
+                    "/sys/devices/pci0000:00",
+                    "/sys/devices/pci0000:00",
+                ],
+            )
+            .expect("dri binds the PCI root");
+            let all = seq_at(&a, &["--ro-bind", "/sys/devices", "/sys/devices"])
+                .expect("usb binds the device tree");
+            assert!(pci < all, "{order:?}: {a:?}");
+        }
     }
 
     #[test]
@@ -3493,7 +3584,7 @@ mod tests {
                 "--ro-bind",
                 "/sys/bus/usb",
                 "/sys/bus/usb",
-                "--dev-bind",
+                "--dev-bind-try",
                 "/dev/bus/usb/001/003",
                 "/dev/bus/usb/001/003",
                 "--ro-bind",
@@ -3525,13 +3616,13 @@ mod tests {
                 "--ro-bind",
                 "/sys/bus/usb",
                 "/sys/bus/usb",
-                "--dev-bind",
+                "--dev-bind-try",
                 "/dev/bus/usb/001/002",
                 "/dev/bus/usb/001/002",
                 "--ro-bind",
                 USB_1_4,
                 USB_1_4,
-                "--dev-bind",
+                "--dev-bind-try",
                 "/dev/bus/usb/001/003",
                 "/dev/bus/usb/001/003",
                 "--ro-bind",
@@ -3559,13 +3650,13 @@ mod tests {
                 "--ro-bind",
                 "/sys/bus/usb",
                 "/sys/bus/usb",
-                "--dev-bind",
+                "--dev-bind-try",
                 "/dev/bus/usb/001/004",
                 "/dev/bus/usb/001/004",
                 "--ro-bind",
                 USB_1_3,
                 USB_1_3,
-                "--dev-bind",
+                "--dev-bind-try",
                 "/dev/bus/usb/001/003",
                 "/dev/bus/usb/001/003",
                 "--ro-bind",
@@ -3590,11 +3681,78 @@ mod tests {
         }
     }
 
+    /// The bus directory alone: every node this grant would have bound
+    /// came from an entry the walk refused.
+    fn only_the_bus(a: &[String]) -> bool {
+        binds(a) == ["--ro-bind", "/sys/bus/usb", "/sys/bus/usb"]
+    }
+
+    #[test]
+    fn usb_passes_over_an_entry_whose_attributes_are_not_what_sysfs_writes() {
+        // A number no usbfs path can be built from, and an id that is
+        // not one: neither is a match, and neither reaches the argv as
+        // text.
+        for (name, value) in [
+            ("busnum", "99999"),
+            ("busnum", "-1"),
+            ("busnum", "abc"),
+            ("busnum", ""),
+            ("devnum", "99999"),
+            ("idVendor", "0bb4x"),
+        ] {
+            let path = format!("/sys/bus/usb/devices/1-2/{name}");
+            let mut ids: Vec<(&str, &str)> =
+                usb_ids().into_iter().filter(|(p, _)| *p != path).collect();
+            ids.push((&path, value));
+            let a = argv_read(
+                &[usb_node(Some("0bb4"), Some("0c8d"))],
+                &usb_host(),
+                &usb_links(),
+                &ids,
+            )
+            .unwrap();
+            assert!(
+                only_the_bus(&a),
+                "{name}={value:?} matched: {:?}",
+                binds(&a)
+            );
+        }
+    }
+
+    #[test]
+    fn usb_passes_over_an_entry_that_resolves_outside_the_device_tree() {
+        // The entry is a symlink and what it points at is what would be
+        // bound, so one pointing anywhere but the device tree is not a
+        // device: bind `/` and the sandbox has the host.
+        for target in ["/", "/etc"] {
+            let a = argv_read(
+                &[usb_node(Some("0bb4"), Some("0c8d"))],
+                &usb_host(),
+                &[("/sys/bus/usb/devices/1-2", target)],
+                &usb_ids(),
+            )
+            .unwrap();
+            assert!(only_the_bus(&a), "{target} was followed: {:?}", binds(&a));
+        }
+    }
+
+    #[test]
+    fn usb_passes_over_an_entry_that_stopped_resolving_mid_walk() {
+        // The attributes were read and then the device went away: no
+        // directory to bind, so no node either.
+        let mut host = fake_host(&usb_host(), &usb_links()).unresolved("/sys/bus/usb/devices/1-2");
+        for (p, bytes) in usb_ids() {
+            host = host.contents(p, bytes.as_bytes());
+        }
+        let a = argv_with(&[usb_node(Some("0bb4"), Some("0c8d"))], &env(), &host, None).unwrap();
+        assert!(only_the_bus(&a), "{:?}", binds(&a));
+    }
+
     #[test]
     fn usb_ignores_an_entry_whose_ids_it_cannot_read() {
         // Everything but the ids of the device that would match: an
         // entry the walk cannot read is an entry it passes over.
-        for hidden in ["idVendor", "busnum", "devnum"] {
+        for hidden in ["idVendor", "idProduct", "busnum", "devnum"] {
             let ids: Vec<_> = usb_ids()
                 .into_iter()
                 .filter(|(p, _)| *p != format!("/sys/bus/usb/devices/1-2/{hidden}"))

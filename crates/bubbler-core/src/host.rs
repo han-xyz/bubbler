@@ -28,10 +28,10 @@ pub trait Host {
     /// user cannot write is forwarded to the document portal read-only,
     /// so this decides what a sandbox is granted, not what it is told.
     fn writable(&self, p: &Path) -> bool;
-    /// The bytes of `p` when there are at most [`SMALL_READ`] of them;
-    /// `None` when it cannot be read or holds more. For the sysfs
-    /// attributes a grant matches a device by, never for content the
-    /// sandbox is handed.
+    /// The bytes of `p` when it is a regular file of at most
+    /// [`SMALL_READ`] of them; `None` for anything else, including a
+    /// file that holds more. For the sysfs attributes a grant matches a
+    /// device by, never for content the sandbox is handed.
     fn read_small(&self, p: &Path) -> Option<Vec<u8>>;
 }
 
@@ -66,11 +66,16 @@ impl Host for RealHost {
         rustix::fs::access(p, rustix::fs::Access::WRITE_OK).is_ok()
     }
 
-    /// One byte over the cap is refused rather than truncated: a
-    /// truncated `idVendor` is a device id that matches the wrong
+    /// The type is checked before the open, so a FIFO cannot park this
+    /// on a writer that never comes and a device node is never read at
+    /// all. One byte over the cap is then refused rather than truncated:
+    /// a truncated `idVendor` is a device id that matches the wrong
     /// device. Sysfs reports every attribute as one page long and
     /// answers with fewer bytes, so the size is read, not stat'd.
     fn read_small(&self, p: &Path) -> Option<Vec<u8>> {
+        if !fs::metadata(p).ok()?.is_file() {
+            return None;
+        }
         let mut buf = Vec::new();
         fs::File::open(p)
             .ok()?
@@ -264,8 +269,18 @@ mod tests {
         let over = write("over", vec![b'x'; SMALL_READ + 1]);
         assert_eq!(RealHost.read_small(&over), None);
         assert_eq!(RealHost.read_small(&tmp.path().join("gone")), None);
-        // A directory opens and then refuses to be read.
+        // Neither a directory nor a FIFO is a file to read: the type is
+        // checked before the open, so the FIFO with no writer does not
+        // park this test.
         assert_eq!(RealHost.read_small(tmp.path()), None);
+        let fifo = tmp.path().join("fifo");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .expect("a fifo needs no privilege");
+        assert_eq!(RealHost.read_small(&fifo), None);
     }
 
     #[test]

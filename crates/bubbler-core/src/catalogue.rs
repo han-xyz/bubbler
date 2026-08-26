@@ -196,7 +196,8 @@ pub static GRANTS: &[Grant] = &[
                that unlocks it is typed into the application inside. No device node is \
                bound — the socket is the whole grant — so what a card refuses without \
                its PIN it still refuses. A host with no `pcscd` socket fails the launch \
-               rather than running without it.",
+               rather than running without it: start `pcscd.socket` (package \
+               `pcsclite`) when the launch reports the socket missing.",
         risk: Risk::Wide,
         grammar: "smartcard",
     },
