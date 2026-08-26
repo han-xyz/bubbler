@@ -1169,12 +1169,13 @@ enumerates zero devices and says nothing useful about why.
 Permissions are not what limits this one. systemd's own
 `50-udev-default.rules` carries `SUBSYSTEM=="kfd", GROUP="render",
 MODE="0666"`, so on a stock host the node is world read-write already and the
-grant, not an ACL, is the whole of the decision. Against `dri` it costs little
-that was not given: a compute job and a render job reach the same GPU through
-the same driver and the same memory, so what one can scrape out of another
-application's buffers, the render nodes already allowed. What it does add is
-reach — every AMD GPU, including one `dri`'s `/dev/dri` nodes were not going
-to be pointed at.
+grant, not an ACL, is the whole of the decision. Against `dri` what it adds is
+reach rather than a new class of access: a compute job goes to the same GPU
+through the same kernel driver the render nodes already opened, so it carries
+no capture risk `dri` did not carry. The reach is the difference. `/dev/kfd` is
+one machine-wide interface where a render node is per card, so the grant covers
+every AMD GPU on the host, including one `dri`'s `/dev/dri` nodes were never
+going to be pointed at.
 
 The runtime itself needs nothing further from bubbler on Arch: ROCm installs
 under `/opt/rocm`, which the baseline binds read-only with `/usr`. An OpenCL

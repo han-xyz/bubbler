@@ -717,8 +717,9 @@ nothing in this tree. `network "host"` gives all of it back on purpose.
 
 **Defends:** nothing that `dri` did not already defend. `compute` is
 refused without `dri` — a config holding it alone does not parse — so it
-never stands as a grant of its own, and against `dri` it reaches the same
-GPUs through the same driver and the same memory. Every path it binds is
+never stands as a grant of its own, and against `dri` it reaches those
+GPUs through the same kernel driver the render nodes already opened.
+Every path it binds is
 required to exist and to be of the right type before the launch: a
 missing `/dev/kfd`, a missing topology directory or a `/dev/kfd` that is
 not a character device stops the run rather than producing a sandbox

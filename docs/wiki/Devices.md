@@ -42,7 +42,10 @@ the topology hands a runtime a render minor it then opens under `/dev/dri`.
 - `/dev/kfd` is **one** node for the whole machine — every AMD GPU, not the
   card you meant. Permissions do not narrow it either: systemd's
   `50-udev-default.rules` sets `SUBSYSTEM=="kfd", GROUP="render", MODE="0666"`.
-- Against `dri` it adds little: the same GPU memory through the same driver.
+- Against `dri` it adds reach, not a new class of access: the same GPU
+  through the same kernel driver the render nodes already opened, so no
+  capture risk `dri` did not carry. The reach is the difference — `/dev/kfd`
+  is machine-wide where a render node is per card.
 - Missing `/dev/kfd` or a missing topology directory fails the launch.
 - Nothing else is needed on Arch — ROCm lives in `/opt/rocm`, which the
   baseline binds read-only. **Never run against a real ROCm/HIP/OpenCL
