@@ -311,8 +311,10 @@ host).
 - `app-runtime` does not carry Discord rich presence.
 - KeePassXC native messaging manifest must be placed by hand.
 - `camera` never exercised on real hardware.
-- Deeply nested KDL would overflow the `kdl` crate's parser; bubbler refuses
-  files over 1 MiB or deeper than 32 braces first.
+- Deeply nested KDL, or a block comment full of `*`/`/`, would overflow the
+  `kdl` crate's parser; bubbler refuses files over 1 MiB, with more than 32
+  `{` anywhere (strings and comments included), or a comment holding more
+  than 128 such marks, before the parser sees them.
 - Desktop entries: D-Bus activation closed for the entry only.
 - Forwarded file arguments are visible to the instance for the rest of the
   portal session, and a symlink argument exports its target.
