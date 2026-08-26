@@ -1139,7 +1139,9 @@ queue interface and not a device: `libhsakmt` reads the topology to find each
 GPU's render minor and then opens `/dev/dri/renderD<minor>` for the memory it
 maps. Without `dri` the node is a handle onto nothing. The check runs on the
 merged config rather than per layer, so a profile may hold `compute` while the
-layer that includes it is the one granting `dri`.
+layer that includes it is the one granting `dri` — and a profile where no
+layer does is caught by the lint instead, as the error `compute-without-dri`,
+before anything is seeded from it.
 
 `/dev/kfd` is **one** node for the whole machine — the ROCm documentation
 calls it the main compute interface, shared by all GPUs — so "compute on this
@@ -1260,11 +1262,14 @@ came from.
 A filter that matches nothing is a warning and not a failure —
 `bubbler: warning: usb: no device matches vendor=ffff product=ffff` — and the
 sandbox starts without the device, since a device you plug in on demand is
-exactly what this grant is usually for. A device that *was* matched and is
-unplugged between the walk and the exec is covered too: matched nodes are
-bound with `--dev-bind-try`. A node missing, or not a character device, when
-the walk probes it still fails the launch, because that is the device the
-config named.
+exactly what this grant is usually for. Unplugging is never a failure either,
+at any point in the run-up: a device whose node or sysfs directory has gone
+between the walk and the bind is passed over as though the walk had not seen
+it (and if that leaves the node with nothing, it warns as an empty filter
+does), and one that goes after that is covered by `--dev-bind-try` on the
+node. What does fail is a path that is still there and is the wrong thing — a
+`/dev/bus/usb/BBB/DDD` that is not a character device is a host anomaly rather
+than an unplug, and the launch stops on it.
 
 Permissions stay the host's. On Arch a usbfs node is `0664 root:root`
 (`50-udev-default.rules`: `SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device",
@@ -2413,7 +2418,8 @@ is deliberately a different code from "grants too much".
 `dup-name-policy` (one bus name given two policies by two layers),
 `own-on-system-bus`, `camera-without-portals` (a `camera` grant no layer gives
 a `portals` to carry, so the portal reads the sandbox as an ordinary process
-of yours).
+of yours), `compute-without-dri` (a `compute` grant no layer gives a `dri` to
+carry, so the render nodes its topology names are not inside).
 
 **Warnings** say the file grants more than it probably means to:
 `x11-without-reason` (an `x11 "host"` grant with no `lint-allow` reason; the

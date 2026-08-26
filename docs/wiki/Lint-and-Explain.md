@@ -20,7 +20,7 @@ advice (exit code untouched).
 
 **Errors** (the file will not do what it says): `bundle-without-dbus`,
 `path-share-reserved`, `dup-name-policy`, `own-on-system-bus`,
-`camera-without-portals`.
+`camera-without-portals`, `compute-without-dri`.
 
 **Warnings** (grants more than it probably means): `x11-without-reason`,
 `seccomp-disabled`, `userns-disabled-with-nested-sandbox`, `own-too-wide`,
