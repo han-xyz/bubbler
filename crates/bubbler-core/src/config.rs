@@ -20,9 +20,31 @@ use crate::dbus;
 use crate::seccomp::syscall_number;
 
 /// Largest configuration bubbler hands to the KDL parser. A profile or
-/// a `config.kdl` is a screenful of grants; a megabyte is already far
-/// past anything a person writes.
-pub const MAX_BYTES: usize = 1024 * 1024;
+/// a `config.kdl` is a screenful of grants — the shipped profiles are
+/// about 5 KB each with their headers — and this is the input
+/// [`PARSER_STACK`] is sized for: the parser may take one stack frame
+/// per byte of the text, so the bytes are the bound on its depth.
+pub const MAX_BYTES: usize = 64 * 1024;
+
+/// Stack reserved for the thread [`parse_document`] runs the parser on.
+///
+/// `kdl` 6.7.1 recurses in three places. Two are driven by bytes a
+/// count can see and are bounded by [`MAX_NESTING`] and
+/// [`MAX_COMMENT_MARKS`]. The third is not: `document` (in its
+/// `v2_parser.rs`) recovers from a top-level token `nodes` refuses —
+/// `}`, `)`, `=` and the rest — by consuming one byte and calling
+/// itself, one frame per byte it cannot place, and no count of the
+/// text bounds that short of refusing every unplaceable byte, which is
+/// refusing every syntax error. So the depth is bounded by the size
+/// instead: at most [`MAX_BYTES`] `document` frames, plus the few the
+/// counted recursions add. Measured in a debug build on x86_64, a
+/// `document` frame is about 3.3 KB, so 64 Ki of them need about 216
+/// MB; this reservation leaves more than twice that. Linux commits the
+/// pages of a thread's stack as they are touched, so the reservation
+/// costs nothing until a file makes the parser use it. A file of
+/// nothing but `}` aborted a release build of bubbler on its 8 MiB
+/// main-thread stack from 13 411 bytes.
+pub const PARSER_STACK: usize = 512 << 20;
 
 /// Most `{` bubbler hands to the KDL parser in one file, counted
 /// wherever they stand: in strings and comments too, and never given
@@ -31,14 +53,15 @@ pub const MAX_BYTES: usize = 1024 * 1024;
 /// at most, so a config that means something, header examples pasted
 /// into its comments included, stays well under this.
 ///
-/// Measured against `kdl` 6.7.1 on x86_64, parsing well-formed nesting
-/// until the process aborts: 1348 levels on the 8 MiB stack a main
-/// thread has in a release build, 253 in a debug build, and 61 on the
-/// 2 MiB stack of a spawned thread in a debug build. The bound sits
-/// under the smallest of those rather than under the largest: bubbler
-/// parses on its main thread, but a library user parsing on a thread of
-/// its own in a debug build is the case that has the least room, and
-/// this is a bound the parser survives there too.
+/// `kdl` 6.7.1 descends into children by recursion, once per `{` it
+/// reads as one, and it can read no `{` the text does not hold: N
+/// braces in the text are at most N descents, however the parser reads
+/// them. Measured on x86_64, parsing well-formed nesting until the
+/// process aborts: 1348 levels on the 8 MiB stack a main thread has in
+/// a release build, 253 in a debug build, and 61 on the 2 MiB stack of
+/// a spawned thread in a debug build. The bound sits far under the
+/// smallest of those, so the children descents are a rounding error on
+/// the stack [`parse_document`] reserves.
 pub const MAX_NESTING: usize = 32;
 
 /// Most `*` and `/` bubbler lets one `/* */` comment hold, nested
@@ -55,8 +78,8 @@ pub const MAX_NESTING: usize = 32;
 /// runs of text — two descents per mark, the worst shape — survives
 /// 1024 marks and aborts at 1500. On the 2 MiB stack of a spawned
 /// thread those are 512 and 256. The bound sits below the worst shape
-/// on the smaller stack, as [`MAX_NESTING`] does, so a library user
-/// parsing on a thread of its own keeps the same margin.
+/// on the smaller stack, as [`MAX_NESTING`] does, so a comment is a
+/// rounding error on the stack [`parse_document`] reserves.
 pub const MAX_COMMENT_MARKS: usize = 128;
 
 /// Keys `env` may not set: the sandbox owns them.
@@ -709,20 +732,52 @@ pub fn parse_profile(text: &str) -> Result<RawProfile, ConfigError> {
     Ok(parse_doc(text, true)?.0)
 }
 
-/// Parse KDL text through the one bound bubbler puts on the parser.
+/// Parse KDL text on a stack sized for what a bounded file can make
+/// the parser do.
 ///
-/// Every configuration bubbler reads is parsed here. `kdl` 6 descends
-/// into `{` by recursion, so a file nested deeply enough overflows the
-/// stack and aborts the process instead of returning an error, and the
-/// text is measured before the parser is handed it.
+/// Every configuration bubbler reads is parsed here. `kdl` 6.7.1
+/// recurses on three things and a file that drives any of them deep
+/// enough overflows the stack and aborts the process instead of
+/// returning an error. Two are driven by bytes: it descends once per
+/// `{` and once per `*` or `/` in a block comment, and the pre-check
+/// refuses the text before the parser sees it when either count passes
+/// its bound. The third is its recovery from a top-level token it
+/// cannot place, one frame per such byte, which no count bounds; so
+/// the text is bounded to [`MAX_BYTES`] and the
+/// parser runs on a thread with [`PARSER_STACK`] reserved for it, on
+/// which at most that many frames plus the two counted recursions
+/// fit with room to spare. The caller's stack is never parsed on:
+/// a thread that cannot be started is an error, not a fallback.
 ///
-/// The measurement is a pre-check and not a parser: it counts every
-/// `{` in the text and measures the comment after every `/*`, wherever
-/// they stand, and decides nothing about what the document means. Text
-/// it accepts may still be invalid KDL.
+/// The count is a pre-check and not a parser: it counts every `{` in
+/// the text and measures the comment after every `/*`, wherever they
+/// stand, and decides nothing about what the document means. Text it
+/// accepts may still be invalid KDL.
 pub fn parse_document(text: &str) -> Result<KdlDocument, ConfigError> {
     check_bounds(text)?;
-    Ok(KdlDocument::parse(text)?)
+    let parsed = std::thread::scope(|scope| {
+        let parser = std::thread::Builder::new()
+            .name("kdl".into())
+            .stack_size(PARSER_STACK)
+            .spawn_scoped(scope, || KdlDocument::parse(text))
+            .map_err(ConfigError::ParserThread)?;
+        parser
+            .join()
+            .map_err(|payload| ConfigError::ParserPanicked(panic_message(&*payload)))
+    })?;
+    Ok(parsed?)
+}
+
+/// What a panic payload says, for the error that carries it out of the
+/// parser thread.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "no message".to_owned()
+    }
 }
 
 /// Refuse text past [`MAX_BYTES`], holding more than [`MAX_NESTING`]
@@ -742,15 +797,21 @@ pub fn parse_document(text: &str) -> Result<KdlDocument, ConfigError> {
 /// or not it would have descended into them. Every `/*` is measured
 /// from where it stands for the same reason. A `{` or a `/*` inside a
 /// string or a comment the parser does read as one is over-counted,
-/// which refuses a file the parser would have survived; no
-/// configuration that grants anything writes thirty-three braces, or a
-/// comment as busy as the bound, anywhere in it.
+/// which refuses a file the parser would have read; no configuration
+/// that grants anything writes thirty-three braces, or a comment as
+/// busy as the bound, anywhere in it.
+///
+/// These two counts are not what keeps the parser on its stack — the
+/// stack [`parse_document`] reserves is sized for a frame per byte of
+/// the text, and a file of [`MAX_NESTING`] braces or a comment at the
+/// bound costs a handful of frames beside that. They keep the deep
+/// recursions cheap and the refusal a message that names the shape.
 ///
 /// Measuring from every `/*` costs linear work: a measure stops one
 /// mark past the bound, so it steps past at most [`MAX_COMMENT_MARKS`]
 /// / 2 further `/*` before it stops, and each byte of the text is
 /// walked by at most that many measures plus one — 65 × [`MAX_BYTES`]
-/// steps in the worst layout, a tenth of a second unoptimised.
+/// steps in the worst layout, a few milliseconds unoptimised.
 fn check_bounds(text: &str) -> Result<(), ConfigError> {
     if text.len() > MAX_BYTES {
         return Err(ConfigError::TooLarge {
@@ -4663,11 +4724,8 @@ command "b""#
 
     #[test]
     fn the_bound_admits_its_own_depth_and_stops_one_past_it() {
-        // The parser and not the pre-check alone: this runs on the 2 MiB
-        // stack a spawned thread has, where an unoptimised `kdl` 6.7.1
-        // overflows at 62 levels. A bound the parser survives even there
-        // is what [`MAX_NESTING`] is for, so a rise past what that stack
-        // takes aborts this test rather than someone's process.
+        // The parser and not the pre-check alone: the bound's own depth
+        // reaches the parser and parses.
         assert!(parse_document(&nested(MAX_NESTING)).is_ok());
         assert!(matches!(
             check_bounds(&nested(MAX_NESTING + 1)),
@@ -4689,6 +4747,32 @@ command "b""#
         assert!(matches!(
             parse(&big),
             Err(ConfigError::TooLarge { bytes, max }) if bytes == big.len() && max == MAX_BYTES
+        ));
+    }
+
+    #[test]
+    fn a_token_the_parser_cannot_place_costs_a_frame_per_byte_and_the_stack_holds_them() {
+        // kdl 6.7.1 recovers from a top-level token `nodes` refuses by
+        // eating one byte and calling `document` again (`document` in
+        // its `v2_parser.rs`): one frame per byte, driven by no `{` and
+        // no `/*` a count could see, so the count admits every one of
+        // these. On the 2 MiB stack this test thread has, 629 of them
+        // aborted the process; at `MAX_BYTES` of them the parser needs
+        // the stack `parse_document` reserves, whatever the caller's.
+        for token in ["}", ")", "="] {
+            let text = token.repeat(MAX_BYTES);
+            assert!(check_bounds(&text).is_ok(), "{token}");
+            assert!(
+                matches!(parse(&text), Err(ConfigError::Parse(_))),
+                "{token}"
+            );
+        }
+        // One byte more than the reservation is sized for is refused
+        // before the parser sees it.
+        let over = "}".repeat(MAX_BYTES + 1);
+        assert!(matches!(
+            parse(&over),
+            Err(ConfigError::TooLarge { bytes, max }) if bytes == MAX_BYTES + 1 && max == MAX_BYTES
         ));
     }
 
@@ -5140,7 +5224,7 @@ command "b""#
                 );
                 // And the whole way in, at a size a config file may
                 // have: past the count, this text aborts the process.
-                let big = format!("{head}{}{tail}", "{".repeat(200_000));
+                let big = format!("{head}{}{tail}", "{".repeat(20_000));
                 assert!(
                     matches!(parse(&big), Err(ConfigError::TooDeep { .. })),
                     "{head:?}{tail:?}"
@@ -5149,7 +5233,7 @@ command "b""#
         }
         // A block comment with no end is the one that needs no counting:
         // the parser reads the rest of the file as comment and says so.
-        let commented = format!("/* c\r{}", "{".repeat(200_000));
+        let commented = format!("/* c\r{}", "{".repeat(20_000));
         assert!(parse(&commented).is_err());
     }
 
@@ -5283,7 +5367,7 @@ command "b""#
         for text in [
             format!("/*{}*/\ncommand \"true\"\n", "/".repeat(2500)),
             format!("/*{}*/\ncommand \"true\"\n", "/*".repeat(20_000)),
-            "/*".repeat(50_000),
+            "/*".repeat(30_000),
         ] {
             assert!(
                 matches!(

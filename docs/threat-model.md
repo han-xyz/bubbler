@@ -941,17 +941,26 @@ shims](manual.md#path-shims) ·
 ### Configuration parsing
 
 **Defends:** the input is your own file, so this is correctness rather
-than security — with one exception. The `kdl` crate parses `{` and
-`/* */` comments by recursing, and a file nested or starred deeply enough
-would overflow the stack and abort bubbler with no diagnostic, so every
-configuration bubbler reads is pre-checked and refused above 1 MiB, above
-32 `{` counted wherever they stand, or holding a `/*` with more than 128
-`*` or `/` after it, naming the file. The count trusts no string and no
-comment and lets no `}` give a brace back: the parser recovers from a
-string it cannot read by reading the inside as nodes, so a bound that
-followed its grammar was one its recovery stepped around. A count that
-trusts nothing can only refuse a file the parser would have survived,
-never admit one it would not.
+than security — with one exception. The `kdl` crate recurses in three
+places, and a file shaped for any of them would overflow the stack and
+abort bubbler with no diagnostic. Two are driven by bytes a count can
+see — it descends once per `{` and once per `*` or `/` in a `/* */`
+comment — so every configuration bubbler reads is pre-checked and refused
+above 32 `{` counted wherever they stand, or holding a `/*` with more
+than 128 `*` or `/` after it, naming the file. The count trusts no string
+and no comment and lets no `}` give a brace back: the parser recovers
+from a string it cannot read by reading the inside as nodes, so a bound
+that followed its grammar was one its recovery stepped around. The third
+recursion is the parser's recovery from a top-level token it cannot place
+(`}`, `)`, `=`, …): one byte consumed and the document parser re-entered,
+one stack frame per such byte, which no count of the text bounds short of
+refusing every syntax error. So the stack is sized for it instead: a
+configuration is refused above 64 KiB, and the parser runs on a thread
+with 512 MiB of stack reserved — pages committed only as touched — which
+holds a frame per byte of the largest file admitted with more than twice
+the room to spare. Counted braces, counted comment marks, and a reserved
+stack for the restarts: the two counts keep the deep recursions cheap, the
+reservation makes the wide one safe.
 Include cycles and depth are bounded, an unknown node is an error rather
 than a silent skip, and a value that could forge a line in `--dry-run`
 output is refused.

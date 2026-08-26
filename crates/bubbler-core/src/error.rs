@@ -38,7 +38,9 @@ pub enum ConfigError {
     #[error("no command: add a `command` node to the config or pass one after `--`")]
     MissingCommand,
     /// Larger than [`crate::config::MAX_BYTES`], and so refused before
-    /// the parser sees it.
+    /// the parser sees it. The KDL parser can take one stack frame per
+    /// byte it cannot place, and the stack it runs on is sized for
+    /// this many.
     #[error("configuration is {bytes} bytes; bubbler parses at most {max}")]
     TooLarge {
         /// Size of the text that was offered.
@@ -49,10 +51,10 @@ pub enum ConfigError {
     /// More than [`crate::config::MAX_NESTING`] `{` in the text, counted
     /// wherever they stand — in strings and comments too, and never
     /// given back by a `}`. The KDL parser descends into `{` by
-    /// recursion, so a file deep enough overflows the stack and aborts
-    /// the process instead of failing to parse; and it recovers from a
-    /// string it cannot read by reading the inside as nodes, so no
-    /// string is trusted to hold its braces.
+    /// recursion, once per brace it reads as one, and it recovers from
+    /// a string it cannot read by reading the inside as nodes, so no
+    /// string is trusted to hold its braces: N braces in the text are
+    /// at most N descents, and this keeps N small.
     #[error(
         "`{{` appears more than {max} times in the file (line {line}); braces are counted wherever they stand, strings and comments included"
     )]
@@ -66,8 +68,7 @@ pub enum ConfigError {
     /// `/` in the comment after it, measured wherever the `/*` stands —
     /// inside a string too, for the reason [`Self::TooDeep`] gives. The
     /// KDL parser reads a block comment by recursing once per one of
-    /// those, so a comment busy enough overflows the stack and aborts
-    /// the process instead of being skipped.
+    /// those, and this keeps that count small.
     #[error(
         "the `/*` at line {line} opens a comment holding more than {max} `*` or `/`; comments are measured wherever they open, strings included"
     )]
@@ -77,6 +78,18 @@ pub enum ConfigError {
         /// The bound it passed, [`crate::config::MAX_COMMENT_MARKS`].
         max: usize,
     },
+    /// The thread the parser runs on, with the stack
+    /// [`crate::config::PARSER_STACK`] reserves, could not be started.
+    /// Nothing is parsed on the caller's stack instead: the reservation
+    /// is what keeps a file of unplaceable bytes from aborting the
+    /// process.
+    #[error("cannot start the parser thread: {0}")]
+    ParserThread(#[source] io::Error),
+    /// The parser panicked, and the panic was caught at the thread it
+    /// ran on rather than carried into the caller — a panic here is an
+    /// error to report, not an abort to be misread as one.
+    #[error("the parser panicked: {0}")]
+    ParserPanicked(String),
 }
 
 /// Failures while resolving a profile through its layers.

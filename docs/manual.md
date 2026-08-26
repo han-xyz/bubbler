@@ -2917,19 +2917,26 @@ none of its own.
 - `camera` has never been exercised against a real camera: this machine has
   none, so neither the portal call nor the device binds are more than unit and
   argv tested; see "camera".
-- The `kdl` crate parses `{` by recursing, so a deeply nested profile or
-  `config.kdl` would overflow the stack and abort bubbler with no diagnostic
-  at all. bubbler pre-checks every configuration it reads and refuses one
-  larger than 1 MiB, one holding more than 32 `{` in total, or one holding a
-  `/*` with more than 128 `*` or `/` in the comment after it (the parser
-  recurses on each of those too), naming the file. The check is not a parser:
-  it counts every `{` and measures from every `/*` wherever they stand,
-  strings and comments included, and a `}` gives nothing back, because the
-  parser recovers from a string it cannot read by reading what was written
-  inside it as configuration, and which strings it cannot read is its own
-  affair. Over-counting can only refuse a file the parser would have
-  survived — thirty-three braces in the comments of one file is the cost —
-  and the recursion itself is upstream's (`kdl` 6.7.1).
+- The `kdl` crate parses by recursing, in three places, so a profile or
+  `config.kdl` shaped for any of them would overflow the stack and abort
+  bubbler with no diagnostic at all. Two are driven by bytes bubbler can
+  count: it descends once per `{` and once per `*` or `/` in a block comment,
+  and bubbler pre-checks every configuration it reads and refuses one holding
+  more than 32 `{` in total, or a `/*` with more than 128 `*` or `/` in the
+  comment after it, naming the file. The check is not a parser: it counts
+  every `{` and measures from every `/*` wherever they stand, strings and
+  comments included, and a `}` gives nothing back, because the parser
+  recovers from a string it cannot read by reading what was written inside it
+  as configuration, and which strings it cannot read is its own affair.
+  Over-counting can only refuse a file — thirty-three braces in the comments
+  of one file is the cost. The third recursion no count reaches: the parser
+  recovers from a top-level token it cannot place (`}`, `)`, `=`, …) by
+  consuming one byte and starting over, one stack frame per such byte, so a
+  file of nothing but `}` aborted bubbler from 13 KB. bubbler refuses a
+  configuration over 64 KiB and parses on a thread with 512 MiB of stack
+  reserved (committed only as touched), which holds a frame for every byte of
+  the largest file admitted with more than twice the room to spare. The
+  recursion itself is upstream's (`kdl` 6.7.1).
 - A generated desktop entry closes D-Bus activation for itself only: anything
   that activates the application's bus name directly still starts the host
   copy. See "Desktop entries".
