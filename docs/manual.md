@@ -158,20 +158,26 @@ but no isolated network namespace at all.
 `try` runs one command in a sandbox without creating an instance. Its config is
 the flattened profile (`generic` unless `--profile` says otherwise) plus one
 bare node per `--grant`; the grants are `wayland`, `x11`, `network`, `dri`,
-`pipewire`, `pulseaudio`, `dbus`, `portals`, `notify`, `tray`, `a11y`,
-`input-method`, `gamepad`, `hidraw` and `camera`, and anything with arguments
-needs a real instance — `system-bus` among them, since it is not a grant
-without rules. The bundles are checked as they are in a config file, so
-`--grant tray` without `--grant dbus` is refused rather than silently dropped,
+`compute`, `pipewire`, `pulseaudio`, `dbus`, `portals`, `notify`, `tray`,
+`a11y`, `input-method`, `gamepad`, `hidraw`, `usb`, `smartcard` and `camera`,
+and anything with arguments needs a real instance — `system-bus` among them,
+since it is not a grant without rules. The bundles are checked as they are in
+a config file, so `--grant tray` without `--grant dbus` is refused rather than
+silently dropped,
 and `--grant camera` needs `--grant portals` (and the `--grant dbus` that
-carries it) the same way.
+carries it) the same way, while `--grant compute` needs `--grant dri` and
+stops with ``bad argument for `compute`: requires dri`` without it.
 `--grant x11` needs `--grant wayland --grant dri`, without which the X server
 it starts inside has nothing to draw in or with. A
 grant the profile already made is not repeated, properties and all:
 `--grant gamepad` on a profile carrying `gamepad hidraw=#true` keeps the
 `hidraw` node rather than narrowing it to the bare one, and `--grant camera` on
 a profile carrying `camera nodes=#true` likewise leaves the device half in
-place. The sandbox lives in
+place. `usb` is the one that goes the other way, because its bare node is the
+*wider* form: `--grant usb` is every USB device, so it replaces the
+`vendor=`/`product=` nodes a profile wrote rather than standing beside them —
+a file holding both shapes is refused, and the flag asked for the wider one. A
+filtered `usb` is a line only a config file can carry. The sandbox lives in
 `$XDG_DATA_HOME/bubbler/try/<pid>/`, never appears in `list`, and is removed
 when the command exits whatever its status; `--keep <name>` renames it into an
 instance instead, refusing a name that is taken. Directories left behind by a
@@ -286,6 +292,17 @@ of which is in the argv, and `--dry-run` prints the sandbox's argv alone.
 `--explain --proxy` prints the D-Bus proxy's own argv and `--explain --wl-proxy`
 the Wayland proxy's.
 
+The hardware grants add two lines of their own. `compute`, `smartcard` and a
+bare `usb` each carry a `grants:` line saying what the binds above it reach —
+every AMD GPU through the one `/dev/kfd`, every reader and card `pcscd` has,
+every USB device including one plugged in later — because in each case the
+argument list is short and what it hands over is not. A `usb` node with
+`vendor=` carries `matched:` instead, one line per device it resolved, as
+`1532:0531 at bus 001 device 004` (the product is `*` where the node named a
+vendor alone), or the text of the launch warning where it matched nothing.
+That is the place to check a filter before trusting it: the ids come from the
+walk that built the binds, not from the config line.
+
 Every generated descriptor says what is behind it: the size of the seccomp
 filter and the architectures it carries, the size of a `--ro-bind-data`, which
 pipe an `--info-fd` or `--block-fd` is, and which socket the supervisor is
@@ -369,12 +386,18 @@ file order does not affect the generated argv.
         no-ipv6
     }
     dri                              # GPU: /dev/dri, NVIDIA nodes, the PCI devices' sysfs
+    compute                          # AMD GPU compute: /dev/kfd and the KFD
+                                     #   topology in sysfs; needs `dri` beside it
     pipewire                         # $XDG_RUNTIME_DIR/pipewire-0
     pulseaudio                       # $XDG_RUNTIME_DIR/pulse/native, sets PULSE_SERVER
     gamepad                          # /dev/input, and the sysfs that names it
                                      #   hidraw=#true is the `hidraw` grant,
                                      #   uinput=#true adds /dev/uinput
     hidraw                           # every /dev/hidraw* node, /sys/class/hidraw
+    usb                              # every /dev/bus/usb node, and one plugged
+                                     #   in later; lint warns
+    usb vendor="1532" product="0531" #   only that device, resolved at launch
+    smartcard                        # the pcscd socket; no device node at all
     camera                           # cameras through the portal; binds nothing
     camera nodes=#true               #   also /dev/video*, /dev/media*, /dev/v4l,
                                      #   their sysfs and /run/udev
@@ -457,10 +480,12 @@ is not bound: those are MIG capability files, which nothing outside MIG reads
 `/proc/driver/nvidia` needs no bind, the baseline `--proc` already shows it.
 `dri` sets no environment: `DRI_PRIME`, `__NV_PRIME_RENDER_OFFLOAD`,
 `__GLX_VENDOR_LIBRARY_NAME` and their kind pick a GPU on a hybrid machine,
-which is a profile's `env` decision, not a service's. Compute is one gap:
-`/etc/OpenCL` and `/etc/nvidia` are not in the `/etc` allowlist, so OpenCL
-needs `etc-share "OpenCL"` and the NVIDIA application profiles need
-`etc-share "nvidia"`.
+which is a profile's `env` decision, not a service's. Compute on the AMD
+driver is the `compute` grant below, which needs `dri` beside it for the
+render nodes it opens; what `dri` leaves out either way is the vendor
+configuration, since `/etc/OpenCL` and `/etc/nvidia` are not in the `/etc`
+allowlist, so an OpenCL ICD needs `etc-share "OpenCL"` and the NVIDIA
+application profiles need `etc-share "nvidia"`.
 
 `gamepad` binds `/dev/input` with device access and `/sys/class/input`,
 `/sys/devices` and `/run/udev` (when the host has it) read-only, which is
@@ -1098,6 +1123,206 @@ what those grants cost — or use the portal, which needs none of it.
 developed on has none, so the portal call, the PipeWire fd crossing
 `xdg-dbus-proxy` and the device binds have unit and argv coverage and no frame
 has ever come through. Treat `camera` as untested on real hardware.
+
+### compute
+
+`compute` is GPU compute on the AMD kernel driver. It binds `/dev/kfd` with
+device access and, read-only, `/sys/devices/virtual/kfd`, `/sys/class/kfd` and
+`/sys/devices/system/node`. `/sys/devices/system/cpu` belongs to that set too,
+and `dri` already binds it: one directory is one mount, so the grant that can
+stand alone is the one that emits it, and `compute` skips it whenever `dri` is
+in the same config — which is always, since it requires it.
+
+That requirement is not bookkeeping either. `compute` without `dri` is a parse
+error, ``bad argument for `compute`: requires dri``, because `/dev/kfd` is a
+queue interface and not a device: `libhsakmt` reads the topology to find each
+GPU's render minor and then opens `/dev/dri/renderD<minor>` for the memory it
+maps. Without `dri` the node is a handle onto nothing. The check runs on the
+merged config rather than per layer, so a profile may hold `compute` while the
+layer that includes it is the one granting `dri`.
+
+`/dev/kfd` is **one** node for the whole machine — the ROCm documentation
+calls it the main compute interface, shared by all GPUs — so "compute on this
+GPU" is not something the grant can say: a sandbox holding it reaches every
+AMD GPU the driver has. Which is why the topology comes with it.
+`/sys/devices/virtual/kfd/kfd/topology/nodes/*` is where a runtime reads the
+GPUs and, per node, their memory banks, caches and io-links; `/sys/class/kfd`
+holds the `kfd` symlink into that tree, and is bound after it so the link
+resolves inside. What is bound is the whole `virtual/kfd` directory and not
+the `topology` below it: the class symlink resolves to
+`/sys/devices/virtual/kfd/kfd`, so binding its parent is what makes both that
+path and everything the runtime walks under it exist inside.
+`/sys/devices/system/node` is the host's NUMA topology, which the same code
+reads for the memory nearest each device, and `/sys/devices/system/cpu` — the
+one `dri` carries — for the CPU caches it reports as a topology node of its
+own.
+
+Everything named is required. A host with no `/dev/kfd` (no AMD GPU, or
+`amdgpu` not loaded) fails the launch with ``service `compute` needs
+`/dev/kfd` which does not exist``, a missing topology directory fails the same
+way, and a `/dev/kfd` that is not a character device is ``needs `/dev/kfd` to
+be a character device``. Half a compute grant is a sandbox whose runtime
+enumerates zero devices and says nothing useful about why.
+
+Permissions are not what limits this one. systemd's own
+`50-udev-default.rules` carries `SUBSYSTEM=="kfd", GROUP="render",
+MODE="0666"`, so on a stock host the node is world read-write already and the
+grant, not an ACL, is the whole of the decision. Against `dri` it costs little
+that was not given: a compute job and a render job reach the same GPU through
+the same driver and the same memory, so what one can scrape out of another
+application's buffers, the render nodes already allowed. What it does add is
+reach — every AMD GPU, including one `dri`'s `/dev/dri` nodes were not going
+to be pointed at.
+
+The runtime itself needs nothing further from bubbler on Arch: ROCm installs
+under `/opt/rocm`, which the baseline binds read-only with `/usr`. An OpenCL
+ICD is the exception, since `/etc/OpenCL` is not on the `/etc` allowlist and
+needs an `etc-share "OpenCL"` of its own.
+
+**Never exercised against a real compute runtime.** The machine bubbler is
+developed on has `/dev/kfd` and a topology with two nodes, and the real test
+checks that both are inside a sandbox — no ROCm, HIP or OpenCL runtime is
+installed on it, so no kernel has ever been dispatched through this grant.
+
+### usb
+
+`usb` is raw USB device I/O: the `/dev/bus/usb` nodes a libusb client opens,
+and the sysfs entries it reads a device's descriptors from. It has two shapes,
+and the difference between them is most of the grant.
+
+    usb                                 # every device, and every one plugged in later
+    usb vendor="1532"                   # every device of that vendor, at launch
+    usb vendor="1532" product="0531"    # that one device, at launch
+
+The bare node binds the `/dev/bus/usb` **directory** with device access, plus
+`/sys/bus/usb` and `/sys/devices` read-only. Being a directory, it is live, the
+way `gamepad`'s `/dev/input` is: a device plugged in while the sandbox runs
+has a node inside it. It is also **every** USB device the machine has — the
+raw interface of your keyboard and of your security key among them — which is
+what `bubbler lint` warns about as `usb-all-devices`. Raw transfers are what a
+device is programmed and read through, rather than what its driver chooses to
+offer.
+
+A node with `vendor=`, optionally narrowed by `product=`, binds only the
+devices whose sysfs reports those ids: for each match its
+`/dev/bus/usb/BBB/DDD` node with device access, and that device's own
+`/sys/devices/…` directory read-only. `/sys/bus/usb` is bound whole either
+way, because that directory is what an enumeration walks; the entries in it
+naming devices the grant did not bind are symlinks that dangle inside, which
+is what libusb sees for a device it may not touch. It is bound once however
+many `usb` nodes the config holds.
+
+That list is resolved once, at launch, by reading
+`/sys/bus/usb/devices/*/{idVendor,idProduct,busnum,devnum}` — so a filtered
+grant is **frozen**, the mirror image of the bare node: a matching device
+plugged in later has no node inside until the instance is restarted, and one
+has to be plugged in *before* the run for the filter to find it at all. The
+numbers are parsed as numbers before the `/dev/bus/usb/BBB/DDD` path is built
+from them, and an entry whose sysfs directory resolves outside `/sys/devices`
+is passed over rather than followed.
+
+`vendor` and `product` are exactly four hex digits, in a string, lower-cased
+before they are compared, so `vendor="0BB4"` and `vendor="0bb4"` are one
+grant. A string and not a number: KDL reads `vendor=1050` as an integer, and
+an id like `0407` would lose its leading zero on the way (`0bb4` is not a
+number at all), so a bare number is refused with ``vendor must be a string
+like "0bb4"``. A `product=` with no `vendor=` is
+refused too — ``product needs a vendor: a product id alone matches that number
+from every vendor``. `lsusb` prints the pair the config wants: `ID 1532:0531`
+is `vendor="1532" product="0531"`.
+
+The node is repeatable, and two nodes in one file where either covers the
+other are an error rather than a silent widening: `usb vendor="0bb4"` beside
+`usb vendor="0bb4" product="0c8d"` makes the second line dead, so bubbler says
+so — ``bad argument for `usb`: `usb vendor="0bb4"` and `usb vendor="0bb4"
+product="0c8d"` overlap; keep the wider one``. **Across profile layers the
+same relation is resolved instead of refused**: the wider node replaces the
+narrower ones, whichever layer wrote it, because a merge must never narrow a
+grant a layer asked for and an including layer widening is the normal
+direction. The consequence is worth knowing: a profile that scopes `usb` to
+one device can be widened to every device by a layer that includes it, with no
+finding on the including line — `usb-all-devices` fires on the layer that
+wrote the bare node, which is the file that has to change. `bubbler profile
+show` prints the flattened result, and `--explain` names the line each bind
+came from.
+
+A filter that matches nothing is a warning and not a failure —
+`bubbler: warning: usb: no device matches vendor=ffff product=ffff` — and the
+sandbox starts without the device, since a device you plug in on demand is
+exactly what this grant is usually for. A device that *was* matched and is
+unplugged between the walk and the exec is covered too: matched nodes are
+bound with `--dev-bind-try`. A node missing, or not a character device, when
+the walk probes it still fails the launch, because that is the device the
+config named.
+
+Permissions stay the host's. On Arch a usbfs node is `0664 root:root`
+(`50-udev-default.rules`: `SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device",
+MODE="0664"`), so every local user may read a device's descriptors and none
+may drive one. Write access comes from a udev rule: `70-uaccess.rules` tags
+hardware wallets, PTP/MTP devices and cameras, portable media players, maker
+tools, AV production controllers and protocol analysers with `uaccess`, which
+is an ACL for the seat's user, and vendor rules keyed on
+`ATTR{idVendor}`/`ATTR{idProduct}` add their own — the shape the Arch wiki
+gives for Android's `adb`. bubbler hands over the node;
+who may open it is what those rules already decided. Compare
+`getfacl /dev/bus/usb/*/*` with `id` before granting it.
+
+And the ids are what the **device** says about itself. `idVendor` and
+`idProduct` come out of the device's own descriptor; they are not a
+certificate, and a device that can be reprogrammed — which is much of what
+raw USB access is used for — can report another's pair and land inside a
+filter written for something else. The filter scopes what an honest device
+population exposes. It does not authenticate the thing on the end of the
+cable, and neither does anything else in this path.
+
+The `/sys/devices` bind under the bare node is the whole device tree, with the
+cost `gamepad`'s bind of it has (DMI strings, ACPI, thermal and battery state,
+`/sys/devices/virtual/net/*` and its traffic counters); when both nodes are
+granted the tree is bound once, and it is emitted after every narrower bind —
+`dri`'s PCI roots among them — whatever order the nodes are written in, since
+bwrap takes the binds in the order they are given. A filtered node binds no
+tree at all, only the matched devices' own directories.
+
+Inside a sandbox, `lsusb` (`usbutils`) is the quickest reading of what the
+grant handed over: with a filter, it lists exactly the matched devices.
+
+### smartcard
+
+`smartcard` binds one socket, `/run/pcscd/pcscd.comm`, read-only at the same
+path inside, and nothing else — no device node, no sysfs, no udev, no
+environment. That is the whole grant. PC/SC applications — OpenSC and the
+PKCS#11 modules built on it, GnuPG's `scdaemon` on its PC/SC path, a browser
+loading a security device — speak to the host's `pcscd`, and libpcsclite
+connects to that path on its own, so nothing has to be told where it is. The
+reader is a USB device the daemon holds open on the host; the sandbox never
+sees it, and `usb` and `smartcard` are not substitutes for one another.
+
+The host side is the Arch wiki's: `pcsclite` and `ccid` — the latter being the
+generic driver for CCID readers — with the daemon enabled. The socket itself
+is created by `pcscd.socket`, whose `ListenStream` is that path, so a launch
+that reports ``service `smartcard` needs `/run/pcscd/pcscd.comm` which does
+not exist`` is saying the unit is not started, and nothing about bubbler. A
+path that exists and is not a socket fails with ``needs
+`/run/pcscd/pcscd.comm` to be a socket``, which is the check that stops a
+regular file planted there from being bound in its place.
+
+What it costs is every reader and every card the daemon has, at the level of
+the APDUs a card answers. While a card is unlocked, an application inside can
+ask it to sign or decrypt as you: the card is a key that answers whoever asks,
+and the sandbox becomes one more caller of the same daemon. The PIN that
+unlocks it is typed into the application inside, so this is a grant for a
+profile you would trust with that PIN. What a card refuses without its PIN it
+still refuses — the grant confers no authority over the card that the daemon
+did not already hold — and there is no per-reader or per-card narrowing, since
+the protocol has no place to express one and bubbler invents none. Note too
+that `pcscd.socket` ships `SocketMode=0666`: every process of yours could
+already connect to it, and what the grant decides is only whether this sandbox
+is one of them.
+
+**Never exercised against a real reader.** This machine runs no `pcscd`, so
+the socket bind is covered by argv snapshots and by the launch-time error, and
+the real test skips with a line naming `pcscd.socket`.
+
 ### app-runtime
 
 `app-runtime "<id>" [mode=rw]` shares `$XDG_RUNTIME_DIR/app/<id>` — **the same
@@ -1758,10 +1983,14 @@ No `network` — a database opens without one, and the grant is your password
 manager's process reaching the internet. No `own "org.freedesktop.secrets"`:
 that name makes the sandbox the Secret Service for the whole session, so every
 libsecret client in it would store its secrets there. It is an outward grant
-rather than a confinement. No `hidraw`, which would not help anyway: KeePassXC
-drives a YubiKey through libusb and a smart card through pcsclite, and bubbler
-grants neither. Browser integration is not in the profile either, but it is one
-line away: the header carries the
+rather than a confinement. No `hidraw` either, which would not help anyway:
+KeePassXC drives a YubiKey through libusb and a smart card through pcsclite,
+which are the `usb` and `smartcard` grants and a different device class. Both
+are one line away for a database that wants them — a `usb` node carrying the
+two ids `lsusb` prints for the key, or `smartcard` for a reader — and neither
+is in the profile, because a password manager that opens its database without
+them should not be handed them by default. Browser integration is not in the
+profile either, but it is one line away: the header carries the
 `app-runtime "org.keepassxc.KeePassXC" mode=rw` node and its `lint-allow`, and
 `firefox` and `chromium` carry the matching read-only line, so the socket
 KeePassXC serves is reachable from another instance once both sides name the
@@ -2889,16 +3118,28 @@ none of its own.
   sandboxed application through `/proc` — exec is a convenience channel, not
   a boundary. What the sandbox can still do with the terminal it is given is
   under "Terminal".
-- AMD compute (ROCm/OpenCL via `/dev/kfd`) is not supported yet; it needs its
-  sysfs topology alongside the node.
+- `compute` has never been exercised against a real compute runtime: this
+  machine has `/dev/kfd` and its topology, and no ROCm, HIP or OpenCL runtime
+  installed, so what is proven is that the node and the topology are inside a
+  sandbox and no kernel has ever been dispatched through them. See "compute".
 - `dri` binds the NVIDIA device nodes but not `/etc/OpenCL` or `/etc/nvidia`,
   so compute and vendor application profiles need an `etc-share` of their own.
 - `hidraw` binds the `/dev/hidraw*` nodes that exist at launch and there is no
   directory to bind instead, so a device plugged in later is invisible to
   hidapi until the instance restarts; evdev still sees it.
-- No raw-USB grant (`/dev/bus/usb` and its sysfs) and no pcsclite socket, so a
-  challenge-response YubiKey or a smart card reader cannot be reached from a
-  sandbox; `hidraw` is a different device class and no substitute.
+- A filtered `usb` node is frozen at launch the same way, since it names
+  resolved device nodes rather than the directory the bare form binds; a
+  device has to be plugged in before the run for the filter to find it, and a
+  `usb` filter is only ever as good as the ids a device reports about itself.
+  See "usb".
+- Two overlapping `usb` nodes in one file are refused, but across profile
+  layers the wider one silently replaces the narrower: a layer that includes a
+  profile scoping `usb` to one device can widen it to every device, and the
+  `usb-all-devices` warning then names the layer that wrote the bare node
+  rather than the include that pulled it in.
+- `smartcard` has never been exercised against a real reader or card: no
+  `pcscd` runs on this machine, so the socket bind has argv coverage and the
+  launch-time error, and no APDU has ever crossed it. See "smartcard".
 - `app-runtime` does not carry Discord rich presence: those clients look for
   `discord-ipc-N` at the top of `$XDG_RUNTIME_DIR`, which no sandbox shares.
 - Nothing installs a browser's native messaging manifest into an instance's

@@ -1,8 +1,11 @@
 # Devices
 
-Every device grant is emitted only where the host has the thing; a missing
+Most device grants are emitted only where the host has the thing; a missing
 `/dev/nvidia*` or `/dev/video*` binds nothing rather than failing. The
-exception is `/dev/uinput`, which is an error when missing.
+exceptions are the grants that name exactly one resource — `/dev/uinput` for
+`gamepad uinput=#true`, `/dev/kfd` and its sysfs topology for `compute`, the
+`pcscd` socket for `smartcard`, `/dev/bus/usb` for a bare `usb` — each of
+which is an error when missing, rather than a quietly weaker sandbox.
 
 ## dri — GPU
 
@@ -13,8 +16,30 @@ That is the sysfs of **every** PCI device, not only the GPU.
 NVIDIA: every `/dev/nvidia*` char device and `/sys/module/nvidia*` when
 present (`nvidia-caps` skipped; `/proc/driver/nvidia` comes with `--proc`).
 `dri` sets no environment — `DRI_PRIME`, `__NV_PRIME_RENDER_OFFLOAD` are a
-profile's `env` decision. Compute needs `etc-share "OpenCL"` / `etc-share
-"nvidia"`; AMD ROCm via `/dev/kfd` is not supported yet.
+profile's `env` decision. An OpenCL ICD still needs `etc-share "OpenCL"` and
+NVIDIA application profiles `etc-share "nvidia"`; AMD compute is the `compute`
+grant below.
+
+## compute — AMD GPU compute
+
+```kdl
+dri
+compute
+```
+
+Binds `/dev/kfd` read-write plus, read-only, `/sys/devices/virtual/kfd`,
+`/sys/class/kfd` and `/sys/devices/system/node` (`/sys/devices/system/cpu`
+comes with `dri`). Requires `dri`: `compute` alone is a parse error, because
+the topology hands a runtime a render minor it then opens under `/dev/dri`.
+
+- `/dev/kfd` is **one** node for the whole machine — every AMD GPU, not the
+  card you meant. Permissions do not narrow it either: systemd's
+  `50-udev-default.rules` sets `SUBSYSTEM=="kfd", GROUP="render", MODE="0666"`.
+- Against `dri` it adds little: the same GPU memory through the same driver.
+- Missing `/dev/kfd` or a missing topology directory fails the launch.
+- Nothing else is needed on Arch — ROCm lives in `/opt/rocm`, which the
+  baseline binds read-only. **Never run against a real ROCm/HIP/OpenCL
+  runtime**; this machine has none installed.
 
 ## pipewire, pulseaudio — audio
 
@@ -59,6 +84,50 @@ FIDO keys, hardware wallets, 3D mice, SDL's hidapi controllers. Unlike
 - It is every HID device; `uaccess` gives you an ACL on security tokens and
   wallets, so a sandbox with `hidraw` can talk to your FIDO key. Check
   `getfacl /dev/hidraw*`.
+
+## usb
+
+```kdl
+usb                                // every device; lint warns (usb-all-devices)
+usb vendor="1532"                  // every device of that vendor
+usb vendor="1532" product="0531"   // that device
+```
+
+Bare: `/dev/bus/usb` read-write (the **directory**, so hotplug works) plus
+`/sys/bus/usb` and `/sys/devices` read-only. Filtered: `/sys/bus/usb`, and per
+matching device its `/dev/bus/usb/BBB/DDD` node and its own `/sys/devices/…`
+directory.
+
+- The bare node is every USB device, raw — your keyboard's interface and your
+  security key's included. That is what `usb-all-devices` warns about.
+- A filter is **frozen at launch**: matched from
+  `/sys/bus/usb/devices/*/{idVendor,idProduct,busnum,devnum}` once, so plug
+  the device in first. No match is a printed warning, not a failure.
+- Ids are four hex digits in a string (`vendor="0BB4"` is lower-cased);
+  `product=` without `vendor=` is refused. `lsusb` prints the pair.
+- Two overlapping nodes in one file are an error; **across profile layers the
+  wider node silently wins**, so an including layer can widen a scoped grant.
+- The ids are what the device claims about itself — a filter is not
+  authentication.
+- Permissions stay the host's: a usbfs node is `0664 root:root`
+  (`50-udev-default.rules`), and write access comes from `uaccess` tags or a
+  vendor's `ATTR{idVendor}` rule. Check `getfacl /dev/bus/usb/*/*`.
+- `--explain` prints a `matched:` line per resolved device; `lsusb` inside is
+  the check that it is what you meant (`usbutils`).
+
+## smartcard
+
+Binds one socket, `/run/pcscd/pcscd.comm`, read-only at the same path. No
+device node, no sysfs, no environment: libpcsclite finds that path itself.
+
+- Host side: `pcsclite` + `ccid`, with `pcscd.socket` started — its
+  `ListenStream` is that path. A stopped daemon fails the launch naming it.
+- Costs every reader and card the daemon has, at APDU level: while a card is
+  unlocked the sandbox can have it sign or decrypt as you, and the PIN is
+  typed into the application inside. No per-reader narrowing exists.
+- The socket ships `SocketMode=0666`, so the grant decides only whether this
+  sandbox is one of the local processes that could already connect.
+- **Never exercised against a real reader** — no `pcscd` on this machine.
 
 ## camera
 

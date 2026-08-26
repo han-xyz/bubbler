@@ -7,11 +7,11 @@ namespace work.
 
 Each application runs in an **instance**: a private home plus a short
 `config.kdl` listing exactly what it is granted — a Wayland socket, the GPU,
-a directory of yours, a filtered D-Bus, a network namespace of its own. Nothing
-is granted by default. Profiles seed that file for 14 applications and compose
-with `include`; `bubbler lint` says where a config gives away more than it
-means to, and `--dry-run --explain` puts every bwrap argument under the node
-that produced it.
+one USB device, a directory of yours, a filtered D-Bus, a network namespace of
+its own. Nothing is granted by default. Profiles seed that file for 14
+applications and compose with `include`; `bubbler lint` says where a config
+gives away more than it means to, and `--dry-run --explain` puts every bwrap
+argument under the node that produced it.
 
 **Documentation:** the [wiki](docs/wiki/Home.md) is the short form, one page per
 topic; [`docs/manual.md`](docs/manual.md) is the long form with every
@@ -107,6 +107,8 @@ every sandboxed `wayland`, which is not optional — a run stops without it;
 `xdg-dbus-proxy` for `dbus`/`system-bus`;
 `passt` (pasta) for an isolated `network`; `nftables` for `outbound "deny"`;
 `xdg-desktop-portal` with a backend for `portals` and `camera`;
+`pcsclite` with `ccid` for `smartcard`, whose whole grant is that daemon's
+socket;
 `xorg-xwayland` for the X server a bare `x11` runs inside the sandbox;
 `at-spi2-core` for `a11y`, and fcitx5 or IBus running for `input-method` to
 reach anything.
@@ -119,7 +121,10 @@ against your other processes, and `x11 "host"` is no boundary at all (a bare
 `x11` runs an X server of the sandbox's own instead). Grants are as wide as
 their names suggest and sometimes wider (`gamepad` is every input device your
 user can open; `pulseaudio` and `pipewire` are each the microphone as well as
-playback, with no portal in front); the wiki's
+playback, with no portal in front; a bare `usb` is raw I/O to every USB device
+including one plugged in later, and `bubbler lint` says so; `compute` is every
+AMD GPU through the one `/dev/kfd`; `smartcard` is every card `pcscd` has, at
+the level of the APDUs it answers); the wiki's
 [Devices](docs/wiki/Devices.md) and [Security](docs/wiki/Security.md) pages and
 the threat model say exactly how wide. Known gaps are listed under
 [Security](docs/wiki/Security.md#known-gaps).

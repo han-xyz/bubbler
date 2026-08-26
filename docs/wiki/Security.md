@@ -243,6 +243,38 @@ of it. The daemons' own names are not granted: fcitx5's carries `Exit`,
 or stop the input method for every application in the session. On Wayland the
 compositor's own text-input path needs no grant at all.
 
+## Hardware grants
+
+Three grants hand over hardware the display and audio grants do not reach.
+Each is as wide as its resource, and the resource is not narrowed by the
+permissions on it in the way `gamepad` and `hidraw` are.
+
+`compute` binds `/dev/kfd` read-write with the KFD and NUMA topology in
+`/sys`. One node serves **every** AMD GPU on the machine, and systemd's
+`50-udev-default.rules` already gives it `MODE="0666"`, so the grant and not
+an ACL is the whole decision. It requires `dri`, and against `dri` it costs
+little more: the same GPU, the same driver, the same memory another
+application left on the card.
+
+`usb` bare binds the `/dev/bus/usb` directory read-write: raw I/O to every USB
+device, hotplug included, which is what `bubbler lint` warns about as
+`usb-all-devices`. `usb vendor="…" [product="…"]` binds only the matching
+nodes, resolved once at launch. Two limits are worth stating plainly: the ids
+are what the device says about itself, so a filter scopes an honest device
+population and authenticates nothing; and while two overlapping nodes in one
+file are refused, across profile layers the wider node silently replaces the
+narrower, so an including layer can widen a scoped grant. Who may open a node
+stays the host's decision — usbfs is `0664 root:root` until a `uaccess` tag or
+a vendor rule says otherwise.
+
+`smartcard` binds the `pcscd` socket and no device at all. It is every reader
+and card the daemon has, at the level of the APDUs a card answers: while a
+card is unlocked the sandbox can have it sign or decrypt as you, and the PIN
+that unlocks it is typed into the application inside. What a card refuses
+without its PIN it still refuses, and there is no per-reader narrowing.
+
+Detail per grant: [Devices](Devices.md).
+
 ## Seccomp
 
 Every sandbox (instances, `try`, the proxy) loads a denylist compiled with
@@ -303,11 +335,13 @@ host).
   on the host.
 - `input-method` has never been exercised against a running fcitx5 or IBus:
   neither is installed on this machine.
-- AMD compute (`/dev/kfd` + sysfs topology) unsupported; NVIDIA compute needs
-  `etc-share "OpenCL"`/`"nvidia"`.
-- `hidraw` and `camera nodes=#true` device lists are frozen at launch.
-- No raw USB grant, no pcsclite socket: challenge-response YubiKey and smart
-  cards unreachable.
+- `compute` never run against a real ROCm/HIP/OpenCL runtime (none installed
+  here); NVIDIA compute still needs `etc-share "OpenCL"`/`"nvidia"`.
+- `hidraw`, `camera nodes=#true` and a filtered `usb` device list are frozen
+  at launch.
+- A `usb` filter trusts the ids a device reports, and a profile layer can
+  widen a scoped `usb` node without a finding on its own line.
+- `smartcard` never exercised against a real reader: no `pcscd` here.
 - `app-runtime` does not carry Discord rich presence.
 - KeePassXC native messaging manifest must be placed by hand.
 - `camera` never exercised on real hardware.

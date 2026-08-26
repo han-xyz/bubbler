@@ -40,10 +40,13 @@ bubbler man [--config]                  bubbler(1) / bubbler-config(5) as roff o
 - `SIGINT`/`SIGTERM` to bubbler are forwarded once as `SIGTERM` to the
   supervisor inside, which gives the command five seconds before `SIGKILL`.
   bubbler returns the command's exit status.
-- `try` grants are bare nodes only: `wayland x11 network dri pipewire pulseaudio
-  dbus portals notify tray a11y input-method gamepad hidraw camera`. Bundles are
-  checked as in a file (`--grant tray` needs `--grant dbus`, `--grant x11` needs
-  `--grant wayland --grant dri` for the X server it starts inside).
+- `try` grants are bare nodes only: `wayland x11 network dri compute pipewire
+  pulseaudio dbus portals notify tray a11y input-method gamepad hidraw usb
+  smartcard camera`. Bundles are checked as in a file (`--grant tray` needs
+  `--grant dbus`, `--grant compute` needs `--grant dri`, `--grant x11` needs
+  `--grant wayland --grant dri` for the X server it starts inside). `--grant
+  usb` is the bare node — every USB device — and replaces any `vendor=` filter
+  the profile wrote; a filtered `usb` needs a config file.
 - `run`, `try` and `open` hand host files named after the program to the
   sandbox through the document portal when `portals` is granted, and print a
   warning naming the gap when they cannot; `exec` does not. See

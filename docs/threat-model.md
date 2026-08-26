@@ -713,6 +713,116 @@ nothing in this tree. `network "host"` gives all of it back on purpose.
 `real_pasta_hides_the_host_loopback_that_network_host_still_reaches`,
 `a_loopback_resolver_is_refused_only_where_it_would_be_the_sandbox`
 
+### GPU compute
+
+**Defends:** nothing that `dri` did not already defend. `compute` is
+refused without `dri` — a config holding it alone does not parse — so it
+never stands as a grant of its own, and against `dri` it reaches the same
+GPUs through the same driver and the same memory. Every path it binds is
+required to exist and to be of the right type before the launch: a
+missing `/dev/kfd`, a missing topology directory or a `/dev/kfd` that is
+not a character device stops the run rather than producing a sandbox
+whose runtime silently enumerates nothing.
+
+**Does not defend:** which GPU. `/dev/kfd` is one node for the whole
+machine, so a sandbox holding the grant reaches every AMD GPU on it, and
+GPU memory is not zeroed between users — what another application left on
+the card is what a compute job can read, which is the cost `dri` already
+carried. Nor do node permissions narrow it: systemd's own
+`50-udev-default.rules` sets `SUBSYSTEM=="kfd", GROUP="render",
+MODE="0666"`, so on a stock host every process of yours can already open
+the node and the grant is the whole of the decision. The bind is
+read-write because bwrap has no read-only device bind.
+
+[compute](manual.md#compute) ·
+`compute_binds_the_kfd_node_and_the_topology_that_names_the_gpus`,
+`compute_without_the_kfd_node_fails_the_launch`,
+`compute_without_the_topology_fails_rather_than_running_blind`,
+`compute_leaves_the_cpu_topology_to_dri_where_both_are_granted`,
+`compute_is_a_flag_node_that_needs_the_gpu_grant_beside_it`,
+`compute_is_granted_when_an_included_layer_is_the_one_with_the_gpu`,
+`real_compute_binds_kfd`, `compute_without_dri_is_refused`
+
+### USB devices
+
+**Defends:** a `usb` node carrying `vendor=` binds only the device nodes
+whose sysfs reports those ids — not the `/dev/bus/usb` directory — so the
+rest of the bus is absent inside, and the `/sys/bus/usb` links naming
+those devices dangle rather than resolve. Nothing read out of sysfs is
+pasted into a path: `busnum` and `devnum` are parsed as numbers before
+`/dev/bus/usb/BBB/DDD` is built from them, an entry whose canonical path
+falls outside `/sys/devices` is passed over rather than bound, and an
+entry whose attributes are not what the kernel writes is skipped. Ids are
+four hex digits, normalised, so a filter cannot be widened by case or
+whitespace. Two overlapping nodes in one file are refused, which keeps a
+config's filters disjoint and means no device node is bound twice. The
+bare form is a lint warning (`usb-all-devices`), not a silent default.
+
+**Does not defend:** three things, deliberately.
+
+The ids are the device's own claim. `idVendor` and `idProduct` come out
+of a descriptor the device writes; a device that can be reprogrammed —
+which is much of what raw USB access is used for — can report another
+device's pair and fall inside a filter written for something else. The
+filter scopes an honest device population; it authenticates nothing.
+
+The bare node is every USB device the host has, raw, and it is live: the
+directory is bound, so a device plugged in while the sandbox runs is
+reachable inside it. That is the grant, and the lint says so.
+
+And **a profile layer can widen it**. Two overlapping `usb` nodes in one
+file are an error, but across layers the wider node replaces the narrower
+one, whichever layer wrote it — a merge must never narrow a grant a layer
+asked for. So a profile that scopes `usb` to one device can be widened to
+every device by a layer that includes it, with no finding on the
+including line; `usb-all-devices` fires on the layer that wrote the bare
+node. `bubbler profile show` and `--explain`'s `matched:` lines are what
+show the merged result.
+
+Who may *open* a bound node is the host's decision throughout: usbfs is
+`0664 root:root` until a `uaccess` tag or a vendor's udev rule says
+otherwise. bubbler grants the node, not the permission.
+
+[usb](manual.md#usb) ·
+`usb_filters_by_four_hex_digit_ids_and_is_repeatable`,
+`usb_with_both_ids_binds_the_one_node_that_reports_them`,
+`usb_with_a_vendor_alone_binds_every_device_of_that_vendor_in_order`,
+`usb_passes_over_an_entry_that_resolves_outside_the_device_tree`,
+`usb_passes_over_an_entry_whose_attributes_are_not_what_sysfs_writes`,
+`usb_needs_the_node_the_ids_pointed_at_to_be_a_device`,
+`usb_that_matches_no_device_warns_rather_than_failing`,
+`usb_filters_from_two_layers_add_up_and_a_bare_node_swallows_them`,
+`a_bare_usb_grant_replaces_the_filters_a_profile_wrote`,
+`usb_warns_about_every_device_and_not_about_a_filtered_node`,
+`real_usb_lists_devices_inside`,
+`real_usb_filter_binds_only_the_named_device`,
+`usb_without_a_match_warns_and_runs`
+
+### Smart cards
+
+**Defends:** the grant binds one socket and nothing else — no device
+node, no sysfs, no udev, no environment — so the reader itself stays with
+`pcscd` on the host. The path must be a socket: a regular file or a
+directory planted at `/run/pcscd/pcscd.comm` fails the launch rather than
+being bound in its place, and a missing one fails naming the path. What a
+card refuses without its PIN it still refuses; the sandbox becomes a
+caller of the daemon, not an owner of the card.
+
+**Does not defend:** the card, once it is unlocked. This is every reader
+and every card the daemon has, at the level of the APDUs a card answers,
+so an application inside can ask an unlocked card to sign or decrypt as
+you — and the PIN that unlocks it is typed into that application. There
+is no per-reader or per-card narrowing: the protocol has no place to
+express one and bubbler invents none. The socket is not a boundary bubbler
+raises either: `pcscd.socket` ships `SocketMode=0666`, so every process of
+yours could already connect to it, and the grant decides only whether this
+sandbox is one of them.
+
+[smartcard](manual.md#smartcard) ·
+`smartcard_binds_the_daemon_socket_and_no_device`,
+`smartcard_without_a_running_daemon_fails_the_launch`,
+`smartcard_is_a_flag_node`, `real_smartcard_socket_is_bound`
+
 ### The terminal
 
 **Defends:** your terminal does not enter the sandbox. Each of bubbler's
@@ -988,13 +1098,22 @@ not run. The real-sandbox tests are guarded by runtime probes rather than
 `require_userns()` creates a user namespace, `require_bwrap()` builds an
 actual sandbox with `bwrap --unshare-all --ro-bind / / --proc /proc --dev
 /dev`, and `require_pasta()` attaches a real pasta to a namespace it made
-for the purpose. Looking for `/proc/self/ns/user` would have been
-dishonest: that path exists in every container, including those whose
-policy refuses the syscall behind it, and the guarded tests would fail
-there instead of skipping. Each reason is written to descriptor 2
-directly rather than with `eprintln!`, so it survives the capture libtest
-installs and an ordinary `cargo test` shows what it did not cover. A host
-that cannot sandbox is proved to skip rather than fail by
+for the purpose. The hardware grants are probed the same way and for the
+same reason: `require_kfd()` checks that `/dev/kfd` is a character
+device, `require_usb_device()` that some `/sys/bus/usb/devices/*/idVendor`
+can be read *and* that `lsusb` is installed (a host without it has none
+inside either, since `/usr` is bound from the host), and
+`require_pcscd()` that `/run/pcscd/pcscd.comm` is a socket, naming
+`pcscd.socket` in the line it prints when it is not — which is what this
+machine prints, so the `smartcard` claims above rest on argv snapshots
+and the launch-time error rather than on a card. Looking for
+`/proc/self/ns/user` would have been dishonest: that path exists in
+every container, including those whose policy refuses the syscall behind
+it, and the guarded tests would fail there instead of skipping. Each
+reason is written to descriptor 2 directly rather than with `eprintln!`,
+so it survives the capture libtest installs and an ordinary `cargo test`
+shows what it did not cover. A host that cannot sandbox is proved to skip
+rather than fail by
 `a_host_without_a_working_bwrap_skips_the_guarded_tests_rather_than_failing_them`,
 which runs one of those tests again — with no `--nocapture` — under a
 `PATH` carrying a `bwrap` that exits 1, and then under one with no

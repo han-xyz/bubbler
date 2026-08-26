@@ -18,10 +18,14 @@ x11 "host"                       // session X socket + cookie; lint warns
 network                          // own namespace via pasta; see Network
 network "host"                   // host's namespace
 dri                              // GPU: /dev/dri, NVIDIA nodes, PCI sysfs
+compute                          // AMD GPU compute: /dev/kfd + KFD sysfs; needs dri
 pipewire                         // $XDG_RUNTIME_DIR/pipewire-0 (playback AND capture)
 pulseaudio                       // pulse/native, sets PULSE_SERVER
 gamepad                          // /dev/input rw + sysfs; hidraw=#true uinput=#true
 hidraw                           // every /dev/hidraw* node
+usb                              // every /dev/bus/usb node, hotplug too; lint warns
+usb vendor="1532" product="0531" // only that device, resolved at launch
+smartcard                        // the pcscd socket; no device node
 camera                           // via portal; nodes=#true also binds /dev/video*
 home-share "Downloads"           // ~/Downloads at /home/bubbler/Downloads, ro
 home-share "Projects/x" mode=rw
@@ -56,9 +60,12 @@ command "firefox"
 | `network` | own namespace, internet via pasta | LAN/mDNS and host loopback unreachable; see [Network](Network.md) |
 | `network "host"` | host's network stack | host loopback services and abstract sockets exposed |
 | `dri` | `/dev/dri` rw, NVIDIA nodes, `/sys/devices/pci*`, `/sys/class/drm` | sysfs of **every** PCI device |
+| `compute` | `/dev/kfd` rw, the KFD and NUMA topology in `/sys` | needs `dri`; one node for **every** AMD GPU, and it is `0666` on a stock host |
 | `pipewire`, `pulseaudio` | session audio socket | microphone too, no portal |
 | `gamepad` | `/dev/input` rw, `/sys/devices`, `/run/udev` | every input node your user can open; keyboard if a group lets you |
 | `hidraw` | every `/dev/hidraw*` at launch | security keys, wallets; list frozen at launch |
+| `usb` | bare: `/dev/bus/usb` rw + `/sys/devices`; `vendor=`/`product=`: only the matching nodes | bare is every device and lint warns; a filter is frozen at launch, and the ids are the device's own claim |
+| `smartcard` | the `pcscd` socket | every reader and card, at APDU level; the PIN is typed inside |
 | `camera` | portal camera; `nodes=#true` adds `/dev/video*` | needs `portals`; untested on real hardware |
 | `home-share` | a path under `$HOME` | one path once; symlinks out of home refused |
 | `path-share` | an absolute path outside home | system roots, instance store and profile dir refused |

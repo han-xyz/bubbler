@@ -41,6 +41,9 @@ own variable (`$BUBBLER_INIT`, `$BUBBLER_WL_PROXY`), then beside the running
 | `xorg-twm`, `openbox`, `jwm` or `icewm` | `x11 wm=` — any window manager on the sandbox's PATH; bubbler ships none |
 | `at-spi2-core` | `a11y` — it is the accessibility bus, and the registry on it |
 | `fcitx5` or `ibus` | `input-method`, optional: without a daemon the grant reaches nothing |
+| `pcsclite` + `ccid` | `smartcard` — the daemon whose socket is the whole grant; `pcscd.socket` must be started or the launch fails naming the path |
+| `usbutils` | `usb`, optional: `lsusb` on the host prints the `vendor=`/`product=` ids a filter is written from, and inside a sandbox it is the reading of what the grant handed over |
+| `rocm-hip-runtime` / `rocm-opencl-runtime` | `compute`, optional: the grant binds `/dev/kfd` and its topology either way, but without a runtime there is nothing to dispatch. ROCm lives under `/opt/rocm`, which the baseline already binds read-only; an OpenCL ICD also wants `etc-share "OpenCL"` |
 
 Also a kernel with unprivileged user namespaces.
 
