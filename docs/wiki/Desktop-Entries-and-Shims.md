@@ -48,8 +48,10 @@ no backups: deleting bubbler's entry brings the application's back.
 
 **Limits:**
 
-- `%f`/`%F` expand to host paths the sandbox cannot see; only files under a
-  `home-share`/`path-share` resolve. `%u` is better where offered.
+- `%f`/`%F`/`%u`/`%U` expand to host paths, which `bubbler open` hands to the
+  sandbox through the document portal (needs `portals`); a file already under a
+  `home-share`/`path-share` is passed under the name it has inside. See
+  [Sharing Files](Sharing-Files.md#file-arguments).
 - Two URLs at once may race two `bubbler open`s to start the instance.
 - `DBusActivatable=false` only closes activation for this entry; anything
   activating the app's bus name directly still starts the host copy.

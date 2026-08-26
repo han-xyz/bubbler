@@ -48,11 +48,19 @@ The instance's own view of the document portal, host
 `/run/user/<uid>/doc/<id>/<name>`, and the portal's own per-document
 permissions decide whether it is writable. Only that subtree is bound, never
 the mount root. Without xdg-document-portal running the launch warns
-(`no document portal at …`) and files picked in a dialog stay unreachable.
+(`no document portal at …`) and files picked in a dialog, or named on the
+command line, stay unreachable.
 Files under a `home-share`/`path-share` work either way.
 
-Known gap: a desktop entry's `%f`/`%F` arguments are host paths; they are
-not registered with the document portal, so they are unreachable inside.
+That view is also where a host file named on the command line lands. `run`,
+`try` and `open` register a trailing argument that is an absolute path or a
+`file://` URI to an existing regular file with
+`org.freedesktop.portal.Documents.AddFull` (`read`, plus `write` where you can
+write the file; `reuse_existing`, never `persistent`) and hand the application
+the document path instead — which is what makes a desktop entry's `%u`/`%f` and
+an "open with" from a file manager reach the sandbox. Without `portals` the
+argument stays as it was and a warning says so. Details and the refusal rules:
+[Sharing Files](Sharing-Files.md#file-arguments).
 
 ## System bus
 

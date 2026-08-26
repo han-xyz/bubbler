@@ -19,7 +19,7 @@ bubbler desktop ff                    # add a menu entry that starts it
 | [Commands](Commands.md) | Every subcommand, one line each |
 | [Configuration](Configuration.md) | `config.kdl`: every node and what it grants |
 | [Profiles](Profiles.md) | The 14 built-in profiles, layers, `include`, your own |
-| [Sharing Files](Sharing-Files.md) | `home-share`, `path-share`, `etc-share`, `app-runtime` |
+| [Sharing Files](Sharing-Files.md) | File arguments through the document portal; `home-share`, `path-share`, `etc-share`, `app-runtime` |
 | [Devices](Devices.md) | GPU, audio, gamepad, hidraw, camera |
 | [Network](Network.md) | Isolated namespace via pasta, inbound ports, outbound filtering |
 | [D-Bus](D-Bus.md) | Session, system and accessibility bus through `xdg-dbus-proxy`, portals, tray, input methods |

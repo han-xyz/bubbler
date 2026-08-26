@@ -12,7 +12,8 @@ does the namespace work.
 Status: milestone 10 — a library of 14 profiles (`alacritty`, `chromium`,
 `code`, `firefox`, `generic`, `keepassxc`, `kitty`, `libreoffice`, `lutris`,
 `mpv`, `spotify`, `steam`, `thunderbird`, `vesktop`) over GPU, sound, a private
-home, host paths through `path-share`, a runtime directory shared between
+home, host paths through `path-share`, host files named on the command line
+through the document portal, a runtime directory shared between
 sandboxes through `app-runtime`, game controllers through `gamepad`, a camera
 through the portal, a filtered session, system and accessibility bus with
 portals, notifications, `tray` and input methods, a terminal of their own, a
@@ -92,7 +93,10 @@ convenience channel, not a boundary.
 
 `open` is what a menu entry or a shim calls: it execs into the instance when
 it is running and starts it when it is not, so a URL opens in the window that
-is already there. A terminal on any of its three standard descriptors is
+is already there. A trailing argument naming a host file is handed to the
+sandbox through the document portal first, which is what makes "open with" from
+a file manager reach the application — `run` and `try` do the same, and
+"File arguments" is the whole of it. A terminal on any of its three standard descriptors is
 somebody watching, and the sandbox gets the terminal its `tty` node asks for;
 with none on any of them, which is how a launcher starts its children, it
 takes `tty "none"` (see "Terminal") and writes bubbler's own stderr — its warnings, a sidecar's
@@ -322,6 +326,12 @@ byte-exact, one-element-per-line form. `--format json` elides nothing; an
 argument that is not UTF-8 is written there with the replacement character,
 since JSON has no byte strings.
 
+A command line carrying host file arguments prints a `forward:` or `visible:`
+line for each of them, on **stderr** and not in the listing: stdout stays the
+byte-exact argv of a dry run, or parsable JSON. Neither mode calls the portal,
+so the document id in a `forward:` line is a literal `<id>`. See "File
+arguments".
+
 `--explain` attributes, it does not justify: "why is `/etc/ssl` in there" is
 answered with "the baseline", and why the baseline holds it is this README's
 job.
@@ -384,7 +394,8 @@ file order does not affect the generated argv.
     system-bus {                     # system bus through the same proxy
         talk "org.freedesktop.UPower"
     }
-    portals                          # XDG portal rules plus /.flatpak-info
+    portals                          # XDG portal rules, /.flatpak-info, and the
+                                     #   document view file arguments land in
     notify                           # talk to org.freedesktop.Notifications
     tray                             # talk to org.kde.StatusNotifierWatcher
     mpris name="firefox.*"           # own org.mpris.MediaPlayer2.firefox.*
@@ -1459,6 +1470,129 @@ under the otherwise denied `/tmp`. It adds a root rather than switching the
 denylist off, and it cannot lift the ones your environment names: your home,
 `$XDG_RUNTIME_DIR`, the instance directory and the profile layer stay refused.
 
+## File arguments
+
+`run`, `try` and `open` read the arguments after the program looking for host
+files, and hand each one they find to the sandbox through the document portal.
+The program itself is never one of them: it is a path *inside* the sandbox, and
+replacing it would swap the binary that runs.
+
+An argument is a candidate when it is an absolute path, or a `file://` URI —
+percent-decoded, with an empty or `localhost` authority, the two RFC 8089 gives
+that meaning — naming a regular file that exists on the host. With `portals`
+granted, bubbler opens each one `O_PATH` and calls
+`org.freedesktop.portal.Documents.AddFull` on the session bus; the file then
+appears inside at `$XDG_RUNTIME_DIR/doc/<id>/<name>`, which is the by-app view
+`portals` already binds there, and the command is given that path instead:
+
+    $ printf hi > /tmp/fwd-demo.txt
+    $ bubbler try --grant dbus --grant portals -- \
+          /usr/bin/sh -c 'echo "$1"; cat "$1"' _ /tmp/fwd-demo.txt
+    /run/user/1000/doc/EorCLxJVSCrs7aKkv5AvCw/fwd-demo.txt
+    hi
+
+`O_PATH` names a file without opening it for reading or writing, so bubbler
+never holds a handle to your document; the portal `fstat`s the descriptor and
+reads the name off `/proc/self/fd`, which is why the name inside is the one at
+the end of any symlink rather than the one you typed. The type is checked a
+second time on that descriptor, so a path that became a directory between the
+plan and the open cannot pass as a file.
+
+The permissions asked for are `read`, plus `write` where you could write the
+file yourself (`access(W_OK)`). Never `delete` and never `grant-permissions`:
+an application handed one file has no business removing it or passing it on.
+`--dry-run` and `--explain` print which of the two a run would ask for, with a
+literal `<id>` — the real one exists only once the portal has been called, and
+neither of those calls it:
+
+    $ bubbler run ff --dry-run -- /usr/bin/cat /tmp/fwd-ro.txt
+    forward: /tmp/fwd-ro.txt → $XDG_RUNTIME_DIR/doc/<id>/fwd-ro.txt (read)
+
+Registrations are session-only. The call sets `reuse_existing`, so a file
+handed to the same instance twice keeps the id it already has instead of
+collecting one per open, and it does not set `persistent`: opening a file in a
+sandbox writes nothing lasting into the portal's document database.
+
+**A file the sandbox can already reach is not registered.** Where it is bound
+at the same path — a `path-share` source, an `etc-share` entry, one of the
+`/etc` entries the baseline allowlist binds, `/usr`, `/opt` — the argument is
+already right and is left alone without a word. Where it is bound under another
+name — a `home-share` source, which puts `$HOME/<path>` at
+`/home/bubbler/<path>`, and the instance's own home, which *is* `/home/bubbler`
+— the argument is rewritten to the path inside and a `visible:` line says so.
+That rewrite needs no portal and no grant, so it applies under `--dry-run` and
+without `portals` as well:
+
+    $ bubbler run ff --dry-run -- /usr/bin/cat ~/Documents/paper.pdf
+    visible: /home/han/Documents/paper.pdf → /home/bubbler/Documents/paper.pdf
+
+Every rule here is applied to the file the path ends at rather than to the
+name. A symlink argument means the file it points at — that is what handing
+over the link meant — and an explanation names both:
+
+    $ bubbler run ff --dry-run -- /usr/bin/cat /tmp/fwd-link.txt
+    forward: /tmp/fwd-link.txt (→ /tmp/fwd-demo.txt) → $XDG_RUNTIME_DIR/doc/<id>/fwd-demo.txt (write)
+
+A share whose own source is a symlink is a second root for the same reason: a
+bind resolves its source but mounts it at the path the config wrote, so a file
+named through the real path of a shared tree is renamed to the path the bind
+puts it at instead of being passed through under a name the sandbox does not
+have.
+
+With `portals` granted, four kinds of argument name a path bubbler will not
+forward. Each is one warning, and each leaves the argument exactly as it was:
+
+    bubbler: warning: /tmp is a directory; grant path-share or home-share to expose it
+    bubbler: warning: /run/user/1000/bus is not a regular file, not forwarded
+    bubbler: warning: /proc/self/environ is under /proc, /sys or /dev, not forwarded
+    bubbler: warning: /tmp/../tmp/fwd-demo.txt contains `..`, not forwarded
+
+A directory is what `path-share` and `home-share` are for; the portal can
+export one, but a whole tree handed over on the strength of an "open with" is
+not what was asked for. `/proc`, `/sys` and `/dev` are kernel interfaces rather
+than documents and the sandbox has its own of each: they are refused by the
+path *and* by what it resolves to, and again on the opened descriptor, whose
+filesystem is checked as well as its name — a bind mount of procfs or sysfs
+answers to a path no prefix test would catch. A `..` is refused rather than
+folded, the same way a share path is: what it resolves to depends on the
+symlinks along the way, and a path that says one file and opens another is not
+one to hand over.
+
+Everything else is untouched and silent: relative paths, flags, bare words,
+`https://` and every other scheme, and a `file://` URI whose authority is
+neither empty nor `localhost`. Those are the command's own business.
+
+Without `portals` nothing is registered, and each candidate says so once:
+
+    bubbler: warning: /tmp/fwd-demo.txt is not visible inside; grant portals to forward files
+
+**Every failure is soft.** No session bus, no document portal, a portal that
+refuses the call, a file that could not be opened: the argument is passed on as
+it was and a warning names the gap — the D-Bus error name and message where the
+portal sent one. A launch is never stopped by a file it could not hand over.
+
+`AddFull` takes one permission set for all of its descriptors, so the files are
+grouped by permission and one call is made per group: a refusal costs the files
+in that call and no others.
+
+`--dry-run` and `--explain` call nothing and register nothing. Their `forward:`
+and `visible:` lines go to **stderr**, because stdout is the record — the
+byte-exact argv of a dry run, or the JSON of `--explain --format json`.
+
+`bubbler exec` deliberately does not forward. It runs a command inside a
+sandbox that is already up, which is a command line you typed rather than a
+file a desktop handed over, and the exec channel is a convenience channel
+rather than a place to widen a running sandbox from. `run` into a running
+instance does forward, since the rewrite happens before the exec channel is
+reached, and so does `open`, which is the same gesture.
+
+This is what makes "open with" work. `bubbler desktop` copies the application's
+own entry and leaves its field codes where the application put them, at the
+end, which is where `bubbler open` collects its arguments; a `bubbler wrap`
+shim passes its own arguments to `bubbler open` the same way. The host path a
+launcher expands `%u` or `%f` to therefore arrives as a trailing argument of
+`open` and is forwarded like any other.
+
 ## Profiles
 
 A profile seeds a new instance's `config.kdl`. It is the same KDL as an
@@ -1809,11 +1943,13 @@ already handle.
 
 Three limits worth knowing before clicking:
 
-- **`%f` and `%F` hand over host paths the sandbox cannot see.** They expand
-  to `/home/you/…`, and the sandbox's home is `/home/bubbler` with the host's
-  never bound; the specification even allows a temporary copy under `/tmp`.
-  Only files under a `home-share` or `path-share` resolve. `%u` needs no
-  mount and is better where the application offers it.
+- **`%f` and `%F` expand to host paths, which `open` forwards.** The path a
+  launcher substitutes is a `/home/you/…` the sandbox has no mount for, so
+  `bubbler open` hands the file to the document portal and gives the
+  application the `$XDG_RUNTIME_DIR/doc/<id>/<name>` path instead; a file
+  already under a `home-share` or `path-share` is passed under the name it has
+  inside. That needs `portals`, and without it the file stays out of reach
+  with a warning saying so. See "File arguments".
 - **Two URLs at once may lose one.** A `%u` or `%f` entry is started once per
   argument, and two `bubbler open` processes that both find the instance
   stopped will both try to start it; one of them loses.
@@ -2138,6 +2274,24 @@ parent directory are both absent, where only the lexical form is left to
 resolve and a link that a run would follow is not followed, so an explanation
 can describe a bus the run it describes goes on to refuse.
 
+Two calls bubbler makes for itself go on that same host bus, and neither goes
+through a program: the accessibility bus address under `a11y`
+(`org.a11y.Bus.GetAddress`) and the registration a file argument needs
+(`org.freedesktop.portal.Documents.AddFull`). bubbler speaks D-Bus itself for
+them — `EXTERNAL` authentication, `Hello`, one method call, one reply — on the
+address above, `$XDG_RUNTIME_DIR/bus` where the variable is unset. A well-known
+destination is resolved to its unique name first (`GetNameOwner`, and
+`StartServiceByName` where nobody holds it yet) and the message is addressed
+there, so a reply is taken only from that owner; the bus's own errors are the
+one exception, since `SENDER` is the bus's to write and no peer can forge it.
+Signals, replies to other calls and message types the client does not know are
+skipped, one five-second budget covers the lookup, the activation and the call
+together, the decoder refuses a message it cannot read exactly rather than
+guessing at it, and any descriptor a reply carries is closed on arrival —
+bubbler passes descriptors out and never takes one back. All of it runs
+host-side, as your user: it is bubbler talking to your session, not the
+sandbox.
+
 Everything the sandbox may reach is a rule: the `dbus` children above, plus the
 bundles `portals`, `notify`, `tray`, `mpris` and `input-method`, and the `a11y`
 grant whose rules are on a bus of its own — each of which needs `dbus`.
@@ -2168,6 +2322,11 @@ not an error: the launch binds nothing there and prints `bubbler: warning:
 portals: no document portal at /run/user/<uid>/doc, so a file picked in a
 portal dialog cannot be opened inside`. Files under a `home-share` or
 `path-share` are reachable either way.
+
+That same view is where a host file named on the command line lands: `run`,
+`try` and `open` register it with `Documents.AddFull` and hand the application
+the document path, which is what makes an "open with" from a file manager
+arrive. See "File arguments".
 
 `tray` is one rule, `--talk=org.kde.StatusNotifierWatcher`: an app registers
 its icon with the watcher and serves the item itself on its own unique name,
@@ -2724,9 +2883,9 @@ none of its own.
   larger than 1 MiB or nested deeper than 32 braces, naming the file; the
   check counts braces outside strings and comments and is not a parser, and
   the recursion itself is upstream's (`kdl` 6.7.1).
-- A generated desktop entry closes D-Bus activation for itself only, and its
-  `%f` file arguments are host paths the sandbox cannot open; both are under
-  "Desktop entries".
+- A generated desktop entry closes D-Bus activation for itself only: anything
+  that activates the application's bus name directly still starts the host
+  copy. See "Desktop entries".
 - The clipboard gate stops a *background* read, not a focused application. The
   keystrokes you type into a sandboxed window are exactly what arms it, so an
   application you are working in can read the selection within a second of any

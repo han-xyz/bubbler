@@ -2,7 +2,44 @@
 
 The sandbox's home is `/home/bubbler`, a private directory under the instance.
 Nothing of your real home is visible unless shared here — or picked by you in
-a portal file chooser under `portals` (see [D-Bus](D-Bus.md#portals)).
+a portal file chooser, or named on the command line, under `portals` (see
+[D-Bus](D-Bus.md#portals)).
+
+## File arguments
+
+`run`, `try` and `open` hand the sandbox the host files named after the program
+— which is how a desktop entry's `%u`/`%f` and an "open with" from a file
+manager arrive. An argument that is an absolute path or a `file://` URI
+(percent-decoded, empty or `localhost` authority) naming an existing regular
+file is registered with the document portal under `portals` and replaced by
+`$XDG_RUNTIME_DIR/doc/<id>/<name>`, the by-app view that grant already binds:
+
+```
+$ bubbler try --grant dbus --grant portals -- \
+      /usr/bin/sh -c 'echo "$1"; cat "$1"' _ /tmp/fwd-demo.txt
+/run/user/1000/doc/EorCLxJVSCrs7aKkv5AvCw/fwd-demo.txt
+hi
+```
+
+- Permissions: `read`, plus `write` where you can write the file yourself.
+  Never `delete`, never `grant-permissions`. Session-only (`reuse_existing`,
+  not `persistent`).
+- Already visible at the same path — `path-share`, `etc-share`, the baseline's
+  `/etc` allowlist, `/usr`, `/opt` — the argument is left alone. Bound under
+  another name — a `home-share` source, the instance home — it is rewritten to
+  the `/home/bubbler/…` form, which needs no portal and no grant.
+- With `portals`, refused with a warning and the argument untouched: a
+  directory (that is what these shares are for), anything that is not a regular
+  file, `/proc` `/sys` `/dev` (by the path, by what it resolves to, and again
+  on the opened descriptor), and any path containing `..`.
+- Untouched and silent: relative paths, flags, bare words, other URI schemes.
+- Symlinks are followed: what is exported is the file at the end of the link,
+  under that file's name.
+- Without `portals`: `<path> is not visible inside; grant portals to forward
+  files`, and the argument stays. Every other failure is soft the same way —
+  a launch is never stopped by a file it could not hand over.
+- `--dry-run`/`--explain` print `forward:`/`visible:` lines on stderr and
+  register nothing. `bubbler exec` deliberately does not forward.
 
 ## home-share
 

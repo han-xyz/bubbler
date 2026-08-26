@@ -549,6 +549,27 @@ cannot change after the check, and `O_NOFOLLOW` makes a symlink fail with
 report the *target's* type and bwrap would bind that target. The system
 bus has no default name at all.
 
+Two calls bubbler makes for itself go on the host session bus rather
+than through the proxy — the accessibility bus address under `a11y`, and
+`Documents.AddFull` for a file argument — over an in-tree client, no
+program and no shell. Its trust rules: a call must name a destination; a
+well-known name is resolved to its unique name (`GetNameOwner`, and
+`StartServiceByName` where nobody holds it yet, then resolved again) and
+the message is addressed *there*; a reply is taken only when it carries
+the pending serial, is a reply type, and its `SENDER` is that owner — or
+is an error from `org.freedesktop.DBus`, the one name the bus stamps
+itself and no peer can forge. Signals, replies to other serials and
+message types the client does not know are skipped; one five-second
+budget covers the lookup, the activation and the call together, so a
+peer that always has another message to skip cannot outlast it; the
+decoder refuses what it cannot read exactly — padding that is not nul, a
+length that does not match its elements, an interior nul, a repeated
+header field, a container nested past the limit — instead of guessing;
+and every descriptor a reply carries is closed on arrival, since bubbler
+passes descriptors out and never takes one back. The client is host-side
+code running as your uid on your own bus: it is bubbler talking to your
+session, not the sandbox, which reaches that bus only through the proxy.
+
 **Does not defend:** what the rules grant. `talk` to a service is talk to
 that service, and a service reachable through the bus is as trusted as
 the bus makes it; `bubbler lint` warns about the wide ones (a name owned
@@ -563,7 +584,18 @@ bus](manual.md#the-system-bus) ·
 `a_proxy_racing_its_own_socket_never_gets_a_symlink_bound`,
 `the_proxy_never_sees_the_instances_control_socket`,
 `real_system_bus_answers_for_the_names_it_grants_and_no_others`,
-`reaching_the_secret_service_is_a_note`
+`reaching_the_secret_service_is_a_note`,
+`a_reply_from_anyone_but_the_owner_of_the_name_is_ignored`,
+`a_reply_with_no_sender_is_refused`,
+`a_forged_answer_to_the_owner_lookup_is_ignored`,
+`an_error_the_bus_sends_itself_answers_a_call_to_a_peer`,
+`a_return_the_bus_sends_for_a_peer_is_not_taken_for_a_reply`,
+`an_activatable_name_is_started_and_looked_up_again`,
+`an_owner_that_answers_that_nobody_is_there_is_forgotten`,
+`a_message_of_an_unknown_type_carrying_the_serial_is_skipped`,
+`a_flood_of_messages_to_skip_does_not_outlast_the_deadline`,
+`a_bus_that_says_nothing_times_the_call_out`,
+`descriptors_a_reply_carries_are_closed`
 
 ### Accessibility bus
 
@@ -741,6 +773,70 @@ under the name you wrote.
 `home_share_through_a_symlink_out_of_the_home_is_refused`,
 `etc_share_through_a_symlink_out_of_etc_is_refused`
 
+### File arguments
+
+**Defends:** the only host file that enters is the one the user named on
+the command line, and it enters through the document portal rather than a
+bind. `run`, `try` and `open` register a trailing argument that is an
+absolute path or a `file://` URI to an existing regular file, one call
+per permission set, with the portal's own per-document permission —
+`read`, plus `write` only where the user could already write the file
+(`access(W_OK)`), never `delete` and never `grant-permissions`. The
+registration is session-scoped: `reuse_existing` is set so a file handed
+over twice keeps one id, `persistent` is not, so nothing lasting is
+written into the portal's database. The descriptor handed over is
+`O_PATH`, which names a file without opening it for reading or writing,
+and its type is re-checked on that descriptor, so a path that became a
+directory between the plan and the open cannot be smuggled to the portal.
+The program itself is never a document — replacing argument 0 would swap
+the binary that runs. Refused, each leaving the argument exactly as it
+was: a directory (`path-share` and `home-share` are the typed grants for
+one), anything that is not a regular file, anything under `/proc`, `/sys`
+or `/dev` — tested on the path, on its resolved form, and once more on
+the opened descriptor, whose filesystem magic is checked as well as its
+`/proc/self/fd` name, since a bind mount of procfs or sysfs answers to a
+path no prefix test catches — and any path holding a `..` component,
+which is refused rather than folded because what it resolves to depends
+on the symlinks along the way. A file the sandbox already reaches is
+renamed to the path it has inside instead of being registered, which
+spends no grant at all. Every failure is soft: the argument is passed on
+unchanged and a warning names the gap.
+
+**Does not defend:** the by-app view. A document is registered against
+the instance's app id and that whole view is bound at
+`$XDG_RUNTIME_DIR/doc` inside, so the application can list and reopen
+every document the same instance was handed earlier in the session, not
+only the one it was started for. That is the portal's design and the
+reason the view is per-app rather than the mount root. A symlink argument
+exports its *target* under the target's name: the link is what the
+desktop handed over and the file at the end of it is what the user meant,
+so an argument naming a link to a private file registers that file. And
+the client that makes the call is host-side code running as your uid on
+your own session bus — see "D-Bus" above. A `portals` sandbox holds a
+`--talk` rule for `org.freedesktop.portal.Documents` of its own besides,
+so what it may ask that portal for directly is the portal's policy for
+its app id rather than bubbler's.
+
+[File arguments](manual.md#file-arguments),
+[D-Bus](manual.md#d-bus) ·
+`real_open_forwards_a_host_file`,
+`real_run_forwards_with_write_when_writable`,
+`real_open_into_a_running_instance_forwards_too`,
+`run_without_portals_warns_and_leaves_the_argument`,
+`a_home_share_path_is_renamed_not_forwarded`,
+`dry_run_prints_the_forward_line`,
+`every_argument_is_classified_once`,
+`the_program_is_never_a_document`,
+`a_link_that_lands_in_proc_is_refused_like_the_path_itself`,
+`a_descriptor_that_lands_in_proc_is_refused_after_the_open`,
+`a_file_that_is_not_one_when_it_is_opened_is_dropped_from_the_call`,
+`one_call_carries_the_descriptor_the_flags_and_the_app_id`,
+`a_permission_set_is_one_call_and_the_ids_come_back_in_order`,
+`a_document_id_that_is_not_a_name_is_refused_rather_than_joined`,
+`a_refusal_leaves_every_file_of_that_call_alone`,
+`a_session_that_broke_is_not_called_again`,
+`nothing_to_register_makes_no_call_at_all`
+
 ### app-runtime
 
 **Defends:** only the leaf `app/<id>` is ever bound, never `app/` and
@@ -806,8 +902,10 @@ shim dispatches on `argv[0]`, which is caller-controlled, so names
 bubbler resolves itself are refused and a name that is not one plain file
 name is refused.
 
-**Does not defend:** the entry is a command line you can edit afterwards,
-and `%f` arguments in it are host paths the sandbox cannot open.
+**Does not defend:** the entry is a command line you can edit afterwards.
+The `%u`/`%f` host paths a launcher expands into it reach `bubbler open`
+as trailing arguments and go through the document portal from there —
+what that grants, and what it does not, is "File arguments" above.
 
 [Desktop entries](manual.md#desktop-entries), [PATH
 shims](manual.md#path-shims) ·

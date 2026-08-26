@@ -313,8 +313,9 @@ host).
 - `camera` never exercised on real hardware.
 - Deeply nested KDL would overflow the `kdl` crate's parser; bubbler refuses
   files over 1 MiB or deeper than 32 braces first.
-- Desktop entries: `%f` paths unreachable; D-Bus activation closed for the
-  entry only.
+- Desktop entries: D-Bus activation closed for the entry only.
+- Forwarded file arguments are visible to the instance for the rest of the
+  portal session, and a symlink argument exports its target.
 
 ## AppArmor
 

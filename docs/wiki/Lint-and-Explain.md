@@ -129,6 +129,15 @@ config decides is grouped under the `wayland` node that decided it:
 either without `--explain` is a usage error. A config that starts no such
 sidecar says so instead of printing an empty view.
 
+A command line carrying host file arguments prints one `forward:` or
+`visible:` line each, on **stderr** so that stdout stays the byte-exact argv or
+parsable JSON. Neither mode calls the portal, so the id is a literal `<id>`:
+
+```
+forward: /tmp/fwd-ro.txt → $XDG_RUNTIME_DIR/doc/<id>/fwd-ro.txt (read)
+visible: /home/han/Documents/paper.pdf → /home/bubbler/Documents/paper.pdf
+```
+
 Groups sit where a node's first argument appears, so the listing is neither
 file order nor argv order; `--dry-run` and `--format json` are the order of
 record. `--explain` attributes, it does not justify: why the baseline holds

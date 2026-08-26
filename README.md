@@ -27,6 +27,7 @@ each defends and what it does not. `bubbler man | man -l -` and
     bubbler run ff --explain              # the same argv, grouped under its nodes
     bubbler exec ff -- firefox --version  # run inside the running instance
     bubbler open ff -- https://a          # hand a URL to the running one, or start it
+    bubbler open ff -- firefox ~/x.pdf    # …or a host file, through the document portal
     bubbler edit ff                       # config.kdl in $EDITOR, then re-check it
     bubbler lint ff                       # grants wider than they mean?
     bubbler desktop ff                    # menu entry "Firefox (Bubbler)"
@@ -38,6 +39,14 @@ each defends and what it does not. `bubbler man | man -l -` and
 
 `create` with no `--profile` uses `generic`: the baseline and nothing else,
 with commented examples to start from. Full list: [Commands](docs/wiki/Commands.md).
+
+A host file named after the program in `run`, `try` or `open` is registered
+with the document portal and handed in at `$XDG_RUNTIME_DIR/doc/<id>/<name>`
+(read, and write where you can write it), so a desktop entry's `%u`/`%f` and
+"open with" from a file manager reach the sandbox. Needs `portals`; without it
+the argument is left alone and a warning names the gap, and a file already
+under a share is passed under the name it has inside:
+[Sharing Files](docs/wiki/Sharing-Files.md#file-arguments).
 
 ## Config
 

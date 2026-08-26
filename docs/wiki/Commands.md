@@ -44,6 +44,10 @@ bubbler man [--config]                  bubbler(1) / bubbler-config(5) as roff o
   dbus portals notify tray a11y input-method gamepad hidraw camera`. Bundles are
   checked as in a file (`--grant tray` needs `--grant dbus`, `--grant x11` needs
   `--grant wayland --grant dri` for the X server it starts inside).
+- `run`, `try` and `open` hand host files named after the program to the
+  sandbox through the document portal when `portals` is granted, and print a
+  warning naming the gap when they cannot; `exec` does not. See
+  [Sharing Files](Sharing-Files.md#file-arguments).
 - `edit` splits `$VISUAL`/`$EDITOR` on whitespace; no shell, no expansion.
 - Instance names: `[A-Za-z0-9._-]`, not starting with `-`, not `try-<digits>`.
 - Environment: `HOME` and `XDG_RUNTIME_DIR` must be set. `BUBBLER_PROFILE_DIR`
