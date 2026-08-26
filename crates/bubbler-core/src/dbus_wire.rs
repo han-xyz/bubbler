@@ -51,7 +51,32 @@ const MAX_ARRAY: usize = 1 << 26;
 
 /// "The maximum length of a message, including header, header alignment
 /// padding, and body is 2 to the 27th power or 134217728 (128 MiB)."
+/// This is the limit on what may be *sent*: a message the encoder
+/// produces has to stay inside it or no conforming peer would read it.
 const MAX_MESSAGE: usize = 1 << 27;
+
+/// The limit on what is *read*, which is bubbler's own and far tighter.
+///
+/// The specification's 128 MiB is a ceiling for a general bus client,
+/// not a size anything here expects: every reply bubbler reads is a
+/// string (`Hello`, `GetNameOwner`, `GetId`, `GetAddress`), a number
+/// (`StartServiceByName`), a variant holding one (`Properties.Get`) or
+/// the doc-id list `AddFull` answers with, which has one short id per
+/// file a single command was handed. 16 MiB is already four orders of
+/// magnitude more than the largest of those, and it keeps the buffer a
+/// hostile peer can make this process hold to something a desktop can
+/// spare.
+const MAX_INCOMING: usize = 16 << 20;
+
+/// Values one decoded block may produce.
+///
+/// [`MAX_ARRAY`] bounds an array's bytes, not what reading it costs: an
+/// `aq` of 16 MiB is eight million [`Value`]s, tens of bytes each, from
+/// one message that was inside every limit the specification states. So
+/// the count is bounded too, across nesting rather than per array. The
+/// replies bubbler reads hold a handful of values; a million is a bound
+/// on a hostile peer, not a limit any answer meets.
+const MAX_VALUES: usize = 1 << 20;
 
 /// "The maximum length of a signature is 255."
 const MAX_SIGNATURE: usize = 255;
@@ -201,9 +226,16 @@ pub enum WireError {
     /// An array declares more bytes than the specification allows.
     #[error("an array of {0} bytes is longer than the specification allows")]
     ArrayTooLong(usize),
-    /// A message is longer than the specification allows.
-    #[error("a message of {0} bytes is longer than the specification allows")]
+    /// A message is longer than this client sends or accepts.
+    #[error("a message of {0} bytes is longer than this client sends or accepts")]
     MessageTooLong(usize),
+    /// One block holds more values than this client reads, however few
+    /// bytes they came in.
+    #[error(
+        "a message holding more than the {} values this client reads",
+        MAX_VALUES
+    )]
+    TooManyValues,
     /// A string is not nul-terminated, hides a nul where a C reader would
     /// stop early, or is not UTF-8.
     #[error("a string is not nul-terminated, holds a nul, or is not UTF-8")]
@@ -724,11 +756,28 @@ fn signature_of(value: &Value, depth: usize) -> Result<String, WireError> {
 struct Reader<'a> {
     buf: &'a [u8],
     at: usize,
+    /// Values produced so far, counted across every container: the
+    /// budget belongs to the block, not to one array inside it.
+    values: usize,
 }
 
 impl<'a> Reader<'a> {
     fn new(buf: &'a [u8]) -> Self {
-        Self { buf, at: 0 }
+        Self {
+            buf,
+            at: 0,
+            values: 0,
+        }
+    }
+
+    /// Account for one value about to be produced. Bytes of a byte array
+    /// are not counted: they stay bytes, and cost what they weigh.
+    fn value(&mut self) -> Result<(), WireError> {
+        self.values += 1;
+        if self.values > MAX_VALUES {
+            return Err(WireError::TooManyValues);
+        }
+        Ok(())
     }
 
     /// Step over the padding before a value of alignment `align`,
@@ -796,6 +845,7 @@ fn decode_value(reader: &mut Reader<'_>, ty: &Type, depth: usize) -> Result<Valu
     if depth > MAX_DEPTH {
         return Err(WireError::Depth);
     }
+    reader.value()?;
     reader.align(ty.alignment())?;
     Ok(match ty {
         Type::Byte => Value::Byte(reader.byte()?),
@@ -901,6 +951,9 @@ fn decode_array(reader: &mut Reader<'_>, element: &Type, depth: usize) -> Result
             }
             let mut entries = Vec::new();
             while reader.at < end {
+                // The key is a string rather than a `Value`, so the
+                // entry it makes is counted here and not by the decoder.
+                reader.value()?;
                 reader.align(8)?;
                 let len = reader.uint32()? as usize;
                 let key = reader.text(len)?;
@@ -989,6 +1042,10 @@ fn encode_message(
 /// Where the body of the message starting at `head` begins and how long
 /// it is, read from the fixed header alone. The header-field array's
 /// length is the UINT32 at offset 12, the last of the fixed part.
+///
+/// Bounded by [`MAX_INCOMING`] rather than by the specification's own
+/// maximum: this decides how many bytes will be read into memory on the
+/// say-so of sixteen bytes from a peer.
 fn frame(head: &[u8]) -> Result<(usize, usize), WireError> {
     let head = head.get(..FIXED_HEADER).ok_or(WireError::Truncated)?;
     if head[0] != b'l' {
@@ -1002,14 +1059,14 @@ fn frame(head: &[u8]) -> Result<(usize, usize), WireError> {
     if fields_len > MAX_ARRAY {
         return Err(WireError::ArrayTooLong(fields_len));
     }
-    if body_len > MAX_MESSAGE {
+    if body_len > MAX_INCOMING {
         return Err(WireError::MessageTooLong(body_len));
     }
     let body_at = align_up(FIXED_HEADER + fields_len, 8);
     let total = body_at
         .checked_add(body_len)
         .ok_or(WireError::MessageTooLong(body_len))?;
-    if total > MAX_MESSAGE {
+    if total > MAX_INCOMING {
         return Err(WireError::MessageTooLong(total));
     }
     Ok((body_at, body_len))
@@ -3442,6 +3499,62 @@ mod tests {
         assert_eq!(reply, vec![Value::Str("the restarted one".to_owned())]);
         drop(session);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn a_block_holding_more_values_than_the_client_reads_is_refused() {
+        // Two bytes on the wire for a value tens of bytes wide: the
+        // array's length is inside every limit the specification states
+        // and reading it would still cost hundreds of megabytes.
+        let count = MAX_VALUES + 1;
+        let mut bytes = ((count * 2) as u32).to_le_bytes().to_vec();
+        bytes.resize(4 + count * 2, 0);
+        assert!(matches!(
+            decode("aq", &bytes),
+            Err(WireError::TooManyValues)
+        ));
+
+        // The budget is the block's, not one array's: a thousand arrays
+        // of a thousand are each unremarkable and together are not.
+        let (rows, columns) = (1024, 1024);
+        let mut bytes = Vec::new();
+        let mut rows_bytes = Vec::new();
+        for _ in 0..rows {
+            rows_bytes.extend_from_slice(&((columns * 2) as u32).to_le_bytes());
+            rows_bytes.resize(rows_bytes.len() + columns * 2, 0);
+        }
+        bytes.extend_from_slice(&(rows_bytes.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&rows_bytes);
+        assert!(rows * (columns + 1) + 1 > MAX_VALUES);
+        assert!(matches!(
+            decode("aaq", &bytes),
+            Err(WireError::TooManyValues)
+        ));
+
+        // A reply of the size bubbler actually reads is untouched by it.
+        let ids: Vec<Value> = (0..64).map(|n| Value::Str(format!("id{n}"))).collect();
+        let body = encode("as", &[Value::Array(ids.clone())]).unwrap();
+        assert_eq!(
+            decode("as", &body).unwrap(),
+            vec![Value::Array(ids)],
+            "a doc-id list is nowhere near the bound"
+        );
+    }
+
+    #[test]
+    fn a_message_longer_than_this_client_accepts_is_refused() {
+        // The specification's ceiling, which is what may be sent.
+        assert_eq!(MAX_MESSAGE, 1 << 27);
+        const { assert!(MAX_INCOMING < MAX_MESSAGE) };
+        let mut head = [0u8; FIXED_HEADER];
+        head[0] = b'l';
+        head[1] = MSG_METHOD_RETURN;
+        head[3] = PROTOCOL_VERSION;
+        // Sixteen bytes claiming more than this client will ever hold.
+        head[4..8].copy_from_slice(&((MAX_INCOMING + 1) as u32).to_le_bytes());
+        assert!(matches!(frame(&head), Err(WireError::MessageTooLong(_))));
+        head[4..8].copy_from_slice(&8u32.to_le_bytes());
+        assert_eq!(frame(&head).unwrap(), (FIXED_HEADER, 8));
     }
 
     /// The session bus socket: `DBUS_SESSION_BUS_ADDRESS` when it names a
