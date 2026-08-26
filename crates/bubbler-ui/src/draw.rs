@@ -56,10 +56,11 @@ const KEYS: [Keys; 4] = [
     Keys {
         screen: Screen::Detail,
         name: "grants",
-        footer: "Space grant  Enter write it  e $EDITOR  s save  u undo  ? more  Esc back",
+        footer: "Space grant/disable  Enter write  Del remove  s save  u undo  ? more  Esc back",
         full: &[
-            ("Space", "grant or revoke"),
+            ("Space", "grant / disable (keeps the line) / enable"),
             ("Enter", "write the node as KDL"),
+            ("Delete", "remove the entry (Backspace too)"),
             ("e", "$EDITOR on config.kdl"),
             ("s", "save"),
             ("u", "undo"),
@@ -323,6 +324,13 @@ fn what_it_costs(detail: &Detail) -> Text<'static> {
     let Some(row) = detail.row() else {
         return Text::from(lines);
     };
+    if row.disabled() {
+        lines.push(Line::styled(
+            "disabled — Space enables, Delete removes",
+            Style::default().dim(),
+        ));
+        lines.push(Line::from(""));
+    }
     if let Some(grant) = row.grant() {
         lines.push(Line::styled(
             format!("{}  ({})", grant.node, grant.risk),
@@ -636,11 +644,7 @@ mod tests {
     /// colour scheme changes, and pinning styles here would make every
     /// one of these a colour test as well.
     fn screen(app: &App, width: u16, height: u16) -> Vec<String> {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal
-            .draw(|frame| frame.render_widget(app, frame.area()))
-            .unwrap();
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = drawn(app, width, height);
         (0..buffer.area.height)
             .map(|y| {
                 (0..buffer.area.width)
@@ -650,6 +654,16 @@ mod tests {
                     .to_owned()
             })
             .collect()
+    }
+
+    /// The cells as drawn, styles and all: what a symbol is dimmed with
+    /// is not in the text the screen reads back as.
+    fn drawn(app: &App, width: u16, height: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(app, frame.area()))
+            .unwrap();
+        terminal.backend().buffer().clone()
     }
 
     /// An editor over a store holding one instance per pair.
@@ -663,16 +677,75 @@ mod tests {
     /// file rather than toggled, so the screens below are what a config
     /// on disk looks like.
     fn list_editor() -> (tempfile::TempDir, App) {
+        editor_over("wayland\nx11 \"host\"\nhome-share \"Downloads\" mode=rw\n")
+    }
+
+    /// An editor over one instance whose `config.kdl` holds `text`.
+    fn editor_over(text: &str) -> (tempfile::TempDir, App) {
         let (tmp, mut app) = editor(&[("ff", "generic")]);
         std::fs::write(
             bubbler_core::instance::config_path(&app.env, "ff"),
-            "// bubbler profile: generic\n// bubbler config: 2\n\
-             wayland\nx11 \"host\"\nhome-share \"Downloads\" mode=rw\n",
+            format!("// bubbler profile: generic\n// bubbler config: 2\n{text}"),
         )
         .unwrap();
         app.reload();
         app.say(String::new());
         (tmp, app)
+    }
+
+    /// The column `text` starts at on `line`, which is a column of the
+    /// buffer because every cell of these screens is one column wide.
+    fn column_of(line: &str, text: char) -> u16 {
+        u16::try_from(line.chars().take_while(|c| *c != text).count()).expect("a column")
+    }
+
+    #[test]
+    fn a_disabled_entry_is_a_dimmed_row_of_its_own() {
+        let (_tmp, mut app) = editor_over("wayland\n/-home-share \"Downloads\"\nnetwork\n");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let lines = screen(&app, 80, 12);
+        let off = lines
+            .iter()
+            .position(|l| l.contains("home-share"))
+            .expect("the disabled row");
+        assert!(
+            lines[off].starts_with("│○ !  home-share \"Downloads\""),
+            "{:?}",
+            lines[off]
+        );
+        assert!(lines[off - 1].starts_with("│●    wayland"), "{lines:?}");
+        // The mark says it is off, and the text is dimmed the way the
+        // nodes the config does not hold are.
+        let cells = drawn(&app, 80, 12);
+        let y = u16::try_from(off).expect("a row");
+        let cell = cells
+            .cell((column_of(&lines[off], 'h'), y))
+            .expect("the first cell of the text");
+        assert_eq!(cell.symbol(), "h");
+        assert!(cell.modifier.contains(Modifier::DIM), "{cell:?}");
+        let on = lines
+            .iter()
+            .position(|l| l.contains("network"))
+            .expect("the granted row below it");
+        let cell = cells
+            .cell((
+                column_of(&lines[on], 'n'),
+                u16::try_from(on).expect("a row"),
+            ))
+            .expect("the first cell of the text");
+        assert!(!cell.modifier.contains(Modifier::DIM), "{cell:?}");
+        // And the pane beside it says what the two keys do with it.
+        let detail = app.detail.as_mut().expect("the editor");
+        detail.selected = detail
+            .rows
+            .iter()
+            .position(crate::detail::Row::disabled)
+            .expect("the disabled row");
+        let said = screen(&app, 80, 12).join(" ");
+        assert!(
+            said.contains("disabled — Space enables, Delete removes"),
+            "{said}"
+        );
     }
 
     #[test]
@@ -706,15 +779,17 @@ mod tests {
                 "│●    wayland                      ││x11  (outward)                            │",
                 "│● !! x11 \"host\"                   ││x11 [\"host\"] [geometry=\"WxH\"]             │",
                 "│● !  home-share \"Downloads\" mode=r││[fullscreen=#true] [grab=#true]           │",
-                "│○ !  network                      ││[wm=\"<program>\"]                          │",
-                "│○ !  dri                          ││                                          │",
-                "│○ !  pipewire                     ││an X server of the sandbox's own, or the  │",
-                "│○ !  pulseaudio                   ││session's                                 │",
-                "│○ !! gamepad                      ││                                          │",
-                "│○ !  hidraw                       ││Bare, bubbler starts a rootful Xwayland   │",
-                "│○ !  camera                       ││inside the sandbox as a client of the     │",
+                // The row that writes a second share, right after the
+                // one the file holds.
+                "│○ !  home-share                   ││[wm=\"<program>\"]                          │",
+                "│○ !  network                      ││                                          │",
+                "│○ !  dri                          ││an X server of the sandbox's own, or the  │",
+                "│○ !  pipewire                     ││session's                                 │",
+                "│○ !  pulseaudio                   ││                                          │",
+                "│○ !! gamepad                      ││Bare, bubbler starts a rootful Xwayland   │",
+                "│○ !  hidraw                       ││inside the sandbox as a client of the     │",
                 "└──────────────────────────────────┘└──────────────────────────────────────────┘",
-                "Space grant  Enter write it  e $EDITOR  s save  u undo  ? more  Esc back",
+                "Space grant/disable  Enter write  Del remove  s save  u undo  ? more  Esc back",
             ]
         );
         // And, further down the same pane, what the linter makes of it:
@@ -751,10 +826,10 @@ mod tests {
                 "│○│[wm=\"<program>\"]                                                          │ │",
                 "│○│Enter writes it, Esc leaves it alone                                      │ │",
                 "│○└──────────────────────────────────────────────────────────────────────────┘ │",
-                "│○ !  hidraw                       ││Bare, bubbler starts a rootful Xwayland   │",
-                "│○ !  camera                       ││inside the sandbox as a client of the     │",
+                "│○ !! gamepad                      ││Bare, bubbler starts a rootful Xwayland   │",
+                "│○ !  hidraw                       ││inside the sandbox as a client of the     │",
                 "└──────────────────────────────────┘└──────────────────────────────────────────┘",
-                "Space grant  Enter write it  e $EDITOR  s save  u undo  ? more  Esc back",
+                "Space grant/disable  Enter write  Del remove  s save  u undo  ? more  Esc back",
             ]
         );
         // The cursor sits at the end of what is written, inside the field.
@@ -932,9 +1007,11 @@ mod tests {
                 "│W     wrap      X     explain   p     profiles  ^R    reload    q     quit                        │",
                 "│                                                                                                  │",
                 "│grants                                                                                            │",
-                "│Space grant or revoke        Enter write the node as KDL  e     $EDITOR on config.kdl             │",
-                "│s     save                   u     undo                   l     lint                              │",
-                "│X     explain                Esc   back                                                           │",
+                "│Space  grant / disable (keeps the line) / enable  Enter  write the node as KDL                    │",
+                "│Delete remove the entry (Backspace too)           e      $EDITOR on config.kdl                    │",
+                "│s      save                                       u      undo                                     │",
+                "│l      lint                                       X      explain                                  │",
+                "│Esc    back                                                                                       │",
                 "│                                                                                                  │",
                 "│profiles                                                                                          │",
                 "│Enter show it flattened           c     create an instance from it                                │",
@@ -949,8 +1026,6 @@ mod tests {
                 "│`q` leaves and `Esc` goes back one screen; `^C` does nothing while this is up, since the terminal │",
                 "│is raw and every key reaches the editor                                                           │",
                 "│any key closes this                                                                               │",
-                "│                                                                                                  │",
-                "│                                                                                                  │",
                 "│                                                                                                  │",
                 "└──────────────────────────────────────────────────────────────────────────────────────────────────┘",
             ]

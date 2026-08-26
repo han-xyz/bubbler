@@ -558,6 +558,15 @@ impl App {
                     self.say(said);
                 }
             }
+            // Only here: a prompt takes every key of what is under it,
+            // so Backspace inside one is still what edits the line.
+            KeyCode::Delete | KeyCode::Backspace => {
+                let env = self.env.clone();
+                if let Some(detail) = &mut self.detail {
+                    let said = detail.clear(&env);
+                    self.say(said);
+                }
+            }
             KeyCode::Enter => {
                 let detail = self.detail.as_ref()?;
                 let row = detail.row()?;
@@ -1239,6 +1248,47 @@ mod tests {
             .iter()
             .position(|r| r.node == node)
             .unwrap_or_else(|| panic!("no row for `{node}`"));
+    }
+
+    #[test]
+    fn delete_removes_the_entry_and_a_prompt_keeps_its_backspace() {
+        fn services(app: &App) -> usize {
+            app.detail.as_ref().expect("the editor").buf.services.len()
+        }
+        let (_tmp, mut app) = app();
+        app.on_key(key(KeyCode::Enter));
+        on_node(&mut app, "home-share");
+        // Backspace inside the prompt takes off characters: the entry a
+        // prompt is open on is not what it removes.
+        app.on_key(key(KeyCode::Enter));
+        clear(&mut app);
+        assert!(app.dialog.is_some(), "the prompt is still open");
+        typed(&mut app, "home-share \"Downloads\"");
+        assert!(app.dialog.is_none(), "the line was taken");
+        assert_eq!(services(&app), 1);
+        // Delete on the row it wrote takes the entry out.
+        on_node(&mut app, "home-share");
+        app.on_key(key(KeyCode::Delete));
+        assert!(
+            app.status.starts_with("removed home-share \"Downloads\""),
+            "{}",
+            app.status
+        );
+        assert_eq!(services(&app), 0);
+        // And so does Backspace, which reaches the pane only because no
+        // prompt is open over it.
+        on_node(&mut app, "home-share");
+        app.on_key(key(KeyCode::Enter));
+        typed(&mut app, "\"Music\"");
+        assert_eq!(services(&app), 1);
+        on_node(&mut app, "home-share");
+        app.on_key(key(KeyCode::Backspace));
+        assert!(
+            app.status.starts_with("removed home-share \"Music\""),
+            "{}",
+            app.status
+        );
+        assert_eq!(services(&app), 0);
     }
 
     #[test]
