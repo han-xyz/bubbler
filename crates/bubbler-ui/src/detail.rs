@@ -77,6 +77,12 @@ impl Row {
         matches!(self.target, Target::Disabled(_))
     }
 
+    /// Whether this row writes another entry of a repeatable node
+    /// rather than naming one the config holds.
+    pub fn adds(&self) -> bool {
+        matches!(self.target, Target::Add(_))
+    }
+
     /// What the catalogue says about it.
     pub fn grant(&self) -> Option<&'static Grant> {
         catalogue::grant(self.node)
@@ -169,25 +175,23 @@ impl Detail {
                 self.trouble = Some(e);
             }
         }
-        // The selection follows the node it was on: toggling `wayland`
+        // The selection follows the entry it was on: toggling `wayland`
         // off moves it into the ungranted half, and the cursor goes with
-        // it rather than staying on whatever slid into the row. What it
-        // says is asked after where it lives, so that Space on the
-        // second `home-share` leaves the cursor on that entry rather
-        // than on the first row the node has.
+        // it rather than staying on whatever slid into the row. What the
+        // row says is asked before where it lives, because an index is
+        // what the entry beside it inherits: disabling the first of two
+        // `home-share`s leaves `Service(0)` naming the second, and a
+        // cursor that followed the index would put the next Space on an
+        // entry nobody aimed at.
         self.selected = row
             .and_then(|(node, target, text)| {
-                self.rows
-                    .iter()
-                    .position(|r| r.node == node && r.target == target)
-                    .or_else(|| {
-                        text.and_then(|text| {
-                            self.rows
-                                .iter()
-                                .position(|r| r.node == node && r.text.as_ref() == Some(&text))
-                        })
-                    })
-                    .or_else(|| self.rows.iter().position(|r| r.node == node))
+                let rows = &self.rows;
+                let is = |r: &Row| r.node == node;
+                rows.iter()
+                    .position(|r| is(r) && r.text == text && r.target == target)
+                    .or_else(|| rows.iter().position(|r| is(r) && r.text == text))
+                    .or_else(|| rows.iter().position(|r| is(r) && r.target == target))
+                    .or_else(|| rows.iter().position(is))
             })
             .unwrap_or(self.selected)
             .min(self.rows.len().saturating_sub(1));
@@ -251,9 +255,9 @@ impl Detail {
             return String::new();
         };
         if let Target::Disabled(i) = row.target {
-            self.enable(i);
+            let said = self.enable(i);
             self.refresh(env);
-            return format!("enabled `{}`", row.node);
+            return said;
         }
         if row.granted() {
             if self.node_at(row.target).is_some_and(|n| n.has_content()) {
@@ -306,6 +310,13 @@ impl Detail {
                 written.name()
             ));
         }
+        // A disabled entry is written back as one node on one line. A
+        // line with no such form — two `lint-allow` ids, say — would
+        // leave the pane with nothing to draw until `u`, so the prompt
+        // says why instead, as it does for every other line it refuses.
+        if matches!(target, Target::Disabled(_)) {
+            kdl_out::node(&written).map_err(|e| e.to_string())?;
+        }
         self.write(written, target);
         self.refresh(env);
         Ok(())
@@ -339,15 +350,31 @@ impl Detail {
             entry.node = written;
             return;
         }
+        let rank = section_rank(&written);
         match (written, target) {
-            (Node::Service(s), Target::Service(i)) => self.buf.services[i] = s,
+            (Node::Service(s), Target::Service(i)) => {
+                let Some(slot) = self.buf.services.get_mut(i) else {
+                    return;
+                };
+                *slot = s;
+            }
             (Node::Service(s), _) => self.buf.services.push(s),
             (Node::Env(pairs), Target::Env(i)) => {
+                if i >= self.buf.env.len() {
+                    return;
+                }
+                let grew = grew_by(pairs.len());
                 self.buf.env.splice(i..=i, pairs);
+                self.shift_disabled(rank, i, grew);
             }
             (Node::Env(pairs), _) => self.buf.env.extend(pairs),
             (Node::LintAllow(allows), Target::LintAllow(i)) => {
+                if i >= self.buf.lint_allows.len() {
+                    return;
+                }
+                let grew = grew_by(allows.len());
                 self.buf.lint_allows.splice(i..=i, allows);
+                self.shift_disabled(rank, i, grew);
             }
             (Node::LintAllow(allows), _) => self.buf.lint_allows.extend(allows),
             (Node::Tty(mode), _) => self.buf.tty = mode,
@@ -380,8 +407,13 @@ impl Detail {
     /// lines of its section pointing at the entries they were read
     /// above: the ones below this entry now sit one nearer the top.
     fn remove(&mut self, target: Target) {
-        let at = index_of(target)
-            .and_then(|i| self.node_at(target).map(|node| (section_rank(&node), i)));
+        let Some(node) = self.node_at(target) else {
+            // The row names no entry, or names one the buffer has lost.
+            // An index is stale only between a change and the refresh
+            // that follows it, and a panic here would leave the terminal
+            // raw and the editor gone.
+            return;
+        };
         match target {
             Target::Service(i) => {
                 self.buf.services.remove(i);
@@ -402,12 +434,19 @@ impl Detail {
             }
             Target::Add(_) | Target::Absent => {}
         }
-        let Some((rank, i)) = at else {
-            return;
-        };
+        if let Some(i) = index_of(target) {
+            self.shift_disabled(section_rank(&node), i, -1);
+        }
+    }
+
+    /// Move the `/-` lines of one section that sit below the entry at
+    /// `i` by `by` entries. Each of them names the entry it was read
+    /// above, so a section that grows or shrinks above them moves that
+    /// entry and has to move them with it.
+    fn shift_disabled(&mut self, rank: u8, i: usize, by: isize) {
         for entry in &mut self.buf.disabled {
             if section_rank(&entry.node) == rank && entry.before > i {
-                entry.before -= 1;
+                entry.before = entry.before.saturating_add_signed(by);
             }
         }
     }
@@ -437,61 +476,71 @@ impl Detail {
     /// node a config holds one of — `tty`, `command` — is written over
     /// where one is granted: the entry the cursor is on is the one that
     /// was asked for.
-    fn enable(&mut self, i: usize) {
+    fn enable(&mut self, i: usize) -> String {
         let Some(entry) = self.buf.disabled.get(i).cloned() else {
-            return;
+            return String::new();
         };
+        let node = entry.node.name();
         self.buf.disabled.remove(i);
         let rank = section_rank(&entry.node);
         let at = entry.before.min(self.section_len(&entry.node));
-        let added = self.insert(entry.node, at);
-        // The `/-` lines below it in its section stand above one entry
-        // more than they did.
+        let written = self.insert(entry.node, at);
+        // The `/-` lines below it in its section stand above the entries
+        // it added as well now. Which they are is a matter of where they
+        // sit in the list rather than of the count they hold: one that
+        // named the same entry from above stays above it.
         for entry in self.buf.disabled.iter_mut().skip(i) {
             if section_rank(&entry.node) == rank {
-                entry.before += added;
+                entry.before += written.count();
+            }
+        }
+        match written {
+            Placed::Added(_) => format!("enabled `{node}`"),
+            Placed::Replaced => format!("enabled `{node}` over the one it held"),
+            Placed::Default => {
+                format!("enabled `{node}` — the default, so there is no line to write")
             }
         }
     }
 
-    /// Put an entry into its section at `at`, and say how many entries
-    /// the section gained by it.
-    fn insert(&mut self, node: Node, at: usize) -> usize {
+    /// Put an entry into its section at `at`, and say what that did to
+    /// the section.
+    fn insert(&mut self, node: Node, at: usize) -> Placed {
         match node {
             Node::Service(s) => {
                 let at = at.min(self.buf.services.len());
                 self.buf.services.insert(at, s);
-                1
+                Placed::Added(1)
             }
             Node::Env(pairs) => {
                 let at = at.min(self.buf.env.len());
                 let added = pairs.len();
                 self.buf.env.splice(at..at, pairs);
-                added
+                Placed::Added(added)
             }
             Node::LintAllow(allows) => {
                 let at = at.min(self.buf.lint_allows.len());
                 let added = allows.len();
                 self.buf.lint_allows.splice(at..at, allows);
-                added
+                Placed::Added(added)
             }
             Node::Tty(mode) => {
                 let held = self.buf.tty != TtyMode::default();
                 self.buf.tty = mode;
-                usize::from(!held)
+                Placed::one_of(held, self.buf.tty == TtyMode::default())
             }
             Node::Userns(mode) => {
                 let held = self.buf.userns != Userns::default();
                 self.buf.userns = mode;
-                usize::from(!held)
+                Placed::one_of(held, self.buf.userns == Userns::default())
             }
             Node::Seccomp(cfg) => {
                 let held = self.buf.seccomp != SeccompConfig::default();
                 self.buf.seccomp = cfg;
-                usize::from(!held)
+                Placed::one_of(held, self.buf.seccomp == SeccompConfig::default())
             }
-            Node::Desktop(name) => usize::from(self.buf.desktop.replace(name).is_none()),
-            Node::Command(argv) => usize::from(self.buf.command.replace(argv).is_none()),
+            Node::Desktop(name) => Placed::one_of(self.buf.desktop.replace(name).is_some(), false),
+            Node::Command(argv) => Placed::one_of(self.buf.command.replace(argv).is_some(), false),
         }
     }
 
@@ -540,6 +589,46 @@ impl Detail {
 /// editor.
 pub fn flatten(text: &str) -> String {
     text.lines().map(str::trim).collect::<Vec<&str>>().join(" ")
+}
+
+/// What putting an entry back into its section did, which is what the
+/// editor says about it: a line appearing is not a line written over.
+enum Placed {
+    /// The section gained this many entries.
+    Added(usize),
+    /// The granted node of a kind a config holds one of was written
+    /// over, because two of that node is not a config bubbler reads.
+    Replaced,
+    /// The value is the node's own default, which a file spells by
+    /// leaving the node out: no line is written at all.
+    Default,
+}
+
+impl Placed {
+    /// What writing a node a config holds one of did: `held` says
+    /// whether one was granted before it, `bare` whether what was
+    /// written is the default the file holds no line for.
+    fn one_of(held: bool, bare: bool) -> Self {
+        match (held, bare) {
+            (_, true) => Self::Default,
+            (true, false) => Self::Replaced,
+            (false, false) => Self::Added(1),
+        }
+    }
+
+    /// How many entries the section gained.
+    fn count(&self) -> usize {
+        match self {
+            Self::Added(n) => *n,
+            Self::Replaced | Self::Default => 0,
+        }
+    }
+}
+
+/// How far a line that writes `n` entries moves what was below the one
+/// entry it replaced.
+fn grew_by(n: usize) -> isize {
+    isize::try_from(n.saturating_sub(1)).unwrap_or_default()
 }
 
 /// Which section of the file a node belongs to, numbered in the order
@@ -1219,6 +1308,103 @@ mod tests {
         );
         assert_eq!(detail.toggle(&env), "enabled `home-share`", "and back");
         assert_eq!(kdl_out::render(&detail.buf).unwrap(), text);
+    }
+
+    #[test]
+    fn space_twice_on_an_entry_leaves_the_file_as_it_was() {
+        let text = "home-share \"A\"\nhome-share \"B\"\n";
+        let (_tmp, env, mut detail) = editing(text);
+        select(&mut detail, "home-share");
+        assert_eq!(detail.row().unwrap().target, Target::Service(0));
+        detail.toggle(&env);
+        // On the entry it disabled, not on the one that slid into the
+        // index that entry had.
+        let row = detail.row().expect("a row").clone();
+        assert!(row.disabled(), "{row:?}");
+        assert_eq!(row.text.as_deref(), Some("home-share \"A\""));
+        assert_eq!(detail.toggle(&env), "enabled `home-share`");
+        assert_eq!(kdl_out::render(&detail.buf).unwrap(), text);
+        assert!(!detail.dirty(), "two presses, and the file is untouched");
+    }
+
+    #[test]
+    fn space_on_the_first_of_two_disabled_entries_grants_that_one() {
+        let text = "/-home-share \"A\"\n/-home-share \"B\"\n";
+        let (_tmp, env, mut detail) = editing(text);
+        select(&mut detail, "home-share");
+        assert_eq!(detail.row().unwrap().target, Target::Disabled(0));
+        detail.toggle(&env);
+        assert_eq!(
+            detail.buf.services,
+            [Service::HomeShare {
+                path: "A".into(),
+                mode: ShareMode::ReadOnly
+            }],
+            "the one the cursor was on"
+        );
+        let row = detail.row().expect("a row").clone();
+        assert!(row.granted(), "{row:?}");
+        assert_eq!(row.text.as_deref(), Some("home-share \"A\""));
+        // And Space again takes that one back off, not the other.
+        detail.toggle(&env);
+        assert!(detail.buf.services.is_empty());
+        assert_eq!(kdl_out::render(&detail.buf).unwrap(), text);
+        assert!(!detail.dirty());
+    }
+
+    #[test]
+    fn a_line_no_disabled_entry_can_be_written_from_is_refused() {
+        let (_tmp, env, mut detail) = editing("/-lint-allow \"network-host\" reason=\"testing\"\n");
+        select(&mut detail, "lint-allow");
+        assert_eq!(detail.row().unwrap().target, Target::Disabled(0));
+        let e = detail
+            .apply(
+                &env,
+                "lint-allow \"network-host\" reason=\"a\"; lint-allow \"home-share-sensitive\" reason=\"b\"",
+            )
+            .unwrap_err();
+        assert!(e.contains("one check id"), "{e}");
+        assert!(detail.trouble.is_none(), "the pane still draws");
+        assert!(!detail.rows.is_empty());
+        assert!(!detail.dirty(), "nothing refused was applied");
+    }
+
+    #[test]
+    fn enabling_a_node_a_config_holds_one_of_says_what_became_of_it() {
+        let (_tmp, env, mut detail) = editing("tty \"none\"\n/-tty \"passthrough\"\n");
+        select(&mut detail, "tty");
+        assert_eq!(detail.row().unwrap().target, Target::Tty);
+        detail.selected += 1;
+        assert_eq!(detail.row().unwrap().target, Target::Disabled(0));
+        assert_eq!(
+            detail.toggle(&env),
+            "enabled `tty` over the one it held",
+            "a config holds one tty node, so the other one went"
+        );
+        assert_eq!(detail.buf.tty, TtyMode::Passthrough);
+        assert!(detail.buf.disabled.is_empty());
+        // And a disabled node whose value is the default is a node the
+        // file writes no line for at all.
+        let (_tmp, env, mut detail) = editing("/-tty \"pty\"\n");
+        select(&mut detail, "tty");
+        assert_eq!(
+            detail.toggle(&env),
+            "enabled `tty` — the default, so there is no line to write"
+        );
+        assert_eq!(kdl_out::render(&detail.buf).unwrap(), "");
+    }
+
+    #[test]
+    fn a_line_that_writes_two_variables_keeps_the_disabled_one_below_both() {
+        let (_tmp, env, mut detail) = editing("env A=\"1\"\n/-env B=\"2\"\n");
+        select(&mut detail, "env");
+        assert_eq!(detail.row().unwrap().target, Target::Env(0));
+        detail.apply(&env, "env C=\"3\" D=\"4\"").unwrap();
+        assert_eq!(
+            kdl_out::render(&detail.buf).unwrap(),
+            "env C=\"3\"\nenv D=\"4\"\n/-env B=\"2\"\n",
+            "the `/-` line stayed below the entry it was read below"
+        );
     }
 
     #[test]

@@ -331,6 +331,13 @@ fn what_it_costs(detail: &Detail) -> Text<'static> {
         ));
         lines.push(Line::from(""));
     }
+    if row.adds() {
+        lines.push(Line::styled(
+            "writes another entry — Enter opens an empty line",
+            Style::default().dim(),
+        ));
+        lines.push(Line::from(""));
+    }
     if let Some(grant) = row.grant() {
         lines.push(Line::styled(
             format!("{}  ({})", grant.node, grant.risk),
@@ -746,6 +753,20 @@ mod tests {
             said.contains("disabled — Space enables, Delete removes"),
             "{said}"
         );
+    }
+
+    #[test]
+    fn the_row_that_adds_an_entry_says_so_beside_the_node() {
+        let (_tmp, mut app) = editor_over("home-share \"Downloads\"\n");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let detail = app.detail.as_mut().expect("the editor");
+        detail.selected = detail
+            .rows
+            .iter()
+            .position(crate::detail::Row::adds)
+            .expect("the row that adds an entry");
+        let said = screen(&app, 80, 12).join(" ");
+        assert!(said.contains("writes another entry"), "{said}");
     }
 
     #[test]
