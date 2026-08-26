@@ -873,9 +873,10 @@ fn block_comment_end(b: &[u8], at: usize) -> (usize, usize) {
 /// as opened it. `"""` *and a newline* open the multi-line form, which
 /// holds lines of its own — a `"` among them ends nothing — and closes
 /// only on a `"""` carrying those hashes that stands on a line of its
-/// own after whitespace: kdl 6.7.1 reads one mid-line as body in a raw
-/// string and as an error in a quoted one, never as the end
-/// (`raw_string` and `quoted_string` in its `v2_parser.rs`). Without
+/// own after whitespace, `\`-escaped whitespace too in a quoted string:
+/// kdl 6.7.1 reads one mid-line as body in a raw string and as an error
+/// in a quoted one, never as the end (`raw_string` and `quoted_string`
+/// in its `v2_parser.rs`). Without
 /// the newline the three quotes are an empty string and a quote, which
 /// is how `#"""a"#` holds `""a`.
 fn string_end(b: &[u8], quote: usize, hashes: usize) -> Option<usize> {
@@ -909,7 +910,7 @@ fn string_end(b: &[u8], quote: usize, hashes: usize) -> Option<usize> {
                 // configuration.
                 if triple
                     && (b.get(i..i + 3) != Some(b"\"\"\"".as_slice())
-                        || !only_spaces(&b[line_start..i]))
+                        || !only_spaces(&b[line_start..i], hashes == 0))
                 {
                     i += 1;
                     continue;
@@ -926,27 +927,46 @@ fn string_end(b: &[u8], quote: usize, hashes: usize) -> Option<usize> {
     None
 }
 
-/// Whether `b` is nothing but the whitespace kdl 6.7.1 lets stand
-/// before a multi-line string's closing quotes: its `UNICODE_SPACES`
-/// (`v2_parser.rs`), by the bytes UTF-8 writes them as.
-fn only_spaces(b: &[u8]) -> bool {
+/// Whether `b` is nothing but what kdl 6.7.1 lets stand before a
+/// multi-line string's closing quotes: its `UNICODE_SPACES`, and with
+/// `escapes` its `ws_escape` too — a `\` followed by one or more of
+/// those spaces (`quoted_string` in its `v2_parser.rs`; a `\` before a
+/// newline is one [`string_end`] has already begun the next line
+/// after). A raw string has no escapes and closes on the spaces alone.
+fn only_spaces(b: &[u8], escapes: bool) -> bool {
     let mut i = 0;
     while i < b.len() {
-        i += match b[i] {
-            b'\t' | b' ' => 1,
-            0xc2 if b.get(i + 1) == Some(&0xa0) => 2,
-            0xe1 if b.get(i + 1..i + 3) == Some(&[0x9a, 0x80]) => 3,
-            0xe2 if b.get(i + 1) == Some(&0x80)
-                && matches!(b.get(i + 2), Some(0x80..=0x8a | 0xaf)) =>
-            {
-                3
-            }
-            0xe2 if b.get(i + 1..i + 3) == Some(&[0x81, 0x9f]) => 3,
-            0xe3 if b.get(i + 1..i + 3) == Some(&[0x80, 0x80]) => 3,
-            _ => return false,
+        if escapes && b[i] == b'\\' {
+            let Some(n) = space_len(b, i + 1) else {
+                return false;
+            };
+            i += 1 + n;
+            continue;
+        }
+        let Some(n) = space_len(b, i) else {
+            return false;
         };
+        i += n;
     }
     true
+}
+
+/// Length of the space at `at`, if one of kdl 6.7.1's `UNICODE_SPACES`
+/// (`v2_parser.rs`) starts there, by the bytes UTF-8 writes it as.
+fn space_len(b: &[u8], at: usize) -> Option<usize> {
+    match *b.get(at)? {
+        b'\t' | b' ' => Some(1),
+        0xc2 if b.get(at + 1) == Some(&0xa0) => Some(2),
+        0xe1 if b.get(at + 1..at + 3) == Some(&[0x9a, 0x80]) => Some(3),
+        0xe2 if b.get(at + 1) == Some(&0x80)
+            && matches!(b.get(at + 2), Some(0x80..=0x8a | 0xaf)) =>
+        {
+            Some(3)
+        }
+        0xe2 if b.get(at + 1..at + 3) == Some(&[0x81, 0x9f]) => Some(3),
+        0xe3 if b.get(at + 1..at + 3) == Some(&[0x80, 0x80]) => Some(3),
+        _ => None,
+    }
 }
 
 /// Line number, counting from one, of the byte at `offset` in `text`.
@@ -5041,6 +5061,32 @@ command "b""#
             let cfg = parse(text).unwrap_or_else(|e| panic!("{text}: {e}"));
             assert!(cfg.disabled.is_empty(), "{text}: {:?}", cfg.disabled);
         }
+    }
+
+    #[test]
+    fn a_whitespace_escape_before_the_closing_quotes_still_closes_the_string() {
+        // kdl 6.7.1 lets a quoted multi-line string close on a line of
+        // spaces and `\`-escaped spaces before its `"""` (`ws_escape` in
+        // `quoted_string`, `v2_parser.rs`); a raw string has no escapes.
+        // A scanner that read the escape as content ran on to the next
+        // `"""` standing alone, and every `/-` line up to there was a
+        // line of the string to it and a dropped comment to the parser.
+        let text =
+            "/-command \"\"\"\n a\n \\ \"\"\"\n/-dri\n/-command \"\"\"\n b\n \"\"\"\npipewire\n";
+        let cfg = parse(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+        let mut names: Vec<_> = cfg.disabled.iter().map(|d| d.node.name()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["command", "command", "dri"],
+            "{:?}",
+            cfg.disabled
+        );
+        // A raw string has no escapes, and needs no case here: its body
+        // ends at `"""` and its hashes wherever they stand, so the same
+        // line in a raw string is a file the parser refuses, which the
+        // scanner never sees.
+        assert!(parse("/-command #\"\"\"\n a\n \\ \"\"\"#\n/-dri\n\"\"\"#\npipewire\n").is_err());
     }
 
     #[test]
