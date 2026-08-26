@@ -1264,11 +1264,13 @@ A filter that matches nothing is a warning and not a failure —
 `bubbler: warning: usb: no device matches vendor=ffff product=ffff` — and the
 sandbox starts without the device, since a device you plug in on demand is
 exactly what this grant is usually for. Unplugging is never a failure either,
-at any point in the run-up: a device whose node or sysfs directory has gone
-between the walk and the bind is passed over as though the walk had not seen
-it (and if that leaves the node with nothing, it warns as an empty filter
-does), and one that goes after that is covered by `--dev-bind-try` on the
-node. What does fail is a path that is still there and is the wrong thing — a
+at any point in the run-up: right before the bind the walk's four
+attributes are read again, and a device whose node or sysfs directory has
+gone, or whose ids or bus and device numbers no longer read the same, is
+passed over with a line such as `bubbler: warning: usb: 1532:0531 at bus 001
+device 004 went away before the bind` (and if that leaves the node with
+nothing, the empty-filter warning follows); one that goes after that is
+covered by `--dev-bind-try` on the node. What does fail is a path that is still there and is the wrong thing — a
 `/dev/bus/usb/BBB/DDD` that is not a character device is a host anomaly rather
 than an unplug, and the launch stops on it.
 
