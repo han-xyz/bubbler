@@ -14,10 +14,11 @@ use bubbler_core::profile::NAMES;
 use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
     PYTHON, bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, bubbler_wayland, bwrap_alive,
-    kill_group, output_past_a_busy_exec, process_running, real_init, require_a11y, require_bwrap,
-    require_dbus, require_document_portal, require_groff, require_host_program, require_nested_x11,
-    require_nested_x11_host, require_nft, require_pasta, require_portal, require_python,
-    require_security_context, require_system_bus, require_tray, say, system_owns, test_pty,
+    kill_group, output_past_a_busy_exec, process_running, real_init, require_a11y,
+    require_a11y_lookup, require_bwrap, require_dbus, require_document_portal, require_groff,
+    require_host_program, require_nested_x11, require_nested_x11_host, require_nft, require_pasta,
+    require_portal, require_python, require_security_context, require_system_bus, require_tray,
+    say, system_owns, test_pty,
 };
 use rustix::fs::{FlockOperation, OFlags, fcntl_getfl, flock};
 use rustix::process::{Pid, Signal, kill_process};
@@ -2914,10 +2915,17 @@ fn real_input_method_hides_the_daemons_main_names() {
 /// it.
 #[test]
 fn real_a11y_lookup_needs_no_dbus_send() {
-    if !require_a11y() {
+    if !require_a11y_lookup() {
         return;
     }
     let Some(init) = real_init() else { return };
+    // The instance lives in the session's own runtime directory, which
+    // `dbus_instance` puts it in; without one there is nothing to look
+    // the proxied socket up under.
+    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) else {
+        say("skipping: XDG_RUNTIME_DIR unset");
+        return;
+    };
     let tmp = setup();
     // Everything the run resolves on `PATH` and nothing else: no
     // `dbus-send` to fall back on and no shell to find one with. The
@@ -2949,16 +2957,20 @@ fn real_a11y_lookup_needs_no_dbus_send() {
         .unwrap_or_default()
         .trim();
     assert!(address.starts_with("unix:path="), "stdout: {s}");
+    // A host bus, not the socket the sidecar will serve for this
+    // instance: everything bubbler creates for it lives under this
+    // directory, and an address naming one of those is refused before
+    // any of this.
+    let ours = runtime.join("bubbler").join(name);
+    assert!(
+        !address.starts_with(&format!("unix:path={}", ours.display())),
+        "the explanation named a socket of bubbler's own: {address}"
+    );
 
     // And the run itself: the application is pointed at the socket the
-    // sidecar serves for that bus, which it has only if the address it
-    // connected to was found.
-    let run = PathBuf::from(
-        std::env::var_os("XDG_RUNTIME_DIR")
-            .expect("the session runtime dir, the one dbus_instance placed this instance in"),
-    );
-    let inside = format!("unix:path={}", run.join("at-spi").join("bus").display());
-    assert_ne!(address, inside, "the explanation echoed the proxied socket");
+    // sidecar serves for that bus, which it has only if the address the
+    // sidecar connected to was found.
+    let inside = format!("unix:path={}", runtime.join("at-spi").join("bus").display());
     let out = bubbler_dbus(tmp.path(), &init)
         .env("PATH", &path)
         .args(["run", name, "--", "/usr/bin/env"])

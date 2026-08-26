@@ -1596,15 +1596,367 @@ fn check_fd_indices(value: &Value, count: u32) -> Result<(), WireError> {
     Ok(())
 }
 
+/// The fake bus every module's tests script: one connection, the
+/// `EXTERNAL` handshake, and replies written from the bus's side.
+///
+/// It lives here because the client under it does: a second copy of this
+/// harness is a second idea of what a bus sends, and the first thing to
+/// go out of step is the `SENDER` the client checks.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::io::{Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::thread::JoinHandle;
+
+    use super::*;
+
+    /// The header field codes and message types a script names, bound to
+    /// the encoder's own so a test cannot assert on a number the wire
+    /// does not use.
+    pub(crate) const BUS_NAME: &str = super::BUS_NAME;
+    pub(crate) const FIELD_PATH: u8 = super::FIELD_PATH;
+    pub(crate) const FIELD_INTERFACE: u8 = super::FIELD_INTERFACE;
+    pub(crate) const FIELD_MEMBER: u8 = super::FIELD_MEMBER;
+    pub(crate) const FIELD_ERROR_NAME: u8 = super::FIELD_ERROR_NAME;
+    pub(crate) const FIELD_REPLY_SERIAL: u8 = super::FIELD_REPLY_SERIAL;
+    pub(crate) const FIELD_DESTINATION: u8 = super::FIELD_DESTINATION;
+    pub(crate) const FIELD_SENDER: u8 = super::FIELD_SENDER;
+    pub(crate) const FIELD_SIGNATURE: u8 = super::FIELD_SIGNATURE;
+    pub(crate) const MSG_METHOD_RETURN: u8 = super::MSG_METHOD_RETURN;
+    pub(crate) const MSG_ERROR: u8 = super::MSG_ERROR;
+
+    /// Longest a script waits for the client, and the client for a
+    /// connection: a test that stops talking fails its join rather than
+    /// hanging the run.
+    pub(crate) const SCRIPT_TIMEOUT: Duration = Duration::from_secs(20);
+
+    /// One method call as the bus saw it.
+    pub(crate) struct Call {
+        /// Header fields in the order the client wrote them.
+        pub(crate) fields: Vec<(u8, Value)>,
+        /// Signature of the body, empty when there is none.
+        pub(crate) signature: String,
+        /// The body, decoded against that signature.
+        pub(crate) body: Vec<Value>,
+        /// Serial the reply must name.
+        pub(crate) serial: u32,
+        /// Descriptors the call carried.
+        pub(crate) fds: Vec<OwnedFd>,
+    }
+
+    impl Call {
+        /// The text of a header field, e.g. the member name.
+        pub(crate) fn text(&self, code: u8) -> String {
+            match self.fields.iter().find(|(c, _)| *c == code) {
+                Some((_, Value::Str(text) | Value::ObjectPath(text))) => text.clone(),
+                other => panic!("header field {code} is {other:?}"),
+            }
+        }
+
+        /// Every textual header field, in the order it was written: what
+        /// the client asked, and of whom.
+        pub(crate) fn texts(&self) -> Vec<(u8, String)> {
+            self.fields
+                .iter()
+                .map(|(code, value)| {
+                    let text = match value {
+                        Value::Str(s) | Value::ObjectPath(s) | Value::Signature(s) => s.clone(),
+                        other => format!("{other:?}"),
+                    };
+                    (*code, text)
+                })
+                .collect()
+        }
+    }
+
+    /// The serial of a message: the second UINT32 of its header.
+    pub(crate) fn serial_of(message: &[u8]) -> u32 {
+        u32::from_le_bytes([message[8], message[9], message[10], message[11]])
+    }
+
+    /// A bus on a socket under `dir` that runs `script` on the one
+    /// connection it accepts.
+    pub(crate) fn fake_bus<F>(dir: &Path, script: F) -> (PathBuf, JoinHandle<()>)
+    where
+        F: FnOnce(UnixStream) + Send + 'static,
+    {
+        let path = dir.join("bus");
+        let listener = UnixListener::bind(&path).unwrap();
+        let handle = std::thread::spawn(move || {
+            // Both waits are bounded before either happens: a client
+            // that never connects, or one that stops mid-message, fails
+            // the join instead of hanging the run.
+            wait(
+                listener.as_fd(),
+                PollFlags::IN,
+                Instant::now() + SCRIPT_TIMEOUT,
+            )
+            .expect("a client connected");
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(SCRIPT_TIMEOUT)).unwrap();
+            script(stream);
+        });
+        (path, handle)
+    }
+
+    /// One `\r\n` line from the client, read a byte at a time so none of
+    /// the message stream that follows `BEGIN` is swallowed.
+    pub(crate) fn server_line(stream: &UnixStream) -> String {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            (&*stream).read_exact(&mut byte).unwrap();
+            out.push(byte[0]);
+            if out.ends_with(b"\r\n") {
+                out.truncate(out.len() - 2);
+                return String::from_utf8(out).unwrap();
+            }
+        }
+    }
+
+    /// The `EXTERNAL` handshake from the bus's side, as the
+    /// specification's Figure 7 (or Figure 8 with `agree` false) has it.
+    pub(crate) fn server_auth(stream: &UnixStream, agree: bool) {
+        let uid = rustix::process::getuid().as_raw();
+        assert_eq!(
+            server_line(stream),
+            format!("\0AUTH EXTERNAL {}", uid_hex(uid))
+        );
+        (&*stream).write_all(b"OK 1234deadbeef\r\n").unwrap();
+        assert_eq!(server_line(stream), "NEGOTIATE_UNIX_FD");
+        let reply: &[u8] = if agree {
+            b"AGREE_UNIX_FD\r\n"
+        } else {
+            b"ERROR not on this transport\r\n"
+        };
+        (&*stream).write_all(reply).unwrap();
+        assert_eq!(server_line(stream), "BEGIN");
+    }
+
+    /// One whole message from the client, with any descriptors it carried.
+    pub(crate) fn server_message(stream: &UnixStream) -> (Vec<u8>, Vec<OwnedFd>) {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut fds = Vec::new();
+        loop {
+            if buf.len() >= FIXED_HEADER {
+                let (body_at, body_len) = frame(&buf).unwrap();
+                if buf.len() >= body_at + body_len {
+                    buf.truncate(body_at + body_len);
+                    return (buf, fds);
+                }
+            }
+            let mut chunk = [0u8; 4096];
+            let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(8))];
+            let mut ancillary = RecvAncillaryBuffer::new(&mut space);
+            let got = recvmsg(
+                stream.as_fd(),
+                &mut [IoSliceMut::new(&mut chunk)],
+                &mut ancillary,
+                RecvFlags::CMSG_CLOEXEC,
+            )
+            .unwrap();
+            for message in ancillary.drain() {
+                if let RecvAncillaryMessage::ScmRights(received) = message {
+                    fds.extend(received);
+                }
+            }
+            assert!(got.bytes > 0, "the client hung up mid-message");
+            buf.extend_from_slice(&chunk[..got.bytes]);
+        }
+    }
+
+    /// Send one message from the bus's side.
+    pub(crate) fn server_send(
+        stream: &UnixStream,
+        kind: u8,
+        serial: u32,
+        fields: &[(u8, Value)],
+        sig: &str,
+        body: &[Value],
+    ) {
+        let mut fields = fields.to_vec();
+        if !sig.is_empty() {
+            fields.push((FIELD_SIGNATURE, Value::Signature(sig.to_owned())));
+        }
+        let body = encode(sig, body).unwrap();
+        let message = encode_message(kind, 0, serial, &fields, &body).unwrap();
+        (&*stream).write_all(&message).unwrap();
+    }
+
+    /// A `METHOD_RETURN` to the call with serial `reply_to`, from
+    /// `sender` — the bus fills that field in, so every reply has one.
+    pub(crate) fn server_reply(
+        stream: &UnixStream,
+        serial: u32,
+        reply_to: u32,
+        sender: &str,
+        sig: &str,
+        body: &[Value],
+    ) {
+        server_send(
+            stream,
+            MSG_METHOD_RETURN,
+            serial,
+            &[
+                (FIELD_REPLY_SERIAL, Value::Uint32(reply_to)),
+                (FIELD_SENDER, Value::Str(sender.to_owned())),
+            ],
+            sig,
+            body,
+        );
+    }
+
+    /// The bytes of a `METHOD_RETURN`, for a test that writes them itself.
+    pub(crate) fn reply_bytes(
+        serial: u32,
+        reply_to: u32,
+        sender: &str,
+        sig: &str,
+        body: &[Value],
+    ) -> Vec<u8> {
+        let mut fields = vec![
+            (FIELD_REPLY_SERIAL, Value::Uint32(reply_to)),
+            (FIELD_SENDER, Value::Str(sender.to_owned())),
+        ];
+        if !sig.is_empty() {
+            fields.push((FIELD_SIGNATURE, Value::Signature(sig.to_owned())));
+        }
+        let body = encode(sig, body).unwrap();
+        encode_message(MSG_METHOD_RETURN, 0, serial, &fields, &body).unwrap()
+    }
+
+    /// A signal, which a pending call must skip whatever it carries.
+    pub(crate) fn signal_bytes(serial: u32, reply_serial: Option<u32>) -> Vec<u8> {
+        let mut fields = vec![
+            (FIELD_PATH, Value::ObjectPath("/org/a".to_owned())),
+            (FIELD_INTERFACE, Value::Str("org.a".to_owned())),
+            (FIELD_MEMBER, Value::Str("Changed".to_owned())),
+            (FIELD_SENDER, Value::Str(":1.5".to_owned())),
+            (FIELD_SIGNATURE, Value::Signature("s".to_owned())),
+        ];
+        if let Some(reply_serial) = reply_serial {
+            fields.push((FIELD_REPLY_SERIAL, Value::Uint32(reply_serial)));
+        }
+        let body = encode("s", &[Value::Str("ignore me".to_owned())]).unwrap();
+        encode_message(4, 0, serial, &fields, &body).unwrap()
+    }
+
+    /// Answer the `Hello` every connection opens with, and return the
+    /// bytes of the call so a test can look at them.
+    pub(crate) fn server_hello(stream: &UnixStream, name: &str) -> Vec<u8> {
+        let (bytes, fds) = server_message(stream);
+        assert!(fds.is_empty());
+        server_reply(
+            stream,
+            1,
+            serial_of(&bytes),
+            BUS_NAME,
+            "s",
+            &[Value::Str(name.to_owned())],
+        );
+        bytes
+    }
+
+    /// The `EXTERNAL` handshake and the `Hello` every connection opens
+    /// with, from the bus's side.
+    pub(crate) fn server_start(stream: &UnixStream) {
+        server_auth(stream, true);
+        server_hello(stream, ":1.5");
+    }
+
+    /// One whole method call from the client, decoded.
+    pub(crate) fn server_call(stream: &UnixStream) -> Call {
+        let (bytes, fds) = server_message(stream);
+        let fields_len = u32::from_le_bytes(
+            bytes[12..16]
+                .try_into()
+                .expect("a header the framing accepted"),
+        ) as usize;
+        let header = decode("yyyyuua(yv)", &bytes[..FIXED_HEADER + fields_len]).unwrap();
+        let (Value::Uint32(serial), Value::Array(raw)) = (&header[5], &header[6]) else {
+            panic!("a header that is not a header: {header:?}");
+        };
+        let fields: Vec<(u8, Value)> = raw
+            .iter()
+            .map(|field| match field {
+                Value::Struct(pair) => match pair.as_slice() {
+                    [Value::Byte(code), Value::Variant(value)] => (*code, (**value).clone()),
+                    other => panic!("a header field that is not one: {other:?}"),
+                },
+                other => panic!("a header field that is not one: {other:?}"),
+            })
+            .collect();
+        let signature = match fields.iter().find(|(code, _)| *code == FIELD_SIGNATURE) {
+            Some((_, Value::Signature(sig))) => sig.clone(),
+            _ => String::new(),
+        };
+        let body = decode(&signature, &bytes[align_up(FIXED_HEADER + fields_len, 8)..]).unwrap();
+        Call {
+            fields,
+            signature,
+            body,
+            serial: *serial,
+            fds,
+        }
+    }
+
+    /// The next call to `member` the client makes. A lookup of who owns
+    /// the destination is answered with `owner` on the way, since the
+    /// client holds the reply to the unique name the bus names here.
+    pub(crate) fn server_awaiting(stream: &UnixStream, member: &str, owner: &str) -> Call {
+        loop {
+            let call = server_call(stream);
+            let asked = call.text(FIELD_MEMBER);
+            if asked == member {
+                return call;
+            }
+            assert_eq!(asked, "GetNameOwner", "the client called {asked}");
+            server_reply(
+                stream,
+                1,
+                call.serial,
+                BUS_NAME,
+                "s",
+                &[Value::Str(owner.to_owned())],
+            );
+        }
+    }
+
+    /// An `ERROR` reply from `sender` to the call with serial `reply_to`.
+    pub(crate) fn server_error(
+        stream: &UnixStream,
+        reply_to: u32,
+        sender: &str,
+        name: &str,
+        message: &str,
+    ) {
+        server_send(
+            stream,
+            MSG_ERROR,
+            1,
+            &[
+                (FIELD_REPLY_SERIAL, Value::Uint32(reply_to)),
+                (FIELD_SENDER, Value::Str(sender.to_owned())),
+                (FIELD_ERROR_NAME, Value::Str(name.to_owned())),
+            ],
+            "s",
+            &[Value::Str(message.to_owned())],
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
     use std::io::{Read, Write};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::FileTypeExt;
-    use std::os::unix::net::{UnixListener, UnixStream};
-    use std::thread::JoinHandle;
+    use std::os::unix::net::UnixStream;
 
+    use super::testing::{
+        fake_bus, reply_bytes, serial_of, server_auth, server_hello, server_line, server_message,
+        server_reply, server_send, signal_bytes,
+    };
     use super::*;
 
     /// The `Hello` call bubbler opens every connection with, byte for
@@ -2056,183 +2408,6 @@ mod tests {
         assert_eq!(uid_hex(1000), "31303030");
         assert_eq!(uid_hex(0), "30");
         assert_eq!(uid_hex(4_294_967_295), "34323934393637323935");
-    }
-
-    /// The serial of a message: the second UINT32 of its header.
-    fn serial_of(message: &[u8]) -> u32 {
-        u32::from_le_bytes([message[8], message[9], message[10], message[11]])
-    }
-
-    /// A bus on a socket under `dir` that runs `script` on the one
-    /// connection it accepts.
-    fn fake_bus<F>(dir: &Path, script: F) -> (PathBuf, JoinHandle<()>)
-    where
-        F: FnOnce(UnixStream) + Send + 'static,
-    {
-        let path = dir.join("bus");
-        let listener = UnixListener::bind(&path).unwrap();
-        let handle = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            // So a client that never sends what the script waits for
-            // fails the test instead of hanging it.
-            stream
-                .set_read_timeout(Some(Duration::from_secs(20)))
-                .unwrap();
-            script(stream);
-        });
-        (path, handle)
-    }
-
-    /// One `\r\n` line from the client, read a byte at a time so none of
-    /// the message stream that follows `BEGIN` is swallowed.
-    fn server_line(stream: &UnixStream) -> String {
-        let mut out = Vec::new();
-        loop {
-            let mut byte = [0u8; 1];
-            (&*stream).read_exact(&mut byte).unwrap();
-            out.push(byte[0]);
-            if out.ends_with(b"\r\n") {
-                out.truncate(out.len() - 2);
-                return String::from_utf8(out).unwrap();
-            }
-        }
-    }
-
-    /// The `EXTERNAL` handshake from the bus's side, as the
-    /// specification's Figure 7 (or Figure 8 with `agree` false) has it.
-    fn server_auth(stream: &UnixStream, agree: bool) {
-        let uid = rustix::process::getuid().as_raw();
-        assert_eq!(
-            server_line(stream),
-            format!("\0AUTH EXTERNAL {}", uid_hex(uid))
-        );
-        (&*stream).write_all(b"OK 1234deadbeef\r\n").unwrap();
-        assert_eq!(server_line(stream), "NEGOTIATE_UNIX_FD");
-        let reply: &[u8] = if agree {
-            b"AGREE_UNIX_FD\r\n"
-        } else {
-            b"ERROR not on this transport\r\n"
-        };
-        (&*stream).write_all(reply).unwrap();
-        assert_eq!(server_line(stream), "BEGIN");
-    }
-
-    /// One whole message from the client, with any descriptors it carried.
-    fn server_message(stream: &UnixStream) -> (Vec<u8>, Vec<OwnedFd>) {
-        let mut buf: Vec<u8> = Vec::new();
-        let mut fds = Vec::new();
-        loop {
-            if buf.len() >= FIXED_HEADER {
-                let (body_at, body_len) = frame(&buf).unwrap();
-                if buf.len() >= body_at + body_len {
-                    buf.truncate(body_at + body_len);
-                    return (buf, fds);
-                }
-            }
-            let mut chunk = [0u8; 4096];
-            let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(8))];
-            let mut ancillary = RecvAncillaryBuffer::new(&mut space);
-            let got = recvmsg(
-                stream.as_fd(),
-                &mut [IoSliceMut::new(&mut chunk)],
-                &mut ancillary,
-                RecvFlags::CMSG_CLOEXEC,
-            )
-            .unwrap();
-            for message in ancillary.drain() {
-                if let RecvAncillaryMessage::ScmRights(received) = message {
-                    fds.extend(received);
-                }
-            }
-            assert!(got.bytes > 0, "the client hung up mid-message");
-            buf.extend_from_slice(&chunk[..got.bytes]);
-        }
-    }
-
-    /// Send one message from the bus's side.
-    fn server_send(
-        stream: &UnixStream,
-        kind: u8,
-        serial: u32,
-        fields: &[(u8, Value)],
-        sig: &str,
-        body: &[Value],
-    ) {
-        let mut fields = fields.to_vec();
-        if !sig.is_empty() {
-            fields.push((FIELD_SIGNATURE, Value::Signature(sig.to_owned())));
-        }
-        let body = encode(sig, body).unwrap();
-        let message = encode_message(kind, 0, serial, &fields, &body).unwrap();
-        (&*stream).write_all(&message).unwrap();
-    }
-
-    /// A `METHOD_RETURN` to the call with serial `reply_to`, from
-    /// `sender` — the bus fills that field in, so every reply has one.
-    fn server_reply(
-        stream: &UnixStream,
-        serial: u32,
-        reply_to: u32,
-        sender: &str,
-        sig: &str,
-        body: &[Value],
-    ) {
-        server_send(
-            stream,
-            MSG_METHOD_RETURN,
-            serial,
-            &[
-                (FIELD_REPLY_SERIAL, Value::Uint32(reply_to)),
-                (FIELD_SENDER, Value::Str(sender.to_owned())),
-            ],
-            sig,
-            body,
-        );
-    }
-
-    /// The bytes of a `METHOD_RETURN`, for a test that writes them itself.
-    fn reply_bytes(serial: u32, reply_to: u32, sender: &str, sig: &str, body: &[Value]) -> Vec<u8> {
-        let mut fields = vec![
-            (FIELD_REPLY_SERIAL, Value::Uint32(reply_to)),
-            (FIELD_SENDER, Value::Str(sender.to_owned())),
-        ];
-        if !sig.is_empty() {
-            fields.push((FIELD_SIGNATURE, Value::Signature(sig.to_owned())));
-        }
-        let body = encode(sig, body).unwrap();
-        encode_message(MSG_METHOD_RETURN, 0, serial, &fields, &body).unwrap()
-    }
-
-    /// A signal, which a pending call must skip whatever it carries.
-    fn signal_bytes(serial: u32, reply_serial: Option<u32>) -> Vec<u8> {
-        let mut fields = vec![
-            (FIELD_PATH, Value::ObjectPath("/org/a".to_owned())),
-            (FIELD_INTERFACE, Value::Str("org.a".to_owned())),
-            (FIELD_MEMBER, Value::Str("Changed".to_owned())),
-            (FIELD_SENDER, Value::Str(":1.5".to_owned())),
-            (FIELD_SIGNATURE, Value::Signature("s".to_owned())),
-        ];
-        if let Some(reply_serial) = reply_serial {
-            fields.push((FIELD_REPLY_SERIAL, Value::Uint32(reply_serial)));
-        }
-        let body = encode("s", &[Value::Str("ignore me".to_owned())]).unwrap();
-        encode_message(4, 0, serial, &fields, &body).unwrap()
-    }
-
-    /// Answer the `Hello` every connection opens with, and return the
-    /// bytes of the call so a test can look at them.
-    fn server_hello(stream: &UnixStream, name: &str) -> Vec<u8> {
-        let (bytes, fds) = server_message(stream);
-        assert!(fds.is_empty());
-        server_reply(
-            stream,
-            1,
-            serial_of(&bytes),
-            BUS_NAME,
-            "s",
-            &[Value::Str(name.to_owned())],
-        );
-        bytes
     }
 
     #[test]

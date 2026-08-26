@@ -564,6 +564,16 @@ pub(crate) fn host_a11y_bus(env: &Env) -> Result<PathBuf, LaunchError> {
 /// must name the same session as the socket the `dbus` grant proxies.
 /// [`host_bus`] resolves it, so an unset variable falls back to
 /// `$XDG_RUNTIME_DIR/bus` here as it does everywhere else.
+///
+/// That resolver is the unguarded one, and what makes it safe is an
+/// ordering rather than a check here: `a11y` is never granted without
+/// `dbus` (the parser refuses the node, see [`plan`]), and both the run
+/// and the explanation resolve the session bus through
+/// [`guarded_host_bus`] before they reach this. A
+/// `$DBUS_SESSION_BUS_ADDRESS` naming a socket under bubbler's own
+/// runtime directory has therefore already failed the run, instead of
+/// becoming the bus this client asks — a socket a sandboxed instance
+/// could answer on, with an accessibility address of its choosing.
 fn ask_a11y_bus(env: &Env) -> Result<PathBuf, LaunchError> {
     let mut session = Session::connect(&host_bus(env)?).map_err(a11y_failure)?;
     let reply = session
@@ -774,9 +784,7 @@ pub fn proxy_command_nodes(
 mod tests {
     use super::*;
     use crate::config::WaylandMode;
-    use crate::dbus_wire::{decode, encode};
-    use std::io::{Read, Write};
-    use std::os::unix::net::{UnixListener, UnixStream};
+    use crate::dbus_wire::testing::*;
     use std::thread::JoinHandle;
 
     fn strs(v: &[OsString]) -> Vec<&str> {
@@ -1521,192 +1529,18 @@ mod tests {
     /// from the D-Bus specification's "Header Fields" and "Message
     /// Format". `dbus_wire` keeps its own copies; a test that shares
     /// them would agree with the encoder by construction.
-    const FIELD_PATH: u8 = 1;
-    const FIELD_INTERFACE: u8 = 2;
-    const FIELD_MEMBER: u8 = 3;
-    const FIELD_ERROR_NAME: u8 = 4;
-    const FIELD_REPLY_SERIAL: u8 = 5;
-    const FIELD_DESTINATION: u8 = 6;
-    const FIELD_SIGNATURE: u8 = 8;
-    const MSG_METHOD_RETURN: u8 = 2;
-    const MSG_ERROR: u8 = 3;
+    /// The unique name the fake bus says `org.a11y.Bus` is held by.
+    /// Every reply carries the `SENDER` a real bus stamps on it, since
+    /// the client answers only to the owner of the name it called.
+    const A11Y_OWNER: &str = ":1.42";
 
-    /// A bus on a socket under `dir` that runs `script` on the one
-    /// connection it accepts, as `dbus_wire`'s own harness does it. Only
-    /// what the one call this module makes needs is here.
-    fn fake_bus<F>(dir: &Path, script: F) -> (PathBuf, JoinHandle<()>)
-    where
-        F: FnOnce(UnixStream) + Send + 'static,
-    {
-        let path = dir.join("bus");
-        let listener = UnixListener::bind(&path).unwrap();
-        let handle = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            // So a client that never sends what the script waits for
-            // fails the test instead of hanging it.
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(20)))
-                .unwrap();
-            script(stream);
-        });
-        (path, handle)
-    }
-
-    /// One `\r\n` line from the client, read a byte at a time so none of
-    /// the message stream that follows `BEGIN` is swallowed.
-    fn server_line(stream: &UnixStream) -> String {
-        let mut out = Vec::new();
-        loop {
-            let mut byte = [0u8; 1];
-            (&*stream).read_exact(&mut byte).unwrap();
-            out.push(byte[0]);
-            if out.ends_with(b"\r\n") {
-                out.truncate(out.len() - 2);
-                return String::from_utf8(out).unwrap();
-            }
-        }
-    }
-
-    /// The `EXTERNAL` handshake from the bus's side and the `Hello` reply
-    /// every connection owes, after which the script is on the call.
-    fn server_start(stream: &UnixStream) {
-        assert!(server_line(stream).starts_with("\0AUTH EXTERNAL "));
-        (&*stream).write_all(b"OK 1234deadbeef\r\n").unwrap();
-        assert_eq!(server_line(stream), "NEGOTIATE_UNIX_FD");
-        (&*stream).write_all(b"AGREE_UNIX_FD\r\n").unwrap();
-        assert_eq!(server_line(stream), "BEGIN");
-        let hello = server_message(stream);
-        server_reply(
-            stream,
-            serial_of(&hello),
-            "s",
-            &[Value::Str(":1.7".to_owned())],
-        );
-    }
-
-    /// One whole message from the client. After `BEGIN` the socket
-    /// carries messages only, and every header says how long its own
-    /// fields and its body are, so each message is read to its exact end.
-    fn server_message(stream: &UnixStream) -> Vec<u8> {
-        let mut head = [0u8; 16];
-        (&*stream).read_exact(&mut head).unwrap();
-        let word = |at: usize| {
-            u32::from_le_bytes(head[at..at + 4].try_into().expect("four bytes")) as usize
-        };
-        // The body starts on the next 8-byte boundary after the fields.
-        let mut rest = vec![0u8; word(12).next_multiple_of(8) + word(4)];
-        (&*stream).read_exact(&mut rest).unwrap();
-        [&head[..], &rest].concat()
-    }
-
-    /// The serial of a message: the second UINT32 of its header.
-    fn serial_of(message: &[u8]) -> u32 {
-        u32::from_le_bytes(message[8..12].try_into().expect("four bytes"))
-    }
-
-    /// The text of each header field of a message, in the order it was
-    /// written: what the client asked, and of whom.
-    fn text_fields(message: &[u8]) -> Vec<(u8, String)> {
-        let end = 16 + u32::from_le_bytes(message[12..16].try_into().expect("four bytes")) as usize;
-        let header = decode("yyyyuua(yv)", &message[..end]).unwrap();
-        let [.., Value::Array(fields)] = header.as_slice() else {
-            panic!("a header whose last member is not the field array");
-        };
-        fields
-            .iter()
-            .map(|field| {
-                let Value::Struct(pair) = field else {
-                    panic!("a header field that is not a struct");
-                };
-                let [Value::Byte(code), Value::Variant(value)] = pair.as_slice() else {
-                    panic!("a header field that is not a code and a variant");
-                };
-                let text = match &**value {
-                    Value::Str(s) | Value::ObjectPath(s) | Value::Signature(s) => s.clone(),
-                    other => format!("{other:?}"),
-                };
-                (*code, text)
-            })
-            .collect()
-    }
-
-    /// One message from the bus's side: the fixed header, the
-    /// header-field array, padding to the 8-byte boundary the body
-    /// starts on, and the body.
-    fn server_send(
-        stream: &UnixStream,
-        kind: u8,
-        fields: &[(u8, Value)],
-        sig: &str,
-        body: &[Value],
-    ) {
-        let body = encode(sig, body).unwrap();
-        let mut fields = fields.to_vec();
-        if !sig.is_empty() {
-            fields.push((FIELD_SIGNATURE, Value::Signature(sig.to_owned())));
-        }
-        let fields = Value::Array(
-            fields
-                .into_iter()
-                .map(|(code, value)| {
-                    Value::Struct(vec![Value::Byte(code), Value::Variant(Box::new(value))])
-                })
-                .collect(),
-        );
-        let mut message = encode(
-            "yyyyuua(yv)",
-            &[
-                // little-endian, this kind, no flags, protocol version 1
-                Value::Byte(b'l'),
-                Value::Byte(kind),
-                Value::Byte(0),
-                Value::Byte(1),
-                Value::Uint32(u32::try_from(body.len()).expect("a test body")),
-                // The bus's own serial; the client matches on the reply
-                // serial in the fields, never on this one.
-                Value::Uint32(1),
-                fields,
-            ],
-        )
-        .unwrap();
-        message.resize(message.len().next_multiple_of(8), 0);
-        message.extend_from_slice(&body);
-        (&*stream).write_all(&message).unwrap();
-    }
-
-    /// A `METHOD_RETURN` to the call with serial `reply_to`.
-    fn server_reply(stream: &UnixStream, reply_to: u32, sig: &str, body: &[Value]) {
-        server_send(
-            stream,
-            MSG_METHOD_RETURN,
-            &[(FIELD_REPLY_SERIAL, Value::Uint32(reply_to))],
-            sig,
-            body,
-        );
-    }
-
-    /// An `ERROR` reply: what the bus answers with when the name is not
-    /// there to answer for itself.
-    fn server_error(stream: &UnixStream, reply_to: u32, name: &str, message: &str) {
-        server_send(
-            stream,
-            MSG_ERROR,
-            &[
-                (FIELD_REPLY_SERIAL, Value::Uint32(reply_to)),
-                (FIELD_ERROR_NAME, Value::Str(name.to_owned())),
-            ],
-            "s",
-            &[Value::Str(message.to_owned())],
-        );
-    }
-
-    /// A bus that answers the one call with `sig` and `body`, whatever
-    /// they are.
+    /// A bus that answers the one call this module makes with `sig` and
+    /// `body`, whatever they are.
     fn bus_answering(dir: &Path, sig: &'static str, body: Vec<Value>) -> (PathBuf, JoinHandle<()>) {
         fake_bus(dir, move |stream| {
             server_start(&stream);
-            let call = server_message(&stream);
-            server_reply(&stream, serial_of(&call), sig, &body);
+            let call = server_awaiting(&stream, "GetAddress", A11Y_OWNER);
+            server_reply(&stream, 2, call.serial, A11Y_OWNER, sig, &body);
         })
     }
 
@@ -1715,11 +1549,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (bus, server) = fake_bus(tmp.path(), |stream| {
             server_start(&stream);
-            let call = server_message(&stream);
-            // The whole of what bubbler asks the session bus for: one
-            // method on one object of one name.
+            let call = server_awaiting(&stream, "GetAddress", A11Y_OWNER);
+            // The whole of what bubbler asks the accessibility bus for:
+            // one method on one object of one name.
             assert_eq!(
-                text_fields(&call),
+                call.texts(),
                 vec![
                     (FIELD_PATH, "/org/a11y/bus".to_owned()),
                     (FIELD_DESTINATION, "org.a11y.Bus".to_owned()),
@@ -1729,7 +1563,9 @@ mod tests {
             );
             server_reply(
                 &stream,
-                serial_of(&call),
+                2,
+                call.serial,
+                A11Y_OWNER,
                 "s",
                 &[Value::Str("unix:path=/run/user/1000/at-spi/bus".to_owned())],
             );
@@ -1779,10 +1615,11 @@ mod tests {
         // shown rather than sent to whatever terminal reads the error.
         let (_bus, server) = fake_bus(tmp.path(), |stream| {
             server_start(&stream);
-            let call = server_message(&stream);
+            let call = server_awaiting(&stream, "GetAddress", A11Y_OWNER);
             server_error(
                 &stream,
-                serial_of(&call),
+                call.serial,
+                A11Y_OWNER,
                 "org.freedesktop.DBus.Error.ServiceUnknown",
                 "The name is not activatable \x1b]52;c;aGk=\x07\nmore",
             );

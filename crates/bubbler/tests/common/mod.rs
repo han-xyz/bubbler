@@ -674,17 +674,71 @@ pub fn require_tray() -> bool {
 /// be tested here: no proxied session bus, or nothing owning
 /// `org.a11y.Bus` to answer `GetAddress` with the host socket's path.
 ///
-/// [`require_dbus`] has already looked for `dbus-send`, which is the
-/// program the launcher itself runs to ask that name.
+/// [`require_dbus`] has already looked for `dbus-send`, which these
+/// tests run *inside* the sandbox; the launcher itself asks the bus over
+/// its own client. A test about that lookup takes
+/// [`require_a11y_lookup`] instead, so a host without the program still
+/// runs the one test the program's absence is the point of.
 pub fn require_a11y() -> bool {
-    if !require_dbus() {
+    require_dbus() && a11y_has_owner()
+}
+
+/// Returns false (after printing why) when the accessibility bus lookup
+/// cannot be tested here: no bwrap, no `xdg-dbus-proxy`, no session bus
+/// on the host, or nothing owning `org.a11y.Bus`.
+///
+/// `dbus-send` is deliberately not among them.
+pub fn require_a11y_lookup() -> bool {
+    if !require_bwrap() {
         return false;
     }
-    let bus = bus_name_has_owner("org.a11y.Bus");
-    if !bus {
+    let proxy = has_program("xdg-dbus-proxy");
+    let bus = host_bus();
+    if !proxy || bus.is_none() {
+        say(&format!("skipping: xdg-dbus-proxy={proxy} bus={bus:?}"));
+        return false;
+    }
+    a11y_has_owner()
+}
+
+/// Whether `org.a11y.Bus` has an owner on the session bus right now,
+/// with the skip line when it has none.
+///
+/// `dbus-send` is asked wherever it is installed, so a bus client of
+/// bubbler's that stopped working fails the test instead of skipping it;
+/// on a host without that program, bubbler's own client is the only way
+/// left to ask.
+fn a11y_has_owner() -> bool {
+    let owner = match host_bus() {
+        _ if has_program("dbus-send") => bus_name_has_owner("org.a11y.Bus"),
+        Some(bus) => name_has_owner(&bus, "org.a11y.Bus"),
+        None => false,
+    };
+    if !owner {
         say("skipping: no org.a11y.Bus on the session bus");
     }
-    bus
+    owner
+}
+
+/// [`bus_name_has_owner`] over bubbler's own bus client, for a host with
+/// no `dbus-send` to ask with.
+fn name_has_owner(bus: &Path, name: &str) -> bool {
+    use bubbler_core::dbus_wire::{Session, Value};
+
+    let Ok(mut session) = Session::connect(bus) else {
+        return false;
+    };
+    session
+        .call(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "NameHasOwner",
+            "s",
+            &[Value::Str(name.to_owned())],
+            &[],
+        )
+        .is_ok_and(|reply| matches!(reply.as_slice(), [Value::Bool(true)]))
 }
 
 /// Returns false (after printing why) when a proxied session bus cannot

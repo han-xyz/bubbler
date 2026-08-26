@@ -666,17 +666,11 @@ impl ForwardError {
 #[cfg(test)]
 mod tests {
     use std::fs::FileType;
-    use std::io::{IoSliceMut, Read, Write};
-    use std::mem::MaybeUninit;
-    use std::os::unix::net::{UnixListener, UnixStream};
-    use std::thread::JoinHandle;
-    use std::time::Duration;
-
-    use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
+    use std::os::unix::net::UnixStream;
 
     use super::*;
     use crate::config::ShareMode;
-    use crate::dbus_wire::{decode, encode};
+    use crate::dbus_wire::testing::*;
     use crate::host::fake::{FakeHost, char_type, types};
 
     fn env() -> Env {
@@ -1055,231 +1049,23 @@ mod tests {
         assert_eq!(planned(&["/home/han/a.pdf"], &tree()).len(), 1);
     }
 
-    const FIELD_PATH: u8 = 1;
-    const FIELD_INTERFACE: u8 = 2;
-    const FIELD_MEMBER: u8 = 3;
-    const FIELD_ERROR_NAME: u8 = 4;
-    const FIELD_REPLY_SERIAL: u8 = 5;
-    const FIELD_DESTINATION: u8 = 6;
-    const FIELD_SENDER: u8 = 7;
-    const FIELD_SIGNATURE: u8 = 8;
-    const MSG_METHOD_RETURN: u8 = 2;
-    const MSG_ERROR: u8 = 3;
-
     /// The unique name the fake bus says the portal holds. Every reply
     /// carries the `SENDER` a real bus stamps on it.
     const PORTAL_OWNER: &str = ":1.77";
-    const BUS_OWNER: &str = "org.freedesktop.DBus";
 
-    /// One method call as the fake bus saw it.
-    struct Call {
-        fields: Vec<(u8, Value)>,
-        signature: String,
-        body: Vec<Value>,
-        serial: u32,
-        fds: Vec<OwnedFd>,
-    }
-
-    impl Call {
-        /// The text of a header field, e.g. the member name.
-        fn text(&self, code: u8) -> String {
-            match self.fields.iter().find(|(c, _)| *c == code) {
-                Some((_, Value::Str(text) | Value::ObjectPath(text))) => text.clone(),
-                other => panic!("header field {code} is {other:?}"),
-            }
-        }
-    }
-
-    /// A bus on a socket under `dir` that runs `script` on the one
-    /// connection it accepts.
-    fn fake_bus<F>(dir: &Path, script: F) -> (PathBuf, JoinHandle<()>)
-    where
-        F: FnOnce(UnixStream) + Send + 'static,
-    {
-        let path = dir.join("bus");
-        let listener = UnixListener::bind(&path).unwrap();
-        let handle = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            // So a client that never sends what the script waits for
-            // fails the test instead of hanging it.
-            stream
-                .set_read_timeout(Some(Duration::from_secs(20)))
-                .unwrap();
-            script(stream);
-        });
-        (path, handle)
-    }
-
-    /// One `\r\n` line from the client, read a byte at a time so none of
-    /// the message stream that follows `BEGIN` is swallowed.
-    fn server_line(stream: &UnixStream) -> String {
-        let mut out = Vec::new();
-        loop {
-            let mut byte = [0u8; 1];
-            (&*stream).read_exact(&mut byte).unwrap();
-            out.push(byte[0]);
-            if out.ends_with(b"\r\n") {
-                out.truncate(out.len() - 2);
-                return String::from_utf8(out).unwrap();
-            }
-        }
-    }
-
-    /// The `EXTERNAL` handshake and the `Hello` every connection opens
-    /// with, from the bus's side.
-    fn server_start(stream: &UnixStream) {
-        assert!(server_line(stream).starts_with("\0AUTH EXTERNAL "));
-        (&*stream).write_all(b"OK 1234deadbeef\r\n").unwrap();
-        assert_eq!(server_line(stream), "NEGOTIATE_UNIX_FD");
-        (&*stream).write_all(b"AGREE_UNIX_FD\r\n").unwrap();
-        assert_eq!(server_line(stream), "BEGIN");
-        let hello = server_call(stream);
-        assert_eq!(hello.text(FIELD_MEMBER), "Hello");
-        server_send(
-            stream,
-            MSG_METHOD_RETURN,
-            BUS_OWNER,
-            &[(FIELD_REPLY_SERIAL, Value::Uint32(hello.serial))],
-            "s",
-            &[Value::Str(":1.5".to_owned())],
-        );
-    }
-
-    /// The next `AddFull` the client makes. A lookup of who owns the
-    /// portal name is answered on the way, so this reads the same
-    /// whether or not the client checks who it is talking to.
+    /// The next `AddFull` the client makes, with the lookup of who owns
+    /// the portal name answered on the way.
     fn server_addfull(stream: &UnixStream) -> Call {
-        loop {
-            let call = server_call(stream);
-            match call.text(FIELD_MEMBER).as_str() {
-                "AddFull" => return call,
-                "GetNameOwner" => server_send(
-                    stream,
-                    MSG_METHOD_RETURN,
-                    BUS_OWNER,
-                    &[(FIELD_REPLY_SERIAL, Value::Uint32(call.serial))],
-                    "s",
-                    &[Value::Str(PORTAL_OWNER.to_owned())],
-                ),
-                other => panic!("the client called {other}"),
-            }
-        }
-    }
-
-    /// One whole method call from the client, with any descriptors it
-    /// carried. The header is `yyyyuua(yv)` and the body starts at the
-    /// next 8-byte boundary after it.
-    fn server_call(stream: &UnixStream) -> Call {
-        let mut buf: Vec<u8> = Vec::new();
-        let mut fds = Vec::new();
-        loop {
-            if buf.len() >= 16 {
-                let body_len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
-                let fields_len = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
-                let body_at = (16 + fields_len).next_multiple_of(8);
-                if buf.len() >= body_at + body_len {
-                    return parse_call(&buf[..body_at + body_len], fds);
-                }
-            }
-            let mut chunk = [0u8; 4096];
-            let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(8))];
-            let mut ancillary = RecvAncillaryBuffer::new(&mut space);
-            let got = recvmsg(
-                stream.as_fd(),
-                &mut [IoSliceMut::new(&mut chunk)],
-                &mut ancillary,
-                RecvFlags::CMSG_CLOEXEC,
-            )
-            .unwrap();
-            for message in ancillary.drain() {
-                if let RecvAncillaryMessage::ScmRights(received) = message {
-                    fds.extend(received);
-                }
-            }
-            assert!(got.bytes > 0, "the client hung up mid-message");
-            buf.extend_from_slice(&chunk[..got.bytes]);
-        }
-    }
-
-    fn parse_call(bytes: &[u8], fds: Vec<OwnedFd>) -> Call {
-        let fields_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-        let header = decode("yyyyuua(yv)", &bytes[..16 + fields_len]).unwrap();
-        let (Value::Uint32(serial), Value::Array(raw)) = (&header[5], &header[6]) else {
-            panic!("a header that is not a header: {header:?}");
-        };
-        let fields: Vec<(u8, Value)> = raw
-            .iter()
-            .map(|field| match field {
-                Value::Struct(pair) => match pair.as_slice() {
-                    [Value::Byte(code), Value::Variant(value)] => (*code, (**value).clone()),
-                    other => panic!("a header field that is not one: {other:?}"),
-                },
-                other => panic!("a header field that is not one: {other:?}"),
-            })
-            .collect();
-        let signature = match fields.iter().find(|(code, _)| *code == FIELD_SIGNATURE) {
-            Some((_, Value::Signature(sig))) => sig.clone(),
-            _ => String::new(),
-        };
-        let body_at = (16 + fields_len).next_multiple_of(8);
-        let body = decode(&signature, &bytes[body_at..]).unwrap();
-        Call {
-            fields,
-            signature,
-            body,
-            serial: *serial,
-            fds,
-        }
-    }
-
-    /// Send one message from the bus's side.
-    fn server_send(
-        stream: &UnixStream,
-        kind: u8,
-        sender: &str,
-        fields: &[(u8, Value)],
-        sig: &str,
-        body: &[Value],
-    ) {
-        let mut fields = fields.to_vec();
-        fields.push((FIELD_SENDER, Value::Str(sender.to_owned())));
-        if !sig.is_empty() {
-            fields.push((FIELD_SIGNATURE, Value::Signature(sig.to_owned())));
-        }
-        let fields: Vec<Value> = fields
-            .into_iter()
-            .map(|(code, value)| {
-                Value::Struct(vec![Value::Byte(code), Value::Variant(Box::new(value))])
-            })
-            .collect();
-        let body = encode(sig, body).unwrap();
-        let mut message = encode(
-            "yyyyuua(yv)",
-            &[
-                Value::Byte(b'l'),
-                Value::Byte(kind),
-                Value::Byte(0),
-                Value::Byte(1),
-                Value::Uint32(body.len() as u32),
-                Value::Uint32(7),
-                Value::Array(fields),
-            ],
-        )
-        .unwrap();
-        while !message.len().is_multiple_of(8) {
-            message.push(0);
-        }
-        message.extend_from_slice(&body);
-        (&*stream).write_all(&message).unwrap();
+        server_awaiting(stream, "AddFull", PORTAL_OWNER)
     }
 
     /// The `(as, a{sv})` an `AddFull` answers with.
     fn server_ids(stream: &UnixStream, call: &Call, ids: &[&str]) {
-        server_send(
+        server_reply(
             stream,
-            MSG_METHOD_RETURN,
+            2,
+            call.serial,
             PORTAL_OWNER,
-            &[(FIELD_REPLY_SERIAL, Value::Uint32(call.serial))],
             "asa{sv}",
             &[
                 Value::Array(ids.iter().map(|id| Value::Str((*id).to_owned())).collect()),
@@ -1410,19 +1196,12 @@ mod tests {
         let (bus, server) = fake_bus(tmp.path(), |stream| {
             server_start(&stream);
             let call = server_addfull(&stream);
-            server_send(
+            server_error(
                 &stream,
-                MSG_ERROR,
+                call.serial,
                 PORTAL_OWNER,
-                &[
-                    (FIELD_REPLY_SERIAL, Value::Uint32(call.serial)),
-                    (
-                        FIELD_ERROR_NAME,
-                        Value::Str("org.freedesktop.portal.Error.NotAllowed".to_owned()),
-                    ),
-                ],
-                "s",
-                &[Value::Str("no".to_owned())],
+                "org.freedesktop.portal.Error.NotAllowed",
+                "no",
             );
         });
         let mut session = Session::connect(&bus).unwrap();
@@ -1510,11 +1289,11 @@ mod tests {
             let call = server_addfull(&stream);
             server_ids(&stream, &call, &["one", "two"]);
             let call = server_addfull(&stream);
-            server_send(
+            server_reply(
                 &stream,
-                MSG_METHOD_RETURN,
+                3,
+                call.serial,
                 PORTAL_OWNER,
-                &[(FIELD_REPLY_SERIAL, Value::Uint32(call.serial))],
                 "s",
                 &[Value::Str("what".to_owned())],
             );

@@ -80,9 +80,9 @@ polkit-judged names (`system-bus-polkit-name`). Prefer a portal
 `a11y` is a **third bus** served by the same proxy process. bubbler finds the
 host's accessibility bus the way at-spi2's own clients do: `$AT_SPI_BUS_ADDRESS`
 if the session set one, else `org.a11y.Bus.GetAddress` on the session bus, asked
-over bubbler's own bus client — one call, no program on `PATH` and no shell.
-The filtered
-socket is bound at `$XDG_RUNTIME_DIR/at-spi/bus` inside and named in
+over bubbler's own bus client — one call, no program on `PATH` and no shell,
+so an `a11y` grant needs no package beyond the bus itself. The filtered socket
+is bound at `$XDG_RUNTIME_DIR/at-spi/bus` inside and named in
 `AT_SPI_BUS_ADDRESS`, which is what every toolkit reads first. A bus that
 cannot be found fails the run naming the step, never silently drops the grant;
 a `unix:abstract=` address is refused, since the proxy's sandbox has no host
