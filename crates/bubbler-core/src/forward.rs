@@ -553,6 +553,9 @@ fn visible_roots(
         add_root(&mut roots, host, same(PathBuf::from(root)), |_| true);
     }
     for name in ETC_ALLOWLIST {
+        // The baseline binds each entry wherever it resolves
+        // (`--ro-bind /etc/<name> /etc/<name>`, and bwrap resolves the
+        // source), so the tree it lands on is visible at that path.
         add_root(&mut roots, host, same(etc(name)), |_| true);
     }
     for service in &cfg.services {
@@ -578,7 +581,14 @@ fn visible_roots(
                 // otherwise claim every argument as already visible.
                 |_| crate::service::reserved_reason(host, env, path).is_none(),
             ),
-            Service::EtcShare { name } => add_root(&mut roots, host, same(etc(name)), |_| true),
+            Service::EtcShare { name } => add_root(
+                &mut roots,
+                host,
+                same(etc(name)),
+                // `etc_share` confines the entry to `/etc` and fails
+                // the launch when a symlink there names anything else.
+                |real| real.starts_with("/etc"),
+            ),
             _ => {}
         }
     }
@@ -822,11 +832,18 @@ fn is_document_id(id: &str) -> bool {
 
 /// Whether a wire failure happened before the call left this process,
 /// which leaves the connection exactly as it was. [`Session::call`]
-/// makes these checks in order before it sends anything: no
-/// destination, a connection that passes no descriptors, more
-/// descriptors than a message may carry, an index the call was not
-/// given, and the marshalling of the body. Everything else either sent
-/// bytes or read some, and is not a state to keep calling on.
+/// makes these checks before it sends anything: no destination, a
+/// connection that passes no descriptors, more descriptors than a
+/// message may carry, an index the call was not given, and a body that
+/// does not match the signature this module wrote.
+///
+/// Only failures the decoder cannot also raise are listed. The
+/// marshalling errors a reply can produce as easily as a body —
+/// `BadSignature` and `Unsupported` from a variant or a dict entry
+/// inside an answer, `BadString`, `ArrayTooLong`, `MessageTooLong`,
+/// `Depth` — count as breaking: the values bubbler encodes here cannot
+/// raise them, and reading a reply that far means the connection is
+/// past a point this client can account for.
 fn before_sending(e: &WireError) -> bool {
     matches!(
         e,
@@ -834,10 +851,8 @@ fn before_sending(e: &WireError) -> bool {
             | WireError::NoFdPassing
             | WireError::TooManyFds(_)
             | WireError::FdIndex(_)
-            | WireError::BadSignature(_)
             | WireError::Arity { .. }
             | WireError::TypeMismatch { .. }
-            | WireError::Unsupported(_)
     )
 }
 
@@ -1238,6 +1253,26 @@ mod tests {
     }
 
     #[test]
+    fn an_etc_share_that_leaves_etc_is_no_root() {
+        // `etc_share` refuses an entry that resolves outside `/etc`, so
+        // the tree it names is not visible inside and an argument under
+        // it is a file like any other.
+        let (file, ..) = types();
+        let host = tree()
+            .link("/etc/wild", "/mnt/wild")
+            .with("/mnt/wild/x.conf", file);
+        let cfg = InstanceConfig {
+            services: vec![Service::EtcShare {
+                name: "wild".into(),
+            }],
+            ..InstanceConfig::default()
+        };
+        let args = [OsString::from("/mnt/wild/x.conf")];
+        let out = plan(&env(), &cfg, Path::new(INSTANCE_HOME), &args, &host);
+        assert_eq!(tag(&out[0]), "forward /mnt/wild/x.conf as x.conf (read)");
+    }
+
+    #[test]
     fn a_home_share_that_leaves_the_home_is_no_root() {
         // `home-share` confines its source to the home directory, so a
         // source pointing out of it never becomes a rename root.
@@ -1402,6 +1437,34 @@ mod tests {
             0,
             "the client sent a message it had no reason to send"
         );
+    }
+
+    /// An `AddFull` answer whose `a{sv}` holds a variant claiming a type
+    /// code that is not one. The reply is well framed, so the client
+    /// reads it before refusing it — which is what puts the connection
+    /// past the point it can account for.
+    fn server_bad_variant(stream: &UnixStream, call: &Call) {
+        let mut message = reply_bytes(
+            9,
+            call.serial,
+            PORTAL_OWNER,
+            "asa{sv}",
+            &[
+                Value::Array(vec![Value::Str("one".to_owned())]),
+                Value::Dict(vec![(
+                    "k".to_owned(),
+                    Value::Variant(Box::new(Value::Str("v".to_owned()))),
+                )]),
+            ],
+        );
+        // The one `<len> s <nul>` in the message is that variant's own
+        // signature; `r` is reserved and names no type.
+        let at = message
+            .windows(3)
+            .position(|w| w == [1, b's', 0])
+            .expect("the variant signature is in the reply");
+        message[at + 1] = b'r';
+        (&*stream).write_all(&message).unwrap();
     }
 
     /// A reply in an endianness the client does not read: the call
@@ -1760,6 +1823,34 @@ mod tests {
             out[0].as_ref().unwrap().inside,
             PathBuf::from("/run/user/1000/doc/a1b2/new.pdf")
         );
+    }
+
+    #[test]
+    fn a_reply_the_client_cannot_read_ends_the_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = file(tmp.path(), "a.pdf");
+        let b = file(tmp.path(), "b.pdf");
+        let (bus, server) = fake_bus(tmp.path(), |stream| {
+            server_start(&stream);
+            let call = server_addfull(&stream);
+            server_bad_variant(&stream, &call);
+            server_end(&stream);
+        });
+        let mut session = Session::connect(&bus).unwrap();
+        let out = register(
+            &env(),
+            "pdf",
+            &[candidate(0, &a, true), candidate(1, &b, false)],
+            &mut session,
+        );
+        drop(session);
+        server.join().unwrap();
+        for answer in &out {
+            assert!(
+                matches!(answer.as_ref().unwrap_err(), ForwardError::Bus(_)),
+                "{answer:?}"
+            );
+        }
     }
 
     #[test]
