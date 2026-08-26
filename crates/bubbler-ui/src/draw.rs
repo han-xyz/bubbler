@@ -3,6 +3,7 @@
 //! screens testable against a `TestBackend` buffer.
 
 use bubbler_core::catalogue::Risk;
+use bubbler_core::kdl_out;
 use bubbler_core::lint::{Finding, Severity};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -262,6 +263,13 @@ fn instance_row(row: &InstanceRow) -> Row<'_> {
     ])
 }
 
+/// Columns a bordered pane spends on its own two edges.
+const BORDERS: usize = 2;
+
+/// Columns a row spends before its node text: the granted mark, the
+/// risk column, and a space either side of it.
+const MARKS: usize = 5;
+
 /// The instance being edited: its grants on the left, what the selected
 /// one costs on the right.
 fn detail(detail: &Detail, area: Rect, buf: &mut Buffer) {
@@ -279,6 +287,11 @@ fn detail(detail: &Detail, area: Rect, buf: &mut Buffer) {
     }
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(45), Constraint::Fill(1)]).areas(body);
+    // The mark and the risk column are what the eye runs down, so the
+    // width the border and those two leave is what the node text gets,
+    // and a node too wide is shortened rather than clipped by the pane:
+    // a clip takes off the `mode=` a share is read for.
+    let room = usize::from(left.width).saturating_sub(BORDERS + MARKS);
     let items = detail.rows.iter().map(|row| {
         let grant = row.grant();
         let risk = grant.map_or(Risk::Narrow, |g| g.risk);
@@ -287,7 +300,7 @@ fn detail(detail: &Detail, area: Rect, buf: &mut Buffer) {
             false => "○",
         };
         let text = match &row.text {
-            Some(text) => crate::detail::flatten(text),
+            Some(text) => kdl_out::shorten(&crate::detail::flatten(text), room),
             None => row.node.to_owned(),
         };
         let style = match row.granted() {
@@ -706,6 +719,23 @@ mod tests {
         u16::try_from(line.chars().take_while(|c| *c != text).count()).expect("a column")
     }
 
+    /// A share whose path fills the pane on its own: the cut goes into
+    /// the path so the mode is still on the row, which is what the row
+    /// is read for.
+    #[test]
+    fn a_long_share_is_cut_inside_its_path_so_its_mode_stays_on_the_row() {
+        let (_tmp, mut app) =
+            editor_over("home-share \"Documents/Reports/2026\" mode=rw\nnetwork\n");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let lines = screen(&app, 80, 8);
+        assert_eq!(
+            lines[2],
+            "│● !  home-share \"Documen…\" mode=rw││home-share  (wide)                        │"
+        );
+        // And the row below it, which needs no cutting, is untouched.
+        assert!(lines[3].starts_with("│○ !  home-share      "), "{lines:?}");
+    }
+
     #[test]
     fn a_disabled_entry_is_a_dimmed_row_of_its_own() {
         let (_tmp, mut app) = editor_over("wayland\n/-home-share \"Downloads\"\nnetwork\n");
@@ -716,7 +746,7 @@ mod tests {
             .position(|l| l.contains("home-share"))
             .expect("the disabled row");
         assert!(
-            lines[off].starts_with("│○ !  home-share \"Downloads\""),
+            lines[off].starts_with("│○ !  home-share \"Downloa…\" mode=ro"),
             "{:?}",
             lines[off]
         );
@@ -799,7 +829,7 @@ mod tests {
                 "┌grants────────────────────────────┐┌what it grants────────────────────────────┐",
                 "│●    wayland                      ││x11  (outward)                            │",
                 "│● !! x11 \"host\"                   ││x11 [\"host\"] [geometry=\"WxH\"]             │",
-                "│● !  home-share \"Downloads\" mode=r││[fullscreen=#true] [grab=#true]           │",
+                "│● !  home-share \"Downloa…\" mode=rw││[fullscreen=#true] [grab=#true]           │",
                 // The row that writes a second share, right after the
                 // one the file holds.
                 "│○ !  home-share                   ││[wm=\"<program>\"]                          │",

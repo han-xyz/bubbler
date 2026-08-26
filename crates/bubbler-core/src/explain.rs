@@ -133,43 +133,34 @@ fn carries_rules(s: &Service) -> bool {
     )
 }
 
-/// `label` cut to [`LABEL_MAX`] characters, with the cut marked.
-fn shorten(label: String) -> String {
-    if label.chars().count() <= LABEL_MAX {
-        return label;
-    }
-    label
-        .chars()
-        .take(LABEL_MAX - 1)
-        .chain(std::iter::once('…'))
-        .collect()
-}
-
 /// The node an origin names, as its KDL. A block node is named by the
 /// line it opens on, since the rules under it are not arguments.
 fn label(origin: Origin, cfg: &InstanceConfig) -> Result<String, ConfigError> {
-    Ok(shorten(match origin {
-        Origin::Baseline => "baseline".to_owned(),
-        Origin::Seccomp => "seccomp".to_owned(),
-        Origin::Userns => "userns".to_owned(),
-        Origin::Ctty => "ctty".to_owned(),
-        Origin::Identity => "identity".to_owned(),
-        Origin::Init => "init".to_owned(),
-        Origin::Command => "command".to_owned(),
-        Origin::Env(i) => match cfg.env.get(i) {
-            Some((k, _)) => format!("env {k}"),
-            None => format!("env #{i}"),
+    Ok(kdl_out::shorten(
+        &match origin {
+            Origin::Baseline => "baseline".to_owned(),
+            Origin::Seccomp => "seccomp".to_owned(),
+            Origin::Userns => "userns".to_owned(),
+            Origin::Ctty => "ctty".to_owned(),
+            Origin::Identity => "identity".to_owned(),
+            Origin::Init => "init".to_owned(),
+            Origin::Command => "command".to_owned(),
+            Origin::Env(i) => match cfg.env.get(i) {
+                Some((k, _)) => format!("env {k}"),
+                None => format!("env #{i}"),
+            },
+            Origin::Service(i) => match cfg.services.get(i) {
+                Some(s) => kdl_out::service(s)?
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .trim_end_matches(" {")
+                    .to_owned(),
+                None => format!("service #{i}"),
+            },
         },
-        Origin::Service(i) => match cfg.services.get(i) {
-            Some(s) => kdl_out::service(s)?
-                .lines()
-                .next()
-                .unwrap_or_default()
-                .trim_end_matches(" {")
-                .to_owned(),
-            None => format!("service #{i}"),
-        },
-    }))
+        LABEL_MAX,
+    ))
 }
 
 /// Where the node behind `origin` was written, in this view. The
@@ -1263,7 +1254,26 @@ bwrap
         let text = label(Origin::Service(0), &cfg).unwrap();
         assert_eq!(text.chars().count(), LABEL_MAX);
         assert!(text.starts_with("path-share \"/srv/xxx"), "{text}");
-        assert!(text.ends_with('…'), "{text}");
+        // The cut is inside the path, so the mode is still on the line:
+        // a group header that dropped it would hide how wide the bind is.
+        assert!(text.ends_with("…\" mode=ro"), "{text}");
+    }
+
+    /// The header of the node that motivated the rule: an application id
+    /// long enough that the whole line does not fit the column.
+    #[test]
+    fn a_long_app_runtime_keeps_its_mode_in_the_header() {
+        let cfg = InstanceConfig {
+            services: vec![Service::AppRuntime {
+                id: "org.keepassxc.KeePassXC".to_owned(),
+                mode: ShareMode::ReadOnly,
+            }],
+            ..InstanceConfig::default()
+        };
+        assert_eq!(
+            label(Origin::Service(0), &cfg).unwrap(),
+            r#"app-runtime "org.keepassxc.Kee…" mode=ro"#
+        );
     }
 
     #[test]

@@ -266,6 +266,86 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
     })
 }
 
+/// `node` cut to `max` characters for a display column, with the cut
+/// marked `…`. Where something follows the node's first quoted argument
+/// — the `mode=` of a share, a second argument, the brace closing a
+/// block — the cut is made *inside* that argument so what follows stays
+/// in view: a `home-share` whose mode fell off the end would hide the
+/// one thing the reader is looking for. A node with nothing after its
+/// argument, and one whose remainder does not fit on its own, is cut at
+/// the end as any other text would be. Display only: the result is not
+/// KDL the parser reads back.
+pub fn shorten(node: &str, max: usize) -> String {
+    if node.chars().count() <= max {
+        return node.to_owned();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    shorten_in_argument(node, max).unwrap_or_else(|| {
+        node.chars()
+            .take(max - 1)
+            .chain(std::iter::once('…'))
+            .collect()
+    })
+}
+
+/// `node` cut inside its first quoted argument, or `None` where that
+/// buys nothing: no quoted argument, nothing after it, or a remainder
+/// leaving no room for even one character of the argument itself.
+fn shorten_in_argument(node: &str, max: usize) -> Option<String> {
+    let chars: Vec<char> = node.chars().collect();
+    let open = chars.iter().position(|c| *c == '"')?;
+    let close = closing_quote(&chars, open)?;
+    if close + 1 == chars.len() {
+        return None;
+    }
+    // The `…` takes a column of its own, between what is kept of the
+    // argument and the closing quote.
+    let budget = max
+        .checked_sub(open + 1 + (chars.len() - close) + 1)
+        .filter(|b| *b > 0)?;
+    // Never end on a lone `\`, which would read as escaping the quote
+    // the cut puts right after it.
+    let inner = &chars[open + 1..close];
+    let mut kept = budget.min(inner.len());
+    while kept > 0
+        && inner[..kept]
+            .iter()
+            .rev()
+            .take_while(|c| **c == '\\')
+            .count()
+            % 2
+            == 1
+    {
+        kept -= 1;
+    }
+    if kept == 0 {
+        return None;
+    }
+    Some(
+        chars[..=open]
+            .iter()
+            .chain(&inner[..kept])
+            .chain(std::iter::once(&'…'))
+            .chain(&chars[close..])
+            .collect(),
+    )
+}
+
+/// Index of the `"` closing the one at `open`, honouring `\"` inside it.
+fn closing_quote(chars: &[char], open: usize) -> Option<usize> {
+    let mut i = open + 1;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 2,
+            '"' => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 /// The `mode=` value of a share. Written on every share, default or
 /// not: how wide a bind is open is what a reader of the file is looking
 /// for, and a node that says nothing leaves them to remember the default.
@@ -730,6 +810,46 @@ mod tests {
         assert_eq!(
             render(&cfg).unwrap(),
             "home-share \"x\" mode=ro\napp-runtime \"org.example.App\" mode=ro\n"
+        );
+    }
+
+    #[test]
+    fn a_node_too_wide_for_its_column_is_cut_inside_its_argument() {
+        // The mode is what a share is read for, so the cut goes into the
+        // path or id and what follows it stays on screen.
+        assert_eq!(
+            shorten(r#"app-runtime "org.keepassxc.KeePassXC" mode=ro"#, 40),
+            r#"app-runtime "org.keepassxc.Kee…" mode=ro"#
+        );
+        assert_eq!(
+            shorten(r#"home-share "Documents/Reports/2026" mode=rw"#, 29),
+            r#"home-share "Documen…" mode=rw"#
+        );
+        // A block node keeps the brace that closes it.
+        assert_eq!(
+            shorten(r#"dbus { talk "ca.desrt.dconf" }"#, 24),
+            r#"dbus { talk "ca.desr…" }"#
+        );
+        // A node that fits is left alone, and one with nothing after its
+        // argument is cut at the end, where there is nothing to protect.
+        assert_eq!(
+            shorten(r#"home-share "Downloads" mode=ro"#, 40),
+            r#"home-share "Downloads" mode=ro"#
+        );
+        assert_eq!(
+            shorten(r#"etc-share "a-very-long-entry-name""#, 20),
+            r#"etc-share "a-very-l…"#
+        );
+        // A remainder too wide on its own leaves no argument to cut, so
+        // the node is cut at the end rather than into nonsense.
+        assert_eq!(
+            shorten(r#"home-share "x" reason="a reason far too long""#, 20),
+            r#"home-share "x" reas…"#
+        );
+        // And never a cut leaving a `\` to escape the quote put after it.
+        assert_eq!(
+            shorten(r#"home-share "a\\b" mode=ro"#, 24),
+            r#"home-share "a…" mode=ro"#
         );
     }
 

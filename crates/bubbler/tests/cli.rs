@@ -992,10 +992,10 @@ fn app_runtime_binds_only_the_leaf_and_explain_names_the_node() {
         .output()
         .unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
-    // Long enough that `--explain`'s label cap elides the tail, so the
-    // node is pinned by what fits rather than by the whole line.
+    // Too long for the label column, so the cut goes into the id and
+    // the mode is still on the header.
     assert!(
-        s.contains("  app-runtime \"org.keepassxc.KeePassXC\" "),
+        s.contains("  app-runtime \"org.keepassxc.Kee…\" mode=ro "),
         "{s}"
     );
     assert!(
