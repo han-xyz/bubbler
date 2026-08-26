@@ -252,9 +252,10 @@ permissions on it in the way `gamepad` and `hidraw` are.
 `compute` binds `/dev/kfd` read-write with the KFD and NUMA topology in
 `/sys`. One node serves **every** AMD GPU on the machine, and systemd's
 `50-udev-default.rules` already gives it `MODE="0666"`, so the grant and not
-an ACL is the whole decision. It requires `dri`, and against `dri` it costs
-little more: the same GPU, the same driver, the same memory another
-application left on the card.
+an ACL is the whole decision. It requires `dri`, and against `dri` what it
+adds is reach rather than a new class of access: a compute job goes to the
+same GPU through the same kernel driver the render nodes already opened, so it
+carries no capture risk `dri` did not carry.
 
 `usb` bare binds the `/dev/bus/usb` directory read-write: raw I/O to every USB
 device, hotplug included, which is what `bubbler lint` warns about as

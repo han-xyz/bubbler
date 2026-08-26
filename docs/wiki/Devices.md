@@ -4,11 +4,12 @@ Each grant below names paths it **requires** at launch and, in some cases,
 paths it binds only where the host has them. A required path that is missing,
 or is not of the type expected, stops the run — never a quietly weaker
 sandbox — and each section says which is which. Broadly: the device node and
-the sysfs a grant cannot work without are required (`/dev/dri` and the PCI
-roots for `dri`, `/dev/input` with `/sys/class/input` and `/sys/devices` for
-`gamepad`, `/dev/kfd` and its topology for `compute`, `/sys/bus/usb` for
-`usb` — plus `/dev/bus/usb` and `/sys/devices` for the bare form, and each
-node a filter matched — the `pcscd` socket for `smartcard`,
+the sysfs a grant cannot work without are required (`/dev/dri` with
+`/sys/dev/char`, `/sys/devices/system/cpu` and at least one
+`/sys/devices/pci*` root for `dri`, `/dev/input` with `/sys/class/input` and
+`/sys/devices` for `gamepad`, `/dev/kfd` and its topology for `compute`,
+`/sys/bus/usb` for `usb` — plus `/dev/bus/usb` and `/sys/devices` for the bare
+form, and each node a filter matched — the `pcscd` socket for `smartcard`,
 `/dev/uinput` for `gamepad uinput=#true`), while the hardware a host may
 simply not have is bound where it exists (`/dev/nvidia*`, `/dev/video*`,
 `/dev/hidraw*`, `/run/udev`).
