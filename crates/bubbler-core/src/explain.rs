@@ -371,6 +371,51 @@ fn rules_of(index: usize, rules: &[(usize, String)]) -> Vec<String> {
 /// would otherwise render as a grant that did nothing.
 const CAMERA_PORTAL: &str = "org.freedesktop.portal.Camera, carried by the portals bundle";
 
+/// What a `compute` node reaches, which its paths do not say: the one
+/// node is every AMD GPU on the machine rather than a card, and the
+/// sysfs half is what a runtime reads to find them.
+const COMPUTE_GRANT: &str = "every AMD GPU on this machine through the one /dev/kfd node, \
+                             with the sysfs topology a compute runtime reads to find them";
+
+/// What a bare `usb` node reaches. The directory is bound rather than
+/// the nodes in it, which is why a device plugged in later is inside as
+/// well — the one difference from the filtered form that no argument of
+/// either shows.
+const USB_ALL_GRANT: &str = "raw I/O to every USB device on this host, the directory bound \
+                             rather than the nodes in it, so one plugged in later is inside too";
+
+/// What a `smartcard` node reaches through the one socket it binds.
+const SMARTCARD_GRANT: &str = "every reader and card pcscd has, at the level of the APDUs a card \
+                               answers; no device node is bound";
+
+/// The devices a filtered `usb` node resolved to, as the ids the node
+/// named against the bus and device number they were found at.
+///
+/// Read back out of the usbfs paths the node bound: that path is where
+/// those numbers are, and nothing else in the view says which device
+/// `/dev/bus/usb/001/004` is. What is read is the source path rather
+/// than the operation in front of it, so a node bound with `-try` — as
+/// one whose device may be unplugged before the exec is — reads the
+/// same. A node that named a vendor alone matched every product of it,
+/// which is what the `*` stands for; one that matched nothing bound no
+/// such path, and the line then says what the launch said on stderr.
+fn usb_matched(vendor: &str, product: Option<&str>, items: &[&Explained]) -> Vec<String> {
+    let id = format!("{vendor}:{}", product.unwrap_or("*"));
+    let found: Vec<String> = items
+        .iter()
+        .filter_map(|i| i.args.get(1)?.to_str()?.strip_prefix("/dev/bus/usb/"))
+        .filter_map(|node| node.split_once('/'))
+        .map(|(bus, dev)| format!("{id} at bus {bus} device {dev}"))
+        .collect();
+    if !found.is_empty() {
+        return found;
+    }
+    vec![match product {
+        Some(product) => format!("no device matches vendor={vendor} product={product}"),
+        None => format!("no device matches vendor={vendor}"),
+    }]
+}
+
 /// What a `seccomp` node did to the default denylist, which is the whole
 /// grant of one that disables the filter and loads no program at all.
 fn seccomp_lines(cfg: &SeccompConfig) -> Vec<String> {
@@ -460,6 +505,20 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
                     Some(Service::X11(X11Mode::Host)) => {
                         out.push("    raw socket: x11 \"host\"".to_owned());
                     }
+                    // The paths a hardware grant binds are arguments
+                    // above it; what they reach on this machine is not.
+                    Some(Service::Compute) => out.push(format!("    grants: {COMPUTE_GRANT}")),
+                    Some(Service::Smartcard) => out.push(format!("    grants: {SMARTCARD_GRANT}")),
+                    Some(Service::Usb { vendor: None, .. }) => {
+                        out.push(format!("    grants: {USB_ALL_GRANT}"));
+                    }
+                    Some(Service::Usb {
+                        vendor: Some(vendor),
+                        product,
+                    }) => out.extend(under(
+                        "matched: ",
+                        usb_matched(vendor, product.as_deref(), &g.items),
+                    )),
                     // The nested mode needs no line of its own: the argv
                     // it hands the supervisor is an argument above, and
                     // that one carries the explanation.
@@ -998,6 +1057,229 @@ bwrap
         .unwrap();
         assert!(
             out.contains(&format!("    rules: {CAMERA_PORTAL}")),
+            "{out:#?}"
+        );
+    }
+
+    /// Every path a `compute` node binds is an argument above it; what
+    /// those paths reach is not. One `/dev/kfd` is every AMD GPU the
+    /// machine has, and the socket `smartcard` binds says nothing about
+    /// the readers behind it either.
+    #[test]
+    fn compute_and_smartcard_say_what_the_paths_they_bind_reach() {
+        let cfg = cfg("dri\ncompute\nsmartcard\ncommand \"true\"");
+        let lines = Lines {
+            services: vec![Some(1), Some(2), Some(3)],
+            ..Lines::default()
+        };
+        let out = render(
+            &[
+                item(
+                    Origin::Service(1),
+                    &["--dev-bind", "/dev/kfd", "/dev/kfd"],
+                    None,
+                ),
+                item(
+                    Origin::Service(1),
+                    &["--ro-bind", "/sys/class/kfd", "/sys/class/kfd"],
+                    None,
+                ),
+                item(
+                    Origin::Service(2),
+                    &[
+                        "--ro-bind",
+                        "/run/pcscd/pcscd.comm",
+                        "/run/pcscd/pcscd.comm",
+                    ],
+                    None,
+                ),
+            ],
+            &View {
+                title: "bwrap",
+                instance: "t",
+                cfg: &cfg,
+                source: Source {
+                    file: "config.kdl",
+                    lines: &lines,
+                },
+                rules: &[],
+                wl_proxy: None,
+                proxy: false,
+                full: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            out.join("\n"),
+            format!(
+                "\
+bwrap
+
+  dri        config.kdl:1  0 arguments
+
+  compute    config.kdl:2  6 arguments
+    --dev-bind /dev/kfd /dev/kfd
+    --ro-bind /sys/class/kfd /sys/class/kfd
+    grants: {COMPUTE_GRANT}
+
+  smartcard  config.kdl:3  3 arguments
+    --ro-bind /run/pcscd/pcscd.comm /run/pcscd/pcscd.comm
+    grants: {SMARTCARD_GRANT}
+
+9 arguments in 3 groups"
+            )
+        );
+    }
+
+    /// The bare node binds a directory, and a directory is what makes a
+    /// device plugged in later reachable too — which no argument of it
+    /// says.
+    #[test]
+    fn a_bare_usb_grant_says_it_is_every_device() {
+        let cfg = cfg("usb\ncommand \"true\"");
+        let lines = Lines::default();
+        let out = render(
+            &[item(
+                Origin::Service(0),
+                &["--dev-bind", "/dev/bus/usb", "/dev/bus/usb"],
+                None,
+            )],
+            &View {
+                title: "bwrap",
+                instance: "t",
+                cfg: &cfg,
+                source: Source {
+                    file: "config.kdl",
+                    lines: &lines,
+                },
+                rules: &[],
+                wl_proxy: None,
+                proxy: false,
+                full: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            out.contains(&format!("    grants: {USB_ALL_GRANT}")),
+            "{out:#?}"
+        );
+    }
+
+    /// A filtered node's arguments name usbfs paths, and
+    /// `/dev/bus/usb/001/004` says nothing about which device that is:
+    /// the numbers are where it happens to be plugged in. The ids the
+    /// node asked for, against the bus and device number they were found
+    /// at, are what tie the two together — and a node that matched
+    /// nothing has no argument at all to be read from.
+    #[test]
+    fn a_filtered_usb_grant_names_the_devices_it_matched() {
+        let cfg = cfg(
+            "usb vendor=\"1532\" product=\"0531\"\nusb vendor=\"0b05\"\n\
+             usb vendor=\"ffff\" product=\"ffff\"\ncommand \"true\"",
+        );
+        let lines = Lines {
+            services: vec![Some(1), Some(2), Some(3)],
+            ..Lines::default()
+        };
+        let out = render(
+            &[
+                // The first filtered node carries the `/sys/bus/usb`
+                // bind every one of them reads through.
+                item(
+                    Origin::Service(0),
+                    &["--ro-bind", "/sys/bus/usb", "/sys/bus/usb"],
+                    None,
+                ),
+                item(
+                    Origin::Service(0),
+                    &[
+                        "--dev-bind-try",
+                        "/dev/bus/usb/001/004",
+                        "/dev/bus/usb/001/004",
+                    ],
+                    None,
+                ),
+                item(
+                    Origin::Service(0),
+                    &[
+                        "--ro-bind",
+                        "/sys/devices/pci0000:00/usb1/1-8",
+                        "/sys/devices/pci0000:00/usb1/1-8",
+                    ],
+                    None,
+                ),
+                item(
+                    Origin::Service(1),
+                    &[
+                        "--dev-bind-try",
+                        "/dev/bus/usb/001/003",
+                        "/dev/bus/usb/001/003",
+                    ],
+                    None,
+                ),
+                item(
+                    Origin::Service(1),
+                    &[
+                        "--ro-bind",
+                        "/sys/devices/pci0000:00/usb1/1-7",
+                        "/sys/devices/pci0000:00/usb1/1-7",
+                    ],
+                    None,
+                ),
+                item(
+                    Origin::Service(1),
+                    &[
+                        "--dev-bind-try",
+                        "/dev/bus/usb/005/002",
+                        "/dev/bus/usb/005/002",
+                    ],
+                    None,
+                ),
+                item(
+                    Origin::Service(1),
+                    &[
+                        "--ro-bind",
+                        "/sys/devices/pci0000:00/usb5/5-1",
+                        "/sys/devices/pci0000:00/usb5/5-1",
+                    ],
+                    None,
+                ),
+            ],
+            &View {
+                title: "bwrap",
+                instance: "t",
+                cfg: &cfg,
+                source: Source {
+                    file: "config.kdl",
+                    lines: &lines,
+                },
+                rules: &[],
+                wl_proxy: None,
+                proxy: false,
+                full: false,
+            },
+        )
+        .unwrap();
+        // The ids as the node wrote them, so a vendor-only node reads as
+        // the every-product filter it is; the numbers come back out of
+        // the usbfs path the argument holds.
+        assert!(
+            out.contains(&"    matched: 1532:0531 at bus 001 device 004".to_owned()),
+            "{out:#?}"
+        );
+        // Two devices of one node, the second aligned under the first.
+        assert!(
+            out.contains(&"    matched: 0b05:* at bus 001 device 003".to_owned()),
+            "{out:#?}"
+        );
+        assert!(
+            out.contains(&"             0b05:* at bus 005 device 002".to_owned()),
+            "{out:#?}"
+        );
+        // The node that matched nothing is the one whose whole grant is
+        // this line: it produced no argument to be found under.
+        assert!(
+            out.contains(&"    matched: no device matches vendor=ffff product=ffff".to_owned()),
             "{out:#?}"
         );
     }

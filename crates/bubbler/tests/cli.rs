@@ -13,12 +13,13 @@ use bubbler_core::bwrap::ETC_ALLOWLIST;
 use bubbler_core::profile::NAMES;
 use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
-    PYTHON, bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, bubbler_wayland, bwrap_alive,
-    kill_group, output_past_a_busy_exec, process_running, real_init, require_a11y,
-    require_a11y_lookup, require_bwrap, require_dbus, require_document_portal, require_groff,
-    require_host_program, require_nested_x11, require_nested_x11_host, require_nft, require_pasta,
-    require_portal, require_python, require_security_context, require_system_bus, require_tray,
-    say, system_owns, test_pty,
+    LSUSB, PYTHON, USB_DEVICES, bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live,
+    bubbler_wayland, bwrap_alive, kill_group, output_past_a_busy_exec, process_running, real_init,
+    require_a11y, require_a11y_lookup, require_bwrap, require_dbus, require_document_portal,
+    require_groff, require_host_program, require_kfd, require_nested_x11, require_nested_x11_host,
+    require_nft, require_pasta, require_pcscd, require_portal, require_python,
+    require_security_context, require_system_bus, require_tray, require_usb_device, say,
+    system_owns, test_pty,
 };
 use rustix::fs::{FlockOperation, OFlags, fcntl_getfl, flock};
 use rustix::process::{Pid, Signal, kill_process};
@@ -1871,6 +1872,376 @@ fn real_bwrap_dri_hands_over_the_hosts_nvidia_stack() {
         .is_ok_and(|o| o.status.success())
     {
         assert!(rest.contains("GPU 0:"), "{stdout}");
+    }
+}
+
+/// One USB device as sysfs reports it: the two ids a filtered `usb` node
+/// is resolved against, and the numbers the usbfs node is named by.
+#[derive(Clone)]
+struct UsbDevice {
+    vendor: String,
+    product: String,
+    bus: u16,
+    dev: u16,
+}
+
+impl UsbDevice {
+    /// The `/dev/bus/usb` node this device is reached through, zero-padded
+    /// the way usbfs names it.
+    fn node(&self) -> String {
+        format!("/dev/bus/usb/{:03}/{:03}", self.bus, self.dev)
+    }
+
+    /// `vendor:product`, which is the field `lsusb` prints after `ID`.
+    fn id(&self) -> String {
+        format!("{}:{}", self.vendor, self.product)
+    }
+}
+
+/// Every USB device this host's sysfs reports. An entry missing one of
+/// the four attributes is an interface (`1-2:1.0`) rather than a device,
+/// and is passed over here as the grant passes over it.
+fn host_usb_devices() -> Vec<UsbDevice> {
+    let attr = |dir: &Path, name: &str| {
+        std::fs::read_to_string(dir.join(name))
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+    };
+    let Ok(entries) = std::fs::read_dir(USB_DEVICES) else {
+        return Vec::new();
+    };
+    let mut out: Vec<UsbDevice> = entries
+        .flatten()
+        .filter_map(|e| {
+            let dir = e.path();
+            Some(UsbDevice {
+                vendor: attr(&dir, "idVendor")?,
+                product: attr(&dir, "idProduct")?,
+                bus: attr(&dir, "busnum")?.parse().ok()?,
+                dev: attr(&dir, "devnum")?.parse().ok()?,
+            })
+        })
+        .collect();
+    out.sort_unstable_by_key(|d| (d.bus, d.dev));
+    out
+}
+
+/// A device whose ids no other device here reports, so a node naming
+/// those two can match nothing else. `None`, with the skip printed,
+/// where every device shares its ids with another: two identical root
+/// hubs are the ordinary case.
+fn a_unique_usb_device() -> Option<UsbDevice> {
+    let all = host_usb_devices();
+    let one = all
+        .iter()
+        .find(|d| all.iter().filter(|o| o.id() == d.id()).count() == 1)
+        .cloned();
+    if one.is_none() {
+        say("skipping: every USB device here shares its ids with another");
+    }
+    one
+}
+
+/// The `vendor:product` of every device an `lsusb` listing names, sorted.
+fn lsusb_ids(listing: &str) -> Vec<String> {
+    let mut ids: Vec<String> = listing
+        .lines()
+        .filter_map(|l| l.split_once(" ID ")?.1.split_whitespace().next())
+        .map(str::to_owned)
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// The bare node binds the whole `/dev/bus/usb` directory, so what
+/// libusb enumerates inside is what it enumerates on the host.
+#[test]
+fn real_usb_lists_devices_inside() {
+    if !require_bwrap() || !require_usb_device() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["try", "--grant", "usb", "--", LSUSB])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.lines().any(|l| l.starts_with("Bus ")), "{stdout}");
+    // The host's own listing through the same program: the directory is
+    // bound, so neither side may hold a device the other does not.
+    let host = Command::new(LSUSB).output().unwrap();
+    assert_eq!(
+        lsusb_ids(&stdout),
+        lsusb_ids(&String::from_utf8_lossy(&host.stdout)),
+        "{stdout}"
+    );
+}
+
+/// The filtered form is resolved against sysfs at launch and binds one
+/// usbfs node: the device the ids name, and nothing else on any bus.
+#[test]
+fn real_usb_filter_binds_only_the_named_device() {
+    if !require_bwrap() || !require_usb_device() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let Some(device) = a_unique_usb_device() else {
+        return;
+    };
+    let tmp = setup();
+    let name = instance_name("usb");
+    bubbler_live(tmp.path(), &init)
+        .args(["create", &name])
+        .status()
+        .unwrap();
+    std::fs::write(
+        tmp.path()
+            .join("data/bubbler/instances")
+            .join(&name)
+            .join("config.kdl"),
+        format!(
+            "usb vendor=\"{}\" product=\"{}\"\n",
+            device.vendor, device.product
+        ),
+    )
+    .unwrap();
+
+    let out = bubbler_live(tmp.path(), &init)
+        .args([
+            "run",
+            name.as_str(),
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            "ls /dev/bus/usb/*/*",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}\n", device.node())
+    );
+
+    // libusb walks the same directory, so the listing inside is that one
+    // device: the others' bus entries point at nodes which are not there.
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["run", name.as_str(), "--", LSUSB])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(lsusb_ids(&stdout), vec![device.id()], "{stdout}");
+}
+
+/// `compute` is the `/dev/kfd` node a ROCm runtime opens and the KFD
+/// topology it enumerates the GPUs from; `dri` is required beside it and
+/// holds the render nodes that topology names.
+#[test]
+fn real_compute_binds_kfd() {
+    if !require_bwrap() || !require_kfd() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let nodes = Path::new("/sys/class/kfd/kfd/topology/nodes");
+    if !Path::new("/dev/dri").is_dir() || !nodes.is_dir() {
+        say("skipping: this host has /dev/kfd without /dev/dri or the KFD topology");
+        return;
+    }
+    let tmp = setup();
+    let out = bubbler_live(tmp.path(), &init)
+        .args([
+            "try",
+            "--grant",
+            "dri",
+            "--grant",
+            "compute",
+            "--",
+            "/usr/bin/ls",
+            "/dev/kfd",
+            nodes.to_str().expect("a literal path"),
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("/dev/kfd"), "{stdout}");
+    // The nodes themselves, reached through the `/sys/class` symlink:
+    // one per CPU and GPU the driver knows.
+    let mut host: Vec<String> = std::fs::read_dir(nodes)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    let mut inside: Vec<String> = stdout
+        .lines()
+        .skip_while(|l| !l.ends_with("nodes:"))
+        .skip(1)
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect();
+    host.sort_unstable();
+    inside.sort_unstable();
+    assert!(!inside.is_empty(), "{stdout}");
+    assert_eq!(inside, host, "{stdout}");
+}
+
+/// The whole of `smartcard` is the `pcscd` socket, bound at the path
+/// libpcsclite connects to without being told.
+#[test]
+fn real_smartcard_socket_is_bound() {
+    if !require_bwrap() || !require_pcscd() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let out = bubbler_live(tmp.path(), &init)
+        .args([
+            "try",
+            "--grant",
+            "smartcard",
+            "--",
+            "/usr/bin/test",
+            "-S",
+            "/run/pcscd/pcscd.comm",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the pcscd socket is not a socket inside: {err}"
+    );
+}
+
+/// A filter naming ids no device here reports is a warning and a sandbox
+/// without that device, not a failed launch: the device is one the user
+/// plugs in, and every other grant behaves that way already.
+#[test]
+fn usb_without_a_match_warns_and_runs() {
+    if !Path::new(USB_DEVICES).is_dir() {
+        say(&format!("skipping: this host has no {USB_DEVICES}"));
+        return;
+    }
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/t/config.kdl"),
+        "usb vendor=\"ffff\" product=\"ffff\"\n",
+    )
+    .unwrap();
+    // A dry run resolves the filter against this host's sysfs like a
+    // real one; it is only the launch it stops short of.
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--dry-run", "--", "/usr/bin/true"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(
+        err.contains("no device matches vendor=ffff product=ffff"),
+        "{err}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("/dev/bus/usb"), "{stdout}");
+}
+
+/// `compute` without `dri` is refused where the config is read, on both
+/// paths a config is made: the topology it binds names render nodes that
+/// would not be in the sandbox.
+#[test]
+fn compute_without_dri_is_refused() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/t/config.kdl"),
+        "compute\ncommand \"/usr/bin/true\"\n",
+    )
+    .unwrap();
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--dry-run"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(
+        err.contains("bad argument for `compute`: requires dri"),
+        "{err}"
+    );
+
+    let out = bubbler(tmp.path())
+        .args(["try", "--grant", "compute", "--", "/usr/bin/true"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("requires dri"), "{err}");
+}
+
+/// What the three hardware grants reach is not in the paths they bind,
+/// so `--explain` says it under the node: every AMD GPU behind one
+/// `/dev/kfd`, every USB device behind the bare `usb` directory or the
+/// named device behind a filtered one, and every card `pcscd` has.
+#[test]
+fn explain_says_what_the_hardware_grants_reach() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    let explained = |config: &str| {
+        std::fs::write(&cfg, config).unwrap();
+        let out = bubbler(tmp.path())
+            .args(["run", "t", "--explain"])
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{config}: {err}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    if require_kfd() && Path::new("/dev/dri").is_dir() {
+        let out = explained("dri\ncompute\ncommand \"/usr/bin/true\"\n");
+        assert!(
+            out.contains("\n    --dev-bind /dev/kfd /dev/kfd\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("\n    grants: every AMD GPU on this machine through the one /dev/kfd"),
+            "{out}"
+        );
+    }
+    if Path::new("/dev/bus/usb").is_dir() {
+        let out = explained("usb\ncommand \"/usr/bin/true\"\n");
+        assert!(
+            out.contains("\n    grants: raw I/O to every USB device on this host"),
+            "{out}"
+        );
+    }
+    if let Some(device) = a_unique_usb_device() {
+        let out = explained(&format!(
+            "usb vendor=\"{}\" product=\"{}\"\ncommand \"/usr/bin/true\"\n",
+            device.vendor, device.product
+        ));
+        assert!(
+            out.contains(&format!(
+                "\n    matched: {} at bus {:03} device {:03}\n",
+                device.id(),
+                device.bus,
+                device.dev
+            )),
+            "{out}"
+        );
+    }
+    if require_pcscd() {
+        let out = explained("smartcard\ncommand \"/usr/bin/true\"\n");
+        assert!(
+            out.contains("\n    grants: every reader and card pcscd has"),
+            "{out}"
+        );
     }
 }
 

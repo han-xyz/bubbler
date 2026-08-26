@@ -203,6 +203,62 @@ pub fn require_host_program(program: &str) -> bool {
     ok
 }
 
+/// The USB tool the `usb` tests list devices with, inside the sandbox
+/// and on the host. Named absolutely for the reason [`TRUE`] is.
+pub const LSUSB: &str = "/usr/bin/lsusb";
+
+/// Where sysfs holds one directory per USB device, each with the
+/// `idVendor` and `idProduct` a filtered `usb` node is resolved against.
+pub const USB_DEVICES: &str = "/sys/bus/usb/devices";
+
+/// Returns false (after printing why) when this host has no `/dev/kfd`,
+/// which is the whole of what a `compute` grant is for: no AMD GPU, or a
+/// kernel with `amdgpu` unloaded.
+pub fn require_kfd() -> bool {
+    let ok = std::fs::metadata("/dev/kfd").is_ok_and(|m| m.file_type().is_char_device());
+    if !ok {
+        say("skipping: this host has no /dev/kfd character device");
+    }
+    ok
+}
+
+/// Returns false (after printing why) when the `usb` grants cannot be
+/// tested here: nothing to list the devices with, or a host whose sysfs
+/// reports no USB device at all.
+///
+/// `lsusb` is looked for on the host because `/usr` is bound from it, so
+/// a host without the program has none inside the sandbox either.
+pub fn require_usb_device() -> bool {
+    if !Path::new(LSUSB).is_file() {
+        say(&format!(
+            "skipping: {LSUSB} is not installed (package `usbutils`)"
+        ));
+        return false;
+    }
+    // An `idVendor` that can be read is what makes an entry a device
+    // rather than one of the interfaces beside it.
+    let any = std::fs::read_dir(USB_DEVICES).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|e| std::fs::read(e.path().join("idVendor")).is_ok())
+    });
+    if !any {
+        say(&format!("skipping: {USB_DEVICES} lists no USB device"));
+    }
+    any
+}
+
+/// Returns false (after printing why) when this host is not running
+/// `pcscd`, whose socket is the whole of a `smartcard` grant. On a
+/// systemd host the unit behind it is `pcscd.socket`.
+pub fn require_pcscd() -> bool {
+    let ok = std::fs::metadata("/run/pcscd/pcscd.comm").is_ok_and(|m| m.file_type().is_socket());
+    if !ok {
+        say("skipping: /run/pcscd/pcscd.comm is not a socket (`pcscd.socket` is not started)");
+    }
+    ok
+}
+
 /// Returns false (after printing why) when the outbound ruleset cannot be
 /// installed here.
 ///

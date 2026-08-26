@@ -31,7 +31,7 @@ jobs:
           pacman -Syu --noconfirm --needed \
             nodejs git gcc pkgconf rustup \
             libseccomp bubblewrap passt nftables python3 xorg-xwayland \
-            wl-clipboard
+            wl-clipboard usbutils
       - name: rust stable
         # rustup rather than the `rust` package: the same mechanism as the msrv
         # job, and it is rustup that guarantees clippy and rustfmt are there.
@@ -57,6 +57,12 @@ jobs:
       # `bubbler` under test, which is where the launcher looks for it; the
       # clipboard tests want `wl-copy` (wl-clipboard) holding a selection and
       # a compositor to read it from, so on a hosted runner they skip too.
+      #
+      # The hardware grants are hardware: `usbutils` is `lsusb`, which the
+      # `usb` tests list the devices they can see with, but a hosted runner
+      # passes none through, has no `/dev/kfd` for `compute` and runs no
+      # `pcscd` for `smartcard`, so all three skip there and are covered on a
+      # machine with the devices.
       - run: cargo test --workspace --locked
 
   # Advisories, licences, bans and sources against deny.toml.
@@ -120,4 +126,12 @@ jobs:
           # No compositor here means every `wayland` test skipped, the
           # clipboard gate's among them: they all connect for real.
           echo "WAYLAND_DISPLAY: ${WAYLAND_DISPLAY:-unset}"
+          # The hardware the three hardware grants are of.  A hosted runner
+          # has none of it, and the `compute`, `usb` and `smartcard` tests
+          # then print their skip and pass.
+          test -c /dev/kfd && echo "kfd: OK" || echo "kfd: missing"
+          ls /sys/bus/usb/devices/*/idVendor >/dev/null 2>&1 \
+            && echo "usb devices: OK" || echo "usb devices: none"
+          test -S /run/pcscd/pcscd.comm \
+            && echo "pcscd: OK" || echo "pcscd: not running"
           exit 0
