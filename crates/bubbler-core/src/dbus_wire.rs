@@ -214,6 +214,11 @@ pub enum WireError {
     /// A `Fd` value names a descriptor that was not handed to the call.
     #[error("a value names file descriptor {0}, which was not given to the call")]
     FdIndex(u32),
+    /// A call with no destination. Every message on a bus is addressed,
+    /// and a reply that could not be attributed to a name's owner is one
+    /// anybody on the bus could have forged.
+    #[error("a call with no destination")]
+    NoDestination,
 }
 
 /// One value on the wire. The model covers the whole D-Bus type system
@@ -564,7 +569,7 @@ fn encode_value(
             // "Variants are marshalled as the SIGNATURE of the contents
             // (which must be a single complete type), followed by a
             // marshalled value with the type given by that signature."
-            let sig = signature_of(inner)?;
+            let sig = signature_of(inner, 0)?;
             let types = parse_signature(&sig)?;
             let [inner_type] = types.as_slice() else {
                 return Err(WireError::BadSignature(sig));
@@ -653,8 +658,14 @@ fn encode_array(
 /// The signature of a value, for the variant that has to carry one.
 ///
 /// An empty array or dict has no element type to read off its contents,
-/// so one cannot go in a variant; nothing bubbler sends does.
-fn signature_of(value: &Value) -> Result<String, WireError> {
+/// so one cannot go in a variant; nothing bubbler sends does. `depth`
+/// bounds the walk: this runs before the encoder has recursed at all, so
+/// without it a deep enough value would overflow the stack here rather
+/// than come back as an error.
+fn signature_of(value: &Value, depth: usize) -> Result<String, WireError> {
+    if depth > MAX_DEPTH {
+        return Err(WireError::Depth);
+    }
     Ok(match value {
         Value::Byte(_) => "y".to_owned(),
         Value::Bool(_) => "b".to_owned(),
@@ -675,18 +686,18 @@ fn signature_of(value: &Value) -> Result<String, WireError> {
             let first = items
                 .first()
                 .ok_or(WireError::Unsupported("an empty array inside a variant"))?;
-            format!("a{}", signature_of(first)?)
+            format!("a{}", signature_of(first, depth + 1)?)
         }
         Value::Dict(entries) => {
             let first = entries
                 .first()
                 .ok_or(WireError::Unsupported("an empty dict inside a variant"))?;
-            format!("a{{s{}}}", signature_of(&first.1)?)
+            format!("a{{s{}}}", signature_of(&first.1, depth + 1)?)
         }
         Value::Struct(fields) => {
             let mut sig = String::from("(");
             for field in fields {
-                sig.push_str(&signature_of(field)?);
+                sig.push_str(&signature_of(field, depth + 1)?);
             }
             sig.push(')');
             sig
@@ -910,7 +921,12 @@ struct Message {
     kind: u8,
     reply_serial: Option<u32>,
     error_name: Option<String>,
+    /// Unique name of the sender, which on a bus the bus itself fills in
+    /// and a client cannot forge.
+    sender: Option<String>,
     signature: String,
+    /// What `UNIX_FDS` declared, which must match what arrived.
+    unix_fds: u32,
     body: Vec<u8>,
 }
 
@@ -972,8 +988,13 @@ fn frame(head: &[u8]) -> Result<(usize, usize), WireError> {
     if fields_len > MAX_ARRAY {
         return Err(WireError::ArrayTooLong(fields_len));
     }
+    if body_len > MAX_MESSAGE {
+        return Err(WireError::MessageTooLong(body_len));
+    }
     let body_at = align_up(FIXED_HEADER + fields_len, 8);
-    let total = body_at + body_len;
+    let total = body_at
+        .checked_add(body_len)
+        .ok_or(WireError::MessageTooLong(body_len))?;
     if total > MAX_MESSAGE {
         return Err(WireError::MessageTooLong(total));
     }
@@ -983,7 +1004,9 @@ fn frame(head: &[u8]) -> Result<(usize, usize), WireError> {
 /// Unmarshal one whole message. Header fields whose code is known must
 /// have the type the specification gives them; unknown codes are
 /// ignored, which is what "Header Fields" requires of a client meeting a
-/// newer bus.
+/// newer bus. A code that appears twice is refused: the specification
+/// gives no rule for which copy wins, and two readers picking different
+/// ones is how a message means two things at once.
 fn decode_message(message: &[u8]) -> Result<Message, WireError> {
     let (body_at, body_len) = frame(message)?;
     let fields_end = FIXED_HEADER
@@ -1008,7 +1031,10 @@ fn decode_message(message: &[u8]) -> Result<Message, WireError> {
 
     let mut reply_serial = None;
     let mut error_name = None;
+    let mut sender = None;
     let mut signature = String::new();
+    let mut unix_fds = 0;
+    let mut seen: Vec<u8> = Vec::new();
     for field in fields {
         let Value::Struct(pair) = field else {
             return Err(WireError::BadMessage("a header field it could not read"));
@@ -1017,13 +1043,18 @@ fn decode_message(message: &[u8]) -> Result<Message, WireError> {
             return Err(WireError::BadMessage("a header field it could not read"));
         };
         let wrong = || WireError::BadMessage("a header field of the wrong type");
+        if seen.contains(code) {
+            return Err(WireError::BadMessage("a header field twice"));
+        }
+        seen.push(*code);
         match (*code, value.as_ref()) {
             (FIELD_REPLY_SERIAL, Value::Uint32(v)) => reply_serial = Some(*v),
             (FIELD_ERROR_NAME, Value::Str(v)) => error_name = Some(v.clone()),
+            (FIELD_SENDER, Value::Str(v)) => sender = Some(v.clone()),
             (FIELD_SIGNATURE, Value::Signature(v)) => signature = v.clone(),
+            (FIELD_UNIX_FDS, Value::Uint32(v)) => unix_fds = *v,
             (FIELD_PATH, Value::ObjectPath(_)) => {}
-            (FIELD_INTERFACE | FIELD_MEMBER | FIELD_DESTINATION | FIELD_SENDER, Value::Str(_)) => {}
-            (FIELD_UNIX_FDS, Value::Uint32(_)) => {}
+            (FIELD_INTERFACE | FIELD_MEMBER | FIELD_DESTINATION, Value::Str(_)) => {}
             (
                 FIELD_PATH | FIELD_INTERFACE | FIELD_MEMBER | FIELD_ERROR_NAME | FIELD_REPLY_SERIAL
                 | FIELD_DESTINATION | FIELD_SENDER | FIELD_SIGNATURE | FIELD_UNIX_FDS,
@@ -1040,7 +1071,9 @@ fn decode_message(message: &[u8]) -> Result<Message, WireError> {
         kind: *kind,
         reply_serial,
         error_name,
+        sender,
         signature,
+        unix_fds,
         body,
     })
 }
@@ -1093,6 +1126,14 @@ fn wait(fd: BorrowedFd<'_>, events: PollFlags, deadline: Instant) -> Result<(), 
 #[derive(Debug)]
 pub struct Session {
     socket: OwnedFd,
+    /// Unique names already looked up for well-known destinations, so a
+    /// second call to the same name costs no round trip. An owner that
+    /// changes mid-session makes the next call fail rather than accept a
+    /// reply from the wrong sender.
+    owners: Vec<(String, String)>,
+    /// Descriptors received and closed since the last whole message, to
+    /// be checked against what that message declares.
+    fds_seen: usize,
     /// Serial of the last message sent; "must not be zero", so the first
     /// call sends 1.
     serial: u32,
@@ -1105,6 +1146,10 @@ pub struct Session {
 impl Session {
     /// Connect to the bus socket at `path`, authenticate as this uid with
     /// `EXTERNAL`, negotiate descriptor passing and say `Hello`.
+    ///
+    /// The whole opening — connect, authenticate, `Hello` — shares one
+    /// [`CALL_TIMEOUT`], so a bus that answers each step just inside the
+    /// deadline cannot hold the caller for a multiple of it.
     ///
     /// A bus that answers `NEGOTIATE_UNIX_FD` with `ERROR` is used
     /// anyway; only a call that carries descriptors then fails, with
@@ -1138,13 +1183,15 @@ impl Session {
         }
         let mut session = Self {
             socket,
+            owners: Vec::new(),
+            fds_seen: 0,
             serial: 0,
             unique_name: String::new(),
             fd_passing: false,
             buf: Vec::new(),
         };
         session.authenticate(deadline)?;
-        session.unique_name = session.hello()?;
+        session.unique_name = session.hello(deadline)?;
         Ok(session)
     }
 
@@ -1162,13 +1209,16 @@ impl Session {
     /// `body` marshalled against `sig` and `fds` travelling beside it,
     /// and return the reply's values.
     ///
-    /// The reply is the one whose `REPLY_SERIAL` is this call's; signals
-    /// and replies to anything else that arrive meanwhile are dropped,
-    /// as are any descriptors they carry — nothing bubbler calls answers
-    /// with one. An `ERROR` reply becomes [`WireError::Remote`], which
-    /// leaves the session usable; every other failure does not.
+    /// The reply is the one whose `REPLY_SERIAL` is this call's, whose
+    /// type is `METHOD_RETURN` or `ERROR`, and whose `SENDER` is the
+    /// unique name that owns `dest`. Everything else that arrives
+    /// meanwhile is dropped, as are any descriptors it carries — nothing
+    /// bubbler calls answers with one. An `ERROR` reply becomes
+    /// [`WireError::Remote`], which leaves the session usable; every
+    /// other failure does not.
     ///
-    /// Waits [`CALL_TIMEOUT`] in total, sending included.
+    /// Waits [`CALL_TIMEOUT`] in total: the owner lookup, the sending
+    /// and every message skipped on the way to the reply.
     // A destination, an object, an interface, a member, a signature, a
     // body and its descriptors is what a D-Bus method call is; a struct
     // of the names would only move the same list one line up.
@@ -1183,6 +1233,27 @@ impl Session {
         body: &[Value],
         fds: &[BorrowedFd<'_>],
     ) -> Result<Vec<Value>, WireError> {
+        let deadline = Instant::now() + CALL_TIMEOUT;
+        self.call_by(dest, path, iface, member, sig, body, fds, deadline)
+    }
+
+    /// [`Session::call`] against a deadline the caller owns, so the
+    /// opening handshake and an owner lookup share the call's.
+    #[allow(clippy::too_many_arguments)]
+    fn call_by(
+        &mut self,
+        dest: &str,
+        path: &str,
+        iface: &str,
+        member: &str,
+        sig: &str,
+        body: &[Value],
+        fds: &[BorrowedFd<'_>],
+        deadline: Instant,
+    ) -> Result<Vec<Value>, WireError> {
+        if dest.is_empty() {
+            return Err(WireError::NoDestination);
+        }
         if !fds.is_empty() && !self.fd_passing {
             return Err(WireError::NoFdPassing);
         }
@@ -1194,15 +1265,17 @@ impl Session {
             check_fd_indices(value, count)?;
         }
 
-        let deadline = Instant::now() + CALL_TIMEOUT;
+        // Before anything is sent, so the reply has a sender to be held
+        // to; the lookup is itself a call, to a name that needs none.
+        let owner = self.owner_of(dest, deadline)?;
         let body = encode(sig, body)?;
-        let mut fields = vec![(FIELD_PATH, Value::ObjectPath(path.to_owned()))];
-        // An empty name is no name: a call with no destination goes to
-        // whoever is on the other end, and one with no interface leaves
-        // the member to be resolved by the callee.
-        if !dest.is_empty() {
-            fields.push((FIELD_DESTINATION, Value::Str(dest.to_owned())));
-        }
+        let mut fields = vec![
+            (FIELD_PATH, Value::ObjectPath(path.to_owned())),
+            (FIELD_DESTINATION, Value::Str(dest.to_owned())),
+        ];
+        // An empty interface is no interface: the member is left to be
+        // resolved by the callee, which the specification allows for a
+        // method call.
         if !iface.is_empty() {
             fields.push((FIELD_INTERFACE, Value::Str(iface.to_owned())));
         }
@@ -1219,31 +1292,91 @@ impl Session {
         self.send(&message, fds, deadline)?;
 
         loop {
+            // Checked here as well as inside the read: a peer that keeps
+            // sending messages to skip never blocks the reader, so
+            // without this the deadline would only bound an idle bus.
+            if Instant::now() >= deadline {
+                return Err(WireError::Timeout);
+            }
             let reply = self.receive(deadline)?;
             if reply.reply_serial != Some(serial) {
                 continue;
             }
+            // "if a signal has a reply serial it must be ignored even
+            // though it has no meaning as of this version of the spec",
+            // and an unknown message type "must be ignored" as well:
+            // only the two reply types may answer a call.
+            if reply.kind != MSG_METHOD_RETURN && reply.kind != MSG_ERROR {
+                continue;
+            }
+            // Serials are guessable, so a reply is only a reply if it
+            // came from the name's owner. Anyone else on the bus — a
+            // sandboxed instance with the `dbus` grant included — could
+            // otherwise answer first and choose what bubbler believes.
+            match reply.sender.as_deref() {
+                Some(sender) if sender == owner => {}
+                Some(_) => continue,
+                None => return Err(WireError::BadMessage("a reply with no sender")),
+            }
             return match reply.kind {
                 MSG_METHOD_RETURN => decode(&reply.signature, &reply.body),
-                MSG_ERROR => Err(WireError::Remote {
-                    name: reply
-                        .error_name
-                        .unwrap_or_else(|| "org.freedesktop.DBus.Error.Failed".to_owned()),
-                    // "If the first argument exists and is a string, it
-                    // is an error message." The name is the half that
-                    // matters, so a body that will not decode leaves the
-                    // refusal a refusal rather than a wire failure.
-                    message: match decode(&reply.signature, &reply.body) {
-                        Ok(values) => match values.first() {
-                            Some(Value::Str(text)) => text.clone(),
-                            _ => String::new(),
+                MSG_ERROR => {
+                    let Some(name) = reply.error_name else {
+                        return Err(WireError::BadMessage("an error reply with no error name"));
+                    };
+                    Err(WireError::Remote {
+                        name,
+                        // "If the first argument exists and is a string,
+                        // it is an error message." The name is the half
+                        // that matters, so a body that will not decode
+                        // leaves the refusal a refusal rather than a
+                        // wire failure.
+                        message: match decode(&reply.signature, &reply.body) {
+                            Ok(values) => match values.first() {
+                                Some(Value::Str(text)) => text.clone(),
+                                _ => String::new(),
+                            },
+                            Err(_) => String::new(),
                         },
-                        Err(_) => String::new(),
-                    },
-                }),
+                    })
+                }
                 _ => Err(WireError::BadMessage("a reply that is not a reply")),
             };
         }
+    }
+
+    /// The unique name that may answer a call to `dest`.
+    ///
+    /// A unique name owns itself and the bus answers for its own name,
+    /// so neither needs asking; every other destination is a well-known
+    /// name whose owner the bus is asked for once per session.
+    fn owner_of(&mut self, dest: &str, deadline: Instant) -> Result<String, WireError> {
+        if dest == BUS_NAME || dest.starts_with(':') {
+            return Ok(dest.to_owned());
+        }
+        if let Some((_, owner)) = self.owners.iter().find(|(name, _)| name == dest) {
+            return Ok(owner.clone());
+        }
+        let reply = self.call_by(
+            BUS_NAME,
+            BUS_PATH,
+            BUS_INTERFACE,
+            "GetNameOwner",
+            "s",
+            &[Value::Str(dest.to_owned())],
+            &[],
+            deadline,
+        )?;
+        let [Value::Str(owner)] = reply.as_slice() else {
+            return Err(WireError::BadMessage(
+                "a GetNameOwner reply that is not one name",
+            ));
+        };
+        if !owner.starts_with(':') {
+            return Err(WireError::BadMessage("a name owner that is not unique"));
+        }
+        self.owners.push((dest.to_owned(), owner.clone()));
+        Ok(owner.clone())
     }
 
     /// The authentication handshake: the credentials nul byte and
@@ -1276,12 +1409,29 @@ impl Session {
 
     /// The unique name, from the `Hello` every connection owes the bus
     /// before it may send anything else.
-    fn hello(&mut self) -> Result<String, WireError> {
-        let reply = self.call(BUS_NAME, BUS_PATH, BUS_INTERFACE, "Hello", "", &[], &[])?;
-        match reply.as_slice() {
-            [Value::Str(name)] => Ok(name.clone()),
-            _ => Err(WireError::BadMessage("a Hello reply that is not one name")),
+    ///
+    /// "Unique connection names must begin with the character ':'": a
+    /// name that does not is not one the bus assigned.
+    fn hello(&mut self, deadline: Instant) -> Result<String, WireError> {
+        let reply = self.call_by(
+            BUS_NAME,
+            BUS_PATH,
+            BUS_INTERFACE,
+            "Hello",
+            "",
+            &[],
+            &[],
+            deadline,
+        )?;
+        let [Value::Str(name)] = reply.as_slice() else {
+            return Err(WireError::BadMessage("a Hello reply that is not one name"));
+        };
+        if !name.starts_with(':') {
+            return Err(WireError::BadMessage(
+                "a Hello reply that is not a unique name",
+            ));
         }
+        Ok(name.clone())
     }
 
     /// One `\r\n`-terminated authentication line, without its ending.
@@ -1364,6 +1514,7 @@ impl Session {
                     for message in ancillary.drain() {
                         if let RecvAncillaryMessage::ScmRights(fds) = message {
                             for fd in fds {
+                                self.fds_seen += 1;
                                 drop(fd);
                             }
                         }
@@ -1384,14 +1535,34 @@ impl Session {
     }
 
     /// The next whole message, read and taken off the buffer.
+    ///
+    /// The descriptors that arrived while it was being read are its own:
+    /// they "may not be sent before the first byte of the message itself
+    /// is transferred or after the last byte", and the kernel hands back
+    /// the data of one `sendmsg` with the descriptors that came with it.
+    /// A message that declares a different number than arrived is
+    /// refused rather than read.
     fn receive(&mut self, deadline: Instant) -> Result<Message, WireError> {
         loop {
+            // First, so that a peer sending whole messages as fast as
+            // the socket takes them still runs out of deadline: nothing
+            // below ever blocks while there is something to read.
+            if Instant::now() >= deadline {
+                return Err(WireError::Timeout);
+            }
             if self.buf.len() >= FIXED_HEADER {
                 let (body_at, body_len) = frame(&self.buf)?;
                 let total = body_at + body_len;
                 if self.buf.len() >= total {
-                    let message: Vec<u8> = self.buf.drain(..total).collect();
-                    return decode_message(&message);
+                    let bytes: Vec<u8> = self.buf.drain(..total).collect();
+                    let message = decode_message(&bytes)?;
+                    let arrived = std::mem::take(&mut self.fds_seen);
+                    if arrived != message.unix_fds as usize {
+                        return Err(WireError::BadMessage(
+                            "a message with fewer or more descriptors than it declares",
+                        ));
+                    }
+                    return Ok(message);
                 }
             }
             self.fill(deadline)?;
@@ -1996,16 +2167,56 @@ mod tests {
         (&*stream).write_all(&message).unwrap();
     }
 
-    /// A `METHOD_RETURN` to the call with serial `reply_to`.
-    fn server_reply(stream: &UnixStream, serial: u32, reply_to: u32, sig: &str, body: &[Value]) {
+    /// A `METHOD_RETURN` to the call with serial `reply_to`, from
+    /// `sender` — the bus fills that field in, so every reply has one.
+    fn server_reply(
+        stream: &UnixStream,
+        serial: u32,
+        reply_to: u32,
+        sender: &str,
+        sig: &str,
+        body: &[Value],
+    ) {
         server_send(
             stream,
             MSG_METHOD_RETURN,
             serial,
-            &[(FIELD_REPLY_SERIAL, Value::Uint32(reply_to))],
+            &[
+                (FIELD_REPLY_SERIAL, Value::Uint32(reply_to)),
+                (FIELD_SENDER, Value::Str(sender.to_owned())),
+            ],
             sig,
             body,
         );
+    }
+
+    /// The bytes of a `METHOD_RETURN`, for a test that writes them itself.
+    fn reply_bytes(serial: u32, reply_to: u32, sender: &str, sig: &str, body: &[Value]) -> Vec<u8> {
+        let mut fields = vec![
+            (FIELD_REPLY_SERIAL, Value::Uint32(reply_to)),
+            (FIELD_SENDER, Value::Str(sender.to_owned())),
+        ];
+        if !sig.is_empty() {
+            fields.push((FIELD_SIGNATURE, Value::Signature(sig.to_owned())));
+        }
+        let body = encode(sig, body).unwrap();
+        encode_message(MSG_METHOD_RETURN, 0, serial, &fields, &body).unwrap()
+    }
+
+    /// A signal, which a pending call must skip whatever it carries.
+    fn signal_bytes(serial: u32, reply_serial: Option<u32>) -> Vec<u8> {
+        let mut fields = vec![
+            (FIELD_PATH, Value::ObjectPath("/org/a".to_owned())),
+            (FIELD_INTERFACE, Value::Str("org.a".to_owned())),
+            (FIELD_MEMBER, Value::Str("Changed".to_owned())),
+            (FIELD_SENDER, Value::Str(":1.5".to_owned())),
+            (FIELD_SIGNATURE, Value::Signature("s".to_owned())),
+        ];
+        if let Some(reply_serial) = reply_serial {
+            fields.push((FIELD_REPLY_SERIAL, Value::Uint32(reply_serial)));
+        }
+        let body = encode("s", &[Value::Str("ignore me".to_owned())]).unwrap();
+        encode_message(4, 0, serial, &fields, &body).unwrap()
     }
 
     /// Answer the `Hello` every connection opens with, and return the
@@ -2017,6 +2228,7 @@ mod tests {
             stream,
             1,
             serial_of(&bytes),
+            BUS_NAME,
             "s",
             &[Value::Str(name.to_owned())],
         );
@@ -2037,6 +2249,7 @@ mod tests {
                 &stream,
                 2,
                 serial_of(&bytes),
+                BUS_NAME,
                 "s",
                 &[Value::Str("deadbeef".to_owned())],
             );
@@ -2048,6 +2261,12 @@ mod tests {
             .call(BUS_NAME, BUS_PATH, BUS_INTERFACE, "GetId", "", &[], &[])
             .unwrap();
         assert_eq!(reply, vec![Value::Str("deadbeef".to_owned())]);
+        // Nothing is sent for a call that names nobody: a reply to it
+        // could not be attributed to an owner.
+        let err = session
+            .call("", BUS_PATH, BUS_INTERFACE, "GetId", "", &[], &[])
+            .unwrap_err();
+        assert!(matches!(err, WireError::NoDestination), "{err:?}");
         drop(session);
         server.join().unwrap();
     }
@@ -2061,23 +2280,25 @@ mod tests {
             let (bytes, _) = server_message(&stream);
             // A signal with no reply serial at all, then a reply to a
             // call this connection never made.
-            server_send(
+            (&stream).write_all(&signal_bytes(7, None)).unwrap();
+            server_reply(
                 &stream,
-                4,
-                7,
-                &[
-                    (FIELD_PATH, Value::ObjectPath("/org/a".to_owned())),
-                    (FIELD_INTERFACE, Value::Str("org.a".to_owned())),
-                    (FIELD_MEMBER, Value::Str("Changed".to_owned())),
-                ],
+                8,
+                999,
+                BUS_NAME,
                 "s",
-                &[Value::Str("ignore me".to_owned())],
+                &[Value::Str("not yours".to_owned())],
             );
-            server_reply(&stream, 8, 999, "s", &[Value::Str("not yours".to_owned())]);
+            // A signal that carries the pending serial: "if a signal has
+            // a reply serial it must be ignored".
+            (&stream)
+                .write_all(&signal_bytes(10, Some(serial_of(&bytes))))
+                .unwrap();
             server_reply(
                 &stream,
                 9,
                 serial_of(&bytes),
+                BUS_NAME,
                 "s",
                 &[Value::Str("yours".to_owned())],
             );
@@ -2108,16 +2329,24 @@ mod tests {
                         FIELD_ERROR_NAME,
                         Value::Str("org.freedesktop.portal.Error.NotAllowed".to_owned()),
                     ),
+                    (FIELD_SENDER, Value::Str(":1.5".to_owned())),
                 ],
                 "s",
                 &[Value::Str("no".to_owned())],
             );
             let (bytes, _) = server_message(&stream);
-            server_reply(&stream, 3, serial_of(&bytes), "u", &[Value::Uint32(1)]);
+            server_reply(
+                &stream,
+                3,
+                serial_of(&bytes),
+                ":1.5",
+                "u",
+                &[Value::Uint32(1)],
+            );
         });
         let mut session = Session::connect(&path).unwrap();
         let err = session
-            .call("org.a", "/org/a", "org.a", "Denied", "", &[], &[])
+            .call(":1.5", "/org/a", "org.a", "Denied", "", &[], &[])
             .unwrap_err();
         match err {
             WireError::Remote { name, message } => {
@@ -2128,7 +2357,7 @@ mod tests {
         }
         // The connection is still good: an error is an answer.
         let reply = session
-            .call("org.a", "/org/a", "org.a", "Allowed", "", &[], &[])
+            .call(":1.5", "/org/a", "org.a", "Allowed", "", &[], &[])
             .unwrap();
         assert_eq!(reply, vec![Value::Uint32(1)]);
         drop(session);
@@ -2164,7 +2393,7 @@ mod tests {
         let file = std::fs::File::open(tmp.path()).unwrap();
         let err = session
             .call(
-                "org.a",
+                ":1.5",
                 "/org/a",
                 "org.a",
                 "Take",
@@ -2209,6 +2438,7 @@ mod tests {
                 &stream,
                 2,
                 serial_of(&bytes),
+                ":1.5",
                 "as",
                 &[Value::Array(vec![Value::Str("1a2b".to_owned())])],
             );
@@ -2218,7 +2448,7 @@ mod tests {
         // A body naming a descriptor the call was not given never leaves.
         let err = session
             .call(
-                "org.a",
+                ":1.5",
                 "/org/a",
                 "org.a",
                 "AddFull",
@@ -2233,7 +2463,7 @@ mod tests {
         assert!(matches!(err, WireError::FdIndex(3)), "{err:?}");
         let reply = session
             .call(
-                "org.a",
+                ":1.5",
                 "/org/a",
                 "org.a",
                 "AddFull",
@@ -2267,6 +2497,396 @@ mod tests {
         assert!(matches!(err, WireError::Timeout), "{err:?}");
         assert!(started.elapsed() >= CALL_TIMEOUT);
         server.join().unwrap();
+    }
+
+    /// Send one message with descriptors attached, the way a reply that
+    /// carries them would arrive.
+    fn server_send_fds(stream: &UnixStream, bytes: &[u8], fds: &[BorrowedFd<'_>]) {
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(8))];
+        let mut ancillary = SendAncillaryBuffer::new(&mut space);
+        assert!(ancillary.push(SendAncillaryMessage::ScmRights(fds)));
+        let sent = sendmsg(
+            stream.as_fd(),
+            &[IoSlice::new(bytes)],
+            &mut ancillary,
+            SendFlags::NOSIGNAL,
+        )
+        .unwrap();
+        assert_eq!(sent, bytes.len());
+    }
+
+    #[test]
+    fn a_reply_from_anyone_but_the_owner_of_the_name_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, server) = fake_bus(tmp.path(), |stream| {
+            server_auth(&stream, true);
+            server_hello(&stream, ":1.15");
+            // A call to a well-known name asks the bus who owns it first.
+            let (bytes, _) = server_message(&stream);
+            assert_eq!(
+                decode("s", &decode_message(&bytes).unwrap().body).unwrap(),
+                vec![Value::Str("org.freedesktop.portal.Documents".to_owned())]
+            );
+            server_reply(
+                &stream,
+                2,
+                serial_of(&bytes),
+                BUS_NAME,
+                "s",
+                &[Value::Str(":1.77".to_owned())],
+            );
+            let (bytes, _) = server_message(&stream);
+            // Another peer on the bus guesses the serial and answers
+            // first, choosing the path bubbler would go on to use.
+            server_reply(
+                &stream,
+                3,
+                serial_of(&bytes),
+                ":1.99",
+                "s",
+                &[Value::Str("/forged".to_owned())],
+            );
+            server_reply(
+                &stream,
+                4,
+                serial_of(&bytes),
+                ":1.77",
+                "s",
+                &[Value::Str("/genuine".to_owned())],
+            );
+            // The owner is remembered, so the second call asks nothing.
+            let (bytes, _) = server_message(&stream);
+            server_reply(
+                &stream,
+                5,
+                serial_of(&bytes),
+                ":1.77",
+                "s",
+                &[Value::Str("/again".to_owned())],
+            );
+        });
+        let mut session = Session::connect(&path).unwrap();
+        for want in ["/genuine", "/again"] {
+            let reply = session
+                .call(
+                    "org.freedesktop.portal.Documents",
+                    "/org/freedesktop/portal/documents",
+                    "org.freedesktop.portal.Documents",
+                    "GetMountPoint",
+                    "",
+                    &[],
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(reply, vec![Value::Str(want.to_owned())]);
+        }
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_reply_with_no_sender_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, server) = fake_bus(tmp.path(), |stream| {
+            server_auth(&stream, true);
+            server_hello(&stream, ":1.16");
+            let (bytes, _) = server_message(&stream);
+            server_send(
+                &stream,
+                MSG_METHOD_RETURN,
+                2,
+                &[(FIELD_REPLY_SERIAL, Value::Uint32(serial_of(&bytes)))],
+                "s",
+                &[Value::Str("from nobody".to_owned())],
+            );
+        });
+        let mut session = Session::connect(&path).unwrap();
+        let err = session
+            .call(":1.5", "/org/a", "org.a", "Ask", "", &[], &[])
+            .unwrap_err();
+        assert!(matches!(err, WireError::BadMessage(_)), "{err:?}");
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_hello_reply_that_is_not_a_unique_name_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, server) = fake_bus(tmp.path(), |stream| {
+            server_auth(&stream, true);
+            let (bytes, _) = server_message(&stream);
+            server_reply(
+                &stream,
+                1,
+                serial_of(&bytes),
+                BUS_NAME,
+                "s",
+                &[Value::Str("org.not.unique".to_owned())],
+            );
+        });
+        let err = Session::connect(&path).unwrap_err();
+        assert!(matches!(err, WireError::BadMessage(_)), "{err:?}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn an_error_reply_with_no_name_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, server) = fake_bus(tmp.path(), |stream| {
+            server_auth(&stream, true);
+            server_hello(&stream, ":1.17");
+            let (bytes, _) = server_message(&stream);
+            server_send(
+                &stream,
+                MSG_ERROR,
+                2,
+                &[
+                    (FIELD_REPLY_SERIAL, Value::Uint32(serial_of(&bytes))),
+                    (FIELD_SENDER, Value::Str(":1.5".to_owned())),
+                ],
+                "s",
+                &[Value::Str("nameless".to_owned())],
+            );
+        });
+        let mut session = Session::connect(&path).unwrap();
+        let err = session
+            .call(":1.5", "/org/a", "org.a", "Ask", "", &[], &[])
+            .unwrap_err();
+        // Never an invented name: a refusal bubbler cannot name is a
+        // failure, not `org.freedesktop.DBus.Error.Failed`.
+        assert!(matches!(err, WireError::BadMessage(_)), "{err:?}");
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_flood_of_messages_to_skip_does_not_outlast_the_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, server) = fake_bus(tmp.path(), |stream| {
+            server_auth(&stream, true);
+            server_hello(&stream, ":1.18");
+            let (bytes, _) = server_message(&stream);
+            // Never the reply: always one more message to skip, so the
+            // reader never waits and the deadline is all that ends it.
+            let signal = signal_bytes(7, Some(serial_of(&bytes)));
+            while (&stream).write_all(&signal).is_ok() {}
+        });
+        let mut session = Session::connect(&path).unwrap();
+        let started = Instant::now();
+        let err = session
+            .call(":1.5", "/org/a", "org.a", "Wait", "", &[], &[])
+            .unwrap_err();
+        assert!(matches!(err, WireError::Timeout), "{err:?}");
+        assert!(started.elapsed() >= CALL_TIMEOUT, "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < CALL_TIMEOUT * 3,
+            "{:?}",
+            started.elapsed()
+        );
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_reply_delivered_one_byte_at_a_time_is_assembled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, server) = fake_bus(tmp.path(), |stream| {
+            server_auth(&stream, true);
+            server_hello(&stream, ":1.19");
+            let (bytes, _) = server_message(&stream);
+            let reply = reply_bytes(
+                2,
+                serial_of(&bytes),
+                ":1.5",
+                "s",
+                &[Value::Str("assembled".to_owned())],
+            );
+            for byte in reply {
+                (&stream).write_all(&[byte]).unwrap();
+            }
+        });
+        let mut session = Session::connect(&path).unwrap();
+        let reply = session
+            .call(":1.5", "/org/a", "org.a", "Ask", "", &[], &[])
+            .unwrap();
+        assert_eq!(reply, vec![Value::Str("assembled".to_owned())]);
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn two_messages_in_one_write_are_read_one_at_a_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, server) = fake_bus(tmp.path(), |stream| {
+            server_auth(&stream, true);
+            server_hello(&stream, ":1.20");
+            let (bytes, _) = server_message(&stream);
+            let mut both = signal_bytes(7, None);
+            both.extend_from_slice(&reply_bytes(
+                8,
+                serial_of(&bytes),
+                ":1.5",
+                "s",
+                &[Value::Str("second".to_owned())],
+            ));
+            (&stream).write_all(&both).unwrap();
+        });
+        let mut session = Session::connect(&path).unwrap();
+        let reply = session
+            .call(":1.5", "/org/a", "org.a", "Ask", "", &[], &[])
+            .unwrap();
+        assert_eq!(reply, vec![Value::Str("second".to_owned())]);
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn descriptors_a_reply_carries_are_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Three copies of a pipe's write end: once every copy is closed
+        // the read end reports end of file, and nothing else can.
+        let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
+        let (path, server) = fake_bus(tmp.path(), move |stream| {
+            server_auth(&stream, true);
+            server_hello(&stream, ":1.21");
+            let (bytes, _) = server_message(&stream);
+            let body = encode("s", &[Value::Str("ok".to_owned())]).unwrap();
+            let message = encode_message(
+                MSG_METHOD_RETURN,
+                0,
+                2,
+                &[
+                    (FIELD_REPLY_SERIAL, Value::Uint32(serial_of(&bytes))),
+                    (FIELD_SENDER, Value::Str(":1.5".to_owned())),
+                    (FIELD_SIGNATURE, Value::Signature("s".to_owned())),
+                    (FIELD_UNIX_FDS, Value::Uint32(3)),
+                ],
+                &body,
+            )
+            .unwrap();
+            let carried = [write.as_fd(), write.as_fd(), write.as_fd()];
+            server_send_fds(&stream, &message, &carried);
+            drop(write);
+        });
+        let mut session = Session::connect(&path).unwrap();
+        let reply = session
+            .call(":1.5", "/org/a", "org.a", "Ask", "", &[], &[])
+            .unwrap();
+        assert_eq!(reply, vec![Value::Str("ok".to_owned())]);
+        server.join().unwrap();
+        let mut fds = [PollFd::from_borrowed_fd(read.as_fd(), PollFlags::IN)];
+        assert_eq!(
+            poll(&mut fds, Some(&timespec(Duration::from_secs(5)))).unwrap(),
+            1,
+            "the pipe never hung up, so a copy of the descriptor is still open"
+        );
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            std::fs::File::from(read).read(&mut byte).unwrap(),
+            0,
+            "the pipe still has a writer, so a received descriptor was kept"
+        );
+        drop(session);
+    }
+
+    #[test]
+    fn a_message_that_declares_descriptors_it_did_not_send_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, server) = fake_bus(tmp.path(), |stream| {
+            server_auth(&stream, true);
+            server_hello(&stream, ":1.22");
+            let (bytes, _) = server_message(&stream);
+            server_send(
+                &stream,
+                MSG_METHOD_RETURN,
+                2,
+                &[
+                    (FIELD_REPLY_SERIAL, Value::Uint32(serial_of(&bytes))),
+                    (FIELD_SENDER, Value::Str(":1.5".to_owned())),
+                    (FIELD_UNIX_FDS, Value::Uint32(3)),
+                ],
+                "s",
+                &[Value::Str("three, honest".to_owned())],
+            );
+        });
+        let mut session = Session::connect(&path).unwrap();
+        let err = session
+            .call(":1.5", "/org/a", "org.a", "Ask", "", &[], &[])
+            .unwrap_err();
+        assert!(matches!(err, WireError::BadMessage(_)), "{err:?}");
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_header_field_that_appears_twice_is_refused() {
+        let message = encode_message(
+            MSG_METHOD_RETURN,
+            0,
+            1,
+            &[
+                (FIELD_REPLY_SERIAL, Value::Uint32(1)),
+                (FIELD_REPLY_SERIAL, Value::Uint32(2)),
+            ],
+            &[],
+        )
+        .unwrap();
+        assert!(matches!(
+            decode_message(&message),
+            Err(WireError::BadMessage(_))
+        ));
+    }
+
+    #[test]
+    fn a_value_too_deep_to_name_is_refused_before_the_stack_runs_out() {
+        // The signature of what goes in a variant is worked out before
+        // the encoder has recursed at all, so the guard has to be there
+        // as well as in the encoder.
+        let mut value = Value::Byte(1);
+        for _ in 0..200 {
+            value = Value::Array(vec![value]);
+        }
+        let err = encode("v", &[Value::Variant(Box::new(value))]).unwrap_err();
+        assert!(matches!(err, WireError::Depth), "{err:?}");
+    }
+
+    /// `depth` nested arrays around a variant holding `inner_depth`
+    /// nested arrays around one byte, for a block starting on an 8-byte
+    /// boundary. Every array holds exactly one element, so a decoder
+    /// walks the whole chain.
+    fn arrays_around_a_variant(depth: usize, inner_depth: usize) -> (String, Vec<u8>) {
+        let inner_sig = format!("{}y", "a".repeat(inner_depth));
+        let mut inner = vec![0x7f];
+        for _ in 0..inner_depth {
+            let mut wrapped = (inner.len() as u32).to_le_bytes().to_vec();
+            wrapped.extend_from_slice(&inner);
+            inner = wrapped;
+        }
+        // One 4-byte length per enclosing array stands before the variant.
+        let at = depth * 4;
+        let mut bytes = vec![inner_sig.len() as u8];
+        bytes.extend_from_slice(inner_sig.as_bytes());
+        bytes.push(0);
+        while !(at + bytes.len()).is_multiple_of(4) {
+            bytes.push(0);
+        }
+        bytes.extend_from_slice(&inner);
+        for _ in 0..depth {
+            let mut wrapped = (bytes.len() as u32).to_le_bytes().to_vec();
+            wrapped.extend_from_slice(&bytes);
+            bytes = wrapped;
+        }
+        (format!("{}v", "a".repeat(depth)), bytes)
+    }
+
+    #[test]
+    fn containers_that_cross_a_variant_boundary_count_toward_one_limit() {
+        let (sig, bytes) = arrays_around_a_variant(10, 10);
+        assert!(decode(&sig, &bytes).is_ok());
+        // Each half is inside the specification's limit of 32 arrays and
+        // the two together are past the total depth of 64.
+        let (sig, bytes) = arrays_around_a_variant(32, 32);
+        assert!(matches!(decode(&sig, &bytes), Err(WireError::Depth)));
     }
 
     /// The session bus socket: `DBUS_SESSION_BUS_ADDRESS` when it names a
