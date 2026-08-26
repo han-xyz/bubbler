@@ -4071,8 +4071,13 @@ mod tests {
 
     #[test]
     fn what_a_spawn_may_inherit_is_the_fds_the_socket_and_the_info_pipe() {
-        let mut alloc = RealAlloc::new(7);
-        assert_eq!(alloc.intended(), vec![7]);
+        // A descriptor this test holds open, so the number below cannot be
+        // handed to one of the allocations that follow: a literal would
+        // be, whenever the process runs this test alone.
+        let socket = std::fs::File::open("/dev/null").unwrap();
+        let number = socket.as_raw_fd();
+        let mut alloc = RealAlloc::new(number);
+        assert_eq!(alloc.intended(), vec![number]);
         alloc.data(b"a").unwrap();
         alloc.block_pipe().unwrap();
         alloc.info_pipe().unwrap();
@@ -4086,14 +4091,17 @@ mod tests {
         // that `inheritable` never touches, so a sweep that went by
         // `fds` alone would take the sandbox pid with it.
         let mut want = held;
-        want.push(7);
+        want.push(number);
         want.push(info);
         assert_eq!(alloc.intended(), want);
         // What `run` does once bwrap holds the socket: the number goes
         // with the descriptor, so a later spawn's sweep is never told to
         // spare a number the kernel has handed on to something else.
         alloc.socket.take();
-        assert!(!alloc.intended().contains(&7), "a closed number is spared");
+        assert!(
+            !alloc.intended().contains(&number),
+            "a closed number is spared"
+        );
     }
 
     #[test]
