@@ -108,6 +108,10 @@ const FIELD_UNIX_FDS: u8 = 9;
 /// name that only means it has not been started yet.
 const ERROR_NO_OWNER: &str = "org.freedesktop.DBus.Error.NameHasNoOwner";
 
+/// What the bus answers with when a name is not activatable at all, and
+/// what it sends back for a call it cannot deliver.
+const ERROR_SERVICE_UNKNOWN: &str = "org.freedesktop.DBus.Error.ServiceUnknown";
+
 /// The bus's own name, object and interface: where `Hello` and `GetId`
 /// live.
 const BUS_NAME: &str = "org.freedesktop.DBus";
@@ -1219,16 +1223,27 @@ impl Session {
     /// `body` marshalled against `sig` and `fds` travelling beside it,
     /// and return the reply's values.
     ///
-    /// The reply is the one whose `REPLY_SERIAL` is this call's, whose
-    /// type is `METHOD_RETURN` or `ERROR`, and whose `SENDER` is the
-    /// unique name that owns `dest`. Everything else that arrives
-    /// meanwhile is dropped, as are any descriptors it carries — nothing
-    /// bubbler calls answers with one. An `ERROR` reply becomes
-    /// [`WireError::Remote`], which leaves the session usable; every
-    /// other failure does not.
+    /// `dest` may be a well-known name or a unique one, but not empty.
+    /// A well-known name is resolved to its owner first — started with
+    /// `StartServiceByName` and resolved again if nobody holds it yet —
+    /// and the message is **addressed to that unique name**, so the peer
+    /// that answers is the one that was looked up. The owner is
+    /// remembered for the session, and forgotten again as soon as a call
+    /// to it comes back saying nobody is there.
     ///
-    /// Waits [`CALL_TIMEOUT`] in total: the owner lookup, the sending
-    /// and every message skipped on the way to the reply.
+    /// A reply is taken only when its `REPLY_SERIAL` is this call's, its
+    /// type is `METHOD_RETURN` or `ERROR`, and its `SENDER` is either
+    /// that owner or — for an `ERROR` alone — `org.freedesktop.DBus`,
+    /// which the bus stamps itself when it cannot deliver the call.
+    /// Everything else that arrives meanwhile is dropped, as are any
+    /// descriptors it carries: nothing bubbler calls answers with one.
+    /// An `ERROR` becomes [`WireError::Remote`] and leaves the session
+    /// usable; every other failure leaves it half-read and to be
+    /// dropped.
+    ///
+    /// One [`CALL_TIMEOUT`] covers all of it: the owner lookup, any
+    /// activation and the second lookup, the sending, and every message
+    /// skipped on the way to the reply.
     // A destination, an object, an interface, a member, a signature, a
     // body and its descriptors is what a D-Bus method call is; a struct
     // of the names would only move the same list one line up.
@@ -1347,6 +1362,13 @@ impl Session {
                     let Some(name) = reply.error_name else {
                         return Err(WireError::BadMessage("an error reply with no error name"));
                     };
+                    // Whoever was looked up is not there any more, so the
+                    // next call resolves the name again — and starts the
+                    // service — instead of addressing the same corpse for
+                    // the rest of the session.
+                    if name == ERROR_NO_OWNER || name == ERROR_SERVICE_UNKNOWN {
+                        self.owners.retain(|(cached, _)| cached != dest);
+                    }
                     Err(WireError::Remote {
                         name,
                         // "If the first argument exists and is a string,
@@ -3328,6 +3350,100 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[test]
+    fn a_return_the_bus_sends_for_a_peer_is_not_taken_for_a_reply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, server) = fake_bus(tmp.path(), |stream| {
+            server_start(&stream);
+            let call = server_awaiting(&stream, "Ask", ":1.77");
+            // The bus may answer for a peer, but only with an error. A
+            // `METHOD_RETURN` under its name is not a reply from the
+            // owner, and taking it would let the bus — or anything that
+            // could ever be mistaken for it — choose the value.
+            server_reply(
+                &stream,
+                2,
+                call.serial,
+                BUS_NAME,
+                "s",
+                &[Value::Str("from the bus".to_owned())],
+            );
+            server_reply(
+                &stream,
+                3,
+                call.serial,
+                ":1.77",
+                "s",
+                &[Value::Str("from the owner".to_owned())],
+            );
+        });
+        let mut session = Session::connect(&path).unwrap();
+        let reply = session
+            .call(A_NAME, "/org/a", "org.a", "Ask", "", &[], &[])
+            .unwrap();
+        assert_eq!(reply, vec![Value::Str("from the owner".to_owned())]);
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn an_owner_that_answers_that_nobody_is_there_is_forgotten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, server) = fake_bus(tmp.path(), |stream| {
+            server_start(&stream);
+            let call = server_call(&stream);
+            assert_eq!(call.text(FIELD_MEMBER), "GetNameOwner");
+            server_reply(
+                &stream,
+                2,
+                call.serial,
+                BUS_NAME,
+                "s",
+                &[Value::Str(":1.77".to_owned())],
+            );
+            let call = server_call(&stream);
+            assert_eq!(call.text(FIELD_DESTINATION), ":1.77");
+            server_error(&stream, call.serial, BUS_NAME, ERROR_NO_OWNER, "gone");
+            // The second call looks the name up again instead of
+            // addressing the connection that is no longer there.
+            let call = server_call(&stream);
+            assert_eq!(call.text(FIELD_MEMBER), "GetNameOwner");
+            server_reply(
+                &stream,
+                3,
+                call.serial,
+                BUS_NAME,
+                "s",
+                &[Value::Str(":1.78".to_owned())],
+            );
+            let call = server_call(&stream);
+            assert_eq!(call.text(FIELD_DESTINATION), ":1.78");
+            server_reply(
+                &stream,
+                4,
+                call.serial,
+                ":1.78",
+                "s",
+                &[Value::Str("the restarted one".to_owned())],
+            );
+        });
+        let mut session = Session::connect(&path).unwrap();
+        let err = session
+            .call(A_NAME, "/org/a", "org.a", "Ask", "", &[], &[])
+            .unwrap_err();
+        assert!(
+            matches!(&err, WireError::Remote { name, .. } if name == ERROR_NO_OWNER),
+            "{err:?}"
+        );
+        assert!(session.owners.is_empty(), "{:?}", session.owners);
+        let reply = session
+            .call(A_NAME, "/org/a", "org.a", "Ask", "", &[], &[])
+            .unwrap();
+        assert_eq!(reply, vec![Value::Str("the restarted one".to_owned())]);
+        drop(session);
+        server.join().unwrap();
+    }
+
     /// The session bus socket: `DBUS_SESSION_BUS_ADDRESS` when it names a
     /// `unix:path=` one, else `$XDG_RUNTIME_DIR/bus`, and only when what
     /// is there is a socket.
@@ -3375,6 +3491,58 @@ mod tests {
         // "UUIDs": 16 bytes, printed as 32 hex digits.
         assert_eq!(id.len(), 32, "{id:?}");
         assert!(id.bytes().all(|b| b.is_ascii_hexdigit()), "{id:?}");
+    }
+
+    /// The desktop portal: a well-known name a real session bus has to
+    /// resolve, and one that is activatable where it exists at all.
+    const PORTAL: &str = "org.freedesktop.portal.Desktop";
+
+    #[test]
+    fn the_real_session_bus_carries_a_call_to_a_name_it_resolved() {
+        let Some(path) = session_bus_socket() else {
+            println!("skipping: no session bus socket to talk to");
+            return;
+        };
+        let mut session = Session::connect(&path).unwrap();
+        match session.call(
+            PORTAL,
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            "ss",
+            &[
+                Value::Str("org.freedesktop.portal.FileChooser".to_owned()),
+                Value::Str("version".to_owned()),
+            ],
+            &[],
+        ) {
+            // `Get` answers with the property inside a variant, and this
+            // one is a version number.
+            Ok(reply) => {
+                let [Value::Variant(version)] = reply.as_slice() else {
+                    panic!("Get answered {reply:?}")
+                };
+                assert!(matches!(**version, Value::Uint32(_)), "{version:?}");
+            }
+            Err(WireError::Remote { name, .. })
+                if name == ERROR_NO_OWNER || name == ERROR_SERVICE_UNKNOWN =>
+            {
+                println!("skipping: no portal on this bus and none to start ({name})");
+                return;
+            }
+            // The portal is there and answered, just not with that
+            // property; the owner path is what this test is about.
+            Err(WireError::Remote { name, .. }) => println!("the portal answered {name}"),
+            Err(other) => panic!("{other:?}"),
+        }
+        // The call went to the unique name the bus gave, not to the
+        // well-known one the caller passed.
+        let (_, owner) = session
+            .owners
+            .iter()
+            .find(|(name, _)| name == PORTAL)
+            .expect("the owner was resolved and kept");
+        assert!(owner.starts_with(':'), "{owner:?}");
     }
 
     #[test]
