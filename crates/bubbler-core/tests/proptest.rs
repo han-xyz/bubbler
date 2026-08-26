@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use bubbler_core::config::{
-    AllowOut, BusRule, Cidr, Errno, InstanceConfig, LintAllow, NetworkConfig, NetworkMode,
-    Outbound, Proto, SeccompConfig, Service, ShareMode, TtyMode, Userns, WaylandMode, X11Mode,
+    AllowOut, BusRule, Cidr, Disabled, Errno, InstanceConfig, LintAllow, NetworkConfig,
+    NetworkMode, Node, Outbound, Proto, SeccompConfig, Service, ShareMode, TtyMode, Userns,
+    WaylandMode, X11Mode,
 };
 use bubbler_core::env::{DEFAULT_DATA_DIRS, Env};
 use bubbler_core::error::{DesktopError, ProfileError};
@@ -384,6 +385,94 @@ fn command() -> impl Strategy<Value = Option<Vec<OsString>>> {
     )
 }
 
+/// Which section of a file a node belongs to, in the order
+/// [`kdl_out::nodes`] writes them. The emitter writes a section in one
+/// piece, so this is the order a parsed config holds its `/-` lines in,
+/// whatever order the file wrote them.
+fn rank(node: &Node) -> u8 {
+    match node {
+        Node::LintAllow(_) => 0,
+        Node::Service(_) => 1,
+        Node::Env(_) => 2,
+        Node::Tty(_) => 3,
+        Node::Userns(_) => 4,
+        Node::Seccomp(_) => 5,
+        Node::Desktop(_) => 6,
+        Node::Command(_) => 7,
+    }
+}
+
+/// A kind of node a `/-` line may keep, and where in its section it
+/// sits, before either is fitted to the config it is written into.
+fn disabled_kinds() -> impl Strategy<Value = Vec<(u8, usize)>> {
+    prop::collection::vec((0u8..8, 0usize..4), 0..5)
+}
+
+/// The generated `/-` lines fitted to the config that holds them: one
+/// node per kind, `before` inside its own section, and the list in the
+/// order the emitter writes it — by section, and by `before` within one.
+/// A config holding them in any other order is one the emitter cannot
+/// write, so it is not one the parser could return either.
+fn fit_disabled(cfg: &InstanceConfig, kinds: &[(u8, usize)]) -> Vec<Disabled> {
+    let mut out: Vec<Disabled> = kinds
+        .iter()
+        .map(|(kind, before)| {
+            let (node, len) = match kind {
+                0 => (
+                    Node::LintAllow(vec![LintAllow {
+                        id: "network-host".to_owned(),
+                        reason: "kept".to_owned(),
+                    }]),
+                    cfg.lint_allows.len(),
+                ),
+                1 => (
+                    Node::Service(Service::HomeShare {
+                        path: PathBuf::from("kept"),
+                        mode: ShareMode::ReadOnly,
+                    }),
+                    cfg.services.len(),
+                ),
+                2 => (
+                    Node::Env(vec![("KEPT".to_owned(), "1".to_owned())]),
+                    cfg.env.len(),
+                ),
+                // The rest are the nodes a file holds one of, so their
+                // section is one long or empty.
+                3 => (
+                    Node::Tty(TtyMode::None),
+                    usize::from(cfg.tty != TtyMode::Pty),
+                ),
+                4 => (
+                    Node::Userns(Userns::Disable),
+                    usize::from(cfg.userns != Userns::Allow),
+                ),
+                5 => (
+                    Node::Seccomp(SeccompConfig {
+                        allow: Vec::new(),
+                        deny: Vec::new(),
+                        disable: true,
+                    }),
+                    usize::from(cfg.seccomp != SeccompConfig::default()),
+                ),
+                6 => (
+                    Node::Desktop("kept.desktop".to_owned()),
+                    usize::from(cfg.desktop.is_some()),
+                ),
+                _ => (
+                    Node::Command(vec![OsString::from("kept")]),
+                    usize::from(cfg.command.is_some()),
+                ),
+            };
+            Disabled {
+                node,
+                before: before % (len + 1),
+            }
+        })
+        .collect();
+    out.sort_by_key(|d| (rank(&d.node), d.before));
+    out
+}
+
 /// A configuration the parser accepts, assembled so that every grant
 /// that requires another is generated behind it.
 fn instance_config() -> impl Strategy<Value = InstanceConfig> {
@@ -406,6 +495,7 @@ fn instance_config() -> impl Strategy<Value = InstanceConfig> {
         seccomp_config(),
         prop::option::of("[a-z][a-z0-9.-]{0,8}".prop_map(|s| format!("{s}.desktop"))),
         command(),
+        disabled_kinds(),
     )
         .prop_map(
             |(
@@ -417,6 +507,7 @@ fn instance_config() -> impl Strategy<Value = InstanceConfig> {
                 seccomp,
                 desktop,
                 command,
+                kinds,
             )| {
                 let mut services = Vec::new();
                 services.extend(bus);
@@ -424,7 +515,7 @@ fn instance_config() -> impl Strategy<Value = InstanceConfig> {
                 services.extend(shares);
                 services.extend(network);
                 services.extend(gamepad);
-                InstanceConfig {
+                let mut cfg = InstanceConfig {
                     services,
                     command,
                     env,
@@ -433,11 +524,12 @@ fn instance_config() -> impl Strategy<Value = InstanceConfig> {
                     userns,
                     lint_allows,
                     desktop,
-                    // The generator writes the nodes a config grants; a
-                    // `/-` line grants nothing, and `config.rs` pins how
-                    // one is read back and written out.
                     disabled: Vec::new(),
-                }
+                };
+                // The `/-` lines last: where one sits is an index into a
+                // section of the config above.
+                cfg.disabled = fit_disabled(&cfg, &kinds);
+                cfg
             },
         )
 }
@@ -490,6 +582,30 @@ proptest! {
         let back = config::parse(&text)
             .unwrap_or_else(|e| panic!("rendered config does not parse: {e}\n{text}"));
         prop_assert_eq!(back, cfg);
+    }
+
+    /// However a file orders its `/-` lines, the config holds them in
+    /// the order the emitter writes them back. A section is written in
+    /// one piece, so a line kept above a node of a later section is
+    /// written below it, and a list in file order would parse from its
+    /// own rendering as a config that is not the one rendered.
+    #[test]
+    fn disabled_lines_are_held_in_the_order_they_are_written(cfg in instance_config()) {
+        let mut enabled = cfg.clone();
+        enabled.disabled = Vec::new();
+        let mut text = String::new();
+        // Every `/-` line first and in reverse, which is the one order
+        // the emitter never writes.
+        for entry in cfg.disabled.iter().rev() {
+            text.push_str(&kdl_out::disabled(entry).expect("every generated node writes"));
+            text.push('\n');
+        }
+        text.push_str(&kdl_out::render(&enabled).expect("every generated value is UTF-8"));
+        let back = config::parse(&text)
+            .unwrap_or_else(|e| panic!("moved config does not parse: {e}\n{text}"));
+        let ranks: Vec<u8> = back.disabled.iter().map(|d| rank(&d.node)).collect();
+        prop_assert!(ranks.is_sorted(), "{ranks:?}\n{text}");
+        prop_assert_eq!(back.disabled.len(), cfg.disabled.len());
     }
 
     /// The generated entry carries the marker key, and the marker is

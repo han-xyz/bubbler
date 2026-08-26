@@ -5028,6 +5028,20 @@ command "b""#
         // all: a `/-` on a line of it is a line of the string.
         let multi = "/-command #\"\"\"\n/-home-share \"x\"\n\"\"\"#\ndri\n";
         assert_eq!(parse(multi).unwrap().disabled.len(), 1);
+        // With a real multi-line string further down the file, the
+        // closing quotes it carries are what a `#\"\"\"a\"#` read as
+        // multi-line would run to, swallowing every line between.
+        let both = "dri\n/-command #\"\"\"a\"#\n/-pipewire\n/-env A=#\"\"\"\ny\n\"\"\"#\n";
+        let cfg = parse(both).unwrap();
+        assert_eq!(
+            cfg.disabled
+                .iter()
+                .map(|d| d.node.name())
+                .collect::<Vec<_>>(),
+            // Written back by section: the service, then the variable,
+            // then the command.
+            vec!["pipewire", "env", "command"]
+        );
     }
 
     #[test]
@@ -5048,6 +5062,30 @@ command "b""#
         let rendered = crate::kdl_out::render(&cfg).unwrap();
         assert_eq!(rendered, "dri\n/-pipewire\n/-command \"false\"\n");
         assert_eq!(parse(&rendered).unwrap(), cfg);
+    }
+
+    #[test]
+    fn a_line_a_backslash_carries_on_opens_no_node() {
+        // Measured against kdl 6.7.1: `dri \<newline>pipewire` is one
+        // node with one argument, for every newline it reads. So the
+        // `/-` under the escline opens no node — it is an entry of the
+        // node above, which the `/-` on that node already keeps — and a
+        // scan that missed the escline would cut two markers out and
+        // leave `dri pipewire`, which is an error rather than an entry.
+        for sep in [
+            "\n", "\r", "\r\n", "\u{0b}", "\u{0c}", "\u{85}", "\u{2028}", "\u{2029}",
+        ] {
+            let text = format!("/-dri \\{sep}/-pipewire{sep}");
+            let cfg = parse(&text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
+            assert_eq!(
+                cfg.disabled
+                    .iter()
+                    .map(|d| d.node.name())
+                    .collect::<Vec<_>>(),
+                vec!["dri"],
+                "{text:?}"
+            );
+        }
     }
 
     #[test]
