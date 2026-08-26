@@ -626,10 +626,11 @@ pub struct InstanceConfig {
     /// instance's launcher entry from, where the command's own entry is
     /// not named after it.
     pub desktop: Option<String>,
-    /// Nodes the file keeps without granting them, in file order: the
-    /// `/-` lines. Nothing downstream of the parser sees them — they are
-    /// neither granted, linted nor explained — and [`crate::kdl_out`]
-    /// writes them back where they were.
+    /// Nodes the file keeps without granting them: the `/-` lines, in
+    /// the order [`crate::kdl_out::nodes`] writes them — by section, and
+    /// within a section in file order, which is where they are written
+    /// back. Nothing downstream of the parser sees them: they are
+    /// neither granted, linted nor explained.
     pub disabled: Vec<Disabled>,
 }
 
@@ -718,13 +719,16 @@ fn check_bounds(text: &str) -> Result<(), ConfigError> {
         i = match b[i] {
             b'/' if b.get(i + 1) == Some(&b'/') => line_comment_end(b, i),
             b'/' if b.get(i + 1) == Some(&b'*') => block_comment_end(b, i),
-            b'"' => string_end(b, i, 0),
+            // A string with no end is not a reason to stop counting:
+            // the parser recovers from it and reads what follows as
+            // configuration, so this has to count that too.
+            b'"' => string_end(b, i, 0).unwrap_or(i + 1),
             // `#` opens a raw string (`#"…"#`) and also the keywords
             // `#true`, `#null` and their kin, which hold no braces.
             b'#' => {
                 let hashes = b[i..].iter().take_while(|c| **c == b'#').count();
                 if b.get(i + hashes) == Some(&b'"') {
-                    string_end(b, i + hashes, hashes)
+                    string_end(b, i + hashes, hashes).unwrap_or(i + hashes + 1)
                 } else {
                     i + hashes
                 }
@@ -752,11 +756,35 @@ fn check_bounds(text: &str) -> Result<(), ConfigError> {
 }
 
 /// Index of the newline that ends the `//` comment at `at`, or the end
-/// of the text.
+/// of the text. KDL ends the comment at any of the newlines it reads,
+/// not only at a line feed: a file with carriage returns for line
+/// endings would otherwise be one comment to the end of the text, and
+/// what the count skipped the parser would still read.
 fn line_comment_end(b: &[u8], at: usize) -> usize {
-    match b[at..].iter().position(|c| *c == b'\n') {
-        Some(n) => at + n,
-        None => b.len(),
+    let mut i = at;
+    while i < b.len() {
+        if newline_len(b, i).is_some() {
+            return i;
+        }
+        i += 1;
+    }
+    b.len()
+}
+
+/// Length of the newline at `at`, if one starts there. kdl 6.7.1 reads
+/// eight forms (`NEWLINES` in its `v2_parser.rs`), and every one of them
+/// ends a comment, opens a line and may open a multi-line string.
+fn newline_len(b: &[u8], at: usize) -> Option<usize> {
+    match *b.get(at)? {
+        b'\r' if b.get(at + 1) == Some(&b'\n') => Some(2),
+        b'\r' | b'\n' | 0x0b | 0x0c => Some(1),
+        // NEL, and the line and paragraph separators, by the bytes UTF-8
+        // writes them as.
+        0xc2 if b.get(at + 1) == Some(&0x85) => Some(2),
+        0xe2 if b.get(at + 1) == Some(&0x80) && matches!(b.get(at + 2), Some(0xa8 | 0xa9)) => {
+            Some(3)
+        }
+        _ => None,
     }
 }
 
@@ -785,13 +813,17 @@ fn block_comment_end(b: &[u8], at: usize) -> usize {
 }
 
 /// Index just past the string whose opening quote is at `quote`, opened
-/// by `hashes` `#` before it. A quoted string ends at the first `"` that
-/// is not escaped; a raw string has no escapes; either ends at a `"`
-/// followed by at least as many `#` as opened it. `"""` opens the
-/// multi-line form, which holds lines of its own — a `"` among them ends
-/// nothing — and closes on the next `"""` carrying those hashes.
-fn string_end(b: &[u8], quote: usize, hashes: usize) -> usize {
-    let triple = b.get(quote..quote + 3) == Some(b"\"\"\"".as_slice());
+/// by `hashes` `#` before it, or `None` where the string never ends. A
+/// quoted string ends at the first `"` that is not escaped; a raw string
+/// has no escapes; either ends at a `"` followed by at least as many `#`
+/// as opened it. `"""` *and a newline* open the multi-line form, which
+/// holds lines of its own — a `"` among them ends nothing — and closes
+/// on the next `"""` carrying those hashes; without the newline the
+/// three quotes are an empty string and a quote, which is how
+/// `#"""a"#` holds `""a`.
+fn string_end(b: &[u8], quote: usize, hashes: usize) -> Option<usize> {
+    let triple = b.get(quote..quote + 3) == Some(b"\"\"\"".as_slice())
+        && newline_len(b, quote + 3).is_some();
     let mut i = quote + if triple { 3 } else { 1 };
     while i < b.len() {
         match b[i] {
@@ -806,14 +838,14 @@ fn string_end(b: &[u8], quote: usize, hashes: usize) -> usize {
                 }
                 let after = i + if triple { 3 } else { 1 };
                 if b[after..].iter().take_while(|c| **c == b'#').count() >= hashes {
-                    return after + hashes;
+                    return Some(after + hashes);
                 }
                 i = after;
             }
             _ => i += 1,
         }
     }
-    b.len()
+    None
 }
 
 /// Line number, counting from one, of the byte at `offset` in `text`.
@@ -934,6 +966,13 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
         let found = disabled_in(tail, profile, at)?;
         cfg.disabled.extend(found);
     }
+    // A section is written back in one piece, so a `/-` line written
+    // above a node of a later section is written below it next time.
+    // The list follows the writing rather than the file: a config parsed
+    // from what bubbler wrote has to be the config bubbler wrote. The
+    // sort is stable, and `before` only grows down a section, so the
+    // order inside one is the file's.
+    cfg.disabled.sort_by_key(|d| section_rank(&d.node));
     if !profile && let Some(node) = bundle_without_dbus(&cfg.services) {
         return Err(ConfigError::BadArgument {
             node: node.to_owned(),
@@ -1124,6 +1163,23 @@ impl Counts {
     }
 }
 
+/// Which section of the file a node belongs to, numbered in the order
+/// [`crate::kdl_out::nodes`] writes the sections. Kept in step with that
+/// function by the round trip: a rank out of order writes a config that
+/// parses back as a different one.
+fn section_rank(node: &Node) -> u8 {
+    match node {
+        Node::LintAllow(_) => 0,
+        Node::Service(_) => 1,
+        Node::Env(_) => 2,
+        Node::Tty(_) => 3,
+        Node::Userns(_) => 4,
+        Node::Seccomp(_) => 5,
+        Node::Desktop(_) => 6,
+        Node::Command(_) => 7,
+    }
+}
+
 /// The disabled entries written in one run of leading or trailing text,
 /// which is where the KDL parser leaves a `/-` node it dropped. The
 /// markers are found first and the text parsed once with them cut out:
@@ -1131,7 +1187,9 @@ impl Counts {
 /// — an indented one, one inside a comment, a string or a block — is
 /// left exactly as it was. One parse, because the bound bubbler puts on
 /// the text it parses is only a bound on the work if the text is parsed
-/// a fixed number of times.
+/// a fixed number of times. A line that is valid KDL but not a node
+/// bubbler takes refuses the file, the way the enabled line would: an
+/// entry the editor turned off is one it can turn back on.
 fn disabled_in(text: &str, profile: bool, at: Counts) -> Result<Vec<Disabled>, ConfigError> {
     let marks = slashdash_marks(text);
     if marks.is_empty() {
@@ -1176,18 +1234,25 @@ fn slashdash_marks(text: &str) -> Vec<usize> {
             opens_line = false;
             continue;
         }
+        if let Some(n) = newline_len(b, i) {
+            i += n;
+            opens_line = true;
+            continue;
+        }
         let (next, opens) = match b[i] {
-            b'\n' => (i + 1, true),
             b'/' if b.get(i + 1) == Some(&b'/') => (line_comment_end(b, i), false),
             b'/' if b.get(i + 1) == Some(&b'*') => (block_comment_end(b, i), false),
             b'\\' => (escline_end(b, i), false),
-            b'"' => (string_end(b, i, 0), false),
+            b'"' => (string_end(b, i, 0).unwrap_or(i + 1), false),
             // `#` opens a raw string (`#"…"#`) and also the keywords
             // `#true`, `#null` and their kin, which open nothing.
             b'#' => {
                 let hashes = b[i..].iter().take_while(|c| **c == b'#').count();
                 if b.get(i + hashes) == Some(&b'"') {
-                    (string_end(b, i + hashes, hashes), false)
+                    (
+                        string_end(b, i + hashes, hashes).unwrap_or(i + hashes + 1),
+                        false,
+                    )
                 } else {
                     (i + hashes, false)
                 }
@@ -1214,10 +1279,12 @@ fn slashdash_marks(text: &str) -> Vec<usize> {
 fn escline_end(b: &[u8], at: usize) -> usize {
     let mut i = at + 1;
     while i < b.len() {
+        if let Some(n) = newline_len(b, i) {
+            return i + n;
+        }
         match b[i] {
-            b' ' | b'\t' | b'\r' => i += 1,
+            b' ' | b'\t' => i += 1,
             b'/' if b.get(i + 1) == Some(&b'/') => i = line_comment_end(b, i),
-            b'\n' => return i + 1,
             _ => return i,
         }
     }
@@ -4867,5 +4934,108 @@ command "b""#
                 before: 1,
             }]
         );
+    }
+
+    #[test]
+    fn the_brace_count_covers_every_byte_the_parser_will_read() {
+        // `check_bounds` promises the parser is never handed text the
+        // count did not clear, and the parser descends into `{` by
+        // recursion: text the count skipped over is a stack overflow,
+        // which aborts the process rather than failing. Each of these
+        // heads used to swallow the rest of the file.
+        for head in [
+            // A raw string of one hash holding `""a`, not a multi-line
+            // string: KDL opens that form only where a newline follows
+            // the three quotes.
+            "command #\"\"\"a\"#\n",
+            // Strings with no end.
+            "command \"x\n",
+            "command #\"x\n",
+            // A comment KDL ends at a carriage return.
+            "// c\r",
+        ] {
+            let deep = format!("{head}{}", "{".repeat(MAX_NESTING + 1));
+            assert!(
+                matches!(check_bounds(&deep), Err(ConfigError::TooDeep { .. })),
+                "{head:?}: {:?}",
+                check_bounds(&deep)
+            );
+            // And the whole way in, at a size a config file may have.
+            let big = format!("{head}{}", "{".repeat(200_000));
+            assert!(
+                matches!(parse(&big), Err(ConfigError::TooDeep { .. })),
+                "{head:?}"
+            );
+        }
+        // A block comment with no end is the one that needs no counting:
+        // the parser reads the rest of the file as comment and says so.
+        let commented = format!("/* c\r{}", "{".repeat(200_000));
+        assert!(parse(&commented).is_err());
+    }
+
+    #[test]
+    fn a_raw_string_with_three_quotes_keeps_the_lines_under_it() {
+        // Read as a multi-line string, `#"""a"#` runs to the end of the
+        // file and takes every `/-` line under it with it, which is a
+        // line dropped from the file the next save writes.
+        let text = "dri\n/-command #\"\"\"a\"#\n/-pipewire\n";
+        let cfg = parse(text).unwrap();
+        assert_eq!(
+            cfg.disabled
+                .iter()
+                .map(|d| d.node.name())
+                .collect::<Vec<_>>(),
+            vec!["pipewire", "command"]
+        );
+        // The string it holds is `""a`, which is what the emitter writes
+        // back, and the round trip keeps both lines.
+        let rendered = crate::kdl_out::render(&cfg).unwrap();
+        assert_eq!(rendered, "dri\n/-pipewire\n/-command \"\\\"\\\"a\"\n");
+        assert_eq!(parse(&rendered).unwrap(), cfg);
+        // The multi-line form is still read as one string, hashes and
+        // all: a `/-` on a line of it is a line of the string.
+        let multi = "/-command #\"\"\"\n/-home-share \"x\"\n\"\"\"#\ndri\n";
+        assert_eq!(parse(multi).unwrap().disabled.len(), 1);
+    }
+
+    #[test]
+    fn a_disabled_entry_is_held_in_the_order_it_is_written_back() {
+        // `/-command` is written above `/-pipewire` here and below it in
+        // the file bubbler writes, because a section is written in one
+        // piece. The list follows the writing: what is parsed from the
+        // rendering has to be the config that was rendered, which is the
+        // property the round-trip fuzz target holds.
+        let cfg = parse("dri\n/-command \"false\"\n/-pipewire\n").unwrap();
+        assert_eq!(
+            cfg.disabled
+                .iter()
+                .map(|d| d.node.name())
+                .collect::<Vec<_>>(),
+            vec!["pipewire", "command"]
+        );
+        let rendered = crate::kdl_out::render(&cfg).unwrap();
+        assert_eq!(rendered, "dri\n/-pipewire\n/-command \"false\"\n");
+        assert_eq!(parse(&rendered).unwrap(), cfg);
+    }
+
+    #[test]
+    fn a_line_opens_after_every_newline_kdl_reads() {
+        // kdl 6.7.1 reads eight newline forms (`v2_parser.rs`'s
+        // `NEWLINES`); a `/-` under any of them opens a line, and a run
+        // of them is a run of disabled entries.
+        for sep in [
+            "\n", "\r", "\r\n", "\u{0b}", "\u{0c}", "\u{85}", "\u{2028}", "\u{2029}",
+        ] {
+            let text = format!("dri{sep}/-pipewire{sep}/-hidraw{sep}");
+            let cfg = parse(&text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
+            assert_eq!(
+                cfg.disabled
+                    .iter()
+                    .map(|d| d.node.name())
+                    .collect::<Vec<_>>(),
+                vec!["pipewire", "hidraw"],
+                "{text:?}"
+            );
+        }
     }
 }
