@@ -827,6 +827,17 @@ mod tests {
             "dri\n/-home-share \"a\"\n/-home-share \"b\"\npipewire\n",
             "/-dri\n/-pipewire\n",
             "home-share \"x\"\n/-home-share \"x\"\n",
+            // The nodes a file holds one of: a disabled one is written
+            // back on the side of the enabled node it was read on.
+            "tty \"none\"\n/-tty \"passthrough\"\n\
+             userns \"disable\"\n/-userns \"allow\"\n\
+             seccomp {\n    disable\n}\n/-seccomp {\n    disable\n}\n\
+             desktop \"org.example.App.desktop\"\n\
+             /-desktop \"org.example.Other.desktop\"\n\
+             command \"true\"\n/-command \"false\"\n",
+            "/-tty \"passthrough\"\ntty \"none\"\n\
+             /-userns \"allow\"\nuserns \"disable\"\n\
+             /-command \"false\"\ncommand \"true\"\n",
             "lint-allow \"network-host\" reason=\"why\"\n\
              /-lint-allow \"own-too-wide\" reason=\"why\"\n\
              dri\n/-home-share \"x\"\nenv A=\"1\"\n/-env B=\"2\"\n\

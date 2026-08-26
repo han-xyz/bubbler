@@ -786,15 +786,25 @@ fn block_comment_end(b: &[u8], at: usize) -> usize {
 
 /// Index just past the string whose opening quote is at `quote`, opened
 /// by `hashes` `#` before it. A quoted string ends at the first `"` that
-/// is not escaped; a raw string has no escapes and ends at a `"`
-/// followed by at least as many `#` as opened it.
+/// is not escaped; a raw string has no escapes; either ends at a `"`
+/// followed by at least as many `#` as opened it. `"""` opens the
+/// multi-line form, which holds lines of its own — a `"` among them ends
+/// nothing — and closes on the next `"""` carrying those hashes.
 fn string_end(b: &[u8], quote: usize, hashes: usize) -> usize {
-    let mut i = quote + 1;
+    let triple = b.get(quote..quote + 3) == Some(b"\"\"\"".as_slice());
+    let mut i = quote + if triple { 3 } else { 1 };
     while i < b.len() {
         match b[i] {
             b'\\' if hashes == 0 => i += 2,
             b'"' => {
-                let after = i + 1;
+                // One quote inside the multi-line form is content, not
+                // the end of it: taking it as the end would leave the
+                // scan reading the rest of the string as configuration.
+                if triple && b.get(i..i + 3) != Some(b"\"\"\"".as_slice()) {
+                    i += 1;
+                    continue;
+                }
+                let after = i + if triple { 3 } else { 1 };
                 if b[after..].iter().take_while(|c| **c == b'#').count() >= hashes {
                     return after + hashes;
                 }
@@ -913,11 +923,15 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
     // writes no node at all: the parser keeps the `/-` lines there.
     if let Some(format) = doc.format() {
         let at = Counts::of(&cfg);
-        if doc.nodes().is_empty() {
-            let found = disabled_in(&format.leading, profile, at)?;
-            cfg.disabled.extend(found);
-        }
-        let found = disabled_in(&format.trailing, profile, at)?;
+        // One or the other: a file with no node keeps the whole of its
+        // text in the leading, and reading both would record every entry
+        // twice if a later parser put it in both.
+        let tail = if doc.nodes().is_empty() {
+            &format.leading
+        } else {
+            &format.trailing
+        };
+        let found = disabled_in(tail, profile, at)?;
         cfg.disabled.extend(found);
     }
     if !profile && let Some(node) = bundle_without_dbus(&cfg.services) {
@@ -1111,49 +1125,103 @@ impl Counts {
 }
 
 /// The disabled entries written in one run of leading or trailing text,
-/// which is where the KDL parser leaves a `/-` node it dropped. Each is
-/// parsed from just after its `/-`, and what the parser leaves under
-/// *that* holds the next one, so the loop walks a run of them. Each
-/// round starts under the node the last one read, so the text it works
-/// on is shorter every time.
+/// which is where the KDL parser leaves a `/-` node it dropped. The
+/// markers are found first and the text parsed once with them cut out:
+/// what was written `/-` is then a node like any other, and what was not
+/// — an indented one, one inside a comment, a string or a block — is
+/// left exactly as it was. One parse, because the bound bubbler puts on
+/// the text it parses is only a bound on the work if the text is parsed
+/// a fixed number of times.
 fn disabled_in(text: &str, profile: bool, at: Counts) -> Result<Vec<Disabled>, ConfigError> {
+    let marks = slashdash_marks(text);
+    if marks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut bare = String::with_capacity(text.len());
+    let mut cut = 0;
+    for mark in &marks {
+        bare.push_str(&text[cut..*mark]);
+        cut = mark + 2;
+    }
+    bare.push_str(&text[cut..]);
+    let doc = parse_document(&bare)?;
     let mut out = Vec::new();
-    let mut rest = text.to_owned();
-    while let Some(i) = slashdash_at(&rest) {
-        let doc = parse_document(&rest[i + 2..])?;
-        // A slashdash is only valid KDL with a node after it, so the
-        // parse above has one; a document without is nothing to keep.
-        let Some(first) = doc.nodes().first() else {
-            break;
-        };
-        let node = parse_node(first, profile)?;
+    for node in doc.nodes() {
+        let node = parse_node(node, profile)?;
         out.push(Disabled {
             before: at.before(&node),
             node,
         });
-        rest = doc.format().map(|f| f.trailing.clone()).unwrap_or_default();
     }
     Ok(out)
 }
 
-/// Where the next `/-` that opens a line is. Only column zero counts: an
-/// indented one is dropped by KDL like any other and bubbler leaves it
-/// as the comment it reads as, and a `/-` inside a comment is not a node
-/// at all, so the comments are stepped over rather than searched.
-fn slashdash_at(text: &str) -> Option<usize> {
+/// Where every `/-` that opens a line of `text` is, in order. Only
+/// column zero at the top level counts: KDL drops an indented `/-` node
+/// as well and bubbler leaves that the comment it reads as, and a `/-`
+/// child of a node is a comment whether the node above it is granted or
+/// kept. Comments, strings and esclines are stepped over rather than
+/// searched — a `/-` inside one is not a node, and the line under an
+/// escline continues the node above rather than opening one.
+fn slashdash_marks(text: &str) -> Vec<usize> {
     let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut depth: usize = 0;
+    let mut opens_line = true;
     let mut i = 0;
     while i < b.len() {
-        if (i == 0 || b[i - 1] == b'\n') && b[i] == b'/' && b.get(i + 1) == Some(&b'-') {
-            return Some(i);
+        if opens_line && depth == 0 && b[i] == b'/' && b.get(i + 1) == Some(&b'-') {
+            out.push(i);
+            i += 2;
+            opens_line = false;
+            continue;
         }
-        i = match b[i] {
-            b'/' if b.get(i + 1) == Some(&b'/') => line_comment_end(b, i),
-            b'/' if b.get(i + 1) == Some(&b'*') => block_comment_end(b, i),
-            _ => i + 1,
+        let (next, opens) = match b[i] {
+            b'\n' => (i + 1, true),
+            b'/' if b.get(i + 1) == Some(&b'/') => (line_comment_end(b, i), false),
+            b'/' if b.get(i + 1) == Some(&b'*') => (block_comment_end(b, i), false),
+            b'\\' => (escline_end(b, i), false),
+            b'"' => (string_end(b, i, 0), false),
+            // `#` opens a raw string (`#"…"#`) and also the keywords
+            // `#true`, `#null` and their kin, which open nothing.
+            b'#' => {
+                let hashes = b[i..].iter().take_while(|c| **c == b'#').count();
+                if b.get(i + hashes) == Some(&b'"') {
+                    (string_end(b, i + hashes, hashes), false)
+                } else {
+                    (i + hashes, false)
+                }
+            }
+            b'{' => {
+                depth += 1;
+                (i + 1, false)
+            }
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                (i + 1, false)
+            }
+            _ => (i + 1, false),
         };
+        i = next;
+        opens_line = opens;
     }
-    None
+    out
+}
+
+/// Index just past the newline the escline at `at` ends on. KDL lets a
+/// `\` carry a node onto the line below, so nothing on that line opens a
+/// node of its own.
+fn escline_end(b: &[u8], at: usize) -> usize {
+    let mut i = at + 1;
+    while i < b.len() {
+        match b[i] {
+            b' ' | b'\t' | b'\r' => i += 1,
+            b'/' if b.get(i + 1) == Some(&b'/') => i = line_comment_end(b, i),
+            b'\n' => return i + 1,
+            _ => return i,
+        }
+    }
+    b.len()
 }
 
 /// `include "<profile>"`: one string argument, repeatable. The name is
@@ -4744,5 +4812,60 @@ command "b""#
         for name in REPEATABLE {
             assert!(NODES.contains(name), "{name}");
         }
+    }
+
+    #[test]
+    fn a_run_of_disabled_lines_costs_one_parse() {
+        // One parse for the whole run, not one per line: `check_bounds`
+        // bounds the text bubbler hands the parser, and that is only a
+        // bound on the work if the text is parsed a fixed number of
+        // times. The fuzzers run this path on every input they generate.
+        let text = "/-dri\n".repeat(4000);
+        let started = std::time::Instant::now();
+        let cfg = parse(&text).unwrap();
+        let took = started.elapsed();
+        assert_eq!(cfg.disabled.len(), 4000);
+        // Generous enough for a debug build on a loaded machine, and far
+        // under what re-parsing the rest of the file per line costs.
+        assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+    }
+
+    #[test]
+    fn a_slashdash_inside_a_string_is_part_of_the_string() {
+        // A multi-line string holds whatever is written in it, including
+        // a line that opens with `/-`. Both spellings, since the raw one
+        // ends on its hashes rather than on the quotes.
+        for text in [
+            "/-command \"\"\"\n/-home-share \"x\"\n\"\"\"\ndri\n",
+            "/-command #\"\"\"\n/-home-share \"x\"\n\"\"\"#\ndri\n",
+        ] {
+            let cfg = parse(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(cfg.disabled.len(), 1, "{text}: {:?}", cfg.disabled);
+            assert_eq!(cfg.disabled[0].node.name(), "command", "{text}");
+        }
+        // And where the node holding the string is itself left alone,
+        // what is inside it is not a node either.
+        for text in [
+            "  /-command \"\"\"\n/-home-share \"x\"\n\"\"\"\ndri\n",
+            "  /-command #\"\"\"\n/-home-share \"x\"\n\"\"\"#\ndri\n",
+        ] {
+            let cfg = parse(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert!(cfg.disabled.is_empty(), "{text}: {:?}", cfg.disabled);
+        }
+    }
+
+    #[test]
+    fn a_slashdash_child_of_a_disabled_node_is_left_as_the_comment_it_is() {
+        // The rule is the same whether the node above is granted or kept:
+        // a child written out with `/-` is a comment, so the disabled
+        // `dbus` keeps no rule the enabled one would not have kept.
+        let cfg = parse("dri\n/-dbus {\n/-talk \"org.a.B\"\n}\n").unwrap();
+        assert_eq!(
+            cfg.disabled,
+            vec![Disabled {
+                node: Node::Service(Service::Dbus { rules: Vec::new() }),
+                before: 1,
+            }]
+        );
     }
 }
