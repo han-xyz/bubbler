@@ -129,9 +129,10 @@ config decides is grouped under the `wayland` node that decided it:
 either without `--explain` is a usage error. A config that starts no such
 sidecar says so instead of printing an empty view.
 
-A command line carrying host file arguments prints one `forward:` or
-`visible:` line each, on **stderr** so that stdout stays the byte-exact argv or
-parsable JSON. Neither mode calls the portal, so the id is a literal `<id>`:
+With `portals` granted, a command line carrying host file arguments prints one
+`forward:` or `visible:` line each, on **stderr** so that stdout stays the
+byte-exact argv or parsable JSON. Without the grant only the `visible:` lines
+appear. Neither mode calls the portal, so the id is a literal `<id>`:
 
 ```
 forward: /tmp/fwd-ro.txt → $XDG_RUNTIME_DIR/doc/<id>/fwd-ro.txt (read)

@@ -94,13 +94,14 @@ convenience channel, not a boundary.
 `open` is what a menu entry or a shim calls: it execs into the instance when
 it is running and starts it when it is not, so a URL opens in the window that
 is already there. A trailing argument naming a host file is handed to the
-sandbox through the document portal first, which is what makes "open with" from
-a file manager reach the application — `run` and `try` do the same, and
-"File arguments" is the whole of it. A terminal on any of its three standard descriptors is
-somebody watching, and the sandbox gets the terminal its `tty` node asks for;
-with none on any of them, which is how a launcher starts its children, it
-takes `tty "none"` (see "Terminal") and writes bubbler's own stderr — its warnings, a sidecar's
-errors, the application's own output — to `last-run.log` in the instance
+sandbox through the document portal first, which is what makes "open with"
+from a file manager reach the application — `run` and `try` do the same, and
+"File arguments" is the whole of it. A terminal on any of its three standard
+descriptors is somebody watching, and the sandbox gets the terminal its `tty`
+node asks for; with none on any of them, which is how a launcher starts its
+children, it takes `tty "none"` (see "Terminal") and writes bubbler's own
+stderr — its warnings, a sidecar's errors, the application's own output — to
+`last-run.log` in the instance
 directory, which `bubbler log` prints. The log is opened before the config is
 read, so a `config.kdl` that stopped the run is in it too, and a log that
 cannot be opened at all — a symlink where the file belongs — costs the record
@@ -326,11 +327,12 @@ byte-exact, one-element-per-line form. `--format json` elides nothing; an
 argument that is not UTF-8 is written there with the replacement character,
 since JSON has no byte strings.
 
-A command line carrying host file arguments prints a `forward:` or `visible:`
-line for each of them, on **stderr** and not in the listing: stdout stays the
-byte-exact argv of a dry run, or parsable JSON. Neither mode calls the portal,
-so the document id in a `forward:` line is a literal `<id>`. See "File
-arguments".
+With `portals` granted, a command line carrying host file arguments prints a
+`forward:` or `visible:` line for each of them, on **stderr** and not in the
+listing: stdout stays the byte-exact argv of a dry run, or parsable JSON.
+Without the grant only the `visible:` lines appear — nothing was going through
+the portal to describe. Neither mode calls it, so the document id in a
+`forward:` line is a literal `<id>`. See "File arguments".
 
 `--explain` attributes, it does not justify: "why is `/etc/ssl` in there" is
 answered with "the baseline", and why the baseline holds it is this README's
@@ -1549,14 +1551,20 @@ forward. Each is one warning, and each leaves the argument exactly as it was:
 
 A directory is what `path-share` and `home-share` are for; the portal can
 export one, but a whole tree handed over on the strength of an "open with" is
-not what was asked for. `/proc`, `/sys` and `/dev` are kernel interfaces rather
-than documents and the sandbox has its own of each: they are refused by the
-path *and* by what it resolves to, and again on the opened descriptor, whose
-filesystem is checked as well as its name — a bind mount of procfs or sysfs
-answers to a path no prefix test would catch. A `..` is refused rather than
-folded, the same way a share path is: what it resolves to depends on the
-symlinks along the way, and a path that says one file and opens another is not
-one to hand over.
+not what was asked for. A directory that is already *under* a share never
+reaches that rule — the visible test runs first, so it is renamed to the path
+inside like any other file there, and nothing is warned about. `/proc`, `/sys`
+and `/dev` are kernel interfaces rather than documents and the sandbox has its
+own of each: they are refused by the path *and* by what it resolves to, and
+once more on the opened descriptor, where the path it is really open on
+(`/proc/self/fd/<n>`) is tested against all three. Its filesystem is tested
+too, but only against procfs and sysfs, since a bind mount of either answers
+to a path no prefix test would catch; `/dev` is caught by name alone, because
+refusing devtmpfs or tmpfs by filesystem would refuse `/tmp`, which is where a
+forwarded file most often lives. A `..` is refused rather than folded, the
+same way a share path is: what it resolves to depends on the symlinks along
+the way, and a path that says one file and opens another is not one to hand
+over.
 
 Everything else is untouched and silent: relative paths, flags, bare words,
 `https://` and every other scheme, and a `file://` URI whose authority is

@@ -29,9 +29,11 @@ hi
   another name — a `home-share` source, the instance home — it is rewritten to
   the `/home/bubbler/…` form, which needs no portal and no grant.
 - With `portals`, refused with a warning and the argument untouched: a
-  directory (that is what these shares are for), anything that is not a regular
-  file, `/proc` `/sys` `/dev` (by the path, by what it resolves to, and again
-  on the opened descriptor), and any path containing `..`.
+  directory *not* under a share (that is what these shares are for — one that
+  is under one is renamed by the rule above, with no warning), anything that
+  is not a regular file, `/proc` `/sys` `/dev` (by the path, by what it
+  resolves to, and again on the opened descriptor — by name for all three, by
+  filesystem for procfs and sysfs), and any path containing `..`.
 - Untouched and silent: relative paths, flags, bare words, other URI schemes.
 - Symlinks are followed: what is exported is the file at the end of the link,
   under that file's name.

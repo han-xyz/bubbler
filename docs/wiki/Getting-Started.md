@@ -36,8 +36,7 @@ own variable (`$BUBBLER_INIT`, `$BUBBLER_WL_PROXY`), then beside the running
 | `xdg-dbus-proxy` | any `dbus` or `system-bus` grant — of the shipped profiles, `chromium`, `code` and `firefox`; no profile grants `system-bus` |
 | `passt` | isolated `network` — every shipped profile with a network |
 | `nftables` | `outbound "deny"` only |
-| `xdg-desktop-portal` + a backend | `portals`, `camera` |
-| `xdg-document-portal` (ships in `xdg-desktop-portal`) | the document view `portals` binds: files picked in the host file chooser, and file arguments `run`/`try`/`open` forward |
+| `xdg-desktop-portal` + a backend | `portals`, `camera`; its document portal is the view `portals` binds, which is where files picked in the host chooser and the file arguments `run`/`try`/`open` forward both land |
 | `xorg-xwayland` | a bare `x11` — the X server that runs inside the sandbox |
 | `xorg-twm`, `openbox`, `jwm` or `icewm` | `x11 wm=` — any window manager on the sandbox's PATH; bubbler ships none |
 | `at-spi2-core` | `a11y` — it is the accessibility bus, and the registry on it |
