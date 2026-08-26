@@ -216,32 +216,17 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
         }
         Service::HomeShare { path, mode } => {
             let path = text("home-share", "path", path.as_os_str())?;
-            let mut node = format!("home-share {}", quote(path));
-            // `ro` is the default, so only `rw` has to be written out.
-            if *mode == ShareMode::ReadWrite {
-                node.push_str(" mode=rw");
-            }
-            node
+            format!("home-share {} mode={}", quote(path), share_mode(*mode))
         }
         Service::PathShare { path, mode } => {
             let path = text("path-share", "path", path.as_os_str())?;
-            let mut node = format!("path-share {}", quote(path));
-            // `ro` is the default, so only `rw` has to be written out.
-            if *mode == ShareMode::ReadWrite {
-                node.push_str(" mode=rw");
-            }
-            node
+            format!("path-share {} mode={}", quote(path), share_mode(*mode))
         }
         Service::EtcShare { name } => {
             format!("etc-share {}", quote(text("etc-share", "name", name)?))
         }
         Service::AppRuntime { id, mode } => {
-            let mut node = format!("app-runtime {}", quote(id));
-            // `ro` is the default, so only `rw` has to be written out.
-            if *mode == ShareMode::ReadWrite {
-                node.push_str(" mode=rw");
-            }
-            node
+            format!("app-runtime {} mode={}", quote(id), share_mode(*mode))
         }
         Service::Mpris { name } => format!("mpris name={}", quote(name)),
         Service::Dbus { rules } => {
@@ -279,6 +264,16 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
             bus_block("system-bus", rules)
         }
     })
+}
+
+/// The `mode=` value of a share. Written on every share, default or
+/// not: how wide a bind is open is what a reader of the file is looking
+/// for, and a node that says nothing leaves them to remember the default.
+fn share_mode(mode: ShareMode) -> &'static str {
+    match mode {
+        ShareMode::ReadOnly => "ro",
+        ShareMode::ReadWrite => "rw",
+    }
 }
 
 /// `x11` and only the properties that differ from the window a bare
@@ -698,9 +693,44 @@ mod tests {
         assert_eq!(render(&cfg).unwrap(), "gamepad\n");
         let cfg = parse("dbus\nportals\ncamera nodes=#false").unwrap();
         assert_eq!(render(&cfg).unwrap(), "dbus\nportals\ncamera\n");
-        // `mode=ro` likewise: the node without it grants the same thing.
-        let cfg = parse("app-runtime \"org.example.App\" mode=ro").unwrap();
-        assert_eq!(render(&cfg).unwrap(), "app-runtime \"org.example.App\"\n");
+    }
+
+    #[test]
+    fn a_share_always_says_its_mode() {
+        // How wide a share is open is the thing to see at a glance, so
+        // `mode=ro` is written out even though leaving it off would parse
+        // to the same grant.
+        assert_eq!(
+            service(&Service::HomeShare {
+                path: "x".into(),
+                mode: ShareMode::ReadOnly,
+            })
+            .unwrap(),
+            r#"home-share "x" mode=ro"#
+        );
+        assert_eq!(
+            service(&Service::PathShare {
+                path: "/mnt/data".into(),
+                mode: ShareMode::ReadOnly,
+            })
+            .unwrap(),
+            r#"path-share "/mnt/data" mode=ro"#
+        );
+        assert_eq!(
+            service(&Service::AppRuntime {
+                id: "org.example.App".to_owned(),
+                mode: ShareMode::ReadOnly,
+            })
+            .unwrap(),
+            r#"app-runtime "org.example.App" mode=ro"#
+        );
+        // A bare node still parses as read-only; it is only written back
+        // with the mode spelled out.
+        let cfg = parse("home-share \"x\"\napp-runtime \"org.example.App\"").unwrap();
+        assert_eq!(
+            render(&cfg).unwrap(),
+            "home-share \"x\" mode=ro\napp-runtime \"org.example.App\" mode=ro\n"
+        );
     }
 
     #[test]
@@ -820,13 +850,13 @@ mod tests {
     #[test]
     fn a_disabled_node_is_written_back_where_it_was() {
         for text in [
-            "/-home-share \"x\"\ndri\n",
-            "dri\n/-home-share \"x\"\npipewire\n",
-            "dri\npipewire\n/-home-share \"x\"\n",
+            "/-home-share \"x\" mode=ro\ndri\n",
+            "dri\n/-home-share \"x\" mode=ro\npipewire\n",
+            "dri\npipewire\n/-home-share \"x\" mode=ro\n",
             "dri\n/-dbus {\n    talk \"org.a.B\"\n}\n",
-            "dri\n/-home-share \"a\"\n/-home-share \"b\"\npipewire\n",
+            "dri\n/-home-share \"a\" mode=ro\n/-home-share \"b\" mode=ro\npipewire\n",
             "/-dri\n/-pipewire\n",
-            "home-share \"x\"\n/-home-share \"x\"\n",
+            "home-share \"x\" mode=ro\n/-home-share \"x\" mode=ro\n",
             // The nodes a file holds one of: a disabled one is written
             // back on the side of the enabled node it was read on.
             "tty \"none\"\n/-tty \"passthrough\"\n\
@@ -840,7 +870,7 @@ mod tests {
              /-command \"false\"\ncommand \"true\"\n",
             "lint-allow \"network-host\" reason=\"why\"\n\
              /-lint-allow \"own-too-wide\" reason=\"why\"\n\
-             dri\n/-home-share \"x\"\nenv A=\"1\"\n/-env B=\"2\"\n\
+             dri\n/-home-share \"x\" mode=ro\nenv A=\"1\"\n/-env B=\"2\"\n\
              /-tty \"none\"\n/-command \"false\"\ncommand \"true\"\n",
         ] {
             round_trip(text);

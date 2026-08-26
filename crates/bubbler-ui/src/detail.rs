@@ -1278,10 +1278,13 @@ mod tests {
         assert_eq!(detail.clear(&env), "", "the add-row names no entry");
         assert!(!detail.dirty());
         detail.selected = at + 1;
-        assert_eq!(detail.clear(&env), "removed home-share \"Music\"");
+        assert_eq!(detail.clear(&env), "removed home-share \"Music\" mode=ro");
         assert!(detail.buf.disabled.is_empty());
         select(&mut detail, "home-share");
-        assert_eq!(detail.clear(&env), "removed home-share \"Downloads\"");
+        assert_eq!(
+            detail.clear(&env),
+            "removed home-share \"Downloads\" mode=ro"
+        );
         assert!(detail.buf.services.is_empty());
         // With the last entry gone the node is offered as any other
         // absent one, and there is nothing left to remove.
@@ -1296,14 +1299,16 @@ mod tests {
 
     #[test]
     fn a_disabled_entry_is_written_back_where_its_line_was() {
-        let text = "home-share \"A\"\n/-home-share \"B\"\nhome-share \"C\"\n";
+        let text = "home-share \"A\" mode=ro\n/-home-share \"B\" mode=ro\n\
+                    home-share \"C\" mode=ro\n";
         let (_tmp, env, mut detail) = editing(text);
         // The entry above the `/-` line keeps its place above it.
         select(&mut detail, "home-share");
         detail.toggle(&env);
         assert_eq!(
             kdl_out::render(&detail.buf).unwrap(),
-            "/-home-share \"A\"\n/-home-share \"B\"\nhome-share \"C\"\n"
+            "/-home-share \"A\" mode=ro\n/-home-share \"B\" mode=ro\n\
+             home-share \"C\" mode=ro\n"
         );
         // What the editor holds is what the file it wrote reads back as,
         // which is the whole point of ordering the entries at all.
@@ -1320,7 +1325,8 @@ mod tests {
         detail.toggle(&env);
         assert_eq!(
             kdl_out::render(&detail.buf).unwrap(),
-            "home-share \"A\"\n/-home-share \"B\"\n/-home-share \"C\"\n"
+            "home-share \"A\" mode=ro\n/-home-share \"B\" mode=ro\n\
+             /-home-share \"C\" mode=ro\n"
         );
         assert!(
             detail.row().is_some_and(Row::disabled),
@@ -1332,7 +1338,7 @@ mod tests {
 
     #[test]
     fn space_twice_on_an_entry_leaves_the_file_as_it_was() {
-        let text = "home-share \"A\"\nhome-share \"B\"\n";
+        let text = "home-share \"A\" mode=ro\nhome-share \"B\" mode=ro\n";
         let (_tmp, env, mut detail) = editing(text);
         select(&mut detail, "home-share");
         assert_eq!(detail.row().unwrap().target, Target::Service(0));
@@ -1341,7 +1347,7 @@ mod tests {
         // index that entry had.
         let row = detail.row().expect("a row").clone();
         assert!(row.disabled(), "{row:?}");
-        assert_eq!(row.text.as_deref(), Some("home-share \"A\""));
+        assert_eq!(row.text.as_deref(), Some("home-share \"A\" mode=ro"));
         assert_eq!(detail.toggle(&env), "enabled `home-share`");
         assert_eq!(kdl_out::render(&detail.buf).unwrap(), text);
         assert!(!detail.dirty(), "two presses, and the file is untouched");
@@ -1349,7 +1355,7 @@ mod tests {
 
     #[test]
     fn space_on_the_first_of_two_disabled_entries_grants_that_one() {
-        let text = "/-home-share \"A\"\n/-home-share \"B\"\n";
+        let text = "/-home-share \"A\" mode=ro\n/-home-share \"B\" mode=ro\n";
         let (_tmp, env, mut detail) = editing(text);
         select(&mut detail, "home-share");
         assert_eq!(detail.row().unwrap().target, Target::Disabled(0));
@@ -1364,7 +1370,7 @@ mod tests {
         );
         let row = detail.row().expect("a row").clone();
         assert!(row.granted(), "{row:?}");
-        assert_eq!(row.text.as_deref(), Some("home-share \"A\""));
+        assert_eq!(row.text.as_deref(), Some("home-share \"A\" mode=ro"));
         // And Space again takes that one back off, not the other.
         detail.toggle(&env);
         assert!(detail.buf.services.is_empty());
@@ -1426,7 +1432,10 @@ mod tests {
             Target::Service(1),
             "on the entry, not on the row that writes the next: {row:?}"
         );
-        assert_eq!(row.text.as_deref(), Some("home-share \"Downloads\""));
+        assert_eq!(
+            row.text.as_deref(),
+            Some("home-share \"Downloads\" mode=ro")
+        );
     }
 
     #[test]
@@ -1504,7 +1513,7 @@ mod tests {
         let (_tmp, env, mut detail) = editing("/-home-share \"Music\"\n");
         select(&mut detail, "home-share");
         assert_eq!(detail.row().unwrap().target, Target::Disabled(0));
-        assert_eq!(detail.prompt_line(), "home-share \"Music\"");
+        assert_eq!(detail.prompt_line(), "home-share \"Music\" mode=ro");
         detail.apply(&env, "home-share \"Music\" mode=rw").unwrap();
         assert!(detail.buf.services.is_empty(), "an edit grants nothing");
         assert_eq!(

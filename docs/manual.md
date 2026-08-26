@@ -423,7 +423,12 @@ stay inside your home directory: a symlink pointing elsewhere is refused, not
 followed. One home path may be shared once, whatever the modes, so
 `home-share "D"` beside `home-share "D" mode=rw` is an error rather than a
 share whose width depends on which line came first; a share below another
-(`"D"` and `"D/sub"`) names a different path and stays allowed.
+(`"D"` and `"D/sub"`) names a different path and stays allowed. `mode=` is
+optional on the way in — a share written without it is read-only — but never on
+the way out: `home-share`, `path-share` and `app-runtime` are written back with
+`mode=ro` or `mode=rw` spelled out, by `profile show`, `reseed`, `--explain`,
+the editor and every `config.kdl` bubbler saves, so how wide a share is open is
+read off the line rather than remembered.
 `etc-share` is confined to `/etc` the same way, and cannot name the account
 files (`passwd`, `group`, `shadow`, `gshadow` and their `-`/`+` variants),
 which the sandbox generates itself. `path-share` reaches outside the home and

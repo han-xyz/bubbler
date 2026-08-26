@@ -52,6 +52,9 @@ home-share "Projects/x" mode=rw
 
 - Source must exist; resolved before binding; a symlink pointing outside your
   home is refused.
+- `mode=` is optional on the way in and always written on the way out: bubbler
+  writes `home-share`, `path-share` and `app-runtime` back with `mode=ro` or
+  `mode=rw` spelled out, so a share's width is read off the line.
 - One path once, whatever the modes (`"D"` and `"D" mode=rw` together is an
   error). `"D"` beside `"D/sub"` is fine.
 - Lint warns on `.ssh`, `.gnupg`, `.pki`, `.password-store`,

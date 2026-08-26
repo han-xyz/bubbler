@@ -992,6 +992,8 @@ fn app_runtime_binds_only_the_leaf_and_explain_names_the_node() {
         .output()
         .unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
+    // Long enough that `--explain`'s label cap elides the tail, so the
+    // node is pinned by what fits rather than by the whole line.
     assert!(
         s.contains("  app-runtime \"org.keepassxc.KeePassXC\" "),
         "{s}"
@@ -5778,7 +5780,7 @@ fn a_disabled_node_is_neither_bound_nor_linted_nor_explained() {
 
     let (code, out, err) = run(tmp.path(), &["run", "t", "--explain"]);
     assert_eq!(code, 0, "{err}");
-    assert!(out.contains("  home-share \"Downloads\" "), "{out}");
+    assert!(out.contains("  home-share \"Downloads\" mode=ro "), "{out}");
     assert!(!out.contains("Music"), "{out}");
 }
 

@@ -45,6 +45,11 @@ desktop "org.mozilla.Thunderbird.desktop"   // which entry `bubbler desktop` cop
 command "firefox"
 ```
 
+`mode=` is optional on the way in — a share written without it is read-only —
+and always written on the way out: `home-share`, `path-share` and `app-runtime`
+come back from `profile show`, `reseed`, `--explain`, the editor and a saved
+`config.kdl` with `mode=ro` or `mode=rw` spelled out.
+
 ## Disabling a node
 
 A node whose line starts with `/-` is kept by the file and granted by nothing:

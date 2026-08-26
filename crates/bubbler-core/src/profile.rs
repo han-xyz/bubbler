@@ -2035,7 +2035,7 @@ mod tests {
         let ProfileError::Conflict { node, a, b } = &err else {
             panic!("{err:?}")
         };
-        assert_eq!(node, "path-share \"/kioxia/Steam\"");
+        assert_eq!(node, "path-share \"/kioxia/Steam\" mode=ro");
         assert!(a.contains("mode=rw") && a.contains("b.kdl"), "{a}");
         assert!(b.contains("mode=ro") && b.contains("a.kdl"), "{b}");
 
@@ -2078,7 +2078,7 @@ mod tests {
         let ProfileError::Conflict { node, a, b } = &err else {
             panic!("{err:?}")
         };
-        assert_eq!(node, "app-runtime \"org.keepassxc.KeePassXC\"");
+        assert_eq!(node, "app-runtime \"org.keepassxc.KeePassXC\" mode=ro");
         assert!(a.contains("mode=rw") && a.contains("b.kdl"), "{a}");
         assert!(b.contains("mode=ro") && b.contains("a.kdl"), "{b}");
     }
@@ -2469,7 +2469,10 @@ mod tests {
                 .iter()
                 .map(|d| kdl_out::disabled(d).unwrap())
                 .collect::<Vec<_>>(),
-            vec!["/-home-share \"under\"", "/-home-share \"mine\""]
+            vec![
+                "/-home-share \"under\" mode=ro",
+                "/-home-share \"mine\" mode=ro"
+            ]
         );
         // A disabled entry is a line of the seed like any other, and the
         // text an instance is seeded with is what the config parses as.
