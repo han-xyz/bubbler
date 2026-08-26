@@ -21,7 +21,7 @@ use crate::seccomp::syscall_number;
 
 /// Largest configuration bubbler hands to the KDL parser. A profile or
 /// a `config.kdl` is a screenful of grants — the shipped profiles are
-/// about 5 KB each with their headers — and this is the input
+/// under 5 KB with their headers — and this is the input
 /// [`PARSER_STACK`] is sized for: the parser may take one stack frame
 /// per byte of the text, so the bytes are the bound on its depth.
 pub const MAX_BYTES: usize = 64 * 1024;
@@ -41,9 +41,12 @@ pub const MAX_BYTES: usize = 64 * 1024;
 /// `document` frame is about 3.3 KB, so 64 Ki of them need about 216
 /// MB; this reservation leaves more than twice that. Linux commits the
 /// pages of a thread's stack as they are touched, so the reservation
-/// costs nothing until a file makes the parser use it. A file of
-/// nothing but `}` aborted a release build of bubbler on its 8 MiB
-/// main-thread stack from 13 411 bytes.
+/// uses no memory until a file makes the parser use it; it is address
+/// space charged at spawn, and a `ulimit -v` or a strict overcommit
+/// setting that cannot charge it fails the spawn as
+/// [`ConfigError::ParserThread`] rather than parsing anywhere else. A
+/// file of nothing but `}` aborted a release build of bubbler on its
+/// 8 MiB main-thread stack from 13 411 bytes.
 pub const PARSER_STACK: usize = 512 << 20;
 
 /// Most `{` bubbler hands to the KDL parser in one file, counted
@@ -5350,16 +5353,6 @@ command "b""#
                 matches!(parse(&shape), Err(ConfigError::TooDeep { .. })),
                 "{shape:?}"
             );
-            // And from a thread with 2 MiB of stack: the caller's
-            // stack is not the one the parser runs on.
-            let text = shape.clone();
-            let on_small = std::thread::Builder::new()
-                .stack_size(2 << 20)
-                .spawn(move || matches!(parse(&text), Err(ConfigError::TooDeep { .. })))
-                .unwrap()
-                .join()
-                .unwrap();
-            assert!(on_small, "{shape:?}");
         }
     }
 

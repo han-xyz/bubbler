@@ -2934,9 +2934,13 @@ none of its own.
   consuming one byte and starting over, one stack frame per such byte, so a
   file of nothing but `}` aborted bubbler from 13 KB. bubbler refuses a
   configuration over 64 KiB and parses on a thread with 512 MiB of stack
-  reserved (committed only as touched), which holds a frame for every byte of
-  the largest file admitted with more than twice the room to spare. The
-  recursion itself is upstream's (`kdl` 6.7.1).
+  reserved, which holds a frame for every byte of the largest file admitted
+  with more than twice the room to spare. That reservation is address space
+  charged when the thread starts, not memory used: under a `ulimit -v` below
+  about 520 MB, or `vm.overcommit_memory=2` with `Committed_AS` near
+  `CommitLimit`, every configuration read fails with `cannot start the parser
+  thread` (exit 1, never a crash). The recursion itself is upstream's (`kdl`
+  6.7.1).
 - A generated desktop entry closes D-Bus activation for itself only: anything
   that activates the application's bus name directly still starts the host
   copy. See "Desktop entries".

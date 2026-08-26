@@ -956,9 +956,12 @@ recursion is the parser's recovery from a top-level token it cannot place
 one stack frame per such byte, which no count of the text bounds short of
 refusing every syntax error. So the stack is sized for it instead: a
 configuration is refused above 64 KiB, and the parser runs on a thread
-with 512 MiB of stack reserved — pages committed only as touched — which
-holds a frame per byte of the largest file admitted with more than twice
-the room to spare. Counted braces, counted comment marks, and a reserved
+with 512 MiB of stack reserved, which holds a frame per byte of the
+largest file admitted with more than twice the room to spare. The
+reservation is address space charged at spawn, not memory used: under a
+`ulimit -v` below about 520 MB, or `vm.overcommit_memory=2` with
+`Committed_AS` near `CommitLimit`, every configuration read fails with
+`cannot start the parser thread` — exit 1, never a crash. Counted braces, counted comment marks, and a reserved
 stack for the restarts: the two counts keep the deep recursions cheap, the
 reservation makes the wide one safe.
 Include cycles and depth are bounded, an unknown node is an error rather
@@ -971,6 +974,7 @@ output is refused.
 gaps](manual.md#known-gaps) ·
 `nesting_past_the_bound_is_refused_before_the_parser_recurses`,
 `a_configuration_past_the_size_bound_is_refused_unparsed`,
+`a_token_the_parser_cannot_place_costs_a_frame_per_byte_and_the_stack_holds_them`,
 `a_configuration_nested_past_the_bound_is_refused_wherever_it_is_read`,
 `a_cycle_is_an_error_naming_the_chain`,
 `nesting_stops_at_the_depth_limit`,

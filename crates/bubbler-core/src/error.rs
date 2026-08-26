@@ -83,7 +83,7 @@ pub enum ConfigError {
     /// Nothing is parsed on the caller's stack instead: the reservation
     /// is what keeps a file of unplaceable bytes from aborting the
     /// process.
-    #[error("cannot start the parser thread: {0}")]
+    #[error("cannot start the parser thread")]
     ParserThread(#[source] io::Error),
     /// The parser panicked, and the panic was caught at the thread it
     /// ran on rather than carried into the caller — a panic here is an

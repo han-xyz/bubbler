@@ -5495,6 +5495,34 @@ fn a_configuration_nested_past_the_bound_is_refused_wherever_it_is_read() {
     assert!(err.contains(&registry.display().to_string()), "{err}");
     let bound = format!("more than {} times", bubbler_core::config::MAX_NESTING);
     assert!(err.contains(&bound), "{err}");
+    // The parser's own recovery — one stack frame per top-level byte it
+    // cannot place — aborted every one of these paths the same way from
+    // 13 KB of `}`. At the size bound it is a parse error like any other,
+    // on every path, whatever stack the path runs on.
+    let wide = "}".repeat(bubbler_core::config::MAX_BYTES);
+    let profile = write_profile(tmp.path(), "system", "wide", &wide);
+    std::fs::write(&cfg, &wide).unwrap();
+    for (args, file) in [
+        (vec!["profile", "show", "wide"], &profile),
+        (vec!["profile", "lint", "wide"], &profile),
+        (vec!["create", "w", "--profile", "wide"], &profile),
+        (vec!["run", "t", "--dry-run"], &cfg),
+    ] {
+        let out = bubbler(tmp.path()).args(&args).output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.code().is_some_and(|c| c != 0), "{args:?}: {err}");
+        assert!(err.contains(&file.display().to_string()), "{args:?}: {err}");
+        assert!(err.contains("invalid KDL"), "{args:?}: {err}");
+    }
+    std::fs::write(&registry, &wide).unwrap();
+    let out = bubbler(tmp.path())
+        .args(["wrap", "--list"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.code().is_some_and(|c| c != 0), "{err}");
+    assert!(err.contains(&registry.display().to_string()), "{err}");
+    assert!(err.contains("invalid KDL"), "{err}");
 }
 
 #[test]
