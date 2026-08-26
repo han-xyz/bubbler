@@ -58,9 +58,16 @@ const REFUSED_ROOTS: [&str; 3] = ["/proc", "/sys", "/dev"];
 pub struct Candidate {
     /// Position in the argument list this was found at.
     pub arg_index: usize,
-    /// The file on the host, absolute and with any `file://` decoded.
+    /// The path the argument named: absolute, `file://` decoded, and
+    /// with its symlinks still in it. Messages name this one, since it
+    /// is what the user wrote.
+    pub given: PathBuf,
+    /// The file on the host with every symlink resolved. This is what
+    /// is opened, what the permission and visibility rules are decided
+    /// on, and what the portal ends up exporting.
     pub host: PathBuf,
-    /// Basename the file keeps inside the document view.
+    /// Basename the file keeps inside the document view: the canonical
+    /// one, since the portal reads the name off the descriptor.
     pub name: OsString,
     /// Whether `write` is asked for as well as `read`: true only where
     /// the user may already write the file.
@@ -81,6 +88,11 @@ pub enum Skip {
     /// Under `/proc`, `/sys` or `/dev`: a kernel interface, not a
     /// document, and one the sandbox has its own of already.
     Refused,
+    /// Holds a `..` component. Refused rather than folded, the same way
+    /// `config.rs` refuses one in a share path: what it resolves to
+    /// depends on symlinks along the way, and a path that says one file
+    /// and opens another is not one to hand over.
+    DotDot,
     /// Already reachable inside *at the same path*: a `path-share`
     /// source, an `etc-share` entry, or one of the trees the baseline
     /// binds. The argument is left alone and nothing is warned about.
@@ -142,6 +154,16 @@ pub enum ForwardError {
     /// [`plan`] and the open cannot smuggle a directory to the portal.
     #[error("{} is not a regular file", .0.display())]
     NotAFile(PathBuf),
+    /// The descriptor turned out to name a path under `/proc`, `/sys`
+    /// or `/dev`. Those `fstat` as regular files, so the check that
+    /// [`plan`] made on the path is made again on what was opened.
+    #[error("{} names {} now, which is under /proc, /sys or /dev", .path.display(), .real.display())]
+    Refused {
+        /// File the argument named.
+        path: PathBuf,
+        /// What the descriptor turned out to be open on.
+        real: PathBuf,
+    },
     /// The portal refused the call: its D-Bus error name and message.
     #[error("{name}: {message}")]
     Portal {
@@ -210,7 +232,7 @@ fn plan_from(
     args: &[OsString],
     host: &dyn Host,
 ) -> Vec<Planned> {
-    let visible = visible_roots(env, cfg, instance_home);
+    let visible = visible_roots(env, cfg, instance_home, host);
     args.iter()
         .enumerate()
         .map(|(index, arg)| classify(offset + index, arg, &visible, host))
@@ -244,6 +266,10 @@ pub fn register(
     }
 
     let app_id = crate::dbus::app_id(instance);
+    // A refusal leaves the session usable; anything else leaves it
+    // half-read, so the remaining groups are failed with the same
+    // reason instead of being sent down a connection that is gone.
+    let mut broken: Option<String> = None;
     for write in permission_sets(candidates) {
         let group: Vec<&(usize, OwnedFd)> = open
             .iter()
@@ -262,18 +288,24 @@ pub fn register(
             Value::Str(app_id.clone()),
             Value::Array(permissions(write)),
         ];
-        let answer = session
-            .call(
-                PORTAL_NAME,
-                PORTAL_PATH,
-                PORTAL_IFACE,
-                "AddFull",
-                "ahusas",
-                &body,
-                &fds,
-            )
-            .map_err(|e| wire_reason(&e))
-            .and_then(|values| document_ids(&values, group.len()));
+        let answer = match &broken {
+            Some(reason) => Err(ForwardError::Bus(reason.clone())),
+            None => session
+                .call(
+                    PORTAL_NAME,
+                    PORTAL_PATH,
+                    PORTAL_IFACE,
+                    "AddFull",
+                    "ahusas",
+                    &body,
+                    &fds,
+                )
+                .map_err(|e| wire_reason(&e))
+                .and_then(|values| document_ids(&values, group.len())),
+        };
+        if let Err(ForwardError::Bus(reason)) = &answer {
+            broken = Some(reason.clone());
+        }
         match &answer {
             Ok(ids) => {
                 for ((index, _), id) in group.iter().zip(ids) {
@@ -308,7 +340,21 @@ pub fn register(
 /// The renames come out of the plan and need no portal at all, so this
 /// is worth calling even when nothing was registered. Arguments neither
 /// covers are copied as they were, `file://` URIs included.
+///
+/// All three lists count positions the same way: `planned` must be the
+/// [`plan`] (or [`plan_args`]) of these same `args`, and `forwards` the
+/// [`register`] of the candidates in it. An index from another argument
+/// list is ignored rather than applied to the wrong argument.
 pub fn rewrite(args: &[OsString], planned: &[Planned], forwards: &[Forward]) -> Vec<OsString> {
+    debug_assert!(
+        planned.len() <= args.len()
+            && forwards.iter().all(|f| f.arg_index < args.len())
+            && planned.iter().all(|p| match p {
+                Planned::Rename { arg_index, .. } => *arg_index < args.len(),
+                _ => true,
+            }),
+        "rewrite was given positions from another argument list"
+    );
     let mut out = args.to_vec();
     let mut put = |index: usize, path: &Path| {
         if let Some(arg) = out.get_mut(index) {
@@ -337,8 +383,9 @@ pub fn explain_lines(planned: &[Planned]) -> Vec<String> {
         .iter()
         .filter_map(|entry| match entry {
             Planned::Forward(candidate) => Some(format!(
-                "forward: {} → $XDG_RUNTIME_DIR/{DOC_DIR}/<id>/{} ({})",
-                candidate.host.display(),
+                "forward: {}{} → $XDG_RUNTIME_DIR/{DOC_DIR}/<id>/{} ({})",
+                candidate.given.display(),
+                resolved_clause(candidate),
                 Path::new(&candidate.name).display(),
                 permission_text(candidate.write),
             )),
@@ -371,6 +418,9 @@ pub fn warning_lines(planned: &[Planned]) -> Vec<String> {
                 "{} is under /proc, /sys or /dev, not forwarded",
                 path.display()
             )),
+            Planned::Skip(_, path, Skip::DotDot) => {
+                Some(format!("{} contains `..`, not forwarded", path.display()))
+            }
             _ => None,
         })
         .collect()
@@ -378,49 +428,65 @@ pub fn warning_lines(planned: &[Planned]) -> Vec<String> {
 
 /// What one argument is.
 fn classify(index: usize, arg: &OsStr, visible: &[Root], host: &dyn Host) -> Planned {
-    let path = match host_path(arg) {
+    let given = match host_path(arg) {
         Some(path) if path.is_absolute() => path,
         Some(path) => return Planned::Skip(index, path, Skip::Relative),
         None => return Planned::Untouched,
     };
-    // The literal path and the path with its symlinks resolved are both
-    // checked: a link under the user's home is a path into `/proc` as
-    // much as the name itself is.
+    if given
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Planned::Skip(index, given, Skip::DotDot);
+    }
+    // Every rule below is applied to the file the path ends at, not to
+    // the name: `~/shared/link` may point anywhere, and a rule that
+    // reads the name alone would grant what the link names instead of
+    // what it opens. Messages keep the path as the user wrote it.
+    let real = host.canonicalize(&given).unwrap_or_else(|| given.clone());
     let refused = |p: &Path| REFUSED_ROOTS.iter().any(|root| p.starts_with(root));
-    if refused(&path) || host.canonicalize(&path).is_some_and(|real| refused(&real)) {
-        return Planned::Skip(index, path, Skip::Refused);
+    if refused(&given) || refused(&real) {
+        return Planned::Skip(index, given, Skip::Refused);
     }
     // The longest matching root wins: an instance home under a shared
     // `~/.local/share` is bound by the more specific of the two.
     let root = visible
         .iter()
-        .filter(|root| path.starts_with(&root.host))
+        .filter(|root| real.starts_with(&root.host))
         .max_by_key(|root| root.host.components().count());
     if let Some(root) = root {
-        return match (&root.inside, path.strip_prefix(&root.host)) {
+        return match (&root.inside, real.strip_prefix(&root.host)) {
+            // Joining an empty remainder would leave a trailing
+            // separator, and the root itself is the argument here.
+            (Some(inside), Ok(rest)) if rest.as_os_str().is_empty() => Planned::Rename {
+                arg_index: index,
+                inside: inside.clone(),
+                host: given,
+            },
             (Some(inside), Ok(rest)) => Planned::Rename {
                 arg_index: index,
                 inside: inside.join(rest),
-                host: path,
+                host: given,
             },
-            _ => Planned::Skip(index, path, Skip::AlreadyVisible),
+            _ => Planned::Skip(index, given, Skip::AlreadyVisible),
         };
     }
-    let Some(kind) = host.file_type(&path) else {
-        return Planned::Skip(index, path, Skip::NotAFile);
+    let Some(kind) = host.file_type(&real) else {
+        return Planned::Skip(index, given, Skip::NotAFile);
     };
     if kind.is_dir() {
-        return Planned::Skip(index, path, Skip::Directory);
+        return Planned::Skip(index, given, Skip::Directory);
     }
-    // A regular file always has a name; the `None` is `/` and paths
-    // ending in `..`, which are directories anyway.
-    let (true, Some(name)) = (kind.is_file(), path.file_name().map(OsStr::to_os_string)) else {
-        return Planned::Skip(index, path, Skip::NotAFile);
+    // A regular file always has a name; the `None` is `/`, which is a
+    // directory anyway.
+    let (true, Some(name)) = (kind.is_file(), real.file_name().map(OsStr::to_os_string)) else {
+        return Planned::Skip(index, given, Skip::NotAFile);
     };
-    let write = host.writable(&path);
+    let write = host.writable(&real);
     Planned::Forward(Candidate {
         arg_index: index,
-        host: path,
+        given,
+        host: real,
         name,
         write,
     })
@@ -445,7 +511,12 @@ struct Root {
 /// `SANDBOX_HOME/<path>` and the instance home is the sandbox home, so
 /// both need the argument rewritten; `path-share`, `etc-share` and the
 /// baseline trees keep the host path.
-fn visible_roots(env: &Env, cfg: &InstanceConfig, instance_home: &Path) -> Vec<Root> {
+fn visible_roots(
+    env: &Env,
+    cfg: &InstanceConfig,
+    instance_home: &Path,
+    host: &dyn Host,
+) -> Vec<Root> {
     let same = |host: PathBuf| Root { host, inside: None };
     let mut roots = vec![Root {
         host: instance_home.to_path_buf(),
@@ -468,6 +539,15 @@ fn visible_roots(env: &Env, cfg: &InstanceConfig, instance_home: &Path) -> Vec<R
     // empty one is a prefix of every path — which would quietly forward
     // no file at all.
     roots.retain(|root| root.host.is_absolute());
+    // The bind resolves its source (`service.rs` confines the resolved
+    // path), so a share whose own source is a symlink is compared
+    // against the tree it really names. A root that resolves to nothing
+    // is left as written; nothing is under it either way.
+    for root in &mut roots {
+        if let Some(real) = host.canonicalize(&root.host) {
+            root.host = real;
+        }
+    }
     roots
 }
 
@@ -572,6 +652,16 @@ fn permissions(write: bool) -> Vec<Value> {
     list
 }
 
+/// ` (→ <canonical>)` where the argument is a symlink, empty where the
+/// path is already the file: what is exported is the file at the end of
+/// the link, and an explanation that hid that would name the wrong file.
+fn resolved_clause(candidate: &Candidate) -> String {
+    match candidate.host == candidate.given {
+        true => String::new(),
+        false => format!(" (→ {})", candidate.host.display()),
+    }
+}
+
 /// The word `--explain` prints for a permission set.
 fn permission_text(write: bool) -> &'static str {
     match write {
@@ -599,7 +689,28 @@ fn open_path(path: &Path) -> Result<OwnedFd, ForwardError> {
     if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile {
         return Err(ForwardError::NotAFile(path.to_path_buf()));
     }
+    // Everything under `/proc` and `/sys` `fstat`s as a regular file, so
+    // the type says nothing about it. `/proc/self/fd/<n>` names what the
+    // descriptor is really open on, which is the one account of it a
+    // swap between the plan and the open cannot have changed.
+    let real = opened_path(fd.as_fd()).map_err(failed)?;
+    if REFUSED_ROOTS.iter().any(|root| real.starts_with(root)) {
+        return Err(ForwardError::Refused {
+            path: path.to_path_buf(),
+            real,
+        });
+    }
     Ok(fd)
+}
+
+/// The path `fd` is open on, as `/proc/self/fd/<n>` gives it. A file
+/// unlinked meanwhile reads as its old path with ` (deleted)` after it,
+/// which is under no root either way.
+fn opened_path(fd: BorrowedFd<'_>) -> Result<PathBuf, rustix::io::Errno> {
+    use std::os::fd::AsRawFd;
+    let link = Path::new("/proc/self/fd").join(fd.as_raw_fd().to_string());
+    let target = rustix::fs::readlink(&link, Vec::new())?;
+    Ok(PathBuf::from(OsString::from_vec(target.into_bytes())))
 }
 
 /// The document ids out of an `AddFull` reply, checked to be one usable
@@ -653,6 +764,10 @@ impl ForwardError {
                 source: io::Error::new(source.kind(), source.to_string()),
             },
             ForwardError::NotAFile(path) => ForwardError::NotAFile(path.clone()),
+            ForwardError::Refused { path, real } => ForwardError::Refused {
+                path: path.clone(),
+                real: real.clone(),
+            },
             ForwardError::Portal { name, message } => ForwardError::Portal {
                 name: name.clone(),
                 message: message.clone(),
@@ -666,6 +781,7 @@ impl ForwardError {
 #[cfg(test)]
 mod tests {
     use std::fs::FileType;
+    use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
     use super::*;
@@ -712,6 +828,10 @@ mod tests {
                     path: "Documents".into(),
                     mode: ShareMode::ReadOnly,
                 },
+                Service::HomeShare {
+                    path: "Downloads".into(),
+                    mode: ShareMode::ReadWrite,
+                },
                 Service::PathShare {
                     path: "/srv/data".into(),
                     mode: ShareMode::ReadWrite,
@@ -737,7 +857,11 @@ mod tests {
             .with("/home/han/link.pdf", file)
             .link("/home/han/link.pdf", "/home/han/a.pdf")
             .rw("/home/han/link.pdf")
+            .with("/home/han/Documents", dir)
             .with("/home/han/Documents/report.pdf", file)
+            .with("/home/han/Downloads/b.pdf", file)
+            .with("/home/han/.ssh/id_rsa", file)
+            .with("/data/inst/home", dir)
             .with("/srv/data/x.csv", file)
             .with("/data/inst/home/note.txt", file)
             .with("/usr/share/doc/manual.pdf", file)
@@ -754,8 +878,9 @@ mod tests {
     fn tag(planned: &Planned) -> String {
         match planned {
             Planned::Forward(c) => format!(
-                "forward {} as {} ({})",
-                c.host.display(),
+                "forward {}{} as {} ({})",
+                c.given.display(),
+                resolved_clause(c),
                 Path::new(&c.name).display(),
                 permission_text(c.write)
             ),
@@ -797,7 +922,7 @@ mod tests {
             ),
             (
                 "/home/han/link.pdf",
-                "forward /home/han/link.pdf as link.pdf (write)",
+                "forward /home/han/link.pdf (→ /home/han/a.pdf) as a.pdf (write)",
             ),
             ("file://other/home/han/a.pdf", "untouched"),
             ("file://localhost", "untouched"),
@@ -845,6 +970,32 @@ mod tests {
                 "/etc/secret.conf",
                 "forward /etc/secret.conf as secret.conf (read)",
             ),
+            // `..` is refused rather than folded: it would otherwise
+            // walk out of the share the path appears to be under.
+            (
+                "/home/han/Documents/../.ssh/id_rsa",
+                "skip /home/han/Documents/../.ssh/id_rsa DotDot",
+            ),
+            (
+                "/usr/../home/han/.ssh/id_rsa",
+                "skip /usr/../home/han/.ssh/id_rsa DotDot",
+            ),
+            (
+                "file:///home/han/Documents%2F..%2F.ssh/id_rsa",
+                "skip /home/han/Documents/../.ssh/id_rsa DotDot",
+            ),
+            // A read-write share renames the same way a read-only one
+            // does; the mode is the bind's business, not the path's.
+            (
+                "/home/han/Downloads/b.pdf",
+                "rename /home/han/Downloads/b.pdf → /home/bubbler/Downloads/b.pdf",
+            ),
+            // The share root itself, with no separator left dangling.
+            (
+                "/home/han/Documents",
+                "rename /home/han/Documents → /home/bubbler/Documents",
+            ),
+            ("/data/inst/home", "rename /data/inst/home → /home/bubbler"),
         ];
         let args: Vec<&str> = cases.iter().map(|(arg, _)| *arg).collect();
         let out = planned(&args, &tree());
@@ -997,21 +1148,12 @@ mod tests {
             host: "/home/han/Documents/b.pdf".into(),
             inside: "/home/bubbler/Documents/b.pdf".into(),
         }];
-        let forwards = vec![
-            Forward {
-                arg_index: 1,
-                host: "/home/han/a.pdf".into(),
-                inside: "/run/user/1000/doc/abc/a.pdf".into(),
-                write: true,
-            },
-            // An index past the end is left alone rather than pushed on.
-            Forward {
-                arg_index: 9,
-                host: "/home/han/z.pdf".into(),
-                inside: "/run/user/1000/doc/zzz/z.pdf".into(),
-                write: false,
-            },
-        ];
+        let forwards = vec![Forward {
+            arg_index: 1,
+            host: "/home/han/a.pdf".into(),
+            inside: "/run/user/1000/doc/abc/a.pdf".into(),
+            write: true,
+        }];
         assert_eq!(
             rewrite(&args, &[], &forwards),
             vec![
@@ -1074,9 +1216,29 @@ mod tests {
         );
     }
 
+    /// Nothing more from the client: the connection ends where it is.
+    fn server_end(stream: &UnixStream) {
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            (&*stream).read(&mut byte).unwrap(),
+            0,
+            "the client sent a message it had no reason to send"
+        );
+    }
+
+    /// A reply in an endianness the client does not read: the call
+    /// fails without the far side having refused anything, which is
+    /// what leaves the connection half-read.
+    fn server_wrong_endianness(stream: &UnixStream, call: &Call) {
+        let mut message = reply_bytes(9, call.serial, PORTAL_OWNER, "", &[]);
+        message[0] = b'B';
+        (&*stream).write_all(&message).unwrap();
+    }
+
     fn candidate(arg_index: usize, path: &Path, write: bool) -> Candidate {
         Candidate {
             arg_index,
+            given: path.to_path_buf(),
             host: path.to_path_buf(),
             name: path.file_name().unwrap().to_os_string(),
             write,
@@ -1316,10 +1478,72 @@ mod tests {
     #[test]
     fn nothing_to_register_makes_no_call_at_all() {
         let tmp = tempfile::tempdir().unwrap();
-        let (bus, server) = fake_bus(tmp.path(), |stream| server_start(&stream));
+        let (bus, server) = fake_bus(tmp.path(), |stream| {
+            server_start(&stream);
+            server_end(&stream);
+        });
         let mut session = Session::connect(&bus).unwrap();
         assert!(register(&env(), "pdf", &[], &mut session).is_empty());
         drop(session);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn a_descriptor_that_lands_in_proc_is_refused_after_the_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        // What a swap between the plan and the open looks like: the
+        // name is still there, the file behind it is a procfs entry,
+        // which `fstat`s as a regular file.
+        let link = tmp.path().join("a.pdf");
+        std::os::unix::fs::symlink("/proc/self/environ", &link).unwrap();
+        let (bus, server) = fake_bus(tmp.path(), |stream| {
+            server_start(&stream);
+            server_end(&stream);
+        });
+        let mut session = Session::connect(&bus).unwrap();
+        let out = register(&env(), "pdf", &[candidate(0, &link, false)], &mut session);
+        drop(session);
+        server.join().unwrap();
+        let e = out[0].as_ref().unwrap_err();
+        assert!(
+            matches!(e, ForwardError::Refused { path, real }
+                if *path == link && real.starts_with("/proc")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn a_session_that_broke_is_not_called_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = file(tmp.path(), "a.pdf");
+        let b = file(tmp.path(), "b.pdf");
+        let (bus, server) = fake_bus(tmp.path(), |stream| {
+            server_start(&stream);
+            let call = server_addfull(&stream);
+            // A reply this client does not read leaves the connection
+            // half-read, which is the case the second group must not be
+            // sent down.
+            server_wrong_endianness(&stream, &call);
+            server_end(&stream);
+        });
+        let mut session = Session::connect(&bus).unwrap();
+        let out = register(
+            &env(),
+            "pdf",
+            &[candidate(0, &a, true), candidate(1, &b, false)],
+            &mut session,
+        );
+        drop(session);
+        server.join().unwrap();
+        for answer in &out {
+            assert!(
+                matches!(answer.as_ref().unwrap_err(), ForwardError::Bus(_)),
+                "{answer:?}"
+            );
+        }
+        assert_eq!(
+            out[0].as_ref().unwrap_err().to_string(),
+            out[1].as_ref().unwrap_err().to_string()
+        );
     }
 }
