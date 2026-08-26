@@ -21,9 +21,10 @@ use std::path::{Path, PathBuf};
 
 use rustix::fs::{Mode, OFlags};
 
+use crate::bwrap::ETC_ALLOWLIST;
 use crate::config::{InstanceConfig, Service};
 use crate::dbus_wire::{Session, Value, WireError};
-use crate::env::Env;
+use crate::env::{Env, SANDBOX_HOME};
 use crate::host::Host;
 
 /// The document portal: bus name, object and interface.
@@ -39,6 +40,13 @@ const FLAG_REUSE_EXISTING: u32 = 1;
 /// Directory of the by-app document view, under `$XDG_RUNTIME_DIR` both
 /// on the host and inside the sandbox.
 const DOC_DIR: &str = "doc";
+
+/// Host trees the baseline binds at the same path inside every sandbox:
+/// `--ro-bind /usr` and `--ro-bind-try /opt`. `/etc` is not one of them
+/// — it is a tmpfs with [`ETC_ALLOWLIST`] bound over it — and neither
+/// are the `/bin` and `/lib` symlinks, which point at `/usr` inside
+/// whatever they are on the host.
+const BASELINE_ROOTS: [&str; 2] = ["/usr", "/opt"];
 
 /// Path prefixes never forwarded: they name kernel interfaces and the
 /// sandbox's own devices, not documents, and the sandbox has its own
@@ -73,8 +81,9 @@ pub enum Skip {
     /// Under `/proc`, `/sys` or `/dev`: a kernel interface, not a
     /// document, and one the sandbox has its own of already.
     Refused,
-    /// Already reachable inside through a share or the instance home,
-    /// so it costs the sandbox nothing to leave the argument alone.
+    /// Already reachable inside *at the same path*: a `path-share`
+    /// source, an `etc-share` entry, or one of the trees the baseline
+    /// binds. The argument is left alone and nothing is warned about.
     AlreadyVisible,
 }
 
@@ -83,6 +92,18 @@ pub enum Skip {
 pub enum Planned {
     /// A host file to ask the portal for.
     Forward(Candidate),
+    /// A file the sandbox already sees, under another name: everything
+    /// bound under [`SANDBOX_HOME`] keeps its relative path but not its
+    /// host one, so the argument becomes the path inside. No portal and
+    /// no grant are involved — the share is already there.
+    Rename {
+        /// Position in the argument list this was found at.
+        arg_index: usize,
+        /// The file on the host.
+        host: PathBuf,
+        /// Where the sandbox sees the same file.
+        inside: PathBuf,
+    },
     /// An argument that named a path bubbler will not forward, with the
     /// path as it was decoded and the reason.
     Skip(usize, PathBuf, Skip),
@@ -155,10 +176,44 @@ pub fn plan(
     args: &[OsString],
     host: &dyn Host,
 ) -> Vec<Planned> {
+    plan_from(0, env, cfg, instance_home, args, host)
+}
+
+/// [`plan`] over a whole command line, the program included: index 0 is
+/// never a document — replacing it would swap the binary that runs — and
+/// the indices are into `cmd`, so [`rewrite`] takes that same slice.
+///
+/// This is what a caller holding an argv wants; [`plan`] is for one that
+/// has already split the program off.
+pub fn plan_args(
+    env: &Env,
+    cfg: &InstanceConfig,
+    instance_home: &Path,
+    cmd: &[OsString],
+    host: &dyn Host,
+) -> Vec<Planned> {
+    let Some((_program, args)) = cmd.split_first() else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(cmd.len());
+    out.push(Planned::Untouched);
+    out.extend(plan_from(1, env, cfg, instance_home, args, host));
+    out
+}
+
+/// [`plan`] with the first argument at `offset` of the caller's list.
+fn plan_from(
+    offset: usize,
+    env: &Env,
+    cfg: &InstanceConfig,
+    instance_home: &Path,
+    args: &[OsString],
+    host: &dyn Host,
+) -> Vec<Planned> {
     let visible = visible_roots(env, cfg, instance_home);
     args.iter()
         .enumerate()
-        .map(|(index, arg)| classify(index, arg, &visible, host))
+        .map(|(index, arg)| classify(offset + index, arg, &visible, host))
         .collect()
 }
 
@@ -246,15 +301,30 @@ pub fn register(
         .collect()
 }
 
-/// The argument list with each forwarded file replaced by its path
-/// inside the sandbox. Arguments nothing was registered for are copied
-/// as they were, `file://` URIs included.
-pub fn rewrite(args: &[OsString], forwards: &[Forward]) -> Vec<OsString> {
+/// The argument list with every file the sandbox will see put at the
+/// path it will see it at: the ones the portal exported, and the ones a
+/// share already holds under [`SANDBOX_HOME`].
+///
+/// The renames come out of the plan and need no portal at all, so this
+/// is worth calling even when nothing was registered. Arguments neither
+/// covers are copied as they were, `file://` URIs included.
+pub fn rewrite(args: &[OsString], planned: &[Planned], forwards: &[Forward]) -> Vec<OsString> {
     let mut out = args.to_vec();
-    for forward in forwards {
-        if let Some(arg) = out.get_mut(forward.arg_index) {
-            *arg = forward.inside.clone().into_os_string();
+    let mut put = |index: usize, path: &Path| {
+        if let Some(arg) = out.get_mut(index) {
+            *arg = path.to_path_buf().into_os_string();
         }
+    };
+    for entry in planned {
+        if let Planned::Rename {
+            arg_index, inside, ..
+        } = entry
+        {
+            put(*arg_index, inside);
+        }
+    }
+    for forward in forwards {
+        put(forward.arg_index, &forward.inside);
     }
     out
 }
@@ -271,6 +341,11 @@ pub fn explain_lines(planned: &[Planned]) -> Vec<String> {
                 candidate.host.display(),
                 Path::new(&candidate.name).display(),
                 permission_text(candidate.write),
+            )),
+            Planned::Rename { host, inside, .. } => Some(format!(
+                "visible: {} → {}",
+                host.display(),
+                inside.display()
             )),
             _ => None,
         })
@@ -302,7 +377,7 @@ pub fn warning_lines(planned: &[Planned]) -> Vec<String> {
 }
 
 /// What one argument is.
-fn classify(index: usize, arg: &OsStr, visible: &[PathBuf], host: &dyn Host) -> Planned {
+fn classify(index: usize, arg: &OsStr, visible: &[Root], host: &dyn Host) -> Planned {
     let path = match host_path(arg) {
         Some(path) if path.is_absolute() => path,
         Some(path) => return Planned::Skip(index, path, Skip::Relative),
@@ -315,8 +390,21 @@ fn classify(index: usize, arg: &OsStr, visible: &[PathBuf], host: &dyn Host) -> 
     if refused(&path) || host.canonicalize(&path).is_some_and(|real| refused(&real)) {
         return Planned::Skip(index, path, Skip::Refused);
     }
-    if visible.iter().any(|root| path.starts_with(root)) {
-        return Planned::Skip(index, path, Skip::AlreadyVisible);
+    // The longest matching root wins: an instance home under a shared
+    // `~/.local/share` is bound by the more specific of the two.
+    let root = visible
+        .iter()
+        .filter(|root| path.starts_with(&root.host))
+        .max_by_key(|root| root.host.components().count());
+    if let Some(root) = root {
+        return match (&root.inside, path.strip_prefix(&root.host)) {
+            (Some(inside), Ok(rest)) => Planned::Rename {
+                arg_index: index,
+                inside: inside.join(rest),
+                host: path,
+            },
+            _ => Planned::Skip(index, path, Skip::AlreadyVisible),
+        };
     }
     let Some(kind) = host.file_type(&path) else {
         return Planned::Skip(index, path, Skip::NotAFile);
@@ -338,22 +426,55 @@ fn classify(index: usize, arg: &OsStr, visible: &[PathBuf], host: &dyn Host) -> 
     })
 }
 
-/// Host roots the sandbox can already reach: the source of every share
-/// the config grants, and the instance's own home.
-fn visible_roots(env: &Env, cfg: &InstanceConfig, instance_home: &Path) -> Vec<PathBuf> {
-    let mut roots = vec![instance_home.to_path_buf()];
+/// A host tree the sandbox already reaches, and where it sees it.
+struct Root {
+    /// Where the files are on the host.
+    host: PathBuf,
+    /// Where the sandbox sees them, when that is not the same path.
+    /// Everything bound under [`SANDBOX_HOME`] keeps its relative path
+    /// and loses its host one; a `path-share` and the baseline trees are
+    /// bound at the path they have on the host.
+    inside: Option<PathBuf>,
+}
+
+/// Host trees the sandbox can already reach: what the baseline binds,
+/// the source of every share the config grants, and the instance's own
+/// home.
+///
+/// The mapping mirrors the binds: `home-share` puts `$HOME/<path>` at
+/// `SANDBOX_HOME/<path>` and the instance home is the sandbox home, so
+/// both need the argument rewritten; `path-share`, `etc-share` and the
+/// baseline trees keep the host path.
+fn visible_roots(env: &Env, cfg: &InstanceConfig, instance_home: &Path) -> Vec<Root> {
+    let same = |host: PathBuf| Root { host, inside: None };
+    let mut roots = vec![Root {
+        host: instance_home.to_path_buf(),
+        inside: Some(PathBuf::from(SANDBOX_HOME)),
+    }];
+    roots.extend(BASELINE_ROOTS.iter().map(|root| same(PathBuf::from(root))));
+    roots.extend(ETC_ALLOWLIST.iter().map(|name| same(etc(name))));
     for service in &cfg.services {
         match service {
-            Service::HomeShare { path, .. } => roots.push(env.home.join(path)),
-            Service::PathShare { path, .. } => roots.push(path.clone()),
+            Service::HomeShare { path, .. } => roots.push(Root {
+                host: env.home.join(path),
+                inside: Some(Path::new(SANDBOX_HOME).join(path)),
+            }),
+            Service::PathShare { path, .. } => roots.push(same(path.clone())),
+            Service::EtcShare { name } => roots.push(same(etc(name))),
             _ => {}
         }
     }
     // A root that is not absolute compares against nothing, and an
     // empty one is a prefix of every path — which would quietly forward
     // no file at all.
-    roots.retain(|root| root.is_absolute());
+    roots.retain(|root| root.host.is_absolute());
     roots
+}
+
+/// One entry of the host `/etc`. The rest of `/etc` inside is a tmpfs,
+/// so nothing else there is visible to the sandbox.
+fn etc(name: impl AsRef<Path>) -> PathBuf {
+    Path::new("/etc").join(name)
 }
 
 /// The host path an argument names, or `None` when it names none: a
@@ -625,6 +746,10 @@ mod tests {
             .with("/home/han/Documents/report.pdf", file)
             .with("/srv/data/x.csv", file)
             .with("/data/inst/home/note.txt", file)
+            .with("/usr/share/doc/manual.pdf", file)
+            .with("/opt/vendor/manual.pdf", file)
+            .with("/etc/fonts/fonts.conf", file)
+            .with("/etc/secret.conf", file)
             .with("/proc/self/exe", file)
             .with("/dev/null", char_type())
     }
@@ -640,6 +765,9 @@ mod tests {
                 Path::new(&c.name).display(),
                 permission_text(c.write)
             ),
+            Planned::Rename { host, inside, .. } => {
+                format!("rename {} → {}", host.display(), inside.display())
+            }
             Planned::Skip(_, path, why) => format!("skip {} {why:?}", path.display()),
             Planned::Untouched => "untouched".to_owned(),
         }
@@ -694,12 +822,34 @@ mod tests {
             ("/sys/power/state", "skip /sys/power/state Refused"),
             (
                 "/home/han/Documents/report.pdf",
-                "skip /home/han/Documents/report.pdf AlreadyVisible",
+                "rename /home/han/Documents/report.pdf → /home/bubbler/Documents/report.pdf",
+            ),
+            (
+                "file:///home/han/Documents/a%20b.pdf",
+                "rename /home/han/Documents/a b.pdf → /home/bubbler/Documents/a b.pdf",
             ),
             ("/srv/data/x.csv", "skip /srv/data/x.csv AlreadyVisible"),
             (
                 "/data/inst/home/note.txt",
-                "skip /data/inst/home/note.txt AlreadyVisible",
+                "rename /data/inst/home/note.txt → /home/bubbler/note.txt",
+            ),
+            (
+                "/usr/share/doc/manual.pdf",
+                "skip /usr/share/doc/manual.pdf AlreadyVisible",
+            ),
+            (
+                "/opt/vendor/manual.pdf",
+                "skip /opt/vendor/manual.pdf AlreadyVisible",
+            ),
+            (
+                "/etc/fonts/fonts.conf",
+                "skip /etc/fonts/fonts.conf AlreadyVisible",
+            ),
+            // The rest of `/etc` inside is a tmpfs, so this one is not
+            // there until the portal puts it there.
+            (
+                "/etc/secret.conf",
+                "forward /etc/secret.conf as secret.conf (read)",
             ),
         ];
         let args: Vec<&str> = cases.iter().map(|(arg, _)| *arg).collect();
@@ -710,6 +860,7 @@ mod tests {
         for (index, entry) in out.iter().enumerate() {
             match entry {
                 Planned::Forward(c) => assert_eq!(c.arg_index, index),
+                Planned::Rename { arg_index, .. } => assert_eq!(*arg_index, index),
                 Planned::Skip(at, ..) => assert_eq!(*at, index),
                 Planned::Untouched => {}
             }
@@ -822,7 +973,13 @@ mod tests {
     #[test]
     fn the_explain_lines_name_the_document_path_with_a_literal_id() {
         let out = planned(
-            &["/home/han/a.pdf", "/home/han/theirs.pdf", "--flag"],
+            &[
+                "/home/han/a.pdf",
+                "/home/han/theirs.pdf",
+                "/home/han/Documents/report.pdf",
+                "/srv/data/x.csv",
+                "--flag",
+            ],
             &tree(),
         );
         assert_eq!(
@@ -830,6 +987,7 @@ mod tests {
             vec![
                 "forward: /home/han/a.pdf → $XDG_RUNTIME_DIR/doc/<id>/a.pdf (write)",
                 "forward: /home/han/theirs.pdf → $XDG_RUNTIME_DIR/doc/<id>/theirs.pdf (read)",
+                "visible: /home/han/Documents/report.pdf → /home/bubbler/Documents/report.pdf",
             ]
         );
     }
@@ -840,6 +998,11 @@ mod tests {
             .iter()
             .map(OsString::from)
             .collect();
+        let renamed = vec![Planned::Rename {
+            arg_index: 2,
+            host: "/home/han/Documents/b.pdf".into(),
+            inside: "/home/bubbler/Documents/b.pdf".into(),
+        }];
         let forwards = vec![
             Forward {
                 arg_index: 1,
@@ -856,14 +1019,40 @@ mod tests {
             },
         ];
         assert_eq!(
-            rewrite(&args, &forwards),
+            rewrite(&args, &[], &forwards),
             vec![
                 OsString::from("--flag"),
                 OsString::from("/run/user/1000/doc/abc/a.pdf"),
                 OsString::from("file:///home/han/b.pdf"),
             ]
         );
-        assert_eq!(rewrite(&args, &[]), args);
+        // A rename needs no portal, so it applies with nothing registered.
+        assert_eq!(
+            rewrite(&args, &renamed, &[]),
+            vec![
+                OsString::from("--flag"),
+                OsString::from("/home/han/a.pdf"),
+                OsString::from("/home/bubbler/Documents/b.pdf"),
+            ]
+        );
+        assert_eq!(rewrite(&args, &[], &[]), args);
+    }
+
+    #[test]
+    fn the_program_is_never_a_document() {
+        let cmd: Vec<OsString> = ["/usr/bin/cat", "/home/han/a.pdf"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let out = plan_args(&env(), &cfg(), Path::new(INSTANCE_HOME), &cmd, &tree());
+        assert_eq!(out[0], Planned::Untouched);
+        assert_eq!(tag(&out[1]), "forward /home/han/a.pdf as a.pdf (write)");
+        assert_eq!(
+            plan_args(&env(), &cfg(), Path::new(INSTANCE_HOME), &[], &tree()),
+            Vec::new()
+        );
+        // A bare argument list keeps the program's own index free.
+        assert_eq!(planned(&["/home/han/a.pdf"], &tree()).len(), 1);
     }
 
     const FIELD_PATH: u8 = 1;
