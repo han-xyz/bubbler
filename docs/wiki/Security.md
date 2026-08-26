@@ -259,13 +259,16 @@ application left on the card.
 `usb` bare binds the `/dev/bus/usb` directory read-write: raw I/O to every USB
 device, hotplug included, which is what `bubbler lint` warns about as
 `usb-all-devices`. `usb vendor="…" [product="…"]` binds only the matching
-nodes, resolved once at launch. Two limits are worth stating plainly: the ids
-are what the device says about itself, so a filter scopes an honest device
-population and authenticates nothing; and while two overlapping nodes in one
-file are refused, across profile layers the wider node silently replaces the
-narrower, so an including layer can widen a scoped grant. Who may open a node
-stays the host's decision — usbfs is `0664 root:root` until a `uaccess` tag or
-a vendor rule says otherwise.
+nodes, resolved once at launch. Three limits are worth stating plainly. The
+ids are what the device says about itself, so a filter scopes an honest device
+population and authenticates nothing. While two overlapping nodes in one file
+are refused, across profile layers the wider node silently replaces the
+narrower, so an including layer can widen a scoped grant. And a filter narrows
+what the sandbox may open, not what it may see: with `dri` or `gamepad` beside
+it, the `/sys/devices` those grants bind make every device's descriptors
+readable inside even though only the matched node is in `/dev`. Who may open
+a node stays the host's decision either way — usbfs is `0664 root:root` until
+a `uaccess` tag or a vendor rule says otherwise.
 
 `smartcard` binds the `pcscd` socket and no device at all. It is every reader
 and card the daemon has, at the level of the APDUs a card answers: while a

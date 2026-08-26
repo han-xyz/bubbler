@@ -1,11 +1,17 @@
 # Devices
 
-Most device grants are emitted only where the host has the thing; a missing
-`/dev/nvidia*` or `/dev/video*` binds nothing rather than failing. The
-exceptions are the grants that name exactly one resource — `/dev/uinput` for
-`gamepad uinput=#true`, `/dev/kfd` and its sysfs topology for `compute`, the
-`pcscd` socket for `smartcard`, `/dev/bus/usb` for a bare `usb` — each of
-which is an error when missing, rather than a quietly weaker sandbox.
+Each grant below names paths it **requires** at launch and, in some cases,
+paths it binds only where the host has them. A required path that is missing,
+or is not of the type expected, stops the run — never a quietly weaker
+sandbox — and each section says which is which. Broadly: the device node and
+the sysfs a grant cannot work without are required (`/dev/dri` and the PCI
+roots for `dri`, `/dev/input` with `/sys/class/input` and `/sys/devices` for
+`gamepad`, `/dev/kfd` and its topology for `compute`, `/sys/bus/usb` for
+`usb` — plus `/dev/bus/usb` and `/sys/devices` for the bare form, and each
+node a filter matched — the `pcscd` socket for `smartcard`,
+`/dev/uinput` for `gamepad uinput=#true`), while the hardware a host may
+simply not have is bound where it exists (`/dev/nvidia*`, `/dev/video*`,
+`/dev/hidraw*`, `/run/udev`).
 
 ## dri — GPU
 
@@ -107,6 +113,11 @@ directory.
   `product=` without `vendor=` is refused. `lsusb` prints the pair.
 - Two overlapping nodes in one file are an error; **across profile layers the
   wider node silently wins**, so an including layer can widen a scoped grant.
+- A filter narrows **access**, not visibility. Alone it leaves the other
+  `/sys/bus/usb` links dangling, but `dri` (PCI roots) or `gamepad`
+  (`/sys/devices`) makes every device's descriptors readable again: measured
+  here, `lsusb` with `dri` + a filter lists all fourteen devices while only
+  the matched node is in `/dev`.
 - The ids are what the device claims about itself — a filter is not
   authentication.
 - Permissions stay the host's: a usbfs node is `0664 root:root`

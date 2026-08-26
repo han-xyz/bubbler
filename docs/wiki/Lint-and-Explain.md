@@ -93,21 +93,8 @@ for a session X display, `sidecar: pasta …` and the nft ruleset under
 Xwayland command line itself, and `--wm` the window manager's name, both
 arguments of `bubbler-init` rather than of bwrap.
 
-`compute`, `smartcard` and a bare `usb` each add a `grants:` line saying what
-their few binds reach, and a `usb` node with `vendor=` adds `matched:` — one
-line per device it resolved (product `*` where the node named a vendor alone),
-or the text of the launch warning where nothing matched:
-
-```
-  usb vendor="1532" product="0531"  config.kdl:1  9 arguments
-    --ro-bind /sys/bus/usb /sys/bus/usb
-    --dev-bind-try /dev/bus/usb/001/004 /dev/bus/usb/001/004
-    --ro-bind /sys/devices/…/usb1/1-8 /sys/devices/…/usb1/1-8
-    matched: 1532:0531 at bus 001 device 004
-
-  usb vendor="ffff"                 config.kdl:2  0 arguments
-    matched: no device matches vendor=ffff
-```
+A few groups of one instance's listing, out of file order as the format puts
+them:
 
 ```
   portals                         config.kdl:11  10 arguments
@@ -137,6 +124,24 @@ That config has an `x11` node, which is why its `wayland` group carries no
 a sandbox with no X display in it. The `x11` group sits after `init` because
 its first argument is a `--setenv`, and the environment phase comes after every
 bind — the one that puts `bubbler-init` in place included.
+
+`compute`, `smartcard` and a bare `usb` each add a `grants:` line saying what
+their few binds reach, and a `usb` node with `vendor=` adds `matched:` — one
+line per device it resolved (product `*` where the node named a vendor alone),
+or the text of the launch warning where nothing matched. The sysfs path is
+shortened with `…` here; the real output prints the device's full
+`/sys/devices/pci…` path, which is long:
+
+```
+  usb vendor="1532" product="0531"  config.kdl:1  9 arguments
+    --ro-bind /sys/bus/usb /sys/bus/usb
+    --dev-bind-try /dev/bus/usb/001/004 /dev/bus/usb/001/004
+    --ro-bind /sys/devices/…/usb1/1-8 /sys/devices/…/usb1/1-8
+    matched: 1532:0531 at bus 001 device 004
+
+  usb vendor="ffff"                 config.kdl:2  0 arguments
+    matched: no device matches vendor=ffff
+```
 
 `--explain --wl-proxy` renders the Wayland proxy's own sandbox instead. Its
 `baseline` and `seccomp` groups carry no config line — the sidecar's filter is

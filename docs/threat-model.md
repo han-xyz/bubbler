@@ -725,10 +725,11 @@ not a character device stops the run rather than producing a sandbox
 whose runtime silently enumerates nothing.
 
 **Does not defend:** which GPU. `/dev/kfd` is one node for the whole
-machine, so a sandbox holding the grant reaches every AMD GPU on it, and
-GPU memory is not zeroed between users — what another application left on
-the card is what a compute job can read, which is the cost `dri` already
-carried. Nor do node permissions narrow it: systemd's own
+machine, so a sandbox holding the grant reaches every AMD GPU on it. What
+it adds beyond `dri` is that reach and not a new class of access: a
+compute job goes to the same GPU through the same kernel driver the
+render nodes already opened, so it carries no capture risk `dri` did not
+carry. Nor do node permissions narrow it: systemd's own
 `50-udev-default.rules` sets `SUBSYSTEM=="kfd", GROUP="render",
 MODE="0666"`, so on a stock host every process of yours can already open
 the node and the grant is the whole of the decision. The bind is
@@ -745,20 +746,21 @@ read-write because bwrap has no read-only device bind.
 
 ### USB devices
 
-**Defends:** a `usb` node carrying `vendor=` binds only the device nodes
-whose sysfs reports those ids — not the `/dev/bus/usb` directory — so the
-rest of the bus is absent inside, and the `/sys/bus/usb` links naming
-those devices dangle rather than resolve. Nothing read out of sysfs is
-pasted into a path: `busnum` and `devnum` are parsed as numbers before
+**Defends:** *access.* A `usb` node carrying `vendor=` binds only the
+device nodes whose sysfs reports those ids — never the `/dev/bus/usb`
+directory — so those are the only devices the sandbox can open, transfer
+to or program, whatever else is in the config. Nothing read out of sysfs
+is pasted into a path: `busnum` and `devnum` are parsed as numbers before
 `/dev/bus/usb/BBB/DDD` is built from them, an entry whose canonical path
 falls outside `/sys/devices` is passed over rather than bound, and an
 entry whose attributes are not what the kernel writes is skipped. Ids are
-four hex digits, normalised, so a filter cannot be widened by case or
-whitespace. Two overlapping nodes in one file are refused, which keeps a
-config's filters disjoint and means no device node is bound twice. The
-bare form is a lint warning (`usb-all-devices`), not a silent default.
+exactly four hex digits and are lower-cased before they are compared, so
+case cannot widen a filter and whitespace is refused rather than trimmed.
+Two overlapping nodes in one file are refused, which keeps a config's
+filters disjoint and means no device node is bound twice. The bare form
+is a lint warning (`usb-all-devices`), not a silent default.
 
-**Does not defend:** three things, deliberately.
+**Does not defend:** four things, deliberately.
 
 The ids are the device's own claim. `idVendor` and `idProduct` come out
 of a descriptor the device writes; a device that can be reprogrammed —
@@ -769,6 +771,17 @@ filter scopes an honest device population; it authenticates nothing.
 The bare node is every USB device the host has, raw, and it is live: the
 directory is bound, so a device plugged in while the sandbox runs is
 reachable inside it. That is the grant, and the lint says so.
+
+**A filter is not a privacy boundary over the bus, only an access one.**
+Alone, a filtered node leaves the other devices' `/sys/bus/usb` links
+dangling and they are invisible inside. But `dri` binds every
+`/sys/devices/pci*` root and `gamepad` binds `/sys/devices` whole, and
+USB devices live under those, so with either grant beside it every
+device's descriptors resolve and are readable — measured on this host,
+`lsusb` inside a `dri` + `usb vendor="1532" product="0531"` sandbox lists
+all fourteen devices, while `/dev/bus/usb/*/*` still holds the one
+matched node. Enumeration and identification widen with the sysfs a
+config already grants; opening a device does not.
 
 And **a profile layer can widen it**. Two overlapping `usb` nodes in one
 file are an error, but across layers the wider node replaces the narrower

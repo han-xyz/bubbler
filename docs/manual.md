@@ -1207,10 +1207,21 @@ A node with `vendor=`, optionally narrowed by `product=`, binds only the
 devices whose sysfs reports those ids: for each match its
 `/dev/bus/usb/BBB/DDD` node with device access, and that device's own
 `/sys/devices/…` directory read-only. `/sys/bus/usb` is bound whole either
-way, because that directory is what an enumeration walks; the entries in it
-naming devices the grant did not bind are symlinks that dangle inside, which
-is what libusb sees for a device it may not touch. It is bound once however
-many `usb` nodes the config holds.
+way, because that directory is what an enumeration walks; it is bound once
+however many `usb` nodes the config holds.
+
+What a filter narrows is **access**, and only that. The nodes it did not bind
+are absent from `/dev`, so no application inside can open, transfer to or
+program those devices — but whether it can *see* them depends on the rest of
+the config. On its own, a filtered `usb` leaves the other `/sys/bus/usb`
+entries pointing at directories that are not inside, so they dangle and an
+enumeration finds one device. Beside `dri`, which binds every
+`/sys/devices/pci*` root, or `gamepad`, which binds `/sys/devices` whole, the
+links resolve again and every device's descriptors are readable: measured
+here, `lsusb` in a `dri` + `usb vendor="1532" product="0531"` sandbox lists
+all fourteen devices of this machine, while `ls /dev/bus/usb/*/*` inside still
+prints the single matched node. Treat the filter as what a sandbox may
+*touch*, not as what it may know is plugged in.
 
 That list is resolved once, at launch, by reading
 `/sys/bus/usb/devices/*/{idVendor,idProduct,busnum,devnum}` — so a filtered
@@ -1988,9 +1999,11 @@ KeePassXC drives a YubiKey through libusb and a smart card through pcsclite,
 which are the `usb` and `smartcard` grants and a different device class. Both
 are one line away for a database that wants them — a `usb` node carrying the
 two ids `lsusb` prints for the key, or `smartcard` for a reader — and neither
-is in the profile, because a password manager that opens its database without
-them should not be handed them by default. Browser integration is not in the
-profile either, but it is one line away: the header carries the
+is in the profile for the reason every profile here is written that way: a
+profile ships what its application needs to *run* and nothing else, a database
+opens without either, and bubbler grants nothing it was not asked for. That is
+this project's rule, not a judgement about KeePassXC. Browser integration is
+not in the profile either, but it is one line away: the header carries the
 `app-runtime "org.keepassxc.KeePassXC" mode=rw` node and its `lint-allow`, and
 `firefox` and `chromium` carry the matching read-only line, so the socket
 KeePassXC serves is reachable from another instance once both sides name the
@@ -2428,7 +2441,12 @@ outright rather than skipping the bind), `dbus-without-rules`,
 `tty-passthrough`, `portal-talk-without-portals` (a portal rule is inert
 without `/.flatpak-info`, which is worse than wrong), `wayland-host`
 (`wayland "host"`, the session's own compositor socket, which the compositor
-cannot tell from your session).
+cannot tell from your session), `wayland-clipboard-open`
+(`wayland clipboard="open"`, the paste gate off, so the sandbox may read the
+selection whenever it holds focus with no keystroke of yours behind the read)
+and `usb-all-devices` (a `usb` node with no `vendor=`: the whole
+`/dev/bus/usb` directory, so every device the host has and every one plugged
+in while the sandbox runs, opened for raw I/O).
 
 **Notes** are information and fail nothing: `app-runtime-rw` (a shared
 application runtime directory granted `mode=rw`, so the sandbox can replace the
