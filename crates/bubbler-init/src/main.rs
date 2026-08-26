@@ -22,7 +22,7 @@ use rustix::io::{Errno, FdFlags, fcntl_dupfd_cloexec, fcntl_getfd, fcntl_setfd};
 use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 use rustix::process::{DumpableBehavior, Pid, Signal, kill_process, set_dumpable_behavior};
 
-use bubbler_init::{proto, wire};
+use bubbler_init::{fds, proto, wire};
 
 /// Supervisor tick: the `poll` timeout, so `accept`, `wait` and every
 /// request read are non-blocking and one iteration is bounded by it.
@@ -173,7 +173,8 @@ fn listener_from_fd(fd: i32) -> Option<UnixListener> {
     // owns and that nothing else will close. `fcntl_getfd` is the probe that
     // rules out a number that is not open at all (EBADF) before any owning
     // handle exists, so no closed number is ever adopted or closed twice;
-    // bubbler passes this listener as the only inherited fd above stdio, so
+    // this listener is the only descriptor above stdio left by the time
+    // `main` gets here, since the sweep there closed every other one, so
     // there is no second owner. A number that is open but not a listening
     // socket is rejected below and closed again on drop.
     let owned = unsafe {
@@ -481,6 +482,15 @@ fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
+    // Before the socket is adopted, the display is bound or anything at
+    // all is started. `--socket-fd` is the one descriptor this argv names,
+    // so everything else above stdio is something bwrap passed through
+    // from whatever started bubbler; the display socket is bound here and
+    // handed to the server on a duplicate of its own.
+    if let Err(e) = fds::sweep(&[args.socket_fd], fds::Stray::Close) {
+        eprintln!("bubbler-init: cannot close the descriptors it was not given: {e}");
+        return ExitCode::from(2);
+    }
     let Some(listener) = listener_from_fd(args.socket_fd) else {
         eprintln!(
             "bubbler-init: {}: not an open listening socket fd",

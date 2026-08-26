@@ -17,10 +17,13 @@ type Started = (std::process::Child, PathBuf, tempfile::TempDir);
 /// no test ever hands it the terminal it is run from. `x11` is the X
 /// server argv passed as `--x11 <argv...> --`, `x11_socket` the socket
 /// the supervisor binds for it, and `wm` the window manager program.
+/// `stray` is a descriptor the supervisor inherits without being told of
+/// it, standing in for whatever the process that started the run had open.
 #[derive(Default)]
 struct Opts<'a> {
     ctty: bool,
     stdio: Option<&'a OwnedFd>,
+    stray: Option<&'a OwnedFd>,
     x11: Option<&'a [&'a str]>,
     x11_socket: Option<&'a Path>,
     wm: Option<&'a Path>,
@@ -33,27 +36,33 @@ static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Spawn a supervisor with the process to ourselves. `listener`, when
 /// given, is duplicated with CLOEXEC cleared so the supervisor inherits
 /// it, and `build` is handed that descriptor's number to name in the
-/// argv it returns. Clearing CLOEXEC is a change to the whole process,
-/// and `cargo test` runs these tests as threads of one: any other spawn
-/// in flight would inherit the descriptor too, and hand it on to every
-/// child of its own. So the lock is held from the duplicate to its
-/// close, and every spawn in this file goes through here.
+/// argv it returns. `stray` is duplicated the same way and named to
+/// nobody: it is what a descriptor the run was never given looks like.
+/// Clearing CLOEXEC is a change to the whole process, and `cargo test`
+/// runs these tests as threads of one: any other spawn in flight would
+/// inherit the descriptor too, and hand it on to every child of its own.
+/// So the lock is held from the duplicate to its close, and every spawn
+/// in this file goes through here.
 fn spawn_locked(
     listener: Option<&UnixListener>,
+    stray: Option<std::os::fd::BorrowedFd<'_>>,
     build: impl FnOnce(Option<std::os::fd::RawFd>) -> Command,
 ) -> std::process::Child {
     // A test that panicked while holding it poisoned nothing: the lock
     // guards a window in this process, not any state worth distrusting.
     let _one_at_a_time = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
-    let inherited = listener.map(|l| {
-        let fd = rustix::io::fcntl_dupfd_cloexec(l.as_fd(), 3).unwrap();
-        rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty()).unwrap();
-        fd
-    });
+    let handed = |fd: std::os::fd::BorrowedFd<'_>| {
+        let dup = rustix::io::fcntl_dupfd_cloexec(fd, 3).unwrap();
+        rustix::io::fcntl_setfd(&dup, rustix::io::FdFlags::empty()).unwrap();
+        dup
+    };
+    let inherited = listener.map(|l| handed(l.as_fd()));
+    let unnamed = stray.map(handed);
     let mut command = build(inherited.as_ref().map(AsRawFd::as_raw_fd));
     let child = command.spawn().unwrap();
     // Closed before the lock goes, or the window it guards is still open.
     drop(inherited);
+    drop(unnamed);
     child
 }
 
@@ -64,7 +73,7 @@ fn start_with(cmd: &[&str], opts: Opts<'_>) -> Started {
     let tmp = tempfile::tempdir().unwrap();
     let sock = tmp.path().join("init.sock");
     let listener = UnixListener::bind(&sock).unwrap();
-    let child = spawn_locked(Some(&listener), |fd| {
+    let child = spawn_locked(Some(&listener), opts.stray.map(AsFd::as_fd), |fd| {
         let mut init = Command::new(env!("CARGO_BIN_EXE_bubbler-init"));
         init.arg("--socket-fd").arg(
             fd.expect("a listener was handed over, so it has a number")
@@ -424,7 +433,7 @@ fn send_prefix_and_fds(stream: &UnixStream, len: u32) {
 #[test]
 fn a_closed_socket_fd_is_a_usage_error_not_an_abort() {
     // No listener to inherit: 99 is a number nothing has open.
-    let init = spawn_locked(None, |_| {
+    let init = spawn_locked(None, None, |_| {
         let mut init = Command::new(env!("CARGO_BIN_EXE_bubbler-init"));
         init.arg("--socket-fd")
             .arg("99")
@@ -612,6 +621,22 @@ fn write_script(dir: &Path, name: &str, body: &str, executable: bool) -> PathBuf
 /// Write one fake X server into `dir` and return its path.
 fn server_script(dir: &Path, name: &str, body: &str) -> PathBuf {
     let text = format!("{SERVER_HEAD}{STAMPS_ON_TERM}{SERVER_ACCEPT}{body}");
+    write_script(dir, name, &text, false)
+}
+
+/// The listing a fake X server takes of itself, with the socket it was
+/// handed left out of it: what is written is everything it inherited that
+/// the supervisor did not mean to give it. Taken before the file it goes
+/// into is opened, as the window manager's and the command's are.
+const SERVER_RECORDS: &str = r#"seen = " ".join(n for n in _fds().split() if int(n) != fd)
+open(sys.argv[0] + ".fds", "w").write(seen)
+"#;
+
+/// Write one fake X server that records what it inherited beside the
+/// socket it was given, and return its path.
+fn recording_server_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let text =
+        format!("{SERVER_HEAD}{FD_LIST}{SERVER_RECORDS}{STAMPS_ON_TERM}{SERVER_ACCEPT}{body}");
     write_script(dir, name, &text, false)
 }
 
@@ -938,6 +963,94 @@ fn no_child_but_the_server_inherits_the_display_socket() {
         std::fs::read_to_string(&out).unwrap().trim(),
         "0 1 2",
         "an exec'd child inherited more than the stdio it was sent"
+    );
+    init.stop();
+}
+
+/// A file the run inherits without being told of it, standing in for
+/// whatever the shell, terminal or build system that started bubbler had
+/// open: `makepkg` runs `check()` with two descriptors of its own.
+fn stray_file(dir: &Path) -> OwnedFd {
+    stdio_file(&dir.join("stray"))
+}
+
+#[test]
+fn no_descriptor_the_supervisor_was_not_given_reaches_anything_it_starts() {
+    if !require_python() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let stray = stray_file(dir.path());
+    // A spawn of this file's own inherits the stray, which is what makes
+    // the assertions below mean anything: without this the run could be
+    // handed nothing at all and still pass every one of them.
+    let probe = write_script(
+        dir.path(),
+        "probe",
+        &format!("#!{PYTHON}\nimport os, sys\n{FD_LIST}print(_fds())\n"),
+        true,
+    );
+    let bare = spawn_locked(None, Some(stray.as_fd()), |_| {
+        let mut c = Command::new(&probe);
+        c.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        c
+    });
+    let out = bare.wait_with_output().unwrap();
+    let inherited = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    assert_ne!(
+        inherited, "0 1 2",
+        "the fixture inherited no stray descriptor, so this run proves nothing"
+    );
+
+    let script = recording_server_script(dir.path(), "xserver.py", SERVES_AND_STAYS);
+    let wm = wm_script(dir.path(), "fake-wm", WM_STAYS);
+    let cmd = fd_recording_command(dir.path());
+    let xsock = dir.path().join("X0");
+    let log = dir.path().join("init.log");
+    let fd = stdio_file(&log);
+    let (mut init, sock) = start_guarded(
+        &[cmd.to_str().unwrap()],
+        Opts {
+            stdio: Some(&fd),
+            stray: Some(&stray),
+            x11: Some(&[PYTHON, script.to_str().unwrap()]),
+            x11_socket: Some(&xsock),
+            wm: Some(&wm),
+            ..Opts::default()
+        },
+    );
+    wait_for_path(&xsock);
+    // The supervisor was given one descriptor above its stdio, the socket
+    // requests arrive on. Whatever else it was handed is closed before it
+    // starts anything, so nothing it starts can be holding it.
+    assert_eq!(
+        wait_for_file(&beside(&cmd, ".fds")),
+        "0 1 2",
+        "the command inherited a descriptor the supervisor was not given"
+    );
+    let client = x_connect(&xsock);
+    assert_eq!(served_byte(&client), b'X');
+    assert_eq!(
+        wait_for_file(&beside(&script, ".fds")),
+        "0 1 2",
+        "the X server inherited more than the socket it was handed"
+    );
+    assert_eq!(
+        wait_for_file(&beside(&wm, ".fds")),
+        "0 1 2",
+        "the window manager inherited a descriptor the supervisor was not given"
+    );
+    let out = dir.path().join("exec.fds");
+    let file = std::fs::File::create(&out).unwrap();
+    let program = format!("import os\n{FD_LIST}print(_fds())\n");
+    let st = exec_with_stdout(&sock, &[PYTHON, "-c", &program], file.as_fd());
+    assert_eq!(ExitStatus::from_raw(st).code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap().trim(),
+        "0 1 2",
+        "an exec'd child inherited a descriptor the supervisor was not given"
     );
     init.stop();
 }
