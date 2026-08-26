@@ -5,6 +5,7 @@ pub mod bwrap;
 pub mod catalogue;
 pub mod config;
 pub mod dbus;
+pub mod dbus_wire;
 pub mod desktop;
 pub mod env;
 pub mod error;
