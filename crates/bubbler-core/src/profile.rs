@@ -10,8 +10,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::config::{
-    self, BusRule, ConfigError, InstanceConfig, LintAllow, Outbound, RawProfile, Service,
-    ShareMode, Userns,
+    self, BusRule, ConfigError, Disabled, InstanceConfig, LintAllow, Node, Outbound, RawProfile,
+    Service, ShareMode, Userns,
 };
 use crate::env::Env;
 use crate::error::ProfileError;
@@ -536,6 +536,7 @@ struct Merged {
     command: Option<(Vec<OsString>, Src)>,
     desktop: Option<(String, Src)>,
     lint_allows: Vec<(LintAllow, Src)>,
+    disabled: Vec<(Disabled, Src)>,
 }
 
 impl Merged {
@@ -551,6 +552,12 @@ impl Merged {
                 Some(slot) => *slot = (allow.clone(), src.clone()),
                 None => self.lint_allows.push((allow.clone(), src.clone())),
             }
+        }
+        // Kept as written, layer by layer, and never merged with one
+        // another or with a grant: a `/-` line grants nothing, so there
+        // is no conflict between two of them to resolve.
+        for entry in &raw.config.disabled {
+            self.disabled.push((entry.clone(), src.clone()));
         }
         for (key, value) in &raw.config.env {
             match self.env.iter_mut().find(|(k, _, _)| k == key) {
@@ -822,33 +829,81 @@ impl Merged {
         for (allow, src) in &self.lint_allows {
             origins.push((kdl_out::lint_allow(allow), src));
         }
+        kept(
+            &self.disabled,
+            |n| matches!(n, Node::LintAllow(_)),
+            name,
+            &mut origins,
+        )?;
         for (svc, src) in &self.services {
             origins.push((kdl_out::service(svc).map_err(bad)?, src));
         }
+        kept(
+            &self.disabled,
+            |n| matches!(n, Node::Service(_)),
+            name,
+            &mut origins,
+        )?;
         for (key, value, src) in &self.env {
             origins.push((kdl_out::env(key, value), src));
         }
+        kept(
+            &self.disabled,
+            |n| matches!(n, Node::Env(_)),
+            name,
+            &mut origins,
+        )?;
         if let Some((mode, src)) = &self.tty
             && *mode != TtyMode::default()
         {
             origins.push((kdl_out::tty(*mode), src));
         }
+        kept(
+            &self.disabled,
+            |n| matches!(n, Node::Tty(_)),
+            name,
+            &mut origins,
+        )?;
         if let Some((mode, src)) = &self.userns
             && *mode != Userns::default()
         {
             origins.push((kdl_out::userns(*mode), src));
         }
+        kept(
+            &self.disabled,
+            |n| matches!(n, Node::Userns(_)),
+            name,
+            &mut origins,
+        )?;
         if let Some(src) = &self.seccomp_src
             && self.seccomp != SeccompConfig::default()
         {
             origins.push((kdl_out::seccomp(&self.seccomp), src));
         }
+        kept(
+            &self.disabled,
+            |n| matches!(n, Node::Seccomp(_)),
+            name,
+            &mut origins,
+        )?;
         if let Some((name, src)) = &self.desktop {
             origins.push((kdl_out::desktop(name), src));
         }
+        kept(
+            &self.disabled,
+            |n| matches!(n, Node::Desktop(_)),
+            name,
+            &mut origins,
+        )?;
         if let Some((argv, src)) = &self.command {
             origins.push((kdl_out::command(argv).map_err(bad)?, src));
         }
+        kept(
+            &self.disabled,
+            |n| matches!(n, Node::Command(_)),
+            name,
+            &mut origins,
+        )?;
         let mut text = String::new();
         for (node, _) in &origins {
             text.push_str(node);
@@ -868,6 +923,26 @@ impl Merged {
                 .collect(),
         })
     }
+}
+
+/// The `/-` lines of one section, written under the section's last node.
+/// Where a layer wrote one is an index into that layer's own nodes, and
+/// the merged section is not the one it counted, so the position a
+/// single layer had is not carried across the merge.
+fn kept<'a>(
+    disabled: &'a [(Disabled, Src)],
+    is: fn(&Node) -> bool,
+    name: &str,
+    origins: &mut Vec<(String, &'a Src)>,
+) -> Result<(), ProfileError> {
+    for (entry, src) in disabled.iter().filter(|(d, _)| is(&d.node)) {
+        let node = kdl_out::disabled(entry).map_err(|source| ProfileError::Parse {
+            origin: format!("flattened profile `{name}`"),
+            source,
+        })?;
+        origins.push((node, src));
+    }
+    Ok(())
 }
 
 /// Union `rules` into `held`, dropping repeats. A name the two layers
@@ -2374,5 +2449,36 @@ mod tests {
             );
         }
         assert!(!r.user_dir().join("escape.kdl").exists());
+    }
+
+    #[test]
+    fn a_layer_carries_its_disabled_entries_into_the_flattened_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(
+            tmp.path(),
+            &[("mine", "include \"under\"\ndri\n/-home-share \"mine\"\n")],
+            &[("under", "pipewire\n/-home-share \"under\"\n")],
+        );
+        let resolved = r.resolve("mine").unwrap();
+        // The included layer's entries come first, the way its grants do,
+        // and nothing merges two disabled entries into one.
+        assert_eq!(
+            resolved
+                .config
+                .disabled
+                .iter()
+                .map(|d| kdl_out::disabled(d).unwrap())
+                .collect::<Vec<_>>(),
+            vec!["/-home-share \"under\"", "/-home-share \"mine\""]
+        );
+        // A disabled entry is a line of the seed like any other, and the
+        // text an instance is seeded with is what the config parses as.
+        assert_eq!(config::parse(&resolved.text).unwrap(), resolved.config);
+        assert_eq!(resolved.text, kdl_out::render(&resolved.config).unwrap());
+        // What it grants is untouched: the entry is a line, not a grant.
+        assert_eq!(
+            resolved.config.services,
+            vec![Service::Pipewire, Service::Dri]
+        );
     }
 }

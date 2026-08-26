@@ -499,6 +499,108 @@ impl Service {
     }
 }
 
+/// The nodes a config may hold more than once, in the order [`NODES`]
+/// lists them. Every other node is one per file: a second one is a
+/// [`ConfigError::Duplicate`], because which of the two applied would be
+/// a matter of file order.
+pub const REPEATABLE: &[&str] = &[
+    "home-share",
+    "path-share",
+    "etc-share",
+    "app-runtime",
+    "env",
+    "lint-allow",
+];
+
+/// One parsed top-level node, whatever kind it is. A config is a list of
+/// these; a node the file keeps but does not grant is a [`Disabled`]
+/// holding one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Node {
+    /// A grant.
+    Service(Service),
+    /// An `env` node, with every variable it sets.
+    Env(Vec<(String, String)>),
+    /// A `lint-allow` node. One node accepts one id; the list is what a
+    /// caller building a node by hand may hold.
+    LintAllow(Vec<LintAllow>),
+    /// A `tty` node.
+    Tty(TtyMode),
+    /// A `userns` node.
+    Userns(Userns),
+    /// A `seccomp` node with its children.
+    Seccomp(SeccompConfig),
+    /// A `desktop` node naming a `.desktop` file.
+    Desktop(String),
+    /// A `command` node with its argv.
+    Command(Vec<OsString>),
+}
+
+impl Node {
+    /// The KDL node it was written as, which is the name [`NODES`] and
+    /// [`crate::catalogue::GRANTS`] hold it under.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Service(s) => s.node_name(),
+            Self::Env(_) => "env",
+            Self::LintAllow(_) => "lint-allow",
+            Self::Tty(_) => "tty",
+            Self::Userns(_) => "userns",
+            Self::Seccomp(_) => "seccomp",
+            Self::Desktop(_) => "desktop",
+            Self::Command(_) => "command",
+        }
+    }
+
+    /// Whether the node carries anything beyond its own name — an
+    /// argument, a property or children. A node that does not is
+    /// spelled out by its name alone, so a `/-` line would keep nothing
+    /// that granting it again does not write.
+    pub fn has_content(&self) -> bool {
+        let Self::Service(s) = self else {
+            // Every other node takes an argument or children to parse at
+            // all, so there is no bare spelling of one.
+            return true;
+        };
+        match s {
+            Service::Wayland(mode) => *mode != WaylandMode::default(),
+            Service::X11(mode) => *mode != X11Mode::default(),
+            Service::Network(cfg) => *cfg != NetworkConfig::default(),
+            Service::Camera { nodes } => *nodes,
+            Service::Gamepad { hidraw, uinput } => *hidraw || *uinput,
+            Service::Dbus { rules } | Service::SystemBus { rules } => !rules.is_empty(),
+            Service::Dri
+            | Service::Pipewire
+            | Service::Pulseaudio
+            | Service::Portals
+            | Service::Notify
+            | Service::Tray
+            | Service::Hidraw
+            | Service::A11y
+            | Service::InputMethod => false,
+            Service::HomeShare { .. }
+            | Service::PathShare { .. }
+            | Service::EtcShare { .. }
+            | Service::AppRuntime { .. }
+            | Service::Mpris { .. } => true,
+        }
+    }
+}
+
+/// A node a file keeps without granting it: one `/-` line, which every
+/// KDL reader drops and bubbler reads back as an entry that is turned
+/// off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Disabled {
+    /// The node, parsed exactly as the enabled line would have been.
+    pub node: Node,
+    /// Index into its section's enabled entries this one sits before
+    /// (`== len` after the last), so it is written back where it was
+    /// read. A `/-` line above a node of another section counts every
+    /// entry of its own section written above it.
+    pub before: usize,
+}
+
 /// Parsed `config.kdl`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InstanceConfig {
@@ -524,6 +626,11 @@ pub struct InstanceConfig {
     /// instance's launcher entry from, where the command's own entry is
     /// not named after it.
     pub desktop: Option<String>,
+    /// Nodes the file keeps without granting them, in file order: the
+    /// `/-` lines. Nothing downstream of the parser sees them — they are
+    /// neither granted, linted nor explained — and [`crate::kdl_out`]
+    /// writes them back where they were.
+    pub disabled: Vec<Disabled>,
 }
 
 /// One profile layer as written: the same nodes an instance config may
@@ -716,215 +823,76 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
     let mut seen_userns = false;
     let mut seen_seccomp = false;
     for node in doc.nodes() {
-        let name = node.name().value();
-        reject_types(node)?;
-        // Resolved against the table rather than by falling off the end
-        // of the match: an arm added without an entry there is a node
-        // the catalogue never describes, and the two lists would drift.
-        if !NODES.contains(&name) && name != "include" {
-            return Err(ConfigError::UnknownNode(name.to_owned()));
+        // The `/-` lines above a node are read before the node itself, so
+        // the entries a file keeps without granting them come out in the
+        // order they are written.
+        if let Some(format) = node.format() {
+            let at = Counts::of(&cfg);
+            let found = disabled_in(&format.leading, profile, at)?;
+            cfg.disabled.extend(found);
         }
-        match name {
-            "dri" | "pipewire" | "pulseaudio" | "portals" | "notify" | "tray" | "hidraw"
-            | "a11y" | "input-method" => {
-                reject_entries(node)?;
-                let svc = match name {
-                    "dri" => Service::Dri,
-                    "pipewire" => Service::Pipewire,
-                    "pulseaudio" => Service::Pulseaudio,
-                    "portals" => Service::Portals,
-                    "notify" => Service::Notify,
-                    "tray" => Service::Tray,
-                    "hidraw" => Service::Hidraw,
-                    "a11y" => Service::A11y,
-                    "input-method" => Service::InputMethod,
-                    // Unreachable through the arm above, and an error
-                    // rather than a fallback: a name added to that list
-                    // and forgotten here would otherwise grant whichever
-                    // service the fallback named.
-                    other => return Err(ConfigError::UnknownNode(other.to_owned())),
-                };
-                if cfg.services.contains(&svc) {
-                    return Err(ConfigError::Duplicate(name.to_owned()));
-                }
-                cfg.services.push(svc);
+        let name = node.name().value();
+        // Not a grant but a layer to merge under this one, so it is taken
+        // here rather than parsed into a [`Node`].
+        if name == "include" {
+            reject_types(node)?;
+            if !profile {
+                return Err(bad(node, "include is only valid in profiles"));
             }
-            "home-share" => {
-                let (path, mode) = parse_share(node, "path", validate_relative)?;
-                // The path alone, not the path and the mode: nothing
-                // downstream chooses between two modes for one home path,
-                // so file order would decide how wide the share is.
-                if cfg
-                    .services
-                    .iter()
-                    .any(|s| matches!(s, Service::HomeShare { path: held, .. } if *held == path))
-                {
-                    return Err(ConfigError::Duplicate(name.to_owned()));
+            includes.push(parse_include(node)?);
+            continue;
+        }
+        match parse_node(node, profile)? {
+            Node::Service(svc) => grant(&mut cfg.services, svc)?,
+            Node::Env(pairs) => {
+                for (key, value) in pairs {
+                    if cfg.env.iter().any(|(held, _)| *held == key) {
+                        return Err(ConfigError::Duplicate(key));
+                    }
+                    cfg.env.push((key, value));
                 }
-                cfg.services.push(Service::HomeShare { path, mode });
             }
-            "path-share" => {
-                let (path, mode) = parse_share(node, "path", validate_absolute)?;
-                let svc = Service::PathShare { path, mode };
-                if cfg.services.contains(&svc) {
-                    return Err(ConfigError::Duplicate(name.to_owned()));
+            Node::LintAllow(allows) => {
+                for allow in allows {
+                    if cfg.lint_allows.iter().any(|a| a.id == allow.id) {
+                        return Err(ConfigError::Duplicate(format!("{name} \"{}\"", allow.id)));
+                    }
+                    cfg.lint_allows.push(allow);
                 }
-                cfg.services.push(svc);
             }
-            "app-runtime" => {
-                let (id, mode) = parse_share(node, "id", validate_app_id)?;
-                // The id alone: one directory cannot be bound twice, so
-                // two modes for one id would leave the width of the
-                // grant to file order.
-                if cfg
-                    .services
-                    .iter()
-                    .any(|s| matches!(s, Service::AppRuntime { id: held, .. } if *held == id))
-                {
-                    return Err(ConfigError::Duplicate(name.to_owned()));
-                }
-                cfg.services.push(Service::AppRuntime { id, mode });
-            }
-            "etc-share" => {
-                let svc = parse_etc_share(node)?;
-                if cfg.services.contains(&svc) {
-                    return Err(ConfigError::Duplicate(name.to_owned()));
-                }
-                cfg.services.push(svc);
-            }
-            "dbus" => {
-                if has_dbus(&cfg.services) {
-                    return Err(ConfigError::Duplicate(name.to_owned()));
-                }
-                cfg.services.push(parse_dbus(node)?);
-            }
-            "wayland" => {
-                // By variant, like `network`: two `wayland` nodes differ
-                // in mode, and which socket the config asks for would be
-                // a matter of their order in the file.
-                if cfg
-                    .services
-                    .iter()
-                    .any(|s| matches!(s, Service::Wayland(_)))
-                {
-                    return Err(ConfigError::Duplicate(name.to_owned()));
-                }
-                cfg.services.push(Service::Wayland(parse_wayland(node)?));
-            }
-            "x11" => {
-                // By variant, and before the node itself is read, like
-                // `network`: two `x11` nodes differ in mode or window,
-                // and which server the config asks for would be a matter
-                // of their order in the file.
-                if cfg.services.iter().any(|s| matches!(s, Service::X11(_))) {
-                    return Err(ConfigError::Duplicate(name.to_owned()));
-                }
-                cfg.services.push(Service::X11(parse_x11(node)?));
-            }
-            "network" => {
-                // By variant, like `gamepad`: two `network` nodes differ
-                // in mode or children, and which sandbox the config asks
-                // for would be a matter of their order in the file.
-                if cfg
-                    .services
-                    .iter()
-                    .any(|s| matches!(s, Service::Network { .. }))
-                {
-                    return Err(ConfigError::Duplicate(name.to_owned()));
-                }
-                cfg.services.push(parse_network(node)?);
-            }
-            "gamepad" => {
-                // By variant: two `gamepad` nodes differing only in their
-                // properties would leave the device list to file order.
-                if cfg
-                    .services
-                    .iter()
-                    .any(|s| matches!(s, Service::Gamepad { .. }))
-                {
-                    return Err(ConfigError::Duplicate(name.to_owned()));
-                }
-                cfg.services.push(parse_gamepad(node)?);
-            }
-            "camera" => {
-                // By variant, for the same reason `gamepad` is.
-                if cfg
-                    .services
-                    .iter()
-                    .any(|s| matches!(s, Service::Camera { .. }))
-                {
-                    return Err(ConfigError::Duplicate(name.to_owned()));
-                }
-                cfg.services.push(parse_camera(node)?);
-            }
-            "system-bus" => {
-                if cfg
-                    .services
-                    .iter()
-                    .any(|s| matches!(s, Service::SystemBus { .. }))
-                {
-                    return Err(ConfigError::Duplicate(name.to_owned()));
-                }
-                cfg.services.push(parse_system_bus(node)?);
-            }
-            "mpris" => {
-                if cfg
-                    .services
-                    .iter()
-                    .any(|s| matches!(s, Service::Mpris { .. }))
-                {
-                    return Err(ConfigError::Duplicate(name.to_owned()));
-                }
-                cfg.services.push(parse_mpris(node)?);
-            }
-            "tty" => {
+            Node::Tty(mode) => {
                 if seen_tty {
                     return Err(ConfigError::Duplicate(name.to_owned()));
                 }
                 seen_tty = true;
-                cfg.tty = parse_tty(node)?;
+                cfg.tty = mode;
             }
-            "userns" => {
+            Node::Userns(mode) => {
                 if seen_userns {
                     return Err(ConfigError::Duplicate(name.to_owned()));
                 }
                 seen_userns = true;
-                cfg.userns = parse_userns(node)?;
+                cfg.userns = mode;
             }
-            "seccomp" => {
+            Node::Seccomp(seccomp) => {
                 if seen_seccomp {
                     return Err(ConfigError::Duplicate(name.to_owned()));
                 }
                 seen_seccomp = true;
-                cfg.seccomp = parse_seccomp(node)?;
+                cfg.seccomp = seccomp;
             }
-            "env" => parse_env(node, &mut cfg.env)?,
-            "lint-allow" => {
-                let allow = parse_lint_allow(node)?;
-                if cfg.lint_allows.iter().any(|a| a.id == allow.id) {
-                    return Err(ConfigError::Duplicate(format!("{name} \"{}\"", allow.id)));
-                }
-                cfg.lint_allows.push(allow);
-            }
-            "include" => {
-                if !profile {
-                    return Err(bad(node, "include is only valid in profiles"));
-                }
-                includes.push(parse_include(node)?);
-            }
-            "desktop" => {
+            Node::Desktop(entry) => {
                 if cfg.desktop.is_some() {
                     return Err(ConfigError::Duplicate(name.to_owned()));
                 }
-                cfg.desktop = Some(parse_desktop(node)?);
+                cfg.desktop = Some(entry);
             }
-            "command" => {
+            Node::Command(argv) => {
                 if cfg.command.is_some() {
                     return Err(ConfigError::Duplicate(name.to_owned()));
                 }
-                cfg.command = Some(parse_command(node)?);
+                cfg.command = Some(argv);
             }
-            other => return Err(ConfigError::UnknownNode(other.to_owned())),
         }
         // What a node granted is counted rather than recorded per arm, so
         // a node added to the match above is placed without being listed
@@ -940,6 +908,17 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
                 _ => {}
             }
         }
+    }
+    // What is left under the last node, and the whole of a file that
+    // writes no node at all: the parser keeps the `/-` lines there.
+    if let Some(format) = doc.format() {
+        let at = Counts::of(&cfg);
+        if doc.nodes().is_empty() {
+            let found = disabled_in(&format.leading, profile, at)?;
+            cfg.disabled.extend(found);
+        }
+        let found = disabled_in(&format.trailing, profile, at)?;
+        cfg.disabled.extend(found);
     }
     if !profile && let Some(node) = bundle_without_dbus(&cfg.services) {
         return Err(ConfigError::BadArgument {
@@ -968,6 +947,213 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
         },
         lines,
     ))
+}
+
+/// One top-level node, whatever kind it is, with none of the checks that
+/// need the rest of the file: no duplicate, no `portals` needs `dbus`.
+/// An enabled node goes through here and then through those checks; a
+/// disabled one (`/-…`) goes through here alone, so a line the editor
+/// turned off is still a line bubbler would have read.
+pub(crate) fn parse_node(node: &KdlNode, profile: bool) -> Result<Node, ConfigError> {
+    let name = node.name().value();
+    reject_types(node)?;
+    // Resolved against the table rather than by falling off the end
+    // of the match: an arm added without an entry there is a node
+    // the catalogue never describes, and the two lists would drift.
+    if !NODES.contains(&name) && name != "include" {
+        return Err(ConfigError::UnknownNode(name.to_owned()));
+    }
+    Ok(match name {
+        "dri" | "pipewire" | "pulseaudio" | "portals" | "notify" | "tray" | "hidraw" | "a11y"
+        | "input-method" => {
+            reject_entries(node)?;
+            Node::Service(match name {
+                "dri" => Service::Dri,
+                "pipewire" => Service::Pipewire,
+                "pulseaudio" => Service::Pulseaudio,
+                "portals" => Service::Portals,
+                "notify" => Service::Notify,
+                "tray" => Service::Tray,
+                "hidraw" => Service::Hidraw,
+                "a11y" => Service::A11y,
+                "input-method" => Service::InputMethod,
+                // Unreachable through the arm above, and an error
+                // rather than a fallback: a name added to that list
+                // and forgotten here would otherwise grant whichever
+                // service the fallback named.
+                other => return Err(ConfigError::UnknownNode(other.to_owned())),
+            })
+        }
+        "home-share" => {
+            let (path, mode) = parse_share(node, "path", validate_relative)?;
+            Node::Service(Service::HomeShare { path, mode })
+        }
+        "path-share" => {
+            let (path, mode) = parse_share(node, "path", validate_absolute)?;
+            Node::Service(Service::PathShare { path, mode })
+        }
+        "app-runtime" => {
+            let (id, mode) = parse_share(node, "id", validate_app_id)?;
+            Node::Service(Service::AppRuntime { id, mode })
+        }
+        "etc-share" => Node::Service(parse_etc_share(node)?),
+        "dbus" => Node::Service(parse_dbus(node)?),
+        "wayland" => Node::Service(Service::Wayland(parse_wayland(node)?)),
+        "x11" => Node::Service(Service::X11(parse_x11(node)?)),
+        "network" => Node::Service(parse_network(node)?),
+        "gamepad" => Node::Service(parse_gamepad(node)?),
+        "camera" => Node::Service(parse_camera(node)?),
+        "system-bus" => Node::Service(parse_system_bus(node)?),
+        "mpris" => Node::Service(parse_mpris(node)?),
+        "tty" => Node::Tty(parse_tty(node)?),
+        "userns" => Node::Userns(parse_userns(node)?),
+        "seccomp" => Node::Seccomp(parse_seccomp(node)?),
+        "env" => {
+            let mut pairs = Vec::new();
+            parse_env(node, &mut pairs)?;
+            Node::Env(pairs)
+        }
+        "lint-allow" => Node::LintAllow(vec![parse_lint_allow(node)?]),
+        // `include` names a layer to merge under this one; it grants
+        // nothing, so there is no node to hold it. A profile takes it in
+        // the loop above, and what reaches here is a `/-include` line.
+        "include" => {
+            return Err(bad(
+                node,
+                if profile {
+                    "cannot be turned off: it names a layer rather than granting anything"
+                } else {
+                    "include is only valid in profiles"
+                },
+            ));
+        }
+        "desktop" => Node::Desktop(parse_desktop(node)?),
+        "command" => Node::Command(parse_command(node)?),
+        other => return Err(ConfigError::UnknownNode(other.to_owned())),
+    })
+}
+
+/// Add one grant, refusing a second node that would grant the same
+/// thing. What "the same" is differs by node: a share is one path or one
+/// id, and a node carrying a mode or children is one per file, since two
+/// of them would leave the width of the grant to file order.
+fn grant(held: &mut Vec<Service>, svc: Service) -> Result<(), ConfigError> {
+    let twice = match &svc {
+        Service::HomeShare { path, .. } => held
+            .iter()
+            .any(|s| matches!(s, Service::HomeShare { path: p, .. } if p == path)),
+        Service::AppRuntime { id, .. } => held
+            .iter()
+            .any(|s| matches!(s, Service::AppRuntime { id: i, .. } if i == id)),
+        Service::Wayland(_) => held.iter().any(|s| matches!(s, Service::Wayland(_))),
+        Service::X11(_) => held.iter().any(|s| matches!(s, Service::X11(_))),
+        Service::Network(_) => held.iter().any(|s| matches!(s, Service::Network(_))),
+        Service::Gamepad { .. } => held.iter().any(|s| matches!(s, Service::Gamepad { .. })),
+        Service::Camera { .. } => held.iter().any(|s| matches!(s, Service::Camera { .. })),
+        Service::Dbus { .. } => held.iter().any(|s| matches!(s, Service::Dbus { .. })),
+        Service::SystemBus { .. } => held.iter().any(|s| matches!(s, Service::SystemBus { .. })),
+        Service::Mpris { .. } => held.iter().any(|s| matches!(s, Service::Mpris { .. })),
+        // The rest carry nothing a second node could differ in, so an
+        // equal grant is the same grant.
+        same => held.contains(same),
+    };
+    if twice {
+        return Err(ConfigError::Duplicate(svc.node_name().to_owned()));
+    }
+    held.push(svc);
+    Ok(())
+}
+
+/// How many entries of each section a file has written so far, counted
+/// the way [`crate::kdl_out::nodes`] writes them back. A disabled node
+/// is remembered as an index into its own section, and this is what that
+/// index counts.
+#[derive(Debug, Clone, Copy, Default)]
+struct Counts {
+    lint_allows: usize,
+    services: usize,
+    env: usize,
+    tty: usize,
+    userns: usize,
+    seccomp: usize,
+    desktop: usize,
+    command: usize,
+}
+
+impl Counts {
+    /// What `cfg` has written so far.
+    fn of(cfg: &InstanceConfig) -> Self {
+        Self {
+            lint_allows: cfg.lint_allows.len(),
+            services: cfg.services.len(),
+            env: cfg.env.len(),
+            tty: usize::from(cfg.tty != TtyMode::default()),
+            userns: usize::from(cfg.userns != Userns::default()),
+            seccomp: usize::from(cfg.seccomp != SeccompConfig::default()),
+            desktop: usize::from(cfg.desktop.is_some()),
+            command: usize::from(cfg.command.is_some()),
+        }
+    }
+
+    /// Where a disabled `node` sits among the entries of its own section.
+    fn before(&self, node: &Node) -> usize {
+        match node {
+            Node::Service(_) => self.services,
+            Node::Env(_) => self.env,
+            Node::LintAllow(_) => self.lint_allows,
+            Node::Tty(_) => self.tty,
+            Node::Userns(_) => self.userns,
+            Node::Seccomp(_) => self.seccomp,
+            Node::Desktop(_) => self.desktop,
+            Node::Command(_) => self.command,
+        }
+    }
+}
+
+/// The disabled entries written in one run of leading or trailing text,
+/// which is where the KDL parser leaves a `/-` node it dropped. Each is
+/// parsed from just after its `/-`, and what the parser leaves under
+/// *that* holds the next one, so the loop walks a run of them. Each
+/// round starts under the node the last one read, so the text it works
+/// on is shorter every time.
+fn disabled_in(text: &str, profile: bool, at: Counts) -> Result<Vec<Disabled>, ConfigError> {
+    let mut out = Vec::new();
+    let mut rest = text.to_owned();
+    while let Some(i) = slashdash_at(&rest) {
+        let doc = parse_document(&rest[i + 2..])?;
+        // A slashdash is only valid KDL with a node after it, so the
+        // parse above has one; a document without is nothing to keep.
+        let Some(first) = doc.nodes().first() else {
+            break;
+        };
+        let node = parse_node(first, profile)?;
+        out.push(Disabled {
+            before: at.before(&node),
+            node,
+        });
+        rest = doc.format().map(|f| f.trailing.clone()).unwrap_or_default();
+    }
+    Ok(out)
+}
+
+/// Where the next `/-` that opens a line is. Only column zero counts: an
+/// indented one is dropped by KDL like any other and bubbler leaves it
+/// as the comment it reads as, and a `/-` inside a comment is not a node
+/// at all, so the comments are stepped over rather than searched.
+fn slashdash_at(text: &str) -> Option<usize> {
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if (i == 0 || b[i - 1] == b'\n') && b[i] == b'/' && b.get(i + 1) == Some(&b'-') {
+            return Some(i);
+        }
+        i = match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'/') => line_comment_end(b, i),
+            b'/' if b.get(i + 1) == Some(&b'*') => block_comment_end(b, i),
+            _ => i + 1,
+        };
+    }
+    None
 }
 
 /// `include "<profile>"`: one string argument, repeatable. The name is
@@ -4265,6 +4451,298 @@ command "b""#
             "dbus {\n    talk \"org.a.B\"\n}\ncommand \"true\"\n".to_owned(),
         ] {
             assert!(parse(&text).is_ok(), "{text}");
+        }
+    }
+
+    /// The one node `text` writes, parsed the way a disabled line is.
+    fn one_node(text: &str) -> Node {
+        let doc = parse_document(text).unwrap();
+        parse_node(doc.nodes().first().unwrap(), true).unwrap()
+    }
+
+    #[test]
+    fn a_node_commented_out_with_slashdash_is_kept_as_a_disabled_entry() {
+        let share = Node::Service(Service::HomeShare {
+            path: PathBuf::from("x"),
+            mode: ShareMode::ReadOnly,
+        });
+        // Before, between and after the enabled nodes: the entry is
+        // remembered where the file put it, counted in the entries of its
+        // own section that come before it.
+        for (text, before) in [
+            ("/-home-share \"x\"\ndri\n", 0),
+            ("dri\n/-home-share \"x\"\npipewire\n", 1),
+            ("dri\npipewire\n/-home-share \"x\"\n", 2),
+        ] {
+            let cfg = parse(text).unwrap();
+            assert_eq!(
+                cfg.disabled,
+                vec![Disabled {
+                    node: share.clone(),
+                    before
+                }],
+                "{text}"
+            );
+            // The grant itself is not in the sandbox.
+            assert!(
+                !cfg.services
+                    .iter()
+                    .any(|s| matches!(s, Service::HomeShare { .. })),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_disabled_block_node_keeps_its_children() {
+        let cfg = parse("dri\n/-dbus {\n    talk \"org.a.B\"\n}\n").unwrap();
+        assert_eq!(
+            cfg.disabled,
+            vec![Disabled {
+                node: Node::Service(Service::Dbus {
+                    rules: vec![BusRule::Talk("org.a.B".to_owned())]
+                }),
+                before: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn two_disabled_lines_in_a_row_are_two_entries() {
+        let cfg = parse("dri\n/-home-share \"a\"\n/-home-share \"b\"\npipewire\n").unwrap();
+        let paths: Vec<&Path> = cfg
+            .disabled
+            .iter()
+            .map(|d| match &d.node {
+                Node::Service(Service::HomeShare { path, .. }) => path.as_path(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(paths, vec![Path::new("a"), Path::new("b")]);
+        assert!(cfg.disabled.iter().all(|d| d.before == 1), "{cfg:?}");
+    }
+
+    #[test]
+    fn a_disabled_node_at_the_end_of_a_file_is_read_without_its_newline() {
+        let cfg = parse("dri\n/-pipewire").unwrap();
+        assert_eq!(
+            cfg.disabled,
+            vec![Disabled {
+                node: Node::Service(Service::Pipewire),
+                before: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_file_of_nothing_but_disabled_nodes_is_read() {
+        let cfg = parse("/-dri\n/-pipewire\n").unwrap();
+        assert!(cfg.services.is_empty(), "{cfg:?}");
+        assert_eq!(
+            cfg.disabled
+                .iter()
+                .map(|d| d.node.name())
+                .collect::<Vec<_>>(),
+            vec!["dri", "pipewire"]
+        );
+    }
+
+    #[test]
+    fn a_disabled_node_is_read_by_the_parser_an_enabled_one_goes_through() {
+        assert!(matches!(
+            parse("/-home-shre \"x\"\ndri\n"),
+            Err(ConfigError::UnknownNode(n)) if n == "home-shre"
+        ));
+        // The same node, enabled and disabled, is refused in the same
+        // words: a line the editor turned off is still a line bubbler
+        // would run.
+        let enabled = parse("home-share \"x\" mode=\"rx\"\n").unwrap_err();
+        let disabled = parse("/-home-share \"x\" mode=\"rx\"\ndri\n").unwrap_err();
+        assert_eq!(disabled.to_string(), enabled.to_string());
+        // `include` names a layer rather than granting anything, so there
+        // is no disabled entry to keep it in.
+        assert!(parse_profile("/-include \"other\"\ndri\n").is_err());
+    }
+
+    #[test]
+    fn a_slashdash_that_does_not_start_a_line_is_left_as_the_comment_it_is() {
+        for text in [
+            // Indented: KDL drops it and so does bubbler.
+            "  /-x11\ndri\n",
+            // An entry of a node, not a node.
+            "dri\nwayland /-\"host\"\n",
+            // Inside a block comment, where it is not a node at all.
+            "/*\n/-home-share \"x\"\n*/\ndri\n",
+        ] {
+            let cfg = parse(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert!(cfg.disabled.is_empty(), "{text}: {:?}", cfg.disabled);
+        }
+    }
+
+    #[test]
+    fn a_slashdash_child_is_left_as_the_comment_it_is() {
+        // Only a top-level node is kept. The children of `dbus`,
+        // `network` and `seccomp` are parts of the node above them, and
+        // half a node the file keeps is not something a config can say.
+        let cfg = parse("dbus {\n    talk \"org.a.B\"\n/-talk \"org.c.D\"\n}\n").unwrap();
+        assert!(cfg.disabled.is_empty(), "{:?}", cfg.disabled);
+        assert_eq!(
+            cfg.services,
+            vec![Service::Dbus {
+                rules: vec![BusRule::Talk("org.a.B".to_owned())]
+            }]
+        );
+    }
+
+    #[test]
+    fn a_disabled_node_takes_no_part_in_the_checks_across_nodes() {
+        // Both of these are errors written out; disabled, they are lines
+        // the file keeps and nothing else.
+        assert!(parse("camera\ndri\n").is_err());
+        assert!(parse("portals\ndri\n").is_err());
+        for text in ["/-camera\ndri\n", "/-portals\ndri\n"] {
+            let cfg = parse(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(cfg.disabled.len(), 1, "{text}");
+        }
+    }
+
+    #[test]
+    fn an_enabled_and_a_disabled_copy_of_one_entry_may_coexist() {
+        let cfg = parse("home-share \"x\"\n/-home-share \"x\"\n").unwrap();
+        assert_eq!(cfg.services.len(), 1);
+        assert_eq!(cfg.disabled.len(), 1);
+        assert_eq!(cfg.disabled[0].before, 1);
+    }
+
+    #[test]
+    fn a_disabled_node_takes_no_line_of_its_own_and_moves_none() {
+        // The lines are the file's, so an enabled node keeps the line it
+        // is really on and a disabled one is nowhere in the list.
+        let lines = node_lines("/-home-share \"x\"\ndri\n/-pipewire\nwayland\n").unwrap();
+        assert_eq!(lines.services, vec![Some(2), Some(4)]);
+    }
+
+    #[test]
+    fn a_node_has_content_when_it_is_more_than_its_own_name() {
+        // The bare spelling of every node that has one, and a spelling
+        // carrying something a `/-` line would keep. Space on a bare row
+        // removes the node, because a `/-dri` line keeps nothing.
+        for (text, content) in [
+            ("wayland", false),
+            ("wayland \"host\"", true),
+            ("wayland clipboard=\"open\"", true),
+            ("x11", false),
+            ("x11 \"host\"", true),
+            ("x11 fullscreen=#true", true),
+            ("network", false),
+            ("network \"host\"", true),
+            ("network {\n    no-ipv6\n}", true),
+            ("dri", false),
+            ("pipewire", false),
+            ("pulseaudio", false),
+            ("gamepad", false),
+            ("gamepad hidraw=#true", true),
+            ("hidraw", false),
+            ("camera", false),
+            ("camera nodes=#true", true),
+            ("home-share \"x\"", true),
+            ("path-share \"/x\"", true),
+            ("etc-share \"hosts\"", true),
+            ("app-runtime \"a.b\"", true),
+            ("dbus", false),
+            ("dbus {\n    talk \"org.a.B\"\n}", true),
+            ("system-bus {\n    talk \"org.a.B\"\n}", true),
+            ("portals", false),
+            ("notify", false),
+            ("tray", false),
+            ("mpris name=\"org.a.B\"", true),
+            ("a11y", false),
+            ("input-method", false),
+            ("tty \"none\"", true),
+            ("userns \"disable\"", true),
+            ("seccomp {\n    disable\n}", true),
+            ("env A=\"1\"", true),
+            ("lint-allow \"network-host\" reason=\"why\"", true),
+            ("desktop \"org.example.App.desktop\"", true),
+            ("command \"true\"", true),
+        ] {
+            let node = one_node(text);
+            assert_eq!(node.has_content(), content, "{text}");
+            // What the emitter writes says the same thing: a node that is
+            // more than its name is written as more than its name.
+            let written = crate::kdl_out::node(&node).unwrap();
+            assert_eq!(written != node.name(), content, "{written}");
+        }
+    }
+
+    #[test]
+    fn the_repeatable_nodes_are_the_ones_a_config_may_hold_twice() {
+        // One node per catalogue entry, twice, distinct where writing the
+        // same thing twice would be pointless.
+        let samples: &[(&str, &str, &str)] = &[
+            ("wayland", "wayland", "wayland \"host\""),
+            ("x11", "x11", "x11 \"host\""),
+            ("network", "network", "network \"host\""),
+            ("dri", "dri", "dri"),
+            ("pipewire", "pipewire", "pipewire"),
+            ("pulseaudio", "pulseaudio", "pulseaudio"),
+            ("gamepad", "gamepad", "gamepad hidraw=#true"),
+            ("hidraw", "hidraw", "hidraw"),
+            ("camera", "camera", "camera nodes=#true"),
+            ("home-share", "home-share \"a\"", "home-share \"b\""),
+            ("path-share", "path-share \"/a\"", "path-share \"/b\""),
+            ("etc-share", "etc-share \"hosts\"", "etc-share \"hostname\""),
+            ("app-runtime", "app-runtime \"a.b\"", "app-runtime \"c.d\""),
+            ("dbus", "dbus", "dbus {\n    talk \"org.a.B\"\n}"),
+            (
+                "system-bus",
+                "system-bus {\n    talk \"org.a.B\"\n}",
+                "system-bus {\n    talk \"org.c.D\"\n}",
+            ),
+            ("portals", "portals", "portals"),
+            ("notify", "notify", "notify"),
+            ("tray", "tray", "tray"),
+            ("mpris", "mpris name=\"org.a.B\"", "mpris name=\"org.c.D\""),
+            ("a11y", "a11y", "a11y"),
+            ("input-method", "input-method", "input-method"),
+            ("tty", "tty \"none\"", "tty \"passthrough\""),
+            ("userns", "userns \"disable\"", "userns \"allow\""),
+            (
+                "seccomp",
+                "seccomp {\n    disable\n}",
+                "seccomp {\n    disable\n}",
+            ),
+            ("env", "env A=\"1\"", "env B=\"2\""),
+            (
+                "lint-allow",
+                "lint-allow \"network-host\" reason=\"why\"",
+                "lint-allow \"own-too-wide\" reason=\"why\"",
+            ),
+            (
+                "desktop",
+                "desktop \"org.example.App.desktop\"",
+                "desktop \"org.example.Other.desktop\"",
+            ),
+            ("command", "command \"true\"", "command \"false\""),
+        ];
+        let named: Vec<&str> = samples.iter().map(|(n, _, _)| *n).collect();
+        assert_eq!(named, NODES, "every node of the catalogue is written twice");
+        for (name, a, b) in samples {
+            let text = format!("{a}\n{b}\n");
+            let got = parse_profile(&text);
+            if REPEATABLE.contains(name) {
+                assert!(got.is_ok(), "{text}: {:?}", got.err());
+            } else {
+                assert!(
+                    matches!(got, Err(ConfigError::Duplicate(_))),
+                    "{text}: {:?}",
+                    got.err()
+                );
+            }
+        }
+        // Nothing in the list that is not a node.
+        for name in REPEATABLE {
+            assert!(NODES.contains(name), "{name}");
         }
     }
 }

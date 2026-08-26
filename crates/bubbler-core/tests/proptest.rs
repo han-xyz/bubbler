@@ -433,6 +433,10 @@ fn instance_config() -> impl Strategy<Value = InstanceConfig> {
                     userns,
                     lint_allows,
                     desktop,
+                    // The generator writes the nodes a config grants; a
+                    // `/-` line grants nothing, and `config.rs` pins how
+                    // one is read back and written out.
+                    disabled: Vec::new(),
                 }
             },
         )

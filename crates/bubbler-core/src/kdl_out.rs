@@ -5,8 +5,8 @@
 use std::ffi::{OsStr, OsString};
 
 use crate::config::{
-    BusRule, Clipboard, InstanceConfig, LintAllow, NestedX11, Service, ShareMode, Userns,
-    WaylandMode, X11Mode,
+    BusRule, Clipboard, Disabled, InstanceConfig, LintAllow, NestedX11, Node, Service, ShareMode,
+    Userns, WaylandMode, X11Mode,
 };
 use crate::error::ConfigError;
 use crate::network::{Mode as NetworkMode, NetworkConfig, Outbound};
@@ -25,33 +25,154 @@ pub fn render(cfg: &InstanceConfig) -> Result<String, ConfigError> {
 }
 
 /// The nodes of `cfg` as separate strings, so a caller can pair each with
-/// where it came from. A block node is one multi-line string.
+/// where it came from. A block node is one multi-line string, and a
+/// disabled entry is one node on its `/-` line.
 pub fn nodes(cfg: &InstanceConfig) -> Result<Vec<String>, ConfigError> {
     let mut out = Vec::new();
     // Ahead of the grants: a finding the file has accepted is about the
     // file, and reading it first says what the nodes below were allowed
     // to be.
-    out.extend(cfg.lint_allows.iter().map(lint_allow));
-    for s in &cfg.services {
-        out.push(service(s)?);
-    }
-    out.extend(cfg.env.iter().map(|(k, v)| env(k, v)));
-    if cfg.tty != TtyMode::default() {
-        out.push(tty(cfg.tty));
-    }
-    if cfg.userns != Userns::default() {
-        out.push(userns(cfg.userns));
-    }
-    if cfg.seccomp != SeccompConfig::default() {
-        out.push(seccomp(&cfg.seccomp));
-    }
-    if let Some(name) = &cfg.desktop {
-        out.push(desktop(name));
-    }
-    if let Some(argv) = &cfg.command {
-        out.push(command(argv)?);
-    }
+    section(
+        cfg,
+        |n| matches!(n, Node::LintAllow(_)),
+        cfg.lint_allows.iter().map(lint_allow).collect(),
+        &mut out,
+    )?;
+    let services: Vec<String> = cfg
+        .services
+        .iter()
+        .map(service)
+        .collect::<Result<_, ConfigError>>()?;
+    section(cfg, |n| matches!(n, Node::Service(_)), services, &mut out)?;
+    section(
+        cfg,
+        |n| matches!(n, Node::Env(_)),
+        cfg.env.iter().map(|(k, v)| env(k, v)).collect(),
+        &mut out,
+    )?;
+    section(
+        cfg,
+        |n| matches!(n, Node::Tty(_)),
+        (cfg.tty != TtyMode::default())
+            .then(|| tty(cfg.tty))
+            .into_iter()
+            .collect(),
+        &mut out,
+    )?;
+    section(
+        cfg,
+        |n| matches!(n, Node::Userns(_)),
+        (cfg.userns != Userns::default())
+            .then(|| userns(cfg.userns))
+            .into_iter()
+            .collect(),
+        &mut out,
+    )?;
+    section(
+        cfg,
+        |n| matches!(n, Node::Seccomp(_)),
+        (cfg.seccomp != SeccompConfig::default())
+            .then(|| seccomp(&cfg.seccomp))
+            .into_iter()
+            .collect(),
+        &mut out,
+    )?;
+    section(
+        cfg,
+        |n| matches!(n, Node::Desktop(_)),
+        cfg.desktop.iter().map(|n| desktop(n)).collect(),
+        &mut out,
+    )?;
+    section(
+        cfg,
+        |n| matches!(n, Node::Command(_)),
+        cfg.command
+            .as_ref()
+            .map(|argv| command(argv))
+            .transpose()?
+            .into_iter()
+            .collect(),
+        &mut out,
+    )?;
     Ok(out)
+}
+
+/// One section of the file: its `enabled` nodes with the disabled
+/// entries of the same section written back among them, each before the
+/// entry it was read above. An entry pointing past the last one is
+/// written after it rather than dropped: the section may have lost the
+/// node it sat above since.
+fn section(
+    cfg: &InstanceConfig,
+    is: fn(&Node) -> bool,
+    enabled: Vec<String>,
+    out: &mut Vec<String>,
+) -> Result<(), ConfigError> {
+    let end = enabled.len();
+    for (i, node) in enabled.into_iter().enumerate() {
+        for d in cfg.disabled.iter().filter(|d| is(&d.node) && d.before == i) {
+            out.push(disabled(d)?);
+        }
+        out.push(node);
+    }
+    for d in cfg
+        .disabled
+        .iter()
+        .filter(|d| is(&d.node) && d.before >= end)
+    {
+        out.push(disabled(d)?);
+    }
+    Ok(())
+}
+
+/// One parsed node as the KDL line it was read from. A node is one line,
+/// or one block: what the emitter writes here is what
+/// [`crate::config::NODES`] takes back.
+pub fn node(n: &Node) -> Result<String, ConfigError> {
+    Ok(match n {
+        Node::Service(s) => service(s)?,
+        Node::Env(pairs) => {
+            // An `env` node without a variable is refused by the parser,
+            // so writing one would produce KDL that no longer reads back.
+            if pairs.is_empty() {
+                return Err(ConfigError::BadArgument {
+                    node: "env".to_owned(),
+                    reason: "sets no variable, and an env node without one is not a config \
+                             bubbler parses"
+                        .to_owned(),
+                });
+            }
+            let mut out = String::from("env");
+            for (key, value) in pairs {
+                out.push_str(&format!(" {key}={}", quote(value)));
+            }
+            out
+        }
+        // One node accepts one check id, and two of them would be two
+        // lines: a `/-` prefix on the first would leave the second
+        // granted.
+        Node::LintAllow(allows) => match allows.as_slice() {
+            [one] => lint_allow(one),
+            other => {
+                return Err(ConfigError::BadArgument {
+                    node: "lint-allow".to_owned(),
+                    reason: format!("accepts one check id, not {}", other.len()),
+                });
+            }
+        },
+        Node::Tty(mode) => tty(*mode),
+        Node::Userns(mode) => userns(*mode),
+        Node::Seccomp(cfg) => seccomp(cfg),
+        Node::Desktop(name) => desktop(name),
+        Node::Command(argv) => command(argv)?,
+    })
+}
+
+/// One disabled entry as the line a config keeps it on. Only the first
+/// line takes the `/-`: the rest of a block node is inside the node the
+/// prefix drops, and a second prefix would be a comment in the children.
+pub fn disabled(d: &Disabled) -> Result<String, ConfigError> {
+    Ok(format!("/-{}", node(&d.node)?))
 }
 
 /// One grant as its KDL node.
@@ -691,5 +812,95 @@ mod tests {
                 "x11 \"host\""
             ]
         );
+    }
+
+    /// Every layout a `/-` line can have in a file: the config is written
+    /// back as the text it was read from, so turning one node off in the
+    /// editor rewrites one line and leaves the rest of the file alone.
+    #[test]
+    fn a_disabled_node_is_written_back_where_it_was() {
+        for text in [
+            "/-home-share \"x\"\ndri\n",
+            "dri\n/-home-share \"x\"\npipewire\n",
+            "dri\npipewire\n/-home-share \"x\"\n",
+            "dri\n/-dbus {\n    talk \"org.a.B\"\n}\n",
+            "dri\n/-home-share \"a\"\n/-home-share \"b\"\npipewire\n",
+            "/-dri\n/-pipewire\n",
+            "home-share \"x\"\n/-home-share \"x\"\n",
+            "lint-allow \"network-host\" reason=\"why\"\n\
+             /-lint-allow \"own-too-wide\" reason=\"why\"\n\
+             dri\n/-home-share \"x\"\nenv A=\"1\"\n/-env B=\"2\"\n\
+             /-tty \"none\"\n/-command \"false\"\ncommand \"true\"\n",
+        ] {
+            round_trip(text);
+            assert_eq!(render(&parse(text).unwrap()).unwrap(), text);
+        }
+        // The one layout that is not its own canonical text: a file whose
+        // last line has no newline gets one.
+        assert_eq!(
+            render(&parse("dri\n/-pipewire").unwrap()).unwrap(),
+            "dri\n/-pipewire\n"
+        );
+    }
+
+    #[test]
+    fn a_disabled_block_node_is_prefixed_on_its_first_line_only() {
+        let entry = Disabled {
+            node: Node::Service(Service::Dbus {
+                rules: vec![BusRule::Talk("org.a.B".to_owned())],
+            }),
+            before: 0,
+        };
+        assert_eq!(
+            disabled(&entry).unwrap(),
+            "/-dbus {\n    talk \"org.a.B\"\n}"
+        );
+    }
+
+    #[test]
+    fn a_node_is_written_as_the_line_it_was_read_from() {
+        // One node in, one line out, for every kind of node a config
+        // holds: the editor writes a row back from this.
+        for text in [
+            "wayland \"host\"",
+            "x11 wm=\"twm\"",
+            "network {\n    no-ipv6\n}",
+            "home-share \"x\" mode=rw",
+            "dbus {\n    talk \"org.a.B\"\n}",
+            "env A=\"1\" B=\"2\"",
+            "lint-allow \"network-host\" reason=\"why\"",
+            "tty \"none\"",
+            "userns \"disable\"",
+            "seccomp {\n    disable\n}",
+            "desktop \"org.example.App.desktop\"",
+            "command \"true\" \"--now\"",
+        ] {
+            let doc = crate::config::parse_document(text).unwrap();
+            let parsed = crate::config::parse_node(doc.nodes().first().unwrap(), false).unwrap();
+            assert_eq!(node(&parsed).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn a_node_that_is_not_one_node_is_refused_rather_than_written() {
+        // The parser cannot make either of these, and writing them would
+        // produce a file that reads back as something else: an empty node
+        // as no node at all, two allows as two lines under one `/-`.
+        for node in [
+            Node::Env(Vec::new()),
+            Node::LintAllow(Vec::new()),
+            Node::LintAllow(vec![
+                LintAllow {
+                    id: "network-host".to_owned(),
+                    reason: "why".to_owned(),
+                },
+                LintAllow {
+                    id: "own-too-wide".to_owned(),
+                    reason: "why".to_owned(),
+                },
+            ]),
+        ] {
+            assert!(super::node(&node).is_err(), "{node:?}");
+        }
     }
 }
