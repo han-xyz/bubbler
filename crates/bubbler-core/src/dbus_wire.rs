@@ -58,15 +58,17 @@ const MAX_MESSAGE: usize = 1 << 27;
 /// The limit on what is *read*, which is bubbler's own and far tighter.
 ///
 /// The specification's 128 MiB is a ceiling for a general bus client,
-/// not a size anything here expects: every reply bubbler reads is a
-/// string (`Hello`, `GetNameOwner`, `GetId`, `GetAddress`), a number
-/// (`StartServiceByName`), a variant holding one (`Properties.Get`) or
-/// the doc-id list `AddFull` answers with, which has one short id per
-/// file a single command was handed. 16 MiB is already four orders of
+/// not a size anything here expects: every reply bubbler reads at run
+/// time is a string (`Hello`, `GetNameOwner`, `GetAddress`), a number
+/// (`StartServiceByName`) or the doc-id list `AddFull` answers with,
+/// which has one short id per file a single command was handed (the
+/// tests also read `GetId` and a `Properties.Get` variant). 16 MiB is already four orders of
 /// magnitude more than the largest of those, and it keeps the buffer a
 /// hostile peer can make this process hold to something a desktop can
 /// spare.
 const MAX_INCOMING: usize = 16 << 20;
+// A reply this client reads must always fit what it may send.
+const _: () = assert!(MAX_INCOMING < MAX_MESSAGE);
 
 /// Values one decoded block may produce.
 ///
@@ -3545,7 +3547,6 @@ mod tests {
     fn a_message_longer_than_this_client_accepts_is_refused() {
         // The specification's ceiling, which is what may be sent.
         assert_eq!(MAX_MESSAGE, 1 << 27);
-        const { assert!(MAX_INCOMING < MAX_MESSAGE) };
         let mut head = [0u8; FIXED_HEADER];
         head[0] = b'l';
         head[1] = MSG_METHOD_RETURN;
