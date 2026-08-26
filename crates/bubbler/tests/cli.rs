@@ -2907,18 +2907,21 @@ fn real_input_method_hides_the_daemons_main_names() {
     );
 }
 
-/// The host's accessibility address is asked of `org.a11y.Bus` with
-/// `dbus-send`, so a host without that program gets the package to
-/// install rather than a sandbox whose bus is quietly missing.
+/// The host's accessibility address is asked of `org.a11y.Bus` over
+/// bubbler's own bus client, so a host with no `dbus-send` anywhere on
+/// `PATH` finds the bus all the same: in the explanation, which resolves
+/// the address without starting a sidecar, and in the run that proxies
+/// it.
 #[test]
-fn a11y_without_dbus_send_on_path_names_the_package() {
-    if !require_dbus() {
+fn real_a11y_lookup_needs_no_dbus_send() {
+    if !require_a11y() {
         return;
     }
     let Some(init) = real_init() else { return };
     let tmp = setup();
-    // Everything the run resolves on `PATH` except the one program under
-    // test. The address cannot come from anywhere else: a test child is
+    // Everything the run resolves on `PATH` and nothing else: no
+    // `dbus-send` to fall back on and no shell to find one with. The
+    // address cannot come from the environment either — a test child is
     // given the session's bus addresses and never its
     // `AT_SPI_BUS_ADDRESS`.
     let path = tmp.path().join("nosend");
@@ -2929,15 +2932,46 @@ fn a11y_without_dbus_send_on_path_names_the_package() {
     let name = &instance_name("a11y-nosend");
     let _leftovers = dbus_instance(tmp.path(), &init, name, "dbus\na11y\ncommand \"true\"\n");
 
+    // The explanation resolves the host address the sidecar is pointed
+    // at and prints it under the node that granted that bus.
     let out = bubbler_dbus(tmp.path(), &init)
         .env("PATH", &path)
-        .args(["run", name])
+        .args(["run", name, "--explain", "--proxy"])
         .output()
         .unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
-    assert_ne!(out.status.code(), Some(0), "the run found a bus: {err}");
-    assert!(err.contains("dbus-send"), "{err}");
-    assert!(err.contains("install the `dbus` package"), "{err}");
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let address = s
+        .lines()
+        .skip_while(|l| !l.starts_with("  a11y "))
+        .nth(1)
+        .unwrap_or_default()
+        .trim();
+    assert!(address.starts_with("unix:path="), "stdout: {s}");
+
+    // And the run itself: the application is pointed at the socket the
+    // sidecar serves for that bus, which it has only if the address it
+    // connected to was found.
+    let run = PathBuf::from(
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .expect("the session runtime dir, the one dbus_instance placed this instance in"),
+    );
+    let inside = format!("unix:path={}", run.join("at-spi").join("bus").display());
+    assert_ne!(address, inside, "the explanation echoed the proxied socket");
+    let out = bubbler_dbus(tmp.path(), &init)
+        .env("PATH", &path)
+        .args(["run", name, "--", "/usr/bin/env"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(
+        s.lines()
+            .any(|l| l == format!("AT_SPI_BUS_ADDRESS={inside}")),
+        "stdout: {s}stderr: {err}"
+    );
 }
 
 /// A dry run of that same config asks no bus anything. The application's
@@ -2945,9 +2979,10 @@ fn a11y_without_dbus_send_on_path_names_the_package() {
 /// creates; the host address is the sidecar's business, and building an
 /// argv starts no sidecar.
 ///
-/// The only program on `PATH` is a `dbus-send` that leaves a file behind
-/// when it runs, so the marker's absence afterwards is the proof that
-/// nothing asked any bus for the address.
+/// `setup()` gives the run no bus address and an empty
+/// `$XDG_RUNTIME_DIR`, so the socket a lookup would connect to is not
+/// there and the run would end with an error naming it. The argv below,
+/// printed with the run exiting 0, is the proof that nothing was asked.
 #[test]
 fn a11y_dry_run_builds_the_bind_without_asking_any_bus() {
     let tmp = setup();
@@ -2957,26 +2992,13 @@ fn a11y_dry_run_builds_the_bind_without_asking_any_bus() {
         "dbus\na11y\ncommand \"true\"\n",
     )
     .unwrap();
-    let path = tmp.path().join("only-dbus-send");
-    std::fs::create_dir_all(&path).unwrap();
-    let marker = tmp.path().join("asked-a-bus");
-    // The marker is written with a redirection and not `touch`: this
-    // directory is the whole of the script's own `PATH` too, so a
-    // stand-in that called any program would leave nothing behind and
-    // the assertion below would hold however often it ran.
-    write_script(
-        &path.join("dbus-send"),
-        &format!("#!/bin/sh\n: > \"{}\"\n", marker.display()),
-    );
 
     let out = bubbler(tmp.path())
-        .env("PATH", &path)
         .args(["run", "t", "--dry-run"])
         .output()
         .unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{err}");
-    assert!(!marker.exists(), "the dry run spawned dbus-send");
     let argv = String::from_utf8_lossy(&out.stdout);
     // `setup()` points $XDG_RUNTIME_DIR at an empty temp dir, so both
     // paths are the test's own.

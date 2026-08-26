@@ -601,7 +601,7 @@ rules whatever it names.
 [The accessibility bus](manual.md#the-accessibility-bus),
 [D-Bus](manual.md#d-bus) ·
 `real_a11y_lets_the_app_register_and_nothing_else`,
-`a11y_without_dbus_send_on_path_names_the_package`,
+`real_a11y_lookup_needs_no_dbus_send`,
 `a11y_dry_run_builds_the_bind_without_asking_any_bus`,
 `a11y_is_a_third_bus_with_the_fixed_allowlist`,
 `the_a11y_bus_is_a_third_address_and_its_rules_follow_its_own_filter`,

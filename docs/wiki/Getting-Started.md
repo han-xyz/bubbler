@@ -39,7 +39,6 @@ own variable (`$BUBBLER_INIT`, `$BUBBLER_WL_PROXY`), then beside the running
 | `xdg-desktop-portal` + a backend | `portals`, `camera` |
 | `xorg-xwayland` | a bare `x11` — the X server that runs inside the sandbox |
 | `xorg-twm`, `openbox`, `jwm` or `icewm` | `x11 wm=` — any window manager on the sandbox's PATH; bubbler ships none |
-| `dbus` (for `dbus-send`) | `a11y`, to ask `org.a11y.Bus` where the accessibility bus is |
 | `at-spi2-core` | `a11y` — it is the accessibility bus, and the registry on it |
 | `fcitx5` or `ibus` | `input-method`, optional: without a daemon the grant reaches nothing |
 

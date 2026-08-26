@@ -4,12 +4,11 @@
 //! never reaches a host bus itself.
 
 use std::ffi::{OsStr, OsString};
-use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 
 use crate::config::{BusRule, Service};
+use crate::dbus_wire::{Session, Value, WireError};
 use crate::env::Env;
 use crate::error::LaunchError;
 use crate::host::Host;
@@ -39,11 +38,6 @@ pub const A11Y_SOCKET: &str = "a11y";
 /// Config node that grants the accessibility bus, for errors about its
 /// socket.
 pub const A11Y_NODE: &str = "a11y";
-
-/// Program that asks the session bus where the accessibility bus is,
-/// from the `dbus` package. It is spawned directly, never through a
-/// shell, and only ever for the one call [`guarded_host_a11y_bus`] makes.
-pub const DBUS_SEND: &str = "dbus-send";
 
 /// Where a system bus socket lives: the host's when no address overrides
 /// it, and the path the filtered one is bound at inside the sandbox.
@@ -556,99 +550,97 @@ pub(crate) fn host_a11y_bus(env: &Env) -> Result<PathBuf, LaunchError> {
         A11Y_NODE,
     )? {
         Some(path) => Ok(path),
-        None => ask_a11y_bus(Path::new(DBUS_SEND), env),
+        None => ask_a11y_bus(env),
     }
 }
 
-/// The socket `org.a11y.Bus` hands out, asked with `program`: one
-/// `GetAddress` call on the session bus, spawned with one argument per
-/// element and no shell anywhere. `program` is [`DBUS_SEND`] resolved on
-/// `PATH` in every run; only a test hands it a path of its own.
+/// The socket `org.a11y.Bus` hands out: one `GetAddress` call, made by
+/// bubbler's own bus client, so an `a11y` grant needs no program on
+/// `PATH` to find the bus with.
 ///
 /// The question goes to the bus `env` names rather than to whatever
 /// `$DBUS_SESSION_BUS_ADDRESS` this process happens to have inherited:
 /// the address that comes back is the one the sandbox is given, and it
 /// must name the same session as the socket the `dbus` grant proxies.
-fn ask_a11y_bus(program: &Path, env: &Env) -> Result<PathBuf, LaunchError> {
-    let mut command = Command::new(program);
-    command.args([
-        "--session",
-        "--print-reply",
-        "--dest=org.a11y.Bus",
-        "/org/a11y/bus",
-        "org.a11y.Bus.GetAddress",
-    ]);
-    if let Some(session_bus) = env.dbus_address.as_deref() {
-        command.env("DBUS_SESSION_BUS_ADDRESS", session_bus);
-    }
-    let out = command.output().map_err(|e| match e.kind() {
-        io::ErrorKind::NotFound => LaunchError::A11y(format!(
-            "`{DBUS_SEND}` not found on PATH; install the `dbus` package"
-        )),
-        _ => LaunchError::A11y(format!("running `{DBUS_SEND}`: {e}")),
-    })?;
-    if !out.status.success() {
-        return Err(LaunchError::A11y(format!(
-            "org.a11y.Bus did not answer GetAddress{}",
-            stderr_note(&out.stderr)
-        )));
-    }
-    let address = parse_get_address_reply(&out.stdout).ok_or_else(|| {
-        LaunchError::A11y("org.a11y.Bus answered GetAddress with no address".to_owned())
-    })?;
+/// [`host_bus`] resolves it, so an unset variable falls back to
+/// `$XDG_RUNTIME_DIR/bus` here as it does everywhere else.
+fn ask_a11y_bus(env: &Env) -> Result<PathBuf, LaunchError> {
+    let mut session = Session::connect(&host_bus(env)?).map_err(a11y_failure)?;
+    let reply = session
+        .call(
+            "org.a11y.Bus",
+            "/org/a11y/bus",
+            "org.a11y.Bus",
+            "GetAddress",
+            "",
+            &[],
+            &[],
+        )
+        .map_err(a11y_failure)?;
+    // `GetAddress` answers with a single string. Anything else is an
+    // answer to some other question, and picking a value out of it would
+    // be a guess.
+    let [Value::Str(address)] = reply.as_slice() else {
+        return Err(LaunchError::A11y(
+            "org.a11y.Bus answered GetAddress with no address".to_owned(),
+        ));
+    };
+    // A D-Bus string is UTF-8 by the specification and the decoder holds
+    // it to that, so the socket path in it is text; the reply is bytes
+    // no further.
+    //
     // The address is not echoed, for the reason `address_path` does not
     // echo the variable's either: it is host input, and an address may
     // hold anything.
-    unix_path(&address).ok_or_else(|| {
+    unix_path(OsStr::new(address.as_str())).ok_or_else(|| {
         LaunchError::A11y(
             "the address org.a11y.Bus returned is not a `unix:path=<path>` socket".to_owned(),
         )
     })
 }
 
-/// The address in a `dbus-send --print-reply` reply: the value of its
-/// one `string "..."` line. `None` when the output holds no such line,
-/// and `None` when it holds more than one — `GetAddress` answers with a
-/// single string, and a reply with two is an answer to some other
-/// question that picking from would be a guess.
+/// A failed `GetAddress` as a launch error: a refusal names itself, and
+/// anything else is the connection or the wire under it.
 ///
-/// Bytes throughout: a socket path need not be UTF-8, and a lossy
-/// reading of one names a different file than the bus is on.
-fn parse_get_address_reply(stdout: &[u8]) -> Option<OsString> {
-    let mut found = None;
-    for line in stdout.split(|b| *b == b'\n') {
-        let Some(rest) = line.trim_ascii().strip_prefix(b"string \"") else {
-            continue;
-        };
-        let Some(value) = rest.strip_suffix(b"\"") else {
-            continue;
-        };
-        if found.is_some() {
-            return None;
+/// Both carry text this process did not write — an error name and
+/// message from the bus, a socket path from the environment — so both go
+/// through [`bus_note`].
+fn a11y_failure(e: WireError) -> LaunchError {
+    LaunchError::A11y(match e {
+        // A bus that answers an error with no text at all: the name is
+        // the half that matters, and a trailing colon would promise a
+        // sentence that is not there.
+        WireError::Remote { name, message } if message.is_empty() => {
+            format!("org.a11y.Bus.GetAddress failed: {}", bus_note(&name))
         }
-        found = Some(OsStr::from_bytes(value).to_owned());
-    }
-    found
+        WireError::Remote { name, message } => format!(
+            "org.a11y.Bus.GetAddress failed: {}: {}",
+            bus_note(&name),
+            bus_note(&message)
+        ),
+        other => format!(
+            "asking the session bus for the accessibility bus: {}",
+            bus_note(&other.to_string())
+        ),
+    })
 }
 
-/// The first line of a failed `dbus-send`'s standard error, as a note to
-/// hang on the error message. It is another program's output, so the
-/// control characters in it are shown rather than sent to whatever
-/// terminal reads the message, and only a line's worth of it is kept.
-fn stderr_note(stderr: &[u8]) -> String {
+/// Text bubbler did not write, as a note to hang on an error message:
+/// the first line of it, with the control characters shown rather than
+/// sent to whatever terminal reads the message.
+fn bus_note(text: &str) -> String {
     /// Characters of the line the message carries; a D-Bus error name
-    /// and its text fit, a program printing something else does not get
-    /// to fill the terminal with it.
+    /// and its text fit, a peer with more to say does not get to fill
+    /// the terminal with it.
     const KEPT: usize = 200;
 
-    let line = stderr.split(|b| *b == b'\n').next().unwrap_or_default();
-    let rendered = String::from_utf8(crate::safe_text::render(line))
+    let line = text.split('\n').next().unwrap_or_default();
+    let rendered = String::from_utf8(crate::safe_text::render(line.as_bytes()))
         .expect("the rendering escapes every byte that is not text");
     let text = rendered.trim();
-    match (text.is_empty(), text.char_indices().nth(KEPT)) {
-        (true, _) => String::new(),
-        (false, Some((cut, _))) => format!(": {}...", &text[..cut]),
-        (false, None) => format!(": {text}"),
+    match text.char_indices().nth(KEPT) {
+        Some((cut, _)) => format!("{}...", &text[..cut]),
+        None => text.to_owned(),
     }
 }
 
@@ -782,7 +774,10 @@ pub fn proxy_command_nodes(
 mod tests {
     use super::*;
     use crate::config::WaylandMode;
-    use std::os::unix::ffi::OsStringExt;
+    use crate::dbus_wire::{decode, encode};
+    use std::io::{Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::thread::JoinHandle;
 
     fn strs(v: &[OsString]) -> Vec<&str> {
         v.iter()
@@ -1496,83 +1491,6 @@ mod tests {
         assert_eq!(host_system_bus(&e).unwrap(), PathBuf::from(SYSTEM_BUS_PATH));
     }
 
-    /// What this host's `dbus-send` printed for the call `host_a11y_bus`
-    /// makes, captured 2026-08-25 on a session running at-spi2.
-    const GET_ADDRESS_REPLY: &str = concat!(
-        "method return time=1787654118.642581 sender=:1.20 -> ",
-        "destination=:1.229719 serial=27 reply_serial=2\n",
-        "   string \"unix:path=/run/user/1000/at-spi/bus_0\"\n"
-    );
-
-    /// A fake `dbus-send` in `dir`: it writes its argv to `dir/argv`,
-    /// prints `stdout` and `stderr` and exits with `code`. Its output is
-    /// handed to it in files so that nothing in the reply has to survive
-    /// a trip through shell quoting.
-    fn fake_dbus_send(dir: &Path, stdout: &[u8], stderr: &[u8], code: i32) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(dir.join("stdout"), stdout).unwrap();
-        std::fs::write(dir.join("stderr"), stderr).unwrap();
-        let program = dir.join(DBUS_SEND);
-        std::fs::write(
-            &program,
-            format!(
-                "#!/bin/sh\n\
-                 printf '%s\\n' \"$@\" > {dir}/argv\n\
-                 printf '%s\\n' \"$DBUS_SESSION_BUS_ADDRESS\" > {dir}/session\n\
-                 cat {dir}/stdout\n\
-                 cat {dir}/stderr >&2\n\
-                 exit {code}\n",
-                dir = dir.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // A file written and then run by a process with threads in it
-        // comes back `ETXTBSY` now and again: another thread's spawn
-        // forked while this write's descriptor was open, and the fork
-        // holds it until its own exec closes it. Taking the miss here
-        // keeps it out of the test that follows.
-        for _ in 0..100 {
-            match Command::new(&program).output() {
-                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                _ => break,
-            }
-        }
-        program
-    }
-
-    #[test]
-    fn the_address_is_the_one_quoted_string_a_reply_holds() {
-        assert_eq!(
-            parse_get_address_reply(GET_ADDRESS_REPLY.as_bytes()),
-            Some(OsString::from("unix:path=/run/user/1000/at-spi/bus_0"))
-        );
-        // A socket path is bytes, and a lossy reading of it would name
-        // another file than the one the bus is on.
-        let mut reply = b"method return sender=:1.2\n   string \"unix:path=/run/".to_vec();
-        reply.extend_from_slice(b"\xff\"\n");
-        assert_eq!(
-            parse_get_address_reply(&reply),
-            Some(OsString::from_vec(b"unix:path=/run/\xff".to_vec()))
-        );
-        for none in [
-            "",
-            "method return time=1 sender=:1.20 -> destination=:1.3 serial=3 reply_serial=2\n",
-            // What a failed call prints; it is on stderr, but a reply
-            // that holds no address is not one to guess at either.
-            "Error org.freedesktop.DBus.Error.ServiceUnknown: The name is not activatable\n",
-            // GetAddress answers with one string. Two is a reply to
-            // some other question, and picking one of them is a guess.
-            "   string \"unix:path=/a\"\n   string \"unix:path=/b\"\n",
-            "   string unix:path=/a\n",
-            "   strings \"unix:path=/a\"\n",
-        ] {
-            assert_eq!(parse_get_address_reply(none.as_bytes()), None, "{none:?}");
-        }
-    }
-
     #[test]
     fn a_set_at_spi_address_is_the_answer_and_only_a_unix_path_is_one() {
         let mut e = env();
@@ -1599,57 +1517,285 @@ mod tests {
         }
     }
 
+    /// Header field codes and message types the fake bus below writes,
+    /// from the D-Bus specification's "Header Fields" and "Message
+    /// Format". `dbus_wire` keeps its own copies; a test that shares
+    /// them would agree with the encoder by construction.
+    const FIELD_PATH: u8 = 1;
+    const FIELD_INTERFACE: u8 = 2;
+    const FIELD_MEMBER: u8 = 3;
+    const FIELD_ERROR_NAME: u8 = 4;
+    const FIELD_REPLY_SERIAL: u8 = 5;
+    const FIELD_DESTINATION: u8 = 6;
+    const FIELD_SIGNATURE: u8 = 8;
+    const MSG_METHOD_RETURN: u8 = 2;
+    const MSG_ERROR: u8 = 3;
+
+    /// A bus on a socket under `dir` that runs `script` on the one
+    /// connection it accepts, as `dbus_wire`'s own harness does it. Only
+    /// what the one call this module makes needs is here.
+    fn fake_bus<F>(dir: &Path, script: F) -> (PathBuf, JoinHandle<()>)
+    where
+        F: FnOnce(UnixStream) + Send + 'static,
+    {
+        let path = dir.join("bus");
+        let listener = UnixListener::bind(&path).unwrap();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            // So a client that never sends what the script waits for
+            // fails the test instead of hanging it.
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+                .unwrap();
+            script(stream);
+        });
+        (path, handle)
+    }
+
+    /// One `\r\n` line from the client, read a byte at a time so none of
+    /// the message stream that follows `BEGIN` is swallowed.
+    fn server_line(stream: &UnixStream) -> String {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            (&*stream).read_exact(&mut byte).unwrap();
+            out.push(byte[0]);
+            if out.ends_with(b"\r\n") {
+                out.truncate(out.len() - 2);
+                return String::from_utf8(out).unwrap();
+            }
+        }
+    }
+
+    /// The `EXTERNAL` handshake from the bus's side and the `Hello` reply
+    /// every connection owes, after which the script is on the call.
+    fn server_start(stream: &UnixStream) {
+        assert!(server_line(stream).starts_with("\0AUTH EXTERNAL "));
+        (&*stream).write_all(b"OK 1234deadbeef\r\n").unwrap();
+        assert_eq!(server_line(stream), "NEGOTIATE_UNIX_FD");
+        (&*stream).write_all(b"AGREE_UNIX_FD\r\n").unwrap();
+        assert_eq!(server_line(stream), "BEGIN");
+        let hello = server_message(stream);
+        server_reply(
+            stream,
+            serial_of(&hello),
+            "s",
+            &[Value::Str(":1.7".to_owned())],
+        );
+    }
+
+    /// One whole message from the client. After `BEGIN` the socket
+    /// carries messages only, and every header says how long its own
+    /// fields and its body are, so each message is read to its exact end.
+    fn server_message(stream: &UnixStream) -> Vec<u8> {
+        let mut head = [0u8; 16];
+        (&*stream).read_exact(&mut head).unwrap();
+        let word = |at: usize| {
+            u32::from_le_bytes(head[at..at + 4].try_into().expect("four bytes")) as usize
+        };
+        // The body starts on the next 8-byte boundary after the fields.
+        let mut rest = vec![0u8; word(12).next_multiple_of(8) + word(4)];
+        (&*stream).read_exact(&mut rest).unwrap();
+        [&head[..], &rest].concat()
+    }
+
+    /// The serial of a message: the second UINT32 of its header.
+    fn serial_of(message: &[u8]) -> u32 {
+        u32::from_le_bytes(message[8..12].try_into().expect("four bytes"))
+    }
+
+    /// The text of each header field of a message, in the order it was
+    /// written: what the client asked, and of whom.
+    fn text_fields(message: &[u8]) -> Vec<(u8, String)> {
+        let end = 16 + u32::from_le_bytes(message[12..16].try_into().expect("four bytes")) as usize;
+        let header = decode("yyyyuua(yv)", &message[..end]).unwrap();
+        let [.., Value::Array(fields)] = header.as_slice() else {
+            panic!("a header whose last member is not the field array");
+        };
+        fields
+            .iter()
+            .map(|field| {
+                let Value::Struct(pair) = field else {
+                    panic!("a header field that is not a struct");
+                };
+                let [Value::Byte(code), Value::Variant(value)] = pair.as_slice() else {
+                    panic!("a header field that is not a code and a variant");
+                };
+                let text = match &**value {
+                    Value::Str(s) | Value::ObjectPath(s) | Value::Signature(s) => s.clone(),
+                    other => format!("{other:?}"),
+                };
+                (*code, text)
+            })
+            .collect()
+    }
+
+    /// One message from the bus's side: the fixed header, the
+    /// header-field array, padding to the 8-byte boundary the body
+    /// starts on, and the body.
+    fn server_send(
+        stream: &UnixStream,
+        kind: u8,
+        fields: &[(u8, Value)],
+        sig: &str,
+        body: &[Value],
+    ) {
+        let body = encode(sig, body).unwrap();
+        let mut fields = fields.to_vec();
+        if !sig.is_empty() {
+            fields.push((FIELD_SIGNATURE, Value::Signature(sig.to_owned())));
+        }
+        let fields = Value::Array(
+            fields
+                .into_iter()
+                .map(|(code, value)| {
+                    Value::Struct(vec![Value::Byte(code), Value::Variant(Box::new(value))])
+                })
+                .collect(),
+        );
+        let mut message = encode(
+            "yyyyuua(yv)",
+            &[
+                // little-endian, this kind, no flags, protocol version 1
+                Value::Byte(b'l'),
+                Value::Byte(kind),
+                Value::Byte(0),
+                Value::Byte(1),
+                Value::Uint32(u32::try_from(body.len()).expect("a test body")),
+                // The bus's own serial; the client matches on the reply
+                // serial in the fields, never on this one.
+                Value::Uint32(1),
+                fields,
+            ],
+        )
+        .unwrap();
+        message.resize(message.len().next_multiple_of(8), 0);
+        message.extend_from_slice(&body);
+        (&*stream).write_all(&message).unwrap();
+    }
+
+    /// A `METHOD_RETURN` to the call with serial `reply_to`.
+    fn server_reply(stream: &UnixStream, reply_to: u32, sig: &str, body: &[Value]) {
+        server_send(
+            stream,
+            MSG_METHOD_RETURN,
+            &[(FIELD_REPLY_SERIAL, Value::Uint32(reply_to))],
+            sig,
+            body,
+        );
+    }
+
+    /// An `ERROR` reply: what the bus answers with when the name is not
+    /// there to answer for itself.
+    fn server_error(stream: &UnixStream, reply_to: u32, name: &str, message: &str) {
+        server_send(
+            stream,
+            MSG_ERROR,
+            &[
+                (FIELD_REPLY_SERIAL, Value::Uint32(reply_to)),
+                (FIELD_ERROR_NAME, Value::Str(name.to_owned())),
+            ],
+            "s",
+            &[Value::Str(message.to_owned())],
+        );
+    }
+
+    /// A bus that answers the one call with `sig` and `body`, whatever
+    /// they are.
+    fn bus_answering(dir: &Path, sig: &'static str, body: Vec<Value>) -> (PathBuf, JoinHandle<()>) {
+        fake_bus(dir, move |stream| {
+            server_start(&stream);
+            let call = server_message(&stream);
+            server_reply(&stream, serial_of(&call), sig, &body);
+        })
+    }
+
     #[test]
-    fn without_the_variable_the_bus_is_asked_with_one_fixed_invocation() {
+    fn without_the_variable_the_bus_is_asked_with_one_fixed_call() {
         let tmp = tempfile::tempdir().unwrap();
-        let program = fake_dbus_send(tmp.path(), GET_ADDRESS_REPLY.as_bytes(), b"", 0);
+        let (bus, server) = fake_bus(tmp.path(), |stream| {
+            server_start(&stream);
+            let call = server_message(&stream);
+            // The whole of what bubbler asks the session bus for: one
+            // method on one object of one name.
+            assert_eq!(
+                text_fields(&call),
+                vec![
+                    (FIELD_PATH, "/org/a11y/bus".to_owned()),
+                    (FIELD_DESTINATION, "org.a11y.Bus".to_owned()),
+                    (FIELD_INTERFACE, "org.a11y.Bus".to_owned()),
+                    (FIELD_MEMBER, "GetAddress".to_owned()),
+                ]
+            );
+            server_reply(
+                &stream,
+                serial_of(&call),
+                "s",
+                &[Value::Str("unix:path=/run/user/1000/at-spi/bus".to_owned())],
+            );
+        });
+        let mut e = env();
+        e.runtime_dir = tmp.path().to_owned();
+        // No `$DBUS_SESSION_BUS_ADDRESS` in this environment: the
+        // question goes to the socket every other bus falls back to, so
+        // an unset variable is no longer a lookup with no bus behind it.
+        assert_eq!(bus, e.runtime_dir.join("bus"));
         assert_eq!(
-            ask_a11y_bus(&program, &env()).unwrap(),
-            PathBuf::from("/run/user/1000/at-spi/bus_0")
+            host_a11y_bus(&e).unwrap(),
+            PathBuf::from("/run/user/1000/at-spi/bus")
         );
-        // The whole of what bubbler asks the session bus for: one method
-        // on one object of one name.
-        assert_eq!(
-            std::fs::read_to_string(tmp.path().join("argv")).unwrap(),
-            "--session\n--print-reply\n--dest=org.a11y.Bus\n/org/a11y/bus\n\
-             org.a11y.Bus.GetAddress\n"
-        );
+        server.join().unwrap();
     }
 
     #[test]
     fn the_session_bus_asked_is_the_one_the_env_names() {
         let tmp = tempfile::tempdir().unwrap();
-        let program = fake_dbus_send(tmp.path(), GET_ADDRESS_REPLY.as_bytes(), b"", 0);
-        let mut e = env();
-        // Not the address this test process inherited: the accessibility
-        // bus has to be the one belonging to the session whose socket the
-        // `dbus` grant proxies.
-        e.dbus_address = Some("unix:path=/tmp/from-the-env".into());
-        ask_a11y_bus(&program, &e).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(tmp.path().join("session")).unwrap(),
-            "unix:path=/tmp/from-the-env\n"
+        let named = tempfile::tempdir().unwrap();
+        let (bus, server) = bus_answering(
+            named.path(),
+            "s",
+            vec![Value::Str("unix:path=/tmp/from-the-named-bus".to_owned())],
         );
+        let mut e = env();
+        // Not the address this test process inherited, and not the
+        // fallback either: the accessibility bus has to be the one
+        // belonging to the session whose socket the `dbus` grant
+        // proxies. Nothing listens in the runtime dir below, so an
+        // answer at all is the proof.
+        e.runtime_dir = tmp.path().to_owned();
+        e.dbus_address = Some(OsString::from(format!("unix:path={}", bus.display())));
+        assert_eq!(
+            host_a11y_bus(&e).unwrap(),
+            PathBuf::from("/tmp/from-the-named-bus")
+        );
+        server.join().unwrap();
     }
 
     #[test]
     fn a_bus_that_does_not_answer_is_a_launch_error_naming_the_step() {
         let tmp = tempfile::tempdir().unwrap();
-        // dbus-send prints the D-Bus error and exits 1. Its output is
-        // another program's, so the control sequences in it are shown
-        // rather than sent to whatever terminal reads the message.
-        let program = fake_dbus_send(
-            tmp.path(),
-            b"",
-            b"Error org.freedesktop.DBus.Error.ServiceUnknown: \x1b]52;c;aGk=\x07\nmore\n",
-            1,
-        );
-        let Err(LaunchError::A11y(msg)) = ask_a11y_bus(&program, &env()) else {
-            panic!("a failed call was accepted");
+        // What the bus answers when nothing owns the name. The message
+        // is the bus's own text, so the control sequences in it are
+        // shown rather than sent to whatever terminal reads the error.
+        let (_bus, server) = fake_bus(tmp.path(), |stream| {
+            server_start(&stream);
+            let call = server_message(&stream);
+            server_error(
+                &stream,
+                serial_of(&call),
+                "org.freedesktop.DBus.Error.ServiceUnknown",
+                "The name is not activatable \x1b]52;c;aGk=\x07\nmore",
+            );
+        });
+        let mut e = env();
+        e.runtime_dir = tmp.path().to_owned();
+        let Err(LaunchError::A11y(msg)) = host_a11y_bus(&e) else {
+            panic!("a refused call was accepted");
         };
-        assert!(msg.contains("org.a11y.Bus"), "{msg}");
+        server.join().unwrap();
+        assert!(msg.contains("org.a11y.Bus.GetAddress failed"), "{msg}");
         assert!(
-            msg.contains("Error org.freedesktop.DBus.Error.ServiceUnknown"),
+            msg.contains("org.freedesktop.DBus.Error.ServiceUnknown"),
             "{msg}"
         );
         assert!(msg.contains("^[]52;c;aGk=^G"), "{msg}");
@@ -1663,38 +1809,73 @@ mod tests {
     }
 
     #[test]
+    fn a_bus_that_is_not_there_is_a_launch_error_naming_the_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut e = env();
+        // A directory with no socket in it, named with an escape
+        // sequence: the path comes from the environment, and a failure
+        // that echoed it raw would hand the terminal whatever it holds.
+        e.runtime_dir = tmp.path().join("a\x1bb");
+        std::fs::create_dir(&e.runtime_dir).unwrap();
+        let Err(LaunchError::A11y(msg)) = host_a11y_bus(&e) else {
+            panic!("a bus that is not there was accepted");
+        };
+        assert!(
+            msg.starts_with("asking the session bus for the accessibility bus: "),
+            "{msg}"
+        );
+        assert!(msg.contains("^["), "{msg}");
+        assert!(!msg.contains('\x1b'), "{msg}");
+    }
+
+    #[test]
     fn an_answer_that_is_no_unix_socket_is_refused_and_never_echoed() {
         let tmp = tempfile::tempdir().unwrap();
         // What at-spi-bus-launcher reports when it listens on an
         // abstract socket: a bus that exists and that the proxy sandbox,
         // with no network namespace of the host's, cannot reach.
-        let abstract_reply = "method return sender=:1.2 reply_serial=2\n   \
-             string \"unix:abstract=/tmp/dbus-Ab3\"\n";
-        let program = fake_dbus_send(tmp.path(), abstract_reply.as_bytes(), b"", 0);
-        let Err(LaunchError::A11y(msg)) = ask_a11y_bus(&program, &env()) else {
+        let (_bus, server) = bus_answering(
+            tmp.path(),
+            "s",
+            vec![Value::Str("unix:abstract=/tmp/dbus-Ab3".to_owned())],
+        );
+        let mut e = env();
+        e.runtime_dir = tmp.path().to_owned();
+        let Err(LaunchError::A11y(msg)) = host_a11y_bus(&e) else {
             panic!("an abstract address was accepted");
         };
+        server.join().unwrap();
         assert!(msg.contains("unix:path="), "{msg}");
         // The address is host input; the message says what was wrong
         // with it, not what it held.
         assert!(!msg.contains("dbus-Ab3"), "{msg}");
-
-        let other = tempfile::tempdir().unwrap();
-        let program = fake_dbus_send(other.path(), b"method return sender=:1.2\n", b"", 0);
-        let Err(LaunchError::A11y(msg)) = ask_a11y_bus(&program, &env()) else {
-            panic!("a reply holding no address was accepted");
-        };
-        assert!(msg.contains("org.a11y.Bus"), "{msg}");
     }
 
     #[test]
-    fn a_missing_dbus_send_names_the_program_and_its_package() {
-        let tmp = tempfile::tempdir().unwrap();
-        let Err(LaunchError::A11y(msg)) = ask_a11y_bus(&tmp.path().join(DBUS_SEND), &env()) else {
-            panic!("a missing program was accepted");
-        };
-        assert!(msg.contains(DBUS_SEND), "{msg}");
-        assert!(msg.contains("PATH"), "{msg}");
-        assert!(msg.contains("dbus"), "{msg}");
+    fn an_answer_that_is_not_one_address_is_no_answer() {
+        // `GetAddress` answers with a single string. A reply with two,
+        // or with none, is an answer to some other question, and picking
+        // a value out of it would be a guess.
+        for (sig, body) in [
+            ("", vec![]),
+            (
+                "ss",
+                vec![
+                    Value::Str("unix:path=/a".to_owned()),
+                    Value::Str("unix:path=/b".to_owned()),
+                ],
+            ),
+            ("u", vec![Value::Uint32(1)]),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (_bus, server) = bus_answering(tmp.path(), sig, body);
+            let mut e = env();
+            e.runtime_dir = tmp.path().to_owned();
+            let Err(LaunchError::A11y(msg)) = host_a11y_bus(&e) else {
+                panic!("a reply of {sig:?} was accepted");
+            };
+            server.join().unwrap();
+            assert!(msg.contains("org.a11y.Bus"), "{sig:?}: {msg}");
+        }
     }
 }

@@ -99,8 +99,8 @@ every sandboxed `wayland`, which is not optional — a run stops without it;
 `passt` (pasta) for an isolated `network`; `nftables` for `outbound "deny"`;
 `xdg-desktop-portal` with a backend for `portals` and `camera`;
 `xorg-xwayland` for the X server a bare `x11` runs inside the sandbox;
-`at-spi2-core` and the `dbus` package's `dbus-send` for `a11y`, and fcitx5 or
-IBus running for `input-method` to reach anything.
+`at-spi2-core` for `a11y`, and fcitx5 or IBus running for `input-method` to
+reach anything.
 See [Getting Started](docs/wiki/Getting-Started.md).
 
 ## What it is not

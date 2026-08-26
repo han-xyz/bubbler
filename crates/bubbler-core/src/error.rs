@@ -232,10 +232,10 @@ pub enum LaunchError {
     #[error("connecting the sandbox network namespace: {0}")]
     Network(String),
     /// The accessibility bus could not be found: `$AT_SPI_BUS_ADDRESS`
-    /// named no socket bubbler can bind, `dbus-send` is missing, or
-    /// `org.a11y.Bus` did not answer with a `unix:path=` address. An
-    /// `a11y` sandbox stops here rather than start with a socket that
-    /// has no bus behind it.
+    /// named no socket bubbler can bind, the session bus could not be
+    /// reached, or `org.a11y.Bus` did not answer with a `unix:path=`
+    /// address. An `a11y` sandbox stops here rather than start with a
+    /// socket that has no bus behind it.
     #[error("finding the accessibility bus: {0}")]
     A11y(String),
     /// Nothing listens on the instance's control socket.

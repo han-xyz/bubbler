@@ -150,7 +150,7 @@ const ENVIRONMENT: &[(&str, &str)] = &[
         "AT_SPI_BUS_ADDRESS",
         "Where the accessibility bus the `a11y` grant proxies is, read before anything is \
          asked of the session: when it is unset, bubbler asks org.a11y.Bus for the address \
-         with dbus-send, from the `dbus` package. It is untrusted like the D-Bus \
+         itself, over its own session-bus client. It is untrusted like the D-Bus \
          addresses, must be a `unix:path=` address, and a bus that cannot be found fails \
          the run rather than dropping the grant.",
     ),

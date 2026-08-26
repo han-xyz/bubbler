@@ -2297,19 +2297,23 @@ filters only what the client sends — the property `tray` already relies on.
 
 The bus is found the way at-spi2's own clients find it: `$AT_SPI_BUS_ADDRESS`
 if the session set one, else `org.a11y.Bus.GetAddress` on the session bus,
-asked with `dbus-send` (the `dbus` package) spawned with one argument per
-element and no shell anywhere, and the reply read for its one `string "…"`
-line. Asking in that order means the bus bubbler proxies is the one the
-applications on this host are already on. The address has to be a `unix:path=`
-one: at-spi's launcher can report a `unix:abstract=` address instead, and the
-proxy's own sandbox has no host network namespace, so there would be nothing
-there to connect to — that is refused with a message saying so, as `tcp:` is on
-the other two buses. Every failure — no `dbus-send` on `PATH`, no
-`org.a11y.Bus` answering, an answer that is not a socket path — stops the run
-naming the step rather than dropping the grant: a socket with no bus behind it
-looks to the application like a broken toolkit and to you like a sandbox that
-quietly gave less than the config asked for. The address itself is never echoed
-back in an error, being host input like any other.
+asked by bubbler itself over its own bus client — one method call on one
+object of one name, with no program on `PATH` to spawn and no shell anywhere.
+The session bus it asks on is the one the `dbus` grant proxies
+(`$DBUS_SESSION_BUS_ADDRESS`, else `$XDG_RUNTIME_DIR/bus`), so the address that
+comes back belongs to that same session. Asking in that order means the bus
+bubbler proxies is the one the applications on this host are already on, and
+asking it ourselves means an `a11y` grant needs no second package to look it
+up with. The address has to be a `unix:path=` one: at-spi's launcher can report
+a `unix:abstract=` address instead, and the proxy's own sandbox has no host
+network namespace, so there would be nothing there to connect to — that is
+refused with a message saying so, as `tcp:` is on the other two buses. Every
+failure — no session bus to ask, no `org.a11y.Bus` answering, an answer that is
+not a socket path — stops the run naming the step rather than dropping the
+grant: a socket with no bus behind it looks to the application like a broken
+toolkit and to you like a sandbox that quietly gave less than the config asked
+for. The address itself is never echoed back in an error, being host input like
+any other.
 
 Inside the sandbox the filtered socket is bound read-only at
 `$XDG_RUNTIME_DIR/at-spi/bus` and `AT_SPI_BUS_ADDRESS` is set to `unix:path=`
@@ -2972,8 +2976,8 @@ upgrade. It is the administrator's, and bubbler ships nothing in it.
 At runtime bubbler needs `bwrap` (bubblewrap), `xdg-dbus-proxy` for any profile
 with a `dbus` or `system-bus` grant, which is most of them, `pasta` (the
 `passt` package) for an isolated `network`, and `libseccomp`. An `a11y` grant
-also needs `dbus-send`, from the `dbus` package, to ask the session where its
-accessibility bus is, and an accessibility bus to find — `at-spi2-core`. An
+needs an accessibility bus to find — `at-spi2-core`; the address is asked of
+the session bus by bubbler itself, so no other package goes with it. An
 `input-method` grant reaches something only where fcitx5 or IBus is running.
 Portals need `xdg-desktop-portal` and a backend for your desktop; neither is
 bubbler's to start. Nothing here depends on a shell: bubbler ships no
