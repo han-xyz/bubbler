@@ -559,8 +559,10 @@ fn selection_settles(want: Option<&[u8]>) -> bool {
 /// threads of one do — this crate's suite and the CLI crate's take the same
 /// lock — and the kernel drops a `flock` when its holder exits, so a suite
 /// that crashed leaves nothing stale behind. The same reasoning, and the same
-/// lock file, as `crates/bubbler/tests/cli.rs`; a test crate cannot share code
-/// with another without a dependency between them.
+/// lock file, as `hold_the_session` in `crates/bubbler/tests/cli.rs`, which
+/// also guards the keyboard focus that decides who is offered the selection;
+/// a test crate cannot share code with another without a dependency between
+/// them, so the path is spelled out in both.
 struct Selection {
     /// The lock file, whose open description is the lock.
     _lock: File,
@@ -608,7 +610,7 @@ impl Drop for Selection {
 /// their clipboard, which no assertion is worth.
 fn hold_the_selection() -> Option<Selection> {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")?;
-    let path = Path::new(&dir).join("bubbler-test-selection.lock");
+    let path = Path::new(&dir).join("bubbler-test-session.lock");
     let lock = File::create(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
     flock(&lock, FlockOperation::LockExclusive)
         .expect("an exclusive lock on a file this process has just created");

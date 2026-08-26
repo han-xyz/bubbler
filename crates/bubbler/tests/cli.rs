@@ -4454,16 +4454,40 @@ fn selection_now() -> Held {
     }
 }
 
-/// The session's selection, owned by one test at a time and given back the
-/// way it was found.
+/// The lock every test that reaches for this session's compositor takes.
+/// Named in `bubbler-wl-proxy`'s suite as well, which shares it.
+const SESSION_LOCK: &str = "bubbler-test-session.lock";
+
+/// The session's compositor, held by one test at a time.
 ///
-/// There is one of it, and a `wl-copy` from one test is the offer another
-/// is halfway through reading: the compositor drops an offer whose source
-/// has been replaced, and the read then returns nothing for a reason that
-/// has nothing to do with the gate. A file lock and not a `Mutex` because
-/// two `cargo test` processes on one login share the selection exactly as
-/// two threads of one do, and the kernel drops a `flock` when its holder
-/// exits, so a suite that crashed leaves nothing stale behind.
+/// Two things up there are single and shared. The selection is one: a
+/// `wl-copy` from one test is the offer another is halfway through
+/// reading, and the compositor drops an offer whose source has been
+/// replaced. Keyboard focus is the other, and it decides who may read the
+/// selection at all — a compositor offers it to the focused client only,
+/// and Hyprland marks every outstanding `wl_data_offer` dead the moment
+/// focus moves, then answers a read on a dead one with nothing written
+/// and no error. So a window mapped by another test — a clipboard
+/// fixture's, or the rootful Xwayland a nested `x11` run starts — is a
+/// clipboard test reading zero bytes where the selection holds six.
+///
+/// A file lock and not a `Mutex` because two `cargo test` processes on one
+/// login share the compositor exactly as two threads of one do, and the
+/// kernel drops a `flock` when its holder exits, so a suite that crashed
+/// leaves nothing stale behind.
+fn hold_the_session() -> std::fs::File {
+    let path = PathBuf::from(
+        std::env::var_os("XDG_RUNTIME_DIR").expect("checked by require_security_context"),
+    )
+    .join(SESSION_LOCK);
+    let lock = std::fs::File::create(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    flock(&lock, FlockOperation::LockExclusive)
+        .expect("an exclusive lock on a file this process has just created");
+    lock
+}
+
+/// The session's selection, owned by one test at a time and given back the
+/// way it was found. Holds [`hold_the_session`] for as long as it lives.
 struct Selection {
     /// The lock file, whose open description is the lock.
     _lock: std::fs::File,
@@ -4513,13 +4537,7 @@ impl Drop for Selection {
 /// back. Taking a selection a test has no way of returning would cost the
 /// user their clipboard, which no assertion is worth.
 fn hold_the_selection() -> Option<Selection> {
-    let path = PathBuf::from(
-        std::env::var_os("XDG_RUNTIME_DIR").expect("checked by require_security_context"),
-    )
-    .join("bubbler-test-selection.lock");
-    let lock = std::fs::File::create(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    flock(&lock, FlockOperation::LockExclusive)
-        .expect("an exclusive lock on a file this process has just created");
+    let lock = hold_the_session();
     // Under the lock: whatever is on it now is the user's, and no other
     // test may replace it between this look and the copy that follows.
     let previous = match selection_now() {
@@ -4939,6 +4957,10 @@ fn real_nested_x11_serves_a_private_display() {
         say(&format!("skipping: {XDPYINFO} is not installed"));
         return;
     }
+    // The server this starts is rootful: it maps a window on the session
+    // and takes its keyboard focus, which is a clipboard test's read
+    // coming back empty. One test at a time up there.
+    let _session = hold_the_session();
     let tmp = setup();
     let name = &instance_name("x11-nested");
     let _leftovers = wayland_instance(tmp.path(), &init, name, NESTED_X11);
@@ -4967,6 +4989,10 @@ fn real_nested_x11_exec_children_see_the_display() {
         return;
     }
     let Some(init) = real_init() else { return };
+    // No X client runs here, so no server should start — but the grant is
+    // the same one, and a test that guesses wrong about that guesses a
+    // window onto another test's compositor. Taken like the rest.
+    let _session = hold_the_session();
     let tmp = setup();
     let name = &instance_name("x11-exec");
     let _leftovers = wayland_instance(tmp.path(), &init, name, NESTED_X11);
@@ -5145,6 +5171,7 @@ fn real_nested_x11_starts_the_server_on_the_first_client() {
     if !require_host_program(XDPYINFO) || !require_host_program(PGREP) {
         return;
     }
+    let _session = hold_the_session();
     let tmp = setup();
     let name = &instance_name("x11-lazy");
     let _leftovers = wayland_instance(tmp.path(), &init, name, NESTED_X11);
@@ -5210,6 +5237,7 @@ fn real_nested_x11_wm_exiting_is_logged_not_fatal() {
     if !require_host_program(XDPYINFO) {
         return;
     }
+    let _session = hold_the_session();
     let tmp = setup();
     let name = &instance_name("x11-wm-exits");
     // `true` is a window manager that manages nothing and exits at once,
@@ -5270,6 +5298,7 @@ fn real_nested_x11_missing_wm_is_logged_not_fatal() {
     if !require_host_program(XDPYINFO) {
         return;
     }
+    let _session = hold_the_session();
     let tmp = setup();
     let name = &instance_name("x11-wm-missing");
     let _leftovers = wayland_instance(
