@@ -5475,9 +5475,9 @@ fn a_configuration_nested_past_the_bound_is_refused_wherever_it_is_read() {
         // An abort has no exit code at all, which is what this had.
         assert!(out.status.code().is_some_and(|c| c != 0), "{args:?}: {err}");
         assert!(err.contains(&file.display().to_string()), "{args:?}: {err}");
-        // The bound as the constant holds it: a message naming a depth
+        // The bound as the constant holds it: a message naming a count
         // the parser no longer stops at would be a lie to whoever hit it.
-        let bound = format!("nested deeper than {}", bubbler_core::config::MAX_NESTING);
+        let bound = format!("more than {} times", bubbler_core::config::MAX_NESTING);
         assert!(err.contains(&bound), "{args:?}: {err}");
     }
     // The shim registry is read on every start under a shim name, so it
@@ -5493,7 +5493,7 @@ fn a_configuration_nested_past_the_bound_is_refused_wherever_it_is_read() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.code().is_some_and(|c| c != 0), "{err}");
     assert!(err.contains(&registry.display().to_string()), "{err}");
-    let bound = format!("nested deeper than {}", bubbler_core::config::MAX_NESTING);
+    let bound = format!("more than {} times", bubbler_core::config::MAX_NESTING);
     assert!(err.contains(&bound), "{err}");
 }
 

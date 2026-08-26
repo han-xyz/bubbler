@@ -941,10 +941,17 @@ shims](manual.md#path-shims) ·
 ### Configuration parsing
 
 **Defends:** the input is your own file, so this is correctness rather
-than security — with one exception. The `kdl` crate parses `{` by
-recursing, and a deeply nested file would overflow the stack and abort
-bubbler with no diagnostic, so every configuration bubbler reads is
-pre-checked and refused above 1 MiB or 32 braces, naming the file.
+than security — with one exception. The `kdl` crate parses `{` and
+`/* */` comments by recursing, and a file nested or starred deeply enough
+would overflow the stack and abort bubbler with no diagnostic, so every
+configuration bubbler reads is pre-checked and refused above 1 MiB, above
+32 `{` counted wherever they stand, or holding a `/*` with more than 128
+`*` or `/` after it, naming the file. The count trusts no string and no
+comment and lets no `}` give a brace back: the parser recovers from a
+string it cannot read by reading the inside as nodes, so a bound that
+followed its grammar was one its recovery stepped around. A count that
+trusts nothing can only refuse a file the parser would have survived,
+never admit one it would not.
 Include cycles and depth are bounded, an unknown node is an error rather
 than a silent skip, and a value that could forge a line in `--dry-run`
 output is refused.

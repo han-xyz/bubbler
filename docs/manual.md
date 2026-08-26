@@ -2920,11 +2920,16 @@ none of its own.
 - The `kdl` crate parses `{` by recursing, so a deeply nested profile or
   `config.kdl` would overflow the stack and abort bubbler with no diagnostic
   at all. bubbler pre-checks every configuration it reads and refuses one
-  larger than 1 MiB or nested deeper than 32 braces, or holding a block
-  comment of more than 128 `*` or `/` (the parser recurses on each of those
-  too), naming the file; the check counts `{` outside comments against `}`
-  outside strings and comments and is not a parser, and the recursion itself
-  is upstream's (`kdl` 6.7.1).
+  larger than 1 MiB, one holding more than 32 `{` in total, or one holding a
+  `/*` with more than 128 `*` or `/` in the comment after it (the parser
+  recurses on each of those too), naming the file. The check is not a parser:
+  it counts every `{` and measures from every `/*` wherever they stand,
+  strings and comments included, and a `}` gives nothing back, because the
+  parser recovers from a string it cannot read by reading what was written
+  inside it as configuration, and which strings it cannot read is its own
+  affair. Over-counting can only refuse a file the parser would have
+  survived — thirty-three braces in the comments of one file is the cost —
+  and the recursion itself is upstream's (`kdl` 6.7.1).
 - A generated desktop entry closes D-Bus activation for itself only: anything
   that activates the application's bus name directly still starts the host
   copy. See "Desktop entries".

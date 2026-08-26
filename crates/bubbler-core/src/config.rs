@@ -24,9 +24,12 @@ use crate::seccomp::syscall_number;
 /// past anything a person writes.
 pub const MAX_BYTES: usize = 1024 * 1024;
 
-/// Deepest `{`…`}` nesting bubbler hands to the KDL parser. The deepest
-/// node bubbler defines is two levels (`network { dns { … } }`), so this
-/// is room to spare for a config that means something.
+/// Most `{` bubbler hands to the KDL parser in one file, counted
+/// wherever they stand: in strings and comments too, and never given
+/// back by a `}`. The deepest node bubbler defines is two levels
+/// (`network { dns { … } }`) and the shipped profiles hold two braces
+/// at most, so a config that means something, header examples pasted
+/// into its comments included, stays well under this.
 ///
 /// Measured against `kdl` 6.7.1 on x86_64, parsing well-formed nesting
 /// until the process aborts: 1348 levels on the 8 MiB stack a main
@@ -713,36 +716,41 @@ pub fn parse_profile(text: &str) -> Result<RawProfile, ConfigError> {
 /// stack and aborts the process instead of returning an error, and the
 /// text is measured before the parser is handed it.
 ///
-/// The measurement is a pre-check and not a parser: it counts `{`
-/// outside comments against `}` outside strings and comments, and
-/// decides nothing about what the document means. Text it accepts may
-/// still be invalid KDL.
+/// The measurement is a pre-check and not a parser: it counts every
+/// `{` in the text and measures the comment after every `/*`, wherever
+/// they stand, and decides nothing about what the document means. Text
+/// it accepts may still be invalid KDL.
 pub fn parse_document(text: &str) -> Result<KdlDocument, ConfigError> {
     check_bounds(text)?;
     Ok(KdlDocument::parse(text)?)
 }
 
-/// Refuse text past [`MAX_BYTES`] or [`MAX_NESTING`]. Counting the
-/// braces by hand is the point: see [`parse_document`].
+/// Refuse text past [`MAX_BYTES`], holding more than [`MAX_NESTING`]
+/// `{`, or holding a `/*` with more than [`MAX_COMMENT_MARKS`] `*` or
+/// `/` in the comment after it. Counting by hand is the point: see
+/// [`parse_document`].
 ///
-/// A `{` inside a string is counted like any other. The parser recovers
-/// from a string it cannot read — a bad escape, a NUL, a multi-line body
-/// whose lines do not carry the indentation of its closing quotes — and
-/// reads what was written inside it as nodes, descending into every `{`
-/// there; a count that trusted the string would have cleared text the
-/// parser then recurses through, and that is a stack overflow, which
-/// aborts the process rather than failing. A `}` inside a string is
-/// let close nothing, though: a string the parser does read as a string
-/// closes nothing, so the `}` it holds would clear `{` that are still
-/// open. The count is therefore cumulative over the file — a `{` in a
-/// string is never closed, and several strings holding a few each add
-/// up — and a file whose strings hold more than [`MAX_NESTING`] `{`
-/// between them is refused; no configuration that grants anything
-/// writes one. Comments are stepped over, and only outside strings:
-/// KDL never reads a comment back as nodes, and a `/*` inside a string
-/// opens none — the braces after the string are the parser's. It is
-/// measured all the same: a string the parser cannot read is one it
-/// reads the inside of, and it recurses on that comment as on any.
+/// The count keeps no model of where strings and comments are. The
+/// parser recovers from a string it cannot read — a bad escape, a NUL,
+/// a `"""` mid-line, a multi-line body whose lines do not carry the
+/// indentation of its closing quotes, and more shapes than a model of
+/// its grammar keeps up with — by reading what was written inside it as
+/// nodes, descending into every `{` there and recursing on every `/*`.
+/// What recovery cannot do is put a `{` or a `/*` into the text. So
+/// every `{` counts wherever it stands and a `}` closes nothing: a file
+/// holding more `{` than the parser may descend into is refused whether
+/// or not it would have descended into them. Every `/*` is measured
+/// from where it stands for the same reason. A `{` or a `/*` inside a
+/// string or a comment the parser does read as one is over-counted,
+/// which refuses a file the parser would have survived; no
+/// configuration that grants anything writes thirty-three braces, or a
+/// comment as busy as the bound, anywhere in it.
+///
+/// Measuring from every `/*` costs linear work: a measure stops one
+/// mark past the bound, so it steps past at most [`MAX_COMMENT_MARKS`]
+/// / 2 further `/*` before it stops, and each byte of the text is
+/// walked by at most that many measures plus one — 65 × [`MAX_BYTES`]
+/// steps in the worst layout, a tenth of a second unoptimised.
 fn check_bounds(text: &str) -> Result<(), ConfigError> {
     if text.len() > MAX_BYTES {
         return Err(ConfigError::TooLarge {
@@ -751,56 +759,29 @@ fn check_bounds(text: &str) -> Result<(), ConfigError> {
         });
     }
     let b = text.as_bytes();
-    let mut depth: usize = 0;
-    // Just past the string being read, or nothing: inside it, a `}`
-    // closes nothing and a `/` opens no comment.
-    let mut string_until: usize = 0;
-    let mut i = 0;
-    while i < b.len() {
-        let quoted = i < string_until;
-        i = match b[i] {
-            b'/' if !quoted && b.get(i + 1) == Some(&b'/') => line_comment_end(b, i),
+    let mut opens: usize = 0;
+    for (i, c) in b.iter().enumerate() {
+        match c {
+            b'{' => {
+                opens += 1;
+                if opens > MAX_NESTING {
+                    return Err(ConfigError::TooDeep {
+                        line: line_at(text, i).unwrap_or(0),
+                        max: MAX_NESTING,
+                    });
+                }
+            }
             b'/' if b.get(i + 1) == Some(&b'*') => {
-                let (end, marks) = block_comment_end(b, i);
+                let (_, marks) = block_comment_end(b, i);
                 if marks > MAX_COMMENT_MARKS {
                     return Err(ConfigError::CommentTooBusy {
                         line: line_at(text, i).unwrap_or(0),
                         max: MAX_COMMENT_MARKS,
                     });
                 }
-                if quoted { i + 1 } else { end }
             }
-            b'"' if !quoted => {
-                string_until = string_end(b, i, 0).unwrap_or(b.len());
-                i + 1
-            }
-            // `#` opens a raw string (`#"…"#`) and also the keywords
-            // `#true`, `#null` and their kin, which open nothing.
-            b'#' if !quoted => {
-                let hashes = b[i..].iter().take_while(|c| **c == b'#').count();
-                if b.get(i + hashes) == Some(&b'"') {
-                    string_until = string_end(b, i + hashes, hashes).unwrap_or(b.len());
-                }
-                i + hashes
-            }
-            b'{' => {
-                depth += 1;
-                if depth > MAX_NESTING {
-                    return Err(ConfigError::TooDeep {
-                        line: line_at(text, i).unwrap_or(0),
-                        max: MAX_NESTING,
-                    });
-                }
-                i + 1
-            }
-            // A `}` too many is the parser's to reject, not this
-            // count's: it says nothing about how deep the file goes.
-            b'}' if !quoted => {
-                depth = depth.saturating_sub(1);
-                i + 1
-            }
-            _ => i + 1,
-        };
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -884,12 +865,8 @@ fn block_comment_end(b: &[u8], at: usize) -> (usize, usize) {
 /// by `hashes` `#` before it, or `None` where the string never ends.
 /// [`slashdash_marks`] steps over what it spans, and runs over text the
 /// parser has already accepted, so a string it steps over is one the
-/// parser read as a string too. [`check_bounds`] runs before the parse
-/// and takes the span for one thing: a `}` inside it closes nothing.
-/// Every `{` counts wherever it stands and every `/*` is measured, so
-/// the span can only err by ending before the parser's own string does
-/// and letting a `}` close what is still open; the multi-line rule
-/// below is what keeps it from that.
+/// parser read as a string too; [`check_bounds`] runs before the parse
+/// and trusts no span at all.
 ///
 /// A quoted string ends at the first `"` that is not escaped; a raw string
 /// has no escapes; either ends at a `"` followed by at least as many `#`
@@ -4696,15 +4673,13 @@ command "b""#
     }
 
     #[test]
-    fn the_pre_check_counts_braces_outside_comments() {
-        let braces = "{".repeat(MAX_NESTING * 4);
-        // A profile that grants what it says still parses, however many
-        // braces its comments hold, and a string may hold them too as
-        // long as the file does not read as deeper than the bound.
+    fn the_pre_check_counts_braces_wherever_they_stand() {
+        // A profile that grants what it says parses with the braces its
+        // nodes, strings and comments hold, up to the bound between
+        // them.
         for text in [
-            format!("// {braces}\ncommand \"true\"\n"),
-            format!("/* {braces} */\ncommand \"true\"\n"),
-            format!("/* /* {braces} */ */\ncommand \"true\"\n"),
+            format!("// {}\ncommand \"true\"\n", "{".repeat(MAX_NESTING)),
+            format!("/* {} */\ncommand \"true\"\n", "{".repeat(MAX_NESTING)),
             format!("command \"{}\"\n", "{".repeat(MAX_NESTING)),
             format!("command #\"{}\"#\n", "{".repeat(MAX_NESTING)),
             format!("command \"\"\"\n{}\n\"\"\"\n", "{".repeat(MAX_NESTING)),
@@ -4712,19 +4687,25 @@ command "b""#
         ] {
             assert!(parse(&text).is_ok(), "{text}");
         }
-        // Deliberately refused rather than trusted: the parser recovers
-        // from a string it cannot read and descends into the braces
-        // written inside it, so the count cannot skip them. No config
-        // that grants anything writes a string like this. Balanced
-        // inside the string is no better: a `}` there closes nothing.
+        // One more is refused wherever it stands. The parser recovers
+        // from a string it cannot read by descending into the braces
+        // written inside it, and which strings it cannot read is its
+        // own affair, so the count trusts no string and no comment,
+        // and lets no `}` give a `{` back. No config that grants
+        // anything writes any of these.
+        let over = "{".repeat(MAX_NESTING + 1);
         for text in [
-            format!("command \"{braces}\"\n"),
-            format!("command #\"{braces}\"#\n"),
-            format!("command \"\"\"\n{braces}\n\"\"\"\n"),
-            format!("command \"{}\"\n", "{}".repeat(MAX_NESTING * 4)),
+            format!("// {over}\ncommand \"true\"\n"),
+            format!("/* {over} */\ncommand \"true\"\n"),
+            format!("/* /* {over} */ */\ncommand \"true\"\n"),
+            format!("command \"{over}\"\n"),
+            format!("command #\"{over}\"#\n"),
+            format!("command \"\"\"\n{over}\n\"\"\"\n"),
+            format!("command \"{}\"\n", "{}".repeat(MAX_NESTING + 1)),
+            format!("{}\n", "dbus {\n}\n".repeat(MAX_NESTING + 1)),
         ] {
             assert!(
-                matches!(parse(&text), Err(ConfigError::TooDeep { .. })),
+                matches!(parse(&text), Err(ConfigError::TooDeep { max, .. }) if max == MAX_NESTING),
                 "{text}"
             );
         }
@@ -5133,6 +5114,8 @@ command "b""#
         // of them. Twenty of those is a nesting of 640 in 3.3 KB, and a
         // count that let the `}` close the `{` cleared it for the
         // parser, which recursed through it and aborted the process.
+        // The count now lets no `}` close anything, so the shapes here
+        // are refused for their `{` alone.
         let closes = format!(
             "{}x \"{}\"\n",
             "n {\n".repeat(MAX_NESTING),
@@ -5203,6 +5186,45 @@ command "b""#
                 matches!(parse(&text), Err(ConfigError::CommentTooBusy { .. })),
                 "{text:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_brace_or_a_comment_counts_wherever_recovery_would_read_it() {
+        // Four shapes that a count following the parser's own notion of
+        // where strings and comments are let through, and that the
+        // parser, recovering from a string it could not read, then
+        // descended into: two of any of them aborted a spawned thread
+        // and ten the main thread. Recovery cannot put a `{` or a `/*`
+        // into the text, so the count takes every one wherever it
+        // stands, and each of these is refused for its braces.
+        let open = "n {\n".repeat(MAX_NESTING);
+        let close = "}".repeat(MAX_NESTING);
+        for shape in [
+            format!("{open}x \"\"\"\n \\ \"\"\"\ny ##\"\"\"\n\"\"\"#\n{close}\n\"\"\"##\n"),
+            format!("{open}\"\n\"{close}"),
+            format!("{open}\"\"\"//\"{close}"),
+            format!("{open}x/*//\n"),
+        ] {
+            let text = shape.repeat(10);
+            assert!(
+                matches!(check_bounds(&text), Err(ConfigError::TooDeep { .. })),
+                "{shape:?}: {:?}",
+                check_bounds(&text)
+            );
+            assert!(
+                matches!(parse(&text), Err(ConfigError::TooDeep { .. })),
+                "{shape:?}"
+            );
+            // And on the stack a spawned thread has, where two of the
+            // shape were enough.
+            let on_small = std::thread::Builder::new()
+                .stack_size(2 << 20)
+                .spawn(move || matches!(parse(&text), Err(ConfigError::TooDeep { .. })))
+                .unwrap()
+                .join()
+                .unwrap();
+            assert!(on_small, "{shape:?}");
         }
     }
 

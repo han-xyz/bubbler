@@ -46,24 +46,33 @@ pub enum ConfigError {
         /// The bound it passed, [`crate::config::MAX_BYTES`].
         max: usize,
     },
-    /// `{` nested deeper than [`crate::config::MAX_NESTING`]. The KDL
-    /// parser descends by recursion, so a file deep enough overflows the
-    /// stack and aborts the process instead of failing to parse.
-    #[error("`{{` nested deeper than {max} at line {line}")]
+    /// More than [`crate::config::MAX_NESTING`] `{` in the text, counted
+    /// wherever they stand — in strings and comments too, and never
+    /// given back by a `}`. The KDL parser descends into `{` by
+    /// recursion, so a file deep enough overflows the stack and aborts
+    /// the process instead of failing to parse; and it recovers from a
+    /// string it cannot read by reading the inside as nodes, so no
+    /// string is trusted to hold its braces.
+    #[error(
+        "`{{` appears more than {max} times in the file (line {line}); braces are counted wherever they stand, strings and comments included"
+    )]
     TooDeep {
-        /// Line the bound was passed on, counting from one.
+        /// Line the brace past the bound is on, counting from one.
         line: u32,
         /// The bound it passed, [`crate::config::MAX_NESTING`].
         max: usize,
     },
-    /// A `/* */` comment holding more than
-    /// [`crate::config::MAX_COMMENT_MARKS`] `*` or `/`. The KDL parser
-    /// reads a block comment by recursing once per one of those, so a
-    /// comment busy enough overflows the stack and aborts the process
-    /// instead of being skipped.
-    #[error("a block comment opened at line {line} holds more than {max} `*` or `/`")]
+    /// A `/*` with more than [`crate::config::MAX_COMMENT_MARKS`] `*` or
+    /// `/` in the comment after it, measured wherever the `/*` stands —
+    /// inside a string too, for the reason [`Self::TooDeep`] gives. The
+    /// KDL parser reads a block comment by recursing once per one of
+    /// those, so a comment busy enough overflows the stack and aborts
+    /// the process instead of being skipped.
+    #[error(
+        "the `/*` at line {line} opens a comment holding more than {max} `*` or `/`; comments are measured wherever they open, strings included"
+    )]
     CommentTooBusy {
-        /// Line the comment opens on, counting from one.
+        /// Line the `/*` is on, counting from one.
         line: u32,
         /// The bound it passed, [`crate::config::MAX_COMMENT_MARKS`].
         max: usize,
