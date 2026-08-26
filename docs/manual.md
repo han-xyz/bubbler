@@ -2921,7 +2921,7 @@ none of its own.
   `config.kdl` would overflow the stack and abort bubbler with no diagnostic
   at all. bubbler pre-checks every configuration it reads and refuses one
   larger than 1 MiB or nested deeper than 32 braces, or holding a block
-  comment of more than 512 `*` or `/` (the parser recurses on each of those
+  comment of more than 128 `*` or `/` (the parser recurses on each of those
   too), naming the file; the check counts `{` outside comments against `}`
   outside strings and comments and is not a parser, and the recursion itself
   is upstream's (`kdl` 6.7.1).

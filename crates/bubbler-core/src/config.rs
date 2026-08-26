@@ -51,11 +51,10 @@ pub const MAX_NESTING: usize = 32;
 /// of `*` or `/` survives 2200 and aborts at 2500, and a mark between
 /// runs of text — two descents per mark, the worst shape — survives
 /// 1024 marks and aborts at 1500. On the 2 MiB stack of a spawned
-/// thread those are 512 and 256. The bound holds on the main thread
-/// bubbler parses on with room to spare in either shape; a library user
-/// parsing a comment this busy on a thread of its own is left the same
-/// margin only in the first.
-pub const MAX_COMMENT_MARKS: usize = 512;
+/// thread those are 512 and 256. The bound sits below the worst shape
+/// on the smaller stack, as [`MAX_NESTING`] does, so a library user
+/// parsing on a thread of its own keeps the same margin.
+pub const MAX_COMMENT_MARKS: usize = 128;
 
 /// Keys `env` may not set: the sandbox owns them.
 pub const RESERVED_ENV: &[&str] = &[
