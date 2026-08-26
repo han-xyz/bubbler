@@ -1157,7 +1157,7 @@ there:
     # keepassxc's config.kdl (its profile lists the line in the header)
     app-runtime "org.keepassxc.KeePassXC" mode=rw
     # the browser's, on the other side
-    app-runtime "org.keepassxc.KeePassXC"
+    app-runtime "org.keepassxc.KeePassXC" mode=ro
 
 Only the leaf `app/<id>` is ever bound, never `app/` itself and never
 `$XDG_RUNTIME_DIR`, which is where every instance's control socket lives.

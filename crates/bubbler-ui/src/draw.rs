@@ -301,7 +301,7 @@ fn detail(detail: &Detail, area: Rect, buf: &mut Buffer) {
         };
         let text = match &row.text {
             Some(text) => kdl_out::shorten(&crate::detail::flatten(text), room),
-            None => row.node.to_owned(),
+            None => kdl_out::shorten(row.node, room),
         };
         let style = match row.granted() {
             true => risk_style(risk),
@@ -734,6 +734,23 @@ mod tests {
         );
         // And the row below it, which needs no cutting, is untouched.
         assert!(lines[3].starts_with("│○ !  home-share      "), "{lines:?}");
+    }
+
+    /// The same, with a path in a wide script: the row is cut by the
+    /// columns it takes on screen, not by its character count, so the
+    /// mode is whole rather than half off the edge of the pane.
+    #[test]
+    fn a_share_named_in_a_wide_script_is_cut_by_the_columns_it_takes() {
+        let (_tmp, mut app) = editor_over("home-share \"文档/报告/2026\" mode=rw\nnetwork\n");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let lines = screen(&app, 80, 8);
+        // A wide character fills two cells, and the buffer this reads
+        // shows the second as a space; what matters is the mode, whole.
+        assert!(lines[2].contains("\" mode=rw"), "{:?}", lines[2]);
+        assert_eq!(
+            lines[2],
+            "│● !  home-share \"文 档 /报 …\" mode=rw││home-share  (wide)                        │"
+        );
     }
 
     #[test]

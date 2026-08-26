@@ -4,6 +4,8 @@
 
 use std::ffi::{OsStr, OsString};
 
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 use crate::config::{
     BusRule, Clipboard, Disabled, InstanceConfig, LintAllow, NestedX11, Node, Service, ShareMode,
     Userns, WaylandMode, X11Mode,
@@ -266,27 +268,29 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
     })
 }
 
-/// `node` cut to `max` characters for a display column, with the cut
-/// marked `…`. Where something follows the node's first quoted argument
-/// — the `mode=` of a share, a second argument, the brace closing a
-/// block — the cut is made *inside* that argument so what follows stays
-/// in view: a `home-share` whose mode fell off the end would hide the
-/// one thing the reader is looking for. A node with nothing after its
-/// argument, and one whose remainder does not fit on its own, is cut at
-/// the end as any other text would be. Display only: the result is not
-/// KDL the parser reads back.
+/// `node` cut to `max` columns on screen, with the cut marked `…`. Where
+/// something follows the node's first quoted argument — the `mode=` of a
+/// share, a second argument, the brace closing a block — the cut is made
+/// *inside* that argument so what follows stays in view: a `home-share`
+/// whose mode fell off the end would hide the one thing the reader is
+/// looking for. A node with nothing after its argument, and one whose
+/// remainder does not fit on its own, is cut at the end as any other
+/// text would be. Columns rather than characters, because a share named
+/// in Chinese is twice as wide as its character count and a line cut to
+/// the count would overflow the column it was cut for. Display only: the
+/// result is not KDL the parser reads back.
 pub fn shorten(node: &str, max: usize) -> String {
-    if node.chars().count() <= max {
+    if node.width() <= max {
         return node.to_owned();
     }
     if max == 0 {
         return String::new();
     }
     shorten_in_argument(node, max).unwrap_or_else(|| {
-        node.chars()
-            .take(max - 1)
-            .chain(std::iter::once('…'))
-            .collect()
+        let chars: Vec<char> = node.chars().collect();
+        // The `…` takes a column of the budget.
+        let kept = fits(&chars, max - 1);
+        chars[..kept].iter().chain(std::iter::once(&'…')).collect()
     })
 }
 
@@ -300,15 +304,15 @@ fn shorten_in_argument(node: &str, max: usize) -> Option<String> {
     if close + 1 == chars.len() {
         return None;
     }
+    let head = &chars[..=open];
+    let tail = &chars[close..];
     // The `…` takes a column of its own, between what is kept of the
     // argument and the closing quote.
-    let budget = max
-        .checked_sub(open + 1 + (chars.len() - close) + 1)
-        .filter(|b| *b > 0)?;
+    let budget = max.checked_sub(columns(head) + columns(tail) + 1)?;
+    let inner = &chars[open + 1..close];
+    let mut kept = fits(inner, budget);
     // Never end on a lone `\`, which would read as escaping the quote
     // the cut puts right after it.
-    let inner = &chars[open + 1..close];
-    let mut kept = budget.min(inner.len());
     while kept > 0
         && inner[..kept]
             .iter()
@@ -324,13 +328,29 @@ fn shorten_in_argument(node: &str, max: usize) -> Option<String> {
         return None;
     }
     Some(
-        chars[..=open]
-            .iter()
+        head.iter()
             .chain(&inner[..kept])
             .chain(std::iter::once(&'…'))
-            .chain(&chars[close..])
+            .chain(tail)
             .collect(),
     )
+}
+
+/// Columns `chars` takes on screen.
+fn columns(chars: &[char]) -> usize {
+    chars.iter().filter_map(|c| c.width()).sum()
+}
+
+/// How many of `chars` fit in `budget` columns.
+fn fits(chars: &[char], budget: usize) -> usize {
+    let mut used = 0;
+    for (i, c) in chars.iter().enumerate() {
+        used += c.width().unwrap_or(0);
+        if used > budget {
+            return i;
+        }
+    }
+    chars.len()
 }
 
 /// Index of the `"` closing the one at `open`, honouring `\"` inside it.
@@ -346,10 +366,20 @@ fn closing_quote(chars: &[char], open: usize) -> Option<usize> {
     None
 }
 
+/// `node` without the trailing `mode=` a share is written with, for a
+/// message that names the node and the two modes it was granted in
+/// separately: a header stating one of them would read as settled. A
+/// node carrying no mode comes back as it is.
+pub(crate) fn without_mode(node: &str) -> &str {
+    node.strip_suffix(" mode=ro")
+        .or_else(|| node.strip_suffix(" mode=rw"))
+        .unwrap_or(node)
+}
+
 /// The `mode=` value of a share. Written on every share, default or
 /// not: how wide a bind is open is what a reader of the file is looking
 /// for, and a node that says nothing leaves them to remember the default.
-fn share_mode(mode: ShareMode) -> &'static str {
+pub(crate) fn share_mode(mode: ShareMode) -> &'static str {
     match mode {
         ShareMode::ReadOnly => "ro",
         ShareMode::ReadWrite => "rw",
@@ -851,6 +881,37 @@ mod tests {
             shorten(r#"home-share "a\\b" mode=ro"#, 24),
             r#"home-share "a…" mode=ro"#
         );
+    }
+
+    /// `max` is columns on screen, not characters: a share named in
+    /// Chinese is twice as wide as its character count, and a cut that
+    /// counted characters would hand the pane a line that overflows and
+    /// gets its mode clipped off after all.
+    #[test]
+    fn a_node_is_never_cut_to_more_columns_than_it_was_given() {
+        use unicode_width::UnicodeWidthStr;
+
+        assert_eq!(
+            shorten(r#"home-share "文档/报告/2026" mode=rw"#, 29),
+            r#"home-share "文档/报…" mode=rw"#
+        );
+        for node in [
+            r#"home-share "文档/报告/2026" mode=rw"#,
+            r#"home-share "Documents/Reports/2026" mode=rw"#,
+            r#"app-runtime "org.keepassxc.KeePassXC" mode=ro"#,
+            r#"etc-share "a-very-long-entry-name""#,
+            r#"dbus { talk "ca.desrt.dconf" }"#,
+            "wayland",
+        ] {
+            for max in 0..60 {
+                let short = shorten(node, max);
+                assert!(
+                    short.width() <= max,
+                    "`{short}` is {} columns, not {max}, from `{node}`",
+                    short.width()
+                );
+            }
+        }
     }
 
     #[test]

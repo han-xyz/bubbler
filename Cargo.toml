@@ -37,6 +37,10 @@ signal-hook = "0.3"
 libseccomp = "0.4"
 wayrs-client = "1"
 wayrs-protocols = { version = "0.14", features = ["security-context-v1"] }
+# Display width of a string, for the columns a node is shortened to fit.
+# Already in the tree through ratatui; the East-Asian width tables it
+# carries are not worth hand-rolling.
+unicode-width = "0.2"
 # Build-time only: the wl-proxy generates its interface tables from the XML
 # the wayrs crates ship, so the tables track the versions Cargo.lock pins.
 wayrs-proto-parser = "3"

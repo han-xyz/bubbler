@@ -809,7 +809,8 @@ impl Merged {
         };
         if held_mode != mode {
             let node = kdl_out::service(svc).unwrap_or_else(|_| name.to_owned());
-            return Err(mode_conflict(&node, held_mode, held_src, mode, src));
+            let node = kdl_out::without_mode(&node);
+            return Err(mode_conflict(node, held_mode, held_src, mode, src));
         }
         Ok(true)
     }
@@ -1001,14 +1002,10 @@ fn app_runtime(s: &Service) -> Option<(&str, ShareMode)> {
 }
 
 fn mode_conflict(node: &str, a: ShareMode, a_src: &Src, b: ShareMode, b_src: &Src) -> ProfileError {
-    let word = |m| match m {
-        ShareMode::ReadOnly => "ro",
-        ShareMode::ReadWrite => "rw",
-    };
     ProfileError::Conflict {
         node: node.to_owned(),
-        a: format!("mode={} in {}", word(a), a_src.label),
-        b: format!("mode={} in {}", word(b), b_src.label),
+        a: format!("mode={} in {}", kdl_out::share_mode(a), a_src.label),
+        b: format!("mode={} in {}", kdl_out::share_mode(b), b_src.label),
     }
 }
 
@@ -2019,7 +2016,9 @@ mod tests {
         let ProfileError::Conflict { node, a, b } = &err else {
             panic!("{err:?}")
         };
-        assert_eq!(node, "home-share \"D\" mode=rw");
+        // The header names the node, never one of the two modes: it is
+        // the modes that are in dispute, and `a`/`b` below say them.
+        assert_eq!(node, "home-share \"D\"");
         assert!(a.contains("mode=ro") && a.contains("b.kdl"), "{a}");
         assert!(b.contains("mode=rw") && b.contains("a.kdl"), "{b}");
 
@@ -2035,7 +2034,7 @@ mod tests {
         let ProfileError::Conflict { node, a, b } = &err else {
             panic!("{err:?}")
         };
-        assert_eq!(node, "path-share \"/kioxia/Steam\" mode=ro");
+        assert_eq!(node, "path-share \"/kioxia/Steam\"");
         assert!(a.contains("mode=rw") && a.contains("b.kdl"), "{a}");
         assert!(b.contains("mode=ro") && b.contains("a.kdl"), "{b}");
 
@@ -2078,7 +2077,7 @@ mod tests {
         let ProfileError::Conflict { node, a, b } = &err else {
             panic!("{err:?}")
         };
-        assert_eq!(node, "app-runtime \"org.keepassxc.KeePassXC\" mode=ro");
+        assert_eq!(node, "app-runtime \"org.keepassxc.KeePassXC\"");
         assert!(a.contains("mode=rw") && a.contains("b.kdl"), "{a}");
         assert!(b.contains("mode=ro") && b.contains("a.kdl"), "{b}");
     }

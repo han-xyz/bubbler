@@ -6,6 +6,8 @@
 
 use std::ffi::OsStr;
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::bwrap::{Explained, Origin};
 use crate::config::{InstanceConfig, Lines, SeccompConfig, Service, WaylandMode, X11Mode};
 use crate::dbus;
@@ -383,21 +385,34 @@ fn seccomp_lines(cfg: &SeccompConfig) -> Vec<String> {
     out
 }
 
+/// `text` padded with spaces to `columns` on screen. `{:<n$}` counts
+/// characters, which would put a label named in a wide script out of
+/// line with the column beside it by its own width again.
+fn pad(text: &str, columns: usize) -> String {
+    let mut out = text.to_owned();
+    out.push_str(&" ".repeat(columns.saturating_sub(text.width())));
+    out
+}
+
 /// The view's title, then one block per node in emit order, then a
 /// summary line.
 pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigError> {
     let groups = groups(items, view)?;
     let width = |f: &dyn Fn(&Group) -> usize| groups.iter().map(f).max().unwrap_or(0);
-    let lw = width(&|g| g.label.chars().count());
-    let sw = width(&|g| g.source.chars().count());
+    let lw = width(&|g| g.label.width());
+    let sw = width(&|g| g.source.width());
     let mut out = vec![view.title.to_owned(), String::new()];
     let mut hidden = 0;
     for g in &groups {
         let n = g.len();
         let plural = if n == 1 { "argument" } else { "arguments" };
         let header = match sw {
-            0 => format!("  {:<lw$}  {n} {plural}", g.label),
-            _ => format!("  {:<lw$}  {:<sw$}  {n} {plural}", g.label, g.source),
+            0 => format!("  {}  {n} {plural}", pad(&g.label, lw)),
+            _ => format!(
+                "  {}  {}  {n} {plural}",
+                pad(&g.label, lw),
+                pad(&g.source, sw)
+            ),
         };
         out.push(header.trim_end().to_owned());
         let elide = !view.full && g.origin == Origin::Baseline;

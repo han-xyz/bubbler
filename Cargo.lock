@@ -124,6 +124,7 @@ dependencies = [
  "signal-hook",
  "tempfile",
  "thiserror",
+ "unicode-width 0.2.2",
  "wayrs-client",
  "wayrs-protocols",
 ]
