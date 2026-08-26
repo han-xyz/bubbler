@@ -68,7 +68,11 @@ impl Host for RealHost {
 
     /// The type is checked before the open, so a FIFO cannot park this
     /// on a writer that never comes and a device node is never read at
-    /// all. One byte over the cap is then refused rather than truncated:
+    /// all. The check is not a guarantee: the path could be replaced
+    /// between the `metadata` and the `open`. What this reads is sysfs
+    /// attributes under root-owned directories, where the only writer is
+    /// the kernel, and the cap bounds what a swap could cost anyway.
+    /// One byte over that cap is refused rather than truncated:
     /// a truncated `idVendor` is a device id that matches the wrong
     /// device. Sysfs reports every attribute as one page long and
     /// answers with fewer bytes, so the size is read, not stat'd.

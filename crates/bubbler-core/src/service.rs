@@ -129,9 +129,15 @@ pub fn apply_all(
     // has to follow them whatever order the nodes are written in.
     // `gamepad` binds the same tree, and one tree is one mount.
     if pad.is_none()
-        && let Some(i) = services
-            .iter()
-            .position(|s| matches!(s, Service::Usb { vendor: None, .. }))
+        && let Some(i) = services.iter().position(|s| {
+            matches!(
+                s,
+                Service::Usb {
+                    vendor: None,
+                    product: None
+                }
+            )
+        })
     {
         args.tag(Origin::Service(i));
         let all = require_dir(host, "usb", PathBuf::from(SYS_DEVICES))?;
@@ -731,9 +737,12 @@ const PCSCD_SOCKET: &str = "/run/pcscd/pcscd.comm";
 /// usbfs nodes and their own `/sys/devices` directories, resolved here
 /// and frozen — a device plugged in afterwards has no node inside. The
 /// bus directory is bound whole either way, because that is what an
-/// enumeration walks; the links in it that point at devices this grant
-/// did not bind dangle inside, which is what libusb sees for a device it
-/// may not touch.
+/// enumeration walks. On its own that leaves the links to every other
+/// device dangling, so an enumeration inside sees only what was granted;
+/// beside a grant that binds the device tree — `dri`'s PCI roots,
+/// `gamepad`'s whole `/sys/devices` — the links resolve again and the
+/// descriptors of every device are readable. What the filter decides
+/// either way is which node can be *opened*, which is the I/O.
 ///
 /// `index` is this node's position among `services`: the bus directory
 /// is one directory and one mount however many nodes the config holds,
@@ -747,16 +756,23 @@ fn usb(
     product: Option<&str>,
 ) -> Result<(), LaunchError> {
     let bus = PathBuf::from(USB_SYSFS);
-    let Some(vendor) = vendor else {
-        // The directory, not the nodes in it, exactly as `gamepad` binds
-        // `/dev/input`: a device plugged in later has a node inside. The
-        // device tree the rest of the grant needs is bound after every
-        // service, beside `gamepad`'s bind of it.
-        let dev = require_dir(host, "usb", PathBuf::from("/dev/bus/usb"))?;
-        args.dev_bind(&dev, &dev);
-        let bus = require_dir(host, "usb", bus)?;
-        args.ro_bind(&bus, &bus);
-        return Ok(());
+    let vendor = match (vendor, product) {
+        (None, None) => {
+            // The directory, not the nodes in it, exactly as `gamepad`
+            // binds `/dev/input`: a device plugged in later has a node
+            // inside. The device tree the rest of the grant needs is
+            // bound after every service, beside `gamepad`'s bind of it.
+            let dev = require_dir(host, "usb", PathBuf::from("/dev/bus/usb"))?;
+            args.dev_bind(&dev, &dev);
+            let bus = require_dir(host, "usb", bus)?;
+            args.ro_bind(&bus, &bus);
+            return Ok(());
+        }
+        // A product id with no vendor is that number from every vendor
+        // that ever used it, which the parser refuses to write. Built by
+        // hand it grants nothing, never the bare node's everything.
+        (None, Some(_)) => return Ok(()),
+        (Some(vendor), _) => vendor,
     };
     let first = services
         .iter()
@@ -807,31 +823,44 @@ fn usb(
             dir,
         );
     }
-    if found.is_empty() {
-        // Not a failure: the device this names is one the user plugs in,
-        // and a sandbox that starts without it is what they asked for
-        // everywhere else in the config.
-        match product {
-            Some(product) => eprintln!(
-                "bubbler: warning: usb: no device matches vendor={vendor} product={product}"
-            ),
-            None => eprintln!("bubbler: warning: usb: no device matches vendor={vendor}"),
-        }
-        return Ok(());
-    }
+    let mut bound = 0;
     for (node, dir) in found {
+        // A device unplugged between the walk and here has neither its
+        // node nor its directory left: it is passed over rather than
+        // reported, so an unplug never fails the launch. A path that is
+        // still there but of the wrong type is a host anomaly and not an
+        // unplug, and is refused below.
+        if host.file_type(&node).is_none() || host.file_type(&dir).is_none() {
+            continue;
+        }
         // `file_type` follows symlinks, but `/dev/bus/usb` is the
         // kernel's own directory, so a link there is the host's decision.
         let node = require(host, "usb", node, "a character device", |t| {
             t.is_char_device()
         })?;
-        // `-try`: the node is one this walk found a moment ago, and a
-        // device unplugged before the exec must not fail the launch.
-        args.dev_bind_try(&node, &node);
         let dir = require_dir(host, "usb", dir)?;
+        // `-try`: the node was there a moment ago, and a device unplugged
+        // before the exec must not fail the launch either.
+        args.dev_bind_try(&node, &node);
         args.ro_bind(&dir, &dir);
+        bound += 1;
+    }
+    if bound == 0 {
+        warn_no_match(vendor, product);
     }
     Ok(())
+}
+
+/// Say that a `usb` node bound nothing. Not a failure: the device it
+/// names is one the user plugs in, and a sandbox that starts without it
+/// is what every other grant does when the host has no such device.
+fn warn_no_match(vendor: &str, product: Option<&str>) {
+    match product {
+        Some(product) => {
+            eprintln!("bubbler: warning: usb: no device matches vendor={vendor} product={product}")
+        }
+        None => eprintln!("bubbler: warning: usb: no device matches vendor={vendor}"),
+    }
 }
 
 /// A sysfs attribute as the lower-case text it holds, which is how a
@@ -3770,6 +3799,96 @@ mod tests {
                 "{hidden} did not stop the match"
             );
         }
+    }
+
+    #[test]
+    fn a_usb_node_with_a_product_and_no_vendor_binds_nothing() {
+        // The parser refuses to write one — a product id alone is that
+        // number from every vendor — so this only reaches here from a
+        // service list built by hand. It is not the bare node, and the
+        // half of a filter it holds grants nothing.
+        let half = Service::Usb {
+            vendor: None,
+            product: Some("0c8d".to_owned()),
+        };
+        let a = argv_read(&[half], &usb_host(), &usb_links(), &usb_ids()).unwrap();
+        assert_eq!(binds(&a), [] as [&str; 0], "{:?}", binds(&a));
+    }
+
+    #[test]
+    fn a_matched_device_that_went_away_before_the_bind_is_passed_over() {
+        // Unplugged between the walk of the bus directory and the bind:
+        // neither the node nor the sysfs directory is there any more,
+        // and either one gone is the device gone.
+        for missing in ["/dev/bus/usb/001/003", USB_1_2] {
+            let host: Vec<_> = usb_host()
+                .into_iter()
+                .filter(|(p, _)| *p != missing)
+                .collect();
+            let a = argv_read(
+                &[usb_node(Some("0bb4"), Some("0c8d"))],
+                &host,
+                &usb_links(),
+                &usb_ids(),
+            )
+            .unwrap();
+            assert!(only_the_bus(&a), "{missing} still bound: {:?}", binds(&a));
+        }
+    }
+
+    #[test]
+    fn a_filtered_usb_beside_dri_leaves_every_descriptor_readable() {
+        // Every USB device hangs under a PCI root, and `dri` binds those
+        // roots whole, so with both grants an enumeration inside reads
+        // the sysfs descriptors of devices this filter never named. What
+        // the filter still decides is which node can be opened, which is
+        // the I/O: the other devices' `/dev/bus/usb` nodes are not here.
+        let mut host = usb_host();
+        host.extend([
+            ("/dev/dri", Dir),
+            ("/sys/dev/char", Dir),
+            ("/sys/devices/system/cpu", Dir),
+            ("/sys/devices/pci0000:00", Dir),
+        ]);
+        let a = argv_read(
+            &[Service::Dri, usb_node(Some("0bb4"), Some("0c8d"))],
+            &host,
+            &usb_links(),
+            &usb_ids(),
+        )
+        .unwrap();
+        assert_eq!(
+            binds(&a),
+            [
+                "--dev-bind",
+                "/dev/dri",
+                "/dev/dri",
+                "--ro-bind",
+                "/sys/dev/char",
+                "/sys/dev/char",
+                "--ro-bind",
+                "/sys/devices/system/cpu",
+                "/sys/devices/system/cpu",
+                // The root every device on the bus is under, this one
+                // included: the descriptors come with it.
+                "--ro-bind",
+                "/sys/devices/pci0000:00",
+                "/sys/devices/pci0000:00",
+                "--ro-bind",
+                "/sys/bus/usb",
+                "/sys/bus/usb",
+                "--dev-bind-try",
+                "/dev/bus/usb/001/003",
+                "/dev/bus/usb/001/003",
+                "--ro-bind",
+                USB_1_2,
+                USB_1_2,
+            ]
+        );
+        assert!(
+            !a.iter().any(|s| s == "/dev/bus/usb/001/004"),
+            "another device's node was bound: {a:?}"
+        );
     }
 
     #[test]

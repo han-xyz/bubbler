@@ -126,11 +126,10 @@ pub static GRANTS: &[Grant] = &[
                topology a compute runtime reads to find the GPUs and the memory near \
                them: `/sys/class/kfd`, `/sys/devices/virtual/kfd` and \
                `/sys/devices/system/node` (`/sys/devices/system/cpu` comes with `dri` \
-               already). Requires `dri`, and against that grant it costs nothing new: a \
-               compute job reads and writes the same GPU memory the render nodes already \
-               reach, so what the two share is what another application has left on the \
-               card. A host with no `/dev/kfd` fails the launch rather than running \
-               without it.",
+               already). Requires `dri`, and against that grant it costs nothing new: \
+               `compute` reaches the same GPU through the same driver as `dri` and adds \
+               no capture risk `dri` did not already carry. A host with no `/dev/kfd` \
+               fails the launch rather than running without it.",
         risk: Risk::Wide,
         grammar: "compute",
     },
@@ -198,7 +197,7 @@ pub static GRANTS: &[Grant] = &[
                its PIN it still refuses. A host with no `pcscd` socket fails the launch \
                rather than running without it: start `pcscd.socket` (package \
                `pcsclite`) when the launch reports the socket missing.",
-        risk: Risk::Wide,
+        risk: Risk::Outward,
         grammar: "smartcard",
     },
     Grant {
