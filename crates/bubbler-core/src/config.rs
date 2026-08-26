@@ -695,9 +695,10 @@ pub fn parse_profile(text: &str) -> Result<RawProfile, ConfigError> {
 /// stack and aborts the process instead of returning an error, and the
 /// text is measured before the parser is handed it.
 ///
-/// The measurement is a pre-check and not a parser: it counts `{` and
-/// `}` outside strings and comments and decides nothing about what the
-/// document means. Text it accepts may still be invalid KDL.
+/// The measurement is a pre-check and not a parser: it counts `{`
+/// outside comments against `}` outside strings and comments, and
+/// decides nothing about what the document means. Text it accepts may
+/// still be invalid KDL.
 pub fn parse_document(text: &str) -> Result<KdlDocument, ConfigError> {
     check_bounds(text)?;
     Ok(KdlDocument::parse(text)?)
@@ -712,10 +713,16 @@ pub fn parse_document(text: &str) -> Result<KdlDocument, ConfigError> {
 /// reads what was written inside it as nodes, descending into every `{`
 /// there; a count that trusted the string would have cleared text the
 /// parser then recurses through, and that is a stack overflow, which
-/// aborts the process rather than failing. The cost is that a string
-/// holding more than [`MAX_NESTING`] unbalanced `{` is refused, and no
-/// configuration that grants anything writes one. Comments are still
-/// stepped over: KDL never reads one back as nodes.
+/// aborts the process rather than failing. A `}` inside a string is
+/// let close nothing, though: a string the parser does read as a string
+/// closes nothing, so the `}` it holds would clear `{` that are still
+/// open. The count is therefore cumulative over the file — a `{` in a
+/// string is never closed, and several strings holding a few each add
+/// up — and a file whose strings hold more than [`MAX_NESTING`] `{`
+/// between them is refused; no configuration that grants anything
+/// writes one. Comments are stepped over, and only outside strings:
+/// KDL never reads a comment back as nodes, and a `/*` inside a string
+/// opens none — the braces after the string are the parser's.
 fn check_bounds(text: &str) -> Result<(), ConfigError> {
     if text.len() > MAX_BYTES {
         return Err(ConfigError::TooLarge {
@@ -725,11 +732,28 @@ fn check_bounds(text: &str) -> Result<(), ConfigError> {
     }
     let b = text.as_bytes();
     let mut depth: usize = 0;
+    // Just past the string being read, or nothing: inside it, a `}`
+    // closes nothing and a `/` opens no comment.
+    let mut string_until: usize = 0;
     let mut i = 0;
     while i < b.len() {
+        let quoted = i < string_until;
         i = match b[i] {
-            b'/' if b.get(i + 1) == Some(&b'/') => line_comment_end(b, i),
-            b'/' if b.get(i + 1) == Some(&b'*') => block_comment_end(b, i),
+            b'/' if !quoted && b.get(i + 1) == Some(&b'/') => line_comment_end(b, i),
+            b'/' if !quoted && b.get(i + 1) == Some(&b'*') => block_comment_end(b, i),
+            b'"' if !quoted => {
+                string_until = string_end(b, i, 0).unwrap_or(b.len());
+                i + 1
+            }
+            // `#` opens a raw string (`#"…"#`) and also the keywords
+            // `#true`, `#null` and their kin, which open nothing.
+            b'#' if !quoted => {
+                let hashes = b[i..].iter().take_while(|c| **c == b'#').count();
+                if b.get(i + hashes) == Some(&b'"') {
+                    string_until = string_end(b, i + hashes, hashes).unwrap_or(b.len());
+                }
+                i + hashes
+            }
             b'{' => {
                 depth += 1;
                 if depth > MAX_NESTING {
@@ -742,7 +766,7 @@ fn check_bounds(text: &str) -> Result<(), ConfigError> {
             }
             // A `}` too many is the parser's to reject, not this
             // count's: it says nothing about how deep the file goes.
-            b'}' => {
+            b'}' if !quoted => {
                 depth = depth.saturating_sub(1);
                 i + 1
             }
@@ -811,13 +835,13 @@ fn block_comment_end(b: &[u8], at: usize) -> usize {
 
 /// Index just past the string whose opening quote is at `quote`, opened
 /// by `hashes` `#` before it, or `None` where the string never ends.
-/// Read only by [`slashdash_marks`], which runs over text the parser has
-/// already accepted, so a string it steps over is one the parser read as
-/// a string too — unlike [`check_bounds`], which runs before the parse
-/// and trusts nothing.
+/// [`slashdash_marks`] steps over what it spans, and runs over text the
+/// parser has already accepted, so a string it steps over is one the
+/// parser read as a string too. [`check_bounds`] runs before the parse
+/// and takes the span only for where a `}` closes nothing: a span that
+/// is wrong there over-counts, which is the direction that refuses.
 ///
-/// A
-/// quoted string ends at the first `"` that is not escaped; a raw string
+/// A quoted string ends at the first `"` that is not escaped; a raw string
 /// has no escapes; either ends at a `"` followed by at least as many `#`
 /// as opened it. `"""` *and a newline* open the multi-line form, which
 /// holds lines of its own — a `"` among them ends nothing — and closes
@@ -4587,8 +4611,6 @@ command "b""#
             format!("command \"{}\"\n", "{".repeat(MAX_NESTING)),
             format!("command #\"{}\"#\n", "{".repeat(MAX_NESTING)),
             format!("command \"\"\"\n{}\n\"\"\"\n", "{".repeat(MAX_NESTING)),
-            // Balanced, so the file never reads as deep at all.
-            format!("command \"{}\"\n", "{}".repeat(MAX_NESTING * 4)),
             "dbus {\n    talk \"org.a.B\"\n}\ncommand \"true\"\n".to_owned(),
         ] {
             assert!(parse(&text).is_ok(), "{text}");
@@ -4596,11 +4618,13 @@ command "b""#
         // Deliberately refused rather than trusted: the parser recovers
         // from a string it cannot read and descends into the braces
         // written inside it, so the count cannot skip them. No config
-        // that grants anything writes a string like this.
+        // that grants anything writes a string like this. Balanced
+        // inside the string is no better: a `}` there closes nothing.
         for text in [
             format!("command \"{braces}\"\n"),
             format!("command #\"{braces}\"#\n"),
             format!("command \"\"\"\n{braces}\n\"\"\"\n"),
+            format!("command \"{}\"\n", "{}".repeat(MAX_NESTING * 4)),
         ] {
             assert!(
                 matches!(parse(&text), Err(ConfigError::TooDeep { .. })),
@@ -5003,6 +5027,36 @@ command "b""#
         // the parser reads the rest of the file as comment and says so.
         let commented = format!("/* c\r{}", "{".repeat(200_000));
         assert!(parse(&commented).is_err());
+    }
+
+    #[test]
+    fn a_closing_brace_inside_a_string_closes_nothing() {
+        // Thirty-two nodes open and a string of thirty-two `}` under
+        // them, which the parser reads as a string and so closes none
+        // of them. Twenty of those is a nesting of 640 in 3.3 KB, and a
+        // count that let the `}` close the `{` cleared it for the
+        // parser, which recursed through it and aborted the process.
+        let closes = format!(
+            "{}x \"{}\"\n",
+            "n {\n".repeat(MAX_NESTING),
+            "}".repeat(MAX_NESTING)
+        )
+        .repeat(20);
+        assert!(
+            matches!(check_bounds(&closes), Err(ConfigError::TooDeep { .. })),
+            "{:?}",
+            check_bounds(&closes)
+        );
+        assert!(matches!(parse(&closes), Err(ConfigError::TooDeep { .. })));
+        // A `/*` inside a string opens no comment either: the braces
+        // after the string are the parser's to read, not a comment's.
+        let opens = format!("x \"/*\" {}", "{".repeat(2000));
+        assert!(
+            matches!(check_bounds(&opens), Err(ConfigError::TooDeep { .. })),
+            "{:?}",
+            check_bounds(&opens)
+        );
+        assert!(matches!(parse(&opens), Err(ConfigError::TooDeep { .. })));
     }
 
     #[test]

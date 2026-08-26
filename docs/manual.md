@@ -2921,8 +2921,8 @@ none of its own.
   `config.kdl` would overflow the stack and abort bubbler with no diagnostic
   at all. bubbler pre-checks every configuration it reads and refuses one
   larger than 1 MiB or nested deeper than 32 braces, naming the file; the
-  check counts braces outside strings and comments and is not a parser, and
-  the recursion itself is upstream's (`kdl` 6.7.1).
+  check counts `{` outside comments against `}` outside strings and comments
+  and is not a parser, and the recursion itself is upstream's (`kdl` 6.7.1).
 - A generated desktop entry closes D-Bus activation for itself only: anything
   that activates the application's bus name directly still starts the host
   copy. See "Desktop entries".
