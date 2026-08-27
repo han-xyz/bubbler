@@ -8581,6 +8581,98 @@ fn real_allow_host_relays_a_listed_name_and_nothing_else() {
     }
 }
 
+/// The escape a review measured against the first version of this
+/// feature: the proxy's cgroup used to sit *inside* the sandbox's
+/// cgroup-namespace root, so an application with the default
+/// `userns "allow"` could mount cgroup2, see it, join it and have the
+/// whole network. bubbler now runs the sandbox in a `sandbox` leaf and
+/// the proxy in a `proxy` leaf beside it, which is outside anything the
+/// application can name.
+#[test]
+fn real_allow_host_survives_the_sandbox_mounting_cgroup2_for_itself() {
+    if !require_egress() || !require_host_program(UNSHARE) {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let instance = "egcg";
+    bubbler_live(tmp.path(), &init)
+        .args(["create", instance])
+        .status()
+        .unwrap();
+    // No `userns` node: the default is `allow`, which is what makes the
+    // mount below possible at all.
+    std::fs::write(
+        tmp.path()
+            .join(format!("data/bubbler/instances/{instance}/config.kdl")),
+        "network {\n    outbound \"deny\"\n    allow-host \"one.one.one.one\"\n}\n",
+    )
+    .unwrap();
+    let out = bubbler_live(tmp.path(), &init)
+        .args([
+            "run",
+            instance,
+            "--",
+            UNSHARE,
+            "--user",
+            "--map-root-user",
+            "--cgroup",
+            "--mount",
+            PYTHON,
+            "-c",
+            CGROUP_ESCAPE,
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let got = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{got}{err}");
+    let line = |name: &str| {
+        got.lines()
+            .find_map(|l| l.strip_prefix(&format!("{name} ")))
+            .unwrap_or_else(|| panic!("{name} missing from {got}{err}"))
+            .trim()
+            .to_owned()
+    };
+    // The mount itself is not what is defended against — the sandbox may
+    // have its own namespaces — so both answers are a pass. What matters
+    // is what it shows.
+    assert!(
+        line("mount") == "ok" || line("mount").starts_with("refused"),
+        "{got}{err}"
+    );
+    assert_eq!(line("visible"), "0", "{got}{err}");
+    assert_eq!(line("join"), "refused", "{got}{err}");
+    // And the two things the join would have bought.
+    assert!(line("direct").starts_with("refused"), "{got}{err}");
+    assert_eq!(line("dns"), "none", "{got}{err}");
+
+    // Teardown: bubbler moved itself back and took all three directories
+    // with it. Named by this instance, since other tests run their own
+    // sandboxes beside this one.
+    let own = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+    let own = own
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .unwrap()
+        .trim_start_matches('/');
+    let left: Vec<String> = std::fs::read_dir(Path::new("/sys/fs/cgroup").join(own))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(&format!("bubbler-{instance}-")))
+        .collect();
+    assert!(left.is_empty(), "cgroups left behind: {left:?}");
+}
+
+/// The escape probe [`real_allow_host_survives_the_sandbox_mounting_cgroup2_for_itself`]
+/// runs inside the sandbox.
+const CGROUP_ESCAPE: &str = include_str!("fixtures/cgroup_escape.py");
+
+/// The namespaces the escape needs are made with this, which is
+/// util-linux's and lives beside python in the sandbox's `/usr`.
+const UNSHARE: &str = "/usr/bin/unshare";
+
 /// The proxy, its argv and the seven variables are all in the
 /// explanation of a run that never happens, with the port as it will be:
 /// bubbler chooses it, so there is nothing to leave as a placeholder but
@@ -8653,11 +8745,14 @@ fn allow_host_explains_the_proxy_and_the_variables_without_running() {
         .find("reject with icmpx admin-prohibited")
         .unwrap_or_else(|| panic!("no reject in {text}"));
     assert!(cgroup < reject, "{text}");
+    // The leaf the proxy is in, never the one the sandbox is in: the
+    // rule that named the sandbox's would accept the application too.
     assert!(text.contains("bubbler-try-"), "{text}");
     assert!(
-        text.contains("-<pid>\" ip daddr 169.254.1.1 udp dport 53 accept"),
+        text.contains("-<pid>/proxy\" ip daddr 169.254.1.1 udp dport 53 accept"),
         "{text}"
     );
+    assert!(!text.contains("/sandbox\""), "{text}");
 
     // And the sidecar's own view of it.
     let out = bubbler(tmp.path())

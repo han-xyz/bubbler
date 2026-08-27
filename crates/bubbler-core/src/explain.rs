@@ -318,8 +318,9 @@ fn ruleset_lines(cfg: &NetworkConfig, instance: &str) -> Vec<String> {
 }
 
 /// The cgroup an explanation writes the `allow-host` rules around: the
-/// one a run of this instance would create, with the sandbox pid it
-/// cannot know yet left as `<pid>`.
+/// proxy leaf of the pair a run of this instance would create, with
+/// bubbler's own pid — which a run that is not happening does not have —
+/// left as `<pid>`.
 ///
 /// bubbler's own cgroup is read where it can be, since that is what
 /// decides the `level` the rule matches at and so what the block would
@@ -329,11 +330,7 @@ fn ruleset_lines(cfg: &NetworkConfig, instance: &str) -> Vec<String> {
 /// rather than shown wrong.
 fn placeholder_cgroup(instance: &str) -> Option<network::Cgroup> {
     let own = cgroup::own_path().unwrap_or_else(|_| "<own-cgroup>".to_owned());
-    let under = match own.is_empty() {
-        true => String::new(),
-        false => format!("{own}/"),
-    };
-    network::Cgroup::new(&format!("{under}bubbler-{instance}-<pid>")).ok()
+    network::Cgroup::new(&cgroup::placeholder(&own, instance)).ok()
 }
 
 /// The egress proxy an `allow-host` is served by, as the launcher will

@@ -28,7 +28,7 @@ use rustix::process::{
 use rustix::thread::{
     CapabilitiesSecureBits, CapabilitySet, CapabilitySets, LinkNameSpaceType, capabilities,
     clear_ambient_capability_set, configure_capability_in_ambient_set, move_into_link_name_space,
-    set_capabilities, set_capabilities_secure_bits,
+    set_capabilities, set_capabilities_secure_bits, set_no_new_privs,
 };
 use signal_hook::SigId;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
@@ -1363,12 +1363,18 @@ fn sandbox_namespaces(child_pid: i32) -> Result<SandboxNs, LaunchError> {
         ));
     }
     let user = owning_userns(net.as_fd()).map_err(|e| LaunchError::Io(net_path, e.into()))?;
-    // Opened from the same pid, after the check above: a pid that had
-    // been reused would have failed there, and the descriptor holds the
-    // namespace open from here on whatever happens to the pid.
     let mnt_path = PathBuf::from(format!("/proc/{child_pid}/ns/mnt"));
     let mnt = rustix::fs::open(&mnt_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
         .map_err(|e| LaunchError::Io(mnt_path, e.into()))?;
+    // Checked on its own descriptor and not left to the check above: a
+    // pid reused in the window between the two `open`s would give a
+    // mount namespace of a stranger's while the network namespace is
+    // still the sandbox's, and the proxy would be joined to both.
+    if same_namespace(mnt.as_fd(), Path::new("/proc/self/ns/mnt"))? {
+        return Err(LaunchError::Network(
+            "sandbox pid reused; refusing to join the host mount namespace".to_owned(),
+        ));
+    }
     Ok(SandboxNs { net, user, mnt })
 }
 
@@ -1611,18 +1617,14 @@ fn start_pasta(
     Ok(handle)
 }
 
-/// A run's egress proxy, and the cgroup that is the whole of its
-/// privilege.
+/// A run's egress proxy.
 ///
-/// The cgroup outlives the process by exactly one drop: a cgroup still
-/// holding a process cannot be removed, so the proxy is stopped first
-/// and the directory goes with the field below it.
+/// The cgroup it is in belongs to the run and outlives it: a cgroup
+/// still holding a process cannot be removed, so the handle is dropped
+/// — which stops the proxy — before the cgroup's own guard is.
 #[derive(Debug)]
 struct NetProxyHandle {
     child: Child,
-    /// Removed once the proxy is gone. Declared after `child` so it is
-    /// dropped after it, whatever [`Drop`] below leaves undone.
-    _cgroup: cgroup::SandboxCgroup,
     /// Set once the run has reaped the sidecar, which is what makes the
     /// notice appear once and stops the pid from being signalled after
     /// it has stopped being the proxy's.
@@ -1698,24 +1700,21 @@ impl NetworkSidecars {
 /// Give the sandbox's namespace its policy, its route and — for an
 /// `allow-host` — its one way out, in that order.
 ///
-/// The order is the whole of the safety here: the cgroup exists before
-/// the ruleset that names it, the ruleset is installed before pasta
-/// connects anything, and the proxy is listening before the caller
-/// releases the sandbox from its `--block-fd`. At no point is the
-/// sandbox both connected and unfiltered, and at no point can the
-/// application reach for a proxy that is not yet answering.
+/// The order is the whole of the safety here: `cgroup` was made before
+/// bwrap was spawned — earlier than the ruleset that names it, and early
+/// enough that the sandbox inherited the leaf beside it — the ruleset is
+/// installed before pasta connects anything, and the proxy is listening
+/// before the caller releases the sandbox from its `--block-fd`. At no
+/// point is the sandbox both connected and unfiltered, and at no point
+/// can the application reach for a proxy that is not yet answering.
 fn start_network(
     env: &Env,
     cfg: &NetworkConfig,
     child_pid: i32,
-    instance: &str,
+    cgroup: Option<&cgroup::SandboxCgroup>,
 ) -> Result<NetworkSidecars, LaunchError> {
     let ns = sandbox_namespaces(child_pid)?;
-    let cgroup = match cfg.allow_hosts.is_empty() {
-        true => None,
-        false => Some(cgroup::create(instance, child_pid)?),
-    };
-    install_rules(cfg, &ns, cgroup.as_ref().map(cgroup::SandboxCgroup::spec))?;
+    install_rules(cfg, &ns, cgroup.map(cgroup::SandboxCgroup::spec))?;
     let pasta = start_pasta(env, cfg, child_pid, &ns)?;
     let proxy = cgroup
         .map(|cgroup| start_net_proxy(cfg, &ns, cgroup))
@@ -1739,7 +1738,7 @@ fn start_network(
 fn start_net_proxy(
     cfg: &NetworkConfig,
     ns: &SandboxNs,
-    cgroup: cgroup::SandboxCgroup,
+    cgroup: &cgroup::SandboxCgroup,
 ) -> Result<NetProxyHandle, LaunchError> {
     let (ready, done) = rustix::pipe::pipe().map_err(|e| LaunchError::Data(e.into()))?;
     fcntl_setfd(&ready, FdFlags::CLOEXEC).map_err(|e| LaunchError::Data(e.into()))?;
@@ -1795,9 +1794,11 @@ fn start_net_proxy(
     // emptied, since `PR_SET_SECUREBITS` itself takes CAP_SETPCAP:
     // dropping first leaves nothing to set it with. Then the ambient
     // set is cleared and every set emptied, which needs no capability
-    // at all. Last, the parent-death signal so a bubbler that is killed
-    // takes the proxy with it, and `PR_SET_DUMPABLE 0` so nothing of
-    // the user's may attach to it.
+    // at all. `PR_SET_NO_NEW_PRIVS` then makes the bounding set moot:
+    // no `execve` from here can gain a privilege, whatever it finds.
+    // Last, the parent-death signal so a bubbler that is killed takes
+    // the proxy with it, and `PR_SET_DUMPABLE 0` so nothing of the
+    // user's may attach to it.
     unsafe {
         cmd.pre_exec(move || {
             let procs = BorrowedFd::borrow_raw(procs);
@@ -1825,23 +1826,23 @@ fn start_net_proxy(
                     inheritable: CapabilitySet::empty(),
                 },
             )?;
+            set_no_new_privs(true)?;
             set_parent_process_death_signal(Some(Signal::TERM))?;
             set_dumpable_behavior(DumpableBehavior::NotDumpable)?;
             Ok(())
         });
     }
     spawning(&[done.as_raw_fd()])?;
-    let child = cmd.spawn().map_err(|e| match e.kind() {
-        io::ErrorKind::NotFound => LaunchError::Network(format!(
-            "the egress proxy is not at {} inside the sandbox",
-            network::NET_PROXY_INSIDE
-        )),
-        _ => LaunchError::Spawn(e),
-    })?;
+    // Never `LaunchError::Spawn`, whose text names bwrap: everything the
+    // `pre_exec` closure returns — the `cgroup.procs` write, the three
+    // `setns`, the `prctl`s — arrives here as a failed spawn too, and a
+    // `NotFound` from one of those is not a missing binary either.
+    let child = cmd
+        .spawn()
+        .map_err(|e| LaunchError::Network(format!("starting the egress proxy: {e}")))?;
     // From here on every exit path stops the proxy through the handle.
     let mut handle = NetProxyHandle {
         child,
-        _cgroup: cgroup,
         exited: false,
     };
     // bubbler's own copy of the write end goes now, so a proxy that dies
@@ -2581,6 +2582,17 @@ pub fn run(
     // Before the argv is built, for the same reason the proxy is: a bind
     // whose source is not there is a failed start, not a warning.
     prepare_app_runtime(env, &inst.config.services)?;
+    // Before bwrap is spawned, and not later: bwrap never changes cgroup,
+    // so whatever cgroup it is started in becomes the root of the
+    // sandbox's cgroup namespace. This moves bubbler into the run's
+    // `sandbox` leaf, so the sandbox inherits it and the proxy's leaf
+    // beside it is outside anything the application can name. Dropped
+    // after the sidecars below, which is what puts bubbler back and
+    // removes the directories.
+    let net_cgroup = match isolated.filter(|c| !c.allow_hosts.is_empty()) {
+        Some(_) => Some(cgroup::create(&inst.name, std::process::id())?),
+        None => None,
+    };
     let argv = build_argv_on(env, inst, command, &mut alloc, stdio.ctty(), &RealHost)?;
     let stop = Arc::new(AtomicBool::new(false));
     // What `stop` becomes once a run has seen it: `stop` is cleared as
@@ -2662,7 +2674,7 @@ pub fn run(
     let mut network = match isolated {
         Some(cfg) => {
             let started = match info.as_ref() {
-                Some((child_pid, _)) => start_network(env, cfg, *child_pid, &inst.name),
+                Some((child_pid, _)) => start_network(env, cfg, *child_pid, net_cgroup.as_ref()),
                 None => Err(LaunchError::Network(
                     "bwrap reported no sandbox pid for pasta to attach to".to_owned(),
                 )),
@@ -2760,6 +2772,21 @@ mod tests {
     use crate::config::WaylandMode;
     use std::io::BufRead;
     use std::os::unix::net::UnixStream;
+
+    /// The pid the proxy's `pre_exec` writes into `cgroup.procs`, which
+    /// is formatted by hand because a forked child may not allocate. The
+    /// ends of the range and the one-digit case, since an off-by-one in
+    /// the buffer index would put the wrong process in the one cgroup
+    /// the filter accepts.
+    #[test]
+    fn the_pid_written_into_the_cgroup_is_formatted_exactly() {
+        let mut buf = [0u8; 10];
+        assert_eq!(decimal(1, &mut buf), b"1");
+        assert_eq!(decimal(0, &mut buf), b"0");
+        assert_eq!(decimal(4194304, &mut buf), b"4194304");
+        // The widest a pid can be, which fills the buffer exactly.
+        assert_eq!(decimal(i32::MAX, &mut buf), b"2147483647");
+    }
 
     /// An `Env` whose `$BUBBLER_INIT` points at a stand-in binary, so
     /// argv building does not depend on where the test binary lives.
