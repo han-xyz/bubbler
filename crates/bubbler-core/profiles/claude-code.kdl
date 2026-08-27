@@ -1,0 +1,36 @@
+// bubbler profile: claude-code
+//
+// Claude Code installed the native way: `~/.local/bin/claude` is a
+// symlink into `~/.local/share/claude/versions/`, and both are shared
+// read-only, the link resolved on the host. Updating happens on the
+// host; inside, DISABLE_AUTOUPDATER stops the attempt against a
+// read-only tree. Installed from a package instead (`/usr/bin/claude`),
+// drop both `home-share` nodes and write `command "claude"`.
+//
+// Start it from the project:
+//     cd <project> && bubbler run claude-code --share .
+// The share is for that run only, and the sandbox starts in it.
+//
+// The private home holds its own `~/.claude`: log in once inside
+// (`/login`, copy the URL into a host browser, paste the code back), or
+// copy `~/.claude/.credentials.json` into the instance home yourself.
+// The host's `~/.claude` — history, settings, credentials — is never
+// visible.
+//
+// Deliberately absent: an ssh agent, a keyring, the host's dotfiles, a
+// display. `git` over SSH needs a key in the private home. The editor
+// bridge (`/ide`) listens on the host's loopback and does not cross the
+// network namespace.
+//
+// `userns "disable"`: bubbler is the boundary. Claude Code's own
+// bubblewrap sandbox warns and is skipped; a Playwright or Chromium MCP
+// server needs `userns "allow"` instead.
+//
+// Other switches, as `env` nodes: DISABLE_TELEMETRY="1",
+// CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1".
+network
+userns "disable"
+env DISABLE_AUTOUPDATER="1"
+home-share ".local/bin/claude" mode=ro
+home-share ".local/share/claude" mode=ro
+command "/home/bubbler/.local/bin/claude"

@@ -22,8 +22,10 @@ use crate::tty::TtyMode;
 
 /// Names of all built-in profiles, sorted.
 pub const NAMES: &[&str] = &[
+    "agent",
     "alacritty",
     "chromium",
+    "claude-code",
     "code",
     "firefox",
     "generic",
@@ -55,8 +57,10 @@ pub const MAX_DEPTH: usize = 8;
 /// KDL text of a built-in profile, if the name is known.
 pub fn lookup(name: &str) -> Option<&'static str> {
     match name {
+        "agent" => Some(include_str!("../profiles/agent.kdl")),
         "alacritty" => Some(include_str!("../profiles/alacritty.kdl")),
         "chromium" => Some(include_str!("../profiles/chromium.kdl")),
+        "claude-code" => Some(include_str!("../profiles/claude-code.kdl")),
         "code" => Some(include_str!("../profiles/code.kdl")),
         "firefox" => Some(include_str!("../profiles/firefox.kdl")),
         "generic" => Some(include_str!("../profiles/generic.kdl")),
@@ -1462,10 +1466,20 @@ mod tests {
         assert_eq!(x11, ["lutris", "steam"]);
         // Proton, umu and pressure-vessel nest their own bubblewrap, and a
         // browser's, Electron's or CEF's inner sandbox is a user namespace
-        // too; the door is shut only where nothing inside needs it.
+        // too; the door is shut only where nothing inside needs it. An
+        // agent's own sandbox is the deliberate exception: bubbler is
+        // the boundary, and the inner one warns and is skipped.
         assert_eq!(
             closed,
-            ["alacritty", "keepassxc", "kitty", "libreoffice", "mpv"]
+            [
+                "agent",
+                "alacritty",
+                "claude-code",
+                "keepassxc",
+                "kitty",
+                "libreoffice",
+                "mpv"
+            ]
         );
     }
 

@@ -16,7 +16,7 @@ use kdl::{KdlDocument, KdlNode};
 
 use crate::config;
 use crate::desktop;
-use crate::env::Env;
+use crate::env::{Env, SANDBOX_HOME};
 use crate::error::{LintError, ReadError};
 use crate::host::Host;
 use crate::profile::Resolver;
@@ -1501,7 +1501,14 @@ fn is_nester(argv0: &str) -> bool {
 fn on_path(ctx: &Context, argv0: &str) -> bool {
     let path = Path::new(argv0);
     if path.components().count() > 1 {
-        return ctx.host.file_type(path).is_some();
+        // A command written for the inside of the sandbox names the
+        // private home by its own path; the file it names lives under
+        // this host's `$HOME`.
+        let host_path = match path.strip_prefix(SANDBOX_HOME) {
+            Ok(rest) => ctx.env.home.join(rest),
+            Err(_) => path.to_path_buf(),
+        };
+        return ctx.host.file_type(&host_path).is_some();
     }
     ctx.search_path
         .iter()
@@ -2349,6 +2356,26 @@ mod tests {
             assert_eq!(
                 ids(&lint(ctx, &["command \"/usr/bin/foot\""])),
                 [] as [&str; 0]
+            );
+        });
+    }
+
+    /// A profile writes `command` for the inside of the sandbox, where
+    /// the home is `SANDBOX_HOME`; the file it names lives under the
+    /// host's own `$HOME`, and that is where this host is asked about it.
+    #[test]
+    fn a_command_under_the_sandbox_home_is_looked_up_under_the_real_home() {
+        let (file, _, _) = fake::types();
+        let tool = env().home.join(".local/bin/tool");
+        let host = host().with(tool.to_str().expect("the test home is UTF-8"), file);
+        with(&host, |ctx| {
+            assert_eq!(
+                ids(&lint(ctx, &["command \"/home/bubbler/.local/bin/tool\""])),
+                [] as [&str; 0]
+            );
+            assert_eq!(
+                ids(&lint(ctx, &["command \"/home/bubbler/.local/bin/other\""])),
+                ["command-not-found"]
             );
         });
     }
