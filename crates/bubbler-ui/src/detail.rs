@@ -324,6 +324,15 @@ impl Detail {
         if matches!(target, Target::Disabled(_)) {
             kdl_out::node(&written).map_err(|e| e.to_string())?;
         }
+        // A row that adds an entry pushes rather than replaces it, and
+        // what makes two entries one node — the path of a share, the
+        // key of an `env` — is the parser's rule and not the editor's.
+        // So the parser is asked before the push: a buffer holding both
+        // renders to a config it refuses, which is the pane going blank
+        // with `given more than once` under it.
+        if matches!(target, Target::Add(_) | Target::Absent) && self.would_repeat(&written)? {
+            return Err(format!("`{}` is already there", flatten(text.trim())));
+        }
         self.write(written, target);
         self.refresh(env);
         Ok(())
@@ -343,6 +352,22 @@ impl Detail {
         self.remove(row.target);
         self.refresh(env);
         format!("removed {}", flatten(&text))
+    }
+
+    /// Whether the buffer already holds `written`, asked by rendering
+    /// the buffer with that node under it and reading it back: the
+    /// duplicate rule is the parser's, down to a share whose path is
+    /// written another way. Only a repeat is answered here — a buffer
+    /// that does not parse for some other reason is the pane's business
+    /// and not this line's.
+    fn would_repeat(&self, written: &Node) -> Result<bool, String> {
+        let mut text = kdl_out::render(&self.buf).map_err(|e| e.to_string())?;
+        text.push_str(&kdl_out::node(written).map_err(|e| e.to_string())?);
+        text.push('\n');
+        Ok(matches!(
+            config::parse(&text),
+            Err(config::ConfigError::Duplicate(_))
+        ))
     }
 
     /// Put what was written into the buffer, over the node the row names
@@ -1056,6 +1081,34 @@ mod tests {
         let e = detail.apply(&env, "teleport").unwrap_err();
         assert!(!e.is_empty(), "the parser's own reason is passed on");
         assert!(!detail.dirty(), "nothing refused was applied");
+    }
+
+    /// A row that adds an entry pushes rather than replaces, so an
+    /// entry the buffer already holds would make a config the parser
+    /// refuses — and the pane would go blank with the parser's words
+    /// under it. The prompt says so in a sentence instead, and the
+    /// buffer is left as it was.
+    #[test]
+    fn writing_an_entry_that_is_already_there_says_so() {
+        let (_tmp, env, mut detail) = editing("home-share \"D\" mode=ro\n");
+        select(&mut detail, "home-share");
+        // The row that writes the *next* entry, which is the one that
+        // pushes; the row above it edits the entry that is there.
+        detail.selected += 1;
+        assert_eq!(detail.row().unwrap().target, Target::Add("home-share"));
+        for line in [
+            "home-share \"D\"",
+            "home-share \"D\" mode=rw",
+            "home-share \"D/\"",
+        ] {
+            let e = detail.apply(&env, line).unwrap_err();
+            assert_eq!(e, format!("`{line}` is already there"));
+            assert!(detail.trouble.is_none(), "{line}: {:?}", detail.trouble);
+            assert!(!detail.dirty(), "{line}: nothing refused was applied");
+        }
+        // A path the buffer does not hold is added like any other.
+        detail.apply(&env, "home-share \"E\"").unwrap();
+        assert_eq!(rows_for(&detail, "home-share").len(), 3);
     }
 
     #[test]
