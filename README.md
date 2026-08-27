@@ -101,7 +101,7 @@ published yet — AUR account registration is currently down. From source:
     target/release/bubbler man          > /usr/share/man/man1/bubbler.1
     target/release/bubbler man --config > /usr/share/man/man5/bubbler-config.5
 
-Build needs Rust 1.95+ and `libseccomp` (2.5.4+). Runtime: `bubblewrap` and a
+Build needs Rust 1.95+, a 64-bit target and `libseccomp` (2.5.4+). Runtime: `bubblewrap` and a
 kernel with user namespaces; `bubbler-wl-proxy` from the set above in front of
 every sandboxed `wayland`, which is not optional — a run stops without it;
 `xdg-dbus-proxy` for `dbus`/`system-bus`;

@@ -12,7 +12,9 @@ cargo build --release
 cargo build --release -p bubbler -p bubbler-init   # without the editor
 ```
 
-Links `libseccomp.so` (the only C dependency; no bindgen). Runtime:
+Links `libseccomp.so` (the only C dependency; no bindgen). 64-bit targets
+only: the KDL parser reserves 512 MiB of address space per read, which the
+build refuses to promise a 32-bit one. Runtime:
 `bwrap`, `xdg-dbus-proxy`, `pasta`, `nft` as the grants need them.
 
 ## Checks (all clean before every commit)

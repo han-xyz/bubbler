@@ -51,6 +51,15 @@ pub const MAX_BYTES: usize = 64 * 1024;
 /// 8 MiB main-thread stack from 13 411 bytes.
 pub const PARSER_STACK: usize = 512 << 20;
 
+// The reservation above is half a gibibyte of address space charged
+// every time a configuration is read, and a 32-bit process has under
+// four of them to charge it against: the parser thread would fail to
+// start on a machine with memory to spare. Refusing the build says so
+// once, where it can be read, rather than every run of every command
+// on the target.
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("bubbler reserves a 512 MiB parser stack and supports 64-bit targets only");
+
 /// Most `{` bubbler hands to the KDL parser in one file, counted
 /// wherever they stand: in strings and comments too, and never given
 /// back by a `}`. The deepest node bubbler defines is two levels

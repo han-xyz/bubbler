@@ -3111,6 +3111,10 @@ not know `mount_setattr`, so that rule would be skipped and the sandbox quietly
 weaker. A skipped name is printed (see "Seccomp"), so a too-old library is loud
 rather than silent, but it is still a downgrade.
 
+**64-bit targets only.** The build refuses a 32-bit one: the parser thread
+reserves 512 MiB of address space every time a configuration is read (see
+"Known gaps"), which a 32-bit process cannot spare.
+
 Requires `bwrap` at runtime and a kernel with user namespaces, plus `pasta`
 (the `passt` package) for any profile with an isolated `network` — which is
 every shipped profile that has one — and `nft` (the `nftables` package) for a
