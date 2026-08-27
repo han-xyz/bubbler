@@ -54,6 +54,7 @@ static USERNS: OnceLock<Option<String>> = OnceLock::new();
 static BWRAP: OnceLock<Option<String>> = OnceLock::new();
 static PASTA: OnceLock<Option<String>> = OnceLock::new();
 static NFT: OnceLock<Option<String>> = OnceLock::new();
+static CGROUP: OnceLock<Option<String>> = OnceLock::new();
 
 /// Run `probe` once, then print its reason on *every* call that finds it
 /// negative: a skipped test that says nothing is indistinguishable from
@@ -317,6 +318,75 @@ pub fn real_wl_proxy() -> Option<PathBuf> {
     }
     say(&format!("skipping: {} is not built", path.display()));
     None
+}
+
+/// The egress proxy binary beside the `bubbler` under test, or `None`
+/// (after printing why) when the workspace has not built it.
+///
+/// No test hands the path over, for the same reason [`real_wl_proxy`]
+/// does not: `network::net_proxy_program` looks beside the running
+/// `bubbler` before it looks at the installed path, and that is this
+/// very directory.
+pub fn real_net_proxy() -> Option<PathBuf> {
+    let path = Path::new(env!("CARGO_BIN_EXE_bubbler"))
+        .parent()
+        .expect("a cargo binary always has a parent directory")
+        .join("bubbler-net-proxy");
+    if path.is_file() {
+        return Some(path);
+    }
+    say(&format!("skipping: {} is not built", path.display()));
+    None
+}
+
+/// Returns false (after printing why) when an `allow-host` sandbox
+/// cannot be started here: it needs everything an `outbound "deny"` one
+/// needs, the proxy binary, python for the probe inside, and a
+/// delegated cgroup2 subtree to put the proxy in.
+pub fn require_egress() -> bool {
+    require_bwrap()
+        && require_pasta()
+        && require_nft()
+        && require_python()
+        && real_net_proxy().is_some()
+        && require_delegated_cgroup()
+}
+
+/// Whether this process may make a cgroup under its own, which is what
+/// the ruleset's `socket cgroupv2` match needs and what a systemd user
+/// session delegates. Probed by making one and removing it again: a
+/// `/sys/fs/cgroup` that is there says nothing about whether this user
+/// may write in it.
+fn require_delegated_cgroup() -> bool {
+    probed(&CGROUP, cgroup_is_delegated)
+}
+
+/// One cgroup created and removed under this process's own.
+fn cgroup_is_delegated() -> Option<String> {
+    let text = match std::fs::read_to_string("/proc/self/cgroup") {
+        Ok(text) => text,
+        Err(e) => return Some(format!("no /proc/self/cgroup: {e}")),
+    };
+    let Some(own) = text
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .map(|p| p.trim_start_matches('/'))
+    else {
+        return Some("this process is in no cgroup2 hierarchy".to_owned());
+    };
+    let dir = Path::new("/sys/fs/cgroup")
+        .join(own)
+        .join(format!("bubbler-probe-{}", std::process::id()));
+    match std::fs::create_dir(&dir) {
+        Ok(()) => {
+            let _ = std::fs::remove_dir(&dir);
+            None
+        }
+        Err(e) => Some(format!(
+            "no delegated cgroup2 subtree ({}): {e}",
+            dir.display()
+        )),
+    }
 }
 
 /// How long a program this test wrote is given to stop being busy.

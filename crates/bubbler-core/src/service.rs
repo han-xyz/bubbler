@@ -58,7 +58,7 @@ pub fn apply_all(
         match s {
             Service::Wayland(_) => wayland(env, args, host, !has_x11, ctx.wayland)?,
             Service::X11(mode) => x11(env, args, host, mode)?,
-            Service::Network(cfg) => network(args, host, cfg)?,
+            Service::Network(cfg) => network(env, args, host, cfg)?,
             Service::HomeShare { path, mode } => home_share(env, args, host, path, *mode)?,
             Service::Dri => dri(args, host)?,
             Service::Pipewire => pipewire(env, args, host)?,
@@ -202,7 +202,18 @@ fn require_exists(
 /// A generated file rather than the host's, except under `"host"` with no
 /// `dns` child: the host's `/etc/resolv.conf` may name a resolver on its
 /// own loopback, which a sandbox with its own namespace can never reach.
-fn network(args: &mut BwrapArgs, host: &dyn Host, cfg: &NetworkConfig) -> Result<(), LaunchError> {
+///
+/// An `allow-host` adds the two halves of the egress proxy that belong
+/// to the sandbox's own argv: the binary, bound where the sidecar execs
+/// it from after joining this mount namespace, and the seven variables
+/// that tell the application where it listens. The proxy process itself
+/// is the launcher's, like pasta.
+fn network(
+    env: &Env,
+    args: &mut BwrapArgs,
+    host: &dyn Host,
+    cfg: &NetworkConfig,
+) -> Result<(), LaunchError> {
     if cfg.mode == NetworkMode::Host {
         args.share_net();
     }
@@ -213,6 +224,21 @@ fn network(args: &mut BwrapArgs, host: &dyn Host, cfg: &NetworkConfig) -> Result
             args.ro_bind(&p, &p);
         }
         None => {}
+    }
+    if !cfg.allow_hosts.is_empty() {
+        // Bound whatever it is and wherever it was found: the installed
+        // path is visible in here anyway, and one path for every build
+        // keeps the argv the launcher execs and the argv `--explain`
+        // prints the same. A missing binary fails the launch here,
+        // before a sandbox is started that would be pointed at a proxy
+        // nothing runs.
+        let (program, _) = network::net_proxy_program(env, host)?;
+        args.ro_bind(&program, Path::new(network::NET_PROXY_INSIDE));
+        // The port is fixed ([`network::PROXY_PORT`]), so these are
+        // exact in a `--dry-run` that starts nothing.
+        for (name, value) in network::proxy_env(network::PROXY_PORT) {
+            args.setenv(OsStr::new(&name), OsStr::new(&value));
+        }
     }
     Ok(())
 }

@@ -116,6 +116,7 @@ struct Explaining {
     format: Format,
     proxy: bool,
     wl_proxy: bool,
+    net_proxy: bool,
 }
 
 /// bubblewrap-based application sandbox.
@@ -178,6 +179,10 @@ that same argv grouped under the config node each argument came from.")]
         /// instead of the sandbox's.
         #[arg(long, requires = "explain", conflicts_with = "proxy")]
         wl_proxy: bool,
+        /// With `--explain`: explain the egress proxy sidecar's argv
+        /// instead of the sandbox's.
+        #[arg(long, requires = "explain", conflicts_with_all = ["proxy", "wl_proxy"])]
+        net_proxy: bool,
         /// With `--explain`: `text` to read, `json` for tooling.
         #[arg(
             long,
@@ -241,6 +246,10 @@ warning when it is not.")]
         /// instead of the sandbox's.
         #[arg(long, requires = "explain", conflicts_with = "proxy")]
         wl_proxy: bool,
+        /// With `--explain`: explain the egress proxy sidecar's argv
+        /// instead of the sandbox's.
+        #[arg(long, requires = "explain", conflicts_with_all = ["proxy", "wl_proxy"])]
+        net_proxy: bool,
         /// With `--explain`: `text` to read, `json` for tooling.
         #[arg(
             long,
@@ -642,8 +651,8 @@ fn explain(
     ctty: bool,
     opts: &Explaining,
 ) -> Result<i32> {
-    let (title, items) = match (opts.proxy, opts.wl_proxy) {
-        (true, _) => (
+    let (title, items) = match (opts.proxy, opts.wl_proxy, opts.net_proxy) {
+        (true, _, _) => (
             "bwrap  (the D-Bus proxy sidecar)",
             launcher::explain_proxy(env, inst)
                 .context("building the proxy's bwrap arguments")?
@@ -654,7 +663,7 @@ fn explain(
                     )
                 })?,
         ),
-        (_, true) => (
+        (_, true, _) => (
             "bwrap  (the Wayland proxy sidecar)",
             launcher::explain_wayland_proxy(env, inst)
                 .context("building the Wayland proxy's bwrap arguments")?
@@ -662,6 +671,18 @@ fn explain(
                     format!(
                         "instance `{}` grants no sandboxed wayland, so it starts no \
                          Wayland proxy sidecar",
+                        inst.name
+                    )
+                })?,
+        ),
+        (_, _, true) => (
+            "bubbler-net-proxy  (the egress proxy sidecar)",
+            launcher::explain_net_proxy(env, inst)
+                .context("building the egress proxy's arguments")?
+                .with_context(|| {
+                    format!(
+                        "instance `{}` names no `allow-host`, so it starts no egress \
+                         proxy sidecar",
                         inst.name
                     )
                 })?,
@@ -695,7 +716,7 @@ fn explain(
         },
         rules: &rules,
         wl_proxy: wl_proxy.as_ref(),
-        proxy: opts.proxy || opts.wl_proxy,
+        proxy: opts.proxy || opts.wl_proxy || opts.net_proxy,
         full: opts.mode == Explain::Full,
     };
     let rendered = match opts.format {
@@ -1108,6 +1129,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             explain: explain_mode,
             proxy,
             wl_proxy,
+            net_proxy,
             format,
             tty,
             share,
@@ -1160,6 +1182,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                         format,
                         proxy,
                         wl_proxy,
+                        net_proxy,
                     },
                 );
             }
@@ -1206,6 +1229,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             explain: explain_mode,
             proxy,
             wl_proxy,
+            net_proxy,
             format,
             tty,
             share,
@@ -1236,6 +1260,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                         format,
                         proxy,
                         wl_proxy,
+                        net_proxy,
                     },
                 );
                 // The sandbox directory must outlive the explanation:

@@ -5,7 +5,7 @@
 //! only the descriptors it was meant to, and every sidecar is killed on
 //! every way out of a run.
 
-use std::ffi::{OsString, c_void};
+use std::ffi::{OsStr, OsString, c_void};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
@@ -21,11 +21,14 @@ use rustix::fs::{Access, AtFlags, MemfdFlags, Mode, OFlags};
 use rustix::io::{Errno, FdFlags, fcntl_dupfd_cloexec, fcntl_setfd};
 use rustix::ioctl::{self, Opcode};
 use rustix::pipe::{PipeFlags, pipe_with};
-use rustix::process::{Pid, Signal, kill_process, test_kill_process};
+use rustix::process::{
+    DumpableBehavior, Pid, Signal, kill_process, set_dumpable_behavior,
+    set_parent_process_death_signal, test_kill_process,
+};
 use rustix::thread::{
-    CapabilitiesSecureBits, CapabilitySet, LinkNameSpaceType, capabilities,
-    configure_capability_in_ambient_set, move_into_link_name_space, set_capabilities,
-    set_capabilities_secure_bits,
+    CapabilitiesSecureBits, CapabilitySet, CapabilitySets, LinkNameSpaceType, capabilities,
+    clear_ambient_capability_set, configure_capability_in_ambient_set, move_into_link_name_space,
+    set_capabilities, set_capabilities_secure_bits,
 };
 use signal_hook::SigId;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
@@ -40,7 +43,7 @@ use crate::host::{Host, RealHost};
 use crate::instance::Instance;
 use crate::tty::{self, Pty, RawGuard, RelayEnd, StdioTarget, TtyMode};
 use crate::wayland::{ProxyPlan, WaylandError};
-use crate::{dbus, exec, init_bin, network, seccomp, service, wayland};
+use crate::{cgroup, dbus, exec, init_bin, network, seccomp, service, wayland};
 
 /// How often a running sandbox is checked for having exited.
 const POLL: Duration = Duration::from_millis(100);
@@ -70,6 +73,15 @@ const PASTA_STOP: Duration = Duration::from_secs(1);
 /// How long `nft` has to install the outbound ruleset. Measured at 1.5 ms
 /// on this host, so this is a bound on a hang and not on the work.
 const NFT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the egress proxy has to report that it is listening. It
+/// binds one socket after three `setns` calls; this is a bound on a hang
+/// and not on the work.
+const NET_PROXY_READY: Duration = Duration::from_secs(5);
+
+/// How long the egress proxy may take to leave after SIGTERM before it
+/// is killed.
+const NET_PROXY_STOP: Duration = Duration::from_secs(5);
 
 /// How long the supervisor has to appear inside the sandbox before the
 /// run goes on without a pid to signal.
@@ -733,6 +745,59 @@ fn wl_proxy_args(
     Ok((args, command))
 }
 
+/// Where the `network` grant sits in the config, which is what the
+/// egress proxy's arguments are attributed to.
+fn network_node(services: &[Service]) -> Option<usize> {
+    services
+        .iter()
+        .position(|s| matches!(s, Service::Network(_)))
+}
+
+/// Every argument of the egress proxy's argv with what produced it, or
+/// `None` when the instance names no `allow-host` and so starts no
+/// proxy.
+///
+/// Not a bwrap argv like the other two sidecars': the proxy runs in the
+/// sandbox's own namespaces, which bubbler puts it in directly, so what
+/// there is to describe is the program and the arguments it is given.
+/// Nothing is started and nothing is created — the descriptor it will
+/// report readiness on is named rather than numbered.
+pub fn explain_net_proxy(
+    env: &Env,
+    inst: &Instance,
+) -> Result<Option<Vec<Explained>>, LaunchError> {
+    let (Some(cfg), Some(node)) = (
+        network_of(&inst.config.services).filter(|c| !c.allow_hosts.is_empty()),
+        network_node(&inst.config.services),
+    ) else {
+        return Ok(None);
+    };
+    // Probed like the sandbox's own argv, which binds this very path: an
+    // explanation that named a binary the run could not find would
+    // describe a launch that fails.
+    let (program, _) = network::net_proxy_program(env, &RealHost)?;
+    let mut items = vec![Explained {
+        origin: Origin::Command,
+        args: vec![OsString::from(network::NET_PROXY_INSIDE)],
+        note: Some(format!("bound read-only from {}", program.display())),
+    }];
+    let argv = network::net_proxy_argv(
+        cfg,
+        network::ProxyFds {
+            ready: OsStr::new("<ready-fd>"),
+            log: OsStr::new("2"),
+        },
+    );
+    // One option and its value to a line, which is how the grammar
+    // reads and how the launcher builds it.
+    items.extend(argv.chunks(2).map(|pair| Explained {
+        origin: Origin::Service(node),
+        args: pair.to_vec(),
+        note: None,
+    }));
+    Ok(Some(items))
+}
+
 /// A running proxy sidecar. Dropping every end of its `--fd` pipe that
 /// bubbler holds is what makes `xdg-dbus-proxy` exit, so the handle must
 /// outlive the sandbox that uses the socket.
@@ -1272,6 +1337,12 @@ struct SandboxNs {
     /// The user namespace that owns [`SandboxNs::net`], which is where a
     /// process holds the capabilities to configure it.
     user: OwnedFd,
+    /// `/proc/<child-pid>/ns/mnt`, which the egress proxy joins as well:
+    /// it resolves names through the sandbox's own `/etc/resolv.conf`
+    /// and sees the sandbox's filesystem and no more of the host's.
+    /// Owned by the same user namespace as [`SandboxNs::net`], so the
+    /// join costs no further capability.
+    mnt: OwnedFd,
 }
 
 /// Open the sandbox's network namespace and the user namespace that owns
@@ -1292,7 +1363,13 @@ fn sandbox_namespaces(child_pid: i32) -> Result<SandboxNs, LaunchError> {
         ));
     }
     let user = owning_userns(net.as_fd()).map_err(|e| LaunchError::Io(net_path, e.into()))?;
-    Ok(SandboxNs { net, user })
+    // Opened from the same pid, after the check above: a pid that had
+    // been reused would have failed there, and the descriptor holds the
+    // namespace open from here on whatever happens to the pid.
+    let mnt_path = PathBuf::from(format!("/proc/{child_pid}/ns/mnt"));
+    let mnt = rustix::fs::open(&mnt_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+        .map_err(|e| LaunchError::Io(mnt_path, e.into()))?;
+    Ok(SandboxNs { net, user, mnt })
 }
 
 /// Install the `outbound "deny"` ruleset in the sandbox's own network
@@ -1310,8 +1387,18 @@ fn sandbox_namespaces(child_pid: i32) -> Result<SandboxNs, LaunchError> {
 /// built from typed values in [`network::ruleset`] — a user string
 /// reaching this argv would be command injection into a process holding
 /// `CAP_NET_ADMIN` over the sandbox's namespaces.
-fn install_rules(cfg: &NetworkConfig, ns: &SandboxNs) -> Result<(), LaunchError> {
-    let Some(text) = network::ruleset(cfg, None) else {
+///
+/// `cgroup` is the one this run's egress proxy will join, and it must
+/// already exist: the rule carries a path but the kernel stores the id
+/// it resolves to, so a cgroup made after this would be matched by
+/// nothing. A config with an `allow-host` and no cgroup is refused
+/// below rather than filtered less than it asked for.
+fn install_rules(
+    cfg: &NetworkConfig,
+    ns: &SandboxNs,
+    cgroup: Option<&network::Cgroup>,
+) -> Result<(), LaunchError> {
+    let Some(text) = network::ruleset(cfg, cgroup) else {
         // Nothing to install where nothing is filtered — and nothing
         // either where the ruleset could not be written, which is a run
         // that asked to be filtered and would have had the whole
@@ -1522,6 +1609,271 @@ fn start_pasta(
         ));
     }
     Ok(handle)
+}
+
+/// A run's egress proxy, and the cgroup that is the whole of its
+/// privilege.
+///
+/// The cgroup outlives the process by exactly one drop: a cgroup still
+/// holding a process cannot be removed, so the proxy is stopped first
+/// and the directory goes with the field below it.
+#[derive(Debug)]
+struct NetProxyHandle {
+    child: Child,
+    /// Removed once the proxy is gone. Declared after `child` so it is
+    /// dropped after it, whatever [`Drop`] below leaves undone.
+    _cgroup: cgroup::SandboxCgroup,
+    /// Set once the run has reaped the sidecar, which is what makes the
+    /// notice appear once and stops the pid from being signalled after
+    /// it has stopped being the proxy's.
+    exited: bool,
+}
+
+impl NetProxyHandle {
+    /// Say, once, that the proxy is gone. The sandbox keeps running: its
+    /// filter is unchanged, so what it loses is the one way out it had,
+    /// and killing an application over that would lose whatever it has
+    /// not written out.
+    fn check(&mut self, warn: &tty::Warn) {
+        if self.exited {
+            return;
+        }
+        let Ok(Some(status)) = self.child.try_wait() else {
+            return;
+        };
+        self.exited = true;
+        warn.say(&format!(
+            "bubbler: warning: the egress proxy exited ({status}); the sandbox can reach \
+             none of its `allow-host` names\n"
+        ));
+    }
+}
+
+impl Drop for NetProxyHandle {
+    /// Stop the proxy and do not return until it is gone. It also holds
+    /// `PR_SET_PDEATHSIG`, but that only covers bubbler dying: a run
+    /// that ends normally must not leave a process inside the sandbox's
+    /// namespaces, and the cgroup cannot be removed while one is there.
+    fn drop(&mut self) {
+        if self.exited || !still_running(&mut self.child) {
+            return;
+        }
+        if let Some(pid) = i32::try_from(self.child.id()).ok().and_then(Pid::from_raw) {
+            let _ = kill_process(pid, Signal::TERM);
+        }
+        let deadline = Instant::now() + NET_PROXY_STOP;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => {}
+            }
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                break;
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+}
+
+/// What an isolated `network` starts once the sandbox has a pid: the
+/// ruleset, pasta, and — where the config names an `allow-host` — the
+/// egress proxy in its cgroup.
+struct NetworkSidecars {
+    pasta: PastaHandle,
+    proxy: Option<NetProxyHandle>,
+}
+
+impl NetworkSidecars {
+    /// Check on both sidecars, each of which says once that it is gone.
+    fn check(&mut self, warn: &tty::Warn) {
+        self.pasta.check(warn);
+        if let Some(proxy) = self.proxy.as_mut() {
+            proxy.check(warn);
+        }
+    }
+}
+
+/// Give the sandbox's namespace its policy, its route and — for an
+/// `allow-host` — its one way out, in that order.
+///
+/// The order is the whole of the safety here: the cgroup exists before
+/// the ruleset that names it, the ruleset is installed before pasta
+/// connects anything, and the proxy is listening before the caller
+/// releases the sandbox from its `--block-fd`. At no point is the
+/// sandbox both connected and unfiltered, and at no point can the
+/// application reach for a proxy that is not yet answering.
+fn start_network(
+    env: &Env,
+    cfg: &NetworkConfig,
+    child_pid: i32,
+    instance: &str,
+) -> Result<NetworkSidecars, LaunchError> {
+    let ns = sandbox_namespaces(child_pid)?;
+    let cgroup = match cfg.allow_hosts.is_empty() {
+        true => None,
+        false => Some(cgroup::create(instance, child_pid)?),
+    };
+    install_rules(cfg, &ns, cgroup.as_ref().map(cgroup::SandboxCgroup::spec))?;
+    let pasta = start_pasta(env, cfg, child_pid, &ns)?;
+    let proxy = cgroup
+        .map(|cgroup| start_net_proxy(cfg, &ns, cgroup))
+        .transpose()?;
+    Ok(NetworkSidecars { pasta, proxy })
+}
+
+/// Start the egress proxy inside the sandbox's namespaces and wait until
+/// it is listening.
+///
+/// The process bubbler forks holds nothing: it writes itself into the
+/// run's cgroup, joins the sandbox's user, network and mount namespaces,
+/// clears every capability set and locks `SECBIT_NOROOT`. What lets it
+/// out is the cgroup and only the cgroup — the ruleset accepts that and
+/// rejects the rest, so a bug in the proxy costs an attacker the names
+/// the config listed and no capability at all.
+///
+/// It is exec'd from [`network::NET_PROXY_INSIDE`], which the sandbox's
+/// own argv bound: after the mount join a host path of bubbler's
+/// resolves to nothing.
+fn start_net_proxy(
+    cfg: &NetworkConfig,
+    ns: &SandboxNs,
+    cgroup: cgroup::SandboxCgroup,
+) -> Result<NetProxyHandle, LaunchError> {
+    let (ready, done) = rustix::pipe::pipe().map_err(|e| LaunchError::Data(e.into()))?;
+    fcntl_setfd(&ready, FdFlags::CLOEXEC).map_err(|e| LaunchError::Data(e.into()))?;
+    // The write end is the one descriptor this spawn hands over, so it
+    // is the one exception to the sweep below.
+    fcntl_setfd(&done, FdFlags::empty()).map_err(|e| LaunchError::Data(e.into()))?;
+    let argv = network::net_proxy_argv(
+        cfg,
+        network::ProxyFds {
+            ready: &OsString::from(done.as_raw_fd().to_string()),
+            // The proxy's audit lines go where bubbler's own do.
+            log: OsStr::new("2"),
+        },
+    );
+    let mut cmd = Command::new(network::NET_PROXY_INSIDE);
+    cmd.args(&argv)
+        // Nothing of the host's environment: the proxy reads none of it,
+        // and every variable is one more thing crossing into the
+        // sandbox's namespaces.
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    let procs = cgroup.procs().as_raw_fd();
+    let (user, net, mnt) = (ns.user.as_raw_fd(), ns.net.as_raw_fd(), ns.mnt.as_raw_fd());
+    // SAFETY: the closure runs in the forked child between `fork` and
+    // `execve`, where only async-signal-safe calls are allowed. Every
+    // call in it is one syscall through rustix and allocates nothing —
+    // the pid is formatted into a stack buffer and `chdir` is handed a
+    // C string literal. The four descriptors are valid there because
+    // `fork` copies the descriptor table and the parent holds the
+    // cgroup handle and `ns` open across the spawn, so `borrow_raw`
+    // borrows descriptors nothing has closed.
+    //
+    // What the exec'd proxy ends up holding, and why each step is in
+    // this order. The pid goes into `cgroup.procs` first, while the
+    // process is still bubbler's own uid in bubbler's own namespaces:
+    // that is what the ruleset accepts, and doing it after the joins
+    // would write through a descriptor from a namespace that no longer
+    // matches. The user namespace is entered before the other two,
+    // since entering a network or mount namespace takes the
+    // capabilities its owning user namespace grants (`setns(2)`); the
+    // mount namespace is owned by the same one, so it costs nothing
+    // further. `chdir` follows the mount join because the inherited
+    // working directory is a host dentry, and a process in the
+    // sandbox's mount namespace holding one could walk back out through
+    // it. Only then are the capability sets emptied — the joins needed
+    // them. `SECBIT_NOROOT` stops the kernel from handing a uid-0
+    // `execve` a full set on top of that — bwrap's outer user namespace
+    // maps bubbler to 0, so without it the proxy would exec with every
+    // capability in the sandbox's user namespace — and `_LOCKED` keeps
+    // the child from undoing it. It is set *before* the sets are
+    // emptied, since `PR_SET_SECUREBITS` itself takes CAP_SETPCAP:
+    // dropping first leaves nothing to set it with. Then the ambient
+    // set is cleared and every set emptied, which needs no capability
+    // at all. Last, the parent-death signal so a bubbler that is killed
+    // takes the proxy with it, and `PR_SET_DUMPABLE 0` so nothing of
+    // the user's may attach to it.
+    unsafe {
+        cmd.pre_exec(move || {
+            let procs = BorrowedFd::borrow_raw(procs);
+            let mut buf = [0u8; 10];
+            rustix::io::write(
+                procs,
+                decimal(rustix::process::getpid().as_raw_nonzero().get(), &mut buf),
+            )?;
+            let user = BorrowedFd::borrow_raw(user);
+            let net = BorrowedFd::borrow_raw(net);
+            let mnt = BorrowedFd::borrow_raw(mnt);
+            move_into_link_name_space(user, Some(LinkNameSpaceType::User))?;
+            move_into_link_name_space(net, Some(LinkNameSpaceType::Network))?;
+            move_into_link_name_space(mnt, Some(LinkNameSpaceType::Mount))?;
+            rustix::process::chdir(c"/")?;
+            set_capabilities_secure_bits(
+                CapabilitiesSecureBits::NO_ROOT | CapabilitiesSecureBits::NO_ROOT_LOCKED,
+            )?;
+            clear_ambient_capability_set()?;
+            set_capabilities(
+                None,
+                CapabilitySets {
+                    effective: CapabilitySet::empty(),
+                    permitted: CapabilitySet::empty(),
+                    inheritable: CapabilitySet::empty(),
+                },
+            )?;
+            set_parent_process_death_signal(Some(Signal::TERM))?;
+            set_dumpable_behavior(DumpableBehavior::NotDumpable)?;
+            Ok(())
+        });
+    }
+    spawning(&[done.as_raw_fd()])?;
+    let child = cmd.spawn().map_err(|e| match e.kind() {
+        io::ErrorKind::NotFound => LaunchError::Network(format!(
+            "the egress proxy is not at {} inside the sandbox",
+            network::NET_PROXY_INSIDE
+        )),
+        _ => LaunchError::Spawn(e),
+    })?;
+    // From here on every exit path stops the proxy through the handle.
+    let mut handle = NetProxyHandle {
+        child,
+        _cgroup: cgroup,
+        exited: false,
+    };
+    // bubbler's own copy of the write end goes now, so a proxy that dies
+    // without writing gives the wait below an EOF instead of a deadline.
+    drop(done);
+    if !wait_ready(&ready, &mut handle.child, Instant::now() + NET_PROXY_READY) {
+        let what = match handle.child.try_wait() {
+            Ok(Some(status)) => format!("it exited ({status})"),
+            _ => format!("it did not report a listening socket within {NET_PROXY_READY:?}"),
+        };
+        return Err(LaunchError::Network(format!(
+            "the egress proxy did not start: {what}"
+        )));
+    }
+    Ok(handle)
+}
+
+/// `value` as decimal ASCII in `buf`, for the one write the proxy's
+/// `pre_exec` makes: formatting through `format!` there would allocate,
+/// which a forked child may not do.
+fn decimal(value: i32, buf: &mut [u8; 10]) -> &[u8] {
+    let mut value = value.unsigned_abs();
+    let mut at = buf.len();
+    loop {
+        at -= 1;
+        buf[at] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 || at == 0 {
+            break;
+        }
+    }
+    &buf[at..]
 }
 
 /// Open a directory bubbler itself created under `$XDG_RUNTIME_DIR`,
@@ -1996,8 +2348,9 @@ struct Watch<'a> {
     supervisor: Option<Pid>,
     /// Latched once a stop has been seen, for as long as the run lasts.
     stopping: &'a AtomicBool,
-    /// The pasta sidecar, where the run has one.
-    pasta: &'a mut Option<PastaHandle>,
+    /// The sidecars an isolated `network` started, where the run has
+    /// them.
+    network: &'a mut Option<NetworkSidecars>,
     /// Where a word about the sidecar goes without blocking the loop.
     warn: &'a tty::Warn,
 }
@@ -2009,8 +2362,8 @@ fn check_exit(child: &mut Child, w: &mut Watch<'_>) -> io::Result<Option<i32>> {
     if let Some(status) = child.try_wait()? {
         return Ok(Some(exit_code(status)));
     }
-    if let Some(pasta) = w.pasta.as_mut() {
-        pasta.check(w.warn);
+    if let Some(network) = w.network.as_mut() {
+        network.check(w.warn);
     }
     let Watch {
         stop,
@@ -2306,16 +2659,10 @@ pub fn run(
     // and one let go before its namespace is connected would start with
     // no network at all. A sandbox that cannot be connected is stopped
     // where it stands rather than run without what it was granted.
-    let mut pasta = match isolated {
+    let mut network = match isolated {
         Some(cfg) => {
             let started = match info.as_ref() {
-                // The ruleset first: a namespace gets its policy before
-                // it gets a route, so there is no window in which the
-                // sandbox is connected and unfiltered.
-                Some((child_pid, _)) => sandbox_namespaces(*child_pid).and_then(|ns| {
-                    install_rules(cfg, &ns)?;
-                    start_pasta(env, cfg, *child_pid, &ns)
-                }),
+                Some((child_pid, _)) => start_network(env, cfg, *child_pid, &inst.name),
                 None => Err(LaunchError::Network(
                     "bwrap reported no sandbox pid for pasta to attach to".to_owned(),
                 )),
@@ -2353,7 +2700,7 @@ pub fn run(
         stop: &stop,
         supervisor,
         stopping: &stopping,
-        pasta: &mut pasta,
+        network: &mut network,
         warn: &warn,
     };
     let code = match &master {

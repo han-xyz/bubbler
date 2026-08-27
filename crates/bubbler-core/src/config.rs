@@ -14,7 +14,7 @@ use kdl::{KdlDocument, KdlNode};
 pub use crate::error::{ConfigError, ReadError};
 pub use crate::network::{
     AllowHost, AllowOut, Cidr, Forward, HostPattern, Mode as NetworkMode, NetworkConfig, Outbound,
-    Proto,
+    PROXY_PORT, Proto,
 };
 pub use crate::seccomp::{Errno, SeccompConfig};
 pub use crate::tty::TtyMode;
@@ -2260,6 +2260,21 @@ fn parse_network(node: &KdlNode) -> Result<Service, ConfigError> {
              reachable already and no proxy runs",
         ));
     }
+    // pasta forwards a port by connecting to it inside the namespace
+    // (`pasta(1)`, "Handling of local traffic"), and inside the
+    // namespace that port is the egress proxy: the forward would publish
+    // bubbler's own proxy on the host's loopback for anything on the host
+    // to reach, with the sandbox's allowlist as the only thing between it
+    // and the names the proxy may dial.
+    if !cfg.allow_hosts.is_empty() && cfg.forwards.iter().any(|f| f.port == PROXY_PORT) {
+        return Err(bad(
+            node,
+            &format!(
+                "`allow-port {PROXY_PORT}` is the egress proxy's port under \
+                 `allow-host`: choose another port for the forward"
+            ),
+        ));
+    }
     Ok(Service::Network(cfg))
 }
 
@@ -3589,6 +3604,37 @@ mod tests {
         assert!(
             parse("network {\n    outbound \"deny\"\n    allow-host \"*.example.com\"\n}").is_ok()
         );
+    }
+
+    /// The proxy's own port cannot be forwarded in from the host beside
+    /// it: pasta would connect to it inside the namespace, which is the
+    /// proxy, and the host would have the sandbox's one way out.
+    /// Without an `allow-host` there is no proxy and the port is a port
+    /// like any other.
+    #[test]
+    fn the_proxy_port_cannot_be_forwarded_in_beside_an_allow_host() {
+        let with = format!(
+            "network {{\n    outbound \"deny\"\n    allow-host \"a.example\"\n    \
+             allow-port {PROXY_PORT}\n}}"
+        );
+        let err = parse(&with).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&format!("allow-port {PROXY_PORT}")),
+            "{err}"
+        );
+        let udp = format!(
+            "network {{\n    outbound \"deny\"\n    allow-host \"a.example\"\n    \
+             allow-port {PROXY_PORT} udp=#true\n}}"
+        );
+        assert!(parse(&udp).is_err());
+        assert!(parse(&format!("network {{\n    allow-port {PROXY_PORT}\n}}")).is_ok());
+        let near = format!(
+            "network {{\n    outbound \"deny\"\n    allow-host \"a.example\"\n    \
+             allow-port {}\n}}",
+            PROXY_PORT + 1
+        );
+        assert!(parse(&near).is_ok());
     }
 
     /// The proxy variables are bubbler's whether or not a config has an

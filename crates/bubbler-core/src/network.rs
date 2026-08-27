@@ -499,6 +499,72 @@ pub fn net_proxy_program(env: &Env, host: &dyn Host) -> Result<(PathBuf, Found),
     )
 }
 
+/// Where the egress proxy is bound inside the sandbox, and the path it
+/// is exec'd from once its `pre_exec` has joined the sandbox's mount
+/// namespace: a host path of bubbler's own resolves to nothing in
+/// there.
+///
+/// `/run` is a tmpfs the builder creates, like [`crate::bwrap::INIT_INSIDE`]
+/// beside it. Bound whatever the binary is and wherever it came from, so
+/// the argv the launcher builds and the one `--explain` prints name the
+/// same program.
+pub const NET_PROXY_INSIDE: &str = "/run/bubbler-net-proxy";
+
+/// The loopback port the egress proxy listens on inside the sandbox.
+///
+/// Fixed, and chosen by bubbler rather than by the proxy, because the
+/// seven variables that point the application at it are `--setenv`
+/// pairs of bwrap's argv — settled before the network namespace the
+/// proxy binds in exists at all (bwrap creates it and cannot join a
+/// namespace bubbler made first). The namespace is the sandbox's own
+/// and the application is still held at its `--block-fd` when the proxy
+/// binds, so nothing can be holding the port; an `allow-port` for the
+/// same number beside an `allow-host` is refused by the parser, since
+/// pasta forwards such a port by connecting to it *in the namespace*
+/// (`pasta(1)`, "Handling of local traffic") and would put the proxy on
+/// the host's loopback.
+pub const PROXY_PORT: u16 = 3128;
+
+/// The egress proxy's own argv, after the program name: what it may
+/// reach, where it listens, and the descriptors it answers on.
+///
+/// One place, so the process the launcher starts and the one
+/// `--explain` describes cannot drift apart. Every element comes from a
+/// typed value — a [`HostPattern`] renders as letters, digits, `-`, `.`
+/// and a leading `*`, and the ports are `u16` — but that is not what
+/// keeps this safe: the proxy is spawned with one argument per `arg()`
+/// and never through a shell.
+pub fn net_proxy_argv(cfg: &NetworkConfig, fds: ProxyFds<'_>) -> Vec<OsString> {
+    let mut argv = Vec::new();
+    for allowed in &cfg.allow_hosts {
+        argv.push(OsString::from("--allow"));
+        argv.push(OsString::from(format!(
+            "{}:{}",
+            allowed.pattern, allowed.port
+        )));
+    }
+    argv.push(OsString::from("--port"));
+    argv.push(OsString::from(PROXY_PORT.to_string()));
+    argv.push(OsString::from("--ready-fd"));
+    argv.push(fds.ready.to_os_string());
+    argv.push(OsString::from("--log-fd"));
+    argv.push(fds.log.to_os_string());
+    argv
+}
+
+/// The descriptors the egress proxy is given, by the number it will see
+/// them at.
+#[derive(Debug, Clone, Copy)]
+pub struct ProxyFds<'a> {
+    /// Written one byte once the proxy is listening. The launcher waits
+    /// on it before it lets the application go, so nothing inside can
+    /// reach for the proxy before it answers.
+    pub ready: &'a OsStr,
+    /// Where the proxy's audit lines go, which is bubbler's own stderr
+    /// and never a file: the lines are about what the sandbox tried.
+    pub log: &'a OsStr,
+}
+
 /// Names of the variables [`proxy_env`] sets, in the order it returns
 /// them. Every one of them is in [`crate::config::RESERVED_ENV`], so no
 /// `env` node can point the sandbox at a proxy of its own.
@@ -1510,6 +1576,70 @@ mod tests {
         assert_eq!(Mode::from_str("none").unwrap(), Mode::None);
         for bad in ["isolated", "", "HOST", "pasta"] {
             assert!(Mode::from_str(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// The proxy's argv is the allowlist, the fixed port and the two
+    /// descriptors, in that order: a golden, because it is the contract
+    /// between bubbler and the one process a name-filtered sandbox lets
+    /// out.
+    #[test]
+    fn net_proxy_argv_is_the_allowlist_the_port_and_the_descriptors() {
+        let cfg = NetworkConfig {
+            outbound: Outbound::Deny,
+            allow_hosts: vec![
+                AllowHost {
+                    pattern: HostPattern::parse("api.example.com").unwrap(),
+                    port: AllowHost::DEFAULT_PORT,
+                },
+                AllowHost {
+                    pattern: HostPattern::parse("*.cdn.example").unwrap(),
+                    port: 8443,
+                },
+            ],
+            ..NetworkConfig::default()
+        };
+        assert_eq!(
+            strs(&net_proxy_argv(
+                &cfg,
+                ProxyFds {
+                    ready: OsStr::new("5"),
+                    log: OsStr::new("2"),
+                }
+            )),
+            [
+                "--allow",
+                "api.example.com:443",
+                "--allow",
+                "*.cdn.example:8443",
+                "--port",
+                "3128",
+                "--ready-fd",
+                "5",
+                "--log-fd",
+                "2",
+            ]
+        );
+    }
+
+    /// The port in the variables is the port the proxy is told to bind,
+    /// and both are the constant: an explanation that printed one and a
+    /// run that used the other would be a sandbox pointed at nothing.
+    #[test]
+    fn the_proxy_variables_name_the_port_the_proxy_is_told_to_bind() {
+        let argv = strs(&net_proxy_argv(
+            &NetworkConfig::default(),
+            ProxyFds {
+                ready: OsStr::new("5"),
+                log: OsStr::new("2"),
+            },
+        ));
+        let i = argv.iter().position(|a| a == "--port").expect("--port");
+        assert_eq!(argv[i + 1], PROXY_PORT.to_string());
+        for (name, value) in proxy_env(PROXY_PORT) {
+            if name.eq_ignore_ascii_case("https_proxy") {
+                assert_eq!(value, format!("http://127.0.0.1:{PROXY_PORT}"));
+            }
         }
     }
 

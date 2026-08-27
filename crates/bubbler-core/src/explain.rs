@@ -9,6 +9,7 @@ use std::ffi::OsStr;
 use unicode_width::UnicodeWidthStr;
 
 use crate::bwrap::{Explained, Origin};
+use crate::cgroup;
 use crate::config::{InstanceConfig, Lines, SeccompConfig, Service, WaylandMode, X11Mode};
 use crate::dbus;
 use crate::error::ConfigError;
@@ -302,14 +303,62 @@ fn under(lead: &str, items: Vec<String>) -> Vec<String> {
 /// is neither a bwrap argument nor a D-Bus rule, so nothing else in this
 /// view would show it; the nesting is kept, with each tab widened to
 /// four columns so a terminal shows what the file holds.
-fn ruleset_lines(cfg: &NetworkConfig) -> Vec<String> {
-    let Some(text) = network::ruleset(cfg, None) else {
+fn ruleset_lines(cfg: &NetworkConfig, instance: &str) -> Vec<String> {
+    let cgroup = match cfg.allow_hosts.is_empty() {
+        true => None,
+        false => placeholder_cgroup(instance),
+    };
+    let Some(text) = network::ruleset(cfg, cgroup.as_ref()) else {
         return Vec::new();
     };
     under(
         "ruleset: ",
         text.lines().map(|l| l.replace('\t', "    ")).collect(),
     )
+}
+
+/// The cgroup an explanation writes the `allow-host` rules around: the
+/// one a run of this instance would create, with the sandbox pid it
+/// cannot know yet left as `<pid>`.
+///
+/// bubbler's own cgroup is read where it can be, since that is what
+/// decides the `level` the rule matches at and so what the block would
+/// actually say; a host that will not answer gets a placeholder there
+/// too, and the shape is still the shape. `None` only where neither
+/// makes a path a rule could carry, and then the block is left out
+/// rather than shown wrong.
+fn placeholder_cgroup(instance: &str) -> Option<network::Cgroup> {
+    let own = cgroup::own_path().unwrap_or_else(|_| "<own-cgroup>".to_owned());
+    let under = match own.is_empty() {
+        true => String::new(),
+        false => format!("{own}/"),
+    };
+    network::Cgroup::new(&format!("{under}bubbler-{instance}-<pid>")).ok()
+}
+
+/// The egress proxy an `allow-host` is served by, as the launcher will
+/// run it. `None` where the node names no name to reach.
+///
+/// The descriptor it reports readiness on is only known once the run has
+/// made the pipe, so it is named here rather than numbered; the log
+/// descriptor is bubbler's own stderr, always.
+fn net_proxy_line(cfg: &NetworkConfig) -> Option<String> {
+    if cfg.allow_hosts.is_empty() {
+        return None;
+    }
+    let argv = network::net_proxy_argv(
+        cfg,
+        network::ProxyFds {
+            ready: OsStr::new("<ready-fd>"),
+            log: OsStr::new("2"),
+        },
+    );
+    let mut line = format!("    sidecar: {}", network::NET_PROXY_INSIDE);
+    for a in &argv {
+        line.push(' ');
+        line.push_str(&a.to_string_lossy());
+    }
+    Some(line)
 }
 
 /// The pasta argv an isolated `network` node is served by. The two
@@ -450,7 +499,8 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
                     // connects the namespace is the process below.
                     Some(Service::Network(cfg)) if cfg.is_isolated() => {
                         out.push(sidecar_line(cfg));
-                        out.extend(ruleset_lines(cfg));
+                        out.extend(net_proxy_line(cfg));
+                        out.extend(ruleset_lines(cfg, view.instance));
                     }
                     // The one `--ro-bind` names the proxy's own socket
                     // whatever the compositor answered; only what the

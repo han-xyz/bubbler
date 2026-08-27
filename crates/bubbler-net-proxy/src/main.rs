@@ -6,11 +6,13 @@
 //! is on the inside, in the one cgroup the filter lets out, and the
 //! application beside it is not.
 //!
-//! So it binds `127.0.0.1:0` itself — after the namespaces are joined,
-//! or the socket would be the host's loopback — reports the port it got
-//! on `--ready-fd` as two bytes, and from then on answers `CONNECT` and
-//! nothing else. Names come from argv; the sandbox never gets to add
-//! one.
+//! So it binds `127.0.0.1:<--port>` itself — after the namespaces are
+//! joined, or the socket would be the host's loopback — reports on
+//! `--ready-fd` that it is listening, and from then on answers `CONNECT`
+//! and nothing else. The port is the launcher's to choose because the
+//! sandbox is told it in an environment variable of bwrap's argv, which
+//! is fixed before the namespace this binds in exists. Names come from
+//! argv; the sandbox never gets to add one.
 
 // The library — the parser, the allowlist and the relay — forbids
 // `unsafe`. The binary cannot: taking over a descriptor the launcher
@@ -37,7 +39,7 @@ use bubbler_net_proxy::relay;
 /// The one usage line, so a grammar error always names the whole
 /// grammar.
 const USAGE: &str = "bubbler-net-proxy: usage: --allow NAME:PORT [--allow NAME:PORT ...] \
---ready-fd N [--log-fd N]";
+--port N --ready-fd N [--log-fd N]";
 
 /// Tunnels one proxy carries at a time. Past this a connection is
 /// answered `503` and closed: a sandbox that opens sockets without
@@ -78,15 +80,21 @@ const LOG_WINDOW: Duration = Duration::from_secs(1);
 /// assembled.
 const READ_CHUNK: usize = 1024;
 
+/// What goes down `--ready-fd` once the listener is up. Its value says
+/// nothing; that it arrives at all is the whole message.
+const READY: u8 = 1;
+
 /// What the launcher asked for.
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
     /// The `name:port` targets a tunnel may be opened to, as written.
     allow: Vec<String>,
-    /// Written the bound port as two bytes, big-endian, once the
-    /// listener is up, and closed. The launcher waits on it before it
-    /// starts the application, so the proxy variables it sets name a
-    /// port that already answers.
+    /// The loopback port to listen on, inside the namespace the
+    /// launcher joined this process to.
+    port: u16,
+    /// Written one byte once the listener is up, and closed. The
+    /// launcher waits on it before it starts the application, so the
+    /// proxy variables it set name a port that already answers.
     ready_fd: i32,
     /// Where the log goes; stderr when the launcher named nothing.
     log_fd: Option<i32>,
@@ -116,7 +124,7 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    match serve(list, args.ready_fd, &log) {
+    match serve(list, args.port, args.ready_fd, &log) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             log.line(&format!("stopped: {err}"));
@@ -134,11 +142,13 @@ fn main() -> ExitCode {
 /// closed twice.
 fn parse_from(mut it: impl Iterator<Item = OsString>) -> Option<Args> {
     let mut allow: Vec<String> = Vec::new();
+    let mut port = None;
     let mut ready_fd = None;
     let mut log_fd = None;
     while let Some(word) = it.next() {
         match word.to_str() {
             Some("--allow") => allow.push(it.next()?.to_str()?.to_owned()),
+            Some("--port") if port.is_none() => port = Some(listen_port(it.next()?)?),
             Some("--ready-fd") if ready_fd.is_none() => ready_fd = Some(number(it.next()?)?),
             Some("--log-fd") if log_fd.is_none() => log_fd = Some(number(it.next()?)?),
             _ => return None,
@@ -149,6 +159,7 @@ fn parse_from(mut it: impl Iterator<Item = OsString>) -> Option<Args> {
     }
     let args = Args {
         allow,
+        port: port?,
         ready_fd: ready_fd?,
         log_fd,
     };
@@ -156,6 +167,16 @@ fn parse_from(mut it: impl Iterator<Item = OsString>) -> Option<Args> {
         return None;
     }
     Some(args)
+}
+
+/// One port number a socket can be bound to: `0` would let the kernel
+/// choose, and a port nobody chose is one the launcher could not have
+/// put in the sandbox's environment.
+fn listen_port(word: OsString) -> Option<u16> {
+    match word.to_str()?.parse::<u16>() {
+        Ok(port) if port > 0 => Some(port),
+        _ => None,
+    }
 }
 
 /// One non-negative descriptor number.
@@ -166,16 +187,18 @@ fn number(word: OsString) -> Option<i32> {
     }
 }
 
-/// Bind the loopback listener, tell the launcher which port it got, and
-/// serve until the process is stopped.
+/// Bind the loopback listener, tell the launcher it is up, and serve
+/// until the process is stopped.
 ///
-/// The port is reported only once the listener is up, so the launcher
-/// never hands the application a proxy address that answers nothing.
-fn serve(list: Allowlist, ready_fd: i32, log: &Arc<Log>) -> io::Result<()> {
-    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
-    let port = listener.local_addr()?.port();
+/// The byte goes out only once the listener is up, so the launcher never
+/// releases an application whose proxy address answers nothing. The
+/// namespace is the sandbox's own and nothing else has run in it, so a
+/// port the launcher picked is free; a bind that fails anyway ends the
+/// process, and the launcher's wait ends with it.
+fn serve(list: Allowlist, port: u16, ready_fd: i32, log: &Arc<Log>) -> io::Result<()> {
+    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
     let ready = adopt(ready_fd)?;
-    File::from(ready).write_all(&port.to_be_bytes())?;
+    File::from(ready).write_all(&[READY])?;
     log.line(&format!(
         "listening on 127.0.0.1:{port} for {} allowed targets",
         list.len()
@@ -543,18 +566,51 @@ mod tests {
         parse_from(words.iter().map(OsString::from))
     }
 
-    const MINIMAL: &[&str] = &["--allow", "api.example:443", "--ready-fd", "3"];
+    const MINIMAL: &[&str] = &[
+        "--allow",
+        "api.example:443",
+        "--port",
+        "3128",
+        "--ready-fd",
+        "3",
+    ];
 
     #[test]
-    fn the_shortest_grammar_names_one_target_and_the_ready_pipe() {
+    fn the_shortest_grammar_names_one_target_the_port_and_the_ready_pipe() {
         assert_eq!(
             args(MINIMAL),
             Some(Args {
                 allow: vec!["api.example:443".to_owned()],
+                port: 3128,
                 ready_fd: 3,
                 log_fd: None,
             })
         );
+    }
+
+    /// The launcher chooses the port, so every way of not naming one is
+    /// a usage error rather than a listener the sandbox was not told
+    /// about.
+    #[test]
+    fn a_proxy_that_was_told_no_port_is_a_usage_error() {
+        assert_eq!(
+            args(&["--allow", "api.example:443", "--ready-fd", "3"]),
+            None
+        );
+        for port in ["0", "65536", "-1", "http", "", "3128.0"] {
+            assert_eq!(
+                args(&[
+                    "--allow",
+                    "api.example:443",
+                    "--port",
+                    port,
+                    "--ready-fd",
+                    "3"
+                ]),
+                None,
+                "{port}"
+            );
+        }
     }
 
     #[test]
@@ -565,6 +621,8 @@ mod tests {
                 "api.example:443",
                 "--allow",
                 "*.cdn.example:8443",
+                "--port",
+                "3128",
                 "--ready-fd",
                 "4",
                 "--log-fd",
@@ -575,6 +633,7 @@ mod tests {
                     "api.example:443".to_owned(),
                     "*.cdn.example:8443".to_owned()
                 ],
+                port: 3128,
                 ready_fd: 4,
                 log_fd: Some(2),
             })
@@ -583,7 +642,7 @@ mod tests {
 
     #[test]
     fn a_proxy_with_nothing_to_allow_is_a_usage_error() {
-        assert_eq!(args(&["--ready-fd", "3"]), None);
+        assert_eq!(args(&["--port", "3128", "--ready-fd", "3"]), None);
         assert_eq!(args(&["--allow", "api.example:443"]), None);
     }
 
@@ -605,7 +664,14 @@ mod tests {
     fn a_descriptor_that_is_not_a_number_is_a_usage_error() {
         for fd in ["stdin", "-1", "3.0", ""] {
             assert_eq!(
-                args(&["--allow", "a.example:443", "--ready-fd", fd]),
+                args(&[
+                    "--allow",
+                    "a.example:443",
+                    "--port",
+                    "3128",
+                    "--ready-fd",
+                    fd
+                ]),
                 None,
                 "{fd}"
             );
@@ -627,25 +693,36 @@ mod tests {
         assert!(adopt(9999).is_err());
     }
 
-    /// A whole run of the proxy over loopback: the port arrives on the
-    /// ready pipe, an allowed target is tunnelled with the bytes that
-    /// came behind the blank line, and a target no `--allow` covers is
-    /// refused without the upstream being touched.
+    /// A whole run of the proxy over loopback on a port of the caller's,
+    /// which is how the launcher runs it: the ready byte arrives once
+    /// the listener is up, an allowed target is tunnelled with the bytes
+    /// that came behind the blank line, and a target no `--allow` covers
+    /// is refused without the upstream being touched.
+    ///
+    /// The port is taken by binding one and letting go of it again: two
+    /// tests of this file run at once, and a constant would be a race
+    /// between them rather than between a proxy and a sandbox.
     fn started(allow: &[&str]) -> u16 {
         let list = Allowlist::parse(allow).expect("an allowlist");
+        let port = {
+            let held =
+                TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("a free port");
+            held.local_addr().expect("its address").port()
+        };
         let (read, write) = rustix::pipe::pipe().expect("a pipe");
         let log = Arc::new(Log::to_stderr());
         let ready = write.into_raw_fd();
         // The proxy serves until the process ends; a test outlives no
         // thread of its own here.
         std::thread::spawn(move || {
-            let _ = serve(list, ready, &log);
+            let _ = serve(list, port, ready, &log);
         });
-        let mut port = [0u8; 2];
+        let mut byte = [0u8; 1];
         File::from(read)
-            .read_exact(&mut port)
-            .expect("the bound port");
-        u16::from_be_bytes(port)
+            .read_exact(&mut byte)
+            .expect("the ready byte");
+        assert_eq!(byte, [READY]);
+        port
     }
 
     fn echo_server() -> u16 {

@@ -3,6 +3,7 @@
 
 pub mod bwrap;
 pub mod catalogue;
+pub mod cgroup;
 pub mod config;
 pub mod dbus;
 pub mod dbus_wire;

@@ -14,11 +14,11 @@ use bubbler_core::profile::NAMES;
 use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
     PYTHON, bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, bubbler_wayland, bwrap_alive,
-    holders_of, kill_group, output_past_a_busy_exec, process_running, real_init, require_a11y,
-    require_a11y_lookup, require_bwrap, require_dbus, require_document_portal, require_groff,
-    require_host_program, require_nested_x11, require_nested_x11_host, require_nft, require_pasta,
-    require_portal, require_python, require_security_context, require_system_bus, require_tray,
-    say, system_owns, test_pty,
+    holders_of, kill_group, output_past_a_busy_exec, process_running, real_init, real_net_proxy,
+    require_a11y, require_a11y_lookup, require_bwrap, require_dbus, require_document_portal,
+    require_egress, require_groff, require_host_program, require_nested_x11,
+    require_nested_x11_host, require_nft, require_pasta, require_portal, require_python,
+    require_security_context, require_system_bus, require_tray, say, system_owns, test_pty,
 };
 use rustix::fs::{FlockOperation, OFlags, fcntl_getfl, flock};
 use rustix::process::{Pid, Signal, kill_process};
@@ -8500,6 +8500,197 @@ for name, argv in [('nft-list:', ['list', 'ruleset']), ('nft-flush:', ['flush', 
     done = subprocess.run(['nft'] + argv, capture_output=True, text=True)
     print(name, done.stderr.replace('\\n', ' ').strip(), flush=True)
 ";
+
+/// The six probes a sandbox with an `allow-host` answers from inside.
+const CONNECT_PROBE: &str = include_str!("fixtures/connect_probe.py");
+
+/// Egress by name, end to end: the proxy is the only way out, and only
+/// to the names the config lists.
+///
+/// The listed name is `localhost` and the echo it resolves to runs
+/// inside the sandbox, because bubbler's pasta invocation
+/// (`--map-host-loopback none --map-guest-addr none`) leaves the sandbox
+/// no address of the host's to reach at all, and an unprivileged test
+/// cannot bind port 53 on the host to answer for a name of its own
+/// either. What that costs is only the cgroup accept rule, which the
+/// seventh probe covers where this host is online.
+#[test]
+fn real_allow_host_relays_a_listed_name_and_nothing_else() {
+    if !require_egress() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    // Any port but the proxy's own, which the parser refuses to forward
+    // and nothing else in the namespace holds.
+    let echo = free_port();
+    let routable = host_is_online().then_some("one.one.one.one");
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "eg"])
+        .status()
+        .unwrap();
+    let mut cfg =
+        format!("network {{\n    outbound \"deny\"\n    allow-host \"localhost\" port={echo}\n");
+    if let Some(name) = routable {
+        cfg.push_str(&format!("    allow-host \"{name}\"\n"));
+    }
+    cfg.push_str("}\n");
+    std::fs::write(tmp.path().join("data/bubbler/instances/eg/config.kdl"), cfg).unwrap();
+    let mut argv: Vec<String> = ["run", "eg", "--", PYTHON, "-c", CONNECT_PROBE]
+        .iter()
+        .map(|a| (*a).to_owned())
+        .collect();
+    argv.push(echo.to_string());
+    argv.push(bubbler_core::network::PROXY_PORT.to_string());
+    argv.extend(routable.map(str::to_owned));
+    let out = bubbler_live(tmp.path(), &init)
+        .args(&argv)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let got = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{got}{err}");
+    let line = |name: &str| {
+        got.lines()
+            .find_map(|l| l.strip_prefix(&format!("{name} ")))
+            .unwrap_or_else(|| panic!("{name} missing from {got}{err}"))
+            .to_owned()
+    };
+    // 1. The listed name on the listed port: the proxy answers and the
+    //    bytes behind the blank line come back from the other end.
+    assert_eq!(line("relay"), "ok", "{got}{err}");
+    // 2-3. The allowlist and the method, judged before anything is
+    //    dialled.
+    assert_eq!(line("unlisted"), "403", "{got}{err}");
+    assert_eq!(line("get"), "405", "{got}{err}");
+    // 4. Straight out of the application: the ruleset accepts the
+    //    proxy's cgroup and rejects the rest, and a reject is immediate.
+    assert!(line("direct").starts_with("refused"), "{got}{err}");
+    // 5. The resolver rules carry the cgroup match too, so the
+    //    application has no name resolution of its own — the channel a
+    //    lookup would otherwise be.
+    assert_eq!(line("dns"), "none", "{got}{err}");
+    // 6. The seven variables, checked against the port bubbler was
+    //    built with rather than against themselves.
+    assert_eq!(line("env"), "ok", "{got}{err}");
+    // 7. Only with a route to the internet: the proxy resolves a real
+    //    name and reaches it, which is the cgroup accept rule doing the
+    //    one thing nothing else in this test needs.
+    if routable.is_some() {
+        assert_eq!(line("egress"), "ok", "{got}{err}");
+    }
+}
+
+/// The proxy, its argv and the seven variables are all in the
+/// explanation of a run that never happens, with the port as it will be:
+/// bubbler chooses it, so there is nothing to leave as a placeholder but
+/// the sandbox pid in the cgroup path.
+#[test]
+fn allow_host_explains_the_proxy_and_the_variables_without_running() {
+    if real_net_proxy().is_none() {
+        return;
+    }
+    let tmp = setup();
+    write_profile(
+        tmp.path(),
+        "system",
+        "app",
+        "network {\n    outbound \"deny\"\n    allow-host \"api.example\"\n}\n\
+         command \"/usr/bin/true\"\n",
+    );
+    let port = bubbler_core::network::PROXY_PORT;
+
+    // The sandbox's own argv: the binary bound where the sidecar execs
+    // it and the variables that point the application at it, exact.
+    // `--dry-run` is `run`'s, so this half needs an instance.
+    bubbler(tmp.path())
+        .args(["create", "eg", "--profile", "app"])
+        .status()
+        .unwrap();
+    let out = bubbler(tmp.path())
+        .args(["run", "eg", "--dry-run"])
+        .output()
+        .unwrap();
+    let dry = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        dry.contains(&format!("--setenv\nHTTPS_PROXY\nhttp://127.0.0.1:{port}\n")),
+        "{dry}"
+    );
+    assert!(dry.contains("\n/run/bubbler-net-proxy\n"), "{dry}");
+
+    // The explanation: the same argv under the `network` node, the
+    // sidecar's own line, and the ruleset written around the cgroup a
+    // run would make.
+    let out = bubbler(tmp.path())
+        .args(["try", "--profile", "app", "--explain"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("--setenv NODE_USE_ENV_PROXY 1"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "sidecar: /run/bubbler-net-proxy --allow api.example:443 --port {port} \
+             --ready-fd <ready-fd> --log-fd 2"
+        )),
+        "{text}"
+    );
+    // The accepts come before the reject, or the rules would be dead
+    // text: the cgroup's own, and the resolver rules gated on it.
+    let cgroup = text
+        .find("socket cgroupv2 level")
+        .unwrap_or_else(|| panic!("no cgroup match in {text}"));
+    let reject = text
+        .find("reject with icmpx admin-prohibited")
+        .unwrap_or_else(|| panic!("no reject in {text}"));
+    assert!(cgroup < reject, "{text}");
+    assert!(text.contains("bubbler-try-"), "{text}");
+    assert!(
+        text.contains("-<pid>\" ip daddr 169.254.1.1 udp dport 53 accept"),
+        "{text}"
+    );
+
+    // And the sidecar's own view of it.
+    let out = bubbler(tmp.path())
+        .args(["try", "--profile", "app", "--explain", "--net-proxy"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("--allow api.example:443"), "{text}");
+    assert!(text.contains(&format!("--port {port}")), "{text}");
+
+    // Without an `allow-host` there is no such sidecar to explain.
+    write_profile(
+        tmp.path(),
+        "system",
+        "plain",
+        "network\ncommand \"/usr/bin/true\"\n",
+    );
+    let out = bubbler(tmp.path())
+        .args(["try", "--profile", "plain", "--explain", "--net-proxy"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no `allow-host`"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
 
 /// What the process holding CAP_NET_ADMIN over the sandbox's namespaces
 /// is allowed to do, and what it is fed.
