@@ -87,6 +87,8 @@ impl Status {
         reason: "Method Not Allowed",
         allow_header: true,
     };
+    /// The request did not arrive whole inside the header deadline.
+    pub const REQUEST_TIMEOUT: Self = Self::new(408, "Request Timeout");
     /// A request-line or target longer than anything a name can need.
     pub const URI_TOO_LONG: Self = Self::new(414, "URI Too Long");
     /// More tunnels than this proxy serves at once.
@@ -194,9 +196,10 @@ fn split_line(
 /// The request-line: a method, an authority-form target and a version,
 /// one space apart.
 ///
-/// The method is judged before anything else about the line, so a
-/// browser pointed at this port is told what the proxy does rather than
-/// what is wrong with its URI.
+/// A line that is three words of visible ASCII is judged by its method
+/// first, so a browser pointed at this port is told what the proxy does
+/// rather than what is wrong with its URI. A line that is not even that
+/// is a 400: there is no method to name.
 fn request_line(line: &[u8]) -> Result<(String, u16), Status> {
     if !line
         .iter()

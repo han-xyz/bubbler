@@ -36,6 +36,11 @@ pub const IDLE: Duration = Duration::from_secs(60);
 pub fn run(client: TcpStream, upstream: TcpStream, idle: Duration) -> io::Result<()> {
     client.set_nonblocking(true)?;
     upstream.set_nonblocking(true)?;
+    // The loop writes whole buffers, so Nagle would only ever hold back
+    // the tail of a direction — which for a TLS tunnel is the record
+    // the peer is waiting on.
+    client.set_nodelay(true)?;
+    upstream.set_nodelay(true)?;
     // One direction each, named for where the bytes come from.
     let mut out = Dir::default();
     let mut back = Dir::default();
