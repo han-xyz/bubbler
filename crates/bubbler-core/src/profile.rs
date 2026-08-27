@@ -1442,11 +1442,15 @@ mod tests {
     }
 
     /// The `Stricter:` block in `claude-code`'s header is
-    /// `claude-code-strict`'s own `network` node, written out for a
-    /// reader to paste over the bare one. It sits five spaces in, which
-    /// is where `opt_in_nodes` above reads prose and skips it — a lone
-    /// `allow-host` line is not a config, so the paste-back test cannot
-    /// be what holds the two files together. This is.
+    /// `claude-code-strict`'s own `lint-allow` and `network` node,
+    /// written out for a reader to paste over the bare one. It sits five
+    /// spaces in, which is where `opt_in_nodes` above reads prose and
+    /// skips it — a lone `allow-host` line is not a config, so the
+    /// paste-back test cannot be what holds the two files together.
+    /// This is, and it compares the *text*: the comment over each group
+    /// of names is the pruning instruction the header tells the reader
+    /// to act on, and a comment corrected in one file only is the drift
+    /// a comparison of parsed nodes would miss.
     #[test]
     fn the_stricter_paste_in_is_the_strict_profile_s_network_node() {
         let header = lookup("claude-code").expect("NAMES lists built-in profiles");
@@ -1464,7 +1468,22 @@ mod tests {
                 out
             });
         assert!(pasted.starts_with("lint-allow "), "{pasted}");
-        let node_of = |text: &str| {
+
+        // The same slice of the profile: from its `lint-allow` to the
+        // end of the `network` block.
+        let strict = lookup("claude-code-strict").expect("NAMES lists built-in profiles");
+        let from = strict
+            .find("lint-allow ")
+            .expect("the strict profile accepts the outbound-deny note");
+        let to = strict[from..]
+            .find("\n}\n")
+            .expect("the strict profile's network node is a block")
+            + from
+            + "\n}\n".len();
+        assert_eq!(pasted, strict[from..to]);
+
+        // And it is a config, not only matching text.
+        let node = |text: &str| {
             let cfg = config::parse(text).unwrap_or_else(|err| panic!("{text}\n{err}"));
             let network = cfg
                 .services
@@ -1474,8 +1493,7 @@ mod tests {
                 .clone();
             (network, cfg.lint_allows)
         };
-        let strict = lookup("claude-code-strict").expect("NAMES lists built-in profiles");
-        assert_eq!(node_of(&pasted), node_of(strict));
+        assert_eq!(node(&pasted), node(strict));
     }
 
     #[test]

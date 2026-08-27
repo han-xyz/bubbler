@@ -1402,16 +1402,19 @@ which names an IPv4 destination that no `ip6` rule ever sees, and an IPv6
 bubbler, not by you: whatever `/etc/resolv.conf` ends up naming — the generated
 `169.254.1.1` or a `dns` child — is accepted on UDP and TCP port 53, since a
 filter that broke name resolution would look like a network outage rather than
-a policy. The table is `inet`, so IPv6 falls under the same policy; an `ip`
-table would leave it open and read identically in `nft list ruleset` to anyone
-not looking at the family.
+a policy. That is the shape of those two rules without an `allow-host`; with
+one they carry the proxy's cgroup match as well and the application resolves
+nothing at all, which is the trade "Egress by name" below makes. The table is
+`inet`, so IPv6 falls under the same policy; an `ip` table would leave it open
+and read identically in `nft list ruleset` to anyone not looking at the
+family.
 
-**It filters by address, and it cannot filter by name.** `allow-out
+**A rule of this table is an address, never a name.** `allow-out
 "api.example.com"` does not exist and will not: a name would have to be
 resolved once at launch into a set of addresses, and a CDN, an Anycast pool or
 a DNS failover answers with different ones later — the connection then dies
 mid-run, refused by the sandbox's own firewall rather than by the peer, which
-is a worse failure than not offering it. What names get instead is
+is a worse failure than not offering it. Names are filtered instead by
 `allow-host`, below: not a rule of this table at all, but a proxy of bubbler's
 that the table is written around. `bubbler lint` says the same thing as the
 `outbound-deny` note.
@@ -1621,9 +1624,12 @@ and `CapAmb` all zero (the bounding set is left as inherited, which nothing can
 draw on without a file capability or uid 0), cwd `/`, and a network namespace
 that is the sandbox's rather than bubbler's.
 
-It runs with **no seccomp filter** in v1, alone among bubbler's sidecars:
-rustix exposes no filter load, the `pre_exec` above must stay
-async-signal-safe, and neither libc nor a new dependency is being added for it.
+It runs with **no seccomp filter** in v1: rustix exposes no filter load, the
+`pre_exec` above must stay async-signal-safe, and neither libc nor a new
+dependency is being added for it. Two of a run's sidecars have none — this one
+and `nft`, a one-shot host binary that exits before the application runs —
+against the three bubbler wraps in a bwrap of its own and hands the default
+filter to; pasta loads a filter of its own making, not bubbler's.
 What stands in for it is the empty capability sets, a crate that is
 `#![deny(unsafe_code)]` apart from one descriptor adoption, an allowlist that
 arrives as argv, and a request parser that is fuzzed
@@ -1664,12 +1670,13 @@ there is no TLS interception, and the proxy sees ciphertext. Anything else is
 answered and dropped: `405 Method Not Allowed` with `Allow: CONNECT` for
 another method, `403` for a name no `allow-host` covers, for the right name on
 the wrong port and for an IP literal (`allow-out` is how an address is named),
-`502` for a name that does not resolve, `504` for a connect that times out
-after ten seconds, `503` past 64 concurrent tunnels, `408` for a request that
-arrives too slowly, and `400`/`414` for a malformed or over-long one. A name
-that resolves to a link-local address has that answer skipped rather than
-dialled. Plain HTTP is not forwarded, and neither is UDP, so a client that
-would use HTTP/3 falls back to TCP. A tunnel idle for 60 seconds is closed.
+`502` for a name that does not resolve and for one whose every resolved
+address refuses the connection, `504` for a connect that times out after ten
+seconds, `503` past 64 concurrent tunnels, `408` for a request that arrives
+too slowly, and `400`/`414` for a malformed or over-long one. A name that
+resolves to a link-local address has that answer skipped rather than dialled.
+Plain HTTP is not forwarded, and neither is UDP, so a client that would use
+HTTP/3 falls back to TCP. A tunnel idle for 60 seconds is closed.
 
 **The names.** ASCII letters, digits and `-` per label, no label starting or
 ending with `-`, at most 63 characters a label and 253 in the name as written,
@@ -1695,8 +1702,10 @@ consequences worth knowing before writing the node:
 
 - An application that ignores the proxy variables fails at the name lookup
   rather than at the connection. That is the documented trade-off, and it reads
-  like a broken resolver rather than like a policy; `bubbler log` has the
-  proxy's own lines beside it.
+  like a broken resolver rather than like a policy. What tells the two apart is
+  the proxy's own line, which goes to bubbler's stderr: the terminal for a run
+  started from one, and `last-run.log` — what `bubbler log <name>` prints — for
+  a run with no terminal, which is how a desktop entry or a shim starts one.
 - An `allow-out` written with no `port=` covers every port at that address,
   port 53 among them. A resolver named that way stays reachable by the
   application directly, which is a hole in the paragraph above — name a port on
@@ -1746,7 +1755,12 @@ or a carriage return — a newline would forge a line in `--dry-run` output. The
 variables the sandbox owns are rejected: `HOME`, `PATH`, `XDG_RUNTIME_DIR`,
 `USER`, `LOGNAME`, `WAYLAND_DISPLAY`, `DISPLAY`, `XAUTHORITY`,
 `XDG_SESSION_TYPE`, `PULSE_SERVER`, `DBUS_SESSION_BUS_ADDRESS`,
-`DBUS_SYSTEM_BUS_ADDRESS`, `AT_SPI_BUS_ADDRESS`, `IBUS_USE_PORTAL`.
+`DBUS_SYSTEM_BUS_ADDRESS`, `AT_SPI_BUS_ADDRESS`, `IBUS_USE_PORTAL`, and the
+seven an `allow-host` sets — `HTTPS_PROXY`, `HTTP_PROXY`, `https_proxy`,
+`http_proxy`, `NO_PROXY`, `no_proxy`, `NODE_USE_ENV_PROXY`. The last seven are
+refused whether or not the config has an `allow-host`: one written by hand
+would point the sandbox at a proxy of its own, past the single opening the
+filter leaves (see "network").
 
 `desktop "<name>.desktop"` names the desktop entry `bubbler desktop` copies an
 instance's menu entry from. It grants nothing and nothing at launch reads it:
@@ -2250,16 +2264,21 @@ anything here is installed), grouped by what each carries:
 
     network {
         outbound "deny"
-        // the API, the sign-in pages, and the OAuth exchange a login code
-        // goes through; the API also answers WebFetch's domain safety check
+        // the API, the sign-in pages, and the OAuth exchange a login code goes
+        // through; the API also answers WebFetch's domain safety check, and
+        // claude.com is a target WebFetch is pre-approved for
         allow-host "api.anthropic.com"
         allow-host "claude.ai"
         allow-host "claude.com"
         allow-host "platform.claude.com"
         // claude.ai connectors (ENABLE_CLAUDEAI_MCP_SERVERS=false drops this)
         allow-host "mcp-proxy.anthropic.com"
-        // releases and version checks, plugin executables and metadata, and
-        // the npm packages an `npx`-launched MCP server installs
+        // releases and version checks, plugin executables, plugin metadata, and
+        // the npm packages an `npx`-launched MCP server installs. The Google
+        // storage host is shared hosting anyone may publish to, so listing it
+        // names a host rather than a party: anything in the sandbox that reaches
+        // it can put bytes in a bucket of its own. Drop that line if no plugin
+        // here needs its metadata.
         allow-host "downloads.claude.ai"
         allow-host "storage.googleapis.com"
         allow-host "registry.npmjs.org"
@@ -2267,8 +2286,9 @@ anything here is installed), grouped by what each carries:
         // drops the second)
         allow-host "bridge.claudeusercontent.com"
         allow-host "*.frame.claudeusercontent.com"
-        // the changelog `/release-notes` reads, and plugin marketplaces
-        // hosted on it
+        // the changelog `/release-notes` reads. Shared hosting as well — every
+        // public repository on GitHub is under this one name — so it is a way
+        // out as much as a source; drop it if the changelog can go unread.
         allow-host "raw.githubusercontent.com"
         // telemetry and error reports, on Datadog's us5 site
         allow-host "http-intake.logs.us5.datadoghq.com"
@@ -2290,14 +2310,21 @@ browser on the host, and the code pasted back is exchanged with `claude.ai` and
 
 The list is documentation rather than measurement. Nobody has yet run the tool
 through this profile end to end, so a feature reaching a host the table does
-not name fails here first — as a refusal in the proxy's log (`bubbler log
-<name>`) naming what it wanted, which is one more `allow-host` line. What stays
-filtered away whatever is kept: `WebFetch` of a URL off the list, an MCP server
-reaching a service of its own, and `git`, `gh` or `curl` against a forge that
-is not named. The application has no DNS of its own under the node either, so
-anything in there that ignores `HTTPS_PROXY` fails at the name lookup rather
-than at the connection. The mechanism, and the delegated cgroup2 subtree it
-needs, is under "network" above.
+not name fails here first — as a refusal from the proxy naming what it wanted,
+on bubbler's stderr: the terminal for a run started from one, as the three
+lines above start it, and `last-run.log`, which `bubbler log <name>` prints,
+for a run with no terminal. The fix is one more `allow-host` line. What stays
+filtered away whatever is kept: `WebFetch` of a URL off the list, an MCP
+server reaching a service of its own, and `git`, `gh` or `curl` against a
+forge that is not named. Two of the fourteen are not destination bounds at all
+— `storage.googleapis.com` and `raw.githubusercontent.com` are shared hosting
+that anyone may publish under, so a listed name is not a listed party and
+bytes can leave through either; their group comments say so, and both groups
+are there to be deleted where the feature is not used. The application has no
+DNS of its own under the node either, so anything in there that ignores
+`HTTPS_PROXY` fails at the name lookup rather than at the connection. The
+mechanism, and the delegated cgroup2 subtree it needs, is under "network"
+above.
 
 `userns "disable"` in both profiles is the deliberate exception to the rule
 that a program nesting a sandbox of its own keeps its namespace. Claude Code's

@@ -269,9 +269,12 @@ ability to reach whatever the names in the config resolve to. Its working
 directory is `/` inside the sandbox's mount namespace and it is non-dumpable;
 it dies with bubbler (`PR_SET_PDEATHSIG`) and is stopped with the run.
 
-It runs with **no seccomp filter** in v1, unlike every other bubbler sidecar:
-rustix exposes no filter load, the `pre_exec` that sets all of the above must
-stay async-signal-safe, and neither libc nor a new crate is being added for it.
+It runs with **no seccomp filter** in v1: rustix exposes no filter load, the
+`pre_exec` that sets all of the above must stay async-signal-safe, and neither
+libc nor a new crate is being added for it. Two of a run's sidecars go without
+one — this proxy and `nft`, a one-shot host binary that exits before the
+application runs — against the three bubbler wraps in a bwrap of its own and
+gives the default filter to; pasta loads a filter of its own making.
 What stands in for the filter: no capability at all, a crate that is
 `#![deny(unsafe_code)]` apart from one descriptor adoption, an allowlist that
 arrives as argv rather than as a file the sandbox could touch, and a request
@@ -295,9 +298,11 @@ head that way is the trade-off rather than a bound bubbler enforces.
 
 ## Seccomp
 
-Every sandbox (instances, `try`, the proxy) loads a denylist compiled with
-libseccomp at launch. Everything not named is allowed: it narrows the kernel
-surface, it is not a capability model.
+Every sandbox (instances, `try`, and each sidecar bubbler wraps in a bwrap of
+its own — the D-Bus and Wayland proxies) loads a denylist compiled with
+libseccomp at launch. The egress proxy is in no bwrap and loads none, as
+above. Everything not named is allowed: it narrows the kernel surface, it is
+not a capability model.
 
 - `EPERM`: kernel keyring, `perf_event_open`, `bpf`, `userfaultfd`,
   `fanotify_init`, NUMA/page migration, module and kexec loading,
@@ -359,7 +364,9 @@ host).
 - No raw USB grant, no pcsclite socket: challenge-response YubiKey and smart
   cards unreachable.
 - `bubbler-net-proxy` runs with no seccomp filter (above), and `allow-host`
-  needs a delegated cgroup2 subtree — without one the run is refused.
+  needs a delegated cgroup2 subtree — without one the run is refused. Its
+  refusals go to bubbler's stderr: your terminal, or `bubbler log <inst>` for a
+  run that had none.
 - `app-runtime` does not carry Discord rich presence.
 - KeePassXC native messaging manifest must be placed by hand.
 - `camera` never exercised on real hardware.

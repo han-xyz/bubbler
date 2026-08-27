@@ -21,8 +21,10 @@
 // It is documentation, not measurement: nobody has yet run the tool
 // through this profile end to end, so a feature that reaches a host the
 // table does not name will fail here first. The failure is the proxy
-// refusing a name — `bubbler log <name>` prints the line naming it, and
-// the fix is one more `allow-host`:
+// refusing a name, and the line naming it goes to bubbler's stderr —
+// your terminal for a run started from one, and `bubbler log <name>`
+// for a run with no terminal, which is how a desktop entry or a shim
+// starts one. The fix is one more `allow-host`:
 //
 //   allow-host "github.com"
 //   allow-host "objects.githubusercontent.com"
@@ -35,11 +37,16 @@
 //
 // What is filtered away: `WebFetch` of any URL off the list, an MCP
 // server that reaches a service of its own, and `git`, `gh` or `curl`
-// against a forge or registry not named here. A name is reached on 443
-// unless the line says `port=<n>`, `*.` at the front matches exactly one
-// label, and a wildcard directly under a top-level domain is a lint
-// note. Nothing here is plain HTTP: the proxy tunnels CONNECT and
-// forwards no other method.
+// against a forge or registry not named here. Two of the names are not
+// destination bounds at all — `storage.googleapis.com` and
+// `raw.githubusercontent.com` are shared hosting anyone may publish
+// under, so bytes can leave through either; the group comments say so,
+// and each group is there to be deleted where the feature is not used.
+//
+// A name is reached on 443 unless the line says `port=<n>`, `*.` at the
+// front matches exactly one label, and a wildcard directly under a
+// top-level domain is a lint note. Nothing here is plain HTTP: the
+// proxy tunnels CONNECT and forwards no other method.
 //
 // Runtime: `passt` and `nftables` as any filtered network needs, plus a
 // delegated cgroup2 subtree for the proxy's own cgroup — a systemd user
@@ -50,16 +57,21 @@
 lint-allow "outbound-deny" reason="the deny is the point of this profile: egress is filtered by name, through the proxy, rather than by address"
 network {
     outbound "deny"
-    // the API, the sign-in pages, and the OAuth exchange a login code
-    // goes through; the API also answers WebFetch's domain safety check
+    // the API, the sign-in pages, and the OAuth exchange a login code goes
+    // through; the API also answers WebFetch's domain safety check, and
+    // claude.com is a target WebFetch is pre-approved for
     allow-host "api.anthropic.com"
     allow-host "claude.ai"
     allow-host "claude.com"
     allow-host "platform.claude.com"
     // claude.ai connectors (ENABLE_CLAUDEAI_MCP_SERVERS=false drops this)
     allow-host "mcp-proxy.anthropic.com"
-    // releases and version checks, plugin executables and metadata, and
-    // the npm packages an `npx`-launched MCP server installs
+    // releases and version checks, plugin executables, plugin metadata, and
+    // the npm packages an `npx`-launched MCP server installs. The Google
+    // storage host is shared hosting anyone may publish to, so listing it
+    // names a host rather than a party: anything in the sandbox that reaches
+    // it can put bytes in a bucket of its own. Drop that line if no plugin
+    // here needs its metadata.
     allow-host "downloads.claude.ai"
     allow-host "storage.googleapis.com"
     allow-host "registry.npmjs.org"
@@ -67,8 +79,9 @@ network {
     // drops the second)
     allow-host "bridge.claudeusercontent.com"
     allow-host "*.frame.claudeusercontent.com"
-    // the changelog `/release-notes` reads, and plugin marketplaces
-    // hosted on it
+    // the changelog `/release-notes` reads. Shared hosting as well — every
+    // public repository on GitHub is under this one name — so it is a way
+    // out as much as a source; drop it if the changelog can go unread.
     allow-host "raw.githubusercontent.com"
     // telemetry and error reports, on Datadog's us5 site
     allow-host "http-intake.logs.us5.datadoghq.com"

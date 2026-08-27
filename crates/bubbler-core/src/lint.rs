@@ -802,19 +802,34 @@ fn arg(node: &KdlNode) -> Option<&str> {
 /// author can have meant.
 fn network_node(i: usize, node: &KdlNode, f: &mut Findings) {
     if kids(node).any(|c| c.name().value() == "outbound" && arg(c) == Some("deny")) {
-        f.push(
-            i,
-            node,
-            &OUTBOUND_DENY,
-            "`outbound \"deny\"` filters by address: the sandbox reaches its \
-             resolver, its own loopback and the `allow-out` destinations, and \
-             nothing else"
-                .to_owned(),
-            "an address policy, not a name one — a host that answers with a \
-             different address, as a CDN does, is refused by the sandbox's own \
-             firewall rather than by the peer; `allow-host` is the same policy \
-             written by name, through a proxy",
-        );
+        // What the filter leaves open depends on whether a name is in
+        // it: an `allow-host` moves the resolver behind the proxy's
+        // cgroup, so telling this reader the sandbox reaches its
+        // resolver would be telling them the opposite of what their
+        // config does.
+        let (message, help) = if kids(node).any(|c| c.name().value() == "allow-host") {
+            (
+                "`outbound \"deny\"` with `allow-host`: the sandbox reaches the \
+                 names listed here through bubbler's proxy, the `allow-out` \
+                 addresses directly, its own loopback, and nothing else — and it \
+                 resolves nothing itself, the resolver being the proxy's too",
+                "a name policy the proxy enforces rather than a rule of the \
+                 ruleset, which accepts that one process: an application that \
+                 ignores `HTTPS_PROXY` fails at the name lookup rather than at \
+                 the connection",
+            )
+        } else {
+            (
+                "`outbound \"deny\"` filters by address: the sandbox reaches its \
+                 resolver, its own loopback and the `allow-out` destinations, and \
+                 nothing else",
+                "an address policy, not a name one — a host that answers with a \
+                 different address, as a CDN does, is refused by the sandbox's own \
+                 firewall rather than by the peer; `allow-host` is the same policy \
+                 written by name, through a proxy",
+            )
+        };
+        f.push(i, node, &OUTBOUND_DENY, message.to_owned(), help);
     }
     for child in kids(node).filter(|c| c.name().value() == "allow-host") {
         // A name the parser refuses is a config error already, and this
@@ -1686,6 +1701,57 @@ mod tests {
             for clean in ["network", "network {\n    outbound \"allow\"\n}"] {
                 assert_eq!(ids(&lint(ctx, &[clean])), [] as [&str; 0], "{clean}");
             }
+        });
+    }
+
+    /// The note is about what the filter leaves open, and an
+    /// `allow-host` changes that: the resolver rules gain the proxy's
+    /// cgroup match, so the sandbox that used to reach its resolver no
+    /// longer does. A reader of the other message would take the
+    /// opposite of their own config from it.
+    #[test]
+    fn the_outbound_deny_note_says_what_an_allow_host_leaves_open() {
+        with(&host(), |ctx| {
+            let by_address = lint(
+                ctx,
+                &["network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\"\n}"],
+            );
+            assert_eq!(ids(&by_address), ["outbound-deny"]);
+            assert!(
+                by_address.findings[0]
+                    .message
+                    .contains("reaches its resolver"),
+                "{by_address:?}"
+            );
+
+            let by_name = lint(
+                ctx,
+                &[
+                    "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\"\n    \
+                     allow-host \"api.example.com\"\n}",
+                ],
+            );
+            assert_eq!(ids(&by_name), ["outbound-deny"]);
+            let finding = &by_name.findings[0];
+            assert_eq!(finding.severity, Severity::Note);
+            // The one thing the other message promises and this
+            // configuration does not give.
+            assert!(
+                !finding.message.contains("reaches its resolver"),
+                "{finding:?}"
+            );
+            assert!(
+                finding.message.contains("resolves nothing itself"),
+                "{finding:?}"
+            );
+            assert!(
+                finding.message.contains("through bubbler's proxy"),
+                "{finding:?}"
+            );
+            assert!(
+                finding.help.contains("ignores `HTTPS_PROXY`"),
+                "{finding:?}"
+            );
         });
     }
 

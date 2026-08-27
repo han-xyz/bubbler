@@ -324,8 +324,10 @@ const CHECK_LINES: &[(&str, &str)] = &[
     ),
     (
         "outbound-deny",
-        "`outbound \"deny\"` filters the sandbox's own network namespace by address: a \
-         name that resolves to an address no `allow-out` covers is refused.",
+        "`outbound \"deny\"` filters the sandbox's own network namespace: by address, so \
+         a name that resolves to an address no `allow-out` covers is refused; and, where \
+         the node has an `allow-host`, by name through the proxy, which is then the only \
+         thing that resolves at all.",
     ),
     (
         "own-on-system-bus",

@@ -59,7 +59,8 @@ not reach, so it finds nothing to connect to.
 
 `claude-code-strict` is the same profile with `allow-host` lines on it: the
 sandbox reaches every host Anthropic's network access requirements table names
-— save `formulae.brew.sh`, which is Homebrew's — over HTTPS, and nothing else.
+— save `formulae.brew.sh`, which is Homebrew's — over HTTPS, and no other name
+at all.
 
 ```
 bubbler create strict --profile claude-code-strict
@@ -74,16 +75,21 @@ sandbox:
 ```kdl
 network {
     outbound "deny"
-    // the API, the sign-in pages, and the OAuth exchange a login code
-    // goes through; the API also answers WebFetch's domain safety check
+    // the API, the sign-in pages, and the OAuth exchange a login code goes
+    // through; the API also answers WebFetch's domain safety check, and
+    // claude.com is a target WebFetch is pre-approved for
     allow-host "api.anthropic.com"
     allow-host "claude.ai"
     allow-host "claude.com"
     allow-host "platform.claude.com"
     // claude.ai connectors (ENABLE_CLAUDEAI_MCP_SERVERS=false drops this)
     allow-host "mcp-proxy.anthropic.com"
-    // releases and version checks, plugin executables and metadata, and
-    // the npm packages an `npx`-launched MCP server installs
+    // releases and version checks, plugin executables, plugin metadata, and
+    // the npm packages an `npx`-launched MCP server installs. The Google
+    // storage host is shared hosting anyone may publish to, so listing it
+    // names a host rather than a party: anything in the sandbox that reaches
+    // it can put bytes in a bucket of its own. Drop that line if no plugin
+    // here needs its metadata.
     allow-host "downloads.claude.ai"
     allow-host "storage.googleapis.com"
     allow-host "registry.npmjs.org"
@@ -91,8 +97,9 @@ network {
     // drops the second)
     allow-host "bridge.claudeusercontent.com"
     allow-host "*.frame.claudeusercontent.com"
-    // the changelog `/release-notes` reads, and plugin marketplaces
-    // hosted on it
+    // the changelog `/release-notes` reads. Shared hosting as well — every
+    // public repository on GitHub is under this one name — so it is a way
+    // out as much as a source; drop it if the changelog can go unread.
     allow-host "raw.githubusercontent.com"
     // telemetry and error reports, on Datadog's us5 site
     allow-host "http-intake.logs.us5.datadoghq.com"
@@ -119,8 +126,10 @@ telemetry somewhere they do not cover.
 
 The list is documentation, not measurement: nobody has yet run the tool through
 this profile end to end, so a feature reaching a host the table does not name
-fails here first. It fails as a refusal in the proxy's log (`bubbler log
-<name>`), naming the host it wanted, and the fix is one more `allow-host` line.
+fails here first. It fails as a refusal from the proxy, and that line goes to
+bubbler's stderr — your terminal for a run started from one, as the commands
+above are, and `bubbler log <name>` for a run with no terminal, which is how a
+desktop entry or a shim starts one. The fix is one more `allow-host` line.
 
 What stays filtered away whatever you keep:
 
@@ -130,6 +139,12 @@ What stays filtered away whatever you keep:
 - Anything that speaks plain HTTP, or that ignores the proxy variables: the
   application has no DNS of its own under this node, so such a client fails at
   the name lookup rather than at the connection.
+
+Two of the fourteen are not destination bounds, and the list is weaker than it
+looks because of them: `storage.googleapis.com` and `raw.githubusercontent.com`
+are shared hosting that anyone may publish under, so a listed name is not a
+listed party and bytes can leave through either. They buy plugin metadata and
+the changelog; delete their lines where neither is used.
 
 It needs `passt` and `nftables` as any filtered network does, plus a cgroup2
 subtree delegated to your user — a systemd user session has one. Without it the

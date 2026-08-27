@@ -29,10 +29,12 @@ network {
 | services on other host addresses (`docker0`, VPN endpoint) | reachable, routed | reachable |
 
 Needs `pasta` (package `passt`). Missing pasta is an error, never a quiet
-fallback. pasta is the one sidecar not wrapped in a sandbox: it must join the
-sandbox's user namespace to configure it, and it isolates itself
-(`pivot_root` into an empty fs, seccomp, no-new-privs). Its authority is over
-the sandbox's namespaces only, which your uid created.
+fallback. pasta is not wrapped in a sandbox: it must join the sandbox's user
+namespace to configure it, and it isolates itself (`pivot_root` into an empty
+fs, seccomp, no-new-privs). Its authority is over the sandbox's namespaces
+only, which your uid created. The egress proxy below is the other sidecar with
+no bwrap of its own, and it is confined the other way — it joins the sandbox's
+namespaces and keeps no capability in them.
 
 Fixed pasta flags on every run: `-t none -u none -T none -U none
 --map-host-loopback none --map-guest-addr none --foreground`. pasta's own
@@ -56,8 +58,10 @@ listen on `0.0.0.0`, not its own loopback.
 
 An nftables ruleset installed in the sandbox's network namespace (`inet`
 table, `policy drop`, trailing `reject`). Always open: loopback, established
-connections, IPv6 neighbour discovery, the resolver on port 53. Everything
-else needs an `allow-out`.
+connections, IPv6 neighbour discovery, and the resolver on port 53 — that last
+one for the sandbox only while no `allow-host` is present, since an
+`allow-host` gates the resolver rules on the proxy's cgroup too (see below).
+Everything else needs an `allow-out`.
 
 - By **address** only; `allow-out "api.example.com"` does not exist and will
   not (CDN/anycast answers change mid-run).
@@ -117,13 +121,14 @@ is how an address is named. Duplicates (same name and port) are an error.
 
 **What the proxy does.** `CONNECT host:port` and nothing else, authorised on
 the request target rather than on `Host`, then bytes relayed blind — no TLS
-interception. Anything else is a status and no tunnel: `405` for another method
-(with `Allow: CONNECT`), `403` for a name no `allow-host` covers, for the wrong
-port and for an IP literal, `502` for a name that does not resolve, `504` for a
-connect timeout, `503` past 64 concurrent tunnels, `408` for a request that
-arrives too slowly, `400`/`414` for a malformed or over-long one. A name that
-resolves to a link-local address is skipped. Plain HTTP is not forwarded, and
-neither is UDP: HTTP/3 is not tunnelled, so a client falls back to TCP.
+interception. Anything else is a status and no tunnel: `405` for another
+method (with `Allow: CONNECT`), `403` for a name no `allow-host` covers, for
+the wrong port and for an IP literal, `502` for a name that does not resolve
+and for one whose every address refuses the connection, `504` for a connect
+timeout, `503` past 64 concurrent tunnels, `408` for a request that arrives
+too slowly, `400`/`414` for a malformed or over-long one. A name that resolves
+to a link-local address is skipped. Plain HTTP is not forwarded, and neither
+is UDP: HTTP/3 is not tunnelled, so a client falls back to TCP.
 
 **DNS is the proxy's.** With any `allow-host` the resolver rules carry the
 cgroup match too, so the proxy resolves and the application does not — that
