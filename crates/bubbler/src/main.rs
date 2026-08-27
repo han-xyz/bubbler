@@ -43,13 +43,14 @@ fn tty_mode(s: &str) -> Result<TtyMode, String> {
     })
 }
 
-/// One `--share` value: a path, optionally with `=ro` or `=rw` at the end,
-/// so a path holding `=` still parses when the mode is spelled out. A
-/// relative path is joined to the current directory, and one holding `.`
-/// or `..` is resolved on the host, because the core binds a share at the
-/// path it was given and refuses one that names a place it would not land
-/// at; `--share ..` therefore shares the parent directory at its resolved
-/// path.
+/// One `--share` value: a path, optionally with `=ro` or `=rw` at the end.
+/// The *last* such suffix is the mode, so a path whose own name ends in
+/// one is still shareable by spelling the mode out (`dir=ro=rw`).
+///
+/// A relative path is joined to the current directory, a `.` is dropped
+/// and a `..` is resolved on the host, because the core binds a share at
+/// the path it was given and refuses one holding either; `--share ..`
+/// therefore shares the parent directory at its resolved path.
 fn share_flag(raw: OsString) -> Result<Share, String> {
     let bytes = raw.as_bytes();
     let (path, mode) = if let Some(p) = bytes.strip_suffix(b"=ro") {
@@ -70,15 +71,24 @@ fn share_flag(raw: OsString) -> Result<Share, String> {
             .map_err(|e| format!("current directory: {e}"))?
             .join(path)
     };
-    if path
-        .components()
-        .any(|c| c == Component::CurDir || c == Component::ParentDir)
-    {
+    // `join` keeps a `.` where it was written and `components` drops it,
+    // so rebuilding the path is what makes `--share .` name the directory
+    // rather than a path with a stray component in every message. Only
+    // `..`, which `components` keeps, is left for the host to resolve.
+    let path: PathBuf = path.components().collect();
+    if path.components().any(|c| c == Component::ParentDir) {
         return std::fs::canonicalize(&path)
             .map(|path| Share { path, mode })
             .map_err(|e| format!("{}: {e}", path.display()));
     }
     Ok(Share { path, mode })
+}
+
+/// Why `run --share` cannot join a sandbox that is already up: a share is
+/// one of the binds bwrap made when it started, and a live mount
+/// namespace takes no more.
+fn share_needs_a_fresh_sandbox(name: &str) -> anyhow::Error {
+    anyhow::anyhow!("instance `{name}` is running; --share needs a fresh sandbox, stop it first")
 }
 
 /// How much of the argv `--explain` prints.
@@ -182,11 +192,13 @@ that same argv grouped under the config node each argument came from.")]
         #[arg(long, value_name = "MODE", value_parser = tty_mode)]
         tty: Option<TtyMode>,
         /// Share a host path for this run only: `PATH` read-write, or
-        /// `PATH=ro`. Under $HOME it appears at the same relative path in
-        /// the private home, elsewhere at the same path; a relative path
-        /// and one holding `.` or `..` are resolved here first. The first
-        /// directory shared is where the command starts. Repeatable; not
-        /// written to config.kdl.
+        /// `PATH=ro`. The last `=ro`/`=rw` is the mode, so a path whose
+        /// own name ends in one needs it spelled out (`dir=ro=rw`). Under
+        /// $HOME it appears at the same relative path in the private
+        /// home, elsewhere at the same path; a relative path is taken
+        /// from the current directory and a `..` is resolved here first.
+        /// The first directory shared is where the command starts.
+        /// Repeatable; not written to config.kdl.
         #[arg(long, value_name = "PATH[=ro|rw]",
               value_parser = OsStringValueParser::new().try_map(share_flag))]
         share: Vec<Share>,
@@ -243,11 +255,13 @@ warning when it is not.")]
         #[arg(long, value_name = "MODE", value_parser = tty_mode)]
         tty: Option<TtyMode>,
         /// Share a host path for this run only: `PATH` read-write, or
-        /// `PATH=ro`. Under $HOME it appears at the same relative path in
-        /// the private home, elsewhere at the same path; a relative path
-        /// and one holding `.` or `..` are resolved here first. The first
-        /// directory shared is where the command starts. Repeatable; not
-        /// written to config.kdl.
+        /// `PATH=ro`. The last `=ro`/`=rw` is the mode, so a path whose
+        /// own name ends in one needs it spelled out (`dir=ro=rw`). Under
+        /// $HOME it appears at the same relative path in the private
+        /// home, elsewhere at the same path; a relative path is taken
+        /// from the current directory and a `..` is resolved here first.
+        /// The first directory shared is where the command starts.
+        /// Repeatable; not written to config.kdl.
         #[arg(long, value_name = "PATH[=ro|rw]",
               value_parser = OsStringValueParser::new().try_map(share_flag))]
         share: Vec<Share>,
@@ -1121,6 +1135,18 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             // `--ctty` is there exactly when a real run would allocate a
             // pty for the sandbox's stdin.
             let ctty = tty::plan(mode, tty::host_is_tty()).ctty();
+            // Before the arguments are forwarded: a run that is about to
+            // be refused must register no document with the portal and
+            // warn about none either.
+            if !inst.config.shares.is_empty()
+                && !dry_run
+                && explain_mode.is_none()
+                && exec::connect(&env, &name)
+                    .with_context(|| format!("connecting to instance `{name}`"))?
+                    .is_some()
+            {
+                return Err(share_needs_a_fresh_sandbox(&name));
+            }
             let forwarded = forwarded_or(&env, &inst, command, dry_run || explain_mode.is_some());
             let command = forwarded.as_deref().or(command);
             if let Some(mode) = explain_mode {
@@ -1153,13 +1179,11 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             if let Some(stream) = exec::connect(&env, &name)
                 .with_context(|| format!("connecting to instance `{name}`"))?
             {
-                // A running sandbox is a set of mounts bwrap made once;
-                // nothing can be bound into it afterwards, so a share
-                // asked for here would be silently missing.
+                // Asked again on this connection, not only on the probe
+                // above: an instance that came up in between is a live
+                // sandbox the share would be missing from just the same.
                 if !inst.config.shares.is_empty() {
-                    bail!(
-                        "instance `{name}` is running; --share needs a fresh sandbox, stop it first"
-                    );
+                    return Err(share_needs_a_fresh_sandbox(&name));
                 }
                 eprintln!(
                     "bubbler: instance `{name}` is running; executing inside it \

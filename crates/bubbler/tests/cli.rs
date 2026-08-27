@@ -948,18 +948,33 @@ fn try_share_read_only_refuses_a_write_inside() {
     let tmp = setup();
     let proj = tmp.path().join("proj");
     std::fs::create_dir(&proj).unwrap();
-    let mut flag = proj.clone().into_os_string();
-    flag.push("=ro");
-    let out = bubbler_live(tmp.path(), &init)
-        .env("BUBBLER_TEST_ALLOW_PATH", tmp.path())
-        .args(["try", "--share"])
-        .arg(&flag)
-        .args(["--", "/usr/bin/touch"])
-        .arg(proj.join("new"))
-        .output()
-        .unwrap();
-    assert_ne!(out.status.code(), Some(0));
+    let touch = |suffix: &str, name: &str| {
+        let mut flag = proj.clone().into_os_string();
+        flag.push(suffix);
+        bubbler_live(tmp.path(), &init)
+            .env("BUBBLER_TEST_ALLOW_PATH", tmp.path())
+            .args(["try", "--share"])
+            .arg(&flag)
+            .args(["--", "/usr/bin/touch"])
+            .arg(proj.join(name))
+            .output()
+            .unwrap()
+    };
+    // The mount, not merely a failure: any refusal before bwrap would
+    // fail the two assertions below just as well, so the kernel's own
+    // word for a read-only bind is what is asked for.
+    let out = touch("=ro", "new");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "{err}");
+    assert!(err.contains("Read-only file system"), "{err}");
     assert!(!proj.join("new").exists());
+
+    // The same command with the default mode, so the refusal above is
+    // the `=ro` and not the share.
+    let out = touch("", "written");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(proj.join("written").exists());
 }
 
 /// A file inside a share is reachable at the path it was named with, so
@@ -1091,6 +1106,66 @@ fn real_run_share_on_a_running_instance_is_refused() {
     assert!(err.contains("--share needs a fresh sandbox"), "{err}");
     // Ended the way the other live runs are: a plain spawn leads no
     // process group of its own, so only its own pid can be signalled.
+    kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
+    let _ = run.wait();
+}
+
+/// The refusal comes before the arguments are forwarded: a run that is
+/// not going to happen must leave nothing behind in the document store
+/// and warn about nothing either.
+#[test]
+fn real_run_share_on_a_running_instance_forwards_no_argument_first() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    write_profile(
+        tmp.path(),
+        "user",
+        "app",
+        "command \"/usr/bin/sleep\" \"30\"\n",
+    );
+    let out = bubbler(tmp.path())
+        .args(["create", "app", "--profile", "app"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut run = bubbler_live(tmp.path(), &init)
+        .args(["run", "app"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let sock = tmp.path().join("run/bubbler/app/init.sock");
+    if !wait_until(
+        || UnixStream::connect(&sock).is_ok(),
+        Duration::from_secs(10),
+    ) {
+        fail_with(run, "the instance never accepted a connection");
+    }
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir(&proj).unwrap();
+    // Outside the share, so it is exactly the argument the forwarding
+    // would take an interest in.
+    let outside = tmp.path().join("outside.txt");
+    std::fs::write(&outside, "x").unwrap();
+    let out = bubbler_live(tmp.path(), &init)
+        .env("BUBBLER_TEST_ALLOW_PATH", tmp.path())
+        .args(["run", "app", "--share"])
+        .arg(&proj)
+        .args(["--", "/usr/bin/true"])
+        .arg(&outside)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--share needs a fresh sandbox"), "{err}");
+    assert!(!err.contains("not visible inside"), "{err}");
+    assert!(!err.contains("forward"), "{err}");
     kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
     let _ = run.wait();
 }
