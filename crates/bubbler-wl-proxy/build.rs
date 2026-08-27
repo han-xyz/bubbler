@@ -10,6 +10,12 @@
 //! XML this parser cannot read, and two stable files that describe one
 //! interface differently, fail the build on purpose: the remedy is to pin the
 //! `wayrs-*` versions, not to let the proxy guess which layout a client meant.
+//!
+//! `BUBBLER_WL_PROXY_TABLES=verbose` prints which copy of a clashing
+//! interface was kept and which file was dropped whole. Those notes are for
+//! whoever bumps the `wayrs-*` versions; every other build is quiet, because
+//! a `cargo:warning` on every build of every dependent crate is a warning
+//! nobody reads.
 
 #![forbid(unsafe_code)]
 
@@ -47,6 +53,10 @@ struct Iface {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=BUBBLER_WL_PROXY_TABLES");
+    // What the tables did with a clashing interface, asked for by whoever
+    // is changing them. Nothing here decides what is generated.
+    let verbose = env::var_os("BUBBLER_WL_PROXY_TABLES").is_some_and(|v| v == "verbose");
     let manifest = PathBuf::from(
         env::var_os("CARGO_MANIFEST_DIR").unwrap_or_else(|| die("CARGO_MANIFEST_DIR is unset")),
     );
@@ -136,10 +146,12 @@ fn main() {
             if !is_unstable(file) {
                 die(format!("{source}: {why}"));
             }
-            println!("cargo:warning={source} dropped whole: {why}");
+            if verbose {
+                println!("cargo:warning={source} dropped whole: {why}");
+            }
             continue;
         }
-        if !kept.is_empty() {
+        if verbose && !kept.is_empty() {
             let names: Vec<&str> = kept.iter().map(|(name, _)| name.as_str()).collect();
             let from: BTreeSet<&str> = kept.iter().map(|(_, from)| from.as_str()).collect();
             println!(

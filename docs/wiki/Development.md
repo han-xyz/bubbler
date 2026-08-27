@@ -17,6 +17,12 @@ only: the KDL parser reserves 512 MiB of address space per read, which the
 build refuses to promise a 32-bit one. Runtime:
 `bwrap`, `xdg-dbus-proxy`, `pasta`, `nft` as the grants need them.
 
+`bubbler-wl-proxy` generates its protocol tables in `build.rs` from the
+`wayrs-*` sources. `BUBBLER_WL_PROXY_TABLES=verbose cargo build -p
+bubbler-wl-proxy` prints which copy of a clashing interface it kept and which
+file it dropped whole — read them when bumping the `wayrs-*` versions;
+otherwise the build is quiet.
+
 ## Checks (all clean before every commit)
 
 ```
