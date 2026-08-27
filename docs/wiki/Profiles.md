@@ -24,8 +24,10 @@ Wayland-first; only the two gaming profiles grant `x11`, and both take the
 
 | Profile | Grants |
 |---|---|
+| `agent` | network, no nested userns; no command of its own |
 | `alacritty` | wayland, no nested userns |
 | `chromium` | wayland dri pulseaudio network dbus portals, ~/Downloads rw |
+| `claude-code` | network, no nested userns, ~/.local/bin/claude and ~/.local/share/claude, `DISABLE_AUTOUPDATER=1` |
 | `code` | wayland dri network dbus portals, ~/Projects rw |
 | `firefox` | wayland dri pulseaudio network dbus portals, ~/Downloads rw |
 | `generic` | nothing beyond the baseline (commented examples to start from) |
@@ -38,6 +40,10 @@ Wayland-first; only the two gaming profiles grant `x11`, and both take the
 | `steam` | wayland `x11 "host"` dri pulseaudio network gamepad |
 | `thunderbird` | wayland network, ~/Downloads rw |
 | `vesktop` | wayland dri pulseaudio network |
+
+`agent` and `claude-code` are the two that run a coding agent rather than a
+desktop application: how each is started from a project directory, and what the
+sandbox around one does not protect, is [AI Agents](AI-Agents.md).
 
 **Sound is `pulseaudio` almost everywhere.** Firefox and Chromium list
 `libpulse` in their Arch dependencies, and Spotify, Electron applications and
@@ -56,7 +62,9 @@ Notes worth knowing:
   none of them nests a sandbox of its own, so the door a nested user
   namespace opens stays shut. For the two terminals that also means the
   shell inside cannot start bwrap, podman or a browser — drop the line for a
-  terminal that hosts those.
+  terminal that hosts those. `agent` and `claude-code` carry it for the other
+  reason: an agent that nests a sandbox of its own has it warned about and
+  skipped, bubbler being the boundary already.
 
 - **steam**: no `portals` on purpose — Steam's runtime reads `/.flatpak-info`
   as "unofficial Flatpak" and aborts. Never add `userns "disable"`

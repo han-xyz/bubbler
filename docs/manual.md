@@ -54,6 +54,7 @@ is an AppArmor profile for packagers that has never been loaded here. See
     bubbler run ff --dry-run              # print the bwrap argv, do not launch
     bubbler run ff --explain              # the same argv, grouped under its nodes
     bubbler run ff --tty none             # no terminal inside at all
+    bubbler run ff --share .              # one host path, for that run only
     bubbler exec ff -- firefox --version  # run inside the instance already running
     bubbler open ff                       # exec into it if it is running, else run
     bubbler open ff -- firefox https://a  # hand a URL to the one already running
@@ -90,6 +91,38 @@ apply on the next start. An exec'd process is given whatever the terminal
 mode decides on (see "Terminal"), and descriptors passed to exec'd commands
 are reachable by the sandboxed application through `/proc`: exec is a
 convenience channel, not a boundary.
+
+`--share <path>[=ro|rw]` on `run` and `try` binds one host path for that run
+and no other. It is read-write unless `=ro` says otherwise, and the last `=ro`
+or `=rw` in the argument is the mode, so a directory whose own name ends in one
+is still shareable by spelling the mode out (`dir=ro=rw`). A relative path is
+taken from the current directory, and a `..` in it is resolved on the host
+first, so `--share .` is the directory you are standing in. A path under your
+home is bound at the same relative path under the private home — `~/src/x` at
+`/home/bubbler/src/x`, the mapping `home-share` makes — and a path outside it
+at the path it has on the host, the mapping `path-share` makes; both come with
+the checks of those nodes, so the source must exist and be a directory or a
+regular file, and the roots under "Host paths" are refused here too, your home
+itself, the instance store and the profile layer among them. A path the config
+already shares is refused (`already shared by config.kdl`), the same path twice
+is refused (`given twice`), and two shares where one contains the other are
+refused (`one share cannot contain another`) for the reason two `path-share`s
+may not overlap.
+
+The first `--share` naming a directory is where the command starts: its mapped
+path replaces `/home/bubbler` in the baseline's `--chdir`, and with only files
+shared the working directory is unchanged. `--explain` prints each one under a
+`--share "<path>" mode=…` group of its own rather than under any node of the
+file, which is the whole of what a share leaves behind: nothing is written to
+`config.kdl`, and the next run shares whatever it is started with. A file
+argument that lies under a share is inside already, so it is passed under the
+name the bind gives it rather than forwarded through the document portal (see
+"File arguments"). `run --share` on an instance that is already running is
+refused — `instance <name> is running; --share needs a fresh sandbox, stop it
+first` — instead of exec'ing into it: a share is one of the binds bwrap made
+when the sandbox started, and a live mount namespace takes no more. Under
+`--dry-run` or `--explain` nothing is running to join, and a fresh sandbox is
+what they describe.
 
 `open` is what a menu entry or a shim calls: it execs into the instance when
 it is running and starts it when it is not, so a URL opens in the window that
@@ -1515,6 +1548,11 @@ file order irrelevant. Where only the resolved sources overlap — two names for
 one host tree, bound at unrelated places — bwrap would accept it, and bubbler
 refuses it anyway so that one host tree has one place inside the sandbox.
 
+A host path can also be shared for one run without touching the file at all:
+`--share` under "Usage" binds it the way whichever of the two nodes matches
+where it lies would, with the same checks and the same refusals, and writes
+nothing back.
+
 `$BUBBLER_TEST_ALLOW_PATH=<dir>` adds one more allowed root; it must be
 absolute and cannot be `/`. It exists so tests can share a temporary directory
 under the otherwise denied `/tmp`. It adds a root rather than switching the
@@ -1742,8 +1780,10 @@ Every one is Wayland-first; only the two gaming profiles grant `x11`, and both
 ask for the session's display with `x11 "host"`. `~/name` below is a
 `home-share`, read-only unless it says `rw`.
 
+    agent         network, no command of its own
     alacritty     wayland
     chromium      wayland dri pulseaudio network dbus portals, ~/Downloads rw
+    claude-code   network, ~/.local/bin/claude and ~/.local/share/claude
     code          wayland dri network dbus portals, ~/Projects rw
     firefox       wayland dri pulseaudio network dbus portals, ~/Downloads rw
     generic       nothing beyond the baseline
@@ -1896,6 +1936,81 @@ two headers is for: the portal runs the chooser on the host, exports what you
 pick into the instance's own document-portal view, and the path it hands back
 opens there (see "D-Bus"). Without them the chooser is the one inside the
 sandbox, and it sees the private home and the shared directory.
+
+#### AI agents
+
+`claude-code` and `agent` are the two profiles that run no desktop application.
+A coding agent reads and writes the project it is pointed at, runs commands in
+it and talks to its API, and that is what these two give it: the project, a
+network, and a private home for its own state. The host's `~/.claude`, its ssh
+agent, its keyring and the rest of its dotfiles are not in there to be read.
+
+The instance is created once and started from whichever project it is to work
+on, which is what `--share` is for (see "Usage"):
+
+    bubbler create claude-code --profile claude-code
+    cd <project>
+    bubbler run claude-code --share .
+
+The share lasts that run and nothing more: no project is named in `config.kdl`,
+and the sandbox starts in the directory the share was made from.
+
+`claude-code` describes the native install, where `~/.local/bin/claude` is a
+symlink into `~/.local/share/claude/versions/`. Both are shared read-only, the
+link resolved on the host, and `env DISABLE_AUTOUPDATER="1"` stops the
+background updater from trying to write a tree it cannot: updating is the
+host's job. Installed from a package instead, where the binary is under `/usr`,
+neither share is needed and `command "claude"` is the whole of it — the
+baseline binds `/usr` read-only already. The other switches the tool has are
+`env` nodes its header names rather than nodes it ships,
+`DISABLE_TELEMETRY="1"` and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"`: a
+profile fixes what the sandbox breaks and leaves policy to you.
+
+Credentials are a file, not a keyring: Claude Code writes
+`~/.claude/.credentials.json` mode 0600 on Linux and asks no secret service for
+it, so nothing here needs a `dbus` grant and what the sandbox writes is the
+instance's own. There is no browser inside for the login either — choose to
+copy the URL, open it on the host and paste the code back — or copy the host's
+credentials into the private home
+(`~/.local/share/bubbler/instances/claude-code/home/.claude/`) before the first
+run and skip the dialogue.
+
+`network` is all or nothing here. The tool reaches its API and a dozen or so
+other hosts, and `outbound "deny"` filters by address (see "network"), which
+those hosts do not have in any stable sense: the answers behind them change
+mid-run, so an address list either breaks the tool or does not confine it.
+
+`userns "disable"` in both profiles is the deliberate exception to the rule
+that a program nesting a sandbox of its own keeps its namespace. Claude Code's
+own sandbox is bubblewrap too, and bubbler is already the boundary, so the
+inner one is let warn and be skipped rather than handed the door back. What
+does need the namespace is a Playwright or Chromium MCP server: `userns
+"allow"` in the instance, and the browser's own sandbox nests as a browser's
+does anywhere else.
+
+`agent` is the same sandbox with no command in it, for any other tool. Two
+lines in the instance (`bubbler edit <name>`) make it one:
+
+    home-share ".local/bin/<tool>" mode=ro
+    command "/home/bubbler/.local/bin/<tool>"
+
+A tool installed under `/usr` needs neither, its `command` being the bare name,
+and its credentials belong in the private home rather than in a share of the
+host's. Codex, and inference servers such as vLLM or SGLang, have not been
+tested here; a server also wants `dri` for the GPU, a read-only share of the
+model cache, and `network { allow-port <n> }` to publish its port on the host's
+loopback.
+
+What none of this protects is the project itself. The agent has the network and
+it has the share, so anything in the share — a token in `.env`, a key in a
+script — can leave through the API or through any command the agent runs. The
+boundary is around your account, not around what the agent does with what you
+handed it: keep secrets out of the share, or share what it needs and no more
+(`--share ./src --share ./config.toml=ro`). Two gaps are structural rather
+than accidental. The editor bridge (`/ide`) is a websocket on the host's
+loopback, with a token under `~/.claude/ide/`, and a sandbox with its own
+network namespace does not reach the host's loopback. And with no display and
+no portals in the sandbox, a deep link or an `xdg-open` has nothing to open.
 
 ### Managing profiles and instances
 

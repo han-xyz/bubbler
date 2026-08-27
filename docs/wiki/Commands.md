@@ -12,6 +12,7 @@ bubbler run <inst> [-- cmd...]          start it (or exec into it if already run
 bubbler run <inst> --dry-run            print the bwrap argv, launch nothing
 bubbler run <inst> --explain            the same argv grouped under the node that made it
 bubbler run <inst> --tty <mode>         pty | passthrough | none
+bubbler run <inst> --share <p>[=ro|rw]  a host path for this run only; `try` too
 bubbler exec <inst> -- cmd...           run a command inside the running instance
 bubbler open <inst> [-- cmd...]         exec if running, else run; what menu entries call
 bubbler log <inst>                      what its last terminal-less run printed
@@ -48,6 +49,13 @@ bubbler man [--config]                  bubbler(1) / bubbler-config(5) as roff o
   sandbox through the document portal when `portals` is granted, and print a
   warning naming the gap when they cannot; `exec` does not. See
   [Sharing Files](Sharing-Files.md#file-arguments).
+- `--share PATH[=ro|rw]` on `run` and `try` binds a host path for that run
+  only: read-write unless `=ro`, at the same relative path under the private
+  home when it is under `$HOME`, at its own path otherwise, with the checks and
+  reserved roots of `home-share`/`path-share`. The first directory shared is
+  the working directory inside. Refused on a running instance, and never
+  written to `config.kdl`. See
+  [Sharing Files](Sharing-Files.md#per-run-shares).
 - `edit` splits `$VISUAL`/`$EDITOR` on whitespace; no shell, no expansion.
 - `ui` keys on the grants screen: `Space` grants a node, turns a granted one
   that carries an argument, a property or children into a `/-` line the file

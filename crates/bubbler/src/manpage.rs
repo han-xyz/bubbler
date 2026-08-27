@@ -216,6 +216,11 @@ const CONFIG_DESCRIPTION: &[&str] = &[
     "A profile may `include` another, and the layers — yours, the system's, the \
      built-in library — are flattened before any of this is read. `bubbler profile \
      show <name>` prints the result with every node under the layer it came from.",
+    "A share given on the command line is not part of this file: `--share \
+     <path>[=ro|rw]` on `bubbler run` and `bubbler try`, described in bubbler(1), \
+     binds one host path for that one run — the way `home-share` or `path-share` \
+     binds one, by where the path lies — and is never written back. So a config \
+     says what its instance is granted when it is started with no arguments.",
     "`bubbler lint` measures a file against the checks under LINT CHECKS below; a \
      warning or a note is accepted with `lint-allow \"<id>\" reason=\"...\"`, and an \
      id no check has is a parse error.",

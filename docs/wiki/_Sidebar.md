@@ -5,6 +5,7 @@
 - [Commands](Commands.md)
 - [Configuration](Configuration.md)
 - [Profiles](Profiles.md)
+- [AI Agents](AI-Agents.md)
 - [Sharing Files](Sharing-Files.md)
 - [Devices](Devices.md)
 - [Network](Network.md)

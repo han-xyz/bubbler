@@ -25,6 +25,7 @@ each defends and what it does not. `bubbler man | man -l -` and
     bubbler run ff                        # start it; exec into it if already running
     bubbler run ff --dry-run              # print the bwrap argv, launch nothing
     bubbler run ff --explain              # the same argv, grouped under its nodes
+    bubbler run ff --share .              # one host path, for that run only
     bubbler exec ff -- firefox --version  # run inside the running instance
     bubbler open ff -- https://a          # hand a URL to the running one, or start it
     bubbler open ff -- firefox ~/x.pdf    # …or a host file, through the document portal

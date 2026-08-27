@@ -18,7 +18,8 @@ bubbler desktop ff                    # add a menu entry that starts it
 | [Getting Started](Getting-Started.md) | Install, dependencies, first instance |
 | [Commands](Commands.md) | Every subcommand, one line each |
 | [Configuration](Configuration.md) | `config.kdl`: every node and what it grants |
-| [Profiles](Profiles.md) | The 14 built-in profiles, layers, `include`, your own |
+| [Profiles](Profiles.md) | The 16 built-in profiles, layers, `include`, your own |
+| [AI Agents](AI-Agents.md) | Claude Code and other coding agents: the profiles, `--share`, what is not protected |
 | [Sharing Files](Sharing-Files.md) | File arguments through the document portal; `home-share`, `path-share`, `etc-share`, `app-runtime` |
 | [Devices](Devices.md) | GPU, audio, gamepad, hidraw, camera |
 | [Network](Network.md) | Isolated namespace via pasta, inbound ports, outbound filtering |

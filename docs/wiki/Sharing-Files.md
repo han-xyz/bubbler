@@ -43,6 +43,37 @@ hi
 - `--dry-run`/`--explain` print `forward:`/`visible:` lines on stderr and
   register nothing. `bubbler exec` deliberately does not forward.
 
+## Per-run shares
+
+`--share PATH[=ro|rw]` on `run` and `try` binds one host path for that run
+only. Read-write unless `=ro` says otherwise — the last `=ro`/`=rw` is the
+mode, so a directory whose own name ends in one needs it spelled out
+(`dir=ro=rw`). A relative path is taken from the current directory, with a `..`
+resolved on the host first. A path under `$HOME` lands at the same relative
+path under the private home, the way `home-share` maps its source; any other
+path lands at the path it has on the host, the way `path-share` does — with the
+type checks and the reserved roots of both, so your home itself, the instance
+store and the profile layer are refused here as well.
+
+```
+cd <project>
+bubbler run cc --share . --share ~/notes.md=ro
+```
+
+- The first directory shared is the sandbox's working directory; with only
+  files shared it stays `/home/bubbler`.
+- Repeatable, and refused rather than guessed at: a path `config.kdl` already
+  shares (`already shared by config.kdl`), the same path twice (`given twice`),
+  two shares where one contains the other (`one share cannot contain another`).
+- Nothing is written to `config.kdl`, so the file keeps saying what the
+  instance is granted with no arguments.
+- Refused on an instance that is already running — a share is one of the binds
+  `bwrap` made at start and a live mount namespace takes no more, so stop it
+  first. `--dry-run` and `--explain` describe a fresh sandbox either way, with
+  the share under a `--share "<path>" mode=…` group of its own.
+- A file argument under a `--share` is inside already: it is passed under the
+  name the bind gives it rather than forwarded through the document portal.
+
 ## home-share
 
 ```kdl
