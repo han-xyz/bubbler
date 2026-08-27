@@ -12,6 +12,8 @@ network {
     allow-out "1.1.1.1"          // any port, tcp and udp
     allow-out "140.82.112.0/20" port=443 proto="tcp"
     allow-out "2606:4700:4700::1111" port=853
+    allow-host "api.example.com"  // by name, through bubbler's own proxy
+    allow-host "*.example.org" port=8443
     no-ipv6
 }
 ```
@@ -72,6 +74,88 @@ else needs an `allow-out`.
 - A layer above cannot drop a `deny` from an `include`d layer; it can add
   destinations.
 - `--explain` prints the ruleset; `bubbler lint` notes it as `outbound-deny`.
+
+## Egress by name: allow-host
+
+```kdl
+network {
+    outbound "deny"
+    allow-host "api.example.com"          // port 443
+    allow-host "files.example.com" port=8443
+    allow-host "*.example.org"            // exactly one label in place of the *
+}
+```
+
+What an address rule cannot say. `allow-host` needs `outbound "deny"` in the
+same node (anything else is a parse error) and is refused under `network "host"`
+and `network "none"`.
+
+**The mechanism.** bubbler starts `bubbler-net-proxy` — a CONNECT-only proxy —
+as a host process that joins the sandbox's user, network and mount namespaces
+and listens on `127.0.0.1:3128` **inside** the namespace. The ruleset accepts
+that one process by its cgroup and rejects everything else, so the application
+has no route out at all; what it has is the proxy, and the seven variables the
+`network` node sets to point it there:
+
+```
+HTTPS_PROXY  HTTP_PROXY  https_proxy  http_proxy  = http://127.0.0.1:3128
+NO_PROXY     no_proxy                             = localhost,127.0.0.1,::1
+NODE_USE_ENV_PROXY                                = 1
+```
+
+All seven are reserved: an `env` node naming one is a config error, with or
+without an `allow-host`. `allow-port 3128` beside an `allow-host` is one too —
+pasta serves a forwarded port from a socket inside the namespace, which would
+publish the proxy on the host's loopback.
+
+**Names.** ASCII LDH labels, lower-cased, one trailing dot stripped, up to 63
+per label and 253 in all. A single label (`localhost`) is allowed. `*.` at the
+front matches exactly one label, and `*.<tld>` — a wildcard directly under a
+top-level domain — is the `allow-host-wildcard` lint note. No IDNA conversion:
+write the A-label (`xn--…`) yourself. An IP literal is not a name; `allow-out`
+is how an address is named. Duplicates (same name and port) are an error.
+
+**What the proxy does.** `CONNECT host:port` and nothing else, authorised on
+the request target rather than on `Host`, then bytes relayed blind — no TLS
+interception. Anything else is a status and no tunnel: `405` for another method
+(with `Allow: CONNECT`), `403` for a name no `allow-host` covers, for the wrong
+port and for an IP literal, `502` for a name that does not resolve, `504` for a
+connect timeout, `503` past 64 concurrent tunnels, `408` for a request that
+arrives too slowly, `400`/`414` for a malformed or over-long one. A name that
+resolves to a link-local address is skipped. Plain HTTP is not forwarded, and
+neither is UDP: HTTP/3 is not tunnelled, so a client falls back to TCP.
+
+**DNS is the proxy's.** With any `allow-host` the resolver rules carry the
+cgroup match too, so the proxy resolves and the application does not — that
+closes the `<secret>.attacker.example` channel out through a query. The
+trade-off: a client that ignores the proxy variables fails at the name lookup
+rather than at the connection, which reads like a broken resolver rather than
+like a policy. Beside that, an `allow-out` naming an address with no `port=`
+still covers port 53 at that address, so a resolver named that way is one the
+application can still query directly.
+
+**What it costs to run.** The proxy's cgroup has to exist before `nft -f` runs,
+under a cgroup2 subtree delegated to your user — a systemd user session provides
+one. Without it a config with an `allow-host` is refused rather than started
+unfiltered, and the message names the requirement. For the length of such a run
+bubbler moves *itself* into `<its own cgroup>/bubbler-<instance>-<pid>/sandbox`
+and leaves the proxy in the sibling `proxy` leaf, so systemd accounting shows
+the run one level deeper than usual; both leaves are removed at teardown, and
+a `SIGKILL`ed bubbler leaves two empty directories that the next run of that
+instance sweeps.
+
+The proxy writes its tunnels and refusals to bubbler's own stderr, at most 20
+lines a second plus a count of what was suppressed:
+
+```
+bubbler-net-proxy: tunnel to api.example.com:443
+bubbler-net-proxy: denied unlisted.example:443: no allow-host covers it
+```
+
+`bubbler run <inst> --explain` shows the proxy's argv and the seven values
+under the `network` node, and `--explain --net-proxy` renders that argv on its
+own. What the proxy is trusted with, and what keeps the application out of its
+cgroup, is in [Security](Security.md#egress-proxy).
 
 ## Failure modes
 

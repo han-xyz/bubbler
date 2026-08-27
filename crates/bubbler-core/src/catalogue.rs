@@ -106,7 +106,11 @@ pub static GRANTS: &[Grant] = &[
                namespace and accepts by its cgroup; the application itself gets no DNS \
                and reaches nothing the proxy did not open, so one that ignores \
                `HTTPS_PROXY` fails at the lookup. Plain HTTP is not forwarded and a \
-               wildcard covers one label.",
+               wildcard covers one label. The node then sets seven reserved \
+               variables — HTTPS_PROXY, HTTP_PROXY, https_proxy and http_proxy to \
+               http://127.0.0.1:3128, NO_PROXY and no_proxy to \
+               localhost,127.0.0.1,::1, and NODE_USE_ENV_PROXY to 1 — and needs a \
+               delegated cgroup2 subtree, which a systemd user session provides.",
         risk: Risk::Wide,
         grammar: "network [\"host\"|\"none\"] { dns \"<ip>\"; allow-port <n> [udp=#true]; \
                   outbound \"deny\"; allow-out \"<ip>[/<len>]\" [port=<n>] \

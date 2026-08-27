@@ -37,10 +37,9 @@ userns "disable"
 command "/home/bubbler/.local/bin/claude"
 ```
 
-- `network` — the API, and every other host the agent chooses to fetch. Egress
-  cannot be narrowed to the API by address: `outbound "deny"` filters addresses
-  only, and the answers for those hosts change mid-run. See
-  [Network](Network.md).
+- `network` — the API, and every other host the agent chooses to fetch. Narrow
+  it by name with `claude-code-strict` below; an address policy cannot do it,
+  since the answers for those hosts change mid-run. See [Network](Network.md).
 - The two shares are the native install: `~/.local/bin/claude` is a symlink
   into `~/.local/share/claude/versions/`, and both go in read-only with the
   link resolved on the host. Installed from a package (`/usr/bin/claude`)
@@ -55,6 +54,63 @@ Deliberately absent: an ssh agent — `git` over SSH needs a key in the private
 home — a keyring, the host's dotfiles, a display. The editor bridge (`/ide`)
 listens on the host's loopback, which the sandbox's own network namespace does
 not reach, so it finds nothing to connect to.
+
+## Claude Code, egress filtered by name
+
+`claude-code-strict` is the same profile with `allow-host` lines on it: the
+sandbox reaches the hosts Anthropic documents as Claude Code's network access
+requirements, over HTTPS, and nothing else.
+
+```
+bubbler create strict --profile claude-code-strict
+cd <project>
+bubbler run strict --share .
+```
+
+The `network` node and the `lint-allow` beside it are the whole difference;
+pasting them over the bare `network` of a `claude-code` instance gets the same
+sandbox:
+
+```kdl
+network {
+    outbound "deny"
+    allow-host "api.anthropic.com"
+    allow-host "claude.ai"
+    allow-host "platform.claude.com"
+    allow-host "downloads.claude.ai"
+    allow-host "registry.npmjs.org"
+    allow-host "raw.githubusercontent.com"
+    allow-host "browser-intake-us5-datadoghq.com"
+    allow-host "http-intake.logs.us5.datadoghq.com"
+}
+lint-allow "outbound-deny" reason="egress is filtered by name here, not by address"
+```
+
+bubbler runs a CONNECT proxy in the sandbox's own network namespace and lets
+only that process out; the tool is pointed at it with `HTTPS_PROXY` and the six
+other variables the node sets. `/login` still works — the URL opens in a browser
+on the host, and the code you paste back is exchanged with `claude.ai` and
+`platform.claude.com`.
+
+What it breaks, each fixable with one more `allow-host` line:
+
+- `WebFetch` of any URL off the list.
+- A plugin marketplace hosted anywhere but GitHub's raw host.
+- An MCP server that reaches a service of its own — and `git`, `gh` or `curl`
+  against a forge or a registry that is not named.
+- Anything that speaks plain HTTP, or that ignores the proxy variables: the
+  application has no DNS of its own under this node, so such a client fails at
+  the name lookup rather than at the connection.
+
+To send no telemetry rather than to allow it, drop the two `datadoghq` lines
+and add `env DISABLE_TELEMETRY="1"` and
+`env CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"`.
+
+It needs `passt` and `nftables` as any filtered network does, plus a cgroup2
+subtree delegated to your user — a systemd user session has one. Without it the
+run is refused, naming the requirement, rather than started unfiltered. The
+mechanism is [Network](Network.md#egress-by-name-allow-host); what the proxy is
+trusted with is [Security](Security.md#egress-proxy).
 
 ## Any other agent
 
@@ -87,7 +143,9 @@ server also wants `dri` for the GPU, a read-only share of the model cache, and
 
 The agent has the network and it has the project. Anything in the project — a
 token in `.env`, a key in a script — can leave through the API or through any
-command the agent runs. The boundary is around your account, not around what
+command the agent runs, and `allow-host` narrows the destinations without
+changing that: the API itself is a way out, and the sandbox does not read what
+goes through the tunnel. The boundary is around your account, not around what
 the agent does with what you handed it. Keep secrets out of the share, or share
 what it needs and no more:
 

@@ -28,6 +28,7 @@ Wayland-first; only the two gaming profiles grant `x11`, and both take the
 | `alacritty` | wayland, no nested userns |
 | `chromium` | wayland dri pulseaudio network dbus portals, ~/Downloads rw |
 | `claude-code` | network, no nested userns, ~/.local/bin/claude and ~/.local/share/claude, `DISABLE_AUTOUPDATER=1` |
+| `claude-code-strict` | `claude-code` with egress filtered by name: `outbound "deny"` and the eight `allow-host` names the tool is documented to need |
 | `code` | wayland dri network dbus portals, ~/Projects rw |
 | `firefox` | wayland dri pulseaudio network dbus portals, ~/Downloads rw |
 | `generic` | nothing beyond the baseline (commented examples to start from) |
@@ -41,9 +42,10 @@ Wayland-first; only the two gaming profiles grant `x11`, and both take the
 | `thunderbird` | wayland network, ~/Downloads rw |
 | `vesktop` | wayland dri pulseaudio network |
 
-`agent` and `claude-code` are the two that run a coding agent rather than a
-desktop application: how each is started from a project directory, and what the
-sandbox around one does not protect, is [AI Agents](AI-Agents.md).
+`agent`, `claude-code` and `claude-code-strict` are the three that run a coding
+agent rather than a desktop application: how each is started from a project
+directory, what the strict one filters and what the sandbox around one does not
+protect, is [AI Agents](AI-Agents.md).
 
 **Sound is `pulseaudio` almost everywhere.** Firefox and Chromium list
 `libpulse` in their Arch dependencies, and Spotify, Electron applications and
@@ -58,14 +60,14 @@ headers say so — if a game is silent, add `pipewire` beside the `pulseaudio`.
 
 Notes worth knowing:
 
-- **`userns "disable"`**, on all seven that carry it: `agent`, `alacritty`,
-  `claude-code`, `keepassxc`, `kitty`, `libreoffice`, `mpv`. Five of them nest
-  no sandbox of their own, so the door a nested user namespace opens stays
-  shut — and for the two terminals that also means the shell inside cannot
-  start bwrap, podman or a browser, so drop the line for a terminal that hosts
-  those. `agent` and `claude-code` carry it for the other reason: an agent that
-  nests a sandbox of its own has it warned about and skipped, bubbler being the
-  boundary already.
+- **`userns "disable"`**, on all eight that carry it: `agent`, `alacritty`,
+  `claude-code`, `claude-code-strict`, `keepassxc`, `kitty`, `libreoffice`,
+  `mpv`. Five of them nest no sandbox of their own, so the door a nested user
+  namespace opens stays shut — and for the two terminals that also means the
+  shell inside cannot start bwrap, podman or a browser, so drop the line for a
+  terminal that hosts those. The three agent profiles carry it for the other
+  reason: an agent that nests a sandbox of its own has it warned about and
+  skipped, bubbler being the boundary already.
 
 - **steam**: no `portals` on purpose — Steam's runtime reads `/.flatpak-info`
   as "unofficial Flatpak" and aborts. Never add `userns "disable"`

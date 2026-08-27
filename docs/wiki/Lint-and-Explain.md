@@ -33,10 +33,16 @@ advice (exit code untouched).
 `dbus-without-rules`, `env-looks-secret`, `tty-passthrough`,
 `portal-talk-without-portals`, `wayland-host`, `wayland-clipboard-open`.
 
-**Notes** (information): `app-runtime-rw`, `network-host`, `outbound-deny`,
-`ozone-hint-unnecessary`, `command-not-found`, `desktop-entry-missing`,
-`camera-nodes-none-present`, `camera-nodes-no-hotplug`, `secrets-access`,
-`lint-allow-unused`, `x11-nested-no-wm`.
+**Notes** (information): `allow-host-wildcard`, `app-runtime-rw`,
+`network-host`, `outbound-deny`, `ozone-hint-unnecessary`,
+`command-not-found`, `desktop-entry-missing`, `camera-nodes-none-present`,
+`camera-nodes-no-hotplug`, `secrets-access`, `lint-allow-unused`,
+`x11-nested-no-wm`.
+
+`allow-host-wildcard` is about a pattern that is a wildcard directly under a
+top-level domain (`*.com`): the `*` stands for one label, so that one covers
+every name anyone registers under the suffix. A wildcard deeper down
+(`*.example.com`) never raises it.
 
 `x11-nested-no-wm` is about the windows inside a nested `x11` server, so a
 config that already asks for the whole output with `fullscreen=#true`, or names
@@ -69,6 +75,7 @@ bubbler run ff --explain                 # grouped under the node that produced 
 bubbler run ff --explain=full            # baseline included
 bubbler run ff --explain --proxy         # the xdg-dbus-proxy sidecar's argv
 bubbler run ff --explain --wl-proxy      # the bubbler-wl-proxy sidecar's argv
+bubbler run ff --explain --net-proxy     # the bubbler-net-proxy sidecar's argv
 bubbler run ff --explain --format json   # one object per operation, true argv order
 bubbler try --profile firefox --explain
 ```
@@ -81,10 +88,11 @@ arguments: D-Bus `rules:`, `rule-only:` for nodes contributing nothing else,
 which socket a `wayland` node binds (`security-context:` plus the
 `sidecar: bubbler-wl-proxy …` line for a bare grant,
 `raw socket: wayland "host"` for the session's own), `raw socket: x11 "host"`
-for a session X display, `sidecar: pasta …` and the nft ruleset under
-`network`. A nested `x11` needs no such line: the `--x11` argument is the
-Xwayland command line itself, and `--wm` the window manager's name, both
-arguments of `bubbler-init` rather than of bwrap.
+for a session X display, and, under `network`, `sidecar: pasta …`, a second
+`sidecar:` line for the egress proxy where the node has an `allow-host`, and
+the nft ruleset the run installs. A nested `x11` needs no such line: the
+`--x11` argument is the Xwayland command line itself, and `--wm` the window
+manager's name, both arguments of `bubbler-init` rather than of bwrap.
 
 ```
   portals                         config.kdl:11  10 arguments
@@ -129,9 +137,22 @@ config decides is grouped under the `wayland` node that decided it:
     paste
 ```
 
-`--proxy` and `--wl-proxy` each render one sidecar and cannot be combined;
-either without `--explain` is a usage error. A config that starts no such
-sidecar says so instead of printing an empty view.
+`--net-proxy` does the same for the egress proxy an `allow-host` starts. Its
+`command` group is the binary as the sandbox execs it (`/run/bubbler-net-proxy`,
+with the host path it is bound from as a note) and every option pair sits under
+the `network` node that decided it:
+
+```
+  network   config.kdl:4  8 arguments
+    --allow api.example.com:443
+    --port 3128
+    --ready-fd <ready-fd>
+    --log-fd 2
+```
+
+`--proxy`, `--wl-proxy` and `--net-proxy` each render one sidecar and no two can
+be combined; any of them without `--explain` is a usage error. A config that
+starts no such sidecar says so instead of printing an empty view.
 
 With `portals` granted, a command line carrying host file arguments prints one
 `forward:` or `visible:` line each, on **stderr** so that stdout stays the

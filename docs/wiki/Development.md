@@ -3,6 +3,7 @@
 Repository: <https://github.com/han-xyz/bubbler>. Rust 1.95+, edition 2024.
 Workspace crates: `bubbler-core` (library: config, profiles, bwrap argv,
 services), `bubbler` (CLI), `bubbler-init` (in-sandbox supervisor),
+`bubbler-wl-proxy` (the Wayland proxy), `bubbler-net-proxy` (the egress proxy),
 `bubbler-ui` (terminal editor). Only `bubbler-ui` links a TUI toolkit.
 
 ## Build
@@ -55,8 +56,8 @@ cargo +nightly fuzz run config_parse fuzz/corpus/config_parse fuzz/seeds/config_
 ```
 
 Targets: `config_parse`, `kdl_roundtrip`, `profile_resolve`, `desktop_patch`,
-`init_wire`, `seccomp_names`, `wrap_registry`. Seeds are committed; the corpus
-is not. Stable builds run the harnesses without coverage guidance — a smoke
+`init_wire`, `seccomp_names`, `wrap_registry`, `net_proxy_request`. Seeds are
+committed; the corpus is not. Stable builds run the harnesses without coverage guidance — a smoke
 test, not fuzzing.
 
 ## CI
@@ -73,7 +74,8 @@ self-hosted runner).
 |---|---|
 | `crates/bubbler-core/src/bwrap.rs` | the only place bwrap flags are emitted; `ETC_ALLOWLIST` |
 | `crates/bubbler-core/src/service.rs` | each grant node to bwrap arguments |
-| `crates/bubbler-core/src/network.rs` | pasta argv and nft ruleset |
+| `crates/bubbler-core/src/network.rs` | pasta argv, nft ruleset, `allow-host` and the egress proxy's argv |
+| `crates/bubbler-core/src/cgroup.rs` | the `sandbox`/`proxy` cgroup leaves an `allow-host` run needs |
 | `crates/bubbler-core/src/seccomp.rs` | `DEFAULT_EPERM`, `DEFAULT_ENOSYS`, filter compile |
 | `crates/bubbler-core/src/dbus.rs` | proxy plan |
 | `crates/bubbler-core/src/lint.rs` | every check id |

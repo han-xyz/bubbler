@@ -17,6 +17,11 @@ x11 wm="openbox"                 // a window manager inside, with the server
 x11 "host"                       // session X socket + cookie; lint warns
 network                          // own namespace via pasta; see Network
 network "host"                   // host's namespace
+network {
+    outbound "deny"              // filter egress: nothing but what the children name
+    allow-out "1.1.1.1" port=53  // by address
+    allow-host "api.example.com" // by name, through a CONNECT proxy of bubbler's
+}
 dri                              // GPU: /dev/dri, NVIDIA nodes, PCI sysfs
 pipewire                         // $XDG_RUNTIME_DIR/pipewire-0 (playback AND capture)
 pulseaudio                       // pulse/native, sets PULSE_SERVER
@@ -83,6 +88,7 @@ name, in the same file or in a layer under it, still applies.
 | `x11 "host"` | the session's X socket, Xauthority at `/home/bubbler/.Xauthority` | X11 clients can keylog each other; lint warns |
 | `network` | own namespace, internet via pasta | LAN/mDNS and host loopback unreachable; see [Network](Network.md) |
 | `network "host"` | host's network stack | host loopback services and abstract sockets exposed |
+| `network { outbound "deny" … }` | egress narrowed to the `allow-out` addresses and the `allow-host` names | a name is served by a CONNECT proxy of bubbler's on `127.0.0.1:3128` inside, which is also the only thing that resolves: the application gets no DNS, and one that ignores `HTTPS_PROXY` fails at the lookup. Needs a delegated cgroup2 subtree |
 | `dri` | `/dev/dri` rw, NVIDIA nodes, `/sys/devices/pci*`, `/sys/class/drm` | sysfs of **every** PCI device |
 | `pipewire`, `pulseaudio` | session audio socket | microphone too, no portal |
 | `gamepad` | `/dev/input` rw, `/sys/devices`, `/run/udev` | every input node your user can open; keyboard if a group lets you |
@@ -98,7 +104,7 @@ name, in the same file or in a layer under it, still applies.
 | `notify`, `tray`, `mpris`, `input-method` | one or two bus rules each; `IBUS_USE_PORTAL` for `input-method` | need `dbus` in the merged result, as `portals` and `a11y` do |
 | `seccomp` | edit the default denylist | `disable` prints a warning each run |
 | `userns "disable"` | no nested user namespaces | breaks Firefox/Chromium inner sandbox, Steam, podman |
-| `env` | extra variables | `HOME`, `PATH`, `DISPLAY` and the like are refused |
+| `env` | extra variables | `HOME`, `PATH`, `DISPLAY` and the seven proxy variables an `allow-host` sets are refused |
 
 Details: [Sharing Files](Sharing-Files.md), [Devices](Devices.md), [Network](Network.md),
 [D-Bus](D-Bus.md), [Terminal](Terminal.md), [Security](Security.md).

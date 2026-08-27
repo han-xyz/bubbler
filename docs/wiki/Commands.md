@@ -56,6 +56,11 @@ bubbler man [--config]                  bubbler(1) / bubbler-config(5) as roff o
   the working directory inside. Refused on a running instance, and never
   written to `config.kdl`. See
   [Sharing Files](Sharing-Files.md#per-run-shares).
+- `--proxy`, `--wl-proxy` and `--net-proxy` on `run` and `try` each render one
+  sidecar's own argv instead of the sandbox's: the D-Bus proxy, the Wayland
+  proxy, and the egress proxy an `allow-host` starts. Each needs `--explain`,
+  and no two can be given together. See
+  [Lint and Explain](Lint-and-Explain.md#--dry-run-and---explain).
 - `edit` splits `$VISUAL`/`$EDITOR` on whitespace; no shell, no expansion.
 - `ui` keys on the grants screen: `Space` grants a node, turns a granted one
   that carries an argument, a property or children into a `/-` line the file

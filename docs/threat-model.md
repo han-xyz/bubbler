@@ -62,7 +62,7 @@ and the one the mechanism table covers.
 
 ### 2. Sandbox ↔ sidecars
 
-Seven processes can come with a sandbox, and they are not one kind of thing:
+Eight processes can come with a sandbox, and they are not one kind of thing:
 
 | Sidecar | Where it runs | Is it a boundary? |
 |---|---|---|
@@ -72,6 +72,7 @@ Seven processes can come with a sandbox, and they are not one kind of thing:
 | `Xwayland` | *inside* the sandbox, started by `bubbler-init` on the first X connection, only with a bare `x11` | **No.** It is the sandbox's own X server rather than a guard in front of one: every client on it is a process of this instance, and X11 isolates none of them from each other. What it replaces is the session's display — it reaches the compositor on the instance's own Wayland socket and listens nowhere but `/tmp/.X11-unix/X0` in the sandbox's private `/tmp`, a socket `bubbler-init` binds and hands over rather than one the server opens. A command that never speaks X11 never starts it. See "X11" below. |
 | a window manager | *inside* the sandbox, started by `bubbler-init` with the server, only with `x11 wm="…"` | **No.** It is a sibling of the application under `bubbler-init`, resolved on the sandbox's own `PATH`, with the same access to that X server as the application it manages and no more reach into it than any other sibling has. Arch enables the Yama LSM with `kernel.yama.ptrace_scope` at 1 (restricted), which stops a `ptrace` on a tracee outside a restricted scope unless the tracer is privileged or holds `CAP_SYS_PTRACE`; the kernel's Yama document defines that scope as the tracer's own descendants, `PR_SET_PTRACER` being the opt-in, and two siblings are outside each other's. bubbler ships none and probes none; a name that resolves to nothing is a log line. |
 | `pasta` | on the host, **not sandboxed**, holding the sandbox's outer user namespace | **No, in one direction.** A pasta that has been taken over *is* that sandbox's network and holds root over the namespaces the sandbox is built from. It owns nothing beyond what your own account already has: your uid created that namespace. Wrapping it in bwrap would not add anything — it would remove the very thing pasta needs, since a process can only join a descendant of its own user namespace. |
+| `bubbler-net-proxy` | on the host, **not in a bwrap**: it joins the sandbox's user, network and mount namespaces and listens on `127.0.0.1:3128` inside, only with an `allow-host` | **Yes, one way.** It is the sandbox's only route out — the ruleset accepts its cgroup and rejects everything else — and it authorises each `CONNECT` target against the allowlist it was given as argv. It holds **no capability**: permitted, effective, inheritable and ambient are all emptied, with `SECBIT_NOROOT|SECBIT_NOROOT_LOCKED` set first because bwrap's outer user namespace maps bubbler to uid 0 and an `execve` without those bits would hand it the full set in the sandbox's user namespace (measured). So it cannot open `AF_PACKET` on the tap and cannot read or flush the sandbox's ruleset, which is what a `CAP_NET_RAW` or `CAP_NET_ADMIN` sidecar would have handed whoever found a bug in it. What a compromised one does get is the sandbox's filesystem view, the sandbox's DNS and the hosts the config named; it sees ciphertext, since it relays bytes after `200` and terminates no TLS. Its cwd is `/` in the sandbox's mount namespace, it is non-dumpable, it dies with bubbler (`PR_SET_PDEATHSIG`) and it runs with **no seccomp filter** in v1 — the one sidecar without one. What stands in for that: the empty capability sets, `PR_SET_NO_NEW_PRIVS`, a crate that is `#![deny(unsafe_code)]` apart from one descriptor adoption, an allowlist that is argv rather than a file the sandbox could touch, and a fuzzed request parser. |
 | `nft` | on the host, entering the sandbox's user and network namespaces to install the ruleset | **Not a party to one.** It builds the network boundary rather than standing in it: it runs before pasta and before the sandbox is let go of its `--block-fd`, so the namespace has a policy before it has a route and before the application has run an instruction either way. Nothing the sandbox controls reaches it — the ruleset is generated from typed values and handed over on stdin, and its argv is two fixed arguments. It holds CAP_NET_ADMIN in the sandbox's user namespace and no other capability anywhere: the capability crosses `execve` through the ambient set, and `SECBIT_NOROOT` with `_LOCKED` stops the uid-0 that bwrap's nested user namespace maps bubbler to from being handed the full set. It exits before the run begins, and one that stops answering is killed rather than left holding that capability. |
 
 ([A run is a chain of processes](manual.md#usage),
@@ -86,7 +87,9 @@ Seven processes can come with a sandbox, and they are not one kind of thing:
 `the_window_manager_starts_with_the_server_and_the_shutdown_runs_inwards`,
 `the_nft_child_holds_cap_net_admin_and_is_fed_the_ruleset`,
 `the_ruleset_is_the_golden_text_nft_is_fed`,
-`outbound_deny_filters_what_no_allow_out_names_and_the_sandbox_cannot_undo_it`.)
+`outbound_deny_filters_what_no_allow_out_names_and_the_sandbox_cannot_undo_it`,
+`net_proxy_argv_is_the_allowlist_the_port_and_the_descriptors`,
+`real_allow_host_relays_a_listed_name_and_nothing_else`.)
 
 ### 3. Instance ↔ instance
 
@@ -713,11 +716,60 @@ the pid, which bwrap moves. A sandbox whose namespace cannot be connected
 waits at `--block-fd` and is stopped, never started without the network
 it was granted.
 
+`outbound "deny"` narrows the namespace to what the config names. By
+address that is an nftables ruleset in the sandbox's own network
+namespace, which the sandbox can neither read nor flush: the rules live
+in the user namespace that owns its network namespace and bwrap puts the
+application in a *nested* one, so `nft list ruleset` inside fails with
+`Operation not permitted` before it reads the table.
+
+By name it is `allow-host`, and the enforcement is a process rather than
+a rule. `bubbler-net-proxy` (§2 above) runs in a per-sandbox cgroup and
+in the sandbox's namespaces; the ruleset accepts that cgroup —
+`socket cgroupv2 level <n> "<own cgroup>/bubbler-<inst>-<pid>/proxy"` —
+and rejects the rest, so the application's own packets never leave and
+what it can reach is what the proxy opens on the names the config listed.
+
+The application cannot reach the proxy's privilege, and the reason is
+**placement** rather than its own confinement. With the default
+`userns "allow"` it can make itself a user, cgroup and mount namespace
+and mount cgroup2 (measured), but that mount is rooted at the `sandbox`
+leaf bubbler moved itself into before spawning bwrap, and the proxy's
+`proxy` leaf is a sibling outside it — unnameable through that mount,
+and refused by `nsdelegate` even if it were named. `allow-port 3128` —
+the one way the host could have been given a path to the proxy, since
+pasta serves a forwarded port from inside the namespace — is a config
+error whenever an `allow-host` is present. Measured from inside such a
+sandbox, doing exactly that:
+
+```
+mount ok        visible 0       join refused
+direct refused EHOSTUNREACH     dns none
+```
+
+`dns none` is deliberate: with any `allow-host` the resolver rules carry
+the cgroup match too, so only the proxy resolves. A sandbox that could
+query would have a channel out of a network that otherwise has none
+(`<secret>.attacker.example`, read off the attacker's own authoritative
+server). The cost is that an application ignoring `HTTPS_PROXY` fails at
+the name lookup rather than at the connection.
+
 **Does not defend:** it is not a firewall. pasta routes, so a host
 service bound to `0.0.0.0` on an address pasta did not copy in — a VPN
 endpoint, `docker0`, a second NIC — is reachable from inside exactly as
-from any other machine on that network. Outbound traffic is all or
-nothing in this tree. `network "host"` gives all of it back on purpose.
+from any other machine on that network. `network "host"` gives all of it
+back on purpose, and neither filter is offered under it.
+
+The proxy is trusted with the tunnel's bytes and runs without a seccomp
+filter (§2). Its log is bubbler's own stderr, and the budget bounds the
+*rate* of those lines (20 a second, then a suppressed count) and not the
+total, so a sandbox refused often enough for long enough can still push
+older lines out of the 1 MiB `last-run.log` cap — the log is a
+diagnostic, and losing its head that way is a trade-off rather than a
+bound bubbler enforces. `allow-host` also needs a delegated cgroup2
+subtree; without one the run is refused rather than started unfiltered.
+An `allow-out` written with no `port=` covers port 53 at that address as
+well, which leaves the application a resolver to query directly.
 
 [network](manual.md#network) ·
 `pasta_argv_is_the_hardened_invocation`,
@@ -726,7 +778,18 @@ nothing in this tree. `network "host"` gives all of it back on purpose.
 `the_user_namespace_comes_from_the_network_namespace_it_owns`,
 `a_sandbox_whose_network_cannot_be_connected_never_runs`,
 `real_pasta_hides_the_host_loopback_that_network_host_still_reaches`,
-`a_loopback_resolver_is_refused_only_where_it_would_be_the_sandbox`
+`a_loopback_resolver_is_refused_only_where_it_would_be_the_sandbox`,
+`allow_host_puts_the_cgroup_accept_before_the_reject_and_gates_dns`,
+`an_allow_out_on_the_resolver_port_is_gated_with_the_rest_of_dns`,
+`the_rule_names_the_proxy_leaf_beside_the_sandbox_s`,
+`the_teardown_moves_bubbler_back_and_removes_every_directory`,
+`an_empty_leftover_of_an_earlier_run_is_swept`,
+`allow_host_needs_outbound_deny_and_an_isolated_namespace`,
+`the_proxy_port_cannot_be_forwarded_in_beside_an_allow_host`,
+`the_proxy_variables_are_reserved`,
+`real_allow_host_relays_a_listed_name_and_nothing_else`,
+`real_allow_host_survives_the_sandbox_mounting_cgroup2_for_itself`,
+`allow_host_explains_the_proxy_and_the_variables_without_running`
 
 ### The terminal
 
@@ -1080,3 +1143,8 @@ changes.
    i386 half. The failure mode is a weaker sandbox reporting success.
 10. Config and profile parsing — include cycles, depth exhaustion, a
     diamond that grants more than a chain, one path merged in two modes.
+11. The egress proxy — the `CONNECT` parser against a request the sandbox
+    writes (the target and `Host` disagreeing, obs-fold, over-long lines,
+    bytes pipelined behind the blank line), and the cgroup placement that
+    keeps the application out of the proxy's leaf, which is the whole of
+    why it may not be joined.

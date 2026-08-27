@@ -380,8 +380,10 @@ impl fmt::Display for AllowHost {
 /// The match resolves the path to a cgroup id when `nft` reads the rule,
 /// so the directory has to exist before the ruleset is installed and to
 /// live as long as the sandbox: a cgroup created afterwards matches
-/// nothing. The sandbox itself cannot join it — it has an empty
-/// capability set, its own cgroup namespace and no cgroupfs to write.
+/// nothing. What keeps the sandbox out of this cgroup is placement, not
+/// its own confinement: the proxy's leaf lies outside the sandbox's
+/// cgroup-namespace root (see [`crate::cgroup`]), so it is unnameable
+/// through any cgroupfs the application mounts for itself.
 ///
 /// The fields are private and [`Cgroup::new`] is the only way to one, so
 /// the [`fmt::Display`] below cannot be reached with a path no rule

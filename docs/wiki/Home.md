@@ -18,11 +18,11 @@ bubbler desktop ff                    # add a menu entry that starts it
 | [Getting Started](Getting-Started.md) | Install, dependencies, first instance |
 | [Commands](Commands.md) | Every subcommand, one line each |
 | [Configuration](Configuration.md) | `config.kdl`: every node and what it grants |
-| [Profiles](Profiles.md) | The 16 built-in profiles, layers, `include`, your own |
+| [Profiles](Profiles.md) | The 17 built-in profiles, layers, `include`, your own |
 | [AI Agents](AI-Agents.md) | Claude Code and other coding agents: the profiles, `--share`, what is not protected |
 | [Sharing Files](Sharing-Files.md) | File arguments through the document portal; `home-share`, `path-share`, `etc-share`, `app-runtime` |
 | [Devices](Devices.md) | GPU, audio, gamepad, hidraw, camera |
-| [Network](Network.md) | Isolated namespace via pasta, inbound ports, outbound filtering |
+| [Network](Network.md) | Isolated namespace via pasta, inbound ports, outbound filtering by address and by name |
 | [D-Bus](D-Bus.md) | Session, system and accessibility bus through `xdg-dbus-proxy`, portals, tray, input methods |
 | [Desktop Entries and Shims](Desktop-Entries-and-Shims.md) | `bubbler desktop`, `bubbler wrap`, `bubbler open` |
 | [Terminal](Terminal.md) | `tty` modes, detaching, the `bubbler-ui` editor |

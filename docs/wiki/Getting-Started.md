@@ -14,16 +14,18 @@ cargo build --release --locked
 install -Dm755 target/release/bubbler      /usr/bin/bubbler
 install -Dm755 target/release/bubbler-init /usr/lib/bubbler/bubbler-init
 install -Dm755 target/release/bubbler-wl-proxy /usr/lib/bubbler/bubbler-wl-proxy
+install -Dm755 target/release/bubbler-net-proxy /usr/lib/bubbler/bubbler-net-proxy
 install -Dm755 target/release/bubbler-ui   /usr/bin/bubbler-ui      # optional
 target/release/bubbler man          > /usr/share/man/man1/bubbler.1
 target/release/bubbler man --config > /usr/share/man/man5/bubbler-config.5
 ```
 
-`bubbler-init`, the supervisor bound into every sandbox, and
-`bubbler-wl-proxy`, the sidecar in front of a sandboxed `wayland` socket, are
-not commands to type; keep both out of `/usr/bin`. Each is looked for in its
-own variable (`$BUBBLER_INIT`, `$BUBBLER_WL_PROXY`), then beside the running
-`bubbler`, then under `/usr/lib/bubbler/`. Build needs Rust 1.95+ and
+`bubbler-init`, the supervisor bound into every sandbox, `bubbler-wl-proxy`,
+the sidecar in front of a sandboxed `wayland` socket, and `bubbler-net-proxy`,
+the egress proxy an `allow-host` is served by, are not commands to type; keep
+all three out of `/usr/bin`. Each is looked for in its own variable
+(`$BUBBLER_INIT`, `$BUBBLER_WL_PROXY`, `$BUBBLER_NET_PROXY`), then beside the
+running `bubbler`, then under `/usr/lib/bubbler/`. Build needs Rust 1.95+ and
 `libseccomp`.
 
 ## Runtime dependencies
@@ -36,6 +38,7 @@ own variable (`$BUBBLER_INIT`, `$BUBBLER_WL_PROXY`), then beside the running
 | `xdg-dbus-proxy` | any `dbus` or `system-bus` grant — of the shipped profiles, `chromium`, `code` and `firefox`; no profile grants `system-bus` |
 | `passt` | isolated `network` — every shipped profile with a network |
 | `nftables` | `outbound "deny"` only |
+| `bubbler-net-proxy` (not a package — installed above) | `network { allow-host … }` only; it also needs a cgroup2 subtree delegated to your user, which a systemd user session provides |
 | `xdg-desktop-portal` + a backend | `portals`, `camera`; its document portal is the view `portals` binds, which is where files picked in the host chooser and the file arguments `run`/`try`/`open` forward both land |
 | `xorg-xwayland` | a bare `x11` — the X server that runs inside the sandbox |
 | `xorg-twm`, `openbox`, `jwm` or `icewm` | `x11 wm=` — any window manager on the sandbox's PATH; bubbler ships none |

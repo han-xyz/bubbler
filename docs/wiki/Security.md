@@ -20,7 +20,9 @@ bubbler ─┬─ bwrap ── bwrap (pid 1 inside, reaps) ── bubbler-init (
          │                                                                └─ a window manager (only with wm=)
          ├─ bwrap ── bwrap ── bubbler-wl-proxy      (with a sandboxed wayland)
          ├─ bwrap ── bwrap ── xdg-dbus-proxy        (only with dbus / system-bus)
-         └─ pasta                                   (only with isolated network; not sandboxed)
+         ├─ pasta                                   (only with isolated network; not sandboxed)
+         └─ bubbler-net-proxy                       (only with allow-host; in the sandbox's
+                                                     namespaces, holding no capability)
 ```
 
 `bubbler-init` serves the control socket `exec` connects to; the socket is
@@ -243,6 +245,54 @@ of it. The daemons' own names are not granted: fcitx5's carries `Exit`,
 or stop the input method for every application in the session. On Wayland the
 compositor's own text-input path needs no grant at all.
 
+## Egress proxy
+
+`allow-host` filters egress by name, and a name is no part of a packet, so the
+filtering is done by a process: `bubbler-net-proxy`, a CONNECT-only proxy the
+sandbox is pointed at with `HTTPS_PROXY` and the six other variables the
+`network` node sets. The nftables ruleset accepts that process by its cgroup
+and rejects everything else, so what the application can reach is what the
+proxy opens for it. How to write the node is under
+[Network](Network.md#egress-by-name-allow-host).
+
+The proxy is a host process that joins the run's cgroup and then the sandbox's
+user, network and mount namespaces before `execve`, and holds **no
+capability**: permitted, effective, inheritable and ambient are all empty, and
+`SECBIT_NOROOT|SECBIT_NOROOT_LOCKED` is set *before* they are emptied, because
+bwrap's outer user namespace maps bubbler to uid 0 and an `execve` without
+those bits would hand the sidecar the full set in the sandbox's user namespace.
+It therefore cannot open `AF_PACKET` on the tap and cannot read or flush the
+sandbox's own ruleset — the two powers a `CAP_NET_RAW` or `CAP_NET_ADMIN`
+sidecar would have handed an attacker who found a bug in it. What a compromised
+proxy does get is the sandbox's filesystem view, the sandbox's DNS, and the
+ability to reach whatever the names in the config resolve to. Its working
+directory is `/` inside the sandbox's mount namespace and it is non-dumpable;
+it dies with bubbler (`PR_SET_PDEATHSIG`) and is stopped with the run.
+
+It runs with **no seccomp filter** in v1, unlike every other bubbler sidecar:
+rustix exposes no filter load, the `pre_exec` that sets all of the above must
+stay async-signal-safe, and neither libc nor a new crate is being added for it.
+What stands in for the filter: no capability at all, a crate that is
+`#![deny(unsafe_code)]` apart from one descriptor adoption, an allowlist that
+arrives as argv rather than as a file the sandbox could touch, and a request
+parser that is fuzzed (`fuzz/fuzz_targets/net_proxy_request.rs`).
+
+The application cannot reach the proxy's privilege, and the reason is
+**placement** rather than its own confinement. With the default `userns "allow"`
+it can make itself a user, cgroup and mount namespace and mount cgroup2
+(measured), but that mount is rooted at the `sandbox` leaf bubbler moved itself
+into before spawning bwrap, and the proxy's `proxy` leaf is a sibling outside
+it — unnameable through that mount, and refused by `nsdelegate` even if it were
+named. `allow-port 3128`, the one way the host could have been given a path to
+the proxy since pasta serves a forwarded port from inside the namespace, is a
+config error whenever an `allow-host` is present.
+
+The proxy's log goes to bubbler's own stderr, never to a file. Its budget bounds
+the *rate* of those lines (20 a second, then a suppressed count), not the total,
+so a sandbox that keeps being refused for long enough can still push older lines
+out of the 1 MiB `last-run.log` cap: the log is a diagnostic, and losing its
+head that way is the trade-off rather than a bound bubbler enforces.
+
 ## Seccomp
 
 Every sandbox (instances, `try`, the proxy) loads a denylist compiled with
@@ -308,6 +358,8 @@ host).
 - `hidraw` and `camera nodes=#true` device lists are frozen at launch.
 - No raw USB grant, no pcsclite socket: challenge-response YubiKey and smart
   cards unreachable.
+- `bubbler-net-proxy` runs with no seccomp filter (above), and `allow-host`
+  needs a delegated cgroup2 subtree — without one the run is refused.
 - `app-runtime` does not carry Discord rich presence.
 - KeePassXC native messaging manifest must be placed by hand.
 - `camera` never exercised on real hardware.

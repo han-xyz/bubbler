@@ -1,0 +1,61 @@
+// bubbler profile: claude-code-strict
+//
+// `claude-code` with the egress filtered by name. The sandbox reaches
+// the hosts listed below over HTTPS and nothing else: bubbler runs a
+// CONNECT proxy in the sandbox's own network namespace, points the
+// tool at it (`HTTPS_PROXY` and the six other variables the `network`
+// node sets), and the nftables ruleset accepts that one process and no
+// other. The application resolves nothing itself — DNS is the proxy's
+// too — so a client of its own that ignores the proxy variables fails
+// at the name lookup rather than at the connection.
+//
+// The names are the ones Anthropic documents as Claude Code's network
+// access requirements: the API, the two hosts an OAuth login exchanges
+// its code with, the release and plugin downloads, the npm registry an
+// `npx`-launched MCP server installs from, GitHub's raw host for the
+// changelog and plugin marketplaces, and the two telemetry intakes.
+// `/login` works — the URL is opened in a browser on the host, and the
+// code you paste back is exchanged with `claude.ai` and
+// `platform.claude.com`, both listed.
+//
+// What it breaks: `WebFetch` of any URL off the list, a plugin
+// marketplace hosted anywhere but `raw.githubusercontent.com`, an MCP
+// server that reaches a service of its own, and `git`, `gh` or `curl`
+// against any forge or registry not named here. Each of those is one
+// line in the instance (`bubbler edit <name>`):
+//
+//   allow-host "github.com"
+//   allow-host "objects.githubusercontent.com"
+//
+// A name is reached on 443 unless the line says `port=<n>`, `*.` at the
+// front matches exactly one label, and a wildcard directly under a
+// top-level domain is a lint note. Nothing here is plain HTTP: the
+// proxy tunnels CONNECT and forwards no other method.
+//
+// To send no telemetry rather than to allow it, drop the two
+// `datadoghq` lines and add `env DISABLE_TELEMETRY="1"` and
+// `env CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"`.
+//
+// Runtime: `passt` and `nftables` as any filtered network needs, plus a
+// delegated cgroup2 subtree for the proxy's own cgroup — a systemd user
+// session has one, and without it the run is refused rather than
+// started unfiltered. Everything else is `claude-code`'s: read that
+// profile's header for the install layout, the login, and what is
+// deliberately absent.
+lint-allow "outbound-deny" reason="the names below are the whole point of this profile; egress is filtered by name through the proxy, not by address"
+network {
+    outbound "deny"
+    allow-host "api.anthropic.com"
+    allow-host "claude.ai"
+    allow-host "platform.claude.com"
+    allow-host "downloads.claude.ai"
+    allow-host "registry.npmjs.org"
+    allow-host "raw.githubusercontent.com"
+    allow-host "browser-intake-us5-datadoghq.com"
+    allow-host "http-intake.logs.us5.datadoghq.com"
+}
+userns "disable"
+env DISABLE_AUTOUPDATER="1"
+home-share ".local/bin/claude" mode=ro
+home-share ".local/share/claude" mode=ro
+command "/home/bubbler/.local/bin/claude"

@@ -31,6 +31,33 @@
 //
 // Other switches, as `env` nodes: DISABLE_TELEMETRY="1",
 // CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1".
+//
+// Stricter: `claude-code-strict` is this profile with the egress
+// filtered by name — the tool reaches the hosts Anthropic documents as
+// its network access requirements and nothing else, through a CONNECT
+// proxy bubbler runs in the sandbox's network namespace. Create an
+// instance from that profile, or replace the bare `network` node here
+// with the whole block:
+//
+//     network {
+//         outbound "deny"
+//         allow-host "api.anthropic.com"
+//         allow-host "claude.ai"
+//         allow-host "platform.claude.com"
+//         allow-host "downloads.claude.ai"
+//         allow-host "registry.npmjs.org"
+//         allow-host "raw.githubusercontent.com"
+//         allow-host "browser-intake-us5-datadoghq.com"
+//         allow-host "http-intake.logs.us5.datadoghq.com"
+//     }
+//     lint-allow "outbound-deny" reason="egress is filtered by name here, not by address"
+//
+// `WebFetch` of a URL off that list, a plugin marketplace hosted
+// anywhere but GitHub's raw host, and an MCP server reaching a service
+// of its own all stop working; each is one more `allow-host` line. The
+// application gets no DNS of its own under it, and the run needs a
+// delegated cgroup2 subtree (a systemd user session has one) beside the
+// `passt` and `nftables` packages.
 network
 userns "disable"
 env DISABLE_AUTOUPDATER="1"

@@ -9,16 +9,18 @@ with named instances, explicit resource grants, and a profile library for
 common applications. bubbler itself is unprivileged; `bwrap`
 does the namespace work.
 
-Status: milestone 10 — a library of 16 profiles (`agent`, `alacritty`,
-`chromium`, `claude-code`, `code`, `firefox`, `generic`, `keepassxc`, `kitty`,
-`libreoffice`, `lutris`, `mpv`, `spotify`, `steam`, `thunderbird`, `vesktop`)
+Status: milestone 10 — a library of 17 profiles (`agent`, `alacritty`,
+`chromium`, `claude-code`, `claude-code-strict`, `code`, `firefox`, `generic`,
+`keepassxc`, `kitty`, `libreoffice`, `lutris`, `mpv`, `spotify`, `steam`,
+`thunderbird`, `vesktop`)
 over GPU, sound, a private home, host paths through `path-share`, host files
 named on the command line through the document portal, a runtime directory
 shared between sandboxes through `app-runtime`, game controllers through
 `gamepad`, a camera through the portal, a filtered session, system and
 accessibility bus with portals, notifications, `tray` and input methods, a
 terminal of their own, a network namespace of their own through pasta with
-outbound filtering through an nftables ruleset installed in it, and a seccomp
+outbound filtering through an nftables ruleset installed in it — by address, or
+by name through a CONNECT proxy that ruleset is written around — and a seccomp
 filter that covers 32-bit binaries as well as 64-bit. Profiles come in three
 layers — yours, the system's, built-in — and compose with `include`. `bubbler
 lint` measures a profile or an instance config against what a sandbox is meant
@@ -158,14 +160,20 @@ command's status.
              │                                                            with `wm=`)
              ├─ bwrap ── bwrap ── bubbler-wl-proxy  (with a sandboxed `wayland`)
              ├─ bwrap ── bwrap ── xdg-dbus-proxy    (only with `dbus`)
-             └─ pasta                               (only with an isolated
-                                                     `network`; not sandboxed)
+             ├─ pasta                               (only with an isolated
+             │                                       `network`; not sandboxed)
+             └─ bubbler-net-proxy                   (only with `allow-host`; in
+                                                     the sandbox's namespaces,
+                                                     holding no capability)
 
-Each `bwrap` leaves a reaper as pid 1 of its own pid namespace. Either proxy's
-sandbox is a sibling of the app's, started by `bubbler` and invisible from
-inside it.
+Each `bwrap` leaves a reaper as pid 1 of its own pid namespace. The Wayland and
+D-Bus proxies' sandboxes are siblings of the app's, started by `bubbler` and
+invisible from inside it. Two sidecars have no bwrap of their own: pasta, which
+could not do its work from inside one, and the egress proxy, which joins the
+sandbox's own namespaces on purpose — that is what puts it on the sandbox's
+loopback — and holds no capability in them. Each is under "network" below.
 
-**pasta is the one sidecar bubbler does not wrap.** bubbler starts it as your
+**pasta is not wrapped in a sandbox.** bubbler starts it as your
 user, outside every sandbox, and hands it a descriptor for the sandbox's outer
 user namespace, which pasta joins in order to configure the network namespace
 that hangs off it. Joining one grants "all capabilities in that namespace,
@@ -254,6 +262,7 @@ file descriptor numbers are the ones a dry run prints.
     bubbler run ff --explain=full          # every argument, the baseline included
     bubbler run ff --explain --proxy       # the D-Bus proxy sidecar's argv instead
     bubbler run ff --explain --wl-proxy    # the Wayland proxy sidecar's argv instead
+    bubbler run ff --explain --net-proxy   # the egress proxy sidecar's argv instead
     bubbler run ff --explain --format json # one object per operation, nothing elided
     bubbler try --profile firefox --explain
 
@@ -314,7 +323,9 @@ stays in true argv order.
 
 A grant that is not only bwrap arguments says so under its own group: a `dbus`
 node lists the `rules:` it hands the proxy, an isolated `network` lists the
-`sidecar:` argv pasta is started with, and a `wayland` node says which socket
+`sidecar:` argv pasta is started with — and a second one for the egress proxy
+where the node has an `allow-host`, with the `ruleset:` block under it — and a
+`wayland` node says which socket
 the one bind is — `security-context:` with the three strings a bare grant
 registers plus the `sidecar:` line naming the proxy in front of it, its two
 sockets and its gate, `raw socket: wayland "host"` for the session's own — none
@@ -344,12 +355,21 @@ default set whatever the instance's `seccomp` node says.
 `--explain --wl-proxy` does the same for the Wayland proxy. Its filter is the
 default set for the same reason, and the one part of its argv the config
 decides — `--gate paste` or `--gate open` — is grouped under the `wayland` node
-that decided it, with that node's line number. The two flags cannot be combined:
-each renders one sidecar's argv, and `--proxy --wl-proxy` together is a usage
-error, as is either without `--explain`. A config with no sidecar of that kind
-says so rather than printing an empty view:
+that decided it, with that node's line number.
+
+`--explain --net-proxy` is the third, for the egress proxy an `allow-host`
+starts. It has no sandbox of its own to render — it joins the application's
+namespaces — so what it prints is the argv alone: the program under `command`,
+as the sandbox execs it (`/run/bubbler-net-proxy`, with the host path it is
+bound from as a note), and every option pair under the `network` node that
+decided it.
+
+The three flags cannot be combined: each renders one sidecar's argv, any two of
+them together is a usage error, as is any of them without `--explain`. A config
+with no sidecar of that kind says so rather than printing an empty view:
 
     bubbler: instance `wlopen` grants no sandboxed wayland, so it starts no Wayland proxy sidecar
+    bubbler: instance `ff` names no `allow-host`, so it starts no egress proxy sidecar
 
 Line numbers are those of the instance's own `config.kdl`, the flattened file
 `create` wrote, not of the profile layer a node was written in; under
@@ -402,6 +422,8 @@ file order does not affect the generated argv.
         allow-out "1.1.1.1"          #   any port, tcp and udp
         allow-out "140.82.112.0/20" port=443 proto="tcp"
         allow-out "2606:4700:4700::1111" port=853
+        allow-host "api.example.com"  #   by name, through bubbler's own proxy
+        allow-host "*.example.org" port=8443
         no-ipv6
     }
     dri                              # GPU: /dev/dri, NVIDIA nodes, the PCI devices' sysfs
@@ -1389,8 +1411,10 @@ not looking at the family.
 resolved once at launch into a set of addresses, and a CDN, an Anycast pool or
 a DNS failover answers with different ones later — the connection then dies
 mid-run, refused by the sandbox's own firewall rather than by the peer, which
-is a worse failure than not offering it. `bubbler lint` says the same thing as
-the `outbound-deny` note.
+is a worse failure than not offering it. What names get instead is
+`allow-host`, below: not a rule of this table at all, but a proxy of bubbler's
+that the table is written around. `bubbler lint` says the same thing as the
+`outbound-deny` note.
 
 **What a blocked destination looks like.** A trailing `reject` rather than a
 drop, so the application gets an error instead of hanging for its own connect
@@ -1471,8 +1495,8 @@ namespace with connectivity has no other unprivileged route (a veth pair needs
 `CAP_NET_ADMIN` in the initial user namespace, which is real root). A missing
 `pasta` is an error naming the `passt` package and `network "host"`, never a
 quiet fall back to the host namespace — which would undo the whole grant. It is
-the one sidecar bubbler does not wrap in a sandbox of its own; what that means
-for the trust boundary is under "A run is a chain of processes" above. The
+not wrapped in a sandbox of its own; what that means for the trust boundary is
+under "A run is a chain of processes" above. The
 sidecar is killed on every way out of a run, and a sandbox whose namespace
 cannot be connected is stopped where it stands rather than started without the
 network it was granted: it waits at bwrap's `--block-fd` until pasta reports
@@ -1486,6 +1510,226 @@ namespaces stop the run instead. And a pasta that dies *during* a run is
 reported once, as `pasta exited (<status>); the sandbox has lost its network`;
 the application keeps running without one, since a lost network is no reason to
 throw away what it has not written out yet.
+
+#### Egress by name: allow-host
+
+    network {
+        outbound "deny"
+        allow-host "api.example.com"
+        allow-host "files.example.com" port=8443
+        allow-host "*.example.org"
+    }
+
+`allow-host` is the policy the address rules cannot express. It requires
+`outbound "deny"` in the same node — anything else is a parse error, the way a
+bundle without `dbus` is — and is refused under `network "host"` and
+`network "none"`, where there is no ruleset of bubbler's to write around it.
+
+A name is no part of a packet, so nothing in the ruleset can hold one. What
+bubbler filters by instead is the *process*: it runs a CONNECT proxy of its own
+inside the sandbox's network namespace, tells the ruleset to accept that one
+process and reject the rest, and points the application at the proxy with
+`HTTPS_PROXY` and six other variables. The application's own packets never
+leave; the proxy's do, to the names the config listed and to nothing else.
+
+**How the ruleset names one process.** `socket cgroupv2 level <n> "<path>"`
+matches by the cgroup a socket's process is in, and — measured on this host,
+kernel 7.1.8 — it matches unprivileged, in the sandbox's network namespace, in
+the `output` chain. So a process bubbler puts in a cgroup of its own passes the
+filter with **no capability at all**. The rules go before the terminal
+`reject`, and with an `allow-host` present the resolver rules carry the same
+match:
+
+    socket cgroupv2 level <n> "<own cgroup>/bubbler-<inst>-<pid>/proxy" ip daddr 169.254.1.1 udp dport 53 accept
+    socket cgroupv2 level <n> "<own cgroup>/bubbler-<inst>-<pid>/proxy" ip daddr 169.254.1.1 tcp dport 53 accept
+    socket cgroupv2 level <n> "<own cgroup>/bubbler-<inst>-<pid>/proxy" accept
+    reject with icmpx admin-prohibited
+
+`<n>` is how many components the path has, counted from the path itself so the
+two can never disagree.
+
+`SO_MARK` would have done the matching too, and was rejected after measuring:
+glibc's resolver opens its own sockets and the caller cannot mark them, so a
+marked proxy could not use `getaddrinfo` — and `meta skuid` cannot tell the two
+processes apart either, both being uid 0 in the user namespace that owns the
+sandbox.
+
+**Two cgroups, and bubbler moves itself into one of them.** nftables resolves
+the path to a cgroup *id* when it reads the rule, so the directory has to exist
+before `nft -f` runs and to live as long as the sandbox; one made afterwards
+matches nothing, silently. And the application's own confinement is not what
+keeps it out of that cgroup — measured, with the default `userns "allow"`: it
+can `unshare(CLONE_NEWUSER|CLONE_NEWCGROUP|CLONE_NEWNS)`, mount cgroup2
+(`CAP_SYS_ADMIN` in the user namespace owning its new cgroup namespace), and
+then name and join anything under its cgroup-namespace root, since the
+migration check asks only for write access to the common ancestor's
+`cgroup.procs`, which is the user's own.
+
+What keeps it out is **placement**. bwrap never changes cgroup, so whichever
+cgroup bwrap is started in becomes the root of the sandbox's cgroup namespace.
+bubbler therefore makes `<its own cgroup>/bubbler-<instance>-<pid>/` with two
+leaves under it, `sandbox` and `proxy`, moves **itself** into `sandbox` before
+spawning bwrap — bwrap, the supervisor and the application inherit it — and
+leaves the proxy in `proxy`, a sibling *outside* that root: unnameable through
+any cgroupfs the application mounts for itself, and refused by `nsdelegate`
+even if it were named. The parent holds no process of its own, and nothing
+writes `cgroup.subtree_control`, so the "no internal processes" rule is never
+reached. Measured from inside a sandbox that mounted its own cgroup2: `mount
+ok`, `visible 0`, `join refused`, and `direct refused EHOSTUNREACH` beside it.
+
+Both live under bubbler's own cgroup, which on a systemd user session is a
+subtree delegated to the user. Without one there is nothing to create, and the
+run is refused rather than started unfiltered:
+
+    allow-host needs a delegated cgroup2 subtree (a systemd user session provides one): creating <path>: <errno>
+
+At teardown bubbler writes its own pid back into the cgroup it came from and
+removes all three directories, retrying for two seconds because bwrap's
+children go a moment after bwrap does. A `SIGKILL`ed bubbler leaves the two
+empty leaves behind; the next run of that instance sweeps empty
+`bubbler-<instance>-*` directories before making its own, and a live run's
+refuse to be removed, so the sweep cannot touch one. The visible cost while a
+filtered run lasts is that bubbler's own process sits one level deeper than it
+did, at `…/bubbler-<instance>-<pid>/sandbox`, which is where systemd's
+accounting sees the whole run.
+
+**The proxy process.** `bubbler-net-proxy` is a workspace binary installed
+beside `bubbler-init` and found the same way (`$BUBBLER_NET_PROXY`, then next
+to the running `bubbler`, then `/usr/lib/bubbler/bubbler-net-proxy`), bound
+read-only into the sandbox at `/run/bubbler-net-proxy` and always exec'd from
+there — it has to be visible in the mount namespace it joins. bubbler starts it
+after pasta and before the application is let go of its `--block-fd`, with a
+cleared environment, stdin and stdout on `/dev/null`, stderr on bubbler's own
+log, and the allowlist as argv (`--allow <name>:<port>`, one per entry) rather
+than as a file the sandbox could reach. In the child, before `execve`, in this
+order:
+
+1. its pid into the `proxy` leaf's `cgroup.procs`, opened before the fork;
+2. `setns` into the sandbox's user namespace, then its network namespace, then
+   its mount namespace;
+3. `chdir("/")`;
+4. `SECBIT_NOROOT | SECBIT_NOROOT_LOCKED`;
+5. the ambient set cleared and every capability set emptied;
+6. `PR_SET_NO_NEW_PRIVS`, `PR_SET_PDEATHSIG(SIGTERM)`, `PR_SET_DUMPABLE(0)`.
+
+The securebits go *before* the sets are emptied and not after: `PR_SET_SECUREBITS`
+itself takes `CAP_SETPCAP`, and setting them afterwards fails with `EPERM`.
+They are load-bearing because bwrap's outer user namespace maps bubbler to
+uid 0, and an `execve` without them would hand the sidecar the full set in the
+sandbox's user namespace. Measured on a live run: `CapPrm`, `CapEff`, `CapInh`
+and `CapAmb` all zero (the bounding set is left as inherited, which nothing can
+draw on without a file capability or uid 0), cwd `/`, and a network namespace
+that is the sandbox's rather than bubbler's.
+
+It runs with **no seccomp filter** in v1, alone among bubbler's sidecars:
+rustix exposes no filter load, the `pre_exec` above must stay
+async-signal-safe, and neither libc nor a new dependency is being added for it.
+What stands in for it is the empty capability sets, a crate that is
+`#![deny(unsafe_code)]` apart from one descriptor adoption, an allowlist that
+arrives as argv, and a request parser that is fuzzed
+(`fuzz/fuzz_targets/net_proxy_request.rs`).
+
+**The port is bubbler's to choose**, and it is `127.0.0.1:3128` inside. The
+seven variables below are `--setenv` pairs of bwrap's own argv, so they are
+settled before the namespace the proxy binds in exists: bwrap makes that
+namespace itself and cannot be told to join one that is already there, so there
+is no binding a port first and naming it afterwards. The namespace is the
+sandbox's own, so the port is free by construction. The proxy is told the
+number (`--port`), binds it after the joins, and reports readiness on a pipe
+before the application is released. An `allow-port 3128` beside an `allow-host`
+is a parse error: a forwarded port is not sent through the tap but served by a
+socket pasta creates in the destination namespace and `splice`s to
+(`pasta(1)`, "Handling of local traffic in pasta"), which would publish
+bubbler's own egress proxy on the host's loopback.
+
+**What the sandbox is told.** With at least one `allow-host` the `network` node
+sets seven variables, all of which are reserved — an `env` node naming one is a
+config error whether or not the config has an `allow-host`:
+
+    HTTPS_PROXY=http://127.0.0.1:3128    https_proxy=http://127.0.0.1:3128
+    HTTP_PROXY=http://127.0.0.1:3128     http_proxy=http://127.0.0.1:3128
+    NO_PROXY=localhost,127.0.0.1,::1     no_proxy=localhost,127.0.0.1,::1
+    NODE_USE_ENV_PROXY=1
+
+Both cases of each name because clients disagree about which they read: curl
+takes the lowercase form, Claude Code tries four spellings, and Node's `fetch`
+honours proxy variables only with `NODE_USE_ENV_PROXY=1`. `NO_PROXY` is set
+because with it unset curl, requests and others proxy `127.0.0.1` too, which
+would send the sandbox's own loopback traffic through the proxy.
+
+**What the proxy speaks.** `CONNECT <host>:<port>` and nothing else. The
+authority form of the request target is what is authorised, never the `Host`
+header — the two can disagree — and after `200` the bytes are relayed blind:
+there is no TLS interception, and the proxy sees ciphertext. Anything else is
+answered and dropped: `405 Method Not Allowed` with `Allow: CONNECT` for
+another method, `403` for a name no `allow-host` covers, for the right name on
+the wrong port and for an IP literal (`allow-out` is how an address is named),
+`502` for a name that does not resolve, `504` for a connect that times out
+after ten seconds, `503` past 64 concurrent tunnels, `408` for a request that
+arrives too slowly, and `400`/`414` for a malformed or over-long one. A name
+that resolves to a link-local address has that answer skipped rather than
+dialled. Plain HTTP is not forwarded, and neither is UDP, so a client that
+would use HTTP/3 falls back to TCP. A tunnel idle for 60 seconds is closed.
+
+**The names.** ASCII letters, digits and `-` per label, no label starting or
+ending with `-`, at most 63 characters a label and 253 in the name as written,
+the trailing dot counted; case is folded and one trailing dot is stripped. A
+single label is a name too (`localhost`), which is what the test suite lists. `*.` in front of the first
+label stands for exactly one label — `*.example.com` covers `api.example.com`
+and neither `example.com` itself nor `a.b.example.com` — and a wildcard
+directly under a top-level domain raises the `allow-host-wildcard` note. There
+is no IDNA conversion: write the `xn--` form the name resolves as. A name whose
+last label is all digits is refused as an address written the wrong way. The
+port defaults to 443, the name and the port are one grant rather than two, and
+a duplicate of both is an error.
+
+**DNS becomes the proxy's alone.** With any `allow-host` the two resolver rules
+carry the cgroup match, so the proxy resolves and the application does not.
+That is deliberate: a sandbox that can send a query can send
+`<secret>.attacker.example` and read the answer off its own authoritative
+server, which is a channel out of a network that otherwise has none. The
+proxy's resolution works because it joined the *mount* namespace as well, so
+`getaddrinfo` reads the sandbox's generated `/etc/resolv.conf` and asks pasta's
+forwarder at `169.254.1.1` — measured at 88 ms in the design spike. Two
+consequences worth knowing before writing the node:
+
+- An application that ignores the proxy variables fails at the name lookup
+  rather than at the connection. That is the documented trade-off, and it reads
+  like a broken resolver rather than like a policy; `bubbler log` has the
+  proxy's own lines beside it.
+- An `allow-out` written with no `port=` covers every port at that address,
+  port 53 among them. A resolver named that way stays reachable by the
+  application directly, which is a hole in the paragraph above — name a port on
+  such a rule if you meant only one.
+
+**What it prints.** The proxy's `--log-fd` is bubbler's own stderr, never a
+file. Its budget is 20 lines a second, after which the count of what was
+swallowed is printed in the next window. Measured on a real run of the
+integration test, with the sandbox's own probes interleaved:
+
+    bubbler-net-proxy: listening on 127.0.0.1:3128 for 2 allowed targets
+    bubbler-net-proxy: tunnel to localhost:45123
+    relay ok
+    bubbler-net-proxy: denied unlisted.invalid:45123: no allow-host covers it
+    unlisted 403
+    get 405
+    direct refused EHOSTUNREACH
+    dns none
+    env ok
+    bubbler-net-proxy: tunnel to one.one.one.one:443
+    egress ok
+
+The last two lines are the whole mechanism end to end: the proxy resolved a
+real name and reached it, in the same sandbox where the application got
+`dns none` from `getaddrinfo` and `EHOSTUNREACH` from a direct connection.
+
+`bubbler run <name> --explain` shows the seven variables, the `--ro-bind` of
+the binary and both `sidecar:` lines under the `network` node, and the ruleset
+block with the cgroup rules in it; `--explain --net-proxy` renders the proxy's
+own argv on its own, the program under `command` with the host path it is bound
+from as a note. Neither runs anything, so the cgroup in an explained ruleset is
+a placeholder: bubbler's real own-cgroup prefix where `/proc/self/cgroup` can
+be read, and `<own-cgroup>` where it cannot.
 
 A config written before this — one with no `// bubbler config: 2` header line
 and a bare `network` node — asks for a different sandbox now than it did then,
@@ -1798,6 +2042,9 @@ ask for the session's display with `x11 "host"`. `~/name` below is a
     alacritty     wayland
     chromium      wayland dri pulseaudio network dbus portals, ~/Downloads rw
     claude-code   network, ~/.local/bin/claude and ~/.local/share/claude
+    claude-code-strict
+                  claude-code with egress filtered by name: outbound "deny"
+                  and the eight allow-host names the tool is documented to need
     code          wayland dri network dbus portals, ~/Projects rw
     firefox       wayland dri pulseaudio network dbus portals, ~/Downloads rw
     generic       nothing beyond the baseline
@@ -1992,10 +2239,42 @@ credentials into the private home
 (`~/.local/share/bubbler/instances/claude-code/home/.claude/`) before the first
 run and skip the dialogue.
 
-`network` is all or nothing here. The tool reaches its API and a dozen or so
-other hosts, and `outbound "deny"` filters by address (see "network"), which
-those hosts do not have in any stable sense: the answers behind them change
-mid-run, so an address list either breaks the tool or does not confine it.
+`network` is the whole internet in `claude-code`, and by name in
+`claude-code-strict`. An address list is no help: the tool reaches its API and
+a dozen or so other hosts, and none of them has an address in any stable sense
+— the answers change mid-run, so an `allow-out` set either breaks the tool or
+does not confine it. `allow-host` is the same policy written by name, and the
+strict profile is `claude-code` with the eight names Anthropic documents as
+Claude Code's network access requirements on it:
+
+    network {
+        outbound "deny"
+        allow-host "api.anthropic.com"
+        allow-host "claude.ai"
+        allow-host "platform.claude.com"
+        allow-host "downloads.claude.ai"
+        allow-host "registry.npmjs.org"
+        allow-host "raw.githubusercontent.com"
+        allow-host "browser-intake-us5-datadoghq.com"
+        allow-host "http-intake.logs.us5.datadoghq.com"
+    }
+    lint-allow "outbound-deny" reason="egress is filtered by name here, not by address"
+
+The API, the two hosts an OAuth login exchanges its code with, the release and
+plugin downloads, the npm registry an `npx`-launched MCP server installs from,
+GitHub's raw host for the changelog and plugin marketplaces, and the two
+telemetry intakes — drop the last two and set `env DISABLE_TELEMETRY="1"` and
+`env CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"` to send nothing rather than
+to allow it. `/login` works: the URL is opened in a browser on the host, and
+the code pasted back is exchanged with two hosts on the list.
+
+What that costs is `WebFetch` of any URL off the list, a plugin marketplace
+hosted anywhere but GitHub's raw host, an MCP server reaching a service of its
+own, and `git`, `gh` or `curl` against a forge that is not named; each is one
+more `allow-host` line. The application has no DNS of its own under the node
+either, so anything in there that ignores `HTTPS_PROXY` fails at the name
+lookup rather than at the connection. The mechanism, and the delegated cgroup2
+subtree it needs, is under "network" above.
 
 `userns "disable"` in both profiles is the deliberate exception to the rule
 that a program nesting a sandbox of its own keeps its namespace. Claude Code's
@@ -2406,6 +2685,8 @@ application runtime directory granted `mode=rw`, so the sandbox can replace the
 sockets everything else naming that id connects to), `network-host`
 (`network "host"`, the one mode that puts the sandbox on the host's network
 stack), `outbound-deny` (an address policy, not a name one),
+`allow-host-wildcard` (an `allow-host` wildcard directly under a top-level
+domain, which covers every name anyone registers under that suffix),
 `ozone-hint-unnecessary`,
 `command-not-found`, `desktop-entry-missing` (a `desktop` node naming an entry
 no application directory here holds, which is what a profile for software you
@@ -3323,7 +3604,7 @@ changes, not part of CI.
     cargo +nightly fuzz run config_parse \
         fuzz/corpus/config_parse fuzz/seeds/config_parse -- -max_total_time=60
 
-Seven targets, each an entry point that reads bytes bubbler did not write:
+Eight targets, each an entry point that reads bytes bubbler did not write:
 
 | Target | What it feeds |
 |---|---|
@@ -3334,10 +3615,11 @@ Seven targets, each an entry point that reads bytes bubbler did not write:
 | `init_wire` | the in-sandbox supervisor's exec request decoder |
 | `seccomp_names` | syscall names, through `libseccomp` to a compiled filter |
 | `wrap_registry` | `wraps.kdl`, and the `argv[0]` a shim is dispatched on |
+| `net_proxy_request` | the egress proxy's `CONNECT` request parser |
 
 `fuzz/seeds/<target>/` holds the starting inputs, and is committed: the
-sixteen shipped profiles for the two KDL targets, the desktop fixtures for the
-patcher, hand-written bytes for the rest. The first two sets are symlinks into
+seventeen shipped profiles for the two KDL targets, the desktop fixtures for
+the patcher, hand-written bytes for the rest. The first two sets are symlinks into
 the tree rather than copies, so a profile that changes changes the seed with
 it. Random bytes barely reach past the KDL tokenizer, so seeding is what makes
 those targets worth running at all. The working corpus (`fuzz/corpus/`) and any
@@ -3362,6 +3644,7 @@ nightly to actually fuzz.
     install -Dm755 target/release/bubbler      /usr/bin/bubbler
     install -Dm755 target/release/bubbler-init /usr/lib/bubbler/bubbler-init
     install -Dm755 target/release/bubbler-wl-proxy /usr/lib/bubbler/bubbler-wl-proxy
+    install -Dm755 target/release/bubbler-net-proxy /usr/lib/bubbler/bubbler-net-proxy
     install -Dm755 target/release/bubbler-ui   /usr/bin/bubbler-ui
     target/release/bubbler man          > /usr/share/man/man1/bubbler.1
     target/release/bubbler man --config > /usr/share/man/man5/bubbler-config.5
@@ -3379,7 +3662,9 @@ binds into every sandbox, not a command to type. `bubbler-wl-proxy`, the
 sidecar in front of a sandboxed `wayland` socket, is beside it for the same
 reason and is found the same way (`$BUBBLER_WL_PROXY`, then next to the running
 `bubbler`, then `/usr/lib/bubbler/bubbler-wl-proxy`), so a build tree runs what
-it just built. bubbler looks for the supervisor in
+it just built; `bubbler-net-proxy`, the egress proxy an `allow-host` is served
+by, is the third of them and is found the same way again
+(`$BUBBLER_NET_PROXY`). bubbler looks for the supervisor in
 `$BUBBLER_INIT`, then next to the running `bubbler`, then at
 `/usr/lib/bubbler/bubbler-init`; a copy in `/usr/bin` would be found by the
 second of those and work fine, which is the point — it buys nothing, and it
@@ -3390,7 +3675,7 @@ The man pages are generated by the binary that was just built, so they cannot
 promise a flag it does not have. Install them uncompressed; a package manager
 that compresses man pages does it itself.
 
-`/usr/share/bubbler/profiles/` is not part of the install set. The sixteen
+`/usr/share/bubbler/profiles/` is not part of the install set. The seventeen
 shipped profiles are compiled into the binary, and that directory is the
 system layer *between* your profiles and the built-in ones: a file put there
 would shadow the built-in of the same name and keep shadowing it after an
@@ -3398,7 +3683,9 @@ upgrade. It is the administrator's, and bubbler ships nothing in it.
 
 At runtime bubbler needs `bwrap` (bubblewrap), `xdg-dbus-proxy` for any profile
 with a `dbus` or `system-bus` grant, which is most of them, `pasta` (the
-`passt` package) for an isolated `network`, and `libseccomp`. An `a11y` grant
+`passt` package) for an isolated `network`, `nftables` for an `outbound "deny"`
+— and, with an `allow-host`, a cgroup2 subtree delegated to the user, which a
+systemd user session provides — and `libseccomp`. An `a11y` grant
 needs an accessibility bus to find — `at-spi2-core`; the address is asked of
 the session bus by bubbler itself, so no other package goes with it. An
 `input-method` grant reaches something only where fcitx5 or IBus is running.

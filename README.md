@@ -56,6 +56,8 @@ under a share is passed under the name it has inside:
     dri
     pulseaudio                       // pulse/native; `pipewire` binds the native socket instead
     network                          // own namespace via pasta; "host" for the host's
+                                     //   `outbound "deny"` + `allow-out`/`allow-host`
+                                     //   filters egress by address or by name
     home-share "Downloads" mode=rw
     dbus                             // the session bus through a filtering sidecar
     portals
@@ -76,8 +78,9 @@ Reference: [Configuration](docs/wiki/Configuration.md).
 
 ## Profiles
 
-    agent  alacritty  chromium  claude-code  code  firefox  generic  keepassxc
-    kitty  libreoffice  lutris  mpv  spotify  steam  thunderbird  vesktop
+    agent  alacritty  chromium  claude-code  claude-code-strict  code  firefox
+    generic  keepassxc  kitty  libreoffice  lutris  mpv  spotify  steam
+    thunderbird  vesktop
 
 Each ships what its application needs to *run* and nothing else; everything it
 can also be given — a tray icon, notifications, media keys, screen sharing, a
@@ -107,7 +110,9 @@ Build needs Rust 1.95+, a 64-bit target and `libseccomp` (2.5.4+). Runtime: `bub
 kernel with user namespaces; `bubbler-wl-proxy` from the set above in front of
 every sandboxed `wayland`, which is not optional — a run stops without it;
 `xdg-dbus-proxy` for `dbus`/`system-bus`;
-`passt` (pasta) for an isolated `network`; `nftables` for `outbound "deny"`;
+`passt` (pasta) for an isolated `network`; `nftables` for `outbound "deny"`,
+with `bubbler-net-proxy` from the set above and a delegated cgroup2 subtree (a
+systemd user session provides one) where that node names an `allow-host`;
 `xdg-desktop-portal` with a backend for `portals` and `camera`;
 `xorg-xwayland` for the X server a bare `x11` runs inside the sandbox;
 `at-spi2-core` for `a11y`, and fcitx5 or IBus running for `input-method` to

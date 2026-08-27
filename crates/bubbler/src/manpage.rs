@@ -107,6 +107,21 @@ const FILES: &[(&str, &str)] = &[
         "The Wayland proxy a `wayland` grant runs beside the sandbox: it serves the socket \
          the application connects to and gates the clipboard on it.",
     ),
+    (
+        "/usr/lib/bubbler/bubbler-net-proxy",
+        "The egress proxy an `allow-host` is served by: it joins the sandbox's user, \
+         network and mount namespaces, listens on 127.0.0.1:3128 in there and tunnels \
+         CONNECT to the names the config listed. Bound read-only into the sandbox at \
+         /run/bubbler-net-proxy, which is where it is exec'd from.",
+    ),
+    (
+        "/sys/fs/cgroup/<bubbler's own cgroup>/bubbler-<name>-<pid>/",
+        "The two cgroups a run with an `allow-host` needs, made before the ruleset is \
+         installed and removed with the run: `sandbox`, which bubbler moves itself into \
+         before starting bwrap, and `proxy`, the sibling outside the sandbox's \
+         cgroup-namespace root that the ruleset accepts. Needs a delegated cgroup2 \
+         subtree, which a systemd user session provides.",
+    ),
 ];
 
 /// Variables bubbler reads, as the `ENVIRONMENT` section lists them.
