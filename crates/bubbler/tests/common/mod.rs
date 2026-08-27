@@ -627,6 +627,12 @@ pub fn require_system_bus() -> bool {
         ));
         return false;
     }
+    // The instance's runtime leftovers live under the session runtime
+    // dir, which the tests behind this guard read without a second check.
+    if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+        say("skipping: XDG_RUNTIME_DIR unset");
+        return false;
+    }
     true
 }
 

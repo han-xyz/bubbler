@@ -2581,6 +2581,13 @@ fn dry_run_prints_the_forward_line() {
     .unwrap();
     let file = host_file(tmp.path(), "paper.pdf", b"%PDF-1.7\n");
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+    // The permission follows `access(W_OK)`, which root answers yes to
+    // whatever the mode bits say — a CI container runs the suite as root —
+    // so the expectation is asked the same way rather than assumed.
+    let permission = match rustix::fs::access(&file, rustix::fs::Access::WRITE_OK) {
+        Ok(()) => "write",
+        Err(_) => "read",
+    };
 
     let out = bubbler(tmp.path())
         .args(["run", "t", "--dry-run", "--", "/usr/bin/cat"])
@@ -2591,7 +2598,7 @@ fn dry_run_prints_the_forward_line() {
     assert_eq!(out.status.code(), Some(0), "{err}");
     assert!(
         err.contains(&format!(
-            "forward: {} → $XDG_RUNTIME_DIR/doc/<id>/paper.pdf (read)",
+            "forward: {} → $XDG_RUNTIME_DIR/doc/<id>/paper.pdf ({permission})",
             file.display()
         )),
         "{err}"
