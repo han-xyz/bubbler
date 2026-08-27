@@ -1512,4 +1512,110 @@ mod tests {
             assert!(Mode::from_str(bad).is_err(), "{bad}");
         }
     }
+
+    /// An `Env` whose only interesting field is where the egress proxy
+    /// is looked for.
+    fn proxy_env_for(net_proxy_override: Option<PathBuf>) -> Env {
+        Env {
+            home: "/home/user".into(),
+            data_home: "/home/user/.local/share".into(),
+            config_home: "/home/user/.config".into(),
+            data_dirs: crate::env::DEFAULT_DATA_DIRS
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
+            runtime_dir: "/run/user/1000".into(),
+            uid: 1000,
+            gid: 1000,
+            wayland_display: None,
+            display: None,
+            xauthority: None,
+            passthrough: vec![],
+            init_override: None,
+            dbus_address: None,
+            dbus_system_address: None,
+            at_spi_bus_address: None,
+            dbus_log: false,
+            seccomp_log: false,
+            test_allow_path: None,
+            profile_dir_override: None,
+            proxy_override: None,
+            pasta_override: None,
+            wl_proxy_override: None,
+            net_proxy_override,
+        }
+    }
+
+    /// A run with an `allow-host` has no way out but this binary, so an
+    /// override naming something that is not one fails the launch rather
+    /// than falling back to whatever else answers to the name.
+    #[test]
+    fn an_override_wins_and_must_be_a_regular_file() {
+        let (file, dir, _) = crate::host::fake::types();
+        let host = crate::host::fake::FakeHost::default()
+            .with("/build/bubbler-net-proxy", file)
+            .with("/build/adir", dir);
+        assert_eq!(
+            net_proxy_program(
+                &proxy_env_for(Some("/build/bubbler-net-proxy".into())),
+                &host
+            )
+            .unwrap(),
+            (PathBuf::from("/build/bubbler-net-proxy"), Found::Override)
+        );
+        assert!(matches!(
+            net_proxy_program(&proxy_env_for(Some("/build/adir".into())), &host),
+            Err(LaunchError::WrongType {
+                service: "network",
+                expected: "a regular file",
+                ..
+            })
+        ));
+        assert!(matches!(
+            net_proxy_program(&proxy_env_for(Some("/build/gone".into())), &host),
+            Err(LaunchError::MissingResource {
+                service: "network",
+                ..
+            })
+        ));
+    }
+
+    /// The packaged path is the last resort, and a missing one is a
+    /// failed launch: the sandbox would be handed a proxy address
+    /// nothing listens on.
+    #[test]
+    fn without_an_override_the_installed_path_is_the_last_resort() {
+        let (file, _, _) = crate::host::fake::types();
+        let host = crate::host::fake::FakeHost::default().with(NET_PROXY_INSTALLED, file);
+        assert_eq!(
+            net_proxy_program(&proxy_env_for(None), &host).unwrap(),
+            (PathBuf::from(NET_PROXY_INSTALLED), Found::Installed)
+        );
+        assert!(matches!(
+            net_proxy_program(&proxy_env_for(None), &crate::host::fake::FakeHost::default()),
+            Err(LaunchError::MissingResource { service: "network", path })
+                if path == std::path::Path::new(NET_PROXY_INSTALLED)
+        ));
+    }
+
+    /// A build tree runs what it just built, without being told where it
+    /// is — and [`Found::Sibling`] is what says the binary has to be
+    /// bound into the sandbox's mount namespace, which the installed one
+    /// never needs.
+    #[test]
+    fn a_sibling_of_the_running_binary_is_preferred_over_the_installed_one() {
+        let (file, _, _) = crate::host::fake::types();
+        let sibling = std::env::current_exe()
+            .expect("a test binary has a path")
+            .parent()
+            .expect("and a directory")
+            .join(NET_PROXY_NAME);
+        let host = crate::host::fake::FakeHost::default()
+            .with(&sibling.to_string_lossy(), file)
+            .with(NET_PROXY_INSTALLED, file);
+        assert_eq!(
+            net_proxy_program(&proxy_env_for(None), &host).unwrap(),
+            (sibling, Found::Sibling)
+        );
+    }
 }
