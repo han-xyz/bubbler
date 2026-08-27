@@ -1441,6 +1441,43 @@ mod tests {
         }
     }
 
+    /// The `Stricter:` block in `claude-code`'s header is
+    /// `claude-code-strict`'s own `network` node, written out for a
+    /// reader to paste over the bare one. It sits five spaces in, which
+    /// is where `opt_in_nodes` above reads prose and skips it — a lone
+    /// `allow-host` line is not a config, so the paste-back test cannot
+    /// be what holds the two files together. This is.
+    #[test]
+    fn the_stricter_paste_in_is_the_strict_profile_s_network_node() {
+        let header = lookup("claude-code").expect("NAMES lists built-in profiles");
+        // Everything commented under the heading, five spaces in: the
+        // prose of that paragraph sits one space in and drops out here,
+        // so what is left is the KDL a reader selects.
+        let pasted: String = header
+            .lines()
+            .skip_while(|l| !l.starts_with("// Stricter:"))
+            .map_while(|l| l.strip_prefix("//"))
+            .filter_map(|body| body.strip_prefix("     "))
+            .fold(String::new(), |mut out, line| {
+                out.push_str(line);
+                out.push('\n');
+                out
+            });
+        assert!(pasted.starts_with("lint-allow "), "{pasted}");
+        let node_of = |text: &str| {
+            let cfg = config::parse(text).unwrap_or_else(|err| panic!("{text}\n{err}"));
+            let network = cfg
+                .services
+                .iter()
+                .find(|s| matches!(s, Service::Network(_)))
+                .expect("both hold a network node")
+                .clone();
+            (network, cfg.lint_allows)
+        };
+        let strict = lookup("claude-code-strict").expect("NAMES lists built-in profiles");
+        assert_eq!(node_of(&pasted), node_of(strict));
+    }
+
     #[test]
     fn hidraw_written_in_two_layers_is_merged_into_one_node() {
         let tmp = tempfile::tempdir().unwrap();

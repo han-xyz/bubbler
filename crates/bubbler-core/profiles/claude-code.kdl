@@ -36,28 +36,48 @@
 // filtered by name — the tool reaches the hosts Anthropic documents as
 // its network access requirements and nothing else, through a CONNECT
 // proxy bubbler runs in the sandbox's network namespace. Create an
-// instance from that profile, or replace the bare `network` node here
-// with the whole block:
+// instance from that profile, or paste the block below over the bare
+// `network` node here; the two are the same text, and a test holds them
+// together.
 //
+//     lint-allow "outbound-deny" reason="the deny is the point of this profile: egress is filtered by name, through the proxy, rather than by address"
 //     network {
 //         outbound "deny"
+//         // the API, the sign-in pages, and the OAuth exchange a login code
+//         // goes through; the API also answers WebFetch's domain safety check
 //         allow-host "api.anthropic.com"
 //         allow-host "claude.ai"
+//         allow-host "claude.com"
 //         allow-host "platform.claude.com"
+//         // claude.ai connectors (ENABLE_CLAUDEAI_MCP_SERVERS=false drops this)
+//         allow-host "mcp-proxy.anthropic.com"
+//         // releases and version checks, plugin executables and metadata, and
+//         // the npm packages an `npx`-launched MCP server installs
 //         allow-host "downloads.claude.ai"
+//         allow-host "storage.googleapis.com"
 //         allow-host "registry.npmjs.org"
+//         // Claude in Chrome, and Artifacts (CLAUDE_CODE_DISABLE_ARTIFACT=1
+//         // drops the second)
+//         allow-host "bridge.claudeusercontent.com"
+//         allow-host "*.frame.claudeusercontent.com"
+//         // the changelog `/release-notes` reads, and plugin marketplaces
+//         // hosted on it
 //         allow-host "raw.githubusercontent.com"
-//         allow-host "browser-intake-us5-datadoghq.com"
+//         // telemetry and error reports, on Datadog's us5 site
 //         allow-host "http-intake.logs.us5.datadoghq.com"
+//         allow-host "browser-intake-us5-datadoghq.com"
+//         // the documentation the tool looks things up in
+//         allow-host "code.claude.com"
 //     }
-//     lint-allow "outbound-deny" reason="egress is filtered by name here, not by address"
 //
-// `WebFetch` of a URL off that list, a plugin marketplace hosted
-// anywhere but GitHub's raw host, and an MCP server reaching a service
-// of its own all stop working; each is one more `allow-host` line. The
-// application gets no DNS of its own under it, and the run needs a
-// delegated cgroup2 subtree (a systemd user session has one) beside the
-// `passt` and `nftables` packages.
+// Delete a group and the tool loses what its comment names. `WebFetch`
+// of a URL off the list, an MCP server reaching a service of its own,
+// and `git` or `curl` against an unnamed forge stop working whatever
+// you keep; each is one more `allow-host` line. The application has no
+// DNS of its own under this node, so anything in there that ignores
+// `HTTPS_PROXY` fails at the name lookup rather than at the connection,
+// and the run needs a delegated cgroup2 subtree (a systemd user session
+// has one) beside the `passt` and `nftables` packages.
 network
 userns "disable"
 env DISABLE_AUTOUPDATER="1"

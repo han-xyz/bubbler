@@ -58,8 +58,8 @@ not reach, so it finds nothing to connect to.
 ## Claude Code, egress filtered by name
 
 `claude-code-strict` is the same profile with `allow-host` lines on it: the
-sandbox reaches the hosts Anthropic documents as Claude Code's network access
-requirements, over HTTPS, and nothing else.
+sandbox reaches every host Anthropic's network access requirements table names
+— save `formulae.brew.sh`, which is Homebrew's — over HTTPS, and nothing else.
 
 ```
 bubbler create strict --profile claude-code-strict
@@ -74,16 +74,33 @@ sandbox:
 ```kdl
 network {
     outbound "deny"
+    // the API, the sign-in pages, and the OAuth exchange a login code
+    // goes through; the API also answers WebFetch's domain safety check
     allow-host "api.anthropic.com"
     allow-host "claude.ai"
+    allow-host "claude.com"
     allow-host "platform.claude.com"
+    // claude.ai connectors (ENABLE_CLAUDEAI_MCP_SERVERS=false drops this)
+    allow-host "mcp-proxy.anthropic.com"
+    // releases and version checks, plugin executables and metadata, and
+    // the npm packages an `npx`-launched MCP server installs
     allow-host "downloads.claude.ai"
+    allow-host "storage.googleapis.com"
     allow-host "registry.npmjs.org"
+    // Claude in Chrome, and Artifacts (CLAUDE_CODE_DISABLE_ARTIFACT=1
+    // drops the second)
+    allow-host "bridge.claudeusercontent.com"
+    allow-host "*.frame.claudeusercontent.com"
+    // the changelog `/release-notes` reads, and plugin marketplaces
+    // hosted on it
     allow-host "raw.githubusercontent.com"
-    allow-host "browser-intake-us5-datadoghq.com"
+    // telemetry and error reports, on Datadog's us5 site
     allow-host "http-intake.logs.us5.datadoghq.com"
+    allow-host "browser-intake-us5-datadoghq.com"
+    // the documentation the tool looks things up in
+    allow-host "code.claude.com"
 }
-lint-allow "outbound-deny" reason="egress is filtered by name here, not by address"
+lint-allow "outbound-deny" reason="the deny is the point of this profile: egress is filtered by name, through the proxy, rather than by address"
 ```
 
 bubbler runs a CONNECT proxy in the sandbox's own network namespace and lets
@@ -92,19 +109,27 @@ other variables the node sets. `/login` still works — the URL opens in a brows
 on the host, and the code you paste back is exchanged with `claude.ai` and
 `platform.claude.com`.
 
-What it breaks, each fixable with one more `allow-host` line:
+The comment over each group says what deleting it costs, which is how to prune:
+no connectors, no Artifacts, no telemetry, no documentation lookups. To send no
+telemetry rather than to allow it, delete that group and add
+`env DISABLE_TELEMETRY="1"` and
+`env CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"` — and note that those two
+names are one Datadog site's (`us5`), so a tenant on another site sends its
+telemetry somewhere they do not cover.
+
+The list is documentation, not measurement: nobody has yet run the tool through
+this profile end to end, so a feature reaching a host the table does not name
+fails here first. It fails as a refusal in the proxy's log (`bubbler log
+<name>`), naming the host it wanted, and the fix is one more `allow-host` line.
+
+What stays filtered away whatever you keep:
 
 - `WebFetch` of any URL off the list.
-- A plugin marketplace hosted anywhere but GitHub's raw host.
 - An MCP server that reaches a service of its own — and `git`, `gh` or `curl`
   against a forge or a registry that is not named.
 - Anything that speaks plain HTTP, or that ignores the proxy variables: the
   application has no DNS of its own under this node, so such a client fails at
   the name lookup rather than at the connection.
-
-To send no telemetry rather than to allow it, drop the two `datadoghq` lines
-and add `env DISABLE_TELEMETRY="1"` and
-`env CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"`.
 
 It needs `passt` and `nftables` as any filtered network does, plus a cgroup2
 subtree delegated to your user — a systemd user session has one. Without it the

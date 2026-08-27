@@ -28,7 +28,7 @@ Wayland-first; only the two gaming profiles grant `x11`, and both take the
 | `alacritty` | wayland, no nested userns |
 | `chromium` | wayland dri pulseaudio network dbus portals, ~/Downloads rw |
 | `claude-code` | network, no nested userns, ~/.local/bin/claude and ~/.local/share/claude, `DISABLE_AUTOUPDATER=1` |
-| `claude-code-strict` | `claude-code` with egress filtered by name: `outbound "deny"` and the eight `allow-host` names the tool is documented to need |
+| `claude-code-strict` | `claude-code` with egress filtered by name: `outbound "deny"` and an `allow-host` for each host the tool is documented to need |
 | `code` | wayland dri network dbus portals, ~/Projects rw |
 | `firefox` | wayland dri pulseaudio network dbus portals, ~/Downloads rw |
 | `generic` | nothing beyond the baseline (commented examples to start from) |

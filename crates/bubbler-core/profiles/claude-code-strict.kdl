@@ -9,32 +9,37 @@
 // too — so a client of its own that ignores the proxy variables fails
 // at the name lookup rather than at the connection.
 //
-// The names are the ones Anthropic documents as Claude Code's network
-// access requirements: the API, the two hosts an OAuth login exchanges
-// its code with, the release and plugin downloads, the npm registry an
-// `npx`-launched MCP server installs from, GitHub's raw host for the
-// changelog and plugin marketplaces, and the two telemetry intakes.
-// `/login` works — the URL is opened in a browser on the host, and the
-// code you paste back is exchanged with `claude.ai` and
-// `platform.claude.com`, both listed.
+// The list is every host Anthropic documents as a Claude Code network
+// access requirement, minus `formulae.brew.sh` (Homebrew, which is not
+// how anything here is installed). The comment above each group says
+// what it carries, so pruning is a matter of deleting the group you do
+// not want: no connectors, no Artifacts, no telemetry, no documentation
+// lookups. `/login` works — the URL is opened in a browser on the host,
+// and the code you paste back is exchanged with `claude.ai` and
+// `platform.claude.com`.
 //
-// What it breaks: `WebFetch` of any URL off the list, a plugin
-// marketplace hosted anywhere but `raw.githubusercontent.com`, an MCP
-// server that reaches a service of its own, and `git`, `gh` or `curl`
-// against any forge or registry not named here. Each of those is one
-// line in the instance (`bubbler edit <name>`):
+// It is documentation, not measurement: nobody has yet run the tool
+// through this profile end to end, so a feature that reaches a host the
+// table does not name will fail here first. The failure is the proxy
+// refusing a name — `bubbler log <name>` prints the line naming it, and
+// the fix is one more `allow-host`:
 //
 //   allow-host "github.com"
 //   allow-host "objects.githubusercontent.com"
 //
-// A name is reached on 443 unless the line says `port=<n>`, `*.` at the
-// front matches exactly one label, and a wildcard directly under a
-// top-level domain is a lint note. Nothing here is plain HTTP: the
-// proxy tunnels CONNECT and forwards no other method.
-//
-// To send no telemetry rather than to allow it, drop the two
-// `datadoghq` lines and add `env DISABLE_TELEMETRY="1"` and
+// The two `datadoghq` names are one Datadog site's, `us5`; a tenant on
+// another site sends its telemetry somewhere else and would need those
+// names instead. To send none at all, delete that group and add
+// `env DISABLE_TELEMETRY="1"` and
 // `env CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"`.
+//
+// What is filtered away: `WebFetch` of any URL off the list, an MCP
+// server that reaches a service of its own, and `git`, `gh` or `curl`
+// against a forge or registry not named here. A name is reached on 443
+// unless the line says `port=<n>`, `*.` at the front matches exactly one
+// label, and a wildcard directly under a top-level domain is a lint
+// note. Nothing here is plain HTTP: the proxy tunnels CONNECT and
+// forwards no other method.
 //
 // Runtime: `passt` and `nftables` as any filtered network needs, plus a
 // delegated cgroup2 subtree for the proxy's own cgroup — a systemd user
@@ -42,17 +47,34 @@
 // started unfiltered. Everything else is `claude-code`'s: read that
 // profile's header for the install layout, the login, and what is
 // deliberately absent.
-lint-allow "outbound-deny" reason="the names below are the whole point of this profile; egress is filtered by name through the proxy, not by address"
+lint-allow "outbound-deny" reason="the deny is the point of this profile: egress is filtered by name, through the proxy, rather than by address"
 network {
     outbound "deny"
+    // the API, the sign-in pages, and the OAuth exchange a login code
+    // goes through; the API also answers WebFetch's domain safety check
     allow-host "api.anthropic.com"
     allow-host "claude.ai"
+    allow-host "claude.com"
     allow-host "platform.claude.com"
+    // claude.ai connectors (ENABLE_CLAUDEAI_MCP_SERVERS=false drops this)
+    allow-host "mcp-proxy.anthropic.com"
+    // releases and version checks, plugin executables and metadata, and
+    // the npm packages an `npx`-launched MCP server installs
     allow-host "downloads.claude.ai"
+    allow-host "storage.googleapis.com"
     allow-host "registry.npmjs.org"
+    // Claude in Chrome, and Artifacts (CLAUDE_CODE_DISABLE_ARTIFACT=1
+    // drops the second)
+    allow-host "bridge.claudeusercontent.com"
+    allow-host "*.frame.claudeusercontent.com"
+    // the changelog `/release-notes` reads, and plugin marketplaces
+    // hosted on it
     allow-host "raw.githubusercontent.com"
-    allow-host "browser-intake-us5-datadoghq.com"
+    // telemetry and error reports, on Datadog's us5 site
     allow-host "http-intake.logs.us5.datadoghq.com"
+    allow-host "browser-intake-us5-datadoghq.com"
+    // the documentation the tool looks things up in
+    allow-host "code.claude.com"
 }
 userns "disable"
 env DISABLE_AUTOUPDATER="1"

@@ -2044,7 +2044,7 @@ ask for the session's display with `x11 "host"`. `~/name` below is a
     claude-code   network, ~/.local/bin/claude and ~/.local/share/claude
     claude-code-strict
                   claude-code with egress filtered by name: outbound "deny"
-                  and the eight allow-host names the tool is documented to need
+                  and the allow-host names the tool is documented to need
     code          wayland dri network dbus portals, ~/Projects rw
     firefox       wayland dri pulseaudio network dbus portals, ~/Downloads rw
     generic       nothing beyond the baseline
@@ -2244,37 +2244,60 @@ run and skip the dialogue.
 a dozen or so other hosts, and none of them has an address in any stable sense
 — the answers change mid-run, so an `allow-out` set either breaks the tool or
 does not confine it. `allow-host` is the same policy written by name, and the
-strict profile is `claude-code` with the eight names Anthropic documents as
-Claude Code's network access requirements on it:
+strict profile is `claude-code` with every host Anthropic's network access
+requirements table names, save `formulae.brew.sh` (Homebrew, which is not how
+anything here is installed), grouped by what each carries:
 
     network {
         outbound "deny"
+        // the API, the sign-in pages, and the OAuth exchange a login code
+        // goes through; the API also answers WebFetch's domain safety check
         allow-host "api.anthropic.com"
         allow-host "claude.ai"
+        allow-host "claude.com"
         allow-host "platform.claude.com"
+        // claude.ai connectors (ENABLE_CLAUDEAI_MCP_SERVERS=false drops this)
+        allow-host "mcp-proxy.anthropic.com"
+        // releases and version checks, plugin executables and metadata, and
+        // the npm packages an `npx`-launched MCP server installs
         allow-host "downloads.claude.ai"
+        allow-host "storage.googleapis.com"
         allow-host "registry.npmjs.org"
+        // Claude in Chrome, and Artifacts (CLAUDE_CODE_DISABLE_ARTIFACT=1
+        // drops the second)
+        allow-host "bridge.claudeusercontent.com"
+        allow-host "*.frame.claudeusercontent.com"
+        // the changelog `/release-notes` reads, and plugin marketplaces
+        // hosted on it
         allow-host "raw.githubusercontent.com"
-        allow-host "browser-intake-us5-datadoghq.com"
+        // telemetry and error reports, on Datadog's us5 site
         allow-host "http-intake.logs.us5.datadoghq.com"
+        allow-host "browser-intake-us5-datadoghq.com"
+        // the documentation the tool looks things up in
+        allow-host "code.claude.com"
     }
-    lint-allow "outbound-deny" reason="egress is filtered by name here, not by address"
+    lint-allow "outbound-deny" reason="the deny is the point of this profile: egress is filtered by name, through the proxy, rather than by address"
 
-The API, the two hosts an OAuth login exchanges its code with, the release and
-plugin downloads, the npm registry an `npx`-launched MCP server installs from,
-GitHub's raw host for the changelog and plugin marketplaces, and the two
-telemetry intakes — drop the last two and set `env DISABLE_TELEMETRY="1"` and
-`env CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"` to send nothing rather than
-to allow it. `/login` works: the URL is opened in a browser on the host, and
-the code pasted back is exchanged with two hosts on the list.
+The comment over each group is what deleting it costs, so pruning is the
+editing this profile is written for: no connectors, no Artifacts, no telemetry,
+no documentation lookups. To send no telemetry rather than to allow it, delete
+that group and set `env DISABLE_TELEMETRY="1"` and
+`env CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"`; the two names are one
+Datadog site's, `us5`, and a tenant on another site sends its telemetry
+somewhere those names do not cover. `/login` works: the URL is opened in a
+browser on the host, and the code pasted back is exchanged with `claude.ai` and
+`platform.claude.com`.
 
-What that costs is `WebFetch` of any URL off the list, a plugin marketplace
-hosted anywhere but GitHub's raw host, an MCP server reaching a service of its
-own, and `git`, `gh` or `curl` against a forge that is not named; each is one
-more `allow-host` line. The application has no DNS of its own under the node
-either, so anything in there that ignores `HTTPS_PROXY` fails at the name
-lookup rather than at the connection. The mechanism, and the delegated cgroup2
-subtree it needs, is under "network" above.
+The list is documentation rather than measurement. Nobody has yet run the tool
+through this profile end to end, so a feature reaching a host the table does
+not name fails here first — as a refusal in the proxy's log (`bubbler log
+<name>`) naming what it wanted, which is one more `allow-host` line. What stays
+filtered away whatever is kept: `WebFetch` of a URL off the list, an MCP server
+reaching a service of its own, and `git`, `gh` or `curl` against a forge that
+is not named. The application has no DNS of its own under the node either, so
+anything in there that ignores `HTTPS_PROXY` fails at the name lookup rather
+than at the connection. The mechanism, and the delegated cgroup2 subtree it
+needs, is under "network" above.
 
 `userns "disable"` in both profiles is the deliberate exception to the rule
 that a program nesting a sandbox of its own keeps its namespace. Claude Code's
