@@ -1069,9 +1069,24 @@ fn space_len(b: &[u8], at: usize) -> Option<usize> {
 }
 
 /// Line number, counting from one, of the byte at `offset` in `text`.
+/// Every newline [`newline_len`] knows opens a line, not the line feed
+/// alone: KDL reads eight of them, so a file written with carriage
+/// returns has the lines the parser sees and not the one `str::lines`
+/// would find. A CRLF opens one line, not two.
 fn line_at(text: &str, offset: usize) -> Option<u32> {
-    let before = text.get(..offset)?;
-    u32::try_from(before.bytes().filter(|b| *b == b'\n').count() + 1).ok()
+    let b = text.get(..offset)?.as_bytes();
+    let mut line: u32 = 1;
+    let mut i = 0;
+    while i < b.len() {
+        match newline_len(b, i) {
+            Some(n) => {
+                line = line.saturating_add(1);
+                i += n;
+            }
+            None => i += 1,
+        }
+    }
+    Some(line)
 }
 
 /// The parsed layer and where its nodes are: `--explain` names the node
@@ -5353,8 +5368,38 @@ command "b""#
         let commented = format!("/* c\r{}", "{".repeat(20_000));
         assert!(matches!(
             parse(&commented),
-            Err(ConfigError::TooDeep { line: 1, .. })
+            Err(ConfigError::TooDeep { line: 2, .. })
         ));
+    }
+
+    /// The line a refusal names is the line the file has, counted by the
+    /// newlines KDL reads and not by line feeds alone: a file written
+    /// with carriage returns is one line to `str::lines` and many to the
+    /// parser, and a line number nobody can find is worse than none.
+    #[test]
+    fn a_line_number_counts_every_newline_kdl_reads() {
+        for nl in [
+            "\n", "\r", "\r\n", "\u{b}", "\u{c}", "\u{85}", "\u{2028}", "\u{2029}",
+        ] {
+            let deep = format!("// a{nl}// b{nl}{}", "{".repeat(MAX_NESTING + 1));
+            assert!(
+                matches!(
+                    check_bounds(&deep),
+                    Err(ConfigError::TooDeep { line: 3, .. })
+                ),
+                "{nl:?}: {:?}",
+                check_bounds(&deep)
+            );
+            let busy = format!("// a{nl}// b{nl}/*{}*/", "*".repeat(MAX_COMMENT_MARKS + 1));
+            assert!(
+                matches!(
+                    check_bounds(&busy),
+                    Err(ConfigError::CommentTooBusy { line: 3, .. })
+                ),
+                "{nl:?}: {:?}",
+                check_bounds(&busy)
+            );
+        }
     }
 
     #[test]
