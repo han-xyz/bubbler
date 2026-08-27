@@ -585,9 +585,12 @@ impl Source {
         Ok(Self { at, text, doc })
     }
 
-    /// Line and column of a byte offset into the layer, both 1-based and
-    /// counted in characters. A built-in layer has no file to point into,
-    /// so it reports neither.
+    /// Line and column of a byte offset into the layer, both 1-based,
+    /// the line counted by every newline KDL reads and the column in
+    /// characters. A file written with carriage returns is one line to
+    /// `str::lines` and many to the parser, and a finding has to point
+    /// where the parser's own refusals do. A built-in layer has no file
+    /// to point into, so it reports neither.
     fn position(&self, offset: usize) -> (Option<u32>, Option<u32>) {
         if matches!(self.at, Where::BuiltIn(_)) {
             return (None, None);
@@ -595,15 +598,24 @@ impl Source {
         // A span past the end would panic the slice; `min` keeps a
         // document the parser rewrote from taking the run down with it.
         let before = &self.text[..offset.min(self.text.len())];
-        let line = 1 + before.bytes().filter(|b| *b == b'\n').count();
-        let col = 1 + match before.rfind('\n') {
-            Some(nl) => before[nl + 1..].chars().count(),
-            None => before.chars().count(),
-        };
-        (
-            Some(u32::try_from(line).unwrap_or(u32::MAX)),
-            Some(u32::try_from(col).unwrap_or(u32::MAX)),
-        )
+        let b = before.as_bytes();
+        let (mut line, mut col) = (1u32, 1u32);
+        let mut i = 0;
+        while i < b.len() {
+            if let Some(n) = config::newline_len(b, i) {
+                line = line.saturating_add(1);
+                col = 1;
+                i += n;
+                continue;
+            }
+            // One column per character, so a multi-byte one is one step.
+            i += 1;
+            while i < b.len() && !before.is_char_boundary(i) {
+                i += 1;
+            }
+            col = col.saturating_add(1);
+        }
+        (Some(line), Some(col))
     }
 }
 
@@ -2375,6 +2387,40 @@ mod tests {
                 at,
                 [(Some(2), Some(3)), (Some(4), Some(5)), (Some(6), Some(1))]
             );
+        });
+    }
+
+    /// The line and column a finding names are counted by the newlines
+    /// KDL reads, not by line feeds alone: a file written with carriage
+    /// returns is one line to `str::lines` and six to the parser, and a
+    /// finding that points at line 1 of it sends the reader nowhere.
+    #[test]
+    fn a_finding_counts_every_newline_kdl_reads() {
+        with(&host(), |ctx| {
+            let lines = [
+                "wayland",
+                "  x11 \"host\"",
+                "dbus {",
+                "    own \"org.kde.*\"",
+                "}",
+                "tty \"passthrough\"",
+            ];
+            for nl in ["\n", "\r", "\r\n", "\u{b}", "\u{c}", "\u{85}", "\u{2028}"] {
+                let text = lines.join(nl);
+                let report = lint(ctx, &[text.as_str()]);
+                assert_eq!(
+                    ids(&report),
+                    ["x11-without-reason", "own-too-wide", "tty-passthrough"],
+                    "{nl:?}"
+                );
+                let at: Vec<(Option<u32>, Option<u32>)> =
+                    report.findings.iter().map(|f| (f.line, f.col)).collect();
+                assert_eq!(
+                    at,
+                    [(Some(2), Some(3)), (Some(4), Some(5)), (Some(6), Some(1))],
+                    "{nl:?}"
+                );
+            }
         });
     }
 

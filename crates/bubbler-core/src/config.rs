@@ -912,8 +912,11 @@ fn line_comment_end(b: &[u8], at: usize) -> usize {
 
 /// Length of the newline at `at`, if one starts there. kdl 6.7.1 reads
 /// eight forms (`NEWLINES` in its `v2_parser.rs`), and every one of them
-/// ends a comment, opens a line and may open a multi-line string.
-fn newline_len(b: &[u8], at: usize) -> Option<usize> {
+/// ends a comment, opens a line and may open a multi-line string. Every
+/// line bubbler counts — the parser's refusals here, the linter's
+/// findings — is counted with this, so one file has one set of line
+/// numbers.
+pub(crate) fn newline_len(b: &[u8], at: usize) -> Option<usize> {
     match *b.get(at)? {
         b'\r' if b.get(at + 1) == Some(&b'\n') => Some(2),
         b'\r' | b'\n' | 0x0b | 0x0c => Some(1),
