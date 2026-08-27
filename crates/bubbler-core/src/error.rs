@@ -189,7 +189,7 @@ pub enum InstanceError {
     /// `reseed` while the instance is running. The live sandbox was built
     /// from `config.kdl` as it stands, so rewriting it now would describe
     /// grants that sandbox does not have.
-    #[error("instance `{0}` is running; stop it before reseeding")]
+    #[error("instance `{0}` is running; exit it before reseeding")]
     AlreadyRunning(String),
     /// `config.kdl` carries no `// bubbler profile: <name>` header, so
     /// there is no profile to re-flatten it from.

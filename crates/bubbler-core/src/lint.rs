@@ -1453,7 +1453,7 @@ fn across_layers(ctx: &Context, sources: &[Source], f: &mut Findings) {
         );
     }
     if let Some((i, node, argv0)) = command
-        && !on_path(ctx, argv0)
+        && !on_path(ctx, sources, argv0)
     {
         f.push(
             i,
@@ -1497,16 +1497,16 @@ fn is_nester(argv0: &str) -> bool {
 }
 
 /// Whether a `command` names a file this host has: the path itself when
-/// it holds a separator — under the sandbox's own home, the path it
-/// answers to on this host — else one of the `$PATH` directories.
-fn on_path(ctx: &Context, argv0: &str) -> bool {
+/// it holds a separator, else one of the `$PATH` directories. A command
+/// written for the sandbox's own home is looked up under this host's
+/// `$HOME`, but only where a `home-share` binds that path in — with no
+/// share, nothing puts a file there however the host is arranged.
+fn on_path(ctx: &Context, sources: &[Source], argv0: &str) -> bool {
     let path = Path::new(argv0);
     if path.components().count() > 1 {
-        // A command written for the inside of the sandbox names the
-        // private home by its own path; the file it names lives under
-        // this host's `$HOME`.
         let host_path = match path.strip_prefix(SANDBOX_HOME) {
-            Ok(rest) => ctx.env.home.join(rest),
+            Ok(rest) if home_share_covers(sources, rest) => ctx.env.home.join(rest),
+            Ok(_) => return false,
             Err(_) => path.to_path_buf(),
         };
         return ctx.host.file_type(&host_path).is_some();
@@ -1514,6 +1514,16 @@ fn on_path(ctx: &Context, argv0: &str) -> bool {
     ctx.search_path
         .iter()
         .any(|dir| ctx.host.file_type(&dir.join(argv0)).is_some())
+}
+
+/// Whether a `home-share` of any layer puts `rel` — that path itself or
+/// a directory above it — into the sandbox's home.
+fn home_share_covers(sources: &[Source], rel: &Path) -> bool {
+    sources
+        .iter()
+        .flat_map(|s| top(s, "home-share"))
+        .filter_map(arg)
+        .any(|share| rel.starts_with(share))
 }
 
 /// Lint every profile name any layer holds, as `--all` does.
@@ -2362,20 +2372,39 @@ mod tests {
     }
 
     /// A profile writes `command` for the inside of the sandbox, where
-    /// the home is `SANDBOX_HOME`; the file it names lives under the
-    /// host's own `$HOME`, and that is where this host is asked about it.
+    /// the home is `SANDBOX_HOME`, and the file it names lives under the
+    /// host's own `$HOME` — but only a `home-share` puts it inside, so
+    /// the same host file is a missing command without one.
     #[test]
-    fn a_command_under_the_sandbox_home_is_looked_up_under_the_real_home() {
-        let (file, _, _) = fake::types();
-        let tool = env().home.join(".local/bin/tool");
-        let host = host().with(tool.to_str().expect("the test home is UTF-8"), file);
+    fn a_command_under_the_sandbox_home_needs_a_home_share_to_be_found() {
+        let (file, dir, _) = fake::types();
+        let path = |p: &Path| p.to_str().expect("the test home is UTF-8").to_owned();
+        let bin = env().home.join(".local/bin");
+        let host = host()
+            .with(&path(&bin), dir)
+            .with(&path(&bin.join("tool")), file);
         with(&host, |ctx| {
+            // The share itself, and a share of the directory above it.
+            for share in [
+                "home-share \".local/bin/tool\" mode=ro\n",
+                "home-share \".local/bin\" mode=ro\n",
+            ] {
+                let found = format!("{share}command \"/home/bubbler/.local/bin/tool\"");
+                assert_eq!(ids(&lint(ctx, &[&found])), [] as [&str; 0], "{found}");
+                let missing = format!("{share}command \"/home/bubbler/.local/bin/other\"");
+                assert_eq!(
+                    ids(&lint(ctx, &[&missing])),
+                    ["command-not-found"],
+                    "{missing}"
+                );
+            }
+            // The host has the file; no node binds it in, so the sandbox
+            // has no such command.
             assert_eq!(
-                ids(&lint(ctx, &["command \"/home/bubbler/.local/bin/tool\""])),
-                [] as [&str; 0]
-            );
-            assert_eq!(
-                ids(&lint(ctx, &["command \"/home/bubbler/.local/bin/other\""])),
+                ids(&lint(
+                    ctx,
+                    &["network\ncommand \"/home/bubbler/.local/bin/tool\""]
+                )),
                 ["command-not-found"]
             );
         });

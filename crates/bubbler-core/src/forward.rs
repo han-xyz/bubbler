@@ -1190,12 +1190,13 @@ mod tests {
     #[test]
     fn a_file_under_a_per_run_share_is_visible_and_a_sibling_is_not() {
         let (file, dir, _) = types();
+        let (work, todo, spare) = (home("work"), home("work/todo.md"), home("spare.md"));
         let host = FakeHost::default()
             .with("/srv/proj", dir)
             .with("/srv/proj/note.txt", file)
             .with("/srv/other/note.txt", file)
-            .with("/home/han/work/todo.md", file)
-            .with("/home/han/spare.md", file);
+            .with(&todo, file)
+            .with(&spare, file);
         let cfg = InstanceConfig {
             shares: vec![
                 Share {
@@ -1203,7 +1204,7 @@ mod tests {
                     mode: ShareMode::ReadWrite,
                 },
                 Share {
-                    path: "/home/han/work".into(),
+                    path: work.into(),
                     mode: ShareMode::ReadOnly,
                 },
             ],
@@ -1212,8 +1213,8 @@ mod tests {
         let args: Vec<OsString> = [
             "/srv/proj/note.txt",
             "/srv/other/note.txt",
-            "/home/han/work/todo.md",
-            "/home/han/spare.md",
+            todo.as_str(),
+            spare.as_str(),
         ]
         .iter()
         .map(OsString::from)
@@ -1223,12 +1224,17 @@ mod tests {
         assert_eq!(
             got,
             [
-                "skip /srv/proj/note.txt AlreadyVisible",
-                "forward /srv/other/note.txt as note.txt (read)",
-                "rename /home/han/work/todo.md → /home/bubbler/work/todo.md",
-                "forward /home/han/spare.md as spare.md (read)",
+                "skip /srv/proj/note.txt AlreadyVisible".to_owned(),
+                "forward /srv/other/note.txt as note.txt (read)".to_owned(),
+                format!("rename {todo} → /home/bubbler/work/todo.md"),
+                format!("forward {spare} as spare.md (read)"),
             ]
         );
+    }
+
+    /// The home of [`env`], as a test writes a host path out.
+    fn home(rel: &str) -> String {
+        env().home.join(rel).to_string_lossy().into_owned()
     }
 
     #[test]
