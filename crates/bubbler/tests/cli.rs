@@ -1599,6 +1599,25 @@ fn home_share_of_the_instance_store_is_refused_and_linted() {
     );
 }
 
+/// A relative `$BUBBLER_PROFILE_DIR` would name a different directory from
+/// every working directory, so the reserved root it makes could be shared
+/// from any other one. Absolute, or refused.
+#[test]
+fn a_relative_profile_dir_override_is_refused() {
+    let tmp = setup();
+    let out = bubbler(tmp.path())
+        .env("BUBBLER_PROFILE_DIR", "shared/profiles")
+        .arg("profiles")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("BUBBLER_PROFILE_DIR must be an absolute path, not `shared/profiles`"),
+        "{err}"
+    );
+}
+
 /// `$BUBBLER_PROFILE_DIR` moves the system profile layer, and a profile
 /// written there is the config of every instance seeded from it. Pointed
 /// inside the home, the directory is one `home-share` away.

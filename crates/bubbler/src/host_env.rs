@@ -100,9 +100,7 @@ pub fn from_process() -> Result<Env> {
         dbus_log: env::var_os("BUBBLER_DBUS_LOG").is_some_and(|v| v == "1"),
         seccomp_log: env::var_os("BUBBLER_SECCOMP_LOG").is_some_and(|v| v == "1"),
         test_allow_path: test_allow_path()?,
-        profile_dir_override: env::var_os("BUBBLER_PROFILE_DIR")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from),
+        profile_dir_override: profile_dir()?,
         proxy_override: env::var_os("BUBBLER_DBUS_PROXY")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from),
@@ -137,6 +135,23 @@ fn data_dirs(value: Option<OsString>) -> Vec<PathBuf> {
 /// and not `/`, and is resolved here so it compares against the canonical
 /// source; a path that does not exist is kept as written and therefore
 /// matches nothing.
+/// `$BUBBLER_PROFILE_DIR`, which must be absolute: the directory is a
+/// reserved root every share is checked against, and a relative one would
+/// name a different directory from every working directory.
+fn profile_dir() -> Result<Option<PathBuf>> {
+    let Some(value) = env::var_os("BUBBLER_PROFILE_DIR").filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        anyhow::bail!(
+            "BUBBLER_PROFILE_DIR must be an absolute path, not `{}`",
+            path.display()
+        );
+    }
+    Ok(Some(path))
+}
+
 fn test_allow_path() -> Result<Option<PathBuf>> {
     let Some(value) = env::var_os("BUBBLER_TEST_ALLOW_PATH").filter(|v| !v.is_empty()) else {
         return Ok(None);

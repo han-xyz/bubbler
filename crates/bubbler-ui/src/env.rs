@@ -57,11 +57,27 @@ pub fn from_process() -> Result<Env> {
         dbus_log: false,
         seccomp_log: false,
         test_allow_path: None,
-        profile_dir_override: var_path("BUBBLER_PROFILE_DIR"),
+        profile_dir_override: profile_dir()?,
         proxy_override: None,
         pasta_override: None,
         wl_proxy_override: None,
     })
+}
+
+/// `$BUBBLER_PROFILE_DIR`, which must be absolute: the directory is a
+/// reserved root the share checks name, and a relative one would name a
+/// different directory from every working directory.
+fn profile_dir() -> Result<Option<PathBuf>> {
+    let Some(path) = var_path("BUBBLER_PROFILE_DIR") else {
+        return Ok(None);
+    };
+    if !path.is_absolute() {
+        anyhow::bail!(
+            "BUBBLER_PROFILE_DIR must be an absolute path, not `{}`",
+            path.display()
+        );
+    }
+    Ok(Some(path))
 }
 
 /// One environment variable as a path, where an empty value counts as
