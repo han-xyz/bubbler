@@ -17,7 +17,7 @@ use bubbler_core::config::{
 };
 use bubbler_core::env::{DEFAULT_DATA_DIRS, Env};
 use bubbler_core::error::{DesktopError, ProfileError};
-use bubbler_core::network::Forward;
+use bubbler_core::network::{AllowHost, Forward, HostPattern};
 use bubbler_core::profile::{MAX_DEPTH, Resolver};
 use bubbler_core::{config, desktop, kdl_out, lint};
 use proptest::prelude::*;
@@ -51,6 +51,16 @@ const APP_IDS: &[&str] = &["org.example.App", "com.example.Player"];
 /// Resolver addresses that are not loopback: an isolated namespace's
 /// loopback is its own, and the parser refuses one there.
 const RESOLVERS: &[&str] = &["1.1.1.1", "9.9.9.9", "2606:4700:4700::1111"];
+
+/// Names in the shape `allow-host` takes: plain, wildcarded and one an
+/// `xn--` form, since none of the three is converted on the way through.
+const HOST_NAMES: &[&str] = &[
+    "api.example.com",
+    "claude.ai",
+    "*.example.com",
+    "xn--bcher-kva.example",
+    "a1.b2",
+];
 
 /// Addresses and networks in the shape `allow-out` takes, v4 and v6.
 const DESTINATIONS: &[&str] = &[
@@ -254,60 +264,83 @@ fn network_service() -> impl Strategy<Value = Option<Service>> {
                 ),
                 0..3,
             ),
+            prop::collection::vec(
+                (
+                    prop::sample::select(HOST_NAMES),
+                    prop::option::of(1u16..9000),
+                ),
+                0..3,
+            ),
         )
-            .prop_map(|(mode, dns, forwards, no_ipv6, deny, allow_out)| {
-                let mode = match mode {
-                    0 => NetworkMode::Isolated,
-                    1 => NetworkMode::Host,
-                    _ => NetworkMode::None,
-                };
-                let mut cfg = NetworkConfig {
-                    mode,
-                    ..NetworkConfig::default()
-                };
-                if mode != NetworkMode::None {
-                    for ip in dns {
-                        let ip = IpAddr::from_str(ip).expect("the table holds literal addresses");
-                        if !cfg.dns.contains(&ip) {
-                            cfg.dns.push(ip);
-                        }
-                    }
-                }
-                if mode == NetworkMode::Isolated {
-                    for (port, udp) in forwards {
-                        if !cfg.forwards.iter().any(|f| f.port == port) {
-                            cfg.forwards.push(Forward { port, udp });
-                        }
-                    }
-                    cfg.no_ipv6 = no_ipv6;
-                    if no_ipv6 {
-                        cfg.dns.retain(|ip| ip.is_ipv4());
-                    }
-                    if deny {
-                        cfg.outbound = Outbound::Deny;
-                        for (dest, port, proto) in allow_out {
-                            let dest =
-                                Cidr::from_str(dest).expect("the table holds literal destinations");
-                            if no_ipv6 && dest.is_ipv6() {
-                                continue;
-                            }
-                            let rule = AllowOut {
-                                dest,
-                                port,
-                                proto: match proto {
-                                    0 => None,
-                                    1 => Some(Proto::Tcp),
-                                    _ => Some(Proto::Udp),
-                                },
-                            };
-                            if !cfg.allow_out.contains(&rule) {
-                                cfg.allow_out.push(rule);
+            .prop_map(
+                |(mode, dns, forwards, no_ipv6, deny, allow_out, allow_hosts)| {
+                    let mode = match mode {
+                        0 => NetworkMode::Isolated,
+                        1 => NetworkMode::Host,
+                        _ => NetworkMode::None,
+                    };
+                    let mut cfg = NetworkConfig {
+                        mode,
+                        ..NetworkConfig::default()
+                    };
+                    if mode != NetworkMode::None {
+                        for ip in dns {
+                            let ip =
+                                IpAddr::from_str(ip).expect("the table holds literal addresses");
+                            if !cfg.dns.contains(&ip) {
+                                cfg.dns.push(ip);
                             }
                         }
                     }
-                }
-                Service::Network(cfg)
-            }),
+                    if mode == NetworkMode::Isolated {
+                        for (port, udp) in forwards {
+                            if !cfg.forwards.iter().any(|f| f.port == port) {
+                                cfg.forwards.push(Forward { port, udp });
+                            }
+                        }
+                        cfg.no_ipv6 = no_ipv6;
+                        if no_ipv6 {
+                            cfg.dns.retain(|ip| ip.is_ipv4());
+                        }
+                        if deny {
+                            cfg.outbound = Outbound::Deny;
+                            for (dest, port, proto) in allow_out {
+                                let dest = Cidr::from_str(dest)
+                                    .expect("the table holds literal destinations");
+                                if no_ipv6 && dest.is_ipv6() {
+                                    continue;
+                                }
+                                let rule = AllowOut {
+                                    dest,
+                                    port,
+                                    proto: match proto {
+                                        0 => None,
+                                        1 => Some(Proto::Tcp),
+                                        _ => Some(Proto::Udp),
+                                    },
+                                };
+                                if !cfg.allow_out.contains(&rule) {
+                                    cfg.allow_out.push(rule);
+                                }
+                            }
+                            // `allow-host` is a rule under the filter like
+                            // the destinations are, and the same name on two
+                            // ports is two entries rather than a duplicate.
+                            for (name, port) in allow_hosts {
+                                let rule = AllowHost {
+                                    pattern: HostPattern::parse(name)
+                                        .expect("the table holds names the parser takes"),
+                                    port: port.unwrap_or(AllowHost::DEFAULT_PORT),
+                                };
+                                if !cfg.allow_hosts.contains(&rule) {
+                                    cfg.allow_hosts.push(rule);
+                                }
+                            }
+                        }
+                    }
+                    Service::Network(cfg)
+                },
+            ),
     )
 }
 

@@ -52,6 +52,12 @@ pub const PASTA_BIN: &str = "pasta";
 /// loopback `--dns-forward` outright.
 pub const DNS_FORWARD: IpAddr = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1));
 
+/// The port a resolver is queried on, which is the one port an
+/// `allow-host` takes away from the application: only the proxy's
+/// cgroup may reach it, whether the rule came from `dns` or was written
+/// as an `allow-out`.
+const DNS_PORT: u16 = 53;
+
 /// Host address an `allow-port` forward listens on. Only the host itself,
 /// never the LAN: the node says the host may reach a port of the sandbox,
 /// and pasta's own default of every address would say rather more.
@@ -327,9 +333,12 @@ impl fmt::Display for AllowOut {
 /// resolves as, so what the config says and what the proxy compares a
 /// `CONNECT` target against are the same bytes.
 ///
-/// A name whose last label is all digits is refused, so an address
-/// cannot be written here and matched as a name; `allow-out` is where an
-/// address goes.
+/// A name whose last label is all digits is refused, so no address in
+/// the notations a config would write one in parses as a name;
+/// `allow-out` is where an address goes. `getaddrinfo` also reads hex
+/// forms such as `0x7f000001`, which are letters and digits and do parse
+/// here — a config writing one has named an address on purpose, and the
+/// proxy refuses an address as a `CONNECT` target whatever its shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostPattern {
     /// The labels under the wildcard, lower case and without the root
@@ -370,7 +379,8 @@ impl HostPattern {
                 wildcard = true;
                 continue;
             }
-            labels.push(Self::label(label)?);
+            Self::check_label(label)?;
+            labels.push(label.to_ascii_lowercase());
         }
         if labels.is_empty() {
             return Err(
@@ -392,8 +402,11 @@ impl HostPattern {
         Ok(Self { labels, wildcard })
     }
 
-    /// One label, lower-cased, or why it is not one.
-    fn label(s: &str) -> Result<String, String> {
+    /// Whether `s` is a label, or why it is not one. The one place the
+    /// rule is written: [`HostPattern::parse`] holds a config to it and
+    /// [`HostPattern::matches`] holds the probe to the same rule, so a
+    /// name that could never be written cannot be matched either.
+    fn check_label(s: &str) -> Result<(), String> {
         if s.is_empty() {
             return Err(
                 "a name holds no empty label: no two dots in a row, and none at the start"
@@ -413,22 +426,30 @@ impl HostPattern {
         if s.starts_with('-') || s.ends_with('-') {
             return Err("a label neither starts nor ends with `-`".to_owned());
         }
-        Ok(s.to_ascii_lowercase())
+        Ok(())
     }
 
     /// Whether `host` is a name this pattern covers. Case is ignored and
     /// one trailing dot with it, since a `CONNECT` target may carry
     /// either form; a wildcard covers exactly one label, never the name
     /// itself and never two labels under it.
+    ///
+    /// The probe is held to the rules [`HostPattern::parse`] takes, the
+    /// wildcard's own label included: a `CONNECT` target is text the
+    /// sandbox wrote, and one that is no name matches nothing here
+    /// rather than reaching a resolver on the strength of its suffix.
     pub fn matches(&self, host: &str) -> bool {
+        if host.len() > Self::MAX_NAME {
+            return false;
+        }
         let host = host.strip_suffix('.').unwrap_or(host);
         let mut got: Vec<&str> = host.split('.').collect();
+        if !got.iter().all(|l| Self::check_label(l).is_ok()) {
+            return false;
+        }
         if self.wildcard {
-            // An empty first label is `.example.com`, which is no host
-            // under `*.example.com`.
-            if !got.first().is_some_and(|first| !first.is_empty()) {
-                return false;
-            }
+            // Never empty: `split` yields at least one label and every
+            // one of them just passed the rule above.
             got.remove(0);
         }
         got.len() == self.labels.len()
@@ -497,36 +518,79 @@ impl fmt::Display for AllowHost {
 /// live as long as the sandbox: a cgroup created afterwards matches
 /// nothing. The sandbox itself cannot join it — it has an empty
 /// capability set, its own cgroup namespace and no cgroupfs to write.
+///
+/// The fields are private and [`Cgroup::new`] is the only way to one, so
+/// the [`fmt::Display`] below cannot be reached with a path no rule
+/// could carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cgroup {
-    /// Path relative to the cgroup2 mount, with no leading slash, such
-    /// as `user.slice/user-1000.slice/bubbler-agent-1234`.
-    pub path: String,
-    /// How many components [`Cgroup::path`] has, which is the `level`
-    /// nftables matches at. A level that does not count the path names
-    /// another cgroup than the one bubbler made, so [`ruleset`] builds
-    /// nothing from it.
-    pub level: u8,
+    path: String,
+    level: u8,
 }
 
 impl Cgroup {
-    /// Whether this names a cgroup a rule may be written from: `level`
-    /// counts the components, each of them a non-empty name of
-    /// `[A-Za-z0-9._-]`, and neither `.` nor `..`.
+    /// The sandbox's cgroup from its path relative to the cgroup2 mount,
+    /// or why that text is no path to write a rule from. `level` is
+    /// counted from the path, so the two can never disagree.
     ///
-    /// The ruleset is fed to a process holding `CAP_NET_ADMIN` over the
-    /// sandbox's namespaces, so nothing that could end the quoted string
-    /// it is rendered inside may reach it.
-    fn is_well_formed(&self) -> bool {
-        let comps: Vec<&str> = self.path.split('/').collect();
-        usize::from(self.level) == comps.len()
-            && comps.iter().all(|c| {
-                !c.is_empty()
-                    && *c != "."
-                    && *c != ".."
-                    && c.bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-            })
+    /// What is refused is what nft could not carry inside a quoted path,
+    /// and nothing else: a `"` would end the string and `;` after it
+    /// would start a second rule, in a process holding `CAP_NET_ADMIN`
+    /// over the sandbox's namespaces. Everything a systemd unit name
+    /// holds passes — `user@1000.service` is where a user session's
+    /// delegated subtree lives, and `@`, `:` and `+` are ordinary
+    /// characters in one.
+    pub fn new(path: &str) -> Result<Self, String> {
+        if path.is_empty() {
+            return Err("a cgroup path is not empty".to_owned());
+        }
+        if path.starts_with('/') || path.ends_with('/') {
+            return Err(
+                "a cgroup path is relative to the cgroup2 mount: no leading or trailing `/`"
+                    .to_owned(),
+            );
+        }
+        if let Some(what) = path.bytes().find_map(|b| match b {
+            b'"' => Some("a quote"),
+            b'\\' => Some("a backslash"),
+            b if b.is_ascii_whitespace() => Some("whitespace"),
+            b if b.is_ascii_control() => Some("a control byte"),
+            b if !b.is_ascii() => Some("a byte outside ASCII"),
+            _ => None,
+        }) {
+            return Err(format!(
+                "a cgroup path is written into a quoted nftables rule, so it holds no \
+                 {what}"
+            ));
+        }
+        let comps: Vec<&str> = path.split('/').collect();
+        if comps
+            .iter()
+            .any(|c| c.is_empty() || *c == "." || *c == "..")
+        {
+            return Err(
+                "every component of a cgroup path is a directory name, so none of them is \
+                 empty, `.` or `..`"
+                    .to_owned(),
+            );
+        }
+        let level = u8::try_from(comps.len())
+            .map_err(|_| "a cgroup path has more components than nftables counts".to_owned())?;
+        Ok(Self {
+            path: path.to_owned(),
+            level,
+        })
+    }
+
+    /// The path relative to the cgroup2 mount, as it was given.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// How many components the path has, which is the `level` nftables
+    /// matches at.
+    pub fn level(&self) -> u8 {
+        self.level
     }
 }
 
@@ -676,20 +740,26 @@ fn resolvers(cfg: &NetworkConfig) -> Option<Vec<IpAddr>> {
 /// application resolves nothing at all. Without an `allow-host` the
 /// argument is unused and the text is byte for byte what it always was.
 ///
-/// `None` where an `allow-host` needs a cgroup — no cgroup passed, or
-/// one no rule can be written from — is a programming error of the
-/// caller's, and the answer is no ruleset rather than one that filters
-/// less than the config says. The launcher must refuse such a run: a
-/// sandbox that asked for `outbound "deny"` and got no ruleset would
-/// have the whole network.
+/// An `allow-out` on port 53 carries the match as well: a resolver named
+/// by address is a resolver, and the gate would be worth little with one
+/// beside it. An `allow-out` that names no port covers 53 among every
+/// other and is written as it stands — narrowing a whole address because
+/// one of its ports is DNS would take away what the node plainly asks
+/// for.
+///
+/// `None` where an `allow-host` needs a cgroup and none was passed is a
+/// programming error of the caller's, and the answer is no ruleset
+/// rather than one that filters less than the config says. The launcher
+/// must refuse such a run: a sandbox that asked for `outbound "deny"`
+/// and got no ruleset would have the whole network.
 pub fn ruleset(cfg: &NetworkConfig, cgroup: Option<&Cgroup>) -> Option<String> {
     if cfg.outbound != Outbound::Deny || !cfg.is_isolated() {
         return None;
     }
     let gate = match (cfg.allow_hosts.is_empty(), cgroup) {
         (true, _) => None,
-        (false, Some(cg)) if cg.is_well_formed() => Some(cg.to_string()),
-        (false, _) => return None,
+        (false, Some(cg)) => Some(cg.to_string()),
+        (false, None) => return None,
     };
     // Every rule the proxy has to pass carries the match, and every rule
     // it does not is written as it always was.
@@ -722,14 +792,24 @@ pub fn ruleset(cfg: &NetworkConfig, cgroup: Option<&Cgroup>) -> Option<String> {
         };
         for proto in [Proto::Udp, Proto::Tcp] {
             rules.push(gated(format!(
-                "{} daddr {dest} {} dport 53 accept",
+                "{} daddr {dest} {} dport {DNS_PORT} accept",
                 dest.family(),
                 proto.keyword()
             )));
         }
     }
     for allowed in &cfg.allow_out {
-        rules.extend(allow_out_rules(allowed));
+        // A resolver named by address is still a resolver: under an
+        // `allow-host` it belongs to the proxy like the generated rules
+        // above, or the application would have the lookup channel the
+        // gate is there to close.
+        let resolver = allowed.port == Some(DNS_PORT);
+        for rule in allow_out_rules(allowed) {
+            rules.push(match resolver {
+                true => gated(rule),
+                false => rule,
+            });
+        }
     }
     // Last of the accepts: the proxy reaches whatever the names it was
     // given resolve to, which is an address the config never wrote and
@@ -1383,6 +1463,32 @@ mod tests {
         assert!(!e.matches("a.example.com"));
     }
 
+    /// The probe is held to the rules a config is held to, the
+    /// wildcard's own label included: a `CONNECT` target is text the
+    /// sandbox wrote, and one that is no name must not reach a resolver
+    /// on the strength of its suffix.
+    #[test]
+    fn a_probe_that_is_no_name_matches_nothing() {
+        let p = pattern("*.example.com");
+        assert!(p.matches("a1.example.com"));
+        for bad in [
+            "a_b.example.com",
+            "-a.example.com",
+            "a-.example.com",
+            "a b.example.com",
+            "b\u{fc}cher.example.com",
+            "a..example.com",
+            "*.example.com",
+            &format!("{}.example.com", "x".repeat(64)),
+            &format!("{}.example.com", "x.".repeat(126)),
+        ] {
+            assert!(!p.matches(bad), "{bad}");
+        }
+        let e = pattern("example.com");
+        assert!(!e.matches("exam ple.com"));
+        assert!(!e.matches("example.com.."));
+    }
+
     /// The proxy's cgroup is the one thing the filter accepts and the
     /// one thing that may resolve a name: an application that ignores
     /// the proxy variables fails at the lookup rather than reaching
@@ -1396,12 +1502,9 @@ mod tests {
             }],
             ..denying(Vec::new())
         };
-        let cg = Cgroup {
-            path: "user.slice/bubbler-t-1".to_owned(),
-            level: 2,
-        };
+        let cg = cgroup();
         let rules = ruleset(&cfg, Some(&cg)).unwrap();
-        let m = "socket cgroupv2 level 2 \"user.slice/bubbler-t-1\"";
+        let m = cg.to_string();
         let accept = rules.find(&format!("{m} accept")).unwrap();
         let reject = rules.find("reject with icmpx").unwrap();
         assert!(accept < reject, "{rules}");
@@ -1415,29 +1518,10 @@ mod tests {
             !rules.contains("\n\t\tip daddr 169.254.1.1 udp dport 53 accept"),
             "{rules}"
         );
-        // A cgroup the caller did not create, or one no rule can name,
-        // gives no ruleset at all rather than one that filters less than
-        // the config says. The launcher refuses the run on it.
+        // A cgroup the caller did not create gives no ruleset at all
+        // rather than one that filters less than the config says. The
+        // launcher refuses the run on it.
         assert!(ruleset(&cfg, None).is_none());
-        for bad in ["", "a b", "a\"b", "..", "a/../b"] {
-            let cg = Cgroup {
-                path: bad.to_owned(),
-                level: u8::try_from(bad.split('/').count()).unwrap(),
-            };
-            assert!(ruleset(&cfg, Some(&cg)).is_none(), "{bad}");
-        }
-        // The level has to count the path, or the rule matches another
-        // cgroup than the one bubbler made.
-        assert!(
-            ruleset(
-                &cfg,
-                Some(&Cgroup {
-                    path: "user.slice/bubbler-t-1".to_owned(),
-                    level: 1,
-                })
-            )
-            .is_none()
-        );
         // Without an `allow-host` the text is what it always was, and a
         // cgroup nothing needs changes nothing.
         let plain = denying(Vec::new());
@@ -1462,6 +1546,105 @@ mod tests {
             assert_eq!(k, PROXY_ENV_NAMES[i]);
             assert!(crate::config::RESERVED_ENV.contains(&k.as_str()), "{k}");
         }
+    }
+
+    /// The cgroup a systemd user session actually delegates: the
+    /// writable subtree is under `user@1000.service`, whose name holds
+    /// an `@`. A validator that refused this shape would refuse every
+    /// real run.
+    fn cgroup() -> Cgroup {
+        Cgroup::new("user.slice/user-1000.slice/user@1000.service/app.slice/bubbler-t-1")
+            .expect("the delegated shape a user session has")
+    }
+
+    #[test]
+    fn a_cgroup_path_is_what_systemd_names_and_nft_can_quote() {
+        let cg = cgroup();
+        assert_eq!(
+            cg.path(),
+            "user.slice/user-1000.slice/user@1000.service/app.slice/bubbler-t-1"
+        );
+        assert_eq!(cg.level(), 5);
+        assert_eq!(
+            cg.to_string(),
+            "socket cgroupv2 level 5 \
+             \"user.slice/user-1000.slice/user@1000.service/app.slice/bubbler-t-1\""
+        );
+        // Everything a unit name may hold is a directory name here.
+        for ok in ["a", "a/b", "system.slice/dbus:name+more@1.service"] {
+            assert!(Cgroup::new(ok).is_ok(), "{ok}");
+        }
+        // A `"` would end the quoted path and a `;` after it would start
+        // a second rule, in a process holding CAP_NET_ADMIN over the
+        // sandbox's namespaces.
+        for bad in [
+            "",
+            "/a",
+            "a/",
+            "a//b",
+            ".",
+            "..",
+            "a/../b",
+            "a/./b",
+            "a\"b",
+            "a\\b",
+            "a b",
+            "a\tb",
+            "a\nb",
+            "a\u{7f}b",
+            "a\u{0}b",
+            "b\u{fc}cher",
+        ] {
+            assert!(Cgroup::new(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// A resolver named by address is a resolver: beside an
+    /// `allow-host` it belongs to the proxy, like the rules the
+    /// generator writes from `dns`.
+    #[test]
+    fn an_allow_out_on_the_resolver_port_is_gated_with_the_rest_of_dns() {
+        let dns_rule = AllowOut {
+            dest: cidr("9.9.9.9"),
+            port: Some(53),
+            proto: Some(Proto::Udp),
+        };
+        let other = AllowOut {
+            dest: cidr("1.1.1.1"),
+            port: Some(443),
+            proto: Some(Proto::Tcp),
+        };
+        let cfg = NetworkConfig {
+            allow_hosts: vec![AllowHost {
+                pattern: pattern("api.example"),
+                port: AllowHost::DEFAULT_PORT,
+            }],
+            allow_out: vec![dns_rule, other],
+            ..denying(Vec::new())
+        };
+        let cg = cgroup();
+        let rules = ruleset(&cfg, Some(&cg)).unwrap();
+        assert!(
+            rules.contains(&format!("{cg} ip daddr 9.9.9.9 udp dport 53 accept")),
+            "{rules}"
+        );
+        // Only the resolver port: the rest of an `allow-out` is what the
+        // node plainly asks for and stays the application's.
+        assert!(
+            rules.contains("\n\t\tip daddr 1.1.1.1 tcp dport 443 accept"),
+            "{rules}"
+        );
+        // With no `allow-host` there is no gate and nothing is prefixed.
+        let plain = NetworkConfig {
+            allow_hosts: Vec::new(),
+            ..cfg.clone()
+        };
+        assert!(
+            ruleset(&plain, Some(&cg))
+                .unwrap()
+                .contains("\n\t\tip daddr 9.9.9.9 udp dport 53 accept"),
+            "{plain:?}"
+        );
     }
 
     /// One rendering for the emitter and for the message that names a
