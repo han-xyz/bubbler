@@ -24,16 +24,16 @@ Wayland-first; only the two gaming profiles grant `x11`, and both take the
 
 | Profile | Grants |
 |---|---|
-| `alacritty` | wayland |
+| `alacritty` | wayland, no nested userns |
 | `chromium` | wayland dri pulseaudio network dbus portals, ~/Downloads rw |
 | `code` | wayland dri network dbus portals, ~/Projects rw |
 | `firefox` | wayland dri pulseaudio network dbus portals, ~/Downloads rw |
 | `generic` | nothing beyond the baseline (commented examples to start from) |
-| `keepassxc` | wayland, ~/Documents rw |
-| `kitty` | wayland dri |
-| `libreoffice` | wayland, ~/Documents rw, `SAL_USE_VCLPLUGIN=gtk3` |
+| `keepassxc` | wayland, ~/Documents rw, no nested userns |
+| `kitty` | wayland dri, no nested userns |
+| `libreoffice` | wayland, ~/Documents rw, `SAL_USE_VCLPLUGIN=gtk3`, no nested userns |
 | `lutris` | wayland `x11 "host"` dri pulseaudio network gamepad, ~/Games rw |
-| `mpv` | wayland dri pipewire, ~/Videos |
+| `mpv` | wayland dri pipewire, ~/Videos, no nested userns |
 | `spotify` | wayland dri pulseaudio network |
 | `steam` | wayland `x11 "host"` dri pulseaudio network gamepad |
 | `thunderbird` | wayland network, ~/Downloads rw |
@@ -51,6 +51,12 @@ runtime on first run and Wine was not installed when this was written, so both
 headers say so — if a game is silent, add `pipewire` beside the `pulseaudio`.
 
 Notes worth knowing:
+
+- **`userns "disable"`** on alacritty, kitty, keepassxc, libreoffice and mpv:
+  none of them nests a sandbox of its own, so the door a nested user
+  namespace opens stays shut. For the two terminals that also means the
+  shell inside cannot start bwrap, podman or a browser — drop the line for a
+  terminal that hosts those.
 
 - **steam**: no `portals` on purpose — Steam's runtime reads `/.flatpak-info`
   as "unofficial Flatpak" and aborts. Never add `userns "disable"`

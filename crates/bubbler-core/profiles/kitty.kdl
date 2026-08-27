@@ -17,6 +17,9 @@
 // want to work on, e.g.
 //     home-share "Projects" mode=rw
 //
+//
+// `userns "disable"`: the shell inside cannot start bwrap, podman or a
+// browser's inner sandbox; drop the line for a terminal that hosts those.
 // Bare by design. Add:
 //   dbus
 //   portals
@@ -35,4 +38,5 @@
 //       swallows the failure and reports version 0.0.0.
 wayland
 dri
+userns "disable"
 command "kitty"

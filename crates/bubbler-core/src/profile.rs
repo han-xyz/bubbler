@@ -1443,22 +1443,30 @@ mod tests {
     }
 
     #[test]
-    fn only_the_gaming_profiles_grant_x11_and_none_disables_user_namespaces() {
+    fn only_the_gaming_profiles_grant_x11_and_only_apps_without_a_nested_sandbox_disable_userns() {
         let tmp = tempfile::tempdir().unwrap();
         let r = resolver(tmp.path(), &[], &[]);
         let mut x11: Vec<&str> = Vec::new();
+        let mut closed: Vec<&str> = Vec::new();
         for n in NAMES {
             let cfg = r.resolve(n).unwrap().config;
             if cfg.services.iter().any(|s| matches!(s, Service::X11(_))) {
                 x11.push(n);
             }
-            // Proton, umu and pressure-vessel nest their own bubblewrap,
-            // and a browser's inner sandbox is a user namespace too.
-            assert_eq!(cfg.userns, Userns::Allow, "{n}");
+            if cfg.userns == Userns::Disable {
+                closed.push(n);
+            }
         }
         // X11 gives a client the whole display: no profile gets it for
         // convenience, only the two whose apps have no Wayland path.
         assert_eq!(x11, ["lutris", "steam"]);
+        // Proton, umu and pressure-vessel nest their own bubblewrap, and a
+        // browser's, Electron's or CEF's inner sandbox is a user namespace
+        // too; the door is shut only where nothing inside needs it.
+        assert_eq!(
+            closed,
+            ["alacritty", "keepassxc", "kitty", "libreoffice", "mpv"]
+        );
     }
 
     #[test]

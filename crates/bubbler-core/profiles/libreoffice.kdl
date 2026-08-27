@@ -8,6 +8,9 @@
 // another disk is named explicitly, e.g.
 //     path-share "/kioxia/docs" mode=rw
 //
+//
+// `userns "disable"`: LibreOffice nests no sandbox of its own, so the door a
+// nested user namespace opens stays shut.
 // Bare by design. Add:
 //   dri
 //     — the GPU. Without it LibreOffice draws in software, which is what
@@ -24,5 +27,6 @@ home-share "Documents" mode=rw
 env SAL_USE_VCLPLUGIN="gtk3"
 // The start centre, not one of the seven per-document entries that run
 // the same command with a `--writer`-style argument.
+userns "disable"
 desktop "libreoffice-startcenter.desktop"
 command "libreoffice"

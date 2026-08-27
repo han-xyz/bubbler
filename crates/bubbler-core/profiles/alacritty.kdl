@@ -1,4 +1,8 @@
 // bubbler profile: alacritty
+// No nested user namespaces: a terminal's own sandbox has no need of one.
+// The shell inside cannot start bwrap, podman or a browser's inner sandbox;
+// drop the `userns` line for a terminal that hosts those.
 wayland
+userns "disable"
 desktop "Alacritty.desktop"
 command "alacritty"

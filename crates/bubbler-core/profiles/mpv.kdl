@@ -1,6 +1,9 @@
 // bubbler profile: mpv
+// No nested user namespaces: mpv nests no sandbox of its own, so the door a
+// nested user namespace opens stays shut.
 wayland
 dri
 pipewire
 home-share "Videos"
+userns "disable"
 command "mpv"

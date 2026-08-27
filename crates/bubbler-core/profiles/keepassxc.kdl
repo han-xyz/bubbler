@@ -28,6 +28,9 @@
 // below, and a database on another disk is named explicitly, e.g.
 //     path-share "/kioxia/keepass" mode=rw
 //
+//
+// `userns "disable"`: KeePassXC nests no sandbox of its own, so the door a
+// nested user namespace opens stays shut.
 // Bare by design. Add:
 //   app-runtime "org.keepassxc.KeePassXC" mode=rw
 //   lint-allow "app-runtime-rw" reason="this is the side that serves the browser socket"
@@ -60,5 +63,6 @@
 //       Needs `dbus`.
 wayland
 home-share "Documents" mode=rw
+userns "disable"
 desktop "org.keepassxc.KeePassXC.desktop"
 command "keepassxc"
