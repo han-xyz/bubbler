@@ -8,12 +8,12 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, IsTerminal, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
-use bubbler_core::config::{self, Service, X11Mode};
+use bubbler_core::config::{self, Service, Share, ShareMode, X11Mode};
 use bubbler_core::dbus;
 use bubbler_core::dbus_wire;
 use bubbler_core::desktop;
@@ -31,6 +31,7 @@ use bubbler_core::run_log;
 use bubbler_core::safe_text;
 use bubbler_core::tty::{self, TtyMode};
 use bubbler_core::wrap;
+use clap::builder::{OsStringValueParser, TypedValueParser};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
 /// `--tty` takes the names the config's `tty` node takes; clap already
@@ -40,6 +41,44 @@ fn tty_mode(s: &str) -> Result<TtyMode, String> {
         ConfigError::BadArgument { reason, .. } => reason,
         other => other.to_string(),
     })
+}
+
+/// One `--share` value: a path, optionally with `=ro` or `=rw` at the end,
+/// so a path holding `=` still parses when the mode is spelled out. A
+/// relative path is joined to the current directory, and one holding `.`
+/// or `..` is resolved on the host, because the core binds a share at the
+/// path it was given and refuses one that names a place it would not land
+/// at; `--share ..` therefore shares the parent directory at its resolved
+/// path.
+fn share_flag(raw: OsString) -> Result<Share, String> {
+    let bytes = raw.as_bytes();
+    let (path, mode) = if let Some(p) = bytes.strip_suffix(b"=ro") {
+        (p, ShareMode::ReadOnly)
+    } else if let Some(p) = bytes.strip_suffix(b"=rw") {
+        (p, ShareMode::ReadWrite)
+    } else {
+        (bytes, ShareMode::ReadWrite)
+    };
+    if path.is_empty() {
+        return Err("a path is required".to_owned());
+    }
+    let path = Path::new(OsStr::from_bytes(path));
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("current directory: {e}"))?
+            .join(path)
+    };
+    if path
+        .components()
+        .any(|c| c == Component::CurDir || c == Component::ParentDir)
+    {
+        return std::fs::canonicalize(&path)
+            .map(|path| Share { path, mode })
+            .map_err(|e| format!("{}: {e}", path.display()));
+    }
+    Ok(Share { path, mode })
 }
 
 /// How much of the argv `--explain` prints.
@@ -142,6 +181,15 @@ that same argv grouped under the config node each argument came from.")]
         /// overrides the instance's `tty` node.
         #[arg(long, value_name = "MODE", value_parser = tty_mode)]
         tty: Option<TtyMode>,
+        /// Share a host path for this run only: `PATH` read-write, or
+        /// `PATH=ro`. Under $HOME it appears at the same relative path in
+        /// the private home, elsewhere at the same path; a relative path
+        /// and one holding `.` or `..` are resolved here first. The first
+        /// directory shared is where the command starts. Repeatable; not
+        /// written to config.kdl.
+        #[arg(long, value_name = "PATH[=ro|rw]",
+              value_parser = OsStringValueParser::new().try_map(share_flag))]
+        share: Vec<Share>,
         /// Command to run; replaces the config's `command`.
         #[arg(last = true)]
         command: Vec<OsString>,
@@ -194,6 +242,15 @@ warning when it is not.")]
         /// overrides the profile's `tty` node.
         #[arg(long, value_name = "MODE", value_parser = tty_mode)]
         tty: Option<TtyMode>,
+        /// Share a host path for this run only: `PATH` read-write, or
+        /// `PATH=ro`. Under $HOME it appears at the same relative path in
+        /// the private home, elsewhere at the same path; a relative path
+        /// and one holding `.` or `..` are resolved here first. The first
+        /// directory shared is where the command starts. Repeatable; not
+        /// written to config.kdl.
+        #[arg(long, value_name = "PATH[=ro|rw]",
+              value_parser = OsStringValueParser::new().try_map(share_flag))]
+        share: Vec<Share>,
         /// Command to run; replaces the profile's `command`.
         #[arg(last = true)]
         command: Vec<OsString>,
@@ -1039,9 +1096,10 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             wl_proxy,
             format,
             tty,
+            share,
             command,
         } => {
-            let inst = Instance::open(&env, &name).with_context(|| {
+            let mut inst = Instance::open(&env, &name).with_context(|| {
                 format!(
                     "opening instance `{name}` ({})",
                     instance::config_path(&env, &name).display()
@@ -1051,6 +1109,10 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             // the sandbox this config asks for, and what it asks for is
             // exactly what changed meaning.
             warn_migration(&inst);
+            // The flag belongs to this run alone: it is put where the
+            // launcher, the dry run and the explanation all read it from,
+            // and config.kdl is never written.
+            inst.config.shares = share;
             let command = (!command.is_empty()).then_some(command.as_slice());
             let mode = tty.unwrap_or(inst.config.tty);
             // A dry run and an explanation both describe a fresh start
@@ -1091,6 +1153,14 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             if let Some(stream) = exec::connect(&env, &name)
                 .with_context(|| format!("connecting to instance `{name}`"))?
             {
+                // A running sandbox is a set of mounts bwrap made once;
+                // nothing can be bound into it afterwards, so a share
+                // asked for here would be silently missing.
+                if !inst.config.shares.is_empty() {
+                    bail!(
+                        "instance `{name}` is running; --share needs a fresh sandbox, stop it first"
+                    );
+                }
                 eprintln!(
                     "bubbler: instance `{name}` is running; executing inside it \
                      (config changes apply after restart)"
@@ -1114,11 +1184,16 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             wl_proxy,
             format,
             tty,
+            share,
             command,
         } => {
             let grants: Vec<&str> = grants.iter().map(String::as_str).collect();
             let mut eph = Instance::ephemeral(&env, &profile, &grants)
                 .context("creating a throwaway sandbox")?;
+            // Before the argument forwarding below and the explanation
+            // after it, both of which describe the sandbox this run asks
+            // for, shares included.
+            eph.instance.config.shares = share;
             let given = (!command.is_empty()).then_some(command.as_slice());
             // Before `--keep`, which only records a name: the sandbox
             // runs, and asks the portal, under the one it was made with.

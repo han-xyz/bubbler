@@ -914,6 +914,160 @@ fn try_explains_a_throwaway_sandbox_without_running_it() {
     assert_eq!(left, 0);
 }
 
+/// A `--share` of a temporary directory needs the test hook: every path
+/// a test can write lies under the denied `/tmp`.
+#[test]
+fn try_share_binds_the_directory_and_starts_there() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir(&proj).unwrap();
+    std::fs::write(proj.join("note.txt"), "x").unwrap();
+    let out = bubbler_live(tmp.path(), &init)
+        .env("BUBBLER_TEST_ALLOW_PATH", tmp.path())
+        .args(["try", "--share"])
+        .arg(&proj)
+        .args(["--", "/usr/bin/pwd"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(s.trim_end(), proj.to_str().unwrap(), "stderr: {err}");
+}
+
+#[test]
+fn try_share_read_only_refuses_a_write_inside() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir(&proj).unwrap();
+    let mut flag = proj.clone().into_os_string();
+    flag.push("=ro");
+    let out = bubbler_live(tmp.path(), &init)
+        .env("BUBBLER_TEST_ALLOW_PATH", tmp.path())
+        .args(["try", "--share"])
+        .arg(&flag)
+        .args(["--", "/usr/bin/touch"])
+        .arg(proj.join("new"))
+        .output()
+        .unwrap();
+    assert_ne!(out.status.code(), Some(0));
+    assert!(!proj.join("new").exists());
+}
+
+#[test]
+fn run_dry_run_lists_the_share_under_its_own_group_and_never_in_the_config() {
+    let tmp = setup();
+    write_profile(tmp.path(), "user", "app", "command \"true\"\n");
+    let out = bubbler(tmp.path())
+        .args(["create", "app", "--profile", "app"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir(&proj).unwrap();
+    let out = bubbler(tmp.path())
+        .env("BUBBLER_TEST_ALLOW_PATH", tmp.path())
+        .args(["run", "app", "--explain", "--share"])
+        .arg(&proj)
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        s.contains(&format!("\n  --share \"{}\" mode=rw", proj.display())),
+        "{s}"
+    );
+    assert!(s.contains("--chdir"), "{s}");
+    // The share is where the command starts, and the baseline's own
+    // `--chdir` is the one argument it replaces.
+    assert!(s.contains(&format!("--chdir {}\n", proj.display())), "{s}");
+    let cfg =
+        std::fs::read_to_string(tmp.path().join("data/bubbler/instances/app/config.kdl")).unwrap();
+    assert!(!cfg.contains("proj"), "{cfg}");
+}
+
+#[test]
+fn share_refuses_a_missing_path_and_names_the_flag() {
+    let tmp = setup();
+    write_profile(tmp.path(), "user", "app", "command \"true\"\n");
+    let out = bubbler(tmp.path())
+        .env("BUBBLER_TEST_ALLOW_PATH", tmp.path())
+        .args(["try", "--profile", "app", "--explain", "--share"])
+        .arg(tmp.path().join("nope"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--share"), "{err}");
+}
+
+#[test]
+fn real_run_share_on_a_running_instance_is_refused() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    write_profile(
+        tmp.path(),
+        "user",
+        "app",
+        "command \"/usr/bin/sleep\" \"30\"\n",
+    );
+    let out = bubbler(tmp.path())
+        .args(["create", "app", "--profile", "app"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut run = bubbler_live(tmp.path(), &init)
+        .args(["run", "app"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let sock = tmp.path().join("run/bubbler/app/init.sock");
+    if !wait_until(
+        || UnixStream::connect(&sock).is_ok(),
+        Duration::from_secs(10),
+    ) {
+        fail_with(run, "the instance never accepted a connection");
+    }
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir(&proj).unwrap();
+    let out = bubbler_live(tmp.path(), &init)
+        .env("BUBBLER_TEST_ALLOW_PATH", tmp.path())
+        .args(["run", "app", "--share"])
+        .arg(&proj)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--share needs a fresh sandbox"), "{err}");
+    // Ended the way the other live runs are: a plain spawn leads no
+    // process group of its own, so only its own pid can be signalled.
+    kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
+    let _ = run.wait();
+}
+
 /// The socket both sides of the `app-runtime` integration tests use,
 /// relative to the shared directory.
 const SHARED_SOCKET: &str = "s.sock";
