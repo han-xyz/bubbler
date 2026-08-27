@@ -42,12 +42,15 @@ fn env(root: &Path) -> Env {
         init_override: None,
         dbus_address: None,
         dbus_system_address: None,
+        at_spi_bus_address: None,
         dbus_log: false,
         seccomp_log: false,
         test_allow_path: None,
         profile_dir_override: Some(root.join("system")),
         proxy_override: None,
         pasta_override: None,
+        wl_proxy_override: None,
+        net_proxy_override: None,
     }
 }
 
