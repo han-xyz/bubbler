@@ -525,13 +525,14 @@ struct Root {
 }
 
 /// Host trees the sandbox can already reach: what the baseline binds,
-/// the source of every share the config grants, and the instance's own
-/// home.
+/// the source of every share the config grants and of every `--share`
+/// this run adds, and the instance's own home.
 ///
 /// The mapping mirrors the binds: `home-share` puts `$HOME/<path>` at
 /// `SANDBOX_HOME/<path>` and the instance home is the sandbox home, so
 /// both need the argument rewritten; `path-share`, `etc-share` and the
-/// baseline trees keep the host path.
+/// baseline trees keep the host path. A `--share` is one or the other by
+/// where its path lies.
 fn visible_roots(
     env: &Env,
     cfg: &InstanceConfig,
@@ -590,6 +591,28 @@ fn visible_roots(
                 |real| real.starts_with("/etc"),
             ),
             _ => {}
+        }
+    }
+    // A `--share` is a bind like the two share nodes above, so a file
+    // under one is inside already: forwarding it would hand the command
+    // a document path for a file it can open where it was named.
+    for share in &cfg.shares {
+        match share.path.strip_prefix(&env.home) {
+            // The same mapping `service::share_paths` binds by: under
+            // the real home at the same relative path in the private
+            // home, anywhere else at its own path.
+            Ok(rel) => add_root(
+                &mut roots,
+                host,
+                Root {
+                    host: share.path.clone(),
+                    inside: Some(Path::new(SANDBOX_HOME).join(rel)),
+                },
+                |real| real.starts_with(&env.home),
+            ),
+            Err(_) => add_root(&mut roots, host, same(share.path.clone()), |_| {
+                crate::service::reserved_reason(host, env, &share.path).is_none()
+            }),
         }
     }
     // A root that is not absolute compares against nothing, and `/` or
@@ -901,7 +924,7 @@ mod tests {
     use std::os::unix::net::UnixStream;
 
     use super::*;
-    use crate::config::ShareMode;
+    use crate::config::{Share, ShareMode};
     use crate::dbus_wire::testing::*;
     use crate::host::fake::{FakeHost, char_type, types};
 
@@ -1158,6 +1181,53 @@ mod tests {
                 PathBuf::from("/home/han/kernel"),
                 Skip::Refused
             )]
+        );
+    }
+
+    /// A `--share` counts the way the config's own shares do: what lies
+    /// under one is visible at the path the bind gives it, and what lies
+    /// beside it is still a file only the portal can hand in.
+    #[test]
+    fn a_file_under_a_per_run_share_is_visible_and_a_sibling_is_not() {
+        let (file, dir, _) = types();
+        let host = FakeHost::default()
+            .with("/srv/proj", dir)
+            .with("/srv/proj/note.txt", file)
+            .with("/srv/other/note.txt", file)
+            .with("/home/han/work/todo.md", file)
+            .with("/home/han/spare.md", file);
+        let cfg = InstanceConfig {
+            shares: vec![
+                Share {
+                    path: "/srv/proj".into(),
+                    mode: ShareMode::ReadWrite,
+                },
+                Share {
+                    path: "/home/han/work".into(),
+                    mode: ShareMode::ReadOnly,
+                },
+            ],
+            ..InstanceConfig::default()
+        };
+        let args: Vec<OsString> = [
+            "/srv/proj/note.txt",
+            "/srv/other/note.txt",
+            "/home/han/work/todo.md",
+            "/home/han/spare.md",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
+        let out = plan(&env(), &cfg, Path::new(INSTANCE_HOME), &args, &host);
+        let got: Vec<String> = out.iter().map(tag).collect();
+        assert_eq!(
+            got,
+            [
+                "skip /srv/proj/note.txt AlreadyVisible",
+                "forward /srv/other/note.txt as note.txt (read)",
+                "rename /home/han/work/todo.md → /home/bubbler/work/todo.md",
+                "forward /home/han/spare.md as spare.md (read)",
+            ]
         );
     }
 

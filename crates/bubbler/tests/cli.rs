@@ -962,6 +962,33 @@ fn try_share_read_only_refuses_a_write_inside() {
     assert!(!proj.join("new").exists());
 }
 
+/// A file inside a share is reachable at the path it was named with, so
+/// bubbler leaves the argument alone instead of warning that only the
+/// document portal could hand it in.
+#[test]
+fn try_share_hands_a_file_argument_over_at_its_own_path() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir(&proj).unwrap();
+    std::fs::write(proj.join("f"), "shared\n").unwrap();
+    let out = bubbler_live(tmp.path(), &init)
+        .env("BUBBLER_TEST_ALLOW_PATH", tmp.path())
+        .args(["try", "--share"])
+        .arg(&proj)
+        .args(["--", "/usr/bin/cat"])
+        .arg(proj.join("f"))
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "shared\n");
+    assert!(!err.contains("not visible inside"), "{err}");
+}
+
 #[test]
 fn run_dry_run_lists_the_share_under_its_own_group_and_never_in_the_config() {
     let tmp = setup();
