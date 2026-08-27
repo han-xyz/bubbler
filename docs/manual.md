@@ -429,7 +429,8 @@ the way out: `home-share`, `path-share` and `app-runtime` are written back with
 `mode=ro` or `mode=rw` spelled out, by `profile show`, `reseed`, `--explain`,
 the editor and every `config.kdl` bubbler saves, so how wide a share is open is
 read off the line rather than remembered.
-`etc-share` is confined to `/etc` the same way, and cannot name the account
+`etc-share` is confined to `/etc` the same way, takes one entry once, and
+cannot name the account
 files (`passwd`, `group`, `shadow`, `gshadow` and their `-`/`+` variants),
 which the sandbox generates itself. `path-share` reaches outside the home and
 has rules of its own, under "Host paths"; `app-runtime`, which shares one
@@ -1473,7 +1474,10 @@ profile may carry it like any other node.
 `path-share "<absolute path>" [mode=rw]` binds a host path outside your home at
 that same path inside the sandbox: `/kioxia/Steam` stays `/kioxia/Steam`, and
 bwrap creates the directories above it. The node is repeatable, read-only
-unless `mode=rw`, and a whole mountpoint is a fine target.
+unless `mode=rw`, and a whole mountpoint is a fine target. One host path may be
+shared once, whatever the modes, the way one home path may: `path-share "/a"`
+beside `path-share "/a" mode=rw` is an error rather than a share whose width
+depends on which line came first.
 
 The path is resolved before anything is bound, and it must be a directory or a
 regular file. Neither end of the share may touch a path the sandbox is built

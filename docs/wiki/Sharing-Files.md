@@ -73,8 +73,8 @@ regular file. Refused, naming the root: `/`, `/proc`, `/sys`, `/dev`, `/etc`,
 the instance store (`~/.local/share/bubbler`), your profile layer
 (`~/.config/bubbler`), `/home/bubbler` — being one, inside one, or containing
 one, as written and as resolved. Carve-out: `/run/media`. `/mnt`, `/media`,
-`/srv` and your own top-level mountpoints are allowed. Two `path-share`s may
-not overlap.
+`/srv` and your own top-level mountpoints are allowed. One path once, whatever
+the modes; two `path-share`s may not overlap.
 
 Why so strict: a sandbox that can write another instance's `config.kdl` or a
 profile grants itself anything on the next run.
@@ -86,8 +86,8 @@ etc-share "vulkan"                // /etc/vulkan read-only; one path component
 etc-share "OpenCL"                // needed for OpenCL; `nvidia` for NVIDIA app profiles
 ```
 
-Cannot name the account files (`passwd`, `group`, `shadow`, …), which the
-sandbox generates. The baseline already binds the common entries — see
+One entry once. Cannot name the account files (`passwd`, `group`, `shadow`, …),
+which the sandbox generates. The baseline already binds the common entries — see
 [Configuration](Configuration.md#baseline-every-sandbox).
 
 ## app-runtime

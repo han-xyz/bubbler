@@ -1280,6 +1280,15 @@ fn grant(held: &mut Vec<Service>, svc: Service) -> Result<(), ConfigError> {
         Service::HomeShare { path, .. } => held
             .iter()
             .any(|s| matches!(s, Service::HomeShare { path: p, .. } if p == path)),
+        Service::PathShare { path, .. } => held
+            .iter()
+            .any(|s| matches!(s, Service::PathShare { path: p, .. } if p == path)),
+        // Keyed on the entry rather than on the whole node so that a
+        // property added to `etc-share` later cannot make two nodes for
+        // one entry, the way a mode did for the two shares above.
+        Service::EtcShare { name } => held
+            .iter()
+            .any(|s| matches!(s, Service::EtcShare { name: n } if n == name)),
         Service::AppRuntime { id, .. } => held
             .iter()
             .any(|s| matches!(s, Service::AppRuntime { id: i, .. } if i == id)),
@@ -3677,13 +3686,35 @@ command "b""#
             };
             assert_eq!(path.to_str().unwrap(), "/kioxia/Steam");
         }
-        assert!(matches!(
-            parse("path-share \"/a\"\npath-share \"/a/\""),
-            Err(ConfigError::Duplicate(n)) if n == "path-share"
-        ));
-        // Two modes for one path is not the same node; the launcher
-        // rejects it as an overlap, with both paths named.
-        assert!(parse("path-share \"/a\"\npath-share \"/a\" mode=rw").is_ok());
+        for text in [
+            "path-share \"/a\"\npath-share \"/a\"",
+            "path-share \"/a\"\npath-share \"/a/\"",
+            "path-share \"/a\"\npath-share \"/a\" mode=rw",
+            "path-share \"/a\" mode=rw\npath-share \"/a\"",
+            "path-share \"/a\" mode=rw\npath-share \"//a/.\" mode=rw",
+        ] {
+            assert!(
+                matches!(parse(text), Err(ConfigError::Duplicate(n)) if n == "path-share"),
+                "{text}"
+            );
+        }
+        // A share below another is a different path; the launcher refuses
+        // the pair as an overlap, with both paths named.
+        assert!(parse("path-share \"/a\"\npath-share \"/a/sub\" mode=rw").is_ok());
+    }
+
+    #[test]
+    fn etc_share_rejects_one_entry_twice() {
+        for text in [
+            "etc-share \"java\"\netc-share \"java\"",
+            "etc-share \"java\"\netc-share \"java/\"",
+        ] {
+            assert!(
+                matches!(parse(text), Err(ConfigError::Duplicate(n)) if n == "etc-share"),
+                "{text}"
+            );
+        }
+        assert!(parse("etc-share \"java\"\netc-share \"vulkan\"").is_ok());
     }
 
     #[test]
