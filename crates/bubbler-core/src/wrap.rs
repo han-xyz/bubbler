@@ -17,7 +17,7 @@ use rustix::fs::{FlockOperation, Mode, OFlags, flock};
 
 use crate::config;
 use crate::env::Env;
-use crate::error::WrapError;
+use crate::error::{ReadError, WrapError};
 use crate::instance::{self, Instance};
 use crate::kdl_out::quote;
 use crate::{dbus, fsutil, init_bin, network};
@@ -176,10 +176,13 @@ pub fn open_argv(instance: &str, args: &[OsString]) -> Vec<OsString> {
 /// dispatch turns what it says into an instance name.
 pub fn load(env: &Env) -> Result<Vec<Wrap>, WrapError> {
     let path = registry_path(env);
-    let text = match fs::read_to_string(&path) {
+    let text = match config::read_bounded(&path) {
         Ok(text) => text,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(WrapError::Io(path, e)),
+        // The same refusal `parse` below makes, named the same way:
+        // the registry is read on every start under a shim name.
+        Err(ReadError::TooLarge(source)) => return Err(WrapError::Parse { path, source }),
+        Err(ReadError::Io(e)) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(ReadError::Io(e)) => return Err(WrapError::Io(path, e)),
     };
     parse(&path, &text)
 }

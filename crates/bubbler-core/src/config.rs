@@ -3,13 +3,15 @@
 //! ignoring a grant would produce a different sandbox than the file says.
 
 use std::ffi::{OsStr, OsString};
+use std::fs::{self, File};
+use std::io::Read;
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
 use kdl::{KdlDocument, KdlNode};
 
-pub use crate::error::ConfigError;
+pub use crate::error::{ConfigError, ReadError};
 pub use crate::network::{
     AllowOut, Cidr, Forward, Mode as NetworkMode, NetworkConfig, Outbound, Proto,
 };
@@ -781,6 +783,39 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     } else {
         "no message".to_owned()
     }
+}
+
+/// Read a configuration file, refusing one past [`MAX_BYTES`] on its
+/// size rather than after it is in memory. Every configuration bubbler
+/// parses comes through here: `fs::read_to_string` would allocate a
+/// file of any size first and leave the bound to say no afterwards,
+/// which bounds the parser's stack but nothing else.
+///
+/// The size is taken from the file's metadata and the read is bounded
+/// again at [`MAX_BYTES`] + 1 bytes, so a file that grows between the
+/// two — or one whose size the metadata cannot know, as procfs and a
+/// pipe cannot — is refused by the second bound instead of being read
+/// to the end.
+pub fn read_bounded(path: &Path) -> Result<String, ReadError> {
+    let too_large = |bytes: usize| {
+        ReadError::TooLarge(ConfigError::TooLarge {
+            bytes,
+            max: MAX_BYTES,
+        })
+    };
+    let bound = MAX_BYTES as u64;
+    let size = fs::metadata(path)?.len();
+    if size > bound {
+        return Err(too_large(usize::try_from(size).unwrap_or(usize::MAX)));
+    }
+    let mut text = String::new();
+    File::open(path)?
+        .take(bound + 1)
+        .read_to_string(&mut text)?;
+    if text.len() > MAX_BYTES {
+        return Err(too_large(text.len()));
+    }
+    Ok(text)
 }
 
 /// Refuse text past [`MAX_BYTES`], holding more than [`MAX_NESTING`]
@@ -4784,6 +4819,51 @@ command "b""#
             parse(&big),
             Err(ConfigError::TooLarge { bytes, max }) if bytes == big.len() && max == MAX_BYTES
         ));
+    }
+
+    /// A file is refused on its size before it is read, not after: the
+    /// bound is what the parser is sized for, and a `read_to_string`
+    /// that pulls the whole file in first makes the bound a bound on
+    /// nothing.
+    #[test]
+    fn a_configuration_is_measured_before_it_is_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.kdl");
+
+        std::fs::write(&path, "a".repeat(MAX_BYTES + 1)).unwrap();
+        let refused = read_bounded(&path);
+        assert!(
+            matches!(
+                &refused,
+                Err(ReadError::TooLarge(ConfigError::TooLarge { bytes, max }))
+                    if *bytes == MAX_BYTES + 1 && *max == MAX_BYTES
+            ),
+            "{refused:?}"
+        );
+        // The same words the parser gives for text of that size, since
+        // this is the same refusal made earlier.
+        assert_eq!(
+            refused.unwrap_err().to_string(),
+            parse(&"a".repeat(MAX_BYTES + 1)).unwrap_err().to_string()
+        );
+
+        // At the bound it is read like any other file.
+        std::fs::write(&path, "a".repeat(MAX_BYTES)).unwrap();
+        assert_eq!(read_bounded(&path).unwrap().len(), MAX_BYTES);
+
+        let missing = tmp.path().join("gone.kdl");
+        assert!(matches!(
+            read_bounded(&missing),
+            Err(ReadError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound
+        ));
+
+        // A size the stat call cannot know is still read: procfs reports
+        // every one of its files as empty, and the guard on the read is
+        // what bounds a file that grows after it was measured.
+        let status = Path::new("/proc/self/status");
+        if status.is_file() {
+            assert!(!read_bounded(status).unwrap().is_empty());
+        }
     }
 
     #[test]

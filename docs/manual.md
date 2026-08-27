@@ -2999,7 +2999,9 @@ none of its own.
   recovers from a top-level token it cannot place (`}`, `)`, `=`, …) by
   consuming one byte and starting over, one stack frame per such byte, so a
   file of nothing but `}` aborted bubbler from 13 KB. bubbler refuses a
-  configuration over 64 KiB and parses on a thread with 512 MiB of stack
+  configuration over 64 KiB — on the file's size, before any of it is read,
+  and again on the read itself, so a file that grew after it was measured is
+  refused too — and parses on a thread with 512 MiB of stack
   reserved, which holds a frame for every byte of the largest file admitted
   with more than twice the room to spare. That reservation is address space
   charged when the thread starts, not memory used: under a `ulimit -v` below

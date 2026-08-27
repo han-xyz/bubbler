@@ -9,7 +9,7 @@ use bubbler_core::instance::{self, Instance};
 use bubbler_core::lint::{self, Severity};
 use bubbler_core::profile;
 use bubbler_core::wrap::{self, Wrap};
-use bubbler_core::{config::InstanceConfig, exec};
+use bubbler_core::{config, config::InstanceConfig, exec};
 
 /// One instance as a row: what it was seeded from, whether it is running,
 /// what it grants and what the linter makes of it.
@@ -130,7 +130,7 @@ impl Store {
 /// the config, the header and the lint run.
 fn row(env: &Env, ctx: &lint::Context<'_>, name: &str) -> Row {
     let path = instance::config_path(env, name);
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let text = config::read_bounded(&path).unwrap_or_default();
     let opened = Instance::open(env, name);
     let (grants, error) = match &opened {
         Ok(inst) => (nodes(&inst.config), None),

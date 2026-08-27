@@ -122,7 +122,7 @@ impl Detail {
     /// starting point and the state `u` returns to.
     pub fn open(env: &Env, name: &str, live: bool) -> Result<Self, String> {
         let inst = Instance::open(env, name).map_err(|e| e.to_string())?;
-        let text = std::fs::read_to_string(inst.config_path()).unwrap_or_default();
+        let text = config::read_bounded(&inst.config_path()).unwrap_or_default();
         let buf = inst.config.clone();
         let mut detail = Self {
             profile: instance::profile_header(&text).map(str::to_owned),

@@ -11,7 +11,7 @@ use rustix::process::{Pid, test_kill_process};
 
 use crate::config::{self, InstanceConfig, NetworkConfig, Service, WaylandMode, X11Mode};
 use crate::env::Env;
-use crate::error::InstanceError;
+use crate::error::{InstanceError, ReadError};
 use crate::fsutil;
 use crate::kdl_out;
 use crate::profile::{self, PROFILE_HEADER};
@@ -158,6 +158,16 @@ fn check_socket_paths(env: &Env, name: &str) -> Result<(), InstanceError> {
 
 fn io_err(path: &Path) -> impl FnOnce(io::Error) -> InstanceError + '_ {
     move |e| InstanceError::Io(path.to_path_buf(), e)
+}
+
+/// One `config.kdl`, refused on its size before it is read. A file past
+/// the parser's bound is the [`crate::error::ConfigError`] the parser
+/// gives; anything else names the path, the way [`io_err`] does.
+fn read_config(path: &Path) -> Result<String, InstanceError> {
+    config::read_bounded(path).map_err(|e| match e {
+        ReadError::Io(e) => InstanceError::Io(path.to_path_buf(), e),
+        ReadError::TooLarge(e) => InstanceError::Config(e),
+    })
 }
 
 /// [`fsutil::write_atomic`] as an [`InstanceError`]: a config is
@@ -503,12 +513,12 @@ impl Instance {
         validate_name(name)?;
         let dir = instances_root(env).join(name);
         let cfg_path = dir.join(CONFIG_FILE);
-        let text = match fs::read_to_string(&cfg_path) {
+        let text = match read_config(&cfg_path) {
             Ok(t) => t,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Err(InstanceError::Io(_, e)) if e.kind() == io::ErrorKind::NotFound => {
                 return Err(InstanceError::NotFound(name.to_owned()));
             }
-            Err(e) => return Err(InstanceError::Io(cfg_path, e)),
+            Err(e) => return Err(e),
         };
         let config = config::parse(&text)?;
         Ok(Self {
@@ -579,7 +589,7 @@ impl Instance {
     /// config, which holds the grants and not the text around them.
     pub fn save(&self, config: &InstanceConfig) -> Result<(), InstanceError> {
         let cfg_path = self.config_path();
-        let held = fs::read_to_string(&cfg_path).map_err(io_err(&cfg_path))?;
+        let held = read_config(&cfg_path)?;
         let mut text = String::new();
         // A profile is only named where the file already named one: a
         // header invented here would send `reseed` to somebody else's
@@ -614,7 +624,7 @@ impl Instance {
         {
             return Err(InstanceError::AlreadyRunning(name.to_owned()));
         }
-        let text = fs::read_to_string(&cfg_path).map_err(io_err(&cfg_path))?;
+        let text = read_config(&cfg_path)?;
         let profile_name = profile_header(&text)
             .ok_or_else(|| InstanceError::NoProfileHeader(cfg_path.clone()))?;
         let (fresh, config) = seed(env, profile_name, &[])?;
@@ -636,7 +646,7 @@ impl Instance {
     /// [`Instance::migration_warning`] stops warning about.
     pub fn mark_version(env: &Env, name: &str) -> Result<bool, InstanceError> {
         let cfg_path = config_path_checked(env, name)?;
-        let text = fs::read_to_string(&cfg_path).map_err(io_err(&cfg_path))?;
+        let text = read_config(&cfg_path)?;
         if config_version(&text).is_some_and(|v| v >= CONFIG_VERSION) {
             return Ok(false);
         }
@@ -736,6 +746,26 @@ mod tests {
         let opened = Instance::open(&env, "ff").unwrap();
         assert_eq!(opened.dir, inst.dir);
         assert_eq!(Instance::list(&env).unwrap(), vec!["ff".to_string()]);
+    }
+
+    /// A `config.kdl` past the parser's size bound is refused with the
+    /// words the parser gives, and refused on its size rather than after
+    /// the whole of it is in memory.
+    #[test]
+    fn a_config_past_the_size_bound_is_refused_by_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = env(tmp.path());
+        let inst = Instance::create(&env, "ff", "generic").unwrap();
+        fs::write(inst.config_path(), "a".repeat(config::MAX_BYTES + 1)).unwrap();
+        let refused = Instance::open(&env, "ff");
+        assert!(
+            matches!(
+                &refused,
+                Err(InstanceError::Config(config::ConfigError::TooLarge { bytes, max }))
+                    if *bytes == config::MAX_BYTES + 1 && *max == config::MAX_BYTES
+            ),
+            "{refused:?}"
+        );
     }
 
     #[test]

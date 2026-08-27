@@ -14,7 +14,7 @@ use crate::config::{
     Service, ShareMode, Userns,
 };
 use crate::env::Env;
-use crate::error::ProfileError;
+use crate::error::{ProfileError, ReadError};
 use crate::instance::is_plain_name;
 use crate::kdl_out;
 use crate::seccomp::SeccompConfig;
@@ -246,15 +246,24 @@ impl Resolver {
             (Origin::System, &self.system_dir),
         ] {
             let path = dir.join(&file);
-            match fs::read_to_string(&path) {
+            match config::read_bounded(&path) {
                 Ok(text) => out.push(Layer {
                     name: name.to_owned(),
                     origin,
                     path: Some(path),
                     text,
                 }),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(ProfileError::Io(path, e)),
+                // A layer past the parser's bound is refused as the
+                // parser refuses it, named by the file it was read
+                // from, since that is the layer nothing below can fix.
+                Err(ReadError::TooLarge(source)) => {
+                    return Err(ProfileError::Parse {
+                        origin: path.display().to_string(),
+                        source,
+                    });
+                }
+                Err(ReadError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(ReadError::Io(e)) => return Err(ProfileError::Io(path, e)),
             }
         }
         if let Some(text) = lookup(name) {

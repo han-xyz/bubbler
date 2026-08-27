@@ -92,6 +92,23 @@ pub enum ConfigError {
     ParserPanicked(String),
 }
 
+/// Why [`crate::config::read_bounded`] could not hand back a
+/// configuration: the two are kept apart because every caller already
+/// names the path in an error of its own, and only it knows whether a
+/// missing file is a failure.
+#[derive(Debug, Error)]
+pub enum ReadError {
+    /// The file could not be read. The bare `io::Error`, so a caller can
+    /// still tell a missing file from an unreadable one.
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    /// The file is larger than [`crate::config::MAX_BYTES`], carried as
+    /// the [`ConfigError::TooLarge`] the parser would have given: the
+    /// refusal is made earlier, not differently.
+    #[error(transparent)]
+    TooLarge(#[from] ConfigError),
+}
+
 /// Failures while resolving a profile through its layers.
 #[derive(Debug, Error)]
 pub enum ProfileError {

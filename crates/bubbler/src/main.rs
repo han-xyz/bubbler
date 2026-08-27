@@ -602,7 +602,7 @@ fn explain(
     };
     let path = inst.config_path();
     let text =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        config::read_bounded(&path).with_context(|| format!("reading {}", path.display()))?;
     let mut lines = config::node_lines(&text)
         .with_context(|| format!("locating the nodes of {}", path.display()))?;
     // The file is read a second time here, so a config edited in between

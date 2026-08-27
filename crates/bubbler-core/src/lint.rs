@@ -9,7 +9,6 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 
@@ -18,7 +17,7 @@ use kdl::{KdlDocument, KdlNode};
 use crate::config;
 use crate::desktop;
 use crate::env::Env;
-use crate::error::LintError;
+use crate::error::{LintError, ReadError};
 use crate::host::Host;
 use crate::profile::Resolver;
 use crate::service;
@@ -456,7 +455,10 @@ pub fn lint_profile(ctx: &Context, resolver: &Resolver, name: &str) -> Result<Re
 
 /// Lint one `config.kdl`, which has a single layer and no `include`s.
 pub fn lint_config(ctx: &Context, path: &Path) -> Result<Report, LintError> {
-    let text = fs::read_to_string(path).map_err(|e| LintError::Io(path.to_path_buf(), e))?;
+    let text = config::read_bounded(path).map_err(|e| match e {
+        ReadError::Io(e) => LintError::Io(path.to_path_buf(), e),
+        ReadError::TooLarge(e) => LintError::Config(e),
+    })?;
     lint_text(ctx, Where::File(path.to_path_buf()), text)
 }
 
