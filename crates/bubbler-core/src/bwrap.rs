@@ -489,14 +489,26 @@ impl BwrapArgs {
     /// the value of the baseline `--chdir`, so the flag is still emitted
     /// once and in phase 1; the group it explains under stays the
     /// baseline's.
+    ///
+    /// # Panics
+    ///
+    /// If the arguments hold no `--chdir`. Only [`BwrapArgs::baseline`]
+    /// builds the sandbox this is called on, and it always emits one.
     pub fn chdir(&mut self, dir: &Path) {
         let flag = OsStr::new("--chdir");
-        if let Some(item) = self.namespaces.iter_mut().find(|i| holds(i, flag))
-            && let Kind::Args(a) = &mut item.kind
-        {
-            a.truncate(1);
-            a.push(dir.as_os_str().to_owned());
-        }
+        // Silently leaving the working directory where it was would put
+        // the sandbox in whatever directory bwrap inherited — a host
+        // path — instead of in the share the caller asked for.
+        let args = self
+            .namespaces
+            .iter_mut()
+            .find_map(|i| match &mut i.kind {
+                Kind::Args(a) if a.first().is_some_and(|p| p == flag) => Some(a),
+                _ => None,
+            })
+            .expect("the baseline emits --chdir once, in phase 1");
+        args.truncate(1);
+        args.push(dir.as_os_str().to_owned());
     }
 
     /// Tag every argument pushed from here on with `origin`. The caller

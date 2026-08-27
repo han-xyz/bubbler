@@ -1086,8 +1086,9 @@ fn home_share(
 
 /// Bind every `--share` after the config's own services, each tagged with
 /// its position. A path under the real home lands at the same relative
-/// path in the private home; any other at its own path, with the same
-/// reserved roots as `path-share`. The first share that is a directory
+/// path in the private home, any other at its own path, and both under
+/// the reserved roots `path-share` is held to. The first share that is a
+/// directory
 /// becomes the working directory. A share the config already makes, one
 /// given twice, and one that contains or sits inside another share are
 /// all errors rather than a second bind of the same place.
@@ -1098,6 +1099,12 @@ pub fn apply_shares(
     args: &mut BwrapArgs,
     host: &dyn Host,
 ) -> Result<(), LaunchError> {
+    // Without a flag there is nothing to check, and `share_plan` would
+    // resolve the config's own shares a second time only to compare them
+    // against nothing.
+    if shares.is_empty() {
+        return Ok(());
+    }
     let mut cwd: Option<PathBuf> = None;
     for (i, (s, (src, dst))) in shares
         .iter()
@@ -1170,22 +1177,35 @@ fn share_plan(
     Ok(out)
 }
 
-/// Every share the config makes, as (canonical source, destination). A
-/// `home-share` carries no source here: a host path under the real home
-/// is one `--share` can only reach through the branch that maps into the
-/// private home, and there the destinations already tell the two apart.
+/// Every share the config makes, as (canonical source, destination),
+/// each resolved the way the service that binds it resolves it: a
+/// symlink in the home makes the two sides of a `home-share` different
+/// paths, and the source is the side a `--share` of that symlink meets.
+// Only the two share nodes are listed. Another service that binds under
+// a share's destination is invisible to the overlap rule: today that is
+// `x11`, whose cookie lands at `/home/bubbler/.Xauthority`.
 fn config_shares(
     services: &[Service],
     env: &Env,
     host: &dyn Host,
 ) -> Result<Vec<(Option<PathBuf>, PathBuf)>, LaunchError> {
-    let mut out: Vec<(Option<PathBuf>, PathBuf)> = services
-        .iter()
-        .filter_map(|s| match s {
-            Service::HomeShare { path, .. } => Some((None, Path::new(SANDBOX_HOME).join(path))),
-            _ => None,
-        })
-        .collect();
+    let mut out: Vec<(Option<PathBuf>, PathBuf)> = Vec::new();
+    for s in services {
+        let Service::HomeShare { path, .. } = s else {
+            continue;
+        };
+        // The name of the node that would be at fault, not of the flag:
+        // `apply_all` resolved this same path before us, so a failure
+        // here is the config's, not the caller's.
+        let src = confine(
+            host,
+            "home-share",
+            &env.home,
+            &env.home.join(path),
+            "the home directory",
+        )?;
+        out.push((Some(src), Path::new(SANDBOX_HOME).join(path)));
+    }
     for (_, dst, src, _) in path_shares(services, env, host)? {
         out.push((Some(src), dst.to_path_buf()));
     }
@@ -1197,16 +1217,15 @@ fn config_shares(
 /// the two are unrelated, and where a share the config makes has no
 /// source to compare against.
 fn overlap(src: &Path, dst: &Path, other_src: Option<&Path>, other_dst: &Path) -> Option<String> {
-    let where_ = match nested(dst, other_dst) {
-        true => String::new(),
-        false => {
-            let other = other_src.filter(|o| nested(src, o))?;
-            format!(
-                " (they resolve to {} and {})",
-                src.display(),
-                other.display()
-            )
-        }
+    let where_ = if nested(dst, other_dst) {
+        String::new()
+    } else {
+        let other = other_src.filter(|o| nested(src, o))?;
+        format!(
+            " (they resolve to {} and {})",
+            src.display(),
+            other.display()
+        )
     };
     Some(format!(
         "{} and {} overlap{where_}; one share cannot contain another",
@@ -1217,30 +1236,44 @@ fn overlap(src: &Path, dst: &Path, other_src: Option<&Path>, other_dst: &Path) -
 
 /// Source and destination of one `--share`: the source resolved and
 /// type-checked as `path-share` does, the destination by where the written
-/// path lies. A path that is not absolute is the CLI's mistake, not the
-/// user's, and is refused as a bad value rather than joined to anything.
+/// path lies, and either way under the reserved roots the config nodes
+/// are held to. The path must be absolute and free of `.` and `..`, which
+/// is what the parser guarantees for a node and nothing guarantees for a
+/// flag; a path that is neither is refused rather than repaired here.
 fn share_paths(
     env: &Env,
     host: &dyn Host,
     written: &Path,
 ) -> Result<(PathBuf, PathBuf), LaunchError> {
-    if !written.is_absolute() {
+    let mut comps = written.components();
+    if comps.next() != Some(Component::RootDir) {
         return Err(LaunchError::BadValue {
             service: "--share",
             reason: format!("{} is not absolute", written.display()),
+        });
+    }
+    // The config nodes are normalised at parse time; a flag is checked
+    // here instead. A `..` left in the path would walk out of every
+    // comparison below — the destination it is bound at is built from the
+    // path as written, so `$HOME/x/..` maps over the private home while
+    // comparing equal to nothing.
+    if !comps.all(|c| matches!(c, Component::Normal(_))) {
+        return Err(LaunchError::BadValue {
+            service: "--share",
+            reason: format!(
+                "{} contains `.` or `..`; give the path without them",
+                written.display()
+            ),
         });
     }
     if let Ok(rel) = written.strip_prefix(&env.home) {
         let src = confine(host, "--share", &env.home, written, "the home directory")?;
         let src = require_dir_or_file(host, "--share", src)?;
         let dst = Path::new(SANDBOX_HOME).join(rel);
-        // The home itself would be bound over the private home, taking
-        // with it whatever the instance keeps there. `path-share` refuses
-        // that destination too; this branch never reaches its check.
-        if dst == Path::new(SANDBOX_HOME) {
+        if let Some((root, end)) = denied_root_in_home(host, env, &src, &dst) {
             return Err(LaunchError::BadValue {
                 service: "--share",
-                reason: denied_reason(written, &src, Path::new(SANDBOX_HOME), End::Destination),
+                reason: denied_reason(written, &src, &root, end),
             });
         }
         return Ok((src, dst));
@@ -1252,7 +1285,34 @@ fn share_paths(
             reason: denied_reason(written, &src, &root, end),
         });
     }
-    Ok((src, written.to_path_buf()))
+    Ok((src, written.components().collect()))
+}
+
+/// The reserved root a share that maps into the private home meets.
+/// [`denied_root`] cannot answer for one: the real home is a root of its
+/// own there and every path inside it is nested with it, so what is left
+/// to check is the roots that lie *within* the home — the instance store
+/// and the profile layer, wherever XDG puts them — and the private home
+/// itself as a destination. Ancestors count, as they do for `path-share`:
+/// binding one covers the root beneath it.
+fn denied_root_in_home(
+    host: &dyn Host,
+    env: &Env,
+    canonical: &Path,
+    dst: &Path,
+) -> Option<(PathBuf, End)> {
+    // The private home first, so that a share of the whole real home is
+    // named by what it would cover rather than by whichever root inside
+    // it happens to be found first.
+    if dst == Path::new(SANDBOX_HOME) {
+        return Some((PathBuf::from(SANDBOX_HOME), End::Destination));
+    }
+    let home = [Some(env.home.clone()), host.canonicalize(&env.home)];
+    env_roots(host, env)
+        .into_iter()
+        .filter(|root| !home.iter().flatten().any(|h| h == root))
+        .find(|root| nested(canonical, root))
+        .map(|root| (root, End::Source))
 }
 
 /// Bind one host `/etc` entry read-only at `/etc/<name>`, on top of the
@@ -1433,8 +1493,17 @@ mod tests {
         shares: &[Share],
         existing: &[(&str, Kind)],
     ) -> Result<Vec<String>, LaunchError> {
+        argv_shared_linked(services, shares, existing, &[])
+    }
+
+    fn argv_shared_linked(
+        services: &[Service],
+        shares: &[Share],
+        existing: &[(&str, Kind)],
+        links: &[(&str, &str)],
+    ) -> Result<Vec<String>, LaunchError> {
         let env = env();
-        let host = fake_host(existing, &[]);
+        let host = fake_host(existing, links);
         let plan = dbus::plan(services, "t");
         let mut args = BwrapArgs::baseline(&env, Path::new("/i/home"), &host);
         apply_all(services, &env, &mut args, &host, &argv_ctx(&plan))?;
@@ -2306,6 +2375,142 @@ mod tests {
             matches!(&e, LaunchError::BadValue { service: "--share", reason } if reason.contains("given twice")),
             "{e}"
         );
+    }
+
+    /// The roots that live under the real home — the instance store and
+    /// the profile layer — are the ones only this branch can reach, and
+    /// a sandbox that can write either one writes the config of every
+    /// instance seeded afterwards.
+    #[test]
+    fn a_share_of_a_reserved_root_under_the_home_is_refused() {
+        let store = home(".local/share/bubbler");
+        let e = argv_shared(
+            &[],
+            &[Share {
+                path: PathBuf::from(&store),
+                mode: ShareMode::ReadWrite,
+            }],
+            &[(&store, Dir)],
+        )
+        .unwrap_err();
+        let LaunchError::BadValue { service, reason } = &e else {
+            panic!("{e}");
+        };
+        assert_eq!(*service, "--share");
+        assert_eq!(reason, &format!("bubbler never shares {store}"));
+        // And its ancestors with it: a bind of one covers the root under
+        // it, which is why `path-share` refuses both ends.
+        let above = home(".local/share");
+        let e = argv_shared(
+            &[],
+            &[Share {
+                path: PathBuf::from(&above),
+                mode: ShareMode::ReadWrite,
+            }],
+            &[(&above, Dir)],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&e, LaunchError::BadValue { service: "--share", reason }
+                if reason == &format!("bubbler never shares {above}, which overlaps {store}")),
+            "{e}"
+        );
+    }
+
+    /// The config nodes are normalised by the parser; a flag is checked
+    /// here. A `..` would be a component of the destination as well, so
+    /// every comparison below it — the private home, the duplicates, the
+    /// overlaps — would compare a path that is not the one bwrap mounts.
+    #[test]
+    fn a_share_with_a_dot_component_or_no_root_is_refused() {
+        let dots = [PathBuf::from("/srv/a/../b"), env().home.join("Projects/..")];
+        for path in dots {
+            let e = argv_shared(
+                &[],
+                &[Share {
+                    path: path.clone(),
+                    mode: ShareMode::ReadWrite,
+                }],
+                &[("/srv/a", Dir), ("/srv/b", Dir), (&home("Projects"), Dir)],
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&e, LaunchError::BadValue { service: "--share", reason }
+                    if reason == &format!("{} contains `.` or `..`; give the path without them", path.display())),
+                "{e}"
+            );
+        }
+        // The CLI joins the caller's cwd, so a relative path here is a
+        // caller that did not; it is refused rather than joined to
+        // anything of bubbler's own.
+        let e = argv_shared(
+            &[],
+            &[Share {
+                path: PathBuf::from("srv/a"),
+                mode: ShareMode::ReadWrite,
+            }],
+            &[("/srv/a", Dir)],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&e, LaunchError::BadValue { service: "--share", reason }
+                if reason == "srv/a is not absolute"),
+            "{e}"
+        );
+    }
+
+    /// A `home-share` binds the path its source resolves to, so a
+    /// symlink in the home makes the node's two sides different paths.
+    /// The flag names the symlink, lands somewhere else inside the
+    /// sandbox, and would bind the same host tree a second time.
+    #[test]
+    fn a_share_through_a_symlink_onto_a_config_share_is_refused() {
+        let e = argv_shared_linked(
+            &[Service::HomeShare {
+                path: PathBuf::from("Projects/app"),
+                mode: ShareMode::ReadOnly,
+            }],
+            &[Share {
+                path: PathBuf::from(home("app")),
+                mode: ShareMode::ReadWrite,
+            }],
+            &[(&home("Projects/app"), Dir)],
+            &[(&home("app"), &home("Projects/app"))],
+        )
+        .unwrap_err();
+        let LaunchError::BadValue { service, reason } = &e else {
+            panic!("{e}");
+        };
+        assert_eq!(*service, "--share");
+        assert_eq!(
+            reason,
+            &format!(
+                "/home/bubbler/app and /home/bubbler/Projects/app overlap \
+                 (they resolve to {0} and {0}); one share cannot contain another",
+                home("Projects/app")
+            )
+        );
+    }
+
+    /// Shares are bound after the config's own grants, which is what the
+    /// overlap rule rests on: bwrap applies binds in the order it is
+    /// given them.
+    #[test]
+    fn a_share_is_bound_after_the_config_binds() {
+        let a = argv_shared(
+            &[Service::HomeShare {
+                path: PathBuf::from("Downloads"),
+                mode: ShareMode::ReadOnly,
+            }],
+            &[Share {
+                path: PathBuf::from(home("Projects/app")),
+                mode: ShareMode::ReadWrite,
+            }],
+            &[(&home("Downloads"), Dir), (&home("Projects/app"), Dir)],
+        )
+        .unwrap();
+        let at = |p: String| a.iter().position(|x| *x == p);
+        assert!(at(home("Downloads")) < at(home("Projects/app")), "{a:?}");
     }
 
     /// The overlap rule two `path-share` nodes are held to, applied to
