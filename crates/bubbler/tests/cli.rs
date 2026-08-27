@@ -4604,7 +4604,9 @@ fn selection_verdict(printed: &str, log: &str) -> Option<String> {
     // window kept it, on a desktop in use — was offered nothing for a
     // reason that says nothing about the proxy; the same for an empty read
     // after the focus moved away mid-test. The fixture reports both.
-    if log.contains("focus: never") || (printed == "0" && log.contains("focus: lost")) {
+    if (printed == "NO_OFFER" && log.contains("focus: never"))
+        || (printed == "0" && log.contains("focus: lost"))
+    {
         say("skipping: the compositor kept keyboard focus on another window");
         return None;
     }
