@@ -1088,9 +1088,9 @@ fn home_share(
 /// its position. A path under the real home lands at the same relative
 /// path in the private home; any other at its own path, with the same
 /// reserved roots as `path-share`. The first share that is a directory
-/// becomes the working directory. A share the config already makes, or
-/// one given twice, is an error rather than a second bind of the same
-/// place.
+/// becomes the working directory. A share the config already makes, one
+/// given twice, and one that contains or sits inside another share are
+/// all errors rather than a second bind of the same place.
 pub fn apply_shares(
     services: &[Service],
     shares: &[Share],
@@ -1098,32 +1098,13 @@ pub fn apply_shares(
     args: &mut BwrapArgs,
     host: &dyn Host,
 ) -> Result<(), LaunchError> {
-    let config_dsts: Vec<PathBuf> = services
-        .iter()
-        .filter_map(|s| match s {
-            Service::HomeShare { path, .. } => Some(Path::new(SANDBOX_HOME).join(path)),
-            Service::PathShare { path, .. } => Some(path.clone()),
-            _ => None,
-        })
-        .collect();
     let mut cwd: Option<PathBuf> = None;
-    let mut seen: Vec<PathBuf> = Vec::new();
-    for (i, s) in shares.iter().enumerate() {
+    for (i, (s, (src, dst))) in shares
+        .iter()
+        .zip(share_plan(services, shares, env, host)?)
+        .enumerate()
+    {
         args.tag(Origin::Share(i));
-        let (src, dst) = share_paths(env, host, &s.path)?;
-        if config_dsts.contains(&dst) {
-            return Err(LaunchError::BadValue {
-                service: "--share",
-                reason: format!("{} already shared by config.kdl", s.path.display()),
-            });
-        }
-        if seen.contains(&dst) {
-            return Err(LaunchError::BadValue {
-                service: "--share",
-                reason: format!("{} given twice", s.path.display()),
-            });
-        }
-        seen.push(dst.clone());
         match s.mode {
             ShareMode::ReadOnly => args.ro_bind(&src, &dst),
             ShareMode::ReadWrite => args.bind(&src, &dst),
@@ -1136,6 +1117,102 @@ pub fn apply_shares(
         args.chdir(&dir);
     }
     Ok(())
+}
+
+/// Every `--share` as (canonical source, destination), in the order the
+/// flags were given, once all of them have passed the checks the config
+/// nodes get. Nothing is bound until the last one has: a run refused
+/// halfway would otherwise be a sandbox built from the shares before the
+/// error.
+fn share_plan(
+    services: &[Service],
+    shares: &[Share],
+    env: &Env,
+    host: &dyn Host,
+) -> Result<Vec<(PathBuf, PathBuf)>, LaunchError> {
+    let config = config_shares(services, env, host)?;
+    let mut out: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for s in shares {
+        let (src, dst) = share_paths(env, host, &s.path)?;
+        // The exact cases first: naming the same place twice is a
+        // mistake worth its own sentence, and the overlap rule below
+        // would otherwise answer for it in the general terms of two
+        // shares that contain one another.
+        if config.iter().any(|(_, d)| *d == dst) {
+            return Err(LaunchError::BadValue {
+                service: "--share",
+                reason: format!("{} already shared by config.kdl", s.path.display()),
+            });
+        }
+        if out.iter().any(|(_, d)| *d == dst) {
+            return Err(LaunchError::BadValue {
+                service: "--share",
+                reason: format!("{} given twice", s.path.display()),
+            });
+        }
+        let against = config
+            .iter()
+            .map(|(o_src, o_dst)| (o_src.as_deref(), o_dst.as_path()))
+            .chain(
+                out.iter()
+                    .map(|(o_src, o_dst)| (Some(o_src.as_path()), o_dst.as_path())),
+            );
+        for (o_src, o_dst) in against {
+            if let Some(reason) = overlap(&src, &dst, o_src, o_dst) {
+                return Err(LaunchError::BadValue {
+                    service: "--share",
+                    reason,
+                });
+            }
+        }
+        out.push((src, dst));
+    }
+    Ok(out)
+}
+
+/// Every share the config makes, as (canonical source, destination). A
+/// `home-share` carries no source here: a host path under the real home
+/// is one `--share` can only reach through the branch that maps into the
+/// private home, and there the destinations already tell the two apart.
+fn config_shares(
+    services: &[Service],
+    env: &Env,
+    host: &dyn Host,
+) -> Result<Vec<(Option<PathBuf>, PathBuf)>, LaunchError> {
+    let mut out: Vec<(Option<PathBuf>, PathBuf)> = services
+        .iter()
+        .filter_map(|s| match s {
+            Service::HomeShare { path, .. } => Some((None, Path::new(SANDBOX_HOME).join(path))),
+            _ => None,
+        })
+        .collect();
+    for (_, dst, src, _) in path_shares(services, env, host)? {
+        out.push((Some(src), dst.to_path_buf()));
+    }
+    Ok(out)
+}
+
+/// Why one `--share` overlaps another share, if it does: the same rule
+/// two `path-share` nodes are held to, in the same words. `None` where
+/// the two are unrelated, and where a share the config makes has no
+/// source to compare against.
+fn overlap(src: &Path, dst: &Path, other_src: Option<&Path>, other_dst: &Path) -> Option<String> {
+    let where_ = match nested(dst, other_dst) {
+        true => String::new(),
+        false => {
+            let other = other_src.filter(|o| nested(src, o))?;
+            format!(
+                " (they resolve to {} and {})",
+                src.display(),
+                other.display()
+            )
+        }
+    };
+    Some(format!(
+        "{} and {} overlap{where_}; one share cannot contain another",
+        dst.display(),
+        other_dst.display()
+    ))
 }
 
 /// Source and destination of one `--share`: the source resolved and
@@ -2228,6 +2305,65 @@ mod tests {
         assert!(
             matches!(&e, LaunchError::BadValue { service: "--share", reason } if reason.contains("given twice")),
             "{e}"
+        );
+    }
+
+    /// The overlap rule two `path-share` nodes are held to, applied to
+    /// the flags: bwrap binds in the order it is given, so one share
+    /// inside another either fails or hides it, depending on which was
+    /// written first.
+    #[test]
+    fn a_share_that_contains_another_share_is_refused() {
+        let e = argv_shared(
+            &[],
+            &[
+                Share {
+                    path: PathBuf::from("/srv/a"),
+                    mode: ShareMode::ReadWrite,
+                },
+                Share {
+                    path: PathBuf::from("/srv/a/b"),
+                    mode: ShareMode::ReadWrite,
+                },
+            ],
+            &[("/srv/a", Dir), ("/srv/a/b", Dir)],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&e, LaunchError::BadValue { service: "--share", reason }
+                if reason == "/srv/a/b and /srv/a overlap; one share cannot contain another"),
+            "{e}"
+        );
+    }
+
+    /// The same rule against the config's own shares, on the mapped
+    /// destinations: the flag names a host path, the node a relative one,
+    /// and only inside the sandbox are the two comparable.
+    #[test]
+    fn a_share_inside_a_config_share_is_refused() {
+        let e = argv_shared(
+            &[Service::HomeShare {
+                path: PathBuf::from("Projects/app"),
+                mode: ShareMode::ReadOnly,
+            }],
+            &[Share {
+                path: PathBuf::from(home("Projects/app/sub")),
+                mode: ShareMode::ReadWrite,
+            }],
+            &[
+                (&home("Projects/app"), Dir),
+                (&home("Projects/app/sub"), Dir),
+            ],
+        )
+        .unwrap_err();
+        let LaunchError::BadValue { service, reason } = &e else {
+            panic!("{e}");
+        };
+        assert_eq!(*service, "--share");
+        assert_eq!(
+            reason,
+            "/home/bubbler/Projects/app/sub and /home/bubbler/Projects/app overlap; \
+             one share cannot contain another"
         );
     }
 
