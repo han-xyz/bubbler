@@ -53,7 +53,9 @@ resolved on the host first. A path under `$HOME` lands at the same relative
 path under the private home, the way `home-share` maps its source; any other
 path lands at the path it has on the host, the way `path-share` does — with the
 type checks and the reserved roots of both, so your home itself, the instance
-store and the profile layer are refused here as well.
+store and the profile layer are refused here as well. What does not carry over
+is the default: those two nodes are read-only unless `mode=rw` says otherwise,
+while a `--share` is read-write unless `=ro` does.
 
 ```
 cd <project>
@@ -68,9 +70,10 @@ bubbler run cc --share . --share ~/notes.md=ro
 - Nothing is written to `config.kdl`, so the file keeps saying what the
   instance is granted with no arguments.
 - Refused on an instance that is already running — a share is one of the binds
-  `bwrap` made at start and a live mount namespace takes no more, so stop it
-  first. `--dry-run` and `--explain` describe a fresh sandbox either way, with
-  the share under a `--share "<path>" mode=…` group of its own.
+  `bwrap` made at start and a live mount namespace takes no more, so exit it
+  first (an instance ends when its command does). `--dry-run` and `--explain`
+  describe a fresh sandbox either way, with the share under a
+  `--share "<path>" mode=…` group of its own.
 - A file argument under a `--share` is inside already: it is passed under the
   name the bind gives it rather than forwarded through the document portal.
 

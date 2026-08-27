@@ -12,11 +12,11 @@ bubbler run <inst> [-- cmd...]          start it (or exec into it if already run
 bubbler run <inst> --dry-run            print the bwrap argv, launch nothing
 bubbler run <inst> --explain            the same argv grouped under the node that made it
 bubbler run <inst> --tty <mode>         pty | passthrough | none
-bubbler run <inst> --share <p>[=ro|rw]  a host path for this run only; `try` too
+bubbler run <inst> --share <p>[=ro|rw]  bind a host path for this run only
 bubbler exec <inst> -- cmd...           run a command inside the running instance
 bubbler open <inst> [-- cmd...]         exec if running, else run; what menu entries call
 bubbler log <inst>                      what its last terminal-less run printed
-bubbler try [--profile p] [--grant g]... -- cmd...   throwaway sandbox
+bubbler try [--profile p] [--grant g]... [--share p]... -- cmd...   throwaway sandbox
 bubbler try --keep <name> -- cmd...     keep it afterwards as an instance
 
 bubbler profiles [--origin]             profile names (and which layer holds each)

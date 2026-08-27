@@ -9,32 +9,31 @@ with named instances, explicit resource grants, and a profile library for
 common applications. bubbler itself is unprivileged; `bwrap`
 does the namespace work.
 
-Status: milestone 10 — a library of 14 profiles (`alacritty`, `chromium`,
-`code`, `firefox`, `generic`, `keepassxc`, `kitty`, `libreoffice`, `lutris`,
-`mpv`, `spotify`, `steam`, `thunderbird`, `vesktop`) over GPU, sound, a private
-home, host paths through `path-share`, host files named on the command line
-through the document portal, a runtime directory shared between
-sandboxes through `app-runtime`, game controllers through `gamepad`, a camera
-through the portal, a filtered session, system and accessibility bus with
-portals, notifications, `tray` and input methods, a terminal of their own, a
-network namespace of their own through pasta with outbound filtering through an
-nftables ruleset installed in it, and a seccomp filter that covers 32-bit
-binaries as well as 64-bit.
-Profiles come in three layers — yours, the system's, built-in — and compose
-with `include`. `bubbler lint` measures a profile or an instance config
-against what a sandbox is meant to give away, and `--dry-run --explain` puts
-every bwrap argument under the node that produced it. `bubbler open` starts an
-instance or hands a URL to the one already running, and keeps what a launch
-with no terminal printed where `bubbler log` finds it; `bubbler desktop` writes
-the menu entry that calls it, `bubbler wrap` the `~/.local/bin` shim. `bubbler
-man` prints both manual pages, and `bubbler ui` opens the terminal editor
-`bubbler-ui`, which is every subcommand over a list of instances and their
-grants. `docs/threat-model.md` says what each mechanism defends and what it
-does not, `fuzz/` holds seven cargo-fuzz targets beside the property tests over
-the same parsers, `cargo deny check` guards the dependency tree,
-`.github/workflows/ci.yml` runs the lot, and `contrib/apparmor/usr.bin.bubbler`
-is an AppArmor profile for packagers that has never been loaded here. See
-"Known gaps" below.
+Status: milestone 10 — a library of 16 profiles (`agent`, `alacritty`,
+`chromium`, `claude-code`, `code`, `firefox`, `generic`, `keepassxc`, `kitty`,
+`libreoffice`, `lutris`, `mpv`, `spotify`, `steam`, `thunderbird`, `vesktop`)
+over GPU, sound, a private home, host paths through `path-share`, host files
+named on the command line through the document portal, a runtime directory
+shared between sandboxes through `app-runtime`, game controllers through
+`gamepad`, a camera through the portal, a filtered session, system and
+accessibility bus with portals, notifications, `tray` and input methods, a
+terminal of their own, a network namespace of their own through pasta with
+outbound filtering through an nftables ruleset installed in it, and a seccomp
+filter that covers 32-bit binaries as well as 64-bit. Profiles come in three
+layers — yours, the system's, built-in — and compose with `include`. `bubbler
+lint` measures a profile or an instance config against what a sandbox is meant
+to give away, and `--dry-run --explain` puts every bwrap argument under the
+node that produced it. `bubbler open` starts an instance or hands a URL to the
+one already running, and keeps what a launch with no terminal printed where
+`bubbler log` finds it; `bubbler desktop` writes the menu entry that calls it,
+`bubbler wrap` the `~/.local/bin` shim. `bubbler man` prints both manual pages,
+and `bubbler ui` opens the terminal editor `bubbler-ui`, which is every
+subcommand over a list of instances and their grants. `docs/threat-model.md`
+says what each mechanism defends and what it does not, `fuzz/` holds seven
+cargo-fuzz targets beside the property tests over the same parsers, `cargo deny
+check` guards the dependency tree, `.github/workflows/ci.yml` runs the lot, and
+`contrib/apparmor/usr.bin.bubbler` is an AppArmor profile for packagers that
+has never been loaded here. See "Known gaps" below.
 
 ## Usage
 
@@ -103,11 +102,13 @@ home is bound at the same relative path under the private home — `~/src/x` at
 at the path it has on the host, the mapping `path-share` makes; both come with
 the checks of those nodes, so the source must exist and be a directory or a
 regular file, and the roots under "Host paths" are refused here too, your home
-itself, the instance store and the profile layer among them. A path the config
-already shares is refused (`already shared by config.kdl`), the same path twice
-is refused (`given twice`), and two shares where one contains the other are
-refused (`one share cannot contain another`) for the reason two `path-share`s
-may not overlap.
+itself, the instance store and the profile layer among them. The default does
+not come with them: `home-share` and `path-share` are read-only unless
+`mode=rw` says otherwise, and a `--share` is read-write unless `=ro` does. A
+path the config already shares is refused (`already shared by config.kdl`), the
+same path twice is refused (`given twice`), and two shares where one contains
+the other are refused (`one share cannot contain another`) for the reason two
+`path-share`s may not overlap.
 
 The first `--share` naming a directory is where the command starts: its mapped
 path replaces `/home/bubbler` in the baseline's `--chdir`, and with only files
@@ -118,9 +119,11 @@ file, which is the whole of what a share leaves behind: nothing is written to
 argument that lies under a share is inside already, so it is passed under the
 name the bind gives it rather than forwarded through the document portal (see
 "File arguments"). `run --share` on an instance that is already running is
-refused — `instance <name> is running; --share needs a fresh sandbox, stop it
+refused — `instance <name> is running; --share needs a fresh sandbox, exit it
 first` — instead of exec'ing into it: a share is one of the binds bwrap made
-when the sandbox started, and a live mount namespace takes no more. Under
+when the sandbox started, and a live mount namespace takes no more. There is no
+`stop` subcommand to reach for: an instance ends when its command exits, or
+when the `bubbler` waiting on it is signalled and passes that on. Under
 `--dry-run` or `--explain` nothing is running to join, and a fresh sandbox is
 what they describe.
 
@@ -1959,12 +1962,15 @@ and the sandbox starts in the directory the share was made from.
 symlink into `~/.local/share/claude/versions/`. Both are shared read-only, the
 link resolved on the host, and `env DISABLE_AUTOUPDATER="1"` stops the
 background updater from trying to write a tree it cannot: updating is the
-host's job. Installed from a package instead, where the binary is under `/usr`,
-neither share is needed and `command "claude"` is the whole of it — the
-baseline binds `/usr` read-only already. The other switches the tool has are
-`env` nodes its header names rather than nodes it ships,
-`DISABLE_TELEMETRY="1"` and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"`: a
-profile fixes what the sandbox breaks and leaves policy to you.
+host's job. Installed from a package instead — the AUR one puts the binary at
+`/opt/claude-code/bin/claude` behind a `/usr/bin/claude` shell wrapper —
+neither share is needed and `command "claude"` is the whole of it: the baseline
+binds `/usr` read-only, and `/opt` read-only as well wherever the host has one
+(`--ro-bind-try`, so a host without `/opt` is not a failed run). The other
+switches the tool has are `env` nodes its header names rather than nodes it
+ships, `DISABLE_TELEMETRY="1"` and
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"`: a profile fixes what the
+sandbox breaks and leaves policy to you.
 
 Credentials are a file, not a keyring: Claude Code writes
 `~/.claude/.credentials.json` mode 0600 on Linux and asks no secret service for
@@ -3317,7 +3323,7 @@ Seven targets, each an entry point that reads bytes bubbler did not write:
 | `wrap_registry` | `wraps.kdl`, and the `argv[0]` a shim is dispatched on |
 
 `fuzz/seeds/<target>/` holds the starting inputs, and is committed: the
-fourteen shipped profiles for the two KDL targets, the desktop fixtures for the
+sixteen shipped profiles for the two KDL targets, the desktop fixtures for the
 patcher, hand-written bytes for the rest. The first two sets are symlinks into
 the tree rather than copies, so a profile that changes changes the seed with
 it. Random bytes barely reach past the KDL tokenizer, so seeding is what makes
@@ -3371,7 +3377,7 @@ The man pages are generated by the binary that was just built, so they cannot
 promise a flag it does not have. Install them uncompressed; a package manager
 that compresses man pages does it itself.
 
-`/usr/share/bubbler/profiles/` is not part of the install set. The fourteen
+`/usr/share/bubbler/profiles/` is not part of the install set. The sixteen
 shipped profiles are compiled into the binary, and that directory is the
 system layer *between* your profiles and the built-in ones: a file put there
 would shadow the built-in of the same name and keep shadowing it after an

@@ -1103,7 +1103,10 @@ fn real_run_share_on_a_running_instance_is_refused() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("--share needs a fresh sandbox"), "{err}");
+    assert!(
+        err.contains("instance `app` is running; --share needs a fresh sandbox, exit it first"),
+        "{err}"
+    );
     // Ended the way the other live runs are: a plain spawn leads no
     // process group of its own, so only its own pid can be signalled.
     kill_process(Pid::from_child(&run), Signal::TERM).unwrap();

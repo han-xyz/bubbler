@@ -73,10 +73,10 @@ home-share ".local/bin/<tool>" mode=ro
 command "/home/bubbler/.local/bin/<tool>"
 ```
 
-A tool installed under `/usr` needs no share at all — the baseline binds `/usr`
-read-only — so its `command` is the bare name. Credentials belong in the
-private home (`~/.config/<tool>` in there is the instance's own), not in a
-share of the host's.
+A tool a package installed needs no share at all — the baseline binds `/usr`
+read-only, and `/opt` too wherever the host has one — so its `command` is the
+bare name. Credentials belong in the private home (`~/.config/<tool>` in there
+is the instance's own), not in a share of the host's.
 
 Codex, and inference servers such as vLLM or SGLang, have not been tested. A
 server also wants `dri` for the GPU, a read-only share of the model cache, and

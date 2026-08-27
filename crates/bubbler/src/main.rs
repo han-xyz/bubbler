@@ -88,7 +88,7 @@ fn share_flag(raw: OsString) -> Result<Share, String> {
 /// one of the binds bwrap made when it started, and a live mount
 /// namespace takes no more.
 fn share_needs_a_fresh_sandbox(name: &str) -> anyhow::Error {
-    anyhow::anyhow!("instance `{name}` is running; --share needs a fresh sandbox, stop it first")
+    anyhow::anyhow!("instance `{name}` is running; --share needs a fresh sandbox, exit it first")
 }
 
 /// How much of the argv `--explain` prints.

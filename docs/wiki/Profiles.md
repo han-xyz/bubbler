@@ -58,13 +58,14 @@ headers say so — if a game is silent, add `pipewire` beside the `pulseaudio`.
 
 Notes worth knowing:
 
-- **`userns "disable"`** on alacritty, kitty, keepassxc, libreoffice and mpv:
-  none of them nests a sandbox of its own, so the door a nested user
-  namespace opens stays shut. For the two terminals that also means the
-  shell inside cannot start bwrap, podman or a browser — drop the line for a
-  terminal that hosts those. `agent` and `claude-code` carry it for the other
-  reason: an agent that nests a sandbox of its own has it warned about and
-  skipped, bubbler being the boundary already.
+- **`userns "disable"`**, on all seven that carry it: `agent`, `alacritty`,
+  `claude-code`, `keepassxc`, `kitty`, `libreoffice`, `mpv`. Five of them nest
+  no sandbox of their own, so the door a nested user namespace opens stays
+  shut — and for the two terminals that also means the shell inside cannot
+  start bwrap, podman or a browser, so drop the line for a terminal that hosts
+  those. `agent` and `claude-code` carry it for the other reason: an agent that
+  nests a sandbox of its own has it warned about and skipped, bubbler being the
+  boundary already.
 
 - **steam**: no `portals` on purpose — Steam's runtime reads `/.flatpak-info`
   as "unofficial Flatpak" and aborts. Never add `userns "disable"`
