@@ -694,6 +694,11 @@ impl Merged {
                             held.allow_out.push(*a);
                         }
                     }
+                    for a in &cfg.allow_hosts {
+                        if !held.allow_hosts.contains(a) {
+                            held.allow_hosts.push(a.clone());
+                        }
+                    }
                     held.no_ipv6 |= cfg.no_ipv6;
                     *held_src = src.clone();
                     return Ok(());
@@ -1759,12 +1764,14 @@ mod tests {
             &[
                 (
                     "base",
-                    "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\" port=443\n}\n",
+                    "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\" port=443\n    \
+                     allow-host \"claude.ai\" port=8443\n}\n",
                 ),
                 (
                     "app",
                     "include \"base\"\nnetwork {\n    outbound \"deny\"\n    \
-                     allow-out \"1.1.1.1\" port=443\n    allow-out \"9.9.9.9\"\n}\n",
+                     allow-out \"1.1.1.1\" port=443\n    allow-out \"9.9.9.9\"\n    \
+                     allow-host \"api.example.com\"\n}\n",
                 ),
                 ("open", "include \"base\"\nnetwork\n"),
             ],
@@ -1785,10 +1792,24 @@ mod tests {
                 ("9.9.9.9".to_owned(), None)
             ]
         );
+        // A name a layer below granted is still granted: a merge that
+        // dropped it would leave the proxy with fewer names than the
+        // profiles between them asked for.
+        assert_eq!(
+            net.allow_hosts
+                .iter()
+                .map(|a| (a.pattern.to_string(), a.port))
+                .collect::<Vec<_>>(),
+            vec![
+                ("claude.ai".to_owned(), 8443),
+                ("api.example.com".to_owned(), 443)
+            ]
+        );
         assert_eq!(
             resolved.text,
             "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\" port=443\n    \
-             allow-out \"9.9.9.9\"\n}\n"
+             allow-out \"9.9.9.9\"\n    allow-host \"claude.ai\" port=8443\n    \
+             allow-host \"api.example.com\"\n}\n"
         );
         // A layer above one that filters cannot drop the filter by
         // saying nothing, which is what a bare `network` node says.

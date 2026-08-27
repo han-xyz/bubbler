@@ -303,7 +303,7 @@ fn under(lead: &str, items: Vec<String>) -> Vec<String> {
 /// view would show it; the nesting is kept, with each tab widened to
 /// four columns so a terminal shows what the file holds.
 fn ruleset_lines(cfg: &NetworkConfig) -> Vec<String> {
-    let Some(text) = network::ruleset(cfg) else {
+    let Some(text) = network::ruleset(cfg, None) else {
         return Vec::new();
     };
     under(

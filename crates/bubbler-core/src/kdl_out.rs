@@ -464,6 +464,12 @@ fn network(cfg: &NetworkConfig) -> String {
     for a in &cfg.allow_out {
         kids.push(format!("allow-out {a}"));
     }
+    // After the addresses: a name is the same policy written the other
+    // way, and the file reads as the address rules plus what the proxy
+    // is told.
+    for a in &cfg.allow_hosts {
+        kids.push(format!("allow-host {a}"));
+    }
     for f in &cfg.forwards {
         let udp = if f.udp { " udp=#true" } else { "" };
         kids.push(format!("allow-port {}{udp}", f.port));
@@ -634,6 +640,12 @@ mod tests {
              proto=\"tcp\"\n}\n",
             "network {\n    outbound \"deny\"\n    allow-out \"2606:4700::/32\" port=853\n}\n",
             "network {\n    outbound \"deny\"\n    allow-out \"10.0.0.0/8\" proto=\"udp\"\n}\n",
+            "network {\n    outbound \"deny\"\n    allow-host \"api.example.com\"\n}\n",
+            "network {\n    outbound \"deny\"\n    allow-host \"*.example.com\" \
+             port=8443\n}\n",
+            "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\" port=443\n    \
+             allow-host \"api.example.com\"\n    allow-host \"api.example.com\" \
+             port=8443\n}\n",
             "network {\n    outbound \"deny\"\n    dns \"1.1.1.1\"\n    \
              allow-out \"1.1.1.1\" port=53\n    allow-port 8080\n    \
              allow-port 53 udp=#true\n    no-ipv6\n}\n",

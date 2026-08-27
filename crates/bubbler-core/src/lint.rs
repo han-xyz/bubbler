@@ -19,6 +19,7 @@ use crate::desktop;
 use crate::env::{Env, SANDBOX_HOME};
 use crate::error::{LintError, ReadError};
 use crate::host::Host;
+use crate::network::HostPattern;
 use crate::profile::Resolver;
 use crate::service;
 
@@ -54,6 +55,12 @@ pub struct Check {
 
 /// Each check as a constant the code that reports it names, so a
 /// finding cannot carry an id no table holds.
+// A note, not a warning: a wildcard is what the config asked for, and
+// how wide one is depends on who registers names under the suffix.
+const ALLOW_HOST_WILDCARD: Check = Check {
+    id: "allow-host-wildcard",
+    severity: Severity::Note,
+};
 const APP_RUNTIME_RW: Check = Check {
     id: "app-runtime-rw",
     severity: Severity::Note,
@@ -207,6 +214,7 @@ const X11_WITHOUT_REASON: Check = Check {
 /// so a check taken out of this table makes the profiles naming it
 /// errors rather than silently accepting nothing.
 pub const CHECKS: &[Check] = &[
+    ALLOW_HOST_WILDCARD,
     APP_RUNTIME_RW,
     BUNDLE_WITHOUT_DBUS,
     CAMERA_NODES_NONE_PRESENT,
@@ -789,6 +797,48 @@ fn arg(node: &KdlNode) -> Option<&str> {
         .and_then(|e| e.value().as_string())
 }
 
+/// What a filtered `network` node says beyond its mode: that the filter
+/// is on at all, and which of its names cover more than the config's
+/// author can have meant.
+fn network_node(i: usize, node: &KdlNode, f: &mut Findings) {
+    if kids(node).any(|c| c.name().value() == "outbound" && arg(c) == Some("deny")) {
+        f.push(
+            i,
+            node,
+            &OUTBOUND_DENY,
+            "`outbound \"deny\"` filters by address: the sandbox reaches its \
+             resolver, its own loopback and the `allow-out` destinations, and \
+             nothing else"
+                .to_owned(),
+            "an address policy, not a name one — a host that answers with a \
+             different address, as a CDN does, is refused by the sandbox's own \
+             firewall rather than by the peer; `allow-host` is the same policy \
+             written by name, through a proxy",
+        );
+    }
+    for child in kids(node).filter(|c| c.name().value() == "allow-host") {
+        // A name the parser refuses is a config error already, and this
+        // check has nothing to say about one.
+        let Some(pattern) = arg(child).and_then(|s| HostPattern::parse(s).ok()) else {
+            continue;
+        };
+        if pattern.wildcard && pattern.labels.len() == 1 {
+            f.push(
+                i,
+                child,
+                &ALLOW_HOST_WILDCARD,
+                format!(
+                    "`allow-host \"{pattern}\"` is a wildcard directly under a top-level \
+                     domain: every name anyone registers under `{}` is reachable",
+                    pattern.labels.join(".")
+                ),
+                "name the hosts the application needs, or keep the wildcard under a \
+                 name whose registrations you know",
+            );
+        }
+    }
+}
+
 /// What a `camera nodes=#true` costs that the portal half does not: a
 /// device list frozen at launch, and, on a host with no camera, nothing
 /// to bind at all. `host_net` is whether the merged config puts the
@@ -935,22 +985,7 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                  the application needs; no clipboard proxy runs in front of the session \
                  socket either, so a focused read is not gated with it",
             ),
-            "network"
-                if kids(node).any(|c| c.name().value() == "outbound" && arg(c) == Some("deny")) =>
-            {
-                f.push(
-                    i,
-                    node,
-                    &OUTBOUND_DENY,
-                    "`outbound \"deny\"` filters by address: the sandbox reaches its \
-                     resolver, its own loopback and the `allow-out` destinations, and \
-                     nothing else"
-                        .to_owned(),
-                    "an address policy, not a name one — a host that answers with a \
-                     different address, as a CDN does, is refused by the sandbox's own \
-                     firewall rather than by the peer",
-                );
-            }
+            "network" => network_node(i, node, f),
             "seccomp" if kids(node).any(|c| c.name().value() == "disable") => f.push(
                 i,
                 node,
@@ -1650,6 +1685,30 @@ mod tests {
             for clean in ["network", "network {\n    outbound \"allow\"\n}"] {
                 assert_eq!(ids(&lint(ctx, &[clean])), [] as [&str; 0], "{clean}");
             }
+        });
+    }
+
+    /// A wildcard directly under a top-level domain covers every name
+    /// anyone can register there, which is worth saying and is not a
+    /// mistake: a wildcard under a name of the author's own is not.
+    #[test]
+    fn a_wildcard_allow_host_under_a_top_level_domain_is_a_note() {
+        with(&host(), |ctx| {
+            let report = lint(
+                ctx,
+                &["network {\n    outbound \"deny\"\n    allow-host \"*.com\"\n}"],
+            );
+            assert_eq!(ids(&report), ["outbound-deny", "allow-host-wildcard"]);
+            assert_eq!(report.findings[1].severity, Severity::Note);
+            assert!(report.findings[1].message.contains("*.com"), "{report:?}");
+            let narrow = lint(
+                ctx,
+                &[
+                    "network {\n    outbound \"deny\"\n    allow-host \"*.example.com\"\n    \
+                   allow-host \"api.example.com\"\n}",
+                ],
+            );
+            assert_eq!(ids(&narrow), ["outbound-deny"]);
         });
     }
 

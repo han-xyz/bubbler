@@ -101,12 +101,16 @@ pub static GRANTS: &[Grant] = &[
                abstract unix sockets, which have no permission checks at all, and the \
                host's interfaces, addresses and VPN tunnels. `allow-port` opens a path \
                from the host's loopback back into the sandbox. `outbound \"deny\"` narrows \
-               the isolated namespace to the addresses `allow-out` names, by address and \
-               never by name.",
+               the isolated namespace to the addresses `allow-out` names. `allow-host` \
+               narrows it by name, through a CONNECT proxy bubbler runs in the sandbox's \
+               namespace and accepts by its cgroup; the application itself gets no DNS \
+               and reaches nothing the proxy did not open, so one that ignores \
+               `HTTPS_PROXY` fails at the lookup. Plain HTTP is not forwarded and a \
+               wildcard covers one label.",
         risk: Risk::Wide,
         grammar: "network [\"host\"|\"none\"] { dns \"<ip>\"; allow-port <n> [udp=#true]; \
                   outbound \"deny\"; allow-out \"<ip>[/<len>]\" [port=<n>] \
-                  [proto=\"tcp\"|\"udp\"]; no-ipv6 }",
+                  [proto=\"tcp\"|\"udp\"]; allow-host \"<name>\" [port=<n>]; no-ipv6 }",
     },
     Grant {
         node: "dri",

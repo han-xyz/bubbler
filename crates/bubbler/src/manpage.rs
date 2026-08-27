@@ -232,6 +232,11 @@ const CONFIG_DESCRIPTION: &[&str] = &[
 /// and a test here holds the two lists together.
 const CHECK_LINES: &[(&str, &str)] = &[
     (
+        "allow-host-wildcard",
+        "An `allow-host` wildcard directly under a top-level domain, which covers every \
+         name anyone registers under that suffix.",
+    ),
+    (
         "app-runtime-rw",
         "An `app-runtime` shared mode=rw, so the sandbox can replace the sockets every \
          other instance naming that id connects to.",

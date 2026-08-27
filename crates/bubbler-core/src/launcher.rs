@@ -1311,7 +1311,19 @@ fn sandbox_namespaces(child_pid: i32) -> Result<SandboxNs, LaunchError> {
 /// reaching this argv would be command injection into a process holding
 /// `CAP_NET_ADMIN` over the sandbox's namespaces.
 fn install_rules(cfg: &NetworkConfig, ns: &SandboxNs) -> Result<(), LaunchError> {
-    let Some(text) = network::ruleset(cfg) else {
+    let Some(text) = network::ruleset(cfg, None) else {
+        // Nothing to install where nothing is filtered — and nothing
+        // either where the ruleset could not be written, which is a run
+        // that asked to be filtered and would have had the whole
+        // network.
+        if cfg.outbound == network::Outbound::Deny && cfg.is_isolated() {
+            return Err(LaunchError::BadValue {
+                service: "network",
+                reason: "the ruleset an `allow-host` needs is written around the \
+                         sandbox's own cgroup, and none was made for this run"
+                    .to_owned(),
+            });
+        }
         return Ok(());
     };
     let (user, net) = (ns.user.as_raw_fd(), ns.net.as_raw_fd());

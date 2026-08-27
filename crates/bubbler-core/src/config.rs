@@ -13,7 +13,8 @@ use kdl::{KdlDocument, KdlNode};
 
 pub use crate::error::{ConfigError, ReadError};
 pub use crate::network::{
-    AllowOut, Cidr, Forward, Mode as NetworkMode, NetworkConfig, Outbound, Proto,
+    AllowHost, AllowOut, Cidr, Forward, HostPattern, Mode as NetworkMode, NetworkConfig, Outbound,
+    Proto,
 };
 pub use crate::seccomp::{Errno, SeccompConfig};
 pub use crate::tty::TtyMode;
@@ -112,6 +113,17 @@ pub const RESERVED_ENV: &[&str] = &[
     "DBUS_SYSTEM_BUS_ADDRESS",
     "AT_SPI_BUS_ADDRESS",
     "IBUS_USE_PORTAL",
+    // The proxy variables, whether or not a config has an `allow-host`:
+    // an `env` node naming one would point the sandbox at a proxy of its
+    // own, past the single opening its filter leaves. A test holds these
+    // to `network::PROXY_ENV_NAMES`, which is what the launcher sets.
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "NODE_USE_ENV_PROXY",
 ];
 
 /// `/etc` entries `etc-share` may not name: the sandbox generates its own
@@ -2084,9 +2096,9 @@ fn validate_relative(node: &KdlNode, s: &str) -> Result<PathBuf, ConfigError> {
 
 /// `network ["host"|"none"] { dns "<ip>"; allow-port <n> [udp=#true];
 /// outbound "deny"; allow-out "<ip>[/<len>]" [port=<n>] [proto="tcp"];
-/// no-ipv6 }`. The bare node is the sandbox's own network namespace,
-/// which is the default; the two spellings name the host's namespace and
-/// no namespace at all.
+/// allow-host "<name>" [port=<n>]; no-ipv6 }`. The bare node is the
+/// sandbox's own network namespace, which is the default; the two
+/// spellings name the host's namespace and no namespace at all.
 ///
 /// `dns` says what the sandbox's resolver file holds, so it belongs to
 /// the two modes that have a network to carry a query; under `none` it
@@ -2095,7 +2107,8 @@ fn validate_relative(node: &KdlNode, s: &str) -> Result<PathBuf, ConfigError> {
 /// isolated mode has one. None of them is ignored where it cannot apply:
 /// that would leave a config granting less than it says. `allow-out`
 /// without `outbound "deny"` is refused for the same reason from the
-/// other side: it would name rules nothing installs.
+/// other side: it would name rules nothing installs, and `allow-host`
+/// without it would name what a sandbox nothing filters reaches anyway.
 fn parse_network(node: &KdlNode) -> Result<Service, ConfigError> {
     let mut cfg = NetworkConfig::default();
     let mut seen_mode = false;
@@ -2174,6 +2187,13 @@ fn parse_network(node: &KdlNode) -> Result<Service, ConfigError> {
                 }
                 cfg.allow_out.push(allowed);
             }
+            "allow-host" => {
+                let allowed = parse_allow_host(child)?;
+                if cfg.allow_hosts.contains(&allowed) {
+                    return Err(ConfigError::Duplicate(format!("allow-host {allowed}")));
+                }
+                cfg.allow_hosts.push(allowed);
+            }
             other => return Err(ConfigError::UnknownNode(other.to_owned())),
         }
     }
@@ -2207,6 +2227,13 @@ fn parse_network(node: &KdlNode) -> Result<Service, ConfigError> {
                  own ruleset",
             ));
         }
+        if !cfg.allow_hosts.is_empty() {
+            return Err(bad(
+                node,
+                "`allow-host` is reached through a proxy of bubbler's inside the \
+                 sandbox's own network namespace, which `host` and `none` do not have",
+            ));
+        }
     }
     if cfg.no_ipv6
         && (cfg.dns.iter().any(IpAddr::is_ipv6) || cfg.allow_out.iter().any(|a| a.dest.is_ipv6()))
@@ -2223,6 +2250,14 @@ fn parse_network(node: &KdlNode) -> Result<Service, ConfigError> {
             "`allow-out` names destinations that are only a rule under \
              `outbound \"deny\"`; without it nothing is filtered and nothing is \
              installed",
+        ));
+    }
+    if cfg.outbound != Outbound::Deny && !cfg.allow_hosts.is_empty() {
+        return Err(bad(
+            node,
+            "`allow-host` names what the sandbox may reach where everything else is \
+             refused, so it needs `outbound \"deny\"`: without it the name is \
+             reachable already and no proxy runs",
         ));
     }
     Ok(Service::Network(cfg))
@@ -2279,6 +2314,54 @@ fn parse_allow_out(node: &KdlNode) -> Result<AllowOut, ConfigError> {
     }
     let dest = dest.ok_or_else(|| bad(node, "expects exactly one destination argument"))?;
     Ok(AllowOut { dest, port, proto })
+}
+
+/// `allow-host "<name>" [port=<n>]`: one name, reached on
+/// [`AllowHost::DEFAULT_PORT`] unless the property says otherwise.
+///
+/// What a name may be is [`HostPattern`]'s to say, and its reason is
+/// passed on as written: like the others here it never echoes the
+/// value, which is arbitrary text out of a config file.
+fn parse_allow_host(node: &KdlNode) -> Result<AllowHost, ConfigError> {
+    let mut pattern: Option<HostPattern> = None;
+    let mut port: Option<u16> = None;
+    for e in node.entries() {
+        match e.name().map(|n| n.value()) {
+            None => {
+                if pattern.is_some() {
+                    return Err(bad(node, "expects exactly one name argument"));
+                }
+                let s = e
+                    .value()
+                    .as_string()
+                    .ok_or_else(|| bad(node, "the name must be a quoted host name"))?;
+                pattern = Some(HostPattern::parse(s).map_err(|reason| bad(node, &reason))?);
+            }
+            Some("port") => {
+                if port.is_some() {
+                    return Err(ConfigError::Duplicate("allow-host port".to_owned()));
+                }
+                port = Some(
+                    e.value()
+                        .as_integer()
+                        .and_then(|n| u16::try_from(n).ok())
+                        .filter(|n| *n != 0)
+                        .ok_or_else(|| bad(node, "expects a port number from 1 to 65535"))?,
+                );
+            }
+            Some(p) => {
+                return Err(ConfigError::UnknownProperty {
+                    node: node.name().value().to_owned(),
+                    prop: p.to_owned(),
+                });
+            }
+        }
+    }
+    let pattern = pattern.ok_or_else(|| bad(node, "expects exactly one name argument"))?;
+    Ok(AllowHost {
+        pattern,
+        port: port.unwrap_or(AllowHost::DEFAULT_PORT),
+    })
 }
 
 /// `dns "<ip>"`. The value is not echoed back: it is arbitrary text and
@@ -3447,6 +3530,80 @@ mod tests {
             .is_ok()
         );
         assert!(parse("network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1/32\"\n}").is_ok());
+    }
+
+    /// `allow-host` is a name reached through a proxy of bubbler's in
+    /// the sandbox's own network namespace, under a filter that rejects
+    /// everything else: without the filter it would name what is
+    /// reachable anyway, and outside the isolated mode there is neither
+    /// a namespace to filter nor a proxy to run in.
+    #[test]
+    fn allow_host_needs_outbound_deny_and_an_isolated_namespace() {
+        for text in [
+            "network {\n    allow-host \"a.example\"\n}",
+            "network {\n    outbound \"allow\"\n    allow-host \"a.example\"\n}",
+            "network \"host\" {\n    allow-host \"a.example\"\n}",
+            "network \"host\" {\n    outbound \"deny\"\n    allow-host \"a.example\"\n}",
+            "network \"none\" {\n    outbound \"deny\"\n    allow-host \"a.example\"\n}",
+            "network {\n    outbound \"deny\"\n    allow-host \"a.example\"\n    \
+             allow-host \"a.example\"\n}",
+            "network {\n    outbound \"deny\"\n    allow-host \"a.example\" port=0\n}",
+            "network {\n    outbound \"deny\"\n    allow-host \"a.example\" port=70000\n}",
+            "network {\n    outbound \"deny\"\n    allow-host \"a.example\" port=\"443\"\n}",
+            "network {\n    outbound \"deny\"\n    allow-host\n}",
+            "network {\n    outbound \"deny\"\n    allow-host \"a.example\" \"b.example\"\n}",
+            "network {\n    outbound \"deny\"\n    allow-host 1\n}",
+            "network {\n    outbound \"deny\"\n    allow-host \"a.example\" ports=443\n}",
+            "network {\n    outbound \"deny\"\n    allow-host \"a.example\" { x }\n}",
+            // The name rules, which `HostPattern` owns: an address is
+            // `allow-out`'s business, and an underscore is no label.
+            "network {\n    outbound \"deny\"\n    allow-host \"1.2.3.4\"\n}",
+            "network {\n    outbound \"deny\"\n    allow-host \"a_b.example\"\n}",
+            "network {\n    outbound \"deny\"\n    allow-host \"*\"\n}",
+        ] {
+            assert!(parse(text).is_err(), "{text}");
+        }
+        // The same name on two ports is two entries, not a duplicate,
+        // and the name is stored as the proxy compares it.
+        let cfg = parse(
+            "network {\n    outbound \"deny\"\n    allow-host \"a.example\"\n    \
+             allow-host \"A.Example.\" port=8443\n}",
+        )
+        .unwrap();
+        let Some(Service::Network(net)) = cfg.services.first() else {
+            panic!("{:?}", cfg.services)
+        };
+        assert_eq!(
+            net.allow_hosts,
+            vec![
+                AllowHost {
+                    pattern: HostPattern::parse("a.example").unwrap(),
+                    port: AllowHost::DEFAULT_PORT,
+                },
+                AllowHost {
+                    pattern: HostPattern::parse("a.example").unwrap(),
+                    port: 8443,
+                },
+            ]
+        );
+        assert!(
+            parse("network {\n    outbound \"deny\"\n    allow-host \"*.example.com\"\n}").is_ok()
+        );
+    }
+
+    /// The proxy variables are bubbler's whether or not a config has an
+    /// `allow-host`: an `env` node naming one would point the sandbox at
+    /// a proxy of its own, which is past the one opening the filter has.
+    #[test]
+    fn the_proxy_variables_are_reserved() {
+        for k in crate::network::PROXY_ENV_NAMES {
+            let text = format!("network\nenv {k}=\"x\"\n");
+            assert!(parse(&text).is_err(), "{k}");
+        }
+        assert_eq!(
+            &RESERVED_ENV[RESERVED_ENV.len() - crate::network::PROXY_ENV_NAMES.len()..],
+            &crate::network::PROXY_ENV_NAMES[..]
+        );
     }
 
     /// pasta refuses a loopback `--dns-forward`, and for the same reason
