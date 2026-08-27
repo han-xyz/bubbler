@@ -330,7 +330,7 @@ impl Detail {
         // So the parser is asked before the push: a buffer holding both
         // renders to a config it refuses, which is the pane going blank
         // with `given more than once` under it.
-        if matches!(target, Target::Add(_) | Target::Absent) && self.would_repeat(&written)? {
+        if matches!(target, Target::Add(_) | Target::Absent) && self.would_repeat(&written) {
             return Err(format!("`{}` is already there", flatten(text.trim())));
         }
         self.write(written, target);
@@ -357,17 +357,22 @@ impl Detail {
     /// Whether the buffer already holds `written`, asked by rendering
     /// the buffer with that node under it and reading it back: the
     /// duplicate rule is the parser's, down to a share whose path is
-    /// written another way. Only a repeat is answered here — a buffer
-    /// that does not parse for some other reason is the pane's business
-    /// and not this line's.
-    fn would_repeat(&self, written: &Node) -> Result<bool, String> {
-        let mut text = kdl_out::render(&self.buf).map_err(|e| e.to_string())?;
-        text.push_str(&kdl_out::node(written).map_err(|e| e.to_string())?);
+    /// written another way.
+    ///
+    /// A question that cannot be asked is answered `false`. A line the
+    /// parser reads as one node and the emitter cannot write as one —
+    /// two `lint-allow` ids — is the splice path's to take, and refusing
+    /// it here would refuse a line the editor accepted before this check
+    /// existed. Only a repeat is answered for the same reason: a buffer
+    /// that does not parse for another reason is the pane's business and
+    /// not this line's.
+    fn would_repeat(&self, written: &Node) -> bool {
+        let (Ok(mut text), Ok(node)) = (kdl_out::render(&self.buf), kdl_out::node(written)) else {
+            return false;
+        };
+        text.push_str(&node);
         text.push('\n');
-        Ok(matches!(
-            config::parse(&text),
-            Err(config::ConfigError::Duplicate(_))
-        ))
+        matches!(config::parse(&text), Err(config::ConfigError::Duplicate(_)))
     }
 
     /// Put what was written into the buffer, over the node the row names
@@ -1109,6 +1114,28 @@ mod tests {
         // A path the buffer does not hold is added like any other.
         detail.apply(&env, "home-share \"E\"").unwrap();
         assert_eq!(rows_for(&detail, "home-share").len(), 3);
+    }
+
+    /// A line the parser reads as one node but the emitter cannot write
+    /// as one — two `lint-allow` ids on a line — belongs to the splice
+    /// path, which takes them as the entries they are. The duplicate
+    /// check has nothing to render and steps aside rather than refusing
+    /// a line the editor took before it existed.
+    #[test]
+    fn a_line_the_emitter_cannot_write_alone_is_still_added() {
+        let (_tmp, env) = fixture::store(&[("ff", "generic")]);
+        let mut detail = Detail::open(&env, "ff", false).unwrap();
+        select(&mut detail, "lint-allow");
+        assert_eq!(detail.row().unwrap().target, Target::Absent);
+        detail
+            .apply(
+                &env,
+                "lint-allow \"x11-without-reason\" reason=\"r\"; \
+                 lint-allow \"network-host\" reason=\"r\"",
+            )
+            .unwrap();
+        assert_eq!(detail.buf.lint_allows.len(), 2);
+        assert_eq!(rows_for(&detail, "lint-allow").len(), 3);
     }
 
     #[test]
