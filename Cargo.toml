@@ -5,6 +5,7 @@ members = [
     "crates/bubbler",
     "crates/bubbler-init",
     "crates/bubbler-wl-proxy",
+    "crates/bubbler-net-proxy",
     "crates/bubbler-ui",
 ]
 # The fuzz targets link against libFuzzer and need a nightly compiler,
@@ -27,6 +28,7 @@ repository = "https://github.com/han-xyz/bubbler"
 # `workspace.package.version` at each release.
 bubbler-core = { path = "crates/bubbler-core", version = "0.19.1" }
 bubbler-init = { path = "crates/bubbler-init", version = "0.19.1" }
+bubbler-net-proxy = { path = "crates/bubbler-net-proxy", version = "0.19.1" }
 kdl = "6"
 thiserror = "2"
 rustix = { version = "1", features = ["fs", "process", "net", "pipe", "event", "pty", "termios", "thread"] }

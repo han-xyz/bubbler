@@ -554,6 +554,7 @@ mod tests {
             proxy_override: None,
             pasta_override: None,
             wl_proxy_override: None,
+            net_proxy_override: None,
         };
         // Named `bubbler`, since that is what a shim points at.
         let bubbler = tmp.path().join("bin").join("bubbler");

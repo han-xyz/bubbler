@@ -837,6 +837,7 @@ mod tests {
             proxy_override: None,
             pasta_override: None,
             wl_proxy_override: None,
+            net_proxy_override: None,
         }
     }
 

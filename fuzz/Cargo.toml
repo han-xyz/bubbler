@@ -12,6 +12,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 bubbler-core = { path = "../crates/bubbler-core" }
 bubbler-init = { path = "../crates/bubbler-init" }
+bubbler-net-proxy = { path = "../crates/bubbler-net-proxy" }
 tempfile = "3"
 
 # Every target is its own binary, and none of them is a test or a
@@ -61,6 +62,13 @@ bench = false
 [[bin]]
 name = "wrap_registry"
 path = "fuzz_targets/wrap_registry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "net_proxy_request"
+path = "fuzz_targets/net_proxy_request.rs"
 test = false
 doc = false
 bench = false

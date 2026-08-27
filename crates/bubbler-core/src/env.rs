@@ -103,6 +103,11 @@ pub struct Env {
     /// instead of the installed one, which is what a build tree runs its
     /// own from. A test and debugging hook; it must be a regular file.
     pub wl_proxy_override: Option<PathBuf>,
+    /// `$BUBBLER_NET_PROXY`: host path of the egress proxy binary to run
+    /// instead of the installed one, for a sandbox with an
+    /// `allow-host`. A test and debugging hook, like
+    /// `$BUBBLER_WL_PROXY`; it must be a regular file.
+    pub net_proxy_override: Option<PathBuf>,
 }
 
 #[cfg(test)]

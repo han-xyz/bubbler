@@ -117,6 +117,7 @@ name = "bubbler-core"
 version = "0.19.1"
 dependencies = [
  "bubbler-init",
+ "bubbler-net-proxy",
  "kdl",
  "libseccomp",
  "proptest",
@@ -136,6 +137,14 @@ dependencies = [
  "rustix",
  "signal-hook",
  "tempfile",
+]
+
+[[package]]
+name = "bubbler-net-proxy"
+version = "0.19.1"
+dependencies = [
+ "rustix",
+ "thiserror",
 ]
 
 [[package]]

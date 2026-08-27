@@ -40,7 +40,9 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use crate::env::Env;
-use crate::error::ConfigError;
+use crate::error::{ConfigError, LaunchError};
+use crate::host::Host;
+use crate::init_bin::{self, Found};
 
 /// The sidecar bubbler runs for an isolated network namespace, as it is
 /// looked up on `PATH`. Arch ships it in `passt`.
@@ -326,150 +328,12 @@ impl fmt::Display for AllowOut {
 /// A name an `allow-host` names: ASCII labels, lower case, with an
 /// optional `*.` in front standing for exactly one label.
 ///
-/// The rules are DNS's own (RFC 1035 §2.3.1 with RFC 1123 §2.1's leading
-/// digit): letters, digits and `-`, no label starting or ending in `-`,
-/// 63 characters to a label and 253 to a name. bubbler converts nothing:
-/// an internationalised name is written as the `xn--` A-labels it
-/// resolves as, so what the config says and what the proxy compares a
-/// `CONNECT` target against are the same bytes.
-///
-/// A name whose last label is all digits is refused, so no address in
-/// the notations a config would write one in parses as a name;
-/// `allow-out` is where an address goes. `getaddrinfo` also reads hex
-/// forms such as `0x7f000001`, which are letters and digits and do parse
-/// here — a config writing one has named an address on purpose, and the
-/// proxy refuses an address as a `CONNECT` target whatever its shape.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostPattern {
-    /// The labels under the wildcard, lower case and without the root
-    /// dot: `["example", "com"]` for `example.com` and for
-    /// `*.example.com` alike.
-    pub labels: Vec<String>,
-    /// Whether a `*.` stands in front of [`HostPattern::labels`], which
-    /// matches one label and never zero or two.
-    pub wildcard: bool,
-}
-
-impl HostPattern {
-    /// Longest name accepted, measured over the text as written: a
-    /// trailing dot counts toward it, so no name buys a label with one.
-    const MAX_NAME: usize = 253;
-    /// Longest single label, from DNS.
-    const MAX_LABEL: usize = 63;
-
-    /// Parse `s` as an `allow-host` name, or say what is wrong with it.
-    ///
-    /// The reason never echoes the value: it is arbitrary text out of a
-    /// config file and may hold the control bytes the message would then
-    /// carry to a terminal.
-    pub fn parse(s: &str) -> Result<Self, String> {
-        if s.len() > Self::MAX_NAME {
-            return Err(format!(
-                "a name is at most {} characters, trailing dot included",
-                Self::MAX_NAME
-            ));
-        }
-        // The root dot is what a name may end in and nothing else: two
-        // of them leave an empty label, which the loop below refuses.
-        let name = s.strip_suffix('.').unwrap_or(s);
-        let mut labels = Vec::new();
-        let mut wildcard = false;
-        for (i, label) in name.split('.').enumerate() {
-            if i == 0 && label == "*" {
-                wildcard = true;
-                continue;
-            }
-            Self::check_label(label)?;
-            labels.push(label.to_ascii_lowercase());
-        }
-        if labels.is_empty() {
-            return Err(
-                "a wildcard stands for one label under a name, as in `*.example.com`".to_owned(),
-            );
-        }
-        // `1.2.3.4` would otherwise parse as a name of four labels and
-        // match nothing a resolver ever answers with.
-        if labels
-            .last()
-            .is_some_and(|l| l.bytes().all(|b| b.is_ascii_digit()))
-        {
-            return Err(
-                "a name whose last label is all digits is an address, and an address is \
-                 what `allow-out` names; the proxy matches names only"
-                    .to_owned(),
-            );
-        }
-        Ok(Self { labels, wildcard })
-    }
-
-    /// Whether `s` is a label, or why it is not one. The one place the
-    /// rule is written: [`HostPattern::parse`] holds a config to it and
-    /// [`HostPattern::matches`] holds the probe to the same rule, so a
-    /// name that could never be written cannot be matched either.
-    fn check_label(s: &str) -> Result<(), String> {
-        if s.is_empty() {
-            return Err(
-                "a name holds no empty label: no two dots in a row, and none at the start"
-                    .to_owned(),
-            );
-        }
-        if s.len() > Self::MAX_LABEL {
-            return Err(format!("a label is at most {} characters", Self::MAX_LABEL));
-        }
-        if !s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
-            return Err(
-                "a label holds ASCII letters, digits and `-` only; write an internationalised \
-                 name as the `xn--` form it resolves as, and a `*` as the whole first label"
-                    .to_owned(),
-            );
-        }
-        if s.starts_with('-') || s.ends_with('-') {
-            return Err("a label neither starts nor ends with `-`".to_owned());
-        }
-        Ok(())
-    }
-
-    /// Whether `host` is a name this pattern covers. Case is ignored and
-    /// one trailing dot with it, since a `CONNECT` target may carry
-    /// either form; a wildcard covers exactly one label, never the name
-    /// itself and never two labels under it.
-    ///
-    /// The probe is held to the rules [`HostPattern::parse`] takes, the
-    /// wildcard's own label included: a `CONNECT` target is text the
-    /// sandbox wrote, and one that is no name matches nothing here
-    /// rather than reaching a resolver on the strength of its suffix.
-    pub fn matches(&self, host: &str) -> bool {
-        if host.len() > Self::MAX_NAME {
-            return false;
-        }
-        let host = host.strip_suffix('.').unwrap_or(host);
-        let mut got: Vec<&str> = host.split('.').collect();
-        if !got.iter().all(|l| Self::check_label(l).is_ok()) {
-            return false;
-        }
-        if self.wildcard {
-            // Never empty: `split` yields at least one label and every
-            // one of them just passed the rule above.
-            got.remove(0);
-        }
-        got.len() == self.labels.len()
-            && got
-                .iter()
-                .zip(&self.labels)
-                .all(|(g, l)| g.eq_ignore_ascii_case(l))
-    }
-}
-
-impl fmt::Display for HostPattern {
-    /// The name as a config writes it, which is its canonical form:
-    /// lower case, no trailing dot.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.wildcard {
-            f.write_str("*.")?;
-        }
-        f.write_str(&self.labels.join("."))
-    }
-}
+/// The rule itself lives in the proxy crate, because both ends need the
+/// same one — the config that accepts a name and the `CONNECT` target
+/// the proxy holds to it — and a filter with two copies of a matching
+/// rule is a filter with two answers. Re-exported here so the `network`
+/// grant's model reads whole.
+pub use bubbler_net_proxy::allow::HostPattern;
 
 /// One `allow-host` child: a name the sandbox may reach under
 /// [`Outbound::Deny`], and the single port it may reach it on.
@@ -603,6 +467,36 @@ impl fmt::Display for Cgroup {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "socket cgroupv2 level {} \"{}\"", self.level, self.path)
     }
+}
+
+/// File name of the egress proxy binary.
+pub const NET_PROXY_NAME: &str = "bubbler-net-proxy";
+
+/// Where the egress proxy is installed, beside `bubbler-init` and the
+/// Wayland proxy. Not a `PATH` name: the binary is bubbler's own, and
+/// the one process a name-filtered sandbox lets out must not be
+/// whatever else on a `PATH` answers to the name.
+pub const NET_PROXY_INSTALLED: &str = "/usr/lib/bubbler/bubbler-net-proxy";
+
+/// Host path of the egress proxy binary and where it was found:
+/// [`Env::net_proxy_override`] (`$BUBBLER_NET_PROXY`), else next to the
+/// running executable, else [`NET_PROXY_INSTALLED`]. The same lookup
+/// the Wayland proxy gets, and for the same reason: a build tree runs
+/// what it just built without being told where it is.
+///
+/// The [`Found`] half is what says whether the binary has to be bound
+/// into the sandbox's mount namespace, which the proxy joins before it
+/// execs. A run with an `allow-host` cannot go on without it — the
+/// application would be handed a proxy address nothing listens on — so
+/// a missing binary fails the launch rather than warning.
+pub fn net_proxy_program(env: &Env, host: &dyn Host) -> Result<(PathBuf, Found), LaunchError> {
+    init_bin::locate_binary(
+        env.net_proxy_override.as_deref(),
+        NET_PROXY_NAME,
+        NET_PROXY_INSTALLED,
+        "network",
+        host,
+    )
 }
 
 /// Names of the variables [`proxy_env`] sets, in the order it returns
@@ -1417,79 +1311,6 @@ mod tests {
 
     fn pattern(s: &str) -> HostPattern {
         HostPattern::parse(s).expect(s)
-    }
-
-    #[test]
-    fn host_patterns_parse_by_the_ldh_rules() {
-        for ok in [
-            "api.anthropic.com",
-            "Claude.AI.",
-            "xn--bcher-kva.example",
-            "*.example.com",
-            "a1.b2",
-        ] {
-            assert!(HostPattern::parse(ok).is_ok(), "{ok}");
-        }
-        assert_eq!(pattern("Claude.AI.").to_string(), "claude.ai");
-        assert_eq!(pattern("*.Example.COM").to_string(), "*.example.com");
-        for bad in [
-            "",
-            ".",
-            "a..b",
-            "-a.b",
-            "a-.b",
-            "a_b.c",
-            "b\u{fc}cher.de",
-            "*",
-            "*.",
-            "a.*.b",
-            "*.*.c",
-            "1.2.3.4",
-            "[::1]",
-            "a b",
-            &format!("{}.c", "x".repeat(64)),
-            &"a.".repeat(127),
-        ] {
-            assert!(HostPattern::parse(bad).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
-    fn a_wildcard_matches_exactly_one_label() {
-        let p = pattern("*.example.com");
-        assert!(p.matches("a.example.com"));
-        assert!(!p.matches("example.com"));
-        assert!(!p.matches("a.b.example.com"));
-        assert!(!p.matches(".example.com"));
-        let e = pattern("example.com");
-        assert!(e.matches("EXAMPLE.com."));
-        assert!(!e.matches("a.example.com"));
-    }
-
-    /// The probe is held to the rules a config is held to, the
-    /// wildcard's own label included: a `CONNECT` target is text the
-    /// sandbox wrote, and one that is no name must not reach a resolver
-    /// on the strength of its suffix.
-    #[test]
-    fn a_probe_that_is_no_name_matches_nothing() {
-        let p = pattern("*.example.com");
-        assert!(p.matches("a1.example.com"));
-        for bad in [
-            "a_b.example.com",
-            "-a.example.com",
-            "a-.example.com",
-            "a b.example.com",
-            "b\u{fc}cher.example.com",
-            "a..example.com",
-            "*.example.com",
-            &format!("{}.example.com", "x".repeat(64)),
-            &format!("{}.example.com", "x.".repeat(126)),
-        ] {
-            assert!(!p.matches(bad), "{bad}");
-        }
-        let e = pattern("example.com");
-        assert!(!e.matches("exam ple.com"));
-        assert!(!e.matches("example.com.."));
     }
 
     /// The proxy's cgroup is the one thing the filter accepts and the

@@ -98,6 +98,7 @@ published yet — AUR account registration is currently down. From source:
     install -Dm755 target/release/bubbler      /usr/bin/bubbler
     install -Dm755 target/release/bubbler-init /usr/lib/bubbler/bubbler-init
     install -Dm755 target/release/bubbler-wl-proxy /usr/lib/bubbler/bubbler-wl-proxy
+    install -Dm755 target/release/bubbler-net-proxy /usr/lib/bubbler/bubbler-net-proxy
     install -Dm755 target/release/bubbler-ui   /usr/bin/bubbler-ui      # optional editor
     target/release/bubbler man          > /usr/share/man/man1/bubbler.1
     target/release/bubbler man --config > /usr/share/man/man5/bubbler-config.5

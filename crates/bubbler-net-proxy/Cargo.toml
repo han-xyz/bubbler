@@ -1,0 +1,19 @@
+[package]
+name = "bubbler-net-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CONNECT-only egress proxy for bubbler sandboxes: the one process a name-filtered network namespace lets out"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bubbler-net-proxy"
+path = "src/main.rs"
+
+[dependencies]
+rustix.workspace = true
+thiserror.workspace = true

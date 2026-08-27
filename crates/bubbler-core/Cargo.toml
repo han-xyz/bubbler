@@ -9,6 +9,10 @@ description = "Library core of bubbler: config model, services, bwrap argument b
 
 [dependencies]
 bubbler-init.workspace = true
+# The `HostPattern` rule an `allow-host` is parsed by is the same one
+# the egress proxy holds a `CONNECT` target to; core takes it from the
+# proxy's library rather than keeping a second copy of a filter rule.
+bubbler-net-proxy.workspace = true
 kdl.workspace = true
 thiserror.workspace = true
 # `stdio` for the last-run log, which points fd 2 at a file for a run
