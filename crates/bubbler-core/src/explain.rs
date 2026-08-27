@@ -160,6 +160,14 @@ fn label(origin: Origin, cfg: &InstanceConfig) -> Result<String, ConfigError> {
                     .to_owned(),
                 None => format!("service #{i}"),
             },
+            Origin::Share(i) => match cfg.shares.get(i) {
+                Some(s) => format!(
+                    "--share {} mode={}",
+                    kdl_out::quote(&s.path.to_string_lossy()),
+                    kdl_out::share_mode(s.mode)
+                ),
+                None => format!("--share #{i}"),
+            },
         },
         LABEL_MAX,
     ))
@@ -515,6 +523,7 @@ pub fn render_json(items: &[Explained], view: &View) -> Result<String, ConfigErr
             Origin::Init => ("init", None),
             Origin::Command => ("command", None),
             Origin::Service(i) => ("service", Some(i)),
+            Origin::Share(i) => ("share", Some(i)),
             Origin::Env(i) => ("env", Some(i)),
         };
         // The same `<file>:<line>` the text form heads a group with, split
@@ -576,7 +585,7 @@ fn quote_os(s: &OsStr) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Clipboard, ShareMode};
+    use crate::config::{Clipboard, Share, ShareMode};
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
@@ -1288,6 +1297,49 @@ bwrap
         assert_eq!(
             label(Origin::Service(0), &cfg).unwrap(),
             r#"app-runtime "org.keepassxc.Kee…" mode=ro"#
+        );
+    }
+
+    /// A per-run share is its own group, named by the flag that made it
+    /// and naming no line: the file it would be in never had the node.
+    #[test]
+    fn a_share_is_a_group_of_its_own_with_no_line_to_name() {
+        let cfg = InstanceConfig {
+            shares: vec![Share {
+                path: PathBuf::from("/srv/src"),
+                mode: ShareMode::ReadWrite,
+            }],
+            ..InstanceConfig::default()
+        };
+        let items = [item(
+            Origin::Share(0),
+            &["--bind", "/srv/src", "/srv/src"],
+            None,
+        )];
+        let view = View {
+            title: "bwrap",
+            instance: "t",
+            cfg: &cfg,
+            source: Source {
+                file: "config.kdl",
+                lines: &Lines::default(),
+            },
+            rules: &[],
+            wl_proxy: None,
+            proxy: false,
+            full: false,
+        };
+        let out = render(&items, &view).unwrap();
+        assert_eq!(
+            out[2], r#"  --share "/srv/src" mode=rw  3 arguments"#,
+            "{out:?}"
+        );
+        let json = render_json(&items, &view).unwrap();
+        assert!(
+            json.contains(
+                r#""kind": "share", "node": "--share \"/srv/src\" mode=rw", "index": 0, "line": null"#
+            ),
+            "{json}"
         );
     }
 

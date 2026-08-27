@@ -500,6 +500,9 @@ fn instance_config() -> impl Strategy<Value = InstanceConfig> {
                 services.extend(gamepad);
                 let mut cfg = InstanceConfig {
                     services,
+                    // A `--share` is never in a file, so a round trip
+                    // through KDL has none to carry.
+                    shares: Vec::new(),
                     command,
                     env,
                     tty,

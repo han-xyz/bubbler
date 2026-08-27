@@ -29,6 +29,8 @@ pub enum Origin {
     Identity,
     /// Index into the instance config's `services`, in file order.
     Service(usize),
+    /// Index into the instance config's `shares`: a `--share` flag.
+    Share(usize),
     /// Index into the instance config's `env`, in file order.
     Env(usize),
     /// The `bubbler-init` bind and the supervisor's own arguments.
@@ -480,6 +482,20 @@ impl BwrapArgs {
                     kind: Kind::Args(vec![flag.to_os_string()]),
                 },
             );
+        }
+    }
+
+    /// Start the command in `dir` instead of the private home. Replaces
+    /// the value of the baseline `--chdir`, so the flag is still emitted
+    /// once and in phase 1; the group it explains under stays the
+    /// baseline's.
+    pub fn chdir(&mut self, dir: &Path) {
+        let flag = OsStr::new("--chdir");
+        if let Some(item) = self.namespaces.iter_mut().find(|i| holds(i, flag))
+            && let Kind::Args(a) = &mut item.kind
+        {
+            a.truncate(1);
+            a.push(dir.as_os_str().to_owned());
         }
     }
 
@@ -1393,6 +1409,36 @@ mod tests {
             .filter(|a| *a != "--unshare-user" && *a != "--disable-userns")
             .collect();
         assert_eq!(rest, strs(&plain), "nothing else about the sandbox moved");
+    }
+
+    /// A per-run share moves the working directory by replacing the
+    /// value of the baseline flag, never by adding a second one: bwrap
+    /// would take the last, and an explanation would show both.
+    #[test]
+    fn chdir_replaces_the_baseline_working_directory() {
+        let plain = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default())
+            .finish(&["sh".into()], &mut Counter::new())
+            .unwrap();
+        let plain = strs(&plain);
+        let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default());
+        args.chdir(Path::new("/srv/src"));
+        let finished = args.finish(&["sh".into()], &mut Counter::new()).unwrap();
+        let s = strs(&finished);
+        assert_eq!(s.iter().filter(|a| **a == "--chdir").count(), 1, "{s:?}");
+        let at = s.iter().position(|a| *a == "--chdir").unwrap();
+        // Same place in phase 1 the baseline puts it, with only the
+        // directory changed.
+        assert_eq!(
+            plain.iter().position(|a| *a == "--chdir"),
+            Some(at),
+            "{s:?}"
+        );
+        assert_eq!(&s[at..at + 2], &["--chdir", "/srv/src"], "{s:?}");
+        assert_eq!(
+            &plain[at..at + 2],
+            &["--chdir", "/home/bubbler"],
+            "{plain:?}"
+        );
     }
 
     #[test]

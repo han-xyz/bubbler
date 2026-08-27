@@ -345,6 +345,17 @@ pub enum ShareMode {
     ReadWrite,
 }
 
+/// One `--share` flag of `run` or `try`: a host path bound for this run
+/// only, never written to `config.kdl`. Under `$HOME` it lands at the same
+/// relative path in the private home, elsewhere at the same path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Share {
+    /// Absolute host path, as the caller named it.
+    pub path: PathBuf,
+    /// Read-write unless the flag said `=ro`.
+    pub mode: ShareMode,
+}
+
 /// One accepted lint finding: the check it silences and why. Only
 /// warnings and notes can be silenced; an error names something the file
 /// cannot do, and there is nothing to accept about it.
@@ -664,6 +675,9 @@ pub struct Disabled {
 pub struct InstanceConfig {
     /// Granted services, in file order.
     pub services: Vec<Service>,
+    /// Per-run shares from `--share`; never read from the file and never
+    /// written back to it.
+    pub shares: Vec<Share>,
     /// Default argv for `run`, if the file has a `command` node.
     pub command: Option<Vec<OsString>>,
     /// Extra environment variables, in file order; never a key from

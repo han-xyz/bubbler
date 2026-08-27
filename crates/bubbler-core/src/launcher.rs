@@ -484,6 +484,13 @@ fn build_args_on<'a>(
         &inst.name,
     )?;
     service::apply_all(&inst.config.services, env, &mut args, host, &ctx)?;
+    service::apply_shares(
+        &inst.config.services,
+        &inst.config.shares,
+        env,
+        &mut args,
+        host,
+    )?;
     service::apply_env(&inst.config.env, &mut args)?;
     args.tag(Origin::Init);
     args.bind_init(&init_bin::locate(env, host)?);

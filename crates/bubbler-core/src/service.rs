@@ -13,7 +13,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::{Component, Path, PathBuf};
 
 use crate::bwrap::{BwrapArgs, Origin};
-use crate::config::{self, RESERVED_ENV, Service, ShareMode, X11Mode};
+use crate::config::{self, RESERVED_ENV, Service, Share, ShareMode, X11Mode};
 use crate::dbus;
 use crate::env::{Env, SANDBOX_HOME};
 use crate::error::LaunchError;
@@ -1084,6 +1084,100 @@ fn home_share(
     Ok(())
 }
 
+/// Bind every `--share` after the config's own services, each tagged with
+/// its position. A path under the real home lands at the same relative
+/// path in the private home; any other at its own path, with the same
+/// reserved roots as `path-share`. The first share that is a directory
+/// becomes the working directory. A share the config already makes, or
+/// one given twice, is an error rather than a second bind of the same
+/// place.
+pub fn apply_shares(
+    services: &[Service],
+    shares: &[Share],
+    env: &Env,
+    args: &mut BwrapArgs,
+    host: &dyn Host,
+) -> Result<(), LaunchError> {
+    let config_dsts: Vec<PathBuf> = services
+        .iter()
+        .filter_map(|s| match s {
+            Service::HomeShare { path, .. } => Some(Path::new(SANDBOX_HOME).join(path)),
+            Service::PathShare { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut cwd: Option<PathBuf> = None;
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for (i, s) in shares.iter().enumerate() {
+        args.tag(Origin::Share(i));
+        let (src, dst) = share_paths(env, host, &s.path)?;
+        if config_dsts.contains(&dst) {
+            return Err(LaunchError::BadValue {
+                service: "--share",
+                reason: format!("{} already shared by config.kdl", s.path.display()),
+            });
+        }
+        if seen.contains(&dst) {
+            return Err(LaunchError::BadValue {
+                service: "--share",
+                reason: format!("{} given twice", s.path.display()),
+            });
+        }
+        seen.push(dst.clone());
+        match s.mode {
+            ShareMode::ReadOnly => args.ro_bind(&src, &dst),
+            ShareMode::ReadWrite => args.bind(&src, &dst),
+        }
+        if cwd.is_none() && host.file_type(&src).is_some_and(|t| t.is_dir()) {
+            cwd = Some(dst);
+        }
+    }
+    if let Some(dir) = cwd {
+        args.chdir(&dir);
+    }
+    Ok(())
+}
+
+/// Source and destination of one `--share`: the source resolved and
+/// type-checked as `path-share` does, the destination by where the written
+/// path lies. A path that is not absolute is the CLI's mistake, not the
+/// user's, and is refused as a bad value rather than joined to anything.
+fn share_paths(
+    env: &Env,
+    host: &dyn Host,
+    written: &Path,
+) -> Result<(PathBuf, PathBuf), LaunchError> {
+    if !written.is_absolute() {
+        return Err(LaunchError::BadValue {
+            service: "--share",
+            reason: format!("{} is not absolute", written.display()),
+        });
+    }
+    if let Ok(rel) = written.strip_prefix(&env.home) {
+        let src = confine(host, "--share", &env.home, written, "the home directory")?;
+        let src = require_dir_or_file(host, "--share", src)?;
+        let dst = Path::new(SANDBOX_HOME).join(rel);
+        // The home itself would be bound over the private home, taking
+        // with it whatever the instance keeps there. `path-share` refuses
+        // that destination too; this branch never reaches its check.
+        if dst == Path::new(SANDBOX_HOME) {
+            return Err(LaunchError::BadValue {
+                service: "--share",
+                reason: denied_reason(written, &src, Path::new(SANDBOX_HOME), End::Destination),
+            });
+        }
+        return Ok((src, dst));
+    }
+    let src = resolve_source(host, "--share", written, require_dir_or_file)?;
+    if let Some((root, end)) = denied_root(host, env, &src, written) {
+        return Err(LaunchError::BadValue {
+            service: "--share",
+            reason: denied_reason(written, &src, &root, end),
+        });
+    }
+    Ok((src, written.to_path_buf()))
+}
+
 /// Bind one host `/etc` entry read-only at `/etc/<name>`, on top of the
 /// baseline allowlist. The entry must resolve inside `/etc`, so a symlink
 /// there cannot pull an unrelated part of the host into the sandbox; the
@@ -1214,13 +1308,9 @@ mod tests {
         argv_planned(services, env, existing, links, None)
     }
 
-    fn argv_planned(
-        services: &[Service],
-        env: &Env,
-        existing: &[(&str, Kind)],
-        links: &[(&str, &str)],
-        wayland: Option<&WaylandPlan>,
-    ) -> Result<Vec<String>, LaunchError> {
+    /// The host tree a test names, with the type the fake reports for
+    /// each entry and the symlinks laid over them.
+    fn fake_host(existing: &[(&str, Kind)], links: &[(&str, &str)]) -> FakeHost {
         let (file, dir, sock) = fake::types();
         let mut host = FakeHost::default();
         for (p, k) in existing {
@@ -1235,6 +1325,17 @@ mod tests {
         for (from, to) in links {
             host = host.link(from, to);
         }
+        host
+    }
+
+    fn argv_planned(
+        services: &[Service],
+        env: &Env,
+        existing: &[(&str, Kind)],
+        links: &[(&str, &str)],
+        wayland: Option<&WaylandPlan>,
+    ) -> Result<Vec<String>, LaunchError> {
+        let host = fake_host(existing, links);
         let plan = dbus::plan(services, "t");
         let ctx = ServiceCtx {
             wayland,
@@ -1242,6 +1343,25 @@ mod tests {
         };
         let mut args = BwrapArgs::baseline(env, Path::new("/i/home"), &host);
         apply_all(services, env, &mut args, &host, &ctx)?;
+        Ok(strs(&args.finish(
+            &[OsString::from("x")],
+            &mut crate::launcher::DryRunAlloc::default(),
+        )?))
+    }
+
+    /// `argv` with the per-run shares bound on top of the services, in
+    /// the one order the launcher uses: the config's own grants first.
+    fn argv_shared(
+        services: &[Service],
+        shares: &[Share],
+        existing: &[(&str, Kind)],
+    ) -> Result<Vec<String>, LaunchError> {
+        let env = env();
+        let host = fake_host(existing, &[]);
+        let plan = dbus::plan(services, "t");
+        let mut args = BwrapArgs::baseline(&env, Path::new("/i/home"), &host);
+        apply_all(services, &env, &mut args, &host, &argv_ctx(&plan))?;
+        apply_shares(services, shares, &env, &mut args, &host)?;
         Ok(strs(&args.finish(
             &[OsString::from("x")],
             &mut crate::launcher::DryRunAlloc::default(),
@@ -1983,6 +2103,153 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// The home of [`env`], as a test writes host paths out.
+    fn home(rel: &str) -> String {
+        env().home.join(rel).to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn a_share_under_the_home_lands_in_the_private_home_read_write() {
+        let src = home("Projects/app");
+        let a = argv_shared(
+            &[],
+            &[Share {
+                path: PathBuf::from(&src),
+                mode: ShareMode::ReadWrite,
+            }],
+            &[(&src, Dir)],
+        )
+        .unwrap();
+        assert!(
+            has_seq(&a, &["--bind", &src, "/home/bubbler/Projects/app"]),
+            "{a:?}"
+        );
+        assert!(
+            has_seq(&a, &["--chdir", "/home/bubbler/Projects/app"]),
+            "{a:?}"
+        );
+        assert!(!has_seq(&a, &["--chdir", "/home/bubbler"]), "{a:?}");
+    }
+
+    #[test]
+    fn a_share_outside_the_home_keeps_its_path_and_a_file_share_moves_no_cwd() {
+        let a = argv_shared(
+            &[],
+            &[
+                Share {
+                    path: PathBuf::from("/srv/notes.txt"),
+                    mode: ShareMode::ReadOnly,
+                },
+                Share {
+                    path: PathBuf::from("/srv/src"),
+                    mode: ShareMode::ReadWrite,
+                },
+            ],
+            &[("/srv/notes.txt", File), ("/srv/src", Dir)],
+        )
+        .unwrap();
+        assert!(
+            has_seq(&a, &["--ro-bind", "/srv/notes.txt", "/srv/notes.txt"]),
+            "{a:?}"
+        );
+        assert!(has_seq(&a, &["--bind", "/srv/src", "/srv/src"]), "{a:?}");
+        // The first *directory* share is the cwd, not the first share.
+        assert!(has_seq(&a, &["--chdir", "/srv/src"]), "{a:?}");
+    }
+
+    #[test]
+    fn a_share_is_refused_where_the_config_nodes_would_refuse_it() {
+        // Missing source.
+        let e = argv_shared(
+            &[],
+            &[Share {
+                path: PathBuf::from("/srv/none"),
+                mode: ShareMode::ReadWrite,
+            }],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                e,
+                LaunchError::MissingResource {
+                    service: "--share",
+                    ..
+                }
+            ),
+            "{e}"
+        );
+        // A reserved root.
+        let e = argv_shared(
+            &[],
+            &[Share {
+                path: PathBuf::from("/etc"),
+                mode: ShareMode::ReadOnly,
+            }],
+            &[("/etc", Dir)],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                e,
+                LaunchError::BadValue {
+                    service: "--share",
+                    ..
+                }
+            ),
+            "{e}"
+        );
+        // Already shared by the config.
+        let src = home("Projects/app");
+        let e = argv_shared(
+            &[Service::HomeShare {
+                path: PathBuf::from("Projects/app"),
+                mode: ShareMode::ReadOnly,
+            }],
+            &[Share {
+                path: PathBuf::from(&src),
+                mode: ShareMode::ReadWrite,
+            }],
+            &[(&src, Dir)],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&e, LaunchError::BadValue { service: "--share", reason } if reason.contains("already shared by config.kdl")),
+            "{e}"
+        );
+        // Given twice.
+        let s = Share {
+            path: PathBuf::from("/srv/src"),
+            mode: ShareMode::ReadWrite,
+        };
+        let e = argv_shared(&[], &[s.clone(), s], &[("/srv/src", Dir)]).unwrap_err();
+        assert!(
+            matches!(&e, LaunchError::BadValue { service: "--share", reason } if reason.contains("given twice")),
+            "{e}"
+        );
+    }
+
+    /// The real home over the private one is the one mapping that takes
+    /// the sandbox apart, and it is the destination rule `path-share`
+    /// already has, applied to the branch that maps into the home.
+    #[test]
+    fn a_share_of_the_home_itself_is_refused() {
+        let src = env().home;
+        let e = argv_shared(
+            &[],
+            &[Share {
+                path: src.clone(),
+                mode: ShareMode::ReadWrite,
+            }],
+            &[(&src.to_string_lossy(), Dir)],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&e, LaunchError::BadValue { service: "--share", reason } if reason.contains("/home/bubbler")),
+            "{e}"
+        );
     }
 
     fn share(path: &str, mode: ShareMode) -> Service {
