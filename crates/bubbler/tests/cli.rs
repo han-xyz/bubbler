@@ -1599,6 +1599,52 @@ fn home_share_of_the_instance_store_is_refused_and_linted() {
     );
 }
 
+/// `$BUBBLER_PROFILE_DIR` moves the system profile layer, and a profile
+/// written there is the config of every instance seeded from it. Pointed
+/// inside the home, the directory is one `home-share` away.
+#[test]
+fn home_share_of_the_profile_dir_override_is_refused_and_linted() {
+    let tmp = setup();
+    let profiles = tmp.path().join("home/myprofiles");
+    std::fs::create_dir_all(&profiles).unwrap();
+    let cmd = || {
+        let mut c = bubbler(tmp.path());
+        c.env("BUBBLER_PROFILE_DIR", &profiles);
+        c
+    };
+    let out = cmd().args(["create", "t"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(
+        &cfg,
+        "home-share \"myprofiles\" mode=rw\ncommand \"true\"\n",
+    )
+    .unwrap();
+
+    let out = cmd().args(["run", "t", "--dry-run"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(
+        err.contains(&format!("bubbler never shares {}", profiles.display())),
+        "{err}"
+    );
+
+    let out = cmd().args(["lint", "t"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains(&format!(
+            "{}:1:1: error[home-share-reserved]",
+            cfg.display()
+        )),
+        "{text}"
+    );
+}
+
 #[test]
 fn test_allow_path_must_be_an_absolute_path_below_the_root() {
     let tmp = setup();

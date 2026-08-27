@@ -172,8 +172,8 @@ pub static GRANTS: &[Grant] = &[
                `mode=rw`, which lets the sandbox change what it was shown. A directory \
                holding another application's state (`.config`, `.local/share`) is that \
                application's data, and the linter says so. bubbler's own directories — \
-               the instance store, the profile layer — are refused on both ends, as for \
-               `path-share`.",
+               the instance store, either profile layer — are refused on both ends, as \
+               for `path-share`.",
         risk: Risk::Wide,
         grammar: "home-share \"<path under $HOME>\" [mode=ro|rw]",
     },
@@ -181,10 +181,10 @@ pub static GRANTS: &[Grant] = &[
         node: "path-share",
         summary: "a host path outside the home, at that same path inside",
         cost: "Read-only unless `mode=rw`. The paths the sandbox is built out of are \
-               refused on both ends — including the instance store, since a sandbox that \
-               can write a `config.kdl` grants itself anything on the next run — but \
-               everything else on the machine is shareable, and a mountpoint is a whole \
-               disk.",
+               refused on both ends — including the instance store and either profile \
+               layer, since a sandbox that can write a `config.kdl` or a profile grants \
+               itself anything on the next run — but everything else on the machine is \
+               shareable, and a mountpoint is a whole disk.",
         risk: Risk::Wide,
         grammar: "path-share \"<absolute path>\" [mode=ro|rw]",
     },

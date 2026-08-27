@@ -2035,6 +2035,40 @@ mod tests {
         });
     }
 
+    /// `$BUBBLER_PROFILE_DIR` moves the system profile layer, and both
+    /// share checks follow it there: under the home it is a
+    /// `home-share` away, outside it a `path-share`.
+    #[test]
+    fn the_profile_dir_override_is_reserved_for_both_share_checks() {
+        let (_, dir, _) = fake::types();
+        let host = host()
+            .with("/home/user/myprofiles", dir)
+            .with("/kioxia/profiles", dir);
+        let search = [PathBuf::from("/usr/bin")];
+        let mut inside = env();
+        inside.profile_dir_override = Some(PathBuf::from("/home/user/myprofiles"));
+        let ctx = Context {
+            env: &inside,
+            host: &host,
+            search_path: &search,
+        };
+        assert_eq!(
+            ids(&lint(&ctx, &["home-share \"myprofiles\" mode=rw"])),
+            ["home-share-reserved"]
+        );
+        let mut outside = env();
+        outside.profile_dir_override = Some(PathBuf::from("/kioxia/profiles"));
+        let ctx = Context {
+            env: &outside,
+            host: &host,
+            search_path: &search,
+        };
+        assert_eq!(
+            ids(&lint(&ctx, &["path-share \"/kioxia/profiles\" mode=rw"])),
+            ["path-share-reserved"]
+        );
+    }
+
     #[test]
     fn a_lint_allow_that_accepts_nothing_is_a_note() {
         with(&host(), |ctx| {

@@ -102,7 +102,7 @@ home is bound at the same relative path under the private home — `~/src/x` at
 at the path it has on the host, the mapping `path-share` makes; both come with
 the checks of those nodes, so the source must exist and be a directory or a
 regular file, and the roots under "Host paths" are refused here too, your home
-itself, the instance store and the profile layer among them. The default does
+itself, the instance store and both profile layers among them. The default does
 not come with them: `home-share` and `path-share` are read-only unless
 `mode=rw` says otherwise, and a `--share` is read-write unless `=ro` does. A
 path the config already shares is refused (`already shared by config.kdl`), the
@@ -458,8 +458,9 @@ a `~/Games`. A `home-share` source is resolved before it is bound and must
 stay inside your home directory: a symlink pointing elsewhere is refused, not
 followed. The directories bubbler builds the sandbox out of are refused
 there as well, read-only as much as read-write: the instance store
-(`~/.local/share/bubbler`), your profile layer (`~/.config/bubbler`), and any
-path containing one (`home-share ".local/share"` covers the store) — a sandbox
+(`~/.local/share/bubbler`), your profile layer (`~/.config/bubbler`), the
+directory `$BUBBLER_PROFILE_DIR` names where that points inside your home, and
+any path containing one (`home-share ".local/share"` covers the store) — a sandbox
 that can write a `config.kdl` or a profile grants itself anything on the next
 run, and one that can only read them reads every other instance's config and
 private home. The linter reports the same thing as `home-share-reserved`.
@@ -1528,18 +1529,21 @@ out of — not what it resolves to, and not the path it is bound at, which diffe
 when what you wrote is a symlink. Those paths are `/`, `/proc`, `/sys`, `/dev`,
 `/etc`, `/usr`, `/opt`, `/home`, your home directory, `/tmp`, `/var`, `/run`,
 `$XDG_RUNTIME_DIR`, `$XDG_DATA_HOME/bubbler` where the instances live,
-`$XDG_CONFIG_HOME/bubbler` where your own profile layer lives, and
-`/home/bubbler`, the private home, on the side that is bound at. Being one of
+`$XDG_CONFIG_HOME/bubbler` where your own profile layer lives, the directory
+`$BUBBLER_PROFILE_DIR` names where it is set — the system profile layer,
+wherever it was moved to — and `/home/bubbler`, the private home, on the side
+that is bound at. Being one of
 them, being inside one, or containing one is refused, and the error names the
 root that stopped it. So a share of `/kioxia` is refused if `$XDG_DATA_HOME` is
 on that disk: a sandbox that can write another instance's `config.kdl` grants
 itself anything on the next run, and one that can write a profile grants itself
-that on every instance seeded from it afterwards. All four roots your
-environment names — your home, `$XDG_RUNTIME_DIR`, the instance store
-`$XDG_DATA_HOME/bubbler` and the profile layer `$XDG_CONFIG_HOME/bubbler`, each
-of them as well as the directory above it — are compared both as written and as
-resolved, so a symlinked home or a symlinked instance store cannot be shared
-under its real name either. `/etc` and your home have typed grants of
+that on every instance seeded from it afterwards. Every root your environment
+names — your home, `$XDG_RUNTIME_DIR`, the instance store
+`$XDG_DATA_HOME/bubbler`, the profile layer `$XDG_CONFIG_HOME/bubbler` and the
+directory `$BUBBLER_PROFILE_DIR` points at, each of them as well as the
+directory above it — are compared both as written and as resolved, so a
+symlinked home or a symlinked instance store cannot be shared under its real
+name either. `/etc` and your home have typed grants of
 their own (`etc-share`, `home-share`), and the rest of that list is what the
 baseline replaces. The one carve-out is `/run/media` and everything
 under it, where udisks mounts removable media — though not when your instances

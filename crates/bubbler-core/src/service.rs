@@ -881,7 +881,7 @@ enum End {
 /// The roots the environment names, each in resolved form as well: with a
 /// symlink anywhere on the way to one of them, only the resolved form
 /// matches the canonical source of a share, and only the written form
-/// matches its destination. The instance store and the profile layer are
+/// matches its destination. The instance store and the profile layers are
 /// resolved on their own as well as under a resolved `$XDG_DATA_HOME` or
 /// `$XDG_CONFIG_HOME`, since either link alone moves them. A root that
 /// does not resolve is kept as written.
@@ -891,7 +891,7 @@ fn env_roots(host: &dyn Host, env: &Env) -> Vec<PathBuf> {
             .unwrap_or_else(|| dir.to_path_buf())
             .join("bubbler")
     };
-    let named = [
+    let mut named = vec![
         env.home.clone(),
         env.runtime_dir.clone(),
         env.data_home.join("bubbler"),
@@ -902,6 +902,11 @@ fn env_roots(host: &dyn Host, env: &Env) -> Vec<PathBuf> {
         env.config_home.join("bubbler"),
         under(&env.config_home),
     ];
+    // The system profile layer wherever `$BUBBLER_PROFILE_DIR` moved it:
+    // it is read as a layer at that path, so it is the same break as the
+    // user's own. The default `/usr/share/bubbler/profiles` needs no
+    // entry of its own — `/usr` is a fixed root, and read-only besides.
+    named.extend(env.profile_dir_override.clone());
     let resolved: Vec<PathBuf> = named.iter().filter_map(|p| host.canonicalize(p)).collect();
     named.into_iter().chain(resolved).collect()
 }
@@ -2294,6 +2299,56 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// `$BUBBLER_PROFILE_DIR` moves the system profile layer, and the
+    /// layer is reserved wherever it is: a sandbox that can write a
+    /// profile there writes the config of every instance seeded from it
+    /// afterwards. Under the home it is reachable by a relative path.
+    #[test]
+    fn home_share_of_the_profile_dir_override_is_refused() {
+        let mut e = env();
+        let dir = home("myprofiles");
+        e.profile_dir_override = Some(PathBuf::from(&dir));
+        let svcs = [Service::HomeShare {
+            path: "myprofiles".into(),
+            mode: ShareMode::ReadWrite,
+        }];
+        let err = argv(&svcs, &e, &[(&dir, Dir)]).unwrap_err();
+        assert!(
+            matches!(&err, LaunchError::BadValue { service: "home-share", reason }
+                if reason == &format!("bubbler never shares {dir}")),
+            "{err}"
+        );
+    }
+
+    /// And outside the home, where `path-share` is what reaches it —
+    /// the directory itself and anything containing it.
+    #[test]
+    fn path_share_of_the_profile_dir_override_is_refused() {
+        let mut e = env();
+        e.profile_dir_override = Some(PathBuf::from("/kioxia/profiles"));
+        for (path, want) in [
+            (
+                "/kioxia/profiles",
+                "bubbler never shares /kioxia/profiles".to_owned(),
+            ),
+            (
+                "/kioxia",
+                "bubbler never shares /kioxia, which overlaps /kioxia/profiles".to_owned(),
+            ),
+        ] {
+            let svcs = [Service::PathShare {
+                path: path.into(),
+                mode: ShareMode::ReadWrite,
+            }];
+            let err = argv(&svcs, &e, &[(path, Dir), ("/kioxia/profiles", Dir)]).unwrap_err();
+            assert!(
+                matches!(&err, LaunchError::BadValue { service: "path-share", reason }
+                    if reason == &want),
+                "{path}: {err}"
+            );
+        }
     }
 
     /// The home of [`env`], as a test writes host paths out.

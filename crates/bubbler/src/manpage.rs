@@ -176,7 +176,8 @@ const ENVIRONMENT: &[(&str, &str)] = &[
     ),
     (
         "BUBBLER_PROFILE_DIR",
-        "Replaces /usr/share/bubbler/profiles as the system profile layer.",
+        "Replaces /usr/share/bubbler/profiles as the system profile layer. The directory \
+         it names is a root no share may reach, wherever it is pointed.",
     ),
     (
         "BUBBLER_DBUS_LOG, BUBBLER_SECCOMP_LOG",

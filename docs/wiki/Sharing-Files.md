@@ -53,7 +53,7 @@ resolved on the host first. A path under `$HOME` lands at the same relative
 path under the private home, the way `home-share` maps its source; any other
 path lands at the path it has on the host, the way `path-share` does — with the
 type checks and the reserved roots of both, so your home itself, the instance
-store and the profile layer are refused here as well. What does not carry over
+store and both profile layers are refused here as well. What does not carry over
 is the default: those two nodes are read-only unless `mode=rw` says otherwise,
 while a `--share` is read-write unless `=ro` does.
 
@@ -92,9 +92,10 @@ home-share "Projects/x" mode=rw
 - One path once, whatever the modes (`"D"` and `"D" mode=rw` together is an
   error). `"D"` beside `"D/sub"` is fine.
 - Refused in either mode, naming the root: the instance store
-  (`~/.local/share/bubbler`), your profile layer (`~/.config/bubbler`) and
-  anything containing one (`.local/share`), as written and as resolved — the
-  same roots `path-share` and `--share` refuse, for the same reason. Lint
+  (`~/.local/share/bubbler`), your profile layer (`~/.config/bubbler`), a
+  `$BUBBLER_PROFILE_DIR` pointed inside your home, and anything containing one
+  (`.local/share`), as written and as resolved — the same roots `path-share`
+  and `--share` refuse, for the same reason. Lint
   reports it as `home-share-reserved`, an error.
 - Lint warns on `.ssh`, `.gnupg`, `.pki`, `.password-store`,
   `.local/share/keyrings`, `.mozilla`, and on `.config`, `.local`, `.cache` whole.
@@ -110,8 +111,9 @@ Binds a host path outside your home at that same path. Must be a directory or
 regular file. Refused, naming the root: `/`, `/proc`, `/sys`, `/dev`, `/etc`,
 `/usr`, `/opt`, `/home`, your home, `/tmp`, `/var`, `/run`, `$XDG_RUNTIME_DIR`,
 the instance store (`~/.local/share/bubbler`), your profile layer
-(`~/.config/bubbler`), `/home/bubbler` — being one, inside one, or containing
-one, as written and as resolved. Carve-out: `/run/media`. `/mnt`, `/media`,
+(`~/.config/bubbler`), the directory `$BUBBLER_PROFILE_DIR` names where it is
+set, `/home/bubbler` — being one, inside one, or containing one, as written and
+as resolved. Carve-out: `/run/media`. `/mnt`, `/media`,
 `/srv` and your own top-level mountpoints are allowed. One path once, whatever
 the modes; two `path-share`s may not overlap.
 
