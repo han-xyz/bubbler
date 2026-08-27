@@ -1360,8 +1360,10 @@ impl Counts {
 /// Which section of the file a node belongs to, numbered in the order
 /// [`crate::kdl_out::nodes`] writes the sections. Kept in step with that
 /// function by the round trip: a rank out of order writes a config that
-/// parses back as a different one.
-fn section_rank(node: &Node) -> u8 {
+/// parses back as a different one. Everything that sorts or groups
+/// disabled entries — the parser here, the editor's rows — ranks them
+/// through this, so there is one order and not one per reader.
+pub fn section_rank(node: &Node) -> u8 {
     match node {
         Node::LintAllow(_) => 0,
         Node::Service(_) => 1,

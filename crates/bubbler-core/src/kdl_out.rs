@@ -99,30 +99,60 @@ pub fn nodes(cfg: &InstanceConfig) -> Result<Vec<String>, ConfigError> {
     Ok(out)
 }
 
+/// One entry of a section in the order it is written back: either an
+/// enabled node, in whatever form its reader built it, or a disabled one
+/// with its index in [`InstanceConfig::disabled`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Entry<'a, T> {
+    /// One granted node, as the caller passed it in.
+    Enabled(T),
+    /// One `/-` entry, and where it sits in `cfg.disabled` — which is
+    /// what an editor needs to name the entry a key press acts on.
+    Disabled(usize, &'a Disabled),
+}
+
 /// One section of the file: its `enabled` nodes with the disabled
-/// entries of the same section written back among them, each before the
-/// entry it was read above. An entry pointing past the last one is
-/// written after it rather than dropped: the section may have lost the
-/// node it sat above since.
+/// entries of the same section among them, each before the entry it was
+/// read above. An entry pointing past the last one comes after it rather
+/// than being dropped: the section may have lost the node it sat above
+/// since. Both readers of a section — [`nodes`] below and the editor's
+/// row list — walk this, so a file and the editor's view of it cannot
+/// disagree about where a `/-` line sits.
+pub fn section_entries<'a, T>(
+    cfg: &'a InstanceConfig,
+    is: fn(&Node) -> bool,
+    enabled: Vec<T>,
+) -> Vec<Entry<'a, T>> {
+    let end = enabled.len();
+    let of_section = |at: &dyn Fn(usize) -> bool| -> Vec<Entry<'a, T>> {
+        cfg.disabled
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| is(&d.node) && at(d.before))
+            .map(|(i, d)| Entry::Disabled(i, d))
+            .collect()
+    };
+    let mut out = Vec::new();
+    for (i, node) in enabled.into_iter().enumerate() {
+        out.extend(of_section(&|before| before == i));
+        out.push(Entry::Enabled(node));
+    }
+    out.extend(of_section(&|before| before >= end));
+    out
+}
+
+/// One section of the file as the lines it is written back as.
 fn section(
     cfg: &InstanceConfig,
     is: fn(&Node) -> bool,
     enabled: Vec<String>,
     out: &mut Vec<String>,
 ) -> Result<(), ConfigError> {
-    let end = enabled.len();
-    for (i, node) in enabled.into_iter().enumerate() {
-        for d in cfg.disabled.iter().filter(|d| is(&d.node) && d.before == i) {
-            out.push(disabled(d)?);
-        }
-        out.push(node);
-    }
-    for d in cfg
-        .disabled
-        .iter()
-        .filter(|d| is(&d.node) && d.before >= end)
-    {
-        out.push(disabled(d)?);
+    for entry in section_entries(cfg, is, enabled) {
+        out.push(match entry {
+            Entry::Enabled(node) => node,
+            Entry::Disabled(_, d) => disabled(d)?,
+        });
     }
     Ok(())
 }
@@ -1063,6 +1093,28 @@ mod tests {
             render(&parse("dri\n/-pipewire").unwrap()).unwrap(),
             "dri\n/-pipewire\n"
         );
+    }
+
+    /// The one order both readers of a section walk: the emitter here
+    /// and the editor's row list, which pairs each entry with what a key
+    /// press edits.
+    #[test]
+    fn one_section_order_serves_every_reader() {
+        let text = "dri\n/-home-share \"x\" mode=ro\npipewire\n/-pipewire\n";
+        let cfg = parse(text).unwrap();
+        let order: Vec<String> = section_entries(
+            &cfg,
+            |n| matches!(n, Node::Service(_)),
+            vec!["dri", "pipewire"],
+        )
+        .into_iter()
+        .map(|e| match e {
+            Entry::Enabled(name) => name.to_owned(),
+            Entry::Disabled(i, d) => format!("/-{i}:{}", d.node.name()),
+        })
+        .collect();
+        assert_eq!(order, ["dri", "/-0:home-share", "pipewire", "/-1:pipewire"]);
+        assert_eq!(render(&cfg).unwrap(), text);
     }
 
     #[test]

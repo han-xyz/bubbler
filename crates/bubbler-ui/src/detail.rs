@@ -357,7 +357,7 @@ impl Detail {
             entry.node = written;
             return;
         }
-        let rank = section_rank(&written);
+        let rank = config::section_rank(&written);
         match (written, target) {
             (Node::Service(s), Target::Service(i)) => {
                 // An index is stale only between a change and the
@@ -448,7 +448,7 @@ impl Detail {
             Target::Add(_) | Target::Absent => {}
         }
         if let Some(i) = index_of(target) {
-            self.shift_disabled(section_rank(&node), i, -1);
+            self.shift_disabled(config::section_rank(&node), i, -1);
         }
     }
 
@@ -458,7 +458,7 @@ impl Detail {
     /// entry and has to move them with it.
     fn shift_disabled(&mut self, rank: u8, i: usize, by: isize) {
         for entry in &mut self.buf.disabled {
-            if section_rank(&entry.node) == rank && entry.before > i {
+            if config::section_rank(&entry.node) == rank && entry.before > i {
                 entry.before = entry.before.saturating_add_signed(by);
             }
         }
@@ -471,7 +471,7 @@ impl Detail {
         let (Some(node), Some(before)) = (self.node_at(target), index_of(target)) else {
             return;
         };
-        let rank = section_rank(&node);
+        let rank = config::section_rank(&node);
         // Read before the entry goes, because taking it out moves the
         // `/-` lines below it up: an entry disabled above one of them
         // is written above it, and one below it below.
@@ -479,7 +479,7 @@ impl Detail {
             .buf
             .disabled
             .iter()
-            .position(|d| (section_rank(&d.node), d.before) > (rank, before))
+            .position(|d| (config::section_rank(&d.node), d.before) > (rank, before))
             .unwrap_or(self.buf.disabled.len());
         self.remove(target);
         self.buf.disabled.insert(at, Disabled { node, before });
@@ -495,7 +495,7 @@ impl Detail {
         };
         let node = entry.node.name();
         self.buf.disabled.remove(i);
-        let rank = section_rank(&entry.node);
+        let rank = config::section_rank(&entry.node);
         let at = entry.before.min(self.section_len(&entry.node));
         let written = self.insert(entry.node, at);
         // The `/-` lines below it in its section stand above the entries
@@ -503,7 +503,7 @@ impl Detail {
         // sit in the list rather than of the count they hold: one that
         // named the same entry from above stays above it.
         for entry in self.buf.disabled.iter_mut().skip(i) {
-            if section_rank(&entry.node) == rank {
+            if config::section_rank(&entry.node) == rank {
                 entry.before += written.count();
             }
         }
@@ -649,23 +649,6 @@ impl Placed {
 /// entry it replaced.
 fn grew_by(n: usize) -> isize {
     isize::try_from(n.saturating_sub(1)).unwrap_or_default()
-}
-
-/// Which section of the file a node belongs to, numbered in the order
-/// [`kdl_out::nodes`] writes the sections. It decides where a disabled
-/// entry sits in [`InstanceConfig::disabled`], which is by section and,
-/// inside one, in file order.
-fn section_rank(node: &Node) -> u8 {
-    match node {
-        Node::LintAllow(_) => 0,
-        Node::Service(_) => 1,
-        Node::Env(_) => 2,
-        Node::Tty(_) => 3,
-        Node::Userns(_) => 4,
-        Node::Seccomp(_) => 5,
-        Node::Desktop(_) => 6,
-        Node::Command(_) => 7,
-    }
 }
 
 /// Where in its section the entry a target names sits, which is what a
@@ -851,41 +834,27 @@ struct Builder {
 
 impl Builder {
     /// One section of the file: its entries with the disabled ones of
-    /// the same section among them, each before the entry it was read
-    /// above, exactly as [`kdl_out::nodes`] writes them. The order is
-    /// the file's, which is what makes a row's line the line a finding
-    /// names.
+    /// the same section among them, in the one order
+    /// [`kdl_out::section_entries`] holds for every reader of a section.
+    /// That order is the file's, which is what makes a row's line the
+    /// line a finding names.
     fn section(
         &mut self,
         cfg: &InstanceConfig,
         is: fn(&Node) -> bool,
         enabled: Vec<(&'static str, String, Target)>,
     ) -> Result<(), String> {
-        let end = enabled.len();
-        for (i, (node, text, target)) in enabled.into_iter().enumerate() {
-            self.disabled(cfg, is, |before| before == i)?;
-            self.push(node, text, target);
-        }
-        // One past the last entry is written after it rather than
-        // dropped: the section may have lost the entry it sat above.
-        self.disabled(cfg, is, |before| before >= end)
-    }
-
-    /// The disabled entries of one section whose place `at` accepts,
-    /// each shown as the node it holds and none of them as `/-`: the
-    /// prompt writes a line, and Space is what turns it back on.
-    fn disabled(
-        &mut self,
-        cfg: &InstanceConfig,
-        is: fn(&Node) -> bool,
-        at: impl Fn(usize) -> bool,
-    ) -> Result<(), String> {
-        for (i, entry) in cfg.disabled.iter().enumerate() {
-            if !is(&entry.node) || !at(entry.before) {
-                continue;
+        for entry in kdl_out::section_entries(cfg, is, enabled) {
+            match entry {
+                kdl_out::Entry::Enabled((node, text, target)) => self.push(node, text, target),
+                // Shown as the node it holds and never as `/-`: the
+                // prompt writes a line, and Space is what turns one
+                // back on.
+                kdl_out::Entry::Disabled(i, d) => {
+                    let text = kdl_out::node(&d.node).map_err(|e| e.to_string())?;
+                    self.push(d.node.name(), text, Target::Disabled(i));
+                }
             }
-            let text = kdl_out::node(&entry.node).map_err(|e| e.to_string())?;
-            self.push(entry.node.name(), text, Target::Disabled(i));
         }
         Ok(())
     }

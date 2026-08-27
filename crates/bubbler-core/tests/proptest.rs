@@ -385,23 +385,6 @@ fn command() -> impl Strategy<Value = Option<Vec<OsString>>> {
     )
 }
 
-/// Which section of a file a node belongs to, in the order
-/// [`kdl_out::nodes`] writes them. The emitter writes a section in one
-/// piece, so this is the order a parsed config holds its `/-` lines in,
-/// whatever order the file wrote them.
-fn rank(node: &Node) -> u8 {
-    match node {
-        Node::LintAllow(_) => 0,
-        Node::Service(_) => 1,
-        Node::Env(_) => 2,
-        Node::Tty(_) => 3,
-        Node::Userns(_) => 4,
-        Node::Seccomp(_) => 5,
-        Node::Desktop(_) => 6,
-        Node::Command(_) => 7,
-    }
-}
-
 /// A kind of node a `/-` line may keep, and where in its section it
 /// sits, before either is fitted to the config it is written into.
 fn disabled_kinds() -> impl Strategy<Value = Vec<(u8, usize)>> {
@@ -469,7 +452,7 @@ fn fit_disabled(cfg: &InstanceConfig, kinds: &[(u8, usize)]) -> Vec<Disabled> {
             }
         })
         .collect();
-    out.sort_by_key(|d| (rank(&d.node), d.before));
+    out.sort_by_key(|d| (config::section_rank(&d.node), d.before));
     out
 }
 
@@ -603,7 +586,7 @@ proptest! {
         text.push_str(&kdl_out::render(&enabled).expect("every generated value is UTF-8"));
         let back = config::parse(&text)
             .unwrap_or_else(|e| panic!("moved config does not parse: {e}\n{text}"));
-        let ranks: Vec<u8> = back.disabled.iter().map(|d| rank(&d.node)).collect();
+        let ranks: Vec<u8> = back.disabled.iter().map(|d| config::section_rank(&d.node)).collect();
         prop_assert!(ranks.is_sorted(), "{ranks:?}\n{text}");
         prop_assert_eq!(back.disabled.len(), cfg.disabled.len());
     }
