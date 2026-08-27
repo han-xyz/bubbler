@@ -1546,9 +1546,9 @@ mod tests {
     /// the same path in every test.
     fn env() -> Env {
         Env {
-            home: PathBuf::from("/home/han"),
-            data_home: PathBuf::from("/home/han/.local/share"),
-            config_home: PathBuf::from("/home/han/.config"),
+            home: PathBuf::from("/home/user"),
+            data_home: PathBuf::from("/home/user/.local/share"),
+            config_home: PathBuf::from("/home/user/.config"),
             data_dirs: crate::env::DEFAULT_DATA_DIRS
                 .iter()
                 .map(PathBuf::from)
@@ -1574,7 +1574,7 @@ mod tests {
         }
     }
 
-    /// Run `f` with a context over `host`, `/home/han` and a `$PATH` of
+    /// Run `f` with a context over `host`, `/home/user` and a `$PATH` of
     /// `/usr/bin`.
     fn with<T>(host: &dyn Host, f: impl FnOnce(&Context) -> T) -> T {
         let e = env();
@@ -1933,11 +1933,11 @@ mod tests {
     fn sharing_a_directory_the_private_home_exists_to_keep_out_is_a_warning() {
         let (_, dir, _) = fake::types();
         let host = host()
-            .with("/home/han/.ssh", dir)
-            .with("/home/han/.ssh/keys", dir)
-            .with("/home/han/.local/share", dir)
-            .with("/home/han/.config/app", dir)
-            .with("/home/han/Downloads", dir);
+            .with("/home/user/.ssh", dir)
+            .with("/home/user/.ssh/keys", dir)
+            .with("/home/user/.local/share", dir)
+            .with("/home/user/.config/app", dir)
+            .with("/home/user/Downloads", dir);
         with(&host, |ctx| {
             assert_eq!(
                 ids(&lint(ctx, &["home-share \".ssh\""])),
@@ -2030,7 +2030,7 @@ mod tests {
     fn a_share_whose_source_is_not_on_this_host_is_a_warning() {
         let (_, dir, _) = fake::types();
         let host = host()
-            .with("/home/han/Downloads", dir)
+            .with("/home/user/Downloads", dir)
             .with("/etc/vulkan", dir);
         with(&host, |ctx| {
             for text in [
@@ -2057,7 +2057,7 @@ mod tests {
         let (file, dir, sock, fifo) = fake::every_type();
         let host = FakeHost::default()
             .with("/usr/bin/foot", file)
-            .with("/home/han/pipe", fifo)
+            .with("/home/user/pipe", fifo)
             .with("/etc/sock", sock)
             .with("/kioxia/pipe", fifo)
             .with("/kioxia/sock", sock)
@@ -2095,9 +2095,9 @@ mod tests {
     #[test]
     fn a_path_share_of_a_root_bubbler_never_shares_is_an_error() {
         let (_, dir, _) = fake::types();
-        let host = host().with("/home/han", dir).with("/kioxia/Steam", dir);
+        let host = host().with("/home/user", dir).with("/kioxia/Steam", dir);
         with(&host, |ctx| {
-            let report = lint(ctx, &["path-share \"/home/han\" mode=rw"]);
+            let report = lint(ctx, &["path-share \"/home/user\" mode=rw"]);
             assert_eq!(ids(&report), ["path-share-reserved"]);
             assert_eq!(report.findings[0].severity, Severity::Error);
             assert_eq!(
@@ -2346,7 +2346,7 @@ mod tests {
         });
         // The user's own applications directory counts too.
         let mine = host().with(
-            "/home/han/.local/share/applications/org.example.Mine.desktop",
+            "/home/user/.local/share/applications/org.example.Mine.desktop",
             file,
         );
         with(&mine, |ctx| {

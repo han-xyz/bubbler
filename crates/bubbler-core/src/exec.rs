@@ -352,9 +352,9 @@ mod tests {
 
     fn env(runtime_dir: &Path) -> Env {
         Env {
-            home: "/home/han".into(),
-            data_home: "/home/han/.local/share".into(),
-            config_home: "/home/han/.config".into(),
+            home: "/home/user".into(),
+            data_home: "/home/user/.local/share".into(),
+            config_home: "/home/user/.config".into(),
             data_dirs: crate::env::DEFAULT_DATA_DIRS
                 .iter()
                 .map(PathBuf::from)

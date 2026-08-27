@@ -140,7 +140,7 @@ appear. Neither mode calls the portal, so the id is a literal `<id>`:
 
 ```
 forward: /tmp/fwd-ro.txt → $XDG_RUNTIME_DIR/doc/<id>/fwd-ro.txt (read)
-visible: /home/han/Documents/paper.pdf → /home/bubbler/Documents/paper.pdf
+visible: /home/user/Documents/paper.pdf → /home/bubbler/Documents/paper.pdf
 ```
 
 Groups sit where a node's first argument appears, so the listing is neither

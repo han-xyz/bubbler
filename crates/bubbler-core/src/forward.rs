@@ -930,9 +930,9 @@ mod tests {
 
     fn env() -> Env {
         Env {
-            home: "/home/han".into(),
-            data_home: "/home/han/.local/share".into(),
-            config_home: "/home/han/.config".into(),
+            home: "/home/user".into(),
+            data_home: "/home/user/.local/share".into(),
+            config_home: "/home/user/.config".into(),
             data_dirs: crate::env::DEFAULT_DATA_DIRS
                 .iter()
                 .map(PathBuf::from)
@@ -987,19 +987,19 @@ mod tests {
     fn tree() -> FakeHost {
         let (file, dir, socket) = types();
         FakeHost::default()
-            .with("/home/han/a.pdf", file)
-            .rw("/home/han/a.pdf")
-            .with("/home/han/a b.pdf", file)
-            .with("/home/han/theirs.pdf", file)
-            .with("/home/han/pics", dir)
-            .with("/home/han/s.sock", socket)
-            .with("/home/han/link.pdf", file)
-            .link("/home/han/link.pdf", "/home/han/a.pdf")
-            .rw("/home/han/link.pdf")
-            .with("/home/han/Documents", dir)
-            .with("/home/han/Documents/report.pdf", file)
-            .with("/home/han/Downloads/b.pdf", file)
-            .with("/home/han/.ssh/id_rsa", file)
+            .with("/home/user/a.pdf", file)
+            .rw("/home/user/a.pdf")
+            .with("/home/user/a b.pdf", file)
+            .with("/home/user/theirs.pdf", file)
+            .with("/home/user/pics", dir)
+            .with("/home/user/s.sock", socket)
+            .with("/home/user/link.pdf", file)
+            .link("/home/user/link.pdf", "/home/user/a.pdf")
+            .rw("/home/user/link.pdf")
+            .with("/home/user/Documents", dir)
+            .with("/home/user/Documents/report.pdf", file)
+            .with("/home/user/Downloads/b.pdf", file)
+            .with("/home/user/.ssh/id_rsa", file)
             .with("/data/inst/home", dir)
             .link("/data/inst/home", "/pool/inst/home")
             .with("/pool/inst/home/note.txt", file)
@@ -1046,30 +1046,30 @@ mod tests {
     fn every_argument_is_classified_once() {
         let cases: &[(&str, &str)] = &[
             (
-                "/home/han/a.pdf",
-                "forward /home/han/a.pdf as a.pdf (write)",
+                "/home/user/a.pdf",
+                "forward /home/user/a.pdf as a.pdf (write)",
             ),
             (
-                "/home/han/theirs.pdf",
-                "forward /home/han/theirs.pdf as theirs.pdf (read)",
+                "/home/user/theirs.pdf",
+                "forward /home/user/theirs.pdf as theirs.pdf (read)",
             ),
             (
-                "file:///home/han/a%20b.pdf",
-                "forward /home/han/a b.pdf as a b.pdf (read)",
+                "file:///home/user/a%20b.pdf",
+                "forward /home/user/a b.pdf as a b.pdf (read)",
             ),
             (
-                "file://localhost/home/han/a.pdf",
-                "forward /home/han/a.pdf as a.pdf (write)",
+                "file://localhost/home/user/a.pdf",
+                "forward /home/user/a.pdf as a.pdf (write)",
             ),
             (
-                "file:/home/han/a.pdf",
-                "forward /home/han/a.pdf as a.pdf (write)",
+                "file:/home/user/a.pdf",
+                "forward /home/user/a.pdf as a.pdf (write)",
             ),
             (
-                "/home/han/link.pdf",
-                "forward /home/han/link.pdf (→ /home/han/a.pdf) as a.pdf (write)",
+                "/home/user/link.pdf",
+                "forward /home/user/link.pdf (→ /home/user/a.pdf) as a.pdf (write)",
             ),
-            ("file://other/home/han/a.pdf", "untouched"),
+            ("file://other/home/user/a.pdf", "untouched"),
             ("file://localhost", "untouched"),
             ("https://example.invalid/a.pdf", "untouched"),
             ("--flag", "untouched"),
@@ -1078,19 +1078,19 @@ mod tests {
             ("./rel", "skip ./rel Relative"),
             ("../up/a.pdf", "skip ../up/a.pdf Relative"),
             ("file:rel/a.pdf", "skip rel/a.pdf Relative"),
-            ("/home/han/pics", "skip /home/han/pics Directory"),
-            ("/home/han/s.sock", "skip /home/han/s.sock NotAFile"),
-            ("/home/han/gone.pdf", "skip /home/han/gone.pdf NotAFile"),
+            ("/home/user/pics", "skip /home/user/pics Directory"),
+            ("/home/user/s.sock", "skip /home/user/s.sock NotAFile"),
+            ("/home/user/gone.pdf", "skip /home/user/gone.pdf NotAFile"),
             ("/proc/self/exe", "skip /proc/self/exe Refused"),
             ("/dev/null", "skip /dev/null Refused"),
             ("/sys/power/state", "skip /sys/power/state Refused"),
             (
-                "/home/han/Documents/report.pdf",
-                "rename /home/han/Documents/report.pdf → /home/bubbler/Documents/report.pdf",
+                "/home/user/Documents/report.pdf",
+                "rename /home/user/Documents/report.pdf → /home/bubbler/Documents/report.pdf",
             ),
             (
-                "file:///home/han/Documents/a%20b.pdf",
-                "rename /home/han/Documents/a b.pdf → /home/bubbler/Documents/a b.pdf",
+                "file:///home/user/Documents/a%20b.pdf",
+                "rename /home/user/Documents/a b.pdf → /home/bubbler/Documents/a b.pdf",
             ),
             ("/srv/data/x.csv", "skip /srv/data/x.csv AlreadyVisible"),
             (
@@ -1118,27 +1118,27 @@ mod tests {
             // `..` is refused rather than folded: it would otherwise
             // walk out of the share the path appears to be under.
             (
-                "/home/han/Documents/../.ssh/id_rsa",
-                "skip /home/han/Documents/../.ssh/id_rsa DotDot",
+                "/home/user/Documents/../.ssh/id_rsa",
+                "skip /home/user/Documents/../.ssh/id_rsa DotDot",
             ),
             (
-                "/usr/../home/han/.ssh/id_rsa",
-                "skip /usr/../home/han/.ssh/id_rsa DotDot",
+                "/usr/../home/user/.ssh/id_rsa",
+                "skip /usr/../home/user/.ssh/id_rsa DotDot",
             ),
             (
-                "file:///home/han/Documents%2F..%2F.ssh/id_rsa",
-                "skip /home/han/Documents/../.ssh/id_rsa DotDot",
+                "file:///home/user/Documents%2F..%2F.ssh/id_rsa",
+                "skip /home/user/Documents/../.ssh/id_rsa DotDot",
             ),
             // A read-write share renames the same way a read-only one
             // does; the mode is the bind's business, not the path's.
             (
-                "/home/han/Downloads/b.pdf",
-                "rename /home/han/Downloads/b.pdf → /home/bubbler/Downloads/b.pdf",
+                "/home/user/Downloads/b.pdf",
+                "rename /home/user/Downloads/b.pdf → /home/bubbler/Downloads/b.pdf",
             ),
             // The share root itself, with no separator left dangling.
             (
-                "/home/han/Documents",
-                "rename /home/han/Documents → /home/bubbler/Documents",
+                "/home/user/Documents",
+                "rename /home/user/Documents → /home/bubbler/Documents",
             ),
             ("/data/inst/home", "rename /data/inst/home → /home/bubbler"),
             // A share whose source is a symlink: the tree it names is
@@ -1172,13 +1172,13 @@ mod tests {
     fn a_link_that_lands_in_proc_is_refused_like_the_path_itself() {
         let (file, ..) = types();
         let host = FakeHost::default()
-            .with("/home/han/kernel", file)
-            .link("/home/han/kernel", "/proc/self/exe");
+            .with("/home/user/kernel", file)
+            .link("/home/user/kernel", "/proc/self/exe");
         assert_eq!(
-            planned(&["/home/han/kernel"], &host),
+            planned(&["/home/user/kernel"], &host),
             vec![Planned::Skip(
                 0,
-                PathBuf::from("/home/han/kernel"),
+                PathBuf::from("/home/user/kernel"),
                 Skip::Refused
             )]
         );
@@ -1240,22 +1240,22 @@ mod tests {
     #[test]
     fn a_share_that_is_not_granted_does_not_hide_a_file() {
         let (file, ..) = types();
-        let host = FakeHost::default().with("/home/han/Documents/report.pdf", file);
-        let args = vec![OsString::from("/home/han/Documents/report.pdf")];
+        let host = FakeHost::default().with("/home/user/Documents/report.pdf", file);
+        let args = vec![OsString::from("/home/user/Documents/report.pdf")];
         let bare = InstanceConfig::default();
         let out = plan(&env(), &bare, Path::new(INSTANCE_HOME), &args, &host);
         assert_eq!(
             tag(&out[0]),
-            "forward /home/han/Documents/report.pdf as report.pdf (read)"
+            "forward /home/user/Documents/report.pdf as report.pdf (read)"
         );
     }
 
     #[test]
     fn a_path_that_is_not_utf8_survives_decoding() {
-        let arg = OsString::from_vec(b"file:///home/han/%ff.pdf".to_vec());
+        let arg = OsString::from_vec(b"file:///home/user/%ff.pdf".to_vec());
         let file: FileType = types().0;
         let name = OsString::from_vec(b"\xff.pdf".to_vec());
-        let host = FakeHost::default().with("/home/han/\u{fffd}", file);
+        let host = FakeHost::default().with("/home/user/\u{fffd}", file);
         let out = plan(
             &env(),
             &cfg(),
@@ -1269,12 +1269,12 @@ mod tests {
             out,
             vec![Planned::Skip(
                 0,
-                PathBuf::from(OsString::from_vec(b"/home/han/\xff.pdf".to_vec())),
+                PathBuf::from(OsString::from_vec(b"/home/user/\xff.pdf".to_vec())),
                 Skip::NotAFile
             )]
         );
         assert_eq!(
-            host_path(OsStr::new("file:///home/han/%ff.pdf"))
+            host_path(OsStr::new("file:///home/user/%ff.pdf"))
                 .and_then(|p| p.file_name().map(OsStr::to_os_string)),
             Some(name)
         );
@@ -1282,9 +1282,9 @@ mod tests {
 
     #[test]
     fn a_root_that_is_no_root_hides_nothing() {
-        let args = vec![OsString::from("/home/han/a.pdf")];
+        let args = vec![OsString::from("/home/user/a.pdf")];
         let out = plan(&env(), &cfg(), Path::new(""), &args, &tree());
-        assert_eq!(tag(&out[0]), "forward /home/han/a.pdf as a.pdf (write)");
+        assert_eq!(tag(&out[0]), "forward /home/user/a.pdf as a.pdf (write)");
     }
 
     #[test]
@@ -1293,12 +1293,12 @@ mod tests {
         // The share source is there, but nothing about it resolves —
         // what the real host answers for a path it cannot walk.
         let host = tree()
-            .with("/home/han/Documents", dir)
-            .with("/home/han/Documents/report.pdf", file)
-            .unresolved("/home/han/Documents");
+            .with("/home/user/Documents", dir)
+            .with("/home/user/Documents/report.pdf", file)
+            .unresolved("/home/user/Documents");
         assert_eq!(
-            tag(&planned(&["/home/han/Documents/report.pdf"], &host)[0]),
-            "rename /home/han/Documents/report.pdf → /home/bubbler/Documents/report.pdf"
+            tag(&planned(&["/home/user/Documents/report.pdf"], &host)[0]),
+            "rename /home/user/Documents/report.pdf → /home/bubbler/Documents/report.pdf"
         );
     }
 
@@ -1309,7 +1309,7 @@ mod tests {
         // so neither may rewrite an argument either.
         let host = tree()
             .link("/srv/escape", "/")
-            .link("/srv/store", "/home/han");
+            .link("/srv/store", "/home/user");
         let cfg = InstanceConfig {
             services: vec![
                 Service::PathShare {
@@ -1323,9 +1323,9 @@ mod tests {
             ],
             ..InstanceConfig::default()
         };
-        let args = [OsString::from("/home/han/a.pdf")];
+        let args = [OsString::from("/home/user/a.pdf")];
         let out = plan(&env(), &cfg, Path::new(INSTANCE_HOME), &args, &host);
-        assert_eq!(tag(&out[0]), "forward /home/han/a.pdf as a.pdf (write)");
+        assert_eq!(tag(&out[0]), "forward /home/user/a.pdf as a.pdf (write)");
     }
 
     #[test]
@@ -1354,7 +1354,7 @@ mod tests {
         // source pointing out of it never becomes a rename root.
         let (file, ..) = types();
         let host = tree()
-            .link("/home/han/Documents", "/mnt/elsewhere")
+            .link("/home/user/Documents", "/mnt/elsewhere")
             .with("/mnt/elsewhere/report.pdf", file);
         assert_eq!(
             tag(&planned(&["/mnt/elsewhere/report.pdf"], &host)[0]),
@@ -1364,7 +1364,7 @@ mod tests {
 
     #[test]
     fn a_nul_in_a_uri_names_no_file() {
-        assert_eq!(host_path(OsStr::new("file:///home/han/a%00b.pdf")), None);
+        assert_eq!(host_path(OsStr::new("file:///home/user/a%00b.pdf")), None);
     }
 
     #[test]
@@ -1379,11 +1379,11 @@ mod tests {
     fn the_warning_lines_are_the_ones_the_cli_prints() {
         let out = planned(
             &[
-                "/home/han/pics",
-                "/home/han/s.sock",
+                "/home/user/pics",
+                "/home/user/s.sock",
                 "/proc/self/exe",
-                "/home/han/Documents/../.ssh/id_rsa",
-                "/home/han/a.pdf",
+                "/home/user/Documents/../.ssh/id_rsa",
+                "/home/user/a.pdf",
                 "/srv/data/x.csv",
                 "./rel",
                 "--flag",
@@ -1393,10 +1393,10 @@ mod tests {
         assert_eq!(
             warning_lines(&out),
             vec![
-                "/home/han/pics is a directory; grant path-share or home-share to expose it",
-                "/home/han/s.sock is not a regular file, not forwarded",
+                "/home/user/pics is a directory; grant path-share or home-share to expose it",
+                "/home/user/s.sock is not a regular file, not forwarded",
                 "/proc/self/exe is under /proc, /sys or /dev, not forwarded",
-                "/home/han/Documents/../.ssh/id_rsa contains `..`, not forwarded",
+                "/home/user/Documents/../.ssh/id_rsa contains `..`, not forwarded",
             ]
         );
     }
@@ -1405,10 +1405,10 @@ mod tests {
     fn the_explain_lines_name_the_document_path_with_a_literal_id() {
         let out = planned(
             &[
-                "/home/han/a.pdf",
-                "/home/han/theirs.pdf",
-                "/home/han/link.pdf",
-                "/home/han/Documents/report.pdf",
+                "/home/user/a.pdf",
+                "/home/user/theirs.pdf",
+                "/home/user/link.pdf",
+                "/home/user/Documents/report.pdf",
                 "/srv/data/x.csv",
                 "--flag",
             ],
@@ -1417,29 +1417,29 @@ mod tests {
         assert_eq!(
             explain_lines(&out),
             vec![
-                "forward: /home/han/a.pdf → $XDG_RUNTIME_DIR/doc/<id>/a.pdf (write)",
-                "forward: /home/han/theirs.pdf → $XDG_RUNTIME_DIR/doc/<id>/theirs.pdf (read)",
+                "forward: /home/user/a.pdf → $XDG_RUNTIME_DIR/doc/<id>/a.pdf (write)",
+                "forward: /home/user/theirs.pdf → $XDG_RUNTIME_DIR/doc/<id>/theirs.pdf (read)",
                 // The link is not what is exported; the file it names is.
-                "forward: /home/han/link.pdf (→ /home/han/a.pdf) → $XDG_RUNTIME_DIR/doc/<id>/a.pdf (write)",
-                "visible: /home/han/Documents/report.pdf → /home/bubbler/Documents/report.pdf",
+                "forward: /home/user/link.pdf (→ /home/user/a.pdf) → $XDG_RUNTIME_DIR/doc/<id>/a.pdf (write)",
+                "visible: /home/user/Documents/report.pdf → /home/bubbler/Documents/report.pdf",
             ]
         );
     }
 
     #[test]
     fn rewrite_replaces_only_what_was_registered() {
-        let args: Vec<OsString> = ["--flag", "/home/han/a.pdf", "file:///home/han/b.pdf"]
+        let args: Vec<OsString> = ["--flag", "/home/user/a.pdf", "file:///home/user/b.pdf"]
             .iter()
             .map(OsString::from)
             .collect();
         let renamed = vec![Planned::Rename {
             arg_index: 2,
-            host: "/home/han/Documents/b.pdf".into(),
+            host: "/home/user/Documents/b.pdf".into(),
             inside: "/home/bubbler/Documents/b.pdf".into(),
         }];
         let forwards = vec![Forward {
             arg_index: 1,
-            host: "/home/han/a.pdf".into(),
+            host: "/home/user/a.pdf".into(),
             inside: "/run/user/1000/doc/abc/a.pdf".into(),
             write: true,
         }];
@@ -1448,7 +1448,7 @@ mod tests {
             vec![
                 OsString::from("--flag"),
                 OsString::from("/run/user/1000/doc/abc/a.pdf"),
-                OsString::from("file:///home/han/b.pdf"),
+                OsString::from("file:///home/user/b.pdf"),
             ]
         );
         // A rename needs no portal, so it applies with nothing registered.
@@ -1456,7 +1456,7 @@ mod tests {
             rewrite(&args, &renamed, &[]),
             vec![
                 OsString::from("--flag"),
-                OsString::from("/home/han/a.pdf"),
+                OsString::from("/home/user/a.pdf"),
                 OsString::from("/home/bubbler/Documents/b.pdf"),
             ]
         );
@@ -1465,19 +1465,19 @@ mod tests {
 
     #[test]
     fn the_program_is_never_a_document() {
-        let cmd: Vec<OsString> = ["/usr/bin/cat", "/home/han/a.pdf"]
+        let cmd: Vec<OsString> = ["/usr/bin/cat", "/home/user/a.pdf"]
             .iter()
             .map(OsString::from)
             .collect();
         let out = plan_args(&env(), &cfg(), Path::new(INSTANCE_HOME), &cmd, &tree());
         assert_eq!(out[0], Planned::Untouched);
-        assert_eq!(tag(&out[1]), "forward /home/han/a.pdf as a.pdf (write)");
+        assert_eq!(tag(&out[1]), "forward /home/user/a.pdf as a.pdf (write)");
         assert_eq!(
             plan_args(&env(), &cfg(), Path::new(INSTANCE_HOME), &[], &tree()),
             Vec::new()
         );
         // A bare argument list keeps the program's own index free.
-        assert_eq!(planned(&["/home/han/a.pdf"], &tree()).len(), 1);
+        assert_eq!(planned(&["/home/user/a.pdf"], &tree()).len(), 1);
     }
 
     /// The unique name the fake bus says the portal holds. Every reply

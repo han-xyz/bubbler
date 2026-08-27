@@ -706,7 +706,7 @@ mod tests {
 
     fn env(data_home: &Path) -> Env {
         Env {
-            home: "/home/han".into(),
+            home: "/home/user".into(),
             data_home: data_home.to_path_buf(),
             config_home: data_home.join("config"),
             data_dirs: crate::env::DEFAULT_DATA_DIRS

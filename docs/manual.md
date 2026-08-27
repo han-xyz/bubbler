@@ -1616,7 +1616,7 @@ That rewrite needs no portal and no grant, so it applies under `--dry-run` and
 without `portals` as well:
 
     $ bubbler run ff --dry-run -- /usr/bin/cat ~/Documents/paper.pdf
-    visible: /home/han/Documents/paper.pdf → /home/bubbler/Documents/paper.pdf
+    visible: /home/user/Documents/paper.pdf → /home/bubbler/Documents/paper.pdf
 
 Every rule here is applied to the file the path ends at rather than to the
 name. A symlink argument means the file it points at — that is what handing

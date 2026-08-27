@@ -1374,9 +1374,9 @@ mod tests {
 
     fn env() -> Env {
         Env {
-            home: "/home/han".into(),
-            data_home: "/home/han/.local/share".into(),
-            config_home: "/home/han/.config".into(),
+            home: "/home/user".into(),
+            data_home: "/home/user/.local/share".into(),
+            config_home: "/home/user/.config".into(),
             data_dirs: crate::env::DEFAULT_DATA_DIRS
                 .iter()
                 .map(PathBuf::from)
@@ -1835,14 +1835,17 @@ mod tests {
         let a = argv(
             &[Service::X11(X11Mode::Host)],
             &e,
-            &[("/tmp/.X11-unix/X0", Sock), ("/home/han/.Xauthority", File)],
+            &[
+                ("/tmp/.X11-unix/X0", Sock),
+                ("/home/user/.Xauthority", File),
+            ],
         )
         .unwrap();
         assert!(has_seq(
             &a,
             &[
                 "--ro-bind",
-                "/home/han/.Xauthority",
+                "/home/user/.Xauthority",
                 "/home/bubbler/.Xauthority"
             ]
         ));
@@ -1866,11 +1869,11 @@ mod tests {
         let a = argv(
             &[Service::X11(X11Mode::Host)],
             &e,
-            &[("/tmp/.X11-unix/X0", Sock), ("/home/han/.Xauthority", Dir)],
+            &[("/tmp/.X11-unix/X0", Sock), ("/home/user/.Xauthority", Dir)],
         )
         .unwrap();
         assert!(!a.contains(&"XAUTHORITY".to_string()));
-        assert!(!a.contains(&"/home/han/.Xauthority".to_string()));
+        assert!(!a.contains(&"/home/user/.Xauthority".to_string()));
     }
 
     #[test]
@@ -2128,20 +2131,27 @@ mod tests {
         let a = argv(
             &svcs,
             &env(),
-            &[("/home/han/Downloads", Dir), ("/home/han/Projects/x", Dir)],
+            &[
+                ("/home/user/Downloads", Dir),
+                ("/home/user/Projects/x", Dir),
+            ],
         )
         .unwrap();
         assert!(has_seq(
             &a,
             &[
                 "--ro-bind",
-                "/home/han/Downloads",
+                "/home/user/Downloads",
                 "/home/bubbler/Downloads"
             ]
         ));
         assert!(has_seq(
             &a,
-            &["--bind", "/home/han/Projects/x", "/home/bubbler/Projects/x"]
+            &[
+                "--bind",
+                "/home/user/Projects/x",
+                "/home/bubbler/Projects/x"
+            ]
         ));
     }
 
@@ -2151,12 +2161,12 @@ mod tests {
             path: "notes.txt".into(),
             mode: ShareMode::ReadOnly,
         }];
-        let a = argv(&svcs, &env(), &[("/home/han/notes.txt", File)]).unwrap();
+        let a = argv(&svcs, &env(), &[("/home/user/notes.txt", File)]).unwrap();
         assert!(has_seq(
             &a,
             &[
                 "--ro-bind",
-                "/home/han/notes.txt",
+                "/home/user/notes.txt",
                 "/home/bubbler/notes.txt"
             ]
         ));
@@ -2186,8 +2196,8 @@ mod tests {
         let r = argv_linked(
             &svcs,
             &env(),
-            &[("/home/han/RootLink", Dir), ("/", Dir)],
-            &[("/home/han/RootLink", "/")],
+            &[("/home/user/RootLink", Dir), ("/", Dir)],
+            &[("/home/user/RootLink", "/")],
         );
         assert!(
             matches!(&r, Err(LaunchError::BadValue { service: "home-share", reason }) if reason.contains("outside the home directory")),
@@ -2204,13 +2214,13 @@ mod tests {
         let a = argv_linked(
             &svcs,
             &env(),
-            &[("/home/han/Downloads", Dir), ("/home/han/dl", Dir)],
-            &[("/home/han/Downloads", "/home/han/dl")],
+            &[("/home/user/Downloads", Dir), ("/home/user/dl", Dir)],
+            &[("/home/user/Downloads", "/home/user/dl")],
         )
         .unwrap();
         assert!(has_seq(
             &a,
-            &["--ro-bind", "/home/han/dl", "/home/bubbler/Downloads"]
+            &["--ro-bind", "/home/user/dl", "/home/bubbler/Downloads"]
         ));
     }
 
@@ -2221,7 +2231,7 @@ mod tests {
             mode: ShareMode::ReadOnly,
         }];
         let (_, dir, _) = fake::types();
-        let host = FakeHost::default().with("/home/han/Downloads", dir);
+        let host = FakeHost::default().with("/home/user/Downloads", dir);
         struct NoHome(FakeHost);
         impl Host for NoHome {
             fn file_type(&self, p: &Path) -> Option<FileType> {
@@ -2622,10 +2632,10 @@ mod tests {
             ("/usr/share", "/usr"),
             ("/opt", "/opt"),
             ("/opt/thing", "/opt"),
-            ("/home", "/home/han"),
+            ("/home", "/home/user"),
             ("/home/other", "/home"),
-            ("/home/han", "/home/han"),
-            ("/home/han/Downloads", "/home/han"),
+            ("/home/user", "/home/user"),
+            ("/home/user/Downloads", "/home/user"),
             ("/tmp", "/tmp"),
             ("/tmp/x", "/tmp"),
             ("/var", "/var"),
@@ -2661,7 +2671,7 @@ mod tests {
                 &[share(path, ShareMode::ReadWrite)],
                 &env(),
                 &[(path, Dir)],
-                &[("/home/han/.local/share/bubbler", "/kioxia/bubbler")],
+                &[("/home/user/.local/share/bubbler", "/kioxia/bubbler")],
             );
             assert!(
                 matches!(&r, Err(LaunchError::BadValue { service: "path-share", reason })
@@ -2773,7 +2783,7 @@ mod tests {
     #[test]
     fn path_share_refuses_the_profile_layer_under_a_relocated_config_home() {
         let mut e = env();
-        // Outside the home, so `/home/han` is not what stops these.
+        // Outside the home, so `/home/user` is not what stops these.
         e.config_home = "/kioxia/cfg".into();
         let cases: &[(&str, Kind)] = &[
             ("/kioxia", Dir),
@@ -2859,7 +2869,7 @@ mod tests {
         // The hook lifts the fixed roots for `/home`, so what is left to
         // refuse these is the destination check itself.
         e.test_allow_path = Some("/home".into());
-        for dst in ["/home/bubbler/x", "/home/han/x"] {
+        for dst in ["/home/bubbler/x", "/home/user/x"] {
             let r = argv_linked(
                 &[share(dst, ShareMode::ReadWrite)],
                 &e,
@@ -2965,8 +2975,8 @@ mod tests {
                 name: "escape".into(),
             }],
             &env(),
-            &[("/etc/escape", Dir), ("/home/han", Dir)],
-            &[("/etc/escape", "/home/han")],
+            &[("/etc/escape", Dir), ("/home/user", Dir)],
+            &[("/etc/escape", "/home/user")],
         );
         assert!(
             matches!(&r, Err(LaunchError::BadValue { service: "etc-share", reason }) if reason.contains("outside")),
