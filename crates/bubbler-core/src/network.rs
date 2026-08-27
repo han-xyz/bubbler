@@ -538,8 +538,12 @@ impl Cgroup {
     /// would start a second rule, in a process holding `CAP_NET_ADMIN`
     /// over the sandbox's namespaces. Everything a systemd unit name
     /// holds passes — `user@1000.service` is where a user session's
-    /// delegated subtree lives, and `@`, `:` and `+` are ordinary
-    /// characters in one.
+    /// delegated subtree lives, `@`, `:` and `+` are ordinary characters
+    /// in one, and a `-` in a name arrives escaped as `\x2d`. Measured:
+    /// nft resolves such a path as written and fails to resolve it with
+    /// the backslash doubled, and a trailing `\` does not escape the
+    /// closing quote, so passing them through is both necessary and
+    /// safe.
     pub fn new(path: &str) -> Result<Self, String> {
         if path.is_empty() {
             return Err("a cgroup path is not empty".to_owned());
@@ -552,7 +556,6 @@ impl Cgroup {
         }
         if let Some(what) = path.bytes().find_map(|b| match b {
             b'"' => Some("a quote"),
-            b'\\' => Some("a backslash"),
             b if b.is_ascii_whitespace() => Some("whitespace"),
             b if b.is_ascii_control() => Some("a control byte"),
             b if !b.is_ascii() => Some("a byte outside ASCII"),
@@ -1570,8 +1573,23 @@ mod tests {
             "socket cgroupv2 level 5 \
              \"user.slice/user-1000.slice/user@1000.service/app.slice/bubbler-t-1\""
         );
-        // Everything a unit name may hold is a directory name here.
-        for ok in ["a", "a/b", "system.slice/dbus:name+more@1.service"] {
+        // Everything a unit name may hold is a directory name here,
+        // systemd's `\xNN` escape for a `-` among it: a scope started
+        // from `xfce4-terminal` is named that way, and nft resolves the
+        // path with the backslash as written.
+        let escaped =
+            "user.slice/user@1000.service/app.slice/app-dbus\\x2d:1.21\\x2dorg.a11y.slice";
+        assert_eq!(
+            Cgroup::new(escaped).unwrap().to_string(),
+            format!("socket cgroupv2 level 4 \"{escaped}\"")
+        );
+        for ok in [
+            "a",
+            "a/b",
+            "a\\b",
+            "system.slice/dbus:name+more@1.service",
+            "system.slice/system-gpg\\x2dagent.slice",
+        ] {
             assert!(Cgroup::new(ok).is_ok(), "{ok}");
         }
         // A `"` would end the quoted path and a `;` after it would start
@@ -1587,7 +1605,6 @@ mod tests {
             "a/../b",
             "a/./b",
             "a\"b",
-            "a\\b",
             "a b",
             "a\tb",
             "a\nb",
