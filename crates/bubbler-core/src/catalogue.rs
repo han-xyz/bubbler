@@ -171,7 +171,9 @@ pub static GRANTS: &[Grant] = &[
         cost: "The source must resolve inside your home and is bound read-only unless \
                `mode=rw`, which lets the sandbox change what it was shown. A directory \
                holding another application's state (`.config`, `.local/share`) is that \
-               application's data, and the linter says so.",
+               application's data, and the linter says so. bubbler's own directories — \
+               the instance store, the profile layer — are refused on both ends, as for \
+               `path-share`.",
         risk: Risk::Wide,
         grammar: "home-share \"<path under $HOME>\" [mode=ro|rw]",
     },

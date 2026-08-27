@@ -1059,9 +1059,11 @@ fn path_shares<'a>(
 
 /// Bind `$HOME/<path>` to `/home/bubbler/<path>`. The host path must exist,
 /// may be of any type and must resolve inside the real home; bubbler never
-/// creates directories in the real home. Resolving and binding both happen
-/// by path, so a symlink swapped in between the two is not detected; that
-/// is inherent to bwrap path binds.
+/// creates directories in the real home. The roots bubbler keeps inside
+/// the home — the instance store and the profile layer — are refused in
+/// both modes, as they are for `path-share` and `--share`. Resolving and
+/// binding both happen by path, so a symlink swapped in between the two
+/// is not detected; that is inherent to bwrap path binds.
 fn home_share(
     env: &Env,
     args: &mut BwrapArgs,
@@ -1069,14 +1071,16 @@ fn home_share(
     rel: &Path,
     mode: ShareMode,
 ) -> Result<(), LaunchError> {
+    let written = env.home.join(rel);
     let src = confine(
         host,
         "home-share",
         &env.home,
-        &env.home.join(rel),
+        &written,
         "the home directory",
     )?;
     let dst = Path::new(SANDBOX_HOME).join(rel);
+    deny_reserved_in_home(host, env, "home-share", &written, &src, &dst)?;
     match mode {
         ShareMode::ReadOnly => args.ro_bind(&src, &dst),
         ShareMode::ReadWrite => args.bind(&src, &dst),
@@ -1270,12 +1274,7 @@ fn share_paths(
         let src = confine(host, "--share", &env.home, written, "the home directory")?;
         let src = require_dir_or_file(host, "--share", src)?;
         let dst = Path::new(SANDBOX_HOME).join(rel);
-        if let Some((root, end)) = denied_root_in_home(host, env, &src, &dst) {
-            return Err(LaunchError::BadValue {
-                service: "--share",
-                reason: denied_reason(written, &src, &root, end),
-            });
-        }
+        deny_reserved_in_home(host, env, "--share", written, &src, &dst)?;
         return Ok((src, dst));
     }
     let src = resolve_source(host, "--share", written, require_dir_or_file)?;
@@ -1286,6 +1285,42 @@ fn share_paths(
         });
     }
     Ok((src, written.components().collect()))
+}
+
+/// Refuse a share that maps into the private home and meets one of the
+/// roots bubbler keeps for itself there. `home-share` and a `--share` of
+/// a path under the real home land in the same place and are held to the
+/// same roots, so both come through here; `written` is the host path the
+/// entry names, which is what the message quotes back.
+fn deny_reserved_in_home(
+    host: &dyn Host,
+    env: &Env,
+    service: &'static str,
+    written: &Path,
+    src: &Path,
+    dst: &Path,
+) -> Result<(), LaunchError> {
+    match denied_root_in_home(host, env, src, dst) {
+        Some((root, end)) => Err(LaunchError::BadValue {
+            service,
+            reason: denied_reason(written, src, &root, end),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Why `home-share "<rel>"` would be refused for meeting one of the
+/// roots bubbler keeps inside the home, if it would. The launcher raises
+/// the same sentence as an error when it builds the argv; the linter
+/// reports it against the node, on a source that need not exist yet.
+pub(crate) fn reserved_in_home_reason(host: &dyn Host, env: &Env, rel: &Path) -> Option<String> {
+    let written = env.home.join(rel);
+    let src = host
+        .canonicalize(&written)
+        .unwrap_or_else(|| written.clone());
+    let dst = Path::new(SANDBOX_HOME).join(rel);
+    let (root, end) = denied_root_in_home(host, env, &src, &dst)?;
+    Some(denied_reason(&written, &src, &root, end))
 }
 
 /// The reserved root a share that maps into the private home meets.
@@ -2264,6 +2299,83 @@ mod tests {
     /// The home of [`env`], as a test writes host paths out.
     fn home(rel: &str) -> String {
         env().home.join(rel).to_string_lossy().into_owned()
+    }
+
+    /// The instance store is bubbler's own directory: read-write the
+    /// sandbox rewrites the `config.kdl` it was launched from and grants
+    /// itself anything on the next run, and read-only it reads every
+    /// other instance's config and private home. Both modes are refused,
+    /// as they are for `path-share` and `--share`.
+    #[test]
+    fn home_share_of_the_instance_store_is_refused() {
+        let store = home(".local/share/bubbler");
+        for mode in [ShareMode::ReadWrite, ShareMode::ReadOnly] {
+            let svcs = [Service::HomeShare {
+                path: ".local/share/bubbler".into(),
+                mode,
+            }];
+            let e = argv(&svcs, &env(), &[(&store, Dir)]).unwrap_err();
+            assert!(
+                matches!(&e, LaunchError::BadValue { service: "home-share", reason }
+                    if reason == &format!("bubbler never shares {store}")),
+                "{mode:?}: {e}"
+            );
+        }
+    }
+
+    /// The user's profile layer, for the same reason: a sandbox that can
+    /// write a profile there writes the config of every instance seeded
+    /// from it afterwards.
+    #[test]
+    fn home_share_of_the_profile_layer_is_refused() {
+        let layer = home(".config/bubbler");
+        let svcs = [Service::HomeShare {
+            path: ".config/bubbler".into(),
+            mode: ShareMode::ReadOnly,
+        }];
+        let e = argv(&svcs, &env(), &[(&layer, Dir)]).unwrap_err();
+        assert!(
+            matches!(&e, LaunchError::BadValue { service: "home-share", reason }
+                if reason == &format!("bubbler never shares {layer}")),
+            "{e}"
+        );
+    }
+
+    /// An ancestor is refused with them: a bind of `.local/share` covers
+    /// the store under it, so the share reaches it either way.
+    #[test]
+    fn home_share_of_an_ancestor_of_the_instance_store_is_refused() {
+        let above = home(".local/share");
+        let store = home(".local/share/bubbler");
+        let svcs = [Service::HomeShare {
+            path: ".local/share".into(),
+            mode: ShareMode::ReadOnly,
+        }];
+        let e = argv(&svcs, &env(), &[(&above, Dir)]).unwrap_err();
+        assert!(
+            matches!(&e, LaunchError::BadValue { service: "home-share", reason }
+                if reason == &format!("bubbler never shares {above}, which overlaps {store}")),
+            "{e}"
+        );
+    }
+
+    /// A directory beside the store is nothing of bubbler's, and the
+    /// check does not widen to the parent it shares with it.
+    #[test]
+    fn home_share_beside_the_instance_store_still_binds() {
+        let other = home(".local/share/Other");
+        let svcs = [Service::HomeShare {
+            path: ".local/share/Other".into(),
+            mode: ShareMode::ReadOnly,
+        }];
+        let a = argv(&svcs, &env(), &[(&other, Dir)]).unwrap();
+        assert!(
+            has_seq(
+                &a,
+                &["--ro-bind", &other, "/home/bubbler/.local/share/Other"]
+            ),
+            "{a:?}"
+        );
     }
 
     #[test]

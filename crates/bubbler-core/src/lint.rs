@@ -97,6 +97,13 @@ const ENV_LOOKS_SECRET: Check = Check {
     id: "env-looks-secret",
     severity: Severity::Warning,
 };
+// An error, not a warning: what it names, the launcher refuses. A
+// `home-share` of the instance store or the profile layer would hand the
+// sandbox the files bubbler builds it out of.
+const HOME_SHARE_RESERVED: Check = Check {
+    id: "home-share-reserved",
+    severity: Severity::Error,
+};
 const HOME_SHARE_SENSITIVE: Check = Check {
     id: "home-share-sensitive",
     severity: Severity::Warning,
@@ -210,6 +217,7 @@ pub const CHECKS: &[Check] = &[
     DESKTOP_ENTRY_MISSING,
     DUP_NAME_POLICY,
     ENV_LOOKS_SECRET,
+    HOME_SHARE_RESERVED,
     HOME_SHARE_SENSITIVE,
     LINT_ALLOW_UNUSED,
     MPRIS_WILDCARD,
@@ -1043,6 +1051,16 @@ fn home_share(ctx: &Context, i: usize, node: &KdlNode, f: &mut Findings) {
     let Some(path) = arg(node) else {
         return;
     };
+    if let Some(reason) = service::reserved_in_home_reason(ctx.host, ctx.env, Path::new(path)) {
+        f.push(
+            i,
+            node,
+            &HOME_SHARE_RESERVED,
+            reason,
+            "name a directory of your own; the launcher refuses this one, which is \
+             bubbler's own state and what every instance is built out of",
+        );
+    }
     let sensitive = SENSITIVE_TREE
         .iter()
         .find(|s| Path::new(path).starts_with(s))
@@ -1943,9 +1961,11 @@ mod tests {
                 ids(&lint(ctx, &["home-share \".ssh\""])),
                 ["home-share-sensitive"]
             );
+            // `.local/share` holds the instance store, which the
+            // launcher refuses before it is sensitive.
             assert_eq!(
                 ids(&lint(ctx, &["home-share \".local/share\""])),
-                ["home-share-sensitive"]
+                ["home-share-reserved", "home-share-sensitive"]
             );
             // A tree of keys is sensitive one directory at a time; the
             // directories that hold every application's state are not,
@@ -1959,6 +1979,57 @@ mod tests {
             );
             assert_eq!(
                 ids(&lint(ctx, &["home-share \"Downloads\" mode=rw"])),
+                [] as [&str; 0]
+            );
+        });
+    }
+
+    /// bubbler's own directories under the home are refused by the
+    /// launcher, so the linter names them against the node rather than
+    /// letting the run be the first to say so.
+    #[test]
+    fn home_share_reserved_fires_on_the_store_the_layer_and_their_ancestors() {
+        let (_, dir, _) = fake::types();
+        let host = host()
+            .with("/home/user/.local/share", dir)
+            .with("/home/user/.local/share/bubbler", dir)
+            .with("/home/user/.config/bubbler", dir);
+        with(&host, |ctx| {
+            let report = lint(ctx, &["home-share \".local/share/bubbler\" mode=rw"]);
+            assert_eq!(ids(&report), ["home-share-reserved"]);
+            assert_eq!(report.findings[0].severity, Severity::Error);
+            assert!(
+                report.findings[0]
+                    .message
+                    .contains("bubbler never shares /home/user/.local/share/bubbler"),
+                "{report:?}"
+            );
+            assert_eq!(
+                ids(&lint(ctx, &["home-share \".config/bubbler\""])),
+                ["home-share-reserved"]
+            );
+            assert_eq!(
+                ids(&lint(ctx, &["home-share \".local/share\""])),
+                ["home-share-reserved", "home-share-sensitive"]
+            );
+        });
+    }
+
+    /// A directory beside the store is not the store: the check names
+    /// the roots themselves and what contains them, nothing wider.
+    #[test]
+    fn home_share_beside_the_instance_store_is_no_finding() {
+        let (_, dir, _) = fake::types();
+        let host = host()
+            .with("/home/user/.local/share/Other", dir)
+            .with("/home/user/.config/app", dir);
+        with(&host, |ctx| {
+            assert_eq!(
+                ids(&lint(ctx, &["home-share \".local/share/Other\" mode=rw"])),
+                [] as [&str; 0]
+            );
+            assert_eq!(
+                ids(&lint(ctx, &["home-share \".config/app\""])),
                 [] as [&str; 0]
             );
         });

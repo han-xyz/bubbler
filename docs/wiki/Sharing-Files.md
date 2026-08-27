@@ -91,6 +91,11 @@ home-share "Projects/x" mode=rw
   `mode=rw` spelled out, so a share's width is read off the line.
 - One path once, whatever the modes (`"D"` and `"D" mode=rw` together is an
   error). `"D"` beside `"D/sub"` is fine.
+- Refused in either mode, naming the root: the instance store
+  (`~/.local/share/bubbler`), your profile layer (`~/.config/bubbler`) and
+  anything containing one (`.local/share`), as written and as resolved — the
+  same roots `path-share` and `--share` refuse, for the same reason. Lint
+  reports it as `home-share-reserved`, an error.
 - Lint warns on `.ssh`, `.gnupg`, `.pki`, `.password-store`,
   `.local/share/keyrings`, `.mozilla`, and on `.config`, `.local`, `.cache` whole.
 

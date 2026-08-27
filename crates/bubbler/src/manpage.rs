@@ -278,6 +278,11 @@ const CHECK_LINES: &[(&str, &str)] = &[
         "An `env` name or value that looks like a credential, in a file people share.",
     ),
     (
+        "home-share-reserved",
+        "A `home-share` of a directory bubbler builds the sandbox out of — the instance \
+         store or the profile layer — or of one holding it; the launcher refuses it.",
+    ),
+    (
         "home-share-sensitive",
         "A `home-share` of a directory holding your keys, sessions or another \
          application's configuration.",

@@ -1548,6 +1548,57 @@ fn path_share_of_a_symlinked_home_or_data_dir_is_refused() {
     }
 }
 
+/// With XDG pointing inside the home, bubbler's own directories are
+/// reachable by a relative path: a `home-share` of the instance store
+/// would bind the `config.kdl` the run reads back into the sandbox. The
+/// launcher refuses it and the linter names it.
+#[test]
+fn home_share_of_the_instance_store_is_refused_and_linted() {
+    let tmp = setup();
+    let data = tmp.path().join("home/.local/share");
+    std::fs::create_dir_all(&data).unwrap();
+    let cmd = || {
+        let mut c = bubbler(tmp.path());
+        c.env("XDG_DATA_HOME", &data);
+        c
+    };
+    let out = cmd().args(["create", "t"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cfg = data.join("bubbler/instances/t/config.kdl");
+    std::fs::write(
+        &cfg,
+        "home-share \".local/share/bubbler\" mode=rw\ncommand \"true\"\n",
+    )
+    .unwrap();
+
+    let out = cmd().args(["run", "t", "--dry-run"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("home-share"), "{err}");
+    assert!(
+        err.contains(&format!(
+            "bubbler never shares {}",
+            data.join("bubbler").display()
+        )),
+        "{err}"
+    );
+
+    let out = cmd().args(["lint", "t"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains(&format!(
+            "{}:1:1: error[home-share-reserved]",
+            cfg.display()
+        )),
+        "{text}"
+    );
+}
+
 #[test]
 fn test_allow_path_must_be_an_absolute_path_below_the_root() {
     let tmp = setup();

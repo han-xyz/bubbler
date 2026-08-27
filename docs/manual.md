@@ -456,7 +456,14 @@ missing one is an error rather than a silently weaker sandbox. That covers
 `home-share` too, so the `firefox` profile needs a `~/Downloads` and `lutris`
 a `~/Games`. A `home-share` source is resolved before it is bound and must
 stay inside your home directory: a symlink pointing elsewhere is refused, not
-followed. One home path may be shared once, whatever the modes, so
+followed. The directories bubbler builds the sandbox out of are refused
+there as well, read-only as much as read-write: the instance store
+(`~/.local/share/bubbler`), your profile layer (`~/.config/bubbler`), and any
+path containing one (`home-share ".local/share"` covers the store) — a sandbox
+that can write a `config.kdl` or a profile grants itself anything on the next
+run, and one that can only read them reads every other instance's config and
+private home. The linter reports the same thing as `home-share-reserved`.
+One home path may be shared once, whatever the modes, so
 `home-share "D"` beside `home-share "D" mode=rw` is an error rather than a
 share whose width depends on which line came first; a share below another
 (`"D"` and `"D/sub"`) names a different path and stays allowed. `mode=` is
@@ -2355,7 +2362,9 @@ is deliberately a different code from "grants too much".
 **Errors** say the file will not do what it says: `bundle-without-dbus` (a
 `portals`/`notify`/`tray`/`mpris`/`a11y`/`input-method` grant no layer gives a
 `dbus` to carry), `path-share-reserved` (a root bubbler never shares),
-`dup-name-policy` (one bus name given two policies by two layers),
+`home-share-reserved` (the instance store, the profile layer, or a path
+holding one), `dup-name-policy` (one bus name given two policies by two
+layers),
 `own-on-system-bus`, `camera-without-portals` (a `camera` grant no layer gives
 a `portals` to carry, so the portal reads the sandbox as an ordinary process
 of yours).

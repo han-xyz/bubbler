@@ -103,9 +103,12 @@ separation is deliberately given up:
   anything on that instance's next run. `$XDG_CONFIG_HOME/bubbler`, where
   your own profile layer lives, is the same break one seeding later: a
   profile written there is the config of every instance created from it.
-  That is why the denylist exists, why it compares the roots your
-  environment names both as written and as resolved, and why the
-  `$BUBBLER_TEST_ALLOW_PATH` hook cannot lift them.
+  That is why the denylist exists, why every share is held to it —
+  `path-share`, `--share` and `home-share`, which reaches those roots by
+  a relative path whenever XDG puts them under your home — why it
+  compares the roots your environment names both as written and as
+  resolved, and why the `$BUBBLER_TEST_ALLOW_PATH` hook cannot lift
+  them.
 - `/etc/machine-id` is bound in, so every instance shares one stable
   identifier with the host.
 
@@ -772,7 +775,10 @@ contain one of the roots the sandbox is built out of — including your
 home, `$XDG_RUNTIME_DIR` and the instance store, each compared as written
 *and* as resolved so a symlinked home cannot be shared under its real
 name. Overlapping shares are refused so that bind order stays irrelevant.
-`home-share` and `etc-share` refuse a symlink that leaves their own tree.
+`home-share` and `etc-share` refuse a symlink that leaves their own tree,
+and a `home-share` — like a `--share` under your home — is held to the
+roots that live *inside* it: the instance store, your profile layer, and
+any path containing one, read-only as much as read-write.
 
 **Does not defend:** TOCTOU. bwrap resolves the path again when it binds,
 so between bubbler's check and that bind the tree can change; on a
@@ -787,6 +793,11 @@ under the name you wrote.
 `path_share_refuses_a_destination_on_a_reserved_root`,
 `path_share_of_a_symlinked_home_or_data_dir_is_refused`,
 `home_share_through_a_symlink_out_of_the_home_is_refused`,
+`home_share_of_the_instance_store_is_refused`,
+`home_share_of_the_profile_layer_is_refused`,
+`home_share_of_an_ancestor_of_the_instance_store_is_refused`,
+`home_share_reserved_fires_on_the_store_the_layer_and_their_ancestors`,
+`home_share_of_the_instance_store_is_refused_and_linted`,
 `etc_share_through_a_symlink_out_of_etc_is_refused`
 
 ### File arguments
