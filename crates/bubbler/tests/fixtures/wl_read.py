@@ -61,6 +61,9 @@ OLD_PYTHON = "OLD_PYTHON"
 #: So the wait is short and bounded, and a refusal costs it once.
 RETRIES, RETRY_PATIENCE = 2, 1.0
 
+#: `xdg_toplevel.state.activated`: the window has keyboard focus.
+ACTIVATED = 4
+
 
 def string(text):
     """One length-prefixed, NUL-terminated, four-byte-padded wire string."""
@@ -89,6 +92,14 @@ class Client:
         self.offer = None
         self.mimes = []
         self.configured = False
+        #: What the compositor said about keyboard focus, through the
+        #: `activated` state of `xdg_toplevel.configure`: `never` while it
+        #: has not given this window focus, `held` once it has, `lost` when
+        #: a later configure took it away. A window a compositor never
+        #: focused is never offered the selection, and one it took focus
+        #: from mid-read gets an empty read — neither says anything about
+        #: the proxy, so the tests read this line to tell them apart.
+        self.focus = "never"
         self.pressed = False
         # Filled in by `data_device`: the two protocols spell the same
         # three messages at different opcodes.
@@ -149,6 +160,13 @@ class Client:
         elif role == "xdg_surface" and opcode == 0:
             self.send(oid, 4, body[:4])
             self.configured = True
+        elif role == "xdg_toplevel" and opcode == 0:
+            count = struct.unpack("<I", body[8:12])[0] // 4
+            states = struct.unpack(f"<{count}I", body[12 : 12 + count * 4])
+            if ACTIVATED in states:
+                self.focus = "held"
+            elif self.focus == "held":
+                self.focus = "lost"
         elif role == "device" and opcode == self.offer_event:
             self.role[struct.unpack("<I", body[:4])[0]] = "offer"
             self.mimes = []
@@ -237,6 +255,7 @@ class Client:
         self.role[xdg] = "xdg_surface"
         self.send(shell, 2, struct.pack("<II", xdg, surface))
         toplevel = self.next_id()
+        self.role[toplevel] = "xdg_toplevel"
         self.send(xdg, 1, struct.pack("<I", toplevel))
         self.send(toplevel, 2, string(title))
         self.send(surface, 6)
@@ -310,6 +329,7 @@ def main(args):
         if "--no-window" not in args:
             client.map_window(option(args, "title", TITLE))
     if not client.until(lambda: client.offer is not None):
+        print("focus:", client.focus, file=sys.stderr, flush=True)
         print("NO_OFFER")
         return 0
     print("offered:", " ".join(client.mimes), file=sys.stderr, flush=True)
@@ -324,6 +344,7 @@ def main(args):
         read = client.read_selection(mime)
     if retried:
         print("retried:", retried, file=sys.stderr, flush=True)
+    print("focus:", client.focus, file=sys.stderr, flush=True)
     print(read)
     return 0
 

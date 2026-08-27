@@ -4599,6 +4599,15 @@ fn selection_verdict(printed: &str, log: &str) -> Option<String> {
         say("skipping: the sandbox's python is older than 3.9");
         return None;
     }
+    // The compositor offers the selection to the client holding keyboard
+    // focus and to no other, so a window it never focused — the user's own
+    // window kept it, on a desktop in use — was offered nothing for a
+    // reason that says nothing about the proxy; the same for an empty read
+    // after the focus moved away mid-test. The fixture reports both.
+    if log.contains("focus: never") || (printed == "0" && log.contains("focus: lost")) {
+        say("skipping: the compositor kept keyboard focus on another window");
+        return None;
+    }
     if printed != "NO_OFFER" {
         return Some(printed.to_owned());
     }
