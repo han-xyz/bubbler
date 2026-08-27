@@ -1,15 +1,19 @@
 // bubbler profile: agent
 //
 // A command-line AI agent with no profile of its own. The sandbox has
-// the network and nothing else; add the tool and the work:
+// the network and nothing else; add the tool and the work to the
+// instance's config:
 //
 //   home-share ".local/bin/<tool>" mode=ro
 //     — the binary, read-only; a symlink is resolved on the host. A tool
 //       under /usr needs no share at all.
 //   command "/home/bubbler/.local/bin/<tool>"
 //
-// and start it from the project, shared for that run only:
-//     cd <project> && bubbler run <instance> --share .
+// Create the instance once:
+//     bubbler create <instance> --profile agent
+// then, for every run, name the project and share it for that run only:
+//     cd <project>
+//     bubbler run <instance> --share .
 //
 // Credentials belong in the private home (`~/.config/<tool>` inside is
 // the instance's own), not in a share of the host's. Deliberately

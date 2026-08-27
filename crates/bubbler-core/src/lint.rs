@@ -1497,7 +1497,8 @@ fn is_nester(argv0: &str) -> bool {
 }
 
 /// Whether a `command` names a file this host has: the path itself when
-/// it holds a separator, else one of the `$PATH` directories.
+/// it holds a separator — under the sandbox's own home, the path it
+/// answers to on this host — else one of the `$PATH` directories.
 fn on_path(ctx: &Context, argv0: &str) -> bool {
     let path = Path::new(argv0);
     if path.components().count() > 1 {

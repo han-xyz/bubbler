@@ -7,8 +7,11 @@
 // read-only tree. Installed from a package instead (`/usr/bin/claude`),
 // drop both `home-share` nodes and write `command "claude"`.
 //
-// Start it from the project:
-//     cd <project> && bubbler run claude-code --share .
+// Create the instance once:
+//     bubbler create claude-code --profile claude-code
+// then, for every run, name the project and share it:
+//     cd <project>
+//     bubbler run claude-code --share .
 // The share is for that run only, and the sandbox starts in it.
 //
 // The private home holds its own `~/.claude`: log in once inside

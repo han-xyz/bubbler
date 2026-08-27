@@ -75,8 +75,8 @@ Reference: [Configuration](docs/wiki/Configuration.md).
 
 ## Profiles
 
-    alacritty  chromium  code  firefox  generic  keepassxc  kitty
-    libreoffice  lutris  mpv  spotify  steam  thunderbird  vesktop
+    agent  alacritty  chromium  claude-code  code  firefox  generic  keepassxc
+    kitty  libreoffice  lutris  mpv  spotify  steam  thunderbird  vesktop
 
 Each ships what its application needs to *run* and nothing else; everything it
 can also be given — a tray icon, notifications, media keys, screen sharing, a
