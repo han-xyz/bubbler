@@ -8501,19 +8501,21 @@ for name, argv in [('nft-list:', ['list', 'ruleset']), ('nft-flush:', ['flush', 
     print(name, done.stderr.replace('\\n', ' ').strip(), flush=True)
 ";
 
-/// The six probes a sandbox with an `allow-host` answers from inside.
+/// The probes a sandbox with an `allow-host` answers from inside.
 const CONNECT_PROBE: &str = include_str!("fixtures/connect_probe.py");
 
 /// Egress by name, end to end: the proxy is the only way out, and only
 /// to the names the config lists.
 ///
-/// The listed name is `localhost` and the echo it resolves to runs
-/// inside the sandbox, because bubbler's pasta invocation
+/// Two of the listed names are there to be refused: `localhost`, which
+/// resolves inward and is not dialled, and `hijack.invalid`, which no
+/// resolver answers and which the application offers to answer itself
+/// through the NSS interposition a review measured. The relay proper
+/// needs a destination off this host — bubbler's pasta invocation
 /// (`--map-host-loopback none --map-guest-addr none`) leaves the sandbox
-/// no address of the host's to reach at all, and an unprivileged test
-/// cannot bind port 53 on the host to answer for a name of its own
-/// either. What that costs is only the cgroup accept rule, which the
-/// seventh probe covers where this host is online.
+/// no address of the host's to reach, and an unprivileged test cannot
+/// bind port 53 there to answer for a name of its own — so `egress`
+/// carries it where this host is online.
 #[test]
 fn real_allow_host_relays_a_listed_name_and_nothing_else() {
     if !require_egress() {
@@ -8531,6 +8533,7 @@ fn real_allow_host_relays_a_listed_name_and_nothing_else() {
         .unwrap();
     let mut cfg =
         format!("network {{\n    outbound \"deny\"\n    allow-host \"localhost\" port={echo}\n");
+    cfg.push_str(&format!("    allow-host \"hijack.invalid\" port={echo}\n"));
     if let Some(name) = routable {
         cfg.push_str(&format!("    allow-host \"{name}\"\n"));
     }
@@ -8556,9 +8559,9 @@ fn real_allow_host_relays_a_listed_name_and_nothing_else() {
             .unwrap_or_else(|| panic!("{name} missing from {got}{err}"))
             .to_owned()
     };
-    // 1. The listed name on the listed port: the proxy answers and the
-    //    bytes behind the blank line come back from the other end.
-    assert_eq!(line("relay"), "ok", "{got}{err}");
+    // 1. A listed name that resolves to the namespace's own loopback:
+    //    the proxy refuses to dial inward, whatever the name.
+    assert_eq!(line("inward"), "502", "{got}{err}");
     // 2-3. The allowlist and the method, judged before anything is
     //    dialled.
     assert_eq!(line("unlisted"), "403", "{got}{err}");
@@ -8579,6 +8582,17 @@ fn real_allow_host_relays_a_listed_name_and_nothing_else() {
     if routable.is_some() {
         assert_eq!(line("egress"), "ok", "{got}{err}");
     }
+    // 8. The interposition: the application answers NSS for a name no
+    //    resolver has and offers the proxy an address of its own. A
+    //    proxy resolving through `getaddrinfo` would take it and answer
+    //    `200`; this one carries its own DNS client and answers `502`.
+    //    `nss live` says the interposition really was answering, which
+    //    is what makes the refusal evidence rather than a coincidence.
+    println!("the interposition was {}", line("nss"));
+    assert_eq!(line("hijack"), "502", "{got}{err}");
+    // 9. Neither refusal was a relay that failed late: nothing ever
+    //    reached the echo the two names pointed at.
+    assert_eq!(line("echoed"), "0", "{got}{err}");
 }
 
 /// The escape a review measured against the first version of this
@@ -8691,6 +8705,10 @@ fn allow_host_explains_the_proxy_and_the_variables_without_running() {
          command \"/usr/bin/true\"\n",
     );
     let port = bubbler_core::network::PROXY_PORT;
+    // The resolver the proxy is told to ask, which is the one the
+    // ruleset opens port 53 to: an isolated namespace with no `dns`
+    // child resolves through pasta's forwarder.
+    let dns = bubbler_core::network::DNS_FORWARD;
 
     // The sandbox's own argv: the binary bound where the sidecar execs
     // it and the variables that point the application at it, exact.
@@ -8731,8 +8749,8 @@ fn allow_host_explains_the_proxy_and_the_variables_without_running() {
     assert!(text.contains("--setenv NODE_USE_ENV_PROXY 1"), "{text}");
     assert!(
         text.contains(&format!(
-            "sidecar: /run/bubbler-net-proxy --allow api.example:443 --port {port} \
-             --ready-fd <ready-fd> --log-fd 2"
+            "sidecar: /run/bubbler-net-proxy --allow api.example:443 \
+             --dns {dns} --port {port} --ready-fd <ready-fd> --log-fd 2"
         )),
         "{text}"
     );

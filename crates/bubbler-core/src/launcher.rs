@@ -1413,7 +1413,7 @@ fn install_rules(
             return Err(LaunchError::BadValue {
                 service: "network",
                 reason: "the ruleset an `allow-host` needs is written around the \
-                         sandbox's own cgroup, and none was made for this run"
+                         egress proxy's own cgroup, and none was made for this run"
                     .to_owned(),
             });
         }

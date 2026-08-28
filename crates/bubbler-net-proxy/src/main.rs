@@ -13,6 +13,11 @@
 //! sandbox is told it in an environment variable of bwrap's argv, which
 //! is fixed before the namespace this binds in exists. Names come from
 //! argv; the sandbox never gets to add one.
+//!
+//! The mount namespace it joins is the sandbox's, which is why names
+//! are resolved by [`dns`] against the `--dns` addresses and never by
+//! `getaddrinfo`: NSS inside that namespace is the application's to
+//! answer.
 
 // The library — the parser, the allowlist and the relay — forbids
 // `unsafe`. The binary cannot: taking over a descriptor the launcher
@@ -23,7 +28,7 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -34,12 +39,13 @@ use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
 
 use bubbler_net_proxy::allow::Allowlist;
 use bubbler_net_proxy::connect::{self, Status};
+use bubbler_net_proxy::dns;
 use bubbler_net_proxy::relay;
 
 /// The one usage line, so a grammar error always names the whole
 /// grammar.
 const USAGE: &str = "bubbler-net-proxy: usage: --allow NAME:PORT [--allow NAME:PORT ...] \
---port N --ready-fd N [--log-fd N]";
+--dns IP [--dns IP ...] --port N --ready-fd N [--log-fd N]";
 
 /// Tunnels one proxy carries at a time. Past this a connection is
 /// answered `503` and closed: a sandbox that opens sockets without
@@ -61,6 +67,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// bytes that came behind it, and every refusal. The relay does its own
 /// waiting; a peer that will not read is not owed a thread.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a refusal written from the accept loop may block. Short,
+/// because the thread it holds is the one that takes every other
+/// connection: a client that never reads its `503` must not be able to
+/// stop the proxy from accepting.
+const REFUSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How long to wait after an `accept` that failed for a reason of its
 /// own. Retrying at once would spin against whatever is exhausted, one
@@ -89,6 +101,9 @@ const READY: u8 = 1;
 struct Args {
     /// The `name:port` targets a tunnel may be opened to, as written.
     allow: Vec<String>,
+    /// The resolvers to ask, in order. The ruleset lets this process
+    /// reach them and lets the application reach nothing on port 53.
+    dns: Vec<IpAddr>,
     /// The loopback port to listen on, inside the namespace the
     /// launcher joined this process to.
     port: u16,
@@ -124,7 +139,12 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    match serve(list, args.port, args.ready_fd, &log) {
+    let dns: Vec<SocketAddr> = args
+        .dns
+        .iter()
+        .map(|ip| SocketAddr::new(*ip, dns::PORT))
+        .collect();
+    match serve(list, dns, args.port, args.ready_fd, &log) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             log.line(&format!("stopped: {err}"));
@@ -135,30 +155,33 @@ fn main() -> ExitCode {
 
 /// Parse the grammar over any argv but this process's own.
 ///
-/// `--allow` repeats and must appear at least once — a proxy with an
-/// empty allowlist would answer `403` to everything, which is a
-/// launcher bug worth failing on. The other options appear once, and no
-/// two may name the same descriptor: a number adopted twice would be
-/// closed twice.
+/// `--allow` and `--dns` repeat and must each appear at least once — a
+/// proxy with an empty allowlist would answer `403` to everything and
+/// one with no resolver `502`, and both are launcher bugs worth failing
+/// on. The other options appear once, and no two may name the same
+/// descriptor: a number adopted twice would be closed twice.
 fn parse_from(mut it: impl Iterator<Item = OsString>) -> Option<Args> {
     let mut allow: Vec<String> = Vec::new();
+    let mut dns: Vec<IpAddr> = Vec::new();
     let mut port = None;
     let mut ready_fd = None;
     let mut log_fd = None;
     while let Some(word) = it.next() {
         match word.to_str() {
             Some("--allow") => allow.push(it.next()?.to_str()?.to_owned()),
+            Some("--dns") => dns.push(it.next()?.to_str()?.parse().ok()?),
             Some("--port") if port.is_none() => port = Some(listen_port(it.next()?)?),
             Some("--ready-fd") if ready_fd.is_none() => ready_fd = Some(number(it.next()?)?),
             Some("--log-fd") if log_fd.is_none() => log_fd = Some(number(it.next()?)?),
             _ => return None,
         }
     }
-    if allow.is_empty() {
+    if allow.is_empty() || dns.is_empty() {
         return None;
     }
     let args = Args {
         allow,
+        dns,
         port: port?,
         ready_fd: ready_fd?,
         log_fd,
@@ -195,7 +218,13 @@ fn number(word: OsString) -> Option<i32> {
 /// namespace is the sandbox's own and nothing else has run in it, so a
 /// port the launcher picked is free; a bind that fails anyway ends the
 /// process, and the launcher's wait ends with it.
-fn serve(list: Allowlist, port: u16, ready_fd: i32, log: &Arc<Log>) -> io::Result<()> {
+fn serve(
+    list: Allowlist,
+    dns: Vec<SocketAddr>,
+    port: u16,
+    ready_fd: i32,
+    log: &Arc<Log>,
+) -> io::Result<()> {
     let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
     let ready = adopt(ready_fd)?;
     File::from(ready).write_all(&[READY])?;
@@ -205,6 +234,7 @@ fn serve(list: Allowlist, port: u16, ready_fd: i32, log: &Arc<Log>) -> io::Resul
     ));
 
     let list = Arc::new(list);
+    let dns = Arc::new(dns);
     let live = Arc::new(AtomicUsize::new(0));
     loop {
         let client = match listener.accept() {
@@ -217,14 +247,15 @@ fn serve(list: Allowlist, port: u16, ready_fd: i32, log: &Arc<Log>) -> io::Resul
             }
         };
         if live.load(Ordering::SeqCst) >= MAX_TUNNELS {
-            refuse(client, Status::SERVICE_UNAVAILABLE, log);
+            refuse(client, Status::SERVICE_UNAVAILABLE, REFUSE_TIMEOUT, log);
             continue;
         }
         let held = Live::take(&live);
         let list = Arc::clone(&list);
+        let dns = Arc::clone(&dns);
         let thread_log = Arc::clone(log);
         let spawned = std::thread::Builder::new().spawn(move || {
-            tunnel(client, &list, &thread_log);
+            tunnel(client, &list, &dns, &thread_log);
             drop(held);
         });
         if let Err(err) = spawned {
@@ -252,7 +283,7 @@ impl Drop for Live {
 
 /// Serve one connection: read its request, judge it, and either relay
 /// or refuse.
-fn tunnel(mut client: TcpStream, list: &Allowlist, log: &Log) {
+fn tunnel(mut client: TcpStream, list: &Allowlist, dns: &[SocketAddr], log: &Log) {
     // One deadline for the whole header phase. A request arriving in
     // pieces is ordinary and must still be served; a request that never
     // ends must not be able to keep a slot by writing a byte now and
@@ -260,7 +291,7 @@ fn tunnel(mut client: TcpStream, list: &Allowlist, log: &Log) {
     let deadline = Instant::now() + HEADER_TIMEOUT;
     let (request, buffered) = match read_request(&mut client, deadline) {
         Ok(pair) => pair,
-        Err(Some(status)) => return refuse(client, status, log),
+        Err(Some(status)) => return refuse(client, status, WRITE_TIMEOUT, log),
         Err(None) => return,
     };
     if !list.matches(&request.host, request.port) {
@@ -268,16 +299,18 @@ fn tunnel(mut client: TcpStream, list: &Allowlist, log: &Log) {
             "denied {}:{}: no allow-host covers it",
             request.host, request.port
         ));
-        return refuse(client, Status::FORBIDDEN, log);
+        return refuse(client, Status::FORBIDDEN, WRITE_TIMEOUT, log);
     }
-    let upstream = match dial(&request.host, request.port, resolve) {
+    let upstream = match dial(&request.host, request.port, |host, port| {
+        dns::resolve_at(host, port, dns)
+    }) {
         Ok(upstream) => upstream,
         Err(status) => {
             log.line(&format!(
                 "{}:{} not reached: {status}",
                 request.host, request.port
             ));
-            return refuse(client, status, log);
+            return refuse(client, status, WRITE_TIMEOUT, log);
         }
     };
     if let Err(err) = open(&client, &upstream, &buffered) {
@@ -367,14 +400,6 @@ fn is_timeout(err: &io::Error) -> bool {
     )
 }
 
-/// What a name resolves to: `getaddrinfo`, which inside the sandbox's
-/// mount namespace reads the sandbox's own `/etc/resolv.conf`. The
-/// ruleset lets this process to that resolver and lets nothing else
-/// there.
-fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
-    (host, port).to_socket_addrs().map(Iterator::collect)
-}
-
 /// Open the upstream connection, or say why there is none.
 ///
 /// Addresses are tried in the order the resolver gave them, and the
@@ -382,13 +407,15 @@ fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
 /// thirty blackholed records must not hold a tunnel slot thirty times
 /// as long as one that answers with one.
 ///
-/// A link-local answer is skipped rather than dialled. Nothing else
-/// about the address is judged — what the sandbox may reach is decided
-/// by name, and the namespace routes nowhere the sandbox could not be
-/// granted with an `allow-out` — but `169.254.0.0/16` is where pasta's
-/// DNS forwarder sits, and an `allow-host` on port 53 whose name
-/// resolved there would hand the application back the resolver the
-/// ruleset took away from it.
+/// A loopback or link-local answer is skipped rather than dialled.
+/// Loopback inside this namespace is the sandbox's own, so a listed
+/// name that resolves there points the proxy at the application — or at
+/// the proxy itself, one tunnel slot per request. `169.254.0.0/16` is
+/// where pasta's DNS forwarder sits, and a listed name resolving there
+/// would hand the application back the resolver the ruleset took away
+/// from it. Nothing else about the address is judged: what the sandbox
+/// may reach is decided by the name its config granted, and the
+/// namespace routes nowhere an `allow-out` could not name.
 fn dial(
     host: &str,
     port: u16,
@@ -398,7 +425,7 @@ fn dial(
     let deadline = Instant::now() + CONNECT_TIMEOUT;
     let mut late = false;
     for addr in addrs {
-        if is_link_local(&addr.ip()) {
+        if is_inward(&addr.ip()) {
             continue;
         }
         let left = deadline.saturating_duration_since(Instant::now());
@@ -419,25 +446,29 @@ fn dial(
     })
 }
 
-/// Whether `ip` is link-local: `169.254.0.0/16` or `fe80::/10`.
+/// Whether `ip` points back inside the namespace rather than out of
+/// it: loopback (`127.0.0.0/8`, `::1`), the unspecified address, or
+/// link-local (`169.254.0.0/16`, `fe80::/10`).
 ///
-/// The IPv6 half is written out rather than taken from
+/// The IPv6 link-local half is written out rather than taken from
 /// `Ipv6Addr::is_unicast_link_local`, which the workspace's declared
 /// minimum toolchain need not have.
-fn is_link_local(ip: &IpAddr) -> bool {
+fn is_inward(ip: &IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => v4.is_link_local(),
-        IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 == 0xfe80,
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.is_unspecified() || v6.segments()[0] & 0xffc0 == 0xfe80
+        }
     }
 }
 
 /// Answer a request that will not be served and close the connection.
-fn refuse(mut client: TcpStream, status: Status, log: &Log) {
+fn refuse(mut client: TcpStream, status: Status, wait: Duration, log: &Log) {
     // One short line, but to a client that never reads it: the write
-    // must not be able to hold the thread it is on, which for a `503`
-    // is the accept loop itself.
+    // must not be able to hold the thread it is on, and for a `503`
+    // that thread is the accept loop, which gets the shorter budget.
     let written = client
-        .set_write_timeout(Some(WRITE_TIMEOUT))
+        .set_write_timeout(Some(wait))
         .and_then(|()| client.write_all(status.response().as_bytes()));
     if let Err(err) = written {
         log.line(&format!("{status} not delivered: {err}"));
@@ -569,6 +600,8 @@ mod tests {
     const MINIMAL: &[&str] = &[
         "--allow",
         "api.example:443",
+        "--dns",
+        "169.254.1.1",
         "--port",
         "3128",
         "--ready-fd",
@@ -581,6 +614,7 @@ mod tests {
             args(MINIMAL),
             Some(Args {
                 allow: vec!["api.example:443".to_owned()],
+                dns: vec![IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))],
                 port: 3128,
                 ready_fd: 3,
                 log_fd: None,
@@ -594,7 +628,14 @@ mod tests {
     #[test]
     fn a_proxy_that_was_told_no_port_is_a_usage_error() {
         assert_eq!(
-            args(&["--allow", "api.example:443", "--ready-fd", "3"]),
+            args(&[
+                "--allow",
+                "api.example:443",
+                "--dns",
+                "1.1.1.1",
+                "--ready-fd",
+                "3"
+            ]),
             None
         );
         for port in ["0", "65536", "-1", "http", "", "3128.0"] {
@@ -602,6 +643,8 @@ mod tests {
                 args(&[
                     "--allow",
                     "api.example:443",
+                    "--dns",
+                    "1.1.1.1",
                     "--port",
                     port,
                     "--ready-fd",
@@ -613,6 +656,54 @@ mod tests {
         }
     }
 
+    /// The proxy resolves names itself, so a run without a resolver
+    /// could answer nothing but `502`: the launcher passing none is a
+    /// bug, and an address that is no address is one too.
+    #[test]
+    fn a_proxy_with_no_resolver_is_a_usage_error() {
+        assert_eq!(
+            args(&[
+                "--allow",
+                "api.example:443",
+                "--port",
+                "3128",
+                "--ready-fd",
+                "3"
+            ]),
+            None
+        );
+        for server in ["", "localhost", "1.1.1.1:53", "1.1.1", "999.1.1.1"] {
+            assert_eq!(
+                args(&[
+                    "--allow",
+                    "api.example:443",
+                    "--dns",
+                    server,
+                    "--port",
+                    "3128",
+                    "--ready-fd",
+                    "3"
+                ]),
+                None,
+                "{server}"
+            );
+        }
+        let both = args(&[
+            "--allow",
+            "api.example:443",
+            "--dns",
+            "169.254.1.1",
+            "--dns",
+            "2606:4700:4700::1111",
+            "--port",
+            "3128",
+            "--ready-fd",
+            "3",
+        ])
+        .expect("two resolvers");
+        assert_eq!(both.dns.len(), 2);
+    }
+
     #[test]
     fn every_option_is_accepted_together_and_allow_repeats() {
         assert_eq!(
@@ -621,6 +712,8 @@ mod tests {
                 "api.example:443",
                 "--allow",
                 "*.cdn.example:8443",
+                "--dns",
+                "169.254.1.1",
                 "--port",
                 "3128",
                 "--ready-fd",
@@ -633,6 +726,7 @@ mod tests {
                     "api.example:443".to_owned(),
                     "*.cdn.example:8443".to_owned()
                 ],
+                dns: vec![IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))],
                 port: 3128,
                 ready_fd: 4,
                 log_fd: Some(2),
@@ -642,7 +736,10 @@ mod tests {
 
     #[test]
     fn a_proxy_with_nothing_to_allow_is_a_usage_error() {
-        assert_eq!(args(&["--port", "3128", "--ready-fd", "3"]), None);
+        assert_eq!(
+            args(&["--dns", "1.1.1.1", "--port", "3128", "--ready-fd", "3"]),
+            None
+        );
         assert_eq!(args(&["--allow", "api.example:443"]), None);
     }
 
@@ -667,6 +764,8 @@ mod tests {
                 args(&[
                     "--allow",
                     "a.example:443",
+                    "--dns",
+                    "1.1.1.1",
                     "--port",
                     "3128",
                     "--ready-fd",
@@ -693,17 +792,16 @@ mod tests {
         assert!(adopt(9999).is_err());
     }
 
-    /// A whole run of the proxy over loopback on a port of the caller's,
-    /// which is how the launcher runs it: the ready byte arrives once
-    /// the listener is up, an allowed target is tunnelled with the bytes
-    /// that came behind the blank line, and a target no `--allow` covers
-    /// is refused without the upstream being touched.
+    /// A whole run of the proxy on a port of the caller's, which is how
+    /// the launcher runs it: the ready byte arrives once the listener is
+    /// up, and every answer after that is the proxy's own.
     ///
     /// The port is taken by binding one and letting go of it again: two
     /// tests of this file run at once, and a constant would be a race
     /// between them rather than between a proxy and a sandbox.
-    fn started(allow: &[&str]) -> u16 {
+    fn started(allow: &[&str], dns: &[SocketAddr]) -> u16 {
         let list = Allowlist::parse(allow).expect("an allowlist");
+        let dns = dns.to_vec();
         let port = {
             let held =
                 TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("a free port");
@@ -715,7 +813,7 @@ mod tests {
         // The proxy serves until the process ends; a test outlives no
         // thread of its own here.
         std::thread::spawn(move || {
-            let _ = serve(list, port, ready, &log);
+            let _ = serve(list, dns, port, ready, &log);
         });
         let mut byte = [0u8; 1];
         File::from(read)
@@ -725,9 +823,10 @@ mod tests {
         port
     }
 
-    fn echo_server() -> u16 {
-        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-            .expect("an upstream listener");
+    /// An echo on `address`, which is what a tunnelled name resolves to.
+    fn echo_server(address: Ipv4Addr) -> u16 {
+        let listener =
+            TcpListener::bind(SocketAddr::from((address, 0))).expect("an upstream listener");
         let port = listener.local_addr().expect("its address").port();
         std::thread::spawn(move || {
             while let Ok((mut sock, _)) = listener.accept() {
@@ -744,15 +843,78 @@ mod tests {
         port
     }
 
+    /// A resolver of the test's own, answering every `A` question with
+    /// `address` and every other question with nothing.
+    ///
+    /// The proxy asks this rather than the host's, which is the whole
+    /// point of the `--dns` argument: nothing it reads inside the
+    /// sandbox decides where it connects.
+    fn stub_resolver(address: Ipv4Addr) -> SocketAddr {
+        let socket = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("a resolver socket");
+        let at = socket.local_addr().expect("its address");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            while let Ok((n, from)) = socket.recv_from(&mut buf) {
+                let query = &buf[..n];
+                let mut at = 12;
+                while at < query.len() && query[at] != 0 {
+                    at += 1 + usize::from(query[at]);
+                }
+                if at + 4 >= query.len() {
+                    continue;
+                }
+                let qtype = u16::from_be_bytes([query[at + 1], query[at + 2]]);
+                let mut answer = Vec::new();
+                answer.extend_from_slice(&query[..2]);
+                answer.extend_from_slice(&0x8180u16.to_be_bytes());
+                answer.extend_from_slice(&1u16.to_be_bytes());
+                answer.extend_from_slice(&u16::from(qtype == 1).to_be_bytes());
+                answer.extend_from_slice(&[0, 0, 0, 0]);
+                answer.extend_from_slice(&query[12..at + 5]);
+                if qtype == 1 {
+                    // The owner name as a pointer to the question's, then
+                    // `A`, `IN`, a minute of TTL and the four octets.
+                    answer.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+                    answer.extend_from_slice(&address.octets());
+                }
+                let _ = socket.send_to(&answer, from);
+            }
+        });
+        at
+    }
+
+    /// An address of this host that is not the loopback, which is what
+    /// the proxy will dial. `None` where there is no route at all, and
+    /// then the tunnel cannot be tested here.
+    fn routable_address() -> Option<Ipv4Addr> {
+        let socket =
+            std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).ok()?;
+        // Connecting a datagram socket sends nothing; it only picks the
+        // route, and with it the address this host would be seen at.
+        socket
+            .connect(SocketAddr::from((Ipv4Addr::new(1, 1, 1, 1), 1)))
+            .ok()?;
+        match socket.local_addr().ok()?.ip() {
+            IpAddr::V4(v4) if !is_inward(&IpAddr::V4(v4)) => Some(v4),
+            _ => None,
+        }
+    }
+
     #[test]
     fn an_allowed_target_is_tunnelled_and_anything_else_is_refused() {
-        let upstream = echo_server();
-        let proxy = started(&[&format!("localhost:{upstream}")]);
+        let Some(address) = routable_address() else {
+            println!("skipping: this host has no address but the loopback");
+            return;
+        };
+        let upstream = echo_server(address);
+        let dns = stub_resolver(address);
+        let proxy = started(&[&format!("api.example:{upstream}")], &[dns]);
 
         let mut sock = TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, proxy)))
             .expect("the proxy answers");
         sock.write_all(
-            format!("CONNECT localhost:{upstream} HTTP/1.1\r\nHost: localhost\r\n\r\nping")
+            format!("CONNECT api.example:{upstream} HTTP/1.1\r\nHost: api.example\r\n\r\nping")
                 .as_bytes(),
         )
         .expect("the request goes out");
@@ -786,6 +948,51 @@ mod tests {
         sock.read_to_string(&mut answer).expect("the refusal");
         assert!(
             answer.starts_with("HTTP/1.1 405 Method Not Allowed\r\nAllow: CONNECT\r\n"),
+            "{answer}"
+        );
+    }
+
+    /// A listed name whose answer points back inside the namespace: the
+    /// echo is there and would answer, and the proxy still refuses,
+    /// because the loopback it would dial is the application's own and
+    /// its own listener sits on it.
+    #[test]
+    fn a_listed_name_that_resolves_inward_is_refused() {
+        let upstream = echo_server(Ipv4Addr::LOCALHOST);
+        let dns = stub_resolver(Ipv4Addr::LOCALHOST);
+        let proxy = started(&[&format!("api.example:{upstream}")], &[dns]);
+        let mut sock = TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, proxy)))
+            .expect("the proxy answers");
+        sock.write_all(
+            format!("CONNECT api.example:{upstream} HTTP/1.1\r\nHost: api.example\r\n\r\n")
+                .as_bytes(),
+        )
+        .expect("the request goes out");
+        let mut answer = String::new();
+        sock.read_to_string(&mut answer).expect("the refusal");
+        assert!(
+            answer.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+            "{answer}"
+        );
+    }
+
+    /// A resolver that answers nothing is a name that cannot be
+    /// dialled, not a name that is dialled anyway.
+    #[test]
+    fn a_name_no_resolver_answers_is_refused() {
+        let dns = stub_resolver(Ipv4Addr::LOCALHOST);
+        let proxy = started(&["api.example:443"], &[dns]);
+        let mut sock = TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, proxy)))
+            .expect("the proxy answers");
+        // The stub answers `A` for every name, so this asks for one it
+        // does not: the `AAAA` half of the answer is empty and the `A`
+        // half points inward, and both are refused.
+        sock.write_all(b"CONNECT api.example:443 HTTP/1.1\r\nHost: api.example\r\n\r\n")
+            .expect("the request goes out");
+        let mut answer = String::new();
+        sock.read_to_string(&mut answer).expect("the refusal");
+        assert!(
+            answer.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
             "{answer}"
         );
     }
@@ -847,7 +1054,7 @@ mod tests {
     }
 
     #[test]
-    fn a_link_local_answer_is_never_dialled() {
+    fn an_answer_that_points_back_inside_is_never_dialled() {
         let v4 = |_: &str, _: u16| Ok(vec![SocketAddr::from((Ipv4Addr::new(169, 254, 1, 1), 53))]);
         assert_eq!(
             dial("resolver.example", 53, v4).expect_err("refused"),
@@ -859,12 +1066,36 @@ mod tests {
             dial("resolver.example", 53, v6).expect_err("refused"),
             Status::BAD_GATEWAY
         );
+        // The loopback inside the namespace is the application's own,
+        // and the proxy's own listener sits on it.
+        for inward in ["127.0.0.1", "127.9.9.9", "0.0.0.0"] {
+            let ip = inward.parse::<Ipv4Addr>().expect("an address");
+            let answer = move |_: &str, _: u16| Ok(vec![SocketAddr::from((ip, 443))]);
+            assert_eq!(
+                dial("api.example", 443, answer).expect_err("refused"),
+                Status::BAD_GATEWAY,
+                "{inward}"
+            );
+        }
+        for inward in ["::1", "::"] {
+            let ip = inward.parse::<Ipv6Addr>().expect("an address");
+            let answer = move |_: &str, _: u16| Ok(vec![SocketAddr::from((ip, 443))]);
+            assert_eq!(
+                dial("api.example", 443, answer).expect_err("refused"),
+                Status::BAD_GATEWAY,
+                "{inward}"
+            );
+        }
     }
 
     #[test]
     fn a_link_local_answer_is_skipped_for_the_one_behind_it() {
-        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-            .expect("an upstream listener");
+        let Some(address) = routable_address() else {
+            println!("skipping: this host has no address but the loopback");
+            return;
+        };
+        let listener =
+            TcpListener::bind(SocketAddr::from((address, 0))).expect("an upstream listener");
         let good = listener.local_addr().expect("its address");
         let answer = move |_: &str, _: u16| {
             Ok(vec![

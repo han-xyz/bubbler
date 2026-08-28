@@ -1628,12 +1628,14 @@ It runs with **no seccomp filter** in v1: rustix exposes no filter load, the
 `pre_exec` above must stay async-signal-safe, and neither libc nor a new
 dependency is being added for it. Two of a run's sidecars have none — this one
 and `nft`, a one-shot host binary that exits before the application runs —
-against the three bubbler wraps in a bwrap of its own and hands the default
-filter to; pasta loads a filter of its own making, not bubbler's.
+against the two sidecar sandboxes and the instance's own, which bubbler wraps
+in a bwrap and hands the default filter to; pasta loads a filter of its own
+making, not bubbler's.
 What stands in for it is the empty capability sets, a crate that is
 `#![deny(unsafe_code)]` apart from one descriptor adoption, an allowlist that
-arrives as argv, and a request parser that is fuzzed
-(`fuzz/fuzz_targets/net_proxy_request.rs`).
+arrives as argv, and two fuzzed parsers — the request
+(`fuzz/fuzz_targets/net_proxy_request.rs`) and the DNS answer
+(`fuzz/fuzz_targets/net_proxy_dns.rs`).
 
 **The port is bubbler's to choose**, and it is `127.0.0.1:3128` inside. The
 seven variables below are `--setenv` pairs of bwrap's own argv, so they are
@@ -1694,11 +1696,18 @@ a duplicate of both is an error.
 carry the cgroup match, so the proxy resolves and the application does not.
 That is deliberate: a sandbox that can send a query can send
 `<secret>.attacker.example` and read the answer off its own authoritative
-server, which is a channel out of a network that otherwise has none. The
-proxy's resolution works because it joined the *mount* namespace as well, so
-`getaddrinfo` reads the sandbox's generated `/etc/resolv.conf` and asks pasta's
-forwarder at `169.254.1.1` — measured at 88 ms in the design spike. Two
-consequences worth knowing before writing the node:
+server, which is a channel out of a network that otherwise has none. The proxy resolves with a DNS client of its
+own — A and AAAA over UDP, TCP on truncation — aimed at the addresses bubbler
+passes it as `--dns`, which are the same ones the ruleset opens port 53 to. It
+does **not** call `getaddrinfo`: it joined the sandbox's *mount* namespace for
+confinement, and inside that namespace `/run` and `/etc` are tmpfs the
+application writes, while the host's `nsswitch.conf` names `resolve` and
+`mymachines` ahead of `dns`. Measured 2026-08-28: an application that binds
+`/run/systemd/resolve/io.systemd.Resolve` answers every NSS lookup in the
+namespace, the proxy's included, and a `CONNECT` to a listed name reached an
+address the application had chosen. A resolver the attacker answers is no name
+policy at all, so the proxy reads nothing off that filesystem to decide where
+it connects. Two consequences worth knowing before writing the node:
 
 - An application that ignores the proxy variables fails at the name lookup
   rather than at the connection. That is the documented trade-off, and it reads

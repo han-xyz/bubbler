@@ -1,20 +1,17 @@
 # What a sandbox with `outbound "deny"` and an `allow-host` can and
 # cannot do, one line per probe. Run inside the sandbox; the Rust side
-# asserts on the six lines.
+# asserts on the lines below.
 #
-# The listed name is `localhost`, and the echo server this starts on the
-# namespace's own loopback is what it resolves to. That is deliberate:
-# `--map-host-loopback none` and `--map-guest-addr none` leave the
-# sandbox no way to reach a listener on the host at all, and an
-# unprivileged test cannot bind port 53 there to answer for a name of its
-# own either. Reaching the echo therefore proves the proxy is inside the
-# namespace, is reachable at the port bubbler put in the environment,
-# resolves through the sandbox's own `/etc/hosts` (so it joined the mount
-# namespace), matches the target against its allowlist and relays the
-# bytes. What it does not prove is the cgroup accept rule, which needs a
-# destination off this host: `egress ok` covers that where the argv names
-# a routable name and this host is online.
+# Two of the probes are about where the proxy will *not* go. A listed
+# name that resolves to the loopback inside this namespace is refused,
+# because that loopback is the application's own and the proxy's own
+# listener sits on it; and a name only this process can answer is
+# refused, because the proxy carries its own DNS client rather than
+# asking NSS in a mount namespace the application writes. The relay
+# itself is proved by `egress`, which needs a destination off this host
+# and so runs only where the argv names a routable name.
 import errno
+import json
 import os
 import socket
 import sys
@@ -28,6 +25,16 @@ PROXY_PORT = int(sys.argv[2])
 # one: an off-namespace destination the proxy must dial through the tap.
 UNLISTED = "unlisted.invalid"
 ROUTABLE = sys.argv[3] if len(sys.argv) > 3 else ""
+# A listed name no resolver on earth answers, which is the point: the
+# only way it resolves is through the interposition below.
+HIJACK = "hijack.invalid"
+# Where `libnss_resolve.so.2` asks. Inside the sandbox `/run` is a tmpfs
+# this process owns, and the host's `/etc/nsswitch.conf` names `resolve`
+# ahead of `dns`, so a socket here answers every NSS lookup in the
+# namespace.
+VARLINK = "/run/systemd/resolve/io.systemd.Resolve"
+# How many connections the echo took. The proxy must make none of them.
+echoed = 0
 
 
 def say(name, what):
@@ -35,19 +42,92 @@ def say(name, what):
 
 
 def echo_listener():
-    """Bound before anything is asked of the proxy, so the dial cannot
-    race the bind. Answers on the namespace's own loopback, which is what
-    `localhost` resolves to in here."""
+    """Bound before anything is asked of the proxy, so a dial cannot race
+    the bind. On every address this namespace has, so that a proxy taking
+    either the loopback answer or the interposed one would reach it and
+    say so."""
     s = socket.socket()
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("127.0.0.1", ECHO_PORT))
+    s.bind(("0.0.0.0", ECHO_PORT))
     s.listen(8)
     return s
 
 
+def tap_address():
+    """This namespace's own address on pasta's tap, found without
+    sending anything: a connected UDP socket only picks the route."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("1.1.1.1", 1))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def varlink_listener():
+    """The interposition a review measured. Returns None where the
+    sandbox does not let this process bind the path at all, which is a
+    weaker run of this probe and not a failure of it."""
+    try:
+        os.makedirs(os.path.dirname(VARLINK), exist_ok=True)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.bind(VARLINK)
+        s.listen(8)
+        return s
+    except OSError:
+        return None
+
+
+def varlink_serve(s, address):
+    while True:
+        try:
+            c, _ = s.accept()
+        except OSError:
+            return
+        threading.Thread(target=varlink_one, args=(c, address), daemon=True).start()
+
+
+def varlink_one(c, address):
+    """Answer `io.systemd.Resolve.ResolveHostname` with an address of
+    this process's choosing: the echo above, which a proxy that believed
+    it would reach."""
+    try:
+        buf = b""
+        while not buf.endswith(b"\0"):
+            data = c.recv(4096)
+            if not data:
+                return
+            buf += data
+        call = json.loads(buf[:-1].decode())
+        name = call.get("parameters", {}).get("name") or HIJACK
+        octets = [int(o) for o in address.split(".")]
+        c.sendall(
+            json.dumps(
+                {
+                    "parameters": {
+                        "addresses": [
+                            {"ifindex": 1, "family": socket.AF_INET, "address": octets}
+                        ],
+                        "name": name,
+                        "flags": 1,
+                    }
+                }
+            ).encode()
+            + b"\0"
+        )
+    except (OSError, ValueError):
+        pass
+    finally:
+        c.close()
+
+
 def echo_server(s):
+    global echoed
     while True:
         c, _ = s.accept()
+        echoed += 1
         threading.Thread(target=echo_one, args=(c,), daemon=True).start()
 
 
@@ -113,12 +193,12 @@ def status(answer):
 
 
 threading.Thread(target=echo_server, args=(echo_listener(),), daemon=True).start()
+TAP = tap_address()
 
-# 1. The listed name, on the listed port: the proxy answers 200 and the
-#    bytes behind the blank line come back from the echo.
-answer = connect_request("localhost:%d" % ECHO_PORT, body="ping", until="ping")
-ok = "200" in status(answer) and answer.endswith("ping")
-say("relay", "ok" if ok else "no: %r" % answer)
+# 1. A listed name that resolves to this namespace's loopback: the proxy
+#    refuses to dial inward, so the echo waiting there is never reached.
+answer = connect_request("localhost:%d" % ECHO_PORT, body="ping")
+say("inward", "502" if "502" in status(answer) else "no: %r" % answer)
 
 # 2. A name no `allow-host` covers, on the same port.
 answer = connect_request("%s:%d" % (UNLISTED, ECHO_PORT))
@@ -173,3 +253,29 @@ say("env", "ok" if not wrong else "no: %r" % wrong)
 if ROUTABLE:
     answer = connect_request("%s:443" % ROUTABLE)
     say("egress", "ok" if "200" in status(answer) else "no: %r" % answer)
+
+# 8. The interposition: this process answers NSS for a name no resolver
+#    has, and then asks the proxy for it. A proxy that resolved through
+#    `getaddrinfo` would be told the echo's address and would answer
+#    `200`; one with its own DNS client gets no such name and answers
+#    `502`. `nss` says whether the interposition was live at all, which
+#    is what makes the proxy's answer worth reading.
+# Bound only now, and not before: while it is up this process answers
+# every NSS lookup in the namespace, its own included, and probe 5 above
+# is about the lookups that leave the sandbox.
+varlink = varlink_listener()
+if varlink is None:
+    say("nss", "unavailable")
+else:
+    threading.Thread(target=varlink_serve, args=(varlink, TAP), daemon=True).start()
+    try:
+        socket.getaddrinfo(HIJACK, ECHO_PORT, socket.AF_INET)
+        say("nss", "live")
+    except OSError:
+        say("nss", "inert")
+answer = connect_request("%s:%d" % (HIJACK, ECHO_PORT), body="ping")
+say("hijack", "502" if "502" in status(answer) else "no: %r" % answer)
+
+# 9. Nothing above reached the echo: the two refusals are refusals, not
+#    a relay that happened to fail late.
+say("echoed", str(echoed))

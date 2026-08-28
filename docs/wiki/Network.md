@@ -32,9 +32,9 @@ Needs `pasta` (package `passt`). Missing pasta is an error, never a quiet
 fallback. pasta is not wrapped in a sandbox: it must join the sandbox's user
 namespace to configure it, and it isolates itself (`pivot_root` into an empty
 fs, seccomp, no-new-privs). Its authority is over the sandbox's namespaces
-only, which your uid created. The egress proxy below is the other sidecar with
-no bwrap of its own, and it is confined the other way — it joins the sandbox's
-namespaces and keeps no capability in them.
+only, which your uid created. The egress proxy below and the one-shot `nft` are
+the other two without a bwrap of their own; the proxy is confined the other way
+— it joins the sandbox's namespaces and keeps no capability in them.
 
 Fixed pasta flags on every run: `-t none -u none -T none -U none
 --map-host-loopback none --map-guest-addr none --foreground`. pasta's own
@@ -127,12 +127,20 @@ the wrong port and for an IP literal, `502` for a name that does not resolve
 and for one whose every address refuses the connection, `504` for a connect
 timeout, `503` past 64 concurrent tunnels, `408` for a request that arrives
 too slowly, `400`/`414` for a malformed or over-long one. A name that resolves
-to a link-local address is skipped. Plain HTTP is not forwarded, and neither
+to a loopback or link-local address is skipped: inside the namespace those point
+back at the application, or at the proxy's own listener. Plain HTTP is not forwarded, and neither
 is UDP: HTTP/3 is not tunnelled, so a client falls back to TCP.
 
 **DNS is the proxy's.** With any `allow-host` the resolver rules carry the
 cgroup match too, so the proxy resolves and the application does not — that
-closes the `<secret>.attacker.example` channel out through a query. The
+closes the `<secret>.attacker.example` channel out through a query. The proxy
+uses a DNS client of its own (A and AAAA over UDP, TCP on truncation) aimed at
+the addresses bubbler passes it as `--dns`, which are the ones those rules open;
+it never calls `getaddrinfo`, because it sits in the sandbox's mount namespace
+and NSS there is the application's to answer — an application that binds
+`/run/systemd/resolve/io.systemd.Resolve` in its own `/run` tmpfs would
+otherwise choose the address every listed name is dialled at (measured
+2026-08-28). The
 trade-off: a client that ignores the proxy variables fails at the name lookup
 rather than at the connection, which reads like a broken resolver rather than
 like a policy. Beside that, an `allow-out` naming an address with no `port=`

@@ -112,7 +112,10 @@ lint-allow "outbound-deny" reason="the deny is the point of this profile: egress
 
 bubbler runs a CONNECT proxy in the sandbox's own network namespace and lets
 only that process out; the tool is pointed at it with `HTTPS_PROXY` and the six
-other variables the node sets. `/login` still works — the URL opens in a browser
+other variables the node sets. The proxy resolves each listed name with a DNS
+client of its own, against the resolver bubbler names on its argv — the sandbox
+answers no lookup of the proxy's, and cannot make a listed name point where it
+likes. `/login` still works — the URL opens in a browser
 on the host, and the code you paste back is exchanged with `claude.ai` and
 `platform.claude.com`.
 

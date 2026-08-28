@@ -7,7 +7,10 @@
 // node sets), and the nftables ruleset accepts that one process and no
 // other. The application resolves nothing itself — DNS is the proxy's
 // too — so a client of its own that ignores the proxy variables fails
-// at the name lookup rather than at the connection.
+// at the name lookup rather than at the connection. The proxy asks the
+// resolver bubbler names on its argv, with a DNS client of its own: it
+// shares the sandbox's mount namespace, where NSS would let the
+// application answer for every name it lists.
 //
 // The list is every host Anthropic documents as a Claude Code network
 // access requirement, minus `formulae.brew.sh` (Homebrew, which is not

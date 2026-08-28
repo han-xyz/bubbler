@@ -373,9 +373,10 @@ impl fmt::Display for AllowHost {
     }
 }
 
-/// The sandbox's cgroup, as the nftables `socket cgroupv2` match names
-/// it, and the one thing the ruleset accepts once an `allow-host` is in
-/// play.
+/// The egress proxy's cgroup, as the nftables `socket cgroupv2` match
+/// names it, and the one thing the ruleset accepts once an `allow-host`
+/// is in play. It is a leaf beside the sandbox's, never the sandbox's
+/// own.
 ///
 /// The match resolves the path to a cgroup id when `nft` reads the rule,
 /// so the directory has to exist before the ruleset is installed and to
@@ -528,14 +529,21 @@ pub const NET_PROXY_INSIDE: &str = "/run/bubbler-net-proxy";
 pub const PROXY_PORT: u16 = 3128;
 
 /// The egress proxy's own argv, after the program name: what it may
-/// reach, where it listens, and the descriptors it answers on.
+/// reach, which resolvers to ask, where it listens, and the descriptors
+/// it answers on.
 ///
 /// One place, so the process the launcher starts and the one
 /// `--explain` describes cannot drift apart. Every element comes from a
 /// typed value — a [`HostPattern`] renders as letters, digits, `-`, `.`
-/// and a leading `*`, and the ports are `u16` — but that is not what
-/// keeps this safe: the proxy is spawned with one argument per `arg()`
-/// and never through a shell.
+/// and a leading `*`, the addresses are [`IpAddr`]s and the ports are
+/// `u16` — but that is not what keeps this safe: the proxy is spawned
+/// with one argument per `arg()` and never through a shell.
+///
+/// The resolvers are the same ones [`ruleset`] opens port 53 to for the
+/// proxy's cgroup, and they are argv because the proxy must not read
+/// them off a filesystem: it runs inside the sandbox's mount namespace,
+/// where `/etc` and `/run` are the application's to write and NSS would
+/// ask the application what a name resolves to.
 pub fn net_proxy_argv(cfg: &NetworkConfig, fds: ProxyFds<'_>) -> Vec<OsString> {
     let mut argv = Vec::new();
     for allowed in &cfg.allow_hosts {
@@ -544,6 +552,10 @@ pub fn net_proxy_argv(cfg: &NetworkConfig, fds: ProxyFds<'_>) -> Vec<OsString> {
             "{}:{}",
             allowed.pattern, allowed.port
         )));
+    }
+    for server in resolvers(cfg).unwrap_or_default() {
+        argv.push(OsString::from("--dns"));
+        argv.push(OsString::from(server.to_string()));
     }
     argv.push(OsString::from("--port"));
     argv.push(OsString::from(PROXY_PORT.to_string()));
@@ -698,8 +710,9 @@ fn resolvers(cfg: &NetworkConfig) -> Option<Vec<IpAddr>> {
 /// and splice it to the host, which never becomes a packet and so is
 /// never seen by netfilter.
 ///
-/// `cgroup` is the sandbox's own cgroup, which the proxy sidecar puts
-/// itself in. With an `allow-host` the ruleset is written around it:
+/// `cgroup` is the leaf the proxy sidecar puts itself in, beside the
+/// sandbox's own and outside anything the application can name. With an
+/// `allow-host` the ruleset is written around it:
 /// the proxy's traffic is accepted whole, since the proxy is what
 /// judges a name, and the resolver rules carry the same match, so the
 /// application resolves nothing at all. Without an `allow-host` the
@@ -1614,6 +1627,8 @@ mod tests {
                 "api.example.com:443",
                 "--allow",
                 "*.cdn.example:8443",
+                "--dns",
+                "169.254.1.1",
                 "--port",
                 "3128",
                 "--ready-fd",
@@ -1622,6 +1637,48 @@ mod tests {
                 "2",
             ]
         );
+    }
+
+    /// The resolvers in the argv are the ones the ruleset opens port 53
+    /// to, and the proxy is given them there rather than left to read a
+    /// `resolv.conf` the application can write.
+    #[test]
+    fn the_proxy_is_told_the_resolvers_the_ruleset_opens() {
+        let cfg = NetworkConfig {
+            outbound: Outbound::Deny,
+            dns: vec![
+                IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
+                "2606:4700:4700::1111".parse().expect("an address"),
+            ],
+            allow_hosts: vec![AllowHost {
+                pattern: HostPattern::parse("api.example").unwrap(),
+                port: AllowHost::DEFAULT_PORT,
+            }],
+            ..NetworkConfig::default()
+        };
+        let argv = strs(&net_proxy_argv(
+            &cfg,
+            ProxyFds {
+                ready: OsStr::new("5"),
+                log: OsStr::new("2"),
+            },
+        ));
+        let named: Vec<&String> = argv
+            .iter()
+            .zip(argv.iter().skip(1))
+            .filter(|(flag, _)| *flag == "--dns")
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(named, ["9.9.9.9", "2606:4700:4700::1111"]);
+        // The same addresses the ruleset accepts for the proxy's cgroup.
+        let rules = ruleset(
+            &cfg,
+            Some(&Cgroup::new("user.slice/x/proxy").expect("a cgroup")),
+        )
+        .expect("a ruleset");
+        for server in named {
+            assert!(rules.contains(server), "{server} is not in the ruleset");
+        }
     }
 
     /// The port in the variables is the port the proxy is told to bind,

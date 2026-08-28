@@ -2275,6 +2275,21 @@ fn parse_network(node: &KdlNode) -> Result<Service, ConfigError> {
             ),
         ));
     }
+    // The same port from the other side: inside the namespace it is the
+    // proxy's own listener, so a name granted on it is a name the proxy
+    // would dial itself for as soon as it resolved to the loopback it
+    // sits on — a tunnel slot per request and no egress at all. The
+    // proxy refuses an inward address anyway; this is so the config
+    // says why rather than the run failing later.
+    if let Some(allowed) = cfg.allow_hosts.iter().find(|a| a.port == PROXY_PORT) {
+        return Err(bad(
+            node,
+            &format!(
+                "`allow-host {allowed}` names {PROXY_PORT}, which is the egress proxy's \
+                 own port inside the sandbox: name the port the service is served on"
+            ),
+        ));
+    }
     Ok(Service::Network(cfg))
 }
 
@@ -3632,6 +3647,25 @@ mod tests {
         let near = format!(
             "network {{\n    outbound \"deny\"\n    allow-host \"a.example\"\n    \
              allow-port {}\n}}",
+            PROXY_PORT + 1
+        );
+        assert!(parse(&near).is_ok());
+    }
+
+    /// A name granted on the proxy's own port is refused the way a
+    /// forward of it is: inside the namespace that port is the proxy's
+    /// listener, so the grant would only ever point the proxy at
+    /// itself.
+    #[test]
+    fn a_name_cannot_be_granted_on_the_proxy_port() {
+        let at = format!(
+            "network {{\n    outbound \"deny\"\n    allow-host \"a.example\" port={PROXY_PORT}\n}}"
+        );
+        let err = parse(&at).unwrap_err();
+        assert!(err.to_string().contains(&PROXY_PORT.to_string()), "{err}");
+        assert!(err.to_string().contains("a.example"), "{err}");
+        let near = format!(
+            "network {{\n    outbound \"deny\"\n    allow-host \"a.example\" port={}\n}}",
             PROXY_PORT + 1
         );
         assert!(parse(&near).is_ok());

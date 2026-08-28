@@ -9,11 +9,15 @@
 //!
 //! Nothing here reads a config file or an environment variable: the
 //! allowlist arrives as argv, already validated by the config that
-//! wrote it.
+//! wrote it, and so do the resolver addresses. The proxy runs inside
+//! the sandbox's mount namespace, where NSS would ask the application
+//! itself what a name resolves to, so [`dns`] speaks the wire format
+//! rather than calling `getaddrinfo`.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod allow;
 pub mod connect;
+pub mod dns;
 pub mod relay;

@@ -72,3 +72,10 @@ path = "fuzz_targets/net_proxy_request.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "net_proxy_dns"
+path = "fuzz_targets/net_proxy_dns.rs"
+test = false
+doc = false
+bench = false

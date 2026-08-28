@@ -264,8 +264,14 @@ those bits would hand the sidecar the full set in the sandbox's user namespace.
 It therefore cannot open `AF_PACKET` on the tap and cannot read or flush the
 sandbox's own ruleset — the two powers a `CAP_NET_RAW` or `CAP_NET_ADMIN`
 sidecar would have handed an attacker who found a bug in it. What a compromised
-proxy does get is the sandbox's filesystem view, the sandbox's DNS, and the
-ability to reach whatever the names in the config resolve to. Its working
+proxy does get is the sandbox's filesystem view, the resolvers bubbler names on
+its argv, and the ability to reach whatever those resolvers answer for the names
+in the config. It does not resolve *through* the sandbox: NSS inside that mount
+namespace is the application's to answer — an application that binds
+`/run/systemd/resolve/io.systemd.Resolve` in the `/run` tmpfs it owns answered
+the proxy's lookups when the proxy used `getaddrinfo` (measured 2026-08-28), so
+the proxy now carries its own DNS client and reads nothing off that filesystem
+to decide where it connects. Its working
 directory is `/` inside the sandbox's mount namespace and it is non-dumpable;
 it dies with bubbler (`PR_SET_PDEATHSIG`) and is stopped with the run.
 
@@ -273,8 +279,9 @@ It runs with **no seccomp filter** in v1: rustix exposes no filter load, the
 `pre_exec` that sets all of the above must stay async-signal-safe, and neither
 libc nor a new crate is being added for it. Two of a run's sidecars go without
 one — this proxy and `nft`, a one-shot host binary that exits before the
-application runs — against the three bubbler wraps in a bwrap of its own and
-gives the default filter to; pasta loads a filter of its own making.
+application runs — against the two sidecar sandboxes and the
+instance's own, which bubbler wraps in a bwrap and gives the default filter to;
+pasta loads a filter of its own making.
 What stands in for the filter: no capability at all, a crate that is
 `#![deny(unsafe_code)]` apart from one descriptor adoption, an allowlist that
 arrives as argv rather than as a file the sandbox could touch, and a request

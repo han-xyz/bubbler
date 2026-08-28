@@ -31,7 +31,7 @@ bubbler-init = { path = "crates/bubbler-init", version = "0.19.1" }
 bubbler-net-proxy = { path = "crates/bubbler-net-proxy", version = "0.19.1" }
 kdl = "6"
 thiserror = "2"
-rustix = { version = "1", features = ["fs", "process", "net", "pipe", "event", "pty", "termios", "thread"] }
+rustix = { version = "1", features = ["fs", "process", "net", "pipe", "event", "pty", "termios", "thread", "rand"] }
 clap = { version = "4", features = ["derive"] }
 clap_mangen = "0.3"
 anyhow = "1"
