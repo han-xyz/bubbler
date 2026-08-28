@@ -361,8 +361,8 @@ that decided it, with that node's line number.
 starts. It has no sandbox of its own to render — it joins the application's
 namespaces — so what it prints is the argv alone: the program under `command`,
 as the sandbox execs it (`/run/bubbler-net-proxy`, with the host path it is
-bound from as a note), and every option pair under the `network` node that
-decided it.
+bound from as a note), and every option under the `network` node that decided
+it.
 
 The three flags cannot be combined: each renders one sidecar's argv, any two of
 them together is a usage error, as is any of them without `--explain`. A config
@@ -1722,25 +1722,33 @@ it connects. Two consequences worth knowing before writing the node:
 
 **What it prints.** The proxy's `--log-fd` is bubbler's own stderr, never a
 file. Its budget is 20 lines a second, after which the count of what was
-swallowed is printed in the next window. What it writes by default is its
-refusals and its own failures: the stderr it writes to is the terminal the
-sandboxed application draws on, and a full-screen one is redrawn over by a line
-per tunnel. `BUBBLER_NET_PROXY_LOG=1` adds the startup line and one line for
-every tunnel opened, which is what the transcript below was taken with —
-measured on a real run of the integration test, with the sandbox's own probes
+swallowed is printed in the next window. What it writes by default is every
+refusal — the allowlist's `denied <name>:<port>: no allow-host covers it`, a
+name that would not resolve, and a `refused <code> <why>` for a request that
+never named a target at all (malformed, not a `CONNECT`, past the header
+deadline, or arriving with every tunnel slot taken) — and its own failures.
+What it does *not* write is the traffic, because the stderr it writes to is the
+terminal the sandboxed application draws on and a full-screen one is redrawn
+over by a line per tunnel. `BUBBLER_NET_PROXY_LOG=1` adds those: the startup
+line, and one line for every tunnel opened. Measured on a real run of the
+integration test's probes with that variable set, the sandbox's own lines
 interleaved:
 
-    bubbler-net-proxy: listening on 127.0.0.1:3128 for 2 allowed targets
-    bubbler-net-proxy: tunnel to localhost:45123
-    relay ok
+    bubbler-net-proxy: listening on 127.0.0.1:3128 for 3 allowed targets
+    bubbler-net-proxy: localhost:45123 not reached: 502 Bad Gateway
+    inward 502
     bubbler-net-proxy: denied unlisted.invalid:45123: no allow-host covers it
     unlisted 403
+    bubbler-net-proxy: refused 405 not CONNECT
     get 405
     direct refused EHOSTUNREACH
     dns none
     env ok
     bubbler-net-proxy: tunnel to one.one.one.one:443
     egress ok
+
+Without the variable the same run prints all of these but the `listening on`
+and `tunnel to` lines.
 
 The last two lines are the whole mechanism end to end: the proxy resolved a
 real name and reached it, in the same sandbox where the application got

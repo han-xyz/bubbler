@@ -8603,6 +8603,12 @@ fn real_allow_host_relays_a_listed_name_and_nothing_else() {
     );
     assert!(!err.contains("tunnel to"), "{got}{err}");
     assert!(!err.contains("listening on"), "{got}{err}");
+    // A refusal that never named a target is printed too, or a run
+    // whose every request was malformed would print nothing at all.
+    assert!(
+        err.contains("bubbler-net-proxy: refused 405 not CONNECT"),
+        "{got}{err}"
+    );
 }
 
 /// The escape a review measured against the first version of this

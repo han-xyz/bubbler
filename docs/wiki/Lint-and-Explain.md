@@ -139,16 +139,20 @@ config decides is grouped under the `wayland` node that decided it:
 
 `--net-proxy` does the same for the egress proxy an `allow-host` starts. Its
 `command` group is the binary as the sandbox execs it (`/run/bubbler-net-proxy`,
-with the host path it is bound from as a note) and every option pair sits under
-the `network` node that decided it:
+with the host path it is bound from as a note) and every option sits under the
+`network` node that decided it:
 
 ```
-  network   config.kdl:4  8 arguments
+  network   config.kdl:4  10 arguments
     --allow api.example.com:443
+    --dns 169.254.1.1
     --port 3128
     --ready-fd <ready-fd>
     --log-fd 2
 ```
+
+That is the default argv; `BUBBLER_NET_PROXY_LOG=1` adds `--log-tunnels` to the
+end of it, and one to the count.
 
 `--proxy`, `--wl-proxy` and `--net-proxy` each render one sidecar and no two can
 be combined; any of them without `--explain` is a usage error. A config that

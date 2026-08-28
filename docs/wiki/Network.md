@@ -158,13 +158,16 @@ a `SIGKILL`ed bubbler leaves two empty directories that the next run of that
 instance sweeps.
 
 The proxy writes to bubbler's own stderr, at most 20 lines a second plus a
-count of what was suppressed. By default that is its refusals and its own
-failures and nothing else — the same terminal is where a full-screen
+count of what was suppressed. By default that is every refusal — a target no
+`allow-host` covers, a name that would not resolve, a request it could not read
+or that was not a `CONNECT`, a connection with every tunnel slot taken — and
+its own failures, and nothing else. The same terminal is where a full-screen
 application inside the sandbox is drawing, and a line per tunnel lands in the
 middle of its frame:
 
 ```
 bubbler-net-proxy: denied unlisted.example:443: no allow-host covers it
+bubbler-net-proxy: refused 405 not CONNECT
 ```
 
 `BUBBLER_NET_PROXY_LOG=1` adds the startup line and one line per tunnel:

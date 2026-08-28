@@ -258,6 +258,7 @@ fn serve(
             }
         };
         if live.load(Ordering::SeqCst) >= MAX_TUNNELS {
+            note_refusal(log, Status::SERVICE_UNAVAILABLE);
             refuse(client, Status::SERVICE_UNAVAILABLE, REFUSE_TIMEOUT, log);
             continue;
         }
@@ -302,7 +303,10 @@ fn tunnel(mut client: TcpStream, list: &Allowlist, dns: &[SocketAddr], log: &Log
     let deadline = Instant::now() + HEADER_TIMEOUT;
     let (request, buffered) = match read_request(&mut client, deadline) {
         Ok(pair) => pair,
-        Err(Some(status)) => return refuse(client, status, WRITE_TIMEOUT, log),
+        Err(Some(status)) => {
+            note_refusal(log, status);
+            return refuse(client, status, WRITE_TIMEOUT, log);
+        }
         Err(None) => return,
     };
     if !list.matches(&request.host, request.port) {
@@ -471,6 +475,35 @@ fn is_inward(ip: &IpAddr) -> bool {
             v6.is_loopback() || v6.is_unspecified() || v6.segments()[0] & 0xffc0 == 0xfe80
         }
     }
+}
+
+/// Write the line for a request refused before it ever named a target:
+/// one this proxy could not read, one that was not a `CONNECT`, one that
+/// ran out the header deadline, or one that arrived with every tunnel
+/// slot taken.
+///
+/// Unconditional, because none of these is traffic: each is a client
+/// doing something no `allow-host` could explain, and with the traffic
+/// log off a run of nothing but these would otherwise print nothing at
+/// all. The refusals that *do* name a target write their own line and
+/// must not come through here twice.
+///
+/// Nothing of the request is repeated: those bytes are the sandbox's to
+/// choose, and a line built out of them is a line the application writes
+/// into the run's record.
+fn note_refusal(log: &Log, status: Status) {
+    let why = match status.code {
+        400 => "malformed request",
+        405 => "not CONNECT",
+        408 => "request header timed out",
+        414 => "request line too long",
+        503 => "too many tunnels",
+        // No other status reaches this, and one that did would still be
+        // worth a line: its own reason phrase says as much as anything
+        // written here could.
+        _ => status.reason,
+    };
+    log.line(&format!("refused {} {why}", status.code));
 }
 
 /// Answer a request that will not be served and close the connection.
@@ -1290,6 +1323,38 @@ mod tests {
             );
             assert_eq!(text.contains("listening on"), verbose, "{verbose}: {text}");
         }
+    }
+
+    /// A client that never gets as far as naming a target still leaves
+    /// a line. With the traffic log off these are the only lines such a
+    /// run has, and a proxy answering `405` in silence would look like
+    /// one nothing had reached at all.
+    #[test]
+    fn a_request_refused_before_it_named_a_target_is_logged_by_default() {
+        let dns = stub_resolver(Ipv4Addr::LOCALHOST);
+        let buf = Buf::default();
+        let proxy = started_with(
+            &["api.example:443"],
+            &[dns],
+            Log::new(Box::new(buf.clone()), false),
+        );
+        let mut sock = TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, proxy)))
+            .expect("the proxy answers");
+        sock.write_all(b"GET http://api.example/ HTTP/1.1\r\nHost: api.example\r\n\r\n")
+            .expect("the request goes out");
+        let mut answer = String::new();
+        sock.read_to_string(&mut answer).expect("the refusal");
+        assert!(
+            answer.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
+            "{answer}"
+        );
+        let text = buf.text();
+        assert!(
+            text.contains("bubbler-net-proxy: refused 405 not CONNECT\n"),
+            "{text}"
+        );
+        // The one line and nothing about the listener it came in on.
+        assert!(!text.contains("listening on"), "{text}");
     }
 
     #[test]

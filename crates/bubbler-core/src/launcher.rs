@@ -790,7 +790,10 @@ pub fn explain_net_proxy(
         env.net_proxy_log,
     );
     // One option and its value to a line, which is how the grammar
-    // reads and how the launcher builds it.
+    // reads and how the launcher builds it. The pairing holds because
+    // every option that takes a value comes first and the one bare word,
+    // `--log-tunnels`, is appended last: a flag added anywhere else
+    // would shift every line after it.
     items.extend(argv.chunks(2).map(|pair| Explained {
         origin: Origin::Service(node),
         args: pair.to_vec(),
