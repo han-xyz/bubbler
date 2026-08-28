@@ -45,7 +45,7 @@ use bubbler_net_proxy::relay;
 /// The one usage line, so a grammar error always names the whole
 /// grammar.
 const USAGE: &str = "bubbler-net-proxy: usage: --allow NAME:PORT [--allow NAME:PORT ...] \
---dns IP [--dns IP ...] --port N --ready-fd N [--log-fd N]";
+--dns IP [--dns IP ...] --port N --ready-fd N [--log-fd N] [--log-tunnels]";
 
 /// Tunnels one proxy carries at a time. Past this a connection is
 /// answered `503` and closed: a sandbox that opens sockets without
@@ -113,6 +113,13 @@ struct Args {
     ready_fd: i32,
     /// Where the log goes; stderr when the launcher named nothing.
     log_fd: Option<i32>,
+    /// Whether the lines about what the proxy carried — the listener it
+    /// opened and every tunnel through it — are written at all. Off,
+    /// because that log shares a terminal with whatever the sandbox is
+    /// running and a full-screen application redraws over it; the
+    /// refusals are written either way, since those are what a user has
+    /// to notice.
+    log_tunnels: bool,
 }
 
 fn main() -> ExitCode {
@@ -132,8 +139,8 @@ fn main() -> ExitCode {
     // reaches the launcher's own record and not a stderr it may not be
     // reading.
     let log = match args.log_fd.map(adopt).transpose() {
-        Ok(Some(fd)) => Arc::new(Log::to_fd(fd)),
-        Ok(None) => Arc::new(Log::to_stderr()),
+        Ok(Some(fd)) => Arc::new(Log::to_fd(fd, args.log_tunnels)),
+        Ok(None) => Arc::new(Log::to_stderr(args.log_tunnels)),
         Err(err) => {
             eprintln!("bubbler-net-proxy: {err}");
             return ExitCode::from(1);
@@ -158,14 +165,16 @@ fn main() -> ExitCode {
 /// `--allow` and `--dns` repeat and must each appear at least once — a
 /// proxy with an empty allowlist would answer `403` to everything and
 /// one with no resolver `502`, and both are launcher bugs worth failing
-/// on. The other options appear once, and no two may name the same
-/// descriptor: a number adopted twice would be closed twice.
+/// on. The other options appear once, `--log-tunnels` included, and no
+/// two may name the same descriptor: a number adopted twice would be
+/// closed twice.
 fn parse_from(mut it: impl Iterator<Item = OsString>) -> Option<Args> {
     let mut allow: Vec<String> = Vec::new();
     let mut dns: Vec<IpAddr> = Vec::new();
     let mut port = None;
     let mut ready_fd = None;
     let mut log_fd = None;
+    let mut log_tunnels = false;
     while let Some(word) = it.next() {
         match word.to_str() {
             Some("--allow") => allow.push(it.next()?.to_str()?.to_owned()),
@@ -173,6 +182,7 @@ fn parse_from(mut it: impl Iterator<Item = OsString>) -> Option<Args> {
             Some("--port") if port.is_none() => port = Some(listen_port(it.next()?)?),
             Some("--ready-fd") if ready_fd.is_none() => ready_fd = Some(number(it.next()?)?),
             Some("--log-fd") if log_fd.is_none() => log_fd = Some(number(it.next()?)?),
+            Some("--log-tunnels") if !log_tunnels => log_tunnels = true,
             _ => return None,
         }
     }
@@ -185,6 +195,7 @@ fn parse_from(mut it: impl Iterator<Item = OsString>) -> Option<Args> {
         port: port?,
         ready_fd: ready_fd?,
         log_fd,
+        log_tunnels,
     };
     if Some(args.ready_fd) == args.log_fd {
         return None;
@@ -228,7 +239,7 @@ fn serve(
     let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
     let ready = adopt(ready_fd)?;
     File::from(ready).write_all(&[READY])?;
-    log.line(&format!(
+    log.if_verbose(&format!(
         "listening on 127.0.0.1:{port} for {} allowed targets",
         list.len()
     ));
@@ -320,7 +331,7 @@ fn tunnel(mut client: TcpStream, list: &Allowlist, dns: &[SocketAddr], log: &Log
         ));
         return;
     }
-    log.line(&format!("tunnel to {}:{}", request.host, request.port));
+    log.if_verbose(&format!("tunnel to {}:{}", request.host, request.port));
     if let Err(err) = relay::run(client, upstream, relay::IDLE) {
         log.line(&format!("{}:{} relay: {err}", request.host, request.port));
     }
@@ -487,6 +498,8 @@ fn refuse(mut client: TcpStream, status: Status, wait: Duration, log: &Log) {
 /// when the window rolls.
 struct Log {
     sink: Mutex<Sink>,
+    /// Whether [`Log::if_verbose`] writes anything.
+    verbose: bool,
 }
 
 /// The sink and its budget under one lock, so two tunnel threads cannot
@@ -503,8 +516,8 @@ struct Sink {
 }
 
 impl Log {
-    /// Write to `out`.
-    fn new(out: Box<dyn Write + Send>) -> Self {
+    /// Write to `out`. `verbose` is `--log-tunnels`.
+    fn new(out: Box<dyn Write + Send>, verbose: bool) -> Self {
         Self {
             sink: Mutex::new(Sink {
                 out,
@@ -512,24 +525,36 @@ impl Log {
                 written: 0,
                 suppressed: 0,
             }),
+            verbose,
         }
     }
 
     /// Write to a descriptor the launcher passed.
-    fn to_fd(fd: OwnedFd) -> Self {
-        Self::new(Box::new(File::from(fd)))
+    fn to_fd(fd: OwnedFd, verbose: bool) -> Self {
+        Self::new(Box::new(File::from(fd)), verbose)
     }
 
     /// Write to stderr, which is where the lines go when the launcher
     /// named no descriptor.
-    fn to_stderr() -> Self {
-        Self::new(Box::new(io::stderr()))
+    fn to_stderr(verbose: bool) -> Self {
+        Self::new(Box::new(io::stderr()), verbose)
     }
 
     /// One line, prefixed with the program name, unless this window's
     /// budget is spent.
     fn line(&self, msg: &str) {
         self.at(Instant::now(), msg);
+    }
+
+    /// [`Log::line`], but only where the launcher asked for the traffic
+    /// itself to be written. Nothing a user has to act on goes through
+    /// here: this is the record of what the proxy carried, and it is
+    /// silent by default so that a full-screen application sharing the
+    /// terminal is not redrawn over.
+    fn if_verbose(&self, msg: &str) {
+        if self.verbose {
+            self.line(msg);
+        }
     }
 
     /// [`Log::line`] against a clock the caller names.
@@ -618,6 +643,7 @@ mod tests {
                 port: 3128,
                 ready_fd: 3,
                 log_fd: None,
+                log_tunnels: false,
             })
         );
     }
@@ -730,6 +756,7 @@ mod tests {
                 port: 3128,
                 ready_fd: 4,
                 log_fd: Some(2),
+                log_tunnels: false,
             })
         );
     }
@@ -747,6 +774,19 @@ mod tests {
     fn a_repeated_option_is_a_usage_error() {
         let mut words: Vec<&str> = MINIMAL.to_vec();
         words.extend(["--ready-fd", "4"]);
+        assert_eq!(args(&words), None);
+    }
+
+    /// The bare word takes no value, appears at most once like every
+    /// other option, and is the only thing that turns the traffic lines
+    /// on.
+    #[test]
+    fn the_tunnel_log_is_off_until_the_word_is_given_and_may_be_given_once() {
+        assert!(!args(MINIMAL).expect("the shortest grammar").log_tunnels);
+        let mut words: Vec<&str> = MINIMAL.to_vec();
+        words.push("--log-tunnels");
+        assert!(args(&words).expect("the word is accepted").log_tunnels);
+        words.push("--log-tunnels");
         assert_eq!(args(&words), None);
     }
 
@@ -800,6 +840,12 @@ mod tests {
     /// tests of this file run at once, and a constant would be a race
     /// between them rather than between a proxy and a sandbox.
     fn started(allow: &[&str], dns: &[SocketAddr]) -> u16 {
+        started_with(allow, dns, Log::to_stderr(false))
+    }
+
+    /// [`started`] against a log of the caller's, which is how the two
+    /// gated lines are read back.
+    fn started_with(allow: &[&str], dns: &[SocketAddr], log: Log) -> u16 {
         let list = Allowlist::parse(allow).expect("an allowlist");
         let dns = dns.to_vec();
         let port = {
@@ -808,7 +854,7 @@ mod tests {
             held.local_addr().expect("its address").port()
         };
         let (read, write) = rustix::pipe::pipe().expect("a pipe");
-        let log = Arc::new(Log::to_stderr());
+        let log = Arc::new(log);
         let ready = write.into_raw_fd();
         // The proxy serves until the process ends; a test outlives no
         // thread of its own here.
@@ -1154,7 +1200,7 @@ mod tests {
     #[test]
     fn the_log_takes_a_budget_of_lines_a_window_and_counts_the_rest() {
         let buf = Buf::default();
-        let log = Log::new(Box::new(buf.clone()));
+        let log = Log::new(Box::new(buf.clone()), false);
         let start = Instant::now();
         for n in 0..LOG_BUDGET + 5 {
             log.at(start, &format!("line {n}"));
@@ -1182,10 +1228,74 @@ mod tests {
         assert!(text.ends_with("bubbler-net-proxy: later\n"), "{text}");
     }
 
+    /// What the proxy carried is written only when the launcher asked
+    /// for it; what it refused is written either way. The lines share a
+    /// terminal with whatever the sandbox runs, and one line a tunnel is
+    /// a full-screen application redrawn over — a refusal is the thing a
+    /// user has to see.
+    #[test]
+    fn the_traffic_lines_wait_for_the_word_and_the_refusals_do_not() {
+        let Some(address) = routable_address() else {
+            println!("skipping: this host has no address but the loopback");
+            return;
+        };
+        let upstream = echo_server(address);
+        let dns = stub_resolver(address);
+        let allowed = format!("api.example:{upstream}");
+        for verbose in [false, true] {
+            let buf = Buf::default();
+            let proxy = started_with(
+                &[&allowed],
+                &[dns],
+                Log::new(Box::new(buf.clone()), verbose),
+            );
+
+            let mut sock = TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, proxy)))
+                .expect("the proxy answers");
+            sock.write_all(
+                format!("CONNECT {allowed} HTTP/1.1\r\nHost: api.example\r\n\r\nping").as_bytes(),
+            )
+            .expect("the request goes out");
+            // The echo comes back through the relay, which the tunnel
+            // thread enters after it has written its line: reading it is
+            // what makes the log complete rather than merely likely.
+            let mut reader = io::BufReader::new(sock.try_clone().expect("a second handle"));
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("the status line");
+            assert_eq!(line, "HTTP/1.1 200 Connection established\r\n");
+            line.clear();
+            reader.read_line(&mut line).expect("the blank line");
+            let mut echoed = [0u8; 4];
+            reader.read_exact(&mut echoed).expect("the echo");
+            assert_eq!(&echoed, b"ping");
+            drop(reader);
+            drop(sock);
+
+            let mut sock = TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, proxy)))
+                .expect("the proxy answers");
+            sock.write_all(b"CONNECT other.example:443 HTTP/1.1\r\nHost: other.example\r\n\r\n")
+                .expect("the request goes out");
+            let mut answer = String::new();
+            sock.read_to_string(&mut answer).expect("the refusal");
+
+            let text = buf.text();
+            assert!(
+                text.contains("denied other.example:443: no allow-host covers it"),
+                "{verbose}: {text}"
+            );
+            assert_eq!(
+                text.contains("tunnel to api.example:"),
+                verbose,
+                "{verbose}: {text}"
+            );
+            assert_eq!(text.contains("listening on"), verbose, "{verbose}: {text}");
+        }
+    }
+
     #[test]
     fn a_log_clock_that_goes_backwards_does_not_panic() {
         let buf = Buf::default();
-        let log = Log::new(Box::new(buf.clone()));
+        let log = Log::new(Box::new(buf.clone()), false);
         let start = Instant::now() + LOG_WINDOW * 10;
         log.at(start, "one");
         log.at(start - LOG_WINDOW * 5, "two");

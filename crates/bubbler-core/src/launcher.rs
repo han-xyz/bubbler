@@ -787,6 +787,7 @@ pub fn explain_net_proxy(
             ready: OsStr::new("<ready-fd>"),
             log: OsStr::new("2"),
         },
+        env.net_proxy_log,
     );
     // One option and its value to a line, which is how the grammar
     // reads and how the launcher builds it.
@@ -1717,7 +1718,7 @@ fn start_network(
     install_rules(cfg, &ns, cgroup.map(cgroup::SandboxCgroup::spec))?;
     let pasta = start_pasta(env, cfg, child_pid, &ns)?;
     let proxy = cgroup
-        .map(|cgroup| start_net_proxy(cfg, &ns, cgroup))
+        .map(|cgroup| start_net_proxy(cfg, &ns, cgroup, env.net_proxy_log))
         .transpose()?;
     Ok(NetworkSidecars { pasta, proxy })
 }
@@ -1735,10 +1736,16 @@ fn start_network(
 /// It is exec'd from [`network::NET_PROXY_INSIDE`], which the sandbox's
 /// own argv bound: after the mount join a host path of bubbler's
 /// resolves to nothing.
+///
+/// `log_tunnels` is [`crate::env::Env::net_proxy_log`]: the proxy's
+/// lines land on bubbler's stderr, which is the terminal the sandboxed
+/// application is drawing on, so only the refusals are written unless
+/// the caller asked for the rest.
 fn start_net_proxy(
     cfg: &NetworkConfig,
     ns: &SandboxNs,
     cgroup: &cgroup::SandboxCgroup,
+    log_tunnels: bool,
 ) -> Result<NetProxyHandle, LaunchError> {
     let (ready, done) = rustix::pipe::pipe().map_err(|e| LaunchError::Data(e.into()))?;
     fcntl_setfd(&ready, FdFlags::CLOEXEC).map_err(|e| LaunchError::Data(e.into()))?;
@@ -1752,6 +1759,7 @@ fn start_net_proxy(
             // The proxy's audit lines go where bubbler's own do.
             log: OsStr::new("2"),
         },
+        log_tunnels,
     );
     let mut cmd = Command::new(network::NET_PROXY_INSIDE);
     cmd.args(&argv)
@@ -2813,6 +2821,7 @@ mod tests {
             dbus_system_address: None,
             at_spi_bus_address: None,
             dbus_log: false,
+            net_proxy_log: false,
             seccomp_log: false,
             test_allow_path: None,
             profile_dir_override: None,
@@ -3068,6 +3077,7 @@ mod tests {
                 },
                 rules: &[],
                 wl_proxy: None,
+                net_proxy_log: false,
                 proxy: false,
                 full: false,
             },
@@ -4178,6 +4188,35 @@ mod tests {
             argv.iter().filter(|a| *a == "--bind").count(),
             1,
             "the socket directory is the only writable bind: {argv:?}"
+        );
+    }
+
+    /// The egress proxy's traffic log is off unless the variable asked
+    /// for it, and the explanation shows the argv a run would use: a
+    /// flag printed here and not passed there, or the other way round,
+    /// would be an explanation of a different process.
+    #[test]
+    fn the_net_proxy_is_explained_with_the_traffic_log_only_when_asked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proxy = tmp.path().join("bubbler-net-proxy");
+        std::fs::write(&proxy, b"").unwrap();
+        let inst = inst(
+            tmp.path(),
+            "network {\n    outbound \"deny\"\n    allow-host \"api.example\"\n}\n",
+        );
+        let words = |log: bool| {
+            let mut e = env(tmp.path());
+            e.net_proxy_override = Some(proxy.clone());
+            e.net_proxy_log = log;
+            let items = explain_net_proxy(&e, &inst)
+                .expect("the proxy binary is there")
+                .expect("an `allow-host` starts one");
+            strs(&items.into_iter().flat_map(|i| i.args).collect::<Vec<_>>())
+        };
+        assert!(!words(false).iter().any(|w| w == "--log-tunnels"));
+        assert_eq!(
+            words(true).last().map(String::as_str),
+            Some("--log-tunnels")
         );
     }
 

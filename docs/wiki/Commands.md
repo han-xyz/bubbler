@@ -72,7 +72,8 @@ bubbler man [--config]                  bubbler(1) / bubbler-config(5) as roff o
 - Instance names: `[A-Za-z0-9._-]`, not starting with `-`, not `try-<digits>`.
 - Environment: `HOME` and `XDG_RUNTIME_DIR` must be set. `BUBBLER_PROFILE_DIR`
   replaces the system profile layer; `BUBBLER_DBUS_LOG=1` logs every filtered
-  D-Bus message; `BUBBLER_SECCOMP_LOG=1` logs denied syscalls instead of
-  denying them (for profile writing only). With `a11y`, `AT_SPI_BUS_ADDRESS`
-  is where bubbler looks for the accessibility bus before it asks
-  `org.a11y.Bus` itself, over its own session-bus client.
+  D-Bus message; `BUBBLER_NET_PROXY_LOG=1` logs every tunnel the egress proxy
+  opens (its refusals are logged either way); `BUBBLER_SECCOMP_LOG=1` logs
+  denied syscalls instead of denying them (for profile writing only). With
+  `a11y`, `AT_SPI_BUS_ADDRESS` is where bubbler looks for the accessibility bus
+  before it asks `org.a11y.Bus` itself, over its own session-bus client.

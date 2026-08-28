@@ -157,12 +157,21 @@ the run one level deeper than usual; both leaves are removed at teardown, and
 a `SIGKILL`ed bubbler leaves two empty directories that the next run of that
 instance sweeps.
 
-The proxy writes its tunnels and refusals to bubbler's own stderr, at most 20
-lines a second plus a count of what was suppressed:
+The proxy writes to bubbler's own stderr, at most 20 lines a second plus a
+count of what was suppressed. By default that is its refusals and its own
+failures and nothing else — the same terminal is where a full-screen
+application inside the sandbox is drawing, and a line per tunnel lands in the
+middle of its frame:
 
 ```
-bubbler-net-proxy: tunnel to api.example.com:443
 bubbler-net-proxy: denied unlisted.example:443: no allow-host covers it
+```
+
+`BUBBLER_NET_PROXY_LOG=1` adds the startup line and one line per tunnel:
+
+```
+bubbler-net-proxy: listening on 127.0.0.1:3128 for 2 allowed targets
+bubbler-net-proxy: tunnel to api.example.com:443
 ```
 
 `bubbler run <inst> --explain` shows the proxy's argv and the seven values

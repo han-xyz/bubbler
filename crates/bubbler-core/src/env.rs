@@ -77,6 +77,10 @@ pub struct Env {
     /// `$BUBBLER_DBUS_LOG=1`: run the D-Bus proxy with `--log`, which
     /// prints every filtered message to bubbler's stderr.
     pub dbus_log: bool,
+    /// `$BUBBLER_NET_PROXY_LOG=1`: run the egress proxy with
+    /// `--log-tunnels`, so every tunnel it opens is printed to bubbler's
+    /// stderr; refusals are printed regardless.
+    pub net_proxy_log: bool,
     /// `$BUBBLER_SECCOMP_LOG=1`: the seccomp filter logs what it would
     /// have denied to the audit log instead of denying it, which is how a
     /// profile's `seccomp` node is worked out. Not a sandbox at all.

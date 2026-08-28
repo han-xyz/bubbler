@@ -195,10 +195,11 @@ const ENVIRONMENT: &[(&str, &str)] = &[
          it names is a root no share may reach, wherever it is pointed.",
     ),
     (
-        "BUBBLER_DBUS_LOG, BUBBLER_SECCOMP_LOG",
-        "=1 runs the D-Bus proxy with --log, and compiles the seccomp filter to log what it \
-         would have denied instead of denying it. Both are debugging aids and both weaken \
-         nothing on their own.",
+        "BUBBLER_DBUS_LOG, BUBBLER_NET_PROXY_LOG, BUBBLER_SECCOMP_LOG",
+        "=1 runs the D-Bus proxy with --log, prints every tunnel the egress proxy opens (its \
+         refusals are printed either way), and compiles the seccomp filter to log what it \
+         would have denied instead of denying it. All three are debugging aids and all three \
+         weaken nothing on their own.",
     ),
     (
         "BUBBLER_TEST_ALLOW_PATH",

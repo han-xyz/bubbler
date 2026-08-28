@@ -1459,6 +1459,7 @@ mod tests {
             dbus_system_address: None,
             at_spi_bus_address: None,
             dbus_log: false,
+            net_proxy_log: false,
             seccomp_log: false,
             test_allow_path: None,
             profile_dir_override: None,

@@ -544,7 +544,12 @@ pub const PROXY_PORT: u16 = 3128;
 /// them off a filesystem: it runs inside the sandbox's mount namespace,
 /// where `/etc` and `/run` are the application's to write and NSS would
 /// ask the application what a name resolves to.
-pub fn net_proxy_argv(cfg: &NetworkConfig, fds: ProxyFds<'_>) -> Vec<OsString> {
+///
+/// `log_tunnels` is [`crate::env::Env::net_proxy_log`]: without it the
+/// proxy writes its refusals and its own failures and nothing about the
+/// traffic it carried, because the descriptor those lines go to is the
+/// terminal the sandboxed application is drawing on.
+pub fn net_proxy_argv(cfg: &NetworkConfig, fds: ProxyFds<'_>, log_tunnels: bool) -> Vec<OsString> {
     let mut argv = Vec::new();
     for allowed in &cfg.allow_hosts {
         argv.push(OsString::from("--allow"));
@@ -563,6 +568,9 @@ pub fn net_proxy_argv(cfg: &NetworkConfig, fds: ProxyFds<'_>) -> Vec<OsString> {
     argv.push(fds.ready.to_os_string());
     argv.push(OsString::from("--log-fd"));
     argv.push(fds.log.to_os_string());
+    if log_tunnels {
+        argv.push(OsString::from("--log-tunnels"));
+    }
     argv
 }
 
@@ -1620,7 +1628,8 @@ mod tests {
                 ProxyFds {
                     ready: OsStr::new("5"),
                     log: OsStr::new("2"),
-                }
+                },
+                false,
             )),
             [
                 "--allow",
@@ -1637,6 +1646,18 @@ mod tests {
                 "2",
             ]
         );
+        // The traffic log is the one thing about the argv a variable of
+        // the caller's decides, and it is the last word of it.
+        let loud = strs(&net_proxy_argv(
+            &cfg,
+            ProxyFds {
+                ready: OsStr::new("5"),
+                log: OsStr::new("2"),
+            },
+            true,
+        ));
+        assert_eq!(loud.last().map(String::as_str), Some("--log-tunnels"));
+        assert_eq!(loud.len(), 13);
     }
 
     /// The resolvers in the argv are the ones the ruleset opens port 53
@@ -1662,6 +1683,7 @@ mod tests {
                 ready: OsStr::new("5"),
                 log: OsStr::new("2"),
             },
+            false,
         ));
         let named: Vec<&String> = argv
             .iter()
@@ -1692,6 +1714,7 @@ mod tests {
                 ready: OsStr::new("5"),
                 log: OsStr::new("2"),
             },
+            false,
         ));
         let i = argv.iter().position(|a| a == "--port").expect("--port");
         assert_eq!(argv[i + 1], PROXY_PORT.to_string());
@@ -1725,6 +1748,7 @@ mod tests {
             dbus_system_address: None,
             at_spi_bus_address: None,
             dbus_log: false,
+            net_proxy_log: false,
             seccomp_log: false,
             test_allow_path: None,
             profile_dir_override: None,

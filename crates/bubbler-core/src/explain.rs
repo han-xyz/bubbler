@@ -72,6 +72,10 @@ pub struct View<'a> {
     /// of the sandbox's own argv shows; `None` where the config grants
     /// no sandboxed `wayland` and so starts none.
     pub wl_proxy: Option<&'a wayland::ProxyPlan>,
+    /// Whether the egress proxy will be run with `--log-tunnels`, which
+    /// is [`crate::env::Env::net_proxy_log`] and shows in its sidecar
+    /// line; nothing else of the explanation depends on it.
+    pub net_proxy_log: bool,
     /// The sidecar's argv rather than the sandbox's: its groups are the
     /// rules themselves, and a grant that contributes neither an argument
     /// nor a rule to it is not a group of it.
@@ -339,7 +343,7 @@ fn placeholder_cgroup(instance: &str) -> Option<network::Cgroup> {
 /// The descriptor it reports readiness on is only known once the run has
 /// made the pipe, so it is named here rather than numbered; the log
 /// descriptor is bubbler's own stderr, always.
-fn net_proxy_line(cfg: &NetworkConfig) -> Option<String> {
+fn net_proxy_line(cfg: &NetworkConfig, log_tunnels: bool) -> Option<String> {
     if cfg.allow_hosts.is_empty() {
         return None;
     }
@@ -349,6 +353,7 @@ fn net_proxy_line(cfg: &NetworkConfig) -> Option<String> {
             ready: OsStr::new("<ready-fd>"),
             log: OsStr::new("2"),
         },
+        log_tunnels,
     );
     let mut line = format!("    sidecar: {}", network::NET_PROXY_INSIDE);
     for a in &argv {
@@ -496,7 +501,7 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
                     // connects the namespace is the process below.
                     Some(Service::Network(cfg)) if cfg.is_isolated() => {
                         out.push(sidecar_line(cfg));
-                        out.extend(net_proxy_line(cfg));
+                        out.extend(net_proxy_line(cfg, view.net_proxy_log));
                         out.extend(ruleset_lines(cfg, view.instance));
                     }
                     // The one `--ro-bind` names the proxy's own socket
@@ -713,6 +718,7 @@ mod tests {
                 },
                 rules: &rules,
                 wl_proxy: None,
+                net_proxy_log: false,
                 proxy: false,
                 full: false,
             },
@@ -784,6 +790,7 @@ bwrap
                 },
                 rules: &[],
                 wl_proxy: None,
+                net_proxy_log: false,
                 proxy: false,
                 full: false,
             },
@@ -833,6 +840,7 @@ bwrap
                     },
                     rules: &[],
                     wl_proxy: Some(&plan),
+                    net_proxy_log: false,
                     proxy: false,
                     full: false,
                 },
@@ -867,6 +875,7 @@ bwrap
                     },
                     rules: &[],
                     wl_proxy: None,
+                    net_proxy_log: false,
                     proxy: false,
                     full: false,
                 },
@@ -966,6 +975,7 @@ bwrap
                 },
                 rules: &rules,
                 wl_proxy: None,
+                net_proxy_log: false,
                 proxy: false,
                 full: false,
             },
@@ -1018,6 +1028,7 @@ bwrap
                     },
                     rules: &bare_rules,
                     wl_proxy: None,
+                    net_proxy_log: false,
                     proxy: false,
                     full: false,
                 },
@@ -1053,6 +1064,7 @@ bwrap
                 },
                 rules: &node_rules,
                 wl_proxy: None,
+                net_proxy_log: false,
                 proxy: false,
                 full: false,
             },
@@ -1079,6 +1091,7 @@ bwrap
                 },
                 rules: &[],
                 wl_proxy: None,
+                net_proxy_log: false,
                 proxy: false,
                 full: true,
             },
@@ -1122,6 +1135,7 @@ bwrap
                 },
                 rules: &[],
                 wl_proxy: None,
+                net_proxy_log: false,
                 proxy: false,
                 full: false,
             },
@@ -1165,6 +1179,7 @@ bwrap
             },
             rules: &rules,
             wl_proxy: None,
+            net_proxy_log: false,
             proxy: true,
             full: true,
         };
@@ -1198,6 +1213,7 @@ bwrap
                 },
                 rules: &[],
                 wl_proxy: None,
+                net_proxy_log: false,
                 proxy: false,
                 full: false,
             },
@@ -1237,6 +1253,7 @@ bwrap
                 },
                 rules: &[],
                 wl_proxy: None,
+                net_proxy_log: false,
                 proxy: false,
                 full: false,
             },
@@ -1274,6 +1291,7 @@ bwrap
                 },
                 rules: &[],
                 wl_proxy: None,
+                net_proxy_log: false,
                 proxy: false,
                 full: false,
             },
@@ -1302,6 +1320,7 @@ bwrap
                 },
                 rules: &[],
                 wl_proxy: None,
+                net_proxy_log: false,
                 proxy: false,
                 full: false,
             },
@@ -1373,6 +1392,7 @@ bwrap
             },
             rules: &[],
             wl_proxy: None,
+            net_proxy_log: false,
             proxy: false,
             full: false,
         };
@@ -1421,6 +1441,7 @@ bwrap
                 },
                 rules: &[],
                 wl_proxy: None,
+                net_proxy_log: false,
                 proxy: false,
                 full: false,
             },

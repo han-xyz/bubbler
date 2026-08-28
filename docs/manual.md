@@ -1722,8 +1722,13 @@ it connects. Two consequences worth knowing before writing the node:
 
 **What it prints.** The proxy's `--log-fd` is bubbler's own stderr, never a
 file. Its budget is 20 lines a second, after which the count of what was
-swallowed is printed in the next window. Measured on a real run of the
-integration test, with the sandbox's own probes interleaved:
+swallowed is printed in the next window. What it writes by default is its
+refusals and its own failures: the stderr it writes to is the terminal the
+sandboxed application draws on, and a full-screen one is redrawn over by a line
+per tunnel. `BUBBLER_NET_PROXY_LOG=1` adds the startup line and one line for
+every tunnel opened, which is what the transcript below was taken with —
+measured on a real run of the integration test, with the sandbox's own probes
+interleaved:
 
     bubbler-net-proxy: listening on 127.0.0.1:3128 for 2 allowed targets
     bubbler-net-proxy: tunnel to localhost:45123
@@ -2912,6 +2917,8 @@ every other application's items.
 
 `BUBBLER_DBUS_LOG=1` runs the proxy with `--log`, so every filtered message is
 printed to bubbler's stderr, for each bus the instance is granted.
+Its counterpart for the egress proxy is `BUBBLER_NET_PROXY_LOG=1`, which runs
+that one with `--log-tunnels` — see "Egress by name: allow-host".
 
 `portals` also publishes the instance's identity on the host, as
 `$XDG_RUNTIME_DIR/.flatpak/bubbler-<name>/bwrapinfo.json`: bwrap's own

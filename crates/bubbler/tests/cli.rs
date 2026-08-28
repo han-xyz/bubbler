@@ -8593,6 +8593,16 @@ fn real_allow_host_relays_a_listed_name_and_nothing_else() {
     // 9. Neither refusal was a relay that failed late: nothing ever
     //    reached the echo the two names pointed at.
     assert_eq!(line("echoed"), "0", "{got}{err}");
+    // 10. What the run printed: the refusals, and not a word about the
+    //     traffic. This stderr is the terminal a sandboxed application
+    //     draws on, so the tunnel lines wait for `BUBBLER_NET_PROXY_LOG`,
+    //     which nothing here sets.
+    assert!(
+        err.contains("bubbler-net-proxy: denied unlisted.invalid"),
+        "{got}{err}"
+    );
+    assert!(!err.contains("tunnel to"), "{got}{err}");
+    assert!(!err.contains("listening on"), "{got}{err}");
 }
 
 /// The escape a review measured against the first version of this
