@@ -23,6 +23,12 @@ pub trait Host {
     /// user cannot write is forwarded to the document portal read-only,
     /// so this decides what a sandbox is granted, not what it is told.
     fn writable(&self, p: &Path) -> bool;
+    /// The target of `p` when `p` is itself a symlink, with nothing
+    /// followed; `None` when it is any other type or is not there.
+    /// [`Host::file_type`] follows links and cannot answer this, and the
+    /// answer is what says whether a destination bwrap creates would be
+    /// created somewhere else.
+    fn read_link(&self, p: &Path) -> Option<PathBuf>;
 }
 
 /// The real filesystem.
@@ -35,6 +41,10 @@ impl Host for RealHost {
 
     fn canonicalize(&self, p: &Path) -> Option<PathBuf> {
         fs::canonicalize(p).ok()
+    }
+
+    fn read_link(&self, p: &Path) -> Option<PathBuf> {
+        fs::read_link(p).ok()
     }
 
     /// A mount point holds a different device number than the directory
@@ -154,6 +164,11 @@ pub(crate) mod fake {
         /// permissions of a real file.
         fn writable(&self, p: &Path) -> bool {
             self.writable.contains(p)
+        }
+        /// Exactly the paths [`FakeHost::link`] named: a link is a link
+        /// at its own path, whatever `canonicalize` rewrites under it.
+        fn read_link(&self, p: &Path) -> Option<PathBuf> {
+            self.links.get(p).cloned()
         }
         fn list_dir(&self, p: &Path) -> Vec<OsString> {
             let mut v: Vec<OsString> = self

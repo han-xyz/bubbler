@@ -12,7 +12,7 @@ use std::fs::FileType;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Component, Path, PathBuf};
 
-use crate::bwrap::{BwrapArgs, Origin};
+use crate::bwrap::{BwrapArgs, Explained, Origin};
 use crate::config::{self, RESERVED_ENV, Service, Share, ShareMode, X11Mode};
 use crate::dbus;
 use crate::env::{Env, SANDBOX_HOME};
@@ -1419,6 +1419,116 @@ fn app_runtime(env: &Env, args: &mut BwrapArgs, id: &str, mode: ShareMode) {
     }
 }
 
+/// bwrap operations that create a path inside the sandbox, and how many
+/// arguments stand between the flag and that path. `--perms` and
+/// `--size` may precede the flag inside one operation, so the flag is
+/// looked for rather than assumed to be first.
+const CREATES: &[(&str, usize)] = &[
+    ("--bind", 2),
+    ("--bind-try", 2),
+    ("--ro-bind", 2),
+    ("--ro-bind-try", 2),
+    ("--dev-bind", 2),
+    ("--dev-bind-try", 2),
+    ("--symlink", 2),
+    ("--bind-data", 2),
+    ("--ro-bind-data", 2),
+    ("--file", 2),
+    ("--dir", 1),
+];
+
+/// The path one operation creates inside the sandbox, or `None` for an
+/// operation that creates none.
+fn destination(op: &Explained) -> Option<&OsStr> {
+    for (i, arg) in op.args.iter().enumerate() {
+        if let Some((_, at)) = CREATES.iter().find(|(flag, _)| arg == OsStr::new(flag)) {
+            return op.args.get(i + at).map(OsString::as_os_str);
+        }
+    }
+    None
+}
+
+/// The trees an application inside the sandbox may write, read off the
+/// argv itself: each is a bind whose destination the sandbox can create
+/// files in, paired with the host directory behind it. Read-only binds
+/// are here too — one id's `app-runtime` directory is writable by
+/// whichever other instance names the same id, and a link planted there
+/// is planted for this run as well.
+fn writable_trees(ops: &[Explained], env: &Env) -> Vec<(PathBuf, PathBuf, &'static str)> {
+    let app = env.runtime_dir.join("app");
+    let doc = env.runtime_dir.join("doc");
+    let mut out = Vec::new();
+    for op in ops {
+        let [flag, src, dst] = op.args.as_slice() else {
+            continue;
+        };
+        if flag != OsStr::new("--bind") && flag != OsStr::new("--ro-bind") {
+            continue;
+        }
+        let dst = Path::new(dst);
+        let tree = if dst == Path::new(SANDBOX_HOME) {
+            "the instance home"
+        } else if dst.parent() == Some(app.as_path()) {
+            "the app-runtime directory"
+        } else if dst == doc.as_path() {
+            "the document view"
+        } else {
+            continue;
+        };
+        out.push((PathBuf::from(src), dst.to_path_buf(), tree));
+    }
+    out
+}
+
+/// Refuse the launch when a path the argv has bwrap create sits behind a
+/// symlink inside a tree the application can write.
+///
+/// bubblewrap below 0.12.0 creates the parents of a destination without
+/// checking for links on the way, so an application that plants
+/// `Downloads -> /oldroot/<victim>` in its own home has the next launch
+/// write into `<victim>` outside the sandbox (GHSA-pxhw-h44j-8pfx,
+/// reproduced on 0.11.2). The sweep runs whatever version the host has:
+/// it costs one `lstat` per component and it is the mitigation the
+/// warning points at.
+///
+/// Every component of the destination's path relative to its tree is
+/// `lstat`ed at the tree's real location on the host, the last one
+/// included — the destination itself is what bwrap creates. Nothing is
+/// deleted: what planted the link is what the user has to see.
+pub fn sweep_destinations(
+    ops: &[Explained],
+    env: &Env,
+    host: &dyn Host,
+) -> Result<(), LaunchError> {
+    let trees = writable_trees(ops, env);
+    for op in ops {
+        let Some(dst) = destination(op) else {
+            continue;
+        };
+        let dst = Path::new(dst);
+        for (host_root, inside_root, tree) in &trees {
+            let Ok(rel) = dst.strip_prefix(inside_root) else {
+                continue;
+            };
+            let mut on_host = host_root.clone();
+            let mut inside = inside_root.clone();
+            for part in rel.components() {
+                on_host.push(part);
+                inside.push(part);
+                if let Some(target) = host.read_link(&on_host) {
+                    return Err(LaunchError::PlantedSymlink {
+                        inside,
+                        tree,
+                        target,
+                        host: host_root.clone(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1467,6 +1577,15 @@ mod tests {
             pasta_override: None,
             wl_proxy_override: None,
             net_proxy_override: None,
+        }
+    }
+
+    /// One operation of an argv, as [`crate::bwrap::Explained`] carries it.
+    fn op(args: &[&str]) -> crate::bwrap::Explained {
+        crate::bwrap::Explained {
+            origin: Origin::Baseline,
+            args: args.iter().map(OsString::from).collect(),
+            note: None,
         }
     }
 
@@ -2316,6 +2435,9 @@ mod tests {
             }
             fn writable(&self, p: &Path) -> bool {
                 Host::writable(&self.0, p)
+            }
+            fn read_link(&self, p: &Path) -> Option<PathBuf> {
+                self.0.read_link(p)
             }
         }
         let e = env();
@@ -4286,5 +4408,152 @@ mod tests {
                 "{key}"
             );
         }
+    }
+
+    /// The reproduced attack: an application inside the sandbox plants
+    /// `Downloads -> /oldroot/<victim>` in its own home, and the next
+    /// launch has bwrap create the bind destination there. bubblewrap
+    /// below 0.12.0 follows it and writes outside the sandbox, so the
+    /// launch is refused before bwrap is ever started.
+    #[test]
+    fn a_bind_destination_behind_a_planted_symlink_refuses_the_launch() {
+        let e = env();
+        let inside = Path::new(SANDBOX_HOME);
+        let home = Path::new("/home/user/.local/share/bubbler/instances/t/home");
+        let ops = vec![
+            op(&["--bind", &home.display().to_string(), SANDBOX_HOME]),
+            op(&[
+                "--ro-bind",
+                "/home/user/Downloads",
+                &inside.join("Downloads").display().to_string(),
+            ]),
+        ];
+        let host = FakeHost::default().link(
+            "/home/user/.local/share/bubbler/instances/t/home/Downloads",
+            "/oldroot/home/user/.config",
+        );
+        let err = sweep_destinations(&ops, &e, &host).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("refusing to start"), "{text}");
+        assert!(
+            text.contains("/home/bubbler/Downloads is a symlink"),
+            "{text}"
+        );
+        assert!(text.contains("in the instance home"), "{text}");
+        assert!(text.contains("-> /oldroot/home/user/.config"), "{text}");
+        assert!(text.contains("an app may have planted it"), "{text}");
+        assert!(text.contains(&home.display().to_string()), "{text}");
+
+        // A plain directory in the same place is what the sandbox is for.
+        let (_, dir, _) = fake::types();
+        let plain = FakeHost::default().with(
+            "/home/user/.local/share/bubbler/instances/t/home/Downloads",
+            dir,
+        );
+        assert!(sweep_destinations(&ops, &e, &plain).is_ok());
+    }
+
+    /// Every component of the path is checked, not only the last: a link
+    /// one level up carries the destination out of the sandbox just as
+    /// well. And the cookie `x11 "host"` writes is a destination too.
+    #[test]
+    fn the_sweep_walks_every_component_and_every_kind_of_destination() {
+        let e = env();
+        let home = "/home/user/.local/share/bubbler/instances/t/home";
+        let base = op(&["--bind", home, SANDBOX_HOME]);
+
+        let deep = vec![
+            base.clone(),
+            op(&["--ro-bind", "/etc/hosts", "/home/bubbler/a/b/hosts"]),
+        ];
+        let host = FakeHost::default().link(&format!("{home}/a"), "/oldroot/etc");
+        let err = sweep_destinations(&deep, &e, &host).unwrap_err();
+        assert!(
+            err.to_string().contains("/home/bubbler/a is a symlink"),
+            "{err}"
+        );
+
+        let cookie = vec![
+            base.clone(),
+            op(&[
+                "--ro-bind",
+                "/run/user/1000/Xauthority",
+                "/home/bubbler/.Xauthority",
+            ]),
+        ];
+        let host = FakeHost::default().link(&format!("{home}/.Xauthority"), "/oldroot/xauth");
+        assert!(sweep_destinations(&cookie, &e, &host).is_err());
+
+        // A `--symlink` and a `--ro-bind-data` create a destination too;
+        // `--perms` sits in front of the data one, so the flag is looked
+        // for rather than assumed first.
+        let others = vec![
+            base.clone(),
+            op(&["--symlink", "/usr/bin/sh", "/home/bubbler/sh"]),
+            op(&[
+                "--perms",
+                "0644",
+                "--ro-bind-data",
+                "7",
+                "/home/bubbler/.config/x",
+            ]),
+            op(&["--perms", "0700", "--dir", "/home/bubbler/state"]),
+        ];
+        for planted in [".config", "sh", "state"] {
+            let host = FakeHost::default().link(&format!("{home}/{planted}"), "/oldroot/x");
+            assert!(
+                sweep_destinations(&others, &e, &host).is_err(),
+                "a planted `{planted}` was not caught"
+            );
+        }
+    }
+
+    /// The app-runtime leaf and the document view are the other two trees
+    /// the application can write; nothing outside the three is swept, so
+    /// a symlink on the host's own `/etc` is not bubbler's business.
+    #[test]
+    fn the_app_runtime_leaf_and_the_document_view_are_swept_and_nothing_else_is() {
+        let e = env();
+        let ops = vec![
+            op(&["--bind", "/i/home", SANDBOX_HOME]),
+            op(&[
+                "--bind",
+                "/run/user/1000/app/org.example.App",
+                "/run/user/1000/app/org.example.App",
+            ]),
+            op(&[
+                "--bind",
+                "/run/user/1000/doc/by-app/org.bubbler.t",
+                "/run/user/1000/doc",
+            ]),
+            op(&["--ro-bind", "/etc/hosts", "/etc/hosts"]),
+        ];
+        let host =
+            FakeHost::default().link("/run/user/1000/app/org.example.App/sock", "/oldroot/x");
+        let more = {
+            let mut v = ops.clone();
+            v.push(op(&[
+                "--ro-bind",
+                "/tmp/s",
+                "/run/user/1000/app/org.example.App/sock",
+            ]));
+            v
+        };
+        let err = sweep_destinations(&more, &e, &host).unwrap_err();
+        assert!(
+            err.to_string().contains("the app-runtime directory"),
+            "{err}"
+        );
+
+        let host =
+            FakeHost::default().link("/run/user/1000/doc/by-app/org.bubbler.t/f", "/oldroot/x");
+        let mut docs = ops.clone();
+        docs.push(op(&["--ro-bind", "/tmp/f", "/run/user/1000/doc/f"]));
+        let err = sweep_destinations(&docs, &e, &host).unwrap_err();
+        assert!(err.to_string().contains("the document view"), "{err}");
+
+        // A link on a host path no tree covers is not swept.
+        let host = FakeHost::default().link("/etc/hosts", "/oldroot/etc/hosts");
+        assert!(sweep_destinations(&ops, &e, &host).is_ok());
     }
 }

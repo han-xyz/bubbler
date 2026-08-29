@@ -2610,7 +2610,16 @@ pub fn run(
         Some(_) => Some(cgroup::create(&inst.name, std::process::id())?),
         None => None,
     };
-    let argv = build_argv_on(env, inst, command, &mut alloc, stdio.ctty(), &RealHost)?;
+    // The operations rather than the flat argv, because the sweep below
+    // reads their destinations. Flattened again straight after, so what
+    // bwrap is handed is what `build_argv` would have produced.
+    let (args, resolved) = build_args_on(env, inst, command, stdio.ctty(), &RealHost)?;
+    let ops = args.finish_explained(resolved, &mut alloc)?;
+    // Before the spawn and after the argv: a destination behind a link an
+    // application planted is a write outside the sandbox on every bwrap
+    // below 0.12.0, and the run is refused rather than made safe.
+    service::sweep_destinations(&ops, env, &RealHost)?;
+    let argv = crate::bwrap::flatten(ops);
     let stop = Arc::new(AtomicBool::new(false));
     // What `stop` becomes once a run has seen it: `stop` is cleared as
     // the signal is acted on, this stays set for the rest of the run.
@@ -4839,5 +4848,30 @@ mod tests {
         assert_ne!(got, link("/proc/self/ns/user".to_owned()));
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// The sweep runs over the very operations a launch is built from, so
+    /// a home-share whose destination sits behind a planted link is
+    /// refused with the argv the run would have used.
+    #[test]
+    fn a_built_argv_with_a_planted_destination_is_refused_before_the_spawn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let items = explained(tmp.path(), &e, "home-share \"Downloads\"\ncommand \"true\"");
+        let home = tmp.path().join("data/bubbler/instances/t/home");
+
+        let clean = share_host(tmp.path());
+        assert!(crate::service::sweep_destinations(&items, &e, &clean).is_ok());
+
+        let planted = share_host(tmp.path()).link(
+            &home.join("Downloads").display().to_string(),
+            "/oldroot/home/user/.config",
+        );
+        let err = crate::service::sweep_destinations(&items, &e, &planted).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("/home/bubbler/Downloads is a symlink"),
+            "{err}"
+        );
     }
 }

@@ -836,7 +836,10 @@ impl BwrapArgs {
 }
 
 /// The argv again: the operations concatenated, element for element.
-fn flatten(items: Vec<Explained>) -> Vec<OsString> {
+/// Public so a caller that had to look at the operations — the
+/// destination sweep does — can still hand bwrap exactly what
+/// [`BwrapArgs::finish`] would have.
+pub fn flatten(items: Vec<Explained>) -> Vec<OsString> {
     items.into_iter().flat_map(|i| i.args).collect()
 }
 

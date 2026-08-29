@@ -1456,6 +1456,83 @@ fn home_share_through_a_symlink_out_of_the_home_is_refused() {
     );
 }
 
+/// The reproduced GHSA-pxhw-h44j-8pfx layout, planted in the instance
+/// home the way an application inside the sandbox would: bwrap below
+/// 0.12.0 follows both links and writes into `<victim>` outside the
+/// sandbox. The run is refused before bwrap starts, so `<victim>` stays
+/// empty on every bwrap, and the links are left for the user to see.
+#[test]
+fn real_bwrap_home_share_behind_a_planted_symlink_is_refused_and_the_victim_stays_empty() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    std::fs::create_dir(tmp.path().join("home/Downloads")).unwrap();
+    let victim = tmp.path().join("victim");
+    std::fs::create_dir(&victim).unwrap();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    let inst = tmp.path().join("data/bubbler/instances/t");
+    std::fs::write(
+        inst.join("config.kdl"),
+        "home-share \"Downloads\"\ncommand \"true\"\n",
+    )
+    .unwrap();
+    let downloads = inst.join("home/Downloads");
+    let cookie = inst.join("home/.Xauthority");
+    std::os::unix::fs::symlink(
+        Path::new("/oldroot").join(victim.strip_prefix("/").unwrap()),
+        &downloads,
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        Path::new("/oldroot")
+            .join(victim.strip_prefix("/").unwrap())
+            .join("xauth"),
+        &cookie,
+    )
+    .unwrap();
+
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["run", "t"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("refusing to start"), "{err}");
+    assert!(
+        err.contains("/home/bubbler/Downloads is a symlink in the instance home"),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!("-> /oldroot{}", victim.display())),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!("Remove it from {}/", inst.join("home").display())),
+        "{err}"
+    );
+    assert!(
+        std::fs::read_dir(&victim).unwrap().next().is_none(),
+        "the victim directory was written to"
+    );
+    assert!(
+        std::fs::symlink_metadata(&downloads)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        std::fs::symlink_metadata(&cookie)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
 /// `path-share` is refused for everything outside `$BUBBLER_TEST_ALLOW_PATH`
 /// here, because a temporary directory lives under the denied `/tmp`.
 #[test]

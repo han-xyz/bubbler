@@ -254,6 +254,26 @@ pub enum LaunchError {
         /// Why the value was rejected.
         reason: String,
     },
+    /// A destination bwrap would create sits behind a symlink inside a
+    /// tree the application can write. bubblewrap below 0.12.0 follows
+    /// it and creates the file outside the sandbox
+    /// (GHSA-pxhw-h44j-8pfx); bubbler never deletes the link, since what
+    /// planted it is what the user has to know about.
+    #[error(
+        "refusing to start: {inside} is a symlink in {tree} (-> {target}); an app may have \
+         planted it. Remove it from {host}/ to continue."
+    )]
+    PlantedSymlink {
+        /// Path inside the sandbox, as the argv writes it.
+        inside: PathBuf,
+        /// Which app-writable tree it is in, as a message names it.
+        tree: &'static str,
+        /// What the link points at, read without following it.
+        target: PathBuf,
+        /// Root of that tree on the host: where the link has to be
+        /// removed from.
+        host: PathBuf,
+    },
     /// Filesystem failure at a specific path.
     #[error("{0}")]
     Io(PathBuf, #[source] io::Error),
