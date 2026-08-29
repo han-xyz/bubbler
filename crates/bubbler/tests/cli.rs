@@ -2945,6 +2945,61 @@ fn run_log_of(tmp: &Path, name: &str) -> String {
     .unwrap_or_default()
 }
 
+/// `stderr` without the lines a host tool below its floor adds to every
+/// launch. They say something about the host, not the run, so a test
+/// that asserts exact output drops them to pass on any host.
+fn without_tool_warnings(stderr: &str) -> String {
+    stderr
+        .lines()
+        .filter(|l| {
+            !l.starts_with("bubbler: warning: bwrap ")
+                && !l.starts_with("bubbler: warning: xdg-dbus-proxy ")
+        })
+        .map(|l| format!("{l}\n"))
+        .collect()
+}
+
+#[test]
+fn a_run_warns_about_a_bwrap_below_the_floor_before_it_starts() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    // A `bwrap` that answers `--version` and nothing else: the warning is
+    // printed before the sandbox is built, so what the run does after is
+    // beside the point, and this way the answer does not depend on the
+    // host's own bwrap.
+    let path = tmp.path().join("bin");
+    std::fs::create_dir(&path).unwrap();
+    let fake = path.join("bwrap");
+    for (version, warns) in [("0.11.2", true), ("0.12.0", false)] {
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/usr/bin/sh\n[ \"$1\" = --version ] && echo 'bubblewrap {version}' && exit 0\nexit 1\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = bubbler(tmp.path())
+            .env("PATH", &path)
+            .args(["run", "t", "--", "/usr/bin/true"])
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        let line = err
+            .lines()
+            .find(|l| l.starts_with("bubbler: warning: bwrap "));
+        assert_eq!(line.is_some(), warns, "{version}: {err}");
+        if let Some(line) = line {
+            assert!(
+                line.starts_with("bubbler: warning: bwrap 0.11.2 "),
+                "{line}"
+            );
+            assert!(line.contains("GHSA-pxhw-h44j-8pfx"), "{line}");
+            assert!(line.contains("upgrade to 0.12.0"), "{line}");
+        }
+    }
+}
+
 #[test]
 fn dry_run_prints_the_forward_line() {
     let tmp = setup();
@@ -3198,7 +3253,7 @@ fn real_open_forwards_a_host_file() {
         .output()
         .unwrap();
     // With no terminal anywhere, `open` puts its own stderr in the log.
-    let said = run_log_of(tmp.path(), name);
+    let said = without_tool_warnings(&run_log_of(tmp.path(), name));
     let s = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "{said}");
     assert!(s.contains("handed-over"), "stdout: {s}log: {said}");
@@ -6753,7 +6808,7 @@ fn real_bwrap_run_with_a_closed_stdout_hands_the_sandbox_dev_null() {
     .stderr(Stdio::piped())
     .output()
     .unwrap();
-    let err = String::from_utf8_lossy(&out.stderr);
+    let err = without_tool_warnings(&String::from_utf8_lossy(&out.stderr));
     assert_eq!(err.trim(), "/dev/null", "{err:?}");
 }
 
