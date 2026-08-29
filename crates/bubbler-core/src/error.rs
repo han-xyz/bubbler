@@ -274,6 +274,34 @@ pub enum LaunchError {
         /// removed from.
         host: PathBuf,
     },
+    /// Whether a destination sits behind a symlink could not be told: a
+    /// component under a directory the user cannot search, or a loop on
+    /// the way. bwrap creates the destination as root of its user
+    /// namespace, which no mode stops, so what bubbler cannot see is
+    /// refused rather than passed.
+    #[error(
+        "refusing to start: cannot check whether {inside} is a symlink in {tree} ({host}: \
+         {source}); make it readable or remove it"
+    )]
+    UncheckedDestination {
+        /// Path inside the sandbox, as the argv writes it.
+        inside: PathBuf,
+        /// Which app-writable tree it is in, as a message names it.
+        tree: &'static str,
+        /// The host path the check failed at.
+        host: PathBuf,
+        /// Why `lstat` could not answer.
+        #[source]
+        source: io::Error,
+    },
+    /// A destination the argv was built with has a `..` or a root
+    /// component, which the symlink sweep cannot walk on the host.
+    /// bubbler builds every destination itself, so this is a bug in the
+    /// builder; refusing keeps the sweep honest about what it checked.
+    #[error(
+        "refusing to start: destination {0} has a `..` or root component the symlink sweep cannot walk"
+    )]
+    UnwalkableDestination(PathBuf),
     /// Filesystem failure at a specific path.
     #[error("{0}")]
     Io(PathBuf, #[source] io::Error),

@@ -1422,7 +1422,10 @@ fn app_runtime(env: &Env, args: &mut BwrapArgs, id: &str, mode: ShareMode) {
 /// bwrap operations that create a path inside the sandbox, and how many
 /// arguments stand between the flag and that path. `--perms` and
 /// `--size` may precede the flag inside one operation, so the flag is
-/// looked for rather than assumed to be first.
+/// looked for rather than assumed to be first. The overlay family is
+/// here for completeness though the builder never emits it; a test
+/// holds every flag the builder can emit to either this list or the
+/// one of flags that create nothing.
 const CREATES: &[(&str, usize)] = &[
     ("--bind", 2),
     ("--bind-try", 2),
@@ -1435,6 +1438,13 @@ const CREATES: &[(&str, usize)] = &[
     ("--ro-bind-data", 2),
     ("--file", 2),
     ("--dir", 1),
+    ("--tmpfs", 1),
+    ("--proc", 1),
+    ("--dev", 1),
+    ("--mqueue", 1),
+    ("--overlay", 3),
+    ("--tmp-overlay", 1),
+    ("--ro-overlay", 1),
 ];
 
 /// The path one operation creates inside the sandbox, or `None` for an
@@ -1493,15 +1503,28 @@ fn writable_trees(ops: &[Explained], env: &Env) -> Vec<(PathBuf, PathBuf, &'stat
 ///
 /// Every component of the destination's path relative to its tree is
 /// `lstat`ed at the tree's real location on the host, the last one
-/// included — the destination itself is what bwrap creates. Nothing is
+/// included — the destination itself is what bwrap creates. A component
+/// that cannot be `lstat`ed refuses the run as well: bwrap creates the
+/// destination as root of its user namespace, past a mode that stops
+/// bubbler, so an unreadable directory is not a clean one. Nothing is
 /// deleted: what planted the link is what the user has to see.
+///
+/// No lock keeps a concurrently running instance of the same sandbox
+/// from planting a link between this check and bwrap's own `mkdir`;
+/// only bwrap 0.12.0 and later closes that window, which is what the
+/// version warning points at.
 pub fn sweep_destinations(
     ops: &[Explained],
     env: &Env,
     host: &dyn Host,
 ) -> Result<(), LaunchError> {
     let trees = writable_trees(ops, env);
-    for op in ops {
+    // bwrap reads options up to the first `--`; everything after it is
+    // bubbler-init's argv, whatever flags it spells.
+    let bwrap_ops = ops
+        .iter()
+        .take_while(|op| op.args.first().map(OsString::as_os_str) != Some(OsStr::new("--")));
+    for op in bwrap_ops {
         let Some(dst) = destination(op) else {
             continue;
         };
@@ -1513,15 +1536,29 @@ pub fn sweep_destinations(
             let mut on_host = host_root.clone();
             let mut inside = inside_root.clone();
             for part in rel.components() {
-                on_host.push(part);
-                inside.push(part);
-                if let Some(target) = host.read_link(&on_host) {
-                    return Err(LaunchError::PlantedSymlink {
-                        inside,
-                        tree,
-                        target,
-                        host: host_root.clone(),
-                    });
+                let Component::Normal(name) = part else {
+                    return Err(LaunchError::UnwalkableDestination(dst.to_path_buf()));
+                };
+                on_host.push(name);
+                inside.push(name);
+                match host.read_link(&on_host) {
+                    Ok(None) => {}
+                    Ok(Some(target)) => {
+                        return Err(LaunchError::PlantedSymlink {
+                            inside,
+                            tree,
+                            target,
+                            host: host_root.clone(),
+                        });
+                    }
+                    Err(source) => {
+                        return Err(LaunchError::UncheckedDestination {
+                            inside,
+                            tree,
+                            host: on_host,
+                            source,
+                        });
+                    }
                 }
             }
         }
@@ -2436,7 +2473,7 @@ mod tests {
             fn writable(&self, p: &Path) -> bool {
                 Host::writable(&self.0, p)
             }
-            fn read_link(&self, p: &Path) -> Option<PathBuf> {
+            fn read_link(&self, p: &Path) -> std::io::Result<Option<PathBuf>> {
                 self.0.read_link(p)
             }
         }
@@ -4555,5 +4592,123 @@ mod tests {
         // A link on a host path no tree covers is not swept.
         let host = FakeHost::default().link("/etc/hosts", "/oldroot/etc/hosts");
         assert!(sweep_destinations(&ops, &e, &host).is_ok());
+    }
+
+    /// A directory the app `chmod 000`'d hides what is under it from
+    /// bubbler's `lstat` and from nothing bwrap does as root of its user
+    /// namespace, so a component that cannot be checked refuses the run
+    /// the same as a link would, naming the host path to make readable.
+    #[test]
+    fn a_destination_component_that_cannot_be_checked_refuses_the_launch() {
+        let e = env();
+        let home = "/home/user/.local/share/bubbler/instances/t/home";
+        let ops = vec![
+            op(&["--bind", home, SANDBOX_HOME]),
+            op(&["--ro-bind", "/home/user/a/b/c", "/home/bubbler/a/b/c"]),
+        ];
+        let host = FakeHost::default()
+            .unreadable(&format!("{home}/a/b"))
+            .link(&format!("{home}/a/b"), "/oldroot/x");
+        let err = sweep_destinations(&ops, &e, &host).unwrap_err();
+        assert!(
+            matches!(err, LaunchError::UncheckedDestination { .. }),
+            "{err}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("refusing to start"), "{text}");
+        assert!(
+            text.contains(
+                "cannot check whether /home/bubbler/a/b is a symlink in the instance home"
+            ),
+            "{text}"
+        );
+        assert!(text.contains(&format!("({home}/a/b: ")), "{text}");
+        assert!(text.contains("make it readable or remove it"), "{text}");
+    }
+
+    /// bubbler builds every destination, so one with `..` in it is a
+    /// builder bug; the sweep refuses it rather than walk it into a path
+    /// it did not check.
+    #[test]
+    fn a_destination_with_a_parent_component_is_refused_as_unwalkable() {
+        let e = env();
+        let home = "/home/user/.local/share/bubbler/instances/t/home";
+        let ops = vec![
+            op(&["--bind", home, SANDBOX_HOME]),
+            op(&["--ro-bind", "/etc/hosts", "/home/bubbler/../etc/hosts"]),
+        ];
+        let err = sweep_destinations(&ops, &e, &FakeHost::default()).unwrap_err();
+        assert!(
+            matches!(err, LaunchError::UnwalkableDestination(_)),
+            "{err}"
+        );
+    }
+
+    /// Options end at bwrap's `--`; the argv bubbler-init and the command
+    /// get after it is not swept, whatever flag names it happens to use.
+    #[test]
+    fn the_sweep_stops_at_the_command_separator() {
+        let e = env();
+        let home = "/home/user/.local/share/bubbler/instances/t/home";
+        let ops = vec![
+            op(&["--bind", home, SANDBOX_HOME]),
+            op(&["--", "/init", "--socket-fd", "7"]),
+            op(&["--", "prog", "--dir", "/home/bubbler/x"]),
+        ];
+        let host = FakeHost::default().link(&format!("{home}/x"), "/oldroot/x");
+        assert!(sweep_destinations(&ops, &e, &host).is_ok());
+    }
+
+    /// Every flag the builder can emit is either one the sweep knows
+    /// creates a destination or one on the list here of flags that create
+    /// none, so a flag added to the builder without that decision fails
+    /// this test instead of leaving a destination unswept. The builder
+    /// is the one place a bwrap flag is spelled, which is what makes its
+    /// source the list to check against.
+    #[test]
+    fn every_flag_the_builder_emits_is_classified_for_the_sweep() {
+        const CREATES_NOTHING: &[&str] = &[
+            "--",
+            "--add-seccomp-fd",
+            "--block-fd",
+            "--chdir",
+            "--clearenv",
+            "--ctty",
+            "--die-with-parent",
+            "--disable-userns",
+            "--hostname",
+            "--info-fd",
+            "--new-session",
+            "--perms",
+            "--setenv",
+            "--share-net",
+            "--socket-fd",
+            "--unshare-all",
+            "--unshare-user",
+            "--wm",
+            "--x11",
+        ];
+        let source = include_str!("bwrap.rs");
+        let mut seen = std::collections::BTreeSet::new();
+        for (i, _) in source.match_indices("\"--") {
+            let rest = &source[i + 1..];
+            let flag = &rest[..rest.find('"').unwrap()];
+            if flag
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            {
+                seen.insert(flag);
+            }
+        }
+        assert!(
+            seen.contains("--ro-bind"),
+            "the scan found nothing: {seen:?}"
+        );
+        for flag in seen {
+            assert!(
+                CREATES.iter().any(|(f, _)| *f == flag) || CREATES_NOTHING.contains(&flag),
+                "`{flag}` is emitted by the builder but the sweep has no ruling on it"
+            );
+        }
     }
 }

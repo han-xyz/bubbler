@@ -1456,11 +1456,12 @@ fn home_share_through_a_symlink_out_of_the_home_is_refused() {
     );
 }
 
-/// The reproduced GHSA-pxhw-h44j-8pfx layout, planted in the instance
-/// home the way an application inside the sandbox would: bwrap below
-/// 0.12.0 follows both links and writes into `<victim>` outside the
-/// sandbox. The run is refused before bwrap starts, so `<victim>` stays
-/// empty on every bwrap, and the links are left for the user to see.
+/// The GHSA-pxhw-h44j-8pfx layout, planted in the instance home the way
+/// an application inside the sandbox would, with a share whose
+/// destination lies through the link: bwrap below 0.12.0 follows
+/// `Downloads` into `<victim>` and creates `sub` there, on the host. The
+/// run is refused before bwrap starts, so `<victim>` stays empty on
+/// every bwrap, and the link is left for the user to see.
 #[test]
 fn real_bwrap_home_share_behind_a_planted_symlink_is_refused_and_the_victim_stays_empty() {
     if !require_bwrap() {
@@ -1468,7 +1469,7 @@ fn real_bwrap_home_share_behind_a_planted_symlink_is_refused_and_the_victim_stay
     }
     let Some(init) = real_init() else { return };
     let tmp = setup();
-    std::fs::create_dir(tmp.path().join("home/Downloads")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("home/Downloads/sub")).unwrap();
     let victim = tmp.path().join("victim");
     std::fs::create_dir(&victim).unwrap();
     bubbler_live(tmp.path(), &init)
@@ -1478,21 +1479,13 @@ fn real_bwrap_home_share_behind_a_planted_symlink_is_refused_and_the_victim_stay
     let inst = tmp.path().join("data/bubbler/instances/t");
     std::fs::write(
         inst.join("config.kdl"),
-        "home-share \"Downloads\"\ncommand \"true\"\n",
+        "home-share \"Downloads/sub\"\ncommand \"true\"\n",
     )
     .unwrap();
     let downloads = inst.join("home/Downloads");
-    let cookie = inst.join("home/.Xauthority");
     std::os::unix::fs::symlink(
         Path::new("/oldroot").join(victim.strip_prefix("/").unwrap()),
         &downloads,
-    )
-    .unwrap();
-    std::os::unix::fs::symlink(
-        Path::new("/oldroot")
-            .join(victim.strip_prefix("/").unwrap())
-            .join("xauth"),
-        &cookie,
     )
     .unwrap();
 
@@ -1525,11 +1518,76 @@ fn real_bwrap_home_share_behind_a_planted_symlink_is_refused_and_the_victim_stay
             .file_type()
             .is_symlink()
     );
+}
+
+/// Puts a mode back on drop, so a directory a test made unsearchable is
+/// removable again by the time the temporary directory goes.
+struct ModeGuard(PathBuf);
+
+impl Drop for ModeGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// The same attack under a directory the application made unsearchable:
+/// `a` is mode 000 and `a/b -> /oldroot/<victim>`. bubbler cannot `lstat`
+/// `a/b`, but bwrap runs as root of its user namespace and creates
+/// `<victim>/c` all the same on 0.11.2, so what cannot be checked is
+/// refused, and the message names the host path to make readable.
+#[test]
+fn real_bwrap_home_share_under_an_unsearchable_directory_is_refused_and_the_victim_stays_empty() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    if rustix::process::geteuid().is_root() {
+        say("skipping: root is not stopped by a mode");
+        return;
+    }
+    let tmp = setup();
+    std::fs::create_dir_all(tmp.path().join("home/a/b/c")).unwrap();
+    let victim = tmp.path().join("victim");
+    std::fs::create_dir(&victim).unwrap();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    let inst = tmp.path().join("data/bubbler/instances/t");
+    std::fs::write(
+        inst.join("config.kdl"),
+        "home-share \"a/b/c\"\ncommand \"true\"\n",
+    )
+    .unwrap();
+    let a = inst.join("home/a");
+    std::fs::create_dir(&a).unwrap();
+    std::os::unix::fs::symlink(
+        Path::new("/oldroot").join(victim.strip_prefix("/").unwrap()),
+        a.join("b"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let _restore = ModeGuard(a.clone());
+
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["run", "t"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("refusing to start"), "{err}");
     assert!(
-        std::fs::symlink_metadata(&cookie)
-            .unwrap()
-            .file_type()
-            .is_symlink()
+        err.contains("cannot check whether /home/bubbler/a/b is a symlink in the instance home"),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!("({}: Permission denied", a.join("b").display())),
+        "{err}"
+    );
+    assert!(err.contains("make it readable or remove it"), "{err}");
+    assert!(
+        std::fs::read_dir(&victim).unwrap().next().is_none(),
+        "the victim directory was written to"
     );
 }
 

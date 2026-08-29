@@ -3,6 +3,7 @@
 
 use std::ffi::OsString;
 use std::fs::{self, FileType};
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// Read-only view of the host filesystem used to decide what to bind.
@@ -23,12 +24,14 @@ pub trait Host {
     /// user cannot write is forwarded to the document portal read-only,
     /// so this decides what a sandbox is granted, not what it is told.
     fn writable(&self, p: &Path) -> bool;
-    /// The target of `p` when `p` is itself a symlink, with nothing
-    /// followed; `None` when it is any other type or is not there.
-    /// [`Host::file_type`] follows links and cannot answer this, and the
-    /// answer is what says whether a destination bwrap creates would be
-    /// created somewhere else.
-    fn read_link(&self, p: &Path) -> Option<PathBuf>;
+    /// What `p` is without following it: `Ok(Some(target))` for a
+    /// symlink, `Ok(None)` for any other type or nothing there at all,
+    /// `Err` when that cannot be told — a parent the user cannot search,
+    /// a loop on the way. The answer says whether a destination bwrap
+    /// creates would be created somewhere else, and bwrap creates it as
+    /// root of its user namespace, past every mode that stops the user,
+    /// so "cannot tell" is an answer of its own and never "no".
+    fn read_link(&self, p: &Path) -> io::Result<Option<PathBuf>>;
 }
 
 /// The real filesystem.
@@ -43,8 +46,13 @@ impl Host for RealHost {
         fs::canonicalize(p).ok()
     }
 
-    fn read_link(&self, p: &Path) -> Option<PathBuf> {
-        fs::read_link(p).ok()
+    fn read_link(&self, p: &Path) -> io::Result<Option<PathBuf>> {
+        match fs::symlink_metadata(p) {
+            Ok(m) if m.file_type().is_symlink() => fs::read_link(p).map(Some),
+            Ok(_) => Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// A mount point holds a different device number than the directory
@@ -94,6 +102,7 @@ pub(crate) mod fake {
         pub mounts: BTreeSet<PathBuf>,
         pub writable: BTreeSet<PathBuf>,
         pub unresolved: BTreeSet<PathBuf>,
+        pub unreadable: BTreeSet<PathBuf>,
     }
 
     impl FakeHost {
@@ -123,6 +132,14 @@ pub(crate) mod fake {
         /// not there.
         pub fn unresolved(mut self, p: &str) -> Self {
             self.unresolved.insert(PathBuf::from(p));
+            self
+        }
+
+        /// Make `read_link` fail for exactly `p` with "permission
+        /// denied", the way `lstat` fails under a directory the user
+        /// cannot search.
+        pub fn unreadable(mut self, p: &str) -> Self {
+            self.unreadable.insert(PathBuf::from(p));
             self
         }
     }
@@ -167,8 +184,11 @@ pub(crate) mod fake {
         }
         /// Exactly the paths [`FakeHost::link`] named: a link is a link
         /// at its own path, whatever `canonicalize` rewrites under it.
-        fn read_link(&self, p: &Path) -> Option<PathBuf> {
-            self.links.get(p).cloned()
+        fn read_link(&self, p: &Path) -> io::Result<Option<PathBuf>> {
+            if self.unreadable.contains(p) {
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
+            Ok(self.links.get(p).cloned())
         }
         fn list_dir(&self, p: &Path) -> Vec<OsString> {
             let mut v: Vec<OsString> = self
