@@ -83,6 +83,11 @@ pub struct View<'a> {
     /// List the baseline instead of summing it up after its first
     /// arguments.
     pub full: bool,
+    /// The version of the `bwrap` this argv would be handed, so a reader
+    /// sees both halves of the sandbox: the arguments, and the binary
+    /// that carries them out. [`crate::version::Version::Unknown`] where
+    /// the tool could not be asked.
+    pub bwrap: crate::version::Version,
 }
 
 /// The proxy rules each node of `cfg` contributes, as (position in
@@ -474,6 +479,11 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
             ),
         };
         out.push(header.trim_end().to_owned());
+        // First line of the group rather than last: it is a fact about
+        // the baseline, not one of the arguments the elision counts.
+        if g.origin == Origin::Baseline {
+            out.push(format!("    bwrap {}", view.bwrap.text()));
+        }
         let elide = !view.full && g.origin == Origin::Baseline;
         let mut shown = 0;
         for item in &g.items {
@@ -721,6 +731,7 @@ mod tests {
                 net_proxy_log: false,
                 proxy: false,
                 full: false,
+                bwrap: crate::version::Version::Known(0, 12, 0),
             },
         )
         .unwrap();
@@ -733,6 +744,7 @@ mod tests {
 bwrap
 
   baseline                                      13 arguments
+    bwrap 0.12.0
     --unshare-all
     --die-with-parent
     --new-session
@@ -793,6 +805,7 @@ bwrap
                 net_proxy_log: false,
                 proxy: false,
                 full: false,
+                bwrap: crate::version::Version::Known(0, 12, 0),
             },
         )
         .unwrap();
@@ -843,6 +856,7 @@ bwrap
                     net_proxy_log: false,
                     proxy: false,
                     full: false,
+                    bwrap: crate::version::Version::Known(0, 12, 0),
                 },
             )
             .unwrap();
@@ -878,6 +892,7 @@ bwrap
                     net_proxy_log: false,
                     proxy: false,
                     full: false,
+                    bwrap: crate::version::Version::Known(0, 12, 0),
                 },
             )
             .unwrap()
@@ -978,6 +993,7 @@ bwrap
                 net_proxy_log: false,
                 proxy: false,
                 full: false,
+                bwrap: crate::version::Version::Known(0, 12, 0),
             },
         )
         .unwrap();
@@ -1031,6 +1047,7 @@ bwrap
                     net_proxy_log: false,
                     proxy: false,
                     full: false,
+                    bwrap: crate::version::Version::Known(0, 12, 0),
                 },
             )
             .unwrap()
@@ -1067,6 +1084,7 @@ bwrap
                 net_proxy_log: false,
                 proxy: false,
                 full: false,
+                bwrap: crate::version::Version::Known(0, 12, 0),
             },
         )
         .unwrap();
@@ -1094,6 +1112,7 @@ bwrap
                 net_proxy_log: false,
                 proxy: false,
                 full: true,
+                bwrap: crate::version::Version::Known(0, 12, 0),
             },
         )
         .unwrap();
@@ -1103,7 +1122,8 @@ bwrap
         );
         assert_eq!(out.last().unwrap(), "13 arguments in 1 group");
         assert_eq!(out[2], "  baseline  13 arguments");
-        assert_eq!(out.len(), 3 + baseline().len() + 2);
+        assert_eq!(out[3], "    bwrap 0.12.0");
+        assert_eq!(out.len(), 4 + baseline().len() + 2);
     }
 
     /// The one group order rule: a node appears where its first argument
@@ -1138,6 +1158,7 @@ bwrap
                 net_proxy_log: false,
                 proxy: false,
                 full: false,
+                bwrap: crate::version::Version::Known(0, 12, 0),
             },
         )
         .unwrap();
@@ -1182,13 +1203,14 @@ bwrap
             net_proxy_log: false,
             proxy: true,
             full: true,
+            bwrap: crate::version::Version::Known(0, 12, 0),
         };
         let out = render(&items, &view).unwrap();
         assert!(!out.iter().any(|l| l.contains("wayland")), "{out:?}");
         // The rule is the argument, not a line under a zero-argument group.
         assert!(!out.iter().any(|l| l.contains("rule-only")), "{out:?}");
-        assert_eq!(out[8], "  notify    config.kdl:3  1 argument");
-        assert_eq!(out[9], "    --talk=org.freedesktop.Notifications");
+        assert_eq!(out[9], "  notify    config.kdl:3  1 argument");
+        assert_eq!(out[10], "    --talk=org.freedesktop.Notifications");
     }
 
     /// A grant that reaches the sandbox through nothing at all on this
@@ -1216,6 +1238,7 @@ bwrap
                 net_proxy_log: false,
                 proxy: false,
                 full: false,
+                bwrap: crate::version::Version::Known(0, 12, 0),
             },
         )
         .unwrap();
@@ -1256,6 +1279,7 @@ bwrap
                 net_proxy_log: false,
                 proxy: false,
                 full: false,
+                bwrap: crate::version::Version::Known(0, 12, 0),
             },
         )
         .unwrap();
@@ -1294,12 +1318,13 @@ bwrap
                 net_proxy_log: false,
                 proxy: false,
                 full: false,
+                bwrap: crate::version::Version::Known(0, 12, 0),
             },
         )
         .unwrap();
-        assert_eq!(out[5], "  seccomp   config.kdl:2  0 arguments");
-        assert_eq!(out[6], "    rule-only: filter disabled");
-        assert_eq!(out[8], "  wayland   config.kdl:1  3 arguments");
+        assert_eq!(out[6], "  seccomp   config.kdl:2  0 arguments");
+        assert_eq!(out[7], "    rule-only: filter disabled");
+        assert_eq!(out[9], "  wayland   config.kdl:1  3 arguments");
     }
 
     /// What a `seccomp` node changed, under the arguments it did produce.
@@ -1323,6 +1348,7 @@ bwrap
                 net_proxy_log: false,
                 proxy: false,
                 full: false,
+                bwrap: crate::version::Version::Known(0, 12, 0),
             },
         )
         .unwrap();
@@ -1395,6 +1421,7 @@ bwrap
             net_proxy_log: false,
             proxy: false,
             full: false,
+            bwrap: crate::version::Version::Known(0, 12, 0),
         };
         let out = render(&items, &view).unwrap();
         assert_eq!(
@@ -1444,6 +1471,7 @@ bwrap
                 net_proxy_log: false,
                 proxy: false,
                 full: false,
+                bwrap: crate::version::Version::Known(0, 12, 0),
             },
         )
         .unwrap();
@@ -1467,5 +1495,46 @@ bwrap
             quote_os(OsStr::from_bytes(b"/tmp/\xff")),
             "\"/tmp/\u{fffd}\""
         );
+    }
+
+    /// The baseline group opens with the bwrap the run would use: which
+    /// arguments bwrap gets is only half of what a sandbox is, and the
+    /// other half is which bwrap reads them.
+    #[test]
+    fn the_baseline_group_names_the_bwrap_version() {
+        let cfg = InstanceConfig::default();
+        let lines = Lines::default();
+        let items = vec![
+            item(Origin::Baseline, &["--unshare-all"], None),
+            item(Origin::Command, &["--", "true"], None),
+        ];
+        let view = |bwrap| View {
+            title: "bwrap",
+            instance: "t",
+            cfg: &cfg,
+            source: Source {
+                file: "config.kdl",
+                lines: &lines,
+            },
+            rules: &[],
+            wl_proxy: None,
+            net_proxy_log: false,
+            proxy: false,
+            full: false,
+            bwrap,
+        };
+        let out = render(&items, &view(crate::version::Version::Known(0, 12, 0))).unwrap();
+        let at = out
+            .iter()
+            .position(|l| l.starts_with("  baseline"))
+            .unwrap();
+        assert_eq!(out[at + 1], "    bwrap 0.12.0", "{out:?}");
+
+        let out = render(&items, &view(crate::version::Version::Unknown)).unwrap();
+        let at = out
+            .iter()
+            .position(|l| l.starts_with("  baseline"))
+            .unwrap();
+        assert_eq!(out[at + 1], "    bwrap unknown", "{out:?}");
     }
 }

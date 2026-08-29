@@ -3089,6 +3089,7 @@ mod tests {
                 net_proxy_log: false,
                 proxy: false,
                 full: false,
+                bwrap: crate::version::Version::Known(0, 12, 0),
             },
         )
         .unwrap();
