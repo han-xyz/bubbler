@@ -43,7 +43,7 @@ use crate::host::{Host, RealHost};
 use crate::instance::Instance;
 use crate::tty::{self, Pty, RawGuard, RelayEnd, StdioTarget, TtyMode};
 use crate::wayland::{ProxyPlan, WaylandError};
-use crate::{cgroup, dbus, exec, init_bin, network, seccomp, service, wayland};
+use crate::{cgroup, dbus, exec, init_bin, network, seccomp, service, version, wayland};
 
 /// How often a running sandbox is checked for having exited.
 const POLL: Duration = Duration::from_millis(100);
@@ -2538,6 +2538,12 @@ pub fn run(
     command: Option<&[OsString]>,
     mode: TtyMode,
 ) -> Result<i32, LaunchError> {
+    // Before anything is created: a host tool below its floor is a fact
+    // about this run, and the reader has to see it whether or not the
+    // run then fails for another reason.
+    for line in version::warnings(version::bwrap(), version::proxy(env), &inst.config.services) {
+        eprintln!("bubbler: warning: {line}");
+    }
     let dir = prepare_runtime_dir(env, inst)?;
     if exec::connect(env, &inst.name)?.is_some() {
         return Err(LaunchError::AlreadyRunning(inst.name.clone()));

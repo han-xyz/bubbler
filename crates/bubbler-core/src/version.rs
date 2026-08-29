@@ -12,6 +12,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
+use crate::config::Service;
 use crate::dbus::{self, PROXY_BIN};
 use crate::env::Env;
 
@@ -121,9 +122,46 @@ pub fn proxy(env: &Env) -> Version {
     *SEEN.get_or_init(|| probe(&dbus::proxy_program(env), PROXY_BIN))
 }
 
+/// The advisory lines a launch prints on stderr, in the order it prints
+/// them. Nothing silences them: the whole point of the bwrap line is
+/// that the host tool cannot enforce what bubbler configured, and a
+/// configuration that could turn it off would be one nobody reads.
+///
+/// The proxy line is printed only for a config that starts the proxy —
+/// `dbus`, `portals`, `a11y` or `system-bus` — since a sandbox with no
+/// bus is not exposed to what its advisories describe.
+pub fn warnings(bwrap: Version, proxy: Version, services: &[Service]) -> Vec<String> {
+    let mut out = Vec::new();
+    if bwrap.below(BWRAP_FLOOR) {
+        out.push(format!(
+            "bwrap {} creates a file or directory under the instance home by following a \
+             symlink an application planted there, which writes outside the sandbox \
+             (GHSA-pxhw-h44j-8pfx); upgrade to 0.12.0. bubbler refuses a run whose \
+             destinations sit behind one, and nothing turns this warning off.",
+            bwrap.text()
+        ));
+    }
+    let bus = services.iter().any(|s| {
+        matches!(
+            s,
+            Service::Dbus { .. } | Service::SystemBus { .. } | Service::Portals | Service::A11y
+        )
+    });
+    if bus && proxy.below(PROXY_FLOOR) {
+        out.push(format!(
+            "xdg-dbus-proxy {} lets a filtered client eavesdrop on the bus and receive \
+             accessibility broadcasts it was not granted (CVE-2026-34080, \
+             GHSA-r7hp-698j-2h6c); upgrade to 0.1.8.",
+            proxy.text()
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Service;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
@@ -195,5 +233,49 @@ mod tests {
             probe(&tmp.path().join("absent"), BWRAP_NAME),
             Version::Unknown
         );
+    }
+
+    #[test]
+    fn an_old_bwrap_always_warns_and_an_old_proxy_only_where_a_bus_is_granted() {
+        let old = Version::Known(0, 11, 2);
+        let new = Version::Known(0, 12, 0);
+        let proxy_old = Version::Known(0, 1, 7);
+        let proxy_new = Version::Known(0, 1, 8);
+
+        let w = warnings(old, proxy_new, &[]);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("bwrap 0.11.2"), "{w:?}");
+        assert!(w[0].contains("GHSA-pxhw-h44j-8pfx"), "{w:?}");
+        assert!(w[0].contains("upgrade to 0.12.0"), "{w:?}");
+
+        // Current tools, nothing to say.
+        assert!(warnings(new, proxy_new, &[Service::Portals]).is_empty());
+
+        // The proxy gate needs a node that starts the proxy.
+        assert!(warnings(new, proxy_old, &[Service::Dri]).is_empty());
+        for node in [
+            Service::Dbus { rules: Vec::new() },
+            Service::Portals,
+            Service::A11y,
+            Service::SystemBus { rules: Vec::new() },
+        ] {
+            let w = warnings(new, proxy_old, std::slice::from_ref(&node));
+            assert_eq!(w.len(), 1, "{node:?}: {w:?}");
+            assert!(w[0].contains("xdg-dbus-proxy 0.1.7"), "{w:?}");
+            assert!(w[0].contains("CVE-2026-34080"), "{w:?}");
+            assert!(w[0].contains("GHSA-r7hp-698j-2h6c"), "{w:?}");
+            assert!(w[0].contains("upgrade to 0.1.8"), "{w:?}");
+        }
+
+        // A version that could not be read is old, and says so.
+        let w = warnings(Version::Unknown, proxy_new, &[]);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("bwrap unknown"), "{w:?}");
+
+        // Both at once, bwrap first.
+        let w = warnings(old, proxy_old, &[Service::Dbus { rules: Vec::new() }]);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w[0].starts_with("bwrap "), "{w:?}");
+        assert!(w[1].starts_with("xdg-dbus-proxy "), "{w:?}");
     }
 }
