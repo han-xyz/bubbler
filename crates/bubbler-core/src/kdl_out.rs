@@ -8,7 +8,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::config::{
     BusRule, Clipboard, Disabled, InstanceConfig, LintAllow, NestedX11, Node, Service, ShareMode,
-    Userns, WaylandMode, X11Mode,
+    TmpSize, Userns, WaylandMode, X11Mode,
 };
 use crate::error::ConfigError;
 use crate::network::{Mode as NetworkMode, NetworkConfig, Outbound};
@@ -50,6 +50,12 @@ pub fn nodes(cfg: &InstanceConfig) -> Result<Vec<String>, ConfigError> {
         cfg,
         |n| matches!(n, Node::Env(_)),
         cfg.env.iter().map(|(k, v)| env(k, v)).collect(),
+        &mut out,
+    )?;
+    section(
+        cfg,
+        |n| matches!(n, Node::Tmp(_)),
+        cfg.tmp.map(tmp).into_iter().collect(),
         &mut out,
     )?;
     section(
@@ -192,6 +198,7 @@ pub fn node(n: &Node) -> Result<String, ConfigError> {
                 });
             }
         },
+        Node::Tmp(size) => tmp(*size),
         Node::Tty(mode) => tty(*mode),
         Node::Userns(mode) => userns(*mode),
         Node::Seccomp(cfg) => seccomp(cfg),
@@ -513,6 +520,21 @@ pub fn lint_allow(a: &LintAllow) -> String {
 /// One `env KEY="value"` node.
 pub fn env(key: &str, value: &str) -> String {
     format!("env {key}={}", quote(value))
+}
+
+/// The `tmp` node for `size`, spelled with the largest of `K`, `M` and
+/// `G` that divides it — which is the spelling it was read as, since the
+/// parser takes no other.
+pub fn tmp(size: TmpSize) -> String {
+    let (n, unit) = [
+        (1024u64 * 1024 * 1024, "G"),
+        (1024 * 1024, "M"),
+        (1024, "K"),
+    ]
+    .into_iter()
+    .find_map(|(scale, unit)| size.0.is_multiple_of(scale).then(|| (size.0 / scale, unit)))
+    .unwrap_or((size.0, "K"));
+    format!("tmp size={}", quote(&format!("{n}{unit}")))
 }
 
 /// The `tty` node for `mode`.

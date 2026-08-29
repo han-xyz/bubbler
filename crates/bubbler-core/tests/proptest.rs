@@ -12,8 +12,8 @@ use std::str::FromStr;
 
 use bubbler_core::config::{
     AllowOut, BusRule, Cidr, Disabled, Errno, InstanceConfig, LintAllow, NetworkConfig,
-    NetworkMode, Node, Outbound, Proto, SeccompConfig, Service, ShareMode, TtyMode, Userns,
-    WaylandMode, X11Mode,
+    NetworkMode, Node, Outbound, Proto, SeccompConfig, Service, ShareMode, TmpSize, TtyMode,
+    Userns, WaylandMode, X11Mode,
 };
 use bubbler_core::env::{DEFAULT_DATA_DIRS, Env};
 use bubbler_core::error::{DesktopError, ProfileError};
@@ -421,7 +421,7 @@ fn command() -> impl Strategy<Value = Option<Vec<OsString>>> {
 /// A kind of node a `/-` line may keep, and where in its section it
 /// sits, before either is fitted to the config it is written into.
 fn disabled_kinds() -> impl Strategy<Value = Vec<(u8, usize)>> {
-    prop::collection::vec((0u8..8, 0usize..4), 0..5)
+    prop::collection::vec((0u8..9, 0usize..4), 0..5)
 }
 
 /// The generated `/-` lines fitted to the config that holds them: one
@@ -474,6 +474,10 @@ fn fit_disabled(cfg: &InstanceConfig, kinds: &[(u8, usize)]) -> Vec<Disabled> {
                     Node::Desktop("kept.desktop".to_owned()),
                     usize::from(cfg.desktop.is_some()),
                 ),
+                7 => (
+                    Node::Tmp(TmpSize(1024 * 1024 * 1024)),
+                    usize::from(cfg.tmp.is_some()),
+                ),
                 _ => (
                     Node::Command(vec![OsString::from("kept")]),
                     usize::from(cfg.command.is_some()),
@@ -508,6 +512,7 @@ fn instance_config() -> impl Strategy<Value = InstanceConfig> {
             Just(TtyMode::None)
         ],
         prop_oneof![Just(Userns::Allow), Just(Userns::Disable)],
+        tmp_size(),
         seccomp_config(),
         prop::option::of("[a-z][a-z0-9.-]{0,8}".prop_map(|s| format!("{s}.desktop"))),
         command(),
@@ -520,6 +525,7 @@ fn instance_config() -> impl Strategy<Value = InstanceConfig> {
                 env,
                 tty,
                 userns,
+                tmp,
                 seccomp,
                 desktop,
                 command,
@@ -538,6 +544,7 @@ fn instance_config() -> impl Strategy<Value = InstanceConfig> {
                     shares: Vec::new(),
                     command,
                     env,
+                    tmp,
                     tty,
                     seccomp,
                     userns,
@@ -551,6 +558,18 @@ fn instance_config() -> impl Strategy<Value = InstanceConfig> {
                 cfg
             },
         )
+}
+
+/// A `tmp size=` the parser takes: a count of one of the three units,
+/// no more than the 64G cap, or no node at all.
+fn tmp_size() -> impl Strategy<Value = Option<TmpSize>> {
+    prop::option::of(
+        (
+            1u64..=64,
+            prop::sample::select(&[1024u64, 1024 * 1024, 1024 * 1024 * 1024][..]),
+        )
+            .prop_map(|(n, scale)| TmpSize(n * scale)),
+    )
 }
 
 /// A `.desktop` file of the shape a vendor ships: the group header, a

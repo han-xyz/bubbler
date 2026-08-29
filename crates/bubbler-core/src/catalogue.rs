@@ -305,6 +305,18 @@ pub static GRANTS: &[Grant] = &[
         grammar: "input-method",
     },
     Grant {
+        node: "tmp",
+        summary: "how large the sandbox's `/tmp` may grow",
+        cost: "A tmpfs is pinned host memory, so whatever the sandbox writes to `/tmp` \
+               comes out of the host's RAM: up to 2G by default, and up to whatever this \
+               node names when it is written. `/etc`, `/var` and `/run` are capped at 64M \
+               and are not affected. Raising it hands the sandbox that much more of the \
+               host's memory to take; lowering it makes an application that stages large \
+               files in `/tmp` fail with ENOSPC.",
+        risk: Risk::Narrow,
+        grammar: "tmp size=\"<n>K|M|G\"",
+    },
+    Grant {
         node: "tty",
         summary: "how the sandbox's stdio reaches your terminal",
         cost: "`pty` is the default: bubbler allocates a pseudoterminal, relays it, and the \
@@ -415,6 +427,7 @@ mod tests {
         ("mpris", "mpris name=\"example\""),
         ("a11y", "a11y"),
         ("input-method", "input-method"),
+        ("tmp", "tmp size=\"2G\""),
         ("tty", "tty \"none\""),
         ("userns", "userns \"disable\""),
         ("seccomp", "seccomp { disable }"),

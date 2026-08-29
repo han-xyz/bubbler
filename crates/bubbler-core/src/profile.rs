@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{
     self, BusRule, ConfigError, Disabled, InstanceConfig, LintAllow, Node, Outbound, RawProfile,
-    Service, ShareMode, Userns,
+    Service, ShareMode, TmpSize, Userns,
 };
 use crate::env::Env;
 use crate::error::{ProfileError, ReadError};
@@ -544,6 +544,7 @@ struct Src {
 struct Merged {
     services: Vec<(Service, Src)>,
     env: Vec<(String, String, Src)>,
+    tmp: Option<(TmpSize, Src)>,
     tty: Option<(TtyMode, Src)>,
     userns: Option<(Userns, Src)>,
     seccomp: SeccompConfig,
@@ -579,6 +580,10 @@ impl Merged {
                 Some(slot) => *slot = (key.clone(), value.clone(), src.clone()),
                 None => self.env.push((key.clone(), value.clone(), src.clone())),
             }
+        }
+        // One cap, not a set: the including layer replaces it.
+        if let Some(size) = raw.config.tmp {
+            self.tmp = Some((size, src.clone()));
         }
         if raw.tty_set {
             self.tty = Some((raw.config.tty, src.clone()));
@@ -871,6 +876,15 @@ impl Merged {
         kept(
             &self.disabled,
             |n| matches!(n, Node::Env(_)),
+            name,
+            &mut origins,
+        )?;
+        if let Some((size, src)) = &self.tmp {
+            origins.push((kdl_out::tmp(*size), src));
+        }
+        kept(
+            &self.disabled,
+            |n| matches!(n, Node::Tmp(_)),
             name,
             &mut origins,
         )?;
@@ -1981,6 +1995,44 @@ mod tests {
         assert_eq!(
             r.resolve("app").unwrap().config.desktop.as_deref(),
             Some("base.desktop")
+        );
+    }
+
+    #[test]
+    fn the_tmp_cap_is_one_size_the_including_layer_decides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(
+            tmp.path(),
+            &[
+                ("app", "include \"base\"\ntmp size=\"512M\"\n"),
+                ("base", "tmp size=\"8G\"\n/-tmp size=\"1G\"\n"),
+            ],
+            &[],
+        );
+        let resolved = r.resolve("app").unwrap();
+        // One cap, not a set: the including layer replaces it, up or down.
+        assert_eq!(resolved.config.tmp, Some(TmpSize(512 * 1024 * 1024)));
+        assert_eq!(
+            resolved.text,
+            kdl_out::render(&resolved.config).unwrap(),
+            "{}",
+            resolved.text
+        );
+        let nodes: Vec<&str> = resolved.origins.iter().map(|o| o.node.as_str()).collect();
+        assert_eq!(nodes, vec!["tmp size=\"512M\"", "/-tmp size=\"1G\""]);
+
+        // A layer without the node leaves the one below alone.
+        let r = resolver(
+            tmp.path(),
+            &[
+                ("app", "include \"base\"\nwayland\n"),
+                ("base", "tmp size=\"8G\"\n"),
+            ],
+            &[],
+        );
+        assert_eq!(
+            r.resolve("app").unwrap().config.tmp,
+            Some(TmpSize(8 * 1024 * 1024 * 1024))
         );
     }
 

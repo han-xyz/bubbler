@@ -24,6 +24,8 @@ pub enum Target {
     Env(usize),
     /// One accepted finding, by its index.
     LintAllow(usize),
+    /// The `tmp` node, of which a config holds one.
+    Tmp,
     /// The `tty` node, of which a config holds one.
     Tty,
     /// The `userns` node.
@@ -420,6 +422,7 @@ impl Detail {
                 self.shift_disabled(rank, i, grew);
             }
             (Node::LintAllow(allows), _) => self.buf.lint_allows.extend(allows),
+            (Node::Tmp(size), _) => self.buf.tmp = Some(size),
             (Node::Tty(mode), _) => self.buf.tty = mode,
             (Node::Userns(mode), _) => self.buf.userns = mode,
             (Node::Seccomp(cfg), _) => self.buf.seccomp = cfg,
@@ -436,6 +439,7 @@ impl Detail {
             Target::Service(i) => Node::Service(self.buf.services.get(i)?.clone()),
             Target::Env(i) => Node::Env(vec![self.buf.env.get(i)?.clone()]),
             Target::LintAllow(i) => Node::LintAllow(vec![self.buf.lint_allows.get(i)?.clone()]),
+            Target::Tmp => Node::Tmp(self.buf.tmp?),
             Target::Tty => Node::Tty(self.buf.tty),
             Target::Userns => Node::Userns(self.buf.userns),
             Target::Seccomp => Node::Seccomp(self.buf.seccomp.clone()),
@@ -467,6 +471,7 @@ impl Detail {
             Target::LintAllow(i) => {
                 self.buf.lint_allows.remove(i);
             }
+            Target::Tmp => self.buf.tmp = None,
             Target::Tty => self.buf.tty = TtyMode::default(),
             Target::Userns => self.buf.userns = Userns::default(),
             Target::Seccomp => self.buf.seccomp = SeccompConfig::default(),
@@ -570,6 +575,7 @@ impl Detail {
                 self.buf.lint_allows.splice(at..at, allows);
                 Placed::Added(added)
             }
+            Node::Tmp(size) => Placed::one_of(self.buf.tmp.replace(size).is_some(), false),
             Node::Tty(mode) => {
                 let held = self.buf.tty != TtyMode::default();
                 self.buf.tty = mode;
@@ -597,6 +603,7 @@ impl Detail {
             Node::LintAllow(_) => self.buf.lint_allows.len(),
             Node::Service(_) => self.buf.services.len(),
             Node::Env(_) => self.buf.env.len(),
+            Node::Tmp(_) => usize::from(self.buf.tmp.is_some()),
             Node::Tty(_) => usize::from(self.buf.tty != TtyMode::default()),
             Node::Userns(_) => usize::from(self.buf.userns != Userns::default()),
             Node::Seccomp(_) => usize::from(self.buf.seccomp != SeccompConfig::default()),
@@ -688,7 +695,12 @@ fn grew_by(n: usize) -> isize {
 fn index_of(target: Target) -> Option<usize> {
     Some(match target {
         Target::LintAllow(i) | Target::Service(i) | Target::Env(i) => i,
-        Target::Tty | Target::Userns | Target::Seccomp | Target::Desktop | Target::Command => 0,
+        Target::Tmp
+        | Target::Tty
+        | Target::Userns
+        | Target::Seccomp
+        | Target::Desktop
+        | Target::Command => 0,
         Target::Disabled(_) | Target::Add(_) | Target::Absent => return None,
     })
 }
@@ -708,6 +720,9 @@ fn written(raw: RawProfile) -> Result<Node, String> {
     }
     if !cfg.lint_allows.is_empty() {
         found.push(Node::LintAllow(cfg.lint_allows));
+    }
+    if let Some(size) = cfg.tmp {
+        found.push(Node::Tmp(size));
     }
     if raw.tty_set {
         found.push(Node::Tty(cfg.tty));
@@ -772,6 +787,14 @@ fn rows(cfg: &InstanceConfig) -> Result<Vec<Row>, String> {
             .iter()
             .enumerate()
             .map(|(i, (key, value))| ("env", kdl_out::env(key, value), Target::Env(i)))
+            .collect(),
+    )?;
+    out.section(
+        cfg,
+        |n| matches!(n, Node::Tmp(_)),
+        cfg.tmp
+            .map(|size| ("tmp", kdl_out::tmp(size), Target::Tmp))
+            .into_iter()
             .collect(),
     )?;
     out.section(
@@ -906,7 +929,7 @@ impl Builder {
 mod tests {
     use super::*;
     use crate::fixture;
-    use bubbler_core::config::{Service, ShareMode, WaylandMode};
+    use bubbler_core::config::{Service, ShareMode, TmpSize, WaylandMode};
     use bubbler_core::lint::Severity;
 
     /// Errors, warnings and notes the buffer has as it stands.
@@ -1467,6 +1490,39 @@ mod tests {
             "enabled `tty`: the default, so there is no line to write"
         );
         assert_eq!(kdl_out::render(&detail.buf).unwrap(), "");
+    }
+
+    #[test]
+    fn a_tmp_row_is_toggled_and_written_like_the_other_one_of_nodes() {
+        let (_tmp, env, mut detail) = editing("/-tmp size=\"1G\"\ntmp size=\"2G\"\n");
+        select(&mut detail, "tmp");
+        assert_eq!(detail.row().unwrap().target, Target::Disabled(0));
+        detail.selected += 1;
+        assert_eq!(detail.row().unwrap().target, Target::Tmp);
+        assert_eq!(
+            detail.row().unwrap().text.as_deref(),
+            Some("tmp size=\"2G\"")
+        );
+        select(&mut detail, "tmp");
+        assert_eq!(
+            detail.toggle(&env),
+            "enabled `tmp` over the one it held",
+            "a config holds one tmp node, so the other one went"
+        );
+        assert_eq!(detail.buf.tmp, Some(TmpSize(1024 * 1024 * 1024)));
+        assert!(detail.buf.disabled.is_empty());
+        assert_eq!(kdl_out::render(&detail.buf).unwrap(), "tmp size=\"1G\"\n");
+        // Off again: a config with no `tmp` node has the default cap.
+        detail.toggle(&env);
+        assert_eq!(detail.buf.tmp, None);
+        assert_eq!(detail.buf.disabled.len(), 1);
+        // And a line typed on the absent row writes the node.
+        let (_tmp, env, mut detail) = editing("wayland\n");
+        select(&mut detail, "tmp");
+        assert_eq!(detail.row().unwrap().target, Target::Absent);
+        detail.apply(&env, "tmp size=\"512M\"").unwrap();
+        assert_eq!(detail.buf.tmp, Some(TmpSize(512 * 1024 * 1024)));
+        assert_eq!(detail.row().unwrap().target, Target::Tmp);
     }
 
     #[test]

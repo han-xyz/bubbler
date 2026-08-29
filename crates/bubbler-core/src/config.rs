@@ -163,6 +163,7 @@ pub const NODES: &[&str] = &[
     "mpris",
     "a11y",
     "input-method",
+    "tmp",
     "tty",
     "userns",
     "seccomp",
@@ -171,6 +172,16 @@ pub const NODES: &[&str] = &[
     "desktop",
     "command",
 ];
+
+/// The cap on the sandbox's `/tmp`, in bytes: the `tmp size="…"` node.
+/// A tmpfs is pinned host memory, so this is how much of the host's RAM
+/// a sandbox may take with files it writes to `/tmp`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TmpSize(pub u64);
+
+/// Largest `tmp size=` bubbler accepts: 64 GiB. A cap past this is a
+/// number nobody meant to write, and the pages behind it are the host's.
+pub const TMP_SIZE_MAX: u64 = 64 * 1024 * 1024 * 1024;
 
 /// Whether the sandbox may create user namespaces of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -605,6 +616,8 @@ pub enum Node {
     /// A `lint-allow` node. One node accepts one id; the list is what a
     /// caller building a node by hand may hold.
     LintAllow(Vec<LintAllow>),
+    /// A `tmp` node: the cap on the sandbox's `/tmp`.
+    Tmp(TmpSize),
     /// A `tty` node.
     Tty(TtyMode),
     /// A `userns` node.
@@ -625,6 +638,7 @@ impl Node {
             Self::Service(s) => s.node_name(),
             Self::Env(_) => "env",
             Self::LintAllow(_) => "lint-allow",
+            Self::Tmp(_) => "tmp",
             Self::Tty(_) => "tty",
             Self::Userns(_) => "userns",
             Self::Seccomp(_) => "seccomp",
@@ -695,6 +709,9 @@ pub struct InstanceConfig {
     /// Extra environment variables, in file order; never a key from
     /// [`RESERVED_ENV`].
     pub env: Vec<(String, String)>,
+    /// Cap on the sandbox's `/tmp`; `None` leaves it at
+    /// [`crate::bwrap::TMP_SIZE`].
+    pub tmp: Option<TmpSize>,
     /// How the sandbox's stdio reaches the user's terminal; `pty` unless
     /// a `tty` node says otherwise.
     pub tty: TtyMode,
@@ -1175,6 +1192,12 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
                     cfg.lint_allows.push(allow);
                 }
             }
+            Node::Tmp(size) => {
+                if cfg.tmp.is_some() {
+                    return Err(ConfigError::Duplicate(name.to_owned()));
+                }
+                cfg.tmp = Some(size);
+            }
             Node::Tty(mode) => {
                 if seen_tty {
                     return Err(ConfigError::Duplicate(name.to_owned()));
@@ -1331,6 +1354,7 @@ pub(crate) fn parse_node(node: &KdlNode, profile: bool) -> Result<Node, ConfigEr
         "camera" => Node::Service(parse_camera(node)?),
         "system-bus" => Node::Service(parse_system_bus(node)?),
         "mpris" => Node::Service(parse_mpris(node)?),
+        "tmp" => Node::Tmp(parse_tmp(node)?),
         "tty" => Node::Tty(parse_tty(node)?),
         "userns" => Node::Userns(parse_userns(node)?),
         "seccomp" => Node::Seccomp(parse_seccomp(node)?),
@@ -1408,6 +1432,7 @@ struct Counts {
     lint_allows: usize,
     services: usize,
     env: usize,
+    tmp: usize,
     tty: usize,
     userns: usize,
     seccomp: usize,
@@ -1422,6 +1447,7 @@ impl Counts {
             lint_allows: cfg.lint_allows.len(),
             services: cfg.services.len(),
             env: cfg.env.len(),
+            tmp: usize::from(cfg.tmp.is_some()),
             tty: usize::from(cfg.tty != TtyMode::default()),
             userns: usize::from(cfg.userns != Userns::default()),
             seccomp: usize::from(cfg.seccomp != SeccompConfig::default()),
@@ -1436,6 +1462,7 @@ impl Counts {
             Node::Service(_) => self.services,
             Node::Env(_) => self.env,
             Node::LintAllow(_) => self.lint_allows,
+            Node::Tmp(_) => self.tmp,
             Node::Tty(_) => self.tty,
             Node::Userns(_) => self.userns,
             Node::Seccomp(_) => self.seccomp,
@@ -1456,11 +1483,12 @@ pub fn section_rank(node: &Node) -> u8 {
         Node::LintAllow(_) => 0,
         Node::Service(_) => 1,
         Node::Env(_) => 2,
-        Node::Tty(_) => 3,
-        Node::Userns(_) => 4,
-        Node::Seccomp(_) => 5,
-        Node::Desktop(_) => 6,
-        Node::Command(_) => 7,
+        Node::Tmp(_) => 3,
+        Node::Tty(_) => 4,
+        Node::Userns(_) => 5,
+        Node::Seccomp(_) => 6,
+        Node::Desktop(_) => 7,
+        Node::Command(_) => 8,
     }
 }
 
@@ -2729,6 +2757,67 @@ fn parse_userns(node: &KdlNode) -> Result<Userns, ConfigError> {
     Userns::from_str(arg)
 }
 
+/// `tmp size="2G"`: one `size=` property, a decimal number with a `K`,
+/// `M` or `G` suffix, at most [`TMP_SIZE_MAX`]. No argument and no
+/// children. The suffix is required: a bare number in a config that also
+/// writes `2G` elsewhere would read as bytes to bubbler and as gibibytes
+/// to everyone else.
+fn parse_tmp(node: &KdlNode) -> Result<TmpSize, ConfigError> {
+    if node.children().is_some() {
+        return Err(bad(node, "takes no children"));
+    }
+    let mut written: Option<&str> = None;
+    for e in node.entries() {
+        match e.name().map(|n| n.value()) {
+            Some("size") => {
+                written = Some(
+                    e.value()
+                        .as_string()
+                        .ok_or_else(|| bad(node, "size must be a string"))?,
+                );
+            }
+            Some(other) => {
+                return Err(ConfigError::UnknownProperty {
+                    node: "tmp".to_owned(),
+                    prop: other.to_owned(),
+                });
+            }
+            None => return Err(bad(node, "takes no argument; write `size=\"2G\"`")),
+        }
+    }
+    let Some(written) = written else {
+        return Err(bad(node, "expects `size=\"<n>K|M|G\"`"));
+    };
+    // The suffix is one ASCII byte, so the split is on a char boundary.
+    let (digits, scale) = match written.as_bytes().last() {
+        Some(b'K') => (&written[..written.len() - 1], 1024u64),
+        Some(b'M') => (&written[..written.len() - 1], 1024 * 1024),
+        Some(b'G') => (&written[..written.len() - 1], 1024 * 1024 * 1024),
+        _ => {
+            return Err(bad(
+                node,
+                "expects a decimal number with a `K`, `M` or `G` suffix, e.g. \"2G\"",
+            ));
+        }
+    };
+    // `u64::from_str` accepts a leading `+`; a size never has one.
+    if digits.starts_with('+') {
+        return Err(bad(node, "expects a decimal number before the suffix"));
+    }
+    let bytes = digits
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(scale))
+        .ok_or_else(|| bad(node, "expects a decimal number before the suffix"))?;
+    if bytes == 0 {
+        return Err(bad(node, "a /tmp of zero bytes is a sandbox with no /tmp"));
+    }
+    if bytes > TMP_SIZE_MAX {
+        return Err(bad(node, "is larger than the 64G bubbler accepts"));
+    }
+    Ok(TmpSize(bytes))
+}
+
 /// `tty "pty"|"passthrough"|"none"`. The name of the mode is the whole
 /// node: an unknown one is an error, never a silent fallback to the
 /// default, which would give the sandbox a terminal the file refused it.
@@ -2960,6 +3049,70 @@ mod tests {
             parse("tty \"pty\"\ntty \"none\""),
             Err(ConfigError::Duplicate(n)) if n == "tty"
         ));
+    }
+
+    #[test]
+    fn tmp_takes_a_size_with_a_binary_suffix_and_nothing_else() {
+        for (text, bytes) in [
+            ("tmp size=\"64K\"", 64 * 1024),
+            ("tmp size=\"64M\"", 64 * 1024 * 1024),
+            ("tmp size=\"2G\"", 2 * 1024 * 1024 * 1024),
+            ("tmp size=\"64G\"", 64u64 * 1024 * 1024 * 1024),
+        ] {
+            assert_eq!(parse(text).unwrap().tmp, Some(TmpSize(bytes)), "{text}");
+        }
+        assert_eq!(parse("wayland").unwrap().tmp, None);
+
+        for bad in [
+            "tmp",
+            "tmp \"2G\"",
+            "tmp size=\"2\"",
+            "tmp size=\"2g\"",
+            "tmp size=\"2GB\"",
+            "tmp size=\"\"",
+            "tmp size=\"0G\"",
+            "tmp size=\"-2G\"",
+            "tmp size=\"+2G\"",
+            "tmp size=\"65G\"",
+            "tmp size=#true",
+            "tmp mode=\"2G\"",
+            "tmp size=\"2G\" { x }",
+        ] {
+            assert!(parse(bad).is_err(), "`{bad}` was accepted");
+        }
+
+        // One per file: two would leave the cap to file order.
+        assert!(matches!(
+            parse("tmp size=\"1G\"\ntmp size=\"2G\""),
+            Err(ConfigError::Duplicate(n)) if n == "tmp"
+        ));
+    }
+
+    #[test]
+    fn a_tmp_node_is_written_back_with_the_largest_suffix_that_divides_it() {
+        for text in ["tmp size=\"64K\"", "tmp size=\"64M\"", "tmp size=\"2G\""] {
+            let cfg = parse(text).unwrap();
+            let out = crate::kdl_out::nodes(&cfg).unwrap();
+            assert_eq!(out, vec![text.to_owned()], "{text}");
+            assert_eq!(parse(&out.join("\n")).unwrap(), cfg, "{text}");
+        }
+        // 2048M is 2G, and comes back as the shorter spelling.
+        assert_eq!(
+            crate::kdl_out::nodes(&parse("tmp size=\"2048M\"").unwrap()).unwrap(),
+            vec!["tmp size=\"2G\"".to_owned()]
+        );
+    }
+
+    /// A `/-tmp` line is an entry the file keeps without granting it,
+    /// like every other node the editor can turn off.
+    #[test]
+    fn a_disabled_tmp_line_is_kept_and_written_back_where_it_was() {
+        let cfg = parse("/-tmp size=\"1G\"\ntmp size=\"2G\"\n").unwrap();
+        assert_eq!(cfg.tmp, Some(TmpSize(2 * 1024 * 1024 * 1024)));
+        assert_eq!(
+            crate::kdl_out::nodes(&cfg).unwrap(),
+            vec!["/-tmp size=\"1G\"".to_owned(), "tmp size=\"2G\"".to_owned()]
+        );
     }
 
     #[test]
@@ -5460,6 +5613,7 @@ command "b""#
             ("mpris", "mpris name=\"org.a.B\"", "mpris name=\"org.c.D\""),
             ("a11y", "a11y", "a11y"),
             ("input-method", "input-method", "input-method"),
+            ("tmp", "tmp size=\"1G\"", "tmp size=\"2G\""),
             ("tty", "tty \"none\"", "tty \"passthrough\""),
             ("userns", "userns \"disable\"", "userns \"allow\""),
             (
