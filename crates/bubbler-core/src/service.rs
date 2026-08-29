@@ -4682,6 +4682,7 @@ mod tests {
             "--perms",
             "--setenv",
             "--share-net",
+            "--size",
             "--socket-fd",
             "--unshare-all",
             "--unshare-user",

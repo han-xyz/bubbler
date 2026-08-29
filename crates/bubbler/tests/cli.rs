@@ -80,9 +80,10 @@ fn create_list_and_dry_run() {
          --info-fd\n3\n--add-seccomp-fd\n4\n\
          --ro-bind\n/usr\n/usr\n--symlink\nusr/bin\n/bin\n--symlink\nusr/lib\n/lib\n\
          --symlink\nusr/lib64\n/lib64\n--symlink\nusr/bin\n/sbin\n\
-         --ro-bind-try\n/opt\n/opt\n--tmpfs\n/etc\n";
+         --ro-bind-try\n/opt\n/opt\n--size\n67108864\n--tmpfs\n/etc\n";
     let expected_suffix = format!(
-        "--proc\n/proc\n--dev\n/dev\n{ntsync}--tmpfs\n/tmp\n--tmpfs\n/var\n--tmpfs\n/run\n\
+        "--proc\n/proc\n--dev\n/dev\n{ntsync}--size\n2147483648\n--tmpfs\n/tmp\n\
+         --size\n67108864\n--tmpfs\n/var\n--size\n67108864\n--tmpfs\n/run\n\
          --bind\n{home}\n/home/bubbler\n--perms\n0700\n--dir\n{run}\n\
          --ro-bind\n{init}\n/run/bubbler-init\n--clearenv\n--setenv\nTERM\ndumb\n\
          --setenv\nHOME\n/home/bubbler\n--setenv\nPATH\n/usr/bin\n--setenv\nXDG_RUNTIME_DIR\n{run}\n\

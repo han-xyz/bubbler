@@ -156,6 +156,18 @@ fn push<const N: usize>(v: &mut Vec<Item>, origin: Origin, parts: [&OsStr; N]) {
     });
 }
 
+/// Cap of the sandbox's `/tmp`, in bytes: 2 GiB. Without one a tmpfs may
+/// grow to half of host RAM (`tmpfs(5)`), and a sandbox that fills it
+/// takes the session's memory with it. Large enough for a browser's
+/// download staging and a build's scratch files; `tmp size="…"` moves it.
+pub const TMP_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Cap of every other tmpfs bubbler mounts, in bytes: 64 MiB. `/etc`,
+/// `/var` and `/run` hold sockets, generated files and directories, not
+/// data, and the runtime directory `--dir` creates inside `/run` shares
+/// this cap because it lives on that tmpfs.
+pub const TMPFS_SIZE: u64 = 64 * 1024 * 1024;
+
 /// Host `/etc` entries bound read-only when they exist. Everything else in
 /// `/etc` is hidden by the tmpfs mounted first.
 pub const ETC_ALLOWLIST: &[&str] = &[
@@ -207,7 +219,8 @@ impl BwrapArgs {
     /// The restrictions every sandbox gets: all namespaces unshared, no
     /// network, read-only `/usr` `/opt`, an `/etc` that is an allowlist
     /// ([`ETC_ALLOWLIST`]) over a tmpfs plus a synthetic passwd and group,
-    /// empty `/tmp` `/var` `/run`, `/dev/ntsync` where the host has that
+    /// empty `/tmp` ([`TMP_SIZE`]) `/var` `/run` ([`TMPFS_SIZE`]),
+    /// `/dev/ntsync` where the host has that
     /// node, a private home at [`SANDBOX_HOME`], an empty
     /// `$XDG_RUNTIME_DIR` at the same path as on the host and mode 0700
     /// (`--perms` applies to the next operation only, so it must
@@ -266,7 +279,15 @@ impl BwrapArgs {
         );
         // The tmpfs has to precede the entry binds and the data files, or it
         // would hide them: bwrap applies filesystem operations in argv order.
-        push(&mut a.skeleton, b, [o("--tmpfs"), o("/etc")]);
+        // `--size` applies to the next operation only (`bwrap(1)`), so
+        // it stays part of the same operation as its `--tmpfs`.
+        let tmpfs_size = OsString::from(TMPFS_SIZE.to_string());
+        let tmp_size = OsString::from(TMP_SIZE.to_string());
+        push(
+            &mut a.skeleton,
+            b,
+            [o("--size"), tmpfs_size.as_os_str(), o("--tmpfs"), o("/etc")],
+        );
         for name in ETC_ALLOWLIST {
             let p = Path::new("/etc").join(name);
             if host.file_type(&p).is_some() {
@@ -307,8 +328,12 @@ impl BwrapArgs {
                 [o("--dev-bind"), ntsync.as_os_str(), ntsync.as_os_str()],
             );
         }
-        for dir in [o("/tmp"), o("/var"), o("/run")] {
-            push(&mut a.skeleton, b, [o("--tmpfs"), dir]);
+        for (size, dir) in [
+            (tmp_size.as_os_str(), o("/tmp")),
+            (tmpfs_size.as_os_str(), o("/var")),
+            (tmpfs_size.as_os_str(), o("/run")),
+        ] {
+            push(&mut a.skeleton, b, [o("--size"), size, o("--tmpfs"), dir]);
         }
         push(
             &mut a.skeleton,
@@ -388,7 +413,12 @@ impl BwrapArgs {
         ] {
             push(&mut a.skeleton, b, [o("--symlink"), o(target), o(link)]);
         }
-        push(&mut a.skeleton, b, [o("--tmpfs"), o("/etc")]);
+        let tmpfs_size = OsString::from(TMPFS_SIZE.to_string());
+        push(
+            &mut a.skeleton,
+            b,
+            [o("--size"), tmpfs_size.as_os_str(), o("--tmpfs"), o("/etc")],
+        );
         for name in PROXY_ETC {
             let p = Path::new("/etc").join(name);
             if host.file_type(&p).is_some() {
@@ -401,7 +431,11 @@ impl BwrapArgs {
         }
         push(&mut a.skeleton, b, [o("--proc"), o("/proc")]);
         push(&mut a.skeleton, b, [o("--dev"), o("/dev")]);
-        push(&mut a.skeleton, b, [o("--tmpfs"), o("/tmp")]);
+        push(
+            &mut a.skeleton,
+            b,
+            [o("--size"), tmpfs_size.as_os_str(), o("--tmpfs"), o("/tmp")],
+        );
         push(&mut a.env, b, [o("--clearenv")]);
         a
     }
@@ -1011,6 +1045,8 @@ mod tests {
                 "--ro-bind-try",
                 "/opt",
                 "/opt",
+                "--size",
+                "67108864",
                 "--tmpfs",
                 "/etc",
                 "--perms",
@@ -1027,10 +1063,16 @@ mod tests {
                 "/proc",
                 "--dev",
                 "/dev",
+                "--size",
+                "2147483648",
                 "--tmpfs",
                 "/tmp",
+                "--size",
+                "67108864",
                 "--tmpfs",
                 "/var",
+                "--size",
+                "67108864",
                 "--tmpfs",
                 "/run",
                 "--bind",
@@ -1146,6 +1188,8 @@ mod tests {
                 "--symlink",
                 "usr/bin",
                 "/sbin",
+                "--size",
+                "67108864",
                 "--tmpfs",
                 "/etc",
                 "--ro-bind",
@@ -1161,6 +1205,8 @@ mod tests {
                 "/proc",
                 "--dev",
                 "/dev",
+                "--size",
+                "67108864",
                 "--tmpfs",
                 "/tmp",
                 "--ro-bind",
@@ -1211,6 +1257,53 @@ mod tests {
         .finish_plain(&["xdg-dbus-proxy".into()], &mut Counter::new())
         .unwrap();
         assert!(!system_only.iter().any(|a| a == "/run/user/1000/bus"));
+    }
+
+    /// Without a cap a tmpfs grows to half of host RAM, and a sandbox
+    /// that fills `/tmp` takes the session down with it. Each `--size`
+    /// has to sit directly in front of the `--tmpfs` it applies to:
+    /// bwrap(1) says the option affects the next tmpfs only.
+    #[test]
+    fn every_tmpfs_carries_its_own_size() {
+        let argv = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default())
+            .finish(&["sh".into()], &mut Counter::new())
+            .unwrap();
+        let s = strs(&argv);
+        for (size, dir) in [
+            ("67108864", "/etc"),
+            ("2147483648", "/tmp"),
+            ("67108864", "/var"),
+            ("67108864", "/run"),
+        ] {
+            assert!(
+                s.windows(4).any(|w| w == ["--size", size, "--tmpfs", dir]),
+                "{dir} has no cap: {s:?}"
+            );
+        }
+        assert_eq!(
+            s.iter().filter(|a| **a == "--tmpfs").count(),
+            s.iter().filter(|a| **a == "--size").count(),
+            "a tmpfs without a size: {s:?}"
+        );
+
+        // The sidecars get the same 64 MiB on both of theirs.
+        let argv = BwrapArgs::proxy_baseline(
+            Some(Path::new("/run/user/1000/bus")),
+            None,
+            None,
+            Path::new("/run/user/1000/bubbler/t/dbus"),
+            &FakeHost::default(),
+        )
+        .finish_plain(&["xdg-dbus-proxy".into()], &mut Counter::new())
+        .unwrap();
+        let s = strs(&argv);
+        for dir in ["/etc", "/tmp"] {
+            assert!(
+                s.windows(4)
+                    .any(|w| w == ["--size", "67108864", "--tmpfs", dir]),
+                "{dir} has no cap: {s:?}"
+            );
+        }
     }
 
     /// The accessibility bus is one more host socket the proxy connects
