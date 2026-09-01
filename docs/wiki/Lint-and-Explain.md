@@ -31,10 +31,11 @@ advice (exit code untouched).
 `mpris-wildcard`, `system-bus-polkit-name`, `home-share-sensitive`,
 `path-share-mountpoint`, `path-share-socket`, `share-source-missing`,
 `dbus-without-rules`, `env-looks-secret`, `tty-passthrough`,
-`portal-talk-without-portals`, `wayland-host`, `wayland-clipboard-open`.
+`tty-passthrough-without-seccomp`, `portal-talk-without-portals`,
+`wayland-host`, `wayland-clipboard-open`, `network-host`.
 
 **Notes** (information): `allow-host-wildcard`, `app-runtime-rw`,
-`network-host`, `outbound-deny`, `ozone-hint-unnecessary`,
+`outbound-deny`, `ozone-hint-unnecessary`,
 `command-not-found`, `desktop-entry-missing`, `camera-nodes-none-present`,
 `camera-nodes-no-hotplug`, `secrets-access`, `lint-allow-unused`,
 `x11-nested-no-wm`.

@@ -134,9 +134,13 @@ const MPRIS_WILDCARD: Check = Check {
     id: "mpris-wildcard",
     severity: Severity::Warning,
 };
+// A warning and not a note: this is the one mode where the sandbox's
+// reach is decided by nothing bubbler binds. Every service on the host's
+// loopback, and every abstract unix socket, which lives in the network
+// namespace rather than in the filesystem.
 const NETWORK_HOST: Check = Check {
     id: "network-host",
-    severity: Severity::Note,
+    severity: Severity::Warning,
 };
 // Information, not a warning: the filter is what the config asked for,
 // and what it cannot do is a property of address filtering rather than a
@@ -195,6 +199,10 @@ const SYSTEM_BUS_POLKIT_NAME: Check = Check {
 };
 const TTY_PASSTHROUGH: Check = Check {
     id: "tty-passthrough",
+    severity: Severity::Warning,
+};
+const TTY_PASSTHROUGH_WITHOUT_SECCOMP: Check = Check {
+    id: "tty-passthrough-without-seccomp",
     severity: Severity::Warning,
 };
 const USERNS_DISABLED_WITH_NESTED_SANDBOX: Check = Check {
@@ -256,6 +264,7 @@ pub const CHECKS: &[Check] = &[
     SHARE_SOURCE_MISSING,
     SYSTEM_BUS_POLKIT_NAME,
     TTY_PASSTHROUGH,
+    TTY_PASSTHROUGH_WITHOUT_SECCOMP,
     USERNS_DISABLED_WITH_NESTED_SANDBOX,
     WAYLAND_CLIPBOARD_OPEN,
     WAYLAND_HOST,
@@ -1086,11 +1095,13 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                 i,
                 node,
                 &NETWORK_HOST,
-                "`network \"host\"` puts the sandbox on the host's network stack: every \
-                 service on the host's loopback and every host abstract unix socket"
+                "`network \"host\"` shares the host network namespace: every host \
+                 loopback service and every abstract unix socket (X11's included) \
+                 is reachable"
                     .to_owned(),
-                "drop the argument for the sandbox's own network namespace, unless the app \
-                 needs the LAN or a service on the host's loopback",
+                "drop the argument for the sandbox's own network namespace, or accept it \
+                 with `lint-allow \"network-host\" reason=\"...\"` naming the host \
+                 service the application needs",
             ),
             "wayland" if arg(node) == Some("host") => f.push(
                 i,
@@ -1650,6 +1661,30 @@ fn across_layers(ctx: &Context, sources: &[Source], f: &mut Findings) {
              installed; otherwise fix the `desktop` node",
         );
     }
+
+    // Two nodes, and not always in one layer: one hands over the
+    // terminal, the other takes away the filter that guards it.
+    // `|&(_, n)|` and `into_iter()`, both to hand `arg` and `kids` a
+    // `&KdlNode` rather than the `&&KdlNode` a borrowed pattern binds.
+    let passthrough = last(sources, "tty").filter(|&(_, n)| arg(n) == Some("passthrough"));
+    let disabled = sources.iter().any(|s| {
+        top(s, "seccomp")
+            .into_iter()
+            .any(|n| kids(n).any(|c| c.name().value() == "disable"))
+    });
+    if let Some((i, node)) = passthrough.filter(|_| disabled) {
+        f.push(
+            i,
+            node,
+            &TTY_PASSTHROUGH_WITHOUT_SECCOMP,
+            "`tty \"passthrough\"` hands the sandbox this terminal's own descriptors and \
+             `seccomp { disable }` takes away the `TIOCSTI` and `TIOCLINUX` rules that \
+             stop it typing into them"
+                .to_owned(),
+            "leave the default `pty`, or keep the filter and take off the names the \
+             application needs one at a time with `seccomp { allow \"...\" }`",
+        );
+    }
 }
 
 /// Whether an application directory holds the entry a `desktop` node
@@ -1885,9 +1920,9 @@ mod tests {
         });
     }
 
-    /// A warning where `network "host"` is a note: what the argument
-    /// gives up is the compositor's own enforcement, and nothing else in
-    /// the sandbox stands in for it.
+    /// The session's socket is a warning of the same weight as
+    /// `network "host"`: what the argument gives up is the compositor's
+    /// own enforcement, and nothing else in the sandbox stands in for it.
     #[test]
     fn wayland_host_is_a_warning_and_the_bare_node_is_not() {
         with(&host(), |ctx| {
@@ -1947,14 +1982,24 @@ mod tests {
         });
     }
 
-    /// Only the host namespace is a finding: the isolated default is
-    /// what the check exists to point back at.
+    /// Only the host namespace is a finding, and it is a warning: what
+    /// the argument reaches is not the LAN alone but every service the
+    /// host runs on its own loopback, and every abstract unix socket,
+    /// which no filesystem permission covers.
     #[test]
-    fn network_host_is_a_note_and_the_other_modes_are_not() {
+    fn network_host_is_a_warning_and_the_other_modes_are_not() {
         with(&host(), |ctx| {
             let report = lint(ctx, &["network \"host\""]);
             assert_eq!(ids(&report), ["network-host"]);
-            assert_eq!(report.findings[0].severity, Severity::Note);
+            assert_eq!(report.findings[0].severity, Severity::Warning);
+            assert!(
+                report.findings[0].message.contains(
+                    "every host loopback service and every abstract unix socket \
+                     (X11's included) is reachable"
+                ),
+                "{}",
+                report.findings[0].message
+            );
             for clean in [
                 "network",
                 "network \"none\"",
@@ -1965,6 +2010,46 @@ mod tests {
             let allowed = lint(
                 ctx,
                 &["network \"host\"\nlint-allow \"network-host\" reason=\"LAN discovery\""],
+            );
+            assert_eq!(ids(&allowed), [] as [&str; 0]);
+        });
+    }
+
+    /// The terminal is handed over by one node and the filter that keeps
+    /// the sandbox from typing into it is taken away by another, in the
+    /// same file or in another layer.
+    #[test]
+    fn passthrough_without_a_filter_is_a_warning_of_its_own() {
+        with(&host(), |ctx| {
+            let both = lint(ctx, &["tty \"passthrough\"\nseccomp {\n    disable\n}"]);
+            assert_eq!(
+                ids(&both),
+                [
+                    "tty-passthrough",
+                    "tty-passthrough-without-seccomp",
+                    "seccomp-disabled"
+                ]
+            );
+            let split = lint(ctx, &["tty \"passthrough\"", "seccomp {\n    disable\n}"]);
+            assert!(
+                split
+                    .findings
+                    .iter()
+                    .any(|f| f.id == "tty-passthrough-without-seccomp")
+            );
+            // Either one on its own says nothing new.
+            for alone in ["tty \"passthrough\"", "seccomp {\n    disable\n}"] {
+                assert!(
+                    !ids(&lint(ctx, &[alone])).contains(&"tty-passthrough-without-seccomp"),
+                    "{alone}"
+                );
+            }
+            let allowed = lint(
+                ctx,
+                &["tty \"passthrough\"\nseccomp {\n    disable\n}\n\
+                   lint-allow \"tty-passthrough\" reason=\"a\"\n\
+                   lint-allow \"seccomp-disabled\" reason=\"b\"\n\
+                   lint-allow \"tty-passthrough-without-seccomp\" reason=\"c\""],
             );
             assert_eq!(ids(&allowed), [] as [&str; 0]);
         });

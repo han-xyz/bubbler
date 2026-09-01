@@ -2747,16 +2747,19 @@ outright rather than skipping the bind), `dbus-without-rules`,
 `env-looks-secret` (an underscore-separated word of the name is `TOKEN`,
 `SECRET`, `PASSWORD`, `APIKEY`, `PAT` and the like, or the value starts
 `ghp_`/`sk-`/`AKIA` — whole words, so `TOKENIZERS_PARALLELISM` is not one),
-`tty-passthrough`, `portal-talk-without-portals` (a portal rule is inert
-without `/.flatpak-info`, which is worse than wrong), `wayland-host`
+`tty-passthrough`, `tty-passthrough-without-seccomp` (`tty "passthrough"`
+with `seccomp { disable }`, which is the terminal handed over with the
+`TIOCSTI` rules taken away), `portal-talk-without-portals` (a portal rule is
+inert without `/.flatpak-info`, which is worse than wrong), `wayland-host`
 (`wayland "host"`, the session's own compositor socket, which the compositor
-cannot tell from your session).
+cannot tell from your session), `network-host` (`network "host"` shares the
+host network namespace: every host loopback service and every abstract unix
+socket, X11's included, is reachable).
 
 **Notes** are information and fail nothing: `app-runtime-rw` (a shared
 application runtime directory granted `mode=rw`, so the sandbox can replace the
-sockets everything else naming that id connects to), `network-host`
-(`network "host"`, the one mode that puts the sandbox on the host's network
-stack), `outbound-deny` (an address policy, not a name one),
+sockets everything else naming that id connects to), `outbound-deny`
+(an address policy, not a name one),
 `allow-host-wildcard` (an `allow-host` wildcard directly under a top-level
 domain, which covers every name anyone registers under that suffix),
 `ozone-hint-unnecessary`,

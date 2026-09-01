@@ -332,8 +332,8 @@ const CHECK_LINES: &[(&str, &str)] = &[
     ),
     (
         "network-host",
-        "`network \"host\"`, the one mode that puts the sandbox on the host's network \
-         stack, loopback services and abstract sockets included.",
+        "`network \"host\"` shares the host network namespace: every host loopback \
+         service and every abstract unix socket, X11's included, is reachable.",
     ),
     (
         "outbound-deny",
@@ -398,6 +398,12 @@ const CHECK_LINES: &[(&str, &str)] = &[
     (
         "tty-passthrough",
         "`tty \"passthrough\"` hands the sandbox this terminal's own descriptors.",
+    ),
+    (
+        "tty-passthrough-without-seccomp",
+        "`tty \"passthrough\"` together with `seccomp { disable }`: the sandbox holds the \
+         caller's own terminal descriptors and no filter denies the `ioctl`s that push \
+         characters into them.",
     ),
     (
         "userns-disabled-with-nested-sandbox",
