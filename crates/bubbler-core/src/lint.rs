@@ -1318,15 +1318,19 @@ fn repeat_outside_block(i: usize, source: &Source, f: &mut Findings) {
         if written.len() < 2 {
             continue;
         }
-        let mut parts: Vec<String> = Vec::new();
-        for node in written.iter().copied().take(3) {
-            let Some(child) = as_block_child(node) else {
-                // A node the config parser will refuse anyway; there is
-                // no block to offer for it.
-                return;
-            };
-            parts.push(child);
-        }
+        // A node the config parser will refuse anyway has no block form
+        // to offer; skip this `kind` rather than every `kind` after it
+        // — `collect` into an `Option` stops at the first `None`
+        // without reaching past this one.
+        let Some(mut parts) = written
+            .iter()
+            .copied()
+            .take(3)
+            .map(as_block_child)
+            .collect::<Option<Vec<String>>>()
+        else {
+            continue;
+        };
         if written.len() > 3 {
             parts.push("…".to_owned());
         }
@@ -3645,6 +3649,37 @@ mod tests {
                 f.help,
                 "write them as one block: `env { A \"1\"; B \"2\" }`"
             );
+        });
+    }
+
+    /// A malformed node of an earlier `REPEATABLE` kind must not
+    /// silence the note for a later kind: the block-child loop's early
+    /// exit used to `return` out of the whole function, walking away
+    /// from every kind after the malformed one rather than just
+    /// skipping the one it could not render.
+    #[test]
+    fn a_malformed_earlier_kind_does_not_silence_a_later_kind() {
+        with(&host(), |ctx| {
+            let alone = lint(ctx, &["path-share \"/a\"\npath-share \"/b\""]);
+            assert!(
+                ids(&alone).contains(&"repeat-outside-block"),
+                "{:?}",
+                alone.findings
+            );
+            // `home-share mode=ro` has no positional argument, so
+            // `as_block_child` cannot render it — `home-share` comes
+            // before `path-share` in `REPEATABLE`.
+            let with_a_malformed_earlier_kind = lint(
+                ctx,
+                &["home-share mode=ro\nhome-share \".b\" mode=ro\n\
+                   path-share \"/a\"\npath-share \"/b\""],
+            );
+            let f = with_a_malformed_earlier_kind
+                .findings
+                .iter()
+                .find(|f| f.id == "repeat-outside-block")
+                .expect("the note still fires for path-share");
+            assert!(f.message.starts_with("`path-share`"), "{f:?}");
         });
     }
 
