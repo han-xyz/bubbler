@@ -32,10 +32,10 @@ running `bubbler`, then under `/usr/lib/bubbler/`. Build needs Rust 1.95+ and
 
 | Package (Arch) | Needed for |
 |---|---|
-| `bubblewrap` | everything |
-| `libseccomp` | everything (linked) |
+| `bubblewrap` | everything; 0.12.0 or newer — an older version runs with a warning on every launch rather than a refusal (it follows a symlink an application planted at a bind destination it creates, GHSA-pxhw-h44j-8pfx; bubbler's own destination sweep closes that regardless) |
+| `libseccomp` | everything (linked); 2.5.4 or newer |
 | `bubbler-wl-proxy` (not a package — installed above) | every sandboxed `wayland`; the run stops if it is missing or will not start |
-| `xdg-dbus-proxy` | any `dbus` or `system-bus` grant — of the shipped profiles, `chromium`, `code` and `firefox`; no profile grants `system-bus` |
+| `xdg-dbus-proxy` | any `dbus` or `system-bus` grant — of the shipped profiles, `chromium`, `code` and `firefox`; no profile grants `system-bus`; 0.1.8 or newer — an older version warns (it lets a filtered client eavesdrop on the bus and receive accessibility broadcasts it was not granted, CVE-2026-34080, GHSA-r7hp-698j-2h6c) |
 | `passt` | isolated `network` — every shipped profile with a network |
 | `nftables` | `outbound "deny"` only |
 | `bubbler-net-proxy` (not a package — installed above) | `network { allow-host … }` only; it also needs a cgroup2 subtree delegated to your user, which a systemd user session provides |

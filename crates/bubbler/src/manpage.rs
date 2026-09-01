@@ -8,6 +8,7 @@ use std::ffi::OsString;
 
 use bubbler_core::catalogue::GRANTS;
 use bubbler_core::lint::CHECKS;
+use bubbler_core::version::{BWRAP_FLOOR, PROXY_FLOOR};
 use clap::Command;
 use clap_mangen::Man;
 use clap_mangen::roff::{Roff, bold, roman};
@@ -209,6 +210,41 @@ const ENVIRONMENT: &[(&str, &str)] = &[
 
 /// The pages and programs a reader goes to next.
 const SEE_ALSO: &str = "bubbler-config(5), bwrap(1), xdg-dbus-proxy(1), pasta(1)";
+
+/// What a run needs on the host beyond the binary itself, as the
+/// `REQUIREMENTS` section lists them. The two version floors are formatted
+/// from `version::BWRAP_FLOOR` and `version::PROXY_FLOOR` themselves, so
+/// this page cannot name a number the code does not actually check.
+fn requirements() -> Vec<(String, &'static str)> {
+    let (a, b, c) = BWRAP_FLOOR;
+    let (x, y, z) = PROXY_FLOOR;
+    vec![
+        (
+            format!("bwrap (bubblewrap) {a}.{b}.{c} or newer"),
+            "An older version runs with a warning on every launch rather than a refusal: it \
+             follows a symlink an application planted at a bind destination it creates, \
+             writing outside the sandbox (GHSA-pxhw-h44j-8pfx). bubbler's own destination \
+             sweep refuses a launch behind a planted symlink regardless of the host's \
+             version; the warning is what says a host fix would close the gap the sweep \
+             stands in for.",
+        ),
+        (
+            format!("xdg-dbus-proxy {x}.{y}.{z} or newer"),
+            "For any dbus, system-bus, portals or a11y grant. An older version warns, and \
+             lets a filtered client eavesdrop on the bus and receive accessibility \
+             broadcasts it was not granted (CVE-2026-34080, GHSA-r7hp-698j-2h6c).",
+        ),
+        (
+            "libseccomp".to_owned(),
+            "Linked at build time; every rule the default filter compiles is checked against \
+             it in the test suite.",
+        ),
+        (
+            "A kernel with unprivileged user namespaces".to_owned(),
+            "What every sandbox bwrap starts is built out of.",
+        ),
+    ]
+}
 
 /// What `config.kdl` is, before the node-by-node list.
 const CONFIG_DESCRIPTION: &[&str] = &[
@@ -555,6 +591,12 @@ pub fn page(cmd: Command, version: &str) -> Vec<OsString> {
         extra.control("TP", []);
         extra.text([bold(*name)]);
         extra.text([roman(*what)]);
+    }
+    extra.control("SH", ["REQUIREMENTS"]);
+    for (name, what) in requirements() {
+        extra.control("TP", []);
+        extra.text([bold(name.as_str())]);
+        extra.text([roman(what)]);
     }
     extra.control("SH", ["SEE ALSO"]);
     extra.text([roman(SEE_ALSO)]);

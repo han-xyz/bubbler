@@ -106,10 +106,13 @@ published yet — AUR account registration is currently down. From source:
     target/release/bubbler man          > /usr/share/man/man1/bubbler.1
     target/release/bubbler man --config > /usr/share/man/man5/bubbler-config.5
 
-Build needs Rust 1.95+, a 64-bit target and `libseccomp` (2.5.4+). Runtime: `bubblewrap` and a
+Build needs Rust 1.95+, a 64-bit target and `libseccomp` (2.5.4+). Runtime: `bubblewrap`
+(0.12.0 or newer — an older version runs with a warning rather than a
+refusal; GHSA-pxhw-h44j-8pfx) and a
 kernel with user namespaces; `bubbler-wl-proxy` from the set above in front of
 every sandboxed `wayland`, which is not optional — a run stops without it;
-`xdg-dbus-proxy` for `dbus`/`system-bus`;
+`xdg-dbus-proxy` (0.1.8 or newer — an older version warns; CVE-2026-34080,
+GHSA-r7hp-698j-2h6c) for `dbus`/`system-bus`;
 `passt` (pasta) for an isolated `network`; `nftables` for `outbound "deny"`,
 with `bubbler-net-proxy` from the set above and a delegated cgroup2 subtree (a
 systemd user session provides one) where that node names an `allow-host`;

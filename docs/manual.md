@@ -231,6 +231,15 @@ command and every exec'd process, waits five seconds, and `SIGKILL`s whatever
 is left; the command's own exit status is what `bubbler` returns. If the
 supervisor cannot be found the signal goes to `bwrap` instead, and the sandbox
 is torn down by `--die-with-parent`, which is the backstop in any case.
+`bubbler-init` also answers `SIGHUP` and `SIGQUIT` with the same grace as
+`SIGTERM`, so a terminal that goes away or a keyboard quit ends the run
+instead of leaving the command to bwrap's own reaper. Before it does any of
+that it hardens itself — `PR_SET_NO_NEW_PRIVS`, the ambient and the three
+`capset` capability sets cleared, whatever the bounding set still holds
+dropped, non-dumpable, and `PR_SET_PDEATHSIG(SIGTERM)` — which under bwrap is
+mostly stating a posture that is already true, and is the point: a supervisor
+started any other way must not be the one process in the tree that kept a
+privilege.
 
 `edit` runs `$VISUAL`, else `$EDITOR`, split on whitespace into an argv with
 the config path appended — there is no shell, so quotes and `$VAR` in those
@@ -272,6 +281,7 @@ file descriptor numbers are the ones a dry run prints.
     bwrap
 
       baseline                                       138 arguments
+        bwrap 0.12.0
         --unshare-all
         --die-with-parent
         --new-session
@@ -301,7 +311,7 @@ file descriptor numbers are the ones a dry run prints.
         --setenv WAYLAND_DISPLAY wayland-1
         --setenv XDG_SESSION_TYPE wayland
         security-context: engine=org.bubbler app=org.bubbler.ff instance=bubbler-ff
-        sidecar: bubbler-wl-proxy listener /run/user/1000/bubbler/ff/wayland → upstream /run/user/1000/bubbler/ff/wayland-context, gate paste
+        sidecar: bubbler-wl-proxy listener /run/user/1000/bubbler/ff/wayland → upstream /run/user/1000/bubbler/ff/wayland-context, gate paste, hides 40 privileged globals
 
       network                         config.kdl:7   5 arguments
         --perms 0644 --ro-bind-data 8 /etc/resolv.conf  (generated file, 23 bytes)
@@ -473,6 +483,8 @@ file order does not affect the generated argv.
     mpris name="firefox.*"           # own org.mpris.MediaPlayer2.firefox.*
     a11y                             # the accessibility bus, through the proxy
     input-method                     # the fcitx5 and IBus portal names
+    tmp size="4G"                    # cap the sandbox's /tmp above the 2G default;
+                                     #   K/M/G suffix, up to 64G
     tty "pty"                        # terminal: "pty", "passthrough" or "none"
     userns "allow"                   # nested user namespaces: "allow" or "disable"
     seccomp {                        # changes to the default syscall denylist
@@ -662,7 +674,9 @@ duplicate line is, and a `/-` on the block turns every entry under it
 off. A block with an argument as well as children is refused ("takes
 an argument or children, not both"), as is a child with children of
 its own or with an argument where the name is already the argument.
-`include` takes no block: it is an argument list already.
+`include` is not one of the six: each line names one profile, and a
+profile layer that extends several writes one `include` line per name
+rather than a block.
 
 `bubbler lint` raises the note `repeat-outside-block` where a file
 writes two or more of one kind on their own lines, and shows the
@@ -737,6 +751,7 @@ own `seccomp` node never reaches it.
     bwrap  (the Wayland proxy sidecar)
 
       baseline                42 arguments
+        bwrap 0.12.0
         --unshare-all
         --die-with-parent
         --new-session
@@ -1828,6 +1843,22 @@ so every run of it prints a warning naming the change and both ways out of it.
 header; `bubbler edit <name>` keeps whatever was written by hand and stamps the
 header too, since a file you have just read through means what it says.
 
+### tmp
+
+`tmp size="<n>K|M|G"` moves the cap on the sandbox's own `/tmp` above the
+2 GiB default: a decimal number with a required `K`, `M` or `G` suffix — the
+suffix is required so that a bare number does not read as bytes to bubbler and
+gibibytes to everyone else — up to 64G, which is the largest bubbler accepts
+because a tmpfs is pinned host memory and a cap past that is not one anyone
+meant to write. The node takes no argument, no children, and `size="0"` is
+refused: a `/tmp` of zero bytes is a sandbox with no `/tmp` at all. Every other
+tmpfs the baseline mounts — `/etc`, `/var`, `/run`, and the runtime directory
+`--dir` makes inside `/run` — stays capped at 64 MiB regardless, since those
+hold sockets and generated files rather than an application's own data; `tmp`
+reaches only `/tmp`. Lowering the cap below what an application stages there
+fails its write with `ENOSPC` rather than weakening the sandbox; raising it
+hands the sandbox that much more of the host's RAM to take.
+
 ### env, command and desktop
 
 `env` keys must look like `[A-Za-z_][A-Za-z0-9_]*`, and each key may appear
@@ -1836,7 +1867,10 @@ or a carriage return — a newline would forge a line in `--dry-run` output. The
 variables the sandbox owns are rejected: `HOME`, `PATH`, `XDG_RUNTIME_DIR`,
 `USER`, `LOGNAME`, `WAYLAND_DISPLAY`, `DISPLAY`, `XAUTHORITY`,
 `XDG_SESSION_TYPE`, `PULSE_SERVER`, `DBUS_SESSION_BUS_ADDRESS`,
-`DBUS_SYSTEM_BUS_ADDRESS`, `AT_SPI_BUS_ADDRESS`, `IBUS_USE_PORTAL`, and the
+`DBUS_SYSTEM_BUS_ADDRESS`, `AT_SPI_BUS_ADDRESS`, `IBUS_USE_PORTAL`,
+`XDG_ACTIVATION_TOKEN` — the token the session issues bubbler to activate a
+window and take the keyboard focus, which a config must not plant a copy
+of — and the
 seven an `allow-host` sets — `HTTPS_PROXY`, `HTTP_PROXY`, `https_proxy`,
 `http_proxy`, `NO_PROXY`, `no_proxy`, `NODE_USE_ENV_PROXY`. The last seven are
 refused whether or not the config has an `allow-host`: one written by hand
@@ -2781,7 +2815,11 @@ holding one), `dup-name-policy` (one bus name given two policies by two
 layers),
 `own-on-system-bus`, `camera-without-portals` (a `camera` grant no layer gives
 a `portals` to carry, so the portal reads the sandbox as an ordinary process
-of yours).
+of yours), `dbus-name-is-host-exec` (a `dbus` or `system-bus` rule naming
+`org.freedesktop.systemd1`, `org.freedesktop.Flatpak`, an
+`org.freedesktop.impl.portal.*` backend or `ca.desrt.dconf` — each runs a
+command or sets policy outside the sandbox, so the grant is not a wider
+sandbox but no sandbox).
 
 **Warnings** say the file grants more than it probably means to:
 `x11-without-reason` (an `x11 "host"` grant with no `lint-allow` reason; the
@@ -2813,7 +2851,10 @@ inert without `/.flatpak-info`, which is worse than wrong), `wayland-host`
 (`wayland "host"`, the session's own compositor socket, which the compositor
 cannot tell from your session), `network-host` (`network "host"` shares the
 host network namespace: every host loopback service and every abstract unix
-socket, X11's included, is reachable).
+socket, X11's included, is reachable), `dbus-name-is-risky` (a `dbus` or
+`system-bus` rule naming a bus name that is defensible but wide — the KWin or
+GNOME shell compositor's own name, the session's file manager, or the Secret
+Service — with the one sentence a reader needs about what the name is).
 
 **Notes** are information and fail nothing: `app-runtime-rw` (a shared
 application runtime directory granted `mode=rw`, so the sandbox can replace the
@@ -2843,7 +2884,10 @@ undecorated and unmanaged in the one compositor window it draws),
 `pulseaudio-module-loading` (a `pulseaudio` grant on a host whose effective
 `pipewire-pulse.conf` leaves `pulse.allow-module-loading` on — the daemon's
 own default — so the host's audio daemon will load a module, a network sink
-among them, because the sandbox asked it to), `repeat-outside-block` (a
+among them, because the sandbox asked it to; the check reads only
+`pipewire-pulse.conf`, so a host running the real `pulseaudio` daemon instead
+of PipeWire's compatibility layer has no such file to turn the property off
+in, and the note fires there by the same default), `repeat-outside-block` (a
 repeatable node — `home-share`, `path-share`, `etc-share`, `app-runtime`,
 `env` or `lint-allow` — written two or more times on its own lines instead
 of one block).
@@ -2961,12 +3005,19 @@ which the portal would take but flatpak's own name check would not.
 The rules it grants are `--talk` for `org.freedesktop.portal.Desktop`
 and `.Documents`, one `--call` and one `--broadcast` per interface it
 opens on the desktop object, `--call=org.freedesktop.portal.Documents=*`,
-and the two `--broadcast` rules the per-call and per-session objects
-answer on. The interfaces the bare node opens are `Request`,
-`Session`, `FileChooser`, `OpenURI`, `Notification`, `Settings`,
-`Print`, `Email`, `Trash`, `Account`, `Inhibit`, `ProxyResolver`,
-`NetworkMonitor`, `MemoryMonitor`, `PowerProfileMonitor`, `Realtime`
-and `GameMode`. Everything else is a child:
+one `--call` and one `--broadcast` each for `Request` and `Session` —
+per-call and per-session objects that live under their own path rather
+than on the desktop object, so each needs a path-scoped rule of its
+own — and `--call` for `org.freedesktop.DBus.Properties.Get` and
+`.GetAll` on the desktop object, which `GDBusProxy` and libportal both
+call when a client constructs its proxy, before any portal call at
+all; `Set` is left out, since no portal property here is meant to be
+written from inside the sandbox. The interfaces the bare node opens on
+the desktop object are `FileChooser`, `OpenURI`, `Notification`,
+`Settings`, `Print`, `Email`, `Trash`, `Account`, `Inhibit`,
+`ProxyResolver`, `NetworkMonitor`, `MemoryMonitor`,
+`PowerProfileMonitor`, `Realtime` and `GameMode`, plus `Request` and
+`Session` on their own paths. Everything else is a child:
 
 | child | interfaces | what it costs |
 |---|---|---|
@@ -3346,16 +3397,33 @@ model.
 `EPERM`: the kernel keyring (`add_key`, `keyctl`, `request_key`),
 `perf_event_open`, `bpf`, `userfaultfd`, `fanotify_init`, the NUMA and
 page-migration calls, module and kexec loading, `iopl`/`ioperm`, swap,
-`reboot`, `syslog`, quota, the system clock and the host name — the list is
-`DEFAULT_EPERM` in `crates/bubbler-core/src/seccomp.rs`. Two `ioctl` requests
+`reboot`, `syslog`, quota, the system clock and the host name, io_uring
+(`io_uring_setup`, `io_uring_enter`, `io_uring_register` — a second syscall
+path that every recent mitigation bypass was written against, and the
+kernel's own `io_uring_disabled=2` already answers `EPERM`, which is what
+every runtime that falls back gracefully is tested against), `pidfd_getfd`
+(takes a descriptor out of another process by pidfd — the sandbox shares its
+pid namespace with `bubbler-init` and with every command run through the exec
+channel) and `kcmp` (compares two processes' kernel objects, a side channel
+out of the sandbox's own process tree) — the list is `DEFAULT_EPERM` in
+`crates/bubbler-core/src/seccomp.rs`. Two `ioctl` requests
 are denied by their argument as well: `TIOCSTI` (0x5412) and `TIOCLINUX`
 (0x541C), which push bytes into a terminal's input queue (CVE-2017-5226,
 CVE-2023-28100). `ENOSYS`: `clone3` and the new mount API (`open_tree`,
 `move_mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `mount_setattr`),
-which is `DEFAULT_ENOSYS` in the same file. `unshare`, `setns`, `clone`,
-`mount`, `pivot_root`, `chroot` and `ptrace` are deliberately *not* denied:
-Firefox and Chromium build their own sandbox out of them, and a nested user
-namespace cannot undo bwrap's read-only binds.
+which is `DEFAULT_ENOSYS` in the same file. Three more of the same mount API
+are denied by syscall *number* instead of by name — `open_tree_attr` (467),
+`listns` (470) and `fchroot` (472) — because libseccomp 2.6.0 has no name for
+them yet; a rule added by a number the native table cannot name is not
+translated to the filter's second architecture, so these three rules hold for
+the build architecture (x86_64) alone, and a 32-bit binary in the sandbox
+still reaches them. A profile may `allow` or `deny` any of the three by that
+same name, exactly as it does for a named syscall. `unshare`, `setns`,
+`clone`, `mount`, `pivot_root`, `chroot` and `ptrace` are deliberately *not*
+denied: Firefox and Chromium build their own sandbox out of them, and a
+nested user namespace cannot undo bwrap's read-only binds. `deny "ptrace"` is
+the opt-in for an application with no inner sandbox of its own to build one
+out of it.
 
 The `seccomp` node changes the list for one instance; the proxy sandbox always
 keeps the default:
@@ -3381,6 +3449,19 @@ program. `disable` prints `bubbler: seccomp disabled for instance <name>` on
 each run, so an unfiltered sandbox is never a quiet one; an `allow` list that
 takes back every rule leaves nothing to load and says
 `bubbler: seccomp has no rules left for instance <name>` for the same reason.
+
+`personality` is filtered by argument rather than denied outright: a
+hand-written cBPF block ahead of the compiled filter allows only five
+values — `PER_LINUX` (0x0), `PER_LINUX32` (0x8), `UNAME26` (0x20000),
+`UNAME26|PER_LINUX32` (0x20008), and the query value `0xffffffff` — and
+answers `EPERM` for anything else, `ADDR_NO_RANDOMIZE`,
+`READ_IMPLIES_EXEC` and `MMAP_PAGE_ZERO` among them: each turns off an
+exploit mitigation that no desktop application needs turned off. The prefix
+only recognises the x86_64 and i386 `AUDIT_ARCH`/`__NR_personality` values,
+so it is compiled into every filter but is inert on any other build
+architecture, where `personality` stays as unrestricted as any syscall
+neither list names. `allow "personality"` drops the prefix entirely and lets
+the syscall through unfiltered, same as naming any other syscall.
 
 A syscall name the linked libseccomp does not know is left out of the filter
 rather than failing the launch, and every run that does so prints, once,
@@ -3473,11 +3554,17 @@ needs. No shipped profile sets it.
 ## Baseline
 
 Every sandbox gets: all namespaces unshared, no network, read-only `/usr` and
-`/opt`, empty `/tmp` `/var` `/run`, a private home at `/home/bubbler`, an
-empty `$XDG_RUNTIME_DIR` at the host's path with mode 0700, `/home/bubbler` as
+`/opt`, an empty `/tmp` capped at 2 GiB (`tmp size="…"` moves that cap, up to
+64G — see "tmp"), empty `/var` and `/run` capped at 64 MiB each — a tmpfs is
+pinned host memory, so every one of these caps is how much of it a sandbox may
+take with files it writes there — a private home at `/home/bubbler`, an
+empty `$XDG_RUNTIME_DIR` at the host's path with mode 0700 and the same 64 MiB
+cap, since the runtime directory `--dir` makes inside `/run` shares that
+tmpfs, `/home/bubbler` as
 the working directory, and a cleared environment (only the locale and terminal
 variables — `TERM`, `LANG`, `LANGUAGE`, `COLORTERM`, `TZ`, `LC_*` — are
-carried over). Grants only add to that.
+carried over). Every sidecar bubbler wraps in a bwrap of its own gets the same
+64 MiB caps on its `/etc`, `/var`, `/run` and `/tmp`. Grants only add to that.
 
 `/dev/ntsync` is bound too, on a host that has the node — the one device the
 baseline hands over, and a deliberate widening of it. It is the kernel's
@@ -3506,6 +3593,18 @@ cookie files named by the environment must really be of that type, so a
 `WAYLAND_DISPLAY` or `XAUTHORITY` naming a directory is refused instead of
 binding the tree under it.
 
+The sandboxed command starts on a session keyring of its own: the forked
+child joins one (`keyctl(2)` `KEYCTL_JOIN_SESSION_KEYRING` with a null name)
+right before it execs `bwrap`, so it never inherits the login session keyring
+that spawned bubbler. `keyctl` is on the default `EPERM` denylist, but a
+profile may take it off, and without this join the keys behind `@s` would be
+the user's rather than this instance's. A kernel built without `CONFIG_KEYS`
+has no keyring to join or to inherit either, so that case is not a failure.
+
+`--explain` prints the host `bwrap` version as the first line of the baseline
+group, `bwrap <version>`, whether or not it meets the floor under
+"Installing" — see "Explaining an argv".
+
 ## Threat model
 
 `docs/threat-model.md` is the long form: the assets, the attacker — one
@@ -3520,7 +3619,34 @@ processes outside a sandbox — anything running as your uid can read the
 instance store and connect to a live instance's control socket. On the display,
 `wayland` is a boundary the compositor enforces with a proxy of bubbler's in
 front of it, and a bare `x11` an X server of the sandbox's own behind that;
-`x11 "host"` is no boundary at all.
+`x11 "host"` is no boundary at all. On the compositor side that boundary is
+only as real as the compositor's own enforcement: KWin offers the security
+context protocol but gates its enforcement on the client sitting in an
+`app-flatpak-*` cgroup unit, which bubbler does not put it in, so a bare
+`wayland` sandbox on KDE is not actually withheld anything by KWin itself, and
+Mutter implements no security-context protocol at all. bubbler's own proxy
+closes that gap: it applies its 40-name privileged-interface denylist to
+every sandboxed `wayland` connection unconditionally, whether or not the
+compositor also took a security context — see "wayland".
+
+Every run checks the host's `bwrap` and `xdg-dbus-proxy` once and warns, on
+stderr, before anything else, when either is older than the floor this
+version needs: `bwrap` below 0.12.0 follows a symlink an application planted
+at a bind destination it creates (GHSA-pxhw-h44j-8pfx), and `xdg-dbus-proxy`
+below 0.1.8 lets a filtered client eavesdrop on the bus and receive
+accessibility broadcasts it was not granted (CVE-2026-34080,
+GHSA-r7hp-698j-2h6c); the `xdg-dbus-proxy` warning only fires for a config
+that starts the proxy at all. Nothing silences either line. Independently of
+the bwrap floor, bubbler sweeps every destination a run's own binds create —
+the private home, an `app-runtime` leaf, the document-portal view — and
+refuses the launch if any path component along the way is a symlink: an
+application already inside a previous run of the same instance cannot plant
+one for this run to write through. The check has no per-instance lock, so a
+second instance racing the first can still plant a link in the window
+between the sweep and the bind on a `bwrap` below the floor; only 0.12.0 or
+newer closes that window itself, which is what the version warning points
+at. A component the sweep cannot even read — a directory `chmod 000`'d, say —
+refuses the launch as well rather than guessing.
 
 bubbler itself is unprivileged and unconfined: it can do whatever your account
 can. `contrib/apparmor/usr.bin.bubbler` is an AppArmor profile that would narrow
@@ -3850,8 +3976,15 @@ system layer *between* your profiles and the built-in ones: a file put there
 would shadow the built-in of the same name and keep shadowing it after an
 upgrade. It is the administrator's, and bubbler ships nothing in it.
 
-At runtime bubbler needs `bwrap` (bubblewrap), `xdg-dbus-proxy` for any profile
-with a `dbus` or `system-bus` grant, which is most of them, `pasta` (the
+At runtime bubbler needs `bwrap` (bubblewrap) — 0.12.0 or newer; an older
+version runs with a warning on every launch rather than a refusal, since it
+follows a symlink an application planted at a bind destination it creates
+(GHSA-pxhw-h44j-8pfx), and bubbler's own destination sweep closes that
+regardless of the host's version — `xdg-dbus-proxy` for any profile with a
+`dbus` or `system-bus` grant, which is most of them — 0.1.8 or newer, again a
+warning and not a refusal below it, since an older one lets a filtered client
+eavesdrop on the bus and receive accessibility broadcasts it was not granted
+(CVE-2026-34080, GHSA-r7hp-698j-2h6c) — `pasta` (the
 `passt` package) for an isolated `network`, `nftables` for an `outbound "deny"`
 — and, with an `allow-host`, a cgroup2 subtree delegated to the user, which a
 systemd user session provides — and `libseccomp`. An `a11y` grant

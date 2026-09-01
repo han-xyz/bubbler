@@ -101,15 +101,24 @@ process, so window rules keyed on a pid name the sidecar rather than the
 application. A bare `x11`'s Xwayland is an ordinary client of the same socket,
 decoded and gated like anything else inside.
 
-A compositor that implements none of this gets the session socket as the
-proxy's upstream — the proxy then hides 40 privileged interfaces itself, a
-denylist of bubbler's own: the 31 Hyprland withholds from a security-context
-client, plus nine of the same class found by reading every global the proxy's
-tables describe. Being a denylist and not the whole class of privileged
-protocols, a protocol nobody has written into it reaches the sandbox on this
-path; what it does let through is written down beside it, so a protocol bump
-that brings a new global fails a test. The fallback is announced once per
-launch:
+The proxy applies its own 40-name privileged-interface denylist to every
+sandboxed `wayland` connection **unconditionally** — the 31 Hyprland
+withholds from a security-context client, plus nine of the same class found
+by reading every global the proxy's tables describe — whether or not the
+compositor also took a security context. That matters because a security
+context is not enforcement on its own: KWin offers
+`wp_security_context_manager_v1` but gates its own enforcement on the client
+sitting in an `app-flatpak-*` cgroup unit, which bubbler does not put it in,
+so on KDE a bubbler sandbox registers a context that KWin does not actually
+act on; Mutter implements no security-context protocol at all. The proxy's
+own denylist is what closes both gaps, not the compositor's. Being a
+denylist and not the whole class of privileged
+protocols, a protocol nobody has written into it reaches the sandbox; what it
+does let through is written down beside it, so a protocol bump that brings a
+new global fails a test. A compositor that implements no security-context
+protocol at all gets the session socket as the proxy's upstream instead of
+the security-context one — the denylist above still applies exactly the same
+way — and the fallback is announced once per launch:
 
 ```
 bubbler: note: wayland: no wp_security_context_manager_v1; the proxy hides the privileged globals instead
@@ -313,12 +322,25 @@ not a capability model.
 
 - `EPERM`: kernel keyring, `perf_event_open`, `bpf`, `userfaultfd`,
   `fanotify_init`, NUMA/page migration, module and kexec loading,
-  `iopl`/`ioperm`, swap, `reboot`, `syslog`, quota, clock, hostname; the
+  `iopl`/`ioperm`, swap, `reboot`, `syslog`, quota, clock, hostname, io_uring
+  (`io_uring_setup`/`_enter`/`_register` — matches the kernel's own
+  `io_uring_disabled=2`), `pidfd_getfd`, `kcmp`; the
   `TIOCSTI` and `TIOCLINUX` ioctls by argument.
-- `ENOSYS`: `clone3` and the new mount API (`open_tree`, `fsopen`, …).
+- `ENOSYS`: `clone3` and the new mount API (`open_tree`, `fsopen`, …). Three
+  more of the same API — `open_tree_attr` (467), `listns` (470), `fchroot`
+  (472) — are denied by syscall *number*, since libseccomp 2.6.0 has no name
+  for them yet, which holds for the build (x86_64) architecture only; a
+  32-bit binary still reaches them. `allow`/`deny` takes them by name too.
+- `personality` is filtered by argument: a hand-written prefix ahead of the
+  compiled filter allows only `PER_LINUX`, `PER_LINUX32`, `UNAME26`, both
+  together, and the query value, `EPERM` for the rest. It recognises only
+  x86_64/i386 `AUDIT_ARCH` values, so on any other build architecture it is
+  inert and `personality` is unrestricted; `allow "personality"` drops the
+  prefix.
 - Deliberately **not** denied: `unshare`, `setns`, `clone`, `mount`,
   `pivot_root`, `chroot`, `ptrace` — Firefox and Chromium build their own
-  sandbox from them.
+  sandbox from them; `deny "ptrace"` is the opt-in for an app with no inner
+  sandbox of its own.
 - On x86_64 the filter carries **x86_64 + i386**, so Steam/Proton/DXVK 32-bit
   code is filtered, not killed. Cost: `modify_ldt` is allowed for both ABIs
   (`seccomp { deny "modify_ldt" }` puts it back). x32 syscalls are killed with

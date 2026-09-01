@@ -135,13 +135,58 @@ mode and bubbler does not install it.
 
 ## What each mechanism defends, and what it does not
 
+### Host tool versions
+
+**Defends:** `bwrap --version` and `xdg-dbus-proxy --version` are read once
+per process, cached, and every `run`, `try` and `open` prints a warning on
+stderr before anything else — before a runtime directory exists, whether or
+not the launch goes on to succeed — naming which tool is old and which fix
+closes the gap: `bwrap` below 0.12.0 follows a symlink an application
+planted at a bind destination it creates, writing outside the sandbox
+(GHSA-pxhw-h44j-8pfx); `xdg-dbus-proxy` below 0.1.8 lets a filtered client
+eavesdrop on the bus and receive accessibility broadcasts it was not granted
+(CVE-2026-34080, GHSA-r7hp-698j-2h6c). The proxy line only fires for a
+config that starts one — a `dbus`, `system-bus`, `portals` or `a11y` grant —
+since a sandbox with no bus is not exposed to what it describes. A version
+that cannot be read at all — the binary missing, a non-zero exit, output
+that is not `<name> X.Y.Z` — is treated as below every floor: a tool that
+will not say which version it is cannot be trusted to be the one that
+carries the fix. Nothing silences either line; no config or environment
+variable turns it off.
+
+**Does not defend:** the bwrap floor is advisory only. bubbler does not
+refuse to launch on an old `bwrap` — the destination symlink sweep below
+covers the one CVE this floor is about regardless of the host's version, so
+the warning is what tells you the sweep is standing in for a host fix you
+have not applied, not a gate that stops the run. The `xdg-dbus-proxy` floor
+has no such standby: below 0.1.8 the two bypasses the warning names are
+real for the length of the run.
+
+[explain](manual.md#explaining-an-argv) ·
+`a_version_line_is_the_tool_s_own_name_and_three_numbers`,
+`unknown_is_below_every_floor_and_a_known_version_compares_by_number`,
+`probing_reads_a_tool_that_answers_and_says_unknown_for_one_that_does_not`,
+`an_old_bwrap_always_warns_and_an_old_proxy_only_where_a_bus_is_granted`,
+`the_baseline_group_names_the_bwrap_version`,
+`a_run_warns_about_a_bwrap_below_the_floor_before_it_starts`
+
 ### Namespaces and the bind set
 
 **Defends:** the filesystem outside the bind set does not exist inside.
 bwrap has no blacklist, so the model is "bind what you need": `/usr` and
-`/opt` read-only, an `/etc` allowlist over a tmpfs, empty `/tmp` `/var`
-`/run`, a private home at `/home/bubbler`, an empty `$XDG_RUNTIME_DIR` at
-the host's path, and a cleared environment. All namespaces are unshared —
+`/opt` read-only, an `/etc` allowlist over a tmpfs, empty `/tmp` capped at
+2 GiB by default (`tmp size="…"` moves that cap, up to 64G) and empty `/var`
+`/run` capped at 64 MiB each — a tmpfs is pinned host memory, so an
+uncapped one lets a sandbox that fills it take the session's memory with
+it — a private home at `/home/bubbler`, an empty `$XDG_RUNTIME_DIR` at
+the host's path sharing the `/run` cap, since it is a directory `--dir`
+makes inside that tmpfs, and a cleared environment. Every sidecar bubbler
+wraps in a bwrap of its own gets the same 64 MiB caps. The forked child also
+joins a session keyring of its own (`keyctl(2)` `KEYCTL_JOIN_SESSION_KEYRING`
+with a null name) right before it execs `bwrap`, so it never inherits the
+login session keyring bubbler itself runs on; `keyctl` is on the `EPERM`
+denylist by default, but a profile may take it off, and without the join the
+keys behind `@s` would be the user's rather than this instance's. All namespaces are unshared —
 except the network one under `network "host"`, which is the whole of that
 grant; `--die-with-parent` and `--new-session` are always on. Bind order is
 semantics — a later `--tmpfs /run` would silently shadow a socket bound
@@ -160,7 +205,8 @@ the portal's per-document mode bits, and nothing of the mount's other apps.
 `portals_binds_this_instances_document_portal_view_read_write`,
 `portals_without_a_document_portal_mount_binds_nothing_there`,
 `real_bwrap_home_is_fixed_and_private`,
-`real_bwrap_etc_is_allowlisted_and_user_is_bubbler`
+`real_bwrap_etc_is_allowlisted_and_user_is_bubbler`,
+`joining_a_session_keyring_leaves_the_thread_on_a_new_one`
 
 ### Host environment values
 
@@ -512,14 +558,28 @@ it.
 
 **Defends:** a denylist compiled at launch and handed to bwrap as one
 program — the keyring, `perf_event_open`, `bpf`, `userfaultfd`, module
-and kexec loading, the clock and the host name, plus `TIOCSTI` and
+and kexec loading, the clock and the host name, io_uring (`io_uring_setup`,
+`io_uring_enter`, `io_uring_register` — `EPERM`, matching the kernel's own
+`io_uring_disabled=2`, since every runtime already falls back gracefully to
+that answer and `ENOSYS` risks a caller probing by another path instead),
+`pidfd_getfd` and `kcmp` (both reach across process boundaries the sandbox
+otherwise keeps closed), plus `TIOCSTI` and
 `TIOCLINUX` denied by ioctl argument (CVE-2017-5226, CVE-2023-28100). A
 second, smaller set answers `ENOSYS` rather than `EPERM` — `clone3` and
 the whole new mount API (`open_tree`, `move_mount`, `fsopen`, `fsconfig`,
 `fsmount`, `fspick`, `mount_setattr`) — so libc falls back to the older
 call instead of failing outright; that API is the one CVE-2021-41133
 walked past flatpak's filter through, because a denylist written before
-it existed did not name it. On
+it existed did not name it. A hand-written cBPF prefix ahead of the
+compiled filter allows `personality` only the five values a desktop
+application has any business setting (`PER_LINUX`, `PER_LINUX32`,
+`UNAME26`, both together, and the query value `0xffffffff`) and answers
+`EPERM` for the rest, `ADDR_NO_RANDOMIZE` among them — the prefix only
+recognises the `x86_64`/`i386` `AUDIT_ARCH` and syscall-number values, so it
+is compiled into every filter but is inert on any other build architecture,
+where `personality` is as unrestricted as any syscall neither denylist
+names; `allow "personality"` drops the prefix and lets the syscall through
+unfiltered on the architectures where it did apply. On
 x86_64 the filter carries i386 as well, so a 32-bit binary is filtered
 rather than killed, and a syscall from an ABI the filter does not carry
 (x32) is killed rather than allowed to walk past it. The proxy sandbox
@@ -540,7 +600,11 @@ kernel bug behind an allowed syscall is a kernel bug in the sandbox.
 `an_unknown_abi_is_killed_rather_than_allowed`,
 `real_bwrap_seccomp_filters_a_32_bit_binary_instead_of_killing_it`,
 `real_bwrap_seccomp_covers_the_dbus_proxy_sandbox`,
-`a_filter_a_profile_emptied_is_as_loud_as_a_disabled_one`
+`a_filter_a_profile_emptied_is_as_loud_as_a_disabled_one`,
+`the_io_uring_family_and_the_process_probes_are_denied_with_eperm`,
+`the_personality_prefix_allows_five_values_and_falls_through`,
+`the_prefix_denies_every_persona_outside_the_allowlist`,
+`allowing_personality_drops_the_prefix`
 
 `open_tree_attr` (467), `listns` (470) and `fchroot` (472) are denied by
 number: libseccomp 2.6.0 has no name for them, and a rule added by a
@@ -982,6 +1046,44 @@ bug; `bubbler lint` notes it as `app-runtime-rw`.
 `real_bwrap_app_runtime_carries_a_byte_between_two_sandboxes_and_the_host`,
 `a_writable_app_runtime_share_is_a_note`
 
+### The destination symlink sweep
+
+**Defends:** every path bubbler itself binds *into* — the private home, the
+`app-runtime` leaf, the document-portal view — not only where its own top
+component sits (the app-runtime `O_NOFOLLOW` above) but every component of
+the path relative to that tree, walked and `lstat`ed against the host
+location before the argv reaches bwrap. An application that ran inside a
+previous launch of the same instance and left a symlink at, say,
+`Downloads/sub` cannot turn this run's `home-share "Downloads/sub"` into a
+write through that link: the launch is refused instead,
+`refusing to start: {path} is a symlink in {tree} (-> {target}); an app may
+have planted it. Remove it from {host}/ to continue.` A component the sweep
+cannot even read — a directory `chmod 000`'d along the way, say — refuses the
+launch the same way rather than guessing what is behind it:
+`refusing to start: cannot check whether {path} is a symlink in {tree}
+({host}: {error}); make it readable or remove it.` Nothing is deleted either
+way; the sweep only reads. It does not run under `--dry-run` or `--explain`,
+which bind nothing.
+
+**Does not defend:** TOCTOU. There is no per-instance lock, so a second
+instance of the same profile running concurrently can plant a symlink in the
+window between this sweep and bwrap's own bind — the same window "Host
+paths" above already carries for a share's source. Only bwrap 0.12.0 or
+newer closes it, by re-checking at bind time instead of trusting an earlier
+look (GHSA-pxhw-h44j-8pfx), which is what "Host tool versions" above warns
+about: the sweep stands in for that fix on an older bwrap against the one
+attacker this model has, not against a second instance racing this one.
+
+[Config (KDL)](manual.md#config-kdl) ·
+`service::tests::a_bind_destination_behind_a_planted_symlink_refuses_the_launch`,
+`service::tests::the_sweep_walks_every_component_and_every_kind_of_destination`,
+`service::tests::the_app_runtime_leaf_and_the_document_view_are_swept_and_nothing_else_is`,
+`service::tests::a_destination_component_that_cannot_be_checked_refuses_the_launch`,
+`service::tests::a_destination_with_a_parent_component_is_refused_as_unwalkable`,
+`launcher::tests::a_built_argv_with_a_planted_destination_is_refused_before_the_spawn`,
+`real_bwrap_home_share_behind_a_planted_symlink_is_refused_and_the_victim_stays_empty`,
+`real_bwrap_home_share_under_an_unsearchable_directory_is_refused_and_the_victim_stays_empty`
+
 ### The exec control channel
 
 **Defends:** the socket is bound by bubbler on the host and handed to the
@@ -1091,6 +1193,40 @@ gaps](manual.md#known-gaps) ·
 `nesting_stops_at_the_depth_limit`,
 `env_and_command_values_reject_bytes_that_cannot_be_argv`,
 `unknown_node_is_an_error`
+
+### Text reaching a screen
+
+**Defends:** a profile or config value, once granted, is not only data
+bubbler reads — it is text bubbler *echoes back*, in a lint finding, a
+`--explain` line, or a config-derived label the terminal editor draws, and a
+terminal *acts* on the control sequences inside a string the way it never
+acts on a bind mount. `safe_text::sanitize` replaces every C0 control but
+`\n`/`\t`, `DEL`, every C1 control, and any whole sequence an `ESC` opens (a
+CSI to its final byte, an OSC/APC/PM/DCS to its `BEL` or `ESC \` terminator,
+or a lone `ESC`) with one `?`, so an OSC 52 that would write the reader's
+clipboard, a `\x1b[2J` that would clear the screen, or a title escape that
+would rename the window reads as inert text instead of running. It is
+applied at every seam in `bubbler-ui` where config- or profile-derived text
+reaches a cell: titles, instance rows, the detail and finding panes, dialog
+prompts and choice labels, and the profiles table. `run_log`/`last-run.log`
+and any byte stream the sandbox itself produced go through `safe_text::render`
+instead, which shows the same control bytes in caret notation rather than
+folding a whole sequence to one mark, since a log is meant to be read back
+byte for byte and not summarised.
+
+**Does not defend:** anything printed straight to a pipe rather than a
+terminal — a pipe is a tool on the other end and gets the bytes as they
+are — and any text that does not pass through one of the two functions
+above; a new draw site that formats config-derived text straight into a
+`Line` without going through `safe_text` is not covered by construction, only
+by review.
+
+[safe_text](manual.md#linting) ·
+`a_terminal_sequence_becomes_one_question_mark`,
+`the_control_characters_a_reader_wants_are_left_alone`,
+`a_terminal_is_shown_the_control_characters_instead_of_acting_on_them`,
+`a_control_sequence_in_a_config_value_is_drawn_as_a_question_mark`,
+`a_control_sequence_in_a_status_message_is_drawn_as_a_question_mark`
 
 ## Non-goals
 

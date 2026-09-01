@@ -41,6 +41,7 @@ tray                             // org.kde.StatusNotifierWatcher (needs dbus)
 mpris name="firefox.*"           // own org.mpris.MediaPlayer2.firefox.*
 a11y                             // the accessibility bus, proxied (needs dbus)
 input-method                     // fcitx5/IBus portal names (needs dbus)
+tmp size="4G"                    // cap /tmp above the 2G default; K/M/G, max 64G
 tty "pty"                        // pty | passthrough | none
 userns "allow"                   // allow | disable nested user namespaces
 seccomp { allow "perf_event_open"; deny "unshare" }
@@ -78,6 +79,36 @@ disabled entry into every instance made from it.
 A `/-` line grants nothing and revokes nothing: an enabled node of the same
 name, in the same file or in a layer under it, still applies.
 
+## Block form for repeatable grants
+
+Six nodes may be written more than once — `home-share`, `path-share`,
+`etc-share`, `app-runtime`, `env` and `lint-allow` — and each takes one block
+in place of one line each:
+
+```kdl
+home-share {
+    ".local/bin/claude" mode=ro
+    ".local/share/claude" mode=ro
+}
+env {
+    DISABLE_AUTOUPDATER "1"
+}
+```
+
+The child's node name is the line's first argument, quoted where it is not a
+bare identifier, with the properties carried over unchanged; `env`'s child is
+the key as the node name with the value as its one argument (`env
+KEY="value"` becomes `KEY "value"`, never `KEY="value"`, since KDL reads
+`key=value` as a property rather than a node name). The two forms are one
+grammar — a block parses to exactly the grants the lines parse to, and a
+duplicate inside a block is the same error a duplicate line is. `bubbler
+lint` raises the note `repeat-outside-block` where a file writes two or more
+of one kind on their own lines, and shows the block that says the same
+thing. `include` is not one of the six: each line names one profile.
+Anything that rewrites a config — `bubbler ui` on save, `create`, `reseed` —
+writes the line form, except `portals { … }`, whose children are part of the
+grant and are always written back as a block.
+
 ## Grant reference
 
 | Node | Grants | Watch out |
@@ -102,6 +133,7 @@ name, in the same file or in a layer under it, still applies.
 | `portals` | portal names + app id `org.bubbler.<inst>`; binds the instance's document-portal view at `$XDG_RUNTIME_DIR/doc`, which is also where host file arguments of `run`/`try`/`open` land | Steam's runtime misreads `/.flatpak-info` |
 | `a11y` | the session's accessibility bus, proxied as a third bus; `AT_SPI_BUS_ADDRESS` | a screen reader reads this app's widgets; needs `dbus` |
 | `notify`, `tray`, `mpris`, `input-method` | one or two bus rules each; `IBUS_USE_PORTAL` for `input-method` | need `dbus` in the merged result, as `portals` and `a11y` do |
+| `tmp` | cap the sandbox's own `/tmp`, up to 64G | default is 2G; every other tmpfs (`/etc`, `/var`, `/run`) stays capped at 64M |
 | `seccomp` | edit the default denylist | `disable` prints a warning each run |
 | `userns "disable"` | no nested user namespaces | breaks Firefox/Chromium inner sandbox, Steam, podman |
 | `env` | extra variables | `HOME`, `PATH`, `DISPLAY` and the seven proxy variables an `allow-host` sets are refused |
@@ -112,7 +144,9 @@ Details: [Sharing Files](Sharing-Files.md), [Devices](Devices.md), [Network](Net
 ## Baseline (every sandbox)
 
 All namespaces unshared, no network, read-only `/usr` and `/opt`, empty `/tmp`
-`/var` `/run`, private home `/home/bubbler`, empty `$XDG_RUNTIME_DIR` (0700),
+capped at 2G by default (`tmp size="…"` moves it, up to 64G) and empty `/var`
+`/run` (and `$XDG_RUNTIME_DIR`, which lives inside `/run`'s tmpfs) capped at
+64M each, private home `/home/bubbler`, empty `$XDG_RUNTIME_DIR` (0700),
 cleared environment (only `TERM`, `LANG`, `LANGUAGE`, `COLORTERM`, `TZ`, `LC_*`
 survive), `/dev/ntsync` when the host has it, `--new-session`,
 `--die-with-parent`, the default seccomp filter. `/etc` is an allowlist over a

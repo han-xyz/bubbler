@@ -13,7 +13,17 @@ dbus {
     call "org.freedesktop.portal.Desktop=org.freedesktop.portal.Settings.Read@/org/freedesktop/portal/desktop"
     broadcast "org.freedesktop.portal.Desktop=@/org/freedesktop/portal/desktop"
 }
-portals            // portal.Desktop/.Documents/.FileChooser + /.flatpak-info
+portals            // the safe set: file chooser, link, notification, print,
+                   //   the read-only monitors a toolkit polls + /.flatpak-info
+portals {          // each child opens one interface group more
+    screencast         // capture the screen after a portal dialog
+    remote-desktop      // inject input into the whole session
+    global-shortcuts    // bindings fire while unfocused
+    background          // write host autostart and launcher entries
+    location            // read the host's location
+    secrets              // read this app's portal secret
+    camera               // the same grant as the top-level `camera` node
+}
 notify             // talk org.freedesktop.Notifications
 tray               // talk org.kde.StatusNotifierWatcher
 mpris name="firefox.*"   // own org.mpris.MediaPlayer2.firefox.*
@@ -32,6 +42,28 @@ a call *into* the sandbox needs no rule.
 name under `org.`; `mpris name="*"` lets the sandbox impersonate any player.
 Never `own "org.kde.*"` — it covers the tray watcher. Name the application.
 `bubbler lint` warns on `own-too-wide` and `mpris-wildcard`.
+
+## Names that are a way out
+
+Four session- or system-bus names are refused outright as
+`dbus-name-is-host-exec` — never a warning, since granting one is not a wider
+sandbox but no sandbox: `org.freedesktop.systemd1` starts a transient unit,
+`org.freedesktop.Flatpak` has `Spawn`, `ca.desrt.dconf` writes the session's
+settings database, and any `org.freedesktop.impl.portal.*` name is a portal
+*backend* rather than the portal itself, so a sandbox that can call or own
+one answers the dialogs a portal should be showing you. A trailing `.*` here
+is a family; a rule naming any member of it matches.
+
+Four more are defensible but wide enough that `bubbler lint` wants a reason
+(`dbus-name-is-risky`, accepted with `lint-allow "dbus-name-is-risky"
+reason="…"`): `org.kde.KWin` and `org.gnome.Shell` are the compositor's own
+bus name — window management, scripting and screen capture for the whole
+session; `org.freedesktop.FileManager1` can have the session's file manager
+open any host path in a window of yours; `org.freedesktop.secrets` is the
+whole login keyring with no partitioning between the applications that call
+it — the same reach the `secrets` child of `portals` opens the narrower way,
+which raises the note `secrets-access` instead (see
+[Lint and Explain](Lint-and-Explain.md)).
 
 ## portals
 

@@ -24,7 +24,11 @@ advice (exit code untouched).
 
 **Errors** (the file will not do what it says): `bundle-without-dbus`,
 `path-share-reserved`, `home-share-reserved`, `dup-name-policy`,
-`own-on-system-bus`, `camera-without-portals`.
+`own-on-system-bus`, `camera-without-portals`, `dbus-name-is-host-exec` (a
+`dbus`/`system-bus` rule naming `org.freedesktop.systemd1`,
+`org.freedesktop.Flatpak`, an `org.freedesktop.impl.portal.*` backend or
+`ca.desrt.dconf`, each of which runs a command or sets policy outside the
+sandbox).
 
 **Warnings** (grants more than it probably means): `x11-without-reason`,
 `seccomp-disabled`, `userns-disabled-with-nested-sandbox`, `own-too-wide`,
@@ -32,7 +36,10 @@ advice (exit code untouched).
 `path-share-mountpoint`, `path-share-socket`, `share-source-missing`,
 `dbus-without-rules`, `env-looks-secret`, `tty-passthrough`,
 `tty-passthrough-without-seccomp`, `portal-talk-without-portals`,
-`wayland-host`, `wayland-clipboard-open`, `network-host`.
+`wayland-host`, `wayland-clipboard-open`, `network-host`,
+`dbus-name-is-risky` (a `dbus`/`system-bus` rule naming a name that is
+defensible but wide — KWin's or the GNOME shell's own bus name, the session's
+file manager, or the Secret Service).
 
 **Notes** (information): `allow-host-wildcard`, `app-runtime-rw`,
 `outbound-deny`, `ozone-hint-unnecessary`,
@@ -108,7 +115,7 @@ manager's name, both arguments of `bubbler-init` rather than of bwrap.
     --ro-bind /run/user/1000/bubbler/ff/wayland /run/user/1000/wayland-1
     --setenv WAYLAND_DISPLAY wayland-1
     security-context: engine=org.bubbler app=org.bubbler.ff instance=bubbler-ff
-    sidecar: bubbler-wl-proxy listener /run/user/1000/bubbler/ff/wayland → upstream /run/user/1000/bubbler/ff/wayland-context, gate paste
+    sidecar: bubbler-wl-proxy listener /run/user/1000/bubbler/ff/wayland → upstream /run/user/1000/bubbler/ff/wayland-context, gate paste, hides 40 privileged globals
   init                                           7 arguments
     --ro-bind /usr/lib/bubbler/bubbler-init /run/bubbler-init
     -- /run/bubbler-init --socket-fd 10  (socket: the exec channel bubbler-init serves)
