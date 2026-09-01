@@ -10,13 +10,15 @@ below either narrows a default or adds an opt-in node.
 
 - `tmp size="<n>K|M|G"` caps the sandbox's own `/tmp` above its 2 GiB
   default, up to 64 GiB; every other tmpfs (`/etc`, `/var`, `/run`, and the
-  runtime directory inside it) is now capped at 64 MiB, on the instance and
-  on every sidecar.
+  runtime directory inside it) is now capped at 64 MiB. Each sidecar's own
+  two tmpfs mounts, its `/etc` and its `/tmp`, are capped at 64 MiB too.
 - `portals` takes children — `screencast`, `remote-desktop`,
   `global-shortcuts`, `background`, `location`, `secrets`, `camera` — each
   opening one interface group instead of the wildcard the bundle used to
-  grant; an instance created before this release keeps its old node until
-  reseeded.
+  grant. An instance created before this release keeps its old node until
+  reseeded, and every run of one warns once, naming the children to add:
+  the config header is now `// bubbler config: 3`, and `bubbler reseed` or
+  `bubbler edit` stamps it.
 - Six repeatable nodes (`home-share`, `path-share`, `etc-share`,
   `app-runtime`, `env`, `lint-allow`) may be written as one block instead of
   one line each; the line form is still accepted, and `bubbler lint` notes a
@@ -48,7 +50,9 @@ below either narrows a default or adds an opt-in node.
   of these by name.
 - Control sequences in config- or profile-derived text are drawn as `?`
   instead of sent to the terminal, in `bubbler-ui` and everywhere a lint
-  finding or an explanation echoes a config value.
+  finding or an explanation echoes a config value; every error and warning
+  on stderr and the entry `bubbler desktop --print` writes show them in
+  caret notation instead, as `bubbler log` already did.
 - `XDG_ACTIVATION_TOKEN` joins the environment keys a config's `env` node
   may not set.
 
