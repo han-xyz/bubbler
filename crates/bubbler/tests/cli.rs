@@ -14,11 +14,12 @@ use bubbler_core::profile::NAMES;
 use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
     PYTHON, bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, bubbler_wayland, bwrap_alive,
-    holders_of, kill_group, output_past_a_busy_exec, process_running, real_init, real_net_proxy,
-    require_a11y, require_a11y_lookup, require_bwrap, require_dbus, require_document_portal,
-    require_egress, require_groff, require_host_program, require_nested_x11,
-    require_nested_x11_host, require_nft, require_pasta, require_portal, require_python,
-    require_security_context, require_system_bus, require_tray, say, system_owns, test_pty,
+    holders_of, isolated, kill_group, output_past_a_busy_exec, process_running, real_init,
+    real_net_proxy, require_a11y, require_a11y_lookup, require_bwrap, require_dbus,
+    require_document_portal, require_egress, require_groff, require_host_program,
+    require_nested_x11, require_nested_x11_host, require_nft, require_pasta, require_portal,
+    require_python, require_security_context, require_system_bus, require_tray, say, system_owns,
+    test_pty,
 };
 use rustix::fs::{FlockOperation, OFlags, fcntl_getfl, flock};
 use rustix::process::{Pid, Signal, kill_process};
@@ -7436,6 +7437,126 @@ report = "\n".join("%s %s" % p for p in probe)
 /// The probe as a one-shot program for `python3 -c`.
 fn probe_program() -> String {
     format!("{}print(report)\n", probe_source())
+}
+
+/// The number of a syscall on the architecture the tests run on.
+fn syscall_nr(name: &str) -> i64 {
+    syscall_number(name).unwrap_or_else(|| panic!("no `{name}` on this architecture"))
+}
+
+/// A `python3 -c` driver that joins a session keyring of its own, puts a
+/// `user` key in it and execs the rest of its arguments. Its own keyring
+/// so nothing is added to the keyring of whoever runs the tests, and an
+/// exec so whatever it starts is a child of a process holding that key.
+fn keyring_driver() -> String {
+    format!(
+        r#"import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+ctypes.set_errno(0)
+if libc.syscall(ctypes.c_long({keyctl}), ctypes.c_long(1), None, 0, 0, 0) < 0:
+    sys.exit("cannot join a session keyring: %d" % ctypes.get_errno())
+ctypes.set_errno(0)
+if libc.syscall(
+    ctypes.c_long({add_key}),
+    ctypes.c_char_p(b"user"),
+    ctypes.c_char_p(sys.argv[1].encode()),
+    ctypes.c_char_p(b"secret"),
+    ctypes.c_size_t(6),
+    ctypes.c_long(-3),
+) < 0:
+    sys.exit("cannot add a key: %d" % ctypes.get_errno())
+os.execv(sys.argv[2], sys.argv[2:])
+"#,
+        keyctl = syscall_nr("keyctl"),
+        add_key = syscall_nr("add_key"),
+    )
+}
+
+/// A `python3 -c` probe that searches the session keyring for the key
+/// [`keyring_driver`] added, and prints `found` or the errno name.
+fn keyring_probe() -> String {
+    format!(
+        r#"import ctypes, errno, sys
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+ctypes.set_errno(0)
+rc = libc.syscall(
+    ctypes.c_long({keyctl}),
+    ctypes.c_long(10),
+    ctypes.c_long(-3),
+    ctypes.c_char_p(b"user"),
+    ctypes.c_char_p(sys.argv[1].encode()),
+    ctypes.c_long(0),
+)
+print("found" if rc >= 0 else errno.errorcode.get(ctypes.get_errno(), "?"))
+"#,
+        keyctl = syscall_nr("keyctl"),
+    )
+}
+
+/// The bwrap child joins a session keyring of its own right before it
+/// execs, so a key in the keyring bubbler itself was started with is out
+/// of the sandbox's reach. Measured through the wiring rather than on the
+/// helper: a driver holds the key and starts bubbler, and the probe
+/// searching from inside the sandbox comes back empty.
+#[test]
+fn real_bwrap_the_sandbox_does_not_inherit_the_session_keyring_it_was_started_from() {
+    if !require_python() {
+        return;
+    }
+    let Some((tmp, init)) = live_instance("keyr") else {
+        return;
+    };
+    // `keyctl` is on the default EPERM list, so without this the probe
+    // could not ask the question at all: an EPERM reads the same as a key
+    // that is not there, whether or not the join happened.
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/keyr/config.kdl"),
+        "seccomp { allow \"keyctl\" }\n",
+    )
+    .unwrap();
+    let desc = format!("bubbler-test-{}", std::process::id());
+    let (driver, probe) = (keyring_driver(), keyring_probe());
+
+    // The control: the same driver running the same probe with no
+    // sandbox in between finds the key, so a miss below is the join and
+    // not a probe that never worked.
+    let out = isolated(tmp.path(), PYTHON)
+        .args(["-c", &driver, &desc, PYTHON, "-c", &probe, &desc])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "found",
+        "{err}"
+    );
+
+    let out = isolated(tmp.path(), PYTHON)
+        .env("BUBBLER_INIT", &init)
+        .args([
+            "-c",
+            &driver,
+            &desc,
+            env!("CARGO_BIN_EXE_bubbler"),
+            "run",
+            "keyr",
+            "--",
+            PYTHON,
+            "-c",
+            &probe,
+            &desc,
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "ENOKEY",
+        "{err}"
+    );
 }
 
 /// Run the probe inside `name`, whose `config.kdl` is `config`, and

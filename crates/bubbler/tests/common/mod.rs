@@ -432,6 +432,16 @@ pub fn bubbler(root: &Path) -> Command {
     c
 }
 
+/// A program that is not bubbler, in the same isolated environment
+/// [`bubbler`] gets: for a driver that has to set something up in the
+/// process bubbler is started *from*, which no environment variable can
+/// express.
+pub fn isolated(root: &Path, program: &str) -> Command {
+    let mut c = Command::new(program);
+    isolate(&mut c, root);
+    c
+}
+
 /// The isolated environment every test process gets, whatever the program.
 ///
 /// stdin is `/dev/null` unless a test hands over a terminal of its own:

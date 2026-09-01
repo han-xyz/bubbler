@@ -207,7 +207,8 @@ the portal's per-document mode bits, and nothing of the mount's other apps.
 `portals_without_a_document_portal_mount_binds_nothing_there`,
 `real_bwrap_home_is_fixed_and_private`,
 `real_bwrap_etc_is_allowlisted_and_user_is_bubbler`,
-`joining_a_session_keyring_leaves_the_thread_on_a_new_one`
+`joining_a_session_keyring_leaves_the_thread_on_a_new_one`,
+`real_bwrap_the_sandbox_does_not_inherit_the_session_keyring_it_was_started_from`
 
 ### Host environment values
 
