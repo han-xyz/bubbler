@@ -766,9 +766,43 @@ bwrap
   portals                         config.kdl:3  0 arguments
     rule-only: --talk=org.freedesktop.portal.Desktop
                --talk=org.freedesktop.portal.Documents
-               --talk=org.freedesktop.portal.FileChooser
-               --call=org.freedesktop.portal.*=*
-               --broadcast=org.freedesktop.portal.*=@/org/freedesktop/portal/*
+               --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Request.*@/org/freedesktop/portal/desktop
+               --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Session.*@/org/freedesktop/portal/desktop
+               --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.FileChooser.*@/org/freedesktop/portal/desktop
+               --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.OpenURI.*@/org/freedesktop/portal/desktop
+               --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Notification.*@/org/freedesktop/portal/desktop
+               --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Settings.*@/org/freedesktop/portal/desktop
+               --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Print.*@/org/freedesktop/portal/desktop
+               --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Email.*@/org/freedesktop/portal/desktop
+               --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Trash.*@/org/freedesktop/portal/desktop
+               --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Account.*@/org/freedesktop/portal/desktop
+               --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Inhibit.*@/org/freedesktop/portal/desktop
+               --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.ProxyResolver.*@/org/freedesktop/portal/desktop
+               --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.NetworkMonitor.*@/org/freedesktop/portal/desktop
+               --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.MemoryMonitor.*@/org/freedesktop/portal/desktop
+               --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.PowerProfileMonitor.*@/org/freedesktop/portal/desktop
+               --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Realtime.*@/org/freedesktop/portal/desktop
+               --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.GameMode.*@/org/freedesktop/portal/desktop
+               --call=org.freedesktop.portal.Documents=*
+               --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Request.*@/org/freedesktop/portal/desktop
+               --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Session.*@/org/freedesktop/portal/desktop
+               --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.FileChooser.*@/org/freedesktop/portal/desktop
+               --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.OpenURI.*@/org/freedesktop/portal/desktop
+               --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Notification.*@/org/freedesktop/portal/desktop
+               --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Settings.*@/org/freedesktop/portal/desktop
+               --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Print.*@/org/freedesktop/portal/desktop
+               --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Email.*@/org/freedesktop/portal/desktop
+               --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Trash.*@/org/freedesktop/portal/desktop
+               --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Account.*@/org/freedesktop/portal/desktop
+               --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Inhibit.*@/org/freedesktop/portal/desktop
+               --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.ProxyResolver.*@/org/freedesktop/portal/desktop
+               --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.NetworkMonitor.*@/org/freedesktop/portal/desktop
+               --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.MemoryMonitor.*@/org/freedesktop/portal/desktop
+               --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.PowerProfileMonitor.*@/org/freedesktop/portal/desktop
+               --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Realtime.*@/org/freedesktop/portal/desktop
+               --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.GameMode.*@/org/freedesktop/portal/desktop
+               --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Request.*@/org/freedesktop/portal/desktop/request/*
+               --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Session.*@/org/freedesktop/portal/desktop/session/*
 
   notify                          config.kdl:4  0 arguments
     rule-only: --talk=org.freedesktop.Notifications
@@ -779,7 +813,7 @@ bwrap
   command                                       2 arguments
     -- true
 
-27 arguments in 7 groups, 4 hidden (--explain=full); 6 D-Bus rules to the proxy (--proxy)";
+27 arguments in 7 groups, 4 hidden (--explain=full); 40 D-Bus rules to the proxy (--proxy)";
 
     /// Which socket a `wayland` grant binds is not visible in its
     /// arguments — both are one `--ro-bind` — so the mode is a line of

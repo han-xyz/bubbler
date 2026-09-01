@@ -549,7 +549,7 @@ fn explain_puts_every_argument_under_the_node_it_came_from() {
     );
     assert!(s.contains(" more (--explain=full)\n"), "{s}");
     assert!(
-        s.ends_with("; 6 D-Bus rules to the proxy (--proxy)\n"),
+        s.ends_with("; 40 D-Bus rules to the proxy (--proxy)\n"),
         "{s}"
     );
 }
@@ -785,7 +785,7 @@ fn explain_proxy_explains_the_sidecar_and_says_when_there_is_none() {
         "{s}"
     );
     assert!(
-        s.contains("\n  portals   config.kdl:2  5 arguments\n"),
+        s.contains("\n  portals   config.kdl:2  39 arguments\n"),
         "{s}"
     );
     assert!(!s.contains("home-share"), "{s}");

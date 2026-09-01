@@ -7,7 +7,7 @@ use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
-use crate::config::{BusRule, Service};
+use crate::config::{BusRule, Portal, Service};
 use crate::dbus_wire::{Session, Value, WireError};
 use crate::env::Env;
 use crate::error::LaunchError;
@@ -56,19 +56,92 @@ pub const FLATPAK_DIR: &str = ".flatpak";
 /// `child-pid` out of it to get a pidfd of the sandbox.
 pub const BWRAPINFO: &str = "bwrapinfo.json";
 
-/// Rules the `portals` bundle grants: the three portal services a
-/// sandboxed app talks to, plus the `--call`/`--broadcast` pair from the
-/// `xdg-dbus-proxy(1)` EXAMPLES section.
-// Not `org.freedesktop.portal.Flatpak`: that is the spawn portal, which
-// starts processes outside the sandbox, and Settings, FileChooser and
-// Notification all live on `portal.Desktop`.
-const PORTAL_RULES: &[&str] = &[
-    "--talk=org.freedesktop.portal.Desktop",
-    "--talk=org.freedesktop.portal.Documents",
-    "--talk=org.freedesktop.portal.FileChooser",
-    "--call=org.freedesktop.portal.*=*",
-    "--broadcast=org.freedesktop.portal.*=@/org/freedesktop/portal/*",
+/// Object path every portal interface but `Request` and `Session` is
+/// served on.
+const DESKTOP_PATH: &str = "/org/freedesktop/portal/desktop";
+
+/// Interfaces the bare `portals` node opens on
+/// `org.freedesktop.portal.Desktop`: a file chooser, a link, a
+/// notification, a print job, the read-only monitors a toolkit polls.
+/// Every interface that hands the sandbox the screen, the input stream,
+/// an autostart entry, the location or a secret is a child instead —
+/// `--call=org.freedesktop.portal.*=*` granted all of them to anything
+/// that wanted a file chooser.
+// `Request` and `Session` are the reply and lifetime objects every
+// other interface answers on; without them a portal call is made and
+// never returns.
+pub const PORTAL_SAFE: &[&str] = &[
+    "Request",
+    "Session",
+    "FileChooser",
+    "OpenURI",
+    "Notification",
+    "Settings",
+    "Print",
+    "Email",
+    "Trash",
+    "Account",
+    "Inhibit",
+    "ProxyResolver",
+    "NetworkMonitor",
+    "MemoryMonitor",
+    "PowerProfileMonitor",
+    "Realtime",
+    "GameMode",
 ];
+
+/// One `--call` for `iface` on the desktop object.
+fn portal_call(iface: &str) -> String {
+    format!("--call=org.freedesktop.portal.Desktop=org.freedesktop.portal.{iface}.*@{DESKTOP_PATH}")
+}
+
+/// One `--broadcast` for `iface` on the desktop object.
+fn portal_broadcast(iface: &str) -> String {
+    format!(
+        "--broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.{iface}.*@{DESKTOP_PATH}"
+    )
+}
+
+/// Every proxy argument `portals` and its `children` ask for. The
+/// `Documents` bus keeps a wildcard: it is one service with no
+/// privileged interface on it, and the document view it serves is the
+/// grant itself.
+pub fn portal_rules(children: &[Portal]) -> Vec<String> {
+    let ifaces = || {
+        PORTAL_SAFE
+            .iter()
+            .copied()
+            .chain(children.iter().flat_map(|c| c.interfaces().iter().copied()))
+    };
+    let mut out = vec![
+        "--talk=org.freedesktop.portal.Desktop".to_owned(),
+        "--talk=org.freedesktop.portal.Documents".to_owned(),
+    ];
+    out.extend(ifaces().map(portal_call));
+    out.push("--call=org.freedesktop.portal.Documents=*".to_owned());
+    out.extend(ifaces().map(portal_broadcast));
+    // The two objects a portal answers on are per-call and per-session,
+    // so their signals arrive on a path of their own rather than on the
+    // desktop object.
+    out.push(
+        "--broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Request.*\
+         @/org/freedesktop/portal/desktop/request/*"
+            .to_owned(),
+    );
+    out.push(
+        "--broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Session.*\
+         @/org/freedesktop/portal/desktop/session/*"
+            .to_owned(),
+    );
+    out
+}
+
+/// What `camera` opens. It rode on `--call=org.freedesktop.portal.*=*`
+/// while that existed; with the wildcard gone the node carries the
+/// interface itself.
+pub fn camera_rules() -> [String; 2] {
+    [portal_call("Camera"), portal_broadcast("Camera")]
+}
 
 /// Rules the `input-method` grant gets: both portal names, whichever
 /// daemon the session runs. The client libraries watch for the name and
@@ -198,9 +271,9 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
         // gets one, and its own list is the whole confinement.
         for (i, s) in services.iter().enumerate() {
             match s {
-                Service::Portals { .. } => {
-                    for r in PORTAL_RULES {
-                        push(&mut rules, (*r).to_owned(), i);
+                Service::Portals { children } => {
+                    for r in portal_rules(children) {
+                        push(&mut rules, r, i);
                     }
                 }
                 Service::Notify => push(
@@ -245,16 +318,20 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
                 | Service::Pulseaudio
                 | Service::Gamepad { .. }
                 | Service::Hidraw
-                // `camera` adds no rule of its own: the Camera interface
-                // lives on `org.freedesktop.portal.Desktop`, which the
-                // `portals` bundle above already talks to.
-                | Service::Camera { .. }
                 | Service::HomeShare { .. }
                 | Service::PathShare { .. }
                 | Service::EtcShare { .. }
                 | Service::Dbus { .. }
                 | Service::SystemBus { .. }
                 | Service::AppRuntime { .. } => {}
+                // The Camera interface is on `org.freedesktop.portal.Desktop`,
+                // which `portals` already talks to, but the node names the
+                // interface itself now that the bundle grants no wildcard.
+                Service::Camera { .. } => {
+                    for r in camera_rules() {
+                        push(&mut rules, r, i);
+                    }
+                }
             }
         }
         Section { node, rules }
@@ -866,22 +943,143 @@ mod tests {
             "ff",
         )
         .expect("dbus is granted");
+        // The bundle's own content is `portal_rules`' contract, checked
+        // below; what this test owns is the order services contribute in.
+        let mut expected = portal_rules(&[]);
+        expected.push("--talk=org.freedesktop.Notifications".to_owned());
+        expected.push("--own=org.mpris.MediaPlayer2.firefox.*".to_owned());
         assert_eq!(
             session(&p),
-            vec![
-                "--talk=org.freedesktop.portal.Desktop",
-                "--talk=org.freedesktop.portal.Documents",
-                "--talk=org.freedesktop.portal.FileChooser",
-                "--call=org.freedesktop.portal.*=*",
-                "--broadcast=org.freedesktop.portal.*=@/org/freedesktop/portal/*",
-                "--talk=org.freedesktop.Notifications",
-                "--own=org.mpris.MediaPlayer2.firefox.*",
-            ]
+            expected.iter().map(String::as_str).collect::<Vec<_>>()
         );
         assert!(p.portals);
         assert_eq!(
             p.flatpak_info,
             b"[Application]\nname=org.bubbler.ff\n\n[Instance]\ninstance-id=bubbler-ff\n".to_vec()
+        );
+    }
+
+    /// The bare bundle names every interface it opens: no
+    /// `--call=org.freedesktop.portal.*=*`, which was ScreenCast,
+    /// RemoteDesktop, InputCapture, GlobalShortcuts, Background,
+    /// DynamicLauncher, Location and Secret behind one node.
+    #[test]
+    fn the_bare_bundle_opens_the_safe_interfaces_only() {
+        let rules = portal_rules(&[]);
+        assert_eq!(
+            rules[..2],
+            [
+                "--talk=org.freedesktop.portal.Desktop",
+                "--talk=org.freedesktop.portal.Documents",
+            ]
+        );
+        assert!(rules.contains(&"--call=org.freedesktop.portal.Documents=*".to_owned()));
+        assert!(
+            rules.contains(
+                &"--call=org.freedesktop.portal.Desktop=org.freedesktop.portal.FileChooser.*\
+              @/org/freedesktop/portal/desktop"
+                    .to_owned()
+            )
+        );
+        assert!(
+            rules.contains(
+                &"--broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Request.*\
+              @/org/freedesktop/portal/desktop/request/*"
+                    .to_owned()
+            )
+        );
+        assert!(
+            rules.contains(
+                &"--broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Session.*\
+              @/org/freedesktop/portal/desktop/session/*"
+                    .to_owned()
+            )
+        );
+        // Gone: the wildcards, and a `--talk` of an interface that is
+        // not a bus name and so named nothing.
+        for gone in [
+            "--talk=org.freedesktop.portal.FileChooser",
+            "--call=org.freedesktop.portal.*=*",
+            "--broadcast=org.freedesktop.portal.*=@/org/freedesktop/portal/*",
+        ] {
+            assert!(!rules.iter().any(|r| r == gone), "{gone}");
+        }
+        // And none of the interfaces a child is for.
+        for iface in ["ScreenCast", "RemoteDesktop", "GlobalShortcuts", "Secret"] {
+            assert!(
+                !rules.iter().any(|r| r.contains(&format!(".{iface}."))),
+                "{iface} is granted by the bare node"
+            );
+        }
+    }
+
+    /// Each child adds its own interfaces and nothing else.
+    #[test]
+    fn a_child_adds_the_interfaces_it_is_named_for() {
+        let bare = portal_rules(&[]);
+        let with = portal_rules(&[Portal::ScreenCast]);
+        let added: Vec<&String> = with.iter().filter(|r| !bare.contains(r)).collect();
+        assert_eq!(
+            added,
+            [
+                "--call=org.freedesktop.portal.Desktop=org.freedesktop.portal.ScreenCast.*\
+                 @/org/freedesktop/portal/desktop",
+                "--call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Screenshot.*\
+                 @/org/freedesktop/portal/desktop",
+                "--broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.ScreenCast.*\
+                 @/org/freedesktop/portal/desktop",
+                "--broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Screenshot.*\
+                 @/org/freedesktop/portal/desktop",
+            ]
+        );
+    }
+
+    /// `camera` used to ride on the wildcard; with the wildcard gone it
+    /// carries the Camera interface itself.
+    #[test]
+    fn camera_carries_its_own_interface_now() {
+        let p = plan(
+            &[
+                Service::Dbus { rules: Vec::new() },
+                Service::Portals {
+                    children: Vec::new(),
+                },
+                Service::Camera { nodes: false },
+            ],
+            "inst",
+        )
+        .unwrap();
+        let args: Vec<String> = p
+            .session
+            .unwrap()
+            .rules
+            .iter()
+            .map(|r| r.arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.contains(
+                &"--call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Camera.*\
+              @/org/freedesktop/portal/desktop"
+                    .to_owned()
+            )
+        );
+        // Without `camera` the interface is not open.
+        let p = plan(
+            &[
+                Service::Dbus { rules: Vec::new() },
+                Service::Portals {
+                    children: Vec::new(),
+                },
+            ],
+            "inst",
+        )
+        .unwrap();
+        assert!(
+            !p.session
+                .unwrap()
+                .rules
+                .iter()
+                .any(|r| r.arg.to_string_lossy().contains("portal.Camera."))
         );
     }
 
