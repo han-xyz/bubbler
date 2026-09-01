@@ -133,7 +133,16 @@ mod tests {
             assert!(is_passthrough(OsStr::new(ok)), "{ok}");
         }
         for no in [
-            "PATH", "HOME", "DISPLAY", "TERMINFO", "lc_all", "XLC_ALL", "",
+            "PATH",
+            "HOME",
+            "DISPLAY",
+            "TERMINFO",
+            "lc_all",
+            "XLC_ALL",
+            "",
+            // A token the session issued to bubbler activates a window
+            // in that session; nothing inside the sandbox may hold one.
+            "XDG_ACTIVATION_TOKEN",
         ] {
             assert!(!is_passthrough(OsStr::new(no)), "{no}");
         }

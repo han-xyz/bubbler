@@ -113,6 +113,11 @@ pub const RESERVED_ENV: &[&str] = &[
     "DBUS_SYSTEM_BUS_ADDRESS",
     "AT_SPI_BUS_ADDRESS",
     "IBUS_USE_PORTAL",
+    // The token the session issued to bubbler, which activates a window
+    // and takes the keyboard focus in that session. Nothing copies it
+    // in — `env::is_passthrough` is an allowlist and it is not on it —
+    // and a config must not plant one either.
+    "XDG_ACTIVATION_TOKEN",
     // The proxy variables, whether or not a config has an `allow-host`:
     // an `env` node naming one would point the sandbox at a proxy of its
     // own, past the single opening its filter leaves. A test holds these
@@ -4301,12 +4306,15 @@ command "b""#
         // addresses at a bus bubbler did not filter, the accessibility
         // one at a registry outside the sandbox, and `IBUS_USE_PORTAL`
         // at the direct ibus socket instead of the portal name the
-        // grant proxies.
+        // grant proxies, and the activation token at a window of the
+        // session's, which is a focus steal written as an environment
+        // variable.
         for key in [
             "DBUS_SESSION_BUS_ADDRESS",
             "DBUS_SYSTEM_BUS_ADDRESS",
             "AT_SPI_BUS_ADDRESS",
             "IBUS_USE_PORTAL",
+            "XDG_ACTIVATION_TOKEN",
         ] {
             assert!(
                 matches!(
