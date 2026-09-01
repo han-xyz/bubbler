@@ -7402,6 +7402,11 @@ probe = [
     ("io_uring_setup", call({io_uring_setup}, 0, 0)),
     # A pidfd of -1: refused by the filter before the descriptor is read.
     ("pidfd_getfd", call({pidfd_getfd}, -1, 0, 0)),
+    # By number: libseccomp 2.6.0 has no name for 467, so the rule was
+    # added as a number and this is the only way to ask for it. A kernel
+    # without the call answers ENOSYS too, which is what the rule makes
+    # the answer everywhere.
+    ("open_tree_attr", call(467, -1, 0, 0, 0)),
     ("tiocsti", ioctl(0x5412)),
     ("tioclinux", ioctl(0x541C)),
     ("getpid", call({getpid})),
@@ -7455,11 +7460,15 @@ fn probe_in(name: &str, config: &str) -> Option<(String, String)> {
 }
 
 #[test]
-fn a_filter_a_profile_emptied_is_as_loud_as_a_disabled_one() {
+fn a_profile_that_allows_back_everything_nameable_still_loads_the_numbered_rules() {
     let tmp = setup();
     bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
-    // Allowing every name back leaves nothing to load, which is
-    // `seccomp { disable }` taken the long way round.
+    // Allowing every name in DEFAULT_EPERM and DEFAULT_ENOSYS back used
+    // to leave nothing to load — `seccomp { disable }` taken the long
+    // way round. DEFAULT_ENOSYS_NUMBERED breaks that: those three
+    // syscalls have no name this libseccomp resolves, so config.rs's own
+    // syscall-name check refuses an `allow` that names them, and they
+    // stay in the filter no matter what the rest of the list gives back.
     let set = RuleSet::default_set();
     let names: Vec<String> = set
         .eperm
@@ -7482,12 +7491,12 @@ fn a_filter_a_profile_emptied_is_as_loud_as_a_disabled_one() {
         .unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("bubbler: seccomp has no rules left for instance t"),
+        !err.contains("bubbler: seccomp has no rules left for instance t"),
         "{err}"
     );
     assert!(
-        !String::from_utf8_lossy(&out.stdout).contains("--add-seccomp-fd"),
-        "an empty filter must load nothing"
+        String::from_utf8_lossy(&out.stdout).contains("--add-seccomp-fd"),
+        "the three numbered rules must still load a filter"
     );
 }
 
@@ -7508,6 +7517,7 @@ fn real_bwrap_seccomp_denies_the_default_list_and_nothing_else() {
     assert_eq!(probed(&out, "clone3"), "ENOSYS", "{out}");
     assert_eq!(probed(&out, "io_uring_setup"), "EPERM", "{out}");
     assert_eq!(probed(&out, "pidfd_getfd"), "EPERM", "{out}");
+    assert_eq!(probed(&out, "open_tree_attr"), "ENOSYS", "{out}");
     assert_eq!(probed(&out, "tiocsti"), "EPERM", "{out}");
     assert_eq!(probed(&out, "tioclinux"), "EPERM", "{out}");
     // A denylist: everything not named keeps working.

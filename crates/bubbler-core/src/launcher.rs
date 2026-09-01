@@ -4869,10 +4869,13 @@ mod tests {
     }
 
     #[test]
-    fn allowing_every_denied_syscall_leaves_no_program_to_load() {
+    fn allowing_every_nameable_syscall_still_loads_the_numbered_rules() {
         use crate::seccomp::{RuleSet, syscall_number};
         // A name no architecture in the filter has is a config error, so
-        // only the ones it does can be allowed back.
+        // only the ones it does can be allowed back. The three numbered
+        // rules of `enosys_numbered` have no such name at all, so they
+        // stay in the filter — this can no longer empty the program the
+        // way it could before DEFAULT_ENOSYS_NUMBERED existed.
         let set = RuleSet::default_set();
         let names: Vec<String> = set
             .eperm
@@ -4891,7 +4894,7 @@ mod tests {
             ),
         );
         let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default(), false).unwrap());
-        assert!(!a.iter().any(|x| x == "--add-seccomp-fd"), "{a:?}");
+        assert!(a.iter().any(|x| x == "--add-seccomp-fd"), "{a:?}");
     }
 
     /// A child in the shape bwrap leaves a sandbox in: a network

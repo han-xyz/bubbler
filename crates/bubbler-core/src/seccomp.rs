@@ -111,6 +111,27 @@ pub const DEFAULT_ENOSYS: &[&str] = &[
     "mount_setattr",
 ];
 
+/// Syscalls answered with `ENOSYS` by *number*, because libseccomp 2.6.0
+/// has no name for them: the newest of the mount API (`open_tree_attr`),
+/// the namespace-listing call (`listns`) and `fchroot`. Numbers from
+/// `asm/unistd_64.h`; post-424 numbers are shared with i386, which
+/// `asm/unistd_32.h` confirms for 467 and 470.
+///
+/// They are added through [`ScmpSyscall::from`] so libseccomp's name
+/// table is never consulted, and they go into the filter *before* the
+/// architectures of `EXTRA_ARCHES`: libseccomp translates a rule to a
+/// second architecture through the syscall's name, and a number the
+/// native table cannot name answers `EFAULT` instead (measured with
+/// libseccomp 2.6.0 and i386 in the filter). So these three rules hold
+/// for the build architecture alone, where the named mount-API rules of
+/// [`DEFAULT_ENOSYS`] hold for both. The name is kept beside the number
+/// so a profile can `allow` it and so the day libseccomp learns the name
+/// is a test failure rather than a duplicate rule.
+// The mount-API class this closes is CVE-2021-41133; flatpak carries the
+// same numbers in `flatpak-syscalls-private.h`.
+pub const DEFAULT_ENOSYS_NUMBERED: &[(&str, i32)] =
+    &[("open_tree_attr", 467), ("listns", 470), ("fchroot", 472)];
+
 /// `ioctl` requests denied with `EPERM` by default, matched on the low 32
 /// bits of argument 1.
 pub const DEFAULT_IOCTL_EPERM: &[u32] = &[TIOCSTI, TIOCLINUX];
@@ -204,6 +225,9 @@ pub struct RuleSet {
     pub eperm: Vec<String>,
     /// Syscall names denied with `ENOSYS`.
     pub enosys: Vec<String>,
+    /// Syscalls denied with `ENOSYS` by number, each with the name a
+    /// profile names it by. See [`DEFAULT_ENOSYS_NUMBERED`].
+    pub enosys_numbered: Vec<(String, i32)>,
     /// `ioctl` request numbers denied with `EPERM`, matched on the low 32
     /// bits of argument 1.
     pub ioctl_eperm: Vec<u32>,
@@ -223,6 +247,10 @@ impl RuleSet {
                 .map(|s| (*s).to_owned())
                 .collect(),
             enosys: DEFAULT_ENOSYS.iter().map(|s| (*s).to_owned()).collect(),
+            enosys_numbered: DEFAULT_ENOSYS_NUMBERED
+                .iter()
+                .map(|(name, nr)| ((*name).to_owned(), *nr))
+                .collect(),
             ioctl_eperm: DEFAULT_IOCTL_EPERM.to_vec(),
         }
     }
@@ -262,6 +290,7 @@ impl RuleSet {
     fn remove(&mut self, name: &str) {
         self.eperm.retain(|s| s != name);
         self.enosys.retain(|s| s != name);
+        self.enosys_numbered.retain(|(n, _)| n != name);
     }
 }
 
@@ -328,13 +357,31 @@ fn build(set: &RuleSet, log: bool) -> Result<Built, LaunchError> {
     filter
         .set_act_badarch(ScmpAction::KillProcess)
         .map_err(failed)?;
+    let mut seen: BTreeSet<i32> = BTreeSet::new();
+    // Before the architectures on purpose: `man 3 seccomp_arch_add` says
+    // a rule added before an architecture does not reach it, and that is
+    // the only way these three go in at all. libseccomp translates a
+    // rule to another architecture through the syscall's *name*, and
+    // answers `EFAULT` for a number the native table cannot name
+    // (measured with libseccomp 2.6.0 and i386 in the filter). So the
+    // choice is a rule on the build architecture or no rule; a 32-bit
+    // binary in the sandbox still reaches these three numbers, which is
+    // recorded in `docs/threat-model.md`.
+    for (_, nr) in &set.enosys_numbered {
+        let nr = ScmpSyscall::from(*nr);
+        if !seen.insert(nr.into()) {
+            continue;
+        }
+        filter
+            .add_rule(action(log, Errno::Enosys), nr)
+            .map_err(failed)?;
+    }
     // `man 3 seccomp_arch_add`: rules added after an architecture is
     // added reach every architecture in the filter, and rules added
     // before it do not. So the architectures come first.
     for arch in EXTRA_ARCHES {
         filter.add_arch(*arch).map_err(failed)?;
     }
-    let mut seen: BTreeSet<i32> = BTreeSet::new();
     let mut skipped = Vec::new();
     for (names, errno) in [(&set.eperm, Errno::Eperm), (&set.enosys, Errno::Enosys)] {
         for name in names {
@@ -515,6 +562,61 @@ mod tests {
         assert_eq!(RuleSet::with(&SeccompConfig::default()), Some(set));
     }
 
+    /// The three numbered rules exist because this libseccomp has no
+    /// name for them. When a later libseccomp learns the names, this
+    /// test is what says so: move the entry to [`DEFAULT_ENOSYS`], where
+    /// it reaches i386 as well, and drop it from here.
+    #[test]
+    fn the_numbered_rules_are_the_ones_this_libseccomp_cannot_name() {
+        for (name, _) in DEFAULT_ENOSYS_NUMBERED {
+            assert_eq!(
+                syscall_number(name),
+                None,
+                "{name} has a name now: move it to DEFAULT_ENOSYS"
+            );
+        }
+        let set = RuleSet::default_set();
+        assert_eq!(set.enosys_numbered.len(), DEFAULT_ENOSYS_NUMBERED.len());
+        assert_eq!(set.enosys_numbered[0], ("open_tree_attr".to_owned(), 467));
+    }
+
+    /// A profile that names one takes its rule back, exactly as it does
+    /// for a name on either of the two lists.
+    #[test]
+    fn allowing_a_numbered_syscall_by_name_takes_its_rule_back() {
+        let cfg = SeccompConfig {
+            allow: vec!["open_tree_attr".to_owned()],
+            ..SeccompConfig::default()
+        };
+        let set = RuleSet::with(&cfg).unwrap();
+        assert!(
+            !set.enosys_numbered
+                .iter()
+                .any(|(n, _)| n == "open_tree_attr")
+        );
+        assert_eq!(set.enosys_numbered.len(), DEFAULT_ENOSYS_NUMBERED.len() - 1);
+    }
+
+    /// The numbers really reach the program. They go in before the
+    /// second architecture is added: libseccomp translates a rule to
+    /// another architecture through the syscall's name, and answers
+    /// `EFAULT` for a number the native table cannot name (measured with
+    /// libseccomp 2.6.0 and i386 in the filter), so the wrong order is a
+    /// failed compile rather than a quietly weaker filter.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_numbered_rules_are_compiled_into_the_program() {
+        let program = compile(&RuleSet::default_set(), false).unwrap().unwrap();
+        let insns = instructions(&program.bytes);
+        for (name, nr) in DEFAULT_ENOSYS_NUMBERED {
+            let k = u32::try_from(*nr).expect("a syscall number is positive");
+            assert!(
+                insns.iter().any(|i| i.3 == k),
+                "no comparison for {name} ({nr})"
+            );
+        }
+    }
+
     /// The kernel's own `io_uring_disabled=2` answers `EPERM`, so every
     /// consumer is already tested against it — libuv falls back to its
     /// thread pool in `uv__iou_init`. `ENOSYS` is not a substitute: a
@@ -633,7 +735,7 @@ mod tests {
     /// so that a rule added by accident, or an architecture dropped from
     /// the filter, is a test failure.
     #[cfg(target_arch = "x86_64")]
-    const DEFAULT_LEN: usize = 122;
+    const DEFAULT_LEN: usize = 125;
 
     #[cfg(target_arch = "x86_64")]
     #[test]
@@ -703,6 +805,12 @@ mod tests {
                 .eperm
                 .into_iter()
                 .chain(RuleSet::default_set().enosys)
+                .chain(
+                    RuleSet::default_set()
+                        .enosys_numbered
+                        .into_iter()
+                        .map(|(n, _)| n),
+                )
                 .chain(["ioctl".to_owned()])
                 .collect(),
             ..SeccompConfig::default()
@@ -714,6 +822,7 @@ mod tests {
         let absent = RuleSet {
             eperm: vec!["nosuchcall".to_owned()],
             enosys: vec![],
+            enosys_numbered: Vec::new(),
             ioctl_eperm: vec![],
         };
         assert_eq!(compile(&absent, false).unwrap(), None);
@@ -737,6 +846,7 @@ mod tests {
         let set = RuleSet {
             eperm: vec!["ioctl".to_owned()],
             enosys: vec![],
+            enosys_numbered: Vec::new(),
             ioctl_eperm: DEFAULT_IOCTL_EPERM.to_vec(),
         };
         let insns = instructions(&compile(&set, false).unwrap().unwrap().bytes);
@@ -754,11 +864,13 @@ mod tests {
         let set = RuleSet {
             eperm: vec!["keyctl".to_owned()],
             enosys: vec!["keyctl".to_owned()],
+            enosys_numbered: Vec::new(),
             ioctl_eperm: vec![],
         };
         let one = RuleSet {
             eperm: vec!["keyctl".to_owned()],
             enosys: vec![],
+            enosys_numbered: Vec::new(),
             ioctl_eperm: vec![],
         };
         assert_eq!(compile(&set, false).unwrap(), compile(&one, false).unwrap());
@@ -772,6 +884,7 @@ mod tests {
         let set = RuleSet {
             eperm: vec!["keyctl".to_owned(), "nosuchcall".to_owned()],
             enosys: vec![],
+            enosys_numbered: Vec::new(),
             ioctl_eperm: vec![],
         };
         let built = build(&set, false).unwrap();
@@ -780,6 +893,7 @@ mod tests {
         let one = RuleSet {
             eperm: vec!["keyctl".to_owned()],
             enosys: vec![],
+            enosys_numbered: Vec::new(),
             ioctl_eperm: vec![],
         };
         assert_eq!(compile(&set, false).unwrap(), compile(&one, false).unwrap());
