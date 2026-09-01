@@ -343,7 +343,7 @@ pub static GRANTS: &[Grant] = &[
         cost: "`allow` takes names off the list, including the `ioctl` rules that deny \
                `TIOCSTI` and `TIOCLINUX`; `deny` adds names. `disable` loads no filter at \
                all, which hands the sandbox the kernel surface the default covers — the \
-               keyring, `bpf`, `perf_event_open`, module loading — and every run of that \
+               keyring, `bpf`, `perf_event_open`, io_uring, module loading — and every run of that \
                instance says so on stderr.",
         risk: Risk::Outward,
         grammar: "seccomp { allow \"<syscall>\"; deny \"<syscall>\" [errno=\"EPERM\"|\"ENOSYS\"]; disable }",

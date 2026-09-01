@@ -17,8 +17,9 @@ use crate::error::LaunchError;
 
 /// Syscalls the default filter answers with `EPERM`: the kernel keyring,
 /// NUMA and VM controls, module and kexec loading, accounting, quota, the
-/// system clock and the host name — each either already unreachable in
-/// bubbler's baseline sandbox or unused by desktop apps. The
+/// system clock and the host name, io_uring, and the calls that reach
+/// into another process (`pidfd_getfd`, `kcmp`) — each either already
+/// unreachable in bubbler's baseline sandbox or unused by desktop apps. The
 /// argument-filtered `ioctl` rules are [`DEFAULT_IOCTL_EPERM`] instead:
 /// denying `ioctl` outright would break every program.
 pub const DEFAULT_EPERM: &[&str] = &[
@@ -63,6 +64,23 @@ pub const DEFAULT_EPERM: &[&str] = &[
     "nfsservctl",
     "vm86",
     "vm86old",
+    // The kernel surface every recent mitigation bypass was written
+    // against, and nothing a desktop application needs through a
+    // sandbox: an io_uring ring is a second syscall path that the audit
+    // and LSM hooks see differently from the first. `EPERM` and not
+    // `ENOSYS`, because the kernel's own `io_uring_disabled=2` answers
+    // `EPERM` and every runtime is tested against that answer.
+    "io_uring_setup",
+    "io_uring_enter",
+    "io_uring_register",
+    // Takes a descriptor out of another process by pidfd. The sandbox
+    // shares its pid namespace with `bubbler-init` and with every
+    // command run through the exec channel.
+    "pidfd_getfd",
+    // Compares two processes' kernel objects, which tells a caller
+    // whether two descriptors are the same open file — a side channel
+    // out of the sandbox's own process tree.
+    "kcmp",
 ];
 
 /// Denied with `EPERM` on top of [`DEFAULT_EPERM`], but only where the
@@ -497,6 +515,32 @@ mod tests {
         assert_eq!(RuleSet::with(&SeccompConfig::default()), Some(set));
     }
 
+    /// The kernel's own `io_uring_disabled=2` answers `EPERM`, so every
+    /// consumer is already tested against it — libuv falls back to its
+    /// thread pool in `uv__iou_init`. `ENOSYS` is not a substitute: a
+    /// caller that reads it as "old kernel" may probe by another path,
+    /// and a kill action would take down a process for a call its
+    /// runtime made on its own.
+    #[test]
+    fn the_io_uring_family_and_the_process_probes_are_denied_with_eperm() {
+        let set = RuleSet::default_set();
+        for name in [
+            "io_uring_setup",
+            "io_uring_enter",
+            "io_uring_register",
+            "pidfd_getfd",
+            "kcmp",
+        ] {
+            let name = name.to_owned();
+            assert!(set.eperm.contains(&name), "{name} is not denied");
+            assert!(!set.enosys.contains(&name), "{name} must answer EPERM");
+            assert!(
+                syscall_number(&name).is_some(),
+                "{name} is unknown to this libseccomp"
+            );
+        }
+    }
+
     #[test]
     fn disable_means_no_rules_at_all() {
         let cfg = SeccompConfig {
@@ -589,7 +633,7 @@ mod tests {
     /// so that a rule added by accident, or an architecture dropped from
     /// the filter, is a test failure.
     #[cfg(target_arch = "x86_64")]
-    const DEFAULT_LEN: usize = 112;
+    const DEFAULT_LEN: usize = 122;
 
     #[cfg(target_arch = "x86_64")]
     #[test]

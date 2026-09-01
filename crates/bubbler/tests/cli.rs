@@ -7397,6 +7397,11 @@ probe = [
     ("perf_event_open", call({perf_event_open}, 0, 0, -1, -1, 0)),
     # Size 0 is rejected before any thread is made, so nothing is forked.
     ("clone3", call({clone3}, 0, 0)),
+    # entries=0 and a null params pointer: the filter answers before the
+    # kernel reads either, and an unfiltered kernel answers EINVAL.
+    ("io_uring_setup", call({io_uring_setup}, 0, 0)),
+    # A pidfd of -1: refused by the filter before the descriptor is read.
+    ("pidfd_getfd", call({pidfd_getfd}, -1, 0, 0)),
     ("tiocsti", ioctl(0x5412)),
     ("tioclinux", ioctl(0x541C)),
     ("getpid", call({getpid})),
@@ -7407,6 +7412,8 @@ report = "\n".join("%s %s" % p for p in probe)
         x32 = x32,
         perf_event_open = nr("perf_event_open"),
         clone3 = nr("clone3"),
+        io_uring_setup = nr("io_uring_setup"),
+        pidfd_getfd = nr("pidfd_getfd"),
         getpid = nr("getpid"),
     )
 }
@@ -7499,6 +7506,8 @@ fn real_bwrap_seccomp_denies_the_default_list_and_nothing_else() {
     assert_eq!(probed(&out, "perf_event_open"), "EPERM", "{out}");
     // ENOSYS, so glibc falls back to `clone`; unfiltered this is EINVAL.
     assert_eq!(probed(&out, "clone3"), "ENOSYS", "{out}");
+    assert_eq!(probed(&out, "io_uring_setup"), "EPERM", "{out}");
+    assert_eq!(probed(&out, "pidfd_getfd"), "EPERM", "{out}");
     assert_eq!(probed(&out, "tiocsti"), "EPERM", "{out}");
     assert_eq!(probed(&out, "tioclinux"), "EPERM", "{out}");
     // A denylist: everything not named keeps working.
