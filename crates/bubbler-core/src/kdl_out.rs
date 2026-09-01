@@ -1,6 +1,15 @@
 //! Canonical KDL for an [`InstanceConfig`]: what a flattened profile is
 //! written back as. Every node the parser accepts, this writes, so
 //! `parse(render(parse(text)))` is `parse(text)` again.
+//!
+//! Canonical, not verbatim: a repeatable grant is written as one line
+//! each even where the file wrote a block of them, because the parsed
+//! config holds grants and not the shape of the file that wrote them.
+//! The one block written back is `portals`, whose children *are* in the
+//! parsed value; a `camera` child comes back as its own top-level node,
+//! since that is the grant it parses to. Every caller of [`render`]
+//! rewrites the file wholesale already — `Instance::save`, `seed`,
+//! `reseed` — so this loses nothing they kept.
 
 use std::ffi::{OsStr, OsString};
 
@@ -1236,5 +1245,49 @@ mod tests {
         // Without children it stays the bare node it was.
         let bare = crate::config::parse("dbus\nportals").unwrap();
         assert_eq!(render(&bare).unwrap(), "dbus\nportals\n");
+    }
+
+    /// A block is read and written back as the lines it stands for: the
+    /// config holds grants, not the shape of the file that wrote them,
+    /// and a round trip has to be the same grants either way.
+    #[test]
+    fn a_repeatable_block_is_written_back_as_lines() {
+        let text = "home-share {\n    \"a\" mode=ro\n    \"b\" mode=rw\n}\n\
+                    env {\n    A \"1\"\n    B \"2\"\n}\n";
+        let cfg = crate::config::parse(text).unwrap();
+        let rendered = render(&cfg).unwrap();
+        assert_eq!(
+            rendered,
+            "home-share \"a\" mode=ro\nhome-share \"b\" mode=rw\nenv A=\"1\"\nenv B=\"2\"\n"
+        );
+        // The round trip is the grants, which is the whole contract.
+        assert_eq!(crate::config::parse(&rendered).unwrap(), cfg);
+    }
+
+    /// A `/-` block comes back as one `/-` line per entry it held, in
+    /// the order it held them.
+    #[test]
+    fn a_disabled_block_is_written_back_as_disabled_lines() {
+        let cfg = crate::config::parse(
+            "wayland\n/-home-share {\n    \"a\" mode=ro\n    \"b\" mode=rw\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            render(&cfg).unwrap(),
+            "wayland\n/-home-share \"a\" mode=ro\n/-home-share \"b\" mode=rw\n"
+        );
+    }
+
+    /// The one block the emitter writes is `portals`, whose children the
+    /// parsed config holds; a `camera` child is its own node, since that
+    /// is the grant it parses to.
+    #[test]
+    fn a_camera_child_is_written_back_as_its_own_node() {
+        let cfg = crate::config::parse("dbus\nportals {\n    screencast\n    camera\n}").unwrap();
+        assert_eq!(
+            render(&cfg).unwrap(),
+            "dbus\nportals {\n    screencast\n}\ncamera\n"
+        );
+        assert_eq!(crate::config::parse(&render(&cfg).unwrap()).unwrap(), cfg);
     }
 }
