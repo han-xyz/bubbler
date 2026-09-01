@@ -5,7 +5,9 @@
 //! recover from anywhere below.
 
 use bubbler_core::catalogue::{self, Grant};
-use bubbler_core::config::{self, Disabled, InstanceConfig, Node, RawProfile, Userns};
+use bubbler_core::config::{
+    self, Disabled, InstanceConfig, Node, Portal, RawProfile, Service, Userns,
+};
 use bubbler_core::env::Env;
 use bubbler_core::host::RealHost;
 use bubbler_core::instance::{self, Instance};
@@ -251,6 +253,19 @@ impl Detail {
             .iter()
             .filter(|f| !f.line.is_some_and(|l| lines.contains(&l)))
             .collect()
+    }
+
+    /// The portal children the selected row grants, if it is a `portals`
+    /// row with any: the pane names each one, since the row itself is
+    /// one line and a block can hold six grants.
+    pub fn portal_children(&self, row: &Row) -> Option<&[Portal]> {
+        let Target::Service(i) = row.target else {
+            return None;
+        };
+        match self.buf.services.get(i)? {
+            Service::Portals { children } if !children.is_empty() => Some(children),
+            _ => None,
+        }
     }
 
     /// Grant, disable, enable or revoke the selected node. A granted

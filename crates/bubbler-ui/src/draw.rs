@@ -369,6 +369,16 @@ fn what_it_costs(detail: &Detail) -> Text<'static> {
         lines.push(Line::from(grant.summary.to_owned()));
         lines.push(Line::from(""));
         lines.push(Line::from(grant.cost.to_owned()));
+        if let Some(children) = detail.portal_children(row) {
+            lines.push(Line::from(""));
+            for child in children {
+                lines.push(Line::from(format!(
+                    "{} — {}",
+                    child.node_name(),
+                    child.cost_line()
+                )));
+            }
+        }
     }
     let findings = detail.findings_of(row);
     let loose = detail.loose_findings();
@@ -881,6 +891,44 @@ mod tests {
         assert!(
             tall.contains("help: drop the argument for a nested"),
             "{tall}"
+        );
+    }
+
+    /// The right-hand pane's text for the row named `node`, from a
+    /// config holding `text`.
+    fn costs_for(text: &str, node: &str) -> String {
+        let (_tmp, env) = fixture::store(&[("ff", "generic")]);
+        std::fs::write(
+            bubbler_core::instance::config_path(&env, "ff"),
+            format!("// bubbler profile: generic\n// bubbler config: 2\n{text}"),
+        )
+        .unwrap();
+        let mut detail = Detail::open(&env, "ff", false).unwrap();
+        detail.selected = detail
+            .rows
+            .iter()
+            .position(|r| r.node == node)
+            .unwrap_or_else(|| panic!("no row for `{node}`"));
+        what_it_costs(&detail).to_string()
+    }
+
+    /// The cost pane names each granted portal child under the node's
+    /// own cost, so `portals { screencast }` is not read as bare
+    /// `portals`.
+    #[test]
+    fn the_cost_pane_names_the_portal_children() {
+        let text = costs_for("dbus\nportals {\n    screencast\n}", "portals");
+        assert!(
+            text.contains("screencast — capture the screen after a portal dialog"),
+            "{text}"
+        );
+        // The catalogue's own cost text for `portals` already says
+        // "screencasts" in passing, so the bare check must be for the
+        // formatted child line rather than the bare word.
+        let bare = costs_for("dbus\nportals", "portals");
+        assert!(
+            !bare.contains("screencast — capture the screen after a portal dialog"),
+            "{bare}"
         );
     }
 

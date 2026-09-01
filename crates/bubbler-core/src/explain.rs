@@ -142,6 +142,7 @@ fn carries_rules(s: &Service) -> bool {
             | Service::Mpris { .. }
             | Service::A11y
             | Service::InputMethod
+            | Service::Camera { .. }
     )
 }
 
@@ -423,12 +424,6 @@ fn rules_of(index: usize, rules: &[(usize, String)]) -> Vec<String> {
         .collect()
 }
 
-/// What a `camera` node grants that no bwrap argument shows. The Camera
-/// interface is on `org.freedesktop.portal.Desktop`, which the `portals`
-/// rules already talk to, so the node adds no rule of its own either and
-/// would otherwise render as a grant that did nothing.
-const CAMERA_PORTAL: &str = "org.freedesktop.portal.Camera, carried by the portals bundle";
-
 /// What a `seccomp` node did to the default denylist, which is the whole
 /// grant of one that disables the filter and loads no program at all.
 fn seccomp_lines(cfg: &SeccompConfig) -> Vec<String> {
@@ -501,11 +496,23 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
         if !view.proxy {
             match g.origin {
                 Origin::Service(i) => match view.cfg.services.get(i) {
+                    // Checked before `carries_rules`: a `Portals` service
+                    // matches both, and its children are a grant of their
+                    // own on top of the bundle's rules.
+                    Some(Service::Portals { children }) => {
+                        out.extend(listed(n == 0, rules_of(i, view.rules)));
+                        if !children.is_empty() {
+                            out.extend(under(
+                                "children: ",
+                                children
+                                    .iter()
+                                    .map(|c| format!("{} — {}", c.node_name(), c.cost_line()))
+                                    .collect(),
+                            ));
+                        }
+                    }
                     Some(s) if carries_rules(s) => {
                         out.extend(listed(n == 0, rules_of(i, view.rules)));
-                    }
-                    Some(Service::Camera { .. }) => {
-                        out.extend(listed(n == 0, vec![CAMERA_PORTAL.to_owned()]));
                     }
                     // An isolated `network` is half a sidecar: its own
                     // arguments are only the resolver file, and what
@@ -1059,6 +1066,45 @@ bwrap
         );
     }
 
+    /// Every child is one line under the `portals` group, so a reader
+    /// sees what the block granted without counting proxy rules.
+    #[test]
+    fn the_portals_group_lists_its_children() {
+        let with_children = cfg("dbus\nportals {\n    screencast\n    location\n}");
+        let items = [item(Origin::Service(1), &[], None)];
+        let view = View {
+            title: "bwrap",
+            instance: "t",
+            cfg: &with_children,
+            source: Source {
+                file: "config.kdl",
+                lines: &Lines::default(),
+            },
+            rules: &[],
+            wl_proxy: None,
+            net_proxy_log: false,
+            proxy: false,
+            full: false,
+            bwrap: crate::version::Version::Known(0, 12, 0),
+        };
+        let out = render(&items, &view).unwrap();
+        assert!(
+            out.iter().any(|l| l
+                == "    children: screencast — capture the screen after a portal dialog"),
+            "{out:#?}"
+        );
+        assert!(
+            out.iter()
+                .any(|l| l.trim() == "location — read the host's location"),
+            "{out:#?}"
+        );
+        // A bare node lists nothing.
+        let bare = cfg("dbus\nportals");
+        let view = View { cfg: &bare, ..view };
+        let out = render(&items, &view).unwrap();
+        assert!(!out.iter().any(|l| l.contains("children:")), "{out:#?}");
+    }
+
     #[test]
     fn a_camera_grant_shows_the_portal_it_reaches_the_sandbox_through() {
         let bare = cfg("dbus\nportals\ncamera\ncommand \"true\"");
@@ -1090,9 +1136,10 @@ bwrap
         };
         // The bare grant is the whole of what the node did, and without
         // the line it would render as a grant that reached nothing.
+        let camera = dbus::camera_rules();
         let out = render_with(&[item(Origin::Command, &["--", "true"], None)]);
         assert!(
-            out.contains(&format!("    rule-only: {CAMERA_PORTAL}")),
+            out.contains(&format!("    rule-only: {}", camera[0])),
             "{out:#?}"
         );
         assert!(out.iter().any(|l| l.starts_with("  camera ")), "{out:#?}");
@@ -1125,7 +1172,7 @@ bwrap
         )
         .unwrap();
         assert!(
-            out.contains(&format!("    rules: {CAMERA_PORTAL}")),
+            out.contains(&format!("    rules: {}", camera[0])),
             "{out:#?}"
         );
     }
