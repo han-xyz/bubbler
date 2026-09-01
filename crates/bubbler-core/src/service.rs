@@ -1472,12 +1472,21 @@ fn writable_trees(ops: &[Explained], env: &Env) -> Vec<(PathBuf, PathBuf, &'stat
     let doc = env.runtime_dir.join("doc");
     let mut out = Vec::new();
     for op in ops {
-        let [flag, src, dst] = op.args.as_slice() else {
+        // The flag is looked for rather than assumed first: the builder
+        // emits prefixed operations — `--perms 0700 --bind src dst` — and
+        // a tree read off only the bare three-element shape would be
+        // dropped silently, taking the sweep of everything under it with
+        // it. [`destination`] reads an operation the same way.
+        let Some(i) = op
+            .args
+            .iter()
+            .position(|a| a == OsStr::new("--bind") || a == OsStr::new("--ro-bind"))
+        else {
             continue;
         };
-        if flag != OsStr::new("--bind") && flag != OsStr::new("--ro-bind") {
+        let (Some(src), Some(dst)) = (op.args.get(i + 1), op.args.get(i + 2)) else {
             continue;
-        }
+        };
         let dst = Path::new(dst);
         let tree = if dst == Path::new(SANDBOX_HOME) {
             "the instance home"
@@ -4514,6 +4523,28 @@ mod tests {
             dir,
         );
         assert!(sweep_destinations(&ops, &e, &plain).is_ok());
+    }
+
+    /// The tree a destination is measured against is read off a bind
+    /// wherever its flag sits in the operation: the builder emits
+    /// `--perms NNNN --bind src dst` as one operation too, and a tree
+    /// missed there takes every destination under it out of the sweep.
+    #[test]
+    fn a_prefixed_bind_still_contributes_its_tree() {
+        let e = env();
+        let home = "/home/user/.local/share/bubbler/instances/t/home";
+        let ops = vec![
+            op(&["--perms", "0700", "--bind", home, SANDBOX_HOME]),
+            op(&[
+                "--ro-bind",
+                "/home/user/Downloads",
+                "/home/bubbler/Downloads",
+            ]),
+        ];
+        let host =
+            FakeHost::default().link(&format!("{home}/Downloads"), "/oldroot/home/user/.config");
+        let err = sweep_destinations(&ops, &e, &host).unwrap_err();
+        assert!(err.to_string().contains("in the instance home"), "{err}");
     }
 
     /// Every component of the path is checked, not only the last: a link
