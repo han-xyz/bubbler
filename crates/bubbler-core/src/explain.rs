@@ -13,6 +13,7 @@ use crate::cgroup;
 use crate::config::{InstanceConfig, Lines, SeccompConfig, Service, WaylandMode, X11Mode};
 use crate::dbus;
 use crate::error::ConfigError;
+use crate::json;
 use crate::kdl_out;
 use crate::network::{self, NetworkConfig};
 use crate::wayland;
@@ -605,10 +606,10 @@ pub fn render_json(items: &[Explained], view: &View) -> Result<String, ConfigErr
             .and_then(|l| l.parse::<u32>().ok());
         let args: Vec<String> = item.args.iter().map(|a| quote_os(a)).collect();
         out.push_str("  {\"origin\": {");
-        out.push_str(&format!("\"kind\": {}", quote(kind)));
+        out.push_str(&format!("\"kind\": {}", json::string(kind)));
         out.push_str(&format!(
             ", \"node\": {}",
-            quote(&label(item.origin, view.cfg)?)
+            json::string(&label(item.origin, view.cfg)?)
         ));
         out.push_str(&match index {
             Some(i) => format!(", \"index\": {i}"),
@@ -620,7 +621,7 @@ pub fn render_json(items: &[Explained], view: &View) -> Result<String, ConfigErr
         });
         out.push_str(&format!("}}, \"args\": [{}]", args.join(", ")));
         out.push_str(&match &item.note {
-            Some(note) => format!(", \"note\": {}", quote(note)),
+            Some(note) => format!(", \"note\": {}", json::string(note)),
             None => ", \"note\": null".to_owned(),
         });
         out.push_str(if n + 1 == items.len() { "}\n" } else { "},\n" });
@@ -629,28 +630,9 @@ pub fn render_json(items: &[Explained], view: &View) -> Result<String, ConfigErr
     Ok(out)
 }
 
-/// A JSON string literal, with the control characters JSON refuses
-/// written as escapes.
-fn quote(s: &str) -> String {
-    let mut out = String::from("\"");
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-/// [`quote`] for an argument, which is not necessarily UTF-8.
+/// [`json::string`] for an argument, which is not necessarily UTF-8.
 fn quote_os(s: &OsStr) -> String {
-    quote(&s.to_string_lossy())
+    json::string(&s.to_string_lossy())
 }
 
 #[cfg(test)]
@@ -1571,12 +1553,14 @@ bwrap
     }
 
     #[test]
-    fn a_quoted_string_survives_the_characters_json_refuses() {
-        assert_eq!(quote("a\"b\\c\nd\te"), "\"a\\\"b\\\\c\\nd\\te\"");
-        assert_eq!(quote("\u{1}"), "\"\\u0001\"");
+    fn an_argument_that_is_not_utf8_is_quoted_lossily() {
         assert_eq!(
             quote_os(OsStr::from_bytes(b"/tmp/\xff")),
             "\"/tmp/\u{fffd}\""
+        );
+        assert_eq!(
+            quote_os(OsStr::from_bytes(b"/tmp/\x1b[2J")),
+            "\"/tmp/\\u001b[2J\""
         );
     }
 

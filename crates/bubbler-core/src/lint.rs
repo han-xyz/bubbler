@@ -19,6 +19,7 @@ use crate::desktop;
 use crate::env::{Env, SANDBOX_HOME};
 use crate::error::{LintError, ReadError};
 use crate::host::Host;
+use crate::json;
 use crate::network::HostPattern;
 use crate::profile::Resolver;
 use crate::service;
@@ -680,15 +681,15 @@ pub fn render_json(report: &Report) -> String {
     let mut out = String::from("[\n");
     for f in &report.findings {
         out.push_str("  {\"file\": ");
-        out.push_str(&json_string(&f.at.label().to_string_lossy()));
+        out.push_str(&json::string(&f.at.label().to_string_lossy()));
         out.push_str(&format!(
             ", \"line\": {}, \"col\": {}, \"severity\": {}, \"check\": {}, \"message\": {}, \"help\": {}}},\n",
             f.line.map_or_else(|| "null".to_owned(), |l| l.to_string()),
             f.col.map_or_else(|| "null".to_owned(), |c| c.to_string()),
-            json_string(&f.severity.to_string()),
-            json_string(f.id),
-            json_string(&f.message),
-            json_string(&f.help),
+            json::string(&f.severity.to_string()),
+            json::string(f.id),
+            json::string(&f.message),
+            json::string(&f.help),
         ));
     }
     out.push_str(&format!(
@@ -698,26 +699,6 @@ pub fn render_json(report: &Report) -> String {
         report.count(Severity::Warning),
         report.count(Severity::Note),
     ));
-    out
-}
-
-/// `s` as a JSON string literal. Every control character is escaped, so a
-/// message built from config text stays one line of valid JSON.
-fn json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
     out
 }
 

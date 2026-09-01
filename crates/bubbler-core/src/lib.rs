@@ -17,6 +17,7 @@ pub mod fsutil;
 pub mod host;
 pub mod init_bin;
 pub mod instance;
+pub mod json;
 pub mod kdl_out;
 pub mod launcher;
 pub mod lint;
