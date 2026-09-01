@@ -746,7 +746,19 @@ impl Source {
             // the whole report down with it.
             match config::parse_repeatable_block(node) {
                 Ok(Some(lines)) => flat.extend(lines),
-                Ok(None) | Err(_) => flat.push(node.clone()),
+                Ok(None) | Err(_) => {
+                    flat.push(node.clone());
+                    // The config parser splits a `portals` block's
+                    // `camera` child into the same `Service::Camera` a
+                    // bare `camera` node parses to, so the checks that
+                    // read a `camera` see it in either form. The
+                    // `portals` node stays in the list, which is what
+                    // keeps `camera-without-portals` silent for the
+                    // child.
+                    if node.name().value() == "portals" {
+                        flat.extend(kids(node).filter(|c| c.name().value() == "camera").cloned());
+                    }
+                }
             }
         }
         Ok(Self {
@@ -2414,6 +2426,36 @@ mod tests {
             assert_eq!(
                 ids(&lint(ctx, &["dbus\nportals {\n    camera\n}"])),
                 [] as [&str; 0]
+            );
+        });
+    }
+
+    /// The child is the same grant as the bare node, so the checks that
+    /// measure `camera nodes=#true` against the host report it in either
+    /// form.
+    #[test]
+    fn the_camera_child_is_linted_like_the_bare_node() {
+        with(&host(), |ctx| {
+            let bare = lint(ctx, &["dbus\nportals\ncamera nodes=#true"]);
+            let child = lint(ctx, &["dbus\nportals {\n    camera nodes=#true\n}"]);
+            assert_eq!(
+                ids(&child),
+                ["camera-nodes-none-present", "camera-nodes-no-hotplug"]
+            );
+            assert_eq!(ids(&bare), ids(&child));
+            assert_eq!(
+                bare.findings.iter().map(|f| &f.message).collect::<Vec<_>>(),
+                child
+                    .findings
+                    .iter()
+                    .map(|f| &f.message)
+                    .collect::<Vec<_>>()
+            );
+            // Each finding points at the child's own line, not at the
+            // `portals` node that opens the block.
+            assert!(
+                child.findings.iter().all(|f| f.line == Some(3)),
+                "{child:#?}"
             );
         });
     }
