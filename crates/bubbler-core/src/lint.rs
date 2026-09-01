@@ -188,6 +188,9 @@ const SECCOMP_DISABLED: Check = Check {
     id: "seccomp-disabled",
     severity: Severity::Warning,
 };
+// Two sites report this check: the D-Bus rule in `dbus_node`, and the
+// `secrets` child of `portals` in `per_layer`, which reaches the same
+// keyring interface through the portal instead of a bare bus name.
 const SECRETS_ACCESS: Check = Check {
     id: "secrets-access",
     severity: Severity::Note,
@@ -1219,6 +1222,16 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
             "camera" if flag(node, "nodes") == Some(true) => {
                 camera_nodes(ctx, i, node, host_net, f);
             }
+            "portals" if kids(node).any(|c| c.name().value() == "secrets") => f.push(
+                i,
+                node,
+                &SECRETS_ACCESS,
+                "`portals { secrets }` opens org.freedesktop.portal.Secret: the host \
+                 keyring hands the sandbox the secret it stores for this application"
+                    .to_owned(),
+                "drop the child unless the application keeps a secret through the portal, \
+                 or accept it with `lint-allow \"secrets-access\" reason=\"...\"`",
+            ),
             "pulseaudio" if pulse_module_loading_on(ctx) => f.push(
                 i,
                 node,
@@ -1479,7 +1492,9 @@ fn kind(ty: std::fs::FileType) -> &'static str {
 }
 
 /// The session bus's own rules: a name claimed more widely than the app
-/// owns, and the one name that is every secret the keyring holds.
+/// owns, and the one name that is every secret the keyring holds. That
+/// second finding's other site is the `secrets` child of `portals`,
+/// reported from `per_layer` instead.
 fn dbus_node(i: usize, node: &KdlNode, f: &mut Findings) {
     for rule in kids(node) {
         let level = rule.name().value();
@@ -2241,6 +2256,53 @@ mod tests {
             assert!(
                 report.findings.iter().all(|f| f.severity == Severity::Note),
                 "{report:#?}"
+            );
+        });
+    }
+
+    /// The `secrets` child is the portal Secret interface, and the note
+    /// that covers `talk "org.freedesktop.secrets"` covers it too.
+    #[test]
+    fn the_secrets_child_carries_the_secrets_note() {
+        with(&host(), |ctx| {
+            assert_eq!(
+                ids(&lint(ctx, &["dbus\nportals {\n    secrets\n}"])),
+                ["secrets-access"]
+            );
+            assert_eq!(
+                lint(ctx, &["dbus\nportals {\n    secrets\n}"]).findings[0].severity,
+                Severity::Note
+            );
+            // Another child raises nothing.
+            assert_eq!(
+                ids(&lint(ctx, &["dbus\nportals {\n    screencast\n}"])),
+                [] as [&str; 0]
+            );
+            // And it can be accepted like any other note.
+            assert_eq!(
+                ids(&lint(
+                    ctx,
+                    &[
+                        "lint-allow \"secrets-access\" reason=\"the app stores its own token\"\n\
+                       dbus\nportals {\n    secrets\n}"
+                    ]
+                )),
+                [] as [&str; 0]
+            );
+        });
+    }
+
+    /// A `camera` written bare still needs `portals`; the child form
+    /// cannot be written without it, so nothing new is checked there.
+    #[test]
+    fn camera_without_portals_survives_the_split() {
+        let (_, dir, _) = fake::types();
+        let host = host().with("/dev", dir);
+        with(&host, |ctx| {
+            assert_eq!(ids(&lint(ctx, &["camera"])), ["camera-without-portals"]);
+            assert_eq!(
+                ids(&lint(ctx, &["dbus\nportals {\n    camera\n}"])),
+                [] as [&str; 0]
             );
         });
     }
