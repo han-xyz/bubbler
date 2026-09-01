@@ -416,13 +416,13 @@ fn profiles(app: &App, area: Rect, buf: &mut Buffer) {
     }
     let rows = app.store.profiles.iter().map(|entry| {
         Row::new([
-            Cell::from(entry.name.clone()),
+            Cell::from(safe(&entry.name)),
             Cell::from(entry.origin.to_string()),
             Cell::from(
                 entry
                     .path
                     .as_deref()
-                    .map_or_else(|| "-".to_owned(), |p| p.display().to_string()),
+                    .map_or_else(|| "-".to_owned(), |p| safe(&p.display().to_string())),
             ),
         ])
     });
@@ -543,11 +543,11 @@ fn dialog(dialog: &Dialog, area: Rect, buf: &mut Buffer) {
         Dialog::Ask {
             title, hint, input, ..
         } => {
-            let block = Block::bordered().title_top(title.clone());
+            let block = Block::bordered().title_top(safe(title));
             let inner = block.inner(area);
             block.render(area, buf);
             let (value, _) = input.view(usize::from(inner.width));
-            let mut lines = vec![Line::from(value.to_owned()), Line::from("")];
+            let mut lines = vec![Line::from(safe(value)), Line::from("")];
             lines.extend(
                 wrapped(hint, usize::from(inner.width))
                     .into_iter()
@@ -563,11 +563,11 @@ fn dialog(dialog: &Dialog, area: Rect, buf: &mut Buffer) {
             let block = Block::bordered().title_top("confirm");
             let inner = block.inner(area);
             block.render(area, buf);
-            let mut lines = vec![Line::from(question.clone()), Line::from("")];
+            let mut lines = vec![Line::from(safe(question)), Line::from("")];
             lines.extend(
                 choices
                     .iter()
-                    .map(|c| Line::from(format!("{}  {}", c.key, c.label))),
+                    .map(|c| Line::from(format!("{}  {}", c.key, safe(&c.label)))),
             );
             lines.push(Line::styled(
                 "Esc or `n` leaves it alone",
@@ -1193,6 +1193,38 @@ mod tests {
         app.say("D\u{1b}[2Jocuments".to_owned());
         let lines = screen(&app, 80, 8);
         assert_eq!(lines.last().unwrap(), "D?ocuments");
+    }
+
+    /// A prompt's own field is drawn, not performed: `Input` takes
+    /// whatever a key event carries, typed or pasted, and the field is
+    /// the value the dialog draws back — the same `?` applies whether the
+    /// text arrived pre-filled from a name or was typed on the spot.
+    #[test]
+    fn a_control_sequence_typed_into_a_prompt_is_drawn_as_a_question_mark() {
+        let (_tmp, mut app) = list_editor();
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        for c in "D\u{1b}[2Jocuments".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let body = screen(&app, 80, 14).join(" ");
+        assert!(body.contains("D?ocuments"), "{body}");
+    }
+
+    /// A profile catalogue entry's own name is drawn, not performed:
+    /// unlike a node's own text, `entry.name` is filename-derived and
+    /// nothing in `kdl_out` ever touches it.
+    #[test]
+    fn a_control_sequence_in_a_profile_name_is_drawn_as_a_question_mark() {
+        let (_tmp, mut app) = list_editor();
+        app.store.profiles = vec![bubbler_core::profile::Entry {
+            name: "D\u{1b}[2Jocuments".to_owned(),
+            origin: bubbler_core::profile::Origin::User,
+            path: None,
+        }];
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        let body = screen(&app, 80, 8).join(" ");
+        assert!(body.contains("D?ocuments"), "{body}");
     }
 
     #[test]
