@@ -302,7 +302,7 @@ file descriptor numbers are the ones a dry run prints.
         rule-only: --talk=org.freedesktop.Notifications
 
       seccomp                                        2 arguments
-        --add-seccomp-fd 5  (filter, 896 bytes, x86_64 + i386)
+        --add-seccomp-fd 5  (filter, 1120 bytes, x86_64 + i386)
 
       wayland                         config.kdl:3   9 arguments
         --ro-bind /run/user/1000/bubbler/ff/wayland /run/user/1000/wayland-1
@@ -758,7 +758,7 @@ own `seccomp` node never reaches it.
         ... 33 more (--explain=full)
 
       seccomp                 2 arguments
-        --add-seccomp-fd 5  (filter, 896 bytes, x86_64 + i386)
+        --add-seccomp-fd 5  (filter, 1120 bytes, x86_64 + i386)
 
       command                 13 arguments
         --ro-bind <build tree>/target/debug/bubbler-wl-proxy <build tree>/target/debug/bubbler-wl-proxy
@@ -3517,7 +3517,7 @@ single-architecture build still denies it. Put it back for one instance with
     }
 
 `--explain` prints the size and the architectures under the descriptor, e.g.
-`--add-seccomp-fd 5  (filter, 896 bytes, x86_64 + i386)`.
+`--add-seccomp-fd 5  (filter, 1120 bytes, x86_64 + i386)`.
 
 A syscall from an ABI the filter does **not** carry is killed rather than
 allowed. x32 is the ABI this matters for: it shares x86_64's `AUDIT_ARCH`
@@ -3578,7 +3578,9 @@ tmpfs, `/home/bubbler` as
 the working directory, and a cleared environment (only the locale and terminal
 variables — `TERM`, `LANG`, `LANGUAGE`, `COLORTERM`, `TZ`, `LC_*` — are
 carried over). Every sidecar bubbler wraps in a bwrap of its own gets the same
-64 MiB caps on its `/etc`, `/var`, `/run` and `/tmp`. Grants only add to that.
+64 MiB cap on its `/etc` and on its `/tmp`, which are the only two tmpfs
+mounts a sidecar has — it needs no `/var` and no `/run` of its own. Grants
+only add to that.
 
 `/dev/ntsync` is bound too, on a host that has the node — the one device the
 baseline hands over, and a deliberate widening of it. It is the kernel's

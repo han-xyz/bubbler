@@ -110,7 +110,7 @@ manager's name, both arguments of `bubbler-init` rather than of bwrap.
     rules: --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.FileChooser.*@/org/freedesktop/portal/desktop
            ...
   seccomp                                        2 arguments
-    --add-seccomp-fd 5  (filter, 896 bytes, x86_64 + i386)
+    --add-seccomp-fd 5  (filter, 1120 bytes, x86_64 + i386)
   wayland                         config.kdl:3   6 arguments
     --ro-bind /run/user/1000/bubbler/ff/wayland /run/user/1000/wayland-1
     --setenv WAYLAND_DISPLAY wayland-1

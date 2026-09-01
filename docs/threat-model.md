@@ -181,7 +181,8 @@ uncapped one lets a sandbox that fills it take the session's memory with
 it — a private home at `/home/bubbler`, an empty `$XDG_RUNTIME_DIR` at
 the host's path sharing the `/run` cap, since it is a directory `--dir`
 makes inside that tmpfs, and a cleared environment. Every sidecar bubbler
-wraps in a bwrap of its own gets the same 64 MiB caps. The forked child also
+wraps in a bwrap of its own gets the same 64 MiB cap on the two tmpfs
+mounts it has, its `/etc` and its `/tmp`. The forked child also
 joins a session keyring of its own (`keyctl(2)` `KEYCTL_JOIN_SESSION_KEYRING`
 with a null name) right before it execs `bwrap`, so it never inherits the
 login session keyring bubbler itself runs on; `keyctl` is on the `EPERM`
