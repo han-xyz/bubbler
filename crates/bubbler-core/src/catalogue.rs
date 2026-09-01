@@ -248,9 +248,16 @@ pub static GRANTS: &[Grant] = &[
                at the time, which is what makes this the narrow way to reach files, \
                cameras and screencasts. Requires `dbus`; the spawn portal is not among \
                the rules. Without a document portal on the host the launch warns and \
-               picked files stay unreachable.",
+               picked files stay unreachable. The bare node opens a safe set — \
+               a file chooser, a link, a notification, a print dialog, the read-only \
+               monitors a toolkit polls — and each child opens one group more: \
+               `screencast` the screen, `remote-desktop` the session's input stream, \
+               `global-shortcuts` bindings that fire unfocused, `background` host \
+               autostart and launcher entries, `location` where you are, `secrets` this \
+               application's portal secret. `camera` is a child too, and the same grant \
+               as the top-level node of that name.",
         risk: Risk::Narrow,
-        grammar: "portals",
+        grammar: "portals [{ screencast remote-desktop ... }]",
     },
     Grant {
         node: "notify",
@@ -480,6 +487,18 @@ mod tests {
                 g.node
             );
         }
+    }
+
+    /// The `portals` entry names its children, so the one table a
+    /// reader meets — the man page, the editor's pane — says the block
+    /// exists without a second table to keep in step.
+    #[test]
+    fn the_portals_entry_names_its_children() {
+        let g = grant("portals").expect("the catalogue holds portals");
+        for child in crate::config::Portal::ALL {
+            assert!(g.cost.contains(child.node_name()), "{}", child.node_name());
+        }
+        assert_eq!(g.grammar, "portals [{ screencast remote-desktop ... }]");
     }
 
     #[test]
