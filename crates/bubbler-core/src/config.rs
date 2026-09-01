@@ -1402,10 +1402,17 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
 /// One top-level node as everything it grants, each with the byte offset
 /// of the text it was written at. Almost every node grants one thing and
 /// is written on one line; a `portals` block grants one thing per child,
-/// and a reader — `--explain`'s line numbers, the linter's positions —
-/// has to be able to point at the child rather than at the block above
-/// it.
+/// and so does a repeatable block (see [`parse_repeatable_block`]), and a
+/// reader — `--explain`'s line numbers, the linter's positions — has to
+/// be able to point at the child rather than at the block above it.
 pub(crate) fn parse_node(node: &KdlNode, profile: bool) -> Result<Vec<(Node, usize)>, ConfigError> {
+    if let Some(lines) = parse_repeatable_block(node)? {
+        let mut out = Vec::with_capacity(lines.len());
+        for line in &lines {
+            out.push((parse_one(line, profile)?, line.name().span().offset()));
+        }
+        return Ok(out);
+    }
     if node.name().value() == "portals" && node.children().is_some() {
         let (portals, camera) = parse_portals(node)?;
         let at = node.name().span().offset();
@@ -1420,6 +1427,75 @@ pub(crate) fn parse_node(node: &KdlNode, profile: bool) -> Result<Vec<(Node, usi
         node.name().span().offset(),
     )])
 }
+
+/// A repeatable node written as a block, as the line-form nodes it
+/// stands for; `None` for every other node.
+///
+/// The child's name is what the line form's first argument was, and the
+/// child's properties come over unchanged, so the result goes through
+/// the node's own parser: `grant`'s dedup, every `ConfigError` shape and
+/// every check downstream stay exactly as they are for the line form,
+/// which is what makes the two spellings one grammar rather than two.
+/// `env` is the one kind with no positional argument to lift — its line
+/// form is `env KEY="value"` — so its child is `KEY "value"` and the
+/// name and the argument become the property.
+///
+/// Each synthesised node keeps the child's spans, so an error, a line
+/// number and a lint finding point at the line the entry is written on
+/// rather than at the block above it.
+pub(crate) fn parse_repeatable_block(node: &KdlNode) -> Result<Option<Vec<KdlNode>>, ConfigError> {
+    let name = node.name().value();
+    if !REPEATABLE.contains(&name) {
+        return Ok(None);
+    }
+    let Some(kids) = node.children() else {
+        return Ok(None);
+    };
+    // Before `parse_one` sees any of it: a block is expanded here, so
+    // this is the only place a type annotation on the block node is seen.
+    reject_types(node)?;
+    if !node.entries().is_empty() {
+        return Err(bad(node, "takes an argument or children, not both"));
+    }
+    let mut out = Vec::with_capacity(kids.nodes().len());
+    for child in kids.nodes() {
+        reject_types(child)?;
+        let mut line = line_form(name, child);
+        // The entries the child carried are the line form's, after the
+        // one its name becomes.
+        let carried: Vec<kdl::KdlEntry> = child.entries().to_vec();
+        line.entries_mut().clear();
+        if name == "env" {
+            let [entry] = carried.as_slice() else {
+                return Err(bad(node, ENV_CHILD));
+            };
+            if entry.name().is_some() {
+                return Err(bad(node, ENV_CHILD));
+            }
+            let Some(value) = entry.value().as_string() else {
+                return Err(bad(node, ENV_CHILD));
+            };
+            line.push(kdl::KdlEntry::new_prop(
+                child.name().value(),
+                kdl::KdlValue::String(value.to_owned()),
+            ));
+        } else {
+            line.push(kdl::KdlEntry::new(kdl::KdlValue::String(
+                child.name().value().to_owned(),
+            )));
+            for e in carried {
+                line.push(e);
+            }
+        }
+        out.push(line);
+    }
+    Ok(Some(out))
+}
+
+/// What an `env` block's child has to be. One string: the line form is
+/// `env KEY="value"`, and `KEY="value"` is an entry in KDL, not a name a
+/// node can be written under.
+const ENV_CHILD: &str = "an env child is one KEY \"value\" pair: exactly one string argument";
 
 /// The `portals` node: the bundle with its children, and separately the
 /// `camera` grant a `camera` child writes, with the offset of that child
@@ -6443,5 +6519,156 @@ command "b""#
             Portal::ScreenCast.cost_line(),
             "capture the screen after a portal dialog"
         );
+    }
+
+    /// One block says what one line each says, for every repeatable
+    /// kind: same grants, same order, same everything downstream.
+    #[test]
+    fn block_form_parses_like_lines() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "home-share \".local/bin/claude\" mode=ro\nhome-share \"Downloads\" mode=rw",
+                "home-share {\n    \".local/bin/claude\" mode=ro\n    \"Downloads\" mode=rw\n}",
+            ),
+            (
+                "path-share \"/mnt/data\" mode=ro\npath-share \"/opt/tool\" mode=rw",
+                "path-share {\n    \"/mnt/data\" mode=ro\n    \"/opt/tool\" mode=rw\n}",
+            ),
+            (
+                "etc-share \"vulkan\"\netc-share \"fonts\"",
+                "etc-share {\n    \"vulkan\"\n    \"fonts\"\n}",
+            ),
+            (
+                "app-runtime \"org.example.A\" mode=ro\napp-runtime \"org.example.B\" mode=rw",
+                "app-runtime {\n    \"org.example.A\" mode=ro\n    \"org.example.B\" mode=rw\n}",
+            ),
+            (
+                "env A=\"1\"\nenv B=\"2\"",
+                "env {\n    A \"1\"\n    B \"2\"\n}",
+            ),
+            (
+                "lint-allow \"network-host\" reason=\"why\"\n\
+                 lint-allow \"own-too-wide\" reason=\"also why\"",
+                "lint-allow {\n    \"network-host\" reason=\"why\"\n    \
+                 \"own-too-wide\" reason=\"also why\"\n}",
+            ),
+        ];
+        for (lines, block) in cases {
+            assert_eq!(
+                parse_profile(lines).unwrap(),
+                parse_profile(block).unwrap(),
+                "{block}"
+            );
+        }
+        // Every repeatable kind is covered.
+        assert_eq!(cases.len(), REPEATABLE.len());
+    }
+
+    /// A block of one, and a block of none, are both a file that says
+    /// what it says: no grant is invented and none is lost.
+    #[test]
+    fn a_block_may_hold_one_entry_or_none() {
+        assert_eq!(
+            parse_profile("home-share {\n    \"Downloads\" mode=rw\n}").unwrap(),
+            parse_profile("home-share \"Downloads\" mode=rw").unwrap()
+        );
+        assert_eq!(
+            parse_profile("home-share {\n}").unwrap().config,
+            InstanceConfig::default()
+        );
+    }
+
+    /// The line form and the block form are one file's two spellings, so
+    /// the duplicate rules are the same in both.
+    #[test]
+    fn a_block_dedups_the_way_the_lines_do() {
+        for text in [
+            "home-share \"x\"\nhome-share \"x\"",
+            "home-share {\n    \"x\"\n    \"x\"\n}",
+            "home-share \"x\"\nhome-share {\n    \"x\"\n}",
+        ] {
+            assert!(
+                matches!(parse_profile(text), Err(ConfigError::Duplicate(_))),
+                "{text}"
+            );
+        }
+        assert!(matches!(
+            parse_profile("env {\n    A \"1\"\n    A \"2\"\n}"),
+            Err(ConfigError::Duplicate(k)) if k == "A"
+        ));
+    }
+
+    /// What a block refuses.
+    #[test]
+    fn a_block_refuses_the_shapes_that_mean_two_things() {
+        // An argument and children at once: which of the two is the entry?
+        assert!(matches!(
+            parse_profile("home-share \"a\" {\n    \"b\"\n}"),
+            Err(ConfigError::BadArgument { node, reason })
+                if node == "home-share" && reason == "takes an argument or children, not both"
+        ));
+        // A child with children of its own: the line form takes none.
+        assert!(matches!(
+            parse_profile("home-share {\n    \"a\" {\n        \"b\"\n    }\n}"),
+            Err(ConfigError::BadArgument { node, reason })
+                if node == "home-share" && reason == "takes no children"
+        ));
+        // A child with an argument where the name is the argument.
+        assert!(matches!(
+            parse_profile("home-share {\n    \"a\" \"b\"\n}"),
+            Err(ConfigError::BadArgument { node, reason })
+                if node == "home-share" && reason == "expects exactly one path argument"
+        ));
+        assert!(matches!(
+            parse_profile("lint-allow {\n    \"network-host\" \"extra\" reason=\"why\"\n}"),
+            Err(ConfigError::BadArgument { node, .. }) if node == "lint-allow"
+        ));
+        // An `env` child is one KEY "value" pair.
+        for text in [
+            "env {\n    A\n}",
+            "env {\n    A \"1\" \"2\"\n}",
+            "env {\n    A B=\"1\"\n}",
+        ] {
+            assert!(
+                matches!(
+                    parse_profile(text),
+                    Err(ConfigError::BadArgument { node, reason })
+                        if node == "env"
+                            && reason == "an env child is one KEY \"value\" pair: \
+                                          exactly one string argument"
+                ),
+                "{text}: {:?}",
+                parse_profile(text)
+            );
+        }
+        // `include` is an argument list already, not a block node.
+        assert!(parse_profile("include {\n    \"base\"\n}").is_err());
+        // And a node that is not repeatable keeps the children it takes.
+        assert!(parse_profile("dbus {\n    talk \"org.example.A\"\n}").is_ok());
+    }
+
+    /// A `/-` block is every entry under it, turned off: one `/-` line
+    /// each is what the file is written back as.
+    #[test]
+    fn a_disabled_block_keeps_every_entry_it_held() {
+        let cfg = parse("/-home-share {\n    \"a\" mode=ro\n    \"b\" mode=rw\n}").unwrap();
+        assert_eq!(cfg.services, Vec::new());
+        assert_eq!(cfg.disabled.len(), 2);
+        assert_eq!(
+            cfg.disabled[0].node,
+            Node::Service(Service::HomeShare {
+                path: PathBuf::from("a"),
+                mode: ShareMode::ReadOnly
+            })
+        );
+    }
+
+    /// A block's entries are pointed at where they are written, not at
+    /// the line the block opens on.
+    #[test]
+    fn a_block_entry_reports_its_own_line() {
+        let text = "wayland\nhome-share {\n    \"a\"\n    \"b\"\n}\n";
+        let (_, lines) = parse_doc(text, true).unwrap();
+        assert_eq!(lines.services, vec![Some(1), Some(3), Some(4)]);
     }
 }
