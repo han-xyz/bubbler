@@ -225,9 +225,12 @@ pub struct RuleSet {
     pub eperm: Vec<String>,
     /// Syscall names denied with `ENOSYS`.
     pub enosys: Vec<String>,
-    /// Syscalls denied with `ENOSYS` by number, each with the name a
-    /// profile names it by. See [`DEFAULT_ENOSYS_NUMBERED`].
-    pub enosys_numbered: Vec<(String, i32)>,
+    /// Syscalls denied by number, each with the name a profile names it
+    /// by and the errno it currently returns. See
+    /// [`DEFAULT_ENOSYS_NUMBERED`]; `deny` of one of these names moves
+    /// its errno here rather than pushing the bare name into `eperm` or
+    /// `enosys`, since libseccomp cannot resolve it by name either way.
+    pub enosys_numbered: Vec<(String, i32, Errno)>,
     /// `ioctl` request numbers denied with `EPERM`, matched on the low 32
     /// bits of argument 1.
     pub ioctl_eperm: Vec<u32>,
@@ -253,7 +256,7 @@ impl RuleSet {
             enosys: DEFAULT_ENOSYS.iter().map(|s| (*s).to_owned()).collect(),
             enosys_numbered: DEFAULT_ENOSYS_NUMBERED
                 .iter()
-                .map(|(name, nr)| ((*name).to_owned(), *nr))
+                .map(|(name, nr)| ((*name).to_owned(), *nr, Errno::Enosys))
                 .collect(),
             ioctl_eperm: DEFAULT_IOCTL_EPERM.to_vec(),
             personality: true,
@@ -287,6 +290,15 @@ impl RuleSet {
                 // filter twice with two different actions.
                 set.ioctl_eperm.clear();
             }
+            // A numbered name has no name libseccomp resolves, so pushing
+            // it into `eperm`/`enosys` like every other `deny` would only
+            // leave it unresolvable and skipped — fully allowed instead
+            // of denied. It stays in `enosys_numbered` with the errno the
+            // profile chose.
+            if let Some((_, nr)) = DEFAULT_ENOSYS_NUMBERED.iter().find(|(n, _)| n == name) {
+                set.enosys_numbered.push((name.clone(), *nr, *errno));
+                continue;
+            }
             match errno {
                 Errno::Eperm => set.eperm.push(name.clone()),
                 Errno::Enosys => set.enosys.push(name.clone()),
@@ -298,7 +310,7 @@ impl RuleSet {
     fn remove(&mut self, name: &str) {
         self.eperm.retain(|s| s != name);
         self.enosys.retain(|s| s != name);
-        self.enosys_numbered.retain(|(n, _)| n != name);
+        self.enosys_numbered.retain(|(n, _, _)| n != name);
     }
 }
 
@@ -384,14 +396,12 @@ fn build(set: &RuleSet, log: bool) -> Result<Built, LaunchError> {
     // choice is a rule on the build architecture or no rule; a 32-bit
     // binary in the sandbox still reaches these three numbers, which is
     // recorded in `docs/threat-model.md`.
-    for (_, nr) in &set.enosys_numbered {
+    for (_, nr, errno) in &set.enosys_numbered {
         let nr = ScmpSyscall::from(*nr);
         if !seen.insert(nr.into()) {
             continue;
         }
-        filter
-            .add_rule(action(log, Errno::Enosys), nr)
-            .map_err(failed)?;
+        filter.add_rule(action(log, *errno), nr).map_err(failed)?;
     }
     // `man 3 seccomp_arch_add`: rules added after an architecture is
     // added reach every architecture in the filter, and rules added
@@ -669,7 +679,10 @@ mod tests {
         }
         let set = RuleSet::default_set();
         assert_eq!(set.enosys_numbered.len(), DEFAULT_ENOSYS_NUMBERED.len());
-        assert_eq!(set.enosys_numbered[0], ("open_tree_attr".to_owned(), 467));
+        assert_eq!(
+            set.enosys_numbered[0],
+            ("open_tree_attr".to_owned(), 467, Errno::Enosys)
+        );
     }
 
     /// A profile that names one takes its rule back, exactly as it does
@@ -684,9 +697,43 @@ mod tests {
         assert!(
             !set.enosys_numbered
                 .iter()
-                .any(|(n, _)| n == "open_tree_attr")
+                .any(|(n, _, _)| n == "open_tree_attr")
         );
         assert_eq!(set.enosys_numbered.len(), DEFAULT_ENOSYS_NUMBERED.len() - 1);
+    }
+
+    /// A `deny` of a numbered syscall must never go through the name
+    /// path: libseccomp cannot resolve `open_tree_attr`, `listns` or
+    /// `fchroot` by name, so pushing the bare name into `eperm`/`enosys`
+    /// — what `deny` does for every other syscall — leaves it
+    /// unresolvable, `skipped` by `build`, and therefore fully allowed.
+    /// A profile author who denies one of these three must get the
+    /// errno they asked for, never the opposite of what they wrote.
+    #[test]
+    fn denying_a_numbered_syscall_keeps_it_numbered_with_the_chosen_errno() {
+        let cfg = SeccompConfig {
+            deny: vec![
+                ("open_tree_attr".to_owned(), Errno::Eperm),
+                ("listns".to_owned(), Errno::Enosys),
+            ],
+            ..SeccompConfig::default()
+        };
+        let set = RuleSet::with(&cfg).unwrap();
+        for name in ["open_tree_attr", "listns"] {
+            let name = name.to_owned();
+            assert!(!set.eperm.contains(&name), "{name} leaked into eperm");
+            assert!(!set.enosys.contains(&name), "{name} leaked into enosys");
+        }
+        assert!(
+            set.enosys_numbered
+                .contains(&("open_tree_attr".to_owned(), 467, Errno::Eperm))
+        );
+        assert!(
+            set.enosys_numbered
+                .contains(&("listns".to_owned(), 470, Errno::Enosys))
+        );
+        let built = build(&set, false).unwrap();
+        assert!(built.skipped.is_empty(), "{:?}", built.skipped);
     }
 
     /// The numbers really reach the program. They go in before the
@@ -1032,7 +1079,7 @@ mod tests {
                     RuleSet::default_set()
                         .enosys_numbered
                         .into_iter()
-                        .map(|(n, _)| n),
+                        .map(|(n, _, _)| n),
                 )
                 .chain(["ioctl".to_owned()])
                 .collect(),

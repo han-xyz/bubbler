@@ -7483,7 +7483,11 @@ fn a_filter_a_profile_emptied_is_as_loud_as_a_disabled_one() {
         .chain(&set.enosys)
         .filter(|n| syscall_number(n).is_some())
         .map(|n| format!("\"{n}\""))
-        .chain(set.enosys_numbered.iter().map(|(n, _)| format!("\"{n}\"")))
+        .chain(
+            set.enosys_numbered
+                .iter()
+                .map(|(n, _, _)| format!("\"{n}\"")),
+        )
         .collect();
     std::fs::write(
         tmp.path().join("data/bubbler/instances/t/config.kdl"),

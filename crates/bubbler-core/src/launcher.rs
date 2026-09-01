@@ -4882,7 +4882,11 @@ mod tests {
             .chain(&set.enosys)
             .filter(|n| syscall_number(n).is_some())
             .map(|n| format!("\"{n}\""))
-            .chain(set.enosys_numbered.iter().map(|(n, _)| format!("\"{n}\"")))
+            .chain(
+                set.enosys_numbered
+                    .iter()
+                    .map(|(n, _, _)| format!("\"{n}\"")),
+            )
             .collect();
         let tmp = tempfile::tempdir().unwrap();
         let e = env(tmp.path());
