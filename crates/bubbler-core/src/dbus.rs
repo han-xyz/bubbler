@@ -60,6 +60,15 @@ pub const BWRAPINFO: &str = "bwrapinfo.json";
 /// served on.
 const DESKTOP_PATH: &str = "/org/freedesktop/portal/desktop";
 
+/// Object path `Request` objects are created under, one per outstanding
+/// call; `xdg-dbus-proxy(1)` matches a rule's path exactly, so a rule at
+/// [`DESKTOP_PATH`] never matches one of these.
+const REQUEST_PATH: &str = "/org/freedesktop/portal/desktop/request/*";
+
+/// Object path `Session` objects are created under, one per open
+/// session; see [`REQUEST_PATH`].
+const SESSION_PATH: &str = "/org/freedesktop/portal/desktop/session/*";
+
 /// Interfaces the bare `portals` node opens on
 /// `org.freedesktop.portal.Desktop`: a file chooser, a link, a
 /// notification, a print job, the read-only monitors a toolkit polls.
@@ -67,12 +76,10 @@ const DESKTOP_PATH: &str = "/org/freedesktop/portal/desktop";
 /// an autostart entry, the location or a secret is a child instead —
 /// `--call=org.freedesktop.portal.*=*` granted all of them to anything
 /// that wanted a file chooser.
-// `Request` and `Session` are the reply and lifetime objects every
-// other interface answers on; without them a portal call is made and
-// never returns.
+// `Request` and `Session` are not here: their objects live under their
+// own subtrees, not at `DESKTOP_PATH`, so `portal_rules` gives them
+// rules of their own instead of routing them through this list.
 pub const PORTAL_SAFE: &[&str] = &[
-    "Request",
-    "Session",
     "FileChooser",
     "OpenURI",
     "Notification",
@@ -120,19 +127,32 @@ pub fn portal_rules(children: &[Portal]) -> Vec<String> {
     out.extend(ifaces().map(portal_call));
     out.push("--call=org.freedesktop.portal.Documents=*".to_owned());
     out.extend(ifaces().map(portal_broadcast));
-    // The two objects a portal answers on are per-call and per-session,
-    // so their signals arrive on a path of their own rather than on the
-    // desktop object.
-    out.push(
-        "--broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Request.*\
-         @/org/freedesktop/portal/desktop/request/*"
-            .to_owned(),
-    );
-    out.push(
-        "--broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Session.*\
-         @/org/freedesktop/portal/desktop/session/*"
-            .to_owned(),
-    );
+    // Request and Session are per-call and per-session objects, not
+    // interfaces on the desktop object itself, so both the calls a
+    // sandbox makes on them (Close, in practice) and the Response/
+    // signals they broadcast need a rule of their own rather than one
+    // that only ever matches DESKTOP_PATH.
+    for (iface, path) in [("Request", REQUEST_PATH), ("Session", SESSION_PATH)] {
+        out.push(format!(
+            "--call=org.freedesktop.portal.Desktop=org.freedesktop.portal.{iface}.*@{path}"
+        ));
+    }
+    for (iface, path) in [("Request", REQUEST_PATH), ("Session", SESSION_PATH)] {
+        out.push(format!(
+            "--broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.{iface}.*@{path}"
+        ));
+    }
+    // GDBusProxy and libportal both call Properties.Get/GetAll on the
+    // desktop object when a client constructs its proxy, before it makes
+    // any portal call at all; without these two every such client fails
+    // at construction. `Set` is left out: no portal property here is
+    // meant to be written from inside the sandbox.
+    out.push(format!(
+        "--call=org.freedesktop.portal.Desktop=org.freedesktop.DBus.Properties.Get@{DESKTOP_PATH}"
+    ));
+    out.push(format!(
+        "--call=org.freedesktop.portal.Desktop=org.freedesktop.DBus.Properties.GetAll@{DESKTOP_PATH}"
+    ));
     out
 }
 
@@ -995,12 +1015,45 @@ mod tests {
                     .to_owned()
             )
         );
-        // Gone: the wildcards, and a `--talk` of an interface that is
-        // not a bus name and so named nothing.
+        // Request and Session objects are per-call and per-session, never
+        // the desktop object itself, so a call needs the same subtree
+        // rule the broadcasts above already have — without it
+        // Request.Close()/Session.Close() are silently dropped.
+        for rule in [
+            "--call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Request.*\
+             @/org/freedesktop/portal/desktop/request/*",
+            "--call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Session.*\
+             @/org/freedesktop/portal/desktop/session/*",
+        ] {
+            assert!(rules.contains(&rule.to_owned()), "{rule}");
+        }
+        // GDBusProxy/libportal call Properties.Get(All) on the desktop
+        // object when a client constructs its proxy; without these two
+        // every GTK portal client breaks on the first property read.
+        for rule in [
+            "--call=org.freedesktop.portal.Desktop=org.freedesktop.DBus.Properties.Get\
+             @/org/freedesktop/portal/desktop",
+            "--call=org.freedesktop.portal.Desktop=org.freedesktop.DBus.Properties.GetAll\
+             @/org/freedesktop/portal/desktop",
+        ] {
+            assert!(rules.contains(&rule.to_owned()), "{rule}");
+        }
+        // Gone: the wildcards, a `--talk` of an interface that is not a
+        // bus name and so named nothing, and a Request/Session rule at
+        // the bare desktop path — no object of either kind is ever
+        // served there, so such a rule would match nothing bwrap sends.
         for gone in [
             "--talk=org.freedesktop.portal.FileChooser",
             "--call=org.freedesktop.portal.*=*",
             "--broadcast=org.freedesktop.portal.*=@/org/freedesktop/portal/*",
+            "--call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Request.*\
+             @/org/freedesktop/portal/desktop",
+            "--call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Session.*\
+             @/org/freedesktop/portal/desktop",
+            "--broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Request.*\
+             @/org/freedesktop/portal/desktop",
+            "--broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Session.*\
+             @/org/freedesktop/portal/desktop",
         ] {
             assert!(!rules.iter().any(|r| r == gone), "{gone}");
         }
@@ -1032,6 +1085,21 @@ mod tests {
                  @/org/freedesktop/portal/desktop",
             ]
         );
+        // A child adds interfaces; it does not touch the Request/Session
+        // subtree rules or the Properties rules, which are the same for
+        // every `portals` grant regardless of its children.
+        for rule in [
+            "--call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Request.*\
+             @/org/freedesktop/portal/desktop/request/*",
+            "--call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Session.*\
+             @/org/freedesktop/portal/desktop/session/*",
+            "--call=org.freedesktop.portal.Desktop=org.freedesktop.DBus.Properties.Get\
+             @/org/freedesktop/portal/desktop",
+            "--call=org.freedesktop.portal.Desktop=org.freedesktop.DBus.Properties.GetAll\
+             @/org/freedesktop/portal/desktop",
+        ] {
+            assert!(with.contains(&rule.to_owned()), "{rule}");
+        }
     }
 
     /// `camera` used to ride on the wildcard; with the wildcard gone it

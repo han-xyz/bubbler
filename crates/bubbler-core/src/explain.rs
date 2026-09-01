@@ -773,8 +773,6 @@ bwrap
   portals                         config.kdl:3  0 arguments
     rule-only: --talk=org.freedesktop.portal.Desktop
                --talk=org.freedesktop.portal.Documents
-               --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Request.*@/org/freedesktop/portal/desktop
-               --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Session.*@/org/freedesktop/portal/desktop
                --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.FileChooser.*@/org/freedesktop/portal/desktop
                --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.OpenURI.*@/org/freedesktop/portal/desktop
                --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Notification.*@/org/freedesktop/portal/desktop
@@ -791,8 +789,6 @@ bwrap
                --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Realtime.*@/org/freedesktop/portal/desktop
                --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.GameMode.*@/org/freedesktop/portal/desktop
                --call=org.freedesktop.portal.Documents=*
-               --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Request.*@/org/freedesktop/portal/desktop
-               --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Session.*@/org/freedesktop/portal/desktop
                --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.FileChooser.*@/org/freedesktop/portal/desktop
                --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.OpenURI.*@/org/freedesktop/portal/desktop
                --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Notification.*@/org/freedesktop/portal/desktop
@@ -808,8 +804,12 @@ bwrap
                --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.PowerProfileMonitor.*@/org/freedesktop/portal/desktop
                --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Realtime.*@/org/freedesktop/portal/desktop
                --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.GameMode.*@/org/freedesktop/portal/desktop
+               --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Request.*@/org/freedesktop/portal/desktop/request/*
+               --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Session.*@/org/freedesktop/portal/desktop/session/*
                --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Request.*@/org/freedesktop/portal/desktop/request/*
                --broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.Session.*@/org/freedesktop/portal/desktop/session/*
+               --call=org.freedesktop.portal.Desktop=org.freedesktop.DBus.Properties.Get@/org/freedesktop/portal/desktop
+               --call=org.freedesktop.portal.Desktop=org.freedesktop.DBus.Properties.GetAll@/org/freedesktop/portal/desktop
 
   notify                          config.kdl:4  0 arguments
     rule-only: --talk=org.freedesktop.Notifications
