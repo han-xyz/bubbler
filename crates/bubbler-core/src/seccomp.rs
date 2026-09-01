@@ -231,6 +231,10 @@ pub struct RuleSet {
     /// `ioctl` request numbers denied with `EPERM`, matched on the low 32
     /// bits of argument 1.
     pub ioctl_eperm: Vec<u32>,
+    /// Whether the hand-written prefix holds `personality` to
+    /// [`PERSONALITY_ALLOWED`]; off when `allow "personality"` is in the
+    /// profile.
+    pub personality: bool,
 }
 
 impl RuleSet {
@@ -252,6 +256,7 @@ impl RuleSet {
                 .map(|(name, nr)| ((*name).to_owned(), *nr))
                 .collect(),
             ioctl_eperm: DEFAULT_IOCTL_EPERM.to_vec(),
+            personality: true,
         }
     }
 
@@ -267,6 +272,9 @@ impl RuleSet {
             set.remove(name);
             if name == "ioctl" {
                 set.ioctl_eperm.clear();
+            }
+            if name == "personality" {
+                set.personality = false;
             }
         }
         for (name, errno) in &cfg.deny {
@@ -337,9 +345,18 @@ pub fn compile(set: &RuleSet, log: bool) -> Result<Option<Program>, LaunchError>
     if built.rules == 0 {
         return Ok(None);
     }
+    // The prefix goes out only together with libseccomp's program: it
+    // ends by falling into libseccomp's first instruction, so on its own
+    // it is not a filter the kernel would accept. A rule set that keeps
+    // the prefix and no rule at all is therefore no filter either.
+    let mut bytes = match set.personality {
+        true => personality_prefix(log),
+        false => Vec::new(),
+    };
+    bytes.extend(export(&built.filter)?);
     Ok(Some(Program {
         arches: ARCHES,
-        bytes: export(&built.filter)?,
+        bytes,
     }))
 }
 
@@ -449,6 +466,81 @@ fn export(filter: &ScmpFilterContext) -> Result<Vec<u8>, LaunchError> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).map_err(io)?;
     Ok(bytes)
+}
+
+/// The persona values a sandbox may set: `PER_LINUX`, `PER_LINUX32`,
+/// `UNAME26`, both together, and the query. Everything else — the
+/// `ADDR_NO_RANDOMIZE`, `READ_IMPLIES_EXEC` and `MMAP_PAGE_ZERO` that
+/// turn off an exploit mitigation among them — is `EPERM`. Values from
+/// `linux/personality.h`.
+pub const PERSONALITY_ALLOWED: [u32; 5] = [0x0, 0x8, 0x2_0000, 0x2_0008, 0xffff_ffff];
+
+/// `AUDIT_ARCH_X86_64` and `AUDIT_ARCH_I386` from `linux/audit.h`.
+const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+const AUDIT_ARCH_I386: u32 = 0x4000_0003;
+/// `__NR_personality` from `asm/unistd_64.h` and `asm/unistd_32.h`.
+const NR_PERSONALITY_X86_64: u32 = 135;
+const NR_PERSONALITY_I386: u32 = 136;
+/// Instruction codes from `linux/bpf_common.h`: `BPF_LD | BPF_W |
+/// BPF_ABS`, `BPF_JMP | BPF_JEQ | BPF_K`, `BPF_JMP | BPF_JA` and
+/// `BPF_RET | BPF_K`.
+const BPF_LD_W_ABS: u16 = 0x0020;
+const BPF_JEQ_K: u16 = 0x0015;
+const BPF_JA: u16 = 0x0005;
+const BPF_RET_K: u16 = 0x0006;
+/// Filter return values from `linux/seccomp.h`.
+const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+const SECCOMP_RET_LOG: u32 = 0x7ffc_0000;
+
+/// One `struct sock_filter` as its little-endian bytes.
+fn insn(code: u16, jt: u8, jf: u8, k: u32) -> [u8; 8] {
+    let mut b = [0u8; 8];
+    b[..2].copy_from_slice(&code.to_le_bytes());
+    b[2] = jt;
+    b[3] = jf;
+    b[4..].copy_from_slice(&k.to_le_bytes());
+    b
+}
+
+/// A cBPF block that returns `EPERM` (or logs) for `personality` with an
+/// argument outside [`PERSONALITY_ALLOWED`] and otherwise falls off its
+/// end, so it can be placed before libseccomp's program: cBPF jumps are
+/// relative and forward, so a block whose last instruction jumps to the
+/// one after it is a prefix of any program. libseccomp cannot express a
+/// per-argument allowlist in a default-allow filter — two comparisons on
+/// one argument are `EINVAL` and an `ALLOW` rule is `EACCES` — which is
+/// why this is written by hand.
+///
+/// Offsets are `struct seccomp_data` from `linux/seccomp.h`: `nr` 0,
+/// `arch` 4, `args[0]` 16, of which the low word is what the kernel
+/// reads, `personality` taking an `unsigned int`. The comment on each
+/// line is its index, and a jump from index `i` lands at `i + 1 + jt`.
+/// Where the filter carries no i386 the second branch never matches and
+/// the main program kills the foreign ABI after the prefix falls
+/// through.
+pub(crate) fn personality_prefix(log: bool) -> Vec<u8> {
+    let deny = match log {
+        true => SECCOMP_RET_LOG,
+        false => SECCOMP_RET_ERRNO | Errno::Eperm.raw() as u32,
+    };
+    let block = [
+        insn(BPF_LD_W_ABS, 0, 0, 4),                   // 0
+        insn(BPF_JEQ_K, 0, 2, AUDIT_ARCH_X86_64),      // 1 -> 2 | 4
+        insn(BPF_LD_W_ABS, 0, 0, 0),                   // 2
+        insn(BPF_JEQ_K, 3, 9, NR_PERSONALITY_X86_64),  // 3 -> 7 | 13
+        insn(BPF_JEQ_K, 0, 8, AUDIT_ARCH_I386),        // 4 -> 5 | 13
+        insn(BPF_LD_W_ABS, 0, 0, 0),                   // 5
+        insn(BPF_JEQ_K, 0, 6, NR_PERSONALITY_I386),    // 6 -> 7 | 13
+        insn(BPF_LD_W_ABS, 0, 0, 16),                  // 7
+        insn(BPF_JEQ_K, 4, 0, PERSONALITY_ALLOWED[0]), // 8 -> 13
+        insn(BPF_JEQ_K, 3, 0, PERSONALITY_ALLOWED[1]), // 9 -> 13
+        insn(BPF_JEQ_K, 2, 0, PERSONALITY_ALLOWED[2]), // 10 -> 13
+        insn(BPF_JEQ_K, 1, 0, PERSONALITY_ALLOWED[3]), // 11 -> 13
+        insn(BPF_JEQ_K, 0, 1, PERSONALITY_ALLOWED[4]), // 12 -> 13 | 14
+        insn(BPF_JA, 0, 0, 1),                         // 13 -> 15, libseccomp's first
+        insn(BPF_RET_K, 0, 0, deny),                   // 14
+    ];
+    block.concat()
 }
 
 fn failed(e: SeccompError) -> LaunchError {
@@ -729,13 +821,15 @@ mod tests {
             .collect()
     }
 
-    /// Instructions in the default filter. libseccomp emits a balanced
-    /// search tree over the syscall numbers of each architecture, so the
-    /// number is a measurement rather than a formula; it is pinned here
-    /// so that a rule added by accident, or an architecture dropped from
-    /// the filter, is a test failure.
+    /// Instructions in the default filter: the fifteen of
+    /// [`personality_prefix`] and libseccomp's 125. libseccomp emits a
+    /// balanced search tree over the syscall numbers of each
+    /// architecture, so its share is a measurement rather than a
+    /// formula; the total is pinned here so that a rule added by
+    /// accident, or an architecture dropped from the filter, is a test
+    /// failure.
     #[cfg(target_arch = "x86_64")]
-    const DEFAULT_LEN: usize = 125;
+    const DEFAULT_LEN: usize = 140;
 
     #[cfg(target_arch = "x86_64")]
     #[test]
@@ -749,7 +843,136 @@ mod tests {
     fn a_program_starts_with_the_architecture_check() {
         let program = compile(&RuleSet::default_set(), false).unwrap().unwrap();
         // BPF_LD | BPF_W | BPF_ABS of `seccomp_data.arch`, at offset 4.
+        assert_eq!(
+            instructions(&program.bytes)[personality_prefix(false).len() / 8],
+            (0x0020, 0, 0, 4)
+        );
+    }
+
+    /// The prefix is a closed block: every jump lands inside it or on
+    /// its end, it loads arch, nr and args[0], names the five allowed
+    /// personas and returns EPERM for anything else.
+    #[test]
+    fn the_personality_prefix_allows_five_values_and_falls_through() {
+        let insns = instructions(&personality_prefix(false));
+        let n = insns.len();
+        for (i, (code, jt, jf, _)) in insns.iter().enumerate() {
+            if code & 0x07 == 0x05 && *code != 0x0005 {
+                // BPF_JMP conditional: both targets inside or at the end.
+                assert!(
+                    i + 1 + *jt as usize <= n && i + 1 + *jf as usize <= n,
+                    "jump {i} leaves the block"
+                );
+            }
+        }
+        assert_eq!(insns[0], (0x0020, 0, 0, 4), "arch first");
+        assert!(insns.contains(&(0x0020, 0, 0, 0)), "nr loaded");
+        assert!(insns.contains(&(0x0020, 0, 0, 16)), "args[0] loaded");
+        for value in PERSONALITY_ALLOWED {
+            assert!(
+                insns.iter().any(|i| i.0 == 0x0015 && i.3 == value),
+                "no allow for {value:#x}"
+            );
+        }
+        // BPF_RET | BPF_K with SECCOMP_RET_ERRNO | EPERM.
+        assert!(insns.contains(&(0x0006, 0, 0, 0x0005_0001)));
+        assert!(
+            !insns.iter().any(|i| i.3 == 0x8000_0000),
+            "the prefix never kills"
+        );
+    }
+
+    #[test]
+    fn the_prefix_logs_instead_of_failing_when_asked() {
+        let insns = instructions(&personality_prefix(true));
+        assert!(insns.contains(&(0x0006, 0, 0, 0x7ffc_0000)));
+    }
+
+    /// The prefix run over a synthetic `struct seccomp_data`, answering
+    /// with the filter return value or `None` when the block fell
+    /// through to the instruction after it — which is where
+    /// libseccomp's program starts. This is what catches a miscounted
+    /// jump: the offsets are written out by hand, so nothing but
+    /// executing them proves they land where the comments say.
+    fn run_prefix(arch: u32, nr: u32, arg0: u64) -> Option<u32> {
+        let insns = instructions(&personality_prefix(false));
+        let mut data = [0u8; 64];
+        data[..4].copy_from_slice(&nr.to_le_bytes());
+        data[4..8].copy_from_slice(&arch.to_le_bytes());
+        data[16..24].copy_from_slice(&arg0.to_le_bytes());
+        let (mut pc, mut acc) = (0usize, 0u32);
+        while pc < insns.len() {
+            let (code, jt, jf, k) = insns[pc];
+            pc += 1;
+            match code {
+                0x0020 => {
+                    let at = k as usize;
+                    acc = u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
+                }
+                0x0015 => pc += usize::from(if acc == k { jt } else { jf }),
+                0x0005 => pc += k as usize,
+                0x0006 => return Some(k),
+                other => panic!("{other:#06x} is not one of the four the prefix uses"),
+            }
+        }
+        assert_eq!(pc, insns.len(), "a jump left the block");
+        None
+    }
+
+    /// Only `personality` is answered, and only the five allowed values
+    /// reach libseccomp's program. The kernel reads the argument as an
+    /// `unsigned int`, so a set high half is not a way past the
+    /// comparisons.
+    #[test]
+    fn the_prefix_denies_every_persona_outside_the_allowlist() {
+        for (arch, nr) in [(0xc000_003eu32, 135u32), (0x4000_0003, 136)] {
+            for value in PERSONALITY_ALLOWED {
+                assert_eq!(run_prefix(arch, nr, u64::from(value)), None, "{value:#x}");
+            }
+            // ADDR_NO_RANDOMIZE, READ_IMPLIES_EXEC, MMAP_PAGE_ZERO and an
+            // allowed persona with one more bit set.
+            for value in [0x4_0000u32, 0x40_0000, 0x10_0000, 0x9] {
+                assert_eq!(
+                    run_prefix(arch, nr, u64::from(value)),
+                    Some(0x0005_0001),
+                    "{value:#x}"
+                );
+            }
+            assert_eq!(
+                run_prefix(arch, nr, 0xdead_0000_0004_0000),
+                Some(0x0005_0001)
+            );
+            // Every other syscall falls through untouched.
+            assert_eq!(run_prefix(arch, 39, 0x4_0000), None);
+        }
+        // An architecture the block does not name is left to the main
+        // program, which kills a foreign ABI. AUDIT_ARCH_AARCH64.
+        assert_eq!(run_prefix(0xc000_00b7, 92, 0x4_0000), None);
+    }
+
+    /// The default program is the prefix followed by libseccomp's output.
+    #[test]
+    fn the_default_program_starts_with_the_personality_prefix() {
+        let program = compile(&RuleSet::default_set(), false).unwrap().unwrap();
+        let prefix = personality_prefix(false);
+        assert!(program.bytes.starts_with(&prefix));
+        assert_eq!(
+            instructions(&program.bytes)[prefix.len() / 8],
+            (0x0020, 0, 0, 4)
+        );
+    }
+
+    #[test]
+    fn allowing_personality_drops_the_prefix() {
+        let cfg = SeccompConfig {
+            allow: vec!["personality".to_owned()],
+            ..SeccompConfig::default()
+        };
+        let set = RuleSet::with(&cfg).unwrap();
+        assert!(!set.personality);
+        let program = compile(&set, false).unwrap().unwrap();
         assert_eq!(instructions(&program.bytes)[0], (0x0020, 0, 0, 4));
+        assert!(!program.bytes.starts_with(&personality_prefix(false)));
     }
 
     /// A caller from an ABI the filter does not carry is killed, so an
@@ -824,6 +1047,7 @@ mod tests {
             enosys: vec![],
             enosys_numbered: Vec::new(),
             ioctl_eperm: vec![],
+            personality: false,
         };
         assert_eq!(compile(&absent, false).unwrap(), None);
     }
@@ -848,6 +1072,7 @@ mod tests {
             enosys: vec![],
             enosys_numbered: Vec::new(),
             ioctl_eperm: DEFAULT_IOCTL_EPERM.to_vec(),
+            personality: false,
         };
         let insns = instructions(&compile(&set, false).unwrap().unwrap().bytes);
         assert!(
@@ -866,12 +1091,14 @@ mod tests {
             enosys: vec!["keyctl".to_owned()],
             enosys_numbered: Vec::new(),
             ioctl_eperm: vec![],
+            personality: false,
         };
         let one = RuleSet {
             eperm: vec!["keyctl".to_owned()],
             enosys: vec![],
             enosys_numbered: Vec::new(),
             ioctl_eperm: vec![],
+            personality: false,
         };
         assert_eq!(compile(&set, false).unwrap(), compile(&one, false).unwrap());
     }
@@ -886,6 +1113,7 @@ mod tests {
             enosys: vec![],
             enosys_numbered: Vec::new(),
             ioctl_eperm: vec![],
+            personality: false,
         };
         let built = build(&set, false).unwrap();
         assert_eq!(built.skipped, ["nosuchcall"]);
@@ -895,6 +1123,7 @@ mod tests {
             enosys: vec![],
             enosys_numbered: Vec::new(),
             ioctl_eperm: vec![],
+            personality: false,
         };
         assert_eq!(compile(&set, false).unwrap(), compile(&one, false).unwrap());
     }

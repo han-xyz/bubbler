@@ -7407,6 +7407,12 @@ probe = [
     # without the call answers ENOSYS too, which is what the rule makes
     # the answer everywhere.
     ("open_tree_attr", call(467, -1, 0, 0, 0)),
+    # The five allowed persona values go through the hand-written cBPF
+    # prefix and reach the kernel; every other value is EPERM. The query
+    # is 0xffffffff and returns the persona in force.
+    ("personality_query", call({personality}, 0xffffffff)),
+    ("personality_norandom", call({personality}, 0x40000)),
+    ("personality_linux32", call({personality}, 0x8)),
     ("tiocsti", ioctl(0x5412)),
     ("tioclinux", ioctl(0x541C)),
     ("getpid", call({getpid})),
@@ -7419,6 +7425,7 @@ report = "\n".join("%s %s" % p for p in probe)
         clone3 = nr("clone3"),
         io_uring_setup = nr("io_uring_setup"),
         pidfd_getfd = nr("pidfd_getfd"),
+        personality = nr("personality"),
         getpid = nr("getpid"),
     )
 }
@@ -7521,6 +7528,11 @@ fn real_bwrap_seccomp_denies_the_default_list_and_nothing_else() {
     assert_eq!(probed(&out, "open_tree_attr"), "ENOSYS", "{out}");
     assert_eq!(probed(&out, "tiocsti"), "EPERM", "{out}");
     assert_eq!(probed(&out, "tioclinux"), "EPERM", "{out}");
+    // `personality` itself is never denied: only the argument outside
+    // the allowlist is, which is what the prefix exists for.
+    assert_eq!(probed(&out, "personality_query"), "ok", "{out}");
+    assert_eq!(probed(&out, "personality_norandom"), "EPERM", "{out}");
+    assert_eq!(probed(&out, "personality_linux32"), "ok", "{out}");
     // A denylist: everything not named keeps working.
     assert_eq!(probed(&out, "getpid"), "ok", "{out}");
 }
@@ -7552,6 +7564,9 @@ fn real_bwrap_seccomp_disable_leaves_the_sandbox_unfiltered_and_says_so() {
     assert_ne!(probed(&out, "perf_event_open"), "EPERM", "{out}");
     assert_ne!(probed(&out, "clone3"), "ENOSYS", "{out}");
     assert_ne!(probed(&out, "tiocsti"), "EPERM", "{out}");
+    // The control for the personality allowlist: nothing but the prefix
+    // refuses `ADDR_NO_RANDOMIZE`, which needs no privilege of its own.
+    assert_ne!(probed(&out, "personality_norandom"), "EPERM", "{out}");
 }
 
 #[test]
