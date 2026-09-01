@@ -477,7 +477,7 @@ fn build_args_on<'a>(
         inst.config
             .services
             .iter()
-            .position(|s| *s == Service::Portals)
+            .position(|s| matches!(s, Service::Portals { .. }))
             .filter(|_| plan.as_ref().is_some_and(|p| p.portals)),
         inst.config
             .services

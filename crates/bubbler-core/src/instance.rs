@@ -208,7 +208,9 @@ fn grant_service(name: &str) -> Option<Service> {
         "pipewire" => Service::Pipewire,
         "pulseaudio" => Service::Pulseaudio,
         "dbus" => Service::Dbus { rules: Vec::new() },
-        "portals" => Service::Portals,
+        "portals" => Service::Portals {
+            children: Vec::new(),
+        },
         "notify" => Service::Notify,
         "tray" => Service::Tray,
         "a11y" => Service::A11y,

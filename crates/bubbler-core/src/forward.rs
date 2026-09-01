@@ -977,7 +977,9 @@ mod tests {
                     path: "/srv/data".into(),
                     mode: ShareMode::ReadWrite,
                 },
-                Service::Portals,
+                Service::Portals {
+                    children: Vec::new(),
+                },
             ],
             ..InstanceConfig::default()
         }

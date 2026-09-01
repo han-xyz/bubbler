@@ -136,7 +136,7 @@ fn carries_rules(s: &Service) -> bool {
         s,
         Service::Dbus { .. }
             | Service::SystemBus { .. }
-            | Service::Portals
+            | Service::Portals { .. }
             | Service::Notify
             | Service::Tray
             | Service::Mpris { .. }

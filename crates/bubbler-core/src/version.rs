@@ -144,7 +144,10 @@ pub fn warnings(bwrap: Version, proxy: Version, services: &[Service]) -> Vec<Str
     let bus = services.iter().any(|s| {
         matches!(
             s,
-            Service::Dbus { .. } | Service::SystemBus { .. } | Service::Portals | Service::A11y
+            Service::Dbus { .. }
+                | Service::SystemBus { .. }
+                | Service::Portals { .. }
+                | Service::A11y
         )
     });
     if bus && proxy.below(PROXY_FLOOR) {
@@ -249,13 +252,24 @@ mod tests {
         assert!(w[0].contains("upgrade to 0.12.0"), "{w:?}");
 
         // Current tools, nothing to say.
-        assert!(warnings(new, proxy_new, &[Service::Portals]).is_empty());
+        assert!(
+            warnings(
+                new,
+                proxy_new,
+                &[Service::Portals {
+                    children: Vec::new()
+                }]
+            )
+            .is_empty()
+        );
 
         // The proxy gate needs a node that starts the proxy.
         assert!(warnings(new, proxy_old, &[Service::Dri]).is_empty());
         for node in [
             Service::Dbus { rules: Vec::new() },
-            Service::Portals,
+            Service::Portals {
+                children: Vec::new(),
+            },
             Service::A11y,
             Service::SystemBus { rules: Vec::new() },
         ] {

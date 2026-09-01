@@ -189,14 +189,16 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
         return None;
     }
     let a11y = services.iter().position(|s| *s == Service::A11y);
-    let portals = services.contains(&Service::Portals);
+    let portals = services
+        .iter()
+        .any(|s| matches!(s, Service::Portals { .. }));
     let session = session.map(|(node, explicit)| {
         let mut rules = explicit_rules(explicit, node);
         // Bundles are sets of session-bus rules; the system bus never
         // gets one, and its own list is the whole confinement.
         for (i, s) in services.iter().enumerate() {
             match s {
-                Service::Portals => {
+                Service::Portals { .. } => {
                     for r in PORTAL_RULES {
                         push(&mut rules, (*r).to_owned(), i);
                     }
@@ -853,7 +855,9 @@ mod tests {
         let p = plan(
             &[
                 Service::Dbus { rules: vec![] },
-                Service::Portals,
+                Service::Portals {
+                    children: Vec::new(),
+                },
                 Service::Notify,
                 Service::Mpris {
                     name: "firefox.*".into(),

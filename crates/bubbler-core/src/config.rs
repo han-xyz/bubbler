@@ -9,7 +9,7 @@ use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
-use kdl::{KdlDocument, KdlNode};
+use kdl::{KdlDocument, KdlIdentifier, KdlNode};
 
 pub use crate::error::{ConfigError, ReadError};
 pub use crate::network::{
@@ -430,6 +430,93 @@ impl BusRule {
     }
 }
 
+/// One optional group of portal interfaces, written as a child of the
+/// `portals` node. The bare node grants a safe set — a file chooser, a
+/// notification, a print dialog — and each child adds one group on top
+/// of it, because `--call=org.freedesktop.portal.*=*` would grant screen
+/// capture, input injection, autostart entries and the login secret to
+/// every sandbox that wanted a file chooser.
+///
+/// `camera` is a child too, but it parses to [`Service::Camera`]: it was
+/// a top-level node before the split and stays one, so the two spellings
+/// are the same grant and writing both is a duplicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Portal {
+    /// ScreenCast and Screenshot.
+    ScreenCast,
+    /// RemoteDesktop and InputCapture.
+    RemoteDesktop,
+    /// GlobalShortcuts.
+    GlobalShortcuts,
+    /// Background and DynamicLauncher.
+    Background,
+    /// Location.
+    Location,
+    /// Secret.
+    Secrets,
+}
+
+impl Portal {
+    /// Every child, in the order the manual and the man page list them:
+    /// widest first, so a reader meets the expensive ones before the
+    /// narrow ones.
+    pub const ALL: &'static [Portal] = &[
+        Portal::ScreenCast,
+        Portal::RemoteDesktop,
+        Portal::GlobalShortcuts,
+        Portal::Background,
+        Portal::Location,
+        Portal::Secrets,
+    ];
+
+    /// The KDL child node it is written as.
+    pub fn node_name(self) -> &'static str {
+        match self {
+            Self::ScreenCast => "screencast",
+            Self::RemoteDesktop => "remote-desktop",
+            Self::GlobalShortcuts => "global-shortcuts",
+            Self::Background => "background",
+            Self::Location => "location",
+            Self::Secrets => "secrets",
+        }
+    }
+
+    /// The `org.freedesktop.portal.<Iface>` interfaces the child opens
+    /// on `org.freedesktop.portal.Desktop`, which is what
+    /// [`crate::dbus`] turns into `--call` and `--broadcast` rules.
+    pub fn interfaces(self) -> &'static [&'static str] {
+        match self {
+            Self::ScreenCast => &["ScreenCast", "Screenshot"],
+            Self::RemoteDesktop => &["RemoteDesktop", "InputCapture"],
+            Self::GlobalShortcuts => &["GlobalShortcuts"],
+            Self::Background => &["Background", "DynamicLauncher"],
+            Self::Location => &["Location"],
+            Self::Secrets => &["Secret"],
+        }
+    }
+
+    /// What granting it costs, in one line: what `--explain` prints
+    /// under the `portals` group and the editor prints beside the node.
+    pub fn cost_line(self) -> &'static str {
+        match self {
+            Self::ScreenCast => "capture the screen after a portal dialog",
+            Self::RemoteDesktop => {
+                "inject input into the whole session; grants persist until revoked"
+            }
+            Self::GlobalShortcuts => "bindings fire while unfocused and persist",
+            Self::Background => "write host autostart and launcher entries",
+            Self::Location => "read the host's location",
+            Self::Secrets => "read this app's portal secret",
+        }
+    }
+
+    /// The child `name` names, if it is one. `camera` is deliberately
+    /// not here: it parses to [`Service::Camera`].
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|p| p.node_name() == name)
+    }
+}
+
 /// One granted resource. Order in the config file is irrelevant; the
 /// builder's phases decide argv order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -491,7 +578,12 @@ pub enum Service {
     },
     /// The XDG desktop portal rule bundle plus the `/.flatpak-info` file
     /// portals read to identify the sandbox. Requires [`Service::Dbus`].
-    Portals,
+    Portals {
+        /// Interface groups granted on top of the safe set, in file
+        /// order. Each is a grant of its own, so two layers granting
+        /// different children add up rather than one replacing the other.
+        children: Vec<Portal>,
+    },
     /// Talk to `org.freedesktop.Notifications`. Requires [`Service::Dbus`].
     Notify,
     /// Talk to `org.kde.StatusNotifierWatcher`, which is what registering
@@ -582,7 +674,7 @@ impl Service {
             Self::EtcShare { .. } => "etc-share",
             Self::Dbus { .. } => "dbus",
             Self::SystemBus { .. } => "system-bus",
-            Self::Portals => "portals",
+            Self::Portals { .. } => "portals",
             Self::Notify => "notify",
             Self::Tray => "tray",
             Self::Gamepad { .. } => "gamepad",
@@ -669,10 +761,10 @@ impl Node {
             Service::Camera { nodes } => *nodes,
             Service::Gamepad { hidraw, uinput } => *hidraw || *uinput,
             Service::Dbus { rules } | Service::SystemBus { rules } => !rules.is_empty(),
+            Service::Portals { children } => !children.is_empty(),
             Service::Dri
             | Service::Pipewire
             | Service::Pulseaudio
-            | Service::Portals
             | Service::Notify
             | Service::Tray
             | Service::Hidraw
@@ -1179,76 +1271,80 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
             includes.push(parse_include(node)?);
             continue;
         }
-        match parse_node(node, profile)? {
-            Node::Service(svc) => grant(&mut cfg.services, svc)?,
-            Node::Env(pairs) => {
-                for (key, value) in pairs {
-                    if cfg.env.iter().any(|(held, _)| *held == key) {
-                        return Err(ConfigError::Duplicate(key));
+        for (parsed, offset) in parse_node(node, profile)? {
+            let name = parsed.name();
+            match parsed {
+                Node::Service(svc) => grant(&mut cfg.services, svc)?,
+                Node::Env(pairs) => {
+                    for (key, value) in pairs {
+                        if cfg.env.iter().any(|(held, _)| *held == key) {
+                            return Err(ConfigError::Duplicate(key));
+                        }
+                        cfg.env.push((key, value));
                     }
-                    cfg.env.push((key, value));
                 }
-            }
-            Node::LintAllow(allows) => {
-                for allow in allows {
-                    if cfg.lint_allows.iter().any(|a| a.id == allow.id) {
-                        return Err(ConfigError::Duplicate(format!("{name} \"{}\"", allow.id)));
+                Node::LintAllow(allows) => {
+                    for allow in allows {
+                        if cfg.lint_allows.iter().any(|a| a.id == allow.id) {
+                            return Err(ConfigError::Duplicate(format!("{name} \"{}\"", allow.id)));
+                        }
+                        cfg.lint_allows.push(allow);
                     }
-                    cfg.lint_allows.push(allow);
+                }
+                Node::Tmp(size) => {
+                    if cfg.tmp.is_some() {
+                        return Err(ConfigError::Duplicate(name.to_owned()));
+                    }
+                    cfg.tmp = Some(size);
+                }
+                Node::Tty(mode) => {
+                    if seen_tty {
+                        return Err(ConfigError::Duplicate(name.to_owned()));
+                    }
+                    seen_tty = true;
+                    cfg.tty = mode;
+                }
+                Node::Userns(mode) => {
+                    if seen_userns {
+                        return Err(ConfigError::Duplicate(name.to_owned()));
+                    }
+                    seen_userns = true;
+                    cfg.userns = mode;
+                }
+                Node::Seccomp(seccomp) => {
+                    if seen_seccomp {
+                        return Err(ConfigError::Duplicate(name.to_owned()));
+                    }
+                    seen_seccomp = true;
+                    cfg.seccomp = seccomp;
+                }
+                Node::Desktop(entry) => {
+                    if cfg.desktop.is_some() {
+                        return Err(ConfigError::Duplicate(name.to_owned()));
+                    }
+                    cfg.desktop = Some(entry);
+                }
+                Node::Command(argv) => {
+                    if cfg.command.is_some() {
+                        return Err(ConfigError::Duplicate(name.to_owned()));
+                    }
+                    cfg.command = Some(argv);
                 }
             }
-            Node::Tmp(size) => {
-                if cfg.tmp.is_some() {
-                    return Err(ConfigError::Duplicate(name.to_owned()));
+            // What a node granted is counted rather than recorded per arm,
+            // so a node added to the match above is placed without being
+            // listed a second time here; only the two that grant nothing
+            // are named.
+            let grew = lines.services.len() < cfg.services.len() || lines.env.len() < cfg.env.len();
+            if grew || matches!(name, "userns" | "seccomp") {
+                let line = line_at(text, offset);
+                lines.services.resize(cfg.services.len(), line);
+                lines.env.resize(cfg.env.len(), line);
+                match name {
+                    "userns" => lines.userns = line,
+                    "seccomp" => lines.seccomp = line,
+                    _ => {}
                 }
-                cfg.tmp = Some(size);
-            }
-            Node::Tty(mode) => {
-                if seen_tty {
-                    return Err(ConfigError::Duplicate(name.to_owned()));
-                }
-                seen_tty = true;
-                cfg.tty = mode;
-            }
-            Node::Userns(mode) => {
-                if seen_userns {
-                    return Err(ConfigError::Duplicate(name.to_owned()));
-                }
-                seen_userns = true;
-                cfg.userns = mode;
-            }
-            Node::Seccomp(seccomp) => {
-                if seen_seccomp {
-                    return Err(ConfigError::Duplicate(name.to_owned()));
-                }
-                seen_seccomp = true;
-                cfg.seccomp = seccomp;
-            }
-            Node::Desktop(entry) => {
-                if cfg.desktop.is_some() {
-                    return Err(ConfigError::Duplicate(name.to_owned()));
-                }
-                cfg.desktop = Some(entry);
-            }
-            Node::Command(argv) => {
-                if cfg.command.is_some() {
-                    return Err(ConfigError::Duplicate(name.to_owned()));
-                }
-                cfg.command = Some(argv);
-            }
-        }
-        // What a node granted is counted rather than recorded per arm, so
-        // a node added to the match above is placed without being listed
-        // a second time here; only the two that grant nothing are named.
-        let grew = lines.services.len() < cfg.services.len() || lines.env.len() < cfg.env.len();
-        if grew || matches!(name, "userns" | "seccomp") {
-            let line = line_at(text, node.span().offset());
-            lines.services.resize(cfg.services.len(), line);
-            lines.env.resize(cfg.env.len(), line);
-            match name {
-                "userns" => lines.userns = line,
-                "seccomp" => lines.seccomp = line,
-                _ => {}
             }
         }
     }
@@ -1303,12 +1399,107 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
     ))
 }
 
+/// One top-level node as everything it grants, each with the byte offset
+/// of the text it was written at. Almost every node grants one thing and
+/// is written on one line; a `portals` block grants one thing per child,
+/// and a reader — `--explain`'s line numbers, the linter's positions —
+/// has to be able to point at the child rather than at the block above
+/// it.
+pub(crate) fn parse_node(node: &KdlNode, profile: bool) -> Result<Vec<(Node, usize)>, ConfigError> {
+    if node.name().value() == "portals" && node.children().is_some() {
+        let (portals, camera) = parse_portals(node)?;
+        let at = node.name().span().offset();
+        let mut out = vec![(Node::Service(portals), at)];
+        if let Some((camera, offset)) = camera {
+            out.push((Node::Service(camera), offset));
+        }
+        return Ok(out);
+    }
+    Ok(vec![(
+        parse_one(node, profile)?,
+        node.name().span().offset(),
+    )])
+}
+
+/// The `portals` node: the bundle with its children, and separately the
+/// `camera` grant a `camera` child writes, with the offset of that child
+/// so a duplicate points at the line that wrote it. A bare node has no
+/// children and no camera.
+fn parse_portals(node: &KdlNode) -> Result<(Service, Option<(Service, usize)>), ConfigError> {
+    // Repeated here and not left to `parse_one`: a block is taken by
+    // `parse_node` before `parse_one` runs, so this is the only place a
+    // type annotation on a `portals` block is seen.
+    reject_types(node)?;
+    reject_arguments(node)?;
+    let Some(kids) = node.children() else {
+        return Ok((
+            Service::Portals {
+                children: Vec::new(),
+            },
+            None,
+        ));
+    };
+    let mut children: Vec<Portal> = Vec::new();
+    let mut camera: Option<(Service, usize)> = None;
+    for child in kids.nodes() {
+        reject_types(child)?;
+        let name = child.name().value();
+        if name == "camera" {
+            if camera.is_some() {
+                return Err(ConfigError::Duplicate(name.to_owned()));
+            }
+            // Parsed by the node's own parser, on a line-form node built
+            // from the child, so `nodes=#true` and every error it can
+            // raise are the top-level node's exactly.
+            camera = Some((
+                parse_camera(&line_form("camera", child))?,
+                child.name().span().offset(),
+            ));
+            continue;
+        }
+        let Some(portal) = Portal::from_name(name) else {
+            let named: Vec<&str> = Portal::ALL.iter().map(|p| p.node_name()).collect();
+            return Err(bad(
+                node,
+                &format!(
+                    "`{name}` is not a portal; the children are {} and camera",
+                    named.join(", ")
+                ),
+            ));
+        };
+        if !child.entries().is_empty() || child.children().is_some() {
+            return Err(bad(
+                node,
+                &format!("`{name}` takes no arguments, properties or children"),
+            ));
+        }
+        if children.contains(&portal) {
+            return Err(ConfigError::Duplicate(name.to_owned()));
+        }
+        children.push(portal);
+    }
+    Ok((Service::Portals { children }, camera))
+}
+
+/// `child` as the line-form node `name` would have been written as: the
+/// child's name becomes the first argument only where the caller asks
+/// for it, so this one keeps the entries and children as they are and
+/// only renames the node. The name and node spans stay the child's, so
+/// an error or a line number points where the text is.
+fn line_form(name: &str, child: &KdlNode) -> KdlNode {
+    let mut line = child.clone();
+    let mut ident = KdlIdentifier::from(name);
+    ident.set_span(child.name().span());
+    line.set_name(ident);
+    line
+}
+
 /// One top-level node, whatever kind it is, with none of the checks that
 /// need the rest of the file: no duplicate, no `portals` needs `dbus`.
 /// An enabled node goes through here and then through those checks; a
 /// disabled one (`/-…`) goes through here alone, so a line the editor
 /// turned off is still a line bubbler would have read.
-pub(crate) fn parse_node(node: &KdlNode, profile: bool) -> Result<Node, ConfigError> {
+pub(crate) fn parse_one(node: &KdlNode, profile: bool) -> Result<Node, ConfigError> {
     let name = node.name().value();
     reject_types(node)?;
     // Resolved against the table rather than by falling off the end
@@ -1318,14 +1509,13 @@ pub(crate) fn parse_node(node: &KdlNode, profile: bool) -> Result<Node, ConfigEr
         return Err(ConfigError::UnknownNode(name.to_owned()));
     }
     Ok(match name {
-        "dri" | "pipewire" | "pulseaudio" | "portals" | "notify" | "tray" | "hidraw" | "a11y"
+        "dri" | "pipewire" | "pulseaudio" | "notify" | "tray" | "hidraw" | "a11y"
         | "input-method" => {
             reject_entries(node)?;
             Node::Service(match name {
                 "dri" => Service::Dri,
                 "pipewire" => Service::Pipewire,
                 "pulseaudio" => Service::Pulseaudio,
-                "portals" => Service::Portals,
                 "notify" => Service::Notify,
                 "tray" => Service::Tray,
                 "hidraw" => Service::Hidraw,
@@ -1349,6 +1539,15 @@ pub(crate) fn parse_node(node: &KdlNode, profile: bool) -> Result<Node, ConfigEr
         "app-runtime" => {
             let (id, mode) = parse_share(node, "id", validate_app_id)?;
             Node::Service(Service::AppRuntime { id, mode })
+        }
+        "portals" => {
+            let (portals, camera) = parse_portals(node)?;
+            // Only `parse_node` above reaches a `portals` node holding a
+            // `camera` child, and it takes the camera itself: one `Node`
+            // has nowhere to put a second grant, so a caller arriving
+            // here with one would drop it.
+            debug_assert!(camera.is_none(), "a portals block goes through parse_node");
+            return Ok(Node::Service(portals));
         }
         "etc-share" => Node::Service(parse_etc_share(node)?),
         "dbus" => Node::Service(parse_dbus(node)?),
@@ -1417,6 +1616,9 @@ fn grant(held: &mut Vec<Service>, svc: Service) -> Result<(), ConfigError> {
         Service::Dbus { .. } => held.iter().any(|s| matches!(s, Service::Dbus { .. })),
         Service::SystemBus { .. } => held.iter().any(|s| matches!(s, Service::SystemBus { .. })),
         Service::Mpris { .. } => held.iter().any(|s| matches!(s, Service::Mpris { .. })),
+        // A second `portals` node would leave which set of children
+        // applies to file order.
+        Service::Portals { .. } => held.iter().any(|s| matches!(s, Service::Portals { .. })),
         // The rest carry nothing a second node could differ in, so an
         // equal grant is the same grant.
         same => held.contains(same),
@@ -1522,11 +1724,12 @@ fn disabled_in(text: &str, profile: bool, at: Counts) -> Result<Vec<Disabled>, C
     let doc = parse_document(&bare)?;
     let mut out = Vec::new();
     for node in doc.nodes() {
-        let node = parse_node(node, profile)?;
-        out.push(Disabled {
-            before: at.before(&node),
-            node,
-        });
+        for (node, _) in parse_node(node, profile)? {
+            out.push(Disabled {
+                before: at.before(&node),
+                node,
+            });
+        }
     }
     Ok(out)
 }
@@ -1632,7 +1835,7 @@ fn bundle_without_dbus(services: &[Service]) -> Option<&'static str> {
         return None;
     }
     services.iter().find_map(|s| match s {
-        Service::Portals => Some("portals"),
+        Service::Portals { .. } => Some("portals"),
         Service::Notify => Some("notify"),
         Service::Tray => Some("tray"),
         Service::Mpris { .. } => Some("mpris"),
@@ -1649,7 +1852,9 @@ fn bundle_without_dbus(services: &[Service]) -> Option<&'static str> {
 /// every unsandboxed process on the machine shares, not this instance's.
 fn camera_without_portals(services: &[Service]) -> bool {
     services.iter().any(|s| matches!(s, Service::Camera { .. }))
-        && !services.contains(&Service::Portals)
+        && !services
+            .iter()
+            .any(|s| matches!(s, Service::Portals { .. }))
 }
 
 /// Whether a nested `x11` is granted without what the server it starts
@@ -4450,7 +4655,11 @@ command "b""#
         )
         .unwrap();
         assert!(matches!(&cfg.services[0], Service::Dbus { rules } if rules.len() == 4));
-        assert!(cfg.services.contains(&Service::Portals));
+        assert!(
+            cfg.services
+                .iter()
+                .any(|s| matches!(s, Service::Portals { .. }))
+        );
         assert!(cfg.services.contains(&Service::Notify));
         assert!(cfg.services.contains(&Service::Mpris {
             name: "firefox.*".into()
@@ -5389,7 +5598,10 @@ command "b""#
     /// The one node `text` writes, parsed the way a disabled line is.
     fn one_node(text: &str) -> Node {
         let doc = parse_document(text).unwrap();
-        parse_node(doc.nodes().first().unwrap(), true).unwrap()
+        parse_node(doc.nodes().first().unwrap(), true)
+            .unwrap()
+            .remove(0)
+            .0
     }
 
     #[test]
@@ -6122,5 +6334,114 @@ command "b""#
                 "{text:?}"
             );
         }
+    }
+
+    /// `portals { … }` grants the bare bundle plus each named child, and
+    /// a child is the same grant however the file spells it.
+    #[test]
+    fn portal_children_are_grants_of_their_own() {
+        let cfg = parse("dbus\nportals {\n    screencast\n    location\n}").unwrap();
+        assert_eq!(
+            cfg.services,
+            vec![
+                Service::Dbus { rules: Vec::new() },
+                Service::Portals {
+                    children: vec![Portal::ScreenCast, Portal::Location]
+                }
+            ]
+        );
+        // Bare `portals` is the safe set and no child.
+        let cfg = parse("dbus\nportals").unwrap();
+        assert_eq!(
+            cfg.services,
+            vec![
+                Service::Dbus { rules: Vec::new() },
+                Service::Portals {
+                    children: Vec::new()
+                }
+            ]
+        );
+    }
+
+    /// `camera` in the block is the same `Service::Camera` the top-level
+    /// node parses to, so writing both is one grant written twice.
+    #[test]
+    fn a_camera_child_is_the_camera_node() {
+        let block = parse("dbus\nportals {\n    camera\n}").unwrap();
+        let line = parse("dbus\nportals\ncamera").unwrap();
+        assert_eq!(block.services, line.services);
+        assert!(block.services.contains(&Service::Camera { nodes: false }));
+        // The property the line form takes is the child's too.
+        let cfg = parse("dbus\nportals {\n    camera nodes=#true\n}").unwrap();
+        assert!(cfg.services.contains(&Service::Camera { nodes: true }));
+        // Both spellings at once is one grant twice.
+        assert!(matches!(
+            parse("dbus\nportals {\n    camera\n}\ncamera"),
+            Err(ConfigError::Duplicate(n)) if n == "camera"
+        ));
+    }
+
+    /// What the block refuses: a name that is not a portal, a child
+    /// carrying anything, and the same child twice.
+    #[test]
+    fn a_portals_block_refuses_what_it_cannot_grant() {
+        assert!(matches!(
+            parse("dbus\nportals {\n    teleport\n}"),
+            Err(ConfigError::BadArgument { node, reason })
+                if node == "portals" && reason.starts_with("`teleport` is not a portal")
+        ));
+        assert!(matches!(
+            parse("dbus\nportals {\n    screencast \"yes\"\n}"),
+            Err(ConfigError::BadArgument { node, reason })
+                if node == "portals"
+                    && reason == "`screencast` takes no arguments, properties or children"
+        ));
+        assert!(matches!(
+            parse("dbus\nportals {\n    screencast\n    screencast\n}"),
+            Err(ConfigError::Duplicate(n)) if n == "screencast"
+        ));
+        // A second `portals` node is a duplicate as it always was.
+        assert!(matches!(
+            parse("dbus\nportals\nportals { screencast }"),
+            Err(ConfigError::Duplicate(n)) if n == "portals"
+        ));
+    }
+
+    /// A child grants nothing without the node that carries it, and the
+    /// node grants nothing without the bus that carries it.
+    #[test]
+    fn a_portal_child_needs_the_bus_under_it() {
+        assert!(matches!(
+            parse("portals { screencast }"),
+            Err(ConfigError::BadArgument { node, reason })
+                if node == "portals" && reason == "requires dbus"
+        ));
+        // `screencast` is not a top-level node: no `<child>-without-portals`
+        // check is needed, because a child cannot be written without it.
+        assert!(matches!(
+            parse("screencast"),
+            Err(ConfigError::UnknownNode(n)) if n == "screencast"
+        ));
+    }
+
+    /// Each child names the interfaces it opens and the one line the
+    /// editor and `--explain` show as its cost.
+    #[test]
+    fn every_portal_child_is_named_described_and_looked_up() {
+        for p in Portal::ALL {
+            assert_eq!(Portal::from_name(p.node_name()), Some(*p), "{p:?}");
+            assert!(!p.interfaces().is_empty(), "{p:?}");
+            assert!(!p.cost_line().is_empty(), "{p:?}");
+            assert!(!p.cost_line().contains('\n'), "{p:?}");
+        }
+        assert_eq!(Portal::from_name("camera"), None);
+        assert_eq!(
+            Portal::ScreenCast.interfaces(),
+            ["ScreenCast", "Screenshot"]
+        );
+        assert_eq!(
+            Portal::ScreenCast.cost_line(),
+            "capture the screen after a portal dialog"
+        );
     }
 }

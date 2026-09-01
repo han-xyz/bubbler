@@ -232,7 +232,17 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
         Service::Dri => "dri".to_owned(),
         Service::Pipewire => "pipewire".to_owned(),
         Service::Pulseaudio => "pulseaudio".to_owned(),
-        Service::Portals => "portals".to_owned(),
+        Service::Portals { children } => {
+            if children.is_empty() {
+                return Ok("portals".to_owned());
+            }
+            let mut node = String::from("portals {\n");
+            for child in children {
+                node.push_str(&format!("    {}\n", child.node_name()));
+            }
+            node.push('}');
+            node
+        }
         Service::Notify => "notify".to_owned(),
         Service::Tray => "tray".to_owned(),
         Service::A11y => "a11y".to_owned(),
@@ -1184,7 +1194,10 @@ mod tests {
             "command \"true\" \"--now\"",
         ] {
             let doc = crate::config::parse_document(text).unwrap();
-            let parsed = crate::config::parse_node(doc.nodes().first().unwrap(), false).unwrap();
+            let parsed = crate::config::parse_node(doc.nodes().first().unwrap(), false)
+                .unwrap()
+                .remove(0)
+                .0;
             assert_eq!(node(&parsed).unwrap(), text);
         }
     }
@@ -1210,5 +1223,18 @@ mod tests {
         ] {
             assert!(super::node(&node).is_err(), "{node:?}");
         }
+    }
+
+    /// A `portals` node with children is written as the block it was
+    /// read as, and reads back the same.
+    #[test]
+    fn a_portals_block_round_trips() {
+        let cfg = crate::config::parse("dbus\nportals {\n    screencast\n    secrets\n}").unwrap();
+        let text = render(&cfg).unwrap();
+        assert_eq!(text, "dbus\nportals {\n    screencast\n    secrets\n}\n");
+        assert_eq!(crate::config::parse(&text).unwrap(), cfg);
+        // Without children it stays the bare node it was.
+        let bare = crate::config::parse("dbus\nportals").unwrap();
+        assert_eq!(render(&bare).unwrap(), "dbus\nportals\n");
     }
 }

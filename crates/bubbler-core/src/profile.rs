@@ -729,6 +729,24 @@ impl Merged {
                     return Ok(());
                 }
             }
+            Service::Portals { children } => {
+                if let Some((held, held_src)) =
+                    self.services.iter_mut().find_map(|(s, src)| match s {
+                        Service::Portals { children: held } => Some((held, src)),
+                        _ => None,
+                    })
+                {
+                    // Each child is a grant of its own, so they add up
+                    // rather than the last layer deciding the set.
+                    for c in children {
+                        if !held.contains(c) {
+                            held.push(*c);
+                        }
+                    }
+                    *held_src = src.clone();
+                    return Ok(());
+                }
+            }
             Service::Camera { nodes } => {
                 if let Some((held_nodes, held_src)) =
                     self.services.iter_mut().find_map(|(s, src)| match s {
@@ -793,7 +811,6 @@ impl Merged {
             Service::Dri
             | Service::Pipewire
             | Service::Pulseaudio
-            | Service::Portals
             | Service::Notify
             | Service::Tray
             | Service::A11y
@@ -1164,7 +1181,12 @@ mod tests {
         // `portals` would write /.flatpak-info, which Steam's own runtime
         // reads as being the unofficial Steam Flatpak: it then refuses to
         // start without a flatpak-portal service to talk to.
-        assert!(!steam.services.contains(&Service::Portals));
+        assert!(
+            !steam
+                .services
+                .iter()
+                .any(|s| matches!(s, Service::Portals { .. }))
+        );
         // ~/.steam is a directory of absolute symlinks into the host home:
         // shared, every one of them dangles inside and the account name
         // the synthetic passwd hides leaks in with them.
@@ -1241,7 +1263,9 @@ mod tests {
                 Service::Dri,
                 network(),
                 Service::Dbus { rules: Vec::new() },
-                Service::Portals,
+                Service::Portals {
+                    children: Vec::new(),
+                },
                 home_share("Projects", ShareMode::ReadWrite),
             ]
         );
@@ -1289,7 +1313,9 @@ mod tests {
                 Service::Pulseaudio,
                 network(),
                 Service::Dbus { rules: Vec::new() },
-                Service::Portals,
+                Service::Portals {
+                    children: Vec::new(),
+                },
                 home_share("Downloads", ShareMode::ReadWrite),
             ]
         );

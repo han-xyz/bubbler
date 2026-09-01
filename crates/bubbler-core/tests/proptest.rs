@@ -12,8 +12,8 @@ use std::str::FromStr;
 
 use bubbler_core::config::{
     AllowOut, BusRule, Cidr, Disabled, Errno, InstanceConfig, LintAllow, NetworkConfig,
-    NetworkMode, Node, Outbound, Proto, SeccompConfig, Service, ShareMode, TmpSize, TtyMode,
-    Userns, WaylandMode, X11Mode,
+    NetworkMode, Node, Outbound, Portal, Proto, SeccompConfig, Service, ShareMode, TmpSize,
+    TtyMode, Userns, WaylandMode, X11Mode,
 };
 use bubbler_core::env::{DEFAULT_DATA_DIRS, Env};
 use bubbler_core::error::{DesktopError, ProfileError};
@@ -196,7 +196,10 @@ fn bus_services() -> impl Strategy<Value = Vec<Service>> {
     (
         prop::option::of(bus_rules(true)),
         prop::option::of(bus_rules(false)),
-        any::<bool>(),
+        prop::option::of(prop::collection::vec(
+            prop::sample::select(Portal::ALL),
+            0..=6,
+        )),
         any::<bool>(),
         any::<bool>(),
         prop::option::of(prop::sample::select(
@@ -220,8 +223,13 @@ fn bus_services() -> impl Strategy<Value = Vec<Service>> {
             if let Some(rules) = system_bus {
                 out.push(Service::SystemBus { rules });
             }
-            if portals {
-                out.push(Service::Portals);
+            if let Some(children) = &portals {
+                // The parser refuses a child written twice, so the
+                // generated set is one of each.
+                let mut children = children.clone();
+                children.sort_by_key(|c| c.node_name());
+                children.dedup();
+                out.push(Service::Portals { children });
             }
             if notify {
                 out.push(Service::Notify);
@@ -234,7 +242,7 @@ fn bus_services() -> impl Strategy<Value = Vec<Service>> {
                     name: name.to_owned(),
                 });
             }
-            if let (true, Some(nodes)) = (portals, camera) {
+            if let (true, Some(nodes)) = (portals.is_some(), camera) {
                 out.push(Service::Camera { nodes });
             }
             out

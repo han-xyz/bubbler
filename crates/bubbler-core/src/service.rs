@@ -67,7 +67,7 @@ pub fn apply_all(
             Service::AppRuntime { id, mode } => app_runtime(env, args, id, *mode),
             Service::Dbus { .. } => dbus_socket(env, args, ctx),
             Service::SystemBus { .. } => system_bus_socket(args, ctx),
-            Service::Portals => portals(env, args, host, ctx)?,
+            Service::Portals { .. } => portals(env, args, host, ctx)?,
             Service::Camera { nodes } => camera(services, args, host, *nodes)?,
             // Bound below, once every share has been resolved: two
             // overlapping shares must be refused before either is emitted.
@@ -570,7 +570,10 @@ fn camera(
     host: &dyn Host,
     nodes: bool,
 ) -> Result<(), LaunchError> {
-    if !services.contains(&Service::Portals) {
+    if !services
+        .iter()
+        .any(|s| matches!(s, Service::Portals { .. }))
+    {
         return Err(LaunchError::BadValue {
             service: "camera",
             reason: "requires portals".to_owned(),
@@ -3582,7 +3585,12 @@ mod tests {
 
     /// The `dbus` and `portals` a `camera` grant requires.
     fn camera_base() -> Vec<Service> {
-        vec![Service::Dbus { rules: vec![] }, Service::Portals]
+        vec![
+            Service::Dbus { rules: vec![] },
+            Service::Portals {
+                children: Vec::new(),
+            },
+        ]
     }
 
     /// The binds a `camera` node adds on top of the grants it requires,
@@ -4256,7 +4264,12 @@ mod tests {
     #[test]
     fn portals_adds_the_flatpak_info_file() {
         let a = argv(
-            &[Service::Dbus { rules: vec![] }, Service::Portals],
+            &[
+                Service::Dbus { rules: vec![] },
+                Service::Portals {
+                    children: Vec::new(),
+                },
+            ],
             &env(),
             &[],
         )
@@ -4274,7 +4287,12 @@ mod tests {
     #[test]
     fn portals_binds_this_instances_document_portal_view_read_write() {
         let a = argv(
-            &[Service::Dbus { rules: vec![] }, Service::Portals],
+            &[
+                Service::Dbus { rules: vec![] },
+                Service::Portals {
+                    children: Vec::new(),
+                },
+            ],
             &env(),
             &[("/run/user/1000/doc", Mount)],
         )
@@ -4301,7 +4319,12 @@ mod tests {
     fn portals_without_a_document_portal_mount_binds_nothing_there() {
         for existing in [&[][..], &[("/run/user/1000/doc", Dir)][..]] {
             let a = argv(
-                &[Service::Dbus { rules: vec![] }, Service::Portals],
+                &[
+                    Service::Dbus { rules: vec![] },
+                    Service::Portals {
+                        children: Vec::new(),
+                    },
+                ],
                 &env(),
                 existing,
             )

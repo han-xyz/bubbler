@@ -971,7 +971,11 @@ fn forwarded_or(
             _ => None,
         })
         .collect();
-    let granted = inst.has_service(&Service::Portals);
+    let granted = inst
+        .config
+        .services
+        .iter()
+        .any(|s| matches!(s, Service::Portals { .. }));
     let mut forwards = Vec::new();
     match granted {
         // Only where a file could have been forwarded is a path that was
