@@ -16,6 +16,11 @@
 // from the `wayland` grant, so no `env` node sets MOZ_ENABLE_WAYLAND;
 // `env MOZ_ENABLE_WAYLAND="0"` goes back to Xwayland.
 //
+// `portals { screencast }` is the ScreenCast and Screenshot portals on
+// top of the bundle's safe set: a file chooser, a link, a notification.
+// The bare node grants none of them. Screen sharing needs `pipewire`
+// too — the portal picks the source, PipeWire carries the frames.
+//
 // Bare by design. Add:
 //   pipewire
 //     — screen and window sharing: the portal picks the source and hands
@@ -42,6 +47,8 @@ dri
 pulseaudio
 network
 dbus
-portals
+portals {
+    screencast
+}
 home-share "Downloads" mode=rw
 command "firefox"

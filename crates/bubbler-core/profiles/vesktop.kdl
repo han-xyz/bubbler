@@ -13,9 +13,12 @@
 //
 // Bare by design. Add:
 //   dbus
-//   portals
+//   portals {
+//       screencast
+//   }
 //     — the file chooser for sending a file, and the source picker for
-//       screen sharing.
+//       screen sharing. `screencast` is what the picker needs; without
+//       the child the bundle grants the chooser and nothing else.
 //   pipewire
 //     — screen and window sharing in a call: the portal picks the source
 //       and hands the stream over PipeWire, so both grants are needed.

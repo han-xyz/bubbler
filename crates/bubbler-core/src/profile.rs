@@ -1063,7 +1063,9 @@ fn mode_conflict(node: &str, a: ShareMode, a_src: &Src, b: ShareMode, b_src: &Sr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BusRule, Clipboard, NestedX11, NetworkConfig, WaylandMode, X11Mode};
+    use crate::config::{
+        BusRule, Clipboard, NestedX11, NetworkConfig, Portal, WaylandMode, X11Mode,
+    };
     use crate::host::fake::{self, FakeHost};
     use crate::lint;
 
@@ -1300,10 +1302,10 @@ mod tests {
         );
 
         // A browser draws, plays, fetches, and saves what it downloads
-        // into one directory; the portal is its file chooser. The
-        // remote-instance bus name, the media keys, the notifications and
-        // the screen sharing are opt-ins, and the bus it does carry holds
-        // no rule of its own.
+        // into one directory; the portal is its file chooser and its
+        // screen-share picker. The remote-instance bus name, the media
+        // keys and the notifications are opt-ins, and the bus it does
+        // carry holds no rule of its own.
         let ff = cfg("firefox");
         assert_eq!(
             ff.services,
@@ -1314,7 +1316,7 @@ mod tests {
                 network(),
                 Service::Dbus { rules: Vec::new() },
                 Service::Portals {
-                    children: Vec::new(),
+                    children: vec![Portal::ScreenCast],
                 },
                 home_share("Downloads", ShareMode::ReadWrite),
             ]
@@ -2676,6 +2678,33 @@ mod tests {
         assert_eq!(
             resolved.config.services,
             vec![Service::Pipewire, Service::Dri]
+        );
+    }
+
+    /// The three profiles whose applications share a screen do it
+    /// through the child rather than through a wildcard nobody wrote.
+    #[test]
+    fn the_browser_profiles_grant_the_screencast_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        for name in ["firefox", "chromium"] {
+            let cfg = Resolver::new(&e).resolve(name).unwrap().config;
+            assert!(
+                cfg.services.contains(&Service::Portals {
+                    children: vec![Portal::ScreenCast]
+                }),
+                "{name}: {:?}",
+                cfg.services
+            );
+        }
+        // `vesktop` is bare by design: the grant is in its header block,
+        // which `every_opt_in_a_header_lists_pastes_back_into_its_own_profile`
+        // runs through the parser and the linter.
+        let cfg = Resolver::new(&e).resolve("vesktop").unwrap().config;
+        assert!(
+            !cfg.services
+                .iter()
+                .any(|s| matches!(s, Service::Portals { .. }))
         );
     }
 }
