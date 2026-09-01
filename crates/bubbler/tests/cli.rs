@@ -7460,15 +7460,15 @@ fn probe_in(name: &str, config: &str) -> Option<(String, String)> {
 }
 
 #[test]
-fn a_profile_that_allows_back_everything_nameable_still_loads_the_numbered_rules() {
+fn a_filter_a_profile_emptied_is_as_loud_as_a_disabled_one() {
     let tmp = setup();
     bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
-    // Allowing every name in DEFAULT_EPERM and DEFAULT_ENOSYS back used
-    // to leave nothing to load — `seccomp { disable }` taken the long
-    // way round. DEFAULT_ENOSYS_NUMBERED breaks that: those three
-    // syscalls have no name this libseccomp resolves, so config.rs's own
-    // syscall-name check refuses an `allow` that names them, and they
-    // stay in the filter no matter what the rest of the list gives back.
+    // Allowing every name back leaves nothing to load, which is
+    // `seccomp { disable }` taken the long way round. The numbered rules
+    // of DEFAULT_ENOSYS_NUMBERED have no name libseccomp resolves, so
+    // they are not caught by the `syscall_number` filter below — but
+    // config.rs knows them by a second table, so naming them in `allow`
+    // still works.
     let set = RuleSet::default_set();
     let names: Vec<String> = set
         .eperm
@@ -7476,6 +7476,7 @@ fn a_profile_that_allows_back_everything_nameable_still_loads_the_numbered_rules
         .chain(&set.enosys)
         .filter(|n| syscall_number(n).is_some())
         .map(|n| format!("\"{n}\""))
+        .chain(set.enosys_numbered.iter().map(|(n, _)| format!("\"{n}\"")))
         .collect();
     std::fs::write(
         tmp.path().join("data/bubbler/instances/t/config.kdl"),
@@ -7491,12 +7492,12 @@ fn a_profile_that_allows_back_everything_nameable_still_loads_the_numbered_rules
         .unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        !err.contains("bubbler: seccomp has no rules left for instance t"),
+        err.contains("bubbler: seccomp has no rules left for instance t"),
         "{err}"
     );
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("--add-seccomp-fd"),
-        "the three numbered rules must still load a filter"
+        !String::from_utf8_lossy(&out.stdout).contains("--add-seccomp-fd"),
+        "an empty filter must load nothing"
     );
 }
 

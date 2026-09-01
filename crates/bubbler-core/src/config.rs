@@ -20,7 +20,7 @@ pub use crate::seccomp::{Errno, SeccompConfig};
 pub use crate::tty::TtyMode;
 
 use crate::dbus;
-use crate::seccomp::syscall_number;
+use crate::seccomp::{DEFAULT_ENOSYS_NUMBERED, syscall_number};
 
 /// Largest configuration bubbler hands to the KDL parser. A profile or
 /// a `config.kdl` is a screenful of grants — the shipped profiles are
@@ -2910,7 +2910,10 @@ fn syscall_name(node: &KdlNode, s: &str) -> Result<String, ConfigError> {
     if !plain {
         return Err(bad(node, "expects a syscall name such as \"keyctl\""));
     }
-    if syscall_number(s).is_none() {
+    // Denied by number in the default filter because libseccomp has no
+    // name for it; still a name a profile can allow or deny by.
+    let numbered = DEFAULT_ENOSYS_NUMBERED.iter().any(|(n, _)| *n == s);
+    if syscall_number(s).is_none() && !numbered {
         return Err(bad(
             node,
             &format!("`{s}` is not a syscall name libseccomp knows"),
@@ -4939,6 +4942,19 @@ command "b""#
         // so naming it there is a rule rather than a mistake.
         #[cfg(target_arch = "x86_64")]
         assert!(parse(r#"seccomp { allow "vm86old" }"#).is_ok());
+    }
+
+    /// The numbered rules of `DEFAULT_ENOSYS_NUMBERED` have no name
+    /// libseccomp resolves — that is the whole reason they are numbered
+    /// — so `allow` must know them by a second table. A name in neither
+    /// table is still the same error as before.
+    #[test]
+    fn a_numbered_syscall_is_a_known_allow_even_though_libseccomp_cannot_name_it() {
+        assert!(parse(r#"seccomp { allow "open_tree_attr" }"#).is_ok());
+        assert!(matches!(
+            parse(r#"seccomp { allow "nosuchcall" }"#),
+            Err(ConfigError::BadArgument { node, .. }) if node == "allow"
+        ));
     }
 
     #[test]

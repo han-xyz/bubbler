@@ -529,7 +529,7 @@ kernel bug behind an allowed syscall is a kernel bug in the sandbox.
 `an_unknown_abi_is_killed_rather_than_allowed`,
 `real_bwrap_seccomp_filters_a_32_bit_binary_instead_of_killing_it`,
 `real_bwrap_seccomp_covers_the_dbus_proxy_sandbox`,
-`a_profile_that_allows_back_everything_nameable_still_loads_the_numbered_rules`
+`a_filter_a_profile_emptied_is_as_loud_as_a_disabled_one`
 
 `open_tree_attr` (467), `listns` (470) and `fchroot` (472) are denied by
 number: libseccomp 2.6.0 has no name for them, and a rule added by a
