@@ -10203,6 +10203,85 @@ fn log_shows_a_terminal_the_control_bytes_and_a_pipe_the_log_itself() {
     assert_eq!(out.stdout, WRITTEN);
 }
 
+/// An error quotes the config it read, and a profile is not always the
+/// reader's own: a node name with an escape in it reaches the terminal
+/// through the message that names the node. Same split as the log — shown
+/// on a terminal, sent as it is down a pipe.
+#[test]
+fn an_error_shows_a_terminal_the_control_bytes_and_a_pipe_the_message_itself() {
+    let tmp = setup();
+    write_profile(tmp.path(), "user", "evil", "\"ev\\u{1b}[31mil-node\"\n");
+
+    let pty = test_pty();
+    let mut child = bubbler(tmp.path())
+        .args(["profile", "lint", "evil"])
+        .stdout(Stdio::null())
+        .stderr(pty.stdio())
+        .spawn()
+        .unwrap();
+    let shown = pty.read_until(Duration::from_secs(10), |s| s.contains("il-node"));
+    assert_ne!(child.wait().unwrap().code(), Some(0));
+    assert!(
+        shown.contains("unknown node `ev^[[31mil-node`"),
+        "{shown:?}"
+    );
+    assert!(!shown.contains('\x1b'), "an escape reached the terminal");
+
+    let out = bubbler(tmp.path())
+        .args(["profile", "lint", "evil"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("unknown node `ev\u{1b}[31mil-node`"),
+        "{err:?}"
+    );
+}
+
+/// `desktop --print` prints an entry built from the application's own
+/// `Name=`, copied out of a file bubbler did not write.
+#[test]
+fn desktop_print_shows_a_terminal_the_control_bytes() {
+    let tmp = setup();
+    write_profile(tmp.path(), "user", "app", "command \"bubbler-test-app\"\n");
+    bubbler(tmp.path())
+        .args(["create", "t", "--profile", "app"])
+        .status()
+        .unwrap();
+    write_entry(
+        tmp.path(),
+        "system",
+        "org.example.App.desktop",
+        "[Desktop Entry]\nType=Application\nName=A\x1b]52;c;aGk=\x07pp\n\
+         Exec=bubbler-test-app %U\n",
+    );
+
+    let pty = test_pty();
+    let mut child = bubbler(tmp.path())
+        .args(["desktop", "t", "--print"])
+        .stdout(pty.stdio())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let shown = pty.read_until(Duration::from_secs(10), |s| s.contains("Exec="));
+    assert_eq!(child.wait().unwrap().code(), Some(0));
+    assert!(
+        shown.contains("Name=A^[]52;c;aGk=^Gpp (Bubbler)"),
+        "{shown:?}"
+    );
+    assert!(!shown.contains('\x1b'), "an escape reached the terminal");
+
+    let out = bubbler(tmp.path())
+        .args(["desktop", "t", "--print"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        out.stdout.windows(2).any(|w| w == b"\x1b]"),
+        "a pipe gets the entry itself"
+    );
+}
+
 /// A stand-in for the terminal editor: `bubbler ui` execs whatever is
 /// named `bubbler-ui`, so a script that says which copy it is proves
 /// which one was found.

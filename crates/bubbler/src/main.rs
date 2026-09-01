@@ -35,6 +35,14 @@ use bubbler_core::wrap;
 use clap::builder::{OsStringValueParser, TypedValueParser};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
+/// `eprintln!` for a diagnostic, through [`eprint_echoed`]. Every message
+/// bubbler writes to stderr quotes something it did not author — a
+/// profile name, a config value, a path, an error from the host — so a
+/// terminal reading them needs the same sanitiser stdout gets.
+macro_rules! ediag {
+    ($($arg:tt)*) => { $crate::eprint_echoed(&format!($($arg)*)) };
+}
+
 /// `--tty` takes the names the config's `tty` node takes; clap already
 /// says which value was rejected, so only the reason is passed on.
 fn tty_mode(s: &str) -> Result<TtyMode, String> {
@@ -579,7 +587,7 @@ fn main() -> ExitCode {
     let code = match real_main(&mut log) {
         Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
         Err(e) => {
-            eprintln!("bubbler: {e:#}");
+            ediag!("bubbler: {e:#}");
             ExitCode::from(1)
         }
     };
@@ -620,9 +628,8 @@ fn print_lines(lines: &[&OsStr], what: &str) -> Result<i32> {
     }
 }
 
-/// Print bytes as they are: a desktop entry is a file, and what is in
-/// it is not this command's to reword. A reader that left early
-/// (`| head`) is a normal end here too.
+/// Print bytes as they are. A reader that left early (`| head`) is a
+/// normal end here too.
 fn print_bytes(bytes: &[u8], what: &str) -> Result<i32> {
     let mut out = io::stdout().lock();
     let written = out.write_all(bytes).and_then(|()| out.flush());
@@ -633,12 +640,23 @@ fn print_bytes(bytes: &[u8], what: &str) -> Result<i32> {
     }
 }
 
-/// Print bytes a sandbox wrote, with what a terminal would act on
+/// Print bytes bubbler did not write, with what a terminal would act on
 /// rendered rather than sent ([`safe_text`]). A log replayed to a
 /// terminal is the sandbox writing to it a second time, with the user
-/// reading rather than watching.
+/// reading rather than watching, and a desktop entry carries the
+/// application's own keys.
 fn print_echoed_bytes(bytes: &[u8], what: &str) -> Result<i32> {
     print_bytes(&echoed(bytes, io::stdout().is_terminal()), what)
+}
+
+/// Write one diagnostic line to stderr, with what a terminal would act on
+/// rendered rather than sent ([`safe_text`]). Reached through [`ediag!`].
+fn eprint_echoed(text: &str) {
+    let mut err = io::stderr().lock();
+    let safe = echoed(text.as_bytes(), err.is_terminal());
+    // A stderr that cannot be written to has nowhere to report that it
+    // could not be written to, and it is not a reason to fail the run.
+    let _ = err.write_all(&safe).and_then(|()| err.write_all(b"\n"));
 }
 
 /// Print the argv of `inst` with every argument under the node it came
@@ -754,7 +772,7 @@ fn build_entry(
 fn refresh_entries(env: &Env, dirs: &desktop::Dirs, program: &Path) -> Result<i32> {
     let entries = desktop::generated(dirs);
     if entries.is_empty() {
-        eprintln!(
+        ediag!(
             "bubbler: no entry of bubbler's in {}; `bubbler desktop <instance>` writes one",
             dirs.user.display()
         );
@@ -780,7 +798,7 @@ fn refresh_entries(env: &Env, dirs: &desktop::Dirs, program: &Path) -> Result<i3
             Err(e) => {
                 failed += 1;
                 let e = e.context(format!("refreshing {}", path.display()));
-                eprintln!("bubbler: {e:#}");
+                ediag!("bubbler: {e:#}");
             }
         }
     }
@@ -799,7 +817,7 @@ fn open_log(path: &Path, truncate: bool) -> Option<run_log::Redirect> {
         Ok(guard) => Some(guard),
         Err(e) => {
             let e = anyhow::Error::new(e);
-            eprintln!("bubbler: warning: no log for this run: {e:#}");
+            ediag!("bubbler: warning: no log for this run: {e:#}");
             None
         }
     }
@@ -810,7 +828,7 @@ fn open_log(path: &Path, truncate: bool) -> Option<run_log::Redirect> {
 /// application's own copied keys is not bubbler's to correct.
 fn warn_invalid(path: &Path) {
     for line in desktop::validate(path) {
-        eprintln!("bubbler: warning: {line}");
+        ediag!("bubbler: warning: {line}");
     }
 }
 
@@ -820,12 +838,12 @@ fn warn_invalid(path: &Path) {
 fn update_desktop_db(dir: &Path) {
     match desktop::update_database(dir) {
         Ok(true) => {}
-        Ok(false) => eprintln!(
+        Ok(false) => ediag!(
             "bubbler: warning: update-desktop-database is not installed \
              (package desktop-file-utils), so the entry may not be offered \
              as a handler for the file types it claims"
         ),
-        Err(e) => eprintln!("bubbler: warning: {e}"),
+        Err(e) => ediag!("bubbler: warning: {e}"),
     }
 }
 
@@ -889,7 +907,7 @@ where
         Ok(_) => 0,
         Err(e) => {
             let e = anyhow::Error::new(e).context(format!("{} still has errors", path.display()));
-            eprintln!("bubbler: {e:#}");
+            ediag!("bubbler: {e:#}");
             1
         }
     }
@@ -931,7 +949,7 @@ fn warn_lint(result: Result<lint::Report, bubbler_core::error::LintError>) {
             // A finding quotes the config it read, and that file is not
             // always the reader's own.
             let line = echoed(line.as_bytes(), terminal);
-            eprintln!("bubbler: lint: {}", String::from_utf8_lossy(&line));
+            ediag!("bubbler: lint: {}", String::from_utf8_lossy(&line));
         }
     }
 }
@@ -940,7 +958,7 @@ fn warn_lint(result: Result<lint::Report, bubbler_core::error::LintError>) {
 /// itself, on stderr and before the run it applies to.
 fn warn_migration(inst: &Instance) {
     if let Some(text) = inst.migration_warning() {
-        eprintln!("bubbler: warning: {text}");
+        ediag!("bubbler: warning: {text}");
     }
 }
 
@@ -984,12 +1002,12 @@ fn forwarded_or(
         // the sandbox has its own of rather than a gap in it.
         true => {
             for line in forward::warning_lines(&planned) {
-                eprintln!("bubbler: warning: {line}");
+                ediag!("bubbler: warning: {line}");
             }
         }
         false => {
             for candidate in &candidates {
-                eprintln!(
+                ediag!(
                     "bubbler: warning: {} is not visible inside; grant portals to forward files",
                     candidate.given.display()
                 );
@@ -1005,7 +1023,7 @@ fn forwarded_or(
                 for (candidate, answer) in candidates.iter().zip(answers) {
                     match answer {
                         Ok(forward) => forwards.push(forward),
-                        Err(e) => eprintln!(
+                        Err(e) => ediag!(
                             "bubbler: warning: forwarding {} failed: {:#}",
                             candidate.given.display(),
                             anyhow::Error::new(e)
@@ -1016,7 +1034,7 @@ fn forwarded_or(
             // One line, not one per file: the gap is the bus itself, and
             // the error already names the address every file would have
             // gone through.
-            Err(e) => eprintln!("bubbler: warning: no host file was forwarded: {e:#}"),
+            Err(e) => ediag!("bubbler: warning: no host file was forwarded: {e:#}"),
         }
     }
     if preview {
@@ -1036,7 +1054,7 @@ fn forwarded_or(
         // On stderr, where every other word about the run goes: stdout
         // is the argv or the JSON the caller asked for.
         for line in forward::explain_lines(&shown) {
-            eprintln!("{line}");
+            ediag!("{line}");
         }
     }
     Some(forward::rewrite(argv, &planned, &forwards))
@@ -1215,7 +1233,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                 if !inst.config.shares.is_empty() {
                     return Err(share_needs_a_fresh_sandbox(&name));
                 }
-                eprintln!(
+                ediag!(
                     "bubbler: instance `{name}` is running; executing inside it \
                      (config changes apply after restart)"
                 );
@@ -1224,7 +1242,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                     .with_context(|| format!("executing in instance `{name}`"));
             }
             if inst.has_service(&Service::X11(X11Mode::Host)) {
-                eprintln!("bubbler: warning: x11 \"host\" grants no isolation between X clients");
+                ediag!("bubbler: warning: x11 \"host\" grants no isolation between X clients");
             }
             launcher::run(&env, &inst, command, mode)
                 .with_context(|| format!("running instance `{name}`"))
@@ -1280,7 +1298,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                     .with_context(|| format!("keeping the sandbox as instance `{name}`"))?;
             }
             if eph.instance.has_service(&Service::X11(X11Mode::Host)) {
-                eprintln!("bubbler: warning: x11 \"host\" grants no isolation between X clients");
+                ediag!("bubbler: warning: x11 \"host\" grants no isolation between X clients");
             }
             let mode = tty.unwrap_or(eph.instance.config.tty);
             let code = launcher::run(&env, &eph.instance, command, mode);
@@ -1356,7 +1374,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                 false => TtyMode::None,
             };
             if let Some(stream) = stream {
-                eprintln!(
+                ediag!(
                     "bubbler: instance `{name}` is running; executing inside it \
                      (config changes apply after restart)"
                 );
@@ -1365,7 +1383,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                     .with_context(|| format!("executing in instance `{name}`"));
             }
             if inst.has_service(&Service::X11(X11Mode::Host)) {
-                eprintln!("bubbler: warning: x11 \"host\" grants no isolation between X clients");
+                ediag!("bubbler: warning: x11 \"host\" grants no isolation between X clients");
             }
             launcher::run(&env, &inst, command, mode)
                 .with_context(|| format!("running instance `{name}`"))
@@ -1412,7 +1430,9 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                 .with_context(|| format!("opening instance `{name}`"))?;
             let (target, entry) = build_entry(&dirs, &inst, &program, replace)?;
             if print {
-                return print_bytes(entry.as_bytes(), "the desktop entry");
+                // The entry carries the application's own `Name=` and
+                // `Exec=`, copied from a file bubbler did not write.
+                return print_echoed_bytes(entry.as_bytes(), "the desktop entry");
             }
             desktop::write(&target, &entry, &name)
                 .with_context(|| format!("writing {}", target.display()))?;
@@ -1455,14 +1475,14 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             match wrap::load(&env) {
                 Ok(wraps) => {
                     for w in wraps.iter().filter(|w| w.instance == name) {
-                        eprintln!(
+                        ediag!(
                             "bubbler: note: shim `{shim}` still opens `{name}`; \
                              `bubbler unwrap {shim}` removes it",
                             shim = w.name
                         );
                     }
                 }
-                Err(e) => eprintln!("bubbler: warning: reading the shim registry: {e}"),
+                Err(e) => ediag!("bubbler: warning: reading the shim registry: {e}"),
             }
             Ok(0)
         }
@@ -1558,7 +1578,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                     Err(e) => {
                         let what = name.as_deref().unwrap_or("every profile");
                         let e = anyhow::Error::new(e).context(format!("linting {what}"));
-                        eprintln!("bubbler: {e:#}");
+                        ediag!("bubbler: {e:#}");
                         return Ok(3);
                     }
                 };
@@ -1612,7 +1632,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                 Ok(found) => report(&found, &opts),
                 Err(e) => {
                     let e = e.context(format!("linting instance `{name}`"));
-                    eprintln!("bubbler: {e:#}");
+                    ediag!("bubbler: {e:#}");
                     Ok(3)
                 }
             }
@@ -1650,7 +1670,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             let made = wrap::add(&env, &name, &shim, &bubbler)
                 .with_context(|| format!("wrapping instance `{name}` as `{shim}`"))?;
             if made.adopted {
-                eprintln!(
+                ediag!(
                     "bubbler: note: {} was already a bubbler shim the registry did not \
                      name; it opens `{name}` from now on",
                     made.path.display()
@@ -1659,7 +1679,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             // Only for a name the user chose: a shim named after the
             // instance shadows nothing, which is why it is the default.
             if as_name.is_some() {
-                eprintln!(
+                ediag!(
                     "bubbler: note: `{shim}` now starts this sandbox wherever PATH resolves it, \
                      the bare-name `Exec=` lines of desktop entries included"
                 );
@@ -1667,7 +1687,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             if let Some(warning) =
                 wrap::path_warning(&wrap::shim_dir(&env), &shim, &host_env::search_path())
             {
-                eprintln!("bubbler: warning: {warning}");
+                ediag!("bubbler: warning: {warning}");
             }
             print_lines(&[made.path.as_os_str()], "the shim path")
         }

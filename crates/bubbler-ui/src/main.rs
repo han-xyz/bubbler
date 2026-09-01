@@ -18,11 +18,13 @@ mod term;
 #[cfg(test)]
 mod fixture;
 
+use std::io::{IsTerminal, Write};
 use std::process::{Child, ExitCode};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use bubbler_core::safe_text;
 use ratatui::crossterm::event;
 
 use crate::app::{Action, App};
@@ -51,7 +53,15 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("bubbler-ui: {e:#}");
+            // The error quotes the store it read: an instance name, a
+            // config value, a path — none of them this program's own.
+            let mut err = std::io::stderr().lock();
+            let text = format!("bubbler-ui: {e:#}\n");
+            let bytes = match err.is_terminal() {
+                true => safe_text::render(text.as_bytes()),
+                false => text.into_bytes(),
+            };
+            let _ = err.write_all(&bytes);
             ExitCode::FAILURE
         }
     }

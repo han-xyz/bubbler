@@ -897,7 +897,10 @@ are not UTF-8 as `\x9b` — whenever its stdout is a terminal, so an OSC 52
 a sandbox left in `last-run.log` cannot write the clipboard of whoever
 reads it. A pipe gets the log byte for byte, since the reader there is a
 tool. The same rendering covers what `--explain` and `lint` echo out of a
-config that need not be yours.
+config that need not be yours, the entry `bubbler desktop --print` builds
+from an application's own `Name=` and `Exec=`, and every error and warning
+bubbler writes to stderr — each of those quotes a name, a value or a path
+it did not author.
 
 **Does not defend:** what is inherent to any relay. The application reads
 what you type into that session and can emit escape sequences your
@@ -1208,11 +1211,12 @@ clipboard, a `\x1b[2J` that would clear the screen, or a title escape that
 would rename the window reads as inert text instead of running. It is
 applied at every seam in `bubbler-ui` where config- or profile-derived text
 reaches a cell: titles, instance rows, the detail and finding panes, dialog
-prompts and choice labels, and the profiles table. `run_log`/`last-run.log`
-and any byte stream the sandbox itself produced go through `safe_text::render`
-instead, which shows the same control bytes in caret notation rather than
-folding a whole sequence to one mark, since a log is meant to be read back
-byte for byte and not summarised.
+prompts and choice labels, and the profiles table. `run_log`/`last-run.log`,
+`bubbler desktop --print`, every error and warning the CLI writes to
+stderr, and any byte stream the sandbox itself produced go through
+`safe_text::render` instead, which shows the same control bytes in caret
+notation rather than folding a whole sequence to one mark, since text
+read back this way is meant to be read byte for byte and not summarised.
 
 **Does not defend:** anything printed straight to a pipe rather than a
 terminal — a pipe is a tool on the other end and gets the bytes as they
@@ -1226,7 +1230,9 @@ by review.
 `the_control_characters_a_reader_wants_are_left_alone`,
 `a_terminal_is_shown_the_control_characters_instead_of_acting_on_them`,
 `a_control_sequence_in_a_config_value_is_drawn_as_a_question_mark`,
-`a_control_sequence_in_a_status_message_is_drawn_as_a_question_mark`
+`a_control_sequence_in_a_status_message_is_drawn_as_a_question_mark`,
+`an_error_shows_a_terminal_the_control_bytes_and_a_pipe_the_message_itself`,
+`desktop_print_shows_a_terminal_the_control_bytes`
 
 ## Non-goals
 
