@@ -202,13 +202,16 @@ but no isolated network namespace at all.
 `try` runs one command in a sandbox without creating an instance. Its config is
 the flattened profile (`generic` unless `--profile` says otherwise) plus one
 bare node per `--grant`; the grants are `wayland`, `x11`, `network`, `dri`,
-`pipewire`, `pulseaudio`, `dbus`, `portals`, `notify`, `tray`, `a11y`,
-`input-method`, `gamepad`, `hidraw` and `camera`, and anything with arguments
-needs a real instance — `system-bus` among them, since it is not a grant
-without rules. The bundles are checked as they are in a config file, so
+`pipewire`, `pulseaudio`, `dbus`, `portals`, `screencast`, `remote-desktop`,
+`global-shortcuts`, `background`, `location`, `secrets`, `notify`, `tray`,
+`a11y`, `input-method`, `gamepad`, `hidraw` and `camera`, and anything with
+arguments needs a real instance — `system-bus` among them, since it is not a
+grant without rules. The bundles are checked as they are in a config file, so
 `--grant tray` without `--grant dbus` is refused rather than silently dropped,
 and `--grant camera` needs `--grant portals` (and the `--grant dbus` that
-carries it) the same way.
+carries it) the same way. A child grant — `screencast` through `secrets` —
+joins the `portals` node the profile already has rather than writing a
+second one, and needs that node's `dbus` the same way.
 `--grant x11` needs `--grant wayland --grant dri`, without which the X server
 it starts inside has nothing to draw in or with. A
 grant the profile already made is not repeated, properties and all:
@@ -456,6 +459,15 @@ file order does not affect the generated argv.
     }
     portals                          # XDG portal rules, /.flatpak-info, and the
                                      #   document view file arguments land in
+    portals {                        # the safe set plus one group per child
+        screencast                   #   capture the screen after a portal dialog
+        remote-desktop               #   inject input into the whole session
+        global-shortcuts             #   bindings fire while unfocused
+        background                   #   write host autostart and launcher entries
+        location                     #   read the host's location
+        secrets                      #   read this app's portal secret
+        camera                       #   the same grant as the `camera` node
+    }
     notify                           # talk to org.freedesktop.Notifications
     tray                             # talk to org.kde.StatusNotifierWatcher
     mpris name="firefox.*"           # own org.mpris.MediaPlayer2.firefox.*
@@ -619,6 +631,50 @@ what writes one (see "Terminal editor"). `reseed` does not keep them: it writes
 the file again from the profile, as it does with everything the file held. A
 `/-` line in a profile — or in any layer under it — is read the same way and
 seeds a disabled entry into every instance made from it.
+
+### Blocks for repeatable grants
+
+Six nodes may be written more than once — `home-share`, `path-share`,
+`etc-share`, `app-runtime`, `env` and `lint-allow` — and each of them
+takes one block in place of one line each. The child's node name is
+what the line's first argument was, quoted where it is not a bare
+identifier, and the properties come over unchanged:
+
+    home-share {
+        ".local/bin/claude" mode=ro
+        ".local/share/claude" mode=ro
+    }
+    env {
+        DISABLE_AUTOUPDATER "1"
+    }
+    lint-allow {
+        "x11-without-reason" reason="Wine games are X11 clients"
+    }
+
+`env` is the one whose line form has no argument to lift — it is
+`env KEY="value"` — so its child is `KEY "value"`: a node named for
+the key with the value as its one argument. `KEY="value"` is not
+valid there; KDL reads `key=value` as an entry, never as a node name.
+
+The two forms are one grammar. A block parses to exactly the grants
+the lines parse to, a duplicate inside a block is the same error a
+duplicate line is, and a `/-` on the block turns every entry under it
+off. A block with an argument as well as children is refused ("takes
+an argument or children, not both"), as is a child with children of
+its own or with an argument where the name is already the argument.
+`include` takes no block: it is an argument list already.
+
+`bubbler lint` raises the note `repeat-outside-block` where a file
+writes two or more of one kind on their own lines, and shows the
+block that says the same thing. Nothing else changes: the same
+grants, the same argv, the same findings.
+
+Anything that rewrites a config writes the line form — `bubbler ui`
+on save, `create` and `reseed` — because the parsed config holds
+grants and not the shape of the file. `portals { … }` is the
+exception: its children are part of the grant, so they are written
+back as a block, and a `camera` child is written back as its own
+top-level `camera` node.
 
 ### wayland
 
@@ -1143,7 +1199,10 @@ nothing at all. The portal opens `/dev/videoN` in the host's PipeWire daemon
 and hands the sandbox an already-connected socket over the bus; frames come
 back as memfds. So the sandbox needs no device node, no `/sys` bind and no
 `pipewire` grant — only the `portals` the node requires, which is why `camera`
-without `portals` is a parse error rather than a warning.
+without `portals` is a parse error rather than a warning. The node carries its
+own `--call`/`--broadcast` for the Camera interface, on top of whatever
+`portals` opens; `portals { camera }` is the same grant, written as the
+block's own child instead of a second top-level node.
 
 That requirement is not bookkeeping. `xdg-desktop-portal` decides camera access
 from a permission store keyed by the app id it reads out of `/.flatpak-info`,
@@ -2773,7 +2832,9 @@ that second half is dropped under `network "host"`), `secrets-access`
 (`talk`/`own` of
 `org.freedesktop.secrets` on the session bus reaches the whole login keyring:
 the Secret Service API partitions nothing between the applications that call
-it), `lint-allow-unused` (a `lint-allow` node that accepts nothing, which is a
+it; the `secrets` child of `portals` raises the same note for the narrower
+path, the one this application's own portal secret comes through),
+`lint-allow-unused` (a `lint-allow` node that accepts nothing, which is a
 suppression outliving what it was written for — and the one check no
 `lint-allow` silences, since that node would be the unused one),
 `x11-nested-no-wm` (a nested `x11` with neither `fullscreen=#true` nor `wm=`:
@@ -2782,7 +2843,10 @@ undecorated and unmanaged in the one compositor window it draws),
 `pulseaudio-module-loading` (a `pulseaudio` grant on a host whose effective
 `pipewire-pulse.conf` leaves `pulse.allow-module-loading` on — the daemon's
 own default — so the host's audio daemon will load a module, a network sink
-among them, because the sandbox asked it to).
+among them, because the sandbox asked it to), `repeat-outside-block` (a
+repeatable node — `home-share`, `path-share`, `etc-share`, `app-runtime`,
+`env` or `lint-allow` — written two or more times on its own lines instead
+of one block).
 
 A warning or a note is accepted with a `lint-allow` node, which takes a check
 id and a required reason:
@@ -2892,12 +2956,36 @@ application id `org.bubbler.<name>`, which is what portals and the proxy
 identify it by. A `.` in the name becomes `_`, since only the last element
 of an id may hold a `-` and xdg-desktop-portal refuses every operation of a
 sandbox whose id it cannot parse; a leading digit is prefixed with `_`,
-which the portal would take but flatpak's own name check would not. The
-rules it grants are `--talk` for `org.freedesktop.portal.Desktop`,
-`.Documents` and `.FileChooser` plus the `--call`/`--broadcast` pair from
-the `xdg-dbus-proxy(1)` examples; the spawn portal
-(`org.freedesktop.portal.Flatpak`), which starts processes outside the
-sandbox, is not among them.
+which the portal would take but flatpak's own name check would not.
+
+The rules it grants are `--talk` for `org.freedesktop.portal.Desktop`
+and `.Documents`, one `--call` and one `--broadcast` per interface it
+opens on the desktop object, `--call=org.freedesktop.portal.Documents=*`,
+and the two `--broadcast` rules the per-call and per-session objects
+answer on. The interfaces the bare node opens are `Request`,
+`Session`, `FileChooser`, `OpenURI`, `Notification`, `Settings`,
+`Print`, `Email`, `Trash`, `Account`, `Inhibit`, `ProxyResolver`,
+`NetworkMonitor`, `MemoryMonitor`, `PowerProfileMonitor`, `Realtime`
+and `GameMode`. Everything else is a child:
+
+| child | interfaces | what it costs |
+|---|---|---|
+| `screencast` | ScreenCast, Screenshot | capture the screen after a portal dialog |
+| `remote-desktop` | RemoteDesktop, InputCapture | inject input into the whole session; grants persist until revoked |
+| `global-shortcuts` | GlobalShortcuts | bindings fire while unfocused and persist |
+| `background` | Background, DynamicLauncher | write host autostart and launcher entries |
+| `location` | Location | read the host's location |
+| `secrets` | Secret | read this app's portal secret |
+| `camera` | Camera | the `camera` node, written inside the block |
+
+Until 0.21 the bundle granted `--call=org.freedesktop.portal.*=*`,
+which was every one of those to any sandbox that wanted a file
+chooser. An instance created before 0.21 keeps the old node until it
+is reseeded or the child is added by hand; a refused portal call is
+visible in `BUBBLER_DBUS_LOG=1` output, and the child to add is the
+one whose interface the refused call names. The spawn portal
+(`org.freedesktop.portal.Flatpak`), which starts processes outside
+the sandbox, is in neither the set nor any child.
 
 The grant also binds this instance's own view of the document portal: host
 `$XDG_RUNTIME_DIR/doc/by-app/org.bubbler.<name>` at `$XDG_RUNTIME_DIR/doc`

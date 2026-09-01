@@ -38,7 +38,7 @@ advice (exit code untouched).
 `outbound-deny`, `ozone-hint-unnecessary`,
 `command-not-found`, `desktop-entry-missing`, `camera-nodes-none-present`,
 `camera-nodes-no-hotplug`, `secrets-access`, `lint-allow-unused`,
-`x11-nested-no-wm`, `pulseaudio-module-loading`.
+`x11-nested-no-wm`, `pulseaudio-module-loading`, `repeat-outside-block`.
 
 `allow-host-wildcard` is about a pattern that is a wildcard directly under a
 top-level domain (`*.com`): the `*` stands for one label, so that one covers
