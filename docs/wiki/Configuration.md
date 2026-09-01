@@ -158,6 +158,10 @@ tmpfs (`ld.so.*`, `fonts`, `localtime`, `machine-id`, `nsswitch.conf`, `hosts`,
 
 ## Config header
 
-`create` writes `// bubbler profile: <name>` and `// bubbler config: 2`. A file
-without the version header and a bare `network` node gets a warning on every
-run: that node used to mean the host namespace. `reseed` or `edit` stamps it.
+`create` writes `// bubbler profile: <name>` and `// bubbler config: 3`. Each
+version records a node whose meaning changed, and a file recording less than
+one of them gets a warning on every run, one per change it has not been
+through: below 2, a bare `network` used to mean the host namespace; below 3, a
+bare `portals` used to open ScreenCast, RemoteDesktop, Location, Secret and the
+rest, which are children of the node now. `reseed` or `edit` stamps the
+header.

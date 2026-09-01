@@ -1837,12 +1837,14 @@ from as a note. Neither runs anything, so the cgroup in an explained ruleset is
 a placeholder: bubbler's real own-cgroup prefix where `/proc/self/cgroup` can
 be read, and `<own-cgroup>` where it cannot.
 
-A config written before this — one with no `// bubbler config: 2` header line
-and a bare `network` node — asks for a different sandbox now than it did then,
-so every run of it prints a warning naming the change and both ways out of it.
-`bubbler reseed <name>` writes the config again from its profile and stamps the
-header; `bubbler edit <name>` keeps whatever was written by hand and stamps the
-header too, since a file you have just read through means what it says.
+A config written before this — one recording less than `// bubbler config: 2`
+and holding a bare `network` node — asks for a different sandbox now than it
+did then, so every run of it prints a warning naming the change and both ways
+out of it. `bubbler reseed <name>` writes the config again from its profile and
+stamps the header; `bubbler edit <name>` keeps whatever was written by hand and
+stamps the header too, since a file you have just read through means what it
+says. Each version is measured on its own, so a file that recorded 2 is never
+warned about `network` again however far the header has moved on since.
 
 ### tmp
 
@@ -3046,9 +3048,12 @@ The interfaces the bare node opens on the desktop object are
 Until 0.21 the bundle granted `--call=org.freedesktop.portal.*=*`,
 which was every one of those to any sandbox that wanted a file
 chooser. An instance created before 0.21 keeps the old node until it
-is reseeded or the child is added by hand; a refused portal call is
-visible in `BUBBLER_DBUS_LOG=1` output, and the child to add is the
-one whose interface the refused call names. The spawn portal
+is reseeded or the child is added by hand, and every run of one whose
+config records less than `// bubbler config: 3` and holds a bare
+`portals` prints a warning naming the children and both ways out;
+a refused portal call is visible in `BUBBLER_DBUS_LOG=1` output, and
+the child to add is the one whose interface the refused call names.
+The spawn portal
 (`org.freedesktop.portal.Flatpak`), which starts processes outside
 the sandbox, is in neither the set nor any child.
 

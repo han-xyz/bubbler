@@ -10,6 +10,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use bubbler_core::bwrap::ETC_ALLOWLIST;
+use bubbler_core::instance::CONFIG_VERSION;
 use bubbler_core::profile::NAMES;
 use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
@@ -431,7 +432,7 @@ fn reseed_rewrites_the_config_from_the_profile_and_backs_it_up() {
     );
     assert_eq!(
         std::fs::read_to_string(&cfg).unwrap(),
-        "// bubbler profile: app\n// bubbler config: 2\nwayland\nnetwork\ncommand \"sh\"\n"
+        "// bubbler profile: app\n// bubbler config: 3\nwayland\nnetwork\ncommand \"sh\"\n"
     );
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("data/bubbler/instances/a/config.kdl.bak"))
@@ -2945,7 +2946,15 @@ fn real_portal_answers_a_call_that_needs_the_app_identity() {
     let Some(init) = real_init() else { return };
     let tmp = setup();
     let name = &instance_name("portal-read");
-    let _leftovers = dbus_instance(tmp.path(), &init, name, "dbus\nportals\ncommand \"true\"\n");
+    // With the version header, so the migration warning a bare `portals`
+    // earns is not what the "nothing was warned about" assertion below
+    // trips over.
+    let _leftovers = dbus_instance(
+        tmp.path(),
+        &init,
+        name,
+        &format!("// bubbler config: {CONFIG_VERSION}\ndbus\nportals\ncommand \"true\"\n"),
+    );
 
     // Settings.ReadAll goes through the portal's app-info lookup, unlike
     // introspection or a property read, which any peer gets.
@@ -3021,7 +3030,15 @@ fn real_portals_bind_the_document_view_and_nothing_above_it() {
     let Some(init) = real_init() else { return };
     let tmp = setup();
     let name = &instance_name("doc-portal");
-    let _leftovers = dbus_instance(tmp.path(), &init, name, "dbus\nportals\ncommand \"true\"\n");
+    // With the version header, so the migration warning a bare `portals`
+    // earns is not what the "nothing was warned about" assertion below
+    // trips over.
+    let _leftovers = dbus_instance(
+        tmp.path(),
+        &init,
+        name,
+        &format!("// bubbler config: {CONFIG_VERSION}\ndbus\nportals\ncommand \"true\"\n"),
+    );
     let run = std::env::var_os("XDG_RUNTIME_DIR").unwrap();
     let doc = PathBuf::from(run).join("doc");
     let out = bubbler_dbus(tmp.path(), &init)
@@ -3384,7 +3401,15 @@ fn real_open_forwards_a_host_file() {
     let Some(init) = real_init() else { return };
     let tmp = setup();
     let name = &instance_name("doc-forward");
-    let _leftovers = dbus_instance(tmp.path(), &init, name, "dbus\nportals\ncommand \"true\"\n");
+    // With the version header, so the migration warning a bare `portals`
+    // earns is not what the "nothing was warned about" assertion below
+    // trips over.
+    let _leftovers = dbus_instance(
+        tmp.path(),
+        &init,
+        name,
+        &format!("// bubbler config: {CONFIG_VERSION}\ndbus\nportals\ncommand \"true\"\n"),
+    );
     let file = host_file(tmp.path(), "forwarded.txt", b"handed-over\n");
 
     let out = bubbler_dbus(tmp.path(), &init)
@@ -3424,7 +3449,15 @@ fn real_run_forwards_with_write_when_writable() {
     let Some(init) = real_init() else { return };
     let tmp = setup();
     let name = &instance_name("doc-write");
-    let _leftovers = dbus_instance(tmp.path(), &init, name, "dbus\nportals\ncommand \"true\"\n");
+    // With the version header, so the migration warning a bare `portals`
+    // earns is not what the "nothing was warned about" assertion below
+    // trips over.
+    let _leftovers = dbus_instance(
+        tmp.path(),
+        &init,
+        name,
+        &format!("// bubbler config: {CONFIG_VERSION}\ndbus\nportals\ncommand \"true\"\n"),
+    );
     let file = host_file(tmp.path(), "journal.txt", b"first\n");
 
     let append = |file: &Path, line: &str| {
@@ -6257,7 +6290,7 @@ fn edit_runs_editor_and_rechecks() {
     // read through stops warning about what `network` now means.
     assert_eq!(
         std::fs::read_to_string(&cfg).unwrap(),
-        "// bubbler config: 2\ncommand \"true\"\n"
+        "// bubbler config: 3\ncommand \"true\"\n"
     );
 }
 
@@ -8390,7 +8423,7 @@ fn a_config_written_before_the_flip_warns_on_every_run() {
     // A file that records the version, or names the mode, says what it
     // means and is left alone.
     for quiet in [
-        "// bubbler config: 2\nnetwork\ncommand \"true\"\n",
+        "// bubbler config: 3\nnetwork\ncommand \"true\"\n",
         "network \"host\"\ncommand \"true\"\n",
         "network \"none\"\ncommand \"true\"\n",
     ] {
@@ -9389,7 +9422,7 @@ fn edit_warns_about_the_flip_before_it_stamps_the_version() {
     assert!(edit().contains("isolated network namespace"));
     assert_eq!(
         std::fs::read_to_string(&cfg).unwrap(),
-        "// bubbler config: 2\nnetwork\ncommand \"true\"\n"
+        "// bubbler config: 3\nnetwork\ncommand \"true\"\n"
     );
     // And having been stamped, it is the last time.
     assert!(!edit().contains("isolated network namespace"));

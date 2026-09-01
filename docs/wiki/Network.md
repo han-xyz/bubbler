@@ -191,6 +191,6 @@ and the app keeps running.
 
 ## Legacy configs
 
-A `config.kdl` without `// bubbler config: 2` and a bare `network` used to
-mean the host namespace; every run warns until `bubbler reseed` or `bubbler
-edit` stamps the header.
+A `config.kdl` recording less than `// bubbler config: 2` and a bare
+`network` used to mean the host namespace; every run warns until `bubbler
+reseed` or `bubbler edit` stamps the header.

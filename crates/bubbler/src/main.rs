@@ -957,7 +957,7 @@ fn warn_lint(result: Result<lint::Report, bubbler_core::error::LintError>) {
 /// What a config written before the current version has to say about
 /// itself, on stderr and before the run it applies to.
 fn warn_migration(inst: &Instance) {
-    if let Some(text) = inst.migration_warning() {
+    for text in inst.migration_warning() {
         ediag!("bubbler: warning: {text}");
     }
 }

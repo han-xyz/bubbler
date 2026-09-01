@@ -23,10 +23,22 @@ const CONFIG_FILE: &str = "config.kdl";
 /// against. Second line of a seeded file, after the profile header.
 pub(crate) const CONFIG_HEADER: &str = "// bubbler config: ";
 
-/// The meanings this bubbler writes. Version 2 is where a bare `network`
-/// node became the sandbox's own network namespace; version 1 is every
-/// file written before that, which has no header at all.
-pub const CONFIG_VERSION: u32 = 2;
+/// The meanings this bubbler writes. Version 3 is where a bare `portals`
+/// node stopped carrying the privileged portal interfaces; version 2 is
+/// where a bare `network` node became the sandbox's own network
+/// namespace; version 1 is every file written before that, which has no
+/// header at all.
+pub const CONFIG_VERSION: u32 = 3;
+
+/// The version a config has to record for a bare `network` node to mean
+/// what this bubbler makes of it. Each migration is measured against the
+/// version that introduced it, not against [`CONFIG_VERSION`]: a file
+/// that has been through one has been through it whatever came after.
+const ISOLATED_NETWORK_VERSION: u32 = 2;
+
+/// The version a config has to record for a bare `portals` node to mean
+/// what this bubbler makes of it. See [`ISOLATED_NETWORK_VERSION`].
+const PORTAL_CHILDREN_VERSION: u32 = 3;
 
 /// Where `reseed` keeps the `config.kdl` it replaces.
 const BACKUP_FILE: &str = "config.kdl.bak";
@@ -704,26 +716,45 @@ impl Instance {
     }
 
     /// What a run of this instance has to say about its config before it
-    /// starts, if anything: a file written before version 2 that still
-    /// holds a bare `network` node asks for a different sandbox now than
-    /// it did when it was written. A file recording any older version
-    /// counts the same as one recording none.
-    pub fn migration_warning(&self) -> Option<String> {
-        let bare = self
-            .config
-            .services
-            .iter()
-            .any(|s| matches!(s, Service::Network(c) if c.is_isolated()));
-        let old = self.config_version.is_none_or(|v| v < CONFIG_VERSION);
-        (old && bare).then(|| {
-            format!(
+    /// starts: a node whose meaning changed after the version the file
+    /// records asks for a different sandbox now than it did when it was
+    /// written. A file recording no version counts as version 1. One
+    /// string per migration the file has not been through, since a file
+    /// old enough may not have been through either.
+    pub fn migration_warning(&self) -> Vec<String> {
+        let written = self.config_version.unwrap_or(1);
+        let services = &self.config.services;
+        let name = &self.name;
+        let mut out = Vec::new();
+        if written < ISOLATED_NETWORK_VERSION
+            && services
+                .iter()
+                .any(|s| matches!(s, Service::Network(c) if c.is_isolated()))
+        {
+            out.push(format!(
                 "`network` now means an isolated network namespace; run \
                  `bubbler reseed {name}` to write the config again from its profile, or \
                  `bubbler edit {name}` to keep your own edits and record the version, \
-                 or write `network \"host\"` to keep the old behaviour",
-                name = self.name
-            )
-        })
+                 or write `network \"host\"` to keep the old behaviour"
+            ));
+        }
+        if written < PORTAL_CHILDREN_VERSION
+            && services
+                .iter()
+                .any(|s| matches!(s, Service::Portals { children } if children.is_empty()))
+        {
+            out.push(format!(
+                "a bare `portals` no longer opens ScreenCast, RemoteDesktop, InputCapture, \
+                 GlobalShortcuts, Background, DynamicLauncher, Location or Secret: each is \
+                 a child written inside the node, such as `portals {{ screencast }}` for \
+                 screen sharing, and the others are `remote-desktop`, `global-shortcuts`, \
+                 `background`, `location`, `secrets` and `camera`; run \
+                 `bubbler reseed {name}` to write the config again from its profile, or \
+                 `bubbler edit {name}` to add the children this application needs and \
+                 record the version"
+            ));
+        }
+        out
     }
 
     /// Whether `s` is among the granted services.
@@ -877,7 +908,7 @@ mod tests {
         // The version header is what stops every later run warning about
         // the meanings the file was written against.
         assert_eq!(reopened.config_version, Some(CONFIG_VERSION));
-        assert!(reopened.migration_warning().is_none());
+        assert!(reopened.migration_warning().is_empty());
         // What it replaced is kept beside it, and the temporary file the
         // rename went through is gone.
         assert_eq!(
@@ -895,7 +926,7 @@ mod tests {
         // re-flattened from the profile it came from.
         let reseeded = Instance::reseed(&env, "ff").unwrap();
         assert_eq!(reseeded.config, inst.config);
-        assert!(reseeded.migration_warning().is_none());
+        assert!(reseeded.migration_warning().is_empty());
     }
 
     #[test]
@@ -1037,14 +1068,17 @@ mod tests {
 
     /// The header a seeded file carries, and the warning a file written
     /// before there was one earns: `network` grants a different sandbox
-    /// now than it did then, and only the bare node changed meaning.
+    /// now than it did then, and only the bare node changed meaning. The
+    /// version that migration landed in is what it is measured against,
+    /// so a file recording it stays silent however far the current
+    /// version has moved on since.
     #[test]
     fn a_config_without_the_version_header_warns_about_a_bare_network() {
         let tmp = tempfile::tempdir().unwrap();
         let env = env(tmp.path());
         let inst = Instance::create(&env, "e", "generic").unwrap();
         assert_eq!(inst.config_version, Some(CONFIG_VERSION));
-        assert_eq!(inst.migration_warning(), None);
+        assert!(inst.migration_warning().is_empty());
 
         let cases = [
             ("network\n", true),
@@ -1060,9 +1094,9 @@ mod tests {
         for (text, warns) in cases {
             std::fs::write(inst.config_path(), text).unwrap();
             let opened = Instance::open(&env, "e").unwrap();
-            let warning = opened.migration_warning();
-            assert_eq!(warning.is_some(), warns, "{text:?}");
-            if let Some(w) = warning {
+            let warnings = opened.migration_warning();
+            assert_eq!(warnings.len(), usize::from(warns), "{text:?}");
+            for w in &warnings {
                 assert!(w.contains("isolated network namespace"), "{w}");
                 // Both ways out: one re-flattens the profile over the
                 // file, the other keeps what was written by hand.
@@ -1075,15 +1109,62 @@ mod tests {
         std::fs::write(inst.config_path(), "// bubbler config: 1\nnetwork\n").unwrap();
         let old = Instance::open(&env, "e").unwrap();
         assert_eq!(old.config_version, Some(1));
-        assert!(old.migration_warning().is_some());
+        assert_eq!(old.migration_warning().len(), 1);
 
         // A header further down is somebody's notes, not a header.
         std::fs::write(inst.config_path(), "network\n// bubbler config: 2\n").unwrap();
+        assert_eq!(
+            Instance::open(&env, "e").unwrap().migration_warning().len(),
+            1
+        );
+    }
+
+    /// A bare `portals` written before version 3 opened nine interfaces
+    /// this bubbler withholds, so a run of it says which children put
+    /// them back. A node that already names children has been through the
+    /// migration whatever the header says it is, and a file recording the
+    /// version is silent either way.
+    #[test]
+    fn a_config_written_before_the_portal_children_warns_about_a_bare_portals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = env(tmp.path());
+        let inst = Instance::create(&env, "e", "generic").unwrap();
+
+        let cases = [
+            ("dbus\nportals\n", 1),
+            ("dbus\nportals {\n    screencast\n}\n", 0),
+            ("dbus\n", 0),
+            ("// bubbler config: 3\ndbus\nportals\n", 0),
+            // Old enough for both, and each is its own line.
+            ("network\ndbus\nportals\n", 2),
+            ("// bubbler config: 2\nnetwork\ndbus\nportals\n", 1),
+        ];
+        for (text, count) in cases {
+            std::fs::write(inst.config_path(), text).unwrap();
+            let warnings = Instance::open(&env, "e").unwrap().migration_warning();
+            assert_eq!(warnings.len(), count, "{text:?}: {warnings:#?}");
+        }
+
+        std::fs::write(inst.config_path(), "dbus\nportals\n").unwrap();
+        let warnings = Instance::open(&env, "e").unwrap().migration_warning();
+        let w = &warnings[0];
+        assert!(
+            w.contains("a bare `portals` no longer opens ScreenCast"),
+            "{w}"
+        );
+        assert!(w.contains("`portals { screencast }`"), "{w}");
+        assert!(w.contains("`remote-desktop`"), "{w}");
+        assert!(w.contains("`secrets`"), "{w}");
+        assert!(w.contains("bubbler reseed e"), "{w}");
+        assert!(w.contains("bubbler edit e"), "{w}");
+
+        // And the version this bubbler writes clears it.
+        assert!(Instance::mark_version(&env, "e").unwrap());
         assert!(
             Instance::open(&env, "e")
                 .unwrap()
                 .migration_warning()
-                .is_some()
+                .is_empty()
         );
     }
 
@@ -1096,18 +1177,23 @@ mod tests {
         assert!(Instance::mark_version(&env, "e").unwrap());
         assert_eq!(
             std::fs::read_to_string(inst.config_path()).unwrap(),
-            "// bubbler profile: generic\n// bubbler config: 2\nnetwork\n"
+            format!("// bubbler profile: generic\n{CONFIG_HEADER}{CONFIG_VERSION}\nnetwork\n")
         );
         // Idempotent: a file that already records a version is left alone.
         assert!(!Instance::mark_version(&env, "e").unwrap());
-        assert_eq!(Instance::open(&env, "e").unwrap().migration_warning(), None);
+        assert!(
+            Instance::open(&env, "e")
+                .unwrap()
+                .migration_warning()
+                .is_empty()
+        );
 
         // Without a profile header the version goes to the top.
         std::fs::write(inst.config_path(), "network\n").unwrap();
         assert!(Instance::mark_version(&env, "e").unwrap());
         assert_eq!(
             std::fs::read_to_string(inst.config_path()).unwrap(),
-            "// bubbler config: 2\nnetwork\n"
+            format!("{CONFIG_HEADER}{CONFIG_VERSION}\nnetwork\n")
         );
 
         // An older header is replaced where it stands, never doubled.
@@ -1119,7 +1205,7 @@ mod tests {
         assert!(Instance::mark_version(&env, "e").unwrap());
         assert_eq!(
             std::fs::read_to_string(inst.config_path()).unwrap(),
-            "// bubbler profile: generic\n// bubbler config: 2\nnetwork\n"
+            format!("// bubbler profile: generic\n{CONFIG_HEADER}{CONFIG_VERSION}\nnetwork\n")
         );
     }
 
@@ -1586,7 +1672,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(after.config_path()).unwrap(),
-            "// bubbler profile: app\n// bubbler config: 2\nwayland\nnetwork\n"
+            format!("// bubbler profile: app\n{CONFIG_HEADER}{CONFIG_VERSION}\nwayland\nnetwork\n")
         );
         assert_eq!(
             fs::read_to_string(after.dir.join(BACKUP_FILE)).unwrap(),
