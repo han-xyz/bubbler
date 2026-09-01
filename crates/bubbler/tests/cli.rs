@@ -532,8 +532,10 @@ fn explain_puts_every_argument_under_the_node_it_came_from() {
     );
     assert!(
         s.contains(
-            "    rules: --talk=org.freedesktop.portal.Desktop\n           \
-             --talk=org.freedesktop.portal.Documents\n"
+            "    rules: --call=org.freedesktop.portal.Desktop=\
+             org.freedesktop.portal.FileChooser.*@/org/freedesktop/portal/desktop\n           \
+             --call=org.freedesktop.portal.Desktop=\
+             org.freedesktop.portal.OpenURI.*@/org/freedesktop/portal/desktop\n"
         ),
         "{s}"
     );

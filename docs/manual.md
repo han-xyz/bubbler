@@ -294,11 +294,9 @@ file descriptor numbers are the ones a dry run prints.
         --block-fd 4  (pipe: the sandbox waits on it until bubbler lets it go)
         --perms 0644 --ro-bind-data 9 /.flatpak-info  (generated file, 69 bytes)
         --bind /run/user/1000/doc/by-app/org.bubbler.ff /run/user/1000/doc
-        rules: --talk=org.freedesktop.portal.Desktop
-               --talk=org.freedesktop.portal.Documents
-               --talk=org.freedesktop.portal.FileChooser
-               --call=org.freedesktop.portal.*=*
-               --broadcast=org.freedesktop.portal.*=@/org/freedesktop/portal/*
+        rules: --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.FileChooser.*@/org/freedesktop/portal/desktop
+               --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.OpenURI.*@/org/freedesktop/portal/desktop
+               ...
 
       notify                          config.kdl:12  0 arguments
         rule-only: --talk=org.freedesktop.Notifications
@@ -3006,22 +3004,31 @@ of an id may hold a `-` and xdg-desktop-portal refuses every operation of a
 sandbox whose id it cannot parse; a leading digit is prefixed with `_`,
 which the portal would take but flatpak's own name check would not.
 
-The rules it grants are `--talk` for `org.freedesktop.portal.Desktop`
-and `.Documents`, one `--call` and one `--broadcast` per interface it
-opens on the desktop object, `--call=org.freedesktop.portal.Documents=*`,
-one `--call` and one `--broadcast` each for `Request` and `Session` —
-per-call and per-session objects that live under their own path rather
-than on the desktop object, so each needs a path-scoped rule of its
-own — and `--call` for `org.freedesktop.DBus.Properties.Get` and
-`.GetAll` on the desktop object, which `GDBusProxy` and libportal both
-call when a client constructs its proxy, before any portal call at
-all; `Set` is left out, since no portal property here is meant to be
-written from inside the sandbox. The interfaces the bare node opens on
-the desktop object are `FileChooser`, `OpenURI`, `Notification`,
-`Settings`, `Print`, `Email`, `Trash`, `Account`, `Inhibit`,
-`ProxyResolver`, `NetworkMonitor`, `MemoryMonitor`,
-`PowerProfileMonitor`, `Realtime` and `GameMode`, plus `Request` and
-`Session` on their own paths. Everything else is a child:
+The rules it grants are one `--call` and one `--broadcast` per interface
+it opens on the desktop object, a `--call` and a `--broadcast` wildcard
+for `org.freedesktop.portal.Documents`, one `--call` and one
+`--broadcast` each for `Request` and `Session` — per-call and
+per-session objects that live under their own path rather than on the
+desktop object, so each needs a path-scoped rule of its own — `--call`
+for `org.freedesktop.DBus.Properties.Get` and `.GetAll` on the desktop
+object, which `GDBusProxy` and libportal both call when a client
+constructs its proxy, before any portal call at all, and `--call` for
+`org.freedesktop.DBus.Introspectable.Introspect` on the same object,
+which is how a client discovers what this session serves. `Properties.Set`
+is left out, since no portal property here is meant to be written from
+inside the sandbox.
+
+No `--talk` for either bus name. `xdg-dbus-proxy(1)` resolves a name to
+one point on an ordered ladder — SEE below TALK below OWN — and a
+`--call` rule only applies while the name sits below TALK, so naming
+`org.freedesktop.portal.Desktop` in a `--talk` as well would forward
+every call to it and leave the rules above as dead text.
+
+The interfaces the bare node opens on the desktop object are
+`FileChooser`, `OpenURI`, `Notification`, `Settings`, `Print`, `Email`,
+`Trash`, `Account`, `Inhibit`, `ProxyResolver`, `NetworkMonitor`,
+`MemoryMonitor`, `PowerProfileMonitor`, `Realtime` and `GameMode`, plus
+`Request` and `Session` on their own paths. Everything else is a child:
 
 | child | interfaces | what it costs |
 |---|---|---|

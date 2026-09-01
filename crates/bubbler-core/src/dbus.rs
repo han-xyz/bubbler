@@ -113,6 +113,12 @@ fn portal_broadcast(iface: &str) -> String {
 /// `Documents` bus keeps a wildcard: it is one service with no
 /// privileged interface on it, and the document view it serves is the
 /// grant itself.
+// No `--talk` of either bus name. `xdg-dbus-proxy(1)` resolves a name to
+// one point on an ordered ladder — SEE < TALK < OWN — and a `--call`
+// rule only applies while the name sits below TALK. Naming
+// `org.freedesktop.portal.Desktop` in both would forward every call and
+// leave the rules below as dead text, which is the whole of what this
+// function is for.
 pub fn portal_rules(children: &[Portal]) -> Vec<String> {
     let ifaces = || {
         PORTAL_SAFE
@@ -120,13 +126,13 @@ pub fn portal_rules(children: &[Portal]) -> Vec<String> {
             .copied()
             .chain(children.iter().flat_map(|c| c.interfaces().iter().copied()))
     };
-    let mut out = vec![
-        "--talk=org.freedesktop.portal.Desktop".to_owned(),
-        "--talk=org.freedesktop.portal.Documents".to_owned(),
-    ];
-    out.extend(ifaces().map(portal_call));
+    let mut out: Vec<String> = ifaces().map(portal_call).collect();
     out.push("--call=org.freedesktop.portal.Documents=*".to_owned());
     out.extend(ifaces().map(portal_broadcast));
+    // The `Documents` broadcast wildcard is what a `--talk` of that name
+    // used to carry: a filtered name receives no signal without a
+    // `--broadcast` rule of its own.
+    out.push("--broadcast=org.freedesktop.portal.Documents=*".to_owned());
     // Request and Session are per-call and per-session objects, not
     // interfaces on the desktop object itself, so both the calls a
     // sandbox makes on them (Close, in practice) and the Response/
@@ -152,6 +158,13 @@ pub fn portal_rules(children: &[Portal]) -> Vec<String> {
     ));
     out.push(format!(
         "--call=org.freedesktop.portal.Desktop=org.freedesktop.DBus.Properties.GetAll@{DESKTOP_PATH}"
+    ));
+    // Introspection is how a client discovers which portal interfaces
+    // this session actually serves; a Qt or `gdbus`-style client asks for
+    // it before its first call. It reads the desktop object's XML and
+    // nothing else, so it is safe where `Properties.Set` is not.
+    out.push(format!(
+        "--call=org.freedesktop.portal.Desktop=org.freedesktop.DBus.Introspectable.Introspect@{DESKTOP_PATH}"
     ));
     out
 }
@@ -986,14 +999,8 @@ mod tests {
     #[test]
     fn the_bare_bundle_opens_the_safe_interfaces_only() {
         let rules = portal_rules(&[]);
-        assert_eq!(
-            rules[..2],
-            [
-                "--talk=org.freedesktop.portal.Desktop",
-                "--talk=org.freedesktop.portal.Documents",
-            ]
-        );
         assert!(rules.contains(&"--call=org.freedesktop.portal.Documents=*".to_owned()));
+        assert!(rules.contains(&"--broadcast=org.freedesktop.portal.Documents=*".to_owned()));
         assert!(
             rules.contains(
                 &"--call=org.freedesktop.portal.Desktop=org.freedesktop.portal.FileChooser.*\
@@ -1035,15 +1042,23 @@ mod tests {
              @/org/freedesktop/portal/desktop",
             "--call=org.freedesktop.portal.Desktop=org.freedesktop.DBus.Properties.GetAll\
              @/org/freedesktop/portal/desktop",
+            "--call=org.freedesktop.portal.Desktop=org.freedesktop.DBus.Introspectable.Introspect\
+             @/org/freedesktop/portal/desktop",
         ] {
             assert!(rules.contains(&rule.to_owned()), "{rule}");
         }
-        // Gone: the wildcards, a `--talk` of an interface that is not a
-        // bus name and so named nothing, and a Request/Session rule at
-        // the bare desktop path — no object of either kind is ever
+        // Gone: the wildcards, every `--talk`, and a Request/Session rule
+        // at the bare desktop path — no object of either kind is ever
         // served there, so such a rule would match nothing bwrap sends.
+        // A `--talk` of a name this function also filters puts that name
+        // above FILTERED on the proxy's ladder, which forwards every call
+        // to it and makes every rule below inert.
         for gone in [
+            "--talk=org.freedesktop.portal.Desktop",
+            "--talk=org.freedesktop.portal.Documents",
             "--talk=org.freedesktop.portal.FileChooser",
+            "--call=org.freedesktop.portal.Desktop=org.freedesktop.DBus.Properties.Set\
+             @/org/freedesktop/portal/desktop",
             "--call=org.freedesktop.portal.*=*",
             "--broadcast=org.freedesktop.portal.*=@/org/freedesktop/portal/*",
             "--call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Request.*\
