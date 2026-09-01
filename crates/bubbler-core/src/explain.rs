@@ -405,13 +405,20 @@ fn wl_sidecar_line(plan: &wayland::ProxyPlan) -> String {
     // read the registry, which an explanation never does. It is shown
     // whether or not the compositor also took a security context: the
     // proxy applies PRIVILEGED either way, and `context` says only
-    // whether the compositor withholds them as well.
+    // whether the compositor withholds them as well — which is what the
+    // last field reports, since one enforcer and two are not the same
+    // sandbox.
     format!(
-        "    sidecar: bubbler-wl-proxy listener {} → upstream {}, gate {}, hides {} privileged globals",
+        "    sidecar: bubbler-wl-proxy listener {} → upstream {}, gate {}, \
+         hides {} privileged globals, compositor enforces too: {}",
         plan.listener.display(),
         plan.upstream.display(),
         plan.gate(),
-        wayland::PRIVILEGED.len()
+        wayland::PRIVILEGED.len(),
+        match plan.context {
+            true => "yes",
+            false => "no",
+        }
     )
 }
 
@@ -852,12 +859,12 @@ bwrap
             (
                 wayland::ProxyPlan::context(dir, Clipboard::Paste),
                 "    sidecar: bubbler-wl-proxy listener \
-                 /run/user/1000/bubbler/t/wayland → upstream /run/user/1000/bubbler/t/wayland-context, gate paste, hides 40 privileged globals",
+                 /run/user/1000/bubbler/t/wayland → upstream /run/user/1000/bubbler/t/wayland-context, gate paste, hides 40 privileged globals, compositor enforces too: yes",
             ),
             (
                 wayland::ProxyPlan::fallback(dir, session, Clipboard::Open),
                 "    sidecar: bubbler-wl-proxy listener \
-                 /run/user/1000/bubbler/t/wayland → upstream /run/user/1000/wayland-1, gate open, hides 40 privileged globals",
+                 /run/user/1000/bubbler/t/wayland → upstream /run/user/1000/wayland-1, gate open, hides 40 privileged globals, compositor enforces too: no",
             ),
         ] {
             let cfg = cfg("wayland\ncommand \"true\"");

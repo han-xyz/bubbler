@@ -309,7 +309,7 @@ file descriptor numbers are the ones a dry run prints.
         --setenv WAYLAND_DISPLAY wayland-1
         --setenv XDG_SESSION_TYPE wayland
         security-context: engine=org.bubbler app=org.bubbler.ff instance=bubbler-ff
-        sidecar: bubbler-wl-proxy listener /run/user/1000/bubbler/ff/wayland → upstream /run/user/1000/bubbler/ff/wayland-context, gate paste, hides 40 privileged globals
+        sidecar: bubbler-wl-proxy listener /run/user/1000/bubbler/ff/wayland → upstream /run/user/1000/bubbler/ff/wayland-context, gate paste, hides 40 privileged globals, compositor enforces too: yes
 
       network                         config.kdl:7   5 arguments
         --perms 0644 --ro-bind-data 8 /etc/resolv.conf  (generated file, 23 bytes)
@@ -941,10 +941,13 @@ another compositor implements, or that Hyprland hands a sandboxed client
 anyway. It stays a denylist and not "the class of privileged protocols": one
 nobody has written into it is advertised to the sandbox on this path, and a line
 in `PRIVILEGED` is the only thing that hides it. The sidecar line of an
-explanation gains `, hides 40 privileged globals` on that path, which is the
-length of the denylist and not a count of what a given compositor offers — an
-explanation never probes, so one printed from the command line always describes
-the security-context path.
+explanation always carries `hides 40 privileged globals`, which is the length
+of the denylist and not a count of what a given compositor offers, and ends
+with `compositor enforces too: yes` or `: no` — whether the privileged globals
+are withheld twice, by the compositor and by the proxy, or only by the proxy.
+An explanation never probes, so one printed from the command line always
+describes the security-context path and always says `yes`; the `no` is what a
+run on a compositor without the protocol is explained as.
 
 A compositor bubbler cannot reach at all — nothing answering on
 `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY` — stops the run instead, the way a missing

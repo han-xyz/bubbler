@@ -748,7 +748,8 @@ fn wayland_dry_run_binds_the_socket_the_proxy_serves() {
     assert!(
         s.contains(&format!(
             "\n    sidecar: bubbler-wl-proxy listener {run}/bubbler/t/wayland \
-             → upstream {run}/bubbler/t/wayland-context, gate paste, hides 40 privileged globals\n",
+             → upstream {run}/bubbler/t/wayland-context, gate paste, hides 40 privileged globals, \
+             compositor enforces too: yes\n",
             run = run.display()
         )),
         "{s}"
