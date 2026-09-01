@@ -398,22 +398,19 @@ fn sidecar_line(cfg: &NetworkConfig) -> String {
 /// does with a clipboard read. None of it is a bwrap argument of the
 /// sandbox, so nothing else in this view would show it.
 fn wl_sidecar_line(plan: &wayland::ProxyPlan) -> String {
-    let mut line = format!(
-        "    sidecar: bubbler-wl-proxy listener {} → upstream {}, gate {}",
-        plan.listener.display(),
-        plan.upstream.display(),
-        plan.gate()
-    );
     // The count is the denylist's length, not a measurement: how many of
     // those a compositor actually offers is only known once a client has
-    // read the registry, which an explanation never does.
-    if !plan.context {
-        line.push_str(&format!(
-            ", hides {} privileged globals",
-            wayland::PRIVILEGED.len()
-        ));
-    }
-    line
+    // read the registry, which an explanation never does. It is shown
+    // whether or not the compositor also took a security context: the
+    // proxy applies PRIVILEGED either way, and `context` says only
+    // whether the compositor withholds them as well.
+    format!(
+        "    sidecar: bubbler-wl-proxy listener {} → upstream {}, gate {}, hides {} privileged globals",
+        plan.listener.display(),
+        plan.upstream.display(),
+        plan.gate(),
+        wayland::PRIVILEGED.len()
+    )
 }
 
 /// The D-Bus proxy rules of the node at `index`, in the order the proxy
@@ -832,7 +829,7 @@ bwrap
             (
                 wayland::ProxyPlan::context(dir, Clipboard::Paste),
                 "    sidecar: bubbler-wl-proxy listener \
-                 /run/user/1000/bubbler/t/wayland → upstream /run/user/1000/bubbler/t/wayland-context, gate paste",
+                 /run/user/1000/bubbler/t/wayland → upstream /run/user/1000/bubbler/t/wayland-context, gate paste, hides 40 privileged globals",
             ),
             (
                 wayland::ProxyPlan::fallback(dir, session, Clipboard::Open),

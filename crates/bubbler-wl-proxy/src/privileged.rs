@@ -1,9 +1,10 @@
-/// Wayland interfaces the proxy hides from a sandbox when the
-/// compositor has no `wp_security_context_v1` to hide them itself:
-/// screen capture, clipboard management without focus, input injection
-/// and keyboard grabs, session lock, overlays, output control, and the
-/// protocols that watch the session rather than the client's own window
-/// — foreign-toplevel listing, idle notification.
+/// Wayland interfaces the proxy hides from a sandbox on every
+/// connection, whether or not the compositor also withholds them
+/// through `wp_security_context_v1` of its own: screen capture,
+/// clipboard management without focus, input injection and keyboard
+/// grabs, session lock, overlays, output control, and the protocols
+/// that watch the session rather than the client's own window —
+/// foreign-toplevel listing, idle notification.
 ///
 /// The names started as what Hyprland 0.56 withholds from a
 /// security-context client (31 of the 71 interfaces the same session
@@ -11,8 +12,8 @@
 /// proxy's tables describe against that same class — protocols another
 /// compositor implements, or that Hyprland hands a sandboxed client
 /// anyway. It is a denylist and nothing more: a privileged protocol
-/// nobody has written down here is advertised to the sandbox on the
-/// fallback path, and adding it is the only thing that hides it.
+/// nobody has written down here is advertised to the sandbox, and
+/// adding it is the only thing that hides it.
 ///
 /// The other side of that audit is `tables::ALLOWED_GLOBALS`, which
 /// names every global this list deliberately lets through, so a new one
