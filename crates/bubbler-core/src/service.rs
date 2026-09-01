@@ -2476,6 +2476,9 @@ mod tests {
             fn read_link(&self, p: &Path) -> std::io::Result<Option<PathBuf>> {
                 self.0.read_link(p)
             }
+            fn read_text(&self, p: &Path, limit: u64) -> Option<String> {
+                self.0.read_text(p, limit)
+            }
         }
         let e = env();
         let mut args = BwrapArgs::baseline(&e, Path::new("/i/home"), &host);

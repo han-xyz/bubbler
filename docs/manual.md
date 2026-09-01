@@ -2778,7 +2778,11 @@ suppression outliving what it was written for — and the one check no
 `lint-allow` silences, since that node would be the unused one),
 `x11-nested-no-wm` (a nested `x11` with neither `fullscreen=#true` nor `wm=`:
 the server it starts has no window manager, so the X windows inside are
-undecorated and unmanaged in the one compositor window it draws).
+undecorated and unmanaged in the one compositor window it draws),
+`pulseaudio-module-loading` (a `pulseaudio` grant on a host whose effective
+`pipewire-pulse.conf` leaves `pulse.allow-module-loading` on — the daemon's
+own default — so the host's audio daemon will load a module, a network sink
+among them, because the sandbox asked it to).
 
 A warning or a note is accepted with a `lint-allow` node, which takes a check
 id and a required reason:

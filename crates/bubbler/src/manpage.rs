@@ -377,6 +377,12 @@ const CHECK_LINES: &[(&str, &str)] = &[
          than answered.",
     ),
     (
+        "pulseaudio-module-loading",
+        "A `pulseaudio` grant on a host whose effective `pipewire-pulse.conf` leaves \
+         `pulse.allow-module-loading` on, so the host's audio daemon will load a module \
+         — a network sink among them — because the sandbox asked it to.",
+    ),
+    (
         "seccomp-disabled",
         "`seccomp { disable }` leaves the sandbox with no syscall filter at all.",
     ),

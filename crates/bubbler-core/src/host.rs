@@ -32,6 +32,11 @@ pub trait Host {
     /// root of its user namespace, past every mode that stops the user,
     /// so "cannot tell" is an answer of its own and never "no".
     fn read_link(&self, p: &Path) -> io::Result<Option<PathBuf>>;
+    /// The first `limit` bytes of `p` as text, or `None` when `p` is not
+    /// a regular file, cannot be read, or is not UTF-8. For the host's
+    /// own daemon configuration; nothing the sandbox can write is read
+    /// through it.
+    fn read_text(&self, p: &Path, limit: u64) -> Option<String>;
 }
 
 /// The real filesystem.
@@ -85,6 +90,18 @@ impl Host for RealHost {
         names.sort();
         names
     }
+
+    fn read_text(&self, p: &Path, limit: u64) -> Option<String> {
+        // The type is checked first, so a fifo left where a config file
+        // belongs cannot block the read.
+        if !self.file_type(p).is_some_and(|t| t.is_file()) {
+            return None;
+        }
+        let file = fs::File::open(p).ok()?;
+        let mut text = String::new();
+        io::Read::read_to_string(&mut io::Read::take(file, limit), &mut text).ok()?;
+        Some(text)
+    }
 }
 
 #[cfg(test)]
@@ -103,6 +120,7 @@ pub(crate) mod fake {
         pub writable: BTreeSet<PathBuf>,
         pub unresolved: BTreeSet<PathBuf>,
         pub unreadable: BTreeSet<PathBuf>,
+        pub texts: BTreeMap<PathBuf, String>,
     }
 
     impl FakeHost {
@@ -140,6 +158,13 @@ pub(crate) mod fake {
         /// cannot search.
         pub fn unreadable(mut self, p: &str) -> Self {
             self.unreadable.insert(PathBuf::from(p));
+            self
+        }
+
+        /// A regular file holding `text`, for the checks that read the
+        /// host's own configuration.
+        pub fn text(mut self, p: &str, text: &str) -> Self {
+            self.texts.insert(PathBuf::from(p), text.to_owned());
             self
         }
     }
@@ -190,15 +215,25 @@ pub(crate) mod fake {
             }
             Ok(self.links.get(p).cloned())
         }
+        /// Entries and [`FakeHost::text`] files both count: a config file
+        /// a check finds by listing its directory is registered by
+        /// content alone, with no `with` naming its type.
         fn list_dir(&self, p: &Path) -> Vec<OsString> {
             let mut v: Vec<OsString> = self
                 .entries
                 .keys()
+                .chain(self.texts.keys())
                 .filter(|k| k.parent() == Some(p))
                 .filter_map(|k| k.file_name().map(|n| n.to_os_string()))
                 .collect();
             v.sort();
+            v.dedup();
             v
+        }
+        fn read_text(&self, p: &Path, limit: u64) -> Option<String> {
+            let text = self.texts.get(p)?;
+            let end = usize::try_from(limit).unwrap_or(usize::MAX).min(text.len());
+            Some(text[..end].to_owned())
         }
     }
 

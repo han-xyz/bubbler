@@ -1411,10 +1411,15 @@ mod tests {
                 .unwrap_or_else(|err| panic!("{name} with its opt-ins pasted in: {err}"));
 
             // The host is built from what the pasted config asks for, so
-            // the run measures the grants and not this machine.
+            // the run measures the grants and not this machine. This
+            // also keeps `pulse.allow-module-loading` off, or every
+            // `pulseaudio` grant would carry the daemon-default note.
             let tmp = tempfile::tempdir().unwrap();
             let e = env(tmp.path());
-            let mut host = FakeHost::default();
+            let mut host = FakeHost::default().text(
+                "/usr/share/pipewire/pipewire-pulse.conf",
+                "pulse.properties = {\n    pulse.allow-module-loading = false\n}\n",
+            );
             {
                 let mut add = |p: &Path, t| {
                     host = std::mem::take(&mut host)

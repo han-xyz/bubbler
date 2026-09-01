@@ -177,6 +177,13 @@ const PORTAL_TALK_WITHOUT_PORTALS: Check = Check {
     id: "portal-talk-without-portals",
     severity: Severity::Warning,
 };
+// Information, not a warning: what the host's audio daemon will do for
+// any client is not a mistake in this file, and the file cannot change
+// it.
+const PULSEAUDIO_MODULE_LOADING: Check = Check {
+    id: "pulseaudio-module-loading",
+    severity: Severity::Note,
+};
 const SECCOMP_DISABLED: Check = Check {
     id: "seccomp-disabled",
     severity: Severity::Warning,
@@ -259,6 +266,7 @@ pub const CHECKS: &[Check] = &[
     PATH_SHARE_RESERVED,
     PATH_SHARE_SOCKET,
     PORTAL_TALK_WITHOUT_PORTALS,
+    PULSEAUDIO_MODULE_LOADING,
     SECCOMP_DISABLED,
     SECRETS_ACCESS,
     SHARE_SOURCE_MISSING,
@@ -1055,6 +1063,73 @@ fn rule_name(node: &KdlNode) -> Option<&str> {
     }
 }
 
+/// Most of a PipeWire configuration file that is read looking for one
+/// property. Larger than any of them; a file past it is a file this
+/// check has nothing to say about.
+const PULSE_CONF_BYTES: u64 = 256 * 1024;
+
+/// The property that decides whether the host's pulse server loads a
+/// module because a client asked it to.
+const PULSE_MODULE_KEY: &str = "pulse.allow-module-loading";
+
+/// The `pipewire-pulse.conf` files in force, in the order they are
+/// applied. archwiki (*PipeWire* § Configuration): the package's files
+/// are in `/usr/share/pipewire`, a copy in `/etc/pipewire` or
+/// `~/.config/pipewire` takes precedence, and the higher-precedence copy
+/// makes the others ignored — so exactly one main file counts. The
+/// shipped file's own header names the two drop-in directories, which
+/// are applied over it.
+fn pulse_conf_files(ctx: &Context) -> Vec<PathBuf> {
+    let dirs = [
+        PathBuf::from("/usr/share/pipewire"),
+        PathBuf::from("/etc/pipewire"),
+        ctx.env.config_home.join("pipewire"),
+    ];
+    let mut files: Vec<PathBuf> = dirs
+        .iter()
+        .rev()
+        .map(|d| d.join("pipewire-pulse.conf"))
+        .find(|p| ctx.host.read_text(p, PULSE_CONF_BYTES).is_some())
+        .into_iter()
+        .collect();
+    for dir in &dirs {
+        let d = dir.join("pipewire-pulse.conf.d");
+        let mut names = ctx.host.list_dir(&d);
+        names.sort();
+        files.extend(names.into_iter().map(|n| d.join(n)));
+    }
+    files
+}
+
+/// Whether the host's pulse server still loads a module on a client's
+/// say-so. The daemon's own default is on: the shipped configuration
+/// carries the property commented out. The files are read line by line
+/// rather than parsed as SPA-JSON — this is a note, and the shape that
+/// turns it off is one line wherever it is written.
+fn pulse_module_loading_on(ctx: &Context) -> bool {
+    let mut on = true;
+    for path in pulse_conf_files(ctx) {
+        let Some(text) = ctx.host.read_text(&path, PULSE_CONF_BYTES) else {
+            continue;
+        };
+        for line in text.lines() {
+            let line = line.trim();
+            if line.starts_with('#') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if key.trim().trim_matches('"') != PULSE_MODULE_KEY {
+                continue;
+            }
+            let value = value.trim().trim_end_matches([',', '}']).trim();
+            on = !value.eq_ignore_ascii_case("false");
+        }
+    }
+    on
+}
+
 /// Checks that need one layer and nothing else, apart from `host_net`:
 /// the merged mode a `camera` message reads differently under.
 fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut Findings) {
@@ -1144,6 +1219,18 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
             "camera" if flag(node, "nodes") == Some(true) => {
                 camera_nodes(ctx, i, node, host_net, f);
             }
+            "pulseaudio" if pulse_module_loading_on(ctx) => f.push(
+                i,
+                node,
+                &PULSEAUDIO_MODULE_LOADING,
+                "the host audio daemon will load network modules on the sandbox's \
+                 behalf: the effective `pipewire-pulse.conf` leaves \
+                 `pulse.allow-module-loading` on"
+                    .to_owned(),
+                "write `pulse.properties = { pulse.allow-module-loading = false }` into \
+                 `~/.config/pipewire/pipewire-pulse.conf.d/10-no-modules.conf` unless an \
+                 application of yours loads pulse modules",
+            ),
             "dbus" => dbus_node(i, node, f),
             "system-bus" => system_bus(i, node, f),
             "app-runtime" if prop(node, "mode") == Some("rw") => f.push(
@@ -3085,6 +3172,57 @@ mod tests {
         });
     }
 
+    /// The daemon's own default is on, so a host that says nothing gets
+    /// the note; a drop-in that turns it off silences it, and the note
+    /// is about the `pulseaudio` grant, not about a host without one.
+    #[test]
+    fn pulseaudio_module_loading_follows_the_effective_pipewire_config() {
+        let bare = host().text(
+            "/usr/share/pipewire/pipewire-pulse.conf",
+            "pulse.properties = {\n    #pulse.allow-module-loading = true\n}\n",
+        );
+        with(&bare, |ctx| {
+            let report = lint(ctx, &["pulseaudio"]);
+            assert_eq!(ids(&report), ["pulseaudio-module-loading"]);
+            assert_eq!(report.findings[0].severity, Severity::Note);
+            assert!(
+                report.findings[0].message.contains(
+                    "the host audio daemon will load network modules on the \
+                              sandbox's behalf"
+                ),
+                "{}",
+                report.findings[0].message
+            );
+            assert_eq!(ids(&lint(ctx, &["wayland"])), [] as [&str; 0]);
+        });
+
+        let off = bare.text(
+            "/home/user/.config/pipewire/pipewire-pulse.conf.d/10-no-modules.conf",
+            "pulse.properties = {\n    pulse.allow-module-loading = false\n}\n",
+        );
+        with(&off, |ctx| {
+            assert_eq!(ids(&lint(ctx, &["pulseaudio"])), [] as [&str; 0]);
+        });
+
+        // A drop-in that turns it back on is later in precedence than
+        // the system file that turned it off.
+        let back_on = host()
+            .text(
+                "/etc/pipewire/pipewire-pulse.conf",
+                "pulse.properties = {\n    pulse.allow-module-loading = false\n}\n",
+            )
+            .text(
+                "/home/user/.config/pipewire/pipewire-pulse.conf.d/99-modules.conf",
+                "pulse.properties = {\n    pulse.allow-module-loading = true\n}\n",
+            );
+        with(&back_on, |ctx| {
+            assert_eq!(
+                ids(&lint(ctx, &["pulseaudio"])),
+                ["pulseaudio-module-loading"]
+            );
+        });
+    }
+
     #[test]
     fn every_builtin_profile_lints_clean() {
         // The host is built from what each profile asks for, so the run
@@ -3101,7 +3239,13 @@ mod tests {
             let cfg = config::parse_profile(text)
                 .unwrap_or_else(|err| panic!("{name}: {err}"))
                 .config;
-            let mut host = FakeHost::default();
+            // This measures the profiles' own grants, not this host's
+            // pipewire config — otherwise every `pulseaudio` grant would
+            // carry `pulseaudio-module-loading` by the daemon's default.
+            let mut host = FakeHost::default().text(
+                "/usr/share/pipewire/pipewire-pulse.conf",
+                "pulse.properties = {\n    pulse.allow-module-loading = false\n}\n",
+            );
             let mut add = |p: &Path, t| {
                 host = std::mem::take(&mut host)
                     .with(p.to_str().expect("built-in profiles hold UTF-8 paths"), t);
