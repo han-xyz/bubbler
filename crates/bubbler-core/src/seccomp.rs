@@ -115,7 +115,11 @@ pub const DEFAULT_ENOSYS: &[&str] = &[
 /// has no name for them: the newest of the mount API (`open_tree_attr`),
 /// the namespace-listing call (`listns`) and `fchroot`. Numbers from
 /// `asm/unistd_64.h`; post-424 numbers are shared with i386, which
-/// `asm/unistd_32.h` confirms for 467 and 470.
+/// `asm/unistd_32.h` confirms for 467 and 470. `fchroot` is proposed and
+/// not merged, so 472 is allocated to nothing yet and the rule denies a
+/// number that already answers `ENOSYS`;
+/// `no_numbered_rule_names_a_number_the_headers_give_to_another_call`
+/// is what fails the day a kernel gives it to some other call.
 ///
 /// They are added through [`ScmpSyscall::from`] so libseccomp's name
 /// table is never consulted, and they go into the filter *before* the
@@ -683,6 +687,37 @@ mod tests {
             set.enosys_numbered[0],
             ("open_tree_attr".to_owned(), 467, Errno::Enosys)
         );
+    }
+
+    /// A rule written as a number denies whatever the kernel puts on that
+    /// number, and a profile can only take it back by a name nobody would
+    /// know to type. So each number is measured against this host's own
+    /// `asm/unistd_64.h`: a number the headers give to another call fails
+    /// here, and the entry has to go.
+    #[test]
+    fn no_numbered_rule_names_a_number_the_headers_give_to_another_call() {
+        // A build host without kernel headers has nothing to measure
+        // against, the way a host without `bwrap` has no sandbox to test.
+        let Ok(header) = std::fs::read_to_string("/usr/include/asm/unistd_64.h") else {
+            println!("no /usr/include/asm/unistd_64.h on this host; nothing to check");
+            return;
+        };
+        let allocated: Vec<(&str, i32)> = header
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("#define __NR_"))
+            .filter_map(|rest| rest.split_once(char::is_whitespace))
+            .filter_map(|(name, number)| Some((name, number.trim().parse().ok()?)))
+            .collect();
+        for (name, number) in DEFAULT_ENOSYS_NUMBERED {
+            let Some((allocated_to, _)) = allocated.iter().find(|(_, n)| n == number) else {
+                continue;
+            };
+            assert_eq!(
+                allocated_to, name,
+                "syscall {number} is `{allocated_to}` in this host's headers, \
+                 not `{name}`: the rule denies `{allocated_to}` in every sandbox"
+            );
+        }
     }
 
     /// A profile that names one takes its rule back, exactly as it does
