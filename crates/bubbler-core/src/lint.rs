@@ -96,6 +96,17 @@ const DBUS_WITHOUT_RULES: Check = Check {
     id: "dbus-without-rules",
     severity: Severity::Warning,
 };
+// An error, not a warning: these names are a way to run a command
+// outside the sandbox, so granting one is not a wider sandbox but no
+// sandbox at all.
+const DBUS_NAME_IS_HOST_EXEC: Check = Check {
+    id: "dbus-name-is-host-exec",
+    severity: Severity::Error,
+};
+const DBUS_NAME_IS_RISKY: Check = Check {
+    id: "dbus-name-is-risky",
+    severity: Severity::Warning,
+};
 const DUP_NAME_POLICY: Check = Check {
     id: "dup-name-policy",
     severity: Severity::Error,
@@ -221,6 +232,8 @@ pub const CHECKS: &[Check] = &[
     CAMERA_NODES_NO_HOTPLUG,
     CAMERA_WITHOUT_PORTALS,
     COMMAND_NOT_FOUND,
+    DBUS_NAME_IS_HOST_EXEC,
+    DBUS_NAME_IS_RISKY,
     DBUS_WITHOUT_RULES,
     DESKTOP_ENTRY_MISSING,
     DUP_NAME_POLICY,
@@ -417,6 +430,97 @@ const SECRET_VALUES: &[&str] = &["ghp_", "sk-", "AKIA"];
 /// The Secret Service name: one session-bus name for every secret the
 /// login keyring holds, with no partitioning between applications.
 const SECRETS_NAME: &str = "org.freedesktop.secrets";
+
+/// Session- and system-bus names that are a way to run a command outside
+/// the sandbox. `org.freedesktop.systemd1` starts a transient unit,
+/// `org.freedesktop.Flatpak` has `Spawn`, `ca.desrt.dconf` writes the
+/// session's settings database, and an `org.freedesktop.impl.portal.*`
+/// name is the *backend* of a portal rather than the portal, so a
+/// sandbox owning or calling one answers the dialogs it should be shown.
+/// A trailing `.*` here is a family; a rule naming any member matches.
+const HOST_EXEC_NAMES: &[&str] = &[
+    "org.freedesktop.systemd1",
+    "org.freedesktop.Flatpak",
+    "org.freedesktop.impl.portal.*",
+    "ca.desrt.dconf",
+];
+
+/// Names that are defensible and worth writing down, each with the one
+/// sentence a reader needs about what the name is.
+const RISKY_NAMES: &[(&str, &str)] = &[
+    (
+        "org.kde.KWin",
+        "the KWin compositor's own bus name: window management, scripting and \
+         screen capture for the whole session",
+    ),
+    (
+        "org.gnome.Shell",
+        "the GNOME shell's own bus name: extensions, the screenshot and \
+         screencast interfaces, and `Eval` where it is built in",
+    ),
+    (
+        "org.freedesktop.FileManager1",
+        "the session's file manager: the sandbox can have it open any host \
+         path in a window of yours",
+    ),
+    (
+        SECRETS_NAME,
+        "the Secret Service API, which is the whole login keyring with no \
+         partitioning between the applications that call it",
+    ),
+];
+
+/// Whether the name a rule writes reaches the name or family `listed`.
+/// Either side may end in `.*`, which stands for every name under the
+/// prefix: `talk "org.freedesktop.*"` reaches `org.freedesktop.systemd1`,
+/// and `org.freedesktop.impl.portal.*` is reached by naming any one of
+/// its members.
+fn name_covers(written: &str, listed: &str) -> bool {
+    let under = |glob: &str, name: &str| {
+        glob.strip_suffix('*')
+            .is_some_and(|prefix| name.starts_with(prefix))
+    };
+    written == listed || under(written, listed) || under(listed, written)
+}
+
+/// The two name checks, over every rule of every bus node. Read across
+/// both buses because the proxy is one process and the names mean the
+/// same thing on either.
+fn bus_names(i: usize, source: &Source, f: &mut Findings) {
+    for (_, rule) in bus_rules(source) {
+        let level = rule.name().value();
+        if !matches!(level, "see" | "talk" | "own" | "call" | "broadcast") {
+            continue;
+        }
+        let Some(name) = rule_name(rule) else {
+            continue;
+        };
+        if HOST_EXEC_NAMES.iter().any(|l| name_covers(name, l)) {
+            f.push(
+                i,
+                rule,
+                &DBUS_NAME_IS_HOST_EXEC,
+                format!(
+                    "`{level} \"{name}\"` reaches a bus name that runs code outside the \
+                     sandbox, so the grant is not a wider sandbox but no sandbox"
+                ),
+                "drop the rule; if the app needs one method of it, there is no narrower \
+                 form that helps — the name itself is the escape",
+            );
+        }
+        if let Some((_, what)) = RISKY_NAMES.iter().find(|(l, _)| name_covers(name, l)) {
+            f.push(
+                i,
+                rule,
+                &DBUS_NAME_IS_RISKY,
+                format!("`{level} \"{name}\"` is {what}"),
+                "drop the rule, narrow it to the one method the app needs with \
+                 `call \"<name>=<interface>.<method>@<path>\"`, or accept it with \
+                 `lint-allow \"dbus-name-is-risky\" reason=\"...\"`",
+            );
+        }
+    }
+}
 
 /// The prefix every XDG desktop portal name starts with.
 const PORTAL_PREFIX: &str = "org.freedesktop.portal.";
@@ -945,6 +1049,7 @@ fn rule_name(node: &KdlNode) -> Option<&str> {
 /// Checks that need one layer and nothing else, apart from `host_net`:
 /// the merged mode a `camera` message reads differently under.
 fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut Findings) {
+    bus_names(i, source, f);
     for node in source.doc.nodes() {
         match node.name().value() {
             "x11" if arg(node) == Some("host") => f.push(
@@ -2236,24 +2341,33 @@ mod tests {
     #[test]
     fn reaching_the_secret_service_is_a_note() {
         with(&host(), |ctx| {
+            // The name is also `dbus-name-is-risky` now (deliberate: both
+            // checks say something true and different about the name).
             for rule in ["talk", "own"] {
                 let text = format!("dbus {{\n    {rule} \"org.freedesktop.secrets\"\n}}");
                 let report = lint(ctx, &[&text]);
-                assert_eq!(ids(&report), ["secrets-access"], "{text}");
-                assert_eq!(report.findings[0].severity, Severity::Note);
-                assert!(
-                    report.findings[0].message.contains("login keyring"),
-                    "{report:?}"
+                assert_eq!(
+                    ids(&report),
+                    ["dbus-name-is-risky", "secrets-access"],
+                    "{text}"
                 );
+                let note = report
+                    .findings
+                    .iter()
+                    .find(|f| f.id == "secrets-access")
+                    .expect("just asserted");
+                assert_eq!(note.severity, Severity::Note);
+                assert!(note.message.contains("login keyring"), "{report:?}");
             }
             // The name lives on the session bus; the same string on the
-            // system bus reaches no keyring.
+            // system bus reaches no keyring, but the two proxies share the
+            // one name-risk table.
             assert_eq!(
                 ids(&lint(
                     ctx,
                     &["system-bus {\n    talk \"org.freedesktop.secrets\"\n}"]
                 )),
-                [] as [&str; 0]
+                ["dbus-name-is-risky"]
             );
         });
     }
@@ -2394,7 +2508,9 @@ mod tests {
     #[test]
     fn an_own_rule_wider_than_the_application_is_a_warning() {
         with(&host(), |ctx| {
-            for name in ["org.*", "org.kde.*", "com.steampowered.*"] {
+            // Neither prefix reaches a name on the new host-exec or risky
+            // tables: this test is about the wildcard's width, not a name.
+            for name in ["net.*", "org.example.*", "com.steampowered.*"] {
                 let text = format!("dbus {{\n    own \"{name}\"\n}}");
                 assert_eq!(ids(&lint(ctx, &[&text])), ["own-too-wide"], "{name}");
             }
@@ -2470,9 +2586,90 @@ mod tests {
             assert_eq!(ids(&lint(ctx, &["dbus"])), ["dbus-without-rules"]);
             assert_eq!(ids(&lint(ctx, &["dbus", "notify"])), [] as [&str; 0]);
             assert_eq!(
-                ids(&lint(ctx, &["dbus {\n    talk \"ca.desrt.dconf\"\n}"])),
+                ids(&lint(ctx, &["dbus {\n    talk \"org.example.App\"\n}"])),
                 [] as [&str; 0]
             );
+        });
+    }
+
+    #[test]
+    fn a_name_that_runs_code_on_the_host_is_an_error_on_every_rule_word() {
+        with(&host(), |ctx| {
+            for rule in [
+                "talk \"org.freedesktop.systemd1\"",
+                "see \"org.freedesktop.systemd1\"",
+                "own \"org.freedesktop.Flatpak\"",
+                "call \"org.freedesktop.Flatpak=org.freedesktop.Flatpak.Spawn@/\"",
+                "broadcast \"ca.desrt.dconf=ca.desrt.dconf.Writer.Notify@/\"",
+                "talk \"org.freedesktop.impl.portal.Access\"",
+                // Glob-aware in both directions: a wildcard that covers a
+                // listed name, and a name covered by a listed wildcard.
+                "talk \"org.freedesktop.*\"",
+                "talk \"org.*\"",
+            ] {
+                let text = format!("dbus {{\n    {rule}\n}}");
+                let report = lint(ctx, &[&text]);
+                assert!(
+                    ids(&report).contains(&"dbus-name-is-host-exec"),
+                    "{rule}: {:?}",
+                    ids(&report)
+                );
+                let f = report
+                    .findings
+                    .iter()
+                    .find(|f| f.id == "dbus-name-is-host-exec")
+                    .expect("just asserted");
+                assert_eq!(f.severity, Severity::Error, "{rule}");
+            }
+
+            // The system bus is filtered by the same proxy and takes the
+            // same list.
+            let text = "system-bus {\n    talk \"org.freedesktop.systemd1\"\n}";
+            assert!(ids(&lint(ctx, &[text])).contains(&"dbus-name-is-host-exec"));
+
+            // A name that is none of them is not one.
+            let text = "dbus {\n    talk \"org.freedesktop.UPower\"\n}";
+            assert!(!ids(&lint(ctx, &[text])).contains(&"dbus-name-is-host-exec"));
+        });
+    }
+
+    #[test]
+    fn a_risky_name_is_a_warning_that_says_what_the_name_does() {
+        with(&host(), |ctx| {
+            for (rule, says) in [
+                ("talk \"org.kde.KWin\"", "window"),
+                ("talk \"org.gnome.Shell\"", "shell"),
+                ("talk \"org.freedesktop.FileManager1\"", "file manager"),
+                ("talk \"org.freedesktop.secrets\"", "keyring"),
+            ] {
+                let text = format!("dbus {{\n    {rule}\n}}");
+                let report = lint(ctx, &[&text]);
+                let f = report
+                    .findings
+                    .iter()
+                    .find(|f| f.id == "dbus-name-is-risky")
+                    .unwrap_or_else(|| panic!("{rule}: {:?}", ids(&report)));
+                assert_eq!(f.severity, Severity::Warning, "{rule}");
+                assert!(
+                    f.message.to_lowercase().contains(says),
+                    "{rule}: {}",
+                    f.message
+                );
+            }
+        });
+    }
+
+    /// A warning can be accepted; the error cannot.
+    #[test]
+    fn the_risky_warning_is_suppressible_and_the_host_exec_error_is_not() {
+        with(&host(), |ctx| {
+            let text = "lint-allow \"dbus-name-is-risky\" reason=\"this app is the file manager\"\n\
+                        dbus {\n    talk \"org.freedesktop.FileManager1\"\n}";
+            assert!(!ids(&lint(ctx, &[text])).contains(&"dbus-name-is-risky"));
+
+            let text = "lint-allow \"dbus-name-is-host-exec\" reason=\"no\"\n\
+                        dbus {\n    talk \"org.freedesktop.systemd1\"\n}";
+            assert!(ids(&lint(ctx, &[text])).contains(&"dbus-name-is-host-exec"));
         });
     }
 
@@ -2663,7 +2860,9 @@ mod tests {
         with(&host(), |ctx| {
             let report = lint(
                 ctx,
-                &["wayland\n  x11 \"host\"\ndbus {\n    own \"org.kde.*\"\n}\ntty \"passthrough\""],
+                &[
+                    "wayland\n  x11 \"host\"\ndbus {\n    own \"org.example.*\"\n}\ntty \"passthrough\"",
+                ],
             );
             assert_eq!(
                 ids(&report),
@@ -2690,7 +2889,7 @@ mod tests {
                 "wayland",
                 "  x11 \"host\"",
                 "dbus {",
-                "    own \"org.kde.*\"",
+                "    own \"org.example.*\"",
                 "}",
                 "tty \"passthrough\"",
             ];

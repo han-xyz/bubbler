@@ -37,6 +37,7 @@
 //       talk "org.freedesktop.secrets"
 //   }
 //   lint-allow "secrets-access" reason="extensions keep their tokens in the Secret Storage API, which is this bus name"
+//   lint-allow "dbus-name-is-risky" reason="the Secret Storage API extensions keep their tokens in is this bus name"
 //     — the block goes in place of the bare `dbus` node above, since one
 //       config carries one `dbus` node. The name is the Secret Storage
 //       API that extensions keep their tokens in; without it, one that

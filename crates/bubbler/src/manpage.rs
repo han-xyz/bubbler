@@ -292,6 +292,18 @@ const CHECK_LINES: &[(&str, &str)] = &[
          nothing.",
     ),
     (
+        "dbus-name-is-host-exec",
+        "A `dbus` or `system-bus` rule naming `org.freedesktop.systemd1`, \
+         `org.freedesktop.Flatpak`, an `org.freedesktop.impl.portal.*` backend or \
+         `ca.desrt.dconf`: each runs a command or sets policy outside the sandbox.",
+    ),
+    (
+        "dbus-name-is-risky",
+        "A `dbus` or `system-bus` rule naming a bus name that is defensible but wide: the \
+         KWin or GNOME shell compositor, the session's file manager, or the Secret \
+         Service.",
+    ),
+    (
         "dup-name-policy",
         "One bus name given two policies by two layers; one name takes one policy.",
     ),
