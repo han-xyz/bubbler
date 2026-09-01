@@ -296,7 +296,7 @@ a pid names the sidecar.
 `the_fallback_proxy_dials_the_session_socket_and_denies`,
 `the_privileged_denylist_is_pinned_sorted_and_unique`,
 `policy::tests::a_global_the_tables_do_not_describe_is_hidden_and_remembered`,
-`policy::tests::a_privileged_global_is_hidden_only_under_the_fallback`,
+`policy::tests::a_privileged_global_is_hidden_whether_the_compositor_hides_it_too`,
 `policy::tests::an_advertised_version_above_the_tables_is_rewritten`,
 `policy::tests::binding_a_hidden_global_by_its_number_is_refused`,
 `policy::tests::binding_a_global_that_was_never_advertised_is_refused`,
@@ -306,6 +306,16 @@ a pid names the sidecar.
 `real_wayland_binds_bubblers_own_socket_not_the_hosts`,
 `real_wayland_proxy_hands_the_application_a_smaller_registry`,
 `real_wayland_proxy_refuses_a_hidden_bind`
+
+The proxy applies its `PRIVILEGED` denylist to every global, whether or
+not the compositor took a security context. A security context is not
+enforcement on its own: KWin gates its own on the client being in an
+`app-flatpak-*` cgroup unit, so on KDE a bubbler sandbox is not gated at
+all; Mutter implements no security-context protocol; wlroots ships the
+mechanism and leaves the policy to the compositor. `--fallback-deny`
+therefore no longer decides what is hidden — it records whether the
+compositor withholds those globals as well, which is what
+`--explain --wl-proxy` reports.
 
 ### Clipboard
 

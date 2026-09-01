@@ -131,8 +131,9 @@ pub struct ProxyPlan {
     /// Host path the proxy connects to on the application's behalf.
     pub upstream: PathBuf,
     /// Whether the compositor accepts on `upstream` as a security
-    /// context. Without one the proxy hides the privileged globals
-    /// itself, which is what `--fallback-deny` asks of it.
+    /// context. The proxy applies [`PRIVILEGED`] either way; this
+    /// decides only whether `--fallback-deny` is passed, which is how
+    /// the proxy reports whether the compositor enforces too.
     pub context: bool,
     /// Whether a clipboard read has to follow input of the user's.
     pub clipboard: Clipboard,
@@ -154,8 +155,9 @@ impl ProxyPlan {
 
     /// The plan for a compositor that offers no
     /// `wp_security_context_manager_v1`: the proxy connects to the
-    /// session's own socket at `session` and applies bubbler's own
-    /// [`PRIVILEGED`] denylist in the compositor's place.
+    /// session's own socket at `session` and is told that nothing but
+    /// its own [`PRIVILEGED`] denylist stands between the sandbox and
+    /// those globals.
     pub fn fallback(instance_runtime: &Path, session: PathBuf, clipboard: Clipboard) -> Self {
         Self {
             listener: socket_path(instance_runtime),

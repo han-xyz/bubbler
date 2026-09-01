@@ -370,7 +370,8 @@ fn a_sync_travels_to_the_compositor_and_back() {
 fn the_registry_holds_no_more_than_the_host_and_nothing_privileged() {
     let Some(host) = host_socket() else { return };
     let direct = Client::connect(&host).globals();
-    let proxy = Proxy::start(&host, "paste", true);
+    // Without `--fallback-deny`: the denylist no longer depends on it.
+    let proxy = Proxy::start(&host, "paste", false);
     let through = Client::connect(&proxy.socket).globals();
     assert!(!through.is_empty(), "the proxy advertised nothing at all");
     assert!(

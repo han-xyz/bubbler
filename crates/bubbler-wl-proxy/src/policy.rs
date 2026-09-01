@@ -85,6 +85,10 @@ pub enum Action {
 #[derive(Debug)]
 pub struct Policy {
     gate: Gate,
+    /// Whether the compositor offered no security context of its own, so
+    /// this proxy is the only thing withholding [`PRIVILEGED`]. It
+    /// withholds them either way; this is what `--explain --wl-proxy`
+    /// reads to say whether the compositor enforces too.
     fallback_deny: bool,
     last_input: Option<Instant>,
 }
@@ -144,9 +148,9 @@ impl Connection {
 }
 
 impl Policy {
-    /// A policy with this gate, hiding the privileged interfaces when
-    /// `fallback_deny` — which the launcher sets when the compositor has no
-    /// security context of its own to hide them.
+    /// A policy with this gate. The privileged interfaces are hidden whatever
+    /// `fallback_deny` says — it records only whether the compositor
+    /// withholds them as well.
     pub fn new(gate: Gate, fallback_deny: bool) -> Self {
         Self {
             gate,
@@ -158,6 +162,13 @@ impl Policy {
     /// The moment an arming input event was last seen, on any connection.
     pub fn last_input(&self) -> Option<Instant> {
         self.last_input
+    }
+
+    /// Whether the compositor withholds the privileged globals as well:
+    /// false when it offered no security context and this proxy is the
+    /// only thing between the sandbox and them.
+    pub fn compositor_enforces(&self) -> bool {
+        !self.fallback_deny
     }
 
     /// Record user input at `now`: from here a clipboard read is forwarded for
@@ -287,7 +298,10 @@ impl Policy {
         let (name, version) = (*name, *version);
         let described = iface.to_str().ok().and_then(|iface| {
             let known = tables::index_of(iface).zip(tables::lookup(iface));
-            known.filter(|_| !(self.fallback_deny && PRIVILEGED.binary_search(&iface).is_ok()))
+            // Whatever the compositor does: `PRIVILEGED` is the proxy's
+            // own list, and a compositor that withholds these as well
+            // takes nothing away by agreeing.
+            known.filter(|_| PRIVILEGED.binary_search(&iface).is_err())
         });
         // Unnamed here, and refused by number in `bind`: an advertisement the
         // client never saw is not a global it may reach for.
@@ -650,18 +664,32 @@ mod tests {
         assert_eq!(proxy.conn.globals(), 0);
     }
 
+    /// The denylist is the proxy's own, not the compositor's stand-in. A
+    /// compositor that takes a security context is trusted to withhold
+    /// these too, but KWin gates its enforcement on an `app-flatpak-*`
+    /// cgroup unit and Mutter has no protocol at all, so a proxy that
+    /// only hid them under the fallback hid them on almost nothing.
     #[test]
-    fn a_privileged_global_is_hidden_only_under_the_fallback() {
-        let mut open = proxy();
-        let (action, _) = open.advertise(7, "zxdg_output_manager_v1", 3);
-        assert_eq!(action, Action::Forward);
-        assert!(!open.conn.objects.is_hidden(7));
+    fn a_privileged_global_is_hidden_whether_the_compositor_hides_it_too() {
+        for fallback in [false, true] {
+            let mut proxy = Proxy::new(Gate::Paste, fallback);
+            map(&mut proxy.conn, REGISTRY, "wl_registry", 1);
+            let (action, _) = proxy.advertise(7, "zxdg_output_manager_v1", 3);
+            assert_eq!(action, Action::Drop, "fallback_deny = {fallback}");
+            assert!(proxy.conn.objects.is_hidden(7));
+            assert_eq!(proxy.policy.compositor_enforces(), !fallback);
+        }
+    }
 
-        let mut denied = Proxy::new(Gate::Paste, true);
-        map(&mut denied.conn, REGISTRY, "wl_registry", 1);
-        let (action, _) = denied.advertise(7, "zxdg_output_manager_v1", 3);
-        assert_eq!(action, Action::Drop);
-        assert!(denied.conn.objects.is_hidden(7));
+    /// And an ordinary global is still offered under either flag.
+    #[test]
+    fn an_ordinary_global_is_offered_under_either_flag() {
+        for fallback in [false, true] {
+            let mut proxy = Proxy::new(Gate::Paste, fallback);
+            map(&mut proxy.conn, REGISTRY, "wl_registry", 1);
+            let (action, _) = proxy.advertise(3, "wl_compositor", 1);
+            assert_eq!(action, Action::Forward, "fallback_deny = {fallback}");
+        }
     }
 
     #[test]
