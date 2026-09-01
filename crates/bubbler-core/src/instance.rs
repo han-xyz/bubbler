@@ -9,7 +9,7 @@ use rustix::fs::Mode;
 use rustix::io::Errno;
 use rustix::process::{Pid, test_kill_process};
 
-use crate::config::{self, InstanceConfig, NetworkConfig, Service, WaylandMode, X11Mode};
+use crate::config::{self, InstanceConfig, NetworkConfig, Portal, Service, WaylandMode, X11Mode};
 use crate::env::Env;
 use crate::error::{InstanceError, ReadError};
 use crate::fsutil;
@@ -43,6 +43,12 @@ pub const GRANTS: &[&str] = &[
     "pulseaudio",
     "dbus",
     "portals",
+    "screencast",
+    "remote-desktop",
+    "global-shortcuts",
+    "background",
+    "location",
+    "secrets",
     "notify",
     "tray",
     "a11y",
@@ -211,6 +217,12 @@ fn grant_service(name: &str) -> Option<Service> {
         "portals" => Service::Portals {
             children: Vec::new(),
         },
+        // A child is written as the node that carries it: `--grant
+        // screencast` on a config that already has `portals` adds the
+        // child to it, which `with_grants` does below.
+        name if Portal::from_name(name).is_some() => Service::Portals {
+            children: vec![Portal::from_name(name).expect("just matched")],
+        },
         "notify" => Service::Notify,
         "tray" => Service::Tray,
         "a11y" => Service::A11y,
@@ -264,6 +276,25 @@ fn with_grants(cfg: &mut InstanceConfig, grants: &[&str]) -> Result<(), Instance
                 .iter()
                 .any(|s| matches!(s, Service::Wayland(_))),
             Service::X11(_) => cfg.services.iter().any(|s| matches!(s, Service::X11(_))),
+            // The one grant that merges into a node already held: a
+            // second `portals` node is a duplicate, so a child has to
+            // join the first rather than fail the "one node" check above.
+            Service::Portals { children } => {
+                match cfg.services.iter_mut().find_map(|s| match s {
+                    Service::Portals { children } => Some(children),
+                    _ => None,
+                }) {
+                    Some(held) => {
+                        for c in children {
+                            if !held.contains(c) {
+                                held.push(*c);
+                            }
+                        }
+                        true
+                    }
+                    None => false,
+                }
+            }
             other => cfg.services.contains(other),
         };
         if !held {
@@ -1380,6 +1411,49 @@ mod tests {
             assert!(grant_service(named).is_none(), "{named}");
             assert!(!GRANTS.contains(&named), "{named}");
         }
+    }
+
+    /// A portal child is a grant name of its own, and granting one on a
+    /// profile that already has `portals` adds the child rather than a
+    /// second node the parser would refuse.
+    #[test]
+    fn a_portal_child_can_be_granted_on_the_command_line() {
+        let mut cfg = config::parse("dbus\nportals").unwrap();
+        with_grants(&mut cfg, &["screencast"]).unwrap();
+        assert_eq!(
+            cfg.services,
+            vec![
+                Service::Dbus { rules: Vec::new() },
+                Service::Portals {
+                    children: vec![config::Portal::ScreenCast]
+                }
+            ]
+        );
+        // Twice is once.
+        with_grants(&mut cfg, &["screencast"]).unwrap();
+        assert_eq!(
+            cfg.services,
+            vec![
+                Service::Dbus { rules: Vec::new() },
+                Service::Portals {
+                    children: vec![config::Portal::ScreenCast]
+                }
+            ]
+        );
+        // A child on a config with no `portals` writes the node with it.
+        let mut cfg = config::parse("dbus").unwrap();
+        with_grants(&mut cfg, &["location"]).unwrap();
+        assert!(cfg.services.contains(&Service::Portals {
+            children: vec![config::Portal::Location]
+        }));
+        // And a child, like `portals` itself, is refused without `dbus`.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut env = env(tmp.path());
+        env.runtime_dir = tmp.path().join("run");
+        assert!(matches!(
+            Instance::ephemeral(&env, "generic", &["screencast"]),
+            Err(InstanceError::Config(_))
+        ));
     }
 
     #[test]
