@@ -26,6 +26,7 @@ libseccomp.workspace = true
 wayrs-client.workspace = true
 wayrs-protocols.workspace = true
 unicode-width.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

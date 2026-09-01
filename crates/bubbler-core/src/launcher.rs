@@ -1875,6 +1875,40 @@ fn start_net_proxy(
     Ok(handle)
 }
 
+/// Put the calling thread on a session keyring of its own
+/// (`keyctl(2)` `KEYCTL_JOIN_SESSION_KEYRING` with a null name, which
+/// creates an anonymous one).
+///
+/// Called in the forked child before `execve`, so the sandbox never
+/// inherits the login session keyring: `keyctl` is on the default
+/// denylist, but a profile may take it off, and the keys behind
+/// `@s` are the user's — not this instance's. A kernel without
+/// `CONFIG_KEYS` answers ENOSYS and there is no keyring to inherit
+/// either, so that one case is not a failure.
+///
+/// `rustix` wraps no keyring call, which is why this is `libc`.
+fn join_session_keyring() -> io::Result<()> {
+    // SAFETY: one syscall taking its arguments by value, allocating
+    // nothing and touching no memory of this process — async-signal-safe,
+    // which is what a `pre_exec` closure is held to. The null name is
+    // what asks for a fresh anonymous keyring rather than a named one.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_keyctl,
+            u64::from(libc::KEYCTL_JOIN_SESSION_KEYRING),
+            0u64,
+        )
+    };
+    if rc >= 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::ENOSYS) => Ok(()),
+        _ => Err(err),
+    }
+}
+
 /// `value` as decimal ASCII in `buf`, for the one write the proxy's
 /// `pre_exec` makes: formatting through `format!` there would allocate,
 /// which a forked child may not do.
@@ -2656,8 +2690,15 @@ pub fn run(
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     fcntl_setfd(&inherited, FdFlags::empty()).map_err(io_at)?;
     spawning(&alloc.intended())?;
-    let mut child = Command::new("bwrap")
-        .args(&argv)
+    let mut cmd = Command::new("bwrap");
+    cmd.args(&argv);
+    // SAFETY: the closure runs in the forked child between `fork` and
+    // `execve`, where only async-signal-safe calls are allowed. It makes
+    // one syscall and allocates nothing.
+    unsafe {
+        cmd.pre_exec(join_session_keyring);
+    }
+    let mut child = cmd
         .stdin(stdio_for(stdio.fds[0], stdio.pty.as_ref())?)
         .stdout(stdio_for(stdio.fds[1], stdio.pty.as_ref())?)
         .stderr(stdio_for(stdio.fds[2], stdio.pty.as_ref())?)
@@ -2816,6 +2857,32 @@ mod tests {
         assert_eq!(decimal(4194304, &mut buf), b"4194304");
         // The widest a pid can be, which fills the buffer exactly.
         assert_eq!(decimal(i32::MAX, &mut buf), b"2147483647");
+    }
+
+    /// A session keyring is per-thread credentials, so joining one here
+    /// changes this thread's keyring and nothing else's. The id before
+    /// and after therefore has to differ: that is the whole of what the
+    /// sandbox gets — a keyring of its own rather than the login
+    /// session's, whatever a profile says about `keyctl`.
+    #[test]
+    fn joining_a_session_keyring_leaves_the_thread_on_a_new_one() {
+        // KEYCTL_GET_KEYRING_ID(KEY_SPEC_SESSION_KEYRING, create=0).
+        let id = || -> i64 {
+            // SAFETY: `keyctl` takes its arguments by value; this asks
+            // for the id of an existing keyring and creates nothing.
+            unsafe { libc::syscall(libc::SYS_keyctl, 0u64, -3i64, 0u64) }
+        };
+        let before = id();
+        if before < 0 {
+            // A kernel without CONFIG_KEYS has no keyring to inherit, so
+            // there is nothing to test rather than something that failed.
+            eprintln!("skipping: this host has no session keyring");
+            return;
+        }
+        join_session_keyring().unwrap();
+        let after = id();
+        assert!(after >= 0, "no keyring after joining one");
+        assert_ne!(before, after, "the thread kept the keyring it was given");
     }
 
     /// An `Env` whose `$BUBBLER_INIT` points at a stand-in binary, so

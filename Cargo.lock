@@ -119,6 +119,7 @@ dependencies = [
  "bubbler-init",
  "bubbler-net-proxy",
  "kdl",
+ "libc",
  "libseccomp",
  "proptest",
  "rustix",

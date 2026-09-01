@@ -48,3 +48,6 @@ unicode-width = "0.2"
 wayrs-proto-parser = "3"
 tempfile = "3"
 proptest = "1"
+# Raw `keyctl`, which rustix does not wrap. Already in the locked graph
+# through libseccomp and signal-hook, so this adds no crate.
+libc = "0.2"
