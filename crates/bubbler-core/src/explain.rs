@@ -153,6 +153,10 @@ fn label(origin: Origin, cfg: &InstanceConfig) -> Result<String, ConfigError> {
             Origin::Baseline => "baseline".to_owned(),
             Origin::Seccomp => "seccomp".to_owned(),
             Origin::Userns => "userns".to_owned(),
+            Origin::Tmp => match cfg.tmp {
+                Some(size) => kdl_out::tmp(size),
+                None => "tmp".to_owned(),
+            },
             Origin::Ctty => "ctty".to_owned(),
             Origin::Identity => "identity".to_owned(),
             Origin::Init => "init".to_owned(),
@@ -580,6 +584,7 @@ pub fn render_json(items: &[Explained], view: &View) -> Result<String, ConfigErr
             Origin::Baseline => ("baseline", None),
             Origin::Seccomp => ("seccomp", None),
             Origin::Userns => ("userns", None),
+            Origin::Tmp => ("tmp", None),
             Origin::Ctty => ("ctty", None),
             Origin::Identity => ("identity", None),
             Origin::Init => ("init", None),

@@ -460,6 +460,10 @@ fn build_args_on<'a>(
         args.tag(Origin::Userns);
         args.disable_userns();
     }
+    if let Some(size) = inst.config.tmp {
+        args.tag(Origin::Tmp);
+        args.tmp_size(size.0);
+    }
     if ctty {
         args.ctty();
     }
@@ -3010,6 +3014,66 @@ mod tests {
             })
             .collect();
         assert!(untagged.is_empty(), "{untagged:?}");
+    }
+
+    /// The node replaces the value in place: one `--tmpfs /tmp`, still
+    /// ahead of everything mounted under it, and the operation now
+    /// belongs to the node that asked for it rather than to the baseline.
+    #[test]
+    fn a_tmp_node_replaces_the_cap_and_owns_the_operation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let items = explained(tmp.path(), &e, "tmp size=\"64M\"\ncommand \"true\"");
+        assert_eq!(line(&items, Origin::Tmp), "--size 67108864 --tmpfs /tmp");
+        let flat = strs(
+            &items
+                .iter()
+                .flat_map(|i| i.args.clone())
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(flat.iter().filter(|a| *a == "/tmp").count(), 1, "{flat:?}");
+        assert!(!flat.contains(&"2147483648".to_owned()), "{flat:?}");
+
+        // Without the node the baseline keeps both the cap and the
+        // operation.
+        let items = explained(tmp.path(), &e, "command \"true\"");
+        assert_eq!(line(&items, Origin::Tmp), "");
+        assert!(
+            strs(
+                &items
+                    .iter()
+                    .flat_map(|i| i.args.clone())
+                    .collect::<Vec<_>>()
+            )
+            .contains(&"2147483648".to_owned())
+        );
+
+        // And the explanation heads a group with the node as written.
+        let cfg = crate::config::parse("tmp size=\"64M\"\ncommand \"true\"").unwrap();
+        let items = explained(tmp.path(), &e, "tmp size=\"64M\"\ncommand \"true\"");
+        let out = crate::explain::render(
+            &items,
+            &crate::explain::View {
+                title: "bwrap",
+                instance: "t",
+                cfg: &cfg,
+                source: crate::explain::Source {
+                    file: "config.kdl",
+                    lines: &crate::config::Lines::default(),
+                },
+                rules: &[],
+                wl_proxy: None,
+                net_proxy_log: false,
+                proxy: false,
+                full: false,
+                bwrap: crate::version::Version::Known(0, 12, 0),
+            },
+        )
+        .unwrap();
+        assert!(
+            out.iter().any(|l| l.starts_with("  tmp size=\"64M\"")),
+            "{out:?}"
+        );
     }
 
     /// The display name decides what the launcher connects to, so it is

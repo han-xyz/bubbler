@@ -23,6 +23,9 @@ pub enum Origin {
     Seccomp,
     /// A `userns "disable"` node.
     Userns,
+    /// A `tmp size=` node, which moves the cap the baseline put on
+    /// `/tmp`.
+    Tmp,
     /// `--ctty`, decided by the terminal mode rather than by the config.
     Ctty,
     /// The `/.flatpak-info` document that names the sandbox to the proxy.
@@ -543,6 +546,33 @@ impl BwrapArgs {
             .expect("the baseline emits --chdir once, in phase 1");
         args.truncate(1);
         args.push(dir.as_os_str().to_owned());
+    }
+
+    /// Cap the sandbox's `/tmp` at `bytes` instead of [`TMP_SIZE`], and
+    /// attribute the operation to the `tmp` node that asked for it.
+    /// The value is replaced where it stands, so `/tmp` is still mounted
+    /// once and still ahead of anything bound under it.
+    ///
+    /// # Panics
+    ///
+    /// If the arguments hold no `--size … --tmpfs /tmp`. Only
+    /// [`BwrapArgs::baseline`] builds the sandbox this is called on, and
+    /// it always emits one.
+    pub fn tmp_size(&mut self, bytes: u64) {
+        let item = self
+            .skeleton
+            .iter_mut()
+            .find(|i| {
+                matches!(&i.kind, Kind::Args(a)
+                    if a.first().is_some_and(|p| p == OsStr::new("--size"))
+                        && a.last().is_some_and(|p| p == OsStr::new("/tmp")))
+            })
+            .expect("the baseline emits `--size … --tmpfs /tmp` once, in phase 2");
+        item.origin = self.origin;
+        let Kind::Args(args) = &mut item.kind else {
+            unreachable!("the item was found by matching on its arguments");
+        };
+        args[1] = OsString::from(bytes.to_string());
     }
 
     /// Tag every argument pushed from here on with `origin`. The caller
