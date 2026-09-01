@@ -58,7 +58,9 @@
 //       talk "org.freedesktop.ScreenSaver"
 //       talk "org.freedesktop.PowerManagement"
 //   }
-//   lint-allow "own-too-wide" reason="com.steampowered.* is Steam's own name space, and the client claims several names under it"
+//   lint-allow {
+//       "own-too-wide" reason="com.steampowered.* is Steam's own name space, and the client claims several names under it"
+//   }
 //     — the names the client claims for itself (steam:// URL handling
 //       among them) and the two power-save blockers it holds while a game
 //       runs.

@@ -3647,4 +3647,27 @@ mod tests {
             );
         });
     }
+
+    /// No shipped profile writes a repeatable kind twice on its own
+    /// line: the block is the form the manual teaches, and a profile is
+    /// where a reader learns it.
+    #[test]
+    fn no_shipped_profile_repeats_a_line_form_node() {
+        let e = env();
+        let resolver = crate::profile::Resolver::new(&e);
+        with(&host(), |ctx| {
+            for entry in resolver.list().unwrap() {
+                let report = lint_profile(ctx, &resolver, &entry.name).unwrap();
+                assert!(
+                    !report
+                        .findings
+                        .iter()
+                        .any(|f| f.id == "repeat-outside-block"),
+                    "{}: {:?}",
+                    entry.name,
+                    report.findings
+                );
+            }
+        });
+    }
 }

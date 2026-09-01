@@ -5,7 +5,7 @@
 // read-only, the link resolved on the host. Updating happens on the
 // host; inside, DISABLE_AUTOUPDATER stops the attempt against a
 // read-only tree. Installed from a package instead (`/usr/bin/claude`),
-// drop both `home-share` nodes and write `command "claude"`.
+// drop the whole `home-share` block and write `command "claude"`.
 //
 // Create the instance once:
 //     bubbler create claude-code --profile claude-code
@@ -87,6 +87,8 @@
 network
 userns "disable"
 env DISABLE_AUTOUPDATER="1"
-home-share ".local/bin/claude" mode=ro
-home-share ".local/share/claude" mode=ro
+home-share {
+    ".local/bin/claude" mode=ro
+    ".local/share/claude" mode=ro
+}
 command "/home/bubbler/.local/bin/claude"

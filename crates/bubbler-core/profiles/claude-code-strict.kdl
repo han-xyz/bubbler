@@ -94,6 +94,8 @@ network {
 }
 userns "disable"
 env DISABLE_AUTOUPDATER="1"
-home-share ".local/bin/claude" mode=ro
-home-share ".local/share/claude" mode=ro
+home-share {
+    ".local/bin/claude" mode=ro
+    ".local/share/claude" mode=ro
+}
 command "/home/bubbler/.local/bin/claude"
