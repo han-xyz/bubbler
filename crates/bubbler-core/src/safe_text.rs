@@ -10,6 +10,8 @@
 //! Only what reaches a terminal is rendered; the caller decides. A pipe
 //! is a tool on the other end and gets the bytes as they are.
 
+use std::borrow::Cow;
+
 /// Render the control characters in `bytes` so a terminal shows them
 /// instead of acting on them: C0 and `DEL` in caret notation (`ESC` is
 /// `^[`), C1 controls and bytes that are not UTF-8 as `\xNN`, everything
@@ -78,12 +80,111 @@ fn push_hex(out: &mut Vec<u8>, b: u8) {
     ]);
 }
 
+/// `s` with everything a terminal would act on replaced by `?`: every C0
+/// control but `\n` and `\t`, `DEL`, the C1 controls, and any sequence an
+/// `ESC` introduces — a CSI, an OSC up to its `BEL` or string
+/// terminator, an APC, and a lone `ESC` — each whole sequence becoming
+/// one `?`.
+///
+/// This is the `str` path, for text bubbler formats into a line it draws
+/// itself: a table cell, a lint message quoting a config value, a title.
+/// [`render`] is the byte path, for a log or an argv the reader asked to
+/// see as it was written; it keeps the characters in caret notation
+/// rather than dropping them. Neither is reversible, and text that holds
+/// nothing to replace is borrowed rather than rebuilt.
+pub fn sanitize(s: &str) -> Cow<'_, str> {
+    if !s.chars().any(needs_replacing) {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' | '\t' => out.push(c),
+            '\x1b' => {
+                out.push('?');
+                skip_sequence(&mut chars);
+            }
+            c if needs_replacing(c) => out.push('?'),
+            c => out.push(c),
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Whether one character is one a terminal acts on: C0 but for the two a
+/// line is laid out with, `DEL`, and the C1 controls, which a terminal
+/// reads as their two-character escapes (`\u{9b}` is CSI).
+fn needs_replacing(c: char) -> bool {
+    match c {
+        '\n' | '\t' => false,
+        '\0'..='\x1f' | '\x7f' | '\u{80}'..='\u{9f}' => true,
+        _ => false,
+    }
+}
+
+/// Step past the rest of the sequence an `ESC` opened, so the whole of it
+/// is the one `?` already written. A CSI ends at its final byte
+/// (`0x40`–`0x7e`), an OSC, APC, PM or DCS at `BEL` or at the string
+/// terminator `ESC \`, and anything else is a two-character escape whose
+/// second character is ordinary text.
+fn skip_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    match chars.peek() {
+        Some('[') => {
+            chars.next();
+            while let Some(c) = chars.peek() {
+                let end = ('\u{40}'..='\u{7e}').contains(c);
+                chars.next();
+                if end {
+                    return;
+                }
+            }
+        }
+        Some(']' | '_' | '^' | 'P') => {
+            chars.next();
+            while let Some(c) = chars.next() {
+                if c == '\x07' {
+                    return;
+                }
+                if c == '\x1b' && chars.peek() == Some(&'\\') {
+                    chars.next();
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn rendered(bytes: &[u8]) -> String {
         String::from_utf8(render(bytes)).expect("the rendering is text")
+    }
+
+    #[test]
+    fn a_terminal_sequence_becomes_one_question_mark() {
+        // The shape CVE-2023-28101 is about: a control sequence carried
+        // in a name that something else prints.
+        assert_eq!(sanitize("a\x1b[2Jb"), "a?b");
+        assert_eq!(sanitize("\x1b]0;retitled\x07x"), "?x");
+        assert_eq!(sanitize("\x1b]52;c;cGF5bG9hZA==\x1b\\"), "?");
+        assert_eq!(sanitize("\x1b_apc\x1b\\"), "?");
+        // An ESC that begins nothing is still not sent on.
+        assert_eq!(sanitize("\x1b"), "?");
+        assert_eq!(sanitize("\x1bZ"), "?Z");
+    }
+
+    #[test]
+    fn the_control_characters_a_reader_wants_are_left_alone() {
+        assert_eq!(sanitize("one\ntwo\tthree"), "one\ntwo\tthree");
+        assert_eq!(sanitize("a\rb\x00c\x7fd"), "a?b?c?d");
+        // C1 is a control too: `\u{9b}` is a one-character CSI.
+        assert_eq!(sanitize("a\u{9b}2Jb"), "a?2Jb");
+        // And ordinary text is borrowed, not rebuilt.
+        assert!(matches!(sanitize("plain 文字"), Cow::Borrowed(_)));
     }
 
     #[test]

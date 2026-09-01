@@ -5,6 +5,7 @@
 use bubbler_core::catalogue::Risk;
 use bubbler_core::kdl_out;
 use bubbler_core::lint::{Finding, Severity};
+use bubbler_core::safe_text;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -116,6 +117,13 @@ fn risk_mark(risk: Risk) -> &'static str {
     }
 }
 
+/// Text that came from a config, a lint message or a sandbox, made safe
+/// to put in a cell: the TUI writes its own cells, so nothing else
+/// renders the control characters in them ([`safe_text::sanitize`]).
+fn safe(text: &str) -> String {
+    safe_text::sanitize(text).into_owned()
+}
+
 fn severity_style(severity: Severity) -> Style {
     match severity {
         Severity::Error => Style::default().fg(Color::Red),
@@ -197,9 +205,9 @@ fn count(n: usize, what: &str) -> String {
 /// The title line of the detail screen: what is being edited, what it
 /// came from and whether it is running.
 fn title(detail: &Detail) -> String {
-    let mut title = detail.name().to_owned();
+    let mut title = safe(detail.name());
     if let Some(profile) = &detail.profile {
-        title.push_str(&format!(" ({profile})"));
+        title.push_str(&format!(" ({})", safe(profile)));
     }
     title.push_str(match detail.live {
         true => " ● running",
@@ -251,12 +259,12 @@ fn instance_row(row: &InstanceRow) -> Row<'_> {
         (false, None) => "○ stop",
     };
     let grants = match &row.error {
-        Some(e) => e.lines().next().unwrap_or("").to_owned(),
-        None => row.grants.join(" "),
+        Some(e) => safe(e.lines().next().unwrap_or("")),
+        None => safe(&row.grants.join(" ")),
     };
     Row::new([
-        Cell::from(row.name.as_str()),
-        Cell::from(row.profile.as_deref().unwrap_or("-")),
+        Cell::from(safe(&row.name)),
+        Cell::from(row.profile.as_deref().map_or_else(|| "-".to_owned(), safe)),
         Cell::from(state),
         Cell::from(grants),
         Cell::from(row.lint_label()),
@@ -300,8 +308,8 @@ fn detail(detail: &Detail, area: Rect, buf: &mut Buffer) {
             false => "○",
         };
         let text = match &row.text {
-            Some(text) => kdl_out::shorten(&crate::detail::flatten(text), room),
-            None => kdl_out::shorten(row.node, room),
+            Some(text) => kdl_out::shorten(&safe(&crate::detail::flatten(text)), room),
+            None => kdl_out::shorten(&safe(row.node), room),
         };
         let style = match row.granted() {
             true => risk_style(risk),
@@ -328,10 +336,7 @@ fn detail(detail: &Detail, area: Rect, buf: &mut Buffer) {
 fn what_it_costs(detail: &Detail) -> Text<'static> {
     let mut lines = Vec::new();
     if let Some(trouble) = &detail.trouble {
-        lines.push(Line::styled(
-            trouble.clone(),
-            severity_style(Severity::Error),
-        ));
+        lines.push(Line::styled(safe(trouble), severity_style(Severity::Error)));
         lines.push(Line::from(""));
     }
     let Some(row) = detail.row() else {
@@ -383,10 +388,18 @@ fn what_it_costs(detail: &Detail) -> Text<'static> {
 fn finding_lines(finding: &Finding) -> Vec<Line<'static>> {
     vec![
         Line::styled(
-            format!("{}[{}]: {}", finding.severity, finding.id, finding.message),
+            format!(
+                "{}[{}]: {}",
+                finding.severity,
+                finding.id,
+                safe(&finding.message)
+            ),
             severity_style(finding.severity),
         ),
-        Line::styled(format!("  help: {}", finding.help), Style::default().dim()),
+        Line::styled(
+            format!("  help: {}", safe(&finding.help)),
+            Style::default().dim(),
+        ),
     ]
 }
 
@@ -394,7 +407,7 @@ fn finding_lines(finding: &Finding) -> Vec<Line<'static>> {
 fn profiles(app: &App, area: Rect, buf: &mut Buffer) {
     if let Some(e) = &app.store.profile_error {
         Paragraph::new(Line::styled(
-            format!("reading the profile layers: {e}"),
+            format!("reading the profile layers: {}", safe(&e.to_string())),
             severity_style(Severity::Error),
         ))
         .wrap(Wrap { trim: true })
@@ -436,12 +449,12 @@ fn viewer(viewer: &Viewer, area: Rect, buf: &mut Buffer) {
         viewer
             .lines
             .iter()
-            .map(|l| Line::from(l.clone()))
+            .map(|l| Line::from(safe(l)))
             .collect::<Vec<Line>>(),
     );
     let offset = u16::try_from(viewer.offset).unwrap_or(u16::MAX);
     Paragraph::new(text)
-        .block(Block::bordered().title_top(viewer.title.clone()))
+        .block(Block::bordered().title_top(safe(&viewer.title)))
         .scroll((offset, 0))
         .render(area, buf);
 }
@@ -1131,6 +1144,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A control sequence in a config value is drawn, not performed. The
+    /// grants pane itself cannot carry one: `kdl_out::quote` re-escapes
+    /// every node it writes there. A lint finding is not re-escaped —
+    /// `command-not-found` quotes `command`'s own argv0 straight into its
+    /// message — so that is the seam this reaches the screen through. The
+    /// escape is spelled `\u{1b}` in the KDL source itself (kdl 6 / KDL v2
+    /// rejects a raw control byte inside a quoted string), and decodes to
+    /// the same character a hand-edited config could carry.
+    #[test]
+    fn a_control_sequence_in_a_config_value_is_drawn_as_a_question_mark() {
+        let (_tmp, mut app) = editor_over("command \"D\\u{1b}[2Jocuments\"\n");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let detail = app.detail.as_mut().expect("the editor");
+        detail.selected = detail
+            .rows
+            .iter()
+            .position(|row| row.node == "command")
+            .expect("the command row");
+        // Wide enough that the finding's own line does not wrap: a wrap
+        // would put the left pane's next row between the two halves of
+        // it once every row is joined below.
+        let lines = screen(&app, 160, 20);
+        let finding = lines
+            .iter()
+            .find(|l| l.contains("command-not-found"))
+            .expect("the finding's line");
+        // Without `sanitize`, the escape byte itself never survives —
+        // ratatui drops every control character when it lays out a
+        // string — but the CSI it opened, `[2J`, is ordinary text to
+        // ratatui and would otherwise sit right there on the pane, in
+        // place of the single `?` a whole sequence collapses to.
+        assert!(
+            finding.contains("`D?ocuments` is not on this host's PATH"),
+            "{finding:?}"
+        );
     }
 
     #[test]
