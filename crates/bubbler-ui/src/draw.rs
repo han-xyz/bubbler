@@ -174,7 +174,7 @@ impl App {
             Screen::Viewer => self
                 .viewer
                 .as_ref()
-                .map_or_else(String::new, |v| v.title.clone()),
+                .map_or_else(String::new, |v| safe(&v.title)),
         };
         Paragraph::new(Line::from(vec![
             Span::styled("bubbler", Style::default().add_modifier(Modifier::BOLD)),
@@ -184,7 +184,7 @@ impl App {
 
     fn footer(&self) -> Paragraph<'_> {
         if !self.status.is_empty() {
-            return Paragraph::new(Line::from(self.status.as_str()).italic());
+            return Paragraph::new(Line::from(safe(&self.status)).italic());
         }
         let keys = KEYS
             .iter()
@@ -1181,6 +1181,18 @@ mod tests {
             finding.contains("`D?ocuments` is not on this host's PATH"),
             "{finding:?}"
         );
+    }
+
+    /// A status message carrying a control sequence is drawn, not
+    /// performed: `App::say` is fed argv, explain output and error text
+    /// verbatim (`app.rs`, `main.rs`), and the footer is the last stop
+    /// before the terminal.
+    #[test]
+    fn a_control_sequence_in_a_status_message_is_drawn_as_a_question_mark() {
+        let (_tmp, mut app) = list_editor();
+        app.say("D\u{1b}[2Jocuments".to_owned());
+        let lines = screen(&app, 80, 8);
+        assert_eq!(lines.last().unwrap(), "D?ocuments");
     }
 
     #[test]
