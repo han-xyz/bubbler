@@ -1,5 +1,6 @@
 //! In-sandbox supervisor: runs the command, serves exec requests on the
-//! inherited socket, forwards SIGTERM/SIGINT, exits with the command's status.
+//! inherited socket, forwards SIGTERM, SIGINT, SIGHUP and SIGQUIT, exits
+//! with the command's status.
 //! With `--x11` it also owns the display socket: the command runs at once with
 //! `DISPLAY` set, and the nested X server (plus the `--wm` window manager) is
 //! started on the first client that connects and stopped last.
@@ -20,7 +21,15 @@ use rustix::event::{Nsecs, PollFd, PollFlags, Timespec, poll};
 use rustix::fs::Mode;
 use rustix::io::{Errno, FdFlags, fcntl_dupfd_cloexec, fcntl_getfd, fcntl_setfd};
 use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
-use rustix::process::{DumpableBehavior, Pid, Signal, kill_process, set_dumpable_behavior};
+use rustix::process::{
+    DumpableBehavior, Pid, Signal, kill_process, set_dumpable_behavior,
+    set_parent_process_death_signal,
+};
+use rustix::thread::{
+    CapabilitySet, CapabilitySets, capabilities, capability_is_in_bounding_set,
+    clear_ambient_capability_set, remove_capability_from_bounding_set, set_capabilities,
+    set_no_new_privs,
+};
 
 use bubbler_init::{fds, proto, wire};
 
@@ -212,6 +221,62 @@ fn take_ctty(command: &mut Command) {
             Ok(())
         });
     }
+}
+
+/// Give up what the supervisor will never use, and tie its life to its
+/// parent's. Under bwrap every capability set is empty and
+/// `no_new_privs` is already on, so most of this is stating the posture
+/// rather than changing it — which is the point: `bubbler-init` is PID 1
+/// of the sandbox and the parent of everything in it, and a supervisor
+/// started any other way must not be the one process that kept a
+/// privilege. The bounding set is only written where something is left
+/// in it, since `PR_CAPBSET_DROP` takes `CAP_SETPCAP`, which a sandbox
+/// does not have; reading it takes nothing.
+///
+/// `PR_SET_NO_NEW_PRIVS` first, so nothing the supervisor `execve`s can
+/// gain a privilege whatever it finds on the filesystem. Then the
+/// ambient set, then the three sets `capset` carries, then the bounding
+/// set, then the parent-death signal: a bwrap that is killed leaves this
+/// process a `SIGTERM`, which is the one the run already knows how to
+/// end on.
+fn harden() -> rustix::io::Result<()> {
+    set_no_new_privs(true)?;
+    clear_ambient_capability_set()?;
+    let empty = CapabilitySets {
+        effective: CapabilitySet::empty(),
+        permitted: CapabilitySet::empty(),
+        inheritable: CapabilitySet::empty(),
+    };
+    if capabilities(None)? != empty {
+        set_capabilities(None, empty)?;
+    }
+    // `.iter_names()`, not `.iter()`: rustix marks `CapabilitySet` with
+    // bitflags' external-bits escape hatch (`const _ = !0;`) so a future
+    // kernel's capability past bit 40 still round-trips through this
+    // type, and `.iter()` yields that one unnamed remainder as a single
+    // multi-bit flag. `capability_is_in_bounding_set` and
+    // `remove_capability_from_bounding_set` both reject anything but a
+    // single bit with `EINVAL`, so `.iter()` would fail on that last
+    // flag on every kernel this runs on; `.iter_names()` yields only the
+    // 41 capabilities this build of rustix knows the names of.
+    for (_, capability) in CapabilitySet::all().iter_names() {
+        if capability_is_in_bounding_set(capability)? {
+            // A caller without CAP_SETPCAP gets EPERM here — the normal
+            // case for a supervisor started outside bwrap, where the
+            // bounding set was never bwrap's to empty in the first
+            // place. That leaves it as this process found it, which
+            // `PR_SET_NO_NEW_PRIVS` above already made inert: no
+            // `execve` from here can turn a bounding-set entry into a
+            // held capability, so there is nothing left to gain by
+            // refusing to run instead.
+            match remove_capability_from_bounding_set(capability) {
+                Ok(()) | Err(Errno::PERM) => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    set_parent_process_death_signal(Some(Signal::TERM))?;
+    Ok(())
 }
 
 /// Turn a request down: say why on the connection's own stderr, and
@@ -513,8 +578,22 @@ fn main() -> ExitCode {
         eprintln!("bubbler-init: cannot become non-dumpable: {e}");
         return ExitCode::from(2);
     }
+    if let Err(e) = harden() {
+        eprintln!("bubbler-init: cannot give up privilege: {e}");
+        return ExitCode::from(2);
+    }
     let stop = Arc::new(AtomicBool::new(false));
-    for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+    // SIGHUP is the terminal going away and SIGQUIT the keyboard asking;
+    // both mean the run is over, and the command is owed the same grace
+    // either way. Left on their default dispositions they would kill the
+    // supervisor outright, and the command would be reaped by bwrap with
+    // no SIGTERM of its own.
+    for sig in [
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGHUP,
+        signal_hook::consts::SIGQUIT,
+    ] {
         if signal_hook::flag::register(sig, Arc::clone(&stop)).is_err() {
             eprintln!("bubbler-init: cannot install signal handlers");
             return ExitCode::from(2);

@@ -995,6 +995,16 @@ than served (`bubbler-init: stopping; <program> was not run`, exit 127),
 so nothing is spawned into a sandbox that is being torn down and no child
 reaches the SIGKILL deadline without having been asked to stop first.
 
+`bubbler-init` makes itself non-dumpable, sets `PR_SET_NO_NEW_PRIVS`,
+clears the ambient set and the three sets `capset` carries, drops
+whatever is left in the bounding set, and takes `PR_SET_PDEATHSIG`
+(`SIGTERM`) before it installs a signal handler or starts anything. Under
+bwrap the capability sets are already empty and `no_new_privs` is already
+on: the steps are taken so that the posture is the supervisor's own and
+not something it inherited. SIGHUP and SIGQUIT end the run exactly as
+SIGTERM does, so a terminal that goes away gives the command its grace
+instead of leaving it to bwrap's reaper.
+
 **Does not defend:** descriptors passed to an exec'd command are
 reachable by the sandboxed application through `/proc`. `exec` is a
 convenience channel, not a boundary, and the manual says so.
@@ -1007,6 +1017,7 @@ convenience channel, not a boundary, and the manual says so.
 `a_trickling_client_cannot_extend_the_deadline`,
 `a_stale_socket_is_unlinked_so_a_fresh_start_can_bind`,
 `an_exec_is_refused_once_the_run_is_stopping`,
+`sighup_and_sigquit_end_the_run_with_the_same_grace_as_sigterm`,
 `real_bwrap_exec_round_trip`
 
 ### Desktop entries and PATH shims

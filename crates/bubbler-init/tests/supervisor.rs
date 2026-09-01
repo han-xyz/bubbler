@@ -1249,6 +1249,39 @@ fn a_second_stop_does_not_buy_the_command_another_grace() {
     );
 }
 
+/// SIGHUP is what a terminal sends when it goes, and SIGQUIT what a
+/// keyboard sends; both end the run the way SIGTERM does, with the
+/// command given its grace first rather than the supervisor dying and
+/// leaving it to bwrap.
+#[test]
+fn sighup_and_sigquit_end_the_run_with_the_same_grace_as_sigterm() {
+    if !require_python() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    for (name, signal) in [
+        ("deaf-hup", rustix::process::Signal::HUP),
+        ("deaf-quit", rustix::process::Signal::QUIT),
+    ] {
+        // A fixture of its own per signal: the `.ready` file it writes is
+        // what `wait_until_deaf` waits for, and a second run would find
+        // the first one's.
+        let cmd = write_script(dir.path(), name, COMMAND_IGNORES_TERM, true);
+        let (mut init, _sock) = start_guarded(&[cmd.to_str().unwrap()], Opts::default());
+        wait_until_deaf(&cmd);
+        let t = Instant::now();
+        rustix::process::kill_process(rustix::process::Pid::from_child(init.child()), signal)
+            .unwrap();
+        let status = init.wait_within(Duration::from_secs(12));
+        assert!(
+            t.elapsed() > Duration::from_secs(4),
+            "{name}: the escalation took {:?}",
+            t.elapsed()
+        );
+        assert_eq!(status.code(), Some(137), "{name}: not a killed command");
+    }
+}
+
 #[test]
 fn a_client_that_connects_while_stopping_wakes_nothing() {
     if !require_python() {
