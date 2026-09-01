@@ -184,6 +184,14 @@ const PULSEAUDIO_MODULE_LOADING: Check = Check {
     id: "pulseaudio-module-loading",
     severity: Severity::Note,
 };
+// A note, not a warning: nothing is granted twice and nothing is wider
+// than it says. It is about reading the file — a run of a dozen
+// `home-share` lines is a wall a reader skims past, and one block with
+// the paths under it is the same grants at a glance.
+const REPEAT_OUTSIDE_BLOCK: Check = Check {
+    id: "repeat-outside-block",
+    severity: Severity::Note,
+};
 const SECCOMP_DISABLED: Check = Check {
     id: "seccomp-disabled",
     severity: Severity::Warning,
@@ -270,6 +278,7 @@ pub const CHECKS: &[Check] = &[
     PATH_SHARE_SOCKET,
     PORTAL_TALK_WITHOUT_PORTALS,
     PULSEAUDIO_MODULE_LOADING,
+    REPEAT_OUTSIDE_BLOCK,
     SECCOMP_DISABLED,
     SECRETS_ACCESS,
     SHARE_SOURCE_MISSING,
@@ -717,12 +726,35 @@ struct Source {
     at: Where,
     text: String,
     doc: KdlDocument,
+    /// The same top-level nodes with every repeatable block expanded
+    /// into the lines it stands for. Every check but
+    /// `repeat-outside-block` reads this: a check that saw only the
+    /// line form would ignore half of a block-form config, and
+    /// `home-share-reserved` is an error nothing else catches before
+    /// the launcher.
+    flat: Vec<KdlNode>,
 }
 
 impl Source {
     fn read(at: Where, text: String) -> Result<Self, LintError> {
         let doc = config::parse_document(&text)?;
-        Ok(Self { at, text, doc })
+        let mut flat = Vec::new();
+        for node in doc.nodes() {
+            // A block the config parser refuses is read here as the node
+            // it is: the refusal comes back from the resolve that
+            // follows the lint, and one malformed block must not take
+            // the whole report down with it.
+            match config::parse_repeatable_block(node) {
+                Ok(Some(lines)) => flat.extend(lines),
+                Ok(None) | Err(_) => flat.push(node.clone()),
+            }
+        }
+        Ok(Self {
+            at,
+            text,
+            doc,
+            flat,
+        })
     }
 
     /// Line and column of a byte offset into the layer, both 1-based,
@@ -877,8 +909,7 @@ fn unused_allows(sources: &[Source], f: &mut Findings) {
 /// Top-level nodes of `source` named `name`, in file order.
 fn top<'a>(source: &'a Source, name: &str) -> Vec<&'a KdlNode> {
     source
-        .doc
-        .nodes()
+        .flat
         .iter()
         .filter(|n| n.name().value() == name)
         .collect()
@@ -1137,7 +1168,8 @@ fn pulse_module_loading_on(ctx: &Context) -> bool {
 /// the merged mode a `camera` message reads differently under.
 fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut Findings) {
     bus_names(i, source, f);
-    for node in source.doc.nodes() {
+    repeat_outside_block(i, source, f);
+    for node in &source.flat {
         match node.name().value() {
             "x11" if arg(node) == Some("host") => f.push(
                 i,
@@ -1268,6 +1300,79 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
             _ => {}
         }
     }
+}
+
+/// Two or more line-form nodes of one repeatable kind, offered as the
+/// one block that says the same thing. Read from the layer's own
+/// document rather than from its expanded nodes: this is the one check
+/// that is about how the file is written, so a block must not look like
+/// the lines it stands for.
+fn repeat_outside_block(i: usize, source: &Source, f: &mut Findings) {
+    for kind in config::REPEATABLE {
+        let written: Vec<&KdlNode> = source
+            .doc
+            .nodes()
+            .iter()
+            .filter(|n| n.name().value() == *kind && n.children().is_none())
+            .collect();
+        if written.len() < 2 {
+            continue;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        for node in written.iter().copied().take(3) {
+            let Some(child) = as_block_child(node) else {
+                // A node the config parser will refuse anyway; there is
+                // no block to offer for it.
+                return;
+            };
+            parts.push(child);
+        }
+        if written.len() > 3 {
+            parts.push("…".to_owned());
+        }
+        f.push(
+            i,
+            written[0],
+            &REPEAT_OUTSIDE_BLOCK,
+            format!("`{kind}` is written {} times, one node each", written.len()),
+            &format!(
+                "write them as one block: `{kind} {{ {} }}`",
+                parts.join("; ")
+            ),
+        );
+    }
+}
+
+/// One line-form node as the child it would be written as inside a
+/// block: the first argument becomes the name, and `env`'s property
+/// becomes a name and one argument. `None` for a node whose shape the
+/// config parser refuses, which has no block form to offer.
+///
+/// A value prints through `KdlValue`'s own `Display`, which quotes only
+/// where a bare identifier would not round-trip (`".config"`, a path
+/// with a `/`) and leaves the rest bare (`mode=ro`) — the same choice
+/// every other value in a written config already makes.
+fn as_block_child(node: &KdlNode) -> Option<String> {
+    if node.name().value() == "env" {
+        let entry = node.entries().first()?;
+        entry.value().as_string()?;
+        return Some(format!("{} {}", entry.name()?.value(), entry.value()));
+    }
+    let mut entries = node.entries().iter();
+    let first = entries.next()?;
+    if first.name().is_some() {
+        return None;
+    }
+    first.value().as_string()?;
+    let mut out = first.value().to_string();
+    for e in entries {
+        e.value().as_string()?;
+        out.push(' ');
+        out.push_str(e.name()?.value());
+        out.push('=');
+        out.push_str(&e.value().to_string());
+    }
+    Some(out)
 }
 
 fn env_node(i: usize, node: &KdlNode, f: &mut Findings) {
@@ -1585,7 +1690,7 @@ fn across_layers(ctx: &Context, sources: &[Source], f: &mut Findings) {
 
     if !has_dbus {
         for (i, source) in sources.iter().enumerate() {
-            for node in source.doc.nodes() {
+            for node in &source.flat {
                 let name = node.name().value();
                 if !BUNDLES.contains(&name) {
                     continue;
@@ -2146,12 +2251,14 @@ mod tests {
                     "{alone}"
                 );
             }
+            // One block, not three lines: three line-form `lint-allow`
+            // nodes would themselves be `repeat-outside-block`.
             let allowed = lint(
                 ctx,
                 &["tty \"passthrough\"\nseccomp {\n    disable\n}\n\
-                   lint-allow \"tty-passthrough\" reason=\"a\"\n\
-                   lint-allow \"seccomp-disabled\" reason=\"b\"\n\
-                   lint-allow \"tty-passthrough-without-seccomp\" reason=\"c\""],
+                   lint-allow {\n    \"tty-passthrough\" reason=\"a\"\n    \
+                   \"seccomp-disabled\" reason=\"b\"\n    \
+                   \"tty-passthrough-without-seccomp\" reason=\"c\"\n}"],
             );
             assert_eq!(ids(&allowed), [] as [&str; 0]);
         });
@@ -3432,6 +3539,112 @@ mod tests {
             let err = lint_text(ctx, Where::File("/p/0.kdl".into()), "bluetooth".to_owned())
                 .expect_err("an unknown node is not a clean config");
             assert!(matches!(err, LintError::Config(_)), "{err:?}");
+        });
+    }
+
+    /// Every check reads a block the way it reads the lines it stands
+    /// for: a form that hid `home-share-reserved` would be a way to
+    /// write a config the linter never looked at.
+    #[test]
+    fn the_checks_read_a_block_as_the_lines_it_stands_for() {
+        let (_, dir, _) = fake::types();
+        let host = host()
+            .with("/home/user/.config", dir)
+            .with("/home/user/.ssh", dir)
+            .with("/home/user/Downloads", dir);
+        with(&host, |ctx| {
+            let lines_report = lint(ctx, &["home-share \".config\" mode=rw"]);
+            let lines = ids(&lines_report);
+            let block_report = lint(ctx, &["home-share {\n    \".config\" mode=rw\n}"]);
+            let block = ids(&block_report);
+            assert_eq!(lines, block);
+            assert!(block.contains(&"home-share-sensitive"), "{block:?}");
+            // The reserved check is an error and cannot be silenced, so
+            // a form that hid it would be a way past it.
+            let reserved_report = lint(
+                ctx,
+                &["home-share {\n    \".local/share/bubbler\" mode=rw\n}"],
+            );
+            let reserved = ids(&reserved_report);
+            assert!(reserved.contains(&"home-share-reserved"), "{reserved:?}");
+            // A `lint-allow` written in a block silences what it names.
+            // `.ssh` rather than `.config`: `.config` is also
+            // `home-share-reserved` under this env's default profile
+            // dir, and that check is an error a `lint-allow` cannot
+            // silence — this assertion is about the warning alone.
+            assert_eq!(
+                ids(&lint(
+                    ctx,
+                    &[
+                        "lint-allow {\n    \"home-share-sensitive\" reason=\"the app is the \
+                       owner of that directory\"\n}\nhome-share \".ssh\" mode=rw"
+                    ]
+                )),
+                [] as [&str; 0]
+            );
+        });
+    }
+
+    /// A finding in a block points at the entry, not at the line the
+    /// block opens on.
+    #[test]
+    fn a_block_finding_points_at_the_entry() {
+        let (_, dir, _) = fake::types();
+        let host = host().with("/home/user/.config", dir);
+        with(&host, |ctx| {
+            let report = lint(
+                ctx,
+                &["wayland\nhome-share {\n    \"Downloads\" mode=rw\n    \".config\" mode=rw\n}"],
+            );
+            let f = report
+                .findings
+                .iter()
+                .find(|f| f.id == "home-share-sensitive")
+                .expect("the sensitive share is found");
+            assert_eq!(f.line, Some(4));
+        });
+    }
+
+    /// Two line-form nodes of one kind: one block writes the same
+    /// grants, and the note shows it.
+    #[test]
+    fn repeat_outside_block_offers_the_block() {
+        with(&host(), |ctx| {
+            let report = lint(
+                ctx,
+                &["home-share \".local/bin/claude\" mode=ro\n\
+                   home-share \".local/share/claude\" mode=ro"],
+            );
+            let f = report
+                .findings
+                .iter()
+                .find(|f| f.id == "repeat-outside-block")
+                .expect("the note is raised");
+            assert_eq!(f.severity, Severity::Note);
+            assert_eq!(f.line, Some(1));
+            assert_eq!(f.message, "`home-share` is written 2 times, one node each");
+            assert_eq!(
+                f.help,
+                "write them as one block: `home-share { \".local/bin/claude\" mode=ro; \
+                 \".local/share/claude\" mode=ro }`"
+            );
+            // One node raises nothing, and the block raises nothing.
+            assert!(!ids(&lint(ctx, &["home-share \"a\""])).contains(&"repeat-outside-block"));
+            assert!(
+                !ids(&lint(ctx, &["home-share {\n    \"a\"\n    \"b\"\n}"]))
+                    .contains(&"repeat-outside-block")
+            );
+            // `env` is offered in the child's own spelling.
+            let report = lint(ctx, &["env A=\"1\"\nenv B=\"2\""]);
+            let f = report
+                .findings
+                .iter()
+                .find(|f| f.id == "repeat-outside-block")
+                .expect("the note is raised for env");
+            assert_eq!(
+                f.help,
+                "write them as one block: `env { A \"1\"; B \"2\" }`"
+            );
         });
     }
 }

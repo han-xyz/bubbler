@@ -383,6 +383,11 @@ const CHECK_LINES: &[(&str, &str)] = &[
          — a network sink among them — because the sandbox asked it to.",
     ),
     (
+        "repeat-outside-block",
+        "Two or more nodes of one repeatable kind written one per line; one block with \
+         the entries under it grants the same thing and reads at a glance.",
+    ),
+    (
         "seccomp-disabled",
         "`seccomp { disable }` leaves the sandbox with no syscall filter at all.",
     ),
