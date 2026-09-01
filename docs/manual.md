@@ -2847,7 +2847,11 @@ outright rather than skipping the bind), `dbus-without-rules`,
 `tty-passthrough`, `tty-passthrough-without-seccomp` (`tty "passthrough"`
 with `seccomp { disable }`, which is the terminal handed over with the
 `TIOCSTI` rules taken away), `portal-talk-without-portals` (a portal rule is
-inert without `/.flatpak-info`, which is worse than wrong), `wayland-host`
+inert without `/.flatpak-info`, which is worse than wrong),
+`wayland-clipboard-open` (`wayland clipboard="open"` with no `lint-allow`
+reason: the proxy forwards every clipboard read the sandbox asks for and
+only logs it, rather than forwarding one that follows a key, button or
+touch of yours), `wayland-host`
 (`wayland "host"`, the session's own compositor socket, which the compositor
 cannot tell from your session), `network-host` (`network "host"` shares the
 host network namespace: every host loopback service and every abstract unix
