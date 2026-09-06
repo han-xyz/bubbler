@@ -10872,6 +10872,13 @@ mod profile_smoke {
     /// fixture), not a browser or office suite's cold start.
     const SMOKE_LIMIT: Duration = Duration::from_secs(30);
 
+    /// How long a mapped window has to stay mapped, with its sandbox
+    /// still running, before the profile counts as working. Measured on
+    /// the case this exists for — `code`, whose launcher returned 1.1 s
+    /// after it had spawned the editor detached — so three seconds is
+    /// well past it and short enough to pay on every profile.
+    const SETTLE: Duration = Duration::from_secs(3);
+
     /// What a GUI smoke test looks for in `hyprctl clients`. Most shipped
     /// profiles set a stable window class; this host's Steam client sets
     /// none on its main window (`class` comes back empty), so that test
@@ -10981,7 +10988,7 @@ mod profile_smoke {
         } else {
             bubbler_wayland(tmp.path(), &init)
         };
-        let run = BackgroundRun {
+        let mut run = BackgroundRun {
             run: Some(
                 cmd.args(["try", "--profile", p.profile])
                     .stderr(std::fs::File::create(&log).unwrap())
@@ -10995,6 +11002,27 @@ mod profile_smoke {
             "{}: no new window within {:?}: {}",
             p.profile,
             p.limit,
+            without_tool_warnings(&run.said())
+        );
+        std::thread::sleep(SETTLE);
+        // A profile whose command starts the application detached and
+        // returns takes the sandbox down with it, and the window it had
+        // already mapped goes with the sandbox: the rise above is real
+        // for about a second and proves nothing.
+        assert!(
+            run.run
+                .as_mut()
+                .is_some_and(|c| c.try_wait().is_ok_and(|s| s.is_none())),
+            "{}: the run ended {:?} after its window mapped: {}",
+            p.profile,
+            SETTLE,
+            without_tool_warnings(&run.said())
+        );
+        assert!(
+            hyprctl_count(&p.seen) > before,
+            "{}: the window was gone {:?} after it mapped: {}",
+            p.profile,
+            SETTLE,
             without_tool_warnings(&run.said())
         );
         stop_within(run, p.limit);
