@@ -10,6 +10,11 @@
   becomes DRM master on a virtual terminal switch and reads the monitors'
   EDID, the framebuffer geometry and every other client's flink names. No
   shipped profile sets it.
+- `home-share` and `path-share` take `optional=#true`: a source absent on
+  this host is skipped instead of refusing the launch, so one profile can
+  name a path only some installs of an app have. `--explain` says when a
+  share was skipped this way; a present source binds exactly as it would
+  without the property.
 
 ### Changed
 

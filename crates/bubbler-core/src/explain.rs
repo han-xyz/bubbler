@@ -563,6 +563,19 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
                     Some(Service::X11(X11Mode::Host)) => {
                         out.push("    raw socket: x11 \"host\"".to_owned());
                     }
+                    // An optional share with no argument bound nothing: a
+                    // required one would have refused the launch instead,
+                    // so this is the one case zero arguments means a
+                    // grant that a live run quietly does not act on.
+                    Some(
+                        s @ (Service::HomeShare { optional: true, .. }
+                        | Service::PathShare { optional: true, .. }),
+                    ) if n == 0 => {
+                        out.push(format!(
+                            "    {}  absent on this host, skipped",
+                            kdl_out::service(s)?
+                        ));
+                    }
                     // The nested mode needs no line of its own: the argv
                     // it hands the supervisor is an argument above, and
                     // that one carries the explanation.
@@ -1491,6 +1504,7 @@ bwrap
             services: vec![Service::PathShare {
                 path: deep,
                 mode: ShareMode::ReadOnly,
+                optional: false,
             }],
             ..InstanceConfig::default()
         };
@@ -1562,6 +1576,115 @@ bwrap
             ),
             "{json}"
         );
+    }
+
+    /// An optional share whose source is absent binds nothing, so its
+    /// group has no arguments; the skip is the only thing left to say
+    /// about it.
+    #[test]
+    fn an_absent_optional_home_share_is_reported_skipped() {
+        let cfg = InstanceConfig {
+            services: vec![Service::HomeShare {
+                path: PathBuf::from("Downloads"),
+                mode: ShareMode::ReadOnly,
+                optional: true,
+            }],
+            ..InstanceConfig::default()
+        };
+        let view = View {
+            title: "bwrap",
+            instance: "t",
+            cfg: &cfg,
+            source: Source {
+                file: "config.kdl",
+                lines: &Lines::default(),
+            },
+            rules: &[],
+            wl_proxy: None,
+            net_proxy_log: false,
+            proxy: false,
+            full: false,
+            bwrap: crate::version::Version::Known(0, 12, 0),
+        };
+        let out = render(&[], &view).unwrap();
+        assert!(
+            out.contains(
+                &"    home-share \"Downloads\" mode=ro optional=#true  \
+                  absent on this host, skipped"
+                    .to_owned()
+            ),
+            "{out:?}"
+        );
+    }
+
+    /// The same skip line, for the other share kind.
+    #[test]
+    fn an_absent_optional_path_share_is_reported_skipped() {
+        let cfg = InstanceConfig {
+            services: vec![Service::PathShare {
+                path: PathBuf::from("/opt/tool"),
+                mode: ShareMode::ReadOnly,
+                optional: true,
+            }],
+            ..InstanceConfig::default()
+        };
+        let view = View {
+            title: "bwrap",
+            instance: "t",
+            cfg: &cfg,
+            source: Source {
+                file: "config.kdl",
+                lines: &Lines::default(),
+            },
+            rules: &[],
+            wl_proxy: None,
+            net_proxy_log: false,
+            proxy: false,
+            full: false,
+            bwrap: crate::version::Version::Known(0, 12, 0),
+        };
+        let out = render(&[], &view).unwrap();
+        assert!(
+            out.contains(
+                &"    path-share \"/opt/tool\" mode=ro optional=#true  \
+                  absent on this host, skipped"
+                    .to_owned()
+            ),
+            "{out:?}"
+        );
+    }
+
+    /// A share that is not optional gets no such line even with no
+    /// arguments: the group being empty here only means the test built
+    /// no `Explained` item for it, never that a live launch would have
+    /// skipped a required source silently.
+    #[test]
+    fn a_required_share_with_no_items_says_nothing_about_being_skipped() {
+        let cfg = InstanceConfig {
+            services: vec![Service::HomeShare {
+                path: PathBuf::from("Downloads"),
+                mode: ShareMode::ReadOnly,
+                optional: false,
+            }],
+            ..InstanceConfig::default()
+        };
+        let view = View {
+            title: "bwrap",
+            instance: "t",
+            cfg: &cfg,
+            source: Source {
+                file: "config.kdl",
+                lines: &Lines::default(),
+            },
+            rules: &[],
+            wl_proxy: None,
+            net_proxy_log: false,
+            proxy: false,
+            full: false,
+            bwrap: crate::version::Version::Known(0, 12, 0),
+        };
+        let out = render(&[], &view).unwrap();
+        assert!(!out.iter().any(|l| l.contains("skipped")), "{out:?}");
     }
 
     #[test]

@@ -968,14 +968,17 @@ mod tests {
                 Service::HomeShare {
                     path: "Documents".into(),
                     mode: ShareMode::ReadOnly,
+                    optional: false,
                 },
                 Service::HomeShare {
                     path: "Downloads".into(),
                     mode: ShareMode::ReadWrite,
+                    optional: false,
                 },
                 Service::PathShare {
                     path: "/srv/data".into(),
                     mode: ShareMode::ReadWrite,
+                    optional: false,
                 },
                 Service::Portals {
                     children: Vec::new(),
@@ -1319,10 +1322,12 @@ mod tests {
                 Service::PathShare {
                     path: "/srv/escape".into(),
                     mode: ShareMode::ReadOnly,
+                    optional: false,
                 },
                 Service::PathShare {
                     path: "/srv/store".into(),
                     mode: ShareMode::ReadWrite,
+                    optional: false,
                 },
             ],
             ..InstanceConfig::default()

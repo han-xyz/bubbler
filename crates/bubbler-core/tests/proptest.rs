@@ -119,7 +119,11 @@ fn share_services() -> impl Strategy<Value = Vec<Service>> {
                     continue;
                 }
                 seen.push(path.clone());
-                out.push(Service::HomeShare { path, mode });
+                out.push(Service::HomeShare {
+                    path,
+                    mode,
+                    optional: false,
+                });
             }
             let mut seen: Vec<PathBuf> = Vec::new();
             for (rel, mode) in path {
@@ -128,7 +132,11 @@ fn share_services() -> impl Strategy<Value = Vec<Service>> {
                     continue;
                 }
                 seen.push(path.clone());
-                out.push(Service::PathShare { path, mode });
+                out.push(Service::PathShare {
+                    path,
+                    mode,
+                    optional: false,
+                });
             }
             let mut seen: Vec<&str> = Vec::new();
             for name in etc {
@@ -453,6 +461,7 @@ fn fit_disabled(cfg: &InstanceConfig, kinds: &[(u8, usize)]) -> Vec<Disabled> {
                     Node::Service(Service::HomeShare {
                         path: PathBuf::from("kept"),
                         mode: ShareMode::ReadOnly,
+                        optional: false,
                     }),
                     cfg.services.len(),
                 ),

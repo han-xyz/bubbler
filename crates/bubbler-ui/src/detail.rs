@@ -989,6 +989,7 @@ mod tests {
                 Service::HomeShare {
                     path: "Downloads".into(),
                     mode: ShareMode::ReadWrite,
+                    optional: false,
                 },
                 Service::Dbus { rules: vec![] },
             ],
@@ -1009,6 +1010,7 @@ mod tests {
             node: config::Node::Service(Service::HomeShare {
                 path: "Music".into(),
                 mode: ShareMode::ReadOnly,
+                optional: false,
             }),
             before: 1,
         });
@@ -1104,7 +1106,8 @@ mod tests {
             shares,
             [&Service::HomeShare {
                 path: "Documents".into(),
-                mode: ShareMode::ReadOnly
+                mode: ShareMode::ReadOnly,
+                optional: false
             }],
             "the row was replaced, not added to"
         );
@@ -1451,7 +1454,8 @@ mod tests {
             detail.buf.services,
             [Service::HomeShare {
                 path: "A".into(),
-                mode: ShareMode::ReadOnly
+                mode: ShareMode::ReadOnly,
+                optional: false
             }],
             "the one the cursor was on"
         );

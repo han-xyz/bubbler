@@ -550,6 +550,10 @@ pub enum Service {
         path: PathBuf,
         /// Read-only unless `mode=rw`.
         mode: ShareMode,
+        /// A missing source is skipped rather than refused, so one
+        /// profile can name a path that only some installs of an app
+        /// have.
+        optional: bool,
     },
     /// Bind a host path outside the home at that same path inside the
     /// sandbox. Reserved roots (`/etc`, `/home`, `/run`, ...) are refused
@@ -559,6 +563,10 @@ pub enum Service {
         path: PathBuf,
         /// Read-only unless `mode=rw`.
         mode: ShareMode,
+        /// A missing source is skipped rather than refused, so one
+        /// profile can name a path that only some installs of an app
+        /// have.
+        optional: bool,
     },
     /// Bind one host `/etc` entry read-only at the same path, on top of
     /// the baseline `/etc` allowlist.
@@ -1607,15 +1615,23 @@ pub(crate) fn parse_one(node: &KdlNode, profile: bool) -> Result<Node, ConfigErr
             })
         }
         "home-share" => {
-            let (path, mode) = parse_share(node, "path", validate_relative)?;
-            Node::Service(Service::HomeShare { path, mode })
+            let (path, mode, optional) = parse_share(node, "path", validate_relative, true)?;
+            Node::Service(Service::HomeShare {
+                path,
+                mode,
+                optional,
+            })
         }
         "path-share" => {
-            let (path, mode) = parse_share(node, "path", validate_absolute)?;
-            Node::Service(Service::PathShare { path, mode })
+            let (path, mode, optional) = parse_share(node, "path", validate_absolute, true)?;
+            Node::Service(Service::PathShare {
+                path,
+                mode,
+                optional,
+            })
         }
         "app-runtime" => {
-            let (id, mode) = parse_share(node, "id", validate_app_id)?;
+            let (id, mode, _) = parse_share(node, "id", validate_app_id, false)?;
             Node::Service(Service::AppRuntime { id, mode })
         }
         "portals" => {
@@ -1995,9 +2011,11 @@ fn parse_share<T>(
     node: &KdlNode,
     what: &str,
     validate: fn(&KdlNode, &str) -> Result<T, ConfigError>,
-) -> Result<(T, ShareMode), ConfigError> {
+    allow_optional: bool,
+) -> Result<(T, ShareMode, bool), ConfigError> {
     let mut value: Option<T> = None;
     let mut mode = ShareMode::ReadOnly;
+    let mut optional = false;
     for e in node.entries() {
         match e.name().map(|n| n.value()) {
             None => {
@@ -2017,6 +2035,17 @@ fn parse_share<T>(
                     _ => return Err(bad(node, "mode must be \"ro\" or \"rw\"")),
                 };
             }
+            // Guarded by the caller rather than a fixed list of node
+            // names: `app-runtime` shares this parser but has no
+            // `optional` property, since its `id` names a directory
+            // bubbler itself makes, never a path an app may or may not
+            // have installed.
+            Some("optional") if allow_optional => {
+                optional = e
+                    .value()
+                    .as_bool()
+                    .ok_or_else(|| bad(node, "optional must be #true or #false"))?;
+            }
             Some(p) => {
                 return Err(ConfigError::UnknownProperty {
                     node: node.name().value().to_owned(),
@@ -2029,7 +2058,7 @@ fn parse_share<T>(
         return Err(bad(node, "takes no children"));
     }
     let value = value.ok_or_else(|| bad(node, &format!("expects exactly one {what} argument")))?;
-    Ok((value, mode))
+    Ok((value, mode, optional))
 }
 
 /// The id of an `app-runtime` node. Validated as an application id
@@ -3561,11 +3590,13 @@ mod tests {
                 Service::Network(NetworkConfig::default()),
                 Service::HomeShare {
                     path: "Downloads".into(),
-                    mode: ShareMode::ReadOnly
+                    mode: ShareMode::ReadOnly,
+                    optional: false
                 },
                 Service::HomeShare {
                     path: "Projects/x".into(),
-                    mode: ShareMode::ReadWrite
+                    mode: ShareMode::ReadWrite,
+                    optional: false
                 },
             ]
         );
@@ -4393,6 +4424,46 @@ mod tests {
     }
 
     #[test]
+    fn home_share_optional_defaults_to_false_and_parses_both_values() {
+        let cfg = parse(r#"home-share "a""#).unwrap();
+        assert_eq!(
+            cfg.services,
+            vec![Service::HomeShare {
+                path: "a".into(),
+                mode: ShareMode::ReadOnly,
+                optional: false,
+            }]
+        );
+        let cfg = parse(r#"home-share "a" optional=#true"#).unwrap();
+        assert_eq!(
+            cfg.services,
+            vec![Service::HomeShare {
+                path: "a".into(),
+                mode: ShareMode::ReadOnly,
+                optional: true,
+            }]
+        );
+        let cfg = parse(r#"home-share "a" optional=#false"#).unwrap();
+        assert_eq!(
+            cfg.services,
+            vec![Service::HomeShare {
+                path: "a".into(),
+                mode: ShareMode::ReadOnly,
+                optional: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn home_share_rejects_a_non_boolean_optional() {
+        assert!(matches!(
+            parse(r#"home-share "a" optional="yes""#),
+            Err(ConfigError::BadArgument { node, reason })
+                if node == "home-share" && reason == "optional must be #true or #false"
+        ));
+    }
+
+    #[test]
     fn command_needs_at_least_one_string() {
         assert!(matches!(
             parse("command"),
@@ -4473,11 +4544,13 @@ command "b""#
             vec![
                 Service::PathShare {
                     path: "/kioxia/Steam".into(),
-                    mode: ShareMode::ReadOnly
+                    mode: ShareMode::ReadOnly,
+                    optional: false
                 },
                 Service::PathShare {
                     path: "/mnt/data".into(),
-                    mode: ShareMode::ReadWrite
+                    mode: ShareMode::ReadWrite,
+                    optional: false
                 },
             ]
         );
@@ -4517,6 +4590,50 @@ command "b""#
         assert!(matches!(
             parse(r#"path-share "/a" ro=#true"#),
             Err(ConfigError::UnknownProperty { .. })
+        ));
+    }
+
+    #[test]
+    fn path_share_optional_defaults_to_false_and_parses_both_values() {
+        let cfg = parse(r#"path-share "/a""#).unwrap();
+        assert_eq!(
+            cfg.services,
+            vec![Service::PathShare {
+                path: "/a".into(),
+                mode: ShareMode::ReadOnly,
+                optional: false,
+            }]
+        );
+        let cfg = parse(r#"path-share "/a" optional=#true"#).unwrap();
+        assert_eq!(
+            cfg.services,
+            vec![Service::PathShare {
+                path: "/a".into(),
+                mode: ShareMode::ReadOnly,
+                optional: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn path_share_rejects_a_non_boolean_optional() {
+        assert!(matches!(
+            parse(r#"path-share "/a" optional=1"#),
+            Err(ConfigError::BadArgument { node, reason })
+                if node == "path-share" && reason == "optional must be #true or #false"
+        ));
+    }
+
+    #[test]
+    fn app_runtime_has_no_optional_property() {
+        // `optional` is a share-node concept: an `app-runtime` id names a
+        // directory bubbler itself makes, never a path an app may or may
+        // not have installed, so the property is unknown here rather
+        // than accepted and ignored.
+        assert!(matches!(
+            parse(r#"app-runtime "org.example.App" optional=#true"#),
+            Err(ConfigError::UnknownProperty { node, prop })
+                if node == "app-runtime" && prop == "optional"
         ));
     }
 
@@ -5776,6 +5893,7 @@ command "b""#
         let share = Node::Service(Service::HomeShare {
             path: PathBuf::from("x"),
             mode: ShareMode::ReadOnly,
+            optional: false,
         });
         // Before, between and after the enabled nodes: the entry is
         // remembered where the file put it, counted in the entries of its
@@ -6750,7 +6868,8 @@ command "b""#
             cfg.disabled[0].node,
             Node::Service(Service::HomeShare {
                 path: PathBuf::from("a"),
-                mode: ShareMode::ReadOnly
+                mode: ShareMode::ReadOnly,
+                optional: false
             })
         );
     }

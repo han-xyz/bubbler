@@ -60,7 +60,11 @@ pub fn apply_all(
             Service::Wayland(_) => wayland(env, args, host, !has_x11, ctx.wayland)?,
             Service::X11(mode) => x11(env, args, host, mode)?,
             Service::Network(cfg) => network(env, args, host, cfg)?,
-            Service::HomeShare { path, mode } => home_share(env, args, host, path, *mode)?,
+            Service::HomeShare {
+                path,
+                mode,
+                optional,
+            } => home_share(env, args, host, path, *mode, *optional)?,
             Service::Dri { kms } => dri(args, host, *kms)?,
             Service::Pipewire => pipewire(env, args, host)?,
             Service::Pulseaudio => pulseaudio(env, args, host)?,
@@ -1153,10 +1157,25 @@ fn path_shares<'a>(
 ) -> Result<Vec<(usize, &'a Path, PathBuf, ShareMode)>, LaunchError> {
     let mut shares: Vec<(usize, &Path, PathBuf, ShareMode)> = Vec::new();
     for (i, s) in services.iter().enumerate() {
-        let Service::PathShare { path, mode } = s else {
+        let Service::PathShare {
+            path,
+            mode,
+            optional,
+        } = s
+        else {
             continue;
         };
-        let src = resolve_source(host, "path-share", path, require_dir_or_file)?;
+        let src = match resolve_source(host, "path-share", path, require_dir_or_file) {
+            // A missing optional source is a silent no-op rather than the
+            // launch error below: `--explain` is where the skip is
+            // reported. Matched on the missing path itself, the same way
+            // `home_share` is, so a source that fails to resolve for a
+            // reason other than "not there" still refuses the launch.
+            Err(LaunchError::MissingResource { path: p, .. }) if *optional && p == *path => {
+                continue;
+            }
+            result => result?,
+        };
         if let Some((root, end)) = denied_root(host, env, &src, path) {
             return Err(LaunchError::BadValue {
                 service: "path-share",
@@ -1200,21 +1219,36 @@ fn path_shares<'a>(
 /// both modes, as they are for `path-share` and `--share`. Resolving and
 /// binding both happen by path, so a symlink swapped in between the two
 /// is not detected; that is inherent to bwrap path binds.
+///
+/// `optional` turns a missing source into a silent no-op rather than the
+/// launch error every other absent resource is: a profile can name a path
+/// only some installs of an app have, and `--explain` is where the skip
+/// is reported.
 fn home_share(
     env: &Env,
     args: &mut BwrapArgs,
     host: &dyn Host,
     rel: &Path,
     mode: ShareMode,
+    optional: bool,
 ) -> Result<(), LaunchError> {
     let written = env.home.join(rel);
-    let src = confine(
+    let src = match confine(
         host,
         "home-share",
         &env.home,
         &written,
         "the home directory",
-    )?;
+    ) {
+        // Matched on the missing path itself, not just the error kind: a
+        // `home-share` that cannot resolve because `$HOME` is gone is a
+        // much bigger problem than one absent optional entry, and stays
+        // the launch error it always was.
+        Err(LaunchError::MissingResource { path, .. }) if optional && path == written => {
+            return Ok(());
+        }
+        result => result?,
+    };
     let dst = Path::new(SANDBOX_HOME).join(rel);
     deny_reserved_in_home(host, env, "home-share", &written, &src, &dst)?;
     match mode {
@@ -1331,19 +1365,28 @@ fn config_shares(
 ) -> Result<Vec<(Option<PathBuf>, PathBuf)>, LaunchError> {
     let mut out: Vec<(Option<PathBuf>, PathBuf)> = Vec::new();
     for s in services {
-        let Service::HomeShare { path, .. } = s else {
+        let Service::HomeShare { path, optional, .. } = s else {
             continue;
         };
         // The name of the node that would be at fault, not of the flag:
         // `apply_all` resolved this same path before us, so a failure
         // here is the config's, not the caller's.
-        let src = confine(
+        let written = env.home.join(path);
+        let src = match confine(
             host,
             "home-share",
             &env.home,
-            &env.home.join(path),
+            &written,
             "the home directory",
-        )?;
+        ) {
+            // A missing optional source binds nothing, so it is not a
+            // share to check `--share` against either; `apply_all`'s
+            // `home_share` makes the same skip.
+            Err(LaunchError::MissingResource { path: p, .. }) if *optional && p == written => {
+                continue;
+            }
+            result => result?,
+        };
         out.push((Some(src), Path::new(SANDBOX_HOME).join(path)));
     }
     for (_, dst, src, _) in path_shares(services, env, host)? {
@@ -2460,10 +2503,12 @@ mod tests {
             Service::HomeShare {
                 path: "Downloads".into(),
                 mode: ShareMode::ReadOnly,
+                optional: false,
             },
             Service::HomeShare {
                 path: "Projects/x".into(),
                 mode: ShareMode::ReadWrite,
+                optional: false,
             },
         ];
         let a = argv(
@@ -2498,6 +2543,7 @@ mod tests {
         let svcs = [Service::HomeShare {
             path: "notes.txt".into(),
             mode: ShareMode::ReadOnly,
+            optional: false,
         }];
         let a = argv(&svcs, &env(), &[("/home/user/notes.txt", File)]).unwrap();
         assert!(has_seq(
@@ -2515,6 +2561,7 @@ mod tests {
         let svcs = [Service::HomeShare {
             path: "Nope".into(),
             mode: ShareMode::ReadOnly,
+            optional: false,
         }];
         assert!(matches!(
             argv(&svcs, &env(), &[]),
@@ -2526,10 +2573,39 @@ mod tests {
     }
 
     #[test]
+    fn home_share_optional_and_absent_binds_nothing_and_does_not_fail() {
+        let svcs = [Service::HomeShare {
+            path: "Nope".into(),
+            mode: ShareMode::ReadOnly,
+            optional: true,
+        }];
+        let a = argv(&svcs, &env(), &[]).unwrap();
+        assert!(!a.iter().any(|s| s.contains("Nope")), "{a:?}");
+    }
+
+    #[test]
+    fn home_share_optional_and_present_binds_exactly_as_a_required_one_would() {
+        let present = |optional| {
+            argv(
+                &[Service::HomeShare {
+                    path: "Downloads".into(),
+                    mode: ShareMode::ReadOnly,
+                    optional,
+                }],
+                &env(),
+                &[("/home/user/Downloads", Dir)],
+            )
+            .unwrap()
+        };
+        assert_eq!(present(true), present(false));
+    }
+
+    #[test]
     fn home_share_through_a_symlink_out_of_the_home_is_refused() {
         let svcs = [Service::HomeShare {
             path: "RootLink".into(),
             mode: ShareMode::ReadWrite,
+            optional: false,
         }];
         let r = argv_linked(
             &svcs,
@@ -2548,6 +2624,7 @@ mod tests {
         let svcs = [Service::HomeShare {
             path: "Downloads".into(),
             mode: ShareMode::ReadOnly,
+            optional: false,
         }];
         let a = argv_linked(
             &svcs,
@@ -2567,6 +2644,7 @@ mod tests {
         let svcs = [Service::HomeShare {
             path: "Downloads".into(),
             mode: ShareMode::ReadOnly,
+            optional: false,
         }];
         let (_, dir, _) = fake::types();
         let host = FakeHost::default().with("/home/user/Downloads", dir);
@@ -2617,6 +2695,7 @@ mod tests {
         let svcs = [Service::HomeShare {
             path: "myprofiles".into(),
             mode: ShareMode::ReadWrite,
+            optional: false,
         }];
         let err = argv(&svcs, &e, &[(&dir, Dir)]).unwrap_err();
         assert!(
@@ -2645,6 +2724,7 @@ mod tests {
             let svcs = [Service::PathShare {
                 path: path.into(),
                 mode: ShareMode::ReadWrite,
+                optional: false,
             }];
             let err = argv(&svcs, &e, &[(path, Dir), ("/kioxia/profiles", Dir)]).unwrap_err();
             assert!(
@@ -2672,6 +2752,7 @@ mod tests {
             let svcs = [Service::HomeShare {
                 path: ".local/share/bubbler".into(),
                 mode,
+                optional: false,
             }];
             let e = argv(&svcs, &env(), &[(&store, Dir)]).unwrap_err();
             assert!(
@@ -2691,6 +2772,7 @@ mod tests {
         let svcs = [Service::HomeShare {
             path: ".config/bubbler".into(),
             mode: ShareMode::ReadOnly,
+            optional: false,
         }];
         let e = argv(&svcs, &env(), &[(&layer, Dir)]).unwrap_err();
         assert!(
@@ -2709,6 +2791,7 @@ mod tests {
         let svcs = [Service::HomeShare {
             path: ".local/share".into(),
             mode: ShareMode::ReadOnly,
+            optional: false,
         }];
         let e = argv(&svcs, &env(), &[(&above, Dir)]).unwrap_err();
         assert!(
@@ -2726,6 +2809,7 @@ mod tests {
         let svcs = [Service::HomeShare {
             path: ".local/share/Other".into(),
             mode: ShareMode::ReadOnly,
+            optional: false,
         }];
         let a = argv(&svcs, &env(), &[(&other, Dir)]).unwrap();
         assert!(
@@ -2834,6 +2918,7 @@ mod tests {
             &[Service::HomeShare {
                 path: PathBuf::from("Projects/app"),
                 mode: ShareMode::ReadOnly,
+                optional: false,
             }],
             &[Share {
                 path: PathBuf::from(&src),
@@ -2950,6 +3035,7 @@ mod tests {
             &[Service::HomeShare {
                 path: PathBuf::from("Projects/app"),
                 mode: ShareMode::ReadOnly,
+                optional: false,
             }],
             &[Share {
                 path: PathBuf::from(home("app")),
@@ -2982,6 +3068,7 @@ mod tests {
             &[Service::HomeShare {
                 path: PathBuf::from("Downloads"),
                 mode: ShareMode::ReadOnly,
+                optional: false,
             }],
             &[Share {
                 path: PathBuf::from(home("Projects/app")),
@@ -3031,6 +3118,7 @@ mod tests {
             &[Service::HomeShare {
                 path: PathBuf::from("Projects/app"),
                 mode: ShareMode::ReadOnly,
+                optional: false,
             }],
             &[Share {
                 path: PathBuf::from(home("Projects/app/sub")),
@@ -3078,6 +3166,7 @@ mod tests {
         Service::PathShare {
             path: path.into(),
             mode,
+            optional: false,
         }
     }
 
@@ -3205,6 +3294,34 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn path_share_optional_and_absent_binds_nothing_and_does_not_fail() {
+        let svcs = [Service::PathShare {
+            path: "/kioxia/Steam".into(),
+            mode: ShareMode::ReadOnly,
+            optional: true,
+        }];
+        let a = argv(&svcs, &env(), &[]).unwrap();
+        assert!(!a.iter().any(|s| s.contains("Steam")), "{a:?}");
+    }
+
+    #[test]
+    fn path_share_optional_and_present_binds_exactly_as_a_required_one_would() {
+        let present = |optional| {
+            argv(
+                &[Service::PathShare {
+                    path: "/kioxia/Steam".into(),
+                    mode: ShareMode::ReadOnly,
+                    optional,
+                }],
+                &env(),
+                &[("/kioxia/Steam", Dir)],
+            )
+            .unwrap()
+        };
+        assert_eq!(present(true), present(false));
     }
 
     #[test]

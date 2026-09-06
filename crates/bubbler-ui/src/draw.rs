@@ -978,7 +978,12 @@ mod tests {
             .grammar;
         assert_eq!(
             wrapped(grammar, 24),
-            ["home-share", "\"<path under $HOME>\"", "[mode=ro|rw]"]
+            [
+                "home-share",
+                "\"<path under $HOME>\"",
+                "[mode=ro|rw]",
+                "[optional=#true]"
+            ]
         );
         assert_eq!(wrapped(grammar, 8), wrapped(grammar, 24));
         assert_eq!(wrapped("", 40), [""]);

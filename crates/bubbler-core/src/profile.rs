@@ -866,7 +866,7 @@ impl Merged {
         if held_mode != mode {
             let node = kdl_out::service(svc).unwrap_or_else(|_| name.to_owned());
             let node = kdl_out::without_mode(&node);
-            return Err(mode_conflict(node, held_mode, held_src, mode, src));
+            return Err(mode_conflict(&node, held_mode, held_src, mode, src));
         }
         Ok(true)
     }
@@ -1045,7 +1045,11 @@ fn union_bus_rules(
 /// The path and mode of a `home-share` node, and nothing else.
 fn home_share(s: &Service) -> Option<(&Path, ShareMode)> {
     match s {
-        Service::HomeShare { path, mode } => Some((path, *mode)),
+        Service::HomeShare {
+            path,
+            mode,
+            optional: _,
+        } => Some((path, *mode)),
         _ => None,
     }
 }
@@ -1053,7 +1057,11 @@ fn home_share(s: &Service) -> Option<(&Path, ShareMode)> {
 /// The path and mode of a `path-share` node, and nothing else.
 fn path_share(s: &Service) -> Option<(&Path, ShareMode)> {
     match s {
-        Service::PathShare { path, mode } => Some((path, *mode)),
+        Service::PathShare {
+            path,
+            mode,
+            optional: _,
+        } => Some((path, *mode)),
         _ => None,
     }
 }
@@ -1159,6 +1167,7 @@ mod tests {
         let home_share = |p: &str, mode| Service::HomeShare {
             path: PathBuf::from(p),
             mode,
+            optional: false,
         };
         assert!(
             cfg("mpv")
@@ -1252,6 +1261,7 @@ mod tests {
         let home_share = |p: &str, mode| Service::HomeShare {
             path: PathBuf::from(p),
             mode,
+            optional: false,
         };
         let wayland = || Service::Wayland(WaylandMode::default());
         let network = || Service::Network(NetworkConfig::default());
@@ -2230,15 +2240,18 @@ mod tests {
                 Service::Network(NetworkConfig::default()),
                 Service::HomeShare {
                     path: "D".into(),
-                    mode: ShareMode::ReadOnly
+                    mode: ShareMode::ReadOnly,
+                    optional: false
                 },
                 Service::HomeShare {
                     path: "E".into(),
-                    mode: ShareMode::ReadWrite
+                    mode: ShareMode::ReadWrite,
+                    optional: false
                 },
                 Service::PathShare {
                     path: "/kioxia/Steam".into(),
-                    mode: ShareMode::ReadOnly
+                    mode: ShareMode::ReadOnly,
+                    optional: false
                 },
                 Service::EtcShare {
                     name: "vulkan".into()

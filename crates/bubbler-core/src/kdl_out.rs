@@ -276,13 +276,31 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
             }
             node
         }
-        Service::HomeShare { path, mode } => {
+        Service::HomeShare {
+            path,
+            mode,
+            optional,
+        } => {
             let path = text("home-share", "path", path.as_os_str())?;
-            format!("home-share {} mode={}", quote(path), share_mode(*mode))
+            format!(
+                "home-share {} mode={}{}",
+                quote(path),
+                share_mode(*mode),
+                optional_suffix(*optional)
+            )
         }
-        Service::PathShare { path, mode } => {
+        Service::PathShare {
+            path,
+            mode,
+            optional,
+        } => {
             let path = text("path-share", "path", path.as_os_str())?;
-            format!("path-share {} mode={}", quote(path), share_mode(*mode))
+            format!(
+                "path-share {} mode={}{}",
+                quote(path),
+                share_mode(*mode),
+                optional_suffix(*optional)
+            )
         }
         Service::EtcShare { name } => {
             format!("etc-share {}", quote(text("etc-share", "name", name)?))
@@ -426,14 +444,20 @@ fn closing_quote(chars: &[char], open: usize) -> Option<usize> {
     None
 }
 
-/// `node` without the trailing `mode=` a share is written with, for a
-/// message that names the node and the two modes it was granted in
-/// separately: a header stating one of them would read as settled. A
-/// node carrying no mode comes back as it is.
-pub(crate) fn without_mode(node: &str) -> &str {
-    node.strip_suffix(" mode=ro")
-        .or_else(|| node.strip_suffix(" mode=rw"))
-        .unwrap_or(node)
+/// `node` without its `mode=`, for a message that names the node and the
+/// two modes it was granted in separately: a header stating one of them
+/// would read as settled. A node carrying no mode comes back as it is.
+/// `optional=#true`, when present, always follows `mode=` and is kept.
+pub(crate) fn without_mode(node: &str) -> String {
+    let (base, optional) = match node.strip_suffix(" optional=#true") {
+        Some(base) => (base, " optional=#true"),
+        None => (node, ""),
+    };
+    let base = base
+        .strip_suffix(" mode=ro")
+        .or_else(|| base.strip_suffix(" mode=rw"))
+        .unwrap_or(base);
+    format!("{base}{optional}")
 }
 
 /// The `mode=` value of a share. Written on every share, default or
@@ -443,6 +467,15 @@ pub(crate) fn share_mode(mode: ShareMode) -> &'static str {
     match mode {
         ShareMode::ReadOnly => "ro",
         ShareMode::ReadWrite => "rw",
+    }
+}
+
+/// `optional=#true` written only when set: `#false` is the default, so a
+/// share that omitted the property reads back exactly as it was written.
+fn optional_suffix(optional: bool) -> &'static str {
+    match optional {
+        true => " optional=#true",
+        false => "",
     }
 }
 
@@ -901,6 +934,7 @@ mod tests {
             service(&Service::HomeShare {
                 path: "x".into(),
                 mode: ShareMode::ReadOnly,
+                optional: false,
             })
             .unwrap(),
             r#"home-share "x" mode=ro"#
@@ -909,6 +943,7 @@ mod tests {
             service(&Service::PathShare {
                 path: "/mnt/data".into(),
                 mode: ShareMode::ReadOnly,
+                optional: false,
             })
             .unwrap(),
             r#"path-share "/mnt/data" mode=ro"#
@@ -928,6 +963,34 @@ mod tests {
             render(&cfg).unwrap(),
             "home-share \"x\" mode=ro\napp-runtime \"org.example.App\" mode=ro\n"
         );
+    }
+
+    #[test]
+    fn optional_is_written_only_when_set_and_round_trips() {
+        // `#false` is the default, so a share written without `optional`
+        // never gains the property back.
+        round_trip(r#"home-share "x""#);
+        round_trip(r#"path-share "/mnt/data""#);
+        assert_eq!(
+            service(&Service::HomeShare {
+                path: "x".into(),
+                mode: ShareMode::ReadOnly,
+                optional: true,
+            })
+            .unwrap(),
+            r#"home-share "x" mode=ro optional=#true"#
+        );
+        assert_eq!(
+            service(&Service::PathShare {
+                path: "/mnt/data".into(),
+                mode: ShareMode::ReadWrite,
+                optional: true,
+            })
+            .unwrap(),
+            r#"path-share "/mnt/data" mode=rw optional=#true"#
+        );
+        round_trip(r#"home-share "x" optional=#true"#);
+        round_trip(r#"path-share "/mnt/data" mode=rw optional=#true"#);
     }
 
     #[test]
@@ -1012,7 +1075,8 @@ mod tests {
                 cfg.services,
                 vec![Service::HomeShare {
                     path: odd.into(),
-                    mode: ShareMode::ReadOnly
+                    mode: ShareMode::ReadOnly,
+                    optional: false
                 }],
                 "{text}"
             );

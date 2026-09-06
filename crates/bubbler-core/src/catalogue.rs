@@ -185,9 +185,11 @@ pub static GRANTS: &[Grant] = &[
                holding another application's state (`.config`, `.local/share`) is that \
                application's data, and the linter says so. bubbler's own directories — \
                the instance store, either profile layer — are refused on both ends, as \
-               for `path-share`.",
+               for `path-share`. `optional=#true` turns an absent source into a silent \
+               no-op instead of refusing the launch; `--explain` says when a share was \
+               skipped this way.",
         risk: Risk::Wide,
-        grammar: "home-share \"<path under $HOME>\" [mode=ro|rw]",
+        grammar: "home-share \"<path under $HOME>\" [mode=ro|rw] [optional=#true]",
     },
     Grant {
         node: "path-share",
@@ -196,9 +198,11 @@ pub static GRANTS: &[Grant] = &[
                refused on both ends — including the instance store and either profile \
                layer, since a sandbox that can write a `config.kdl` or a profile grants \
                itself anything on the next run — but everything else on the machine is \
-               shareable, and a mountpoint is a whole disk.",
+               shareable, and a mountpoint is a whole disk. `optional=#true` turns an \
+               absent source into a silent no-op instead of refusing the launch; \
+               `--explain` says when a share was skipped this way.",
         risk: Risk::Wide,
-        grammar: "path-share \"<absolute path>\" [mode=ro|rw]",
+        grammar: "path-share \"<absolute path>\" [mode=ro|rw] [optional=#true]",
     },
     Grant {
         node: "etc-share",
@@ -521,6 +525,24 @@ mod tests {
                 assert_eq!(svc.node_name(), *node, "{text}");
             }
             assert!(grant(node).is_some(), "{node} has no catalogue entry");
+        }
+    }
+
+    /// Both share nodes say what `optional=#true` does and where the skip
+    /// is reported, and their grammar names the property.
+    #[test]
+    fn the_share_nodes_document_optional() {
+        for node in ["home-share", "path-share"] {
+            let g = grant(node).expect("the catalogue holds it");
+            assert!(
+                g.grammar.ends_with("[optional=#true]"),
+                "{node}: {}",
+                g.grammar
+            );
+            assert!(
+                g.cost.contains("--explain"),
+                "{node}: cost does not say where the skip is reported"
+            );
         }
     }
 

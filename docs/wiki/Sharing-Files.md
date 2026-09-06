@@ -85,7 +85,9 @@ home-share "Projects/x" mode=rw
 ```
 
 - Source must exist; resolved before binding; a symlink pointing outside your
-  home is refused.
+  home is refused. `optional=#true` turns a missing source into a silent
+  no-op instead — useful for a profile naming a path only some installs of
+  an app have. `--explain` says when a share was skipped this way.
 - `mode=` is optional on the way in and always written on the way out: bubbler
   writes `home-share`, `path-share` and `app-runtime` back with `mode=ro` or
   `mode=rw` spelled out, so a share's width is read off the line.
@@ -115,7 +117,9 @@ the instance store (`~/.local/share/bubbler`), your profile layer
 set, `/home/bubbler` — being one, inside one, or containing one, as written and
 as resolved. Carve-out: `/run/media`. `/mnt`, `/media`,
 `/srv` and your own top-level mountpoints are allowed. One path once, whatever
-the modes; two `path-share`s may not overlap.
+the modes; two `path-share`s may not overlap. `optional=#true` turns a
+missing source into a silent no-op instead of refusing the launch;
+`--explain` says when a share was skipped this way.
 
 Why so strict: a sandbox that can write another instance's `config.kdl` or a
 profile grants itself anything on the next run.

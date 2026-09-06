@@ -498,7 +498,9 @@ file order does not affect the generated argv.
     command "firefox"
 
 Every source must exist and be of the expected type when the argv is built; a
-missing one is an error rather than a silently weaker sandbox. That covers
+missing one is an error rather than a silently weaker sandbox. The one
+exception is `home-share` and `path-share` written with `optional=#true`: a
+missing source is skipped instead, and `--explain` says so. That covers
 `home-share` too, so the `firefox` profile needs a `~/Downloads` and `lutris`
 a `~/Games`. A `home-share` source is resolved before it is bound and must
 stay inside your home directory: a symlink pointing elsewhere is refused, not
@@ -1910,13 +1912,15 @@ profile may carry it like any other node.
 
 ## Host paths
 
-`path-share "<absolute path>" [mode=rw]` binds a host path outside your home at
-that same path inside the sandbox: `/kioxia/Steam` stays `/kioxia/Steam`, and
-bwrap creates the directories above it. The node is repeatable, read-only
-unless `mode=rw`, and a whole mountpoint is a fine target. One host path may be
-shared once, whatever the modes, the way one home path may: `path-share "/a"`
-beside `path-share "/a" mode=rw` is an error rather than a share whose width
-depends on which line came first.
+`path-share "<absolute path>" [mode=rw] [optional=#true]` binds a host path
+outside your home at that same path inside the sandbox: `/kioxia/Steam` stays
+`/kioxia/Steam`, and bwrap creates the directories above it. The node is
+repeatable, read-only unless `mode=rw`, and a whole mountpoint is a fine
+target. One host path may be shared once, whatever the modes, the way one
+home path may: `path-share "/a"` beside `path-share "/a" mode=rw` is an error
+rather than a share whose width depends on which line came first.
+`optional=#true` skips a missing source instead of refusing the launch;
+`--explain` reports the skip.
 
 The path is resolved before anything is bound, and it must be a directory or a
 regular file. Neither end of the share may touch a path the sandbox is built
