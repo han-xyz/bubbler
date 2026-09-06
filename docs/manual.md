@@ -2698,8 +2698,10 @@ the registry is held under a `flock(2)` on `wraps.kdl.lock` beside it, and the
 file itself is replaced by a rename, so a reader sees one whole registry or the
 other.
 
-Nothing inside a sandbox can reach a shim: the sandbox's `PATH` is `/usr/bin`,
-its home is `/home/bubbler`, and no shim directory is ever bound in. The one
+Nothing inside a sandbox can reach a shim: the sandbox's `PATH` is
+`/usr/bin:/home/bubbler/.local/bin`, its home is `/home/bubbler`, and that
+`.local/bin` is the instance's own private home, not the real one a shim sits
+in — no shim directory is ever bound in. The one
 footgun left is wrapping a program bubbler itself runs on the host — `edit`
 execs `$VISUAL`/`$EDITOR` with no shell, so a wrapped `nvim` would open
 `config.kdl` inside a sandbox that has no bind for it.

@@ -88,7 +88,7 @@ fn create_list_and_dry_run() {
          --size\n67108864\n--tmpfs\n/var\n--size\n67108864\n--tmpfs\n/run\n\
          --bind\n{home}\n/home/bubbler\n--perms\n0700\n--dir\n{run}\n\
          --ro-bind\n{init}\n/run/bubbler-init\n--clearenv\n--setenv\nTERM\ndumb\n\
-         --setenv\nHOME\n/home/bubbler\n--setenv\nPATH\n/usr/bin\n--setenv\nXDG_RUNTIME_DIR\n{run}\n\
+         --setenv\nHOME\n/home/bubbler\n--setenv\nPATH\n/usr/bin:/home/bubbler/.local/bin\n--setenv\nXDG_RUNTIME_DIR\n{run}\n\
          --setenv\nUSER\nbubbler\n--setenv\nLOGNAME\nbubbler\n\
          --\n/run/bubbler-init\n--socket-fd\n7\n--\n/usr/bin/true\n",
         ntsync = ntsync_bind(),

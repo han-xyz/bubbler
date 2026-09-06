@@ -369,7 +369,11 @@ impl BwrapArgs {
             push(&mut a.env, b, [o("--setenv"), k, v]);
         }
         push(&mut a.env, b, [o("--setenv"), o("HOME"), o(SANDBOX_HOME)]);
-        push(&mut a.env, b, [o("--setenv"), o("PATH"), o("/usr/bin")]);
+        // Host binaries first: a file an app drops into its own
+        // `~/.local/bin` (the Claude Code installer, XDG user binaries)
+        // must never shadow `/usr/bin` for a bare command name.
+        let path = format!("/usr/bin:{SANDBOX_HOME}/.local/bin");
+        push(&mut a.env, b, [o("--setenv"), o("PATH"), o(&path)]);
         push(
             &mut a.env,
             b,
@@ -1171,7 +1175,7 @@ mod tests {
                 "/home/bubbler",
                 "--setenv",
                 "PATH",
-                "/usr/bin",
+                "/usr/bin:/home/bubbler/.local/bin",
                 "--setenv",
                 "XDG_RUNTIME_DIR",
                 "/run/user/1000",

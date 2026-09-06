@@ -1216,6 +1216,16 @@ The `%u`/`%f` host paths a launcher expands into it reach `bubbler open`
 as trailing arguments and go through the document portal from there —
 what that grants, and what it does not, is "File arguments" above.
 
+A sandbox's own `PATH` is `/usr/bin:/home/bubbler/.local/bin` — host
+binaries always resolve first, so a file an application writes into its
+own `~/.local/bin` (an updater, a plugin, anything the app itself drops
+there under its private home) can never shadow `/usr/bin` for a bare
+command name a profile or a config looks up. The directory is on `PATH`
+at all because that is where a real install with no `/usr/bin` package
+puts its command: the native Claude Code installer and the XDG
+user-binaries convention both write there, and a `home-share` of that
+path needs the sandbox to find what it shares.
+
 [Desktop entries](manual.md#desktop-entries), [PATH
 shims](manual.md#path-shims) ·
 `a_symlink_planted_where_the_entry_is_built_is_never_written_through`,
@@ -1223,7 +1233,8 @@ shims](manual.md#path-shims) ·
 `the_keys_that_bypass_the_sandbox_are_forced_even_where_they_are_absent`,
 `a_file_that_is_not_our_shim_is_never_replaced`,
 `names_bubbler_resolves_itself_are_refused`,
-`a_registry_bubbler_did_not_write_is_an_error`
+`a_registry_bubbler_did_not_write_is_an_error`,
+`baseline_argv_is_exact`
 
 ### Configuration parsing
 

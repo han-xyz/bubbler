@@ -30,6 +30,12 @@
   it — `gamepad`, with the whole of `/sys/devices` — cannot reopen the card
   sysfs. The NVIDIA nodes are unchanged, having no render/primary split of
   their own.
+- The sandbox `PATH` is `/usr/bin:/home/bubbler/.local/bin` instead of
+  `/usr/bin` alone, so a bare command name resolves an app installed under
+  a shared `.local/bin` (the native Claude Code installer, XDG user
+  binaries) without naming the absolute path. Host binaries stay first,
+  so nothing an app writes to its own `~/.local/bin` can shadow `/usr/bin`
+  for it.
 
 ## 0.21.0 (unreleased)
 
