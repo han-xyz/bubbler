@@ -1,8 +1,9 @@
 // bubbler profile: thunderbird
 //
-// Mail and an attachment saved into ~/Downloads. Everything else — the
-// profile, the message store, the address book — lives in the private
-// home.
+// Mail is a network and somewhere to save an attachment: `network` for
+// the servers you configure, `home-share "Downloads"` for what you save
+// out of a message. Everything else — the profile, the message store,
+// the address book — lives in the private home.
 //
 // Gecko has defaulted to Wayland since Firefox 121 and takes the display
 // from the `wayland` grant, so no `env` node sets MOZ_ENABLE_WAYLAND;
