@@ -5,6 +5,7 @@
 //! what it holds.
 
 use std::ffi::OsStr;
+use std::path::Path;
 
 use unicode_width::UnicodeWidthStr;
 
@@ -26,6 +27,13 @@ const BASELINE_SHOWN: usize = 8;
 /// arguments like any other, and neither they nor the masks that are
 /// missing beside them say what granting them opens.
 const KMS_NOTE: &str = " (kms: card nodes, EDID and framebuffer geometry readable)";
+
+/// What a bare `dri` group is headed with where the grant bound a
+/// primary node anyway: a GPU on the proprietary NVIDIA driver, whose
+/// EGL will not drive a Wayland display without it. The file says
+/// nothing about that node, and the reach it opens is the one above.
+const NVIDIA_NOTE: &str =
+    " (nvidia: primary node bound for its EGL — EDID and framebuffer geometry readable)";
 
 /// Longest node text a header shows. A `path-share` of a deep path would
 /// otherwise set the width of the column for every other group.
@@ -133,6 +141,24 @@ impl Group<'_> {
     fn len(&self) -> usize {
         self.items.iter().map(|i| i.args.len()).sum()
     }
+}
+
+/// Whether a group holds a `--dev-bind` of a primary DRM node. Read off
+/// the arguments rather than probed again: what the note beside them
+/// says is that they are there, and a run this explains would be the one
+/// that put them there.
+fn binds_a_primary_node(items: &[&Explained]) -> bool {
+    items.iter().any(|i| {
+        let [flag, src, ..] = i.args.as_slice() else {
+            return false;
+        };
+        let src = Path::new(src);
+        flag == "--dev-bind"
+            && src.parent() == Some(Path::new("/dev/dri"))
+            && src
+                .file_name()
+                .is_some_and(|n| n.as_encoded_bytes().starts_with(b"card"))
+    })
 }
 
 /// Whether a service also carries rules for the D-Bus proxy, which are
@@ -492,10 +518,14 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
             ),
         };
         let mut header = header.trim_end().to_owned();
-        if let Origin::Service(i) = g.origin
-            && matches!(view.cfg.services.get(i), Some(Service::Dri { kms: true }))
-        {
-            header.push_str(KMS_NOTE);
+        if let Origin::Service(i) = g.origin {
+            match view.cfg.services.get(i) {
+                Some(Service::Dri { kms: true }) => header.push_str(KMS_NOTE),
+                Some(Service::Dri { kms: false }) if binds_a_primary_node(&g.items) => {
+                    header.push_str(NVIDIA_NOTE);
+                }
+                _ => {}
+            }
         }
         out.push(header);
         // First line of the group rather than last: it is a fact about
@@ -1018,6 +1048,54 @@ bwrap
             head("dri kms=#true\ncommand \"true\""),
             "  dri kms=#true  3 arguments (kms: card nodes, EDID and framebuffer geometry \
              readable)"
+        );
+    }
+
+    /// The bare node binds a primary node of its own where the GPU is on
+    /// the proprietary NVIDIA driver, and what that opens is what the
+    /// `kms` property is noted for, so the group says so there too.
+    #[test]
+    fn a_dri_group_says_when_a_primary_node_came_with_the_bare_node() {
+        let cfg = cfg("dri\ncommand \"true\"");
+        let lines = Lines::default();
+        let out = render(
+            &[
+                item(
+                    Origin::Service(0),
+                    &["--dev-bind", "/dev/dri/renderD128", "/dev/dri/renderD128"],
+                    None,
+                ),
+                item(
+                    Origin::Service(0),
+                    &["--dev-bind", "/dev/dri/card1", "/dev/dri/card1"],
+                    None,
+                ),
+            ],
+            &View {
+                title: "bwrap",
+                instance: "t",
+                cfg: &cfg,
+                source: Source {
+                    file: "config.kdl",
+                    lines: &lines,
+                },
+                rules: &[],
+                wl_proxy: None,
+                net_proxy_log: false,
+                proxy: false,
+                full: false,
+                bwrap: crate::version::Version::Known(0, 12, 0),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            out.iter().find(|l| l.starts_with("  dri")),
+            Some(
+                &"  dri  6 arguments (nvidia: primary node bound for its EGL — EDID and \
+                  framebuffer geometry readable)"
+                    .to_owned()
+            ),
+            "{out:#?}"
         );
     }
 

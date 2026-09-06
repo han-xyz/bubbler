@@ -516,6 +516,19 @@ fn dri_nodes(host: &dyn Host, by_path: &Path) -> (BTreeSet<OsString>, BTreeSet<O
     (render, card)
 }
 
+/// Whether a bare `dri` on this host binds a primary node as well as the
+/// render nodes, which it does for a GPU on the proprietary NVIDIA
+/// driver. The linter asks, so a config that says nothing about that
+/// node can still tell the reader what the run opens.
+pub(crate) fn dri_binds_a_primary_node(host: &dyn Host) -> bool {
+    let (render, _) = dri_nodes(host, &Path::new(DRI_DEV).join("by-path"));
+    render.iter().any(|name| {
+        host.canonicalize(&Path::new(DRM_CLASS).join(name).join("device"))
+            .and_then(|dir| dri_driver(host, &dir))
+            .is_some_and(|driver| driver == "nvidia")
+    })
+}
+
 /// The name of the kernel driver bound to the device at `dir`, from the
 /// link its bus keeps beside it (`.../0000:01:00.0/driver` ->
 /// `../../../../bus/pci/drivers/nvidia`). `None` where the device has no

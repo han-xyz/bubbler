@@ -1342,7 +1342,16 @@ mod tests {
         press(&mut app, 's');
         let row = app.store.row("ff").expect("still listed");
         assert!(row.grants.contains(&"x11"), "{:?}", row.grants);
-        assert_eq!(row.lint, Some([0, 0, 1]), "the note a nested x11 earns");
+        // The nested server earns `x11-nested-no-wm`; a machine whose GPU
+        // is on the proprietary NVIDIA driver earns `dri-nvidia-primary`
+        // beside it, so the count is the host's, not the config's.
+        let [errors, warnings, notes] = row.lint.expect("the row carries a lint result");
+        assert_eq!(
+            (errors, warnings, notes >= 1),
+            (0, 0, true),
+            "{:?}",
+            row.lint
+        );
     }
 
     #[test]

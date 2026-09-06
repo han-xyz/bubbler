@@ -4,6 +4,9 @@
 
 ### Added
 
+- Lint note `dri-nvidia-primary`: a bare `dri` on a host whose GPU is on the
+  proprietary NVIDIA driver binds that GPU's primary node, and the note says
+  what the node opens.
 - `dri kms=#true` grants the primary (`card*`) nodes and leaves their sysfs
   readable, for a compositor or a mode-setting tool. `bubbler lint` notes it
   as `dri-kms` and `--explain` marks the group: with those nodes a sandbox
@@ -31,8 +34,12 @@
   sysfs. The NVIDIA nodes are unchanged, having no render/primary split of
   their own, and a GPU whose PCI driver is `nvidia` keeps its primary node
   with them: that stack's EGL declines a Wayland display without it, and a
-  sandboxed GUI application would render in software. Its card sysfs stays
-  masked, and no other driver's primary node is bound.
+  sandboxed GUI application would render in software. That node answers DRM
+  ioctls — the connectors, their modes and the monitors' EDID — which the
+  masked card sysfs does not withhold, so on that driver a bare `dri`
+  reaches as far as `dri kms=#true`; `--explain` marks the group and the
+  new `dri-nvidia-primary` lint note says so. No other driver's primary
+  node is bound.
 - The sandbox `PATH` is `/usr/bin:/home/bubbler/.local/bin` instead of
   `/usr/bin` alone, so a bare command name resolves an app installed under
   a shared `.local/bin` (the native Claude Code installer, XDG user

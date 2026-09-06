@@ -54,7 +54,8 @@ pulse.allow-module-loading = false }`, then restart `pipewire-pulse.service`).
 **Notes** (information): `allow-host-wildcard`, `app-runtime-rw`,
 `outbound-deny`, `ozone-hint-unnecessary`,
 `command-not-found`, `desktop-entry-missing`, `camera-nodes-none-present`,
-`camera-nodes-no-hotplug`, `dri-kms`, `secrets-access`, `lint-allow-unused`,
+`camera-nodes-no-hotplug`, `dri-kms`, `dri-nvidia-primary`,
+`secrets-access`, `lint-allow-unused`,
 `x11-nested-no-wm`, `repeat-outside-block`.
 
 `allow-host-wildcard` is about a pattern that is a wildcard directly under a
@@ -66,6 +67,12 @@ every name anyone registers under the suffix. A wildcard deeper down
 the sandbox becomes DRM master on a virtual terminal switch and reads the
 monitors' EDID, the framebuffer geometry and every other client's flink
 names. The bare node binds the render nodes, which carry none of that.
+
+`dri-nvidia-primary` reads this host: where a render node's GPU is on the
+proprietary NVIDIA driver, a bare `dri` binds that GPU's primary node too
+(its EGL will not drive a Wayland display without one), and the node
+carries the connectors, their modes and the monitors' EDID through DRM
+ioctls. On that driver the bare grant reaches as far as `kms=#true`.
 
 `x11-nested-no-wm` is about the windows inside a nested `x11` server, so a
 config that already asks for the whole output with `fullscreen=#true`, or names

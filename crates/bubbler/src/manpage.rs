@@ -346,6 +346,12 @@ const CHECK_LINES: &[(&str, &str)] = &[
          and DRM master on a virtual terminal switch.",
     ),
     (
+        "dri-nvidia-primary",
+        "A bare `dri` on a host whose GPU is on the proprietary NVIDIA driver, which binds \
+         that GPU's primary node: its EGL will not drive a Wayland display without one, and \
+         the node carries the monitors' EDID, their modes and the framebuffer geometry.",
+    ),
+    (
         "dup-name-policy",
         "One bus name given two policies by two layers; one name takes one policy.",
     ),

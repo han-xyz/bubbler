@@ -572,9 +572,14 @@ is not bound: those are MIG capability files, which nothing outside MIG reads
 A GPU whose PCI driver is `nvidia` keeps its primary node with all that:
 measured on driver 610, that stack's EGL declines a Wayland display without
 `/dev/dri/card<N>`, and the application falls back to llvmpipe — every GUI
-profile would then composite in software. Its card sysfs stays masked all
-the same (the EDID and the framebuffer geometry are read through those
-files, not through the node), and no other driver's primary node is bound.
+profile would then composite in software. That node is the mode-setting
+interface, and it answers DRM ioctls: measured with `modetest -M nvidia-drm
+-c` inside such a sandbox, the connectors, their full mode lists and the
+monitors' EDID come back byte for byte as they do outside. The card sysfs
+stays masked, which withholds none of that on this driver, so on an NVIDIA
+GPU a bare `dri` reaches as far as `kms=#true` does — `--explain` marks the
+group and `lint` reports `dri-nvidia-primary`. No other driver's primary
+node is bound.
 `dri` sets no environment: `DRI_PRIME`, `__NV_PRIME_RENDER_OFFLOAD`,
 `__GLX_VENDOR_LIBRARY_NAME` and their kind pick a GPU on a hybrid machine,
 which is a profile's `env` decision, not a service's. Compute is one gap:
@@ -2943,6 +2948,10 @@ that second half is dropped under `network "host"`), `dri-kms`
 (`dri kms=#true`, which binds the primary nodes and leaves their sysfs
 readable: the monitors' EDID, the framebuffer geometry, every other
 client's flink names, and DRM master on a virtual terminal switch),
+`dri-nvidia-primary` (a bare `dri` on a host whose GPU is on the
+proprietary NVIDIA driver: the grant binds that GPU's primary node, because
+its EGL will not drive a Wayland display without one, and the node carries
+the connectors, their modes and the monitors' EDID),
 `secrets-access`
 (`talk`/`own` of
 `org.freedesktop.secrets` on the session bus reaches the whole login keyring:

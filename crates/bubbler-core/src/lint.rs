@@ -115,6 +115,13 @@ const DRI_KMS: Check = Check {
     id: "dri-kms",
     severity: Severity::Note,
 };
+// A note about the host, like `pulseaudio-module-loading`: the file asks
+// for nothing beyond the render nodes, and what the run adds to them
+// depends on which driver this machine's GPU is on.
+const DRI_NVIDIA_PRIMARY: Check = Check {
+    id: "dri-nvidia-primary",
+    severity: Severity::Note,
+};
 const DUP_NAME_POLICY: Check = Check {
     id: "dup-name-policy",
     severity: Severity::Error,
@@ -280,6 +287,7 @@ pub const CHECKS: &[Check] = &[
     DBUS_WITHOUT_RULES,
     DESKTOP_ENTRY_MISSING,
     DRI_KMS,
+    DRI_NVIDIA_PRIMARY,
     DUP_NAME_POLICY,
     ENV_LOOKS_SECRET,
     ETC_HOST,
@@ -1286,6 +1294,20 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                 "drop the property unless the application sets a display mode itself; \
                  rendering, video decoding and Vulkan need only the render nodes the bare \
                  node binds",
+            ),
+            "dri" if service::dri_binds_a_primary_node(ctx.host) => f.push(
+                i,
+                node,
+                &DRI_NVIDIA_PRIMARY,
+                "a GPU on this host is on the proprietary NVIDIA driver, whose EGL will \
+                 not drive a Wayland display without the primary node, so `dri` binds \
+                 that node: through it the sandbox reads the monitors' EDID, their modes \
+                 and the framebuffer geometry, which is the reach `kms=#true` is noted \
+                 for"
+                .to_owned(),
+                "nothing narrower exists on that driver; write `dri kms=#true` where the \
+                 file should say so, or run the application on a GPU the Mesa drivers \
+                 drive",
             ),
             "camera" if flag(node, "nodes") == Some(true) => {
                 camera_nodes(ctx, i, node, host_net, f);
@@ -2344,6 +2366,40 @@ mod tests {
                 )),
                 [] as [&str; 0]
             );
+        });
+    }
+
+    /// A host whose GPU is on the proprietary NVIDIA driver: the render
+    /// node udev names, the class entry it is found through, and the
+    /// driver link that says which stack drives it.
+    fn gpu_host(driver: &str) -> FakeHost {
+        let (_, dir, _) = fake::types();
+        let device = "/sys/devices/pci0000:00/0000:00:01.1/0000:01:00.0";
+        host()
+            .with("/dev/dri/by-path/pci-0000:01:00.0-render", dir)
+            .link("/dev/dri/by-path/pci-0000:01:00.0-render", "../renderD128")
+            .link("/sys/class/drm/renderD128/device", device)
+            .link(
+                &format!("{device}/driver"),
+                &format!("../../../../bus/pci/drivers/{driver}"),
+            )
+    }
+
+    /// The bare node binds a primary node on that driver, whose EGL will
+    /// not drive a Wayland display without one, and the file says nothing
+    /// about it: the note is where a reader learns what the run opens.
+    #[test]
+    fn dri_on_an_nvidia_host_is_a_note_and_on_a_mesa_host_is_not() {
+        with(&gpu_host("nvidia"), |ctx| {
+            let report = lint(ctx, &["dri"]);
+            assert_eq!(ids(&report), ["dri-nvidia-primary"]);
+            assert_eq!(report.findings[0].severity, Severity::Note);
+            assert!(report.findings[0].message.contains("EDID"), "{report:?}");
+            // `kms=#true` already says it in the file, and says more.
+            assert_eq!(ids(&lint(ctx, &["dri kms=#true"])), ["dri-kms"]);
+        });
+        with(&gpu_host("amdgpu"), |ctx| {
+            assert_eq!(ids(&lint(ctx, &["dri"])), [] as [&str; 0]);
         });
     }
 

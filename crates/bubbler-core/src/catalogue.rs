@@ -125,9 +125,11 @@ pub static GRANTS: &[Grant] = &[
                leaves that sysfs readable: the sandbox becomes KMS master on a virtual \
                terminal switch, and reads the monitors' EDID serial numbers, the \
                framebuffer geometry and every other client's flink names. A GPU on the \
-               proprietary NVIDIA driver keeps its primary node either way, since that \
-               stack has no render/primary split and its EGL will not drive a Wayland \
-               display without it.",
+               proprietary NVIDIA driver keeps its primary node without the property, \
+               since its EGL will not drive a Wayland display otherwise, and that node \
+               carries the connectors, their modes and the EDID whatever the sysfs beside \
+               it says: on that driver the bare node reaches as far as `kms=#true`, and \
+               `lint` says so.",
         risk: Risk::Wide,
         grammar: "dri [kms=#true]",
     },

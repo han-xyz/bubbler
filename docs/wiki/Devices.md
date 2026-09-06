@@ -39,8 +39,12 @@ Those nodes have no render/primary split of their own, so `dri` on the
 proprietary driver stays as wide as it was, with or without `kms` — and a
 GPU whose PCI driver is `nvidia` keeps its primary node too, because that
 EGL declines a Wayland display without it and the application would render
-in software; its card sysfs stays masked, and no other driver's primary
-node is bound.
+in software. The node answers DRM ioctls: `modetest -M nvidia-drm -c`
+inside such a sandbox lists the connectors, their modes and the monitors'
+EDID exactly as it does outside, and the masked card sysfs withholds none
+of it. On that driver the bare node therefore reaches as far as
+`kms=#true`; `--explain` marks the group and `lint` reports
+`dri-nvidia-primary`. No other driver's primary node is bound.
 `dri` sets no environment — `DRI_PRIME`, `__NV_PRIME_RENDER_OFFLOAD` are a
 profile's `env` decision. Compute needs `etc-share "OpenCL"` / `etc-share
 "nvidia"`; AMD ROCm via `/dev/kfd` is not supported yet.
