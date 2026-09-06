@@ -2859,50 +2859,72 @@ mod tests {
         );
     }
 
-    /// The `claude-code` profiles resolve without error on a host lacking both
-    /// the native installer's `~/.local/bin/claude` and the npm global's
-    /// `/usr/bin/claude`, because the `home-share` entries are optional; the
-    /// resolved profiles carry the bare `command "claude"` that resolves
-    /// through the sandbox PATH when either layout is present on the host.
+    /// The `claude-code` profiles launch without error on a host lacking
+    /// both the native installer's `~/.local/bin/claude` and the npm
+    /// global's `~/.local/share/claude`: both `home-share` entries are
+    /// optional, so the fake host binds neither and `--explain` reports
+    /// both skipped rather than the launch failing.
     #[test]
-    fn claude_code_profiles_work_without_native_install() {
+    fn claude_code_profiles_launch_and_explain_without_the_native_install() {
         let tmp = tempfile::tempdir().unwrap();
-        // Resolver uses a fake home without `.local/bin/claude` or
-        // `.local/share/claude`, simulating a host with only the npm global
-        // layout or neither install present.
         let e = env(tmp.path());
         let r = Resolver::new(&e);
+        let (file, ..) = fake::types();
 
         for name in ["claude-code", "claude-code-strict"] {
-            let resolved = r.resolve(name).unwrap();
-            let cfg = &resolved.config;
+            let cfg = r.resolve(name).unwrap().config;
+            // `claude-code-strict` filters egress through a proxy binary
+            // that `network()` requires present before granting anything
+            // else; the fake host holds nothing beyond that, so both
+            // `.local` shares stay absent for both profiles.
+            let host = FakeHost::default().with(crate::network::NET_PROXY_INSTALLED, file);
+            let ctx = crate::service::ServiceCtx {
+                instance_runtime: tmp.path().join("run"),
+                dbus: None,
+                wayland: None,
+            };
+            let mut args = crate::bwrap::BwrapArgs::baseline(&e, Path::new("/i/home"), &host);
+            crate::service::apply_all(&cfg.services, &e, &mut args, &host, &ctx)
+                .unwrap_or_else(|err| panic!("{name}: {err}"));
+            let items = args
+                .finish_explained(
+                    &[OsString::from("x")],
+                    &mut crate::launcher::DryRunAlloc::default(),
+                )
+                .unwrap();
 
-            // Bare `command "claude"` replaces the absolute path, resolved
-            // through the sandbox PATH at runtime.
-            assert_eq!(cfg.command, Some(vec![OsString::from("claude")]), "{name}");
+            let argv: Vec<OsString> = items.iter().flat_map(|i| i.args.clone()).collect();
+            for needle in [".local/bin/claude", ".local/share/claude"] {
+                assert!(
+                    !argv.iter().any(|a| a.to_string_lossy().contains(needle)),
+                    "{name}: unexpected bind for {needle}: {argv:?}"
+                );
+            }
 
-            // Both `.local` shares are present and optional, so they don't fail
-            // resolution when the source is missing on the host.
-            let home_shares: Vec<_> = cfg
-                .services
-                .iter()
-                .filter_map(|s| match s {
-                    Service::HomeShare { path, optional, .. } => Some((path, *optional)),
-                    _ => None,
-                })
-                .collect();
-            let local_bin_found = home_shares
-                .iter()
-                .any(|(p, opt)| p.to_string_lossy() == ".local/bin/claude" && *opt);
-            let local_share_found = home_shares
-                .iter()
-                .any(|(p, opt)| p.to_string_lossy() == ".local/share/claude" && *opt);
-            assert!(
-                local_bin_found && local_share_found,
-                "{name}: expected optional home-shares for `.local/bin/claude` and `.local/share/claude`, \
-                 got {:?}",
-                home_shares
-            );
+            let view = crate::explain::View {
+                title: "bwrap",
+                instance: "t",
+                cfg: &cfg,
+                source: crate::explain::Source {
+                    file: "config.kdl",
+                    lines: &crate::config::Lines::default(),
+                },
+                rules: &[],
+                wl_proxy: None,
+                net_proxy_log: false,
+                proxy: false,
+                full: false,
+                bwrap: crate::version::Version::Known(0, 12, 0),
+            };
+            let out = crate::explain::render(&items, &view).unwrap();
+            for skipped in [
+                "    home-share \".local/bin/claude\" mode=ro optional=#true  \
+                 absent on this host, skipped",
+                "    home-share \".local/share/claude\" mode=ro optional=#true  \
+                 absent on this host, skipped",
+            ] {
+                assert!(out.contains(&skipped.to_owned()), "{name}: {out:?}");
+            }
         }
     }
 }
