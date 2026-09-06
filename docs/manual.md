@@ -2880,7 +2880,20 @@ host network namespace: every host loopback service and every abstract unix
 socket, X11's included, is reachable), `dbus-name-is-risky` (a `dbus` or
 `system-bus` rule naming a bus name that is defensible but wide — the KWin or
 GNOME shell compositor's own name, the session's file manager, or the Secret
-Service — with the one sentence a reader needs about what the name is).
+Service — with the one sentence a reader needs about what the name is),
+`pulseaudio-module-loading` (a `pulseaudio` grant on a host whose effective
+`pipewire-pulse.conf` leaves `pulse.allow-module-loading` on — the daemon's
+own default — so the host's audio daemon will load a module, a network sink
+or tunnel among them, because the sandbox asked it to: outside the sandbox's
+network namespace and its egress proxy, and nothing bubbler binds can stop
+it. Fix it on the host with a drop-in
+`~/.config/pipewire/pipewire-pulse.conf.d/<name>.conf` (or
+`/etc/pipewire/pipewire-pulse.conf.d/`) setting `pulse.properties = {
+pulse.allow-module-loading = false }`, then restart `pipewire-pulse.service`;
+the check reads only `pipewire-pulse.conf`, so a host running the real
+`pulseaudio` daemon instead of PipeWire's compatibility layer has no such
+file to turn the property off in, and the warning fires there by the same
+default).
 
 **Notes** are information and fail nothing: `app-runtime-rw` (a shared
 application runtime directory granted `mode=rw`, so the sandbox can replace the
@@ -2911,13 +2924,7 @@ suppression outliving what it was written for — and the one check no
 `x11-nested-no-wm` (a nested `x11` with neither `fullscreen=#true` nor `wm=`:
 the server it starts has no window manager, so the X windows inside are
 undecorated and unmanaged in the one compositor window it draws),
-`pulseaudio-module-loading` (a `pulseaudio` grant on a host whose effective
-`pipewire-pulse.conf` leaves `pulse.allow-module-loading` on — the daemon's
-own default — so the host's audio daemon will load a module, a network sink
-among them, because the sandbox asked it to; the check reads only
-`pipewire-pulse.conf`, so a host running the real `pulseaudio` daemon instead
-of PipeWire's compatibility layer has no such file to turn the property off
-in, and the note fires there by the same default), `repeat-outside-block` (a
+`repeat-outside-block` (a
 repeatable node — `home-share`, `path-share`, `etc-share`, `app-runtime`,
 `env` or `lint-allow` — written two or more times on its own lines instead
 of one block).

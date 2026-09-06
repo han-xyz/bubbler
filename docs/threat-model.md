@@ -200,6 +200,24 @@ global order.
 `$XDG_RUNTIME_DIR/doc`: what the host chooser exported for this app id, with
 the portal's per-document mode bits, and nothing of the mount's other apps.
 
+`pulseaudio` binds one socket, `pulse/native`, but what answers on the other
+end is a host daemon a grant cannot narrow. Measured on this host (PipeWire
+1.6.8, `pipewire-pulse`): a sandboxed client carrying `/.flatpak-info` is
+tagged `pipewire.client.access = flatpak`, `pipewire.access.effective =
+flatpak` — and `pactl load-module module-null-sink` still succeeds. A
+pipewire-pulse socket configured `client.access = "restricted"` still
+accepts `LOAD_MODULE`. The only gate is the global
+`pulse.allow-module-loading`; Arch ships `/usr/share/pipewire/pipewire-pulse.conf`
+with it commented out, which is on. A loaded module — `module-native-protocol-tcp`,
+`module-pipe-sink`, a tunnel module among them — runs in the host's audio
+server, outside the sandbox's network namespace and its egress proxy: bwrap
+binds nothing that stops it. The fix is host-side, not a bind: a drop-in
+`~/.config/pipewire/pipewire-pulse.conf.d/<any>.conf` (or
+`/etc/pipewire/pipewire-pulse.conf.d/`) with `pulse.properties = {
+pulse.allow-module-loading = false }`, then a restart of
+`pipewire-pulse.service`; `bubbler lint` names this (`pulseaudio-module-loading`,
+a warning).
+
 [Baseline](manual.md#baseline) ·
 `baseline_argv_is_exact`, `etc_is_an_allowlist_of_existing_entries`,
 `service_binds_come_after_runtime_dir_and_before_env`,
@@ -687,6 +705,29 @@ that service, and a service reachable through the bus is as trusted as
 the bus makes it; `bubbler lint` warns about the wide ones (a name owned
 beyond the application, every media-player name, polkit-backed system
 services, the secret service).
+
+Nor does it defend the portal service's own availability. Measured on this
+host (xdg-desktop-portal 1.22.1): a `ScreenCast.CreateSession` call with no
+`session_handle_token` in its options dict aborts the portal process —
+`xdp-session.c:296:xdp_session_initable_init: assertion failed:
+(session->token != NULL)` — and during one probe the portal went down three
+times this way. Any sandboxed application with the `screencast` child can
+therefore stop the host's portal service for every other application on the
+desktop until D-Bus activation restarts it. This is an upstream bug in a
+process bubbler does not run and the proxy cannot filter for: the missing
+key is absent from the call, not a value a rule can reject.
+
+What `portals` buys from PipeWire's own Flatpak policy is narrower than it
+sounds, and worth stating exactly. `/.flatpak-info`, which `portals` writes,
+puts a client under WirePlumber's Flatpak access rules; measured on this
+host (WirePlumber 0.5.15): such a client gets permissions `rwx` rather than
+the unsandboxed default `rwxm` — no `m`, so no muting, rerouting or
+destroying another client's nodes or links. It does not narrow visibility:
+every node on the graph still shows up to the client, 22 of 22 measured on
+this host, capture nodes included — the policy trims what a sandboxed
+client can *do* to other clients' nodes, not what it can *see* or *read*.
+Camera nodes are the one exception, gated separately by the portal's own
+permission store rather than by this access level.
 
 [D-Bus](manual.md#d-bus), [The system
 bus](manual.md#the-system-bus) ·
@@ -1351,3 +1392,8 @@ changes.
     bytes pipelined behind the blank line), and the cgroup placement that
     keeps the application out of the proxy's leaf, which is the whole of
     why it may not be joined.
+12. The portal service's own crash on a missing `session_handle_token` in
+    `ScreenCast.CreateSession` (measured on xdg-desktop-portal 1.22.1,
+    `xdp-session.c:296`) — an upstream bug that any `screencast` grant can
+    trigger, tracked here until it lands fixed upstream rather than fixed
+    in this repo.

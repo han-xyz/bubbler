@@ -185,12 +185,14 @@ const PORTAL_TALK_WITHOUT_PORTALS: Check = Check {
     id: "portal-talk-without-portals",
     severity: Severity::Warning,
 };
-// Information, not a warning: what the host's audio daemon will do for
-// any client is not a mistake in this file, and the file cannot change
-// it.
+// A warning, not a note: what the host's audio daemon will do for any
+// client is still not a mistake in this file, and the file still cannot
+// change it — but a loaded module runs outside the sandbox's network
+// namespace and its egress proxy, so the user has to see it, not just
+// read past it.
 const PULSEAUDIO_MODULE_LOADING: Check = Check {
     id: "pulseaudio-module-loading",
-    severity: Severity::Note,
+    severity: Severity::Warning,
 };
 // A note, not a warning: nothing is granted twice and nothing is wider
 // than it says. It is about reading the file — a run of a dozen
@@ -1283,12 +1285,14 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                 node,
                 &PULSEAUDIO_MODULE_LOADING,
                 "the host audio daemon will load network modules on the sandbox's \
-                 behalf: the effective `pipewire-pulse.conf` leaves \
+                 behalf, outside the sandbox's network namespace and its egress \
+                 proxy: the effective `pipewire-pulse.conf` leaves \
                  `pulse.allow-module-loading` on"
                     .to_owned(),
                 "write `pulse.properties = { pulse.allow-module-loading = false }` into \
-                 `~/.config/pipewire/pipewire-pulse.conf.d/10-no-modules.conf` unless an \
-                 application of yours loads pulse modules",
+                 `~/.config/pipewire/pipewire-pulse.conf.d/10-no-modules.conf` and \
+                 restart `pipewire-pulse.service`, unless an application of yours \
+                 loads pulse modules",
             ),
             "dbus" => dbus_node(i, node, f),
             "system-bus" => system_bus(i, node, f),
@@ -3413,8 +3417,8 @@ mod tests {
     }
 
     /// The daemon's own default is on, so a host that says nothing gets
-    /// the note; a drop-in that turns it off silences it, and the note
-    /// is about the `pulseaudio` grant, not about a host without one.
+    /// the warning; a drop-in that turns it off silences it, and the
+    /// warning is about the `pulseaudio` grant, not about a host without one.
     #[test]
     fn pulseaudio_module_loading_follows_the_effective_pipewire_config() {
         let bare = host().text(
@@ -3424,7 +3428,7 @@ mod tests {
         with(&bare, |ctx| {
             let report = lint(ctx, &["pulseaudio"]);
             assert_eq!(ids(&report), ["pulseaudio-module-loading"]);
-            assert_eq!(report.findings[0].severity, Severity::Note);
+            assert_eq!(report.findings[0].severity, Severity::Warning);
             assert!(
                 report.findings[0].message.contains(
                     "the host audio daemon will load network modules on the \

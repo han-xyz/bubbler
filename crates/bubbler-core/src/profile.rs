@@ -1465,7 +1465,7 @@ mod tests {
             // The host is built from what the pasted config asks for, so
             // the run measures the grants and not this machine. This
             // also keeps `pulse.allow-module-loading` off, or every
-            // `pulseaudio` grant would carry the daemon-default note.
+            // `pulseaudio` grant would carry the daemon-default warning.
             let tmp = tempfile::tempdir().unwrap();
             let e = env(tmp.path());
             let mut host = FakeHost::default().text(

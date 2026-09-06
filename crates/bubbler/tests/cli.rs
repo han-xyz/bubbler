@@ -8087,6 +8087,17 @@ fn profile_lint_warns_with_a_line_and_a_lint_allow_node_accepts_it() {
 fn profile_lint_all_reads_every_layer_once_and_json_carries_the_counts() {
     let tmp = setup();
     make_builtin_share_sources(tmp.path());
+    // Several built-in profiles grant `pulseaudio`; without this, the
+    // counts below would measure whether this host's pipewire daemon
+    // still loads modules on request (`pulseaudio-module-loading`) rather
+    // than the profiles' own grants.
+    std::fs::create_dir_all(tmp.path().join("config/pipewire/pipewire-pulse.conf.d")).unwrap();
+    std::fs::write(
+        tmp.path()
+            .join("config/pipewire/pipewire-pulse.conf.d/10-no-modules.conf"),
+        "pulse.properties = {\n    pulse.allow-module-loading = false\n}\n",
+    )
+    .unwrap();
     let (code, out, err) = run(
         tmp.path(),
         &["profile", "lint", "--all", "--format", "json"],

@@ -39,13 +39,20 @@ sandbox).
 `wayland-host`, `wayland-clipboard-open`, `network-host`,
 `dbus-name-is-risky` (a `dbus`/`system-bus` rule naming a name that is
 defensible but wide — KWin's or the GNOME shell's own bus name, the session's
-file manager, or the Secret Service).
+file manager, or the Secret Service), `pulseaudio-module-loading` (a
+`pulseaudio` grant on a host whose effective `pipewire-pulse.conf` leaves
+`pulse.allow-module-loading` on: the host's audio daemon will load a module
+— a network sink or tunnel among them — outside the sandbox's network
+namespace and its egress proxy, and nothing bubbler binds can stop it. Fix
+it on the host with a drop-in `~/.config/pipewire/pipewire-pulse.conf.d/<name>.conf`
+(or `/etc/pipewire/pipewire-pulse.conf.d/`) setting `pulse.properties = {
+pulse.allow-module-loading = false }`, then restart `pipewire-pulse.service`).
 
 **Notes** (information): `allow-host-wildcard`, `app-runtime-rw`,
 `outbound-deny`, `ozone-hint-unnecessary`,
 `command-not-found`, `desktop-entry-missing`, `camera-nodes-none-present`,
 `camera-nodes-no-hotplug`, `dri-kms`, `secrets-access`, `lint-allow-unused`,
-`x11-nested-no-wm`, `pulseaudio-module-loading`, `repeat-outside-block`.
+`x11-nested-no-wm`, `repeat-outside-block`.
 
 `allow-host-wildcard` is about a pattern that is a wildcard directly under a
 top-level domain (`*.com`): the `*` stands for one label, so that one covers
