@@ -36,7 +36,11 @@ sysfs underneath them.
 NVIDIA: every `/dev/nvidia*` char device and `/sys/module/nvidia*` when
 present (`nvidia-caps` skipped; `/proc/driver/nvidia` comes with `--proc`).
 Those nodes have no render/primary split of their own, so `dri` on the
-proprietary driver stays as wide as it was, with or without `kms`.
+proprietary driver stays as wide as it was, with or without `kms` — and a
+GPU whose PCI driver is `nvidia` keeps its primary node too, because that
+EGL declines a Wayland display without it and the application would render
+in software; its card sysfs stays masked, and no other driver's primary
+node is bound.
 `dri` sets no environment — `DRI_PRIME`, `__NV_PRIME_RENDER_OFFLOAD` are a
 profile's `env` decision. Compute needs `etc-share "OpenCL"` / `etc-share
 "nvidia"`; AMD ROCm via `/dev/kfd` is not supported yet.

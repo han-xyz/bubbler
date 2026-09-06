@@ -2323,6 +2323,65 @@ fn real_bwrap_userns_disable_stops_a_nested_user_namespace() {
     );
 }
 
+/// The renderer `eglinfo -B` reports for the Wayland platform, empty
+/// where that platform did not initialise at all.
+fn wayland_platform_renderer(out: &str) -> String {
+    out.lines()
+        .skip_while(|l| *l != "Wayland platform:")
+        .take_while(|l| !l.ends_with("platform:") || *l == "Wayland platform:")
+        .find_map(|l| l.strip_prefix("OpenGL core profile renderer: "))
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// A GUI application reaches the GPU through the compositor, and on the
+/// proprietary NVIDIA driver its EGL declines the Wayland display
+/// without the primary node: the client then falls back to llvmpipe and
+/// the whole session composites in software.
+#[test]
+fn real_wayland_dri_renders_on_hardware_not_llvmpipe() {
+    if !require_security_context() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    if !Path::new("/usr/bin/eglinfo").is_file() {
+        say("skipping: /usr/bin/eglinfo is not installed (package `mesa-utils`)");
+        return;
+    }
+    // A session whose own Wayland EGL is software has nothing to
+    // measure the sandbox against.
+    let outside = wayland_platform_renderer(&String::from_utf8_lossy(
+        &Command::new("/usr/bin/eglinfo")
+            .arg("-B")
+            .output()
+            .unwrap()
+            .stdout,
+    ));
+    if outside.is_empty() || outside.contains("llvmpipe") {
+        say(&format!(
+            "skipping: this session's own Wayland renderer is {outside:?}"
+        ));
+        return;
+    }
+    let tmp = setup();
+    let name = instance_name("dri-egl");
+    let _leftovers = wayland_instance(tmp.path(), &init, &name, "wayland\ndri\ncommand \"true\"\n");
+    let out = bubbler_wayland(tmp.path(), &init)
+        .args(["run", &name, "--", "/usr/bin/eglinfo", "-B"])
+        .output()
+        .unwrap();
+    // `eglinfo` exits non-zero when any platform fails to initialise,
+    // which it does on this host outside a sandbox too (the X11 platform
+    // on a second device): what the platform reports is the measurement,
+    // not the status.
+    let err = without_tool_warnings(&String::from_utf8_lossy(&out.stderr));
+    let inside = wayland_platform_renderer(&String::from_utf8_lossy(&out.stdout));
+    assert!(
+        !inside.is_empty() && !inside.contains("llvmpipe"),
+        "the session renders on {outside:?} and the sandbox on {inside:?}\n{err}"
+    );
+}
+
 /// The render nodes are the whole of a bare `dri` grant, and a driver
 /// initialises on them: `eglinfo` names a renderer for every GPU it
 /// opened, while the primary nodes\' sysfs — the monitors\' EDID among

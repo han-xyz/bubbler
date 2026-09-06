@@ -29,7 +29,10 @@
   every other bind of the run, so a sibling grant that binds a tree above
   it — `gamepad`, with the whole of `/sys/devices` — cannot reopen the card
   sysfs. The NVIDIA nodes are unchanged, having no render/primary split of
-  their own.
+  their own, and a GPU whose PCI driver is `nvidia` keeps its primary node
+  with them: that stack's EGL declines a Wayland display without it, and a
+  sandboxed GUI application would render in software. Its card sysfs stays
+  masked, and no other driver's primary node is bound.
 - The sandbox `PATH` is `/usr/bin:/home/bubbler/.local/bin` instead of
   `/usr/bin` alone, so a bare command name resolves an app installed under
   a shared `.local/bin` (the native Claude Code installer, XDG user

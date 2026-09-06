@@ -124,9 +124,10 @@ pub static GRANTS: &[Grant] = &[
                hidden behind an empty read-only tmpfs. `kms=#true` adds the card nodes and \
                leaves that sysfs readable: the sandbox becomes KMS master on a virtual \
                terminal switch, and reads the monitors' EDID serial numbers, the \
-               framebuffer geometry and every other client's flink names. The NVIDIA \
-               nodes have no render/primary split, so `dri` on that driver is wide either \
-               way.",
+               framebuffer geometry and every other client's flink names. A GPU on the \
+               proprietary NVIDIA driver keeps its primary node either way, since that \
+               stack has no render/primary split and its EGL will not drive a Wayland \
+               display without it.",
         risk: Risk::Wide,
         grammar: "dri [kms=#true]",
     },

@@ -397,6 +397,10 @@ fn x11(
     Ok(())
 }
 
+/// Where the kernel puts the DRM device nodes. A `dri` grant binds the
+/// nodes it needs one by one, never this directory.
+const DRI_DEV: &str = "/dev/dri";
+
 /// Where the kernel publishes the DRM class: one entry per node, plus
 /// the connector directories that carry a monitor's EDID.
 const DRM_CLASS: &str = "/sys/class/drm";
@@ -409,7 +413,7 @@ const DRM_CLASS: &str = "/sys/class/drm";
 /// it: DRM master on a virtual terminal switch, the monitors' EDID, the
 /// framebuffer geometry, every other client's flink names.
 fn dri(args: &mut BwrapArgs, host: &dyn Host, kms: bool) -> Result<(), LaunchError> {
-    let dev = require_dir(host, "dri", PathBuf::from("/dev/dri"))?;
+    let dev = require_dir(host, "dri", PathBuf::from(DRI_DEV))?;
     // udev's `by-path` links are the only discovery path: a node's name
     // says nothing about which kind it is, and `/dev/dri` bound whole is
     // what this grant no longer does. The directory itself is not bound.
@@ -512,11 +516,23 @@ fn dri_nodes(host: &dyn Host, by_path: &Path) -> (BTreeSet<OsString>, BTreeSet<O
     (render, card)
 }
 
+/// The name of the kernel driver bound to the device at `dir`, from the
+/// link its bus keeps beside it (`.../0000:01:00.0/driver` ->
+/// `../../../../bus/pci/drivers/nvidia`). `None` where the device has no
+/// driver or the link cannot be read.
+fn dri_driver(host: &dyn Host, dir: &Path) -> Option<OsString> {
+    let target = host.read_link(&dir.join("driver")).ok().flatten()?;
+    target.file_name().map(OsStr::to_os_string)
+}
+
 /// The sysfs one render node needs: the GPU's own directory under
 /// `/sys/devices`, with the primary nodes under it masked by an empty
 /// read-only tmpfs unless `kms`, and `/sys/class/drm/<node>` as the
 /// relative symlink the host has there, so a driver that walks the class
 /// directory finds the device without the rest of the class being bound.
+/// A GPU on the proprietary NVIDIA driver also keeps its primary node,
+/// which is the one thing its EGL will not drive a Wayland display
+/// without.
 fn dri_sysfs(
     args: &mut BwrapArgs,
     host: &dyn Host,
@@ -548,16 +564,28 @@ fn dri_sysfs(
     args.ro_bind(&dir, &dir);
     let drm = dir.join("drm");
     if !kms {
-        // The primary node's directory holds the connectors, and each of
-        // those holds the monitor's EDID; the node's own attributes carry
-        // the framebuffer geometry.
+        // NVIDIA's proprietary stack has no render/primary split, and its
+        // EGL declines a Wayland display without the primary node:
+        // measured on driver 610, a client inside falls back to llvmpipe
+        // and Mesa reports `pci id 10de:…, driver (null)`. Only the node
+        // is needed — with it bound and the sysfs below still masked, the
+        // same client gets the GPU back.
+        let nvidia = dri_driver(host, &dir).is_some_and(|d| d == "nvidia");
         for entry in host.list_dir(&drm) {
             let card = drm.join(&entry);
-            if entry.as_encoded_bytes().starts_with(b"card")
-                && host.file_type(&card).is_some_and(|t| t.is_dir())
+            if !entry.as_encoded_bytes().starts_with(b"card")
+                || !host.file_type(&card).is_some_and(|t| t.is_dir())
             {
-                args.mask_dir(&card);
+                continue;
             }
+            if nvidia {
+                let node = Path::new(DRI_DEV).join(&entry);
+                args.dev_bind(&node, &node);
+            }
+            // The primary node's directory holds the connectors, and each
+            // of those holds the monitor's EDID; the node's own
+            // attributes carry the framebuffer geometry.
+            args.mask_dir(&card);
         }
     }
     // Relative, as the host writes it: a driver comparing the link with
@@ -3645,7 +3673,29 @@ mod tests {
             ("/dev/dri/by-path/pci-0000:0c:00.0-render", "../renderD129"),
             ("/sys/class/drm/renderD128/device", GPU_A),
             ("/sys/class/drm/renderD129/device", GPU_B),
+            (
+                "/sys/devices/pci0000:00/0000:00:01.1/0000:01:00.0/driver",
+                "../../../../bus/pci/drivers/amdgpu",
+            ),
+            (
+                "/sys/devices/pci0000:00/0000:00:08.1/0000:0c:00.0/driver",
+                "../../../../bus/pci/drivers/amdgpu",
+            ),
         ]
+    }
+
+    /// [`two_gpu_links`] with the first GPU driven by the proprietary
+    /// NVIDIA driver, as this desktop has it.
+    fn nvidia_gpu_links() -> Vec<(&'static str, &'static str)> {
+        two_gpu_links()
+            .into_iter()
+            .map(|(from, to)| match from {
+                "/sys/devices/pci0000:00/0000:00:01.1/0000:01:00.0/driver" => {
+                    (from, "../../../../bus/pci/drivers/nvidia")
+                }
+                _ => (from, to),
+            })
+            .collect()
     }
 
     /// What a bare `dri` binds on [`two_gpu_host`]. The masks it also
@@ -3716,6 +3766,58 @@ mod tests {
             [two_gpu_binds(), two_gpu_masks()].concat(),
             "no card node, no `/dev/dri` itself, no `by-path`, no PCI root and no \
              `/sys/class/drm` around the two symlinks"
+        );
+    }
+
+    #[test]
+    fn dri_binds_the_primary_node_of_an_nvidia_gpu_and_of_no_other() {
+        let a = argv_linked(
+            &[Service::Dri { kms: false }],
+            &env(),
+            &two_gpu_host(),
+            &nvidia_gpu_links(),
+        )
+        .unwrap();
+        assert_eq!(
+            binds(&a),
+            [
+                vec![
+                    "--dev-bind",
+                    "/dev/dri/renderD128",
+                    "/dev/dri/renderD128",
+                    "--dev-bind",
+                    "/dev/dri/renderD129",
+                    "/dev/dri/renderD129",
+                    "--ro-bind",
+                    "/sys/dev/char",
+                    "/sys/dev/char",
+                    "--ro-bind",
+                    "/sys/devices/system/cpu",
+                    "/sys/devices/system/cpu",
+                    "--ro-bind",
+                    GPU_A,
+                    GPU_A,
+                    "--dev-bind",
+                    "/dev/dri/card1",
+                    "/dev/dri/card1",
+                    "--symlink",
+                    "../../devices/pci0000:00/0000:00:01.1/0000:01:00.0/drm/renderD128",
+                    "/sys/class/drm/renderD128",
+                    "--ro-bind",
+                    GPU_B,
+                    GPU_B,
+                    "--symlink",
+                    "../../devices/pci0000:00/0000:00:08.1/0000:0c:00.0/drm/renderD129",
+                    "/sys/class/drm/renderD129",
+                    "--ro-bind",
+                    "/sys/class/drm/version",
+                    "/sys/class/drm/version",
+                ],
+                two_gpu_masks(),
+            ]
+            .concat(),
+            "the Mesa-driven GPU keeps its primary node out, and both card \
+             directories stay masked"
         );
     }
 

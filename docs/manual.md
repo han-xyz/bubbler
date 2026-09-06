@@ -569,6 +569,12 @@ so a node missing at launch stays missing. The `/dev/nvidia-caps` directory
 is not bound: those are MIG capability files, which nothing outside MIG reads
 (`nvidia-cap1` is root-only, `nvidia-cap2` is world-readable).
 `/proc/driver/nvidia` needs no bind, the baseline `--proc` already shows it.
+A GPU whose PCI driver is `nvidia` keeps its primary node with all that:
+measured on driver 610, that stack's EGL declines a Wayland display without
+`/dev/dri/card<N>`, and the application falls back to llvmpipe — every GUI
+profile would then composite in software. Its card sysfs stays masked all
+the same (the EDID and the framebuffer geometry are read through those
+files, not through the node), and no other driver's primary node is bound.
 `dri` sets no environment: `DRI_PRIME`, `__NV_PRIME_RENDER_OFFLOAD`,
 `__GLX_VENDOR_LIBRARY_NAME` and their kind pick a GPU on a hybrid machine,
 which is a profile's `env` decision, not a service's. Compute is one gap:

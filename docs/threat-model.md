@@ -1018,7 +1018,11 @@ under the name you wrote.
 
 The NVIDIA nodes a `dri` grant adds have no render/primary split: one
 `/dev/nvidia*` device is both, so that half of the grant is as wide with
-the bare node as with `kms=#true`.
+the bare node as with `kms=#true`. A GPU on that driver also keeps its
+primary node, measured as the one thing its EGL needs to drive a Wayland
+display; the mode-setting reach that node carries is therefore open to a
+sandbox on an NVIDIA GPU, while its card sysfs — the EDID and the
+framebuffer geometry — stays masked, and a Mesa-driven GPU keeps both out.
 
 [Host paths](manual.md#host-paths) ·
 `path_share_refuses_every_reserved_root`,
