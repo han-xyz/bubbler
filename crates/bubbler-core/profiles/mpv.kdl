@@ -1,4 +1,28 @@
 // bubbler profile: mpv
+//
+// `wayland` is the display it draws on, and the only one: there is no
+// `x11` beside it, so a `--vo` with no Wayland backend (`xv`, and the
+// X11 fallbacks the Arch wiki names under Mpv#Fix jerky playback and
+// tearing) has nothing to open.
+//
+// `dri` is the GPU. mpv "defaults to using the OpenGL video output
+// device setting on hardware that supports it", and `--hwdec` decodes
+// through the same driver (Arch wiki, Mpv). Bare, not `kms=#true`: the
+// render node is what a driver draws through, and the card node is the
+// display controller, which a player never opens.
+//
+// `pipewire` is the sound: on a PipeWire host mpv's own default audio
+// output driver is `pipewire` (Arch wiki, Mpv#Screen sharing cannot
+// capture audio from mpv), so this is the socket it reaches for. It
+// carries capture as well as playback, so it is the microphone too;
+// `pulseaudio` beside it is the same reach through the older protocol,
+// not a narrower one.
+//
+// `home-share "Videos"` is read-only, because a player reads its files
+// and writes none. Edit the node for the directory you keep films in;
+// a library on another disk is named explicitly, e.g.
+//   path-share "/mnt/films"
+//
 // No nested user namespaces: mpv nests no sandbox of its own, so the door a
 // nested user namespace opens stays shut.
 wayland
