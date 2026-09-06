@@ -10754,13 +10754,37 @@ mod profile_smoke {
         limit: Duration,
     }
 
+    /// [`BackgroundRun::stop`] with `limit` in place of the shared
+    /// `RUN_LIMIT`: a profile whose cold start earned a longer wait
+    /// (steam) deserves the same patience exiting — SIGTERM has to reach
+    /// its client and whatever update helpers are still running, not
+    /// fit inside the 10s every other real-bwrap test in this file waits.
+    fn stop_within(mut run: BackgroundRun, limit: Duration) -> String {
+        let Some(mut child) = run.run.take() else {
+            return run.said();
+        };
+        let _ = kill_process(Pid::from_child(&child), Signal::TERM);
+        let stopped = wait_until(|| child.try_wait().is_ok_and(|s| s.is_some()), limit);
+        if !stopped {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(
+            stopped,
+            "the run did not stop after SIGTERM: {}",
+            run.said()
+        );
+        run.said()
+    }
+
     /// Start a `GuiProfile` in a throwaway sandbox and prove a window
     /// matching its identity mapped: skip (with a reason on stderr) when
     /// its gate binary is absent, this host offers no security-context
     /// Wayland, or no Hyprland answers `hyprctl`; else wait out its own
     /// `limit` for the count of matching windows to rise past what the
     /// desktop had before the sandbox started. Terminates the sandbox with
-    /// SIGTERM and asserts it stopped, whether the window appeared or not.
+    /// SIGTERM and asserts it stopped within that same `limit`, whether
+    /// the window appeared or not.
     fn gui_smoke(p: GuiProfile) {
         if !require_host_program(p.gate) || !require_security_context() || !require_hyprctl() {
             return;
@@ -10796,7 +10820,7 @@ mod profile_smoke {
             p.limit,
             without_tool_warnings(&run.said())
         );
-        run.stop();
+        stop_within(run, p.limit);
     }
 
     #[test]
