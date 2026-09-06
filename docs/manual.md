@@ -540,9 +540,10 @@ nodes and leaves their sysfs readable, which is what a compositor or a
 mode-setting tool needs and what nothing else does: the sandbox becomes DRM
 master on a virtual terminal switch and reads the EDID serial numbers, the
 framebuffer geometry and every other client's flink names. `lint` notes it as
-`dri-kms`, `--explain` marks the group, and no shipped profile sets it. A
-`gamepad` grant beside `dri` binds `/sys/devices` whole, and that later bind
-covers the card masks — the sysfs comes back, though the nodes do not.
+`dri-kms`, `--explain` marks the group, and no shipped profile sets it. The
+masks are emitted after every other bind of the run, so a sibling grant that
+binds a tree above them — `gamepad`, with the whole of `/sys/devices` —
+cannot reopen the card sysfs underneath.
 `pipewire` and `pulseaudio` hand the sandbox the session's
 audio socket directly, which is capture as well as playback: everything the
 session exposes, including the microphone, with no portal in between. An ALSA
@@ -597,8 +598,7 @@ is a keylogger grant. Compare `ls -l /dev/input` with `id` before granting
 `gamepad`.
 
 The `/sys` side is wide too. `/sys/devices` is the whole device tree, which
-contains `dri`'s GPU directories — the `card*` masks under them included, so
-`gamepad` beside `dri` puts that sysfs back — and much more: DMI vendor,
+contains `dri`'s GPU directories and much more: DMI vendor,
 board and BIOS strings
 (the serial numbers among them stay root-only), ACPI, platform, thermal and
 battery state, the attributes of every block and tty device, and

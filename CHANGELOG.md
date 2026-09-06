@@ -20,8 +20,11 @@
   symlink per render node plus `version`. The `/sys/devices/pci*` roots and
   the whole-`/sys/class/drm` bind are gone. `by-path` is the only place a
   node is looked for, so a host that has `/dev/dri` without a `*-render`
-  link there now fails instead of binding more. The NVIDIA nodes are
-  unchanged, having no render/primary split of their own.
+  link there now fails instead of binding more. A mask is emitted after
+  every other bind of the run, so a sibling grant that binds a tree above
+  it — `gamepad`, with the whole of `/sys/devices` — cannot reopen the card
+  sysfs. The NVIDIA nodes are unchanged, having no render/primary split of
+  their own.
 
 ## 0.21.0 (unreleased)
 

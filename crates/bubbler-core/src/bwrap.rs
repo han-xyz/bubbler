@@ -121,7 +121,7 @@ pub trait FdAllocator {
 /// Ordered, phase-separated bubblewrap arguments.
 ///
 /// Phases: 1 namespaces, 2 filesystem skeleton, 3 runtime dir,
-/// 4 service binds, 5 environment, then `--` and the command.
+/// 4 service binds, 4b masks, 5 environment, then `--` and the command.
 // No `Default`: `baseline` is the only constructor, so a `BwrapArgs`
 // without the baseline restrictions cannot be built.
 #[derive(Debug, Clone)]
@@ -130,6 +130,12 @@ pub struct BwrapArgs {
     skeleton: Vec<Item>,
     runtime_dir: Vec<Item>,
     binds: Vec<Item>,
+    /// What [`BwrapArgs::mask_dir`] covers, emitted after every bind of
+    /// phase 4: a mask is only a mask while nothing binds over it, and a
+    /// grant whose binds are hoisted to the end of that phase — `gamepad`
+    /// with its whole `/sys/devices` — would otherwise reopen what
+    /// another grant masked underneath.
+    masks: Vec<Item>,
     env: Vec<Item>,
     /// `--ctty` in the supervisor's own argv, not a bwrap flag.
     ctty: bool,
@@ -240,6 +246,7 @@ impl BwrapArgs {
             skeleton: Vec::new(),
             runtime_dir: Vec::new(),
             binds: Vec::new(),
+            masks: Vec::new(),
             env: Vec::new(),
             ctty: false,
             x11: None,
@@ -393,6 +400,7 @@ impl BwrapArgs {
             skeleton: Vec::new(),
             runtime_dir: Vec::new(),
             binds: Vec::new(),
+            masks: Vec::new(),
             env: Vec::new(),
             ctty: false,
             x11: None,
@@ -683,12 +691,16 @@ impl BwrapArgs {
         );
     }
 
-    /// Mask a directory with an empty read-only tmpfs (phase 4). Used to
-    /// hide GPU card sysfs directories without breaking device discovery
-    /// when render-only `dri` is granted.
+    /// Mask a directory with an empty read-only tmpfs. Used to hide GPU
+    /// card sysfs directories without breaking device discovery when
+    /// render-only `dri` is granted.
+    ///
+    /// Emitted after every bind of phase 4, whichever grant asked for it
+    /// and wherever that grant sits in the file: bind order is
+    /// semantics, and a mask a later bind covers is no mask at all.
     pub fn mask_dir(&mut self, dir: &Path) {
         push(
-            &mut self.binds,
+            &mut self.masks,
             self.origin,
             [
                 OsStr::new("--size"),
@@ -698,7 +710,7 @@ impl BwrapArgs {
             ],
         );
         push(
-            &mut self.binds,
+            &mut self.masks,
             self.origin,
             [OsStr::new("--remount-ro"), dir.as_os_str()],
         );
@@ -879,6 +891,7 @@ impl BwrapArgs {
             self.skeleton,
             self.runtime_dir,
             self.binds,
+            self.masks,
             self.env,
         ]
         .into_iter()

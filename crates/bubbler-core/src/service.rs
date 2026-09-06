@@ -3529,8 +3529,9 @@ mod tests {
         ]
     }
 
-    /// Everything a bare `dri` emits on [`two_gpu_host`], which is the
-    /// whole grant on a host with no proprietary driver.
+    /// What a bare `dri` binds on [`two_gpu_host`]. The masks it also
+    /// emits are [`two_gpu_masks`], which every grant's binds come
+    /// before.
     fn two_gpu_binds() -> Vec<&'static str> {
         vec![
             "--dev-bind",
@@ -3548,30 +3549,37 @@ mod tests {
             "--ro-bind",
             GPU_A,
             GPU_A,
-            "--size",
-            "4096",
-            "--tmpfs",
-            "/sys/devices/pci0000:00/0000:00:01.1/0000:01:00.0/drm/card1",
-            "--remount-ro",
-            "/sys/devices/pci0000:00/0000:00:01.1/0000:01:00.0/drm/card1",
             "--symlink",
             "../../devices/pci0000:00/0000:00:01.1/0000:01:00.0/drm/renderD128",
             "/sys/class/drm/renderD128",
             "--ro-bind",
             GPU_B,
             GPU_B,
-            "--size",
-            "4096",
-            "--tmpfs",
-            "/sys/devices/pci0000:00/0000:00:08.1/0000:0c:00.0/drm/card0",
-            "--remount-ro",
-            "/sys/devices/pci0000:00/0000:00:08.1/0000:0c:00.0/drm/card0",
             "--symlink",
             "../../devices/pci0000:00/0000:00:08.1/0000:0c:00.0/drm/renderD129",
             "/sys/class/drm/renderD129",
             "--ro-bind",
             "/sys/class/drm/version",
             "/sys/class/drm/version",
+        ]
+    }
+
+    /// The card directories a bare `dri` covers on [`two_gpu_host`], in
+    /// the place the builder emits every mask: after the binds.
+    fn two_gpu_masks() -> Vec<&'static str> {
+        vec![
+            "--size",
+            "4096",
+            "--tmpfs",
+            "/sys/devices/pci0000:00/0000:00:01.1/0000:01:00.0/drm/card1",
+            "--remount-ro",
+            "/sys/devices/pci0000:00/0000:00:01.1/0000:01:00.0/drm/card1",
+            "--size",
+            "4096",
+            "--tmpfs",
+            "/sys/devices/pci0000:00/0000:00:08.1/0000:0c:00.0/drm/card0",
+            "--remount-ro",
+            "/sys/devices/pci0000:00/0000:00:08.1/0000:0c:00.0/drm/card0",
         ]
     }
 
@@ -3586,7 +3594,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             binds(&a),
-            two_gpu_binds(),
+            [two_gpu_binds(), two_gpu_masks()].concat(),
             "no card node, no `/dev/dri` itself, no `by-path`, no PCI root and no \
              `/sys/class/drm` around the two symlinks"
         );
@@ -3638,6 +3646,38 @@ mod tests {
                 "/sys/class/drm/version",
                 "/sys/class/drm/version",
             ]
+        );
+    }
+
+    #[test]
+    fn dris_card_masks_survive_a_gamepads_whole_device_tree() {
+        let card_a = "/sys/devices/pci0000:00/0000:00:01.1/0000:01:00.0/drm/card1";
+        let mut host = gamepad_host();
+        host.extend(two_gpu_host());
+        for order in [
+            [Service::Dri { kms: false }, pad(false, false)],
+            [pad(false, false), Service::Dri { kms: false }],
+        ] {
+            let a = argv_linked(&order, &env(), &host, &two_gpu_links()).unwrap();
+            let tree = seq_at(&a, &["--ro-bind", "/sys/devices", "/sys/devices"])
+                .expect("gamepad binds the device tree");
+            let mask = seq_at(&a, &["--size", "4096", "--tmpfs", card_a])
+                .expect("dri masks the card directory");
+            // A bind of the tree over a mask already laid would hand the
+            // card sysfs back, so the masks are emitted last of all.
+            assert!(tree < mask, "{order:?}: {a:?}");
+            assert!(has_seq(&a, &["--remount-ro", card_a]), "{a:?}");
+        }
+        let kms = argv_linked(
+            &[Service::Dri { kms: true }, pad(false, false)],
+            &env(),
+            &host,
+            &two_gpu_links(),
+        )
+        .unwrap();
+        assert!(
+            !has_seq(&kms, &["--size", "4096", "--tmpfs", card_a]),
+            "{kms:?}"
         );
     }
 
@@ -3732,10 +3772,12 @@ mod tests {
             "/sys/module/nvidia_uvm",
             "/sys/module/nvidia_uvm",
         ]);
+        expected.extend(two_gpu_masks());
         assert_eq!(
             binds(&a),
             expected,
-            "the /dev/nvidia-caps directory and unrelated module directories stay out"
+            "the /dev/nvidia-caps directory and unrelated module directories stay out, \
+             and the card masks follow every bind"
         );
     }
 
@@ -3754,7 +3796,7 @@ mod tests {
             &two_gpu_links(),
         )
         .unwrap();
-        assert_eq!(binds(&a), two_gpu_binds());
+        assert_eq!(binds(&a), [two_gpu_binds(), two_gpu_masks()].concat());
     }
 
     #[test]

@@ -942,9 +942,11 @@ A `dri` grant is held to the same shape. What it binds is the render node
 of every GPU — the targets of the `/dev/dri/by-path/*-render` links, in
 the `../<node>` form udev writes them and no other — and each of those
 GPUs' own directory under `/sys/devices`, with the `drm/card*`
-directories under it covered by an empty read-only tmpfs and
-`/sys/class/drm` rebuilt from one symlink per render node plus `version`.
-The primary (`card*`) nodes are what that leaves out, and with them: DRM
+directories under it covered by an empty read-only tmpfs — emitted after
+every other bind of the run, so a wider bind of a sibling grant
+(`gamepad`, which takes all of `/sys/devices`) cannot reopen what a mask
+covers — and `/sys/class/drm` rebuilt from one symlink per render node
+plus `version`. The primary (`card*`) nodes are what that leaves out, and with them: DRM
 master on a virtual terminal switch, which lets a client take over the
 display; the monitors' EDID, whose serial numbers identify the hardware;
 the framebuffer geometry; and the flink names every other DRM client on
@@ -960,10 +962,7 @@ under the name you wrote.
 
 The NVIDIA nodes a `dri` grant adds have no render/primary split: one
 `/dev/nvidia*` device is both, so that half of the grant is as wide with
-the bare node as with `kms=#true`. And a `gamepad` grant beside `dri`
-binds `/sys/devices` whole, which is emitted after the masks and covers
-them: the card sysfs is readable again in a sandbox holding both, though
-the card nodes themselves are not bound.
+the bare node as with `kms=#true`.
 
 [Host paths](manual.md#host-paths) ·
 `path_share_refuses_every_reserved_root`,
@@ -984,6 +983,7 @@ the card nodes themselves are not bound.
 `dri_kms_adds_the_card_nodes_and_leaves_their_sysfs_readable`,
 `dri_without_a_render_node_under_by_path_is_an_error`,
 `dri_refuses_a_render_node_whose_sysfs_leaves_the_device_tree`,
+`dris_card_masks_survive_a_gamepads_whole_device_tree`,
 `real_bwrap_dri_initialises_a_driver_without_the_card_nodes`
 
 ### File arguments

@@ -29,9 +29,9 @@ framebuffer geometry, and every other client's flink names. Only for a
 compositor, a mode-setting tool or a bare-KMS player; `lint` notes it as
 `dri-kms`. Rendering, video decoding and Vulkan need the bare node.
 
-A `gamepad` grant beside `dri` binds `/sys/devices` whole, and that bind
-covers the card masks: the two together expose the sysfs the bare `dri`
-hides (the nodes themselves stay out).
+The masks are emitted after every other bind of the run, so no sibling
+grant — `gamepad`, which binds `/sys/devices` whole — reopens the card
+sysfs underneath them.
 
 NVIDIA: every `/dev/nvidia*` char device and `/sys/module/nvidia*` when
 present (`nvidia-caps` skipped; `/proc/driver/nvidia` comes with `--proc`).
