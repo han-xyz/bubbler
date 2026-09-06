@@ -46,6 +46,22 @@ moment, and they take the selection and give it back with one flavour on it —
 its plainest text form, or its first content type where it had no text, so an
 HTML selection comes back as text and an image-only one as the image.
 
+## Profile smoke tests
+
+`crates/bubbler/tests/cli.rs`'s `profile_smoke` module starts every shipped
+profile for real and checks that it did what it should: a GUI profile's
+window mapped on Hyprland, a CLI profile's command printed what was
+documented. It measures a profile; it does not fix one that fails here.
+
+```
+cargo test -p bubbler --test cli profile_smoke -- --test-threads=1
+```
+
+Serial only: it starts real desktop apps one at a time against a session
+with exactly one desktop to watch them on. It needs Hyprland (`hyprctl`) and
+each app installed — either missing is a printed skip, not a failure, so a
+host with neither reports nothing rather than a wall of red.
+
 ## Fuzzing
 
 `fuzz/` is a cargo-fuzz crate outside the workspace (nightly):

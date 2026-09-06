@@ -10666,3 +10666,406 @@ fn a_host_without_a_working_bwrap_skips_the_guarded_tests_rather_than_failing_th
         assert!(all.contains("1 passed"), "{}: {all}", path.display());
     }
 }
+
+/// One live smoke test per shipped profile, against this desktop's real
+/// Hyprland session and the apps actually installed on it. A GUI
+/// profile's test proves its window mapped; a CLI profile's proves its
+/// command's stdout came back as documented. Neither fixes a profile
+/// that fails here — that measures, and the measurement is the point.
+///
+/// Every test skips (with a reason printed through [`say`]) rather than
+/// fails when the app or Hyprland itself is not on this host. Run the
+/// module with `--test-threads=1`: it starts real desktop apps one at a
+/// time against a session with exactly one desktop to watch them on, and
+/// several such launches at once would make the timing this measures mean
+/// nothing.
+///
+///     cargo test -p bubbler --test cli profile_smoke -- --test-threads=1
+mod profile_smoke {
+    use super::*;
+
+    /// What a GUI smoke test looks for in `hyprctl clients`. Most shipped
+    /// profiles set a stable window class; this host's Steam client sets
+    /// none on its main window (`class` comes back empty), so that test
+    /// matches its title instead, which is fixed at "Steam" regardless of
+    /// login state.
+    enum Seen {
+        Class(&'static str),
+        Title(&'static str),
+    }
+
+    /// How many mapped windows `hyprctl clients` reports matching `seen`
+    /// right now. A live desktop already has some of the classes these
+    /// tests look for open outside the test — this session's own
+    /// `firefox`, `code` and `vesktop` windows carry exactly the classes
+    /// their own profiles do — so a smoke test counts rather than merely
+    /// looks for one, and only a rise past what was there when the
+    /// sandbox started is its own window.
+    fn hyprctl_count(seen: &Seen) -> usize {
+        let out = hyprctl(&["clients"]);
+        if !out.status.success() {
+            return 0;
+        }
+        let want = match seen {
+            Seen::Class(c) => format!("class: {c}"),
+            Seen::Title(t) => format!("title: {t}"),
+        };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.trim() == want)
+            .count()
+    }
+
+    /// [`bubbler_wayland`] with the host's `$DISPLAY` too: `x11 "host"` —
+    /// steam's and lutris's grant — is a hard launch error without it (a
+    /// missing `DISPLAY`), and no other smoke test here touches X11.
+    fn bubbler_x11_host(root: &Path, init: &Path) -> Command {
+        let mut c = bubbler_wayland(root, init);
+        if let Some(display) = std::env::var_os("DISPLAY") {
+            c.env("DISPLAY", display);
+        }
+        c
+    }
+
+    /// One shipped GUI profile's smoke test: the host binary it needs,
+    /// the window identity that proves it ran, which `$HOME` subdirectories
+    /// its `home-share` grants need to exist first, whether its `network`
+    /// grant needs pasta to attach, and whether its `x11 "host"` grant
+    /// needs the host's `$DISPLAY` forwarded in.
+    struct GuiProfile {
+        profile: &'static str,
+        gate: &'static str,
+        seen: Seen,
+        home_dirs: &'static [&'static str],
+        network: bool,
+        x11_host: bool,
+    }
+
+    /// Start a `GuiProfile` in a throwaway sandbox and prove a window
+    /// matching its identity mapped: skip (with a reason on stderr) when
+    /// its gate binary is absent, this host offers no security-context
+    /// Wayland, or no Hyprland answers `hyprctl`; else wait out
+    /// [`RUN_LIMIT`] for the count of matching windows to rise past what
+    /// the desktop had before the sandbox started. Terminates the sandbox
+    /// with SIGTERM and asserts it stopped, whether the window appeared
+    /// or not.
+    fn gui_smoke(p: GuiProfile) {
+        if !require_host_program(p.gate) || !require_security_context() || !require_hyprctl() {
+            return;
+        }
+        if p.network && !require_pasta() {
+            return;
+        }
+        let Some(init) = real_init() else { return };
+        let tmp = setup();
+        for dir in p.home_dirs {
+            std::fs::create_dir_all(tmp.path().join("home").join(dir)).unwrap();
+        }
+        let before = hyprctl_count(&p.seen);
+        let log = tmp.path().join(format!("{}.err", p.profile));
+        let mut cmd = if p.x11_host {
+            bubbler_x11_host(tmp.path(), &init)
+        } else {
+            bubbler_wayland(tmp.path(), &init)
+        };
+        let run = BackgroundRun {
+            run: Some(
+                cmd.args(["try", "--profile", p.profile])
+                    .stderr(std::fs::File::create(&log).unwrap())
+                    .spawn()
+                    .unwrap(),
+            ),
+            log,
+        };
+        assert!(
+            wait_until(|| hyprctl_count(&p.seen) > before, RUN_LIMIT),
+            "{}: no new window within {RUN_LIMIT:?}: {}",
+            p.profile,
+            without_tool_warnings(&run.said())
+        );
+        run.stop();
+    }
+
+    #[test]
+    fn alacritty_window_appears() {
+        gui_smoke(GuiProfile {
+            profile: "alacritty",
+            gate: "/usr/bin/alacritty",
+            seen: Seen::Class("Alacritty"),
+            home_dirs: &[],
+            network: false,
+            x11_host: false,
+        });
+    }
+
+    #[test]
+    fn chromium_window_appears() {
+        gui_smoke(GuiProfile {
+            profile: "chromium",
+            gate: "/usr/bin/chromium",
+            seen: Seen::Class("chromium"),
+            home_dirs: &["Downloads"],
+            network: true,
+            x11_host: false,
+        });
+    }
+
+    #[test]
+    fn code_window_appears() {
+        gui_smoke(GuiProfile {
+            profile: "code",
+            gate: "/usr/bin/code",
+            seen: Seen::Class("code"),
+            home_dirs: &["Projects"],
+            network: true,
+            x11_host: false,
+        });
+    }
+
+    #[test]
+    fn firefox_window_appears() {
+        gui_smoke(GuiProfile {
+            profile: "firefox",
+            gate: "/usr/bin/firefox",
+            seen: Seen::Class("firefox"),
+            home_dirs: &["Downloads"],
+            network: true,
+            x11_host: false,
+        });
+    }
+
+    #[test]
+    fn keepassxc_window_appears() {
+        gui_smoke(GuiProfile {
+            profile: "keepassxc",
+            gate: "/usr/bin/keepassxc",
+            seen: Seen::Class("org.keepassxc.KeePassXC"),
+            home_dirs: &["Documents"],
+            network: false,
+            x11_host: false,
+        });
+    }
+
+    #[test]
+    fn kitty_window_appears() {
+        gui_smoke(GuiProfile {
+            profile: "kitty",
+            gate: "/usr/bin/kitty",
+            seen: Seen::Class("kitty"),
+            home_dirs: &[],
+            network: false,
+            x11_host: false,
+        });
+    }
+
+    #[test]
+    fn libreoffice_window_appears() {
+        // libreoffice-still ships `/usr/bin/libreoffice`; a build that
+        // ships only the bare `soffice` binary names the same program
+        // under that name instead.
+        let gate = if Path::new("/usr/bin/libreoffice").is_file() {
+            "/usr/bin/libreoffice"
+        } else {
+            "/usr/bin/soffice"
+        };
+        gui_smoke(GuiProfile {
+            profile: "libreoffice",
+            gate,
+            // The bare `command "libreoffice"` this profile ships opens
+            // the start centre, not a per-document window.
+            seen: Seen::Class("libreoffice-startcenter"),
+            home_dirs: &["Documents"],
+            network: false,
+            x11_host: false,
+        });
+    }
+
+    #[test]
+    fn lutris_window_appears() {
+        gui_smoke(GuiProfile {
+            profile: "lutris",
+            gate: "/usr/bin/lutris",
+            seen: Seen::Class("net.lutris.Lutris"),
+            home_dirs: &["Games"],
+            network: true,
+            x11_host: true,
+        });
+    }
+
+    #[test]
+    fn mpv_window_appears() {
+        gui_smoke(GuiProfile {
+            profile: "mpv",
+            gate: "/usr/bin/mpv",
+            seen: Seen::Class("mpv"),
+            home_dirs: &["Videos"],
+            network: false,
+            x11_host: false,
+        });
+    }
+
+    #[test]
+    fn spotify_window_appears() {
+        gui_smoke(GuiProfile {
+            profile: "spotify",
+            gate: "/usr/bin/spotify",
+            seen: Seen::Class("Spotify"),
+            home_dirs: &[],
+            network: true,
+            x11_host: false,
+        });
+    }
+
+    #[test]
+    fn steam_window_appears() {
+        gui_smoke(GuiProfile {
+            profile: "steam",
+            gate: "/usr/bin/steam",
+            seen: Seen::Title("Steam"),
+            home_dirs: &[],
+            network: true,
+            x11_host: true,
+        });
+    }
+
+    #[test]
+    fn thunderbird_window_appears() {
+        gui_smoke(GuiProfile {
+            profile: "thunderbird",
+            gate: "/usr/bin/thunderbird",
+            seen: Seen::Class("org.mozilla.Thunderbird"),
+            home_dirs: &["Downloads"],
+            network: true,
+            x11_host: false,
+        });
+    }
+
+    #[test]
+    fn vesktop_window_appears() {
+        gui_smoke(GuiProfile {
+            profile: "vesktop",
+            gate: "/usr/bin/vesktop",
+            seen: Seen::Class("vesktop"),
+            home_dirs: &[],
+            network: true,
+            x11_host: false,
+        });
+    }
+
+    /// [`bubbler_live`] with the real `$HOME`: `claude-code`'s and
+    /// `claude-code-strict`'s `home-share` resolve against it, and the
+    /// native installer's `~/.local/bin/claude` is only ever there, never
+    /// under the isolated fixture home every other test gets. The
+    /// instance store and the profile layer still come from `root`.
+    fn bubbler_home(root: &Path, init: &Path) -> Command {
+        let mut c = bubbler_live(root, init);
+        if let Some(home) = std::env::var_os("HOME") {
+            c.env("HOME", home);
+        }
+        c
+    }
+
+    /// Whether this host has the native install layout `claude-code` and
+    /// `claude-code-strict` both hard-code a `home-share` of. Without
+    /// both paths present, launch fails before the command this test
+    /// overrides ever runs — a missing `home-share` source is a launch
+    /// error regardless of what command replaces the profile's own.
+    fn require_claude_native_install() -> bool {
+        let Some(home) = std::env::var_os("HOME") else {
+            say("skipping: claude-code needs $HOME to find the native install");
+            return false;
+        };
+        let home = PathBuf::from(home);
+        let ok =
+            home.join(".local/bin/claude").is_file() && home.join(".local/share/claude").is_dir();
+        if !ok {
+            say("skipping: ~/.local/bin/claude or ~/.local/share/claude is not installed");
+        }
+        ok
+    }
+
+    /// Start `profile` in a throwaway sandbox running exactly `argv`, and
+    /// check its stdout with `check`. Skips (with a reason `gate` itself
+    /// prints) when `gate` returns false. `home` selects [`bubbler_home`]
+    /// over [`bubbler_live`], for a profile whose `home-share` needs the
+    /// real `$HOME`.
+    fn command_smoke(
+        profile: &str,
+        gate: impl FnOnce() -> bool,
+        home: bool,
+        argv: &[&str],
+        check: impl FnOnce(&str) -> bool,
+        what: &str,
+    ) {
+        if !gate() {
+            return;
+        }
+        let Some(init) = real_init() else { return };
+        let tmp = setup();
+        let mut cmd = if home {
+            bubbler_home(tmp.path(), &init)
+        } else {
+            bubbler_live(tmp.path(), &init)
+        };
+        let out = cmd
+            .args(["try", "--profile", profile, "--"])
+            .args(argv)
+            .output()
+            .unwrap();
+        let err = without_tool_warnings(&String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "{profile}: {err}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            check(stdout.trim_end()),
+            "{profile}: stdout {stdout:?} did not {what}: {err}"
+        );
+    }
+
+    #[test]
+    fn generic_runs_the_command_verbatim() {
+        command_smoke(
+            "generic",
+            require_bwrap,
+            false,
+            &["/usr/bin/sh", "-c", "echo ok"],
+            |out| out == "ok",
+            "equal \"ok\"",
+        );
+    }
+
+    #[test]
+    fn agent_runs_a_bare_command_over_its_network_grant() {
+        command_smoke(
+            "agent",
+            || require_bwrap() && require_pasta(),
+            false,
+            &["/usr/bin/sh", "-c", "echo ok"],
+            |out| out == "ok",
+            "equal \"ok\"",
+        );
+    }
+
+    #[test]
+    fn claude_code_prints_its_version() {
+        command_smoke(
+            "claude-code",
+            || require_bwrap() && require_pasta() && require_claude_native_install(),
+            true,
+            &["/home/bubbler/.local/bin/claude", "--version"],
+            |out| out.starts_with(|c: char| c.is_ascii_digit()),
+            "start with a digit",
+        );
+    }
+
+    #[test]
+    fn claude_code_strict_prints_its_version() {
+        command_smoke(
+            "claude-code-strict",
+            || require_egress() && require_claude_native_install(),
+            true,
+            &["/home/bubbler/.local/bin/claude", "--version"],
+            |out| out.starts_with(|c: char| c.is_ascii_digit()),
+            "start with a digit",
+        );
+    }
+}
