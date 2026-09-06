@@ -2953,7 +2953,9 @@ mod tests {
             let items = args
                 .finish_explained(
                     &[OsString::from("x")],
-                    &mut crate::launcher::DryRunAlloc::default(),
+                    &mut crate::launcher::DryRunAlloc::new(PathBuf::from(
+                        "/run/user/1000/bubbler/i",
+                    )),
                 )
                 .unwrap();
 

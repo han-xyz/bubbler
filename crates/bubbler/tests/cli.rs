@@ -76,6 +76,7 @@ fn create_list_and_dry_run() {
     );
     let home = tmp.path().join("data/bubbler/instances/t/home");
     let run = tmp.path().join("run");
+    let data = run.join("bubbler/t");
     // Which allowlisted `/etc` entries exist is a property of this host, so
     // only the parts around them are exact.
     let expected_prefix = "bwrap\n--unshare-all\n--die-with-parent\n--new-session\n--hostname\nbubbler\n--chdir\n/home/bubbler\n\
@@ -90,7 +91,7 @@ fn create_list_and_dry_run() {
          --ro-bind\n{init}\n/run/bubbler-init\n--clearenv\n--setenv\nTERM\ndumb\n\
          --setenv\nHOME\n/home/bubbler\n--setenv\nPATH\n/usr/bin:/home/bubbler/.local/bin\n--setenv\nXDG_RUNTIME_DIR\n{run}\n\
          --setenv\nUSER\nbubbler\n--setenv\nLOGNAME\nbubbler\n\
-         --\n/run/bubbler-init\n--socket-fd\n7\n--\n/usr/bin/true\n",
+         --\n/run/bubbler-init\n--socket-fd\n5\n--\n/usr/bin/true\n",
         ntsync = ntsync_bind(),
         home = home.display(),
         run = run.display(),
@@ -98,13 +99,21 @@ fn create_list_and_dry_run() {
     );
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.starts_with(expected_prefix), "{s}");
-    // Fd 3 is the info pipe and 4 the seccomp filter.
+    // The synthetic passwd and group are files a run writes to its own
+    // runtime directory and binds read-only, not descriptors: a nested
+    // sandbox has to be able to bind them again.
     assert!(
-        s.contains("--perms\n0644\n--ro-bind-data\n5\n/etc/passwd\n"),
+        s.contains(&format!(
+            "--ro-bind\n{}/etc-passwd\n/etc/passwd\n",
+            data.display()
+        )),
         "{s}"
     );
     assert!(
-        s.contains("--perms\n0644\n--ro-bind-data\n6\n/etc/group\n"),
+        s.contains(&format!(
+            "--ro-bind\n{}/etc-group\n/etc/group\n",
+            data.display()
+        )),
         "{s}"
     );
     assert!(s.ends_with(&expected_suffix), "{s}");
@@ -506,11 +515,14 @@ fn explain_puts_every_argument_under_the_node_it_came_from() {
     assert!(s.contains("    --add-seccomp-fd 5  (filter, "), "{s}");
     assert!(s.contains(&format!(", {ARCHES}")), "{s}");
     assert!(
-        s.contains("--ro-bind-data 8 /.flatpak-info  (generated file, "),
+        s.contains(&format!(
+            "--ro-bind {}/.flatpak-info /.flatpak-info  (generated file, ",
+            tmp.path().join("run/bubbler/t").display()
+        )),
         "{s}"
     );
     assert!(
-        s.contains("--socket-fd 9  (socket: the exec channel bubbler-init serves)"),
+        s.contains("--socket-fd 6  (socket: the exec channel bubbler-init serves)"),
         "{s}"
     );
     // Each granted node is named with the line it is on, `notify` too,
@@ -2760,6 +2772,115 @@ fn real_bwrap_etc_host_binds_the_hosts_whole_etc() {
     let mut lines = s.lines();
     assert_eq!(lines.next(), Some("bubbler"), "{s}");
     assert_eq!(lines.next(), Some("MISSING"), "{s}");
+}
+
+/// A nested `bwrap` that binds `path` over a fresh `/etc`, as the Steam
+/// Linux Runtime's pressure-vessel does with the outer `/etc/resolv.conf`.
+/// The symlinks are what lets the loader find `libc` in the new root.
+fn nested_bind(path: &str) -> String {
+    format!(
+        "/usr/bin/bwrap --ro-bind /usr /usr --symlink usr/bin /bin \
+         --symlink usr/lib /lib --symlink usr/lib64 /lib64 --tmpfs /etc \
+         --ro-bind {path} {path} --proc /proc --dev /dev -- /usr/bin/true \
+         || echo REBIND-FAILED {path}"
+    )
+}
+
+/// A sandbox that nests one of its own must be able to re-bind the files
+/// bubbler generates for it. bwrap's own `--ro-bind-data` cannot be
+/// re-bound: it binds a file it has already unlinked, and resolving the
+/// source of a nested bind through `/proc/self/fd` then fails with
+/// ENOENT, which is what stopped Steam's `steamwebhelper` from starting.
+#[test]
+fn real_bwrap_a_nested_bwrap_binds_the_generated_etc_files() {
+    if !require_bwrap() || !require_pasta() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let script = ["/etc/passwd", "/etc/group", "/etc/resolv.conf"]
+        .map(nested_bind)
+        .join("; ");
+    let out = bubbler_live(tmp.path(), &init)
+        .args([
+            "try",
+            "--profile",
+            "generic",
+            "--grant",
+            "network",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            &script,
+        ])
+        .output()
+        .unwrap();
+    let err = without_tool_warnings(&String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{err}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "", "{err}");
+}
+
+/// The same for `/.flatpak-info`, which `portals` generates: a nested
+/// sandbox binds it to tell its own children they are in a Flatpak.
+#[test]
+fn real_bwrap_a_nested_bwrap_binds_the_generated_flatpak_info() {
+    if !require_dbus() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let out = bubbler_dbus(tmp.path(), &init)
+        .args([
+            "try",
+            "--profile",
+            "generic",
+            "--grant",
+            "dbus",
+            "--grant",
+            "portals",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            &nested_bind("/.flatpak-info"),
+        ])
+        .output()
+        .unwrap();
+    let err = without_tool_warnings(&String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{err}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "", "{err}");
+}
+
+/// A generated file is the sandbox's to read and nobody's to change:
+/// `/etc` is a writable tmpfs, so what keeps the synthetic passwd from
+/// being rewritten is the read-only bind over it, not the directory.
+#[test]
+fn real_bwrap_a_generated_file_is_read_only_inside() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let out = bubbler_live(tmp.path(), &init)
+        .args([
+            "try",
+            "--profile",
+            "generic",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            "echo x > /etc/probe && echo ETC-WRITABLE; \
+             echo x > /etc/passwd && echo PASSWD-WRITABLE; echo DONE",
+        ])
+        .output()
+        .unwrap();
+    let err = without_tool_warnings(&String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{err}");
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        s.lines().collect::<Vec<_>>(),
+        ["ETC-WRITABLE", "DONE"],
+        "{s}"
+    );
 }
 
 /// Poll until `ready` holds, so the test never sleeps longer than it must.

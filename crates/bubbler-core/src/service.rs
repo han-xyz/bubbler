@@ -229,7 +229,7 @@ fn network(
         args.share_net();
     }
     match network::resolv_conf(cfg) {
-        Some(content) => args.ro_bind_data(content, Path::new("/etc/resolv.conf"), "0644"),
+        Some(content) => args.ro_bind_data(content, Path::new("/etc/resolv.conf")),
         None if cfg.mode == NetworkMode::Host => {
             let p = require_file(host, "network", PathBuf::from("/etc/resolv.conf"))?;
             args.ro_bind(&p, &p);
@@ -944,11 +944,7 @@ fn portals(
             service: "portals",
             reason: "requires dbus".to_owned(),
         })?;
-    args.ro_bind_data(
-        plan.flatpak_info.clone(),
-        Path::new(dbus::FLATPAK_INFO),
-        "0644",
-    );
+    args.ro_bind_data(plan.flatpak_info.clone(), Path::new(dbus::FLATPAK_INFO));
     // The identity file is also what makes gdk-pixbuf's glycin loaders
     // look for `flatpak-spawn` on the default path (glycin 2.1.5,
     // `libglycin-2.so`); without one GTK's icon loading fails an
@@ -1916,7 +1912,7 @@ mod tests {
         apply_all(services, env, &mut args, &host, &ctx)?;
         Ok(strs(&args.finish(
             &[OsString::from("x")],
-            &mut crate::launcher::DryRunAlloc::default(),
+            &mut crate::launcher::DryRunAlloc::new(PathBuf::from("/run/user/1000/bubbler/i")),
         )?))
     }
 
@@ -1944,7 +1940,7 @@ mod tests {
         apply_shares(services, shares, &env, &mut args, &host)?;
         Ok(strs(&args.finish(
             &[OsString::from("x")],
-            &mut crate::launcher::DryRunAlloc::default(),
+            &mut crate::launcher::DryRunAlloc::new(PathBuf::from("/run/user/1000/bubbler/i")),
         )?))
     }
 
@@ -2510,7 +2506,17 @@ mod tests {
             !has_seq(&a, &["--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf"]),
             "{a:?}"
         );
-        assert!(has_seq(&a, &["--perms", "0644", "--ro-bind-data"]), "{a:?}");
+        assert!(
+            has_seq(
+                &a,
+                &[
+                    "--ro-bind",
+                    "/run/user/1000/bubbler/i/etc-resolv.conf",
+                    "/etc/resolv.conf"
+                ]
+            ),
+            "{a:?}"
+        );
         // And it needs nothing of the host: an empty host tree is enough.
         assert!(argv(&[Service::Network(NetworkConfig::default())], &env(), &[]).is_ok());
     }
@@ -2526,7 +2532,17 @@ mod tests {
         });
         let a = argv(std::slice::from_ref(&svc), &env(), &[]).unwrap();
         assert!(a.contains(&"--share-net".to_string()), "{a:?}");
-        assert!(has_seq(&a, &["--perms", "0644", "--ro-bind-data"]), "{a:?}");
+        assert!(
+            has_seq(
+                &a,
+                &[
+                    "--ro-bind",
+                    "/run/user/1000/bubbler/i/etc-resolv.conf",
+                    "/etc/resolv.conf"
+                ]
+            ),
+            "{a:?}"
+        );
         assert!(
             !has_seq(&a, &["--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf"]),
             "{a:?}"
@@ -4757,11 +4773,14 @@ mod tests {
             &[],
         )
         .unwrap();
-        // Fd 3 is the info pipe, 4 and 5 the baseline passwd and group.
         assert!(
             has_seq(
                 &a,
-                &["--perms", "0644", "--ro-bind-data", "6", "/.flatpak-info"]
+                &[
+                    "--ro-bind",
+                    "/run/user/1000/bubbler/i/.flatpak-info",
+                    "/.flatpak-info"
+                ]
             ),
             "{a:?}"
         );
@@ -4977,7 +4996,9 @@ mod tests {
             &args
                 .finish(
                     &[OsString::from("x")],
-                    &mut crate::launcher::DryRunAlloc::default(),
+                    &mut crate::launcher::DryRunAlloc::new(PathBuf::from(
+                        "/run/user/1000/bubbler/i",
+                    )),
                 )
                 .unwrap(),
         );

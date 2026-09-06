@@ -280,7 +280,7 @@ file descriptor numbers are the ones a dry run prints.
 
     bwrap
 
-      baseline                                       138 arguments
+      baseline                                       134 arguments
         bwrap 0.12.0
         --unshare-all
         --die-with-parent
@@ -288,11 +288,11 @@ file descriptor numbers are the ones a dry run prints.
         --hostname bubbler
         --chdir /home/bubbler
         --info-fd 3  (pipe: bwrap reports the sandbox pid on it)
-        ... 129 more (--explain=full)
+        ... 125 more (--explain=full)
 
-      portals                         config.kdl:11  10 arguments
+      portals                         config.kdl:11  8 arguments
         --block-fd 4  (pipe: the sandbox waits on it until bubbler lets it go)
-        --perms 0644 --ro-bind-data 9 /.flatpak-info  (generated file, 69 bytes)
+        --ro-bind /run/user/1000/bubbler/ff/.flatpak-info /.flatpak-info  (generated file, 69 bytes)
         --bind /run/user/1000/doc/by-app/org.bubbler.ff /run/user/1000/doc
         rules: --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.FileChooser.*@/org/freedesktop/portal/desktop
                --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.OpenURI.*@/org/freedesktop/portal/desktop
@@ -311,18 +311,18 @@ file descriptor numbers are the ones a dry run prints.
         security-context: engine=org.bubbler app=org.bubbler.ff instance=bubbler-ff
         sidecar: bubbler-wl-proxy listener /run/user/1000/bubbler/ff/wayland → upstream /run/user/1000/bubbler/ff/wayland-context, gate paste, hides 40 privileged globals, compositor enforces too: yes
 
-      network                         config.kdl:7   5 arguments
-        --perms 0644 --ro-bind-data 8 /etc/resolv.conf  (generated file, 23 bytes)
+      network                         config.kdl:7   3 arguments
+        --ro-bind /run/user/1000/bubbler/ff/etc-resolv.conf /etc/resolv.conf  (generated file, 23 bytes)
         sidecar: pasta --config-net --foreground --quiet -t none -u none -T none -U none --map-host-loopback none --map-guest-addr none --dns-forward 169.254.1.1 --userns <userns> --pid <ready-fd> <child-pid>
 
       init                                           7 arguments
         --ro-bind /usr/lib/bubbler/bubbler-init /run/bubbler-init
-        -- /run/bubbler-init --socket-fd 10  (socket: the exec channel bubbler-init serves)
+        -- /run/bubbler-init --socket-fd 6  (socket: the exec channel bubbler-init serves)
 
       command                                        2 arguments
         -- firefox
 
-    233 arguments in 14 groups, 129 hidden (--explain=full); 8 D-Bus rules to the proxy (--proxy)
+    225 arguments in 14 groups, 125 hidden (--explain=full); 8 D-Bus rules to the proxy (--proxy)
 
 A group sits where the node's *first* argument is emitted and gathers every
 later one it contributed, whichever phase that came from: `network "host"` is
@@ -344,10 +344,10 @@ of which is in the argv, and `--dry-run` prints the sandbox's argv alone.
 `--explain --proxy` prints the D-Bus proxy's own argv and `--explain --wl-proxy`
 the Wayland proxy's.
 
-Every generated descriptor says what is behind it: the size of the seccomp
-filter and the architectures it carries, the size of a `--ro-bind-data`, which
-pipe an `--info-fd` or `--block-fd` is, and which socket the supervisor is
-handed. A node whose grant
+Every generated descriptor and file says what is behind it: the size of the
+seccomp filter and the architectures it carries, the size of a generated file
+and the path in the run's runtime directory it is bound from, which pipe an
+`--info-fd` or `--block-fd` is, and which socket the supervisor is handed. A node whose grant
 is D-Bus rules rather than bwrap arguments lists those rules instead — under
 `rule-only:` when it contributes nothing else, `rules:` when it also has
 arguments. A `seccomp` node reads the same way, since what it changed is not

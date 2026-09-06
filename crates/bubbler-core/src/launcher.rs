@@ -10,7 +10,7 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -87,21 +87,39 @@ const NET_PROXY_STOP: Duration = Duration::from_secs(5);
 /// run goes on without a pid to signal.
 const SUPERVISOR_WAIT: Duration = Duration::from_secs(2);
 
-/// Allocator for `--dry-run`: numbers every fd 3, 4, ... without creating
-/// anything.
+/// The name a generated file takes in the run's runtime directory: the
+/// path it is bound at inside the sandbox with its separators flattened,
+/// so `--explain` names the file a run would write and no two
+/// destinations collide on one name.
+pub(crate) fn data_name(dest: &Path) -> OsString {
+    let mut name = OsString::new();
+    for part in dest.components() {
+        if let Component::Normal(part) = part {
+            if !name.is_empty() {
+                name.push("-");
+            }
+            name.push(part);
+        }
+    }
+    name
+}
+
+/// Allocator for `--dry-run`: numbers every fd 3, 4, ... and names each
+/// generated file where a run would write it, without creating anything.
 #[derive(Debug)]
 pub struct DryRunAlloc {
     next: u32,
-}
-
-impl Default for DryRunAlloc {
-    /// Numbering starts above the process's own stdio.
-    fn default() -> Self {
-        Self { next: 2 }
-    }
+    dir: PathBuf,
 }
 
 impl DryRunAlloc {
+    /// `dir` is the run's runtime directory, which is where a real run
+    /// writes the generated files. Fd numbering starts above the
+    /// process's own stdio.
+    pub fn new(dir: PathBuf) -> Self {
+        Self { next: 2, dir }
+    }
+
     fn bump(&mut self) -> io::Result<OsString> {
         self.next += 1;
         Ok(OsString::from(self.next.to_string()))
@@ -111,6 +129,9 @@ impl DryRunAlloc {
 impl FdAllocator for DryRunAlloc {
     fn data(&mut self, _content: &[u8]) -> io::Result<OsString> {
         self.bump()
+    }
+    fn file(&mut self, dest: &Path, _content: &[u8]) -> io::Result<OsString> {
+        Ok(self.dir.join(data_name(dest)).into_os_string())
     }
     fn init_socket(&mut self) -> io::Result<OsString> {
         self.bump()
@@ -155,26 +176,36 @@ pub struct RealAlloc {
     /// Write end of the pipe the sandbox is blocked on. Writing to it or
     /// dropping it is what lets the sandbox exec its command.
     pub block_write: Option<OwnedFd>,
+    /// The run's runtime directory, where the generated files go.
+    dir: PathBuf,
+    /// The generated files written there so far, removed when this
+    /// allocator drops. It outlives the sandbox it built the argv for —
+    /// a bind whose source is unlinked is exactly what this replaced.
+    written: Vec<PathBuf>,
+}
+
+impl Drop for RealAlloc {
+    fn drop(&mut self) {
+        for path in self.written.drain(..) {
+            // Nothing to report: the run is over, and a file left behind
+            // is overwritten by the next start of the same instance.
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 impl RealAlloc {
-    /// Allocate around an already inherited control socket fd.
-    pub fn new(socket: RawFd) -> Self {
-        Self {
-            fds: Vec::new(),
-            socket: Some(socket),
-            listen: None,
-            listen_fd: None,
-            ready_read: None,
-            info_read: None,
-            info_write: None,
-            block_write: None,
-        }
+    /// Allocate around an already inherited control socket fd. `dir` is
+    /// the run's runtime directory, which the caller has created.
+    pub fn new(socket: RawFd, dir: PathBuf) -> Self {
+        let mut a = Self::sidecar(dir);
+        a.socket = Some(socket);
+        a
     }
 
-    /// Allocate for a sidecar sandbox: data files and a ready pipe, but
-    /// no control socket to hand out.
-    pub fn sidecar() -> Self {
+    /// Allocate for a sidecar sandbox: generated files and a ready pipe,
+    /// but no control socket to hand out.
+    pub fn sidecar(dir: PathBuf) -> Self {
         Self {
             fds: Vec::new(),
             socket: None,
@@ -184,16 +215,17 @@ impl RealAlloc {
             info_read: None,
             info_write: None,
             block_write: None,
+            dir,
+            written: Vec::new(),
         }
     }
 
     /// Allocate for a sidecar that accepts on a socket bubbler has
     /// already bound and listened on, which it inherits by number.
-    pub fn sidecar_listening(listener: OwnedFd) -> Self {
-        Self {
-            listen: Some(listener),
-            ..Self::sidecar()
-        }
+    pub fn sidecar_listening(listener: OwnedFd, dir: PathBuf) -> Self {
+        let mut a = Self::sidecar(dir);
+        a.listen = Some(listener);
+        a
     }
 
     /// Keep `fd` open for the child and report the number it will see.
@@ -289,6 +321,24 @@ impl FdAllocator for RealAlloc {
         f.write_all(content)?;
         f.seek(SeekFrom::Start(0))?;
         Ok(self.keep(f.into()))
+    }
+
+    /// `O_NOFOLLOW` so a link cannot move the write out of the runtime
+    /// directory, and the mode is set rather than left to the caller's
+    /// umask, so what the sandbox sees does not depend on how bubbler
+    /// was started. bwrap takes the destination's permissions from the
+    /// source, so this is the mode `/etc/passwd` has inside.
+    fn file(&mut self, dest: &Path, content: &[u8]) -> io::Result<OsString> {
+        let path = self.dir.join(data_name(dest));
+        let mut f = std::fs::File::from(rustix::fs::open(
+            &path,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH,
+        )?);
+        rustix::fs::fchmod(&f, Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH)?;
+        f.write_all(content)?;
+        self.written.push(path.clone());
+        Ok(path.into_os_string())
     }
 
     fn init_socket(&mut self) -> io::Result<OsString> {
@@ -427,7 +477,8 @@ fn explain_on(
     host: &dyn Host,
 ) -> Result<Vec<Explained>, LaunchError> {
     let (args, command) = build_args_on(env, inst, command, ctty, host)?;
-    args.finish_explained(command, &mut DryRunAlloc::default())
+    let mut alloc = DryRunAlloc::new(instance_runtime_dir(env, &inst.name));
+    args.finish_explained(command, &mut alloc)
 }
 
 /// The builder and the command behind [`build_argv`], before the fds are
@@ -592,7 +643,7 @@ pub fn explain_proxy(env: &Env, inst: &Instance) -> Result<Option<Vec<Explained>
         .map(|_| dbus::guarded_host_a11y_bus(&RealHost, env))
         .transpose()?;
     let dir = instance_runtime_dir(env, &inst.name);
-    let mut alloc = DryRunAlloc::default();
+    let mut alloc = DryRunAlloc::new(dir.clone());
     let (args, command) = proxy_args(
         env,
         &plan,
@@ -644,11 +695,7 @@ fn proxy_args(
     // The proxy reads this to decide it is talking for a sandboxed app;
     // without `portals` it is only the `[Application]` section.
     args.tag(Origin::Identity);
-    args.ro_bind_data(
-        plan.flatpak_info.clone(),
-        Path::new(dbus::FLATPAK_INFO),
-        "0644",
-    );
+    args.ro_bind_data(plan.flatpak_info.clone(), Path::new(dbus::FLATPAK_INFO));
     // An overriding binary is not on the sandbox's `PATH`, so it is bound
     // in at its own path; the packaged proxy needs no bind.
     if env.proxy_override.is_some() {
@@ -697,7 +744,7 @@ pub fn explain_wayland_proxy(
     ) else {
         return Ok(None);
     };
-    let mut alloc = DryRunAlloc::default();
+    let mut alloc = DryRunAlloc::new(instance_runtime_dir(env, &inst.name));
     let (args, command) = wl_proxy_args(env, &plan, node, &RealHost, &mut alloc)?;
     Ok(Some(args.finish_plain_explained(&command, &mut alloc)?))
 }
@@ -1022,7 +1069,7 @@ pub fn start_wayland(
     };
     let listener = bind_listener(&plan.listener)?;
     let socket = FileGuard(plan.listener.clone());
-    let mut alloc = RealAlloc::sidecar_listening(listener.into());
+    let mut alloc = RealAlloc::sidecar_listening(listener.into(), dir.to_path_buf());
     let argv = wl_proxy_argv(env, &plan, node, host, &mut alloc)?;
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     spawning(&alloc.intended())?;
@@ -1152,7 +1199,7 @@ pub fn start_proxy(
     // The proxy gets this directory and nothing else of the instance's
     // runtime state, so it is created here rather than bound from above.
     mkdir_private(&dbus::socket_dir(dir))?;
-    let mut alloc = RealAlloc::sidecar();
+    let mut alloc = RealAlloc::sidecar(dir.to_path_buf());
     let argv = proxy_argv(
         env,
         plan,
@@ -2601,7 +2648,7 @@ pub fn run(
         UnixListener::bind(&sock_path).map_err(|e| LaunchError::Io(sock_path.clone(), e))?;
     let _socket_guard = FileGuard(sock_path.clone());
     let inherited = fcntl_dupfd_cloexec(listener.as_fd(), 3).map_err(io_at)?;
-    let mut alloc = RealAlloc::new(inherited.as_raw_fd());
+    let mut alloc = RealAlloc::new(inherited.as_raw_fd(), dir.clone());
     // A run with nothing to run must fail before a sidecar is started.
     resolve_command(inst, command)?;
     // Before the argv is built, so the proxy's socket is there for bwrap
@@ -2896,6 +2943,21 @@ mod tests {
 
     /// An `Env` whose `$BUBBLER_INIT` points at a stand-in binary, so
     /// argv building does not depend on where the test binary lives.
+    /// A dry run's allocator pointed where a real run of the instance
+    /// [`inst`] builds would write its generated files, so an argv built
+    /// here and one built by the launcher itself name the same paths.
+    fn dry(e: &Env) -> DryRunAlloc {
+        DryRunAlloc::new(instance_runtime_dir(e, "t"))
+    }
+
+    /// The directory a real allocator gets in a test that allocates
+    /// descriptors and no generated file: one that is not there, so a
+    /// call to [`FdAllocator::file`] would fail rather than write
+    /// somewhere real.
+    fn no_data_dir() -> PathBuf {
+        PathBuf::from("/nonexistent/bubbler")
+    }
+
     fn env(tmp: &Path) -> Env {
         let init = tmp.join("bubbler-init");
         std::fs::write(&init, b"").unwrap();
@@ -2969,7 +3031,7 @@ mod tests {
             e,
             &inst(tmp, kdl),
             None,
-            &mut DryRunAlloc::default(),
+            &mut dry(e),
             false,
             &device_host(tmp),
         )
@@ -3017,7 +3079,7 @@ mod tests {
             &e,
             &inst(tmp.path(), kdl),
             None,
-            &mut DryRunAlloc::default(),
+            &mut dry(&e),
             false,
             &share_host(tmp.path()),
         )
@@ -3050,9 +3112,10 @@ mod tests {
         assert_eq!(
             line(&items, Origin::Service(1)),
             format!(
-                "--block-fd 4 --perms 0644 --ro-bind-data 8 /.flatpak-info \
+                "--block-fd 4 --ro-bind {run}/bubbler/t/.flatpak-info /.flatpak-info \
                  --overlay-src /usr/bin --tmp-overlay /usr/bin \
                  --ro-bind {init} /usr/bin/flatpak-spawn --remount-ro /usr/bin",
+                run = run.display(),
                 init = tmp.path().join("bubbler-init").display()
             )
         );
@@ -3074,7 +3137,7 @@ mod tests {
         assert_eq!(
             line(&items, Origin::Init),
             format!(
-                "--ro-bind {init} /run/bubbler-init -- /run/bubbler-init --socket-fd 9",
+                "--ro-bind {init} /run/bubbler-init -- /run/bubbler-init --socket-fd 6",
                 init = tmp.path().join("bubbler-init").display()
             )
         );
@@ -3276,7 +3339,7 @@ mod tests {
     }
 
     #[test]
-    fn a_generated_fd_says_what_is_behind_it() {
+    fn a_generated_fd_or_file_says_what_is_behind_it() {
         let tmp = tempfile::tempdir().unwrap();
         let e = env(tmp.path());
         let items = explained(tmp.path(), &e, "command \"true\"");
@@ -3295,7 +3358,10 @@ mod tests {
             note("--add-seccomp-fd").starts_with("filter, "),
             "{items:?}"
         );
-        assert_eq!(note("--perms"), "generated file, 88 bytes");
+        let generated = items
+            .iter()
+            .find_map(|i| i.note.clone().filter(|n| n.starts_with("generated file")));
+        assert_eq!(generated.as_deref(), Some("generated file, 88 bytes"));
         assert_eq!(note("--"), "socket: the exec channel bubbler-init serves");
     }
 
@@ -3314,7 +3380,10 @@ mod tests {
         assert_eq!(items[0].origin, Origin::Baseline);
         assert_eq!(
             line(&items, Origin::Identity),
-            "--perms 0644 --ro-bind-data 5 /.flatpak-info"
+            format!(
+                "--ro-bind {}/bubbler/t/.flatpak-info /.flatpak-info",
+                tmp.path().join("run").display()
+            )
         );
         // One element per line: the sidecar's argv is its rule list, and
         // each rule is grouped under the node that asked for it.
@@ -3395,7 +3464,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let e = env(tmp.path());
         let i = inst(tmp.path(), "command \"foot\" \"-e\" \"fish\"");
-        let a = build_argv(&e, &i, None, &mut DryRunAlloc::default(), false).unwrap();
+        let a = build_argv(&e, &i, None, &mut dry(&e), false).unwrap();
         assert_eq!(
             &a[a.len() - 4..],
             &[
@@ -3405,14 +3474,7 @@ mod tests {
                 "fish".into()
             ]
         );
-        let a = build_argv(
-            &e,
-            &i,
-            Some(&[OsString::from("ls")]),
-            &mut DryRunAlloc::default(),
-            false,
-        )
-        .unwrap();
+        let a = build_argv(&e, &i, Some(&[OsString::from("ls")]), &mut dry(&e), false).unwrap();
         assert_eq!(&a[a.len() - 2..], &[OsString::from("--"), "ls".into()]);
     }
 
@@ -3421,7 +3483,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let e = env(tmp.path());
         let i = inst(tmp.path(), "command \"foot\"");
-        let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default(), false).unwrap());
+        let a = strs(&build_argv(&e, &i, None, &mut dry(&e), false).unwrap());
         let init = tmp.path().join("bubbler-init").display().to_string();
         assert!(
             a.windows(3)
@@ -3431,7 +3493,7 @@ mod tests {
         // 6 to the baseline passwd and group.
         assert_eq!(
             &a[a.len() - 6..],
-            &["--", INIT_INSIDE, "--socket-fd", "7", "--", "foot"]
+            &["--", INIT_INSIDE, "--socket-fd", "5", "--", "foot"]
         );
     }
 
@@ -3442,7 +3504,7 @@ mod tests {
         e.init_override = Some(tmp.path().join("gone"));
         let i = inst(tmp.path(), "command \"foot\"");
         assert!(matches!(
-            build_argv(&e, &i, None, &mut DryRunAlloc::default(), false),
+            build_argv(&e, &i, None, &mut dry(&e), false),
             Err(LaunchError::MissingResource {
                 service: "init",
                 ..
@@ -3458,7 +3520,7 @@ mod tests {
             tmp.path(),
             "env MOZ_ENABLE_WAYLAND=\"1\"\ncommand \"firefox\"",
         );
-        let a = build_argv(&e, &i, None, &mut DryRunAlloc::default(), false).unwrap();
+        let a = build_argv(&e, &i, None, &mut dry(&e), false).unwrap();
         let s = strs(&a);
         assert!(
             s.windows(3)
@@ -3472,11 +3534,11 @@ mod tests {
         let e = env(tmp.path());
         let i = inst(tmp.path(), "");
         assert!(matches!(
-            build_argv(&e, &i, None, &mut DryRunAlloc::default(), false),
+            build_argv(&e, &i, None, &mut dry(&e), false),
             Err(LaunchError::Config(ConfigError::MissingCommand))
         ));
         assert!(matches!(
-            build_argv(&e, &i, Some(&[]), &mut DryRunAlloc::default(), false),
+            build_argv(&e, &i, Some(&[]), &mut dry(&e), false),
             Err(LaunchError::Config(ConfigError::MissingCommand))
         ));
     }
@@ -3658,7 +3720,7 @@ mod tests {
             .unwrap();
         let handle = WaylandHandle {
             child,
-            alloc: RealAlloc::sidecar(),
+            alloc: RealAlloc::sidecar(no_data_dir()),
             _close: None,
             _socket: FileGuard(socket.clone()),
             _context: None,
@@ -3720,7 +3782,7 @@ mod tests {
         );
         let handle = WaylandHandle {
             child,
-            alloc: RealAlloc::sidecar(),
+            alloc: RealAlloc::sidecar(no_data_dir()),
             _close: None,
             _socket: FileGuard(socket.clone()),
             _context: None,
@@ -3747,7 +3809,7 @@ mod tests {
         // the installed layout's argv and not this build tree's.
         let (file, _, _) = crate::host::fake::types();
         let host = FakeHost::default().with(wayland::PROXY_BIN, file);
-        let argv = wl_proxy_argv(&e, &plan, 0, &host, &mut DryRunAlloc::default()).unwrap();
+        let argv = wl_proxy_argv(&e, &plan, 0, &host, &mut dry(&e)).unwrap();
         assert_eq!(
             strs(&argv),
             vec![
@@ -3816,7 +3878,7 @@ mod tests {
         let plan = ProxyPlan::fallback(dir, "/run/user/1000/wayland-1".into(), Clipboard::Open);
         let (file, _, _) = crate::host::fake::types();
         let host = FakeHost::default().with(wayland::PROXY_BIN, file);
-        let argv = strs(&wl_proxy_argv(&e, &plan, 0, &host, &mut DryRunAlloc::default()).unwrap());
+        let argv = strs(&wl_proxy_argv(&e, &plan, 0, &host, &mut dry(&e)).unwrap());
         let tail: Vec<&str> = argv
             .iter()
             .skip_while(|a| *a != "--")
@@ -3869,7 +3931,7 @@ mod tests {
         let plan = ProxyPlan::context(Path::new("/run/user/1000/bubbler/t"), Clipboard::Paste);
         let (file, _, _) = crate::host::fake::types();
         let host = FakeHost::default().with("/build/bubbler-wl-proxy", file);
-        let argv = strs(&wl_proxy_argv(&e, &plan, 0, &host, &mut DryRunAlloc::default()).unwrap());
+        let argv = strs(&wl_proxy_argv(&e, &plan, 0, &host, &mut dry(&e)).unwrap());
         assert!(
             argv.windows(3).any(|w| w
                 == [
@@ -3881,13 +3943,7 @@ mod tests {
         );
         assert!(argv.contains(&"/build/bubbler-wl-proxy".to_owned()));
         assert!(matches!(
-            wl_proxy_argv(
-                &e,
-                &plan,
-                0,
-                &FakeHost::default(),
-                &mut DryRunAlloc::default()
-            ),
+            wl_proxy_argv(&e, &plan, 0, &FakeHost::default(), &mut dry(&e)),
             Err(LaunchError::MissingResource {
                 service: "wayland",
                 ..
@@ -3913,7 +3969,7 @@ mod tests {
             },
             Path::new("/run/user/1000/bubbler/t"),
             &FakeHost::default(),
-            &mut DryRunAlloc::default(),
+            &mut DryRunAlloc::new(PathBuf::from("/run/user/1000/bubbler/t")),
         )
         .unwrap();
         assert_eq!(
@@ -3957,10 +4013,8 @@ mod tests {
                 "--bind",
                 "/run/user/1000/bubbler/t/dbus",
                 "/run/user/1000/bubbler/t/dbus",
-                "--perms",
-                "0644",
-                "--ro-bind-data",
-                "5",
+                "--ro-bind",
+                "/run/user/1000/bubbler/t/.flatpak-info",
                 "/.flatpak-info",
                 "--clearenv",
                 "--",
@@ -3998,7 +4052,7 @@ mod tests {
                 },
                 Path::new("/run/user/1000/bubbler/t"),
                 &FakeHost::default(),
-                &mut DryRunAlloc::default(),
+                &mut dry(&e),
             )
             .unwrap(),
         );
@@ -4062,7 +4116,7 @@ mod tests {
                 },
                 Path::new("/run/user/1000/bubbler/t"),
                 &FakeHost::default(),
-                &mut DryRunAlloc::default(),
+                &mut dry(&e),
             )
             .unwrap(),
         );
@@ -4134,7 +4188,7 @@ mod tests {
                 },
                 Path::new("/run/user/1000/bubbler/t"),
                 &FakeHost::default(),
-                &mut DryRunAlloc::default(),
+                &mut dry(&e),
             )
             .unwrap(),
         );
@@ -4334,7 +4388,7 @@ mod tests {
                 },
                 dir,
                 &FakeHost::default(),
-                &mut DryRunAlloc::default(),
+                &mut dry(&e),
             )
             .unwrap(),
         );
@@ -4412,7 +4466,7 @@ mod tests {
                 },
                 Path::new("/run/user/1000/bubbler/t"),
                 &FakeHost::default(),
-                &mut DryRunAlloc::default(),
+                &mut dry(&e),
             )
             .unwrap(),
         );
@@ -4441,7 +4495,7 @@ mod tests {
                 },
                 Path::new("/run/user/1000/bubbler/t"),
                 &host,
-                &mut DryRunAlloc::default(),
+                &mut dry(&e),
             )
             .unwrap(),
         );
@@ -4464,7 +4518,7 @@ mod tests {
                 },
                 Path::new("/run/user/1000/bubbler/t"),
                 &FakeHost::default(),
-                &mut DryRunAlloc::default(),
+                &mut dry(&e),
             ),
             Err(LaunchError::MissingResource {
                 service: "dbus",
@@ -4478,7 +4532,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let e = env(tmp.path());
         let i = inst(tmp.path(), "dbus\nportals\ncommand \"x\"");
-        let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default(), false).unwrap());
+        let a = strs(&build_argv(&e, &i, None, &mut dry(&e), false).unwrap());
         let bus = tmp.path().join("run/bubbler/t/bus").display().to_string();
         let inside = tmp.path().join("run/bus").display().to_string();
         assert!(
@@ -4503,11 +4557,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let e = env(tmp.path());
         let i = inst(tmp.path(), "dbus\nportals\ncommand \"x\"");
-        let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default(), false).unwrap());
+        let a = strs(&build_argv(&e, &i, None, &mut dry(&e), false).unwrap());
         assert!(a.windows(2).any(|w| w == ["--block-fd", "4"]), "{a:?}");
         for kdl in ["dbus\ncommand \"x\"", "command \"x\""] {
             let i = inst(tmp.path(), kdl);
-            let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default(), false).unwrap());
+            let a = strs(&build_argv(&e, &i, None, &mut dry(&e), false).unwrap());
             assert!(!a.contains(&"--block-fd".to_string()), "{kdl}: {a:?}");
         }
     }
@@ -4669,7 +4723,7 @@ mod tests {
 
     #[test]
     fn dry_run_alloc_numbers_every_fd_from_three() {
-        let mut alloc = DryRunAlloc::default();
+        let mut alloc = DryRunAlloc::new(PathBuf::from("/run/user/1000/bubbler/t"));
         assert_eq!(alloc.data(b"a").unwrap(), OsString::from("3"));
         assert_eq!(alloc.data(b"b").unwrap(), OsString::from("4"));
         assert_eq!(alloc.init_socket().unwrap(), OsString::from("5"));
@@ -4685,7 +4739,7 @@ mod tests {
         // be, whenever the process runs this test alone.
         let socket = std::fs::File::open("/dev/null").unwrap();
         let number = socket.as_raw_fd();
-        let mut alloc = RealAlloc::new(number);
+        let mut alloc = RealAlloc::new(number, no_data_dir());
         assert_eq!(alloc.intended(), vec![number]);
         alloc.data(b"a").unwrap();
         alloc.block_pipe().unwrap();
@@ -4716,7 +4770,7 @@ mod tests {
     #[test]
     fn real_alloc_block_pipe_hands_the_sandbox_the_read_end() {
         use std::io::Read;
-        let mut alloc = RealAlloc::new(7);
+        let mut alloc = RealAlloc::new(7, no_data_dir());
         let fd = alloc.block_pipe().unwrap();
         let read = alloc.fds.last().expect("the read end is inherited");
         assert_eq!(fd, OsString::from(read.as_raw_fd().to_string()));
@@ -4747,7 +4801,7 @@ mod tests {
     #[test]
     fn real_alloc_data_is_readable_from_the_start_and_inheritable_for_one_spawn() {
         use std::io::Read;
-        let mut alloc = RealAlloc::new(7);
+        let mut alloc = RealAlloc::new(7, no_data_dir());
         let fd = alloc.data(b"hello").unwrap();
         assert_eq!(alloc.init_socket().unwrap(), OsString::from("7"));
         assert_eq!(alloc.fds.len(), 1);
@@ -4772,7 +4826,7 @@ mod tests {
     #[test]
     fn real_alloc_ready_pipe_keeps_the_read_end() {
         use std::io::Read;
-        let mut alloc = RealAlloc::new(7);
+        let mut alloc = RealAlloc::new(7, no_data_dir());
         let fd = alloc.ready_pipe().unwrap();
         let write = alloc.fds.last().expect("the write end is inherited");
         assert_eq!(fd, OsString::from(write.as_raw_fd().to_string()));
@@ -4788,7 +4842,7 @@ mod tests {
     #[test]
     fn real_alloc_info_pipe_splits_the_ends() {
         use std::io::Read;
-        let mut alloc = RealAlloc::new(7);
+        let mut alloc = RealAlloc::new(7, no_data_dir());
         let fd = alloc.info_pipe().unwrap();
         let write = alloc.info_write.take().expect("the write end is inherited");
         assert_eq!(fd, OsString::from(write.as_raw_fd().to_string()));
@@ -4861,7 +4915,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let e = env(tmp.path());
         let i = inst(tmp.path(), "command \"foot\"");
-        let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default(), false).unwrap());
+        let a = strs(&build_argv(&e, &i, None, &mut dry(&e), false).unwrap());
         // Straight after the info fd, and before the filesystem phase.
         assert_eq!(
             &a[7..12],
@@ -4870,7 +4924,7 @@ mod tests {
         );
         assert_eq!(
             &a[a.len() - 6..],
-            &["--", INIT_INSIDE, "--socket-fd", "7", "--", "foot"]
+            &["--", INIT_INSIDE, "--socket-fd", "5", "--", "foot"]
         );
     }
 
@@ -4879,7 +4933,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let e = env(tmp.path());
         let i = inst(tmp.path(), "seccomp { disable }\ncommand \"foot\"");
-        let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default(), false).unwrap());
+        let a = strs(&build_argv(&e, &i, None, &mut dry(&e), false).unwrap());
         assert!(!a.iter().any(|x| x == "--add-seccomp-fd"), "{a:?}");
     }
 
@@ -4912,7 +4966,7 @@ mod tests {
                 names.join(" ")
             ),
         );
-        let a = strs(&build_argv(&e, &i, None, &mut DryRunAlloc::default(), false).unwrap());
+        let a = strs(&build_argv(&e, &i, None, &mut dry(&e), false).unwrap());
         assert!(!a.iter().any(|x| x == "--add-seccomp-fd"), "{a:?}");
     }
 

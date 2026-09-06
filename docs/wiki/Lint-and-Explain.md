@@ -112,7 +112,8 @@ bubbler try --profile firefox --explain
 
 Neither launches anything or creates a runtime directory. `--explain` shows,
 per group, the config line, the argument count, what is behind each generated
-descriptor (seccomp filter size and architectures, `--ro-bind-data` size,
+descriptor and file (seccomp filter size and architectures, the size of a
+generated file and where in the runtime directory it is bound from,
 which pipe an `--info-fd`/`--block-fd` is), and grants that are not bwrap
 arguments: D-Bus `rules:`, `rule-only:` for nodes contributing nothing else,
 which socket a `wayland` node binds (`security-context:` plus the
@@ -125,9 +126,9 @@ the nft ruleset the run installs. A nested `x11` needs no such line: the
 manager's name, both arguments of `bubbler-init` rather than of bwrap.
 
 ```
-  portals                         config.kdl:11  10 arguments
+  portals                         config.kdl:11  8 arguments
     --block-fd 4  (pipe: the sandbox waits on it until bubbler lets it go)
-    --perms 0644 --ro-bind-data 9 /.flatpak-info  (generated file, 69 bytes)
+    --ro-bind /run/user/1000/bubbler/ff/.flatpak-info /.flatpak-info  (generated file, 69 bytes)
     --bind /run/user/1000/doc/by-app/org.bubbler.ff /run/user/1000/doc
     rules: --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.FileChooser.*@/org/freedesktop/portal/desktop
            ...
@@ -140,7 +141,7 @@ manager's name, both arguments of `bubbler-init` rather than of bwrap.
     sidecar: bubbler-wl-proxy listener /run/user/1000/bubbler/ff/wayland → upstream /run/user/1000/bubbler/ff/wayland-context, gate paste, hides 40 privileged globals, compositor enforces too: yes
   init                                           7 arguments
     --ro-bind /usr/lib/bubbler/bubbler-init /run/bubbler-init
-    -- /run/bubbler-init --socket-fd 10  (socket: the exec channel bubbler-init serves)
+    -- /run/bubbler-init --socket-fd 6  (socket: the exec channel bubbler-init serves)
   x11 wm="openbox"                config.kdl:5   21 arguments
     --setenv DISPLAY :0
     --x11 /usr/bin/Xwayland :0 -noreset -nolisten tcp -nolisten local -nolisten unix -ac -hidpi -decorate -geometry 1280x720 --  (nested Xwayland, started by bubbler-init on the first X connection; -listenfd is added at run time)

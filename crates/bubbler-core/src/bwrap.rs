@@ -74,13 +74,9 @@ enum Kind {
     /// The same, with what an explanation adds where the paths alone do
     /// not say what the operation is there for.
     Noted { args: Vec<OsString>, note: String },
-    /// Content written to an fd by the allocator at `finish` time and
-    /// bound read-only at `dest` with `mode`.
-    Data {
-        content: Vec<u8>,
-        dest: PathBuf,
-        mode: OsString,
-    },
+    /// Content written to a host file by the allocator at `finish` time
+    /// and bound read-only at `dest`.
+    Data { content: Vec<u8>, dest: PathBuf },
     /// `--info-fd` with the fd the allocator opens at `finish` time.
     InfoFd,
     /// `--block-fd` with the fd the allocator opens at `finish` time.
@@ -113,11 +109,19 @@ pub const INIT_INSIDE: &str = "/run/bubbler-init";
 // (`getconf PATH`), and `/bin` is a symlink to `usr/bin` here.
 pub const FLATPAK_SPAWN_INSIDE: &str = "/usr/bin/flatpak-spawn";
 
-/// Turns generated content and channels into the fd numbers bwrap is told
-/// to read them from. `--dry-run` counts, a real run creates the fds.
+/// Turns generated content and channels into the fd numbers and host
+/// paths bwrap is told to read them from. `--dry-run` counts and names,
+/// a real run creates the fds and writes the files.
 pub trait FdAllocator {
-    /// Fd holding `content`, for a `--ro-bind-data`.
+    /// Fd holding `content`, for an `--add-seccomp-fd`.
     fn data(&mut self, content: &[u8]) -> io::Result<OsString>;
+    /// Host path of a file holding `content`, for a `--ro-bind` at
+    /// `dest`. A file and not bwrap's own `--ro-bind-data`, which binds a
+    /// file it has already unlinked: a sandbox that nests one of its own
+    /// cannot re-bind such a destination (the nested bwrap resolves its
+    /// source through `/proc/self/fd`, and an unlinked dentry there is
+    /// ENOENT), which is what kept Steam's runtime from starting.
+    fn file(&mut self, dest: &Path, content: &[u8]) -> io::Result<OsString>;
     /// Fd of the listening control socket `bubbler-init` serves.
     fn init_socket(&mut self) -> io::Result<OsString>;
     /// Fd a sidecar reports readiness on; the allocator keeps the other end.
@@ -331,7 +335,6 @@ impl BwrapArgs {
                 kind: Kind::Data {
                     content,
                     dest: dest.into(),
-                    mode: "0644".into(),
                 },
             });
         }
@@ -827,15 +830,14 @@ impl BwrapArgs {
         push(&mut self.binds, self.origin, [o("--remount-ro"), bin]);
     }
 
-    /// Bind `content` read-only at `dest` with `mode` (phase 4). The bytes
-    /// are handed to the fd allocator in `finish`.
-    pub fn ro_bind_data(&mut self, content: Vec<u8>, dest: &Path, mode: &str) {
+    /// Bind `content` read-only at `dest` (phase 4). The bytes are handed
+    /// to the allocator in `finish`, which writes them to a host file.
+    pub fn ro_bind_data(&mut self, content: Vec<u8>, dest: &Path) {
         self.binds.push(Item {
             origin: self.origin,
             kind: Kind::Data {
                 content,
                 dest: dest.to_path_buf(),
-                mode: mode.into(),
             },
         });
     }
@@ -996,21 +998,10 @@ impl BwrapArgs {
             let (args, note) = match item.kind {
                 Kind::Args(a) => (a, None),
                 Kind::Noted { args, note } => (args, Some(note)),
-                Kind::Data {
-                    content,
-                    dest,
-                    mode,
-                } => {
-                    let fd = alloc.data(&content).map_err(LaunchError::Data)?;
-                    // `--perms` applies to the next operation only.
+                Kind::Data { content, dest } => {
+                    let src = alloc.file(&dest, &content).map_err(LaunchError::Data)?;
                     (
-                        vec![
-                            "--perms".into(),
-                            mode,
-                            "--ro-bind-data".into(),
-                            fd,
-                            dest.into_os_string(),
-                        ],
+                        vec!["--ro-bind".into(), src, dest.into_os_string()],
                         Some(format!("generated file, {} bytes", content.len())),
                     )
                 }
@@ -1110,9 +1101,22 @@ mod tests {
         }
     }
 
+    /// Where a run would write its generated files, so an argv assertion
+    /// names the same path a dry run of a real instance would.
+    const DATA_DIR: &str = "/run/user/1000/bubbler/i";
+
+    fn data_path(dest: &Path) -> OsString {
+        Path::new(DATA_DIR)
+            .join(crate::launcher::data_name(dest))
+            .into_os_string()
+    }
+
     impl FdAllocator for Counter {
         fn data(&mut self, _content: &[u8]) -> io::Result<OsString> {
             self.bump()
+        }
+        fn file(&mut self, dest: &Path, _content: &[u8]) -> io::Result<OsString> {
+            Ok(data_path(dest))
         }
         fn init_socket(&mut self) -> io::Result<OsString> {
             self.bump()
@@ -1142,6 +1146,10 @@ mod tests {
             self.seen.push(content.to_vec());
             self.next.bump()
         }
+        fn file(&mut self, dest: &Path, content: &[u8]) -> io::Result<OsString> {
+            self.seen.push(content.to_vec());
+            Ok(data_path(dest))
+        }
         fn init_socket(&mut self) -> io::Result<OsString> {
             self.next.bump()
         }
@@ -1163,6 +1171,9 @@ mod tests {
 
     impl FdAllocator for Failing {
         fn data(&mut self, _content: &[u8]) -> io::Result<OsString> {
+            Err(io::Error::other("nope"))
+        }
+        fn file(&mut self, _dest: &Path, _content: &[u8]) -> io::Result<OsString> {
             Err(io::Error::other("nope"))
         }
         fn init_socket(&mut self) -> io::Result<OsString> {
@@ -1226,15 +1237,11 @@ mod tests {
                 "67108864",
                 "--tmpfs",
                 "/etc",
-                "--perms",
-                "0644",
-                "--ro-bind-data",
-                "4",
+                "--ro-bind",
+                "/run/user/1000/bubbler/i/etc-passwd",
                 "/etc/passwd",
-                "--perms",
-                "0644",
-                "--ro-bind-data",
-                "5",
+                "--ro-bind",
+                "/run/user/1000/bubbler/i/etc-group",
                 "/etc/group",
                 "--proc",
                 "/proc",
@@ -1281,7 +1288,7 @@ mod tests {
                 "--",
                 "/run/bubbler-init",
                 "--socket-fd",
-                "6",
+                "4",
                 "--",
                 "/usr/bin/true",
             ]
@@ -1539,18 +1546,18 @@ mod tests {
             Path::new("/run/user/1000/bubbler/t/dbus"),
             &FakeHost::default(),
         );
-        args.ro_bind_data(
-            b"[Application]\n".to_vec(),
-            Path::new("/.flatpak-info"),
-            "0644",
-        );
+        args.ro_bind_data(b"[Application]\n".to_vec(), Path::new("/.flatpak-info"));
         let argv = args
             .finish_plain(&["xdg-dbus-proxy".into()], &mut Counter::new())
             .unwrap();
         let s = strs(&argv);
         assert!(
-            s.windows(5)
-                .any(|w| w == ["--perms", "0644", "--ro-bind-data", "3", "/.flatpak-info"]),
+            s.windows(3).any(|w| w
+                == [
+                    "--ro-bind",
+                    "/run/user/1000/bubbler/i/.flatpak-info",
+                    "/.flatpak-info"
+                ]),
             "{s:?}"
         );
         // No supervisor and no control socket: the proxy is not an instance.
@@ -1589,14 +1596,18 @@ mod tests {
         assert!(!s.contains(&"/etc/shadow"));
         assert!(!s.windows(3).any(|w| w == ["--ro-bind", "/etc", "/etc"]));
         assert!(pos("/etc/hosts") > pos("--tmpfs"));
-        assert!(
-            s.windows(5)
-                .any(|w| w == ["--perms", "0644", "--ro-bind-data", "4", "/etc/passwd"])
-        );
-        assert!(
-            s.windows(5)
-                .any(|w| w == ["--perms", "0644", "--ro-bind-data", "5", "/etc/group"])
-        );
+        assert!(s.windows(3).any(|w| w
+            == [
+                "--ro-bind",
+                "/run/user/1000/bubbler/i/etc-passwd",
+                "/etc/passwd"
+            ]));
+        assert!(s.windows(3).any(|w| w
+            == [
+                "--ro-bind",
+                "/run/user/1000/bubbler/i/etc-group",
+                "/etc/group"
+            ]));
         assert!(pos("/etc/passwd") < pos("--proc"));
         assert!(s.windows(3).any(|w| w == ["--setenv", "USER", "bubbler"]));
         assert!(
@@ -1629,13 +1640,21 @@ mod tests {
         assert!(!s.contains(&"/etc/hosts"), "{s:?}");
         assert!(!s.contains(&"/etc/fonts"), "{s:?}");
         assert!(
-            s.windows(5)
-                .any(|w| w == ["--perms", "0644", "--ro-bind-data", "4", "/etc/passwd"]),
+            s.windows(3).any(|w| w
+                == [
+                    "--ro-bind",
+                    "/run/user/1000/bubbler/i/etc-passwd",
+                    "/etc/passwd"
+                ]),
             "{s:?}"
         );
         assert!(
-            s.windows(5)
-                .any(|w| w == ["--perms", "0644", "--ro-bind-data", "5", "/etc/group"]),
+            s.windows(3).any(|w| w
+                == [
+                    "--ro-bind",
+                    "/run/user/1000/bubbler/i/etc-group",
+                    "/etc/group"
+                ]),
             "{s:?}"
         );
         assert!(pos("/etc/passwd") > pos("/etc"), "{s:?}");
@@ -1795,10 +1814,10 @@ mod tests {
     }
 
     #[test]
-    fn data_items_become_ro_bind_data_with_allocated_fds() {
+    fn data_items_become_read_only_binds_of_written_files() {
         let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default());
-        args.ro_bind_data(b"hello".to_vec(), Path::new("/etc/x"), "0644");
-        args.ro_bind_data(b"world".to_vec(), Path::new("/etc/y"), "0600");
+        args.ro_bind_data(b"hello".to_vec(), Path::new("/etc/x"));
+        args.ro_bind_data(b"world".to_vec(), Path::new("/etc/y"));
         let mut rec = Recorder {
             seen: Vec::new(),
             next: Counter::new(),
@@ -1806,22 +1825,23 @@ mod tests {
         let argv = args.finish(&["sh".into()], &mut rec).unwrap();
         let seen = rec.seen;
         let s = strs(&argv);
-        // Fd 3 went to the info pipe, 4 and 5 to the baseline passwd and group.
         assert!(
-            s.windows(5)
-                .any(|w| w == ["--perms", "0644", "--ro-bind-data", "6", "/etc/x"])
+            s.windows(3)
+                .any(|w| w == ["--ro-bind", "/run/user/1000/bubbler/i/etc-x", "/etc/x"])
         );
         assert!(
-            s.windows(5)
-                .any(|w| w == ["--perms", "0600", "--ro-bind-data", "7", "/etc/y"])
+            s.windows(3)
+                .any(|w| w == ["--ro-bind", "/run/user/1000/bubbler/i/etc-y", "/etc/y"])
         );
+        // The baseline's passwd and group came through the same call
+        // first, so the two written here are the last two seen.
         assert_eq!(seen[2..], [b"hello".to_vec(), b"world".to_vec()]);
     }
 
     #[test]
     fn allocator_failure_is_data_error() {
         let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default());
-        args.ro_bind_data(b"x".to_vec(), Path::new("/etc/x"), "0644");
+        args.ro_bind_data(b"x".to_vec(), Path::new("/etc/x"));
         let r = args.finish(&["sh".into()], &mut Failing);
         assert!(matches!(r, Err(LaunchError::Data(_))));
     }
@@ -1832,10 +1852,11 @@ mod tests {
             .finish(&["sh".into()], &mut Counter::new())
             .unwrap();
         let s = strs(&argv);
-        // Fd 3 went to the info pipe, 4 and 5 to the baseline passwd and group.
+        // Fd 3 went to the info pipe; the baseline passwd and group are
+        // files, not descriptors, so the control socket is next.
         assert_eq!(
             &s[s.len() - 6..],
-            &["--", INIT_INSIDE, "--socket-fd", "6", "--", "sh"]
+            &["--", INIT_INSIDE, "--socket-fd", "4", "--", "sh"]
         );
     }
 
@@ -1847,7 +1868,7 @@ mod tests {
         let s = strs(&argv);
         assert_eq!(
             &s[s.len() - 7..],
-            &["--", INIT_INSIDE, "--socket-fd", "6", "--ctty", "--", "sh"]
+            &["--", INIT_INSIDE, "--socket-fd", "4", "--ctty", "--", "sh"]
         );
     }
 

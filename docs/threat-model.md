@@ -717,6 +717,12 @@ desktop until D-Bus activation restarts it. This is an upstream bug in a
 process bubbler does not run and the proxy cannot filter for: the missing
 key is absent from the call, not a value a rule can reject.
 
+`/.flatpak-info` is written to the run's own runtime directory and bound
+read-only from there, the way the synthetic `/etc` files below are: the
+sandbox's `/` is a writable tmpfs, so what stops an application from
+rewriting the file the host portal identifies it by is the read-only bind
+and not the directory it lands in.
+
 What `portals` buys from PipeWire's own Flatpak policy is narrower than it
 sounds, and worth stating exactly. `/.flatpak-info`, which `portals` writes,
 puts a client under WirePlumber's Flatpak access rules; measured on this
@@ -1023,7 +1029,17 @@ is not there whatever the application expects, which is the default and the
 reason for it — a config cannot widen `/etc` by accident, and a host file
 bubbler has not reviewed stays unreachable. `passwd` and `group` are always
 the synthetic ones bubbler writes (the account `bubbler`, holding the host's
-uid and gid, plus `nobody`), never the host's own. `etc "host"` is the
+uid and gid, plus `nobody`), never the host's own. Every file bubbler
+generates for a sandbox — these two, an isolated `network`'s
+`/etc/resolv.conf`, `portals`' `/.flatpak-info` — is written into the run's
+runtime directory (`$XDG_RUNTIME_DIR/bubbler/<instance>/`, mode 0700) at
+mode 0644, bound read-only from there and removed when the run ends. Not
+bwrap's own `--ro-bind-data`, which binds a file it has already unlinked: a
+sandbox that nests a bubblewrap of its own — Steam's runtime and Proton
+do — cannot bind such a destination again, because the nested bwrap
+resolves its source through `/proc/self/fd` and an unlinked dentry there is
+ENOENT. `/etc` inside is a writable tmpfs, so the read-only bind is what
+keeps the synthetic `passwd` from being rewritten, not the directory. `etc "host"` is the
 explicit opt-out: it binds the host's whole `/etc` read-only in the
 allowlist's place, so `hostname`, `fstab`, `ssh/ssh_config`, the `X11`
 config directory and every other world-readable file the host keeps there
@@ -1076,7 +1092,11 @@ the reader; a Mesa-driven GPU keeps node and sysfs out.
 `binding_the_hosts_etc_tags_the_bind_and_the_synthetic_files_with_its_own_origin`,
 `etc_host_is_a_warning_and_the_bare_node_is_not`,
 `real_bwrap_etc_is_allowlisted_and_user_is_bubbler`,
-`real_bwrap_etc_host_binds_the_hosts_whole_etc`
+`real_bwrap_etc_host_binds_the_hosts_whole_etc`,
+`data_items_become_read_only_binds_of_written_files`,
+`real_bwrap_a_nested_bwrap_binds_the_generated_etc_files`,
+`real_bwrap_a_nested_bwrap_binds_the_generated_flatpak_info`,
+`real_bwrap_a_generated_file_is_read_only_inside`
 
 ### File arguments
 

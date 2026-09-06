@@ -1212,14 +1212,10 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                 );
             }
             if dry_run {
-                let argv = launcher::build_argv(
-                    &env,
-                    &inst,
-                    command,
-                    &mut launcher::DryRunAlloc::default(),
-                    ctty,
-                )
-                .context("building bwrap arguments")?;
+                let mut alloc =
+                    launcher::DryRunAlloc::new(launcher::instance_runtime_dir(&env, &inst.name));
+                let argv = launcher::build_argv(&env, &inst, command, &mut alloc, ctty)
+                    .context("building bwrap arguments")?;
                 let mut lines = vec![OsStr::new("bwrap")];
                 lines.extend(argv.iter().map(OsString::as_os_str));
                 return print_lines(&lines, "the bwrap argv");
