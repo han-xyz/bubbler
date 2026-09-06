@@ -667,6 +667,43 @@ impl BwrapArgs {
         );
     }
 
+    /// Symlink inside the sandbox (phase 4). Used to rebuild sysfs paths
+    /// (e.g. `/sys/class/drm` from its constituent symlinks) so render-only
+    /// `dri` services can hide GPU card sysfs directories without breaking
+    /// device discovery.
+    pub fn symlink(&mut self, target: &Path, link: &Path) {
+        push(
+            &mut self.binds,
+            self.origin,
+            [
+                OsStr::new("--symlink"),
+                target.as_os_str(),
+                link.as_os_str(),
+            ],
+        );
+    }
+
+    /// Mask a directory with an empty read-only tmpfs (phase 4). Used to
+    /// hide GPU card sysfs directories without breaking device discovery
+    /// when render-only `dri` is granted.
+    pub fn mask_dir(&mut self, dir: &Path) {
+        push(
+            &mut self.binds,
+            self.origin,
+            [
+                OsStr::new("--size"),
+                OsStr::new("4096"),
+                OsStr::new("--tmpfs"),
+                dir.as_os_str(),
+            ],
+        );
+        push(
+            &mut self.binds,
+            self.origin,
+            [OsStr::new("--remount-ro"), dir.as_os_str()],
+        );
+    }
+
     /// Read-write bind of a host path (phase 4).
     pub fn bind(&mut self, src: &Path, dst: &Path) {
         push(
@@ -1762,5 +1799,59 @@ mod tests {
             .finish(&["sh".into()], &mut Counter::new())
             .unwrap();
         assert!(!strs(&argv).contains(&"--add-seccomp-fd"));
+    }
+
+    #[test]
+    fn symlink_emits_arguments_in_the_service_section() {
+        let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default());
+        args.tag(Origin::Service(0));
+        args.ro_bind(Path::new("/etc"), Path::new("/etc"));
+        args.symlink(Path::new("usr/lib"), Path::new("/lib64"));
+        let argv = args.finish(&["sh".into()], &mut Counter::new()).unwrap();
+        let s = strs(&argv);
+        let ro_bind_pos = s
+            .windows(3)
+            .position(|w| w == ["--ro-bind", "/etc", "/etc"])
+            .expect("ro_bind must appear in argv");
+        let symlink_pos = s
+            .windows(3)
+            .position(|w| w == ["--symlink", "usr/lib", "/lib64"])
+            .expect("symlink must appear in argv");
+        assert!(
+            symlink_pos > ro_bind_pos,
+            "symlink must appear after the preceding ro_bind in the service phase: {s:?}"
+        );
+    }
+
+    #[test]
+    fn mask_dir_emits_size_tmpfs_and_remount_ro() {
+        let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default());
+        args.tag(Origin::Service(0));
+        args.ro_bind(Path::new("/etc"), Path::new("/etc"));
+        args.mask_dir(Path::new("/sys/class/drm/card0"));
+        let argv = args.finish(&["sh".into()], &mut Counter::new()).unwrap();
+        let s = strs(&argv);
+        let ro_bind_pos = s
+            .windows(3)
+            .position(|w| w == ["--ro-bind", "/etc", "/etc"])
+            .expect("ro_bind must appear in argv");
+        let mask_start = s
+            .windows(4)
+            .position(|w| {
+                w[0] == "--size"
+                    && w[1] == "4096"
+                    && w[2] == "--tmpfs"
+                    && w[3] == "/sys/class/drm/card0"
+            })
+            .expect("mask_dir must emit --size 4096 --tmpfs <dir>");
+        assert!(
+            mask_start > ro_bind_pos,
+            "mask_dir must appear after the preceding ro_bind in the service phase: {s:?}"
+        );
+        assert_eq!(
+            &s[mask_start + 4..mask_start + 6],
+            &["--remount-ro", "/sys/class/drm/card0"],
+            "mask_dir must follow with --remount-ro: {s:?}"
+        );
     }
 }

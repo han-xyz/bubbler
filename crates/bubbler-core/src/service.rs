@@ -4737,6 +4737,7 @@ mod tests {
             "--info-fd",
             "--new-session",
             "--perms",
+            "--remount-ro",
             "--setenv",
             "--share-net",
             "--size",
