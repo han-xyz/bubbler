@@ -11,9 +11,13 @@
 // No `own "org.freedesktop.secrets"`. That rule makes this sandbox the
 // Secret Service for the whole session: every application that stores a
 // password through libsecret stores it here. It is an outward grant
-// rather than a confinement (see the README), and first owner wins, so a
-// host keyring already holding the name only makes the request fail. Add
-// it, inside a `dbus` block, if you mean to replace that keyring:
+// rather than a confinement (see the README), and first owner wins: a
+// host keyring already holding the name only makes the request fail, and
+// on a session where nothing holds it the sandbox takes it and every
+// libsecret client in the session then talks to this instance (measured
+// — the proxy passes the RequestName through and the bus answers
+// "primary owner"). Add it, inside a `dbus` block, if you mean to
+// replace that keyring:
 //     own "org.freedesktop.secrets"
 //
 // No `hidraw`, and it would not help: KeePassXC reaches a YubiKey
