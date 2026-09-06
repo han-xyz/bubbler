@@ -2858,4 +2858,51 @@ mod tests {
                 .any(|s| matches!(s, Service::Portals { .. }))
         );
     }
+
+    /// The `claude-code` profiles resolve without error on a host lacking both
+    /// the native installer's `~/.local/bin/claude` and the npm global's
+    /// `/usr/bin/claude`, because the `home-share` entries are optional; the
+    /// resolved profiles carry the bare `command "claude"` that resolves
+    /// through the sandbox PATH when either layout is present on the host.
+    #[test]
+    fn claude_code_profiles_work_without_native_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Resolver uses a fake home without `.local/bin/claude` or
+        // `.local/share/claude`, simulating a host with only the npm global
+        // layout or neither install present.
+        let e = env(tmp.path());
+        let r = Resolver::new(&e);
+
+        for name in ["claude-code", "claude-code-strict"] {
+            let resolved = r.resolve(name).unwrap();
+            let cfg = &resolved.config;
+
+            // Bare `command "claude"` replaces the absolute path, resolved
+            // through the sandbox PATH at runtime.
+            assert_eq!(cfg.command, Some(vec![OsString::from("claude")]), "{name}");
+
+            // Both `.local` shares are present and optional, so they don't fail
+            // resolution when the source is missing on the host.
+            let home_shares: Vec<_> = cfg
+                .services
+                .iter()
+                .filter_map(|s| match s {
+                    Service::HomeShare { path, optional, .. } => Some((path, *optional)),
+                    _ => None,
+                })
+                .collect();
+            let local_bin_found = home_shares
+                .iter()
+                .any(|(p, opt)| p.to_string_lossy() == ".local/bin/claude" && *opt);
+            let local_share_found = home_shares
+                .iter()
+                .any(|(p, opt)| p.to_string_lossy() == ".local/share/claude" && *opt);
+            assert!(
+                local_bin_found && local_share_found,
+                "{name}: expected optional home-shares for `.local/bin/claude` and `.local/share/claude`, \
+                 got {:?}",
+                home_shares
+            );
+        }
+    }
 }
