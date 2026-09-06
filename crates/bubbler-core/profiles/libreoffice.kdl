@@ -1,8 +1,21 @@
 // bubbler profile: libreoffice
 //
-// SAL_USE_VCLPLUGIN is set because bubbler clears the environment, which
-// leaves LibreOffice's VCL plugin to an autodetection with nothing to go
-// on.
+// `etc-share "libreoffice"`: this installation's `bootstraprc` and
+// `sofficerc` are symlinks from the program directory into
+// /etc/libreoffice, and the baseline hides everything in /etc that is not
+// on its allowlist. Without `bootstraprc` the suite has no
+// `UserInstallation` path, so soffice.bin exits 1 before it writes its
+// user profile and no window ever maps (measured). An installation that
+// keeps those files in the program directory itself wants the line
+// removed rather than kept: a share whose source is missing is an error.
+//
+// The splash screen prints `Failed to open display` on the way past: it
+// draws itself with Xlib, finds no X server, and gives up on the splash
+// alone. Nothing else in the suite needs one.
+//
+// No `env` node names a VCL plugin. bubbler clears the environment, and
+// with nothing to autodetect from LibreOffice picks the gtk3 plugin by
+// itself (measured); `env SAL_USE_VCLPLUGIN="qt6"` picks another.
 //
 // Documents live in ~/Documents and in the private home. A directory on
 // another disk is named explicitly, e.g.
@@ -24,7 +37,7 @@
 //       the private home and ~/Documents.
 wayland
 home-share "Documents" mode=rw
-env SAL_USE_VCLPLUGIN="gtk3"
+etc-share "libreoffice"
 // The start centre, not one of the seven per-document entries that run
 // the same command with a `--writer`-style argument.
 userns "disable"

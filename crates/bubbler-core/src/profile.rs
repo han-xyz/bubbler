@@ -1231,11 +1231,9 @@ mod tests {
                 .contains(&home_share("Videos", ShareMode::ReadOnly))
         );
         assert!(cfg("thunderbird").env.is_empty());
-        assert!(
-            cfg("libreoffice")
-                .env
-                .contains(&("SAL_USE_VCLPLUGIN".to_owned(), "gtk3".to_owned()))
-        );
+        assert!(cfg("libreoffice").services.contains(&Service::EtcShare {
+            name: OsString::from("libreoffice")
+        }));
         assert!(cfg("vesktop").services.contains(&Service::Pulseaudio));
         let steam = cfg("steam");
         assert!(steam.services.contains(&Service::Gamepad {
@@ -1427,18 +1425,22 @@ mod tests {
             ]
         );
 
-        // A document editor is a display and the documents. It keeps one
-        // `env` node, because bubbler clears the environment and VCL then
-        // has nothing to autodetect from.
+        // A document editor is a display, the documents, and the one
+        // `/etc` entry its own program directory links to. VCL picks the
+        // gtk3 plugin by itself in a cleared environment, so no `env`
+        // node names one.
         let lo = cfg("libreoffice");
         assert_eq!(
             lo.services,
-            vec![wayland(), home_share("Documents", ShareMode::ReadWrite)]
+            vec![
+                wayland(),
+                home_share("Documents", ShareMode::ReadWrite),
+                Service::EtcShare {
+                    name: OsString::from("libreoffice")
+                },
+            ]
         );
-        assert_eq!(
-            lo.env,
-            vec![("SAL_USE_VCLPLUGIN".to_owned(), "gtk3".to_owned())]
-        );
+        assert!(lo.env.is_empty(), "{:?}", lo.env);
     }
 
     /// The node entries of a header's `Bare by design. Add:` block: the
