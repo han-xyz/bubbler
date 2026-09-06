@@ -2171,6 +2171,60 @@ fn real_dbus_camera_binds_no_device_and_nodes_only_bind_what_is_there() {
     }
 }
 
+/// gdk-pixbuf's glycin loaders run `env -i … flatpak-spawn …` as soon as
+/// `/.flatpak-info` is there, so the whole point of the shim is that the
+/// program is found through glibc's built-in `/bin:/usr/bin` with no
+/// `PATH` in the environment at all — and that `/usr/bin` is no more
+/// writable for having become an overlay to make room for it.
+#[test]
+fn real_dbus_portals_answer_the_flatpak_spawn_a_loader_looks_for() {
+    if !require_dbus() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let shim = |grants: &[&str], command: &str| {
+        let mut c = bubbler_dbus(tmp.path(), &init);
+        c.arg("try");
+        for g in grants {
+            c.args(["--grant", g]);
+        }
+        c.args(["--", "/usr/bin/sh", "-c", command])
+            .output()
+            .unwrap()
+    };
+
+    // `--directory` is the working directory the loader is given and
+    // `--forward-fd` the descriptor it reads its D-Bus peer connection
+    // from, so both have to survive the exec the shim does in place.
+    let out = shim(
+        &["dbus", "portals"],
+        "env -i flatpak-spawn --directory=/tmp --forward-fd=3 -- \
+         /usr/bin/sh -c \"pwd; readlink /proc/self/fd/3\" 3</usr/lib/os-release",
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "/tmp\n/usr/lib/os-release\n",
+        "{err}"
+    );
+
+    // An overlay left writable is a `/usr/bin` the sandbox can replace
+    // program by program, which is worse than the missing shim.
+    let out = shim(&["dbus", "portals"], "touch /usr/bin/x");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("Read-only file system"), "{err}");
+
+    // Nothing but the identity file asks for the shim: without `portals`
+    // the sandbox has the host's own `/usr/bin` and no such program.
+    let out = shim(&["dbus"], "env -i flatpak-spawn /usr/bin/true");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("flatpak-spawn"), "{err}");
+}
+
 #[test]
 fn real_bwrap_alsa_configuration_reaches_the_sandbox() {
     if !require_bwrap() {

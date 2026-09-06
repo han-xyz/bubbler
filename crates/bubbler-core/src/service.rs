@@ -34,6 +34,10 @@ pub struct ServiceCtx<'a> {
     pub dbus: Option<&'a dbus::Plan>,
     /// How `wayland` is served this run; `None` without the grant.
     pub wayland: Option<&'a WaylandPlan>,
+    /// Host path of the `bubbler-init` binary, which `portals` binds a
+    /// second time as the `flatpak-spawn` shim. The same path the
+    /// supervisor itself is bound from: one file, two names.
+    pub init_bin: &'a Path,
 }
 
 /// Apply every service to `args`. `host` reports the type of a host path
@@ -945,6 +949,13 @@ fn portals(
         Path::new(dbus::FLATPAK_INFO),
         "0644",
     );
+    // The identity file is also what makes gdk-pixbuf's glycin loaders
+    // look for `flatpak-spawn` on the default path (glycin 2.1.5,
+    // `libglycin-2.so`); without one GTK's icon loading fails an
+    // assertion and takes the application down with it. The shim runs
+    // the loader inside this sandbox, which is the trust level glycin's
+    // own sandbox-less fallback would have given it.
+    args.flatpak_spawn_shim(ctx.init_bin);
     let doc = env.runtime_dir.join("doc");
     // `by-app/<app id>` itself is never probed: the FUSE creates it on
     // the first lookup for any valid app id (xdg-desktop-portal,
@@ -1609,12 +1620,12 @@ fn app_runtime(env: &Env, args: &mut BwrapArgs, id: &str, mode: ShareMode) {
 }
 
 /// bwrap operations that create a path inside the sandbox, and how many
-/// arguments stand between the flag and that path. `--perms` and
-/// `--size` may precede the flag inside one operation, so the flag is
-/// looked for rather than assumed to be first. The overlay family is
-/// here for completeness though the builder never emits it; a test
-/// holds every flag the builder can emit to either this list or the
-/// one of flags that create nothing.
+/// arguments stand between the flag and that path. `--perms`, `--size`
+/// and `--overlay-src` may precede the flag inside one operation, so the
+/// flag is looked for rather than assumed to be first. `--overlay` and
+/// `--ro-overlay` are here for completeness though the builder emits
+/// neither; a test holds every flag the builder can emit to either this
+/// list or the one of flags that create nothing.
 const CREATES: &[(&str, usize)] = &[
     ("--bind", 2),
     ("--bind-try", 2),
@@ -1839,6 +1850,7 @@ mod tests {
             instance_runtime: "/run/user/1000/bubbler/t".into(),
             dbus: plan.as_ref(),
             wayland: None,
+            init_bin: Path::new(crate::init_bin::INSTALLED),
         }
     }
 
@@ -4755,6 +4767,51 @@ mod tests {
         );
     }
 
+    /// `/.flatpak-info` is what makes gdk-pixbuf's glycin loaders look
+    /// for `flatpak-spawn`, so the grant that writes the file is the
+    /// grant that answers for the program. Nothing else may reach the
+    /// overlay: a sandbox without `portals` keeps the host's `/usr/bin`.
+    #[test]
+    fn portals_puts_the_flatpak_spawn_shim_on_the_default_path() {
+        let a = argv(
+            &[
+                Service::Dbus { rules: vec![] },
+                Service::Portals {
+                    children: Vec::new(),
+                },
+            ],
+            &env(),
+            &[],
+        )
+        .unwrap();
+        assert!(
+            has_seq(
+                &a,
+                &["--overlay-src", "/usr/bin", "--tmp-overlay", "/usr/bin"]
+            ),
+            "{a:?}"
+        );
+        assert!(
+            has_seq(
+                &a,
+                &[
+                    "--ro-bind",
+                    "/usr/lib/bubbler/bubbler-init",
+                    "/usr/bin/flatpak-spawn"
+                ]
+            ),
+            "{a:?}"
+        );
+        assert!(has_seq(&a, &["--remount-ro", "/usr/bin"]), "{a:?}");
+
+        let bare = argv(&[Service::Dbus { rules: vec![] }], &env(), &[]).unwrap();
+        assert!(!bare.iter().any(|s| s == "--overlay-src"), "{bare:?}");
+        assert!(
+            !bare.iter().any(|s| s == "/usr/bin/flatpak-spawn"),
+            "{bare:?}"
+        );
+    }
+
     #[test]
     fn portals_binds_this_instances_document_portal_view_read_write() {
         let a = argv(
@@ -5198,6 +5255,8 @@ mod tests {
             "--hostname",
             "--info-fd",
             "--new-session",
+            // A source to read the next overlay from, not a destination.
+            "--overlay-src",
             "--perms",
             "--remount-ro",
             "--setenv",

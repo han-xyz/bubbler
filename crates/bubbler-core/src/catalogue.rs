@@ -266,7 +266,10 @@ pub static GRANTS: &[Grant] = &[
                `global-shortcuts` bindings that fire unfocused, `background` host \
                autostart and launcher entries, `location` where you are, `secrets` this \
                application's portal secret. `camera` is a child too, and the same grant \
-               as the top-level node of that name.",
+               as the top-level node of that name. The identity file also makes \
+               gdk-pixbuf's image loaders look for `flatpak-spawn`, so the grant puts one \
+               on the sandbox's path: `/usr/bin` becomes an overlay of itself, remounted \
+               read-only, which needs unprivileged overlayfs — Linux 5.11 or newer.",
         risk: Risk::Narrow,
         grammar: "portals [{ screencast remote-desktop ... }]",
     },

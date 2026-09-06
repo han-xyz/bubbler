@@ -729,6 +729,26 @@ client can *do* to other clients' nodes, not what it can *see* or *read*.
 Camera nodes are the one exception, gated separately by the portal's own
 permission store rather than by this access level.
 
+The identity file also costs the grant a program. gdk-pixbuf's glycin image
+loaders read `/.flatpak-info` to pick their own sandbox, and on finding one
+they run the loader through `flatpak-spawn`; a sandbox that has no such
+program fails the load, and under GTK 3 that is an assertion that aborts the
+application. bubbler answers with a shim rather than by dropping the identity
+file: the same `bubbler-init` binary, selected by its `argv[0]`, which reads
+the command line and `execve`s the loader here. It speaks no D-Bus, opens no
+socket and builds no sub-sandbox, so it reaches nothing the calling
+application could not reach itself — the loader runs at the trust level
+glycin's own sandbox-less fallback gives it, inside bubbler's sandbox rather
+than beside it. `--host`, `--talk-name` and the rest of the options that only
+mean something with the host's bus behind them are refused by name, not
+ignored, so nothing believes it was given a channel out. The cost is the
+mount it takes to put the shim where `env -i` will find it: `/usr/bin`
+becomes an overlay of itself with the writes going to a tmpfs nothing can
+see, and is remounted read-only immediately after the shim is bound. Left
+writable — as an overlay is by default — that mount would let the sandbox
+replace or delete any program in `/usr/bin` for the life of the run, which is
+the failure this remount exists to close.
+
 [D-Bus](manual.md#d-bus), [The system
 bus](manual.md#the-system-bus) ·
 `real_dbus_hides_names_the_rules_do_not_grant`,
@@ -748,7 +768,9 @@ bus](manual.md#the-system-bus) ·
 `a_message_of_an_unknown_type_carrying_the_serial_is_skipped`,
 `a_flood_of_messages_to_skip_does_not_outlast_the_deadline`,
 `a_bus_that_says_nothing_times_the_call_out`,
-`descriptors_a_reply_carries_are_closed`
+`descriptors_a_reply_carries_are_closed`,
+`real_dbus_portals_answer_the_flatpak_spawn_a_loader_looks_for`,
+`the_flatpak_spawn_shim_is_an_overlay_the_remount_takes_back`
 
 ### Accessibility bus
 

@@ -33,6 +33,8 @@ use rustix::thread::{
 
 use bubbler_init::{fds, proto, wire};
 
+mod spawn;
+
 /// Supervisor tick: the `poll` timeout, so `accept`, `wait` and every
 /// request read are non-blocking and one iteration is bounded by it.
 const TICK: Duration = Duration::from_millis(20);
@@ -542,7 +544,23 @@ fn code_of(status: ExitStatus) -> u8 {
     u8::try_from(code).unwrap_or(1)
 }
 
+/// Whether this process was started as the `flatpak-spawn` shim rather
+/// than as the supervisor. One file is bound at both paths, so the
+/// basename of `argv[0]` is the whole of what separates the two modes.
+fn shim_requested() -> bool {
+    std::env::args_os()
+        .next()
+        .is_some_and(|a| Path::new(&a).file_name() == Some(OsStr::new(spawn::NAME)))
+}
+
 fn main() -> ExitCode {
+    // Before anything the supervisor does to its own process: the shim
+    // keeps the descriptors its caller forwarded, which the sweep below
+    // exists to close, and it holds no privilege the command should not
+    // have — it is a child of the sandboxed application, not its parent.
+    if shim_requested() {
+        return spawn::run(std::env::args_os().skip(1));
+    }
     let Some(mut args) = parse_args() else {
         eprintln!("{USAGE}");
         return ExitCode::from(2);

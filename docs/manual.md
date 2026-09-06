@@ -3079,6 +3079,26 @@ of an id may hold a `-` and xdg-desktop-portal refuses every operation of a
 sandbox whose id it cannot parse; a leading digit is prefixed with `_`,
 which the portal would take but flatpak's own name check would not.
 
+That file is also what makes gdk-pixbuf's glycin image loaders look for
+`flatpak-spawn`: seeing one, they run
+`env -i … flatpak-spawn --sandbox … prlimit … glycin-svg`, and a sandbox
+without that program fails the icon load — with GTK 3 that is an assertion
+and the application aborts before its first window. So `portals` binds one:
+the `bubbler-init` binary again, which takes the mode from its own `argv[0]`
+and runs the loader inside this sandbox rather than asking any host for a
+sub-sandbox. `--host` and the other options that need the host's bus are
+refused by name; `--directory`, `--env`, `--clear-env` and `--forward-fd`
+are honoured, and the command replaces the shim in place, so the caller's
+`wait` is on the process it started. `env -i` empties the environment, so
+the lookup falls back to glibc's built-in `/bin:/usr/bin` and the shim has
+to be at `/usr/bin/flatpak-spawn` — a path bwrap cannot create in the
+read-only `/usr`. `/usr/bin` therefore becomes an overlay of itself with the
+writes going to an invisible tmpfs, and is remounted read-only once the shim
+is bound, so the sandbox can neither add to it nor replace what is in it.
+`--explain` lists the three operations under the `portals` group. Unprivileged
+overlayfs is a kernel requirement (Linux 5.11 or newer); on an older one bwrap
+refuses the mount and says so, and the launch fails.
+
 The rules it grants are one `--call` and one `--broadcast` per interface
 it opens on the desktop object, a `--call` and a `--broadcast` wildcard
 for `org.freedesktop.portal.Documents`, one `--call` and one

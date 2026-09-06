@@ -71,6 +71,9 @@ struct Item {
 enum Kind {
     /// The elements of one operation, e.g. `--ro-bind SRC DST`.
     Args(Vec<OsString>),
+    /// The same, with what an explanation adds where the paths alone do
+    /// not say what the operation is there for.
+    Noted { args: Vec<OsString>, note: String },
     /// Content written to an fd by the allocator at `finish` time and
     /// bound read-only at `dest` with `mode`.
     Data {
@@ -101,6 +104,14 @@ enum Kind {
 // 0.11.2 refuses a destination in it ("Can't mkdir parents for
 // /usr/lib/bubbler/bubbler-init: Read-only file system").
 pub const INIT_INSIDE: &str = "/run/bubbler-init";
+
+/// Where the `flatpak-spawn` shim — the same `bubbler-init` binary,
+/// which takes that mode from its own `argv[0]` — is bound in a sandbox
+/// that carries `/.flatpak-info`.
+// Not a free choice: gdk-pixbuf's glycin loaders run the program through
+// `env -i`, which leaves glibc's built-in path `/bin:/usr/bin` to find it
+// (`getconf PATH`), and `/bin` is a symlink to `usr/bin` here.
+pub const FLATPAK_SPAWN_INSIDE: &str = "/usr/bin/flatpak-spawn";
 
 /// Turns generated content and channels into the fd numbers bwrap is told
 /// to read them from. `--dry-run` counts, a real run creates the fds.
@@ -781,6 +792,41 @@ impl BwrapArgs {
         self.ro_bind(host_path, Path::new(INIT_INSIDE));
     }
 
+    /// Bind the same `bubbler-init` binary a second time, as
+    /// [`FLATPAK_SPAWN_INSIDE`] (phase 4), which is what an image loader
+    /// in a sandbox carrying `/.flatpak-info` looks for.
+    ///
+    /// `/usr` is a read-only bind of the host's, and bwrap cannot create
+    /// a mount point in it ("Can't create file at
+    /// /usr/bin/flatpak-spawn: Read-only file system"), so `/usr/bin`
+    /// becomes an overlay of itself with the writes going to an
+    /// invisible tmpfs — and then read-only again, since an overlay left
+    /// writable is a `/usr/bin` the sandbox can replace program by
+    /// program. Needs unprivileged overlayfs (Linux 5.11 or newer);
+    /// where the kernel refuses the mount bwrap says so and the launch
+    /// fails.
+    pub fn flatpak_spawn_shim(&mut self, host_path: &Path) {
+        let o = OsStr::new;
+        let bin = o("/usr/bin");
+        // `--overlay-src` does nothing on its own and applies to the
+        // next overlay option only (`bwrap(1)`), so it stays part of the
+        // same operation as its `--tmp-overlay`.
+        self.binds.push(Item {
+            origin: self.origin,
+            kind: Kind::Noted {
+                args: vec![
+                    o("--overlay-src").into(),
+                    bin.into(),
+                    o("--tmp-overlay").into(),
+                    bin.into(),
+                ],
+                note: "flatpak-spawn shim (glycin, gdk-pixbuf)".to_owned(),
+            },
+        });
+        self.ro_bind(host_path, Path::new(FLATPAK_SPAWN_INSIDE));
+        push(&mut self.binds, self.origin, [o("--remount-ro"), bin]);
+    }
+
     /// Bind `content` read-only at `dest` with `mode` (phase 4). The bytes
     /// are handed to the fd allocator in `finish`.
     pub fn ro_bind_data(&mut self, content: Vec<u8>, dest: &Path, mode: &str) {
@@ -949,6 +995,7 @@ impl BwrapArgs {
         {
             let (args, note) = match item.kind {
                 Kind::Args(a) => (a, None),
+                Kind::Noted { args, note } => (args, Some(note)),
                 Kind::Data {
                     content,
                     dest,
@@ -1887,6 +1934,46 @@ mod tests {
         );
         assert!(pos("/x/bubbler-init") > pos("--dir"));
         assert!(pos("/x/bubbler-init") < pos("--clearenv"));
+    }
+
+    /// bwrap cannot make a mount point inside the read-only `/usr`, so
+    /// the shim needs a writable `/usr/bin` first and a remount to take
+    /// the write back: without the remount the sandbox can replace or
+    /// delete anything in it. The three are one sequence in that order,
+    /// and all of them after the `/usr` the overlay reads from.
+    #[test]
+    fn the_flatpak_spawn_shim_is_an_overlay_the_remount_takes_back() {
+        let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default());
+        args.flatpak_spawn_shim(Path::new("/x/bubbler-init"));
+        let explained = args
+            .finish_explained(&["sh".into()], &mut Counter::new())
+            .unwrap();
+        let flat = flatten(explained.clone());
+        let s = strs(&flat);
+        let pos = |x: &str| s.iter().position(|a| *a == x).unwrap();
+        assert!(
+            s.windows(4)
+                .any(|w| w == ["--overlay-src", "/usr/bin", "--tmp-overlay", "/usr/bin"]),
+            "{s:?}"
+        );
+        assert!(
+            s.windows(3)
+                .any(|w| w == ["--ro-bind", "/x/bubbler-init", FLATPAK_SPAWN_INSIDE]),
+            "{s:?}"
+        );
+        assert!(pos("--ro-bind") < pos("--overlay-src"), "{s:?}");
+        assert!(pos("--overlay-src") < pos(FLATPAK_SPAWN_INSIDE), "{s:?}");
+        assert!(pos(FLATPAK_SPAWN_INSIDE) < pos("--remount-ro"), "{s:?}");
+        // The overlay is the one operation whose paths do not say what
+        // it is there for, so it is the one that carries the note.
+        let overlay = explained
+            .iter()
+            .find(|e| e.args.first().is_some_and(|a| a == "--overlay-src"))
+            .expect("the overlay is in the argv");
+        assert_eq!(
+            overlay.note.as_deref(),
+            Some("flatpak-spawn shim (glycin, gdk-pixbuf)")
+        );
     }
 
     #[test]

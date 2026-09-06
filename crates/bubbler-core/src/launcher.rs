@@ -450,10 +450,15 @@ fn build_args_on<'a>(
     let instance_runtime = instance_runtime_dir(env, &inst.name);
     let wayland_plan =
         wayland_mode(&inst.config.services).map(|m| wayland::plan(m, &instance_runtime));
+    // Resolved before the services rather than beside the bind at the
+    // end: `portals` binds the same file as the `flatpak-spawn` shim, so
+    // a run that cannot find the supervisor must fail before either.
+    let init = init_bin::locate(env, host)?;
     let ctx = service::ServiceCtx {
         instance_runtime,
         dbus: plan.as_ref(),
         wayland: wayland_plan.as_ref(),
+        init_bin: &init,
     };
     let mut args = BwrapArgs::baseline(env, &inst.home(), host);
     if inst.config.userns == Userns::Disable {
@@ -513,7 +518,7 @@ fn build_args_on<'a>(
     )?;
     service::apply_env(&inst.config.env, &mut args)?;
     args.tag(Origin::Init);
-    args.bind_init(&init_bin::locate(env, host)?);
+    args.bind_init(&init);
     Ok((args, command))
 }
 
@@ -3040,10 +3045,16 @@ mod tests {
             )
         );
         // The wait for the identity document belongs to the `portals`
-        // node, next to the file that identity is written from.
+        // node, next to the file that identity is written from — and so
+        // does the `flatpak-spawn` shim that identity file calls for.
         assert_eq!(
             line(&items, Origin::Service(1)),
-            "--block-fd 4 --perms 0644 --ro-bind-data 8 /.flatpak-info"
+            format!(
+                "--block-fd 4 --perms 0644 --ro-bind-data 8 /.flatpak-info \
+                 --overlay-src /usr/bin --tmp-overlay /usr/bin \
+                 --ro-bind {init} /usr/bin/flatpak-spawn --remount-ro /usr/bin",
+                init = tmp.path().join("bubbler-init").display()
+            )
         );
         // `notify` is a rule for the proxy and nothing for bwrap.
         assert_eq!(line(&items, Origin::Service(2)), "");
