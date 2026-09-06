@@ -10851,14 +10851,21 @@ fn a_host_without_a_working_bwrap_skips_the_guarded_tests_rather_than_failing_th
 /// that fails here — that measures, and the measurement is the point.
 ///
 /// Every test is `#[ignore]`d: it opens real apps on the user's desktop,
-/// and four profiles (firefox, libreoffice, spotify, steam) fail until
-/// the profile pass Tasks 7-9 do lands, which must not block unrelated
-/// work landing on top of this one. Run it explicitly, serially — it
-/// starts real desktop apps one at a time against a session with exactly
-/// one desktop to watch them on, and several such launches at once would
+/// and two profiles (spotify, steam) fail until their own profile pass
+/// lands, which must not block unrelated work landing on top of this
+/// one. Run one explicitly, by its whole name, serially — these start
+/// real desktop apps one at a time against a session with exactly one
+/// desktop to watch them on, and several such launches at once would
 /// make the timing this measures mean nothing:
 ///
-///     cargo test -p bubbler --test cli profile_smoke -- --ignored --test-threads=1
+///     cargo test -p bubbler --test cli -- --ignored --exact profile_smoke::kitty_window_appears --test-threads=1
+///
+/// `--exact` is what holds that to one test. libtest ORs its filters, so
+/// a profile name added to a `profile_smoke` filter widens the run to
+/// the whole suite — Steam included — instead of narrowing it; measured,
+/// `-- --ignored --list profile_smoke kitty_window_appears` lists all 17.
+/// `--list` is also how to read the names off: the GUI ones end in
+/// `_window_appears`, the four command ones do not.
 ///
 /// Where a test does skip (with a reason printed through [`say`]) rather
 /// than fail, it is because the app or Hyprland itself is not on this

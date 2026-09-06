@@ -53,20 +53,26 @@ profile for real and checks that it did what it should: a GUI profile's
 window mapped on Hyprland, a CLI profile's command printed what was
 documented. It measures a profile; it does not fix one that fails here.
 Every test in it is `#[ignore]`d — `cargo test --workspace` never opens an
-app on your desktop — so run it explicitly:
+app on your desktop — so run one explicitly, by its whole name:
 
 ```
-cargo test -p bubbler --test cli profile_smoke -- --ignored --test-threads=1
+cargo test -p bubbler --test cli -- --ignored --exact profile_smoke::kitty_window_appears --test-threads=1
 ```
+
+`--exact` is what holds that to one test. libtest ORs its filters, so a
+profile name added to a `profile_smoke` filter widens the run to the whole
+suite — Steam included — instead of narrowing it: `-- --ignored --list
+profile_smoke kitty_window_appears` lists all 17. Drop `--exact` and the
+name to ask for the whole suite on purpose; `--list` reads the names off,
+GUI ones ending in `_window_appears` and the four command ones not.
 
 Serial only: it starts real desktop apps one at a time against a session
 with exactly one desktop to watch them on. It needs Hyprland (`hyprctl`) and
 each app installed — either missing is a printed skip, not a failure, so a
 host with neither reports nothing rather than a wall of red.
 
-Four profiles are known to fail here and are tracked, not treated as a
-broken test run, until the profile pass lands: `firefox`, `libreoffice`,
-`spotify`, `steam`.
+Two profiles are known to fail here and are tracked, not treated as a
+broken test run, until their profile pass lands: `spotify`, `steam`.
 
 ## Fuzzing
 
