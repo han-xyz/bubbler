@@ -628,13 +628,29 @@ impl Merged {
     /// privilege level nobody wrote.
     fn add_service(&mut self, svc: &Service, src: &Src) -> Result<(), ProfileError> {
         match svc {
-            Service::HomeShare { .. } => {
+            Service::HomeShare { path, optional, .. } => {
                 if self.holds_share(svc, src, "home-share", home_share)? {
+                    self.merge_share_optional(*optional, src, |s| match s {
+                        Service::HomeShare {
+                            path: p,
+                            optional: o,
+                            ..
+                        } if p == path => Some(o),
+                        _ => None,
+                    });
                     return Ok(());
                 }
             }
-            Service::PathShare { .. } => {
+            Service::PathShare { path, optional, .. } => {
                 if self.holds_share(svc, src, "path-share", path_share)? {
+                    self.merge_share_optional(*optional, src, |s| match s {
+                        Service::PathShare {
+                            path: p,
+                            optional: o,
+                            ..
+                        } if p == path => Some(o),
+                        _ => None,
+                    });
                     return Ok(());
                 }
             }
@@ -869,6 +885,29 @@ impl Merged {
             return Err(mode_conflict(&node, held_mode, held_src, mode, src));
         }
         Ok(true)
+    }
+
+    /// ORs `optional` into the held share `same` finds, and moves its
+    /// source to `src`: an including layer must be able to relax a
+    /// base's share for a host that lacks it, and a base cannot know
+    /// every host, so any layer marking it optional wins — the same
+    /// rule `dri kms` merges by. Called only after [`Self::holds_share`]
+    /// has confirmed the two agree on path and mode, so `same` always
+    /// finds an entry here.
+    fn merge_share_optional(
+        &mut self,
+        optional: bool,
+        src: &Src,
+        mut same: impl FnMut(&mut Service) -> Option<&mut bool>,
+    ) {
+        if let Some((held_optional, held_src)) = self
+            .services
+            .iter_mut()
+            .find_map(|(s, s_src)| same(s).map(|o| (o, s_src)))
+        {
+            *held_optional |= optional;
+            *held_src = src.clone();
+        }
     }
 
     /// The flattened profile: its config, its canonical KDL, and where
@@ -2332,6 +2371,45 @@ mod tests {
         assert_eq!(node, "app-runtime \"org.keepassxc.KeePassXC\"");
         assert!(a.contains("mode=rw") && a.contains("b.kdl"), "{a}");
         assert!(b.contains("mode=ro") && b.contains("a.kdl"), "{b}");
+    }
+
+    /// An including profile must be able to relax a base's share for a
+    /// host that lacks it, and a base cannot know every host, so
+    /// `optional` merges by OR the same way `dri kms` does: either layer
+    /// marking it optional wins, whichever order the two are read in.
+    #[test]
+    fn optional_merges_by_or_whichever_layer_sets_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(
+            tmp.path(),
+            &[(
+                "a",
+                "include \"b\"\nhome-share \"x\" mode=ro optional=#true\n",
+            )],
+            &[("b", "home-share \"x\" mode=ro\n")],
+        );
+        assert_eq!(
+            r.resolve("a").unwrap().config.services,
+            vec![Service::HomeShare {
+                path: "x".into(),
+                mode: ShareMode::ReadOnly,
+                optional: true,
+            }]
+        );
+
+        let r = resolver(
+            tmp.path(),
+            &[("a", "include \"b\"\nhome-share \"x\" mode=ro\n")],
+            &[("b", "home-share \"x\" mode=ro optional=#true\n")],
+        );
+        assert_eq!(
+            r.resolve("a").unwrap().config.services,
+            vec![Service::HomeShare {
+                path: "x".into(),
+                mode: ShareMode::ReadOnly,
+                optional: true,
+            }]
+        );
     }
 
     #[test]

@@ -561,27 +561,44 @@ fn visible_roots(
     }
     for service in &cfg.services {
         match service {
-            Service::HomeShare { path, .. } => add_root(
-                &mut roots,
-                host,
-                Root {
-                    host: env.home.join(path),
-                    inside: Some(Path::new(SANDBOX_HOME).join(path)),
-                },
-                // `home_share` confines the resolved source to the home
-                // directory and fails the launch when it leaves it.
-                |real| real.starts_with(&env.home),
-            ),
-            Service::PathShare { path, .. } => add_root(
-                &mut roots,
-                host,
-                same(path.clone()),
-                // The launcher refuses a `path-share` that meets a
-                // reserved root, so one never reaches a bind — and a
-                // source resolving to `/` or to the user's home would
-                // otherwise claim every argument as already visible.
-                |_| crate::service::reserved_reason(host, env, path).is_none(),
-            ),
+            Service::HomeShare { path, optional, .. } => {
+                // A missing optional source binds nothing, the same skip
+                // `home_share` itself makes, so it is not a root either:
+                // an argument under it is a file like any other, not one
+                // the sandbox already sees under a path that was never
+                // bound.
+                if *optional && host.file_type(&env.home.join(path)).is_none() {
+                    continue;
+                }
+                add_root(
+                    &mut roots,
+                    host,
+                    Root {
+                        host: env.home.join(path),
+                        inside: Some(Path::new(SANDBOX_HOME).join(path)),
+                    },
+                    // `home_share` confines the resolved source to the
+                    // home directory and fails the launch when it
+                    // leaves it.
+                    |real| real.starts_with(&env.home),
+                )
+            }
+            Service::PathShare { path, optional, .. } => {
+                if *optional && host.file_type(path).is_none() {
+                    continue;
+                }
+                add_root(
+                    &mut roots,
+                    host,
+                    same(path.clone()),
+                    // The launcher refuses a `path-share` that meets a
+                    // reserved root, so one never reaches a bind — and a
+                    // source resolving to `/` or to the user's home
+                    // would otherwise claim every argument as already
+                    // visible.
+                    |_| crate::service::reserved_reason(host, env, path).is_none(),
+                )
+            }
             Service::EtcShare { name } => add_root(
                 &mut roots,
                 host,
@@ -1335,6 +1352,29 @@ mod tests {
         let args = [OsString::from("/home/user/a.pdf")];
         let out = plan(&env(), &cfg, Path::new(INSTANCE_HOME), &args, &host);
         assert_eq!(tag(&out[0]), "forward /home/user/a.pdf as a.pdf (write)");
+    }
+
+    /// A skipped optional share binds nothing, so it is no root either:
+    /// an argument under it is a file like any other, not a file the
+    /// sandbox already sees under a renamed path that was never bound.
+    #[test]
+    fn an_optional_home_share_whose_source_is_absent_covers_nothing() {
+        let (file, ..) = types();
+        let host = tree().with("/home/user/Extras/report.pdf", file);
+        let cfg = InstanceConfig {
+            services: vec![Service::HomeShare {
+                path: "Extras".into(),
+                mode: ShareMode::ReadOnly,
+                optional: true,
+            }],
+            ..InstanceConfig::default()
+        };
+        let args = [OsString::from("/home/user/Extras/report.pdf")];
+        let out = plan(&env(), &cfg, Path::new(INSTANCE_HOME), &args, &host);
+        assert_eq!(
+            tag(&out[0]),
+            "forward /home/user/Extras/report.pdf as report.pdf (read)"
+        );
     }
 
     #[test]
