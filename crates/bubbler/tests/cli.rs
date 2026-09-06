@@ -10886,32 +10886,21 @@ mod profile_smoke {
     /// well past it and short enough to pay on every profile.
     const SETTLE: Duration = Duration::from_secs(3);
 
-    /// What a GUI smoke test looks for in `hyprctl clients`. Most shipped
-    /// profiles set a stable window class; this host's Steam client sets
-    /// none on its main window (`class` comes back empty), so that test
-    /// matches its title instead, which is fixed at "Steam" regardless of
-    /// login state.
-    enum Seen {
-        Class(&'static str),
-        Title(&'static str),
-    }
-
-    /// How many mapped windows `hyprctl clients` reports matching `seen`
-    /// right now. A live desktop already has some of the classes these
-    /// tests look for open outside the test — this session's own
-    /// `firefox`, `code` and `vesktop` windows carry exactly the classes
-    /// their own profiles do — so a smoke test counts rather than merely
-    /// looks for one, and only a rise past what was there when the
-    /// sandbox started is its own window.
-    fn hyprctl_count(seen: &Seen) -> usize {
+    /// How many windows `hyprctl clients` reports under `class` right
+    /// now. A live desktop already has some of the classes these tests
+    /// look for open outside the test — this session's own `firefox`,
+    /// `code` and `vesktop` windows carry exactly the classes their own
+    /// profiles do — so a smoke test counts rather than merely looks for
+    /// one, and only a rise past what was there when the sandbox started
+    /// is its own window. The class and not the title: a title follows
+    /// what the app is showing, and Steam's is "Sign in to Steam" until
+    /// somebody logs in.
+    fn hyprctl_count(class: &str) -> usize {
         let out = hyprctl(&["clients"]);
         if !out.status.success() {
             return 0;
         }
-        let want = match seen {
-            Seen::Class(c) => format!("class: {c}"),
-            Seen::Title(t) => format!("title: {t}"),
-        };
+        let want = format!("class: {class}");
         String::from_utf8_lossy(&out.stdout)
             .lines()
             .filter(|l| l.trim() == want)
@@ -10930,7 +10919,7 @@ mod profile_smoke {
     }
 
     /// One shipped GUI profile's smoke test: the host binary it needs,
-    /// the window identity that proves it ran, which `$HOME` subdirectories
+    /// the window class that proves it ran, which `$HOME` subdirectories
     /// its `home-share` grants need to exist first, whether its `network`
     /// grant needs pasta to attach, whether its `x11 "host"` grant needs
     /// the host's `$DISPLAY` forwarded in, and how long its own cold start
@@ -10938,7 +10927,7 @@ mod profile_smoke {
     struct GuiProfile {
         profile: &'static str,
         gate: &'static str,
-        seen: Seen,
+        class: &'static str,
         home_dirs: &'static [&'static str],
         network: bool,
         x11_host: bool,
@@ -10988,7 +10977,7 @@ mod profile_smoke {
         for dir in p.home_dirs {
             std::fs::create_dir_all(tmp.path().join("home").join(dir)).unwrap();
         }
-        let before = hyprctl_count(&p.seen);
+        let before = hyprctl_count(p.class);
         let log = tmp.path().join(format!("{}.err", p.profile));
         let mut cmd = if p.x11_host {
             bubbler_x11_host(tmp.path(), &init)
@@ -11005,7 +10994,7 @@ mod profile_smoke {
             log,
         };
         assert!(
-            wait_until(|| hyprctl_count(&p.seen) > before, p.limit),
+            wait_until(|| hyprctl_count(p.class) > before, p.limit),
             "{}: no new window within {:?}: {}",
             p.profile,
             p.limit,
@@ -11026,7 +11015,7 @@ mod profile_smoke {
             without_tool_warnings(&run.said())
         );
         assert!(
-            hyprctl_count(&p.seen) > before,
+            hyprctl_count(p.class) > before,
             "{}: the window was gone {:?} after it mapped: {}",
             p.profile,
             SETTLE,
@@ -11041,7 +11030,7 @@ mod profile_smoke {
         gui_smoke(GuiProfile {
             profile: "alacritty",
             gate: "/usr/bin/alacritty",
-            seen: Seen::Class("Alacritty"),
+            class: "Alacritty",
             home_dirs: &[],
             network: false,
             x11_host: false,
@@ -11055,7 +11044,7 @@ mod profile_smoke {
         gui_smoke(GuiProfile {
             profile: "chromium",
             gate: "/usr/bin/chromium",
-            seen: Seen::Class("chromium"),
+            class: "chromium",
             home_dirs: &["Downloads"],
             network: true,
             x11_host: false,
@@ -11069,7 +11058,7 @@ mod profile_smoke {
         gui_smoke(GuiProfile {
             profile: "code",
             gate: "/usr/bin/code",
-            seen: Seen::Class("code"),
+            class: "code",
             home_dirs: &["Projects"],
             network: true,
             x11_host: false,
@@ -11083,7 +11072,7 @@ mod profile_smoke {
         gui_smoke(GuiProfile {
             profile: "firefox",
             gate: "/usr/bin/firefox",
-            seen: Seen::Class("firefox"),
+            class: "firefox",
             home_dirs: &["Downloads"],
             network: true,
             x11_host: false,
@@ -11097,7 +11086,7 @@ mod profile_smoke {
         gui_smoke(GuiProfile {
             profile: "keepassxc",
             gate: "/usr/bin/keepassxc",
-            seen: Seen::Class("org.keepassxc.KeePassXC"),
+            class: "org.keepassxc.KeePassXC",
             home_dirs: &["Documents"],
             network: false,
             x11_host: false,
@@ -11111,7 +11100,7 @@ mod profile_smoke {
         gui_smoke(GuiProfile {
             profile: "kitty",
             gate: "/usr/bin/kitty",
-            seen: Seen::Class("kitty"),
+            class: "kitty",
             home_dirs: &[],
             network: false,
             x11_host: false,
@@ -11135,7 +11124,7 @@ mod profile_smoke {
             gate,
             // The bare `command "libreoffice"` this profile ships opens
             // the start centre, not a per-document window.
-            seen: Seen::Class("libreoffice-startcenter"),
+            class: "libreoffice-startcenter",
             home_dirs: &["Documents"],
             network: false,
             x11_host: false,
@@ -11149,7 +11138,7 @@ mod profile_smoke {
         gui_smoke(GuiProfile {
             profile: "lutris",
             gate: "/usr/bin/lutris",
-            seen: Seen::Class("net.lutris.Lutris"),
+            class: "net.lutris.Lutris",
             home_dirs: &["Games"],
             network: true,
             x11_host: true,
@@ -11163,7 +11152,7 @@ mod profile_smoke {
         gui_smoke(GuiProfile {
             profile: "mpv",
             gate: "/usr/bin/mpv",
-            seen: Seen::Class("mpv"),
+            class: "mpv",
             home_dirs: &["Videos"],
             network: false,
             x11_host: false,
@@ -11177,7 +11166,7 @@ mod profile_smoke {
         gui_smoke(GuiProfile {
             profile: "spotify",
             gate: "/usr/bin/spotify",
-            seen: Seen::Class("Spotify"),
+            class: "Spotify",
             home_dirs: &[],
             network: true,
             x11_host: false,
@@ -11191,13 +11180,15 @@ mod profile_smoke {
         gui_smoke(GuiProfile {
             profile: "steam",
             gate: "/usr/bin/steam",
-            seen: Seen::Title("Steam"),
+            class: "steam",
             home_dirs: &[],
             network: true,
             x11_host: true,
-            // `try`'s empty home makes every run Steam's first: it
-            // self-updates its client before any window maps, measured
-            // past two minutes on this host both sandboxed and bare.
+            // `try`'s empty home makes every run Steam's first, and a
+            // first run downloads the whole client before it starts:
+            // 496 MB, measured at about 16 minutes here. The limit is
+            // not enough for that and is not meant to be; a second
+            // obstacle behind it is measured in the profile's header.
             limit: Duration::from_secs(180),
         });
     }
@@ -11208,7 +11199,7 @@ mod profile_smoke {
         gui_smoke(GuiProfile {
             profile: "thunderbird",
             gate: "/usr/bin/thunderbird",
-            seen: Seen::Class("org.mozilla.Thunderbird"),
+            class: "org.mozilla.Thunderbird",
             home_dirs: &["Downloads"],
             network: true,
             x11_host: false,
@@ -11222,7 +11213,7 @@ mod profile_smoke {
         gui_smoke(GuiProfile {
             profile: "vesktop",
             gate: "/usr/bin/vesktop",
-            seen: Seen::Class("vesktop"),
+            class: "vesktop",
             home_dirs: &[],
             network: true,
             x11_host: false,

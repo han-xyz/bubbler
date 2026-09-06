@@ -6,7 +6,26 @@
 // client opens several windows and there is no window manager inside.
 // The Arch wiki's own bwrap example carries an accuracy dispute over
 // exactly that forwarding: an X11 client can keylog and inject into every
-// other X11 client, Xwayland included.
+// other X11 client, Xwayland included. Measured: the client and
+// steamwebhelper both come up as Xwayland clients here.
+//
+// `wayland` is not for the client, then, but for what it starts: an SDL3
+// or a native-Wayland game, and gamescope run nested on this session
+// rather than embedded on a card node (Arch wiki, Gamescope). It costs
+// nothing beside `x11 "host"`, which already hands over the whole
+// display, and what goes through it goes through bubbler's proxy and a
+// security context, which X11 has no equivalent of.
+//
+// `dri` is the GPU everything here renders on, the 32-bit client
+// included. Bare, not `kms=#true`: the card node is the display
+// controller, and a game drawing into a window on this session's
+// compositor never opens one. Gamescope wants one only as an embedded
+// compositor.
+//
+// `gamepad` is the controllers, read through evdev. It binds /dev/input
+// whole, so the keyboard and the mouse of this seat come with it
+// (measured: the nodes readable inside are the ones udev gave this login
+// an ACL on) — which `x11 "host"` above already concedes.
 //
 // Sound is `pulseaudio`. The grant binds $XDG_RUNTIME_DIR/pulse/native —
 // the socket PipeWire's pulse server holds on a PipeWire host — and sets
@@ -31,6 +50,24 @@
 // service and exits 71, so steam.sh stops before the client starts
 // (measured). Steam brings its own file browser; a path outside the
 // private home is shared below instead.
+//
+// Known here, measured 2026-09-06: the client installs and connects,
+// but steamwebhelper — everything you would look at — never starts, so
+// no window ever maps. The helper runs under pressure-vessel's own
+// bubblewrap, which binds the outer /etc/resolv.conf into its container;
+// bubbler writes that file, and /etc/passwd and /etc/group, with bwrap's
+// `--ro-bind-data`, which binds an inode bwrap has already unlinked, and
+// a nested bind of one of those fails with ENOENT (reproduced with two
+// plain bwraps and no bubbler). The client restarts the helper every ten
+// seconds and shows nothing. Nothing in this profile changes that; a
+// generated file written into the sandbox rather than bound over it does
+// — measured, the client then reaches its sign-in window.
+//
+// A first run is also a download of the whole client — 496 MB, about
+// 16 minutes here — with no window while it happens: the bootstrapper
+// takes its console update UI while the installed client version is 0
+// ("Using update UI: console" in ~/.local/share/Steam/logs), and only an
+// installed client's updater draws one.
 //
 // Steam builds its own ~/.steam and ~/.local/share/Steam in the private
 // home on first run. The host's are not shared, because ~/.steam is a
