@@ -21,6 +21,21 @@
 // The bare node grants none of them. Screen sharing needs `pipewire`
 // too — the portal picks the source, PipeWire carries the frames.
 //
+// `dbus` is the proxied session bus. It is here because a portal call is
+// a bus call and `portals` cannot work without one; the bare node opens
+// no name of its own, and every rule the proxy carries comes from the
+// bundles beside it.
+//
+// `dri` is the GPU. Without it Gecko composites in software, which
+// renders every page and costs frame rate and battery on a video. Bare,
+// so the sandbox gets the render nodes and not the card nodes: no EDID,
+// no framebuffer geometry, no other client's buffers.
+//
+// `home-share "Downloads" mode=rw` is where a download lands, and the
+// only part of the real home this profile shares. Picking a file to
+// upload goes the other way, through the portal file chooser, which
+// needs no share at all.
+//
 // Bare by design. Add:
 //   pipewire
 //     — screen and window sharing: the portal picks the source and hands
