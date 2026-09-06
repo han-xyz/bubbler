@@ -1,5 +1,10 @@
 // bubbler profile: kitty
 //
+// A display and a GPU, and nothing else. kitty draws its cells through
+// OpenGL: without `dri` the sandbox holds no render node at all and EGL
+// falls back to llvmpipe (measured — `libEGL warning: failed to get
+// driver name for fd -1`). It runs either way, in software.
+//
 // A terminal emulator allocates its own pseudoterminals. bwrap's
 // `--dev /dev` gives every sandbox a private devpts instance with its own
 // index space (measured), so this needs no grant of its own and never a
