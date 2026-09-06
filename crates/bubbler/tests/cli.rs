@@ -11031,21 +11031,25 @@ mod profile_smoke {
         c
     }
 
-    /// Whether this host has the native install layout `claude-code` and
-    /// `claude-code-strict` both hard-code a `home-share` of. Without
-    /// both paths present, launch fails before the command this test
-    /// overrides ever runs — a missing `home-share` source is a launch
-    /// error regardless of what command replaces the profile's own.
-    fn require_claude_native_install() -> bool {
+    /// Whether `claude` is resolvable in the sandbox PATH: either `/usr/bin/claude`
+    /// exists (npm global layout) or both `~/.local/bin/claude` and
+    /// `~/.local/share/claude` exist (native installer layout). The sandbox PATH is
+    /// `/usr/bin:/home/bubbler/.local/bin`, so the command searches those in order.
+    fn require_claude_resolvable() -> bool {
+        if std::path::Path::new("/usr/bin/claude").is_file() {
+            return true;
+        }
         let Some(home) = std::env::var_os("HOME") else {
-            say("skipping: claude-code needs $HOME to find the native install");
+            say("skipping: claude-code needs $HOME to resolve the native install");
             return false;
         };
         let home = PathBuf::from(home);
         let ok =
             home.join(".local/bin/claude").is_file() && home.join(".local/share/claude").is_dir();
         if !ok {
-            say("skipping: ~/.local/bin/claude or ~/.local/share/claude is not installed");
+            say(
+                "skipping: neither /usr/bin/claude nor ~/.local/bin/claude with ~/.local/share/claude is installed",
+            );
         }
         ok
     }
@@ -11118,7 +11122,7 @@ mod profile_smoke {
     fn claude_code_prints_its_version() {
         command_smoke(
             "claude-code",
-            || require_bwrap() && require_pasta() && require_claude_native_install(),
+            || require_bwrap() && require_pasta() && require_claude_resolvable(),
             true,
             &["claude", "--version"],
             |out| out.starts_with(|c: char| c.is_ascii_digit()),
@@ -11131,7 +11135,7 @@ mod profile_smoke {
     fn claude_code_strict_prints_its_version() {
         command_smoke(
             "claude-code-strict",
-            || require_egress() && require_claude_native_install(),
+            || require_egress() && require_claude_resolvable(),
             true,
             &["claude", "--version"],
             |out| out.starts_with(|c: char| c.is_ascii_digit()),
