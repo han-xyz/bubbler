@@ -106,15 +106,15 @@ fn flag_services() -> impl Strategy<Value = Vec<Service>> {
 /// one the parser accepts.
 fn share_services() -> impl Strategy<Value = Vec<Service>> {
     (
-        prop::collection::vec((rel_path(), share_mode()), 0..3),
-        prop::collection::vec((rel_path(), share_mode()), 0..3),
+        prop::collection::vec((rel_path(), share_mode(), any::<bool>()), 0..3),
+        prop::collection::vec((rel_path(), share_mode(), any::<bool>()), 0..3),
         prop::collection::vec(prop::sample::select(ETC_ENTRIES), 0..3),
         prop::collection::vec((prop::sample::select(APP_IDS), share_mode()), 0..2),
     )
         .prop_map(|(home, path, etc, app)| {
             let mut out = Vec::new();
             let mut seen: Vec<PathBuf> = Vec::new();
-            for (path, mode) in home {
+            for (path, mode, optional) in home {
                 if seen.contains(&path) {
                     continue;
                 }
@@ -122,11 +122,11 @@ fn share_services() -> impl Strategy<Value = Vec<Service>> {
                 out.push(Service::HomeShare {
                     path,
                     mode,
-                    optional: false,
+                    optional,
                 });
             }
             let mut seen: Vec<PathBuf> = Vec::new();
-            for (rel, mode) in path {
+            for (rel, mode, optional) in path {
                 let path = Path::new("/opt").join(rel);
                 if seen.contains(&path) {
                     continue;
@@ -135,7 +135,7 @@ fn share_services() -> impl Strategy<Value = Vec<Service>> {
                 out.push(Service::PathShare {
                     path,
                     mode,
-                    optional: false,
+                    optional,
                 });
             }
             let mut seen: Vec<&str> = Vec::new();

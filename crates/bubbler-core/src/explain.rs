@@ -1654,6 +1654,51 @@ bwrap
         );
     }
 
+    /// A present optional share binds exactly as a required one would,
+    /// and the skip line belongs to the one it does not bind: a group
+    /// with an argument is never the one `n == 0` matches.
+    #[test]
+    fn a_present_optional_home_share_binds_normally_and_is_not_reported_skipped() {
+        let cfg = InstanceConfig {
+            services: vec![Service::HomeShare {
+                path: PathBuf::from("Downloads"),
+                mode: ShareMode::ReadOnly,
+                optional: true,
+            }],
+            ..InstanceConfig::default()
+        };
+        let items = [item(
+            Origin::Service(0),
+            &[
+                "--ro-bind",
+                "/home/user/Downloads",
+                "/home/bubbler/Downloads",
+            ],
+            None,
+        )];
+        let view = View {
+            title: "bwrap",
+            instance: "t",
+            cfg: &cfg,
+            source: Source {
+                file: "config.kdl",
+                lines: &Lines::default(),
+            },
+            rules: &[],
+            wl_proxy: None,
+            net_proxy_log: false,
+            proxy: false,
+            full: false,
+            bwrap: crate::version::Version::Known(0, 12, 0),
+        };
+        let out = render(&items, &view).unwrap();
+        assert!(
+            out.contains(&"    --ro-bind /home/user/Downloads /home/bubbler/Downloads".to_owned()),
+            "{out:?}"
+        );
+        assert!(!out.iter().any(|l| l.contains("skipped")), "{out:?}");
+    }
+
     /// A share that is not optional gets no such line even with no
     /// arguments: the group being empty here only means the test built
     /// no `Explained` item for it, never that a live launch would have

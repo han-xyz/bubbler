@@ -2313,6 +2313,24 @@ mod tests {
         assert!(a.contains("mode=ro") && a.contains("b.kdl"), "{a}");
         assert!(b.contains("mode=rw") && b.contains("a.kdl"), "{b}");
 
+        // `optional=#true` sits after `mode=` in the rendered node, so
+        // the header must still find and drop the mode underneath it
+        // rather than leaving the settled value in a message about the
+        // two that disagree.
+        let r = resolver(
+            tmp.path(),
+            &[(
+                "a",
+                "include \"b\"\nhome-share \"D\" mode=rw optional=#true\n",
+            )],
+            &[("b", "home-share \"D\"\n")],
+        );
+        let err = r.resolve("a").unwrap_err();
+        let ProfileError::Conflict { node, .. } = &err else {
+            panic!("{err:?}")
+        };
+        assert_eq!(node, "home-share \"D\" optional=#true");
+
         // `path-share` carries a mode too, so it needs the same rule: a
         // layer that collapsed the pair would hand out `rw` or take it
         // away, and neither is what either file asked for.
