@@ -22,11 +22,12 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "bubbler-core"
-version = "0.20.1"
+version = "0.21.0"
 dependencies = [
  "bubbler-init",
  "bubbler-net-proxy",
  "kdl",
+ "libc",
  "libseccomp",
  "rustix",
  "signal-hook",
@@ -49,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "bubbler-init"
-version = "0.20.1"
+version = "0.21.0"
 dependencies = [
  "rustix",
  "signal-hook",
@@ -57,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "bubbler-net-proxy"
-version = "0.20.1"
+version = "0.21.0"
 dependencies = [
  "rustix",
  "thiserror",
