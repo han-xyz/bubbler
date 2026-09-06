@@ -135,6 +135,7 @@ grant and are always written back as a block.
 | `portals` | portal names + app id `org.bubbler.<inst>`; binds the instance's document-portal view at `$XDG_RUNTIME_DIR/doc`, which is also where host file arguments of `run`/`try`/`open` land | Steam's runtime misreads `/.flatpak-info` |
 | `a11y` | the session's accessibility bus, proxied as a third bus; `AT_SPI_BUS_ADDRESS` | a screen reader reads this app's widgets; needs `dbus` |
 | `notify`, `tray`, `mpris`, `input-method` | one or two bus rules each; `IBUS_USE_PORTAL` for `input-method` | need `dbus` in the merged result, as `portals` and `a11y` do |
+| `etc "host"` | the host's whole `/etc`, read-only, in place of the allowlist | `hostname`, `fstab`, `ssh/ssh_config`, `X11` config and every other world-readable file becomes visible; `passwd`/`group` stay synthetic; lint warns |
 | `tmp` | cap the sandbox's own `/tmp`, up to 64G | default is 2G; every other tmpfs (`/etc`, `/var`, `/run`) stays capped at 64M |
 | `seccomp` | edit the default denylist | `disable` prints a warning each run |
 | `userns "disable"` | no nested user namespaces | breaks Firefox/Chromium inner sandbox, Steam, podman |

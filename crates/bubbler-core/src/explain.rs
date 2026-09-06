@@ -160,6 +160,10 @@ fn label(origin: Origin, cfg: &InstanceConfig) -> Result<String, ConfigError> {
             Origin::Baseline => "baseline".to_owned(),
             Origin::Seccomp => "seccomp".to_owned(),
             Origin::Userns => "userns".to_owned(),
+            // Only reached in Host mode: the allowlist's items stay
+            // tagged `Origin::Baseline`, so there is no bare-node case
+            // to spell here.
+            Origin::Etc => "etc \"host\"".to_owned(),
             Origin::Tmp => match cfg.tmp {
                 Some(size) => kdl_out::tmp(size),
                 None => "tmp".to_owned(),
@@ -620,6 +624,7 @@ pub fn render_json(items: &[Explained], view: &View) -> Result<String, ConfigErr
             Origin::Baseline => ("baseline", None),
             Origin::Seccomp => ("seccomp", None),
             Origin::Userns => ("userns", None),
+            Origin::Etc => ("etc", None),
             Origin::Tmp => ("tmp", None),
             Origin::Ctty => ("ctty", None),
             Origin::Identity => ("identity", None),
@@ -834,6 +839,54 @@ bwrap
     -- true
 
 27 arguments in 7 groups, 4 hidden (--explain=full); 40 D-Bus rules to the proxy (--proxy)";
+
+    /// The host bind and the two synthetic files render as one group
+    /// headed by the node that put them there, not folded into the
+    /// baseline that would exist without it.
+    #[test]
+    fn an_etc_host_grant_groups_the_bind_and_the_synthetic_files_together() {
+        let cfg = cfg("etc \"host\"\ncommand \"true\"");
+        let lines = Lines::default();
+        let items = [
+            item(Origin::Etc, &["--ro-bind", "/etc", "/etc"], None),
+            item(Origin::Etc, &["--ro-bind-data", "4", "/etc/passwd"], None),
+            item(Origin::Etc, &["--ro-bind-data", "5", "/etc/group"], None),
+            item(Origin::Command, &["--", "true"], None),
+        ];
+        let out = render(
+            &items,
+            &View {
+                title: "bwrap",
+                instance: "t",
+                cfg: &cfg,
+                source: Source {
+                    file: "config.kdl",
+                    lines: &lines,
+                },
+                rules: &[],
+                wl_proxy: None,
+                net_proxy_log: false,
+                proxy: false,
+                full: false,
+                bwrap: crate::version::Version::Known(0, 12, 0),
+            },
+        )
+        .unwrap();
+        let at = out
+            .iter()
+            .position(|l| l.starts_with("  etc"))
+            .unwrap_or_else(|| panic!("{out:#?}"));
+        assert_eq!(out[at], "  etc \"host\"  9 arguments");
+        assert_eq!(
+            &out[at + 1..at + 4],
+            [
+                "    --ro-bind /etc /etc".to_owned(),
+                "    --ro-bind-data 4 /etc/passwd".to_owned(),
+                "    --ro-bind-data 5 /etc/group".to_owned(),
+            ],
+            "{out:#?}"
+        );
+    }
 
     /// Which socket a `wayland` grant binds is not visible in its
     /// arguments — both are one `--ro-bind` — so the mode is a line of

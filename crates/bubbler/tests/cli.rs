@@ -2585,6 +2585,70 @@ fn real_bwrap_etc_is_allowlisted_and_user_is_bubbler() {
     }
 }
 
+/// `etc "host"` binds the host's whole `/etc` read-only in place of the
+/// allowlist: `/etc/fstab`, which `ETC_ALLOWLIST` never carries, reads
+/// with the node and does not without it, while `id -un` still says
+/// `bubbler` either way.
+///
+/// `/etc/os-release` is a poor file for this contrast on a host where
+/// it is a symlink into `/usr`: `os-release` is itself in
+/// `ETC_ALLOWLIST`, so the allowlist already binds it by following the
+/// link. `fstab` is not on that list.
+#[test]
+fn real_bwrap_etc_host_binds_the_hosts_whole_etc() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    if !Path::new("/etc/fstab").is_file() {
+        say("skipping: this host has no /etc/fstab, which the allowlist never carries");
+        return;
+    }
+    let script = "id -un; cat /etc/fstab >/dev/null && echo READ || echo MISSING";
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "hostetc"])
+        .status()
+        .unwrap();
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/hostetc/config.kdl"),
+        "etc \"host\"\n",
+    )
+    .unwrap();
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["run", "hostetc", "--", "/usr/bin/sh", "-c", script])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut lines = s.lines();
+    assert_eq!(lines.next(), Some("bubbler"), "{s}");
+    assert_eq!(lines.next(), Some("READ"), "{s}");
+
+    // The same script, with the allowlist standing: fstab is not on it.
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "allowlistetc"])
+        .status()
+        .unwrap();
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["run", "allowlistetc", "--", "/usr/bin/sh", "-c", script])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut lines = s.lines();
+    assert_eq!(lines.next(), Some("bubbler"), "{s}");
+    assert_eq!(lines.next(), Some("MISSING"), "{s}");
+}
+
 /// Poll until `ready` holds, so the test never sleeps longer than it must.
 fn wait_until(mut ready: impl FnMut() -> bool, limit: Duration) -> bool {
     let deadline = Instant::now() + limit;

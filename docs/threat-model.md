@@ -995,6 +995,21 @@ the machine shares through that node. `dri kms=#true` grants them back,
 says so in `--explain` and is noted by `lint`; no shipped profile sets
 it.
 
+`/etc` defaults to an allowlist over a tmpfs: only the names in
+`ETC_ALLOWLIST` that exist on the host are bound, so a file the list misses
+is not there whatever the application expects, which is the default and the
+reason for it — a config cannot widen `/etc` by accident, and a host file
+bubbler has not reviewed stays unreachable. `passwd` and `group` are always
+the synthetic ones bubbler writes (the account `bubbler`, holding the host's
+uid and gid, plus `nobody`), never the host's own. `etc "host"` is the
+explicit opt-out: it binds the host's whole `/etc` read-only in the
+allowlist's place, so `hostname`, `fstab`, `ssh/ssh_config`, the `X11`
+config directory and every other world-readable file the host keeps there
+becomes visible to the sandbox. The synthetic `passwd` and `group` are
+mounted over that bind last regardless, so the host username stays hidden
+in both modes; `lint` warns (`etc-host`) so the choice is on purpose. No
+shipped profile sets it.
+
 **Does not defend:** TOCTOU. bwrap resolves the path again when it binds,
 so between bubbler's check and that bind the tree can change; on a
 single-user machine the party who could change it is you. And the flip
@@ -1025,7 +1040,13 @@ the bare node as with `kms=#true`.
 `dri_without_a_render_node_under_by_path_is_an_error`,
 `dri_refuses_a_render_node_whose_sysfs_leaves_the_device_tree`,
 `dris_card_masks_survive_a_gamepads_whole_device_tree`,
-`real_bwrap_dri_initialises_a_driver_without_the_card_nodes`
+`real_bwrap_dri_initialises_a_driver_without_the_card_nodes`,
+`etc_host_parses_and_anything_else_is_refused`,
+`binding_the_hosts_etc_replaces_the_tmpfs_and_allowlist_with_one_bind`,
+`binding_the_hosts_etc_tags_the_bind_and_the_synthetic_files_with_its_own_origin`,
+`etc_host_is_a_warning_and_the_bare_node_is_not`,
+`real_bwrap_etc_is_allowlisted_and_user_is_bubbler`,
+`real_bwrap_etc_host_binds_the_hosts_whole_etc`
 
 ### File arguments
 

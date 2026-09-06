@@ -16,8 +16,8 @@ use std::ffi::{OsStr, OsString};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::config::{
-    BusRule, Clipboard, Disabled, InstanceConfig, LintAllow, NestedX11, Node, Service, ShareMode,
-    TmpSize, Userns, WaylandMode, X11Mode,
+    BusRule, Clipboard, Disabled, EtcMode, InstanceConfig, LintAllow, NestedX11, Node, Service,
+    ShareMode, TmpSize, Userns, WaylandMode, X11Mode,
 };
 use crate::error::ConfigError;
 use crate::network::{Mode as NetworkMode, NetworkConfig, Outbound};
@@ -59,6 +59,15 @@ pub fn nodes(cfg: &InstanceConfig) -> Result<Vec<String>, ConfigError> {
         cfg,
         |n| matches!(n, Node::Env(_)),
         cfg.env.iter().map(|(k, v)| env(k, v)).collect(),
+        &mut out,
+    )?;
+    section(
+        cfg,
+        |n| matches!(n, Node::Etc(_)),
+        (cfg.etc != EtcMode::default())
+            .then(|| etc(cfg.etc))
+            .into_iter()
+            .collect(),
         &mut out,
     )?;
     section(
@@ -207,6 +216,7 @@ pub fn node(n: &Node) -> Result<String, ConfigError> {
                 });
             }
         },
+        Node::Etc(mode) => etc(*mode),
         Node::Tmp(size) => tmp(*size),
         Node::Tty(mode) => tty(*mode),
         Node::Userns(mode) => userns(*mode),
@@ -578,6 +588,15 @@ pub fn env(key: &str, value: &str) -> String {
     format!("env {key}={}", quote(value))
 }
 
+/// The `etc` node for `mode`: bare for the allowlist, `"host"` for the
+/// host's own `/etc`.
+pub fn etc(mode: EtcMode) -> String {
+    match mode {
+        EtcMode::Allowlist => "etc".to_owned(),
+        EtcMode::Host => "etc \"host\"".to_owned(),
+    }
+}
+
 /// The `tmp` node for `size`, spelled with the largest of `K`, `M` and
 /// `G` that divides it — which is the spelling it was read as, since the
 /// parser takes no other.
@@ -734,6 +753,20 @@ mod tests {
             // Canonical already: what the emitter writes is the input.
             assert_eq!(render(&parse(text).unwrap()).unwrap(), text);
         }
+    }
+
+    /// The bare node normalises away like `tty`'s and `userns`'s default
+    /// values do: a config that grants nothing beyond the allowlist
+    /// writes nothing back for it. `"host"` is canonical already.
+    #[test]
+    fn etc_host_round_trips_and_the_bare_node_normalises_away() {
+        round_trip("etc\n");
+        assert_eq!(render(&parse("etc\n").unwrap()).unwrap(), "");
+        round_trip("etc \"host\"\n");
+        assert_eq!(
+            render(&parse("etc \"host\"\n").unwrap()).unwrap(),
+            "etc \"host\"\n"
+        );
     }
 
     /// Both modes and the gate, since the emitter is what a saved config

@@ -36,7 +36,7 @@ use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 use bubbler_init::fds;
 
 use crate::bwrap::{BwrapArgs, Explained, FdAllocator, Origin};
-use crate::config::{NetworkConfig, Service, Userns, WaylandMode};
+use crate::config::{EtcMode, NetworkConfig, Service, Userns, WaylandMode};
 use crate::env::Env;
 use crate::error::{ConfigError, LaunchError};
 use crate::host::{Host, RealHost};
@@ -459,6 +459,10 @@ fn build_args_on<'a>(
     if inst.config.userns == Userns::Disable {
         args.tag(Origin::Userns);
         args.disable_userns();
+    }
+    if inst.config.etc == EtcMode::Host {
+        args.tag(Origin::Etc);
+        args.bind_host_etc();
     }
     if let Some(size) = inst.config.tmp {
         args.tag(Origin::Tmp);

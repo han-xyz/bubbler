@@ -1867,6 +1867,20 @@ stamps the header too, since a file you have just read through means what it
 says. Each version is measured on its own, so a file that recorded 2 is never
 warned about `network` again however far the header has moved on since.
 
+### etc
+
+`etc ["host"]`: the bare node keeps the tmpfs allowlist described under
+"Baseline" — bubbler's default, and the reason for it is there. `etc "host"`
+binds the host's whole `/etc` read-only in its place: `hostname`, `fstab`,
+`ssh/ssh_config`, the `X11` config directory and every other world-readable
+file the host keeps in `/etc` becomes visible, not only the names
+`ETC_ALLOWLIST` lists. `passwd` and `group` are still the synthetic ones
+bubbler writes, mounted over the host bind last, so the host username stays
+hidden either way. The node takes no property and no child; anything besides
+a bare `etc` or `etc "host"` is a config error. `bubbler lint` warns about it
+as `etc-host` and takes a `lint-allow` node naming what the application reads
+from `/etc` that the allowlist misses.
+
 ### tmp
 
 `tmp size="<n>K|M|G"` moves the cap on the sandbox's own `/tmp` above the
@@ -2883,7 +2897,12 @@ touch of yours), `wayland-host`
 (`wayland "host"`, the session's own compositor socket, which the compositor
 cannot tell from your session), `network-host` (`network "host"` shares the
 host network namespace: every host loopback service and every abstract unix
-socket, X11's included, is reachable), `dbus-name-is-risky` (a `dbus` or
+socket, X11's included, is reachable), `etc-host` (`etc "host"` binds the
+host's whole `/etc` read-only in place of the allowlist: `hostname`, `fstab`,
+`ssh/ssh_config`, the `X11` config directory and every other world-readable
+file the host keeps there becomes visible; `passwd` and `group` stay the
+synthetic ones bubbler writes, so the host username is hidden either way),
+`dbus-name-is-risky` (a `dbus` or
 `system-bus` rule naming a bus name that is defensible but wide — the KWin or
 GNOME shell compositor's own name, the session's file manager, or the Secret
 Service — with the one sentence a reader needs about what the name is),

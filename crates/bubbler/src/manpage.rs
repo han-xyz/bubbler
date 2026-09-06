@@ -354,6 +354,12 @@ const CHECK_LINES: &[(&str, &str)] = &[
         "An `env` name or value that looks like a credential, in a file people share.",
     ),
     (
+        "etc-host",
+        "`etc \"host\"` binds the host's whole `/etc` read-only in place of the allowlist: \
+         `hostname`, `fstab`, `ssh_config` and every other world-readable file the host \
+         keeps there becomes visible.",
+    ),
+    (
         "home-share-reserved",
         "A `home-share` of a directory bubbler builds the sandbox out of — the instance \
          store or the profile layer — or of one holding it; the launcher refuses it.",

@@ -36,7 +36,10 @@ sandbox).
 `path-share-mountpoint`, `path-share-socket`, `share-source-missing`,
 `dbus-without-rules`, `env-looks-secret`, `tty-passthrough`,
 `tty-passthrough-without-seccomp`, `portal-talk-without-portals`,
-`wayland-host`, `wayland-clipboard-open`, `network-host`,
+`wayland-host`, `wayland-clipboard-open`, `network-host`, `etc-host` (`etc
+"host"` binds the host's whole `/etc` read-only in place of the allowlist:
+`hostname`, `fstab`, `ssh/ssh_config`, `X11` config and every other
+world-readable file becomes visible; `passwd`/`group` stay synthetic),
 `dbus-name-is-risky` (a `dbus`/`system-bus` rule naming a name that is
 defensible but wide — KWin's or the GNOME shell's own bus name, the session's
 file manager, or the Secret Service), `pulseaudio-module-loading` (a

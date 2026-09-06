@@ -123,6 +123,13 @@ const ENV_LOOKS_SECRET: Check = Check {
     id: "env-looks-secret",
     severity: Severity::Warning,
 };
+// A warning, not a note: the username stays hidden either way, but
+// everything else the host keeps in `/etc` becomes readable, and the
+// file cannot say which of that the application actually needs.
+const ETC_HOST: Check = Check {
+    id: "etc-host",
+    severity: Severity::Warning,
+};
 // An error, not a warning: what it names, the launcher refuses. A
 // `home-share` of the instance store or the profile layer would hand the
 // sandbox the files bubbler builds it out of.
@@ -275,6 +282,7 @@ pub const CHECKS: &[Check] = &[
     DRI_KMS,
     DUP_NAME_POLICY,
     ENV_LOOKS_SECRET,
+    ETC_HOST,
     HOME_SHARE_RESERVED,
     HOME_SHARE_SENSITIVE,
     LINT_ALLOW_UNUSED,
@@ -1203,6 +1211,18 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                 "`tty \"passthrough\"` hands the sandbox this terminal's own descriptors"
                     .to_owned(),
                 "leave the default `pty` unless the command has to share the caller's terminal",
+            ),
+            "etc" if arg(node) == Some("host") => f.push(
+                i,
+                node,
+                &ETC_HOST,
+                "`etc \"host\"` binds the host's whole `/etc` read-only in place of the \
+                 allowlist: `hostname`, `fstab`, `ssh_config` and every other \
+                 world-readable file the host keeps there becomes visible"
+                    .to_owned(),
+                "drop the argument for the tmpfs allowlist, or accept it with \
+                 `lint-allow \"etc-host\" reason=\"...\"` naming what the application reads \
+                 from `/etc` that the allowlist misses",
             ),
             "network" if arg(node) == Some("host") => f.push(
                 i,
@@ -2146,6 +2166,24 @@ mod tests {
                 ],
             );
             assert_eq!(ids(&narrow), ["outbound-deny"]);
+        });
+    }
+
+    /// The host's whole `/etc` is a warning of the same weight as
+    /// `wayland "host"` and `network "host"`: the username stays hidden,
+    /// but everything else the host keeps in `/etc` becomes visible.
+    #[test]
+    fn etc_host_is_a_warning_and_the_bare_node_is_not() {
+        with(&host(), |ctx| {
+            let report = lint(ctx, &["etc \"host\""]);
+            assert_eq!(ids(&report), ["etc-host"]);
+            assert_eq!(report.findings[0].severity, Severity::Warning);
+            assert_eq!(ids(&lint(ctx, &["etc"])), [] as [&str; 0]);
+            let allowed = lint(
+                ctx,
+                &["etc \"host\"\nlint-allow \"etc-host\" reason=\"needs /etc/fstab\""],
+            );
+            assert_eq!(ids(&allowed), [] as [&str; 0]);
         });
     }
 

@@ -320,6 +320,19 @@ pub static GRANTS: &[Grant] = &[
         grammar: "input-method",
     },
     Grant {
+        node: "etc",
+        summary: "the host's whole `/etc`, read-only, in place of the allowlist",
+        cost: "The baseline binds only the names in `ETC_ALLOWLIST` \
+               (`crates/bubbler-core/src/bwrap.rs`). `etc \"host\"` replaces that tmpfs \
+               with the host's `/etc` as it is: `hostname`, `fstab`, `ssh/ssh_config`, the \
+               `X11` config directory and every other world-readable file the host keeps \
+               there, not only the allowlist's entries. `passwd` and `group` are still the \
+               synthetic ones bubbler writes, mounted over it last, so the host username \
+               stays hidden either way.",
+        risk: Risk::Wide,
+        grammar: "etc [\"host\"]",
+    },
+    Grant {
         node: "tmp",
         summary: "how large the sandbox's `/tmp` may grow",
         cost: "A tmpfs is pinned host memory, so whatever the sandbox writes to `/tmp` \
@@ -442,6 +455,7 @@ mod tests {
         ("mpris", "mpris name=\"example\""),
         ("a11y", "a11y"),
         ("input-method", "input-method"),
+        ("etc", "etc \"host\""),
         ("tmp", "tmp size=\"2G\""),
         ("tty", "tty \"none\""),
         ("userns", "userns \"disable\""),

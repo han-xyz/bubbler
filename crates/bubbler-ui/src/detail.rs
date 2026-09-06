@@ -6,7 +6,7 @@
 
 use bubbler_core::catalogue::{self, Grant};
 use bubbler_core::config::{
-    self, Disabled, InstanceConfig, Node, Portal, RawProfile, Service, Userns,
+    self, Disabled, EtcMode, InstanceConfig, Node, Portal, RawProfile, Service, Userns,
 };
 use bubbler_core::env::Env;
 use bubbler_core::host::RealHost;
@@ -26,6 +26,8 @@ pub enum Target {
     Env(usize),
     /// One accepted finding, by its index.
     LintAllow(usize),
+    /// The `etc` node, of which a config holds one.
+    Etc,
     /// The `tmp` node, of which a config holds one.
     Tmp,
     /// The `tty` node, of which a config holds one.
@@ -437,6 +439,7 @@ impl Detail {
                 self.shift_disabled(rank, i, grew);
             }
             (Node::LintAllow(allows), _) => self.buf.lint_allows.extend(allows),
+            (Node::Etc(mode), _) => self.buf.etc = mode,
             (Node::Tmp(size), _) => self.buf.tmp = Some(size),
             (Node::Tty(mode), _) => self.buf.tty = mode,
             (Node::Userns(mode), _) => self.buf.userns = mode,
@@ -454,6 +457,7 @@ impl Detail {
             Target::Service(i) => Node::Service(self.buf.services.get(i)?.clone()),
             Target::Env(i) => Node::Env(vec![self.buf.env.get(i)?.clone()]),
             Target::LintAllow(i) => Node::LintAllow(vec![self.buf.lint_allows.get(i)?.clone()]),
+            Target::Etc => Node::Etc(self.buf.etc),
             Target::Tmp => Node::Tmp(self.buf.tmp?),
             Target::Tty => Node::Tty(self.buf.tty),
             Target::Userns => Node::Userns(self.buf.userns),
@@ -486,6 +490,7 @@ impl Detail {
             Target::LintAllow(i) => {
                 self.buf.lint_allows.remove(i);
             }
+            Target::Etc => self.buf.etc = EtcMode::default(),
             Target::Tmp => self.buf.tmp = None,
             Target::Tty => self.buf.tty = TtyMode::default(),
             Target::Userns => self.buf.userns = Userns::default(),
@@ -590,6 +595,11 @@ impl Detail {
                 self.buf.lint_allows.splice(at..at, allows);
                 Placed::Added(added)
             }
+            Node::Etc(mode) => {
+                let held = self.buf.etc != EtcMode::default();
+                self.buf.etc = mode;
+                Placed::one_of(held, self.buf.etc == EtcMode::default())
+            }
             Node::Tmp(size) => Placed::one_of(self.buf.tmp.replace(size).is_some(), false),
             Node::Tty(mode) => {
                 let held = self.buf.tty != TtyMode::default();
@@ -618,6 +628,7 @@ impl Detail {
             Node::LintAllow(_) => self.buf.lint_allows.len(),
             Node::Service(_) => self.buf.services.len(),
             Node::Env(_) => self.buf.env.len(),
+            Node::Etc(_) => usize::from(self.buf.etc != EtcMode::default()),
             Node::Tmp(_) => usize::from(self.buf.tmp.is_some()),
             Node::Tty(_) => usize::from(self.buf.tty != TtyMode::default()),
             Node::Userns(_) => usize::from(self.buf.userns != Userns::default()),
@@ -710,7 +721,8 @@ fn grew_by(n: usize) -> isize {
 fn index_of(target: Target) -> Option<usize> {
     Some(match target {
         Target::LintAllow(i) | Target::Service(i) | Target::Env(i) => i,
-        Target::Tmp
+        Target::Etc
+        | Target::Tmp
         | Target::Tty
         | Target::Userns
         | Target::Seccomp
@@ -735,6 +747,9 @@ fn written(raw: RawProfile) -> Result<Node, String> {
     }
     if !cfg.lint_allows.is_empty() {
         found.push(Node::LintAllow(cfg.lint_allows));
+    }
+    if raw.etc_set {
+        found.push(Node::Etc(cfg.etc));
     }
     if let Some(size) = cfg.tmp {
         found.push(Node::Tmp(size));
@@ -802,6 +817,14 @@ fn rows(cfg: &InstanceConfig) -> Result<Vec<Row>, String> {
             .iter()
             .enumerate()
             .map(|(i, (key, value))| ("env", kdl_out::env(key, value), Target::Env(i)))
+            .collect(),
+    )?;
+    out.section(
+        cfg,
+        |n| matches!(n, Node::Etc(_)),
+        (cfg.etc != EtcMode::default())
+            .then(|| ("etc", kdl_out::etc(cfg.etc), Target::Etc))
+            .into_iter()
             .collect(),
     )?;
     out.section(

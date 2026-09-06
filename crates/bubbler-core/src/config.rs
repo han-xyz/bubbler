@@ -168,6 +168,7 @@ pub const NODES: &[&str] = &[
     "mpris",
     "a11y",
     "input-method",
+    "etc",
     "tmp",
     "tty",
     "userns",
@@ -215,6 +216,18 @@ impl FromStr for Userns {
             }),
         }
     }
+}
+
+/// What the sandbox's `/etc` is built from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EtcMode {
+    /// A tmpfs holding only [`crate::bwrap::ETC_ALLOWLIST`], plus the
+    /// synthetic `passwd` and `group` that hide the host username.
+    #[default]
+    Allowlist,
+    /// The host's whole `/etc` bound read-only (`etc "host"`); `passwd`
+    /// and `group` are still the synthetic ones, mounted over it last.
+    Host,
 }
 
 /// What `wayland` binds: bubbler's own socket registered with the
@@ -725,6 +738,8 @@ pub enum Node {
     /// A `lint-allow` node. One node accepts one id; the list is what a
     /// caller building a node by hand may hold.
     LintAllow(Vec<LintAllow>),
+    /// An `etc` node: the allowlist or the host's whole `/etc`.
+    Etc(EtcMode),
     /// A `tmp` node: the cap on the sandbox's `/tmp`.
     Tmp(TmpSize),
     /// A `tty` node.
@@ -747,6 +762,7 @@ impl Node {
             Self::Service(s) => s.node_name(),
             Self::Env(_) => "env",
             Self::LintAllow(_) => "lint-allow",
+            Self::Etc(_) => "etc",
             Self::Tmp(_) => "tmp",
             Self::Tty(_) => "tty",
             Self::Userns(_) => "userns",
@@ -761,10 +777,17 @@ impl Node {
     /// spelled out by its name alone, so a `/-` line would keep nothing
     /// that granting it again does not write.
     pub fn has_content(&self) -> bool {
-        let Self::Service(s) = self else {
-            // Every other node takes an argument or children to parse at
-            // all, so there is no bare spelling of one.
-            return true;
+        let s = match self {
+            // The one other node with a bare spelling: like a service's
+            // default mode, the allowlist is what granting nothing more
+            // writes.
+            Self::Etc(mode) => return *mode != EtcMode::default(),
+            Self::Service(s) => s,
+            _ => {
+                // Every other node takes an argument or children to parse
+                // at all, so there is no bare spelling of one.
+                return true;
+            }
         };
         match s {
             Service::Wayland(mode) => *mode != WaylandMode::default(),
@@ -818,6 +841,9 @@ pub struct InstanceConfig {
     /// Extra environment variables, in file order; never a key from
     /// [`RESERVED_ENV`].
     pub env: Vec<(String, String)>,
+    /// What the sandbox's `/etc` is built from; the allowlist unless an
+    /// `etc` node says otherwise.
+    pub etc: EtcMode,
     /// Cap on the sandbox's `/tmp`; `None` leaves it at
     /// [`crate::bwrap::TMP_SIZE`].
     pub tmp: Option<TmpSize>,
@@ -858,6 +884,9 @@ pub struct RawProfile {
     /// Whether a `userns` node was written, for the same reason
     /// [`RawProfile::tty_set`] exists.
     pub userns_set: bool,
+    /// Whether an `etc` node was written, for the same reason
+    /// [`RawProfile::tty_set`] exists.
+    pub etc_set: bool,
 }
 
 /// Parse KDL v2 text into an [`InstanceConfig`]. `include` is rejected:
@@ -1262,6 +1291,7 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
     let mut includes: Vec<String> = Vec::new();
     let mut seen_tty = false;
     let mut seen_userns = false;
+    let mut seen_etc = false;
     let mut seen_seccomp = false;
     for node in doc.nodes() {
         // The `/-` lines above a node are read before the node itself, so
@@ -1302,6 +1332,13 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
                         }
                         cfg.lint_allows.push(allow);
                     }
+                }
+                Node::Etc(mode) => {
+                    if seen_etc {
+                        return Err(ConfigError::Duplicate(name.to_owned()));
+                    }
+                    seen_etc = true;
+                    cfg.etc = mode;
                 }
                 Node::Tmp(size) => {
                     if cfg.tmp.is_some() {
@@ -1406,6 +1443,7 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
             includes,
             tty_set: seen_tty,
             userns_set: seen_userns,
+            etc_set: seen_etc,
         },
         lines,
     ))
@@ -1653,6 +1691,7 @@ pub(crate) fn parse_one(node: &KdlNode, profile: bool) -> Result<Node, ConfigErr
         "camera" => Node::Service(parse_camera(node)?),
         "system-bus" => Node::Service(parse_system_bus(node)?),
         "mpris" => Node::Service(parse_mpris(node)?),
+        "etc" => Node::Etc(parse_etc(node)?),
         "tmp" => Node::Tmp(parse_tmp(node)?),
         "tty" => Node::Tty(parse_tty(node)?),
         "userns" => Node::Userns(parse_userns(node)?),
@@ -1735,6 +1774,7 @@ struct Counts {
     lint_allows: usize,
     services: usize,
     env: usize,
+    etc: usize,
     tmp: usize,
     tty: usize,
     userns: usize,
@@ -1750,6 +1790,7 @@ impl Counts {
             lint_allows: cfg.lint_allows.len(),
             services: cfg.services.len(),
             env: cfg.env.len(),
+            etc: usize::from(cfg.etc != EtcMode::default()),
             tmp: usize::from(cfg.tmp.is_some()),
             tty: usize::from(cfg.tty != TtyMode::default()),
             userns: usize::from(cfg.userns != Userns::default()),
@@ -1765,6 +1806,7 @@ impl Counts {
             Node::Service(_) => self.services,
             Node::Env(_) => self.env,
             Node::LintAllow(_) => self.lint_allows,
+            Node::Etc(_) => self.etc,
             Node::Tmp(_) => self.tmp,
             Node::Tty(_) => self.tty,
             Node::Userns(_) => self.userns,
@@ -1786,12 +1828,13 @@ pub fn section_rank(node: &Node) -> u8 {
         Node::LintAllow(_) => 0,
         Node::Service(_) => 1,
         Node::Env(_) => 2,
-        Node::Tmp(_) => 3,
-        Node::Tty(_) => 4,
-        Node::Userns(_) => 5,
-        Node::Seccomp(_) => 6,
-        Node::Desktop(_) => 7,
-        Node::Command(_) => 8,
+        Node::Etc(_) => 3,
+        Node::Tmp(_) => 4,
+        Node::Tty(_) => 5,
+        Node::Userns(_) => 6,
+        Node::Seccomp(_) => 7,
+        Node::Desktop(_) => 8,
+        Node::Command(_) => 9,
     }
 }
 
@@ -2849,6 +2892,43 @@ fn parse_geometry(s: &str) -> Option<String> {
     Some(format!("{}x{}", positive(w)?, positive(h)?))
 }
 
+/// `etc ["host"]`: the bare node keeps the tmpfs allowlist, `"host"`
+/// binds the host's whole `/etc` read-only in its place. Nothing about
+/// either is configurable, so no property and no child applies to it.
+fn parse_etc(node: &KdlNode) -> Result<EtcMode, ConfigError> {
+    if node.children().is_some() {
+        return Err(bad(node, "takes no children"));
+    }
+    let mut host = false;
+    let mut seen_mode = false;
+    for e in node.entries() {
+        let Some(prop) = e.name().map(|n| n.value()) else {
+            if seen_mode {
+                return Err(bad(node, "expects at most one mode argument"));
+            }
+            seen_mode = true;
+            let s = e
+                .value()
+                .as_string()
+                .ok_or_else(|| bad(node, "mode must be \"host\""))?;
+            if s != "host" {
+                return Err(bad(node, &format!("expected `host`, got `{s}`")));
+            }
+            host = true;
+            continue;
+        };
+        return Err(ConfigError::UnknownProperty {
+            node: node.name().value().to_owned(),
+            prop: prop.to_owned(),
+        });
+    }
+    Ok(if host {
+        EtcMode::Host
+    } else {
+        EtcMode::Allowlist
+    })
+}
+
 /// `wayland ["host"] [clipboard="open"]`: the bare node is the security
 /// context, and the property is the one thing about the proxy in front
 /// of it a config decides. A property with `"host"` is an error rather
@@ -3604,6 +3684,24 @@ mod tests {
             cfg.command.unwrap(),
             vec![OsString::from("foot"), "-e".into(), "fish".into()]
         );
+    }
+
+    /// The bare node and the one mode name it takes. A second `etc`
+    /// node is a duplicate whatever the two modes say: which `/etc` the
+    /// config asks for would otherwise be a matter of file order.
+    #[test]
+    fn etc_host_parses_and_anything_else_is_refused() {
+        let cfg = parse("etc \"host\"\ncommand \"true\"").unwrap();
+        assert_eq!(cfg.etc, EtcMode::Host);
+        let bare = parse("etc\ncommand \"true\"").unwrap();
+        assert_eq!(bare.etc, EtcMode::Allowlist);
+        for bad in ["etc \"other\"", "etc 1", "etc foo=\"host\"", "etc { x }"] {
+            assert!(parse(&format!("{bad}\ncommand \"true\"")).is_err(), "{bad}");
+        }
+        assert!(matches!(
+            parse("etc\netc \"host\"\ncommand \"true\""),
+            Err(ConfigError::Duplicate(n)) if n == "etc"
+        ));
     }
 
     /// The bare node and the one mode name it takes. A second `wayland`
@@ -6088,6 +6186,8 @@ command "b""#
             ("mpris name=\"org.a.B\"", true),
             ("a11y", false),
             ("input-method", false),
+            ("etc", false),
+            ("etc \"host\"", true),
             ("tty \"none\"", true),
             ("userns \"disable\"", true),
             ("seccomp {\n    disable\n}", true),
@@ -6135,6 +6235,7 @@ command "b""#
             ("mpris", "mpris name=\"org.a.B\"", "mpris name=\"org.c.D\""),
             ("a11y", "a11y", "a11y"),
             ("input-method", "input-method", "input-method"),
+            ("etc", "etc", "etc \"host\""),
             ("tmp", "tmp size=\"1G\"", "tmp size=\"2G\""),
             ("tty", "tty \"none\"", "tty \"passthrough\""),
             ("userns", "userns \"disable\"", "userns \"allow\""),

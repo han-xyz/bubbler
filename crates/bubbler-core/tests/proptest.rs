@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use bubbler_core::config::{
-    AllowOut, BusRule, Cidr, Disabled, Errno, InstanceConfig, LintAllow, NetworkConfig,
+    AllowOut, BusRule, Cidr, Disabled, Errno, EtcMode, InstanceConfig, LintAllow, NetworkConfig,
     NetworkMode, Node, Outbound, Portal, Proto, SeccompConfig, Service, ShareMode, TmpSize,
     TtyMode, Userns, WaylandMode, X11Mode,
 };
@@ -529,6 +529,7 @@ fn instance_config() -> impl Strategy<Value = InstanceConfig> {
             Just(TtyMode::None)
         ],
         prop_oneof![Just(Userns::Allow), Just(Userns::Disable)],
+        prop_oneof![Just(EtcMode::Allowlist), Just(EtcMode::Host)],
         tmp_size(),
         seccomp_config(),
         prop::option::of("[a-z][a-z0-9.-]{0,8}".prop_map(|s| format!("{s}.desktop"))),
@@ -542,6 +543,7 @@ fn instance_config() -> impl Strategy<Value = InstanceConfig> {
                 env,
                 tty,
                 userns,
+                etc,
                 tmp,
                 seccomp,
                 desktop,
@@ -561,6 +563,7 @@ fn instance_config() -> impl Strategy<Value = InstanceConfig> {
                     shares: Vec::new(),
                     command,
                     env,
+                    etc,
                     tmp,
                     tty,
                     seccomp,

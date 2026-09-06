@@ -26,6 +26,9 @@ pub enum Origin {
     /// A `tmp size=` node, which moves the cap the baseline put on
     /// `/tmp`.
     Tmp,
+    /// An `etc "host"` node, which replaces the tmpfs allowlist with the
+    /// host's whole `/etc`.
+    Etc,
     /// `--ctty`, decided by the terminal mode rather than by the config.
     Ctty,
     /// The `/.flatpak-info` document that names the sandbox to the proxy.
@@ -585,6 +588,49 @@ impl BwrapArgs {
             unreachable!("the item was found by matching on its arguments");
         };
         args[1] = OsString::from(bytes.to_string());
+    }
+
+    /// Replace the `/etc` tmpfs and its allowlist with one read-only
+    /// bind of the host's whole `/etc` (`etc "host"`, phase 2), and
+    /// attribute the bind and the synthetic `passwd`/`group` binds that
+    /// follow it to the `etc` node that asked for it. The two synthetic
+    /// binds are left standing where they are, after the replacement: the
+    /// host username stays hidden whichever mode `/etc` is in.
+    ///
+    /// # Panics
+    ///
+    /// If the arguments hold no `--size … --tmpfs /etc` followed by two
+    /// data binds. Only [`BwrapArgs::baseline`] builds the sandbox this
+    /// is called on, and it always emits both.
+    pub fn bind_host_etc(&mut self) {
+        let start = self
+            .skeleton
+            .iter()
+            .position(|i| {
+                matches!(&i.kind, Kind::Args(a)
+                    if a.first().is_some_and(|p| p == OsStr::new("--size"))
+                        && a.last().is_some_and(|p| p == OsStr::new("/etc")))
+            })
+            .expect("the baseline emits `--size … --tmpfs /etc` once, in phase 2");
+        let end = self.skeleton[start..]
+            .iter()
+            .position(|i| matches!(i.kind, Kind::Data { .. }))
+            .map(|n| start + n)
+            .expect("the baseline emits the synthetic passwd/group binds after the /etc tmpfs");
+        for item in &mut self.skeleton[end..end + 2] {
+            item.origin = self.origin;
+        }
+        self.skeleton.splice(
+            start..end,
+            [Item {
+                origin: self.origin,
+                kind: Kind::Args(vec![
+                    OsString::from("--ro-bind"),
+                    OsString::from("/etc"),
+                    OsString::from("/etc"),
+                ]),
+            }],
+        );
     }
 
     /// Tag every argument pushed from here on with `origin`. The caller
@@ -1510,6 +1556,62 @@ mod tests {
             s.windows(3)
                 .any(|w| w == ["--setenv", "LOGNAME", "bubbler"])
         );
+    }
+
+    /// `etc "host"` replaces the tmpfs and its allowlist with one bind
+    /// of the host's whole `/etc`; the synthetic `passwd`/`group` binds
+    /// still follow it, in the same order, so the host username stays
+    /// hidden.
+    #[test]
+    fn binding_the_hosts_etc_replaces_the_tmpfs_and_allowlist_with_one_bind() {
+        let (f, d, _) = crate::host::fake::types();
+        let host = FakeHost::default()
+            .with("/etc/hosts", f)
+            .with("/etc/fonts", d);
+        let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &host);
+        args.tag(Origin::Etc);
+        args.bind_host_etc();
+        let argv = args.finish(&["sh".into()], &mut Counter::new()).unwrap();
+        let s = strs(&argv);
+        let pos = |x: &str| s.iter().position(|a| *a == x).unwrap();
+        assert!(
+            s.windows(3).any(|w| w == ["--ro-bind", "/etc", "/etc"]),
+            "{s:?}"
+        );
+        assert!(!s.windows(2).any(|w| w == ["--tmpfs", "/etc"]), "{s:?}");
+        assert!(!s.contains(&"/etc/hosts"), "{s:?}");
+        assert!(!s.contains(&"/etc/fonts"), "{s:?}");
+        assert!(
+            s.windows(5)
+                .any(|w| w == ["--perms", "0644", "--ro-bind-data", "4", "/etc/passwd"]),
+            "{s:?}"
+        );
+        assert!(
+            s.windows(5)
+                .any(|w| w == ["--perms", "0644", "--ro-bind-data", "5", "/etc/group"]),
+            "{s:?}"
+        );
+        assert!(pos("/etc/passwd") > pos("/etc"), "{s:?}");
+        assert!(pos("/etc/passwd") < pos("--proc"), "{s:?}");
+    }
+
+    /// The bind and the two synthetic files are tagged with the `etc`
+    /// node that asked for them, not left as baseline: `--explain`
+    /// groups them together rather than folding them into the sandbox
+    /// that would exist without it.
+    #[test]
+    fn binding_the_hosts_etc_tags_the_bind_and_the_synthetic_files_with_its_own_origin() {
+        let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default());
+        args.tag(Origin::Etc);
+        args.bind_host_etc();
+        let argv = args
+            .finish_explained(&["sh".into()], &mut Counter::new())
+            .unwrap();
+        let etc: Vec<&Explained> = argv.iter().filter(|i| i.origin == Origin::Etc).collect();
+        assert_eq!(etc.len(), 3, "{argv:#?}");
+        assert_eq!(strs(&etc[0].args), ["--ro-bind", "/etc", "/etc"]);
+        assert!(etc[1].args.iter().any(|a| a == "/etc/passwd"), "{etc:#?}");
+        assert!(etc[2].args.iter().any(|a| a == "/etc/group"), "{etc:#?}");
     }
 
     #[test]

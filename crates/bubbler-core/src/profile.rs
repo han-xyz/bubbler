@@ -10,8 +10,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::config::{
-    self, BusRule, ConfigError, Disabled, InstanceConfig, LintAllow, Node, Outbound, RawProfile,
-    Service, ShareMode, TmpSize, Userns,
+    self, BusRule, ConfigError, Disabled, EtcMode, InstanceConfig, LintAllow, Node, Outbound,
+    RawProfile, Service, ShareMode, TmpSize, Userns,
 };
 use crate::env::Env;
 use crate::error::{ProfileError, ReadError};
@@ -544,6 +544,7 @@ struct Src {
 struct Merged {
     services: Vec<(Service, Src)>,
     env: Vec<(String, String, Src)>,
+    etc: Option<(EtcMode, Src)>,
     tmp: Option<(TmpSize, Src)>,
     tty: Option<(TtyMode, Src)>,
     userns: Option<(Userns, Src)>,
@@ -580,6 +581,11 @@ impl Merged {
                 Some(slot) => *slot = (key.clone(), value.clone(), src.clone()),
                 None => self.env.push((key.clone(), value.clone(), src.clone())),
             }
+        }
+        // One `/etc`, not a set: the including layer replaces it, the
+        // same way `tty` and `userns` work.
+        if raw.etc_set {
+            self.etc = Some((raw.config.etc, src.clone()));
         }
         // One cap, not a set: the including layer replaces it.
         if let Some(size) = raw.config.tmp {
@@ -946,6 +952,17 @@ impl Merged {
         kept(
             &self.disabled,
             |n| matches!(n, Node::Env(_)),
+            name,
+            &mut origins,
+        )?;
+        if let Some((mode, src)) = &self.etc
+            && *mode != EtcMode::default()
+        {
+            origins.push((kdl_out::etc(*mode), src));
+        }
+        kept(
+            &self.disabled,
+            |n| matches!(n, Node::Etc(_)),
             name,
             &mut origins,
         )?;
@@ -2119,6 +2136,44 @@ mod tests {
         assert_eq!(
             r.resolve("app").unwrap().config.desktop.as_deref(),
             Some("base.desktop")
+        );
+    }
+
+    #[test]
+    fn etc_host_follows_the_including_layer_and_survives_flattening() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(
+            tmp.path(),
+            &[
+                ("app", "include \"base\"\netc\n"),
+                ("base", "etc \"host\"\n"),
+            ],
+            &[],
+        );
+        // One `/etc`, so the including layer decides it outright: the
+        // bare node written in `app` wins over the host mode `base` asks
+        // for.
+        assert_eq!(r.resolve("app").unwrap().config.etc, EtcMode::Allowlist);
+
+        // A layer without the node leaves the one below alone, and what
+        // survives flattening is what a seeded instance and the launcher
+        // both read back.
+        let r = resolver(
+            tmp.path(),
+            &[
+                ("app", "include \"base\"\nwayland\n"),
+                ("base", "etc \"host\"\n"),
+            ],
+            &[],
+        );
+        let resolved = r.resolve("app").unwrap();
+        assert_eq!(resolved.config.etc, EtcMode::Host);
+        assert!(resolved.text.contains("etc \"host\""), "{}", resolved.text);
+        assert_eq!(
+            resolved.text,
+            kdl_out::render(&resolved.config).unwrap(),
+            "{}",
+            resolved.text
         );
     }
 
