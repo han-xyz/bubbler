@@ -20,5 +20,12 @@
 // absent: an ssh agent, a keyring, the host's dotfiles, a display; a
 // tool that nests a sandbox of its own, or drives a browser, needs
 // `userns "allow"`.
+//
+// The two nodes: `network` is the API the agent talks to, in a network
+// namespace of its own — `claude-code-strict` shows what naming the
+// hosts it may reach costs. `userns "disable"` closes the door a nested
+// user namespace opens, which a command-line tool has no use for and a
+// browser driver or an inner sandbox does (see above). Nothing else is
+// granted, so there is nothing else here to justify.
 network
 userns "disable"
