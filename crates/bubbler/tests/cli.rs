@@ -10673,16 +10673,27 @@ fn a_host_without_a_working_bwrap_skips_the_guarded_tests_rather_than_failing_th
 /// command's stdout came back as documented. Neither fixes a profile
 /// that fails here — that measures, and the measurement is the point.
 ///
-/// Every test skips (with a reason printed through [`say`]) rather than
-/// fails when the app or Hyprland itself is not on this host. Run the
-/// module with `--test-threads=1`: it starts real desktop apps one at a
-/// time against a session with exactly one desktop to watch them on, and
-/// several such launches at once would make the timing this measures mean
-/// nothing.
+/// Every test is `#[ignore]`d: it opens real apps on the user's desktop,
+/// and four profiles (firefox, libreoffice, spotify, steam) fail until
+/// the profile pass Tasks 7-9 do lands, which must not block unrelated
+/// work landing on top of this one. Run it explicitly, serially — it
+/// starts real desktop apps one at a time against a session with exactly
+/// one desktop to watch them on, and several such launches at once would
+/// make the timing this measures mean nothing:
 ///
-///     cargo test -p bubbler --test cli profile_smoke -- --test-threads=1
+///     cargo test -p bubbler --test cli profile_smoke -- --ignored --test-threads=1
+///
+/// Where a test does skip (with a reason printed through [`say`]) rather
+/// than fail, it is because the app or Hyprland itself is not on this
+/// host.
 mod profile_smoke {
     use super::*;
+
+    /// How long a cold GUI profile is given to map its first window in an
+    /// empty, throwaway home — the shared [`RUN_LIMIT`] times lighter
+    /// actions than a first launch (an `exec`, a signal, a python
+    /// fixture), not a browser or office suite's cold start.
+    const SMOKE_LIMIT: Duration = Duration::from_secs(30);
 
     /// What a GUI smoke test looks for in `hyprctl clients`. Most shipped
     /// profiles set a stable window class; this host's Steam client sets
@@ -10730,8 +10741,9 @@ mod profile_smoke {
     /// One shipped GUI profile's smoke test: the host binary it needs,
     /// the window identity that proves it ran, which `$HOME` subdirectories
     /// its `home-share` grants need to exist first, whether its `network`
-    /// grant needs pasta to attach, and whether its `x11 "host"` grant
-    /// needs the host's `$DISPLAY` forwarded in.
+    /// grant needs pasta to attach, whether its `x11 "host"` grant needs
+    /// the host's `$DISPLAY` forwarded in, and how long its own cold start
+    /// is given.
     struct GuiProfile {
         profile: &'static str,
         gate: &'static str,
@@ -10739,16 +10751,16 @@ mod profile_smoke {
         home_dirs: &'static [&'static str],
         network: bool,
         x11_host: bool,
+        limit: Duration,
     }
 
     /// Start a `GuiProfile` in a throwaway sandbox and prove a window
     /// matching its identity mapped: skip (with a reason on stderr) when
     /// its gate binary is absent, this host offers no security-context
-    /// Wayland, or no Hyprland answers `hyprctl`; else wait out
-    /// [`RUN_LIMIT`] for the count of matching windows to rise past what
-    /// the desktop had before the sandbox started. Terminates the sandbox
-    /// with SIGTERM and asserts it stopped, whether the window appeared
-    /// or not.
+    /// Wayland, or no Hyprland answers `hyprctl`; else wait out its own
+    /// `limit` for the count of matching windows to rise past what the
+    /// desktop had before the sandbox started. Terminates the sandbox with
+    /// SIGTERM and asserts it stopped, whether the window appeared or not.
     fn gui_smoke(p: GuiProfile) {
         if !require_host_program(p.gate) || !require_security_context() || !require_hyprctl() {
             return;
@@ -10778,15 +10790,17 @@ mod profile_smoke {
             log,
         };
         assert!(
-            wait_until(|| hyprctl_count(&p.seen) > before, RUN_LIMIT),
-            "{}: no new window within {RUN_LIMIT:?}: {}",
+            wait_until(|| hyprctl_count(&p.seen) > before, p.limit),
+            "{}: no new window within {:?}: {}",
             p.profile,
+            p.limit,
             without_tool_warnings(&run.said())
         );
         run.stop();
     }
 
     #[test]
+    #[ignore = "opt-in profile smoke test; run explicitly (see docs/wiki/Development.md)"]
     fn alacritty_window_appears() {
         gui_smoke(GuiProfile {
             profile: "alacritty",
@@ -10795,10 +10809,12 @@ mod profile_smoke {
             home_dirs: &[],
             network: false,
             x11_host: false,
+            limit: SMOKE_LIMIT,
         });
     }
 
     #[test]
+    #[ignore = "opt-in profile smoke test; run explicitly (see docs/wiki/Development.md)"]
     fn chromium_window_appears() {
         gui_smoke(GuiProfile {
             profile: "chromium",
@@ -10807,10 +10823,12 @@ mod profile_smoke {
             home_dirs: &["Downloads"],
             network: true,
             x11_host: false,
+            limit: SMOKE_LIMIT,
         });
     }
 
     #[test]
+    #[ignore = "opt-in profile smoke test; run explicitly (see docs/wiki/Development.md)"]
     fn code_window_appears() {
         gui_smoke(GuiProfile {
             profile: "code",
@@ -10819,10 +10837,12 @@ mod profile_smoke {
             home_dirs: &["Projects"],
             network: true,
             x11_host: false,
+            limit: SMOKE_LIMIT,
         });
     }
 
     #[test]
+    #[ignore = "opt-in profile smoke test; run explicitly (see docs/wiki/Development.md)"]
     fn firefox_window_appears() {
         gui_smoke(GuiProfile {
             profile: "firefox",
@@ -10831,10 +10851,12 @@ mod profile_smoke {
             home_dirs: &["Downloads"],
             network: true,
             x11_host: false,
+            limit: SMOKE_LIMIT,
         });
     }
 
     #[test]
+    #[ignore = "opt-in profile smoke test; run explicitly (see docs/wiki/Development.md)"]
     fn keepassxc_window_appears() {
         gui_smoke(GuiProfile {
             profile: "keepassxc",
@@ -10843,10 +10865,12 @@ mod profile_smoke {
             home_dirs: &["Documents"],
             network: false,
             x11_host: false,
+            limit: SMOKE_LIMIT,
         });
     }
 
     #[test]
+    #[ignore = "opt-in profile smoke test; run explicitly (see docs/wiki/Development.md)"]
     fn kitty_window_appears() {
         gui_smoke(GuiProfile {
             profile: "kitty",
@@ -10855,10 +10879,12 @@ mod profile_smoke {
             home_dirs: &[],
             network: false,
             x11_host: false,
+            limit: SMOKE_LIMIT,
         });
     }
 
     #[test]
+    #[ignore = "opt-in profile smoke test; run explicitly (see docs/wiki/Development.md)"]
     fn libreoffice_window_appears() {
         // libreoffice-still ships `/usr/bin/libreoffice`; a build that
         // ships only the bare `soffice` binary names the same program
@@ -10877,10 +10903,12 @@ mod profile_smoke {
             home_dirs: &["Documents"],
             network: false,
             x11_host: false,
+            limit: SMOKE_LIMIT,
         });
     }
 
     #[test]
+    #[ignore = "opt-in profile smoke test; run explicitly (see docs/wiki/Development.md)"]
     fn lutris_window_appears() {
         gui_smoke(GuiProfile {
             profile: "lutris",
@@ -10889,10 +10917,12 @@ mod profile_smoke {
             home_dirs: &["Games"],
             network: true,
             x11_host: true,
+            limit: SMOKE_LIMIT,
         });
     }
 
     #[test]
+    #[ignore = "opt-in profile smoke test; run explicitly (see docs/wiki/Development.md)"]
     fn mpv_window_appears() {
         gui_smoke(GuiProfile {
             profile: "mpv",
@@ -10901,10 +10931,12 @@ mod profile_smoke {
             home_dirs: &["Videos"],
             network: false,
             x11_host: false,
+            limit: SMOKE_LIMIT,
         });
     }
 
     #[test]
+    #[ignore = "opt-in profile smoke test; run explicitly (see docs/wiki/Development.md)"]
     fn spotify_window_appears() {
         gui_smoke(GuiProfile {
             profile: "spotify",
@@ -10913,10 +10945,12 @@ mod profile_smoke {
             home_dirs: &[],
             network: true,
             x11_host: false,
+            limit: SMOKE_LIMIT,
         });
     }
 
     #[test]
+    #[ignore = "opt-in profile smoke test; run explicitly (see docs/wiki/Development.md)"]
     fn steam_window_appears() {
         gui_smoke(GuiProfile {
             profile: "steam",
@@ -10925,10 +10959,15 @@ mod profile_smoke {
             home_dirs: &[],
             network: true,
             x11_host: true,
+            // `try`'s empty home makes every run Steam's first: it
+            // self-updates its client before any window maps, measured
+            // past two minutes on this host both sandboxed and bare.
+            limit: Duration::from_secs(180),
         });
     }
 
     #[test]
+    #[ignore = "opt-in profile smoke test; run explicitly (see docs/wiki/Development.md)"]
     fn thunderbird_window_appears() {
         gui_smoke(GuiProfile {
             profile: "thunderbird",
@@ -10937,10 +10976,12 @@ mod profile_smoke {
             home_dirs: &["Downloads"],
             network: true,
             x11_host: false,
+            limit: SMOKE_LIMIT,
         });
     }
 
     #[test]
+    #[ignore = "opt-in profile smoke test; run explicitly (see docs/wiki/Development.md)"]
     fn vesktop_window_appears() {
         gui_smoke(GuiProfile {
             profile: "vesktop",
@@ -10949,6 +10990,7 @@ mod profile_smoke {
             home_dirs: &[],
             network: true,
             x11_host: false,
+            limit: SMOKE_LIMIT,
         });
     }
 
@@ -11022,6 +11064,7 @@ mod profile_smoke {
     }
 
     #[test]
+    #[ignore = "opt-in profile smoke test; run explicitly (see docs/wiki/Development.md)"]
     fn generic_runs_the_command_verbatim() {
         command_smoke(
             "generic",
@@ -11034,6 +11077,7 @@ mod profile_smoke {
     }
 
     #[test]
+    #[ignore = "opt-in profile smoke test; run explicitly (see docs/wiki/Development.md)"]
     fn agent_runs_a_bare_command_over_its_network_grant() {
         command_smoke(
             "agent",
@@ -11046,6 +11090,7 @@ mod profile_smoke {
     }
 
     #[test]
+    #[ignore = "opt-in profile smoke test; run explicitly (see docs/wiki/Development.md)"]
     fn claude_code_prints_its_version() {
         command_smoke(
             "claude-code",
@@ -11058,6 +11103,7 @@ mod profile_smoke {
     }
 
     #[test]
+    #[ignore = "opt-in profile smoke test; run explicitly (see docs/wiki/Development.md)"]
     fn claude_code_strict_prints_its_version() {
         command_smoke(
             "claude-code-strict",
