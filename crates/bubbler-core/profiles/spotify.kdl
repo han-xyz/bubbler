@@ -18,6 +18,16 @@
 // bridge. `network "host"` restores it at the price of the host's own
 // loopback services.
 //
+// `wayland` is the display, and the only one: the sandbox has no X
+// display at all, so the client's Chromium layer takes the socket that
+// grant binds.
+//
+// `dri` is the GPU: the client's Chromium layer initialises a GPU
+// process on it — the shader caches it leaves in the private home are
+// the evidence — and composites in software without it. Bare, so the
+// sandbox gets the render nodes and not the card nodes: no EDID, no
+// framebuffer geometry, no other client's buffers.
+//
 // Bare by design. Add:
 //   dbus {
 //       talk "org.freedesktop.ScreenSaver"
