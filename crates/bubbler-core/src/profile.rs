@@ -2937,6 +2937,7 @@ mod tests {
                 instance_runtime: tmp.path().join("run"),
                 dbus: None,
                 wayland: None,
+                init_bin: Path::new(crate::init_bin::INSTALLED),
             };
             let mut args = crate::bwrap::BwrapArgs::baseline(&e, Path::new("/i/home"), &host);
             crate::service::apply_all(&cfg.services, &e, &mut args, &host, &ctx)
