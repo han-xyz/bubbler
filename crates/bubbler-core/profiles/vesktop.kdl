@@ -11,6 +11,19 @@
 // which /usr/bin/vesktop reads from $XDG_CONFIG_HOME. That wrapper also
 // sets ELECTRON_OZONE_PLATFORM_HINT itself, so no `env` node here does.
 //
+// `wayland` is the display, and the only one: the sandbox has no X
+// display at all, so the hint above resolves to the socket that grant
+// binds.
+//
+// `dri` is the GPU. Without it Electron composites in software and
+// decodes video the same way, which is what a call costs most. Bare, so
+// the sandbox gets the render nodes and not the card nodes: no EDID, no
+// framebuffer geometry, no other client's buffers.
+//
+// `network` is the sandbox's own network namespace, which is all this
+// needs: everything it talks to is Discord's, and nothing of the host's
+// loopback is reachable from it.
+//
 // Bare by design. Add:
 //   dbus
 //   portals {
