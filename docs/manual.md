@@ -437,7 +437,9 @@ file order does not affect the generated argv.
         allow-host "*.example.org" port=8443
         no-ipv6
     }
-    dri                              # GPU: /dev/dri, NVIDIA nodes, the PCI devices' sysfs
+    dri                              # GPU: the render nodes, NVIDIA nodes,
+                                     #   each GPU's own sysfs
+    dri kms=#true                    #   also the card nodes and their sysfs
     pipewire                         # $XDG_RUNTIME_DIR/pipewire-0
     pulseaudio                       # $XDG_RUNTIME_DIR/pulse/native, sets PULSE_SERVER
     gamepad                          # /dev/input, and the sysfs that names it
@@ -523,12 +525,25 @@ files (`passwd`, `group`, `shadow`, `gshadow` and their `-`/`+` variants),
 which the sandbox generates itself. `path-share` reaches outside the home and
 has rules of its own, under "Host paths"; `app-runtime`, which shares one
 directory under `$XDG_RUNTIME_DIR`, and `network` each have a section of their
-own below. `dri` binds `/dev/dri` read-write and exposes `/sys/dev/char`,
-`/sys/devices/system/cpu`, every
-`/sys/devices/pci*` root and, where the host has it, `/sys/class/drm` (whose
-entries are relative symlinks into those roots, so it adds only `version`)
-read-only — that is the sysfs attributes of every PCI device on the machine,
-not just the GPU. `pipewire` and `pulseaudio` hand the sandbox the session's
+own below. `dri` binds the **render node** of every GPU read-write — the
+targets of the `/dev/dri/by-path/*-render` links, and nothing else of
+`/dev/dri`, `by-path` included — and exposes `/sys/dev/char`,
+`/sys/devices/system/cpu` and each of those GPUs' own `/sys/devices`
+directory read-only, with the `drm/card*` directories under it covered by an
+empty read-only tmpfs and `/sys/class/drm` rebuilt inside as one symlink per
+render node plus `version`. A driver therefore finds its device without the
+primary nodes, the connectors that carry the monitors' EDID, or any other PCI
+device being in the sandbox at all; `by-path` is the only place a node is
+looked for, so a host that has `/dev/dri` but no `*-render` link there is an
+error rather than a wider bind. `dri kms=#true` adds the primary (`card*`)
+nodes and leaves their sysfs readable, which is what a compositor or a
+mode-setting tool needs and what nothing else does: the sandbox becomes DRM
+master on a virtual terminal switch and reads the EDID serial numbers, the
+framebuffer geometry and every other client's flink names. `lint` notes it as
+`dri-kms`, `--explain` marks the group, and no shipped profile sets it. A
+`gamepad` grant beside `dri` binds `/sys/devices` whole, and that later bind
+covers the card masks — the sysfs comes back, though the nodes do not.
+`pipewire` and `pulseaudio` hand the sandbox the session's
 audio socket directly, which is capture as well as playback: everything the
 session exposes, including the microphone, with no portal in between. An ALSA
 client reaches the same server through `/etc/alsa`, which the baseline binds:
@@ -539,7 +554,9 @@ override of yours does not reach the sandbox; an `.asoundrc` in the private home
 does. `/dev/snd` itself is never bound, so an application that opens the
 hardware directly still has nothing to open.
 
-`dri` also hands over the proprietary NVIDIA stack where the host has it:
+`dri` also hands over the proprietary NVIDIA stack where the host has it, and
+those nodes have no render/primary split of their own, so `dri` on that
+driver is as wide with the bare node as with `kms=#true`:
 every `/dev/nvidia*` char device with device access, and every
 `/sys/module/nvidia*` directory read-only. NVML and libglvnd read
 `/sys/module/nvidia/initstate` and fall back to Mesa without it. All of it is
@@ -580,7 +597,9 @@ is a keylogger grant. Compare `ls -l /dev/input` with `id` before granting
 `gamepad`.
 
 The `/sys` side is wide too. `/sys/devices` is the whole device tree, which
-contains `dri`'s PCI roots and much more: DMI vendor, board and BIOS strings
+contains `dri`'s GPU directories — the `card*` masks under them included, so
+`gamepad` beside `dri` puts that sysfs back — and much more: DMI vendor,
+board and BIOS strings
 (the serial numbers among them stay root-only), ACPI, platform, thermal and
 battery state, the attributes of every block and tty device, and
 `/sys/devices/virtual/net/*`, where interface names and live traffic counters
@@ -2874,7 +2893,11 @@ domain, which covers every name anyone registers under that suffix),
 no application directory here holds, which is what a profile for software you
 have not installed looks like), `camera-nodes-none-present` (`camera nodes=#true` on a
 host with no `/dev/video*` or `/dev/media*`, so that half of the grant binds
-nothing), `camera-nodes-no-hotplug` (the node list is frozen at launch, and
+nothing), `dri-kms` (`dri kms=#true`, which binds the primary nodes and
+leaves their sysfs readable: the monitors' EDID, the framebuffer geometry,
+every other client's flink names, and DRM master on a virtual terminal
+switch),
+`camera-nodes-no-hotplug` (the node list is frozen at launch, and
 under an isolated network namespace no uevent reaches the sandbox either —
 that second half is dropped under `network "host"`), `secrets-access`
 (`talk`/`own` of

@@ -118,13 +118,17 @@ pub static GRANTS: &[Grant] = &[
     },
     Grant {
         node: "dri",
-        summary: "the GPU: /dev/dri, the NVIDIA nodes, and the sysfs a driver reads",
-        cost: "The device nodes are bound read-write, since bwrap has no read-only device \
-               bind, and the sysfs half is `/sys/dev/char`, `/sys/devices/system/cpu` and \
-               every `/sys/devices/pci*` root — the attributes of every PCI device on the \
-               machine, not only the GPU.",
+        summary: "the GPU's render nodes and the sysfs a driver reads",
+        cost: "The render nodes are bound read-write, since bwrap has no read-only device \
+               bind, and with them each GPU's own sysfs directory, its card directories \
+               hidden behind an empty read-only tmpfs. `kms=#true` adds the card nodes and \
+               leaves that sysfs readable: the sandbox becomes KMS master on a virtual \
+               terminal switch, and reads the monitors' EDID serial numbers, the \
+               framebuffer geometry and every other client's flink names. The NVIDIA \
+               nodes have no render/primary split, so `dri` on that driver is wide either \
+               way.",
         risk: Risk::Wide,
-        grammar: "dri",
+        grammar: "dri [kms=#true]",
     },
     Grant {
         node: "pipewire",
@@ -413,7 +417,7 @@ mod tests {
         ("wayland", "wayland \"host\""),
         ("x11", "x11 \"host\""),
         ("network", "network \"host\""),
-        ("dri", "dri"),
+        ("dri", "dri kms=#true"),
         ("pipewire", "pipewire"),
         ("pulseaudio", "pulseaudio"),
         ("gamepad", "gamepad uinput=#true"),

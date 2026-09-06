@@ -22,7 +22,8 @@ network {
     allow-out "1.1.1.1" port=53  // by address
     allow-host "api.example.com" // by name, through a CONNECT proxy of bubbler's
 }
-dri                              // GPU: /dev/dri, NVIDIA nodes, PCI sysfs
+dri                              // GPU: the render nodes, NVIDIA nodes, their sysfs
+dri kms=#true                    // also the card nodes and their sysfs (KMS)
 pipewire                         // $XDG_RUNTIME_DIR/pipewire-0 (playback AND capture)
 pulseaudio                       // pulse/native, sets PULSE_SERVER
 gamepad                          // /dev/input rw + sysfs; hidraw=#true uinput=#true
@@ -120,7 +121,8 @@ grant and are always written back as a block.
 | `network` | own namespace, internet via pasta | LAN/mDNS and host loopback unreachable; see [Network](Network.md) |
 | `network "host"` | host's network stack | host loopback services and abstract sockets exposed |
 | `network { outbound "deny" … }` | egress narrowed to the `allow-out` addresses and the `allow-host` names | a name is served by a CONNECT proxy of bubbler's on `127.0.0.1:3128` inside, which is also the only thing that resolves: the application gets no DNS, and one that ignores `HTTPS_PROXY` fails at the lookup. Needs a delegated cgroup2 subtree |
-| `dri` | `/dev/dri` rw, NVIDIA nodes, `/sys/devices/pci*`, `/sys/class/drm` | sysfs of **every** PCI device |
+| `dri` | every GPU's render node rw, NVIDIA nodes, each GPU's own `/sys/devices` directory with its `drm/card*` masked | the nodes are rw (bwrap has no read-only device bind); the NVIDIA nodes have no render/primary split |
+| `dri kms=#true` | the primary (`card*`) nodes too, and their sysfs unmasked | DRM master on a VT switch, the monitors' EDID, framebuffer geometry, other clients' flink names; lint notes `dri-kms` |
 | `pipewire`, `pulseaudio` | session audio socket | microphone too, no portal |
 | `gamepad` | `/dev/input` rw, `/sys/devices`, `/run/udev` | every input node your user can open; keyboard if a group lets you |
 | `hidraw` | every `/dev/hidraw*` at launch | security keys, wallets; list frozen at launch |

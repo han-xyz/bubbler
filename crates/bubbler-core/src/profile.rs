@@ -808,7 +808,7 @@ impl Merged {
                     return Ok(());
                 }
             }
-            Service::Dri
+            Service::Dri { .. }
             | Service::Pipewire
             | Service::Pulseaudio
             | Service::Notify
@@ -1262,7 +1262,7 @@ mod tests {
             code.services,
             vec![
                 wayland(),
-                Service::Dri,
+                Service::Dri { kms: false },
                 network(),
                 Service::Dbus { rules: Vec::new() },
                 Service::Portals {
@@ -1282,7 +1282,12 @@ mod tests {
         assert_eq!(sp.command, Some(vec![OsString::from("spotify")]));
         assert_eq!(
             sp.services,
-            vec![wayland(), Service::Dri, Service::Pulseaudio, network()]
+            vec![
+                wayland(),
+                Service::Dri { kms: false },
+                Service::Pulseaudio,
+                network()
+            ]
         );
 
         // A terminal makes its own ptys in the private devpts `--dev`
@@ -1291,14 +1296,19 @@ mod tests {
         // opt-in.
         let kitty = cfg("kitty");
         assert_eq!(kitty.command, Some(vec![OsString::from("kitty")]));
-        assert_eq!(kitty.services, vec![wayland(), Service::Dri]);
+        assert_eq!(kitty.services, vec![wayland(), Service::Dri { kms: false }]);
 
         // The same shape for a chat client: a call takes sound and a
         // network, and screen sharing is `pipewire` plus `portals` on
         // top, as its header says.
         assert_eq!(
             cfg("vesktop").services,
-            vec![wayland(), Service::Dri, Service::Pulseaudio, network()]
+            vec![
+                wayland(),
+                Service::Dri { kms: false },
+                Service::Pulseaudio,
+                network()
+            ]
         );
 
         // A browser draws, plays, fetches, and saves what it downloads
@@ -1311,7 +1321,7 @@ mod tests {
             ff.services,
             vec![
                 wayland(),
-                Service::Dri,
+                Service::Dri { kms: false },
                 Service::Pulseaudio,
                 network(),
                 Service::Dbus { rules: Vec::new() },
@@ -1609,7 +1619,7 @@ mod tests {
         );
         assert_eq!(
             r.resolve("only-system").unwrap().config.services,
-            vec![Service::Dri]
+            vec![Service::Dri { kms: false }]
         );
         let entries = r.list().unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
@@ -1786,7 +1796,7 @@ mod tests {
                 cfg.services,
                 vec![
                     Service::Wayland(WaylandMode::default()),
-                    Service::Dri,
+                    Service::Dri { kms: false },
                     Service::X11(want)
                 ],
                 "{app}"
@@ -2450,7 +2460,7 @@ mod tests {
             vec![
                 Service::Wayland(WaylandMode::default()),
                 Service::Network(NetworkConfig::default()),
-                Service::Dri
+                Service::Dri { kms: false }
             ]
         );
         // `base` merged under `b`, not again between `b` and `c`, where it
@@ -2677,7 +2687,7 @@ mod tests {
         // What it grants is untouched: the entry is a line, not a grant.
         assert_eq!(
             resolved.config.services,
-            vec![Service::Pipewire, Service::Dri]
+            vec![Service::Pipewire, Service::Dri { kms: false }]
         );
     }
 

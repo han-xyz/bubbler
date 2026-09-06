@@ -938,11 +938,32 @@ is held to the roots that live *inside* it: the instance store, your
 profile layer, a `$BUBBLER_PROFILE_DIR` pointed there, and any path
 containing one, read-only as much as read-write.
 
+A `dri` grant is held to the same shape. What it binds is the render node
+of every GPU — the targets of the `/dev/dri/by-path/*-render` links, in
+the `../<node>` form udev writes them and no other — and each of those
+GPUs' own directory under `/sys/devices`, with the `drm/card*`
+directories under it covered by an empty read-only tmpfs and
+`/sys/class/drm` rebuilt from one symlink per render node plus `version`.
+The primary (`card*`) nodes are what that leaves out, and with them: DRM
+master on a virtual terminal switch, which lets a client take over the
+display; the monitors' EDID, whose serial numbers identify the hardware;
+the framebuffer geometry; and the flink names every other DRM client on
+the machine shares through that node. `dri kms=#true` grants them back,
+says so in `--explain` and is noted by `lint`; no shipped profile sets
+it.
+
 **Does not defend:** TOCTOU. bwrap resolves the path again when it binds,
 so between bubbler's check and that bind the tree can change; on a
 single-user machine the party who could change it is you. And the flip
 side of resolving first is that what gets bound is the link's *target*
 under the name you wrote.
+
+The NVIDIA nodes a `dri` grant adds have no render/primary split: one
+`/dev/nvidia*` device is both, so that half of the grant is as wide with
+the bare node as with `kms=#true`. And a `gamepad` grant beside `dri`
+binds `/sys/devices` whole, which is emitted after the masks and covers
+them: the card sysfs is readable again in a sandbox holding both, though
+the card nodes themselves are not bound.
 
 [Host paths](manual.md#host-paths) ·
 `path_share_refuses_every_reserved_root`,
@@ -958,7 +979,12 @@ under the name you wrote.
 `path_share_of_the_profile_dir_override_is_refused`,
 `home_share_reserved_fires_on_the_store_the_layer_and_their_ancestors`,
 `home_share_of_the_instance_store_is_refused_and_linted`,
-`etc_share_through_a_symlink_out_of_etc_is_refused`
+`etc_share_through_a_symlink_out_of_etc_is_refused`,
+`dri_binds_the_render_nodes_and_each_gpus_own_sysfs`,
+`dri_kms_adds_the_card_nodes_and_leaves_their_sysfs_readable`,
+`dri_without_a_render_node_under_by_path_is_an_error`,
+`dri_refuses_a_render_node_whose_sysfs_leaves_the_device_tree`,
+`real_bwrap_dri_initialises_a_driver_without_the_card_nodes`
 
 ### File arguments
 

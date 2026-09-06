@@ -346,7 +346,7 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
                 Service::Wayland(_)
                 | Service::X11(_)
                 | Service::Network { .. }
-                | Service::Dri
+                | Service::Dri { .. }
                 | Service::Pipewire
                 | Service::Pulseaudio
                 | Service::Gamepad { .. }

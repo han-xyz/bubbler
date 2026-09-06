@@ -340,6 +340,12 @@ const CHECK_LINES: &[(&str, &str)] = &[
          Service.",
     ),
     (
+        "dri-kms",
+        "`dri kms=#true`, which binds the primary nodes and leaves their sysfs readable: \
+         the monitors' EDID, the framebuffer geometry, every other client's flink names, \
+         and DRM master on a virtual terminal switch.",
+    ),
+    (
         "dup-name-policy",
         "One bus name given two policies by two layers; one name takes one policy.",
     ),

@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.22.0 (unreleased)
+
+### Added
+
+- `dri kms=#true` grants the primary (`card*`) nodes and leaves their sysfs
+  readable, for a compositor or a mode-setting tool. `bubbler lint` notes it
+  as `dri-kms` and `--explain` marks the group: with those nodes a sandbox
+  becomes DRM master on a virtual terminal switch and reads the monitors'
+  EDID, the framebuffer geometry and every other client's flink names. No
+  shipped profile sets it.
+
+### Changed
+
+- `dri` binds the render node of every GPU instead of all of `/dev/dri`:
+  the targets of the `/dev/dri/by-path/*-render` links, each GPU's own
+  `/sys/devices` directory with its `drm/card*` directories masked by an
+  empty read-only tmpfs, and `/sys/class/drm` rebuilt inside from one
+  symlink per render node plus `version`. The `/sys/devices/pci*` roots and
+  the whole-`/sys/class/drm` bind are gone. `by-path` is the only place a
+  node is looked for, so a host that has `/dev/dri` without a `*-render`
+  link there now fails instead of binding more. The NVIDIA nodes are
+  unchanged, having no render/primary split of their own.
+
 ## 0.21.0 (unreleased)
 
 Hardening milestone: closes several gaps found by an escape-research pass

@@ -222,7 +222,7 @@ fn grant_service(name: &str) -> Option<Service> {
         // --grant dri` with it, which the config check names.
         "x11" => Service::X11(X11Mode::default()),
         "network" => Service::Network(NetworkConfig::default()),
-        "dri" => Service::Dri,
+        "dri" => Service::Dri { kms: false },
         "pipewire" => Service::Pipewire,
         "pulseaudio" => Service::Pulseaudio,
         "dbus" => Service::Dbus { rules: Vec::new() },
@@ -1351,7 +1351,13 @@ mod tests {
         let eph = Instance::ephemeral(&env, "firefox", &["dri", "dri", "network"]).unwrap();
         let services = &eph.instance.config.services;
         assert!(services.contains(&Service::Network(NetworkConfig::default())));
-        assert_eq!(services.iter().filter(|s| **s == Service::Dri).count(), 1);
+        assert_eq!(
+            services
+                .iter()
+                .filter(|s| **s == Service::Dri { kms: false })
+                .count(),
+            1
+        );
         drop(eph);
         // A grant whose node carries a mode is held whichever mode the
         // profile wrote it in: a second node would be a duplicate, and
@@ -1688,7 +1694,7 @@ mod tests {
         // A second reseed overwrites the backup rather than refusing.
         user_profile(&env, "app", "dri\n");
         let after = Instance::reseed(&env, "a").unwrap();
-        assert!(after.config.services.contains(&Service::Dri));
+        assert!(after.config.services.contains(&Service::Dri { kms: false }));
         assert!(
             fs::read_to_string(after.dir.join(BACKUP_FILE))
                 .unwrap()

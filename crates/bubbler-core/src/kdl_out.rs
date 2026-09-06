@@ -238,7 +238,11 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
         Service::X11(X11Mode::Nested(n)) => x11(n),
         Service::X11(X11Mode::Host) => "x11 \"host\"".to_owned(),
         Service::Network(cfg) => network(cfg),
-        Service::Dri => "dri".to_owned(),
+        Service::Dri { kms } => match kms {
+            // `#false` is the default, so only the card nodes are written.
+            true => "dri kms=#true".to_owned(),
+            false => "dri".to_owned(),
+        },
         Service::Pipewire => "pipewire".to_owned(),
         Service::Pulseaudio => "pulseaudio".to_owned(),
         Service::Portals { children } => {

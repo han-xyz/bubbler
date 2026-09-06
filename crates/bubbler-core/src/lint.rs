@@ -108,6 +108,13 @@ const DBUS_NAME_IS_RISKY: Check = Check {
     id: "dbus-name-is-risky",
     severity: Severity::Warning,
 };
+// A note, not a warning: the card nodes are what a mode-setting tool
+// asks for, and what they cost is worth saying once rather than making
+// the config argue for them.
+const DRI_KMS: Check = Check {
+    id: "dri-kms",
+    severity: Severity::Note,
+};
 const DUP_NAME_POLICY: Check = Check {
     id: "dup-name-policy",
     severity: Severity::Error,
@@ -263,6 +270,7 @@ pub const CHECKS: &[Check] = &[
     DBUS_NAME_IS_RISKY,
     DBUS_WITHOUT_RULES,
     DESKTOP_ENTRY_MISSING,
+    DRI_KMS,
     DUP_NAME_POLICY,
     ENV_LOOKS_SECRET,
     HOME_SHARE_RESERVED,
@@ -1244,6 +1252,19 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                     );
                 }
             }
+            "dri" if flag(node, "kms") == Some(true) => f.push(
+                i,
+                node,
+                &DRI_KMS,
+                "`dri kms=#true` binds the primary nodes and leaves their sysfs readable: \
+                 the sandbox reads the monitors' EDID serial numbers, the framebuffer \
+                 geometry and every other client's flink names, and becomes DRM master \
+                 on a virtual terminal switch"
+                    .to_owned(),
+                "drop the property unless the application sets a display mode itself; \
+                 rendering, video decoding and Vulkan need only the render nodes the bare \
+                 node binds",
+            ),
             "camera" if flag(node, "nodes") == Some(true) => {
                 camera_nodes(ctx, i, node, host_net, f);
             }
@@ -2258,6 +2279,29 @@ mod tests {
                    \"tty-passthrough-without-seccomp\" reason=\"c\"\n}"],
             );
             assert_eq!(ids(&allowed), [] as [&str; 0]);
+        });
+    }
+
+    /// The bare grant is the render nodes, which say nothing about the
+    /// display; the property is what puts the monitors back in reach, so
+    /// it is a note rather than silence.
+    #[test]
+    fn dri_kms_is_a_note_and_the_bare_grant_is_not() {
+        with(&host(), |ctx| {
+            let report = lint(ctx, &["dri kms=#true"]);
+            assert_eq!(ids(&report), ["dri-kms"]);
+            assert_eq!(report.findings[0].severity, Severity::Note);
+            assert!(report.findings[0].message.contains("EDID"), "{report:?}");
+            for quiet in ["dri", "dri kms=#false"] {
+                assert_eq!(ids(&lint(ctx, &[quiet])), [] as [&str; 0], "{quiet}");
+            }
+            assert_eq!(
+                ids(&lint(
+                    ctx,
+                    &["dri kms=#true\nlint-allow \"dri-kms\" reason=\"a KMS test tool\""]
+                )),
+                [] as [&str; 0]
+            );
         });
     }
 

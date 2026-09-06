@@ -531,10 +531,14 @@ pub enum Service {
     /// A network namespace, and what it is connected to: the sandbox's
     /// own by default, the host's under `network "host"`.
     Network(NetworkConfig),
-    /// GPU access: the `/dev/dri` device nodes, bound read-write, plus the
-    /// `/sys` entries a userspace driver reads to match a node to its
+    /// GPU access: the render node of every GPU, bound read-write, plus
+    /// the `/sys` entries a userspace driver reads to match a node to its
     /// hardware.
-    Dri,
+    Dri {
+        /// Add the primary (`card*`) nodes and leave their sysfs
+        /// directories readable, which is what mode setting takes.
+        kms: bool,
+    },
     /// Access to the host PipeWire socket.
     Pipewire,
     /// Access to the host PulseAudio socket.
@@ -666,7 +670,7 @@ impl Service {
             Self::Wayland(_) => "wayland",
             Self::X11(_) => "x11",
             Self::Network(_) => "network",
-            Self::Dri => "dri",
+            Self::Dri { .. } => "dri",
             Self::Pipewire => "pipewire",
             Self::Pulseaudio => "pulseaudio",
             Self::HomeShare { .. } => "home-share",
@@ -759,11 +763,11 @@ impl Node {
             Service::X11(mode) => *mode != X11Mode::default(),
             Service::Network(cfg) => *cfg != NetworkConfig::default(),
             Service::Camera { nodes } => *nodes,
+            Service::Dri { kms } => *kms,
             Service::Gamepad { hidraw, uinput } => *hidraw || *uinput,
             Service::Dbus { rules } | Service::SystemBus { rules } => !rules.is_empty(),
             Service::Portals { children } => !children.is_empty(),
-            Service::Dri
-            | Service::Pipewire
+            Service::Pipewire
             | Service::Pulseaudio
             | Service::Notify
             | Service::Tray
@@ -1585,11 +1589,9 @@ pub(crate) fn parse_one(node: &KdlNode, profile: bool) -> Result<Node, ConfigErr
         return Err(ConfigError::UnknownNode(name.to_owned()));
     }
     Ok(match name {
-        "dri" | "pipewire" | "pulseaudio" | "notify" | "tray" | "hidraw" | "a11y"
-        | "input-method" => {
+        "pipewire" | "pulseaudio" | "notify" | "tray" | "hidraw" | "a11y" | "input-method" => {
             reject_entries(node)?;
             Node::Service(match name {
-                "dri" => Service::Dri,
                 "pipewire" => Service::Pipewire,
                 "pulseaudio" => Service::Pulseaudio,
                 "notify" => Service::Notify,
@@ -1625,6 +1627,7 @@ pub(crate) fn parse_one(node: &KdlNode, profile: bool) -> Result<Node, ConfigErr
             debug_assert!(camera.is_none(), "a portals block goes through parse_node");
             return Ok(Node::Service(portals));
         }
+        "dri" => Node::Service(parse_dri(node)?),
         "etc-share" => Node::Service(parse_etc_share(node)?),
         "dbus" => Node::Service(parse_dbus(node)?),
         "wayland" => Node::Service(Service::Wayland(parse_wayland(node)?)),
@@ -1689,6 +1692,7 @@ fn grant(held: &mut Vec<Service>, svc: Service) -> Result<(), ConfigError> {
         Service::Network(_) => held.iter().any(|s| matches!(s, Service::Network(_))),
         Service::Gamepad { .. } => held.iter().any(|s| matches!(s, Service::Gamepad { .. })),
         Service::Camera { .. } => held.iter().any(|s| matches!(s, Service::Camera { .. })),
+        Service::Dri { .. } => held.iter().any(|s| matches!(s, Service::Dri { .. })),
         Service::Dbus { .. } => held.iter().any(|s| matches!(s, Service::Dbus { .. })),
         Service::SystemBus { .. } => held.iter().any(|s| matches!(s, Service::SystemBus { .. })),
         Service::Mpris { .. } => held.iter().any(|s| matches!(s, Service::Mpris { .. })),
@@ -1943,7 +1947,7 @@ fn nested_x11_without_display_stack(services: &[Service]) -> bool {
         .iter()
         .any(|s| matches!(s, Service::X11(X11Mode::Nested(_))))
         && !(services.iter().any(|s| matches!(s, Service::Wayland(_)))
-            && services.contains(&Service::Dri))
+            && services.iter().any(|s| matches!(s, Service::Dri { .. })))
 }
 
 fn bad(node: &KdlNode, reason: &str) -> ConfigError {
@@ -3034,6 +3038,43 @@ fn parse_camera(node: &KdlNode) -> Result<Service, ConfigError> {
     })
 }
 
+/// `dri [kms=#true]`: the bare node is the render nodes and the sysfs a
+/// driver reads, and the property adds the primary nodes mode setting
+/// goes through.
+fn parse_dri(node: &KdlNode) -> Result<Service, ConfigError> {
+    let mut kms: Option<bool> = None;
+    for e in node.entries() {
+        let Some(prop) = e.name().map(|n| n.value()) else {
+            return Err(bad(node, "takes no arguments"));
+        };
+        if prop != "kms" {
+            return Err(ConfigError::UnknownProperty {
+                node: node.name().value().to_owned(),
+                prop: prop.to_owned(),
+            });
+        }
+        // Written twice, the two entries disagree about the card nodes
+        // and the winner would be a matter of their order in the line.
+        if kms.is_some() {
+            return Err(ConfigError::Duplicate(format!(
+                "{} {prop}",
+                node.name().value()
+            )));
+        }
+        kms = Some(
+            e.value()
+                .as_bool()
+                .ok_or_else(|| bad(node, &format!("{prop} must be #true or #false")))?,
+        );
+    }
+    if node.children().is_some() {
+        return Err(bad(node, "takes no children"));
+    }
+    Ok(Service::Dri {
+        kms: kms.unwrap_or(false),
+    })
+}
+
 /// `userns "allow"|"disable"`, the same shape `tty` has.
 fn parse_userns(node: &KdlNode) -> Result<Userns, ConfigError> {
     let arg = one_string_arg(node)?;
@@ -3515,7 +3556,7 @@ mod tests {
             cfg.services,
             vec![
                 Service::Wayland(WaylandMode::default()),
-                Service::Dri,
+                Service::Dri { kms: false },
                 Service::X11(X11Mode::Nested(NestedX11::default())),
                 Service::Network(NetworkConfig::default()),
                 Service::HomeShare {
@@ -4208,11 +4249,61 @@ mod tests {
     }
 
     #[test]
+    fn dri_takes_an_optional_kms_property() {
+        assert_eq!(
+            parse("dri").unwrap().services,
+            vec![Service::Dri { kms: false }]
+        );
+        assert_eq!(
+            parse("dri kms=#true").unwrap().services,
+            vec![Service::Dri { kms: true }]
+        );
+        assert_eq!(
+            parse("dri kms=#false").unwrap().services,
+            vec![Service::Dri { kms: false }]
+        );
+        assert!(matches!(
+            parse("dri card=#true"),
+            Err(ConfigError::UnknownProperty { node, prop })
+                if node == "dri" && prop == "card"
+        ));
+        assert!(matches!(
+            parse("dri kms=\"yes\""),
+            Err(ConfigError::BadArgument { node, reason })
+                if node == "dri" && reason == "kms must be #true or #false"
+        ));
+        assert!(matches!(
+            parse("dri \"kms\""),
+            Err(ConfigError::BadArgument { node, reason })
+                if node == "dri" && reason == "takes no arguments"
+        ));
+        assert!(matches!(
+            parse("dri { kms; }"),
+            Err(ConfigError::BadArgument { node, reason })
+                if node == "dri" && reason == "takes no children"
+        ));
+        // By variant, like `camera`: two nodes differing only in the
+        // property would leave the card nodes to file order.
+        assert!(matches!(
+            parse("dri\ndri kms=#true"),
+            Err(ConfigError::Duplicate(n)) if n == "dri"
+        ));
+        assert!(matches!(
+            parse("dri kms=#true kms=#false"),
+            Err(ConfigError::Duplicate(n)) if n == "dri kms"
+        ));
+    }
+
+    #[test]
     fn device_and_audio_services_are_flag_nodes() {
         let cfg = parse("dri\npipewire\npulseaudio").unwrap();
         assert_eq!(
             cfg.services,
-            vec![Service::Dri, Service::Pipewire, Service::Pulseaudio]
+            vec![
+                Service::Dri { kms: false },
+                Service::Pipewire,
+                Service::Pulseaudio
+            ]
         );
         assert!(matches!(parse("dri\ndri"), Err(ConfigError::Duplicate(n)) if n == "dri"));
         assert!(matches!(
@@ -5858,6 +5949,7 @@ command "b""#
             ("network \"host\"", true),
             ("network {\n    no-ipv6\n}", true),
             ("dri", false),
+            ("dri kms=#true", true),
             ("pipewire", false),
             ("pulseaudio", false),
             ("gamepad", false),
@@ -5903,7 +5995,7 @@ command "b""#
             ("wayland", "wayland", "wayland \"host\""),
             ("x11", "x11", "x11 \"host\""),
             ("network", "network", "network \"host\""),
-            ("dri", "dri", "dri"),
+            ("dri", "dri", "dri kms=#true"),
             ("pipewire", "pipewire", "pipewire"),
             ("pulseaudio", "pulseaudio", "pulseaudio"),
             ("gamepad", "gamepad", "gamepad hidraw=#true"),

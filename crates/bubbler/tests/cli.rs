@@ -2323,6 +2323,57 @@ fn real_bwrap_userns_disable_stops_a_nested_user_namespace() {
     );
 }
 
+/// The render nodes are the whole of a bare `dri` grant, and a driver
+/// initialises on them: `eglinfo` names a renderer for every GPU it
+/// opened, while the primary nodes\' sysfs — the monitors\' EDID among
+/// it — is not there to read.
+#[test]
+fn real_bwrap_dri_initialises_a_driver_without_the_card_nodes() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        say("skipping: WAYLAND_DISPLAY unset");
+        return;
+    }
+    if !Path::new("/usr/bin/eglinfo").is_file() {
+        say("skipping: /usr/bin/eglinfo is not installed (package `mesa-utils`)");
+        return;
+    }
+    let tmp = setup();
+    let out = bubbler_live(tmp.path(), &init)
+        .args([
+            "try",
+            "--profile",
+            "generic",
+            "--grant",
+            "dri",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            "eglinfo -B 2>&1 | grep -c renderer; cat /sys/class/drm/card*/edid 2>&1 | head -1",
+        ])
+        .output()
+        .unwrap();
+    let err = without_tool_warnings(&String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{err}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut lines = stdout.lines();
+    let renderers: usize = lines
+        .next()
+        .and_then(|l| l.trim().parse().ok())
+        .unwrap_or_else(|| panic!("{stdout}"));
+    assert!(
+        renderers >= 1,
+        "no driver initialised on the render nodes: {stdout}"
+    );
+    // The whole of `/sys/class/drm` inside is the render nodes and
+    // `version`, so the glob matches nothing to open.
+    let edid = lines.next().unwrap_or_default();
+    assert!(edid.starts_with("cat:"), "a card node\'s EDID: {stdout}");
+}
+
 #[test]
 fn real_bwrap_dri_hands_over_the_hosts_nvidia_stack() {
     if !require_bwrap() {

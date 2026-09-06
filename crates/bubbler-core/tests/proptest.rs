@@ -89,7 +89,7 @@ fn flag_services() -> impl Strategy<Value = Vec<Service>> {
             // `"host"`: every subset of this list has to parse, and the
             // nested default requires `wayland` and `dri` behind it.
             Service::X11(X11Mode::Host),
-            Service::Dri,
+            Service::Dri { kms: false },
             Service::Pipewire,
             Service::Pulseaudio,
             Service::Hidraw,

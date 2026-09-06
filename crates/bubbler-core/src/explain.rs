@@ -22,6 +22,11 @@ use crate::wayland;
 /// baseline is the same in every sandbox and the longest group by far.
 const BASELINE_SHOWN: usize = 8;
 
+/// What a `dri kms=#true` group is headed with. The card nodes are two
+/// arguments like any other, and neither they nor the masks that are
+/// missing beside them say what granting them opens.
+const KMS_NOTE: &str = " (kms: card nodes, EDID and framebuffer geometry readable)";
+
 /// Longest node text a header shows. A `path-share` of a deep path would
 /// otherwise set the width of the column for every other group.
 const LABEL_MAX: usize = 40;
@@ -482,7 +487,13 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
                 pad(&g.source, sw)
             ),
         };
-        out.push(header.trim_end().to_owned());
+        let mut header = header.trim_end().to_owned();
+        if let Origin::Service(i) = g.origin
+            && matches!(view.cfg.services.get(i), Some(Service::Dri { kms: true }))
+        {
+            header.push_str(KMS_NOTE);
+        }
+        out.push(header);
         // First line of the group rather than last: it is a fact about
         // the baseline, not one of the arguments the elision counts.
         if g.origin == Origin::Baseline {
@@ -898,6 +909,50 @@ bwrap
             let at = |needle: &str| out.iter().position(|l| l.starts_with(needle));
             assert!(at("    security-context:") < at("    sidecar:"), "{out:#?}");
         }
+    }
+
+    /// What `dri kms=#true` costs is not in its arguments: the card
+    /// nodes are two `--dev-bind`s like the render nodes, and the sysfs
+    /// the bare node masks is simply not masked.
+    #[test]
+    fn a_dri_group_says_what_kms_costs() {
+        let lines = Lines::default();
+        let head = |kdl: &str| {
+            let cfg = cfg(kdl);
+            let out = render(
+                &[item(
+                    Origin::Service(0),
+                    &["--dev-bind", "/dev/dri/renderD128", "/dev/dri/renderD128"],
+                    None,
+                )],
+                &View {
+                    title: "bwrap",
+                    instance: "t",
+                    cfg: &cfg,
+                    source: Source {
+                        file: "config.kdl",
+                        lines: &lines,
+                    },
+                    rules: &[],
+                    wl_proxy: None,
+                    net_proxy_log: false,
+                    proxy: false,
+                    full: false,
+                    bwrap: crate::version::Version::Known(0, 12, 0),
+                },
+            )
+            .unwrap();
+            out.iter()
+                .find(|l| l.starts_with("  dri"))
+                .cloned()
+                .unwrap_or_else(|| panic!("{out:#?}"))
+        };
+        assert_eq!(head("dri\ncommand \"true\""), "  dri  3 arguments");
+        assert_eq!(
+            head("dri kms=#true\ncommand \"true\""),
+            "  dri kms=#true  3 arguments (kms: card nodes, EDID and framebuffer geometry \
+             readable)"
+        );
     }
 
     /// Which X server an `x11` grant runs is not in its arguments

@@ -264,7 +264,7 @@ mod tests {
         );
 
         // The proxy gate needs a node that starts the proxy.
-        assert!(warnings(new, proxy_old, &[Service::Dri]).is_empty());
+        assert!(warnings(new, proxy_old, &[Service::Dri { kms: false }]).is_empty());
         for node in [
             Service::Dbus { rules: Vec::new() },
             Service::Portals {

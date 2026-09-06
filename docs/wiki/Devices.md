@@ -6,12 +6,37 @@ exception is `/dev/uinput`, which is an error when missing.
 
 ## dri — GPU
 
-Binds `/dev/dri` read-write, and read-only: `/sys/dev/char`,
-`/sys/devices/system/cpu`, every `/sys/devices/pci*` root, `/sys/class/drm`.
-That is the sysfs of **every** PCI device, not only the GPU.
+```kdl
+dri
+dri kms=#true
+```
+
+Binds the **render node** of every GPU read-write — each
+`/dev/dri/by-path/*-render` link resolved, nothing else of `/dev/dri`, and
+not `by-path` itself — and read-only: `/sys/dev/char`,
+`/sys/devices/system/cpu` and each of those GPUs' own `/sys/devices`
+directory. The `drm/card*` directories under it are covered with an empty
+read-only tmpfs, and `/sys/class/drm` is rebuilt inside as one symlink per
+render node plus `version`, so a driver finds its device without the
+primary nodes, the connectors or the other PCI devices being there. A host
+with `/dev/dri` but no `by-path/*-render` entry is an error, not a wider
+bind.
+
+`kms=#true` adds the primary (`card*`) nodes and leaves their sysfs
+readable. That is mode setting, and with it: DRM master on a virtual
+terminal switch, the monitors' EDID (serial numbers included), the
+framebuffer geometry, and every other client's flink names. Only for a
+compositor, a mode-setting tool or a bare-KMS player; `lint` notes it as
+`dri-kms`. Rendering, video decoding and Vulkan need the bare node.
+
+A `gamepad` grant beside `dri` binds `/sys/devices` whole, and that bind
+covers the card masks: the two together expose the sysfs the bare `dri`
+hides (the nodes themselves stay out).
 
 NVIDIA: every `/dev/nvidia*` char device and `/sys/module/nvidia*` when
 present (`nvidia-caps` skipped; `/proc/driver/nvidia` comes with `--proc`).
+Those nodes have no render/primary split of their own, so `dri` on the
+proprietary driver stays as wide as it was, with or without `kms`.
 `dri` sets no environment — `DRI_PRIME`, `__NV_PRIME_RENDER_OFFLOAD` are a
 profile's `env` decision. Compute needs `etc-share "OpenCL"` / `etc-share
 "nvidia"`; AMD ROCm via `/dev/kfd` is not supported yet.

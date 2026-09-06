@@ -44,13 +44,18 @@ file manager, or the Secret Service).
 **Notes** (information): `allow-host-wildcard`, `app-runtime-rw`,
 `outbound-deny`, `ozone-hint-unnecessary`,
 `command-not-found`, `desktop-entry-missing`, `camera-nodes-none-present`,
-`camera-nodes-no-hotplug`, `secrets-access`, `lint-allow-unused`,
+`camera-nodes-no-hotplug`, `dri-kms`, `secrets-access`, `lint-allow-unused`,
 `x11-nested-no-wm`, `pulseaudio-module-loading`, `repeat-outside-block`.
 
 `allow-host-wildcard` is about a pattern that is a wildcard directly under a
 top-level domain (`*.com`): the `*` stands for one label, so that one covers
 every name anyone registers under the suffix. A wildcard deeper down
 (`*.example.com`) never raises it.
+
+`dri-kms` is about the primary (`card*`) nodes `kms=#true` adds: with them
+the sandbox becomes DRM master on a virtual terminal switch and reads the
+monitors' EDID, the framebuffer geometry and every other client's flink
+names. The bare node binds the render nodes, which carry none of that.
 
 `x11-nested-no-wm` is about the windows inside a nested `x11` server, so a
 config that already asks for the whole output with `fullscreen=#true`, or names
