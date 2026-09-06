@@ -55,8 +55,8 @@
 // delegated cgroup2 subtree for the proxy's own cgroup — a systemd user
 // session has one, and without it the run is refused rather than
 // started unfiltered. Everything else is `claude-code`'s: read that
-// profile's header for the install layout, the login, and what is
-// deliberately absent.
+// profile's header for the native vs npm install layouts, the login,
+// and what is deliberately absent.
 lint-allow "outbound-deny" reason="the deny is the point of this profile: egress is filtered by name, through the proxy, rather than by address"
 network {
     outbound "deny"
@@ -95,7 +95,7 @@ network {
 userns "disable"
 env DISABLE_AUTOUPDATER="1"
 home-share {
-    ".local/bin/claude" mode=ro
-    ".local/share/claude" mode=ro
+    ".local/bin/claude" mode=ro optional=#true
+    ".local/share/claude" mode=ro optional=#true
 }
-command "/home/bubbler/.local/bin/claude"
+command "claude"

@@ -30,20 +30,22 @@ it:
 
 ```kdl
 network
-home-share ".local/bin/claude" mode=ro
-home-share ".local/share/claude" mode=ro
+home-share ".local/bin/claude" mode=ro optional=#true
+home-share ".local/share/claude" mode=ro optional=#true
 env DISABLE_AUTOUPDATER="1"
 userns "disable"
-command "/home/bubbler/.local/bin/claude"
+command "claude"
 ```
 
 - `network` — the API, and every other host the agent chooses to fetch. Narrow
   it by name with `claude-code-strict` below; an address policy cannot do it,
   since the answers for those hosts change mid-run. See [Network](Network.md).
-- The two shares are the native install: `~/.local/bin/claude` is a symlink
-  into `~/.local/share/claude/versions/`, and both go in read-only with the
-  link resolved on the host. Installed from a package (`/usr/bin/claude`)
-  instead, drop them both and write `command "claude"`.
+- The two optional shares adapt to the install layout: the native installer
+  puts a symlink at `~/.local/bin/claude` into `~/.local/share/claude/versions/`,
+  and npm global puts `/usr/bin/claude` on the PATH. Both resolve through the
+  sandbox PATH (`/usr/bin` first); whichever is present on the host is used,
+  and `bubbler try --profile claude-code --explain` shows which shares bound or
+  `absent on this host, skipped`.
 - `env DISABLE_AUTOUPDATER="1"` — the tree the updater writes to is read-only
   in there. Updating happens on the host.
 - `userns "disable"` — one sandbox, and bubbler is it. Claude Code's own

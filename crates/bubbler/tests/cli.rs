@@ -11120,7 +11120,7 @@ mod profile_smoke {
             "claude-code",
             || require_bwrap() && require_pasta() && require_claude_native_install(),
             true,
-            &["/home/bubbler/.local/bin/claude", "--version"],
+            &["claude", "--version"],
             |out| out.starts_with(|c: char| c.is_ascii_digit()),
             "start with a digit",
         );
@@ -11133,7 +11133,7 @@ mod profile_smoke {
             "claude-code-strict",
             || require_egress() && require_claude_native_install(),
             true,
-            &["/home/bubbler/.local/bin/claude", "--version"],
+            &["claude", "--version"],
             |out| out.starts_with(|c: char| c.is_ascii_digit()),
             "start with a digit",
         );
