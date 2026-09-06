@@ -2893,13 +2893,13 @@ domain, which covers every name anyone registers under that suffix),
 no application directory here holds, which is what a profile for software you
 have not installed looks like), `camera-nodes-none-present` (`camera nodes=#true` on a
 host with no `/dev/video*` or `/dev/media*`, so that half of the grant binds
-nothing), `dri-kms` (`dri kms=#true`, which binds the primary nodes and
-leaves their sysfs readable: the monitors' EDID, the framebuffer geometry,
-every other client's flink names, and DRM master on a virtual terminal
-switch),
-`camera-nodes-no-hotplug` (the node list is frozen at launch, and
+nothing), `camera-nodes-no-hotplug` (the node list is frozen at launch, and
 under an isolated network namespace no uevent reaches the sandbox either —
-that second half is dropped under `network "host"`), `secrets-access`
+that second half is dropped under `network "host"`), `dri-kms`
+(`dri kms=#true`, which binds the primary nodes and leaves their sysfs
+readable: the monitors' EDID, the framebuffer geometry, every other
+client's flink names, and DRM master on a virtual terminal switch),
+`secrets-access`
 (`talk`/`own` of
 `org.freedesktop.secrets` on the session bus reaches the whole login keyring:
 the Secret Service API partitions nothing between the applications that call

@@ -74,8 +74,10 @@ pub fn apply_all(
             // overlapping shares must be refused before either is emitted.
             Service::PathShare { .. } => {}
             // Bound after the loop, so its whole-`/sys/devices` bind always
-            // follows the PCI roots `dri` binds under it rather than
-            // depending on the order of the two nodes in the file.
+            // follows the device directories `dri` binds under it rather
+            // than depending on the order of the two nodes in the file.
+            // The masks `dri` lays over the card directories are emitted
+            // after this bind again, in the builder's own late section.
             Service::Gamepad { .. } => {}
             // Bound after the loop with `gamepad hidraw=#true`, which is
             // the same grant written the older way: one bind, whether the
@@ -583,8 +585,8 @@ fn gamepad(
     let dev = require_dir(host, "gamepad", PathBuf::from("/dev/input"))?;
     args.dev_bind(&dev, &dev);
     // `/sys/class/input` entries are symlinks into `/sys/devices`, and a
-    // bluetooth or virtual controller lives outside the PCI roots `dri`
-    // exposes, so the whole tree is bound read-only.
+    // bluetooth or virtual controller lives outside the GPU directories
+    // `dri` exposes, so the whole tree is bound read-only.
     for p in ["/sys/class/input", "/sys/devices"] {
         let p = require_dir(host, "gamepad", PathBuf::from(p))?;
         args.ro_bind(&p, &p);

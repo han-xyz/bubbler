@@ -729,6 +729,21 @@ impl Merged {
                     return Ok(());
                 }
             }
+            Service::Dri { kms } => {
+                if let Some((held_kms, held_src)) =
+                    self.services.iter_mut().find_map(|(s, src)| match s {
+                        Service::Dri { kms: held } => Some((held, src)),
+                        _ => None,
+                    })
+                {
+                    // The card nodes are a grant of their own on top of
+                    // the render nodes, so they add up rather than the
+                    // last layer deciding them.
+                    *held_kms |= *kms;
+                    *held_src = src.clone();
+                    return Ok(());
+                }
+            }
             Service::Portals { children } => {
                 if let Some((held, held_src)) =
                     self.services.iter_mut().find_map(|(s, src)| match s {
@@ -808,8 +823,7 @@ impl Merged {
                     return Ok(());
                 }
             }
-            Service::Dri { .. }
-            | Service::Pipewire
+            Service::Pipewire
             | Service::Pulseaudio
             | Service::Notify
             | Service::Tray
@@ -1565,6 +1579,24 @@ mod tests {
         let resolved = r.resolve("app").unwrap();
         assert_eq!(resolved.config.services, vec![Service::Hidraw]);
         assert_eq!(resolved.text, "hidraw\n");
+    }
+
+    #[test]
+    fn dri_kms_written_in_one_layer_covers_a_bare_dri_in_another() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (app, base) in [
+            ("include \"base\"\ndri kms=#true\n", "dri\n"),
+            ("include \"base\"\ndri\n", "dri kms=#true\n"),
+        ] {
+            let r = resolver(tmp.path(), &[], &[("app", app), ("base", base)]);
+            let resolved = r.resolve("app").unwrap();
+            assert_eq!(
+                resolved.config.services,
+                vec![Service::Dri { kms: true }],
+                "{app}"
+            );
+            assert_eq!(resolved.text, "dri kms=#true\n", "{app}");
+        }
     }
 
     #[test]
