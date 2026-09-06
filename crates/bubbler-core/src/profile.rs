@@ -1335,7 +1335,13 @@ mod tests {
         // API, which has no per-application partitioning and so hands
         // over every secret in the login keyring, is an opt-in.
         let code = cfg("code");
-        assert_eq!(code.command, Some(vec![OsString::from("code")]));
+        // `--wait` is what keeps the sandbox alive: the `code` launcher
+        // starts the editor detached and returns, and a command that
+        // returns ends the run under it.
+        assert_eq!(
+            code.command,
+            Some(vec![OsString::from("code"), OsString::from("--wait")])
+        );
         assert_eq!(
             code.services,
             vec![

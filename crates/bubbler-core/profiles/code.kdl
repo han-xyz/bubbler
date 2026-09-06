@@ -4,6 +4,23 @@
 // `home-share` node to the tree you keep code in — before the first run:
 // a share whose source is missing is an error, not a quieter sandbox.
 //
+// `--wait` is part of the command, not a preference: the `code` launcher
+// starts the editor detached and returns about a second later, and a
+// sandbox ends when its command does — without it the window maps and
+// dies with the run that made it (measured). `--wait` returns when the
+// window closes, which is when this instance should stop.
+//
+// `dri` is not optional here. Without it every VS Code process still
+// starts — zygote, renderer, gpu-process on the Wayland ozone backend —
+// and no window ever maps (measured).
+//
+// `dbus` and `portals` are the desktop's side: the editor reads the
+// colour scheme over org.freedesktop.portal.Settings as it starts
+// (measured), and its file chooser is then the portal's, which reaches
+// outside the shared directories and exports what you pick into this
+// instance's document view. Without them the chooser is the one inside
+// the sandbox and sees the private home and ~/Projects.
+//
 // VS Code keeps its own multi-process sandbox inside bubbler's. Arch's
 // /usr/share/code/chrome-sandbox is NOT setuid, unlike
 // /usr/lib/electron*/chrome-sandbox, so Electron takes the user-namespace
@@ -55,4 +72,4 @@ network
 dbus
 portals
 home-share "Projects" mode=rw
-command "code"
+command "code" "--wait"
