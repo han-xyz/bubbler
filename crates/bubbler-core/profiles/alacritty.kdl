@@ -1,7 +1,17 @@
 // bubbler profile: alacritty
+//
+// A display, and nothing else. Alacritty draws through OpenGL and finds
+// no render node in this sandbox, so it renders in software and says so
+// on startup (`libEGL warning: failed to get driver name for fd -1`);
+// `dri` below is what stops that.
+//
 // No nested user namespaces: a terminal's own sandbox has no need of one.
 // The shell inside cannot start bwrap, podman or a browser's inner sandbox;
 // drop the `userns` line for a terminal that hosts those.
+// Bare by design. Add:
+//   dri
+//     — the GPU, and with it hardware glyph rendering instead of
+//       llvmpipe.
 wayland
 userns "disable"
 desktop "Alacritty.desktop"
