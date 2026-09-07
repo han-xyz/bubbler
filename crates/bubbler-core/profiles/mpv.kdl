@@ -8,8 +8,9 @@
 // `dri` is the GPU. mpv "defaults to using the OpenGL video output
 // device setting on hardware that supports it", and `--hwdec` decodes
 // through the same driver (Arch wiki, Mpv). Bare, not `kms=#true`: the
-// render node is what a driver draws through, and the card node is the
-// display controller, which a player never opens.
+// render node is what a driver draws through, and a player is not the
+// display controller. What bare `dri` binds anyway on the proprietary
+// NVIDIA driver, `lint` notes.
 //
 // `pipewire` is the sound: on a PipeWire host mpv's own default audio
 // output driver is `pipewire` (Arch wiki, Mpv#Screen sharing cannot

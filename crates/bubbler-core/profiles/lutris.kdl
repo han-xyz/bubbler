@@ -16,10 +16,14 @@
 // `dri` is the GPU the games render on, and the GL Lutris asks for
 // itself: without it the window still maps, but every GLX context fails
 // (measured: BadValue from X_GLXCreateNewContext). Bare, not
-// `kms=#true` — the card node is the display controller, and a game
-// drawing into a window on this session's compositor never opens one.
-// Gamescope wants one only as an embedded compositor; a Wine manager
-// runs it nested, as a client of the session (Arch wiki, Gamescope).
+// `kms=#true`: a game drawing into a window on this session's compositor
+// is not the display controller, and `kms=#true` would leave the card
+// sysfs — the monitors' EDID and modes — readable on top. What bare
+// `dri` binds anyway on the proprietary NVIDIA driver, whose EGL will
+// not take a Wayland display without the primary node, `lint` notes.
+// Gamescope wants a card node only as an embedded compositor; a Wine
+// manager runs it nested, as a client of the session (Arch wiki,
+// Gamescope).
 //
 // `network` is the sandbox's own network namespace, for the runners,
 // the Proton and DXVK builds and the installer scripts Lutris fetches.

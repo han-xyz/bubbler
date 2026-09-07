@@ -17,10 +17,11 @@
 // security context, which X11 has no equivalent of.
 //
 // `dri` is the GPU everything here renders on, the 32-bit client
-// included. Bare, not `kms=#true`: the card node is the display
-// controller, and a game drawing into a window on this session's
-// compositor never opens one. Gamescope wants one only as an embedded
-// compositor.
+// included. Bare, not `kms=#true`: a game drawing into a window on this
+// session's compositor is not the display controller, and `kms=#true`
+// would leave the card sysfs readable on top. What bare `dri` binds
+// anyway on the proprietary NVIDIA driver, `lint` notes. Gamescope wants
+// a card node only as an embedded compositor.
 //
 // `gamepad` is the controllers, read through evdev. It binds /dev/input
 // whole, so the keyboard and the mouse of this seat come with it
