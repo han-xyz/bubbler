@@ -1227,7 +1227,8 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                 node,
                 &ETC_HOST,
                 "`etc \"host\"` binds the host's whole `/etc` read-only in place of the \
-                 allowlist: `hostname`, `fstab`, `ssh_config` and every other \
+                 allowlist: `hostname` (on a machine named after its user, the username \
+                 again), `fstab`, `ssh_config` and every other \
                  world-readable file the host keeps there becomes visible"
                     .to_owned(),
                 "drop the argument for the tmpfs allowlist, or accept it with \
@@ -1306,9 +1307,9 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                  that node: through it the sandbox reads the connectors, their modes, \
                  the monitors' EDID"
                     .to_owned(),
-                "nothing narrower exists on that driver; write `dri kms=#true` where the \
-                 file should say so, or run the application on a GPU the Mesa drivers \
-                 drive",
+                "nothing narrower exists on that driver; run the application on a GPU \
+                 the Mesa drivers drive, or accept it with \
+                 `lint-allow \"dri-nvidia-primary\" reason=\"...\"`",
             ),
             "camera" if flag(node, "nodes") == Some(true) => {
                 camera_nodes(ctx, i, node, host_net, f);

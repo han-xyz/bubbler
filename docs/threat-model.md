@@ -1047,8 +1047,10 @@ explicit opt-out: it binds the host's whole `/etc` read-only in the
 allowlist's place, so `hostname`, `fstab`, `ssh/ssh_config`, the `X11`
 config directory and every other world-readable file the host keeps there
 becomes visible to the sandbox. The synthetic `passwd` and `group` are
-mounted over that bind last regardless, so the host username stays hidden
-in both modes; `lint` warns (`etc-host`) so the choice is on purpose. No
+mounted over that bind last regardless, together with the shadow-suite
+backups (`passwd-`, `passwd+`, `group-`, `group+`) and empty
+`subuid`/`subgid`, where the host has them, so the host username stays
+hidden in both modes; `lint` warns (`etc-host`) so the choice is on purpose. No
 shipped profile sets it.
 
 **Does not defend:** TOCTOU. bwrap resolves the path again when it binds,

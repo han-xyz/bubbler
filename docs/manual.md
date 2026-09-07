@@ -1889,7 +1889,9 @@ binds the host's whole `/etc` read-only in its place: `hostname`, `fstab`,
 `ssh/ssh_config`, the `X11` config directory and every other world-readable
 file the host keeps in `/etc` becomes visible, not only the names
 `ETC_ALLOWLIST` lists. `passwd` and `group` are still the synthetic ones
-bubbler writes, mounted over the host bind last, so the host username stays
+bubbler writes, mounted over the host bind last, together with the
+shadow-suite backups (`passwd-`, `passwd+`, `group-`, `group+`) and empty
+`subuid`/`subgid`, where the host has them, so the host username stays
 hidden either way. The node takes no property and no child; anything besides
 a bare `etc` or `etc "host"` is a config error. `bubbler lint` warns about it
 as `etc-host` and takes a `lint-allow` node naming what the application reads

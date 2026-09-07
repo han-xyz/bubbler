@@ -333,7 +333,9 @@ pub static GRANTS: &[Grant] = &[
                with the host's `/etc` as it is: `hostname`, `fstab`, `ssh/ssh_config`, the \
                `X11` config directory and every other world-readable file the host keeps \
                there, not only the allowlist's entries. `passwd` and `group` are still the \
-               synthetic ones bubbler writes, mounted over it last, so the host username \
+               synthetic ones bubbler writes, mounted over it last, together with the \
+               shadow-suite backups (`passwd-`, `passwd+`, `group-`, `group+`) and empty \
+               `subuid`/`subgid`, where the host has them, so the host username \
                stays hidden either way.",
         risk: Risk::Wide,
         grammar: "etc [\"host\"]",

@@ -121,7 +121,7 @@ grant and are always written back as a block.
 | `network` | own namespace, internet via pasta | LAN/mDNS and host loopback unreachable; see [Network](Network.md) |
 | `network "host"` | host's network stack | host loopback services and abstract sockets exposed |
 | `network { outbound "deny" … }` | egress narrowed to the `allow-out` addresses and the `allow-host` names | a name is served by a CONNECT proxy of bubbler's on `127.0.0.1:3128` inside, which is also the only thing that resolves: the application gets no DNS, and one that ignores `HTTPS_PROXY` fails at the lookup. Needs a delegated cgroup2 subtree |
-| `dri` | every GPU's render node rw, NVIDIA nodes, each GPU's own `/sys/devices` directory with its `drm/card*` masked | the nodes are rw (bwrap has no read-only device bind); the NVIDIA nodes have no render/primary split |
+| `dri` | every GPU's render node rw, NVIDIA nodes, each GPU's own `/sys/devices` directory with its `drm/card*` masked | the nodes are rw (bwrap has no read-only device bind); the NVIDIA nodes have no render/primary split; on the proprietary NVIDIA driver the GPU's primary node comes with the bare grant (connectors, their modes, the monitors' EDID) — lint notes `dri-nvidia-primary` |
 | `dri kms=#true` | the primary (`card*`) nodes too, and their sysfs unmasked | DRM master on a VT switch, the monitors' EDID, framebuffer geometry, other clients' flink names; lint notes `dri-kms` |
 | `pipewire`, `pulseaudio` | session audio socket | microphone too, no portal |
 | `gamepad` | `/dev/input` rw, `/sys/devices`, `/run/udev` | every input node your user can open; keyboard if a group lets you |
@@ -135,7 +135,7 @@ grant and are always written back as a block.
 | `portals` | portal names + app id `org.bubbler.<inst>`; binds the instance's document-portal view at `$XDG_RUNTIME_DIR/doc`, which is also where host file arguments of `run`/`try`/`open` land | Steam's runtime misreads `/.flatpak-info` |
 | `a11y` | the session's accessibility bus, proxied as a third bus; `AT_SPI_BUS_ADDRESS` | a screen reader reads this app's widgets; needs `dbus` |
 | `notify`, `tray`, `mpris`, `input-method` | one or two bus rules each; `IBUS_USE_PORTAL` for `input-method` | need `dbus` in the merged result, as `portals` and `a11y` do |
-| `etc "host"` | the host's whole `/etc`, read-only, in place of the allowlist | `hostname`, `fstab`, `ssh/ssh_config`, `X11` config and every other world-readable file becomes visible; `passwd`/`group` stay synthetic; lint warns |
+| `etc "host"` | the host's whole `/etc`, read-only, in place of the allowlist | `hostname`, `fstab`, `ssh/ssh_config`, `X11` config and every other world-readable file becomes visible; `passwd`/`group` stay synthetic, together with the shadow-suite backups (`passwd-`, `passwd+`, `group-`, `group+`) and empty `subuid`/`subgid`, where the host has them; lint warns |
 | `tmp` | cap the sandbox's own `/tmp`, up to 64G | default is 2G; every other tmpfs (`/etc`, `/var`, `/run`) stays capped at 64M |
 | `seccomp` | edit the default denylist | `disable` prints a warning each run |
 | `userns "disable"` | no nested user namespaces | breaks Firefox/Chromium inner sandbox, Steam, podman |
