@@ -1,7 +1,8 @@
 // bubbler profile: libreoffice
 //
-// `etc-share "libreoffice"`: this installation's `bootstraprc` and
-// `sofficerc` are symlinks from the program directory into
+// `etc-share "libreoffice"`: this installation's `bootstraprc`,
+// `sofficerc` and the printer setup `share/psprint/psprint.conf` are
+// symlinks from the install tree into
 // /etc/libreoffice, and the baseline hides everything in /etc that is not
 // on its allowlist. Without `bootstraprc` the suite has no
 // `UserInstallation` path, so soffice.bin exits 1 before it writes its
@@ -15,7 +16,8 @@
 //
 // No `env` node names a VCL plugin. bubbler clears the environment, and
 // with nothing to autodetect from LibreOffice picks the gtk3 plugin by
-// itself (measured); `env SAL_USE_VCLPLUGIN="qt6"` picks another.
+// itself — with no such node, `libvclplug_gtk3lo.so` is what soffice.bin
+// maps; `env SAL_USE_VCLPLUGIN="qt6"` picks another.
 //
 // Documents live in ~/Documents and in the private home. A directory on
 // another disk is named explicitly, e.g.

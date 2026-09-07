@@ -42,7 +42,9 @@
 // A checkout outside the home is named explicitly, e.g.
 //     path-share "/kioxia/src" mode=rw
 //
-// `network` is the sandbox's own network namespace, so a dev server on
+// `network` is the marketplace, the update check, settings sync and
+// whatever an extension of yours talks to. It is the sandbox's own
+// network namespace, so a dev server on
 // the host's own 127.0.0.1 is not reachable from the editor, and one the
 // editor starts is not reachable from a host browser. Add
 // `network { allow-port 3000 }` to publish a port of the sandbox on the
