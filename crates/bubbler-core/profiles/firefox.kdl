@@ -28,8 +28,9 @@
 //
 // `dri` is the GPU. Without it Gecko composites in software, which
 // renders every page and costs frame rate and battery on a video. Bare,
-// so the sandbox gets the render nodes and not the card nodes: no EDID,
-// no framebuffer geometry, no other client's buffers.
+// so the sandbox gets the render nodes and not the card nodes. What bare
+// `dri` binds anyway on the proprietary NVIDIA driver, whose EGL will not
+// take a Wayland display without the primary node, `lint` notes.
 //
 // `home-share "Downloads" mode=rw` is where a download lands, and the
 // only part of the real home this profile shares. Picking a file to

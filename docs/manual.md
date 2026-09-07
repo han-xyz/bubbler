@@ -504,8 +504,8 @@ Every source must exist and be of the expected type when the argv is built; a
 missing one is an error rather than a silently weaker sandbox. The one
 exception is `home-share` and `path-share` written with `optional=#true`: a
 missing source is skipped instead, and `--explain` says so. That covers
-`home-share` too, so the `firefox` profile needs a `~/Downloads` and `lutris`
-a `~/Games`. A `home-share` source is resolved before it is bound and must
+`home-share` too, so the `firefox` profile needs a `~/Downloads`. A
+`home-share` source is resolved before it is bound and must
 stay inside your home directory: a symlink pointing elsewhere is refused, not
 followed. The directories bubbler builds the sandbox out of are refused
 there as well, read-only as much as read-write: the instance store
@@ -2233,8 +2233,8 @@ ask for the session's display with `x11 "host"`. `~/name` below is a
     generic       nothing beyond the baseline
     keepassxc     wayland, ~/Documents rw
     kitty         wayland dri
-    libreoffice   wayland, ~/Documents rw, SAL_USE_VCLPLUGIN=gtk3
-    lutris        wayland x11 "host" dri pulseaudio network gamepad, ~/Games rw
+    libreoffice   wayland, ~/Documents rw, etc-share libreoffice
+    lutris        wayland x11 "host" dri pulseaudio network gamepad, ~/Games rw (optional)
     mpv           wayland dri pipewire, ~/Videos
     spotify       wayland dri pulseaudio network
     steam         wayland x11 "host" dri pulseaudio network gamepad
@@ -2265,8 +2265,11 @@ and `thunderbird` (reverse-DNS names), and `libreoffice`, whose command is run
 by eight entries — the start centre is the one meant. The rest resolve by file
 name; `mpv`'s does too, once mpv is installed. See "Desktop entries".
 
-`SAL_USE_VCLPLUGIN=gtk3` is there because bubbler clears the environment,
-leaving LibreOffice's VCL plugin to an autodetection with nothing to go on.
+`etc-share "libreoffice"` is there because this installation's `bootstraprc`,
+`sofficerc` and printer setup are symlinks into `/etc/libreoffice`, which the
+baseline hides: without `bootstraprc` the suite has no `UserInstallation` path
+and `soffice.bin` exits before a window ever maps.
+
 The Mozilla apps need no variable of their own: Gecko has defaulted to Wayland
 since Firefox 121 and takes it from the `WAYLAND_DISPLAY` the `wayland` grant
 sets, so `MOZ_ENABLE_WAYLAND=1` is gone from both profiles — write

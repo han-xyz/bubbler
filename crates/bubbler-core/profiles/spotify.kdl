@@ -22,11 +22,12 @@
 // display at all, so the client's Chromium layer takes the socket that
 // grant binds.
 //
-// `dri` is the GPU: the client's Chromium layer initialises a GPU
-// process on it — the shader caches it leaves in the private home are
-// the evidence — and composites in software without it. Bare, so the
-// sandbox gets the render nodes and not the card nodes: no EDID, no
-// framebuffer geometry, no other client's buffers.
+// `dri` is the GPU: the client's Chromium layer initialises a GPU process
+// on it — the shader caches it leaves in the private home are the
+// evidence — and composites in software without it. Bare, so the sandbox
+// gets the render nodes and not the card nodes. What bare `dri` binds
+// anyway on the proprietary NVIDIA driver, whose EGL will not take a
+// Wayland display without the primary node, `lint` notes.
 //
 // Bare by design. Add:
 //   dbus {

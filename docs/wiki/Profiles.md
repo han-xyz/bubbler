@@ -34,8 +34,8 @@ Wayland-first; only the two gaming profiles grant `x11`, and both take the
 | `generic` | nothing beyond the baseline (commented examples to start from) |
 | `keepassxc` | wayland, ~/Documents rw, no nested userns |
 | `kitty` | wayland dri, no nested userns |
-| `libreoffice` | wayland, ~/Documents rw, `SAL_USE_VCLPLUGIN=gtk3`, no nested userns |
-| `lutris` | wayland `x11 "host"` dri pulseaudio network gamepad, ~/Games rw |
+| `libreoffice` | wayland, ~/Documents rw, `etc-share libreoffice`, no nested userns |
+| `lutris` | wayland `x11 "host"` dri pulseaudio network gamepad, ~/Games rw (optional) |
 | `mpv` | wayland dri pipewire, ~/Videos, no nested userns |
 | `spotify` | wayland dri pulseaudio network |
 | `steam` | wayland `x11 "host"` dri pulseaudio network gamepad |

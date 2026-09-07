@@ -17,8 +17,9 @@
 //
 // `dri` is the GPU. Without it Electron composites in software and
 // decodes video the same way, which is what a call costs most. Bare, so
-// the sandbox gets the render nodes and not the card nodes: no EDID, no
-// framebuffer geometry, no other client's buffers.
+// the sandbox gets the render nodes and not the card nodes. What bare
+// `dri` binds anyway on the proprietary NVIDIA driver, whose EGL will not
+// take a Wayland display without the primary node, `lint` notes.
 //
 // `network` is the sandbox's own network namespace, which is all this
 // needs: everything it talks to is Discord's, and nothing of the host's
