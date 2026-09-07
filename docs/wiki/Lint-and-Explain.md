@@ -39,7 +39,10 @@ sandbox).
 `wayland-host`, `wayland-clipboard-open`, `network-host`, `etc-host` (`etc
 "host"` binds the host's whole `/etc` read-only in place of the allowlist:
 `hostname`, `fstab`, `ssh/ssh_config`, `X11` config and every other
-world-readable file becomes visible; `passwd`/`group` stay synthetic),
+world-readable file becomes visible; `passwd`/`group` stay the synthetic
+ones bubbler writes, overlaid with the shadow-suite backups and empty
+`subuid`/`subgid` where the host has them, so the host username stays
+hidden),
 `dbus-name-is-risky` (a `dbus`/`system-bus` rule naming a name that is
 defensible but wide — KWin's or the GNOME shell's own bus name, the session's
 file manager, or the Secret Service), `pulseaudio-module-loading` (a

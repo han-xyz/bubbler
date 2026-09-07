@@ -362,8 +362,11 @@ const CHECK_LINES: &[(&str, &str)] = &[
     (
         "etc-host",
         "`etc \"host\"` binds the host's whole `/etc` read-only in place of the allowlist: \
-         `hostname`, `fstab`, `ssh_config` and every other world-readable file the host \
-         keeps there becomes visible.",
+         `hostname` (on a machine named after its user, the username again), `fstab`, \
+         `ssh_config` and every other world-readable file the host keeps there becomes \
+         visible; `passwd`/`group` stay the synthetic ones bubbler writes, overlaid with \
+         the shadow-suite backups and empty `subuid`/`subgid` where the host has them, so \
+         the host username stays hidden.",
     ),
     (
         "home-share-reserved",

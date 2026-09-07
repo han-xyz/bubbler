@@ -1229,7 +1229,10 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                 "`etc \"host\"` binds the host's whole `/etc` read-only in place of the \
                  allowlist: `hostname` (on a machine named after its user, the username \
                  again), `fstab`, `ssh_config` and every other \
-                 world-readable file the host keeps there becomes visible"
+                 world-readable file the host keeps there becomes visible; `passwd`/`group` \
+                 stay the synthetic ones bubbler writes, overlaid with the shadow-suite \
+                 backups and empty `subuid`/`subgid` where the host has them, so the host \
+                 username stays hidden"
                     .to_owned(),
                 "drop the argument for the tmpfs allowlist, or accept it with \
                  `lint-allow \"etc-host\" reason=\"...\"` naming what the application reads \

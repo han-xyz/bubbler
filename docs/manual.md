@@ -2921,8 +2921,10 @@ host network namespace: every host loopback service and every abstract unix
 socket, X11's included, is reachable), `etc-host` (`etc "host"` binds the
 host's whole `/etc` read-only in place of the allowlist: `hostname`, `fstab`,
 `ssh/ssh_config`, the `X11` config directory and every other world-readable
-file the host keeps there becomes visible; `passwd` and `group` stay the
-synthetic ones bubbler writes, so the host username is hidden either way),
+file the host keeps there becomes visible; `passwd`/`group` stay the
+synthetic ones bubbler writes, overlaid with the shadow-suite backups and
+empty `subuid`/`subgid` where the host has them, so the host username stays
+hidden),
 `dbus-name-is-risky` (a `dbus` or
 `system-bus` rule naming a bus name that is defensible but wide — the KWin or
 GNOME shell compositor's own name, the session's file manager, or the Secret
