@@ -1060,7 +1060,7 @@ the bare node as with `kms=#true`. A GPU on that driver also keeps its
 primary node, measured as the one thing its EGL needs to drive a Wayland
 display. That node is not a narrower grant than `kms=#true`: measured with
 `modetest -M nvidia-drm -c` inside a bare `dri` sandbox, the connectors,
-their modes and the monitors' EDID come back through DRM ioctls exactly as
+their modes, the monitors' EDID come back through DRM ioctls exactly as
 they do outside, and the card sysfs mask withholds none of it. So on an
 NVIDIA GPU a bare `dri` carries the mode-setting reach, said out loud by
 `--explain` and by the `dri-nvidia-primary` lint note rather than left to

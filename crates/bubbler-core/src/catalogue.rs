@@ -127,8 +127,8 @@ pub static GRANTS: &[Grant] = &[
                framebuffer geometry and every other client's flink names. A GPU on the \
                proprietary NVIDIA driver keeps its primary node without the property, \
                since its EGL will not drive a Wayland display otherwise, and that node \
-               carries the connectors, their modes and the EDID whatever the sysfs beside \
-               it says: on that driver the bare node reaches as far as `kms=#true`, and \
+               carries the connectors, their modes, the monitors' EDID whatever the sysfs \
+               beside it says: on that driver the bare node reaches as far as `kms=#true`, and \
                `lint` says so.",
         risk: Risk::Wide,
         grammar: "dri [kms=#true]",

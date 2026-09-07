@@ -71,7 +71,7 @@ names. The bare node binds the render nodes, which carry none of that.
 `dri-nvidia-primary` reads this host: where a render node's GPU is on the
 proprietary NVIDIA driver, a bare `dri` binds that GPU's primary node too
 (its EGL will not drive a Wayland display without one), and the node
-carries the connectors, their modes and the monitors' EDID through DRM
+carries the connectors, their modes, the monitors' EDID through DRM
 ioctls. On that driver the bare grant reaches as far as `kms=#true`.
 
 `x11-nested-no-wm` is about the windows inside a nested `x11` server, so a

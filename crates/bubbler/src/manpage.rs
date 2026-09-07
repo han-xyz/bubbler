@@ -349,7 +349,7 @@ const CHECK_LINES: &[(&str, &str)] = &[
         "dri-nvidia-primary",
         "A bare `dri` on a host whose GPU is on the proprietary NVIDIA driver, which binds \
          that GPU's primary node: its EGL will not drive a Wayland display without one, and \
-         the node carries the monitors' EDID, their modes and the framebuffer geometry.",
+         the node carries the connectors, their modes, the monitors' EDID.",
     ),
     (
         "dup-name-policy",

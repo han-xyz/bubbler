@@ -54,7 +54,7 @@
   their own, and a GPU whose PCI driver is `nvidia` keeps its primary node
   with them: that stack's EGL declines a Wayland display without it, and a
   sandboxed GUI application would render in software. That node answers DRM
-  ioctls — the connectors, their modes and the monitors' EDID — which the
+  ioctls — the connectors, their modes, the monitors' EDID — which the
   masked card sysfs does not withhold, so on that driver a bare `dri`
   reaches as far as `dri kms=#true`; `--explain` marks the group and the
   new `dri-nvidia-primary` lint note says so. No other driver's primary

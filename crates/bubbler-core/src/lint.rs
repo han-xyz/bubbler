@@ -1303,10 +1303,9 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                 &DRI_NVIDIA_PRIMARY,
                 "a GPU on this host is on the proprietary NVIDIA driver, whose EGL will \
                  not drive a Wayland display without the primary node, so `dri` binds \
-                 that node: through it the sandbox reads the monitors' EDID, their modes \
-                 and the framebuffer geometry, which is the reach `kms=#true` is noted \
-                 for"
-                .to_owned(),
+                 that node: through it the sandbox reads the connectors, their modes, \
+                 the monitors' EDID"
+                    .to_owned(),
                 "nothing narrower exists on that driver; write `dri kms=#true` where the \
                  file should say so, or run the application on a GPU the Mesa drivers \
                  drive",

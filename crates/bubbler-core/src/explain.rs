@@ -31,9 +31,10 @@ const KMS_NOTE: &str = " (kms: card nodes, EDID and framebuffer geometry readabl
 /// What a bare `dri` group is headed with where the grant bound a
 /// primary node anyway: a GPU on the proprietary NVIDIA driver, whose
 /// EGL will not drive a Wayland display without it. The file says
-/// nothing about that node, and the reach it opens is the one above.
-const NVIDIA_NOTE: &str =
-    " (nvidia: primary node bound for its EGL — EDID and framebuffer geometry readable)";
+/// nothing about that node, so the header says what it reads through
+/// it: connectors, their modes, the monitors' EDID — measured with
+/// `modetest`, not the master-only reach [`KMS_NOTE`] carries.
+const NVIDIA_NOTE: &str = " (nvidia: primary node bound for its EGL — connectors, their modes, the monitors' EDID readable)";
 
 /// Longest node text a header shows. A `path-share` of a deep path would
 /// otherwise set the width of the column for every other group.
@@ -1052,8 +1053,8 @@ bwrap
     }
 
     /// The bare node binds a primary node of its own where the GPU is on
-    /// the proprietary NVIDIA driver, and what that opens is what the
-    /// `kms` property is noted for, so the group says so there too.
+    /// the proprietary NVIDIA driver, and the group carries a note of
+    /// its own for what that node reads, distinct from `kms`'s.
     #[test]
     fn a_dri_group_says_when_a_primary_node_came_with_the_bare_node() {
         let cfg = cfg("dri\ncommand \"true\"");
@@ -1091,8 +1092,8 @@ bwrap
         assert_eq!(
             out.iter().find(|l| l.starts_with("  dri")),
             Some(
-                &"  dri  6 arguments (nvidia: primary node bound for its EGL — EDID and \
-                  framebuffer geometry readable)"
+                &"  dri  6 arguments (nvidia: primary node bound for its EGL — connectors, \
+                  their modes, the monitors' EDID readable)"
                     .to_owned()
             ),
             "{out:#?}"
