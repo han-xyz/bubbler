@@ -1734,13 +1734,15 @@ mod tests {
         assert!(pos("/etc/subgid") < pos("--proc"), "{s:?}");
     }
 
-    /// The bind and the two synthetic files are tagged with the `etc`
-    /// node that asked for them, not left as baseline: `--explain`
-    /// groups them together rather than folding them into the sandbox
-    /// that would exist without it.
+    /// The bind, the two synthetic files and the shadow-suite overlay
+    /// that follows them are all tagged with the `etc` node that asked
+    /// for them, not left as baseline: `--explain` groups them together
+    /// rather than folding them into the sandbox that would exist
+    /// without it.
     #[test]
     fn binding_the_hosts_etc_tags_the_bind_and_the_synthetic_files_with_its_own_origin() {
-        let host = FakeHost::default();
+        let (f, _, _) = crate::host::fake::types();
+        let host = FakeHost::default().with("/etc/subuid", f);
         let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &host);
         args.tag(Origin::Etc);
         args.bind_host_etc(&host);
@@ -1748,10 +1750,11 @@ mod tests {
             .finish_explained(&["sh".into()], &mut Counter::new())
             .unwrap();
         let etc: Vec<&Explained> = argv.iter().filter(|i| i.origin == Origin::Etc).collect();
-        assert_eq!(etc.len(), 3, "{argv:#?}");
+        assert_eq!(etc.len(), 4, "{argv:#?}");
         assert_eq!(strs(&etc[0].args), ["--ro-bind", "/etc", "/etc"]);
         assert!(etc[1].args.iter().any(|a| a == "/etc/passwd"), "{etc:#?}");
         assert!(etc[2].args.iter().any(|a| a == "/etc/group"), "{etc:#?}");
+        assert!(etc[3].args.iter().any(|a| a == "/etc/subuid"), "{etc:#?}");
     }
 
     #[test]
