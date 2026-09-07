@@ -89,20 +89,27 @@ const SUPERVISOR_WAIT: Duration = Duration::from_secs(2);
 
 /// The name a generated file takes in the run's runtime directory: the
 /// path it is bound at inside the sandbox with its separators flattened,
-/// so `--explain` names the file a run would write and no two
-/// destinations collide on one name.
-pub(crate) fn data_name(dest: &Path) -> OsString {
-    let mut name = OsString::new();
+/// and `prefix` in front of it, so `--explain` names the file a run
+/// would write and no two destinations collide on one name.
+pub(crate) fn data_name(prefix: &str, dest: &Path) -> OsString {
+    let mut name = OsString::from(prefix);
+    let mut first = true;
     for part in dest.components() {
         if let Component::Normal(part) = part {
-            if !name.is_empty() {
+            if !first {
                 name.push("-");
             }
             name.push(part);
+            first = false;
         }
     }
     name
 }
+
+/// What a sidecar's generated files are called apart from the
+/// application sandbox's: both write into the run's one runtime
+/// directory, and `portals` gives both of them a `/.flatpak-info`.
+const SIDECAR_PREFIX: &str = "proxy-";
 
 /// Allocator for `--dry-run`: numbers every fd 3, 4, ... and names each
 /// generated file where a run would write it, without creating anything.
@@ -110,6 +117,7 @@ pub(crate) fn data_name(dest: &Path) -> OsString {
 pub struct DryRunAlloc {
     next: u32,
     dir: PathBuf,
+    prefix: &'static str,
 }
 
 impl DryRunAlloc {
@@ -117,7 +125,20 @@ impl DryRunAlloc {
     /// writes the generated files. Fd numbering starts above the
     /// process's own stdio.
     pub fn new(dir: PathBuf) -> Self {
-        Self { next: 2, dir }
+        Self {
+            next: 2,
+            dir,
+            prefix: "",
+        }
+    }
+
+    /// [`DryRunAlloc::new`] naming the files a sidecar's own allocator
+    /// would write, which are never the application sandbox's.
+    pub fn sidecar(dir: PathBuf) -> Self {
+        Self {
+            prefix: SIDECAR_PREFIX,
+            ..Self::new(dir)
+        }
     }
 
     fn bump(&mut self) -> io::Result<OsString> {
@@ -131,7 +152,7 @@ impl FdAllocator for DryRunAlloc {
         self.bump()
     }
     fn file(&mut self, dest: &Path, _content: &[u8]) -> io::Result<OsString> {
-        Ok(self.dir.join(data_name(dest)).into_os_string())
+        Ok(self.dir.join(data_name(self.prefix, dest)).into_os_string())
     }
     fn init_socket(&mut self) -> io::Result<OsString> {
         self.bump()
@@ -150,8 +171,19 @@ impl FdAllocator for DryRunAlloc {
     }
 }
 
-/// Allocator for a real run: memfds for data files, the control socket
-/// bubbler already bound, and a sidecar ready pipe.
+/// Allocator for a real run: memfds for seccomp filters, generated files
+/// in the run's runtime directory, the control socket bubbler already
+/// bound, and a sidecar ready pipe.
+///
+/// A generated file is the live source of a read-only bind, so its
+/// content must not change and it must not be unlinked while any sandbox
+/// holds that bind. Each allocator therefore owns the files it wrote and
+/// is the only thing that unlinks them, when it drops after its own
+/// sandbox has exited; and no two allocators of one run write the same
+/// path, which is what [`RealAlloc::sidecar`]'s name prefix is for —
+/// `portals` gives the application sandbox and the D-Bus proxy a
+/// `/.flatpak-info` each, and the proxy is already running with its own
+/// bound when the application's argv is built.
 #[derive(Debug)]
 pub struct RealAlloc {
     /// Fds bwrap inherits; they stay open until it has been spawned.
@@ -178,6 +210,9 @@ pub struct RealAlloc {
     pub block_write: Option<OwnedFd>,
     /// The run's runtime directory, where the generated files go.
     dir: PathBuf,
+    /// What this allocator's file names begin with, so a sidecar's are
+    /// never the application sandbox's.
+    prefix: &'static str,
     /// The generated files written there so far, removed when this
     /// allocator drops. It outlives the sandbox it built the argv for —
     /// a bind whose source is unlinked is exactly what this replaced.
@@ -198,14 +233,20 @@ impl RealAlloc {
     /// Allocate around an already inherited control socket fd. `dir` is
     /// the run's runtime directory, which the caller has created.
     pub fn new(socket: RawFd, dir: PathBuf) -> Self {
-        let mut a = Self::sidecar(dir);
+        let mut a = Self::in_dir(dir, "");
         a.socket = Some(socket);
         a
     }
 
     /// Allocate for a sidecar sandbox: generated files and a ready pipe,
-    /// but no control socket to hand out.
+    /// but no control socket to hand out. Its files are named apart from
+    /// the application sandbox's, which are bound into a sandbox this
+    /// one must not write under.
     pub fn sidecar(dir: PathBuf) -> Self {
+        Self::in_dir(dir, SIDECAR_PREFIX)
+    }
+
+    fn in_dir(dir: PathBuf, prefix: &'static str) -> Self {
         Self {
             fds: Vec::new(),
             socket: None,
@@ -216,6 +257,7 @@ impl RealAlloc {
             info_write: None,
             block_write: None,
             dir,
+            prefix,
             written: Vec::new(),
         }
     }
@@ -329,7 +371,7 @@ impl FdAllocator for RealAlloc {
     /// was started. bwrap takes the destination's permissions from the
     /// source, so this is the mode `/etc/passwd` has inside.
     fn file(&mut self, dest: &Path, content: &[u8]) -> io::Result<OsString> {
-        let path = self.dir.join(data_name(dest));
+        let path = self.dir.join(data_name(self.prefix, dest));
         let mut f = std::fs::File::from(rustix::fs::open(
             &path,
             OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -643,7 +685,7 @@ pub fn explain_proxy(env: &Env, inst: &Instance) -> Result<Option<Vec<Explained>
         .map(|_| dbus::guarded_host_a11y_bus(&RealHost, env))
         .transpose()?;
     let dir = instance_runtime_dir(env, &inst.name);
-    let mut alloc = DryRunAlloc::new(dir.clone());
+    let mut alloc = DryRunAlloc::sidecar(dir.clone());
     let (args, command) = proxy_args(
         env,
         &plan,
@@ -744,7 +786,7 @@ pub fn explain_wayland_proxy(
     ) else {
         return Ok(None);
     };
-    let mut alloc = DryRunAlloc::new(instance_runtime_dir(env, &inst.name));
+    let mut alloc = DryRunAlloc::sidecar(instance_runtime_dir(env, &inst.name));
     let (args, command) = wl_proxy_args(env, &plan, node, &RealHost, &mut alloc)?;
     Ok(Some(args.finish_plain_explained(&command, &mut alloc)?))
 }
@@ -2876,8 +2918,9 @@ pub fn run(
         }
         None => wait_plain(&mut child, &mut watch),
     }?;
-    // bwrap copies the data files out of the fds while it starts, so they
-    // must stay open until it has exited.
+    // After the wait and not before it: the generated files are the live
+    // sources of the sandbox's read-only binds, and dropping the
+    // allocator unlinks them.
     drop(alloc);
     Ok(code)
 }
@@ -3366,6 +3409,33 @@ mod tests {
     }
 
     #[test]
+    fn the_proxy_and_the_sandbox_bind_flatpak_info_from_two_host_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let kdl = "dbus\nportals\ncommand \"true\"\n";
+        let source = |items: &[Explained]| {
+            items
+                .iter()
+                .find_map(|i| match i.args.as_slice() {
+                    [flag, src, dest]
+                        if flag == "--ro-bind" && dest == OsStr::new(dbus::FLATPAK_INFO) =>
+                    {
+                        Some(src.clone())
+                    }
+                    _ => None,
+                })
+                .expect("a `portals` node writes /.flatpak-info")
+        };
+        let sandbox = source(&explained(tmp.path(), &e, kdl));
+        let proxy = source(
+            &explain_proxy(&e, &inst(tmp.path(), kdl))
+                .unwrap()
+                .expect("a `dbus` node starts a proxy"),
+        );
+        assert_ne!(sandbox, proxy);
+    }
+
+    #[test]
     fn the_proxy_argv_is_explained_only_where_there_is_a_proxy() {
         let tmp = tempfile::tempdir().unwrap();
         let e = env(tmp.path());
@@ -3381,7 +3451,7 @@ mod tests {
         assert_eq!(
             line(&items, Origin::Identity),
             format!(
-                "--ro-bind {}/bubbler/t/.flatpak-info /.flatpak-info",
+                "--ro-bind {}/bubbler/t/proxy-.flatpak-info /.flatpak-info",
                 tmp.path().join("run").display()
             )
         );
@@ -3969,7 +4039,7 @@ mod tests {
             },
             Path::new("/run/user/1000/bubbler/t"),
             &FakeHost::default(),
-            &mut DryRunAlloc::new(PathBuf::from("/run/user/1000/bubbler/t")),
+            &mut DryRunAlloc::sidecar(PathBuf::from("/run/user/1000/bubbler/t")),
         )
         .unwrap();
         assert_eq!(
@@ -4014,7 +4084,7 @@ mod tests {
                 "/run/user/1000/bubbler/t/dbus",
                 "/run/user/1000/bubbler/t/dbus",
                 "--ro-bind",
-                "/run/user/1000/bubbler/t/.flatpak-info",
+                "/run/user/1000/bubbler/t/proxy-.flatpak-info",
                 "/.flatpak-info",
                 "--clearenv",
                 "--",

@@ -1107,7 +1107,7 @@ mod tests {
 
     fn data_path(dest: &Path) -> OsString {
         Path::new(DATA_DIR)
-            .join(crate::launcher::data_name(dest))
+            .join(crate::launcher::data_name("", dest))
             .into_os_string()
     }
 
