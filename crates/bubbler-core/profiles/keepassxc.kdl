@@ -15,9 +15,10 @@
 // host keyring already holding the name only makes the request fail, and
 // on a session where nothing holds it the sandbox takes it and every
 // libsecret client in the session then talks to this instance (measured
-// — the proxy passes the RequestName through and the bus answers
-// "primary owner"). Add it, inside a `dbus` block, if you mean to
-// replace that keyring:
+// — with `[FdoSecrets] Enabled=true` in its own config KeePassXC's
+// RequestName goes through the proxy and the bus answers "primary
+// owner"). Add it, inside a `dbus` block, if you mean to replace that
+// keyring:
 //     own "org.freedesktop.secrets"
 //
 // No `hidraw`, and it would not help: KeePassXC reaches a YubiKey
@@ -59,6 +60,11 @@
 //   portals
 //     — the file chooser that reaches outside the shared directories,
 //       for a database or a key file kept elsewhere. Needs `dbus`.
+//       Bare, not `portals { secrets }`: measured, the child does reach
+//       org.freedesktop.portal.Secret where bare `portals` answers
+//       `Access denied` — but that interface is an application reading
+//       its own portal secret, this host's portal implements none, and
+//       the Secret Service KeePassXC serves is the `own` rule above.
 //   notify
 //     — the "database saved" and "entry copied" notifications. Needs
 //       `dbus`.
