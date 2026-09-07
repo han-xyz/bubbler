@@ -1281,11 +1281,13 @@ mod tests {
         let lutris = cfg("lutris");
         assert!(lutris.services.contains(&Service::X11(X11Mode::Host)));
         assert_eq!(lutris.seccomp, SeccompConfig::default());
-        assert!(
-            lutris
-                .services
-                .contains(&home_share("Games", ShareMode::ReadWrite))
-        );
+        // Optional: a host with no ~/Games is one where Lutris installs
+        // into the private home instead, not one where the run fails.
+        assert!(lutris.services.contains(&Service::HomeShare {
+            path: PathBuf::from("Games"),
+            mode: ShareMode::ReadWrite,
+            optional: true,
+        }));
 
         for n in [
             "chromium",

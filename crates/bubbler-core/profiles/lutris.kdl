@@ -40,10 +40,13 @@
 // killed. Never add `userns "disable"` — those runtimes nest
 // pressure-vessel's own bubblewrap.
 //
-// ~/Games is Lutris's own convention for the install directory, and a
-// missing share source is an error rather than a skipped bind, so create
-// it (`mkdir ~/Games`) or edit the node to the directory you use. A prefix
-// or library outside the home is named explicitly, e.g.
+// ~/Games is Lutris's own convention for the install directory. The
+// share is `optional`, so a host without one is not a failed run: the
+// bind is skipped (`--explain` says `absent on this host, skipped`) and
+// Lutris installs into the private home's own Games directory instead.
+// Create ~/Games to share a library you already have, or edit the node
+// to the directory you keep one in. A prefix or library outside the home
+// is named explicitly, e.g.
 //   path-share "/kioxia/Games" mode=rw
 //
 // Bare by design. Add:
@@ -83,6 +86,6 @@ dri
 pulseaudio
 network
 gamepad
-home-share "Games" mode=rw
+home-share "Games" mode=rw optional=#true
 desktop "net.lutris.Lutris.desktop"
 command "lutris"

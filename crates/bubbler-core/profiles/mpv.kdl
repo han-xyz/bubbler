@@ -25,6 +25,10 @@
 //
 // No nested user namespaces: mpv nests no sandbox of its own, so the door a
 // nested user namespace opens stays shut.
+//
+// `lint` answers `note[command-not-found]` on a host that has no mpv:
+// that is the host's answer and not this profile's, which is written for
+// software you may not have installed yet.
 wayland
 dri
 pipewire
