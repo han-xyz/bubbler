@@ -230,7 +230,9 @@ const SECRETS_ACCESS: Check = Check {
 // A warning, not an error: a profile is written for a host that has the
 // directory, and one that does not is a host the profile was not written
 // for. The launcher refuses the run outright, so nothing is skipped
-// quietly by the lint letting it through.
+// quietly by the lint letting it through — unless the node is marked
+// `optional=#true`, in which case the launcher itself skips the bind and
+// the lint stays silent to match.
 const SHARE_SOURCE_MISSING: Check = Check {
     id: "share-source-missing",
     severity: Severity::Warning,
@@ -1615,6 +1617,13 @@ fn share_source(
     f: &mut Findings,
 ) -> bool {
     let Some(ty) = ctx.host.file_type(source) else {
+        // An optional share with an absent source is a silent no-op at
+        // launch (`forward.rs`), so nothing to warn about: the profile
+        // asked for exactly this skip. `etc-share` has no `optional`
+        // property, so `flag` reads it as unset there.
+        if flag(node, "optional") == Some(true) {
+            return false;
+        }
         f.push(
             i,
             node,
@@ -1623,8 +1632,8 @@ fn share_source(
                 "`{what} \"{written}\"` names {}, which is not on this host",
                 source.display()
             ),
-            "create it, or drop the node; a missing source fails the run rather than \
-             skipping the bind",
+            "create it, mark the node `optional=#true`, or drop it; without \
+             `optional` a missing source fails the run rather than skipping the bind",
         );
         return false;
     };
@@ -2905,6 +2914,50 @@ mod tests {
                 )),
                 [] as [&str; 0]
             );
+        });
+    }
+
+    /// The launcher skips the bind silently for an optional share with no
+    /// source, so the lint must not warn either — a warning the profile
+    /// cannot avoid would fail R14 for every host lacking the source.
+    #[test]
+    fn an_optional_share_whose_source_is_absent_is_not_a_warning() {
+        let host = host();
+        with(&host, |ctx| {
+            for text in [
+                "home-share \"Games\" optional=#true",
+                "path-share \"/kioxia/Steam\" optional=#true",
+            ] {
+                assert_eq!(ids(&lint(ctx, &[text])), [] as [&str; 0], "{text}");
+            }
+        });
+    }
+
+    /// Without `optional`, the same absent source still fails the run, so
+    /// the warning stays — and now names the alternative the profile has.
+    #[test]
+    fn a_non_optional_share_whose_source_is_absent_names_optional_as_the_fix() {
+        let host = host();
+        with(&host, |ctx| {
+            let report = lint(ctx, &["home-share \"Games\""]);
+            assert_eq!(ids(&report), ["share-source-missing"]);
+            assert!(
+                report.findings[0].help.contains("optional=#true"),
+                "{}",
+                report.findings[0].help
+            );
+        });
+    }
+
+    /// `optional=#true` only silences the missing-source case; a source
+    /// present but of the wrong type still warns.
+    #[test]
+    fn an_optional_share_whose_source_is_the_wrong_type_still_warns() {
+        let (_, _, _, fifo) = fake::every_type();
+        let host = host().with("/kioxia/pipe", fifo);
+        with(&host, |ctx| {
+            let report = lint(ctx, &["path-share \"/kioxia/pipe\" optional=#true"]);
+            assert_eq!(ids(&report), ["share-source-missing"]);
         });
     }
 

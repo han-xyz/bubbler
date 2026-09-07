@@ -2893,7 +2893,9 @@ socket is command execution across the boundary), `share-source-missing` (a
 `home-share`, `path-share` or `etc-share` source this host does not have, or
 has as something other than a directory or a regular file — a profile is
 written for a host that has the directory, and the launcher refuses the run
-outright rather than skipping the bind), `dbus-without-rules`,
+outright rather than skipping the bind; a node marked `optional=#true` with
+an absent source is the exception, since the launcher skips its bind
+silently and the lint stays silent to match), `dbus-without-rules`,
 `env-looks-secret` (an underscore-separated word of the name is `TOKEN`,
 `SECRET`, `PASSWORD`, `APIKEY`, `PAT` and the like, or the value starts
 `ghp_`/`sk-`/`AKIA` — whole words, so `TOKENIZERS_PARALLELISM` is not one),
