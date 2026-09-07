@@ -606,17 +606,22 @@ impl BwrapArgs {
 
     /// Replace the `/etc` tmpfs and its allowlist with one read-only
     /// bind of the host's whole `/etc` (`etc "host"`, phase 2), and
-    /// attribute the bind and the synthetic `passwd`/`group` binds that
-    /// follow it to the `etc` node that asked for it. The two synthetic
-    /// binds are left standing where they are, after the replacement: the
-    /// host username stays hidden whichever mode `/etc` is in.
+    /// attribute the bind and the synthetic binds that follow it to the
+    /// `etc` node that asked for it. The synthetic `passwd`/`group`
+    /// binds are left standing where they are, after the replacement,
+    /// and joined by the same synthetic content over `passwd`/`group`'s
+    /// `-`/`+` backups and an empty file over `subuid`/`subgid` — each
+    /// only where `host` has the mountpoint for it — because those are
+    /// the four world-readable files under the allowlist mode's reach
+    /// that still name the host account otherwise: the host username
+    /// stays hidden whichever mode `/etc` is in.
     ///
     /// # Panics
     ///
     /// If the arguments hold no `--size … --tmpfs /etc` followed by two
     /// data binds. Only [`BwrapArgs::baseline`] builds the sandbox this
     /// is called on, and it always emits both.
-    pub fn bind_host_etc(&mut self) {
+    pub fn bind_host_etc(&mut self, host: &dyn Host) {
         let start = self
             .skeleton
             .iter()
@@ -634,6 +639,48 @@ impl BwrapArgs {
         for item in &mut self.skeleton[end..end + 2] {
             item.origin = self.origin;
         }
+        let (
+            Kind::Data {
+                content: passwd, ..
+            },
+            Kind::Data { content: group, .. },
+        ) = (&self.skeleton[end].kind, &self.skeleton[end + 1].kind)
+        else {
+            unreachable!("end holds the synthetic passwd/group binds, matched above");
+        };
+        let (passwd, group) = (passwd.clone(), group.clone());
+        let mut extra = Vec::new();
+        for (content, dest) in [
+            (passwd.clone(), "/etc/passwd-"),
+            (passwd, "/etc/passwd+"),
+            (group.clone(), "/etc/group-"),
+            (group, "/etc/group+"),
+        ] {
+            if host.file_type(Path::new(dest)).is_some() {
+                extra.push(Item {
+                    origin: self.origin,
+                    kind: Kind::Data {
+                        content,
+                        dest: dest.into(),
+                    },
+                });
+            }
+        }
+        // subuid/subgid carry no per-sandbox identity to synthesise, only
+        // the host account to hide, so an empty file is enough to cover
+        // the mountpoint.
+        for dest in ["/etc/subuid", "/etc/subgid"] {
+            if host.file_type(Path::new(dest)).is_some() {
+                extra.push(Item {
+                    origin: self.origin,
+                    kind: Kind::Data {
+                        content: Vec::new(),
+                        dest: dest.into(),
+                    },
+                });
+            }
+        }
+        self.skeleton.splice(end + 2..end + 2, extra);
         self.skeleton.splice(
             start..end,
             [Item {
@@ -1619,16 +1666,24 @@ mod tests {
     /// `etc "host"` replaces the tmpfs and its allowlist with one bind
     /// of the host's whole `/etc`; the synthetic `passwd`/`group` binds
     /// still follow it, in the same order, so the host username stays
-    /// hidden.
+    /// hidden. So do the shadow-suite backups and `subuid`/`subgid`,
+    /// which name the host account the same way `passwd`/`group` do and
+    /// are not on the allowlist — but only the ones the host actually
+    /// has: `/etc/passwd+` here does not exist, and gets no bind of its
+    /// own to point nowhere.
     #[test]
     fn binding_the_hosts_etc_replaces_the_tmpfs_and_allowlist_with_one_bind() {
         let (f, d, _) = crate::host::fake::types();
         let host = FakeHost::default()
             .with("/etc/hosts", f)
-            .with("/etc/fonts", d);
+            .with("/etc/fonts", d)
+            .with("/etc/passwd-", f)
+            .with("/etc/group-", f)
+            .with("/etc/subuid", f)
+            .with("/etc/subgid", f);
         let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &host);
         args.tag(Origin::Etc);
-        args.bind_host_etc();
+        args.bind_host_etc(&host);
         let argv = args.finish(&["sh".into()], &mut Counter::new()).unwrap();
         let s = strs(&argv);
         let pos = |x: &str| s.iter().position(|a| *a == x).unwrap();
@@ -1657,8 +1712,26 @@ mod tests {
                 ]),
             "{s:?}"
         );
+        for (src, dest) in [
+            ("etc-passwd-", "/etc/passwd-"),
+            ("etc-group-", "/etc/group-"),
+            ("etc-subuid", "/etc/subuid"),
+            ("etc-subgid", "/etc/subgid"),
+        ] {
+            assert!(
+                s.windows(3).any(|w| w
+                    == [
+                        "--ro-bind",
+                        format!("/run/user/1000/bubbler/i/{src}").as_str(),
+                        dest
+                    ]),
+                "{s:?}"
+            );
+        }
+        assert!(!s.contains(&"/etc/passwd+"), "{s:?}");
+        assert!(!s.contains(&"/etc/group+"), "{s:?}");
         assert!(pos("/etc/passwd") > pos("/etc"), "{s:?}");
-        assert!(pos("/etc/passwd") < pos("--proc"), "{s:?}");
+        assert!(pos("/etc/subgid") < pos("--proc"), "{s:?}");
     }
 
     /// The bind and the two synthetic files are tagged with the `etc`
@@ -1667,9 +1740,10 @@ mod tests {
     /// that would exist without it.
     #[test]
     fn binding_the_hosts_etc_tags_the_bind_and_the_synthetic_files_with_its_own_origin() {
-        let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default());
+        let host = FakeHost::default();
+        let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &host);
         args.tag(Origin::Etc);
-        args.bind_host_etc();
+        args.bind_host_etc(&host);
         let argv = args
             .finish_explained(&["sh".into()], &mut Counter::new())
             .unwrap();

@@ -2719,6 +2719,11 @@ fn real_bwrap_etc_is_allowlisted_and_user_is_bubbler() {
 /// it is a symlink into `/usr`: `os-release` is itself in
 /// `ETC_ALLOWLIST`, so the allowlist already binds it by following the
 /// link. `fstab` is not on that list.
+///
+/// The shadow-suite backups and `subuid`/`subgid` are on no allowlist
+/// either, and unlike `fstab` they name the host account: `bind_host_etc`
+/// has to overlay them the same way it overlays `passwd`/`group`, or
+/// `etc "host"` stops hiding the host username the moment one exists.
 #[test]
 fn real_bwrap_etc_host_binds_the_hosts_whole_etc() {
     if !require_bwrap() {
@@ -2753,6 +2758,42 @@ fn real_bwrap_etc_host_binds_the_hosts_whole_etc() {
     let mut lines = s.lines();
     assert_eq!(lines.next(), Some("bubbler"), "{s}");
     assert_eq!(lines.next(), Some("READ"), "{s}");
+
+    // The host's own account name, from outside the sandbox: what the
+    // shadow-suite backups and subuid/subgid must not still carry once
+    // `etc "host"` has bound them, and what `/etc/passwd` must carry
+    // instead of it.
+    let user = std::env::var("USER").unwrap_or_default();
+    if user.is_empty() {
+        say("skipping the username sweep: $USER is not set for this test run");
+    } else {
+        let leak_script = format!(
+            "cat /etc/passwd; \
+             for f in /etc/passwd- /etc/passwd+ /etc/group- /etc/group+ /etc/subuid /etc/subgid; do \
+             [ -e \"$f\" ] && echo \"$f $(grep -c '{user}' \"$f\" || true)\"; \
+             done"
+        );
+        let out = bubbler_live(tmp.path(), &init)
+            .args(["run", "hostetc", "--", "/usr/bin/sh", "-c", &leak_script])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let s = String::from_utf8_lossy(&out.stdout);
+        let mut lines = s.lines();
+        // passwd_content() is two lines: `bubbler` then `nobody`.
+        let passwd: Vec<&str> = lines.by_ref().take(2).collect();
+        assert!(passwd.iter().any(|l| l.starts_with("bubbler:")), "{s}");
+        for line in lines {
+            assert!(
+                line.ends_with(" 0"),
+                "{line} still names the host account: {s}"
+            );
+        }
+    }
 
     // The same script, with the allowlist standing: fstab is not on it.
     bubbler_live(tmp.path(), &init)

@@ -560,7 +560,7 @@ fn build_args_on<'a>(
     }
     if inst.config.etc == EtcMode::Host {
         args.tag(Origin::Etc);
-        args.bind_host_etc();
+        args.bind_host_etc(host);
     }
     if let Some(size) = inst.config.tmp {
         args.tag(Origin::Tmp);
