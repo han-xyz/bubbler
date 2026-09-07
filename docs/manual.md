@@ -3097,7 +3097,10 @@ and runs the loader inside this sandbox rather than asking any host for a
 sub-sandbox. `--host` and the other options that need the host's bus are
 refused by name; `--directory`, `--env`, `--clear-env` and `--forward-fd`
 are honoured, and the command replaces the shim in place, so the caller's
-`wait` is on the process it started. `env -i` empties the environment, so
+`wait` is on the process it started. `--sandbox`, its `--sandbox-*`
+companions, `--no-network`, `--watch-bus` and `--latest-version` are
+accepted and build nothing: the command runs with this sandbox's whole
+reach. `env -i` empties the environment, so
 the lookup falls back to glibc's built-in `/bin:/usr/bin` and the shim has
 to be at `/usr/bin/flatpak-spawn` — a path bwrap cannot create in the
 read-only `/usr`. `/usr/bin` therefore becomes an overlay of itself with the

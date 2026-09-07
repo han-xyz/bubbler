@@ -2984,8 +2984,6 @@ mod tests {
         assert_ne!(before, after, "the thread kept the keyring it was given");
     }
 
-    /// An `Env` whose `$BUBBLER_INIT` points at a stand-in binary, so
-    /// argv building does not depend on where the test binary lives.
     /// A dry run's allocator pointed where a real run of the instance
     /// [`inst`] builds would write its generated files, so an argv built
     /// here and one built by the launcher itself name the same paths.
@@ -3001,6 +2999,8 @@ mod tests {
         PathBuf::from("/nonexistent/bubbler")
     }
 
+    /// An `Env` whose `$BUBBLER_INIT` points at a stand-in binary, so
+    /// argv building does not depend on where the test binary lives.
     fn env(tmp: &Path) -> Env {
         let init = tmp.join("bubbler-init");
         std::fs::write(&init, b"").unwrap();
@@ -3559,8 +3559,8 @@ mod tests {
             a.windows(3)
                 .any(|w| w == ["--ro-bind", init.as_str(), INIT_INSIDE])
         );
-        // Fd 3 went to the info pipe, 4 to the seccomp filter and 5 and
-        // 6 to the baseline passwd and group.
+        // Fd 3 went to the info pipe, 4 to the seccomp filter; passwd
+        // and group are files.
         assert_eq!(
             &a[a.len() - 6..],
             &["--", INIT_INSIDE, "--socket-fd", "5", "--", "foot"]

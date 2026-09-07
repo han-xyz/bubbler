@@ -747,7 +747,10 @@ application could not reach itself — the loader runs at the trust level
 glycin's own sandbox-less fallback gives it, inside bubbler's sandbox rather
 than beside it. `--host`, `--talk-name` and the rest of the options that only
 mean something with the host's bus behind them are refused by name, not
-ignored, so nothing believes it was given a channel out. The cost is the
+ignored, so nothing believes it was given a channel out. `--sandbox`, its
+`--sandbox-*` companions, `--no-network`, `--watch-bus` and
+`--latest-version` are accepted and build nothing: the command runs with
+this sandbox's whole reach. The cost is the
 mount it takes to put the shim where `env -i` will find it: `/usr/bin`
 becomes an overlay of itself with the writes going to a tmpfs nothing can
 see, and is remounted read-only immediately after the shim is bound. Left
