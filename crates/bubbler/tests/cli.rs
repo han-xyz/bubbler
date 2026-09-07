@@ -11043,8 +11043,10 @@ mod profile_smoke {
     /// the window class that proves it ran, which `$HOME` subdirectories
     /// its `home-share` grants need to exist first, whether its `network`
     /// grant needs pasta to attach, whether its `x11 "host"` grant needs
-    /// the host's `$DISPLAY` forwarded in, and how long its own cold start
-    /// is given.
+    /// the host's `$DISPLAY` forwarded in, how long its own cold start is
+    /// given, and the environment variable naming an instance to run
+    /// instead of a throwaway one, for an app whose first run in an empty
+    /// home is not a start at all.
     struct GuiProfile {
         profile: &'static str,
         gate: &'static str,
@@ -11053,6 +11055,20 @@ mod profile_smoke {
         network: bool,
         x11_host: bool,
         limit: Duration,
+        warm: Option<&'static str>,
+    }
+
+    /// [`bubbler_x11_host`] with the session's own `$HOME` and
+    /// `$XDG_DATA_HOME`: an instance somebody warmed up is in the real
+    /// instance store, not under the test's isolated root.
+    fn bubbler_warm(root: &Path, init: &Path) -> Command {
+        let mut c = bubbler_x11_host(root, init);
+        for var in ["HOME", "XDG_DATA_HOME"] {
+            if let Some(value) = std::env::var_os(var) {
+                c.env(var, value);
+            }
+        }
+        c
     }
 
     /// [`BackgroundRun::stop`] with `limit` in place of the shared
@@ -11093,6 +11109,18 @@ mod profile_smoke {
         if p.network && !require_pasta() {
             return;
         }
+        let warm = match p.warm.map(|var| (var, std::env::var_os(var))) {
+            Some((var, None)) => {
+                say(&format!(
+                    "skipping: {}: a first run in an empty home downloads the whole client \
+                     before anything starts; set {var}=<instance> to one already warmed up",
+                    p.profile
+                ));
+                return;
+            }
+            Some((_, name)) => name,
+            None => None,
+        };
         let Some(init) = real_init() else { return };
         let tmp = setup();
         for dir in p.home_dirs {
@@ -11100,49 +11128,62 @@ mod profile_smoke {
         }
         let before = hyprctl_count(p.class);
         let log = tmp.path().join(format!("{}.err", p.profile));
-        let mut cmd = if p.x11_host {
-            bubbler_x11_host(tmp.path(), &init)
-        } else {
-            bubbler_wayland(tmp.path(), &init)
+        let mut cmd = match (&warm, p.x11_host) {
+            (Some(_), _) => bubbler_warm(tmp.path(), &init),
+            (None, true) => bubbler_x11_host(tmp.path(), &init),
+            (None, false) => bubbler_wayland(tmp.path(), &init),
+        };
+        match &warm {
+            Some(name) => cmd.arg("run").arg(name),
+            None => cmd.args(["try", "--profile", p.profile]),
         };
         let mut run = BackgroundRun {
             run: Some(
-                cmd.args(["try", "--profile", p.profile])
-                    .stderr(std::fs::File::create(&log).unwrap())
+                cmd.stderr(std::fs::File::create(&log).unwrap())
                     .spawn()
                     .unwrap(),
             ),
             log,
         };
-        assert!(
-            wait_until(|| hyprctl_count(p.class) > before, p.limit),
-            "{}: no new window within {:?}: {}",
-            p.profile,
-            p.limit,
-            without_tool_warnings(&run.said())
-        );
-        std::thread::sleep(SETTLE);
+        let seen = wait_until(|| hyprctl_count(p.class) > before, p.limit);
         // A profile whose command starts the application detached and
         // returns takes the sandbox down with it, and the window it had
         // already mapped goes with the sandbox: the rise above is real
         // for about a second and proves nothing.
+        if seen {
+            std::thread::sleep(SETTLE);
+        }
+        let alive = run
+            .run
+            .as_mut()
+            .is_some_and(|c| c.try_wait().is_ok_and(|s| s.is_none()));
+        let stayed = hyprctl_count(p.class) > before;
+        // Measured while the sandbox is up and asserted once it is down:
+        // a panic in front of the stop would leave it running on the
+        // user's desktop for the rest of the suite, and a profile that
+        // fails is exactly when that happens.
+        let said = stop_within(run, p.limit);
         assert!(
-            run.run
-                .as_mut()
-                .is_some_and(|c| c.try_wait().is_ok_and(|s| s.is_none())),
+            seen,
+            "{}: no new window within {:?}: {}",
+            p.profile,
+            p.limit,
+            without_tool_warnings(&said)
+        );
+        assert!(
+            alive,
             "{}: the run ended {:?} after its window mapped: {}",
             p.profile,
             SETTLE,
-            without_tool_warnings(&run.said())
+            without_tool_warnings(&said)
         );
         assert!(
-            hyprctl_count(p.class) > before,
+            stayed,
             "{}: the window was gone {:?} after it mapped: {}",
             p.profile,
             SETTLE,
-            without_tool_warnings(&run.said())
+            without_tool_warnings(&said)
         );
-        stop_within(run, p.limit);
     }
 
     #[test]
@@ -11156,6 +11197,7 @@ mod profile_smoke {
             network: false,
             x11_host: false,
             limit: SMOKE_LIMIT,
+            warm: None,
         });
     }
 
@@ -11170,6 +11212,7 @@ mod profile_smoke {
             network: true,
             x11_host: false,
             limit: SMOKE_LIMIT,
+            warm: None,
         });
     }
 
@@ -11184,6 +11227,7 @@ mod profile_smoke {
             network: true,
             x11_host: false,
             limit: SMOKE_LIMIT,
+            warm: None,
         });
     }
 
@@ -11198,6 +11242,7 @@ mod profile_smoke {
             network: true,
             x11_host: false,
             limit: SMOKE_LIMIT,
+            warm: None,
         });
     }
 
@@ -11212,6 +11257,7 @@ mod profile_smoke {
             network: false,
             x11_host: false,
             limit: SMOKE_LIMIT,
+            warm: None,
         });
     }
 
@@ -11226,6 +11272,7 @@ mod profile_smoke {
             network: false,
             x11_host: false,
             limit: SMOKE_LIMIT,
+            warm: None,
         });
     }
 
@@ -11250,6 +11297,7 @@ mod profile_smoke {
             network: false,
             x11_host: false,
             limit: SMOKE_LIMIT,
+            warm: None,
         });
     }
 
@@ -11264,6 +11312,7 @@ mod profile_smoke {
             network: true,
             x11_host: true,
             limit: SMOKE_LIMIT,
+            warm: None,
         });
     }
 
@@ -11278,6 +11327,7 @@ mod profile_smoke {
             network: false,
             x11_host: false,
             limit: SMOKE_LIMIT,
+            warm: None,
         });
     }
 
@@ -11292,6 +11342,7 @@ mod profile_smoke {
             network: true,
             x11_host: false,
             limit: SMOKE_LIMIT,
+            warm: None,
         });
     }
 
@@ -11305,12 +11356,15 @@ mod profile_smoke {
             home_dirs: &[],
             network: true,
             x11_host: true,
-            // `try`'s empty home makes every run Steam's first, and a
-            // first run downloads the whole client before it starts:
-            // 496 MB, measured at about 16 minutes here. The limit is
-            // not enough for that and is not meant to be; a second
-            // obstacle behind it is measured in the profile's header.
+            // A cold client, once installed, spends a minute or more on
+            // its runtime and its CEF helper before the first window.
             limit: Duration::from_secs(180),
+            // `try`'s empty home makes every run Steam's first, and a
+            // first run downloads the whole client before anything
+            // starts: 496 MB, at whatever the link gives. So this one
+            // profile is measured against an instance somebody has
+            // already warmed up, and skipped where nobody names one.
+            warm: Some("BUBBLER_SMOKE_STEAM_INSTANCE"),
         });
     }
 
@@ -11325,6 +11379,7 @@ mod profile_smoke {
             network: true,
             x11_host: false,
             limit: SMOKE_LIMIT,
+            warm: None,
         });
     }
 
@@ -11339,6 +11394,7 @@ mod profile_smoke {
             network: true,
             x11_host: false,
             limit: SMOKE_LIMIT,
+            warm: None,
         });
     }
 

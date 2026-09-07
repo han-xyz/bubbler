@@ -71,8 +71,18 @@ with exactly one desktop to watch them on. It needs Hyprland (`hyprctl`) and
 each app installed — either missing is a printed skip, not a failure, so a
 host with neither reports nothing rather than a wall of red.
 
-Two profiles are known to fail here and are tracked, not treated as a
-broken test run, until their profile pass lands: `spotify`, `steam`.
+`spotify` is known to fail here and is tracked, not treated as a broken
+test run, until its profile pass lands.
+
+`steam` skips instead of running: `bubbler try` hands the client an empty
+home, which makes every run its first, and a first run downloads the whole
+client (496 MB) before anything starts. Point the test at an instance you
+have already warmed up — created from the profile, started once, and left
+installed — and it runs against that:
+
+```
+BUBBLER_SMOKE_STEAM_INSTANCE=<instance> cargo test -p bubbler --test cli -- --ignored --exact profile_smoke::steam_window_appears --test-threads=1
+```
 
 ## Fuzzing
 

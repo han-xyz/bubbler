@@ -51,23 +51,18 @@
 // (measured). Steam brings its own file browser; a path outside the
 // private home is shared below instead.
 //
-// Known here, measured 2026-09-06: the client installs and connects,
-// but steamwebhelper — everything you would look at — never starts, so
-// no window ever maps. The helper runs under pressure-vessel's own
-// bubblewrap, which binds the outer /etc/resolv.conf into its container;
-// bubbler writes that file, and /etc/passwd and /etc/group, with bwrap's
-// `--ro-bind-data`, which binds an inode bwrap has already unlinked, and
-// a nested bind of one of those fails with ENOENT (reproduced with two
-// plain bwraps and no bubbler). The client restarts the helper every ten
-// seconds and shows nothing. Nothing in this profile changes that; a
-// generated file written into the sandbox rather than bound over it does
-// — measured, the client then reaches its sign-in window.
-//
-// A first run is also a download of the whole client — 496 MB, about
-// 16 minutes here — with no window while it happens: the bootstrapper
-// takes its console update UI while the installed client version is 0
-// ("Using update UI: console" in ~/.local/share/Steam/logs), and only an
-// installed client's updater draws one.
+// A first run is a download of the whole client — 496 MB, at whatever
+// the link gives — with no window at all while it happens: the
+// bootstrapper takes its console update UI while the installed client
+// version is 0 ("Using update UI: console" in
+// ~/.local/share/Steam/logs), and only an installed client's updater
+// draws one. Measured past that point: the client, the Steam Linux
+// Runtime and steamwebhelper all start, and the window is the sign-in
+// one. steamwebhelper is where a broken sandbox shows first — it runs
+// under pressure-vessel's own bubblewrap, which re-binds the /etc files
+// this one has, and the client restarts it every ten seconds without
+// ever saying why on its own stderr; its log is
+// ~/.local/share/Steam/logs/webhelper-linux.txt.
 //
 // Steam builds its own ~/.steam and ~/.local/share/Steam in the private
 // home on first run. The host's are not shared, because ~/.steam is a
