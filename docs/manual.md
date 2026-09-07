@@ -290,9 +290,12 @@ file descriptor numbers are the ones a dry run prints.
         --info-fd 3  (pipe: bwrap reports the sandbox pid on it)
         ... 125 more (--explain=full)
 
-      portals                         config.kdl:11  8 arguments
+      portals                         config.kdl:11  17 arguments
         --block-fd 4  (pipe: the sandbox waits on it until bubbler lets it go)
         --ro-bind /run/user/1000/bubbler/ff/.flatpak-info /.flatpak-info  (generated file, 69 bytes)
+        --overlay-src /usr/bin --tmp-overlay /usr/bin  (flatpak-spawn shim (glycin, gdk-pixbuf))
+        --ro-bind /usr/lib/bubbler/bubbler-init /usr/bin/flatpak-spawn
+        --remount-ro /usr/bin
         --bind /run/user/1000/doc/by-app/org.bubbler.ff /run/user/1000/doc
         rules: --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.FileChooser.*@/org/freedesktop/portal/desktop
                --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.OpenURI.*@/org/freedesktop/portal/desktop
@@ -322,7 +325,7 @@ file descriptor numbers are the ones a dry run prints.
       command                                        2 arguments
         -- firefox
 
-    225 arguments in 14 groups, 125 hidden (--explain=full); 8 D-Bus rules to the proxy (--proxy)
+    234 arguments in 14 groups, 125 hidden (--explain=full); 8 D-Bus rules to the proxy (--proxy)
 
 A group sits where the node's *first* argument is emitted and gathers every
 later one it contributed, whichever phase that came from: `network "host"` is

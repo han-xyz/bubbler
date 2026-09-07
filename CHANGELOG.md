@@ -18,6 +18,25 @@
   name a path only some installs of an app have. `--explain` says when a
   share was skipped this way; a present source binds exactly as it would
   without the property.
+- `etc "host"` binds the host's whole `/etc` read-only in place of the tmpfs
+  allowlist. `bubbler lint` warns about it as `etc-host`; the synthetic
+  `passwd` and `group` files are still the ones bubbler writes either way,
+  so the host username never reaches the sandbox. No shipped profile sets
+  it.
+- A `flatpak-spawn` shim: every sandbox that carries `/.flatpak-info` gets a
+  second `bubbler-init` mode at `/usr/bin/flatpak-spawn`, reachable through
+  glibc's default `/bin:/usr/bin` path once `/usr/bin` becomes an overlay
+  of itself remounted read-only. gdk-pixbuf's glycin image loaders look for
+  that program as soon as the identity file is there, and a GTK 3
+  application aborts on a missing SVG icon without it; `--host` and the
+  other options that would reach the host's own bus are refused by name.
+  Needs unprivileged overlayfs (Linux 5.11 or newer).
+- A live smoke test per shipped profile (`profile_smoke` in
+  `crates/bubbler/tests/cli.rs`, run with `--ignored --exact
+  profile_smoke::<name>`): a GUI profile's window mapping on Hyprland, or a
+  CLI profile's command output. `BUBBLER_SMOKE_STEAM_INSTANCE=<instance>`
+  points the steam entry at one already installed, instead of downloading a
+  fresh client on every run.
 
 ### Changed
 
@@ -46,6 +65,63 @@
   binaries) without naming the absolute path. Host binaries stay first,
   so nothing an app writes to its own `~/.local/bin` can shadow `/usr/bin`
   for it.
+- Generated files (`/etc/passwd`, `/etc/group`, `/etc/resolv.conf`,
+  `/.flatpak-info`) are written into the instance's own runtime directory
+  and bound read-only from there, instead of `--ro-bind-data`'s anonymous,
+  already-unlinked fd. A nested bwrap — Steam's own `pressure-vessel` among
+  them — cannot re-open such a source through `/proc/self/fd`, so nothing
+  that nests a sandbox inside this one could bind these files again; a path
+  on disk still can.
+- `pulseaudio-module-loading` is now a warning, not a note: measurement
+  showed no bwrap bind can stop a host's `pipewire-pulse` daemon from
+  loading a module — a network sink or tunnel among them — outside the
+  sandbox's own network namespace and egress proxy on a client's request.
+  The message names the host-side fix: a `pipewire-pulse.conf.d` drop-in
+  setting `pulse.allow-module-loading = false`, and a service restart.
+
+### Fixed
+
+- `share-source-missing` no longer warns for a `home-share`/`path-share`
+  whose source is absent when the node carries `optional=#true`: the
+  launch already skips such a bind silently, so the lint now agrees
+  instead of reporting a fault that isn't one.
+
+### Notes
+
+- xdg-desktop-portal 1.22.1 aborts a `ScreenCast.CreateSession` call that
+  has no `session_handle_token` in its options dict (`xdp-session.c:296`),
+  stopping the host's portal service for every other application on the
+  desktop until D-Bus activation restarts it. This is an upstream bug in a
+  process bubbler does not run; the proxy cannot filter for it, since the
+  missing key is absent from the call rather than a value a rule can
+  reject.
+- What `portals` buys from PipeWire's own Flatpak policy is narrower than
+  it sounds: a client that carries `/.flatpak-info` gets WirePlumber's
+  Flatpak access rules — `rwx` rather than the unsandboxed default `rwxm`,
+  so no muting, rerouting or destroying another client's nodes — but no
+  narrower visibility (every node on the graph still shows, capture nodes
+  included). Camera nodes are the one exception, gated separately through
+  the portal's own permission store.
+
+### Profiles
+
+- `claude-code`/`claude-code-strict`: run `command "claude"`, so the native
+  installer's `~/.local/bin/claude` and an npm global install at
+  `/usr/bin/claude` both resolve through the sandbox `PATH`; the two shares
+  the native layout needs are `optional=#true`, skipped rather than
+  refusing the launch when the other layout is what the host has.
+- `firefox`: works again — the `flatpak-spawn` shim answers the `portals`
+  grant's `/.flatpak-info`, which GTK's SVG loader was aborting on.
+- `libreoffice`: shares `etc-share "libreoffice"`, the directory this
+  distribution's `bootstraprc`/`sofficerc` symlink into, which the suite
+  needs for a user-installation path to exist at all.
+- `code`: runs `command "code" "--wait"`, so its window outlives the
+  launcher that starts it detached and returns.
+- `lutris`: `home-share "Games"` is `optional=#true` — Lutris installs into
+  its own private home where `~/Games` does not exist, instead of failing
+  the launch.
+- `steam`: starts — `steamwebhelper` needed the generated `/etc` files
+  bound from the runtime directory to survive its own nested bwrap.
 
 ## 0.21.0 (unreleased)
 

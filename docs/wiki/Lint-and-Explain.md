@@ -126,9 +126,12 @@ the nft ruleset the run installs. A nested `x11` needs no such line: the
 manager's name, both arguments of `bubbler-init` rather than of bwrap.
 
 ```
-  portals                         config.kdl:11  8 arguments
+  portals                         config.kdl:11  17 arguments
     --block-fd 4  (pipe: the sandbox waits on it until bubbler lets it go)
     --ro-bind /run/user/1000/bubbler/ff/.flatpak-info /.flatpak-info  (generated file, 69 bytes)
+    --overlay-src /usr/bin --tmp-overlay /usr/bin  (flatpak-spawn shim (glycin, gdk-pixbuf))
+    --ro-bind /usr/lib/bubbler/bubbler-init /usr/bin/flatpak-spawn
+    --remount-ro /usr/bin
     --bind /run/user/1000/doc/by-app/org.bubbler.ff /run/user/1000/doc
     rules: --call=org.freedesktop.portal.Desktop=org.freedesktop.portal.FileChooser.*@/org/freedesktop/portal/desktop
            ...
