@@ -55,10 +55,10 @@
   with them: that stack's EGL declines a Wayland display without it, and a
   sandboxed GUI application would render in software. That node answers DRM
   ioctls — the connectors, their modes, the monitors' EDID — which the
-  masked card sysfs does not withhold, so on that driver a bare `dri`
-  reaches as far as `dri kms=#true`; `--explain` marks the group and the
-  new `dri-nvidia-primary` lint note says so. No other driver's primary
-  node is bound.
+  masked card sysfs does not withhold; `dri kms=#true` reaches further
+  still, adding DRM master, the framebuffer geometry and the flink names.
+  `--explain` marks the group and the new `dri-nvidia-primary` lint note
+  says so. No other driver's primary node is bound.
 - The sandbox `PATH` is `/usr/bin:/home/bubbler/.local/bin` instead of
   `/usr/bin` alone, so a bare command name resolves an app installed under
   a shared `.local/bin` (the native Claude Code installer, XDG user

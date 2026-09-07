@@ -579,10 +579,10 @@ profile would then composite in software. That node is the mode-setting
 interface, and it answers DRM ioctls: measured with `modetest -M nvidia-drm
 -c` inside such a sandbox, the connectors, their modes, the monitors' EDID
 come back byte for byte as they do outside. The card sysfs
-stays masked, which withholds none of that on this driver, so on an NVIDIA
-GPU a bare `dri` reaches as far as `kms=#true` does — `--explain` marks the
-group and `lint` reports `dri-nvidia-primary`. No other driver's primary
-node is bound.
+stays masked, which withholds none of that on this driver; `kms=#true`
+reaches further still, adding DRM master, the framebuffer geometry and
+the flink names — `--explain` marks the group and `lint` reports
+`dri-nvidia-primary`. No other driver's primary node is bound.
 `dri` sets no environment: `DRI_PRIME`, `__NV_PRIME_RENDER_OFFLOAD`,
 `__GLX_VENDOR_LIBRARY_NAME` and their kind pick a GPU on a hybrid machine,
 which is a profile's `env` decision, not a service's. Compute is one gap:

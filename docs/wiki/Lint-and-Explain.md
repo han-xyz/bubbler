@@ -72,7 +72,8 @@ names. The bare node binds the render nodes, which carry none of that.
 proprietary NVIDIA driver, a bare `dri` binds that GPU's primary node too
 (its EGL will not drive a Wayland display without one), and the node
 carries the connectors, their modes, the monitors' EDID through DRM
-ioctls. On that driver the bare grant reaches as far as `kms=#true`.
+ioctls; `kms=#true` reaches further still, adding DRM master, the
+framebuffer geometry and the flink names.
 
 `x11-nested-no-wm` is about the windows inside a nested `x11` server, so a
 config that already asks for the whole output with `fullscreen=#true`, or names

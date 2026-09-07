@@ -128,8 +128,8 @@ pub static GRANTS: &[Grant] = &[
                proprietary NVIDIA driver keeps its primary node without the property, \
                since its EGL will not drive a Wayland display otherwise, and that node \
                carries the connectors, their modes, the monitors' EDID whatever the sysfs \
-               beside it says: on that driver the bare node reaches as far as `kms=#true`, and \
-               `lint` says so.",
+               beside it says, and `lint` says so; `kms=#true` reaches further still, \
+               adding DRM master, the framebuffer geometry and the flink names.",
         risk: Risk::Wide,
         grammar: "dri [kms=#true]",
     },

@@ -1061,13 +1061,14 @@ The NVIDIA nodes a `dri` grant adds have no render/primary split: one
 `/dev/nvidia*` device is both, so that half of the grant is as wide with
 the bare node as with `kms=#true`. A GPU on that driver also keeps its
 primary node, measured as the one thing its EGL needs to drive a Wayland
-display. That node is not a narrower grant than `kms=#true`: measured with
-`modetest -M nvidia-drm -c` inside a bare `dri` sandbox, the connectors,
-their modes, the monitors' EDID come back through DRM ioctls exactly as
-they do outside, and the card sysfs mask withholds none of it. So on an
-NVIDIA GPU a bare `dri` carries the mode-setting reach, said out loud by
-`--explain` and by the `dri-nvidia-primary` lint note rather than left to
-the reader; a Mesa-driven GPU keeps node and sysfs out.
+display. Measured with `modetest -M nvidia-drm -c` inside a bare `dri`
+sandbox, that node answers with the connectors, their modes, the
+monitors' EDID through DRM ioctls exactly as they do outside, and the
+card sysfs mask withholds none of it; `kms=#true` reaches further still,
+adding DRM master, the framebuffer geometry and the flink names every
+other DRM client shares. Both are said out loud, by `--explain` and by
+the `dri-nvidia-primary` lint note, rather than left to the reader; a
+Mesa-driven GPU keeps node and sysfs out.
 
 [Host paths](manual.md#host-paths) ·
 `path_share_refuses_every_reserved_root`,
