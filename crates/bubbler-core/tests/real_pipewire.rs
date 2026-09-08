@@ -330,19 +330,21 @@ impl PipeWireBed {
     }
 
     /// The same from inside a security context carrying `props`, taken
-    /// once the client's permissions have arrived.
+    /// once every one of `markers` has arrived.
     ///
-    /// WirePlumber attaches the permission manager a moment after the
-    /// client connects, and a client that lists before that lands sees
-    /// **nothing at all** — measured: a short listing is always zero
-    /// objects, never a partial set. The null sink is visible under
-    /// every grant, so its presence is what says the update has arrived
-    /// and that what is missing beside it is missing by policy.
-    pub fn info_in_context(&self, props: &str) -> String {
+    /// WirePlumber attaches each object's permissions independently, so
+    /// a listing taken between two such updates can hold one bed node
+    /// but not the other — measured: the null sink present, the null
+    /// source not yet. `markers` names what this context is expected to
+    /// reach, so the wait covers the whole expected set rather than
+    /// just the first node to arrive.
+    pub fn info_in_context(&self, props: &str, markers: &[&str]) -> String {
         let mut listing = String::new();
         wait_for("the context's view of the graph", || {
             listing = self.in_context(props, "pw-cli info all");
-            object(&listing, &[SINK]).is_some()
+            markers
+                .iter()
+                .all(|marker| object(&listing, &[marker]).is_some())
         });
         listing
     }
@@ -616,7 +618,7 @@ fn a_playback_context_sees_no_source_no_other_stream_and_no_metadata() {
     // the sandbox may keep seeing.
     assert!(!seen.contains("\"metadata.name\""), "{seen}");
 
-    let listing = bed.info_in_context(PLAYBACK);
+    let listing = bed.info_in_context(PLAYBACK, &[SINK]);
     let sink = object(&listing, &[SINK]).expect("the sink is visible");
     assert_eq!(sink.permissions, "r-x--", "on the sink:\n{listing}");
     // What the sink's `r-x--` means, asked of the daemon rather than
@@ -638,7 +640,7 @@ fn a_bubbler_context_with_no_grant_the_drop_in_knows_falls_back_to_playback() {
         return;
     };
     for props in [BOGUS_GRANT, NO_GRANT] {
-        let listing = bed.info_in_context(props);
+        let listing = bed.info_in_context(props, &[SINK]);
         let sink = object(&listing, &[SINK]).expect("the sink is visible");
         assert_eq!(sink.permissions, "r-x--", "under {props}:\n{listing}");
         assert!(
@@ -728,7 +730,7 @@ fn a_context_that_is_not_bubblers_keeps_the_reach_it_had() {
     };
     // `pw-container`'s own defaults: `org.flatpak`, no `bubbler.audio`.
     // The drop-in must not narrow a context it did not create.
-    let listing = bed.info_in_context("{}");
+    let listing = bed.info_in_context("{}", &[SINK, SOURCE]);
     for marker in [SINK, SOURCE] {
         let node = object(&listing, &[marker])
             .unwrap_or_else(|| panic!("{marker} is visible:\n{listing}"));
