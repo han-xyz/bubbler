@@ -553,12 +553,15 @@ cannot reopen the card sysfs underneath.
 `pipewire` and `pulseaudio` hand the sandbox a socket of this run's own
 rather than the session's: `pipewire` the socket of the PipeWire security
 context created for the instance, `pulseaudio` the socket of a
-`pipewire-pulse` bubbler starts under that same context. That server is
-configured from a copy of the host's effective `pipewire-pulse.conf` (yours
-first, then `/etc/pipewire`, then `/usr/share/pipewire`) and a fragment of
-bubbler's own that pins the socket and refuses `load-module`, which is how a
-pulse client would otherwise reach past the session manager's policy; your
-own `pipewire-pulse.conf.d` fragments are not copied, since a
+`pipewire-pulse` bubbler starts under that same context. That server is the
+`pipewire-pulse` package's protocol module, which the `pipewire` package does
+not pull in: a host without it fails a `pulseaudio` run naming the module file
+it looked for, and installing that package is the fix. It is configured from a
+copy of the host's effective `pipewire-pulse.conf` (yours first, then
+`/etc/pipewire`, then `/usr/share/pipewire`) and a fragment of bubbler's own
+that pins the socket, turns D-Bus support off and refuses `load-module`, which
+is how a pulse client would otherwise reach past the session manager's policy;
+your own `pipewire-pulse.conf.d` fragments are not copied, since a
 `server.address` in one of them would decide which socket the run serves.
 Either grant is capture as well as playback, and what scopes it is the
 policy drop-in rather than the socket. An ALSA client reaches the same
