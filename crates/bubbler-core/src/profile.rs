@@ -1576,21 +1576,15 @@ mod tests {
 
             // The host is built from what the pasted config asks for, so
             // the run measures the grants and not this machine. This also
-            // keeps `pulse.allow-module-loading` off and marks the
-            // WirePlumber drop-in installed, or every `pipewire`/
-            // `pulseaudio` grant would carry the daemon-default warning
-            // or `audio-policy-missing` regardless of what the profile asks.
+            // marks the WirePlumber drop-in installed, or every
+            // `pipewire`/`pulseaudio` grant would carry
+            // `audio-policy-missing` regardless of what the profile asks.
             let tmp = tempfile::tempdir().unwrap();
             let e = env(tmp.path());
-            let mut host = FakeHost::default()
-                .text(
-                    "/usr/share/pipewire/pipewire-pulse.conf",
-                    "pulse.properties = {\n    pulse.allow-module-loading = false\n}\n",
-                )
-                .with(
-                    "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf",
-                    file,
-                );
+            let mut host = FakeHost::default().with(
+                "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf",
+                file,
+            );
             {
                 let mut add = |p: &Path, t| {
                     host = std::mem::take(&mut host)

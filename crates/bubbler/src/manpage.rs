@@ -445,12 +445,6 @@ const CHECK_LINES: &[(&str, &str)] = &[
          than answered.",
     ),
     (
-        "pulseaudio-module-loading",
-        "A `pulseaudio` grant on a host whose effective `pipewire-pulse.conf` leaves \
-         `pulse.allow-module-loading` on, so the host's audio daemon will load a module \
-         — a network sink among them — because the sandbox asked it to.",
-    ),
-    (
         "repeat-outside-block",
         "Two or more nodes of one repeatable kind written one per line; one block with \
          the entries under it grants the same thing and reads at a glance.",

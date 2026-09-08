@@ -52,14 +52,7 @@ of `/usr/share/wireplumber/wireplumber.conf.d/`,
 `$XDG_CONFIG_HOME/wireplumber/wireplumber.conf.d/`: the grant is full access
 to every PipeWire node instead of what it asks for. Fix it with `bubbler
 audio-policy --print > <path>` naming one of those three directories and
-`50-bubbler.conf`, then restart WirePlumber), `pulseaudio-module-loading` (a
-`pulseaudio` grant on a host whose effective `pipewire-pulse.conf` leaves
-`pulse.allow-module-loading` on: the host's audio daemon will load a module
-— a network sink or tunnel among them — outside the sandbox's network
-namespace and its egress proxy, and nothing bubbler binds can stop it. Fix
-it on the host with a drop-in `~/.config/pipewire/pipewire-pulse.conf.d/<name>.conf`
-(or `/etc/pipewire/pipewire-pulse.conf.d/`) setting `pulse.properties = {
-pulse.allow-module-loading = false }`, then restart `pipewire-pulse.service`).
+`50-bubbler.conf`, then restart WirePlumber).
 
 **Notes** (information): `allow-host-wildcard`, `app-runtime-rw`,
 `outbound-deny`, `ozone-hint-unnecessary`,

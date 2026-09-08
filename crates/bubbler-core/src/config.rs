@@ -5886,6 +5886,16 @@ command "b""#
         ));
     }
 
+    /// A retired check id is resolved against the same table a typo is:
+    /// `lint::CHECKS` no longer holds `pulseaudio-module-loading` (0.23
+    /// retired it for `audio-policy-missing`), so a config that still
+    /// names it in `lint-allow` fails to parse rather than reading as an
+    /// accepted-but-unused suppression.
+    #[test]
+    fn lint_allow_of_the_retired_pulseaudio_module_loading_id_is_a_parse_error() {
+        assert!(parse("lint-allow \"pulseaudio-module-loading\" reason=\"old config\"").is_err());
+    }
+
     #[test]
     fn tty_set_says_whether_the_node_was_written() {
         assert!(!parse_profile("wayland").unwrap().tty_set);

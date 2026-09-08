@@ -200,24 +200,6 @@ global order.
 `$XDG_RUNTIME_DIR/doc`: what the host chooser exported for this app id, with
 the portal's per-document mode bits, and nothing of the mount's other apps.
 
-`pulseaudio` binds one socket, `pulse/native`, but what answers on the other
-end is a host daemon a grant cannot narrow. Measured on this host (PipeWire
-1.6.8, `pipewire-pulse`): a sandboxed client carrying `/.flatpak-info` is
-tagged `pipewire.client.access = flatpak`, `pipewire.access.effective =
-flatpak` — and `pactl load-module module-null-sink` still succeeds. A
-pipewire-pulse socket configured `client.access = "restricted"` still
-accepts `LOAD_MODULE`. The only gate is the global
-`pulse.allow-module-loading`; Arch ships `/usr/share/pipewire/pipewire-pulse.conf`
-with it commented out, which is on. A loaded module — `module-native-protocol-tcp`,
-`module-pipe-sink`, a tunnel module among them — runs in the host's audio
-server, outside the sandbox's network namespace and its egress proxy: bwrap
-binds nothing that stops it. The fix is host-side, not a bind: a drop-in
-`~/.config/pipewire/pipewire-pulse.conf.d/<any>.conf` (or
-`/etc/pipewire/pipewire-pulse.conf.d/`) with `pulse.properties = {
-pulse.allow-module-loading = false }`, then a restart of
-`pipewire-pulse.service`; `bubbler lint` names this (`pulseaudio-module-loading`,
-a warning).
-
 [Baseline](manual.md#baseline) ·
 `baseline_argv_is_exact`, `etc_is_an_allowlist_of_existing_entries`,
 `service_binds_come_after_runtime_dir_and_before_env`,

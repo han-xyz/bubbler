@@ -160,13 +160,6 @@ pub(crate) mod fake {
             self.unreadable.insert(PathBuf::from(p));
             self
         }
-
-        /// A regular file holding `text`, for the checks that read the
-        /// host's own configuration.
-        pub fn text(mut self, p: &str, text: &str) -> Self {
-            self.texts.insert(PathBuf::from(p), text.to_owned());
-            self
-        }
     }
 
     impl Host for FakeHost {

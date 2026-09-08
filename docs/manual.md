@@ -2938,20 +2938,7 @@ WirePlumber policy drop-in installed in none of
 grant is full access to every PipeWire node instead of what the grant
 asks for, microphone and every other client's audio included. Fix it
 with `bubbler audio-policy --print > <path>` naming one of those three
-directories and `50-bubbler.conf`, then restart WirePlumber),
-`pulseaudio-module-loading` (a `pulseaudio` grant on a host whose effective
-`pipewire-pulse.conf` leaves `pulse.allow-module-loading` on — the daemon's
-own default — so the host's audio daemon will load a module, a network sink
-or tunnel among them, because the sandbox asked it to: outside the sandbox's
-network namespace and its egress proxy, and nothing bubbler binds can stop
-it. Fix it on the host with a drop-in
-`~/.config/pipewire/pipewire-pulse.conf.d/<name>.conf` (or
-`/etc/pipewire/pipewire-pulse.conf.d/`) setting `pulse.properties = {
-pulse.allow-module-loading = false }`, then restart `pipewire-pulse.service`;
-the check reads only `pipewire-pulse.conf`, so a host running the real
-`pulseaudio` daemon instead of PipeWire's compatibility layer has no such
-file to turn the property off in, and the warning fires there by the same
-default).
+directories and `50-bubbler.conf`, then restart WirePlumber).
 
 **Notes** are information and fail nothing: `app-runtime-rw` (a shared
 application runtime directory granted `mode=rw`, so the sandbox can replace the

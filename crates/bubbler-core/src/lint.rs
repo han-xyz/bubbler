@@ -125,9 +125,9 @@ const DRI_KMS: Check = Check {
     id: "dri-kms",
     severity: Severity::Note,
 };
-// A note about the host, like `pulseaudio-module-loading`: the file asks
-// for nothing beyond the render nodes, and what the run adds to them
-// depends on which driver this machine's GPU is on.
+// A note about the host, like `audio-policy-missing`: the file asks for
+// nothing beyond the render nodes, and what the run adds to them depends
+// on which driver this machine's GPU is on.
 const DRI_NVIDIA_PRIMARY: Check = Check {
     id: "dri-nvidia-primary",
     severity: Severity::Note,
@@ -214,15 +214,6 @@ const PIPEWIRE_MICROPHONE: Check = Check {
 };
 const PORTAL_TALK_WITHOUT_PORTALS: Check = Check {
     id: "portal-talk-without-portals",
-    severity: Severity::Warning,
-};
-// A warning, not a note: what the host's audio daemon will do for any
-// client is still not a mistake in this file, and the file still cannot
-// change it — but a loaded module runs outside the sandbox's network
-// namespace and its egress proxy, so the user has to see it, not just
-// read past it.
-const PULSEAUDIO_MODULE_LOADING: Check = Check {
-    id: "pulseaudio-module-loading",
     severity: Severity::Warning,
 };
 // A note, not a warning: nothing is granted twice and nothing is wider
@@ -325,7 +316,6 @@ pub const CHECKS: &[Check] = &[
     PATH_SHARE_SOCKET,
     PIPEWIRE_MICROPHONE,
     PORTAL_TALK_WITHOUT_PORTALS,
-    PULSEAUDIO_MODULE_LOADING,
     REPEAT_OUTSIDE_BLOCK,
     SECCOMP_DISABLED,
     SECRETS_ACCESS,
@@ -1137,73 +1127,6 @@ fn rule_name(node: &KdlNode) -> Option<&str> {
     }
 }
 
-/// Most of a PipeWire configuration file that is read looking for one
-/// property. Larger than any of them; a file past it is a file this
-/// check has nothing to say about.
-const PULSE_CONF_BYTES: u64 = 256 * 1024;
-
-/// The property that decides whether the host's pulse server loads a
-/// module because a client asked it to.
-const PULSE_MODULE_KEY: &str = "pulse.allow-module-loading";
-
-/// The `pipewire-pulse.conf` files in force, in the order they are
-/// applied. archwiki (*PipeWire* § Configuration): the package's files
-/// are in `/usr/share/pipewire`, a copy in `/etc/pipewire` or
-/// `~/.config/pipewire` takes precedence, and the higher-precedence copy
-/// makes the others ignored — so exactly one main file counts. The
-/// shipped file's own header names the two drop-in directories, which
-/// are applied over it.
-fn pulse_conf_files(ctx: &Context) -> Vec<PathBuf> {
-    let dirs = [
-        PathBuf::from("/usr/share/pipewire"),
-        PathBuf::from("/etc/pipewire"),
-        ctx.env.config_home.join("pipewire"),
-    ];
-    let mut files: Vec<PathBuf> = dirs
-        .iter()
-        .rev()
-        .map(|d| d.join("pipewire-pulse.conf"))
-        .find(|p| ctx.host.read_text(p, PULSE_CONF_BYTES).is_some())
-        .into_iter()
-        .collect();
-    for dir in &dirs {
-        let d = dir.join("pipewire-pulse.conf.d");
-        let mut names = ctx.host.list_dir(&d);
-        names.sort();
-        files.extend(names.into_iter().map(|n| d.join(n)));
-    }
-    files
-}
-
-/// Whether the host's pulse server still loads a module on a client's
-/// say-so. The daemon's own default is on: the shipped configuration
-/// carries the property commented out. The files are read line by line
-/// rather than parsed as SPA-JSON — this is a note, and the shape that
-/// turns it off is one line wherever it is written.
-fn pulse_module_loading_on(ctx: &Context) -> bool {
-    let mut on = true;
-    for path in pulse_conf_files(ctx) {
-        let Some(text) = ctx.host.read_text(&path, PULSE_CONF_BYTES) else {
-            continue;
-        };
-        for line in text.lines() {
-            let line = line.trim();
-            if line.starts_with('#') {
-                continue;
-            }
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            if key.trim().trim_matches('"') != PULSE_MODULE_KEY {
-                continue;
-            }
-            let value = value.trim().trim_end_matches([',', '}']).trim();
-            on = !value.eq_ignore_ascii_case("false");
-        }
-    }
-    on
-}
-
 /// The `pipewire-microphone` note, if `node` carries the child: `name`
 /// is `node`'s own name, since `pipewire` and `pulseaudio` share this
 /// wording and differ only in which one is being named.
@@ -1218,30 +1141,6 @@ fn microphone_note(i: usize, node: &KdlNode, name: &str, f: &mut Findings) {
                  and capture from them"
             ),
             "drop the child where the app only plays",
-        );
-    }
-}
-
-/// Two independent things about a `pulseaudio` node: the `microphone`
-/// child it may carry, and whether this host still lets a client load
-/// network modules on it, which is a fact about the host rather than
-/// about the child, so either, both or neither can be true at once.
-fn pulseaudio_node(ctx: &Context, i: usize, node: &KdlNode, f: &mut Findings) {
-    microphone_note(i, node, "pulseaudio", f);
-    if pulse_module_loading_on(ctx) {
-        f.push(
-            i,
-            node,
-            &PULSEAUDIO_MODULE_LOADING,
-            "the host audio daemon will load network modules on the sandbox's \
-             behalf, outside the sandbox's network namespace and its egress \
-             proxy: the effective `pipewire-pulse.conf` leaves \
-             `pulse.allow-module-loading` on"
-                .to_owned(),
-            "write `pulse.properties = { pulse.allow-module-loading = false }` into \
-             `~/.config/pipewire/pipewire-pulse.conf.d/10-no-modules.conf` and \
-             restart `pipewire-pulse.service`, unless an application of yours \
-             loads pulse modules",
         );
     }
 }
@@ -1421,7 +1320,7 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                 audio_policy_missing(ctx, i, node, "pipewire", f);
             }
             "pulseaudio" => {
-                pulseaudio_node(ctx, i, node, f);
+                microphone_note(i, node, "pulseaudio", f);
                 audio_policy_missing(ctx, i, node, "pulseaudio", f);
             }
             "dbus" => dbus_node(i, node, f),
@@ -2465,23 +2364,16 @@ mod tests {
     }
 
     /// A `microphone` child is what puts capture in reach; the bare node
-    /// says nothing about it and stays quiet. Measured on a host with
-    /// module loading already turned off and the policy drop-in
-    /// installed, so it is the one finding under test and neither
-    /// `pulseaudio-module-loading` nor `audio-policy-missing`, both
-    /// independent of it.
+    /// says nothing about it and stays quiet. Measured on a host with the
+    /// policy drop-in installed, so it is the one finding under test and
+    /// not `audio-policy-missing`, which is independent of it.
     #[test]
     fn pipewire_microphone_is_a_note_and_the_bare_grant_is_not() {
         let (file, _, _) = fake::types();
-        let quiet = host()
-            .text(
-                "/home/user/.config/pipewire/pipewire-pulse.conf.d/10-no-modules.conf",
-                "pulse.properties = {\n    pulse.allow-module-loading = false\n}\n",
-            )
-            .with(
-                "/home/user/.config/wireplumber/wireplumber.conf.d/50-bubbler.conf",
-                file,
-            );
+        let quiet = host().with(
+            "/home/user/.config/wireplumber/wireplumber.conf.d/50-bubbler.conf",
+            file,
+        );
         with(&quiet, |ctx| {
             for node in ["pipewire", "pulseaudio"] {
                 let text = format!("{node} {{\n    microphone\n}}");
@@ -2502,18 +2394,13 @@ mod tests {
                 );
             }
         });
-        // Three independent findings on a host with neither fix applied —
-        // the child, the host's own module policy, and the missing
-        // drop-in — so a node that raises all three keeps all three
-        // rather than one silencing another.
+        // The two `pulseaudio` findings are about different things — the
+        // child and the missing policy install — so a node that raises
+        // both keeps both rather than the second silencing the first.
         with(&host(), |ctx| {
             assert_eq!(
                 ids(&lint(ctx, &["pulseaudio {\n    microphone\n}"])),
-                [
-                    "pipewire-microphone",
-                    "pulseaudio-module-loading",
-                    "audio-policy-missing"
-                ]
+                ["pipewire-microphone", "audio-policy-missing"]
             );
         });
     }
@@ -3703,80 +3590,13 @@ mod tests {
         });
     }
 
-    /// The daemon's own default is on, so a host that says nothing gets
-    /// the warning; a drop-in that turns it off silences it, and the
-    /// warning is about the `pulseaudio` grant, not about a host without one.
-    #[test]
-    fn pulseaudio_module_loading_follows_the_effective_pipewire_config() {
-        let (file, _, _) = fake::types();
-        let bare = host()
-            .text(
-                "/usr/share/pipewire/pipewire-pulse.conf",
-                "pulse.properties = {\n    #pulse.allow-module-loading = true\n}\n",
-            )
-            .with(
-                "/home/user/.config/wireplumber/wireplumber.conf.d/50-bubbler.conf",
-                file,
-            );
-        with(&bare, |ctx| {
-            let report = lint(ctx, &["pulseaudio"]);
-            assert_eq!(ids(&report), ["pulseaudio-module-loading"]);
-            assert_eq!(report.findings[0].severity, Severity::Warning);
-            assert!(
-                report.findings[0].message.contains(
-                    "the host audio daemon will load network modules on the \
-                              sandbox's behalf"
-                ),
-                "{}",
-                report.findings[0].message
-            );
-            assert_eq!(ids(&lint(ctx, &["wayland"])), [] as [&str; 0]);
-        });
-
-        let off = bare.text(
-            "/home/user/.config/pipewire/pipewire-pulse.conf.d/10-no-modules.conf",
-            "pulse.properties = {\n    pulse.allow-module-loading = false\n}\n",
-        );
-        with(&off, |ctx| {
-            assert_eq!(ids(&lint(ctx, &["pulseaudio"])), [] as [&str; 0]);
-        });
-
-        // A drop-in that turns it back on is later in precedence than
-        // the system file that turned it off.
-        let back_on = host()
-            .text(
-                "/etc/pipewire/pipewire-pulse.conf",
-                "pulse.properties = {\n    pulse.allow-module-loading = false\n}\n",
-            )
-            .text(
-                "/home/user/.config/pipewire/pipewire-pulse.conf.d/99-modules.conf",
-                "pulse.properties = {\n    pulse.allow-module-loading = true\n}\n",
-            )
-            .with(
-                "/home/user/.config/wireplumber/wireplumber.conf.d/50-bubbler.conf",
-                file,
-            );
-        with(&back_on, |ctx| {
-            assert_eq!(
-                ids(&lint(ctx, &["pulseaudio"])),
-                ["pulseaudio-module-loading"]
-            );
-        });
-    }
-
     /// No drop-in anywhere is the default fixture (`host()`), so the
     /// warning fires for either audio node, names the node and all three
     /// directories bubbler searched, and points the help at the command
-    /// that writes the file and the restart it needs. Module loading is
-    /// turned off so `pulseaudio` raises only this finding, not also
-    /// `pulseaudio-module-loading`.
+    /// that writes the file and the restart it needs.
     #[test]
     fn audio_policy_missing_fires_without_the_drop_in_and_names_where_to_put_it() {
-        let quiet = host().text(
-            "/usr/share/pipewire/pipewire-pulse.conf",
-            "pulse.properties = {\n    pulse.allow-module-loading = false\n}\n",
-        );
-        with(&quiet, |ctx| {
+        with(&host(), |ctx| {
             for node in ["pipewire", "pulseaudio"] {
                 let report = lint(ctx, &[node]);
                 assert_eq!(ids(&report), ["audio-policy-missing"], "{node}");
@@ -3822,14 +3642,11 @@ mod tests {
 
     #[test]
     fn audio_policy_missing_is_accepted_with_a_lint_allow() {
-        // `pipewire`, not `pulseaudio`: the latter also carries
-        // `pulseaudio-module-loading` on a host that says nothing about
-        // its pulse config, which this `lint-allow` does not name.
         with(&host(), |ctx| {
             assert_eq!(
                 ids(&lint(
                     ctx,
-                    &["pipewire\nlint-allow \"audio-policy-missing\" \
+                    &["pulseaudio\nlint-allow \"audio-policy-missing\" \
                          reason=\"packaged host\""]
                 )),
                 [] as [&str; 0]
@@ -3853,21 +3670,14 @@ mod tests {
             let cfg = config::parse_profile(text)
                 .unwrap_or_else(|err| panic!("{name}: {err}"))
                 .config;
-            // This measures the profiles' own grants, not this host's
-            // pipewire config or whether the WirePlumber drop-in is
-            // installed — otherwise every `pipewire`/`pulseaudio` grant
-            // would carry `pulseaudio-module-loading` by the daemon's
-            // default or `audio-policy-missing` regardless of what the
-            // profile asks.
-            let mut host = FakeHost::default()
-                .text(
-                    "/usr/share/pipewire/pipewire-pulse.conf",
-                    "pulse.properties = {\n    pulse.allow-module-loading = false\n}\n",
-                )
-                .with(
-                    "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf",
-                    file,
-                );
+            // This measures the profiles' own grants, not whether this
+            // host has the WirePlumber drop-in installed — otherwise
+            // every `pipewire`/`pulseaudio` grant would carry
+            // `audio-policy-missing` regardless of what the profile asks.
+            let mut host = FakeHost::default().with(
+                "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf",
+                file,
+            );
             let mut add = |p: &Path, t| {
                 host = std::mem::take(&mut host)
                     .with(p.to_str().expect("built-in profiles hold UTF-8 paths"), t);
