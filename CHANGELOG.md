@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.22.0 (unreleased)
+## 0.22.0
 
 ### Added
 
@@ -128,7 +128,7 @@
   drawing anything; with no bus at all it stops after its GPU process and
   never starts a renderer.
 
-## 0.21.0 (unreleased)
+## 0.21.0
 
 Hardening milestone: closes several gaps found by an escape-research pass
 over the sandbox boundary. No config or CLI surface removed; every change

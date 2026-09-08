@@ -14,7 +14,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.21.0"
+version = "0.22.0"
 edition = "2024"
 # `kdl` 6 declares 1.95; everything else in the locked graph is older.
 # Pinned so a too-old toolchain says so once instead of failing to parse.
@@ -26,9 +26,9 @@ repository = "https://github.com/han-xyz/bubbler"
 # `version` beside `path`: crates.io refuses a bare path dependency, and
 # `cargo deny` reads one as a wildcard requirement.  Bumped with
 # `workspace.package.version` at each release.
-bubbler-core = { path = "crates/bubbler-core", version = "0.21.0" }
-bubbler-init = { path = "crates/bubbler-init", version = "0.21.0" }
-bubbler-net-proxy = { path = "crates/bubbler-net-proxy", version = "0.21.0" }
+bubbler-core = { path = "crates/bubbler-core", version = "0.22.0" }
+bubbler-init = { path = "crates/bubbler-init", version = "0.22.0" }
+bubbler-net-proxy = { path = "crates/bubbler-net-proxy", version = "0.22.0" }
 kdl = "6"
 thiserror = "2"
 rustix = { version = "1", features = ["fs", "process", "net", "pipe", "event", "pty", "termios", "thread", "rand"] }
