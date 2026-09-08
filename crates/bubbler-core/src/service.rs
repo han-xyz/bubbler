@@ -3158,7 +3158,7 @@ mod tests {
             "/media/x",
             "/srv/x",
             "/run/media",
-            "/run/media/han/usb",
+            "/run/media/user/usb",
         ] {
             let a = argv(&[share(path, ShareMode::ReadOnly)], &env(), &[(path, Dir)])
                 .unwrap_or_else(|e| panic!("{path} should be allowed, got {e:?}"));
