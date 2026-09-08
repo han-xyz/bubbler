@@ -1,7 +1,8 @@
 # The security tokens the host's PipeWire daemon has attached to the
 # clients of one bubbler instance, one line per client, in the order the
 # Rust side asserts them. `pw-dump`'s output arrives on stdin and the
-# instance name is the one argument; a client of another context, or of
+# instance name is the first argument; any further argument is another
+# property to print after the tokens. A client of another context, or of
 # no context at all, is not printed.
 import json
 import sys
@@ -16,10 +17,11 @@ KEYS = (
 )
 
 app = sys.argv[1]
+keys = KEYS + tuple(sys.argv[2:])
 for obj in json.load(sys.stdin):
     if obj.get("type") != "PipeWire:Interface:Client":
         continue
     props = obj.get("info", {}).get("props", {})
     if props.get("pipewire.sec.app-id") != app:
         continue
-    print(" ".join(f"{key}={props.get(key)}" for key in KEYS))
+    print(" ".join(f"{key}={props.get(key)}" for key in keys))

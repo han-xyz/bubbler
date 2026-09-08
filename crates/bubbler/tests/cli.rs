@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use bubbler_core::bwrap::ETC_ALLOWLIST;
 use bubbler_core::instance::CONFIG_VERSION;
-use bubbler_core::pipewire::PW_CONTAINER;
+use bubbler_core::pipewire::{PULSE_MODULE, PW_CONTAINER};
 use bubbler_core::profile::NAMES;
 use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
@@ -568,6 +568,82 @@ fn explain_names_the_context_an_audio_grant_is_served_through() {
         "{s}"
     );
     assert!(s.contains(&format!("sidecar: {PW_CONTAINER} -P ")), "{s}");
+}
+
+/// The `pulseaudio` grant is served by a PulseAudio server of this run's
+/// own under the instance's runtime directory, so the session's pulse
+/// socket is bound from nowhere.
+#[test]
+fn dry_run_binds_the_planned_private_pulse_socket_and_not_the_sessions() {
+    if !require_host_program(PW_CONTAINER) || !require_host_program(PULSE_MODULE) {
+        return;
+    }
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "pulseaudio\ncommand \"true\"\n").unwrap();
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--dry-run"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        s.contains(&format!(
+            "--ro-bind\n{}\n{}\n",
+            tmp.path().join("run/bubbler/t/pw/pulse/native").display(),
+            tmp.path().join("run/pulse/native").display()
+        )),
+        "{s}"
+    );
+    // The same path is the destination above; as a *source* it would be
+    // the session's own pulse server bound straight into the sandbox.
+    assert!(
+        !s.contains(&format!(
+            "--ro-bind\n{}\n",
+            tmp.path().join("run/pulse/native").display()
+        )),
+        "{s}"
+    );
+}
+
+/// The server a pulse client talks to is a process of this run's, and
+/// what it refuses is in its configuration rather than in the sandbox's
+/// argv — so the explanation is where a reader can see both.
+#[test]
+fn explain_names_the_private_pulse_server_and_the_context_under_it() {
+    if !require_host_program(PW_CONTAINER) || !require_host_program(PULSE_MODULE) {
+        return;
+    }
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "pulseaudio\ncommand \"true\"\n").unwrap();
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--explain"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        s.contains("sidecar: /usr/bin/pipewire -c pipewire-pulse.conf"),
+        "{s}"
+    );
+    assert!(
+        s.contains("(pulse: a private server on this run's context, module loading refused)"),
+        "{s}"
+    );
+    // The one context of the instance, described under the grant it is
+    // created for like any other audio grant.
+    assert!(s.contains("(context: org.bubbler t playback)"), "{s}");
 }
 
 /// The explanation says what the grant costs on *this* host, and without
@@ -2499,11 +2575,19 @@ fn require_pipewire_session() -> bool {
 /// The security tokens the host daemon has attached to the clients of
 /// `app`, one line each, as the fixture prints them.
 fn host_pw_clients(app: &str) -> String {
+    host_pw_clients_with(app, &[])
+}
+
+/// [`host_pw_clients`] with `extra` properties printed after the tokens,
+/// which is how a client of the private pulse server is told from the
+/// server's own.
+fn host_pw_clients_with(app: &str, extra: &[&str]) -> String {
     let dump = Command::new(PW_DUMP)
         .output()
         .expect("pw-dump runs on this host");
     let mut probe = Command::new(PYTHON)
         .args(["-c", PW_CLIENT, app])
+        .args(extra)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2617,6 +2701,158 @@ fn real_bwrap_pipewire_context_tags_the_client() {
     // for the temporary directory to take with it.
     let out = bubbler_audio(tmp.path(), &init)
         .args(["delete", "audioctx", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The tools the pulse test needs beside the PipeWire ones: a pulse
+/// client to talk to the private server, and the protocol module that
+/// makes the sidecar one.
+const PACTL: &str = "/usr/bin/pactl";
+
+/// Whether this host can serve a bubbler `pulseaudio` grant.
+fn require_pulse_session() -> bool {
+    require_pipewire_session() && require_host_program(PACTL) && require_host_program(PULSE_MODULE)
+}
+
+/// A `pulseaudio` sandbox talks to a PulseAudio server of this run's
+/// own, on the instance's security context: the server answers from the
+/// private socket, it refuses to load a module for its client — the way
+/// a pulse client reaches past any policy — and the daemon sees that
+/// client tagged like a native one. When the run ends, neither the
+/// server nor anything it wrote is left.
+#[test]
+fn real_bwrap_pulseaudio_serves_a_private_server() {
+    if !require_pulse_session() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_audio(tmp.path(), &init)
+        .args(["create", "audiopulse"])
+        .status()
+        .unwrap();
+    let cfg = tmp
+        .path()
+        .join("data/bubbler/instances/audiopulse/config.kdl");
+    std::fs::write(&cfg, "pulseaudio\ncommand \"true\"\n").unwrap();
+    // Both answers are read from inside the sandbox, and `subscribe`
+    // then holds the client open for as long as the run does, so the
+    // host side has a pulse client to ask the daemon about.
+    let mut child = bubbler_audio(tmp.path(), &init)
+        .args([
+            "run",
+            "audiopulse",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            "pactl info 2>&1; pactl load-module module-null-sink 2>&1; exec pactl subscribe",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut clients = String::new();
+    while !clients.contains("client.api=pipewire-pulse") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+        clients = host_pw_clients_with("audiopulse", &["client.api"]);
+    }
+    let instance = session_pipewire()
+        .expect("checked above")
+        .with_file_name("bubbler/audiopulse");
+    // Read while the run is up and judged once it is down, as the
+    // context test is: an assertion that failed here would leave the
+    // sandbox and two sidecars behind for every later run to see.
+    let socket = instance.join("pw/pulse/native").exists();
+    let config =
+        std::fs::read_to_string(instance.join("pw/cfg/pipewire-pulse.conf.d/00-bubbler.conf"))
+            .unwrap_or_default();
+
+    kill_process(Pid::from_child(&child), Signal::TERM).expect("the run is still going");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while child.try_wait().expect("waiting for the run").is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the run ignored SIGTERM");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The run id every client of this instance carries, read before the
+    // handle is consumed for the output.
+    let run_id = child.id();
+    let out = child.wait_with_output().expect("the run's output");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // R5: the server that answers is a pipewire-pulse, and the module
+    // loading a client would reach past the policy with is refused.
+    assert!(
+        said.contains("Server Name: PulseAudio (on PipeWire"),
+        "{said}"
+    );
+    assert!(said.contains("Failure: Access denied"), "{said}");
+    assert!(
+        said.contains(&format!(
+            "Server String: unix:{}",
+            session_pipewire()
+                .expect("checked above")
+                .with_file_name("pulse/native")
+                .display()
+        )),
+        "{said}"
+    );
+    assert!(
+        socket,
+        "no private pulse socket under {instance:?} during the run"
+    );
+    assert!(
+        config.contains("pulse.allow-module-loading = false"),
+        "the fragment the server read: {config}"
+    );
+    // R3, pulse half: a client of that server is a client of the
+    // instance's context, tagged exactly as a native client is.
+    assert!(
+        clients.lines().any(|l| l
+            == format!(
+                "pipewire.sec.engine=org.bubbler pipewire.sec.app-id=audiopulse \
+                 pipewire.sec.instance-id={} pipewire.access=restricted \
+                 pipewire.access.effective=restricted bubbler.audio=playback \
+                 client.api=pipewire-pulse",
+                run_id
+            )),
+        "{clients}"
+    );
+    // R4, pulse half: the server, its socket and its configuration are
+    // gone with the run.
+    assert!(
+        !bwrap_alive("pipewire-pulse.conf"),
+        "a pulse sidecar sandbox is left"
+    );
+    assert!(
+        !process_running("pipewire", "pipewire-pulse.conf"),
+        "a private pulse server is left"
+    );
+    assert!(
+        !instance.join("pw").exists(),
+        "the sidecar directory is left: {instance:?}"
+    );
+    assert!(
+        host_pw_clients("audiopulse").is_empty(),
+        "the daemon still holds a client of the context"
+    );
+
+    let out = bubbler_audio(tmp.path(), &init)
+        .args(["delete", "audiopulse", "--yes"])
         .output()
         .unwrap();
     assert!(
