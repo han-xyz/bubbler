@@ -550,12 +550,21 @@ framebuffer geometry and every other client's flink names. `lint` notes it as
 masks are emitted after every other bind of the run, so a sibling grant that
 binds a tree above them — `gamepad`, with the whole of `/sys/devices` —
 cannot reopen the card sysfs underneath.
-`pipewire` and `pulseaudio` hand the sandbox the session's
-audio socket directly, which is capture as well as playback: everything the
-session exposes, including the microphone, with no portal in between. An ALSA
-client reaches the same server through `/etc/alsa`, which the baseline binds:
-those files are where pipewire-alsa defines the `default` PCM, and without them
-alsa-lib falls back to a hardware card whose `/dev/snd` nodes no sandbox has.
+`pipewire` and `pulseaudio` hand the sandbox a socket of this run's own
+rather than the session's: `pipewire` the socket of the PipeWire security
+context created for the instance, `pulseaudio` the socket of a
+`pipewire-pulse` bubbler starts under that same context. That server is
+configured from a copy of the host's effective `pipewire-pulse.conf` (yours
+first, then `/etc/pipewire`, then `/usr/share/pipewire`) and a fragment of
+bubbler's own that pins the socket and refuses `load-module`, which is how a
+pulse client would otherwise reach past the session manager's policy; your
+own `pipewire-pulse.conf.d` fragments are not copied, since a
+`server.address` in one of them would decide which socket the run serves.
+Either grant is capture as well as playback, and what scopes it is the
+policy drop-in rather than the socket. An ALSA client reaches the same
+daemon through `/etc/alsa`, which the baseline binds: those files are where
+pipewire-alsa defines the `default` PCM, and without them alsa-lib falls back
+to a hardware card whose `/dev/snd` nodes no sandbox has.
 Only `/etc/alsa` is on the allowlist, not `/etc/asound.conf`, so a system-wide
 override of yours does not reach the sandbox; an `.asoundrc` in the private home
 does. `/dev/snd` itself is never bound, so an application that opens the
