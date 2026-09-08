@@ -122,11 +122,12 @@ const WIREPLUMBER_MAIN_CONF: &str = "/usr/share/wireplumber/wireplumber.conf";
 
 /// Everything the bed shells out to, in the order a missing one is
 /// worth reporting.
-const NEEDED: [&str; 6] = [
+const NEEDED: [&str; 7] = [
     "pipewire",
     "wireplumber",
     "pw-container",
     "pw-dump",
+    "pw-cli",
     "pw-cat",
     "pw-link",
 ];
@@ -137,6 +138,17 @@ pub const PLAYBACK: &str = r#"{ "pipewire.sec.engine": "org.bubbler", "pipewire.
 
 /// The same with the `microphone` child.
 pub const PLAYBACK_MICROPHONE: &str = r#"{ "pipewire.sec.engine": "org.bubbler", "pipewire.sec.app-id": "bed", "pipewire.sec.instance-id": "t1", "pipewire.access": "restricted", "bubbler.audio": "playback,microphone" }"#;
+
+/// A grant string the drop-in does not know, as a future bubbler or a
+/// typo could produce.
+pub const BOGUS_GRANT: &str = r#"{ "pipewire.sec.engine": "org.bubbler", "pipewire.sec.app-id": "bed", "pipewire.access": "restricted", "bubbler.audio": "bogus" }"#;
+
+/// A bubbler context with the grant key missing altogether.
+pub const NO_GRANT: &str = r#"{ "pipewire.sec.engine": "org.bubbler", "pipewire.sec.app-id": "bed", "pipewire.access": "restricted" }"#;
+
+/// Markers naming the bed's two nodes in a `pw-cli info all` listing.
+const SINK: &str = r#"node.name = "bed-sink""#;
+const SOURCE: &str = r#"node.name = "bed-source""#;
 
 /// Say why a test is being skipped where a plain `cargo test` will show
 /// it. Written to descriptor 2 rather than through `eprintln!`: libtest
@@ -311,6 +323,30 @@ impl PipeWireBed {
         self.host_tool("pw-link", &["-l"])
     }
 
+    /// `pw-cli info all` against the bed, which prints each object's
+    /// permissions where `pw-dump` spreads them over five lines.
+    pub fn info_from_host(&self) -> String {
+        self.host_tool("pw-cli", &["info", "all"])
+    }
+
+    /// The same from inside a security context carrying `props`, taken
+    /// once the client's permissions have arrived.
+    ///
+    /// WirePlumber attaches the permission manager a moment after the
+    /// client connects, and a client that lists before that lands sees
+    /// **nothing at all** — measured: a short listing is always zero
+    /// objects, never a partial set. The null sink is visible under
+    /// every grant, so its presence is what says the update has arrived
+    /// and that what is missing beside it is missing by policy.
+    pub fn info_in_context(&self, props: &str) -> String {
+        let mut listing = String::new();
+        wait_for("the context's view of the graph", || {
+            listing = self.in_context(props, "pw-cli info all");
+            object(&listing, &[SINK]).is_some()
+        });
+        listing
+    }
+
     fn host_tool(&self, program: &str, args: &[&str]) -> String {
         let out = self
             .command(program)
@@ -441,6 +477,31 @@ fn daemon(command: &mut Command, log: &Path) -> Child {
         .unwrap_or_else(|e| panic!("{command:?} did not run: {e}"))
 }
 
+/// One object as `pw-cli info all` prints it: a block opening with the
+/// id and the five-character permission string the asking client holds
+/// on it, with the object's properties below.
+struct Object {
+    id: String,
+    permissions: String,
+}
+
+/// The object whose block carries every one of `markers`, or `None` when
+/// the client `listing` came from cannot see it.
+fn object(listing: &str, markers: &[&str]) -> Option<Object> {
+    let listing = format!("\n{listing}");
+    let block = listing
+        .split("\n\tid: ")
+        .skip(1)
+        .find(|block| markers.iter().all(|marker| block.contains(marker)))?;
+    Some(Object {
+        id: block.lines().next()?.to_owned(),
+        permissions: block
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("permissions: "))?
+            .to_owned(),
+    })
+}
+
 /// Poll `ready` until it holds, or fail the test naming what never came.
 fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -554,6 +615,37 @@ fn a_playback_context_sees_no_source_no_other_stream_and_no_metadata() {
     // the interface name is also the metadata *factory*'s type, which
     // the sandbox may keep seeing.
     assert!(!seen.contains("\"metadata.name\""), "{seen}");
+
+    let listing = bed.info_in_context(PLAYBACK);
+    let sink = object(&listing, &[SINK]).expect("the sink is visible");
+    assert_eq!(sink.permissions, "r-x--", "on the sink:\n{listing}");
+    // What the sink's `r-x--` means, asked of the daemon rather than
+    // read off the manager's own configuration: a `default_permissions`
+    // widened to include `w` would leave every assertion above intact.
+    let refused = bed.in_context(
+        PLAYBACK,
+        &format!("pw-cli set-param {} Props \"{{ mute: true }}\"", sink.id),
+    );
+    assert!(
+        refused.contains("Permission denied") && refused.contains("requires -wx--"),
+        "muting the sink from a playback context was not refused:\n{refused}"
+    );
+}
+
+#[test]
+fn a_bubbler_context_with_no_grant_the_drop_in_knows_falls_back_to_playback() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    for props in [BOGUS_GRANT, NO_GRANT] {
+        let listing = bed.info_in_context(props);
+        let sink = object(&listing, &[SINK]).expect("the sink is visible");
+        assert_eq!(sink.permissions, "r-x--", "under {props}:\n{listing}");
+        assert!(
+            object(&listing, &[SOURCE]).is_none(),
+            "under {props} the null source was reachable:\n{listing}"
+        );
+    }
 }
 
 #[test]
@@ -586,8 +678,22 @@ fn a_playback_capture_stream_gets_no_link() {
         &format!("pw-cat -r {}", out.display()),
         "Stream/Input/Audio",
     );
-    // The stream is in the graph; give the session manager the rescan it
-    // would need to link it before asking whether it did.
+    // The stream is in the graph and WirePlumber has decided this
+    // client's access — `pipewire.access.effective` is what
+    // `apply-access.lua` writes once it has attached the permission
+    // manager — so the session manager has everything it needs to link,
+    // and the two seconds below are the window in which it would.
+    //
+    // A bound, not a proof: nothing announces "I considered this stream
+    // and declined". A host slow enough to rescan later than this would
+    // pass the test with a link still coming.
+    wait_for("the capture client's access decision", || {
+        object(
+            &bed.info_from_host(),
+            &["bubbler.audio = \"playback\"", "pipewire.access.effective"],
+        )
+        .is_some()
+    });
     std::thread::sleep(Duration::from_secs(2));
     let links = bed.links();
     assert!(
@@ -622,7 +728,16 @@ fn a_context_that_is_not_bubblers_keeps_the_reach_it_had() {
     };
     // `pw-container`'s own defaults: `org.flatpak`, no `bubbler.audio`.
     // The drop-in must not narrow a context it did not create.
-    let seen = bed.in_context("{}", "pw-dump");
-    assert!(seen.contains("\"node.name\": \"bed-sink\""), "{seen}");
-    assert!(seen.contains("\"node.name\": \"bed-source\""), "{seen}");
+    let listing = bed.info_in_context("{}");
+    for marker in [SINK, SOURCE] {
+        let node = object(&listing, &[marker])
+            .unwrap_or_else(|| panic!("{marker} is visible:\n{listing}"));
+        // The measured default here, not the documented one: WirePlumber
+        // 0.5.15 hands an unmatched restricted client `Perm.ALL`, so the
+        // sandbox could rename this node and move the session's default
+        // device, not only read it. If this ever reads `r-x--`, the
+        // upstream default changed and the warning bubbler prints when
+        // the drop-in is missing overstates the reach.
+        assert_eq!(node.permissions, "rwxml", "on {marker}:\n{listing}");
+    }
 }
