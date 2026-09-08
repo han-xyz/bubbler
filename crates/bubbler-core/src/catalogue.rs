@@ -135,7 +135,7 @@ pub static GRANTS: &[Grant] = &[
     },
     Grant {
         node: "pipewire",
-        summary: "the session's PipeWire socket",
+        summary: "this instance's own PipeWire security context",
         cost: "Bare, with 0.23's policy drop-in installed, the sandbox may play into the \
                session's sinks and see them; every microphone and line-in is hidden. \
                `microphone` adds every `Audio/Source` the host has: capture is allowed. \
@@ -145,7 +145,7 @@ pub static GRANTS: &[Grant] = &[
     },
     Grant {
         node: "pulseaudio",
-        summary: "the session's PulseAudio socket, and `PULSE_SERVER` pointing at it",
+        summary: "this instance's own private PulseAudio server, and `PULSE_SERVER` pointing at it",
         cost: "The same reach `pipewire` has, through the older protocol: bare is playback \
                only with 0.23's policy drop-in installed; `microphone` adds every \
                `Audio/Source` the host has, capture allowed.",

@@ -339,14 +339,40 @@ stays in true argv order.
 A grant that is not only bwrap arguments says so under its own group: a `dbus`
 node lists the `rules:` it hands the proxy, an isolated `network` lists the
 `sidecar:` argv pasta is started with — and a second one for the egress proxy
-where the node has an `allow-host`, with the `ruleset:` block under it — and a
+where the node has an `allow-host`, with the `ruleset:` block under it — a
 `wayland` node says which socket
 the one bind is — `security-context:` with the three strings a bare grant
 registers plus the `sidecar:` line naming the proxy in front of it, its two
-sockets and its gate, `raw socket: wayland "host"` for the session's own — none
-of which is in the argv, and `--dry-run` prints the sandbox's argv alone.
-`--explain --proxy` prints the D-Bus proxy's own argv and `--explain --wl-proxy`
-the Wayland proxy's.
+sockets and its gate, `raw socket: wayland "host"` for the session's own —
+and a `pipewire` or `pulseaudio` node lists the `sidecar:` argv of the
+context it runs (`pipewire`) or the private pulse server behind it
+(`pulseaudio`), plus a `(context: …)` line naming the engine, the instance
+and the grant set — where the WirePlumber policy drop-in that scopes it is
+not installed, the header itself carries `(policy drop-in not found:
+microphone reachable)` — none of which is in the argv, and `--dry-run`
+prints the sandbox's argv alone. `--explain --proxy` prints the D-Bus
+proxy's own argv and `--explain --wl-proxy` the Wayland proxy's.
+
+    bubbler run media --explain
+
+      pipewire    config.kdl:3  3 arguments (policy drop-in not found: microphone reachable)
+        --ro-bind /run/user/1000/bubbler/media/pipewire-0 /run/user/1000/pipewire-0
+        sidecar: /usr/bin/pw-container -P {"pipewire.sec.engine":"org.bubbler","pipewire.sec.app-id":"media","pipewire.sec.instance-id":"<run id>","pipewire.access":"restricted","bubbler.audio":"playback,microphone"} -- /run/bubbler-pw-hold
+        (context: org.bubbler media playback,microphone)
+
+      pulseaudio  config.kdl:6  6 arguments
+        --ro-bind /run/user/1000/bubbler/media/pulse-native /run/user/1000/pulse/native
+        --setenv PULSE_SERVER unix:/run/user/1000/pulse/native
+        sidecar: /usr/bin/pipewire -c pipewire-pulse.conf
+        (pulse: a private server on this run's context, module loading refused)
+
+`pipewire { microphone }` is what put `microphone` in `bubbler.audio` above;
+a bare `pulseaudio` in the same config still resolves to the merged set,
+since the grant is per instance and not per node. The `(policy drop-in not
+found: …)` suffix names the same fact once, on the first audio node's
+header, rather than on every node that grants audio — this host has no
+drop-in installed, which is also why the second group carries no line of
+its own beyond the sidecar and the socket.
 
 Every generated descriptor and file says what is behind it: the size of the
 seccomp filter and the architectures it carries, the size of a generated file
@@ -444,8 +470,11 @@ file order does not affect the generated argv.
     dri                              # GPU: the render nodes, NVIDIA nodes,
                                      #   each GPU's own sysfs
     dri kms=#true                    #   also the card nodes and their sysfs
-    pipewire                         # $XDG_RUNTIME_DIR/pipewire-0
-    pulseaudio                       # $XDG_RUNTIME_DIR/pulse/native, sets PULSE_SERVER
+    pipewire                         # $XDG_RUNTIME_DIR/pipewire-0, playback only
+    pipewire { microphone }          #   also every microphone and line-in
+    pulseaudio                       # $XDG_RUNTIME_DIR/pulse/native, sets
+                                     #   PULSE_SERVER; playback only
+    pulseaudio { microphone }        #   also every microphone and line-in
     gamepad                          # /dev/input, and the sysfs that names it
                                      #   hidraw=#true is the `hidraw` grant,
                                      #   uinput=#true adds /dev/uinput
@@ -563,8 +592,15 @@ that pins the socket, turns D-Bus support off and refuses `load-module`, which
 is how a pulse client would otherwise reach past the session manager's policy;
 your own `pipewire-pulse.conf.d` fragments are not copied, since a
 `server.address` in one of them would decide which socket the run serves.
-Either grant is capture as well as playback, and what scopes it is the
-policy drop-in rather than the socket. An ALSA client reaches the same
+Bare, either grant is playback only. `microphone` on either node —
+`pipewire { microphone }`, `pulseaudio { microphone }` — adds capture: the
+grant is per instance, ORed into one set across both nodes and every
+layer, so a `microphone` on one widens the other in the same config too.
+What scopes a bare grant to playback is the WirePlumber policy drop-in
+installed on the host, not the socket — see "Installing" below — and
+without it a sandbox reaches every node the config did not ask for;
+`bubbler lint` and a run's own warning name the gap as
+`audio-policy-missing`. An ALSA client reaches the same
 daemon through `/etc/alsa`, which the baseline binds: those files are where
 pipewire-alsa defines the `default` PCM, and without them alsa-lib falls back
 to a hardware card whose `/dev/snd` nodes no sandbox has.
@@ -2254,7 +2290,7 @@ ask for the session's display with `x11 "host"`. `~/name` below is a
     spotify       wayland dri pulseaudio network
     steam         wayland x11 "host" dri pulseaudio network gamepad
     thunderbird   wayland network, ~/Downloads rw
-    vesktop       wayland dri pulseaudio network
+    vesktop       wayland dri pulseaudio { microphone } network
 
 Sound is `pulseaudio` in every profile that has any, and `pipewire` only in
 `mpv`. That is not a preference: `pulseaudio` binds
@@ -2263,16 +2299,26 @@ path a libpulse client takes, and most of the applications here are measured
 libpulse clients: `libpulse` is in the Arch dependencies of `firefox` and
 `chromium`, and `/opt/spotify/spotify`, `/opt/spotify/libcef.so` and
 `/usr/lib/electron40/electron` each carry `libpulse.so.0` for the dlopen. On a
-PipeWire host that socket is the one pipewire-pulse serves, so nothing is lost
-by taking it. `steam` and `lutris` are the unmeasured half of that claim — the
-client fetches its own runtime on first run, and Wine is not installed on the
-machine this was written on — so both headers say so and name the fix: if a
-game is silent, add `pipewire` beside the `pulseaudio`. `pipewire`
-binds `pipewire-0`, the native socket, which is what a client speaking the
-PipeWire protocol itself uses (mpv) and what the portal hands a screen or
-camera stream over — which is why the profiles that could share a screen list
-`pipewire` as an opt-in beside their `portals`. Either socket carries capture
-as well as playback, so either is the microphone.
+PipeWire host, 0.23 makes that socket a private `pipewire-pulse` of this run's
+own rather than the session's, so nothing about the choice changes. `steam`
+and `lutris` are the unmeasured half of that claim — the client fetches its
+own runtime on first run, and Wine is not installed on the machine this was
+written on — so both headers say so and name the fix: if a game is silent,
+add `pipewire` beside the `pulseaudio`. `pipewire` binds `pipewire-0`, the
+socket of this run's own PipeWire security context, which is what a client
+speaking the PipeWire protocol itself uses (mpv) and what the portal hands a
+screen or camera stream over — which is why the profiles that could share a
+screen list `pipewire` as an opt-in beside their `portals`.
+
+Bare, either grant is playback only, once the WirePlumber policy drop-in is
+installed — every header says so, and names `audio-policy-missing` as the
+lint warning where the drop-in is not. Only `vesktop` grants the microphone:
+a call is what the app is for, so it carries `pulseaudio { microphone }`
+rather than the bare node every other audio profile gets. `chromium`,
+`firefox` and `steam` each carry a commented-out `pulseaudio { microphone }`
+line naming the use it is for — a web meeting's `getUserMedia`, in-game
+voice chat — without granting it; `lutris`, `spotify` and `mpv` need no
+microphone and their headers say so.
 
 Five carry a `desktop` node, because their application's entry is not named
 after its command: `alacritty` (`Alacritty.desktop`), `keepassxc`, `lutris`
@@ -2320,11 +2366,13 @@ id. Installing the native messaging manifest is still yours to do;
 "KeePassXC-Browser, both sides under bubbler" under "app-runtime" is the whole
 procedure.
 
-`spotify` and `vesktop` end up the same four nodes — display, GPU, the
-PulseAudio socket, a network — because that is what playing and calling take.
-The media keys (`mpris name="spotify"`, the exact name and not a prefix: the
-player name is `org.mpris.MediaPlayer2.spotify` while the app id is
-`com.spotify.Client`, and a `*` would own every player on the bus), the tray
+`spotify` and `vesktop` end up the same four kinds of node — display, GPU,
+audio, a network — because that is what playing and calling take; only
+`vesktop`'s `pulseaudio` carries `{ microphone }`, since a call needs one and
+playing music does not. The media keys (`mpris name="spotify"`, the exact
+name and not a prefix: the player name is `org.mpris.MediaPlayer2.spotify`
+while the app id is `com.spotify.Client`, and a `*` would own every player
+on the bus), the tray
 icon, the notifications, the screen sharing (`pipewire` plus `portals`) and
 Vesktop's `~/Downloads` are opt-ins in their headers. `kitty` is two nodes and
 needs no grant for the pseudoterminals it makes: `--dev` gives each sandbox a
@@ -4137,6 +4185,7 @@ A `pipewire` or `pulseaudio` grant needs the WirePlumber policy drop-in
 that scopes it installed, and WirePlumber restarted:
 
     bubbler audio-policy --print > /usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf
+    systemctl --user restart wireplumber
 
 (or `/etc/wireplumber/wireplumber.conf.d/`, or the per-user
 `$XDG_CONFIG_HOME/wireplumber/wireplumber.conf.d/` — the three places

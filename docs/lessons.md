@@ -51,3 +51,15 @@ grant binds a tree and a promise says one fact stays out of it, grep the
 bound tree for that fact from inside a live sandbox before the claim goes
 in a doc — the per-task reviews and the verifier both passed the two
 files they were told about.
+
+## A sidecar that reports readiness must be able to take a signal before it reports
+
+`bubbler-pw-hold` (0.23's PipeWire context holder) wrote the report line
+that tells bubbler the sidecar is up, and closed the descriptor, before it
+registered its own SIGTERM handler. A signal landing in that window found
+the default disposition and killed the holder outright, leaving
+`pw-container` waiting inside `system()` for its child until the
+launcher's own stop deadline turned into a SIGKILL — 10 of 25 runs of the
+holder's own tests failed on it. Register the signal handlers before the
+line that says "ready", never after, in every sidecar built on this
+report-then-wait shape.

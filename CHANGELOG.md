@@ -1,5 +1,83 @@
 # Changelog
 
+## 0.23.0 (unreleased)
+
+### Added
+
+- A PipeWire security context of its own for every instance: a
+  `pw-container` sidecar, shaped like the D-Bus proxy's, creates it and a
+  `bubbler-pw-hold` holder mode hands its socket back and keeps it alive;
+  every client that reaches PipeWire through a `pipewire` or `pulseaudio`
+  grant now carries `pipewire.sec.engine`, `pipewire.sec.app-id`,
+  `pipewire.sec.instance-id`, `pipewire.access` and `bubbler.audio` on the
+  daemon's side, instead of arriving as an untagged client of the session.
+- `pipewire` and `pulseaudio` take an optional `microphone` child
+  (`pipewire { microphone }`, `pulseaudio { microphone }`); the grant is
+  per instance, ORed across whichever of the two nodes and layers carry
+  it, and bare is playback only. `bubbler lint` notes it as
+  `pipewire-microphone`.
+- A WirePlumber policy drop-in, `contrib/wireplumber/50-bubbler.conf`: two
+  permission managers matched by `bubbler.audio`, denying a playback-only
+  context every `Audio/Source` node — and the link permission that would
+  let a capture stream reach one anyway — while leaving sinks and the
+  client's own objects read+execute. `bubbler audio-policy --print` writes
+  the embedded copy to stdout, for installing without a checkout of the
+  source tree; where it is not installed, a run warns on stderr,
+  `--explain` marks the group, and `bubbler lint` warns
+  `audio-policy-missing`, all three naming the directories WirePlumber
+  loads it from.
+- A hermetic PipeWire/WirePlumber test bed
+  (`cargo test -p bubbler-core --test real_pipewire`): a private daemon
+  pair with a null sink and a null source, loading the drop-in, measuring
+  the policy without touching the session's own audio.
+
+### Changed
+
+- `pulseaudio` no longer binds the session's own PulseAudio socket. It
+  starts a private `pipewire-pulse` of this run's own under the same
+  security context, configured from a copy of the host's effective
+  `pipewire-pulse.conf` plus a fragment of bubbler's own that pins the
+  socket, turns D-Bus support off and refuses `load-module` — the gap a
+  WirePlumber policy alone cannot close, since a loaded module runs inside
+  the server rather than through anything a client-side policy governs.
+- Both audio sidecars — the context's `pw-container` and the private
+  `pipewire-pulse` — run in their own minimal bwrap: read-only root, no
+  home, no network, the host's `pipewire-0` and the instance's runtime
+  directory, the default seccomp filter, dying with bubbler.
+- `lint-allow "pulseaudio-module-loading"` in an existing config is now a
+  parse error, the same as any other id `lint` no longer recognises — drop
+  the line.
+
+### Removed
+
+- `pulseaudio-module-loading`: the private pulse server every
+  `pulseaudio` grant now runs refuses module loading itself, so the
+  host-daemon check it used to need is moot.
+
+### Profiles
+
+- `vesktop`: grants `pulseaudio { microphone }` instead of bare
+  `pulseaudio` — voice chat is what the app is for, and 0.23 makes
+  capture an explicit grant rather than something every playback socket
+  carried along.
+- `chromium`, `firefox`, `steam`: headers say playback-only is now the
+  default and give the exact `pulseaudio { microphone }` line to add for
+  a web meeting's microphone or in-game voice chat.
+- `lutris`, `spotify`, `mpv`: headers say what playback-only now means
+  for them (no microphone, no other app's audio, no module loading on
+  the private server behind a `pulseaudio` grant).
+
+### Notes
+
+- Install the drop-in and restart WirePlumber:
+  `bubbler audio-policy --print > <path>` into one of the three
+  `wireplumber.conf.d` directories the warning and the lint name, then
+  `systemctl --user restart wireplumber`. Without it a `pipewire`/
+  `pulseaudio` grant reaches every PipeWire node instead of what it asks
+  for — measured on WirePlumber 0.5.15, whose default for an unmatched
+  restricted client is `Perm.ALL`, not the `Perm.RX` its own script text
+  documents.
+
 ## 0.22.0
 
 ### Added

@@ -40,23 +40,28 @@ Wayland-first; only the two gaming profiles grant `x11`, and both take the
 | `spotify` | wayland dri pulseaudio network |
 | `steam` | wayland `x11 "host"` dri pulseaudio network gamepad |
 | `thunderbird` | wayland network, ~/Downloads rw |
-| `vesktop` | wayland dri pulseaudio network |
+| `vesktop` | wayland dri pulseaudio { microphone } network |
 
 `agent`, `claude-code` and `claude-code-strict` are the three that run a coding
 agent rather than a desktop application: how each is started from a project
 directory, what the strict one filters and what the sandbox around one does not
 protect, is [AI Agents](AI-Agents.md).
 
-**Sound is `pulseaudio` almost everywhere.** Firefox and Chromium list
-`libpulse` in their Arch dependencies, and Spotify, Electron applications and
-CEF ones open `libpulse.so.0` themselves; that grant binds
-`$XDG_RUNTIME_DIR/pulse/native`, which PipeWire's pulse server holds on a
-PipeWire host. `pipewire` binds `pipewire-0`, the native socket — what a client
-that speaks PipeWire itself takes (`mpv`), and what the portal hands a screen
-or camera stream over. Either socket carries capture as well as playback.
-`steam` and `lutris` are the unmeasured half: the client downloads its own
-runtime on first run and Wine was not installed when this was written, so both
-headers say so — if a game is silent, add `pipewire` beside the `pulseaudio`.
+**Sound is `pulseaudio` almost everywhere, playback only.** Firefox and
+Chromium list `libpulse` in their Arch dependencies, and Spotify, Electron
+applications and CEF ones open `libpulse.so.0` themselves; that grant
+starts a private `pipewire-pulse` of this run's own and binds its socket
+at `$XDG_RUNTIME_DIR/pulse/native`. `pipewire` binds `pipewire-0`, this
+run's own PipeWire security context — what a client that speaks PipeWire
+itself takes (`mpv`), and what the portal hands a screen or camera stream
+over. Bare, either grant is playback only, once the WirePlumber policy
+drop-in is installed (see [Devices](Devices.md)); only `vesktop` carries
+`{ microphone }` — a call is what the app is for — and `chromium`,
+`firefox` and `steam` each carry a commented-out `pulseaudio { microphone }`
+line for a web meeting or in-game voice. `steam` and `lutris` are the
+unmeasured half: the client downloads its own runtime on first run and
+Wine was not installed when this was written, so both headers say so — if
+a game is silent, add `pipewire` beside the `pulseaudio`.
 
 Notes worth knowing:
 

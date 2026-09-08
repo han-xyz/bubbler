@@ -54,7 +54,8 @@ under a share is passed under the name it has inside:
     // bubbler profile: firefox
     wayland                          // security-context socket, proxied; "host" for the session's
     dri
-    pulseaudio                       // pulse/native; `pipewire` binds the native socket instead
+    pulseaudio                       // pulse/native, playback only; `pipewire` binds the
+                                     //   native socket instead, `{ microphone }` adds capture
     network                          // own namespace via pasta; "host" for the host's
                                      //   `outbound "deny"` + `allow-out`/`allow-host`
                                      //   filters egress by address or by name
@@ -128,8 +129,10 @@ A boundary between your account and one application — not against root, not
 against your other processes, and `x11 "host"` is no boundary at all (a bare
 `x11` runs an X server of the sandbox's own instead). Grants are as wide as
 their names suggest and sometimes wider (`gamepad` is every input device your
-user can open; `pulseaudio` and `pipewire` are each the microphone as well as
-playback, with no portal in front); the wiki's
+user can open; `pulseaudio` and `pipewire` are playback only by name, but
+reach every PipeWire node — microphone included — unless the host has the
+WirePlumber policy drop-in installed, `bubbler audio-policy --print`); the
+wiki's
 [Devices](docs/wiki/Devices.md) and [Security](docs/wiki/Security.md) pages and
 the threat model say exactly how wide. Known gaps are listed under
 [Security](docs/wiki/Security.md#known-gaps).

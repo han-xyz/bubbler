@@ -24,8 +24,10 @@ network {
 }
 dri                              // GPU: the render nodes, NVIDIA nodes, their sysfs
 dri kms=#true                    // also the card nodes and their sysfs (KMS)
-pipewire                         // $XDG_RUNTIME_DIR/pipewire-0 (playback AND capture)
-pulseaudio                       // pulse/native, sets PULSE_SERVER
+pipewire                         // $XDG_RUNTIME_DIR/pipewire-0, playback only
+pipewire { microphone }          //   also every microphone and line-in
+pulseaudio                       // pulse/native, sets PULSE_SERVER, playback only
+pulseaudio { microphone }        //   also every microphone and line-in
 gamepad                          // /dev/input rw + sysfs; hidraw=#true uinput=#true
 hidraw                           // every /dev/hidraw* node
 camera                           // via portal; nodes=#true also binds /dev/video*
@@ -123,7 +125,7 @@ grant and are always written back as a block.
 | `network { outbound "deny" … }` | egress narrowed to the `allow-out` addresses and the `allow-host` names | a name is served by a CONNECT proxy of bubbler's on `127.0.0.1:3128` inside, which is also the only thing that resolves: the application gets no DNS, and one that ignores `HTTPS_PROXY` fails at the lookup. Needs a delegated cgroup2 subtree |
 | `dri` | every GPU's render node rw, NVIDIA nodes, each GPU's own `/sys/devices` directory with its `drm/card*` masked | the nodes are rw (bwrap has no read-only device bind); the NVIDIA nodes have no render/primary split; on the proprietary NVIDIA driver the GPU's primary node comes with the bare grant (connectors, their modes, the monitors' EDID) — lint notes `dri-nvidia-primary` |
 | `dri kms=#true` | the primary (`card*`) nodes too, and their sysfs unmasked | DRM master on a VT switch, the monitors' EDID, framebuffer geometry, other clients' flink names; lint notes `dri-kms` |
-| `pipewire`, `pulseaudio` | session audio socket | microphone too, no portal |
+| `pipewire`, `pulseaudio` | this instance's own PipeWire security context; bare is playback only | needs the WirePlumber policy drop-in installed to actually narrow the reach — see [Devices](Devices.md); `{ microphone }` adds every source, no portal |
 | `gamepad` | `/dev/input` rw, `/sys/devices`, `/run/udev` | every input node your user can open; keyboard if a group lets you |
 | `hidraw` | every `/dev/hidraw*` at launch | security keys, wallets; list frozen at launch |
 | `camera` | portal camera; `nodes=#true` adds `/dev/video*` | needs `portals`; untested on real hardware |

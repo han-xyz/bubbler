@@ -763,6 +763,107 @@ bus](manual.md#the-system-bus) ·
 `real_dbus_portals_answer_the_flatpak_spawn_a_loader_looks_for`,
 `the_flatpak_spawn_shim_is_an_overlay_the_remount_takes_back`
 
+### Audio
+
+**Defends:** a `pipewire` or `pulseaudio` grant no longer reaches the
+session's own socket. Each instance gets a PipeWire security context of
+its own, created by a `pw-container` sidecar confined the way the D-Bus
+proxy is — its own bwrap, read-only root, no home, no network, the
+host's `pipewire-0` bound read-only and this run's own directory as its
+`/tmp`, nothing else, dying with bubbler — and every client that arrives
+through it is stamped on the
+daemon's side with five properties a policy can match on:
+`pipewire.sec.engine = "org.bubbler"`, `pipewire.sec.app-id = <instance>`,
+`pipewire.sec.instance-id = <run id>`, `pipewire.access = "restricted"`
+(which the daemon turns into `pipewire.access.effective = "restricted"`
+on the client object) and `bubbler.audio = "playback"` or
+`"playback,microphone"` — the one property the grant set collapses into,
+`microphone` ORed across `pipewire` and `pulseaudio` and across every
+layer, so a `pulseaudio { microphone }` in one layer widens a bare
+`pipewire` elsewhere in the same config.
+
+Where the WirePlumber policy drop-in
+(`contrib/wireplumber/50-bubbler.conf`) is installed, it matches that
+engine into one of two permission managers — `bubbler-playback` for a
+bare grant, `bubbler-playback-microphone` for one carrying `microphone`
+— each read+execute on the graph and the client's own objects, nothing
+writable, and, for the playback manager alone, no permission at all on
+every `Audio/Source` node, every other client's stream and the metadata
+objects. Withholding all permissions on a source withholds more than its
+visibility: `PW_PERM_L` is what lets a link be made to a node the client
+cannot see, and the playback manager grants it nowhere, so a capture
+stream a playback-only client opens — linked by the session manager on
+the client's behalf, not by the client itself — gets no link to a source
+it was never given the permission to see. An engine match with no
+recognised `bubbler.audio` value, or none at all, lands in the base rule
+ahead of the grant-specific one rather than falling through to
+WirePlumber's own default, so a typo in the property still narrows
+rather than widens.
+
+**Does not defend:** absence. Measured on this host (WirePlumber 0.5.15):
+a `restricted` client with no matching `access.rules` entry does not get
+the `Perm.RX` `find-default-access.lua`'s own text documents — two bugs,
+one in that script and one in `find-config-access.lua`, stack in the
+client's favour and hand it `Perm.ALL` instead: read, write, execute and
+metadata on every node, capture included, with nothing in the sandbox
+able to tell the two cases apart. A host with no WirePlumber, an older
+one, or no drop-in installed therefore gives every `pipewire`/
+`pulseaudio` grant the session's whole reach, silently. bubbler cannot
+close that gap from inside a sandbox; what it does instead is say so
+loudly, every time: a `bubbler: warning:` line on every real run naming
+the three install directories, an `--explain` suffix on the group, and a
+host-conditional `audio-policy-missing` lint warning naming the same
+three paths and the `bubbler audio-policy --print` fix.
+
+The private pulse server closes a gap the context alone cannot: a pulse
+client can `LOAD_MODULE` a server into loading `module-native-protocol-tcp`
+or a tunnel module that would then run outside the sandbox's network
+namespace and its egress proxy entirely — a policy on the context narrows
+what a client can *reach*, not what a server it commands loads into
+itself. `pulseaudio`'s own private `pipewire-pulse`, started under that
+same context, refuses this by configuration rather than by policy:
+`pulse.allow-module-loading = false` in the fragment bubbler writes
+beside its copy of the host's `pipewire-pulse.conf`, so `pactl
+load-module` fails `Access denied` on every `pulseaudio` grant whether or
+not the WirePlumber drop-in is installed — the two are independent
+layers, one per protocol. That server's own protocol parser is confined
+the same way the context sidecar is: its own minimal bwrap, read-only
+root, no home, no network, dying with bubbler.
+
+What is left, with the drop-in installed: the sandbox still sees the
+sinks and its own client objects — an application learns what output
+devices the host has, which is what playing sound needs — and the reach
+is per *instance*, not per node: `microphone` on either `pipewire` or
+`pulseaudio` widens the other grant in the same config too, since the
+merged set is what the one `bubbler.audio` property carries. The host's
+`pipewire-0-manager` socket, which would let a client change permissions
+or unload modules outright, is never bound into any sandbox, drop-in or
+not. `camera` is unchanged by any of this: it reaches a device through
+the portal's own fd crossing and permission store, never through a
+`pipewire` or `pulseaudio` grant.
+
+[Config (KDL)](manual.md#config-kdl), [Installing](manual.md#installing),
+[Linting](manual.md#linting) ·
+`the_context_properties_are_the_five_keys_in_order`,
+`pipewire_binds_this_instances_context_socket_and_not_the_sessions`,
+`pulseaudio_binds_this_instances_private_server_and_not_the_sessions`,
+`pw_context_argv_runs_pw_container_in_its_own_sandbox`,
+`pw_pulse_argv_runs_the_pulse_server_in_its_own_sandbox`,
+`real_bwrap_pipewire_context_tags_the_client`,
+`real_bwrap_pulseaudio_serves_a_private_server`,
+`a_playback_context_sees_no_source_no_other_stream_and_no_metadata`,
+`a_playback_capture_stream_gets_no_link`,
+`a_playback_output_stream_links_to_the_sink`,
+`a_microphone_context_captures_from_the_null_source`,
+`a_bubbler_context_with_no_grant_the_drop_in_knows_falls_back_to_playback`,
+`a_context_that_is_not_bubblers_keeps_the_reach_it_had`,
+`audio_policy_missing_fires_without_the_drop_in_and_names_where_to_put_it`,
+`audio_policy_warns_before_a_real_run_without_the_drop_in`,
+`explain_says_the_audio_policy_drop_in_is_missing`,
+`a_run_without_pw_container_starts_no_context_sidecar`,
+`a_run_without_the_pulse_protocol_module_starts_no_server`,
+`a_bare_camera_binds_nothing_even_where_the_host_has_a_camera`
+
 ### Accessibility bus
 
 **Defends:** the accessibility bus is proxied, never bound. It is a peer

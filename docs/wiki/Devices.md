@@ -52,9 +52,28 @@ profile's `env` decision. Compute needs `etc-share "OpenCL"` / `etc-share
 
 ## pipewire, pulseaudio — audio
 
-Hand over the session's audio socket directly: playback **and capture**,
-microphone included, no portal. ALSA clients reach the same server through
-`/etc/alsa` (baseline). `/dev/snd` is never bound.
+```kdl
+pipewire
+pipewire { microphone }
+pulseaudio
+pulseaudio { microphone }
+```
+
+Each hands the sandbox a socket of this run's own PipeWire security
+context — never the session's — created by a `pw-container` sidecar;
+`pulseaudio` starts a private `pipewire-pulse` under that same context
+instead of binding the session's PulseAudio socket. Bare is playback
+only; `microphone` ORs into one per-instance grant across both nodes and
+every layer, adding every `Audio/Source` the host has — every microphone
+and line-in.
+
+What actually narrows the reach is the WirePlumber policy drop-in, not
+the socket: without it installed (`bubbler audio-policy --print`, see
+[Commands](Commands.md)) a sandbox reaches every PipeWire node regardless
+of what the config asks for, and `bubbler lint`/a run's own warning say
+so (`audio-policy-missing`). The private pulse server refuses
+`LOAD_MODULE` on its own, drop-in or not. ALSA clients reach the same
+daemon through `/etc/alsa` (baseline). `/dev/snd` is never bound.
 
 ## gamepad
 
