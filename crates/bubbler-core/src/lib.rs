@@ -23,6 +23,7 @@ pub mod kdl_out;
 pub mod launcher;
 pub mod lint;
 pub mod network;
+pub mod pipewire;
 pub mod profile;
 pub mod run_log;
 pub mod safe_text;

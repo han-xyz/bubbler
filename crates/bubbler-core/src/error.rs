@@ -330,6 +330,13 @@ pub enum LaunchError {
     /// would have started without the bus socket it expects.
     #[error("the D-Bus proxy did not become ready")]
     ProxyNotReady,
+    /// The sidecar that creates this run's PipeWire security context did
+    /// not report the socket it made. The run stops here: a sandbox
+    /// started anyway would either have no audio socket at all or, if
+    /// one were bound from the session instead, the untagged client the
+    /// context exists to prevent.
+    #[error("pw-container did not create this instance's PipeWire security context: {0}")]
+    PwContext(String),
     /// The pasta sidecar could not be started or did not report that it
     /// had configured the sandbox's network namespace. The sandbox is
     /// stopped rather than let go: an isolated `network` that reached

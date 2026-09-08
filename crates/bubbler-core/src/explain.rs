@@ -11,12 +11,15 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::bwrap::{Explained, Origin};
 use crate::cgroup;
-use crate::config::{InstanceConfig, Lines, SeccompConfig, Service, WaylandMode, X11Mode};
+use crate::config::{
+    AudioSet, InstanceConfig, Lines, SeccompConfig, Service, WaylandMode, X11Mode,
+};
 use crate::dbus;
 use crate::error::ConfigError;
 use crate::json;
 use crate::kdl_out;
 use crate::network::{self, NetworkConfig};
+use crate::pipewire;
 use crate::wayland;
 
 /// Arguments of the baseline listed before the rest is summed up. The
@@ -458,6 +461,39 @@ fn wl_sidecar_line(plan: &wayland::ProxyPlan) -> String {
     )
 }
 
+/// Where the first of an instance's audio grants sits, which is the
+/// group the one context they share is described under.
+fn audio_node(services: &[Service]) -> Option<usize> {
+    services
+        .iter()
+        .position(|s| matches!(s, Service::Pipewire { .. } | Service::Pulseaudio { .. }))
+}
+
+/// The `pw-container` an audio grant is served through, and what the
+/// context it creates says about the sandbox. Neither is an argument of
+/// the sandbox's own argv: the one bind names a socket, and everything
+/// that makes it this instance's socket is on the other side of it.
+///
+/// The run id is only known once there is a run, so it is named here
+/// rather than filled in, the way the sidecar descriptors of the other
+/// grants are.
+fn pw_context_lines(instance: &str, audio: AudioSet) -> [String; 2] {
+    let properties = pipewire::properties(instance, pipewire::RUN_ID_SHOWN, audio);
+    let mut sidecar = String::from("    sidecar:");
+    for arg in pipewire::command(&properties) {
+        sidecar.push(' ');
+        sidecar.push_str(&arg.to_string_lossy());
+    }
+    [
+        sidecar,
+        format!(
+            "    (context: {} {instance} {})",
+            pipewire::ENGINE,
+            pipewire::grant(audio)
+        ),
+    ]
+}
+
 /// The D-Bus proxy rules of the node at `index`, in the order the proxy
 /// is given them.
 fn rules_of(index: usize, rules: &[(usize, String)]) -> Vec<String> {
@@ -591,6 +627,20 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
                             dbus::flatpak_instance_id(view.instance)
                         ));
                         out.extend(view.wl_proxy.map(wl_sidecar_line));
+                    }
+                    // One context serves both audio nodes, so it is
+                    // described under the first of them; a second group
+                    // saying the same would read as a second sidecar.
+                    Some(Service::Pipewire { .. } | Service::Pulseaudio { .. })
+                        if audio_node(&view.cfg.services) == Some(i) =>
+                    {
+                        out.extend(
+                            view.cfg
+                                .audio()
+                                .map(|audio| pw_context_lines(view.instance, audio))
+                                .into_iter()
+                                .flatten(),
+                        );
                     }
                     Some(Service::Wayland(WaylandMode::Host)) => {
                         out.push("    raw socket: wayland \"host\"".to_owned());
@@ -1005,6 +1055,65 @@ bwrap
             // other half of what the one bind does not show.
             let at = |needle: &str| out.iter().position(|l| l.starts_with(needle));
             assert!(at("    security-context:") < at("    sidecar:"), "{out:#?}");
+        }
+    }
+
+    /// One bind shows a path and nothing else: which daemon is behind
+    /// it, and what the sandbox may do there, are the context's — and
+    /// the context is a process, not an argument.
+    #[test]
+    fn an_audio_grant_names_the_context_it_is_served_through() {
+        for (kdl, grant) in [
+            ("pipewire\ncommand \"true\"", "playback"),
+            (
+                "pulseaudio {\n    microphone\n}\ncommand \"true\"",
+                "playback,microphone",
+            ),
+        ] {
+            let cfg = cfg(kdl);
+            let lines = Lines::default();
+            let out = render(
+                &[item(
+                    Origin::Service(0),
+                    &[
+                        "--ro-bind",
+                        "/run/user/1000/bubbler/t/pw/pipewire-0",
+                        "/run/user/1000/pipewire-0",
+                    ],
+                    None,
+                )],
+                &View {
+                    title: "bwrap",
+                    instance: "t",
+                    cfg: &cfg,
+                    source: Source {
+                        file: "config.kdl",
+                        lines: &lines,
+                    },
+                    rules: &[],
+                    wl_proxy: None,
+                    net_proxy_log: false,
+                    proxy: false,
+                    full: false,
+                    bwrap: crate::version::Version::Known(0, 12, 0),
+                },
+            )
+            .unwrap();
+            assert!(
+                out.contains(&format!("    (context: org.bubbler t {grant})")),
+                "{out:#?}"
+            );
+            assert!(
+                out.contains(&format!(
+                    "    sidecar: /usr/bin/pw-container -P \
+                     {{\"pipewire.sec.engine\":\"org.bubbler\",\
+                     \"pipewire.sec.app-id\":\"t\",\
+                     \"pipewire.sec.instance-id\":\"<run id>\",\
+                     \"pipewire.access\":\"restricted\",\
+                     \"bubbler.audio\":\"{grant}\"}} -- /run/bubbler-pw-hold"
+                )),
+                "{out:#?}"
+            );
         }
     }
 

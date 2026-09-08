@@ -43,7 +43,7 @@ use crate::host::{Host, RealHost};
 use crate::instance::Instance;
 use crate::tty::{self, Pty, RawGuard, RelayEnd, StdioTarget, TtyMode};
 use crate::wayland::{ProxyPlan, WaylandError};
-use crate::{cgroup, dbus, exec, init_bin, network, seccomp, service, version, wayland};
+use crate::{cgroup, dbus, exec, init_bin, network, pipewire, seccomp, service, version, wayland};
 
 /// How often a running sandbox is checked for having exited.
 const POLL: Duration = Duration::from_millis(100);
@@ -62,6 +62,19 @@ const PROXY_STOP: Duration = Duration::from_secs(1);
 /// How long the Wayland proxy may take to leave after SIGTERM before it
 /// is killed.
 const WL_PROXY_STOP: Duration = Duration::from_secs(5);
+
+/// How long the audio sidecar has to report the socket of the security
+/// context it created.
+const PW_READY: Duration = Duration::from_secs(5);
+
+/// How long that sidecar may take to leave after SIGTERM before it is
+/// killed.
+const PW_STOP: Duration = Duration::from_secs(5);
+
+/// The longest report line the audio sidecar is read for. What the
+/// holder writes is a constant of bubbler's; anything longer is not the
+/// holder answering.
+const PW_REPORT_MAX: usize = 4096;
 
 /// How long pasta has to report that it has configured the sandbox's
 /// network namespace.
@@ -637,6 +650,43 @@ fn apply_seccomp(
     Ok(())
 }
 
+/// Complete bwrap argv (without the program name) for the sidecar that
+/// creates one instance's PipeWire security context. `alloc` keeps the
+/// read end of the pipe the holder inside reports the socket's path on.
+pub fn pw_context_argv(
+    env: &Env,
+    ctx: &pipewire::Context<'_>,
+    host: &dyn Host,
+    alloc: &mut dyn FdAllocator,
+) -> Result<Vec<OsString>, LaunchError> {
+    let report = alloc.ready_pipe().map_err(LaunchError::Data)?;
+    let init = init_bin::locate(env, host)?;
+    let mut args = BwrapArgs::pw_context_baseline(
+        &pipewire::host_socket(&env.runtime_dir),
+        &pipewire::dir(ctx.instance_runtime),
+        host,
+    );
+    // The sidecar has no `seccomp` node of its own: an instance may relax
+    // its own filter, never the one around the process that holds its
+    // security context open.
+    args.tag(Origin::Seccomp);
+    if let Some(program) = seccomp::compile(&seccomp::RuleSet::default_set(), env.seccomp_log)? {
+        args.add_seccomp(program.bytes, program.arches);
+    }
+    args.tag(Origin::Command);
+    // The supervisor binary a second time, under the name that selects
+    // its holder mode: `pw-container` runs one word, and the basename of
+    // that word is the whole of what chooses the mode.
+    args.ro_bind(&init, Path::new(pipewire::HOLDER_INSIDE));
+    // `pw-container` finds the session's daemon under this, and the
+    // holder finds the descriptor to report on under the other. Nothing
+    // else of the environment survives the baseline's `--clearenv`.
+    args.setenv(OsStr::new("XDG_RUNTIME_DIR"), env.runtime_dir.as_os_str());
+    args.setenv(OsStr::new(pipewire::REPORT_FD), &report);
+    let properties = pipewire::properties(ctx.instance, ctx.run_id, ctx.audio);
+    args.finish_plain(&pipewire::command(&properties), alloc)
+}
+
 /// Complete bwrap argv (without the program name) for the D-Bus proxy
 /// sidecar of one instance. `buses` holds the host socket of each bus
 /// the plan grants, already type-checked; `alloc` keeps the read end of
@@ -1193,6 +1243,225 @@ fn bind_context(dir: &Path, instance: &str) -> Result<(OwnedFd, FileGuard), Laun
         &dbus::flatpak_instance_id(instance),
     )?;
     Ok((close_write, guard))
+}
+
+/// A run's PipeWire security context: the sidecar that created it and
+/// the directory its socket lives in.
+///
+/// `pw-container` tears the context down when its program exits, so
+/// dropping this handle is what ends it, and it must outlive the sandbox
+/// that connects through the socket.
+#[derive(Debug)]
+pub struct PwHandle {
+    /// The sidecar sandbox: bwrap, `pw-container` in it, the holder in
+    /// that.
+    child: Child,
+    /// Holds both ends of the pipe the holder reported on; clearing it
+    /// is what closes them.
+    alloc: RealAlloc,
+    /// The instance's context directory, removed once the sidecar has
+    /// exited. `pw-container` unlinks the name it chose, which the
+    /// holder renamed away, so what is left there is bubbler's.
+    dir: PathBuf,
+}
+
+impl Drop for PwHandle {
+    /// Stop the sidecar: SIGTERM, then SIGKILL if it is still there.
+    ///
+    /// The signal goes to bwrap and not to `pw-container`: the sidecar
+    /// runs with `--new-session`, so it is in no process group of
+    /// bubbler's, and `pw-container` ignores SIGTERM until its own
+    /// program has exited (measured on 1.6.8). What ends it is bwrap
+    /// dying, which takes the pid namespace `pw-container` is pid 1 of
+    /// with it.
+    fn drop(&mut self) {
+        if still_running(&mut self.child) {
+            if let Some(pid) = i32::try_from(self.child.id()).ok().and_then(Pid::from_raw) {
+                let _ = kill_process(pid, Signal::TERM);
+            }
+            let deadline = Instant::now() + PW_STOP;
+            loop {
+                match self.child.try_wait() {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) => {}
+                }
+                if Instant::now() >= deadline {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    break;
+                }
+                std::thread::sleep(POLL);
+            }
+        }
+        self.alloc.fds.clear();
+        self.alloc.ready_read.take();
+        // The directory is bubbler's own and holds nothing but the
+        // context socket; the sandbox that bound it has exited by now.
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Create this run's PipeWire security context and wait for its socket,
+/// so the socket is there for bwrap to bind. `Ok(None)` where the
+/// instance grants no audio at all. The handle must outlive the sandbox.
+///
+/// Called before the argv is built, like the other sidecars: what the
+/// sandbox binds is what this creates, and a bind whose source is not
+/// there is a failed start rather than a sandbox without audio.
+///
+/// Marks every descriptor of the calling process above stdio that this
+/// spawn is not meant to hand over close-on-exec, so an embedder's own
+/// open files do not cross into the sidecar; none is closed.
+pub fn start_pw_context(
+    env: &Env,
+    dir: &Path,
+    inst: &Instance,
+    host: &dyn Host,
+) -> Result<Option<PwHandle>, LaunchError> {
+    let Some(audio) = inst.config.audio() else {
+        return Ok(None);
+    };
+    // The session's own daemon, which nothing but this sidecar reaches.
+    // Probed here and not where the sandbox's argv is built: that argv
+    // names only the context's socket, and an explanation of it describes
+    // a run on a host whose daemon may not be up yet.
+    service::require_socket(host, "pipewire", pipewire::host_socket(&env.runtime_dir))?;
+    // The sidecar's whole `/tmp`, and the only thing it can write.
+    let pw = pipewire::dir(dir);
+    mkdir_private(&pw)?;
+    // The pid of this run: two runs of one instance are then two
+    // contexts on the daemon's side rather than one name used twice.
+    let run_id = std::process::id().to_string();
+    let ctx = pipewire::Context {
+        instance_runtime: dir,
+        instance: &inst.name,
+        run_id: &run_id,
+        audio,
+    };
+    let mut alloc = RealAlloc::sidecar(dir.to_path_buf());
+    let argv = pw_context_argv(env, &ctx, host, &mut alloc)?;
+    alloc.inheritable(true).map_err(LaunchError::Data)?;
+    spawning(&alloc.intended())?;
+    let child = Command::new("bwrap")
+        .args(&argv)
+        .spawn()
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => LaunchError::BwrapMissing,
+            _ => LaunchError::Spawn(e),
+        })?;
+    // From here on every exit path stops the sidecar through the handle.
+    let mut handle = PwHandle {
+        child,
+        alloc,
+        dir: pw,
+    };
+    // The instance's own bwrap must not inherit these: a second holder
+    // of the report pipe would keep bubbler from seeing it hang up.
+    handle.alloc.inheritable(false).map_err(LaunchError::Data)?;
+    let PwHandle { child, alloc, .. } = &mut handle;
+    let ready = alloc
+        .ready_read
+        .as_ref()
+        .ok_or_else(|| LaunchError::Data(io::Error::other("no report pipe was allocated")))?;
+    // The holder reports the name it renamed the socket to as its own
+    // sandbox sees it — that sandbox's `/tmp` is this directory — so the
+    // one answer bubbler takes is the name it planned for.
+    if read_report(ready, child, Instant::now() + PW_READY).as_deref()
+        != Some(pipewire::SOCKET_INSIDE)
+    {
+        let what = match child.try_wait() {
+            Ok(Some(status)) => format!("it exited ({status})"),
+            _ => format!(
+                "it did not report `{}` within {PW_READY:?}",
+                pipewire::SOCKET_INSIDE
+            ),
+        };
+        return Err(LaunchError::PwContext(what));
+    }
+    check_context_socket(dir)?;
+    Ok(Some(handle))
+}
+
+/// The line the holder reports the context socket on, without its
+/// newline, or `None` when the deadline passes, the pipe reaches EOF or
+/// the sidecar is gone.
+///
+/// A byte at a time: the line is one short path, and the descriptor stays
+/// open afterwards, so a longer read would block on a pipe with nothing
+/// more coming.
+fn read_report(ready: &OwnedFd, child: &mut Child, deadline: Instant) -> Option<String> {
+    let mut line = Vec::new();
+    loop {
+        let slice = Timespec {
+            tv_sec: POLL.as_secs() as Secs,
+            tv_nsec: POLL.subsec_nanos() as Nsecs,
+        };
+        match poll(&mut [PollFd::new(ready, PollFlags::IN)], Some(&slice)) {
+            // `Ok(0)` already waited out the slice; a failing poll keeps
+            // failing, so sleep rather than spin until the deadline.
+            Ok(0) => {}
+            Err(_) => std::thread::sleep(POLL),
+            Ok(_) => {
+                let mut byte = [0u8; 1];
+                match rustix::io::read(ready, &mut byte) {
+                    Ok(0) => return None,
+                    Ok(_) if byte[0] == b'\n' => return String::from_utf8(line).ok(),
+                    Ok(_) if line.len() >= PW_REPORT_MAX => return None,
+                    Ok(_) => line.push(byte[0]),
+                    Err(Errno::INTR) => {}
+                    Err(_) => return None,
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
+            return None;
+        }
+    }
+}
+
+/// Prove the context socket is a socket before bwrap binds it, without
+/// following a symlink: bwrap resolves a bind source through links, so
+/// one planted at this name would put whatever it points at into the
+/// sandbox instead.
+// Weaker than what the D-Bus proxy's socket gets ([`adopt_proxy_bus`]
+// moves it out of the sidecar's reach first, so its type cannot change
+// after the check): the context socket stays in the directory the
+// sidecar has as its `/tmp`, because that is the directory
+// `pw-container` creates it in and the one `--dry-run` names. The window
+// is between this check and bwrap's own resolution, and what could use
+// it is a `pw-container` that has been taken over — a process with no
+// network, a read-only root, and nothing of the application's input to
+// parse.
+fn check_context_socket(dir: &Path) -> Result<(), LaunchError> {
+    let path = pipewire::socket(dir);
+    let at = open_dir(&pipewire::dir(dir))?;
+    let wrong_type = || LaunchError::WrongType {
+        service: "pipewire",
+        path: path.clone(),
+        expected: "a socket",
+    };
+    let socket = rustix::fs::openat(
+        &at,
+        pipewire::SOCKET_NAME,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| match e {
+        Errno::LOOP => wrong_type(),
+        Errno::NOENT => LaunchError::MissingResource {
+            service: "pipewire",
+            path: path.clone(),
+        },
+        e => LaunchError::Io(path.clone(), e.into()),
+    })?;
+    let stat = rustix::fs::fstat(&socket).map_err(|e| LaunchError::Io(path.clone(), e.into()))?;
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Socket {
+        return Err(wrong_type());
+    }
+    Ok(())
 }
 
 /// Start the filtering D-Bus proxy for an instance in its own sandbox and
@@ -2719,6 +2988,10 @@ pub fn run(
     // whole run. `wayland "host"` asks for the session's socket outright,
     // and without the grant there is nothing to start.
     let _wayland = start_wayland(env, &dir, inst, &RealHost)?;
+    // Before the argv is built, for the same reason: the socket an audio
+    // grant binds is the one this sidecar's holder creates, and it is
+    // the only PipeWire socket the sandbox is given.
+    let _pw_context = start_pw_context(env, &dir, inst, &RealHost)?;
     let host = tty::host_stdio()?;
     let is_tty = tty::host_is_tty();
     let mut stdio = tty::plan(mode, is_tty);
@@ -4019,6 +4292,113 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn pw_context_argv_runs_pw_container_in_its_own_sandbox() {
+        use crate::config::AudioSet;
+        use crate::host::fake::{FakeHost, types};
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let (file, _, _) = types();
+        let host =
+            FakeHost::default().with(&tmp.path().join("bubbler-init").display().to_string(), file);
+        let dir = instance_runtime_dir(&e, "t");
+        let ctx = pipewire::Context {
+            instance_runtime: &dir,
+            instance: "t",
+            run_id: "4711",
+            audio: AudioSet { microphone: false },
+        };
+        let argv =
+            pw_context_argv(&e, &ctx, &host, &mut DryRunAlloc::sidecar(dir.clone())).unwrap();
+        let run = e.runtime_dir.display().to_string();
+        assert_eq!(
+            strs(&argv),
+            vec![
+                "--unshare-all".to_owned(),
+                "--die-with-parent".to_owned(),
+                "--new-session".to_owned(),
+                "--add-seccomp-fd".to_owned(),
+                "4".to_owned(),
+                "--ro-bind".to_owned(),
+                "/usr".to_owned(),
+                "/usr".to_owned(),
+                "--symlink".to_owned(),
+                "usr/bin".to_owned(),
+                "/bin".to_owned(),
+                "--symlink".to_owned(),
+                "usr/lib".to_owned(),
+                "/lib".to_owned(),
+                "--symlink".to_owned(),
+                "usr/lib64".to_owned(),
+                "/lib64".to_owned(),
+                "--symlink".to_owned(),
+                "usr/bin".to_owned(),
+                "/sbin".to_owned(),
+                "--size".to_owned(),
+                "67108864".to_owned(),
+                "--tmpfs".to_owned(),
+                "/etc".to_owned(),
+                "--proc".to_owned(),
+                "/proc".to_owned(),
+                "--dev".to_owned(),
+                "/dev".to_owned(),
+                "--size".to_owned(),
+                "67108864".to_owned(),
+                "--tmpfs".to_owned(),
+                "/tmp".to_owned(),
+                "--ro-bind".to_owned(),
+                format!("{run}/pipewire-0"),
+                format!("{run}/pipewire-0"),
+                "--bind".to_owned(),
+                format!("{run}/bubbler/t/pw"),
+                "/tmp".to_owned(),
+                "--ro-bind".to_owned(),
+                tmp.path().join("bubbler-init").display().to_string(),
+                "/run/bubbler-pw-hold".to_owned(),
+                "--clearenv".to_owned(),
+                "--setenv".to_owned(),
+                "XDG_RUNTIME_DIR".to_owned(),
+                run.clone(),
+                "--setenv".to_owned(),
+                "BUBBLER_PW_REPORT_FD".to_owned(),
+                "3".to_owned(),
+                "--".to_owned(),
+                "/usr/bin/pw-container".to_owned(),
+                "-P".to_owned(),
+                r#"{"pipewire.sec.engine":"org.bubbler","pipewire.sec.app-id":"t","pipewire.sec.instance-id":"4711","pipewire.access":"restricted","bubbler.audio":"playback"}"#.to_owned(),
+                "--".to_owned(),
+                "/run/bubbler-pw-hold".to_owned(),
+            ]
+        );
+    }
+
+    /// The grant set is the one thing about the sidecar that a config
+    /// changes, and it reaches the daemon as a context property.
+    #[test]
+    fn a_microphone_grant_says_so_in_the_context_properties() {
+        use crate::config::AudioSet;
+        use crate::host::fake::{FakeHost, types};
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let (file, _, _) = types();
+        let host =
+            FakeHost::default().with(&tmp.path().join("bubbler-init").display().to_string(), file);
+        let dir = instance_runtime_dir(&e, "t");
+        let ctx = pipewire::Context {
+            instance_runtime: &dir,
+            instance: "t",
+            run_id: "4711",
+            audio: AudioSet { microphone: true },
+        };
+        let mut alloc = DryRunAlloc::sidecar(dir.clone());
+        let argv = strs(&pw_context_argv(&e, &ctx, &host, &mut alloc).unwrap());
+        assert!(
+            argv.iter()
+                .any(|a| a.contains(r#""bubbler.audio":"playback,microphone""#)),
+            "{argv:?}"
+        );
     }
 
     #[test]

@@ -520,6 +520,40 @@ impl BwrapArgs {
     /// the proxy accepts the application on is not bound at all: it is
     /// handed over as a descriptor, so the proxy can neither reach the
     /// directory it lives in nor create anything beside it.
+    /// The sandbox the PipeWire context sidecar runs in: the sidecar
+    /// baseline, the session's own `pipewire-0` read-only at its own
+    /// path, and `dir` as the whole of `/tmp`.
+    ///
+    /// That socket is the only thing of the session in here — the
+    /// manager socket beside it never is. `/tmp` is bound rather than
+    /// left a tmpfs because `pw-container` creates its socket at a
+    /// `/tmp` path it chooses itself and takes from no environment
+    /// variable, so binding that directory is how bubbler decides where
+    /// the socket lands; `dir` is the instance's own, holds nothing but
+    /// that socket, and is the only thing this sidecar can write.
+    pub fn pw_context_baseline(host_socket: &Path, dir: &Path, host: &dyn Host) -> Self {
+        let mut a = Self::sidecar_baseline(host);
+        let o = OsStr::new;
+        let b = Origin::Baseline;
+        push(
+            &mut a.skeleton,
+            b,
+            [
+                o("--ro-bind"),
+                host_socket.as_os_str(),
+                host_socket.as_os_str(),
+            ],
+        );
+        // After the baseline's own `--tmpfs /tmp`, which this replaces:
+        // bwrap applies filesystem operations in the order given.
+        push(
+            &mut a.skeleton,
+            b,
+            [o("--bind"), dir.as_os_str(), o("/tmp")],
+        );
+        a
+    }
+
     pub fn wl_proxy_baseline(upstream: &Path, host: &dyn Host) -> Self {
         let mut a = Self::sidecar_baseline(host);
         push(

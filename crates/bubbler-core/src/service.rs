@@ -19,6 +19,7 @@ use crate::env::{Env, SANDBOX_HOME};
 use crate::error::LaunchError;
 use crate::host::Host;
 use crate::network::{self, Mode as NetworkMode, NetworkConfig};
+use crate::pipewire;
 use crate::wayland::WaylandPlan;
 
 mod dri;
@@ -73,7 +74,7 @@ pub fn apply_all(
                 optional,
             } => home_share(env, args, host, path, *mode, *optional)?,
             Service::Dri { kms } => dri(args, host, *kms)?,
-            Service::Pipewire { .. } => pipewire(env, args, host)?,
+            Service::Pipewire { .. } => pipewire(env, args, host, ctx)?,
             Service::Pulseaudio { .. } => pulseaudio(env, args, host)?,
             Service::EtcShare { name } => etc_share(args, host, name)?,
             Service::AppRuntime { id, mode } => app_runtime(env, args, id, *mode),
@@ -611,17 +612,47 @@ fn gamepad_uinput(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchErr
     Ok(())
 }
 
-/// Bind the PipeWire socket at the same path; clients find it through
+/// Bind the socket of this instance's own PipeWire security context
+/// where a client looks for one; clients find it through
 /// `$XDG_RUNTIME_DIR`, so no variable is needed.
-fn pipewire(env: &Env, args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
-    let p = require_socket(host, "pipewire", env.runtime_dir.join("pipewire-0"))?;
-    args.ro_bind(&p, &p);
+///
+/// The session's `pipewire-0` is not bound and neither is its manager
+/// socket: a client that arrives through the context is tagged with the
+/// instance and its grant set, which is what the session manager's
+/// policy acts on, and one that reached the session's own socket would
+/// be tagged with nothing.
+///
+/// The source is not probed, unlike every other bind of a host path: it
+/// exists only once the launcher's sidecar has created it, and a
+/// `--dry-run` names the path a run would bind with nothing started at
+/// all — exactly as [`dbus_socket`] names the proxy's.
+fn pipewire(
+    env: &Env,
+    args: &mut BwrapArgs,
+    host: &dyn Host,
+    ctx: &ServiceCtx,
+) -> Result<(), LaunchError> {
+    audio_context(host)?;
+    args.ro_bind(
+        &pipewire::socket(&ctx.instance_runtime),
+        &env.runtime_dir.join("pipewire-0"),
+    );
+    Ok(())
+}
+
+/// Require the tool every audio grant's context is created with. Checked
+/// where the argv is built, so a host without it fails a `--dry-run`
+/// too, and by name, so what a run reports is a missing package and not
+/// a shell inside a sidecar.
+fn audio_context(host: &dyn Host) -> Result<(), LaunchError> {
+    require_file(host, "pipewire", PathBuf::from(pipewire::PW_CONTAINER))?;
     Ok(())
 }
 
 /// Bind the PulseAudio native socket at the same path and set
 /// `PULSE_SERVER` to it so clients find the socket.
 fn pulseaudio(env: &Env, args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
+    audio_context(host)?;
     let p = require_socket(host, "pulseaudio", env.runtime_dir.join("pulse/native"))?;
     args.ro_bind(&p, &p);
     let mut value = OsString::from("unix:");
@@ -3937,28 +3968,58 @@ mod tests {
         assert_eq!(bare, with_tray);
     }
 
+    /// The host tree of a desktop that can serve audio: the tool that
+    /// creates a context, and the session's own sockets, which no
+    /// sandbox is given.
+    fn audio_host() -> Vec<(&'static str, Kind)> {
+        vec![
+            (crate::pipewire::PW_CONTAINER, File),
+            ("/run/user/1000/pipewire-0", Sock),
+            ("/run/user/1000/pipewire-0-manager", Sock),
+            ("/run/user/1000/pulse/native", Sock),
+        ]
+    }
+
     #[test]
-    fn pipewire_and_pulseaudio_bind_sockets() {
+    fn pipewire_binds_this_instances_context_socket_and_not_the_sessions() {
         let a = argv(
-            &[
-                Service::Pipewire { microphone: false },
-                Service::Pulseaudio { microphone: false },
-            ],
+            &[Service::Pipewire { microphone: false }],
             &env(),
-            &[
-                ("/run/user/1000/pipewire-0", Sock),
-                ("/run/user/1000/pulse/native", Sock),
-            ],
+            &audio_host(),
         )
         .unwrap();
         assert!(has_seq(
             &a,
             &[
                 "--ro-bind",
-                "/run/user/1000/pipewire-0",
+                "/run/user/1000/bubbler/t/pw/pipewire-0",
                 "/run/user/1000/pipewire-0"
             ]
         ));
+        // Not the session's daemon, and not its manager socket either:
+        // the whole point of the context is that the sandbox reaches
+        // PipeWire only through a server that knows which instance it is.
+        assert!(
+            !a.iter().any(|w| w == "/run/user/1000/pipewire-0-manager"),
+            "{a:?}"
+        );
+        assert!(
+            !binds(&a)
+                .windows(2)
+                .any(|w| w == ["--ro-bind", "/run/user/1000/pipewire-0"]
+                    || w == ["--bind", "/run/user/1000/pipewire-0"]),
+            "{a:?}"
+        );
+    }
+
+    #[test]
+    fn pulseaudio_binds_the_socket_and_names_it() {
+        let a = argv(
+            &[Service::Pulseaudio { microphone: false }],
+            &env(),
+            &audio_host(),
+        )
+        .unwrap();
         assert!(has_seq(
             &a,
             &[
@@ -3977,23 +4038,39 @@ mod tests {
         ));
         assert!(matches!(
             argv(
-                &[Service::Pipewire { microphone: false }],
+                &[Service::Pulseaudio { microphone: false }],
                 &env(),
-                &[("/run/user/1000/pipewire-0", File)]
+                &[(crate::pipewire::PW_CONTAINER, File)]
             ),
-            Err(LaunchError::WrongType {
-                service: "pipewire",
-                expected: "a socket",
-                ..
-            })
-        ));
-        assert!(matches!(
-            argv(&[Service::Pulseaudio { microphone: false }], &env(), &[]),
             Err(LaunchError::MissingResource {
                 service: "pulseaudio",
                 ..
             })
         ));
+    }
+
+    /// Both audio grants are served through a context, so both need the
+    /// tool that creates one — and the failure names it while the argv
+    /// is built, not a shell inside a sidecar once the run has started.
+    #[test]
+    fn an_audio_grant_without_pw_container_is_refused_before_anything_starts() {
+        for service in [
+            Service::Pipewire { microphone: false },
+            Service::Pulseaudio { microphone: false },
+        ] {
+            let host: Vec<(&str, Kind)> = audio_host()
+                .into_iter()
+                .filter(|(p, _)| *p != crate::pipewire::PW_CONTAINER)
+                .collect();
+            assert!(
+                matches!(
+                    argv(std::slice::from_ref(&service), &env(), &host),
+                    Err(LaunchError::MissingResource { service: "pipewire", ref path })
+                        if path == Path::new(crate::pipewire::PW_CONTAINER)
+                ),
+                "{service:?}"
+            );
+        }
     }
 
     #[test]
