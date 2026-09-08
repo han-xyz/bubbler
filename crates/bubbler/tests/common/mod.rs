@@ -556,6 +556,26 @@ pub fn bubbler_live(root: &Path, init: &Path) -> Command {
     c
 }
 
+/// [`bubbler_live`] with the session's real `XDG_RUNTIME_DIR`, which an
+/// audio grant needs: the sidecar that creates the run's PipeWire
+/// security context connects to the session's daemon under it. Instance
+/// runtime state therefore lands in the real runtime dir, so such tests
+/// need distinctive names.
+pub fn bubbler_audio(root: &Path, init: &Path) -> Command {
+    let mut c = bubbler_live(root, init);
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        c.env("XDG_RUNTIME_DIR", dir);
+    }
+    c
+}
+
+/// The session's own PipeWire socket, or `None` where this session has
+/// no daemon to create a security context on.
+pub fn session_pipewire() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?).join("pipewire-0");
+    path.exists().then_some(path)
+}
+
 /// [`bubbler_live`] with the session's real `XDG_RUNTIME_DIR` and bus
 /// addresses, which a proxied bus needs; HOME and
 /// XDG_DATA_HOME stay under `root`. Instance runtime state therefore

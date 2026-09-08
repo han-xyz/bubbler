@@ -11,16 +11,17 @@ use std::time::{Duration, Instant};
 
 use bubbler_core::bwrap::ETC_ALLOWLIST;
 use bubbler_core::instance::CONFIG_VERSION;
+use bubbler_core::pipewire::PW_CONTAINER;
 use bubbler_core::profile::NAMES;
 use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
-    PYTHON, bubbler, bubbler_dbus, bubbler_in_sh, bubbler_live, bubbler_wayland, bwrap_alive,
-    holders_of, isolated, kill_group, output_past_a_busy_exec, process_running, real_init,
-    real_net_proxy, require_a11y, require_a11y_lookup, require_bwrap, require_dbus,
+    PYTHON, bubbler, bubbler_audio, bubbler_dbus, bubbler_in_sh, bubbler_live, bubbler_wayland,
+    bwrap_alive, holders_of, isolated, kill_group, output_past_a_busy_exec, process_running,
+    real_init, real_net_proxy, require_a11y, require_a11y_lookup, require_bwrap, require_dbus,
     require_document_portal, require_egress, require_groff, require_host_program,
     require_nested_x11, require_nested_x11_host, require_nft, require_pasta, require_portal,
-    require_python, require_security_context, require_system_bus, require_tray, say, system_owns,
-    test_pty,
+    require_python, require_security_context, require_system_bus, require_tray, say,
+    session_pipewire, system_owns, test_pty,
 };
 use rustix::fs::{FlockOperation, OFlags, fcntl_getfl, flock};
 use rustix::process::{Pid, Signal, kill_process};
@@ -496,6 +497,77 @@ fn run_without_command_fails_with_message() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("no command"));
+}
+
+/// The audio grants are served through a security context of this run's
+/// own, so the socket the sandbox gets is one the launcher's sidecar
+/// creates under the instance's runtime directory — never the session's
+/// daemon, and never the manager socket beside it.
+#[test]
+fn dry_run_binds_the_planned_context_socket_and_not_the_sessions() {
+    if !require_host_program(PW_CONTAINER) {
+        return;
+    }
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "pipewire\ncommand \"true\"\n").unwrap();
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--dry-run"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        s.contains(&format!(
+            "--ro-bind\n{}\n{}\n",
+            tmp.path().join("run/bubbler/t/pw/pipewire-0").display(),
+            tmp.path().join("run/pipewire-0").display()
+        )),
+        "{s}"
+    );
+    // The same path is the destination above; as a *source* it would be
+    // the session's own daemon bound straight into the sandbox.
+    assert!(
+        !s.contains(&format!(
+            "--ro-bind\n{}\n",
+            tmp.path().join("run/pipewire-0").display()
+        )),
+        "{s}"
+    );
+    assert!(!s.contains("pipewire-0-manager"), "{s}");
+}
+
+/// What the context says about the sandbox is not in the sandbox's own
+/// argv, so the explanation is where a reader can see it.
+#[test]
+fn explain_names_the_context_an_audio_grant_is_served_through() {
+    if !require_host_program(PW_CONTAINER) {
+        return;
+    }
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "pipewire {\n    microphone\n}\ncommand \"true\"\n").unwrap();
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--explain"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        s.contains("(context: org.bubbler t playback,microphone)"),
+        "{s}"
+    );
+    assert!(s.contains(&format!("sidecar: {PW_CONTAINER} -P ")), "{s}");
 }
 
 /// An instance whose grants need nothing of this host: the D-Bus socket
@@ -2325,6 +2397,152 @@ fn real_bwrap_alsa_configuration_reaches_the_sandbox() {
     // for the temporary directory to take with it.
     let out = bubbler_dbus(tmp.path(), &init)
         .args(["delete", "alsacfg", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The properties of the clients one instance holds on the session's own
+/// daemon, read from `pw-dump` on the host side.
+const PW_CLIENT: &str = include_str!("fixtures/pw_client.py");
+
+/// The two PipeWire tools the test below needs beside `pw-container`:
+/// one to hold a client open inside the sandbox, one to ask the host
+/// daemon what it made of it.
+const PW_MON: &str = "/usr/bin/pw-mon";
+const PW_DUMP: &str = "/usr/bin/pw-dump";
+
+/// Whether this host can serve a bubbler audio context: bwrap, the
+/// PipeWire tools, python for the probe, and a session daemon to create
+/// the context on.
+fn require_pipewire_session() -> bool {
+    if !require_bwrap() || !require_python() {
+        return false;
+    }
+    for program in [PW_CONTAINER, PW_MON, PW_DUMP] {
+        if !require_host_program(program) {
+            return false;
+        }
+    }
+    if session_pipewire().is_none() {
+        say("skipping: this session has no pipewire-0 socket");
+        return false;
+    }
+    true
+}
+
+/// The security tokens the host daemon has attached to the clients of
+/// `app`, one line each, as the fixture prints them.
+fn host_pw_clients(app: &str) -> String {
+    let dump = Command::new(PW_DUMP)
+        .output()
+        .expect("pw-dump runs on this host");
+    let mut probe = Command::new(PYTHON)
+        .args(["-c", PW_CLIENT, app])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("python runs on this host");
+    probe
+        .stdin
+        .take()
+        .expect("a piped stdin")
+        .write_all(&dump.stdout)
+        .expect("the dump goes into the probe");
+    let out = probe.wait_with_output().expect("the probe answers");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A `pipewire` sandbox reaches the session's daemon only through a
+/// security context of this run's own, so the daemon knows which
+/// instance every client of it is and what that instance was granted —
+/// and when the run ends, nothing of the context is left.
+#[test]
+fn real_bwrap_pipewire_context_tags_the_client() {
+    if !require_pipewire_session() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_audio(tmp.path(), &init)
+        .args(["create", "audioctx"])
+        .status()
+        .unwrap();
+    let cfg = tmp
+        .path()
+        .join("data/bubbler/instances/audioctx/config.kdl");
+    std::fs::write(&cfg, "pipewire\ncommand \"true\"\n").unwrap();
+    // A client that stays connected for as long as the run does, so the
+    // host side has something to ask the daemon about.
+    let mut child = bubbler_audio(tmp.path(), &init)
+        .args(["run", "audioctx", "--", PW_MON])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut clients = String::new();
+    while clients.is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+        clients = host_pw_clients("audioctx");
+    }
+    // The instance id is this run's own pid: two runs of one instance
+    // are two contexts on the daemon's side, not one name used twice.
+    assert_eq!(
+        clients.trim(),
+        format!(
+            "pipewire.sec.engine=org.bubbler pipewire.sec.app-id=audioctx \
+             pipewire.sec.instance-id={} pipewire.access=restricted \
+             pipewire.access.effective=restricted bubbler.audio=playback",
+            child.id()
+        )
+    );
+    let pw = session_pipewire()
+        .expect("checked above")
+        .with_file_name("bubbler/audioctx/pw");
+    assert!(pw.join("pipewire-0").exists(), "{pw:?}");
+
+    // The way a terminal ends a run: bubbler stops the sandbox and the
+    // sidecar behind it on its way out.
+    kill_process(Pid::from_child(&child), Signal::TERM).expect("the run is still going");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match child.try_wait().expect("waiting for the run") {
+            Some(_) => break,
+            None => assert!(
+                Instant::now() < deadline,
+                "the run ignored SIGTERM: {}",
+                String::from_utf8_lossy(&host_pw_clients("audioctx").into_bytes())
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!bwrap_alive("bubbler-pw-hold"), "a sidecar sandbox is left");
+    assert!(
+        !process_running("pw-container", "audioctx"),
+        "a pw-container is left"
+    );
+    assert!(!pw.exists(), "the context directory is left: {pw:?}");
+    assert!(
+        host_pw_clients("audioctx").is_empty(),
+        "the daemon still holds a client of the context"
+    );
+
+    // The instance's runtime state is in the session's own runtime dir
+    // rather than under the test root, so it is deleted rather than left
+    // for the temporary directory to take with it.
+    let out = bubbler_audio(tmp.path(), &init)
+        .args(["delete", "audioctx", "--yes"])
         .output()
         .unwrap();
     assert!(
