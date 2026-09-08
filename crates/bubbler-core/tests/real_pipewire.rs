@@ -7,12 +7,18 @@
 //! disabled, and the bed's PipeWire loads no device factory, so the
 //! graph holds one null sink and one null source and nothing else.
 
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use rustix::process::{Pid, Signal, kill_process};
+use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 use tempfile::TempDir;
+
+/// The policy drop-in as it is shipped, loaded by the bed's WirePlumber
+/// from the bed's own config directory. The tests below are what says
+/// whether the shipped file grants what it promises.
+const DROP_IN: &str = include_str!("../../../contrib/wireplumber/50-bubbler.conf");
 
 /// The bed's PipeWire: the protocol, the client-node and adapter
 /// factories, the metadata factory WirePlumber needs, and two null
@@ -124,6 +130,13 @@ const NEEDED: [&str; 6] = [
     "pw-link",
 ];
 
+/// A security context's properties as bubbler will set them for a
+/// `pipewire` grant with no `microphone` child.
+pub const PLAYBACK: &str = r#"{ "pipewire.sec.engine": "org.bubbler", "pipewire.sec.app-id": "bed", "pipewire.sec.instance-id": "t1", "pipewire.access": "restricted", "bubbler.audio": "playback" }"#;
+
+/// The same with the `microphone` child.
+pub const PLAYBACK_MICROPHONE: &str = r#"{ "pipewire.sec.engine": "org.bubbler", "pipewire.sec.app-id": "bed", "pipewire.sec.instance-id": "t1", "pipewire.access": "restricted", "bubbler.audio": "playback,microphone" }"#;
+
 /// Say why a test is being skipped where a plain `cargo test` will show
 /// it. Written to descriptor 2 rather than through `eprintln!`: libtest
 /// captures the Rust-side handle until a test fails, and a skip nobody
@@ -205,6 +218,8 @@ impl PipeWireBed {
             .expect("a copy of the stock wireplumber.conf");
         std::fs::write(wp.join("wireplumber.conf.d/00-bed.conf"), BED_PROFILE)
             .expect("the bed's wireplumber profile");
+        std::fs::write(wp.join("wireplumber.conf.d/50-bubbler.conf"), DROP_IN)
+            .expect("the policy drop-in");
 
         let pipewire = daemon(
             Command::new("pipewire")
@@ -257,6 +272,12 @@ impl PipeWireBed {
         self.host_tool("pw-dump", &[])
     }
 
+    /// `pw-link -l` against the bed: every link in the graph, one
+    /// endpoint per line.
+    pub fn links(&self) -> String {
+        self.host_tool("pw-link", &["-l"])
+    }
+
     fn host_tool(&self, program: &str, args: &[&str]) -> String {
         let out = self
             .command(program)
@@ -270,6 +291,48 @@ impl PipeWireBed {
     pub fn command(&self, program: &str) -> Command {
         let mut command = Command::new(program);
         command.env("PIPEWIRE_RUNTIME_DIR", self.dir.path().join("run"));
+        command
+    }
+
+    /// `program`, run in a PipeWire security context carrying `props`,
+    /// with its output captured.
+    ///
+    /// `pw-container` takes a single program argument and hands it to
+    /// `system()`, dropping anything further on its command line, so
+    /// `program` must be one shell word — a bare tool name here.
+    pub fn in_context(&self, props: &str, program: &str) -> String {
+        let out = self
+            .context_command(props, program)
+            .output()
+            .expect("pw-container did not run");
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        text
+    }
+
+    /// The same, left running for the caller to watch the graph while it
+    /// is up.
+    pub fn spawn_in_context(&self, props: &str, program: &str) -> Child {
+        let mut command = self.context_command(props, program);
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        // Its own process group, so the whole context can be signalled
+        // at once. `pw-container` sits inside `system()` while the
+        // program runs and only removes its socket once that returns,
+        // so a signal to `pw-container` alone would leave the socket in
+        // `/tmp` for ever.
+        //
+        // SAFETY: the closure runs in the child between fork and exec,
+        // where only async-signal-safe work is allowed; `setpgid` is a
+        // bare syscall that allocates nothing and takes no lock.
+        unsafe {
+            command.pre_exec(|| rustix::process::setpgid(None, None).map_err(Into::into));
+        }
+        command.spawn().expect("pw-container did not run")
+    }
+
+    fn context_command(&self, props: &str, program: &str) -> Command {
+        let mut command = self.command("pw-container");
+        command.arg("-P").arg(props).arg("--").arg(program);
         command
     }
 }
@@ -366,4 +429,144 @@ fn dropping_the_bed_leaves_no_daemon_and_no_directory() {
         );
     }
     assert!(!dir.exists(), "{} outlived the bed", dir.display());
+}
+
+/// Three seconds of silence as a 48 kHz stereo WAV, for `pw-cat` to play
+/// long enough that the graph can be read while it does.
+fn silence(path: &Path) {
+    const FRAMES: u32 = 48_000 * 3;
+    let data = FRAMES * 4;
+    let mut wav = Vec::with_capacity(44 + data as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&48_000u32.to_le_bytes());
+    wav.extend_from_slice(&(48_000u32 * 4).to_le_bytes());
+    wav.extend_from_slice(&4u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data.to_le_bytes());
+    wav.resize(44 + data as usize, 0);
+    std::fs::write(path, wav).expect("a wav for pw-cat to play");
+}
+
+/// A `pw-cat` killed with the test rather than left to finish.
+struct Streaming(Child);
+
+impl Drop for Streaming {
+    fn drop(&mut self) {
+        let group = Pid::from_raw(self.0.id() as i32).expect("a live child");
+        let _ = kill_process_group(group, Signal::TERM);
+        wait_or_kill(&mut self.0);
+    }
+}
+
+/// Start `program` in a context carrying `props` and wait until the
+/// node it opens is in the graph, so what follows measures a stream that
+/// exists rather than one that has not arrived yet.
+fn streaming(bed: &PipeWireBed, props: &str, program: &str, class: &str) -> Streaming {
+    let child = Streaming(bed.spawn_in_context(props, program));
+    wait_for(&format!("a {class} node from {program}"), || {
+        bed.dump_from_host()
+            .contains(&format!("\"media.class\": \"{class}\""))
+    });
+    child
+}
+
+#[test]
+fn a_playback_context_sees_no_source_no_other_stream_and_no_metadata() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let wav = bed.dir().join("tone.wav");
+    silence(&wav);
+    let _other = streaming(
+        &bed,
+        PLAYBACK,
+        &format!("pw-cat -p {}", wav.display()),
+        "Stream/Output/Audio",
+    );
+
+    let seen = bed.in_context(PLAYBACK, "pw-dump");
+    assert!(seen.contains("\"node.name\": \"bed-sink\""), "{seen}");
+    assert!(!seen.contains("\"node.name\": \"bed-source\""), "{seen}");
+    assert!(!seen.contains("\"media.class\": \"Stream/"), "{seen}");
+    // `metadata.name` is on the metadata objects and on nothing else;
+    // the interface name is also the metadata *factory*'s type, which
+    // the sandbox may keep seeing.
+    assert!(!seen.contains("\"metadata.name\""), "{seen}");
+}
+
+#[test]
+fn a_playback_output_stream_links_to_the_sink() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let wav = bed.dir().join("tone.wav");
+    silence(&wav);
+    let _playing = streaming(
+        &bed,
+        PLAYBACK,
+        &format!("pw-cat -p {}", wav.display()),
+        "Stream/Output/Audio",
+    );
+    wait_for("a link to the null sink", || {
+        bed.links().contains("bed-sink:playback_")
+    });
+}
+
+#[test]
+fn a_playback_capture_stream_gets_no_link() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let out = bed.dir().join("captured.wav");
+    let _recording = streaming(
+        &bed,
+        PLAYBACK,
+        &format!("pw-cat -r {}", out.display()),
+        "Stream/Input/Audio",
+    );
+    // The stream is in the graph; give the session manager the rescan it
+    // would need to link it before asking whether it did.
+    std::thread::sleep(Duration::from_secs(2));
+    let links = bed.links();
+    assert!(
+        !links.contains("bed-source"),
+        "a playback-only context captured from the null source:\n{links}"
+    );
+}
+
+#[test]
+fn a_microphone_context_captures_from_the_null_source() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let out = bed.dir().join("captured.wav");
+    let _recording = streaming(
+        &bed,
+        PLAYBACK_MICROPHONE,
+        &format!("pw-cat -r {}", out.display()),
+        "Stream/Input/Audio",
+    );
+    wait_for("a link from the null source", || {
+        bed.links().contains("bed-source:capture_")
+    });
+    let seen = bed.in_context(PLAYBACK_MICROPHONE, "pw-dump");
+    assert!(seen.contains("\"node.name\": \"bed-source\""), "{seen}");
+}
+
+#[test]
+fn a_context_that_is_not_bubblers_keeps_the_reach_it_had() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    // `pw-container`'s own defaults: `org.flatpak`, no `bubbler.audio`.
+    // The drop-in must not narrow a context it did not create.
+    let seen = bed.in_context("{}", "pw-dump");
+    assert!(seen.contains("\"node.name\": \"bed-sink\""), "{seen}");
+    assert!(seen.contains("\"node.name\": \"bed-source\""), "{seen}");
 }
