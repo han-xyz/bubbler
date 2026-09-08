@@ -1,7 +1,8 @@
 //! The WirePlumber policy drop-in (`contrib/wireplumber/50-bubbler.conf`)
 //! that scopes each instance's audio grant, embedded so bubbler can hand
-//! it out (`bubbler audio-policy --print`) and detect its absence
-//! (R9) without touching the source tree it was built from.
+//! it out (`bubbler audio-policy --print`) and detect when none of the
+//! host's `wireplumber.conf.d` directories holds it, without touching
+//! the source tree it was built from.
 
 use std::path::PathBuf;
 
@@ -19,7 +20,7 @@ pub const DROP_IN: &str = include_str!("../../../contrib/wireplumber/50-bubbler.
 pub const DROP_IN_NAME: &str = "50-bubbler.conf";
 
 /// The three `wireplumber.conf.d` directories bubbler looks for the
-/// drop-in in, in the order [`installed`] searches (R9).
+/// drop-in in, in the order [`installed`] searches.
 pub fn install_dirs(env: &Env) -> [PathBuf; 3] {
     [
         PathBuf::from("/usr/share/wireplumber/wireplumber.conf.d"),
@@ -39,8 +40,9 @@ pub fn installed(host: &dyn Host, env: &Env) -> Option<PathBuf> {
     })
 }
 
-/// Exact text of the run-time warning (R9), without the `bubbler:
-/// warning:` prefix every diagnostic bubbler prints already carries.
+/// Exact text of the warning a real run prints when the drop-in is not
+/// installed, without the `bubbler: warning:` prefix every diagnostic
+/// bubbler prints already carries.
 pub const RUN_WARNING: &str = "audio policy drop-in 50-bubbler.conf not found in any \
      wireplumber.conf.d: the sandbox has full access to every PipeWire node (microphone \
      and every other client's audio reachable)";
@@ -54,7 +56,7 @@ pub fn run_warning(cfg: &InstanceConfig, host: &dyn Host, env: &Env) -> Option<&
 }
 
 /// Suffix a `pipewire`/`pulseaudio` `--explain` group header takes
-/// where the drop-in is absent (R9): the grant looks scoped to what the
+/// where the drop-in is absent: the grant looks scoped to what the
 /// config asks for and in fact reaches everything. `crate::explain::render`
 /// appends it in the same place a group's `KMS_NOTE`/`NVIDIA_NOTE` lands.
 pub const EXPLAIN_SUFFIX: &str = " (policy drop-in not found: microphone reachable)";
@@ -107,8 +109,8 @@ mod tests {
     }
 
     /// The embedded copy is what a fresh read of the file on disk holds
-    /// too (R10): a stale embed would ship a drop-in that does not
-    /// match what `contrib/` documents and reviews.
+    /// too: a stale embed would ship a drop-in that does not match what
+    /// `contrib/` documents and reviews.
     #[test]
     fn drop_in_matches_the_file_on_disk() {
         let path =

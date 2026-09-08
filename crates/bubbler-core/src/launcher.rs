@@ -1328,8 +1328,9 @@ impl Drop for PwHandle {
     /// runs with `--new-session`, so it is in no process group of
     /// bubbler's, and `pw-container` ignores SIGTERM until its own
     /// program has exited (measured on 1.6.8). What ends it is bwrap
-    /// dying, which takes the pid namespace `pw-container` is pid 1 of
-    /// with it.
+    /// dying, which takes the pid namespace with it — bwrap's own
+    /// reaper is pid 1 there, `pw-container` its child (`man bwrap`,
+    /// `--as-pid-1`: unset for this sidecar).
     fn drop(&mut self) {
         if still_running(&mut self.child) {
             if let Some(pid) = i32::try_from(self.child.id()).ok().and_then(Pid::from_raw) {
@@ -1704,7 +1705,7 @@ pub fn start_pw_pulse(
 
 /// Write the configuration of this run's private PulseAudio server into
 /// the sidecar's own directory and return the directory its
-/// `PIPEWIRE_CONFIG_DIR` names (R6).
+/// `PIPEWIRE_CONFIG_DIR` names.
 ///
 /// The host's effective `pipewire-pulse.conf` is copied rather than
 /// pointed at: `PIPEWIRE_CONFIG_DIR` replaces the search path whole and

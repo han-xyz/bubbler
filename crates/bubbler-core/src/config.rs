@@ -552,14 +552,14 @@ pub enum Service {
         /// directories readable, which is what mode setting takes.
         kms: bool,
     },
-    /// Access to the host PipeWire socket: playback only unless
-    /// `microphone` is set.
+    /// Access to this instance's PipeWire context socket: playback only
+    /// unless `microphone` is set.
     Pipewire {
         /// Every `Audio/Source` the host has, and capture from them.
         microphone: bool,
     },
-    /// Access to the host PulseAudio socket: playback only unless
-    /// `microphone` is set.
+    /// Access to this instance's private pulse server: playback only
+    /// unless `microphone` is set.
     Pulseaudio {
         /// Every `Audio/Source` the host has, and capture from them.
         microphone: bool,

@@ -1146,7 +1146,7 @@ fn microphone_note(i: usize, node: &KdlNode, name: &str, f: &mut Findings) {
     }
 }
 
-/// The `audio-policy-missing` warning (R9). `pipewire` and `pulseaudio`
+/// The `audio-policy-missing` warning. `pipewire` and `pulseaudio`
 /// share one instance-wide audio reach — [`InstanceConfig::audio`] ORs
 /// them the same way — so this is called once per run over every layer
 /// rather than once per node, and names the first audio node found

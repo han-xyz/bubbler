@@ -55,8 +55,8 @@ fn hand_over(remote: &Path, report: BorrowedFd<'_>) -> Result<PathBuf, String> {
 pub fn run() -> ExitCode {
     // Set before anything is renamed: from here on the holder leaves
     // with `pw-container` even if nothing signals it. That is a backstop
-    // behind the sidecar's own pid namespace, whose pid 1 is
-    // `pw-container` itself.
+    // behind the sidecar's own pid namespace, whose pid 1 is bwrap's own
+    // reaper — `pw-container` is its child.
     if let Err(e) = set_parent_process_death_signal(Some(Signal::TERM)) {
         eprintln!("{NAME}: cannot ask to die with pw-container: {e}");
         return ExitCode::from(2);
