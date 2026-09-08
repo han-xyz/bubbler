@@ -722,8 +722,8 @@ impl Service {
 }
 
 /// The audio grant an instance carries, once `pipewire` and `pulseaudio`
-/// are folded into the one set the security context (Task 3) is built
-/// from: two nodes writing to one instance-wide reach.
+/// are folded into the one set the per-instance security context 0.23
+/// builds from: two nodes writing to one instance-wide reach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioSet {
     /// `microphone` was asked for under `pipewire`, `pulseaudio`, or both.
@@ -4581,6 +4581,30 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// `microphone` means nothing outside `pipewire`/`pulseaudio`: a bare
+    /// top-level node is unknown like any other, and a child of another
+    /// bundle is refused the way that bundle refuses any unlisted child —
+    /// `dri`'s generic "takes no children" names the node but not the
+    /// word, which is `reject_entries`'s existing behaviour for every
+    /// flag node and not something this grammar changes.
+    #[test]
+    fn microphone_grants_nothing_anywhere_but_the_two_audio_nodes() {
+        assert!(matches!(
+            parse("microphone"),
+            Err(ConfigError::UnknownNode(n)) if n == "microphone"
+        ));
+        assert!(matches!(
+            parse("dri {\n    microphone\n}"),
+            Err(ConfigError::BadArgument { node, reason })
+                if node == "dri" && reason == "takes no children"
+        ));
+        assert!(matches!(
+            parse("dbus\nportals {\n    microphone\n}"),
+            Err(ConfigError::BadArgument { node, reason })
+                if node == "portals" && reason.starts_with("`microphone` is not a portal")
+        ));
     }
 
     /// `microphone` under either node ORs into the one set `audio()`

@@ -1193,22 +1193,30 @@ fn pulse_module_loading_on(ctx: &Context) -> bool {
     on
 }
 
-/// Two independent things about a `pulseaudio` node: the `microphone`
-/// child it may carry, and whether this host still lets a client load
-/// network modules on it, which is a fact about the host rather than
-/// about the child, so either, both or neither can be true at once.
-fn pulseaudio_node(ctx: &Context, i: usize, node: &KdlNode, f: &mut Findings) {
+/// The `pipewire-microphone` note, if `node` carries the child: `name`
+/// is `node`'s own name, since `pipewire` and `pulseaudio` share this
+/// wording and differ only in which one is being named.
+fn microphone_note(i: usize, node: &KdlNode, name: &str, f: &mut Findings) {
     if kids(node).any(|c| c.name().value() == "microphone") {
         f.push(
             i,
             node,
             &PIPEWIRE_MICROPHONE,
-            "`pulseaudio { microphone }` adds every microphone and line-in the session has, \
-             and capture from them"
-                .to_owned(),
+            format!(
+                "`{name} {{ microphone }}` adds every microphone and line-in the session has, \
+                 and capture from them"
+            ),
             "drop the child where the app only plays",
         );
     }
+}
+
+/// Two independent things about a `pulseaudio` node: the `microphone`
+/// child it may carry, and whether this host still lets a client load
+/// network modules on it, which is a fact about the host rather than
+/// about the child, so either, both or neither can be true at once.
+fn pulseaudio_node(ctx: &Context, i: usize, node: &KdlNode, f: &mut Findings) {
+    microphone_note(i, node, "pulseaudio", f);
     if pulse_module_loading_on(ctx) {
         f.push(
             i,
@@ -1369,17 +1377,7 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                 "drop the child unless the application keeps a secret through the portal, \
                  or accept it with `lint-allow \"secrets-access\" reason=\"...\"`",
             ),
-            "pipewire" if kids(node).any(|c| c.name().value() == "microphone") => {
-                f.push(
-                    i,
-                    node,
-                    &PIPEWIRE_MICROPHONE,
-                    "`pipewire { microphone }` adds every microphone and line-in the session \
-                     has, and capture from them"
-                        .to_owned(),
-                    "drop the child where the app only plays",
-                );
-            }
+            "pipewire" => microphone_note(i, node, "pipewire", f),
             "pulseaudio" => pulseaudio_node(ctx, i, node, f),
             "dbus" => dbus_node(i, node, f),
             "system-bus" => system_bus(i, node, f),
