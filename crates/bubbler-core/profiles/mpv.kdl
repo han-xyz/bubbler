@@ -14,10 +14,10 @@
 //
 // `pipewire` is the sound: on a PipeWire host mpv's own default audio
 // output driver is `pipewire` (Arch wiki, Mpv#Screen sharing cannot
-// capture audio from mpv), so this is the socket it reaches for. It
-// carries capture as well as playback, so it is the microphone too;
-// `pulseaudio` beside it is the same reach through the older protocol,
-// not a narrower one.
+// capture audio from mpv), so this is the socket it reaches for. Bare,
+// it is playback only: no microphone, no other app's audio. `pulseaudio`
+// beside it is the same reach through the older protocol, not a
+// narrower one, and its private server refuses to load a module.
 //
 // `home-share "Videos"` is read-only, because a player reads its files
 // and writes none. Edit the node for the directory you keep films in;

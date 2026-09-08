@@ -5,8 +5,9 @@
 // name it) and reach the server through $XDG_RUNTIME_DIR/pulse/native,
 // which is what that grant binds. `pipewire` binds only pipewire-0, the
 // native socket, and is for a client that speaks PipeWire itself or for
-// the screen-share portal. Either socket carries capture as well as
-// playback: this is the microphone too.
+// the screen-share portal. Bare, either socket is playback only: no
+// microphone, no other app's audio, and the private server pulseaudio
+// runs behind refuses to load a module.
 //
 // No `talk "org.freedesktop.secrets"`: a music player's session token is
 // adequately kept in its own config file in the private home, and the
