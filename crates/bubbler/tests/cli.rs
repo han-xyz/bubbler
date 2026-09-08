@@ -11017,11 +11017,10 @@ fn a_host_without_a_working_bwrap_skips_the_guarded_tests_rather_than_failing_th
 /// its first, so it is measured against an instance somebody has already
 /// warmed up, named by `BUBBLER_SMOKE_STEAM_INSTANCE`, and skipped where
 /// nobody names one, which keeps it from blocking unrelated work landing
-/// on top of this one. Run one
-/// explicitly, by its whole name, serially — these start
-/// real desktop apps one at a time against a session with exactly one
-/// desktop to watch them on, and several such launches at once would
-/// make the timing this measures mean nothing:
+/// on top of this one. Run one explicitly, by its whole name, serially —
+/// these start real desktop apps one at a time against a session with
+/// exactly one desktop to watch them on, and several such launches at
+/// once would make the timing this measures mean nothing:
 ///
 ///     cargo test -p bubbler --test cli -- --ignored --exact profile_smoke::kitty_window_appears --test-threads=1
 ///
@@ -11485,7 +11484,10 @@ mod profile_smoke {
     /// check its stdout with `check`. Skips (with a reason `gate` itself
     /// prints) when `gate` returns false. `home` selects [`bubbler_home`]
     /// over [`bubbler_live`], for a profile whose `home-share` needs the
-    /// real `$HOME`.
+    /// real `$HOME`. Bounded by `limit` the way [`gui_smoke`] bounds every
+    /// step of its own wait: a command that blocks (an agent stalled on a
+    /// login) is terminated — SIGTERM, then the same stop wait — and
+    /// fails by name and limit rather than hanging the suite.
     fn command_smoke(
         profile: &str,
         gate: impl FnOnce() -> bool,
@@ -11493,6 +11495,7 @@ mod profile_smoke {
         argv: &[&str],
         check: impl FnOnce(&str) -> bool,
         what: &str,
+        limit: Duration,
     ) {
         if !gate() {
             return;
@@ -11504,11 +11507,22 @@ mod profile_smoke {
         } else {
             bubbler_live(tmp.path(), &init)
         };
-        let out = cmd
+        let mut child = cmd
             .args(["try", "--profile", profile, "--"])
             .args(argv)
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .unwrap();
+        if !wait_until(|| child.try_wait().is_ok_and(|s| s.is_some()), limit) {
+            let _ = kill_process(Pid::from_child(&child), Signal::TERM);
+            if !wait_until(|| child.try_wait().is_ok_and(|s| s.is_some()), limit) {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+            panic!("{profile}: no exit within {}s", limit.as_secs());
+        }
+        let out = child.wait_with_output().unwrap();
         let err = without_tool_warnings(&String::from_utf8_lossy(&out.stderr));
         assert!(out.status.success(), "{profile}: {err}");
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -11528,6 +11542,7 @@ mod profile_smoke {
             &["/usr/bin/sh", "-c", "echo ok"],
             |out| out == "ok",
             "equal \"ok\"",
+            SMOKE_LIMIT,
         );
     }
 
@@ -11541,6 +11556,7 @@ mod profile_smoke {
             &["/usr/bin/sh", "-c", "echo ok"],
             |out| out == "ok",
             "equal \"ok\"",
+            SMOKE_LIMIT,
         );
     }
 
@@ -11554,6 +11570,7 @@ mod profile_smoke {
             &["claude", "--version"],
             |out| out.starts_with(|c: char| c.is_ascii_digit()),
             "start with a digit",
+            SMOKE_LIMIT,
         );
     }
 
@@ -11567,6 +11584,49 @@ mod profile_smoke {
             &["claude", "--version"],
             |out| out.starts_with(|c: char| c.is_ascii_digit()),
             "start with a digit",
+            SMOKE_LIMIT,
         );
+    }
+
+    #[test]
+    #[ignore = "opt-in profile smoke test; run explicitly (see docs/wiki/Development.md)"]
+    fn command_smoke_terminates_a_command_that_never_exits() {
+        let before = String::from_utf8_lossy(
+            &std::process::Command::new(PGREP)
+                .args(["-af", "bubbler (try|run)"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .into_owned();
+        let start = Instant::now();
+        let caught = std::panic::catch_unwind(|| {
+            command_smoke(
+                "generic",
+                require_bwrap,
+                false,
+                &["/usr/bin/sh", "-c", "sleep 60"],
+                |_| true,
+                "never checked",
+                Duration::from_secs(1),
+            );
+        });
+        let elapsed = start.elapsed();
+        let msg = caught
+            .unwrap_err()
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(msg, "generic: no exit within 1s");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        let after = String::from_utf8_lossy(
+            &std::process::Command::new(PGREP)
+                .args(["-af", "bubbler (try|run)"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .into_owned();
+        assert_eq!(after, before, "a bubbler process was left behind");
     }
 }
