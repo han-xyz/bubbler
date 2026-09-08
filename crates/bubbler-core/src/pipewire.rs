@@ -13,6 +13,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::config::AudioSet;
+use crate::host::Host;
 use crate::json;
 
 /// Engine name every context bubbler creates carries. The session
@@ -55,6 +56,64 @@ pub const SOCKET_INSIDE: &str = "/tmp/pipewire-0";
 /// once there is a run.
 pub const RUN_ID_SHOWN: &str = "<run id>";
 
+/// The daemon binary the private PulseAudio server of a `pulseaudio`
+/// grant is one configuration of: the same `pipewire` that serves the
+/// session, started on a config of bubbler's.
+pub const PIPEWIRE: &str = "/usr/bin/pipewire";
+
+/// The module that config loads, and the whole of what makes the sidecar
+/// a PulseAudio server. From the `pipewire-pulse` package, which the
+/// `pipewire` package does not pull in, so a host can have every other
+/// piece of this and not that one.
+pub const PULSE_MODULE: &str = "/usr/lib/pipewire-0.3/libpipewire-module-protocol-pulse.so";
+
+/// Name of the config file the private server is started with, and so
+/// the name of the copy bubbler writes: `PIPEWIRE_CONFIG_DIR` replaces
+/// the whole search path, and there is no fallback for the main file
+/// (measured on 1.6.8: "error loading config … pipewire-pulse.conf: No
+/// such file or directory").
+pub const PULSE_CONF: &str = "pipewire-pulse.conf";
+
+/// Bubbler's own fragment beside that copy. The drop-in directory of the
+/// main file's name is read as well, and a dictionary in it overrides
+/// what the main file set (`pipewire.conf(5)`, DROP-IN CONFIGURATION
+/// FILES).
+pub const PULSE_DROP_IN: &str = "pipewire-pulse.conf.d/00-bubbler.conf";
+
+/// The config directory as the pulse sidecar sees it, which is what its
+/// `PIPEWIRE_CONFIG_DIR` names: [`pulse_config_dir`] under the `/tmp`
+/// that directory is bound as.
+pub const PULSE_CONFIG_INSIDE: &str = "/tmp/cfg";
+
+/// The private pulse socket as that sidecar sees it, and so the address
+/// [`PULSE_OVERRIDE`] names.
+pub const PULSE_SOCKET_INSIDE: &str = "/tmp/pulse/native";
+
+/// Where the context socket is bound in the pulse sidecar, and what its
+/// `PIPEWIRE_REMOTE` names. Under `/run` rather than the runtime dir:
+/// the sidecar has no runtime directory of the session's, and an
+/// absolute remote is taken as a path (measured: the private server
+/// arrives on the session daemon as a client of the context).
+pub const REMOTE_INSIDE: &str = "/run/pipewire-0";
+
+/// The whole of what bubbler changes about the host's pulse
+/// configuration: the server listens on one socket of this run's own,
+/// and a client may not make it load a module.
+///
+/// Module loading is what a pulse client uses to reach past the policy —
+/// `module-null-sink`, `module-loopback` and the rest run inside the
+/// server, not the sandbox — so it is refused here rather than left to
+/// the session manager's rules. The user's own
+/// `pipewire-pulse.conf.d` fragments are not copied beside this one:
+/// theirs would set `server.address` too, and the last one read would
+/// decide which socket this run serves.
+pub const PULSE_OVERRIDE: &str = concat!(
+    "pulse.properties = {\n",
+    "    server.address = [ \"unix:/tmp/pulse/native\" ]\n",
+    "    pulse.allow-module-loading = false\n",
+    "}\n"
+);
+
 /// The security context one run of one instance is served through: what
 /// it says about the sandbox, and where its socket goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +148,54 @@ pub fn dir(instance_runtime: &Path) -> PathBuf {
 /// resolves is a name the sidecar cannot reach.
 pub fn socket(instance_runtime: &Path) -> PathBuf {
     instance_runtime.join(SOCKET_NAME)
+}
+
+/// `<pw dir>/pulse/native`: the socket the private pulse server of a
+/// `pulseaudio` grant listens on, which is the only PulseAudio socket
+/// that sandbox is given.
+pub fn pulse_socket(instance_runtime: &Path) -> PathBuf {
+    dir(instance_runtime).join("pulse/native")
+}
+
+/// `<pw dir>/cfg`: the configuration bubbler writes for that server —
+/// the host's effective [`PULSE_CONF`] copied, and [`PULSE_OVERRIDE`]
+/// beside it.
+pub fn pulse_config_dir(instance_runtime: &Path) -> PathBuf {
+    dir(instance_runtime).join("cfg")
+}
+
+/// The three directories a `pipewire-pulse.conf` is looked for in, in
+/// the order PipeWire itself reads them: the user's own, the system's,
+/// then the one the package ships ("An equally named file in a directory
+/// with a higher precedence makes the analogous files ignored", Arch
+/// wiki, PipeWire#Configuration).
+pub fn pulse_conf_dirs(config_home: &Path) -> [PathBuf; 3] {
+    [
+        config_home.join("pipewire"),
+        PathBuf::from("/etc/pipewire"),
+        PathBuf::from("/usr/share/pipewire"),
+    ]
+}
+
+/// The `pipewire-pulse.conf` this host would start a pulse server with,
+/// which is the one bubbler copies; `None` where no directory holds one.
+pub fn pulse_conf(host: &dyn Host, config_home: &Path) -> Option<PathBuf> {
+    pulse_conf_dirs(config_home).into_iter().find_map(|dir| {
+        let path = dir.join(PULSE_CONF);
+        host.file_type(&path)
+            .is_some_and(|t| t.is_file())
+            .then_some(path)
+    })
+}
+
+/// The command the pulse sidecar runs. The config is named by file name
+/// and not by path: `PIPEWIRE_CONFIG_DIR` is what says which directory
+/// it is read from.
+pub fn pulse_command() -> Vec<OsString> {
+    [PIPEWIRE, "-c", PULSE_CONF]
+        .into_iter()
+        .map(OsString::from)
+        .collect()
 }
 
 /// The grant set as the policy drop-in matches it.
@@ -135,6 +242,7 @@ pub fn command(properties: &str) -> Vec<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::fake::{FakeHost, types};
 
     fn set(microphone: bool) -> AudioSet {
         AudioSet { microphone }
@@ -204,6 +312,81 @@ mod tests {
             socket(instance).file_name(),
             Path::new(SOCKET_INSIDE).file_name(),
             "the holder names it, and the move keeps that name"
+        );
+    }
+
+    #[test]
+    fn the_effective_pulse_config_is_the_users_before_etc_before_the_shipped_one() {
+        let (file, _, _) = types();
+        let config_home = Path::new("/home/user/.config");
+        let dirs = pulse_conf_dirs(config_home);
+        assert_eq!(
+            dirs,
+            [
+                PathBuf::from("/home/user/.config/pipewire"),
+                PathBuf::from("/etc/pipewire"),
+                PathBuf::from("/usr/share/pipewire"),
+            ]
+        );
+        for (i, dir) in dirs.iter().enumerate() {
+            // Every directory below this one holds the file too, so what
+            // is measured is the precedence and not which one exists.
+            let mut host = FakeHost::default();
+            for lower in &dirs[i..] {
+                host = host.with(lower.join(PULSE_CONF).to_str().unwrap(), file);
+            }
+            assert_eq!(
+                pulse_conf(&host, config_home),
+                Some(dir.join(PULSE_CONF)),
+                "{}",
+                dir.display()
+            );
+        }
+        assert_eq!(pulse_conf(&FakeHost::default(), config_home), None);
+    }
+
+    #[test]
+    fn the_bubbler_fragment_names_the_private_socket_and_refuses_module_loading() {
+        assert!(
+            PULSE_OVERRIDE.contains(&format!(
+                r#"server.address = [ "unix:{PULSE_SOCKET_INSIDE}" ]"#
+            )),
+            "{PULSE_OVERRIDE}"
+        );
+        assert!(
+            PULSE_OVERRIDE.contains("pulse.allow-module-loading = false"),
+            "{PULSE_OVERRIDE}"
+        );
+    }
+
+    #[test]
+    fn the_pulse_socket_and_its_config_are_in_the_directory_the_sidecar_writes() {
+        let instance = Path::new("/run/user/1000/bubbler/t");
+        assert_eq!(
+            pulse_socket(instance),
+            Path::new("/run/user/1000/bubbler/t/pw/pulse/native")
+        );
+        assert_eq!(
+            pulse_config_dir(instance),
+            Path::new("/run/user/1000/bubbler/t/pw/cfg")
+        );
+        // That directory is the sidecar's whole `/tmp`, so the host path
+        // and the path the fragment names are the same place.
+        assert_eq!(
+            pulse_socket(instance).strip_prefix(dir(instance)),
+            Path::new(PULSE_SOCKET_INSIDE).strip_prefix("/tmp")
+        );
+        assert_eq!(
+            pulse_config_dir(instance).strip_prefix(dir(instance)),
+            Path::new(PULSE_CONFIG_INSIDE).strip_prefix("/tmp")
+        );
+    }
+
+    #[test]
+    fn the_pulse_command_starts_the_daemon_on_the_copied_config() {
+        assert_eq!(
+            pulse_command(),
+            ["/usr/bin/pipewire", "-c", "pipewire-pulse.conf"]
         );
     }
 }
