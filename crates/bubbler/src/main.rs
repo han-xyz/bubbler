@@ -1265,6 +1265,9 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             if inst.has_service(&Service::X11(X11Mode::Host)) {
                 ediag!("bubbler: warning: x11 \"host\" grants no isolation between X clients");
             }
+            if let Some(warning) = audio_policy::run_warning(&inst.config, &RealHost, &env) {
+                ediag!("bubbler: warning: {warning}");
+            }
             launcher::run(&env, &inst, command, mode)
                 .with_context(|| format!("running instance `{name}`"))
         }
@@ -1320,6 +1323,10 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             }
             if eph.instance.has_service(&Service::X11(X11Mode::Host)) {
                 ediag!("bubbler: warning: x11 \"host\" grants no isolation between X clients");
+            }
+            if let Some(warning) = audio_policy::run_warning(&eph.instance.config, &RealHost, &env)
+            {
+                ediag!("bubbler: warning: {warning}");
             }
             let mode = tty.unwrap_or(eph.instance.config.tty);
             let code = launcher::run(&env, &eph.instance, command, mode);
@@ -1405,6 +1412,9 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             }
             if inst.has_service(&Service::X11(X11Mode::Host)) {
                 ediag!("bubbler: warning: x11 \"host\" grants no isolation between X clients");
+            }
+            if let Some(warning) = audio_policy::run_warning(&inst.config, &RealHost, &env) {
+                ediag!("bubbler: warning: {warning}");
             }
             launcher::run(&env, &inst, command, mode)
                 .with_context(|| format!("running instance `{name}`"))

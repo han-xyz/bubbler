@@ -2930,6 +2930,15 @@ hidden),
 `system-bus` rule naming a bus name that is defensible but wide — the KWin or
 GNOME shell compositor's own name, the session's file manager, or the Secret
 Service — with the one sentence a reader needs about what the name is),
+`audio-policy-missing` (a `pipewire` or `pulseaudio` grant with the
+WirePlumber policy drop-in installed in none of
+`/usr/share/wireplumber/wireplumber.conf.d/`,
+`/etc/wireplumber/wireplumber.conf.d/` or
+`$XDG_CONFIG_HOME/wireplumber/wireplumber.conf.d/`: the sandbox's audio
+grant is full access to every PipeWire node instead of what the grant
+asks for, microphone and every other client's audio included. Fix it
+with `bubbler audio-policy --print > <path>` naming one of those three
+directories and `50-bubbler.conf`, then restart WirePlumber),
 `pulseaudio-module-loading` (a `pulseaudio` grant on a host whose effective
 `pipewire-pulse.conf` leaves `pulse.allow-module-loading` on — the daemon's
 own default — so the host's audio daemon will load a module, a network sink

@@ -294,6 +294,12 @@ const CHECK_LINES: &[(&str, &str)] = &[
          other instance naming that id connects to.",
     ),
     (
+        "audio-policy-missing",
+        "A `pipewire` or `pulseaudio` grant with no WirePlumber policy drop-in installed: \
+         the sandbox's audio reach is full access to every PipeWire node rather than what \
+         the grant asks for.",
+    ),
+    (
         "bundle-without-dbus",
         "A `portals`, `notify`, `tray`, `mpris`, `a11y` or `input-method` grant that no \
          layer gives a `dbus` to carry its rules.",

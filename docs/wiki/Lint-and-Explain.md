@@ -45,7 +45,14 @@ ones bubbler writes, overlaid with the shadow-suite backups and empty
 hidden),
 `dbus-name-is-risky` (a `dbus`/`system-bus` rule naming a name that is
 defensible but wide — KWin's or the GNOME shell's own bus name, the session's
-file manager, or the Secret Service), `pulseaudio-module-loading` (a
+file manager, or the Secret Service), `audio-policy-missing` (a `pipewire`
+or `pulseaudio` grant with the WirePlumber policy drop-in installed in none
+of `/usr/share/wireplumber/wireplumber.conf.d/`,
+`/etc/wireplumber/wireplumber.conf.d/` or
+`$XDG_CONFIG_HOME/wireplumber/wireplumber.conf.d/`: the grant is full access
+to every PipeWire node instead of what it asks for. Fix it with `bubbler
+audio-policy --print > <path>` naming one of those three directories and
+`50-bubbler.conf`, then restart WirePlumber), `pulseaudio-module-loading` (a
 `pulseaudio` grant on a host whose effective `pipewire-pulse.conf` leaves
 `pulse.allow-module-loading` on: the host's audio daemon will load a module
 — a network sink or tunnel among them — outside the sandbox's network

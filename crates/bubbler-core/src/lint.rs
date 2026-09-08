@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use kdl::{KdlDocument, KdlNode};
 
+use crate::audio_policy;
 use crate::config;
 use crate::desktop;
 use crate::env::{Env, SANDBOX_HOME};
@@ -65,6 +66,15 @@ const ALLOW_HOST_WILDCARD: Check = Check {
 const APP_RUNTIME_RW: Check = Check {
     id: "app-runtime-rw",
     severity: Severity::Note,
+};
+// A warning, not a note: the host's audio daemon still does what the
+// grant asks either way, but without the drop-in a `pipewire`/
+// `pulseaudio` grant is not scoped at all — every other client's audio
+// and every microphone are reachable — so a reader has to see it rather
+// than read past it.
+const AUDIO_POLICY_MISSING: Check = Check {
+    id: "audio-policy-missing",
+    severity: Severity::Warning,
 };
 const BUNDLE_WITHOUT_DBUS: Check = Check {
     id: "bundle-without-dbus",
@@ -286,6 +296,7 @@ const X11_WITHOUT_REASON: Check = Check {
 pub const CHECKS: &[Check] = &[
     ALLOW_HOST_WILDCARD,
     APP_RUNTIME_RW,
+    AUDIO_POLICY_MISSING,
     BUNDLE_WITHOUT_DBUS,
     CAMERA_NODES_NONE_PRESENT,
     CAMERA_NODES_NO_HOTPLUG,
@@ -1235,6 +1246,34 @@ fn pulseaudio_node(ctx: &Context, i: usize, node: &KdlNode, f: &mut Findings) {
     }
 }
 
+/// The `audio-policy-missing` warning (R9), alike on `pipewire` and
+/// `pulseaudio`: without the WirePlumber drop-in neither node's grant is
+/// scoped at all, whatever `microphone` says.
+fn audio_policy_missing(ctx: &Context, i: usize, node: &KdlNode, name: &str, f: &mut Findings) {
+    if audio_policy::installed(ctx.host, ctx.env).is_some() {
+        return;
+    }
+    let dirs = audio_policy::install_dirs(ctx.env);
+    f.push(
+        i,
+        node,
+        &AUDIO_POLICY_MISSING,
+        format!(
+            "no WirePlumber policy drop-in ({}) is installed in {}, {} or {}: this `{name}` \
+             grant reaches every PipeWire node instead of what it asks for — microphone and \
+             every other client's audio included",
+            audio_policy::DROP_IN_NAME,
+            dirs[0].display(),
+            dirs[1].display(),
+            dirs[2].display(),
+        ),
+        &format!(
+            "install it with `bubbler audio-policy --print > {}` and restart WirePlumber",
+            dirs[2].join(audio_policy::DROP_IN_NAME).display()
+        ),
+    );
+}
+
 /// Checks that need one layer and nothing else, apart from `host_net`:
 /// the merged mode a `camera` message reads differently under.
 fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut Findings) {
@@ -1377,8 +1416,14 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                 "drop the child unless the application keeps a secret through the portal, \
                  or accept it with `lint-allow \"secrets-access\" reason=\"...\"`",
             ),
-            "pipewire" => microphone_note(i, node, "pipewire", f),
-            "pulseaudio" => pulseaudio_node(ctx, i, node, f),
+            "pipewire" => {
+                microphone_note(i, node, "pipewire", f);
+                audio_policy_missing(ctx, i, node, "pipewire", f);
+            }
+            "pulseaudio" => {
+                pulseaudio_node(ctx, i, node, f);
+                audio_policy_missing(ctx, i, node, "pulseaudio", f);
+            }
             "dbus" => dbus_node(i, node, f),
             "system-bus" => system_bus(i, node, f),
             "app-runtime" if prop(node, "mode") == Some("rw") => f.push(
@@ -2421,15 +2466,22 @@ mod tests {
 
     /// A `microphone` child is what puts capture in reach; the bare node
     /// says nothing about it and stays quiet. Measured on a host with
-    /// module loading already turned off, so it is the one finding under
-    /// test and not `pulseaudio-module-loading`, which is independent of
-    /// it.
+    /// module loading already turned off and the policy drop-in
+    /// installed, so it is the one finding under test and neither
+    /// `pulseaudio-module-loading` nor `audio-policy-missing`, both
+    /// independent of it.
     #[test]
     fn pipewire_microphone_is_a_note_and_the_bare_grant_is_not() {
-        let quiet = host().text(
-            "/home/user/.config/pipewire/pipewire-pulse.conf.d/10-no-modules.conf",
-            "pulse.properties = {\n    pulse.allow-module-loading = false\n}\n",
-        );
+        let (file, _, _) = fake::types();
+        let quiet = host()
+            .text(
+                "/home/user/.config/pipewire/pipewire-pulse.conf.d/10-no-modules.conf",
+                "pulse.properties = {\n    pulse.allow-module-loading = false\n}\n",
+            )
+            .with(
+                "/home/user/.config/wireplumber/wireplumber.conf.d/50-bubbler.conf",
+                file,
+            );
         with(&quiet, |ctx| {
             for node in ["pipewire", "pulseaudio"] {
                 let text = format!("{node} {{\n    microphone\n}}");
@@ -2450,13 +2502,18 @@ mod tests {
                 );
             }
         });
-        // The two `pulseaudio` findings are about different things — the
-        // child and the host's own module policy — so a node that raises
-        // both keeps both rather than the second silencing the first.
+        // Three independent findings on a host with neither fix applied —
+        // the child, the host's own module policy, and the missing
+        // drop-in — so a node that raises all three keeps all three
+        // rather than one silencing another.
         with(&host(), |ctx| {
             assert_eq!(
                 ids(&lint(ctx, &["pulseaudio {\n    microphone\n}"])),
-                ["pipewire-microphone", "pulseaudio-module-loading"]
+                [
+                    "pipewire-microphone",
+                    "pulseaudio-module-loading",
+                    "audio-policy-missing"
+                ]
             );
         });
     }
@@ -3651,10 +3708,16 @@ mod tests {
     /// warning is about the `pulseaudio` grant, not about a host without one.
     #[test]
     fn pulseaudio_module_loading_follows_the_effective_pipewire_config() {
-        let bare = host().text(
-            "/usr/share/pipewire/pipewire-pulse.conf",
-            "pulse.properties = {\n    #pulse.allow-module-loading = true\n}\n",
-        );
+        let (file, _, _) = fake::types();
+        let bare = host()
+            .text(
+                "/usr/share/pipewire/pipewire-pulse.conf",
+                "pulse.properties = {\n    #pulse.allow-module-loading = true\n}\n",
+            )
+            .with(
+                "/home/user/.config/wireplumber/wireplumber.conf.d/50-bubbler.conf",
+                file,
+            );
         with(&bare, |ctx| {
             let report = lint(ctx, &["pulseaudio"]);
             assert_eq!(ids(&report), ["pulseaudio-module-loading"]);
@@ -3688,11 +3751,88 @@ mod tests {
             .text(
                 "/home/user/.config/pipewire/pipewire-pulse.conf.d/99-modules.conf",
                 "pulse.properties = {\n    pulse.allow-module-loading = true\n}\n",
+            )
+            .with(
+                "/home/user/.config/wireplumber/wireplumber.conf.d/50-bubbler.conf",
+                file,
             );
         with(&back_on, |ctx| {
             assert_eq!(
                 ids(&lint(ctx, &["pulseaudio"])),
                 ["pulseaudio-module-loading"]
+            );
+        });
+    }
+
+    /// No drop-in anywhere is the default fixture (`host()`), so the
+    /// warning fires for either audio node, names the node and all three
+    /// directories bubbler searched, and points the help at the command
+    /// that writes the file and the restart it needs. Module loading is
+    /// turned off so `pulseaudio` raises only this finding, not also
+    /// `pulseaudio-module-loading`.
+    #[test]
+    fn audio_policy_missing_fires_without_the_drop_in_and_names_where_to_put_it() {
+        let quiet = host().text(
+            "/usr/share/pipewire/pipewire-pulse.conf",
+            "pulse.properties = {\n    pulse.allow-module-loading = false\n}\n",
+        );
+        with(&quiet, |ctx| {
+            for node in ["pipewire", "pulseaudio"] {
+                let report = lint(ctx, &[node]);
+                assert_eq!(ids(&report), ["audio-policy-missing"], "{node}");
+                let finding = &report.findings[0];
+                assert_eq!(finding.severity, Severity::Warning, "{node}");
+                assert!(finding.message.contains(node), "{node}: {finding:?}");
+                for dir in [
+                    "/usr/share/wireplumber/wireplumber.conf.d",
+                    "/etc/wireplumber/wireplumber.conf.d",
+                    "/home/user/.config/wireplumber/wireplumber.conf.d",
+                ] {
+                    assert!(finding.message.contains(dir), "{node}: {finding:?}");
+                }
+                assert!(
+                    finding.help.contains("bubbler audio-policy --print >"),
+                    "{node}: {finding:?}"
+                );
+                assert!(
+                    finding.help.contains("restart WirePlumber"),
+                    "{node}: {finding:?}"
+                );
+            }
+            assert_eq!(ids(&lint(ctx, &["wayland"])), [] as [&str; 0]);
+        });
+    }
+
+    /// Whichever of the three directories holds the file, the grant is
+    /// scoped and the warning is silent.
+    #[test]
+    fn audio_policy_missing_is_silenced_by_any_of_the_three_directories() {
+        let (file, _, _) = fake::types();
+        for dir in [
+            "/usr/share/wireplumber/wireplumber.conf.d",
+            "/etc/wireplumber/wireplumber.conf.d",
+            "/home/user/.config/wireplumber/wireplumber.conf.d",
+        ] {
+            let quiet = host().with(&format!("{dir}/50-bubbler.conf"), file);
+            with(&quiet, |ctx| {
+                assert_eq!(ids(&lint(ctx, &["pipewire"])), [] as [&str; 0], "{dir}");
+            });
+        }
+    }
+
+    #[test]
+    fn audio_policy_missing_is_accepted_with_a_lint_allow() {
+        // `pipewire`, not `pulseaudio`: the latter also carries
+        // `pulseaudio-module-loading` on a host that says nothing about
+        // its pulse config, which this `lint-allow` does not name.
+        with(&host(), |ctx| {
+            assert_eq!(
+                ids(&lint(
+                    ctx,
+                    &["pipewire\nlint-allow \"audio-policy-missing\" \
+                         reason=\"packaged host\""]
+                )),
+                [] as [&str; 0]
             );
         });
     }
@@ -3714,12 +3854,20 @@ mod tests {
                 .unwrap_or_else(|err| panic!("{name}: {err}"))
                 .config;
             // This measures the profiles' own grants, not this host's
-            // pipewire config — otherwise every `pulseaudio` grant would
-            // carry `pulseaudio-module-loading` by the daemon's default.
-            let mut host = FakeHost::default().text(
-                "/usr/share/pipewire/pipewire-pulse.conf",
-                "pulse.properties = {\n    pulse.allow-module-loading = false\n}\n",
-            );
+            // pipewire config or whether the WirePlumber drop-in is
+            // installed — otherwise every `pipewire`/`pulseaudio` grant
+            // would carry `pulseaudio-module-loading` by the daemon's
+            // default or `audio-policy-missing` regardless of what the
+            // profile asks.
+            let mut host = FakeHost::default()
+                .text(
+                    "/usr/share/pipewire/pipewire-pulse.conf",
+                    "pulse.properties = {\n    pulse.allow-module-loading = false\n}\n",
+                )
+                .with(
+                    "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf",
+                    file,
+                );
             let mut add = |p: &Path, t| {
                 host = std::mem::take(&mut host)
                     .with(p.to_str().expect("built-in profiles hold UTF-8 paths"), t);

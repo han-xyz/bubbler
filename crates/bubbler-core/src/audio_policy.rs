@@ -1,10 +1,11 @@
 //! The WirePlumber policy drop-in (`contrib/wireplumber/50-bubbler.conf`)
 //! that scopes each instance's audio grant, embedded so bubbler can hand
-//! it out (`bubbler audio-policy --print`) without a checkout of the
-//! source tree it was built from.
+//! it out (`bubbler audio-policy --print`) and detect its absence
+//! (R9) without touching the source tree it was built from.
 
 use std::path::PathBuf;
 
+use crate::config::InstanceConfig;
 use crate::env::Env;
 use crate::host::Host;
 
@@ -36,6 +37,41 @@ pub fn installed(host: &dyn Host, env: &Env) -> Option<PathBuf> {
         let path = dir.join(DROP_IN_NAME);
         host.file_type(&path).is_some().then_some(path)
     })
+}
+
+/// Exact text of the run-time warning (R9), without the `bubbler:
+/// warning:` prefix every diagnostic bubbler prints already carries.
+pub const RUN_WARNING: &str = "audio policy drop-in 50-bubbler.conf not found in any \
+     wireplumber.conf.d: the sandbox has full access to every PipeWire node (microphone \
+     and every other client's audio reachable)";
+
+/// [`RUN_WARNING`], where this run needs it: `cfg` grants `pipewire` or
+/// `pulseaudio` and no host directory holds the drop-in. Printed once
+/// per real run (`main.rs`'s `Run`, `Try` and `Open`), never for
+/// `--dry-run` or `--explain`, which carry their own framing.
+pub fn run_warning(cfg: &InstanceConfig, host: &dyn Host, env: &Env) -> Option<&'static str> {
+    (cfg.audio().is_some() && installed(host, env).is_none()).then_some(RUN_WARNING)
+}
+
+/// Suffix a `pipewire`/`pulseaudio` `--explain` group header takes
+/// where the drop-in is absent (R9): the grant looks scoped to what the
+/// config asks for and in fact reaches everything.
+///
+/// `crate::explain::render` (`explain.rs`) is where every other group's
+/// header note (`KMS_NOTE`, `NVIDIA_NOTE`) is appended, but its `View`
+/// carries no host or env to call [`installed`] with, and threading one
+/// through touches every `explain::View` literal in the tree, several of
+/// them in `launcher.rs`'s tests — Task 3's file. Not wired here; see
+/// the task report for the call site and the one field `View` needs.
+pub const EXPLAIN_SUFFIX: &str = " (policy drop-in not found: microphone reachable)";
+
+/// [`EXPLAIN_SUFFIX`] where the drop-in is absent, else `""` — ready to
+/// append to an audio group's header unconditionally once wired in.
+pub fn explain_suffix(host: &dyn Host, env: &Env) -> &'static str {
+    match installed(host, env) {
+        Some(_) => "",
+        None => EXPLAIN_SUFFIX,
+    }
 }
 
 #[cfg(test)]
@@ -108,5 +144,35 @@ mod tests {
     fn installed_is_none_where_no_directory_holds_it() {
         let e = env();
         assert_eq!(installed(&FakeHost::default(), &e), None);
+    }
+
+    #[test]
+    fn run_warning_fires_only_for_an_audio_grant_with_no_drop_in() {
+        let e = env();
+        let (file, _, _) = fake::types();
+        let installed_host = FakeHost::default().with(
+            install_dirs(&e)[0].join(DROP_IN_NAME).to_str().unwrap(),
+            file,
+        );
+        let audio = crate::config::parse("pipewire\ncommand \"true\"").unwrap();
+        let silent = crate::config::parse("command \"true\"").unwrap();
+        assert_eq!(
+            run_warning(&audio, &FakeHost::default(), &e),
+            Some(RUN_WARNING)
+        );
+        assert_eq!(run_warning(&audio, &installed_host, &e), None);
+        assert_eq!(run_warning(&silent, &FakeHost::default(), &e), None);
+    }
+
+    #[test]
+    fn explain_suffix_is_empty_once_the_drop_in_is_installed() {
+        let e = env();
+        let (file, _, _) = fake::types();
+        assert_eq!(explain_suffix(&FakeHost::default(), &e), EXPLAIN_SUFFIX);
+        let host = FakeHost::default().with(
+            install_dirs(&e)[2].join(DROP_IN_NAME).to_str().unwrap(),
+            file,
+        );
+        assert_eq!(explain_suffix(&host, &e), "");
     }
 }
