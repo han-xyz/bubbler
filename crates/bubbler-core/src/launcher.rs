@@ -1615,6 +1615,18 @@ pub fn start_pw_pulse(
     if let Some(parent) = socket.parent() {
         mkdir_private(parent)?;
     }
+    // What a run that was killed before its handle could clean up left
+    // there, removed the way the Wayland listener's is: readiness below
+    // is this name appearing, so a leftover would be taken for the new
+    // server's socket and bound while that server was still starting —
+    // and the sandbox would hold a socket nothing listens on. A second
+    // run of one instance is refused long before this, so anything at
+    // this name is a dead run's.
+    if let Err(e) = std::fs::remove_file(&socket)
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        return Err(LaunchError::Io(socket.clone(), e));
+    }
     write_pulse_config(env, host, dir)?;
     let mut alloc = RealAlloc::sidecar(dir.to_path_buf());
     let argv = pw_pulse_argv(env, dir, host, &mut alloc)?;

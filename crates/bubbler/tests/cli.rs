@@ -2862,6 +2862,77 @@ fn real_bwrap_pulseaudio_serves_a_private_server() {
     );
 }
 
+/// A run that is killed outright leaves its private pulse socket in the
+/// instance's runtime directory. The next run must be answered by the
+/// server it starts and not by what the dead one left, which nothing is
+/// listening on any more.
+#[test]
+fn real_bwrap_pulseaudio_replaces_the_socket_a_killed_run_left() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    if !require_pulse_session() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_audio(tmp.path(), &init)
+        .args(["create", "audiostale"])
+        .status()
+        .unwrap();
+    let cfg = tmp
+        .path()
+        .join("data/bubbler/instances/audiostale/config.kdl");
+    std::fs::write(&cfg, "pulseaudio\ncommand \"true\"\n").unwrap();
+    let instance = session_pipewire()
+        .expect("checked above")
+        .with_file_name("bubbler/audiostale");
+    let pulse = instance.join("pw/pulse");
+    std::fs::create_dir_all(&pulse).unwrap();
+    for dir in [&instance, &instance.join("pw"), &pulse] {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let stale = pulse.join("native");
+    let _ = std::fs::remove_file(&stale);
+    // Bound and dropped: what is left is a socket with no server behind
+    // it, exactly what a killed run leaves.
+    drop(UnixListener::bind(&stale).expect("a socket where the dead run's was"));
+
+    let out = bubbler_audio(tmp.path(), &init)
+        .args([
+            "run",
+            "audiostale",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            "pactl info 2>&1",
+        ])
+        .output()
+        .unwrap();
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        said.contains("Server Name: PulseAudio (on PipeWire"),
+        "{said}"
+    );
+    assert!(
+        !instance.join("pw").exists(),
+        "the sidecar directory is left: {instance:?}"
+    );
+
+    let out = bubbler_audio(tmp.path(), &init)
+        .args(["delete", "audiostale", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn real_bwrap_gamepad_uinput_binds_the_node_and_says_so() {
     if !require_bwrap() {
