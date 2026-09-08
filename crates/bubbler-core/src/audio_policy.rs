@@ -5,7 +5,7 @@
 //! the host's `wireplumber.conf.d` directories holds the drop-in,
 //! without touching the source tree it was built from.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::InstanceConfig;
 use crate::env::Env;
@@ -28,12 +28,14 @@ pub const DROP_IN_NAME: &str = "50-bubbler.conf";
 pub const HOOK: &str =
     include_str!("../../../contrib/wireplumber/scripts/bubbler/refuse-links.lua");
 
-/// Path WirePlumber loads the hook under, relative to a `scripts`
-/// directory: `$WIREPLUMBER_DATA_DIR`, `$XDG_DATA_HOME/wireplumber`,
-/// `$XDG_DATA_DIRS/*/wireplumber` or `/usr/share/wireplumber`, in that
-/// order. Not a `wireplumber.conf.d` directory and not `/etc`: script
-/// lookup is the data-directory search, which holds neither.
+/// Path WirePlumber loads the hook under, relative to one of
+/// [`hook_dirs`]; the name the drop-in's `wireplumber.components` gives
+/// it, so the two must change together.
 pub const HOOK_NAME: &str = "bubbler/refuse-links.lua";
+
+/// Where WirePlumber was built to look for its own scripts, which the
+/// default `$XDG_DATA_DIRS` also ends with.
+const DATA_DIR: &str = "/usr/share";
 
 /// The three `wireplumber.conf.d` directories bubbler looks for the
 /// drop-in in, in the order [`installed`] searches.
@@ -43,6 +45,32 @@ pub fn install_dirs(env: &Env) -> [PathBuf; 3] {
         PathBuf::from("/etc/wireplumber/wireplumber.conf.d"),
         env.config_home.join("wireplumber/wireplumber.conf.d"),
     ]
+}
+
+/// The `wireplumber/scripts` directories bubbler looks for the hook in,
+/// in the order [`hook_installed`] searches.
+///
+/// A script is found by the *data*-directory search and not the
+/// configuration one the drop-in is found by, so none of
+/// [`install_dirs`] is among these and `/etc` is not either:
+/// `$XDG_DATA_HOME`, then `$XDG_DATA_DIRS`, then the directory
+/// WirePlumber was built with, which the default `$XDG_DATA_DIRS`
+/// already holds and which is listed once either way — these are what a
+/// diagnostic names.
+/// `$WIREPLUMBER_DATA_DIR`, which would replace the whole search, is not
+/// consulted: a session that sets it is a WirePlumber developer's.
+pub fn hook_dirs(env: &Env) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::with_capacity(env.data_dirs.len() + 2);
+    let bases = std::iter::once(env.data_home.as_path())
+        .chain(env.data_dirs.iter().map(PathBuf::as_path))
+        .chain(std::iter::once(Path::new(DATA_DIR)));
+    for base in bases {
+        let dir = base.join("wireplumber/scripts");
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
 }
 
 /// Full path of the installed drop-in: the first of [`install_dirs`]
@@ -56,33 +84,101 @@ pub fn installed(host: &dyn Host, env: &Env) -> Option<PathBuf> {
     })
 }
 
-/// Exact text of the warning a real run prints when the drop-in is not
-/// installed, without the `bubbler: warning:` prefix every diagnostic
-/// bubbler prints already carries.
-pub const RUN_WARNING: &str = "audio policy drop-in 50-bubbler.conf not found in any \
-     wireplumber.conf.d: the sandbox has full access to every PipeWire node (microphone \
-     and every other client's audio reachable)";
-
-/// [`RUN_WARNING`], where this run needs it: `cfg` grants `pipewire` or
-/// `pulseaudio` and no host directory holds the drop-in. Printed once
-/// per real run (`main.rs`'s `Run`, `Try` and `Open`), never for
-/// `--dry-run` or `--explain`, which carry their own framing.
-pub fn run_warning(cfg: &InstanceConfig, host: &dyn Host, env: &Env) -> Option<&'static str> {
-    (cfg.audio().is_some() && installed(host, env).is_none()).then_some(RUN_WARNING)
+/// Full path of the installed hook: the first of [`hook_dirs`] that
+/// holds [`HOOK_NAME`]; `None` where none does.
+pub fn hook_installed(host: &dyn Host, env: &Env) -> Option<PathBuf> {
+    hook_dirs(env).into_iter().find_map(|dir| {
+        let path = dir.join(HOOK_NAME);
+        host.file_type(&path).is_some().then_some(path)
+    })
 }
 
-/// Suffix a `pipewire`/`pulseaudio` `--explain` group header takes
-/// where the drop-in is absent: the grant looks scoped to what the
-/// config asks for and in fact reaches everything. `crate::explain::render`
-/// appends it in the same place a group's `KMS_NOTE`/`NVIDIA_NOTE` lands.
-pub const EXPLAIN_SUFFIX: &str = " (policy drop-in not found: microphone reachable)";
+/// Which half of the policy a host does not hold. Both are needed: the
+/// drop-in scopes the grant, and the hook refuses the links a
+/// permission cannot express.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Missing {
+    /// No `wireplumber.conf.d` holds [`DROP_IN_NAME`].
+    DropIn,
+    /// No `wireplumber/scripts` directory holds [`HOOK_NAME`].
+    Hook,
+    /// Neither.
+    Both,
+}
 
-/// [`EXPLAIN_SUFFIX`] where the drop-in is absent, else `""`, for an
-/// audio group's header.
+/// Exact text of the warning a real run prints for each case, without
+/// the `bubbler: warning:` prefix every diagnostic bubbler prints
+/// already carries.
+const RUN_WARNING_DROP_IN: &str = "audio policy drop-in not found (50-bubbler.conf): the \
+     sandbox has full access to every PipeWire node (microphone and every other client's \
+     audio reachable)";
+const RUN_WARNING_HOOK: &str = "audio policy hook script not found \
+     (bubbler/refuse-links.lua): the sandbox has full access to every PipeWire node \
+     (microphone and every other client's audio reachable)";
+const RUN_WARNING_BOTH: &str = "audio policy drop-in and hook script not found \
+     (50-bubbler.conf, bubbler/refuse-links.lua): the sandbox has full access to every \
+     PipeWire node (microphone and every other client's audio reachable)";
+
+/// Suffix a `pipewire`/`pulseaudio` `--explain` group header takes for
+/// each case: the grant looks scoped to what the config asks for and in
+/// fact reaches more. `crate::explain::render` appends it in the same
+/// place a group's `KMS_NOTE`/`NVIDIA_NOTE` lands.
+const EXPLAIN_SUFFIX_DROP_IN: &str =
+    " (policy drop-in 50-bubbler.conf not found: microphone reachable)";
+const EXPLAIN_SUFFIX_HOOK: &str =
+    " (policy hook script bubbler/refuse-links.lua not found: microphone reachable)";
+const EXPLAIN_SUFFIX_BOTH: &str = " (policy drop-in 50-bubbler.conf and hook script \
+     bubbler/refuse-links.lua not found: microphone reachable)";
+
+impl Missing {
+    /// The line a real run prints on stderr for this case.
+    pub fn run_warning(self) -> &'static str {
+        match self {
+            Missing::DropIn => RUN_WARNING_DROP_IN,
+            Missing::Hook => RUN_WARNING_HOOK,
+            Missing::Both => RUN_WARNING_BOTH,
+        }
+    }
+
+    /// What `--explain` appends to the audio group's header for it.
+    pub fn explain_suffix(self) -> &'static str {
+        match self {
+            Missing::DropIn => EXPLAIN_SUFFIX_DROP_IN,
+            Missing::Hook => EXPLAIN_SUFFIX_HOOK,
+            Missing::Both => EXPLAIN_SUFFIX_BOTH,
+        }
+    }
+}
+
+/// What this host is missing of the policy, or `None` where it holds
+/// both files.
+pub fn missing(host: &dyn Host, env: &Env) -> Option<Missing> {
+    match (
+        installed(host, env).is_some(),
+        hook_installed(host, env).is_some(),
+    ) {
+        (true, true) => None,
+        (false, true) => Some(Missing::DropIn),
+        (true, false) => Some(Missing::Hook),
+        (false, false) => Some(Missing::Both),
+    }
+}
+
+/// The warning where this run needs it: `cfg` grants `pipewire` or
+/// `pulseaudio` and the host holds less than the whole policy. Printed
+/// once per real run (`main.rs`'s `Run`, `Try` and `Open`), never for
+/// `--dry-run` or `--explain`, which carry their own framing.
+pub fn run_warning(cfg: &InstanceConfig, host: &dyn Host, env: &Env) -> Option<&'static str> {
+    cfg.audio()?;
+    Some(missing(host, env)?.run_warning())
+}
+
+/// The suffix an audio group's header takes, `""` where the host holds
+/// the whole policy.
 pub fn explain_suffix(host: &dyn Host, env: &Env) -> &'static str {
-    match installed(host, env) {
-        Some(_) => "",
-        None => EXPLAIN_SUFFIX,
+    match missing(host, env) {
+        Some(case) => case.explain_suffix(),
+        None => "",
     }
 }
 
@@ -121,6 +217,64 @@ mod tests {
             pasta_override: None,
             wl_proxy_override: None,
             net_proxy_override: None,
+        }
+    }
+
+    /// Every combination of the two files a host can hold.
+    fn holding(paths: &[PathBuf]) -> FakeHost {
+        let (file, _, _) = fake::types();
+        let mut host = FakeHost::default();
+        for path in paths {
+            host = host.with(path.to_str().expect("the fixture's paths are UTF-8"), file);
+        }
+        host
+    }
+
+    #[test]
+    fn missing_names_the_half_the_host_does_not_hold() {
+        let e = env();
+        let drop_in = install_dirs(&e)[0].join(DROP_IN_NAME);
+        let hook = hook_dirs(&e)[0].join(HOOK_NAME);
+        assert_eq!(
+            missing(&holding(&[drop_in.clone(), hook.clone()]), &e),
+            None
+        );
+        assert_eq!(missing(&holding(&[hook]), &e), Some(Missing::DropIn));
+        assert_eq!(missing(&holding(&[drop_in]), &e), Some(Missing::Hook));
+        assert_eq!(missing(&holding(&[]), &e), Some(Missing::Both));
+    }
+
+    #[test]
+    fn hook_installed_finds_the_file_in_any_data_directory() {
+        let e = env();
+        for dir in hook_dirs(&e) {
+            let path = dir.join(HOOK_NAME);
+            assert_eq!(
+                hook_installed(&holding(std::slice::from_ref(&path)), &e),
+                Some(path),
+                "{}",
+                dir.display()
+            );
+        }
+    }
+
+    /// A diagnostic names the file the host is missing and not the one
+    /// it has, or the reader installs the wrong half.
+    #[test]
+    fn every_diagnostic_names_the_files_it_is_about() {
+        for (case, named, unnamed) in [
+            (Missing::DropIn, &[DROP_IN_NAME][..], &[HOOK_NAME][..]),
+            (Missing::Hook, &[HOOK_NAME][..], &[DROP_IN_NAME][..]),
+            (Missing::Both, &[DROP_IN_NAME, HOOK_NAME][..], &[][..]),
+        ] {
+            for text in [case.run_warning(), case.explain_suffix()] {
+                for file in named {
+                    assert!(text.contains(file), "{case:?}: {text}");
+                }
+                for file in unnamed {
+                    assert!(!text.contains(file), "{case:?}: {text}");
+                }
+            }
         }
     }
 
@@ -170,32 +324,43 @@ mod tests {
     }
 
     #[test]
-    fn run_warning_fires_only_for_an_audio_grant_with_no_drop_in() {
+    fn run_warning_fires_only_for_an_audio_grant_with_half_a_policy() {
         let e = env();
-        let (file, _, _) = fake::types();
-        let installed_host = FakeHost::default().with(
-            install_dirs(&e)[0].join(DROP_IN_NAME).to_str().unwrap(),
-            file,
-        );
+        let whole = holding(&[
+            install_dirs(&e)[0].join(DROP_IN_NAME),
+            hook_dirs(&e)[0].join(HOOK_NAME),
+        ]);
         let audio = crate::config::parse("pipewire\ncommand \"true\"").unwrap();
         let silent = crate::config::parse("command \"true\"").unwrap();
         assert_eq!(
             run_warning(&audio, &FakeHost::default(), &e),
-            Some(RUN_WARNING)
+            Some(Missing::Both.run_warning())
         );
-        assert_eq!(run_warning(&audio, &installed_host, &e), None);
+        assert_eq!(
+            run_warning(
+                &audio,
+                &holding(&[install_dirs(&e)[0].join(DROP_IN_NAME)]),
+                &e
+            ),
+            Some(Missing::Hook.run_warning())
+        );
+        assert_eq!(run_warning(&audio, &whole, &e), None);
         assert_eq!(run_warning(&silent, &FakeHost::default(), &e), None);
     }
 
     #[test]
-    fn explain_suffix_is_empty_once_the_drop_in_is_installed() {
+    fn explain_suffix_is_empty_once_both_files_are_installed() {
         let e = env();
-        let (file, _, _) = fake::types();
-        assert_eq!(explain_suffix(&FakeHost::default(), &e), EXPLAIN_SUFFIX);
-        let host = FakeHost::default().with(
-            install_dirs(&e)[2].join(DROP_IN_NAME).to_str().unwrap(),
-            file,
+        assert_eq!(
+            explain_suffix(&FakeHost::default(), &e),
+            Missing::Both.explain_suffix()
         );
-        assert_eq!(explain_suffix(&host, &e), "");
+        let half = holding(&[install_dirs(&e)[2].join(DROP_IN_NAME)]);
+        assert_eq!(explain_suffix(&half, &e), Missing::Hook.explain_suffix());
+        let whole = holding(&[
+            install_dirs(&e)[2].join(DROP_IN_NAME),
+            hook_dirs(&e)[0].join(HOOK_NAME),
+        ]);
+        assert_eq!(explain_suffix(&whole, &e), "");
     }
 }

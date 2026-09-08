@@ -1152,9 +1152,9 @@ fn microphone_note(i: usize, node: &KdlNode, name: &str, f: &mut Findings) {
 /// rather than once per node, and names the first audio node found
 /// across them; a config granting both gets one finding, not two.
 fn audio_policy_missing(ctx: &Context, sources: &[Source], f: &mut Findings) {
-    if audio_policy::installed(ctx.host, ctx.env).is_some() {
+    let Some(case) = audio_policy::missing(ctx.host, ctx.env) else {
         return;
-    }
+    };
     let Some((i, node, name)) = sources.iter().enumerate().find_map(|(i, s)| {
         s.flat
             .iter()
@@ -1164,24 +1164,65 @@ fn audio_policy_missing(ctx: &Context, sources: &[Source], f: &mut Findings) {
         return;
     };
     let dirs = audio_policy::install_dirs(ctx.env);
-    f.push(
-        i,
-        node,
-        &AUDIO_POLICY_MISSING,
-        format!(
-            "no WirePlumber policy drop-in ({}) is installed in {}, {} or {}: this `{name}` \
-             grant reaches every PipeWire node instead of what it asks for — microphone and \
-             every other client's audio included",
-            audio_policy::DROP_IN_NAME,
-            dirs[0].display(),
-            dirs[1].display(),
-            dirs[2].display(),
-        ),
-        &format!(
-            "install it with `bubbler audio-policy --print > {}` and restart WirePlumber",
-            dirs[2].join(audio_policy::DROP_IN_NAME).display()
-        ),
+    let hook_dirs = audio_policy::hook_dirs(ctx.env);
+    let drop_in = format!(
+        "no WirePlumber policy drop-in ({}) is installed in {}, {} or {}",
+        audio_policy::DROP_IN_NAME,
+        dirs[0].display(),
+        dirs[1].display(),
+        dirs[2].display(),
     );
+    let hook = format!(
+        "no policy hook script ({}) is installed in {}",
+        audio_policy::HOOK_NAME,
+        hook_dirs
+            .iter()
+            .map(|dir| dir.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    // The hook is the half that decides links, so its absence leaves the
+    // grant scoped and the output mix still readable; without the drop-in
+    // nothing is scoped at all.
+    let message = match case {
+        audio_policy::Missing::DropIn => format!(
+            "{drop_in}: this `{name}` grant reaches every PipeWire node instead of what it \
+             asks for — microphone and every other client's audio included"
+        ),
+        audio_policy::Missing::Hook => format!(
+            "{hook}: this `{name}` grant is scoped, but a capture stream can still record \
+             the sink's monitor ports — every other client's audio"
+        ),
+        audio_policy::Missing::Both => format!(
+            "{drop_in}, and {hook}: this `{name}` grant reaches every PipeWire node instead \
+             of what it asks for — microphone and every other client's audio included"
+        ),
+    };
+    let write_drop_in = format!(
+        "bubbler audio-policy --print > {}",
+        dirs[2].join(audio_policy::DROP_IN_NAME).display()
+    );
+    let script = hook_dirs[0].join(audio_policy::HOOK_NAME);
+    let write_hook = format!(
+        "mkdir -p {} && bubbler audio-policy --print --script > {}",
+        script
+            .parent()
+            .expect("the hook's name has a directory in it")
+            .display(),
+        script.display()
+    );
+    let help = match case {
+        audio_policy::Missing::DropIn => {
+            format!("install it with `{write_drop_in}` and restart WirePlumber")
+        }
+        audio_policy::Missing::Hook => {
+            format!("install it with `{write_hook}` and restart WirePlumber")
+        }
+        audio_policy::Missing::Both => format!(
+            "install them with `{write_drop_in}` and `{write_hook}`, then restart WirePlumber"
+        ),
+    };
+    f.push(i, node, &AUDIO_POLICY_MISSING, message, &help);
 }
 
 /// Checks that need one layer and nothing else, apart from `host_net`:
@@ -2094,6 +2135,9 @@ mod tests {
         FakeHost::default().with("/usr/bin/foot", file)
     }
 
+    /// The hook where the fake environment's `$XDG_DATA_HOME` puts it.
+    const HOOK_PATH: &str = "/home/user/.local/share/wireplumber/scripts/bubbler/refuse-links.lua";
+
     /// The filter is a note, not a warning: it is what the config asked
     /// for, and what it says is what address filtering cannot do.
     #[test]
@@ -2375,10 +2419,12 @@ mod tests {
     #[test]
     fn pipewire_microphone_is_a_note_and_the_bare_grant_is_not() {
         let (file, _, _) = fake::types();
-        let quiet = host().with(
-            "/home/user/.config/wireplumber/wireplumber.conf.d/50-bubbler.conf",
-            file,
-        );
+        let quiet = host()
+            .with(
+                "/home/user/.config/wireplumber/wireplumber.conf.d/50-bubbler.conf",
+                file,
+            )
+            .with(HOOK_PATH, file);
         with(&quiet, |ctx| {
             for node in ["pipewire", "pulseaudio"] {
                 let text = format!("{node} {{\n    microphone\n}}");
@@ -3628,8 +3674,8 @@ mod tests {
         });
     }
 
-    /// Whichever of the three directories holds the file, the grant is
-    /// scoped and the warning is silent.
+    /// Whichever of the three directories holds the drop-in, with the
+    /// hook beside it the grant is scoped and the warning is silent.
     #[test]
     fn audio_policy_missing_is_silenced_by_any_of_the_three_directories() {
         let (file, _, _) = fake::types();
@@ -3638,9 +3684,37 @@ mod tests {
             "/etc/wireplumber/wireplumber.conf.d",
             "/home/user/.config/wireplumber/wireplumber.conf.d",
         ] {
-            let quiet = host().with(&format!("{dir}/50-bubbler.conf"), file);
+            let quiet = host()
+                .with(&format!("{dir}/50-bubbler.conf"), file)
+                .with(HOOK_PATH, file);
             with(&quiet, |ctx| {
                 assert_eq!(ids(&lint(ctx, &["pipewire"])), [] as [&str; 0], "{dir}");
+            });
+        }
+    }
+
+    /// Half a policy is its own finding: which file to write is what the
+    /// reader needs, and the two go in directories of different kinds.
+    #[test]
+    fn audio_policy_missing_names_the_half_that_is_absent() {
+        let (file, _, _) = fake::types();
+        let drop_in = "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf";
+        for (held, named, unnamed) in [
+            (drop_in, "bubbler/refuse-links.lua", "50-bubbler.conf"),
+            (HOOK_PATH, "50-bubbler.conf", "bubbler/refuse-links.lua"),
+        ] {
+            let half = host().with(held, file);
+            with(&half, |ctx| {
+                let report = lint(ctx, &["pipewire"]);
+                assert_eq!(ids(&report), ["audio-policy-missing"], "{held}");
+                let finding = &report.findings[0];
+                assert!(finding.message.contains(named), "{held}: {finding:?}");
+                assert!(!finding.message.contains(unnamed), "{held}: {finding:?}");
+                assert!(finding.help.contains(named), "{held}: {finding:?}");
+                assert!(
+                    finding.help.contains("restart WirePlumber"),
+                    "{held}: {finding:?}"
+                );
             });
         }
     }
@@ -3692,10 +3766,12 @@ mod tests {
             // host has the WirePlumber drop-in installed — otherwise
             // every `pipewire`/`pulseaudio` grant would carry
             // `audio-policy-missing` regardless of what the profile asks.
-            let mut host = FakeHost::default().with(
-                "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf",
-                file,
-            );
+            let mut host = FakeHost::default()
+                .with(
+                    "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf",
+                    file,
+                )
+                .with(HOOK_PATH, file);
             let mut add = |p: &Path, t| {
                 host = std::mem::take(&mut host)
                     .with(p.to_str().expect("built-in profiles hold UTF-8 paths"), t);

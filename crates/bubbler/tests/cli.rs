@@ -27,6 +27,29 @@ use rustix::fs::{FlockOperation, OFlags, fcntl_getfl, flock};
 use rustix::process::{Pid, Signal, kill_process};
 use rustix::termios::{ControlModes, InputModes, LocalModes, OutputModes, tcgetattr};
 
+/// Write the policy under a test root, where the isolated
+/// `$XDG_CONFIG_HOME` and `$XDG_DATA_HOME` put it: `drop_in` for the
+/// half that scopes the grant, `hook` for the half that refuses the
+/// links. A test that wants neither finding installs both.
+fn install_audio_policy(root: &Path, drop_in: bool, hook: bool) {
+    if drop_in {
+        let dir = root.join("config/wireplumber/wireplumber.conf.d");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(bubbler_core::audio_policy::DROP_IN_NAME),
+            bubbler_core::audio_policy::DROP_IN,
+        )
+        .unwrap();
+    }
+    if hook {
+        let path = root
+            .join("data/wireplumber/scripts")
+            .join(bubbler_core::audio_policy::HOOK_NAME);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bubbler_core::audio_policy::HOOK).unwrap();
+    }
+}
+
 fn setup() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join("home")).unwrap();
@@ -673,7 +696,7 @@ fn explain_says_the_audio_policy_drop_in_is_missing() {
         .find(|l| l.starts_with("  pipewire"))
         .unwrap_or_else(|| panic!("no pipewire group in {s}"));
     assert!(
-        header.ends_with(bubbler_core::audio_policy::EXPLAIN_SUFFIX),
+        header.ends_with(bubbler_core::audio_policy::Missing::Both.explain_suffix()),
         "{header}"
     );
 }
@@ -684,13 +707,7 @@ fn explain_says_nothing_about_the_policy_where_the_drop_in_is_installed() {
         return;
     }
     let tmp = setup();
-    std::fs::create_dir_all(tmp.path().join("config/wireplumber/wireplumber.conf.d")).unwrap();
-    std::fs::write(
-        tmp.path()
-            .join("config/wireplumber/wireplumber.conf.d/50-bubbler.conf"),
-        bubbler_core::audio_policy::DROP_IN,
-    )
-    .unwrap();
+    install_audio_policy(tmp.path(), true, true);
     bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
     let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
     std::fs::write(&cfg, "pipewire\ncommand \"true\"\n").unwrap();
@@ -5376,7 +5393,7 @@ fn audio_policy_warns_before_a_real_run_without_the_drop_in() {
     let err = String::from_utf8_lossy(&out.stderr);
     let expected = format!(
         "bubbler: warning: {}",
-        bubbler_core::audio_policy::RUN_WARNING
+        bubbler_core::audio_policy::Missing::Both.run_warning()
     );
     assert!(err.contains(&expected), "{err}");
     // No pipewire-0 socket in the fake $XDG_RUNTIME_DIR, so the run
@@ -5389,22 +5406,35 @@ fn audio_policy_warns_before_a_real_run_without_the_drop_in() {
     assert!(!String::from_utf8_lossy(&out.stderr).contains(&expected));
 }
 
+/// Half a policy is still a warning, and it names the half that is
+/// missing rather than the one the host has.
 #[test]
-fn audio_policy_is_silent_before_a_real_run_with_the_drop_in_installed() {
+fn audio_policy_warns_before_a_real_run_with_only_the_drop_in() {
     let tmp = setup();
-    std::fs::create_dir_all(tmp.path().join("config/wireplumber/wireplumber.conf.d")).unwrap();
-    std::fs::write(
-        tmp.path()
-            .join("config/wireplumber/wireplumber.conf.d/50-bubbler.conf"),
-        bubbler_core::audio_policy::DROP_IN,
-    )
-    .unwrap();
+    install_audio_policy(tmp.path(), true, false);
     bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
     let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
     std::fs::write(&cfg, "pipewire\ncommand \"/usr/bin/true\"\n").unwrap();
     let out = bubbler(tmp.path()).args(["run", "t"]).output().unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(!err.contains("audio policy drop-in"), "{err}");
+    let expected = format!(
+        "bubbler: warning: {}",
+        bubbler_core::audio_policy::Missing::Hook.run_warning()
+    );
+    assert!(err.contains(&expected), "{err}");
+    assert_eq!(out.status.code(), Some(1), "{err}");
+}
+
+#[test]
+fn audio_policy_is_silent_before_a_real_run_with_the_whole_policy_installed() {
+    let tmp = setup();
+    install_audio_policy(tmp.path(), true, true);
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "pipewire\ncommand \"/usr/bin/true\"\n").unwrap();
+    let out = bubbler(tmp.path()).args(["run", "t"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("audio policy"), "{err}");
     // Still fails on the missing pipewire-0 socket, just not on the policy.
     assert_eq!(out.status.code(), Some(1), "{err}");
 }
@@ -9067,13 +9097,7 @@ fn run(tmp: &Path, args: &[&str]) -> (i32, String, String) {
 #[test]
 fn profile_lint_notes_a_microphone_child() {
     let tmp = setup();
-    std::fs::create_dir_all(tmp.path().join("config/wireplumber/wireplumber.conf.d")).unwrap();
-    std::fs::write(
-        tmp.path()
-            .join("config/wireplumber/wireplumber.conf.d/50-bubbler.conf"),
-        bubbler_core::audio_policy::DROP_IN,
-    )
-    .unwrap();
+    install_audio_policy(tmp.path(), true, true);
     write_profile(
         tmp.path(),
         "user",
@@ -9140,13 +9164,7 @@ fn profile_lint_all_reads_every_layer_once_and_json_carries_the_counts() {
     // this, the counts below would measure whether this test's fake
     // $XDG_CONFIG_HOME has the WirePlumber drop-in (`audio-policy-missing`)
     // rather than the profiles' own grants.
-    std::fs::create_dir_all(tmp.path().join("config/wireplumber/wireplumber.conf.d")).unwrap();
-    std::fs::write(
-        tmp.path()
-            .join("config/wireplumber/wireplumber.conf.d/50-bubbler.conf"),
-        bubbler_core::audio_policy::DROP_IN,
-    )
-    .unwrap();
+    install_audio_policy(tmp.path(), true, true);
     let (code, out, err) = run(
         tmp.path(),
         &["profile", "lint", "--all", "--format", "json"],

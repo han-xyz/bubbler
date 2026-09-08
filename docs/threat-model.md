@@ -836,15 +836,15 @@ able to tell the two cases apart. A host with no WirePlumber, an older
 one, or no drop-in installed therefore gives every `pipewire`/
 `pulseaudio` grant the session's whole reach, silently. bubbler cannot
 close that gap from inside a sandbox; what it does instead is say so
-loudly, every time: a `bubbler: warning: audio policy drop-in
-50-bubbler.conf not found in any wireplumber.conf.d: the sandbox has
-full access to every PipeWire node (microphone and every other client's
-audio reachable)` line on every real run, the same fact appended to the
-group under `--explain`, and a host-conditional `audio-policy-missing`
-lint warning that does name the three install directories and the
-`bubbler audio-policy --print` fix. The hook's absence is not detected
-at all: bubbler looks for the drop-in and says nothing about the script
-beside it.
+loudly, every time, and about each half of the policy separately: a
+`bubbler: warning: audio policy drop-in and hook script not found
+(50-bubbler.conf, bubbler/refuse-links.lua): the sandbox has full access
+to every PipeWire node (microphone and every other client's audio
+reachable)` line on every real run — `drop-in` or `hook script` alone
+where only one is absent — the same fact appended to the group under
+`--explain`, and a host-conditional `audio-policy-missing` lint warning
+that does name the directories each file is looked for in and the
+`bubbler audio-policy --print` / `--print --script` fix.
 
 The private pulse server closes a gap the context alone cannot: a pulse
 client can `LOAD_MODULE` a server into loading `module-native-protocol-tcp`

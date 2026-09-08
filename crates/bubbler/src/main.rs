@@ -511,18 +511,19 @@ Write the WirePlumber policy bubbler ships to stdout, byte for byte, so it can
 be installed without a checkout of the source tree. It is two files, and both
 are needed:
 
-    bubbler audio-policy --print > /usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf
-    bubbler audio-policy --print --script > /usr/share/wireplumber/scripts/bubbler/refuse-links.lua
+    bubbler audio-policy --print > ~/.config/wireplumber/wireplumber.conf.d/50-bubbler.conf
+    bubbler audio-policy --print --script > ~/.local/share/wireplumber/scripts/bubbler/refuse-links.lua
 
-The drop-in also goes in `/etc/wireplumber/wireplumber.conf.d/` or the per-user
-`$XDG_CONFIG_HOME/wireplumber/wireplumber.conf.d/`; the script's directory is a
-data directory and not a config one, so per-user it is
-`$XDG_DATA_HOME/wireplumber/scripts/bubbler/`. Restart WirePlumber afterwards.
-Without the drop-in installed, a `pipewire` or `pulseaudio` grant reaches every
-PipeWire node instead of what it asks for — `run`, `--explain` and `lint` all
-say so. Without the script beside it the grant is scoped but a sandbox can
-still record the sink's monitor ports, which carry every other application's
-audio.")]
+The drop-in also goes in `/usr/share/wireplumber/wireplumber.conf.d/` or
+`/etc/wireplumber/wireplumber.conf.d/`; the script's directory is a data
+directory and not a config one, so system-wide it is
+`/usr/share/wireplumber/scripts/bubbler/` and never `/etc`. Create the
+directories first and restart WirePlumber afterwards. Without the drop-in
+installed, a `pipewire` or `pulseaudio` grant reaches every PipeWire node
+instead of what it asks for; without the script beside it the grant is scoped
+but a sandbox can still record the sink's monitor ports, which carry every
+other application's audio. `run`, `--explain` and `lint` each say which of the
+two is missing.")]
     AudioPolicy {
         /// Write the policy to stdout.
         #[arg(long, required = true)]

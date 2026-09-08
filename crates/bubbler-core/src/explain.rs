@@ -95,10 +95,10 @@ pub struct View<'a> {
     /// line; nothing else of the explanation depends on it.
     pub net_proxy_log: bool,
     /// What an audio grant's group header ends with:
-    /// [`crate::audio_policy::EXPLAIN_SUFFIX`] where this host has no
-    /// policy drop-in, else empty. Asked of the host by the caller, like
-    /// `bwrap` below: an explanation describes a run, and probes for it
-    /// itself.
+    /// [`crate::audio_policy::Missing::explain_suffix`] where this host
+    /// holds less than the whole policy, else empty. Asked of the host
+    /// by the caller, like `bwrap` below: an explanation describes a
+    /// run, and probes for it itself.
     pub audio_policy: &'static str,
     /// The sidecar's argv rather than the sandbox's: its groups are the
     /// rules themselves, and a grant that contributes neither an argument
@@ -1272,13 +1272,13 @@ bwrap
                 .filter(|l| l.starts_with("  pipewire") || l.starts_with("  pulseaudio"))
                 .collect::<Vec<_>>()
         };
-        let absent = headers(crate::audio_policy::EXPLAIN_SUFFIX);
+        let absent = headers(crate::audio_policy::Missing::Both.explain_suffix());
         assert!(
-            absent[0].ends_with(crate::audio_policy::EXPLAIN_SUFFIX),
+            absent[0].ends_with(crate::audio_policy::Missing::Both.explain_suffix()),
             "{absent:?}"
         );
         assert!(
-            !absent[1].ends_with(crate::audio_policy::EXPLAIN_SUFFIX),
+            !absent[1].ends_with(crate::audio_policy::Missing::Both.explain_suffix()),
             "{absent:?}"
         );
         assert!(

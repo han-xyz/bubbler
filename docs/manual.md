@@ -4189,18 +4189,24 @@ A `pipewire` or `pulseaudio` grant needs the WirePlumber policy that
 scopes it installed — the drop-in and the linking hook it loads — and
 WirePlumber restarted:
 
-    bubbler audio-policy --print > /usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf
-    bubbler audio-policy --print --script > /usr/share/wireplumber/scripts/bubbler/refuse-links.lua
+    mkdir -p ~/.config/wireplumber/wireplumber.conf.d \
+             ~/.local/share/wireplumber/scripts/bubbler
+    bubbler audio-policy --print > \
+        ~/.config/wireplumber/wireplumber.conf.d/50-bubbler.conf
+    bubbler audio-policy --print --script > \
+        ~/.local/share/wireplumber/scripts/bubbler/refuse-links.lua
     systemctl --user restart wireplumber
 
-(or `/etc/wireplumber/wireplumber.conf.d/`, or the per-user
-`$XDG_CONFIG_HOME/wireplumber/wireplumber.conf.d/` — the three places
-`bubbler lint` and a run's own warning name). Without it a `pipewire` or
-`pulseaudio` grant reaches every PipeWire node instead of what it asks
-for. The hook goes in a *data* directory rather than a config one —
-per-user, `$XDG_DATA_HOME/wireplumber/scripts/bubbler/` — and without it
-beside the drop-in the grant is scoped but a sandbox can still record
-the sink's monitor ports, which carry every other application's audio.
+The drop-in also goes in `/usr/share/wireplumber/wireplumber.conf.d/` or
+`/etc/wireplumber/wireplumber.conf.d/` — the three places `bubbler lint`
+names. The hook goes in a *data* directory rather than a config one, so
+its system-wide home is `/usr/share/wireplumber/scripts/bubbler/` and
+never `/etc`: a script is found by `$XDG_DATA_HOME`, `$XDG_DATA_DIRS`
+and `/usr/share`. Without the drop-in a `pipewire` or `pulseaudio` grant
+reaches every PipeWire node instead of what it asks for; without the
+hook beside it the grant is scoped but a sandbox can still record the
+sink's monitor ports, which carry every other application's audio. A run
+and `bubbler lint` say which of the two is missing.
 
 Packaging lives in a repository of its own, not in this one.
 

@@ -1576,15 +1576,20 @@ mod tests {
 
             // The host is built from what the pasted config asks for, so
             // the run measures the grants and not this machine. This also
-            // marks the WirePlumber drop-in installed, or every
-            // `pipewire`/`pulseaudio` grant would carry
+            // marks both files of the WirePlumber policy installed, or
+            // every `pipewire`/`pulseaudio` grant would carry
             // `audio-policy-missing` regardless of what the profile asks.
             let tmp = tempfile::tempdir().unwrap();
             let e = env(tmp.path());
-            let mut host = FakeHost::default().with(
-                "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf",
-                file,
-            );
+            let mut host = FakeHost::default()
+                .with(
+                    "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf",
+                    file,
+                )
+                .with(
+                    "/usr/share/wireplumber/scripts/bubbler/refuse-links.lua",
+                    file,
+                );
             {
                 let mut add = |p: &Path, t| {
                     host = std::mem::take(&mut host)

@@ -46,13 +46,16 @@ hidden),
 `dbus-name-is-risky` (a `dbus`/`system-bus` rule naming a name that is
 defensible but wide — KWin's or the GNOME shell's own bus name, the session's
 file manager, or the Secret Service), `audio-policy-missing` (a `pipewire`
-or `pulseaudio` grant with the WirePlumber policy drop-in installed in none
-of `/usr/share/wireplumber/wireplumber.conf.d/`,
+or `pulseaudio` grant with part of the WirePlumber policy not installed: the
+drop-in in none of `/usr/share/wireplumber/wireplumber.conf.d/`,
 `/etc/wireplumber/wireplumber.conf.d/` or
-`$XDG_CONFIG_HOME/wireplumber/wireplumber.conf.d/`: the grant is full access
-to every PipeWire node instead of what it asks for. Fix it with `bubbler
-audio-policy --print > <path>` naming one of those three directories and
-`50-bubbler.conf`, then restart WirePlumber).
+`$XDG_CONFIG_HOME/wireplumber/wireplumber.conf.d/`, or the hook script in no
+`wireplumber/scripts/` under `$XDG_DATA_HOME`, `$XDG_DATA_DIRS` or
+`/usr/share`. Without the drop-in the grant is full access to every PipeWire
+node instead of what it asks for; without the hook it is scoped but the sink's
+monitor ports stay recordable. The finding names the half that is missing and
+the `bubbler audio-policy --print` or `--print --script` that writes it, then
+restart WirePlumber).
 
 **Notes** (information): `allow-host-wildcard`, `app-runtime-rw`,
 `outbound-deny`, `ozone-hint-unnecessary`,

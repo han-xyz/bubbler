@@ -73,10 +73,11 @@ a sandbox off the sink's monitor ports and off another client's stream:
 without them installed (`bubbler audio-policy --print` and `--print
 --script`, see [Commands](Commands.md)) a sandbox reaches every PipeWire
 node regardless of what the config asks for; `bubbler lint` warns
-`audio-policy-missing`, and a run without it prints `bubbler: warning:
-audio policy drop-in 50-bubbler.conf not found in any
-wireplumber.conf.d: the sandbox has full access to every PipeWire node
-(microphone and every other client's audio reachable)` on stderr. The
+`audio-policy-missing`, and a run without them prints `bubbler: warning:
+audio policy drop-in and hook script not found (50-bubbler.conf,
+bubbler/refuse-links.lua): the sandbox has full access to every PipeWire
+node (microphone and every other client's audio reachable)` on stderr,
+naming whichever half the host is missing. The
 private pulse server refuses
 `LOAD_MODULE` on its own, drop-in or not. ALSA clients reach the same
 daemon through `/etc/alsa` (baseline). `/dev/snd` is never bound.
