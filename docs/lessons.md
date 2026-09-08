@@ -40,3 +40,14 @@ and the nested sandbox's own bind sees "No such file or directory".
 Generated files (`/etc/passwd`, `/.flatpak-info`, ...) are written to
 the runtime directory and bound read-only from there instead, so a
 path a nested sandbox can re-open still exists on disk.
+
+## A "hidden" claim is swept against the whole bound tree
+
+`etc "host"` promised the username stays hidden and overlaid the two
+files everyone names, `passwd` and `group`; the final review of 0.22
+found `/etc/passwd-`, `/etc/group-`, `/etc/subuid` and `/etc/subgid`
+world-readable through the same bind, each naming the account. When a
+grant binds a tree and a promise says one fact stays out of it, grep the
+bound tree for that fact from inside a live sandbox before the claim goes
+in a doc — the per-task reviews and the verifier both passed the two
+files they were told about.
