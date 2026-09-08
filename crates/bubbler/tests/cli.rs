@@ -525,7 +525,7 @@ fn dry_run_binds_the_planned_context_socket_and_not_the_sessions() {
     assert!(
         s.contains(&format!(
             "--ro-bind\n{}\n{}\n",
-            tmp.path().join("run/bubbler/t/pw/pipewire-0").display(),
+            tmp.path().join("run/bubbler/t/pipewire-0").display(),
             tmp.path().join("run/pipewire-0").display()
         )),
         "{s}"
@@ -2496,6 +2496,28 @@ fn real_bwrap_pipewire_context_tags_the_client() {
         std::thread::sleep(Duration::from_millis(200));
         clients = host_pw_clients("audioctx");
     }
+    let instance = session_pipewire()
+        .expect("checked above")
+        .with_file_name("bubbler/audioctx");
+    // Read while the run is up and judged once it is down: an assertion
+    // that failed here would leave the sandbox, its sidecar and their
+    // client on the session's daemon behind for every later run to see.
+    let bound = instance.join("pipewire-0").exists();
+    let context_dir = instance.join("pw").is_dir();
+
+    // The way a terminal ends a run: bubbler stops the sandbox and the
+    // sidecar behind it on its way out.
+    kill_process(Pid::from_child(&child), Signal::TERM).expect("the run is still going");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while child.try_wait().expect("waiting for the run").is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the run ignored SIGTERM");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
     // The instance id is this run's own pid: two runs of one instance
     // are two contexts on the daemon's side, not one name used twice.
     assert_eq!(
@@ -2507,32 +2529,23 @@ fn real_bwrap_pipewire_context_tags_the_client() {
             child.id()
         )
     );
-    let pw = session_pipewire()
-        .expect("checked above")
-        .with_file_name("bubbler/audioctx/pw");
-    assert!(pw.join("pipewire-0").exists(), "{pw:?}");
-
-    // The way a terminal ends a run: bubbler stops the sandbox and the
-    // sidecar behind it on its way out.
-    kill_process(Pid::from_child(&child), Signal::TERM).expect("the run is still going");
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        match child.try_wait().expect("waiting for the run") {
-            Some(_) => break,
-            None => assert!(
-                Instant::now() < deadline,
-                "the run ignored SIGTERM: {}",
-                String::from_utf8_lossy(&host_pw_clients("audioctx").into_bytes())
-            ),
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    // Bound from beside the directory the sidecar writes, not from
+    // inside it: what bwrap resolves is a name only bubbler can touch.
+    assert!(bound, "no context socket at {instance:?} during the run");
+    assert!(context_dir, "no context directory in {instance:?}");
     assert!(!bwrap_alive("bubbler-pw-hold"), "a sidecar sandbox is left");
     assert!(
         !process_running("pw-container", "audioctx"),
         "a pw-container is left"
     );
-    assert!(!pw.exists(), "the context directory is left: {pw:?}");
+    assert!(
+        !instance.join("pw").exists(),
+        "the context directory is left: {instance:?}"
+    );
+    assert!(
+        !instance.join("pipewire-0").exists(),
+        "the context socket is left: {instance:?}"
+    );
     assert!(
         host_pw_clients("audioctx").is_empty(),
         "the daemon still holds a client of the context"

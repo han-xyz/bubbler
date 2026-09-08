@@ -3992,7 +3992,7 @@ mod tests {
             &a,
             &[
                 "--ro-bind",
-                "/run/user/1000/bubbler/t/pw/pipewire-0",
+                "/run/user/1000/bubbler/t/pipewire-0",
                 "/run/user/1000/pipewire-0"
             ]
         ));

@@ -1263,6 +1263,9 @@ pub struct PwHandle {
     /// exited. `pw-container` unlinks the name it chose, which the
     /// holder renamed away, so what is left there is bubbler's.
     dir: PathBuf,
+    /// Removes the socket once it has been moved out of `dir`; `None`
+    /// until then, when whatever is in there goes with the directory.
+    _socket: Option<FileGuard>,
 }
 
 impl Drop for PwHandle {
@@ -1354,6 +1357,7 @@ pub fn start_pw_context(
         child,
         alloc,
         dir: pw,
+        _socket: None,
     };
     // The instance's own bwrap must not inherit these: a second holder
     // of the report pipe would keep bubbler from seeing it hang up.
@@ -1378,7 +1382,7 @@ pub fn start_pw_context(
         };
         return Err(LaunchError::PwContext(what));
     }
-    check_context_socket(dir)?;
+    handle._socket = Some(adopt_context_socket(dir, env.uid)?);
     Ok(Some(handle))
 }
 
@@ -1422,46 +1426,65 @@ fn read_report(ready: &OwnedFd, child: &mut Child, deadline: Instant) -> Option<
     }
 }
 
-/// Prove the context socket is a socket before bwrap binds it, without
-/// following a symlink: bwrap resolves a bind source through links, so
-/// one planted at this name would put whatever it points at into the
-/// sandbox instead.
-// Weaker than what the D-Bus proxy's socket gets ([`adopt_proxy_bus`]
-// moves it out of the sidecar's reach first, so its type cannot change
-// after the check): the context socket stays in the directory the
-// sidecar has as its `/tmp`, because that is the directory
-// `pw-container` creates it in and the one `--dry-run` names. The window
-// is between this check and bwrap's own resolution, and what could use
-// it is a `pw-container` that has been taken over — a process with no
-// network, a read-only root, and nothing of the application's input to
-// parse.
-fn check_context_socket(dir: &Path) -> Result<(), LaunchError> {
+/// Move the context socket out of the one directory the sidecar can
+/// write, then prove that what was moved is a socket of this user's.
+/// The returned guard removes it when the run ends.
+///
+/// The context keeps serving after the move: `pw-container` listens on
+/// the socket it bound, not on the path, and the sandbox connects
+/// through the new one.
+// The move comes first and the check second, as [`adopt_proxy_bus`]'s
+// does: the reverse leaves a window in which a sidecar that keeps
+// swapping the name can put a symlink in the place of the socket that
+// was just checked, and bwrap resolves a bind source through links.
+// Nothing outside the instance directory can touch the entry once it is
+// here, so its type cannot change after this. `O_NOFOLLOW` then makes a
+// symlink fail with ELOOP instead of being followed, since `stat`
+// through a path would report the type of the target.
+fn adopt_context_socket(dir: &Path, uid: u32) -> Result<FileGuard, LaunchError> {
+    let from = open_dir(&pipewire::dir(dir))?;
+    let to = open_dir(dir)?;
     let path = pipewire::socket(dir);
-    let at = open_dir(&pipewire::dir(dir))?;
-    let wrong_type = || LaunchError::WrongType {
+    rustix::fs::renameat(&from, pipewire::SOCKET_NAME, &to, pipewire::SOCKET_NAME).map_err(
+        |e| match e {
+            Errno::NOENT => LaunchError::MissingResource {
+                service: "pipewire",
+                path: pipewire::dir(dir).join(pipewire::SOCKET_NAME),
+            },
+            e => LaunchError::Io(path.clone(), e.into()),
+        },
+    )?;
+    // Whatever was moved is bubbler's to remove from here on, socket or not.
+    let guard = FileGuard(path.clone());
+    let wrong_type = |expected| LaunchError::WrongType {
         service: "pipewire",
         path: path.clone(),
-        expected: "a socket",
+        expected,
     };
     let socket = rustix::fs::openat(
-        &at,
+        &to,
         pipewire::SOCKET_NAME,
         OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(|e| match e {
-        Errno::LOOP => wrong_type(),
-        Errno::NOENT => LaunchError::MissingResource {
-            service: "pipewire",
-            path: path.clone(),
-        },
+        Errno::LOOP => wrong_type("a socket"),
         e => LaunchError::Io(path.clone(), e.into()),
     })?;
     let stat = rustix::fs::fstat(&socket).map_err(|e| LaunchError::Io(path.clone(), e.into()))?;
-    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Socket {
-        return Err(wrong_type());
+    let kind = rustix::fs::FileType::from_raw_mode(stat.st_mode);
+    if kind != rustix::fs::FileType::Socket {
+        // A directory cannot be unlinked as a file, and one left at this
+        // name would fail the rename of every later start of the instance.
+        if kind == rustix::fs::FileType::Directory {
+            remove_moved_dir(&to, pipewire::SOCKET_NAME, &path);
+        }
+        return Err(wrong_type("a socket"));
     }
-    Ok(())
+    if stat.st_uid != uid {
+        return Err(wrong_type("a socket owned by this user"));
+    }
+    Ok(guard)
 }
 
 /// Start the filtering D-Bus proxy for an instance in its own sandbox and

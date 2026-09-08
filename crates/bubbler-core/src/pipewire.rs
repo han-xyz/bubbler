@@ -83,9 +83,12 @@ pub fn dir(instance_runtime: &Path) -> PathBuf {
     instance_runtime.join("pw")
 }
 
-/// Host path of the context socket, once the holder has renamed it.
+/// Host path of the context socket the sandbox binds: beside [`dir`],
+/// never in it. The holder gives the socket its name in there and
+/// bubbler moves it here before anything binds it, so what bwrap
+/// resolves is a name the sidecar cannot reach.
 pub fn socket(instance_runtime: &Path) -> PathBuf {
-    dir(instance_runtime).join(SOCKET_NAME)
+    instance_runtime.join(SOCKET_NAME)
 }
 
 /// The grant set as the policy drop-in matches it.
@@ -186,16 +189,21 @@ mod tests {
     }
 
     #[test]
-    fn the_socket_is_named_under_the_instances_own_runtime_directory() {
-        let dir = Path::new("/run/user/1000/bubbler/t");
+    fn the_socket_is_named_beside_the_directory_the_sidecar_writes() {
+        let instance = Path::new("/run/user/1000/bubbler/t");
         assert_eq!(
-            socket(dir),
-            Path::new("/run/user/1000/bubbler/t/pw/pipewire-0")
+            socket(instance),
+            Path::new("/run/user/1000/bubbler/t/pipewire-0")
+        );
+        assert_eq!(dir(instance), Path::new("/run/user/1000/bubbler/t/pw"));
+        assert!(
+            !socket(instance).starts_with(dir(instance)),
+            "the socket bwrap binds is out of the sidecar's reach"
         );
         assert_eq!(
-            socket(dir).file_name(),
+            socket(instance).file_name(),
             Path::new(SOCKET_INSIDE).file_name(),
-            "the holder renames to one name, seen from two mount namespaces"
+            "the holder names it, and the move keeps that name"
         );
     }
 }
