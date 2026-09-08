@@ -1,11 +1,14 @@
 // bubbler profile: vesktop
 //
-// Sound is `pulseaudio`: Vesktop is Electron, whose audio backend opens
-// libpulse.so.0 (the string is in /usr/lib/electron40/electron), and the
-// socket that grant binds is the one it looks for, for the microphone in
-// a call as well as for playback. `pipewire` binds only pipewire-0, the
-// native socket, which Electron uses for screen capture rather than for
-// sound.
+// Sound is `pulseaudio { microphone }`: voice chat is what the app is
+// for, and Vesktop is Electron, whose audio backend opens libpulse.so.0
+// (the string is in /usr/lib/electron40/electron) and reaches it through
+// the socket that grant binds, for a call's playback and its capture
+// alike. `microphone` is what puts capture in reach at all — bare
+// `pulseaudio` is playback only under 0.23's policy — and it opens every
+// microphone and line-in the session has, and capture from them. `pipewire`
+// binds only pipewire-0, the native socket, which Electron uses for screen
+// capture rather than for sound.
 //
 // Extra Electron flags go in the private home's vesktop-flags.conf,
 // which /usr/bin/vesktop reads from $XDG_CONFIG_HOME. That wrapper also
@@ -46,6 +49,8 @@
 //     — the tray icon, and with it "close to tray". Needs `dbus`.
 wayland
 dri
-pulseaudio
+pulseaudio {
+    microphone
+}
 network
 command "vesktop"

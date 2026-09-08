@@ -3722,13 +3722,24 @@ mod tests {
             };
             let report =
                 lint_profile(&ctx, &resolver, name).unwrap_or_else(|err| panic!("{name}: {err}"));
+            // vesktop's own comment explains the `microphone` child it
+            // carries, which R14 allows: a note, not a defect.
+            let expected = if name == &"vesktop" {
+                vec![
+                    "note[pipewire-microphone]: `pulseaudio { microphone }` adds every \
+                     microphone and line-in the session has, and capture from them"
+                        .to_owned(),
+                ]
+            } else {
+                Vec::new()
+            };
             assert_eq!(
                 report
                     .findings
                     .iter()
                     .map(|f| format!("{}[{}]: {}", f.severity, f.id, f.message))
                     .collect::<Vec<_>>(),
-                Vec::<String>::new(),
+                expected,
                 "{name} does not lint clean"
             );
         }

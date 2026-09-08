@@ -1263,7 +1263,7 @@ mod tests {
         assert!(
             cfg("vesktop")
                 .services
-                .contains(&Service::Pulseaudio { microphone: false })
+                .contains(&Service::Pulseaudio { microphone: true })
         );
         let steam = cfg("steam");
         assert!(steam.services.contains(&Service::Gamepad {
@@ -1428,7 +1428,7 @@ mod tests {
             vec![
                 wayland(),
                 Service::Dri { kms: false },
-                Service::Pulseaudio { microphone: false },
+                Service::Pulseaudio { microphone: true },
                 network()
             ]
         );
@@ -1614,13 +1614,26 @@ mod tests {
             };
             let report =
                 lint::lint_profile(&ctx, &r, name).unwrap_or_else(|err| panic!("{name}: {err}"));
+            // vesktop's own live grant carries `microphone`, not an
+            // opt-in from its header block, so `pipewire-microphone`
+            // fires on it regardless of what is pasted; its header
+            // explains the note, which is what R14 asks for.
+            let expected = if *name == "vesktop" {
+                vec![
+                    "note[pipewire-microphone]: `pulseaudio { microphone }` adds every \
+                     microphone and line-in the session has, and capture from them"
+                        .to_owned(),
+                ]
+            } else {
+                Vec::new()
+            };
             assert_eq!(
                 report
                     .findings
                     .iter()
                     .map(|f| format!("{}[{}]: {}", f.severity, f.id, f.message))
                     .collect::<Vec<_>>(),
-                Vec::<String>::new(),
+                expected,
                 "{name} with its opt-ins pasted in does not lint clean"
             );
         }
