@@ -1377,6 +1377,12 @@ pub fn start_pw_context(
     let Some(audio) = inst.config.audio() else {
         return Ok(None);
     };
+    // Before anything is started, and not only where the sandbox's argv
+    // is built (`service::audio_context`, which is what a `--dry-run`
+    // fails on): a run reaches that point after this sidecar is up, so
+    // without this the missing tool would surface as a sidecar that
+    // never reported its socket.
+    service::require_file(host, "pipewire", PathBuf::from(pipewire::PW_CONTAINER))?;
     // The session's own daemon, which nothing but this sidecar reaches.
     // Probed here and not where the sandbox's argv is built: that argv
     // names only the context's socket, and an explanation of it describes
@@ -1627,6 +1633,11 @@ pub fn start_pw_pulse(
     {
         return Ok(None);
     }
+    // Before the configuration is written and the server started, for
+    // the reason the context sidecar's tool is: without it this server
+    // comes up with no protocol to serve, and the run would fail on the
+    // readiness deadline rather than on the package that is missing.
+    service::require_file(host, "pulseaudio", PathBuf::from(pipewire::PULSE_MODULE))?;
     // The sidecar's whole `/tmp`, and the only thing it can write.
     let pw = pipewire::pulse_dir(dir);
     mkdir_private(&pw)?;
@@ -4683,6 +4694,61 @@ mod tests {
             argv.iter()
                 .any(|a| a.contains(r#""bubbler.audio":"playback,microphone""#)),
             "{argv:?}"
+        );
+    }
+
+    /// R13: a live run stops on the missing tool, before a sidecar it
+    /// could never create the context with is started. The plan-time
+    /// check in `service` is what a `--dry-run` fails on; this is the
+    /// path a run takes.
+    #[test]
+    fn a_run_without_pw_container_starts_no_context_sidecar() {
+        use crate::host::fake::{FakeHost, types};
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let i = inst(tmp.path(), "pipewire\ncommand \"true\"\n");
+        let dir = instance_runtime_dir(&e, "t");
+        // The session's daemon is up: the tool is the one thing missing.
+        let (_, _, socket) = types();
+        let host = FakeHost::default().with(
+            pipewire::host_socket(&e.runtime_dir).to_str().unwrap(),
+            socket,
+        );
+        assert!(matches!(
+            start_pw_context(&e, &dir, &i, &host),
+            Err(LaunchError::MissingResource { service: "pipewire", ref path })
+                if path == Path::new(pipewire::PW_CONTAINER)
+        ));
+        assert!(!pipewire::dir(&dir).exists(), "a context directory is left");
+    }
+
+    /// R13, pulse half: the same for the module that makes the sidecar a
+    /// PulseAudio server — without it the server would come up without a
+    /// socket and the run would fail on a timeout instead.
+    #[test]
+    fn a_run_without_the_pulse_protocol_module_starts_no_server() {
+        use crate::host::fake::{FakeHost, types};
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let i = inst(tmp.path(), "pulseaudio\ncommand \"true\"\n");
+        let dir = instance_runtime_dir(&e, "t");
+        // Everything the server needs except the module itself.
+        let (file, _, _) = types();
+        let host = FakeHost::default().with(
+            pipewire::pulse_conf_dirs(&e.config_home)[2]
+                .join(pipewire::PULSE_CONF)
+                .to_str()
+                .unwrap(),
+            file,
+        );
+        assert!(matches!(
+            start_pw_pulse(&e, &dir, &i, &host),
+            Err(LaunchError::MissingResource { service: "pulseaudio", ref path })
+                if path == Path::new(pipewire::PULSE_MODULE)
+        ));
+        assert!(
+            !pipewire::pulse_dir(&dir).exists(),
+            "a server directory is left"
         );
     }
 
