@@ -500,6 +500,22 @@ fn pw_context_lines(instance: &str, audio: AudioSet) -> [String; 2] {
     ]
 }
 
+/// The private PulseAudio server a `pulseaudio` grant is served by, and
+/// what bubbler's own configuration of it withholds. It runs on the
+/// context the group above describes; only the protocol its clients
+/// speak is older.
+fn pw_pulse_lines() -> [String; 2] {
+    let mut sidecar = String::from("    sidecar:");
+    for arg in pipewire::pulse_command() {
+        sidecar.push(' ');
+        sidecar.push_str(&arg.to_string_lossy());
+    }
+    [
+        sidecar,
+        "    (pulse: a private server on this run's context, module loading refused)".to_owned(),
+    ]
+}
+
 /// The D-Bus proxy rules of the node at `index`, in the order the proxy
 /// is given them.
 fn rules_of(index: usize, rules: &[(usize, String)]) -> Vec<String> {
@@ -646,16 +662,21 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
                     // One context serves both audio nodes, so it is
                     // described under the first of them; a second group
                     // saying the same would read as a second sidecar.
-                    Some(Service::Pipewire { .. } | Service::Pulseaudio { .. })
-                        if audio_node(&view.cfg.services) == Some(i) =>
-                    {
-                        out.extend(
-                            view.cfg
-                                .audio()
-                                .map(|audio| pw_context_lines(view.instance, audio))
-                                .into_iter()
-                                .flatten(),
-                        );
+                    Some(s @ (Service::Pipewire { .. } | Service::Pulseaudio { .. })) => {
+                        if audio_node(&view.cfg.services) == Some(i) {
+                            out.extend(
+                                view.cfg
+                                    .audio()
+                                    .map(|audio| pw_context_lines(view.instance, audio))
+                                    .into_iter()
+                                    .flatten(),
+                            );
+                        }
+                        // The pulse server is one grant's own, however
+                        // many grants share the context above it.
+                        if matches!(s, Service::Pulseaudio { .. }) {
+                            out.extend(pw_pulse_lines());
+                        }
                     }
                     Some(Service::Wayland(WaylandMode::Host)) => {
                         out.push("    raw socket: wayland \"host\"".to_owned());
@@ -1135,6 +1156,78 @@ bwrap
                 "{out:#?}"
             );
         }
+    }
+
+    /// The pulse grant is served by a server of its own on the one
+    /// context both grants share, so its group names that server and the
+    /// context line stays where the first grant is.
+    #[test]
+    fn the_pulse_group_names_the_server_it_is_served_by() {
+        let cfg = cfg("pipewire\npulseaudio\ncommand \"true\"");
+        let lines = Lines::default();
+        let out = render(
+            &[
+                item(
+                    Origin::Service(0),
+                    &[
+                        "--ro-bind",
+                        "/run/user/1000/bubbler/t/pipewire-0",
+                        "/run/user/1000/pipewire-0",
+                    ],
+                    None,
+                ),
+                item(
+                    Origin::Service(1),
+                    &[
+                        "--ro-bind",
+                        "/run/user/1000/bubbler/t/pw/pulse/native",
+                        "/run/user/1000/pulse/native",
+                    ],
+                    None,
+                ),
+            ],
+            &View {
+                title: "bwrap",
+                instance: "t",
+                cfg: &cfg,
+                source: Source {
+                    file: "config.kdl",
+                    lines: &lines,
+                },
+                rules: &[],
+                wl_proxy: None,
+                audio_policy: "",
+                net_proxy_log: false,
+                proxy: false,
+                full: false,
+                bwrap: crate::version::Version::Known(0, 12, 0),
+            },
+        )
+        .unwrap();
+        let count = |needle: &str| out.iter().filter(|l| l.contains(needle)).count();
+        let at = |needle: &str| {
+            out.iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} is missing from {out:#?}"))
+        };
+        // One context for the instance, described under the first of its
+        // grants; the pulse server is the pulse group's own.
+        assert_eq!(count("(context: org.bubbler t playback)"), 1, "{out:#?}");
+        assert!(at("(context:") < at("  pulseaudio"), "{out:#?}");
+        assert_eq!(
+            count("sidecar: /usr/bin/pipewire -c pipewire-pulse.conf"),
+            1,
+            "{out:#?}"
+        );
+        assert!(
+            at("  pulseaudio") < at("sidecar: /usr/bin/pipewire"),
+            "{out:#?}"
+        );
+        assert_eq!(
+            count("(pulse: a private server on this run's context, module loading refused)"),
+            1,
+            "{out:#?}"
+        );
     }
 
     /// Where an absent policy drop-in is said: on the header of the one

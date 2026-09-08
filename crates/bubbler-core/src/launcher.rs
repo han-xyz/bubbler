@@ -71,6 +71,15 @@ const PW_READY: Duration = Duration::from_secs(5);
 /// killed.
 const PW_STOP: Duration = Duration::from_secs(5);
 
+/// How long the private PulseAudio server has to create its socket
+/// before the run is stopped. It reports readiness on nothing, so this
+/// bounds a wait on the socket appearing.
+const PULSE_READY: Duration = Duration::from_secs(5);
+
+/// How long that server may take to leave after SIGTERM before it is
+/// killed.
+const PULSE_STOP: Duration = Duration::from_secs(5);
+
 /// The longest report line the audio sidecar is read for. What the
 /// holder writes is a constant of bubbler's; anything longer is not the
 /// holder answering.
@@ -685,6 +694,50 @@ pub fn pw_context_argv(
     args.setenv(OsStr::new(pipewire::REPORT_FD), &report);
     let properties = pipewire::properties(ctx.instance, ctx.run_id, ctx.audio);
     args.finish_plain(&pipewire::command(&properties), alloc)
+}
+
+/// Complete bwrap argv (without the program name) for the sidecar that
+/// serves one instance's `pulseaudio` grant: a PulseAudio server of this
+/// run's own, connected to the run's security context.
+///
+/// It is given no readiness pipe. `pipewire` reports nothing on one, and
+/// what says the server is up is the socket appearing in the directory
+/// bubbler bound as its `/tmp`.
+pub fn pw_pulse_argv(
+    env: &Env,
+    instance_runtime: &Path,
+    host: &dyn Host,
+    alloc: &mut dyn FdAllocator,
+) -> Result<Vec<OsString>, LaunchError> {
+    let mut args = BwrapArgs::pw_pulse_baseline(
+        &pipewire::socket(instance_runtime),
+        Path::new(pipewire::REMOTE_INSIDE),
+        &pipewire::dir(instance_runtime),
+        host,
+    );
+    // No `seccomp` node of the instance's reaches this filter, for the
+    // reason it does not reach the context sidecar's: the process a
+    // grant is served through is not the process the grant is for.
+    args.tag(Origin::Seccomp);
+    if let Some(program) = seccomp::compile(&seccomp::RuleSet::default_set(), env.seccomp_log)? {
+        args.add_seccomp(program.bytes, program.arches);
+    }
+    args.tag(Origin::Command);
+    // The runtime directory is the bound `/tmp` and not the session's:
+    // this server writes its socket and its pid file under it, and the
+    // session's runtime directory is not in this sandbox at all.
+    args.setenv(OsStr::new("XDG_RUNTIME_DIR"), OsStr::new("/tmp"));
+    args.setenv(
+        OsStr::new("PIPEWIRE_REMOTE"),
+        OsStr::new(pipewire::REMOTE_INSIDE),
+    );
+    // Which replaces the whole config search path, so the copy bubbler
+    // wrote is the only configuration this server can read.
+    args.setenv(
+        OsStr::new("PIPEWIRE_CONFIG_DIR"),
+        OsStr::new(pipewire::PULSE_CONFIG_INSIDE),
+    );
+    args.finish_plain(&pipewire::pulse_command(), alloc)
 }
 
 /// Complete bwrap argv (without the program name) for the D-Bus proxy
@@ -1485,6 +1538,168 @@ fn adopt_context_socket(dir: &Path, uid: u32) -> Result<FileGuard, LaunchError> 
         return Err(wrong_type("a socket owned by this user"));
     }
     Ok(guard)
+}
+
+/// A run's private PulseAudio server: the sidecar it runs in.
+///
+/// Dropping the handle stops it, so it must outlive the sandbox that
+/// connects through its socket — and it is dropped before
+/// [`PwHandle`], since this server is a client of that context. What it
+/// wrote goes with the context directory the other handle removes.
+#[derive(Debug)]
+pub struct PulseHandle {
+    /// The sidecar sandbox: bwrap, `pipewire` in it.
+    child: Child,
+    /// Holds the descriptors that spawn inherited; clearing it is what
+    /// closes them.
+    alloc: RealAlloc,
+}
+
+impl Drop for PulseHandle {
+    /// Stop the server: SIGTERM, then SIGKILL if it is still there. The
+    /// signal goes to bwrap, whose `--die-with-parent` takes the server
+    /// inside it down with it.
+    fn drop(&mut self) {
+        if still_running(&mut self.child) {
+            if let Some(pid) = i32::try_from(self.child.id()).ok().and_then(Pid::from_raw) {
+                let _ = kill_process(pid, Signal::TERM);
+            }
+            let deadline = Instant::now() + PULSE_STOP;
+            loop {
+                match self.child.try_wait() {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) => {}
+                }
+                if Instant::now() >= deadline {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    break;
+                }
+                std::thread::sleep(POLL);
+            }
+        }
+        self.alloc.fds.clear();
+    }
+}
+
+/// Start this run's private PulseAudio server and wait for its socket,
+/// so the socket is there for bwrap to bind. `Ok(None)` where the
+/// instance grants no `pulseaudio`. The handle must outlive the sandbox.
+///
+/// Called after [`start_pw_context`], whose socket this server connects
+/// to, and before the argv is built, like every other sidecar: a bind
+/// whose source is not there is a failed start rather than a sandbox
+/// without audio.
+///
+/// Marks every descriptor of the calling process above stdio that this
+/// spawn is not meant to hand over close-on-exec, so an embedder's own
+/// open files do not cross into the sidecar; none is closed.
+pub fn start_pw_pulse(
+    env: &Env,
+    dir: &Path,
+    inst: &Instance,
+    host: &dyn Host,
+) -> Result<Option<PulseHandle>, LaunchError> {
+    if !inst
+        .config
+        .services
+        .iter()
+        .any(|s| matches!(s, Service::Pulseaudio { .. }))
+    {
+        return Ok(None);
+    }
+    let socket = pipewire::pulse_socket(dir);
+    // The server binds the address it is given and creates no directory
+    // for it (measured on 1.6.8: "bind() to '/tmp/pulse/native' failed:
+    // No such file or directory"), so this is bubbler's to make.
+    if let Some(parent) = socket.parent() {
+        mkdir_private(parent)?;
+    }
+    write_pulse_config(env, host, dir)?;
+    let mut alloc = RealAlloc::sidecar(dir.to_path_buf());
+    let argv = pw_pulse_argv(env, dir, host, &mut alloc)?;
+    alloc.inheritable(true).map_err(LaunchError::Data)?;
+    spawning(&alloc.intended())?;
+    let child = Command::new("bwrap")
+        .args(&argv)
+        .spawn()
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => LaunchError::BwrapMissing,
+            _ => LaunchError::Spawn(e),
+        })?;
+    // From here on every exit path stops the sidecar through the handle.
+    let mut handle = PulseHandle { child, alloc };
+    // The instance's own bwrap must not inherit the seccomp descriptor
+    // this argv was built with.
+    handle.alloc.inheritable(false).map_err(LaunchError::Data)?;
+    let deadline = Instant::now() + PULSE_READY;
+    loop {
+        if socket.exists() {
+            return Ok(Some(handle));
+        }
+        if let Ok(Some(status)) = handle.child.try_wait() {
+            return Err(LaunchError::PwPulse(format!("it exited ({status})")));
+        }
+        if Instant::now() >= deadline {
+            return Err(LaunchError::PwPulse(format!(
+                "it did not create `{}` within {PULSE_READY:?}",
+                socket.display()
+            )));
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+/// Write the configuration of this run's private PulseAudio server into
+/// the sidecar's own directory and return the directory its
+/// `PIPEWIRE_CONFIG_DIR` names (R6).
+///
+/// The host's effective `pipewire-pulse.conf` is copied rather than
+/// pointed at: `PIPEWIRE_CONFIG_DIR` replaces the search path whole and
+/// has no fallback for the main file. Only that file is copied — the
+/// user's own fragments beside it are left where they are, since one of
+/// them setting `server.address` would decide which socket this run
+/// serves and where it lands.
+fn write_pulse_config(env: &Env, host: &dyn Host, dir: &Path) -> Result<PathBuf, LaunchError> {
+    let dirs = pipewire::pulse_conf_dirs(&env.config_home);
+    let source = pipewire::pulse_conf(host, &env.config_home).ok_or_else(|| {
+        // The last directory searched is the one the package ships, so
+        // that is the path a report can be acted on.
+        LaunchError::MissingResource {
+            service: "pulseaudio",
+            path: dirs[dirs.len() - 1].join(pipewire::PULSE_CONF),
+        }
+    })?;
+    let text = std::fs::read(&source).map_err(|e| LaunchError::Io(source.clone(), e))?;
+    let cfg = pipewire::pulse_config_dir(dir);
+    let drop_in = cfg.join(pipewire::PULSE_DROP_IN);
+    let drop_in_dir = drop_in
+        .parent()
+        .expect("PULSE_DROP_IN names a file inside a directory");
+    mkdir_private(&cfg)?;
+    mkdir_private(drop_in_dir)?;
+    write_private(&cfg.join(pipewire::PULSE_CONF), &text)?;
+    write_private(&drop_in, pipewire::PULSE_OVERRIDE.as_bytes())?;
+    Ok(cfg)
+}
+
+/// Write `content` to `path`, readable and writable by this user alone.
+///
+/// `O_NOFOLLOW` so a link cannot move the write out of the runtime
+/// directory, and the mode is set rather than left to the umask or to
+/// what an earlier run gave the file.
+fn write_private(path: &Path, content: &[u8]) -> Result<(), LaunchError> {
+    let io_at = |e: Errno| LaunchError::Io(path.to_path_buf(), e.into());
+    let file = rustix::fs::open(
+        path,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(io_at)?;
+    rustix::fs::fchmod(&file, Mode::RUSR | Mode::WUSR).map_err(io_at)?;
+    std::fs::File::from(file)
+        .write_all(content)
+        .map_err(|e| LaunchError::Io(path.to_path_buf(), e))
 }
 
 /// Start the filtering D-Bus proxy for an instance in its own sandbox and
@@ -3015,6 +3230,10 @@ pub fn run(
     // grant binds is the one this sidecar's holder creates, and it is
     // the only PipeWire socket the sandbox is given.
     let _pw_context = start_pw_context(env, &dir, inst, &RealHost)?;
+    // After the context, which it connects to, and before the sandbox,
+    // whose only PulseAudio socket it serves. Dropped before the context
+    // handle, since this server is one of that context's clients.
+    let _pw_pulse = start_pw_pulse(env, &dir, inst, &RealHost)?;
     let host = tty::host_stdio()?;
     let is_tty = tty::host_is_tty();
     let mut stdio = tty::plan(mode, is_tty);
@@ -4424,6 +4643,132 @@ mod tests {
                 .any(|a| a.contains(r#""bubbler.audio":"playback,microphone""#)),
             "{argv:?}"
         );
+    }
+
+    /// R4, pulse half: the private pulse server reaches this run's own
+    /// security context and nothing else of the session — not the
+    /// daemon's socket, not a home, not the network.
+    #[test]
+    fn pw_pulse_argv_runs_the_pulse_server_in_its_own_sandbox() {
+        use crate::host::fake::FakeHost;
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let dir = instance_runtime_dir(&e, "t");
+        let argv = pw_pulse_argv(
+            &e,
+            &dir,
+            &FakeHost::default(),
+            &mut DryRunAlloc::sidecar(dir.clone()),
+        )
+        .unwrap();
+        let run = e.runtime_dir.display().to_string();
+        assert_eq!(
+            strs(&argv),
+            vec![
+                "--unshare-all".to_owned(),
+                "--die-with-parent".to_owned(),
+                "--new-session".to_owned(),
+                "--add-seccomp-fd".to_owned(),
+                "3".to_owned(),
+                "--ro-bind".to_owned(),
+                "/usr".to_owned(),
+                "/usr".to_owned(),
+                "--symlink".to_owned(),
+                "usr/bin".to_owned(),
+                "/bin".to_owned(),
+                "--symlink".to_owned(),
+                "usr/lib".to_owned(),
+                "/lib".to_owned(),
+                "--symlink".to_owned(),
+                "usr/lib64".to_owned(),
+                "/lib64".to_owned(),
+                "--symlink".to_owned(),
+                "usr/bin".to_owned(),
+                "/sbin".to_owned(),
+                "--size".to_owned(),
+                "67108864".to_owned(),
+                "--tmpfs".to_owned(),
+                "/etc".to_owned(),
+                "--proc".to_owned(),
+                "/proc".to_owned(),
+                "--dev".to_owned(),
+                "/dev".to_owned(),
+                "--size".to_owned(),
+                "67108864".to_owned(),
+                "--tmpfs".to_owned(),
+                "/tmp".to_owned(),
+                "--ro-bind".to_owned(),
+                format!("{run}/bubbler/t/pipewire-0"),
+                "/run/pipewire-0".to_owned(),
+                "--bind".to_owned(),
+                format!("{run}/bubbler/t/pw"),
+                "/tmp".to_owned(),
+                "--clearenv".to_owned(),
+                "--setenv".to_owned(),
+                "XDG_RUNTIME_DIR".to_owned(),
+                "/tmp".to_owned(),
+                "--setenv".to_owned(),
+                "PIPEWIRE_REMOTE".to_owned(),
+                "/run/pipewire-0".to_owned(),
+                "--setenv".to_owned(),
+                "PIPEWIRE_CONFIG_DIR".to_owned(),
+                "/tmp/cfg".to_owned(),
+                "--".to_owned(),
+                "/usr/bin/pipewire".to_owned(),
+                "-c".to_owned(),
+                "pipewire-pulse.conf".to_owned(),
+            ]
+        );
+    }
+
+    /// R6: what the private pulse server reads is the host's own
+    /// configuration plus bubbler's two settings, in a directory only
+    /// this user can open.
+    #[test]
+    fn the_pulse_config_is_the_hosts_copied_with_bubblers_fragment_beside_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let text = "pulse.properties = { server.address = [ \"unix:native\" ] }\n";
+        let source = e.config_home.join("pipewire").join(pipewire::PULSE_CONF);
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, text).unwrap();
+        let dir = instance_runtime_dir(&e, "t");
+        std::fs::create_dir_all(pipewire::dir(&dir)).unwrap();
+
+        let cfg = write_pulse_config(&e, &RealHost, &dir).unwrap();
+
+        assert_eq!(cfg, pipewire::pulse_config_dir(&dir));
+        assert_eq!(
+            std::fs::read_to_string(cfg.join(pipewire::PULSE_CONF)).unwrap(),
+            text
+        );
+        assert_eq!(
+            std::fs::read_to_string(cfg.join(pipewire::PULSE_DROP_IN)).unwrap(),
+            pipewire::PULSE_OVERRIDE
+        );
+        let mode = |p: PathBuf| std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(cfg.clone()), 0o700);
+        assert_eq!(mode(cfg.join("pipewire-pulse.conf.d")), 0o700);
+        assert_eq!(mode(cfg.join(pipewire::PULSE_CONF)), 0o600);
+        assert_eq!(mode(cfg.join(pipewire::PULSE_DROP_IN)), 0o600);
+    }
+
+    /// `PIPEWIRE_CONFIG_DIR` has no fallback for the main file, so a host
+    /// holding none is a run that would fail inside a sidecar; it fails
+    /// here instead, naming the file it looked for last.
+    #[test]
+    fn a_host_with_no_pulse_configuration_is_named_rather_than_started_without_one() {
+        use crate::host::fake::FakeHost;
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let dir = instance_runtime_dir(&e, "t");
+        std::fs::create_dir_all(pipewire::dir(&dir)).unwrap();
+        assert!(matches!(
+            write_pulse_config(&e, &FakeHost::default(), &dir),
+            Err(LaunchError::MissingResource { service: "pulseaudio", ref path })
+                if path == Path::new("/usr/share/pipewire/pipewire-pulse.conf")
+        ));
     }
 
     #[test]

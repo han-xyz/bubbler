@@ -546,6 +546,37 @@ impl BwrapArgs {
         a
     }
 
+    /// The sandbox the private PulseAudio server of a `pulseaudio` grant
+    /// runs in: the sidecar baseline, this run's own context socket
+    /// read-only at `inside`, and `dir` as the whole of `/tmp`.
+    ///
+    /// The session's own `pipewire-0` is not in here at all — this
+    /// server is a client of the instance's security context like any
+    /// other, so what it may do is what the session manager grants the
+    /// instance. `inside` is a path of bubbler's choosing rather than
+    /// the socket's own: the sandbox has no runtime directory of the
+    /// session's to put it in. `/tmp` is bound for the same reason it is
+    /// in [`BwrapArgs::pw_context_baseline`] — it is where the socket
+    /// this server listens on lands, and `dir` is the instance's own.
+    pub fn pw_pulse_baseline(socket: &Path, inside: &Path, dir: &Path, host: &dyn Host) -> Self {
+        let mut a = Self::sidecar_baseline(host);
+        let o = OsStr::new;
+        let b = Origin::Baseline;
+        push(
+            &mut a.skeleton,
+            b,
+            [o("--ro-bind"), socket.as_os_str(), inside.as_os_str()],
+        );
+        // After the baseline's own `--tmpfs /tmp`, which this replaces:
+        // bwrap applies filesystem operations in the order given.
+        push(
+            &mut a.skeleton,
+            b,
+            [o("--bind"), dir.as_os_str(), o("/tmp")],
+        );
+        a
+    }
+
     /// The sandbox the Wayland proxy sidecar runs in: the sidecar
     /// baseline plus `upstream`, the compositor socket it forwards the
     /// application's connection to, read-only and at its own path.

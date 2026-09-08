@@ -75,7 +75,7 @@ pub fn apply_all(
             } => home_share(env, args, host, path, *mode, *optional)?,
             Service::Dri { kms } => dri(args, host, *kms)?,
             Service::Pipewire { .. } => pipewire(env, args, host, ctx)?,
-            Service::Pulseaudio { .. } => pulseaudio(env, args, host)?,
+            Service::Pulseaudio { .. } => pulseaudio(env, args, host, ctx)?,
             Service::EtcShare { name } => etc_share(args, host, name)?,
             Service::AppRuntime { id, mode } => app_runtime(env, args, id, *mode),
             Service::Dbus { .. } => dbus_socket(env, args, ctx),
@@ -649,14 +649,34 @@ fn audio_context(host: &dyn Host) -> Result<(), LaunchError> {
     Ok(())
 }
 
-/// Bind the PulseAudio native socket at the same path and set
-/// `PULSE_SERVER` to it so clients find the socket.
-fn pulseaudio(env: &Env, args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
+/// Bind the socket of this instance's own PulseAudio server where a
+/// client looks for one, and set `PULSE_SERVER` to it.
+///
+/// The session's own pulse socket is not bound: that server is the
+/// session's, loads modules for whoever asks and knows nothing of this
+/// instance. The one bound here is a `pipewire-pulse` the launcher
+/// starts for this run alone, connected to the instance's security
+/// context, so every pulse client of the sandbox arrives on the daemon
+/// tagged like a native one — and it refuses to load a module.
+///
+/// The source is not probed, for the reason [`pipewire`]'s is not: it
+/// exists only once that sidecar has created it, and a `--dry-run` names
+/// the path a run would bind with nothing started at all.
+fn pulseaudio(
+    env: &Env,
+    args: &mut BwrapArgs,
+    host: &dyn Host,
+    ctx: &ServiceCtx,
+) -> Result<(), LaunchError> {
     audio_context(host)?;
-    let p = require_socket(host, "pulseaudio", env.runtime_dir.join("pulse/native"))?;
-    args.ro_bind(&p, &p);
+    // The module that makes the sidecar a pulse server, from a package
+    // of its own; named here so a host without it is a refusal that says
+    // what to install rather than a sidecar that never comes up.
+    require_file(host, "pulseaudio", PathBuf::from(pipewire::PULSE_MODULE))?;
+    let inside = env.runtime_dir.join("pulse/native");
+    args.ro_bind(&pipewire::pulse_socket(&ctx.instance_runtime), &inside);
     let mut value = OsString::from("unix:");
-    value.push(p.as_os_str());
+    value.push(inside.as_os_str());
     args.setenv(OsStr::new("PULSE_SERVER"), &value);
     Ok(())
 }
@@ -3974,6 +3994,7 @@ mod tests {
     fn audio_host() -> Vec<(&'static str, Kind)> {
         vec![
             (crate::pipewire::PW_CONTAINER, File),
+            (crate::pipewire::PULSE_MODULE, File),
             ("/run/user/1000/pipewire-0", Sock),
             ("/run/user/1000/pipewire-0-manager", Sock),
             ("/run/user/1000/pulse/native", Sock),
@@ -4013,7 +4034,7 @@ mod tests {
     }
 
     #[test]
-    fn pulseaudio_binds_the_socket_and_names_it() {
+    fn pulseaudio_binds_this_instances_private_server_and_not_the_sessions() {
         let a = argv(
             &[Service::Pulseaudio { microphone: false }],
             &env(),
@@ -4024,10 +4045,12 @@ mod tests {
             &a,
             &[
                 "--ro-bind",
-                "/run/user/1000/pulse/native",
+                "/run/user/1000/bubbler/t/pw/pulse/native",
                 "/run/user/1000/pulse/native"
             ]
         ));
+        // The name the sandbox finds it under is the usual one, so
+        // `PULSE_SERVER` says what it has always said.
         assert!(has_seq(
             &a,
             &[
@@ -4036,16 +4059,31 @@ mod tests {
                 "unix:/run/user/1000/pulse/native"
             ]
         ));
+        // The session's own pulse socket is bound from nowhere: a client
+        // that reached it would be a client of the session's server,
+        // which loads modules and knows nothing of this instance.
+        assert!(
+            !binds(&a)
+                .windows(2)
+                .any(|w| w == ["--ro-bind", "/run/user/1000/pulse/native"]
+                    || w == ["--bind", "/run/user/1000/pulse/native"]),
+            "{a:?}"
+        );
+    }
+
+    /// R13, pulse half: the pulse protocol module is its own package,
+    /// and a host without it would fail inside the sidecar with no
+    /// socket ever appearing.
+    #[test]
+    fn pulseaudio_without_the_pulse_protocol_module_is_refused_before_anything_starts() {
+        let host: Vec<(&str, Kind)> = audio_host()
+            .into_iter()
+            .filter(|(p, _)| *p != crate::pipewire::PULSE_MODULE)
+            .collect();
         assert!(matches!(
-            argv(
-                &[Service::Pulseaudio { microphone: false }],
-                &env(),
-                &[(crate::pipewire::PW_CONTAINER, File)]
-            ),
-            Err(LaunchError::MissingResource {
-                service: "pulseaudio",
-                ..
-            })
+            argv(&[Service::Pulseaudio { microphone: false }], &env(), &host),
+            Err(LaunchError::MissingResource { service: "pulseaudio", ref path })
+                if path == Path::new(crate::pipewire::PULSE_MODULE)
         ));
     }
 

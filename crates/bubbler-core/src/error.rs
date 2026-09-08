@@ -337,6 +337,12 @@ pub enum LaunchError {
     /// context exists to prevent.
     #[error("pw-container did not create this instance's PipeWire security context: {0}")]
     PwContext(String),
+    /// The private PulseAudio server of a `pulseaudio` grant did not
+    /// come up. The run stops here for the reason a missing context
+    /// does: the sandbox would start with a bind of a socket nothing
+    /// listens on, and there is no second server to fall back to.
+    #[error("pipewire-pulse did not serve this instance's private PulseAudio socket: {0}")]
+    PwPulse(String),
     /// The pasta sidecar could not be started or did not report that it
     /// had configured the sandbox's network namespace. The sandbox is
     /// stopped rather than let go: an isolated `network` that reached
