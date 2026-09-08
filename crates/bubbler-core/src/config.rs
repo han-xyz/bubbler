@@ -1711,6 +1711,10 @@ pub(crate) fn parse_one(node: &KdlNode, profile: bool) -> Result<Node, ConfigErr
             Node::Service(match name {
                 "pipewire" => Service::Pipewire { microphone },
                 "pulseaudio" => Service::Pulseaudio { microphone },
+                // Unreachable through the arm above, and an error
+                // rather than a fallback: a name added to that list
+                // and forgotten here would otherwise grant whichever
+                // service the fallback named.
                 other => return Err(ConfigError::UnknownNode(other.to_owned())),
             })
         }
