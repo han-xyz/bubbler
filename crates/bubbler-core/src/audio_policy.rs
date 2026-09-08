@@ -55,18 +55,12 @@ pub fn run_warning(cfg: &InstanceConfig, host: &dyn Host, env: &Env) -> Option<&
 
 /// Suffix a `pipewire`/`pulseaudio` `--explain` group header takes
 /// where the drop-in is absent (R9): the grant looks scoped to what the
-/// config asks for and in fact reaches everything.
-///
-/// `crate::explain::render` (`explain.rs`) is where every other group's
-/// header note (`KMS_NOTE`, `NVIDIA_NOTE`) is appended, but its `View`
-/// carries no host or env to call [`installed`] with, and threading one
-/// through touches every `explain::View` literal in the tree, several of
-/// them in `launcher.rs`'s tests — Task 3's file. Not wired here; see
-/// the task report for the call site and the one field `View` needs.
+/// config asks for and in fact reaches everything. `crate::explain::render`
+/// appends it in the same place a group's `KMS_NOTE`/`NVIDIA_NOTE` lands.
 pub const EXPLAIN_SUFFIX: &str = " (policy drop-in not found: microphone reachable)";
 
-/// [`EXPLAIN_SUFFIX`] where the drop-in is absent, else `""` — ready to
-/// append to an audio group's header unconditionally once wired in.
+/// [`EXPLAIN_SUFFIX`] where the drop-in is absent, else `""`, for an
+/// audio group's header.
 pub fn explain_suffix(host: &dyn Host, env: &Env) -> &'static str {
     match installed(host, env) {
         Some(_) => "",
