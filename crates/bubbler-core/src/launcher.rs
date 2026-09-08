@@ -712,7 +712,7 @@ pub fn pw_pulse_argv(
     let mut args = BwrapArgs::pw_pulse_baseline(
         &pipewire::socket(instance_runtime),
         Path::new(pipewire::REMOTE_INSIDE),
-        &pipewire::dir(instance_runtime),
+        &pipewire::pulse_dir(instance_runtime),
         host,
     );
     // No `seccomp` node of the instance's reaches this filter, for the
@@ -1435,7 +1435,12 @@ pub fn start_pw_context(
         };
         return Err(LaunchError::PwContext(what));
     }
-    handle._socket = Some(adopt_context_socket(dir, env.uid)?);
+    handle._socket = Some(adopt_socket(
+        "pipewire",
+        (&pipewire::dir(dir), pipewire::SOCKET_NAME),
+        (dir, pipewire::SOCKET_NAME),
+        env.uid,
+    )?);
     Ok(Some(handle))
 }
 
@@ -1479,13 +1484,13 @@ fn read_report(ready: &OwnedFd, child: &mut Child, deadline: Instant) -> Option<
     }
 }
 
-/// Move the context socket out of the one directory the sidecar can
-/// write, then prove that what was moved is a socket of this user's.
-/// The returned guard removes it when the run ends.
+/// Move the socket a sidecar made (`from`: its directory and the name it
+/// made it under) out of the one directory that sidecar can write, into
+/// `to`, then prove that what was moved is a socket of this user's. The
+/// returned guard removes it when the run ends.
 ///
-/// The context keeps serving after the move: `pw-container` listens on
-/// the socket it bound, not on the path, and the sandbox connects
-/// through the new one.
+/// The sidecar keeps serving after the move: it listens on the socket it
+/// bound, not on the path, and the sandbox connects through the new one.
 // The move comes first and the check second, as [`adopt_proxy_bus`]'s
 // does: the reverse leaves a window in which a sidecar that keeps
 // swapping the name can put a symlink in the place of the socket that
@@ -1494,29 +1499,34 @@ fn read_report(ready: &OwnedFd, child: &mut Child, deadline: Instant) -> Option<
 // here, so its type cannot change after this. `O_NOFOLLOW` then makes a
 // symlink fail with ELOOP instead of being followed, since `stat`
 // through a path would report the type of the target.
-fn adopt_context_socket(dir: &Path, uid: u32) -> Result<FileGuard, LaunchError> {
-    let from = open_dir(&pipewire::dir(dir))?;
-    let to = open_dir(dir)?;
-    let path = pipewire::socket(dir);
-    rustix::fs::renameat(&from, pipewire::SOCKET_NAME, &to, pipewire::SOCKET_NAME).map_err(
-        |e| match e {
-            Errno::NOENT => LaunchError::MissingResource {
-                service: "pipewire",
-                path: pipewire::dir(dir).join(pipewire::SOCKET_NAME),
-            },
-            e => LaunchError::Io(path.clone(), e.into()),
+fn adopt_socket(
+    service: &'static str,
+    from: (&Path, &str),
+    to: (&Path, &str),
+    uid: u32,
+) -> Result<FileGuard, LaunchError> {
+    let (from_dir, made) = from;
+    let (to_dir, name) = to;
+    let source = open_dir(from_dir)?;
+    let target = open_dir(to_dir)?;
+    let path = to_dir.join(name);
+    rustix::fs::renameat(&source, made, &target, name).map_err(|e| match e {
+        Errno::NOENT => LaunchError::MissingResource {
+            service,
+            path: from_dir.join(made),
         },
-    )?;
+        e => LaunchError::Io(path.clone(), e.into()),
+    })?;
     // Whatever was moved is bubbler's to remove from here on, socket or not.
     let guard = FileGuard(path.clone());
     let wrong_type = |expected| LaunchError::WrongType {
-        service: "pipewire",
+        service,
         path: path.clone(),
         expected,
     };
     let socket = rustix::fs::openat(
-        &to,
-        pipewire::SOCKET_NAME,
+        &target,
+        name,
         OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
@@ -1530,7 +1540,7 @@ fn adopt_context_socket(dir: &Path, uid: u32) -> Result<FileGuard, LaunchError> 
         // A directory cannot be unlinked as a file, and one left at this
         // name would fail the rename of every later start of the instance.
         if kind == rustix::fs::FileType::Directory {
-            remove_moved_dir(&to, pipewire::SOCKET_NAME, &path);
+            remove_moved_dir(&target, name, &path);
         }
         return Err(wrong_type("a socket"));
     }
@@ -1540,12 +1550,12 @@ fn adopt_context_socket(dir: &Path, uid: u32) -> Result<FileGuard, LaunchError> 
     Ok(guard)
 }
 
-/// A run's private PulseAudio server: the sidecar it runs in.
+/// A run's private PulseAudio server: the sidecar it runs in, the
+/// directory it writes and the socket bubbler moved out of it.
 ///
 /// Dropping the handle stops it, so it must outlive the sandbox that
-/// connects through its socket — and it is dropped before
-/// [`PwHandle`], since this server is a client of that context. What it
-/// wrote goes with the context directory the other handle removes.
+/// connects through its socket — and it is dropped before [`PwHandle`],
+/// since this server is a client of that context.
 #[derive(Debug)]
 pub struct PulseHandle {
     /// The sidecar sandbox: bwrap, `pipewire` in it.
@@ -1553,6 +1563,12 @@ pub struct PulseHandle {
     /// Holds the descriptors that spawn inherited; clearing it is what
     /// closes them.
     alloc: RealAlloc,
+    /// The server's own directory, removed once it has exited: its
+    /// configuration, the socket it made and the pid file beside it.
+    dir: PathBuf,
+    /// Removes the socket once it has been moved out of `dir`; `None`
+    /// until then, when what is in there goes with the directory.
+    _socket: Option<FileGuard>,
 }
 
 impl Drop for PulseHandle {
@@ -1579,6 +1595,9 @@ impl Drop for PulseHandle {
             }
         }
         self.alloc.fds.clear();
+        // The directory is bubbler's own and holds nothing but this
+        // server's; the sandbox that bound its socket has exited by now.
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -1608,24 +1627,25 @@ pub fn start_pw_pulse(
     {
         return Ok(None);
     }
-    let socket = pipewire::pulse_socket(dir);
+    // The sidecar's whole `/tmp`, and the only thing it can write.
+    let pw = pipewire::pulse_dir(dir);
+    mkdir_private(&pw)?;
     // The server binds the address it is given and creates no directory
     // for it (measured on 1.6.8: "bind() to '/tmp/pulse/native' failed:
     // No such file or directory"), so this is bubbler's to make.
-    if let Some(parent) = socket.parent() {
-        mkdir_private(parent)?;
-    }
+    let made_in = pipewire::pulse_socket_dir(dir);
+    mkdir_private(&made_in)?;
+    let made = made_in.join(pipewire::PULSE_NATIVE);
     // What a run that was killed before its handle could clean up left
     // there, removed the way the Wayland listener's is: readiness below
     // is this name appearing, so a leftover would be taken for the new
-    // server's socket and bound while that server was still starting —
-    // and the sandbox would hold a socket nothing listens on. A second
-    // run of one instance is refused long before this, so anything at
-    // this name is a dead run's.
-    if let Err(e) = std::fs::remove_file(&socket)
+    // server's socket while that server was still starting. A second run
+    // of one instance is refused long before this, so anything at this
+    // name is a dead run's.
+    if let Err(e) = std::fs::remove_file(&made)
         && e.kind() != io::ErrorKind::NotFound
     {
-        return Err(LaunchError::Io(socket.clone(), e));
+        return Err(LaunchError::Io(made.clone(), e));
     }
     write_pulse_config(env, host, dir)?;
     let mut alloc = RealAlloc::sidecar(dir.to_path_buf());
@@ -1640,26 +1660,35 @@ pub fn start_pw_pulse(
             _ => LaunchError::Spawn(e),
         })?;
     // From here on every exit path stops the sidecar through the handle.
-    let mut handle = PulseHandle { child, alloc };
+    let mut handle = PulseHandle {
+        child,
+        alloc,
+        dir: pw,
+        _socket: None,
+    };
     // The instance's own bwrap must not inherit the seccomp descriptor
     // this argv was built with.
     handle.alloc.inheritable(false).map_err(LaunchError::Data)?;
     let deadline = Instant::now() + PULSE_READY;
-    loop {
-        if socket.exists() {
-            return Ok(Some(handle));
-        }
+    while !made.exists() {
         if let Ok(Some(status)) = handle.child.try_wait() {
             return Err(LaunchError::PwPulse(format!("it exited ({status})")));
         }
         if Instant::now() >= deadline {
             return Err(LaunchError::PwPulse(format!(
                 "it did not create `{}` within {PULSE_READY:?}",
-                socket.display()
+                made.display()
             )));
         }
         std::thread::sleep(POLL);
     }
+    handle._socket = Some(adopt_socket(
+        "pulseaudio",
+        (&made_in, pipewire::PULSE_NATIVE),
+        (dir, pipewire::PULSE_ADOPTED),
+        env.uid,
+    )?);
+    Ok(Some(handle))
 }
 
 /// Write the configuration of this run's private PulseAudio server into
@@ -4713,7 +4742,7 @@ mod tests {
                 format!("{run}/bubbler/t/pipewire-0"),
                 "/run/pipewire-0".to_owned(),
                 "--bind".to_owned(),
-                format!("{run}/bubbler/t/pw"),
+                format!("{run}/bubbler/t/pwpulse"),
                 "/tmp".to_owned(),
                 "--clearenv".to_owned(),
                 "--setenv".to_owned(),
@@ -4746,7 +4775,7 @@ mod tests {
         std::fs::create_dir_all(source.parent().unwrap()).unwrap();
         std::fs::write(&source, text).unwrap();
         let dir = instance_runtime_dir(&e, "t");
-        std::fs::create_dir_all(pipewire::dir(&dir)).unwrap();
+        std::fs::create_dir_all(pipewire::pulse_dir(&dir)).unwrap();
 
         let cfg = write_pulse_config(&e, &RealHost, &dir).unwrap();
 
@@ -4775,7 +4804,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let e = env(tmp.path());
         let dir = instance_runtime_dir(&e, "t");
-        std::fs::create_dir_all(pipewire::dir(&dir)).unwrap();
+        std::fs::create_dir_all(pipewire::pulse_dir(&dir)).unwrap();
         assert!(matches!(
             write_pulse_config(&e, &FakeHost::default(), &dir),
             Err(LaunchError::MissingResource { service: "pulseaudio", ref path })

@@ -89,6 +89,16 @@ pub const PULSE_CONFIG_INSIDE: &str = "/tmp/cfg";
 /// [`PULSE_OVERRIDE`] names.
 pub const PULSE_SOCKET_INSIDE: &str = "/tmp/pulse/native";
 
+/// The name the private server gives its socket, which is the last
+/// component of [`PULSE_SOCKET_INSIDE`].
+pub const PULSE_NATIVE: &str = "native";
+
+/// The name that socket takes once bubbler has moved it beside the
+/// sidecar's directory, where the server cannot reach it. Not `native`:
+/// it sits in the instance's runtime directory beside the context
+/// socket, and each name there says which sidecar made it.
+pub const PULSE_ADOPTED: &str = "pulse-native";
+
 /// Where the context socket is bound in the pulse sidecar, and what its
 /// `PIPEWIRE_REMOTE` names. Under `/run` rather than the runtime dir:
 /// the sidecar has no runtime directory of the session's, and an
@@ -150,18 +160,36 @@ pub fn socket(instance_runtime: &Path) -> PathBuf {
     instance_runtime.join(SOCKET_NAME)
 }
 
-/// `<pw dir>/pulse/native`: the socket the private pulse server of a
-/// `pulseaudio` grant listens on, which is the only PulseAudio socket
-/// that sandbox is given.
-pub fn pulse_socket(instance_runtime: &Path) -> PathBuf {
-    dir(instance_runtime).join("pulse/native")
+/// `<instance runtime dir>/pwpulse`: the directory the private pulse
+/// server of a `pulseaudio` grant writes, which is that sidecar's whole
+/// `/tmp`.
+///
+/// Not [`dir`]: the two audio sidecars share the instance's context but
+/// neither may write what the other reads — the pulse server is the
+/// process the sandboxed application talks to, and the context sidecar
+/// has the session's own socket.
+pub fn pulse_dir(instance_runtime: &Path) -> PathBuf {
+    instance_runtime.join("pwpulse")
 }
 
-/// `<pw dir>/cfg`: the configuration bubbler writes for that server —
+/// `<pulse dir>/pulse`: where that server creates its socket, since the
+/// address it is given is under the runtime directory it is handed.
+pub fn pulse_socket_dir(instance_runtime: &Path) -> PathBuf {
+    pulse_dir(instance_runtime).join("pulse")
+}
+
+/// Host path of the private pulse socket the sandbox binds: beside
+/// [`pulse_dir`], never in it. bubbler moves it here before anything
+/// binds it, so what bwrap resolves is a name the server cannot swap.
+pub fn pulse_socket(instance_runtime: &Path) -> PathBuf {
+    instance_runtime.join(PULSE_ADOPTED)
+}
+
+/// `<pulse dir>/cfg`: the configuration bubbler writes for that server —
 /// the host's effective [`PULSE_CONF`] copied, and [`PULSE_OVERRIDE`]
 /// beside it.
 pub fn pulse_config_dir(instance_runtime: &Path) -> PathBuf {
-    dir(instance_runtime).join("cfg")
+    pulse_dir(instance_runtime).join("cfg")
 }
 
 /// The three directories a `pipewire-pulse.conf` is looked for in, in
@@ -360,25 +388,37 @@ mod tests {
     }
 
     #[test]
-    fn the_pulse_socket_and_its_config_are_in_the_directory_the_sidecar_writes() {
+    fn the_pulse_socket_is_named_beside_the_directory_the_sidecar_writes() {
         let instance = Path::new("/run/user/1000/bubbler/t");
         assert_eq!(
             pulse_socket(instance),
-            Path::new("/run/user/1000/bubbler/t/pw/pulse/native")
+            Path::new("/run/user/1000/bubbler/t/pulse-native")
+        );
+        assert!(
+            !pulse_socket(instance).starts_with(pulse_dir(instance)),
+            "the socket bwrap binds is out of the server's reach"
         );
         assert_eq!(
-            pulse_config_dir(instance),
-            Path::new("/run/user/1000/bubbler/t/pw/cfg")
+            pulse_socket_dir(instance).join(PULSE_NATIVE),
+            Path::new("/run/user/1000/bubbler/t/pwpulse/pulse/native")
         );
-        // That directory is the sidecar's whole `/tmp`, so the host path
-        // and the path the fragment names are the same place.
+        // The directory is the sidecar's whole `/tmp`, so the host paths
+        // and the ones its configuration names are the same places.
         assert_eq!(
-            pulse_socket(instance).strip_prefix(dir(instance)),
+            pulse_socket_dir(instance)
+                .join(PULSE_NATIVE)
+                .strip_prefix(pulse_dir(instance)),
             Path::new(PULSE_SOCKET_INSIDE).strip_prefix("/tmp")
         );
         assert_eq!(
-            pulse_config_dir(instance).strip_prefix(dir(instance)),
+            pulse_config_dir(instance).strip_prefix(pulse_dir(instance)),
             Path::new(PULSE_CONFIG_INSIDE).strip_prefix("/tmp")
+        );
+        // Neither audio sidecar can write what the other reads.
+        assert!(
+            !pulse_dir(instance).starts_with(dir(instance))
+                && !dir(instance).starts_with(pulse_dir(instance)),
+            "the two sidecars share a directory"
         );
     }
 

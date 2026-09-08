@@ -17,8 +17,8 @@ use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
     PYTHON, bubbler, bubbler_audio, bubbler_dbus, bubbler_in_sh, bubbler_live, bubbler_wayland,
     bwrap_alive, holders_of, isolated, kill_group, output_past_a_busy_exec, process_running,
-    real_init, real_net_proxy, require_a11y, require_a11y_lookup, require_bwrap, require_dbus,
-    require_document_portal, require_egress, require_groff, require_host_program,
+    program_running, real_init, real_net_proxy, require_a11y, require_a11y_lookup, require_bwrap,
+    require_dbus, require_document_portal, require_egress, require_groff, require_host_program,
     require_nested_x11, require_nested_x11_host, require_nft, require_pasta, require_portal,
     require_python, require_security_context, require_system_bus, require_tray, say,
     session_pipewire, system_owns, test_pty,
@@ -595,7 +595,7 @@ fn dry_run_binds_the_planned_private_pulse_socket_and_not_the_sessions() {
     assert!(
         s.contains(&format!(
             "--ro-bind\n{}\n{}\n",
-            tmp.path().join("run/bubbler/t/pw/pulse/native").display(),
+            tmp.path().join("run/bubbler/t/pulse-native").display(),
             tmp.path().join("run/pulse/native").display()
         )),
         "{s}"
@@ -2678,7 +2678,13 @@ fn real_bwrap_pipewire_context_tags_the_client() {
     // inside it: what bwrap resolves is a name only bubbler can touch.
     assert!(bound, "no context socket at {instance:?} during the run");
     assert!(context_dir, "no context directory in {instance:?}");
-    assert!(!bwrap_alive("bubbler-pw-hold"), "a sidecar sandbox is left");
+    // By the bind that makes it this instance's sidecar, not by the
+    // holder: every context sidecar names the same `/run/bubbler-pw-hold`
+    // and other tests run their own beside this one.
+    assert!(
+        !bwrap_alive(&format!("{}/pw /tmp", instance.display())),
+        "a sidecar sandbox is left"
+    );
     assert!(
         !process_running("pw-container", "audioctx"),
         "a pw-container is left"
@@ -2769,9 +2775,11 @@ fn real_bwrap_pulseaudio_serves_a_private_server() {
     // Read while the run is up and judged once it is down, as the
     // context test is: an assertion that failed here would leave the
     // sandbox and two sidecars behind for every later run to see.
-    let socket = instance.join("pw/pulse/native").exists();
+    // Bound from beside the directory the server writes, not from inside
+    // it: what bwrap resolves is a name only bubbler can touch.
+    let socket = instance.join("pulse-native").exists();
     let config =
-        std::fs::read_to_string(instance.join("pw/cfg/pipewire-pulse.conf.d/00-bubbler.conf"))
+        std::fs::read_to_string(instance.join("pwpulse/cfg/pipewire-pulse.conf.d/00-bubbler.conf"))
             .unwrap_or_default();
 
     kill_process(Pid::from_child(&child), Signal::TERM).expect("the run is still going");
@@ -2813,7 +2821,7 @@ fn real_bwrap_pulseaudio_serves_a_private_server() {
     );
     assert!(
         socket,
-        "no private pulse socket under {instance:?} during the run"
+        "no private pulse socket beside {instance:?} during the run"
     );
     assert!(
         config.contains("pulse.allow-module-loading = false"),
@@ -2834,18 +2842,23 @@ fn real_bwrap_pulseaudio_serves_a_private_server() {
     );
     // R4, pulse half: the server, its socket and its configuration are
     // gone with the run.
+    // By the bind that makes it this run's server, not by the program:
+    // another sandbox of this desktop's may be playing audio while the
+    // suite runs, and what this asserts is that *this* server is gone.
     assert!(
-        !bwrap_alive("pipewire-pulse.conf"),
+        !bwrap_alive(&format!("{}/pwpulse /tmp", instance.display())),
         "a pulse sidecar sandbox is left"
     );
     assert!(
-        !process_running("pipewire", "pipewire-pulse.conf"),
+        !program_running("pipewire", "pipewire-pulse.conf"),
         "a private pulse server is left"
     );
-    assert!(
-        !instance.join("pw").exists(),
-        "the sidecar directory is left: {instance:?}"
-    );
+    for left in ["pw", "pwpulse", "pulse-native"] {
+        assert!(
+            !instance.join(left).exists(),
+            "{left} is left in {instance:?}"
+        );
+    }
     assert!(
         host_pw_clients("audiopulse").is_empty(),
         "the daemon still holds a client of the context"
@@ -2886,9 +2899,9 @@ fn real_bwrap_pulseaudio_replaces_the_socket_a_killed_run_left() {
     let instance = session_pipewire()
         .expect("checked above")
         .with_file_name("bubbler/audiostale");
-    let pulse = instance.join("pw/pulse");
+    let pulse = instance.join("pwpulse/pulse");
     std::fs::create_dir_all(&pulse).unwrap();
-    for dir in [&instance, &instance.join("pw"), &pulse] {
+    for dir in [&instance, &instance.join("pwpulse"), &pulse] {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     let stale = pulse.join("native");
@@ -2918,8 +2931,8 @@ fn real_bwrap_pulseaudio_replaces_the_socket_a_killed_run_left() {
         "{said}"
     );
     assert!(
-        !instance.join("pw").exists(),
-        "the sidecar directory is left: {instance:?}"
+        !instance.join("pwpulse").exists(),
+        "the server's directory is left: {instance:?}"
     );
 
     let out = bubbler_audio(tmp.path(), &init)

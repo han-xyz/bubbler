@@ -660,7 +660,8 @@ fn audio_context(host: &dyn Host) -> Result<(), LaunchError> {
 /// tagged like a native one — and it refuses to load a module.
 ///
 /// The source is not probed, for the reason [`pipewire`]'s is not: it
-/// exists only once that sidecar has created it, and a `--dry-run` names
+/// exists only once that sidecar has created it and the launcher has
+/// moved it out of the server's own directory, and a `--dry-run` names
 /// the path a run would bind with nothing started at all.
 fn pulseaudio(
     env: &Env,
@@ -4045,7 +4046,7 @@ mod tests {
             &a,
             &[
                 "--ro-bind",
-                "/run/user/1000/bubbler/t/pw/pulse/native",
+                "/run/user/1000/bubbler/t/pulse-native",
                 "/run/user/1000/pulse/native"
             ]
         ));
