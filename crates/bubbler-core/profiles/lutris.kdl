@@ -36,9 +36,10 @@
 // the socket PipeWire's pulse server holds on a PipeWire host — and sets
 // PULSE_SERVER to it, which is the path a libpulse client takes, as Wine
 // and the Proton runtimes are. Bare, it is playback only: no microphone,
-// no other app's audio, and the private server it now runs behind
-// refuses to load a module, with the policy drop-in installed; `lint`
-// warns `audio-policy-missing` where it is not. Not measured here: if a
+// no other app's audio — not the sink's monitor either — and the
+// private server it now runs behind refuses to load a module, with the
+// policy installed, which is the drop-in and the linking hook it loads;
+// `lint` warns `audio-policy-missing` where it is not. Not measured here: if a
 // game is silent, add `pipewire` beside it.
 //
 // umu, Proton and DXVK's 32-bit path make i386 syscalls; the default

@@ -16,18 +16,25 @@
   per instance, ORed across whichever of the two nodes and layers carry
   it, and bare is playback only. `bubbler lint` notes it as
   `pipewire-microphone`.
-- A WirePlumber policy drop-in, `contrib/wireplumber/50-bubbler.conf`: two
-  permission managers matched by `bubbler.audio`, denying a playback-only
-  context every `Audio/Source` node — and the link permission that would
-  let a capture stream reach one anyway — while leaving sinks and the
-  client's own objects read+execute. `bubbler audio-policy --print` writes
-  the embedded copy to stdout, for installing without a checkout of the
-  source tree; where it is not installed, a run warns on stderr (`audio
-  policy drop-in 50-bubbler.conf not found in any wireplumber.conf.d: the
-  sandbox has full access to every PipeWire node (microphone and every
-  other client's audio reachable)`), `--explain` appends the same fact to
-  the group, and `bubbler lint` warns `audio-policy-missing`, naming the
-  directories WirePlumber loads it from.
+- A WirePlumber policy in two files, `contrib/wireplumber/50-bubbler.conf`
+  and the `contrib/wireplumber/scripts/bubbler/refuse-links.lua` it
+  loads: two permission managers matched by `bubbler.audio`, denying a
+  playback-only context every `Audio/Source` node — and the link
+  permission that would let a capture stream reach one anyway — while
+  leaving sinks and the client's own objects read+execute and every
+  stream read-only, and a linking hook that refuses what a permission
+  cannot, since a permission is about one object and a link about two: no
+  capture stream of a bubbler context reaches a sink's monitor ports
+  under any grant, and none is linked to another client's stream.
+  `bubbler audio-policy --print` and `--print --script` write the
+  embedded copies to stdout, for installing without a checkout of the
+  source tree; where the drop-in is not installed, a run warns on stderr
+  (`audio policy drop-in 50-bubbler.conf not found in any
+  wireplumber.conf.d: the sandbox has full access to every PipeWire node
+  (microphone and every other client's audio reachable)`), `--explain`
+  appends the same fact to the group, and `bubbler lint` warns
+  `audio-policy-missing`, naming the directories WirePlumber loads it
+  from.
 - A hermetic PipeWire/WirePlumber test bed
   (`cargo test -p bubbler-core --test real_pipewire`): a private daemon
   pair with a null sink and a null source, loading the drop-in, measuring
@@ -66,15 +73,22 @@
   default and give the exact `pulseaudio { microphone }` line to add for
   a web meeting's microphone or in-game voice chat.
 - `lutris`, `spotify`, `mpv`: headers say what playback-only now means
-  for them (no microphone, no other app's audio, no module loading on
-  the private server behind a `pulseaudio` grant).
+  for them (no microphone, no other app's audio — the sink's monitor
+  included — no module loading on the private server behind a
+  `pulseaudio` grant).
 
 ### Notes
 
-- Install the drop-in and restart WirePlumber:
+- Install both files of the policy and restart WirePlumber:
   `bubbler audio-policy --print > <path>` into one of the three
-  `wireplumber.conf.d` directories the warning and the lint name, then
-  `systemctl --user restart wireplumber`. Without it a `pipewire`/
+  `wireplumber.conf.d` directories the warning and the lint name, and
+  `bubbler audio-policy --print --script >
+  /usr/share/wireplumber/scripts/bubbler/refuse-links.lua` (or the
+  per-user `$XDG_DATA_HOME/wireplumber/scripts/bubbler/` — a script is
+  looked for in data directories, not config ones), then
+  `systemctl --user restart wireplumber`. With the drop-in alone the
+  grant is scoped but a sandbox can still record the sink's monitor
+  ports. Without it a `pipewire`/
   `pulseaudio` grant reaches every PipeWire node instead of what it asks
   for — measured on WirePlumber 0.5.15, whose default for an unmatched
   restricted client is `Perm.ALL`, not the `Perm.RX` its own script text

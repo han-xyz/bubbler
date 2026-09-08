@@ -794,16 +794,33 @@ Where the WirePlumber policy drop-in
 engine into one of two permission managers — `bubbler-playback` for a
 bare grant, `bubbler-playback-microphone` for one carrying `microphone`
 — each read+execute on the graph and the client's own objects, nothing
-writable, and, in both managers, no permission at all on every other
-client's stream, the metadata objects and the session manager's own
-client; the playback manager alone also withholds all permission on
-every `Audio/Source` node. Withholding all permissions on a source
-withholds more than its
-visibility: `PW_PERM_L` is what lets a link be made to a node the client
-cannot see, and the playback manager grants it nowhere, so a capture
-stream a playback-only client opens — linked by the session manager on
-the client's behalf, not by the client itself — gets no link to a source
-it was never given the permission to see. An engine match with no
+writable, and, in both managers, no permission at all on the metadata
+objects and on the session manager's own client, and read and nothing
+else on every stream node. The playback manager alone adds no permission
+at all on every `Audio/Source`, and withholding all permissions on a
+source withholds more than its visibility: `PW_PERM_L` is what lets a
+link be made to a node the client cannot see, and the playback manager
+grants it nowhere, so a capture stream a playback-only client opens —
+linked by the session manager on the client's behalf, not by the client
+itself — gets no link to a source it was never given the permission to
+see.
+
+Streams are readable rather than hidden because the private
+`pipewire-pulse` a `pulseaudio` grant runs creates a stream node per
+application it serves and cannot answer a client about a node it cannot
+see: hidden streams make `paplay` fail with a protocol error, measured
+on the test bed. Readable is also linkable — `PW_PERM_L` is consulted
+only for a node the client *cannot* see — so what a permission cannot
+decide, the linking hook the drop-in loads
+(`contrib/wireplumber/scripts/bubbler/refuse-links.lua`) decides in the
+session manager: for any `org.bubbler` client it refuses a link to
+another client's stream in either direction, a capture link to a sink
+(its monitor ports carry everything the session is playing, and they are
+reached through the sink's own read permission, which is the grant), and
+a capture link to a source for a context without `microphone`. Without
+that hook installed beside the drop-in the grant is scoped but the
+monitor ports are not: a capture stream asking for
+`stream.capture.sink` records the output mix. An engine match with no
 recognised `bubbler.audio` value, or none at all, lands in the base rule
 ahead of the grant-specific one rather than falling through to
 WirePlumber's own default, so a typo in the property still narrows
@@ -825,7 +842,9 @@ full access to every PipeWire node (microphone and every other client's
 audio reachable)` line on every real run, the same fact appended to the
 group under `--explain`, and a host-conditional `audio-policy-missing`
 lint warning that does name the three install directories and the
-`bubbler audio-policy --print` fix.
+`bubbler audio-policy --print` fix. The hook's absence is not detected
+at all: bubbler looks for the drop-in and says nothing about the script
+beside it.
 
 The private pulse server closes a gap the context alone cannot: a pulse
 client can `LOAD_MODULE` a server into loading `module-native-protocol-tcp`

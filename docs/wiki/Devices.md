@@ -67,14 +67,17 @@ only; `microphone` ORs into one per-instance grant across both nodes and
 every layer, adding every `Audio/Source` the host has — every microphone
 and line-in.
 
-What actually narrows the reach is the WirePlumber policy drop-in, not
-the socket: without it installed (`bubbler audio-policy --print`, see
-[Commands](Commands.md)) a sandbox reaches every PipeWire node regardless
-of what the config asks for; `bubbler lint` warns `audio-policy-missing`,
-and a run without it prints `bubbler: warning: audio policy drop-in
-50-bubbler.conf not found in any wireplumber.conf.d: the sandbox has
-full access to every PipeWire node (microphone and every other client's
-audio reachable)` on stderr. The private pulse server refuses
+What actually narrows the reach is bubbler's WirePlumber policy, not the
+socket — the drop-in and the linking hook it loads, which is what keeps
+a sandbox off the sink's monitor ports and off another client's stream:
+without them installed (`bubbler audio-policy --print` and `--print
+--script`, see [Commands](Commands.md)) a sandbox reaches every PipeWire
+node regardless of what the config asks for; `bubbler lint` warns
+`audio-policy-missing`, and a run without it prints `bubbler: warning:
+audio policy drop-in 50-bubbler.conf not found in any
+wireplumber.conf.d: the sandbox has full access to every PipeWire node
+(microphone and every other client's audio reachable)` on stderr. The
+private pulse server refuses
 `LOAD_MODULE` on its own, drop-in or not. ALSA clients reach the same
 daemon through `/etc/alsa` (baseline). `/dev/snd` is never bound.
 

@@ -90,13 +90,16 @@ cargo test -p bubbler-core --test real_pipewire
 A hermetic PipeWire/WirePlumber pair of its own: a private
 `PIPEWIRE_RUNTIME_DIR` with a null sink and a null source, and a
 WirePlumber loading the drop-in from a `wireplumber.conf.d` of the bed's
-own, with `pw-container` run against that daemon. It measures the 0.23
-audio policy — the two permission managers, the link permission a
-playback context does not get, the fallback for a context the drop-in
-does not recognise — and never reaches the session's own PipeWire or
-WirePlumber to do it. Needs `pipewire`, `wireplumber`, `pw-container`,
-`pw-dump`, `pw-cli`, `pw-cat` and `pw-link`; each is checked and a
-missing one is a printed skip naming it, not a failure. Every daemon and sidecar the bed forks dies with the
+own and its linking hook from a data directory of the bed's own, with
+`pw-container` run against that daemon. It measures the 0.23 audio
+policy — the two permission managers, the link permission a playback
+context does not get, the links the hook refuses, the private
+`pipewire-pulse` a `pulseaudio` grant runs, the fallback for a context
+the drop-in does not recognise — and never reaches the session's own
+PipeWire or WirePlumber to do it. Needs `pipewire`, `wireplumber`,
+`pw-container`, `pw-dump`, `pw-cli`, `pw-cat`, `pw-link`, `pactl`,
+`paplay` and `parecord`; each is checked and a missing one is a printed
+skip naming it, not a failure. Every daemon and sidecar the bed forks dies with the
 thread that forked it (`PR_SET_PDEATHSIG`), so a `kill -9` of the test
 binary leaves no daemon and no directory behind either.
 

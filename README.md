@@ -130,8 +130,9 @@ against your other processes, and `x11 "host"` is no boundary at all (a bare
 `x11` runs an X server of the sandbox's own instead). Grants are as wide as
 their names suggest and sometimes wider (`gamepad` is every input device your
 user can open; `pulseaudio` and `pipewire` are playback only by name, but
-reach every PipeWire node — microphone included — unless the host has the
-WirePlumber policy drop-in installed, `bubbler audio-policy --print`); the
+reach every PipeWire node — microphone included — unless the host has
+bubbler's WirePlumber policy installed, both files of it: `bubbler
+audio-policy --print` and `--print --script`); the
 wiki's
 [Devices](docs/wiki/Devices.md) and [Security](docs/wiki/Security.md) pages and
 the threat model say exactly how wide. Known gaps are listed under

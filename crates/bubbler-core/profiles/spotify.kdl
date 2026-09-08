@@ -6,9 +6,11 @@
 // which is what that grant binds. `pipewire` binds only pipewire-0, the
 // native socket, and is for a client that speaks PipeWire itself or for
 // the screen-share portal. Bare, either socket is playback only: no
-// microphone, no other app's audio, and the private server pulseaudio
-// runs behind refuses to load a module, with the policy drop-in
-// installed; `lint` warns `audio-policy-missing` where it is not.
+// microphone, no other app's audio — not the sink's monitor either —
+// and the private server pulseaudio runs behind refuses to load a
+// module, with the policy installed, which is the drop-in and the
+// linking hook it loads; `lint` warns `audio-policy-missing` where it
+// is not.
 //
 // No `talk "org.freedesktop.secrets"`: a music player's session token is
 // adequately kept in its own config file in the private home, and the
