@@ -12,8 +12,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use rustix::process::{Pid, Signal, kill_process, kill_process_group};
-use tempfile::TempDir;
+use rustix::process::{
+    Pid, Signal, kill_process, kill_process_group, set_parent_process_death_signal,
+};
 
 /// The policy drop-in as it is shipped, loaded by the bed's WirePlumber
 /// from the bed's own config directory. The tests below are what says
@@ -163,15 +164,59 @@ fn on_path(name: &str) -> Option<PathBuf> {
         .unwrap_or_default()
 }
 
+/// Where a bed's directory goes. Not `TMPDIR`: `sockaddr_un.sun_path`
+/// holds 108 bytes and the daemon refuses to listen on a longer path,
+/// and `pw-container` puts its own socket under `/tmp` whatever the
+/// environment says, so a bed elsewhere would gain nothing and could
+/// only be too deep.
+const BEDS: &str = "/tmp";
+
+/// Prefix of a bed directory. The rest is the owning process's pid and a
+/// counter, so a stale one can be told from a live one.
+const BED_PREFIX: &str = "bubbler-bed-";
+
+/// A fresh bed directory named after this process, so what is left over
+/// after an abnormal end can be attributed and swept.
+fn new_bed_dir() -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let nth = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = Path::new(BEDS).join(format!("{BED_PREFIX}{}.{nth}", std::process::id()));
+    std::fs::create_dir(&dir).expect("a bed directory of this run's own");
+    dir
+}
+
+/// Remove the bed directories of runs that are gone.
+///
+/// `Drop` removes a bed's own directory, but a `SIGKILL` on the test
+/// binary — a CI timeout, an OOM kill, a developer's `kill -9` — runs no
+/// destructor, and the leftovers would accumulate in `/tmp` unnoticed.
+fn sweep_stale_beds() {
+    let Ok(entries) = std::fs::read_dir(BEDS) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(rest) = name
+            .to_string_lossy()
+            .strip_prefix(BED_PREFIX)
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let owner = rest.split('.').next().unwrap_or_default().to_owned();
+        if owner.is_empty() || Path::new("/proc").join(&owner).exists() {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
+}
+
 /// A private PipeWire and WirePlumber pair, with the shipped policy
 /// drop-in loaded, and the handles to drive it.
 pub struct PipeWireBed {
-    /// Killed before `dir` is removed: the fields drop in declaration
-    /// order, and a daemon still running when its runtime directory goes
-    /// would recreate parts of it.
     pipewire: Child,
     wireplumber: Child,
-    dir: TempDir,
+    dir: PathBuf,
 }
 
 impl PipeWireBed {
@@ -188,24 +233,12 @@ impl PipeWireBed {
             say(&format!("skipping: {WIREPLUMBER_MAIN_CONF} not installed"));
             return None;
         }
-        let dir = TempDir::with_prefix("bubbler-bed-").expect("a temporary directory");
-        // `sockaddr_un.sun_path` is 108 bytes including the terminator,
-        // and the daemon refuses to listen on a longer path. A build
-        // whose `TMPDIR` is deep enough to break that gets a skip rather
-        // than a failure nobody can act on.
-        let socket = dir.path().join("run").join("pipewire-0-manager");
-        if socket.as_os_str().len() >= 108 {
-            say(&format!(
-                "skipping: {} is too long for a unix socket",
-                socket.display()
-            ));
-            return None;
-        }
-        Some(Self::start_in(dir))
+        sweep_stale_beds();
+        Some(Self::start_in(new_bed_dir()))
     }
 
-    fn start_in(dir: TempDir) -> PipeWireBed {
-        let root = dir.path();
+    fn start_in(dir: PathBuf) -> PipeWireBed {
+        let root = dir.clone();
         let run = root.join("run");
         let pw = root.join("pipewire");
         let wp = root.join("wireplumber");
@@ -258,7 +291,7 @@ impl PipeWireBed {
 
     /// The bed's directory, so a test can look for it after the drop.
     pub fn dir(&self) -> &Path {
-        self.dir.path()
+        &self.dir
     }
 
     /// The two daemons' pids, for the same reason.
@@ -290,7 +323,7 @@ impl PipeWireBed {
     /// A command pointed at the bed and at nothing else.
     pub fn command(&self, program: &str) -> Command {
         let mut command = Command::new(program);
-        command.env("PIPEWIRE_RUNTIME_DIR", self.dir.path().join("run"));
+        command.env("PIPEWIRE_RUNTIME_DIR", self.dir.join("run"));
         command
     }
 
@@ -322,10 +355,14 @@ impl PipeWireBed {
         // `/tmp` for ever.
         //
         // SAFETY: the closure runs in the child between fork and exec,
-        // where only async-signal-safe work is allowed; `setpgid` is a
-        // bare syscall that allocates nothing and takes no lock.
+        // where only async-signal-safe work is allowed; `setpgid` and
+        // `prctl` are bare syscalls that allocate nothing and take no
+        // lock.
         unsafe {
-            command.pre_exec(|| rustix::process::setpgid(None, None).map_err(Into::into));
+            command.pre_exec(|| {
+                rustix::process::setpgid(None, None)?;
+                dies_with_this_thread()
+            });
         }
         command.spawn().expect("pw-container did not run")
     }
@@ -347,7 +384,19 @@ impl Drop for PipeWireBed {
             let _ = kill_process(pid, Signal::TERM);
             wait_or_kill(child);
         }
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// Ask the kernel to `SIGKILL` this process when the thread that forked
+/// it goes.
+///
+/// `Drop` covers a normal end; this covers the rest. libtest gives each
+/// test its own thread and `PipeWireBed::start` is called from the test
+/// body, so the death signal is armed against the thread that owns the
+/// bed — which also ends when the process is killed.
+fn dies_with_this_thread() -> std::io::Result<()> {
+    set_parent_process_death_signal(Some(Signal::KILL)).map_err(Into::into)
 }
 
 /// Reap a child that has been asked to stop, and stop insisting: a
@@ -380,7 +429,14 @@ fn daemon(command: &mut Command, log: &Path) -> Child {
         .env_remove("DISPLAY")
         .stdin(Stdio::null())
         .stdout(out)
-        .stderr(err)
+        .stderr(err);
+    // SAFETY: the closure runs in the child between fork and exec, where
+    // only async-signal-safe work is allowed; `prctl` is a bare syscall
+    // that allocates nothing and takes no lock.
+    unsafe {
+        command.pre_exec(dies_with_this_thread);
+    }
+    command
         .spawn()
         .unwrap_or_else(|e| panic!("{command:?} did not run: {e}"))
 }
