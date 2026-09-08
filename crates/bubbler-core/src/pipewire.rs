@@ -107,8 +107,9 @@ pub const PULSE_ADOPTED: &str = "pulse-native";
 pub const REMOTE_INSIDE: &str = "/run/pipewire-0";
 
 /// The whole of what bubbler changes about the host's pulse
-/// configuration: the server listens on one socket of this run's own,
-/// and a client may not make it load a module.
+/// configuration: the server listens on one socket of this run's own, a
+/// client may not make it load a module, and it asks no session bus for
+/// anything.
 ///
 /// Module loading is what a pulse client uses to reach past the policy —
 /// `module-null-sink`, `module-loopback` and the rest run inside the
@@ -117,7 +118,15 @@ pub const REMOTE_INSIDE: &str = "/run/pipewire-0";
 /// `pipewire-pulse.conf.d` fragments are not copied beside this one:
 /// theirs would set `server.address` too, and the last one read would
 /// decide which socket this run serves.
+///
+/// D-Bus support is off because the sidecar has no bus to reach and
+/// every module that wants one says so on bubbler's stderr otherwise
+/// ("Enable DBus support. This will enable DBus support in the various
+/// modules that require it", `pipewire.conf(5)`).
 pub const PULSE_OVERRIDE: &str = concat!(
+    "context.properties = {\n",
+    "    support.dbus = false\n",
+    "}\n",
     "pulse.properties = {\n",
     "    server.address = [ \"unix:/tmp/pulse/native\" ]\n",
     "    pulse.allow-module-loading = false\n",
@@ -374,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn the_bubbler_fragment_names_the_private_socket_and_refuses_module_loading() {
+    fn the_bubbler_fragment_names_the_private_socket_and_refuses_module_loading_and_dbus() {
         assert!(
             PULSE_OVERRIDE.contains(&format!(
                 r#"server.address = [ "unix:{PULSE_SOCKET_INSIDE}" ]"#
@@ -383,6 +392,10 @@ mod tests {
         );
         assert!(
             PULSE_OVERRIDE.contains("pulse.allow-module-loading = false"),
+            "{PULSE_OVERRIDE}"
+        );
+        assert!(
+            PULSE_OVERRIDE.contains("support.dbus = false"),
             "{PULSE_OVERRIDE}"
         );
     }
