@@ -62,11 +62,13 @@ and the one the mechanism table covers.
 
 ### 2. Sandbox ↔ sidecars
 
-Eight processes can come with a sandbox, and they are not one kind of thing:
+Ten processes can come with a sandbox, and they are not one kind of thing:
 
 | Sidecar | Where it runs | Is it a boundary? |
 |---|---|---|
 | `xdg-dbus-proxy` | its own bwrap sandbox, sibling of the app's | **Yes.** It is a filter, it sees only the host bus sockets read-only — up to three of them — and the instance's `dbus/` subdirectory read-write, and the socket it serves is moved out of its reach before anything is bound. |
+| `pw-container` | its own bwrap sandbox, sibling of the app's, started for every `pipewire` or `pulseaudio` grant | **Not a party to one.** It creates the boundary rather than standing in it: once the context exists, the sandboxed application's PipeWire traffic reaches the session daemon directly through the socket bwrap binds in, and the daemon applies whatever policy the WirePlumber drop-in matches to the context's properties — `pw-container` itself is never on that path, and the sandboxed app never talks to it. What it holds: the one connection it opens to the host's `pipewire-0` to create the context, its own `<inst>/pw` directory as its whole `/tmp` and nothing else, no network, no home. It runs until its own child — the holder that reports the socket's path and then waits on a signal — exits, and that exit is what tears the context down. |
+| the private `pipewire-pulse` | its own bwrap sandbox, sibling of the app's and of `pw-container`'s, only with a `pulseaudio` grant | **Yes.** Unlike the context holder, this one is in the data path: a pulse client inside the sandbox speaks the PulseAudio protocol to it directly, over the socket bwrap binds in, which is why it is confined the same way the proxies are. It reaches nothing of the session — its own outbound connection is the context socket alone, so it arrives at the daemon as a client of this same context — and its own `<inst>/pwpulse` directory is its whole `/tmp`, sharing no bind with `pw-container`'s `<inst>/pw`. Its socket is adopted into `<inst>/` — moved out of its own reach and checked — before bubbler binds it into the sandbox, the same pattern the context socket and the D-Bus proxy's both follow. What it enforces beyond the daemon's own policy: `pulse.allow-module-loading = false` in the config bubbler writes for it, so a client cannot `LOAD_MODULE` its way past a WirePlumber policy that never gated module loading at all. |
 | `bubbler-wl-proxy` | its own bwrap sandbox, sibling of the app's, in front of every sandboxed `wayland` (bare or `clipboard="open"`) | **Yes.** It is the only thing listening on the socket the sandbox connects to, and it forwards nothing it could not decode: every message is parsed against generated interface tables and re-encoded from what was parsed. It sees all of the sandbox's display traffic in both directions. What it holds is the app-facing listener, handed in by number, one connection to the compositor for each of the up to 256 client connections it accepts, and two more descriptors the launcher passes — the audit log and the readiness pipe. The `wayland-context` socket it dials is the one thing of the run bound into its sandbox: no home, no network, no instance runtime directory, no `init.sock`, default seccomp. It does not see what a clipboard read returns; those bytes travel on a descriptor it passes through without reading. |
 | `bubbler-init` | *inside* the sandbox, as pid 2 | **No.** It is the supervisor, not a guard: it shares the sandbox with the application. What it holds — the listening control socket — is kept from the application by being an inherited descriptor with no path, `CLOEXEC` in the only process that has it, and `PR_SET_DUMPABLE` off so `/proc/<init>/fd` cannot be walked. |
 | `Xwayland` | *inside* the sandbox, started by `bubbler-init` on the first X connection, only with a bare `x11` | **No.** It is the sandbox's own X server rather than a guard in front of one: every client on it is a process of this instance, and X11 isolates none of them from each other. What it replaces is the session's display — it reaches the compositor on the instance's own Wayland socket and listens nowhere but `/tmp/.X11-unix/X0` in the sandbox's private `/tmp`, a socket `bubbler-init` binds and hands over rather than one the server opens. A command that never speaks X11 never starts it. See "X11" below. |
@@ -76,7 +78,8 @@ Eight processes can come with a sandbox, and they are not one kind of thing:
 | `nft` | on the host, entering the sandbox's user and network namespaces to install the ruleset | **Not a party to one.** It builds the network boundary rather than standing in it: it runs before pasta and before the sandbox is let go of its `--block-fd`, so the namespace has a policy before it has a route and before the application has run an instruction either way. Nothing the sandbox controls reaches it — the ruleset is generated from typed values and handed over on stdin, and its argv is two fixed arguments. It holds CAP_NET_ADMIN in the sandbox's user namespace and no other capability anywhere: the capability crosses `execve` through the ambient set, and `SECBIT_NOROOT` with `_LOCKED` stops the uid-0 that bwrap's nested user namespace maps bubbler to from being handed the full set. It exits before the run begins, and one that stops answering is killed rather than left holding that capability. |
 
 ([A run is a chain of processes](manual.md#usage),
-[D-Bus](manual.md#d-bus), [network](manual.md#network);
+[D-Bus](manual.md#d-bus), [network](manual.md#network),
+[Config (KDL)](manual.md#config-kdl);
 `the_proxy_never_sees_the_instances_control_socket`,
 `a_proxied_socket_is_moved_out_of_the_proxys_reach`,
 `proxy_argv_runs_the_proxy_in_its_own_sandbox`,
@@ -85,6 +88,10 @@ Eight processes can come with a sandbox, and they are not one kind of thing:
 `real_wayland_a_proxy_that_will_not_start_stops_the_run`,
 `the_x_server_is_not_started_until_a_client_connects`,
 `the_window_manager_starts_with_the_server_and_the_shutdown_runs_inwards`,
+`pw_context_argv_runs_pw_container_in_its_own_sandbox`,
+`pw_pulse_argv_runs_the_pulse_server_in_its_own_sandbox`,
+`real_bwrap_pipewire_context_tags_the_client`,
+`real_bwrap_pulseaudio_serves_a_private_server`,
 `the_nft_child_holds_cap_net_admin_and_is_fed_the_ruleset`,
 `the_ruleset_is_the_golden_text_nft_is_fed`,
 `outbound_deny_filters_what_no_allow_out_names_and_the_sandbox_cannot_undo_it`,
