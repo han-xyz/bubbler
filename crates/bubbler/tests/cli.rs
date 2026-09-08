@@ -17,8 +17,8 @@ use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
     PYTHON, bubbler, bubbler_audio, bubbler_dbus, bubbler_in_sh, bubbler_live, bubbler_wayland,
     bwrap_alive, holders_of, isolated, kill_group, output_past_a_busy_exec, process_running,
-    program_running, real_init, real_net_proxy, require_a11y, require_a11y_lookup, require_bwrap,
-    require_dbus, require_document_portal, require_egress, require_groff, require_host_program,
+    real_init, real_net_proxy, require_a11y, require_a11y_lookup, require_bwrap, require_dbus,
+    require_document_portal, require_egress, require_groff, require_host_program,
     require_nested_x11, require_nested_x11_host, require_nft, require_pasta, require_portal,
     require_python, require_security_context, require_system_bus, require_tray, say,
     session_pipewire, system_owns, test_pty,
@@ -2842,16 +2842,14 @@ fn real_bwrap_pulseaudio_serves_a_private_server() {
     );
     // R4, pulse half: the server, its socket and its configuration are
     // gone with the run.
-    // By the bind that makes it this run's server, not by the program:
+    // By the bind that makes it this run's sidecar, not by the program:
     // another sandbox of this desktop's may be playing audio while the
-    // suite runs, and what this asserts is that *this* server is gone.
+    // suite runs, and what this asserts is that *this* server is gone —
+    // the `pipewire` inside that bwrap goes with it, since it is pid 1's
+    // child in a pid namespace `--die-with-parent` takes down.
     assert!(
         !bwrap_alive(&format!("{}/pwpulse /tmp", instance.display())),
         "a pulse sidecar sandbox is left"
-    );
-    assert!(
-        !program_running("pipewire", "pipewire-pulse.conf"),
-        "a private pulse server is left"
     );
     for left in ["pw", "pwpulse", "pulse-native"] {
         assert!(

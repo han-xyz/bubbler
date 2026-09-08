@@ -522,32 +522,6 @@ pub fn process_running(program: &str, needle: &str) -> bool {
         .any(|line| line.contains(program) && line.contains(needle))
 }
 
-/// Whether some process was *started* as `program` — the file name of
-/// its `argv[0]` — and has `needle` in its command line.
-///
-/// Stricter than [`process_running`], which matches `program` anywhere in
-/// the line: a shell or an editor whose own command line quotes the
-/// program is not the program running.
-pub fn program_running(program: &str, needle: &str) -> bool {
-    let Ok(procs) = std::fs::read_dir("/proc") else {
-        return false;
-    };
-    procs
-        .flatten()
-        .filter_map(|e| std::fs::read(e.path().join("cmdline")).ok())
-        .any(|raw| {
-            let mut words = raw.split(|b| *b == 0);
-            let started_as = words
-                .next()
-                .map(|w| String::from_utf8_lossy(w).into_owned())
-                .is_some_and(|w| Path::new(&w).file_name() == Some(OsStr::new(program)));
-            started_as
-                && String::from_utf8_lossy(&raw)
-                    .replace('\0', " ")
-                    .contains(needle)
-        })
-}
-
 /// Every process of this user's holding a descriptor on `path`, by pid.
 ///
 /// The whole of `/proc` is walked rather than one pid guessed at: a
