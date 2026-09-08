@@ -33,6 +33,7 @@ use rustix::thread::{
 
 use bubbler_init::{fds, proto, wire};
 
+mod pw_hold;
 mod spawn;
 
 /// Supervisor tick: the `poll` timeout, so `accept`, `wait` and every
@@ -544,13 +545,13 @@ fn code_of(status: ExitStatus) -> u8 {
     u8::try_from(code).unwrap_or(1)
 }
 
-/// Whether this process was started as the `flatpak-spawn` shim rather
-/// than as the supervisor. One file is bound at both paths, so the
-/// basename of `argv[0]` is the whole of what separates the two modes.
-fn shim_requested() -> bool {
+/// Whether this process was started as `name` rather than as the
+/// supervisor. One file is bound at every mode's own path, so the
+/// basename of `argv[0]` is the whole of what separates the modes.
+fn started_as(name: &str) -> bool {
     std::env::args_os()
         .next()
-        .is_some_and(|a| Path::new(&a).file_name() == Some(OsStr::new(spawn::NAME)))
+        .is_some_and(|a| Path::new(&a).file_name() == Some(OsStr::new(name)))
 }
 
 fn main() -> ExitCode {
@@ -558,8 +559,15 @@ fn main() -> ExitCode {
     // keeps the descriptors its caller forwarded, which the sweep below
     // exists to close, and it holds no privilege the command should not
     // have — it is a child of the sandboxed application, not its parent.
-    if shim_requested() {
+    if started_as(spawn::NAME) {
         return spawn::run(std::env::args_os().skip(1));
+    }
+    // Also before the sweep, and for the same reason: the holder reports
+    // on a descriptor bubbler passed it, and it is not the sandbox's
+    // supervisor but a process of the audio sidecar, with no control
+    // socket and no command of its own.
+    if started_as(pw_hold::NAME) {
+        return pw_hold::run();
     }
     let Some(mut args) = parse_args() else {
         eprintln!("{USAGE}");
