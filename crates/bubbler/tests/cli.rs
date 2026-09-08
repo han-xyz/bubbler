@@ -11013,12 +11013,11 @@ fn a_host_without_a_working_bwrap_skips_the_guarded_tests_rather_than_failing_th
 /// that fails here — that measures, and the measurement is the point.
 ///
 /// Every test is `#[ignore]`d: it opens real apps on the user's desktop.
-/// `spotify` is the only profile still listed as failing here, tracked
-/// rather than treated as a broken test run. `steam` skips instead of
-/// failing: `try`'s empty home makes every run its first, so it is
-/// measured against an instance somebody has already warmed up, named by
-/// `BUBBLER_SMOKE_STEAM_INSTANCE`, and skipped where nobody names one.
-/// Neither blocks unrelated work landing on top of this one. Run one
+/// `steam` skips instead of failing: `try`'s empty home makes every run
+/// its first, so it is measured against an instance somebody has already
+/// warmed up, named by `BUBBLER_SMOKE_STEAM_INSTANCE`, and skipped where
+/// nobody names one, which keeps it from blocking unrelated work landing
+/// on top of this one. Run one
 /// explicitly, by its whole name, serially — these start
 /// real desktop apps one at a time against a session with exactly one
 /// desktop to watch them on, and several such launches at once would
@@ -11382,7 +11381,10 @@ mod profile_smoke {
         gui_smoke(GuiProfile {
             profile: "spotify",
             gate: "/usr/bin/spotify",
-            class: "Spotify",
+            // Lower case: the client is an X11 application on a session
+            // that has a display for it, and the sandbox gives it none,
+            // so it takes the Wayland path and a Wayland app id.
+            class: "spotify",
             home_dirs: &[],
             network: true,
             x11_host: false,

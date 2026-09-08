@@ -71,9 +71,6 @@ with exactly one desktop to watch them on. It needs Hyprland (`hyprctl`) and
 each app installed — either missing is a printed skip, not a failure, so a
 host with neither reports nothing rather than a wall of red.
 
-`spotify` is known to fail here and is tracked, not treated as a broken
-test run, until its profile pass lands.
-
 `steam` skips instead of running: `bubbler try` hands the client an empty
 home, which makes every run its first, and a first run downloads the whole
 client (496 MB) before anything starts. Point the test at an instance you
