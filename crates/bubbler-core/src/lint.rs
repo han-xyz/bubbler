@@ -867,6 +867,7 @@ fn run(ctx: &Context, sources: &[Source]) -> Report {
         per_layer(ctx, i, source, host_net, &mut f);
     }
     across_layers(ctx, sources, &mut f);
+    audio_policy_missing(ctx, sources, &mut f);
     let allowed: Vec<&str> = sources
         .iter()
         .flat_map(|s| top(s, "lint-allow"))
@@ -1145,13 +1146,23 @@ fn microphone_note(i: usize, node: &KdlNode, name: &str, f: &mut Findings) {
     }
 }
 
-/// The `audio-policy-missing` warning (R9), alike on `pipewire` and
-/// `pulseaudio`: without the WirePlumber drop-in neither node's grant is
-/// scoped at all, whatever `microphone` says.
-fn audio_policy_missing(ctx: &Context, i: usize, node: &KdlNode, name: &str, f: &mut Findings) {
+/// The `audio-policy-missing` warning (R9). `pipewire` and `pulseaudio`
+/// share one instance-wide audio reach — [`InstanceConfig::audio`] ORs
+/// them the same way — so this is called once per run over every layer
+/// rather than once per node, and names the first audio node found
+/// across them; a config granting both gets one finding, not two.
+fn audio_policy_missing(ctx: &Context, sources: &[Source], f: &mut Findings) {
     if audio_policy::installed(ctx.host, ctx.env).is_some() {
         return;
     }
+    let Some((i, node, name)) = sources.iter().enumerate().find_map(|(i, s)| {
+        s.flat
+            .iter()
+            .find(|n| matches!(n.name().value(), "pipewire" | "pulseaudio"))
+            .map(|n| (i, n, n.name().value()))
+    }) else {
+        return;
+    };
     let dirs = audio_policy::install_dirs(ctx.env);
     f.push(
         i,
@@ -1315,14 +1326,8 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                 "drop the child unless the application keeps a secret through the portal, \
                  or accept it with `lint-allow \"secrets-access\" reason=\"...\"`",
             ),
-            "pipewire" => {
-                microphone_note(i, node, "pipewire", f);
-                audio_policy_missing(ctx, i, node, "pipewire", f);
-            }
-            "pulseaudio" => {
-                microphone_note(i, node, "pulseaudio", f);
-                audio_policy_missing(ctx, i, node, "pulseaudio", f);
-            }
+            "pipewire" => microphone_note(i, node, "pipewire", f),
+            "pulseaudio" => microphone_note(i, node, "pulseaudio", f),
             "dbus" => dbus_node(i, node, f),
             "system-bus" => system_bus(i, node, f),
             "app-runtime" if prop(node, "mode") == Some("rw") => f.push(
@@ -3650,6 +3655,19 @@ mod tests {
                          reason=\"packaged host\""]
                 )),
                 [] as [&str; 0]
+            );
+        });
+    }
+
+    /// `pipewire` and `pulseaudio` share one instance-wide audio reach
+    /// (`InstanceConfig::audio` ORs them), so a config granting both
+    /// gets one missing-drop-in finding, not one per node.
+    #[test]
+    fn audio_policy_missing_fires_once_for_a_config_granting_both_nodes() {
+        with(&host(), |ctx| {
+            assert_eq!(
+                ids(&lint(ctx, &["pipewire\npulseaudio"])),
+                ["audio-policy-missing"]
             );
         });
     }

@@ -4756,6 +4756,49 @@ fn x11_warns_before_a_real_run() {
     assert!(!String::from_utf8_lossy(&out.stderr).contains("x11 \"host\" grants no isolation"));
 }
 
+#[test]
+fn audio_policy_warns_before_a_real_run_without_the_drop_in() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "pipewire\ncommand \"/usr/bin/true\"\n").unwrap();
+    let out = bubbler(tmp.path()).args(["run", "t"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let expected = format!(
+        "bubbler: warning: {}",
+        bubbler_core::audio_policy::RUN_WARNING
+    );
+    assert!(err.contains(&expected), "{err}");
+    // No pipewire-0 socket in the fake $XDG_RUNTIME_DIR, so the run
+    // fails after the warning is out, the same way x11's does on $DISPLAY.
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&out.stderr).contains(&expected));
+}
+
+#[test]
+fn audio_policy_is_silent_before_a_real_run_with_the_drop_in_installed() {
+    let tmp = setup();
+    std::fs::create_dir_all(tmp.path().join("config/wireplumber/wireplumber.conf.d")).unwrap();
+    std::fs::write(
+        tmp.path()
+            .join("config/wireplumber/wireplumber.conf.d/50-bubbler.conf"),
+        bubbler_core::audio_policy::DROP_IN,
+    )
+    .unwrap();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "pipewire\ncommand \"/usr/bin/true\"\n").unwrap();
+    let out = bubbler(tmp.path()).args(["run", "t"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("audio policy drop-in"), "{err}");
+    // Still fails on the missing pipewire-0 socket, just not on the policy.
+    assert_eq!(out.status.code(), Some(1), "{err}");
+}
+
 /// The nested mode's whole server command line reaches the supervisor:
 /// `--x11`, the argv, and the `--` that closes it, all before the `--`
 /// the sandbox's own command follows. The words are the contract with
