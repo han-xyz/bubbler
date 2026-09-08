@@ -32,9 +32,13 @@
 // the socket PipeWire's pulse server holds on a PipeWire host — and sets
 // PULSE_SERVER to it, which is the path a libpulse client takes; the
 // client's CEF layer and the runtime it downloads are libpulse clients.
-// That socket carries capture as well as playback, so it is the
-// microphone too. Not measured here, because the client fetches its own
-// runtime on first run: if a game is silent, add `pipewire` beside it.
+// Bare, it is playback only. Not measured here, because the client
+// fetches its own runtime on first run: if a game is silent, add
+// `pipewire` beside it.
+//   pulseaudio { microphone }
+//     — in-game voice chat with other players. Every microphone and
+//       line-in the session has becomes reachable, and capture from
+//       them.
 //
 // The default filter covers i386 as well as x86_64, so the 32-bit client
 // and its games are filtered rather than killed, and `modify_ldt` stays
