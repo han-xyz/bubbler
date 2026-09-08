@@ -7,19 +7,35 @@
 //! disabled, and the bed's PipeWire loads no device factory, so the
 //! graph holds one null sink and one null source and nothing else.
 
+use std::ffi::OsStr;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use rustix::process::{
     Pid, Signal, kill_process, kill_process_group, set_parent_process_death_signal,
 };
 
+use bubbler_core::host::RealHost;
+use bubbler_core::pipewire::{
+    PIPEWIRE, PULSE_CONF, PULSE_DROP_IN, PULSE_NATIVE, PULSE_OVERRIDE, PULSE_SOCKET_INSIDE,
+    pulse_conf,
+};
+
 /// The policy drop-in as it is shipped, loaded by the bed's WirePlumber
 /// from the bed's own config directory. The tests below are what says
 /// whether the shipped file grants what it promises.
 const DROP_IN: &str = include_str!("../../../contrib/wireplumber/50-bubbler.conf");
+
+/// The linking hook that drop-in loads, likewise as it is shipped.
+const HOOK: &str = include_str!("../../../contrib/wireplumber/scripts/bubbler/refuse-links.lua");
+
+/// Where the hook goes for the bed's WirePlumber to find it: script
+/// lookup is the data-directory search (`WP_BASE_DIRS_DATA`), which
+/// `XDG_DATA_HOME` joins without replacing, so the stock scripts still
+/// come from the system's own directory.
+const HOOK_IN_DATA_DIR: &str = "wireplumber/scripts/bubbler/refuse-links.lua";
 
 /// The bed's PipeWire: the protocol, the client-node and adapter
 /// factories, the metadata factory WirePlumber needs, and two null
@@ -122,7 +138,7 @@ const WIREPLUMBER_MAIN_CONF: &str = "/usr/share/wireplumber/wireplumber.conf";
 
 /// Everything the bed shells out to, in the order a missing one is
 /// worth reporting.
-const NEEDED: [&str; 7] = [
+const NEEDED: [&str; 10] = [
     "pipewire",
     "wireplumber",
     "pw-container",
@@ -130,6 +146,9 @@ const NEEDED: [&str; 7] = [
     "pw-cli",
     "pw-cat",
     "pw-link",
+    "pactl",
+    "paplay",
+    "parecord",
 ];
 
 /// A security context's properties as bubbler will set them for a
@@ -149,6 +168,10 @@ pub const NO_GRANT: &str = r#"{ "pipewire.sec.engine": "org.bubbler", "pipewire.
 /// Markers naming the bed's two nodes in a `pw-cli info all` listing.
 const SINK: &str = r#"node.name = "bed-sink""#;
 const SOURCE: &str = r#"node.name = "bed-source""#;
+
+/// The same for a playing client's stream node, which is another
+/// client's audio as the graph carries it.
+const STREAM: &str = r#"media.class = "Stream/Output/Audio""#;
 
 /// Say why a test is being skipped where a plain `cargo test` will show
 /// it. Written to descriptor 2 rather than through `eprintln!`: libtest
@@ -265,6 +288,11 @@ impl PipeWireBed {
             .expect("the bed's wireplumber profile");
         std::fs::write(wp.join("wireplumber.conf.d/50-bubbler.conf"), DROP_IN)
             .expect("the policy drop-in");
+        let data = root.join("data");
+        let hook = data.join(HOOK_IN_DATA_DIR);
+        std::fs::create_dir_all(hook.parent().expect("a script directory"))
+            .expect("the bed's script directory");
+        std::fs::write(&hook, HOOK).expect("the policy's linking hook");
 
         let pipewire = daemon(
             Command::new("pipewire")
@@ -283,6 +311,7 @@ impl PipeWireBed {
                 .args(["-p", "bubbler-bed"])
                 .env("PIPEWIRE_RUNTIME_DIR", &run)
                 .env("WIREPLUMBER_CONFIG_DIR", &wp)
+                .env("XDG_DATA_HOME", &data)
                 .env("XDG_STATE_HOME", root.join("state")),
             &root.join("wireplumber.log"),
         );
@@ -384,25 +413,76 @@ impl PipeWireBed {
     /// The same, left running for the caller to watch the graph while it
     /// is up.
     pub fn spawn_in_context(&self, props: &str, program: &str) -> Child {
+        self.spawn_in_context_logged(props, program, None)
+    }
+
+    /// The same with the program's output kept in `log`, which is what
+    /// says why a server that did not come up did not.
+    pub fn spawn_in_context_logged(&self, props: &str, program: &str, log: Option<&Path>) -> Child {
         let mut command = self.context_command(props, program);
-        command.stdout(Stdio::null()).stderr(Stdio::null());
-        // Its own process group, so the whole context can be signalled
-        // at once. `pw-container` sits inside `system()` while the
-        // program runs and only removes its socket once that returns,
-        // so a signal to `pw-container` alone would leave the socket in
-        // `/tmp` for ever.
-        //
-        // SAFETY: the closure runs in the child between fork and exec,
-        // where only async-signal-safe work is allowed; `setpgid` and
-        // `prctl` are bare syscalls that allocate nothing and take no
-        // lock.
-        unsafe {
-            command.pre_exec(|| {
-                rustix::process::setpgid(None, None)?;
-                dies_with_this_thread()
-            });
+        match log {
+            Some(path) => {
+                let out = std::fs::File::create(path).expect("a log for the context's program");
+                let err = out.try_clone().expect("a second handle on that log");
+                command.stdout(out).stderr(err);
+            }
+            None => {
+                command.stdout(Stdio::null()).stderr(Stdio::null());
+            }
         }
+        own_process_group(&mut command);
         command.spawn().expect("pw-container did not run")
+    }
+
+    /// A private `pipewire-pulse` under a context carrying `props`,
+    /// started the way a `pulseaudio` grant starts one: the same binary
+    /// and config-file name, the host's effective configuration copied
+    /// beside bubbler's own fragment, and one socket of this server's
+    /// own.
+    fn pulse_server(&self, props: &str) -> PulseServer {
+        let config = self.dir.join("pwpulse/cfg");
+        let socket = self.dir.join("pwpulse/pulse").join(PULSE_NATIVE);
+        std::fs::create_dir_all(
+            config
+                .join(PULSE_DROP_IN)
+                .parent()
+                .expect("a drop-in directory"),
+        )
+        .expect("the server's config directory");
+        std::fs::create_dir_all(socket.parent().expect("a socket directory"))
+            .expect("the server's socket directory");
+        // The system's file, never the developer's: `pulse_conf` reads
+        // the user's `pipewire` directory first, and a bed that took
+        // what it found there would measure that host's audio and not
+        // bubbler's policy.
+        let effective = pulse_conf(&RealHost, &self.dir.join("no-config-home"))
+            .expect("a pipewire-pulse.conf on this host");
+        std::fs::copy(&effective, config.join(PULSE_CONF)).expect("a copy of that config");
+        std::fs::write(config.join(PULSE_DROP_IN), pulse_fragment(&socket))
+            .expect("bubbler's pulse fragment");
+
+        // `PIPEWIRE_CONFIG_DIR` is set on the server and not on the
+        // whole context: it replaces PipeWire's search path outright,
+        // and `pw-container` is itself a PipeWire client that would
+        // then find no `client.conf` and refuse to start. In a run of
+        // bubbler's own there is no such process — the sidecar has the
+        // variable and the sidecar is the server.
+        let log = self.dir.join("pwpulse.log");
+        let running = Streaming(self.spawn_in_context_logged(
+            props,
+            &format!(
+                "PIPEWIRE_CONFIG_DIR={} {PIPEWIRE} -c {PULSE_CONF}",
+                config.display()
+            ),
+            Some(&log),
+        ));
+        wait_for_logged("the private pulse server's socket", &log, || {
+            socket.exists()
+        });
+        PulseServer {
+            _running: running,
+            socket,
+        }
     }
 
     fn context_command(&self, props: &str, program: &str) -> Command {
@@ -423,6 +503,25 @@ impl Drop for PipeWireBed {
             wait_or_kill(child);
         }
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Start `command`'s child in a process group of its own that dies with
+/// this thread.
+///
+/// A group, because a program started under `pw-container` is a
+/// grandchild: `pw-container` sits inside `system()` while it runs and
+/// only removes its socket once that returns, so a signal to
+/// `pw-container` alone would leave the socket in `/tmp` for ever.
+fn own_process_group(command: &mut Command) {
+    // SAFETY: the closure runs in the child between fork and exec,
+    // where only async-signal-safe work is allowed; `setpgid` and
+    // `prctl` are bare syscalls that allocate nothing and take no lock.
+    unsafe {
+        command.pre_exec(|| {
+            rustix::process::setpgid(None, None)?;
+            dies_with_this_thread()
+        });
     }
 }
 
@@ -485,6 +584,9 @@ fn daemon(command: &mut Command, log: &Path) -> Child {
 struct Object {
     id: String,
     permissions: String,
+    /// The object's `object.serial`, which is the name a client gives a
+    /// target it asks to be linked to (`pw-cat --target`).
+    serial: Option<String>,
 }
 
 /// The object whose block carries every one of `markers`, or `None` when
@@ -501,7 +603,33 @@ fn object(listing: &str, markers: &[&str]) -> Option<Object> {
             .lines()
             .find_map(|line| line.trim().strip_prefix("permissions: "))?
             .to_owned(),
+        // A property line is printed with a leading `*` when the value
+        // has changed since the last listing, so the name is not at the
+        // start of what `trim` leaves.
+        serial: block
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .trim_start_matches('*')
+                    .trim_start()
+                    .strip_prefix("object.serial = \"")
+            })
+            .map(|serial| serial.trim_end_matches('"').to_owned()),
     })
+}
+
+/// The same, with the process's own log in the failure: a server that
+/// refuses to start says why there and nowhere else.
+fn wait_for_logged(what: &str, log: &Path, mut ready: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if ready() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let said = std::fs::read_to_string(log).unwrap_or_default();
+    panic!("{what} never came up:\n{said}");
 }
 
 /// Poll `ready` until it holds, or fail the test naming what never came.
@@ -583,6 +711,59 @@ impl Drop for Streaming {
     }
 }
 
+/// bubbler's own pulse fragment with the socket path moved into the
+/// bed. Everything else the server's behaviour turns on — no module
+/// loading, no session bus — is the shipped text, so a change to it is
+/// measured here and not only asserted on in a unit test.
+fn pulse_fragment(socket: &Path) -> String {
+    let moved = PULSE_OVERRIDE.replace(PULSE_SOCKET_INSIDE, &socket.to_string_lossy());
+    assert_ne!(
+        moved, PULSE_OVERRIDE,
+        "the shipped fragment no longer names {PULSE_SOCKET_INSIDE}"
+    );
+    moved
+}
+
+/// A private `pipewire-pulse` and the socket it serves, killed with the
+/// test.
+struct PulseServer {
+    _running: Streaming,
+    socket: PathBuf,
+}
+
+impl PulseServer {
+    /// `program` run against this server and no other, from outside the
+    /// security context: what a `pulseaudio` grant gives the sandboxed
+    /// application is this socket, and the PipeWire daemon behind it is
+    /// the server's business alone.
+    fn run(&self, program: &str, args: &[&OsStr]) -> Output {
+        self.command(program, args)
+            .output()
+            .unwrap_or_else(|e| panic!("{program} did not run: {e}"))
+    }
+
+    /// The same, left running and killed with the test: `parecord`
+    /// writes until it is stopped.
+    fn spawn(&self, program: &str, args: &[&OsStr]) -> Streaming {
+        let mut command = self.command(program, args);
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        own_process_group(&mut command);
+        Streaming(
+            command
+                .spawn()
+                .unwrap_or_else(|e| panic!("{program} did not run: {e}")),
+        )
+    }
+
+    fn command(&self, program: &str, args: &[&OsStr]) -> Command {
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .env("PULSE_SERVER", format!("unix:{}", self.socket.display()));
+        command
+    }
+}
+
 /// Start `program` in a context carrying `props` and wait until the
 /// node it opens is in the graph, so what follows measures a stream that
 /// exists rather than one that has not arrived yet.
@@ -595,8 +776,29 @@ fn streaming(bed: &PipeWireBed, props: &str, program: &str, class: &str) -> Stre
     child
 }
 
+/// Wait until the session manager has decided the access of a context
+/// carrying `grant` — `pipewire.access.effective` is what
+/// `apply-access.lua` writes once it has attached the permission
+/// manager, so from then on it has everything it needs to link — and
+/// then leave it the window in which it would.
+///
+/// A bound, not a proof: nothing announces "I considered this stream
+/// and declined". A host slow enough to rescan later than this would
+/// pass a no-link test with a link still coming.
+fn window_in_which_it_would_link(bed: &PipeWireBed, grant: &str) {
+    let decided = format!("bubbler.audio = \"{grant}\"");
+    wait_for("the capture client's access decision", || {
+        object(
+            &bed.info_from_host(),
+            &[&decided, "pipewire.access.effective"],
+        )
+        .is_some()
+    });
+    std::thread::sleep(Duration::from_secs(2));
+}
+
 #[test]
-fn a_playback_context_sees_no_source_no_other_stream_and_no_metadata() {
+fn a_playback_context_sees_no_source_no_metadata_and_only_reads_streams() {
     let Some(bed) = PipeWireBed::start() else {
         return;
     };
@@ -612,15 +814,22 @@ fn a_playback_context_sees_no_source_no_other_stream_and_no_metadata() {
     let seen = bed.in_context(PLAYBACK, "pw-dump");
     assert!(seen.contains("\"node.name\": \"bed-sink\""), "{seen}");
     assert!(!seen.contains("\"node.name\": \"bed-source\""), "{seen}");
-    assert!(!seen.contains("\"media.class\": \"Stream/"), "{seen}");
     // `metadata.name` is on the metadata objects and on nothing else;
     // the interface name is also the metadata *factory*'s type, which
     // the sandbox may keep seeing.
     assert!(!seen.contains("\"metadata.name\""), "{seen}");
 
-    let listing = bed.info_in_context(PLAYBACK, &[SINK]);
+    let listing = bed.info_in_context(PLAYBACK, &[SINK, STREAM]);
     let sink = object(&listing, &[SINK]).expect("the sink is visible");
     assert_eq!(sink.permissions, "r-x--", "on the sink:\n{listing}");
+    // Another client's stream is visible because the private pulse
+    // server must see the streams it creates, and read is the whole of
+    // it: no `x` to call a method on it, no `l` to be linked to it.
+    let stream = object(&listing, &[STREAM]).expect("another client's stream is visible");
+    assert_eq!(
+        stream.permissions, "r----",
+        "on another client's stream:\n{listing}"
+    );
     // What the sink's `r-x--` means, asked of the daemon rather than
     // read off the manager's own configuration: a `default_permissions`
     // widened to include `w` would leave every assertion above intact.
@@ -680,27 +889,53 @@ fn a_playback_capture_stream_gets_no_link() {
         &format!("pw-cat -r {}", out.display()),
         "Stream/Input/Audio",
     );
-    // The stream is in the graph and WirePlumber has decided this
-    // client's access — `pipewire.access.effective` is what
-    // `apply-access.lua` writes once it has attached the permission
-    // manager — so the session manager has everything it needs to link,
-    // and the two seconds below are the window in which it would.
-    //
-    // A bound, not a proof: nothing announces "I considered this stream
-    // and declined". A host slow enough to rescan later than this would
-    // pass the test with a link still coming.
-    wait_for("the capture client's access decision", || {
-        object(
-            &bed.info_from_host(),
-            &["bubbler.audio = \"playback\"", "pipewire.access.effective"],
-        )
-        .is_some()
-    });
-    std::thread::sleep(Duration::from_secs(2));
+    window_in_which_it_would_link(&bed, "playback");
     let links = bed.links();
     assert!(
         !links.contains("bed-source"),
         "a playback-only context captured from the null source:\n{links}"
+    );
+}
+
+#[test]
+fn a_playback_context_gets_no_link_to_another_clients_stream() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let wav = bed.dir().join("tone.wav");
+    silence(&wav);
+    let _other = streaming(
+        &bed,
+        PLAYBACK,
+        &format!("pw-cat -p {}", wav.display()),
+        "Stream/Output/Audio",
+    );
+    let listing = bed.info_in_context(PLAYBACK, &[STREAM]);
+    let stream = object(&listing, &[STREAM]).expect("another client's stream is visible");
+    let serial = stream.serial.expect("the stream's object.serial");
+
+    // Seeing a stream is what the pulse server needs; being linked to
+    // one is eavesdropping, and `--target` is how a client asks for it
+    // by name.
+    let out = bed.dir().join("stolen.wav");
+    let _thief = streaming(
+        &bed,
+        PLAYBACK,
+        &format!("pw-cat -r --target={serial} {}", out.display()),
+        "Stream/Input/Audio",
+    );
+    window_in_which_it_would_link(&bed, "playback");
+
+    let links = bed.links();
+    // The playing client is still linked, so this is a graph that
+    // links rather than one that has stopped.
+    assert!(links.contains("bed-sink:playback_"), "{links}");
+    // A capture stream's ports are the only `input_` ports here: the
+    // sink's are `playback_`, the source's `capture_` and its monitor's
+    // `monitor_`.
+    assert!(
+        !links.contains("input_"),
+        "a playback context was linked to another client's stream:\n{links}"
     );
 }
 
@@ -721,6 +956,121 @@ fn a_microphone_context_captures_from_the_null_source() {
     });
     let seen = bed.in_context(PLAYBACK_MICROPHONE, "pw-dump");
     assert!(seen.contains("\"node.name\": \"bed-source\""), "{seen}");
+}
+
+#[test]
+fn no_context_records_the_sinks_monitor_ports() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    // Under `microphone` too: what that grant opens is the microphone,
+    // never the mix of everything the session is playing.
+    for (props, grant) in [
+        (PLAYBACK, "playback"),
+        (PLAYBACK_MICROPHONE, "playback,microphone"),
+    ] {
+        let out = bed.dir().join("mix.wav");
+        let _recording = streaming(
+            &bed,
+            props,
+            &format!(
+                "pw-cat -r -P '{{ stream.capture.sink = true }}' --target=bed-sink {}",
+                out.display()
+            ),
+            "Stream/Input/Audio",
+        );
+        window_in_which_it_would_link(&bed, grant);
+
+        let links = bed.links();
+        assert!(
+            !links.contains("monitor_"),
+            "a {grant} context was linked to the sink's monitor ports:\n{links}"
+        );
+    }
+}
+
+#[test]
+fn a_playback_context_plays_through_a_private_pulse_server() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let wav = bed.dir().join("tone.wav");
+    silence(&wav);
+    let server = bed.pulse_server(PLAYBACK);
+
+    let played = server.run("paplay", &[wav.as_os_str()]);
+    assert!(
+        played.status.success(),
+        "paplay through the private pulse server: {played:?}"
+    );
+}
+
+#[test]
+fn a_pulse_client_under_playback_lists_only_the_sinks_monitor_as_a_source() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let server = bed.pulse_server(PLAYBACK);
+
+    let listed = server.run("pactl", &["list", "short", "sources"].map(OsStr::new));
+    assert!(
+        listed.status.success(),
+        "pactl list short sources: {listed:?}"
+    );
+    let sources = String::from_utf8_lossy(&listed.stdout);
+    assert_eq!(
+        sources.lines().count(),
+        1,
+        "sources under playback:\n{sources}"
+    );
+    assert!(
+        sources.contains("bed-sink.monitor"),
+        "sources under playback:\n{sources}"
+    );
+}
+
+#[test]
+fn a_pulse_client_under_playback_gets_no_capture_link() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let server = bed.pulse_server(PLAYBACK);
+    let out = bed.dir().join("captured.wav");
+    let _recording = server.spawn(
+        "parecord",
+        &[OsStr::new("--file-format=wav"), out.as_os_str()],
+    );
+    wait_for("the pulse client's capture stream", || {
+        bed.dump_from_host()
+            .contains("\"media.class\": \"Stream/Input/Audio\"")
+    });
+    window_in_which_it_would_link(&bed, "playback");
+
+    let links = bed.links();
+    assert!(
+        !links.contains("bed-source") && !links.contains("monitor_"),
+        "a pulse client under playback was linked to something it may not record:\n{links}"
+    );
+}
+
+#[test]
+fn a_pulse_client_under_microphone_records_from_the_null_source() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let server = bed.pulse_server(PLAYBACK_MICROPHONE);
+    let out = bed.dir().join("captured.wav");
+    let _recording = server.spawn(
+        "parecord",
+        &[
+            OsStr::new("--device=bed-source"),
+            OsStr::new("--file-format=wav"),
+            out.as_os_str(),
+        ],
+    );
+    wait_for("a link from the null source", || {
+        bed.links().contains("bed-source:capture_")
+    });
 }
 
 #[test]

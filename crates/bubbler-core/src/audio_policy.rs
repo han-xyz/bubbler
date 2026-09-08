@@ -1,8 +1,9 @@
-//! The WirePlumber policy drop-in (`contrib/wireplumber/50-bubbler.conf`)
-//! that scopes each instance's audio grant, embedded so bubbler can hand
-//! it out (`bubbler audio-policy --print`) and detect when none of the
-//! host's `wireplumber.conf.d` directories holds it, without touching
-//! the source tree it was built from.
+//! The WirePlumber policy that scopes each instance's audio grant — the
+//! drop-in (`contrib/wireplumber/50-bubbler.conf`) and the linking hook
+//! it loads — embedded so bubbler can hand both out (`bubbler
+//! audio-policy --print`, `--print --script`) and detect when none of
+//! the host's `wireplumber.conf.d` directories holds the drop-in,
+//! without touching the source tree it was built from.
 
 use std::path::PathBuf;
 
@@ -18,6 +19,21 @@ pub const DROP_IN: &str = include_str!("../../../contrib/wireplumber/50-bubbler.
 /// File name WirePlumber loads the drop-in under, in any of
 /// [`install_dirs`].
 pub const DROP_IN_NAME: &str = "50-bubbler.conf";
+
+/// The linking hook the drop-in loads, exactly as shipped in
+/// `contrib/`. A permission says what one object may do; which links
+/// may be made is a fact about two, so the part of the policy that
+/// keeps a sandbox off the sink's monitor ports and off another
+/// client's stream is this script rather than a rule.
+pub const HOOK: &str =
+    include_str!("../../../contrib/wireplumber/scripts/bubbler/refuse-links.lua");
+
+/// Path WirePlumber loads the hook under, relative to a `scripts`
+/// directory: `$WIREPLUMBER_DATA_DIR`, `$XDG_DATA_HOME/wireplumber`,
+/// `$XDG_DATA_DIRS/*/wireplumber` or `/usr/share/wireplumber`, in that
+/// order. Not a `wireplumber.conf.d` directory and not `/etc`: script
+/// lookup is the data-directory search, which holds neither.
+pub const HOOK_NAME: &str = "bubbler/refuse-links.lua";
 
 /// The three `wireplumber.conf.d` directories bubbler looks for the
 /// drop-in in, in the order [`installed`] searches.
@@ -118,6 +134,17 @@ mod tests {
         let disk =
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         assert_eq!(DROP_IN, disk);
+    }
+
+    #[test]
+    fn hook_matches_the_file_on_disk() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("contrib/wireplumber/scripts")
+            .join(HOOK_NAME);
+        let disk =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert_eq!(HOOK, disk);
     }
 
     #[test]

@@ -10921,6 +10921,19 @@ fn audio_policy_print_writes_the_embedded_drop_in() {
     assert_eq!(out.stdout, bubbler_core::audio_policy::DROP_IN.as_bytes());
 }
 
+/// The policy is two files: the drop-in loads a linking hook, and a
+/// hand-installed policy needs both out of the binary.
+#[test]
+fn audio_policy_print_script_writes_the_embedded_hook() {
+    let tmp = setup();
+    let out = bubbler(tmp.path())
+        .args(["audio-policy", "--print", "--script"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(out.stdout, bubbler_core::audio_policy::HOOK.as_bytes());
+}
+
 #[test]
 fn audio_policy_without_print_is_a_usage_error() {
     let tmp = setup();

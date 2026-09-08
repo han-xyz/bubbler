@@ -505,23 +505,31 @@ command line never carries its dependencies; this subcommand runs the copy
 beside this binary, else the first on PATH, and says how to install it when
 there is none. Everything it does, it does by running this binary.")]
     Ui,
-    /// Print the WirePlumber policy drop-in that scopes a `pipewire`/`pulseaudio` grant.
+    /// Print the WirePlumber policy that scopes a `pipewire`/`pulseaudio` grant.
     #[command(long_about = "\
-Write the WirePlumber policy drop-in bubbler ships
-(contrib/wireplumber/50-bubbler.conf) to stdout, byte for byte, so it can be
-installed without a checkout of the source tree:
+Write the WirePlumber policy bubbler ships to stdout, byte for byte, so it can
+be installed without a checkout of the source tree. It is two files, and both
+are needed:
 
     bubbler audio-policy --print > /usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf
+    bubbler audio-policy --print --script > /usr/share/wireplumber/scripts/bubbler/refuse-links.lua
 
-(or `/etc/wireplumber/wireplumber.conf.d/`, or the per-user
-`$XDG_CONFIG_HOME/wireplumber/wireplumber.conf.d/`), then restart WirePlumber.
-Without it installed in one of those three, a `pipewire` or `pulseaudio`
-grant reaches every PipeWire node instead of what it asks for — `run`,
-`--explain` and `lint` all say so.")]
+The drop-in also goes in `/etc/wireplumber/wireplumber.conf.d/` or the per-user
+`$XDG_CONFIG_HOME/wireplumber/wireplumber.conf.d/`; the script's directory is a
+data directory and not a config one, so per-user it is
+`$XDG_DATA_HOME/wireplumber/scripts/bubbler/`. Restart WirePlumber afterwards.
+Without the drop-in installed, a `pipewire` or `pulseaudio` grant reaches every
+PipeWire node instead of what it asks for — `run`, `--explain` and `lint` all
+say so. Without the script beside it the grant is scoped but a sandbox can
+still record the sink's monitor ports, which carry every other application's
+audio.")]
     AudioPolicy {
-        /// Write the drop-in to stdout.
+        /// Write the policy to stdout.
         #[arg(long, required = true)]
         print: bool,
+        /// Write the linking hook the drop-in loads, not the drop-in.
+        #[arg(long)]
+        script: bool,
     },
     /// Print bubbler's manual pages in roff.
     #[command(long_about = "\
@@ -656,6 +664,14 @@ fn print_bytes(bytes: &[u8], what: &str) -> Result<i32> {
         Ok(()) => Ok(0),
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(0),
         Err(e) => Err(e).with_context(|| format!("writing {what}")),
+    }
+}
+
+/// Write one of the two files the audio policy is made of.
+fn print_policy(script: bool) -> Result<i32> {
+    match script {
+        true => print_bytes(audio_policy::HOOK.as_bytes(), "the audio policy's hook"),
+        false => print_bytes(audio_policy::DROP_IN.as_bytes(), "the audio policy drop-in"),
     }
 }
 
@@ -1157,8 +1173,12 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
     // Before the environment too: the drop-in is a constant embedded at
     // build time, and a packaging step installing it needs no session
     // either.
-    if let Cmd::AudioPolicy { print: true } = cli.cmd {
-        return print_bytes(audio_policy::DROP_IN.as_bytes(), "the audio policy drop-in");
+    if let Cmd::AudioPolicy {
+        print: true,
+        script,
+    } = cli.cmd
+    {
+        return print_policy(script);
     }
     let env = host_env::from_process()?;
     match cli.cmd {
@@ -1649,9 +1669,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
         // clap's `required = true` on `print` means this is reached only
         // with it set; the early check above is what actually runs it,
         // before `env` is read.
-        Cmd::AudioPolicy { print: _ } => {
-            print_bytes(audio_policy::DROP_IN.as_bytes(), "the audio policy drop-in")
-        }
+        Cmd::AudioPolicy { print: _, script } => print_policy(script),
         Cmd::Man { config } => print_man(config),
         Cmd::Lint { name, opts } => {
             let path = host_env::search_path();
