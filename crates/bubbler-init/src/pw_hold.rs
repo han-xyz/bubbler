@@ -79,19 +79,18 @@ pub fn run() -> ExitCode {
     // this line, and the only other descriptors it has are the ones
     // `pw-container` was started with.
     let report = unsafe { OwnedFd::from_raw_fd(fd) };
-    if let Err(why) = hand_over(Path::new(&remote), report.as_fd()) {
-        eprintln!("{NAME}: {why}");
-        return ExitCode::from(1);
-    }
-    // Closed as soon as the path is out: bubbler reads one line and then
-    // waits on nothing, and a descriptor held open here would keep it
-    // from seeing the end of a holder that died before reporting.
-    drop(report);
     let stop = Arc::new(AtomicBool::new(false));
     // The four the supervisor takes, for the same reason: each of them
     // means the run is over, and left on their default dispositions they
     // would kill this process where it stands instead of letting it
     // report the exit `pw-container` reads.
+    //
+    // Before the report and not after it: the line below is what tells
+    // bubbler the context is up, and the run it belongs to can end at
+    // any moment from then on. A SIGTERM in the window between the two
+    // would find the default disposition and kill the holder, which
+    // leaves `pw-container` waiting out the launcher's whole stop
+    // deadline instead of exiting with it.
     for sig in [
         signal_hook::consts::SIGTERM,
         signal_hook::consts::SIGINT,
@@ -103,6 +102,14 @@ pub fn run() -> ExitCode {
             return ExitCode::from(2);
         }
     }
+    if let Err(why) = hand_over(Path::new(&remote), report.as_fd()) {
+        eprintln!("{NAME}: {why}");
+        return ExitCode::from(1);
+    }
+    // Closed as soon as the path is out: bubbler reads one line and then
+    // waits on nothing, and a descriptor held open here would keep it
+    // from seeing the end of a holder that died before reporting.
+    drop(report);
     while !stop.load(Ordering::Relaxed) {
         // A signal that arrived between the check above and this call
         // would not interrupt it, so the wait is bounded rather than
