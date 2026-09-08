@@ -37,8 +37,9 @@
 // PULSE_SERVER to it, which is the path a libpulse client takes, as Wine
 // and the Proton runtimes are. Bare, it is playback only: no microphone,
 // no other app's audio, and the private server it now runs behind
-// refuses to load a module. Not measured here: if a game is silent, add
-// `pipewire` beside it.
+// refuses to load a module, with the policy drop-in installed; `lint`
+// warns `audio-policy-missing` where it is not. Not measured here: if a
+// game is silent, add `pipewire` beside it.
 //
 // umu, Proton and DXVK's 32-bit path make i386 syscalls; the default
 // filter carries i386 as well as x86_64, so they are filtered rather than

@@ -5,7 +5,9 @@
 // $XDG_RUNTIME_DIR/pulse/native, which is what that grant binds.
 // `pipewire` binds only pipewire-0, the native socket, and is what the
 // screen-share portal hands frames over. Bare, either socket is playback
-// only: nothing a page asks for through getUserMedia is reachable.
+// only: nothing a page asks for through getUserMedia is reachable, with
+// the policy drop-in installed; `lint` warns `audio-policy-missing`
+// where it is not.
 //   pulseaudio { microphone }
 //     — the microphone a web meeting's getUserMedia call asks for.
 //       Every microphone and line-in the session has becomes

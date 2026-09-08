@@ -32,9 +32,10 @@
 // the socket PipeWire's pulse server holds on a PipeWire host — and sets
 // PULSE_SERVER to it, which is the path a libpulse client takes; the
 // client's CEF layer and the runtime it downloads are libpulse clients.
-// Bare, it is playback only. Not measured here, because the client
-// fetches its own runtime on first run: if a game is silent, add
-// `pipewire` beside it.
+// Bare, it is playback only, with the policy drop-in installed; `lint`
+// warns `audio-policy-missing` where it is not. Not measured here,
+// because the client fetches its own runtime on first run: if a game is
+// silent, add `pipewire` beside it.
 //   pulseaudio { microphone }
 //     — in-game voice chat with other players. Every microphone and
 //       line-in the session has becomes reachable, and capture from

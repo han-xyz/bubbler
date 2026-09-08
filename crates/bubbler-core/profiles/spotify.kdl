@@ -7,7 +7,8 @@
 // native socket, and is for a client that speaks PipeWire itself or for
 // the screen-share portal. Bare, either socket is playback only: no
 // microphone, no other app's audio, and the private server pulseaudio
-// runs behind refuses to load a module.
+// runs behind refuses to load a module, with the policy drop-in
+// installed; `lint` warns `audio-policy-missing` where it is not.
 //
 // No `talk "org.freedesktop.secrets"`: a music player's session token is
 // adequately kept in its own config file in the private home, and the

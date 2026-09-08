@@ -5,10 +5,11 @@
 // (the string is in /usr/lib/electron40/electron) and reaches it through
 // the socket that grant binds, for a call's playback and its capture
 // alike. `microphone` is what puts capture in reach at all — bare
-// `pulseaudio` is playback only under 0.23's policy — and it opens every
-// microphone and line-in the session has, and capture from them. `pipewire`
-// binds only pipewire-0, the native socket, which Electron uses for screen
-// capture rather than for sound.
+// `pulseaudio` is playback only, with the policy drop-in installed;
+// `lint` warns `audio-policy-missing` where it is not — and it opens
+// every microphone and line-in the session has, and capture from them.
+// `pipewire` binds only pipewire-0, the native socket, which Electron
+// uses for screen capture rather than for sound.
 //
 // Extra Electron flags go in the private home's vesktop-flags.conf,
 // which /usr/bin/vesktop reads from $XDG_CONFIG_HOME. That wrapper also
