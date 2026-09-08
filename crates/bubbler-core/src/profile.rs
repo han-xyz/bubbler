@@ -3046,6 +3046,7 @@ mod tests {
                 },
                 rules: &[],
                 wl_proxy: None,
+                audio_policy: "",
                 net_proxy_log: false,
                 proxy: false,
                 full: false,

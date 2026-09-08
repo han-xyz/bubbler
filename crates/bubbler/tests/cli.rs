@@ -570,6 +570,67 @@ fn explain_names_the_context_an_audio_grant_is_served_through() {
     assert!(s.contains(&format!("sidecar: {PW_CONTAINER} -P ")), "{s}");
 }
 
+/// The explanation says what the grant costs on *this* host, and without
+/// the policy drop-in an audio grant reaches every node whatever the
+/// config asks for.
+#[test]
+fn explain_says_the_audio_policy_drop_in_is_missing() {
+    if !require_host_program(PW_CONTAINER) {
+        return;
+    }
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "pipewire\ncommand \"true\"\n").unwrap();
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--explain"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let header = s
+        .lines()
+        .find(|l| l.starts_with("  pipewire"))
+        .unwrap_or_else(|| panic!("no pipewire group in {s}"));
+    assert!(
+        header.ends_with(bubbler_core::audio_policy::EXPLAIN_SUFFIX),
+        "{header}"
+    );
+}
+
+#[test]
+fn explain_says_nothing_about_the_policy_where_the_drop_in_is_installed() {
+    if !require_host_program(PW_CONTAINER) {
+        return;
+    }
+    let tmp = setup();
+    std::fs::create_dir_all(tmp.path().join("config/wireplumber/wireplumber.conf.d")).unwrap();
+    std::fs::write(
+        tmp.path()
+            .join("config/wireplumber/wireplumber.conf.d/50-bubbler.conf"),
+        bubbler_core::audio_policy::DROP_IN,
+    )
+    .unwrap();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "pipewire\ncommand \"true\"\n").unwrap();
+    let out = bubbler(tmp.path())
+        .args(["run", "t", "--explain"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!s.contains("policy drop-in"), "{s}");
+}
+
 /// An instance whose grants need nothing of this host: the D-Bus socket
 /// is bound from a path the launcher would create, and `notify` is a rule
 /// for the proxy rather than an argument.

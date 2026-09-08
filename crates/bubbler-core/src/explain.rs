@@ -94,6 +94,12 @@ pub struct View<'a> {
     /// is [`crate::env::Env::net_proxy_log`] and shows in its sidecar
     /// line; nothing else of the explanation depends on it.
     pub net_proxy_log: bool,
+    /// What an audio grant's group header ends with:
+    /// [`crate::audio_policy::EXPLAIN_SUFFIX`] where this host has no
+    /// policy drop-in, else empty. Asked of the host by the caller, like
+    /// `bwrap` below: an explanation describes a run, and probes for it
+    /// itself.
+    pub audio_policy: &'static str,
     /// The sidecar's argv rather than the sandbox's: its groups are the
     /// rules themselves, and a grant that contributes neither an argument
     /// nor a rule to it is not a group of it.
@@ -561,6 +567,15 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
                 Some(Service::Dri { kms: false }) if binds_a_primary_node(&g.items) => {
                     header.push_str(NVIDIA_NOTE);
                 }
+                // One context and one policy for the whole instance, so
+                // the absent drop-in is said once, on the group that
+                // describes the context — which is the node `lint`'s
+                // `audio-policy-missing` names as well.
+                Some(Service::Pipewire { .. } | Service::Pulseaudio { .. })
+                    if audio_node(&view.cfg.services) == Some(i) =>
+                {
+                    header.push_str(view.audio_policy);
+                }
                 _ => {}
             }
         }
@@ -836,6 +851,7 @@ mod tests {
                 },
                 rules: &rules,
                 wl_proxy: None,
+                audio_policy: "",
                 net_proxy_log: false,
                 proxy: false,
                 full: false,
@@ -946,6 +962,7 @@ bwrap
                 },
                 rules: &[],
                 wl_proxy: None,
+                audio_policy: "",
                 net_proxy_log: false,
                 proxy: false,
                 full: false,
@@ -992,6 +1009,7 @@ bwrap
                 },
                 rules: &[],
                 wl_proxy: None,
+                audio_policy: "",
                 net_proxy_log: false,
                 proxy: false,
                 full: false,
@@ -1043,6 +1061,7 @@ bwrap
                     },
                     rules: &[],
                     wl_proxy: Some(&plan),
+                    audio_policy: "",
                     net_proxy_log: false,
                     proxy: false,
                     full: false,
@@ -1092,6 +1111,7 @@ bwrap
                     },
                     rules: &[],
                     wl_proxy: None,
+                    audio_policy: "",
                     net_proxy_log: false,
                     proxy: false,
                     full: false,
@@ -1115,6 +1135,63 @@ bwrap
                 "{out:#?}"
             );
         }
+    }
+
+    /// Where an absent policy drop-in is said: on the header of the one
+    /// group that describes the context, not on every audio node's.
+    #[test]
+    fn a_missing_audio_policy_ends_the_header_of_the_group_the_context_is_under() {
+        let cfg = cfg("pipewire\npulseaudio\ncommand \"true\"");
+        let lines = Lines::default();
+        let headers = |suffix: &'static str| {
+            let out = render(
+                &[
+                    item(
+                        Origin::Service(0),
+                        &["--ro-bind", "/run/t/pw", "/run/pw"],
+                        None,
+                    ),
+                    item(
+                        Origin::Service(1),
+                        &["--ro-bind", "/run/t/pa", "/run/pa"],
+                        None,
+                    ),
+                ],
+                &View {
+                    title: "bwrap",
+                    instance: "t",
+                    cfg: &cfg,
+                    source: Source {
+                        file: "config.kdl",
+                        lines: &lines,
+                    },
+                    rules: &[],
+                    wl_proxy: None,
+                    audio_policy: suffix,
+                    net_proxy_log: false,
+                    proxy: false,
+                    full: false,
+                    bwrap: crate::version::Version::Known(0, 12, 0),
+                },
+            )
+            .unwrap();
+            out.into_iter()
+                .filter(|l| l.starts_with("  pipewire") || l.starts_with("  pulseaudio"))
+                .collect::<Vec<_>>()
+        };
+        let absent = headers(crate::audio_policy::EXPLAIN_SUFFIX);
+        assert!(
+            absent[0].ends_with(crate::audio_policy::EXPLAIN_SUFFIX),
+            "{absent:?}"
+        );
+        assert!(
+            !absent[1].ends_with(crate::audio_policy::EXPLAIN_SUFFIX),
+            "{absent:?}"
+        );
+        assert!(
+            headers("").iter().all(|h| !h.contains("policy drop-in")),
+            "an installed drop-in says nothing"
+        );
     }
 
     /// What `dri kms=#true` costs is not in its arguments: the card
@@ -1141,6 +1218,7 @@ bwrap
                     },
                     rules: &[],
                     wl_proxy: None,
+                    audio_policy: "",
                     net_proxy_log: false,
                     proxy: false,
                     full: false,
@@ -1191,6 +1269,7 @@ bwrap
                 },
                 rules: &[],
                 wl_proxy: None,
+                audio_policy: "",
                 net_proxy_log: false,
                 proxy: false,
                 full: false,
@@ -1230,6 +1309,7 @@ bwrap
                     },
                     rules: &[],
                     wl_proxy: None,
+                    audio_policy: "",
                     net_proxy_log: false,
                     proxy: false,
                     full: false,
@@ -1331,6 +1411,7 @@ bwrap
                 },
                 rules: &rules,
                 wl_proxy: None,
+                audio_policy: "",
                 net_proxy_log: false,
                 proxy: false,
                 full: false,
@@ -1380,6 +1461,7 @@ bwrap
             },
             rules: &[],
             wl_proxy: None,
+            audio_policy: "",
             net_proxy_log: false,
             proxy: false,
             full: false,
@@ -1424,6 +1506,7 @@ bwrap
                     },
                     rules: &bare_rules,
                     wl_proxy: None,
+                    audio_policy: "",
                     net_proxy_log: false,
                     proxy: false,
                     full: false,
@@ -1462,6 +1545,7 @@ bwrap
                 },
                 rules: &node_rules,
                 wl_proxy: None,
+                audio_policy: "",
                 net_proxy_log: false,
                 proxy: false,
                 full: false,
@@ -1490,6 +1574,7 @@ bwrap
                 },
                 rules: &[],
                 wl_proxy: None,
+                audio_policy: "",
                 net_proxy_log: false,
                 proxy: false,
                 full: true,
@@ -1536,6 +1621,7 @@ bwrap
                 },
                 rules: &[],
                 wl_proxy: None,
+                audio_policy: "",
                 net_proxy_log: false,
                 proxy: false,
                 full: false,
@@ -1581,6 +1667,7 @@ bwrap
             },
             rules: &rules,
             wl_proxy: None,
+            audio_policy: "",
             net_proxy_log: false,
             proxy: true,
             full: true,
@@ -1616,6 +1703,7 @@ bwrap
                 },
                 rules: &[],
                 wl_proxy: None,
+                audio_policy: "",
                 net_proxy_log: false,
                 proxy: false,
                 full: false,
@@ -1657,6 +1745,7 @@ bwrap
                 },
                 rules: &[],
                 wl_proxy: None,
+                audio_policy: "",
                 net_proxy_log: false,
                 proxy: false,
                 full: false,
@@ -1696,6 +1785,7 @@ bwrap
                 },
                 rules: &[],
                 wl_proxy: None,
+                audio_policy: "",
                 net_proxy_log: false,
                 proxy: false,
                 full: false,
@@ -1726,6 +1816,7 @@ bwrap
                 },
                 rules: &[],
                 wl_proxy: None,
+                audio_policy: "",
                 net_proxy_log: false,
                 proxy: false,
                 full: false,
@@ -1800,6 +1891,7 @@ bwrap
             },
             rules: &[],
             wl_proxy: None,
+            audio_policy: "",
             net_proxy_log: false,
             proxy: false,
             full: false,
@@ -1842,6 +1934,7 @@ bwrap
             },
             rules: &[],
             wl_proxy: None,
+            audio_policy: "",
             net_proxy_log: false,
             proxy: false,
             full: false,
@@ -1879,6 +1972,7 @@ bwrap
             },
             rules: &[],
             wl_proxy: None,
+            audio_policy: "",
             net_proxy_log: false,
             proxy: false,
             full: false,
@@ -1927,6 +2021,7 @@ bwrap
             },
             rules: &[],
             wl_proxy: None,
+            audio_policy: "",
             net_proxy_log: false,
             proxy: false,
             full: false,
@@ -1964,6 +2059,7 @@ bwrap
             },
             rules: &[],
             wl_proxy: None,
+            audio_policy: "",
             net_proxy_log: false,
             proxy: false,
             full: false,
@@ -2004,6 +2100,7 @@ bwrap
                 },
                 rules: &[],
                 wl_proxy: None,
+                audio_policy: "",
                 net_proxy_log: false,
                 proxy: false,
                 full: false,
@@ -2056,6 +2153,7 @@ bwrap
             },
             rules: &[],
             wl_proxy: None,
+            audio_policy: "",
             net_proxy_log: false,
             proxy: false,
             full: false,

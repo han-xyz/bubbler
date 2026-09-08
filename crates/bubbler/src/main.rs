@@ -754,6 +754,7 @@ fn explain(
         },
         rules: &rules,
         wl_proxy: wl_proxy.as_ref(),
+        audio_policy: audio_policy::explain_suffix(&RealHost, env),
         net_proxy_log: env.net_proxy_log,
         proxy: opts.proxy || opts.wl_proxy || opts.net_proxy,
         full: opts.mode == Explain::Full,
