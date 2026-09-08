@@ -122,6 +122,11 @@
   the launch.
 - `steam`: starts — `steamwebhelper` needed the generated `/etc` files
   bound from the runtime directory to survive its own nested bwrap.
+- `spotify`: starts — it grants `dbus` and `mpris name="spotify"`, without
+  which the client reads the `RequestName` it cannot own as another copy of
+  itself already running, calls `Raise` on that name and exits before
+  drawing anything; with no bus at all it stops after its GPU process and
+  never starts a renderer.
 
 ## 0.21.0 (unreleased)
 

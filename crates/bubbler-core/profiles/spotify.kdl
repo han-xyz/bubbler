@@ -12,6 +12,21 @@
 // adequately kept in its own config file in the private home, and the
 // rule would let it talk to whatever process holds every password you
 // have.
+
+// `dbus` and `mpris name="spotify"` are what let the client start at all,
+// which is worth saying because neither reads like a startup dependency.
+// Before it draws anything the client asks the bus to own
+// `org.mpris.MediaPlayer2.spotify`, and a `RequestName` that does not come
+// back as the primary owner it reads as "a copy is already running": it
+// calls `Raise` on that name and exits 0, having drawn nothing. Measured
+// here with `BUBBLER_DBUS_LOG=1`: with a bare `dbus` the proxy filters the
+// request (`policy: 0 (required 3)`) and the client is gone in a second.
+// Without `dbus` at all it does not exit — it stops after its two zygotes
+// and the GPU process, starts neither the network service nor a renderer,
+// and maps no window ever. The name is exact, not a prefix: the app id is
+// com.spotify.Client but the player name it publishes is
+// org.mpris.MediaPlayer2.spotify, and a `*` here would own every player on
+// the bus. Media keys and the desktop's player controls come with it.
 //
 // `network` is the sandbox's own network namespace, so Spotify Connect
 // finds no devices: discovery is mDNS on the LAN and pasta does not
@@ -34,17 +49,13 @@
 //       talk "org.freedesktop.ScreenSaver"
 //       talk "org.gnome.SettingsDaemon.MediaKeys"
 //   }
-//     — the power-save blocker CEF holds during playback, and GNOME's
-//       media-key grab, which the client asks for by that name. Both
-//       strings are in /opt/spotify/libcef.so; on any other desktop
-//       nothing owns the second and the rule is inert. CEF also tries
-//       `org.freedesktop.PowerManagement`, so add that too if the screen
-//       blanks during playback.
-//   mpris name="spotify"
-//     — media keys and the desktop's player controls. The exact name,
-//       not a prefix: the app's own id is com.spotify.Client but the
-//       player name it publishes is org.mpris.MediaPlayer2.spotify, and
-//       a `*` here would own every player on the bus. Needs `dbus`.
+//     — in place of the bare `dbus` node above, since one config carries
+//       one `dbus` node: the power-save blocker CEF holds during
+//       playback, and GNOME's media-key grab, which the client asks for
+//       by that name. Both strings are in /opt/spotify/libcef.so; on any
+//       other desktop nothing owns the second and the rule is inert. CEF
+//       also tries `org.freedesktop.PowerManagement`, so add that too if
+//       the screen blanks during playback.
 //   notify
 //     — the "now playing" notifications. Needs `dbus`.
 //   tray
@@ -58,4 +69,6 @@ wayland
 dri
 pulseaudio
 network
+dbus
+mpris name="spotify"
 command "spotify"

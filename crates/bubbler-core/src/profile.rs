@@ -1362,8 +1362,10 @@ mod tests {
         assert!(code.env.is_empty(), "{:?}", code.env);
 
         // A music player needs the sound socket its CEF layer opens and
-        // the network it streams over; the media keys, the tray icon and
-        // the power-save names are opt-ins.
+        // the network it streams over; the tray icon and the power-save
+        // names are opt-ins. The bus and the player name are not: the
+        // client reads a `RequestName` it cannot own as a second copy of
+        // itself and exits before drawing anything.
         let sp = cfg("spotify");
         assert_eq!(sp.command, Some(vec![OsString::from("spotify")]));
         assert_eq!(
@@ -1372,7 +1374,11 @@ mod tests {
                 wayland(),
                 Service::Dri { kms: false },
                 Service::Pulseaudio,
-                network()
+                network(),
+                Service::Dbus { rules: Vec::new() },
+                Service::Mpris {
+                    name: "spotify".to_owned()
+                }
             ]
         );
 
