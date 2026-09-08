@@ -136,19 +136,21 @@ pub static GRANTS: &[Grant] = &[
     Grant {
         node: "pipewire",
         summary: "the session's PipeWire socket",
-        cost: "Capture as well as playback: everything the session exposes, the microphone \
-               among it, with no portal in between and no prompt. The `camera` grant is \
-               the portal-mediated way to reach a device instead.",
+        cost: "Bare, with 0.23's policy drop-in installed, the sandbox may play into the \
+               session's sinks and see them; every microphone and line-in is hidden. \
+               `microphone` adds every `Audio/Source` the host has: capture is allowed. \
+               The `camera` grant is the portal-mediated way to reach a device instead.",
         risk: Risk::Wide,
-        grammar: "pipewire",
+        grammar: "pipewire [{ microphone }]",
     },
     Grant {
         node: "pulseaudio",
         summary: "the session's PulseAudio socket, and `PULSE_SERVER` pointing at it",
-        cost: "The same reach `pipewire` has, through the older protocol: recording as \
-               well as playing, with nothing between the sandbox and the server.",
+        cost: "The same reach `pipewire` has, through the older protocol: bare is playback \
+               only with 0.23's policy drop-in installed; `microphone` adds every \
+               `Audio/Source` the host has, capture allowed.",
         risk: Risk::Wide,
-        grammar: "pulseaudio",
+        grammar: "pulseaudio [{ microphone }]",
     },
     Grant {
         node: "gamepad",
