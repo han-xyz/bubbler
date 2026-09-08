@@ -72,6 +72,7 @@ has never been loaded here. See "Known gaps" below.
     bubbler list
     bubbler delete ff --yes               # instance and private home; irreversible
     bubbler ui                            # the terminal editor, if it is installed
+    bubbler audio-policy --print          # the WirePlumber drop-in, for `install`
     bubbler man                           # bubbler(1) as roff, on stdout
     bubbler man --config                  # bubbler-config(5): every node, every check
 
@@ -4123,6 +4124,17 @@ the session bus by bubbler itself, so no other package goes with it. An
 Portals need `xdg-desktop-portal` and a backend for your desktop; neither is
 bubbler's to start. Nothing here depends on a shell: bubbler ships no
 completions.
+
+A `pipewire` or `pulseaudio` grant needs the WirePlumber policy drop-in
+that scopes it installed, and WirePlumber restarted:
+
+    bubbler audio-policy --print > /usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf
+
+(or `/etc/wireplumber/wireplumber.conf.d/`, or the per-user
+`$XDG_CONFIG_HOME/wireplumber/wireplumber.conf.d/` — the three places
+`bubbler lint` and a run's own warning name). Without it a `pipewire` or
+`pulseaudio` grant reaches every PipeWire node instead of what it asks
+for.
 
 Packaging lives in a repository of its own, not in this one.
 

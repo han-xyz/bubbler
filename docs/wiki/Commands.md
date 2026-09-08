@@ -31,6 +31,7 @@ bubbler wrap --list                     every shim, ok|broken
 bubbler unwrap <inst>
 
 bubbler ui                              terminal editor (bubbler-ui)
+bubbler audio-policy --print            WirePlumber policy drop-in for a `pipewire`/`pulseaudio` grant
 bubbler man [--config]                  bubbler(1) / bubbler-config(5) as roff on stdout
 ```
 

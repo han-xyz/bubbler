@@ -13,6 +13,7 @@ use std::process::{Command, ExitCode};
 use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
+use bubbler_core::audio_policy;
 use bubbler_core::config::{self, Service, Share, ShareMode, X11Mode};
 use bubbler_core::dbus;
 use bubbler_core::dbus_wire;
@@ -504,6 +505,24 @@ command line never carries its dependencies; this subcommand runs the copy
 beside this binary, else the first on PATH, and says how to install it when
 there is none. Everything it does, it does by running this binary.")]
     Ui,
+    /// Print the WirePlumber policy drop-in that scopes a `pipewire`/`pulseaudio` grant.
+    #[command(long_about = "\
+Write the WirePlumber policy drop-in bubbler ships
+(contrib/wireplumber/50-bubbler.conf) to stdout, byte for byte, so it can be
+installed without a checkout of the source tree:
+
+    bubbler audio-policy --print > /usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf
+
+(or `/etc/wireplumber/wireplumber.conf.d/`, or the per-user
+`$XDG_CONFIG_HOME/wireplumber/wireplumber.conf.d/`), then restart WirePlumber.
+Without it installed in one of those three, a `pipewire` or `pulseaudio`
+grant reaches every PipeWire node instead of what it asks for — `run`,
+`--explain` and `lint` all say so.")]
+    AudioPolicy {
+        /// Write the drop-in to stdout.
+        #[arg(long, required = true)]
+        print: bool,
+    },
     /// Print bubbler's manual pages in roff.
     #[command(long_about = "\
 Print bubbler's own manual page, bubbler(1), as roff on stdout: the synopsis
@@ -1134,6 +1153,12 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
     if let Cmd::Man { config } = cli.cmd {
         return print_man(config);
     }
+    // Before the environment too: the drop-in is a constant embedded at
+    // build time, and a packaging step installing it needs no session
+    // either.
+    if let Cmd::AudioPolicy { print: true } = cli.cmd {
+        return print_bytes(audio_policy::DROP_IN.as_bytes(), "the audio policy drop-in");
+    }
     let env = host_env::from_process()?;
     match cli.cmd {
         Cmd::Create { name, profile } => {
@@ -1609,6 +1634,12 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             // way of every signal the terminal sends.
             let e = Command::new(&editor).exec();
             Err(e).with_context(|| format!("running {}", editor.display()))
+        }
+        // clap's `required = true` on `print` means this is reached only
+        // with it set; the early check above is what actually runs it,
+        // before `env` is read.
+        Cmd::AudioPolicy { print: _ } => {
+            print_bytes(audio_policy::DROP_IN.as_bytes(), "the audio policy drop-in")
         }
         Cmd::Man { config } => print_man(config),
         Cmd::Lint { name, opts } => {

@@ -10211,6 +10211,7 @@ const COMMANDS: &[&str] = &[
     "bubbler wrap",
     "bubbler unwrap",
     "bubbler ui",
+    "bubbler audio-policy",
     "bubbler man",
 ];
 
@@ -10248,6 +10249,41 @@ fn the_long_help_of_a_shim_says_what_it_takes_over() {
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("never deletes"), "{text}");
+}
+
+#[test]
+fn audio_policy_print_writes_the_embedded_drop_in() {
+    let tmp = setup();
+    let out = bubbler(tmp.path())
+        .args(["audio-policy", "--print"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(out.stdout, bubbler_core::audio_policy::DROP_IN.as_bytes());
+}
+
+#[test]
+fn audio_policy_without_print_is_a_usage_error() {
+    let tmp = setup();
+    let out = bubbler(tmp.path()).args(["audio-policy"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--print"), "{err}");
+}
+
+/// A packaging step installs the drop-in with no session running, the
+/// same as the man pages `bubbler man` renders under fakeroot.
+#[test]
+fn audio_policy_print_needs_no_session_environment() {
+    let tmp = setup();
+    let out = bubbler(tmp.path())
+        .args(["audio-policy", "--print"])
+        .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
 }
 
 #[test]
