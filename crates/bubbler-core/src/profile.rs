@@ -845,9 +845,35 @@ impl Merged {
                     return Ok(());
                 }
             }
-            Service::Pipewire
-            | Service::Pulseaudio
-            | Service::Notify
+            Service::Pipewire { microphone } => {
+                if let Some((held, held_src)) =
+                    self.services.iter_mut().find_map(|(s, src)| match s {
+                        Service::Pipewire { microphone: held } => Some((held, src)),
+                        _ => None,
+                    })
+                {
+                    // A grant of its own, on top of the socket the bare
+                    // node gives, so it adds up rather than the last
+                    // layer deciding it — the same rule `dri kms` and
+                    // `gamepad`'s properties merge by.
+                    *held |= *microphone;
+                    *held_src = src.clone();
+                    return Ok(());
+                }
+            }
+            Service::Pulseaudio { microphone } => {
+                if let Some((held, held_src)) =
+                    self.services.iter_mut().find_map(|(s, src)| match s {
+                        Service::Pulseaudio { microphone: held } => Some((held, src)),
+                        _ => None,
+                    })
+                {
+                    *held |= *microphone;
+                    *held_src = src.clone();
+                    return Ok(());
+                }
+            }
+            Service::Notify
             | Service::Tray
             | Service::A11y
             | Service::InputMethod
@@ -1234,7 +1260,11 @@ mod tests {
         assert!(cfg("libreoffice").services.contains(&Service::EtcShare {
             name: OsString::from("libreoffice")
         }));
-        assert!(cfg("vesktop").services.contains(&Service::Pulseaudio));
+        assert!(
+            cfg("vesktop")
+                .services
+                .contains(&Service::Pulseaudio { microphone: false })
+        );
         let steam = cfg("steam");
         assert!(steam.services.contains(&Service::Gamepad {
             hidraw: false,
@@ -1373,7 +1403,7 @@ mod tests {
             vec![
                 wayland(),
                 Service::Dri { kms: false },
-                Service::Pulseaudio,
+                Service::Pulseaudio { microphone: false },
                 network(),
                 Service::Dbus { rules: Vec::new() },
                 Service::Mpris {
@@ -1398,7 +1428,7 @@ mod tests {
             vec![
                 wayland(),
                 Service::Dri { kms: false },
-                Service::Pulseaudio,
+                Service::Pulseaudio { microphone: false },
                 network()
             ]
         );
@@ -1414,7 +1444,7 @@ mod tests {
             vec![
                 wayland(),
                 Service::Dri { kms: false },
-                Service::Pulseaudio,
+                Service::Pulseaudio { microphone: false },
                 network(),
                 Service::Dbus { rules: Vec::new() },
                 Service::Portals {
@@ -2501,6 +2531,33 @@ mod tests {
         );
     }
 
+    /// `microphone` ORs across layers the way `optional` does: once one
+    /// layer asks for it, an including layer that says nothing new about
+    /// it does not take it back.
+    #[test]
+    fn microphone_ors_across_layers_whichever_one_sets_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(
+            tmp.path(),
+            &[("a", "include \"b\"\npipewire\n")],
+            &[("b", "pipewire {\n    microphone\n}\n")],
+        );
+        assert_eq!(
+            r.resolve("a").unwrap().config.services,
+            vec![Service::Pipewire { microphone: true }]
+        );
+
+        let r = resolver(
+            tmp.path(),
+            &[("a", "include \"b\"\npipewire {\n    microphone\n}\n")],
+            &[("b", "pipewire\n")],
+        );
+        assert_eq!(
+            r.resolve("a").unwrap().config.services,
+            vec![Service::Pipewire { microphone: true }]
+        );
+    }
+
     #[test]
     fn two_layers_may_not_grant_one_bus_name_two_policies() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2899,7 +2956,10 @@ mod tests {
         // What it grants is untouched: the entry is a line, not a grant.
         assert_eq!(
             resolved.config.services,
-            vec![Service::Pipewire, Service::Dri { kms: false }]
+            vec![
+                Service::Pipewire { microphone: false },
+                Service::Dri { kms: false }
+            ]
         );
     }
 

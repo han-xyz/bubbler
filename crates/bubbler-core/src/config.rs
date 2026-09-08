@@ -552,10 +552,18 @@ pub enum Service {
         /// directories readable, which is what mode setting takes.
         kms: bool,
     },
-    /// Access to the host PipeWire socket.
-    Pipewire,
-    /// Access to the host PulseAudio socket.
-    Pulseaudio,
+    /// Access to the host PipeWire socket: playback only unless
+    /// `microphone` is set.
+    Pipewire {
+        /// Every `Audio/Source` the host has, and capture from them.
+        microphone: bool,
+    },
+    /// Access to the host PulseAudio socket: playback only unless
+    /// `microphone` is set.
+    Pulseaudio {
+        /// Every `Audio/Source` the host has, and capture from them.
+        microphone: bool,
+    },
     /// Bind `$HOME/<path>` on the host to the same relative path inside the
     /// private home.
     HomeShare {
@@ -692,8 +700,8 @@ impl Service {
             Self::X11(_) => "x11",
             Self::Network(_) => "network",
             Self::Dri { .. } => "dri",
-            Self::Pipewire => "pipewire",
-            Self::Pulseaudio => "pulseaudio",
+            Self::Pipewire { .. } => "pipewire",
+            Self::Pulseaudio { .. } => "pulseaudio",
             Self::HomeShare { .. } => "home-share",
             Self::PathShare { .. } => "path-share",
             Self::EtcShare { .. } => "etc-share",
@@ -711,6 +719,15 @@ impl Service {
             Self::AppRuntime { .. } => "app-runtime",
         }
     }
+}
+
+/// The audio grant an instance carries, once `pipewire` and `pulseaudio`
+/// are folded into the one set the security context (Task 3) is built
+/// from: two nodes writing to one instance-wide reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioSet {
+    /// `microphone` was asked for under `pipewire`, `pulseaudio`, or both.
+    pub microphone: bool,
 }
 
 /// The nodes a config may hold more than once, in the order [`NODES`]
@@ -798,9 +815,8 @@ impl Node {
             Service::Gamepad { hidraw, uinput } => *hidraw || *uinput,
             Service::Dbus { rules } | Service::SystemBus { rules } => !rules.is_empty(),
             Service::Portals { children } => !children.is_empty(),
-            Service::Pipewire
-            | Service::Pulseaudio
-            | Service::Notify
+            Service::Pipewire { microphone } | Service::Pulseaudio { microphone } => *microphone,
+            Service::Notify
             | Service::Tray
             | Service::Hidraw
             | Service::A11y
@@ -868,6 +884,26 @@ pub struct InstanceConfig {
     /// back. Nothing downstream of the parser sees them: they are
     /// neither granted, linted nor explained.
     pub disabled: Vec<Disabled>,
+}
+
+impl InstanceConfig {
+    /// The audio grant this instance carries: `None` when neither
+    /// `pipewire` nor `pulseaudio` is granted, otherwise `microphone`
+    /// ORed across whichever of the two are, since either one reaches
+    /// the same context socket.
+    pub fn audio(&self) -> Option<AudioSet> {
+        self.services.iter().fold(None, |set, svc| {
+            let microphone = match svc {
+                Service::Pipewire { microphone } | Service::Pulseaudio { microphone } => {
+                    *microphone
+                }
+                _ => return set,
+            };
+            Some(AudioSet {
+                microphone: set.is_some_and(|s| s.microphone) || microphone,
+            })
+        })
+    }
 }
 
 /// One profile layer as written: the same nodes an instance config may
@@ -1607,6 +1643,41 @@ fn parse_portals(node: &KdlNode) -> Result<(Service, Option<(Service, usize)>), 
     Ok((Service::Portals { children }, camera))
 }
 
+/// The `pipewire` or `pulseaudio` node: bare grants playback, a
+/// `microphone` child adds capture. Returns whether the child was given.
+fn parse_audio(node: &KdlNode) -> Result<bool, ConfigError> {
+    reject_types(node)?;
+    reject_arguments(node)?;
+    let Some(kids) = node.children() else {
+        return Ok(false);
+    };
+    let mut microphone = false;
+    for child in kids.nodes() {
+        reject_types(child)?;
+        let name = child.name().value();
+        if name != "microphone" {
+            return Err(bad(
+                node,
+                &format!(
+                    "`{name}` is not a child of `{}`; the only child is `microphone`",
+                    node.name().value()
+                ),
+            ));
+        }
+        if !child.entries().is_empty() || child.children().is_some() {
+            return Err(bad(
+                node,
+                "`microphone` takes no arguments, properties or children",
+            ));
+        }
+        if microphone {
+            return Err(ConfigError::Duplicate("microphone".to_owned()));
+        }
+        microphone = true;
+    }
+    Ok(microphone)
+}
+
 /// `child` as the line-form node `name` would have been written as: the
 /// child's name becomes the first argument only where the caller asks
 /// for it, so this one keeps the entries and children as they are and
@@ -1635,11 +1706,17 @@ pub(crate) fn parse_one(node: &KdlNode, profile: bool) -> Result<Node, ConfigErr
         return Err(ConfigError::UnknownNode(name.to_owned()));
     }
     Ok(match name {
-        "pipewire" | "pulseaudio" | "notify" | "tray" | "hidraw" | "a11y" | "input-method" => {
+        "pipewire" | "pulseaudio" => {
+            let microphone = parse_audio(node)?;
+            Node::Service(match name {
+                "pipewire" => Service::Pipewire { microphone },
+                "pulseaudio" => Service::Pulseaudio { microphone },
+                other => return Err(ConfigError::UnknownNode(other.to_owned())),
+            })
+        }
+        "notify" | "tray" | "hidraw" | "a11y" | "input-method" => {
             reject_entries(node)?;
             Node::Service(match name {
-                "pipewire" => Service::Pipewire,
-                "pulseaudio" => Service::Pulseaudio,
                 "notify" => Service::Notify,
                 "tray" => Service::Tray,
                 "hidraw" => Service::Hidraw,
@@ -4430,8 +4507,8 @@ mod tests {
             cfg.services,
             vec![
                 Service::Dri { kms: false },
-                Service::Pipewire,
-                Service::Pulseaudio
+                Service::Pipewire { microphone: false },
+                Service::Pulseaudio { microphone: false }
             ]
         );
         assert!(matches!(parse("dri\ndri"), Err(ConfigError::Duplicate(n)) if n == "dri"));
@@ -4443,6 +4520,91 @@ mod tests {
             parse("pipewire foo=bar"),
             Err(ConfigError::UnknownProperty { .. })
         ));
+    }
+
+    /// `microphone` is the one child either audio node takes: bare is
+    /// playback, the child adds capture. Errors follow `portals`'
+    /// wording, naming the offending word and the node that refused it.
+    #[test]
+    fn pipewire_and_pulseaudio_take_an_optional_microphone_child() {
+        for (name, bare, on) in [
+            (
+                "pipewire",
+                Service::Pipewire { microphone: false },
+                Service::Pipewire { microphone: true },
+            ),
+            (
+                "pulseaudio",
+                Service::Pulseaudio { microphone: false },
+                Service::Pulseaudio { microphone: true },
+            ),
+        ] {
+            assert_eq!(parse(name).unwrap().services, vec![bare], "{name}");
+            assert_eq!(
+                parse(&format!("{name} {{\n    microphone\n}}"))
+                    .unwrap()
+                    .services,
+                vec![on],
+                "{name}"
+            );
+            assert!(
+                matches!(
+                    parse(&format!("{name} {{\n    microphone\n    microphone\n}}")),
+                    Err(ConfigError::Duplicate(n)) if n == "microphone"
+                ),
+                "{name}"
+            );
+            assert!(
+                matches!(
+                    parse(&format!("{name} {{\n    line-in\n}}")),
+                    Err(ConfigError::BadArgument { node, reason })
+                        if node == name && reason.starts_with("`line-in` is not a child")
+                ),
+                "{name}"
+            );
+            assert!(
+                matches!(
+                    parse(&format!("{name} {{\n    microphone \"x\"\n}}")),
+                    Err(ConfigError::BadArgument { node, reason })
+                        if node == name
+                            && reason == "`microphone` takes no arguments, properties or children"
+                ),
+                "{name}"
+            );
+            assert!(
+                matches!(
+                    parse(&format!("{name} {{\n    microphone {{\n        x\n    }}\n}}")),
+                    Err(ConfigError::BadArgument { node, reason })
+                        if node == name
+                            && reason == "`microphone` takes no arguments, properties or children"
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    /// `microphone` under either node ORs into the one set `audio()`
+    /// reports: granted through `pipewire`, through `pulseaudio`, or
+    /// neither says so, the answer is the same either way round.
+    #[test]
+    fn audio_ors_the_microphone_flag_across_pipewire_and_pulseaudio() {
+        assert_eq!(parse("").unwrap().audio(), None);
+        assert_eq!(
+            parse("pipewire\npulseaudio").unwrap().audio(),
+            Some(AudioSet { microphone: false })
+        );
+        assert_eq!(
+            parse("pipewire {\n    microphone\n}\npulseaudio")
+                .unwrap()
+                .audio(),
+            Some(AudioSet { microphone: true })
+        );
+        assert_eq!(
+            parse("pipewire\npulseaudio {\n    microphone\n}")
+                .unwrap()
+                .audio(),
+            Some(AudioSet { microphone: true })
+        );
     }
 
     #[test]
@@ -6055,7 +6217,7 @@ command "b""#
         assert_eq!(
             cfg.disabled,
             vec![Disabled {
-                node: Node::Service(Service::Pipewire),
+                node: Node::Service(Service::Pipewire { microphone: false }),
                 before: 1,
             }]
         );
@@ -6167,7 +6329,9 @@ command "b""#
             ("dri", false),
             ("dri kms=#true", true),
             ("pipewire", false),
+            ("pipewire {\n    microphone\n}", true),
             ("pulseaudio", false),
+            ("pulseaudio {\n    microphone\n}", true),
             ("gamepad", false),
             ("gamepad hidraw=#true", true),
             ("hidraw", false),

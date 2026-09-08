@@ -73,8 +73,8 @@ pub fn apply_all(
                 optional,
             } => home_share(env, args, host, path, *mode, *optional)?,
             Service::Dri { kms } => dri(args, host, *kms)?,
-            Service::Pipewire => pipewire(env, args, host)?,
-            Service::Pulseaudio => pulseaudio(env, args, host)?,
+            Service::Pipewire { .. } => pipewire(env, args, host)?,
+            Service::Pulseaudio { .. } => pulseaudio(env, args, host)?,
             Service::EtcShare { name } => etc_share(args, host, name)?,
             Service::AppRuntime { id, mode } => app_runtime(env, args, id, *mode),
             Service::Dbus { .. } => dbus_socket(env, args, ctx),
@@ -3943,7 +3943,10 @@ mod tests {
     #[test]
     fn pipewire_and_pulseaudio_bind_sockets() {
         let a = argv(
-            &[Service::Pipewire, Service::Pulseaudio],
+            &[
+                Service::Pipewire { microphone: false },
+                Service::Pulseaudio { microphone: false },
+            ],
             &env(),
             &[
                 ("/run/user/1000/pipewire-0", Sock),
@@ -3977,7 +3980,7 @@ mod tests {
         ));
         assert!(matches!(
             argv(
-                &[Service::Pipewire],
+                &[Service::Pipewire { microphone: false }],
                 &env(),
                 &[("/run/user/1000/pipewire-0", File)]
             ),
@@ -3988,7 +3991,7 @@ mod tests {
             })
         ));
         assert!(matches!(
-            argv(&[Service::Pulseaudio], &env(), &[]),
+            argv(&[Service::Pulseaudio { microphone: false }], &env(), &[]),
             Err(LaunchError::MissingResource {
                 service: "pulseaudio",
                 ..

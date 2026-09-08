@@ -253,8 +253,8 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
             true => "dri kms=#true".to_owned(),
             false => "dri".to_owned(),
         },
-        Service::Pipewire => "pipewire".to_owned(),
-        Service::Pulseaudio => "pulseaudio".to_owned(),
+        Service::Pipewire { microphone } => audio_node("pipewire", *microphone),
+        Service::Pulseaudio { microphone } => audio_node("pulseaudio", *microphone),
         Service::Portals { children } => {
             if children.is_empty() {
                 return Ok("portals".to_owned());
@@ -486,6 +486,16 @@ fn optional_suffix(optional: bool) -> &'static str {
     match optional {
         true => " optional=#true",
         false => "",
+    }
+}
+
+/// `pipewire`/`pulseaudio`: bare unless `microphone` was granted, then
+/// the block form the parser reads back as the same grant.
+fn audio_node(name: &str, microphone: bool) -> String {
+    if microphone {
+        format!("{name} {{\n    microphone\n}}")
+    } else {
+        name.to_owned()
     }
 }
 
@@ -1332,6 +1342,21 @@ mod tests {
             ]),
         ] {
             assert!(super::node(&node).is_err(), "{node:?}");
+        }
+    }
+
+    /// `pipewire`/`pulseaudio` with a `microphone` child are written as
+    /// the block form and read back the same; bare stays bare.
+    #[test]
+    fn pipewire_and_pulseaudio_microphone_round_trips() {
+        for name in ["pipewire", "pulseaudio"] {
+            let cfg = crate::config::parse(&format!("{name} {{\n    microphone\n}}")).unwrap();
+            let text = render(&cfg).unwrap();
+            assert_eq!(text, format!("{name} {{\n    microphone\n}}\n"), "{name}");
+            assert_eq!(crate::config::parse(&text).unwrap(), cfg, "{name}");
+            // Without the child it stays the bare node it was.
+            let bare = crate::config::parse(name).unwrap();
+            assert_eq!(render(&bare).unwrap(), format!("{name}\n"), "{name}");
         }
     }
 

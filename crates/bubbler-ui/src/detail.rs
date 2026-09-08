@@ -1079,12 +1079,22 @@ mod tests {
         select(&mut detail, "pipewire");
         assert!(!detail.row().unwrap().granted());
         assert_eq!(detail.toggle(&env), "granted `pipewire`");
-        assert!(detail.buf.services.contains(&Service::Pipewire));
+        assert!(
+            detail
+                .buf
+                .services
+                .contains(&Service::Pipewire { microphone: false })
+        );
         assert!(detail.dirty(), "the file does not have it yet");
         // The cursor follows the node it was on, into the granted half.
         assert_eq!(detail.row().unwrap().node, "pipewire");
         assert_eq!(detail.toggle(&env), "removed `pipewire`");
-        assert!(!detail.buf.services.contains(&Service::Pipewire));
+        assert!(
+            !detail
+                .buf
+                .services
+                .contains(&Service::Pipewire { microphone: false })
+        );
         assert!(!detail.dirty(), "back to the file");
     }
 

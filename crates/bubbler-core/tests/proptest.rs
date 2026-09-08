@@ -90,8 +90,8 @@ fn flag_services() -> impl Strategy<Value = Vec<Service>> {
             // nested default requires `wayland` and `dri` behind it.
             Service::X11(X11Mode::Host),
             Service::Dri { kms: false },
-            Service::Pipewire,
-            Service::Pulseaudio,
+            Service::Pipewire { microphone: false },
+            Service::Pulseaudio { microphone: false },
             Service::Hidraw,
         ]
         .into_iter()

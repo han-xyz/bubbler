@@ -307,6 +307,34 @@ fn profile_show_flattens_and_names_the_layer_each_node_came_from() {
     );
 }
 
+/// `profile show` writes `microphone` back as the block the parser reads
+/// back the same, on both audio nodes.
+#[test]
+fn profile_show_writes_the_microphone_child_back_as_a_block() {
+    let tmp = setup();
+    write_profile(
+        tmp.path(),
+        "user",
+        "mic",
+        "pipewire {\n    microphone\n}\npulseaudio\ncommand \"sh\"\n",
+    );
+    let out = bubbler(tmp.path())
+        .args(["profile", "show", "mic"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("pipewire {\n    microphone\n}\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("pulseaudio\n"), "{stdout}");
+}
+
 #[test]
 fn profile_edit_seeds_the_user_layer_and_rechecks_it() {
     let tmp = setup();

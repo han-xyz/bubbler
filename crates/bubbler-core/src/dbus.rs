@@ -347,8 +347,8 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
                 | Service::X11(_)
                 | Service::Network { .. }
                 | Service::Dri { .. }
-                | Service::Pipewire
-                | Service::Pulseaudio
+                | Service::Pipewire { .. }
+                | Service::Pulseaudio { .. }
                 | Service::Gamepad { .. }
                 | Service::Hidraw
                 | Service::HomeShare { .. }
