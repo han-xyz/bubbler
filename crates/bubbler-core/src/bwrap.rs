@@ -512,14 +512,6 @@ impl BwrapArgs {
         a
     }
 
-    /// The sandbox the Wayland proxy sidecar runs in: the sidecar
-    /// baseline plus `upstream`, the compositor socket it forwards the
-    /// application's connection to, read-only and at its own path.
-    ///
-    /// That socket is the only thing of the session in here. The socket
-    /// the proxy accepts the application on is not bound at all: it is
-    /// handed over as a descriptor, so the proxy can neither reach the
-    /// directory it lives in nor create anything beside it.
     /// The sandbox the PipeWire context sidecar runs in: the sidecar
     /// baseline, the session's own `pipewire-0` read-only at its own
     /// path, and `dir` as the whole of `/tmp`.
@@ -554,6 +546,14 @@ impl BwrapArgs {
         a
     }
 
+    /// The sandbox the Wayland proxy sidecar runs in: the sidecar
+    /// baseline plus `upstream`, the compositor socket it forwards the
+    /// application's connection to, read-only and at its own path.
+    ///
+    /// That socket is the only thing of the session in here. The socket
+    /// the proxy accepts the application on is not bound at all: it is
+    /// handed over as a descriptor, so the proxy can neither reach the
+    /// directory it lives in nor create anything beside it.
     pub fn wl_proxy_baseline(upstream: &Path, host: &dyn Host) -> Self {
         let mut a = Self::sidecar_baseline(host);
         push(
