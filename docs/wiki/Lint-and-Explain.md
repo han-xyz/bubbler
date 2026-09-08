@@ -59,7 +59,9 @@ pulse.allow-module-loading = false }`, then restart `pipewire-pulse.service`).
 `command-not-found`, `desktop-entry-missing`, `camera-nodes-none-present`,
 `camera-nodes-no-hotplug`, `dri-kms`, `dri-nvidia-primary`,
 `secrets-access`, `lint-allow-unused`,
-`x11-nested-no-wm`, `repeat-outside-block`.
+`x11-nested-no-wm`, `repeat-outside-block`, `pipewire-microphone` (a
+`microphone` child on `pipewire` or `pulseaudio`: every microphone and
+line-in the session has, and capture from them).
 
 `allow-host-wildcard` is about a pattern that is a wildcard directly under a
 top-level domain (`*.com`): the `*` stands for one label, so that one covers

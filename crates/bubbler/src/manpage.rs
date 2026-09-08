@@ -429,6 +429,11 @@ const CHECK_LINES: &[(&str, &str)] = &[
          socket is command execution across the boundary.",
     ),
     (
+        "pipewire-microphone",
+        "A `microphone` child on `pipewire` or `pulseaudio`: every microphone and line-in \
+         the session has, and capture from them.",
+    ),
+    (
         "portal-talk-without-portals",
         "A portal name in the bus rules without `portals`, so the call is refused rather \
          than answered.",

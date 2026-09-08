@@ -8407,6 +8407,29 @@ fn run(tmp: &Path, args: &[&str]) -> (i32, String, String) {
     )
 }
 
+/// `microphone` is a note, not a warning: it fails nothing, and the exit
+/// code says so. `pipewire`, not `pulseaudio`: the latter also carries
+/// `pulseaudio-module-loading`, a finding of this host's own audio
+/// config that would make the count depend on the machine running the
+/// test.
+#[test]
+fn profile_lint_notes_a_microphone_child() {
+    let tmp = setup();
+    write_profile(
+        tmp.path(),
+        "user",
+        "mic",
+        "pipewire {\n    microphone\n}\ncommand \"sh\"\n",
+    );
+    let (code, out, _) = run(tmp.path(), &["profile", "lint", "mic"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("note[pipewire-microphone]"), "{out}");
+    assert!(
+        out.contains("1 layer linted, 0 errors, 0 warnings, 1 note"),
+        "{out}"
+    );
+}
+
 #[test]
 fn profile_lint_warns_with_a_line_and_a_lint_allow_node_accepts_it() {
     let tmp = setup();

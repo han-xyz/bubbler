@@ -195,6 +195,13 @@ const PATH_SHARE_SOCKET: Check = Check {
     id: "path-share-socket",
     severity: Severity::Warning,
 };
+// A note, not a warning: the child is what the config asked for, the
+// same way `dri kms` is — worth saying once what it reaches rather than
+// making the file argue for it.
+const PIPEWIRE_MICROPHONE: Check = Check {
+    id: "pipewire-microphone",
+    severity: Severity::Note,
+};
 const PORTAL_TALK_WITHOUT_PORTALS: Check = Check {
     id: "portal-talk-without-portals",
     severity: Severity::Warning,
@@ -305,6 +312,7 @@ pub const CHECKS: &[Check] = &[
     PATH_SHARE_MOUNTPOINT,
     PATH_SHARE_RESERVED,
     PATH_SHARE_SOCKET,
+    PIPEWIRE_MICROPHONE,
     PORTAL_TALK_WITHOUT_PORTALS,
     PULSEAUDIO_MODULE_LOADING,
     REPEAT_OUTSIDE_BLOCK,
@@ -1185,6 +1193,40 @@ fn pulse_module_loading_on(ctx: &Context) -> bool {
     on
 }
 
+/// Two independent things about a `pulseaudio` node: the `microphone`
+/// child it may carry, and whether this host still lets a client load
+/// network modules on it, which is a fact about the host rather than
+/// about the child, so either, both or neither can be true at once.
+fn pulseaudio_node(ctx: &Context, i: usize, node: &KdlNode, f: &mut Findings) {
+    if kids(node).any(|c| c.name().value() == "microphone") {
+        f.push(
+            i,
+            node,
+            &PIPEWIRE_MICROPHONE,
+            "`pulseaudio { microphone }` adds every microphone and line-in the session has, \
+             and capture from them"
+                .to_owned(),
+            "drop the child where the app only plays",
+        );
+    }
+    if pulse_module_loading_on(ctx) {
+        f.push(
+            i,
+            node,
+            &PULSEAUDIO_MODULE_LOADING,
+            "the host audio daemon will load network modules on the sandbox's \
+             behalf, outside the sandbox's network namespace and its egress \
+             proxy: the effective `pipewire-pulse.conf` leaves \
+             `pulse.allow-module-loading` on"
+                .to_owned(),
+            "write `pulse.properties = { pulse.allow-module-loading = false }` into \
+             `~/.config/pipewire/pipewire-pulse.conf.d/10-no-modules.conf` and \
+             restart `pipewire-pulse.service`, unless an application of yours \
+             loads pulse modules",
+        );
+    }
+}
+
 /// Checks that need one layer and nothing else, apart from `host_net`:
 /// the merged mode a `camera` message reads differently under.
 fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut Findings) {
@@ -1327,20 +1369,18 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                 "drop the child unless the application keeps a secret through the portal, \
                  or accept it with `lint-allow \"secrets-access\" reason=\"...\"`",
             ),
-            "pulseaudio" if pulse_module_loading_on(ctx) => f.push(
-                i,
-                node,
-                &PULSEAUDIO_MODULE_LOADING,
-                "the host audio daemon will load network modules on the sandbox's \
-                 behalf, outside the sandbox's network namespace and its egress \
-                 proxy: the effective `pipewire-pulse.conf` leaves \
-                 `pulse.allow-module-loading` on"
-                    .to_owned(),
-                "write `pulse.properties = { pulse.allow-module-loading = false }` into \
-                 `~/.config/pipewire/pipewire-pulse.conf.d/10-no-modules.conf` and \
-                 restart `pipewire-pulse.service`, unless an application of yours \
-                 loads pulse modules",
-            ),
+            "pipewire" if kids(node).any(|c| c.name().value() == "microphone") => {
+                f.push(
+                    i,
+                    node,
+                    &PIPEWIRE_MICROPHONE,
+                    "`pipewire { microphone }` adds every microphone and line-in the session \
+                     has, and capture from them"
+                        .to_owned(),
+                    "drop the child where the app only plays",
+                );
+            }
+            "pulseaudio" => pulseaudio_node(ctx, i, node, f),
             "dbus" => dbus_node(i, node, f),
             "system-bus" => system_bus(i, node, f),
             "app-runtime" if prop(node, "mode") == Some("rw") => f.push(
@@ -2377,6 +2417,48 @@ mod tests {
                     &["dri kms=#true\nlint-allow \"dri-kms\" reason=\"a KMS test tool\""]
                 )),
                 [] as [&str; 0]
+            );
+        });
+    }
+
+    /// A `microphone` child is what puts capture in reach; the bare node
+    /// says nothing about it and stays quiet. Measured on a host with
+    /// module loading already turned off, so it is the one finding under
+    /// test and not `pulseaudio-module-loading`, which is independent of
+    /// it.
+    #[test]
+    fn pipewire_microphone_is_a_note_and_the_bare_grant_is_not() {
+        let quiet = host().text(
+            "/home/user/.config/pipewire/pipewire-pulse.conf.d/10-no-modules.conf",
+            "pulse.properties = {\n    pulse.allow-module-loading = false\n}\n",
+        );
+        with(&quiet, |ctx| {
+            for node in ["pipewire", "pulseaudio"] {
+                let text = format!("{node} {{\n    microphone\n}}");
+                let report = lint(ctx, &[&text]);
+                assert_eq!(ids(&report), ["pipewire-microphone"], "{node}");
+                assert_eq!(report.findings[0].severity, Severity::Note, "{node}");
+                assert!(report.findings[0].message.contains(node), "{node}");
+                assert_eq!(ids(&lint(ctx, &[node])), [] as [&str; 0], "{node}");
+                assert_eq!(
+                    ids(&lint(
+                        ctx,
+                        &[&format!(
+                            "{text}\nlint-allow \"pipewire-microphone\" reason=\"voice chat\""
+                        )]
+                    )),
+                    [] as [&str; 0],
+                    "{node}"
+                );
+            }
+        });
+        // The two `pulseaudio` findings are about different things — the
+        // child and the host's own module policy — so a node that raises
+        // both keeps both rather than the second silencing the first.
+        with(&host(), |ctx| {
+            assert_eq!(
+                ids(&lint(ctx, &["pulseaudio {\n    microphone\n}"])),
+                ["pipewire-microphone", "pulseaudio-module-loading"]
             );
         });
     }

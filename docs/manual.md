@@ -2979,7 +2979,10 @@ undecorated and unmanaged in the one compositor window it draws),
 `repeat-outside-block` (a
 repeatable node — `home-share`, `path-share`, `etc-share`, `app-runtime`,
 `env` or `lint-allow` — written two or more times on its own lines instead
-of one block).
+of one block),
+`pipewire-microphone` (a `microphone` child on `pipewire` or `pulseaudio`,
+which adds every microphone and line-in the session has, and capture from
+them).
 
 A warning or a note is accepted with a `lint-allow` node, which takes a check
 id and a required reason:
