@@ -794,9 +794,11 @@ Where the WirePlumber policy drop-in
 engine into one of two permission managers — `bubbler-playback` for a
 bare grant, `bubbler-playback-microphone` for one carrying `microphone`
 — each read+execute on the graph and the client's own objects, nothing
-writable, and, for the playback manager alone, no permission at all on
-every `Audio/Source` node, every other client's stream and the metadata
-objects. Withholding all permissions on a source withholds more than its
+writable, and, in both managers, no permission at all on every other
+client's stream, the metadata objects and the session manager's own
+client; the playback manager alone also withholds all permission on
+every `Audio/Source` node. Withholding all permissions on a source
+withholds more than its
 visibility: `PW_PERM_L` is what lets a link be made to a node the client
 cannot see, and the playback manager grants it nowhere, so a capture
 stream a playback-only client opens — linked by the session manager on
@@ -817,10 +819,13 @@ able to tell the two cases apart. A host with no WirePlumber, an older
 one, or no drop-in installed therefore gives every `pipewire`/
 `pulseaudio` grant the session's whole reach, silently. bubbler cannot
 close that gap from inside a sandbox; what it does instead is say so
-loudly, every time: a `bubbler: warning:` line on every real run naming
-the three install directories, an `--explain` suffix on the group, and a
-host-conditional `audio-policy-missing` lint warning naming the same
-three paths and the `bubbler audio-policy --print` fix.
+loudly, every time: a `bubbler: warning: audio policy drop-in
+50-bubbler.conf not found in any wireplumber.conf.d: the sandbox has
+full access to every PipeWire node (microphone and every other client's
+audio reachable)` line on every real run, the same fact appended to the
+group under `--explain`, and a host-conditional `audio-policy-missing`
+lint warning that does name the three install directories and the
+`bubbler audio-policy --print` fix.
 
 The private pulse server closes a gap the context alone cannot: a pulse
 client can `LOAD_MODULE` a server into loading `module-native-protocol-tcp`

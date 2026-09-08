@@ -599,8 +599,11 @@ layer, so a `microphone` on one widens the other in the same config too.
 What scopes a bare grant to playback is the WirePlumber policy drop-in
 installed on the host, not the socket — see "Installing" below — and
 without it a sandbox reaches every node the config did not ask for;
-`bubbler lint` and a run's own warning name the gap as
-`audio-policy-missing`. An ALSA client reaches the same
+`bubbler lint` warns `audio-policy-missing`, and a run without the
+drop-in prints `bubbler: warning: audio policy drop-in 50-bubbler.conf
+not found in any wireplumber.conf.d: the sandbox has full access to
+every PipeWire node (microphone and every other client's audio
+reachable)` on stderr. An ALSA client reaches the same
 daemon through `/etc/alsa`, which the baseline binds: those files are where
 pipewire-alsa defines the `default` PCM, and without them alsa-lib falls back
 to a hardware card whose `/dev/snd` nodes no sandbox has.

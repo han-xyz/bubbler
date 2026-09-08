@@ -22,10 +22,12 @@
   let a capture stream reach one anyway — while leaving sinks and the
   client's own objects read+execute. `bubbler audio-policy --print` writes
   the embedded copy to stdout, for installing without a checkout of the
-  source tree; where it is not installed, a run warns on stderr,
-  `--explain` marks the group, and `bubbler lint` warns
-  `audio-policy-missing`, all three naming the directories WirePlumber
-  loads it from.
+  source tree; where it is not installed, a run warns on stderr (`audio
+  policy drop-in 50-bubbler.conf not found in any wireplumber.conf.d: the
+  sandbox has full access to every PipeWire node (microphone and every
+  other client's audio reachable)`), `--explain` appends the same fact to
+  the group, and `bubbler lint` warns `audio-policy-missing`, naming the
+  directories WirePlumber loads it from.
 - A hermetic PipeWire/WirePlumber test bed
   (`cargo test -p bubbler-core --test real_pipewire`): a private daemon
   pair with a null sink and a null source, loading the drop-in, measuring

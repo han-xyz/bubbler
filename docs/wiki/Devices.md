@@ -70,8 +70,11 @@ and line-in.
 What actually narrows the reach is the WirePlumber policy drop-in, not
 the socket: without it installed (`bubbler audio-policy --print`, see
 [Commands](Commands.md)) a sandbox reaches every PipeWire node regardless
-of what the config asks for, and `bubbler lint`/a run's own warning say
-so (`audio-policy-missing`). The private pulse server refuses
+of what the config asks for; `bubbler lint` warns `audio-policy-missing`,
+and a run without it prints `bubbler: warning: audio policy drop-in
+50-bubbler.conf not found in any wireplumber.conf.d: the sandbox has
+full access to every PipeWire node (microphone and every other client's
+audio reachable)` on stderr. The private pulse server refuses
 `LOAD_MODULE` on its own, drop-in or not. ALSA clients reach the same
 daemon through `/etc/alsa` (baseline). `/dev/snd` is never bound.
 
