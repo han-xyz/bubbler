@@ -52,8 +52,9 @@ drop-in in none of `/usr/share/wireplumber/wireplumber.conf.d/`,
 `$XDG_CONFIG_HOME/wireplumber/wireplumber.conf.d/`, or the hook script in no
 `wireplumber/scripts/` under `$XDG_DATA_HOME`, `$XDG_DATA_DIRS` or
 `/usr/share`. Without the drop-in the grant is full access to every PipeWire
-node instead of what it asks for; without the hook it is scoped but the sink's
-monitor ports stay recordable. The finding names the half that is missing and
+node instead of what it asks for; without the hook it is scoped but every other
+client's audio stays recordable — its streams and the sink's monitor ports,
+which the sandbox can also link to itself. The finding names the half that is missing and
 the `bubbler audio-policy --print` or `--print --script` that writes it, then
 restart WirePlumber).
 

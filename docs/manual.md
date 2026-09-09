@@ -348,15 +348,17 @@ sockets and its gate, `raw socket: wayland "host"` for the session's own —
 and a `pipewire` or `pulseaudio` node lists the `sidecar:` argv of the
 context it runs (`pipewire`) or the private pulse server behind it
 (`pulseaudio`), plus a `(context: …)` line naming the engine, the instance
-and the grant set — where the WirePlumber policy drop-in that scopes it is
-not installed, the header itself carries `(policy drop-in not found:
-microphone reachable)` — none of which is in the argv, and `--dry-run`
+and the grant set — where part of the WirePlumber policy that scopes it is
+not installed, the header itself carries `(policy drop-in 50-bubbler.conf
+and hook script bubbler/refuse-links.lua not found: microphone
+reachable)`, naming whichever half the host is missing — none of which is
+in the argv, and `--dry-run`
 prints the sandbox's argv alone. `--explain --proxy` prints the D-Bus
 proxy's own argv and `--explain --wl-proxy` the Wayland proxy's.
 
     bubbler run media --explain
 
-      pipewire    config.kdl:3  3 arguments (policy drop-in not found: microphone reachable)
+      pipewire    config.kdl:3  3 arguments (policy drop-in 50-bubbler.conf and hook script bubbler/refuse-links.lua not found: microphone reachable)
         --ro-bind /run/user/1000/bubbler/media/pipewire-0 /run/user/1000/pipewire-0
         sidecar: /usr/bin/pw-container -P {"pipewire.sec.engine":"org.bubbler","pipewire.sec.app-id":"media","pipewire.sec.instance-id":"<run id>","pipewire.access":"restricted","bubbler.audio":"playback,microphone"} -- /run/bubbler-pw-hold
         (context: org.bubbler media playback,microphone)
@@ -597,14 +599,16 @@ Bare, either grant is playback only. `microphone` on either node —
 `pipewire { microphone }`, `pulseaudio { microphone }` — adds capture: the
 grant is per instance, ORed into one set across both nodes and every
 layer, so a `microphone` on one widens the other in the same config too.
-What scopes a bare grant to playback is the WirePlumber policy drop-in
-installed on the host, not the socket — see "Installing" below — and
-without it a sandbox reaches every node the config did not ask for;
-`bubbler lint` warns `audio-policy-missing`, and a run without the
-drop-in prints `bubbler: warning: audio policy drop-in 50-bubbler.conf
-not found in any wireplumber.conf.d: the sandbox has full access to
-every PipeWire node (microphone and every other client's audio
-reachable)` on stderr. An ALSA client reaches the same
+What scopes a bare grant to playback is bubbler's WirePlumber policy
+installed on the host, not the socket — the drop-in and the linking hook
+it loads, see "Installing" below — and without the drop-in a sandbox
+reaches every node the config did not ask for, while without the hook the
+grant is scoped and every other client's audio stays recordable;
+`bubbler lint` warns `audio-policy-missing`, and a run missing both
+prints `bubbler: warning: audio policy drop-in and hook script not found
+(50-bubbler.conf, bubbler/refuse-links.lua): the sandbox has full access
+to every PipeWire node (microphone and every other client's audio
+reachable)` on stderr, naming whichever half it is. An ALSA client reaches the same
 daemon through `/etc/alsa`, which the baseline binds: those files are where
 pipewire-alsa defines the `default` PCM, and without them alsa-lib falls back
 to a hardware card whose `/dev/snd` nodes no sandbox has.
@@ -2994,15 +2998,19 @@ hidden),
 `system-bus` rule naming a bus name that is defensible but wide — the KWin or
 GNOME shell compositor's own name, the session's file manager, or the Secret
 Service — with the one sentence a reader needs about what the name is),
-`audio-policy-missing` (a `pipewire` or `pulseaudio` grant with the
-WirePlumber policy drop-in installed in none of
+`audio-policy-missing` (a `pipewire` or `pulseaudio` grant with part of
+bubbler's WirePlumber policy not installed: the drop-in in none of
 `/usr/share/wireplumber/wireplumber.conf.d/`,
 `/etc/wireplumber/wireplumber.conf.d/` or
-`$XDG_CONFIG_HOME/wireplumber/wireplumber.conf.d/`: the sandbox's audio
-grant is full access to every PipeWire node instead of what the grant
-asks for, microphone and every other client's audio included. Fix it
-with `bubbler audio-policy --print > <path>` naming one of those three
-directories and `50-bubbler.conf`, then restart WirePlumber).
+`$XDG_CONFIG_HOME/wireplumber/wireplumber.conf.d/`, or the hook script in
+no `wireplumber/scripts/` under `$XDG_DATA_HOME`, `$XDG_DATA_DIRS` or
+`/usr/share`. Without the drop-in the sandbox's audio grant is full
+access to every PipeWire node instead of what the grant asks for,
+microphone and every other client's audio included; without the hook the
+grant is scoped and every other client's audio stays recordable. The
+finding names the half that is missing and the `bubbler audio-policy
+--print` or `--print --script` that writes it, then restart
+WirePlumber).
 
 **Notes** are information and fail nothing: `app-runtime-rw` (a shared
 application runtime directory granted `mode=rw`, so the sandbox can replace the

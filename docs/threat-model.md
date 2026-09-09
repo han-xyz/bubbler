@@ -817,10 +817,32 @@ session manager: for any `org.bubbler` client it refuses a link to
 another client's stream in either direction, a capture link to a sink
 (its monitor ports carry everything the session is playing, and they are
 reached through the sink's own read permission, which is the grant), and
-a capture link to a source for a context without `microphone`. Without
-that hook installed beside the drop-in the grant is scoped but the
-monitor ports are not: a capture stream asking for
-`stream.capture.sink` records the output mix. An engine match with no
+a capture link to a source for a context without `microphone`.
+
+That covers the links the session manager makes; a client can also make
+one itself, and node permissions cannot stop it. PipeWire 1.6.8 lets any
+client link two nodes it can see (`src/pipewire/impl-link.c`,
+`check_permission`: read on both nodes for the client creating the link,
+and the owner of each node must be able to see the other unless the
+creating client holds `PW_PERM_L`), and a playback sandbox must see the
+sink for its own audio to reach it — so nothing at the node level tells
+"WirePlumber links my stream to the sink" apart from "I link the sink's
+monitor to my capture stream". The lever is the link factory: the hook
+withholds every permission on the `link-factory` global from an
+`org.bubbler` client, and the core then answers its `create_object` with
+`ENOENT` while WirePlumber, which holds the whole graph, goes on linking
+on the sandbox's behalf. Read alone is not enough — measured on 1.6.8,
+the core asks only for read on that global — and a permission-manager
+rule cannot express it either: the managers' `rules` are not applied to
+factory globals, measured on WirePlumber 0.5.15. A link a bubbler
+context did make is destroyed on sight as well, which is belt and
+braces: a link WirePlumber makes for a sandbox carries WirePlumber's own
+`client.id`, never the sandbox's.
+
+Without that hook installed beside the drop-in the grant is scoped and
+every other client's audio is not: a capture stream asking for
+`stream.capture.sink` records the output mix, another client's stream is
+linkable, and the sandbox can make both links itself. An engine match with no
 recognised `bubbler.audio` value, or none at all, lands in the base rule
 ahead of the grant-specific one rather than falling through to
 WirePlumber's own default, so a typo in the property still narrows
@@ -841,7 +863,9 @@ loudly, every time, and about each half of the policy separately: a
 (50-bubbler.conf, bubbler/refuse-links.lua): the sandbox has full access
 to every PipeWire node (microphone and every other client's audio
 reachable)` line on every real run — `drop-in` or `hook script` alone
-where only one is absent — the same fact appended to the group under
+where only one is absent, and the hook-only line says what that case
+actually costs rather than repeating this one — the same fact appended
+to the group under
 `--explain`, and a host-conditional `audio-policy-missing` lint warning
 that does name the directories each file is looked for in and the
 `bubbler audio-policy --print` / `--print --script` fix.

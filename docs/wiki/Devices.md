@@ -69,7 +69,8 @@ and line-in.
 
 What actually narrows the reach is bubbler's WirePlumber policy, not the
 socket — the drop-in and the linking hook it loads, which is what keeps
-a sandbox off the sink's monitor ports and off another client's stream:
+a sandbox off the sink's monitor ports and off another client's stream,
+whether the session manager makes the link or the sandbox tries to:
 without them installed (`bubbler audio-policy --print` and `--print
 --script`, see [Commands](Commands.md)) a sandbox reaches every PipeWire
 node regardless of what the config asks for; `bubbler lint` warns

@@ -25,7 +25,10 @@
   stream read-only, and a linking hook that refuses what a permission
   cannot, since a permission is about one object and a link about two: no
   capture stream of a bubbler context reaches a sink's monitor ports
-  under any grant, and none is linked to another client's stream.
+  under any grant, and none is linked to another client's stream. The
+  hook also takes the link factory away from a bubbler context, so a
+  sandbox cannot make either link itself — the daemon lets any client
+  link two nodes it can see, and a playback sandbox has to see the sink.
   `bubbler audio-policy --print` and `--print --script` write the
   embedded copies to stdout, for installing without a checkout of the
   source tree; where either file is not installed, a run warns on stderr
@@ -86,8 +89,9 @@
   is looked for in data directories, not config ones; system-wide,
   `/usr/share/wireplumber/scripts/bubbler/` and never `/etc`), then
   `systemctl --user restart wireplumber`. With the drop-in alone the
-  grant is scoped but a sandbox can still record the sink's monitor
-  ports, and `lint` and every run say so. Without it a `pipewire`/
+  grant is scoped but every other client's audio stays recordable — its
+  streams and the sink's monitor ports — and `lint` and every run say
+  so. Without it a `pipewire`/
   `pulseaudio` grant reaches every PipeWire node instead of what it asks
   for — measured on WirePlumber 0.5.15, whose default for an unmatched
   restricted client is `Perm.ALL`, not the `Perm.RX` its own script text
