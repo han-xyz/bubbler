@@ -116,8 +116,8 @@ const RUN_WARNING_DROP_IN: &str = "audio policy drop-in not found (50-bubbler.co
      sandbox has full access to every PipeWire node (microphone and every other client's \
      audio reachable)";
 const RUN_WARNING_HOOK: &str = "audio policy hook script not found \
-     (bubbler/refuse-links.lua): the grant is scoped, but every other client's audio is \
-     recordable (its streams and the sink's monitor ports)";
+     (bubbler/refuse-links.lua): another client's stream and the sink's monitor are \
+     recordable";
 const RUN_WARNING_BOTH: &str = "audio policy drop-in and hook script not found \
      (50-bubbler.conf, bubbler/refuse-links.lua): the sandbox has full access to every \
      PipeWire node (microphone and every other client's audio reachable)";
