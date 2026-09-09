@@ -838,6 +838,9 @@ factory globals, measured on WirePlumber 0.5.15. A link a bubbler
 context did make is destroyed on sight as well, which is belt and
 braces: a link WirePlumber makes for a sandbox carries WirePlumber's own
 `client.id`, never the sandbox's.
+The same rule refuses a sandboxed JACK client's own connections
+(`jack_connect` and the patchbay tools), so an audio application that
+wires its graph by hand plays only what WirePlumber links for it.
 
 Without that hook installed beside the drop-in the grant is scoped and
 every other client's audio is not: a capture stream asking for
