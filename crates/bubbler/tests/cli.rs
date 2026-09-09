@@ -27,6 +27,30 @@ use rustix::fs::{FlockOperation, OFlags, fcntl_getfl, flock};
 use rustix::process::{Pid, Signal, kill_process};
 use rustix::termios::{ControlModes, InputModes, LocalModes, OutputModes, tcgetattr};
 
+/// Whether this host is one where an *absent* audio policy can be
+/// measured at all.
+///
+/// The isolated environment covers `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME`
+/// and `$XDG_DATA_DIRS`, but WirePlumber's system directories are
+/// absolute and bubbler looks in them for real, so on a host with the
+/// packaged policy installed there is no such case to build. The
+/// FakeHost tests in `audio_policy` carry the logic; these measure the
+/// binary, and skip.
+fn require_no_packaged_audio_policy() -> bool {
+    let packaged = [
+        "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf",
+        "/etc/wireplumber/wireplumber.conf.d/50-bubbler.conf",
+        "/usr/share/wireplumber/scripts/bubbler/refuse-links.lua",
+    ]
+    .into_iter()
+    .find(|path| Path::new(path).exists());
+    if let Some(path) = packaged {
+        common::say(&format!("skipping: {path} is installed on this host"));
+        return false;
+    }
+    true
+}
+
 /// Write the policy under a test root, where the isolated
 /// `$XDG_CONFIG_HOME` and `$XDG_DATA_HOME` put it: `drop_in` for the
 /// half that scopes the grant, `hook` for the half that refuses the
@@ -674,6 +698,9 @@ fn explain_names_the_private_pulse_server_and_the_context_under_it() {
 /// config asks for.
 #[test]
 fn explain_says_the_audio_policy_drop_in_is_missing() {
+    if !require_no_packaged_audio_policy() {
+        return;
+    }
     if !require_host_program(PW_CONTAINER) {
         return;
     }
@@ -5385,6 +5412,9 @@ fn x11_warns_before_a_real_run() {
 
 #[test]
 fn audio_policy_warns_before_a_real_run_without_the_drop_in() {
+    if !require_no_packaged_audio_policy() {
+        return;
+    }
     let tmp = setup();
     bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
     let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
@@ -5410,6 +5440,9 @@ fn audio_policy_warns_before_a_real_run_without_the_drop_in() {
 /// missing rather than the one the host has.
 #[test]
 fn audio_policy_warns_before_a_real_run_with_only_the_drop_in() {
+    if !require_no_packaged_audio_policy() {
+        return;
+    }
     let tmp = setup();
     install_audio_policy(tmp.path(), true, false);
     bubbler(tmp.path()).args(["create", "t"]).status().unwrap();

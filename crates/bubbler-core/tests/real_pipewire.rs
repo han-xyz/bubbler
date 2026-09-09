@@ -401,13 +401,19 @@ impl PipeWireBed {
     /// `system()`, dropping anything further on its command line, so
     /// `program` must be one shell word — a bare tool name here.
     pub fn in_context(&self, props: &str, program: &str) -> String {
-        let out = self
-            .context_command(props, program)
-            .output()
-            .expect("pw-container did not run");
+        let out = self.output_in_context(props, program);
         let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&out.stderr));
         text
+    }
+
+    /// The same with the status the program ended on, for a test whose
+    /// subject is a refusal: what the daemon told the client is as much
+    /// the measurement as what the graph shows afterwards.
+    pub fn output_in_context(&self, props: &str, program: &str) -> Output {
+        self.context_command(props, program)
+            .output()
+            .expect("pw-container did not run")
     }
 
     /// The same, left running for the caller to watch the graph while it
@@ -985,6 +991,56 @@ fn no_context_records_the_sinks_monitor_ports() {
         assert!(
             !links.contains("monitor_"),
             "a {grant} context was linked to the sink's monitor ports:\n{links}"
+        );
+    }
+}
+
+#[test]
+fn no_context_makes_a_link_of_its_own() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let wav = bed.dir().join("tone.wav");
+    silence(&wav);
+    for (props, grant) in [
+        (PLAYBACK, "playback"),
+        (PLAYBACK_MICROPHONE, "playback,microphone"),
+    ] {
+        let _other = streaming(
+            &bed,
+            PLAYBACK,
+            &format!("pw-cat -p {}", wav.display()),
+            "Stream/Output/Audio",
+        );
+        // Autoconnect off, so the session manager never offers this
+        // stream a target: what follows measures the client's own reach
+        // through the link factory and nothing the hook decides.
+        let out = bed.dir().join("stolen.wav");
+        let _thief = streaming(
+            &bed,
+            props,
+            &format!(
+                "pw-record -P '{{ node.autoconnect = false }}' {}",
+                out.display()
+            ),
+            "Stream/Input/Audio",
+        );
+
+        for source in ["bed-sink:monitor_FL", "pw-cat:output_FL"] {
+            let refused =
+                bed.output_in_context(props, &format!("pw-link -L {source} pw-record:input_FL"));
+            // `pw-link` exits 0 whatever the daemon answers (measured),
+            // so what it was told is on its stderr and the graph below
+            // is the rest of the measurement.
+            assert!(
+                String::from_utf8_lossy(&refused.stderr).contains("failed to link ports"),
+                "a {grant} context linked {source} to its own capture stream: {refused:?}"
+            );
+        }
+        let links = bed.links();
+        assert!(
+            !links.contains("pw-record:input_"),
+            "a {grant} context linked itself to something:\n{links}"
         );
     }
 }
