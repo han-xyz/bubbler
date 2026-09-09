@@ -521,9 +521,11 @@ directory and not a config one, so system-wide it is
 directories first and restart WirePlumber afterwards. Without the drop-in
 installed, a `pipewire` or `pulseaudio` grant reaches every PipeWire node
 instead of what it asks for; without the script beside it the grant is scoped
-but a sandbox can still record the sink's monitor ports, which carry every
-other application's audio. `run`, `--explain` and `lint` each say which of the
-two is missing.")]
+but every other application's audio stays recordable — the script is what
+refuses a capture stream a link to another client's stream or to the sink's
+monitor ports, and what takes the link factory away so the sandbox cannot make
+those links itself. `run`, `--explain` and `lint` each say which of the two is
+missing.")]
     AudioPolicy {
         /// Write the policy to stdout.
         #[arg(long, required = true)]

@@ -1190,8 +1190,9 @@ fn audio_policy_missing(ctx: &Context, sources: &[Source], f: &mut Findings) {
              asks for — microphone and every other client's audio included"
         ),
         audio_policy::Missing::Hook => format!(
-            "{hook}: this `{name}` grant is scoped, but a capture stream can still record \
-             the sink's monitor ports — every other client's audio"
+            "{hook}: this `{name}` grant is scoped, but every other client's audio stays \
+             recordable — a capture stream reaches another client's stream or the sink's \
+             monitor ports, and the sandbox can make those links itself"
         ),
         audio_policy::Missing::Both => format!(
             "{drop_in}, and {hook}: this `{name}` grant reaches every PipeWire node instead \

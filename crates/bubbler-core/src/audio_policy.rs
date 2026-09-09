@@ -108,13 +108,16 @@ pub enum Missing {
 
 /// Exact text of the warning a real run prints for each case, without
 /// the `bubbler: warning:` prefix every diagnostic bubbler prints
-/// already carries.
+/// already carries. Each says what is reachable in *that* case: with
+/// the drop-in installed and only the hook missing the grant is still
+/// scoped, so the microphone is not in reach and saying it were would
+/// cost the warning its credit.
 const RUN_WARNING_DROP_IN: &str = "audio policy drop-in not found (50-bubbler.conf): the \
      sandbox has full access to every PipeWire node (microphone and every other client's \
      audio reachable)";
 const RUN_WARNING_HOOK: &str = "audio policy hook script not found \
-     (bubbler/refuse-links.lua): the sandbox has full access to every PipeWire node \
-     (microphone and every other client's audio reachable)";
+     (bubbler/refuse-links.lua): the grant is scoped, but every other client's audio is \
+     recordable (its streams and the sink's monitor ports)";
 const RUN_WARNING_BOTH: &str = "audio policy drop-in and hook script not found \
      (50-bubbler.conf, bubbler/refuse-links.lua): the sandbox has full access to every \
      PipeWire node (microphone and every other client's audio reachable)";
@@ -125,8 +128,8 @@ const RUN_WARNING_BOTH: &str = "audio policy drop-in and hook script not found \
 /// place a group's `KMS_NOTE`/`NVIDIA_NOTE` lands.
 const EXPLAIN_SUFFIX_DROP_IN: &str =
     " (policy drop-in 50-bubbler.conf not found: microphone reachable)";
-const EXPLAIN_SUFFIX_HOOK: &str =
-    " (policy hook script bubbler/refuse-links.lua not found: microphone reachable)";
+const EXPLAIN_SUFFIX_HOOK: &str = " (policy hook script bubbler/refuse-links.lua not found: \
+     another client's audio recordable)";
 const EXPLAIN_SUFFIX_BOTH: &str = " (policy drop-in 50-bubbler.conf and hook script \
      bubbler/refuse-links.lua not found: microphone reachable)";
 
