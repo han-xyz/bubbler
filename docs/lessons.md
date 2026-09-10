@@ -63,3 +63,31 @@ launcher's own stop deadline turned into a SIGKILL — 10 of 25 runs of the
 holder's own tests failed on it. Register the signal handlers before the
 line that says "ready", never after, in every sidecar built on this
 report-then-wait shape.
+
+## A measured host default carries the version it was measured on
+
+A `pacman -Syu` on 2026-09-10 turned three tests red with no code change.
+Hyprland 0.56.2 made `hyprctl dispatch` evaluate its argument as Lua: the
+positional `sendshortcut ,v,title:…` string became a parse error, and a
+missed window is now a warning at exit 0, so a success check alone proves
+nothing. WirePlumber 0.5.17 hands an unmatched restricted context `rwx-l`
+where 0.5.15 gave `rwxml`; a test pinned the 0.5.15 string, and three
+documents stated it, as if it were WirePlumber's behaviour rather than one
+version's. When the suite goes red after an upgrade, read the install dates
+(`pacman -Qi hyprland wireplumber pipewire`) before touching code. A test
+about a host default asserts the property it exists for — here, that the
+drop-in narrows nothing it did not create — and a document that quotes a
+measured default names the version and gains a clause when a newer one
+measures differently.
+
+## A round-trip strategy generates only what the parser can produce
+
+The config proptest built an `allow-host` on port 3128, the egress proxy's
+own port, which `config.rs` refuses on purpose; the rendered config could
+not parse back and the property failed on the parser's rule, not on a
+bug. Its twin sat two lines up: the `allow-port` strategy had the same
+hole, and the whole-branch review found it after the per-fix sweep had
+not — sweep every strategy that names the same value, not the one that
+failed. A generator for a round-trip property excludes every value the
+parser rejects by design, with that rule named beside the exclusion, and
+proptest's seed file is committed so the case runs first next time.
