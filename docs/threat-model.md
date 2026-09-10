@@ -857,7 +857,9 @@ the `Perm.RX` `find-default-access.lua`'s own text documents — two bugs,
 one in that script and one in `find-config-access.lua`, stack in the
 client's favour and hand it `Perm.ALL` instead: read, write, execute and
 metadata on every node, capture included, with nothing in the sandbox
-able to tell the two cases apart. A host with no WirePlumber, an older
+able to tell the two cases apart. WirePlumber 0.5.17, measured
+2026-09-10, hands the same client `rwx-l`: the metadata bit is gone, the
+rest is not. A host with no WirePlumber, an older
 one, or no drop-in installed therefore gives every `pipewire`/
 `pulseaudio` grant the session's whole reach, silently. bubbler cannot
 close that gap from inside a sandbox; what it does instead is say so

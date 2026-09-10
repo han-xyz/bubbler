@@ -95,7 +95,7 @@
   `pulseaudio` grant reaches every PipeWire node instead of what it asks
   for — measured on WirePlumber 0.5.15, whose default for an unmatched
   restricted client is `Perm.ALL`, not the `Perm.RX` its own script text
-  documents.
+  documents; 0.5.17 withholds the metadata bit (`rwx-l`) and nothing else.
 
 ## 0.22.0
 

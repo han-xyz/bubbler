@@ -1140,12 +1140,17 @@ fn a_context_that_is_not_bubblers_keeps_the_reach_it_had() {
     for marker in [SINK, SOURCE] {
         let node = object(&listing, &[marker])
             .unwrap_or_else(|| panic!("{marker} is visible:\n{listing}"));
-        // The measured default here, not the documented one: WirePlumber
-        // 0.5.15 hands an unmatched restricted client `Perm.ALL`, so the
-        // sandbox could rename this node and move the session's default
-        // device, not only read it. If this ever reads `r-x--`, the
-        // upstream default changed and the warning bubbler prints when
-        // the drop-in is missing overstates the reach.
-        assert_eq!(node.permissions, "rwxml", "on {marker}:\n{listing}");
+        // Measured, not documented: WirePlumber 0.5.15 handed an unmatched
+        // restricted client `Perm.ALL` (`rwxml`), 0.5.17 hands it `rwx-l`,
+        // the metadata bit withheld and read, write, execute and link
+        // kept; either way the drop-in narrowed nothing. If this ever
+        // reads `r-x--`, the upstream default became the documented one
+        // and the warning bubbler prints when the drop-in is missing
+        // overstates the reach.
+        assert!(
+            node.permissions.starts_with("rwx"),
+            "on {marker}: {} is narrowed to what the drop-in's managers give\n{listing}",
+            node.permissions
+        );
     }
 }
