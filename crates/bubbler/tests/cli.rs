@@ -6488,12 +6488,19 @@ fn real_wayland_proxy_opens_the_gate_for_a_keystroke() {
         run.said()
     );
     // Hyprland 0.56's `hyprctl dispatch` evaluates its argument as Lua
-    // (`hl.dispatch(…)`); the old positional string form is a parse
-    // error there. A missing window is a warning on stdout with exit 0,
-    // so success alone would not prove the shortcut reached the window.
+    // (`hl.dispatch(…)`); an Arch derivative may still ship an older
+    // hyprctl that only takes the positional string form, so both
+    // generations are spoken. The Lua form fails an older hyprctl with a
+    // non-zero exit; the positional form fails 0.56 with a Lua parse
+    // error (also a non-zero exit, code 7) on stdout. A missing window is
+    // a warning on stdout with exit 0 there, so success alone would not
+    // prove the shortcut reached the window.
     let dispatch =
         format!(r#"hl.dsp.send_shortcut{{mods="", key="v", window="title:^({name})$"}}"#);
-    let sent = hyprctl(&["dispatch", &dispatch]);
+    let mut sent = hyprctl(&["dispatch", &dispatch]);
+    if !sent.status.success() {
+        sent = hyprctl(&["dispatch", "sendshortcut", &format!(",v,title:^({name})$")]);
+    }
     let said = format!(
         "{}{}",
         String::from_utf8_lossy(&sent.stdout),

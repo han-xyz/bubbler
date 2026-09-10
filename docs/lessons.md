@@ -70,7 +70,9 @@ A `pacman -Syu` on 2026-09-10 turned three tests red with no code change.
 Hyprland 0.56.2 made `hyprctl dispatch` evaluate its argument as Lua: the
 positional `sendshortcut ,v,title:…` string became a parse error, and a
 missed window is now a warning at exit 0, so a success check alone proves
-nothing. WirePlumber 0.5.17 hands an unmatched restricted context `rwx-l`
+nothing. The test now speaks both generations, since an Arch derivative may
+lag a Hyprland release and the AUR package's check() runs the suite.
+WirePlumber 0.5.17 hands an unmatched restricted context `rwx-l`
 where 0.5.15 gave `rwxml`; a test pinned the 0.5.15 string, and three
 documents stated it, as if it were WirePlumber's behaviour rather than one
 version's. When the suite goes red after an upgrade, read the install dates
