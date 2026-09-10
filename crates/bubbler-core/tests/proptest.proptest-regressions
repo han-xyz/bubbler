@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 506c46ffaec8b606de43549dcb8a53bca822678f8059c03ea154aaf365f6f865 # shrinks to cfg = InstanceConfig { services: [Network(NetworkConfig { mode: Isolated, dns: [], forwards: [], no_ipv6: false, outbound: Deny, allow_out: [], allow_hosts: [AllowHost { pattern: HostPattern { labels: ["api", "example", "com"], wildcard: false }, port: 3128 }] })], shares: [], command: None, env: [], etc: Allowlist, tmp: None, tty: Pty, seccomp: SeccompConfig { allow: [], deny: [], disable: false }, userns: Allow, lint_allows: [], desktop: None, disabled: [] }

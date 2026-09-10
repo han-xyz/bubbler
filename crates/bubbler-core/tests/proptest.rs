@@ -17,7 +17,7 @@ use bubbler_core::config::{
 };
 use bubbler_core::env::{DEFAULT_DATA_DIRS, Env};
 use bubbler_core::error::{DesktopError, ProfileError};
-use bubbler_core::network::{AllowHost, Forward, HostPattern};
+use bubbler_core::network::{AllowHost, Forward, HostPattern, PROXY_PORT};
 use bubbler_core::profile::{MAX_DEPTH, Resolver};
 use bubbler_core::{config, desktop, kdl_out, lint};
 use proptest::prelude::*;
@@ -283,7 +283,14 @@ fn network_service() -> impl Strategy<Value = Option<Service>> {
             prop::collection::vec(
                 (
                     prop::sample::select(HOST_NAMES),
-                    prop::option::of(1u16..9000),
+                    // `config.rs` refuses an `allow-host` naming
+                    // `PROXY_PORT`: that port is the egress proxy's own,
+                    // not a service's, so the parser can never produce it.
+                    prop::option::of(
+                        (1u16..9000).prop_filter("not the egress proxy's own port", |port| {
+                            *port != PROXY_PORT
+                        }),
+                    ),
                 ),
                 0..3,
             ),
