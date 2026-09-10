@@ -6489,14 +6489,18 @@ fn real_wayland_proxy_opens_the_gate_for_a_keystroke() {
     );
     // Hyprland 0.56's `hyprctl dispatch` evaluates its argument as Lua
     // (`hl.dispatch(…)`); the old positional string form is a parse
-    // error there. A missing window is a warning on stderr with exit 0,
+    // error there. A missing window is a warning on stdout with exit 0,
     // so success alone would not prove the shortcut reached the window.
     let dispatch =
         format!(r#"hl.dsp.send_shortcut{{mods="", key="v", window="title:^({name})$"}}"#);
     let sent = hyprctl(&["dispatch", &dispatch]);
-    let stderr = String::from_utf8_lossy(&sent.stderr);
-    assert!(sent.status.success(), "{stderr}");
-    assert!(!stderr.contains("window not found"), "{stderr}");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&sent.stdout),
+        String::from_utf8_lossy(&sent.stderr)
+    );
+    assert!(sent.status.success(), "{said}");
+    assert!(!said.contains("window not found"), "{said}");
     let ended = wait_until(
         || {
             run.run
