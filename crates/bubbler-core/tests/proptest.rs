@@ -269,7 +269,18 @@ fn network_service() -> impl Strategy<Value = Option<Service>> {
         (
             0u8..3,
             prop::collection::vec(prop::sample::select(RESOLVERS), 0..2),
-            prop::collection::vec((1024u16..9000, any::<bool>()), 0..2),
+            // `config.rs:2740` refuses `allow-port PROXY_PORT` whenever
+            // `allow_hosts` is non-empty: that port is the egress
+            // proxy's own, so the parser can never produce it there.
+            prop::collection::vec(
+                (
+                    (1024u16..9000).prop_filter("not the egress proxy's own port", |port| {
+                        *port != PROXY_PORT
+                    }),
+                    any::<bool>(),
+                ),
+                0..2,
+            ),
             any::<bool>(),
             any::<bool>(),
             prop::collection::vec(

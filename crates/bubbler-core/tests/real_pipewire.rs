@@ -1149,7 +1149,7 @@ fn a_context_that_is_not_bubblers_keeps_the_reach_it_had() {
         // overstates the reach.
         assert!(
             node.permissions.starts_with("rwx"),
-            "on {marker}: {} is narrowed to what the drop-in's managers give\n{listing}",
+            "on {marker}: {} — either the drop-in narrowed a foreign context or the upstream default became the documented one\n{listing}",
             node.permissions
         );
     }
