@@ -95,8 +95,10 @@ built-in — and `bubbler profile edit firefox` starts your layer as
 
 ## Installing
 
-Arch Linux: AUR packages (`bubbler`, `bubbler-git`) are prepared but not
-published yet — AUR account registration is currently down. From source:
+Arch Linux: the AUR packages (`bubbler`, `bubbler-git`) live in `aur/` until
+they are published — AUR account registration is currently down — so
+`cd aur/bubbler && makepkg -si` builds the release and `aur/bubbler-git` the
+current `master`. From source:
 
     cargo build --release --locked
     install -Dm755 target/release/bubbler      /usr/bin/bubbler

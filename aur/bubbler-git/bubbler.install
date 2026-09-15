@@ -1,0 +1,23 @@
+# The policy is read when WirePlumber starts, so an installed file
+# changes nothing for the session manager already running.
+_note() {
+  cat <<'NOTE'
+bubbler's WirePlumber policy is now under /usr/share/wireplumber. A running
+WirePlumber loads it on its next start:
+    systemctl --user restart wireplumber
+Until then a pipewire or pulseaudio grant reaches every PipeWire node,
+and each run says so.
+NOTE
+}
+
+post_install() {
+  _note
+}
+
+# 0.23.0 is the first release with the policy; a later release that
+# changes it raises this version.
+post_upgrade() {
+  if (( $(vercmp "$2" 0.23.0) < 0 )); then
+    _note
+  fi
+}

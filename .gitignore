@@ -1,2 +1,7 @@
 /target
 crates/bubbler/tests/fixtures/__pycache__/
+aur/*/src/
+aur/*/pkg/
+aur/*/bubbler/
+aur/*/*.pkg.tar.*
+aur/*/*.log

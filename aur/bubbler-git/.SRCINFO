@@ -1,0 +1,40 @@
+pkgbase = bubbler-git
+	pkgdesc = Application sandboxing on top of bubblewrap, with named instances, explicit resource grants, and a profile library (git)
+	pkgver = 0.20.1.r0.gca3332d
+	pkgrel = 1
+	url = https://github.com/han-xyz/bubbler
+	arch = x86_64
+	license = GPL-3.0-or-later
+	makedepends = cargo
+	makedepends = git
+	depends = bubblewrap>=0.12.0
+	depends = libseccomp
+	depends = libgcc
+	depends = glibc
+	source = bubbler::git+https://github.com/han-xyz/bubbler.git
+	sha256sums = SKIP
+
+pkgname = bubbler-git
+	pkgdesc = Application sandboxing on top of bubblewrap, with named instances, explicit resource grants, and a profile library (git)
+	install = bubbler.install
+	optdepends = xdg-dbus-proxy: dbus, system-bus, portals, notify, mpris and tray grants
+	optdepends = passt: isolated network namespace (network "isolated")
+	optdepends = nftables: outbound filtering and allow-host inside an isolated network
+	optdepends = xdg-desktop-portal: file chooser, screencast and camera portals
+	optdepends = pipewire: pipewire and pulseaudio grants (pw-container security context)
+	optdepends = pipewire-pulse: pulseaudio grant (a private server per sandbox)
+	optdepends = wireplumber: the audio policy this package installs, 0.5.15 or newer
+	optdepends = xorg-xwayland: the X server a bare x11 runs inside the sandbox
+	optdepends = at-spi2-core: a11y grant
+	optdepends = bubbler-ui: terminal editor for instances (bubbler ui)
+	provides = bubbler=0.20.1.r0.gca3332d
+	conflicts = bubbler
+
+pkgname = bubbler-ui-git
+	pkgdesc = Terminal editor for bubbler sandbox instances (git)
+	depends = bubbler-git
+	depends = libseccomp
+	depends = libgcc
+	depends = glibc
+	provides = bubbler-ui=0.20.1.r0.gca3332d
+	conflicts = bubbler-ui
