@@ -9213,12 +9213,19 @@ fn profile_lint_all_reads_every_layer_once_and_json_carries_the_counts() {
     // $XDG_CONFIG_HOME has the WirePlumber drop-in (`audio-policy-missing`)
     // rather than the profiles' own grants.
     install_audio_policy(tmp.path(), true, true);
+    // An `etc-share` names the host's own `/etc`, unlike a `home-share`,
+    // which this test can fake under its temporary home; a host missing
+    // one is a warning `make_builtin_share_sources` cannot suppress.
+    let missing = missing_builtin_etc_shares();
     let (code, out, err) = run(
         tmp.path(),
         &["profile", "lint", "--all", "--format", "json"],
     );
-    assert_eq!(code, 0, "{out}{err}");
-    assert!(out.contains("\"errors\": 0, \"warnings\": 0"), "{out}");
+    assert_eq!(code, if missing == 0 { 0 } else { 1 }, "{out}{err}");
+    assert!(
+        out.contains(&format!("\"errors\": 0, \"warnings\": {missing}")),
+        "{out}"
+    );
     assert!(
         out.contains(&format!("\"layers\": {}", NAMES.len())),
         "{out}"
@@ -9238,10 +9245,12 @@ fn profile_lint_all_reads_every_layer_once_and_json_carries_the_counts() {
         1,
         "{out}"
     );
+    let warnings = 1 + missing;
     assert!(
         out.contains(&format!(
-            "{} layers linted, 0 errors, 1 warning",
-            NAMES.len() + 3
+            "{} layers linted, 0 errors, {warnings} warning{}",
+            NAMES.len() + 3,
+            if warnings == 1 { "" } else { "s" }
         )),
         "{out}"
     );
@@ -9266,6 +9275,27 @@ fn make_builtin_share_sources(root: &Path) {
             }
         }
     }
+}
+
+/// How many built-in `etc-share`s this host lacks under `/etc`. An
+/// `etc-share` names the host's own `/etc`, which a test cannot fake
+/// without root, so each absent source is one `share-source-missing`
+/// warning the profile means to keep — the test derives the expected
+/// count from the host instead of assuming it.
+fn missing_builtin_etc_shares() -> usize {
+    let mut missing = 0;
+    for name in NAMES {
+        let text = bubbler_core::profile::lookup(name).expect("NAMES lists built-ins");
+        let cfg = bubbler_core::config::parse_profile(text).unwrap().config;
+        for s in &cfg.services {
+            if let bubbler_core::config::Service::EtcShare { name } = s
+                && !Path::new("/etc").join(name).exists()
+            {
+                missing += 1;
+            }
+        }
+    }
+    missing
 }
 
 #[test]
