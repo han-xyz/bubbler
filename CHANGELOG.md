@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.23.1
+
+### Fixed
+
+- The CLI test suite asserts nothing about what a host has installed.
+  The built-in profile lint test measured whether this machine had the
+  applications and the `/etc` entry the profiles name, and the real
+  `try --grant network` test started pasta without checking for it; a
+  clean system — the AUR package's `check()` among them — saw failures
+  where the suite's contract is a skip.
+
+### Changed
+
+- The AUR packages under `aur/` depend on `passt` instead of suggesting
+  it: nearly every shipped profile grants `network`, which starts pasta.
+
 ## 0.23.0
 
 ### Added
