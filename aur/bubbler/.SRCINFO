@@ -8,6 +8,7 @@ pkgbase = bubbler
 	makedepends = cargo
 	makedepends = git
 	depends = bubblewrap>=0.12.0
+	depends = passt
 	depends = libseccomp
 	depends = libgcc
 	depends = glibc
@@ -18,7 +19,6 @@ pkgname = bubbler
 	pkgdesc = Application sandboxing on top of bubblewrap, with named instances, explicit resource grants, and a profile library
 	install = bubbler.install
 	optdepends = xdg-dbus-proxy: dbus, system-bus, portals, notify, mpris and tray grants
-	optdepends = passt: isolated network namespace (network "isolated")
 	optdepends = nftables: outbound filtering and allow-host inside an isolated network
 	optdepends = xdg-desktop-portal: file chooser, screencast and camera portals
 	optdepends = pipewire: pipewire and pulseaudio grants (pw-container security context)

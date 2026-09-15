@@ -8,7 +8,7 @@ pkgdesc='Application sandboxing on top of bubblewrap, with named instances, expl
 arch=(x86_64)
 url='https://github.com/han-xyz/bubbler'
 license=(GPL-3.0-or-later)
-depends=('bubblewrap>=0.12.0' libseccomp libgcc glibc)
+depends=('bubblewrap>=0.12.0' passt libseccomp libgcc glibc)
 makedepends=(cargo git)
 # git rev-parse v0.23.0 (the tag object, not the commit it points to)
 _tag=b25b87e6cb3c96c58001e9b1297df4d34c8b514f
@@ -45,7 +45,6 @@ check() {
 package_bubbler() {
   pkgdesc='Application sandboxing on top of bubblewrap, with named instances, explicit resource grants, and a profile library'
   optdepends=('xdg-dbus-proxy: dbus, system-bus, portals, notify, mpris and tray grants'
-              'passt: isolated network namespace (network "isolated")'
               'nftables: outbound filtering and allow-host inside an isolated network'
               'xdg-desktop-portal: file chooser, screencast and camera portals'
               'pipewire: pipewire and pulseaudio grants (pw-container security context)'
