@@ -9556,6 +9556,43 @@ fn a_missing_pasta_names_the_package_and_the_host_mode() {
 }
 
 #[test]
+fn a_missing_dbus_proxy_names_the_package() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/t/config.kdl"),
+        "dbus {\n    see \"org.freedesktop.DBus\"\n}\ncommand \"sh\"\n",
+    )
+    .unwrap();
+    let start = std::time::Instant::now();
+    let out = bubbler_live(tmp.path(), &init)
+        .env("BUBBLER_DBUS_PROXY", tmp.path().join("no-such-proxy"))
+        .args(["run", "t", "--", "/usr/bin/echo", "ran"])
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("xdg-dbus-proxy"), "{err}");
+    assert!(
+        err.contains("install the `xdg-dbus-proxy` package"),
+        "{err}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    // The bug this guards: without the pre-spawn check, the failure only
+    // surfaces after the 5-second PROXY_READY wait for a proxy that bwrap
+    // never managed to exec.
+    assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+}
+
+#[test]
 fn a_config_written_before_the_flip_warns_on_every_run() {
     let tmp = setup();
     bubbler(tmp.path()).args(["create", "t"]).status().unwrap();

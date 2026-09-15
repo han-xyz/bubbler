@@ -1768,6 +1768,26 @@ pub fn start_proxy(
     plan: &dbus::Plan,
     host: &dyn Host,
 ) -> Result<ProxyHandle, LaunchError> {
+    // Checked before anything else: the proxy runs inside its own bwrap,
+    // so a missing binary would otherwise surface as bwrap's own execvp
+    // line, only after the full PROXY_READY wait for a proxy that never
+    // started.
+    let program = dbus::proxy_program(env);
+    let found = if program.components().count() > 1 {
+        rustix::fs::access(&program, Access::EXEC_OK).is_ok()
+    } else {
+        on_path(&program.to_string_lossy()).is_some()
+    };
+    if !found {
+        return Err(LaunchError::BadValue {
+            service: "dbus",
+            reason: format!(
+                "`{}` is not on PATH; install the `xdg-dbus-proxy` package, or drop the \
+                 `dbus`, `portals`, `a11y` and `system-bus` nodes",
+                program.display()
+            ),
+        });
+    }
     // Only the buses the plan grants are resolved: probing the other one
     // would fail a run over a socket it never asked for.
     let session_bus = plan

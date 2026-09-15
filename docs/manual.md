@@ -3088,8 +3088,9 @@ serves at
 `$XDG_RUNTIME_DIR/bus` inside the sandbox, with `DBUS_SESSION_BUS_ADDRESS`
 pointing there. The start waits up to five seconds for the proxy to report
 that it has bound its socket and is accepting connections, and fails if it
-does not; the proxy exits with the sandbox. `--dry-run` prints that bind
-without starting anything.
+does not; the proxy exits with the sandbox. A missing `xdg-dbus-proxy` is an
+error naming the `xdg-dbus-proxy` package, checked before that wait rather
+than after it. `--dry-run` prints that bind without starting anything.
 
 The proxy creates its sockets in `$XDG_RUNTIME_DIR/bubbler/<name>/dbus/`, and
 that directory is the only writable path in the proxy's own sandbox. The
