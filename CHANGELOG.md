@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.23.2
+
+### Fixed
+
+- A run whose config starts the D-Bus proxy on a host without
+  `xdg-dbus-proxy` now fails at once, naming the package to install,
+  instead of surfacing bwrap's `execvp` line and waiting five seconds for
+  a proxy that never started.
+
 ## 0.23.1
 
 ### Fixed
