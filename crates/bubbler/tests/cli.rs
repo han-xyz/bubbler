@@ -7696,7 +7696,7 @@ fn try_grant_x11_alone_names_the_requirement() {
 
 #[test]
 fn real_bwrap_try_grants_network_and_leaves_nothing_behind() {
-    if !require_bwrap() {
+    if !require_bwrap() || !require_pasta() {
         return;
     }
     let Some(init) = real_init() else { return };
