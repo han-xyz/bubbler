@@ -19,4 +19,5 @@ Terms this repo uses; synonyms to avoid in code, docs and commits.
 - `holder` — `bubbler-init`'s `bubbler-pw-hold` mode: renames the context socket beside itself, reports its path over a pipe, then waits on a signal to keep the context alive until the sandbox exits.
 - `optional share` — `home-share`/`path-share` with `optional=#true`: skipped when the source is absent, `--explain` says so.
 - `smoke test` — the opt-in live test per shipped profile in `crates/bubbler/tests/cli.rs`: window class seen or version line printed.
+- `run log` — an instance's `last-run.log`: what a start with no terminal attached wrote to stderr — bubbler's own errors, the sidecars' and the application's — emptied by a fresh start, appended to by one that executes into a running sandbox; not "error log", since it holds everything the run printed.
 - `generated file` — a file bubbler writes for the sandbox (`/etc/passwd`, `/etc/group`, `/etc/resolv.conf`, `/.flatpak-info`), bound read-only.
