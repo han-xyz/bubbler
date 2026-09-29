@@ -300,8 +300,9 @@ impl App {
         }
     }
 
-    /// Show the run log of a start that failed at its end, headed by how
-    /// it ended, so a log the start left empty still says something.
+    /// Show the run log of a start that failed at its end, followed by how
+    /// it ended: the last line is the one the view opens on, so it is in
+    /// sight however long the log is, and an empty log still says something.
     pub fn show_failed_start(
         &mut self,
         title: impl Into<String>,
@@ -309,7 +310,7 @@ impl App {
         log: Vec<String>,
     ) {
         let empty = log.is_empty().then(|| "the run log is empty".to_owned());
-        let lines = std::iter::once(outcome).chain(log).chain(empty).collect();
+        let lines = log.into_iter().chain(empty).chain([outcome]).collect();
         self.show(title, lines, None, true);
     }
 
@@ -1480,18 +1481,18 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_start_heads_its_run_log_with_how_it_ended() {
+    fn a_failed_start_ends_its_run_log_with_how_it_ended() {
         let (_tmp, mut app) = app();
         let lines = |app: &App| app.viewer.as_ref().unwrap().lines.clone();
         app.show_failed_start("last-run.log of ff", "`ff` exited 1".to_owned(), Vec::new());
         assert_eq!(app.screen(), Screen::Viewer);
-        assert_eq!(lines(&app), ["`ff` exited 1", "the run log is empty"]);
+        assert_eq!(lines(&app), ["the run log is empty", "`ff` exited 1"]);
         app.show_failed_start(
             "last-run.log of ff",
             "`ff` exited 1".to_owned(),
             vec!["no such file".to_owned()],
         );
-        assert_eq!(lines(&app), ["`ff` exited 1", "no such file"]);
+        assert_eq!(lines(&app), ["no such file", "`ff` exited 1"]);
     }
 
     #[test]
