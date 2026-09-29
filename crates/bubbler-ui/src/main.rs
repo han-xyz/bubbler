@@ -250,7 +250,10 @@ fn perform(
                 }
                 app.reload();
             }
-            Err(e) => app.say(format!("could not run it: {e}")),
+            Err(e) => app.say(match outcome {
+                Some(outcome) => format!("{outcome}; could not show its run log: {e}"),
+                None => format!("could not run it: {e}"),
+            }),
         },
     }
     Ok(())

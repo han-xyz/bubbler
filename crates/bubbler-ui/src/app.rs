@@ -356,9 +356,9 @@ impl App {
     }
 
     /// What a child started by `r` or `o` ending means: nothing when it
-    /// succeeded, else its run log — or, while a dialog or the help is
-    /// open, a word on the status line, so the viewer does not take the
-    /// screen from under them.
+    /// succeeded, else its run log in place of the help — or, while a
+    /// dialog is open, a word on the status line, so the viewer does not
+    /// take the input in progress from under them.
     pub fn exited(&mut self, name: &str, status: ExitStatus) -> Option<Action> {
         if status.success() {
             return None;
@@ -367,10 +367,11 @@ impl App {
             Some(code) => format!("`{name}` exited {code}"),
             None => format!("`{name}` was killed by a signal"),
         };
-        if self.dialog.is_some() || self.help {
+        if self.dialog.is_some() {
             self.say(format!("{outcome}; `L` shows why"));
             return None;
         }
+        self.help = false;
         self.say(outcome.clone());
         Some(Action::run_log(name, Some(outcome)))
     }
@@ -1507,12 +1508,15 @@ mod tests {
     }
 
     #[test]
-    fn a_start_that_failed_under_the_help_says_so_on_the_status_line() {
+    fn a_start_that_failed_under_the_help_closes_it_for_the_run_log() {
         let (_tmp, mut app) = app();
+        let log = press(&mut app, 'L').unwrap();
         press(&mut app, '?');
-        assert!(app.exited("ff", exit_code(2)).is_none());
-        assert_eq!(app.status, "`ff` exited 2; `L` shows why");
-        assert!(app.help, "the help is still up");
+        let action = app.exited("ff", exit_code(2)).expect("the run log");
+        assert_eq!(argv(&action), argv(&log));
+        assert!(at_end(&action));
+        assert_eq!(app.status, "`ff` exited 2");
+        assert!(!app.help, "the help is closed");
     }
 
     #[test]
