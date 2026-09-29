@@ -1768,26 +1768,6 @@ pub fn start_proxy(
     plan: &dbus::Plan,
     host: &dyn Host,
 ) -> Result<ProxyHandle, LaunchError> {
-    // Checked before anything else: the proxy runs inside its own bwrap,
-    // so a missing binary would otherwise surface as bwrap's own execvp
-    // line, only after the full PROXY_READY wait for a proxy that never
-    // started.
-    let program = dbus::proxy_program(env);
-    let found = if program.components().count() > 1 {
-        rustix::fs::access(&program, Access::EXEC_OK).is_ok()
-    } else {
-        on_path(&program.to_string_lossy()).is_some()
-    };
-    if !found {
-        return Err(LaunchError::BadValue {
-            service: "dbus",
-            reason: format!(
-                "`{}` is not on PATH; install the `xdg-dbus-proxy` package, or drop the \
-                 `dbus`, `portals`, `a11y` and `system-bus` nodes",
-                program.display()
-            ),
-        });
-    }
     // Only the buses the plan grants are resolved: probing the other one
     // would fail a run over a socket it never asked for.
     let session_bus = plan
@@ -1818,6 +1798,25 @@ pub fn start_proxy(
             service::require_socket(host, dbus::A11Y_NODE, path)
         })
         .transpose()?;
+    // After the bus guards, so a refused bus address is reported before a
+    // missing package; before the spawn, so a missing binary is not bwrap's
+    // own execvp line after the full PROXY_READY wait.
+    let program = dbus::proxy_program(env);
+    let found = if program.components().count() > 1 {
+        rustix::fs::access(&program, Access::EXEC_OK).is_ok()
+    } else {
+        on_path(&program.to_string_lossy()).is_some()
+    };
+    if !found {
+        return Err(LaunchError::BadValue {
+            service: "dbus",
+            reason: format!(
+                "`{}` is not on PATH; install the `xdg-dbus-proxy` package, or drop the \
+                 `dbus`, `portals`, `a11y` and `system-bus` nodes",
+                program.display()
+            ),
+        });
+    }
     // The proxy gets this directory and nothing else of the instance's
     // runtime state, so it is created here rather than bound from above.
     mkdir_private(&dbus::socket_dir(dir))?;

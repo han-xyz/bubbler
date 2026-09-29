@@ -16,9 +16,9 @@ use bubbler_core::profile::NAMES;
 use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
     PYTHON, bubbler, bubbler_audio, bubbler_dbus, bubbler_in_sh, bubbler_live, bubbler_wayland,
-    bwrap_alive, holders_of, isolated, kill_group, output_past_a_busy_exec, process_running,
-    real_init, real_net_proxy, require_a11y, require_a11y_lookup, require_bwrap, require_dbus,
-    require_document_portal, require_egress, require_groff, require_host_program,
+    bwrap_alive, holders_of, host_bus, isolated, kill_group, output_past_a_busy_exec,
+    process_running, real_init, real_net_proxy, require_a11y, require_a11y_lookup, require_bwrap,
+    require_dbus, require_document_portal, require_egress, require_groff, require_host_program,
     require_nested_x11, require_nested_x11_host, require_nft, require_pasta, require_portal,
     require_python, require_security_context, require_system_bus, require_tray, say,
     session_pipewire, system_owns, test_pty,
@@ -9560,6 +9560,10 @@ fn a_missing_dbus_proxy_names_the_package() {
     if !require_bwrap() {
         return;
     }
+    if host_bus().is_none() {
+        say("skipping: no host session bus");
+        return;
+    }
     let Some(init) = real_init() else { return };
     let tmp = setup();
     bubbler_live(tmp.path(), &init)
@@ -9572,7 +9576,7 @@ fn a_missing_dbus_proxy_names_the_package() {
     )
     .unwrap();
     let start = std::time::Instant::now();
-    let out = bubbler_live(tmp.path(), &init)
+    let out = bubbler_dbus(tmp.path(), &init)
         .env("BUBBLER_DBUS_PROXY", tmp.path().join("no-such-proxy"))
         .args(["run", "t", "--", "/usr/bin/echo", "ran"])
         .output()
