@@ -141,11 +141,13 @@ descriptors is somebody watching, and the sandbox gets the terminal its `tty`
 node asks for; with none on any of them, which is how a launcher starts its
 children, it takes `tty "none"` (see "Terminal") and writes bubbler's own
 stderr — its warnings, a sidecar's errors, the application's own output — to
-`last-run.log` in the instance directory, which `bubbler log` prints. The log
-is opened before the config is read, so a `config.kdl` that stopped the run is
-in it too, and a log that cannot be opened at all — a symlink where the file
-belongs — costs the record rather than the run: bubbler says so and starts the
-sandbox anyway. Printed to a terminal, the log has its control characters
+`last-run.log` in the instance directory, which `bubbler log` prints. `run`
+with no terminal on any descriptor writes the same log, emptied and added to
+the same way, but as a copy: its stderr still goes where it went, while `open`
+sends it to the log instead. The log is opened before the config is read, so
+a `config.kdl` that stopped the run is in it too, and a log that cannot be
+opened at all — a symlink where the file belongs — costs the record rather
+than the run: bubbler says so and starts the sandbox anyway. Printed to a terminal, the log has its control characters
 shown (`^[`) rather than sent, so reading what a sandbox wrote is not letting
 it write to your terminal a second time; down a pipe it is the log, byte for
 byte. See "Desktop entries".
@@ -963,9 +965,9 @@ maps a window, takes focus, is offered the selection and reads it:
 
 Once something has armed the gate the tail counts the gap instead — `no input
 for <n> ms`, the same refusal either way. Audit lines go to bubbler's own
-stderr, which for a run without a terminal is `last-run.log` (see "Terminal"),
-and are rate-limited to one a second: gate lines and connection-closed lines
-have a budget each, counted apart so a
+stderr, which for a run without a terminal reaches `last-run.log` (see
+"Terminal"), and are rate-limited to one a second: gate lines and
+connection-closed lines have a budget each, counted apart so a
 `receive` in a tight loop cannot spend the log's whole allowance and push the
 line that says why a connection ended out of the record. What a burst swallowed
 rides on the next line of its kind as a count.

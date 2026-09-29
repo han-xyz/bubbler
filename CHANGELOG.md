@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `bubbler run` with no terminal attached also keeps a copy of its stderr in
+  the run log (`last-run.log`) that `bubbler log` prints; `open` sends it there
+  instead.
+
 ## 0.23.3
 
 ### Fixed

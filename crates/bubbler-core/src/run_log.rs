@@ -105,6 +105,17 @@ pub struct Redirect {
 /// The file is opened `O_APPEND` either way, so a second bubbler writing
 /// to the same log lands after what is already there rather than over it.
 pub fn redirect(path: &Path, truncate: bool) -> Result<Redirect, LaunchError> {
+    start(path, truncate, false)
+}
+
+/// [`redirect`], with everything also still written to the stderr the
+/// caller had: the cap is the file's alone, and a stderr whose reader has
+/// gone is given up on while the file goes on.
+pub fn tee(path: &Path, truncate: bool) -> Result<Redirect, LaunchError> {
+    start(path, truncate, true)
+}
+
+fn start(path: &Path, truncate: bool, keep_stderr: bool) -> Result<Redirect, LaunchError> {
     let io_at = |e: io::Error| LaunchError::Io(path.to_path_buf(), e);
     let file = open(path, OFlags::WRONLY | OFlags::CREATE | OFlags::APPEND).map_err(io_at)?;
     // The mode is only applied when the file is created, so a log from an
@@ -119,6 +130,10 @@ pub fn redirect(path: &Path, truncate: bool) -> Result<Redirect, LaunchError> {
         .as_fd()
         .try_clone_to_owned()
         .map_err(LaunchError::Data)?;
+    let stderr = match keep_stderr {
+        true => Some(saved.try_clone().map_err(LaunchError::Data)?),
+        false => None,
+    };
     // Not CLOEXEC once it is fd 2: every child bubbler starts writes its
     // own errors into the log too.
     rustix::stdio::dup2_stderr(&writer).map_err(|e| LaunchError::Data(e.into()))?;
@@ -126,9 +141,13 @@ pub fn redirect(path: &Path, truncate: bool) -> Result<Redirect, LaunchError> {
     // Nothing in here may start a process; see the module comment.
     std::thread::spawn(move || {
         let file = std::fs::File::from(file);
-        let _ = copy_capped(std::fs::File::from(reader), &file, || {
-            file.metadata().map(|m| m.len())
-        });
+        let mut stderr = stderr.map(std::fs::File::from);
+        let _ = copy_capped(
+            std::fs::File::from(reader),
+            &file,
+            || file.metadata().map(|m| m.len()),
+            stderr.as_mut().map(|f| f as &mut dyn Write),
+        );
         // A send that finds nobody waiting is the caller having given up
         // on the flush, which is not this thread's failure.
         let _ = tx.send(());
@@ -166,10 +185,14 @@ impl Drop for Redirect {
 /// `size` is the destination's own size, asked for again before every
 /// write rather than counted here, so whatever another writer has
 /// appended in the meantime counts against the same cap.
+///
+/// `stderr`, when given, is sent every byte read, past the cap too, until
+/// a write to it fails.
 fn copy_capped(
     mut src: impl Read,
     mut dst: impl Write,
     mut size: impl FnMut() -> io::Result<u64>,
+    mut stderr: Option<&mut dyn Write>,
 ) -> io::Result<()> {
     let note = NOTE.len() as u64;
     let mut noted = false;
@@ -181,6 +204,11 @@ fn copy_capped(
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         };
+        if let Some(out) = stderr.as_mut()
+            && out.write_all(&buf[..read]).is_err()
+        {
+            stderr = None;
+        }
         // The note is kept out of the room for output, so writing it is
         // never what takes the file over the cap.
         let room = MAX_BYTES.saturating_sub(size()?);
@@ -208,8 +236,54 @@ mod tests {
     /// does, counting `held` bytes another writer put there first.
     fn capped(input: &[u8], held: u64) -> Vec<u8> {
         let out = std::cell::RefCell::new(Vec::new());
-        copy_capped(input, Shared(&out), || Ok(held + out.borrow().len() as u64)).unwrap();
+        copy_capped(
+            input,
+            Shared(&out),
+            || Ok(held + out.borrow().len() as u64),
+            None,
+        )
+        .unwrap();
         out.into_inner()
+    }
+
+    /// An original stderr whose reader has gone.
+    struct Closed;
+
+    impl Write for Closed {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_tee_gives_stderr_everything_and_the_file_what_fits() {
+        let flood = vec![b'x'; 8192];
+        let out = std::cell::RefCell::new(Vec::new());
+        let mut stderr = Vec::new();
+        copy_capped(
+            &flood[..],
+            Shared(&out),
+            || Ok(MAX_BYTES - 100 + out.borrow().len() as u64),
+            Some(&mut stderr),
+        )
+        .unwrap();
+        assert_eq!(stderr, flood);
+        assert_eq!(out.borrow().len(), 100);
+        assert!(out.borrow().ends_with(NOTE.as_bytes()));
+
+        // A reader that left costs its own copy, not the file's.
+        let out = std::cell::RefCell::new(Vec::new());
+        copy_capped(
+            &b"hello"[..],
+            Shared(&out),
+            || Ok(out.borrow().len() as u64),
+            Some(&mut Closed),
+        )
+        .unwrap();
+        assert_eq!(out.into_inner(), b"hello");
     }
 
     /// A destination the size closure can read the length of, which is

@@ -11577,6 +11577,102 @@ fn open_with_a_terminal_on_any_descriptor_leaves_the_log_alone() {
     );
 }
 
+#[test]
+fn run_without_a_terminal_leaves_its_errors_in_the_log_that_log_prints() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "bluetooth\n").unwrap();
+    let log = tmp.path().join("data/bubbler/instances/t/last-run.log");
+
+    // The caller's stderr keeps what the run said; the log keeps a copy.
+    let out = bubbler(tmp.path()).args(["run", "t"]).output().unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("unknown node `bluetooth`"), "{err}");
+    let first = std::fs::read_to_string(&log).unwrap();
+    assert!(first.contains("unknown node `bluetooth`"), "{first}");
+    let out = bubbler(tmp.path()).args(["log", "t"]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), first);
+
+    // A fresh start empties the log: only the second run's error is left.
+    std::fs::write(&cfg, "wifi\n").unwrap();
+    let out = bubbler(tmp.path()).args(["run", "t"]).output().unwrap();
+    assert!(!out.status.success());
+    let second = std::fs::read_to_string(&log).unwrap();
+    assert!(second.contains("unknown node `wifi`"), "{second}");
+    assert!(!second.contains("bluetooth"), "{second}");
+}
+
+#[test]
+fn run_dry_run_without_a_terminal_writes_no_log() {
+    let tmp = setup();
+    write_profile(tmp.path(), "user", "app", "command \"/usr/bin/true\"\n");
+    bubbler(tmp.path())
+        .args(["create", "t", "--profile", "app"])
+        .status()
+        .unwrap();
+    let out = bubbler(tmp.path())
+        .args(["run", "--dry-run", "t"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !tmp.path()
+            .join("data/bubbler/instances/t/last-run.log")
+            .exists()
+    );
+}
+
+#[test]
+fn real_bwrap_run_into_a_live_instance_adds_to_its_log() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    write_profile(tmp.path(), "user", "app", "command \"/usr/bin/sleep\"\n");
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t", "--profile", "app"])
+        .status()
+        .unwrap();
+    let mut run = bubbler_live(tmp.path(), &init)
+        .args(["run", "t", "--", "/usr/bin/sleep", "30"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let sock = tmp.path().join("run/bubbler/t/init.sock");
+    if !wait_until(
+        || UnixStream::connect(&sock).is_ok(),
+        Duration::from_secs(10),
+    ) {
+        fail_with(run, "the instance never accepted a connection");
+    }
+
+    // Two runs into the live sandbox: each adds its line to the log of
+    // the run it went into instead of emptying it.
+    let log = tmp.path().join("data/bubbler/instances/t/last-run.log");
+    for _ in 0..2 {
+        let out = bubbler_live(tmp.path(), &init)
+            .args(["run", "t", "--", "/usr/bin/true"])
+            .output()
+            .unwrap();
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(out.status.success(), "{text}");
+    }
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(text.matches("executing inside it").count(), 2, "{text}");
+
+    kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
+    let _ = run.wait();
+}
+
 /// A log is the sandbox's own output, so printing it is bubbler handing
 /// a terminal whatever the application wrote — an OSC 52 in it writes
 /// the clipboard of whoever reads the log. On a terminal the control

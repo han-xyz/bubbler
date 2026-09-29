@@ -169,7 +169,9 @@ An argument after `--` that names a host file is registered with the document
 portal and handed in at $XDG_RUNTIME_DIR/doc/<id>/<name> when the config grants
 `portals`; without that grant it is left as it was and a warning names the gap.
 `--dry-run` prints the bwrap argv and launches nothing; `--explain` prints
-that same argv grouped under the config node each argument came from.")]
+that same argv grouped under the config node each argument came from. With no
+terminal on any of the three standard descriptors, a copy of its stderr is kept
+in the instance's last-run.log, which `bubbler log` prints.")]
     Run {
         /// Instance name.
         name: String,
@@ -847,12 +849,17 @@ fn refresh_entries(env: &Env, dirs: &desktop::Dirs, program: &Path) -> Result<i3
     Ok(i32::from(failed > 0))
 }
 
-/// The log a run without a terminal writes, or `None` after saying why
+/// The log a run without a terminal writes, started by `start`
+/// ([`run_log::redirect`] or [`run_log::tee`]), or `None` after saying why
 /// there is none: a log that cannot be opened — a symlink where the file
 /// belongs, a full disk — is a lost record, and losing the record is not
 /// a reason to refuse the sandbox the user asked for.
-fn open_log(path: &Path, truncate: bool) -> Option<run_log::Redirect> {
-    match run_log::redirect(path, truncate) {
+fn open_log(
+    start: fn(&Path, bool) -> Result<run_log::Redirect, LaunchError>,
+    path: &Path,
+    truncate: bool,
+) -> Option<run_log::Redirect> {
+    match start(path, truncate) {
         Ok(guard) => Some(guard),
         Err(e) => {
             let e = anyhow::Error::new(e);
@@ -1209,6 +1216,22 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             share,
             command,
         } => {
+            // Before the config is read, and connected first so a run
+            // into a live sandbox adds to its log, the way `open` does;
+            // unlike `open`, the run's stderr still goes where it went.
+            let starts = !dry_run && explain_mode.is_none();
+            if starts && !tty::host_is_tty().iter().any(|t| *t) {
+                let config = instance::config_path_checked(&env, &name)
+                    .with_context(|| format!("opening instance `{name}`"))?;
+                let running = exec::connect(&env, &name)
+                    .with_context(|| format!("connecting to instance `{name}`"))?
+                    .is_some();
+                *log = open_log(
+                    run_log::tee,
+                    &config.with_file_name(run_log::LOG_FILE),
+                    !running,
+                );
+            }
             let mut inst = Instance::open(&env, &name).with_context(|| {
                 format!(
                     "opening instance `{name}` ({})",
@@ -1406,7 +1429,11 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             // bubbler reads, and every stderr goes to the log.
             let watched = tty::host_is_tty().iter().any(|t| *t);
             if !watched {
-                *log = open_log(&config.with_file_name(run_log::LOG_FILE), stream.is_none());
+                *log = open_log(
+                    run_log::redirect,
+                    &config.with_file_name(run_log::LOG_FILE),
+                    stream.is_none(),
+                );
             }
             let inst = Instance::open(&env, &name).with_context(|| {
                 format!(
