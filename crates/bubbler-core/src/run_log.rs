@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::Duration;
 
+use rustix::event::{PollFd, PollFlags, poll};
 use rustix::fs::{Mode, OFlags};
 use rustix::pipe::PipeFlags;
 
@@ -144,7 +145,7 @@ fn start(path: &Path, truncate: bool, keep_stderr: bool) -> Result<Redirect, Lau
     // Nothing in here may start a process; see the module comment.
     std::thread::spawn(move || {
         let file = std::fs::File::from(file);
-        let mut stderr = stderr.map(std::fs::File::from);
+        let mut stderr = stderr.map(|fd| Blocking(std::fs::File::from(fd)));
         let _ = copy_capped(
             std::fs::File::from(reader),
             &file,
@@ -202,9 +203,9 @@ impl Drop for Redirect {
 /// the file has had its share: a stderr nobody reads blocks the copy, and
 /// the record is what matters then. A stderr whose reader has gone is given
 /// up on; any other failure there costs that chunk. With a `stderr`, a file
-/// that fails is given one try at a note saying so, then given up on while
-/// the copy goes on, since the caller's own stderr is what the run was
-/// promised.
+/// that fails is given one try at a note saying so, when it has room for
+/// it under the cap, then given up on while the copy goes on, since the
+/// caller's own stderr is what the run was promised.
 fn copy_capped(
     mut src: impl Read,
     dst: impl Write,
@@ -228,8 +229,11 @@ fn copy_capped(
             if !teeing {
                 return Err(e);
             }
-            // The log just failed, so the note may not land either.
-            let _ = file.write_all(STOPPED.as_bytes());
+            // The log just failed, so the note may not land either, and it
+            // is only tried where the file says there is room for it.
+            if size().is_ok_and(|held| held + STOPPED.len() as u64 <= MAX_BYTES) {
+                let _ = file.write_all(STOPPED.as_bytes());
+            }
             dst = None;
         }
         if let Some(out) = stderr.as_mut()
@@ -238,6 +242,29 @@ fn copy_capped(
         {
             stderr = None;
         }
+    }
+}
+
+/// The caller's stderr, written to as if it blocked: its file description
+/// may be one a parent shares with `O_NONBLOCK` set, where a full pipe
+/// answers `WouldBlock`, and a chunk dropped for that is output the
+/// caller would have had without bubbler in between.
+struct Blocking(std::fs::File);
+
+impl Write for Blocking {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        loop {
+            match self.0.write(buf) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    let mut fds = [PollFd::new(&self.0, PollFlags::OUT)];
+                    poll(&mut fds, None)?;
+                }
+                written => return written,
+            }
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
     }
 }
 
@@ -300,15 +327,14 @@ mod tests {
         }
     }
 
-    /// A stderr whose first write fails with `WouldBlock` and whose later
-    /// writes land.
+    /// A stderr whose first write fails and whose later writes land.
     struct FailsOnce(bool, Vec<u8>);
 
     impl Write for FailsOnce {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             if !self.0 {
                 self.0 = true;
-                return Err(io::ErrorKind::WouldBlock.into());
+                return Err(io::ErrorKind::Other.into());
             }
             self.1.extend_from_slice(buf);
             Ok(buf.len())
@@ -383,12 +409,14 @@ mod tests {
 
         // A log that fails after taking some output says where it stopped.
         let out = std::cell::RefCell::new(Vec::new());
+        let failed = std::cell::Cell::new(false);
         let mut stderr = Vec::new();
         copy_capped(
             (&b"one"[..]).chain(&b"two"[..]),
             Shared(&out),
             || match out.borrow().len() {
                 0 => Ok(0),
+                held if failed.replace(true) => Ok(held as u64),
                 _ => Err(io::ErrorKind::Other.into()),
             },
             Some(&mut stderr),
@@ -396,6 +424,42 @@ mod tests {
         .unwrap();
         assert_eq!(stderr, b"onetwo");
         assert_eq!(out.into_inner(), [b"one", STOPPED.as_bytes()].concat());
+
+        // Never past the cap, the note included.
+        let out = std::cell::RefCell::new(Vec::new());
+        let asked = std::cell::Cell::new(0);
+        copy_capped(
+            &b"one"[..],
+            Shared(&out),
+            || {
+                asked.set(asked.get() + 1);
+                match asked.get() {
+                    1 => Err(io::ErrorKind::Other.into()),
+                    _ => Ok(MAX_BYTES - 1),
+                }
+            },
+            Some(&mut Vec::new()),
+        )
+        .unwrap();
+        assert!(out.into_inner().is_empty());
+    }
+
+    #[test]
+    fn a_non_blocking_stderr_is_waited_for_not_dropped() {
+        let (reader, writer) = rustix::pipe::pipe_with(PipeFlags::CLOEXEC).unwrap();
+        rustix::fs::fcntl_setfl(&writer, OFlags::NONBLOCK).unwrap();
+        let drain = std::thread::spawn(move || {
+            // Late, so the pipe fills and the writer is told to wait.
+            std::thread::sleep(Duration::from_millis(100));
+            let mut all = Vec::new();
+            std::fs::File::from(reader).read_to_end(&mut all).unwrap();
+            all
+        });
+        let flood = vec![b'x'; 1 << 20];
+        let mut stderr = Blocking(std::fs::File::from(writer));
+        copy_capped(&flood[..], io::sink(), || Ok(0), Some(&mut stderr)).unwrap();
+        drop(stderr);
+        assert_eq!(drain.join().unwrap().len(), flood.len());
     }
 
     /// A destination the size closure can read the length of, which is

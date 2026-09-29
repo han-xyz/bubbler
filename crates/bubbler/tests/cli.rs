@@ -11693,7 +11693,8 @@ fn real_bwrap_run_into_a_live_instance_adds_to_its_log() {
     assert!(err.contains("late"), "{err}");
 
     // Under `--tty none` the command writes to a pipe bubbler reads, so
-    // its stderr goes through the copy into the log.
+    // its stderr goes through the copy into the log and still reaches
+    // the caller.
     let out = bubbler_live(tmp.path(), &init)
         .args([
             "run",
@@ -11710,9 +11711,43 @@ fn real_bwrap_run_into_a_live_instance_adds_to_its_log() {
     let text = std::fs::read_to_string(&log).unwrap();
     assert!(out.status.success(), "{text}");
     assert!(text.contains("inner"), "{text}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("inner"), "{err}");
 
     kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
     let _ = run.wait();
+}
+
+#[test]
+fn real_bwrap_fresh_run_without_a_terminal_gives_its_stderr_to_both() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    write_profile(tmp.path(), "user", "app", "command \"/usr/bin/sleep\"\n");
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t", "--profile", "app"])
+        .status()
+        .unwrap();
+    let out = bubbler_live(tmp.path(), &init)
+        .args([
+            "run",
+            "t",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            "echo app-$((6*7)) >&2",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("app-42"), "{err}");
+    let log = tmp.path().join("data/bubbler/instances/t/last-run.log");
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(text.contains("app-42"), "{text}");
 }
 
 #[test]

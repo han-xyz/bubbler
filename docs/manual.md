@@ -2839,12 +2839,13 @@ anywhere. `run` and `open` are started detached: a process group of their own, s
 meant for the editor is not sent to them, and `/dev/null` for stdio, so they
 hold no descriptor of this terminal. It is a new process group and not a new
 session — they stay in the editor's session, under its controlling terminal —
-and the state column catches up on the next second's probe. Both leave the
-run log that `L` shows, and one that fails — a non-zero exit or a signal —
-opens it in the viewer at its end, or says so on the status line while a
-prompt is open. `exec`, `try` and the editors take the terminal instead: the editor leaves raw mode and the
-alternate screen first, and takes them back when the command exits, without
-asking the terminal anything on the way in or out.
+and the state column catches up on the next second's probe. Both leave the run
+log that `L` shows, and one that fails — a non-zero exit or a signal — opens it
+in the viewer at its end, headed by how it ended, or says so on the status line
+while a prompt or the help is open. `exec`, `try` and the editors take the
+terminal instead: the editor leaves raw mode and the alternate screen first,
+and takes them back when the command exits, without asking the terminal
+anything on the way in or out.
 
 Whatever it ran, what is in the buffer stays in it: the list is read again
 afterwards, unsaved edits are kept, and the status line says so.
@@ -3503,11 +3504,12 @@ a pseudoterminal bubbler allocated and relay between the two; an fd that is
 not a terminal — a pipe, a redirect — is passed through unchanged, so a
 piped `bubbler run t -- cat` still reads the pipe and a redirected
 `bubbler run t` still writes the file. The exception is fd 2 when none of the
-three is a terminal: a sandbox that `run` starts then writes its stderr to
-bubbler's copy into `last-run.log`, which passes it on to the file, so under
-`2>&1` its lines can arrive out of order with stdout's. A pty is allocated only
-when at least one of the three is a terminal. The mode is the `tty` node in
-`config.kdl` and `--tty <mode>` on `run`, `exec` and `try`, which wins over it:
+three is a terminal: a sandbox that `run` starts then writes its stderr to a
+pipe that bubbler copies both into `last-run.log` and on to its destination, so
+under `2>&1` its lines can arrive out of order with stdout's. A pty is
+allocated only when at least one of the three is a terminal. The mode is the
+`tty` node in `config.kdl` and `--tty <mode>` on `run`, `exec` and `try`, which
+wins over it:
 
     pty          the default, described above
     passthrough  bubbler's own descriptors, handed over as they are

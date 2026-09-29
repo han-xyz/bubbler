@@ -5,8 +5,10 @@
 ### Changed
 
 - `bubbler run` with no terminal attached also keeps a copy of its stderr in
-  the run log (`last-run.log`) that `bubbler log` prints; `open` sends it there
-  instead.
+  the run log (`last-run.log`) that `bubbler log` prints. Only `run` changed:
+  `open` behaves as before. The sandbox's stderr now reaches the caller through
+  bubbler's copy, so a script sees the same bytes, possibly reordered against
+  stdout under `2>&1`.
 
 ### Added
 

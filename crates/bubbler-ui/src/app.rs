@@ -26,7 +26,8 @@ pub enum Action {
     Detached {
         /// The instance it starts, so a failure can be traced back to it.
         name: String,
-        /// The command line.
+        /// The arguments bubbler is started with, one element per
+        /// argument and no shell in between.
         args: Vec<OsString>,
     },
     /// Leave the alternate screen, hand the terminal over, and come back
@@ -43,6 +44,8 @@ pub enum Action {
         explain: Option<Explain>,
         /// Open the viewer on its last page rather than its first.
         at_end: bool,
+        /// How the start whose run log this is ended, when it failed.
+        outcome: Option<String>,
     },
     /// Read the store again.
     Reload,
@@ -58,16 +61,19 @@ impl Action {
             args,
             explain: None,
             at_end: false,
+            outcome: None,
         }
     }
 
-    /// `bubbler log <name>`, opened where the newest lines are.
-    fn run_log(name: &str) -> Self {
+    /// `bubbler log <name>`, opened where the newest lines are, headed by
+    /// the `outcome` of a start that failed.
+    fn run_log(name: &str, outcome: Option<String>) -> Self {
         Self::Capture {
             title: format!("last-run.log of {name}"),
             args: args(&["log", name]),
             explain: None,
             at_end: true,
+            outcome,
         }
     }
 }
@@ -294,6 +300,19 @@ impl App {
         }
     }
 
+    /// Show the run log of a start that failed at its end, headed by how
+    /// it ended, so a log the start left empty still says something.
+    pub fn show_failed_start(
+        &mut self,
+        title: impl Into<String>,
+        outcome: String,
+        log: Vec<String>,
+    ) {
+        let empty = log.is_empty().then(|| "the run log is empty".to_owned());
+        let lines = std::iter::once(outcome).chain(log).chain(empty).collect();
+        self.show(title, lines, None, true);
+    }
+
     /// Read the store again: the list, the profiles and the shims. The
     /// detail screen's buffer is not touched, which is what a save wants —
     /// the grants and lint columns are stale the moment a file is written.
@@ -336,21 +355,23 @@ impl App {
     }
 
     /// What a child started by `r` or `o` ending means: nothing when it
-    /// succeeded, else its run log — or, while a dialog is open, a word
-    /// on the status line, so the viewer does not take the screen from
-    /// under a prompt.
+    /// succeeded, else its run log — or, while a dialog or the help is
+    /// open, a word on the status line, so the viewer does not take the
+    /// screen from under them.
     pub fn exited(&mut self, name: &str, status: ExitStatus) -> Option<Action> {
         if status.success() {
             return None;
         }
-        if self.dialog.is_none() {
-            return Some(Action::run_log(name));
+        let outcome = match status.code() {
+            Some(code) => format!("`{name}` exited {code}"),
+            None => format!("`{name}` was killed by a signal"),
+        };
+        if self.dialog.is_some() || self.help {
+            self.say(format!("{outcome}; `L` shows why"));
+            return None;
         }
-        self.say(match status.code() {
-            Some(code) => format!("`{name}` exited {code}; `L` shows why"),
-            None => format!("`{name}` was killed by a signal; `L` shows why"),
-        });
-        None
+        self.say(outcome.clone());
+        Some(Action::run_log(name, Some(outcome)))
     }
 
     /// The offset of the viewer's last page over `lines` lines: the
@@ -500,7 +521,7 @@ impl App {
                 format!("lint {name}"),
                 args(&["lint", &name]),
             )),
-            KeyCode::Char('L') => Some(Action::run_log(&name)),
+            KeyCode::Char('L') => Some(Action::run_log(&name, None)),
             KeyCode::Char('X') => Some(explain_action(&Explain {
                 name,
                 full: false,
@@ -963,6 +984,7 @@ fn explain_action(explain: &Explain) -> Action {
         args: argv,
         explain: Some(explain.clone()),
         at_end: false,
+        outcome: None,
     }
 }
 
@@ -1441,12 +1463,35 @@ mod tests {
     fn a_start_that_failed_opens_its_run_log_at_the_end() {
         let (_tmp, mut app) = app();
         let log = press(&mut app, 'L').unwrap();
-        for status in [exit_code(1), killed_by(9)] {
+        assert!(matches!(&log, Action::Capture { outcome: None, .. }));
+        for (status, said) in [
+            (exit_code(1), "`ff` exited 1"),
+            (killed_by(9), "`ff` was killed by a signal"),
+        ] {
             let action = app.exited("ff", status).expect("the run log");
-            assert_eq!(action, log, "the capture `L` builds");
-            assert_eq!(argv(&action), ["log", "ff"]);
+            assert_eq!(argv(&action), argv(&log), "the command `L` runs");
             assert!(at_end(&action));
+            assert!(
+                matches!(&action, Action::Capture { outcome: Some(o), .. } if o == said),
+                "{action:?}"
+            );
+            assert_eq!(app.status, said);
         }
+    }
+
+    #[test]
+    fn a_failed_start_heads_its_run_log_with_how_it_ended() {
+        let (_tmp, mut app) = app();
+        let lines = |app: &App| app.viewer.as_ref().unwrap().lines.clone();
+        app.show_failed_start("last-run.log of ff", "`ff` exited 1".to_owned(), Vec::new());
+        assert_eq!(app.screen(), Screen::Viewer);
+        assert_eq!(lines(&app), ["`ff` exited 1", "the run log is empty"]);
+        app.show_failed_start(
+            "last-run.log of ff",
+            "`ff` exited 1".to_owned(),
+            vec!["no such file".to_owned()],
+        );
+        assert_eq!(lines(&app), ["`ff` exited 1", "no such file"]);
     }
 
     #[test]
@@ -1458,6 +1503,15 @@ mod tests {
         assert!(app.exited("ff", killed_by(15)).is_none());
         assert_eq!(app.status, "`ff` was killed by a signal; `L` shows why");
         assert!(app.dialog.is_some(), "the prompt is still up");
+    }
+
+    #[test]
+    fn a_start_that_failed_under_the_help_says_so_on_the_status_line() {
+        let (_tmp, mut app) = app();
+        press(&mut app, '?');
+        assert!(app.exited("ff", exit_code(2)).is_none());
+        assert_eq!(app.status, "`ff` exited 2; `L` shows why");
+        assert!(app.help, "the help is still up");
     }
 
     #[test]

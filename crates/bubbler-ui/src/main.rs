@@ -226,8 +226,14 @@ fn perform(
             args,
             explain,
             at_end,
+            outcome,
         } => match cli.captured(&args) {
             Ok(out) => {
+                if let Some(outcome) = outcome {
+                    app.show_failed_start(title, outcome, out.lines());
+                    app.reload();
+                    return Ok(());
+                }
                 let mut lines = out.lines();
                 if !out.status.success() && lines.is_empty() {
                     lines.push(match out.status.code() {
