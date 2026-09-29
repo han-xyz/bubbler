@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.23.3
+
+### Fixed
+
+- A bus address that points into bubbler's own runtime directory is refused
+  again on a host without `xdg-dbus-proxy`: 0.23.2's check for the missing
+  proxy ran first and reported the package instead of the refusal.
+
 ## 0.23.2
 
 ### Fixed
