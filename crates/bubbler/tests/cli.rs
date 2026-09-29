@@ -11605,27 +11605,30 @@ fn run_without_a_terminal_leaves_its_errors_in_the_log_that_log_prints() {
 }
 
 #[test]
-fn run_dry_run_without_a_terminal_writes_no_log() {
+fn run_dry_run_or_explain_without_a_terminal_writes_no_log() {
     let tmp = setup();
     write_profile(tmp.path(), "user", "app", "command \"/usr/bin/true\"\n");
     bubbler(tmp.path())
         .args(["create", "t", "--profile", "app"])
         .status()
         .unwrap();
-    let out = bubbler(tmp.path())
-        .args(["run", "--dry-run", "t"])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        !tmp.path()
-            .join("data/bubbler/instances/t/last-run.log")
-            .exists()
-    );
+    for flag in ["--dry-run", "--explain"] {
+        let out = bubbler(tmp.path())
+            .args(["run", "t", flag])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{flag}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !tmp.path()
+                .join("data/bubbler/instances/t/last-run.log")
+                .exists(),
+            "{flag}"
+        );
+    }
 }
 
 #[test]
@@ -11669,8 +11672,83 @@ fn real_bwrap_run_into_a_live_instance_adds_to_its_log() {
     let text = std::fs::read_to_string(&log).unwrap();
     assert_eq!(text.matches("executing inside it").count(), 2, "{text}");
 
+    // A child the command leaves behind on the caller's own descriptors
+    // writes to that stderr after bubbler has gone, not to a copy that
+    // went with it.
+    let out = bubbler_live(tmp.path(), &init)
+        .args([
+            "run",
+            "t",
+            "--tty",
+            "passthrough",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            "(/usr/bin/sleep 2; echo late >&2) &",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("late"), "{err}");
+
     kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
     let _ = run.wait();
+}
+
+#[test]
+fn run_with_a_terminal_on_any_descriptor_leaves_the_log_alone() {
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "bluetooth\n").unwrap();
+    let pty = test_pty();
+    let out = bubbler(tmp.path())
+        .args(["run", "t"])
+        .stdin(pty.stdio())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("unknown node `bluetooth`"), "{err}");
+    assert!(
+        !tmp.path()
+            .join("data/bubbler/instances/t/last-run.log")
+            .exists(),
+        "the log was written with a terminal on stdin"
+    );
+}
+
+#[test]
+fn run_whose_log_cannot_be_opened_warns_and_runs_on() {
+    let tmp = setup();
+    write_profile(tmp.path(), "user", "app", "command \"/usr/bin/true\"\n");
+    bubbler(tmp.path())
+        .args(["create", "t", "--profile", "app"])
+        .status()
+        .unwrap();
+    let log = tmp.path().join("data/bubbler/instances/t/last-run.log");
+    let elsewhere = tmp.path().join("elsewhere");
+    std::os::unix::fs::symlink(&elsewhere, &log).unwrap();
+    let mut cmd = bubbler(tmp.path());
+    cmd.args(["run", "t"]);
+    let sandboxed = require_bwrap();
+    if let (true, Some(init)) = (sandboxed, real_init()) {
+        cmd.env("BUBBLER_INIT", init);
+    }
+    let out = cmd.output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("no log for this run"), "{err}");
+    assert!(err.contains("last-run.log"), "{err}");
+    assert!(!elsewhere.exists(), "the symlink was followed");
+    if sandboxed && real_init().is_some() {
+        assert!(out.status.success(), "{err}");
+    } else {
+        assert!(
+            err.contains("bubbler-init") || err.contains("bwrap"),
+            "{err}"
+        );
+    }
 }
 
 /// A log is the sandbox's own output, so printing it is bubbler handing

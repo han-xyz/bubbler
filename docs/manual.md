@@ -147,10 +147,10 @@ the same way, but as a copy: its stderr still goes where it went, while `open`
 sends it to the log instead. The log is opened before the config is read, so
 a `config.kdl` that stopped the run is in it too, and a log that cannot be
 opened at all — a symlink where the file belongs — costs the record rather
-than the run: bubbler says so and starts the sandbox anyway. Printed to a terminal, the log has its control characters
-shown (`^[`) rather than sent, so reading what a sandbox wrote is not letting
-it write to your terminal a second time; down a pipe it is the log, byte for
-byte. See "Desktop entries".
+than the run: bubbler says so and starts the sandbox anyway. Printed to a
+terminal, the log has its control characters shown (`^[`) rather than sent,
+so reading what a sandbox wrote is not letting it write to your terminal a
+second time; down a pipe it is the log, byte for byte. See "Desktop entries".
 
 A run is a chain of processes; `bubbler` waits at the top of it and returns the
 command's status.
@@ -3496,8 +3496,11 @@ The host terminal does not enter the sandbox. For each of bubbler's own fds
 a pseudoterminal bubbler allocated and relay between the two; an fd that is
 not a terminal — a pipe, a redirect — is passed through unchanged, so a
 piped `bubbler run t -- cat` still reads the pipe and a redirected
-`bubbler run t` still writes the file. A pty is allocated only when at least
-one of the three is a terminal. The mode is the `tty` node in `config.kdl` and
+`bubbler run t` still writes the file. The exception is fd 2 when none of the
+three is a terminal: a sandbox that `run` starts then writes its stderr to
+bubbler's copy into `last-run.log`, which passes it on to the file, so under
+`2>&1` its lines can arrive out of order with stdout's. A pty is allocated
+only when at least one of the three is a terminal. The mode is the `tty` node in `config.kdl` and
 `--tty <mode>` on `run`, `exec` and `try`, which wins over it:
 
     pty          the default, described above

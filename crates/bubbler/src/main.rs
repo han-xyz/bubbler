@@ -613,8 +613,8 @@ as clean. The checks are listed in bubbler-config(5).")]
 
 fn main() -> ExitCode {
     // The guard lives here and not inside the run so that the error a
-    // failed run ends with is written to the log as well; `open` is the
-    // only subcommand that ever fills it in.
+    // failed run ends with is written to the log as well; `open` and
+    // `run` are the only subcommands that ever fill it in.
     let mut log = None;
     let code = match real_main(&mut log) {
         Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
@@ -1219,18 +1219,25 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             // Before the config is read, and connected first so a run
             // into a live sandbox adds to its log, the way `open` does;
             // unlike `open`, the run's stderr still goes where it went.
+            // The stream is kept, so the log is emptied or added to on the
+            // same answer the run then acts on.
             let starts = !dry_run && explain_mode.is_none();
+            let mut probed = None;
             if starts && !tty::host_is_tty().iter().any(|t| *t) {
-                let config = instance::config_path_checked(&env, &name)
-                    .with_context(|| format!("opening instance `{name}`"))?;
-                let running = exec::connect(&env, &name)
-                    .with_context(|| format!("connecting to instance `{name}`"))?
-                    .is_some();
+                let config = instance::config_path_checked(&env, &name).with_context(|| {
+                    format!(
+                        "opening instance `{name}` ({})",
+                        instance::config_path(&env, &name).display()
+                    )
+                })?;
+                let stream = exec::connect(&env, &name)
+                    .with_context(|| format!("connecting to instance `{name}`"))?;
                 *log = open_log(
                     run_log::tee,
                     &config.with_file_name(run_log::LOG_FILE),
-                    !running,
+                    stream.is_none(),
                 );
+                probed = Some(stream);
             }
             let mut inst = Instance::open(&env, &name).with_context(|| {
                 format!(
@@ -1292,9 +1299,12 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                 lines.extend(argv.iter().map(OsString::as_os_str));
                 return print_lines(&lines, "the bwrap argv");
             }
-            if let Some(stream) = exec::connect(&env, &name)
-                .with_context(|| format!("connecting to instance `{name}`"))?
-            {
+            let stream = match probed {
+                Some(stream) => stream,
+                None => exec::connect(&env, &name)
+                    .with_context(|| format!("connecting to instance `{name}`"))?,
+            };
+            if let Some(stream) = stream {
                 // Asked again on this connection, not only on the probe
                 // above: an instance that came up in between is a live
                 // sandbox the share would be missing from just the same.
@@ -1306,7 +1316,17 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                      (config changes apply after restart)"
                 );
                 let command = launcher::resolve_command(&inst, command)?;
-                return exec::run_in(&stream, command, mode)
+                // The command gets the caller's own stderr, not the copy
+                // into the log: a child it leaves behind would hold that
+                // copy's pipe past this run, which ends it.
+                let mut host = tty::host_stdio()?;
+                if let Some(redirect) = log.as_ref() {
+                    host[2] = redirect
+                        .original_stderr()
+                        .try_clone_to_owned()
+                        .context("duplicating stderr")?;
+                }
+                return exec::run_in_with(&stream, command, mode, host)
                     .with_context(|| format!("executing in instance `{name}`"));
             }
             if inst.has_service(&Service::X11(X11Mode::Host)) {

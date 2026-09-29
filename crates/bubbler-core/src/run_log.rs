@@ -18,7 +18,7 @@
 //! into a process that has no business holding it.
 
 use std::io::{self, Read, Write};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::Duration;
@@ -159,6 +159,15 @@ fn start(path: &Path, truncate: bool, keep_stderr: bool) -> Result<Redirect, Lau
     })
 }
 
+impl Redirect {
+    /// The stderr the caller had before fd 2 was pointed at the log: what
+    /// a command that may outlive this run is handed, so nothing it writes
+    /// later depends on a copy that ends with the run.
+    pub fn original_stderr(&self) -> BorrowedFd<'_> {
+        self.saved.as_fd()
+    }
+}
+
 impl Drop for Redirect {
     fn drop(&mut self) {
         // Both copies of the write end have to go before the reader sees
@@ -186,15 +195,20 @@ impl Drop for Redirect {
 /// write rather than counted here, so whatever another writer has
 /// appended in the meantime counts against the same cap.
 ///
-/// `stderr`, when given, is sent every byte read, past the cap too, until
-/// a write to it fails.
+/// `stderr`, when given, is sent every byte read, past the cap too, after
+/// the file has had its share: a stderr nobody reads blocks the copy, and
+/// the record is what matters then. A stderr whose reader has gone is given
+/// up on; any other failure there costs that chunk. With a `stderr`, a file
+/// that fails is given up on and the copy goes on, since the caller's own
+/// stderr is what the run was promised.
 fn copy_capped(
     mut src: impl Read,
-    mut dst: impl Write,
+    dst: impl Write,
     mut size: impl FnMut() -> io::Result<u64>,
     mut stderr: Option<&mut dyn Write>,
 ) -> io::Result<()> {
-    let note = NOTE.len() as u64;
+    let teeing = stderr.is_some();
+    let mut dst = Some(dst);
     let mut noted = false;
     let mut buf = [0u8; 8192];
     loop {
@@ -204,27 +218,48 @@ fn copy_capped(
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         };
+        if let Some(file) = dst.as_mut()
+            && let Err(e) = append_capped(file, &buf[..read], &mut size, &mut noted)
+        {
+            if !teeing {
+                return Err(e);
+            }
+            dst = None;
+        }
         if let Some(out) = stderr.as_mut()
-            && out.write_all(&buf[..read]).is_err()
+            && let Err(e) = out.write_all(&buf[..read])
+            && e.kind() == io::ErrorKind::BrokenPipe
         {
             stderr = None;
         }
-        // The note is kept out of the room for output, so writing it is
-        // never what takes the file over the cap.
-        let room = MAX_BYTES.saturating_sub(size()?);
-        let take = usize::try_from(room.saturating_sub(note))
-            .unwrap_or(usize::MAX)
-            .min(read);
-        if take > 0 {
-            dst.write_all(&buf[..take])?;
-        }
-        if take < read && !noted {
-            noted = true;
-            if room >= note {
-                dst.write_all(NOTE.as_bytes())?;
-            }
+    }
+}
+
+/// Write what of `chunk` fits under [`MAX_BYTES`] to `dst`, and the note
+/// the first time something does not.
+fn append_capped(
+    mut dst: impl Write,
+    chunk: &[u8],
+    size: &mut impl FnMut() -> io::Result<u64>,
+    noted: &mut bool,
+) -> io::Result<()> {
+    let note = NOTE.len() as u64;
+    // The note is kept out of the room for output, so writing it is
+    // never what takes the file over the cap.
+    let room = MAX_BYTES.saturating_sub(size()?);
+    let take = usize::try_from(room.saturating_sub(note))
+        .unwrap_or(usize::MAX)
+        .min(chunk.len());
+    if take > 0 {
+        dst.write_all(&chunk[..take])?;
+    }
+    if take < chunk.len() && !*noted {
+        *noted = true;
+        if room >= note {
+            dst.write_all(NOTE.as_bytes())?;
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -246,12 +281,31 @@ mod tests {
         out.into_inner()
     }
 
-    /// An original stderr whose reader has gone.
-    struct Closed;
+    /// A destination every write to fails with this kind: `BrokenPipe` is
+    /// a stderr whose reader has gone, `StorageFull` a log on a full disk.
+    struct Failing(io::ErrorKind);
 
-    impl Write for Closed {
+    impl Write for Failing {
         fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-            Err(io::ErrorKind::BrokenPipe.into())
+            Err(self.0.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A stderr whose first write fails with `WouldBlock` and whose later
+    /// writes land.
+    struct FailsOnce(bool, Vec<u8>);
+
+    impl Write for FailsOnce {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if !self.0 {
+                self.0 = true;
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            self.1.extend_from_slice(buf);
+            Ok(buf.len())
         }
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
@@ -280,10 +334,46 @@ mod tests {
             &b"hello"[..],
             Shared(&out),
             || Ok(out.borrow().len() as u64),
-            Some(&mut Closed),
+            Some(&mut Failing(io::ErrorKind::BrokenPipe)),
         )
         .unwrap();
         assert_eq!(out.into_inner(), b"hello");
+
+        // Any other failure costs that chunk only.
+        let out = std::cell::RefCell::new(Vec::new());
+        let mut stderr = FailsOnce(false, Vec::new());
+        copy_capped(
+            (&b"one"[..]).chain(&b"two"[..]),
+            Shared(&out),
+            || Ok(out.borrow().len() as u64),
+            Some(&mut stderr),
+        )
+        .unwrap();
+        assert_eq!(stderr.1, b"two");
+        assert_eq!(out.into_inner(), b"onetwo");
+    }
+
+    #[test]
+    fn a_tee_whose_log_fails_keeps_giving_stderr_everything() {
+        let mut stderr = Vec::new();
+        copy_capped(
+            (&b"one"[..]).chain(&b"two"[..]),
+            Failing(io::ErrorKind::StorageFull),
+            || Ok(0),
+            Some(&mut stderr),
+        )
+        .unwrap();
+        assert_eq!(stderr, b"onetwo");
+
+        let mut stderr = Vec::new();
+        copy_capped(
+            (&b"one"[..]).chain(&b"two"[..]),
+            Vec::new(),
+            || Err(io::ErrorKind::Other.into()),
+            Some(&mut stderr),
+        )
+        .unwrap();
+        assert_eq!(stderr, b"onetwo");
     }
 
     /// A destination the size closure can read the length of, which is

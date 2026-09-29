@@ -195,8 +195,18 @@ pub fn run_in(
     argv: &[OsString],
     mode: tty::TtyMode,
 ) -> Result<i32, LaunchError> {
+    run_in_with(stream, argv, mode, tty::host_stdio()?)
+}
+
+/// [`run_in`] with `host` standing in for bubbler's own stdin, stdout and
+/// stderr: what the command is handed and what its output is relayed to.
+pub fn run_in_with(
+    stream: &UnixStream,
+    argv: &[OsString],
+    mode: tty::TtyMode,
+    host: [OwnedFd; 3],
+) -> Result<i32, LaunchError> {
     let refs: Vec<&OsStr> = argv.iter().map(|a| a.as_os_str()).collect();
-    let host = tty::host_stdio()?;
     let is_tty = tty::host_is_tty();
     let mut plan = tty::plan(mode, is_tty);
     // The pty copies the first terminal bubbler has, and is allocated
