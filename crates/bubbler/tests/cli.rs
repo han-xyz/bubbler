@@ -11692,6 +11692,25 @@ fn real_bwrap_run_into_a_live_instance_adds_to_its_log() {
     assert!(out.status.success(), "{err}");
     assert!(err.contains("late"), "{err}");
 
+    // Under `--tty none` the command writes to a pipe bubbler reads, so
+    // its stderr goes through the copy into the log.
+    let out = bubbler_live(tmp.path(), &init)
+        .args([
+            "run",
+            "t",
+            "--tty",
+            "none",
+            "--",
+            "/usr/bin/sh",
+            "-c",
+            "echo inner >&2",
+        ])
+        .output()
+        .unwrap();
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("inner"), "{text}");
+
     kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
     let _ = run.wait();
 }
@@ -11732,8 +11751,8 @@ fn run_whose_log_cannot_be_opened_warns_and_runs_on() {
     std::os::unix::fs::symlink(&elsewhere, &log).unwrap();
     let mut cmd = bubbler(tmp.path());
     cmd.args(["run", "t"]);
-    let sandboxed = require_bwrap();
-    if let (true, Some(init)) = (sandboxed, real_init()) {
+    let init = if require_bwrap() { real_init() } else { None };
+    if let Some(init) = &init {
         cmd.env("BUBBLER_INIT", init);
     }
     let out = cmd.output().unwrap();
@@ -11741,13 +11760,11 @@ fn run_whose_log_cannot_be_opened_warns_and_runs_on() {
     assert!(err.contains("no log for this run"), "{err}");
     assert!(err.contains("last-run.log"), "{err}");
     assert!(!elsewhere.exists(), "the symlink was followed");
-    if sandboxed && real_init().is_some() {
+    if init.is_some() {
         assert!(out.status.success(), "{err}");
     } else {
-        assert!(
-            err.contains("bubbler-init") || err.contains("bwrap"),
-            "{err}"
-        );
+        let (_, after) = err.split_once("no log for this run").unwrap();
+        assert!(after.contains("running instance `t`"), "{err}");
     }
 }
 

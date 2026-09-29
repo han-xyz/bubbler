@@ -40,6 +40,9 @@ pub const MAX_BYTES: u64 = 1 << 20;
 /// Written once, in place of the output that no longer fits.
 const NOTE: &str = "\nbubbler: log full; the rest of this run's output was dropped\n";
 
+/// Tried once when a tee's log fails, so a cut-off record reads as one.
+const STOPPED: &str = "\nbubbler: writing the log failed; the record of this run stops here\n";
+
 /// How long a [`Redirect`] waits for the copying thread on the way out. A
 /// sidecar that outlived the run still holds the pipe open, and giving up
 /// costs the last few lines, never the exit.
@@ -199,8 +202,9 @@ impl Drop for Redirect {
 /// the file has had its share: a stderr nobody reads blocks the copy, and
 /// the record is what matters then. A stderr whose reader has gone is given
 /// up on; any other failure there costs that chunk. With a `stderr`, a file
-/// that fails is given up on and the copy goes on, since the caller's own
-/// stderr is what the run was promised.
+/// that fails is given one try at a note saying so, then given up on while
+/// the copy goes on, since the caller's own stderr is what the run was
+/// promised.
 fn copy_capped(
     mut src: impl Read,
     dst: impl Write,
@@ -219,11 +223,13 @@ fn copy_capped(
             Err(e) => return Err(e),
         };
         if let Some(file) = dst.as_mut()
-            && let Err(e) = append_capped(file, &buf[..read], &mut size, &mut noted)
+            && let Err(e) = append_capped(&mut *file, &buf[..read], &mut size, &mut noted)
         {
             if !teeing {
                 return Err(e);
             }
+            // The log just failed, so the note may not land either.
+            let _ = file.write_all(STOPPED.as_bytes());
             dst = None;
         }
         if let Some(out) = stderr.as_mut()
@@ -374,6 +380,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stderr, b"onetwo");
+
+        // A log that fails after taking some output says where it stopped.
+        let out = std::cell::RefCell::new(Vec::new());
+        let mut stderr = Vec::new();
+        copy_capped(
+            (&b"one"[..]).chain(&b"two"[..]),
+            Shared(&out),
+            || match out.borrow().len() {
+                0 => Ok(0),
+                _ => Err(io::ErrorKind::Other.into()),
+            },
+            Some(&mut stderr),
+        )
+        .unwrap();
+        assert_eq!(stderr, b"onetwo");
+        assert_eq!(out.into_inner(), [b"one", STOPPED.as_bytes()].concat());
     }
 
     /// A destination the size closure can read the length of, which is

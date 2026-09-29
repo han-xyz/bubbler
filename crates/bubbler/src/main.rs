@@ -1316,11 +1316,14 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                      (config changes apply after restart)"
                 );
                 let command = launcher::resolve_command(&inst, command)?;
-                // The command gets the caller's own stderr, not the copy
-                // into the log: a child it leaves behind would hold that
-                // copy's pipe past this run, which ends it.
+                // A command handed fd 2 gets the caller's own stderr, not
+                // the copy into the log: a child it leaves behind would hold
+                // that copy's pipe past this run, which ends it. Under
+                // `none` it writes to a pipe bubbler pumps into the copy.
                 let mut host = tty::host_stdio()?;
-                if let Some(redirect) = log.as_ref() {
+                if let Some(redirect) = log.as_ref()
+                    && mode != TtyMode::None
+                {
                     host[2] = redirect
                         .original_stderr()
                         .try_clone_to_owned()
