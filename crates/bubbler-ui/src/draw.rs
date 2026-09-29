@@ -1095,7 +1095,12 @@ mod tests {
     #[test]
     fn a_report_is_shown_as_it_was_printed() {
         let (_tmp, mut app) = list_editor();
-        app.show("lint ff", vec!["one".to_owned(), "two".to_owned()], None);
+        app.show(
+            "lint ff",
+            vec!["one".to_owned(), "two".to_owned()],
+            None,
+            false,
+        );
         assert_eq!(
             screen(&app, 80, 8),
             [
@@ -1109,6 +1114,17 @@ mod tests {
                 "j/k scroll  f full  p proxy  Esc back",
             ]
         );
+    }
+
+    #[test]
+    fn a_viewer_opened_at_its_end_shows_the_last_page() {
+        let (_tmp, mut app) = list_editor();
+        app.page = 4;
+        let lines = (1..=10).map(|i| format!("line {i}")).collect();
+        app.show("last-run.log of ff", lines, None, true);
+        let shown = screen(&app, 80, 8);
+        assert!(shown[2].starts_with("│line 7 "), "{shown:?}");
+        assert!(shown[5].starts_with("│line 10 "), "{shown:?}");
     }
 
     /// A key and what it does, on one line with only spaces between

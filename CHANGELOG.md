@@ -8,6 +8,11 @@
   the run log (`last-run.log`) that `bubbler log` prints; `open` sends it there
   instead.
 
+### Added
+
+- `bubbler ui` opens the run log of an instance it started with `r` or `o`
+  that fails, at its end; `L` opens it at its end too.
+
 ## 0.23.3
 
 ### Fixed

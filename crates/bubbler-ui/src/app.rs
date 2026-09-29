@@ -6,6 +6,7 @@
 //! deleted home — is spent by the loop in `main`.
 
 use std::ffi::OsString;
+use std::process::ExitStatus;
 
 use bubbler_core::env::Env;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -22,7 +23,12 @@ pub enum Action {
     /// Start it in a session of its own with no terminal, and come
     /// straight back: `run` and `open`, so the editor stays up and the
     /// live column catches up on the next tick.
-    Detached(Vec<OsString>),
+    Detached {
+        /// The instance it starts, so a failure can be traced back to it.
+        name: String,
+        /// The command line.
+        args: Vec<OsString>,
+    },
     /// Leave the alternate screen, hand the terminal over, and come back
     /// when it exits: `exec`, `try`, `edit`.
     Attached(Vec<OsString>),
@@ -35,6 +41,8 @@ pub enum Action {
         /// Which explanation this is, when it is one, so `f` and `p` can
         /// ask for another.
         explain: Option<Explain>,
+        /// Open the viewer on its last page rather than its first.
+        at_end: bool,
     },
     /// Read the store again.
     Reload,
@@ -49,6 +57,17 @@ impl Action {
             title: title.into(),
             args,
             explain: None,
+            at_end: false,
+        }
+    }
+
+    /// `bubbler log <name>`, opened where the newest lines are.
+    fn run_log(name: &str) -> Self {
+        Self::Capture {
+            title: format!("last-run.log of {name}"),
+            args: args(&["log", name]),
+            explain: None,
+            at_end: true,
         }
     }
 }
@@ -253,11 +272,21 @@ impl App {
     }
 
     /// Show `lines` in the viewer, pushing it if it is not already up.
-    pub fn show(&mut self, title: impl Into<String>, lines: Vec<String>, explain: Option<Explain>) {
+    pub fn show(
+        &mut self,
+        title: impl Into<String>,
+        lines: Vec<String>,
+        explain: Option<Explain>,
+        at_end: bool,
+    ) {
+        let offset = match at_end {
+            true => self.last_page(lines.len()),
+            false => 0,
+        };
         self.viewer = Some(Viewer {
             title: title.into(),
             lines,
-            offset: 0,
+            offset,
             explain,
         });
         if self.screen() != Screen::Viewer {
@@ -304,6 +333,31 @@ impl App {
                 self.say(format!("instance `{name}`: {e}"));
             }
         }
+    }
+
+    /// What a child started by `r` or `o` ending means: nothing when it
+    /// succeeded, else its run log — or, while a dialog is open, a word
+    /// on the status line, so the viewer does not take the screen from
+    /// under a prompt.
+    pub fn exited(&mut self, name: &str, status: ExitStatus) -> Option<Action> {
+        if status.success() {
+            return None;
+        }
+        if self.dialog.is_none() {
+            return Some(Action::run_log(name));
+        }
+        self.say(match status.code() {
+            Some(code) => format!("`{name}` exited {code}; `L` shows why"),
+            None => format!("`{name}` was killed by a signal; `L` shows why"),
+        });
+        None
+    }
+
+    /// The offset of the viewer's last page over `lines` lines: the
+    /// viewer scrolls by what it can show rather than by rows in a list,
+    /// so this is the last page and not the last line on its own.
+    fn last_page(&self, lines: usize) -> usize {
+        lines.saturating_sub(self.page.max(1))
     }
 
     /// Probe every instance's socket again, which is all a tick does.
@@ -408,12 +462,14 @@ impl App {
                 None
             }
             KeyCode::Char('r') => {
-                self.say(format!("started `{name}`; nothing of its output is kept"));
-                Some(Action::Detached(args(&["run", &name, "--tty", "none"])))
+                self.say(format!("started `{name}`; `L` shows what it wrote"));
+                let args = args(&["run", &name, "--tty", "none"]);
+                Some(Action::Detached { name, args })
             }
             KeyCode::Char('o') => {
                 self.say(format!("opened `{name}`; `L` shows what it wrote"));
-                Some(Action::Detached(args(&["open", &name])))
+                let args = args(&["open", &name]);
+                Some(Action::Detached { name, args })
             }
             KeyCode::Char('x') => {
                 self.ask(
@@ -444,10 +500,7 @@ impl App {
                 format!("lint {name}"),
                 args(&["lint", &name]),
             )),
-            KeyCode::Char('L') => Some(Action::capture(
-                format!("last-run.log of {name}"),
-                args(&["log", &name]),
-            )),
+            KeyCode::Char('L') => Some(Action::run_log(&name)),
             KeyCode::Char('X') => Some(explain_action(&Explain {
                 name,
                 full: false,
@@ -670,14 +723,8 @@ impl App {
     }
 
     fn viewer_key(&mut self, key: KeyEvent) -> Option<Action> {
-        // The viewer scrolls by what it can show rather than by rows in a
-        // list, so `G` is the last page and not the last line on its own.
         let page = self.page.max(1);
-        let last = self
-            .viewer
-            .as_ref()
-            .map_or(0, |v| v.lines.len())
-            .saturating_sub(page);
+        let last = self.last_page(self.viewer.as_ref().map_or(0, |v| v.lines.len()));
         let at = self.viewer.as_ref()?.offset;
         let scrolled = match key.code {
             KeyCode::Char('j') | KeyCode::Down => Some((at + 1).min(last)),
@@ -915,6 +962,7 @@ fn explain_action(explain: &Explain) -> Action {
         title: format!("explain {}", explain.name),
         args: argv,
         explain: Some(explain.clone()),
+        at_end: false,
     }
 }
 
@@ -1021,6 +1069,8 @@ mod tests {
     use crate::fixture;
     use bubbler_core::env::Env;
     use ratatui::crossterm::event::KeyCode;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
 
     /// An editor over a store holding `ff`, seeded from `generic`.
     fn app() -> (tempfile::TempDir, App) {
@@ -1056,7 +1106,7 @@ mod tests {
     /// The command line an action names, as strings.
     fn argv(action: &Action) -> Vec<String> {
         let args = match action {
-            Action::Detached(args) | Action::Attached(args) => args,
+            Action::Detached { args, .. } | Action::Attached(args) => args,
             Action::Capture { args, .. } => args,
             Action::Reload | Action::Quit => return Vec::new(),
         };
@@ -1070,10 +1120,10 @@ mod tests {
         let (_tmp, mut app) = app();
         let run = press(&mut app, 'r').unwrap();
         assert_eq!(argv(&run), ["run", "ff", "--tty", "none"]);
-        assert!(matches!(run, Action::Detached(_)));
+        assert!(matches!(&run, Action::Detached { name, .. } if name == "ff"));
         let open = press(&mut app, 'o').unwrap();
         assert_eq!(argv(&open), ["open", "ff"]);
-        assert!(matches!(open, Action::Detached(_)));
+        assert!(matches!(&open, Action::Detached { name, .. } if name == "ff"));
         press(&mut app, 'x');
         clear(&mut app);
         let exec = typed(&mut app, "/bin/sh -l").unwrap();
@@ -1171,14 +1221,14 @@ mod tests {
         let Action::Capture { title, explain, .. } = action else {
             panic!("an explanation is a viewer");
         };
-        app.show(title, vec!["bwrap".to_owned()], explain);
+        app.show(title, vec!["bwrap".to_owned()], explain, false);
         assert_eq!(app.screen(), Screen::Viewer);
         let full = press(&mut app, 'f').unwrap();
         assert_eq!(argv(&full), ["run", "ff", "--explain", "full"]);
         let Action::Capture { title, explain, .. } = full else {
             panic!("still an explanation");
         };
-        app.show(title, vec!["bwrap".to_owned()], explain);
+        app.show(title, vec!["bwrap".to_owned()], explain, false);
         let proxy = press(&mut app, 'p').unwrap();
         assert_eq!(
             argv(&proxy),
@@ -1359,7 +1409,7 @@ mod tests {
         let (_tmp, mut app) = app();
         app.page = 5;
         let lines: Vec<String> = (0..20).map(|i| i.to_string()).collect();
-        app.show("long", lines, None);
+        app.show("long", lines, None, false);
         press(&mut app, 'G');
         let offset = |app: &App| app.viewer.as_ref().unwrap().offset;
         assert_eq!(offset(&app), 15, "the last page, not the last line");
@@ -1373,6 +1423,65 @@ mod tests {
         assert_eq!(offset(&app), 0);
         press(&mut app, 'k');
         assert_eq!(offset(&app), 0);
+    }
+
+    fn exit_code(code: i32) -> ExitStatus {
+        ExitStatus::from_raw(code << 8)
+    }
+
+    fn killed_by(signal: i32) -> ExitStatus {
+        ExitStatus::from_raw(signal)
+    }
+
+    fn at_end(action: &Action) -> bool {
+        matches!(action, Action::Capture { at_end: true, .. })
+    }
+
+    #[test]
+    fn a_start_that_failed_opens_its_run_log_at_the_end() {
+        let (_tmp, mut app) = app();
+        let log = press(&mut app, 'L').unwrap();
+        for status in [exit_code(1), killed_by(9)] {
+            let action = app.exited("ff", status).expect("the run log");
+            assert_eq!(action, log, "the capture `L` builds");
+            assert_eq!(argv(&action), ["log", "ff"]);
+            assert!(at_end(&action));
+        }
+    }
+
+    #[test]
+    fn a_start_that_failed_under_a_dialog_says_so_on_the_status_line() {
+        let (_tmp, mut app) = app();
+        press(&mut app, 'd');
+        assert!(app.exited("ff", exit_code(2)).is_none());
+        assert_eq!(app.status, "`ff` exited 2; `L` shows why");
+        assert!(app.exited("ff", killed_by(15)).is_none());
+        assert_eq!(app.status, "`ff` was killed by a signal; `L` shows why");
+        assert!(app.dialog.is_some(), "the prompt is still up");
+    }
+
+    #[test]
+    fn a_start_that_succeeded_changes_nothing() {
+        let (_tmp, mut app) = app();
+        app.say("before");
+        assert!(app.exited("ff", exit_code(0)).is_none());
+        assert_eq!(app.status, "before");
+        assert_eq!(app.screen(), Screen::Instances);
+    }
+
+    #[test]
+    fn only_the_run_log_opens_at_its_end() {
+        let (_tmp, mut app) = app();
+        assert!(at_end(&press(&mut app, 'L').unwrap()));
+        assert!(!at_end(&press(&mut app, 'l').unwrap()));
+        assert!(!at_end(&press(&mut app, 'X').unwrap()));
+    }
+
+    #[test]
+    fn a_run_says_where_its_output_went() {
+        let (_tmp, mut app) = app();
+        press(&mut app, 'r');
+        assert_eq!(app.status, "started `ff`; `L` shows what it wrote");
     }
 
     #[test]

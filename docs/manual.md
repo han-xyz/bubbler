@@ -2839,8 +2839,10 @@ anywhere. `run` and `open` are started detached: a process group of their own, s
 meant for the editor is not sent to them, and `/dev/null` for stdio, so they
 hold no descriptor of this terminal. It is a new process group and not a new
 session — they stay in the editor's session, under its controlling terminal —
-and the state column catches up on the next second's probe. `exec`, `try` and
-the editors take the terminal instead: the editor leaves raw mode and the
+and the state column catches up on the next second's probe. Both leave the
+run log that `L` shows, and one that fails — a non-zero exit or a signal —
+opens it in the viewer at its end, or says so on the status line while a
+prompt is open. `exec`, `try` and the editors take the terminal instead: the editor leaves raw mode and the
 alternate screen first, and takes them back when the command exits, without
 asking the terminal anything on the way in or out.
 

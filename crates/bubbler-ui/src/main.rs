@@ -19,7 +19,7 @@ mod term;
 mod fixture;
 
 use std::io::{IsTerminal, Write};
-use std::process::{Child, ExitCode};
+use std::process::{Child, ExitCode, ExitStatus};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -114,7 +114,7 @@ fn event_loop(
     cli: &Cli,
     stop: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
-    let mut started: Vec<Child> = Vec::new();
+    let mut started: Vec<(String, Child)> = Vec::new();
     while !app.quit {
         // What a page is, for the viewer: the body between the header,
         // the footer and the viewer's own border.
@@ -123,6 +123,14 @@ fn event_loop(
             .context("asking the terminal its size")?
             .height;
         app.page = usize::from(height.saturating_sub(4)).max(1);
+        // A sandbox started from here is nobody's to wait for, but its
+        // exit status is this process's to collect, and a failed one is
+        // the user's to see before the frame is drawn.
+        for (name, status) in reap(&mut started) {
+            if let Some(action) = app.exited(&name, status) {
+                perform(terminal, app, cli, action, &mut started)?;
+            }
+        }
         terminal
             .draw(|frame| {
                 frame.render_widget(&*app, frame.area());
@@ -134,9 +142,6 @@ fn event_loop(
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        // A sandbox started from here is nobody's to wait for, but its
-        // exit status is this process's to collect.
-        started.retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
         let ready = match event::poll(TICK) {
             Ok(ready) => ready,
             // A signal interrupted the wait; the flag above says whether
@@ -162,13 +167,27 @@ fn event_loop(
     Ok(())
 }
 
+/// Take the children that have ended out of `started`, with how each
+/// ended.
+fn reap(started: &mut Vec<(String, Child)>) -> Vec<(String, ExitStatus)> {
+    let mut ended = Vec::new();
+    started.retain_mut(|(name, child)| match child.try_wait() {
+        Ok(Some(status)) => {
+            ended.push((name.clone(), status));
+            false
+        }
+        _ => true,
+    });
+    ended
+}
+
 /// Spend what a keystroke asked for.
 fn perform(
     terminal: &mut Term,
     app: &mut App,
     cli: &Cli,
     action: Action,
-    started: &mut Vec<Child>,
+    started: &mut Vec<(String, Child)>,
 ) -> Result<()> {
     match action {
         Action::Quit => app.quit = true,
@@ -176,8 +195,8 @@ fn perform(
             app.reload();
             app.say("read the store again");
         }
-        Action::Detached(args) => match cli.detached(&args) {
-            Ok(child) => started.push(child),
+        Action::Detached { name, args } => match cli.detached(&args) {
+            Ok(child) => started.push((name, child)),
             Err(e) => app.say(format!("could not start it: {e}")),
         },
         Action::Attached(args) => {
@@ -206,6 +225,7 @@ fn perform(
             title,
             args,
             explain,
+            at_end,
         } => match cli.captured(&args) {
             Ok(out) => {
                 let mut lines = out.lines();
@@ -216,10 +236,11 @@ fn perform(
                     });
                 }
                 // A one-line answer — a path written, an instance gone —
-                // is the status line's, not a screen of its own.
-                match (lines.len() > 1, explain) {
+                // is the status line's, not a screen of its own. A run log
+                // is always a screen: its one line is why a start failed.
+                match (lines.len() > 1 || at_end, explain) {
                     (false, None) => app.say(lines.first().cloned().unwrap_or(title)),
-                    (_, explain) => app.show(title, lines, explain),
+                    (_, explain) => app.show(title, lines, explain, at_end),
                 }
                 app.reload();
             }
