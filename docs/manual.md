@@ -373,7 +373,7 @@ proxy's own argv and `--explain --wl-proxy` the Wayland proxy's.
 
       pipewire    config.kdl:3  3 arguments (policy drop-in 50-bubbler.conf and hook script bubbler/refuse-links.lua not found: microphone reachable)
         --ro-bind /run/user/1000/bubbler/media/pipewire-0 /run/user/1000/pipewire-0
-        sidecar: /usr/bin/pw-container -P {"pipewire.sec.engine":"org.bubbler","pipewire.sec.app-id":"media","pipewire.sec.instance-id":"<run id>","pipewire.access":"restricted","bubbler.audio":"playback,microphone"} -- /run/bubbler-pw-hold
+        sidecar: /usr/bin/pw-container -P {"pipewire.sec.engine":"org.bubbler","pipewire.sec.app-id":"media","pipewire.sec.instance-id":"<run id>","pipewire.access":"restricted","pipewire.sec.bubbler.audio":"playback,microphone"} -- /run/bubbler-pw-hold
         (context: org.bubbler media playback,microphone)
 
       pulseaudio  config.kdl:6  6 arguments
@@ -382,7 +382,8 @@ proxy's own argv and `--explain --wl-proxy` the Wayland proxy's.
         sidecar: /usr/bin/pipewire -c pipewire-pulse.conf
         (pulse: a private server on this run's context, module loading refused)
 
-`pipewire { microphone }` is what put `microphone` in `bubbler.audio` above;
+`pipewire { microphone }` is what put `microphone` in
+`pipewire.sec.bubbler.audio` above;
 a bare `pulseaudio` in the same config still resolves to the merged set,
 since the grant is per instance and not per node. The `(policy drop-in not
 found: …)` suffix names the same fact once, on the first audio node's
@@ -631,7 +632,13 @@ restarted (see "Installing").
 prints `bubbler: warning: audio policy drop-in and hook script not found
 (50-bubbler.conf, bubbler/refuse-links.lua): the sandbox has full access
 to every PipeWire node (microphone and every other client's audio
-reachable)` on stderr, naming whichever half it is. An ALSA client reaches the same
+reachable)` on stderr, naming whichever half it is. Where both are installed
+but either is not the one this bubbler embeds — an older bubbler's, or an
+edited copy — a run prints `bubbler: warning: audio policy files differ from
+this bubbler's (50-bubbler.conf, bubbler/refuse-links.lua): …`: the grant is
+not enforced as documented until both are written again and WirePlumber
+restarted. The check compares the copies WirePlumber loads with bubbler's
+own; whether the running WirePlumber has loaded them, it cannot tell. An ALSA client reaches the same
 daemon through `/etc/alsa`, which the baseline binds: those files are where
 pipewire-alsa defines the `default` PCM, and without them alsa-lib falls back
 to a hardware card whose `/dev/snd` nodes no sandbox has.

@@ -5121,7 +5121,7 @@ mod tests {
                 "--".to_owned(),
                 "/usr/bin/pw-container".to_owned(),
                 "-P".to_owned(),
-                r#"{"pipewire.sec.engine":"org.bubbler","pipewire.sec.app-id":"t","pipewire.sec.instance-id":"4711","pipewire.access":"restricted","bubbler.audio":"playback"}"#.to_owned(),
+                r#"{"pipewire.sec.engine":"org.bubbler","pipewire.sec.app-id":"t","pipewire.sec.instance-id":"4711","pipewire.access":"restricted","pipewire.sec.bubbler.audio":"playback"}"#.to_owned(),
                 "--".to_owned(),
                 "/run/bubbler-pw-hold".to_owned(),
             ]
@@ -5150,7 +5150,7 @@ mod tests {
         let argv = strs(&pw_context_argv(&e, &ctx, &host, &mut alloc).unwrap());
         assert!(
             argv.iter()
-                .any(|a| a.contains(r#""bubbler.audio":"playback,microphone""#)),
+                .any(|a| a.contains(r#""pipewire.sec.bubbler.audio":"playback,microphone""#)),
             "{argv:?}"
         );
     }

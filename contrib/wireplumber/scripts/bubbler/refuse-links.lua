@@ -130,7 +130,7 @@ SimpleEventHook {
         return
       end
       why = refusal (si_props, target_props,
-          client.properties ["bubbler.audio"] or "")
+          client.properties ["pipewire.sec.bubbler.audio"] or "")
     end
 
     if why then

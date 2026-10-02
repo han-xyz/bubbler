@@ -256,7 +256,7 @@ pub fn properties(instance: &str, run_id: &str, audio: AudioSet) -> String {
         ("pipewire.sec.app-id", instance),
         ("pipewire.sec.instance-id", run_id),
         ("pipewire.access", ACCESS),
-        ("bubbler.audio", grant(audio)),
+        ("pipewire.sec.bubbler.audio", grant(audio)),
     ];
     let body: Vec<String> = pairs
         .iter()
@@ -289,11 +289,11 @@ mod tests {
     fn the_context_properties_are_the_five_keys_in_order() {
         assert_eq!(
             properties("vesktop", "4711", set(false)),
-            r#"{"pipewire.sec.engine":"org.bubbler","pipewire.sec.app-id":"vesktop","pipewire.sec.instance-id":"4711","pipewire.access":"restricted","bubbler.audio":"playback"}"#
+            r#"{"pipewire.sec.engine":"org.bubbler","pipewire.sec.app-id":"vesktop","pipewire.sec.instance-id":"4711","pipewire.access":"restricted","pipewire.sec.bubbler.audio":"playback"}"#
         );
         assert_eq!(
             properties("vesktop", "4711", set(true)),
-            r#"{"pipewire.sec.engine":"org.bubbler","pipewire.sec.app-id":"vesktop","pipewire.sec.instance-id":"4711","pipewire.access":"restricted","bubbler.audio":"playback,microphone"}"#
+            r#"{"pipewire.sec.engine":"org.bubbler","pipewire.sec.app-id":"vesktop","pipewire.sec.instance-id":"4711","pipewire.access":"restricted","pipewire.sec.bubbler.audio":"playback,microphone"}"#
         );
     }
 

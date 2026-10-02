@@ -2962,7 +2962,7 @@ fn real_bwrap_pipewire_context_tags_the_client() {
         format!(
             "pipewire.sec.engine=org.bubbler pipewire.sec.app-id=audioctx \
              pipewire.sec.instance-id={} pipewire.access=restricted \
-             pipewire.access.effective=restricted bubbler.audio=playback",
+             pipewire.access.effective=restricted pipewire.sec.bubbler.audio=playback",
             child.id()
         )
     );
@@ -3129,7 +3129,7 @@ fn real_bwrap_pulseaudio_serves_a_private_server() {
             == format!(
                 "pipewire.sec.engine=org.bubbler pipewire.sec.app-id=audiopulse \
                  pipewire.sec.instance-id={} pipewire.access=restricted \
-                 pipewire.access.effective=restricted bubbler.audio=playback \
+                 pipewire.access.effective=restricted pipewire.sec.bubbler.audio=playback \
                  client.api=pipewire-pulse",
                 run_id
             )),
@@ -6145,6 +6145,40 @@ fn audio_policy_warns_before_a_real_run_with_only_the_drop_in() {
         bubbler_core::audio_policy::Missing::Hook.run_warning()
     );
     assert!(err.contains(&expected), "{err}");
+    assert_eq!(out.status.code(), Some(1), "{err}");
+}
+
+/// A policy from another bubbler — before 0.24.2 the grant was a key a
+/// client could set on itself — is in place but does not enforce the
+/// grant this binary states, so the run says so. The copy under the
+/// test root is the one WirePlumber loads, whatever `/usr/share` holds.
+#[test]
+fn audio_policy_warns_before_a_real_run_with_another_versions_policy() {
+    let tmp = setup();
+    install_audio_policy(tmp.path(), true, true);
+    std::fs::write(
+        tmp.path()
+            .join("config/wireplumber/wireplumber.conf.d")
+            .join(bubbler_core::audio_policy::DROP_IN_NAME),
+        bubbler_core::audio_policy::DROP_IN.replace("pipewire.sec.bubbler.audio", "bubbler.audio"),
+    )
+    .unwrap();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "pipewire\ncommand \"/usr/bin/true\"\n").unwrap();
+    let out = bubbler(tmp.path()).args(["run", "t"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(
+            "bubbler: warning: audio policy files differ from this bubbler's \
+             (50-bubbler.conf, bubbler/refuse-links.lua)"
+        ),
+        "{err}"
+    );
+    assert!(
+        err.contains("bubbler audio-policy --print") && err.contains("restart WirePlumber"),
+        "{err}"
+    );
     assert_eq!(out.status.code(), Some(1), "{err}");
 }
 

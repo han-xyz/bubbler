@@ -133,6 +133,14 @@ const EXPLAIN_SUFFIX_HOOK: &str = " (policy hook script bubbler/refuse-links.lua
 const EXPLAIN_SUFFIX_BOTH: &str = " (policy drop-in 50-bubbler.conf and hook script \
      bubbler/refuse-links.lua not found: microphone reachable)";
 
+/// The same where both files are there but are not this binary's.
+const RUN_WARNING_DIFFERS: &str = "audio policy files differ from this bubbler's \
+     (50-bubbler.conf, bubbler/refuse-links.lua): the grant is not enforced as documented \
+     until you rewrite both (bubbler audio-policy --print, bubbler audio-policy --print \
+     --script) and restart WirePlumber";
+const EXPLAIN_SUFFIX_DIFFERS: &str = " (policy files 50-bubbler.conf and \
+     bubbler/refuse-links.lua differ from this bubbler's: grant not enforced as documented)";
+
 impl Missing {
     /// The line a real run prints on stderr for this case.
     pub fn run_warning(self) -> &'static str {
@@ -173,7 +181,10 @@ pub fn missing(host: &dyn Host, env: &Env) -> Option<Missing> {
 /// `--dry-run` or `--explain`, which carry their own framing.
 pub fn run_warning(cfg: &InstanceConfig, host: &dyn Host, env: &Env) -> Option<&'static str> {
     cfg.audio()?;
-    Some(missing(host, env)?.run_warning())
+    match missing(host, env) {
+        Some(case) => Some(case.run_warning()),
+        None => differs(host, env).then_some(RUN_WARNING_DIFFERS),
+    }
 }
 
 /// The suffix an audio group's header takes, `""` where the host holds
@@ -181,8 +192,28 @@ pub fn run_warning(cfg: &InstanceConfig, host: &dyn Host, env: &Env) -> Option<&
 pub fn explain_suffix(host: &dyn Host, env: &Env) -> &'static str {
     match missing(host, env) {
         Some(case) => case.explain_suffix(),
+        None if differs(host, env) => EXPLAIN_SUFFIX_DIFFERS,
         None => "",
     }
+}
+
+/// Whether a policy file WirePlumber loads is not the one this binary
+/// embeds, an older bubbler's or an edited copy: the grant it states is
+/// then not the grant enforced. The drop-in WirePlumber loads is the
+/// last of [`install_dirs`] that holds it — a fragment name is loaded
+/// once, from the directory that ranks highest, `$XDG_CONFIG_HOME` over
+/// `/etc` over `/usr/share` — and the hook the first of [`hook_dirs`].
+fn differs(host: &dyn Host, env: &Env) -> bool {
+    let drop_in = install_dirs(env)
+        .into_iter()
+        .rev()
+        .map(|dir| dir.join(DROP_IN_NAME))
+        .find(|path| host.file_type(path).is_some());
+    [(drop_in, DROP_IN), (hook_installed(host, env), HOOK)]
+        .into_iter()
+        .any(|(path, embedded)| {
+            path.is_some_and(|path| host.read(&path).as_deref() != Some(embedded.as_bytes()))
+        })
 }
 
 #[cfg(test)]
@@ -224,11 +255,18 @@ mod tests {
     }
 
     /// Every combination of the two files a host can hold.
+    /// A host holding `paths`, each with the embedded text of the policy
+    /// file it names.
     fn holding(paths: &[PathBuf]) -> FakeHost {
         let (file, _, _) = fake::types();
         let mut host = FakeHost::default();
         for path in paths {
-            host = host.with(path.to_str().expect("the fixture's paths are UTF-8"), file);
+            let name = path.to_str().expect("the fixture's paths are UTF-8");
+            let text = match path.ends_with(HOOK_NAME) {
+                true => HOOK,
+                false => DROP_IN,
+            };
+            host = host.with(name, file).text(name, text);
         }
         host
     }
@@ -365,5 +403,8 @@ mod tests {
             hook_dirs(&e)[0].join(HOOK_NAME),
         ]);
         assert_eq!(explain_suffix(&whole, &e), "");
+        let edited = install_dirs(&e)[2].join(DROP_IN_NAME);
+        let other = whole.text(edited.to_str().unwrap(), "# another version\n");
+        assert_eq!(explain_suffix(&other, &e), EXPLAIN_SUFFIX_DIFFERS);
     }
 }

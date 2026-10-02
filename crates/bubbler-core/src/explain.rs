@@ -1151,7 +1151,7 @@ bwrap
                      \"pipewire.sec.app-id\":\"t\",\
                      \"pipewire.sec.instance-id\":\"<run id>\",\
                      \"pipewire.access\":\"restricted\",\
-                     \"bubbler.audio\":\"{grant}\"}} -- /run/bubbler-pw-hold"
+                     \"pipewire.sec.bubbler.audio\":\"{grant}\"}} -- /run/bubbler-pw-hold"
                 )),
                 "{out:#?}"
             );

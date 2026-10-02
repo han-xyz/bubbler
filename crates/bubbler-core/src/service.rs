@@ -2579,6 +2579,9 @@ mod tests {
             fn read_link(&self, p: &Path) -> std::io::Result<Option<PathBuf>> {
                 self.0.read_link(p)
             }
+            fn read(&self, p: &Path) -> Option<Vec<u8>> {
+                self.0.read(p)
+            }
         }
         let e = env();
         let mut args = BwrapArgs::baseline(&e, Path::new("/i/home"), &host);

@@ -833,11 +833,27 @@ daemon's side with five properties a policy can match on:
 `pipewire.sec.engine = "org.bubbler"`, `pipewire.sec.app-id = <instance>`,
 `pipewire.sec.instance-id = <run id>`, `pipewire.access = "restricted"`
 (which the daemon turns into `pipewire.access.effective = "restricted"`
-on the client object) and `bubbler.audio = "playback"` or
+on the client object) and `pipewire.sec.bubbler.audio = "playback"` or
 `"playback,microphone"` — the one property the grant set collapses into,
 `microphone` ORed across `pipewire` and `pulseaudio` and across every
 layer, so a `pulseaudio { microphone }` in one layer widens a bare
-`pipewire` elsewhere in the same config.
+`pipewire` elsewhere in the same config. The grant is a `pipewire.sec.`
+key because the daemon refuses a client every update to such a key, its
+first included (PipeWire 1.6.9, `impl-client.c`
+`check_client_property_update`). Any other key a client may set on
+itself, and its first update is applied before the client is registered,
+so before WirePlumber can see it: until 0.24.2 the grant was
+`bubbler.audio`, and a playback sandbox whose PipeWire client
+configuration set `bubbler.audio = "playback,microphone"` was matched
+into the microphone rules and recorded the source (measured in the test
+bed, WirePlumber 0.5.18). The same claim, through the client's
+configuration or a later `Core.update_properties`, now leaves
+`pipewire.sec.bubbler.audio` as the context set it (measured). A policy
+installed by an earlier bubbler still matches `bubbler.audio`: under it
+a context of this bubbler gets the playback rules whatever its grant,
+and a sandbox can still claim the microphone (both measured), which is
+why bubbler warns before a run when the installed drop-in or hook is not
+its own.
 
 Where the WirePlumber policy drop-in
 (`contrib/wireplumber/50-bubbler.conf`) is installed, it matches that
@@ -947,7 +963,7 @@ Without that hook installed beside the drop-in the grant is scoped and
 every other client's audio is not: a capture stream asking for
 `stream.capture.sink` records the output mix, another client's stream is
 linkable, and the sandbox can make both links itself. An engine match with no
-recognised `bubbler.audio` value, or none at all, lands in the base rule
+recognised `pipewire.sec.bubbler.audio` value, or none at all, lands in the base rule
 ahead of the grant-specific one rather than falling through to
 WirePlumber's own default, so a typo in the property still narrows
 rather than widens.
@@ -996,7 +1012,7 @@ sinks and its own client objects — an application learns what output
 devices the host has, which is what playing sound needs — and the reach
 is per *instance*, not per node: `microphone` on either `pipewire` or
 `pulseaudio` widens the other grant in the same config too, since the
-merged set is what the one `bubbler.audio` property carries. The host's
+merged set is what the one `pipewire.sec.bubbler.audio` property carries. The host's
 `pipewire-0-manager` socket, which would let a client change permissions
 or unload modules outright, is never bound into any sandbox, drop-in or
 not. `camera` is unchanged by any of this: it reaches a device through

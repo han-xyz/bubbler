@@ -32,6 +32,8 @@ pub trait Host {
     /// root of its user namespace, past every mode that stops the user,
     /// so "cannot tell" is an answer of its own and never "no".
     fn read_link(&self, p: &Path) -> io::Result<Option<PathBuf>>;
+    /// The bytes of the file at `p`; `None` if it cannot be read.
+    fn read(&self, p: &Path) -> Option<Vec<u8>>;
 }
 
 /// The real filesystem.
@@ -74,6 +76,10 @@ impl Host for RealHost {
         rustix::fs::access(p, rustix::fs::Access::WRITE_OK).is_ok()
     }
 
+    fn read(&self, p: &Path) -> Option<Vec<u8>> {
+        fs::read(p).ok()
+    }
+
     /// A directory that cannot be read yields an empty list, so a caller
     /// that needs an entry from it reports the entry missing rather than
     /// the I/O error: `dri` fails with `MissingResource`, never silently.
@@ -103,11 +109,20 @@ pub(crate) mod fake {
         pub writable: BTreeSet<PathBuf>,
         pub unresolved: BTreeSet<PathBuf>,
         pub unreadable: BTreeSet<PathBuf>,
+        pub contents: BTreeMap<PathBuf, Vec<u8>>,
     }
 
     impl FakeHost {
         pub fn with(mut self, p: &str, t: FileType) -> Self {
             self.entries.insert(PathBuf::from(p), t);
+            self
+        }
+
+        /// Give the file at `p` the bytes `read` answers with; a file
+        /// without them reads as unreadable.
+        pub fn text(mut self, p: &str, text: &str) -> Self {
+            self.contents
+                .insert(PathBuf::from(p), text.as_bytes().to_vec());
             self
         }
 
@@ -189,6 +204,9 @@ pub(crate) mod fake {
                 return Err(io::Error::from(io::ErrorKind::PermissionDenied));
             }
             Ok(self.links.get(p).cloned())
+        }
+        fn read(&self, p: &Path) -> Option<Vec<u8>> {
+            self.contents.get(p).cloned()
         }
         fn list_dir(&self, p: &Path) -> Vec<OsString> {
             let mut v: Vec<OsString> = self

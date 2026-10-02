@@ -51,6 +51,15 @@
   streams go to the host's default. A smart filter a sandbox offers is
   refused by the same rule, not measured. The same reinstall and restart
   applies.
+- A sandbox with a `pipewire` or `pulseaudio` grant could give itself the
+  `microphone` grant: the grant was the client property `bubbler.audio`,
+  which a client may set on itself before WirePlumber sees it (measured: a
+  client configured with `bubbler.audio = "playback,microphone"` recorded
+  the source). The grant is now `pipewire.sec.bubbler.audio`, which only the
+  security context sets. Under a policy installed by an earlier bubbler
+  every grant gets the playback rules and a sandbox can still claim the
+  microphone; bubbler now warns before a run when the installed drop-in or
+  hook is not its own. The same reinstall and restart applies.
 
 ## 0.24.1
 

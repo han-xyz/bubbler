@@ -13,7 +13,7 @@ KEYS = (
     "pipewire.sec.instance-id",
     "pipewire.access",
     "pipewire.access.effective",
-    "bubbler.audio",
+    "pipewire.sec.bubbler.audio",
 )
 
 app = sys.argv[1]

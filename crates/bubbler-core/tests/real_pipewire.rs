@@ -153,14 +153,14 @@ const NEEDED: [&str; 10] = [
 
 /// A security context's properties as bubbler will set them for a
 /// `pipewire` grant with no `microphone` child.
-pub const PLAYBACK: &str = r#"{ "pipewire.sec.engine": "org.bubbler", "pipewire.sec.app-id": "bed", "pipewire.sec.instance-id": "t1", "pipewire.access": "restricted", "bubbler.audio": "playback" }"#;
+pub const PLAYBACK: &str = r#"{ "pipewire.sec.engine": "org.bubbler", "pipewire.sec.app-id": "bed", "pipewire.sec.instance-id": "t1", "pipewire.access": "restricted", "pipewire.sec.bubbler.audio": "playback" }"#;
 
 /// The same with the `microphone` child.
-pub const PLAYBACK_MICROPHONE: &str = r#"{ "pipewire.sec.engine": "org.bubbler", "pipewire.sec.app-id": "bed", "pipewire.sec.instance-id": "t1", "pipewire.access": "restricted", "bubbler.audio": "playback,microphone" }"#;
+pub const PLAYBACK_MICROPHONE: &str = r#"{ "pipewire.sec.engine": "org.bubbler", "pipewire.sec.app-id": "bed", "pipewire.sec.instance-id": "t1", "pipewire.access": "restricted", "pipewire.sec.bubbler.audio": "playback,microphone" }"#;
 
 /// A grant string the drop-in does not know, as a future bubbler or a
 /// typo could produce.
-pub const BOGUS_GRANT: &str = r#"{ "pipewire.sec.engine": "org.bubbler", "pipewire.sec.app-id": "bed", "pipewire.access": "restricted", "bubbler.audio": "bogus" }"#;
+pub const BOGUS_GRANT: &str = r#"{ "pipewire.sec.engine": "org.bubbler", "pipewire.sec.app-id": "bed", "pipewire.access": "restricted", "pipewire.sec.bubbler.audio": "bogus" }"#;
 
 /// A bubbler context with the grant key missing altogether.
 pub const NO_GRANT: &str = r#"{ "pipewire.sec.engine": "org.bubbler", "pipewire.sec.app-id": "bed", "pipewire.access": "restricted" }"#;
@@ -959,7 +959,7 @@ fn streaming(bed: &PipeWireBed, props: &str, program: &str, class: &str) -> Stre
 /// and declined". A host slow enough to rescan later than this would
 /// pass a no-link test with a link still coming.
 fn window_in_which_it_would_link(bed: &PipeWireBed, grant: &str) {
-    let decided = format!("bubbler.audio = \"{grant}\"");
+    let decided = format!("pipewire.sec.bubbler.audio = \"{grant}\"");
     wait_for("the capture client's access decision", || {
         object(
             &bed.info_from_host(),
@@ -1115,6 +1115,113 @@ fn a_playback_context_gets_no_link_to_another_clients_stream() {
         !links.contains("input_"),
         "a playback context was linked to another client's stream:\n{links}"
     );
+}
+
+/// The microphone claimed by the client itself, both under the key the
+/// policy reads and under the one it read before: what the client says
+/// at connect, from its configuration's `context.properties` or from
+/// `PIPEWIRE_PROPS`, reaches the daemon in its first update, before any
+/// session manager can see the client; `Core.update_properties` is an
+/// update after that.
+const CLAIM: &str = r#"{ "bubbler.audio": "playback,microphone", "pipewire.sec.bubbler.audio": "playback,microphone" }"#;
+
+/// What `wpexec` runs to claim the microphone once connected and then
+/// open a capture stream of its own.
+const CLAIM_LATER: &str = r#"
+Core.update_properties {
+  ["bubbler.audio"] = "playback,microphone",
+  ["pipewire.sec.bubbler.audio"] = "playback,microphone",
+}
+claimer = LocalNode ("adapter", {
+  ["factory.name"] = "support.null-audio-sink",
+  ["node.name"] = "claimer",
+  ["media.class"] = "Stream/Input/Audio",
+  ["audio.position"] = "FL,FR",
+  ["node.autoconnect"] = "true",
+})
+claimer:activate (Feature.Proxy.BOUND)
+"#;
+
+/// Markers for a client object, and for one carrying the claim under
+/// the key the policy no longer reads.
+const CLIENT: &str = "type: PipeWire:Interface:Client";
+const CLAIMED: &str = r#"bubbler.audio = "playback,microphone""#;
+
+#[test]
+fn a_playback_context_that_claims_the_microphone_gets_the_playback_grant() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let config = bed.dir().join("claim");
+    std::fs::create_dir_all(config.join("client.conf.d")).expect("a client config directory");
+    std::fs::copy(
+        "/usr/share/pipewire/client.conf",
+        config.join("client.conf"),
+    )
+    .expect("a copy of the stock client.conf");
+    std::fs::write(
+        config.join("client.conf.d/claim.conf"),
+        format!("context.properties = {CLAIM}\n"),
+    )
+    .expect("the claim's drop-in");
+    let script = bed.dir().join("claim.lua");
+    std::fs::write(&script, CLAIM_LATER).expect("the later claim's script");
+    let out = bed.dir().join("captured.wav");
+
+    // `PIPEWIRE_PROPS` lands on the stream and not the client (measured),
+    // so only the other two are required to reach the client at all.
+    for (route, reaches_the_client, program) in [
+        (
+            "its configuration",
+            true,
+            format!(
+                "PIPEWIRE_CONFIG_DIR={} pw-cat -r {}",
+                config.display(),
+                out.display()
+            ),
+        ),
+        (
+            "PIPEWIRE_PROPS",
+            false,
+            format!("PIPEWIRE_PROPS='{CLAIM}' pw-cat -r {}", out.display()),
+        ),
+        (
+            "a later update",
+            true,
+            format!(
+                "WIREPLUMBER_CONFIG_DIR={} wpexec {}",
+                bed.dir().join("wireplumber").display(),
+                script.display()
+            ),
+        ),
+    ] {
+        wait_for("the end of the previous claimer", || {
+            object(&bed.info_from_host(), &[CLIENT, CLAIMED]).is_none()
+        });
+        let _recording = streaming(&bed, PLAYBACK, &program, "Stream/Input/Audio");
+        window_in_which_it_would_link(&bed, "playback");
+        let clients = bed.info_from_host();
+        let links = bed.links();
+        assert!(
+            !reaches_the_client || object(&clients, &[CLIENT, CLAIMED]).is_some(),
+            "the claim through {route} never reached the client:\n{clients}"
+        );
+        assert!(
+            object(
+                &clients,
+                &[
+                    CLIENT,
+                    r#"pipewire.sec.bubbler.audio = "playback,microphone""#
+                ]
+            )
+            .is_none(),
+            "a client changed its grant through {route}:\n{clients}"
+        );
+        assert!(
+            !links.contains("bed-source"),
+            "a playback context that claimed the microphone through {route} captured:\n{links}"
+        );
+    }
 }
 
 #[test]
@@ -1660,7 +1767,7 @@ fn a_context_that_is_not_bubblers_keeps_the_reach_it_had() {
     let Some(bed) = PipeWireBed::start() else {
         return;
     };
-    // `pw-container`'s own defaults: `org.flatpak`, no `bubbler.audio`.
+    // `pw-container`'s own defaults: `org.flatpak`, no `pipewire.sec.bubbler.audio`.
     // The drop-in must not narrow a context it did not create.
     let listing = bed.info_in_context("{}", &[SINK, SOURCE]);
     for marker in [SINK, SOURCE] {
