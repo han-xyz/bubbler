@@ -330,6 +330,11 @@ pub enum LaunchError {
     /// would have started without the bus socket it expects.
     #[error("the D-Bus proxy did not become ready")]
     ProxyNotReady,
+    /// A stop signal arrived while a sidecar was starting, and the start
+    /// ended there. [`crate::launcher::run`] exits with a stopped run's
+    /// code in its place.
+    #[error("the start was stopped by a signal")]
+    Stopped,
     /// The sidecar that creates this run's PipeWire security context did
     /// not report the socket it made. The run stops here: a sandbox
     /// started anyway would either have no audio socket at all or, if

@@ -243,6 +243,9 @@ is torn down by `--die-with-parent`, which is the backstop in any case.
 directory exists: one that arrives while the sidecars are still starting ends
 the start before the command runs, stops the sidecars already up, removes
 `init.sock`, their directories and the run's cgroup, and `bubbler` exits 143.
+One that arrives as the sandbox itself is being spawned goes to the command as
+it does during a run, and a start that fails for a reason of its own in that
+window still says why and exits 1.
 `bubbler-init` also answers `SIGHUP` and `SIGQUIT` with the same grace as
 `SIGTERM`, so a terminal that goes away or a keyboard quit ends the run
 instead of leaving the command to bwrap's own reaper. Before it does any of

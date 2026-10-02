@@ -9921,8 +9921,8 @@ fn lint_on_an_instance_reads_its_own_config() {
 }
 
 /// A stand-in pasta: it records the argv it was given, reports readiness
-/// on the `--pid` path exactly as pasta does, and then waits to be
-/// killed. What it proves is what bubbler does around the sidecar, not
+/// on the `--pid` path exactly as pasta does — or never, with
+/// `FAKE_PASTA_HANG=1` — and then waits to be killed. What it proves is what bubbler does around the sidecar, not
 /// what pasta does with a namespace.
 const FAKE_PASTA: &str = "\
 #!/usr/bin/python3
@@ -9932,6 +9932,8 @@ open(os.environ['FAKE_PASTA_ARGV'], 'w').write('\\n'.join(argv))
 open(os.environ['FAKE_PASTA_PID'], 'w').write(str(os.getpid()))
 if os.environ.get('FAKE_PASTA_SILENT') == '1':
     sys.exit(3)
+if os.environ.get('FAKE_PASTA_HANG') == '1':
+    signal.pause()
 with open(argv[argv.index('--pid') + 1], 'w') as f:
     f.write(f'{os.getpid()}\\n')
 signal.pause()
@@ -9953,6 +9955,192 @@ fn pasta_case(root: &std::path::Path, init: &std::path::Path, kdl: &str) -> Comm
         .env("FAKE_PASTA_PID", root.join("pasta.pid"));
     std::fs::write(root.join("data/bubbler/instances/t/config.kdl"), kdl).unwrap();
     c
+}
+
+/// The pid [`FAKE_PASTA`] wrote under `root`, once it has written it.
+fn fake_pasta_pid(root: &Path) -> Option<i32> {
+    std::fs::read_to_string(root.join("pasta.pid"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// SIGTERM to `run`, and its exit status and stderr once it has gone.
+fn stop_run(mut run: Child) -> (Option<i32>, String) {
+    kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
+    let mut status = None;
+    assert!(
+        wait_until(
+            || {
+                status = run.try_wait().expect("waiting for the run");
+                status.is_some()
+            },
+            Duration::from_secs(15)
+        ),
+        "the run did not stop after SIGTERM"
+    );
+    let err = String::from_utf8_lossy(&run.wait_with_output().unwrap().stderr).into_owned();
+    (status.and_then(|s| s.code()), err)
+}
+
+#[test]
+fn a_signal_while_pasta_starts_stops_the_run_and_leaves_nothing() {
+    if !require_bwrap() || !require_python() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    let marker = tmp.path().join("data/bubbler/instances/t/home/ran");
+    let run = pasta_case(tmp.path(), &init, "network {\n    allow-port 8080\n}\n")
+        .env("FAKE_PASTA_HANG", "1")
+        .args(["run", "t", "--", "/usr/bin/touch", "/home/bubbler/ran"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut pasta = None;
+    if !wait_until(
+        || {
+            pasta = fake_pasta_pid(tmp.path());
+            pasta.is_some()
+        },
+        Duration::from_secs(10),
+    ) {
+        fail_with(run, "pasta never started");
+    }
+    let (code, err) = stop_run(run);
+    assert!(
+        !tmp.path().join("run/bubbler/t/init.sock").exists(),
+        "the start left `init.sock`: {err}"
+    );
+    assert_eq!(code, Some(143), "{err}");
+    assert!(!marker.exists(), "the application ran after the signal");
+    let pasta = pasta.unwrap();
+    assert!(
+        wait_until(|| !pid_alive(pasta), Duration::from_secs(5)),
+        "pasta outlived the run"
+    );
+}
+
+/// A stand-in egress proxy: it marks the sandbox's home, whose namespaces
+/// it has joined, and never reports itself listening.
+fn silent_net_proxy(path: &Path) {
+    write_script(
+        path,
+        "#!/usr/bin/sh\n: > /home/bubbler/proxy-started\nexec /usr/bin/sleep 30\n",
+    );
+}
+
+/// The cgroup this test process is in, under `/sys/fs/cgroup`: where a
+/// bubbler it starts makes its run's cgroup.
+fn own_cgroup() -> PathBuf {
+    let text = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+    let own = text
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .expect("require_egress found a cgroup2 hierarchy");
+    Path::new("/sys/fs/cgroup").join(own.trim_start_matches('/'))
+}
+
+#[test]
+fn a_signal_while_the_egress_proxy_starts_removes_the_runs_cgroup() {
+    if !require_egress() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    let proxy = tmp.path().join("silent-net-proxy");
+    silent_net_proxy(&proxy);
+    let home = tmp.path().join("data/bubbler/instances/t/home");
+    let run = pasta_case(
+        tmp.path(),
+        &init,
+        "network {\n    outbound \"deny\"\n    allow-host \"localhost\" port=9\n}\n",
+    )
+    .env("BUBBLER_NET_PROXY", &proxy)
+    .args(["run", "t", "--", "/usr/bin/touch", "/home/bubbler/ran"])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    let cgroup = own_cgroup().join(format!("bubbler-t-{}", run.id()));
+    if !wait_until(
+        || home.join("proxy-started").exists(),
+        Duration::from_secs(10),
+    ) {
+        fail_with(run, "the egress proxy never started");
+    }
+    assert!(cgroup.is_dir(), "no cgroup at {}", cgroup.display());
+    let pasta = fake_pasta_pid(tmp.path()).expect("pasta reported before the proxy started");
+    let (code, err) = stop_run(run);
+    assert!(
+        !tmp.path().join("run/bubbler/t/init.sock").exists(),
+        "the start left `init.sock`: {err}"
+    );
+    assert_eq!(code, Some(143), "{err}");
+    assert!(
+        !home.join("ran").exists(),
+        "the application ran after the signal"
+    );
+    assert!(
+        wait_until(|| !pid_alive(pasta), Duration::from_secs(5)),
+        "pasta outlived the run"
+    );
+    assert!(!cgroup.exists(), "the start left {}", cgroup.display());
+}
+
+/// A refusal of the start's own is still reported when a stop signal is
+/// pending as well: bwrap here never writes its info document, which the
+/// run waits out whatever the signal says.
+#[test]
+fn a_start_that_fails_on_its_own_while_a_stop_is_pending_still_says_why() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    let bin = tmp.path().join("silent-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let spawned = tmp.path().join("spawned");
+    write_script(
+        &bin.join("bwrap"),
+        &format!(
+            "#!/usr/bin/sh\n\
+             if [ \"$1\" = --args ]; then : > '{}'; exec /usr/bin/sleep 30; fi\n\
+             exec /usr/bin/bwrap \"$@\"\n",
+            spawned.display()
+        ),
+    );
+    let run = pasta_case(tmp.path(), &init, "network {\n    allow-port 8080\n}\n")
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .args(["run", "t", "--", "/usr/bin/true"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    if !wait_until(|| spawned.exists(), Duration::from_secs(10)) {
+        fail_with(run, "the sandbox's bwrap never started");
+    }
+    let (code, err) = stop_run(run);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("reported no sandbox pid"), "{err}");
+    assert!(
+        !tmp.path().join("run/bubbler/t/init.sock").exists(),
+        "the start left `init.sock`: {err}"
+    );
 }
 
 #[test]

@@ -1096,9 +1096,14 @@ impl Drop for ProxyHandle {
 
 /// Wait for the sidecar's ready byte, which says it has bound its socket
 /// and is accepting connections. False when the deadline passes, the pipe
-/// reaches EOF, the child is gone or `stop` is set: nothing is listening
-/// either way, or the run is no longer waiting for it.
-fn wait_ready(ready: &OwnedFd, child: &mut Child, deadline: Instant, stop: &AtomicBool) -> bool {
+/// reaches EOF or the child is gone: nothing is listening either way.
+/// [`LaunchError::Stopped`] once `stop` is set.
+fn wait_ready(
+    ready: &OwnedFd,
+    child: &mut Child,
+    deadline: Instant,
+    stop: &AtomicBool,
+) -> Result<bool, LaunchError> {
     let mut byte = [0u8; 1];
     loop {
         let slice = Timespec {
@@ -1111,17 +1116,20 @@ fn wait_ready(ready: &OwnedFd, child: &mut Child, deadline: Instant, stop: &Atom
             Ok(0) => {}
             Err(_) => std::thread::sleep(POLL),
             Ok(_) => match rustix::io::read(ready, &mut byte) {
-                Ok(0) => return false,
-                Ok(_) => return true,
+                Ok(0) => return Ok(false),
+                Ok(_) => return Ok(true),
                 Err(Errno::INTR) => {}
-                Err(_) => return false,
+                Err(_) => return Ok(false),
             },
         }
-        if Instant::now() >= deadline || stop.load(Ordering::SeqCst) {
-            return false;
+        if stop.load(Ordering::SeqCst) {
+            return Err(LaunchError::Stopped);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
         }
         if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
-            return false;
+            return Ok(false);
         }
     }
 }
@@ -1297,7 +1305,7 @@ pub fn start_wayland(
         .ready_read
         .as_ref()
         .ok_or_else(|| LaunchError::Data(io::Error::other("no ready pipe was allocated")))?;
-    if !wait_ready(ready, child, Instant::now() + PROXY_READY, stop) {
+    if !wait_ready(ready, child, Instant::now() + PROXY_READY, stop)? {
         let what = match child.try_wait() {
             Ok(Some(status)) => format!("it exited ({status})"),
             _ => format!("it did not report a listening socket within {PROXY_READY:?}"),
@@ -1480,7 +1488,7 @@ pub fn start_pw_context(
     // The holder reports the name it renamed the socket to as its own
     // sandbox sees it — that sandbox's `/tmp` is this directory — so the
     // one answer bubbler takes is the name it planned for.
-    if read_report(ready, child, Instant::now() + PW_READY, stop).as_deref()
+    if read_report(ready, child, Instant::now() + PW_READY, stop)?.as_deref()
         != Some(pipewire::SOCKET_INSIDE)
     {
         let what = match child.try_wait() {
@@ -1502,8 +1510,8 @@ pub fn start_pw_context(
 }
 
 /// The line the holder reports the context socket on, without its
-/// newline, or `None` when the deadline passes, the pipe reaches EOF, the
-/// sidecar is gone or `stop` is set.
+/// newline, or `None` when the deadline passes, the pipe reaches EOF or
+/// the sidecar is gone; [`LaunchError::Stopped`] once `stop` is set.
 ///
 /// A byte at a time: the line is one short path, and the descriptor stays
 /// open afterwards, so a longer read would block on a pipe with nothing
@@ -1513,7 +1521,7 @@ fn read_report(
     child: &mut Child,
     deadline: Instant,
     stop: &AtomicBool,
-) -> Option<String> {
+) -> Result<Option<String>, LaunchError> {
     let mut line = Vec::new();
     loop {
         let slice = Timespec {
@@ -1528,20 +1536,23 @@ fn read_report(
             Ok(_) => {
                 let mut byte = [0u8; 1];
                 match rustix::io::read(ready, &mut byte) {
-                    Ok(0) => return None,
-                    Ok(_) if byte[0] == b'\n' => return String::from_utf8(line).ok(),
-                    Ok(_) if line.len() >= PW_REPORT_MAX => return None,
+                    Ok(0) => return Ok(None),
+                    Ok(_) if byte[0] == b'\n' => return Ok(String::from_utf8(line).ok()),
+                    Ok(_) if line.len() >= PW_REPORT_MAX => return Ok(None),
                     Ok(_) => line.push(byte[0]),
                     Err(Errno::INTR) => {}
-                    Err(_) => return None,
+                    Err(_) => return Ok(None),
                 }
             }
         }
-        if Instant::now() >= deadline || stop.load(Ordering::SeqCst) {
-            return None;
+        if stop.load(Ordering::SeqCst) {
+            return Err(LaunchError::Stopped);
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
         }
         if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
-            return None;
+            return Ok(None);
         }
     }
 }
@@ -1728,7 +1739,7 @@ pub fn start_pw_pulse(
             return Err(LaunchError::PwPulse(format!("it exited ({status})")));
         }
         if stop.load(Ordering::SeqCst) {
-            return Err(LaunchError::PwPulse("a stop signal arrived".to_owned()));
+            return Err(LaunchError::Stopped);
         }
         if Instant::now() >= deadline {
             return Err(LaunchError::PwPulse(format!(
@@ -1913,7 +1924,7 @@ pub fn start_proxy(
         .ready_read
         .as_ref()
         .ok_or_else(|| LaunchError::Data(io::Error::other("no ready pipe was allocated")))?;
-    if !wait_ready(ready, child, Instant::now() + PROXY_READY, stop) {
+    if !wait_ready(ready, child, Instant::now() + PROXY_READY, stop)? {
         return Err(LaunchError::ProxyNotReady);
     }
     Ok(handle)
@@ -2406,7 +2417,7 @@ fn start_pasta(
         &mut handle.child,
         Instant::now() + PASTA_READY,
         stop,
-    ) {
+    )? {
         return Err(LaunchError::Network(
             "pasta did not configure the namespace".to_owned(),
         ));
@@ -2667,7 +2678,7 @@ fn start_net_proxy(
         &mut handle.child,
         Instant::now() + NET_PROXY_READY,
         stop,
-    ) {
+    )? {
         let what = match handle.child.try_wait() {
             Ok(Some(status)) => format!("it exited ({status})"),
             _ => format!("it did not report a listening socket within {NET_PROXY_READY:?}"),
@@ -3479,7 +3490,7 @@ pub fn run(
     // Everything the start made is dropped by the time this matches,
     // which is what stops the sidecars and removes what they left.
     match start_and_wait(env, inst, command, mode, dir, &stop, &mut registered) {
-        Err(_) if stop.load(Ordering::SeqCst) => Ok(STOPPED_CODE),
+        Err(LaunchError::Stopped) => Ok(STOPPED_CODE),
         code => code,
     }
 }
