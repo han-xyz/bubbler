@@ -1571,19 +1571,7 @@ fn adopt_socket(
     let (to_dir, name) = to;
     // `from_dir` may be one the sidecar made or replaced (the pulse
     // server's `pulse`), so a link at its name is refused, not followed.
-    let source = rustix::fs::open(
-        from_dir,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|e| match e {
-        Errno::LOOP | Errno::NOTDIR => LaunchError::WrongType {
-            service,
-            path: from_dir.to_path_buf(),
-            expected: "a directory",
-        },
-        e => LaunchError::Io(from_dir.to_path_buf(), e.into()),
-    })?;
+    let source = open_dir_nofollow(rustix::fs::CWD, from_dir, from_dir, service)?;
     let target = open_dir(to_dir)?;
     let path = to_dir.join(name);
     rustix::fs::renameat(&source, made, &target, name).map_err(|e| match e {
@@ -2755,8 +2743,7 @@ fn open_dir(path: &Path) -> Result<OwnedFd, LaunchError> {
 
 /// Move the proxy's socket out of the one directory the proxy can write
 /// to, then prove that what was moved really is a socket of this user's
-/// (`uid`). The returned
-/// guard removes the moved entry when the run ends.
+/// (`uid`). The returned guard removes the moved entry when the run ends.
 ///
 /// The proxy keeps serving after the move: it listens on the socket it
 /// bound, not on the path, and the sandbox connects through the new one.
@@ -2775,7 +2762,8 @@ fn adopt_proxy_bus(
     node: &'static str,
     uid: u32,
 ) -> Result<FileGuard, LaunchError> {
-    let from = open_dir(&dbus::socket_dir(dir))?;
+    let from_dir = dbus::socket_dir(dir);
+    let from = open_dir_nofollow(rustix::fs::CWD, &from_dir, &from_dir, node)?;
     let to = open_dir(dir)?;
     let path = dbus::app_bus_path(dir, socket);
     rustix::fs::renameat(&from, socket, &to, socket).map_err(|e| match e {
@@ -2851,18 +2839,61 @@ fn mkdir_private(dir: &Path) -> Result<(), LaunchError> {
 /// an entry that is still there. Called before the sidecar that writes
 /// `dir` is started, so what a dead run's sidecar left in it — a link
 /// out of the runtime directory above all — is never followed by
-/// anything bubbler writes or unlinks there. Only after the instance's
-/// control socket is bound, so it is never a live run's directory.
+/// anything bubbler writes or unlinks there. Called after this run has
+/// bound the instance's control socket and found no live run behind it;
+/// two starts racing over a dead run's socket can both get there, and
+/// the second then removes the first one's directory (a known gap).
 fn fresh_sidecar_dir(dir: &Path) -> Result<(), LaunchError> {
-    let io_at = |e: io::Error| LaunchError::Io(dir.to_path_buf(), e);
-    // A link is unlinked itself: `symlink_metadata` does not follow it.
-    match std::fs::symlink_metadata(dir) {
-        Ok(m) if m.is_dir() => std::fs::remove_dir_all(dir).map_err(io_at)?,
-        Ok(_) => std::fs::remove_file(dir).map_err(io_at)?,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+    let io_at = |e: Errno| LaunchError::Io(dir.to_path_buf(), e.into());
+    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
+        unreachable!("a sidecar directory is named inside the instance's");
+    };
+    let at = open_dir(parent)?;
+    match remove_tree(&at, name) {
+        Ok(()) | Err(Errno::NOENT) => {}
         Err(e) => return Err(io_at(e)),
     }
-    rustix::fs::mkdir(dir, Mode::RWXU).map_err(|e| io_at(e.into()))
+    rustix::fs::mkdirat(&at, name, Mode::RWXU).map_err(io_at)
+}
+
+/// Remove `name` under `at` and, where it is a directory, everything in
+/// it, following no link. A sidecar runs as the user and can leave a
+/// directory no one may read or write, so each one is first given back
+/// to its owner (0700) through a descriptor of its own: the mode
+/// changes on the directory that was opened, never on whatever a path
+/// names by then.
+fn remove_tree(at: &OwnedFd, name: &OsStr) -> rustix::io::Result<()> {
+    let stat = rustix::fs::statat(at, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory {
+        return rustix::fs::unlinkat(at, name, AtFlags::empty());
+    }
+    let pinned = rustix::fs::openat(
+        at,
+        name,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    // `fchmod` refuses an `O_PATH` descriptor, and one opened for reading
+    // needs the permission this is restoring.
+    rustix::fs::chmod(format!("/proc/self/fd/{}", pinned.as_raw_fd()), Mode::RWXU)?;
+    let inner = rustix::fs::openat(
+        &pinned,
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let mut names = Vec::new();
+    for entry in rustix::fs::Dir::read_from(&inner)? {
+        let entry = entry?;
+        let entry_name = OsStr::from_bytes(entry.file_name().to_bytes());
+        if entry_name != "." && entry_name != ".." {
+            names.push(entry_name.to_owned());
+        }
+    }
+    for entry_name in names {
+        remove_tree(&inner, &entry_name)?;
+    }
+    rustix::fs::unlinkat(at, name, AtFlags::REMOVEDIR)
 }
 
 /// Create `$XDG_RUNTIME_DIR/bubbler/<name>/` with mode 0700; an existing
@@ -2918,7 +2949,7 @@ fn prepare_app_runtime(env: &Env, services: &[Service]) -> Result<(), LaunchErro
     mkdir_private(&env.runtime_dir)?;
     let app = env.runtime_dir.join("app");
     mkdir_private(&app)?;
-    let at = open_dir_nofollow(rustix::fs::CWD, &app, &app)?;
+    let at = open_dir_nofollow(rustix::fs::CWD, &app, &app, "app-runtime")?;
     for id in ids {
         let dir = service::app_runtime_dir(env, id);
         // `mkdir` reports EEXIST for a symlink too, since it does not
@@ -2928,17 +2959,19 @@ fn prepare_app_runtime(env: &Env, services: &[Service]) -> Result<(), LaunchErro
             Ok(()) | Err(Errno::EXIST) => {}
             Err(e) => return Err(LaunchError::Io(dir, e.into())),
         }
-        open_dir_nofollow(&at, id, &dir)?;
+        open_dir_nofollow(&at, id, &dir, "app-runtime")?;
     }
     Ok(())
 }
 
 /// Open `path` under `at` as a directory without following a symlink in
-/// its last component. `named` is the whole path, for the error only.
+/// its last component. `named` is the whole path and `service` what
+/// needed it, for the error only.
 fn open_dir_nofollow<P: rustix::path::Arg>(
     at: impl AsFd,
     path: P,
     named: &Path,
+    service: &'static str,
 ) -> Result<OwnedFd, LaunchError> {
     rustix::fs::openat(
         at,
@@ -2948,7 +2981,7 @@ fn open_dir_nofollow<P: rustix::path::Arg>(
     )
     .map_err(|e| match e {
         Errno::LOOP | Errno::NOTDIR => LaunchError::WrongType {
-            service: "app-runtime",
+            service,
             path: named.to_path_buf(),
             expected: "a directory",
         },
@@ -5222,6 +5255,90 @@ mod tests {
         }
     }
 
+    /// A sidecar runs as the user, so it can leave a tree no one may open
+    /// in the directory it writes. Each real start path clears it before
+    /// its sidecar starts, links inside it included, and changes nothing
+    /// those links name. The fakes reach no further than a sidecar bwrap
+    /// that fails on a bind source the host does not have.
+    #[test]
+    fn an_unreadable_tree_a_sidecar_left_does_not_block_its_start() {
+        use crate::host::fake::{FakeHost, types};
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut e = env(tmp.path());
+        let bus = tmp.path().join("bus");
+        e.dbus_address = Some(format!("unix:path={}", bus.display()).into());
+        e.proxy_override = Some(PathBuf::from("/usr/bin/true"));
+        let conf = e.config_home.join("pipewire").join(pipewire::PULSE_CONF);
+        std::fs::create_dir_all(conf.parent().unwrap()).unwrap();
+        std::fs::write(&conf, "pulse.properties = {}\n").unwrap();
+        let (file, _, socket) = types();
+        let host = FakeHost::default()
+            .with(bus.to_str().unwrap(), socket)
+            .with(
+                pipewire::host_socket(&e.runtime_dir).to_str().unwrap(),
+                socket,
+            )
+            .with(pipewire::PW_CONTAINER, file)
+            .with(pipewire::PULSE_MODULE, file)
+            .with(conf.to_str().unwrap(), file);
+        let i = inst(tmp.path(), "dbus\npipewire\npulseaudio\ncommand \"true\"\n");
+        let dir = prepare_runtime_dir(&e, &i).unwrap();
+        let plan = dbus::plan(&i.config.services, "t").expect("dbus is granted");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let sentinel = elsewhere.join("sentinel");
+        std::fs::write(&sentinel, b"sentinel").unwrap();
+        let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777;
+        let before = (mode(&elsewhere), mode(&sentinel));
+        let stop = AtomicBool::new(false);
+        type Start<'a> = Box<dyn Fn() -> Result<(), LaunchError> + 'a>;
+        let starts: [(PathBuf, Start); 3] = [
+            (
+                dbus::socket_dir(&dir),
+                Box::new(|| start_proxy(&e, &dir, &plan, &host, &stop).map(|_| ())),
+            ),
+            (
+                pipewire::dir(&dir),
+                Box::new(|| start_pw_context(&e, &dir, &i, &host, &stop).map(|_| ())),
+            ),
+            (
+                pipewire::pulse_dir(&dir),
+                Box::new(|| start_pw_pulse(&e, &dir, &i, &host, &stop).map(|_| ())),
+            ),
+        ];
+        for (sidecar, start) in starts {
+            let locked = sidecar.join("x");
+            std::fs::create_dir_all(&locked).unwrap();
+            std::fs::write(locked.join("f"), b"").unwrap();
+            std::os::unix::fs::symlink(&sentinel, locked.join("out")).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, locked.join("up")).unwrap();
+            for d in [&locked, &sidecar] {
+                std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o000)).unwrap();
+            }
+
+            let got = start();
+
+            assert!(
+                !matches!(&got, Err(LaunchError::Io(p, _)) if p.starts_with(&sidecar)),
+                "{}: {got:?}",
+                sidecar.display()
+            );
+            if let Ok(m) = std::fs::symlink_metadata(&sidecar) {
+                std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o700)).unwrap();
+                assert!(m.is_dir(), "{}", sidecar.display());
+                assert_eq!(
+                    std::fs::read_dir(&sidecar).unwrap().count(),
+                    0,
+                    "{}: the tree is still there",
+                    sidecar.display()
+                );
+            }
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"sentinel");
+            assert_eq!((mode(&elsewhere), mode(&sentinel)), before);
+        }
+    }
+
     /// `PIPEWIRE_CONFIG_DIR` has no fallback for the main file, so a host
     /// holding none is a run that would fail inside a sidecar; it fails
     /// here instead, naming the file it looked for last.
@@ -5984,6 +6101,27 @@ mod tests {
             })
         ));
         assert!(!dbus::app_bus_path(dir, socket).exists());
+    }
+
+    #[test]
+    fn a_link_in_place_of_the_proxys_directory_is_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        std::fs::create_dir(&dir).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let socket = dbus::SESSION_SOCKET;
+        let _listener = UnixListener::bind(elsewhere.join(socket)).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dbus::socket_dir(&dir)).unwrap();
+        assert!(matches!(
+            adopt_proxy_bus(&dir, socket, dbus::SESSION_NODE, own_uid()),
+            Err(LaunchError::WrongType {
+                service: "dbus",
+                expected: "a directory",
+                ..
+            })
+        ));
+        assert!(elsewhere.join(socket).exists());
     }
 
     /// A pid no process has: a child that has already been reaped.

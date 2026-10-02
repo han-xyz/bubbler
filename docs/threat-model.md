@@ -81,8 +81,12 @@ Each of the three directories a sidecar writes — `<inst>/dbus`, `<inst>/pw`
 and `<inst>/pwpulse` — is removed and created afresh by bubbler before that
 sidecar starts, and the creation fails on anything still at the name, so a
 link a compromised sidecar left there in a run that ended without cleanup
-is never followed by a later start; a socket is adopted only out of a
-directory that is not a link, and only when this user owns it.
+is never followed by a later start, and a directory it made unreadable is
+given back to the user and removed rather than blocking every later start;
+a socket is adopted only out of a directory that is not a link, and only
+when this user owns it. Two starts of one instance racing over a dead
+run's control socket can both get this far, and the later one then
+removes the earlier one's sidecar directories: a known gap.
 
 ([A run is a chain of processes](manual.md#usage),
 [D-Bus](manual.md#d-bus), [network](manual.md#network),
@@ -93,6 +97,8 @@ directory that is not a link, and only when this user owns it.
 `a_sidecar_directory_is_made_afresh_whatever_is_at_its_name`,
 `a_dead_runs_links_in_the_pulse_directory_are_not_followed`,
 `a_link_in_place_of_the_socket_directory_is_not_followed`,
+`a_link_in_place_of_the_proxys_directory_is_not_followed`,
+`an_unreadable_tree_a_sidecar_left_does_not_block_its_start`,
 `proxy_argv_runs_the_proxy_in_its_own_sandbox`,
 `wl_proxy_argv_runs_the_proxy_in_its_own_sandbox`,
 `real_wayland_proxy_serves_the_only_socket_the_sandbox_sees`,
