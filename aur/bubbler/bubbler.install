@@ -13,9 +13,10 @@ NOTE
 _changed() {
   cat <<'NOTE'
 bubbler's WirePlumber policy changed in 0.24.2: until WirePlumber restarts,
-a sandbox with a pipewire or pulseaudio grant can record other applications,
-through a link of its own or a sink it offers, or give itself the microphone,
-and a microphone grant records nothing. Restart it:
+a sandbox with a pipewire grant can record other applications through a link
+of its own or a sink it offers, give itself the microphone, or silence host
+audio with a filter it offers, and a microphone grant records nothing.
+Restart it:
     systemctl --user restart wireplumber
 Any copy of the policy outside /usr/share (under ~/.config, ~/.local/share,
 /etc or /usr/local/share) is not updated by the package and is the one

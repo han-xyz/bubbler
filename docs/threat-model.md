@@ -888,7 +888,10 @@ session manager: for any `org.bubbler` client it refuses a link to
 another client's stream in either direction, a capture link to a sink
 (its monitor ports carry everything the session is playing, and they are
 reached through the sink's own read permission, which is the grant), and
-a capture link to a source for a context without `microphone`. Whoever
+a capture link to a source for a context without `microphone`, and any
+link at all to a sandbox's stream whose class is not `Stream/Output/Audio`
+or `Stream/Input/Audio`, which the audio grant does not cover (measured:
+until 0.24.2 such a stream was linked and the link then destroyed). Whoever
 owns the stream being linked, it also refuses a link to any node of an
 `org.bubbler` client that is not that stream's own: a sandbox can create
 nodes of its own, and measured on WirePlumber 0.5.18 and PipeWire 1.6.9,
@@ -949,16 +952,21 @@ an `org.bubbler` client at either end is destroyed when WirePlumber sees
 it, whoever made it and whether or not its maker is still connected,
 unless WirePlumber made it and it is one of that client's own streams in
 the stream's own direction: a `Stream/Output/Audio` as the link's
-output, a `Stream/Input/Audio` as its input. "WirePlumber" is any
+output, a `Stream/Input/Audio` as its input. The other end is not
+checked there: a link WirePlumber makes outside the linking hooks is
+kept whatever it reaches. "WirePlumber" is any
 instance of it, so a split setup's instances keep each other's links:
 the link's creator is a client carrying `wireplumber.daemon = "true"`
 and no `pipewire.sec.engine`. Any client may set the first on itself,
 but a client of a security context gets the second from the context's
 socket before it says anything and can neither change nor drop it
 (PipeWire 1.6.9, `module-protocol-native.c` and `impl-client.c`); a
-client outside every context is unconfined anyway. A link whose end's
-node, or that node's owner, WirePlumber does not know yet when the link
-appears is decided again once it does. A node a sandbox creates through
+client outside every context is unconfined anyway. A restricted client
+outside every context — another sandboxer's, an application on the
+portal path — can wear the marker too and keep a link it makes to a
+sandbox's stream; confining those clients is not bubbler's. A link whose
+end's node, or that node's owner, WirePlumber does not know yet when the
+link appears is decided again once it does, and so is the default. A node a sandbox creates through
 the `adapter` factory with `object.linger` set carries no `client.id`
 (`module-adapter.c`), so it would not be recognised as the sandbox's at
 all; until 0.24.2 a playback sandbox could make one (measured), and the
@@ -1036,6 +1044,15 @@ not. `camera` is unchanged by any of this: it reaches a device through
 the portal's own fd crossing and permission store, never through a
 `pipewire` or `pulseaudio` grant.
 
+Known gaps, with both files installed. A factory loaded into the daemon
+after a sandbox connected — a module loaded later — keeps that client's
+default permissions and is readable by it: the hook hides factories once,
+when the client's access is decided. Hiding `Audio/Duplex` from a
+playback sandbox also keeps it from playing into a duplex device, such as
+the single node of an ALSA pro-audio profile; that takes the `microphone`
+grant. A patchbay that re-creates a link the hook destroyed loops against
+the hook, each new link destroyed in turn.
+
 [Config (KDL)](manual.md#config-kdl), [Installing](manual.md#installing),
 [Linting](manual.md#linting) ·
 `the_context_properties_are_the_five_keys_in_order`,
@@ -1045,7 +1062,7 @@ the portal's own fd crossing and permission store, never through a
 `pw_pulse_argv_runs_the_pulse_server_in_its_own_sandbox`,
 `real_bwrap_pipewire_context_tags_the_client`,
 `real_bwrap_pulseaudio_serves_a_private_server`,
-`a_playback_context_sees_no_source_no_other_stream_and_no_metadata`,
+`a_playback_context_sees_no_source_no_metadata_and_only_reads_streams`,
 `a_playback_capture_stream_gets_no_link`,
 `a_playback_output_stream_links_to_the_sink`,
 `a_microphone_context_captures_from_the_null_source`,

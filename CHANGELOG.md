@@ -41,16 +41,17 @@
   to or from a sandbox's node that is not one of its own streams as
   WirePlumber linked it. Reinstall the policy (`bubbler audio-policy
   --print`, `--print --script`) and restart WirePlumber.
-- A sandbox with a `pipewire` or `pulseaudio` grant could record every host
+- A sandbox with a `pipewire` grant could record every host
   stream without making a link: an `Audio/Sink` it created with a high
   `priority.session` became the default sink where none was configured, and
   WirePlumber linked host streams into it (measured on WirePlumber 0.5.18;
   an `Audio/Source` it offered took host recorders the same way). The linking
   hook now refuses any link to a sandbox's node that is not that stream's
   own, and keeps a sandbox's nodes out of default-node selection so host
-  streams go to the host's default. The same reinstall and restart
-  applies.
-- A sandbox with a `pipewire` or `pulseaudio` grant could give itself the
+  streams go to the host's default; the default is decided again when a
+  sandbox's client becomes known after its node. The same reinstall and
+  restart applies.
+- A sandbox with a `pipewire` grant could give itself the
   `microphone` grant: the grant was the client property `bubbler.audio`,
   which a client may set on itself before WirePlumber sees it (measured: a
   client configured with `bubbler.audio = "playback,microphone"` recorded
@@ -59,10 +60,10 @@
   every grant gets the playback rules and a sandbox can still claim the
   microphone; bubbler now warns before a run when the installed drop-in or
   hook is not its own. The same reinstall and restart applies.
-- Without the `microphone` grant a sandbox could still see, and with a
-  claimed grant record, every source that is not exactly `Audio/Source`:
-  `Audio/Source/Virtual` (echo-cancel, noise suppression) and
-  `Audio/Duplex` (measured). The playback rules now hide every class
+- Without the `microphone` grant a sandbox could still see every source
+  that is not exactly `Audio/Source`: `Audio/Source/Virtual` (echo-cancel,
+  noise suppression) and `Audio/Duplex` (measured); with the claimed grant
+  above it could record them too, by the same rule (not measured). The playback rules now hide every class
   beginning `Audio/Source` and `Audio/Duplex`, and the linking hook refuses
   them by the same test; with the grant a sandbox records from them,
   `Audio/Duplex` included, which the hook used to refuse as a sink.
@@ -76,6 +77,9 @@
   owner, so no rule of the policy applied to it and it outlived the
   sandbox. The linking hook now takes every factory but `client-node`, the
   one streams are made through, away from a sandbox.
+- A sandbox's stream of a class other than `Stream/Output/Audio` or
+  `Stream/Input/Audio` was linked by WirePlumber and the link then
+  destroyed by the hook (measured); such a stream now gets no link.
 
 ## 0.24.1
 

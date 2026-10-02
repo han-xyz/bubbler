@@ -528,8 +528,9 @@ refuses a capture stream a link to another client's stream or to the sink's
 monitor ports, and what takes the link factory away so the sandbox cannot make
 those links itself, with every other factory but the one streams are made
 through. It also destroys any link to or from a sandbox's node that
-is not one of its own streams, a patchbay's included, and keeps a sink or
-source a sandbox offers from becoming the default. `run`, `--explain` and
+is not one of its own streams as WirePlumber linked it, so a link drawn in a
+patchbay is cut too, and keeps a sink or source a sandbox offers from
+becoming the default. `run`, `--explain` and
 `lint` each say which of the two is missing. After an upgrade that changes the
 policy, write both files again wherever they were installed and restart
 WirePlumber: the upgrade does not update a copy written here.")]

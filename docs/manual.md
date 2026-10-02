@@ -620,10 +620,13 @@ reaches every node the config did not ask for, while without the hook the
 grant is scoped and every other client's audio stays recordable.
 The hook also keeps a sandbox from linking anything itself, and destroys
 any link to or from a sandbox's node that is not one of its own streams
-as WirePlumber linked it, one you draw in a patchbay included. A sink or
-source a sandbox offers is never made the default and no host stream is
-linked to it. Before 0.24.2 a sandbox could still win a link of its own
-in the first instant of a new connection, now and then, and keep it, and
+as WirePlumber linked it, one you draw in a patchbay included. A sink,
+source or filter a sandbox offers through its own connection is never made
+the default and no host stream is linked to it: a host stream aimed at one
+plays on the default instead. What this does not cover is listed under
+"Audio" in `docs/threat-model.md`. Before 0.24.2 a sandbox could still win
+a link of its own in the first instant of a new connection, now and then,
+and keep it, and
 a sink it offered could become the default and take every host stream
 (measured on WirePlumber 0.5.18); a policy installed by an older bubbler
 keeps both open until both files are reinstalled and WirePlumber
@@ -4264,10 +4267,12 @@ and `bubbler lint` say which of the two is missing.
 Run the same commands again after an upgrade that changes the policy —
 0.24.2 does — and restart WirePlumber: a copy you wrote yourself is not
 updated by the upgrade, and a running WirePlumber keeps the hook it
-started with. That holds for every copy outside `/usr/share` — under
+started with. That holds for every copy no package installed — under
 `~/.config`, `~/.local/share`, `/etc/wireplumber` or
-`/usr/local/share/wireplumber` — since each is found before the packaged
-one; write it again or remove it.
+`/usr/local/share/wireplumber`, and under `/usr/share` for a source
+install — since a package updates only its own copy and each of the
+others is found before it; write it again, or remove it where the
+packaged one is installed.
 
 Packaging lives in a repository of its own, not in this one.
 
