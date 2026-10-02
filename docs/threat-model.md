@@ -909,7 +909,7 @@ the sink's monitor or another client's stream into the sandbox's own
 capture stream — and a sandbox can open connections and retry for as
 long as it likes. Since 0.24.2 the hook hides the factory *before* the
 manager attaches. The daemon holds a restricted client's requests until
-it may read the core, which the attach is what grants, and the attach
+it may read the core, which only the attach grants, and the attach
 changes only the default and the objects its rules match — never a
 factory — so no request of the sandbox's meets a readable factory: 0 in
 1400 attempts under the same load. Behind that, any link with a node of

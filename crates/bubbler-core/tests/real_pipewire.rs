@@ -1013,16 +1013,16 @@ fn no_context_makes_a_link_of_its_own() {
     let Some(bed) = PipeWireBed::start() else {
         return;
     };
-    let wav = bed.dir().join("tone.wav");
-    silence(&wav);
     for (props, grant) in [
         (PLAYBACK, "playback"),
         (PLAYBACK_MICROPHONE, "playback,microphone"),
     ] {
+        // Without end, so the port waited for below cannot be gone
+        // before a slow session manager has shown it to the context.
         let _other = streaming(
             &bed,
             PLAYBACK,
-            &format!("pw-cat -p {}", wav.display()),
+            "pw-cat -p -a - < /dev/zero",
             "Stream/Output/Audio",
         );
         // Autoconnect off, so the session manager never offers this
@@ -1068,7 +1068,9 @@ fn no_context_makes_a_link_of_its_own() {
 }
 
 /// How long the test below keeps opening fresh contexts: long enough for
-/// a few hundred, short enough for the normal suite.
+/// a few hundred, short enough for the normal suite. It runs wherever the
+/// bed can start, like every test here, and adds no load of its own; the
+/// measurement under load that motivated it is not part of the suite.
 const FRESH_CONTEXTS_FOR: Duration = Duration::from_secs(3);
 
 /// The longest a forbidden link may be seen alive. Not zero: should a
@@ -1113,6 +1115,7 @@ fn no_fresh_context_keeps_a_link_it_asks_for_in_its_first_instant() {
                 } else {
                     alive_since = None;
                 }
+                std::thread::sleep(Duration::from_millis(10));
             }
             longest
         });
@@ -1120,12 +1123,23 @@ fn no_fresh_context_keeps_a_link_it_asks_for_in_its_first_instant() {
         // instant before the session manager has acted on it.
         let deadline = Instant::now() + FRESH_CONTEXTS_FOR;
         let mut attempts = 0;
+        let mut refused = 0;
         while Instant::now() < deadline {
             let props = [PLAYBACK, PLAYBACK_MICROPHONE][attempts % 2];
             let source = ["bed-sink:monitor_FL", "pw-cat:output_FL"][attempts / 2 % 2];
-            bed.output_in_context(props, &format!("pw-link -L {source} pw-record:input_FL"));
+            let out =
+                bed.output_in_context(props, &format!("pw-link -L {source} pw-record:input_FL"));
+            if String::from_utf8_lossy(&out.stderr)
+                .contains("failed to link ports: No such file or directory")
+            {
+                refused += 1;
+            }
             attempts += 1;
         }
+        assert!(
+            refused > 0,
+            "none of {attempts} attempts was refused the link factory, so none measured it"
+        );
         std::thread::sleep(FORBIDDEN_LINK_LIFE);
         done.store(true, std::sync::atomic::Ordering::Relaxed);
         let longest = watcher.join().expect("the watcher thread");
@@ -1207,18 +1221,17 @@ fn a_link_to_a_bubbler_context_that_wireplumber_did_not_make_is_destroyed() {
         format!(r#"{{ "client.id": "{wireplumber}" }}"#),
     ] {
         for source in ["bed-sink:monitor_FL", "player:output_FL"] {
-            let made = bed
-                .command("pw-link")
+            // `pw-link`'s own answer cannot say a link was made: one
+            // destroyed before it settled is EINVAL, as are other faults
+            // (pw-link.c `link_proxy_destroy`). The hook's log line can.
+            let before = links_destroyed(&bed);
+            bed.command("pw-link")
                 .args(["-L", "-p", &claim, source, "thief:input_FL"])
                 .output()
                 .expect("pw-link did not run");
-            // EINVAL is `pw-link`'s word for a link removed before it
-            // settled (pw-link.c `link_proxy_destroy`): made, and
-            // destroyed faster than it could negotiate.
-            let said = String::from_utf8_lossy(&made.stderr);
-            assert!(
-                said.is_empty() || said.contains("failed to link ports: Invalid argument"),
-                "the host did not get its link from {source}: {made:?}"
+            wait_for(
+                &format!("the hook destroying a link from {source} claiming {claim}"),
+                || links_destroyed(&bed) == before + 1,
             );
             wait_for(
                 &format!("the end of a link from {source} claiming {claim}"),
@@ -1231,6 +1244,15 @@ fn a_link_to_a_bubbler_context_that_wireplumber_did_not_make_is_destroyed() {
         before.iter().all(|link| after.contains(link)),
         "WirePlumber's own links did not survive:\n{before:#?}\n{after:#?}"
     );
+}
+
+/// How many links the bed's linking hook has destroyed so far, by the
+/// line it logs for each.
+fn links_destroyed(bed: &PipeWireBed) -> usize {
+    std::fs::read_to_string(bed.dir().join("wireplumber.log"))
+        .unwrap_or_default()
+        .matches("destroying a link to a bubbler context")
+        .count()
 }
 
 /// The bed runs one WirePlumber, so a second instance of a split setup
@@ -1261,12 +1283,6 @@ fn only_a_session_manager_outside_every_context_keeps_a_link_to_a_bubbler_stream
             .take_while(|line| line.starts_with(' '))
             .any(|line| line.ends_with("bed-sink:playback_FR"))
     };
-    let destroyed = || {
-        std::fs::read_to_string(bed.dir().join("wireplumber.log"))
-            .unwrap_or_default()
-            .matches("destroying a link to a bubbler context")
-            .count()
-    };
 
     // `pw-cli` rather than `pw-link -m`, which makes the link again each
     // time it goes; a link `pw-cli` makes lives while it runs, and it runs
@@ -1286,11 +1302,11 @@ fn only_a_session_manager_outside_every_context_keeps_a_link_to_a_bubbler_stream
         Streaming(child)
     };
 
-    let before = destroyed();
+    let before = links_destroyed(&bed);
     let forged = crossing(bed.context_command(r#"{ "wireplumber.daemon": "true" }"#, "pw-cli"));
     wait_for(
         "the destruction of a link from a context claiming to be WirePlumber",
-        || destroyed() == before + 1,
+        || links_destroyed(&bed) == before + 1,
     );
     assert!(!crossed(), "{}", bed.links());
     drop(forged);
@@ -1319,7 +1335,7 @@ fn only_a_session_manager_outside_every_context_keeps_a_link_to_a_bubbler_stream
         "a second session manager's link was destroyed:\n{}",
         bed.links()
     );
-    assert_eq!(destroyed(), before + 1);
+    assert_eq!(links_destroyed(&bed), before + 1);
 }
 
 /// A context under `props` offers a device node ranked above the bed's

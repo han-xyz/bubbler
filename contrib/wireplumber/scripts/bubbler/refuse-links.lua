@@ -44,6 +44,13 @@
 -- own, a capture stream only to an `Audio/Source`, and only where the
 -- instance was granted `microphone`; and the sandbox links nothing
 -- itself.
+--
+-- Nor is anything linked to a sandbox's node that is not one of its own
+-- streams — a sink, source or filter it offers takes no host stream —
+-- and no such node becomes the session's default. A link to or from a
+-- sandbox's node that is not one of its own streams as WirePlumber
+-- linked it is destroyed once WirePlumber sees it, one drawn in a
+-- patchbay included.
 
 local lutils = require ("linking-utils")
 local log = Log.open_topic ("s-linking")
@@ -199,8 +206,8 @@ SimpleEventHook {
     end
     local factory = factories:lookup {}
     if not factory then
-      log:warning (client, "no link factory in the graph: a sandbox that can \
-          see two nodes can link them itself")
+      log:warning (client, "no link factory in the graph: a sandbox that " ..
+          "can see two nodes can link them itself")
       return
     end
     -- No permission at all, not read-only: measured on PipeWire 1.6.8,

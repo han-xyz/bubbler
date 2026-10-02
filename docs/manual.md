@@ -4257,7 +4257,10 @@ and `bubbler lint` say which of the two is missing.
 Run the same commands again after an upgrade that changes the policy —
 0.24.2 does — and restart WirePlumber: a copy you wrote yourself is not
 updated by the upgrade, and a running WirePlumber keeps the hook it
-started with.
+started with. That holds for every copy outside `/usr/share` — under
+`~/.config`, `~/.local/share`, `/etc/wireplumber` or
+`/usr/local/share/wireplumber` — since each is found before the packaged
+one; write it again or remove it.
 
 Packaging lives in a repository of its own, not in this one.
 
