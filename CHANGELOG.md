@@ -14,6 +14,11 @@
   server, D-Bus proxy, pasta, egress proxy) inherited bubbler's stdio, so one
   compromised through the sandbox held the caller's terminal; they now get
   `/dev/null` and a pipe bubbler copies to its own stderr.
+- A link a compromised audio or D-Bus sidecar left in its own directory was
+  followed by the next start of the instance after a run that ended without
+  cleanup, writing or unlinking files in a host directory of its choosing;
+  those directories are now made afresh at every start, and the D-Bus proxy's
+  socket is refused unless this user owns it.
 
 ## 0.24.1
 

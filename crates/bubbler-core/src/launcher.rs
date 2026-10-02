@@ -1441,7 +1441,7 @@ pub fn start_pw_context(
     service::require_socket(host, "pipewire", pipewire::host_socket(&env.runtime_dir))?;
     // The sidecar's whole `/tmp`, and the only thing it can write.
     let pw = pipewire::dir(dir);
-    mkdir_private(&pw)?;
+    fresh_sidecar_dir(&pw)?;
     // The pid of this run: two runs of one instance are then two
     // contexts on the daemon's side rather than one name used twice.
     let run_id = std::process::id().to_string();
@@ -1561,7 +1561,21 @@ fn adopt_socket(
 ) -> Result<FileGuard, LaunchError> {
     let (from_dir, made) = from;
     let (to_dir, name) = to;
-    let source = open_dir(from_dir)?;
+    // `from_dir` may be one the sidecar made or replaced (the pulse
+    // server's `pulse`), so a link at its name is refused, not followed.
+    let source = rustix::fs::open(
+        from_dir,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| match e {
+        Errno::LOOP | Errno::NOTDIR => LaunchError::WrongType {
+            service,
+            path: from_dir.to_path_buf(),
+            expected: "a directory",
+        },
+        e => LaunchError::Io(from_dir.to_path_buf(), e.into()),
+    })?;
     let target = open_dir(to_dir)?;
     let path = to_dir.join(name);
     rustix::fs::renameat(&source, made, &target, name).map_err(|e| match e {
@@ -1689,27 +1703,10 @@ pub fn start_pw_pulse(
     // comes up with no protocol to serve, and the run would fail on the
     // readiness deadline rather than on the package that is missing.
     service::require_file(host, "pulseaudio", PathBuf::from(pipewire::PULSE_MODULE))?;
-    // The sidecar's whole `/tmp`, and the only thing it can write.
+    prepare_pulse_dir(env, host, dir)?;
     let pw = pipewire::pulse_dir(dir);
-    mkdir_private(&pw)?;
-    // The server binds the address it is given and creates no directory
-    // for it (measured on 1.6.8: "bind() to '/tmp/pulse/native' failed:
-    // No such file or directory"), so this is bubbler's to make.
     let made_in = pipewire::pulse_socket_dir(dir);
-    mkdir_private(&made_in)?;
     let made = made_in.join(pipewire::PULSE_NATIVE);
-    // What a run that was killed before its handle could clean up left
-    // there, removed the way the Wayland listener's is: readiness below
-    // is this name appearing, so a leftover would be taken for the new
-    // server's socket while that server was still starting. A second run
-    // of one instance is refused long before this, so anything at this
-    // name is a dead run's.
-    if let Err(e) = std::fs::remove_file(&made)
-        && e.kind() != io::ErrorKind::NotFound
-    {
-        return Err(LaunchError::Io(made.clone(), e));
-    }
-    write_pulse_config(env, host, dir)?;
     let mut alloc = RealAlloc::sidecar(dir.to_path_buf());
     let argv = pw_pulse_argv(env, dir, host, &mut alloc)?;
     let cmd = bwrap_command(&argv, &mut alloc)?;
@@ -1748,6 +1745,21 @@ pub fn start_pw_pulse(
         env.uid,
     )?);
     Ok(Some(handle))
+}
+
+/// Make the private pulse server's directory and write what it reads
+/// there, before the server is started.
+fn prepare_pulse_dir(env: &Env, host: &dyn Host, dir: &Path) -> Result<(), LaunchError> {
+    // The sidecar's whole `/tmp`, and the only thing it can write; made
+    // afresh, so nothing a dead run left there is taken for the new
+    // server's socket (readiness is `native` appearing) or written through.
+    fresh_sidecar_dir(&pipewire::pulse_dir(dir))?;
+    // The server binds the address it is given and creates no directory
+    // for it (measured on 1.6.8: "bind() to '/tmp/pulse/native' failed:
+    // No such file or directory"), so this is bubbler's to make.
+    mkdir_private(&pipewire::pulse_socket_dir(dir))?;
+    write_pulse_config(env, host, dir)?;
+    Ok(())
 }
 
 /// Write the configuration of this run's private PulseAudio server into
@@ -1866,7 +1878,7 @@ pub fn start_proxy(
     }
     // The proxy gets this directory and nothing else of the instance's
     // runtime state, so it is created here rather than bound from above.
-    mkdir_private(&dbus::socket_dir(dir))?;
+    fresh_sidecar_dir(&dbus::socket_dir(dir))?;
     let mut alloc = RealAlloc::sidecar(dir.to_path_buf());
     let argv = proxy_argv(
         env,
@@ -2716,7 +2728,8 @@ fn open_dir(path: &Path) -> Result<OwnedFd, LaunchError> {
 }
 
 /// Move the proxy's socket out of the one directory the proxy can write
-/// to, then prove that what was moved really is a socket. The returned
+/// to, then prove that what was moved really is a socket of this user's
+/// (`uid`). The returned
 /// guard removes the moved entry when the run ends.
 ///
 /// The proxy keeps serving after the move: it listens on the socket it
@@ -2730,7 +2743,12 @@ fn open_dir(path: &Path) -> Result<OwnedFd, LaunchError> {
 // type of the target and bwrap would bind that target.
 // `node` is the config node that granted this bus, so a failure names what
 // the user would have to change rather than the sidecar that failed.
-fn adopt_proxy_bus(dir: &Path, socket: &str, node: &'static str) -> Result<FileGuard, LaunchError> {
+fn adopt_proxy_bus(
+    dir: &Path,
+    socket: &str,
+    node: &'static str,
+    uid: u32,
+) -> Result<FileGuard, LaunchError> {
     let from = open_dir(&dbus::socket_dir(dir))?;
     let to = open_dir(dir)?;
     let path = dbus::app_bus_path(dir, socket);
@@ -2743,10 +2761,10 @@ fn adopt_proxy_bus(dir: &Path, socket: &str, node: &'static str) -> Result<FileG
     })?;
     // Whatever was moved is bubbler's to remove from here on, socket or not.
     let guard = FileGuard(path.clone());
-    let wrong_type = || LaunchError::WrongType {
+    let wrong_type = |expected| LaunchError::WrongType {
         service: node,
         path: path.clone(),
-        expected: "a socket",
+        expected,
     };
     let bus = rustix::fs::openat(
         &to,
@@ -2755,7 +2773,7 @@ fn adopt_proxy_bus(dir: &Path, socket: &str, node: &'static str) -> Result<FileG
         Mode::empty(),
     )
     .map_err(|e| match e {
-        Errno::LOOP => wrong_type(),
+        Errno::LOOP => wrong_type("a socket"),
         e => LaunchError::Io(path.clone(), e.into()),
     })?;
     let stat = rustix::fs::fstat(&bus).map_err(|e| LaunchError::Io(path.clone(), e.into()))?;
@@ -2766,7 +2784,10 @@ fn adopt_proxy_bus(dir: &Path, socket: &str, node: &'static str) -> Result<FileG
         if kind == rustix::fs::FileType::Directory {
             remove_moved_dir(&to, socket, &path);
         }
-        return Err(wrong_type());
+        return Err(wrong_type("a socket"));
+    }
+    if stat.st_uid != uid {
+        return Err(wrong_type("a socket owned by this user"));
     }
     Ok(guard)
 }
@@ -2798,6 +2819,24 @@ fn mkdir_private(dir: &Path) -> Result<(), LaunchError> {
         Ok(()) | Err(Errno::EXIST) => Ok(()),
         Err(e) => Err(LaunchError::Io(dir.to_path_buf(), e.into())),
     }
+}
+
+/// Remove whatever is at `dir` and create it again, mode 0700, failing on
+/// an entry that is still there. Called before the sidecar that writes
+/// `dir` is started, so what a dead run's sidecar left in it — a link
+/// out of the runtime directory above all — is never followed by
+/// anything bubbler writes or unlinks there. Only after the instance's
+/// control socket is bound, so it is never a live run's directory.
+fn fresh_sidecar_dir(dir: &Path) -> Result<(), LaunchError> {
+    let io_at = |e: io::Error| LaunchError::Io(dir.to_path_buf(), e);
+    // A link is unlinked itself: `symlink_metadata` does not follow it.
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(dir).map_err(io_at)?,
+        Ok(_) => std::fs::remove_file(dir).map_err(io_at)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io_at(e)),
+    }
+    rustix::fs::mkdir(dir, Mode::RWXU).map_err(|e| io_at(e.into()))
 }
 
 /// Create `$XDG_RUNTIME_DIR/bubbler/<name>/` with mode 0700; an existing
@@ -3389,7 +3428,7 @@ pub fn run(
     let mut buses: Vec<FileGuard> = Vec::new();
     if let Some(plan) = &plan {
         for (socket, node) in plan.buses() {
-            buses.push(adopt_proxy_bus(&dir, socket, node)?);
+            buses.push(adopt_proxy_bus(&dir, socket, node, env.uid)?);
         }
     }
     // Before the argv is built, for the same reason the D-Bus proxy is:
@@ -4984,6 +5023,125 @@ mod tests {
         assert_eq!(mode(cfg.join(pipewire::PULSE_DROP_IN)), 0o600);
     }
 
+    /// A sidecar can write its own directory, so a dead run can leave a
+    /// link there to a host directory the sidecar chose. Planted where a
+    /// file bubbler writes or unlinks is: in the pulse directory itself
+    /// and in both subdirectories.
+    #[test]
+    fn a_dead_runs_links_in_the_pulse_directory_are_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let source = e.config_home.join("pipewire").join(pipewire::PULSE_CONF);
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "pulse.properties = {}\n").unwrap();
+        let dir = instance_runtime_dir(&e, "t");
+        let pw = pipewire::pulse_dir(&dir);
+        std::fs::create_dir_all(&pw).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let sentinels = [pipewire::PULSE_NATIVE, pipewire::PULSE_CONF];
+        for name in sentinels {
+            std::fs::write(elsewhere.join(name), b"sentinel").unwrap();
+        }
+        std::os::unix::fs::symlink(&elsewhere, pipewire::pulse_socket_dir(&dir)).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, pipewire::pulse_config_dir(&dir)).unwrap();
+
+        prepare_pulse_dir(&e, &RealHost, &dir).unwrap();
+
+        for name in sentinels {
+            assert_eq!(
+                std::fs::read(elsewhere.join(name)).ok().as_deref(),
+                Some(&b"sentinel"[..]),
+                "{name} outside the runtime directory was touched"
+            );
+        }
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 2);
+        for made in [
+            pipewire::pulse_socket_dir(&dir),
+            pipewire::pulse_config_dir(&dir),
+        ] {
+            assert!(
+                std::fs::symlink_metadata(&made).unwrap().is_dir(),
+                "{} is not a directory of its own",
+                made.display()
+            );
+        }
+
+        // A link in place of the pulse directory itself.
+        std::fs::remove_dir_all(&pw).unwrap();
+        std::fs::remove_file(elsewhere.join(pipewire::PULSE_CONF)).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &pw).unwrap();
+        prepare_pulse_dir(&e, &RealHost, &dir).unwrap();
+        assert!(std::fs::symlink_metadata(&pw).unwrap().is_dir());
+        assert!(!elsewhere.join(pipewire::PULSE_CONF).exists());
+        assert!(!elsewhere.join("cfg").exists());
+    }
+
+    /// The pulse server can replace the directory its socket is made in
+    /// while it runs; the socket is then looked for there, never in the
+    /// host directory a link names, and nothing there is moved or removed.
+    #[test]
+    fn a_link_in_place_of_the_socket_directory_is_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        std::fs::create_dir(&dir).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join(pipewire::PULSE_NATIVE), b"sentinel").unwrap();
+        std::fs::create_dir(pipewire::pulse_dir(&dir)).unwrap();
+        let made_in = pipewire::pulse_socket_dir(&dir);
+        std::os::unix::fs::symlink(&elsewhere, &made_in).unwrap();
+        assert!(matches!(
+            adopt_socket(
+                "pulseaudio",
+                (&made_in, pipewire::PULSE_NATIVE),
+                (&dir, pipewire::PULSE_ADOPTED),
+                rustix::process::getuid().as_raw(),
+            ),
+            Err(LaunchError::WrongType {
+                service: "pulseaudio",
+                expected: "a directory",
+                ..
+            })
+        ));
+        assert_eq!(
+            std::fs::read(elsewhere.join(pipewire::PULSE_NATIVE))
+                .ok()
+                .as_deref(),
+            Some(&b"sentinel"[..])
+        );
+    }
+
+    /// The same for the two other directories a sidecar writes: whatever
+    /// a dead run left at their name is replaced by a fresh directory, a
+    /// link included, and what it pointed at is left alone.
+    #[test]
+    fn a_sidecar_directory_is_made_afresh_whatever_is_at_its_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        std::fs::create_dir(&dir).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("sentinel"), b"sentinel").unwrap();
+        for sidecar in [pipewire::dir(&dir), dbus::socket_dir(&dir)] {
+            std::os::unix::fs::symlink(&elsewhere, &sidecar).unwrap();
+            fresh_sidecar_dir(&sidecar).unwrap();
+            let made = std::fs::symlink_metadata(&sidecar).unwrap();
+            assert!(made.is_dir(), "{} is still a link", sidecar.display());
+            assert_eq!(std::fs::read_dir(&sidecar).unwrap().count(), 0);
+            assert!(elsewhere.join("sentinel").exists());
+
+            std::fs::write(sidecar.join("left"), b"").unwrap();
+            fresh_sidecar_dir(&sidecar).unwrap();
+            assert_eq!(std::fs::read_dir(&sidecar).unwrap().count(), 0);
+
+            std::fs::remove_dir(&sidecar).unwrap();
+            std::fs::write(&sidecar, b"").unwrap();
+            fresh_sidecar_dir(&sidecar).unwrap();
+            assert!(std::fs::symlink_metadata(&sidecar).unwrap().is_dir());
+        }
+    }
+
     /// `PIPEWIRE_CONFIG_DIR` has no fallback for the main file, so a host
     /// holding none is a run that would fail inside a sidecar; it fails
     /// here instead, naming the file it looked for last.
@@ -5625,7 +5783,7 @@ mod tests {
             let dir = tmp.path();
             std::fs::create_dir(dbus::socket_dir(dir)).unwrap();
             let listener = UnixListener::bind(dbus::proxy_bus_path(dir, socket)).unwrap();
-            let guard = adopt_proxy_bus(dir, socket, dbus::SESSION_NODE).unwrap();
+            let guard = adopt_proxy_bus(dir, socket, dbus::SESSION_NODE, own_uid()).unwrap();
             let moved = std::fs::symlink_metadata(dbus::app_bus_path(dir, socket)).unwrap();
             assert!(std::os::unix::fs::FileTypeExt::is_socket(
                 &moved.file_type()
@@ -5645,7 +5803,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir(dbus::socket_dir(tmp.path())).unwrap();
         assert!(matches!(
-            adopt_proxy_bus(tmp.path(), dbus::SYSTEM_SOCKET, dbus::SYSTEM_NODE),
+            adopt_proxy_bus(
+                tmp.path(),
+                dbus::SYSTEM_SOCKET,
+                dbus::SYSTEM_NODE,
+                own_uid()
+            ),
             Err(LaunchError::MissingResource {
                 service: "system-bus",
                 ..
@@ -5660,7 +5823,7 @@ mod tests {
         let socket = dbus::SESSION_SOCKET;
         std::fs::create_dir(dbus::socket_dir(dir)).unwrap();
         assert!(matches!(
-            adopt_proxy_bus(dir, socket, dbus::SESSION_NODE),
+            adopt_proxy_bus(dir, socket, dbus::SESSION_NODE, own_uid()),
             Err(LaunchError::MissingResource {
                 service: "dbus",
                 ..
@@ -5670,7 +5833,7 @@ mod tests {
         // of its target, and bwrap would bind that target.
         std::os::unix::fs::symlink("/etc", dbus::proxy_bus_path(dir, socket)).unwrap();
         assert!(matches!(
-            adopt_proxy_bus(dir, socket, dbus::SESSION_NODE),
+            adopt_proxy_bus(dir, socket, dbus::SESSION_NODE, own_uid()),
             Err(LaunchError::WrongType {
                 service: "dbus",
                 expected: "a socket",
@@ -5689,7 +5852,7 @@ mod tests {
         );
         std::fs::write(dbus::proxy_bus_path(dir, socket), b"").unwrap();
         assert!(matches!(
-            adopt_proxy_bus(dir, socket, dbus::SESSION_NODE),
+            adopt_proxy_bus(dir, socket, dbus::SESSION_NODE, own_uid()),
             Err(LaunchError::WrongType {
                 service: "dbus",
                 expected: "a socket",
@@ -5703,7 +5866,7 @@ mod tests {
         std::fs::create_dir(dbus::proxy_bus_path(dir, socket)).unwrap();
         std::fs::write(dbus::proxy_bus_path(dir, socket).join("x"), b"").unwrap();
         assert!(matches!(
-            adopt_proxy_bus(dir, socket, dbus::SESSION_NODE),
+            adopt_proxy_bus(dir, socket, dbus::SESSION_NODE, own_uid()),
             Err(LaunchError::WrongType {
                 service: "dbus",
                 expected: "a socket",
@@ -5716,9 +5879,31 @@ mod tests {
         );
         // And the next honest start works.
         let listener = UnixListener::bind(dbus::proxy_bus_path(dir, socket)).unwrap();
-        adopt_proxy_bus(dir, socket, dbus::SESSION_NODE)
+        adopt_proxy_bus(dir, socket, dbus::SESSION_NODE, own_uid())
             .expect("a socket after a refused directory");
         drop(listener);
+    }
+
+    fn own_uid() -> u32 {
+        rustix::process::getuid().as_raw()
+    }
+
+    #[test]
+    fn a_proxied_socket_of_another_user_stops_the_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let socket = dbus::SESSION_SOCKET;
+        std::fs::create_dir(dbus::socket_dir(dir)).unwrap();
+        let _listener = UnixListener::bind(dbus::proxy_bus_path(dir, socket)).unwrap();
+        assert!(matches!(
+            adopt_proxy_bus(dir, socket, dbus::SESSION_NODE, own_uid() + 1),
+            Err(LaunchError::WrongType {
+                service: "dbus",
+                expected: "a socket owned by this user",
+                ..
+            })
+        ));
+        assert!(!dbus::app_bus_path(dir, socket).exists());
     }
 
     /// A pid no process has: a child that has already been reaped.

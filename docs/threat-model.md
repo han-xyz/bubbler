@@ -77,11 +77,22 @@ Ten processes can come with a sandbox, and they are not one kind of thing:
 | `bubbler-net-proxy` | on the host, **not in a bwrap**: it joins the sandbox's user, network and mount namespaces and listens on `127.0.0.1:3128` inside, only with an `allow-host` | **Yes, one way.** It is the sandbox's only route out — the ruleset accepts its cgroup and rejects everything else — and it authorises each `CONNECT` target against the allowlist it was given as argv. It holds **no capability**: permitted, effective, inheritable and ambient are all emptied, with `SECBIT_NOROOT|SECBIT_NOROOT_LOCKED` set first because bwrap's outer user namespace maps bubbler to uid 0 and an `execve` without those bits would hand it the full set in the sandbox's user namespace (measured). So it cannot open `AF_PACKET` on the tap and cannot read or flush the sandbox's ruleset, which is what a `CAP_NET_RAW` or `CAP_NET_ADMIN` sidecar would have handed whoever found a bug in it. What a compromised one does get is the sandbox's filesystem view, the resolvers bubbler named on its argv and the hosts the config named; it does **not** take its answers from the sandbox — it carries its own DNS client and never calls `getaddrinfo`, because NSS inside that mount namespace is the application's to answer (measured 2026-08-28: an application that binds `/run/systemd/resolve/io.systemd.Resolve` in the `/run` tmpfs it owns answers every lookup in the namespace, and a `CONNECT` to a listed name went to an address it chose); it sees ciphertext, since it relays bytes after `200` and terminates no TLS. Its cwd is `/` in the sandbox's mount namespace, its stdin and stdout are `/dev/null` and its stderr a pipe bubbler copies to its own, it is non-dumpable, it dies with bubbler (`PR_SET_PDEATHSIG`) and it runs with **no seccomp filter** in v1 — one of the two rows here without one, beside `nft`, which is a one-shot host binary that exits before the application runs; the two sidecar sandboxes and the instance's own carry the default filter, and pasta loads one of its own making. What stands in for that: the empty capability sets, `PR_SET_NO_NEW_PRIVS`, a crate that is `#![deny(unsafe_code)]` apart from one descriptor adoption, an allowlist and a resolver list that are argv rather than files the sandbox could touch, and a fuzzed parser for both the request and the DNS answer. |
 | `nft` | on the host, entering the sandbox's user and network namespaces to install the ruleset | **Not a party to one.** It builds the network boundary rather than standing in it: it runs before pasta and before the sandbox is let go of its `--block-fd`, so the namespace has a policy before it has a route and before the application has run an instruction either way. Nothing the sandbox controls reaches it — the ruleset is generated from typed values and handed over on stdin, and its argv is two fixed arguments. It holds CAP_NET_ADMIN in the sandbox's user namespace and no other capability anywhere: the capability crosses `execve` through the ambient set, and `SECBIT_NOROOT` with `_LOCKED` stops the uid-0 that bwrap's nested user namespace maps bubbler to from being handed the full set. It exits before the run begins, and one that stops answering is killed rather than left holding that capability. |
 
+Each of the three directories a sidecar writes — `<inst>/dbus`, `<inst>/pw`
+and `<inst>/pwpulse` — is removed and created afresh by bubbler before that
+sidecar starts, and the creation fails on anything still at the name, so a
+link a compromised sidecar left there in a run that ended without cleanup
+is never followed by a later start; a socket is adopted only out of a
+directory that is not a link, and only when this user owns it.
+
 ([A run is a chain of processes](manual.md#usage),
 [D-Bus](manual.md#d-bus), [network](manual.md#network),
 [Config (KDL)](manual.md#config-kdl);
 `the_proxy_never_sees_the_instances_control_socket`,
 `a_proxied_socket_is_moved_out_of_the_proxys_reach`,
+`a_proxied_socket_of_another_user_stops_the_run`,
+`a_sidecar_directory_is_made_afresh_whatever_is_at_its_name`,
+`a_dead_runs_links_in_the_pulse_directory_are_not_followed`,
+`a_link_in_place_of_the_socket_directory_is_not_followed`,
 `proxy_argv_runs_the_proxy_in_its_own_sandbox`,
 `wl_proxy_argv_runs_the_proxy_in_its_own_sandbox`,
 `real_wayland_proxy_serves_the_only_socket_the_sandbox_sees`,

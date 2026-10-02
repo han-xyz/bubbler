@@ -3987,7 +3987,8 @@ earlier run, and binds the control socket `init.sock` in it; a sandboxed
 `bubbler-wl-proxy` serves, and beside it `wayland-context`, where the
 compositor accepts the security context; a `dbus`, `system-bus` or `a11y` grant
 adds the subdirectory
-`dbus/` the proxy creates its sockets in and the checked sockets `bus`,
+`dbus/` the proxy creates its sockets in, removed and made afresh at every
+start, and the checked sockets `bus`,
 `system` and `a11y` — one per granted bus — beside it, and a `portals` grant adds
 `$XDG_RUNTIME_DIR/.flatpak/bubbler-<name>/`, creating `.flatpak/` if it is
 missing. Everything a run makes there is removed again when it ends, with one
