@@ -1090,7 +1090,7 @@ impl Drop for ProxyHandle {
         }
         // The directory is bubbler's own and holds only what the proxy put
         // there; the socket it served has been moved out of it already.
-        let _ = std::fs::remove_dir_all(&self.socket_dir);
+        remove_sidecar_dir(&self.socket_dir);
     }
 }
 
@@ -1414,7 +1414,7 @@ impl Drop for PwHandle {
         self.alloc.ready_read.take();
         // The directory is bubbler's own and holds nothing but the
         // context socket; the sandbox that bound it has exited by now.
-        let _ = std::fs::remove_dir_all(&self.dir);
+        remove_sidecar_dir(&self.dir);
     }
 }
 
@@ -1615,7 +1615,7 @@ fn adopt_socket(
         // A directory cannot be unlinked as a file, and one left at this
         // name would fail the rename of every later start of the instance.
         if kind == rustix::fs::FileType::Directory {
-            remove_moved_dir(&target, name, &path);
+            remove_moved_dir(&target, to_dir, name);
         }
         return Err(wrong_type("a socket"));
     }
@@ -1675,7 +1675,7 @@ impl Drop for PulseHandle {
         self.alloc.fds.clear();
         // The directory is bubbler's own and holds nothing but this
         // server's; the sandbox that bound its socket has exited by now.
-        let _ = std::fs::remove_dir_all(&self.dir);
+        remove_sidecar_dir(&self.dir);
     }
 }
 
@@ -2807,7 +2807,7 @@ fn adopt_proxy_bus(
         // A directory cannot be unlinked as a file, and one left at this
         // name would fail the rename of every later start of the instance.
         if kind == rustix::fs::FileType::Directory {
-            remove_moved_dir(&to, socket, &path);
+            remove_moved_dir(&to, dir, socket);
         }
         return Err(wrong_type("a socket"));
     }
@@ -2817,11 +2817,15 @@ fn adopt_proxy_bus(
     Ok(guard)
 }
 
-/// Remove a directory the proxy planted where its socket belongs. Whatever
-/// it holds goes with it: after the move nothing but bubbler can reach it.
-fn remove_moved_dir(inst: &OwnedFd, socket: &str, path: &Path) {
-    if rustix::fs::unlinkat(inst, socket, AtFlags::REMOVEDIR).is_err() {
-        let _ = std::fs::remove_dir_all(path);
+/// Clear the name of a directory a sidecar planted where its socket
+/// belongs, so the next start's rename onto it does not fail. Whatever it
+/// holds goes with it: after the move nothing but bubbler can reach it.
+fn remove_moved_dir(inst: &OwnedFd, dir: &Path, socket: &str) {
+    if let Err(e) = move_aside(inst, dir, OsStr::new(socket)) {
+        eprintln!(
+            "bubbler: warning: {} could not be moved aside ({e}); later starts will fail until it is removed",
+            dir.join(socket).display()
+        );
     }
 }
 
@@ -2866,31 +2870,47 @@ fn fresh_sidecar_dir(dir: &Path) -> Result<(), LaunchError> {
         unreachable!("a sidecar directory is named inside the instance's");
     };
     let at = open_dir(parent)?;
-    let moved = match rustix::fs::statat(&at, name, AtFlags::SYMLINK_NOFOLLOW) {
-        Err(Errno::NOENT) => None,
+    match rustix::fs::statat(&at, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Err(Errno::NOENT) => {}
         Err(e) => return Err(io_at(e)),
-        // Within the one directory bubbler owns, so no mode or depth of
-        // the tree can refuse it, and a link is moved as the link.
-        Ok(_) => Some(
-            rename_to_free(&at, name, &at, &mut 0, |seq| leftover_name(name, seq))
-                .map_err(io_at)?,
-        ),
-    };
-    rustix::fs::mkdirat(&at, name, Mode::RWXU).map_err(io_at)?;
-    clear_leftovers(&at, name);
-    if let Some(moved) = moved
-        && rustix::fs::statat(&at, &moved, AtFlags::SYMLINK_NOFOLLOW).is_ok()
-    {
+        Ok(_) => move_aside(&at, parent, name).map_err(io_at)?,
+    }
+    rustix::fs::mkdirat(&at, name, Mode::RWXU).map_err(io_at)
+}
+
+/// Rename `name` under `at` (the directory `dir`) aside and remove it
+/// best-effort with every earlier leftover of that name, saying so when
+/// it could not be removed in full. The rename is within the one
+/// directory bubbler owns, so no mode or depth of the tree can refuse it,
+/// and a link is moved as the link.
+fn move_aside(at: &OwnedFd, dir: &Path, name: &OsStr) -> rustix::io::Result<()> {
+    let moved = rename_to_free(at, name, at, &mut 0, |seq| leftover_name(name, seq))?;
+    clear_leftovers(at, name);
+    if rustix::fs::statat(at, &moved, AtFlags::SYMLINK_NOFOLLOW).is_ok() {
         eprintln!(
-            "bubbler: warning: {} is what a dead run's sidecar left and could not be removed in full; the next start tries again",
-            parent.join(moved).display()
+            "bubbler: warning: {} is what a sidecar left and could not be removed in full; the next start tries again",
+            dir.join(moved).display()
         );
     }
     Ok(())
 }
 
-/// `<name>.leftover.<pid>.<seq>`: where [`fresh_sidecar_dir`] moves what
-/// it found at `name`. Only bubbler can write the instance's runtime
+/// Remove a sidecar's directory once the sidecar has exited, best-effort
+/// and within the budget: `std::fs::remove_dir_all` recurses, and a tree
+/// deep enough overflows the stack and aborts bubbler. What is left is
+/// moved aside by the next start.
+fn remove_sidecar_dir(dir: &Path) {
+    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
+        return;
+    };
+    let Ok(at) = open_dir(parent) else {
+        return;
+    };
+    let _ = remove_tree(&at, name, &mut LEFTOVER_BUDGET.clone());
+}
+
+/// `<name>.leftover.<pid>.<seq>`: where [`move_aside`] moves what it
+/// found at `name`. Only bubbler can write the instance's runtime
 /// directory, so the name has no one to be guessed by.
 fn leftover_name(name: &OsStr, seq: u64) -> OsString {
     let mut aside = leftover_prefix(name);
@@ -6291,6 +6311,123 @@ mod tests {
         adopt_proxy_bus(dir, socket, dbus::SESSION_NODE, own_uid())
             .expect("a socket after a refused directory");
         drop(listener);
+    }
+
+    /// A proxy can plant a tree no walk finishes where its socket belongs:
+    /// deeper than the descriptor limit, with a level no one may open and
+    /// links out. It is refused, nothing it links to changes, and nothing
+    /// is left at the socket's name to fail the next start.
+    #[test]
+    fn a_deep_unreadable_tree_at_a_proxy_sockets_name_does_not_block_the_next_start() {
+        use std::os::unix::fs::PermissionsExt;
+        with_desktop_fd_limit(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let elsewhere = tmp.path().join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            let sentinel = elsewhere.join("sentinel");
+            std::fs::write(&sentinel, b"sentinel").unwrap();
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+            let before = (mode(&elsewhere), mode(&sentinel));
+            let dir = tmp.path().join("t");
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::create_dir(dbus::socket_dir(&dir)).unwrap();
+            let socket = dbus::SESSION_SOCKET;
+            let planted = dbus::proxy_bus_path(&dir, socket);
+            let bottom = plant_chain(&planted, 1500);
+            rustix::fs::mkdirat(&bottom, "locked", Mode::RWXU).unwrap();
+            let locked = rustix::fs::openat(
+                &bottom,
+                "locked",
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .unwrap();
+            rustix::fs::symlinkat(&sentinel, &locked, "out").unwrap();
+            rustix::fs::symlinkat(&elsewhere, &locked, "up").unwrap();
+            rustix::fs::chmod(
+                format!("/proc/self/fd/{}", locked.as_raw_fd()),
+                Mode::empty(),
+            )
+            .unwrap();
+
+            assert!(matches!(
+                adopt_proxy_bus(&dir, socket, dbus::SESSION_NODE, own_uid()),
+                Err(LaunchError::WrongType {
+                    expected: "a socket",
+                    ..
+                })
+            ));
+
+            let app_bus = dbus::app_bus_path(&dir, socket);
+            assert!(
+                std::fs::symlink_metadata(&app_bus).is_err(),
+                "the tree was kept"
+            );
+            assert_eq!(leftovers(&dir, &app_bus), Vec::<OsString>::new());
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"sentinel");
+            assert_eq!((mode(&elsewhere), mode(&sentinel)), before);
+            let listener = UnixListener::bind(&planted).unwrap();
+            adopt_proxy_bus(&dir, socket, dbus::SESSION_NODE, own_uid())
+                .expect("a socket after a refused tree");
+            drop(listener);
+        });
+    }
+
+    /// When a run ends, each sidecar's directory goes with whatever its
+    /// sidecar left in it, a level no one may open included.
+    #[test]
+    fn a_sidecars_unreadable_tree_goes_when_its_run_ends() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let child = || Command::new("true").spawn().unwrap();
+        let relay = || run_log::relay().unwrap().1;
+        let plant = |sidecar: &Path| {
+            let locked = sidecar.join("x");
+            std::fs::create_dir_all(&locked).unwrap();
+            std::fs::write(locked.join("f"), b"").unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            sidecar.to_path_buf()
+        };
+        let handles: Vec<(PathBuf, Box<dyn std::any::Any>)> = vec![
+            (
+                dbus::socket_dir(dir),
+                Box::new(ProxyHandle {
+                    child: child(),
+                    alloc: RealAlloc::sidecar(dir.to_path_buf()),
+                    socket_dir: plant(&dbus::socket_dir(dir)),
+                    _stderr: relay(),
+                }),
+            ),
+            (
+                pipewire::dir(dir),
+                Box::new(PwHandle {
+                    child: child(),
+                    alloc: RealAlloc::sidecar(dir.to_path_buf()),
+                    dir: plant(&pipewire::dir(dir)),
+                    _socket: None,
+                    _stderr: relay(),
+                }),
+            ),
+            (
+                pipewire::pulse_dir(dir),
+                Box::new(PulseHandle {
+                    child: child(),
+                    alloc: RealAlloc::sidecar(dir.to_path_buf()),
+                    dir: plant(&pipewire::pulse_dir(dir)),
+                    _socket: None,
+                    _stderr: relay(),
+                }),
+            ),
+        ];
+        for (sidecar, handle) in handles {
+            drop(handle);
+            assert!(
+                std::fs::symlink_metadata(&sidecar).is_err(),
+                "{} is still there",
+                sidecar.display()
+            );
+        }
     }
 
     fn own_uid() -> u32 {

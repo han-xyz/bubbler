@@ -88,7 +88,9 @@ directory back to the user as it goes and holding a fixed number of
 descriptors whatever the tree's depth; a tree that cannot be removed in
 full is named in a warning and taken up again by the next start, but
 never blocks one. A socket is adopted only out of a directory that is
-not a link, and only when this user owns it. Two starts of one instance
+not a link, and only when this user owns it; a directory found where the
+socket belongs is moved aside and removed the same way, and so is each
+sidecar directory when its run ends. Two starts of one instance
 racing over a dead run's control socket can both get this far, and the
 later one then moves the earlier one's sidecar directories aside: a known
 gap.
@@ -106,6 +108,8 @@ gap.
 `an_unreadable_tree_a_sidecar_left_does_not_block_its_start`,
 `a_tree_deeper_than_the_descriptor_limit_does_not_block_its_start`,
 `removing_a_moved_tree_changes_nothing_its_links_name`,
+`a_deep_unreadable_tree_at_a_proxy_sockets_name_does_not_block_the_next_start`,
+`a_sidecars_unreadable_tree_goes_when_its_run_ends`,
 `proxy_argv_runs_the_proxy_in_its_own_sandbox`,
 `wl_proxy_argv_runs_the_proxy_in_its_own_sandbox`,
 `real_wayland_proxy_serves_the_only_socket_the_sandbox_sees`,
