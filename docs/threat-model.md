@@ -863,7 +863,12 @@ bare grant, `bubbler-playback-microphone` for one carrying `microphone`
 writable, and, in both managers, no permission at all on the metadata
 objects and on the session manager's own client, and read and nothing
 else on every stream node. The playback manager alone adds no permission
-at all on every `Audio/Source`, and withholding all permissions on a
+at all on every node a stream can record from — each class beginning
+`Audio/Source` (`/Virtual`, a filter's source such as echo-cancel;
+`/Internal`) and `Audio/Duplex`, the classes WirePlumber offers as a
+default source; before 0.24.2 it hid `Audio/Source` alone, and a
+playback sandbox saw the rest (measured) — and the linking hook refuses
+a capture stream every other target by the same test. Withholding all permissions on a
 source withholds more than its visibility: `PW_PERM_L` is what lets a
 link be made to a node the client cannot see, and the playback manager
 grants it nowhere, so a capture stream a playback-only client opens —

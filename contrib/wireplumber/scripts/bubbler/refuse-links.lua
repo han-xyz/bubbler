@@ -41,9 +41,9 @@
 --     — so it is set on the client below.
 --
 -- So: a bubbler sandbox's stream is linked to device nodes and to its
--- own, a capture stream only to an `Audio/Source`, and only where the
--- instance was granted `microphone`; and the sandbox links nothing
--- itself.
+-- own, a capture stream only to an `Audio/Source*` or `Audio/Duplex`
+-- node, and only where the instance was granted `microphone`; and the
+-- sandbox links nothing itself.
 --
 -- Nor is anything linked to a sandbox's node that is not one of its own
 -- streams — a sink, source or filter it offers takes no host stream —
@@ -74,6 +74,13 @@ local function bubbler_client (source, client_id)
   return nil
 end
 
+-- Whether a stream can record from the node: the classes 50-bubbler.conf
+-- hides without the microphone grant, by the same test.
+local function capture_capable (node_props)
+  local class = node_props ["media.class"] or ""
+  return class:find ("^Audio/Source") ~= nil or class == "Audio/Duplex"
+end
+
 -- Why this link may not be made, or nil where it may.
 local function refusal (si_props, target_props, grant)
   if target_props ["item.node.type"] == "stream" and
@@ -85,10 +92,12 @@ local function refusal (si_props, target_props, grant)
     return nil
   end
 
-  -- A capture stream and a target that is also an input: the target is
-  -- a sink and what would be linked are its monitor ports.
-  if target_props ["item.node.direction"] == "input" then
-    return "a sink's monitor ports"
+  -- A capture stream and a target that is also an input and records
+  -- nothing itself: the target is a sink and what would be linked are
+  -- its monitor ports.
+  if not capture_capable (target_props) then
+    return target_props ["item.node.direction"] == "input" and
+        "a sink's monitor ports" or "a node that is not a source"
   end
 
   if not string.find (grant, "microphone", 1, true) then

@@ -1243,6 +1243,104 @@ fn a_microphone_context_captures_from_the_null_source() {
     assert!(seen.contains("\"node.name\": \"bed-source\""), "{seen}");
 }
 
+/// Every class a node records from other than `Audio/Source` itself, as
+/// the bed adds one null node of each: `Audio/Source/Virtual` is what a
+/// filter's source is (echo-cancel, noise suppression), `Audio/Duplex` a
+/// device that both plays and records.
+const OTHER_SOURCES: [(&str, &str); 2] = [
+    ("virtual-source", "Audio/Source/Virtual"),
+    ("duplex", "Audio/Duplex"),
+];
+
+/// The bed's `OTHER_SOURCES`, created from the host and left lingering,
+/// with the `object.serial` of each: a capture stream must name a duplex
+/// node by serial, since WirePlumber matches a `target.object` given by
+/// name only against nodes of the opposite direction
+/// (linking/find-defined-target.lua), and a duplex node is an input.
+fn add_other_sources(bed: &PipeWireBed) -> Vec<String> {
+    for (name, class) in OTHER_SOURCES {
+        let out = bed
+            .command("pw-cli")
+            .args([
+                "create-node",
+                "adapter",
+                &format!(
+                    "{{ factory.name = support.null-audio-sink, node.name = {name}, \
+                     media.class = {class}, audio.position = \"FL,FR\", object.linger = true }}"
+                ),
+            ])
+            .output()
+            .expect("pw-cli did not run");
+        assert!(out.status.success(), "{out:?}");
+    }
+    wait_for("the bed's other sources", || {
+        let dump = bed.dump_from_host();
+        OTHER_SOURCES
+            .iter()
+            .all(|(name, _)| dump.contains(&format!("\"node.name\": \"{name}\"")))
+    });
+    let listing = bed.info_from_host();
+    OTHER_SOURCES
+        .iter()
+        .map(|(name, _)| {
+            object(&listing, &[&format!("node.name = \"{name}\"")])
+                .and_then(|node| node.serial)
+                .expect("the serial of the node just created")
+        })
+        .collect()
+}
+
+#[test]
+fn a_playback_context_neither_sees_nor_records_any_other_source() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let serials = add_other_sources(&bed);
+    let listing = bed.info_in_context(PLAYBACK, &[SINK]);
+    for ((name, class), serial) in OTHER_SOURCES.iter().zip(&serials) {
+        assert!(
+            object(&listing, &[&format!("node.name = \"{name}\"")]).is_none(),
+            "a playback context sees an {class}:\n{listing}"
+        );
+        let out = bed.dir().join(format!("{name}.wav"));
+        let _recording = streaming(
+            &bed,
+            PLAYBACK,
+            &format!("pw-cat -r --target={serial} {}", out.display()),
+            "Stream/Input/Audio",
+        );
+        window_in_which_it_would_link(&bed, "playback");
+        let links = bed.links();
+        assert!(
+            !links.contains("pw-cat:input_"),
+            "a playback context recorded from an {class}:\n{links}"
+        );
+    }
+}
+
+#[test]
+fn a_microphone_context_records_from_every_other_source() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let serials = add_other_sources(&bed);
+    for ((name, class), serial) in OTHER_SOURCES.iter().zip(&serials) {
+        let out = bed.dir().join(format!("{name}.wav"));
+        let _recording = streaming(
+            &bed,
+            PLAYBACK_MICROPHONE,
+            &format!("pw-cat -r --target={serial} {}", out.display()),
+            "Stream/Input/Audio",
+        );
+        wait_for(&format!("a link from the {class}"), || {
+            bed.links()
+                .lines()
+                .skip_while(|line| !line.starts_with(&format!("{name}:")))
+                .any(|line| line.contains("pw-cat:input_"))
+        });
+    }
+}
+
 #[test]
 fn no_context_records_the_sinks_monitor_ports() {
     let Some(bed) = PipeWireBed::start() else {

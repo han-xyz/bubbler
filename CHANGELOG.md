@@ -60,6 +60,13 @@
   every grant gets the playback rules and a sandbox can still claim the
   microphone; bubbler now warns before a run when the installed drop-in or
   hook is not its own. The same reinstall and restart applies.
+- Without the `microphone` grant a sandbox could still see, and with a
+  claimed grant record, every source that is not exactly `Audio/Source`:
+  `Audio/Source/Virtual` (echo-cancel, noise suppression) and
+  `Audio/Duplex` (measured). The playback rules now hide every class
+  beginning `Audio/Source` and `Audio/Duplex`, and the linking hook refuses
+  them by the same test; with the grant a sandbox records from them,
+  `Audio/Duplex` included, which the hook used to refuse as a sink.
 
 ## 0.24.1
 
