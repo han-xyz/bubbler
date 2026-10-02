@@ -44,7 +44,9 @@ use crate::host::{Host, RealHost};
 use crate::instance::Instance;
 use crate::tty::{self, Pty, RawGuard, RelayEnd, StdioTarget, TtyMode};
 use crate::wayland::{ProxyPlan, WaylandError};
-use crate::{cgroup, dbus, exec, init_bin, network, pipewire, seccomp, service, version, wayland};
+use crate::{
+    cgroup, dbus, exec, init_bin, network, pipewire, run_log, seccomp, service, version, wayland,
+};
 
 /// How often a running sandbox is checked for having exited.
 const POLL: Duration = Duration::from_millis(100);
@@ -1053,6 +1055,9 @@ pub struct ProxyHandle {
     alloc: RealAlloc,
     /// The proxy's own directory, removed once it has exited.
     socket_dir: PathBuf,
+    /// Copies the proxy's stderr to bubbler's; last, so it drops after
+    /// the proxy is reaped.
+    _stderr: run_log::Relay,
 }
 
 impl Drop for ProxyHandle {
@@ -1147,6 +1152,9 @@ pub struct WaylandHandle {
     _socket: FileGuard,
     /// Removes the socket the compositor accepts on, where there is one.
     _context: Option<FileGuard>,
+    /// Copies the proxy's stderr to bubbler's; last, so it drops after
+    /// the proxy is reaped.
+    _stderr: run_log::Relay,
 }
 
 impl Drop for WaylandHandle {
@@ -1252,17 +1260,15 @@ pub fn start_wayland(
     let socket = FileGuard(plan.listener.clone());
     let mut alloc = RealAlloc::sidecar_listening(listener.into(), dir.to_path_buf());
     let argv = wl_proxy_argv(env, &plan, node, host, &mut alloc)?;
-    let mut cmd = bwrap_command(&argv, &mut alloc)?;
+    let cmd = bwrap_command(&argv, &mut alloc)?;
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     spawning(&alloc.intended())?;
-    let child = cmd.spawn().map_err(|e| match e.kind() {
-        io::ErrorKind::NotFound => LaunchError::BwrapMissing,
-        _ => LaunchError::Spawn(e),
-    })?;
+    let (child, stderr) = spawn_sidecar(cmd)?;
     // From here on every exit path stops the proxy through the handle.
     let mut handle = WaylandHandle {
         child,
         alloc,
+        _stderr: stderr,
         _close: close,
         _socket: socket,
         _context: context,
@@ -1354,6 +1360,9 @@ pub struct PwHandle {
     /// Removes the socket once it has been moved out of `dir`; `None`
     /// until then, when whatever is in there goes with the directory.
     _socket: Option<FileGuard>,
+    /// Copies the sidecar's stderr to bubbler's; last, so it drops after
+    /// the sidecar is reaped.
+    _stderr: run_log::Relay,
 }
 
 impl Drop for PwHandle {
@@ -1438,17 +1447,15 @@ pub fn start_pw_context(
     };
     let mut alloc = RealAlloc::sidecar(dir.to_path_buf());
     let argv = pw_context_argv(env, &ctx, host, &mut alloc)?;
-    let mut cmd = bwrap_command(&argv, &mut alloc)?;
+    let cmd = bwrap_command(&argv, &mut alloc)?;
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     spawning(&alloc.intended())?;
-    let child = cmd.spawn().map_err(|e| match e.kind() {
-        io::ErrorKind::NotFound => LaunchError::BwrapMissing,
-        _ => LaunchError::Spawn(e),
-    })?;
+    let (child, stderr) = spawn_sidecar(cmd)?;
     // From here on every exit path stops the sidecar through the handle.
     let mut handle = PwHandle {
         child,
         alloc,
+        _stderr: stderr,
         dir: pw,
         _socket: None,
     };
@@ -1610,6 +1617,9 @@ pub struct PulseHandle {
     /// Removes the socket once it has been moved out of `dir`; `None`
     /// until then, when what is in there goes with the directory.
     _socket: Option<FileGuard>,
+    /// Copies the server's stderr to bubbler's; last, so it drops after
+    /// the server is reaped.
+    _stderr: run_log::Relay,
 }
 
 impl Drop for PulseHandle {
@@ -1696,17 +1706,15 @@ pub fn start_pw_pulse(
     write_pulse_config(env, host, dir)?;
     let mut alloc = RealAlloc::sidecar(dir.to_path_buf());
     let argv = pw_pulse_argv(env, dir, host, &mut alloc)?;
-    let mut cmd = bwrap_command(&argv, &mut alloc)?;
+    let cmd = bwrap_command(&argv, &mut alloc)?;
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     spawning(&alloc.intended())?;
-    let child = cmd.spawn().map_err(|e| match e.kind() {
-        io::ErrorKind::NotFound => LaunchError::BwrapMissing,
-        _ => LaunchError::Spawn(e),
-    })?;
+    let (child, stderr) = spawn_sidecar(cmd)?;
     // From here on every exit path stops the sidecar through the handle.
     let mut handle = PulseHandle {
         child,
         alloc,
+        _stderr: stderr,
         dir: pw,
         _socket: None,
     };
@@ -1866,17 +1874,15 @@ pub fn start_proxy(
         host,
         &mut alloc,
     )?;
-    let mut cmd = bwrap_command(&argv, &mut alloc)?;
+    let cmd = bwrap_command(&argv, &mut alloc)?;
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     spawning(&alloc.intended())?;
-    let child = cmd.spawn().map_err(|e| match e.kind() {
-        io::ErrorKind::NotFound => LaunchError::BwrapMissing,
-        _ => LaunchError::Spawn(e),
-    })?;
+    let (child, stderr) = spawn_sidecar(cmd)?;
     // From here on every exit path stops the proxy through the handle.
     let mut handle = ProxyHandle {
         child,
         alloc,
+        _stderr: stderr,
         socket_dir: dbus::socket_dir(dir),
     };
     handle.alloc.close_options();
@@ -2264,6 +2270,25 @@ fn bwrap_command(argv: &Argv, alloc: &mut RealAlloc) -> Result<Command, LaunchEr
         .arg(options)
         .args(argv.command());
     Ok(cmd)
+}
+
+/// Spawn a sidecar's bwrap with `/dev/null` for stdin and stdout and a
+/// [`run_log::relay`] for stderr: a sidecar parses what the sandbox sends
+/// it, so it holds none of the caller's stdio and no terminal.
+fn spawn_sidecar(mut cmd: Command) -> Result<(Child, run_log::Relay), LaunchError> {
+    let (stderr, relay) = run_log::relay()?;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr);
+    let spawned = cmd.spawn();
+    // `cmd` holds bubbler's copy of the relay's write end; the relay only
+    // sees the end of the output once that copy is gone.
+    drop(cmd);
+    let child = spawned.map_err(|e| match e.kind() {
+        io::ErrorKind::NotFound => LaunchError::BwrapMissing,
+        _ => LaunchError::Spawn(e),
+    })?;
+    Ok((child, relay))
 }
 
 /// Where a spawn looks with `PATH` unset: the directories execvp falls
@@ -4442,6 +4467,7 @@ mod tests {
             _close: None,
             _socket: FileGuard(socket.clone()),
             _context: None,
+            _stderr: run_log::relay().unwrap().1,
         };
         let started = Instant::now();
         drop(handle);
@@ -4504,6 +4530,7 @@ mod tests {
             _close: None,
             _socket: FileGuard(socket.clone()),
             _context: None,
+            _stderr: run_log::relay().unwrap().1,
         };
         let started = Instant::now();
         drop(handle);

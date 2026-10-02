@@ -10,6 +10,10 @@
   layout — was readable inside every sandbox through `/proc/1/cmdline`; bwrap
   now reads its options from a descriptor (`--args`), and its command line
   holds only that and the command.
+- The four bwrap sidecars (Wayland proxy, PipeWire context holder, private
+  pulse server, D-Bus proxy) inherited bubbler's stdin, stdout and stderr, so
+  one compromised through the sandbox held the caller's terminal; they now get
+  `/dev/null` and a stderr pipe bubbler copies to its own.
 
 ## 0.24.1
 

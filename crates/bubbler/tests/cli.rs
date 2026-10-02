@@ -5639,6 +5639,122 @@ fn a_proxy_that_swaps_its_socket_for_a_symlink_never_reaches_the_sandbox() {
     );
 }
 
+/// [`honest_proxy`] that first writes a line to each of its stdout and
+/// stderr.
+fn talking_proxy(path: &Path) {
+    write_script(
+        path,
+        r#"#!/usr/bin/python3
+import os, select, socket, sys, time
+print("sidecar-stdout", flush=True)
+print("sidecar-stderr", file=sys.stderr, flush=True)
+fd = int(sys.argv[1].split("=", 1)[1])
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[3])
+s.listen(8)
+os.write(fd, b"r")
+poller = select.poll()
+poller.register(fd, 0)
+deadline = time.time() + 15
+while time.time() < deadline and not poller.poll(20):
+    pass
+"#,
+    );
+}
+
+/// A `dbus` instance whose proxy is [`talking_proxy`] on a bus nothing
+/// speaks on, run with `command` and the caller's stdio as given.
+fn talking_proxy_run(tmp: &Path, init: &Path, proxy: &Path, command: &[&str]) -> Command {
+    talking_proxy(proxy);
+    let out = bubbler_live(tmp, init)
+        .args(["create", "talk"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(tmp.join("data/bubbler/instances/talk/config.kdl"), "dbus\n").unwrap();
+    let mut run = bubbler_live(tmp, init);
+    run.env(
+        "DBUS_SESSION_BUS_ADDRESS",
+        format!("unix:path={}", tmp.join("fakebus").display()),
+    )
+    .env("BUBBLER_DBUS_PROXY", proxy)
+    .args(["run", "talk", "--"])
+    .args(command);
+    run
+}
+
+/// A sidecar parses what the sandbox sends it, so it holds nothing of the
+/// caller's: not the file bubbler's stdout is, and no terminal.
+#[test]
+fn a_sidecar_holds_neither_the_callers_stdout_nor_a_terminal() {
+    if !require_bwrap() || !require_python() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let _listener = UnixListener::bind(tmp.path().join("fakebus")).unwrap();
+    let proxy = tmp.path().join("talking-proxy");
+    let stdout = tmp.path().join("stdout");
+    let pty = test_pty();
+    let terminal = std::fs::read_link(format!("/proc/self/fd/{}", pty.slave.as_raw_fd())).unwrap();
+    let child = talking_proxy_run(tmp.path(), &init, &proxy, &["/usr/bin/sleep", "3"])
+        .stdin(pty.stdio())
+        .stdout(std::fs::File::create(&stdout).unwrap())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let is_sidecar = |pid: &i32| {
+        std::fs::read(format!("/proc/{pid}/cmdline"))
+            .is_ok_and(|c| String::from_utf8_lossy(&c).contains(&*proxy.to_string_lossy()))
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = false;
+    let mut holding = Vec::new();
+    while !seen && Instant::now() < deadline {
+        seen = process_running(&proxy.to_string_lossy(), "--fd=");
+        for path in [&stdout, &terminal] {
+            holding.extend(holders_of(path).into_iter().filter(is_sidecar));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(seen, "the proxy never ran: {err}");
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(
+        holding.is_empty(),
+        "sidecar pids {holding:?} hold the caller's stdio"
+    );
+    let written = std::fs::read_to_string(&stdout).unwrap();
+    assert!(!written.contains("sidecar-stdout"), "{written}");
+}
+
+/// What a sidecar says on stderr still reaches the caller, and the run log
+/// where bubbler keeps one.
+#[test]
+fn a_sidecars_stderr_reaches_the_callers_stderr_and_the_run_log() {
+    if !require_bwrap() || !require_python() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let _listener = UnixListener::bind(tmp.path().join("fakebus")).unwrap();
+    let proxy = tmp.path().join("talking-proxy");
+    let out = talking_proxy_run(tmp.path(), &init, &proxy, &["/usr/bin/true"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(err.contains("sidecar-stderr"), "{err}");
+    let log = run_log_of(tmp.path(), "talk");
+    assert!(log.contains("sidecar-stderr"), "{log}");
+}
+
 #[test]
 fn x11_warns_before_a_real_run() {
     let tmp = setup();

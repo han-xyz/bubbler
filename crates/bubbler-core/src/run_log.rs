@@ -190,6 +190,44 @@ impl Drop for Redirect {
     }
 }
 
+/// The write end of a pipe whose every byte a thread copies to the stderr
+/// bubbler has now, for a sidecar's stderr: the sidecar parses what the
+/// sandbox sends it, so it is handed no terminal of the caller's.
+pub fn relay() -> Result<(OwnedFd, Relay), LaunchError> {
+    let (reader, writer) =
+        rustix::pipe::pipe_with(PipeFlags::CLOEXEC).map_err(|e| LaunchError::Data(e.into()))?;
+    let stderr = io::stderr()
+        .as_fd()
+        .try_clone_to_owned()
+        .map_err(LaunchError::Data)?;
+    let (tx, done) = mpsc::sync_channel(1);
+    // Nothing in here may start a process; see the module comment.
+    std::thread::spawn(move || {
+        let mut stderr = Blocking(std::fs::File::from(stderr));
+        let _ = copy_capped(
+            std::fs::File::from(reader),
+            io::sink(),
+            || Ok(0),
+            Some(&mut stderr),
+        );
+        let _ = tx.send(());
+    });
+    Ok((writer, Relay { done }))
+}
+
+/// The copying thread of a [`relay`]. Dropped once the sidecar is gone, it
+/// waits up to [`FLUSH`] for the last of its output.
+#[derive(Debug)]
+pub struct Relay {
+    done: Receiver<()>,
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        let _ = self.done.recv_timeout(FLUSH);
+    }
+}
+
 /// Copy `src` to `dst` while `size` reports room under [`MAX_BYTES`],
 /// then say once that the rest was dropped and keep reading. Draining to
 /// the end matters: a writer whose pipe fills stops dead, and the writer
