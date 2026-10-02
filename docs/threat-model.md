@@ -188,14 +188,15 @@ uncapped one lets a sandbox that fills it take the session's memory with
 it — a private home at `/home/bubbler`, an empty `$XDG_RUNTIME_DIR` at
 the host's path sharing the `/run` cap, since it is a directory `--dir`
 makes inside that tmpfs, and a cleared environment. bwrap itself stays
-as pid 1 in the sandbox, where every process can read `/proc/1/environ`, and
-`--clearenv` cleans only what bwrap starts; bubbler therefore starts every
-bwrap, a sidecar's included, with an empty environment, so `/proc/1/environ`
-holds nothing of the caller's. `/proc/1/cmdline` is as readable, so bwrap
-reads its options from a sealed memfd through `--args`: its command line
-holds `--args <fd>` and the command, nothing of the host's layout. Every sidecar bubbler
-wraps in a bwrap of its own gets the same 64 MiB cap on the two tmpfs
-mounts it has, its `/etc` and its `/tmp`. The forked child also
+as pid 1 in the sandbox, where every process can read `/proc/1/environ`,
+and `--clearenv` cleans only what bwrap starts; bubbler therefore starts
+every bwrap, a sidecar's included, with an empty environment, so
+`/proc/1/environ` holds nothing of the caller's. `/proc/1/cmdline` is as
+readable, so bwrap reads its options from a sealed memfd through
+`--args`: its command line holds `--args <fd>` and the command, nothing
+of the host's layout. Every sidecar bubbler wraps in a bwrap of its own
+gets the same 64 MiB cap on the two tmpfs mounts it has, its `/etc` and
+its `/tmp`. The forked child also
 joins a session keyring of its own (`keyctl(2)` `KEYCTL_JOIN_SESSION_KEYRING`
 with a null name) right before it execs `bwrap`, so it never inherits the
 login session keyring bubbler itself runs on; `keyctl` is on the `EPERM`
@@ -221,7 +222,12 @@ the portal's per-document mode bits, and nothing of the mount's other apps.
 `real_bwrap_home_is_fixed_and_private`,
 `real_bwrap_etc_is_allowlisted_and_user_is_bubbler`,
 `joining_a_session_keyring_leaves_the_thread_on_a_new_one`,
-`real_bwrap_the_sandbox_does_not_inherit_the_session_keyring_it_was_started_from`
+`real_bwrap_the_sandbox_does_not_inherit_the_session_keyring_it_was_started_from`,
+`real_bwrap_pid_1_holds_nothing_of_the_callers_environment`,
+`real_bwrap_the_dbus_proxy_bwrap_gets_nothing_of_the_callers_environment`,
+`real_bwrap_the_audio_bwraps_get_nothing_of_the_callers_environment`,
+`real_bwrap_the_wayland_proxy_bwrap_gets_nothing_of_the_callers_environment`,
+`real_bwrap_a_run_with_path_unset_still_finds_bwrap`
 
 ### Host environment values
 

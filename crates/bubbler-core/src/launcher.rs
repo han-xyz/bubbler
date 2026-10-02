@@ -2266,14 +2266,20 @@ fn bwrap_command(argv: &Argv, alloc: &mut RealAlloc) -> Result<Command, LaunchEr
     Ok(cmd)
 }
 
+/// Where a spawn looks with `PATH` unset: the directories execvp falls
+/// back on, which `Command` would have used on a program named without a
+/// directory.
+const DEFAULT_PATH: &str = "/usr/bin:/bin";
+
 /// Where `bin` is found on `$PATH`, if anywhere.
 ///
 /// The library reads the environment here for two things only: `bwrap`
 /// itself, which is started with none, and an error message, where a
 /// failed spawn has to tell a package that is not installed from a
 /// failure of bubbler's own, the two arriving as the same `NotFound`.
+/// With `PATH` unset it searches [`DEFAULT_PATH`], as a spawn would.
 fn on_path(bin: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
+    let path = std::env::var_os("PATH").unwrap_or_else(|| DEFAULT_PATH.into());
     std::env::split_paths(&path).find_map(|dir| {
         if dir.as_os_str().is_empty() {
             return None;

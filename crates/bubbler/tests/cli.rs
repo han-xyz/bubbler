@@ -1226,15 +1226,133 @@ fn real_bwrap_pid_1_holds_nothing_of_the_callers_environment() {
         .env("BUBBLER_LEAK_MARKER", "hostsecret123")
         .args(["try", "--profile", "generic", "--", "/usr/bin/sh", "-c"])
         .arg(
-            "test -r /proc/1/environ || exit 3; \
-             if tr '\\0' '\\n' < /proc/1/environ | grep -q BUBBLER_LEAK_MARKER; \
-             then echo leaked; else echo clean; fi",
+            "e=$(tr '\\0' '\\n' < /proc/1/environ) || exit 3; \
+             case \"$e\" in *BUBBLER_LEAK_MARKER*) echo leaked;; *) echo clean;; esac",
         )
         .output()
         .unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{err}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "clean\n", "{err}");
+}
+
+/// bubbler resolves bwrap itself, since bwrap is started with no
+/// environment; with no `PATH` at all it looks where libc's execvp would.
+#[test]
+fn real_bwrap_a_run_with_path_unset_still_finds_bwrap() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    if !["/usr/bin/bwrap", "/bin/bwrap"]
+        .iter()
+        .any(|p| Path::new(p).is_file())
+    {
+        say("skipping: bwrap is in neither /usr/bin nor /bin");
+        return;
+    }
+    let tmp = setup();
+    let out = bubbler_live(tmp.path(), &init)
+        .env_remove("PATH")
+        .args(["try", "--profile", "generic", "--", "/usr/bin/true"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+}
+
+/// The environment every sandbox spawn of `try --grant <grants>` was
+/// started with, one line per spawn: a `bwrap` on `PATH` records its own
+/// and execs the real one. The version probe passes no `--args` and is
+/// not a sandbox, so it is not recorded.
+fn sandbox_spawn_environs(mut bubbler: Command, root: &Path, grants: &[&str]) -> Vec<String> {
+    let bin = root.join("recording-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let log = root.join("spawns.log");
+    let fake = bin.join("bwrap");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/usr/bin/sh\n\
+             if [ \"$1\" = --args ]; then\n\
+             e=$(/usr/bin/tr '\\0' ' ' < /proc/$$/environ) || exit 99\n\
+             printf 'spawn %s\\n' \"$e\" >> '{}'\n\
+             fi\n\
+             exec /usr/bin/bwrap \"$@\"\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bubbler
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("BUBBLER_LEAK_MARKER", "hostsecret123")
+        .args(["try", "--profile", "generic"]);
+    for grant in grants {
+        bubbler.args(["--grant", grant]);
+    }
+    let out = bubbler.args(["--", "/usr/bin/true"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn real_bwrap_the_dbus_proxy_bwrap_gets_nothing_of_the_callers_environment() {
+    if !require_dbus() || !Path::new("/usr/bin/bwrap").is_file() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let spawns = sandbox_spawn_environs(bubbler_dbus(tmp.path(), &init), tmp.path(), &["dbus"]);
+    assert_eq!(spawns.len(), 2, "the proxy and the sandbox: {spawns:?}");
+    assert!(
+        spawns.iter().all(|s| !s.contains("BUBBLER_LEAK_MARKER")),
+        "{spawns:?}"
+    );
+}
+
+#[test]
+fn real_bwrap_the_audio_bwraps_get_nothing_of_the_callers_environment() {
+    if !require_pipewire_session() || !Path::new("/usr/bin/bwrap").is_file() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let spawns = sandbox_spawn_environs(
+        bubbler_audio(tmp.path(), &init),
+        tmp.path(),
+        &["pipewire", "pulseaudio"],
+    );
+    assert_eq!(
+        spawns.len(),
+        3,
+        "the context holder, the pulse server and the sandbox: {spawns:?}"
+    );
+    assert!(
+        spawns.iter().all(|s| !s.contains("BUBBLER_LEAK_MARKER")),
+        "{spawns:?}"
+    );
+}
+
+#[test]
+fn real_bwrap_the_wayland_proxy_bwrap_gets_nothing_of_the_callers_environment() {
+    if !require_security_context() || !Path::new("/usr/bin/bwrap").is_file() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let spawns =
+        sandbox_spawn_environs(bubbler_wayland(tmp.path(), &init), tmp.path(), &["wayland"]);
+    assert_eq!(spawns.len(), 2, "the proxy and the sandbox: {spawns:?}");
+    assert!(
+        spawns.iter().all(|s| !s.contains("BUBBLER_LEAK_MARKER")),
+        "{spawns:?}"
+    );
 }
 
 /// bwrap's command line is readable at `/proc/1/cmdline` inside: its
