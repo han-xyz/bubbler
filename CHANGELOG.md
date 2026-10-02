@@ -10,10 +10,11 @@
   `/proc/1/cmdline`; bwrap now reads its options from a descriptor (`--args`),
   and its command line holds only that and the command. The bind sources
   stay visible in `/proc/self/mountinfo`, as with any bind mount.
-- Every sidecar (Wayland proxy, PipeWire context holder, private pulse
-  server, D-Bus proxy, pasta, egress proxy) inherited bubbler's stdio, so one
-  compromised through the sandbox held the caller's terminal; they now get
-  `/dev/null` and a pipe bubbler copies to its own stderr.
+- A sidecar compromised through the sandbox held the caller's terminal: the
+  Wayland proxy, PipeWire context holder, private pulse server and D-Bus
+  proxy inherited all of bubbler's stdio, pasta and the egress proxy its
+  stderr. They now get `/dev/null` and a pipe bubbler copies to its own
+  stderr.
 - A link a compromised audio or D-Bus sidecar left in its own directory was
   followed by the next start of the instance after a run that ended without
   cleanup, writing or unlinking files in a host directory of its choosing;
@@ -22,6 +23,14 @@
 - A Ctrl-C, closed terminal or logout while the sidecars were starting killed
   bubbler outright, leaving `init.sock`, the sidecar directories and the
   cgroup behind; the signal now stops the sidecars and removes all three.
+- The egress proxy dialled an allow-listed name whose answer was an
+  IPv4-mapped IPv6 address (`::ffff:127.0.0.1`) pointing at the sandbox's
+  loopback or pasta's DNS forwarder; it now refuses those as it refuses the
+  plain IPv4 ones.
+- The egress proxy was dumpable, though the threat model says otherwise:
+  `execve` reset the flag bubbler set before it. The proxy now makes itself
+  non-dumpable, so a process in the sandbox's user namespace without
+  `CAP_SYS_PTRACE` cannot read its memory or descriptors.
 
 ## 0.24.1
 

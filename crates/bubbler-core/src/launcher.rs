@@ -2618,8 +2618,8 @@ fn start_net_proxy(
     // at all. `PR_SET_NO_NEW_PRIVS` then makes the bounding set moot:
     // no `execve` from here can gain a privilege, whatever it finds.
     // Last, the parent-death signal so a bubbler that is killed takes
-    // the proxy with it, and `PR_SET_DUMPABLE 0` so nothing of the
-    // user's may attach to it.
+    // the proxy with it, and `PR_SET_DUMPABLE 0` for the time before
+    // `execve`, which resets it; the proxy sets it again itself.
     unsafe {
         cmd.pre_exec(move || {
             let procs = BorrowedFd::borrow_raw(procs);

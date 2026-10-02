@@ -5859,8 +5859,8 @@ fn a_sidecar_holds_neither_the_callers_stdout_nor_a_terminal() {
     assert!(!written.contains("sidecar-stdout"), "{written}");
 }
 
-/// pasta and the egress proxy have no bwrap of their own, and hold no
-/// terminal of the caller's either.
+/// pasta has no bwrap of its own, and holds no terminal of the caller's
+/// either.
 #[test]
 fn the_pasta_sidecar_holds_no_terminal_of_the_callers() {
     if !require_bwrap() || !require_python() {
@@ -5924,6 +5924,97 @@ fn real_allow_host_the_egress_proxy_holds_no_terminal_of_the_callers() {
         fds.unwrap_or_else(|| panic!("the egress proxy's descriptors were never read: {shown}"));
     assert_none_of_the_callers(&fds, &stdout);
     assert_eq!(out.status.code(), Some(0), "{shown}");
+}
+
+const NSENTER: &str = "/usr/bin/nsenter";
+const SETPRIV: &str = "/usr/bin/setpriv";
+
+/// The egress proxy parses what the sandbox sends it, so it is
+/// non-dumpable: a process of the user's in the sandbox's user namespace
+/// with no capability there cannot read its descriptors. This test can
+/// read them itself, as the namespace's owner, whose root it maps to.
+#[test]
+fn real_allow_host_the_egress_proxy_is_not_dumpable() {
+    if !require_egress() || !require_host_program(NSENTER) || !require_host_program(SETPRIV) {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "egnd"])
+        .status()
+        .unwrap();
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/egnd/config.kdl"),
+        "network {\n    outbound \"deny\"\n    allow-host \"dumpable-check.invalid\"\n}\n",
+    )
+    .unwrap();
+    let child = bubbler_live(tmp.path(), &init)
+        .args(["run", "egnd", "--", "/usr/bin/sleep", "3"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let is_the_proxy = |pid: &i32| {
+        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            return false;
+        };
+        let argv: Vec<_> = cmdline.split(|b| *b == 0).collect();
+        argv[0] == bubbler_core::network::NET_PROXY_INSIDE.as_bytes()
+            && argv.contains(&&b"dumpable-check.invalid:443"[..])
+    };
+    let mut proxy = None;
+    wait_until(
+        || {
+            proxy = std::fs::read_dir("/proc")
+                .unwrap()
+                .flatten()
+                .filter_map(|e| e.file_name().to_string_lossy().parse::<i32>().ok())
+                .find(is_the_proxy);
+            proxy.is_some()
+        },
+        Duration::from_secs(10),
+    );
+    let read_from_inside = |pid: i32| {
+        Command::new(NSENTER)
+            .arg("--preserve-credentials")
+            .arg(format!("--user=/proc/{pid}/ns/user"))
+            .args([SETPRIV, "--securebits=+noroot,+noroot_locked"])
+            .args([
+                "--bounding-set=-all",
+                "--inh-caps=-all",
+                "--ambient-caps=-all",
+            ])
+            .args(["--", "/usr/bin/readlink", "-v"])
+            .arg(format!("/proc/{pid}/fd/0"))
+            .output()
+            .unwrap()
+    };
+    let closed = proxy.map(|pid| {
+        // The flag is set by the proxy's first line, which may not have
+        // run yet when its command line first shows.
+        let mut last = None;
+        let closed = wait_until(
+            || {
+                let out = read_from_inside(pid);
+                let denied =
+                    String::from_utf8_lossy(&out.stderr).contains("fd/0: Permission denied");
+                last = Some(out);
+                denied
+            },
+            Duration::from_secs(2),
+        );
+        (closed, last)
+    });
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let (closed, last) =
+        closed.unwrap_or_else(|| panic!("the egress proxy was never found: {err}"));
+    assert!(
+        closed,
+        "the egress proxy's descriptors were readable from inside: {last:?}"
+    );
+    assert_eq!(out.status.code(), Some(0), "{err}");
 }
 
 /// What a sidecar says on stderr still reaches the caller, and the run log

@@ -36,6 +36,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
+use rustix::process::{DumpableBehavior, set_dumpable_behavior};
 
 use bubbler_net_proxy::allow::Allowlist;
 use bubbler_net_proxy::connect::{self, Status};
@@ -123,6 +124,12 @@ struct Args {
 }
 
 fn main() -> ExitCode {
+    // The launcher's `PR_SET_DUMPABLE 0` covers only the window before
+    // `execve`, which resets it.
+    if let Err(e) = set_dumpable_behavior(DumpableBehavior::NotDumpable) {
+        eprintln!("bubbler-net-proxy: cannot become non-dumpable: {e}");
+        return ExitCode::from(1);
+    }
     let Some(args) = parse_from(std::env::args_os().skip(1)) else {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
@@ -463,7 +470,9 @@ fn dial(
 
 /// Whether `ip` points back inside the namespace rather than out of
 /// it: loopback (`127.0.0.0/8`, `::1`), the unspecified address, or
-/// link-local (`169.254.0.0/16`, `fe80::/10`).
+/// link-local (`169.254.0.0/16`, `fe80::/10`). An IPv4-mapped address
+/// (`::ffff:a.b.c.d`) is judged by its IPv4 half, which is what a
+/// dual-stack socket dials.
 ///
 /// The IPv6 link-local half is written out rather than taken from
 /// `Ipv6Addr::is_unicast_link_local`, which the workspace's declared
@@ -472,6 +481,9 @@ fn is_inward(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified() || v4.is_link_local(),
         IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_inward(&IpAddr::V4(v4));
+            }
             v6.is_loopback() || v6.is_unspecified() || v6.segments()[0] & 0xffc0 == 0xfe80
         }
     }
@@ -1164,6 +1176,19 @@ mod tests {
                 Status::BAD_GATEWAY,
                 "{inward}"
             );
+        }
+    }
+
+    /// A dual-stack socket dials the IPv4 address inside a mapped one.
+    #[test]
+    fn an_ipv4_mapped_answer_is_judged_by_its_ipv4_half() {
+        for (mapped, inward) in [
+            ("::ffff:127.0.0.1", true),
+            ("::ffff:169.254.1.1", true),
+            ("::ffff:8.8.8.8", false),
+        ] {
+            let ip = IpAddr::V6(mapped.parse().expect("an address"));
+            assert_eq!(is_inward(&ip), inward, "{mapped}");
         }
     }
 
