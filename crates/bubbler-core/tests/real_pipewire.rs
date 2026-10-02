@@ -1817,14 +1817,7 @@ fn a_host_stream_passes_by_a_node_a_context_offers(
     });
     window_in_which_it_would_link(&bed, grant);
 
-    let mut command = bed.command("pw-cat");
-    command
-        .args(host)
-        .stdin(std::fs::File::open("/dev/zero").expect("/dev/zero"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    own_process_group(&mut command);
-    let _host = Streaming(command.spawn().expect("pw-cat did not run"));
+    let _host = host_stream(&bed, host);
     wait_for("a link for the host's stream", || {
         bed.links().contains("host:")
     });
@@ -1832,11 +1825,17 @@ fn a_host_stream_passes_by_a_node_a_context_offers(
     // have moved the stream.
     std::thread::sleep(FORBIDDEN_LINK_LIFE);
     let links = bed.links();
-    let defaults = bed.host_tool("pw-metadata", &["-n", "default", "0"]);
+    let defaults = bed.host_tool("pw-metadata", &["-n", "default"]);
     assert!(defaults.contains("default.audio."), "{defaults}");
     assert!(
         !defaults.contains("offered"),
         "a node a {grant} context offered became a default:\n{defaults}"
+    );
+    // A stream sent to the default in place of its own target keeps that
+    // target: nothing tells it to follow the default from now on.
+    assert!(
+        !defaults.contains("target."),
+        "a host stream was set to follow the default:\n{defaults}"
     );
     assert!(
         !links.contains("offered:"),
@@ -1922,6 +1921,196 @@ fn a_host_stream_passes_by_a_smart_filter_a_playback_context_offers() {
         &["-p", "-a", "-P", "{ node.name = host }", "-"],
         "bed-sink:playback_",
     );
+}
+
+/// `pw-cat` with `args`, run on the host outside every context and fed
+/// silence, killed with the test.
+fn host_stream(bed: &PipeWireBed, args: &[&str]) -> Streaming {
+    let mut command = bed.command("pw-cat");
+    command
+        .args(args)
+        .stdin(std::fs::File::open("/dev/zero").expect("/dev/zero"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    own_process_group(&mut command);
+    Streaming(command.spawn().expect("pw-cat did not run"))
+}
+
+/// A context offers a sink named after a host device that is not there.
+/// A host stream pinned to that device with `node.dont-fallback` is what
+/// WirePlumber leaves unlinked when its device is missing
+/// (linking/find-defined-target.lua destroys it with an error), so it is
+/// neither played into the sandbox's sink nor sent to the default.
+#[test]
+fn a_pinned_host_stream_does_not_fall_back_from_a_sink_a_context_names_after_its_device() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let _offered = Streaming(bed.spawn_in_context(
+        PLAYBACK,
+        "pw-cat -r -a -P '{ media.class = Audio/Sink, node.name = bed-headset }' /dev/null",
+    ));
+    wait_for("the context's sink", || {
+        bed.dump_from_host()
+            .contains("\"node.name\": \"bed-headset\"")
+    });
+    window_in_which_it_would_link(&bed, "playback");
+
+    let watched = LinkMonitor::start(&bed);
+    let mut host = host_stream(
+        &bed,
+        &[
+            "-p",
+            "-a",
+            "--target=bed-headset",
+            "-P",
+            "{ node.name = host, node.dont-fallback = true }",
+            "-",
+        ],
+    );
+    wait_for("the end of the pinned host stream", || {
+        matches!(host.0.try_wait(), Ok(Some(_)))
+    });
+    // The host stream is the only thing in the graph that could be
+    // linked.
+    let seen = watched.seen();
+    assert!(
+        !seen.contains("|->"),
+        "a pinned host stream was linked:\n{seen}"
+    );
+}
+
+/// `pw-link -m` on the host for the length of a test: every link made,
+/// however briefly it lived, where `pw-link -l` shows only the ones up
+/// at the moment it is asked.
+struct LinkMonitor {
+    _running: Streaming,
+    log: PathBuf,
+}
+
+impl LinkMonitor {
+    /// Started once it has listed the bed's source, so a link made from
+    /// here on is in what it saw. `stdbuf`, because `pw-link` writing to
+    /// a file holds its lines until it exits, and it exits killed.
+    fn start(bed: &PipeWireBed) -> LinkMonitor {
+        let log = bed.dir().join("links.log");
+        let out = std::fs::File::create(&log).expect("a log for pw-link");
+        let mut command = bed.command("stdbuf");
+        command
+            .args(["-oL", "pw-link", "-m", "-o", "-l"])
+            .stdout(out)
+            .stderr(Stdio::null());
+        own_process_group(&mut command);
+        let running = Streaming(command.spawn().expect("pw-link did not run"));
+        let monitor = LinkMonitor {
+            _running: running,
+            log,
+        };
+        wait_for("pw-link's first listing", || {
+            monitor.seen().contains("bed-source:capture_")
+        });
+        monitor
+    }
+
+    fn seen(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+}
+
+/// A host stream aimed at a sink a context offers goes where a stream
+/// with no target goes: through the host's own smart filter, as a stream
+/// sent to the default by linking/find-default-target is.
+#[test]
+fn a_host_stream_aimed_at_a_sink_a_context_offers_passes_through_the_hosts_filter() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let _filter = host_stream(
+        &bed,
+        &[
+            "-r",
+            "-a",
+            "-P",
+            "{ media.class = Audio/Sink, node.name = host-filter, \
+             node.link-group = host-filter, filter.smart = true, \
+             filter.smart.name = host-filter, \
+             filter.smart.target = { node.name = bed-sink } }",
+            "/dev/null",
+        ],
+    );
+    let _filter_out = host_stream(
+        &bed,
+        &[
+            "-p",
+            "-a",
+            "-P",
+            "{ node.name = host-filter-out, node.link-group = host-filter }",
+            "-",
+        ],
+    );
+    let _plain = host_stream(&bed, &["-p", "-a", "-P", "{ node.name = plain }", "-"]);
+    wait_for("a stream with no target in the host's filter", || {
+        peers(&bed.links(), "plain:output_FL").contains(&"host-filter:playback_FL")
+    });
+    let defaults = bed.host_tool("pw-metadata", &["-n", "default", "0"]);
+    assert!(
+        defaults.contains("'default.audio.sink' value:'{\"name\":\"bed-sink\"}'"),
+        "the filter took the default, so a stream sent there says nothing:\n{defaults}"
+    );
+
+    let _offered = Streaming(bed.spawn_in_context(
+        PLAYBACK,
+        "pw-cat -r -a -P '{ media.class = Audio/Sink, node.name = offered }' /dev/null",
+    ));
+    wait_for("the context's sink", || {
+        bed.dump_from_host().contains("\"node.name\": \"offered\"")
+    });
+    window_in_which_it_would_link(&bed, "playback");
+    wait_for("the filter's own stream on the sink", || {
+        peers(&bed.links(), "host-filter-out:output_FL").contains(&"bed-sink:playback_FL")
+    });
+    let watched = LinkMonitor::start(&bed);
+    let _host = host_stream(
+        &bed,
+        &[
+            "-p",
+            "-a",
+            "--target=offered",
+            "-P",
+            "{ node.name = host }",
+            "-",
+        ],
+    );
+    wait_for("a link for the host's stream", || {
+        !peers(&bed.links(), "host:output_FL").is_empty()
+    });
+    std::thread::sleep(FORBIDDEN_LINK_LIFE);
+    let links = bed.links();
+    assert_eq!(
+        peers(&links, "host:output_FL"),
+        ["host-filter:playback_FL"],
+        "a host stream sent away from a context's sink missed the host's filter:\n{links}"
+    );
+    // Every other link was up before the monitor started, so a link to
+    // the sink after the host's ports appeared is the host stream's,
+    // however briefly it lived.
+    let seen = watched.seen();
+    let since_the_host = seen.split_once("+host:").map_or("", |(_, after)| after);
+    assert!(
+        !since_the_host.contains("|-> bed-sink:"),
+        "a host stream was played past the host's filter first:\n{seen}"
+    );
+}
+
+/// What `port` is linked to in a `pw-link -l` listing.
+fn peers<'a>(links: &'a str, port: &str) -> Vec<&'a str> {
+    links
+        .lines()
+        .skip_while(|line| *line != port)
+        .skip(1)
+        .take_while(|line| line.starts_with(' '))
+        .filter_map(|line| line.trim().strip_prefix("|-> "))
+        .collect()
 }
 
 #[test]

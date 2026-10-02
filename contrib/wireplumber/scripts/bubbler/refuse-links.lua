@@ -47,7 +47,8 @@
 --
 -- WirePlumber links no other client's stream to a sandbox's node that
 -- is not that stream's own, and no such node becomes the session's
--- default; a host stream aimed at one goes to the default instead.
+-- default; a host stream aimed at one goes where it would go without
+-- it, and one pinned to it with `node.dont-fallback` gets no link.
 --
 -- A link with a sandbox's node at either end is destroyed when
 -- WirePlumber sees it, unless WirePlumber made it and each sandbox end
@@ -56,6 +57,8 @@
 -- whatever it reaches; one drawn in a patchbay is destroyed.
 
 local lutils = require ("linking-utils")
+local cutils = require ("common-utils")
+local futils = require ("filter-utils")
 local log = Log.open_topic ("s-linking")
 
 -- The engine name bubbler gives every security context it creates.
@@ -177,13 +180,48 @@ SimpleEventHook {
   end
 }:register ()
 
+-- The first enabled smart filter of the host's in front of `target`, or
+-- of no target at all where `target` is nil, in WirePlumber's chain
+-- order: futils.get_filter_from_target's search, passing over a
+-- sandbox's filter that put itself first in the chain.
+local function host_filter (source, si_props, target)
+  local direction = cutils.getTargetDirection (si_props)
+  for _, filter in ipairs (futils.filters) do
+    if filter.direction == direction and
+        filter.media_type == si_props ["media.type"] and
+        filter.smart and not filter.disabled and
+        ((target ~= nil and filter.target ~= nil and filter.target.id == target.id) or
+         (target == nil and filter.targetless)) and
+        not foreign_sandbox_node (source, si_props, filter.main_si.properties) then
+      return filter.main_si
+    end
+  end
+  return nil
+end
+
+-- What a stream sent to `filter` was aimed at, where `filter` is a smart
+-- filter's main node with a target, else nil.
+local function filter_target (filter)
+  for _, entry in ipairs (futils.filters) do
+    if entry.main_si.id == filter.id then
+      return entry.target
+    end
+  end
+  return nil
+end
+
 -- WirePlumber's finders can still aim a stream at a sandbox's node: its
 -- smart filter (linking/get-filter-from-target), a node named as the
 -- stream's target (linking/find-defined-target) or one ranked above the
 -- host's own (linking/find-best-target). Refused after
 -- linking/prepare-link, the stream would play nowhere, so here, after
--- every finder and before prepare-link, it gets the session's default
--- instead, which is never a sandbox's node.
+-- every finder and before prepare-link, it is decided as though the
+-- sandbox's node were not there: what a sandbox's filter stood in front
+-- of, else the session's default (never a sandbox's node), each through
+-- the host's own filters as get-filter-from-target would have put it;
+-- and a stream pinned with `node.dont-fallback` to a target that is
+-- only a sandbox's is left as find-defined-target leaves one whose
+-- target is missing.
 SimpleEventHook {
   name = "bubbler/no-target-from-a-sandbox",
   after = { "linking/find-defined-target",
@@ -201,20 +239,54 @@ SimpleEventHook {
     },
   },
   execute = function (event)
-    local source, _, si, si_props, _, target =
+    local source, _, si, si_props, si_flags, target =
         lutils:unwrap_select_target_event (event)
     if not target or
         not foreign_sandbox_node (source, si_props, target.properties) then
       return
     end
-    local default = lutils.findDefaultLinkable (si)
-    if default and lutils.canLink (si_props, default) and
-        not foreign_sandbox_node (source, si_props, default.properties) then
-      log:info (si, string.format ("%s goes to the default %s, not %s",
+
+    local aimed = filter_target (target)
+    if aimed and foreign_sandbox_node (source, si_props, aimed.properties) then
+      aimed = nil
+    end
+    local defined = si_flags.has_defined_target
+    if not aimed and defined and
+        cutils.parseBool (si_props ["node.dont-fallback"]) then
+      log:info (si, string.format ("%s is pinned to %s, a sandbox's node",
           tostring (si_props ["node.name"]),
-          tostring (default.properties ["node.name"]),
           tostring (target.properties ["node.name"])))
-      event:set_data ("target", default)
+      event:set_data ("target", nil)
+      if not cutils.parseBool (si_props ["node.linger"]) then
+        local node = si:get_associated_proxy ("node")
+        lutils.sendClientError (event, node, -2, "defined target not found")
+        node:request_destroy ()
+      end
+      event:stop_processing ()
+      return
+    end
+
+    if not aimed then
+      aimed = lutils.findDefaultLinkable (si)
+      defined = false
+      si_flags.has_defined_target = false
+      si_flags.has_node_defined_target = false
+    end
+    local chosen = aimed and (host_filter (source, si_props, aimed) or
+        (not defined and host_filter (source, si_props, nil)) or aimed)
+
+    local compatible, can_passthrough
+    if chosen then
+      compatible, can_passthrough = lutils.checkPassthroughCompatibility (si, chosen)
+    end
+    if chosen and compatible and lutils.canLink (si_props, chosen) and
+        not foreign_sandbox_node (source, si_props, chosen.properties) then
+      log:info (si, string.format ("%s goes to %s, not %s",
+          tostring (si_props ["node.name"]),
+          tostring (chosen.properties ["node.name"]),
+          tostring (target.properties ["node.name"])))
+      si_flags.can_passthrough = can_passthrough
+      event:set_data ("target", chosen)
     else
       event:set_data ("target", nil)
     end
