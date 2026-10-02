@@ -19,6 +19,9 @@
   cleanup, writing or unlinking files in a host directory of its choosing;
   those directories are now made afresh at every start, and the D-Bus proxy's
   socket is refused unless this user owns it.
+- A Ctrl-C, closed terminal or logout while the sidecars were starting killed
+  bubbler outright, leaving `init.sock`, the sidecar directories and the
+  cgroup behind; the signal now stops the sidecars and removes all three.
 
 ## 0.24.1
 

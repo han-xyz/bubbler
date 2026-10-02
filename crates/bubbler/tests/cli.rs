@@ -5645,6 +5645,84 @@ fn a_proxy_that_swaps_its_socket_for_a_symlink_never_reaches_the_sandbox() {
     );
 }
 
+/// A stand-in for `xdg-dbus-proxy` that marks its directory and never
+/// reports itself ready, so a run waits on it for the whole readiness
+/// deadline.
+fn silent_proxy(path: &Path) {
+    write_script(path, "#!/bin/sh\n: > \"${3%/*}/started\"\nexec sleep 30\n");
+}
+
+#[test]
+fn a_signal_while_a_sidecar_starts_stops_the_run_and_leaves_nothing() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let bus = tmp.path().join("fakebus");
+    let _listener = UnixListener::bind(&bus).unwrap();
+    let proxy = tmp.path().join("silent-proxy");
+    silent_proxy(&proxy);
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["create", "halt"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/halt/config.kdl"),
+        "dbus\n",
+    )
+    .unwrap();
+    let marker = tmp.path().join("data/bubbler/instances/halt/home/ran");
+    let mut run = bubbler_live(tmp.path(), &init)
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}", bus.display()),
+        )
+        .env("BUBBLER_DBUS_PROXY", &proxy)
+        .args(["run", "halt", "--", "/usr/bin/touch", "/home/bubbler/ran"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let dir = tmp.path().join("run/bubbler/halt");
+    if !wait_until(|| dir.join("dbus/started").exists(), Duration::from_secs(4)) {
+        fail_with(run, "the proxy never started");
+    }
+    let bwraps = bwraps_under(run.id());
+    assert_eq!(sandboxes_of(run.id(), &bwraps), 1, "the proxy's sandbox");
+    kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
+    let mut status = None;
+    assert!(
+        wait_until(
+            || {
+                status = run.try_wait().expect("waiting for the run");
+                status.is_some()
+            },
+            Duration::from_secs(8)
+        ),
+        "the run did not stop after SIGTERM"
+    );
+    let err = String::from_utf8_lossy(&run.wait_with_output().unwrap().stderr).into_owned();
+    for left in ["init.sock", "dbus"] {
+        assert!(!dir.join(left).exists(), "the start left `{left}`: {err}");
+    }
+    assert_eq!(
+        status.and_then(|s| s.code()),
+        Some(143),
+        "{status:?}: {err}"
+    );
+    assert!(!marker.exists(), "the application ran after the signal");
+    assert!(
+        wait_until(|| !bwrap_alive(&bwraps), Duration::from_secs(5)),
+        "the proxy's sandbox outlived the run"
+    );
+}
+
 /// [`honest_proxy`] that first writes a line to each of its stdout and
 /// stderr.
 fn talking_proxy(path: &Path) {

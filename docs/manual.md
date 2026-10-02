@@ -239,6 +239,10 @@ command and every exec'd process, waits five seconds, and `SIGKILL`s whatever
 is left; the command's own exit status is what `bubbler` returns. If the
 supervisor cannot be found the signal goes to `bwrap` instead, and the sandbox
 is torn down by `--die-with-parent`, which is the backstop in any case.
+`SIGINT`, `SIGTERM` and `SIGHUP` are caught from the moment the instance's runtime
+directory exists: one that arrives while the sidecars are still starting ends
+the start before the command runs, stops the sidecars already up, removes
+`init.sock`, their directories and the run's cgroup, and `bubbler` exits 143.
 `bubbler-init` also answers `SIGHUP` and `SIGQUIT` with the same grace as
 `SIGTERM`, so a terminal that goes away or a keyboard quit ends the run
 instead of leaving the command to bwrap's own reaper. Before it does any of

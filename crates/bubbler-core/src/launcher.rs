@@ -1096,8 +1096,9 @@ impl Drop for ProxyHandle {
 
 /// Wait for the sidecar's ready byte, which says it has bound its socket
 /// and is accepting connections. False when the deadline passes, the pipe
-/// reaches EOF or the child is gone: nothing is listening either way.
-fn wait_ready(ready: &OwnedFd, child: &mut Child, deadline: Instant) -> bool {
+/// reaches EOF, the child is gone or `stop` is set: nothing is listening
+/// either way, or the run is no longer waiting for it.
+fn wait_ready(ready: &OwnedFd, child: &mut Child, deadline: Instant, stop: &AtomicBool) -> bool {
     let mut byte = [0u8; 1];
     loop {
         let slice = Timespec {
@@ -1116,7 +1117,7 @@ fn wait_ready(ready: &OwnedFd, child: &mut Child, deadline: Instant) -> bool {
                 Err(_) => return false,
             },
         }
-        if Instant::now() >= deadline {
+        if Instant::now() >= deadline || stop.load(Ordering::SeqCst) {
             return false;
         }
         if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
@@ -1219,6 +1220,7 @@ pub fn start_wayland(
     dir: &Path,
     inst: &Instance,
     host: &dyn Host,
+    stop: &AtomicBool,
 ) -> Result<Option<WaylandHandle>, LaunchError> {
     let (Some(WaylandMode::Sandboxed { clipboard }), Some(node)) = (
         wayland_mode(&inst.config.services),
@@ -1295,7 +1297,7 @@ pub fn start_wayland(
         .ready_read
         .as_ref()
         .ok_or_else(|| LaunchError::Data(io::Error::other("no ready pipe was allocated")))?;
-    if !wait_ready(ready, child, Instant::now() + PROXY_READY) {
+    if !wait_ready(ready, child, Instant::now() + PROXY_READY, stop) {
         let what = match child.try_wait() {
             Ok(Some(status)) => format!("it exited ({status})"),
             _ => format!("it did not report a listening socket within {PROXY_READY:?}"),
@@ -1424,6 +1426,7 @@ pub fn start_pw_context(
     dir: &Path,
     inst: &Instance,
     host: &dyn Host,
+    stop: &AtomicBool,
 ) -> Result<Option<PwHandle>, LaunchError> {
     let Some(audio) = inst.config.audio() else {
         return Ok(None);
@@ -1477,7 +1480,7 @@ pub fn start_pw_context(
     // The holder reports the name it renamed the socket to as its own
     // sandbox sees it — that sandbox's `/tmp` is this directory — so the
     // one answer bubbler takes is the name it planned for.
-    if read_report(ready, child, Instant::now() + PW_READY).as_deref()
+    if read_report(ready, child, Instant::now() + PW_READY, stop).as_deref()
         != Some(pipewire::SOCKET_INSIDE)
     {
         let what = match child.try_wait() {
@@ -1499,13 +1502,18 @@ pub fn start_pw_context(
 }
 
 /// The line the holder reports the context socket on, without its
-/// newline, or `None` when the deadline passes, the pipe reaches EOF or
-/// the sidecar is gone.
+/// newline, or `None` when the deadline passes, the pipe reaches EOF, the
+/// sidecar is gone or `stop` is set.
 ///
 /// A byte at a time: the line is one short path, and the descriptor stays
 /// open afterwards, so a longer read would block on a pipe with nothing
 /// more coming.
-fn read_report(ready: &OwnedFd, child: &mut Child, deadline: Instant) -> Option<String> {
+fn read_report(
+    ready: &OwnedFd,
+    child: &mut Child,
+    deadline: Instant,
+    stop: &AtomicBool,
+) -> Option<String> {
     let mut line = Vec::new();
     loop {
         let slice = Timespec {
@@ -1529,7 +1537,7 @@ fn read_report(ready: &OwnedFd, child: &mut Child, deadline: Instant) -> Option<
                 }
             }
         }
-        if Instant::now() >= deadline {
+        if Instant::now() >= deadline || stop.load(Ordering::SeqCst) {
             return None;
         }
         if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
@@ -1689,6 +1697,7 @@ pub fn start_pw_pulse(
     dir: &Path,
     inst: &Instance,
     host: &dyn Host,
+    stop: &AtomicBool,
 ) -> Result<Option<PulseHandle>, LaunchError> {
     if !inst
         .config
@@ -1729,6 +1738,9 @@ pub fn start_pw_pulse(
     while !made.exists() {
         if let Ok(Some(status)) = handle.child.try_wait() {
             return Err(LaunchError::PwPulse(format!("it exited ({status})")));
+        }
+        if stop.load(Ordering::SeqCst) {
+            return Err(LaunchError::PwPulse("a stop signal arrived".to_owned()));
         }
         if Instant::now() >= deadline {
             return Err(LaunchError::PwPulse(format!(
@@ -1826,6 +1838,7 @@ pub fn start_proxy(
     dir: &Path,
     plan: &dbus::Plan,
     host: &dyn Host,
+    stop: &AtomicBool,
 ) -> Result<ProxyHandle, LaunchError> {
     // Only the buses the plan grants are resolved: probing the other one
     // would fail a run over a socket it never asked for.
@@ -1912,7 +1925,7 @@ pub fn start_proxy(
         .ready_read
         .as_ref()
         .ok_or_else(|| LaunchError::Data(io::Error::other("no ready pipe was allocated")))?;
-    if !wait_ready(ready, child, Instant::now() + PROXY_READY) {
+    if !wait_ready(ready, child, Instant::now() + PROXY_READY, stop) {
         return Err(LaunchError::ProxyNotReady);
     }
     Ok(handle)
@@ -2352,6 +2365,7 @@ fn start_pasta(
     cfg: &NetworkConfig,
     child_pid: i32,
     ns: &SandboxNs,
+    stop: &AtomicBool,
 ) -> Result<PastaHandle, LaunchError> {
     let userns = &ns.user;
     let (ready, done) = rustix::pipe::pipe().map_err(|e| LaunchError::Data(e.into()))?;
@@ -2399,7 +2413,12 @@ fn start_pasta(
         exited: false,
         _stderr: stderr,
     };
-    if !wait_ready(&ready, &mut handle.child, Instant::now() + PASTA_READY) {
+    if !wait_ready(
+        &ready,
+        &mut handle.child,
+        Instant::now() + PASTA_READY,
+        stop,
+    ) {
         return Err(LaunchError::Network(
             "pasta did not configure the namespace".to_owned(),
         ));
@@ -2505,12 +2524,13 @@ fn start_network(
     cfg: &NetworkConfig,
     child_pid: i32,
     cgroup: Option<&cgroup::SandboxCgroup>,
+    stop: &AtomicBool,
 ) -> Result<NetworkSidecars, LaunchError> {
     let ns = sandbox_namespaces(child_pid)?;
     install_rules(cfg, &ns, cgroup.map(cgroup::SandboxCgroup::spec))?;
-    let pasta = start_pasta(env, cfg, child_pid, &ns)?;
+    let pasta = start_pasta(env, cfg, child_pid, &ns, stop)?;
     let proxy = cgroup
-        .map(|cgroup| start_net_proxy(cfg, &ns, cgroup, env.net_proxy_log))
+        .map(|cgroup| start_net_proxy(cfg, &ns, cgroup, env.net_proxy_log, stop))
         .transpose()?;
     Ok(NetworkSidecars { pasta, proxy })
 }
@@ -2538,6 +2558,7 @@ fn start_net_proxy(
     ns: &SandboxNs,
     cgroup: &cgroup::SandboxCgroup,
     log_tunnels: bool,
+    stop: &AtomicBool,
 ) -> Result<NetProxyHandle, LaunchError> {
     let (ready, done) = rustix::pipe::pipe().map_err(|e| LaunchError::Data(e.into()))?;
     fcntl_setfd(&ready, FdFlags::CLOEXEC).map_err(|e| LaunchError::Data(e.into()))?;
@@ -2653,7 +2674,12 @@ fn start_net_proxy(
     // bubbler's own copy of the write end goes now, so a proxy that dies
     // without writing gives the wait below an EOF instead of a deadline.
     drop(done);
-    if !wait_ready(&ready, &mut handle.child, Instant::now() + NET_PROXY_READY) {
+    if !wait_ready(
+        &ready,
+        &mut handle.child,
+        Instant::now() + NET_PROXY_READY,
+        stop,
+    ) {
         let what = match handle.child.try_wait() {
             Ok(Some(status)) => format!("it exited ({status})"),
             _ => format!("it did not report a listening socket within {NET_PROXY_READY:?}"),
@@ -3387,6 +3413,10 @@ fn wait_relaying(
 /// Marks every descriptor of the calling process above stdio that this
 /// spawn is not meant to hand over close-on-exec, so an embedder's own
 /// open files do not cross into the sandbox; none is closed.
+///
+/// A stop signal caught while the sidecars are starting ends the start:
+/// what was started is stopped and removed, and the code is the one a
+/// run stopped by that signal gives.
 pub fn run(
     env: &Env,
     inst: &Instance,
@@ -3400,6 +3430,43 @@ pub fn run(
         eprintln!("bubbler: warning: {line}");
     }
     let dir = prepare_runtime_dir(env, inst)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut registered = SignalGuard(Vec::new());
+    // From here on and not only once the sandbox is up: the sidecars can
+    // take seconds to start, and a signal's default action in that
+    // window would leave them and the runtime directory behind. SIGHUP
+    // among them: a terminal that goes away must still leave through the
+    // same path, which stops the sandbox and hands the settings back,
+    // rather than killing bubbler where it stands.
+    for sig in [SIGINT, SIGTERM, SIGHUP] {
+        let id =
+            signal_hook::flag::register(sig, Arc::clone(&stop)).map_err(LaunchError::Signal)?;
+        registered.0.push(id);
+    }
+    // Everything the start made is dropped by the time this matches,
+    // which is what stops the sidecars and removes what they left.
+    match start_and_wait(env, inst, command, mode, dir, &stop, &mut registered) {
+        Err(_) if stop.load(Ordering::SeqCst) => Ok(STOPPED_CODE),
+        code => code,
+    }
+}
+
+/// The exit code of a run a stop signal ended before the sandbox was let
+/// go: the one its command gives when the SIGTERM a normal run forwards
+/// stops it.
+const STOPPED_CODE: i32 = 128 + SIGTERM;
+
+/// [`run`] from its runtime directory on, with the stop signals already
+/// caught in `stop`.
+fn start_and_wait(
+    env: &Env,
+    inst: &Instance,
+    command: Option<&[OsString]>,
+    mode: TtyMode,
+    dir: PathBuf,
+    stop: &AtomicBool,
+    registered: &mut SignalGuard,
+) -> Result<i32, LaunchError> {
     if exec::connect(env, &inst.name)?.is_some() {
         return Err(LaunchError::AlreadyRunning(inst.name.clone()));
     }
@@ -3418,7 +3485,7 @@ pub fn run(
     let portals = plan.as_ref().is_some_and(|p| p.portals);
     let isolated = network_of(&inst.config.services).filter(|c| c.is_isolated());
     let _proxy = match &plan {
-        Some(plan) => Some(start_proxy(env, &dir, plan, &RealHost)?),
+        Some(plan) => Some(start_proxy(env, &dir, plan, &RealHost, stop)?),
         None => None,
     };
     // Between the proxy's ready byte and the sandbox's bind each socket
@@ -3431,21 +3498,30 @@ pub fn run(
             buses.push(adopt_proxy_bus(&dir, socket, node, env.uid)?);
         }
     }
+    if stop.load(Ordering::SeqCst) {
+        return Ok(STOPPED_CODE);
+    }
     // Before the argv is built, for the same reason the D-Bus proxy is:
     // the socket the sandbox binds is the one this sidecar accepts on,
     // and a bind of a socket nothing is listening on is a failed start.
     // The handle holds the proxy and the security context open for the
     // whole run. `wayland "host"` asks for the session's socket outright,
     // and without the grant there is nothing to start.
-    let _wayland = start_wayland(env, &dir, inst, &RealHost)?;
+    let _wayland = start_wayland(env, &dir, inst, &RealHost, stop)?;
+    if stop.load(Ordering::SeqCst) {
+        return Ok(STOPPED_CODE);
+    }
     // Before the argv is built, for the same reason: the socket an audio
     // grant binds is the one this sidecar's holder creates, and it is
     // the only PipeWire socket the sandbox is given.
-    let _pw_context = start_pw_context(env, &dir, inst, &RealHost)?;
+    let _pw_context = start_pw_context(env, &dir, inst, &RealHost, stop)?;
+    if stop.load(Ordering::SeqCst) {
+        return Ok(STOPPED_CODE);
+    }
     // After the context, which it connects to, and before the sandbox,
     // whose only PulseAudio socket it serves. Dropped before the context
     // handle, since this server is one of that context's clients.
-    let _pw_pulse = start_pw_pulse(env, &dir, inst, &RealHost)?;
+    let _pw_pulse = start_pw_pulse(env, &dir, inst, &RealHost, stop)?;
     let host = tty::host_stdio()?;
     let is_tty = tty::host_is_tty();
     let mut stdio = tty::plan(mode, is_tty);
@@ -3483,24 +3559,17 @@ pub fn run(
     // below 0.12.0, and the run is refused rather than made safe.
     service::sweep_destinations(&finished.ops, env, &RealHost)?;
     let argv = finished.into_argv();
-    let stop = Arc::new(AtomicBool::new(false));
     // What `stop` becomes once a run has seen it: `stop` is cleared as
     // the signal is acted on, this stays set for the rest of the run.
     let stopping = AtomicBool::new(false);
     let winch = Arc::new(AtomicBool::new(false));
-    let mut registered = SignalGuard(Vec::new());
-    // SIGHUP among them: a terminal that goes away must still leave
-    // through the same path, which stops the sandbox and hands the
-    // settings back, rather than killing bubbler where it stands.
-    for sig in [SIGINT, SIGTERM, SIGHUP] {
-        let id =
-            signal_hook::flag::register(sig, Arc::clone(&stop)).map_err(LaunchError::Signal)?;
-        registered.0.push(id);
-    }
     if stdio.needs_pty() {
         let id = signal_hook::flag::register(SIGWINCH, Arc::clone(&winch))
             .map_err(LaunchError::Signal)?;
         registered.0.push(id);
+    }
+    if stop.load(Ordering::SeqCst) {
+        return Ok(STOPPED_CODE);
     }
     // Raw from here on: the pty inside has the line discipline now, so
     // Ctrl-C is a byte for it and the guard restores the terminal on
@@ -3570,7 +3639,9 @@ pub fn run(
     let mut network = match isolated {
         Some(cfg) => {
             let started = match info.as_ref() {
-                Some((child_pid, _)) => start_network(env, cfg, *child_pid, net_cgroup.as_ref()),
+                Some((child_pid, _)) => {
+                    start_network(env, cfg, *child_pid, net_cgroup.as_ref(), stop)
+                }
                 None => Err(LaunchError::Network(
                     "bwrap reported no sandbox pid for pasta to attach to".to_owned(),
                 )),
@@ -3586,6 +3657,12 @@ pub fn run(
         None => None,
     };
     if portals || isolated.is_some() {
+        // Still held, so a stop caught while pasta started ends the start
+        // here rather than letting the application begin only to stop it.
+        if stop.load(Ordering::SeqCst) {
+            abort_sandbox(&mut child, info.as_ref().map(|(pid, _)| *pid));
+            return Ok(STOPPED_CODE);
+        }
         release_block(&mut alloc);
     }
     // Its own deadline: the one above may already have been spent waiting
@@ -3605,7 +3682,7 @@ pub fn run(
     };
     let warn = tty::Warn::new();
     let mut watch = Watch {
-        stop: &stop,
+        stop,
         supervisor,
         stopping: &stopping,
         network: &mut network,
@@ -4005,7 +4082,8 @@ mod tests {
         let app = inst(tmp.path(), "wayland\ncommand \"true\"");
         for bad in ["../wayland-1", "/run/user/1000/wayland-1"] {
             e.wayland_display = Some(bad.into());
-            let err = start_wayland(&e, &dir, &app, &RealHost).expect_err(bad);
+            let err =
+                start_wayland(&e, &dir, &app, &RealHost, &AtomicBool::new(false)).expect_err(bad);
             assert!(
                 matches!(
                     err,
@@ -4019,7 +4097,7 @@ mod tests {
         }
         e.wayland_display = None;
         assert!(matches!(
-            start_wayland(&e, &dir, &app, &RealHost),
+            start_wayland(&e, &dir, &app, &RealHost, &AtomicBool::new(false)),
             Err(LaunchError::MissingEnv {
                 service: "wayland",
                 var: "WAYLAND_DISPLAY"
@@ -4043,7 +4121,9 @@ mod tests {
         for kdl in ["command \"true\"", "wayland \"host\"\ncommand \"true\""] {
             let app = inst(tmp.path(), kdl);
             assert!(
-                start_wayland(&e, &dir, &app, &RealHost).unwrap().is_none(),
+                start_wayland(&e, &dir, &app, &RealHost, &AtomicBool::new(false))
+                    .unwrap()
+                    .is_none(),
                 "{kdl}"
             );
         }
@@ -4877,7 +4957,7 @@ mod tests {
             socket,
         );
         assert!(matches!(
-            start_pw_context(&e, &dir, &i, &host),
+            start_pw_context(&e, &dir, &i, &host, &AtomicBool::new(false)),
             Err(LaunchError::MissingResource { service: "pipewire", ref path })
                 if path == Path::new(pipewire::PW_CONTAINER)
         ));
@@ -4904,7 +4984,7 @@ mod tests {
             file,
         );
         assert!(matches!(
-            start_pw_pulse(&e, &dir, &i, &host),
+            start_pw_pulse(&e, &dir, &i, &host, &AtomicBool::new(false)),
             Err(LaunchError::MissingResource { service: "pulseaudio", ref path })
                 if path == Path::new(pipewire::PULSE_MODULE)
         ));
@@ -5513,7 +5593,7 @@ mod tests {
             // Both paths into the proxy, since a run resolves the
             // addresses again rather than reading the explanation.
             for got in [
-                start_proxy(&e, &dir, &plan, &host).map(|_| ()),
+                start_proxy(&e, &dir, &plan, &host, &AtomicBool::new(false)).map(|_| ()),
                 explain_proxy(&e, &cfg).map(|_| ()),
             ] {
                 match got {
@@ -5542,7 +5622,7 @@ mod tests {
             let plan = dbus::plan(&cfg.config.services, "t").expect("a `dbus` node starts a proxy");
             let dir = instance_runtime_dir(&e, "t");
             for got in [
-                start_proxy(&e, &dir, &plan, &host).map(|_| ()),
+                start_proxy(&e, &dir, &plan, &host, &AtomicBool::new(false)).map(|_| ()),
                 explain_proxy(&e, &cfg).map(|_| ()),
             ] {
                 assert!(
