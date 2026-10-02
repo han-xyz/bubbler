@@ -220,6 +220,67 @@ fn new_bed_dir() -> PathBuf {
     dir
 }
 
+/// Every live process of the bed in `dir`, as `pid comm`: each one the
+/// bed starts carries `PIPEWIRE_RUNTIME_DIR` or `PULSE_SERVER` under
+/// `dir` in its environment, where its command line may name nothing of
+/// the bed at all (`pw-cat -p -a -`, the pulse server's `pipewire -c`).
+fn processes_of(dir: &Path) -> Vec<String> {
+    let needle = format!("{}/", dir.display());
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            std::fs::read(entry.path().join("environ")).is_ok_and(|environ| {
+                environ
+                    .windows(needle.len())
+                    .any(|window| window == needle.as_bytes())
+            })
+        })
+        .map(|entry| {
+            let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+            format!("{} {}", entry.file_name().to_string_lossy(), comm.trim())
+        })
+        .collect()
+}
+
+/// What ends a bed's processes when its test binary goes, however it
+/// goes: it waits for the end of a pipe only the test holds, then kills
+/// every process `processes_of` would find. A death signal reaches only
+/// a direct child, and a program under `pw-container` is a grandchild
+/// that need not end with the bed's daemon (the pulse server does not,
+/// measured); one process group for the bed would do as much, but each
+/// `Streaming` has a group of its own so that a test can stop it alone.
+const SUPERVISOR: &str = r#"
+trap '' INT TERM HUP QUIT
+read -r _
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  left=
+  for p in /proc/[0-9]*; do
+    if grep -qsF -- "$1/" "$p/environ"; then
+      kill -KILL "${p#/proc/}" 2>/dev/null && left=1
+    fi
+  done
+  [ -z "$left" ] && exit 0
+  sleep 0.1
+done
+"#;
+
+/// The bed's supervisor, in a group of its own so that a terminal's
+/// `^C` to the test does not end it before it has done its work.
+fn supervisor(dir: &Path) -> Child {
+    Command::new("sh")
+        .args(["-c", SUPERVISOR, "sh"])
+        .arg(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("the bed's supervisor")
+}
+
 /// Remove the bed directories of runs that are gone.
 ///
 /// `Drop` removes a bed's own directory, but a `SIGKILL` on the test
@@ -251,6 +312,7 @@ fn sweep_stale_beds() {
 pub struct PipeWireBed {
     pipewire: Child,
     wireplumber: Child,
+    supervisor: Child,
     dir: PathBuf,
 }
 
@@ -294,6 +356,7 @@ impl PipeWireBed {
             .expect("the bed's script directory");
         std::fs::write(&hook, HOOK).expect("the policy's linking hook");
 
+        let supervisor = supervisor(&dir);
         let pipewire = daemon(
             Command::new("pipewire")
                 .arg("-c")
@@ -318,6 +381,7 @@ impl PipeWireBed {
         let bed = PipeWireBed {
             pipewire,
             wireplumber,
+            supervisor,
             dir,
         };
         // WirePlumber registers itself as a client before it applies any
@@ -516,6 +580,8 @@ impl Drop for PipeWireBed {
             let _ = kill_process(pid, Signal::TERM);
             wait_or_kill(child);
         }
+        drop(self.supervisor.stdin.take());
+        let _ = self.supervisor.wait();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -690,6 +756,99 @@ fn dropping_the_bed_leaves_no_daemon_and_no_directory() {
         );
     }
     assert!(!dir.exists(), "{} outlived the bed", dir.display());
+    let left = processes_of(&dir);
+    assert!(left.is_empty(), "outlived the bed: {left:?}");
+}
+
+/// Set on the copy of this binary the test below kills; the test it
+/// names holds a bed until then and does nothing in any other run.
+const HELD_BED: &str = "BUBBLER_TEST_HELD_BED";
+
+#[test]
+fn a_bed_held_until_its_test_is_killed() {
+    if std::env::var_os(HELD_BED).is_none() {
+        return;
+    }
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let server = bed.pulse_server(PLAYBACK_MICROPHONE);
+    let out = bed.dir().join("captured.wav");
+    let _recording = server.spawn(
+        "parecord",
+        &[
+            OsStr::new("--device=bed-source"),
+            OsStr::new("--file-format=wav"),
+            out.as_os_str(),
+        ],
+    );
+    let _tone = streaming(
+        &bed,
+        PLAYBACK,
+        "pw-cat -p -a - < /dev/zero",
+        "Stream/Output/Audio",
+    );
+    wait_for("the recording and the tone", || {
+        let links = bed.links();
+        links.contains("bed-source:capture_") && links.contains("bed-sink:playback_")
+    });
+    println!("{HELD_BED}={}", bed.dir().display());
+    // A pipe's stdout is not flushed line by line (measured).
+    std::io::Write::flush(&mut std::io::stdout()).expect("the line to the killing test");
+    std::thread::sleep(Duration::from_secs(60));
+}
+
+#[test]
+fn nothing_of_a_bed_outlives_a_killed_test_binary() {
+    let mut command = Command::new(std::env::current_exe().expect("the path of this test binary"));
+    command
+        .args([
+            "--exact",
+            "a_bed_held_until_its_test_is_killed",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(HELD_BED, "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    // SAFETY: as in `daemon`: `prctl` alone between fork and exec.
+    unsafe {
+        command.pre_exec(dies_with_this_thread);
+    }
+    let mut held = command.spawn().expect("a copy of this test binary");
+    let prefix = format!("{HELD_BED}=");
+    let dir = std::io::BufRead::lines(std::io::BufReader::new(
+        held.stdout.take().expect("the copy's stdout"),
+    ))
+    .map_while(Result::ok)
+    .find_map(|line| line.split_once(&prefix).map(|(_, dir)| PathBuf::from(dir)));
+    let Some(dir) = dir else {
+        let status = held.wait().expect("the copy's status");
+        assert!(status.success(), "the held bed did not come up: {status}");
+        return;
+    };
+
+    let before = processes_of(&dir);
+    let pid = Pid::from_raw(held.id() as i32).expect("a live child");
+    kill_process(pid, Signal::KILL).expect("SIGKILL to the copy");
+    let _ = held.wait();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut left = processes_of(&dir);
+    while !left.is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        left = processes_of(&dir);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        left.is_empty(),
+        "outlived a SIGKILLed test binary: {left:?} of {before:?}"
+    );
+    for program in ["parecord", "pw-cat", "pw-container"] {
+        assert!(
+            before.iter().any(|process| process.ends_with(program)),
+            "the held bed ran no {program}: {before:?}"
+        );
+    }
 }
 
 /// Three seconds of silence as a 48 kHz stereo WAV, for `pw-cat` to play
