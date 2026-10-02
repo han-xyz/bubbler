@@ -78,15 +78,20 @@ Ten processes can come with a sandbox, and they are not one kind of thing:
 | `nft` | on the host, entering the sandbox's user and network namespaces to install the ruleset | **Not a party to one.** It builds the network boundary rather than standing in it: it runs before pasta and before the sandbox is let go of its `--block-fd`, so the namespace has a policy before it has a route and before the application has run an instruction either way. Nothing the sandbox controls reaches it — the ruleset is generated from typed values and handed over on stdin, and its argv is two fixed arguments. It holds CAP_NET_ADMIN in the sandbox's user namespace and no other capability anywhere: the capability crosses `execve` through the ambient set, and `SECBIT_NOROOT` with `_LOCKED` stops the uid-0 that bwrap's nested user namespace maps bubbler to from being handed the full set. It exits before the run begins, and one that stops answering is killed rather than left holding that capability. |
 
 Each of the three directories a sidecar writes — `<inst>/dbus`, `<inst>/pw`
-and `<inst>/pwpulse` — is removed and created afresh by bubbler before that
-sidecar starts, and the creation fails on anything still at the name, so a
-link a compromised sidecar left there in a run that ended without cleanup
-is never followed by a later start, and a directory it made unreadable is
-given back to the user and removed rather than blocking every later start;
-a socket is adopted only out of a directory that is not a link, and only
-when this user owns it. Two starts of one instance racing over a dead
-run's control socket can both get this far, and the later one then
-removes the earlier one's sidecar directories: a known gap.
+and `<inst>/pwpulse` — is created afresh by bubbler before that sidecar
+starts: whatever is at the name is first renamed aside within `<inst>`,
+which no sidecar can write, and the creation fails on anything still at
+the name, so a link a compromised sidecar left there in a run that ended
+without cleanup is never followed by a later start. What was moved aside
+is then removed best-effort, without following links, giving each
+directory back to the user as it goes and holding a fixed number of
+descriptors whatever the tree's depth; a tree that cannot be removed in
+full is named in a warning and taken up again by the next start, but
+never blocks one. A socket is adopted only out of a directory that is
+not a link, and only when this user owns it. Two starts of one instance
+racing over a dead run's control socket can both get this far, and the
+later one then moves the earlier one's sidecar directories aside: a known
+gap.
 
 ([A run is a chain of processes](manual.md#usage),
 [D-Bus](manual.md#d-bus), [network](manual.md#network),
@@ -99,6 +104,8 @@ removes the earlier one's sidecar directories: a known gap.
 `a_link_in_place_of_the_socket_directory_is_not_followed`,
 `a_link_in_place_of_the_proxys_directory_is_not_followed`,
 `an_unreadable_tree_a_sidecar_left_does_not_block_its_start`,
+`a_tree_deeper_than_the_descriptor_limit_does_not_block_its_start`,
+`removing_a_moved_tree_changes_nothing_its_links_name`,
 `proxy_argv_runs_the_proxy_in_its_own_sandbox`,
 `wl_proxy_argv_runs_the_proxy_in_its_own_sandbox`,
 `real_wayland_proxy_serves_the_only_socket_the_sandbox_sees`,

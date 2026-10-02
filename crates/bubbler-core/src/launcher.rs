@@ -2846,37 +2846,143 @@ fn mkdir_private(dir: &Path) -> Result<(), LaunchError> {
     }
 }
 
-/// Remove whatever is at `dir` and create it again, mode 0700, failing on
-/// an entry that is still there. Called before the sidecar that writes
-/// `dir` is started, so what a dead run's sidecar left in it — a link
-/// out of the runtime directory above all — is never followed by
-/// anything bubbler writes or unlinks there. Called after this run has
-/// bound the instance's control socket and found no live run behind it;
-/// two starts racing over a dead run's socket can both get there, and
-/// the second then removes the first one's directory (a known gap).
+/// How many entries one start reads or removes while clearing what dead
+/// runs' sidecars left, so a tree of any size delays a start by a bounded
+/// amount; what is left over is taken up again by the next start.
+const LEFTOVER_BUDGET: usize = 100_000;
+
+/// Create `dir` afresh, mode 0700, failing on an entry that is still
+/// there. Whatever is at its name is first renamed aside in the same
+/// directory and then removed best-effort, so nothing a dead run's
+/// sidecar left — a link out of the runtime directory above all, or a
+/// tree no walk can finish — is followed by anything bubbler writes
+/// there or can block the start. Called after this run has bound the
+/// instance's control socket and found no live run behind it; two starts
+/// racing over a dead run's socket can both get there, and the second
+/// then moves the first one's directory aside (a known gap).
 fn fresh_sidecar_dir(dir: &Path) -> Result<(), LaunchError> {
     let io_at = |e: Errno| LaunchError::Io(dir.to_path_buf(), e.into());
     let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
         unreachable!("a sidecar directory is named inside the instance's");
     };
     let at = open_dir(parent)?;
-    match remove_tree(&at, name) {
-        Ok(()) | Err(Errno::NOENT) => {}
+    let moved = match rustix::fs::statat(&at, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Err(Errno::NOENT) => None,
         Err(e) => return Err(io_at(e)),
+        // Within the one directory bubbler owns, so no mode or depth of
+        // the tree can refuse it, and a link is moved as the link.
+        Ok(_) => Some(
+            rename_to_free(&at, name, &at, &mut 0, |seq| leftover_name(name, seq))
+                .map_err(io_at)?,
+        ),
+    };
+    rustix::fs::mkdirat(&at, name, Mode::RWXU).map_err(io_at)?;
+    clear_leftovers(&at, name);
+    if let Some(moved) = moved
+        && rustix::fs::statat(&at, &moved, AtFlags::SYMLINK_NOFOLLOW).is_ok()
+    {
+        eprintln!(
+            "bubbler: warning: {} is what a dead run's sidecar left and could not be removed in full; the next start tries again",
+            parent.join(moved).display()
+        );
     }
-    rustix::fs::mkdirat(&at, name, Mode::RWXU).map_err(io_at)
+    Ok(())
+}
+
+/// `<name>.leftover.<pid>.<seq>`: where [`fresh_sidecar_dir`] moves what
+/// it found at `name`. Only bubbler can write the instance's runtime
+/// directory, so the name has no one to be guessed by.
+fn leftover_name(name: &OsStr, seq: u64) -> OsString {
+    let mut aside = leftover_prefix(name);
+    aside.push(format!("{}.{seq}", std::process::id()));
+    aside
+}
+
+fn leftover_prefix(name: &OsStr) -> OsString {
+    let mut prefix = name.to_owned();
+    prefix.push(".leftover.");
+    prefix
+}
+
+/// Remove every earlier leftover of `name` under `at` that the budget
+/// reaches. A failure is left for the next start: the warning is said
+/// once, by the start that moved the tree aside.
+fn clear_leftovers(at: &OwnedFd, name: &OsStr) {
+    let prefix = leftover_prefix(name);
+    let mut budget = LEFTOVER_BUDGET;
+    let Ok(names) = entry_names(at, &mut budget) else {
+        return;
+    };
+    for leftover in names {
+        if leftover.as_bytes().starts_with(prefix.as_bytes()) {
+            let _ = remove_tree(at, &leftover, &mut budget);
+        }
+    }
+}
+
+/// Rename `name` under `from` to the first name `make` gives from `seq`
+/// on that is free under `to`, never replacing an entry; the name it took
+/// is returned and `seq` left past it.
+fn rename_to_free(
+    from: &OwnedFd,
+    name: &OsStr,
+    to: &OwnedFd,
+    seq: &mut u64,
+    make: impl Fn(u64) -> OsString,
+) -> rustix::io::Result<OsString> {
+    loop {
+        let new = make(*seq);
+        *seq += 1;
+        match rustix::fs::renameat_with(from, name, to, &new, rustix::fs::RenameFlags::NOREPLACE) {
+            Err(Errno::EXIST) => {}
+            Err(e) => return Err(e),
+            Ok(()) => return Ok(new),
+        }
+    }
 }
 
 /// Remove `name` under `at` and, where it is a directory, everything in
-/// it, following no link. A sidecar runs as the user and can leave a
-/// directory no one may read or write, so each one is first given back
-/// to its owner (0700) through a descriptor of its own: the mode
-/// changes on the directory that was opened, never on whatever a path
-/// names by then.
-fn remove_tree(at: &OwnedFd, name: &OsStr) -> rustix::io::Result<()> {
+/// it, following no link, holding a fixed number of descriptors whatever
+/// the depth: each pass empties the directories directly in the top one
+/// and lifts what they hold up into it. Fails with `EAGAIN` once `budget`
+/// entries have been read.
+fn remove_tree(at: &OwnedFd, name: &OsStr, budget: &mut usize) -> rustix::io::Result<()> {
+    let Some(top) = unlink_or_open(at, name)? else {
+        return Ok(());
+    };
+    let mut lifted = 0;
+    loop {
+        let names = entry_names(&top, budget)?;
+        if names.is_empty() {
+            break;
+        }
+        for entry in names {
+            let Some(inner) = unlink_or_open(&top, &entry)? else {
+                continue;
+            };
+            for sub in entry_names(&inner, budget)? {
+                if unlink_or_open(&inner, &sub)?.is_some() {
+                    rename_to_free(&inner, &sub, &top, &mut lifted, |seq| {
+                        OsString::from(seq.to_string())
+                    })?;
+                }
+            }
+            rustix::fs::unlinkat(&top, &entry, AtFlags::REMOVEDIR)?;
+        }
+    }
+    rustix::fs::unlinkat(at, name, AtFlags::REMOVEDIR)
+}
+
+/// Unlink `name` under `at` unless it is a directory; a directory is
+/// given back to its owner (0700) and opened for reading. A sidecar runs
+/// as the user and can leave one no one may read, write or move to
+/// another parent; the mode changes on the directory that was opened,
+/// never on whatever a path names by then, and a link is never followed.
+fn unlink_or_open(at: &OwnedFd, name: &OsStr) -> rustix::io::Result<Option<OwnedFd>> {
     let stat = rustix::fs::statat(at, name, AtFlags::SYMLINK_NOFOLLOW)?;
     if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory {
-        return rustix::fs::unlinkat(at, name, AtFlags::empty());
+        rustix::fs::unlinkat(at, name, AtFlags::empty())?;
+        return Ok(None);
     }
     let pinned = rustix::fs::openat(
         at,
@@ -2887,24 +2993,28 @@ fn remove_tree(at: &OwnedFd, name: &OsStr) -> rustix::io::Result<()> {
     // `fchmod` refuses an `O_PATH` descriptor, and one opened for reading
     // needs the permission this is restoring.
     rustix::fs::chmod(format!("/proc/self/fd/{}", pinned.as_raw_fd()), Mode::RWXU)?;
-    let inner = rustix::fs::openat(
+    rustix::fs::openat(
         &pinned,
         ".",
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
-    )?;
+    )
+    .map(Some)
+}
+
+/// The names in `dir`, each one taken off `budget`.
+fn entry_names(dir: &OwnedFd, budget: &mut usize) -> rustix::io::Result<Vec<OsString>> {
     let mut names = Vec::new();
-    for entry in rustix::fs::Dir::read_from(&inner)? {
+    for entry in rustix::fs::Dir::read_from(dir)? {
         let entry = entry?;
-        let entry_name = OsStr::from_bytes(entry.file_name().to_bytes());
-        if entry_name != "." && entry_name != ".." {
-            names.push(entry_name.to_owned());
+        let name = OsStr::from_bytes(entry.file_name().to_bytes());
+        if name == "." || name == ".." {
+            continue;
         }
+        *budget = budget.checked_sub(1).ok_or(Errno::AGAIN)?;
+        names.push(name.to_owned());
     }
-    for entry_name in names {
-        remove_tree(&inner, &entry_name)?;
-    }
-    rustix::fs::unlinkat(at, name, AtFlags::REMOVEDIR)
+    Ok(names)
 }
 
 /// Create `$XDG_RUNTIME_DIR/bubbler/<name>/` with mode 0700; an existing
@@ -5348,6 +5458,97 @@ mod tests {
             assert_eq!(std::fs::read(&sentinel).unwrap(), b"sentinel");
             assert_eq!((mode(&elsewhere), mode(&sentinel)), before);
         }
+    }
+
+    /// A chain of directories `depth` deep at `top`, made one level at a
+    /// time so no path ever gets long; the deepest directory is returned.
+    fn plant_chain(top: &Path, depth: usize) -> OwnedFd {
+        let pin = OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        std::fs::create_dir(top).unwrap();
+        let mut at = rustix::fs::open(top, pin, Mode::empty()).unwrap();
+        for _ in 0..depth {
+            rustix::fs::mkdirat(&at, "d", Mode::RWXU).unwrap();
+            at = rustix::fs::openat(&at, "d", pin, Mode::empty()).unwrap();
+        }
+        at
+    }
+
+    /// The descriptor limit most desktops start a process with, so a tree
+    /// deeper than half of it is deeper than one descriptor per level of
+    /// a walk can reach.
+    fn with_desktop_fd_limit(test: impl FnOnce()) {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+        let was = getrlimit(Resource::Nofile);
+        let lowered = Rlimit {
+            current: Some(was.current.map_or(1024, |c| c.min(1024))),
+            maximum: was.maximum,
+        };
+        setrlimit(Resource::Nofile, lowered).unwrap();
+        test();
+        setrlimit(Resource::Nofile, was).unwrap();
+    }
+
+    fn leftovers(dir: &Path, sidecar: &Path) -> Vec<OsString> {
+        let mut prefix = sidecar.file_name().unwrap().to_owned();
+        prefix.push(".");
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n.as_bytes().starts_with(prefix.as_bytes()))
+            .collect()
+    }
+
+    /// A sidecar can build a tree deeper than any walk holding a
+    /// descriptor per level can follow. The start still gets a fresh
+    /// directory, and the tree is gone rather than left beside it.
+    #[test]
+    fn a_tree_deeper_than_the_descriptor_limit_does_not_block_its_start() {
+        with_desktop_fd_limit(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let sidecar = pipewire::dir(tmp.path());
+            plant_chain(&sidecar, 1500);
+
+            fresh_sidecar_dir(&sidecar).unwrap();
+
+            assert!(std::fs::symlink_metadata(&sidecar).unwrap().is_dir());
+            assert_eq!(std::fs::read_dir(&sidecar).unwrap().count(), 0);
+            assert_eq!(leftovers(tmp.path(), &sidecar), Vec::<OsString>::new());
+        });
+    }
+
+    /// What the moved tree links to, at its deepest and behind levels no
+    /// one may open, is neither followed, removed nor given new modes.
+    #[test]
+    fn removing_a_moved_tree_changes_nothing_its_links_name() {
+        use std::os::unix::fs::PermissionsExt;
+        with_desktop_fd_limit(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let elsewhere = tmp.path().join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            let sentinel = elsewhere.join("sentinel");
+            std::fs::write(&sentinel, b"sentinel").unwrap();
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+            let before = (mode(&elsewhere), mode(&sentinel));
+            let dir = tmp.path().join("t");
+            std::fs::create_dir(&dir).unwrap();
+            let sidecar = dbus::socket_dir(&dir);
+            let bottom = plant_chain(&sidecar, 600);
+            rustix::fs::symlinkat(&sentinel, &bottom, "out").unwrap();
+            rustix::fs::symlinkat(&elsewhere, &bottom, "up").unwrap();
+            rustix::fs::chmod(
+                format!("/proc/self/fd/{}", bottom.as_raw_fd()),
+                Mode::empty(),
+            )
+            .unwrap();
+            std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+            fresh_sidecar_dir(&sidecar).unwrap();
+
+            assert_eq!(std::fs::read_dir(&sidecar).unwrap().count(), 0);
+            assert_eq!(leftovers(&dir, &sidecar), Vec::<OsString>::new());
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"sentinel");
+            assert_eq!((mode(&elsewhere), mode(&sentinel)), before);
+        });
     }
 
     /// `PIPEWIRE_CONFIG_DIR` has no fallback for the main file, so a host
