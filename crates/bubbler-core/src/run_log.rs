@@ -44,9 +44,9 @@ const NOTE: &str = "\nbubbler: log full; the rest of this run's output was dropp
 /// Tried once when a tee's log fails, so a cut-off record reads as one.
 const STOPPED: &str = "\nbubbler: writing the log failed; the record of this run stops here\n";
 
-/// How long a [`Redirect`] waits for the copying thread on the way out. A
-/// sidecar that outlived the run still holds the pipe open, and giving up
-/// costs the last few lines, never the exit.
+/// How long a [`Redirect`] or a [`Relay`] waits for its copying thread on
+/// the way out. A process that outlived the run still holds the pipe open,
+/// and giving up costs the last few lines, never the exit.
 const FLUSH: Duration = Duration::from_secs(1);
 
 /// The log of the instance whose directory is `dir`.
@@ -216,7 +216,7 @@ pub fn relay() -> Result<(OwnedFd, Relay), LaunchError> {
 }
 
 /// The copying thread of a [`relay`]. Dropped once the sidecar is gone, it
-/// waits up to [`FLUSH`] for the last of its output.
+/// waits up to a second for the last of its output.
 #[derive(Debug)]
 pub struct Relay {
     done: Receiver<()>,

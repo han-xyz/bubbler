@@ -5685,8 +5685,66 @@ fn talking_proxy_run(tmp: &Path, init: &Path, proxy: &Path, command: &[&str]) ->
     run
 }
 
+/// One open descriptor of a sidecar: its pid, its number and what it is.
+type SidecarFd = (i32, String, PathBuf);
+
+/// The descriptor tables of the processes whose command line holds
+/// `needle`, read until the one whose `argv[0]` is `main` has been read or
+/// ten seconds pass; `None` if it never was. A table that cannot be read
+/// is read again on the next pass, never taken for a clean one.
+fn sidecar_fds(needle: &str, main: &str) -> Option<Vec<SidecarFd>> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut fds = Vec::new();
+    while Instant::now() < deadline {
+        for pid in std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_string_lossy().parse::<i32>().ok())
+        {
+            let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+                continue;
+            };
+            let argv: Vec<_> = cmdline.split(|b| *b == 0).collect();
+            // bubbler's own `--version` probe of a program is no sidecar.
+            if !argv.iter().any(|a| a == &needle.as_bytes()) || argv.contains(&&b"--version"[..]) {
+                continue;
+            }
+            let Ok(dir) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+                continue;
+            };
+            fds.extend(dir.flatten().filter_map(|e| {
+                let target = std::fs::read_link(e.path()).ok()?;
+                Some((pid, e.file_name().to_string_lossy().into_owned(), target))
+            }));
+            if argv[0] == main.as_bytes() {
+                return Some(fds);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
+/// Every descriptor in `fds` is none of the caller's: stdin is
+/// `/dev/null`, stderr a pipe, and nothing is a terminal or `stdout`.
+fn assert_none_of_the_callers(fds: &[SidecarFd], stdout: &Path) {
+    for (pid, fd, target) in fds {
+        let shown = target.to_string_lossy();
+        assert!(
+            target != stdout && !shown.starts_with("/dev/pts/") && !shown.starts_with("/dev/tty"),
+            "pid {pid} holds the caller's {shown} as fd {fd}"
+        );
+        match fd.as_str() {
+            "0" => assert_eq!(shown, "/dev/null", "pid {pid} stdin"),
+            "2" => assert!(shown.starts_with("pipe:"), "pid {pid} stderr is {shown}"),
+            _ => {}
+        }
+    }
+}
+
 /// A sidecar parses what the sandbox sends it, so it holds nothing of the
-/// caller's: not the file bubbler's stdout is, and no terminal.
+/// caller's: not the file bubbler's stdout is, and no terminal. What it
+/// writes to stderr still reaches the caller's.
 #[test]
 fn a_sidecar_holds_neither_the_callers_stdout_nor_a_terminal() {
     if !require_bwrap() || !require_python() {
@@ -5698,37 +5756,88 @@ fn a_sidecar_holds_neither_the_callers_stdout_nor_a_terminal() {
     let proxy = tmp.path().join("talking-proxy");
     let stdout = tmp.path().join("stdout");
     let pty = test_pty();
-    let terminal = std::fs::read_link(format!("/proc/self/fd/{}", pty.slave.as_raw_fd())).unwrap();
     let child = talking_proxy_run(tmp.path(), &init, &proxy, &["/usr/bin/sleep", "3"])
         .stdin(pty.stdio())
         .stdout(std::fs::File::create(&stdout).unwrap())
-        .stderr(Stdio::piped())
+        .stderr(pty.stdio())
         .spawn()
         .unwrap();
-    let is_sidecar = |pid: &i32| {
-        std::fs::read(format!("/proc/{pid}/cmdline"))
-            .is_ok_and(|c| String::from_utf8_lossy(&c).contains(&*proxy.to_string_lossy()))
-    };
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut seen = false;
-    let mut holding = Vec::new();
-    while !seen && Instant::now() < deadline {
-        seen = process_running(&proxy.to_string_lossy(), "--fd=");
-        for path in [&stdout, &terminal] {
-            holding.extend(holders_of(path).into_iter().filter(is_sidecar));
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let fds = sidecar_fds(&proxy.to_string_lossy(), PYTHON);
+    let shown = pty.read_until(Duration::from_secs(10), |s| s.contains("sidecar-stderr"));
     let out = child.wait_with_output().unwrap();
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(seen, "the proxy never ran: {err}");
-    assert_eq!(out.status.code(), Some(0), "{err}");
-    assert!(
-        holding.is_empty(),
-        "sidecar pids {holding:?} hold the caller's stdio"
-    );
+    let fds = fds.unwrap_or_else(|| panic!("the proxy's descriptors were never read: {shown}"));
+    assert_none_of_the_callers(&fds, &stdout);
+    assert_eq!(out.status.code(), Some(0), "{shown}");
+    assert!(shown.contains("sidecar-stderr"), "{shown}");
     let written = std::fs::read_to_string(&stdout).unwrap();
     assert!(!written.contains("sidecar-stdout"), "{written}");
+}
+
+/// pasta and the egress proxy have no bwrap of their own, and hold no
+/// terminal of the caller's either.
+#[test]
+fn the_pasta_sidecar_holds_no_terminal_of_the_callers() {
+    if !require_bwrap() || !require_python() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    let stdout = tmp.path().join("stdout");
+    let pty = test_pty();
+    let child = pasta_case(tmp.path(), &init, "network\n")
+        .args(["run", "t", "--", "/usr/bin/sleep", "3"])
+        .stdin(pty.stdio())
+        .stdout(std::fs::File::create(&stdout).unwrap())
+        .stderr(pty.stdio())
+        .spawn()
+        .unwrap();
+    let fds = sidecar_fds(&tmp.path().join("fake-pasta").to_string_lossy(), PYTHON);
+    let out = child.wait_with_output().unwrap();
+    let fds = fds.expect("the stand-in pasta's descriptors were never read");
+    assert_none_of_the_callers(&fds, &stdout);
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn real_allow_host_the_egress_proxy_holds_no_terminal_of_the_callers() {
+    if !require_egress() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "egfd"])
+        .status()
+        .unwrap();
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/egfd/config.kdl"),
+        "network {\n    outbound \"deny\"\n    allow-host \"fd-check.invalid\"\n}\n",
+    )
+    .unwrap();
+    let stdout = tmp.path().join("stdout");
+    let pty = test_pty();
+    let child = bubbler_live(tmp.path(), &init)
+        .args(["run", "egfd", "--", "/usr/bin/sleep", "3"])
+        .stdin(pty.stdio())
+        .stdout(std::fs::File::create(&stdout).unwrap())
+        .stderr(pty.stdio())
+        .spawn()
+        .unwrap();
+    // Its `--allow` names this run's proxy among any other test's.
+    let fds = sidecar_fds(
+        "fd-check.invalid:443",
+        bubbler_core::network::NET_PROXY_INSIDE,
+    );
+    let out = child.wait_with_output().unwrap();
+    let shown = pty.read_until(Duration::from_millis(200), |_| false);
+    let fds =
+        fds.unwrap_or_else(|| panic!("the egress proxy's descriptors were never read: {shown}"));
+    assert_none_of_the_callers(&fds, &stdout);
+    assert_eq!(out.status.code(), Some(0), "{shown}");
 }
 
 /// What a sidecar says on stderr still reaches the caller, and the run log

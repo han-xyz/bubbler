@@ -10,10 +10,10 @@
   `/proc/1/cmdline`; bwrap now reads its options from a descriptor (`--args`),
   and its command line holds only that and the command. The bind sources
   stay visible in `/proc/self/mountinfo`, as with any bind mount.
-- The four bwrap sidecars (Wayland proxy, PipeWire context holder, private
-  pulse server, D-Bus proxy) inherited bubbler's stdin, stdout and stderr, so
-  one compromised through the sandbox held the caller's terminal; they now get
-  `/dev/null` and a stderr pipe bubbler copies to its own.
+- Every sidecar (Wayland proxy, PipeWire context holder, private pulse
+  server, D-Bus proxy, pasta, egress proxy) inherited bubbler's stdio, so one
+  compromised through the sandbox held the caller's terminal; they now get
+  `/dev/null` and a pipe bubbler copies to its own stderr.
 
 ## 0.24.1
 

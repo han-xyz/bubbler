@@ -1061,8 +1061,8 @@ pub struct ProxyHandle {
     alloc: RealAlloc,
     /// The proxy's own directory, removed once it has exited.
     socket_dir: PathBuf,
-    /// Copies the proxy's stderr to bubbler's; last, so it drops after
-    /// the proxy is reaped.
+    /// Copies the proxy's stderr to bubbler's. Fields drop after `drop`
+    /// has reaped the proxy, so the copy can see the end of its output.
     _stderr: run_log::Relay,
 }
 
@@ -1158,8 +1158,8 @@ pub struct WaylandHandle {
     _socket: FileGuard,
     /// Removes the socket the compositor accepts on, where there is one.
     _context: Option<FileGuard>,
-    /// Copies the proxy's stderr to bubbler's; last, so it drops after
-    /// the proxy is reaped.
+    /// Copies the proxy's stderr to bubbler's. Fields drop after `drop`
+    /// has reaped the proxy, so the copy can see the end of its output.
     _stderr: run_log::Relay,
 }
 
@@ -1366,8 +1366,8 @@ pub struct PwHandle {
     /// Removes the socket once it has been moved out of `dir`; `None`
     /// until then, when whatever is in there goes with the directory.
     _socket: Option<FileGuard>,
-    /// Copies the sidecar's stderr to bubbler's; last, so it drops after
-    /// the sidecar is reaped.
+    /// Copies the sidecar's stderr to bubbler's. Fields drop after `drop`
+    /// has reaped the sidecar, so the copy can see the end of its output.
     _stderr: run_log::Relay,
 }
 
@@ -1623,8 +1623,8 @@ pub struct PulseHandle {
     /// Removes the socket once it has been moved out of `dir`; `None`
     /// until then, when what is in there goes with the directory.
     _socket: Option<FileGuard>,
-    /// Copies the server's stderr to bubbler's; last, so it drops after
-    /// the server is reaped.
+    /// Copies the server's stderr to bubbler's. Fields drop after `drop`
+    /// has reaped the server, so the copy can see the end of its output.
     _stderr: run_log::Relay,
 }
 
@@ -1931,6 +1931,9 @@ struct PastaHandle {
     /// the notice below appear once and what stops the pid from being
     /// signalled after it has stopped being pasta's.
     exited: bool,
+    /// Copies pasta's stderr to bubbler's. Fields drop after `drop` has
+    /// reaped it, so the copy can see the end of its output.
+    _stderr: run_log::Relay,
 }
 
 impl PastaHandle {
@@ -2352,21 +2355,20 @@ fn start_pasta(
             child: &OsString::from(child_pid.to_string()),
         },
     );
-    // pasta's own messages go where bubbler's do, never to the caller's
-    // stdout: that is the argv audit trail.
-    let log = io::stderr()
-        .as_fd()
-        .try_clone_to_owned()
-        .map_err(LaunchError::Data)?;
     // Nothing above stdio here either: pasta opens the two descriptors
     // through bubbler's own `/proc` entry rather than inheriting them, so
     // marking them close-on-exec — which they already are — costs nothing.
     spawning(&[])?;
+    // pasta's own messages, on both its stdout and its stderr, go where
+    // bubbler's do, never to the caller's stdout (that is the argv audit
+    // trail) and never as the caller's own descriptor.
+    let (log, stderr) = run_log::relay()?;
+    let log_too = log.try_clone().map_err(LaunchError::Data)?;
     let child = Command::new(network::program(env))
         .args(&argv)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::from(log_too))
         .spawn()
         .map_err(|e| match e.kind() {
             io::ErrorKind::NotFound => LaunchError::BadValue {
@@ -2383,6 +2385,7 @@ fn start_pasta(
     let mut handle = PastaHandle {
         child,
         exited: false,
+        _stderr: stderr,
     };
     if !wait_ready(&ready, &mut handle.child, Instant::now() + PASTA_READY) {
         return Err(LaunchError::Network(
@@ -2404,6 +2407,9 @@ struct NetProxyHandle {
     /// notice appear once and stops the pid from being signalled after
     /// it has stopped being the proxy's.
     exited: bool,
+    /// Copies the proxy's stderr to bubbler's. Fields drop after `drop` has
+    /// reaped it, so the copy can see the end of its output.
+    _stderr: run_log::Relay,
 }
 
 impl NetProxyHandle {
@@ -2535,6 +2541,7 @@ fn start_net_proxy(
         },
         log_tunnels,
     );
+    let (log, stderr) = run_log::relay()?;
     let mut cmd = Command::new(network::NET_PROXY_INSIDE);
     cmd.args(&argv)
         // Nothing of the host's environment: the proxy reads none of it,
@@ -2543,7 +2550,7 @@ fn start_net_proxy(
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
+        .stderr(log);
     let procs = cgroup.procs().as_raw_fd();
     let (user, net, mnt) = (ns.user.as_raw_fd(), ns.net.as_raw_fd(), ns.mnt.as_raw_fd());
     // SAFETY: the closure runs in the forked child between `fork` and
@@ -2619,13 +2626,17 @@ fn start_net_proxy(
     // `pre_exec` closure returns — the `cgroup.procs` write, the three
     // `setns`, the `prctl`s — arrives here as a failed spawn too, and a
     // `NotFound` from one of those is not a missing binary either.
-    let child = cmd
-        .spawn()
-        .map_err(|e| LaunchError::Network(format!("starting the egress proxy: {e}")))?;
+    let spawned = cmd.spawn();
+    // `cmd` holds bubbler's copy of the relay's write end; see
+    // `spawn_sidecar`.
+    drop(cmd);
+    let child =
+        spawned.map_err(|e| LaunchError::Network(format!("starting the egress proxy: {e}")))?;
     // From here on every exit path stops the proxy through the handle.
     let mut handle = NetProxyHandle {
         child,
         exited: false,
+        _stderr: stderr,
     };
     // bubbler's own copy of the write end goes now, so a proxy that dies
     // without writing gives the wait below an EOF instead of a deadline.
