@@ -1585,6 +1585,8 @@ fn adopt_socket(
     let source = open_dir_nofollow(rustix::fs::CWD, from_dir, from_dir, service)?;
     let target = open_dir(to_dir)?;
     let path = to_dir.join(name);
+    clear_socket_name(&target, to_dir, name)
+        .map_err(|e| LaunchError::Io(path.clone(), e.into()))?;
     rustix::fs::renameat(&source, made, &target, name).map_err(|e| match e {
         Errno::NOENT => LaunchError::MissingResource {
             service,
@@ -2777,6 +2779,7 @@ fn adopt_proxy_bus(
     let from = open_dir_nofollow(rustix::fs::CWD, &from_dir, &from_dir, node)?;
     let to = open_dir(dir)?;
     let path = dbus::app_bus_path(dir, socket);
+    clear_socket_name(&to, dir, socket).map_err(|e| LaunchError::Io(path.clone(), e.into()))?;
     rustix::fs::renameat(&from, socket, &to, socket).map_err(|e| match e {
         Errno::NOENT => LaunchError::MissingResource {
             service: node,
@@ -2823,9 +2826,27 @@ fn adopt_proxy_bus(
 fn remove_moved_dir(inst: &OwnedFd, dir: &Path, socket: &str) {
     if let Err(e) = move_aside(inst, dir, OsStr::new(socket)) {
         eprintln!(
-            "bubbler: warning: {} could not be moved aside ({e}); later starts will fail until it is removed",
+            "bubbler: warning: {} could not be moved aside ({e}); the next start tries again",
             dir.join(socket).display()
         );
+    }
+}
+
+/// Move aside a directory at a socket's name under `inst` (the directory
+/// `dir`) before a socket is renamed onto it: one is left there when a
+/// run is killed between moving a planted directory in and clearing it,
+/// and a socket cannot replace a directory. Anything else at the name is
+/// replaced by the rename.
+fn clear_socket_name(inst: &OwnedFd, dir: &Path, socket: &str) -> rustix::io::Result<()> {
+    match rustix::fs::statat(inst, socket, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat)
+            if rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                == rustix::fs::FileType::Directory =>
+        {
+            move_aside(inst, dir, OsStr::new(socket))
+        }
+        Ok(_) | Err(Errno::NOENT) => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
@@ -2850,9 +2871,9 @@ fn mkdir_private(dir: &Path) -> Result<(), LaunchError> {
     }
 }
 
-/// How many entries one start reads or removes while clearing what dead
-/// runs' sidecars left, so a tree of any size delays a start by a bounded
-/// amount; what is left over is taken up again by the next start.
+/// How many entries one start unlinks, lifts or opens while clearing what
+/// dead runs' sidecars left, so a tree of any size delays a start by a
+/// bounded amount; what is left over is taken up again by the next start.
 const LEFTOVER_BUDGET: usize = 100_000;
 
 /// Create `dir` afresh, mode 0700, failing on an entry that is still
@@ -2871,7 +2892,7 @@ fn fresh_sidecar_dir(dir: &Path) -> Result<(), LaunchError> {
     };
     let at = open_dir(parent)?;
     match rustix::fs::statat(&at, name, AtFlags::SYMLINK_NOFOLLOW) {
-        Err(Errno::NOENT) => {}
+        Err(Errno::NOENT) => clear_leftovers(&at, name),
         Err(e) => return Err(io_at(e)),
         Ok(_) => move_aside(&at, parent, name).map_err(io_at)?,
     }
@@ -2930,7 +2951,9 @@ fn leftover_prefix(name: &OsStr) -> OsString {
 fn clear_leftovers(at: &OwnedFd, name: &OsStr) {
     let prefix = leftover_prefix(name);
     let mut budget = LEFTOVER_BUDGET;
-    let Ok(names) = entry_names(at, &mut budget) else {
+    // Only bubbler writes the instance's directory, so its width is not a
+    // sidecar's to choose.
+    let Ok(names) = entry_names(at, usize::MAX) else {
         return;
     };
     for leftover in names {
@@ -2961,36 +2984,54 @@ fn rename_to_free(
     }
 }
 
+/// How many names are read from one directory before the ones read are
+/// dealt with, so a directory of any width costs bounded memory.
+const READ_BATCH: usize = 1024;
+
 /// Remove `name` under `at` and, where it is a directory, everything in
 /// it, following no link, holding a fixed number of descriptors whatever
 /// the depth: each pass empties the directories directly in the top one
-/// and lifts what they hold up into it. Fails with `EAGAIN` once `budget`
-/// entries have been read.
+/// and lifts what they hold up into it. Each entry unlinked, lifted or
+/// opened takes one off `budget`, and what was done stays done, so a call
+/// that fails with `EAGAIN` once it is spent has still shrunk the tree.
 fn remove_tree(at: &OwnedFd, name: &OsStr, budget: &mut usize) -> rustix::io::Result<()> {
     let Some(top) = unlink_or_open(at, name)? else {
         return Ok(());
     };
     let mut lifted = 0;
     loop {
-        let names = entry_names(&top, budget)?;
+        let names = entry_names(&top, READ_BATCH)?;
         if names.is_empty() {
             break;
         }
         for entry in names {
+            spend(budget)?;
             let Some(inner) = unlink_or_open(&top, &entry)? else {
                 continue;
             };
-            for sub in entry_names(&inner, budget)? {
-                if unlink_or_open(&inner, &sub)?.is_some() {
-                    rename_to_free(&inner, &sub, &top, &mut lifted, |seq| {
-                        OsString::from(seq.to_string())
-                    })?;
+            loop {
+                let subs = entry_names(&inner, READ_BATCH)?;
+                if subs.is_empty() {
+                    break;
+                }
+                for sub in subs {
+                    spend(budget)?;
+                    if unlink_or_open(&inner, &sub)?.is_some() {
+                        rename_to_free(&inner, &sub, &top, &mut lifted, |seq| {
+                            OsString::from(seq.to_string())
+                        })?;
+                    }
                 }
             }
             rustix::fs::unlinkat(&top, &entry, AtFlags::REMOVEDIR)?;
         }
     }
     rustix::fs::unlinkat(at, name, AtFlags::REMOVEDIR)
+}
+
+fn spend(budget: &mut usize) -> rustix::io::Result<()> {
+    *budget = budget.checked_sub(1).ok_or(Errno::AGAIN)?;
+    Ok(())
 }
 
 /// Unlink `name` under `at` unless it is a directory; a directory is
@@ -3022,17 +3063,18 @@ fn unlink_or_open(at: &OwnedFd, name: &OsStr) -> rustix::io::Result<Option<Owned
     .map(Some)
 }
 
-/// The names in `dir`, each one taken off `budget`.
-fn entry_names(dir: &OwnedFd, budget: &mut usize) -> rustix::io::Result<Vec<OsString>> {
+/// Up to `max` of the names in `dir`, from its start.
+fn entry_names(dir: &OwnedFd, max: usize) -> rustix::io::Result<Vec<OsString>> {
     let mut names = Vec::new();
     for entry in rustix::fs::Dir::read_from(dir)? {
+        if names.len() == max {
+            break;
+        }
         let entry = entry?;
         let name = OsStr::from_bytes(entry.file_name().to_bytes());
-        if name == "." || name == ".." {
-            continue;
+        if name != "." && name != ".." {
+            names.push(name.to_owned());
         }
-        *budget = budget.checked_sub(1).ok_or(Errno::AGAIN)?;
-        names.push(name.to_owned());
     }
     Ok(names)
 }
@@ -6428,6 +6470,95 @@ mod tests {
                 sidecar.display()
             );
         }
+    }
+
+    /// A tree with more entries than one pass may touch still shrinks on
+    /// every pass, so the starts that follow clear it in the end.
+    #[test]
+    fn clearing_a_tree_wider_than_the_budget_makes_progress_on_every_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let top = tmp.path().join("t");
+        std::fs::create_dir(&top).unwrap();
+        for i in 0..30 {
+            std::fs::write(top.join(format!("f{i}")), b"").unwrap();
+        }
+        for i in 0..5 {
+            let sub = top.join(format!("d{i}"));
+            std::fs::create_dir_all(sub.join("deeper")).unwrap();
+            std::fs::write(sub.join("deeper").join("f"), b"").unwrap();
+            for j in 0..10 {
+                std::fs::write(sub.join(format!("f{j}")), b"").unwrap();
+            }
+        }
+        fn count(dir: &Path) -> usize {
+            std::fs::read_dir(dir)
+                .map(|entries| {
+                    entries
+                        .map(|e| {
+                            let e = e.unwrap();
+                            1 + if e.file_type().unwrap().is_dir() {
+                                count(&e.path())
+                            } else {
+                                0
+                            }
+                        })
+                        .sum()
+                })
+                .unwrap_or(0)
+        }
+        let at = open_dir(tmp.path()).unwrap();
+        let mut left = count(&top);
+        let passes = left;
+        for _ in 0..passes {
+            match remove_tree(&at, OsStr::new("t"), &mut 8) {
+                Ok(()) => {
+                    assert!(std::fs::symlink_metadata(&top).is_err());
+                    return;
+                }
+                Err(e) => assert_eq!(e, Errno::AGAIN),
+            }
+            let now = count(&top);
+            assert!(now < left, "a pass left {now} of {left} entries");
+            left = now;
+        }
+        panic!("{left} entries are never removed");
+    }
+
+    /// A run killed between moving a planted directory to a socket's name
+    /// and clearing it leaves it there; the next start moves it aside
+    /// rather than failing to rename its socket onto it.
+    #[test]
+    fn a_directory_left_at_a_sockets_name_does_not_block_the_next_adopt() {
+        use std::os::unix::fs::FileTypeExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        std::fs::create_dir(&dir).unwrap();
+        let socket = dbus::SESSION_SOCKET;
+        std::fs::create_dir(dbus::socket_dir(&dir)).unwrap();
+        let app_bus = dbus::app_bus_path(&dir, socket);
+        std::fs::create_dir(&app_bus).unwrap();
+        std::fs::write(app_bus.join("x"), b"").unwrap();
+        let _bus = UnixListener::bind(dbus::proxy_bus_path(&dir, socket)).unwrap();
+        let _bus_guard = adopt_proxy_bus(&dir, socket, dbus::SESSION_NODE, own_uid())
+            .expect("a socket over a directory left at its name");
+        assert!(std::fs::metadata(&app_bus).unwrap().file_type().is_socket());
+
+        let made_in = tmp.path().join("pw");
+        std::fs::create_dir(&made_in).unwrap();
+        let target = dir.join("pw-socket");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("x"), b"").unwrap();
+        let _pw = UnixListener::bind(made_in.join("made")).unwrap();
+        let _pw_guard = adopt_socket(
+            "pipewire",
+            (&made_in, "made"),
+            (&dir, "pw-socket"),
+            own_uid(),
+        )
+        .expect("a socket over a directory left at its name");
+        assert!(std::fs::metadata(&target).unwrap().file_type().is_socket());
+        assert_eq!(leftovers(&dir, &app_bus), Vec::<OsString>::new());
+        assert_eq!(leftovers(&dir, &target), Vec::<OsString>::new());
     }
 
     fn own_uid() -> u32 {

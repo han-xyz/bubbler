@@ -110,6 +110,8 @@ gap.
 `removing_a_moved_tree_changes_nothing_its_links_name`,
 `a_deep_unreadable_tree_at_a_proxy_sockets_name_does_not_block_the_next_start`,
 `a_sidecars_unreadable_tree_goes_when_its_run_ends`,
+`clearing_a_tree_wider_than_the_budget_makes_progress_on_every_pass`,
+`a_directory_left_at_a_sockets_name_does_not_block_the_next_adopt`,
 `proxy_argv_runs_the_proxy_in_its_own_sandbox`,
 `wl_proxy_argv_runs_the_proxy_in_its_own_sandbox`,
 `real_wayland_proxy_serves_the_only_socket_the_sandbox_sees`,
