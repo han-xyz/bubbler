@@ -383,7 +383,11 @@ impl PipeWireBed {
                 .env("PIPEWIRE_RUNTIME_DIR", &run)
                 .env("WIREPLUMBER_CONFIG_DIR", &wp)
                 .env("XDG_DATA_HOME", &data)
-                .env("XDG_STATE_HOME", root.join("state")),
+                .env("XDG_STATE_HOME", root.join("state"))
+                // Info for the linking scripts' topic, where the hook logs
+                // each link it refuses (`links_refused`); the default level
+                // everywhere else.
+                .env("WIREPLUMBER_DEBUG", "2,s-linking:I"),
             &root.join("wireplumber.log"),
         );
         let bed = PipeWireBed {
@@ -1178,11 +1182,24 @@ claimer = LocalNode ("adapter", {
 claimer:activate (Feature.Proxy.BOUND)
 "#;
 
-/// Markers for a client object, and for one carrying the claim under
-/// the key the policy no longer reads.
+/// Markers for a client object, for a capture stream's node, and for an
+/// object carrying the claim under the key the policy no longer reads:
+/// the tab before it is what `pw-cli info` prints ahead of each property,
+/// so the marker cannot match inside `pipewire.sec.bubbler.audio`.
 const CLIENT: &str = "type: PipeWire:Interface:Client";
-const CLAIMED: &str = r#"bubbler.audio = "playback,microphone""#;
+const CAPTURE_STREAM: &str = r#"media.class = "Stream/Input/Audio""#;
+const CLAIMED: &str = "\tbubbler.audio = \"playback,microphone\"";
 
+/// The grant the claim asks for, as the daemon would carry it had the
+/// claim worked.
+const GRANTED_THE_MICROPHONE: &str = r#"pipewire.sec.bubbler.audio = "playback,microphone""#;
+
+/// Each route a client in a playback context can drive to claim the
+/// microphone, and for each, the evidence that the claim reached the
+/// daemon (the host's `pw-cli info` shows it on the client or, for
+/// `PIPEWIRE_PROPS`, on the stream), that WirePlumber aimed the capture
+/// stream at the source (the hook logged refusing that link), and that
+/// the grant did not change and no link was made.
 #[test]
 fn a_playback_context_that_claims_the_microphone_gets_the_playback_grant() {
     let Some(bed) = PipeWireBed::start() else {
@@ -1201,26 +1218,25 @@ fn a_playback_context_that_claims_the_microphone_gets_the_playback_grant() {
     std::fs::write(&script, CLAIM_LATER).expect("the later claim's script");
     let out = bed.dir().join("captured.wav");
 
-    // `PIPEWIRE_PROPS` lands on the stream and not the client (measured),
-    // so only the other two are required to reach the client at all.
-    for (route, reaches_the_client, program) in [
+    for (route, claimed, program) in [
         (
             "its configuration",
-            true,
+            [CLIENT, CLAIMED],
             format!(
                 "PIPEWIRE_CONFIG_DIR={} pw-cat -r {}",
                 config.display(),
                 out.display()
             ),
         ),
+        // `PIPEWIRE_PROPS` lands on the stream and not the client.
         (
             "PIPEWIRE_PROPS",
-            false,
+            [CAPTURE_STREAM, CLAIMED],
             format!("PIPEWIRE_PROPS='{CLAIM}' pw-cat -r {}", out.display()),
         ),
         (
             "a later update",
-            true,
+            [CLIENT, CLAIMED],
             format!(
                 "WIREPLUMBER_CONFIG_DIR={} wpexec {}",
                 bed.dir().join("wireplumber").display(),
@@ -1228,33 +1244,105 @@ fn a_playback_context_that_claims_the_microphone_gets_the_playback_grant() {
             ),
         ),
     ] {
-        wait_for("the end of the previous claimer", || {
-            object(&bed.info_from_host(), &[CLIENT, CLAIMED]).is_none()
+        claim_is_refused(&bed, route, &claimed, || {
+            Streaming(bed.spawn_in_context(PLAYBACK, &program))
         });
-        let _recording = streaming(&bed, PLAYBACK, &program, "Stream/Input/Audio");
-        window_in_which_it_would_link(&bed, "playback");
-        let clients = bed.info_from_host();
-        let links = bed.links();
-        assert!(
-            !reaches_the_client || object(&clients, &[CLIENT, CLAIMED]).is_some(),
-            "the claim through {route} never reached the client:\n{clients}"
-        );
-        assert!(
-            object(
-                &clients,
-                &[
-                    CLIENT,
-                    r#"pipewire.sec.bubbler.audio = "playback,microphone""#
-                ]
-            )
-            .is_none(),
-            "a client changed its grant through {route}:\n{clients}"
-        );
-        assert!(
-            !links.contains("bed-source"),
-            "a playback context that claimed the microphone through {route} captured:\n{links}"
-        );
     }
+    // The private pulse server connects each pulse client to the daemon
+    // with that client's property list, `PULSE_PROP` included.
+    let server = bed.pulse_server(PLAYBACK);
+    claim_is_refused(
+        &bed,
+        "a pulse client's property list",
+        &[CLIENT, CLAIMED],
+        || {
+            server.spawn(
+                "sh",
+                &[
+                    OsStr::new("-c"),
+                    OsStr::new(&format!(
+                        "PULSE_PROP='bubbler.audio=\"playback,microphone\" \
+                     pipewire.sec.bubbler.audio=\"playback,microphone\"' \
+                     exec parecord --file-format=wav {}",
+                        out.display()
+                    )),
+                ],
+            )
+        },
+    );
+}
+
+/// Start a claimer with `start`, once the previous one is gone, and
+/// require the claim in the daemon (an object carrying every one of
+/// `claimed`), a refused link to the source, no client holding the
+/// microphone grant, and no link to the source.
+fn claim_is_refused(
+    bed: &PipeWireBed,
+    route: &str,
+    claimed: &[&str],
+    start: impl FnOnce() -> Streaming,
+) {
+    wait_for("the end of the previous claimer", || {
+        let listing = bed.info_from_host();
+        object(&listing, &[CLAIMED]).is_none() && object(&listing, &[CAPTURE_STREAM]).is_none()
+    });
+    let refused = links_refused(bed, "bed-source");
+    let _recording = start();
+    wait_for(&format!("the claim through {route} in the daemon"), || {
+        object(&bed.info_from_host(), claimed).is_some()
+    });
+    wait_for(
+        &format!("a link to the source refused through {route}"),
+        || links_refused(bed, "bed-source") > refused,
+    );
+    let clients = bed.info_from_host();
+    assert!(
+        object(&clients, &[CLIENT, GRANTED_THE_MICROPHONE]).is_none(),
+        "a client changed its grant through {route}:\n{clients}"
+    );
+    let links = bed.links();
+    assert!(
+        !links.contains("bed-source"),
+        "a playback context that claimed the microphone through {route} captured:\n{links}"
+    );
+}
+
+/// A sandbox cannot open a security context of its own with the grant it
+/// lacks: a client that already carries `pipewire.sec.engine` is refused
+/// a nested one.
+#[test]
+fn a_playback_context_cannot_nest_a_context_that_claims_the_microphone() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let nested = bed.output_in_context(
+        PLAYBACK,
+        &format!("pw-container -P '{CLAIM}' -- 'echo the nested program ran'"),
+    );
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&nested.stdout),
+        String::from_utf8_lossy(&nested.stderr)
+    );
+    assert!(
+        said.contains("can't create security context: Operation not permitted")
+            && !said.contains("the nested program ran"),
+        "a nested context was not refused:\n{said}"
+    );
+    let clients = bed.info_from_host();
+    assert!(
+        object(&clients, &[CLIENT, GRANTED_THE_MICROPHONE]).is_none(),
+        "a client holds the microphone grant:\n{clients}"
+    );
+}
+
+/// How many links the bed's linking hook has refused toward the node
+/// named `target`, by the line it logs for each.
+fn links_refused(bed: &PipeWireBed, target: &str) -> usize {
+    std::fs::read_to_string(bed.dir().join("wireplumber.log"))
+        .unwrap_or_default()
+        .matches(&format!("a link to {target}: "))
+        .count()
 }
 
 #[test]
