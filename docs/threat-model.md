@@ -191,7 +191,9 @@ makes inside that tmpfs, and a cleared environment. bwrap itself stays
 as pid 1 in the sandbox, where every process can read `/proc/1/environ`, and
 `--clearenv` cleans only what bwrap starts; bubbler therefore starts every
 bwrap, a sidecar's included, with an empty environment, so `/proc/1/environ`
-holds nothing of the caller's. Every sidecar bubbler
+holds nothing of the caller's. `/proc/1/cmdline` is as readable, so bwrap
+reads its options from a sealed memfd through `--args`: its command line
+holds `--args <fd>` and the command, nothing of the host's layout. Every sidecar bubbler
 wraps in a bwrap of its own gets the same 64 MiB cap on the two tmpfs
 mounts it has, its `/etc` and its `/tmp`. The forked child also
 joins a session keyring of its own (`keyctl(2)` `KEYCTL_JOIN_SESSION_KEYRING`

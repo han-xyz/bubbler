@@ -1237,6 +1237,88 @@ fn real_bwrap_pid_1_holds_nothing_of_the_callers_environment() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "clean\n", "{err}");
 }
 
+/// bwrap's command line is readable at `/proc/1/cmdline` inside: its
+/// options arrive through `--args`, so the host's layout is not there.
+#[test]
+fn real_bwrap_pid_1_command_line_holds_none_of_the_options() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let out = bubbler_live(tmp.path(), &init)
+        .args([
+            "try",
+            "--profile",
+            "generic",
+            "--",
+            "/usr/bin/cat",
+            "/proc/1/cmdline",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let words: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .map(str::to_owned)
+        .collect();
+    assert!(words.iter().any(|w| w == "--args"), "{words:?}");
+    for flag in ["--bind", "--ro-bind", "--setenv"] {
+        assert!(!words.iter().any(|w| w == flag), "{flag} in {words:?}");
+    }
+    let home = tmp.path().to_string_lossy();
+    assert!(!words.iter().any(|w| w.contains(&*home)), "{words:?}");
+}
+
+/// The options are long with a few hundred shares, and still reach bwrap
+/// whole: the last share is there.
+#[test]
+fn real_bwrap_a_few_hundred_shares_all_reach_the_sandbox() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let mut c = bubbler_live(tmp.path(), &init);
+    c.env("BUBBLER_TEST_ALLOW_PATH", tmp.path()).arg("try");
+    let mut last = PathBuf::new();
+    for i in 0..300 {
+        last = tmp.path().join(format!("share-{i:03}"));
+        std::fs::create_dir(&last).unwrap();
+        c.arg("--share").arg(&last);
+    }
+    std::fs::write(last.join("f"), "last\n").unwrap();
+    let out = c
+        .args(["--", "/usr/bin/cat"])
+        .arg(last.join("f"))
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "last\n", "{err}");
+}
+
+/// `--` is a value a variable may hold, and a word a command may hold;
+/// neither moves where bwrap's options end.
+#[test]
+fn real_bwrap_a_variable_and_a_command_holding_a_separator_still_start() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    write_profile(tmp.path(), "user", "dashes", "env A=\"--\"\n");
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["try", "--profile", "dashes", "--", "/usr/bin/sh", "-c"])
+        .args(["echo \"$A\" \"$1\"", "sh", "--"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "-- --\n", "{err}");
+}
+
 #[test]
 fn real_bwrap_a_granted_variable_still_reaches_the_application() {
     if !require_bwrap() {

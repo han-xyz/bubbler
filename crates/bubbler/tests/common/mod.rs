@@ -495,11 +495,56 @@ pub fn kill_group(child: &Child) {
     let _ = kill_process_group(Pid::from_child(child), Signal::KILL);
 }
 
-/// Whether a `bwrap` whose command line holds `needle` is still running.
-/// A run that has ended must leave none: bubbler tears its sandboxes down
+/// Whether a `bwrap` is still running whose command line, or one of whose
+/// mounts written `<host source> <destination>`, holds `needle`. A run
+/// that has ended must leave none: bubbler tears its sandboxes down
 /// itself, and `--die-with-parent` is only the backstop behind that.
+///
+/// The mounts because bwrap's options reach it through `--args` and are
+/// not on its command line; what it bound is in its `mountinfo`.
 pub fn bwrap_alive(needle: &str) -> bool {
-    process_running("bwrap", needle)
+    if process_running("bwrap", needle) {
+        return true;
+    }
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    let host = host_mount_points();
+    procs
+        .flatten()
+        .filter(|e| {
+            std::fs::read(e.path().join("cmdline")).is_ok_and(|c| {
+                c.split(|b| *b == 0)
+                    .next()
+                    .is_some_and(|program| program.ends_with(b"bwrap"))
+            })
+        })
+        .filter_map(|e| std::fs::read_to_string(e.path().join("mountinfo")).ok())
+        .any(|info| {
+            info.lines().any(|line| {
+                let f: Vec<&str> = line.split(' ').collect();
+                let Some(prefix) = f.get(2).and_then(|dev| host.get(*dev)) else {
+                    return false;
+                };
+                let source = format!("{}{}", prefix.trim_end_matches('/'), f[3]);
+                format!("{source} {}", f[4]).contains(needle)
+            })
+        })
+}
+
+/// Where each filesystem's root is mounted on the host, by `maj:min`.
+fn host_mount_points() -> std::collections::HashMap<String, String> {
+    let info = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    let mut points = std::collections::HashMap::new();
+    for line in info.lines() {
+        let f: Vec<&str> = line.split(' ').collect();
+        if f.len() > 4 && f[3] == "/" {
+            points
+                .entry(f[2].to_owned())
+                .or_insert_with(|| f[4].to_owned());
+        }
+    }
+    points
 }
 
 /// Whether some process has `program` and `needle` in its command line.

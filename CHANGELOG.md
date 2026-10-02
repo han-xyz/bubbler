@@ -6,6 +6,10 @@
 
 - The environment bubbler was started in was readable inside every sandbox
   through `/proc/1/environ`; bwrap now starts with an empty one.
+- bwrap's whole argument list — every host path bound in, the instance
+  layout — was readable inside every sandbox through `/proc/1/cmdline`; bwrap
+  now reads its options from a descriptor (`--args`), and its command line
+  holds only that and the command.
 
 ## 0.24.1
 

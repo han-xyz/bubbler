@@ -991,21 +991,33 @@ impl BwrapArgs {
         self,
         command: &[OsString],
         alloc: &mut dyn FdAllocator,
-    ) -> Result<Vec<OsString>, LaunchError> {
-        Ok(flatten(self.finish_explained(command, alloc)?))
+    ) -> Result<Argv, LaunchError> {
+        Ok(self.finish_ops(command, alloc)?.into_argv())
     }
 
     /// [`BwrapArgs::finish`] with every operation kept apart and tagged
     /// with what produced it. Flattening the result is the argv again,
     /// element for element.
     pub fn finish_explained(
-        mut self,
+        self,
         command: &[OsString],
         alloc: &mut dyn FdAllocator,
     ) -> Result<Vec<Explained>, LaunchError> {
+        Ok(self.finish_ops(command, alloc)?.ops)
+    }
+
+    /// [`BwrapArgs::finish_explained`] that also remembers where bwrap's
+    /// options end, for a caller that reads the operations and then
+    /// hands bwrap the argv.
+    pub(crate) fn finish_ops(
+        mut self,
+        command: &[OsString],
+        alloc: &mut dyn FdAllocator,
+    ) -> Result<Finished, LaunchError> {
         let ctty = self.ctty;
         let x11 = self.x11.take();
         let mut out = self.emit(alloc)?;
+        let options = out.len();
         let socket = alloc.init_socket().map_err(LaunchError::Data)?;
         out.push(Explained {
             origin: Origin::Init,
@@ -1056,7 +1068,7 @@ impl BwrapArgs {
             args,
             note: None,
         });
-        Ok(out)
+        Ok(Finished { ops: out, options })
     }
 
     /// Like [`BwrapArgs::finish`] but running `command` directly. Only
@@ -1066,11 +1078,12 @@ impl BwrapArgs {
         self,
         command: &[OsString],
         alloc: &mut dyn FdAllocator,
-    ) -> Result<Vec<OsString>, LaunchError> {
-        let mut out = flatten(self.emit(alloc)?);
-        out.push(OsString::from("--"));
-        out.extend_from_slice(command);
-        Ok(out)
+    ) -> Result<Argv, LaunchError> {
+        let mut args = flatten(self.emit(alloc)?);
+        let command_at = args.len();
+        args.push(OsString::from("--"));
+        args.extend_from_slice(command);
+        Ok(Argv { args, command_at })
     }
 
     /// [`BwrapArgs::finish_plain`] with every operation kept apart and
@@ -1155,6 +1168,53 @@ impl BwrapArgs {
 /// [`BwrapArgs::finish`] would have.
 pub fn flatten(items: Vec<Explained>) -> Vec<OsString> {
     items.into_iter().flat_map(|i| i.args).collect()
+}
+
+/// A complete bwrap argv that knows where the builder put its `--`:
+/// bwrap's options before it, the separator and the command from it on.
+/// Reads as the whole list wherever a list is wanted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Argv {
+    args: Vec<OsString>,
+    command_at: usize,
+}
+
+impl Argv {
+    /// bwrap's own options, which it may be handed through `--args`.
+    pub fn options(&self) -> &[OsString] {
+        &self.args[..self.command_at]
+    }
+
+    /// The builder's `--` and the command after it, which bwrap only
+    /// takes from its real command line.
+    pub fn command(&self) -> &[OsString] {
+        &self.args[self.command_at..]
+    }
+}
+
+impl std::ops::Deref for Argv {
+    type Target = [OsString];
+
+    fn deref(&self) -> &[OsString] {
+        &self.args
+    }
+}
+
+/// The operations of a finished argv and how many of them come before
+/// the builder's `--`.
+pub(crate) struct Finished {
+    pub(crate) ops: Vec<Explained>,
+    options: usize,
+}
+
+impl Finished {
+    pub(crate) fn into_argv(self) -> Argv {
+        let command_at = self.ops[..self.options].iter().map(|o| o.args.len()).sum();
+        Argv {
+            args: flatten(self.ops),
+            command_at,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2000,6 +2060,31 @@ mod tests {
             &s[s.len() - 6..],
             &["--", INIT_INSIDE, "--socket-fd", "4", "--", "sh"]
         );
+    }
+
+    #[test]
+    fn the_options_end_at_the_builders_own_separator() {
+        let command: Vec<OsString> = ["sh", "--", "x"].map(OsString::from).to_vec();
+        let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default());
+        args.setenv(OsStr::new("A"), OsStr::new("--"));
+        let argv = args.finish(&command, &mut Counter::new()).unwrap();
+        assert_eq!(
+            strs(argv.options()).last_chunk(),
+            Some(&["--setenv", "A", "--"])
+        );
+        assert_eq!(
+            strs(argv.command()),
+            ["--", INIT_INSIDE, "--socket-fd", "4", "--", "sh", "--", "x"]
+        );
+
+        let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default());
+        args.setenv(OsStr::new("A"), OsStr::new("--"));
+        let argv = args.finish_plain(&command, &mut Counter::new()).unwrap();
+        assert_eq!(
+            strs(argv.options()).last_chunk(),
+            Some(&["--setenv", "A", "--"])
+        );
+        assert_eq!(strs(argv.command()), ["--", "sh", "--", "x"]);
     }
 
     #[test]

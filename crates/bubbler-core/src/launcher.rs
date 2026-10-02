@@ -8,6 +8,7 @@
 use std::ffi::{OsStr, OsString, c_void};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Component, Path, PathBuf};
@@ -17,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rustix::event::{Nsecs, PollFd, PollFlags, Secs, Timespec, poll};
-use rustix::fs::{Access, AtFlags, MemfdFlags, Mode, OFlags};
+use rustix::fs::{Access, AtFlags, MemfdFlags, Mode, OFlags, SealFlags};
 use rustix::io::{Errno, FdFlags, fcntl_dupfd_cloexec, fcntl_setfd};
 use rustix::ioctl::{self, Opcode};
 use rustix::pipe::{PipeFlags, pipe_with};
@@ -35,7 +36,7 @@ use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 
 use bubbler_init::fds;
 
-use crate::bwrap::{BwrapArgs, Explained, FdAllocator, Origin};
+use crate::bwrap::{Argv, BwrapArgs, Explained, FdAllocator, Origin};
 use crate::config::{EtcMode, NetworkConfig, Service, Userns, WaylandMode};
 use crate::env::Env;
 use crate::error::{ConfigError, LaunchError};
@@ -220,6 +221,9 @@ pub struct RealAlloc {
     /// Which of `fds` that socket became, so bubbler's own copy can be
     /// closed again once the sidecar holding it has been spawned.
     listen_fd: Option<RawFd>,
+    /// Which of `fds` holds bwrap's options, closed again once the
+    /// bwrap that reads them has been spawned.
+    options_fd: Option<RawFd>,
     /// Read end of the ready pipe, once [`FdAllocator::ready_pipe`] made one.
     pub ready_read: Option<OwnedFd>,
     /// Read end of the info pipe bwrap reports the sandbox pid on.
@@ -274,6 +278,7 @@ impl RealAlloc {
             socket: None,
             listen: None,
             listen_fd: None,
+            options_fd: None,
             ready_read: None,
             info_read: None,
             info_write: None,
@@ -304,6 +309,37 @@ impl RealAlloc {
     /// no listener was handed over.
     fn close_listener(&mut self) {
         if let Some(fd) = self.listen_fd.take() {
+            self.fds.retain(|held| held.as_raw_fd() != fd);
+        }
+    }
+
+    /// bwrap's options, each ended by a NUL, in a sealed memfd it reads
+    /// through `--args`; the number it is inherited as. Sealed rather than
+    /// a pipe so nothing has to write while bwrap reads, whatever the
+    /// length; kept with the other fds, so only this spawn inherits it.
+    fn options(&mut self, options: &[OsString]) -> io::Result<OsString> {
+        let fd = rustix::fs::memfd_create(
+            "bubbler-args",
+            MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+        )?;
+        let mut f = std::fs::File::from(fd);
+        for option in options {
+            f.write_all(option.as_bytes())?;
+            f.write_all(b"\0")?;
+        }
+        f.seek(SeekFrom::Start(0))?;
+        rustix::fs::fcntl_add_seals(
+            &f,
+            SealFlags::SEAL | SealFlags::SHRINK | SealFlags::GROW | SealFlags::WRITE,
+        )?;
+        self.options_fd = Some(f.as_raw_fd());
+        Ok(self.keep(f.into()))
+    }
+
+    /// Close bubbler's own copy of the options, once the bwrap that reads
+    /// them has been spawned.
+    fn close_options(&mut self) {
+        if let Some(fd) = self.options_fd.take() {
             self.fds.retain(|held| held.as_raw_fd() != fd);
         }
     }
@@ -501,7 +537,7 @@ pub fn build_argv(
     command: Option<&[OsString]>,
     alloc: &mut dyn FdAllocator,
     ctty: bool,
-) -> Result<Vec<OsString>, LaunchError> {
+) -> Result<Argv, LaunchError> {
     build_argv_on(env, inst, command, alloc, ctty, &RealHost)
 }
 
@@ -514,7 +550,7 @@ fn build_argv_on(
     alloc: &mut dyn FdAllocator,
     ctty: bool,
     host: &dyn Host,
-) -> Result<Vec<OsString>, LaunchError> {
+) -> Result<Argv, LaunchError> {
     let (args, command) = build_args_on(env, inst, command, ctty, host)?;
     args.finish(command, alloc)
 }
@@ -667,7 +703,7 @@ pub fn pw_context_argv(
     ctx: &pipewire::Context<'_>,
     host: &dyn Host,
     alloc: &mut dyn FdAllocator,
-) -> Result<Vec<OsString>, LaunchError> {
+) -> Result<Argv, LaunchError> {
     let report = alloc.ready_pipe().map_err(LaunchError::Data)?;
     let init = init_bin::locate(env, host)?;
     let mut args = BwrapArgs::pw_context_baseline(
@@ -708,7 +744,7 @@ pub fn pw_pulse_argv(
     instance_runtime: &Path,
     host: &dyn Host,
     alloc: &mut dyn FdAllocator,
-) -> Result<Vec<OsString>, LaunchError> {
+) -> Result<Argv, LaunchError> {
     let mut args = BwrapArgs::pw_pulse_baseline(
         &pipewire::socket(instance_runtime),
         Path::new(pipewire::REMOTE_INSIDE),
@@ -751,7 +787,7 @@ pub fn proxy_argv(
     dir: &Path,
     host: &dyn Host,
     alloc: &mut dyn FdAllocator,
-) -> Result<Vec<OsString>, LaunchError> {
+) -> Result<Argv, LaunchError> {
     let (args, command) = proxy_args(env, plan, buses, dir, host, alloc)?;
     let plain: Vec<OsString> = command.into_iter().map(|(arg, _)| arg).collect();
     args.finish_plain(&plain, alloc)
@@ -869,7 +905,7 @@ pub fn wl_proxy_argv(
     node: usize,
     host: &dyn Host,
     alloc: &mut dyn FdAllocator,
-) -> Result<Vec<OsString>, LaunchError> {
+) -> Result<Argv, LaunchError> {
     let (args, command) = wl_proxy_args(env, plan, node, host, alloc)?;
     let plain: Vec<OsString> = command.into_iter().map(|(arg, _)| arg).collect();
     args.finish_plain(&plain, alloc)
@@ -1216,15 +1252,13 @@ pub fn start_wayland(
     let socket = FileGuard(plan.listener.clone());
     let mut alloc = RealAlloc::sidecar_listening(listener.into(), dir.to_path_buf());
     let argv = wl_proxy_argv(env, &plan, node, host, &mut alloc)?;
+    let mut cmd = bwrap_command(&argv, &mut alloc)?;
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     spawning(&alloc.intended())?;
-    let child = bwrap_command()?
-        .args(&argv)
-        .spawn()
-        .map_err(|e| match e.kind() {
-            io::ErrorKind::NotFound => LaunchError::BwrapMissing,
-            _ => LaunchError::Spawn(e),
-        })?;
+    let child = cmd.spawn().map_err(|e| match e.kind() {
+        io::ErrorKind::NotFound => LaunchError::BwrapMissing,
+        _ => LaunchError::Spawn(e),
+    })?;
     // From here on every exit path stops the proxy through the handle.
     let mut handle = WaylandHandle {
         child,
@@ -1240,6 +1274,7 @@ pub fn start_wayland(
     // died — the application would wait on a socket nothing answers
     // instead of being refused outright.
     handle.alloc.close_listener();
+    handle.alloc.close_options();
     // What is left is CLOEXEC again before the instance's own bwrap is
     // spawned: the ready pipe belongs to this one spawn and no other.
     handle.alloc.inheritable(false).map_err(LaunchError::Data)?;
@@ -1403,15 +1438,13 @@ pub fn start_pw_context(
     };
     let mut alloc = RealAlloc::sidecar(dir.to_path_buf());
     let argv = pw_context_argv(env, &ctx, host, &mut alloc)?;
+    let mut cmd = bwrap_command(&argv, &mut alloc)?;
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     spawning(&alloc.intended())?;
-    let child = bwrap_command()?
-        .args(&argv)
-        .spawn()
-        .map_err(|e| match e.kind() {
-            io::ErrorKind::NotFound => LaunchError::BwrapMissing,
-            _ => LaunchError::Spawn(e),
-        })?;
+    let child = cmd.spawn().map_err(|e| match e.kind() {
+        io::ErrorKind::NotFound => LaunchError::BwrapMissing,
+        _ => LaunchError::Spawn(e),
+    })?;
     // From here on every exit path stops the sidecar through the handle.
     let mut handle = PwHandle {
         child,
@@ -1419,6 +1452,7 @@ pub fn start_pw_context(
         dir: pw,
         _socket: None,
     };
+    handle.alloc.close_options();
     // The instance's own bwrap must not inherit these: a second holder
     // of the report pipe would keep bubbler from seeing it hang up.
     handle.alloc.inheritable(false).map_err(LaunchError::Data)?;
@@ -1662,15 +1696,13 @@ pub fn start_pw_pulse(
     write_pulse_config(env, host, dir)?;
     let mut alloc = RealAlloc::sidecar(dir.to_path_buf());
     let argv = pw_pulse_argv(env, dir, host, &mut alloc)?;
+    let mut cmd = bwrap_command(&argv, &mut alloc)?;
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     spawning(&alloc.intended())?;
-    let child = bwrap_command()?
-        .args(&argv)
-        .spawn()
-        .map_err(|e| match e.kind() {
-            io::ErrorKind::NotFound => LaunchError::BwrapMissing,
-            _ => LaunchError::Spawn(e),
-        })?;
+    let child = cmd.spawn().map_err(|e| match e.kind() {
+        io::ErrorKind::NotFound => LaunchError::BwrapMissing,
+        _ => LaunchError::Spawn(e),
+    })?;
     // From here on every exit path stops the sidecar through the handle.
     let mut handle = PulseHandle {
         child,
@@ -1678,6 +1710,7 @@ pub fn start_pw_pulse(
         dir: pw,
         _socket: None,
     };
+    handle.alloc.close_options();
     // The instance's own bwrap must not inherit the seccomp descriptor
     // this argv was built with.
     handle.alloc.inheritable(false).map_err(LaunchError::Data)?;
@@ -1833,21 +1866,20 @@ pub fn start_proxy(
         host,
         &mut alloc,
     )?;
+    let mut cmd = bwrap_command(&argv, &mut alloc)?;
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     spawning(&alloc.intended())?;
-    let child = bwrap_command()?
-        .args(&argv)
-        .spawn()
-        .map_err(|e| match e.kind() {
-            io::ErrorKind::NotFound => LaunchError::BwrapMissing,
-            _ => LaunchError::Spawn(e),
-        })?;
+    let child = cmd.spawn().map_err(|e| match e.kind() {
+        io::ErrorKind::NotFound => LaunchError::BwrapMissing,
+        _ => LaunchError::Spawn(e),
+    })?;
     // From here on every exit path stops the proxy through the handle.
     let mut handle = ProxyHandle {
         child,
         alloc,
         socket_dir: dbus::socket_dir(dir),
     };
+    handle.alloc.close_options();
     // The instance's own bwrap must not inherit these: a second holder of
     // the ready pipe would keep the proxy alive after the run has ended.
     handle.alloc.inheritable(false).map_err(LaunchError::Data)?;
@@ -2217,10 +2249,20 @@ fn install_rules(
 /// environment: it stays pid 1 inside the sandbox, where its environ is
 /// readable, and `--clearenv` cleans only what it starts
 /// (https://github.com/containers/bubblewrap/issues/725).
-fn bwrap_command() -> Result<Command, LaunchError> {
+///
+/// Its command line is readable there too, so `argv`'s options reach it
+/// through `--args` from a descriptor `alloc` holds until the spawn has
+/// happened ([`RealAlloc::close_options`]). The `--` and the command stay
+/// on the command line: bwrap drops a command it finds in an `--args`
+/// file. Call before the spawn window opens, so the descriptor is in it.
+fn bwrap_command(argv: &Argv, alloc: &mut RealAlloc) -> Result<Command, LaunchError> {
     let bwrap = on_path("bwrap").ok_or(LaunchError::BwrapMissing)?;
+    let options = alloc.options(argv.options()).map_err(LaunchError::Data)?;
     let mut cmd = Command::new(bwrap);
-    cmd.env_clear();
+    cmd.env_clear()
+        .arg("--args")
+        .arg(options)
+        .args(argv.command());
     Ok(cmd)
 }
 
@@ -3348,12 +3390,12 @@ pub fn run(
     // reads their destinations. Flattened again straight after, so what
     // bwrap is handed is what `build_argv` would have produced.
     let (args, resolved) = build_args_on(env, inst, command, stdio.ctty(), &RealHost)?;
-    let ops = args.finish_explained(resolved, &mut alloc)?;
+    let finished = args.finish_ops(resolved, &mut alloc)?;
     // Before the spawn and after the argv: a destination behind a link an
     // application planted is a write outside the sandbox on every bwrap
     // below 0.12.0, and the run is refused rather than made safe.
-    service::sweep_destinations(&ops, env, &RealHost)?;
-    let argv = crate::bwrap::flatten(ops);
+    service::sweep_destinations(&finished.ops, env, &RealHost)?;
+    let argv = finished.into_argv();
     let stop = Arc::new(AtomicBool::new(false));
     // What `stop` becomes once a run has seen it: `stop` is cleared as
     // the signal is acted on, this stays set for the rest of the run.
@@ -3380,14 +3422,13 @@ pub fn run(
         true => Some(RawGuard::new(host[0].as_fd())?),
         false => None,
     };
+    let mut cmd = bwrap_command(&argv, &mut alloc)?;
     // The sandbox's own fds are inheritable for exactly this spawn: the
     // proxy was started before it and pasta is started after it, and the
     // instance's control socket in particular is neither one's to hold.
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     fcntl_setfd(&inherited, FdFlags::empty()).map_err(io_at)?;
     spawning(&alloc.intended())?;
-    let mut cmd = bwrap_command()?;
-    cmd.args(&argv);
     // SAFETY: the closure runs in the forked child between `fork` and
     // `execve`, where only async-signal-safe calls are allowed. It makes
     // one syscall and allocates nothing.
@@ -3403,6 +3444,7 @@ pub fn run(
             io::ErrorKind::NotFound => LaunchError::BwrapMissing,
             _ => LaunchError::Spawn(e),
         })?;
+    alloc.close_options();
     alloc.inheritable(false).map_err(LaunchError::Data)?;
     // The sandbox holds the listening socket and the info pipe now; bubbler
     // keeping copies would make a dead instance look live and hide the EOF.
@@ -3725,7 +3767,7 @@ mod tests {
             &share_host(tmp.path()),
         )
         .unwrap();
-        assert_eq!(flat, argv);
+        assert_eq!(flat, argv.to_vec());
     }
 
     #[test]
