@@ -40,17 +40,20 @@
 --     that — measured: their `rules` are not applied to factory globals
 --     — so it is set on the client below.
 --
--- So: a bubbler sandbox's stream is linked to device nodes and to its
--- own, a capture stream only to an `Audio/Source*` or `Audio/Duplex`
--- node, and only where the instance was granted `microphone`; and the
--- sandbox links nothing itself.
+-- So: of a bubbler sandbox's nodes only its audio streams are linked, to
+-- device nodes and to its own; a capture stream only to an
+-- `Audio/Source*` or `Audio/Duplex` node, and only where the instance
+-- was granted `microphone`; and the sandbox links nothing itself.
 --
--- Nor is anything linked to a sandbox's node that is not one of its own
--- streams — a sink, source or filter it offers takes no host stream —
--- and no such node becomes the session's default. A link to or from a
--- sandbox's node that is not one of its own streams as WirePlumber
--- linked it is destroyed once WirePlumber sees it, one drawn in a
--- patchbay included.
+-- WirePlumber links no other client's stream to a sandbox's node that
+-- is not that stream's own, and no such node becomes the session's
+-- default; a host stream aimed at one goes to the default instead.
+--
+-- A link with a sandbox's node at either end is destroyed when
+-- WirePlumber sees it, unless WirePlumber made it and each sandbox end
+-- is an audio stream in its own direction. The other end is not checked
+-- there, so a link WirePlumber makes outside the hooks above is kept
+-- whatever it reaches; one drawn in a patchbay is destroyed.
 
 local lutils = require ("linking-utils")
 local log = Log.open_topic ("s-linking")
@@ -58,16 +61,27 @@ local log = Log.open_topic ("s-linking")
 -- The engine name bubbler gives every security context it creates.
 local BUBBLER_ENGINE = "org.bubbler"
 
+-- The one media class a sandbox's stream may have in each direction:
+-- what the audio grant covers, and all the hooks below link.
+local AUDIO_STREAM_CLASS = {
+  output = "Stream/Output/Audio",
+  input = "Stream/Input/Audio",
+}
+
+-- The object of `kind` ("client", "node") whose bound id is `id`, or nil.
+local function lookup (source, kind, id)
+  return source:call ("get-object-manager", kind):lookup {
+    Constraint { "bound-id", "=", id, type = "gobject" },
+  }
+end
+
 -- The client object `client_id` names, or nil where the graph has no
 -- such client (a node whose client is already gone).
 local function bubbler_client (source, client_id)
   if not client_id then
     return nil
   end
-  local clients = source:call ("get-object-manager", "client")
-  local client = clients:lookup {
-    Constraint { "bound-id", "=", client_id, type = "gobject" },
-  }
+  local client = lookup (source, "client", client_id)
   if client and client.properties ["pipewire.sec.engine"] == BUBBLER_ENGINE then
     return client
   end
@@ -93,6 +107,11 @@ end
 
 -- Why this link may not be made, or nil where it may.
 local function refusal (si_props, target_props, grant)
+  if si_props ["media.class"] ~=
+      AUDIO_STREAM_CLASS [si_props ["item.node.direction"]] then
+    return "a node that is not an audio stream"
+  end
+
   if target_props ["item.node.type"] == "stream" and
       target_props ["client.id"] ~= si_props ["client.id"] then
     return "another client's stream"
@@ -299,17 +318,15 @@ SimpleEventHook {
 -- only outside every security context: a context's client has
 -- `pipewire.sec.engine` from the context's socket before it says
 -- anything (module-protocol-native.c) and can neither change nor drop
--- it.
+-- it. A restricted client outside every context can wear the marker
+-- too; confining those is not this policy's.
 local function made_by_wireplumber (source, link)
   local linger = link.properties ["object.linger"]
   local creator = link.properties ["client.id"]
   if linger == "true" or linger == "1" or not creator then
     return false
   end
-  local clients = source:call ("get-object-manager", "client")
-  local client = clients:lookup {
-    Constraint { "bound-id", "=", creator, type = "gobject" },
-  }
+  local client = lookup (source, "client", creator)
   return client ~= nil and
       client.properties ["wireplumber.daemon"] == "true" and
       client.properties ["pipewire.sec.engine"] == nil
@@ -318,27 +335,26 @@ end
 -- The properties of the node `node_id` names where it belongs to a
 -- bubbler context, or nil.
 local function bubbler_node (source, node_id)
-  local nodes = source:call ("get-object-manager", "node")
-  local node = nodes:lookup {
-    Constraint { "bound-id", "=", node_id, type = "gobject" },
-  }
+  local node = lookup (source, "node", node_id)
   if node and bubbler_client (source, node.properties ["client.id"]) then
     return node.properties
   end
   return nil
 end
 
--- Whether a link from `output` to `input`, the properties of each end
--- that belongs to a bubbler context (nil for one that does not), is one
--- of a context's own streams in that stream's own direction.
-local function own_stream_link (output, input)
-  if output and output ["media.class"] ~= "Stream/Output/Audio" then
+-- Whether a link from `sandbox_output` to `sandbox_input` is one of a
+-- context's own audio streams in that stream's own direction.
+local function own_stream_link (sandbox_output, sandbox_input)
+  if sandbox_output and
+      sandbox_output ["media.class"] ~= AUDIO_STREAM_CLASS.output then
     return false
   end
-  if input and input ["media.class"] ~= "Stream/Input/Audio" then
+  if sandbox_input and
+      sandbox_input ["media.class"] ~= AUDIO_STREAM_CLASS.input then
     return false
   end
-  return not (output and input) or output ["client.id"] == input ["client.id"]
+  return not (sandbox_output and sandbox_input) or
+      sandbox_output ["client.id"] == sandbox_input ["client.id"]
 end
 
 -- The `object.serial` of every link already asked to go, which a later
@@ -364,8 +380,10 @@ local function destroy_if_refused (source, link)
       own_stream_link (output, input)) then
     log:warning (link, "destroying a link to a bubbler context " ..
         "that the policy refuses")
-    destroying [serial] = true
     link:request_destroy ()
+    if serial then
+      destroying [serial] = true
+    end
   end
 end
 
@@ -384,7 +402,10 @@ SimpleEventHook {
 -- At `link-added` the node at an end, or the client that owns it, may
 -- not be in WirePlumber's object managers yet, and the link would pass
 -- as one with no sandbox at either end. It is decided again when that
--- node or a bubbler client arrives.
+-- node or a bubbler client arrives, and so is the default, which a
+-- sandbox's node may have won while its client was not known yet:
+-- default-nodes/rescan-trigger rescans on session items, the default
+-- metadata and device routes, never on a client.
 SimpleEventHook {
   name = "bubbler/destroy-refused-link-once-its-ends-are-known",
   interests = {
@@ -396,20 +417,19 @@ SimpleEventHook {
     local source = event:get_source ()
     local subject = event:get_subject ()
     local id = tostring (subject ["bound-id"])
-    local nodes = source:call ("get-object-manager", "node")
     local is_client = event:get_properties () ["event.type"] == "client-added"
-    if is_client and
-        subject.properties ["pipewire.sec.engine"] ~= BUBBLER_ENGINE then
-      return
+    if is_client then
+      if subject.properties ["pipewire.sec.engine"] ~= BUBBLER_ENGINE then
+        return
+      end
+      source:call ("schedule-rescan", "default-nodes")
     end
 
     local function ends_here (node_id)
       if not is_client then
         return node_id == id
       end
-      local node = nodes:lookup {
-        Constraint { "bound-id", "=", node_id, type = "gobject" },
-      }
+      local node = lookup (source, "node", node_id)
       return node ~= nil and node.properties ["client.id"] == id
     end
 

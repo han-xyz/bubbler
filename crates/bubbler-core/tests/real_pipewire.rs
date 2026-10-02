@@ -136,9 +136,14 @@ wireplumber.profiles = {
 /// the bed copies this one in beside its own drop-ins.
 const WIREPLUMBER_MAIN_CONF: &str = "/usr/share/wireplumber/wireplumber.conf";
 
+/// PipeWire's stock client configuration, which a client pointed at a
+/// `PIPEWIRE_CONFIG_DIR` of its own needs beside its drop-ins in the
+/// same way.
+const PIPEWIRE_CLIENT_CONF: &str = "/usr/share/pipewire/client.conf";
+
 /// Everything the bed shells out to, in the order a missing one is
 /// worth reporting.
-const NEEDED: [&str; 10] = [
+const NEEDED: [&str; 11] = [
     "pipewire",
     "wireplumber",
     "pw-container",
@@ -146,6 +151,7 @@ const NEEDED: [&str; 10] = [
     "pw-cli",
     "pw-cat",
     "pw-link",
+    "pw-metadata",
     "pactl",
     "paplay",
     "parecord",
@@ -326,9 +332,11 @@ impl PipeWireBed {
                 return None;
             }
         }
-        if !Path::new(WIREPLUMBER_MAIN_CONF).is_file() {
-            say(&format!("skipping: {WIREPLUMBER_MAIN_CONF} not installed"));
-            return None;
+        for conf in [WIREPLUMBER_MAIN_CONF, PIPEWIRE_CLIENT_CONF] {
+            if !Path::new(conf).is_file() {
+                say(&format!("skipping: {conf} not installed"));
+                return None;
+            }
         }
         sweep_stale_beds();
         Some(Self::start_in(new_bed_dir()))
@@ -1075,6 +1083,34 @@ fn a_playback_capture_stream_gets_no_link() {
     );
 }
 
+/// The audio grant links a sandbox's two audio stream classes and no
+/// other: a stream of any other class gets no link, rather than one the
+/// hook then destroys.
+#[test]
+fn a_context_stream_of_another_class_gets_no_link() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let class = "Stream/Output/Audio/Internal";
+    let _odd = streaming(
+        &bed,
+        PLAYBACK,
+        &format!("pw-cat -p -a -P '{{ media.class = {class}, node.name = odd }}' - < /dev/zero"),
+        class,
+    );
+    window_in_which_it_would_link(&bed, "playback");
+    assert_eq!(
+        links_destroyed(&bed),
+        0,
+        "the hook destroyed links of a {class} stream"
+    );
+    let links = bed.links();
+    assert!(
+        !links.contains("odd:"),
+        "a {class} stream was linked:\n{links}"
+    );
+}
+
 #[test]
 fn a_playback_context_gets_no_link_to_another_clients_stream() {
     let Some(bed) = PipeWireBed::start() else {
@@ -1154,11 +1190,8 @@ fn a_playback_context_that_claims_the_microphone_gets_the_playback_grant() {
     };
     let config = bed.dir().join("claim");
     std::fs::create_dir_all(config.join("client.conf.d")).expect("a client config directory");
-    std::fs::copy(
-        "/usr/share/pipewire/client.conf",
-        config.join("client.conf"),
-    )
-    .expect("a copy of the stock client.conf");
+    std::fs::copy(PIPEWIRE_CLIENT_CONF, config.join("client.conf"))
+        .expect("a copy of the stock client.conf");
     std::fs::write(
         config.join("client.conf.d/claim.conf"),
         format!("context.properties = {CLAIM}\n"),
@@ -1496,9 +1529,8 @@ fn no_fresh_context_keeps_a_link_it_asks_for_in_its_first_instant() {
     let Some(bed) = PipeWireBed::start() else {
         return;
     };
-    // One process playing without end, not a loop around a file: a loop
-    // under a SIGKILLed test binary outlives the bed and spins, while
-    // `pw-cat` exits once its daemon is gone.
+    // `pw-cat` must end when the bed's daemon does: nothing here outlives
+    // a killed test binary.
     let _other = streaming(
         &bed,
         PLAYBACK,
@@ -1536,7 +1568,7 @@ fn no_fresh_context_keeps_a_link_it_asks_for_in_its_first_instant() {
         // instant before the session manager has acted on it.
         let deadline = Instant::now() + FRESH_CONTEXTS_FOR;
         let mut attempts = 0;
-        let mut refused = 0;
+        let mut enoent = 0;
         while Instant::now() < deadline {
             let props = [PLAYBACK, PLAYBACK_MICROPHONE][attempts % 2];
             let source = ["bed-sink:monitor_FL", "pw-cat:output_FL"][attempts / 2 % 2];
@@ -1545,13 +1577,13 @@ fn no_fresh_context_keeps_a_link_it_asks_for_in_its_first_instant() {
             if String::from_utf8_lossy(&out.stderr)
                 .contains("failed to link ports: No such file or directory")
             {
-                refused += 1;
+                enoent += 1;
             }
             attempts += 1;
         }
         assert!(
-            refused > 0,
-            "none of {attempts} attempts was refused the link factory, so none measured it"
+            enoent > 0,
+            "none of {attempts} attempts got ENOENT, so none can have met a hidden link factory"
         );
         std::thread::sleep(FORBIDDEN_LINK_LIFE);
         done.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1697,10 +1729,9 @@ fn only_a_session_manager_outside_every_context_keeps_a_link_to_a_bubbler_stream
             .any(|line| line.ends_with("bed-sink:playback_FR"))
     };
 
-    // `pw-cli` rather than `pw-link -m`, which makes the link again each
-    // time it goes; a link `pw-cli` makes lives while it runs, and it runs
-    // until its stdin closes.
-    let crossing = |mut command: Command| {
+    // A link `pw-cli` makes lives while it runs, and it runs until its
+    // stdin closes.
+    let crossing = |mut command: Command, link: &str| {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -1709,14 +1740,15 @@ fn only_a_session_manager_outside_every_context_keeps_a_link_to_a_bubbler_stream
         let mut child = command.spawn().expect("pw-cli did not run");
         std::io::Write::write_all(
             child.stdin.as_mut().expect("pw-cli's stdin"),
-            b"create-link player output_FL bed-sink playback_FR\n",
+            format!("create-link {link}\n").as_bytes(),
         )
         .expect("a command for pw-cli");
         Streaming(child)
     };
 
     let before = links_destroyed(&bed);
-    let forged = crossing(bed.context_command(r#"{ "wireplumber.daemon": "true" }"#, "pw-cli"));
+    let forging = || bed.context_command(r#"{ "wireplumber.daemon": "true" }"#, "pw-cli");
+    let forged = crossing(forging(), CROSSED);
     wait_for(
         "the destruction of a link from a context claiming to be WirePlumber",
         || links_destroyed(&bed) == before + 1,
@@ -1728,11 +1760,8 @@ fn only_a_session_manager_outside_every_context_keeps_a_link_to_a_bubbler_stream
     // configuration's `context.properties`.
     let config = bed.dir().join("second-instance");
     std::fs::create_dir_all(config.join("client.conf.d")).expect("a client config directory");
-    std::fs::copy(
-        "/usr/share/pipewire/client.conf",
-        config.join("client.conf"),
-    )
-    .expect("a copy of the stock client.conf");
+    std::fs::copy(PIPEWIRE_CLIENT_CONF, config.join("client.conf"))
+        .expect("a copy of the stock client.conf");
     std::fs::write(
         config.join("client.conf.d/marker.conf"),
         "context.properties = { wireplumber.daemon = true }\n",
@@ -1740,16 +1769,25 @@ fn only_a_session_manager_outside_every_context_keeps_a_link_to_a_bubbler_stream
     .expect("the marker's drop-in");
     let mut command = bed.command("pw-cli");
     command.env("PIPEWIRE_CONFIG_DIR", &config);
-    let _second_instance = crossing(command);
+    let _second_instance = crossing(command, CROSSED);
     wait_for("the link of a second session manager", crossed);
-    std::thread::sleep(FORBIDDEN_LINK_LIFE);
+    // The hook decides links in the order WirePlumber sees them, so once
+    // a forged link made after it is destroyed, this one has been decided.
+    let _forged_again = crossing(forging(), "player output_FR bed-sink playback_FL");
+    wait_for("the destruction of a second forged link", || {
+        links_destroyed(&bed) == before + 2
+    });
     assert!(
         crossed(),
         "a second session manager's link was destroyed:\n{}",
         bed.links()
     );
-    assert_eq!(links_destroyed(&bed), before + 1);
+    assert_eq!(links_destroyed(&bed), before + 2);
 }
+
+/// The player's left channel into the sink's right: not the link
+/// WirePlumber makes itself.
+const CROSSED: &str = "player output_FL bed-sink playback_FR";
 
 /// A context under `props` offers a device node ranked above the bed's
 /// own (`offers`, each run in a context of its own and naming its node
@@ -1787,11 +1825,19 @@ fn a_host_stream_passes_by_a_node_a_context_offers(
         .stderr(Stdio::null());
     own_process_group(&mut command);
     let _host = Streaming(command.spawn().expect("pw-cat did not run"));
-    let mut links = String::new();
     wait_for("a link for the host's stream", || {
-        links = bed.links();
-        links.contains("host:")
+        bed.links().contains("host:")
     });
+    // Long enough for a default decided again after the first link to
+    // have moved the stream.
+    std::thread::sleep(FORBIDDEN_LINK_LIFE);
+    let links = bed.links();
+    let defaults = bed.host_tool("pw-metadata", &["-n", "default", "0"]);
+    assert!(defaults.contains("default.audio."), "{defaults}");
+    assert!(
+        !defaults.contains("offered"),
+        "a node a {grant} context offered became a default:\n{defaults}"
+    );
     assert!(
         !links.contains("offered:"),
         "a host stream was linked to a node a {grant} context offered:\n{links}"
