@@ -143,6 +143,11 @@ const ENVIRONMENT: &[(&str, &str)] = &[
          is ignored, as the XDG base directory specification asks.",
     ),
     (
+        "XDG_CONFIG_DIRS",
+        "Where the audio policy check looks for WirePlumber's drop-in, after XDG_CONFIG_HOME \
+         as WirePlumber does; /etc/xdg when it is unset. A relative entry is ignored.",
+    ),
+    (
         "WAYLAND_DISPLAY, DISPLAY, XAUTHORITY",
         "Which session sockets the `wayland` and `x11 \"host\"` grants bind; a bare `x11` \
          reads neither DISPLAY nor XAUTHORITY, the server being its own. These are \
@@ -292,6 +297,12 @@ const CHECK_LINES: &[(&str, &str)] = &[
         "app-runtime-rw",
         "An `app-runtime` shared mode=rw, so the sandbox can replace the sockets every \
          other instance naming that id connects to.",
+    ),
+    (
+        "audio-policy-differs",
+        "A `pipewire` or `pulseaudio` grant where an installed WirePlumber policy file is \
+         not the one this bubbler embeds: under an older policy a sandbox can claim the \
+         microphone grant for itself.",
     ),
     (
         "audio-policy-missing",

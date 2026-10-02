@@ -152,11 +152,8 @@ const EXPLAIN_SUFFIX_HOOK: &str = " (policy hook script bubbler/refuse-links.lua
 const EXPLAIN_SUFFIX_BOTH: &str = " (policy drop-in 50-bubbler.conf and hook script \
      bubbler/refuse-links.lua not found: microphone reachable)";
 
-/// The same where both files are there but are not this binary's.
-const RUN_WARNING_DIFFERS: &str = "audio policy files differ from this bubbler's \
-     (50-bubbler.conf, bubbler/refuse-links.lua): the grant is not enforced as documented \
-     until you rewrite both (bubbler audio-policy --print, bubbler audio-policy --print \
-     --script) and restart WirePlumber";
+/// The `--explain` suffix where both files are installed but either
+/// differs from the copy this binary embeds.
 const EXPLAIN_SUFFIX_DIFFERS: &str = " (policy files 50-bubbler.conf and \
      bubbler/refuse-links.lua differ from this bubbler's: grant not enforced as documented)";
 
@@ -194,16 +191,38 @@ pub fn missing(host: &dyn Host, env: &Env) -> Option<Missing> {
     }
 }
 
+/// The `lint-allow` id that accepts an installed policy file differing
+/// from this binary's: a copy edited on purpose. The same id names the
+/// lint check that reports it.
+pub const DIFFERS_CHECK: &str = "audio-policy-differs";
+
 /// The warning where this run needs it: `cfg` grants `pipewire` or
-/// `pulseaudio` and the host holds less than the whole policy. Printed
-/// once per real run (`main.rs`'s `Run`, `Try` and `Open`), never for
-/// `--dry-run` or `--explain`, which carry their own framing.
-pub fn run_warning(cfg: &InstanceConfig, host: &dyn Host, env: &Env) -> Option<&'static str> {
+/// `pulseaudio` and the host holds less than the whole policy, or a
+/// copy that differs from this binary's which `cfg` does not accept with
+/// a `lint-allow` of [`DIFFERS_CHECK`]. Printed once per real run
+/// (`main.rs`'s `Run`, `Try` and `Open`), never for `--dry-run` or
+/// `--explain`, which carry their own framing.
+pub fn run_warning(cfg: &InstanceConfig, host: &dyn Host, env: &Env) -> Option<String> {
     cfg.audio()?;
-    match missing(host, env) {
-        Some(case) => Some(case.run_warning()),
-        None => differs(host, env).then_some(RUN_WARNING_DIFFERS),
+    if let Some(case) = missing(host, env) {
+        return Some(case.run_warning().to_owned());
     }
+    if cfg
+        .lint_allows
+        .iter()
+        .any(|allow| allow.id == DIFFERS_CHECK)
+    {
+        return None;
+    }
+    let paths = differing(host, env);
+    if paths.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}; {}",
+        differs_message(&paths),
+        differs_help(&paths)
+    ))
 }
 
 /// The suffix an audio group's header takes, `""` where the host holds
@@ -211,24 +230,69 @@ pub fn run_warning(cfg: &InstanceConfig, host: &dyn Host, env: &Env) -> Option<&
 pub fn explain_suffix(host: &dyn Host, env: &Env) -> &'static str {
     match missing(host, env) {
         Some(case) => case.explain_suffix(),
-        None if differs(host, env) => EXPLAIN_SUFFIX_DIFFERS,
+        None if !differing(host, env).is_empty() => EXPLAIN_SUFFIX_DIFFERS,
         None => "",
     }
 }
 
-/// Whether a policy file WirePlumber loads is not the one this binary
+/// The policy files WirePlumber loads that are not the ones this binary
 /// embeds, an older bubbler's or an edited copy: the grant it states is
 /// then not the grant enforced. The copies compared are [`installed`]
 /// and [`hook_installed`], the ones WirePlumber loads.
-fn differs(host: &dyn Host, env: &Env) -> bool {
+pub fn differing(host: &dyn Host, env: &Env) -> Vec<PathBuf> {
     [
         (installed(host, env), DROP_IN),
         (hook_installed(host, env), HOOK),
     ]
     .into_iter()
-    .any(|(path, embedded)| {
-        path.is_some_and(|path| host.read(&path).as_deref() != Some(embedded.as_bytes()))
+    .filter_map(|(path, embedded)| {
+        let path = path?;
+        (host.read(&path).as_deref() != Some(embedded.as_bytes())).then_some(path)
     })
+    .collect()
+}
+
+/// Which of `paths` differ, and what that leaves open.
+pub fn differs_message(paths: &[PathBuf]) -> String {
+    format!(
+        "audio policy differs from this bubbler's in {}: under an older policy a sandbox \
+         can claim the microphone grant for itself",
+        paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" and ")
+    )
+}
+
+/// What to run for `paths`: each written again with the `--print` that
+/// produces it, or, under `/usr/share`, the package that installed it
+/// updated; then WirePlumber restarted. Or, for an edit made on purpose,
+/// the `lint-allow` that accepts it.
+pub fn differs_help(paths: &[PathBuf]) -> String {
+    let steps: Vec<String> = paths
+        .iter()
+        .map(|path| {
+            let script = if path.ends_with(HOOK_NAME) {
+                " --script"
+            } else {
+                ""
+            };
+            if path.starts_with(DATA_DIR) {
+                format!("update the package that installed {}", path.display())
+            } else {
+                format!(
+                    "`bubbler audio-policy --print{script} > {}`",
+                    path.display()
+                )
+            }
+        })
+        .collect();
+    format!(
+        "{}, then `systemctl --user restart wireplumber`; a copy edited on purpose is \
+         accepted with `lint-allow \"{DIFFERS_CHECK}\" reason=\"...\"`",
+        steps.join(" and ")
+    )
 }
 
 #[cfg(test)]
@@ -391,8 +455,36 @@ mod tests {
         ] {
             let host = holding_texts(&files);
             assert_eq!(missing(&host, &e), None, "{case}");
-            assert_eq!(differs(&host, &e), differ, "{case}");
+            assert_eq!(!differing(&host, &e).is_empty(), differ, "{case}");
         }
+    }
+
+    /// A copy a package installed is the package's to update; any other
+    /// is written again with the `--print` that produces it.
+    #[test]
+    fn differs_help_writes_a_users_copy_and_updates_a_packaged_one() {
+        let user_hook = Path::new("/home/user/.local/share/wireplumber/scripts").join(HOOK_NAME);
+        let packaged_drop_in =
+            Path::new("/usr/share/wireplumber/wireplumber.conf.d").join(DROP_IN_NAME);
+        let help = differs_help(&[packaged_drop_in.clone(), user_hook.clone()]);
+        assert!(
+            help.contains(&format!(
+                "update the package that installed {}",
+                packaged_drop_in.display()
+            )),
+            "{help}"
+        );
+        assert!(
+            help.contains(&format!(
+                "`bubbler audio-policy --print --script > {}`",
+                user_hook.display()
+            )),
+            "{help}"
+        );
+        assert!(
+            help.contains("systemctl --user restart wireplumber"),
+            "{help}"
+        );
     }
 
     #[test]
@@ -511,7 +603,7 @@ mod tests {
         let silent = crate::config::parse("command \"true\"").unwrap();
         assert_eq!(
             run_warning(&audio, &FakeHost::default(), &e),
-            Some(Missing::Both.run_warning())
+            Some(Missing::Both.run_warning().to_owned())
         );
         assert_eq!(
             run_warning(
@@ -519,7 +611,7 @@ mod tests {
                 &holding(&[install_dirs(&e)[0].join(DROP_IN_NAME)]),
                 &e
             ),
-            Some(Missing::Hook.run_warning())
+            Some(Missing::Hook.run_warning().to_owned())
         );
         assert_eq!(run_warning(&audio, &whole, &e), None);
         assert_eq!(run_warning(&silent, &FakeHost::default(), &e), None);

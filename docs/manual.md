@@ -637,11 +637,19 @@ prints `bubbler: warning: audio policy drop-in and hook script not found
 to every PipeWire node (microphone and every other client's audio
 reachable)` on stderr, naming whichever half it is. Where both are installed
 but either is not the one this bubbler embeds — an older bubbler's, or an
-edited copy — a run prints `bubbler: warning: audio policy files differ from
-this bubbler's (50-bubbler.conf, bubbler/refuse-links.lua): …`: the grant is
-not enforced as documented until both are written again and WirePlumber
-restarted. The check compares the copies WirePlumber loads with bubbler's
-own; whether the running WirePlumber has loaded them, it cannot tell. An ALSA client reaches the same
+edited copy — a run prints `bubbler: warning: audio policy differs from
+this bubbler's in <path>: under an older policy a sandbox can claim the
+microphone grant for itself; …`, naming each file that differs, and
+`bubbler lint` warns `audio-policy-differs`. Both say what to run: the
+`bubbler audio-policy --print` (`--print --script` for the hook) that
+writes that path again, or, for a copy under `/usr/share`, an update of
+the package that installed it; then `systemctl --user restart
+wireplumber`. A copy you edited on purpose is accepted per config with
+`lint-allow "audio-policy-differs" reason="..."`, which silences both the
+lint and the run warning for that config only, so every other config
+still hears about it. The check compares the copies WirePlumber loads with
+bubbler's own; whether the running WirePlumber has loaded them, it cannot
+tell. An ALSA client reaches the same
 daemon through `/etc/alsa`, which the baseline binds: those files are where
 pipewire-alsa defines the `default` PCM, and without them alsa-lib falls back
 to a hardware card whose `/dev/snd` nodes no sandbox has.
@@ -3047,7 +3055,13 @@ microphone and every other client's audio included; without the hook the
 grant is scoped and every other client's audio stays recordable. The
 finding names the half that is missing and the `bubbler audio-policy
 --print` or `--print --script` that writes it, then restart
-WirePlumber).
+WirePlumber),
+`audio-policy-differs` (the whole policy installed but a copy WirePlumber
+loads is not the one this bubbler embeds — an older bubbler's, under which
+a sandbox can claim the microphone grant for itself, or one you edited.
+The finding names each such file and what writes it again; accept an
+edit made on purpose with `lint-allow "audio-policy-differs"
+reason="..."`).
 
 **Notes** are information and fail nothing: `app-runtime-rw` (a shared
 application runtime directory granted `mode=rw`, so the sandbox can replace the

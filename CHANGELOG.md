@@ -58,8 +58,12 @@
   the source). The grant is now `pipewire.sec.bubbler.audio`, which only the
   security context sets. Under a policy installed by an earlier bubbler
   every grant gets the playback rules and a sandbox can still claim the
-  microphone; bubbler now warns before a run when the installed drop-in or
-  hook is not its own. The same reinstall and restart applies.
+  microphone; bubbler now warns before a run, and `bubbler lint` warns
+  `audio-policy-differs`, when the installed drop-in or hook WirePlumber
+  loads is not its own, naming the file and what writes it again. A copy
+  edited on purpose is accepted per config with
+  `lint-allow "audio-policy-differs" reason="..."`. The same reinstall and
+  restart applies.
 - Without the `microphone` grant a sandbox could still see every source
   that is not exactly `Audio/Source`: `Audio/Source/Virtual` (echo-cancel,
   noise suppression) and `Audio/Duplex` (measured); with the claimed grant

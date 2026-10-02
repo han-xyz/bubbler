@@ -76,6 +76,10 @@ const AUDIO_POLICY_MISSING: Check = Check {
     id: "audio-policy-missing",
     severity: Severity::Warning,
 };
+const AUDIO_POLICY_DIFFERS: Check = Check {
+    id: audio_policy::DIFFERS_CHECK,
+    severity: Severity::Warning,
+};
 const BUNDLE_WITHOUT_DBUS: Check = Check {
     id: "bundle-without-dbus",
     severity: Severity::Error,
@@ -287,6 +291,7 @@ const X11_WITHOUT_REASON: Check = Check {
 pub const CHECKS: &[Check] = &[
     ALLOW_HOST_WILDCARD,
     APP_RUNTIME_RW,
+    AUDIO_POLICY_DIFFERS,
     AUDIO_POLICY_MISSING,
     BUNDLE_WITHOUT_DBUS,
     CAMERA_NODES_NONE_PRESENT,
@@ -868,6 +873,7 @@ fn run(ctx: &Context, sources: &[Source]) -> Report {
     }
     across_layers(ctx, sources, &mut f);
     audio_policy_missing(ctx, sources, &mut f);
+    audio_policy_differs(ctx, sources, &mut f);
     let allowed: Vec<&str> = sources
         .iter()
         .flat_map(|s| top(s, "lint-allow"))
@@ -1155,12 +1161,7 @@ fn audio_policy_missing(ctx: &Context, sources: &[Source], f: &mut Findings) {
     let Some(case) = audio_policy::missing(ctx.host, ctx.env) else {
         return;
     };
-    let Some((i, node, name)) = sources.iter().enumerate().find_map(|(i, s)| {
-        s.flat
-            .iter()
-            .find(|n| matches!(n.name().value(), "pipewire" | "pulseaudio"))
-            .map(|n| (i, n, n.name().value()))
-    }) else {
+    let Some((i, node, name)) = audio_node(sources) else {
         return;
     };
     let dirs = audio_policy::install_dirs(ctx.env);
@@ -1225,6 +1226,40 @@ fn audio_policy_missing(ctx: &Context, sources: &[Source], f: &mut Findings) {
         ),
     };
     f.push(i, node, &AUDIO_POLICY_MISSING, message, &help);
+}
+
+/// The `audio-policy-differs` warning: the whole policy is installed but
+/// a copy WirePlumber loads is not this binary's. Where part of it is
+/// missing, `audio-policy-missing` speaks instead.
+fn audio_policy_differs(ctx: &Context, sources: &[Source], f: &mut Findings) {
+    if audio_policy::missing(ctx.host, ctx.env).is_some() {
+        return;
+    }
+    let paths = audio_policy::differing(ctx.host, ctx.env);
+    if paths.is_empty() {
+        return;
+    }
+    let Some((i, node, _)) = audio_node(sources) else {
+        return;
+    };
+    f.push(
+        i,
+        node,
+        &AUDIO_POLICY_DIFFERS,
+        audio_policy::differs_message(&paths),
+        &audio_policy::differs_help(&paths),
+    );
+}
+
+/// The first `pipewire` or `pulseaudio` node across the layers, with its
+/// layer and name: the one instance-wide audio reach the policy scopes.
+fn audio_node(sources: &[Source]) -> Option<(usize, &KdlNode, &str)> {
+    sources.iter().enumerate().find_map(|(i, s)| {
+        s.flat
+            .iter()
+            .find(|n| matches!(n.name().value(), "pipewire" | "pulseaudio"))
+            .map(|n| (i, n, n.name().value()))
+    })
 }
 
 /// Checks that need one layer and nothing else, apart from `host_net`:
@@ -2430,7 +2465,12 @@ mod tests {
                 "/home/user/.config/wireplumber/wireplumber.conf.d/50-bubbler.conf",
                 file,
             )
-            .with(HOOK_PATH, file);
+            .text(
+                "/home/user/.config/wireplumber/wireplumber.conf.d/50-bubbler.conf",
+                audio_policy::DROP_IN,
+            )
+            .with(HOOK_PATH, file)
+            .text(HOOK_PATH, audio_policy::HOOK);
         with(&quiet, |ctx| {
             for node in ["pipewire", "pulseaudio"] {
                 let text = format!("{node} {{\n    microphone\n}}");
@@ -3697,7 +3737,9 @@ mod tests {
         ] {
             let quiet = host()
                 .with(&format!("{dir}/50-bubbler.conf"), file)
-                .with(HOOK_PATH, file);
+                .text(&format!("{dir}/50-bubbler.conf"), audio_policy::DROP_IN)
+                .with(HOOK_PATH, file)
+                .text(HOOK_PATH, audio_policy::HOOK);
             with(&quiet, |ctx| {
                 assert_eq!(ids(&lint(ctx, &["pipewire"])), [] as [&str; 0], "{dir}");
             });
@@ -3782,7 +3824,12 @@ mod tests {
                     "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf",
                     file,
                 )
-                .with(HOOK_PATH, file);
+                .text(
+                    "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf",
+                    audio_policy::DROP_IN,
+                )
+                .with(HOOK_PATH, file)
+                .text(HOOK_PATH, audio_policy::HOOK);
             let mut add = |p: &Path, t| {
                 host = std::mem::take(&mut host)
                     .with(p.to_str().expect("built-in profiles hold UTF-8 paths"), t);

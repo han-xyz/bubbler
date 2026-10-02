@@ -1587,9 +1587,17 @@ mod tests {
                     "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf",
                     file,
                 )
+                .text(
+                    "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf",
+                    crate::audio_policy::DROP_IN,
+                )
                 .with(
                     "/usr/share/wireplumber/scripts/bubbler/refuse-links.lua",
                     file,
+                )
+                .text(
+                    "/usr/share/wireplumber/scripts/bubbler/refuse-links.lua",
+                    crate::audio_policy::HOOK,
                 );
             {
                 let mut add = |p: &Path, t| {

@@ -6150,36 +6150,88 @@ fn audio_policy_warns_before_a_real_run_with_only_the_drop_in() {
 
 /// A policy from another bubbler — before 0.24.2 the grant was a key a
 /// client could set on itself — is in place but does not enforce the
-/// grant this binary states, so the run says so. The copy under the
-/// test root is the one WirePlumber loads, whatever `/usr/share` holds.
+/// grant this binary states, so the run says so: which file, what it
+/// costs, what to run. The copy under the test root is the one
+/// WirePlumber loads, whatever `/usr/share` holds.
 #[test]
 fn audio_policy_warns_before_a_real_run_with_another_versions_policy() {
     let tmp = setup();
-    install_audio_policy(tmp.path(), true, true);
-    std::fs::write(
-        tmp.path()
-            .join("config/wireplumber/wireplumber.conf.d")
-            .join(bubbler_core::audio_policy::DROP_IN_NAME),
-        bubbler_core::audio_policy::DROP_IN.replace("pipewire.sec.bubbler.audio", "bubbler.audio"),
-    )
-    .unwrap();
+    let stale = install_stale_drop_in(tmp.path());
     bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
     let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
     std::fs::write(&cfg, "pipewire\ncommand \"/usr/bin/true\"\n").unwrap();
     let out = bubbler(tmp.path()).args(["run", "t"]).output().unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains(
-            "bubbler: warning: audio policy files differ from this bubbler's \
-             (50-bubbler.conf, bubbler/refuse-links.lua)"
-        ),
-        "{err}"
-    );
-    assert!(
-        err.contains("bubbler audio-policy --print") && err.contains("restart WirePlumber"),
-        "{err}"
-    );
+    let warning = err
+        .lines()
+        .find(|line| line.starts_with("bubbler: warning: audio policy differs"))
+        .unwrap_or_else(|| panic!("no warning:\n{err}"));
+    for said in [
+        stale.display().to_string(),
+        "a sandbox can claim the microphone grant".to_owned(),
+        format!("bubbler audio-policy --print > {}", stale.display()),
+        "systemctl --user restart wireplumber".to_owned(),
+        "lint-allow \"audio-policy-differs\"".to_owned(),
+    ] {
+        assert!(warning.contains(&said), "{said}:\n{warning}");
+    }
+    assert!(!warning.contains("refuse-links.lua"), "{warning}");
     assert_eq!(out.status.code(), Some(1), "{err}");
+}
+
+/// A copy edited on purpose is accepted per config, the way any other
+/// finding is, and a config that does not say so still hears about it.
+#[test]
+fn audio_policy_differs_is_accepted_with_a_lint_allow() {
+    let tmp = setup();
+    install_stale_drop_in(tmp.path());
+    for (name, accepted) in [("edited", true), ("plain", false)] {
+        bubbler(tmp.path()).args(["create", name]).status().unwrap();
+        let allow = if accepted {
+            "lint-allow \"audio-policy-differs\" reason=\"a rule of my own\"\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            tmp.path()
+                .join("data/bubbler/instances")
+                .join(name)
+                .join("config.kdl"),
+            format!("pipewire\n{allow}command \"/usr/bin/true\"\n"),
+        )
+        .unwrap();
+        let out = bubbler(tmp.path()).args(["run", name]).output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            !err.contains("audio policy differs"),
+            accepted,
+            "{name}:\n{err}"
+        );
+        let linted = bubbler(tmp.path()).args(["lint", name]).output().unwrap();
+        let said = String::from_utf8_lossy(&linted.stdout).into_owned()
+            + &String::from_utf8_lossy(&linted.stderr);
+        assert_eq!(
+            !said.contains("audio-policy-differs"),
+            accepted,
+            "{name}:\n{said}"
+        );
+    }
+}
+
+/// The whole policy under the test root with the drop-in an older
+/// bubbler's, which matched the grant under a key a client could set;
+/// its path.
+fn install_stale_drop_in(root: &Path) -> PathBuf {
+    install_audio_policy(root, true, true);
+    let path = root
+        .join("config/wireplumber/wireplumber.conf.d")
+        .join(bubbler_core::audio_policy::DROP_IN_NAME);
+    std::fs::write(
+        &path,
+        bubbler_core::audio_policy::DROP_IN.replace("pipewire.sec.bubbler.audio", "bubbler.audio"),
+    )
+    .unwrap();
+    path
 }
 
 #[test]
