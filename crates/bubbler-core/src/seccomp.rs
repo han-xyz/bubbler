@@ -99,7 +99,11 @@ pub const SINGLE_ARCH_EPERM: &[&str] = &["modify_ldt"];
 /// Syscalls the default filter answers with `ENOSYS`, so libc falls back
 /// to the older call instead of failing: seccomp cannot inspect `clone3`'s
 /// `clone_args`, and the new mount API can rewrite the sandbox's own VFS.
-// The mount API hole is CVE-2021-41133.
+// The mount API hole is CVE-2021-41133. `mount_setattr` is left out:
+// bubblewrap 0.13 needs it for every bind mount and has no fallback, and it
+// needs CAP_SYS_ADMIN over the mount namespace, cannot clear locked flags and
+// cannot ID-map a host filesystem, so with userns and `mount` allowed it adds
+// nothing `mount(MS_REMOUNT|MS_BIND)` does not.
 pub const DEFAULT_ENOSYS: &[&str] = &[
     "clone3",
     "open_tree",
@@ -108,7 +112,6 @@ pub const DEFAULT_ENOSYS: &[&str] = &[
     "fsconfig",
     "fsmount",
     "fspick",
-    "mount_setattr",
 ];
 
 /// Syscalls answered with `ENOSYS` by *number*, because libseccomp 2.6.0
@@ -660,6 +663,14 @@ mod tests {
     }
 
     #[test]
+    fn mount_setattr_is_allowed_while_the_rest_of_the_mount_api_is_not() {
+        let set = RuleSet::default_set();
+        let denied = |name: &str| set.eperm.iter().chain(&set.enosys).any(|n| n == name);
+        assert!(!denied("mount_setattr"));
+        assert!(denied("open_tree"));
+    }
+
+    #[test]
     fn the_default_set_is_the_two_lists_plus_the_ioctl_rules() {
         let set = RuleSet::default_set();
         assert_eq!(set.eperm[..DEFAULT_EPERM.len()], *DEFAULT_EPERM);
@@ -904,14 +915,14 @@ mod tests {
     }
 
     /// Instructions in the default filter: the fifteen of
-    /// [`personality_prefix`] and libseccomp's 125. libseccomp emits a
+    /// [`personality_prefix`] and libseccomp's 123. libseccomp emits a
     /// balanced search tree over the syscall numbers of each
     /// architecture, so its share is a measurement rather than a
     /// formula; the total is pinned here so that a rule added by
     /// accident, or an architecture dropped from the filter, is a test
     /// failure.
     #[cfg(target_arch = "x86_64")]
-    const DEFAULT_LEN: usize = 140;
+    const DEFAULT_LEN: usize = 138;
 
     #[cfg(target_arch = "x86_64")]
     #[test]

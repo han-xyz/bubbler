@@ -575,11 +575,15 @@ that answer and `ENOSYS` risks a caller probing by another path instead),
 otherwise keeps closed), plus `TIOCSTI` and
 `TIOCLINUX` denied by ioctl argument (CVE-2017-5226, CVE-2023-28100). A
 second, smaller set answers `ENOSYS` rather than `EPERM` — `clone3` and
-the whole new mount API (`open_tree`, `move_mount`, `fsopen`, `fsconfig`,
-`fsmount`, `fspick`, `mount_setattr`) — so libc falls back to the older
+the rest of the new mount API (`open_tree`, `move_mount`, `fsopen`, `fsconfig`,
+`fsmount`, `fspick`) — so libc falls back to the older
 call instead of failing outright; that API is the one CVE-2021-41133
 walked past flatpak's filter through, because a denylist written before
-it existed did not name it. A hand-written cBPF prefix ahead of the
+it existed did not name it. `mount_setattr` is the exception: bubblewrap 0.13
+needs it for every bind mount, so a nested `bwrap` dies without it. It needs
+`CAP_SYS_ADMIN` over the mount namespace, cannot clear locked flags and cannot
+ID-map a host filesystem, so with a nested user namespace and `mount` allowed
+it grants what `mount(MS_REMOUNT|MS_BIND)` already does. A hand-written cBPF prefix ahead of the
 compiled filter allows `personality` only the five values a desktop
 application has any business setting (`PER_LINUX`, `PER_LINUX32`,
 `UNAME26`, both together, and the query value `0xffffffff`) and answers
@@ -622,7 +626,7 @@ architecture — measured, `seccomp_rule_add` answers `EFAULT` once i386 is
 in the filter. So those three rules hold for the build architecture only.
 A 32-bit binary inside the sandbox reaches those three numbers; the named
 mount-API calls (`open_tree`, `move_mount`, `fsopen`, `fsconfig`,
-`fsmount`, `fspick`, `mount_setattr`) are denied on both ABIs. The gap
+`fsmount`, `fspick`) are denied on both ABIs. The gap
 closes by itself when libseccomp learns the names, which
 `the_numbered_rules_are_the_ones_this_libseccomp_cannot_name` fails on.
 

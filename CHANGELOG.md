@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.24.1
+
+### Fixed
+
+- A nested bubblewrap 0.13 (GTK image loaders, Steam's runtime) starts inside a
+  sandbox again: the default filter no longer answers `mount_setattr` with
+  `ENOSYS`.
+
 ## 0.24.0
 
 ### Changed

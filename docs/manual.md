@@ -3621,8 +3621,13 @@ out of the sandbox's own process tree) — the list is `DEFAULT_EPERM` in
 are denied by their argument as well: `TIOCSTI` (0x5412) and `TIOCLINUX`
 (0x541C), which push bytes into a terminal's input queue (CVE-2017-5226,
 CVE-2023-28100). `ENOSYS`: `clone3` and the new mount API (`open_tree`,
-`move_mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `mount_setattr`),
-which is `DEFAULT_ENOSYS` in the same file. Three more of the same mount API
+`move_mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`), which is
+`DEFAULT_ENOSYS` in the same file. `mount_setattr` is allowed: bubblewrap 0.13
+sets every bind mount's flags with it and has no fallback, so a nested `bwrap`
+(GTK image loaders, Steam's runtime) dies without it. It needs `CAP_SYS_ADMIN`
+over the mount namespace, cannot clear locked flags and cannot ID-map a host
+filesystem, which is what `mount(MS_REMOUNT|MS_BIND)` already allows here;
+`userns "disable"` is the switch for an instance that must not nest. Three more of the same mount API
 are denied by syscall *number* instead of by name — `open_tree_attr` (467),
 `listns` (470) and `fchroot` (472) — because libseccomp 2.6.0 has no name for
 them yet; a rule added by a number the native table cannot name is not
@@ -4029,9 +4034,9 @@ hand, and `pkg-config` is optional, used only to set a cfg for a libseccomp 2.6
 API bubbler does not call.
 
 **libseccomp 2.5.4 or newer.** The floor is the syscall table, not the API:
-bubbler names its rules, and a libseccomp whose table predates Linux 5.17 does
-not know `mount_setattr`, so that rule would be skipped and the sandbox quietly
-weaker. A skipped name is printed (see "Seccomp"), so a too-old library is loud
+bubbler names its rules, and a libseccomp whose table lacks one of them (the
+newest named rule today is `pidfd_getfd`, Linux 5.6) would skip it and leave
+the sandbox quietly weaker. A skipped name is printed (see "Seccomp"), so a too-old library is loud
 rather than silent, but it is still a downgrade.
 
 **64-bit targets only.** The build refuses a 32-bit one: the parser thread
