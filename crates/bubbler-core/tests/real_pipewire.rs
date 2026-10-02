@@ -1233,6 +1233,95 @@ fn a_link_to_a_bubbler_context_that_wireplumber_did_not_make_is_destroyed() {
     );
 }
 
+/// The bed runs one WirePlumber, so a second instance of a split setup
+/// is stood in for by a client that carries the marker every instance's
+/// client carries; whether one in a security context can wear it is the
+/// question a sandbox's forgery would ask.
+#[test]
+fn only_a_session_manager_outside_every_context_keeps_a_link_to_a_bubbler_stream() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let _player = streaming(
+        &bed,
+        PLAYBACK,
+        "pw-cat -p -a -P '{ node.name = player }' - < /dev/zero",
+        "Stream/Output/Audio",
+    );
+    wait_for("WirePlumber's link for the player", || {
+        bed.links().contains("bed-sink:playback_")
+    });
+    // One of the player's own links in its own direction, crossed so it
+    // is not the one WirePlumber already made.
+    let crossed = || {
+        bed.links()
+            .lines()
+            .skip_while(|line| *line != "player:output_FL")
+            .skip(1)
+            .take_while(|line| line.starts_with(' '))
+            .any(|line| line.ends_with("bed-sink:playback_FR"))
+    };
+    let destroyed = || {
+        std::fs::read_to_string(bed.dir().join("wireplumber.log"))
+            .unwrap_or_default()
+            .matches("destroying a link to a bubbler context")
+            .count()
+    };
+
+    // `pw-cli` rather than `pw-link -m`, which makes the link again each
+    // time it goes; a link `pw-cli` makes lives while it runs, and it runs
+    // until its stdin closes.
+    let crossing = |mut command: Command| {
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        own_process_group(&mut command);
+        let mut child = command.spawn().expect("pw-cli did not run");
+        std::io::Write::write_all(
+            child.stdin.as_mut().expect("pw-cli's stdin"),
+            b"create-link player output_FL bed-sink playback_FR\n",
+        )
+        .expect("a command for pw-cli");
+        Streaming(child)
+    };
+
+    let before = destroyed();
+    let forged = crossing(bed.context_command(r#"{ "wireplumber.daemon": "true" }"#, "pw-cli"));
+    wait_for(
+        "the destruction of a link from a context claiming to be WirePlumber",
+        || destroyed() == before + 1,
+    );
+    assert!(!crossed(), "{}", bed.links());
+    drop(forged);
+
+    // A client's properties outside a context come from its own
+    // configuration's `context.properties`.
+    let config = bed.dir().join("second-instance");
+    std::fs::create_dir_all(config.join("client.conf.d")).expect("a client config directory");
+    std::fs::copy(
+        "/usr/share/pipewire/client.conf",
+        config.join("client.conf"),
+    )
+    .expect("a copy of the stock client.conf");
+    std::fs::write(
+        config.join("client.conf.d/marker.conf"),
+        "context.properties = { wireplumber.daemon = true }\n",
+    )
+    .expect("the marker's drop-in");
+    let mut command = bed.command("pw-cli");
+    command.env("PIPEWIRE_CONFIG_DIR", &config);
+    let _second_instance = crossing(command);
+    wait_for("the link of a second session manager", crossed);
+    std::thread::sleep(FORBIDDEN_LINK_LIFE);
+    assert!(
+        crossed(),
+        "a second session manager's link was destroyed:\n{}",
+        bed.links()
+    );
+    assert_eq!(destroyed(), before + 1);
+}
+
 /// A context under `props` offers a device node ranked above the bed's
 /// own (`offer`, a node named `offered`) before a host stream starts
 /// (`host`, a node named `host`): the host stream must reach `bed_end`

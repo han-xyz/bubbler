@@ -212,14 +212,31 @@ SimpleEventHook {
   end
 }:register ()
 
--- Whether WirePlumber made `link`. The daemon writes the creator's id
--- into `client.id` only on a link that does not linger (PipeWire 1.6.9,
--- module-link-factory.c); a lingering link carries whatever its creator
--- sent, so there the id proves nothing.
-local function made_by_wireplumber (link)
+-- Whether a WirePlumber instance made `link` — any instance, not only
+-- this one: the hook runs in every instance of a split setup, and each
+-- would otherwise destroy the links the others make. The daemon writes
+-- the creator's id into `client.id` only on a link that does not linger
+-- (PipeWire 1.6.9, module-link-factory.c); a lingering link carries
+-- whatever its creator sent, so there the id proves nothing. Every
+-- instance's client carries `wireplumber.daemon`, but so may any client
+-- (impl-client.c refuses a client only `pipewire.*` keys), so it counts
+-- only outside every security context: a context's client has
+-- `pipewire.sec.engine` from the context's socket before it says
+-- anything (module-protocol-native.c) and can neither change nor drop
+-- it.
+local function made_by_wireplumber (source, link)
   local linger = link.properties ["object.linger"]
-  return linger ~= "true" and linger ~= "1" and
-      link.properties ["client.id"] == tostring (Core.get_own_bound_id ())
+  local creator = link.properties ["client.id"]
+  if linger == "true" or linger == "1" or not creator then
+    return false
+  end
+  local clients = source:call ("get-object-manager", "client")
+  local client = clients:lookup {
+    Constraint { "bound-id", "=", creator, type = "gobject" },
+  }
+  return client ~= nil and
+      client.properties ["wireplumber.daemon"] == "true" and
+      client.properties ["pipewire.sec.engine"] == nil
 end
 
 -- The properties of the node `node_id` names where it belongs to a
@@ -248,6 +265,34 @@ local function own_stream_link (output, input)
   return not (output and input) or output ["client.id"] == input ["client.id"]
 end
 
+-- The `object.serial` of every link already asked to go, which a later
+-- check would otherwise ask again. Serials are never reused.
+local destroying = {}
+
+-- By the link's ends, not its creator: a link a sandbox won before its
+-- factory was hidden lingers with no creator on it at all, and any other
+-- client's link to or from a sandbox is one the policy above would have
+-- refused. WirePlumber's own links are kept only where they are the
+-- ones the policy permits.
+local function destroy_if_refused (source, link)
+  local serial = link.properties ["object.serial"]
+  if destroying [serial] then
+    return
+  end
+  local output = bubbler_node (source, link.properties ["link.output.node"])
+  local input = bubbler_node (source, link.properties ["link.input.node"])
+  if not output and not input then
+    return
+  end
+  if not (made_by_wireplumber (source, link) and
+      own_stream_link (output, input)) then
+    log:warning (link, "destroying a link to a bubbler context " ..
+        "that the policy refuses")
+    destroying [serial] = true
+    link:request_destroy ()
+  end
+end
+
 SimpleEventHook {
   name = "bubbler/destroy-refused-link",
   interests = {
@@ -256,22 +301,48 @@ SimpleEventHook {
     },
   },
   execute = function (event)
+    destroy_if_refused (event:get_source (), event:get_subject ())
+  end
+}:register ()
+
+-- At `link-added` the node at an end, or the client that owns it, may
+-- not be in WirePlumber's object managers yet, and the link would pass
+-- as one with no sandbox at either end. It is decided again when that
+-- node or a bubbler client arrives.
+SimpleEventHook {
+  name = "bubbler/destroy-refused-link-once-its-ends-are-known",
+  interests = {
+    EventInterest {
+      Constraint { "event.type", "c", "node-added", "client-added" },
+    },
+  },
+  execute = function (event)
     local source = event:get_source ()
-    local link = event:get_subject ()
-    -- By the link's ends, not its creator: a link a sandbox won before
-    -- its factory was hidden lingers with no creator on it at all, and
-    -- any other client's link to or from a sandbox is one the policy
-    -- above would have refused. WirePlumber's own links are kept only
-    -- where they are the ones the policy permits.
-    local output = bubbler_node (source, link.properties ["link.output.node"])
-    local input = bubbler_node (source, link.properties ["link.input.node"])
-    if not output and not input then
+    local subject = event:get_subject ()
+    local id = tostring (subject ["bound-id"])
+    local nodes = source:call ("get-object-manager", "node")
+    local is_client = event:get_properties () ["event.type"] == "client-added"
+    if is_client and
+        subject.properties ["pipewire.sec.engine"] ~= BUBBLER_ENGINE then
       return
     end
-    if not (made_by_wireplumber (link) and own_stream_link (output, input)) then
-      log:warning (link, "destroying a link to a bubbler context " ..
-          "that the policy refuses")
-      link:request_destroy ()
+
+    local function ends_here (node_id)
+      if not is_client then
+        return node_id == id
+      end
+      local node = nodes:lookup {
+        Constraint { "bound-id", "=", node_id, type = "gobject" },
+      }
+      return node ~= nil and node.properties ["client.id"] == id
+    end
+
+    local links = source:call ("get-object-manager", "link")
+    for link in links:iterate () do
+      if ends_here (link.properties ["link.output.node"]) or
+          ends_here (link.properties ["link.input.node"]) then
+        destroy_if_refused (source, link)
+      end
     end
   end
 }:register ()

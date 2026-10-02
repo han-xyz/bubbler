@@ -917,8 +917,21 @@ an `org.bubbler` client at either end is destroyed when WirePlumber sees
 it, whoever made it and whether or not its maker is still connected,
 unless WirePlumber made it and it is one of that client's own streams in
 the stream's own direction: a `Stream/Output/Audio` as the link's
-output, a `Stream/Input/Audio` as its input. That is decided by the
-link's two ends, not its maker: the daemon writes `client.id` only on a link that does
+output, a `Stream/Input/Audio` as its input. "WirePlumber" is any
+instance of it, so a split setup's instances keep each other's links:
+the link's creator is a client carrying `wireplumber.daemon = "true"`
+and no `pipewire.sec.engine`. Any client may set the first on itself,
+but a client of a security context gets the second from the context's
+socket before it says anything and can neither change nor drop it
+(PipeWire 1.6.9, `module-protocol-native.c` and `impl-client.c`); a
+client outside every context is unconfined anyway. A link whose end's
+node, or that node's owner, WirePlumber does not know yet when the link
+appears is decided again once it does. A node a sandbox creates through
+the `adapter` factory with `object.linger` set carries no `client.id`
+(`module-adapter.c`), so it is not recognised as the sandbox's at all,
+and this rule and the refusal above do not apply to it: a known gap,
+not measured. That is decided by the link's two ends, not its
+maker: the daemon writes `client.id` only on a link that does
 not linger, so a lingering link names whatever creator it likes. With
 the factory deliberately left open, such a link lived 0.6 ms at most.
 This also cuts a link the user draws to or from a sandboxed stream by
