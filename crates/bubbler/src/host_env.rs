@@ -7,7 +7,7 @@ use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use bubbler_core::env::{DEFAULT_DATA_DIRS, Env, is_passthrough};
+use bubbler_core::env::{DEFAULT_CONFIG_DIRS, DEFAULT_DATA_DIRS, Env, is_passthrough};
 use rustix::fs::{Mode, OFlags};
 use rustix::io::fcntl_getfd;
 
@@ -70,7 +70,8 @@ pub fn from_process() -> Result<Env> {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".config"));
-    let data_dirs = data_dirs(env::var_os("XDG_DATA_DIRS"));
+    let config_dirs = xdg_dirs(env::var_os("XDG_CONFIG_DIRS"), DEFAULT_CONFIG_DIRS);
+    let data_dirs = xdg_dirs(env::var_os("XDG_DATA_DIRS"), DEFAULT_DATA_DIRS);
     let runtime_dir = PathBuf::from(
         env::var_os("XDG_RUNTIME_DIR")
             .filter(|v| !v.is_empty())
@@ -82,6 +83,7 @@ pub fn from_process() -> Result<Env> {
         home,
         data_home,
         config_home,
+        config_dirs,
         data_dirs,
         runtime_dir,
         uid: rustix::process::getuid().as_raw(),
@@ -118,9 +120,9 @@ pub fn from_process() -> Result<Env> {
     })
 }
 
-/// `$XDG_DATA_DIRS` split into directories, or [`DEFAULT_DATA_DIRS`]
-/// when it is unset or empty, which is what the XDG base directory
-/// specification asks for.
+/// `$XDG_DATA_DIRS` or `$XDG_CONFIG_DIRS` split into directories, or
+/// `defaults` when it is unset or empty, which is what the XDG base
+/// directory specification asks for.
 ///
 /// A relative entry is dropped rather than resolved: that specification
 /// says every path in these variables must be absolute and that an
@@ -128,11 +130,11 @@ pub fn from_process() -> Result<Env> {
 /// ignore it. An empty entry means the current directory and goes the
 /// same way. What it would otherwise cost is a launcher entry read from
 /// wherever the process happened to be started.
-fn data_dirs(value: Option<OsString>) -> Vec<PathBuf> {
+fn xdg_dirs(value: Option<OsString>, defaults: &[&str]) -> Vec<PathBuf> {
     value
         .filter(|v| !v.is_empty())
         .map(|v| env::split_paths(&v).filter(|d| d.is_absolute()).collect())
-        .unwrap_or_else(|| DEFAULT_DATA_DIRS.iter().map(PathBuf::from).collect())
+        .unwrap_or_else(|| defaults.iter().map(PathBuf::from).collect())
 }
 
 /// `$BUBBLER_TEST_ALLOW_PATH`: the one extra root `path-share` accepts,
@@ -205,19 +207,23 @@ mod tests {
     #[test]
     fn a_relative_data_directory_is_ignored_and_only_an_unset_list_defaults() {
         let default: Vec<PathBuf> = DEFAULT_DATA_DIRS.iter().map(PathBuf::from).collect();
-        assert_eq!(data_dirs(None), default);
-        assert_eq!(data_dirs(Some(OsString::from(""))), default);
+        assert_eq!(xdg_dirs(None, DEFAULT_DATA_DIRS), default);
         assert_eq!(
-            data_dirs(Some(OsString::from(
-                "/opt/share:share:../share::/usr/share"
-            ))),
+            xdg_dirs(Some(OsString::from("")), DEFAULT_DATA_DIRS),
+            default
+        );
+        assert_eq!(
+            xdg_dirs(
+                Some(OsString::from("/opt/share:share:../share::/usr/share")),
+                DEFAULT_DATA_DIRS
+            ),
             vec![PathBuf::from("/opt/share"), PathBuf::from("/usr/share")],
             "a relative or empty entry is dropped, the absolute ones kept in order"
         );
         // A list that names nothing absolute names nowhere to look. The
         // defaults are for a variable nobody set, not for one whose every
         // entry the specification says to ignore.
-        assert!(data_dirs(Some(OsString::from("share:../share"))).is_empty());
-        assert!(data_dirs(Some(OsString::from(":"))).is_empty());
+        assert!(xdg_dirs(Some(OsString::from("share:../share")), DEFAULT_DATA_DIRS).is_empty());
+        assert!(xdg_dirs(Some(OsString::from(":")), DEFAULT_DATA_DIRS).is_empty());
     }
 }

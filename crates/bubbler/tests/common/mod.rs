@@ -460,6 +460,9 @@ fn isolate(c: &mut Command, root: &Path) {
         // desktop entry installed on this host cannot be what a test
         // resolves, and nothing a test writes lands outside it.
         .env("XDG_DATA_DIRS", root.join("share"))
+        // The same for the system configuration layer, which WirePlumber
+        // reads its drop-ins from.
+        .env("XDG_CONFIG_DIRS", root.join("xdg"))
         .env("XDG_RUNTIME_DIR", root.join("run"))
         // Both profile layers point into the test root, so a profile
         // installed on the host cannot change what a test resolves.

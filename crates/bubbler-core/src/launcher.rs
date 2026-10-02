@@ -4028,6 +4028,7 @@ mod tests {
             home: tmp.join("home"),
             data_home: tmp.join("data"),
             config_home: tmp.join("config"),
+            config_dirs: Vec::new(),
             data_dirs: crate::env::DEFAULT_DATA_DIRS
                 .iter()
                 .map(PathBuf::from)

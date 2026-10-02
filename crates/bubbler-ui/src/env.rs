@@ -42,6 +42,7 @@ pub fn from_process() -> Result<Env> {
         home,
         data_home,
         config_home,
+        config_dirs: Vec::new(),
         data_dirs,
         runtime_dir,
         uid: rustix::process::getuid().as_raw(),

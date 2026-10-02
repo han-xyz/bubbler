@@ -1166,11 +1166,12 @@ fn audio_policy_missing(ctx: &Context, sources: &[Source], f: &mut Findings) {
     let dirs = audio_policy::install_dirs(ctx.env);
     let hook_dirs = audio_policy::hook_dirs(ctx.env);
     let drop_in = format!(
-        "no WirePlumber policy drop-in ({}) is installed in {}, {} or {}",
+        "no WirePlumber policy drop-in ({}) is installed in {}",
         audio_policy::DROP_IN_NAME,
-        dirs[0].display(),
-        dirs[1].display(),
-        dirs[2].display(),
+        dirs.iter()
+            .map(|dir| dir.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
     );
     let hook = format!(
         "no policy hook script ({}) is installed in {}",
@@ -1201,7 +1202,7 @@ fn audio_policy_missing(ctx: &Context, sources: &[Source], f: &mut Findings) {
     };
     let write_drop_in = format!(
         "bubbler audio-policy --print > {}",
-        dirs[2].join(audio_policy::DROP_IN_NAME).display()
+        dirs[0].join(audio_policy::DROP_IN_NAME).display()
     );
     let script = hook_dirs[0].join(audio_policy::HOOK_NAME);
     let write_hook = format!(
@@ -2069,6 +2070,10 @@ mod tests {
             home: PathBuf::from("/home/user"),
             data_home: PathBuf::from("/home/user/.local/share"),
             config_home: PathBuf::from("/home/user/.config"),
+            config_dirs: crate::env::DEFAULT_CONFIG_DIRS
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
             data_dirs: crate::env::DEFAULT_DATA_DIRS
                 .iter()
                 .map(PathBuf::from)
@@ -3643,8 +3648,8 @@ mod tests {
     }
 
     /// No drop-in anywhere is the default fixture (`host()`), so the
-    /// warning fires for either audio node, names the node and all three
-    /// directories bubbler searched, and points the help at the command
+    /// warning fires for either audio node, names the node and every
+    /// directory bubbler searched, and points the help at the command
     /// that writes the file and the restart it needs.
     #[test]
     fn audio_policy_missing_fires_without_the_drop_in_and_names_where_to_put_it() {
@@ -3656,9 +3661,11 @@ mod tests {
                 assert_eq!(finding.severity, Severity::Warning, "{node}");
                 assert!(finding.message.contains(node), "{node}: {finding:?}");
                 for dir in [
-                    "/usr/share/wireplumber/wireplumber.conf.d",
-                    "/etc/wireplumber/wireplumber.conf.d",
                     "/home/user/.config/wireplumber/wireplumber.conf.d",
+                    "/etc/xdg/wireplumber/wireplumber.conf.d",
+                    "/etc/wireplumber/wireplumber.conf.d",
+                    "/usr/local/share/wireplumber/wireplumber.conf.d",
+                    "/usr/share/wireplumber/wireplumber.conf.d",
                 ] {
                     assert!(finding.message.contains(dir), "{node}: {finding:?}");
                 }
@@ -3675,15 +3682,18 @@ mod tests {
         });
     }
 
-    /// Whichever of the three directories holds the drop-in, with the
-    /// hook beside it the grant is scoped and the warning is silent.
+    /// Whichever directory WirePlumber reads the drop-in from holds it,
+    /// with the hook beside it the grant is scoped and the warning is
+    /// silent.
     #[test]
-    fn audio_policy_missing_is_silenced_by_any_of_the_three_directories() {
+    fn audio_policy_missing_is_silenced_by_any_install_directory() {
         let (file, _, _) = fake::types();
         for dir in [
-            "/usr/share/wireplumber/wireplumber.conf.d",
-            "/etc/wireplumber/wireplumber.conf.d",
             "/home/user/.config/wireplumber/wireplumber.conf.d",
+            "/etc/xdg/wireplumber/wireplumber.conf.d",
+            "/etc/wireplumber/wireplumber.conf.d",
+            "/usr/local/share/wireplumber/wireplumber.conf.d",
+            "/usr/share/wireplumber/wireplumber.conf.d",
         ] {
             let quiet = host()
                 .with(&format!("{dir}/50-bubbler.conf"), file)

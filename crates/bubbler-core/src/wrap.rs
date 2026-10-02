@@ -532,6 +532,7 @@ mod tests {
             home: tmp.path().join("home"),
             data_home: tmp.path().join("data"),
             config_home: tmp.path().join("config"),
+            config_dirs: Vec::new(),
             data_dirs: crate::env::DEFAULT_DATA_DIRS
                 .iter()
                 .map(PathBuf::from)

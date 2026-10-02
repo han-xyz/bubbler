@@ -1228,6 +1228,7 @@ mod tests {
             home: "/home/user".into(),
             data_home: "/home/user/.local/share".into(),
             config_home: "/home/user/.config".into(),
+            config_dirs: Vec::new(),
             data_dirs: crate::env::DEFAULT_DATA_DIRS
                 .iter()
                 .map(PathBuf::from)

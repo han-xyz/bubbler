@@ -13,6 +13,9 @@ pub const SANDBOX_HOME: &str = "/home/bubbler";
 /// as the XDG base directory specification names them.
 pub const DEFAULT_DATA_DIRS: &[&str] = &["/usr/local/share", "/usr/share"];
 
+/// The same for `$XDG_CONFIG_DIRS`.
+pub const DEFAULT_CONFIG_DIRS: &[&str] = &["/etc/xdg"];
+
 /// Environment variables copied from the host into the sandbox when set:
 /// terminal and locale. `LC_*` is not listed here; [`is_passthrough`] is
 /// the whole policy. `TZ` may name a path, so this is not a value-only list.
@@ -36,6 +39,10 @@ pub struct Env {
     /// `$XDG_CONFIG_HOME` (or `$HOME/.config`); the user's profile layer
     /// lives in `bubbler/profiles/` under it.
     pub config_home: PathBuf,
+    /// `$XDG_CONFIG_DIRS` (or `/etc/xdg`), in precedence order and
+    /// absolute like [`Env::data_dirs`]; where WirePlumber looks for its
+    /// configuration after `$XDG_CONFIG_HOME`.
+    pub config_dirs: Vec<PathBuf>,
     /// `$XDG_DATA_DIRS` (or `/usr/local/share:/usr/share`), in precedence
     /// order; where an application's own desktop entry is looked up,
     /// under `$XDG_DATA_HOME`'s copy of the same name. Absolute: the XDG

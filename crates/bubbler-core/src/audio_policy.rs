@@ -37,14 +37,33 @@ pub const HOOK_NAME: &str = "bubbler/refuse-links.lua";
 /// default `$XDG_DATA_DIRS` also ends with.
 const DATA_DIR: &str = "/usr/share";
 
-/// The three `wireplumber.conf.d` directories bubbler looks for the
-/// drop-in in, in the order [`installed`] searches.
-pub fn install_dirs(env: &Env) -> [PathBuf; 3] {
-    [
-        PathBuf::from("/usr/share/wireplumber/wireplumber.conf.d"),
-        PathBuf::from("/etc/wireplumber/wireplumber.conf.d"),
-        env.config_home.join("wireplumber/wireplumber.conf.d"),
-    ]
+/// Where WirePlumber was built to look for configuration after
+/// `$XDG_CONFIG_DIRS`.
+const SYSCONF_DIR: &str = "/etc";
+
+/// The `wireplumber.conf.d` directories WirePlumber 0.5.18 reads the
+/// drop-in from, highest-ranking first: `$XDG_CONFIG_HOME`, each of
+/// `$XDG_CONFIG_DIRS`, `/etc`, each of `$XDG_DATA_DIRS`, `/usr/share`
+/// (lib/wp/base-dirs.c `lookup_dirs` under `WP_BASE_DIRS_CONFIGURATION`),
+/// each listed once. A fragment name is loaded once, from the first of
+/// these holding it (`wp_base_dirs_new_files_iterator` drops a
+/// lower-ranked file of the same name), so that copy is the one in
+/// effect. `$WIREPLUMBER_CONFIG_DIR`, which would replace the whole
+/// search, is not consulted, as for [`hook_dirs`].
+pub fn install_dirs(env: &Env) -> Vec<PathBuf> {
+    let bases = std::iter::once(env.config_home.as_path())
+        .chain(env.config_dirs.iter().map(PathBuf::as_path))
+        .chain(std::iter::once(Path::new(SYSCONF_DIR)))
+        .chain(env.data_dirs.iter().map(PathBuf::as_path))
+        .chain(std::iter::once(Path::new(DATA_DIR)));
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for base in bases {
+        let dir = base.join("wireplumber/wireplumber.conf.d");
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
 }
 
 /// The `wireplumber/scripts` directories bubbler looks for the hook in,
@@ -73,10 +92,10 @@ pub fn hook_dirs(env: &Env) -> Vec<PathBuf> {
     dirs
 }
 
-/// Full path of the installed drop-in: the first of [`install_dirs`]
-/// that holds a file named [`DROP_IN_NAME`]; `None` where none does,
-/// which is what an absent policy is measured by everywhere else in
-/// this module.
+/// Full path of the drop-in WirePlumber loads: the first of
+/// [`install_dirs`] that holds a file named [`DROP_IN_NAME`]; `None`
+/// where none does, which is what an absent policy is measured by
+/// everywhere else in this module.
 pub fn installed(host: &dyn Host, env: &Env) -> Option<PathBuf> {
     install_dirs(env).into_iter().find_map(|dir| {
         let path = dir.join(DROP_IN_NAME);
@@ -199,21 +218,17 @@ pub fn explain_suffix(host: &dyn Host, env: &Env) -> &'static str {
 
 /// Whether a policy file WirePlumber loads is not the one this binary
 /// embeds, an older bubbler's or an edited copy: the grant it states is
-/// then not the grant enforced. The drop-in WirePlumber loads is the
-/// last of [`install_dirs`] that holds it — a fragment name is loaded
-/// once, from the directory that ranks highest, `$XDG_CONFIG_HOME` over
-/// `/etc` over `/usr/share` — and the hook the first of [`hook_dirs`].
+/// then not the grant enforced. The copies compared are [`installed`]
+/// and [`hook_installed`], the ones WirePlumber loads.
 fn differs(host: &dyn Host, env: &Env) -> bool {
-    let drop_in = install_dirs(env)
-        .into_iter()
-        .rev()
-        .map(|dir| dir.join(DROP_IN_NAME))
-        .find(|path| host.file_type(path).is_some());
-    [(drop_in, DROP_IN), (hook_installed(host, env), HOOK)]
-        .into_iter()
-        .any(|(path, embedded)| {
-            path.is_some_and(|path| host.read(&path).as_deref() != Some(embedded.as_bytes()))
-        })
+    [
+        (installed(host, env), DROP_IN),
+        (hook_installed(host, env), HOOK),
+    ]
+    .into_iter()
+    .any(|(path, embedded)| {
+        path.is_some_and(|path| host.read(&path).as_deref() != Some(embedded.as_bytes()))
+    })
 }
 
 #[cfg(test)]
@@ -227,6 +242,10 @@ mod tests {
             home: PathBuf::from("/home/user"),
             data_home: PathBuf::from("/home/user/.local/share"),
             config_home: PathBuf::from("/home/user/.config"),
+            config_dirs: crate::env::DEFAULT_CONFIG_DIRS
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
             data_dirs: crate::env::DEFAULT_DATA_DIRS
                 .iter()
                 .map(PathBuf::from)
@@ -254,21 +273,138 @@ mod tests {
         }
     }
 
-    /// Every combination of the two files a host can hold.
     /// A host holding `paths`, each with the embedded text of the policy
     /// file it names.
     fn holding(paths: &[PathBuf]) -> FakeHost {
+        let files: Vec<(PathBuf, &str)> = paths
+            .iter()
+            .map(|path| {
+                let text = if path.ends_with(HOOK_NAME) {
+                    HOOK
+                } else {
+                    DROP_IN
+                };
+                (path.clone(), text)
+            })
+            .collect();
+        holding_texts(&files)
+    }
+
+    /// A host holding each path with the text beside it.
+    fn holding_texts(files: &[(PathBuf, &str)]) -> FakeHost {
         let (file, _, _) = fake::types();
         let mut host = FakeHost::default();
-        for path in paths {
+        for (path, text) in files {
             let name = path.to_str().expect("the fixture's paths are UTF-8");
-            let text = match path.ends_with(HOOK_NAME) {
-                true => HOOK,
-                false => DROP_IN,
-            };
             host = host.with(name, file).text(name, text);
         }
         host
+    }
+
+    const STALE: &str = "# an older bubbler's copy\n";
+
+    /// WirePlumber 0.5.18's configuration search, highest first
+    /// (lib/wp/base-dirs.c `lookup_dirs` under
+    /// `WP_BASE_DIRS_CONFIGURATION`), with `wireplumber.conf.d` below each.
+    #[test]
+    fn install_dirs_are_wireplumbers_configuration_search_highest_first() {
+        let mut e = env();
+        e.config_dirs = vec![PathBuf::from("/opt/xdg"), PathBuf::from("/etc/xdg")];
+        e.data_dirs = vec![
+            PathBuf::from("/usr/local/share"),
+            PathBuf::from("/usr/share"),
+        ];
+        let expected: Vec<PathBuf> = [
+            "/home/user/.config",
+            "/opt/xdg",
+            "/etc/xdg",
+            "/etc",
+            "/usr/local/share",
+            "/usr/share",
+        ]
+        .iter()
+        .map(|base| Path::new(base).join("wireplumber/wireplumber.conf.d"))
+        .collect();
+        assert_eq!(install_dirs(&e).to_vec(), expected);
+    }
+
+    /// Whichever copy ranks highest is the one WirePlumber loads, and so
+    /// the one compared; a fragment name is loaded once
+    /// (`wp_base_dirs_new_files_iterator` drops a lower-ranked file of the
+    /// same name).
+    #[test]
+    fn the_copy_compared_is_the_one_wireplumber_loads() {
+        let e = env();
+        let conf = |base: &str| {
+            Path::new(base)
+                .join("wireplumber/wireplumber.conf.d")
+                .join(DROP_IN_NAME)
+        };
+        let script = |base: &str| Path::new(base).join("wireplumber/scripts").join(HOOK_NAME);
+        let hook = (script("/usr/share"), HOOK);
+        for (case, files, differ) in [
+            (
+                "a stale copy in /usr/local/share over the package's",
+                vec![
+                    (conf("/usr/local/share"), STALE),
+                    (conf("/usr/share"), DROP_IN),
+                    hook.clone(),
+                ],
+                true,
+            ),
+            (
+                "a stale copy in /etc/xdg over a current one in /etc",
+                vec![
+                    (conf("/etc/xdg"), STALE),
+                    (conf("/etc"), DROP_IN),
+                    hook.clone(),
+                ],
+                true,
+            ),
+            (
+                "a current user copy over a stale package one",
+                vec![
+                    (conf("/home/user/.config"), DROP_IN),
+                    (conf("/usr/share"), STALE),
+                    hook.clone(),
+                ],
+                false,
+            ),
+            (
+                "an edited hook in the user's data directory",
+                vec![
+                    (conf("/usr/share"), DROP_IN),
+                    (script("/home/user/.local/share"), STALE),
+                    hook.clone(),
+                ],
+                true,
+            ),
+            (
+                "a current user hook over a stale package one",
+                vec![
+                    (conf("/usr/share"), DROP_IN),
+                    (script("/home/user/.local/share"), HOOK),
+                    (script("/usr/share"), STALE),
+                ],
+                false,
+            ),
+        ] {
+            let host = holding_texts(&files);
+            assert_eq!(missing(&host, &e), None, "{case}");
+            assert_eq!(differs(&host, &e), differ, "{case}");
+        }
+    }
+
+    #[test]
+    fn a_drop_in_only_in_a_config_or_data_dir_is_not_missing() {
+        let e = env();
+        for base in ["/etc/xdg", "/usr/local/share"] {
+            let drop_in = Path::new(base)
+                .join("wireplumber/wireplumber.conf.d")
+                .join(DROP_IN_NAME);
+            let host = holding(&[drop_in, hook_dirs(&e)[0].join(HOOK_NAME)]);
+            assert_eq!(missing(&host, &e), None, "{base}");
+        }
     }
 
     #[test]
@@ -343,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn installed_finds_the_file_in_any_of_the_three_directories() {
+    fn installed_finds_the_file_in_any_install_directory() {
         let e = env();
         let (file, _, _) = fake::types();
         for dir in install_dirs(&e) {
@@ -396,14 +532,14 @@ mod tests {
             explain_suffix(&FakeHost::default(), &e),
             Missing::Both.explain_suffix()
         );
-        let half = holding(&[install_dirs(&e)[2].join(DROP_IN_NAME)]);
+        let half = holding(&[install_dirs(&e)[0].join(DROP_IN_NAME)]);
         assert_eq!(explain_suffix(&half, &e), Missing::Hook.explain_suffix());
         let whole = holding(&[
-            install_dirs(&e)[2].join(DROP_IN_NAME),
+            install_dirs(&e)[0].join(DROP_IN_NAME),
             hook_dirs(&e)[0].join(HOOK_NAME),
         ]);
         assert_eq!(explain_suffix(&whole, &e), "");
-        let edited = install_dirs(&e)[2].join(DROP_IN_NAME);
+        let edited = install_dirs(&e)[0].join(DROP_IN_NAME);
         let other = whole.text(edited.to_str().unwrap(), "# another version\n");
         assert_eq!(explain_suffix(&other, &e), EXPLAIN_SUFFIX_DIFFERS);
     }
