@@ -1213,6 +1213,53 @@ fn try_explains_a_throwaway_sandbox_without_running_it() {
     assert_eq!(left, 0);
 }
 
+/// bwrap is pid 1 inside the sandbox and its environ is readable there:
+/// `--clearenv` cleans only the application's.
+#[test]
+fn real_bwrap_pid_1_holds_nothing_of_the_callers_environment() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let out = bubbler_live(tmp.path(), &init)
+        .env("BUBBLER_LEAK_MARKER", "hostsecret123")
+        .args(["try", "--profile", "generic", "--", "/usr/bin/sh", "-c"])
+        .arg(
+            "test -r /proc/1/environ || exit 3; \
+             if tr '\\0' '\\n' < /proc/1/environ | grep -q BUBBLER_LEAK_MARKER; \
+             then echo leaked; else echo clean; fi",
+        )
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "clean\n", "{err}");
+}
+
+#[test]
+fn real_bwrap_a_granted_variable_still_reaches_the_application() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    write_profile(
+        tmp.path(),
+        "user",
+        "granted",
+        "env BUBBLER_GRANTED=\"yes\"\n",
+    );
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["try", "--profile", "granted", "--", "/usr/bin/printenv"])
+        .arg("BUBBLER_GRANTED")
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "yes\n", "{err}");
+}
+
 /// A `--share` of a temporary directory needs the test hook: every path
 /// a test can write lies under the denied `/tmp`.
 #[test]

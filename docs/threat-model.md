@@ -187,7 +187,11 @@ bwrap has no blacklist, so the model is "bind what you need": `/usr` and
 uncapped one lets a sandbox that fills it take the session's memory with
 it — a private home at `/home/bubbler`, an empty `$XDG_RUNTIME_DIR` at
 the host's path sharing the `/run` cap, since it is a directory `--dir`
-makes inside that tmpfs, and a cleared environment. Every sidecar bubbler
+makes inside that tmpfs, and a cleared environment. bwrap itself stays
+as pid 1 in the sandbox, where every process can read `/proc/1/environ`, and
+`--clearenv` cleans only what bwrap starts; bubbler therefore starts every
+bwrap, a sidecar's included, with an empty environment, so `/proc/1/environ`
+holds nothing of the caller's. Every sidecar bubbler
 wraps in a bwrap of its own gets the same 64 MiB cap on the two tmpfs
 mounts it has, its `/etc` and its `/tmp`. The forked child also
 joins a session keyring of its own (`keyctl(2)` `KEYCTL_JOIN_SESSION_KEYRING`

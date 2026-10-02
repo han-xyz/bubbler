@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.24.2
+
+### Security
+
+- The environment bubbler was started in was readable inside every sandbox
+  through `/proc/1/environ`; bwrap now starts with an empty one.
+
 ## 0.24.1
 
 ### Fixed

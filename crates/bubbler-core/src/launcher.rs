@@ -1218,7 +1218,7 @@ pub fn start_wayland(
     let argv = wl_proxy_argv(env, &plan, node, host, &mut alloc)?;
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     spawning(&alloc.intended())?;
-    let child = Command::new("bwrap")
+    let child = bwrap_command()?
         .args(&argv)
         .spawn()
         .map_err(|e| match e.kind() {
@@ -1405,7 +1405,7 @@ pub fn start_pw_context(
     let argv = pw_context_argv(env, &ctx, host, &mut alloc)?;
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     spawning(&alloc.intended())?;
-    let child = Command::new("bwrap")
+    let child = bwrap_command()?
         .args(&argv)
         .spawn()
         .map_err(|e| match e.kind() {
@@ -1664,7 +1664,7 @@ pub fn start_pw_pulse(
     let argv = pw_pulse_argv(env, dir, host, &mut alloc)?;
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     spawning(&alloc.intended())?;
-    let child = Command::new("bwrap")
+    let child = bwrap_command()?
         .args(&argv)
         .spawn()
         .map_err(|e| match e.kind() {
@@ -1835,7 +1835,7 @@ pub fn start_proxy(
     )?;
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     spawning(&alloc.intended())?;
-    let child = Command::new("bwrap")
+    let child = bwrap_command()?
         .args(&argv)
         .spawn()
         .map_err(|e| match e.kind() {
@@ -2213,12 +2213,23 @@ fn install_rules(
     Ok(())
 }
 
+/// `bwrap`, found on bubbler's own `PATH`, to be started with an empty
+/// environment: it stays pid 1 inside the sandbox, where its environ is
+/// readable, and `--clearenv` cleans only what it starts
+/// (https://github.com/containers/bubblewrap/issues/725).
+fn bwrap_command() -> Result<Command, LaunchError> {
+    let bwrap = on_path("bwrap").ok_or(LaunchError::BwrapMissing)?;
+    let mut cmd = Command::new(bwrap);
+    cmd.env_clear();
+    Ok(cmd)
+}
+
 /// Where `bin` is found on `$PATH`, if anywhere.
 ///
-/// Only ever asked on the way to an error message, which is why the
-/// library reads the environment here at all: a failed spawn has to be
-/// able to tell a package that is not installed from a failure of
-/// bubbler's own, and the two arrive as the same `NotFound`.
+/// The library reads the environment here for two things only: `bwrap`
+/// itself, which is started with none, and an error message, where a
+/// failed spawn has to tell a package that is not installed from a
+/// failure of bubbler's own, the two arriving as the same `NotFound`.
 fn on_path(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path).find_map(|dir| {
@@ -3375,7 +3386,7 @@ pub fn run(
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     fcntl_setfd(&inherited, FdFlags::empty()).map_err(io_at)?;
     spawning(&alloc.intended())?;
-    let mut cmd = Command::new("bwrap");
+    let mut cmd = bwrap_command()?;
     cmd.args(&argv);
     // SAFETY: the closure runs in the forked child between `fork` and
     // `execve`, where only async-signal-safe calls are allowed. It makes
