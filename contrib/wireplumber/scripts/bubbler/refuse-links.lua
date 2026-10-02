@@ -7,7 +7,7 @@
 -- beside 50-bubbler.conf, which is what loads it.
 --
 -- The permission managers in 50-bubbler.conf say what a sandbox may
--- see. Two things they cannot say, because both are facts about a
+-- see. Three things they cannot say, because each is a fact about a
 -- link's two ends and a permission is a fact about one object:
 --
 --   * A sink's monitor ports carry everything the session is playing
@@ -51,10 +51,9 @@
 -- it, and one pinned to it with `node.dont-fallback` gets no link.
 --
 -- A link with a sandbox's node at either end is destroyed when
--- WirePlumber sees it, unless WirePlumber made it and each sandbox end
--- is an audio stream in its own direction. The other end is not checked
--- there, so a link WirePlumber makes outside the hooks above is kept
--- whatever it reaches; one drawn in a patchbay is destroyed.
+-- WirePlumber sees it, unless WirePlumber made it and it is one the
+-- hooks above would have let it make; one drawn in a patchbay is
+-- destroyed.
 
 local lutils = require ("linking-utils")
 local cutils = require ("common-utils")
@@ -102,7 +101,8 @@ local function foreign_sandbox_node (source, si_props, target_props)
 end
 
 -- Whether a stream can record from the node: the classes 50-bubbler.conf
--- hides without the microphone grant, by the same test.
+-- hides without the microphone grant (its `~Audio/Source.*` is an
+-- unanchored match, so it hides at least these).
 local function capture_capable (node_props)
   local class = node_props ["media.class"] or ""
   return class:find ("^Audio/Source") ~= nil or class == "Audio/Duplex"
@@ -414,9 +414,15 @@ local function bubbler_node (source, node_id)
   return nil
 end
 
--- Whether a link from `sandbox_output` to `sandbox_input` is one of a
--- context's own audio streams in that stream's own direction.
-local function own_stream_link (sandbox_output, sandbox_input)
+-- Whether `link`, from `sandbox_output` to `sandbox_input`, is one the
+-- first line would have let WirePlumber make: a context's own audio
+-- streams in their own direction, and where only one end is a sandbox's,
+-- the other end what `refusal` allows it — a playback stream into
+-- anything but another client's stream, a capture stream from a source
+-- and only with the microphone grant. WirePlumber links a stream before
+-- it knows the stream's client after a restart, and then this is the
+-- only check.
+local function own_stream_link (source, link, sandbox_output, sandbox_input)
   if sandbox_output and
       sandbox_output ["media.class"] ~= AUDIO_STREAM_CLASS.output then
     return false
@@ -425,8 +431,19 @@ local function own_stream_link (sandbox_output, sandbox_input)
       sandbox_input ["media.class"] ~= AUDIO_STREAM_CLASS.input then
     return false
   end
-  return not (sandbox_output and sandbox_input) or
-      sandbox_output ["client.id"] == sandbox_input ["client.id"]
+  if sandbox_output and sandbox_input then
+    return sandbox_output ["client.id"] == sandbox_input ["client.id"]
+  end
+  if sandbox_output then
+    local host = lookup (source, "node", link.properties ["link.input.node"])
+    return host ~= nil and
+        (host.properties ["media.class"] or ""):find ("^Stream/") == nil
+  end
+  local host = lookup (source, "node", link.properties ["link.output.node"])
+  local client = bubbler_client (source, sandbox_input ["client.id"])
+  return host ~= nil and client ~= nil and capture_capable (host.properties) and
+      string.find (client.properties ["pipewire.sec.bubbler.audio"] or "",
+          "microphone", 1, true) ~= nil
 end
 
 -- The `object.serial` of every link already asked to go, which a later
@@ -449,7 +466,7 @@ local function destroy_if_refused (source, link)
     return
   end
   if not (made_by_wireplumber (source, link) and
-      own_stream_link (output, input)) then
+      own_stream_link (source, link, output, input)) then
     log:warning (link, "destroying a link to a bubbler context " ..
         "that the policy refuses")
     link:request_destroy ()

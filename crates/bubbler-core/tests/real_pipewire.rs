@@ -326,6 +326,13 @@ impl PipeWireBed {
     /// A running bed, or `None` (having said which binary is missing)
     /// on a host that cannot hold one.
     pub fn start() -> Option<PipeWireBed> {
+        Self::start_with(|_| ()).map(|(bed, ())| bed)
+    }
+
+    /// The same, with `before_session_manager` run against the bed's
+    /// directory once its PipeWire listens and before its WirePlumber
+    /// starts, and what it returned.
+    fn start_with<T>(before_session_manager: impl FnOnce(&Path) -> T) -> Option<(PipeWireBed, T)> {
         for binary in NEEDED {
             if on_path(binary).is_none() {
                 say(&format!("skipping: {binary} not installed"));
@@ -339,10 +346,13 @@ impl PipeWireBed {
             }
         }
         sweep_stale_beds();
-        Some(Self::start_in(new_bed_dir()))
+        Some(Self::start_in(new_bed_dir(), before_session_manager))
     }
 
-    fn start_in(dir: PathBuf) -> PipeWireBed {
+    fn start_in<T>(
+        dir: PathBuf,
+        before_session_manager: impl FnOnce(&Path) -> T,
+    ) -> (PipeWireBed, T) {
         let root = dir.clone();
         let run = root.join("run");
         let pw = root.join("pipewire");
@@ -376,6 +386,7 @@ impl PipeWireBed {
         wait_for("the bed's pipewire socket", || {
             run.join("pipewire-0").exists()
         });
+        let early = before_session_manager(&dir);
 
         let wireplumber = daemon(
             Command::new("wireplumber")
@@ -403,7 +414,7 @@ impl PipeWireBed {
         wait_for("the bed's wireplumber", || {
             bed.dump_from_host().contains("\"wireplumber.daemon\"")
         });
-        bed
+        (bed, early)
     }
 
     /// The bed's directory, so a test can look for it after the drop.
@@ -1336,6 +1347,70 @@ fn a_playback_context_cannot_nest_a_context_that_claims_the_microphone() {
     );
 }
 
+/// What `wpexec` runs to list the factories its client can see, once
+/// the session manager has let it see anything.
+const LIST_FACTORIES: &str = r#"
+factories = ObjectManager { Interest { type = "factory" } }
+factories:connect ("installed", function (om)
+  for factory in om:iterate () do
+    print ("factory " .. factory.properties ["factory.name"])
+  end
+  print ("listed")
+  Core.quit ()
+end)
+factories:activate ()
+"#;
+
+/// A sandbox connected while WirePlumber starts has its factories hidden
+/// all the same, though the hook's own list of them may still be empty
+/// when WirePlumber decides that client's access.
+#[test]
+fn a_context_connected_before_the_session_manager_cannot_see_the_link_factory() {
+    let started = PipeWireBed::start_with(|dir| {
+        let script = dir.join("list-factories.lua");
+        std::fs::write(&script, LIST_FACTORIES).expect("the listing script");
+        let log = dir.join("early.log");
+        let out = std::fs::File::create(&log).expect("a log for the early client");
+        let err = out.try_clone().expect("a second handle on that log");
+        let mut command = Command::new("pw-container");
+        command
+            .env("PIPEWIRE_RUNTIME_DIR", dir.join("run"))
+            .arg("-P")
+            .arg(PLAYBACK)
+            .arg("--")
+            .arg(format!(
+                "WIREPLUMBER_CONFIG_DIR={} wpexec {}",
+                dir.join("wireplumber").display(),
+                script.display()
+            ))
+            .stdout(out)
+            .stderr(err);
+        own_process_group(&mut command);
+        let early = Streaming(command.spawn().expect("pw-container did not run"));
+        wait_for("the early client in the daemon", || {
+            let dump = Command::new("pw-dump")
+                .env("PIPEWIRE_RUNTIME_DIR", dir.join("run"))
+                .output()
+                .expect("pw-dump did not run");
+            String::from_utf8_lossy(&dump.stdout)
+                .contains("\"pipewire.sec.engine\": \"org.bubbler\"")
+        });
+        (early, log)
+    });
+    let Some((_bed, (_early, log))) = started else {
+        return;
+    };
+    let mut listed = String::new();
+    wait_for("the early client's factory list", || {
+        listed = std::fs::read_to_string(&log).unwrap_or_default();
+        listed.contains("listed")
+    });
+    assert!(
+        listed.contains("factory client-node") && !listed.contains("factory link-factory"),
+        "a context connected before the session manager sees:\n{listed}"
+    );
+}
+
 /// How many links the bed's linking hook has refused toward the node
 /// named `target`, by the line it logs for each.
 fn links_refused(bed: &PipeWireBed, target: &str) -> usize {
@@ -1817,26 +1892,9 @@ fn only_a_session_manager_outside_every_context_keeps_a_link_to_a_bubbler_stream
             .any(|line| line.ends_with("bed-sink:playback_FR"))
     };
 
-    // A link `pw-cli` makes lives while it runs, and it runs until its
-    // stdin closes.
-    let crossing = |mut command: Command, link: &str| {
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        own_process_group(&mut command);
-        let mut child = command.spawn().expect("pw-cli did not run");
-        std::io::Write::write_all(
-            child.stdin.as_mut().expect("pw-cli's stdin"),
-            format!("create-link {link}\n").as_bytes(),
-        )
-        .expect("a command for pw-cli");
-        Streaming(child)
-    };
-
     let before = links_destroyed(&bed);
     let forging = || bed.context_command(r#"{ "wireplumber.daemon": "true" }"#, "pw-cli");
-    let forged = crossing(forging(), CROSSED);
+    let forged = holding_a_link(forging(), CROSSED);
     wait_for(
         "the destruction of a link from a context claiming to be WirePlumber",
         || links_destroyed(&bed) == before + 1,
@@ -1844,24 +1902,11 @@ fn only_a_session_manager_outside_every_context_keeps_a_link_to_a_bubbler_stream
     assert!(!crossed(), "{}", bed.links());
     drop(forged);
 
-    // A client's properties outside a context come from its own
-    // configuration's `context.properties`.
-    let config = bed.dir().join("second-instance");
-    std::fs::create_dir_all(config.join("client.conf.d")).expect("a client config directory");
-    std::fs::copy(PIPEWIRE_CLIENT_CONF, config.join("client.conf"))
-        .expect("a copy of the stock client.conf");
-    std::fs::write(
-        config.join("client.conf.d/marker.conf"),
-        "context.properties = { wireplumber.daemon = true }\n",
-    )
-    .expect("the marker's drop-in");
-    let mut command = bed.command("pw-cli");
-    command.env("PIPEWIRE_CONFIG_DIR", &config);
-    let _second_instance = crossing(command, CROSSED);
+    let _second_instance = holding_a_link(second_session_manager(&bed), CROSSED);
     wait_for("the link of a second session manager", crossed);
     // The hook decides links in the order WirePlumber sees them, so once
     // a forged link made after it is destroyed, this one has been decided.
-    let _forged_again = crossing(forging(), "player output_FR bed-sink playback_FL");
+    let _forged_again = holding_a_link(forging(), "player output_FR bed-sink playback_FL");
     wait_for("the destruction of a second forged link", || {
         links_destroyed(&bed) == before + 2
     });
@@ -1876,6 +1921,112 @@ fn only_a_session_manager_outside_every_context_keeps_a_link_to_a_bubbler_stream
 /// The player's left channel into the sink's right: not the link
 /// WirePlumber makes itself.
 const CROSSED: &str = "player output_FL bed-sink playback_FR";
+
+/// `pw-cli` from the host as a second session manager: a client's
+/// properties outside a context come from its own configuration's
+/// `context.properties`, and this one carries the marker every
+/// WirePlumber instance's client carries.
+fn second_session_manager(bed: &PipeWireBed) -> Command {
+    let config = bed.dir().join("second-instance");
+    std::fs::create_dir_all(config.join("client.conf.d")).expect("a client config directory");
+    std::fs::copy(PIPEWIRE_CLIENT_CONF, config.join("client.conf"))
+        .expect("a copy of the stock client.conf");
+    std::fs::write(
+        config.join("client.conf.d/marker.conf"),
+        "context.properties = { wireplumber.daemon = true }\n",
+    )
+    .expect("the marker's drop-in");
+    let mut command = bed.command("pw-cli");
+    command.env("PIPEWIRE_CONFIG_DIR", &config);
+    command
+}
+
+/// `command`, a `pw-cli`, making `link` and holding it: a link `pw-cli`
+/// makes lives while it runs, and it runs until its stdin closes.
+fn holding_a_link(mut command: Command, link: &str) -> Streaming {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    own_process_group(&mut command);
+    let mut child = command.spawn().expect("pw-cli did not run");
+    std::io::Write::write_all(
+        child.stdin.as_mut().expect("pw-cli's stdin"),
+        format!("create-link {link}\n").as_bytes(),
+    )
+    .expect("a command for pw-cli");
+    Streaming(child)
+}
+
+/// A session manager's link into a sandbox's capture stream is kept only
+/// where the policy would have made it — from a source, with the
+/// microphone grant — as when WirePlumber linked the stream before it
+/// knew the stream's client and the first line could not decide.
+#[test]
+fn a_session_managers_link_into_a_capture_stream_is_kept_only_where_the_grant_allows() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let _player = streaming(
+        &bed,
+        PLAYBACK,
+        "pw-cat -p -a -P '{ node.name = player }' - < /dev/zero",
+        "Stream/Output/Audio",
+    );
+    let unlinked = |name: &str| {
+        format!("pw-record -P '{{ node.autoconnect = false, node.name = {name} }}' /dev/null")
+    };
+    let _recorder = streaming(
+        &bed,
+        PLAYBACK_MICROPHONE,
+        &unlinked("recorder"),
+        "Stream/Input/Audio",
+    );
+    let _thief = Streaming(bed.spawn_in_context(PLAYBACK, &unlinked("thief")));
+    // The source's left channel is not always listed (measured), so
+    // every link here is of the right one.
+    wait_for("the ports to link", || {
+        let ports = bed.host_tool("pw-link", &["-io"]);
+        [
+            "bed-source:capture_FR",
+            "recorder:input_FR",
+            "thief:input_FR",
+        ]
+        .iter()
+        .all(|port| ports.contains(port))
+    });
+
+    let before = links_destroyed(&bed);
+    let _granted = holding_a_link(
+        second_session_manager(&bed),
+        "bed-source capture_FR recorder input_FR",
+    );
+    wait_for("the second session manager's link to the recorder", || {
+        bed.links().contains("recorder:input_FR")
+    });
+    // Not the source into the thief: the daemon refuses that link itself
+    // (measured: EPERM, impl-link.c `check_permission`), since the
+    // thief's client cannot see the source and this one holds no link
+    // permission.
+    let mut refused = Vec::new();
+    for (n, link) in [
+        "bed-sink monitor_FR thief input_FR",
+        "player output_FR thief input_FR",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        refused.push(holding_a_link(second_session_manager(&bed), link));
+        wait_for(&format!("the hook destroying {link}"), || {
+            links_destroyed(&bed) == before + n + 1
+        });
+    }
+    let links = bed.links();
+    assert!(!links.contains("thief:input_"), "{links}");
+    // Decided before the three after it, which were destroyed.
+    assert!(links.contains("recorder:input_FR"), "{links}");
+    assert_eq!(links_destroyed(&bed), before + 2);
+}
 
 /// A context under `props` offers a device node ranked above the bed's
 /// own (`offers`, each run in a context of its own and naming its node

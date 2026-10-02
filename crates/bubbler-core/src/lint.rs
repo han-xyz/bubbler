@@ -1228,13 +1228,9 @@ fn audio_policy_missing(ctx: &Context, sources: &[Source], f: &mut Findings) {
     f.push(i, node, &AUDIO_POLICY_MISSING, message, &help);
 }
 
-/// The `audio-policy-differs` warning: the whole policy is installed but
-/// a copy WirePlumber loads is not this binary's. Where part of it is
-/// missing, `audio-policy-missing` speaks instead.
+/// The `audio-policy-differs` warning: a copy of the policy WirePlumber
+/// loads is not this binary's, whether or not the other half is there.
 fn audio_policy_differs(ctx: &Context, sources: &[Source], f: &mut Findings) {
-    if audio_policy::missing(ctx.host, ctx.env).is_some() {
-        return;
-    }
     let paths = audio_policy::differing(ctx.host, ctx.env);
     if paths.is_empty() {
         return;
@@ -3752,11 +3748,21 @@ mod tests {
     fn audio_policy_missing_names_the_half_that_is_absent() {
         let (file, _, _) = fake::types();
         let drop_in = "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf";
-        for (held, named, unnamed) in [
-            (drop_in, "bubbler/refuse-links.lua", "50-bubbler.conf"),
-            (HOOK_PATH, "50-bubbler.conf", "bubbler/refuse-links.lua"),
+        for (held, named, unnamed, text) in [
+            (
+                drop_in,
+                "bubbler/refuse-links.lua",
+                "50-bubbler.conf",
+                audio_policy::DROP_IN,
+            ),
+            (
+                HOOK_PATH,
+                "50-bubbler.conf",
+                "bubbler/refuse-links.lua",
+                audio_policy::HOOK,
+            ),
         ] {
-            let half = host().with(held, file);
+            let half = host().with(held, file).text(held, text);
             with(&half, |ctx| {
                 let report = lint(ctx, &["pipewire"]);
                 assert_eq!(ids(&report), ["audio-policy-missing"], "{held}");
@@ -3770,6 +3776,22 @@ mod tests {
                 );
             });
         }
+    }
+
+    /// The drop-in an older bubbler's and the hook missing: both findings.
+    #[test]
+    fn a_stale_drop_in_beside_a_missing_hook_is_both_findings() {
+        let (file, _, _) = fake::types();
+        let drop_in = "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf";
+        let stale = host()
+            .with(drop_in, file)
+            .text(drop_in, "# an older bubbler's copy\n");
+        with(&stale, |ctx| {
+            assert_eq!(
+                ids(&lint(ctx, &["pipewire"])),
+                ["audio-policy-missing", "audio-policy-differs"]
+            );
+        });
     }
 
     #[test]

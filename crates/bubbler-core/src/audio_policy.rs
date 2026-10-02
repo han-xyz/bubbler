@@ -178,11 +178,13 @@ impl Missing {
 }
 
 /// What this host is missing of the policy, or `None` where it holds
-/// both files.
+/// both files. A copy WirePlumber would pick but cannot read counts as
+/// missing: it cannot load it either.
 pub fn missing(host: &dyn Host, env: &Env) -> Option<Missing> {
+    let readable = |path: Option<PathBuf>| path.is_some_and(|path| host.read(&path).is_some());
     match (
-        installed(host, env).is_some(),
-        hook_installed(host, env).is_some(),
+        readable(installed(host, env)),
+        readable(hook_installed(host, env)),
     ) {
         (true, true) => None,
         (false, true) => Some(Missing::DropIn),
@@ -199,30 +201,28 @@ pub const DIFFERS_CHECK: &str = "audio-policy-differs";
 /// The warning where this run needs it: `cfg` grants `pipewire` or
 /// `pulseaudio` and the host holds less than the whole policy, or a
 /// copy that differs from this binary's which `cfg` does not accept with
-/// a `lint-allow` of [`DIFFERS_CHECK`]. Printed once per real run
-/// (`main.rs`'s `Run`, `Try` and `Open`), never for `--dry-run` or
+/// a `lint-allow` of [`DIFFERS_CHECK`], or both. Printed once per real
+/// run (`main.rs`'s `Run`, `Try` and `Open`), never for `--dry-run` or
 /// `--explain`, which carry their own framing.
 pub fn run_warning(cfg: &InstanceConfig, host: &dyn Host, env: &Env) -> Option<String> {
     cfg.audio()?;
-    if let Some(case) = missing(host, env) {
-        return Some(case.run_warning().to_owned());
-    }
-    if cfg
+    let missing = missing(host, env).map(Missing::run_warning);
+    let accepted = cfg
         .lint_allows
         .iter()
-        .any(|allow| allow.id == DIFFERS_CHECK)
-    {
-        return None;
+        .any(|allow| allow.id == DIFFERS_CHECK);
+    let paths = if accepted {
+        Vec::new()
+    } else {
+        differing(host, env)
+    };
+    let differs = (!paths.is_empty())
+        .then(|| format!("{}; {}", differs_message(&paths), differs_help(&paths)));
+    match (missing, differs) {
+        (Some(missing), Some(differs)) => Some(format!("{missing}; {differs}")),
+        (Some(missing), None) => Some(missing.to_owned()),
+        (None, differs) => differs,
     }
-    let paths = differing(host, env);
-    if paths.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "{}; {}",
-        differs_message(&paths),
-        differs_help(&paths)
-    ))
 }
 
 /// The suffix an audio group's header takes, `""` where the host holds
@@ -238,7 +238,8 @@ pub fn explain_suffix(host: &dyn Host, env: &Env) -> &'static str {
 /// The policy files WirePlumber loads that are not the ones this binary
 /// embeds, an older bubbler's or an edited copy: the grant it states is
 /// then not the grant enforced. The copies compared are [`installed`]
-/// and [`hook_installed`], the ones WirePlumber loads.
+/// and [`hook_installed`], the ones WirePlumber loads; one it cannot read
+/// is [`missing`] instead.
 pub fn differing(host: &dyn Host, env: &Env) -> Vec<PathBuf> {
     [
         (installed(host, env), DROP_IN),
@@ -247,7 +248,7 @@ pub fn differing(host: &dyn Host, env: &Env) -> Vec<PathBuf> {
     .into_iter()
     .filter_map(|(path, embedded)| {
         let path = path?;
-        (host.read(&path).as_deref() != Some(embedded.as_bytes())).then_some(path)
+        (host.read(&path)? != embedded.as_bytes()).then_some(path)
     })
     .collect()
 }
@@ -590,6 +591,32 @@ mod tests {
     fn installed_is_none_where_no_directory_holds_it() {
         let e = env();
         assert_eq!(installed(&FakeHost::default(), &e), None);
+    }
+
+    /// WirePlumber cannot load a copy it cannot read either, so the half
+    /// is missing — the stronger warning — rather than different.
+    #[test]
+    fn an_unreadable_copy_is_missing_not_differing() {
+        let e = env();
+        let (file, _, _) = fake::types();
+        let drop_in = install_dirs(&e)[0].join(DROP_IN_NAME);
+        let host = holding(&[hook_dirs(&e)[0].join(HOOK_NAME)])
+            .with(drop_in.to_str().expect("a UTF-8 fixture path"), file);
+        assert_eq!(missing(&host, &e), Some(Missing::DropIn));
+        assert_eq!(differing(&host, &e), Vec::<PathBuf>::new());
+    }
+
+    /// Half a policy and the other half an older bubbler's: the run says
+    /// both, since the older drop-in lets a sandbox claim the microphone.
+    #[test]
+    fn a_stale_drop_in_beside_a_missing_hook_is_named_too() {
+        let e = env();
+        let drop_in = install_dirs(&e)[0].join(DROP_IN_NAME);
+        let host = holding_texts(&[(drop_in.clone(), STALE)]);
+        let audio = crate::config::parse("pipewire\ncommand \"true\"").unwrap();
+        let warning = run_warning(&audio, &host, &e).expect("a warning");
+        assert!(warning.contains(Missing::Hook.run_warning()), "{warning}");
+        assert!(warning.contains(&differs_message(&[drop_in])), "{warning}");
     }
 
     #[test]
