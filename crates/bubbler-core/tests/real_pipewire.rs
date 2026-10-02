@@ -491,9 +491,17 @@ impl PipeWireBed {
         }
     }
 
+    /// Armed with the death signal even for a short call: `pw-container`
+    /// keeps the context's listening socket open, so a client that
+    /// connected after the bed's daemon died waits on it for ever, and
+    /// `pw-container` waits on that client.
     fn context_command(&self, props: &str, program: &str) -> Command {
         let mut command = self.command("pw-container");
         command.arg("-P").arg(props).arg("--").arg(program);
+        // SAFETY: as in `daemon`: `prctl` alone between fork and exec.
+        unsafe {
+            command.pre_exec(dies_with_this_thread);
+        }
         command
     }
 }
@@ -1073,12 +1081,13 @@ fn no_fresh_context_keeps_a_link_it_asks_for_in_its_first_instant() {
     let Some(bed) = PipeWireBed::start() else {
         return;
     };
-    let wav = bed.dir().join("tone.wav");
-    silence(&wav);
+    // One process playing without end, not a loop around a file: a loop
+    // under a SIGKILLed test binary outlives the bed and spins, while
+    // `pw-cat` exits once its daemon is gone.
     let _other = streaming(
         &bed,
         PLAYBACK,
-        &format!("sh -c 'while :; do pw-cat -p {}; done'", wav.display()),
+        "pw-cat -p -a - < /dev/zero",
         "Stream/Output/Audio",
     );
     let out = bed.dir().join("stolen.wav");
