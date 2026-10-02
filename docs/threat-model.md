@@ -867,7 +867,21 @@ session manager: for any `org.bubbler` client it refuses a link to
 another client's stream in either direction, a capture link to a sink
 (its monitor ports carry everything the session is playing, and they are
 reached through the sink's own read permission, which is the grant), and
-a capture link to a source for a context without `microphone`.
+a capture link to a source for a context without `microphone`. Whoever
+owns the stream being linked, it also refuses a link to any node of an
+`org.bubbler` client that is not that stream's own: a sandbox can create
+nodes of its own, and measured on WirePlumber 0.5.18 and PipeWire 1.6.9,
+up to 0.24.1 an `Audio/Sink` a playback or microphone sandbox offered
+with a high `priority.session` became the default sink, there being no
+configured one, and every host stream started afterwards was linked into
+it — the sandbox recorded them without making a link — as was a host
+recorder from an `Audio/Source` it offered. Refusing the link alone left
+those host streams unlinked, since `linking/find-default-target` picks
+the default before the hook runs (measured), so since 0.24.2 a
+sandbox's nodes are also left out of default-node selection and host
+streams go on to the host's own default (measured). A smart filter
+(`filter.smart`) a sandbox offers, or a configured default naming a
+sandbox's node, is refused by the same rule; neither was measured.
 
 That covers the links the session manager makes; a client can also make
 one itself, and node permissions cannot stop it. PipeWire 1.6.8 lets any
@@ -898,15 +912,17 @@ manager attaches. The daemon holds a restricted client's requests until
 it may read the core, which the attach is what grants, and the attach
 changes only the default and the objects its rules match — never a
 factory — so no request of the sandbox's meets a readable factory: 0 in
-1400 attempts under the same load. Behind that, any link that touches a
-node of an `org.bubbler` client and that WirePlumber did not make is
-destroyed when WirePlumber sees it, whoever made it and whether or not
-its maker is still connected. That is decided by the link's two ends,
-not its maker: the daemon writes `client.id` only on a link that does
+1400 attempts under the same load. Behind that, any link with a node of
+an `org.bubbler` client at either end is destroyed when WirePlumber sees
+it, whoever made it and whether or not its maker is still connected,
+unless WirePlumber made it and it is one of that client's own streams in
+the stream's own direction: a `Stream/Output/Audio` as the link's
+output, a `Stream/Input/Audio` as its input. That is decided by the
+link's two ends, not its maker: the daemon writes `client.id` only on a link that does
 not linger, so a lingering link names whatever creator it likes. With
 the factory deliberately left open, such a link lived 0.6 ms at most.
-This also cuts a link the user draws into a sandboxed stream by hand in
-a patchbay. Both changes apply once the policy files are reinstalled —
+This also cuts a link the user draws to or from a sandboxed stream by
+hand in a patchbay. Both changes apply once the policy files are reinstalled —
 `bubbler audio-policy --print` and `bubbler audio-policy --print
 --script` into the places they were installed — and WirePlumber is
 restarted; a running WirePlumber keeps the hook it started with.

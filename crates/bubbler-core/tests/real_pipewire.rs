@@ -1233,6 +1233,80 @@ fn a_link_to_a_bubbler_context_that_wireplumber_did_not_make_is_destroyed() {
     );
 }
 
+/// A context under `props` offers a device node ranked above the bed's
+/// own (`offer`, a node named `offered`) before a host stream starts
+/// (`host`, a node named `host`): the host stream must reach `bed_end`
+/// and no port of the offered node, which would otherwise be the
+/// session's default for want of a configured one.
+fn a_host_stream_passes_by_a_node_a_context_offers(
+    props: &str,
+    grant: &str,
+    offer: &str,
+    host: &[&str],
+    bed_end: &str,
+) {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let _offered = Streaming(bed.spawn_in_context(props, offer));
+    wait_for("the context's offered node", || {
+        bed.dump_from_host().contains("\"node.name\": \"offered\"")
+    });
+    window_in_which_it_would_link(&bed, grant);
+
+    let mut command = bed.command("pw-cat");
+    command
+        .args(host)
+        .stdin(std::fs::File::open("/dev/zero").expect("/dev/zero"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    own_process_group(&mut command);
+    let _host = Streaming(command.spawn().expect("pw-cat did not run"));
+    let mut links = String::new();
+    wait_for("a link for the host's stream", || {
+        links = bed.links();
+        links.contains("host:")
+    });
+    assert!(
+        !links.contains("offered:"),
+        "a host stream was linked to a node a {grant} context offered:\n{links}"
+    );
+    assert!(links.contains(bed_end), "{links}");
+}
+
+#[test]
+fn a_host_stream_does_not_play_into_a_sink_a_playback_context_offers() {
+    a_host_stream_passes_by_a_node_a_context_offers(
+        PLAYBACK,
+        "playback",
+        "pw-cat -r -a -P '{ media.class = Audio/Sink, priority.session = 5000, node.name = offered }' /dev/null",
+        &["-p", "-a", "-P", "{ node.name = host }", "-"],
+        "bed-sink:playback_",
+    );
+}
+
+#[test]
+fn a_host_stream_does_not_play_into_a_sink_a_microphone_context_offers() {
+    a_host_stream_passes_by_a_node_a_context_offers(
+        PLAYBACK_MICROPHONE,
+        "playback,microphone",
+        "pw-cat -r -a -P '{ media.class = Audio/Sink, priority.session = 5000, node.name = offered }' /dev/null",
+        &["-p", "-a", "-P", "{ node.name = host }", "-"],
+        "bed-sink:playback_",
+    );
+}
+
+#[test]
+fn a_host_recorder_does_not_record_from_a_source_a_playback_context_offers() {
+    a_host_stream_passes_by_a_node_a_context_offers(
+        PLAYBACK,
+        "playback",
+        "pw-cat -p -a -P '{ media.class = Audio/Source, priority.session = 5000, node.name = offered }' - < /dev/zero",
+        &["-r", "-a", "-P", "{ node.name = host }", "/dev/null"],
+        "bed-source:capture_",
+    );
+}
+
 #[test]
 fn a_playback_context_plays_through_a_private_pulse_server() {
     let Some(bed) = PipeWireBed::start() else {

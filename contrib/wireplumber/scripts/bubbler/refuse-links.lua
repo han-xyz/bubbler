@@ -108,21 +108,63 @@ SimpleEventHook {
       return
     end
 
-    local client = bubbler_client (source, si_props ["client.id"])
-    if not client then
-      return
+    local target_props = target.properties
+    local why
+    -- Whoever the stream belongs to: a sink, source or filter a sandbox
+    -- offers would otherwise take a host stream without the sandbox
+    -- making any link.
+    if bubbler_client (source, target_props ["client.id"]) and
+        (target_props ["item.node.type"] ~= "stream" or
+         target_props ["client.id"] ~= si_props ["client.id"]) then
+      why = "a sandbox's node that is not the stream's own"
+    else
+      local client = bubbler_client (source, si_props ["client.id"])
+      if not client then
+        return
+      end
+      why = refusal (si_props, target_props,
+          client.properties ["bubbler.audio"] or "")
     end
 
-    local why = refusal (si_props, target.properties,
-        client.properties ["bubbler.audio"] or "")
     if why then
-      log:info (si, string.format ("refusing %s (%s) a link to %s: %s",
+      log:info (si, string.format ("refusing %s (client %s) a link to %s: %s",
           tostring (si_props ["node.name"]),
-          tostring (client.properties ["pipewire.sec.app-id"]),
-          tostring (target.properties ["node.name"]),
+          tostring (si_props ["client.id"]),
+          tostring (target_props ["node.name"]),
           why))
       event:set_data ("target", nil)
     end
+  end
+}:register ()
+
+-- Refusing the link alone would leave every host stream unlinked while a
+-- sandbox's node is the default: find-default-target picks the default
+-- before any later hook can refuse it. So a sandbox's node is never a
+-- candidate for the default in the first place.
+SimpleEventHook {
+  name = "bubbler/no-default-from-a-sandbox",
+  before = { "default-nodes/find-selected-default-node",
+             "default-nodes/find-stored-default-node",
+             "default-nodes/find-best-default-node" },
+  interests = {
+    EventInterest {
+      Constraint { "event.type", "=", "select-default-node" },
+    },
+  },
+  execute = function (event)
+    local available = event:get_data ("available-nodes")
+    available = available and available:parse ()
+    if not available then
+      return
+    end
+    local source = event:get_source ()
+    local kept = {}
+    for _, node_props in ipairs (available) do
+      if not bubbler_client (source, node_props ["client.id"]) then
+        table.insert (kept, Json.Object (node_props))
+      end
+    end
+    event:set_data ("available-nodes", Json.Array (kept))
   end
 }:register ()
 
@@ -180,18 +222,34 @@ local function made_by_wireplumber (link)
       link.properties ["client.id"] == tostring (Core.get_own_bound_id ())
 end
 
--- Whether the node `node_id` names belongs to a bubbler context.
+-- The properties of the node `node_id` names where it belongs to a
+-- bubbler context, or nil.
 local function bubbler_node (source, node_id)
   local nodes = source:call ("get-object-manager", "node")
   local node = nodes:lookup {
     Constraint { "bound-id", "=", node_id, type = "gobject" },
   }
-  return node ~= nil and
-      bubbler_client (source, node.properties ["client.id"]) ~= nil
+  if node and bubbler_client (source, node.properties ["client.id"]) then
+    return node.properties
+  end
+  return nil
+end
+
+-- Whether a link from `output` to `input`, the properties of each end
+-- that belongs to a bubbler context (nil for one that does not), is one
+-- of a context's own streams in that stream's own direction.
+local function own_stream_link (output, input)
+  if output and output ["media.class"] ~= "Stream/Output/Audio" then
+    return false
+  end
+  if input and input ["media.class"] ~= "Stream/Input/Audio" then
+    return false
+  end
+  return not (output and input) or output ["client.id"] == input ["client.id"]
 end
 
 SimpleEventHook {
-  name = "bubbler/destroy-link-wireplumber-did-not-make",
+  name = "bubbler/destroy-refused-link",
   interests = {
     EventInterest {
       Constraint { "event.type", "=", "link-added" },
@@ -200,17 +258,19 @@ SimpleEventHook {
   execute = function (event)
     local source = event:get_source ()
     local link = event:get_subject ()
-    if made_by_wireplumber (link) then
-      return
-    end
     -- By the link's ends, not its creator: a link a sandbox won before
     -- its factory was hidden lingers with no creator on it at all, and
-    -- any other client's link into a sandbox is one the policy above
-    -- would have refused.
-    if bubbler_node (source, link.properties ["link.output.node"]) or
-        bubbler_node (source, link.properties ["link.input.node"]) then
-      log:warning (link, "destroying a link to a bubbler context that \
-          WirePlumber did not make")
+    -- any other client's link to or from a sandbox is one the policy
+    -- above would have refused. WirePlumber's own links are kept only
+    -- where they are the ones the policy permits.
+    local output = bubbler_node (source, link.properties ["link.output.node"])
+    local input = bubbler_node (source, link.properties ["link.input.node"])
+    if not output and not input then
+      return
+    end
+    if not (made_by_wireplumber (link) and own_stream_link (output, input)) then
+      log:warning (link, "destroying a link to a bubbler context " ..
+          "that the policy refuses")
       link:request_destroy ()
     end
   end

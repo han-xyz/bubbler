@@ -38,9 +38,19 @@
   and keep it, recording the output mix or another application's stream
   without the `microphone` grant. The linking hook now hides the link factory
   before WirePlumber grants the connection anything, and destroys any link
-  into a sandbox that WirePlumber did not make. Reinstall the policy
-  (`bubbler audio-policy --print`, `--print --script`) and restart
-  WirePlumber.
+  to or from a sandbox's node that is not one of its own streams as
+  WirePlumber linked it. Reinstall the policy (`bubbler audio-policy
+  --print`, `--print --script`) and restart WirePlumber.
+- A sandbox with a `pipewire` or `pulseaudio` grant could record every host
+  stream without making a link: an `Audio/Sink` it created with a high
+  `priority.session` became the default sink where none was configured, and
+  WirePlumber linked host streams into it (measured on WirePlumber 0.5.18;
+  an `Audio/Source` it offered took host recorders the same way). The linking
+  hook now refuses any link to a sandbox's node that is not that stream's
+  own, and keeps a sandbox's nodes out of default-node selection so host
+  streams go to the host's default. A smart filter a sandbox offers is
+  refused by the same rule, not measured. The same reinstall and restart
+  applies.
 
 ## 0.24.1
 

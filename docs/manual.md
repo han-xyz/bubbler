@@ -618,11 +618,15 @@ it loads, see "Installing" below — and without the drop-in a sandbox
 reaches every node the config did not ask for, while without the hook the
 grant is scoped and every other client's audio stays recordable.
 The hook also keeps a sandbox from linking anything itself, and destroys
-any link into a sandbox that WirePlumber did not make, one you draw in a
-patchbay included. Before 0.24.2 a sandbox could still win such a link
-in the first instant of a new connection, now and then, and keep it; a
-policy installed by an older bubbler keeps that open until both files are
-reinstalled and WirePlumber restarted (see "Installing").
+any link to or from a sandbox's node that is not one of its own streams
+as WirePlumber linked it, one you draw in a patchbay included. A sink or
+source a sandbox offers is never made the default and no host stream is
+linked to it. Before 0.24.2 a sandbox could still win a link of its own
+in the first instant of a new connection, now and then, and keep it, and
+a sink it offered could become the default and take every host stream
+(measured on WirePlumber 0.5.18); a policy installed by an older bubbler
+keeps both open until both files are reinstalled and WirePlumber
+restarted (see "Installing").
 `bubbler lint` warns `audio-policy-missing`, and a run missing both
 prints `bubbler: warning: audio policy drop-in and hook script not found
 (50-bubbler.conf, bubbler/refuse-links.lua): the sandbox has full access
