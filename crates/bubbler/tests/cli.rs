@@ -21,7 +21,7 @@ use common::{
     require_a11y_lookup, require_bwrap, require_dbus, require_document_portal, require_egress,
     require_groff, require_host_program, require_nested_x11, require_nested_x11_host, require_nft,
     require_pasta, require_portal, require_python, require_security_context, require_system_bus,
-    require_tray, say, session_pipewire, system_owns, test_pty,
+    require_tray, sandboxes_of, say, session_pipewire, system_owns, test_pty,
 };
 use rustix::fs::{FlockOperation, OFlags, fcntl_getfl, flock};
 use rustix::process::{Pid, Signal, kill_process};
@@ -2973,7 +2973,11 @@ fn real_bwrap_pipewire_context_tags_the_client() {
     // By the process tree the run's bwraps were found in while it was up,
     // the sidecar's with the sandbox's: other tests run their own beside
     // this one.
-    assert!(!bwraps.is_empty(), "no bwrap under the run while it was up");
+    assert_eq!(
+        sandboxes_of(child.id(), &bwraps),
+        2,
+        "the sandbox and the context sidecar under the run while it was up"
+    );
     assert!(!bwrap_alive(&bwraps), "a sandbox of the run is left");
     assert!(
         !process_running("pw-container", "audioctx"),
@@ -3138,7 +3142,11 @@ fn real_bwrap_pulseaudio_serves_a_private_server() {
     // while the suite runs, and what this asserts is that *this* server
     // is gone — the `pipewire` inside that bwrap goes with it, since it is
     // pid 1's child in a pid namespace `--die-with-parent` takes down.
-    assert!(!bwraps.is_empty(), "no bwrap under the run while it was up");
+    assert_eq!(
+        sandboxes_of(run_id, &bwraps),
+        3,
+        "the sandbox, the context sidecar and the pulse server under the run while it was up"
+    );
     assert!(!bwrap_alive(&bwraps), "a sandbox of the run is left");
     for left in ["pw", "pwpulse", "pulse-native"] {
         assert!(
@@ -9581,7 +9589,18 @@ fn real_bwrap_seccomp_covers_the_dbus_proxy_sandbox() {
         fail_with(run, "the proxy never wrote its report");
     }
     let out = std::fs::read_to_string(&report).unwrap();
-    let bwraps = bwraps_under(run.id());
+    // The proxy is started before the application's sandbox, so its
+    // report alone does not mean both bwraps are there to be listed.
+    let mut bwraps = Vec::new();
+    if !wait_until(
+        || {
+            bwraps = bwraps_under(run.id());
+            sandboxes_of(run.id(), &bwraps) == 2
+        },
+        Duration::from_secs(10),
+    ) {
+        fail_with(run, "the app sandbox and the proxy's never both ran");
+    }
     // SIGTERM and wait, never SIGKILL: bubbler is what tears the two
     // sandboxes down, and killing it here — while the run is still
     // starting up — is how a test leaves a bwrap of its own behind.
@@ -9597,7 +9616,6 @@ fn real_bwrap_seccomp_covers_the_dbus_proxy_sandbox() {
     assert_eq!(probed(&out, "clone3"), "ENOSYS", "{out}");
     assert_eq!(probed(&out, "getpid"), "ok", "{out}");
     // Neither the app sandbox nor the proxy's outlives the run.
-    assert!(!bwraps.is_empty(), "no bwrap under the run while it was up");
     assert!(
         wait_until(|| !bwrap_alive(&bwraps), Duration::from_secs(5)),
         "a bwrap of instance `seccp` outlived the run"

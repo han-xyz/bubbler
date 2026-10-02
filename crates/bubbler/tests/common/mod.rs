@@ -500,6 +500,7 @@ pub fn kill_group(child: &Child) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Started {
     pid: i32,
+    parent: i32,
     start: u64,
 }
 
@@ -518,12 +519,20 @@ pub fn bwraps_under(pid: u32) -> Vec<Started> {
             if stat.comm == "bwrap" {
                 found.push(Started {
                     pid: *child,
+                    parent,
                     start: stat.start,
                 });
             }
         }
     }
     found
+}
+
+/// How many of `bwraps` bubbler `pid` started itself: one per sandbox,
+/// the application's and each sidecar's. The rest are the bwraps those
+/// fork to be pid 1 of their namespaces.
+pub fn sandboxes_of(pid: u32, bwraps: &[Started]) -> usize {
+    bwraps.iter().filter(|b| b.parent == pid as i32).count()
 }
 
 /// Whether any of `bwraps` is still running. A run that has ended must
