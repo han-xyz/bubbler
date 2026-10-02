@@ -48,8 +48,7 @@
   an `Audio/Source` it offered took host recorders the same way). The linking
   hook now refuses any link to a sandbox's node that is not that stream's
   own, and keeps a sandbox's nodes out of default-node selection so host
-  streams go to the host's default. A smart filter a sandbox offers is
-  refused by the same rule, not measured. The same reinstall and restart
+  streams go to the host's default. The same reinstall and restart
   applies.
 - A sandbox with a `pipewire` or `pulseaudio` grant could give itself the
   `microphone` grant: the grant was the client property `bubbler.audio`,
@@ -67,6 +66,11 @@
   beginning `Audio/Source` and `Audio/Duplex`, and the linking hook refuses
   them by the same test; with the grant a sandbox records from them,
   `Audio/Duplex` included, which the hook used to refuse as a sink.
+- A sandbox with a `pipewire` grant could silence the desktop: while it
+  offered a smart filter (`filter.smart`), every host stream that started
+  was refused the filter and left unlinked, and so was a host stream aimed
+  at a sink it offered (measured). Such a stream now plays on the session's
+  default.
 - A sandbox with a `pipewire` grant could create a node the daemon owns
   through the `adapter` factory (measured); made to linger, it carried no
   owner, so no rule of the policy applied to it and it outlived the

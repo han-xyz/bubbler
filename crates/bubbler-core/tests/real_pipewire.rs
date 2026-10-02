@@ -1752,23 +1752,30 @@ fn only_a_session_manager_outside_every_context_keeps_a_link_to_a_bubbler_stream
 }
 
 /// A context under `props` offers a device node ranked above the bed's
-/// own (`offer`, a node named `offered`) before a host stream starts
+/// own (`offers`, each run in a context of its own and naming its node
+/// `offered` or `offered-<something>`) before a host stream starts
 /// (`host`, a node named `host`): the host stream must reach `bed_end`
 /// and no port of the offered node, which would otherwise be the
 /// session's default for want of a configured one.
 fn a_host_stream_passes_by_a_node_a_context_offers(
     props: &str,
     grant: &str,
-    offer: &str,
+    offers: &[&str],
     host: &[&str],
     bed_end: &str,
 ) {
     let Some(bed) = PipeWireBed::start() else {
         return;
     };
-    let _offered = Streaming(bed.spawn_in_context(props, offer));
-    wait_for("the context's offered node", || {
-        bed.dump_from_host().contains("\"node.name\": \"offered\"")
+    let _offered: Vec<Streaming> = offers
+        .iter()
+        .map(|offer| Streaming(bed.spawn_in_context(props, offer)))
+        .collect();
+    wait_for("the context's offered nodes", || {
+        bed.dump_from_host()
+            .matches("\"node.name\": \"offered")
+            .count()
+            == offers.len()
     });
     window_in_which_it_would_link(&bed, grant);
 
@@ -1797,7 +1804,9 @@ fn a_host_stream_does_not_play_into_a_sink_a_playback_context_offers() {
     a_host_stream_passes_by_a_node_a_context_offers(
         PLAYBACK,
         "playback",
-        "pw-cat -r -a -P '{ media.class = Audio/Sink, priority.session = 5000, node.name = offered }' /dev/null",
+        &[
+            "pw-cat -r -a -P '{ media.class = Audio/Sink, priority.session = 5000, node.name = offered }' /dev/null",
+        ],
         &["-p", "-a", "-P", "{ node.name = host }", "-"],
         "bed-sink:playback_",
     );
@@ -1808,7 +1817,9 @@ fn a_host_stream_does_not_play_into_a_sink_a_microphone_context_offers() {
     a_host_stream_passes_by_a_node_a_context_offers(
         PLAYBACK_MICROPHONE,
         "playback,microphone",
-        "pw-cat -r -a -P '{ media.class = Audio/Sink, priority.session = 5000, node.name = offered }' /dev/null",
+        &[
+            "pw-cat -r -a -P '{ media.class = Audio/Sink, priority.session = 5000, node.name = offered }' /dev/null",
+        ],
         &["-p", "-a", "-P", "{ node.name = host }", "-"],
         "bed-sink:playback_",
     );
@@ -1819,9 +1830,51 @@ fn a_host_recorder_does_not_record_from_a_source_a_playback_context_offers() {
     a_host_stream_passes_by_a_node_a_context_offers(
         PLAYBACK,
         "playback",
-        "pw-cat -p -a -P '{ media.class = Audio/Source, priority.session = 5000, node.name = offered }' - < /dev/zero",
+        &[
+            "pw-cat -p -a -P '{ media.class = Audio/Source, priority.session = 5000, node.name = offered }' - < /dev/zero",
+        ],
         &["-r", "-a", "-P", "{ node.name = host }", "/dev/null"],
         "bed-source:capture_",
+    );
+}
+
+#[test]
+fn a_host_stream_aimed_at_a_sink_a_playback_context_offers_plays_on_the_default() {
+    a_host_stream_passes_by_a_node_a_context_offers(
+        PLAYBACK,
+        "playback",
+        &["pw-cat -r -a -P '{ media.class = Audio/Sink, node.name = offered }' /dev/null"],
+        &[
+            "-p",
+            "-a",
+            "--target=offered",
+            "-P",
+            "{ node.name = host }",
+            "-",
+        ],
+        "bed-sink:playback_",
+    );
+}
+
+/// A smart filter is a pair of nodes sharing a link group: the sink
+/// streams are routed into and the stream it plays on with, both made
+/// through `client-node`. Two connections, not two clients of one
+/// `pw-container`: one of two clients connecting to it at once now and
+/// then gets EPIPE (measured, under every policy).
+#[test]
+fn a_host_stream_passes_by_a_smart_filter_a_playback_context_offers() {
+    a_host_stream_passes_by_a_node_a_context_offers(
+        PLAYBACK,
+        "playback",
+        &[
+            "pw-cat -r -a -P '{ media.class = Audio/Sink, node.name = offered, \
+             node.link-group = sandbox-filter, filter.smart = true, \
+             filter.smart.name = sandbox-filter }' /dev/null",
+            "pw-cat -p -a -P '{ node.name = offered-out, \
+             node.link-group = sandbox-filter }' - < /dev/zero",
+        ],
+        &["-p", "-a", "-P", "{ node.name = host }", "-"],
+        "bed-sink:playback_",
     );
 }
 

@@ -74,6 +74,16 @@ local function bubbler_client (source, client_id)
   return nil
 end
 
+-- Whether the target is a sandbox's node that is not the stream's own:
+-- whoever the stream belongs to, a sink, source or filter a sandbox
+-- offers would otherwise take a host stream without the sandbox making
+-- any link.
+local function foreign_sandbox_node (source, si_props, target_props)
+  return bubbler_client (source, target_props ["client.id"]) ~= nil and
+      (target_props ["item.node.type"] ~= "stream" or
+       target_props ["client.id"] ~= si_props ["client.id"])
+end
+
 -- Whether a stream can record from the node: the classes 50-bubbler.conf
 -- hides without the microphone grant, by the same test.
 local function capture_capable (node_props)
@@ -126,12 +136,7 @@ SimpleEventHook {
 
     local target_props = target.properties
     local why
-    -- Whoever the stream belongs to: a sink, source or filter a sandbox
-    -- offers would otherwise take a host stream without the sandbox
-    -- making any link.
-    if bubbler_client (source, target_props ["client.id"]) and
-        (target_props ["item.node.type"] ~= "stream" or
-         target_props ["client.id"] ~= si_props ["client.id"]) then
+    if foreign_sandbox_node (source, si_props, target_props) then
       why = "a sandbox's node that is not the stream's own"
     else
       local client = bubbler_client (source, si_props ["client.id"])
@@ -148,6 +153,50 @@ SimpleEventHook {
           tostring (si_props ["client.id"]),
           tostring (target_props ["node.name"]),
           why))
+      event:set_data ("target", nil)
+    end
+  end
+}:register ()
+
+-- WirePlumber's finders can still aim a stream at a sandbox's node: its
+-- smart filter (linking/get-filter-from-target), a node named as the
+-- stream's target (linking/find-defined-target) or one ranked above the
+-- host's own (linking/find-best-target). Refused after
+-- linking/prepare-link, the stream would play nowhere, so here, after
+-- every finder and before prepare-link, it gets the session's default
+-- instead, which is never a sandbox's node.
+SimpleEventHook {
+  name = "bubbler/no-target-from-a-sandbox",
+  after = { "linking/find-defined-target",
+            "linking/find-audio-group-target",
+            "linking/find-filter-target",
+            "linking/find-media-role-target",
+            "linking/find-media-role-sink-target",
+            "linking/find-default-target",
+            "linking/find-best-target",
+            "linking/get-filter-from-target" },
+  before = "linking/prepare-link",
+  interests = {
+    EventInterest {
+      Constraint { "event.type", "=", "select-target" },
+    },
+  },
+  execute = function (event)
+    local source, _, si, si_props, _, target =
+        lutils:unwrap_select_target_event (event)
+    if not target or
+        not foreign_sandbox_node (source, si_props, target.properties) then
+      return
+    end
+    local default = lutils.findDefaultLinkable (si)
+    if default and lutils.canLink (si_props, default) and
+        not foreign_sandbox_node (source, si_props, default.properties) then
+      log:info (si, string.format ("%s goes to the default %s, not %s",
+          tostring (si_props ["node.name"]),
+          tostring (default.properties ["node.name"]),
+          tostring (target.properties ["node.name"])))
+      event:set_data ("target", default)
+    else
       event:set_data ("target", nil)
     end
   end

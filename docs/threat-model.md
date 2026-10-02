@@ -900,9 +900,18 @@ recorder from an `Audio/Source` it offered. Refusing the link alone left
 those host streams unlinked, since `linking/find-default-target` picks
 the default before the hook runs (measured), so since 0.24.2 a
 sandbox's nodes are also left out of default-node selection and host
-streams go on to the host's own default (measured). A smart filter
-(`filter.smart`) a sandbox offers, or a configured default naming a
-sandbox's node, is refused by the same rule; neither was measured.
+streams go on to the host's own default (measured). The other finders
+can still aim a host stream at a sandbox's node — its smart filter
+(`filter.smart`, `linking/get-filter-from-target`), a node the stream
+names as its target (`linking/find-defined-target`), one ranked above
+the host's own (`linking/find-best-target`) — and until this round such
+a stream was refused after `linking/prepare-link` and played nowhere:
+while a playback sandbox offered a smart filter, every host stream that
+started was left unlinked, and so was one aimed at a sink it offered
+(both measured). A hook after every finder and before
+`linking/prepare-link` now hands such a stream the session's default
+instead, which is never a sandbox's node (both measured: the stream
+plays on the bed's sink).
 
 That covers the links the session manager makes; a client can also make
 one itself, and node permissions cannot stop it. PipeWire 1.6.8 lets any
