@@ -67,6 +67,11 @@
   beginning `Audio/Source` and `Audio/Duplex`, and the linking hook refuses
   them by the same test; with the grant a sandbox records from them,
   `Audio/Duplex` included, which the hook used to refuse as a sink.
+- A sandbox with a `pipewire` grant could create a node the daemon owns
+  through the `adapter` factory (measured); made to linger, it carried no
+  owner, so no rule of the policy applied to it and it outlived the
+  sandbox. The linking hook now takes every factory but `client-node`, the
+  one streams are made through, away from a sandbox.
 
 ## 0.24.1
 

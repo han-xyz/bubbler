@@ -184,13 +184,16 @@ SimpleEventHook {
   end
 }:register ()
 
--- The link factory, which every client that makes a link of its own
--- asks the core for by name.
+-- Every factory in the graph. A sandbox keeps `client-node`, which is
+-- what a stream is made through (pipewire-pulse's included), and loses
+-- the rest: `link-factory`, through which it would link what it can see
+-- itself, and every factory that makes a node or other object the daemon
+-- owns (`adapter`, `spa-node-factory`, `metadata`, ...) — such a node,
+-- made with `object.linger`, carries no `client.id` (PipeWire 1.6.9,
+-- module-adapter.c), so nothing below could tell it was a sandbox's.
+local STREAM_FACTORY = "client-node"
 local factories = ObjectManager {
-  Interest {
-    type = "factory",
-    Constraint { "factory.name", "=", "link-factory", type = "pw-global" },
-  },
+  Interest { type = "factory" },
 }
 factories:activate ()
 
@@ -198,10 +201,11 @@ factories:activate ()
 -- update that lets the client's held requests through, and a hook after
 -- it runs one main-loop turn later — measured on WirePlumber 0.5.18,
 -- long enough for a fresh connection to create a link with the factory
--- still readable. The explicit entry set here survives the attach, which
--- changes the default and the objects its rules match, never a factory.
+-- still readable. The explicit entries set here survive the attach,
+-- which changes the default and the objects its rules match, never a
+-- factory.
 SimpleEventHook {
-  name = "bubbler/hide-link-factory",
+  name = "bubbler/hide-factories",
   before = "client/apply-access",
   interests = {
     EventInterest {
@@ -213,18 +217,25 @@ SimpleEventHook {
     if client.properties ["pipewire.sec.engine"] ~= BUBBLER_ENGINE then
       return
     end
-    local factory = factories:lookup {}
-    if not factory then
-      log:warning (client, "no link factory in the graph: a sandbox that " ..
-          "can see two nodes can link them itself")
-      return
-    end
     -- No permission at all, not read-only: measured on PipeWire 1.6.8,
     -- the core asks only for read on the factory global before creating
     -- the object, so a readable factory is a usable one.
-    client:update_permissions { [factory ["bound-id"]] = "-" }
-    log:info (client, "link factory hidden from " ..
-        tostring (client.properties ["pipewire.sec.app-id"]))
+    local hidden = {}
+    local link_factory = false
+    for factory in factories:iterate () do
+      local name = factory.properties ["factory.name"]
+      if name ~= STREAM_FACTORY then
+        hidden [factory ["bound-id"]] = "-"
+        link_factory = link_factory or name == "link-factory"
+      end
+    end
+    if not link_factory then
+      log:warning (client, "no link factory in the graph: a sandbox that " ..
+          "can see two nodes can link them itself")
+    end
+    client:update_permissions (hidden)
+    log:info (client, "every factory but " .. STREAM_FACTORY ..
+        " hidden from " .. tostring (client.properties ["pipewire.sec.app-id"]))
   end
 }:register ()
 

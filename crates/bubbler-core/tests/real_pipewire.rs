@@ -1431,6 +1431,55 @@ fn no_context_makes_a_link_of_its_own() {
     }
 }
 
+/// A node made through a factory other than `client-node` is the
+/// daemon's, and with `object.linger` carries no `client.id` at all
+/// (module-adapter.c), so nothing could tell it was a sandbox's.
+#[test]
+fn a_context_creates_nodes_only_as_its_own_streams() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    for (props, grant) in [
+        (PLAYBACK, "playback"),
+        (PLAYBACK_MICROPHONE, "playback,microphone"),
+    ] {
+        for factory in ["adapter", "spa-node-factory"] {
+            let name = format!("made-{factory}");
+            let out = bed.output_in_context(
+                props,
+                &format!(
+                    "pw-cli create-node {factory} '{{ factory.name = support.null-audio-sink, \
+                     node.name = {name}, media.class = Audio/Sink, object.linger = true }}'"
+                ),
+            );
+            std::thread::sleep(FORBIDDEN_LINK_LIFE);
+            let dump = bed.dump_from_host();
+            assert!(
+                !dump.contains(&format!("\"node.name\": \"{name}\"")),
+                "a {grant} context made a node through {factory}: {out:?}"
+            );
+        }
+        let listing = bed.info_in_context(props, &[SINK]);
+        let factories: Vec<&str> = listing
+            .split("\n\tid: ")
+            .filter(|block| block.contains("type: PipeWire:Interface:Factory"))
+            .filter_map(|block| {
+                block.lines().find_map(|line| {
+                    line.trim()
+                        .trim_start_matches('*')
+                        .trim_start()
+                        .strip_prefix("factory.name = ")
+                })
+            })
+            .collect();
+        assert_eq!(
+            factories,
+            [r#""client-node""#],
+            "the factories a {grant} context can see"
+        );
+    }
+}
+
 /// How long the test below keeps opening fresh contexts: long enough for
 /// a few hundred, short enough for the normal suite. It runs wherever the
 /// bed can start, like every test here, and adds no load of its own; the

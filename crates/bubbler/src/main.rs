@@ -526,7 +526,8 @@ instead of what it asks for; without the script beside it the grant is scoped
 but every other application's audio stays recordable — the script is what
 refuses a capture stream a link to another client's stream or to the sink's
 monitor ports, and what takes the link factory away so the sandbox cannot make
-those links itself. It also destroys any link to or from a sandbox's node that
+those links itself, with every other factory but the one streams are made
+through. It also destroys any link to or from a sandbox's node that
 is not one of its own streams, a patchbay's included, and keeps a sink or
 source a sandbox offers from becoming the default. `run`, `--explain` and
 `lint` each say which of the two is missing. After an upgrade that changes the

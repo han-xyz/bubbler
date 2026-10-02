@@ -914,7 +914,9 @@ sink for its own audio to reach it — so nothing at the node level tells
 "WirePlumber links my stream to the sink" apart from "I link the sink's
 monitor to my capture stream". The lever is the link factory: the hook
 withholds every permission on the `link-factory` global from an
-`org.bubbler` client, and the core then answers its `create_object` with
+`org.bubbler` client — and on every other factory but `client-node`,
+the one a stream is made through, which a playback context in the test
+bed could otherwise read (`adapter`, `spa-node-factory`, `metadata`) — and the core then answers its `create_object` with
 `ENOENT` while WirePlumber, which holds the whole graph, goes on linking
 on the sandbox's behalf. Read alone is not enough — measured on 1.6.8,
 the core asks only for read on that global — and a permission-manager
@@ -949,9 +951,10 @@ client outside every context is unconfined anyway. A link whose end's
 node, or that node's owner, WirePlumber does not know yet when the link
 appears is decided again once it does. A node a sandbox creates through
 the `adapter` factory with `object.linger` set carries no `client.id`
-(`module-adapter.c`), so it is not recognised as the sandbox's at all,
-and this rule and the refusal above do not apply to it: a known gap,
-not measured. That is decided by the link's two ends, not its
+(`module-adapter.c`), so it would not be recognised as the sandbox's at
+all; until 0.24.2 a playback sandbox could make one (measured), and the
+hook now takes every factory but `client-node` away from it, so the
+only nodes it can create are its own streams. That is decided by the link's two ends, not its
 maker: the daemon writes `client.id` only on a link that does
 not linger, so a lingering link names whatever creator it likes. With
 the factory deliberately left open, such a link lived 0.6 ms at most.
