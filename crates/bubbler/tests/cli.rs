@@ -16,12 +16,12 @@ use bubbler_core::profile::NAMES;
 use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
     PYTHON, bubbler, bubbler_audio, bubbler_dbus, bubbler_in_sh, bubbler_live, bubbler_wayland,
-    bwrap_alive, holders_of, host_bus, isolated, kill_group, output_past_a_busy_exec,
-    process_running, real_init, real_net_proxy, require_a11y, require_a11y_lookup, require_bwrap,
-    require_dbus, require_document_portal, require_egress, require_groff, require_host_program,
-    require_nested_x11, require_nested_x11_host, require_nft, require_pasta, require_portal,
-    require_python, require_security_context, require_system_bus, require_tray, say,
-    session_pipewire, system_owns, test_pty,
+    bwrap_alive, bwraps_under, command_lines, holders_of, host_bus, isolated, kill_group,
+    output_past_a_busy_exec, process_running, real_init, real_net_proxy, require_a11y,
+    require_a11y_lookup, require_bwrap, require_dbus, require_document_portal, require_egress,
+    require_groff, require_host_program, require_nested_x11, require_nested_x11_host, require_nft,
+    require_pasta, require_portal, require_python, require_security_context, require_system_bus,
+    require_tray, say, session_pipewire, system_owns, test_pty,
 };
 use rustix::fs::{FlockOperation, OFlags, fcntl_getfl, flock};
 use rustix::process::{Pid, Signal, kill_process};
@@ -2940,6 +2940,7 @@ fn real_bwrap_pipewire_context_tags_the_client() {
     // client on the session's daemon behind for every later run to see.
     let bound = instance.join("pipewire-0").exists();
     let context_dir = instance.join("pw").is_dir();
+    let bwraps = bwraps_under(child.id());
 
     // The way a terminal ends a run: bubbler stops the sandbox and the
     // sidecar behind it on its way out.
@@ -2969,13 +2970,11 @@ fn real_bwrap_pipewire_context_tags_the_client() {
     // inside it: what bwrap resolves is a name only bubbler can touch.
     assert!(bound, "no context socket at {instance:?} during the run");
     assert!(context_dir, "no context directory in {instance:?}");
-    // By the bind that makes it this instance's sidecar, not by the
-    // holder: every context sidecar names the same `/run/bubbler-pw-hold`
-    // and other tests run their own beside this one.
-    assert!(
-        !bwrap_alive(&format!("{}/pw /tmp", instance.display())),
-        "a sidecar sandbox is left"
-    );
+    // By the process tree the run's bwraps were found in while it was up,
+    // the sidecar's with the sandbox's: other tests run their own beside
+    // this one.
+    assert!(!bwraps.is_empty(), "no bwrap under the run while it was up");
+    assert!(!bwrap_alive(&bwraps), "a sandbox of the run is left");
     assert!(
         !process_running("pw-container", "audioctx"),
         "a pw-container is left"
@@ -3072,6 +3071,7 @@ fn real_bwrap_pulseaudio_serves_a_private_server() {
     let config =
         std::fs::read_to_string(instance.join("pwpulse/cfg/pipewire-pulse.conf.d/00-bubbler.conf"))
             .unwrap_or_default();
+    let bwraps = bwraps_under(child.id());
 
     kill_process(Pid::from_child(&child), Signal::TERM).expect("the run is still going");
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -3133,15 +3133,13 @@ fn real_bwrap_pulseaudio_serves_a_private_server() {
     );
     // R4, pulse half: the server, its socket and its configuration are
     // gone with the run.
-    // By the bind that makes it this run's sidecar, not by the program:
-    // another sandbox of this desktop's may be playing audio while the
-    // suite runs, and what this asserts is that *this* server is gone —
-    // the `pipewire` inside that bwrap goes with it, since it is pid 1's
-    // child in a pid namespace `--die-with-parent` takes down.
-    assert!(
-        !bwrap_alive(&format!("{}/pwpulse /tmp", instance.display())),
-        "a pulse sidecar sandbox is left"
-    );
+    // By the process tree this run's bwraps were found in, not by the
+    // program: another sandbox of this desktop's may be playing audio
+    // while the suite runs, and what this asserts is that *this* server
+    // is gone — the `pipewire` inside that bwrap goes with it, since it is
+    // pid 1's child in a pid namespace `--die-with-parent` takes down.
+    assert!(!bwraps.is_empty(), "no bwrap under the run while it was up");
+    assert!(!bwrap_alive(&bwraps), "a sandbox of the run is left");
     for left in ["pw", "pwpulse", "pulse-native"] {
         assert!(
             !instance.join(left).exists(),
@@ -6217,18 +6215,25 @@ fn real_wayland_proxy_serves_the_only_socket_the_sandbox_sees() {
     // own upstream path, which no other run's proxy carries.
     let upstream = leftovers.runtime.join("wayland-context");
     let upstream = upstream.display().to_string();
+    let proxy = command_lines("bwrap", &upstream);
     assert!(
-        bwrap_alive(&upstream),
+        !proxy.is_empty(),
         "the proxy was not running: {}",
         run.said()
     );
+    // Its options reached it through `--args`, not its command line.
+    for line in &proxy {
+        assert!(line.contains("--args "), "{line}");
+        assert!(!line.contains("--ro-bind"), "{line}");
+        assert!(!line.contains("--setenv"), "{line}");
+    }
     let log = run.stop();
     // Bounded rather than immediate: bwrap's own children carry its argv,
     // and they are still in `/proc` for a moment after the bwrap bubbler
     // waited for has been reaped. None of them may outlive the run, which
     // is what a deadline says and an instant look does not.
     assert!(
-        wait_until(|| !bwrap_alive(&upstream), RUN_LIMIT),
+        wait_until(|| !process_running("bwrap", &upstream), RUN_LIMIT),
         "the proxy outlived the run: {log}"
     );
     assert!(!leftovers.runtime.join("wayland").exists(), "{log}");
@@ -9467,6 +9472,7 @@ fn real_bwrap_seccomp_covers_the_dbus_proxy_sandbox() {
         fail_with(run, "the proxy never wrote its report");
     }
     let out = std::fs::read_to_string(&report).unwrap();
+    let bwraps = bwraps_under(run.id());
     // SIGTERM and wait, never SIGKILL: bubbler is what tears the two
     // sandboxes down, and killing it here — while the run is still
     // starting up — is how a test leaves a bwrap of its own behind.
@@ -9482,9 +9488,9 @@ fn real_bwrap_seccomp_covers_the_dbus_proxy_sandbox() {
     assert_eq!(probed(&out, "clone3"), "ENOSYS", "{out}");
     assert_eq!(probed(&out, "getpid"), "ok", "{out}");
     // Neither the app sandbox nor the proxy's outlives the run.
-    let instance = format!("{}/run/bubbler/seccp", tmp.path().display());
+    assert!(!bwraps.is_empty(), "no bwrap under the run while it was up");
     assert!(
-        wait_until(|| !bwrap_alive(&instance), Duration::from_secs(5)),
+        wait_until(|| !bwrap_alive(&bwraps), Duration::from_secs(5)),
         "a bwrap of instance `seccp` outlived the run"
     );
 }

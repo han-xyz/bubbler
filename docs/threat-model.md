@@ -187,26 +187,30 @@ bwrap has no blacklist, so the model is "bind what you need": `/usr` and
 uncapped one lets a sandbox that fills it take the session's memory with
 it — a private home at `/home/bubbler`, an empty `$XDG_RUNTIME_DIR` at
 the host's path sharing the `/run` cap, since it is a directory `--dir`
-makes inside that tmpfs, and a cleared environment. bwrap itself stays
-as pid 1 in the sandbox, where every process can read `/proc/1/environ`,
-and `--clearenv` cleans only what bwrap starts; bubbler therefore starts
-every bwrap, a sidecar's included, with an empty environment, so
+makes inside that tmpfs, and a cleared environment. bwrap itself stays as
+pid 1 in the sandbox, where every process can read `/proc/1/environ`, and
+`--clearenv` cleans only what bwrap starts; bubbler therefore starts every
+bwrap, a sidecar's included, with an empty environment, so
 `/proc/1/environ` holds nothing of the caller's. `/proc/1/cmdline` is as
-readable, so bwrap reads its options from a sealed memfd through
-`--args`: its command line holds `--args <fd>` and the command, nothing
-of the host's layout. Every sidecar bubbler wraps in a bwrap of its own
-gets the same 64 MiB cap on the two tmpfs mounts it has, its `/etc` and
-its `/tmp`. The forked child also
-joins a session keyring of its own (`keyctl(2)` `KEYCTL_JOIN_SESSION_KEYRING`
-with a null name) right before it execs `bwrap`, so it never inherits the
-login session keyring bubbler itself runs on; `keyctl` is on the `EPERM`
-denylist by default, but a profile may take it off, and without the join the
-keys behind `@s` would be the user's rather than this instance's. All namespaces are unshared —
-except the network one under `network "host"`, which is the whole of that
-grant; `--die-with-parent` and `--new-session` are always on. Bind order is
-semantics — a later `--tmpfs /run` would silently shadow a socket bound
-under it — so the builder emits in fixed phases and no service controls
-global order.
+readable, so bwrap reads its options from a sealed memfd through `--args`:
+its command line holds `--args <fd>` and the command, and neither the
+option list nor the descriptor numbers in it. The mounts themselves stay
+visible: `/proc/self/mountinfo` inside shows each bind's source path
+within its filesystem, which no bind mount can hide, and where the host's
+`kernel.yama.ptrace_scope` is 0 a sandboxed process of the same uid can
+read the options from bwrap's memory. Every sidecar bubbler wraps in a
+bwrap of its own gets the same 64 MiB cap on the two tmpfs mounts it has,
+its `/etc` and its `/tmp`. The forked child also joins a session keyring
+of its own (`keyctl(2)` `KEYCTL_JOIN_SESSION_KEYRING` with a null name)
+right before it execs `bwrap`, so it never inherits the login session
+keyring bubbler itself runs on; `keyctl` is on the `EPERM` denylist by
+default, but a profile may take it off, and without the join the keys
+behind `@s` would be the user's rather than this instance's. All
+namespaces are unshared — except the network one under `network "host"`,
+which is the whole of that grant; `--die-with-parent` and `--new-session`
+are always on. Bind order is semantics — a later `--tmpfs /run` would
+silently shadow a socket bound under it — so the builder emits in fixed
+phases and no service controls global order.
 
 **Does not defend:** anything you bind in. `home-share`, `path-share`,
 `etc-share` and `dri` are grants, and a grant is what it says it is. A

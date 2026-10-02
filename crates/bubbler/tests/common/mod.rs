@@ -495,76 +495,92 @@ pub fn kill_group(child: &Child) {
     let _ = kill_process_group(Pid::from_child(child), Signal::KILL);
 }
 
-/// Whether a `bwrap` is still running whose command line, or one of whose
-/// mounts written `<host source> <destination>`, holds `needle`. A run
-/// that has ended must leave none: bubbler tears its sandboxes down
-/// itself, and `--die-with-parent` is only the backstop behind that.
-///
-/// The mounts because bwrap's options reach it through `--args` and are
-/// not on its command line; what it bound is in its `mountinfo`.
-pub fn bwrap_alive(needle: &str) -> bool {
-    if process_running("bwrap", needle) {
-        return true;
-    }
-    let Ok(procs) = std::fs::read_dir("/proc") else {
-        return false;
-    };
-    let host = host_mount_points();
-    procs
-        .flatten()
-        .filter(|e| {
-            std::fs::read(e.path().join("cmdline")).is_ok_and(|c| {
-                c.split(|b| *b == 0)
-                    .next()
-                    .is_some_and(|program| program.ends_with(b"bwrap"))
-            })
-        })
-        .filter_map(|e| std::fs::read_to_string(e.path().join("mountinfo")).ok())
-        .any(|info| {
-            info.lines().any(|line| {
-                let f: Vec<&str> = line.split(' ').collect();
-                let Some(prefix) = f.get(2).and_then(|dev| host.get(*dev)) else {
-                    return false;
-                };
-                let source = format!("{}{}", prefix.trim_end_matches('/'), f[3]);
-                format!("{source} {}", f[4]).contains(needle)
-            })
-        })
+/// One process, by pid and the start time `/proc/<pid>/stat` gives it,
+/// so a pid the kernel hands out again later is not taken for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Started {
+    pid: i32,
+    start: u64,
 }
 
-/// Where each filesystem's root is mounted on the host, by `maj:min`.
-fn host_mount_points() -> std::collections::HashMap<String, String> {
-    let info = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
-    let mut points = std::collections::HashMap::new();
-    for line in info.lines() {
-        let f: Vec<&str> = line.split(' ').collect();
-        if f.len() > 4 && f[3] == "/" {
-            points
-                .entry(f[2].to_owned())
-                .or_insert_with(|| f[4].to_owned());
+/// Every `bwrap` below `pid` in the process tree: a run's sandbox and its
+/// sidecars', when `pid` is the run's bubbler. Read while the run is up,
+/// since a bwrap left behind is no longer below it once bubbler is gone.
+pub fn bwraps_under(pid: u32) -> Vec<Started> {
+    let procs: Vec<(i32, Stat)> = all_pids()
+        .filter_map(|p| stat_of(p).map(|s| (p, s)))
+        .collect();
+    let mut below = vec![pid as i32];
+    let mut found = Vec::new();
+    while let Some(parent) = below.pop() {
+        for (child, stat) in procs.iter().filter(|(_, s)| s.ppid == parent) {
+            below.push(*child);
+            if stat.comm == "bwrap" {
+                found.push(Started {
+                    pid: *child,
+                    start: stat.start,
+                });
+            }
         }
     }
-    points
+    found
+}
+
+/// Whether any of `bwraps` is still running. A run that has ended must
+/// leave none: bubbler tears its sandboxes down itself, and
+/// `--die-with-parent` is only the backstop behind that.
+pub fn bwrap_alive(bwraps: &[Started]) -> bool {
+    bwraps
+        .iter()
+        .any(|b| stat_of(b.pid).is_some_and(|s| s.start == b.start && s.state != 'Z'))
+}
+
+/// What [`bwraps_under`] reads of one `/proc/<pid>/stat`.
+struct Stat {
+    comm: String,
+    state: char,
+    ppid: i32,
+    start: u64,
+}
+
+fn stat_of(pid: i32) -> Option<Stat> {
+    let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The name is in parentheses and may hold spaces or parentheses of
+    // its own, so the fields after it are counted from the last `)`.
+    let (head, tail) = raw.rsplit_once(')')?;
+    let comm = head.split_once('(')?.1.to_owned();
+    let fields: Vec<&str> = tail.split_whitespace().collect();
+    Some(Stat {
+        comm,
+        state: fields.first()?.chars().next()?,
+        ppid: fields.get(1)?.parse().ok()?,
+        start: fields.get(19)?.parse().ok()?,
+    })
+}
+
+fn all_pids() -> impl Iterator<Item = i32> {
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse().ok())
 }
 
 /// Whether some process has `program` and `needle` in its command line.
 /// Read from `/proc` directly: `pgrep` is procps-ng, which a clean build
 /// chroot does not have.
 pub fn process_running(program: &str, needle: &str) -> bool {
-    let Ok(procs) = std::fs::read_dir("/proc") else {
-        return false;
-    };
-    procs
-        .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .bytes()
-                .all(|b| b.is_ascii_digit())
-        })
-        .filter_map(|e| std::fs::read(e.path().join("cmdline")).ok())
+    !command_lines(program, needle).is_empty()
+}
+
+/// The command line, its words joined by spaces, of every process that
+/// has `program` and `needle` in it.
+pub fn command_lines(program: &str, needle: &str) -> Vec<String> {
+    all_pids()
+        .filter_map(|pid| std::fs::read(format!("/proc/{pid}/cmdline")).ok())
         .map(|raw| String::from_utf8_lossy(&raw).replace('\0', " "))
-        .any(|line| line.contains(program) && line.contains(needle))
+        .filter(|line| line.contains(program) && line.contains(needle))
+        .collect()
 }
 
 /// Every process of this user's holding a descriptor on `path`, by pid.

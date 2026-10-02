@@ -6,10 +6,10 @@
 
 - The environment bubbler was started in was readable inside every sandbox
   through `/proc/1/environ`; bwrap now starts with an empty one.
-- bwrap's whole argument list — every host path bound in, the instance
-  layout — was readable inside every sandbox through `/proc/1/cmdline`; bwrap
-  now reads its options from a descriptor (`--args`), and its command line
-  holds only that and the command.
+- bwrap's whole option list was readable inside every sandbox through
+  `/proc/1/cmdline`; bwrap now reads its options from a descriptor (`--args`),
+  and its command line holds only that and the command. The bind sources
+  stay visible in `/proc/self/mountinfo`, as with any bind mount.
 - The four bwrap sidecars (Wayland proxy, PipeWire context holder, private
   pulse server, D-Bus proxy) inherited bubbler's stdin, stdout and stderr, so
   one compromised through the sandbox held the caller's terminal; they now get

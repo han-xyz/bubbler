@@ -320,6 +320,12 @@ impl RealAlloc {
     /// a pipe so nothing has to write while bwrap reads, whatever the
     /// length; kept with the other fds, so only this spawn inherits it.
     fn options(&mut self, options: &[OsString]) -> io::Result<OsString> {
+        if let Some(option) = options.iter().find(|o| o.as_bytes().contains(&0)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("a bwrap option holds a NUL byte: {option:?}"),
+            ));
+        }
         let fd = rustix::fs::memfd_create(
             "bubbler-args",
             MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
@@ -5854,6 +5860,22 @@ mod tests {
             .read_to_string(&mut got)
             .unwrap();
         assert_eq!(got, "hello");
+    }
+
+    /// bwrap splits its `--args` data at every NUL, so an option holding
+    /// one would arrive as two.
+    #[test]
+    fn real_alloc_options_refuse_an_option_holding_a_nul() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut alloc = RealAlloc::sidecar(no_data_dir());
+        let options = [
+            OsString::from("--setenv"),
+            OsString::from_vec(b"A\0--bind".to_vec()),
+            OsString::from("x"),
+        ];
+        let err = alloc.options(&options).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(alloc.fds.is_empty());
     }
 
     #[test]
