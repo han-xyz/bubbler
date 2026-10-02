@@ -136,9 +136,15 @@ local factories = ObjectManager {
 }
 factories:activate ()
 
+-- Before the permission manager attaches, not after: the attach is the
+-- update that lets the client's held requests through, and a hook after
+-- it runs one main-loop turn later — measured on WirePlumber 0.5.18,
+-- long enough for a fresh connection to create a link with the factory
+-- still readable. The explicit entry set here survives the attach, which
+-- changes the default and the objects its rules match, never a factory.
 SimpleEventHook {
   name = "bubbler/hide-link-factory",
-  after = "client/apply-access",
+  before = "client/apply-access",
   interests = {
     EventInterest {
       Constraint { "event.type", "=", "select-access" },
@@ -164,21 +170,47 @@ SimpleEventHook {
   end
 }:register ()
 
+-- Whether WirePlumber made `link`. The daemon writes the creator's id
+-- into `client.id` only on a link that does not linger (PipeWire 1.6.9,
+-- module-link-factory.c); a lingering link carries whatever its creator
+-- sent, so there the id proves nothing.
+local function made_by_wireplumber (link)
+  local linger = link.properties ["object.linger"]
+  return linger ~= "true" and linger ~= "1" and
+      link.properties ["client.id"] == tostring (Core.get_own_bound_id ())
+end
+
+-- Whether the node `node_id` names belongs to a bubbler context.
+local function bubbler_node (source, node_id)
+  local nodes = source:call ("get-object-manager", "node")
+  local node = nodes:lookup {
+    Constraint { "bound-id", "=", node_id, type = "gobject" },
+  }
+  return node ~= nil and
+      bubbler_client (source, node.properties ["client.id"]) ~= nil
+end
+
 SimpleEventHook {
-  name = "bubbler/destroy-self-made-link",
+  name = "bubbler/destroy-link-wireplumber-did-not-make",
   interests = {
     EventInterest {
       Constraint { "event.type", "=", "link-added" },
     },
   },
   execute = function (event)
+    local source = event:get_source ()
     local link = event:get_subject ()
-    -- A link WirePlumber makes on a sandbox's behalf carries its own
-    -- client id, not the sandbox's, so this reaches only a link the
-    -- sandbox created for itself — which the hidden factory should
-    -- already have refused.
-    if bubbler_client (event:get_source (), link.properties ["client.id"]) then
-      log:warning (link, "destroying a link a bubbler context made for itself")
+    if made_by_wireplumber (link) then
+      return
+    end
+    -- By the link's ends, not its creator: a link a sandbox won before
+    -- its factory was hidden lingers with no creator on it at all, and
+    -- any other client's link into a sandbox is one the policy above
+    -- would have refused.
+    if bubbler_node (source, link.properties ["link.output.node"]) or
+        bubbler_node (source, link.properties ["link.input.node"]) then
+      log:warning (link, "destroying a link to a bubbler context that \
+          WirePlumber did not make")
       link:request_destroy ()
     end
   end

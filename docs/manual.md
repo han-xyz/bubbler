@@ -616,7 +616,13 @@ What scopes a bare grant to playback is bubbler's WirePlumber policy
 installed on the host, not the socket — the drop-in and the linking hook
 it loads, see "Installing" below — and without the drop-in a sandbox
 reaches every node the config did not ask for, while without the hook the
-grant is scoped and every other client's audio stays recordable;
+grant is scoped and every other client's audio stays recordable.
+The hook also keeps a sandbox from linking anything itself, and destroys
+any link into a sandbox that WirePlumber did not make, one you draw in a
+patchbay included. Before 0.24.2 a sandbox could still win such a link
+in the first instant of a new connection, now and then, and keep it; a
+policy installed by an older bubbler keeps that open until both files are
+reinstalled and WirePlumber restarted (see "Installing").
 `bubbler lint` warns `audio-policy-missing`, and a run missing both
 prints `bubbler: warning: audio policy drop-in and hook script not found
 (50-bubbler.conf, bubbler/refuse-links.lua): the sandbox has full access
@@ -4243,6 +4249,11 @@ reaches every PipeWire node instead of what it asks for; without the
 hook beside it the grant is scoped but a sandbox can still record the
 sink's monitor ports, which carry every other application's audio. A run
 and `bubbler lint` say which of the two is missing.
+
+Run the same commands again after an upgrade that changes the policy —
+0.24.2 does — and restart WirePlumber: a copy you wrote yourself is not
+updated by the upgrade, and a running WirePlumber keeps the hook it
+started with.
 
 Packaging lives in a repository of its own, not in this one.
 

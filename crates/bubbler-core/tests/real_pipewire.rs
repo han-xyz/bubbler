@@ -817,8 +817,13 @@ fn a_playback_context_sees_no_source_no_metadata_and_only_reads_streams() {
         "Stream/Output/Audio",
     );
 
-    let seen = bed.in_context(PLAYBACK, "pw-dump");
-    assert!(seen.contains("\"node.name\": \"bed-sink\""), "{seen}");
+    // A dump taken before the session manager has granted this context
+    // anything is empty, and would pass every negative assertion below.
+    let mut seen = String::new();
+    wait_for("the sink in a playback context's dump", || {
+        seen = bed.in_context(PLAYBACK, "pw-dump");
+        seen.contains("\"node.name\": \"bed-sink\"")
+    });
     assert!(!seen.contains("\"node.name\": \"bed-source\""), "{seen}");
     // `metadata.name` is on the metadata objects and on nothing else;
     // the interface name is also the metadata *factory*'s type, which
@@ -1027,13 +1032,22 @@ fn no_context_makes_a_link_of_its_own() {
         );
 
         for source in ["bed-sink:monitor_FL", "pw-cat:output_FL"] {
+            // `pw-link` says the same words for a port it cannot find and
+            // a link it was refused (measured), so the refusal below only
+            // counts once the context is known to see both ports.
+            wait_for(&format!("{source} in the {grant} context's view"), || {
+                let ports = bed.in_context(props, "pw-link -io");
+                ports.contains(source) && ports.contains("pw-record:input_FL")
+            });
             let refused =
                 bed.output_in_context(props, &format!("pw-link -L {source} pw-record:input_FL"));
             // `pw-link` exits 0 whatever the daemon answers (measured),
-            // so what it was told is on its stderr and the graph below
-            // is the rest of the measurement.
+            // so what it was told is on its stderr: the hidden factory's
+            // ENOENT, and not the EINVAL of a link made and destroyed
+            // before it settled, nor the silence of one that stayed.
             assert!(
-                String::from_utf8_lossy(&refused.stderr).contains("failed to link ports"),
+                String::from_utf8_lossy(&refused.stderr)
+                    .contains("failed to link ports: No such file or directory"),
                 "a {grant} context linked {source} to its own capture stream: {refused:?}"
             );
         }
@@ -1043,6 +1057,171 @@ fn no_context_makes_a_link_of_its_own() {
             "a {grant} context linked itself to something:\n{links}"
         );
     }
+}
+
+/// How long the test below keeps opening fresh contexts: long enough for
+/// a few hundred, short enough for the normal suite.
+const FRESH_CONTEXTS_FOR: Duration = Duration::from_secs(3);
+
+/// The longest a forbidden link may be seen alive. Not zero: should a
+/// context ever win a link again, the linking hook destroys it once
+/// WirePlumber sees it, and this bounds how long that may take.
+const FORBIDDEN_LINK_LIFE: Duration = Duration::from_millis(500);
+
+#[test]
+fn no_fresh_context_keeps_a_link_it_asks_for_in_its_first_instant() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let wav = bed.dir().join("tone.wav");
+    silence(&wav);
+    let _other = streaming(
+        &bed,
+        PLAYBACK,
+        &format!("sh -c 'while :; do pw-cat -p {}; done'", wav.display()),
+        "Stream/Output/Audio",
+    );
+    let out = bed.dir().join("stolen.wav");
+    let _thief = streaming(
+        &bed,
+        PLAYBACK,
+        &format!(
+            "pw-record -P '{{ node.autoconnect = false }}' {}",
+            out.display()
+        ),
+        "Stream/Input/Audio",
+    );
+
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let watcher = scope.spawn(|| {
+            let mut longest = Duration::ZERO;
+            let mut alive_since = None;
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                let now = Instant::now();
+                if bed.links().contains("pw-record:input_") {
+                    longest = longest.max(now - *alive_since.get_or_insert(now));
+                } else {
+                    alive_since = None;
+                }
+            }
+            longest
+        });
+        // Every call is a new connection in a new context, each with the
+        // instant before the session manager has acted on it.
+        let deadline = Instant::now() + FRESH_CONTEXTS_FOR;
+        let mut attempts = 0;
+        while Instant::now() < deadline {
+            let props = [PLAYBACK, PLAYBACK_MICROPHONE][attempts % 2];
+            let source = ["bed-sink:monitor_FL", "pw-cat:output_FL"][attempts / 2 % 2];
+            bed.output_in_context(props, &format!("pw-link -L {source} pw-record:input_FL"));
+            attempts += 1;
+        }
+        std::thread::sleep(FORBIDDEN_LINK_LIFE);
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let longest = watcher.join().expect("the watcher thread");
+        assert!(
+            longest < FORBIDDEN_LINK_LIFE,
+            "a link a context made for itself was seen alive for {longest:?} in {attempts} attempts"
+        );
+    });
+    let links = bed.links();
+    assert!(
+        !links.contains("pw-record:input_"),
+        "a link a context made for itself outlived the attempts:\n{links}"
+    );
+}
+
+#[test]
+fn a_link_to_a_bubbler_context_that_wireplumber_did_not_make_is_destroyed() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let _player = streaming(
+        &bed,
+        PLAYBACK,
+        "pw-cat -p -a -P '{ node.name = player }' - < /dev/zero",
+        "Stream/Output/Audio",
+    );
+    let _microphone = streaming(
+        &bed,
+        PLAYBACK_MICROPHONE,
+        "pw-cat -r -a -P '{ node.name = microphone }' /dev/null",
+        "Stream/Input/Audio",
+    );
+    // WirePlumber's own links for both permitted paths, by link id: a
+    // hook that destroyed them too would leave them relinked under a new
+    // id at best.
+    let permitted = || {
+        bed.host_tool("pw-link", &["-l", "-I"])
+            .lines()
+            .filter(|line| {
+                line.contains('|')
+                    && (line.contains("player:output_") || line.contains("microphone:input_"))
+            })
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let mut before = Vec::new();
+    wait_for(
+        "WirePlumber's links for the player and the microphone",
+        || {
+            before = permitted();
+            ["player:", "microphone:"]
+                .iter()
+                .all(|node| before.iter().any(|link| link.contains(node)))
+        },
+    );
+    let out = bed.dir().join("stolen.wav");
+    let _thief = streaming(
+        &bed,
+        PLAYBACK,
+        &format!(
+            "pw-record -P '{{ node.autoconnect = false, node.name = thief }}' {}",
+            out.display()
+        ),
+        "Stream/Input/Audio",
+    );
+    // The microphone's node already answers to the thief's media class.
+    wait_for("the thief's capture port", || {
+        bed.host_tool("pw-link", &["-i"]).contains("thief:input_FL")
+    });
+    let wireplumber = object(&bed.info_from_host(), &[r#"wireplumber.daemon = "true""#])
+        .expect("WirePlumber's client")
+        .id;
+
+    // From the host, so it is not the link factory that stops it; and a
+    // lingering link carries whatever `client.id` its creator gives it,
+    // so the second claims to be WirePlumber's.
+    for claim in [
+        "{}".to_owned(),
+        format!(r#"{{ "client.id": "{wireplumber}" }}"#),
+    ] {
+        for source in ["bed-sink:monitor_FL", "player:output_FL"] {
+            let made = bed
+                .command("pw-link")
+                .args(["-L", "-p", &claim, source, "thief:input_FL"])
+                .output()
+                .expect("pw-link did not run");
+            // EINVAL is `pw-link`'s word for a link removed before it
+            // settled (pw-link.c `link_proxy_destroy`): made, and
+            // destroyed faster than it could negotiate.
+            let said = String::from_utf8_lossy(&made.stderr);
+            assert!(
+                said.is_empty() || said.contains("failed to link ports: Invalid argument"),
+                "the host did not get its link from {source}: {made:?}"
+            );
+            wait_for(
+                &format!("the end of a link from {source} claiming {claim}"),
+                || !bed.links().contains("thief:input_"),
+            );
+        }
+    }
+    let after = permitted();
+    assert!(
+        before.iter().all(|link| after.contains(link)),
+        "WirePlumber's own links did not survive:\n{before:#?}\n{after:#?}"
+    );
 }
 
 #[test]

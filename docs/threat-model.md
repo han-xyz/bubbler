@@ -884,10 +884,32 @@ withholds every permission on the `link-factory` global from an
 on the sandbox's behalf. Read alone is not enough — measured on 1.6.8,
 the core asks only for read on that global — and a permission-manager
 rule cannot express it either: the managers' `rules` are not applied to
-factory globals, measured on WirePlumber 0.5.15. A link a bubbler
-context did make is destroyed on sight as well, which is belt and
-braces: a link WirePlumber makes for a sandbox carries WirePlumber's own
-`client.id`, never the sandbox's.
+factory globals, measured on WirePlumber 0.5.15.
+
+Up to 0.24.1 that held only most of the time. The hook hid the factory
+one WirePlumber main-loop turn after `client/apply-access` had attached
+the permission manager, and a fresh connection that asked for a
+lingering link in between got one: measured on WirePlumber 0.5.18 under
+load, 4 links in 1400 attempts, each alive until observation stopped —
+the sink's monitor or another client's stream into the sandbox's own
+capture stream — and a sandbox can open connections and retry for as
+long as it likes. Since 0.24.2 the hook hides the factory *before* the
+manager attaches. The daemon holds a restricted client's requests until
+it may read the core, which the attach is what grants, and the attach
+changes only the default and the objects its rules match — never a
+factory — so no request of the sandbox's meets a readable factory: 0 in
+1400 attempts under the same load. Behind that, any link that touches a
+node of an `org.bubbler` client and that WirePlumber did not make is
+destroyed when WirePlumber sees it, whoever made it and whether or not
+its maker is still connected. That is decided by the link's two ends,
+not its maker: the daemon writes `client.id` only on a link that does
+not linger, so a lingering link names whatever creator it likes. With
+the factory deliberately left open, such a link lived 0.6 ms at most.
+This also cuts a link the user draws into a sandboxed stream by hand in
+a patchbay. Both changes apply once the policy files are reinstalled —
+`bubbler audio-policy --print` and `bubbler audio-policy --print
+--script` into the places they were installed — and WirePlumber is
+restarted; a running WirePlumber keeps the hook it started with.
 The same rule refuses a sandboxed JACK client's own connections
 (`jack_connect` and the patchbay tools), so an audio application that
 wires its graph by hand plays only what WirePlumber links for it.

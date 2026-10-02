@@ -33,6 +33,14 @@
   processes in a user namespace outside the sandbox's ancestry, such as
   another sandbox's egress proxy. The application could not reach it either
   way: it runs in a nested user namespace and a pid namespace of its own.
+- A sandbox with a `pipewire` or `pulseaudio` grant could, now and then,
+  make a link of its own in the first instant of a new PipeWire connection
+  and keep it, recording the output mix or another application's stream
+  without the `microphone` grant. The linking hook now hides the link factory
+  before WirePlumber grants the connection anything, and destroys any link
+  into a sandbox that WirePlumber did not make. Reinstall the policy
+  (`bubbler audio-policy --print`, `--print --script`) and restart
+  WirePlumber.
 
 ## 0.24.1
 
