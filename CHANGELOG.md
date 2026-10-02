@@ -29,8 +29,10 @@
   plain IPv4 ones.
 - The egress proxy was dumpable, though the threat model says otherwise:
   `execve` reset the flag bubbler set before it. The proxy now makes itself
-  non-dumpable, so a process in the sandbox's user namespace without
-  `CAP_SYS_PTRACE` cannot read its memory or descriptors.
+  non-dumpable, which stops a core dump of it and turns away the user's
+  processes in a user namespace outside the sandbox's ancestry, such as
+  another sandbox's egress proxy. The application could not reach it either
+  way: it runs in a nested user namespace and a pid namespace of its own.
 
 ## 0.24.1
 

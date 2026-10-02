@@ -5929,13 +5929,29 @@ fn real_allow_host_the_egress_proxy_holds_no_terminal_of_the_callers() {
 const NSENTER: &str = "/usr/bin/nsenter";
 const SETPRIV: &str = "/usr/bin/setpriv";
 
-/// The egress proxy parses what the sandbox sends it, so it is
-/// non-dumpable: a process of the user's in the sandbox's user namespace
-/// with no capability there cannot read its descriptors. This test can
-/// read them itself, as the namespace's owner, whose root it maps to.
+/// [`SETPRIV`] running the rest of its argv with no capability, as the
+/// egress proxy runs.
+const NO_CAPABILITY: [&str; 6] = [
+    SETPRIV,
+    "--securebits=+noroot,+noroot_locked",
+    "--bounding-set=-all",
+    "--inh-caps=-all",
+    "--ambient-caps=-all",
+    "--",
+];
+
+/// The egress proxy is non-dumpable: a process of the user's in the user
+/// namespace the proxy joined (bwrap's outer one) with no capability there
+/// cannot read its descriptors. The application cannot reach it either
+/// way, from a nested user namespace and a pid namespace of its own; this
+/// test can, as the namespace's owner, whose root it maps to.
 #[test]
 fn real_allow_host_the_egress_proxy_is_not_dumpable() {
-    if !require_egress() || !require_host_program(NSENTER) || !require_host_program(SETPRIV) {
+    if !require_egress()
+        || !require_host_program(NSENTER)
+        || !require_host_program(SETPRIV)
+        || !require_host_program(UNSHARE)
+    {
         return;
     }
     let Some(init) = real_init() else { return };
@@ -5977,15 +5993,11 @@ fn real_allow_host_the_egress_proxy_is_not_dumpable() {
     );
     let read_from_inside = |pid: i32| {
         Command::new(NSENTER)
+            .env("LC_ALL", "C")
             .arg("--preserve-credentials")
             .arg(format!("--user=/proc/{pid}/ns/user"))
-            .args([SETPRIV, "--securebits=+noroot,+noroot_locked"])
-            .args([
-                "--bounding-set=-all",
-                "--inh-caps=-all",
-                "--ambient-caps=-all",
-            ])
-            .args(["--", "/usr/bin/readlink", "-v"])
+            .args(NO_CAPABILITY)
+            .args(["/usr/bin/readlink", "-v"])
             .arg(format!("/proc/{pid}/fd/0"))
             .output()
             .unwrap()
@@ -6015,6 +6027,37 @@ fn real_allow_host_the_egress_proxy_is_not_dumpable() {
         "the egress proxy's descriptors were readable from inside: {last:?}"
     );
     assert_eq!(out.status.code(), Some(0), "{err}");
+    // The same probe reads a dumpable process with no capability, like the
+    // proxy's, in a namespace mapped the same way: the denial above is the
+    // flag and not the probe.
+    let mut dumpable = Command::new(UNSHARE)
+        .args(["--user", "--map-root-user"])
+        .args(NO_CAPABILITY)
+        .args(["/usr/bin/sleep", "10"])
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = dumpable.id() as i32;
+    let mut probe = None;
+    let read = wait_until(
+        || {
+            let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+            if comm != "sleep\n" {
+                return false;
+            }
+            let out = read_from_inside(pid);
+            let ok = out.status.success();
+            probe = Some(out);
+            ok
+        },
+        Duration::from_secs(2),
+    );
+    dumpable.kill().unwrap();
+    dumpable.wait().unwrap();
+    assert!(
+        read,
+        "the probe could not read a dumpable process: {probe:?}"
+    );
 }
 
 /// What a sidecar says on stderr still reaches the caller, and the run log
