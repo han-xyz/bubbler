@@ -38,6 +38,14 @@ pub const LOG_FILE: &str = "last-run.log";
 /// file, not one writer's share of it.
 pub const MAX_BYTES: u64 = 1 << 20;
 
+/// Kept free under [`MAX_BYTES`] by every writer but a start that ended
+/// without binding, so that start's error is recorded even when the run
+/// before it filled the log, which it appends to rather than empties.
+const FAILURE_ROOM: u64 = 4096;
+
+/// Where the output of a run, a start that joined one and an exec stops.
+const RUN_CAP: u64 = MAX_BYTES - FAILURE_ROOM;
+
 /// Written once, in place of the output that no longer fits.
 const NOTE: &str = "\nbubbler: log full; the rest of this run's output was dropped\n";
 
@@ -94,9 +102,10 @@ fn open(path: &Path, flags: OFlags) -> io::Result<OwnedFd> {
 /// fd 2 pointed at an instance's log for as long as this lives. Dropping
 /// it puts the caller's own stderr back.
 pub struct Redirect {
-    /// Where [`Redirect::started`] or [`Redirect::joined`] tells the
-    /// copying thread whether the log is emptied first.
-    settle: Option<SyncSender<bool>>,
+    /// Where [`Redirect::started`], [`Redirect::joined`] or
+    /// [`Redirect::not_started`] tells the copying thread the cap its
+    /// copy stops at; dropped unsettled, the thread empties the log first.
+    settle: Option<SyncSender<u64>>,
     /// The log, when it is to be emptied, for [`Redirect::started`] to
     /// empty before it returns.
     to_empty: Option<OwnedFd>,
@@ -164,15 +173,20 @@ fn start(path: &Path, truncate: bool, keep_stderr: bool) -> Result<Redirect, Lau
         // A sender dropped unused is the redirect dropped before the run
         // said, which keeps what was asked for. A failed truncation costs
         // the old run's lines staying ahead of this one's, nothing more.
-        if truncate && settled.recv().unwrap_or(true) {
-            let _ = rustix::fs::ftruncate(&file, 0);
-        }
+        let cap = match truncate {
+            true => settled.recv().unwrap_or_else(|_| {
+                let _ = rustix::fs::ftruncate(&file, 0);
+                RUN_CAP
+            }),
+            false => RUN_CAP,
+        };
         let file = std::fs::File::from(file);
         let mut stderr = stderr.map(|fd| Blocking(std::fs::File::from(fd)));
         let _ = copy_capped(
             std::fs::File::from(reader),
             &file,
             || file.metadata().map(|m| m.len()),
+            cap,
             stderr.as_mut().map(|f| f as &mut dyn Write),
         );
         // A send that finds nobody waiting is the caller having given up
@@ -199,25 +213,26 @@ impl Redirect {
         if let Some(file) = &self.to_empty {
             let _ = rustix::fs::ftruncate(file, 0);
         }
-        self.settle_on(false);
+        self.settle_on(RUN_CAP);
     }
 
     /// This run joined one that is already up: what it writes is added
     /// to that run's log.
     pub fn joined(&self) {
-        self.settle_on(false);
+        self.settle_on(RUN_CAP);
     }
 
     /// This run ended without starting the sandbox: what it wrote is
-    /// added to the log, which may be the one a running start is writing.
+    /// added to the log, which may be the one a running start is writing,
+    /// and may use the room every other writer leaves free.
     pub fn not_started(&self) {
-        self.settle_on(false);
+        self.settle_on(MAX_BYTES);
     }
 
     /// The first answer is the one that counts; the channel holds one.
-    fn settle_on(&self, truncate: bool) {
+    fn settle_on(&self, cap: u64) {
         if let Some(settle) = &self.settle {
-            let _ = settle.try_send(truncate);
+            let _ = settle.try_send(cap);
         }
     }
 
@@ -266,6 +281,7 @@ pub fn relay() -> Result<(OwnedFd, Relay), LaunchError> {
             std::fs::File::from(reader),
             io::sink(),
             || Ok(0),
+            RUN_CAP,
             Some(&mut stderr),
         );
         let _ = tx.send(());
@@ -286,7 +302,7 @@ impl Drop for Relay {
     }
 }
 
-/// Copy `src` to `dst` while `size` reports room under [`MAX_BYTES`],
+/// Copy `src` to `dst` while `size` reports room under `cap`,
 /// then say once that the rest was dropped and keep reading. Draining to
 /// the end matters: a writer whose pipe fills stops dead, and the writer
 /// here is the sandbox.
@@ -306,6 +322,7 @@ fn copy_capped(
     mut src: impl Read,
     dst: impl Write,
     mut size: impl FnMut() -> io::Result<u64>,
+    cap: u64,
     mut stderr: Option<&mut dyn Write>,
 ) -> io::Result<()> {
     let teeing = stderr.is_some();
@@ -320,14 +337,14 @@ fn copy_capped(
             Err(e) => return Err(e),
         };
         if let Some(file) = dst.as_mut()
-            && let Err(e) = append_capped(&mut *file, &buf[..read], &mut size, &mut noted)
+            && let Err(e) = append_capped(&mut *file, &buf[..read], &mut size, cap, &mut noted)
         {
             if !teeing {
                 return Err(e);
             }
             // The log just failed, so the note may not land either, and it
             // is only tried where the file says there is room for it.
-            if size().is_ok_and(|held| held + STOPPED.len() as u64 <= MAX_BYTES) {
+            if size().is_ok_and(|held| held + STOPPED.len() as u64 <= cap) {
                 let _ = file.write_all(STOPPED.as_bytes());
             }
             dst = None;
@@ -364,18 +381,19 @@ impl Write for Blocking {
     }
 }
 
-/// Write what of `chunk` fits under [`MAX_BYTES`] to `dst`, and the note
-/// the first time something does not.
+/// Write what of `chunk` fits under `cap` to `dst`, and the note the
+/// first time something does not.
 fn append_capped(
     mut dst: impl Write,
     chunk: &[u8],
     size: &mut impl FnMut() -> io::Result<u64>,
+    cap: u64,
     noted: &mut bool,
 ) -> io::Result<()> {
     let note = NOTE.len() as u64;
     // The note is kept out of the room for output, so writing it is
     // never what takes the file over the cap.
-    let room = MAX_BYTES.saturating_sub(size()?);
+    let room = cap.saturating_sub(size()?);
     let take = usize::try_from(room.saturating_sub(note))
         .unwrap_or(usize::MAX)
         .min(chunk.len());
@@ -404,6 +422,7 @@ mod tests {
             input,
             Shared(&out),
             || Ok(held + out.borrow().len() as u64),
+            MAX_BYTES,
             None,
         )
         .unwrap();
@@ -449,6 +468,7 @@ mod tests {
             &flood[..],
             Shared(&out),
             || Ok(MAX_BYTES - 100 + out.borrow().len() as u64),
+            MAX_BYTES,
             Some(&mut stderr),
         )
         .unwrap();
@@ -462,6 +482,7 @@ mod tests {
             &b"hello"[..],
             Shared(&out),
             || Ok(out.borrow().len() as u64),
+            MAX_BYTES,
             Some(&mut Failing(io::ErrorKind::BrokenPipe)),
         )
         .unwrap();
@@ -474,6 +495,7 @@ mod tests {
             (&b"one"[..]).chain(&b"two"[..]),
             Shared(&out),
             || Ok(out.borrow().len() as u64),
+            MAX_BYTES,
             Some(&mut stderr),
         )
         .unwrap();
@@ -488,6 +510,7 @@ mod tests {
             (&b"one"[..]).chain(&b"two"[..]),
             Failing(io::ErrorKind::StorageFull),
             || Ok(0),
+            MAX_BYTES,
             Some(&mut stderr),
         )
         .unwrap();
@@ -498,6 +521,7 @@ mod tests {
             (&b"one"[..]).chain(&b"two"[..]),
             Vec::new(),
             || Err(io::ErrorKind::Other.into()),
+            MAX_BYTES,
             Some(&mut stderr),
         )
         .unwrap();
@@ -515,6 +539,7 @@ mod tests {
                 held if failed.replace(true) => Ok(held as u64),
                 _ => Err(io::ErrorKind::Other.into()),
             },
+            MAX_BYTES,
             Some(&mut stderr),
         )
         .unwrap();
@@ -534,6 +559,7 @@ mod tests {
                     _ => Ok(MAX_BYTES - 1),
                 }
             },
+            MAX_BYTES,
             Some(&mut Vec::new()),
         )
         .unwrap();
@@ -553,7 +579,14 @@ mod tests {
         });
         let flood = vec![b'x'; 1 << 20];
         let mut stderr = Blocking(std::fs::File::from(writer));
-        copy_capped(&flood[..], io::sink(), || Ok(0), Some(&mut stderr)).unwrap();
+        copy_capped(
+            &flood[..],
+            io::sink(),
+            || Ok(0),
+            MAX_BYTES,
+            Some(&mut stderr),
+        )
+        .unwrap();
         drop(stderr);
         assert_eq!(drain.join().unwrap().len(), flood.len());
     }
@@ -592,6 +625,29 @@ mod tests {
         // room for nothing but the note is left alone too.
         assert!(capped(&flood, MAX_BYTES).is_empty());
         assert!(capped(&flood, MAX_BYTES - 1).is_empty());
+    }
+
+    #[test]
+    fn a_start_that_did_not_bind_is_recorded_in_a_log_the_last_run_filled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = path(tmp.path());
+
+        let run = redirect(&log, true).unwrap();
+        run.started();
+        io::stderr().write_all(&vec![b'x'; 2 << 20]).unwrap();
+        drop(run);
+
+        let failed = "bubbler: the start failed before its lock\n";
+        let start = redirect(&log, true).unwrap();
+        io::stderr().write_all(failed.as_bytes()).unwrap();
+        start.not_started();
+        drop(start);
+
+        let held = read(&log).unwrap().unwrap();
+        let said = String::from_utf8_lossy(&held);
+        assert!(said.contains(NOTE), "the run did not fill the log");
+        assert!(said.contains(failed), "the failure was not recorded");
+        assert!(held.len() as u64 <= MAX_BYTES, "{}", held.len());
     }
 
     #[test]
