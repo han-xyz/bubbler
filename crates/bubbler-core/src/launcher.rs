@@ -3897,7 +3897,15 @@ fn start_and_wait(
             match started {
                 Ok(handle) => Some(handle),
                 Err(e) => {
+                    // A Ctrl-C reaches `nft` and the held bwrap too and
+                    // kills them, which is the stop's doing, as in
+                    // `wait_ready`. A bwrap still running when its info
+                    // deadline passed failed on its own.
+                    let bwrap_ended = matches!(child.try_wait(), Ok(Some(_)));
                     abort_sandbox(&mut child, info.as_ref().map(|(pid, _)| *pid));
+                    if stop.load(Ordering::SeqCst) && (info.is_some() || bwrap_ended) {
+                        return Err(LaunchError::Stopped);
+                    }
                     return Err(e);
                 }
             }

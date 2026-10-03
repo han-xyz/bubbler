@@ -10642,6 +10642,52 @@ fn a_signal_to_the_process_group_while_the_egress_proxy_starts_stops_both_sideca
     );
 }
 
+/// `nft` is in bubbler's process group, so a Ctrl-C kills it before it
+/// installs the ruleset: the run ends as stopped, not blaming `nft`.
+#[test]
+fn a_signal_to_the_process_group_while_nft_runs_ends_as_stopped() {
+    if !require_bwrap() || !require_python() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    let bin = tmp.path().join("hanging-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let started = tmp.path().join("nft-started");
+    write_script(
+        &bin.join("nft"),
+        &format!(
+            "#!/usr/bin/sh\n: > '{}'\nexec /usr/bin/sleep 30\n",
+            started.display()
+        ),
+    );
+    let marker = tmp.path().join("data/bubbler/instances/t/home/ran");
+    let run = pasta_case(
+        tmp.path(),
+        &init,
+        "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\" port=443 proto=\"tcp\"\n}\n",
+    )
+    .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+    .args(["run", "t", "--", "/usr/bin/touch", "/home/bubbler/ran"])
+    .process_group(0)
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    if !wait_until(|| started.exists(), Duration::from_secs(10)) {
+        kill_group(&run);
+        fail_with(run, "nft never started");
+    }
+    let (code, err) = interrupt_group(run);
+    assert_eq!(code, Some(143), "{err}");
+    assert!(!err.contains("nft"), "nft was blamed: {err}");
+    assert!(!marker.exists(), "the application ran after the signal");
+}
+
 /// A refusal of the start's own is still reported when a stop signal is
 /// pending as well: bwrap here never writes its info document, which the
 /// run waits out whatever the signal says.
