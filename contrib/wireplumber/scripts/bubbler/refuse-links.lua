@@ -186,23 +186,42 @@ local function offers_devices (client)
   return ("," .. grant .. ","):find (",devices,", 1, true) ~= nil
 end
 
--- Whether a session item of the host's that is no stream — a device or a
--- filter — has a `node.name` or `object.path` among those of `props_list`.
--- A stream pinned to that name would otherwise be aimed at whichever of the
--- two linking/find-defined-target meets first, streams included. A host
--- stream of the same name is left alone: two instances of one application
--- commonly share one.
-local function shadows_a_host_device (source, props_list)
+-- The keys a stock lookup by name matches a target on:
+-- linking/find-defined-target takes a candidate whose `node.name` or
+-- `object.path` is the pinned value, and
+-- linking/find-media-role-sink-target one whose `node.name`, failing
+-- that whose `node.nick`, is the preferred target.
+local NAME_KEYS = { "node.name", "object.path", "node.nick" }
+
+-- Whether `props` has a name among `NAME_KEYS` that is also one of the
+-- device's.
+local function shares_a_name (props, device)
+  for _, key in ipairs (NAME_KEYS) do
+    for _, device_key in ipairs (NAME_KEYS) do
+      if props [key] ~= nil and props [key] == device [device_key] then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+-- Whether a session item that is no stream — a device or a filter — of
+-- the host's, or of a sandbox whose own devices stand beside the host's,
+-- shares a name with any of `props_list`. A stream pinned to that name
+-- would otherwise be aimed at whichever of the two a lookup meets first,
+-- streams included. A host stream of the same name is left alone: two
+-- instances of one application commonly share one.
+local function shadows_a_device (source, props_list)
   for si in source:call ("get-object-manager", "session-item"):iterate {
       type = "SiLinkable" } do
-    local host = si.properties
-    if not (host ["media.class"] or ""):find ("^Stream/") and
-        not bubbler_client (source, host ["client.id"]) then
+    local device = si.properties
+    local owner = bubbler_client (source, device ["client.id"])
+    if not (device ["media.class"] or ""):find ("^Stream/") and
+        (not owner or offers_devices (owner)) then
       for _, props in ipairs (props_list) do
-        for _, key in ipairs { "node.name", "object.path" } do
-          if props [key] ~= nil and props [key] == host [key] then
-            return true
-          end
+        if shares_a_name (props, device) then
+          return true
         end
       end
     end
@@ -212,7 +231,7 @@ end
 
 -- Whether a node with these properties, as they stand now, is kept out of
 -- the session: a node of a sandbox without the device grant that is not a
--- plain audio stream, or that is named after a device of the host's.
+-- plain audio stream, or that shares a name with a device.
 -- `item_props`, where the node has a session item, are what the finders
 -- read: frozen at the item's creation. A stream carries a link group only
 -- as one half of a filter.
@@ -225,7 +244,7 @@ local function kept_from_the_session (source, node_props, item_props)
   return (class ~= AUDIO_STREAM_CLASS.output and
       class ~= AUDIO_STREAM_CLASS.input) or
       node_props ["node.link-group"] ~= nil or
-      shadows_a_host_device (source, { node_props, item_props })
+      shadows_a_device (source, { node_props, item_props })
 end
 
 -- A sandbox offers no device: of its nodes only its plain audio streams
@@ -264,10 +283,11 @@ SimpleEventHook {
 -- WirePlumber restart the node is already in the graph), and a stream
 -- that has since changed its own properties into a filter's (a client
 -- may, and no event follows), or a stream older than the host device it
--- is named after (a headset that reconnects). Default-node selection and the filter chain
--- are rebuilt only in these two rescans and read the node's current
--- properties there (default-nodes/rescan.lua, lib/filter-utils.lua
--- rescanFilters), so removing the item first keeps the node out of both.
+-- is named after (a headset that reconnects). Default-node selection and
+-- the filter chain are rebuilt only in these two rescans and read the
+-- node's current properties there (default-nodes/rescan.lua,
+-- lib/filter-utils.lua rescanFilters), so removing the item first keeps
+-- the node out of both.
 SimpleEventHook {
   name = "bubbler/no-device-from-a-sandbox-on-rescan",
   before = { "default-nodes/rescan", "lib/filter-utils/rescan",

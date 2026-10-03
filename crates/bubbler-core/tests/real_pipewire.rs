@@ -2397,22 +2397,40 @@ fn host_stream(bed: &PipeWireBed, args: &[&str]) -> Streaming {
 fn a_host_stream_pinned_to_a_device_whose_name_a_context_copies_links_to_the_device() {
     a_host_stream_pinned_to_a_device_links_to_it_beside(
         "pw-cat -r -a -P '{ media.class = Audio/Sink, node.name = bed-headset }' /dev/null",
+        "bed-headset",
+        "bed-headset",
     );
 }
 
 /// The same with a capture stream as the copy: WirePlumber resolves a
-/// pinned name over streams too (linking/find-defined-target.lua).
+/// pinned name over streams too, and matches it against either the
+/// `node.name` or the `object.path` of each
+/// (linking/find-defined-target.lua), so the copy may take the device's
+/// `node.name` as its `object.path`, or the reverse.
 #[test]
 fn a_host_stream_pinned_to_a_device_whose_name_a_contexts_stream_copies_links_to_the_device() {
     a_host_stream_pinned_to_a_device_links_to_it_beside(
         "pw-cat -r -a -P '{ node.name = bed-headset }' /dev/null",
+        "bed-headset",
+        "bed-headset",
+    );
+    a_host_stream_pinned_to_a_device_links_to_it_beside(
+        "pw-cat -r -a -P '{ node.name = bed-headset-path }' /dev/null",
+        "bed-headset-path",
+        "bed-headset-path",
+    );
+    a_host_stream_pinned_to_a_device_links_to_it_beside(
+        "pw-cat -r -a -P '{ node.name = shadow, object.path = bed-headset }' /dev/null",
+        "shadow",
+        "bed-headset",
     );
 }
 
-/// A host stream pinned to the host's mono sink `bed-headset` is linked to
-/// it beside `copy`, a node a context names `bed-headset`, whichever of
-/// the two came first.
-fn a_host_stream_pinned_to_a_device_links_to_it_beside(copy: &str) {
+/// A host stream pinned to `target` — the `node.name` (`bed-headset`) or
+/// the `object.path` (`bed-headset-path`) of the host's mono sink — is
+/// linked to the sink beside `copy`, a node a context names `copy_name`,
+/// whichever of the two came first.
+fn a_host_stream_pinned_to_a_device_links_to_it_beside(copy: &str, copy_name: &str, target: &str) {
     let Some(bed) = PipeWireBed::start() else {
         return;
     };
@@ -2426,24 +2444,32 @@ fn a_host_stream_pinned_to_a_device_links_to_it_beside(copy: &str) {
                 "--channels=1",
                 "--channel-map=mono",
                 "-P",
-                "{ media.class = Audio/Sink, node.name = bed-headset }",
+                "{ media.class = Audio/Sink, node.name = bed-headset, \
+                 object.path = bed-headset-path }",
                 "/dev/null",
             ],
         )
     };
-    let headsets = || {
-        bed.dump_from_host()
-            .matches("\"node.name\": \"bed-headset\"")
-            .count()
+    let names = if copy_name == "bed-headset" {
+        vec!["bed-headset"]
+    } else {
+        vec!["bed-headset", copy_name]
+    };
+    let present = || {
+        let dump = bed.dump_from_host();
+        names
+            .iter()
+            .map(|name| dump.matches(&format!("\"node.name\": \"{name}\"")).count())
+            .sum::<usize>()
     };
     for (n, copy_first) in [true, false].into_iter().enumerate() {
         let first = if copy_first { copy() } else { device() };
-        wait_for("the first bed-headset", || headsets() == 1);
+        wait_for("the first node", || present() == 1);
         if copy_first {
             window_in_which_it_would_link(&bed, "playback");
         }
         let second = if copy_first { device() } else { copy() };
-        wait_for("the host's device beside the copy", || headsets() == 2);
+        wait_for("the host's device beside the copy", || present() == 2);
         if !copy_first {
             window_in_which_it_would_link(&bed, "playback");
         }
@@ -2455,27 +2481,29 @@ fn a_host_stream_pinned_to_a_device_links_to_it_beside(copy: &str) {
             &[
                 "-p",
                 "-a",
-                "--target=bed-headset",
+                &format!("--target={target}"),
                 "-P",
                 &format!("{{ node.name = {host}, node.dont-fallback = true }}"),
                 "-",
             ],
         );
         wait_for(
-            "a link from the pinned host stream to the host's device",
+            &format!("a link from the host stream pinned to {target} to the host's device"),
             || watched.seen().contains("|-> bed-headset:playback_MONO"),
         );
         std::thread::sleep(FORBIDDEN_LINK_LIFE);
         let seen = watched.seen();
         assert!(
             seen.lines()
-                .filter(|line| line.contains("|-> bed-headset:"))
+                .filter(|line| names
+                    .iter()
+                    .any(|name| line.contains(&format!("|-> {name}:"))))
                 .all(|line| line.contains("bed-headset:playback_MONO")),
-            "a pinned host stream was linked to a context's copy of its device \
-             (copy first: {copy_first}):\n{seen}"
+            "a host stream pinned to {target} was linked to a context's copy \
+             {copy_name} of its device (copy first: {copy_first}):\n{seen}"
         );
         drop((first, second));
-        wait_for("both bed-headsets gone", || headsets() == 0);
+        wait_for("the device and the copy gone", || present() == 0);
     }
 }
 
