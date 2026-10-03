@@ -397,20 +397,25 @@ fn sweep_dir(dir: &Path, prefix: &str) {
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(pid) = name
+        let Some((pid, lock)) = name
             .to_str()
             .and_then(|n| n.strip_prefix(prefix))
-            .map(|n| n.strip_suffix(launcher::START_LOCK_SUFFIX).unwrap_or(n))
-            .and_then(dir_pid)
+            .map(|n| match n.strip_suffix(launcher::START_LOCK_SUFFIX) {
+                Some(stem) => (stem, true),
+                None => (n, false),
+            })
+            .and_then(|(n, lock)| Some((dir_pid(n)?, lock)))
         else {
             continue;
         };
         if host::pid_alive(pid) {
             continue;
         }
-        let removed = match entry.file_type() {
-            Ok(t) if t.is_dir() => fs::remove_dir_all(entry.path()),
-            _ => fs::remove_file(entry.path()),
+        // A file that is not a start lock is nothing a try made, so the
+        // removal of a directory fails on it and it is reported.
+        let removed = match lock {
+            true => fs::remove_file(entry.path()),
+            false => fs::remove_dir_all(entry.path()),
         };
         if let Err(e) = removed {
             eprintln!("bubbler: {}: {e}", entry.path().display());
@@ -1607,9 +1612,15 @@ mod tests {
         for n in [&format!("try-{dead}"), &format!("try-{live}"), "inst"] {
             fs::write(runtime.join(format!("{n}@start.lock")), b"").unwrap();
         }
+        // A try is a directory; a file under a dead pid's name is not one.
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let file = child.id().to_string();
+        child.wait().unwrap();
+        fs::write(try_root(&env).join(&file), b"").unwrap();
 
         sweep_stale(&env);
 
+        assert!(try_root(&env).join(&file).exists());
         assert!(!try_root(&env).join(&dead).exists());
         for n in kept {
             assert!(try_root(&env).join(n).exists(), "{n}");
