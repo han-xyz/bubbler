@@ -12,6 +12,7 @@ MAKEPKG="${RELEASE_MAKEPKG:-makepkg}"
 phase=""
 head_before=""
 tag_made=""
+staging=""
 
 die() {
     echo "release: $*" >&2
@@ -21,6 +22,7 @@ die() {
 rollback() {
     local status=$?
     trap - EXIT
+    [ -z "$staging" ] || rm -rf "$staging"
     [ "$status" -eq 0 ] && exit 0
     case "$phase" in
         bump)
@@ -29,7 +31,6 @@ rollback() {
             ;;
         tag)
             [ -z "$tag_made" ] || git tag -d "$tag_made" >/dev/null 2>&1 || true
-            git reset -q --soft "$head_before"
             git checkout -q "$head_before" -- aur/bubbler
             echo "release: rolled back the tag and aur/bubbler" >&2
             ;;
@@ -37,6 +38,9 @@ rollback() {
     exit "$status"
 }
 trap rollback EXIT
+# Without these the EXIT trap sees status 0 after a signal and rolls nothing back.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 require_version() {
     [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "version must be X.Y.Z, got '$1'"
@@ -104,6 +108,9 @@ require_aurs_checkout() {
     [ "$top" = "$aurs_dir" ] || die "'$aurs_dir' is not the top level of a git checkout"
     [ "$top" != "$(pwd -P)" ] || die "'$aurs_dir' is this repository, not an AUR checkout"
     [ -s "$aurs_dir/PKGBUILD" ] || die "'$aurs_dir' has no PKGBUILD to take the first line from"
+    for file in PKGBUILD bubbler.install .SRCINFO; do
+        [ ! -d "$aurs_dir/$file" ] || die "'$aurs_dir/$file' is a directory"
+    done
     case "$(head -n1 "$aurs_dir/PKGBUILD")" in
         "# Maintainer:"*) ;;
         *) die "the first line of '$aurs_dir/PKGBUILD' is not a '# Maintainer:' line" ;;
@@ -119,7 +126,7 @@ tag_is_made() {
 }
 
 copy_to_aurs() {
-    local version="$1" aurs_dir="$2" staging
+    local version="$1" aurs_dir="$2"
     staging="$(mktemp -d "$aurs_dir/.release.XXXXXX")" || return 1
     {
         head -n1 "$aurs_dir/PKGBUILD"
@@ -127,15 +134,16 @@ copy_to_aurs() {
     } >"$staging/PKGBUILD" \
         && cp aur/bubbler/bubbler.install aur/bubbler/.SRCINFO "$staging/" \
         && mv "$staging/PKGBUILD" "$staging/bubbler.install" "$staging/.SRCINFO" "$aurs_dir/" \
-        || { rm -rf "$staging"; return 1; }
+        || return 1
     rmdir "$staging"
+    staging=""
     echo "Written to $aurs_dir, nothing committed there. To commit:"
     printf 'git -C %q commit -am "Update to %s"\n' "$aurs_dir" "$version"
 }
 
 copy_or_die() {
     local version="$1" aurs_dir="$2"
-    copy_to_aurs "$version" "$aurs_dir" 2>/dev/null || {
+    copy_to_aurs "$version" "$aurs_dir" || {
         echo "release: could not write to '$aurs_dir'; the tag and the two commits in this repository are done" >&2
         printf 'release: redo only the copy with: scripts/release --tag %s %q\n' "$version" "$aurs_dir" >&2
         exit 1

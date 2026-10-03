@@ -168,15 +168,17 @@ regenerates `.SRCINFO` with `makepkg --printsrcinfo` and commits
 `makepkg`. With `aurs-dir` it also writes the PKGBUILD there (keeping that
 file's first line), `bubbler.install` and `.SRCINFO`, and prints the commit
 command without running it; it refuses when `aurs-dir` is not a directory, is
-not the top level of a git checkout other than this repository, or has no
-PKGBUILD whose first line starts with `# Maintainer:`.
+not the top level of a git checkout other than this repository, has no
+PKGBUILD whose first line starts with `# Maintainer:`, or holds a directory
+where one of the three files goes.
 
 Every refusal comes before the first change. If a step fails after that (a
 sed that did not match, `cargo`, `makepkg`, a commit hook), the script removes
 the tag it made and restores the files it touched to the last commit. If only
 the `aurs-dir` write fails, the tag and both commits stay, nothing is left in
-`aurs-dir`, and the script prints the command to redo just the copy:
+`aurs-dir`, and the script prints why and the command to redo just the copy:
 `scripts/release --tag X.Y.Z aurs-dir` with the tag already made does only that.
+A write stopped by SIGINT or SIGTERM leaves nothing in `aurs-dir` either.
 
 Merging, pushing and the AUR push stay manual. `scripts/release.test` checks
 both commands in a throwaway repository.
