@@ -4241,7 +4241,7 @@ mod tests {
         let lock = tmp.path().join("t@start.lock");
         let path = dir.join(exec::SOCKET_NAME);
         let stop = AtomicBool::new(false);
-        drop(UnixListener::bind(&path).unwrap());
+        exec::close_for_good(UnixListener::bind(&path).unwrap());
         let (live, _guard) =
             bind_control_socket(&dir, &lock, "t", &stop, None).expect("a fresh bind");
         let again = bind_control_socket(&dir, &lock, "t", &stop, None);
@@ -4269,7 +4269,7 @@ mod tests {
         let path = tmp.path().join(exec::SOCKET_NAME);
         let stop = AtomicBool::new(false);
         let (listener, guard) = bind_control_socket(tmp.path(), &lock, "t", &stop, None).unwrap();
-        drop(listener);
+        exec::close_for_good(listener);
         let (_later, later_guard) =
             bind_control_socket(tmp.path(), &lock, "t", &stop, None).unwrap();
         drop(guard);

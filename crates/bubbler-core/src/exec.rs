@@ -359,6 +359,15 @@ pub fn run_in_with(
     }
 }
 
+/// Close `listener` the way a killed run's is closed, leaving its socket
+/// file in place. Shut down first: a test running alongside may fork
+/// while it is open, and the child holds a copy of it until it execs.
+#[cfg(test)]
+pub(crate) fn close_for_good(listener: std::os::unix::net::UnixListener) {
+    rustix::net::shutdown(&listener, rustix::net::Shutdown::Both)
+        .expect("shutdown fails only on a descriptor that is not a socket");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,7 +428,7 @@ mod tests {
         let e = env(tmp.path());
         let path = instance_dir(tmp.path(), "t").join(SOCKET_NAME);
         // A socket file with nobody listening is what a killed run leaves.
-        drop(UnixListener::bind(&path).unwrap());
+        close_for_good(UnixListener::bind(&path).unwrap());
         assert!(connect(&e, "t").unwrap().is_none());
         assert!(path.exists());
     }
@@ -443,7 +452,7 @@ mod tests {
 
         // A socket file a killed run left behind is not a live instance,
         // and is left for the next start to clear.
-        drop(listener);
+        close_for_good(listener);
         assert!(!is_live(&e, "t"));
         assert!(path.exists());
     }
