@@ -871,10 +871,15 @@ fn join_after_lost_start(
     log: Option<&run_log::Redirect>,
     lost: LaunchError,
 ) -> Result<UnixStream> {
+    let joined =
+        exec::connect(env, name).with_context(|| format!("connecting to instance `{name}`"));
     if let Some(log) = log {
-        log.joined();
+        match joined {
+            Ok(Some(_)) => log.joined(),
+            Ok(None) | Err(_) => log.not_started(),
+        }
     }
-    match exec::connect(env, name).with_context(|| format!("connecting to instance `{name}`"))? {
+    match joined? {
         Some(stream) => Ok(stream),
         None => Err(lost).with_context(|| format!("running instance `{name}`")),
     }

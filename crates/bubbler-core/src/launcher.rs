@@ -3677,7 +3677,9 @@ fn wait_relaying(
 /// [started](run_log::Redirect::started) the sandbox once the control
 /// socket is bound, and otherwise that it
 /// [did not](run_log::Redirect::not_started), since another start may be
-/// writing to it.
+/// writing to it. On `AlreadyRunning` it is told nothing: the caller
+/// either [joins](run_log::Redirect::joined) that run or says it did not
+/// start.
 ///
 /// Marks every descriptor of the calling process above stdio that this
 /// spawn is not meant to hand over close-on-exec, so an embedder's own
@@ -3695,7 +3697,9 @@ pub fn run(
 ) -> Result<i32, LaunchError> {
     let ended = start_run(env, inst, command, mode, log);
     // A no-op after `started`, whose answer is the one that counts.
-    if let Some(log) = log {
+    if let Some(log) = log
+        && !matches!(ended, Err(LaunchError::AlreadyRunning(_)))
+    {
         log.not_started();
     }
     ended
@@ -5060,6 +5064,42 @@ mod tests {
             run(&e, &i, None, TtyMode::Passthrough, None),
             Err(LaunchError::AlreadyRunning(n)) if n == "t"
         ));
+    }
+
+    /// A start that lost the race and joined writes like any run, so a
+    /// start that fails after it still finds room for its line.
+    #[test]
+    fn a_start_that_joined_leaves_room_for_a_failed_start_after_it() {
+        use std::io::Write;
+        let _fd2 = run_log::FD2.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let e = env(tmp.path());
+        let i = inst(tmp.path(), "command \"/usr/bin/true\"");
+        let dir = prepare_runtime_dir(&e, &i).unwrap();
+        let _listener = UnixListener::bind(dir.join(exec::SOCKET_NAME)).unwrap();
+        let log = tmp.path().join(run_log::LOG_FILE);
+
+        let joining = run_log::redirect(&log, true).unwrap();
+        let lost = run(&e, &i, None, TtyMode::Passthrough, Some(&joining));
+        assert!(
+            matches!(lost, Err(LaunchError::AlreadyRunning(_))),
+            "{lost:?}"
+        );
+        joining.joined();
+        std::io::stderr().write_all(&vec![b'x'; 2 << 20]).unwrap();
+        drop(joining);
+
+        let failed = "bubbler: the start failed before its lock\n";
+        let start = run_log::redirect(&log, true).unwrap();
+        std::io::stderr().write_all(failed.as_bytes()).unwrap();
+        start.not_started();
+        drop(start);
+
+        let held = run_log::read(&log).unwrap().unwrap();
+        assert!(
+            String::from_utf8_lossy(&held).contains(failed),
+            "the failure was not recorded"
+        );
     }
 
     #[test]

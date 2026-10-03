@@ -409,6 +409,12 @@ fn append_capped(
     Ok(())
 }
 
+/// Held by every test that points fd 2 at a log: the descriptor is the
+/// whole test binary's, and two redirects at once would each put back the
+/// other's pipe.
+#[cfg(test)]
+pub(crate) static FD2: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -629,6 +635,7 @@ mod tests {
 
     #[test]
     fn a_start_that_did_not_bind_is_recorded_in_a_log_the_last_run_filled() {
+        let _fd2 = FD2.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let log = path(tmp.path());
 
