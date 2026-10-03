@@ -2403,23 +2403,32 @@ fn start_pasta(
     // trail) and never as the caller's own descriptor.
     let (log, stderr) = run_log::relay()?;
     let log_too = log.try_clone().map_err(LaunchError::Data)?;
-    let child = Command::new(network::program(env))
-        .args(&argv)
+    let mut cmd = Command::new(network::program(env));
+    cmd.args(&argv)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_too))
-        .spawn()
-        .map_err(|e| match e.kind() {
-            io::ErrorKind::NotFound => LaunchError::BadValue {
-                service: "network",
-                reason: format!(
-                    "`{}` is not on PATH; install the `passt` package, or write \
+        .stderr(Stdio::from(log_too));
+    // SAFETY: the closure runs in the forked child between `fork` and
+    // `execve`; `setsid` is one syscall that allocates nothing, so it is
+    // async-signal-safe. In a session of its own pasta has no controlling
+    // terminal, so it cannot open `/dev/tty` and reach the caller's.
+    unsafe {
+        cmd.pre_exec(|| {
+            rustix::process::setsid()?;
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().map_err(|e| match e.kind() {
+        io::ErrorKind::NotFound => LaunchError::BadValue {
+            service: "network",
+            reason: format!(
+                "`{}` is not on PATH; install the `passt` package, or write \
                      `network \"host\"` to use the host network namespace",
-                    network::PASTA_BIN
-                ),
-            },
-            _ => LaunchError::Spawn(e),
-        })?;
+                network::PASTA_BIN
+            ),
+        },
+        _ => LaunchError::Spawn(e),
+    })?;
     // From here on every exit path stops pasta through the handle.
     let mut handle = PastaHandle {
         child,
@@ -2633,9 +2642,13 @@ fn start_net_proxy(
     // no `execve` from here can gain a privilege, whatever it finds.
     // Last, the parent-death signal so a bubbler that is killed takes
     // the proxy with it, and `PR_SET_DUMPABLE 0` for the time before
-    // `execve`, which resets it; the proxy sets it again itself.
+    // `execve`, which resets it; the proxy sets it again itself. `setsid`
+    // comes first and needs nothing: in a session of its own the proxy
+    // has no controlling terminal, so it cannot open `/dev/tty` and reach
+    // the caller's.
     unsafe {
         cmd.pre_exec(move || {
+            rustix::process::setsid()?;
             let procs = BorrowedFd::borrow_raw(procs);
             let mut buf = [0u8; 10];
             rustix::io::write(

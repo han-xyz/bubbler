@@ -1292,7 +1292,9 @@ three: the four bwrap sidecars and the egress proxy have `/dev/null` as
 stdin and stdout, pasta has it as stdin, and every other stdio descriptor
 of theirs is a pipe bubbler copies to its own stderr. Every sandbox is started with
 `--new-session`, so it inherits no controlling terminal, and the seccomp
-filter denies `TIOCSTI` and `TIOCLINUX` on top of that. A terminal that
+filter denies `TIOCSTI` and `TIOCLINUX` on top of that. pasta and the
+egress proxy run in no bwrap, so bubbler starts each in a session of its
+own: neither has a controlling terminal to open as `/dev/tty`. A terminal that
 will not take output cannot wedge bubbler, and nothing is dropped while
 the run lasts: once 64 KiB is waiting the sandbox's own side is left
 unread, so the application blocks in its `write` and the output runs at

@@ -13,8 +13,9 @@
 - A sidecar compromised through the sandbox held the caller's terminal: the
   Wayland proxy, PipeWire context holder, private pulse server and D-Bus
   proxy inherited all of bubbler's stdio, pasta and the egress proxy its
-  stderr. They now get `/dev/null` and a pipe bubbler copies to its own
-  stderr.
+  stderr and its controlling terminal. They now get `/dev/null` and a pipe
+  bubbler copies to its own stderr, and pasta and the egress proxy a session
+  of their own with no controlling terminal.
 - A link a compromised audio or D-Bus sidecar left in its own directory was
   followed by the next start of the instance after a run that ended without
   cleanup, writing or unlinking files in a host directory of its choosing;

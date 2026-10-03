@@ -6061,6 +6061,107 @@ fn real_allow_host_the_egress_proxy_holds_no_terminal_of_the_callers() {
     assert_eq!(out.status.code(), Some(0), "{shown}");
 }
 
+/// What `/proc/<pid>/stat` says of a process's terminal: its `comm`,
+/// parent, session (field 6) and `tty_nr` (field 7, 0 for none).
+#[derive(Debug, Clone)]
+struct TerminalStat {
+    comm: String,
+    ppid: i32,
+    session: i32,
+    tty_nr: i32,
+}
+
+fn terminal_stat(pid: i32) -> Option<TerminalStat> {
+    let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (head, tail) = raw.rsplit_once(')')?;
+    let fields: Vec<&str> = tail.split_whitespace().collect();
+    Some(TerminalStat {
+        comm: head.split_once('(')?.1.to_owned(),
+        ppid: fields.get(1)?.parse().ok()?,
+        session: fields.get(3)?.parse().ok()?,
+        tty_nr: fields.get(4)?.parse().ok()?,
+    })
+}
+
+/// pasta and the egress proxy are each in a session of their own with no
+/// controlling terminal, even when bubbler was started on one: a sidecar
+/// in bubbler's session could open `/dev/tty` and reach the caller's.
+#[test]
+fn real_allow_host_pasta_and_the_egress_proxy_have_no_controlling_terminal() {
+    if !require_egress() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "egtty"])
+        .status()
+        .unwrap();
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/egtty/config.kdl"),
+        "network {\n    outbound \"deny\"\n    allow-host \"tty-check.invalid\"\n}\n",
+    )
+    .unwrap();
+    let pty = test_pty();
+    let mut cmd = bubbler_live(tmp.path(), &init);
+    cmd.args(["run", "egtty", "--", "/usr/bin/sleep", "3"])
+        .stdin(pty.stdio())
+        .stdout(Stdio::null())
+        .stderr(pty.stdio());
+    // SAFETY: runs between fork and execve; `setsid` and
+    // `ioctl(TIOCSCTTY)` are single syscalls that allocate nothing, and
+    // fd 0 is the pty slave by then, since stdio is installed first.
+    unsafe {
+        cmd.pre_exec(|| {
+            rustix::process::setsid()?;
+            rustix::process::ioctl_tiocsctty(BorrowedFd::borrow_raw(0))?;
+            Ok(())
+        });
+    }
+    let run = cmd.spawn().unwrap();
+    let me = Pid::from_child(&run).as_raw_nonzero().get();
+    let mut seen = None;
+    wait_until(
+        || {
+            let Some(own) = terminal_stat(me) else {
+                return false;
+            };
+            let kids: Vec<_> = std::fs::read_dir("/proc")
+                .unwrap()
+                .flatten()
+                .filter_map(|e| e.file_name().to_string_lossy().parse::<i32>().ok())
+                .filter_map(|pid| terminal_stat(pid).map(|s| (pid, s)))
+                .filter(|(_, s)| s.ppid == me)
+                .collect();
+            let pick = |names: &[&str]| {
+                kids.iter()
+                    .find(|(_, s)| names.iter().any(|n| s.comm.starts_with(n)))
+                    .map(|(_, s)| s.clone())
+            };
+            // pasta is a link to passt, and execs a build for this CPU.
+            let pasta = pick(&["pasta", "passt"]);
+            if let (Some(pasta), Some(proxy)) = (pasta, pick(&["bubbler-net"])) {
+                seen = Some((own, pasta, proxy));
+            }
+            seen.is_some()
+        },
+        Duration::from_secs(10),
+    );
+    let out = run.wait_with_output().unwrap();
+    let shown = pty.read_until(Duration::from_millis(200), |_| false);
+    let (own, pasta, proxy) =
+        seen.unwrap_or_else(|| panic!("pasta and the egress proxy were never seen: {shown}"));
+    assert_ne!(own.tty_nr, 0, "bubbler was given no terminal: {own:?}");
+    for sidecar in [pasta, proxy] {
+        assert_eq!(sidecar.tty_nr, 0, "{sidecar:?} holds bubbler's terminal");
+        assert_ne!(
+            sidecar.session, own.session,
+            "{sidecar:?} is in bubbler's session"
+        );
+    }
+    assert_eq!(out.status.code(), Some(0), "{shown}");
+}
+
 const NSENTER: &str = "/usr/bin/nsenter";
 const SETPRIV: &str = "/usr/bin/setpriv";
 
