@@ -1215,21 +1215,35 @@ items: where a user enables it, a sandbox's sink on a host with no other
 sink keeps its "Dummy Output" from appearing. The playback
 grant protects what a sandbox can hear and record, not the availability
 of host audio, with one exception the hook enforces: a stream that would
-hold its sink for itself — `node.exclusive`, or a session item
-WirePlumber marks `item.node.encoded-only` — makes stock WirePlumber turn
-every later stream away from that sink ("target is linked exclusively",
-measured: a host stream started after a playback context's exclusive
-stream got no link). Without the exclusive grant (`exclusive` on either
-audio node, the word `exclusive`) such a stream of a sandbox gets no link
-and its client an error, through the private pulse server too (a pulse
-client sets `node.exclusive` as a stream property; measured), and the
-sandbox's other streams are never linked in passthrough, which holds a
-sink the same way. A hook cannot link the stream shared instead: stock
-reads `node.exclusive` from the session item's properties, which a hook
-cannot change (measured on 0.5.18). The encoded-only half is enforced by
-reading, not measured: the item property is WirePlumber's own (a node
-claiming it gets an item without it, measured), and the bed's null sink
-takes no encoded format. With the grant, stock behaviour holds and the
+hold its sink or source for itself — `node.exclusive`, or a session item
+WirePlumber marks `item.node.encoded-only` at either end — makes stock
+WirePlumber turn every later stream away from that device ("target is
+linked exclusively", measured: a host stream started after a playback
+context's exclusive stream got no link). Without the exclusive grant
+(`exclusive` on either audio node, the word `exclusive`) such a stream of
+a sandbox gets no link and its client an error, once, after every other
+check has allowed the link (measured: a capture stream without
+`microphone` is refused the source and not told it needs `exclusive`;
+the error is sent once over two rescans), through the private pulse
+server too (a pulse client sets `node.exclusive` as a stream property;
+measured), and the sandbox's other streams are never linked in
+passthrough, which holds a device the same way. The stream is not linked
+shared instead: a hook cannot change the properties stock reads
+`node.exclusive` from (each event hands it a fresh copy of the session
+item's, `lib/linking-utils.lua:144`; measured on 0.5.18), and linking
+the stream shared would mean re-implementing WirePlumber's own link step
+(`linking/link-target.lua`), which this policy does not do (read, not
+measured). After a WirePlumber restart, a link WirePlumber made for such
+a stream before it knew the stream's client is removed once the client
+is known, and the rescan that follows refuses the stream. The bed never
+produced that order (the client known first in every run), so this is
+measured only against a copy of the hook that learns each client a
+second late: there the stock exclusive link stood and a host stream got
+none without the removal, and with it the host stream played. The
+encoded-only half, the target half included, and the passthrough
+suppression are enforced by reading, not measured: the item property is
+WirePlumber's own (a node claiming it gets an item without it,
+measured), and the bed's null sink takes no encoded format. With the grant, stock behaviour holds and the
 instance can keep host streams off a sink while it plays. A JACK client, which
 links its own ports, links nothing: the link factory is hidden from it.
 Hiding `Audio/Duplex` from a
@@ -1271,6 +1285,9 @@ the hook, each new link destroyed in turn.
 `a_context_creates_nodes_only_as_its_own_streams`,
 `a_host_stream_plays_after_a_playback_contexts_stream_asked_for_the_sink_alone`,
 `a_host_stream_plays_after_a_pulse_clients_stream_asked_for_the_sink_alone`,
+`a_host_stream_plays_after_a_restart_met_a_playback_contexts_stream_asking_for_the_sink_alone`,
+`a_playback_contexts_capture_stream_asking_for_the_source_alone_is_refused_the_source`,
+`a_contexts_stream_refused_for_holding_the_sink_is_told_once`,
 `an_exclusive_contexts_stream_holds_the_sink_against_a_later_host_stream`,
 `a_stream_a_context_turns_into_a_smart_filter_takes_no_host_stream`,
 `a_sink_a_context_offered_before_the_session_manager_restarted_is_no_device`,

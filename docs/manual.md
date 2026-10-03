@@ -506,11 +506,11 @@ file order does not affect the generated argv.
     pipewire                         # $XDG_RUNTIME_DIR/pipewire-0, playback only
     pipewire { microphone }          #   also every microphone and line-in
     pipewire { devices }             #   its own sinks and sources as devices
-    pipewire { exclusive }           #   a stream may hold a sink for itself
+    pipewire { exclusive }           #   a stream may hold a device for itself
     pulseaudio                       # $XDG_RUNTIME_DIR/pulse/native, sets
                                      #   PULSE_SERVER; playback only
     pulseaudio { microphone }        #   also every microphone and line-in
-    pulseaudio { exclusive }         #   a stream may hold a sink for itself
+    pulseaudio { exclusive }         #   a stream may hold a device for itself
     gamepad                          # /dev/input, and the sysfs that names it
                                      #   hidraw=#true is the `hidraw` grant,
                                      #   uinput=#true adds /dev/uinput
@@ -648,14 +648,15 @@ behind `microphone`. The pulse server of a `pulseaudio` grant shares the
 instance's context and so carries `devices` too, and cannot use it.
 `exclusive`, on either node (`pipewire { exclusive }`,
 `pulseaudio { exclusive }`, ORed like `microphone`), lets a stream hold a
-sink for itself: ask for it exclusively (mpv's `--audio-exclusive`, a
-`node.exclusive` stream property, which a pulse client can set too) or pass
+sink or source for itself: ask for it exclusively (mpv's `--audio-exclusive`,
+a `node.exclusive` stream property, which a pulse client can set too) or pass
 encoded audio through to a receiver (surround bitstream passthrough). While
-such a stream holds the sink, WirePlumber turns every new stream aimed at it
-away, your own included. Without `exclusive`, such a stream of the instance
-gets no link and its client an error ("holding a device for one stream needs
-the exclusive grant"), and the instance's other streams are linked mixed,
-never in passthrough.
+such a stream holds the device, WirePlumber turns every new stream aimed at
+it away, your own included. Without `exclusive`, such a stream of the
+instance gets no link and its client an error ("holding a device for one
+stream needs the exclusive grant"), so the player does not play until you
+add `exclusive`; the instance's other streams are linked mixed, never in
+passthrough.
 Two kinds of application are not supported under a scoped grant, with or
 without `devices`: one that connects its own ports (a JACK client under
 `pw-jack`), since the link factory stays hidden from every sandbox, and

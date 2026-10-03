@@ -141,9 +141,9 @@ pub static GRANTS: &[Grant] = &[
                `microphone` adds every `Audio/Source` the host has: capture is allowed. \
                `devices` treats the sinks and sources the sandbox makes like the host's: \
                it hears whatever is routed into them, and one may become the default. \
-               `exclusive` lets a stream hold a sink for itself (exclusive access, encoded \
-               passthrough), keeping every later stream off it; without it such a stream \
-               gets no link. \
+               `exclusive` lets a stream hold a sink or source for itself (exclusive \
+               access, encoded passthrough), keeping every later stream off it; without \
+               it such a stream gets no link. \
                The `camera` grant is the portal-mediated way to reach a device instead.",
         risk: Risk::Wide,
         grammar: "pipewire [{ microphone; devices; exclusive }]",

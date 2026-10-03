@@ -58,16 +58,19 @@
 -- device. Every factory but `client-node` stays hidden from it all the
 -- same, so its devices are nodes it runs itself, carrying its client id.
 --
--- A stream may hold its target for itself: ask for it exclusively
--- (`node.exclusive`) or pass encoded audio through it, and stock
--- WirePlumber then turns every stream that comes later away from that
--- target ("target is linked exclusively", linking/prepare-link.lua). Of a
--- sandbox without the exclusive grant (`exclusive` in its grant) such a
--- stream is not linked and its client is told why, and its other streams
--- are linked mixed, never in passthrough. Linking the stream shared
--- instead is not open to a hook: the stock scripts read `node.exclusive`
--- from the session item's properties, which a hook cannot change
--- (measured on WirePlumber 0.5.18).
+-- A stream may hold its target, a sink or source, for itself: ask for it
+-- exclusively (`node.exclusive`) or pass encoded audio through it, and
+-- stock WirePlumber then turns every stream that comes later away from
+-- that target ("target is linked exclusively", linking/prepare-link.lua).
+-- Of a sandbox without the exclusive grant (`exclusive` in its grant) such
+-- a stream is not linked and its client is told why, once; its other
+-- streams are linked mixed, never in passthrough. A link made for such a
+-- stream before WirePlumber knew its client, after a restart, is removed
+-- once it does. The stream is not linked shared instead: a hook cannot
+-- change the properties stock reads `node.exclusive` from, each event
+-- handing it a fresh copy (lib/linking-utils.lua:144, measured on
+-- WirePlumber 0.5.18), and linking it shared would mean re-implementing
+-- linking/link-target.lua, which this policy does not do.
 --
 -- A link with a sandbox's node at either end is destroyed when
 -- WirePlumber sees it, unless WirePlumber made it and it is one the
@@ -81,8 +84,6 @@ local log = Log.open_topic ("s-linking")
 -- The engine name bubbler gives every security context it creates.
 local BUBBLER_ENGINE = "org.bubbler"
 
--- -EPERM, the error a client is sent whose stream is refused for
--- holding its target.
 local EPERM = -1
 
 -- The one media class a sandbox's stream may have in each direction:
