@@ -1437,7 +1437,7 @@ fn a_context_connected_before_the_session_manager_cannot_see_the_link_factory() 
         });
         (early, log)
     });
-    let Some((_bed, (_early, log))) = started else {
+    let Some((bed, (_early, log))) = started else {
         return;
     };
     let mut listed = String::new();
@@ -1445,10 +1445,22 @@ fn a_context_connected_before_the_session_manager_cannot_see_the_link_factory() 
         listed = std::fs::read_to_string(&log).unwrap_or_default();
         listed.contains("listed")
     });
+    let wireplumber =
+        std::fs::read_to_string(bed.dir().join("wireplumber.log")).unwrap_or_default();
+    let hidden_as_it_appeared = wireplumber.contains("link-factory hidden from bed as it appeared");
     assert!(
         listed.contains("factory client-node") && !listed.contains("factory link-factory"),
-        "a context connected before the session manager sees:\n{listed}"
+        "a context connected before the session manager sees (link factory hidden \
+         as it appeared: {hidden_as_it_appeared}):\n{listed}"
     );
+    say(&format!(
+        "the early context's link factory was hidden {}",
+        if hidden_as_it_appeared {
+            "by the factories handler as it appeared"
+        } else {
+            "by bubbler/hide-factories"
+        }
+    ));
 }
 
 /// How many links the bed's linking hook has refused toward the node
@@ -2190,6 +2202,26 @@ fn a_host_stream_aimed_at_a_sink_a_playback_context_offers_plays_on_the_default(
     );
 }
 
+/// The output stream of a host loopback carries a link group that is no
+/// smart filter's, which WirePlumber's filter search looks at first.
+#[test]
+fn a_host_loopbacks_stream_aimed_at_a_sink_a_playback_context_offers_plays_on_the_default() {
+    a_host_stream_passes_by_a_node_a_context_offers(
+        PLAYBACK,
+        "playback",
+        &["pw-cat -r -a -P '{ media.class = Audio/Sink, node.name = offered }' /dev/null"],
+        &[
+            "-p",
+            "-a",
+            "--target=offered",
+            "-P",
+            "{ node.name = host, node.link-group = host-loopback }",
+            "-",
+        ],
+        "bed-sink:playback_",
+    );
+}
+
 /// A smart filter is a pair of nodes sharing a link group: the sink
 /// streams are routed into and the stream it plays on with, both made
 /// through `client-node`. Two connections, not two clients of one
@@ -2351,11 +2383,12 @@ fn host_stream(bed: &PipeWireBed, args: &[&str]) -> Streaming {
     Streaming(command.spawn().expect("pw-cat did not run"))
 }
 
-/// A context offers a sink under the name of a host device before the
-/// device itself appears, as when a Bluetooth headset reconnects: a host
-/// stream pinned to that name with `node.dont-fallback` is linked to the
-/// host's device, never to the copy. The device is mono, so its ports
-/// (`playback_MONO`) tell it from the copy's (`playback_FL`, `_FR`).
+/// A context offers a sink under the name of a host device, before the
+/// device itself appears (as when a Bluetooth headset reconnects) and
+/// after it: a host stream pinned to that name with `node.dont-fallback`
+/// is linked to the host's device, never to the copy. The device is mono,
+/// so its ports (`playback_MONO`) tell it from the copy's (`playback_FL`,
+/// `_FR`).
 ///
 /// Observed through `pw-link -m`: stock WirePlumber links a stream pinned
 /// this way and then destroys it on its next rescan, with or without a
@@ -2365,55 +2398,70 @@ fn a_host_stream_pinned_to_a_device_whose_name_a_context_copies_links_to_the_dev
     let Some(bed) = PipeWireBed::start() else {
         return;
     };
-    let _copy = Streaming(bed.spawn_in_context(
-        PLAYBACK,
-        "pw-cat -r -a -P '{ media.class = Audio/Sink, node.name = bed-headset }' /dev/null",
-    ));
-    wait_for("the context's sink", || {
-        bed.dump_from_host()
-            .contains("\"node.name\": \"bed-headset\"")
-    });
-    window_in_which_it_would_link(&bed, "playback");
-    let _device = host_stream(
-        &bed,
-        &[
-            "-r",
-            "-a",
-            "--channels=1",
-            "--channel-map=mono",
-            "-P",
-            "{ media.class = Audio/Sink, node.name = bed-headset }",
-            "/dev/null",
-        ],
-    );
-    wait_for("the host's device beside the copy", || {
+    let copy = || {
+        Streaming(bed.spawn_in_context(
+            PLAYBACK,
+            "pw-cat -r -a -P '{ media.class = Audio/Sink, node.name = bed-headset }' /dev/null",
+        ))
+    };
+    let device = || {
+        host_stream(
+            &bed,
+            &[
+                "-r",
+                "-a",
+                "--channels=1",
+                "--channel-map=mono",
+                "-P",
+                "{ media.class = Audio/Sink, node.name = bed-headset }",
+                "/dev/null",
+            ],
+        )
+    };
+    let headsets = || {
         bed.dump_from_host()
             .matches("\"node.name\": \"bed-headset\"")
             .count()
-            == 2
-    });
+    };
+    for (n, copy_first) in [true, false].into_iter().enumerate() {
+        let first = if copy_first { copy() } else { device() };
+        wait_for("the first bed-headset", || headsets() == 1);
+        if copy_first {
+            window_in_which_it_would_link(&bed, "playback");
+        }
+        let second = if copy_first { device() } else { copy() };
+        wait_for("the host's device beside the copy", || headsets() == 2);
+        if !copy_first {
+            window_in_which_it_would_link(&bed, "playback");
+        }
 
-    let watched = LinkMonitor::start(&bed);
-    let _host = host_stream(
-        &bed,
-        &[
-            "-p",
-            "-a",
-            "--target=bed-headset",
-            "-P",
-            "{ node.name = host, node.dont-fallback = true }",
-            "-",
-        ],
-    );
-    wait_for(
-        "a link from the pinned host stream to the host's device",
-        || watched.seen().contains("|-> bed-headset:playback_MONO"),
-    );
-    let seen = watched.seen();
-    assert!(
-        !seen.contains("|-> bed-headset:playback_F"),
-        "a pinned host stream was linked to a context's copy of its device:\n{seen}"
-    );
+        let watched = LinkMonitor::start(&bed);
+        let host = format!("host{n}");
+        let _host = host_stream(
+            &bed,
+            &[
+                "-p",
+                "-a",
+                "--target=bed-headset",
+                "-P",
+                &format!("{{ node.name = {host}, node.dont-fallback = true }}"),
+                "-",
+            ],
+        );
+        wait_for(
+            "a link from the pinned host stream to the host's device",
+            || watched.seen().contains("|-> bed-headset:playback_MONO"),
+        );
+        std::thread::sleep(FORBIDDEN_LINK_LIFE);
+        let seen = watched.seen();
+        assert!(
+            !seen.contains("|-> bed-headset:playback_F"),
+            "a pinned host stream was linked to a context's copy of its device \
+             (copy first: {copy_first}):\n{seen}"
+        );
+        drop((first, second));
+        wait_for("both bed-headsets gone", || headsets() == 0);
+    }
 }
 
 /// `pw-link -m` on the host for the length of a test: every link made,

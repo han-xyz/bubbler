@@ -295,6 +295,9 @@ factories:connect ("object-added", function (_, factory)
   for client in source:call ("get-object-manager", "client"):iterate () do
     if client.properties ["pipewire.sec.engine"] == BUBBLER_ENGINE then
       client:update_permissions { [factory ["bound-id"]] = "-" }
+      log:info (client, string.format ("%s hidden from %s as it appeared",
+          tostring (factory.properties ["factory.name"]),
+          tostring (client.properties ["pipewire.sec.app-id"])))
     end
   end
 end)
