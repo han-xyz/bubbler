@@ -57,8 +57,21 @@ const NOT_CONTENT: &[&str] = &["TARGETS", "TIMESTAMP", "MULTIPLE", "SAVE_TARGETS
 /// selection over.
 const SELECTION_SETTLE: Duration = Duration::from_secs(5);
 
+/// The variable that opts in to tests reaching the developer's live
+/// session, its compositor and clipboard among them.
+const SESSION_TESTS: &str = "BUBBLER_TEST_SESSION";
+
+/// Whether `BUBBLER_TEST_SESSION=1` asks for the tests that reach the session.
+fn session_tests_wanted() -> bool {
+    std::env::var_os(SESSION_TESTS).is_some_and(|value| value == "1")
+}
+
 /// The compositor's own socket, or `None` with a printed reason.
 fn host_socket() -> Option<PathBuf> {
+    if !session_tests_wanted() {
+        println!("skipped: set BUBBLER_TEST_SESSION=1 to run tests that reach the session");
+        return None;
+    }
     let Some(display) = std::env::var_os("WAYLAND_DISPLAY") else {
         println!("skipped: WAYLAND_DISPLAY is not set");
         return None;

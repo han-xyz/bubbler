@@ -194,6 +194,16 @@ fn say(line: &str) {
     }
 }
 
+/// The variable that opts in to tests that start audio daemons. The bed is
+/// private, but it shares the developer's machine, and a run that left its
+/// daemons behind once pinned a CPU.
+const SESSION_TESTS: &str = "BUBBLER_TEST_SESSION";
+
+/// Whether `BUBBLER_TEST_SESSION=1` asks for the tests that start a bed.
+fn session_tests_wanted() -> bool {
+    std::env::var_os(SESSION_TESTS).is_some_and(|value| value == "1")
+}
+
 /// The first `PATH` entry that holds an executable named `name`.
 fn on_path(name: &str) -> Option<PathBuf> {
     std::env::var_os("PATH")
@@ -323,8 +333,8 @@ pub struct PipeWireBed {
 }
 
 impl PipeWireBed {
-    /// A running bed, or `None` (having said which binary is missing)
-    /// on a host that cannot hold one.
+    /// A running bed, or `None` (having said why) on a run that did not
+    /// opt in or a host that cannot hold one.
     pub fn start() -> Option<PipeWireBed> {
         Self::start_with(|_| ()).map(|(bed, ())| bed)
     }
@@ -333,6 +343,10 @@ impl PipeWireBed {
     /// directory once its PipeWire listens and before its WirePlumber
     /// starts, and what it returned.
     fn start_with<T>(before_session_manager: impl FnOnce(&Path) -> T) -> Option<(PipeWireBed, T)> {
+        if !session_tests_wanted() {
+            say("skipping: set BUBBLER_TEST_SESSION=1 to run tests that reach the session");
+            return None;
+        }
         for binary in NEEDED {
             if on_path(binary).is_none() {
                 say(&format!("skipping: {binary} not installed"));

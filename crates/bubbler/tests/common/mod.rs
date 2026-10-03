@@ -686,14 +686,28 @@ pub fn bubbler_wayland(root: &Path, init: &Path) -> Command {
     c
 }
 
+/// The variable that opts in to tests reaching the developer's live
+/// session: its bus, portals, compositor, clipboard and PipeWire.
+const SESSION_TESTS: &str = "BUBBLER_TEST_SESSION";
+
+/// Returns false (after printing why) unless `BUBBLER_TEST_SESSION=1`,
+/// so a packager's build or CI never touches a desktop session.
+pub fn require_session() -> bool {
+    if std::env::var_os(SESSION_TESTS).is_some_and(|value| value == "1") {
+        return true;
+    }
+    say("skipping: set BUBBLER_TEST_SESSION=1 to run tests that reach the session");
+    false
+}
+
 /// Returns false (after printing why) when a Wayland security context
-/// cannot be tested here: no bwrap, no `WAYLAND_DISPLAY`, or a compositor
-/// that offers no `wp_security_context_manager_v1`.
+/// cannot be tested here: no opt-in, no bwrap, no `WAYLAND_DISPLAY`, or a
+/// compositor that offers no `wp_security_context_manager_v1`.
 ///
 /// The probe is the launcher's own: `probe` connects over the very
 /// environment a test hands the run through [`bubbler_wayland`].
 pub fn require_security_context() -> bool {
-    if !require_bwrap() {
+    if !require_session() || !require_bwrap() {
         return false;
     }
     if std::env::var_os("WAYLAND_DISPLAY").is_none() {
@@ -791,10 +805,10 @@ pub fn system_owns(name: &str) -> bool {
 }
 
 /// Returns false (after printing why) when a proxied system bus cannot be
-/// tested here: no bwrap, no `xdg-dbus-proxy` or `dbus-send`, or no
-/// system bus socket on the host.
+/// tested here: no opt-in, no bwrap, no `xdg-dbus-proxy` or `dbus-send`,
+/// or no system bus socket on the host.
 pub fn require_system_bus() -> bool {
-    if !require_bwrap() {
+    if !require_session() || !require_bwrap() {
         return false;
     }
     let proxy = has_program("xdg-dbus-proxy");
@@ -895,12 +909,12 @@ pub fn require_a11y() -> bool {
 }
 
 /// Returns false (after printing why) when the accessibility bus lookup
-/// cannot be tested here: no bwrap, no `xdg-dbus-proxy`, no session bus
-/// on the host, or nothing owning `org.a11y.Bus`.
+/// cannot be tested here: no opt-in, no bwrap, no `xdg-dbus-proxy`, no
+/// session bus on the host, or nothing owning `org.a11y.Bus`.
 ///
 /// `dbus-send` is deliberately not among them.
 pub fn require_a11y_lookup() -> bool {
-    if !require_bwrap() {
+    if !require_session() || !require_bwrap() {
         return false;
     }
     let proxy = has_program("xdg-dbus-proxy");
@@ -953,10 +967,10 @@ fn name_has_owner(bus: &Path, name: &str) -> bool {
 }
 
 /// Returns false (after printing why) when a proxied session bus cannot
-/// be tested here: no bwrap, no `xdg-dbus-proxy` or `dbus-send`, or no
-/// session bus on the host.
+/// be tested here: no opt-in, no bwrap, no `xdg-dbus-proxy` or
+/// `dbus-send`, or no session bus on the host.
 pub fn require_dbus() -> bool {
-    if !require_bwrap() {
+    if !require_session() || !require_bwrap() {
         return false;
     }
     let proxy = has_program("xdg-dbus-proxy");

@@ -20,8 +20,9 @@ use common::{
     kill_group, output_past_a_busy_exec, process_running, real_init, real_net_proxy, require_a11y,
     require_a11y_lookup, require_bwrap, require_dbus, require_document_portal, require_egress,
     require_groff, require_host_program, require_nested_x11, require_nested_x11_host, require_nft,
-    require_pasta, require_portal, require_python, require_security_context, require_system_bus,
-    require_tray, sandboxes_of, say, session_pipewire, stat_of, system_owns, test_pty,
+    require_pasta, require_portal, require_python, require_security_context, require_session,
+    require_system_bus, require_tray, sandboxes_of, say, session_pipewire, stat_of, system_owns,
+    test_pty,
 };
 use rustix::fs::{FlockOperation, OFlags, fcntl_getfl, flock};
 use rustix::process::{Pid, Signal, kill_process};
@@ -2806,7 +2807,7 @@ fn real_dbus_portals_answer_the_flatpak_spawn_a_loader_looks_for() {
 
 #[test]
 fn real_bwrap_alsa_configuration_reaches_the_sandbox() {
-    if !require_bwrap() {
+    if !require_session() || !require_bwrap() {
         return;
     }
     let Some(init) = real_init() else { return };
@@ -2883,11 +2884,11 @@ const PW_CLIENT: &str = include_str!("fixtures/pw_client.py");
 const PW_MON: &str = "/usr/bin/pw-mon";
 const PW_DUMP: &str = "/usr/bin/pw-dump";
 
-/// Whether this host can serve a bubbler audio context: bwrap, the
-/// PipeWire tools, python for the probe, and a session daemon to create
-/// the context on.
+/// Whether this host can serve a bubbler audio context: the opt-in,
+/// bwrap, the PipeWire tools, python for the probe, and a session daemon
+/// to create the context on.
 fn require_pipewire_session() -> bool {
-    if !require_bwrap() || !require_python() {
+    if !require_session() || !require_bwrap() || !require_python() {
         return false;
     }
     for program in [PW_CONTAINER, PW_MON, PW_DUMP] {
@@ -10953,7 +10954,7 @@ fn a_missing_pasta_names_the_package_and_the_host_mode() {
 
 #[test]
 fn a_missing_dbus_proxy_names_the_package() {
-    if !require_bwrap() {
+    if !require_session() || !require_bwrap() {
         return;
     }
     if host_bus().is_none() {

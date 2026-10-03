@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.25.0
+
+### Changed
+
+- Tests that reach the desktop session or start PipeWire daemons run only with
+  `BUBBLER_TEST_SESSION=1`; a plain `cargo test` and the package's `check()`
+  touch no session.
+
 ## 0.24.2
 
 ### Security

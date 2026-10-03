@@ -40,8 +40,22 @@ sandbox probe for one (create a userns, run a real `bwrap`, attach pasta) and
 skip with a printed reason on a host that cannot — a green run says what it
 did not cover. `crates/bubbler-core/tests/proptest.rs` holds the property
 tests: emitter/parser round trip, desktop patch idempotence, include resolver
-never recursing past the stack. With `$WAYLAND_DISPLAY` set the Wayland tests
-run against your own compositor: they map a window and take the focus for a
+never recursing past the stack.
+
+Tests that reach your desktop session — its session and system bus, portals,
+tray, accessibility bus, compositor, clipboard and PipeWire — and the audio
+policy test bed below, which starts PipeWire and WirePlumber daemons of its own,
+run only with `BUBBLER_TEST_SESSION=1`:
+
+```
+BUBBLER_TEST_SESSION=1 cargo test --workspace
+```
+
+Without it (any other value counts as unset) each of them prints `skipping: set
+BUBBLER_TEST_SESSION=1 …` and passes, so a plain `cargo test --workspace` and
+the AUR package's `check()` need no session and start no daemon. With
+`BUBBLER_TEST_SESSION=1` and `$WAYLAND_DISPLAY` set the Wayland tests run
+against your own compositor: they map a window and take the focus for a
 moment, and they take the selection and give it back with one flavour on it —
 its plainest text form, or its first content type where it had no text, so an
 HTML selection comes back as text and an image-only one as the image.
@@ -84,7 +98,7 @@ BUBBLER_SMOKE_STEAM_INSTANCE=<instance> cargo test -p bubbler --test cli -- --ig
 ## Audio policy test bed
 
 ```
-cargo test -p bubbler-core --test real_pipewire
+BUBBLER_TEST_SESSION=1 cargo test -p bubbler-core --test real_pipewire
 ```
 
 A hermetic PipeWire/WirePlumber pair of its own: a private
