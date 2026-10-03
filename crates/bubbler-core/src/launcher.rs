@@ -2173,6 +2173,7 @@ fn install_rules(
     cfg: &NetworkConfig,
     ns: &SandboxNs,
     cgroup: Option<&network::Cgroup>,
+    stop: &AtomicBool,
 ) -> Result<(), LaunchError> {
     let Some(text) = network::ruleset(cfg, cgroup) else {
         // Nothing to install where nothing is filtered — and nothing
@@ -2288,6 +2289,11 @@ fn install_rules(
             NFT_TIMEOUT.as_secs()
         )));
     };
+    // A Ctrl-C reaches `nft` too, in bubbler's process group: killed by
+    // a signal while a stop is pending, it is the stop's doing.
+    if status.signal().is_some() && stop.load(Ordering::SeqCst) {
+        return Err(LaunchError::Stopped);
+    }
     if !status.success() {
         return Err(LaunchError::Network(format!(
             "`{}` refused the outbound ruleset ({status})",
@@ -2556,7 +2562,7 @@ fn start_network(
     stop: &AtomicBool,
 ) -> Result<NetworkSidecars, LaunchError> {
     let ns = sandbox_namespaces(child_pid)?;
-    install_rules(cfg, &ns, cgroup.map(cgroup::SandboxCgroup::spec))?;
+    install_rules(cfg, &ns, cgroup.map(cgroup::SandboxCgroup::spec), stop)?;
     let pasta = start_pasta(env, cfg, child_pid, &ns, stop)?;
     let proxy = cgroup
         .map(|cgroup| start_net_proxy(cfg, &ns, cgroup, env.net_proxy_log, stop))
@@ -3897,13 +3903,12 @@ fn start_and_wait(
             match started {
                 Ok(handle) => Some(handle),
                 Err(e) => {
-                    // A Ctrl-C reaches `nft` and the held bwrap too and
-                    // kills them, which is the stop's doing, as in
-                    // `wait_ready`. A bwrap still running when its info
-                    // deadline passed failed on its own.
+                    // A Ctrl-C reaches the held bwrap too and kills it,
+                    // which is the stop's doing. Any other failure is
+                    // reported, a stop pending or not.
                     let bwrap_ended = matches!(child.try_wait(), Ok(Some(_)));
                     abort_sandbox(&mut child, info.as_ref().map(|(pid, _)| *pid));
-                    if stop.load(Ordering::SeqCst) && (info.is_some() || bwrap_ended) {
+                    if stop.load(Ordering::SeqCst) && bwrap_ended {
                         return Err(LaunchError::Stopped);
                     }
                     return Err(e);

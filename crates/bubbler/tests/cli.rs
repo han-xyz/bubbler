@@ -10688,6 +10688,54 @@ fn a_signal_to_the_process_group_while_nft_runs_ends_as_stopped() {
     assert!(!marker.exists(), "the application ran after the signal");
 }
 
+/// An `nft` that refuses the ruleset on its own is reported even when a
+/// stop signal reached bubbler while it ran: only the stop itself ends
+/// the run as stopped.
+#[test]
+fn an_nft_refusal_while_a_stop_is_pending_still_says_why() {
+    if !require_bwrap() || !require_python() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "t"])
+        .status()
+        .unwrap();
+    let bin = tmp.path().join("refusing-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let (started, signalled) = (tmp.path().join("nft-started"), tmp.path().join("signalled"));
+    write_script(
+        &bin.join("nft"),
+        &format!(
+            "#!/usr/bin/sh\n: > '{}'\n\
+             until [ -e '{}' ]; do /usr/bin/sleep 0.05; done\n\
+             /usr/bin/sleep 0.2\nexit 1\n",
+            started.display(),
+            signalled.display()
+        ),
+    );
+    let run = pasta_case(
+        tmp.path(),
+        &init,
+        "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\" port=443 proto=\"tcp\"\n}\n",
+    )
+    .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+    .args(["run", "t", "--", "/usr/bin/true"])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    if !wait_until(|| started.exists(), Duration::from_secs(10)) {
+        fail_with(run, "nft never started");
+    }
+    kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
+    std::fs::write(&signalled, "").unwrap();
+    let (code, err) = ended(run, "SIGTERM");
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("refused the outbound ruleset"), "{err}");
+}
+
 /// A refusal of the start's own is still reported when a stop signal is
 /// pending as well: bwrap here never writes its info document, which the
 /// run waits out whatever the signal says.
