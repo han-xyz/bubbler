@@ -910,37 +910,35 @@ link at all to a sandbox's stream whose class is not `Stream/Output/Audio`
 or `Stream/Input/Audio`, which the audio grant does not cover (measured:
 until 0.24.2 such a stream was linked and the link then destroyed). Whoever
 owns the stream being linked, it also refuses a link to any node of an
-`org.bubbler` client that is not that stream's own: a sandbox can create
-nodes of its own, and measured on WirePlumber 0.5.18 and PipeWire 1.6.9,
-up to 0.24.1 an `Audio/Sink` a playback or microphone sandbox offered
-with a high `priority.session` became the default sink, there being no
-configured one, and every host stream started afterwards was linked into
-it — the sandbox recorded them without making a link — as was a host
-recorder from an `Audio/Source` it offered. Refusing the link alone left
-those host streams unlinked, since `linking/find-default-target` picks
-the default before the hook runs (measured), so since 0.24.2 a
-sandbox's nodes are also left out of default-node selection and host
-streams go on to the host's own default (measured). The other finders
-can still aim a host stream at a sandbox's node — its smart filter
-(`filter.smart`, `linking/get-filter-from-target`), a node the stream
-names as its target (`linking/find-defined-target`), one ranked above
-the host's own (`linking/find-best-target`) — and until 0.24.2 such
-a stream was refused after `linking/prepare-link` and played nowhere:
-while a playback sandbox offered a smart filter, every host stream that
-started was left unlinked, and so was one aimed at a sink it offered
-(both measured). A hook after every finder and before
-`linking/prepare-link` now hands such a stream what a sandbox's filter
-stood in front of, else the session's default, which is never a
-sandbox's node — through the host's first smart filter in front of it,
-unless the stream is a smart filter's own, which goes there directly
-(measured: the stream plays on the bed's sink, or through the host's
-filter in front of it, and a host filter's own stream stays on the sink
-while a sandbox's filter follows it in the chain). A stream pinned with
-`node.dont-fallback` to a sandbox's node gets no link, as
-`linking/find-defined-target` leaves one whose target is missing
-(measured: before, it was moved to the default). This is bubbler's own
-reading of WirePlumber's search, not WirePlumber's; where the two differ
-is listed under the known gaps below.
+`org.bubbler` client that is not that stream's own.
+
+A sandbox offers no audio device. It can create nodes of its own through
+`client-node` — a sink with `pw-cat` and a `media.class`, a sink and its
+stream with `pw-loopback`, a smart filter (`node.link-group`,
+`filter.smart`) — and measured on WirePlumber 0.5.18 and PipeWire 1.6.9,
+up to 0.24.1 an `Audio/Sink` a sandbox offered with a high
+`priority.session` became the default sink and took every host stream
+started afterwards; 0.24.2 sent such streams elsewhere with a hook of its
+own that re-implemented WirePlumber's target and filter search and
+drifted from it. Since 0.25.0 a node of an `org.bubbler` client whose
+class is not `Stream/Output/Audio` or `Stream/Input/Audio` never becomes
+a session item: the hook stops WirePlumber's `node-added` event before
+`node/create-item`, the only place a node's session item is made, and
+every finder, the smart-filter chain (`lib/filter-utils.lua`) and the
+default-node rescan search session items alone. The node stays in the
+graph, unlinked; its client gets no error and hears nothing through it.
+Measured in the test bed over 200 host streams, each started as soon as a
+fresh sandbox's node appeared — a sink ranked above the host's, the same
+sink named as the stream's target, a smart filter, and a sink named after
+a host device that appears after it, the stream pinned to that name with
+`node.dont-fallback` — every host stream was linked to the host's own
+node, `pw-link -m` saw no link into any sandbox node, and no sandbox node
+became a default; over 20 restarts of WirePlumber with a sandbox's sink
+already in the graph, the same. The `adapter` factory, which makes a node
+owned by the daemon, stays hidden from a sandbox (below), so a node it
+cannot keep out of the session this way is one it cannot make. A JACK
+client's node under `pw-jack` carries no `media.class` at all (measured),
+so stock WirePlumber makes no session item for it either.
 
 That covers the links the session manager makes; a client can also make
 one itself, and node permissions cannot stop it. PipeWire 1.6.8 lets any
@@ -1074,26 +1072,26 @@ not. `camera` is unchanged by any of this: it reaches a device through
 the portal's own fd crossing and permission store, never through a
 `pipewire` or `pulseaudio` grant.
 
-Known gaps, with both files installed. A factory loaded into the daemon
-after a sandbox connected — a module loaded later — keeps that client's
-default permissions and is readable by it: the hook hides factories once,
-when the client's access is decided. (A sandbox connected before
-WirePlumber starts had them hidden in the runs measured; the order in
-which the hook learns of the factories and of the client is not
-guaranteed.) The playback
+Known gaps, with both files installed. A factory the daemon gains after
+a sandbox's access was decided — a module the daemon loads later — is
+hidden from every sandbox already connected when the hook sees it
+appear, and so is one the hook had not yet listed when the access was
+decided; neither case is measured: no client can make the daemon load a
+module (`pw-cli load-module` loads into the client's own process, and
+the test bed's daemon listed the same five factories after it did), so
+the bed cannot produce a late factory. (A sandbox connected before
+WirePlumber starts had them hidden in the runs measured.) A sandbox's
+node is kept out of the session only when its client is already known
+to WirePlumber at `node-added`; that held in every run measured (220,
+none with the client unknown), since a sandbox can create nothing before
+WirePlumber has decided its access, but it is an ordering of WirePlumber's
+object managers, not a guarantee. The playback
 grant protects what a sandbox can hear and record, not the availability
 of host audio: a playback sandbox's own stream can take the default sink
 exclusively (`node.exclusive`, passthrough), and WirePlumber then drops
 new host streams aimed at it; whether sandboxes may use exclusive or
-passthrough output is to be decided in 0.25.0. The redirect of a host
-stream away from a sandbox's node is bubbler's own reading of
-WirePlumber's target and filter search and differs from it in edge
-cases: a sandbox that gives its node the name of a host device that is
-present can come first in WirePlumber's search by name; a host stream
-pinned to that name with `node.dont-fallback` is then refused ("defined
-target not found") although its device exists, and one pinned without it
-plays on the default rather than on its device. That is availability of
-host audio, not capture; the redirect is to be redesigned in 0.25.0.
+passthrough output is to be decided in 0.25.0. A JACK client, which
+links its own ports, links nothing: the link factory is hidden from it.
 Hiding `Audio/Duplex` from a
 playback sandbox also keeps it from playing into a duplex device, such as
 the single node of an ALSA pro-audio profile; that takes the `microphone`
@@ -1112,10 +1110,12 @@ the hook, each new link destroyed in turn.
 `a_playback_context_sees_no_source_no_metadata_and_only_reads_streams`,
 `a_playback_context_that_claims_the_microphone_gets_the_playback_grant`,
 `a_playback_context_cannot_nest_a_context_that_claims_the_microphone`,
-`a_pinned_host_stream_does_not_fall_back_from_a_sink_a_context_names_after_its_device`,
-`a_host_stream_aimed_at_a_sink_a_context_offers_passes_through_the_hosts_filter`,
-`a_host_filters_own_stream_plays_on_past_a_smart_filter_a_context_offers_after_it`,
-`a_host_loopbacks_stream_aimed_at_a_sink_a_context_offers_passes_through_the_hosts_filter`,
+`a_host_stream_does_not_play_into_a_sink_a_playback_context_offers`,
+`a_host_stream_aimed_at_a_sink_a_playback_context_offers_plays_on_the_default`,
+`a_host_stream_passes_by_a_smart_filter_a_playback_context_offers`,
+`a_host_recorder_does_not_record_from_a_source_a_playback_context_offers`,
+`a_host_stream_pinned_to_a_device_whose_name_a_context_copies_links_to_the_device`,
+`a_host_stream_keeps_to_the_hosts_smart_filter_whatever_filter_a_context_offers`,
 `a_session_managers_link_into_a_capture_stream_is_kept_only_where_the_grant_allows`,
 `a_context_connected_before_the_session_manager_cannot_see_the_link_factory`,
 `a_playback_capture_stream_gets_no_link`,

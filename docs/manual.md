@@ -632,15 +632,13 @@ reaches every node the config did not ask for, while without the hook the
 grant is scoped and every other client's audio stays recordable.
 The hook also keeps a sandbox from linking anything itself, and destroys
 any link to or from a sandbox's node that is not one of its own streams
-as WirePlumber would link it, one you draw in a patchbay included. A sink,
-source or filter a sandbox offers through its own connection is never made
-the default and no host stream is linked to it: a host stream aimed at one
-plays on what a sandbox's filter stood in front of, else on the default,
-through your own smart filters (a smart filter's own stream goes there
-directly) — and one pinned to it with `node.dont-fallback` gets no link, as
-with its device missing. Where a sandbox names its node after one of your
-devices, a stream pinned to that device can be refused or sent to the
-default although the device is there. What this does not cover is listed under
+as WirePlumber would link it, one you draw in a patchbay included. A sandbox
+offers no audio device: a sink, source or filter it creates through its own
+connection stays out of WirePlumber's session, so it is never a default, a
+target or one of your smart filters, and your streams are linked as if it
+did not exist — one pinned to a device whose name the sandbox copies
+included. The sandbox's node stays, unlinked, with no error to its
+application. What this does not cover is listed under
 "Audio" in `docs/threat-model.md`. Before 0.24.2 a sandbox could still win
 a link of its own in the first instant of a new connection, now and then,
 and keep it, and
