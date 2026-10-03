@@ -641,8 +641,9 @@ SimpleEventHook {
 -- from the target (lib/linking-utils.lua isLinked). Only a link made
 -- before WirePlumber knew the client, after a restart, can be one; no
 -- rescan undoes it, since prepare-link keeps a stream already linked to
--- its target. The peer is forgotten, as linking/rescan.lua does when it
--- removes a link, so the next rescan reaches the first line again.
+-- its target. The peer and a role-policy priority link are forgotten, as
+-- linking/rescan.lua does when it removes a link, so the next rescan
+-- reaches the first line again.
 local function release_held_targets (source, client_id)
   local items = source:call ("get-object-manager", "session-item")
   local own = {}
@@ -664,6 +665,9 @@ local function release_held_targets (source, client_id)
     log:info (silink, string.format ("removing a link holding its target " ..
         "for client %s, made before WirePlumber knew it", client_id))
     lutils:get_flags (tonumber (silink.properties ["main.item.id"])).peer_id = nil
+    if silink.properties:get_boolean ("is.role.policy.link") then
+      lutils.clearPriorityMediaRoleLink (silink)
+    end
     silink:remove ()
   end
 end
