@@ -22,6 +22,12 @@
   with an errno, and `userns-disabled-with-nested-sandbox` says the mount API
   a nested sandbox needs is denied too.
 
+### Fixed
+
+- A start of an `allow-host` instance removed the empty cgroups of another
+  instance whose name began with its own, and those of a start of the same
+  instance not yet in them, which then failed with "No such device".
+
 ## 0.24.2
 
 ### Security

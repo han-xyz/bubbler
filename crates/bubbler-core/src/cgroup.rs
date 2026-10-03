@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
+use rustix::process::{Pid, test_kill_process};
 
 use crate::error::LaunchError;
 use crate::network;
@@ -187,6 +188,9 @@ pub fn create(instance: &str, pid: u32) -> Result<SandboxCgroup, LaunchError> {
 struct Ops {
     mkdir: fn(&Path) -> Result<(), Errno>,
     rmdir: fn(&Path) -> Result<(), Errno>,
+    /// Whether a pid is a running process, which decides whether a leaf
+    /// is a live run's.
+    alive: fn(i32) -> bool,
 }
 
 impl Ops {
@@ -195,7 +199,14 @@ impl Ops {
     const KERNEL: Self = Self {
         mkdir: kernel_mkdir,
         rmdir: kernel_rmdir,
+        alive: kernel_alive,
     };
+}
+
+/// A process that cannot be signalled for want of permission is still
+/// there; only `ESRCH` says it is gone.
+fn kernel_alive(pid: i32) -> bool {
+    Pid::from_raw(pid).is_some_and(|pid| test_kill_process(pid) != Err(Errno::SRCH))
 }
 
 /// 0755 like every other cgroup: the directory is the user's own and
@@ -236,7 +247,7 @@ fn create_under(
     // that this instance is not running — a live run's directories
     // refuse to be removed anyway, since a cgroup holding a process
     // cannot be.
-    sweep(ops, &home, &prefix);
+    sweep(ops, &home, &prefix, pid);
     let dir = root.join(&base);
     let (sandbox, proxy) = (dir.join(SANDBOX_LEAF), dir.join(PROXY_LEAF));
     for d in [&dir, &sandbox, &proxy] {
@@ -296,18 +307,24 @@ fn remove(ops: Ops, dirs: &[&PathBuf]) {
     }
 }
 
-/// Remove empty cgroups of earlier runs of this instance. A directory
-/// still holding a process — a run that is live, whatever the launcher
-/// thinks — refuses, which is the check that keeps this from touching
-/// anything of another run's.
-fn sweep(ops: Ops, home: &Path, prefix: &str) {
+/// Remove empty cgroups of earlier runs of this instance: those named
+/// `{prefix}{pid}` exactly, whose pid is no running process but `own`.
+/// A live run's leaves stay even while still empty, as they are between
+/// another start's `mkdir` and its move into them; a pid reused since
+/// leaves a leftover for a later start to sweep.
+fn sweep(ops: Ops, home: &Path, prefix: &str, own: u32) {
     let Ok(entries) = std::fs::read_dir(home) else {
         return;
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.starts_with(prefix) {
+        let Some(pid) = name.to_str().and_then(|n| n.strip_prefix(prefix)) else {
+            continue;
+        };
+        if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        if pid != own.to_string() && pid.parse().is_ok_and(ops.alive) {
             continue;
         }
         let dir = entry.path();
@@ -421,6 +438,13 @@ mod tests {
     const FAKE: Ops = Ops {
         mkdir: fake_mkdir,
         rmdir: fake_rmdir,
+        alive: |_| false,
+    };
+
+    /// [`FAKE`] on a host where pid 9 is a running process.
+    const PID_9_ALIVE: Ops = Ops {
+        alive: |pid| pid == 9,
+        ..FAKE
     };
 
     fn fake_mkdir(dir: &Path) -> Result<(), Errno> {
@@ -544,6 +568,57 @@ mod tests {
             "another instance's is not touched"
         );
         assert!(cgroup.proxy.is_dir());
+    }
+
+    /// A leaf is an instance's only under its exact name: `a`'s sweep
+    /// leaves `a-b`'s alone, and a name whose pid is not a number is no
+    /// run's at all.
+    #[test]
+    fn the_sweep_spares_another_instance_whose_name_shares_the_prefix() {
+        let own = "user.slice/app.scope";
+        let tmp = tempfile::tempdir().expect("a temporary directory");
+        let leaves = ["bubbler-a-b-7", "bubbler-a-x9"];
+        let mut cgroups = vec![own.to_owned()];
+        cgroups.extend(leaves.iter().map(|l| format!("{own}/{l}/proxy")));
+        fake_root(
+            tmp.path(),
+            &cgroups.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        let _cgroup = create_under(tmp.path(), own, "a", 22, FAKE).expect("the run's cgroups");
+        for leaf in leaves {
+            assert!(
+                tmp.path().join(own).join(leaf).join("proxy").is_dir(),
+                "{leaf} was swept"
+            );
+        }
+    }
+
+    /// A leaf whose run is still alive stays, populated or not: another
+    /// start of the same instance makes its leaves before it moves into
+    /// them. Once that pid is gone the leaf is a leftover like any other.
+    #[test]
+    fn the_sweep_spares_a_live_run_and_removes_a_dead_one() {
+        let own = "user.slice/app.scope";
+        for (ops, kept) in [(PID_9_ALIVE, true), (FAKE, false)] {
+            let tmp = tempfile::tempdir().expect("a temporary directory");
+            fake_root(tmp.path(), &[own, &format!("{own}/bubbler-a-9/proxy")]);
+            let _cgroup = create_under(tmp.path(), own, "a", 22, ops).expect("the run's cgroups");
+            assert_eq!(
+                tmp.path().join(own).join("bubbler-a-9").exists(),
+                kept,
+                "pid 9 alive: {kept}"
+            );
+        }
+    }
+
+    /// This run's own pid is alive, but a leaf under it is an earlier
+    /// run's that had the pid before.
+    #[test]
+    fn a_leftover_under_this_run_s_own_pid_is_swept() {
+        let own = "user.slice/app.scope";
+        let tmp = tempfile::tempdir().expect("a temporary directory");
+        fake_root(tmp.path(), &[own, &format!("{own}/bubbler-a-9/proxy")]);
+        create_under(tmp.path(), own, "a", 9, PID_9_ALIVE).expect("the run's cgroups");
     }
 
     /// The same instance and pid twice over is the one case the sweep
