@@ -171,6 +171,10 @@ pub const DEVICES: &str = r#"{ "pipewire.sec.engine": "org.bubbler", "pipewire.s
 /// Both children.
 pub const MICROPHONE_DEVICES: &str = r#"{ "pipewire.sec.engine": "org.bubbler", "pipewire.sec.app-id": "bed", "pipewire.sec.instance-id": "t1", "pipewire.access": "restricted", "pipewire.sec.bubbler.audio": "playback,microphone,devices" }"#;
 
+/// The same with the `exclusive` child: a stream may hold a sink for
+/// itself.
+pub const EXCLUSIVE: &str = r#"{ "pipewire.sec.engine": "org.bubbler", "pipewire.sec.app-id": "bed", "pipewire.sec.instance-id": "t1", "pipewire.access": "restricted", "pipewire.sec.bubbler.audio": "playback,exclusive" }"#;
+
 /// A grant string the drop-in does not know, as a future bubbler or a
 /// typo could produce.
 pub const BOGUS_GRANT: &str = r#"{ "pipewire.sec.engine": "org.bubbler", "pipewire.sec.app-id": "bed", "pipewire.access": "restricted", "pipewire.sec.bubbler.audio": "bogus" }"#;
@@ -3180,4 +3184,129 @@ fn a_context_that_is_not_bubblers_keeps_the_reach_it_had() {
             node.permissions
         );
     }
+}
+
+/// What stock WirePlumber logs when it turns a stream away from a sink
+/// another stream holds for itself (linking/prepare-link.lua, 0.5.18).
+const HELD_EXCLUSIVELY: &str = "target is linked exclusively";
+
+/// Wait until the stream `holder` is either linked to the sink or gone,
+/// its client having been told why it is not: either way WirePlumber has
+/// decided it, so a stream started after this one meets that decision.
+fn holder_decided(bed: &PipeWireBed, holder: &mut Streaming) {
+    wait_for("the holding stream linked or turned away", || {
+        !peers(&bed.links(), "holder:output_FL").is_empty()
+            || holder.0.try_wait().expect("the holder's status").is_some()
+    });
+}
+
+/// A host stream, started on the host once `holder` is decided, and
+/// waited for on the sink.
+fn host_stream_on_the_sink(bed: &PipeWireBed) -> Streaming {
+    let host = host_stream(bed, &["-p", "-a", "-P", "{ node.name = host }", "-"]);
+    wait_for("the host stream on the sink", || {
+        peers(&bed.links(), "host:output_FL").contains(&"bed-sink:playback_FL")
+    });
+    host
+}
+
+fn wireplumber_log(bed: &PipeWireBed) -> String {
+    std::fs::read_to_string(bed.dir().join("wireplumber.log")).unwrap_or_default()
+}
+
+/// A playback context's stream that asks for the sink exclusively is not
+/// linked and its client is told so; a host stream started after it
+/// plays on the sink.
+///
+/// The encoded-only half of the rule has no row: the session item's
+/// `item.node.encoded-only` is WirePlumber's own (measured on 0.5.18: a
+/// node carrying it `true` gets an item carrying it `false`), and the
+/// bed's null sink takes no encoded format to make a stream that is.
+#[test]
+fn a_host_stream_plays_after_a_playback_contexts_stream_asked_for_the_sink_alone() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let told = bed.dir().join("holder.log");
+    let mut holder = Streaming(bed.spawn_in_context_logged(
+        PLAYBACK,
+        "pw-cat -p -a -P '{ node.name = holder, node.exclusive = true }' /dev/zero",
+        Some(&told),
+    ));
+    holder_decided(&bed, &mut holder);
+    let _host = host_stream_on_the_sink(&bed);
+
+    assert!(
+        peers(&bed.links(), "holder:output_FL").is_empty(),
+        "the holder was linked:\n{}",
+        bed.links()
+    );
+    let said = std::fs::read_to_string(&told).unwrap_or_default();
+    assert!(
+        said.contains("needs the exclusive grant"),
+        "the holder's client was not told why:\n{said}"
+    );
+    assert!(!wireplumber_log(&bed).contains(HELD_EXCLUSIVELY));
+}
+
+/// The same through the private pulse server: a pulse client may set
+/// `node.exclusive` on the stream the server makes for it.
+#[test]
+fn a_host_stream_plays_after_a_pulse_clients_stream_asked_for_the_sink_alone() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let server = bed.pulse_server(PLAYBACK);
+    let mut holder = server.spawn(
+        "pacat",
+        &[
+            "--property=node.exclusive=true",
+            "--property=node.name=holder",
+            "/dev/zero",
+        ]
+        .map(OsStr::new),
+    );
+    holder_decided(&bed, &mut holder);
+    let _host = host_stream_on_the_sink(&bed);
+
+    assert!(
+        peers(&bed.links(), "holder:output_FL").is_empty(),
+        "the pulse client's stream was linked:\n{}",
+        bed.links()
+    );
+    let ended = holder.0.try_wait().expect("pacat's status");
+    assert!(
+        ended.is_some_and(|status| !status.success()),
+        "pacat was not told its stream failed: {ended:?}"
+    );
+    assert!(!wireplumber_log(&bed).contains(HELD_EXCLUSIVELY));
+}
+
+/// With the `exclusive` grant stock behaviour holds: the context's stream
+/// takes the sink for itself and a host stream started after it is
+/// turned away.
+#[test]
+fn an_exclusive_contexts_stream_holds_the_sink_against_a_later_host_stream() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let mut holder = Streaming(bed.spawn_in_context(
+        EXCLUSIVE,
+        "pw-cat -p -a -P '{ node.name = holder, node.exclusive = true }' /dev/zero",
+    ));
+    holder_decided(&bed, &mut holder);
+    assert!(
+        peers(&bed.links(), "holder:output_FL").contains(&"bed-sink:playback_FL"),
+        "the exclusive context's stream was not linked:\n{}",
+        bed.links()
+    );
+    let _host = host_stream(&bed, &["-p", "-a", "-P", "{ node.name = host }", "-"]);
+    wait_for("the host stream turned away from the held sink", || {
+        wireplumber_log(&bed).contains(HELD_EXCLUSIVELY)
+    });
+    assert!(
+        peers(&bed.links(), "host:output_FL").is_empty(),
+        "the host stream was linked to a held sink:\n{}",
+        bed.links()
+    );
 }

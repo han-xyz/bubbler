@@ -58,16 +58,32 @@
 -- device. Every factory but `client-node` stays hidden from it all the
 -- same, so its devices are nodes it runs itself, carrying its client id.
 --
+-- A stream may hold its target for itself: ask for it exclusively
+-- (`node.exclusive`) or pass encoded audio through it, and stock
+-- WirePlumber then turns every stream that comes later away from that
+-- target ("target is linked exclusively", linking/prepare-link.lua). Of a
+-- sandbox without the exclusive grant (`exclusive` in its grant) such a
+-- stream is not linked and its client is told why, and its other streams
+-- are linked mixed, never in passthrough. Linking the stream shared
+-- instead is not open to a hook: the stock scripts read `node.exclusive`
+-- from the session item's properties, which a hook cannot change
+-- (measured on WirePlumber 0.5.18).
+--
 -- A link with a sandbox's node at either end is destroyed when
 -- WirePlumber sees it, unless WirePlumber made it and it is one the
 -- hooks above would have let it make; one drawn in a patchbay is
 -- destroyed.
 
 local lutils = require ("linking-utils")
+local cutils = require ("common-utils")
 local log = Log.open_topic ("s-linking")
 
 -- The engine name bubbler gives every security context it creates.
 local BUBBLER_ENGINE = "org.bubbler"
+
+-- -EPERM, the error a client is sent whose stream is refused for
+-- holding its target.
+local EPERM = -1
 
 -- The one media class a sandbox's stream may have in each direction:
 -- what the audio grant covers, and all the hooks below link.
@@ -96,11 +112,17 @@ local function bubbler_client (source, client_id)
   return nil
 end
 
+-- Whether the client's grant holds `word`: the grant is a
+-- comma-separated list of words, and no word may match inside another.
+local function granted (client, word)
+  local grant = client.properties ["pipewire.sec.bubbler.audio"] or ""
+  return ("," .. grant .. ","):find ("," .. word .. ",", 1, true) ~= nil
+end
+
 -- Whether the client's grant lets its own devices stand beside the
 -- host's.
 local function offers_devices (client)
-  local grant = client.properties ["pipewire.sec.bubbler.audio"] or ""
-  return ("," .. grant .. ","):find (",devices,", 1, true) ~= nil
+  return granted (client, "devices")
 end
 
 -- Whether the target is a sandbox's node that is not the stream's own:
@@ -127,8 +149,19 @@ local function capture_capable (node_props)
   return class:find ("^Audio/Source") ~= nil or class == "Audio/Duplex"
 end
 
+-- Whether the stream would hold its target for itself: asked for it
+-- exclusively, or able to play encoded audio only, which is passed
+-- through unmixed.
+local function holds_its_target (si_props)
+  return cutils.parseBool (si_props ["node.exclusive"]) or
+      cutils.parseBool (si_props ["item.node.encoded-only"])
+end
+
+local HOLDS_ITS_TARGET =
+    "a stream that would hold its target for itself, without the exclusive grant"
+
 -- Why this link may not be made, or nil where it may.
-local function refusal (si_props, target_props, grant)
+local function refusal (si_props, target_props, client)
   if si_props ["media.class"] ~=
       AUDIO_STREAM_CLASS [si_props ["item.node.direction"]] then
     return "a node that is not an audio stream"
@@ -137,6 +170,10 @@ local function refusal (si_props, target_props, grant)
   if target_props ["item.node.type"] == "stream" and
       target_props ["client.id"] ~= si_props ["client.id"] then
     return "another client's stream"
+  end
+
+  if holds_its_target (si_props) and not granted (client, "exclusive") then
+    return HOLDS_ITS_TARGET
   end
 
   if si_props ["item.node.direction"] ~= "input" then
@@ -151,7 +188,7 @@ local function refusal (si_props, target_props, grant)
         "a sink's monitor ports" or "a node that is not a source"
   end
 
-  if not string.find (grant, "microphone", 1, true) then
+  if not granted (client, "microphone") then
     return "a source, without the microphone grant"
   end
 
@@ -168,7 +205,7 @@ SimpleEventHook {
     },
   },
   execute = function (event)
-    local source, _, si, si_props, _, target =
+    local source, _, si, si_props, si_flags, target =
         lutils:unwrap_select_target_event (event)
 
     if not target then
@@ -177,15 +214,13 @@ SimpleEventHook {
 
     local target_props = target.properties
     local why
+    local client = bubbler_client (source, si_props ["client.id"])
     if foreign_sandbox_node (source, si_props, target_props) then
       why = "a sandbox's node that is not the stream's own"
+    elseif not client then
+      return
     else
-      local client = bubbler_client (source, si_props ["client.id"])
-      if not client then
-        return
-      end
-      why = refusal (si_props, target_props,
-          client.properties ["pipewire.sec.bubbler.audio"] or "")
+      why = refusal (si_props, target_props, client)
     end
 
     if why then
@@ -195,6 +230,17 @@ SimpleEventHook {
           tostring (target_props ["node.name"]),
           why))
       event:set_data ("target", nil)
+      -- Told, as stock tells a stream it turns away from a held target;
+      -- the other refusals leave a stream that may yet be linked elsewhere.
+      if why == HOLDS_ITS_TARGET then
+        lutils.sendClientError (event, si:get_associated_proxy ("node"),
+            EPERM, "bubbler: holding a device for one stream needs the " ..
+            "exclusive grant")
+      end
+    elseif not granted (client, "exclusive") then
+      -- link-target marks a passthrough link, which holds the target as
+      -- an exclusive one does (lib/linking-utils.lua isLinked).
+      si_flags.can_passthrough = false
     end
   end
 }:register ()
@@ -473,8 +519,7 @@ local function own_stream_link (source, link, sandbox_output, sandbox_input)
   local host = lookup (source, "node", link.properties ["link.output.node"])
   local client = bubbler_client (source, sandbox_input ["client.id"])
   return host ~= nil and client ~= nil and capture_capable (host.properties) and
-      string.find (client.properties ["pipewire.sec.bubbler.audio"] or "",
-          "microphone", 1, true) ~= nil
+      granted (client, "microphone")
 end
 
 -- Whether `props` are those of a device a sandbox offers under the device
@@ -500,8 +545,7 @@ local function offered_device_link (source, output, input)
   end
   local client = bubbler_client (source, input ["client.id"])
   return client == nil or (capture_capable (output) and
-      string.find (client.properties ["pipewire.sec.bubbler.audio"] or "",
-          "microphone", 1, true) ~= nil)
+      granted (client, "microphone"))
 end
 
 -- The `object.serial` of every link already asked to go, which a later
