@@ -51,7 +51,7 @@ sandbox. `?` on any screen lists keys:
 | instances | `Enter` grants, `r` run, `o` open, `x` exec, `t` try, `n` new, `d` delete, `R` reseed, `e` `$EDITOR`, `l` lint, `L` log, `D` desktop entry, `W` shim, `X` explain, `p` profiles, `^R` re-read |
 | grants | `Space` grant / disable (keeps the line) / enable, `Enter` edit the node as one line of KDL, `Del` remove the entry (`Backspace` too), `e` `$EDITOR`, `s` save, `u` undo, `l` lint, `X` explain, `Esc` back |
 | profiles | `Enter` show flattened, `c` create instance, `e` edit your layer, `l` lint |
-| viewer | `j`/`k` scroll, `f` every argument and the seccomp filter, `p` the proxy's argv |
+| viewer | `j`/`k` scroll, `f` arguments and filter, `p` the proxy's argv |
 
 `Space` on a granted node that carries an argument, a property or children
 writes it back as a `/-` line rather than dropping what it said (see
