@@ -39,9 +39,10 @@ use std::time::{Duration, Instant};
 
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
-use rustix::process::{Pid, test_kill_process};
+use rustix::process::Pid;
 
 use crate::error::LaunchError;
+use crate::host;
 use crate::network;
 
 /// Where the unified hierarchy is mounted. Every path a rule carries is
@@ -203,10 +204,8 @@ impl Ops {
     };
 }
 
-/// A process that cannot be signalled for want of permission is still
-/// there; only `ESRCH` says it is gone.
 fn kernel_alive(pid: i32) -> bool {
-    Pid::from_raw(pid).is_some_and(|pid| test_kill_process(pid) != Err(Errno::SRCH))
+    Pid::from_raw(pid).is_some_and(host::pid_alive)
 }
 
 /// 0755 like every other cgroup: the directory is the user's own and
@@ -324,8 +323,9 @@ fn sweep(ops: Ops, home: &Path, prefix: &str, own: u32) {
         if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
-        if pid != own.to_string() && pid.parse().is_ok_and(ops.alive) {
-            continue;
+        match pid.parse::<i32>() {
+            Ok(pid) if pid as u32 == own || !(ops.alive)(pid) => {}
+            _ => continue,
         }
         let dir = entry.path();
         remove(
@@ -571,13 +571,13 @@ mod tests {
     }
 
     /// A leaf is an instance's only under its exact name: `a`'s sweep
-    /// leaves `a-b`'s alone, and a name whose pid is not a number is no
-    /// run's at all.
+    /// leaves `a-b`'s alone, and a name whose pid is not a number, or no
+    /// pid there can be, is no run's at all.
     #[test]
     fn the_sweep_spares_another_instance_whose_name_shares_the_prefix() {
         let own = "user.slice/app.scope";
         let tmp = tempfile::tempdir().expect("a temporary directory");
-        let leaves = ["bubbler-a-b-7", "bubbler-a-x9"];
+        let leaves = ["bubbler-a-b-7", "bubbler-a-x9", "bubbler-a-99999999999"];
         let mut cgroups = vec![own.to_owned()];
         cgroups.extend(leaves.iter().map(|l| format!("{own}/{l}/proxy")));
         fake_root(
@@ -618,6 +618,8 @@ mod tests {
         let own = "user.slice/app.scope";
         let tmp = tempfile::tempdir().expect("a temporary directory");
         fake_root(tmp.path(), &[own, &format!("{own}/bubbler-a-9/proxy")]);
+        // The run makes the same leaves again, so the leftover being gone
+        // is the `mkdir` succeeding: one left in place fails it.
         create_under(tmp.path(), own, "a", 9, PID_9_ALIVE).expect("the run's cgroups");
     }
 

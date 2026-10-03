@@ -24,7 +24,7 @@ use rustix::ioctl::{self, Opcode};
 use rustix::pipe::{PipeFlags, pipe_with};
 use rustix::process::{
     DumpableBehavior, Pid, Signal, kill_process, set_dumpable_behavior,
-    set_parent_process_death_signal, test_kill_process,
+    set_parent_process_death_signal,
 };
 use rustix::thread::{
     CapabilitiesSecureBits, CapabilitySet, CapabilitySets, LinkNameSpaceType, capabilities,
@@ -45,7 +45,8 @@ use crate::instance::Instance;
 use crate::tty::{self, Pty, RawGuard, RelayEnd, StdioTarget, TtyMode};
 use crate::wayland::{ProxyPlan, WaylandError};
 use crate::{
-    cgroup, dbus, exec, init_bin, network, pipewire, run_log, seccomp, service, version, wayland,
+    cgroup, dbus, exec, host, init_bin, network, pipewire, run_log, seccomp, service, version,
+    wayland,
 };
 
 /// How often a running sandbox is checked for having exited.
@@ -3390,11 +3391,9 @@ fn sweep_identity(dir: &Path) {
     let Ok(info) = std::fs::read(dir.join(dbus::BWRAPINFO)) else {
         return;
     };
-    // `kill(pid, 0)` fails with ESRCH only when no process has that pid;
-    // EPERM means it is alive and owned by someone else.
     let gone = parse_child_pid(&info)
         .and_then(Pid::from_raw)
-        .is_some_and(|pid| test_kill_process(pid) == Err(Errno::SRCH));
+        .is_some_and(|pid| !host::pid_alive(pid));
     if gone {
         let _ = std::fs::remove_dir_all(dir);
     }

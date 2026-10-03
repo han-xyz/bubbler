@@ -6,8 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::Mode;
-use rustix::io::Errno;
-use rustix::process::{Pid, test_kill_process};
+use rustix::process::Pid;
 
 use crate::config::{self, InstanceConfig, NetworkConfig, Portal, Service, WaylandMode, X11Mode};
 use crate::env::Env;
@@ -15,7 +14,7 @@ use crate::error::{InstanceError, ReadError};
 use crate::fsutil;
 use crate::kdl_out;
 use crate::profile::{self, PROFILE_HEADER};
-use crate::{dbus, exec, launcher};
+use crate::{dbus, exec, host, launcher};
 
 const CONFIG_FILE: &str = "config.kdl";
 
@@ -404,9 +403,7 @@ fn sweep_dir(dir: &Path, prefix: &str) {
         else {
             continue;
         };
-        // `kill(pid, 0)` fails with ESRCH only when no process has that
-        // pid; EPERM means it is alive and owned by someone else.
-        if test_kill_process(pid) != Err(Errno::SRCH) {
+        if host::pid_alive(pid) {
             continue;
         }
         if let Err(e) = fs::remove_dir_all(entry.path()) {

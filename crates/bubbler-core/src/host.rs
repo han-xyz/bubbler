@@ -6,6 +6,15 @@ use std::fs::{self, FileType};
 use std::io;
 use std::path::{Path, PathBuf};
 
+use rustix::io::Errno;
+use rustix::process::{Pid, test_kill_process};
+
+/// Whether a process has `pid`. `kill(pid, 0)` fails with ESRCH only
+/// when none has; EPERM means it is alive and owned by someone else.
+pub(crate) fn pid_alive(pid: Pid) -> bool {
+    test_kill_process(pid) != Err(Errno::SRCH)
+}
+
 /// Read-only view of the host filesystem used to decide what to bind.
 pub trait Host {
     /// Type of `p` with symlinks followed; `None` if it does not exist.
