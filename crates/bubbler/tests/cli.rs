@@ -15,13 +15,13 @@ use bubbler_core::pipewire::{PULSE_MODULE, PW_CONTAINER};
 use bubbler_core::profile::NAMES;
 use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
-    PYTHON, bubbler, bubbler_audio, bubbler_dbus, bubbler_in_sh, bubbler_live, bubbler_wayland,
-    bwrap_alive, bwraps_under, command_lines, holders_of, host_bus, isolated, kill_group,
-    output_past_a_busy_exec, process_running, real_init, real_net_proxy, require_a11y,
+    PYTHON, Stat, bubbler, bubbler_audio, bubbler_dbus, bubbler_in_sh, bubbler_live,
+    bubbler_wayland, bwrap_alive, bwraps_under, command_lines, holders_of, host_bus, isolated,
+    kill_group, output_past_a_busy_exec, process_running, real_init, real_net_proxy, require_a11y,
     require_a11y_lookup, require_bwrap, require_dbus, require_document_portal, require_egress,
     require_groff, require_host_program, require_nested_x11, require_nested_x11_host, require_nft,
     require_pasta, require_portal, require_python, require_security_context, require_system_bus,
-    require_tray, sandboxes_of, say, session_pipewire, system_owns, test_pty,
+    require_tray, sandboxes_of, say, session_pipewire, stat_of, system_owns, test_pty,
 };
 use rustix::fs::{FlockOperation, OFlags, fcntl_getfl, flock};
 use rustix::process::{Pid, Signal, kill_process};
@@ -6061,31 +6061,42 @@ fn real_allow_host_the_egress_proxy_holds_no_terminal_of_the_callers() {
     assert_eq!(out.status.code(), Some(0), "{shown}");
 }
 
-/// What `/proc/<pid>/stat` says of a process's terminal: its `comm`,
-/// parent, session (field 6) and `tty_nr` (field 7, 0 for none).
-#[derive(Debug, Clone)]
-struct TerminalStat {
-    comm: String,
-    ppid: i32,
-    session: i32,
-    tty_nr: i32,
+/// A process by pid and start time, so a pid the kernel hands out again
+/// is not taken for it.
+type Started = (i32, u64);
+
+/// bubbler `pid`'s pasta and egress proxy, as their `/proc/<pid>/stat`
+/// reads, once both have started.
+fn network_sidecars(pid: i32) -> Option<[(i32, Stat); 2]> {
+    let mut kids: Vec<(i32, Stat)> = std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|e| e.file_name().to_string_lossy().parse::<i32>().ok())
+        .filter_map(|p| stat_of(p).map(|s| (p, s)))
+        .filter(|(_, s)| s.ppid == pid)
+        .collect();
+    // pasta is a link to passt, and execs a build for this CPU.
+    let pasta = kids
+        .iter()
+        .position(|(_, s)| s.comm.starts_with("pasta") || s.comm.starts_with("passt"))?;
+    let pasta = kids.swap_remove(pasta);
+    let proxy = kids
+        .into_iter()
+        .find(|(_, s)| s.comm.starts_with("bubbler-net"))?;
+    Some([pasta, proxy])
 }
 
-fn terminal_stat(pid: i32) -> Option<TerminalStat> {
-    let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let (head, tail) = raw.rsplit_once(')')?;
-    let fields: Vec<&str> = tail.split_whitespace().collect();
-    Some(TerminalStat {
-        comm: head.split_once('(')?.1.to_owned(),
-        ppid: fields.get(1)?.parse().ok()?,
-        session: fields.get(3)?.parse().ok()?,
-        tty_nr: fields.get(4)?.parse().ok()?,
-    })
+/// Whether any of `procs` is still running as the process it was.
+fn any_outlived(procs: &[Started]) -> bool {
+    procs
+        .iter()
+        .any(|(pid, start)| stat_of(*pid).is_some_and(|s| s.start == *start && s.state != 'Z'))
 }
 
 /// pasta and the egress proxy are each in a session of their own with no
 /// controlling terminal, even when bubbler was started on one: a sidecar
 /// in bubbler's session could open `/dev/tty` and reach the caller's.
+/// Out of bubbler's process group, they still end with the run.
 #[test]
 fn real_allow_host_pasta_and_the_egress_proxy_have_no_controlling_terminal() {
     if !require_egress() {
@@ -6123,36 +6134,18 @@ fn real_allow_host_pasta_and_the_egress_proxy_have_no_controlling_terminal() {
     let mut seen = None;
     wait_until(
         || {
-            let Some(own) = terminal_stat(me) else {
-                return false;
-            };
-            let kids: Vec<_> = std::fs::read_dir("/proc")
-                .unwrap()
-                .flatten()
-                .filter_map(|e| e.file_name().to_string_lossy().parse::<i32>().ok())
-                .filter_map(|pid| terminal_stat(pid).map(|s| (pid, s)))
-                .filter(|(_, s)| s.ppid == me)
-                .collect();
-            let pick = |names: &[&str]| {
-                kids.iter()
-                    .find(|(_, s)| names.iter().any(|n| s.comm.starts_with(n)))
-                    .map(|(_, s)| s.clone())
-            };
-            // pasta is a link to passt, and execs a build for this CPU.
-            let pasta = pick(&["pasta", "passt"]);
-            if let (Some(pasta), Some(proxy)) = (pasta, pick(&["bubbler-net"])) {
-                seen = Some((own, pasta, proxy));
-            }
+            seen = stat_of(me).zip(network_sidecars(me));
             seen.is_some()
         },
         Duration::from_secs(10),
     );
     let out = run.wait_with_output().unwrap();
     let shown = pty.read_until(Duration::from_millis(200), |_| false);
-    let (own, pasta, proxy) =
+    let (own, sidecars) =
         seen.unwrap_or_else(|| panic!("pasta and the egress proxy were never seen: {shown}"));
+    let started: Vec<Started> = sidecars.iter().map(|(pid, s)| (*pid, s.start)).collect();
     assert_ne!(own.tty_nr, 0, "bubbler was given no terminal: {own:?}");
-    for sidecar in [pasta, proxy] {
+    for (_, sidecar) in &sidecars {
         assert_eq!(sidecar.tty_nr, 0, "{sidecar:?} holds bubbler's terminal");
         assert_ne!(
             sidecar.session, own.session,
@@ -6160,6 +6153,10 @@ fn real_allow_host_pasta_and_the_egress_proxy_have_no_controlling_terminal() {
         );
     }
     assert_eq!(out.status.code(), Some(0), "{shown}");
+    assert!(
+        wait_until(|| !any_outlived(&started), Duration::from_secs(5)),
+        "pasta or the egress proxy outlived the run: {started:?}"
+    );
 }
 
 const NSENTER: &str = "/usr/bin/nsenter";
@@ -10423,19 +10420,32 @@ fn fake_pasta_pid(root: &Path) -> Option<i32> {
 }
 
 /// SIGTERM to `run`, and its exit status and stderr once it has gone.
-fn stop_run(mut run: Child) -> (Option<i32>, String) {
+fn stop_run(run: Child) -> (Option<i32>, String) {
     kill_process(Pid::from_child(&run), Signal::TERM).unwrap();
+    ended(run, "SIGTERM")
+}
+
+/// SIGINT to `run`'s process group, as a Ctrl-C at a terminal sends it,
+/// and the run's exit status and stderr once it has gone. `run` leads
+/// its own group (`process_group(0)`).
+fn interrupt_group(run: Child) -> (Option<i32>, String) {
+    rustix::process::kill_process_group(Pid::from_child(&run), Signal::INT).unwrap();
+    ended(run, "SIGINT to its process group")
+}
+
+/// `run`'s exit status and stderr once it has gone, after `signal`.
+fn ended(mut run: Child, signal: &str) -> (Option<i32>, String) {
     let mut status = None;
-    assert!(
-        wait_until(
-            || {
-                status = run.try_wait().expect("waiting for the run");
-                status.is_some()
-            },
-            Duration::from_secs(15)
-        ),
-        "the run did not stop after SIGTERM"
-    );
+    if !wait_until(
+        || {
+            status = run.try_wait().expect("waiting for the run");
+            status.is_some()
+        },
+        Duration::from_secs(15),
+    ) {
+        kill_group(&run);
+        panic!("the run did not stop after {signal}");
+    }
     let err = String::from_utf8_lossy(&run.wait_with_output().unwrap().stderr).into_owned();
     (status.and_then(|s| s.code()), err)
 }
@@ -10552,6 +10562,84 @@ fn a_signal_while_the_egress_proxy_starts_removes_the_runs_cgroup() {
         "pasta outlived the run"
     );
     assert!(!cgroup.exists(), "the start left {}", cgroup.display());
+}
+
+/// A Ctrl-C at a terminal reaches bubbler's process group, which pasta
+/// and the egress proxy are not in: bubbler's own stop is what ends them,
+/// and the run ends as stopped.
+#[test]
+fn a_signal_to_the_process_group_while_the_egress_proxy_starts_stops_both_sidecars() {
+    if !require_egress() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_live(tmp.path(), &init)
+        .args(["create", "egint"])
+        .status()
+        .unwrap();
+    let proxy = tmp.path().join("silent-net-proxy");
+    write_script(
+        &proxy,
+        "#!/usr/bin/sh\necho $$ > /home/bubbler/proxy-pid\nexec /usr/bin/sleep 30\n",
+    );
+    let home = tmp.path().join("data/bubbler/instances/egint/home");
+    // Its own instance name: a start sweeps the empty cgroups of its
+    // instance's earlier runs, and the proxy leaf of another test's
+    // starting run of the same name is one.
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/egint/config.kdl"),
+        "network {\n    outbound \"deny\"\n    allow-host \"localhost\" port=9\n}\n",
+    )
+    .unwrap();
+    let fake = tmp.path().join("fake-pasta");
+    write_script(&fake, FAKE_PASTA);
+    let run = bubbler_live(tmp.path(), &init)
+        .env("BUBBLER_PASTA", &fake)
+        .env("FAKE_PASTA_ARGV", tmp.path().join("pasta.argv"))
+        .env("FAKE_PASTA_PID", tmp.path().join("pasta.pid"))
+        .env("BUBBLER_NET_PROXY", &proxy)
+        .args(["run", "egint", "--", "/usr/bin/touch", "/home/bubbler/ran"])
+        .process_group(0)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut proxy_pid = None;
+    if !wait_until(
+        || {
+            proxy_pid = std::fs::read_to_string(home.join("proxy-pid"))
+                .ok()
+                .and_then(|t| t.trim().parse::<i32>().ok());
+            proxy_pid.is_some()
+        },
+        Duration::from_secs(10),
+    ) {
+        kill_group(&run);
+        fail_with(run, "the egress proxy never started");
+    }
+    let pasta = fake_pasta_pid(tmp.path()).expect("pasta reported before the proxy started");
+    let started: Vec<Started> = [pasta, proxy_pid.unwrap()]
+        .into_iter()
+        .map(|pid| {
+            (
+                pid,
+                stat_of(pid)
+                    .expect("a sidecar gone before the signal")
+                    .start,
+            )
+        })
+        .collect();
+    let (code, err) = interrupt_group(run);
+    assert_eq!(code, Some(143), "{err}");
+    assert!(
+        !home.join("ran").exists(),
+        "the application ran after the signal"
+    );
+    assert!(
+        wait_until(|| !any_outlived(&started), Duration::from_secs(5)),
+        "pasta or the egress proxy outlived the run: {started:?}"
+    );
 }
 
 /// A refusal of the start's own is still reported when a stop signal is

@@ -2403,7 +2403,21 @@ fn start_pasta(
     // trail) and never as the caller's own descriptor.
     let (log, stderr) = run_log::relay()?;
     let log_too = log.try_clone().map_err(LaunchError::Data)?;
-    let mut cmd = Command::new(network::program(env));
+    let missing = || LaunchError::BadValue {
+        service: "network",
+        reason: format!(
+            "`{}` is not on PATH; install the `passt` package, or write \
+             `network \"host\"` to use the host network namespace",
+            network::PASTA_BIN
+        ),
+    };
+    let program = match &env.pasta_override {
+        Some(path) => path.clone(),
+        // Looked up here, so the forked child `execve`s a path rather than
+        // walking `PATH` after `fork`.
+        None => on_path(network::PASTA_BIN).ok_or_else(missing)?,
+    };
+    let mut cmd = Command::new(program);
     cmd.args(&argv)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
@@ -2419,14 +2433,7 @@ fn start_pasta(
         });
     }
     let child = cmd.spawn().map_err(|e| match e.kind() {
-        io::ErrorKind::NotFound => LaunchError::BadValue {
-            service: "network",
-            reason: format!(
-                "`{}` is not on PATH; install the `passt` package, or write \
-                     `network \"host\"` to use the host network namespace",
-                network::PASTA_BIN
-            ),
-        },
+        io::ErrorKind::NotFound => missing(),
         _ => LaunchError::Spawn(e),
     })?;
     // From here on every exit path stops pasta through the handle.
@@ -2618,8 +2625,11 @@ fn start_net_proxy(
     // borrows descriptors nothing has closed.
     //
     // What the exec'd proxy ends up holding, and why each step is in
-    // this order. The pid goes into `cgroup.procs` first, while the
-    // process is still bubbler's own uid in bubbler's own namespaces:
+    // this order. `setsid` first, which needs nothing: in a session of
+    // its own the proxy has no controlling terminal, so it cannot open
+    // `/dev/tty` and reach the caller's. The pid goes into `cgroup.procs`
+    // next, while the process is still bubbler's own uid in bubbler's
+    // own namespaces:
     // that is what the ruleset accepts, and doing it after the joins
     // would write through a descriptor from a namespace that no longer
     // matches. The user namespace is entered before the other two,
@@ -2642,10 +2652,7 @@ fn start_net_proxy(
     // no `execve` from here can gain a privilege, whatever it finds.
     // Last, the parent-death signal so a bubbler that is killed takes
     // the proxy with it, and `PR_SET_DUMPABLE 0` for the time before
-    // `execve`, which resets it; the proxy sets it again itself. `setsid`
-    // comes first and needs nothing: in a session of its own the proxy
-    // has no controlling terminal, so it cannot open `/dev/tty` and reach
-    // the caller's.
+    // `execve`, which resets it; the proxy sets it again itself.
     unsafe {
         cmd.pre_exec(move || {
             rustix::process::setsid()?;

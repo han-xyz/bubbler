@@ -933,14 +933,6 @@ fn forwards(cfg: &NetworkConfig, udp: bool) -> OsString {
     }
 }
 
-/// The pasta binary to run: `$BUBBLER_PASTA` when it is set, else
-/// [`PASTA_BIN`] from `PATH`.
-pub fn program(env: &Env) -> PathBuf {
-    env.pasta_override
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(PASTA_BIN))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

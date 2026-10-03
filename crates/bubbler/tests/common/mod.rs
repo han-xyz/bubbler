@@ -547,15 +547,19 @@ pub fn bwrap_alive(bwraps: &[Started]) -> bool {
         .any(|b| stat_of(b.pid).is_some_and(|s| s.start == b.start && s.state != 'Z'))
 }
 
-/// What [`bwraps_under`] reads of one `/proc/<pid>/stat`.
-struct Stat {
-    comm: String,
-    state: char,
-    ppid: i32,
-    start: u64,
+/// What the tests read of one `/proc/<pid>/stat`: `session` is field 6
+/// and `tty_nr` field 7, 0 for no controlling terminal.
+#[derive(Debug)]
+pub struct Stat {
+    pub comm: String,
+    pub state: char,
+    pub ppid: i32,
+    pub session: i32,
+    pub tty_nr: i32,
+    pub start: u64,
 }
 
-fn stat_of(pid: i32) -> Option<Stat> {
+pub fn stat_of(pid: i32) -> Option<Stat> {
     let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // The name is in parentheses and may hold spaces or parentheses of
     // its own, so the fields after it are counted from the last `)`.
@@ -566,6 +570,8 @@ fn stat_of(pid: i32) -> Option<Stat> {
         comm,
         state: fields.first()?.chars().next()?,
         ppid: fields.get(1)?.parse().ok()?,
+        session: fields.get(3)?.parse().ok()?,
+        tty_nr: fields.get(4)?.parse().ok()?,
         start: fields.get(19)?.parse().ok()?,
     })
 }
