@@ -9,7 +9,7 @@ use std::ffi::{OsStr, OsString, c_void};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -3708,33 +3708,56 @@ pub fn run(
 /// stops it.
 const STOPPED_CODE: i32 = 128 + SIGTERM;
 
-/// The lock file in an instance's runtime directory that a start holds
-/// from its liveness check through its bind. Never removed: a start
-/// that locked a file since unlinked would hold a lock nobody else sees.
-const START_LOCK: &str = "start.lock";
+/// What [`start_lock_path`] puts after the instance's name. `@` is no
+/// character an instance name may hold, so the file can be no instance's
+/// runtime directory.
+pub(crate) const START_LOCK_SUFFIX: &str = "@start.lock";
 
-/// How often a start waiting on another's [`START_LOCK`] tries again and
+/// How often a start waiting on another's start lock tries again and
 /// looks at its stop flag.
 const START_LOCK_POLL: Duration = Duration::from_millis(50);
+
+/// `$XDG_RUNTIME_DIR/bubbler/<name>@start.lock`, the lock a start of
+/// `name` holds from its liveness check through its bind. Beside the
+/// runtime directory rather than in it, so that removing the directory
+/// leaves it; no run removes it, since a start that locked a file since
+/// unlinked would hold a lock nobody else sees.
+fn start_lock_path(env: &Env, name: &str) -> PathBuf {
+    env.runtime_dir
+        .join(RUNTIME_SUBDIR)
+        .join(format!("{name}{START_LOCK_SUFFIX}"))
+}
+
+/// Open the start lock, creating it, without following a link and
+/// without a FIFO parking the open.
+fn open_start_lock(path: &Path) -> Result<OwnedFd, LaunchError> {
+    rustix::fs::open(
+        path,
+        OFlags::CREATE
+            | OFlags::WRONLY
+            | OFlags::NOFOLLOW
+            | OFlags::NONBLOCK
+            | OFlags::NOCTTY
+            | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|e| LaunchError::Io(path.to_path_buf(), e.into()))
+}
 
 /// Bind the instance's control socket in `dir`, the one place a socket
 /// left by a dead run is unlinked. `AlreadyRunning` when a run answers on
 /// it, which a start that lost the race to another finds too: the check,
-/// the unlink and the bind all happen under [`START_LOCK`], released on
-/// return. `Stopped` when a stop signal arrives while it waits.
+/// the unlink and the bind all happen under the lock at `lock_path`,
+/// released on return. `Stopped` when a stop signal arrives while it
+/// waits.
 fn bind_control_socket(
     dir: &Path,
+    lock_path: &Path,
     name: &str,
     stop: &AtomicBool,
 ) -> Result<UnixListener, LaunchError> {
-    let lock_path = dir.join(START_LOCK);
-    let lock_err = |e: Errno| LaunchError::Io(lock_path.clone(), e.into());
-    let lock = rustix::fs::open(
-        &lock_path,
-        OFlags::CREATE | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    )
-    .map_err(lock_err)?;
+    let lock_err = |e: Errno| LaunchError::Io(lock_path.to_path_buf(), e.into());
+    let lock = open_start_lock(lock_path)?;
     // Polled rather than blocking: the stop signals are installed with
     // SA_RESTART, so a blocking `flock` would sleep through them.
     loop {
@@ -3750,13 +3773,12 @@ fn bind_control_socket(
     }
     let sock_path = dir.join(exec::SOCKET_NAME);
     let io_at = |e: io::Error| LaunchError::Io(sock_path.clone(), e);
-    match UnixStream::connect(&sock_path) {
-        Ok(_) => return Err(LaunchError::AlreadyRunning(name.to_owned())),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
-            std::fs::remove_file(&sock_path).map_err(io_at)?;
-        }
-        Err(e) => return Err(io_at(e)),
+    if exec::is_live_at(&sock_path) {
+        return Err(LaunchError::AlreadyRunning(name.to_owned()));
+    }
+    match std::fs::remove_file(&sock_path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(io_at(e)),
+        _ => {}
     }
     UnixListener::bind(&sock_path).map_err(io_at)
 }
@@ -3774,7 +3796,7 @@ fn start_and_wait(
 ) -> Result<i32, LaunchError> {
     let sock_path = dir.join(exec::SOCKET_NAME);
     let io_at = |e: Errno| LaunchError::Io(sock_path.clone(), e.into());
-    let listener = bind_control_socket(&dir, &inst.name, stop)?;
+    let listener = bind_control_socket(&dir, &start_lock_path(env, &inst.name), &inst.name, stop)?;
     let _socket_guard = FileGuard(sock_path.clone());
     let inherited = fcntl_dupfd_cloexec(listener.as_fd(), 3).map_err(io_at)?;
     let mut alloc = RealAlloc::new(inherited.as_raw_fd(), dir.clone());
@@ -4108,11 +4130,14 @@ mod tests {
     #[test]
     fn a_start_binds_over_a_dead_socket_and_not_over_a_live_one() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join(exec::SOCKET_NAME);
+        let dir = tmp.path().join("t");
+        std::fs::create_dir(&dir).unwrap();
+        let lock = tmp.path().join("t@start.lock");
+        let path = dir.join(exec::SOCKET_NAME);
         let stop = AtomicBool::new(false);
         drop(UnixListener::bind(&path).unwrap());
-        let live = bind_control_socket(tmp.path(), "t", &stop).expect("a fresh bind");
-        let again = bind_control_socket(tmp.path(), "t", &stop);
+        let live = bind_control_socket(&dir, &lock, "t", &stop).expect("a fresh bind");
+        let again = bind_control_socket(&dir, &lock, "t", &stop);
         assert!(
             matches!(&again, Err(LaunchError::AlreadyRunning(n)) if n == "t"),
             "{again:?}"
@@ -4120,9 +4145,11 @@ mod tests {
         let _client = UnixStream::connect(&path).unwrap();
         live.accept()
             .expect("the first start's socket still answers");
-        assert!(
-            tmp.path().join(START_LOCK).exists(),
-            "the lock file is kept"
+        assert!(lock.exists(), "the lock file is kept");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "only the socket is in the runtime directory"
         );
     }
 
@@ -4130,10 +4157,11 @@ mod tests {
     #[test]
     fn a_start_waiting_on_the_lock_ends_when_stopped() {
         let tmp = tempfile::tempdir().unwrap();
-        let held = std::fs::File::create(tmp.path().join(START_LOCK)).unwrap();
+        let lock = tmp.path().join("t@start.lock");
+        let held = std::fs::File::create(&lock).unwrap();
         flock(&held, FlockOperation::LockExclusive).unwrap();
         let stop = AtomicBool::new(true);
-        let waited = bind_control_socket(tmp.path(), "t", &stop);
+        let waited = bind_control_socket(tmp.path(), &lock, "t", &stop);
         assert!(matches!(waited, Err(LaunchError::Stopped)), "{waited:?}");
         assert!(!tmp.path().join(exec::SOCKET_NAME).exists());
     }

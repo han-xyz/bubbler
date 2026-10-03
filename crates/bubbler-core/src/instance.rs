@@ -387,9 +387,10 @@ fn dir_pid(name: &str) -> Option<Pid> {
     Pid::from_raw(i32::try_from(name.parse::<u32>().ok()?).ok()?)
 }
 
-/// Remove every entry of `dir` named `<prefix><pid>` whose pid is not a
-/// live process, and nothing else. Best effort: a directory that cannot
-/// be removed is reported, never fatal.
+/// Remove every entry of `dir` named `<prefix><pid>`, or that with the
+/// start lock's suffix, whose pid is not a live process, and nothing
+/// else. Best effort: an entry that cannot be removed is reported, never
+/// fatal.
 fn sweep_dir(dir: &Path, prefix: &str) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -399,6 +400,7 @@ fn sweep_dir(dir: &Path, prefix: &str) {
         let Some(pid) = name
             .to_str()
             .and_then(|n| n.strip_prefix(prefix))
+            .map(|n| n.strip_suffix(launcher::START_LOCK_SUFFIX).unwrap_or(n))
             .and_then(dir_pid)
         else {
             continue;
@@ -406,14 +408,19 @@ fn sweep_dir(dir: &Path, prefix: &str) {
         if host::pid_alive(pid) {
             continue;
         }
-        if let Err(e) = fs::remove_dir_all(entry.path()) {
+        let removed = match entry.file_type() {
+            Ok(t) if t.is_dir() => fs::remove_dir_all(entry.path()),
+            _ => fs::remove_file(entry.path()),
+        };
+        if let Err(e) = removed {
             eprintln!("bubbler: {}: {e}", entry.path().display());
         }
     }
 }
 
-/// Remove leftovers of tries whose bubbler is gone: `try/<pid>` and
-/// `<runtime>/bubbler/try-<pid>` for every pid no live process has. A
+/// Remove leftovers of tries whose bubbler is gone: `try/<pid>`,
+/// `<runtime>/bubbler/try-<pid>` and its start lock for every pid no
+/// live process has. A
 /// name that is not a pid is not swept.
 pub fn sweep_stale(env: &Env) {
     sweep_dir(&try_root(env), "");
@@ -1595,6 +1602,11 @@ mod tests {
             fs::create_dir_all(runtime.join(format!("{n}{dead}"))).unwrap();
         }
         fs::create_dir_all(runtime.join(format!("try-{live}"))).unwrap();
+        // A try's start lock sits beside its runtime directory, and goes
+        // with it.
+        for n in [&format!("try-{dead}"), &format!("try-{live}"), "inst"] {
+            fs::write(runtime.join(format!("{n}@start.lock")), b"").unwrap();
+        }
 
         sweep_stale(&env);
 
@@ -1607,6 +1619,9 @@ mod tests {
             assert!(runtime.join(format!("{n}{dead}")).exists(), "{n}");
         }
         assert!(runtime.join(format!("try-{live}")).exists());
+        assert!(!runtime.join(format!("try-{dead}@start.lock")).exists());
+        assert!(runtime.join(format!("try-{live}@start.lock")).exists());
+        assert!(runtime.join("inst@start.lock").exists());
     }
 
     #[test]

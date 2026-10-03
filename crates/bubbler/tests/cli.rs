@@ -5798,8 +5798,8 @@ fn two_starts_released_together_one_runs_and_one_is_told_it_is_running() {
     )
     .unwrap();
     let dir = tmp.path().join("run/bubbler/twostart");
-    std::fs::create_dir_all(&dir).unwrap();
-    let lock_path = dir.join("start.lock");
+    std::fs::create_dir_all(tmp.path().join("run/bubbler")).unwrap();
+    let lock_path = tmp.path().join("run/bubbler/twostart@start.lock");
     let held = std::fs::File::create(&lock_path).unwrap();
     flock(&held, FlockOperation::LockExclusive).unwrap();
     let start = || {

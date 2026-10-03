@@ -12,7 +12,7 @@ use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -85,8 +85,12 @@ const PROBE_WAIT: Timespec = Timespec {
 /// Anything that is not a connection a listener answered counts as not
 /// running, since nothing could be exec'd through it either.
 pub fn is_live(env: &Env, name: &str) -> bool {
-    let path = socket_path(env, name);
-    let Ok(addr) = SocketAddrUnix::new(&path) else {
+    is_live_at(&socket_path(env, name))
+}
+
+/// [`is_live`] for the control socket at `path`.
+pub(crate) fn is_live_at(path: &Path) -> bool {
+    let Ok(addr) = SocketAddrUnix::new(path) else {
         return false;
     };
     let Ok(sock) = socket_with(

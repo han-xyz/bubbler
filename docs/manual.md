@@ -91,8 +91,9 @@ handed to the sandbox as an inherited file descriptor, so nothing inside can
 reach the path. `run` on an instance that is already running says so and
 execs into it instead of starting a second sandbox; configuration changes
 apply on the next start. Of two starts made at the same moment, one starts
-the sandbox and the other ends with "instance `<name>` is already running". An exec'd process is given whatever the terminal
-mode decides on (see "Terminal"), and descriptors passed to exec'd commands
+the sandbox and the other ends with "instance `<name>` is already running".
+An exec'd process is given whatever the terminal mode decides on (see
+"Terminal"), and descriptors passed to exec'd commands
 are reachable by the sandboxed application through `/proc`: exec is a
 convenience channel, not a boundary.
 
@@ -4052,7 +4053,8 @@ outside its own state. Every
 run except a dry run or an explanation also creates
 `$XDG_RUNTIME_DIR/bubbler/<name>/`, mode 0700, reusing one left over from an
 earlier run, and binds the control socket `init.sock` in it while holding a
-lock on the empty file `start.lock` beside it; a sandboxed
+lock on the empty file `$XDG_RUNTIME_DIR/bubbler/<name>@start.lock` beside
+the directory; a sandboxed
 `wayland` grant adds `wayland`, the socket the sandbox connects to and
 `bubbler-wl-proxy` serves, and beside it `wayland-context`, where the
 compositor accepts the security context; a `dbus`, `system-bus` or `a11y` grant
@@ -4062,9 +4064,9 @@ start, and the checked sockets `bus`,
 `system` and `a11y` — one per granted bus — beside it, and a `portals` grant adds
 `$XDG_RUNTIME_DIR/.flatpak/bubbler-<name>/`, creating `.flatpak/` if it is
 missing. Everything a run makes there is removed again when it ends, with two
-exceptions: `start.lock`, and an `app-runtime` grant creates `$XDG_RUNTIME_DIR/app/<id>` (and
-`app/` above it) and leaves it, since a peer of another instance may still be
-using it.
+exceptions: the start lock, which stays, and an `app-runtime` grant's
+`$XDG_RUNTIME_DIR/app/<id>` (and `app/` above it), left since a peer of
+another instance may still be using it.
 `HOME` and `XDG_RUNTIME_DIR` must be set and non-empty. Your profiles live in
 `$XDG_CONFIG_HOME/bubbler/profiles/` (by default under `~/.config`) and the
 system's in `/usr/share/bubbler/profiles/`, or wherever

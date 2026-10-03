@@ -1447,9 +1447,9 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             // a run nobody is watching has to leave a record of.
             let config = instance::config_path_checked(&env, &name)
                 .with_context(|| format!("opening instance `{name}`"))?;
-            // Before the log is opened, so a stale socket is cleared and
-            // the answer decides whether this run empties the log or adds
-            // to what the run it is executing into wrote.
+            // Before the log is opened, so the answer decides whether this
+            // run empties the log or adds to what the run it is executing
+            // into wrote.
             let stream = exec::connect(&env, &name)
                 .with_context(|| format!("connecting to instance `{name}`"))?;
             // A launcher starts its children with no terminal at all, so
