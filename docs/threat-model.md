@@ -921,12 +921,25 @@ up to 0.24.1 an `Audio/Sink` a sandbox offered with a high
 started afterwards; 0.24.2 sent such streams elsewhere with a hook of its
 own that re-implemented WirePlumber's target and filter search and
 drifted from it. Since 0.25.0 a node of an `org.bubbler` client whose
-class is not `Stream/Output/Audio` or `Stream/Input/Audio` never becomes
-a session item: the hook stops WirePlumber's `node-added` event before
-`node/create-item`, the only place a node's session item is made, and
-every finder, the smart-filter chain (`lib/filter-utils.lua`) and the
-default-node rescan search session items alone. The node stays in the
-graph, unlinked; its client gets no error and hears nothing through it.
+class is not `Stream/Output/Audio` or `Stream/Input/Audio`, or that
+carries `node.link-group`, has no session item: the hook stops
+WirePlumber's `node-added` event before `node/create-item`, the only
+place a node's session item is made, and every finder, the smart-filter
+chain (`lib/filter-utils.lua`) and the default-node rescan search session
+items alone. A client may change its own node's properties at any time
+(`pw_stream_update_properties`; measured: a sandbox's capture stream
+turned itself into a smart filter's `Audio/Sink`, gaining the link group
+then or carrying it from the start, and WirePlumber aimed host streams at
+it), and WirePlumber raises no event for that, so the hook also runs
+first in every default-node and linking rescan — where defaults and the
+filter chain are rebuilt from the nodes' current properties — and removes
+the session item of every such node, by its current properties, whose
+client it knows. The node stays in the graph, unlinked; its client gets
+no error and hears nothing through it. A sandbox's stream that carries a
+link group loses its session item too, so a loopback or filter run
+inside a sandbox — `pw-loopback` (measured), or another that pairs its
+nodes by a link group — plays nothing; a plain stream carries no link
+group.
 Measured in the test bed over 200 host streams, each started as soon as a
 fresh sandbox's node appeared — a sink ranked above the host's, the same
 sink named as the stream's target, a smart filter, and a sink named after
@@ -934,7 +947,12 @@ a host device that appears after it, the stream pinned to that name with
 `node.dont-fallback` — every host stream was linked to the host's own
 node, `pw-link -m` saw no link into any sandbox node, and no sandbox node
 became a default; over 20 restarts of WirePlumber with a sandbox's sink
-already in the graph, the same. The `adapter` factory, which makes a node
+already in the graph, the same. Over 50 sandbox streams that turned
+themselves into a smart filter's sink (25 with the link group from the
+start, 25 gaining it then), every host stream started afterwards played
+on the host's sink and none was refused a link to the sandbox's node;
+with the rescan half of the hook removed, each of those gaining the link
+group took the host stream (3 of 3). The `adapter` factory, which makes a node
 owned by the daemon, stays hidden from a sandbox (below), so a node it
 cannot keep out of the session this way is one it cannot make. A JACK
 client's node under `pw-jack` carries no `media.class` at all (measured),
@@ -1080,12 +1098,19 @@ decided; neither case is measured: no client can make the daemon load a
 module (`pw-cli load-module` loads into the client's own process, and
 the test bed's daemon listed the same five factories after it did), so
 the bed cannot produce a late factory. (A sandbox connected before
-WirePlumber starts had them hidden in the runs measured.) A sandbox's
-node is kept out of the session only when its client is already known
-to WirePlumber at `node-added`; that held in every run measured (220,
-none with the client unknown), since a sandbox can create nothing before
-WirePlumber has decided its access, but it is an ordering of WirePlumber's
-object managers, not a guarantee. The playback
+WirePlumber starts had them hidden in the runs measured.) After a
+WirePlumber restart a sandbox's nodes are already in the graph, and
+WirePlumber may meet a node before its client: the node then gets a
+session item at `node-added`, and the client's arrival rescans defaults
+and links, whose first hook removes it. Until then a host stream started
+in that window can be aimed at it — refused by the link check once the
+client is known, a link already made destroyed then. The bed never
+produced that order (20 restarts, the client known at `node-added` each
+time); with the `node-added` half of the hook removed, the rescan half
+alone kept the sink out in 10 of 10 restarts. `fallback-sink.lua`, off in
+the stock configuration, counts `Audio/Sink` nodes rather than session
+items: where a user enables it, a sandbox's sink on a host with no other
+sink keeps its "Dummy Output" from appearing. The playback
 grant protects what a sandbox can hear and record, not the availability
 of host audio: a playback sandbox's own stream can take the default sink
 exclusively (`node.exclusive`, passthrough), and WirePlumber then drops
@@ -1116,6 +1141,8 @@ the hook, each new link destroyed in turn.
 `a_host_recorder_does_not_record_from_a_source_a_playback_context_offers`,
 `a_host_stream_pinned_to_a_device_whose_name_a_context_copies_links_to_the_device`,
 `a_host_stream_keeps_to_the_hosts_smart_filter_whatever_filter_a_context_offers`,
+`a_stream_a_context_turns_into_a_smart_filter_takes_no_host_stream`,
+`a_sink_a_context_offered_before_the_session_manager_restarted_is_no_device`,
 `a_session_managers_link_into_a_capture_stream_is_kept_only_where_the_grant_allows`,
 `a_context_connected_before_the_session_manager_cannot_see_the_link_factory`,
 `a_playback_capture_stream_gets_no_link`,

@@ -641,8 +641,12 @@ offers no audio device: a sink, source or filter it creates through its own
 connection stays out of WirePlumber's session, so it is never a default, a
 target or one of your smart filters, and your streams are linked as if it
 did not exist — one pinned to a device whose name the sandbox copies
-included. The sandbox's node stays, unlinked, with no error to its
-application. What this does not cover is listed under
+included, and one a sandbox's stream turns into later by changing its own
+properties. The sandbox's node stays, unlinked, with no error to its
+application. A loopback or filter inside a sandbox (`pw-loopback`, for
+one) plays nothing: its stream
+carries a link group, which a stream needs only as half of a filter. What
+this does not cover is listed under
 "Audio" in `docs/threat-model.md`. Before 0.24.2 a sandbox could still win
 a link of its own in the first instant of a new connection, now and then,
 and keep it, and
