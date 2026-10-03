@@ -5723,6 +5723,102 @@ fn a_signal_while_a_sidecar_starts_stops_the_run_and_leaves_nothing() {
     );
 }
 
+/// Ctrl-C at a terminal goes to the whole foreground process group, so
+/// the sidecar being waited on dies of it too: the run still ends as
+/// stopped, not as a sidecar that failed. The pulse server's bwrap is a
+/// stand-in that never makes its socket and dies of the signal.
+#[test]
+fn real_bwrap_a_signal_to_the_process_group_while_a_sidecar_starts_ends_as_stopped() {
+    if !require_pulse_session() {
+        return;
+    }
+    if !Path::new("/usr/bin/bwrap").is_file() {
+        say("skipping: the stand-in bwrap execs /usr/bin/bwrap");
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    bubbler_audio(tmp.path(), &init)
+        .args(["create", "audiohalt"])
+        .status()
+        .unwrap();
+    std::fs::write(
+        tmp.path()
+            .join("data/bubbler/instances/audiohalt/config.kdl"),
+        "pulseaudio\n",
+    )
+    .unwrap();
+    let bin = tmp.path().join("hanging-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let started = tmp.path().join("pulse-started");
+    write_script(
+        &bin.join("bwrap"),
+        &format!(
+            "#!/usr/bin/sh\n\
+             case \" $* \" in *\" pipewire-pulse.conf \"*) : > '{}'; exec /usr/bin/sleep 30;; esac\n\
+             exec /usr/bin/bwrap \"$@\"\n",
+            started.display()
+        ),
+    );
+    let marker = tmp.path().join("data/bubbler/instances/audiohalt/home/ran");
+    let mut run = bubbler_audio(tmp.path(), &init)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .args([
+            "run",
+            "audiohalt",
+            "--",
+            "/usr/bin/touch",
+            "/home/bubbler/ran",
+        ])
+        .process_group(0)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    if !wait_until(|| started.exists(), Duration::from_secs(10)) {
+        kill_group(&run);
+        fail_with(run, "the pulse server never started");
+    }
+    let bwraps = bwraps_under(run.id());
+    rustix::process::kill_process_group(Pid::from_child(&run), Signal::INT).unwrap();
+    let mut status = None;
+    if !wait_until(
+        || {
+            status = run.try_wait().expect("waiting for the run");
+            status.is_some()
+        },
+        Duration::from_secs(15),
+    ) {
+        kill_group(&run);
+        fail_with(run, "the run did not stop after SIGINT");
+    }
+    let err = String::from_utf8_lossy(&run.wait_with_output().unwrap().stderr).into_owned();
+    let instance = session_pipewire()
+        .expect("checked above")
+        .with_file_name("bubbler/audiohalt");
+    let left: Vec<_> = ["init.sock", "pw", "pwpulse", "pipewire-0"]
+        .into_iter()
+        .filter(|name| instance.join(name).exists())
+        .collect();
+    let sidecars_gone = wait_until(|| !bwrap_alive(&bwraps), Duration::from_secs(5));
+    bubbler_audio(tmp.path(), &init)
+        .args(["delete", "audiohalt", "--yes"])
+        .status()
+        .unwrap();
+    assert_eq!(
+        status.and_then(|s| s.code()),
+        Some(143),
+        "{status:?}: {err}"
+    );
+    assert!(
+        !err.contains("did not serve"),
+        "a sidecar was blamed: {err}"
+    );
+    assert!(left.is_empty(), "the start left {left:?}: {err}");
+    assert!(!marker.exists(), "the application ran after the signal");
+    assert!(sidecars_gone, "a sidecar's sandbox outlived the run");
+}
+
 /// [`honest_proxy`] that first writes a line to each of its stdout and
 /// stderr.
 fn talking_proxy(path: &Path) {

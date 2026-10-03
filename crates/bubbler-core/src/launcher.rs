@@ -1097,7 +1097,8 @@ impl Drop for ProxyHandle {
 /// Wait for the sidecar's ready byte, which says it has bound its socket
 /// and is accepting connections. False when the deadline passes, the pipe
 /// reaches EOF or the child is gone: nothing is listening either way.
-/// [`LaunchError::Stopped`] once `stop` is set.
+/// [`LaunchError::Stopped`] once `stop` is set, the sidecar gone or not:
+/// a Ctrl-C reaches the sidecar's process group too, and kills it.
 fn wait_ready(
     ready: &OwnedFd,
     child: &mut Child,
@@ -1105,7 +1106,7 @@ fn wait_ready(
     stop: &AtomicBool,
 ) -> Result<bool, LaunchError> {
     let mut byte = [0u8; 1];
-    loop {
+    let is_ready = loop {
         let slice = Timespec {
             tv_sec: POLL.as_secs() as Secs,
             tv_nsec: POLL.subsec_nanos() as Nsecs,
@@ -1116,22 +1117,26 @@ fn wait_ready(
             Ok(0) => {}
             Err(_) => std::thread::sleep(POLL),
             Ok(_) => match rustix::io::read(ready, &mut byte) {
-                Ok(0) => return Ok(false),
-                Ok(_) => return Ok(true),
+                Ok(0) => break false,
+                Ok(_) => break true,
                 Err(Errno::INTR) => {}
-                Err(_) => return Ok(false),
+                Err(_) => break false,
             },
         }
         if stop.load(Ordering::SeqCst) {
             return Err(LaunchError::Stopped);
         }
         if Instant::now() >= deadline {
-            return Ok(false);
+            break false;
         }
         if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
-            return Ok(false);
+            break false;
         }
+    };
+    if !is_ready && stop.load(Ordering::SeqCst) {
+        return Err(LaunchError::Stopped);
     }
+    Ok(is_ready)
 }
 
 /// Whether `child` is still a process of this run's, and so still one to
@@ -1511,7 +1516,8 @@ pub fn start_pw_context(
 
 /// The line the holder reports the context socket on, without its
 /// newline, or `None` when the deadline passes, the pipe reaches EOF or
-/// the sidecar is gone; [`LaunchError::Stopped`] once `stop` is set.
+/// the sidecar is gone; [`LaunchError::Stopped`] once `stop` is set, the
+/// sidecar gone or not, as [`wait_ready`].
 ///
 /// A byte at a time: the line is one short path, and the descriptor stays
 /// open afterwards, so a longer read would block on a pipe with nothing
@@ -1523,7 +1529,7 @@ fn read_report(
     stop: &AtomicBool,
 ) -> Result<Option<String>, LaunchError> {
     let mut line = Vec::new();
-    loop {
+    let report = loop {
         let slice = Timespec {
             tv_sec: POLL.as_secs() as Secs,
             tv_nsec: POLL.subsec_nanos() as Nsecs,
@@ -1536,12 +1542,12 @@ fn read_report(
             Ok(_) => {
                 let mut byte = [0u8; 1];
                 match rustix::io::read(ready, &mut byte) {
-                    Ok(0) => return Ok(None),
-                    Ok(_) if byte[0] == b'\n' => return Ok(String::from_utf8(line).ok()),
-                    Ok(_) if line.len() >= PW_REPORT_MAX => return Ok(None),
+                    Ok(0) => break None,
+                    Ok(_) if byte[0] == b'\n' => break String::from_utf8(line).ok(),
+                    Ok(_) if line.len() >= PW_REPORT_MAX => break None,
                     Ok(_) => line.push(byte[0]),
                     Err(Errno::INTR) => {}
-                    Err(_) => return Ok(None),
+                    Err(_) => break None,
                 }
             }
         }
@@ -1549,12 +1555,16 @@ fn read_report(
             return Err(LaunchError::Stopped);
         }
         if Instant::now() >= deadline {
-            return Ok(None);
+            break None;
         }
         if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
-            return Ok(None);
+            break None;
         }
+    };
+    if report.is_none() && stop.load(Ordering::SeqCst) {
+        return Err(LaunchError::Stopped);
     }
+    Ok(report)
 }
 
 /// Move the socket a sidecar made (`from`: its directory and the name it
@@ -1737,11 +1747,13 @@ pub fn start_pw_pulse(
     handle.alloc.inheritable(false).map_err(LaunchError::Data)?;
     let deadline = Instant::now() + PULSE_READY;
     while !made.exists() {
-        if let Ok(Some(status)) = handle.child.try_wait() {
-            return Err(LaunchError::PwPulse(format!("it exited ({status})")));
-        }
+        // Before the exit: a Ctrl-C reaches this server's process group
+        // too, and kills it.
         if stop.load(Ordering::SeqCst) {
             return Err(LaunchError::Stopped);
+        }
+        if let Ok(Some(status)) = handle.child.try_wait() {
+            return Err(LaunchError::PwPulse(format!("it exited ({status})")));
         }
         if Instant::now() >= deadline {
             return Err(LaunchError::PwPulse(format!(
