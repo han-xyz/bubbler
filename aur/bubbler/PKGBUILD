@@ -39,7 +39,8 @@ check() {
   export CARGO_TARGET_DIR=target
   # Tests that need a real sandbox skip themselves when the build
   # environment cannot create user namespaces (a clean chroot cannot).
-  # Tests that reach a desktop session are off unless BUBBLER_TEST_SESSION=1.
+  # Tests that reach the desktop session or start PipeWire daemons run only
+  # with BUBBLER_TEST_SESSION=1.
   cargo test --frozen --workspace
 }
 
