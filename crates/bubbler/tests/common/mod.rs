@@ -540,8 +540,7 @@ pub fn sandboxes_of(pid: u32, bwraps: &[Started]) -> usize {
 
 /// Whether any of `procs` is still running as the process it was. A run
 /// that has ended must leave none of its sandboxes or sidecars: bubbler
-/// tears them down itself, and `--die-with-parent` is only the backstop
-/// behind that.
+/// tears them down itself.
 pub fn any_alive(procs: &[Started]) -> bool {
     procs
         .iter()
