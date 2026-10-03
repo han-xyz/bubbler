@@ -178,7 +178,10 @@ the tag it made and restores the files it touched to the last commit. If only
 the `aurs-dir` write fails, the tag and both commits stay, nothing is left in
 `aurs-dir`, and the script prints why and the command to redo just the copy:
 `scripts/release --tag X.Y.Z aurs-dir` with the tag already made does only that.
-A write stopped by SIGINT or SIGTERM leaves nothing in `aurs-dir` either.
+A write stopped by SIGINT or SIGTERM leaves nothing in `aurs-dir` before its
+last step, the move of the three files; one stopped during that move can leave
+some replaced, and the same command puts them right. A signal after a commit
+leaves that commit, and the tag it names, where they are.
 
 Merging, pushing and the AUR push stay manual. `scripts/release.test` checks
 both commands in a throwaway repository.

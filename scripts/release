@@ -24,6 +24,8 @@ rollback() {
     trap - EXIT
     [ -z "$staging" ] || rm -rf "$staging"
     [ "$status" -eq 0 ] && exit 0
+    # A signal can land after the phase's commit and before the phase is cleared.
+    [ -z "$phase" ] || [ "$(git rev-parse HEAD)" = "$head_before" ] || phase=""
     case "$phase" in
         bump)
             git checkout -q HEAD -- Cargo.toml Cargo.lock fuzz/Cargo.lock
@@ -70,6 +72,7 @@ bump() {
     [ "$old" != "$version" ] || die "Cargo.toml is already at $version"
     old="${old//./\\.}"
 
+    head_before="$(git rev-parse HEAD)"
     phase=bump
     sed -i \
         -e "/^\[workspace.package\]/,/^\[/ s/^version = \"$old\"/version = \"$version\"/" \

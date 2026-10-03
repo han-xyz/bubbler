@@ -231,6 +231,27 @@ check refuses --tag 9.9.9
 check grep -qx 'pkgver=1.0.0' aur/bubbler/PKGBUILD
 check grep -qx '_tag=0000000000000000000000000000000000000000' aur/bubbler/PKGBUILD
 
+# A commit that was made and then reported as failed: the state a signal
+# leaves when it lands between `git commit` and the end of its phase.
+mkdir "$work/late-fail"
+cat >"$work/late-fail/git" <<EOF
+#!/bin/sh
+$(command -v git) "\$@" || exit
+[ "\$1" != commit ]
+EOF
+chmod +x "$work/late-fail/git"
+new_repo latefail feat/x
+git checkout -q -b other
+err="$(PATH="$work/late-fail:$PATH" "$release" 9.9.9 2>&1 >/dev/null)" && failures=$((failures + 1))
+check test "$(git log -1 --format=%s)" = "chore: release v9.9.9"
+check test -z "$(git status --porcelain)"
+check test -z "$(grep 'rolled back' <<<"$err")"
+err="$(PATH="$work/late-fail:$PATH" "$release" --tag 9.9.9 2>&1 >/dev/null)" && failures=$((failures + 1))
+check test "$(git log -1 --format=%s)" = "chore: the AUR package builds 9.9.9"
+check test "$(git cat-file -t v9.9.9)" = tag
+check test -z "$(git status --porcelain)"
+check test -z "$(grep 'rolled back' <<<"$err")"
+
 if [ "$(id -u)" -ne 0 ]; then
     new_repo redo feat/x
     git checkout -q -b other
