@@ -3146,7 +3146,9 @@ fn a_sink_a_devices_context_offers_may_become_the_default() {
 
 /// A source a `devices` context offers is a source like the host's: a
 /// host recorder aimed at it records from it, and another context's
-/// capture stream without the microphone grant does not.
+/// capture stream without the microphone grant does not. Nor does one
+/// aimed at the monitor of a sink the context offers, which a playback
+/// context can see: there the hook is what refuses it.
 #[test]
 fn a_host_recorder_records_from_a_source_a_devices_context_offers() {
     let Some(bed) = PipeWireBed::start() else {
@@ -3180,26 +3182,50 @@ fn a_host_recorder_records_from_a_source_a_devices_context_offers() {
         "pw-cat -r -a --target=offered -P '{ node.name = thief }' /dev/null",
         "Stream/Input/Audio",
     );
+    let _offered_sink = Streaming(bed.spawn_in_context(
+        DEVICES,
+        "pw-cat -r -a -P '{ media.class = Audio/Sink, node.name = offered-sink }' /dev/null",
+    ));
+    wait_for("the context's sink", || {
+        bed.dump_from_host()
+            .contains("\"node.name\": \"offered-sink\"")
+    });
+    let _monitor_thief = Streaming(bed.spawn_in_context(
+        PLAYBACK,
+        "pw-cat -r -a --target=offered-sink \
+         -P '{ node.name = monitor-thief, stream.capture.sink = true }' /dev/null",
+    ));
+    wait_for("the hook refusing the sink's monitor", || {
+        links_refused(&bed, "offered-sink") > 0
+    });
     window_in_which_it_would_link(&bed, "playback");
     let links = bed.links();
-    assert!(
-        !links.contains("thief:input_"),
-        "a playback context recorded from a devices context's source:\n{links}"
-    );
+    for thief in ["thief", "monitor-thief"] {
+        assert!(
+            linked_to(&links, thief).is_empty(),
+            "a playback context's {thief} recorded from a devices context's node:\n{links}"
+        );
+    }
 }
 
 /// What may flow into a `devices` context's sink is a stream's audio,
 /// linked by a session manager: a host stream is kept, a sink's monitor
 /// is destroyed even from a session manager, the source is refused by the
-/// daemon (the context cannot see it), and a patchbay's link from the
-/// stream is destroyed.
+/// daemon where the context cannot see it and destroyed by the hook where
+/// it can (`microphone`), and a patchbay's link from the stream is
+/// destroyed.
 #[test]
 fn only_a_session_managers_link_from_a_stream_into_a_devices_sink_is_kept() {
+    only_a_session_managers_link_from_a_stream_into_the_sink_of(DEVICES);
+    only_a_session_managers_link_from_a_stream_into_the_sink_of(MICROPHONE_DEVICES);
+}
+
+fn only_a_session_managers_link_from_a_stream_into_the_sink_of(context: &str) {
     let Some(bed) = PipeWireBed::start() else {
         return;
     };
     let _offered = Streaming(bed.spawn_in_context(
-        DEVICES,
+        context,
         "pw-cat -r -a -P '{ media.class = Audio/Sink, node.name = offered }' /dev/null",
     ));
     let _player = host_stream(
@@ -3223,7 +3249,7 @@ fn only_a_session_managers_link_from_a_stream_into_a_devices_sink_is_kept() {
         .iter()
         .all(|port| ports.contains(port))
     });
-    window_in_which_it_would_link(&bed, "playback,devices");
+    window_in_which_it_would_link(&bed, grant_of(context));
 
     let before = links_destroyed(&bed);
     let _granted = holding_a_link(
@@ -3240,16 +3266,38 @@ fn only_a_session_managers_link_from_a_stream_into_a_devices_sink_is_kept() {
     wait_for("the hook destroying the monitor's link", || {
         links_destroyed(&bed) == before + 1
     });
-    let _source = holding_a_link(
-        second_session_manager(&bed),
-        "bed-source capture_FR offered playback_FR",
-    );
+    let source_link = "bed-source capture_FR offered playback_FR";
+    let mut destroyed = before + 1;
+    let _source = if context == DEVICES {
+        let refused = second_session_manager(&bed)
+            .arg("create-link")
+            .args(source_link.split(' '))
+            .output()
+            .expect("pw-cli did not run");
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&refused.stdout),
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        assert!(
+            said.contains("Operation not permitted"),
+            "the daemon did not refuse the source's link:\n{said}"
+        );
+        None
+    } else {
+        let held = holding_a_link(second_session_manager(&bed), source_link);
+        destroyed += 1;
+        wait_for("the hook destroying the source's link", || {
+            links_destroyed(&bed) == destroyed
+        });
+        Some(held)
+    };
     bed.command("pw-link")
         .args(["-L", "player:output_FL", "offered:playback_FL"])
         .output()
         .expect("pw-link did not run");
     wait_for("the hook destroying the patchbay's link", || {
-        links_destroyed(&bed) == before + 2
+        links_destroyed(&bed) == destroyed + 1
     });
     std::thread::sleep(FORBIDDEN_LINK_LIFE);
     let links = bed.links();
