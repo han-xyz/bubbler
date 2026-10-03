@@ -17,6 +17,13 @@ use libfuzzer_sys::fuzz_target;
 const MAX_NAMES: usize = 16;
 
 fuzz_target!(|data: &[u8]| {
+    let Some((&first, data)) = data.split_first() else {
+        return;
+    };
+    let userns = match first % 2 {
+        0 => Userns::Allow,
+        _ => Userns::Disable,
+    };
     let Ok(text) = std::str::from_utf8(data) else {
         return;
     };
@@ -34,7 +41,7 @@ fuzz_target!(|data: &[u8]| {
             _ => cfg.deny.push(((*name).to_owned(), Errno::Enosys)),
         }
     }
-    let Some(set) = RuleSet::with(&cfg, Userns::Allow) else {
+    let Some(set) = RuleSet::with(&cfg, userns) else {
         return;
     };
     let Ok(Some(program)) = seccomp::compile(&set, false) else {

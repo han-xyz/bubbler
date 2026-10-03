@@ -9608,7 +9608,7 @@ probe = [
     # By number: libseccomp 2.6.0 has no name for 467, so the rule was
     # added as a number and this is the only way to ask for it. A kernel
     # without the call answers ENOSYS too, which is what the rule makes
-    # the answer everywhere.
+    # the answer where it is in force: `userns "disable"` and sidecars.
     ("open_tree_attr", call(467, -1, 0, 0, 0)),
     # A null path and a null fs name: an unfiltered kernel faults or
     # refuses before it opens or creates anything.
@@ -10166,6 +10166,9 @@ fn real_bwrap_seccomp_covers_the_dbus_proxy_sandbox() {
     );
     assert_eq!(probed(&out, "keyctl"), "EPERM", "{out}");
     assert_eq!(probed(&out, "clone3"), "ENOSYS", "{out}");
+    // A sidecar never nests, so it keeps the mount API denied.
+    assert_eq!(probed(&out, "open_tree"), "ENOSYS", "{out}");
+    assert_eq!(probed(&out, "fsopen"), "ENOSYS", "{out}");
     assert_eq!(probed(&out, "getpid"), "ok", "{out}");
     // Neither the app sandbox nor the proxy's outlives the run.
     assert!(

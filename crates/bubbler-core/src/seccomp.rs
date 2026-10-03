@@ -102,7 +102,11 @@ pub const SINGLE_ARCH_EPERM: &[&str] = &["modify_ldt"];
 /// `clone_args`, and the new mount API can rewrite the sandbox's own VFS.
 /// An application whose user namespaces are not disabled gets the mount
 /// API back ([`MOUNT_API`]); sidecars never do.
-// The mount API hole is CVE-2021-41133. `mount_setattr` is left out:
+// The mount API hole is CVE-2021-41133: rewriting the VFS a host service reads
+// through /proc/PID/root. An instance that may nest reaches that class anyway
+// through `mount` in a user namespace of its own, so these rules close it only
+// together with `userns "disable"`, which now denies both APIs the capability.
+// `mount_setattr` is left out:
 // bubblewrap 0.13 needs it for every bind mount and has no fallback, and it
 // needs CAP_SYS_ADMIN over the mount namespace, cannot clear locked flags and
 // cannot ID-map a host filesystem, so with userns and `mount` allowed it adds
@@ -145,10 +149,12 @@ pub const DEFAULT_ENOSYS_NUMBERED: &[(&str, i32)] =
 /// The mount-API rules of [`DEFAULT_ENOSYS`] and [`DEFAULT_ENOSYS_NUMBERED`]
 /// that an application which may start a sandbox of its own is spared:
 /// bubblewrap is moving its bind mounts onto them, with the `mount()`
-/// fallback compiled out on distributions that assume a new kernel. Each
-/// needs `CAP_SYS_ADMIN` in the user namespace owning the mount namespace,
-/// which only a user namespace of the sandbox's own grants, so with
-/// `userns "disable"` they stay denied.
+/// fallback compiled out on distributions that assume a new kernel. Every
+/// call that creates, attaches or reconfigures a mount needs `CAP_SYS_ADMIN`
+/// in the user namespace owning the mount namespace, which only a user
+/// namespace of the sandbox's own grants, so with `userns "disable"` they
+/// stay denied; `open_tree` without `OPEN_TREE_CLONE` only opens an `O_PATH`
+/// descriptor, which `open` already gives.
 pub const MOUNT_API: &[&str] = &[
     "open_tree",
     "move_mount",
@@ -293,7 +299,7 @@ impl RuleSet {
     /// The denylist of an application that may create user namespaces:
     /// the default set without [`MOUNT_API`], so a sandbox it starts
     /// inside this one can mount.
-    pub fn nesting_set() -> Self {
+    fn nesting_set() -> Self {
         let mut set = Self::default_set();
         for name in MOUNT_API {
             set.remove(name);
@@ -301,8 +307,8 @@ impl RuleSet {
         set
     }
 
-    /// The application's set — [`Self::nesting_set`] unless `userns` is
-    /// disabled, [`Self::default_set`] then — with `cfg`'s allows removed
+    /// The application's set — [`Self::default_set`] less [`MOUNT_API`]
+    /// unless `userns` is disabled — with `cfg`'s allows removed
     /// and its denies appended, or `None` when the profile disabled the
     /// filter. Naming `ioctl` in either list drops the
     /// [`DEFAULT_IOCTL_EPERM`] rules.
@@ -716,6 +722,7 @@ mod tests {
         for name in ["clone3", "listns", "fchroot"] {
             assert!(denied.contains(&name), "{name} is allowed");
         }
+        assert!(!denied.contains(&"mount_setattr"));
         assert!(!set.eperm.iter().any(|n| n == "mount_setattr"));
     }
 
@@ -727,6 +734,8 @@ mod tests {
             for name in MOUNT_API.iter().chain(&["clone3", "listns", "fchroot"]) {
                 assert!(denied.contains(name), "{name} is allowed");
             }
+            assert!(!denied.contains(&"mount_setattr"));
+            assert!(!set.eperm.iter().any(|n| n == "mount_setattr"));
         }
     }
 
@@ -998,6 +1007,20 @@ mod tests {
         let program = compile(&RuleSet::default_set(), false).unwrap().unwrap();
         assert_eq!(program.arches, "x86_64 + i386");
         assert_eq!(instructions(&program.bytes).len(), DEFAULT_LEN);
+    }
+
+    /// Instructions in the application's filter where it may nest: the
+    /// default filter without [`MOUNT_API`], measured like [`DEFAULT_LEN`].
+    #[cfg(target_arch = "x86_64")]
+    const NESTING_LEN: usize = 125;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_nesting_set_compiles_to_one_program_of_a_known_size() {
+        let set = RuleSet::with(&SeccompConfig::default(), Userns::Allow).unwrap();
+        let program = compile(&set, false).unwrap().unwrap();
+        assert_eq!(program.arches, "x86_64 + i386");
+        assert_eq!(instructions(&program.bytes).len(), NESTING_LEN);
     }
 
     #[test]
