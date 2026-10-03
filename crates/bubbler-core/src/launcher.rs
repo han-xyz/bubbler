@@ -3754,8 +3754,9 @@ const START_LOCK_POLL: Duration = Duration::from_millis(50);
 /// `$XDG_RUNTIME_DIR/bubbler/<name>@start.lock`, the lock a start of
 /// `name` holds from its liveness check through its bind. Beside the
 /// runtime directory rather than in it, so that removing the directory
-/// leaves it; no run removes it, since a start that locked a file since
-/// unlinked would hold a lock nobody else sees.
+/// leaves it; only a throwaway sandbox, which no other start shares,
+/// removes its own, since a start that locked a file since unlinked
+/// would hold a lock nobody else sees.
 pub(crate) fn start_lock_path(env: &Env, name: &str) -> PathBuf {
     env.runtime_dir
         .join(RUNTIME_SUBDIR)
