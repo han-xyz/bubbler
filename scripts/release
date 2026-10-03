@@ -1,16 +1,41 @@
 #!/usr/bin/env bash
 # scripts/release <version>                  version bump commit
 # scripts/release --tag <version> [aurs-dir] tag, AUR package commit
-# Never merges or pushes.
+# Never merges or pushes. A refusal changes nothing; a failure after the first
+# change is rolled back.
 set -euo pipefail
 
 CARGO="${RELEASE_CARGO:-cargo}"
 MAKEPKG="${RELEASE_MAKEPKG:-makepkg}"
 
+phase=""
+head_before=""
+tag_made=""
+
 die() {
     echo "release: $*" >&2
     exit 1
 }
+
+rollback() {
+    local status=$?
+    trap - EXIT
+    [ "$status" -eq 0 ] && exit 0
+    case "$phase" in
+        bump)
+            git checkout -q -- Cargo.toml Cargo.lock fuzz/Cargo.lock
+            echo "release: rolled back the version changes" >&2
+            ;;
+        tag)
+            [ -z "$tag_made" ] || git tag -d "$tag_made" >/dev/null
+            git reset -q --soft "$head_before"
+            git checkout -q "$head_before" -- aur/bubbler
+            echo "release: rolled back the tag and aur/bubbler" >&2
+            ;;
+    esac
+    exit "$status"
+}
+trap rollback EXIT
 
 require_version() {
     [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "version must be X.Y.Z, got '$1'"
@@ -30,6 +55,7 @@ bump() {
     require_clean_tree
     grep -qFx "## $version" CHANGELOG.md || die "CHANGELOG.md has no '## $version' heading"
     branch="$(git branch --show-current)"
+    [ -n "$branch" ] || die "HEAD is detached; release from a feature branch"
     case "$branch" in
         main | master) die "on trunk branch '$branch'; release from a feature branch" ;;
     esac
@@ -38,46 +64,71 @@ bump() {
     [ -n "$old" ] || die "no version in [workspace.package]"
     [ "$old" != "$version" ] || die "Cargo.toml is already at $version"
     old="${old//./\\.}"
+
+    phase=bump
     sed -i \
         -e "/^\[workspace.package\]/,/^\[/ s/^version = \"$old\"/version = \"$version\"/" \
         -e "s/^\(bubbler-\(core\|init\|net-proxy\) = {.*version = \)\"$old\"/\1\"$version\"/" \
         Cargo.toml
+    [ "$(workspace_version <Cargo.toml)" = "$version" ] \
+        && [ "$(grep -c "^bubbler-\(core\|init\|net-proxy\) = {.*version = \"$version\"" Cargo.toml)" = 3 ] \
+        || die "Cargo.toml does not have the four version sites in the expected form"
 
     "$CARGO" update -w --offline
     (cd fuzz && "$CARGO" update -w --offline)
     git add Cargo.toml Cargo.lock fuzz/Cargo.lock
     git commit -q -m "chore: release v$version"
+    phase=""
 }
 
 set_pkgbuild() {
-    local version="$1" tag_object="$2"
+    local version="$1" tag_object="$2" pkgbuild=aur/bubbler/PKGBUILD
     sed -i \
         -e "s/^pkgver=.*/pkgver=$version/" \
+        -e "s/^pkgrel=.*/pkgrel=1/" \
         -e "s/^# git rev-parse v[0-9.]* /# git rev-parse v$version /" \
         -e "s/^_tag=.*/_tag=$tag_object/" \
-        aur/bubbler/PKGBUILD
+        "$pkgbuild"
+    grep -qx "pkgver=$version" "$pkgbuild" \
+        && grep -qx "pkgrel=1" "$pkgbuild" \
+        && grep -q "^# git rev-parse v$version " "$pkgbuild" \
+        && grep -qx "_tag=$tag_object" "$pkgbuild" \
+        || die "$pkgbuild does not have pkgver, pkgrel, the tag comment and _tag in the expected form"
+}
+
+require_aurs_checkout() {
+    local aurs_dir="$1" top
+    [ -d "$aurs_dir" ] || die "aurs-dir is not a directory"
+    top="$(git -C "$aurs_dir" rev-parse --show-toplevel 2>/dev/null || true)"
+    [ "$top" = "$aurs_dir" ] || die "'$aurs_dir' is not the top level of a git checkout"
+    [ "$top" != "$(pwd -P)" ] || die "'$aurs_dir' is this repository, not an AUR checkout"
+    [ -s "$aurs_dir/PKGBUILD" ] || die "'$aurs_dir' has no PKGBUILD to take the first line from"
+    case "$(head -n1 "$aurs_dir/PKGBUILD")" in
+        "# Maintainer:"*) ;;
+        *) die "the first line of '$aurs_dir/PKGBUILD' is not a '# Maintainer:' line" ;;
+    esac
 }
 
 tag() {
-    local version="$1" aurs_dir="${2:-}" tag_object
+    local version="$1" aurs_dir="$2" tag_object
     require_version "$version"
     require_clean_tree
     [ "$(git show HEAD:Cargo.toml | workspace_version)" = "$version" ] \
         || die "HEAD's Cargo.toml is not at $version; run scripts/release $version first"
     git rev-parse -q --verify "refs/tags/v$version" >/dev/null && die "tag v$version already exists"
     command -v "$MAKEPKG" >/dev/null || die "makepkg is not installed; it writes .SRCINFO"
-    if [ -n "$aurs_dir" ]; then
-        [ -d "$aurs_dir" ] || die "'$aurs_dir' is not a directory"
-        [ -f "$aurs_dir/PKGBUILD" ] || die "'$aurs_dir' has no PKGBUILD to take the first line from"
-        aurs_dir="$(cd "$aurs_dir" && pwd)"
-    fi
+    [ -z "$aurs_dir" ] || require_aurs_checkout "$aurs_dir"
 
+    head_before="$(git rev-parse HEAD)"
+    phase=tag
     git tag -a "v$version" -m "v$version"
+    tag_made="v$version"
     tag_object="$(git rev-parse "v$version")"
     set_pkgbuild "$version" "$tag_object"
     (cd aur/bubbler && "$MAKEPKG" --printsrcinfo >.SRCINFO)
     git add aur/bubbler/PKGBUILD aur/bubbler/.SRCINFO
     git commit -q -m "chore: the AUR package builds $version"
+    phase=""
 
     [ -n "$aurs_dir" ] || return 0
     {
@@ -85,21 +136,27 @@ tag() {
         tail -n +2 aur/bubbler/PKGBUILD
     } >"$aurs_dir/PKGBUILD.new"
     mv "$aurs_dir/PKGBUILD.new" "$aurs_dir/PKGBUILD"
-    cp aur/bubbler/bubbler.install "$aurs_dir/bubbler.install"
-    (cd "$aurs_dir" && "$MAKEPKG" --printsrcinfo >.SRCINFO)
+    cp aur/bubbler/bubbler.install aur/bubbler/.SRCINFO "$aurs_dir/"
     echo "Written to $aurs_dir, nothing committed there. To commit:"
-    echo "git -C $aurs_dir commit -am \"Update to $version\""
+    printf 'git -C %q commit -am "Update to %s"\n' "$aurs_dir" "$version"
 }
 
-cd "$(git rev-parse --show-toplevel)"
+resolve_dir() {
+    (cd -- "$1" >/dev/null 2>&1 && pwd -P) || die "'$1' is not a directory"
+}
+
 case "${1:-}" in
     --tag)
         [ $# -ge 2 ] && [ $# -le 3 ] || die "usage: scripts/release --tag <version> [aurs-dir]"
-        tag "$2" "${3:-}"
+        aurs_dir=""
+        [ -z "${3:-}" ] || aurs_dir="$(resolve_dir "$3")"
+        cd "$(git rev-parse --show-toplevel)"
+        tag "$2" "$aurs_dir"
         ;;
     "" | -*) die "usage: scripts/release <version> | --tag <version> [aurs-dir]" ;;
     *)
         [ $# -eq 1 ] || die "usage: scripts/release <version>"
+        cd "$(git rev-parse --show-toplevel)"
         bump "$1"
         ;;
 esac

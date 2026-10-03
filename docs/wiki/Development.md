@@ -157,15 +157,23 @@ scripts/release --tag X.Y.Z [aurs-dir]
 The first sets the version in the root `Cargo.toml`, runs
 `cargo update -w --offline` in the root and in `fuzz/`, and commits
 `chore: release vX.Y.Z`. It refuses on a dirty tree, a version that is not
-`X.Y.Z`, a missing changelog heading, or a trunk branch (`main`, `master`).
+`X.Y.Z`, a missing changelog heading, a `Cargo.toml` already at `X.Y.Z`, a
+detached HEAD, or a trunk branch (`main`, `master`).
 
 The second tags `vX.Y.Z` (annotated), points `aur/bubbler/PKGBUILD` at the tag
-object, regenerates `.SRCINFO` with `makepkg --printsrcinfo` and commits
+object (`pkgver`, the comment above `_tag`, `_tag`, and `pkgrel` reset to 1),
+regenerates `.SRCINFO` with `makepkg --printsrcinfo` and commits
 `chore: the AUR package builds X.Y.Z`. It refuses on a dirty tree, a
 `Cargo.toml` at HEAD that is not at `X.Y.Z`, an existing tag, or a missing
-`makepkg`. With `aurs-dir`, a separate AUR checkout, it also writes the
-PKGBUILD there (keeping that file's first line), `bubbler.install` and
-`.SRCINFO`, and prints the commit command without running it.
+`makepkg`. With `aurs-dir` it also writes the PKGBUILD there (keeping that
+file's first line), `bubbler.install` and `.SRCINFO`, and prints the commit
+command without running it; it refuses when `aurs-dir` is not a directory, is
+not the top level of a git checkout other than this repository, or has no
+PKGBUILD whose first line starts with `# Maintainer:`.
+
+Every refusal comes before the first change. If a step fails after that (a
+sed that did not match, `cargo`, `makepkg`, a commit hook), the script removes
+the tag it made and restores the files it touched.
 
 Merging, pushing and the AUR push stay manual. `scripts/release.test` checks
 both commands in a throwaway repository.

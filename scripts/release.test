@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-release="$(cd "$(dirname "$0")" && pwd)/release"
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE CDPATH
+
+release="$(cd -- "$(dirname "$0")" >/dev/null && pwd -P)/release"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
@@ -31,6 +34,8 @@ new_repo() {
     git init -q -b "$branch"
     git config user.name tester
     git config user.email tester@example.invalid
+    git init -q --bare "$work/$1.origin"
+    git remote add origin "$work/$1.origin"
     cat >Cargo.toml <<'EOF'
 [workspace.package]
 version = "1.0.0"
@@ -50,6 +55,7 @@ EOF
 # Maintainer: Repo Line
 pkgbase=bubbler
 pkgver=1.0.0
+pkgrel=2
 # git rev-parse v1.0.0 (the tag object, not the commit it points to)
 _tag=0000000000000000000000000000000000000000
 EOF
@@ -59,11 +65,39 @@ EOF
     git commit -q -m init
 }
 
-refuses() { ! "$release" "$@" >/dev/null 2>&1; }
+state() {
+    git status --porcelain
+    git tag -l
+    git rev-parse HEAD
+}
+
+refuses() {
+    local before err
+    before="$(state)"
+    if err="$("$release" "$@" 2>&1 >/dev/null)"; then
+        return 1
+    fi
+    case "$err" in
+        "release: "*) ;;
+        *) return 1 ;;
+    esac
+    [ "$(state)" = "$before" ]
+}
+
+new_aurs() {
+    mkdir -p "$1"
+    git -C "$1" init -q
+    printf '# Maintainer: Real Maintainer\nold\n' >"$1/PKGBUILD"
+    git -C "$1" add PKGBUILD
+    git -C "$1" -c user.name=t -c user.email=t@example.invalid commit -q -m first
+}
 
 new_repo ok feat/x
 check refuses 9.9
 check refuses 9.9.9-rc1
+check refuses
+check refuses --tag
+check refuses --tag 9.9.9
 printf 'x' >stray
 check refuses 9.9.9
 rm stray
@@ -75,6 +109,12 @@ check refuses 9.9.9
 sed -i 's/^## 9.9.8/## 9.9.9/' CHANGELOG.md
 git commit -qam changelog
 
+git checkout -q --detach
+check refuses 9.9.9
+git checkout -q other
+
+RELEASE_CARGO=false check refuses 9.9.9
+
 "$release" 9.9.9 >/dev/null
 check test "$(git log -1 --format=%s)" = "chore: release v9.9.9"
 check test "$(git log -1 --format=%B | grep -c .)" = 1
@@ -85,48 +125,93 @@ check grep -q '^rust-version = "1.0.0"' Cargo.toml
 check grep -q '^version = "9.9.9"' Cargo.toml
 check test "$(grep -c 'version = "9.9.9"' Cargo.toml)" = 4
 check test -z "$(git status --porcelain)"
+check refuses 9.9.9
 
 check refuses --tag 9.9.8
+printf 'x' >stray
+check refuses --tag 9.9.9
+rm stray
 git tag v9.9.9-other
+RELEASE_MAKEPKG=false check refuses --tag 9.9.9
+RELEASE_MAKEPKG=no-such-makepkg check refuses --tag 9.9.9
+before_head="$(git rev-parse HEAD)"
 "$release" --tag 9.9.9 >/dev/null
 check test "$(git cat-file -t v9.9.9)" = tag
 tag_object="$(git rev-parse v9.9.9)"
 check grep -qx "_tag=$tag_object" aur/bubbler/PKGBUILD
 check grep -qx 'pkgver=9.9.9' aur/bubbler/PKGBUILD
+check grep -qx 'pkgrel=1' aur/bubbler/PKGBUILD
 check grep -q '^# git rev-parse v9.9.9 ' aur/bubbler/PKGBUILD
 check grep -qx 'srcinfo for 9.9.9' aur/bubbler/.SRCINFO
 check test "$(git log -1 --format=%s)" = "chore: the AUR package builds 9.9.9"
 check test "$(git log -1 --format=%B | grep -c .)" = 1
+check test "$(git rev-parse HEAD~1)" = "$before_head"
 check test -z "$(git status --porcelain)"
 check refuses --tag 9.9.9
+check test -z "$(git --git-dir="$work/ok.origin" for-each-ref)"
 
 new_repo withaurs feat/x
 git checkout -q -b other
 "$release" 9.9.9 >/dev/null
 aurs="$work/aurs"
-mkdir "$aurs"
-git -C "$aurs" init -q
-printf '# Maintainer: Real Maintainer\nold\n' >"$aurs/PKGBUILD"
-git -C "$aurs" add PKGBUILD
-git -C "$aurs" -c user.name=t -c user.email=t@example.invalid commit -q -m first
-out="$("$release" --tag 9.9.9 "$aurs")"
+new_aurs "$aurs"
+check refuses --tag 9.9.9 "$work/not-a-directory"
+mkdir "$work/plain"
+check refuses --tag 9.9.9 "$work/plain"
+mkdir "$work/nogit"
+echo '# Maintainer: X' >"$work/nogit/PKGBUILD"
+check refuses --tag 9.9.9 "$work/nogit"
+check refuses --tag 9.9.9 "$work"
+check refuses --tag 9.9.9 "$work/withaurs/aur/bubbler"
+new_aurs "$work/empty"
+: >"$work/empty/PKGBUILD"
+check refuses --tag 9.9.9 "$work/empty"
+new_aurs "$work/nomaint"
+echo 'pkgbase=bubbler' >"$work/nomaint/PKGBUILD"
+check refuses --tag 9.9.9 "$work/nomaint"
+cd "$work/withaurs"
+mkdir sub
+cd sub
+out="$("$release" --tag 9.9.9 ../../aurs)"
+cd ..
 check test "$(head -1 "$aurs/PKGBUILD")" = "# Maintainer: Real Maintainer"
 check grep -qx 'pkgver=9.9.9' "$aurs/PKGBUILD"
+check grep -qx 'pkgrel=1' "$aurs/PKGBUILD"
 check grep -qx "_tag=$(git rev-parse v9.9.9)" "$aurs/PKGBUILD"
 check test -f "$aurs/bubbler.install"
 check grep -qx 'srcinfo for 9.9.9' "$aurs/.SRCINFO"
 check test "$(git -C "$aurs" rev-list --count HEAD)" = 1
 check grep -qF "git -C $aurs commit -am \"Update to 9.9.9\"" <<<"$out"
+check test -z "$(git --git-dir="$work/withaurs.origin" for-each-ref)"
 
 new_repo trunk master
 check refuses 9.9.9
 
-new_repo nomakepkg feat/x
+new_repo cargofail feat/x
+git checkout -q -b other
+RELEASE_CARGO=false check refuses 9.9.9
+check test -z "$(git status --porcelain)"
+
+new_repo dependrift feat/x
+git checkout -q -b other
+sed -i 's/^bubbler-init = .*/bubbler-init = "1.0.0"/' Cargo.toml
+git commit -qam drift
+check refuses 9.9.9
+check grep -q '^version = "1.0.0"' Cargo.toml
+
+new_repo pkgdrift feat/x
 git checkout -q -b other
 "$release" 9.9.9 >/dev/null
-msg="$(RELEASE_MAKEPKG=no-such-makepkg "$release" --tag 9.9.9 2>&1 || true)"
-check grep -q makepkg <<<"$msg"
-check test -z "$(git tag -l v9.9.9)"
+sed -i '/^# git rev-parse/d' aur/bubbler/PKGBUILD
+git commit -qam drift
+check refuses --tag 9.9.9
+check test -z "$(git tag -l)"
+
+new_repo makepkgfail feat/x
+git checkout -q -b other
+"$release" 9.9.9 >/dev/null
+RELEASE_MAKEPKG=false check refuses --tag 9.9.9
+check grep -qx 'pkgver=1.0.0' aur/bubbler/PKGBUILD
 
 if [ "$failures" -ne 0 ]; then
     echo "$failures check(s) failed" >&2
