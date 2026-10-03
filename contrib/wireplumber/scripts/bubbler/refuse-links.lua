@@ -51,6 +51,13 @@
 -- them a default or a filter. WirePlumber links
 -- no other client's stream to a sandbox's stream either.
 --
+-- Under the device grant (`devices` in its grant) a sandbox's nodes that
+-- are no stream are devices like the host's: WirePlumber may link another
+-- client's stream to them and make one a default. Into such a device flows
+-- only a playback stream; a capture stream records from it as from a host
+-- device. Every factory but `client-node` stays hidden from it all the
+-- same, so its devices are nodes it runs itself, carrying its client id.
+--
 -- A link with a sandbox's node at either end is destroyed when
 -- WirePlumber sees it, unless WirePlumber made it and it is one the
 -- hooks above would have let it make; one drawn in a patchbay is
@@ -89,14 +96,27 @@ local function bubbler_client (source, client_id)
   return nil
 end
 
+-- Whether the client's grant lets its own devices stand beside the
+-- host's.
+local function offers_devices (client)
+  local grant = client.properties ["pipewire.sec.bubbler.audio"] or ""
+  return ("," .. grant .. ","):find (",devices,", 1, true) ~= nil
+end
+
 -- Whether the target is a sandbox's node that is not the stream's own:
 -- whoever the stream belongs to, a sink, source or filter a sandbox
 -- offers would otherwise take a host stream without the sandbox making
--- any link.
+-- any link. A device of a sandbox with the device grant is a device like
+-- the host's; its streams are still its own.
 local function foreign_sandbox_node (source, si_props, target_props)
-  return bubbler_client (source, target_props ["client.id"]) ~= nil and
-      (target_props ["item.node.type"] ~= "stream" or
-       target_props ["client.id"] ~= si_props ["client.id"])
+  local owner = bubbler_client (source, target_props ["client.id"])
+  if not owner then
+    return false
+  end
+  if target_props ["item.node.type"] == "stream" then
+    return target_props ["client.id"] ~= si_props ["client.id"]
+  end
+  return not offers_devices (owner)
 end
 
 -- Whether a stream can record from the node: the classes 50-bubbler.conf
@@ -178,13 +198,6 @@ SimpleEventHook {
     end
   end
 }:register ()
-
--- Whether the client's grant lets its own devices stand beside the
--- host's.
-local function offers_devices (client)
-  local grant = client.properties ["pipewire.sec.bubbler.audio"] or ""
-  return ("," .. grant .. ","):find (",devices,", 1, true) ~= nil
-end
 
 -- The keys a stock lookup by name matches a target on:
 -- linking/find-defined-target takes a candidate whose `node.name` or
@@ -464,6 +477,33 @@ local function own_stream_link (source, link, sandbox_output, sandbox_input)
           "microphone", 1, true) ~= nil
 end
 
+-- Whether `props` are those of a device a sandbox offers under the device
+-- grant: one of its nodes that is no stream.
+local function offered_device (source, props)
+  local client = bubbler_client (source, props ["client.id"])
+  return client ~= nil and offers_devices (client) and
+      (props ["media.class"] or ""):find ("^Stream/") == nil
+end
+
+-- Whether a link between `output` and `input`, one of them a device a
+-- sandbox offers, is one WirePlumber makes for a stream aimed at that
+-- device: a playback stream into it, or a capture stream from it, where a
+-- sandbox's capture stream needs a source and the microphone grant as it
+-- does from a host device. Nothing else flows into an offered device: not
+-- a source, not a sink's monitor, since the sandbox hears what does.
+local function offered_device_link (source, output, input)
+  if offered_device (source, input) then
+    return output ["media.class"] == AUDIO_STREAM_CLASS.output
+  end
+  if input ["media.class"] ~= AUDIO_STREAM_CLASS.input then
+    return false
+  end
+  local client = bubbler_client (source, input ["client.id"])
+  return client == nil or (capture_capable (output) and
+      string.find (client.properties ["pipewire.sec.bubbler.audio"] or "",
+          "microphone", 1, true) ~= nil)
+end
+
 -- The `object.serial` of every link already asked to go, which a later
 -- check would otherwise ask again. Serials are never reused.
 local destroying = {}
@@ -483,8 +523,18 @@ local function destroy_if_refused (source, link)
   if not output and not input then
     return
   end
-  if not (made_by_wireplumber (source, link) and
-      own_stream_link (source, link, output, input)) then
+  local allowed
+  if (output and offered_device (source, output)) or
+      (input and offered_device (source, input)) then
+    local output_node = lookup (source, "node", link.properties ["link.output.node"])
+    local input_node = lookup (source, "node", link.properties ["link.input.node"])
+    allowed = output_node ~= nil and input_node ~= nil and
+        offered_device_link (source, output_node.properties,
+            input_node.properties)
+  else
+    allowed = own_stream_link (source, link, output, input)
+  end
+  if not (made_by_wireplumber (source, link) and allowed) then
     log:warning (link, "destroying a link to a bubbler context " ..
         "that the policy refuses")
     link:request_destroy ()
