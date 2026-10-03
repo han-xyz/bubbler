@@ -150,11 +150,12 @@ local function capture_capable (node_props)
 end
 
 -- Whether the stream would hold its target for itself: asked for it
--- exclusively, or able to play encoded audio only, which is passed
--- through unmixed.
-local function holds_its_target (si_props)
+-- exclusively, or either end able to take encoded audio only, which is
+-- passed through unmixed.
+local function holds_its_target (si_props, target_props)
   return cutils.parseBool (si_props ["node.exclusive"]) or
-      cutils.parseBool (si_props ["item.node.encoded-only"])
+      cutils.parseBool (si_props ["item.node.encoded-only"]) or
+      cutils.parseBool (target_props ["item.node.encoded-only"])
 end
 
 local HOLDS_ITS_TARGET =
@@ -188,7 +189,8 @@ local function refusal (si_props, target_props, client)
 
   -- Last, so a stream is told it needs the exclusive grant only where
   -- that grant alone would let it be linked.
-  if holds_its_target (si_props) and not granted (client, "exclusive") then
+  if holds_its_target (si_props, target_props) and
+      not granted (client, "exclusive") then
     return HOLDS_ITS_TARGET
   end
 
