@@ -31,7 +31,8 @@
 
 - `pipewire { devices }` lets an instance offer audio devices: the sinks and
   sources it makes through its own connection are treated like the host's, so
-  host streams may play into them and one may become the default; `bubbler
+  host streams may play into them and one may become the default; a smart
+  filter, or a node named after a host device, is still kept out; `bubbler
   lint` notes `audio-devices-offered`.
 - `pipewire { exclusive }` / `pulseaudio { exclusive }` let an instance's
   stream hold a sink for itself, as bitstream passthrough to a receiver or

@@ -71,7 +71,8 @@ purpose).
 `microphone` child on `pipewire` or `pulseaudio`: every microphone and
 line-in the session has, and capture from them), `audio-devices-offered` (a
 `devices` child on `pipewire`: the instance hears whatever is routed into
-the devices it offers, and one of them may become the default).
+the devices it offers — its sinks, sources and plain filters, never a smart
+filter — and one of them may become the default).
 
 `allow-host-wildcard` is about a pattern that is a wildcard directly under a
 top-level domain (`*.com`): the `*` stands for one label, so that one covers

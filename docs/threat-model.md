@@ -852,9 +852,10 @@ daemon's side with five properties a policy can match on:
 (which the daemon turns into `pipewire.access.effective = "restricted"`
 on the client object) and `pipewire.sec.bubbler.audio`, `"playback"`
 followed by `,microphone` and `,devices` where granted — the one property
-the grant set collapses into, each child ORed across `pipewire` and
-`pulseaudio` and across every layer, so a `pulseaudio { microphone }` in one layer widens a bare
-`pipewire` elsewhere in the same config. The grant is a `pipewire.sec.`
+the grant set collapses into, `microphone` ORed across both nodes,
+`devices` from `pipewire`, both across every layer, so a
+`pulseaudio { microphone }` in one layer widens a bare `pipewire`
+elsewhere in the same config. The grant is a `pipewire.sec.`
 key because the daemon refuses a client every update to such a key, its
 first included (PipeWire 1.6.9, `impl-client.c`
 `check_client_property_update`). Any other key a client may set on
@@ -986,10 +987,11 @@ cannot keep out of the session this way is one it cannot make. A JACK
 client's node under `pw-jack` carries no `media.class` at all (measured),
 so stock WirePlumber makes no session item for it either.
 
-The device grant (`pipewire { devices }`, the word `devices`) lifts that
-for one instance: its nodes that are no stream keep their session items
-and are devices of the session like the host's. A host stream aimed at
-its sink plays into it, a host recorder may record from its source, and
+The device grant (`pipewire { devices }`, the word `devices`) lifts the
+class rule for one instance: its nodes that are no stream — sinks,
+sources and plain filters or loopbacks — keep their session items and are
+devices of the session like the host's. A host stream aimed at its sink
+plays into it, a host recorder may record from its source, and
 WirePlumber may make one of them the default (all measured in the test
 bed, the sink made through `client-node` by `pw-cat` and by
 `pw-loopback`). The instance hears whatever is routed into its devices,
@@ -998,25 +1000,41 @@ offered device only where WirePlumber made it from an audio playback
 stream, so a sink's monitor and a source are never linked in, even by a
 session manager (measured: a second session manager's link from the
 sink's monitor was destroyed, its link from the source refused by the
-daemon, a patchbay's link from a stream destroyed). Another sandbox's
-capture stream records from an offered source only under its own
-`microphone`, as from a host source, and another sandbox's stream named
-after an offered device does not take a host stream pinned to it
-(measured). Without `microphone` the instance still sees no source and
-records from none. The grant does not open a factory: `adapter`,
-`spa-node-factory` and the link factory stay hidden from every sandbox,
-with or without it (measured: a device-grant context's `pw-cli create-node adapter` is
-refused with "unknown factory name"). `adapter` takes any SPA factory the daemon
-maps — a host ALSA or V4L2 device among them — and runs the node in the
-daemon, and a node made with `object.linger` carries no owner at all and
-outlives the instance, so nothing could tell it from a host device; the
-devices the grant covers are only nodes the instance runs itself, which
-carry its client id and end with it. An application that makes its
-devices daemon-side (EasyEffects makes its sink and source through
-`adapter`) is not supported under a scoped grant. One security context
-serves both audio nodes, so the private pulse server of a `pulseaudio`
-grant carries the word too; it cannot use it, since it refuses every
-`load-module` and makes no device itself.
+daemon, or destroyed by the hook where the instance holds `microphone`
+and can see the source, a patchbay's link from a stream destroyed).
+Another sandbox's capture stream records from an offered source only
+under its own `microphone`, as from a host source, and another sandbox's
+stream named after an offered device does not take a host stream pinned
+to it (measured). The grant lifts neither the name rule nor the filter
+chain: a node of the instance, device or stream, that shares a
+`node.name`, `object.path` or `node.nick` with a device it does not own
+loses its session item as without the grant (measured: a device-grant
+context's sink and its stream named after a host device, in both arrival
+orders, took no host stream pinned to that device), and so does one
+marked a smart filter (`filter.smart`, by its properties now or as its
+item froze them), which lib/filter-utils.lua would otherwise put in front
+of the host device its `filter.smart.target` names, so every host stream
+pinned to that device or recorder aimed at that source would pass through
+the instance (measured: a smart filter aimed at the host's sink, one
+aimed at its source, and one that marked itself smart a second after it
+was made took no pinned host stream or recorder). The `filters` metadata,
+the other way a node is made smart, is hidden from a device-grant context
+as from every sandbox (measured). Without `microphone` the instance still
+sees no source and records from none. The grant does not open a factory:
+`adapter`, `spa-node-factory` and the link factory stay hidden from every
+sandbox, with or without it (measured: a device-grant context's `pw-cli
+create-node adapter` is refused with "unknown factory name"). `adapter`
+takes any SPA factory the daemon maps — a host ALSA or V4L2 device among
+them — and runs the node in the daemon, and a node made with
+`object.linger` carries no owner at all and outlives the instance, so
+nothing could tell it from a host device; the devices the grant covers
+are only nodes the instance runs itself, which carry its client id and
+end with it. An application that makes its devices daemon-side
+(EasyEffects makes its sink and source through `adapter`) is not
+supported under a scoped grant. One security context serves both audio
+nodes, so the private pulse server of a `pulseaudio` grant carries the
+word too; it cannot use it, since it refuses every `load-module` and
+makes no device itself.
 
 That covers the links the session manager makes; a client can also make
 one itself, and node permissions cannot stop it. PipeWire 1.6.8 lets any
@@ -1248,6 +1266,8 @@ the hook, each new link destroyed in turn.
 `a_host_recorder_records_from_a_source_a_devices_context_offers`,
 `only_a_session_managers_link_from_a_stream_into_a_devices_sink_is_kept`,
 `a_host_stream_pinned_to_a_devices_contexts_sink_links_to_it_beside_another_contexts_copy`,
+`a_host_stream_pinned_to_a_device_links_to_it_beside_a_devices_contexts_copy`,
+`a_host_stream_passes_by_a_smart_filter_a_devices_context_offers_in_front_of_a_device`,
 `a_context_creates_nodes_only_as_its_own_streams`,
 `a_host_stream_plays_after_a_playback_contexts_stream_asked_for_the_sink_alone`,
 `a_host_stream_plays_after_a_pulse_clients_stream_asked_for_the_sink_alone`,
