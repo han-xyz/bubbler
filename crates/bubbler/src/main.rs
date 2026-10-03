@@ -7,6 +7,7 @@ use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, IsTerminal, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -862,6 +863,26 @@ fn refresh_entries(env: &Env, dirs: &desktop::Dirs, program: &Path) -> Result<i3
 /// there is none: a log that cannot be opened — a symlink where the file
 /// belongs, a full disk — is a lost record, and losing the record is not
 /// a reason to refuse the sandbox the user asked for.
+/// The connection a start that lost the race to another start of the
+/// instance joins that one through, the way a later run would: the
+/// winner has bound the control socket, and a connection waits there
+/// until its sandbox answers. Tried once; a winner already gone again is
+/// the start's own error.
+fn join_after_lost_start(
+    env: &Env,
+    name: &str,
+    log: Option<&run_log::Redirect>,
+    lost: LaunchError,
+) -> Result<UnixStream> {
+    if let Some(log) = log {
+        log.joined();
+    }
+    match exec::connect(env, name).with_context(|| format!("connecting to instance `{name}`"))? {
+        Some(stream) => Ok(stream),
+        None => Err(lost).with_context(|| format!("running instance `{name}`")),
+    }
+}
+
 fn open_log(
     start: fn(&Path, bool) -> Result<run_log::Redirect, LaunchError>,
     path: &Path,
@@ -1312,42 +1333,52 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                 None => exec::connect(&env, &name)
                     .with_context(|| format!("connecting to instance `{name}`"))?,
             };
-            if let Some(stream) = stream {
-                // Asked again on this connection, not only on the probe
-                // above: an instance that came up in between is a live
-                // sandbox the share would be missing from just the same.
-                if !inst.config.shares.is_empty() {
-                    return Err(share_needs_a_fresh_sandbox(&name));
+            let stream = match stream {
+                Some(stream) => stream,
+                None => {
+                    if inst.has_service(&Service::X11(X11Mode::Host)) {
+                        ediag!(
+                            "bubbler: warning: x11 \"host\" grants no isolation between X clients"
+                        );
+                    }
+                    if let Some(warning) = audio_policy::run_warning(&inst.config, &RealHost, &env)
+                    {
+                        ediag!("bubbler: warning: {warning}");
+                    }
+                    match launcher::run(&env, &inst, command, mode, log.as_ref()) {
+                        Err(e @ LaunchError::AlreadyRunning(_)) => {
+                            join_after_lost_start(&env, &name, log.as_ref(), e)?
+                        }
+                        code => return code.with_context(|| format!("running instance `{name}`")),
+                    }
                 }
-                ediag!(
-                    "bubbler: instance `{name}` is running; executing inside it \
-                     (config changes apply after restart)"
-                );
-                let command = launcher::resolve_command(&inst, command)?;
-                // A command handed fd 2 gets the caller's own stderr, not
-                // the copy into the log: a child it leaves behind would hold
-                // that copy's pipe past this run, which ends it. Under
-                // `none` it writes to a pipe bubbler pumps into the copy.
-                let mut host = tty::host_stdio()?;
-                if let Some(redirect) = log.as_ref()
-                    && mode != TtyMode::None
-                {
-                    host[2] = redirect
-                        .original_stderr()
-                        .try_clone_to_owned()
-                        .context("duplicating stderr")?;
-                }
-                return exec::run_in_with(&stream, command, mode, host)
-                    .with_context(|| format!("executing in instance `{name}`"));
+            };
+            // Asked again on this connection, not only on the probe
+            // above: an instance that came up in between is a live
+            // sandbox the share would be missing from just the same.
+            if !inst.config.shares.is_empty() {
+                return Err(share_needs_a_fresh_sandbox(&name));
             }
-            if inst.has_service(&Service::X11(X11Mode::Host)) {
-                ediag!("bubbler: warning: x11 \"host\" grants no isolation between X clients");
+            ediag!(
+                "bubbler: instance `{name}` is running; executing inside it \
+                 (config changes apply after restart)"
+            );
+            let command = launcher::resolve_command(&inst, command)?;
+            // A command handed fd 2 gets the caller's own stderr, not
+            // the copy into the log: a child it leaves behind would hold
+            // that copy's pipe past this run, which ends it. Under
+            // `none` it writes to a pipe bubbler pumps into the copy.
+            let mut host = tty::host_stdio()?;
+            if let Some(redirect) = log.as_ref()
+                && mode != TtyMode::None
+            {
+                host[2] = redirect
+                    .original_stderr()
+                    .try_clone_to_owned()
+                    .context("duplicating stderr")?;
             }
-            if let Some(warning) = audio_policy::run_warning(&inst.config, &RealHost, &env) {
-                ediag!("bubbler: warning: {warning}");
-            }
-            launcher::run(&env, &inst, command, mode)
-                .with_context(|| format!("running instance `{name}`"))
+            exec::run_in_with(&stream, command, mode, host)
+                .with_context(|| format!("executing in instance `{name}`"))
         }
         Cmd::Try {
             profile,
@@ -1407,7 +1438,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                 ediag!("bubbler: warning: {warning}");
             }
             let mode = tty.unwrap_or(eph.instance.config.tty);
-            let code = launcher::run(&env, &eph.instance, command, mode);
+            let code = launcher::run(&env, &eph.instance, command, mode, None);
             // Something else already answers on this pid's control socket,
             // so that runtime directory is not this run's to remove.
             if matches!(code, Err(LaunchError::AlreadyRunning(_))) {
@@ -1483,23 +1514,33 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                 true => inst.config.tty,
                 false => TtyMode::None,
             };
-            if let Some(stream) = stream {
-                ediag!(
-                    "bubbler: instance `{name}` is running; executing inside it \
-                     (config changes apply after restart)"
-                );
-                let command = launcher::resolve_command(&inst, command)?;
-                return exec::run_in(&stream, command, mode)
-                    .with_context(|| format!("executing in instance `{name}`"));
-            }
-            if inst.has_service(&Service::X11(X11Mode::Host)) {
-                ediag!("bubbler: warning: x11 \"host\" grants no isolation between X clients");
-            }
-            if let Some(warning) = audio_policy::run_warning(&inst.config, &RealHost, &env) {
-                ediag!("bubbler: warning: {warning}");
-            }
-            launcher::run(&env, &inst, command, mode)
-                .with_context(|| format!("running instance `{name}`"))
+            let stream = match stream {
+                Some(stream) => stream,
+                None => {
+                    if inst.has_service(&Service::X11(X11Mode::Host)) {
+                        ediag!(
+                            "bubbler: warning: x11 \"host\" grants no isolation between X clients"
+                        );
+                    }
+                    if let Some(warning) = audio_policy::run_warning(&inst.config, &RealHost, &env)
+                    {
+                        ediag!("bubbler: warning: {warning}");
+                    }
+                    match launcher::run(&env, &inst, command, mode, log.as_ref()) {
+                        Err(e @ LaunchError::AlreadyRunning(_)) => {
+                            join_after_lost_start(&env, &name, log.as_ref(), e)?
+                        }
+                        code => return code.with_context(|| format!("running instance `{name}`")),
+                    }
+                }
+            };
+            ediag!(
+                "bubbler: instance `{name}` is running; executing inside it \
+                 (config changes apply after restart)"
+            );
+            let command = launcher::resolve_command(&inst, command)?;
+            exec::run_in(&stream, command, mode)
+                .with_context(|| format!("executing in instance `{name}`"))
         }
         Cmd::Log { name } => {
             let config = instance::config_path_checked(&env, &name)

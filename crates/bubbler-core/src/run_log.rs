@@ -20,7 +20,7 @@
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::time::Duration;
 
 use rustix::event::{PollFd, PollFlags, poll};
@@ -94,6 +94,9 @@ fn open(path: &Path, flags: OFlags) -> io::Result<OwnedFd> {
 /// fd 2 pointed at an instance's log for as long as this lives. Dropping
 /// it puts the caller's own stderr back.
 pub struct Redirect {
+    /// Where [`Redirect::started`] or [`Redirect::joined`] tells the
+    /// copying thread whether the log is emptied first.
+    settle: Option<SyncSender<bool>>,
     saved: OwnedFd,
     /// bubbler's end of the pipe. Dropped first on the way out, since the
     /// copying thread ends on the last writer closing it.
@@ -105,6 +108,14 @@ pub struct Redirect {
 /// `truncate` empties the file first, which is what starting a sandbox
 /// does; an exec into a live instance appends instead, so a run's log
 /// outlives the commands sent into it.
+///
+/// With `truncate`, nothing is copied until the run says which it turned
+/// out to be — [`Redirect::started`] or [`Redirect::joined`] — or the
+/// redirect is dropped, which empties the log as asked: a start that
+/// loses the race to another start of the instance joins that one, and
+/// must not empty the log it is writing. Until then what is written
+/// waits in the pipe, which holds far more than a start says before
+/// its bind.
 ///
 /// The file is opened `O_APPEND` either way, so a second bubbler writing
 /// to the same log lands after what is already there rather than over it.
@@ -125,9 +136,7 @@ fn start(path: &Path, truncate: bool, keep_stderr: bool) -> Result<Redirect, Lau
     // The mode is only applied when the file is created, so a log from an
     // older run, or from a different umask, is narrowed here.
     rustix::fs::fchmod(&file, Mode::RUSR | Mode::WUSR).map_err(|e| io_at(e.into()))?;
-    if truncate {
-        rustix::fs::ftruncate(&file, 0).map_err(|e| io_at(e.into()))?;
-    }
+    let (settle, settled) = mpsc::sync_channel(1);
     let (reader, writer) =
         rustix::pipe::pipe_with(PipeFlags::CLOEXEC).map_err(|e| LaunchError::Data(e.into()))?;
     let saved = io::stderr()
@@ -144,6 +153,12 @@ fn start(path: &Path, truncate: bool, keep_stderr: bool) -> Result<Redirect, Lau
     let (tx, done) = mpsc::sync_channel(1);
     // Nothing in here may start a process; see the module comment.
     std::thread::spawn(move || {
+        // A sender dropped unused is the redirect dropped before the run
+        // said, which keeps what was asked for. A failed truncation costs
+        // the old run's lines staying ahead of this one's, nothing more.
+        if truncate && settled.recv().unwrap_or(true) {
+            let _ = rustix::fs::ftruncate(&file, 0);
+        }
         let file = std::fs::File::from(file);
         let mut stderr = stderr.map(|fd| Blocking(std::fs::File::from(fd)));
         let _ = copy_capped(
@@ -157,6 +172,7 @@ fn start(path: &Path, truncate: bool, keep_stderr: bool) -> Result<Redirect, Lau
         let _ = tx.send(());
     });
     Ok(Redirect {
+        settle: Some(settle),
         saved,
         writer: Some(writer),
         done,
@@ -164,6 +180,25 @@ fn start(path: &Path, truncate: bool, keep_stderr: bool) -> Result<Redirect, Lau
 }
 
 impl Redirect {
+    /// This run started the sandbox: a log opened to be emptied is
+    /// emptied now, and everything the run wrote follows.
+    pub fn started(&self) {
+        self.settle_on(true);
+    }
+
+    /// This run joined one that is already up: what it writes is added
+    /// to that run's log.
+    pub fn joined(&self) {
+        self.settle_on(false);
+    }
+
+    /// The first answer is the one that counts; the channel holds one.
+    fn settle_on(&self, truncate: bool) {
+        if let Some(settle) = &self.settle {
+            let _ = settle.try_send(truncate);
+        }
+    }
+
     /// The stderr the caller had before fd 2 was pointed at the log: what
     /// a command that may outlive this run is handed, so nothing it writes
     /// later depends on a copy that ends with the run.
@@ -174,6 +209,7 @@ impl Redirect {
 
 impl Drop for Redirect {
     fn drop(&mut self) {
+        self.settle.take();
         // Both copies of the write end have to go before the reader sees
         // the end of the output: this one, and the one that is fd 2.
         self.writer.take();

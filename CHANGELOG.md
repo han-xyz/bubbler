@@ -29,7 +29,9 @@
   instance not yet in them, which then failed with "No such device".
 - Two starts of one instance at the same moment could both pass the
   already-running check; the second failed with a raw I/O error, and could
-  delete the first one's control socket. It now says the instance is running.
+  delete the first one's control socket. It now runs its command inside the
+  sandbox the first one started, and a relaunch while the last run is still
+  ending no longer loses its control socket to that run's cleanup.
 
 ## 0.24.2
 

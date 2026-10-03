@@ -91,7 +91,7 @@ handed to the sandbox as an inherited file descriptor, so nothing inside can
 reach the path. `run` on an instance that is already running says so and
 execs into it instead of starting a second sandbox; configuration changes
 apply on the next start. Of two starts made at the same moment, one starts
-the sandbox and the other ends with "instance `<name>` is already running".
+the sandbox and the other execs into it the same way.
 An exec'd process is given whatever the terminal mode decides on (see
 "Terminal"), and descriptors passed to exec'd commands
 are reachable by the sandboxed application through `/proc`: exec is a

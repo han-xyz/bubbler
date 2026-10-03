@@ -3665,6 +3665,10 @@ fn wait_relaying(
 /// holds a descriptor for the user's terminal. `AlreadyRunning` when the
 /// instance is live; that is an exec, which the caller decides on.
 ///
+/// `log` is the run's log, if it has one: it is told the run
+/// [started](run_log::Redirect::started) the sandbox once the control
+/// socket is bound, which a start that lost a race never gets to.
+///
 /// Marks every descriptor of the calling process above stdio that this
 /// spawn is not meant to hand over close-on-exec, so an embedder's own
 /// open files do not cross into the sandbox; none is closed.
@@ -3677,6 +3681,7 @@ pub fn run(
     inst: &Instance,
     command: Option<&[OsString]>,
     mode: TtyMode,
+    log: Option<&run_log::Redirect>,
 ) -> Result<i32, LaunchError> {
     // Before anything is created: a host tool below its floor is a fact
     // about this run, and the reader has to see it whether or not the
@@ -3684,7 +3689,7 @@ pub fn run(
     for line in version::warnings(version::bwrap(), version::proxy(env), &inst.config.services) {
         eprintln!("bubbler: warning: {line}");
     }
-    let dir = prepare_runtime_dir(env, inst)?;
+    prepare_runtime_dir(env, inst)?;
     let stop = Arc::new(AtomicBool::new(false));
     let mut registered = SignalGuard(Vec::new());
     // From here on and not only once the sandbox is up: the sidecars can
@@ -3700,7 +3705,7 @@ pub fn run(
     }
     // Everything the start made is dropped by the time this matches,
     // which is what stops the sidecars and removes what they left.
-    match start_and_wait(env, inst, command, mode, dir, &stop, &mut registered) {
+    match start_and_wait(env, inst, command, mode, &stop, &mut registered, log) {
         Err(LaunchError::Stopped) => Ok(STOPPED_CODE),
         code => code,
     }
@@ -3834,17 +3839,18 @@ fn lock_for_teardown(path: &Path) -> Option<OwnedFd> {
     }
 }
 
-/// [`run`] from its runtime directory on, with the stop signals already
-/// caught in `stop`.
+/// [`run`] once its runtime directory is there, with the stop signals
+/// already caught in `stop`.
 fn start_and_wait(
     env: &Env,
     inst: &Instance,
     command: Option<&[OsString]>,
     mode: TtyMode,
-    dir: PathBuf,
     stop: &AtomicBool,
     registered: &mut SignalGuard,
+    log: Option<&run_log::Redirect>,
 ) -> Result<i32, LaunchError> {
+    let dir = instance_runtime_dir(env, &inst.name);
     let lock_path = start_lock_path(env, &inst.name);
     // Declared first so that it is dropped last: taken again once the
     // sandbox has exited, it holds a relaunch back until everything
@@ -3853,6 +3859,9 @@ fn start_and_wait(
     let sock_path = dir.join(exec::SOCKET_NAME);
     let io_at = |e: Errno| LaunchError::Io(sock_path.clone(), e.into());
     let (listener, _socket_guard) = bind_control_socket(&dir, &lock_path, &inst.name, stop)?;
+    if let Some(log) = log {
+        log.started();
+    }
     let inherited = fcntl_dupfd_cloexec(listener.as_fd(), 3).map_err(io_at)?;
     let mut alloc = RealAlloc::new(inherited.as_raw_fd(), dir.clone());
     // A run with nothing to run must fail before a sidecar is started.
@@ -5010,7 +5019,7 @@ mod tests {
         let dir = prepare_runtime_dir(&e, &i).unwrap();
         let _listener = UnixListener::bind(dir.join(exec::SOCKET_NAME)).unwrap();
         assert!(matches!(
-            run(&e, &i, None, TtyMode::Passthrough),
+            run(&e, &i, None, TtyMode::Passthrough, None),
             Err(LaunchError::AlreadyRunning(n)) if n == "t"
         ));
     }

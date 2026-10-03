@@ -5868,20 +5868,17 @@ fn a_signal_while_a_sidecar_starts_stops_the_run_and_leaves_nothing() {
 }
 
 /// Two starts of one instance, both past the CLI's own liveness probe
-/// and released together by the lock the test holds: one binds and waits
-/// on its proxy, the other is told the instance is running, and the
-/// winner's control socket is still there and answering.
+/// and released together by the lock the test holds: one starts the
+/// sandbox and the other joins it, so both commands run, in one sandbox.
+/// Each writes the pid namespace it is in where the test can read it,
+/// then waits to be stopped.
 #[test]
-fn two_starts_released_together_one_runs_and_one_is_told_it_is_running() {
+fn two_starts_released_together_both_run_in_one_sandbox() {
     if !require_bwrap() {
         return;
     }
     let Some(init) = real_init() else { return };
     let tmp = setup();
-    let bus = tmp.path().join("fakebus");
-    let _listener = UnixListener::bind(&bus).unwrap();
-    let proxy = tmp.path().join("silent-proxy");
-    silent_proxy(&proxy);
     let out = bubbler_live(tmp.path(), &init)
         .args(["create", "twostart"])
         .output()
@@ -5894,28 +5891,29 @@ fn two_starts_released_together_one_runs_and_one_is_told_it_is_running() {
     std::fs::write(
         tmp.path()
             .join("data/bubbler/instances/twostart/config.kdl"),
-        "dbus\n",
+        "\n",
     )
     .unwrap();
-    let dir = tmp.path().join("run/bubbler/twostart");
     std::fs::create_dir_all(tmp.path().join("run/bubbler")).unwrap();
     let lock_path = tmp.path().join("run/bubbler/twostart@start.lock");
     let held = std::fs::File::create(&lock_path).unwrap();
     flock(&held, FlockOperation::LockExclusive).unwrap();
     let start = || {
         bubbler_live(tmp.path(), &init)
-            .env(
-                "DBUS_SESSION_BUS_ADDRESS",
-                format!("unix:path={}", bus.display()),
-            )
-            .env("BUBBLER_DBUS_PROXY", &proxy)
-            .args(["run", "twostart", "--", "/usr/bin/true"])
+            .args([
+                "run",
+                "twostart",
+                "--",
+                "/usr/bin/sh",
+                "-c",
+                "readlink /proc/self/ns/pid > /home/bubbler/ns.$$; exec /usr/bin/sleep 30",
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap()
     };
-    let mut runs = [start(), start()];
+    let runs = [start(), start()];
     let holds_lock = |run: &Child| {
         std::fs::read_dir(format!("/proc/{}/fd", run.id()))
             .into_iter()
@@ -5923,52 +5921,59 @@ fn two_starts_released_together_one_runs_and_one_is_told_it_is_running() {
             .flatten()
             .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|p| p == lock_path))
     };
-    if !wait_until(|| runs.iter().all(holds_lock), Duration::from_secs(4)) {
-        let [a, b] = runs;
-        let _ = kill_process(Pid::from_child(&b), Signal::KILL);
-        fail_with(a, "the starts never waited on the lock");
-    }
+    let waited = wait_until(|| runs.iter().all(holds_lock), Duration::from_secs(4));
     drop(held);
-    let mut loser = None;
-    let told = wait_until(
-        || {
-            loser = runs
-                .iter_mut()
-                .position(|r| r.try_wait().expect("waiting for a run").is_some());
-            loser.is_some()
-        },
-        Duration::from_secs(4),
-    );
-    let answers = UnixStream::connect(dir.join("init.sock")).is_ok();
-    let [a, b] = runs;
-    let (winner, loser) = match loser {
-        Some(1) => (a, Some(b)),
-        _ => (b, told.then_some(a)),
-    };
-    kill_process(Pid::from_child(&winner), Signal::TERM).unwrap();
-    let won = winner.wait_with_output().unwrap();
+    let home = tmp.path().join("data/bubbler/instances/twostart/home");
+    let mut seen: Vec<String> = Vec::new();
+    let both_ran = waited
+        && wait_until(
+            || {
+                seen = std::fs::read_dir(&home)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter(|e| e.file_name().to_string_lossy().starts_with("ns."))
+                    .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+                    .filter(|ns| !ns.is_empty())
+                    .collect();
+                seen.len() == 2
+            },
+            Duration::from_secs(10),
+        );
+    for run in &runs {
+        let _ = kill_process(Pid::from_child(run), Signal::TERM);
+    }
+    let outs = runs.map(|r| r.wait_with_output().unwrap());
+    let log = std::fs::read_to_string(
+        tmp.path()
+            .join("data/bubbler/instances/twostart/last-run.log"),
+    )
+    .unwrap_or_default();
     bubbler_live(tmp.path(), &init)
         .args(["delete", "twostart", "--yes"])
         .status()
         .unwrap();
-    let Some(loser) = loser else {
-        panic!(
-            "neither start ended: {}",
-            String::from_utf8_lossy(&won.stderr)
-        );
-    };
-    let lost = loser.wait_with_output().unwrap();
-    let err = String::from_utf8_lossy(&lost.stderr);
-    assert_eq!(lost.status.code(), Some(1), "{err}");
-    assert!(err.contains("is already running"), "{err}");
-    assert!(!err.contains("os error"), "{err}");
-    assert!(answers, "the running start's control socket did not answer");
+    let said: Vec<String> = outs
+        .iter()
+        .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+        .collect();
+    assert!(waited, "the starts never waited on the lock: {said:?}");
+    assert!(both_ran, "the commands did not both run: {seen:?} {said:?}");
+    assert_eq!(seen[0], seen[1], "two sandboxes: {said:?}");
+    for err in &said {
+        assert!(!err.contains("already running"), "{err}");
+        assert!(!err.contains("os error"), "{err}");
+    }
     assert_eq!(
-        won.status.code(),
-        Some(143),
-        "{}",
-        String::from_utf8_lossy(&won.stderr)
+        said.iter()
+            .filter(|e| e.contains("is running; executing inside it"))
+            .count(),
+        1,
+        "{said:?}"
     );
+    // The run that joined added to the log rather than emptying it after
+    // the run that started had begun writing to it.
+    assert!(log.contains("executing inside it"), "{log}");
 }
 
 /// Ctrl-C at a terminal goes to the whole foreground process group, so
