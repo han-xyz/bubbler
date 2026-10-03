@@ -623,9 +623,12 @@ any link to or from a sandbox's node that is not one of its own streams
 as WirePlumber would link it, one you draw in a patchbay included. A sink,
 source or filter a sandbox offers through its own connection is never made
 the default and no host stream is linked to it: a host stream aimed at one
-plays where it would without it — on the default, through your own smart
-filters — and one pinned to it with `node.dont-fallback` gets no link, as
-with its device missing. What this does not cover is listed under
+plays on what a sandbox's filter stood in front of, else on the default,
+through your own smart filters (a smart filter's own stream goes there
+directly) — and one pinned to it with `node.dont-fallback` gets no link, as
+with its device missing. Where a sandbox names its node after one of your
+devices, a stream pinned to that device can be refused or sent to the
+default although the device is there. What this does not cover is listed under
 "Audio" in `docs/threat-model.md`. Before 0.24.2 a sandbox could still win
 a link of its own in the first instant of a new connection, now and then,
 and keep it, and

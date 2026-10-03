@@ -77,9 +77,12 @@
 - A sandbox with a `pipewire` grant could silence the desktop: while it
   offered a smart filter (`filter.smart`), every host stream that started
   was refused the filter and left unlinked, and so was a host stream aimed
-  at a sink it offered (measured). Such a stream now plays where it would
-  without the sandbox's node — the default, through the host's own smart
-  filters — and one pinned to it with `node.dont-fallback` gets no link.
+  at a sink it offered (measured). Such a stream now plays on what the
+  sandbox's filter stood in front of, else the default, through the host's
+  own smart filters (a smart filter's own stream directly), and one pinned
+  to it with `node.dont-fallback` gets no link. A host stream pinned to a
+  device whose name a sandbox's node also carries can still be refused or
+  sent to the default; that is to be redesigned in 0.25.0.
 - A sandbox with a `pipewire` grant could create a node the daemon owns
   through the `adapter` factory (measured); made to linger, it carried no
   owner, so no rule of the policy applied to it and it outlived the

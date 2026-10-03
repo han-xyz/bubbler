@@ -912,15 +912,18 @@ a stream was refused after `linking/prepare-link` and played nowhere:
 while a playback sandbox offered a smart filter, every host stream that
 started was left unlinked, and so was one aimed at a sink it offered
 (both measured). A hook after every finder and before
-`linking/prepare-link` now hands such a stream what it would get without
-the sandbox's node — what a sandbox's filter stood in front of, else the
-session's default, which is never a sandbox's node — through the host's
-own smart filters as `linking/get-filter-from-target` would have put it
-(both measured: the stream plays on the bed's sink, or through the host's
-filter in front of it). A stream pinned with `node.dont-fallback` to a
-target that is only a sandbox's gets no link, as
+`linking/prepare-link` now hands such a stream what a sandbox's filter
+stood in front of, else the session's default, which is never a
+sandbox's node — through the host's first smart filter in front of it,
+unless the stream is a smart filter's own, which goes there directly
+(measured: the stream plays on the bed's sink, or through the host's
+filter in front of it, and a host filter's own stream stays on the sink
+while a sandbox's filter follows it in the chain). A stream pinned with
+`node.dont-fallback` to a sandbox's node gets no link, as
 `linking/find-defined-target` leaves one whose target is missing
-(measured: before, it was moved to the default).
+(measured: before, it was moved to the default). This is bubbler's own
+reading of WirePlumber's search, not WirePlumber's; where the two differ
+is listed under the known gaps below.
 
 That covers the links the session manager makes; a client can also make
 one itself, and node permissions cannot stop it. PipeWire 1.6.8 lets any
@@ -1058,12 +1061,23 @@ Known gaps, with both files installed. A factory loaded into the daemon
 after a sandbox connected — a module loaded later — keeps that client's
 default permissions and is readable by it: the hook hides factories once,
 when the client's access is decided. (A sandbox connected before
-WirePlumber starts has them hidden all the same, measured.) The playback
+WirePlumber starts had them hidden in the runs measured; the order in
+which the hook learns of the factories and of the client is not
+guaranteed.) The playback
 grant protects what a sandbox can hear and record, not the availability
 of host audio: a playback sandbox's own stream can take the default sink
 exclusively (`node.exclusive`, passthrough), and WirePlumber then drops
 new host streams aimed at it; whether sandboxes may use exclusive or
-passthrough output is to be decided in 0.25.0. Hiding `Audio/Duplex` from a
+passthrough output is to be decided in 0.25.0. The redirect of a host
+stream away from a sandbox's node is bubbler's own reading of
+WirePlumber's target and filter search and differs from it in edge
+cases: a sandbox that gives its node the name of a host device that is
+present can come first in WirePlumber's search by name; a host stream
+pinned to that name with `node.dont-fallback` is then refused ("defined
+target not found") although its device exists, and one pinned without it
+plays on the default rather than on its device. That is availability of
+host audio, not capture; the redirect is to be redesigned in 0.25.0.
+Hiding `Audio/Duplex` from a
 playback sandbox also keeps it from playing into a duplex device, such as
 the single node of an ALSA pro-audio profile; that takes the `microphone`
 grant. A patchbay that re-creates a link the hook destroyed loops against
@@ -1083,6 +1097,7 @@ the hook, each new link destroyed in turn.
 `a_playback_context_cannot_nest_a_context_that_claims_the_microphone`,
 `a_pinned_host_stream_does_not_fall_back_from_a_sink_a_context_names_after_its_device`,
 `a_host_stream_aimed_at_a_sink_a_context_offers_passes_through_the_hosts_filter`,
+`a_host_filters_own_stream_plays_on_past_a_smart_filter_a_context_offers_after_it`,
 `a_session_managers_link_into_a_capture_stream_is_kept_only_where_the_grant_allows`,
 `a_context_connected_before_the_session_manager_cannot_see_the_link_factory`,
 `a_playback_capture_stream_gets_no_link`,
