@@ -513,6 +513,14 @@ local function bubbler_node (source, node_id)
   return nil
 end
 
+-- Whether a sandbox's capture stream may record from `output`: a source,
+-- and only with the microphone grant.
+local function may_record_from (source, capture_props, output_props)
+  local client = bubbler_client (source, capture_props ["client.id"])
+  return client ~= nil and capture_capable (output_props) and
+      granted (client, "microphone")
+end
+
 -- Whether `link`, from `sandbox_output` to `sandbox_input`, is one the
 -- first line would have let WirePlumber make: a context's own audio
 -- streams in their own direction, and where only one end is a sandbox's,
@@ -539,9 +547,7 @@ local function own_stream_link (source, link, sandbox_output, sandbox_input)
         (host.properties ["media.class"] or ""):find ("^Stream/") == nil
   end
   local host = lookup (source, "node", link.properties ["link.output.node"])
-  local client = bubbler_client (source, sandbox_input ["client.id"])
-  return host ~= nil and client ~= nil and capture_capable (host.properties) and
-      granted (client, "microphone")
+  return host ~= nil and may_record_from (source, sandbox_input, host.properties)
 end
 
 -- Whether `props` are those of a device a sandbox offers under the device
@@ -565,9 +571,8 @@ local function offered_device_link (source, output, input)
   if input ["media.class"] ~= AUDIO_STREAM_CLASS.input then
     return false
   end
-  local client = bubbler_client (source, input ["client.id"])
-  return client == nil or (capture_capable (output) and
-      granted (client, "microphone"))
+  return bubbler_client (source, input ["client.id"]) == nil or
+      may_record_from (source, input, output)
 end
 
 -- The `object.serial` of every link already asked to go, which a later
