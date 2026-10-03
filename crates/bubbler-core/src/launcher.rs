@@ -663,7 +663,7 @@ fn build_args_on<'a>(
     args.tag(Origin::Seccomp);
     apply_seccomp(
         &mut args,
-        seccomp::RuleSet::with(&inst.config.seccomp),
+        seccomp::RuleSet::with(&inst.config.seccomp, inst.config.userns),
         env,
         &inst.name,
     )?;

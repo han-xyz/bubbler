@@ -629,7 +629,15 @@ it existed did not name it. `mount_setattr` is the exception: bubblewrap 0.13
 needs it for every bind mount, so a nested `bwrap` dies without it. It needs
 `CAP_SYS_ADMIN` over the mount namespace, cannot clear locked flags and cannot
 ID-map a host filesystem, so with a nested user namespace and `mount` allowed
-it grants what `mount(MS_REMOUNT|MS_BIND)` already does. A hand-written cBPF prefix ahead of the
+it grants what `mount(MS_REMOUNT|MS_BIND)` already does. The rest of the mount
+API, `open_tree_attr` included, is denied only where nesting is off — with
+`userns "disable"` and in every sidecar — since bubblewrap is moving its bind
+mounts onto those calls ([#793](https://github.com/containers/bubblewrap/pull/793),
+[#805](https://github.com/containers/bubblewrap/pull/805)). Each needs
+`CAP_SYS_ADMIN` in the user namespace that owns the mount namespace, which a
+process holds only inside a user namespace of its own; bubbler already allows
+nested user namespaces and plain `mount`, and `userns "disable"` withholds
+exactly that capability. A hand-written cBPF prefix ahead of the
 compiled filter allows `personality` only the five values a desktop
 application has any business setting (`PER_LINUX`, `PER_LINUX32`,
 `UNAME26`, both together, and the query value `0xffffffff`) and answers
@@ -642,9 +650,9 @@ unfiltered on the architectures where it did apply. On
 x86_64 the filter carries i386 as well, so a 32-bit binary is filtered
 rather than killed, and a syscall from an ABI the filter does not carry
 (x32) is killed rather than allowed to walk past it. The proxy sandbox
-gets the same filter. A weaker filter is never quiet: `disable`, an
-`allow` list that empties the rules, and a name this libseccomp does not
-know each print on every run.
+gets the same filter with the whole mount API denied. A weaker filter is
+never quiet: `disable`, an `allow` list that empties the rules, and a name
+this libseccomp does not know each print on every run.
 
 **Does not defend:** this narrows the kernel surface; it is not a
 capability model. Everything unnamed is allowed, and `unshare`, `setns`,
@@ -654,6 +662,8 @@ kernel bug behind an allowed syscall is a kernel bug in the sandbox.
 
 [Seccomp](manual.md#seccomp) ·
 `real_bwrap_seccomp_denies_the_default_list_and_nothing_else`,
+`real_bwrap_seccomp_denies_the_mount_api_where_user_namespaces_are_disabled`,
+`disabled_user_namespaces_and_sidecars_keep_the_mount_api_denied`,
 `the_default_set_compiles_to_one_program_of_a_known_size`,
 `the_ioctl_rules_compare_the_request_argument_once_per_architecture`,
 `an_unknown_abi_is_killed_rather_than_allowed`,
@@ -672,7 +682,7 @@ architecture — measured, `seccomp_rule_add` answers `EFAULT` once i386 is
 in the filter. So those three rules hold for the build architecture only.
 A 32-bit binary inside the sandbox reaches those three numbers; the named
 mount-API calls (`open_tree`, `move_mount`, `fsopen`, `fsconfig`,
-`fsmount`, `fspick`) are denied on both ABIs. The gap
+`fsmount`, `fspick`), where they are denied, are denied on both ABIs. The gap
 closes by itself when libseccomp learns the names, which
 `the_numbered_rules_are_the_ones_this_libseccomp_cannot_name` fails on.
 

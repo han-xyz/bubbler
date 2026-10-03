@@ -9606,6 +9606,10 @@ probe = [
     # without the call answers ENOSYS too, which is what the rule makes
     # the answer everywhere.
     ("open_tree_attr", call(467, -1, 0, 0, 0)),
+    # A null path and a null fs name: an unfiltered kernel faults or
+    # refuses before it opens or creates anything.
+    ("open_tree", call({open_tree}, -1, 0, 0)),
+    ("fsopen", call({fsopen}, 0, 0)),
     # The five allowed persona values go through the hand-written cBPF
     # prefix and reach the kernel; every other value is EPERM. The query
     # is 0xffffffff and returns the persona in force.
@@ -9624,6 +9628,8 @@ report = "\n".join("%s %s" % p for p in probe)
         clone3 = nr("clone3"),
         io_uring_setup = nr("io_uring_setup"),
         pidfd_getfd = nr("pidfd_getfd"),
+        open_tree = nr("open_tree"),
+        fsopen = nr("fsopen"),
         personality = nr("personality"),
         getpid = nr("getpid"),
     )
@@ -9848,7 +9854,10 @@ fn real_bwrap_seccomp_denies_the_default_list_and_nothing_else() {
     assert_eq!(probed(&out, "clone3"), "ENOSYS", "{out}");
     assert_eq!(probed(&out, "io_uring_setup"), "EPERM", "{out}");
     assert_eq!(probed(&out, "pidfd_getfd"), "EPERM", "{out}");
-    assert_eq!(probed(&out, "open_tree_attr"), "ENOSYS", "{out}");
+    // The mount API is the application's while it may nest: bwrap is
+    // moving its bind mounts onto these calls.
+    assert_ne!(probed(&out, "open_tree"), "ENOSYS", "{out}");
+    assert_ne!(probed(&out, "fsopen"), "ENOSYS", "{out}");
     assert_eq!(probed(&out, "tiocsti"), "EPERM", "{out}");
     assert_eq!(probed(&out, "tioclinux"), "EPERM", "{out}");
     // `personality` itself is never denied: only the argument outside
@@ -9867,6 +9876,17 @@ fn real_bwrap_seccomp_allow_hands_one_syscall_back() {
     };
     assert_ne!(probed(&out, "keyctl"), "EPERM", "{out}");
     assert_eq!(probed(&out, "perf_event_open"), "EPERM", "{out}");
+    assert_eq!(probed(&out, "clone3"), "ENOSYS", "{out}");
+}
+
+#[test]
+fn real_bwrap_seccomp_denies_the_mount_api_where_user_namespaces_are_disabled() {
+    let Some((out, _)) = probe_in("seccu", "userns \"disable\"\n") else {
+        return;
+    };
+    assert_eq!(probed(&out, "open_tree"), "ENOSYS", "{out}");
+    assert_eq!(probed(&out, "fsopen"), "ENOSYS", "{out}");
+    assert_eq!(probed(&out, "open_tree_attr"), "ENOSYS", "{out}");
     assert_eq!(probed(&out, "clone3"), "ENOSYS", "{out}");
 }
 

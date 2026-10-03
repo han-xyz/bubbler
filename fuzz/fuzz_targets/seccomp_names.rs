@@ -7,6 +7,7 @@
 
 #![no_main]
 
+use bubbler_core::config::Userns;
 use bubbler_core::seccomp::{self, Errno, RuleSet, SeccompConfig};
 use libfuzzer_sys::fuzz_target;
 
@@ -33,7 +34,7 @@ fuzz_target!(|data: &[u8]| {
             _ => cfg.deny.push(((*name).to_owned(), Errno::Enosys)),
         }
     }
-    let Some(set) = RuleSet::with(&cfg) else {
+    let Some(set) = RuleSet::with(&cfg, Userns::Allow) else {
         return;
     };
     let Ok(Some(program)) = seccomp::compile(&set, false) else {

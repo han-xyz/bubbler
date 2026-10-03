@@ -7,6 +7,8 @@
 - Tests that reach the desktop session or start PipeWire daemons run only with
   `BUBBLER_TEST_SESSION=1`; a plain `cargo test` and the package's `check()`
   touch no session.
+- An application that may nest keeps the new mount API (`open_tree`, `fsopen`
+  and the rest); it stays `ENOSYS` with `userns "disable"` and in sidecars.
 
 ## 0.24.2
 

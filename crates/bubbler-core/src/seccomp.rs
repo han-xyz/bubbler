@@ -13,6 +13,7 @@ use libseccomp::{
 use rustix::fs::MemfdFlags;
 use rustix::io::Errno as OsErrno;
 
+use crate::config::Userns;
 use crate::error::LaunchError;
 
 /// Syscalls the default filter answers with `EPERM`: the kernel keyring,
@@ -99,6 +100,8 @@ pub const SINGLE_ARCH_EPERM: &[&str] = &["modify_ldt"];
 /// Syscalls the default filter answers with `ENOSYS`, so libc falls back
 /// to the older call instead of failing: seccomp cannot inspect `clone3`'s
 /// `clone_args`, and the new mount API can rewrite the sandbox's own VFS.
+/// An application whose user namespaces are not disabled gets the mount
+/// API back ([`MOUNT_API`]); sidecars never do.
 // The mount API hole is CVE-2021-41133. `mount_setattr` is left out:
 // bubblewrap 0.13 needs it for every bind mount and has no fallback, and it
 // needs CAP_SYS_ADMIN over the mount namespace, cannot clear locked flags and
@@ -138,6 +141,23 @@ pub const DEFAULT_ENOSYS: &[&str] = &[
 // same numbers in `flatpak-syscalls-private.h`.
 pub const DEFAULT_ENOSYS_NUMBERED: &[(&str, i32)] =
     &[("open_tree_attr", 467), ("listns", 470), ("fchroot", 472)];
+
+/// The mount-API rules of [`DEFAULT_ENOSYS`] and [`DEFAULT_ENOSYS_NUMBERED`]
+/// that an application which may start a sandbox of its own is spared:
+/// bubblewrap is moving its bind mounts onto them, with the `mount()`
+/// fallback compiled out on distributions that assume a new kernel. Each
+/// needs `CAP_SYS_ADMIN` in the user namespace owning the mount namespace,
+/// which only a user namespace of the sandbox's own grants, so with
+/// `userns "disable"` they stay denied.
+pub const MOUNT_API: &[&str] = &[
+    "open_tree",
+    "move_mount",
+    "fsopen",
+    "fsconfig",
+    "fsmount",
+    "fspick",
+    "open_tree_attr",
+];
 
 /// `ioctl` requests denied with `EPERM` by default, matched on the low 32
 /// bits of argument 1.
@@ -270,14 +290,30 @@ impl RuleSet {
         }
     }
 
-    /// The default set with `cfg`'s allows removed and its denies appended,
-    /// or `None` when the profile disabled the filter. Naming `ioctl` in
-    /// either list drops the [`DEFAULT_IOCTL_EPERM`] rules.
-    pub fn with(cfg: &SeccompConfig) -> Option<Self> {
+    /// The denylist of an application that may create user namespaces:
+    /// the default set without [`MOUNT_API`], so a sandbox it starts
+    /// inside this one can mount.
+    pub fn nesting_set() -> Self {
+        let mut set = Self::default_set();
+        for name in MOUNT_API {
+            set.remove(name);
+        }
+        set
+    }
+
+    /// The application's set — [`Self::nesting_set`] unless `userns` is
+    /// disabled, [`Self::default_set`] then — with `cfg`'s allows removed
+    /// and its denies appended, or `None` when the profile disabled the
+    /// filter. Naming `ioctl` in either list drops the
+    /// [`DEFAULT_IOCTL_EPERM`] rules.
+    pub fn with(cfg: &SeccompConfig, userns: Userns) -> Option<Self> {
         if cfg.disable {
             return None;
         }
-        let mut set = Self::default_set();
+        let mut set = match userns {
+            Userns::Allow => Self::nesting_set(),
+            Userns::Disable => Self::default_set(),
+        };
         for name in &cfg.allow {
             set.remove(name);
             if name == "ioctl" {
@@ -662,12 +698,36 @@ mod tests {
         assert!(!EXTRA_ARCHES.contains(&ScmpArch::X32));
     }
 
+    fn enosys_names(set: &RuleSet) -> Vec<&str> {
+        set.enosys
+            .iter()
+            .map(String::as_str)
+            .chain(set.enosys_numbered.iter().map(|(n, _, _)| n.as_str()))
+            .collect()
+    }
+
     #[test]
-    fn mount_setattr_is_allowed_while_the_rest_of_the_mount_api_is_not() {
-        let set = RuleSet::default_set();
-        let denied = |name: &str| set.eperm.iter().chain(&set.enosys).any(|n| n == name);
-        assert!(!denied("mount_setattr"));
-        assert!(denied("open_tree"));
+    fn an_application_that_may_nest_keeps_the_mount_api() {
+        let set = RuleSet::with(&SeccompConfig::default(), Userns::Allow).unwrap();
+        let denied = enosys_names(&set);
+        for name in MOUNT_API {
+            assert!(!denied.contains(name), "{name} is denied");
+        }
+        for name in ["clone3", "listns", "fchroot"] {
+            assert!(denied.contains(&name), "{name} is allowed");
+        }
+        assert!(!set.eperm.iter().any(|n| n == "mount_setattr"));
+    }
+
+    #[test]
+    fn disabled_user_namespaces_and_sidecars_keep_the_mount_api_denied() {
+        let disabled = RuleSet::with(&SeccompConfig::default(), Userns::Disable).unwrap();
+        for set in [&disabled, &RuleSet::default_set()] {
+            let denied = enosys_names(set);
+            for name in MOUNT_API.iter().chain(&["clone3", "listns", "fchroot"]) {
+                assert!(denied.contains(name), "{name} is allowed");
+            }
+        }
     }
 
     #[test]
@@ -676,7 +736,10 @@ mod tests {
         assert_eq!(set.eperm[..DEFAULT_EPERM.len()], *DEFAULT_EPERM);
         assert_eq!(set.enosys, DEFAULT_ENOSYS);
         assert_eq!(set.ioctl_eperm, vec![0x5412, 0x541C]);
-        assert_eq!(RuleSet::with(&SeccompConfig::default()), Some(set));
+        assert_eq!(
+            RuleSet::with(&SeccompConfig::default(), Userns::Disable),
+            Some(set)
+        );
     }
 
     /// The three numbered rules exist because this libseccomp has no
@@ -739,7 +802,7 @@ mod tests {
             allow: vec!["open_tree_attr".to_owned()],
             ..SeccompConfig::default()
         };
-        let set = RuleSet::with(&cfg).unwrap();
+        let set = RuleSet::with(&cfg, Userns::Disable).unwrap();
         assert!(
             !set.enosys_numbered
                 .iter()
@@ -764,7 +827,7 @@ mod tests {
             ],
             ..SeccompConfig::default()
         };
-        let set = RuleSet::with(&cfg).unwrap();
+        let set = RuleSet::with(&cfg, Userns::Disable).unwrap();
         for name in ["open_tree_attr", "listns"] {
             let name = name.to_owned();
             assert!(!set.eperm.contains(&name), "{name} leaked into eperm");
@@ -835,7 +898,7 @@ mod tests {
             deny: vec![("unshare".to_owned(), Errno::Eperm)],
             ..SeccompConfig::default()
         };
-        assert_eq!(RuleSet::with(&cfg), None);
+        assert_eq!(RuleSet::with(&cfg, Userns::Disable), None);
     }
 
     #[test]
@@ -844,7 +907,7 @@ mod tests {
             allow: vec!["keyctl".to_owned(), "clone3".to_owned()],
             ..SeccompConfig::default()
         };
-        let set = RuleSet::with(&cfg).unwrap();
+        let set = RuleSet::with(&cfg, Userns::Disable).unwrap();
         assert!(!set.eperm.contains(&"keyctl".to_owned()));
         assert!(!set.enosys.contains(&"clone3".to_owned()));
         assert_eq!(set.eperm.len(), RuleSet::default_set().eperm.len() - 1);
@@ -859,7 +922,12 @@ mod tests {
             allow: vec!["ioctl".to_owned()],
             ..SeccompConfig::default()
         };
-        assert!(RuleSet::with(&cfg).unwrap().ioctl_eperm.is_empty());
+        assert!(
+            RuleSet::with(&cfg, Userns::Disable)
+                .unwrap()
+                .ioctl_eperm
+                .is_empty()
+        );
     }
 
     #[test]
@@ -873,7 +941,7 @@ mod tests {
             ],
             ..SeccompConfig::default()
         };
-        let set = RuleSet::with(&cfg).unwrap();
+        let set = RuleSet::with(&cfg, Userns::Disable).unwrap();
         assert_eq!(
             &set.eperm[set.eperm.len() - 3..],
             ["unshare", "setns", "keyctl"]
@@ -890,7 +958,7 @@ mod tests {
             deny: vec![("clone3".to_owned(), Errno::Eperm)],
             ..SeccompConfig::default()
         };
-        let set = RuleSet::with(&cfg).unwrap();
+        let set = RuleSet::with(&cfg, Userns::Disable).unwrap();
         assert_eq!(set.enosys, DEFAULT_ENOSYS[1..]);
         assert_eq!(set.eperm.last().unwrap(), "clone3");
     }
@@ -1061,7 +1129,7 @@ mod tests {
             allow: vec!["personality".to_owned()],
             ..SeccompConfig::default()
         };
-        let set = RuleSet::with(&cfg).unwrap();
+        let set = RuleSet::with(&cfg, Userns::Disable).unwrap();
         assert!(!set.personality);
         let program = compile(&set, false).unwrap().unwrap();
         assert_eq!(instructions(&program.bytes)[0], (0x0020, 0, 0, 4));
@@ -1131,7 +1199,10 @@ mod tests {
                 .collect(),
             ..SeccompConfig::default()
         };
-        assert_eq!(compile(&RuleSet::with(&cfg).unwrap(), false).unwrap(), None);
+        assert_eq!(
+            compile(&RuleSet::with(&cfg, Userns::Disable).unwrap(), false).unwrap(),
+            None
+        );
         assert_eq!(compile(&RuleSet::default(), false).unwrap(), None);
         // Names alone are not rules: a set only this architecture's
         // sibling has leaves nothing to load either.
@@ -1152,7 +1223,7 @@ mod tests {
             ..SeccompConfig::default()
         };
         let full = compile(&RuleSet::default_set(), false).unwrap().unwrap();
-        let fewer = compile(&RuleSet::with(&cfg).unwrap(), false)
+        let fewer = compile(&RuleSet::with(&cfg, Userns::Disable).unwrap(), false)
             .unwrap()
             .unwrap();
         assert!(fewer.bytes.len() < full.bytes.len());
