@@ -3561,7 +3561,7 @@ mod tests {
     /// True (after printing why) when the run did not opt in to tests that
     /// talk to the developer's real session bus.
     fn session_tests_skipped() -> bool {
-        if crate::session_tests_wanted() {
+        if std::env::var_os("BUBBLER_TEST_SESSION").is_some_and(|v| v == "1") {
             return false;
         }
         println!(

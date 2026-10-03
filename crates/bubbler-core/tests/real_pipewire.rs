@@ -333,7 +333,7 @@ impl PipeWireBed {
     /// directory once its PipeWire listens and before its WirePlumber
     /// starts, and what it returned.
     fn start_with<T>(before_session_manager: impl FnOnce(&Path) -> T) -> Option<(PipeWireBed, T)> {
-        if !bubbler_core::session_tests_wanted() {
+        if !session_tests_wanted() {
             say(
                 "skipping: set BUBBLER_TEST_SESSION=1 to run tests that reach the session or start audio daemons",
             );
@@ -827,9 +827,14 @@ fn a_bed_held_until_its_test_is_killed() {
     std::thread::sleep(Duration::from_secs(60));
 }
 
+/// Whether `BUBBLER_TEST_SESSION=1` asks for the tests that start audio daemons.
+fn session_tests_wanted() -> bool {
+    std::env::var_os("BUBBLER_TEST_SESSION").is_some_and(|value| value == "1")
+}
+
 #[test]
 fn nothing_of_a_bed_outlives_a_killed_test_binary() {
-    if !bubbler_core::session_tests_wanted() {
+    if !session_tests_wanted() {
         say(
             "skipping: set BUBBLER_TEST_SESSION=1 to run tests that reach the session or start audio daemons",
         );

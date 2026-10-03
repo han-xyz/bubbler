@@ -33,11 +33,3 @@ pub mod tty;
 pub mod version;
 pub mod wayland;
 pub mod wrap;
-
-/// Whether `BUBBLER_TEST_SESSION=1` asks for the tests that reach the
-/// developer's session or start audio daemons. For bubbler's own tests;
-/// any other value, unset included, leaves them skipped.
-#[doc(hidden)]
-pub fn session_tests_wanted() -> bool {
-    std::env::var_os("BUBBLER_TEST_SESSION").is_some_and(|value| value == "1")
-}

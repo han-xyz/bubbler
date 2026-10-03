@@ -689,7 +689,7 @@ pub fn bubbler_wayland(root: &Path, init: &Path) -> Command {
 /// Returns false (after printing why) unless `BUBBLER_TEST_SESSION=1`,
 /// so a packager's build or CI never touches a desktop session.
 pub fn require_session() -> bool {
-    if bubbler_core::session_tests_wanted() {
+    if std::env::var_os("BUBBLER_TEST_SESSION").is_some_and(|v| v == "1") {
         return true;
     }
     say(
