@@ -11,7 +11,7 @@
 
 struct state {
 	struct pw_stream *stream;
-	const char *later;
+	struct pw_properties *later;
 };
 
 static void on_process(void *data)
@@ -30,9 +30,7 @@ static const struct pw_stream_events events = {
 static void on_timer(void *data, uint64_t expirations)
 {
 	struct state *state = data;
-	struct pw_properties *later = pw_properties_new_string(state->later);
-	pw_stream_update_properties(state->stream, &later->dict);
-	pw_properties_free(later);
+	pw_stream_update_properties(state->stream, &state->later->dict);
 }
 
 int main(int argc, char *argv[])
@@ -42,9 +40,14 @@ int main(int argc, char *argv[])
 	pw_init(&argc, &argv);
 	struct pw_main_loop *main_loop = pw_main_loop_new(NULL);
 	struct pw_loop *loop = pw_main_loop_get_loop(main_loop);
-	struct state state = { .later = argv[3] };
+	struct pw_properties *props = pw_properties_new_string(argv[2]);
+	struct state state = { .later = pw_properties_new_string(argv[3]) };
+	if (!props || !state.later)
+		return 2;
 	state.stream = pw_stream_new_simple(loop, "changes-its-properties",
-			pw_properties_new_string(argv[2]), &events, &state);
+			props, &events, &state);
+	if (!state.stream)
+		return 2;
 
 	uint8_t buffer[1024];
 	struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));

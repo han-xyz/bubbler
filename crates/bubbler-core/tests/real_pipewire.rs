@@ -2332,7 +2332,7 @@ fn a_stream_a_context_turns_into_a_smart_filter_takes_no_host_stream() {
         let offered = Streaming(bed.spawn_in_context(
             PLAYBACK,
             &format!(
-                "{} in '{{ {created} }}' '{{ {filter} }}'",
+                "'{}' in '{{ {created} }}' '{{ {filter} }}'",
                 fixture.display()
             ),
         ));
