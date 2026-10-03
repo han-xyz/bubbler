@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# scripts/release <version>                  version bump commit
+# scripts/release --tag <version> [aurs-dir] tag, AUR package commit
+# Never merges or pushes.
+set -euo pipefail
+
+CARGO="${RELEASE_CARGO:-cargo}"
+MAKEPKG="${RELEASE_MAKEPKG:-makepkg}"
+
+die() {
+    echo "release: $*" >&2
+    exit 1
+}
+
+require_version() {
+    [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "version must be X.Y.Z, got '$1'"
+}
+
+require_clean_tree() {
+    [ -z "$(git status --porcelain)" ] || die "the working tree is not clean"
+}
+
+workspace_version() {
+    sed -n '/^\[workspace.package\]/,/^\[/ s/^version = "\(.*\)"$/\1/p' | head -n1
+}
+
+bump() {
+    local version="$1" branch old
+    require_version "$version"
+    require_clean_tree
+    grep -qFx "## $version" CHANGELOG.md || die "CHANGELOG.md has no '## $version' heading"
+    branch="$(git branch --show-current)"
+    case "$branch" in
+        main | master) die "on trunk branch '$branch'; release from a feature branch" ;;
+    esac
+
+    old="$(workspace_version <Cargo.toml)"
+    [ -n "$old" ] || die "no version in [workspace.package]"
+    [ "$old" != "$version" ] || die "Cargo.toml is already at $version"
+    old="${old//./\\.}"
+    sed -i \
+        -e "/^\[workspace.package\]/,/^\[/ s/^version = \"$old\"/version = \"$version\"/" \
+        -e "s/^\(bubbler-\(core\|init\|net-proxy\) = {.*version = \)\"$old\"/\1\"$version\"/" \
+        Cargo.toml
+
+    "$CARGO" update -w --offline
+    (cd fuzz && "$CARGO" update -w --offline)
+    git add Cargo.toml Cargo.lock fuzz/Cargo.lock
+    git commit -q -m "chore: release v$version"
+}
+
+set_pkgbuild() {
+    local version="$1" tag_object="$2"
+    sed -i \
+        -e "s/^pkgver=.*/pkgver=$version/" \
+        -e "s/^# git rev-parse v[0-9.]* /# git rev-parse v$version /" \
+        -e "s/^_tag=.*/_tag=$tag_object/" \
+        aur/bubbler/PKGBUILD
+}
+
+tag() {
+    local version="$1" aurs_dir="${2:-}" tag_object
+    require_version "$version"
+    require_clean_tree
+    [ "$(git show HEAD:Cargo.toml | workspace_version)" = "$version" ] \
+        || die "HEAD's Cargo.toml is not at $version; run scripts/release $version first"
+    git rev-parse -q --verify "refs/tags/v$version" >/dev/null && die "tag v$version already exists"
+    command -v "$MAKEPKG" >/dev/null || die "makepkg is not installed; it writes .SRCINFO"
+    if [ -n "$aurs_dir" ]; then
+        [ -d "$aurs_dir" ] || die "'$aurs_dir' is not a directory"
+        [ -f "$aurs_dir/PKGBUILD" ] || die "'$aurs_dir' has no PKGBUILD to take the first line from"
+        aurs_dir="$(cd "$aurs_dir" && pwd)"
+    fi
+
+    git tag -a "v$version" -m "v$version"
+    tag_object="$(git rev-parse "v$version")"
+    set_pkgbuild "$version" "$tag_object"
+    (cd aur/bubbler && "$MAKEPKG" --printsrcinfo >.SRCINFO)
+    git add aur/bubbler/PKGBUILD aur/bubbler/.SRCINFO
+    git commit -q -m "chore: the AUR package builds $version"
+
+    [ -n "$aurs_dir" ] || return 0
+    {
+        head -n1 "$aurs_dir/PKGBUILD"
+        tail -n +2 aur/bubbler/PKGBUILD
+    } >"$aurs_dir/PKGBUILD.new"
+    mv "$aurs_dir/PKGBUILD.new" "$aurs_dir/PKGBUILD"
+    cp aur/bubbler/bubbler.install "$aurs_dir/bubbler.install"
+    (cd "$aurs_dir" && "$MAKEPKG" --printsrcinfo >.SRCINFO)
+    echo "Written to $aurs_dir, nothing committed there. To commit:"
+    echo "git -C $aurs_dir commit -am \"Update to $version\""
+}
+
+cd "$(git rev-parse --show-toplevel)"
+case "${1:-}" in
+    --tag)
+        [ $# -ge 2 ] && [ $# -le 3 ] || die "usage: scripts/release --tag <version> [aurs-dir]"
+        tag "$2" "${3:-}"
+        ;;
+    "" | -*) die "usage: scripts/release <version> | --tag <version> [aurs-dir]" ;;
+    *)
+        [ $# -eq 1 ] || die "usage: scripts/release <version>"
+        bump "$1"
+        ;;
+esac

@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+release="$(cd "$(dirname "$0")" && pwd)/release"
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+failures=0
+check() {
+    if ! "$@"; then
+        echo "FAIL: $*" >&2
+        failures=$((failures + 1))
+    fi
+}
+
+cat >"$work/cargo-stub" <<'EOF'
+#!/bin/sh
+echo "updated by stub" >>Cargo.lock
+EOF
+cat >"$work/makepkg-stub" <<'EOF'
+#!/bin/sh
+echo "srcinfo for $(sed -n 's/^pkgver=//p' PKGBUILD)"
+EOF
+chmod +x "$work/cargo-stub" "$work/makepkg-stub"
+export RELEASE_CARGO="$work/cargo-stub" RELEASE_MAKEPKG="$work/makepkg-stub"
+
+new_repo() {
+    local dir="$work/$1" branch="$2"
+    mkdir -p "$dir/fuzz" "$dir/aur/bubbler"
+    cd "$dir"
+    git init -q -b "$branch"
+    git config user.name tester
+    git config user.email tester@example.invalid
+    cat >Cargo.toml <<'EOF'
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.0.0"
+
+[workspace.dependencies]
+bubbler-core = { path = "crates/bubbler-core", version = "1.0.0" }
+bubbler-init = { path = "crates/bubbler-init", version = "1.0.0" }
+bubbler-net-proxy = { path = "crates/bubbler-net-proxy", version = "1.0.0" }
+kdl = "1.0.0"
+EOF
+    echo lock >Cargo.lock
+    echo lock >fuzz/Cargo.lock
+    printf '# Changelog\n\n## 9.9.9\n\n- thing\n' >CHANGELOG.md
+    cat >aur/bubbler/PKGBUILD <<'EOF'
+# Maintainer: Repo Line
+pkgbase=bubbler
+pkgver=1.0.0
+# git rev-parse v1.0.0 (the tag object, not the commit it points to)
+_tag=0000000000000000000000000000000000000000
+EOF
+    echo install >aur/bubbler/bubbler.install
+    echo old >aur/bubbler/.SRCINFO
+    git add -A
+    git commit -q -m init
+}
+
+refuses() { ! "$release" "$@" >/dev/null 2>&1; }
+
+new_repo ok feat/x
+check refuses 9.9
+check refuses 9.9.9-rc1
+printf 'x' >stray
+check refuses 9.9.9
+rm stray
+
+git checkout -q -b other
+sed -i 's/^## 9.9.9/## 9.9.8/' CHANGELOG.md
+git commit -qam changelog
+check refuses 9.9.9
+sed -i 's/^## 9.9.8/## 9.9.9/' CHANGELOG.md
+git commit -qam changelog
+
+"$release" 9.9.9 >/dev/null
+check test "$(git log -1 --format=%s)" = "chore: release v9.9.9"
+check test "$(git log -1 --format=%B | grep -c .)" = 1
+check test "$(git show --name-only --format= HEAD | sort | tr '\n' ' ')" = "Cargo.lock Cargo.toml fuzz/Cargo.lock "
+check test "$(git diff HEAD~1 HEAD -- Cargo.toml | grep -c '^+[^+]')" = 4
+check grep -q '^kdl = "1.0.0"' Cargo.toml
+check grep -q '^rust-version = "1.0.0"' Cargo.toml
+check grep -q '^version = "9.9.9"' Cargo.toml
+check test "$(grep -c 'version = "9.9.9"' Cargo.toml)" = 4
+check test -z "$(git status --porcelain)"
+
+check refuses --tag 9.9.8
+git tag v9.9.9-other
+"$release" --tag 9.9.9 >/dev/null
+check test "$(git cat-file -t v9.9.9)" = tag
+tag_object="$(git rev-parse v9.9.9)"
+check grep -qx "_tag=$tag_object" aur/bubbler/PKGBUILD
+check grep -qx 'pkgver=9.9.9' aur/bubbler/PKGBUILD
+check grep -q '^# git rev-parse v9.9.9 ' aur/bubbler/PKGBUILD
+check grep -qx 'srcinfo for 9.9.9' aur/bubbler/.SRCINFO
+check test "$(git log -1 --format=%s)" = "chore: the AUR package builds 9.9.9"
+check test "$(git log -1 --format=%B | grep -c .)" = 1
+check test -z "$(git status --porcelain)"
+check refuses --tag 9.9.9
+
+new_repo withaurs feat/x
+git checkout -q -b other
+"$release" 9.9.9 >/dev/null
+aurs="$work/aurs"
+mkdir "$aurs"
+git -C "$aurs" init -q
+printf '# Maintainer: Real Maintainer\nold\n' >"$aurs/PKGBUILD"
+git -C "$aurs" add PKGBUILD
+git -C "$aurs" -c user.name=t -c user.email=t@example.invalid commit -q -m first
+out="$("$release" --tag 9.9.9 "$aurs")"
+check test "$(head -1 "$aurs/PKGBUILD")" = "# Maintainer: Real Maintainer"
+check grep -qx 'pkgver=9.9.9' "$aurs/PKGBUILD"
+check grep -qx "_tag=$(git rev-parse v9.9.9)" "$aurs/PKGBUILD"
+check test -f "$aurs/bubbler.install"
+check grep -qx 'srcinfo for 9.9.9' "$aurs/.SRCINFO"
+check test "$(git -C "$aurs" rev-list --count HEAD)" = 1
+check grep -qF "git -C $aurs commit -am \"Update to 9.9.9\"" <<<"$out"
+
+new_repo trunk master
+check refuses 9.9.9
+
+new_repo nomakepkg feat/x
+git checkout -q -b other
+"$release" 9.9.9 >/dev/null
+msg="$(RELEASE_MAKEPKG=no-such-makepkg "$release" --tag 9.9.9 2>&1 || true)"
+check grep -q makepkg <<<"$msg"
+check test -z "$(git tag -l v9.9.9)"
+
+if [ "$failures" -ne 0 ]; then
+    echo "$failures check(s) failed" >&2
+    exit 1
+fi
+echo "all release checks passed"

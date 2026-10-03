@@ -144,6 +144,32 @@ and `bwrap --unshare-all` work on the runner — hosted runners fail the bwrap
 line under Docker's seccomp profile, so real-sandbox coverage needs a
 self-hosted runner).
 
+## Releasing
+
+Two commands, run on the feature branch once the checks pass and `CHANGELOG.md`
+has its `## X.Y.Z` heading:
+
+```sh
+scripts/release X.Y.Z
+scripts/release --tag X.Y.Z [aurs-dir]
+```
+
+The first sets the version in the root `Cargo.toml`, runs
+`cargo update -w --offline` in the root and in `fuzz/`, and commits
+`chore: release vX.Y.Z`. It refuses on a dirty tree, a version that is not
+`X.Y.Z`, a missing changelog heading, or a trunk branch (`main`, `master`).
+
+The second tags `vX.Y.Z` (annotated), points `aur/bubbler/PKGBUILD` at the tag
+object, regenerates `.SRCINFO` with `makepkg --printsrcinfo` and commits
+`chore: the AUR package builds X.Y.Z`. It refuses on a dirty tree, a
+`Cargo.toml` at HEAD that is not at `X.Y.Z`, an existing tag, or a missing
+`makepkg`. With `aurs-dir`, a separate AUR checkout, it also writes the
+PKGBUILD there (keeping that file's first line), `bubbler.install` and
+`.SRCINFO`, and prints the commit command without running it.
+
+Merging, pushing and the AUR push stay manual. `scripts/release.test` checks
+both commands in a throwaway repository.
+
 ## Layout
 
 | Path | Purpose |
