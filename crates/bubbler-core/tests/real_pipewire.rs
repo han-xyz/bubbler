@@ -3525,6 +3525,49 @@ fn a_host_stream_plays_after_a_pulse_clients_stream_asked_for_the_sink_alone() {
     assert!(!wireplumber_log(&bed).contains(HELD_EXCLUSIVELY));
 }
 
+/// A playback context's stream that asks for the sink alone only once it
+/// is linked holds nothing after WirePlumber restarts: the WirePlumber
+/// that starts meets the stream and its client in whatever order its
+/// object managers deliver them, and a link it made before it knew the
+/// client is undone once it does. A host stream started then plays on the
+/// sink.
+#[test]
+fn a_host_stream_plays_after_a_restart_met_a_playback_contexts_stream_asking_for_the_sink_alone() {
+    let Some(mut bed) = PipeWireBed::start() else {
+        return;
+    };
+    let Some(fixture) = changes_its_properties(&bed) else {
+        return;
+    };
+    let _holder = Streaming(bed.spawn_in_context(
+        PLAYBACK,
+        &format!(
+            "'{}' out '{{ media.class = Stream/Output/Audio, node.name = holder }}' \
+             '{{ node.exclusive = true }}'",
+            fixture.display()
+        ),
+    ));
+    wait_for("the holder linked and asking for the sink alone", || {
+        bed.dump_from_host().contains("\"node.exclusive\"")
+            && peers(&bed.links(), "holder:output_FL").contains(&"bed-sink:playback_FL")
+    });
+    bed.restart_session_manager();
+    window_in_which_it_would_link(&bed, "playback");
+    let _host = host_stream_on_the_sink(&bed);
+
+    assert!(
+        peers(&bed.links(), "holder:output_FL").is_empty(),
+        "the holder was linked after the restart:\n{}",
+        bed.links()
+    );
+    let log = wireplumber_log(&bed);
+    assert!(
+        log.contains("refusing holder") && log.contains("without the exclusive grant"),
+        "the hook did not refuse the holder after the restart:\n{log}"
+    );
+    assert!(!log.contains(HELD_EXCLUSIVELY));
+}
+
 /// With the `exclusive` grant stock behaviour holds: the context's stream
 /// takes the sink for itself and a host stream started after it is
 /// turned away.

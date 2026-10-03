@@ -627,6 +627,39 @@ SimpleEventHook {
   end
 }:register ()
 
+-- Remove every link WirePlumber made for a stream of the client
+-- `client_id` that holds its target: link-target marks it `exclusive` or
+-- `passthrough`, and while it stands every later stream is turned away
+-- from the target (lib/linking-utils.lua isLinked). Only a link made
+-- before WirePlumber knew the client, after a restart, can be one; no
+-- rescan undoes it, since prepare-link keeps a stream already linked to
+-- its target. The peer is forgotten, as linking/rescan.lua does when it
+-- removes a link, so the next rescan reaches the first line again.
+local function release_held_targets (source, client_id)
+  local items = source:call ("get-object-manager", "session-item")
+  local own = {}
+  for si in items:iterate { type = "SiLinkable" } do
+    if si.properties ["client.id"] == client_id then
+      own [si.id] = true
+    end
+  end
+  local held = {}
+  for silink in items:iterate { type = "SiLink" } do
+    local props = silink.properties
+    if own [tonumber (props ["main.item.id"])] and
+        (cutils.parseBool (props ["exclusive"]) or
+            cutils.parseBool (props ["passthrough"])) then
+      table.insert (held, silink)
+    end
+  end
+  for _, silink in ipairs (held) do
+    log:info (silink, string.format ("removing a link holding its target " ..
+        "for client %s, made before WirePlumber knew it", client_id))
+    lutils:get_flags (tonumber (silink.properties ["main.item.id"])).peer_id = nil
+    silink:remove ()
+  end
+end
+
 -- At `link-added` the node at an end, or the client that owns it, may
 -- not be in WirePlumber's object managers yet, and the link would pass
 -- as one with no sandbox at either end. It is decided again when that
@@ -650,6 +683,9 @@ SimpleEventHook {
     if is_client then
       if subject.properties ["pipewire.sec.engine"] ~= BUBBLER_ENGINE then
         return
+      end
+      if not granted (subject, "exclusive") then
+        release_held_targets (source, id)
       end
       source:call ("schedule-rescan", "default-nodes")
       source:call ("schedule-rescan", "linking")
