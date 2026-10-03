@@ -28,14 +28,6 @@ pub fn from_process() -> Result<Env> {
     );
     let data_home = var_path("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local/share"));
     let config_home = var_path("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"));
-    let data_dirs: Vec<PathBuf> = env::var_os("XDG_DATA_DIRS")
-        .filter(|v| !v.is_empty())
-        .map(|v| {
-            env::split_paths(&v)
-                .filter(|d| !d.as_os_str().is_empty())
-                .collect()
-        })
-        .unwrap_or_else(|| DEFAULT_DATA_DIRS.iter().map(PathBuf::from).collect());
     let runtime_dir = var_path("XDG_RUNTIME_DIR")
         .context("XDG_RUNTIME_DIR is not set; a session manager should set it")?;
     Ok(Env {
@@ -43,7 +35,7 @@ pub fn from_process() -> Result<Env> {
         data_home,
         config_home,
         config_dirs: config_dirs(env::var_os("XDG_CONFIG_DIRS")),
-        data_dirs,
+        data_dirs: data_dirs(env::var_os("XDG_DATA_DIRS")),
         runtime_dir,
         uid: rustix::process::getuid().as_raw(),
         gid: rustix::process::getgid().as_raw(),
@@ -90,6 +82,12 @@ fn config_dirs(value: Option<OsString>) -> Vec<PathBuf> {
     xdg_dirs(value, DEFAULT_CONFIG_DIRS)
 }
 
+/// `$XDG_DATA_DIRS` as the CLI reads it, so the UI and the CLI search the
+/// same places for the WirePlumber policy files.
+fn data_dirs(value: Option<OsString>) -> Vec<PathBuf> {
+    xdg_dirs(value, DEFAULT_DATA_DIRS)
+}
+
 /// One environment variable as a path, where an empty value counts as
 /// unset: an empty one would be the current directory, which is not what
 /// any of these name.
@@ -130,6 +128,21 @@ mod tests {
         assert_eq!(
             config_dirs(Some(OsString::from("/opt/xdg:/etc/xdg"))),
             vec![PathBuf::from("/opt/xdg"), PathBuf::from("/etc/xdg")]
+        );
+    }
+
+    #[test]
+    fn data_dirs_default_to_the_usr_shares_and_drop_relative_entries() {
+        assert_eq!(
+            data_dirs(None),
+            vec![
+                PathBuf::from("/usr/local/share"),
+                PathBuf::from("/usr/share")
+            ]
+        );
+        assert_eq!(
+            data_dirs(Some(OsString::from("/opt/share:relative/share:/usr/share"))),
+            vec![PathBuf::from("/opt/share"), PathBuf::from("/usr/share")]
         );
     }
 }
