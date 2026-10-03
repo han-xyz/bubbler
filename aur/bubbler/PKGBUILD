@@ -11,7 +11,7 @@ license=(GPL-3.0-or-later)
 depends=('bubblewrap>=0.12.0' passt libseccomp libgcc glibc)
 makedepends=(cargo git)
 # git rev-parse v0.24.2 (the tag object, not the commit it points to)
-_tag=887b9033b7150d0f6d0dd976cbbec9e0ca47b67d
+_tag=9e3ceac67d9652bc061d72022976058e4a3ff49f
 source=("git+$url.git#tag=$_tag")
 sha256sums=(SKIP)
 

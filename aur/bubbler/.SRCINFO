@@ -12,7 +12,7 @@ pkgbase = bubbler
 	depends = libseccomp
 	depends = libgcc
 	depends = glibc
-	source = git+https://github.com/han-xyz/bubbler.git#tag=887b9033b7150d0f6d0dd976cbbec9e0ca47b67d
+	source = git+https://github.com/han-xyz/bubbler.git#tag=9e3ceac67d9652bc061d72022976058e4a3ff49f
 	sha256sums = SKIP
 
 pkgname = bubbler
