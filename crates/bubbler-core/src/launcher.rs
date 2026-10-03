@@ -9,6 +9,7 @@ use std::ffi::{OsStr, OsString, c_void};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Component, Path, PathBuf};
@@ -2921,8 +2922,10 @@ const LEFTOVER_BUDGET: usize = 100_000;
 /// sidecar left — a link out of the runtime directory above all, or a
 /// tree no walk can finish — is followed by anything bubbler writes
 /// there or can block the start. Called after this run has bound the
-/// instance's control socket and found no live run behind it, which only
-/// one start at a time can do.
+/// instance's control socket and found no live run behind it. Only one
+/// start at a time gets there, and a run that is ending holds a start
+/// back until its teardown is done — except for a start that binds in the
+/// moment between the sandbox's exit and the ending run taking the lock.
 fn fresh_sidecar_dir(dir: &Path) -> Result<(), LaunchError> {
     let io_at = |e: Errno| LaunchError::Io(dir.to_path_buf(), e.into());
     let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
@@ -3755,7 +3758,7 @@ fn bind_control_socket(
     lock_path: &Path,
     name: &str,
     stop: &AtomicBool,
-) -> Result<UnixListener, LaunchError> {
+) -> Result<(UnixListener, SocketGuard), LaunchError> {
     let lock_err = |e: Errno| LaunchError::Io(lock_path.to_path_buf(), e.into());
     let lock = open_start_lock(lock_path)?;
     // Polled rather than blocking: the stop signals are installed with
@@ -3780,7 +3783,55 @@ fn bind_control_socket(
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(io_at(e)),
         _ => {}
     }
-    UnixListener::bind(&sock_path).map_err(io_at)
+    let listener = UnixListener::bind(&sock_path).map_err(io_at)?;
+    let bound = std::fs::symlink_metadata(&sock_path).map_err(io_at)?;
+    let guard = SocketGuard {
+        id: (bound.dev(), bound.ino()),
+        path: sock_path,
+    };
+    Ok((listener, guard))
+}
+
+/// Removes the control socket this run bound when the run leaves, and
+/// only that one: a start made once this run's sandbox had exited may
+/// have bound its own at the same path.
+#[derive(Debug)]
+struct SocketGuard {
+    path: PathBuf,
+    /// Device and inode of the socket as bound.
+    id: (u64, u64),
+}
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        let ours =
+            std::fs::symlink_metadata(&self.path).is_ok_and(|m| (m.dev(), m.ino()) == self.id);
+        // Nothing to report: a socket left behind is found refused, and
+        // cleared, by the next start.
+        if ours {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Take the start lock again once the sandbox has exited, so a start
+/// made now waits for this run's teardown instead of binding into it.
+/// Blocking: a stop signal has usually ended the run by now, and another
+/// start holds the lock only from its liveness check to its bind. A lock
+/// that cannot be had costs only that guarantee, so it is a warning.
+fn lock_for_teardown(path: &Path) -> Option<OwnedFd> {
+    let locked = open_start_lock(path).and_then(|lock| {
+        flock(&lock, FlockOperation::LockExclusive)
+            .map(|()| lock)
+            .map_err(|e| LaunchError::Io(path.to_path_buf(), e.into()))
+    });
+    match locked {
+        Ok(lock) => Some(lock),
+        Err(e) => {
+            eprintln!("bubbler: warning: {e}");
+            None
+        }
+    }
 }
 
 /// [`run`] from its runtime directory on, with the stop signals already
@@ -3794,10 +3845,14 @@ fn start_and_wait(
     stop: &AtomicBool,
     registered: &mut SignalGuard,
 ) -> Result<i32, LaunchError> {
+    let lock_path = start_lock_path(env, &inst.name);
+    // Declared first so that it is dropped last: taken again once the
+    // sandbox has exited, it holds a relaunch back until everything
+    // below is torn down.
+    let _ending: Option<OwnedFd>;
     let sock_path = dir.join(exec::SOCKET_NAME);
     let io_at = |e: Errno| LaunchError::Io(sock_path.clone(), e.into());
-    let listener = bind_control_socket(&dir, &start_lock_path(env, &inst.name), &inst.name, stop)?;
-    let _socket_guard = FileGuard(sock_path.clone());
+    let (listener, _socket_guard) = bind_control_socket(&dir, &lock_path, &inst.name, stop)?;
     let inherited = fcntl_dupfd_cloexec(listener.as_fd(), 3).map_err(io_at)?;
     let mut alloc = RealAlloc::new(inherited.as_raw_fd(), dir.clone());
     // A run with nothing to run must fail before a sidecar is started.
@@ -4051,7 +4106,9 @@ fn start_and_wait(
             wait_pumping(&mut child, &mut watch, &ends, sink.as_fd())
         }
         None => wait_plain(&mut child, &mut watch),
-    }?;
+    };
+    _ending = lock_for_teardown(&lock_path);
+    let code = code?;
     // After the wait and not before it: the generated files are the live
     // sources of the sandbox's read-only binds, and dropping the
     // allocator unlinks them.
@@ -4136,7 +4193,7 @@ mod tests {
         let path = dir.join(exec::SOCKET_NAME);
         let stop = AtomicBool::new(false);
         drop(UnixListener::bind(&path).unwrap());
-        let live = bind_control_socket(&dir, &lock, "t", &stop).expect("a fresh bind");
+        let (live, _guard) = bind_control_socket(&dir, &lock, "t", &stop).expect("a fresh bind");
         let again = bind_control_socket(&dir, &lock, "t", &stop);
         assert!(
             matches!(&again, Err(LaunchError::AlreadyRunning(n)) if n == "t"),
@@ -4151,6 +4208,23 @@ mod tests {
             1,
             "only the socket is in the runtime directory"
         );
+    }
+
+    /// A run's guard removes the socket it bound, and leaves one a later
+    /// start bound at the same path in its place.
+    #[test]
+    fn a_run_removes_its_own_socket_and_not_a_later_start_s() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock = tmp.path().join("t@start.lock");
+        let path = tmp.path().join(exec::SOCKET_NAME);
+        let stop = AtomicBool::new(false);
+        let (listener, guard) = bind_control_socket(tmp.path(), &lock, "t", &stop).unwrap();
+        drop(listener);
+        let (_later, later_guard) = bind_control_socket(tmp.path(), &lock, "t", &stop).unwrap();
+        drop(guard);
+        assert!(path.exists(), "the later start's socket was removed");
+        drop(later_guard);
+        assert!(!path.exists(), "a run's own socket is removed");
     }
 
     /// A start waiting on another's lock is still ended by a stop signal.

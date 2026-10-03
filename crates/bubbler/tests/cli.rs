@@ -5573,6 +5573,106 @@ while time.time() < deadline and not poller.poll(20):
     );
 }
 
+/// [`honest_proxy`], except that once told to leave it marks its
+/// directory `stopping` and stays until it is killed, which holds the run
+/// in its teardown for the whole stop deadline.
+fn slow_stopping_proxy(path: &Path) {
+    write_script(
+        path,
+        r#"#!/usr/bin/python3
+import os, select, socket, sys, time
+fd = int(sys.argv[1].split("=", 1)[1])
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[3])
+s.listen(8)
+os.write(fd, b"r")
+poller = select.poll()
+poller.register(fd, 0)
+deadline = time.time() + 15
+while time.time() < deadline and not poller.poll(20):
+    pass
+open(os.path.join(os.path.dirname(sys.argv[3]), "stopping"), "w").close()
+time.sleep(30)
+"#,
+    );
+}
+
+/// A start made while the last run is still tearing down binds a socket
+/// that run's teardown leaves alone: the new run is still reachable once
+/// the old one has gone.
+#[test]
+fn a_start_during_the_last_run_s_teardown_keeps_its_socket() {
+    if !require_bwrap() || !require_python() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let bus = tmp.path().join("fakebus");
+    let _listener = UnixListener::bind(&bus).unwrap();
+    let proxy = tmp.path().join("slow-proxy");
+    slow_stopping_proxy(&proxy);
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["create", "relaunch"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(
+        tmp.path()
+            .join("data/bubbler/instances/relaunch/config.kdl"),
+        "dbus\n",
+    )
+    .unwrap();
+    let start = |command: &[&str]| {
+        bubbler_live(tmp.path(), &init)
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}", bus.display()),
+            )
+            .env("BUBBLER_DBUS_PROXY", &proxy)
+            .args(["run", "relaunch", "--"])
+            .args(command)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let dir = tmp.path().join("run/bubbler/relaunch");
+    let first = start(&["/usr/bin/true"]);
+    if !wait_until(
+        || dir.join("dbus/stopping").exists(),
+        Duration::from_secs(8),
+    ) {
+        fail_with(first, "the first run never reached its teardown");
+    }
+    let mut second = start(&["/usr/bin/sleep", "8"]);
+    let first = first.wait_with_output().unwrap();
+    let reachable = wait_until(
+        || UnixStream::connect(dir.join("init.sock")).is_ok(),
+        Duration::from_secs(4),
+    );
+    let still_running = second.try_wait().unwrap().is_none();
+    let _ = kill_process(Pid::from_child(&second), Signal::TERM);
+    let second = second.wait_with_output().unwrap();
+    bubbler_live(tmp.path(), &init)
+        .args(["delete", "relaunch", "--yes"])
+        .status()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        still_running && reachable,
+        "the second run (running: {still_running}) lost its socket: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+}
+
 #[test]
 fn a_directory_left_at_the_socket_path_does_not_wedge_the_instance() {
     if !require_bwrap() || !require_python() {
