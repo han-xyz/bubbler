@@ -29,6 +29,27 @@ pub fn is_passthrough(name: &OsStr) -> bool {
     name.starts_with(b"LC_") || PASSTHROUGH_VARS.iter().any(|v| v.as_bytes() == name)
 }
 
+/// `$XDG_DATA_DIRS` or `$XDG_CONFIG_DIRS` split into directories, or
+/// `defaults` when it is unset or empty, which is what the XDG base
+/// directory specification asks for.
+///
+/// A relative entry is dropped rather than resolved: that specification
+/// says every path in these variables must be absolute and that an
+/// implementation meeting a relative one is to consider it invalid and
+/// ignore it. An empty entry means the current directory and goes the
+/// same way. What it would otherwise cost is a launcher entry read from
+/// wherever the process happened to be started.
+pub fn xdg_dirs(value: Option<OsString>, defaults: &[&str]) -> Vec<PathBuf> {
+    value
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            std::env::split_paths(&v)
+                .filter(|d| d.is_absolute())
+                .collect()
+        })
+        .unwrap_or_else(|| defaults.iter().map(PathBuf::from).collect())
+}
+
 /// Host-side facts the builder and services need.
 #[derive(Debug, Clone)]
 pub struct Env {
@@ -154,5 +175,28 @@ mod tests {
             assert!(!is_passthrough(OsStr::new(no)), "{no}");
         }
         assert!(!is_passthrough(OsStr::from_bytes(b"LC\xff")));
+    }
+
+    #[test]
+    fn a_relative_data_directory_is_ignored_and_only_an_unset_list_defaults() {
+        let default: Vec<PathBuf> = DEFAULT_DATA_DIRS.iter().map(PathBuf::from).collect();
+        assert_eq!(xdg_dirs(None, DEFAULT_DATA_DIRS), default);
+        assert_eq!(
+            xdg_dirs(Some(OsString::from("")), DEFAULT_DATA_DIRS),
+            default
+        );
+        assert_eq!(
+            xdg_dirs(
+                Some(OsString::from("/opt/share:share:../share::/usr/share")),
+                DEFAULT_DATA_DIRS
+            ),
+            vec![PathBuf::from("/opt/share"), PathBuf::from("/usr/share")],
+            "a relative or empty entry is dropped, the absolute ones kept in order"
+        );
+        // A list that names nothing absolute names nowhere to look. The
+        // defaults are for a variable nobody set, not for one whose every
+        // entry the specification says to ignore.
+        assert!(xdg_dirs(Some(OsString::from("share:../share")), DEFAULT_DATA_DIRS).is_empty());
+        assert!(xdg_dirs(Some(OsString::from(":")), DEFAULT_DATA_DIRS).is_empty());
     }
 }

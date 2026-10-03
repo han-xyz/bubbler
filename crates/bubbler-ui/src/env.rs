@@ -9,7 +9,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use bubbler_core::env::{DEFAULT_DATA_DIRS, Env};
+use bubbler_core::env::{DEFAULT_CONFIG_DIRS, DEFAULT_DATA_DIRS, Env, xdg_dirs};
 
 /// Build an [`Env`] from the current process environment. A missing or
 /// empty `$HOME` or `$XDG_RUNTIME_DIR` is an error for the same reason it
@@ -42,7 +42,7 @@ pub fn from_process() -> Result<Env> {
         home,
         data_home,
         config_home,
-        config_dirs: Vec::new(),
+        config_dirs: config_dirs(env::var_os("XDG_CONFIG_DIRS")),
         data_dirs,
         runtime_dir,
         uid: rustix::process::getuid().as_raw(),
@@ -83,6 +83,13 @@ fn profile_dir() -> Result<Option<PathBuf>> {
     Ok(Some(path))
 }
 
+/// Where WirePlumber looks for its configuration after
+/// `$XDG_CONFIG_HOME`, from `$XDG_CONFIG_DIRS` as read: the audio policy
+/// lint has to look in the same places.
+fn config_dirs(value: Option<OsString>) -> Vec<PathBuf> {
+    xdg_dirs(value, DEFAULT_CONFIG_DIRS)
+}
+
 /// One environment variable as a path, where an empty value counts as
 /// unset: an empty one would be the current directory, which is not what
 /// any of these name.
@@ -111,4 +118,18 @@ pub fn shell() -> OsString {
     env::var_os("SHELL")
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| OsString::from("/bin/sh"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_dirs_default_to_etc_xdg_and_follow_the_variable() {
+        assert_eq!(config_dirs(None), vec![PathBuf::from("/etc/xdg")]);
+        assert_eq!(
+            config_dirs(Some(OsString::from("/opt/xdg:/etc/xdg"))),
+            vec![PathBuf::from("/opt/xdg"), PathBuf::from("/etc/xdg")]
+        );
+    }
 }

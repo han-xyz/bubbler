@@ -7,7 +7,7 @@ use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use bubbler_core::env::{DEFAULT_CONFIG_DIRS, DEFAULT_DATA_DIRS, Env, is_passthrough};
+use bubbler_core::env::{DEFAULT_CONFIG_DIRS, DEFAULT_DATA_DIRS, Env, is_passthrough, xdg_dirs};
 use rustix::fs::{Mode, OFlags};
 use rustix::io::fcntl_getfd;
 
@@ -120,23 +120,6 @@ pub fn from_process() -> Result<Env> {
     })
 }
 
-/// `$XDG_DATA_DIRS` or `$XDG_CONFIG_DIRS` split into directories, or
-/// `defaults` when it is unset or empty, which is what the XDG base
-/// directory specification asks for.
-///
-/// A relative entry is dropped rather than resolved: that specification
-/// says every path in these variables must be absolute and that an
-/// implementation meeting a relative one is to consider it invalid and
-/// ignore it. An empty entry means the current directory and goes the
-/// same way. What it would otherwise cost is a launcher entry read from
-/// wherever the process happened to be started.
-fn xdg_dirs(value: Option<OsString>, defaults: &[&str]) -> Vec<PathBuf> {
-    value
-        .filter(|v| !v.is_empty())
-        .map(|v| env::split_paths(&v).filter(|d| d.is_absolute()).collect())
-        .unwrap_or_else(|| defaults.iter().map(PathBuf::from).collect())
-}
-
 /// `$BUBBLER_TEST_ALLOW_PATH`: the one extra root `path-share` accepts,
 /// at both ends of a share, for tests and debugging. It must be absolute
 /// and not `/`, and is resolved here so it compares against the canonical
@@ -198,32 +181,4 @@ pub fn search_path() -> Vec<PathBuf> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_relative_data_directory_is_ignored_and_only_an_unset_list_defaults() {
-        let default: Vec<PathBuf> = DEFAULT_DATA_DIRS.iter().map(PathBuf::from).collect();
-        assert_eq!(xdg_dirs(None, DEFAULT_DATA_DIRS), default);
-        assert_eq!(
-            xdg_dirs(Some(OsString::from("")), DEFAULT_DATA_DIRS),
-            default
-        );
-        assert_eq!(
-            xdg_dirs(
-                Some(OsString::from("/opt/share:share:../share::/usr/share")),
-                DEFAULT_DATA_DIRS
-            ),
-            vec![PathBuf::from("/opt/share"), PathBuf::from("/usr/share")],
-            "a relative or empty entry is dropped, the absolute ones kept in order"
-        );
-        // A list that names nothing absolute names nowhere to look. The
-        // defaults are for a variable nobody set, not for one whose every
-        // entry the specification says to ignore.
-        assert!(xdg_dirs(Some(OsString::from("share:../share")), DEFAULT_DATA_DIRS).is_empty());
-        assert!(xdg_dirs(Some(OsString::from(":")), DEFAULT_DATA_DIRS).is_empty());
-    }
 }
