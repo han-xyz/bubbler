@@ -186,7 +186,8 @@ pub struct Viewer {
 pub struct Explain {
     /// The instance being explained.
     pub name: String,
-    /// Every argument, the baseline included.
+    /// Every argument, the baseline included, and every call the
+    /// seccomp filter answers with an errno.
     pub full: bool,
     /// The D-Bus proxy sidecar's argv rather than the sandbox's.
     pub proxy: bool,

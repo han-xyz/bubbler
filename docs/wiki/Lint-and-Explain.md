@@ -116,7 +116,7 @@ shipped profile lints clean.
 ```
 bubbler run ff --dry-run                 # `bwrap` then one argv element per line, diffable
 bubbler run ff --explain                 # grouped under the node that produced each argument
-bubbler run ff --explain=full            # baseline included
+bubbler run ff --explain=full            # baseline and every call the seccomp filter denies included
 bubbler run ff --explain --proxy         # the xdg-dbus-proxy sidecar's argv
 bubbler run ff --explain --wl-proxy      # the bubbler-wl-proxy sidecar's argv
 bubbler run ff --explain --net-proxy     # the bubbler-net-proxy sidecar's argv
@@ -138,6 +138,12 @@ for a session X display, and, under `network`, `sidecar: pasta …`, a second
 the nft ruleset the run installs. A nested `x11` needs no such line: the
 `--x11` argument is the Xwayland command line itself, and `--wm` the window
 manager's name, both arguments of `bubbler-init` rather than of bwrap.
+`--explain=full` adds `filter:` lines under the `seccomp` group: every call
+the application's filter answers with an errno (`clone3 (ENOSYS)`,
+`keyctl (EPERM)`, `ioctl TIOCSTI (EPERM)`), as built for this instance's
+`userns` and `seccomp` nodes. Under `userns "disable"` that includes the new
+mount API (`open_tree`, `fsopen` and the rest) a nested sandbox needs, which
+`userns-disabled-with-nested-sandbox` warns about.
 
 ```
   portals                         config.kdl:11  17 arguments

@@ -10,6 +10,12 @@
 - An application that may nest keeps the new mount API (`open_tree`, `fsopen`
   and the rest); it stays `ENOSYS` with `userns "disable"` and in sidecars.
 
+### Added
+
+- `--explain=full` lists every call the application's seccomp filter answers
+  with an errno, and `userns-disabled-with-nested-sandbox` says the mount API
+  a nested sandbox needs is denied too.
+
 ## 0.24.2
 
 ### Security

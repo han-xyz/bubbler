@@ -1975,9 +1975,11 @@ fn across_layers(ctx: &Context, sources: &[Source], f: &mut Findings) {
             &USERNS_DISABLED_WITH_NESTED_SANDBOX,
             format!(
                 "`userns \"disable\"` with `command \"{argv0}\"`, which is known to start a \
-                 sandbox of its own inside this one; the list of such commands is a heuristic"
+                 sandbox of its own inside this one, and the new mount API a nested sandbox \
+                 needs is denied as well; the list of such commands is a heuristic"
             ),
-            "drop `userns \"disable\"` if the app does not start",
+            "drop `userns \"disable\"` if the app does not start; `--explain=full` lists \
+             the calls the filter denies",
         );
     }
     if let Some((i, node, argv0)) = command
@@ -3417,10 +3419,17 @@ mod tests {
             .with("/usr/bin/chromium", file)
             .with("/usr/bin/foot", file);
         with(&host, |ctx| {
-            assert_eq!(
-                ids(&lint(ctx, &["userns \"disable\"\ncommand \"chromium\""])),
-                ["userns-disabled-with-nested-sandbox"]
+            let report = lint(ctx, &["userns \"disable\"\ncommand \"chromium\""]);
+            assert_eq!(ids(&report), ["userns-disabled-with-nested-sandbox"]);
+            let finding = &report.findings[0];
+            assert!(
+                finding
+                    .message
+                    .contains("the new mount API a nested sandbox needs is denied as well"),
+                "{}",
+                finding.message
             );
+            assert!(finding.help.contains("--explain=full"), "{}", finding.help);
             assert_eq!(
                 ids(&lint(ctx, &["userns \"disable\"\ncommand \"foot\""])),
                 [] as [&str; 0]

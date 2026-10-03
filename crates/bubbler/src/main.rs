@@ -107,7 +107,8 @@ enum Explain {
     /// Every group, with the baseline summed up after its first
     /// arguments. The default.
     Groups,
-    /// Every argument, the baseline included.
+    /// Every argument, the baseline included, and every call the
+    /// seccomp filter answers with an errno.
     Full,
 }
 

@@ -868,6 +868,10 @@ fn explain_full_lists_the_baseline_and_json_elides_nothing() {
     );
     assert!(s.contains("\n    --symlink usr/bin /bin\n"), "{s}");
     assert!(!s.contains("(--explain=full)"), "{s}");
+    // The filter itself, as `userns "disable"` leaves it.
+    assert!(s.contains("\n    filter: "), "{s}");
+    assert!(s.contains(" clone3 (ENOSYS)\n"), "{s}");
+    assert!(s.contains(" open_tree (ENOSYS)\n"), "{s}");
 
     let out = bubbler(tmp.path())
         .args(["run", "t", "--explain", "--format", "json"])

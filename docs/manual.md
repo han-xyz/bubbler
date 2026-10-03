@@ -286,7 +286,7 @@ implies `--dry-run`: nothing is launched, no runtime directory is made, and the
 file descriptor numbers are the ones a dry run prints.
 
     bubbler run ff --explain               # groups, with the baseline summed up
-    bubbler run ff --explain=full          # every argument, the baseline included
+    bubbler run ff --explain=full          # every argument, the baseline and the seccomp filter included
     bubbler run ff --explain --proxy       # the D-Bus proxy sidecar's argv instead
     bubbler run ff --explain --wl-proxy    # the Wayland proxy sidecar's argv instead
     bubbler run ff --explain --net-proxy   # the egress proxy sidecar's argv instead
@@ -436,7 +436,13 @@ prints a node with the layer it came from.
 
 This is a reading format, not a diffing one: it joins the elements of an
 operation onto one line and stops listing the baseline after its first arguments
-(`--explain=full` lists all of it). `--dry-run` on its own remains the
+(`--explain=full` lists all of it). `--explain=full` also lists, under the
+`seccomp` group as `filter:` lines, every call the application's filter
+answers with an errno — each name, or name and number (`listns #470
+(ENOSYS)`) where libseccomp has no name for it, the two `ioctl` requests and
+the `personality` rule — as the launcher builds it for this instance's
+`userns` and `seccomp` nodes; a nested sandbox that dies with "Function not
+implemented" is read against that list. `--dry-run` on its own remains the
 byte-exact, one-element-per-line form. `--format json` elides nothing; an
 argument that is not UTF-8 is written there with the replacement character,
 since JSON has no byte strings.
@@ -3009,8 +3015,10 @@ sandbox but no sandbox).
 `x11-without-reason` (an `x11 "host"` grant with no `lint-allow` reason; the
 nested default never warns), `seccomp-disabled`,
 `userns-disabled-with-nested-sandbox`
-(`userns "disable"` under a command known to nest a sandbox of its own — the
-list of such commands is a heuristic), `own-too-wide` (an `own` ending in `*`
+(`userns "disable"` under a command known to nest a sandbox of its own, where
+the new mount API a nested sandbox needs is denied as well and
+`--explain=full` lists the filter — the list of such commands is a
+heuristic), `own-too-wide` (an `own` ending in `*`
 with fewer than three name elements before it, so `org.kde.*` warns and
 `org.mozilla.firefox.*` does not), `mpris-wildcard`, `system-bus-polkit-name`
 (a `talk` on a system service whose privileged actions polkit judges as you),

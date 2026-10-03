@@ -492,8 +492,9 @@ const CHECK_LINES: &[(&str, &str)] = &[
     ),
     (
         "userns-disabled-with-nested-sandbox",
-        "`userns \"disable\"` under a command known to start a sandbox of its own; the \
-         list of such commands is a heuristic.",
+        "`userns \"disable\"` under a command known to start a sandbox of its own, where \
+         the new mount API a nested sandbox needs is denied as well (--explain=full lists \
+         the filter); the list of such commands is a heuristic.",
     ),
     (
         "wayland-clipboard-open",

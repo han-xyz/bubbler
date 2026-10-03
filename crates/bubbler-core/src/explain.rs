@@ -20,6 +20,7 @@ use crate::json;
 use crate::kdl_out;
 use crate::network::{self, NetworkConfig};
 use crate::pipewire;
+use crate::seccomp::{self, Errno};
 use crate::wayland;
 
 /// Arguments of the baseline listed before the rest is summed up. The
@@ -547,6 +548,41 @@ fn seccomp_lines(cfg: &SeccompConfig) -> Vec<String> {
     out
 }
 
+/// Every call the application's filter answers with an errno, as the
+/// launcher builds it for this config; empty where the filter is
+/// disabled.
+fn filter_lines(cfg: &InstanceConfig) -> Vec<String> {
+    let Some(set) = seccomp::RuleSet::with(&cfg.seccomp, cfg.userns) else {
+        return Vec::new();
+    };
+    let named = [(&set.eperm, Errno::Eperm), (&set.enosys, Errno::Enosys)]
+        .into_iter()
+        .flat_map(|(names, errno)| names.iter().map(move |n| format!("{n} ({})", errno.name())));
+    let numbered = set
+        .enosys_numbered
+        .iter()
+        .map(|(name, nr, errno)| format!("{name} #{nr} ({})", errno.name()));
+    let ioctls = set.ioctl_eperm.iter().map(|request| {
+        let request = match *request {
+            seccomp::TIOCSTI => "TIOCSTI".to_owned(),
+            seccomp::TIOCLINUX => "TIOCLINUX".to_owned(),
+            other => format!("{other:#x}"),
+        };
+        format!("ioctl {request} ({})", Errno::Eperm.name())
+    });
+    let personality = set.personality.then(|| {
+        format!(
+            "personality outside the allowed personas ({})",
+            Errno::Eperm.name()
+        )
+    });
+    named
+        .chain(numbered)
+        .chain(ioctls)
+        .chain(personality)
+        .collect()
+}
+
 /// `text` padded with spaces to `columns` on screen. `{:<n$}` counts
 /// characters, which would put a label named in a wide script out of
 /// line with the column beside it by its own width again.
@@ -702,7 +738,12 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
                     // that one carries the explanation.
                     _ => {}
                 },
-                Origin::Seccomp => out.extend(listed(n == 0, seccomp_lines(&view.cfg.seccomp))),
+                Origin::Seccomp => {
+                    out.extend(listed(n == 0, seccomp_lines(&view.cfg.seccomp)));
+                    if view.full {
+                        out.extend(under("filter: ", filter_lines(view.cfg)));
+                    }
+                }
                 _ => {}
             }
         }
@@ -1920,6 +1961,74 @@ bwrap
         assert_eq!(out[3], "    --add-seccomp-fd 4");
         assert_eq!(out[4], "    rules: allow ptrace, perf_event_open");
         assert_eq!(out[5], "           deny read (ENOSYS)");
+    }
+
+    fn render_seccomp(kdl: &str, full: bool) -> Vec<String> {
+        let cfg = cfg(kdl);
+        let items = [item(Origin::Seccomp, &["--add-seccomp-fd", "4"], None)];
+        render(
+            &items,
+            &View {
+                title: "bwrap",
+                instance: "t",
+                cfg: &cfg,
+                source: Source {
+                    file: "config.kdl",
+                    lines: &Lines::default(),
+                },
+                rules: &[],
+                wl_proxy: None,
+                audio_policy: "",
+                net_proxy_log: false,
+                proxy: false,
+                full,
+                bwrap: crate::version::Version::Known(0, 12, 0),
+            },
+        )
+        .unwrap()
+    }
+
+    fn lists(out: &[String], entry: &str) -> bool {
+        out.iter()
+            .any(|l| l.trim_start().trim_start_matches("filter: ") == entry)
+    }
+
+    /// What the filter answers each call with, for the instance's own
+    /// `userns` and `seccomp` nodes: the list a nested sandbox's
+    /// "Function not implemented" is read against.
+    #[test]
+    fn full_lists_the_filter_the_application_gets_with_each_errno() {
+        let out = render_seccomp("command \"true\"", true);
+        assert!(lists(&out, "clone3 (ENOSYS)"), "{out:#?}");
+        assert!(lists(&out, "keyctl (EPERM)"), "{out:#?}");
+        assert!(lists(&out, "listns #470 (ENOSYS)"), "{out:#?}");
+        assert!(lists(&out, "ioctl TIOCSTI (EPERM)"), "{out:#?}");
+        assert!(lists(&out, "ioctl TIOCLINUX (EPERM)"), "{out:#?}");
+        assert!(!out.iter().any(|l| l.contains("open_tree")), "{out:#?}");
+
+        let out = render_seccomp("userns \"disable\"\ncommand \"true\"", true);
+        assert!(lists(&out, "open_tree (ENOSYS)"), "{out:#?}");
+        assert!(lists(&out, "open_tree_attr #467 (ENOSYS)"), "{out:#?}");
+
+        let out = render_seccomp(
+            "seccomp {\n    allow \"clone3\"\n    deny \"chroot\"\n}\ncommand \"true\"",
+            true,
+        );
+        assert!(!lists(&out, "clone3 (ENOSYS)"), "{out:#?}");
+        assert!(lists(&out, "chroot (EPERM)"), "{out:#?}");
+
+        let out = render_seccomp("seccomp {\n    disable\n}\ncommand \"true\"", true);
+        assert!(
+            out.contains(&"    rules: filter disabled".to_owned()),
+            "{out:#?}"
+        );
+        assert!(!out.iter().any(|l| l.contains("(EPERM)")), "{out:#?}");
+    }
+
+    #[test]
+    fn plain_explain_does_not_list_the_filter() {
+        let out = render_seccomp("command \"true\"", false);
+        assert!(!out.iter().any(|l| l.contains("clone3")), "{out:#?}");
     }
 
     #[test]
