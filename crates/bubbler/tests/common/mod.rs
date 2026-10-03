@@ -502,9 +502,9 @@ pub fn kill_group(child: &Child) {
 /// so a pid the kernel hands out again later is not taken for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Started {
-    pid: i32,
-    parent: i32,
-    start: u64,
+    pub pid: i32,
+    pub parent: i32,
+    pub start: u64,
 }
 
 /// Every `bwrap` below `pid` in the process tree: a run's sandbox and its
@@ -538,13 +538,14 @@ pub fn sandboxes_of(pid: u32, bwraps: &[Started]) -> usize {
     bwraps.iter().filter(|b| b.parent == pid as i32).count()
 }
 
-/// Whether any of `bwraps` is still running. A run that has ended must
-/// leave none: bubbler tears its sandboxes down itself, and
-/// `--die-with-parent` is only the backstop behind that.
-pub fn bwrap_alive(bwraps: &[Started]) -> bool {
-    bwraps
+/// Whether any of `procs` is still running as the process it was. A run
+/// that has ended must leave none of its sandboxes or sidecars: bubbler
+/// tears them down itself, and `--die-with-parent` is only the backstop
+/// behind that.
+pub fn any_alive(procs: &[Started]) -> bool {
+    procs
         .iter()
-        .any(|b| stat_of(b.pid).is_some_and(|s| s.start == b.start && s.state != 'Z'))
+        .any(|p| stat_of(p.pid).is_some_and(|s| s.start == p.start && s.state != 'Z'))
 }
 
 /// What the tests read of one `/proc/<pid>/stat`: `session` is field 6

@@ -15,8 +15,8 @@ use bubbler_core::pipewire::{PULSE_MODULE, PW_CONTAINER};
 use bubbler_core::profile::NAMES;
 use bubbler_core::seccomp::{ARCHES, RuleSet, syscall_number};
 use common::{
-    PYTHON, Stat, bubbler, bubbler_audio, bubbler_dbus, bubbler_in_sh, bubbler_live,
-    bubbler_wayland, bwrap_alive, bwraps_under, command_lines, holders_of, host_bus, isolated,
+    PYTHON, Started, Stat, any_alive, bubbler, bubbler_audio, bubbler_dbus, bubbler_in_sh,
+    bubbler_live, bubbler_wayland, bwraps_under, command_lines, holders_of, host_bus, isolated,
     kill_group, output_past_a_busy_exec, process_running, real_init, real_net_proxy, require_a11y,
     require_a11y_lookup, require_bwrap, require_dbus, require_document_portal, require_egress,
     require_groff, require_host_program, require_nested_x11, require_nested_x11_host, require_nft,
@@ -3017,7 +3017,7 @@ fn real_bwrap_pipewire_context_tags_the_client() {
         2,
         "the sandbox and the context sidecar under the run while it was up"
     );
-    assert!(!bwrap_alive(&bwraps), "a sandbox of the run is left");
+    assert!(!any_alive(&bwraps), "a sandbox of the run is left");
     assert!(
         !process_running("pw-container", "audioctx"),
         "a pw-container is left"
@@ -3186,7 +3186,7 @@ fn real_bwrap_pulseaudio_serves_a_private_server() {
         3,
         "the sandbox, the context sidecar and the pulse server under the run while it was up"
     );
-    assert!(!bwrap_alive(&bwraps), "a sandbox of the run is left");
+    assert!(!any_alive(&bwraps), "a sandbox of the run is left");
     for left in ["pw", "pwpulse", "pulse-native"] {
         assert!(
             !instance.join(left).exists(),
@@ -5757,7 +5757,7 @@ fn a_signal_while_a_sidecar_starts_stops_the_run_and_leaves_nothing() {
     );
     assert!(!marker.exists(), "the application ran after the signal");
     assert!(
-        wait_until(|| !bwrap_alive(&bwraps), Duration::from_secs(5)),
+        wait_until(|| !any_alive(&bwraps), Duration::from_secs(5)),
         "the proxy's sandbox outlived the run"
     );
 }
@@ -5839,7 +5839,7 @@ fn real_bwrap_a_signal_to_the_process_group_while_a_sidecar_starts_ends_as_stopp
         .into_iter()
         .filter(|name| instance.join(name).exists())
         .collect();
-    let sidecars_gone = wait_until(|| !bwrap_alive(&bwraps), Duration::from_secs(5));
+    let sidecars_gone = wait_until(|| !any_alive(&bwraps), Duration::from_secs(5));
     bubbler_audio(tmp.path(), &init)
         .args(["delete", "audiohalt", "--yes"])
         .status()
@@ -6061,10 +6061,6 @@ fn real_allow_host_the_egress_proxy_holds_no_terminal_of_the_callers() {
     assert_eq!(out.status.code(), Some(0), "{shown}");
 }
 
-/// A process by pid and start time, so a pid the kernel hands out again
-/// is not taken for it.
-type Started = (i32, u64);
-
 /// bubbler `pid`'s pasta and egress proxy, as their `/proc/<pid>/stat`
 /// reads, once both have started.
 fn network_sidecars(pid: i32) -> Option<[(i32, Stat); 2]> {
@@ -6084,13 +6080,6 @@ fn network_sidecars(pid: i32) -> Option<[(i32, Stat); 2]> {
         .into_iter()
         .find(|(_, s)| s.comm.starts_with("bubbler-net"))?;
     Some([pasta, proxy])
-}
-
-/// Whether any of `procs` is still running as the process it was.
-fn any_outlived(procs: &[Started]) -> bool {
-    procs
-        .iter()
-        .any(|(pid, start)| stat_of(*pid).is_some_and(|s| s.start == *start && s.state != 'Z'))
 }
 
 /// pasta and the egress proxy are each in a session of their own with no
@@ -6143,7 +6132,14 @@ fn real_allow_host_pasta_and_the_egress_proxy_have_no_controlling_terminal() {
     let shown = pty.read_until(Duration::from_millis(200), |_| false);
     let (own, sidecars) =
         seen.unwrap_or_else(|| panic!("pasta and the egress proxy were never seen: {shown}"));
-    let started: Vec<Started> = sidecars.iter().map(|(pid, s)| (*pid, s.start)).collect();
+    let started: Vec<Started> = sidecars
+        .iter()
+        .map(|(pid, s)| Started {
+            pid: *pid,
+            parent: me,
+            start: s.start,
+        })
+        .collect();
     assert_ne!(own.tty_nr, 0, "bubbler was given no terminal: {own:?}");
     for (_, sidecar) in &sidecars {
         assert_eq!(sidecar.tty_nr, 0, "{sidecar:?} holds bubbler's terminal");
@@ -6154,7 +6150,7 @@ fn real_allow_host_pasta_and_the_egress_proxy_have_no_controlling_terminal() {
     }
     assert_eq!(out.status.code(), Some(0), "{shown}");
     assert!(
-        wait_until(|| !any_outlived(&started), Duration::from_secs(5)),
+        wait_until(|| !any_alive(&started), Duration::from_secs(5)),
         "pasta or the egress proxy outlived the run: {started:?}"
     );
 }
@@ -10148,7 +10144,7 @@ fn real_bwrap_seccomp_covers_the_dbus_proxy_sandbox() {
     assert_eq!(probed(&out, "getpid"), "ok", "{out}");
     // Neither the app sandbox nor the proxy's outlives the run.
     assert!(
-        wait_until(|| !bwrap_alive(&bwraps), Duration::from_secs(5)),
+        wait_until(|| !any_alive(&bwraps), Duration::from_secs(5)),
         "a bwrap of instance `seccp` outlived the run"
     );
 }
@@ -10574,6 +10570,9 @@ fn a_signal_to_the_process_group_while_the_egress_proxy_starts_stops_both_sideca
     }
     let Some(init) = real_init() else { return };
     let tmp = setup();
+    // Its own instance name: a start sweeps the empty cgroups of its
+    // instance's earlier runs, and the proxy leaf of another test's
+    // starting run of the same name is one.
     bubbler_live(tmp.path(), &init)
         .args(["create", "egint"])
         .status()
@@ -10584,9 +10583,6 @@ fn a_signal_to_the_process_group_while_the_egress_proxy_starts_stops_both_sideca
         "#!/usr/bin/sh\necho $$ > /home/bubbler/proxy-pid\nexec /usr/bin/sleep 30\n",
     );
     let home = tmp.path().join("data/bubbler/instances/egint/home");
-    // Its own instance name: a start sweeps the empty cgroups of its
-    // instance's earlier runs, and the proxy leaf of another test's
-    // starting run of the same name is one.
     std::fs::write(
         tmp.path().join("data/bubbler/instances/egint/config.kdl"),
         "network {\n    outbound \"deny\"\n    allow-host \"localhost\" port=9\n}\n",
@@ -10619,15 +10615,15 @@ fn a_signal_to_the_process_group_while_the_egress_proxy_starts_stops_both_sideca
         fail_with(run, "the egress proxy never started");
     }
     let pasta = fake_pasta_pid(tmp.path()).expect("pasta reported before the proxy started");
+    let parent = Pid::from_child(&run).as_raw_nonzero().get();
     let started: Vec<Started> = [pasta, proxy_pid.unwrap()]
         .into_iter()
-        .map(|pid| {
-            (
-                pid,
-                stat_of(pid)
-                    .expect("a sidecar gone before the signal")
-                    .start,
-            )
+        .map(|pid| Started {
+            pid,
+            parent,
+            start: stat_of(pid)
+                .expect("a sidecar gone before the signal")
+                .start,
         })
         .collect();
     let (code, err) = interrupt_group(run);
@@ -10637,7 +10633,7 @@ fn a_signal_to_the_process_group_while_the_egress_proxy_starts_stops_both_sideca
         "the application ran after the signal"
     );
     assert!(
-        wait_until(|| !any_outlived(&started), Duration::from_secs(5)),
+        wait_until(|| !any_alive(&started), Duration::from_secs(5)),
         "pasta or the egress proxy outlived the run: {started:?}"
     );
 }
