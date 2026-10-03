@@ -2211,9 +2211,7 @@ fn a_pinned_host_stream_does_not_fall_back_from_a_sink_a_context_names_after_its
         matches!(host.0.try_wait(), Ok(Some(_)))
     });
     wait_for("the hook's word that the stream is pinned", || {
-        std::fs::read_to_string(bed.dir().join("wireplumber.log"))
-            .unwrap_or_default()
-            .contains("host is pinned to bed-headset")
+        hook_said(&bed, "host is pinned to bed-headset")
     });
     // The host stream is the only thing in the graph that could be
     // linked.
@@ -2398,6 +2396,10 @@ fn a_host_filters_own_stream_plays_on_past_a_smart_filter_a_context_offers_after
         peers(&bed.links(), "offered-out:output_FL").contains(&"bed-sink:playback_FL")
     });
     window_in_which_it_would_link(&bed, "playback");
+    wait_for(
+        "the hook's word that it sent the filter's stream on",
+        || hook_said(&bed, "host-filter-out goes to bed-sink, not offered"),
+    );
     std::thread::sleep(FORBIDDEN_LINK_LIFE);
     let links = bed.links();
     assert_eq!(
@@ -2405,6 +2407,105 @@ fn a_host_filters_own_stream_plays_on_past_a_smart_filter_a_context_offers_after
         ["bed-sink:playback_FL"],
         "the host filter's own stream left the sink for a context's filter:\n{links}"
     );
+}
+
+/// A host loopback that is not a smart filter, its stream aimed at a sink
+/// a context offers, is sent on through the host's smart filter like any
+/// other host stream: only a smart filter's own stream skips it.
+#[test]
+fn a_host_loopbacks_stream_aimed_at_a_sink_a_context_offers_passes_through_the_hosts_filter() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let _filter = host_stream(
+        &bed,
+        &[
+            "-r",
+            "-a",
+            "-P",
+            "{ media.class = Audio/Sink, node.name = host-filter, \
+             node.link-group = host-filter, filter.smart = true, \
+             filter.smart.name = host-filter, \
+             filter.smart.target = { node.name = bed-sink } }",
+            "/dev/null",
+        ],
+    );
+    let _filter_out = host_stream(
+        &bed,
+        &[
+            "-p",
+            "-a",
+            "-P",
+            "{ node.name = host-filter-out, node.link-group = host-filter }",
+            "-",
+        ],
+    );
+    let _loop_in = host_stream(
+        &bed,
+        &[
+            "-r",
+            "-a",
+            "-P",
+            "{ media.class = Audio/Sink, node.name = loop, node.link-group = loop }",
+            "/dev/null",
+        ],
+    );
+    // A loopback's own sink can win the default over the bed's, which
+    // has no priority; the user's choice is what keeps it.
+    bed.host_tool(
+        "pw-metadata",
+        &[
+            "-n",
+            "default",
+            "0",
+            "default.configured.audio.sink",
+            "{ \"name\": \"bed-sink\" }",
+        ],
+    );
+    wait_for("the bed's sink as the default", || {
+        bed.host_tool("pw-metadata", &["-n", "default", "0"])
+            .contains("'default.audio.sink' value:'{\"name\":\"bed-sink\"}'")
+    });
+    wait_for("the host filter's own stream on the sink", || {
+        peers(&bed.links(), "host-filter-out:output_FL").contains(&"bed-sink:playback_FL")
+    });
+
+    let _offered = Streaming(bed.spawn_in_context(
+        PLAYBACK,
+        "pw-cat -r -a -P '{ media.class = Audio/Sink, node.name = offered }' /dev/null",
+    ));
+    wait_for("the context's sink", || {
+        bed.dump_from_host().contains("\"node.name\": \"offered\"")
+    });
+    window_in_which_it_would_link(&bed, "playback");
+    let _loop_out = host_stream(
+        &bed,
+        &[
+            "-p",
+            "-a",
+            "--target=offered",
+            "-P",
+            "{ node.name = loop-out, node.link-group = loop }",
+            "-",
+        ],
+    );
+    wait_for("a link for the loopback's stream", || {
+        !peers(&bed.links(), "loop-out:output_FL").is_empty()
+    });
+    std::thread::sleep(FORBIDDEN_LINK_LIFE);
+    let links = bed.links();
+    assert_eq!(
+        peers(&links, "loop-out:output_FL"),
+        ["host-filter:playback_FL"],
+        "a loopback's stream sent away from a context's sink missed the host's filter:\n{links}"
+    );
+}
+
+/// Whether the bed's WirePlumber has logged `line`.
+fn hook_said(bed: &PipeWireBed, line: &str) -> bool {
+    std::fs::read_to_string(bed.dir().join("wireplumber.log"))
+        .unwrap_or_default()
+        .contains(line)
 }
 
 /// What `port` is linked to in a `pw-link -l` listing.

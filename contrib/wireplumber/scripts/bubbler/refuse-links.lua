@@ -47,8 +47,9 @@
 --
 -- WirePlumber links no other client's stream to a sandbox's node that
 -- is not that stream's own, and no such node becomes the session's
--- default; a host stream aimed at one goes where it would go without
--- it, and one pinned to it with `node.dont-fallback` gets no link.
+-- default; a host stream aimed at one goes to what a sandbox's filter
+-- stood in front of, else the default, and one pinned to it with
+-- `node.dont-fallback` gets no link (docs/threat-model.md, known gaps).
 --
 -- A link with a sandbox's node at either end is destroyed when
 -- WirePlumber sees it, unless WirePlumber made it and it is one the
@@ -218,7 +219,8 @@ local function filters_own_stream (si_props)
     return false
   end
   for _, entry in ipairs (futils.filters) do
-    if entry.link_group == link_group then
+    if entry.link_group == link_group and entry.smart and
+        not entry.disabled then
       return true
     end
   end
@@ -230,14 +232,13 @@ end
 -- stream's target (linking/find-defined-target) or one ranked above the
 -- host's own (linking/find-best-target). Refused after
 -- linking/prepare-link, the stream would play nowhere, so here, after
--- every finder and before prepare-link, it is decided as though the
--- sandbox's node were not there: what a sandbox's filter stood in front
--- of, else the session's default (never a sandbox's node), each through
--- the host's own filters as get-filter-from-target would have put it,
--- except for a filter's own stream, which goes there directly;
--- and a stream pinned with `node.dont-fallback` to a target that is
--- only a sandbox's is left as find-defined-target leaves one whose
--- target is missing.
+-- every finder and before prepare-link, it is sent to what a sandbox's
+-- filter stood in front of, else the session's default (never a
+-- sandbox's node), through the host's first smart filter in front of
+-- that, a smart filter's own stream directly; and a stream pinned with
+-- `node.dont-fallback` to a sandbox's node is left as
+-- find-defined-target leaves one whose target is missing. Where this
+-- differs from WirePlumber's own search: docs/threat-model.md, known gaps.
 SimpleEventHook {
   name = "bubbler/no-target-from-a-sandbox",
   after = { "linking/find-defined-target",
