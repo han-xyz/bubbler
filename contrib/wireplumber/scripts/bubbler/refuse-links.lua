@@ -45,8 +45,8 @@
 -- `Audio/Source*` or `Audio/Duplex` node, and only where the instance
 -- was granted `microphone`; and the sandbox links nothing itself.
 --
--- A sandbox offers no device: its nodes that are not audio streams never
--- become session items, so WirePlumber links no other client's stream to
+-- A sandbox offers no device: its nodes that are not plain audio streams
+-- keep no session item, so WirePlumber links no other client's stream to
 -- them and makes none of them a default or a filter. WirePlumber links
 -- no other client's stream to a sandbox's stream either.
 --
@@ -181,18 +181,32 @@ SimpleEventHook {
 -- Whether the client's grant lets its own devices stand beside the
 -- host's.
 local function offers_devices (client)
-  return string.find (client.properties ["pipewire.sec.bubbler.audio"] or "",
-      "devices", 1, true) ~= nil
+  local grant = client.properties ["pipewire.sec.bubbler.audio"] or ""
+  return ("," .. grant .. ","):find (",devices,", 1, true) ~= nil
 end
 
--- A sandbox offers no device: of its nodes only its audio streams become
--- session items. Every finder, the smart-filter chain
+-- Whether a node with these properties, as they stand now, is kept out of
+-- the session: a node of a sandbox without the device grant that is not a
+-- plain audio stream. A stream carries a link group only as one half of a
+-- filter.
+local function kept_from_the_session (source, node_props)
+  local client = bubbler_client (source, node_props ["client.id"])
+  if not client or offers_devices (client) then
+    return false
+  end
+  local class = node_props ["media.class"]
+  return (class ~= AUDIO_STREAM_CLASS.output and
+      class ~= AUDIO_STREAM_CLASS.input) or
+      node_props ["node.link-group"] ~= nil
+end
+
+-- A sandbox offers no device: of its nodes only its plain audio streams
+-- become session items. Every finder, the smart-filter chain
 -- (lib/filter-utils.lua) and the default-node rescan search session items
 -- alone, so a sink, source or filter a sandbox makes is never a target,
 -- a filter or a default for anyone; the node stays in the graph,
 -- unlinked, and its client gets no error. node/create-item is the only
--- maker of a node's session item, and stopping the event before it keeps
--- it from running for this node.
+-- maker of a node's session item.
 SimpleEventHook {
   name = "bubbler/no-device-from-a-sandbox",
   after = "bubbler/destroy-refused-link-once-its-ends-are-known",
@@ -204,22 +218,55 @@ SimpleEventHook {
   },
   execute = function (event)
     local node = event:get_subject ()
-    local client = bubbler_client (event:get_source (),
-        node.properties ["client.id"])
-    if not client or offers_devices (client) then
-      return
-    end
-    local class = node.properties ["media.class"]
-    if class == AUDIO_STREAM_CLASS.output or
-        class == AUDIO_STREAM_CLASS.input then
+    if not kept_from_the_session (event:get_source (), node.properties) then
       return
     end
     log:info (node, string.format ("%s (client %s, %s) is no device of " ..
-        "the session: not an audio stream of a sandbox",
+        "the session: not a plain audio stream of a sandbox",
         tostring (node.properties ["node.name"]),
         tostring (node.properties ["client.id"]),
-        tostring (class)))
+        tostring (node.properties ["media.class"])))
     event:stop_processing ()
+  end
+}:register ()
+
+-- The same, for a node that has a session item all the same: one that
+-- reached node-added before WirePlumber knew its client (after a
+-- WirePlumber restart the node is already in the graph), and a stream
+-- that has since changed its own properties into a filter's (a client
+-- may, and no event follows). Default-node selection and the filter chain
+-- are rebuilt only in these two rescans and read the node's current
+-- properties there (default-nodes/rescan.lua, lib/filter-utils.lua
+-- rescanFilters), so removing the item first keeps the node out of both.
+SimpleEventHook {
+  name = "bubbler/no-device-from-a-sandbox-on-rescan",
+  before = { "default-nodes/rescan", "lib/filter-utils/rescan",
+      "linking/mpris-pause-disable-rescan", "linking/rescan" },
+  interests = {
+    EventInterest {
+      Constraint { "event.type", "=", "rescan-for-default-nodes" },
+    },
+    EventInterest {
+      Constraint { "event.type", "=", "rescan-for-linking" },
+    },
+  },
+  execute = function (event)
+    local source = event:get_source ()
+    local kept = {}
+    for si in source:call ("get-object-manager", "session-item"):iterate {
+        type = "SiLinkable" } do
+      local node = si:get_associated_proxy ("node")
+      if node and kept_from_the_session (source, node.properties) then
+        table.insert (kept, si)
+      end
+    end
+    for _, si in ipairs (kept) do
+      log:info (si, string.format ("removing the session item of %s " ..
+          "(client %s): not a plain audio stream of a sandbox",
+          tostring (si.properties ["node.name"]),
+          tostring (si.properties ["client.id"])))
+      si:remove ()
+    end
   end
 }:register ()
 
@@ -407,8 +454,9 @@ SimpleEventHook {
 -- At `link-added` the node at an end, or the client that owns it, may
 -- not be in WirePlumber's object managers yet, and the link would pass
 -- as one with no sandbox at either end. It is decided again when that
--- node or a bubbler client arrives, and so is the default, which a
--- sandbox's node may have won while its client was not known yet:
+-- node or a bubbler client arrives. A bubbler client's arrival also
+-- rescans defaults and links, whose first hook removes the session item
+-- a node of that client got while the client was not known yet:
 -- default-nodes/rescan-trigger rescans on session items, the default
 -- metadata and device routes, never on a client.
 SimpleEventHook {
@@ -428,6 +476,7 @@ SimpleEventHook {
         return
       end
       source:call ("schedule-rescan", "default-nodes")
+      source:call ("schedule-rescan", "linking")
     end
 
     local function ends_here (node_id)

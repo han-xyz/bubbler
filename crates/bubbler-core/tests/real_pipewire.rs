@@ -394,33 +394,37 @@ impl PipeWireBed {
         });
         let early = before_session_manager(&dir);
 
-        let wireplumber = daemon(
-            Command::new("wireplumber")
-                .args(["-p", "bubbler-bed"])
-                .env("PIPEWIRE_RUNTIME_DIR", &run)
-                .env("WIREPLUMBER_CONFIG_DIR", &wp)
-                .env("XDG_DATA_HOME", &data)
-                .env("XDG_STATE_HOME", root.join("state"))
-                // Info for the linking scripts' topic, where the hook logs
-                // each link it refuses (`links_refused`); the default level
-                // everywhere else.
-                .env("WIREPLUMBER_DEBUG", "2,s-linking:I"),
-            &root.join("wireplumber.log"),
-        );
         let bed = PipeWireBed {
             pipewire,
-            wireplumber,
+            wireplumber: session_manager(&root),
             supervisor,
             dir,
         };
-        // WirePlumber registers itself as a client before it applies any
-        // policy, so the bed is only ready once its session manager is
-        // in the graph; a context opened before that gets the daemon's
-        // own permissions instead of the drop-in's.
-        wait_for("the bed's wireplumber", || {
-            bed.dump_from_host().contains("\"wireplumber.daemon\"")
-        });
+        bed.wait_for_the_session_manager();
         (bed, early)
+    }
+
+    /// WirePlumber registers itself as a client before it applies any
+    /// policy, so the bed is only ready once its session manager is in
+    /// the graph; a context opened before that gets the daemon's own
+    /// permissions instead of the drop-in's.
+    fn wait_for_the_session_manager(&self) {
+        wait_for("the bed's wireplumber", || {
+            self.dump_from_host().contains("\"wireplumber.daemon\"")
+        });
+    }
+
+    /// Stop the bed's WirePlumber and start it again, as a user's session
+    /// does on a restart: everything already in the graph is new to it.
+    fn restart_session_manager(&mut self) {
+        let pid = Pid::from_raw(self.wireplumber.id() as i32).expect("a live child");
+        let _ = kill_process(pid, Signal::TERM);
+        wait_or_kill(&mut self.wireplumber);
+        wait_for("the bed's wireplumber gone", || {
+            !self.dump_from_host().contains("\"wireplumber.daemon\"")
+        });
+        self.wireplumber = session_manager(&self.dir);
+        self.wait_for_the_session_manager();
     }
 
     /// The bed's directory, so a test can look for it after the drop.
@@ -663,6 +667,25 @@ fn wait_or_kill(child: &mut Child) {
             }
         }
     }
+}
+
+/// The bed's WirePlumber, over the bed in `root`, logging to
+/// `wireplumber.log` there.
+fn session_manager(root: &Path) -> Child {
+    let data = root.join("data");
+    daemon(
+        Command::new("wireplumber")
+            .args(["-p", "bubbler-bed"])
+            .env("PIPEWIRE_RUNTIME_DIR", root.join("run"))
+            .env("WIREPLUMBER_CONFIG_DIR", root.join("wireplumber"))
+            .env("XDG_DATA_HOME", &data)
+            .env("XDG_STATE_HOME", root.join("state"))
+            // Info for the linking scripts' topic, where the hook logs
+            // each link it refuses (`links_refused`); the default level
+            // everywhere else.
+            .env("WIREPLUMBER_DEBUG", "2,s-linking:I"),
+        &root.join("wireplumber.log"),
+    )
 }
 
 /// Spawn a daemon with its output in `log`, so a failure to start can be
@@ -2072,8 +2095,18 @@ fn a_host_stream_passes_by_a_node_a_context_offers(
             == offers.len()
     });
     window_in_which_it_would_link(&bed, grant);
+    a_host_stream_passes_by_what_a_context_offered(&bed, grant, host, bed_end);
+}
 
-    let _host = host_stream(&bed, host);
+/// The host stream `host` (a node named `host`) reaches `bed_end` and no
+/// port of a node named `offered`, which is no default either.
+fn a_host_stream_passes_by_what_a_context_offered(
+    bed: &PipeWireBed,
+    grant: &str,
+    host: &[&str],
+    bed_end: &str,
+) {
+    let _host = host_stream(bed, host);
     wait_for("a link for the host's stream", || {
         bed.links().contains("host:")
     });
@@ -2177,6 +2210,132 @@ fn a_host_stream_passes_by_a_smart_filter_a_playback_context_offers() {
         &["-p", "-a", "-P", "{ node.name = host }", "-"],
         "bed-sink:playback_",
     );
+}
+
+/// A sink a context offered while WirePlumber was up is no device for the
+/// WirePlumber that starts after it, which meets the sink and its client
+/// in whatever order its object managers deliver them.
+#[test]
+fn a_sink_a_context_offered_before_the_session_manager_restarted_is_no_device() {
+    let Some(mut bed) = PipeWireBed::start() else {
+        return;
+    };
+    let _offered = Streaming(bed.spawn_in_context(
+        PLAYBACK,
+        "pw-cat -r -a -P '{ media.class = Audio/Sink, priority.session = 5000, node.name = offered }' /dev/null",
+    ));
+    wait_for("the context's sink", || {
+        bed.dump_from_host().contains("\"node.name\": \"offered\"")
+    });
+    window_in_which_it_would_link(&bed, "playback");
+    bed.restart_session_manager();
+    window_in_which_it_would_link(&bed, "playback");
+    a_host_stream_passes_by_what_a_context_offered(
+        &bed,
+        "playback",
+        &["-p", "-a", "-P", "{ node.name = host }", "-"],
+        "bed-sink:playback_",
+    );
+}
+
+/// The C fixture that changes its own node's properties, built into the
+/// bed's directory, or `None` (having said why) on a host without a C
+/// compiler or PipeWire's headers.
+fn changes_its_properties(bed: &PipeWireBed) -> Option<PathBuf> {
+    for tool in ["cc", "pkg-config"] {
+        if on_path(tool).is_none() {
+            say(&format!("skipping: {tool} not installed"));
+            return None;
+        }
+    }
+    let flags = Command::new("pkg-config")
+        .args(["--cflags", "--libs", "libpipewire-0.3"])
+        .output()
+        .expect("pkg-config did not run");
+    if !flags.status.success() {
+        say("skipping: libpipewire-0.3 headers not installed");
+        return None;
+    }
+    let binary = bed.dir().join("changes_its_properties");
+    let built = Command::new("cc")
+        .arg("-o")
+        .arg(&binary)
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/changes_its_properties.c"
+        ))
+        .args(String::from_utf8_lossy(&flags.stdout).split_whitespace())
+        .output()
+        .expect("cc did not run");
+    assert!(
+        built.status.success(),
+        "the fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    Some(binary)
+}
+
+/// A context's capture stream that turns itself into a smart filter's
+/// sink once WirePlumber has made it a session item — with the link
+/// group from the start, and with the link group added only then — takes
+/// no host stream: an untargeted host stream still plays on the bed's
+/// sink.
+#[test]
+fn a_stream_a_context_turns_into_a_smart_filter_takes_no_host_stream() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let Some(fixture) = changes_its_properties(&bed) else {
+        return;
+    };
+    let filter = "media.class = Audio/Sink, node.link-group = sandbox-filter, \
+                  filter.smart = true, filter.smart.name = sandbox-filter";
+    for (n, created) in [
+        "media.class = Stream/Input/Audio, node.name = offered, node.link-group = sandbox-filter",
+        "media.class = Stream/Input/Audio, node.name = offered",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let offered = Streaming(bed.spawn_in_context(
+            PLAYBACK,
+            &format!(
+                "{} in '{{ {created} }}' '{{ {filter} }}'",
+                fixture.display()
+            ),
+        ));
+        wait_for("the context's stream turned into a filter", || {
+            bed.dump_from_host()
+                .contains("\"filter.smart.name\": \"sandbox-filter\"")
+        });
+        window_in_which_it_would_link(&bed, "playback");
+
+        let watched = LinkMonitor::start(&bed);
+        let host = format!("host{n}");
+        let _host = host_stream(
+            &bed,
+            &["-p", "-a", "-P", &format!("{{ node.name = {host} }}"), "-"],
+        );
+        wait_for(&format!("a link for {host} (created as {created})"), || {
+            !peers(&bed.links(), &format!("{host}:output_FL")).is_empty()
+        });
+        std::thread::sleep(FORBIDDEN_LINK_LIFE);
+        let links = bed.links();
+        assert_eq!(
+            peers(&links, &format!("{host}:output_FL")),
+            ["bed-sink:playback_FL"],
+            "{host} left the sink beside a context's stream created as {created}:\n{links}"
+        );
+        let seen = watched.seen();
+        assert!(
+            !seen.contains("|-> offered:"),
+            "a host stream was linked to a context's stream created as {created}:\n{seen}"
+        );
+        drop(offered);
+        wait_for("the context's stream gone", || {
+            !bed.dump_from_host().contains("\"node.name\": \"offered\"")
+        });
+    }
 }
 
 /// `pw-cat` with `args`, run on the host outside every context and fed
