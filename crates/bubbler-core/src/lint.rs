@@ -1243,7 +1243,7 @@ fn audio_policy_differs(ctx: &Context, sources: &[Source], f: &mut Findings) {
         node,
         &AUDIO_POLICY_DIFFERS,
         audio_policy::differs_message(&paths),
-        &audio_policy::differs_help(&paths),
+        &audio_policy::differs_help(&paths, ctx.env),
     );
 }
 

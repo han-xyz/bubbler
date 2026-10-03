@@ -56,7 +56,7 @@ node instead of what it asks for; without the hook it is scoped but every other
 client's audio stays recordable — its streams and the sink's monitor ports,
 which the sandbox can also link to itself. The finding names the half that is missing and
 the `bubbler audio-policy --print` or `--print --script` that writes it, then
-restart WirePlumber), `audio-policy-differs` (the whole policy installed but a
+restart WirePlumber), `audio-policy-differs` (a
 copy WirePlumber loads is not this bubbler's: under an older one a sandbox can
 claim the microphone grant; names each file and what writes it again, and
 `lint-allow "audio-policy-differs" reason="..."` accepts a copy edited on

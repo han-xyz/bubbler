@@ -2210,6 +2210,11 @@ fn a_pinned_host_stream_does_not_fall_back_from_a_sink_a_context_names_after_its
     wait_for("the end of the pinned host stream", || {
         matches!(host.0.try_wait(), Ok(Some(_)))
     });
+    wait_for("the hook's word that the stream is pinned", || {
+        std::fs::read_to_string(bed.dir().join("wireplumber.log"))
+            .unwrap_or_default()
+            .contains("host is pinned to bed-headset")
+    });
     // The host stream is the only thing in the graph that could be
     // linked.
     let seen = watched.seen();

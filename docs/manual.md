@@ -647,14 +647,18 @@ this bubbler's in <path>: under an older policy a sandbox can claim the
 microphone grant for itself; …`, naming each file that differs, and
 `bubbler lint` warns `audio-policy-differs`. Both say what to run: the
 `bubbler audio-policy --print` (`--print --script` for the hook) that
-writes that path again, or, for a copy under `/usr/share`, an update of
-the package that installed it; then `systemctl --user restart
-wireplumber`. A copy you edited on purpose is accepted per config with
+writes that path again where it is in your own directories; for a copy
+under `/usr/share`, an update of the package that installed it; for one
+anywhere else (`/etc`, `/etc/xdg`, `/usr/local/share`), the command that
+writes your own copy, which outranks it; then `systemctl --user restart
+wireplumber`. A copy you edited on purpose is accepted with
 `lint-allow "audio-policy-differs" reason="..."`, which silences both the
-lint and the run warning for that config only, so every other config
-still hears about it. The check compares the copies WirePlumber loads with
+lint and the run warning for every config that carries it, directly or
+through a profile. The check compares the copies WirePlumber loads with
 bubbler's own; whether the running WirePlumber has loaded them, it cannot
-tell. An ALSA client reaches the same
+tell. It reads the search directories (`$XDG_CONFIG_HOME`,
+`$XDG_CONFIG_DIRS`, `$XDG_DATA_HOME`, `$XDG_DATA_DIRS`) from bubbler's own
+environment, which can differ from the one WirePlumber was started with. An ALSA client reaches the same
 daemon through `/etc/alsa`, which the baseline binds: those files are where
 pipewire-alsa defines the `default` PCM, and without them alsa-lib falls back
 to a hardware card whose `/dev/snd` nodes no sandbox has.

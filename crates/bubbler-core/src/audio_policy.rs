@@ -217,7 +217,7 @@ pub fn run_warning(cfg: &InstanceConfig, host: &dyn Host, env: &Env) -> Option<S
         differing(host, env)
     };
     let differs = (!paths.is_empty())
-        .then(|| format!("{}; {}", differs_message(&paths), differs_help(&paths)));
+        .then(|| format!("{}; {}", differs_message(&paths), differs_help(&paths, env)));
     match (missing, differs) {
         (Some(missing), Some(differs)) => Some(format!("{missing}; {differs}")),
         (Some(missing), None) => Some(missing.to_owned()),
@@ -266,24 +266,39 @@ pub fn differs_message(paths: &[PathBuf]) -> String {
     )
 }
 
-/// What to run for `paths`: each written again with the `--print` that
-/// produces it, or, under `/usr/share`, the package that installed it
-/// updated; then WirePlumber restarted. Or, for an edit made on purpose,
-/// the `lint-allow` that accepts it.
-pub fn differs_help(paths: &[PathBuf]) -> String {
+/// What to run for `paths`: a copy in the user's own directories written
+/// again with the `--print` that produces it; under `/usr/share`, the
+/// package that installed it updated; anywhere else, which the user's
+/// shell cannot write, the user's own copy written, which outranks it;
+/// then WirePlumber restarted. Or, for an edit made on purpose, the
+/// `lint-allow` that accepts it.
+pub fn differs_help(paths: &[PathBuf], env: &Env) -> String {
     let steps: Vec<String> = paths
         .iter()
         .map(|path| {
-            let script = if path.ends_with(HOOK_NAME) {
-                " --script"
-            } else {
-                ""
-            };
-            if path.starts_with(DATA_DIR) {
-                format!("update the package that installed {}", path.display())
-            } else {
+            let is_hook = path.ends_with(HOOK_NAME);
+            let script = if is_hook { " --script" } else { "" };
+            if path.starts_with(&env.config_home) || path.starts_with(&env.data_home) {
                 format!(
                     "`bubbler audio-policy --print{script} > {}`",
+                    path.display()
+                )
+            } else if path.starts_with(DATA_DIR) {
+                format!("update the package that installed {}", path.display())
+            } else {
+                let user_copy = if is_hook {
+                    hook_dirs(env)[0].join(HOOK_NAME)
+                } else {
+                    install_dirs(env)[0].join(DROP_IN_NAME)
+                };
+                format!(
+                    "`mkdir -p {} && bubbler audio-policy --print{script} > {}`, which \
+                     outranks {}",
+                    user_copy
+                        .parent()
+                        .expect("the user's copy has a directory")
+                        .display(),
+                    user_copy.display(),
                     path.display()
                 )
             }
@@ -467,7 +482,7 @@ mod tests {
         let user_hook = Path::new("/home/user/.local/share/wireplumber/scripts").join(HOOK_NAME);
         let packaged_drop_in =
             Path::new("/usr/share/wireplumber/wireplumber.conf.d").join(DROP_IN_NAME);
-        let help = differs_help(&[packaged_drop_in.clone(), user_hook.clone()]);
+        let help = differs_help(&[packaged_drop_in.clone(), user_hook.clone()], &env());
         assert!(
             help.contains(&format!(
                 "update the package that installed {}",
@@ -486,6 +501,39 @@ mod tests {
             help.contains("systemctl --user restart wireplumber"),
             "{help}"
         );
+    }
+
+    /// A copy outside the user's own directories and not a package's
+    /// cannot be written by the user's shell; the user's own copy, which
+    /// outranks it, can.
+    #[test]
+    fn differs_help_writes_a_users_copy_over_a_system_one() {
+        let e = env();
+        for (system, user, script) in [
+            (
+                Path::new("/etc/xdg/wireplumber/wireplumber.conf.d").join(DROP_IN_NAME),
+                Path::new("/home/user/.config/wireplumber/wireplumber.conf.d").join(DROP_IN_NAME),
+                "",
+            ),
+            (
+                Path::new("/usr/local/share/wireplumber/scripts").join(HOOK_NAME),
+                Path::new("/home/user/.local/share/wireplumber/scripts").join(HOOK_NAME),
+                " --script",
+            ),
+        ] {
+            let help = differs_help(std::slice::from_ref(&system), &e);
+            assert!(
+                help.contains(&format!(
+                    "mkdir -p {} && bubbler audio-policy --print{script} > {}`, which outranks {}",
+                    user.parent().expect("a directory").display(),
+                    user.display(),
+                    system.display()
+                )),
+                "{help}"
+            );
+            assert!(!help.contains(&format!("> {}", system.display())), "{help}");
+            assert!(!help.contains("sudo"), "{help}");
+        }
     }
 
     #[test]
