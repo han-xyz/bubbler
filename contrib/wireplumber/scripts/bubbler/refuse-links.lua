@@ -172,24 +172,24 @@ local function refusal (si_props, target_props, client)
     return "another client's stream"
   end
 
+  if si_props ["item.node.direction"] == "input" then
+    -- A capture stream and a target that is also an input and records
+    -- nothing itself: the target is a sink and what would be linked are
+    -- its monitor ports.
+    if not capture_capable (target_props) then
+      return target_props ["item.node.direction"] == "input" and
+          "a sink's monitor ports" or "a node that is not a source"
+    end
+
+    if not granted (client, "microphone") then
+      return "a source, without the microphone grant"
+    end
+  end
+
+  -- Last, so a stream is told it needs the exclusive grant only where
+  -- that grant alone would let it be linked.
   if holds_its_target (si_props) and not granted (client, "exclusive") then
     return HOLDS_ITS_TARGET
-  end
-
-  if si_props ["item.node.direction"] ~= "input" then
-    return nil
-  end
-
-  -- A capture stream and a target that is also an input and records
-  -- nothing itself: the target is a sink and what would be linked are
-  -- its monitor ports.
-  if not capture_capable (target_props) then
-    return target_props ["item.node.direction"] == "input" and
-        "a sink's monitor ports" or "a node that is not a source"
-  end
-
-  if not granted (client, "microphone") then
-    return "a source, without the microphone grant"
   end
 
   return nil
@@ -232,7 +232,12 @@ SimpleEventHook {
       event:set_data ("target", nil)
       -- Told, as stock tells a stream it turns away from a held target;
       -- the other refusals leave a stream that may yet be linked elsewhere.
-      if why == HOLDS_ITS_TARGET then
+      -- Once per session item, kept in its flags as link-target keeps
+      -- `was_handled`: every rescan selects the stream again.
+      if why == HOLDS_ITS_TARGET and not si_flags.told_it_holds_its_target then
+        si_flags.told_it_holds_its_target = true
+        log:info (si, "telling the client of " ..
+            tostring (si_props ["node.name"]) .. " it needs the exclusive grant")
         lutils.sendClientError (event, si:get_associated_proxy ("node"),
             EPERM, "bubbler: holding a device for one stream needs the " ..
             "exclusive grant")

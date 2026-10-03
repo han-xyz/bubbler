@@ -3522,7 +3522,90 @@ fn a_host_stream_plays_after_a_pulse_clients_stream_asked_for_the_sink_alone() {
         ended.is_some_and(|status| !status.success()),
         "pacat was not told its stream failed: {ended:?}"
     );
-    assert!(!wireplumber_log(&bed).contains(HELD_EXCLUSIVELY));
+    let log = wireplumber_log(&bed);
+    assert!(
+        refusals_of(&log, "holder").any(|line| line.ends_with(HOLDS_ITS_TARGET)),
+        "the hook did not refuse the pulse client's stream for holding the sink:\n{log}"
+    );
+    assert!(!log.contains(HELD_EXCLUSIVELY));
+}
+
+/// The reason the hook logs for a stream refused for holding its target.
+const HOLDS_ITS_TARGET: &str = "without the exclusive grant";
+
+/// The hook's lines refusing the stream `name` a link.
+fn refusals_of<'a>(log: &'a str, name: &str) -> impl Iterator<Item = &'a str> {
+    let refusing = format!("refusing {name} (client");
+    log.lines().filter(move |line| line.contains(&refusing))
+}
+
+/// A playback context's capture stream that asks for its source alone is
+/// refused for the missing microphone grant, which granting `exclusive`
+/// would not lift, and is not told it needs `exclusive`.
+#[test]
+fn a_playback_contexts_capture_stream_asking_for_the_source_alone_is_refused_the_source() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let told = bed.dir().join("recorder.log");
+    let _recorder = Streaming(bed.spawn_in_context_logged(
+        PLAYBACK,
+        "pw-cat -r -a -P '{ node.name = recorder, node.exclusive = true }' /dev/null",
+        Some(&told),
+    ));
+    let mut log = String::new();
+    wait_for("the hook refusing the recorder", || {
+        log = wireplumber_log(&bed);
+        refusals_of(&log, "recorder").next().is_some()
+    });
+    let refusals: Vec<&str> = refusals_of(&log, "recorder").collect();
+    assert!(
+        refusals
+            .iter()
+            .all(|line| line.ends_with("a source, without the microphone grant")),
+        "the recorder was refused for something else:\n{refusals:#?}"
+    );
+    let said = std::fs::read_to_string(&told).unwrap_or_default();
+    assert!(
+        !said.contains("needs the exclusive grant"),
+        "the recorder's client was told it needs exclusive:\n{said}"
+    );
+}
+
+/// A stream refused for holding its target is told so once: a rescan
+/// after it refuses it again and tells it nothing more.
+#[test]
+fn a_contexts_stream_refused_for_holding_the_sink_is_told_once() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let Some(fixture) = changes_its_properties(&bed) else {
+        return;
+    };
+    let _holder = Streaming(bed.spawn_in_context(
+        PLAYBACK,
+        &format!(
+            "'{}' out '{{ media.class = Stream/Output/Audio, node.name = holder, \
+             node.exclusive = true }}' '{{ media.name = holder }}'",
+            fixture.display()
+        ),
+    ));
+    wait_for("the hook refusing the holder", || {
+        refusals_of(&wireplumber_log(&bed), "holder")
+            .next()
+            .is_some()
+    });
+    let _host = host_stream_on_the_sink(&bed);
+    let mut log = String::new();
+    wait_for("the hook refusing the holder on a later rescan", || {
+        log = wireplumber_log(&bed);
+        refusals_of(&log, "holder").count() >= 2
+    });
+    assert_eq!(
+        log.matches("telling the client of holder").count(),
+        1,
+        "the holder's client was not told exactly once:\n{log}"
+    );
 }
 
 /// A playback context's stream that asks for the sink alone only once it
