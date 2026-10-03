@@ -643,8 +643,9 @@ target or one of your smart filters, and your streams are linked as if it
 did not exist, also when a sandbox's stream later changes its own
 properties into a sink's or a filter's. A stream of yours pinned to a
 device by name is linked to that device even where a sandbox's node,
-stream or not, carries the same name; one pinned to the name of another
-of your streams is not covered. The sandbox's node stays, unlinked, with
+stream or not, carries that name as its `node.name`, `object.path` or
+`node.nick`; one pinned to the name of another of your streams is not
+covered. The sandbox's node stays, unlinked, with
 no error to its application. A loopback or filter inside a sandbox (`pw-loopback`, for
 one) plays nothing: its stream
 carries a link group, which a stream needs only as half of a filter. What

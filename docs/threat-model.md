@@ -947,15 +947,21 @@ that device when the sandbox's stream is the older of the two — measured:
 the host stream, refused the sandbox's stream, was left with no link at
 all, 20 of 20 times for a playback stream pinned to a sink, a recorder
 pinned to a source, with and without `node.dont-fallback`, and 10 of 10 by
-`object.path`. So a sandbox's stream also has no session item while its
-`node.name` or `object.path` — by its current properties, or by its
-session item's, which WirePlumber froze when it made the item and which
-the search reads — is that of a session item that no sandbox owns and that
-is no stream; the same two places apply it, `node-added` for a stream
-that comes after the device and the rescans for one that came before.
-With it, every one of those cases linked the host stream to the device;
-a stream created under a device's name and renamed a second later took
-the host stream 10 of 10 times while only its current name was compared.
+`object.path`. That search matches the pinned value against either key
+of each candidate, so a sandbox's `node.name` equal to a device's
+`object.path`, or the reverse, shadows the device as well (measured: the
+host stream left unlinked in both, copy first), and a role-based
+loopback's preferred target (`linking/find-media-role-sink-target.lua`)
+is looked up by `node.name`, then by `node.nick`. So a sandbox's stream
+also has no session item while any of its `node.name`, `object.path` and
+`node.nick` — by its current properties, or by its session item's, which
+WirePlumber froze when it made the item and which the search reads —
+equals any of the three of a session item that is no stream and that no
+sandbox owns; the same two places apply it, `node-added` for a stream that comes after the
+device and the rescans for one that came before. With it, every one of
+those cases linked the host stream to the device; a stream created under
+a device's name and renamed a second later took the host stream 10 of 10
+times while only its current name was compared.
 A sandbox's stream that loses its item this way plays or records nothing
 until it is opened again, also after the device leaves.
 Measured in the test bed over 200 host streams, each started as soon as a
@@ -1174,6 +1180,7 @@ the hook, each new link destroyed in turn.
 `a_host_recorder_does_not_record_from_a_source_a_playback_context_offers`,
 `a_host_stream_pinned_to_a_device_whose_name_a_context_copies_links_to_the_device`,
 `a_host_stream_pinned_to_a_device_whose_name_a_contexts_stream_copies_links_to_the_device`,
+`a_host_stream_pinned_to_a_device_links_to_it_beside_a_contexts_renamed_stream`,
 `a_host_stream_keeps_to_the_hosts_smart_filter_whatever_filter_a_context_offers`,
 `a_stream_a_context_turns_into_a_smart_filter_takes_no_host_stream`,
 `a_sink_a_context_offered_before_the_session_manager_restarted_is_no_device`,
