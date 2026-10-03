@@ -850,10 +850,10 @@ daemon's side with five properties a policy can match on:
 `pipewire.sec.engine = "org.bubbler"`, `pipewire.sec.app-id = <instance>`,
 `pipewire.sec.instance-id = <run id>`, `pipewire.access = "restricted"`
 (which the daemon turns into `pipewire.access.effective = "restricted"`
-on the client object) and `pipewire.sec.bubbler.audio = "playback"` or
-`"playback,microphone"` — the one property the grant set collapses into,
-`microphone` ORed across `pipewire` and `pulseaudio` and across every
-layer, so a `pulseaudio { microphone }` in one layer widens a bare
+on the client object) and `pipewire.sec.bubbler.audio`, `"playback"`
+followed by `,microphone` and `,devices` where granted — the one property
+the grant set collapses into, each child ORed across `pipewire` and
+`pulseaudio` and across every layer, so a `pulseaudio { microphone }` in one layer widens a bare
 `pipewire` elsewhere in the same config. The grant is a `pipewire.sec.`
 key because the daemon refuses a client every update to such a key, its
 first included (PipeWire 1.6.9, `impl-client.c`
@@ -875,7 +875,10 @@ its own.
 Where the WirePlumber policy drop-in
 (`contrib/wireplumber/50-bubbler.conf`) is installed, it matches that
 engine into one of two permission managers — `bubbler-playback` for a
-bare grant, `bubbler-playback-microphone` for one carrying `microphone`
+bare grant, `bubbler-playback-microphone` for one carrying the word
+`microphone` (an anchored match on the comma-separated word, so
+`playback,microphone,devices` keeps the microphone and `playback,devices`
+does not gain it, both measured in the test bed)
 — each read+execute on the graph and the client's own objects, nothing
 writable, and, in both managers, no permission at all on the metadata
 objects and on the session manager's own client, and read and nothing
@@ -982,6 +985,38 @@ owned by the daemon, stays hidden from a sandbox (below), so a node it
 cannot keep out of the session this way is one it cannot make. A JACK
 client's node under `pw-jack` carries no `media.class` at all (measured),
 so stock WirePlumber makes no session item for it either.
+
+The device grant (`pipewire { devices }`, the word `devices`) lifts that
+for one instance: its nodes that are no stream keep their session items
+and are devices of the session like the host's. A host stream aimed at
+its sink plays into it, a host recorder may record from its source, and
+WirePlumber may make one of them the default (all measured in the test
+bed, the sink made through `client-node` by `pw-cat` and by
+`pw-loopback`). The instance hears whatever is routed into its devices,
+and that is all that flows into them: the hook keeps a link into an
+offered device only where WirePlumber made it from an audio playback
+stream, so a sink's monitor and a source are never linked in, even by a
+session manager (measured: a second session manager's link from the
+sink's monitor was destroyed, its link from the source refused by the
+daemon, a patchbay's link from a stream destroyed). Another sandbox's
+capture stream records from an offered source only under its own
+`microphone`, as from a host source, and another sandbox's stream named
+after an offered device does not take a host stream pinned to it
+(measured). Without `microphone` the instance still sees no source and
+records from none. The grant does not open a factory: `adapter`,
+`spa-node-factory` and the link factory stay hidden from every sandbox,
+with or without it (measured: a device-grant context's `pw-cli create-node adapter` is
+refused with "unknown factory name"). `adapter` takes any SPA factory the daemon
+maps — a host ALSA or V4L2 device among them — and runs the node in the
+daemon, and a node made with `object.linger` carries no owner at all and
+outlives the instance, so nothing could tell it from a host device; the
+devices the grant covers are only nodes the instance runs itself, which
+carry its client id and end with it. An application that makes its
+devices daemon-side (EasyEffects makes its sink and source through
+`adapter`) is not supported under a scoped grant. One security context
+serves both audio nodes, so the private pulse server of a `pulseaudio`
+grant carries the word too; it cannot use it, since it refuses every
+`load-module` and makes no device itself.
 
 That covers the links the session manager makes; a client can also make
 one itself, and node permissions cannot stop it. PipeWire 1.6.8 lets any
@@ -1193,6 +1228,14 @@ the hook, each new link destroyed in turn.
 `a_host_stream_pinned_to_a_device_whose_name_a_contexts_stream_copies_links_to_the_device`,
 `a_host_stream_pinned_to_a_device_links_to_it_beside_a_contexts_renamed_stream`,
 `a_host_stream_keeps_to_the_hosts_smart_filter_whatever_filter_a_context_offers`,
+`a_devices_context_reaches_the_microphone_only_with_the_microphone_grant`,
+`a_host_stream_plays_into_a_sink_a_devices_context_makes_with_pw_cat`,
+`a_host_stream_plays_through_a_loopback_a_devices_context_makes`,
+`a_sink_a_devices_context_offers_may_become_the_default`,
+`a_host_recorder_records_from_a_source_a_devices_context_offers`,
+`only_a_session_managers_link_from_a_stream_into_a_devices_sink_is_kept`,
+`a_host_stream_pinned_to_a_devices_contexts_sink_links_to_it_beside_another_contexts_copy`,
+`a_context_creates_nodes_only_as_its_own_streams`,
 `a_stream_a_context_turns_into_a_smart_filter_takes_no_host_stream`,
 `a_sink_a_context_offered_before_the_session_manager_restarted_is_no_device`,
 `a_session_managers_link_into_a_capture_stream_is_kept_only_where_the_grant_allows`,

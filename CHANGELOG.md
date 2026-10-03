@@ -26,6 +26,10 @@
 
 ### Added
 
+- `pipewire { devices }` lets an instance offer audio devices: the sinks and
+  sources it makes through its own connection are treated like the host's, so
+  host streams may play into them and one may become the default; `bubbler
+  lint` notes `audio-devices-offered`.
 - `--explain=full` lists every call the application's seccomp filter answers
   with an errno, and `userns-disabled-with-nested-sandbox` says the mount API
   a nested sandbox needs is denied too.

@@ -505,6 +505,7 @@ file order does not affect the generated argv.
     dri kms=#true                    #   also the card nodes and their sysfs
     pipewire                         # $XDG_RUNTIME_DIR/pipewire-0, playback only
     pipewire { microphone }          #   also every microphone and line-in
+    pipewire { devices }             #   its own sinks and sources as devices
     pulseaudio                       # $XDG_RUNTIME_DIR/pulse/native, sets
                                      #   PULSE_SERVER; playback only
     pulseaudio { microphone }        #   also every microphone and line-in
@@ -629,6 +630,23 @@ Bare, either grant is playback only. `microphone` on either node —
 `pipewire { microphone }`, `pulseaudio { microphone }` — adds capture: the
 grant is per instance, ORed into one set across both nodes and every
 layer, so a `microphone` on one widens the other in the same config too.
+`devices`, on `pipewire` only (`pipewire { devices }`,
+`pipewire { microphone; devices }`; under `pulseaudio` it is a config
+error naming `pipewire { devices }`), is for an application that exists to
+offer audio devices, a virtual sink or an effects chain: the sinks and
+sources the instance makes are devices of the session like yours, so your
+streams may be linked to them, your recorders may record from its
+sources, and one of them may become the default. The instance hears
+whatever is routed into the devices it offers, and nothing else flows
+into them: no source and no sink's monitor. Microphones stay behind
+`microphone`. The pulse server of a `pulseaudio` grant shares the
+instance's context and so carries `devices` too, and cannot use it.
+Two kinds of application are not supported under a scoped grant, with or
+without `devices`: one that connects its own ports (a JACK client under
+`pw-jack`), since the link factory stays hidden from every sandbox, and
+one that makes its devices inside the PipeWire daemon (EasyEffects makes
+its sink and source through the `adapter` factory), since `adapter` stays
+hidden too.
 What scopes a bare grant to playback is bubbler's WirePlumber policy
 installed on the host, not the socket — the drop-in and the linking hook
 it loads, see "Installing" below — and without the drop-in a sandbox
@@ -3136,7 +3154,9 @@ repeatable node — `home-share`, `path-share`, `etc-share`, `app-runtime`,
 of one block),
 `pipewire-microphone` (a `microphone` child on `pipewire` or `pulseaudio`,
 which adds every microphone and line-in the session has, and capture from
-them).
+them), `audio-devices-offered` (a `devices` child on `pipewire`: the
+instance hears whatever is routed into the devices it offers, and one of
+them may become the default).
 
 A warning or a note is accepted with a `lint-allow` node, which takes a check
 id and a required reason:
