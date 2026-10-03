@@ -110,10 +110,11 @@ pub struct Redirect {
 /// outlives the commands sent into it.
 ///
 /// With `truncate`, nothing is copied until the run says which it turned
-/// out to be — [`Redirect::started`] or [`Redirect::joined`] — or the
-/// redirect is dropped, which empties the log as asked: a start that
-/// loses the race to another start of the instance joins that one, and
-/// must not empty the log it is writing. Until then what is written
+/// out to be — [`Redirect::started`], [`Redirect::joined`] or
+/// [`Redirect::not_started`] — or the redirect is dropped, which empties
+/// the log as asked: a start that loses the race to another start of the
+/// instance, or is stopped while it waits on that one, must not empty the
+/// log it is writing. Until then what is written
 /// waits in the pipe, which holds far more than a start says before
 /// its bind.
 ///
@@ -189,6 +190,12 @@ impl Redirect {
     /// This run joined one that is already up: what it writes is added
     /// to that run's log.
     pub fn joined(&self) {
+        self.settle_on(false);
+    }
+
+    /// This run ended without starting the sandbox: what it wrote is
+    /// added to the log, which may be the one a running start is writing.
+    pub fn not_started(&self) {
         self.settle_on(false);
     }
 

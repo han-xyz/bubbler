@@ -5976,6 +5976,63 @@ fn two_starts_released_together_both_run_in_one_sandbox() {
     assert!(log.contains("executing inside it"), "{log}");
 }
 
+/// A start stopped while it waits on the lock of a start that is running
+/// adds to that run's log rather than emptying it.
+#[test]
+fn a_start_stopped_while_it_waits_on_the_lock_keeps_the_running_log() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["create", "waiting"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let log_path = tmp
+        .path()
+        .join("data/bubbler/instances/waiting/last-run.log");
+    let earlier = "what the running start has written so far\n";
+    std::fs::write(&log_path, earlier).unwrap();
+    std::fs::create_dir_all(tmp.path().join("run/bubbler")).unwrap();
+    let lock_path = tmp.path().join("run/bubbler/waiting@start.lock");
+    let held = std::fs::File::create(&lock_path).unwrap();
+    flock(&held, FlockOperation::LockExclusive).unwrap();
+    let run = bubbler_live(tmp.path(), &init)
+        .args(["run", "waiting", "--", "/usr/bin/true"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let waited = wait_until(
+        || {
+            std::fs::read_dir(format!("/proc/{}/fd", run.id()))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|p| p == lock_path))
+        },
+        Duration::from_secs(4),
+    );
+    let _ = kill_process(Pid::from_child(&run), Signal::TERM);
+    let out = run.wait_with_output().unwrap();
+    drop(held);
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    bubbler_live(tmp.path(), &init)
+        .args(["delete", "waiting", "--yes"])
+        .status()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(waited, "the start never waited on the lock: {said}");
+    assert_eq!(out.status.code(), Some(143), "{said}");
+    assert!(log.starts_with(earlier), "the log was emptied: {log:?}");
+}
+
 /// Ctrl-C at a terminal goes to the whole foreground process group, so
 /// the sidecar being waited on dies of it too: the run still ends as
 /// stopped, not as a sidecar that failed. The pulse server's bwrap is a

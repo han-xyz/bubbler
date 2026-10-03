@@ -3667,7 +3667,9 @@ fn wait_relaying(
 ///
 /// `log` is the run's log, if it has one: it is told the run
 /// [started](run_log::Redirect::started) the sandbox once the control
-/// socket is bound, which a start that lost a race never gets to.
+/// socket is bound, and otherwise that it
+/// [did not](run_log::Redirect::not_started), since another start may be
+/// writing to it.
 ///
 /// Marks every descriptor of the calling process above stdio that this
 /// spawn is not meant to hand over close-on-exec, so an embedder's own
@@ -3677,6 +3679,22 @@ fn wait_relaying(
 /// what was started is stopped and removed, and the code is the one a
 /// run stopped by that signal gives.
 pub fn run(
+    env: &Env,
+    inst: &Instance,
+    command: Option<&[OsString]>,
+    mode: TtyMode,
+    log: Option<&run_log::Redirect>,
+) -> Result<i32, LaunchError> {
+    let ended = start_run(env, inst, command, mode, log);
+    // A no-op after `started`, whose answer is the one that counts.
+    if let Some(log) = log {
+        log.not_started();
+    }
+    ended
+}
+
+/// [`run`] up to telling `log` the run did not start the sandbox.
+fn start_run(
     env: &Env,
     inst: &Instance,
     command: Option<&[OsString]>,
