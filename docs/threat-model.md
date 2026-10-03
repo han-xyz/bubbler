@@ -939,7 +939,25 @@ no error and hears nothing through it. A sandbox's stream that carries a
 link group loses its session item too, so a loopback or filter run
 inside a sandbox — `pw-loopback` (measured), or another that pairs its
 nodes by a link group — plays nothing; a plain stream carries no link
-group.
+group. WirePlumber resolves a stream pinned by name
+(`linking/find-defined-target.lua`) over every session item, streams
+included, so a sandbox's plain stream with the `node.name` or
+`object.path` of a host device would be picked for a host stream pinned to
+that device when the sandbox's stream is the older of the two — measured:
+the host stream, refused the sandbox's stream, was left with no link at
+all, 20 of 20 times for a playback stream pinned to a sink, a recorder
+pinned to a source, with and without `node.dont-fallback`, and 10 of 10 by
+`object.path`. So a sandbox's stream also has no session item while its
+`node.name` or `object.path` — by its current properties, or by its
+session item's, which WirePlumber froze when it made the item and which
+the search reads — is that of a session item that no sandbox owns and that
+is no stream; the same two places apply it, `node-added` for a stream
+that comes after the device and the rescans for one that came before.
+With it, every one of those cases linked the host stream to the device;
+a stream created under a device's name and renamed a second later took
+the host stream 10 of 10 times while only its current name was compared.
+A sandbox's stream that loses its item this way plays or records nothing
+until it is opened again, also after the device leaves.
 Measured in the test bed over 200 host streams, each started as soon as a
 fresh sandbox's node appeared — a sink ranked above the host's, the same
 sink named as the stream's target, a smart filter, and a sink named after
@@ -1107,7 +1125,21 @@ in that window can be aimed at it — refused by the link check once the
 client is known, a link already made destroyed then. The bed never
 produced that order (20 restarts, the client known at `node-added` each
 time); with the `node-added` half of the hook removed, the rescan half
-alone kept the sink out in 10 of 10 restarts. `fallback-sink.lua`, off in
+alone kept the sink out in 10 of 10 restarts. A host stream pinned by
+name before the device it names exists can be aimed at a sandbox's stream
+of that name and is then refused and left silent; it is chosen again in
+the rescan the device's arrival starts, which removes the sandbox's
+stream first (measured: linked to the device within 250 ms of the
+device's start, 20 of 20, with and without `node.dont-fallback`). A
+stream pinned by name to another host *stream* is left alone: two
+instances of one application commonly share a stream name, so a
+sandbox's stream named like a host stream can still be picked for it, and
+the host stream is then refused and plays nowhere. A change of the
+host's `node.features.audio.*` settings has WirePlumber reconfigure every
+session item it made (`node/create-item.lua`, `reconfigureAudioAdapters`)
+and register again the items the hook removed, until the rescan that
+follows removes them again; a host stream started in that window can be
+aimed at one and is refused. `fallback-sink.lua`, off in
 the stock configuration, counts `Audio/Sink` nodes rather than session
 items: where a user enables it, a sandbox's sink on a host with no other
 sink keeps its "Dummy Output" from appearing. The playback
@@ -1141,6 +1173,7 @@ the hook, each new link destroyed in turn.
 `a_host_stream_passes_by_a_smart_filter_a_playback_context_offers`,
 `a_host_recorder_does_not_record_from_a_source_a_playback_context_offers`,
 `a_host_stream_pinned_to_a_device_whose_name_a_context_copies_links_to_the_device`,
+`a_host_stream_pinned_to_a_device_whose_name_a_contexts_stream_copies_links_to_the_device`,
 `a_host_stream_keeps_to_the_hosts_smart_filter_whatever_filter_a_context_offers`,
 `a_stream_a_context_turns_into_a_smart_filter_takes_no_host_stream`,
 `a_sink_a_context_offered_before_the_session_manager_restarted_is_no_device`,

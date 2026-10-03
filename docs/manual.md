@@ -640,10 +640,12 @@ as WirePlumber would link it, one you draw in a patchbay included. A sandbox
 offers no audio device: a sink, source or filter it creates through its own
 connection stays out of WirePlumber's session, so it is never a default, a
 target or one of your smart filters, and your streams are linked as if it
-did not exist — one pinned to a device whose name the sandbox copies
-included, and one a sandbox's stream turns into later by changing its own
-properties. The sandbox's node stays, unlinked, with no error to its
-application. A loopback or filter inside a sandbox (`pw-loopback`, for
+did not exist, also when a sandbox's stream later changes its own
+properties into a sink's or a filter's. A stream of yours pinned to a
+device by name is linked to that device even where a sandbox's node,
+stream or not, carries the same name; one pinned to the name of another
+of your streams is not covered. The sandbox's node stays, unlinked, with
+no error to its application. A loopback or filter inside a sandbox (`pw-loopback`, for
 one) plays nothing: its stream
 carries a link group, which a stream needs only as half of a filter. What
 this does not cover is listed under
