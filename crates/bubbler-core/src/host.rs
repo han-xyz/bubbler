@@ -1,5 +1,5 @@
 //! Host filesystem inspection behind a trait so builder and services can
-//! be tested against a fake tree.
+//! be tested against a fake tree, and whether a host process is alive.
 
 use std::ffi::OsString;
 use std::fs::{self, FileType};
