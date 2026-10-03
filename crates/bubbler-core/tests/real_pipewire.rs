@@ -2395,15 +2395,28 @@ fn host_stream(bed: &PipeWireBed, args: &[&str]) -> Streaming {
 /// sandbox in the graph (measured on 0.5.18), so the link does not last.
 #[test]
 fn a_host_stream_pinned_to_a_device_whose_name_a_context_copies_links_to_the_device() {
+    a_host_stream_pinned_to_a_device_links_to_it_beside(
+        "pw-cat -r -a -P '{ media.class = Audio/Sink, node.name = bed-headset }' /dev/null",
+    );
+}
+
+/// The same with a capture stream as the copy: WirePlumber resolves a
+/// pinned name over streams too (linking/find-defined-target.lua).
+#[test]
+fn a_host_stream_pinned_to_a_device_whose_name_a_contexts_stream_copies_links_to_the_device() {
+    a_host_stream_pinned_to_a_device_links_to_it_beside(
+        "pw-cat -r -a -P '{ node.name = bed-headset }' /dev/null",
+    );
+}
+
+/// A host stream pinned to the host's mono sink `bed-headset` is linked to
+/// it beside `copy`, a node a context names `bed-headset`, whichever of
+/// the two came first.
+fn a_host_stream_pinned_to_a_device_links_to_it_beside(copy: &str) {
     let Some(bed) = PipeWireBed::start() else {
         return;
     };
-    let copy = || {
-        Streaming(bed.spawn_in_context(
-            PLAYBACK,
-            "pw-cat -r -a -P '{ media.class = Audio/Sink, node.name = bed-headset }' /dev/null",
-        ))
-    };
+    let copy = || Streaming(bed.spawn_in_context(PLAYBACK, copy));
     let device = || {
         host_stream(
             &bed,
@@ -2455,7 +2468,9 @@ fn a_host_stream_pinned_to_a_device_whose_name_a_context_copies_links_to_the_dev
         std::thread::sleep(FORBIDDEN_LINK_LIFE);
         let seen = watched.seen();
         assert!(
-            !seen.contains("|-> bed-headset:playback_F"),
+            seen.lines()
+                .filter(|line| line.contains("|-> bed-headset:"))
+                .all(|line| line.contains("bed-headset:playback_MONO")),
             "a pinned host stream was linked to a context's copy of its device \
              (copy first: {copy_first}):\n{seen}"
         );

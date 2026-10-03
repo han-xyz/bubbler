@@ -45,9 +45,10 @@
 -- `Audio/Source*` or `Audio/Duplex` node, and only where the instance
 -- was granted `microphone`; and the sandbox links nothing itself.
 --
--- A sandbox offers no device: its nodes that are not plain audio streams
--- keep no session item, so WirePlumber links no other client's stream to
--- them and makes none of them a default or a filter. WirePlumber links
+-- A sandbox offers no device: its nodes that are not plain audio streams,
+-- and its streams named after a host device, keep no session item, so
+-- WirePlumber links no other client's stream to them and makes none of
+-- them a default or a filter. WirePlumber links
 -- no other client's stream to a sandbox's stream either.
 --
 -- A link with a sandbox's node at either end is destroyed when
@@ -185,11 +186,37 @@ local function offers_devices (client)
   return ("," .. grant .. ","):find (",devices,", 1, true) ~= nil
 end
 
+-- Whether a session item of the host's that is no stream — a device or a
+-- filter — has a `node.name` or `object.path` among those of `props_list`.
+-- A stream pinned to that name would otherwise be aimed at whichever of the
+-- two linking/find-defined-target meets first, streams included. A host
+-- stream of the same name is left alone: two instances of one application
+-- commonly share one.
+local function shadows_a_host_device (source, props_list)
+  for si in source:call ("get-object-manager", "session-item"):iterate {
+      type = "SiLinkable" } do
+    local host = si.properties
+    if not (host ["media.class"] or ""):find ("^Stream/") and
+        not bubbler_client (source, host ["client.id"]) then
+      for _, props in ipairs (props_list) do
+        for _, key in ipairs { "node.name", "object.path" } do
+          if props [key] ~= nil and props [key] == host [key] then
+            return true
+          end
+        end
+      end
+    end
+  end
+  return false
+end
+
 -- Whether a node with these properties, as they stand now, is kept out of
 -- the session: a node of a sandbox without the device grant that is not a
--- plain audio stream. A stream carries a link group only as one half of a
--- filter.
-local function kept_from_the_session (source, node_props)
+-- plain audio stream, or that is named after a device of the host's.
+-- `item_props`, where the node has a session item, are what the finders
+-- read: frozen at the item's creation. A stream carries a link group only
+-- as one half of a filter.
+local function kept_from_the_session (source, node_props, item_props)
   local client = bubbler_client (source, node_props ["client.id"])
   if not client or offers_devices (client) then
     return false
@@ -197,7 +224,8 @@ local function kept_from_the_session (source, node_props)
   local class = node_props ["media.class"]
   return (class ~= AUDIO_STREAM_CLASS.output and
       class ~= AUDIO_STREAM_CLASS.input) or
-      node_props ["node.link-group"] ~= nil
+      node_props ["node.link-group"] ~= nil or
+      shadows_a_host_device (source, { node_props, item_props })
 end
 
 -- A sandbox offers no device: of its nodes only its plain audio streams
@@ -222,7 +250,8 @@ SimpleEventHook {
       return
     end
     log:info (node, string.format ("%s (client %s, %s) is no device of " ..
-        "the session: not a plain audio stream of a sandbox",
+        "the session: not a plain audio stream of a sandbox, or named " ..
+        "after a host device",
         tostring (node.properties ["node.name"]),
         tostring (node.properties ["client.id"]),
         tostring (node.properties ["media.class"])))
@@ -234,7 +263,8 @@ SimpleEventHook {
 -- reached node-added before WirePlumber knew its client (after a
 -- WirePlumber restart the node is already in the graph), and a stream
 -- that has since changed its own properties into a filter's (a client
--- may, and no event follows). Default-node selection and the filter chain
+-- may, and no event follows), or a stream older than the host device it
+-- is named after (a headset that reconnects). Default-node selection and the filter chain
 -- are rebuilt only in these two rescans and read the node's current
 -- properties there (default-nodes/rescan.lua, lib/filter-utils.lua
 -- rescanFilters), so removing the item first keeps the node out of both.
@@ -256,13 +286,15 @@ SimpleEventHook {
     for si in source:call ("get-object-manager", "session-item"):iterate {
         type = "SiLinkable" } do
       local node = si:get_associated_proxy ("node")
-      if node and kept_from_the_session (source, node.properties) then
+      if node and kept_from_the_session (source, node.properties,
+          si.properties) then
         table.insert (kept, si)
       end
     end
     for _, si in ipairs (kept) do
       log:info (si, string.format ("removing the session item of %s " ..
-          "(client %s): not a plain audio stream of a sandbox",
+          "(client %s): not a plain audio stream of a sandbox, or named " ..
+          "after a host device",
           tostring (si.properties ["node.name"]),
           tostring (si.properties ["client.id"])))
       si:remove ()
