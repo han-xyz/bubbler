@@ -912,9 +912,15 @@ a stream was refused after `linking/prepare-link` and played nowhere:
 while a playback sandbox offered a smart filter, every host stream that
 started was left unlinked, and so was one aimed at a sink it offered
 (both measured). A hook after every finder and before
-`linking/prepare-link` now hands such a stream the session's default
-instead, which is never a sandbox's node (both measured: the stream
-plays on the bed's sink).
+`linking/prepare-link` now hands such a stream what it would get without
+the sandbox's node — what a sandbox's filter stood in front of, else the
+session's default, which is never a sandbox's node — through the host's
+own smart filters as `linking/get-filter-from-target` would have put it
+(both measured: the stream plays on the bed's sink, or through the host's
+filter in front of it). A stream pinned with `node.dont-fallback` to a
+target that is only a sandbox's gets no link, as
+`linking/find-defined-target` leaves one whose target is missing
+(measured: before, it was moved to the default).
 
 That covers the links the session manager makes; a client can also make
 one itself, and node permissions cannot stop it. PipeWire 1.6.8 lets any
@@ -950,11 +956,15 @@ factory — so no request of the sandbox's meets a readable factory: 0 in
 1400 attempts under the same load. Behind that, any link with a node of
 an `org.bubbler` client at either end is destroyed when WirePlumber sees
 it, whoever made it and whether or not its maker is still connected,
-unless WirePlumber made it and it is one of that client's own streams in
-the stream's own direction: a `Stream/Output/Audio` as the link's
-output, a `Stream/Input/Audio` as its input. The other end is not
-checked there: a link WirePlumber makes outside the linking hooks is
-kept whatever it reaches. "WirePlumber" is any
+unless WirePlumber made it and the linking hooks would have let it: one
+of that client's own streams in the stream's own direction (a
+`Stream/Output/Audio` as the link's output, a `Stream/Input/Audio` as
+its input), and where the other end is the host's, a playback stream
+into anything but another client's stream, a capture stream from a
+source and only with the `microphone` grant (measured with a second
+session manager's links: the sink's monitor and another client's stream
+into a playback sandbox's capture stream destroyed, a source into a
+microphone sandbox's kept). "WirePlumber" is any
 instance of it, so a split setup's instances keep each other's links:
 the link's creator is a client carrying `wireplumber.daemon = "true"`
 and no `pipewire.sec.engine`. Any client may set the first on itself,
@@ -1047,7 +1057,13 @@ the portal's own fd crossing and permission store, never through a
 Known gaps, with both files installed. A factory loaded into the daemon
 after a sandbox connected — a module loaded later — keeps that client's
 default permissions and is readable by it: the hook hides factories once,
-when the client's access is decided. Hiding `Audio/Duplex` from a
+when the client's access is decided. (A sandbox connected before
+WirePlumber starts has them hidden all the same, measured.) The playback
+grant protects what a sandbox can hear and record, not the availability
+of host audio: a playback sandbox's own stream can take the default sink
+exclusively (`node.exclusive`, passthrough), and WirePlumber then drops
+new host streams aimed at it; whether sandboxes may use exclusive or
+passthrough output is to be decided in 0.25.0. Hiding `Audio/Duplex` from a
 playback sandbox also keeps it from playing into a duplex device, such as
 the single node of an ALSA pro-audio profile; that takes the `microphone`
 grant. A patchbay that re-creates a link the hook destroyed loops against
@@ -1063,6 +1079,12 @@ the hook, each new link destroyed in turn.
 `real_bwrap_pipewire_context_tags_the_client`,
 `real_bwrap_pulseaudio_serves_a_private_server`,
 `a_playback_context_sees_no_source_no_metadata_and_only_reads_streams`,
+`a_playback_context_that_claims_the_microphone_gets_the_playback_grant`,
+`a_playback_context_cannot_nest_a_context_that_claims_the_microphone`,
+`a_pinned_host_stream_does_not_fall_back_from_a_sink_a_context_names_after_its_device`,
+`a_host_stream_aimed_at_a_sink_a_context_offers_passes_through_the_hosts_filter`,
+`a_session_managers_link_into_a_capture_stream_is_kept_only_where_the_grant_allows`,
+`a_context_connected_before_the_session_manager_cannot_see_the_link_factory`,
 `a_playback_capture_stream_gets_no_link`,
 `a_playback_output_stream_links_to_the_sink`,
 `a_microphone_context_captures_from_the_null_source`,

@@ -620,10 +620,12 @@ reaches every node the config did not ask for, while without the hook the
 grant is scoped and every other client's audio stays recordable.
 The hook also keeps a sandbox from linking anything itself, and destroys
 any link to or from a sandbox's node that is not one of its own streams
-as WirePlumber linked it, one you draw in a patchbay included. A sink,
+as WirePlumber would link it, one you draw in a patchbay included. A sink,
 source or filter a sandbox offers through its own connection is never made
 the default and no host stream is linked to it: a host stream aimed at one
-plays on the default instead. What this does not cover is listed under
+plays where it would without it — on the default, through your own smart
+filters — and one pinned to it with `node.dont-fallback` gets no link, as
+with its device missing. What this does not cover is listed under
 "Audio" in `docs/threat-model.md`. Before 0.24.2 a sandbox could still win
 a link of its own in the first instant of a new connection, now and then,
 and keep it, and
@@ -3044,11 +3046,11 @@ hidden),
 GNOME shell compositor's own name, the session's file manager, or the Secret
 Service — with the one sentence a reader needs about what the name is),
 `audio-policy-missing` (a `pipewire` or `pulseaudio` grant with part of
-bubbler's WirePlumber policy not installed: the drop-in in none of
-`/usr/share/wireplumber/wireplumber.conf.d/`,
-`/etc/wireplumber/wireplumber.conf.d/` or
-`$XDG_CONFIG_HOME/wireplumber/wireplumber.conf.d/`, or the hook script in
-no `wireplumber/scripts/` under `$XDG_DATA_HOME`, `$XDG_DATA_DIRS` or
+bubbler's WirePlumber policy not installed, or installed where WirePlumber
+cannot read it: the drop-in in no `wireplumber/wireplumber.conf.d/` under
+`$XDG_CONFIG_HOME`, `$XDG_CONFIG_DIRS` (`/etc/xdg`), `/etc`,
+`$XDG_DATA_DIRS` or `/usr/share`, or the hook script in no
+`wireplumber/scripts/` under `$XDG_DATA_HOME`, `$XDG_DATA_DIRS` or
 `/usr/share`. Without the drop-in the sandbox's audio grant is full
 access to every PipeWire node instead of what the grant asks for,
 microphone and every other client's audio included; without the hook the
@@ -3056,8 +3058,9 @@ grant is scoped and every other client's audio stays recordable. The
 finding names the half that is missing and the `bubbler audio-policy
 --print` or `--print --script` that writes it, then restart
 WirePlumber),
-`audio-policy-differs` (the whole policy installed but a copy WirePlumber
-loads is not the one this bubbler embeds — an older bubbler's, under which
+`audio-policy-differs` (a copy WirePlumber loads is not the one this
+bubbler embeds, reported beside `audio-policy-missing` where the other half
+is absent — an older bubbler's, under which
 a sandbox can claim the microphone grant for itself, or one you edited.
 The finding names each such file and what writes it again; accept an
 edit made on purpose with `lint-allow "audio-policy-differs"
@@ -4267,12 +4270,12 @@ WirePlumber restarted:
         ~/.local/share/wireplumber/scripts/bubbler/refuse-links.lua
     systemctl --user restart wireplumber
 
-The drop-in also goes in `/usr/share/wireplumber/wireplumber.conf.d/` or
-`/etc/wireplumber/wireplumber.conf.d/` — the three places `bubbler lint`
-names. The hook goes in a *data* directory rather than a config one, so
-its system-wide home is `/usr/share/wireplumber/scripts/bubbler/` and
-never `/etc`: a script is found by `$XDG_DATA_HOME`, `$XDG_DATA_DIRS`
-and `/usr/share`. Without the drop-in a `pipewire` or `pulseaudio` grant
+The drop-in also goes in the `wireplumber/wireplumber.conf.d/` of
+`/etc/xdg`, `/etc`, `/usr/local/share` or `/usr/share` — WirePlumber's
+configuration search, which `bubbler lint` names. The hook goes in a
+*data* directory rather than a config one, so its system-wide home is
+`/usr/share/wireplumber/scripts/bubbler/` and never `/etc`: a script is
+found by `$XDG_DATA_HOME`, `$XDG_DATA_DIRS` and `/usr/share`. Without the drop-in a `pipewire` or `pulseaudio` grant
 reaches every PipeWire node instead of what it asks for; without the
 hook beside it the grant is scoped but a sandbox can still record the
 sink's monitor ports, which carry every other application's audio. A run

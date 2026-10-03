@@ -62,8 +62,11 @@
   `audio-policy-differs`, when the installed drop-in or hook WirePlumber
   loads is not its own, naming the file and what writes it again. A copy
   edited on purpose is accepted per config with
-  `lint-allow "audio-policy-differs" reason="..."`. The same reinstall and
-  restart applies.
+  `lint-allow "audio-policy-differs" reason="..."`. The check now follows
+  WirePlumber's own search (`/etc/xdg`, `$XDG_CONFIG_DIRS`,
+  `$XDG_DATA_DIRS` included), so a stale copy that outranks the packaged
+  one is found, and a copy WirePlumber cannot read counts as missing. The
+  same reinstall and restart applies.
 - Without the `microphone` grant a sandbox could still see every source
   that is not exactly `Audio/Source`: `Audio/Source/Virtual` (echo-cancel,
   noise suppression) and `Audio/Duplex` (measured); with the claimed grant
@@ -74,8 +77,9 @@
 - A sandbox with a `pipewire` grant could silence the desktop: while it
   offered a smart filter (`filter.smart`), every host stream that started
   was refused the filter and left unlinked, and so was a host stream aimed
-  at a sink it offered (measured). Such a stream now plays on the session's
-  default.
+  at a sink it offered (measured). Such a stream now plays where it would
+  without the sandbox's node — the default, through the host's own smart
+  filters — and one pinned to it with `node.dont-fallback` gets no link.
 - A sandbox with a `pipewire` grant could create a node the daemon owns
   through the `adapter` factory (measured); made to linger, it carried no
   owner, so no rule of the policy applied to it and it outlived the

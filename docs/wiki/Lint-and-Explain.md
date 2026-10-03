@@ -46,10 +46,10 @@ hidden),
 `dbus-name-is-risky` (a `dbus`/`system-bus` rule naming a name that is
 defensible but wide — KWin's or the GNOME shell's own bus name, the session's
 file manager, or the Secret Service), `audio-policy-missing` (a `pipewire`
-or `pulseaudio` grant with part of the WirePlumber policy not installed: the
-drop-in in none of `/usr/share/wireplumber/wireplumber.conf.d/`,
-`/etc/wireplumber/wireplumber.conf.d/` or
-`$XDG_CONFIG_HOME/wireplumber/wireplumber.conf.d/`, or the hook script in no
+or `pulseaudio` grant with part of the WirePlumber policy not installed or
+unreadable: the drop-in in no `wireplumber/wireplumber.conf.d/` under
+`$XDG_CONFIG_HOME`, `$XDG_CONFIG_DIRS` (`/etc/xdg`), `/etc`,
+`$XDG_DATA_DIRS` or `/usr/share`, or the hook script in no
 `wireplumber/scripts/` under `$XDG_DATA_HOME`, `$XDG_DATA_DIRS` or
 `/usr/share`. Without the drop-in the grant is full access to every PipeWire
 node instead of what it asks for; without the hook it is scoped but every other
