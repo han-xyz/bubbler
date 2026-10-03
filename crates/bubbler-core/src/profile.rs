@@ -3075,6 +3075,7 @@ mod tests {
                 wl_proxy: None,
                 audio_policy: "",
                 net_proxy_log: false,
+                seccomp_log: false,
                 proxy: false,
                 full: false,
                 bwrap: crate::version::Version::Known(0, 12, 0),

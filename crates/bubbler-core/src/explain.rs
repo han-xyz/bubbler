@@ -95,6 +95,10 @@ pub struct View<'a> {
     /// is [`crate::env::Env::net_proxy_log`] and shows in its sidecar
     /// line; nothing else of the explanation depends on it.
     pub net_proxy_log: bool,
+    /// Whether the filter logs instead of denying, which is
+    /// [`crate::env::Env::seccomp_log`] and shows in the filter list
+    /// `full` prints.
+    pub seccomp_log: bool,
     /// What an audio grant's group header ends with:
     /// [`crate::audio_policy::Missing::explain_suffix`] where this host
     /// holds less than the whole policy, else empty. Asked of the host
@@ -550,30 +554,42 @@ fn seccomp_lines(cfg: &SeccompConfig) -> Vec<String> {
 
 /// Every call the application's filter answers with an errno, as the
 /// launcher builds it for this config; empty where the filter is
-/// disabled.
-fn filter_lines(cfg: &InstanceConfig) -> Vec<String> {
+/// disabled. `loaded` is whether the argv carries the compiled program:
+/// a set `compile` found no rule in loads none, the `personality` prefix
+/// included. A name this libseccomp cannot resolve is left out, as
+/// `compile` leaves it out. With `log` every rule writes an audit entry
+/// and lets the call through, so each says `logged` for its errno.
+fn filter_lines(cfg: &InstanceConfig, loaded: bool, log: bool) -> Vec<String> {
     let Some(set) = seccomp::RuleSet::with(&cfg.seccomp, cfg.userns) else {
         return Vec::new();
     };
+    if !loaded {
+        return vec!["none loaded, no rules left: the sandbox runs unfiltered".to_owned()];
+    }
+    let answer = |errno: Errno| match log {
+        true => "logged",
+        false => errno.name(),
+    };
     let named = [(&set.eperm, Errno::Eperm), (&set.enosys, Errno::Enosys)]
         .into_iter()
-        .flat_map(|(names, errno)| names.iter().map(move |n| format!("{n} ({})", errno.name())));
+        .flat_map(|(names, errno)| {
+            names
+                .iter()
+                .filter(|n| seccomp::syscall_number(n).is_some())
+                .map(move |n| format!("{n} ({})", answer(errno)))
+        });
     let numbered = set
         .enosys_numbered
         .iter()
-        .map(|(name, nr, errno)| format!("{name} #{nr} ({})", errno.name()));
-    let ioctls = set.ioctl_eperm.iter().map(|request| {
-        let request = match *request {
-            seccomp::TIOCSTI => "TIOCSTI".to_owned(),
-            seccomp::TIOCLINUX => "TIOCLINUX".to_owned(),
-            other => format!("{other:#x}"),
-        };
-        format!("ioctl {request} ({})", Errno::Eperm.name())
-    });
+        .map(|(name, nr, errno)| format!("{name} #{nr} ({})", answer(*errno)));
+    let ioctls = seccomp::DEFAULT_IOCTL_NAMES
+        .iter()
+        .filter(|(request, _)| set.ioctl_eperm.contains(request))
+        .map(|(_, name)| format!("ioctl {name} ({})", answer(Errno::Eperm)));
     let personality = set.personality.then(|| {
         format!(
-            "personality outside the allowed personas ({})",
-            Errno::Eperm.name()
+            "personality other than PER_LINUX, PER_LINUX32, UNAME26 or the query ({})",
+            answer(Errno::Eperm)
         )
     });
     named
@@ -741,7 +757,10 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
                 Origin::Seccomp => {
                     out.extend(listed(n == 0, seccomp_lines(&view.cfg.seccomp)));
                     if view.full {
-                        out.extend(under("filter: ", filter_lines(view.cfg)));
+                        out.extend(under(
+                            "filter: ",
+                            filter_lines(view.cfg, n > 0, view.seccomp_log),
+                        ));
                     }
                 }
                 _ => {}
@@ -915,6 +934,7 @@ mod tests {
                 wl_proxy: None,
                 audio_policy: "",
                 net_proxy_log: false,
+                seccomp_log: false,
                 proxy: false,
                 full: false,
                 bwrap: crate::version::Version::Known(0, 12, 0),
@@ -1026,6 +1046,7 @@ bwrap
                 wl_proxy: None,
                 audio_policy: "",
                 net_proxy_log: false,
+                seccomp_log: false,
                 proxy: false,
                 full: false,
                 bwrap: crate::version::Version::Known(0, 12, 0),
@@ -1073,6 +1094,7 @@ bwrap
                 wl_proxy: None,
                 audio_policy: "",
                 net_proxy_log: false,
+                seccomp_log: false,
                 proxy: false,
                 full: false,
                 bwrap: crate::version::Version::Known(0, 12, 0),
@@ -1125,6 +1147,7 @@ bwrap
                     wl_proxy: Some(&plan),
                     audio_policy: "",
                     net_proxy_log: false,
+                    seccomp_log: false,
                     proxy: false,
                     full: false,
                     bwrap: crate::version::Version::Known(0, 12, 0),
@@ -1175,6 +1198,7 @@ bwrap
                     wl_proxy: None,
                     audio_policy: "",
                     net_proxy_log: false,
+                    seccomp_log: false,
                     proxy: false,
                     full: false,
                     bwrap: crate::version::Version::Known(0, 12, 0),
@@ -1239,6 +1263,7 @@ bwrap
                 wl_proxy: None,
                 audio_policy: "",
                 net_proxy_log: false,
+                seccomp_log: false,
                 proxy: false,
                 full: false,
                 bwrap: crate::version::Version::Known(0, 12, 0),
@@ -1303,6 +1328,7 @@ bwrap
                     wl_proxy: None,
                     audio_policy: suffix,
                     net_proxy_log: false,
+                    seccomp_log: false,
                     proxy: false,
                     full: false,
                     bwrap: crate::version::Version::Known(0, 12, 0),
@@ -1354,6 +1380,7 @@ bwrap
                     wl_proxy: None,
                     audio_policy: "",
                     net_proxy_log: false,
+                    seccomp_log: false,
                     proxy: false,
                     full: false,
                     bwrap: crate::version::Version::Known(0, 12, 0),
@@ -1405,6 +1432,7 @@ bwrap
                 wl_proxy: None,
                 audio_policy: "",
                 net_proxy_log: false,
+                seccomp_log: false,
                 proxy: false,
                 full: false,
                 bwrap: crate::version::Version::Known(0, 12, 0),
@@ -1445,6 +1473,7 @@ bwrap
                     wl_proxy: None,
                     audio_policy: "",
                     net_proxy_log: false,
+                    seccomp_log: false,
                     proxy: false,
                     full: false,
                     bwrap: crate::version::Version::Known(0, 12, 0),
@@ -1547,6 +1576,7 @@ bwrap
                 wl_proxy: None,
                 audio_policy: "",
                 net_proxy_log: false,
+                seccomp_log: false,
                 proxy: false,
                 full: false,
                 bwrap: crate::version::Version::Known(0, 12, 0),
@@ -1597,6 +1627,7 @@ bwrap
             wl_proxy: None,
             audio_policy: "",
             net_proxy_log: false,
+            seccomp_log: false,
             proxy: false,
             full: false,
             bwrap: crate::version::Version::Known(0, 12, 0),
@@ -1642,6 +1673,7 @@ bwrap
                     wl_proxy: None,
                     audio_policy: "",
                     net_proxy_log: false,
+                    seccomp_log: false,
                     proxy: false,
                     full: false,
                     bwrap: crate::version::Version::Known(0, 12, 0),
@@ -1681,6 +1713,7 @@ bwrap
                 wl_proxy: None,
                 audio_policy: "",
                 net_proxy_log: false,
+                seccomp_log: false,
                 proxy: false,
                 full: false,
                 bwrap: crate::version::Version::Known(0, 12, 0),
@@ -1710,6 +1743,7 @@ bwrap
                 wl_proxy: None,
                 audio_policy: "",
                 net_proxy_log: false,
+                seccomp_log: false,
                 proxy: false,
                 full: true,
                 bwrap: crate::version::Version::Known(0, 12, 0),
@@ -1757,6 +1791,7 @@ bwrap
                 wl_proxy: None,
                 audio_policy: "",
                 net_proxy_log: false,
+                seccomp_log: false,
                 proxy: false,
                 full: false,
                 bwrap: crate::version::Version::Known(0, 12, 0),
@@ -1803,6 +1838,7 @@ bwrap
             wl_proxy: None,
             audio_policy: "",
             net_proxy_log: false,
+            seccomp_log: false,
             proxy: true,
             full: true,
             bwrap: crate::version::Version::Known(0, 12, 0),
@@ -1839,6 +1875,7 @@ bwrap
                 wl_proxy: None,
                 audio_policy: "",
                 net_proxy_log: false,
+                seccomp_log: false,
                 proxy: false,
                 full: false,
                 bwrap: crate::version::Version::Known(0, 12, 0),
@@ -1881,6 +1918,7 @@ bwrap
                 wl_proxy: None,
                 audio_policy: "",
                 net_proxy_log: false,
+                seccomp_log: false,
                 proxy: false,
                 full: false,
                 bwrap: crate::version::Version::Known(0, 12, 0),
@@ -1921,6 +1959,7 @@ bwrap
                 wl_proxy: None,
                 audio_policy: "",
                 net_proxy_log: false,
+                seccomp_log: false,
                 proxy: false,
                 full: false,
                 bwrap: crate::version::Version::Known(0, 12, 0),
@@ -1952,6 +1991,7 @@ bwrap
                 wl_proxy: None,
                 audio_policy: "",
                 net_proxy_log: false,
+                seccomp_log: false,
                 proxy: false,
                 full: false,
                 bwrap: crate::version::Version::Known(0, 12, 0),
@@ -1964,14 +2004,20 @@ bwrap
     }
 
     fn render_seccomp(kdl: &str, full: bool) -> Vec<String> {
-        let cfg = cfg(kdl);
+        render_filter(&cfg(kdl), full, true, false)
+    }
+
+    /// `loaded` is whether the launcher put a program into the argv: a
+    /// rule set left with nothing to compile produces no argument.
+    fn render_filter(cfg: &InstanceConfig, full: bool, loaded: bool, log: bool) -> Vec<String> {
         let items = [item(Origin::Seccomp, &["--add-seccomp-fd", "4"], None)];
+        let items = if loaded { &items[..] } else { &[] };
         render(
-            &items,
+            items,
             &View {
                 title: "bwrap",
                 instance: "t",
-                cfg: &cfg,
+                cfg,
                 source: Source {
                     file: "config.kdl",
                     lines: &Lines::default(),
@@ -1980,12 +2026,91 @@ bwrap
                 wl_proxy: None,
                 audio_policy: "",
                 net_proxy_log: false,
+                seccomp_log: log,
                 proxy: false,
                 full,
                 bwrap: crate::version::Version::Known(0, 12, 0),
             },
         )
         .unwrap()
+    }
+
+    /// The launcher's `compile` leaves out a name this libseccomp cannot
+    /// resolve, so the list does too. The parser refuses such a name, so
+    /// only a default list newer than the library carries one.
+    #[test]
+    fn full_leaves_out_a_name_the_filter_cannot_carry() {
+        let mut cfg = cfg("command \"true\"");
+        cfg.seccomp
+            .deny
+            .push(("nosuchcall".to_owned(), crate::seccomp::Errno::Eperm));
+        let out = render_filter(&cfg, true, true, false);
+        assert!(!lists(&out, "nosuchcall (EPERM)"), "{out:#?}");
+        assert!(lists(&out, "clone3 (ENOSYS)"), "{out:#?}");
+    }
+
+    /// An `allow` list that takes every rule back loads no filter at all,
+    /// the `personality` prefix included, and the launcher says so.
+    #[test]
+    fn full_says_no_filter_is_loaded_when_no_rule_is_left() {
+        let set =
+            crate::seccomp::RuleSet::with(&SeccompConfig::default(), crate::config::Userns::Allow)
+                .unwrap();
+        let names: Vec<String> = set
+            .eperm
+            .iter()
+            .chain(&set.enosys)
+            .chain(set.enosys_numbered.iter().map(|(n, _, _)| n))
+            .chain(&["ioctl".to_owned()])
+            .map(|n| format!("\"{n}\""))
+            .collect();
+        let cfg = cfg(&format!(
+            "seccomp {{\n    allow {}\n}}\ncommand \"true\"",
+            names.join(" ")
+        ));
+        let out = render_filter(&cfg, true, false, false);
+        assert!(
+            lists(
+                &out,
+                "none loaded, no rules left: the sandbox runs unfiltered"
+            ),
+            "{out:#?}"
+        );
+        assert!(!out.iter().any(|l| l.contains("personality")), "{out:#?}");
+    }
+
+    /// With `$BUBBLER_SECCOMP_LOG=1` no rule denies anything: each one
+    /// writes an audit entry and lets the call through.
+    #[test]
+    fn full_says_the_rules_only_log_in_log_mode() {
+        let out = render_filter(&cfg("command \"true\""), true, true, true);
+        assert!(lists(&out, "clone3 (logged)"), "{out:#?}");
+        assert!(lists(&out, "ioctl TIOCSTI (logged)"), "{out:#?}");
+        assert!(
+            !out.iter()
+                .any(|l| l.contains("(ENOSYS)") || l.contains("(EPERM)")),
+            "{out:#?}"
+        );
+    }
+
+    #[test]
+    fn full_names_the_personas_the_filter_allows_unless_personality_is_allowed() {
+        let out = render_seccomp("command \"true\"", true);
+        assert!(
+            lists(
+                &out,
+                "personality other than PER_LINUX, PER_LINUX32, UNAME26 or the query (EPERM)"
+            ),
+            "{out:#?}"
+        );
+        let out = render_seccomp(
+            "seccomp {\n    allow \"personality\"\n}\ncommand \"true\"",
+            true,
+        );
+        assert!(
+            !out.iter().any(|l| l.contains("personality other")),
+            "{out:#?}"
+        );
     }
 
     fn lists(out: &[String], entry: &str) -> bool {
@@ -2095,6 +2220,7 @@ bwrap
             wl_proxy: None,
             audio_policy: "",
             net_proxy_log: false,
+            seccomp_log: false,
             proxy: false,
             full: false,
             bwrap: crate::version::Version::Known(0, 12, 0),
@@ -2138,6 +2264,7 @@ bwrap
             wl_proxy: None,
             audio_policy: "",
             net_proxy_log: false,
+            seccomp_log: false,
             proxy: false,
             full: false,
             bwrap: crate::version::Version::Known(0, 12, 0),
@@ -2176,6 +2303,7 @@ bwrap
             wl_proxy: None,
             audio_policy: "",
             net_proxy_log: false,
+            seccomp_log: false,
             proxy: false,
             full: false,
             bwrap: crate::version::Version::Known(0, 12, 0),
@@ -2225,6 +2353,7 @@ bwrap
             wl_proxy: None,
             audio_policy: "",
             net_proxy_log: false,
+            seccomp_log: false,
             proxy: false,
             full: false,
             bwrap: crate::version::Version::Known(0, 12, 0),
@@ -2263,6 +2392,7 @@ bwrap
             wl_proxy: None,
             audio_policy: "",
             net_proxy_log: false,
+            seccomp_log: false,
             proxy: false,
             full: false,
             bwrap: crate::version::Version::Known(0, 12, 0),
@@ -2304,6 +2434,7 @@ bwrap
                 wl_proxy: None,
                 audio_policy: "",
                 net_proxy_log: false,
+                seccomp_log: false,
                 proxy: false,
                 full: false,
                 bwrap: crate::version::Version::Known(0, 12, 0),
@@ -2357,6 +2488,7 @@ bwrap
             wl_proxy: None,
             audio_policy: "",
             net_proxy_log: false,
+            seccomp_log: false,
             proxy: false,
             full: false,
             bwrap,

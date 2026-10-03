@@ -169,6 +169,10 @@ pub const MOUNT_API: &[&str] = &[
 /// bits of argument 1.
 pub const DEFAULT_IOCTL_EPERM: &[u32] = &[TIOCSTI, TIOCLINUX];
 
+/// [`DEFAULT_IOCTL_EPERM`] with the name of each request, for
+/// `--explain`.
+pub const DEFAULT_IOCTL_NAMES: &[(u32, &str)] = &[(TIOCSTI, "TIOCSTI"), (TIOCLINUX, "TIOCLINUX")];
+
 /// Pushes bytes into the controlling terminal's input queue, so a sandbox
 /// sharing the user's tty could type commands into their shell
 /// (CVE-2017-5226). Value from `asm-generic/ioctls.h`.
@@ -742,6 +746,8 @@ mod tests {
     #[test]
     fn the_default_set_is_the_two_lists_plus_the_ioctl_rules() {
         let set = RuleSet::default_set();
+        let named: Vec<u32> = DEFAULT_IOCTL_NAMES.iter().map(|(r, _)| *r).collect();
+        assert_eq!(named, DEFAULT_IOCTL_EPERM);
         assert_eq!(set.eperm[..DEFAULT_EPERM.len()], *DEFAULT_EPERM);
         assert_eq!(set.enosys, DEFAULT_ENOSYS);
         assert_eq!(set.ioctl_eperm, vec![0x5412, 0x541C]);

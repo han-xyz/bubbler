@@ -90,7 +90,7 @@ const KEYS: [Keys; 4] = [
         full: &[
             ("j/k", "scroll"),
             ("g/G", "ends"),
-            ("f", "every argument"),
+            ("f", "arguments and filter"),
             ("p", "the D-Bus proxy's argv"),
             ("Esc", "back"),
         ],
@@ -1169,7 +1169,7 @@ mod tests {
                 "│Esc   back                                                                                        │",
                 "│                                                                                                  │",
                 "│viewer                                                                                            │",
-                "│j/k scroll                  g/G ends                    f   every argument                        │",
+                "│j/k scroll                  g/G ends                    f   arguments and filter                  │",
                 "│p   the D-Bus proxy's argv  Esc back                                                              │",
                 "│                                                                                                  │",
                 "│run and open start detached; exec, try and the editors take the terminal                          │",

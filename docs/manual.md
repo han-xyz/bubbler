@@ -442,10 +442,14 @@ answers with an errno — each name, or name and number (`listns #470
 (ENOSYS)`) where libseccomp has no name for it, the two `ioctl` requests and
 the `personality` rule — as the launcher builds it for this instance's
 `userns` and `seccomp` nodes; a nested sandbox that dies with "Function not
-implemented" is read against that list. `--dry-run` on its own remains the
-byte-exact, one-element-per-line form. `--format json` elides nothing; an
-argument that is not UTF-8 is written there with the replacement character,
-since JSON has no byte strings.
+implemented" is read against that list. The numbered rules hold for the
+architecture bubbler was built for only, where the named ones reach i386 as
+well on x86_64. With `$BUBBLER_SECCOMP_LOG=1` each rule says `(logged)` in place of
+its errno, and where no rule is left the list says the sandbox runs
+unfiltered. `--dry-run` on its own remains the byte-exact,
+one-element-per-line form. `--format json` elides no argument but carries no
+`filter:` list; an argument that is not UTF-8 is written there with the
+replacement character, since JSON has no byte strings.
 
 With `portals` granted, a command line carrying host file arguments prints a
 `forward:` or `visible:` line for each of them, on **stderr** and not in the
@@ -2912,7 +2916,7 @@ Keys, with `?` for the full list on every screen:
 | instances | `Enter` grants, `r` run, `o` open, `x` exec, `t` try, `n` new, `d` delete, `R` reseed, `e` `$EDITOR`, `l` lint, `L` last-run log, `D` desktop entry, `W` shim, `X` explain, `p` profiles, `^R` re-read |
 | grants | `Space` grant / disable (keeps the line) / enable, `Enter` write the node as KDL, `Del` remove the entry (`Backspace` too), `e` `$EDITOR`, `s` save, `u` undo, `l` lint, `X` explain, `Esc` back |
 | profiles | `Enter` show it flattened, `c` create an instance from it, `e` `$EDITOR` on your layer, `l` lint |
-| viewer | `j`/`k` scroll, `f` every argument, `p` the proxy's argv |
+| viewer | `j`/`k` scroll, `f` every argument and the seccomp filter, `p` the proxy's argv |
 
 `Space` is the three-way key. On a node the config does not hold it grants it,
 where the node means something on its own. On a granted node carrying anything
