@@ -3756,7 +3756,7 @@ const START_LOCK_POLL: Duration = Duration::from_millis(50);
 /// runtime directory rather than in it, so that removing the directory
 /// leaves it; no run removes it, since a start that locked a file since
 /// unlinked would hold a lock nobody else sees.
-fn start_lock_path(env: &Env, name: &str) -> PathBuf {
+pub(crate) fn start_lock_path(env: &Env, name: &str) -> PathBuf {
     env.runtime_dir
         .join(RUNTIME_SUBDIR)
         .join(format!("{name}{START_LOCK_SUFFIX}"))

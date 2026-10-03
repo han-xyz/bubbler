@@ -442,7 +442,8 @@ pub struct Ephemeral {
     // `Drop` runs without an `Env`, so the paths it needs are copied here.
     instances_root: PathBuf,
     runtime: PathBuf,
-    /// Whether the runtime directory is this guard's to remove.
+    start_lock: PathBuf,
+    /// Whether the runtime directory and start lock are this guard's to remove.
     remove_runtime: bool,
 }
 
@@ -493,6 +494,12 @@ impl Drop for Ephemeral {
             && e.kind() != io::ErrorKind::NotFound
         {
             eprintln!("bubbler: {}: {e}", self.runtime.display());
+        }
+        if self.remove_runtime
+            && let Err(e) = fs::remove_file(&self.start_lock)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            eprintln!("bubbler: {}: {e}", self.start_lock.display());
         }
     }
 }
@@ -547,6 +554,7 @@ impl Instance {
             return Err(InstanceError::Io(dir, e));
         }
         make_dir(&dir, &name, &text)?;
+        let start_lock = launcher::start_lock_path(env, &name);
         Ok(Ephemeral {
             instance: Self {
                 name,
@@ -556,6 +564,7 @@ impl Instance {
             },
             keep: None,
             instances_root: instances_root(env),
+            start_lock,
             runtime,
             remove_runtime: true,
         })

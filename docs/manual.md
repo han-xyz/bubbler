@@ -4074,8 +4074,9 @@ start, and the checked sockets `bus`,
 `system` and `a11y` — one per granted bus — beside it, and a `portals` grant adds
 `$XDG_RUNTIME_DIR/.flatpak/bubbler-<name>/`, creating `.flatpak/` if it is
 missing. Everything a run makes there is removed again when it ends, with two
-exceptions: the start lock, which stays until `$XDG_RUNTIME_DIR` is cleared
-at logout, and an `app-runtime` grant's
+exceptions: a named instance's start lock, which stays until
+`$XDG_RUNTIME_DIR` is cleared at logout (a throwaway sandbox's goes with it),
+and an `app-runtime` grant's
 `$XDG_RUNTIME_DIR/app/<id>` (and `app/` above it), left since a peer of
 another instance may still be using it.
 `HOME` and `XDG_RUNTIME_DIR` must be set and non-empty. Your profiles live in
