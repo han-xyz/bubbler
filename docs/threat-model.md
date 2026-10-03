@@ -1753,7 +1753,7 @@ Stated so nobody has to infer them.
   ([x11](manual.md#x11), [Linting](manual.md#linting);
   `x11_host_is_a_warning_and_the_nested_default_is_a_note`,
   `x11_warns_before_a_real_run`,
-  `only_the_gaming_profiles_grant_x11_and_none_disables_user_namespaces`.)
+  `only_the_gaming_profiles_grant_x11_and_only_apps_without_a_nested_sandbox_disable_userns`.)
 - **No defence against the kernel.** seccomp narrows the surface; a bug
   behind an allowed syscall is reachable, and the syscalls Firefox and
   Chromium need to build their own sandbox are allowed on purpose.
