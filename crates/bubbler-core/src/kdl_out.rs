@@ -256,8 +256,12 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
         Service::Pipewire {
             microphone,
             devices,
-        } => audio_node("pipewire", *microphone, *devices),
-        Service::Pulseaudio { microphone } => audio_node("pulseaudio", *microphone, false),
+            exclusive,
+        } => audio_node("pipewire", *microphone, *devices, *exclusive),
+        Service::Pulseaudio {
+            microphone,
+            exclusive,
+        } => audio_node("pulseaudio", *microphone, false, *exclusive),
         Service::Portals { children } => {
             if children.is_empty() {
                 return Ok("portals".to_owned());
@@ -494,11 +498,15 @@ fn optional_suffix(optional: bool) -> &'static str {
 
 /// `pipewire`/`pulseaudio`: bare unless a child was granted, then the
 /// block form the parser reads back as the same grant.
-fn audio_node(name: &str, microphone: bool, devices: bool) -> String {
-    let children: Vec<&str> = [("microphone", microphone), ("devices", devices)]
-        .into_iter()
-        .filter_map(|(child, on)| on.then_some(child))
-        .collect();
+fn audio_node(name: &str, microphone: bool, devices: bool, exclusive: bool) -> String {
+    let children: Vec<&str> = [
+        ("microphone", microphone),
+        ("devices", devices),
+        ("exclusive", exclusive),
+    ]
+    .into_iter()
+    .filter_map(|(child, on)| on.then_some(child))
+    .collect();
     if children.is_empty() {
         return name.to_owned();
     }
@@ -1362,6 +1370,20 @@ mod tests {
         for text in [
             "pipewire {\n    devices\n}\n",
             "pipewire {\n    microphone\n    devices\n}\n",
+        ] {
+            let cfg = crate::config::parse(text).unwrap();
+            assert_eq!(render(&cfg).unwrap(), text);
+        }
+    }
+
+    /// `exclusive` is written back last, on either audio node.
+    #[test]
+    fn exclusive_round_trips_on_both_audio_nodes() {
+        for text in [
+            "pipewire {\n    exclusive\n}\n",
+            "pipewire {\n    microphone\n    devices\n    exclusive\n}\n",
+            "pulseaudio {\n    exclusive\n}\n",
+            "pulseaudio {\n    microphone\n    exclusive\n}\n",
         ] {
             let cfg = crate::config::parse(text).unwrap();
             assert_eq!(render(&cfg).unwrap(), text);

@@ -225,8 +225,12 @@ fn grant_service(name: &str) -> Option<Service> {
         "pipewire" => Service::Pipewire {
             microphone: false,
             devices: false,
+            exclusive: false,
         },
-        "pulseaudio" => Service::Pulseaudio { microphone: false },
+        "pulseaudio" => Service::Pulseaudio {
+            microphone: false,
+            exclusive: false,
+        },
         "dbus" => Service::Dbus { rules: Vec::new() },
         "portals" => Service::Portals {
             children: Vec::new(),

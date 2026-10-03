@@ -5343,6 +5343,7 @@ mod tests {
             audio: AudioSet {
                 microphone: false,
                 devices: false,
+                exclusive: false,
             },
         };
         let argv =
@@ -5428,6 +5429,7 @@ mod tests {
             audio: AudioSet {
                 microphone: true,
                 devices: false,
+                exclusive: false,
             },
         };
         let mut alloc = DryRunAlloc::sidecar(dir.clone());

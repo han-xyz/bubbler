@@ -4012,6 +4012,7 @@ mod tests {
             &[Service::Pipewire {
                 microphone: false,
                 devices: false,
+                exclusive: false,
             }],
             &env(),
             &audio_host(),
@@ -4044,7 +4045,10 @@ mod tests {
     #[test]
     fn pulseaudio_binds_this_instances_private_server_and_not_the_sessions() {
         let a = argv(
-            &[Service::Pulseaudio { microphone: false }],
+            &[Service::Pulseaudio {
+                microphone: false,
+                exclusive: false,
+            }],
             &env(),
             &audio_host(),
         )
@@ -4089,7 +4093,7 @@ mod tests {
             .filter(|(p, _)| *p != crate::pipewire::PULSE_MODULE)
             .collect();
         assert!(matches!(
-            argv(&[Service::Pulseaudio { microphone: false }], &env(), &host),
+            argv(&[Service::Pulseaudio { microphone: false, exclusive: false }], &env(), &host),
             Err(LaunchError::MissingResource { service: "pulseaudio", ref path })
                 if path == Path::new(crate::pipewire::PULSE_MODULE)
         ));
@@ -4104,8 +4108,12 @@ mod tests {
             Service::Pipewire {
                 microphone: false,
                 devices: false,
+                exclusive: false,
             },
-            Service::Pulseaudio { microphone: false },
+            Service::Pulseaudio {
+                microphone: false,
+                exclusive: false,
+            },
         ] {
             let host: Vec<(&str, Kind)> = audio_host()
                 .into_iter()

@@ -93,8 +93,12 @@ fn flag_services() -> impl Strategy<Value = Vec<Service>> {
             Service::Pipewire {
                 microphone: false,
                 devices: false,
+                exclusive: false,
             },
-            Service::Pulseaudio { microphone: false },
+            Service::Pulseaudio {
+                microphone: false,
+                exclusive: false,
+            },
             Service::Hidraw,
         ]
         .into_iter()

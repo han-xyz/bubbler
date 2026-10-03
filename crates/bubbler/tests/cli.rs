@@ -637,6 +637,29 @@ fn explain_states_the_device_grant() {
     );
 }
 
+/// `exclusive` under `pulseaudio` reaches the one context both audio
+/// nodes are served through.
+#[test]
+fn explain_states_the_exclusive_grant() {
+    if !require_host_program(PW_CONTAINER) {
+        return;
+    }
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(
+        &cfg,
+        "pipewire\npulseaudio {\n    exclusive\n}\ncommand \"true\"\n",
+    )
+    .unwrap();
+    let (code, out, err) = run(tmp.path(), &["run", "t", "--explain"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("(context: org.bubbler t playback,exclusive)"),
+        "{out}"
+    );
+}
+
 /// `devices` is a note naming what the instance hears, and `lint-allow`
 /// accepts it like any check.
 #[test]

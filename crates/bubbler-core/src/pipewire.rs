@@ -236,13 +236,20 @@ pub fn pulse_command() -> Vec<OsString> {
 }
 
 /// The grant set as the policy drop-in matches it.
-pub fn grant(audio: AudioSet) -> &'static str {
-    match (audio.microphone, audio.devices) {
-        (false, false) => "playback",
-        (true, false) => "playback,microphone",
-        (false, true) => "playback,devices",
-        (true, true) => "playback,microphone,devices",
-    }
+pub fn grant(audio: AudioSet) -> String {
+    let children = [
+        ("microphone", audio.microphone),
+        ("devices", audio.devices),
+        ("exclusive", audio.exclusive),
+    ];
+    std::iter::once("playback")
+        .chain(
+            children
+                .into_iter()
+                .filter_map(|(word, on)| on.then_some(word)),
+        )
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The context properties, as one JSON object for `pw-container -P`.
@@ -253,12 +260,13 @@ pub fn grant(audio: AudioSet) -> &'static str {
 /// depend on that. The whole value is one argv element handed to bwrap,
 /// which no shell sees — only the program word is.
 pub fn properties(instance: &str, run_id: &str, audio: AudioSet) -> String {
+    let grant = grant(audio);
     let pairs = [
         ("pipewire.sec.engine", ENGINE),
         ("pipewire.sec.app-id", instance),
         ("pipewire.sec.instance-id", run_id),
         ("pipewire.access", ACCESS),
-        ("pipewire.sec.bubbler.audio", grant(audio)),
+        ("pipewire.sec.bubbler.audio", grant.as_str()),
     ];
     let body: Vec<String> = pairs
         .iter()
@@ -287,6 +295,7 @@ mod tests {
         AudioSet {
             microphone,
             devices: false,
+            exclusive: false,
         }
     }
 
@@ -313,6 +322,24 @@ mod tests {
             let audio = AudioSet {
                 microphone,
                 devices: true,
+                exclusive: false,
+            };
+            assert_eq!(grant(audio), grant_string);
+        }
+    }
+
+    /// `exclusive` joins the grant as a word of its own, last.
+    #[test]
+    fn the_grant_carries_exclusive_as_a_word() {
+        for (microphone, devices, grant_string) in [
+            (false, false, "playback,exclusive"),
+            (true, false, "playback,microphone,exclusive"),
+            (true, true, "playback,microphone,devices,exclusive"),
+        ] {
+            let audio = AudioSet {
+                microphone,
+                devices,
+                exclusive: true,
             };
             assert_eq!(grant(audio), grant_string);
         }

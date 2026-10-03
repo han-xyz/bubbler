@@ -848,13 +848,15 @@ impl Merged {
             Service::Pipewire {
                 microphone,
                 devices,
+                exclusive,
             } => {
-                if let Some((held_microphone, held_devices, held_src)) =
+                if let Some((held_microphone, held_devices, held_exclusive, held_src)) =
                     self.services.iter_mut().find_map(|(s, src)| match s {
                         Service::Pipewire {
                             microphone: held_microphone,
                             devices: held_devices,
-                        } => Some((held_microphone, held_devices, src)),
+                            exclusive: held_exclusive,
+                        } => Some((held_microphone, held_devices, held_exclusive, src)),
                         _ => None,
                     })
                 {
@@ -864,18 +866,26 @@ impl Merged {
                     // `gamepad`'s properties merge by.
                     *held_microphone |= *microphone;
                     *held_devices |= *devices;
+                    *held_exclusive |= *exclusive;
                     *held_src = src.clone();
                     return Ok(());
                 }
             }
-            Service::Pulseaudio { microphone } => {
-                if let Some((held, held_src)) =
+            Service::Pulseaudio {
+                microphone,
+                exclusive,
+            } => {
+                if let Some((held_microphone, held_exclusive, held_src)) =
                     self.services.iter_mut().find_map(|(s, src)| match s {
-                        Service::Pulseaudio { microphone: held } => Some((held, src)),
+                        Service::Pulseaudio {
+                            microphone: held_microphone,
+                            exclusive: held_exclusive,
+                        } => Some((held_microphone, held_exclusive, src)),
                         _ => None,
                     })
                 {
-                    *held |= *microphone;
+                    *held_microphone |= *microphone;
+                    *held_exclusive |= *exclusive;
                     *held_src = src.clone();
                     return Ok(());
                 }
@@ -1268,11 +1278,10 @@ mod tests {
         assert!(cfg("libreoffice").services.contains(&Service::EtcShare {
             name: OsString::from("libreoffice")
         }));
-        assert!(
-            cfg("vesktop")
-                .services
-                .contains(&Service::Pulseaudio { microphone: true })
-        );
+        assert!(cfg("vesktop").services.contains(&Service::Pulseaudio {
+            microphone: true,
+            exclusive: false
+        }));
         let steam = cfg("steam");
         assert!(steam.services.contains(&Service::Gamepad {
             hidraw: false,
@@ -1411,7 +1420,10 @@ mod tests {
             vec![
                 wayland(),
                 Service::Dri { kms: false },
-                Service::Pulseaudio { microphone: false },
+                Service::Pulseaudio {
+                    microphone: false,
+                    exclusive: false
+                },
                 network(),
                 Service::Dbus { rules: Vec::new() },
                 Service::Mpris {
@@ -1436,7 +1448,10 @@ mod tests {
             vec![
                 wayland(),
                 Service::Dri { kms: false },
-                Service::Pulseaudio { microphone: true },
+                Service::Pulseaudio {
+                    microphone: true,
+                    exclusive: false
+                },
                 network()
             ]
         );
@@ -1452,7 +1467,10 @@ mod tests {
             vec![
                 wayland(),
                 Service::Dri { kms: false },
-                Service::Pulseaudio { microphone: false },
+                Service::Pulseaudio {
+                    microphone: false,
+                    exclusive: false
+                },
                 network(),
                 Service::Dbus { rules: Vec::new() },
                 Service::Portals {
@@ -2581,7 +2599,8 @@ mod tests {
             r.resolve("a").unwrap().config.services,
             vec![Service::Pipewire {
                 microphone: true,
-                devices: false
+                devices: false,
+                exclusive: false
             }]
         );
 
@@ -2594,7 +2613,8 @@ mod tests {
             r.resolve("a").unwrap().config.services,
             vec![Service::Pipewire {
                 microphone: true,
-                devices: false
+                devices: false,
+                exclusive: false
             }]
         );
     }
@@ -2621,6 +2641,32 @@ mod tests {
             );
             let audio = r.resolve("a").unwrap().config.audio().unwrap();
             assert!(audio.microphone && audio.devices, "{upper} over {lower}");
+        }
+    }
+
+    /// `exclusive` ORs across layers on either audio node.
+    #[test]
+    fn exclusive_ors_across_layers_on_either_node() {
+        let tmp = tempfile::tempdir().unwrap();
+        for node in ["pipewire", "pulseaudio"] {
+            for (upper, lower) in [
+                (
+                    format!("{node} {{\n    exclusive\n}}\n"),
+                    format!("{node} {{\n    microphone\n}}\n"),
+                ),
+                (
+                    format!("{node} {{\n    microphone\n}}\n"),
+                    format!("{node} {{\n    exclusive\n}}\n"),
+                ),
+            ] {
+                let r = resolver(
+                    tmp.path(),
+                    &[("a", &format!("include \"b\"\n{upper}"))],
+                    &[("b", &lower)],
+                );
+                let audio = r.resolve("a").unwrap().config.audio().unwrap();
+                assert!(audio.microphone && audio.exclusive, "{upper} over {lower}");
+            }
         }
     }
 
@@ -3025,7 +3071,8 @@ mod tests {
             vec![
                 Service::Pipewire {
                     microphone: false,
-                    devices: false
+                    devices: false,
+                    exclusive: false
                 },
                 Service::Dri { kms: false }
             ]

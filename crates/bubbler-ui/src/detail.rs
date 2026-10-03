@@ -1081,7 +1081,8 @@ mod tests {
         assert_eq!(detail.toggle(&env), "granted `pipewire`");
         assert!(detail.buf.services.contains(&Service::Pipewire {
             microphone: false,
-            devices: false
+            devices: false,
+            exclusive: false
         }));
         assert!(detail.dirty(), "the file does not have it yet");
         // The cursor follows the node it was on, into the granted half.
@@ -1089,7 +1090,8 @@ mod tests {
         assert_eq!(detail.toggle(&env), "removed `pipewire`");
         assert!(!detail.buf.services.contains(&Service::Pipewire {
             microphone: false,
-            devices: false
+            devices: false,
+            exclusive: false
         }));
         assert!(!detail.dirty(), "back to the file");
     }
