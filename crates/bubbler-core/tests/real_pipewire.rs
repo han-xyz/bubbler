@@ -1717,6 +1717,10 @@ fn a_context_creates_nodes_only_as_its_own_streams() {
                 !dump.contains(&format!("\"node.name\": \"{name}\"")),
                 "a {grant} context made a node through {factory}: {out:?}"
             );
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("unknown factory name"),
+                "a {grant} context was not refused {factory}: {out:?}"
+            );
         }
         let listing = bed.info_in_context(props, &[SINK]);
         let factories: Vec<&str> = listing
