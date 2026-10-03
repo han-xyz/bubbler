@@ -620,9 +620,9 @@ that answer and `ENOSYS` risks a caller probing by another path instead),
 `pidfd_getfd` and `kcmp` (both reach across process boundaries the sandbox
 otherwise keeps closed), plus `TIOCSTI` and
 `TIOCLINUX` denied by ioctl argument (CVE-2017-5226, CVE-2023-28100). A
-second, smaller set answers `ENOSYS` rather than `EPERM` — `clone3` and
-the rest of the new mount API (`open_tree`, `move_mount`, `fsopen`, `fsconfig`,
-`fsmount`, `fspick`) — so libc falls back to the older
+second, smaller set answers `ENOSYS` rather than `EPERM` — `clone3`, and
+where nesting is off the rest of the new mount API (`open_tree`, `move_mount`,
+`fsopen`, `fsconfig`, `fsmount`, `fspick`) — so libc falls back to the older
 call instead of failing outright; that API is the one CVE-2021-41133
 walked past flatpak's filter through, because a denylist written before
 it existed did not name it. `mount_setattr` is the exception: bubblewrap 0.13
@@ -633,11 +633,17 @@ it grants what `mount(MS_REMOUNT|MS_BIND)` already does. The rest of the mount
 API, `open_tree_attr` included, is denied only where nesting is off — with
 `userns "disable"` and in every sidecar — since bubblewrap is moving its bind
 mounts onto those calls ([#793](https://github.com/containers/bubblewrap/pull/793),
-[#805](https://github.com/containers/bubblewrap/pull/805)). Each needs
-`CAP_SYS_ADMIN` in the user namespace that owns the mount namespace, which a
-process holds only inside a user namespace of its own; bubbler already allows
-nested user namespaces and plain `mount`, and `userns "disable"` withholds
-exactly that capability. A hand-written cBPF prefix ahead of the
+[#805](https://github.com/containers/bubblewrap/pull/805)). Every one of them
+that creates, attaches or reconfigures a mount needs `CAP_SYS_ADMIN` in the
+user namespace that owns the mount namespace, which a process holds only
+inside a user namespace of its own (`open_tree` without `OPEN_TREE_CLONE`
+only opens an `O_PATH` descriptor, which `open` already gives); bubbler
+already allows nested user namespaces and plain `mount`, and
+`userns "disable"` withholds exactly that capability. So for an application
+that may nest the ENOSYS rules do not close CVE-2021-41133's class —
+rewriting the VFS a host service reads through `/proc/PID/root` — since
+`mount` in a user namespace of its own already reached it; `userns "disable"`
+is what closes it, now for both APIs. A hand-written cBPF prefix ahead of the
 compiled filter allows `personality` only the five values a desktop
 application has any business setting (`PER_LINUX`, `PER_LINUX32`,
 `UNAME26`, both together, and the query value `0xffffffff`) and answers
@@ -664,6 +670,7 @@ kernel bug behind an allowed syscall is a kernel bug in the sandbox.
 `real_bwrap_seccomp_denies_the_default_list_and_nothing_else`,
 `real_bwrap_seccomp_denies_the_mount_api_where_user_namespaces_are_disabled`,
 `disabled_user_namespaces_and_sidecars_keep_the_mount_api_denied`,
+`the_nesting_set_compiles_to_one_program_of_a_known_size`,
 `the_default_set_compiles_to_one_program_of_a_known_size`,
 `the_ioctl_rules_compare_the_request_argument_once_per_architecture`,
 `an_unknown_abi_is_killed_rather_than_allowed`,

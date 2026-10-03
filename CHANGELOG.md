@@ -2,13 +2,19 @@
 
 ## 0.25.0
 
+### Security
+
+- The default seccomp filter no longer answers the new mount API (`open_tree`,
+  `move_mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `open_tree_attr`)
+  with `ENOSYS` for an application that may nest, so a nested bubblewrap can
+  mount with it; with `userns "disable"` and in every sidecar all seven stay
+  denied, as do `clone3`, `listns` and `fchroot` everywhere.
+
 ### Changed
 
 - Tests that reach the desktop session or start PipeWire daemons run only with
   `BUBBLER_TEST_SESSION=1`; a plain `cargo test` and the package's `check()`
   touch no session and start no daemon.
-- An application that may nest keeps the new mount API (`open_tree`, `fsopen`
-  and the rest); it stays `ENOSYS` with `userns "disable"` and in sidecars.
 
 ### Added
 

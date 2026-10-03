@@ -329,9 +329,9 @@ not a capability model.
 - `ENOSYS`: `clone3` and the new mount API (`open_tree`, `fsopen`, …); the
   mount API only with `userns "disable"` and in sidecars, since a nested
   bubblewrap needs it. Three more — `open_tree_attr` (467, mount API),
-  `listns` (470), `fchroot` (472) — are denied by syscall *number*, since libseccomp 2.6.0 has no name
-  for them yet, which holds for the build (x86_64) architecture only; a
-  32-bit binary still reaches them. `allow`/`deny` takes them by name too.
+  `listns` (470), `fchroot` (472) — are denied by syscall *number*, since
+  libseccomp 2.6.0 has no name for them yet, which holds for the build
+  (x86_64) architecture only; a 32-bit binary still reaches them. `allow`/`deny` takes them by name too.
 - `personality` is filtered by argument: a hand-written prefix ahead of the
   compiled filter allows only `PER_LINUX`, `PER_LINUX32`, `UNAME26`, both
   together, and the query value, `EPERM` for the rest. It recognises only

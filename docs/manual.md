@@ -3679,20 +3679,20 @@ out of the sandbox's own process tree) — the list is `DEFAULT_EPERM` in
 `crates/bubbler-core/src/seccomp.rs`. Two `ioctl` requests
 are denied by their argument as well: `TIOCSTI` (0x5412) and `TIOCLINUX`
 (0x541C), which push bytes into a terminal's input queue (CVE-2017-5226,
-CVE-2023-28100). `ENOSYS`: `clone3` and the new mount API (`open_tree`,
-`move_mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`), which is
-`DEFAULT_ENOSYS` in the same file. The mount API, `open_tree_attr` with it, is
-denied only with `userns "disable"` and in every sidecar: an application that
-may nest keeps it, because bubblewrap is moving its bind mounts onto those calls
-and distributions that assume a new kernel build it without the `mount()`
+CVE-2023-28100). `ENOSYS`: `clone3`, and with `userns "disable"` and in every
+sidecar the new mount API (`open_tree`, `move_mount`, `fsopen`, `fsconfig`,
+`fsmount`, `fspick`) — together `DEFAULT_ENOSYS` in the same file. An
+application that may nest keeps the mount API, `open_tree_attr` with it,
+because bubblewrap is moving its bind mounts onto those calls and
+distributions that assume a new kernel build it without the `mount()`
 fallback. `mount_setattr` is allowed: bubblewrap 0.13
 sets every bind mount's flags with it and has no fallback, so a nested `bwrap`
 (GTK image loaders, Steam's runtime) dies without it. It needs `CAP_SYS_ADMIN`
 over the mount namespace, cannot clear locked flags and cannot ID-map a host
 filesystem, which is what `mount(MS_REMOUNT|MS_BIND)` already allows here;
 `userns "disable"` is the switch for an instance that must not nest. Three more
-calls are denied by syscall *number* instead of by name — `open_tree_attr` (467,
-under the same rule as the rest of the mount API),
+calls are denied by syscall *number* instead of by name — `open_tree_attr`
+(467, under the same rule as the rest of the mount API),
 `listns` (470) and `fchroot` (472) — because libseccomp 2.6.0 has no name for
 them yet; a rule added by a number the native table cannot name is not
 translated to the filter's second architecture, so these three rules hold for
