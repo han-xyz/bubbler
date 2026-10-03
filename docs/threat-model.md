@@ -957,9 +957,10 @@ also has no session item while any of its `node.name`, `object.path` and
 `node.nick` — by its current properties, or by its session item's, which
 WirePlumber froze when it made the item and which the search reads —
 equals any of the three of a session item that is no stream and that no
-sandbox owns; the same two places apply it, `node-added` for a stream that comes after the
-device and the rescans for one that came before. With it, every one of
-those cases linked the host stream to the device; a stream created under
+sandbox owns; the same two places apply it, `node-added` for a stream
+that comes after the device and the rescans for one that came before.
+With it, every one of those cases linked the host stream to the device
+(the role-based lookup by `node.nick` not measured); a stream created under
 a device's name and renamed a second later took the host stream 10 of 10
 times while only its current name was compared.
 A sandbox's stream that loses its item this way plays or records nothing
@@ -1140,7 +1141,17 @@ device's start, 20 of 20, with and without `node.dont-fallback`). A
 stream pinned by name to another host *stream* is left alone: two
 instances of one application commonly share a stream name, so a
 sandbox's stream named like a host stream can still be picked for it, and
-the host stream is then refused and plays nowhere. A change of the
+the host stream is then refused and plays nowhere. WirePlumber restores a
+stream's saved target (`node.stream.restore-target`, on by default;
+`node/restore-stream` in its `state-stream.lua`) by looking up a node by
+`node.name` over all nodes, not only the ones the policy leaves in the
+session, so a sandbox's node that copies the name of a device the user
+once moved a host stream to can make that stream play on the default
+device instead of the chosen one, or, where the sandbox's node is a plain
+stream named after a device that is absent at that moment, nowhere.
+Nothing is captured: every link to the sandbox is still refused. This is
+read from the script, not measured, and is to be measured and closed
+after 0.25.0. A change of the
 host's `node.features.audio.*` settings has WirePlumber reconfigure every
 session item it made (`node/create-item.lua`, `reconfigureAudioAdapters`)
 and register again the items the hook removed, until the rescan that

@@ -645,12 +645,13 @@ properties into a sink's or a filter's. A stream of yours pinned to a
 device by name is linked to that device even where a sandbox's node,
 stream or not, carries that name as its `node.name`, `object.path` or
 `node.nick`; one pinned to the name of another of your streams is not
-covered. The sandbox's node stays, unlinked, with
-no error to its application. A loopback or filter inside a sandbox (`pw-loopback`, for
-one) plays nothing: its stream
-carries a link group, which a stream needs only as half of a filter. What
-this does not cover is listed under
-"Audio" in `docs/threat-model.md`. Before 0.24.2 a sandbox could still win
+covered. The sandbox's node stays, unlinked, with no error to its
+application. A loopback or filter inside a sandbox (`pw-loopback`, for
+one) plays nothing: its stream carries a link group, which a stream
+needs only as half of a filter. A stream WirePlumber restores to a saved
+target can be sent to the default device by a sandbox's node of the
+device's name, which "Audio" in `docs/threat-model.md` lists among what
+this does not cover. Before 0.24.2 a sandbox could still win
 a link of its own in the first instant of a new connection, now and then,
 and keep it, and
 a sink it offered could become the default and take every host stream
