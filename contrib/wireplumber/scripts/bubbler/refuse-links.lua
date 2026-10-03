@@ -210,6 +210,21 @@ local function filter_target (filter)
   return nil
 end
 
+-- Whether the stream is a smart filter's own node: host_filter would find
+-- that filter, or one before it in the chain, and neither can be linked.
+local function filters_own_stream (si_props)
+  local link_group = si_props ["node.link-group"]
+  if link_group == nil then
+    return false
+  end
+  for _, entry in ipairs (futils.filters) do
+    if entry.link_group == link_group then
+      return true
+    end
+  end
+  return false
+end
+
 -- WirePlumber's finders can still aim a stream at a sandbox's node: its
 -- smart filter (linking/get-filter-from-target), a node named as the
 -- stream's target (linking/find-defined-target) or one ranked above the
@@ -218,7 +233,8 @@ end
 -- every finder and before prepare-link, it is decided as though the
 -- sandbox's node were not there: what a sandbox's filter stood in front
 -- of, else the session's default (never a sandbox's node), each through
--- the host's own filters as get-filter-from-target would have put it;
+-- the host's own filters as get-filter-from-target would have put it,
+-- except for a filter's own stream, which goes there directly;
 -- and a stream pinned with `node.dont-fallback` to a target that is
 -- only a sandbox's is left as find-defined-target leaves one whose
 -- target is missing.
@@ -272,8 +288,11 @@ SimpleEventHook {
       si_flags.has_defined_target = false
       si_flags.has_node_defined_target = false
     end
-    local chosen = aimed and (host_filter (source, si_props, aimed) or
-        (not defined and host_filter (source, si_props, nil)) or aimed)
+    local chosen = aimed
+    if aimed and not filters_own_stream (si_props) then
+      chosen = host_filter (source, si_props, aimed) or
+          (not defined and host_filter (source, si_props, nil)) or aimed
+    end
 
     local compatible, can_passthrough
     if chosen then
