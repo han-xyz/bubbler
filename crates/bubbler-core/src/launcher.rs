@@ -3783,12 +3783,15 @@ fn open_start_lock(path: &Path) -> Result<OwnedFd, LaunchError> {
 /// it, which a start that lost the race to another finds too: the check,
 /// the unlink and the bind all happen under the lock at `lock_path`,
 /// released on return. `Stopped` when a stop signal arrives while it
-/// waits.
+/// waits. `log` is told the run [started](run_log::Redirect::started)
+/// while the lock is still held, so a start that joins this one adds to
+/// it only after it was emptied.
 fn bind_control_socket(
     dir: &Path,
     lock_path: &Path,
     name: &str,
     stop: &AtomicBool,
+    log: Option<&run_log::Redirect>,
 ) -> Result<(UnixListener, SocketGuard), LaunchError> {
     let lock_err = |e: Errno| LaunchError::Io(lock_path.to_path_buf(), e.into());
     let lock = open_start_lock(lock_path)?;
@@ -3820,6 +3823,9 @@ fn bind_control_socket(
         id: (bound.dev(), bound.ino()),
         path: sock_path,
     };
+    if let Some(log) = log {
+        log.started();
+    }
     Ok((listener, guard))
 }
 
@@ -3884,10 +3890,7 @@ fn start_and_wait(
     let _ending: Option<OwnedFd>;
     let sock_path = dir.join(exec::SOCKET_NAME);
     let io_at = |e: Errno| LaunchError::Io(sock_path.clone(), e.into());
-    let (listener, _socket_guard) = bind_control_socket(&dir, &lock_path, &inst.name, stop)?;
-    if let Some(log) = log {
-        log.started();
-    }
+    let (listener, _socket_guard) = bind_control_socket(&dir, &lock_path, &inst.name, stop, log)?;
     let inherited = fcntl_dupfd_cloexec(listener.as_fd(), 3).map_err(io_at)?;
     let mut alloc = RealAlloc::new(inherited.as_raw_fd(), dir.clone());
     // A run with nothing to run must fail before a sidecar is started.
@@ -4234,8 +4237,9 @@ mod tests {
         let path = dir.join(exec::SOCKET_NAME);
         let stop = AtomicBool::new(false);
         drop(UnixListener::bind(&path).unwrap());
-        let (live, _guard) = bind_control_socket(&dir, &lock, "t", &stop).expect("a fresh bind");
-        let again = bind_control_socket(&dir, &lock, "t", &stop);
+        let (live, _guard) =
+            bind_control_socket(&dir, &lock, "t", &stop, None).expect("a fresh bind");
+        let again = bind_control_socket(&dir, &lock, "t", &stop, None);
         assert!(
             matches!(&again, Err(LaunchError::AlreadyRunning(n)) if n == "t"),
             "{again:?}"
@@ -4259,9 +4263,10 @@ mod tests {
         let lock = tmp.path().join("t@start.lock");
         let path = tmp.path().join(exec::SOCKET_NAME);
         let stop = AtomicBool::new(false);
-        let (listener, guard) = bind_control_socket(tmp.path(), &lock, "t", &stop).unwrap();
+        let (listener, guard) = bind_control_socket(tmp.path(), &lock, "t", &stop, None).unwrap();
         drop(listener);
-        let (_later, later_guard) = bind_control_socket(tmp.path(), &lock, "t", &stop).unwrap();
+        let (_later, later_guard) =
+            bind_control_socket(tmp.path(), &lock, "t", &stop, None).unwrap();
         drop(guard);
         assert!(path.exists(), "the later start's socket was removed");
         drop(later_guard);
@@ -4276,7 +4281,7 @@ mod tests {
         let held = std::fs::File::create(&lock).unwrap();
         flock(&held, FlockOperation::LockExclusive).unwrap();
         let stop = AtomicBool::new(true);
-        let waited = bind_control_socket(tmp.path(), &lock, "t", &stop);
+        let waited = bind_control_socket(tmp.path(), &lock, "t", &stop, None);
         assert!(matches!(waited, Err(LaunchError::Stopped)), "{waited:?}");
         assert!(!tmp.path().join(exec::SOCKET_NAME).exists());
     }

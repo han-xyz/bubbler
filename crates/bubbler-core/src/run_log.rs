@@ -97,6 +97,9 @@ pub struct Redirect {
     /// Where [`Redirect::started`] or [`Redirect::joined`] tells the
     /// copying thread whether the log is emptied first.
     settle: Option<SyncSender<bool>>,
+    /// The log, when it is to be emptied, for [`Redirect::started`] to
+    /// empty before it returns.
+    to_empty: Option<OwnedFd>,
     saved: OwnedFd,
     /// bubbler's end of the pipe. Dropped first on the way out, since the
     /// copying thread ends on the last writer closing it.
@@ -138,6 +141,10 @@ fn start(path: &Path, truncate: bool, keep_stderr: bool) -> Result<Redirect, Lau
     // older run, or from a different umask, is narrowed here.
     rustix::fs::fchmod(&file, Mode::RUSR | Mode::WUSR).map_err(|e| io_at(e.into()))?;
     let (settle, settled) = mpsc::sync_channel(1);
+    let to_empty = match truncate {
+        true => Some(file.try_clone().map_err(LaunchError::Data)?),
+        false => None,
+    };
     let (reader, writer) =
         rustix::pipe::pipe_with(PipeFlags::CLOEXEC).map_err(|e| LaunchError::Data(e.into()))?;
     let saved = io::stderr()
@@ -174,6 +181,7 @@ fn start(path: &Path, truncate: bool, keep_stderr: bool) -> Result<Redirect, Lau
     });
     Ok(Redirect {
         settle: Some(settle),
+        to_empty,
         saved,
         writer: Some(writer),
         done,
@@ -182,9 +190,16 @@ fn start(path: &Path, truncate: bool, keep_stderr: bool) -> Result<Redirect, Lau
 
 impl Redirect {
     /// This run started the sandbox: a log opened to be emptied is
-    /// emptied now, and everything the run wrote follows.
+    /// emptied before this returns, so a start that joins once the start
+    /// lock is released adds to it after that, and everything the run
+    /// wrote follows.
     pub fn started(&self) {
-        self.settle_on(true);
+        // A failed truncation costs the old run's lines staying ahead of
+        // this one's, nothing more.
+        if let Some(file) = &self.to_empty {
+            let _ = rustix::fs::ftruncate(file, 0);
+        }
+        self.settle_on(false);
     }
 
     /// This run joined one that is already up: what it writes is added
