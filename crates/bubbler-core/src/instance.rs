@@ -222,7 +222,10 @@ fn grant_service(name: &str) -> Option<Service> {
         "x11" => Service::X11(X11Mode::default()),
         "network" => Service::Network(NetworkConfig::default()),
         "dri" => Service::Dri { kms: false },
-        "pipewire" => Service::Pipewire { microphone: false },
+        "pipewire" => Service::Pipewire {
+            microphone: false,
+            devices: false,
+        },
         "pulseaudio" => Service::Pulseaudio { microphone: false },
         "dbus" => Service::Dbus { rules: Vec::new() },
         "portals" => Service::Portals {

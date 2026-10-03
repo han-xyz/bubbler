@@ -618,6 +618,51 @@ fn explain_names_the_context_an_audio_grant_is_served_through() {
     assert!(s.contains(&format!("sidecar: {PW_CONTAINER} -P ")), "{s}");
 }
 
+/// The device grant is a word of the context's grant, which is where
+/// the explanation shows it.
+#[test]
+fn explain_states_the_device_grant() {
+    if !require_host_program(PW_CONTAINER) {
+        return;
+    }
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "pipewire {\n    devices\n}\ncommand \"true\"\n").unwrap();
+    let (code, out, err) = run(tmp.path(), &["run", "t", "--explain"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("(context: org.bubbler t playback,devices)"),
+        "{out}"
+    );
+}
+
+/// `devices` is a note naming what the instance hears, and `lint-allow`
+/// accepts it like any check.
+#[test]
+fn lint_notes_audio_devices_offered_and_lint_allow_silences_it() {
+    let tmp = setup();
+    install_audio_policy(tmp.path(), true, true);
+    run(tmp.path(), &["create", "t"]);
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(&cfg, "pipewire {\n    devices\n}\n").unwrap();
+    let (code, out, err) = run(tmp.path(), &["lint", "t"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(out.contains("note[audio-devices-offered]"), "{out}");
+    assert!(
+        out.contains("hears whatever is routed into the devices it offers"),
+        "{out}"
+    );
+    std::fs::write(
+        &cfg,
+        "pipewire {\n    devices\n}\nlint-allow \"audio-devices-offered\" reason=\"effects\"\n",
+    )
+    .unwrap();
+    let (code, out, err) = run(tmp.path(), &["lint", "t"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(!out.contains("audio-devices-offered"), "{out}");
+}
+
 /// The `pulseaudio` grant is served by a PulseAudio server of this run's
 /// own under the instance's runtime directory, so the session's pulse
 /// socket is bound from nowhere.

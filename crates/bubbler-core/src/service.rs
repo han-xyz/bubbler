@@ -4009,7 +4009,10 @@ mod tests {
     #[test]
     fn pipewire_binds_this_instances_context_socket_and_not_the_sessions() {
         let a = argv(
-            &[Service::Pipewire { microphone: false }],
+            &[Service::Pipewire {
+                microphone: false,
+                devices: false,
+            }],
             &env(),
             &audio_host(),
         )
@@ -4098,7 +4101,10 @@ mod tests {
     #[test]
     fn an_audio_grant_without_pw_container_is_refused_before_anything_starts() {
         for service in [
-            Service::Pipewire { microphone: false },
+            Service::Pipewire {
+                microphone: false,
+                devices: false,
+            },
             Service::Pulseaudio { microphone: false },
         ] {
             let host: Vec<(&str, Kind)> = audio_host()

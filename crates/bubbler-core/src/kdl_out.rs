@@ -253,8 +253,11 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
             true => "dri kms=#true".to_owned(),
             false => "dri".to_owned(),
         },
-        Service::Pipewire { microphone } => audio_node("pipewire", *microphone),
-        Service::Pulseaudio { microphone } => audio_node("pulseaudio", *microphone),
+        Service::Pipewire {
+            microphone,
+            devices,
+        } => audio_node("pipewire", *microphone, *devices),
+        Service::Pulseaudio { microphone } => audio_node("pulseaudio", *microphone, false),
         Service::Portals { children } => {
             if children.is_empty() {
                 return Ok("portals".to_owned());
@@ -489,14 +492,21 @@ fn optional_suffix(optional: bool) -> &'static str {
     }
 }
 
-/// `pipewire`/`pulseaudio`: bare unless `microphone` was granted, then
-/// the block form the parser reads back as the same grant.
-fn audio_node(name: &str, microphone: bool) -> String {
-    if microphone {
-        format!("{name} {{\n    microphone\n}}")
-    } else {
-        name.to_owned()
+/// `pipewire`/`pulseaudio`: bare unless a child was granted, then the
+/// block form the parser reads back as the same grant.
+fn audio_node(name: &str, microphone: bool, devices: bool) -> String {
+    let children: Vec<&str> = [("microphone", microphone), ("devices", devices)]
+        .into_iter()
+        .filter_map(|(child, on)| on.then_some(child))
+        .collect();
+    if children.is_empty() {
+        return name.to_owned();
     }
+    let body: String = children
+        .iter()
+        .map(|child| format!("    {child}\n"))
+        .collect();
+    format!("{name} {{\n{body}}}")
 }
 
 /// `x11` and only the properties that differ from the window a bare
@@ -1342,6 +1352,19 @@ mod tests {
             ]),
         ] {
             assert!(super::node(&node).is_err(), "{node:?}");
+        }
+    }
+
+    /// `pipewire`'s `devices` child is written back after `microphone`,
+    /// alone or beside it, and read back as the same grant.
+    #[test]
+    fn pipewire_devices_round_trips() {
+        for text in [
+            "pipewire {\n    devices\n}\n",
+            "pipewire {\n    microphone\n    devices\n}\n",
+        ] {
+            let cfg = crate::config::parse(text).unwrap();
+            assert_eq!(render(&cfg).unwrap(), text);
         }
     }
 

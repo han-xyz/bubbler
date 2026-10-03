@@ -845,10 +845,16 @@ impl Merged {
                     return Ok(());
                 }
             }
-            Service::Pipewire { microphone } => {
-                if let Some((held, held_src)) =
+            Service::Pipewire {
+                microphone,
+                devices,
+            } => {
+                if let Some((held_microphone, held_devices, held_src)) =
                     self.services.iter_mut().find_map(|(s, src)| match s {
-                        Service::Pipewire { microphone: held } => Some((held, src)),
+                        Service::Pipewire {
+                            microphone: held_microphone,
+                            devices: held_devices,
+                        } => Some((held_microphone, held_devices, src)),
                         _ => None,
                     })
                 {
@@ -856,7 +862,8 @@ impl Merged {
                     // node gives, so it adds up rather than the last
                     // layer deciding it — the same rule `dri kms` and
                     // `gamepad`'s properties merge by.
-                    *held |= *microphone;
+                    *held_microphone |= *microphone;
+                    *held_devices |= *devices;
                     *held_src = src.clone();
                     return Ok(());
                 }
@@ -2572,7 +2579,10 @@ mod tests {
         );
         assert_eq!(
             r.resolve("a").unwrap().config.services,
-            vec![Service::Pipewire { microphone: true }]
+            vec![Service::Pipewire {
+                microphone: true,
+                devices: false
+            }]
         );
 
         let r = resolver(
@@ -2582,8 +2592,36 @@ mod tests {
         );
         assert_eq!(
             r.resolve("a").unwrap().config.services,
-            vec![Service::Pipewire { microphone: true }]
+            vec![Service::Pipewire {
+                microphone: true,
+                devices: false
+            }]
         );
+    }
+
+    /// `devices` ORs across layers the same way, beside `microphone` from
+    /// another layer.
+    #[test]
+    fn devices_ors_across_layers_beside_microphone() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (upper, lower) in [
+            (
+                "pipewire {\n    devices\n}\n",
+                "pipewire {\n    microphone\n}\n",
+            ),
+            (
+                "pipewire {\n    microphone\n}\n",
+                "pipewire {\n    devices\n}\n",
+            ),
+        ] {
+            let r = resolver(
+                tmp.path(),
+                &[("a", &format!("include \"b\"\n{upper}"))],
+                &[("b", lower)],
+            );
+            let audio = r.resolve("a").unwrap().config.audio().unwrap();
+            assert!(audio.microphone && audio.devices, "{upper} over {lower}");
+        }
     }
 
     #[test]
@@ -2985,7 +3023,10 @@ mod tests {
         assert_eq!(
             resolved.config.services,
             vec![
-                Service::Pipewire { microphone: false },
+                Service::Pipewire {
+                    microphone: false,
+                    devices: false
+                },
                 Service::Dri { kms: false }
             ]
         );

@@ -5340,7 +5340,10 @@ mod tests {
             instance_runtime: &dir,
             instance: "t",
             run_id: "4711",
-            audio: AudioSet { microphone: false },
+            audio: AudioSet {
+                microphone: false,
+                devices: false,
+            },
         };
         let argv =
             pw_context_argv(&e, &ctx, &host, &mut DryRunAlloc::sidecar(dir.clone())).unwrap();
@@ -5422,7 +5425,10 @@ mod tests {
             instance_runtime: &dir,
             instance: "t",
             run_id: "4711",
-            audio: AudioSet { microphone: true },
+            audio: AudioSet {
+                microphone: true,
+                devices: false,
+            },
         };
         let mut alloc = DryRunAlloc::sidecar(dir.clone());
         let argv = strs(&pw_context_argv(&e, &ctx, &host, &mut alloc).unwrap());

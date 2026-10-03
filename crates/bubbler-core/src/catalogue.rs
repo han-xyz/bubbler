@@ -139,9 +139,11 @@ pub static GRANTS: &[Grant] = &[
         cost: "Bare, with the policy drop-in installed, the sandbox may play into the \
                session's sinks and see them; every microphone and line-in is hidden. \
                `microphone` adds every `Audio/Source` the host has: capture is allowed. \
+               `devices` treats the sinks and sources the sandbox makes like the host's: \
+               it hears whatever is routed into them, and one may become the default. \
                The `camera` grant is the portal-mediated way to reach a device instead.",
         risk: Risk::Wide,
-        grammar: "pipewire [{ microphone }]",
+        grammar: "pipewire [{ microphone; devices }]",
     },
     Grant {
         node: "pulseaudio",

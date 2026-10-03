@@ -76,6 +76,11 @@ const AUDIO_POLICY_MISSING: Check = Check {
     id: "audio-policy-missing",
     severity: Severity::Warning,
 };
+// A note, as `microphone` is: the child is what the config asked for.
+const AUDIO_DEVICES_OFFERED: Check = Check {
+    id: "audio-devices-offered",
+    severity: Severity::Note,
+};
 const AUDIO_POLICY_DIFFERS: Check = Check {
     id: audio_policy::DIFFERS_CHECK,
     severity: Severity::Warning,
@@ -291,6 +296,7 @@ const X11_WITHOUT_REASON: Check = Check {
 pub const CHECKS: &[Check] = &[
     ALLOW_HOST_WILDCARD,
     APP_RUNTIME_RW,
+    AUDIO_DEVICES_OFFERED,
     AUDIO_POLICY_DIFFERS,
     AUDIO_POLICY_MISSING,
     BUNDLE_WITHOUT_DBUS,
@@ -1152,6 +1158,23 @@ fn microphone_note(i: usize, node: &KdlNode, name: &str, f: &mut Findings) {
     }
 }
 
+/// The `audio-devices-offered` note, if a `pipewire` node carries the
+/// `devices` child.
+fn devices_note(i: usize, node: &KdlNode, f: &mut Findings) {
+    if kids(node).any(|c| c.name().value() == "devices") {
+        f.push(
+            i,
+            node,
+            &AUDIO_DEVICES_OFFERED,
+            "`pipewire { devices }` treats the instance's sinks and sources like the \
+             host's: it hears whatever is routed into the devices it offers, and one of \
+             them may become the session's default"
+                .to_owned(),
+            "drop the child unless the application exists to offer audio devices",
+        );
+    }
+}
+
 /// The `audio-policy-missing` warning. `pipewire` and `pulseaudio`
 /// share one instance-wide audio reach — [`InstanceConfig::audio`] ORs
 /// them the same way — so this is called once per run over every layer
@@ -1400,7 +1423,10 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
                 "drop the child unless the application keeps a secret through the portal, \
                  or accept it with `lint-allow \"secrets-access\" reason=\"...\"`",
             ),
-            "pipewire" => microphone_note(i, node, "pipewire", f),
+            "pipewire" => {
+                microphone_note(i, node, "pipewire", f);
+                devices_note(i, node, f);
+            }
             "pulseaudio" => microphone_note(i, node, "pulseaudio", f),
             "dbus" => dbus_node(i, node, f),
             "system-bus" => system_bus(i, node, f),

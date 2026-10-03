@@ -299,6 +299,12 @@ const CHECK_LINES: &[(&str, &str)] = &[
          other instance naming that id connects to.",
     ),
     (
+        "audio-devices-offered",
+        "A `devices` child on `pipewire`: the instance's sinks and sources are treated \
+         like the host's, so it hears whatever is routed into them and one may become \
+         the default.",
+    ),
+    (
         "audio-policy-differs",
         "A `pipewire` or `pulseaudio` grant where an installed WirePlumber policy file is \
          not the one this bubbler embeds: under an older policy a sandbox can claim the \

@@ -237,9 +237,11 @@ pub fn pulse_command() -> Vec<OsString> {
 
 /// The grant set as the policy drop-in matches it.
 pub fn grant(audio: AudioSet) -> &'static str {
-    match audio.microphone {
-        true => "playback,microphone",
-        false => "playback",
+    match (audio.microphone, audio.devices) {
+        (false, false) => "playback",
+        (true, false) => "playback,microphone",
+        (false, true) => "playback,devices",
+        (true, true) => "playback,microphone,devices",
     }
 }
 
@@ -282,7 +284,10 @@ mod tests {
     use crate::host::fake::{FakeHost, types};
 
     fn set(microphone: bool) -> AudioSet {
-        AudioSet { microphone }
+        AudioSet {
+            microphone,
+            devices: false,
+        }
     }
 
     #[test]
@@ -295,6 +300,22 @@ mod tests {
             properties("vesktop", "4711", set(true)),
             r#"{"pipewire.sec.engine":"org.bubbler","pipewire.sec.app-id":"vesktop","pipewire.sec.instance-id":"4711","pipewire.access":"restricted","pipewire.sec.bubbler.audio":"playback,microphone"}"#
         );
+    }
+
+    /// `devices` joins the grant as a word of its own, after
+    /// `microphone` where both are granted.
+    #[test]
+    fn the_grant_carries_devices_as_a_word() {
+        for (microphone, grant_string) in [
+            (false, "playback,devices"),
+            (true, "playback,microphone,devices"),
+        ] {
+            let audio = AudioSet {
+                microphone,
+                devices: true,
+            };
+            assert_eq!(grant(audio), grant_string);
+        }
     }
 
     /// The parser cannot produce such a name today; the encoder still
