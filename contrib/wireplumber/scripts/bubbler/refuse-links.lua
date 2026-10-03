@@ -45,11 +45,10 @@
 -- `Audio/Source*` or `Audio/Duplex` node, and only where the instance
 -- was granted `microphone`; and the sandbox links nothing itself.
 --
--- WirePlumber links no other client's stream to a sandbox's node that
--- is not that stream's own, and no such node becomes the session's
--- default; a host stream aimed at one goes to what a sandbox's filter
--- stood in front of, else the default, and one pinned to it with
--- `node.dont-fallback` gets no link (docs/threat-model.md, known gaps).
+-- A sandbox offers no device: its nodes that are not audio streams never
+-- become session items, so WirePlumber links no other client's stream to
+-- them and makes none of them a default or a filter. WirePlumber links
+-- no other client's stream to a sandbox's stream either.
 --
 -- A link with a sandbox's node at either end is destroyed when
 -- WirePlumber sees it, unless WirePlumber made it and it is one the
@@ -57,8 +56,6 @@
 -- destroyed.
 
 local lutils = require ("linking-utils")
-local cutils = require ("common-utils")
-local futils = require ("filter-utils")
 local log = Log.open_topic ("s-linking")
 
 -- The engine name bubbler gives every security context it creates.
@@ -181,166 +178,48 @@ SimpleEventHook {
   end
 }:register ()
 
--- The first enabled smart filter of the host's in front of `target`, or
--- of no target at all where `target` is nil, in WirePlumber's chain
--- order: futils.get_filter_from_target's search, passing over a
--- sandbox's filter that put itself first in the chain.
-local function host_filter (source, si_props, target)
-  local direction = cutils.getTargetDirection (si_props)
-  for _, filter in ipairs (futils.filters) do
-    if filter.direction == direction and
-        filter.media_type == si_props ["media.type"] and
-        filter.smart and not filter.disabled and
-        ((target ~= nil and filter.target ~= nil and filter.target.id == target.id) or
-         (target == nil and filter.targetless)) and
-        not foreign_sandbox_node (source, si_props, filter.main_si.properties) then
-      return filter.main_si
-    end
-  end
-  return nil
+-- Whether the client's grant lets its own devices stand beside the
+-- host's.
+local function offers_devices (client)
+  return string.find (client.properties ["pipewire.sec.bubbler.audio"] or "",
+      "devices", 1, true) ~= nil
 end
 
--- What a stream sent to `filter` was aimed at, where `filter` is a smart
--- filter's main node with a target, else nil.
-local function filter_target (filter)
-  for _, entry in ipairs (futils.filters) do
-    if entry.main_si.id == filter.id then
-      return entry.target
-    end
-  end
-  return nil
-end
-
--- Whether the stream is a smart filter's own node: host_filter would find
--- that filter, or one before it in the chain, and neither can be linked.
-local function filters_own_stream (si_props)
-  local link_group = si_props ["node.link-group"]
-  if link_group == nil then
-    return false
-  end
-  for _, entry in ipairs (futils.filters) do
-    if entry.link_group == link_group and entry.smart and
-        not entry.disabled then
-      return true
-    end
-  end
-  return false
-end
-
--- WirePlumber's finders can still aim a stream at a sandbox's node: its
--- smart filter (linking/get-filter-from-target), a node named as the
--- stream's target (linking/find-defined-target) or one ranked above the
--- host's own (linking/find-best-target). Refused after
--- linking/prepare-link, the stream would play nowhere, so here, after
--- every finder and before prepare-link, it is sent to what a sandbox's
--- filter stood in front of, else the session's default (never a
--- sandbox's node), through the host's first smart filter in front of
--- that, a smart filter's own stream directly; and a stream pinned with
--- `node.dont-fallback` to a sandbox's node is left as
--- find-defined-target leaves one whose target is missing. Where this
--- differs from WirePlumber's own search: docs/threat-model.md, known gaps.
+-- A sandbox offers no device: of its nodes only its audio streams become
+-- session items. Every finder, the smart-filter chain
+-- (lib/filter-utils.lua) and the default-node rescan search session items
+-- alone, so a sink, source or filter a sandbox makes is never a target,
+-- a filter or a default for anyone; the node stays in the graph,
+-- unlinked, and its client gets no error. node/create-item is the only
+-- maker of a node's session item, and stopping the event before it keeps
+-- it from running for this node.
 SimpleEventHook {
-  name = "bubbler/no-target-from-a-sandbox",
-  after = { "linking/find-defined-target",
-            "linking/find-audio-group-target",
-            "linking/find-filter-target",
-            "linking/find-media-role-target",
-            "linking/find-media-role-sink-target",
-            "linking/find-default-target",
-            "linking/find-best-target",
-            "linking/get-filter-from-target" },
-  before = "linking/prepare-link",
+  name = "bubbler/no-device-from-a-sandbox",
+  after = "bubbler/destroy-refused-link-once-its-ends-are-known",
+  before = "node/create-item",
   interests = {
     EventInterest {
-      Constraint { "event.type", "=", "select-target" },
+      Constraint { "event.type", "=", "node-added" },
     },
   },
   execute = function (event)
-    local source, _, si, si_props, si_flags, target =
-        lutils:unwrap_select_target_event (event)
-    if not target or
-        not foreign_sandbox_node (source, si_props, target.properties) then
+    local node = event:get_subject ()
+    local client = bubbler_client (event:get_source (),
+        node.properties ["client.id"])
+    if not client or offers_devices (client) then
       return
     end
-
-    local aimed = filter_target (target)
-    if aimed and foreign_sandbox_node (source, si_props, aimed.properties) then
-      aimed = nil
-    end
-    local defined = si_flags.has_defined_target
-    if not aimed and defined and
-        cutils.parseBool (si_props ["node.dont-fallback"]) then
-      log:info (si, string.format ("%s is pinned to %s, a sandbox's node",
-          tostring (si_props ["node.name"]),
-          tostring (target.properties ["node.name"])))
-      event:set_data ("target", nil)
-      if not cutils.parseBool (si_props ["node.linger"]) then
-        local node = si:get_associated_proxy ("node")
-        lutils.sendClientError (event, node, -2, "defined target not found")
-        node:request_destroy ()
-      end
-      event:stop_processing ()
+    local class = node.properties ["media.class"]
+    if class == AUDIO_STREAM_CLASS.output or
+        class == AUDIO_STREAM_CLASS.input then
       return
     end
-
-    if not aimed then
-      aimed = lutils.findDefaultLinkable (si)
-      defined = false
-      si_flags.has_defined_target = false
-      si_flags.has_node_defined_target = false
-    end
-    local chosen = aimed
-    if aimed and not filters_own_stream (si_props) then
-      chosen = host_filter (source, si_props, aimed) or
-          (not defined and host_filter (source, si_props, nil)) or aimed
-    end
-
-    local compatible, can_passthrough
-    if chosen then
-      compatible, can_passthrough = lutils.checkPassthroughCompatibility (si, chosen)
-    end
-    if chosen and compatible and lutils.canLink (si_props, chosen) and
-        not foreign_sandbox_node (source, si_props, chosen.properties) then
-      log:info (si, string.format ("%s goes to %s, not %s",
-          tostring (si_props ["node.name"]),
-          tostring (chosen.properties ["node.name"]),
-          tostring (target.properties ["node.name"])))
-      si_flags.can_passthrough = can_passthrough
-      event:set_data ("target", chosen)
-    else
-      event:set_data ("target", nil)
-    end
-  end
-}:register ()
-
--- Refusing the link alone would leave every host stream unlinked while a
--- sandbox's node is the default: find-default-target picks the default
--- before any later hook can refuse it. So a sandbox's node is never a
--- candidate for the default in the first place.
-SimpleEventHook {
-  name = "bubbler/no-default-from-a-sandbox",
-  before = { "default-nodes/find-selected-default-node",
-             "default-nodes/find-stored-default-node",
-             "default-nodes/find-best-default-node" },
-  interests = {
-    EventInterest {
-      Constraint { "event.type", "=", "select-default-node" },
-    },
-  },
-  execute = function (event)
-    local available = event:get_data ("available-nodes")
-    available = available and available:parse ()
-    if not available then
-      return
-    end
-    local source = event:get_source ()
-    local kept = {}
-    for _, node_props in ipairs (available) do
-      if not bubbler_client (source, node_props ["client.id"]) then
-        table.insert (kept, Json.Object (node_props))
-      end
-    end
-    event:set_data ("available-nodes", Json.Array (kept))
+    log:info (node, string.format ("%s (client %s, %s) is no device of " ..
+        "the session: not an audio stream of a sandbox",
+        tostring (node.properties ["node.name"]),
+        tostring (node.properties ["client.id"]),
+        tostring (class)))
+    event:stop_processing ()
   end
 }:register ()
 
@@ -355,6 +234,23 @@ local STREAM_FACTORY = "client-node"
 local factories = ObjectManager {
   Interest { type = "factory" },
 }
+
+-- A factory the graph gains after a sandbox's access was decided, or one
+-- this object manager had not listed yet when it was, is hidden from
+-- every sandbox already connected. Before the standard event source is
+-- loaded no access has been decided, and bubbler/hide-factories will
+-- find the factory listed here.
+factories:connect ("object-added", function (_, factory)
+  local source = Plugin.find ("standard-event-source")
+  if not source or factory.properties ["factory.name"] == STREAM_FACTORY then
+    return
+  end
+  for client in source:call ("get-object-manager", "client"):iterate () do
+    if client.properties ["pipewire.sec.engine"] == BUBBLER_ENGINE then
+      client:update_permissions { [factory ["bound-id"]] = "-" }
+    end
+  end
+end)
 factories:activate ()
 
 -- Before the permission manager attaches, not after: the attach is the

@@ -9,6 +9,14 @@
   with `ENOSYS` for an application that may nest, so a nested bubblewrap can
   mount with it; with `userns "disable"` and in every sidecar all seven stay
   denied, as do `clone3`, `listns` and `fchroot` everywhere.
+- A sandbox offers no audio device: a sink, source or filter it creates is
+  kept out of WirePlumber's session, so it is never a default, a target or a
+  smart filter for another client. This replaces 0.24.2's redirect of host
+  streams, which sent a stream pinned to a present device whose name a
+  sandbox copied nowhere and could pass by the host's own smart filters.
+- The audio policy files changed: rewrite them (`bubbler audio-policy
+  --print` and `--print --script`, or the package update) and restart
+  WirePlumber; `bubbler lint` reports `audio-policy-differs` until then.
 
 ### Changed
 
