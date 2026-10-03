@@ -588,7 +588,7 @@ fn filter_lines(cfg: &InstanceConfig, loaded: bool, log: bool) -> Vec<String> {
         .map(|(_, name)| format!("ioctl {name} ({})", answer(Errno::Eperm)));
     let personality = set.personality.then(|| {
         format!(
-            "personality other than PER_LINUX, PER_LINUX32, UNAME26 or the query ({})",
+            "personality other than PER_LINUX, PER_LINUX32, UNAME26 (alone or with PER_LINUX32) or the query ({})",
             answer(Errno::Eperm)
         )
     });
@@ -2099,7 +2099,7 @@ bwrap
         assert!(
             lists(
                 &out,
-                "personality other than PER_LINUX, PER_LINUX32, UNAME26 or the query (EPERM)"
+                "personality other than PER_LINUX, PER_LINUX32, UNAME26 (alone or with PER_LINUX32) or the query (EPERM)"
             ),
             "{out:#?}"
         );
