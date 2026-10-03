@@ -2357,8 +2357,8 @@ fn on_path(bin: &str) -> Option<PathBuf> {
             return None;
         }
         let candidate = dir.join(bin);
-        rustix::fs::access(&candidate, Access::EXEC_OK)
-            .is_ok()
+        // A directory passes the access check; execvp would go on past it.
+        (candidate.is_file() && rustix::fs::access(&candidate, Access::EXEC_OK).is_ok())
             .then_some(candidate)
     })
 }

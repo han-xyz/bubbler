@@ -33,64 +33,31 @@
   processes in a user namespace outside the sandbox's ancestry, such as
   another sandbox's egress proxy. The application could not reach it either
   way: it runs in a nested user namespace and a pid namespace of its own.
-- A sandbox with a `pipewire` or `pulseaudio` grant could, now and then,
-  make a link of its own in the first instant of a new PipeWire connection
-  and keep it, recording the output mix or another application's stream
-  without the `microphone` grant. The linking hook now hides the link factory
-  before WirePlumber grants the connection anything, and destroys any link
-  to or from a sandbox's node that is not one of its own streams as
-  WirePlumber linked it. Reinstall the policy (`bubbler audio-policy
-  --print`, `--print --script`) and restart WirePlumber.
-- A sandbox with a `pipewire` grant could record every host
-  stream without making a link: an `Audio/Sink` it created with a high
-  `priority.session` became the default sink where none was configured, and
-  WirePlumber linked host streams into it (measured on WirePlumber 0.5.18;
-  an `Audio/Source` it offered took host recorders the same way). The linking
-  hook now refuses any link to a sandbox's node that is not that stream's
-  own, and keeps a sandbox's nodes out of default-node selection so host
-  streams go to the host's default; the default is decided again when a
-  sandbox's client becomes known after its node. The same reinstall and
-  restart applies.
-- A sandbox with a `pipewire` grant could give itself the
-  `microphone` grant: the grant was the client property `bubbler.audio`,
-  which a client may set on itself before WirePlumber sees it (measured: a
-  client configured with `bubbler.audio = "playback,microphone"` recorded
-  the source). The grant is now `pipewire.sec.bubbler.audio`, which only the
-  security context sets. Under a policy installed by an earlier bubbler
-  every grant gets the playback rules and a sandbox can still claim the
-  microphone; bubbler now warns before a run, and `bubbler lint` warns
-  `audio-policy-differs`, when the installed drop-in or hook WirePlumber
-  loads is not its own, naming the file and what writes it again. A copy
-  edited on purpose is accepted per config with
-  `lint-allow "audio-policy-differs" reason="..."`. The check now follows
-  WirePlumber's own search (`/etc/xdg`, `$XDG_CONFIG_DIRS`,
-  `$XDG_DATA_DIRS` included), so a stale copy that outranks the packaged
-  one is found, and a copy WirePlumber cannot read counts as missing. The
-  same reinstall and restart applies.
-- Without the `microphone` grant a sandbox could still see every source
-  that is not exactly `Audio/Source`: `Audio/Source/Virtual` (echo-cancel,
-  noise suppression) and `Audio/Duplex` (measured); with the claimed grant
-  above it could record them too, by the same rule (not measured). The playback rules now hide every class
-  beginning `Audio/Source` and `Audio/Duplex`, and the linking hook refuses
-  them by the same test; with the grant a sandbox records from them,
-  `Audio/Duplex` included, which the hook used to refuse as a sink.
-- A sandbox with a `pipewire` grant could silence the desktop: while it
-  offered a smart filter (`filter.smart`), every host stream that started
-  was refused the filter and left unlinked, and so was a host stream aimed
-  at a sink it offered (measured). Such a stream now plays on what the
-  sandbox's filter stood in front of, else the default, through the host's
-  own smart filters (a smart filter's own stream directly), and one pinned
-  to it with `node.dont-fallback` gets no link. A host stream pinned to a
-  device whose name a sandbox's node also carries can still be refused or
-  sent to the default; that is to be redesigned in 0.25.0.
-- A sandbox with a `pipewire` grant could create a node the daemon owns
-  through the `adapter` factory (measured); made to linger, it carried no
-  owner, so no rule of the policy applied to it and it outlived the
-  sandbox. The linking hook now takes every factory but `client-node`, the
-  one streams are made through, away from a sandbox.
+- The audio fixes below change the WirePlumber policy: reinstall it
+  (`bubbler audio-policy --print`, `--print --script`) and restart WirePlumber.
+  How each was measured and the gaps that remain are in the threat model's
+  Audio section (`docs/threat-model.md`).
+- A sandbox with a `pipewire` or `pulseaudio` grant could make a link of its
+  own in the first instant of a connection and record without the
+  `microphone` grant; the policy now hides the link factory first and
+  destroys any link that is not one of the sandbox's own streams.
+- A sandbox with a `pipewire` grant could become the default sink or source
+  and receive host streams; its nodes are now out of default-node selection
+  and no host stream is linked to them.
+- A sandbox with a `pipewire` grant could give itself the `microphone` grant;
+  the grant is now a property only the security context sets, and bubbler
+  and `bubbler lint` warn (`audio-policy-differs`) when the policy
+  WirePlumber loads is not this bubbler's.
+- Without the `microphone` grant a sandbox could still see virtual and duplex
+  sources; every `Audio/Source*` and `Audio/Duplex` class is now hidden.
+- A sandbox with a `pipewire` grant could silence the desktop by offering a
+  smart filter or a sink a host stream was aimed at; such host streams now
+  play on what the sandbox's filter stood in front of, else the default.
+- A sandbox with a `pipewire` grant could create an ownerless node that
+  outlived it through the `adapter` factory; it now gets no factory but
+  `client-node`.
 - A sandbox's stream of a class other than `Stream/Output/Audio` or
-  `Stream/Input/Audio` was linked by WirePlumber and the link then
-  destroyed by the hook (measured); such a stream now gets no link.
+  `Stream/Input/Audio` now gets no link.
 
 ## 0.24.1
 

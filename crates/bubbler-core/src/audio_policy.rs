@@ -281,7 +281,7 @@ pub fn differs_help(paths: &[PathBuf], env: &Env) -> String {
             if path.starts_with(&env.config_home) || path.starts_with(&env.data_home) {
                 format!(
                     "`bubbler audio-policy --print{script} > {}`",
-                    path.display()
+                    shell_word(path)
                 )
             } else if path.starts_with(DATA_DIR) {
                 format!("update the package that installed {}", path.display())
@@ -294,11 +294,8 @@ pub fn differs_help(paths: &[PathBuf], env: &Env) -> String {
                 format!(
                     "`mkdir -p {} && bubbler audio-policy --print{script} > {}`, which \
                      outranks {}",
-                    user_copy
-                        .parent()
-                        .expect("the user's copy has a directory")
-                        .display(),
-                    user_copy.display(),
+                    shell_word(user_copy.parent().expect("the user's copy has a directory")),
+                    shell_word(&user_copy),
                     path.display()
                 )
             }
@@ -309,6 +306,20 @@ pub fn differs_help(paths: &[PathBuf], env: &Env) -> String {
          accepted with `lint-allow \"{DIFFERS_CHECK}\" reason=\"...\"`",
         steps.join(" and ")
     )
+}
+
+/// `path` as one word of a POSIX shell command: as it is where a shell
+/// would leave every character alone, else in single quotes.
+fn shell_word(path: &Path) -> String {
+    let text = path.display().to_string();
+    let is_plain = !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c));
+    if is_plain {
+        return text;
+    }
+    format!("'{}'", text.replace('\'', r"'\''"))
 }
 
 #[cfg(test)]
@@ -534,6 +545,46 @@ mod tests {
             assert!(!help.contains(&format!("> {}", system.display())), "{help}");
             assert!(!help.contains("sudo"), "{help}");
         }
+    }
+
+    #[test]
+    fn differs_help_quotes_a_path_the_shell_would_split() {
+        let e = Env {
+            config_home: PathBuf::from("/home/user/my config"),
+            ..env()
+        };
+        let system = Path::new("/etc/xdg/wireplumber/wireplumber.conf.d").join(DROP_IN_NAME);
+        let help = differs_help(std::slice::from_ref(&system), &e);
+        assert!(
+            help.contains(&format!(
+                "`mkdir -p '/home/user/my config/wireplumber/wireplumber.conf.d' && \
+                 bubbler audio-policy --print > \
+                 '/home/user/my config/wireplumber/wireplumber.conf.d/{DROP_IN_NAME}'`"
+            )),
+            "{help}"
+        );
+        let user = e
+            .config_home
+            .join("wireplumber/wireplumber.conf.d")
+            .join(DROP_IN_NAME);
+        let help = differs_help(std::slice::from_ref(&user), &e);
+        assert!(
+            help.contains(&format!(
+                "`bubbler audio-policy --print > \
+                 '/home/user/my config/wireplumber/wireplumber.conf.d/{DROP_IN_NAME}'`"
+            )),
+            "{help}"
+        );
+        let quote = Path::new("/home/it's").join(DROP_IN_NAME);
+        let e = Env {
+            config_home: PathBuf::from("/home/it's"),
+            ..env()
+        };
+        let help = differs_help(std::slice::from_ref(&quote), &e);
+        assert!(
+            help.contains(&format!("> '/home/it'\\''s/{DROP_IN_NAME}'`")),
+            "{help}"
+        );
     }
 
     #[test]

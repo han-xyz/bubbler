@@ -1261,6 +1261,33 @@ fn real_bwrap_a_run_with_path_unset_still_finds_bwrap() {
     assert_eq!(out.status.code(), Some(0), "{err}");
 }
 
+/// A directory named `bwrap` earlier on `PATH` is passed over, as execvp
+/// passes it over.
+#[test]
+fn real_bwrap_a_directory_named_bwrap_on_path_is_not_bwrap() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    if !["/usr/bin/bwrap", "/bin/bwrap"]
+        .iter()
+        .any(|p| Path::new(p).is_file())
+    {
+        say("skipping: bwrap is in neither /usr/bin nor /bin");
+        return;
+    }
+    let tmp = setup();
+    let bin = tmp.path().join("dir-bin");
+    std::fs::create_dir_all(bin.join("bwrap")).unwrap();
+    let out = bubbler_live(tmp.path(), &init)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .args(["try", "--profile", "generic", "--", "/usr/bin/true"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+}
+
 /// The environment every sandbox spawn of `try --grant <grants>` was
 /// started with, one line per spawn: a `bwrap` on `PATH` records its own
 /// and execs the real one. The version probe passes no `--args` and is
@@ -1303,7 +1330,11 @@ fn sandbox_spawn_environs(mut bubbler: Command, root: &Path, grants: &[&str]) ->
 
 #[test]
 fn real_bwrap_the_dbus_proxy_bwrap_gets_nothing_of_the_callers_environment() {
-    if !require_dbus() || !Path::new("/usr/bin/bwrap").is_file() {
+    if !require_dbus() {
+        return;
+    }
+    if !Path::new("/usr/bin/bwrap").is_file() {
+        say("skipping: the recording bwrap execs /usr/bin/bwrap");
         return;
     }
     let Some(init) = real_init() else { return };
@@ -1318,7 +1349,11 @@ fn real_bwrap_the_dbus_proxy_bwrap_gets_nothing_of_the_callers_environment() {
 
 #[test]
 fn real_bwrap_the_audio_bwraps_get_nothing_of_the_callers_environment() {
-    if !require_pipewire_session() || !Path::new("/usr/bin/bwrap").is_file() {
+    if !require_pipewire_session() {
+        return;
+    }
+    if !Path::new("/usr/bin/bwrap").is_file() {
+        say("skipping: the recording bwrap execs /usr/bin/bwrap");
         return;
     }
     let Some(init) = real_init() else { return };
@@ -1341,7 +1376,11 @@ fn real_bwrap_the_audio_bwraps_get_nothing_of_the_callers_environment() {
 
 #[test]
 fn real_bwrap_the_wayland_proxy_bwrap_gets_nothing_of_the_callers_environment() {
-    if !require_security_context() || !Path::new("/usr/bin/bwrap").is_file() {
+    if !require_security_context() {
+        return;
+    }
+    if !Path::new("/usr/bin/bwrap").is_file() {
+        say("skipping: the recording bwrap execs /usr/bin/bwrap");
         return;
     }
     let Some(init) = real_init() else { return };
