@@ -1,6 +1,6 @@
 pkgbase = bubbler
 	pkgdesc = Application sandboxing on top of bubblewrap, with named instances, explicit resource grants, and a profile library
-	pkgver = 0.24.1
+	pkgver = 0.24.2
 	pkgrel = 1
 	url = https://github.com/han-xyz/bubbler
 	arch = x86_64
@@ -12,7 +12,7 @@ pkgbase = bubbler
 	depends = libseccomp
 	depends = libgcc
 	depends = glibc
-	source = git+https://github.com/han-xyz/bubbler.git#tag=8d0b893038382706a9402dcd7bbc79d46300f18e
+	source = git+https://github.com/han-xyz/bubbler.git#tag=887b9033b7150d0f6d0dd976cbbec9e0ca47b67d
 	sha256sums = SKIP
 
 pkgname = bubbler
