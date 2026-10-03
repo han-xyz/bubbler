@@ -213,6 +213,47 @@ git checkout -q -b other
 RELEASE_MAKEPKG=false check refuses --tag 9.9.9
 check grep -qx 'pkgver=1.0.0' aur/bubbler/PKGBUILD
 
+new_repo bumphook feat/x
+git checkout -q -b other
+printf '#!/bin/sh\nexit 1\n' >.git/hooks/pre-commit
+chmod +x .git/hooks/pre-commit
+check refuses 9.9.9
+
+new_repo taghook feat/x
+git checkout -q -b other
+"$release" 9.9.9 >/dev/null
+printf '#!/bin/sh\nexit 1\n' >.git/hooks/pre-commit
+chmod +x .git/hooks/pre-commit
+check refuses --tag 9.9.9
+check grep -qx 'pkgver=1.0.0' aur/bubbler/PKGBUILD
+check grep -qx '_tag=0000000000000000000000000000000000000000' aur/bubbler/PKGBUILD
+
+if [ "$(id -u)" -ne 0 ]; then
+    new_repo redo feat/x
+    git checkout -q -b other
+    "$release" 9.9.9 >/dev/null
+    new_aurs "$work/redo-aurs"
+    chmod a-w "$work/redo-aurs"
+    err="$("$release" --tag 9.9.9 "$work/redo-aurs" 2>&1 >/dev/null)" && failures=$((failures + 1))
+    chmod u+w "$work/redo-aurs"
+    check test "${err%%: *}" = release
+    check grep -qF -- "--tag 9.9.9 $work/redo-aurs" <<<"$err"
+    check test "$(git cat-file -t v9.9.9)" = tag
+    check test "$(git log -1 --format=%s)" = "chore: the AUR package builds 9.9.9"
+    check test -z "$(git status --porcelain)"
+    check test -z "$(git -C "$work/redo-aurs" status --porcelain)"
+    check test "$(ls -A "$work/redo-aurs" | LC_ALL=C sort | tr '\n' ' ')" = ".git PKGBUILD "
+    redo_head="$(git rev-parse HEAD)"
+    redo_out="$("$release" --tag 9.9.9 "$work/redo-aurs")"
+    check test "$(git rev-parse HEAD)" = "$redo_head"
+    check grep -qF "git -C $work/redo-aurs commit" <<<"$redo_out"
+    check test "$(head -1 "$work/redo-aurs/PKGBUILD")" = "# Maintainer: Real Maintainer"
+    check grep -qx "_tag=$(git rev-parse v9.9.9)" "$work/redo-aurs/PKGBUILD"
+    check grep -qx 'srcinfo for 9.9.9' "$work/redo-aurs/.SRCINFO"
+    check test -f "$work/redo-aurs/bubbler.install"
+    check test "$(ls -A "$work/redo-aurs" | LC_ALL=C sort | tr '\n' ' ')" = ".SRCINFO .git PKGBUILD bubbler.install "
+fi
+
 if [ "$failures" -ne 0 ]; then
     echo "$failures check(s) failed" >&2
     exit 1

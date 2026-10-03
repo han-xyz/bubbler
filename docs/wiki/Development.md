@@ -173,7 +173,10 @@ PKGBUILD whose first line starts with `# Maintainer:`.
 
 Every refusal comes before the first change. If a step fails after that (a
 sed that did not match, `cargo`, `makepkg`, a commit hook), the script removes
-the tag it made and restores the files it touched.
+the tag it made and restores the files it touched to the last commit. If only
+the `aurs-dir` write fails, the tag and both commits stay, nothing is left in
+`aurs-dir`, and the script prints the command to redo just the copy:
+`scripts/release --tag X.Y.Z aurs-dir` with the tag already made does only that.
 
 Merging, pushing and the AUR push stay manual. `scripts/release.test` checks
 both commands in a throwaway repository.

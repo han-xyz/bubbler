@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # scripts/release <version>                  version bump commit
-# scripts/release --tag <version> [aurs-dir] tag, AUR package commit
+# scripts/release --tag <version> [aurs-dir] tag, AUR package commit; with the
+#                                            tag already made, only the aurs-dir copy
 # Never merges or pushes. A refusal changes nothing; a failure after the first
 # change is rolled back.
 set -euo pipefail
@@ -23,11 +24,11 @@ rollback() {
     [ "$status" -eq 0 ] && exit 0
     case "$phase" in
         bump)
-            git checkout -q -- Cargo.toml Cargo.lock fuzz/Cargo.lock
+            git checkout -q HEAD -- Cargo.toml Cargo.lock fuzz/Cargo.lock
             echo "release: rolled back the version changes" >&2
             ;;
         tag)
-            [ -z "$tag_made" ] || git tag -d "$tag_made" >/dev/null
+            [ -z "$tag_made" ] || git tag -d "$tag_made" >/dev/null 2>&1 || true
             git reset -q --soft "$head_before"
             git checkout -q "$head_before" -- aur/bubbler
             echo "release: rolled back the tag and aur/bubbler" >&2
@@ -109,20 +110,57 @@ require_aurs_checkout() {
     esac
 }
 
+tag_is_made() {
+    local version="$1" object commit
+    object="$(git rev-parse "refs/tags/v$version")"
+    commit="$(git rev-parse "refs/tags/v$version^{commit}")"
+    [ "$(git show "$commit:Cargo.toml" | workspace_version)" = "$version" ] \
+        && git show HEAD:aur/bubbler/PKGBUILD | grep -qx "_tag=$object"
+}
+
+copy_to_aurs() {
+    local version="$1" aurs_dir="$2" staging
+    staging="$(mktemp -d "$aurs_dir/.release.XXXXXX")" || return 1
+    {
+        head -n1 "$aurs_dir/PKGBUILD"
+        tail -n +2 aur/bubbler/PKGBUILD
+    } >"$staging/PKGBUILD" \
+        && cp aur/bubbler/bubbler.install aur/bubbler/.SRCINFO "$staging/" \
+        && mv "$staging/PKGBUILD" "$staging/bubbler.install" "$staging/.SRCINFO" "$aurs_dir/" \
+        || { rm -rf "$staging"; return 1; }
+    rmdir "$staging"
+    echo "Written to $aurs_dir, nothing committed there. To commit:"
+    printf 'git -C %q commit -am "Update to %s"\n' "$aurs_dir" "$version"
+}
+
+copy_or_die() {
+    local version="$1" aurs_dir="$2"
+    copy_to_aurs "$version" "$aurs_dir" 2>/dev/null || {
+        echo "release: could not write to '$aurs_dir'; the tag and the two commits in this repository are done" >&2
+        printf 'release: redo only the copy with: scripts/release --tag %s %q\n' "$version" "$aurs_dir" >&2
+        exit 1
+    }
+}
+
 tag() {
     local version="$1" aurs_dir="$2" tag_object
     require_version "$version"
     require_clean_tree
     [ "$(git show HEAD:Cargo.toml | workspace_version)" = "$version" ] \
         || die "HEAD's Cargo.toml is not at $version; run scripts/release $version first"
-    git rev-parse -q --verify "refs/tags/v$version" >/dev/null && die "tag v$version already exists"
+    if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+        [ -n "$aurs_dir" ] && tag_is_made "$version" || die "tag v$version already exists"
+        require_aurs_checkout "$aurs_dir"
+        copy_or_die "$version" "$aurs_dir"
+        return 0
+    fi
     command -v "$MAKEPKG" >/dev/null || die "makepkg is not installed; it writes .SRCINFO"
     [ -z "$aurs_dir" ] || require_aurs_checkout "$aurs_dir"
 
     head_before="$(git rev-parse HEAD)"
     phase=tag
-    git tag -a "v$version" -m "v$version"
     tag_made="v$version"
+    git tag -a "v$version" -m "v$version"
     tag_object="$(git rev-parse "v$version")"
     set_pkgbuild "$version" "$tag_object"
     (cd aur/bubbler && "$MAKEPKG" --printsrcinfo >.SRCINFO)
@@ -130,15 +168,7 @@ tag() {
     git commit -q -m "chore: the AUR package builds $version"
     phase=""
 
-    [ -n "$aurs_dir" ] || return 0
-    {
-        head -n1 "$aurs_dir/PKGBUILD"
-        tail -n +2 aur/bubbler/PKGBUILD
-    } >"$aurs_dir/PKGBUILD.new"
-    mv "$aurs_dir/PKGBUILD.new" "$aurs_dir/PKGBUILD"
-    cp aur/bubbler/bubbler.install aur/bubbler/.SRCINFO "$aurs_dir/"
-    echo "Written to $aurs_dir, nothing committed there. To commit:"
-    printf 'git -C %q commit -am "Update to %s"\n' "$aurs_dir" "$version"
+    [ -z "$aurs_dir" ] || copy_or_die "$version" "$aurs_dir"
 }
 
 resolve_dir() {
