@@ -91,7 +91,11 @@ handed to the sandbox as an inherited file descriptor, so nothing inside can
 reach the path. `run` on an instance that is already running says so and
 execs into it instead of starting a second sandbox; configuration changes
 apply on the next start. Of two starts made at the same moment, one starts
-the sandbox and the other execs into it the same way.
+the sandbox and the other execs into it the same way. A start made while
+the previous run is still ending waits for that run's teardown, which can
+take a few seconds, and then starts a fresh sandbox. One made in the instant
+after the sandbox exits, before its run has noticed, can still fail to start
+or lose portal access; start it again.
 An exec'd process is given whatever the terminal mode decides on (see
 "Terminal"), and descriptors passed to exec'd commands
 are reachable by the sandboxed application through `/proc`: exec is a
@@ -4062,7 +4066,8 @@ start, and the checked sockets `bus`,
 `system` and `a11y` — one per granted bus — beside it, and a `portals` grant adds
 `$XDG_RUNTIME_DIR/.flatpak/bubbler-<name>/`, creating `.flatpak/` if it is
 missing. Everything a run makes there is removed again when it ends, with two
-exceptions: the start lock, which stays, and an `app-runtime` grant's
+exceptions: the start lock, which stays until `$XDG_RUNTIME_DIR` is cleared
+at logout, and an `app-runtime` grant's
 `$XDG_RUNTIME_DIR/app/<id>` (and `app/` above it), left since a peer of
 another instance may still be using it.
 `HOME` and `XDG_RUNTIME_DIR` must be set and non-empty. Your profiles live in
