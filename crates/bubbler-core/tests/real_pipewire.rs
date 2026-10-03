@@ -2507,6 +2507,116 @@ fn a_host_stream_pinned_to_a_device_links_to_it_beside(copy: &str, copy_name: &s
     }
 }
 
+/// A context's stream that takes a device's name a second after it was
+/// created, while the device is there, and one created under the device's
+/// name that drops it a second later, before the device appears: a host
+/// stream pinned to the device is linked to it. WirePlumber matches the
+/// pinned name against the properties a session item froze at its
+/// creation, the default-node rescan against the node's current ones.
+#[test]
+fn a_host_stream_pinned_to_a_device_links_to_it_beside_a_contexts_renamed_stream() {
+    a_host_stream_pinned_to_a_device_links_to_it_beside_a_renamed_copy(
+        "early",
+        "bed-headset",
+        true,
+    );
+    a_host_stream_pinned_to_a_device_links_to_it_beside_a_renamed_copy(
+        "bed-headset",
+        "renamed",
+        false,
+    );
+}
+
+/// A host stream pinned to the host's mono sink `bed-headset` is linked to
+/// it beside a context's capture stream created as `created` and renamed
+/// to `later` a second later, with the device started before the stream
+/// or after its rename.
+fn a_host_stream_pinned_to_a_device_links_to_it_beside_a_renamed_copy(
+    created: &str,
+    later: &str,
+    device_first: bool,
+) {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let Some(fixture) = changes_its_properties(&bed) else {
+        return;
+    };
+    let device = || {
+        host_stream(
+            &bed,
+            &[
+                "-r",
+                "-a",
+                "--channels=1",
+                "--channel-map=mono",
+                "-P",
+                "{ media.class = Audio/Sink, node.name = bed-headset, \
+                 object.path = bed-headset-path }",
+                "/dev/null",
+            ],
+        )
+    };
+    let start_device = || {
+        let started = device();
+        wait_for("the host's device", || {
+            bed.dump_from_host()
+                .contains("\"object.path\": \"bed-headset-path\"")
+        });
+        started
+    };
+    let renamed = || {
+        let wanted = if device_first { 2 } else { 1 };
+        bed.dump_from_host()
+            .matches(&format!("\"node.name\": \"{later}\""))
+            .count()
+            >= wanted
+    };
+
+    let device_before = device_first.then(start_device);
+    let _copy = Streaming(bed.spawn_in_context(
+        PLAYBACK,
+        &format!(
+            "'{}' in '{{ media.class = Stream/Input/Audio, node.name = {created} }}' \
+             '{{ node.name = {later} }}'",
+            fixture.display()
+        ),
+    ));
+    window_in_which_it_would_link(&bed, "playback");
+    wait_for(&format!("the context's stream renamed to {later}"), renamed);
+    let _device = device_before.unwrap_or_else(&start_device);
+
+    let watched = LinkMonitor::start(&bed);
+    let _host = host_stream(
+        &bed,
+        &[
+            "-p",
+            "-a",
+            "--target=bed-headset",
+            "-P",
+            "{ node.name = host, node.dont-fallback = true }",
+            "-",
+        ],
+    );
+    wait_for(
+        &format!("a link from the pinned host stream to the host's device ({created} -> {later})"),
+        || watched.seen().contains("|-> bed-headset:playback_MONO"),
+    );
+    std::thread::sleep(FORBIDDEN_LINK_LIFE);
+    let seen = watched.seen();
+    assert!(
+        seen.lines()
+            .filter(|line| {
+                [created, later]
+                    .iter()
+                    .any(|name| line.contains(&format!("|-> {name}:")))
+            })
+            .all(|line| line.contains("bed-headset:playback_MONO")),
+        "a pinned host stream was linked to a context's stream renamed from {created} \
+         to {later}:\n{seen}"
+    );
+}
+
 /// `pw-link -m` on the host for the length of a test: every link made,
 /// however briefly it lived, where `pw-link -l` shows only the ones up
 /// at the moment it is asked.
