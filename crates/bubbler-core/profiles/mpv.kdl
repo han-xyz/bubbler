@@ -20,7 +20,8 @@
 // drop-in and the linking hook it loads; `lint` warns
 // `audio-policy-missing` where it is not. `pulseaudio` beside it is the same reach through the older
 // protocol, not a narrower one, and its private server refuses to load
-// a module.
+// a module. Bitstream passthrough to a receiver or `--audio-exclusive`
+// needs `pipewire { exclusive }`, added by you.
 //
 // `home-share "Videos"` is read-only, because a player reads its files
 // and writes none. Edit the node for the directory you keep films in;

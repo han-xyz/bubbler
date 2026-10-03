@@ -1196,10 +1196,23 @@ the stock configuration, counts `Audio/Sink` nodes rather than session
 items: where a user enables it, a sandbox's sink on a host with no other
 sink keeps its "Dummy Output" from appearing. The playback
 grant protects what a sandbox can hear and record, not the availability
-of host audio: a playback sandbox's own stream can take the default sink
-exclusively (`node.exclusive`, passthrough), and WirePlumber then drops
-new host streams aimed at it; whether sandboxes may use exclusive or
-passthrough output is to be decided in 0.25.0. A JACK client, which
+of host audio, with one exception the hook enforces: a stream that would
+hold its sink for itself — `node.exclusive`, or a session item
+WirePlumber marks `item.node.encoded-only` — makes stock WirePlumber turn
+every later stream away from that sink ("target is linked exclusively",
+measured: a host stream started after a playback context's exclusive
+stream got no link). Without the exclusive grant (`exclusive` on either
+audio node, the word `exclusive`) such a stream of a sandbox gets no link
+and its client an error, through the private pulse server too (a pulse
+client sets `node.exclusive` as a stream property; measured), and the
+sandbox's other streams are never linked in passthrough, which holds a
+sink the same way. A hook cannot link the stream shared instead: stock
+reads `node.exclusive` from the session item's properties, which a hook
+cannot change (measured on 0.5.18). The encoded-only half is enforced by
+reading, not measured: the item property is WirePlumber's own (a node
+claiming it gets an item without it, measured), and the bed's null sink
+takes no encoded format. With the grant, stock behaviour holds and the
+instance can keep host streams off a sink while it plays. A JACK client, which
 links its own ports, links nothing: the link factory is hidden from it.
 Hiding `Audio/Duplex` from a
 playback sandbox also keeps it from playing into a duplex device, such as
@@ -1236,6 +1249,9 @@ the hook, each new link destroyed in turn.
 `only_a_session_managers_link_from_a_stream_into_a_devices_sink_is_kept`,
 `a_host_stream_pinned_to_a_devices_contexts_sink_links_to_it_beside_another_contexts_copy`,
 `a_context_creates_nodes_only_as_its_own_streams`,
+`a_host_stream_plays_after_a_playback_contexts_stream_asked_for_the_sink_alone`,
+`a_host_stream_plays_after_a_pulse_clients_stream_asked_for_the_sink_alone`,
+`an_exclusive_contexts_stream_holds_the_sink_against_a_later_host_stream`,
 `a_stream_a_context_turns_into_a_smart_filter_takes_no_host_stream`,
 `a_sink_a_context_offered_before_the_session_manager_restarted_is_no_device`,
 `a_session_managers_link_into_a_capture_stream_is_kept_only_where_the_grant_allows`,

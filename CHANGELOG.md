@@ -14,6 +14,9 @@
   smart filter for another client. This replaces 0.24.2's redirect of host
   streams, which sent a stream pinned to a present device whose name a
   sandbox copied nowhere and could pass by the host's own smart filters.
+- A sandbox's stream no longer takes a sink for itself (exclusive access or
+  encoded passthrough) unless the instance has `exclusive`: without it the
+  stream gets no link, so no later host stream is turned away from the sink.
 - The audio policy files changed: rewrite them (`bubbler audio-policy
   --print` and `--print --script`, or the package update) and restart
   WirePlumber; `bubbler lint` reports `audio-policy-differs` until then.
@@ -30,6 +33,9 @@
   sources it makes through its own connection are treated like the host's, so
   host streams may play into them and one may become the default; `bubbler
   lint` notes `audio-devices-offered`.
+- `pipewire { exclusive }` / `pulseaudio { exclusive }` let an instance's
+  stream hold a sink for itself, as bitstream passthrough to a receiver or
+  mpv's `--audio-exclusive` needs.
 - `--explain=full` lists every call the application's seccomp filter answers
   with an errno, and `userns-disabled-with-nested-sandbox` says the mount API
   a nested sandbox needs is denied too.
