@@ -425,8 +425,7 @@ fn sweep_dir(dir: &Path, prefix: &str) {
 
 /// Remove leftovers of tries whose bubbler is gone: `try/<pid>`,
 /// `<runtime>/bubbler/try-<pid>` and its start lock for every pid no
-/// live process has. A
-/// name that is not a pid is not swept.
+/// live process has. A name that is not a pid is not swept.
 pub fn sweep_stale(env: &Env) {
     sweep_dir(&try_root(env), "");
     sweep_dir(&env.runtime_dir.join(launcher::RUNTIME_SUBDIR), "try-");

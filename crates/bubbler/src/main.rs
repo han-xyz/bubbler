@@ -858,16 +858,13 @@ fn refresh_entries(env: &Env, dirs: &desktop::Dirs, program: &Path) -> Result<i3
     Ok(i32::from(failed > 0))
 }
 
-/// The log a run without a terminal writes, started by `start`
-/// ([`run_log::redirect`] or [`run_log::tee`]), or `None` after saying why
-/// there is none: a log that cannot be opened — a symlink where the file
-/// belongs, a full disk — is a lost record, and losing the record is not
-/// a reason to refuse the sandbox the user asked for.
 /// The connection a start that lost the race to another start of the
 /// instance joins that one through, the way a later run would: the
 /// winner has bound the control socket, and a connection waits there
 /// until its sandbox answers. Tried once; a winner already gone again is
-/// the start's own error.
+/// the start's own error. A winner whose start then fails ends the join
+/// as an instance that stopped while the command was running, as it does
+/// for any exec made while a start is under way.
 fn join_after_lost_start(
     env: &Env,
     name: &str,
@@ -883,6 +880,11 @@ fn join_after_lost_start(
     }
 }
 
+/// The log a run without a terminal writes, started by `start`
+/// ([`run_log::redirect`] or [`run_log::tee`]), or `None` after saying why
+/// there is none: a log that cannot be opened — a symlink where the file
+/// belongs, a full disk — is a lost record, and losing the record is not
+/// a reason to refuse the sandbox the user asked for.
 fn open_log(
     start: fn(&Path, bool) -> Result<run_log::Redirect, LaunchError>,
     path: &Path,
