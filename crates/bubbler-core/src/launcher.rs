@@ -3501,6 +3501,10 @@ struct Watch<'a> {
     network: &'a mut Option<NetworkSidecars>,
     /// Where a word about the sidecar goes without blocking the loop.
     warn: &'a tty::Warn,
+    /// The instance's start lock, taken into `ending` the moment the
+    /// sandbox's exit is seen rather than once the output is drained.
+    start_lock: &'a Path,
+    ending: Option<OwnedFd>,
 }
 
 /// Forward a caught signal to the sandbox and report the exit code once
@@ -3508,6 +3512,10 @@ struct Watch<'a> {
 /// the one place the sidecar is checked on as well.
 fn check_exit(child: &mut Child, w: &mut Watch<'_>) -> io::Result<Option<i32>> {
     if let Some(status) = child.try_wait()? {
+        // Once only: a second open of the file would wait on this one.
+        if w.ending.is_none() {
+            w.ending = lock_for_teardown(w.start_lock);
+        }
         return Ok(Some(exit_code(status)));
     }
     if let Some(network) = w.network.as_mut() {
@@ -4099,6 +4107,8 @@ fn start_and_wait(
         stopping: &stopping,
         network: &mut network,
         warn: &warn,
+        start_lock: &lock_path,
+        ending: None,
     };
     let code = match &master {
         Some(master) => {
@@ -4134,7 +4144,11 @@ fn start_and_wait(
         }
         None => wait_plain(&mut child, &mut watch),
     };
-    _ending = lock_for_teardown(&lock_path);
+    // A wait that failed before it saw the exit took no lock.
+    _ending = watch
+        .ending
+        .take()
+        .or_else(|| lock_for_teardown(&lock_path));
     let code = code?;
     // After the wait and not before it: the generated files are the live
     // sources of the sandbox's read-only binds, and dropping the
