@@ -5767,6 +5767,110 @@ fn a_signal_while_a_sidecar_starts_stops_the_run_and_leaves_nothing() {
     );
 }
 
+/// Two starts of one instance, both past the CLI's own liveness probe
+/// and released together by the lock the test holds: one binds and waits
+/// on its proxy, the other is told the instance is running, and the
+/// winner's control socket is still there and answering.
+#[test]
+fn two_starts_released_together_one_runs_and_one_is_told_it_is_running() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let bus = tmp.path().join("fakebus");
+    let _listener = UnixListener::bind(&bus).unwrap();
+    let proxy = tmp.path().join("silent-proxy");
+    silent_proxy(&proxy);
+    let out = bubbler_live(tmp.path(), &init)
+        .args(["create", "twostart"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(
+        tmp.path()
+            .join("data/bubbler/instances/twostart/config.kdl"),
+        "dbus\n",
+    )
+    .unwrap();
+    let dir = tmp.path().join("run/bubbler/twostart");
+    std::fs::create_dir_all(&dir).unwrap();
+    let lock_path = dir.join("start.lock");
+    let held = std::fs::File::create(&lock_path).unwrap();
+    flock(&held, FlockOperation::LockExclusive).unwrap();
+    let start = || {
+        bubbler_live(tmp.path(), &init)
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}", bus.display()),
+            )
+            .env("BUBBLER_DBUS_PROXY", &proxy)
+            .args(["run", "twostart", "--", "/usr/bin/true"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let mut runs = [start(), start()];
+    let holds_lock = |run: &Child| {
+        std::fs::read_dir(format!("/proc/{}/fd", run.id()))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|p| p == lock_path))
+    };
+    if !wait_until(|| runs.iter().all(holds_lock), Duration::from_secs(4)) {
+        let [a, b] = runs;
+        let _ = kill_process(Pid::from_child(&b), Signal::KILL);
+        fail_with(a, "the starts never waited on the lock");
+    }
+    drop(held);
+    let mut loser = None;
+    let told = wait_until(
+        || {
+            loser = runs
+                .iter_mut()
+                .position(|r| r.try_wait().expect("waiting for a run").is_some());
+            loser.is_some()
+        },
+        Duration::from_secs(4),
+    );
+    let answers = UnixStream::connect(dir.join("init.sock")).is_ok();
+    let [a, b] = runs;
+    let (winner, loser) = match loser {
+        Some(1) => (a, Some(b)),
+        _ => (b, told.then_some(a)),
+    };
+    kill_process(Pid::from_child(&winner), Signal::TERM).unwrap();
+    let won = winner.wait_with_output().unwrap();
+    bubbler_live(tmp.path(), &init)
+        .args(["delete", "twostart", "--yes"])
+        .status()
+        .unwrap();
+    let Some(loser) = loser else {
+        panic!(
+            "neither start ended: {}",
+            String::from_utf8_lossy(&won.stderr)
+        );
+    };
+    let lost = loser.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&lost.stderr);
+    assert_eq!(lost.status.code(), Some(1), "{err}");
+    assert!(err.contains("is already running"), "{err}");
+    assert!(!err.contains("os error"), "{err}");
+    assert!(answers, "the running start's control socket did not answer");
+    assert_eq!(
+        won.status.code(),
+        Some(143),
+        "{}",
+        String::from_utf8_lossy(&won.stderr)
+    );
+}
+
 /// Ctrl-C at a terminal goes to the whole foreground process group, so
 /// the sidecar being waited on dies of it too: the run still ends as
 /// stopped, not as a sidecar that failed. The pulse server's bwrap is a

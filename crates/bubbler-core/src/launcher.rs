@@ -9,7 +9,7 @@ use std::ffi::{OsStr, OsString, c_void};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rustix::event::{Nsecs, PollFd, PollFlags, Secs, Timespec, poll};
-use rustix::fs::{Access, AtFlags, MemfdFlags, Mode, OFlags, SealFlags};
+use rustix::fs::{Access, AtFlags, FlockOperation, MemfdFlags, Mode, OFlags, SealFlags, flock};
 use rustix::io::{Errno, FdFlags, fcntl_dupfd_cloexec, fcntl_setfd};
 use rustix::ioctl::{self, Opcode};
 use rustix::pipe::{PipeFlags, pipe_with};
@@ -2920,9 +2920,8 @@ const LEFTOVER_BUDGET: usize = 100_000;
 /// sidecar left — a link out of the runtime directory above all, or a
 /// tree no walk can finish — is followed by anything bubbler writes
 /// there or can block the start. Called after this run has bound the
-/// instance's control socket and found no live run behind it; two starts
-/// racing over a dead run's socket can both get there, and the second
-/// then moves the first one's directory aside (a known gap).
+/// instance's control socket and found no live run behind it, which only
+/// one start at a time can do.
 fn fresh_sidecar_dir(dir: &Path) -> Result<(), LaunchError> {
     let io_at = |e: Errno| LaunchError::Io(dir.to_path_buf(), e.into());
     let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
@@ -3710,6 +3709,59 @@ pub fn run(
 /// stops it.
 const STOPPED_CODE: i32 = 128 + SIGTERM;
 
+/// The lock file in an instance's runtime directory that a start holds
+/// from its liveness check through its bind. Never removed: a start
+/// that locked a file since unlinked would hold a lock nobody else sees.
+const START_LOCK: &str = "start.lock";
+
+/// How often a start waiting on another's [`START_LOCK`] tries again and
+/// looks at its stop flag.
+const START_LOCK_POLL: Duration = Duration::from_millis(50);
+
+/// Bind the instance's control socket in `dir`, the one place a socket
+/// left by a dead run is unlinked. `AlreadyRunning` when a run answers on
+/// it, which a start that lost the race to another finds too: the check,
+/// the unlink and the bind all happen under [`START_LOCK`], released on
+/// return. `Stopped` when a stop signal arrives while it waits.
+fn bind_control_socket(
+    dir: &Path,
+    name: &str,
+    stop: &AtomicBool,
+) -> Result<UnixListener, LaunchError> {
+    let lock_path = dir.join(START_LOCK);
+    let lock_err = |e: Errno| LaunchError::Io(lock_path.clone(), e.into());
+    let lock = rustix::fs::open(
+        &lock_path,
+        OFlags::CREATE | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(lock_err)?;
+    // Polled rather than blocking: the stop signals are installed with
+    // SA_RESTART, so a blocking `flock` would sleep through them.
+    loop {
+        match flock(&lock, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => break,
+            Err(Errno::WOULDBLOCK | Errno::INTR) => {}
+            Err(e) => return Err(lock_err(e)),
+        }
+        if stop.load(Ordering::SeqCst) {
+            return Err(LaunchError::Stopped);
+        }
+        std::thread::sleep(START_LOCK_POLL);
+    }
+    let sock_path = dir.join(exec::SOCKET_NAME);
+    let io_at = |e: io::Error| LaunchError::Io(sock_path.clone(), e);
+    match UnixStream::connect(&sock_path) {
+        Ok(_) => return Err(LaunchError::AlreadyRunning(name.to_owned())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+            std::fs::remove_file(&sock_path).map_err(io_at)?;
+        }
+        Err(e) => return Err(io_at(e)),
+    }
+    UnixListener::bind(&sock_path).map_err(io_at)
+}
+
 /// [`run`] from its runtime directory on, with the stop signals already
 /// caught in `stop`.
 fn start_and_wait(
@@ -3721,13 +3773,9 @@ fn start_and_wait(
     stop: &AtomicBool,
     registered: &mut SignalGuard,
 ) -> Result<i32, LaunchError> {
-    if exec::connect(env, &inst.name)?.is_some() {
-        return Err(LaunchError::AlreadyRunning(inst.name.clone()));
-    }
     let sock_path = dir.join(exec::SOCKET_NAME);
     let io_at = |e: Errno| LaunchError::Io(sock_path.clone(), e.into());
-    let listener =
-        UnixListener::bind(&sock_path).map_err(|e| LaunchError::Io(sock_path.clone(), e))?;
+    let listener = bind_control_socket(&dir, &inst.name, stop)?;
     let _socket_guard = FileGuard(sock_path.clone());
     let inherited = fcntl_dupfd_cloexec(listener.as_fd(), 3).map_err(io_at)?;
     let mut alloc = RealAlloc::new(inherited.as_raw_fd(), dir.clone());
@@ -4054,6 +4102,41 @@ mod tests {
     /// here and one built by the launcher itself name the same paths.
     fn dry(e: &Env) -> DryRunAlloc {
         DryRunAlloc::new(instance_runtime_dir(e, "t"))
+    }
+
+    /// A socket a dead run left is cleared and bound again; one a run
+    /// answers on is that run's, and is left answering.
+    #[test]
+    fn a_start_binds_over_a_dead_socket_and_not_over_a_live_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(exec::SOCKET_NAME);
+        let stop = AtomicBool::new(false);
+        drop(UnixListener::bind(&path).unwrap());
+        let live = bind_control_socket(tmp.path(), "t", &stop).expect("a fresh bind");
+        let again = bind_control_socket(tmp.path(), "t", &stop);
+        assert!(
+            matches!(&again, Err(LaunchError::AlreadyRunning(n)) if n == "t"),
+            "{again:?}"
+        );
+        let _client = UnixStream::connect(&path).unwrap();
+        live.accept()
+            .expect("the first start's socket still answers");
+        assert!(
+            tmp.path().join(START_LOCK).exists(),
+            "the lock file is kept"
+        );
+    }
+
+    /// A start waiting on another's lock is still ended by a stop signal.
+    #[test]
+    fn a_start_waiting_on_the_lock_ends_when_stopped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let held = std::fs::File::create(tmp.path().join(START_LOCK)).unwrap();
+        flock(&held, FlockOperation::LockExclusive).unwrap();
+        let stop = AtomicBool::new(true);
+        let waited = bind_control_socket(tmp.path(), "t", &stop);
+        assert!(matches!(waited, Err(LaunchError::Stopped)), "{waited:?}");
+        assert!(!tmp.path().join(exec::SOCKET_NAME).exists());
     }
 
     /// The directory a real allocator gets in a test that allocates

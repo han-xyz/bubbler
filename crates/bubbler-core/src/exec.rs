@@ -41,16 +41,21 @@ pub fn socket_path(env: &Env, name: &str) -> PathBuf {
         .join(SOCKET_NAME)
 }
 
-/// Connect to a live instance. `Ok(None)` when nothing listens; a refused
-/// socket is left over from a dead run and is unlinked so a fresh start
-/// can bind the path again.
+/// Connect to a live instance. `Ok(None)` when nothing listens. A refused
+/// socket is left over from a dead run and is left where it is: only a
+/// start unlinks it, under the lock it binds the path again under, since
+/// a socket refused here may be one a start has bound and not yet
+/// listened on.
 pub fn connect(env: &Env, name: &str) -> Result<Option<UnixStream>, LaunchError> {
     let path = socket_path(env, name);
     match UnixStream::connect(&path) {
         Ok(s) => Ok(Some(s)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
-            std::fs::remove_file(&path).map_err(|e| LaunchError::Io(path.clone(), e))?;
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
             Ok(None)
         }
         Err(e) => Err(LaunchError::Io(path, e)),
@@ -75,9 +80,8 @@ const PROBE_WAIT: Timespec = Timespec {
 /// until it accepts, and a connection that is queued is waited on for
 /// 200 ms at most.
 ///
-/// Unlike [`connect`], a socket left over from a dead run is left where
-/// it is — this is the probe a caller may make on every redraw, and
-/// unlinking belongs to the paths that are about to bind the path again.
+/// A socket left over from a dead run is left where it is: unlinking
+/// belongs to the start that is about to bind the path again.
 /// Anything that is not a connection a listener answered counts as not
 /// running, since nothing could be exec'd through it either.
 pub fn is_live(env: &Env, name: &str) -> bool {
@@ -408,14 +412,14 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_socket_is_unlinked_so_a_fresh_start_can_bind() {
+    fn a_stale_socket_is_not_running_and_is_left_for_a_start_to_clear() {
         let tmp = tempfile::tempdir().unwrap();
         let e = env(tmp.path());
         let path = instance_dir(tmp.path(), "t").join(SOCKET_NAME);
         // A socket file with nobody listening is what a killed run leaves.
         drop(UnixListener::bind(&path).unwrap());
         assert!(connect(&e, "t").unwrap().is_none());
-        assert!(!path.exists());
+        assert!(path.exists());
     }
 
     #[test]
@@ -436,8 +440,7 @@ mod tests {
         drop(stream);
 
         // A socket file a killed run left behind is not a live instance,
-        // and unlike `connect` this probe leaves it for the next start to
-        // clear: it may be polled on every redraw.
+        // and is left for the next start to clear.
         drop(listener);
         assert!(!is_live(&e, "t"));
         assert!(path.exists());

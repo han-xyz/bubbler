@@ -27,6 +27,9 @@
 - A start of an `allow-host` instance removed the empty cgroups of another
   instance whose name began with its own, and those of a start of the same
   instance not yet in them, which then failed with "No such device".
+- Two starts of one instance at the same moment could both pass the
+  already-running check; the second failed with a raw I/O error, and could
+  delete the first one's control socket. It now says the instance is running.
 
 ## 0.24.2
 
