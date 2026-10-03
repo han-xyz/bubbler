@@ -194,16 +194,6 @@ fn say(line: &str) {
     }
 }
 
-/// The variable that opts in to tests that start audio daemons. The bed is
-/// private, but it shares the developer's machine, and a run that left its
-/// daemons behind once pinned a CPU.
-const SESSION_TESTS: &str = "BUBBLER_TEST_SESSION";
-
-/// Whether `BUBBLER_TEST_SESSION=1` asks for the tests that start a bed.
-fn session_tests_wanted() -> bool {
-    std::env::var_os(SESSION_TESTS).is_some_and(|value| value == "1")
-}
-
 /// The first `PATH` entry that holds an executable named `name`.
 fn on_path(name: &str) -> Option<PathBuf> {
     std::env::var_os("PATH")
@@ -343,8 +333,10 @@ impl PipeWireBed {
     /// directory once its PipeWire listens and before its WirePlumber
     /// starts, and what it returned.
     fn start_with<T>(before_session_manager: impl FnOnce(&Path) -> T) -> Option<(PipeWireBed, T)> {
-        if !session_tests_wanted() {
-            say("skipping: set BUBBLER_TEST_SESSION=1 to run tests that reach the session");
+        if !bubbler_core::session_tests_wanted() {
+            say(
+                "skipping: set BUBBLER_TEST_SESSION=1 to run tests that reach the session or start audio daemons",
+            );
             return None;
         }
         for binary in NEEDED {
@@ -837,6 +829,12 @@ fn a_bed_held_until_its_test_is_killed() {
 
 #[test]
 fn nothing_of_a_bed_outlives_a_killed_test_binary() {
+    if !bubbler_core::session_tests_wanted() {
+        say(
+            "skipping: set BUBBLER_TEST_SESSION=1 to run tests that reach the session or start audio daemons",
+        );
+        return;
+    }
     let mut command = Command::new(std::env::current_exe().expect("the path of this test binary"));
     command
         .args([

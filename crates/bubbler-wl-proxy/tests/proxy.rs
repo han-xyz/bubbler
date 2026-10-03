@@ -69,7 +69,9 @@ fn session_tests_wanted() -> bool {
 /// The compositor's own socket, or `None` with a printed reason.
 fn host_socket() -> Option<PathBuf> {
     if !session_tests_wanted() {
-        println!("skipped: set BUBBLER_TEST_SESSION=1 to run tests that reach the session");
+        println!(
+            "skipped: set BUBBLER_TEST_SESSION=1 to run tests that reach the session or start audio daemons"
+        );
         return None;
     }
     let Some(display) = std::env::var_os("WAYLAND_DISPLAY") else {

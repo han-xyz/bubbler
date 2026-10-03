@@ -3558,6 +3558,18 @@ mod tests {
         assert_eq!(frame(&head).unwrap(), (FIXED_HEADER, 8));
     }
 
+    /// True (after printing why) when the run did not opt in to tests that
+    /// talk to the developer's real session bus.
+    fn session_tests_skipped() -> bool {
+        if crate::session_tests_wanted() {
+            return false;
+        }
+        println!(
+            "skipping: set BUBBLER_TEST_SESSION=1 to run tests that reach the session or start audio daemons"
+        );
+        true
+    }
+
     /// The session bus socket: `DBUS_SESSION_BUS_ADDRESS` when it names a
     /// `unix:path=` one, else `$XDG_RUNTIME_DIR/bus`, and only when what
     /// is there is a socket.
@@ -3586,6 +3598,9 @@ mod tests {
 
     #[test]
     fn the_real_session_bus_answers_get_id() {
+        if session_tests_skipped() {
+            return;
+        }
         let Some(path) = session_bus_socket() else {
             println!("skipping: no session bus socket to talk to");
             return;
@@ -3613,6 +3628,9 @@ mod tests {
 
     #[test]
     fn the_real_session_bus_carries_a_call_to_a_name_it_resolved() {
+        if session_tests_skipped() {
+            return;
+        }
         let Some(path) = session_bus_socket() else {
             println!("skipping: no session bus socket to talk to");
             return;
@@ -3661,6 +3679,9 @@ mod tests {
 
     #[test]
     fn the_real_session_bus_refuses_a_method_that_is_not_there() {
+        if session_tests_skipped() {
+            return;
+        }
         let Some(path) = session_bus_socket() else {
             println!("skipping: no session bus socket to talk to");
             return;

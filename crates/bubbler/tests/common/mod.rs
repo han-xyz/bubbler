@@ -686,17 +686,15 @@ pub fn bubbler_wayland(root: &Path, init: &Path) -> Command {
     c
 }
 
-/// The variable that opts in to tests reaching the developer's live
-/// session: its bus, portals, compositor, clipboard and PipeWire.
-const SESSION_TESTS: &str = "BUBBLER_TEST_SESSION";
-
 /// Returns false (after printing why) unless `BUBBLER_TEST_SESSION=1`,
 /// so a packager's build or CI never touches a desktop session.
 pub fn require_session() -> bool {
-    if std::env::var_os(SESSION_TESTS).is_some_and(|value| value == "1") {
+    if bubbler_core::session_tests_wanted() {
         return true;
     }
-    say("skipping: set BUBBLER_TEST_SESSION=1 to run tests that reach the session");
+    say(
+        "skipping: set BUBBLER_TEST_SESSION=1 to run tests that reach the session or start audio daemons",
+    );
     false
 }
 

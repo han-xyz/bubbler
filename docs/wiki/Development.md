@@ -42,18 +42,23 @@ did not cover. `crates/bubbler-core/tests/proptest.rs` holds the property
 tests: emitter/parser round trip, desktop patch idempotence, include resolver
 never recursing past the stack.
 
-Tests that reach your desktop session — its session and system bus, portals,
-tray, accessibility bus, compositor, clipboard and PipeWire — and the audio
-policy test bed below, which starts PipeWire and WirePlumber daemons of its own,
-run only with `BUBBLER_TEST_SESSION=1`:
+Tests that reach your desktop session — its session and system bus (the
+`cli` tests and the `the_real_session_bus_*` unit tests in `bubbler-core`'s
+`dbus_wire`), portals, tray, accessibility bus, compositor, clipboard and
+PipeWire — and the audio policy test bed below, which starts PipeWire and
+WirePlumber daemons of its own, run only with `BUBBLER_TEST_SESSION=1`:
 
 ```
 BUBBLER_TEST_SESSION=1 cargo test --workspace
 ```
 
-Without it (any other value counts as unset) each of them prints `skipping: set
-BUBBLER_TEST_SESSION=1 …` and passes, so a plain `cargo test --workspace` and
-the AUR package's `check()` need no session and start no daemon. With
+Without it (any other value counts as unset) each of them passes with a skip
+line, `skipping: set BUBBLER_TEST_SESSION=1 …`, so a plain
+`cargo test --workspace` and the AUR package's `check()` need no session and
+start no daemon. The `cli` and bed tests write that line to stderr, where a
+plain run shows it; the `dbus_wire` unit tests and `bubbler-wl-proxy`'s proxy
+tests print it through `println!` (`skipped: …` in the proxy tests), which
+shows only under `-- --nocapture`. With
 `BUBBLER_TEST_SESSION=1` and `$WAYLAND_DISPLAY` set the Wayland tests run
 against your own compositor: they map a window and take the focus for a
 moment, and they take the selection and give it back with one flavour on it —
