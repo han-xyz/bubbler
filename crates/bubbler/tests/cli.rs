@@ -5597,9 +5597,9 @@ time.sleep(30)
     );
 }
 
-/// A start made while the last run is still tearing down binds a socket
-/// that run's teardown leaves alone: the new run is still reachable once
-/// the old one has gone.
+/// A start made while the last run is still tearing down waits on the
+/// start lock until that teardown is over, and binds a socket that run
+/// leaves alone: the new run is still reachable once the old one has gone.
 #[test]
 fn a_start_during_the_last_run_s_teardown_keeps_its_socket() {
     if !require_bwrap() || !require_python() {
@@ -5641,7 +5641,7 @@ fn a_start_during_the_last_run_s_teardown_keeps_its_socket() {
             .unwrap()
     };
     let dir = tmp.path().join("run/bubbler/relaunch");
-    let first = start(&["/usr/bin/true"]);
+    let mut first = start(&["/usr/bin/true"]);
     if !wait_until(
         || dir.join("dbus/stopping").exists(),
         Duration::from_secs(8),
@@ -5649,6 +5649,19 @@ fn a_start_during_the_last_run_s_teardown_keeps_its_socket() {
         fail_with(first, "the first run never reached its teardown");
     }
     let mut second = start(&["/usr/bin/sleep", "8"]);
+    let lock_path = tmp.path().join("run/bubbler/relaunch@start.lock");
+    let holds_lock = || {
+        std::fs::read_dir(format!("/proc/{}/fd", second.id()))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|p| p == lock_path))
+    };
+    // A start that is not held back has the lock open only from its
+    // liveness check to its bind, a few milliseconds.
+    let reached_lock = wait_until(holds_lock, Duration::from_secs(4));
+    std::thread::sleep(Duration::from_millis(300));
+    let held_back = reached_lock && holds_lock() && first.try_wait().unwrap().is_none();
     let first = first.wait_with_output().unwrap();
     let reachable = wait_until(
         || UnixStream::connect(dir.join("init.sock")).is_ok(),
@@ -5665,6 +5678,11 @@ fn a_start_during_the_last_run_s_teardown_keeps_its_socket() {
         first.status.success(),
         "{}",
         String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        held_back,
+        "the second run did not wait for the first run's teardown: {}",
+        String::from_utf8_lossy(&second.stderr)
     );
     assert!(
         still_running && reachable,
