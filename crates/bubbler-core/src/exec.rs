@@ -43,9 +43,7 @@ pub fn socket_path(env: &Env, name: &str) -> PathBuf {
 
 /// Connect to a live instance. `Ok(None)` when nothing listens. A refused
 /// socket is left over from a dead run and is left where it is: only a
-/// start unlinks it, under the lock it binds the path again under, since
-/// a socket refused here may be one a start has bound and not yet
-/// listened on.
+/// start unlinks it, under the lock it binds the path again under.
 pub fn connect(env: &Env, name: &str) -> Result<Option<UnixStream>, LaunchError> {
     let path = socket_path(env, name);
     match UnixStream::connect(&path) {

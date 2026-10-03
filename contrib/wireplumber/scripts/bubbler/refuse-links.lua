@@ -46,10 +46,11 @@
 -- was granted `microphone`; and the sandbox links nothing itself.
 --
 -- A sandbox offers no device: its nodes that are not plain audio streams,
--- and its streams named after a host device, keep no session item, so
+-- its streams that carry a link group, and its streams named after any
+-- device, a device-grant sandbox's included, keep no session item, so
 -- WirePlumber links no other client's stream to them and makes none of
--- them a default or a filter. WirePlumber links
--- no other client's stream to a sandbox's stream either.
+-- them a default or a filter. WirePlumber links no other client's stream
+-- to a sandbox's stream either.
 --
 -- Under the device grant (`devices` in its grant) a sandbox's nodes that
 -- are no stream are devices like the host's: WirePlumber may link another
@@ -126,11 +127,13 @@ local function offers_devices (client)
   return granted (client, "devices")
 end
 
--- Whether the target is a sandbox's node that is not the stream's own:
--- whoever the stream belongs to, a sink, source or filter a sandbox
--- offers would otherwise take a host stream without the sandbox making
--- any link. A device of a sandbox with the device grant is a device like
--- the host's; its streams are still its own.
+-- Whether the target is a sandbox's node that is not the stream's own.
+-- A sink, source or filter of a sandbox without the device grant keeps no
+-- session item, so a target meets one only when it was itemised before
+-- WirePlumber knew its client and has not been swept yet: this is the
+-- backstop that keeps a host stream off it in that window. A device of a
+-- sandbox with the device grant is a device like the host's; its streams
+-- are still its own.
 local function foreign_sandbox_node (source, si_props, target_props)
   local owner = bubbler_client (source, target_props ["client.id"])
   if not owner then

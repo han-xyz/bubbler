@@ -1804,7 +1804,10 @@ convenience channel, not a boundary, and the manual says so.
 `an_incoming_request_larger_than_the_cap_is_rejected`,
 `a_truncated_payload_times_out_instead_of_hanging`,
 `a_trickling_client_cannot_extend_the_deadline`,
-`a_stale_socket_is_unlinked_so_a_fresh_start_can_bind`,
+`a_stale_socket_is_not_running_and_is_left_for_a_start_to_clear`,
+`a_start_binds_over_a_dead_socket_and_not_over_a_live_one`,
+`a_run_removes_its_own_socket_and_not_a_later_start_s`,
+`a_start_waiting_on_the_lock_ends_when_stopped`,
 `an_exec_is_refused_once_the_run_is_stopping`,
 `sighup_and_sigquit_end_the_run_with_the_same_grace_as_sigterm`,
 `real_bwrap_exec_round_trip`
