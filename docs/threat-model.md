@@ -889,13 +889,13 @@ at all on every node a stream can record from — each class beginning
 `/Internal`) and `Audio/Duplex`, the classes WirePlumber offers as a
 default source; before 0.24.2 it hid `Audio/Source` alone, and a
 playback sandbox saw the rest (measured) — and the linking hook refuses
-a capture stream every other target by the same test. Withholding all permissions on a
-source withholds more than its visibility: `PW_PERM_L` is what lets a
-link be made to a node the client cannot see, and the playback manager
-grants it nowhere, so a capture stream a playback-only client opens —
-linked by the session manager on the client's behalf, not by the client
-itself — gets no link to a source it was never given the permission to
-see.
+a capture stream every other target by the same test. Withholding all
+permissions on a source withholds more than its visibility: `PW_PERM_L`
+is what lets a link be made to a node the client cannot see, and the
+playback manager grants it nowhere, so a capture stream a playback-only
+client opens — linked by the session manager on the client's behalf, not
+by the client itself — gets no link to a source it was never given the
+permission to see.
 
 Streams are readable rather than hidden because the private
 `pipewire-pulse` a `pulseaudio` grant runs creates a stream node per
@@ -1007,17 +1007,20 @@ under its own `microphone`, as from a host source, and another sandbox's
 stream named after an offered device does not take a host stream pinned
 to it (measured). The grant lifts neither the name rule nor the filter
 chain: a node of the instance, device or stream, that shares a
-`node.name`, `object.path` or `node.nick` with a device it does not own
-loses its session item as without the grant (measured: a device-grant
-context's sink and its stream named after a host device, in both arrival
-orders, took no host stream pinned to that device), and so does one
+`node.name`, `object.path` or `node.nick` with any other device — the
+host's, one another sandbox offers, or another of its own — loses its
+session item as without the grant (measured: a device-grant context's
+sink and its stream named after a host device, in both arrival orders,
+took no host stream pinned to that device), and so does one
 marked a smart filter (`filter.smart`, by its properties now or as its
 item froze them), which lib/filter-utils.lua would otherwise put in front
 of the host device its `filter.smart.target` names, so every host stream
 pinned to that device or recorder aimed at that source would pass through
 the instance (measured: a smart filter aimed at the host's sink, one
 aimed at its source, and one that marked itself smart a second after it
-was made took no pinned host stream or recorder). The `filters` metadata,
+was made took no pinned host stream or recorder). Between two
+device-grant sandboxes a name stays with the one that offered it first
+(by reading). The `filters` metadata,
 the other way a node is made smart, is hidden from a device-grant context
 as from every sandbox (measured). Without `microphone` the instance still
 sees no source and records from none. The grant does not open a factory:
@@ -1243,14 +1246,14 @@ none without the removal, and with it the host stream played. The
 encoded-only half, the target half included, and the passthrough
 suppression are enforced by reading, not measured: the item property is
 WirePlumber's own (a node claiming it gets an item without it,
-measured), and the bed's null sink takes no encoded format. With the grant, stock behaviour holds and the
-instance can keep host streams off a sink while it plays. A JACK client, which
-links its own ports, links nothing: the link factory is hidden from it.
-Hiding `Audio/Duplex` from a
-playback sandbox also keeps it from playing into a duplex device, such as
-the single node of an ALSA pro-audio profile; that takes the `microphone`
-grant. A patchbay that re-creates a link the hook destroyed loops against
-the hook, each new link destroyed in turn.
+measured), and the bed's null sink takes no encoded format. With the
+grant, stock behaviour holds and the instance can keep host streams off
+a sink while it plays. A JACK client, which links its own ports, links
+nothing: the link factory is hidden from it. Hiding `Audio/Duplex` from
+a playback sandbox also keeps it from playing into a duplex device, such
+as the single node of an ALSA pro-audio profile; that takes the
+`microphone` grant. A patchbay that re-creates a link the hook destroyed
+loops against the hook, each new link destroyed in turn.
 
 [Config (KDL)](manual.md#config-kdl), [Installing](manual.md#installing),
 [Linting](manual.md#linting) ·
