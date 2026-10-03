@@ -267,17 +267,19 @@ end
 
 -- Whether a session item that is no stream — a device or a filter — of
 -- the host's, or of a sandbox whose own devices stand beside the host's,
--- shares a name with any of `props_list`. A stream pinned to that name
--- would otherwise be aimed at whichever of the two a lookup meets first,
--- streams included. A host stream of the same name is left alone: two
--- instances of one application commonly share one.
-local function shadows_a_device (source, props_list)
+-- and not the item of the node `node_id` itself, shares a name with any
+-- of `props_list`. A stream pinned to that name would otherwise be aimed
+-- at whichever of the two a lookup meets first, streams included. A host
+-- stream of the same name is left alone: two instances of one
+-- application commonly share one.
+local function shadows_a_device (source, node_id, props_list)
   for si in source:call ("get-object-manager", "session-item"):iterate {
       type = "SiLinkable" } do
     local device = si.properties
     local owner = bubbler_client (source, device ["client.id"])
     if not (device ["media.class"] or ""):find ("^Stream/") and
-        (not owner or offers_devices (owner)) then
+        (not owner or offers_devices (owner)) and
+        device ["node.id"] ~= node_id then
       for _, props in ipairs (props_list) do
         if shares_a_name (props, device) then
           return true
@@ -288,22 +290,43 @@ local function shadows_a_device (source, props_list)
   return false
 end
 
--- Whether a node with these properties, as they stand now, is kept out of
--- the session: a node of a sandbox without the device grant that is not a
--- plain audio stream, or that shares a name with a device.
+-- Whether any of `props_list` marks its node a smart filter, which
+-- lib/filter-utils.lua puts in front of the device it names: every stream
+-- aimed at that device would go through it. The `filters` metadata, the
+-- other place a node is marked smart, is hidden from every sandbox.
+local function smart_filter (props_list)
+  for _, props in ipairs (props_list) do
+    if cutils.parseBool (props ["filter.smart"]) then
+      return true
+    end
+  end
+  return false
+end
+
+-- Whether `node`, as it stands now, is kept out of the session: a node of
+-- a sandbox that shares a name with a device, a smart filter, and without
+-- the device grant every node that is not a plain audio stream.
 -- `item_props`, where the node has a session item, are what the finders
 -- read: frozen at the item's creation. A stream carries a link group only
 -- as one half of a filter.
-local function kept_from_the_session (source, node_props, item_props)
+local function kept_from_the_session (source, node, item_props)
+  local node_props = node.properties
   local client = bubbler_client (source, node_props ["client.id"])
-  if not client or offers_devices (client) then
+  if not client then
     return false
+  end
+  local props_list = { node_props, item_props }
+  local named_after_a_device = function ()
+    return shadows_a_device (source, tostring (node ["bound-id"]), props_list)
+  end
+  if offers_devices (client) then
+    return smart_filter (props_list) or named_after_a_device ()
   end
   local class = node_props ["media.class"]
   return (class ~= AUDIO_STREAM_CLASS.output and
       class ~= AUDIO_STREAM_CLASS.input) or
       node_props ["node.link-group"] ~= nil or
-      shadows_a_device (source, { node_props, item_props })
+      named_after_a_device ()
 end
 
 -- A sandbox offers no device: of its nodes only its plain audio streams
@@ -324,12 +347,12 @@ SimpleEventHook {
   },
   execute = function (event)
     local node = event:get_subject ()
-    if not kept_from_the_session (event:get_source (), node.properties) then
+    if not kept_from_the_session (event:get_source (), node) then
       return
     end
     log:info (node, string.format ("%s (client %s, %s) is no device of " ..
-        "the session: not a plain audio stream of a sandbox, or named " ..
-        "after a host device",
+        "the session: not a plain audio stream of a sandbox, a smart " ..
+        "filter, or named after a device",
         tostring (node.properties ["node.name"]),
         tostring (node.properties ["client.id"]),
         tostring (node.properties ["media.class"])))
@@ -365,15 +388,14 @@ SimpleEventHook {
     for si in source:call ("get-object-manager", "session-item"):iterate {
         type = "SiLinkable" } do
       local node = si:get_associated_proxy ("node")
-      if node and kept_from_the_session (source, node.properties,
-          si.properties) then
+      if node and kept_from_the_session (source, node, si.properties) then
         table.insert (kept, si)
       end
     end
     for _, si in ipairs (kept) do
       log:info (si, string.format ("removing the session item of %s " ..
-          "(client %s): not a plain audio stream of a sandbox, or named " ..
-          "after a host device",
+          "(client %s): not a plain audio stream of a sandbox, a smart " ..
+          "filter, or named after a device",
           tostring (si.properties ["node.name"]),
           tostring (si.properties ["client.id"])))
       si:remove ()

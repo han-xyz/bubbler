@@ -2416,6 +2416,7 @@ fn host_stream(bed: &PipeWireBed, args: &[&str]) -> Streaming {
 fn a_host_stream_pinned_to_a_device_whose_name_a_context_copies_links_to_the_device() {
     a_host_stream_pinned_to_a_device_links_to_it_beside(
         None,
+        PLAYBACK,
         "pw-cat -r -a -P '{ media.class = Audio/Sink, node.name = bed-headset }' /dev/null",
         "bed-headset",
         "bed-headset",
@@ -2431,18 +2432,21 @@ fn a_host_stream_pinned_to_a_device_whose_name_a_context_copies_links_to_the_dev
 fn a_host_stream_pinned_to_a_device_whose_name_a_contexts_stream_copies_links_to_the_device() {
     a_host_stream_pinned_to_a_device_links_to_it_beside(
         None,
+        PLAYBACK,
         "pw-cat -r -a -P '{ node.name = bed-headset }' /dev/null",
         "bed-headset",
         "bed-headset",
     );
     a_host_stream_pinned_to_a_device_links_to_it_beside(
         None,
+        PLAYBACK,
         "pw-cat -r -a -P '{ node.name = bed-headset-path }' /dev/null",
         "bed-headset-path",
         "bed-headset-path",
     );
     a_host_stream_pinned_to_a_device_links_to_it_beside(
         None,
+        PLAYBACK,
         "pw-cat -r -a -P '{ node.name = shadow, object.path = bed-headset }' /dev/null",
         "shadow",
         "bed-headset",
@@ -2456,19 +2460,52 @@ fn a_host_stream_pinned_to_a_device_whose_name_a_contexts_stream_copies_links_to
 fn a_host_stream_pinned_to_a_devices_contexts_sink_links_to_it_beside_another_contexts_copy() {
     a_host_stream_pinned_to_a_device_links_to_it_beside(
         Some(DEVICES),
+        PLAYBACK,
         "pw-cat -r -a -P '{ node.name = bed-headset }' /dev/null",
         "bed-headset",
         "bed-headset",
     );
 }
 
+/// The device grant does not lift the name rule: a `devices` context's
+/// sink, or its stream, named after a host device takes no host stream
+/// pinned to that device.
+#[test]
+fn a_host_stream_pinned_to_a_device_links_to_it_beside_a_devices_contexts_copy() {
+    a_host_stream_pinned_to_a_device_links_to_it_beside(
+        None,
+        DEVICES,
+        "pw-cat -r -a -P '{ media.class = Audio/Sink, node.name = bed-headset }' /dev/null",
+        "bed-headset",
+        "bed-headset",
+    );
+    a_host_stream_pinned_to_a_device_links_to_it_beside(
+        None,
+        DEVICES,
+        "pw-cat -r -a -P '{ node.name = bed-headset }' /dev/null",
+        "bed-headset",
+        "bed-headset",
+    );
+}
+
+/// The grant a context's `props` carry, as `window_in_which_it_would_link`
+/// waits for it.
+fn grant_of(props: &str) -> &str {
+    props
+        .split(r#""pipewire.sec.bubbler.audio": ""#)
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("a context with a grant")
+}
+
 /// A host stream pinned to `target` — the `node.name` (`bed-headset`) or
 /// the `object.path` (`bed-headset-path`) of a mono sink, the host's or,
 /// under `device_context`, a context's — is linked to the sink beside
-/// `copy`, a node a playback context names `copy_name`, whichever of the
-/// two came first.
+/// `copy`, a node a context under `copy_context` names `copy_name`,
+/// whichever of the two came first.
 fn a_host_stream_pinned_to_a_device_links_to_it_beside(
     device_context: Option<&str>,
+    copy_context: &str,
     copy: &str,
     copy_name: &str,
     target: &str,
@@ -2476,7 +2513,7 @@ fn a_host_stream_pinned_to_a_device_links_to_it_beside(
     let Some(bed) = PipeWireBed::start() else {
         return;
     };
-    let copy = || Streaming(bed.spawn_in_context(PLAYBACK, copy));
+    let copy = || Streaming(bed.spawn_in_context(copy_context, copy));
     let device_args = [
         "-r",
         "-a",
@@ -2515,12 +2552,12 @@ fn a_host_stream_pinned_to_a_device_links_to_it_beside(
         let first = if copy_first { copy() } else { device() };
         wait_for("the first node", || present() == 1);
         if copy_first {
-            window_in_which_it_would_link(&bed, "playback");
+            window_in_which_it_would_link(&bed, grant_of(copy_context));
         }
         let second = if copy_first { device() } else { copy() };
         wait_for("the host's device beside the copy", || present() == 2);
         if !copy_first {
-            window_in_which_it_would_link(&bed, "playback");
+            window_in_which_it_would_link(&bed, grant_of(copy_context));
         }
 
         let watched = LinkMonitor::start(&bed);
@@ -2919,6 +2956,164 @@ fn a_host_stream_plays_through_a_loopback_a_devices_context_makes() {
     wait_for("the loopback's stream on the host's sink", || {
         peers(&bed.links(), "offered-out:output_FL").contains(&"bed-sink:playback_FL")
     });
+}
+
+/// Whether the bed's linking hook kept the node named `name` out of the
+/// session, by the line it logs for each of the two ways.
+fn kept_out_of_the_session(bed: &PipeWireBed, name: &str) -> bool {
+    wireplumber_log(bed).lines().any(|line| {
+        (line.contains(&format!(" {name} (client "))
+            && line.contains("is no device of the session"))
+            || line.contains(&format!("removing the session item of {name} (client "))
+    })
+}
+
+/// The ports linked to any port of the node `node` in a `pw-link -l`
+/// listing, in either direction.
+fn linked_to<'a>(links: &'a str, node: &str) -> Vec<&'a str> {
+    let mut found = Vec::new();
+    let mut at_node = false;
+    for line in links.lines() {
+        if !line.starts_with(' ') {
+            at_node = line.starts_with(&format!("{node}:"));
+        } else if at_node {
+            let peer = line.trim();
+            found.push(
+                peer.strip_prefix("|-> ")
+                    .or_else(|| peer.strip_prefix("|<- "))
+                    .unwrap_or(peer),
+            );
+        }
+    }
+    found
+}
+
+/// A `devices` context offers a smart filter — `filter`, a node named
+/// `offered`, and the stream of its link group — aimed at the bed's
+/// device whose ports begin `device`; a host stream (`host`, a node named
+/// `host`) pinned to that device is linked to it alone, and the filter's
+/// node is kept out of the session.
+fn a_host_stream_passes_by_a_smart_filter_a_devices_context_offers(
+    bed: &PipeWireBed,
+    filter: [&str; 2],
+    host: &[&str],
+    device: &str,
+) {
+    let _filter = filter.map(|program| Streaming(bed.spawn_in_context(DEVICES, program)));
+    wait_for("the context's smart filter", || {
+        bed.dump_from_host()
+            .contains("\"filter.smart.name\": \"sandbox-filter\"")
+    });
+    window_in_which_it_would_link(bed, "playback,devices");
+
+    let _host = host_stream(bed, host);
+    wait_for("a link for the host stream", || {
+        !linked_to(&bed.links(), "host").is_empty()
+    });
+    std::thread::sleep(FORBIDDEN_LINK_LIFE);
+    let links = bed.links();
+    let peers = linked_to(&links, "host");
+    assert!(
+        peers.iter().all(|peer| peer.starts_with(device)),
+        "a host stream pinned to {device} met a devices context's smart filter:\n{links}"
+    );
+    assert!(
+        kept_out_of_the_session(bed, "offered"),
+        "a devices context's smart filter kept its session item:\n{}",
+        wireplumber_log(bed)
+    );
+}
+
+const SMART_FILTER_OUT: &str =
+    "pw-cat -p -a -P '{ node.name = offered-out, node.link-group = sandbox-filter }' - < /dev/zero";
+
+/// The device grant offers no smart filter, whichever way it is aimed:
+/// a filter in front of the bed's sink takes no host stream pinned to
+/// the sink, one behind its source no host recorder pinned to the source,
+/// and a node that says it is a smart filter a second after it was made
+/// is caught then. A `devices` context cannot reach the `filters`
+/// metadata, the other way WirePlumber reads a node as smart.
+#[test]
+fn a_host_stream_passes_by_a_smart_filter_a_devices_context_offers_in_front_of_a_device() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    a_host_stream_passes_by_a_smart_filter_a_devices_context_offers(
+        &bed,
+        [
+            "pw-cat -r -a -P '{ media.class = Audio/Sink, node.name = offered, \
+             node.link-group = sandbox-filter, filter.smart = true, \
+             filter.smart.name = sandbox-filter, \
+             filter.smart.target = { node.name = bed-sink } }' /dev/null",
+            SMART_FILTER_OUT,
+        ],
+        &[
+            "-p",
+            "-a",
+            "--target=bed-sink",
+            "-P",
+            "{ node.name = host }",
+            "-",
+        ],
+        "bed-sink:playback_",
+    );
+    drop(bed);
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    a_host_stream_passes_by_a_smart_filter_a_devices_context_offers(
+        &bed,
+        [
+            "pw-cat -p -a -P '{ media.class = Audio/Source, node.name = offered, \
+             node.link-group = sandbox-filter, filter.smart = true, \
+             filter.smart.name = sandbox-filter, \
+             filter.smart.target = { node.name = bed-source } }' - < /dev/zero",
+            "pw-cat -r -a -P '{ node.name = offered-in, node.link-group = sandbox-filter }' /dev/null",
+        ],
+        &[
+            "-r",
+            "-a",
+            "--target=bed-source",
+            "-P",
+            "{ node.name = host }",
+            "/dev/null",
+        ],
+        "bed-source:capture_",
+    );
+    drop(bed);
+
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let mut seen = String::new();
+    wait_for("the sink in a devices context's dump", || {
+        seen = bed.in_context(DEVICES, "pw-dump");
+        seen.contains("\"node.name\": \"bed-sink\"")
+    });
+    assert!(!seen.contains("\"metadata.name\""), "{seen}");
+    let Some(fixture) = changes_its_properties(&bed) else {
+        return;
+    };
+    let late = format!(
+        "'{}' in '{{ media.class = Audio/Sink, node.name = offered, \
+         node.link-group = sandbox-filter }}' '{{ filter.smart = true, \
+         filter.smart.name = sandbox-filter, \
+         filter.smart.target = {{ node.name = bed-sink }} }}'",
+        fixture.display()
+    );
+    a_host_stream_passes_by_a_smart_filter_a_devices_context_offers(
+        &bed,
+        [&late, SMART_FILTER_OUT],
+        &[
+            "-p",
+            "-a",
+            "--target=bed-sink",
+            "-P",
+            "{ node.name = host }",
+            "-",
+        ],
+        "bed-sink:playback_",
+    );
 }
 
 /// The session may make a `devices` context's sink its default, and
