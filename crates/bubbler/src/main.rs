@@ -830,7 +830,8 @@ fn refresh_entries(env: &Env, dirs: &desktop::Dirs, program: &Path) -> Result<i3
     Ok(i32::from(failed > 0))
 }
 
-// Tried once; a winner already gone again is the start's own error. A
+// The connection a start that lost the race to another start of the
+// instance joins that one through. Tried once; a winner already gone again is the start's own error. A
 // winner whose start then fails ends the join as an instance that stopped
 // while the command was running.
 fn join_after_lost_start(
@@ -970,7 +971,9 @@ fn report(report: &lint::Report, opts: &LintOpts) -> Result<i32> {
     Ok(code)
 }
 
-// Notes are left out, the exit code is untouched, and a run that could
+// The errors and warnings of a lint run on stderr, prefixed so they are
+// plainly bubbler's and plainly not the command's own output. Notes are
+// left out, the exit code is untouched, and a run that could
 // not be made at all says nothing: this rides along with another command,
 // and must never be what fails it.
 fn warn_lint(result: Result<lint::Report, bubbler_core::error::LintError>) {
@@ -1095,7 +1098,7 @@ fn portal_session(env: &Env) -> Result<dbus_wire::Session> {
     Ok(dbus_wire::Session::connect(&bus)?)
 }
 
-// `argv[0]` is the only place the name it was called by survives —
+// `argv[0]` is the only place the name this process was called by survives —
 // `current_exe()` reads `/proc/self/exe` and so resolves the symlink — and
 // it is caller-controlled, so the name is a key into the registry bubbler
 // wrote and never an instance name in its own right.
