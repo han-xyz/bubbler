@@ -214,7 +214,7 @@ pub const NOT_LOADED_CHECK: &str = "audio-policy-not-loaded";
 pub fn run_warning(cfg: &InstanceConfig, host: &dyn Host, env: &Env) -> Option<String> {
     cfg.audio()?;
     let missing = missing(host, env).map(Missing::run_warning);
-    let paths = if accepts(cfg, DIFFERS_CHECK) {
+    let paths = if cfg.accepts(DIFFERS_CHECK) {
         Vec::new()
     } else {
         differing(host, env)
@@ -237,15 +237,11 @@ pub fn not_loaded_warning(
     read: impl FnOnce(&Env) -> LoadedRevision,
 ) -> Option<String> {
     cfg.audio()?;
-    let differs_reported = !accepts(cfg, DIFFERS_CHECK) && !differing(host, env).is_empty();
-    if missing(host, env).is_some() || differs_reported || accepts(cfg, NOT_LOADED_CHECK) {
+    let differs_reported = !cfg.accepts(DIFFERS_CHECK) && !differing(host, env).is_empty();
+    if missing(host, env).is_some() || differs_reported || cfg.accepts(NOT_LOADED_CHECK) {
         return None;
     }
     read(env).run_warning()
-}
-
-fn accepts(cfg: &InstanceConfig, check: &str) -> bool {
-    cfg.lint_allows.iter().any(|allow| allow.id == check)
 }
 
 /// The audio group header's suffix: the policy missing, differing or not loaded; `""` where it is

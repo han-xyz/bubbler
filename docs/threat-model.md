@@ -329,8 +329,6 @@ describes goes on to refuse.
 **Defends:** a `wayland` grant binds a socket bubbler listens on itself,
 registered with the compositor through `wp_security_context_v1` as engine
 `org.bubbler`, app id `org.bubbler.<inst>`, instance id `bubbler-<inst>`.
-Two names can give one app id (`my.app`, `my_app`), so a name another
-instance's app id already has is refused when it is made.
 A client on it is one the compositor knows to be sandboxed, and the
 compositor withholds its privileged globals from such a client. The
 sandbox does not connect to that socket: it connects to a second one
@@ -825,7 +823,11 @@ rules act on (`find-flatpak-access.lua`, 0.5.18); a context client with
 bubbler's file, `[Instance]` included, gets the drop-in's permissions and
 nothing else (measured, WirePlumber 0.5.18). The camera is gated by the
 portal's own permission store, keyed by the app id the portal reads from
-the proxy's copy of the file.
+the proxy's copy of the file. Two instance names can give one app id
+(`my.app`, `my_app`), so a name another instance's app id already has is
+refused when it is made; a pair made by hand or before 0.26.0 is only
+warned about, by `bubbler lint` and on each start, and a `lint-allow` of
+`app-id-shared` silences that.
 
 The identity file also costs the grant a program. gdk-pixbuf's glycin image
 loaders read `/.flatpak-info` to pick their own sandbox, and on finding one

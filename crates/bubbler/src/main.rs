@@ -1356,8 +1356,10 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                             "bubbler: warning: x11 \"host\" grants no isolation between X clients"
                         );
                     }
-                    if let Some(warning) = inst.app_id_warning(&env).context("listing instances")? {
-                        ediag!("bubbler: warning: {warning}");
+                    match inst.app_id_warning(&env) {
+                        Ok(Some(warning)) => ediag!("bubbler: warning: {warning}"),
+                        Ok(None) => {}
+                        Err(e) => ediag!("bubbler: warning: listing instances: {e}"),
                     }
                     if let Some(warning) = audio_policy::run_warning(&inst.config, &RealHost, &env)
                     {
@@ -1556,8 +1558,10 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                             "bubbler: warning: x11 \"host\" grants no isolation between X clients"
                         );
                     }
-                    if let Some(warning) = inst.app_id_warning(&env).context("listing instances")? {
-                        ediag!("bubbler: warning: {warning}");
+                    match inst.app_id_warning(&env) {
+                        Ok(Some(warning)) => ediag!("bubbler: warning: {warning}"),
+                        Ok(None) => {}
+                        Err(e) => ediag!("bubbler: warning: listing instances: {e}"),
                     }
                     if let Some(warning) = audio_policy::run_warning(&inst.config, &RealHost, &env)
                     {

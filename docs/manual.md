@@ -281,9 +281,12 @@ the same application id (see "D-Bus") as an existing instance: `my.app` and
 forwarded documents and the window app id. `create` and `try --keep` refuse
 such a name, naming the instance that has it. A pair made before 0.26.0 is
 reported by `bubbler lint` (`app-id-shared`) and warned about on each `run` or
-`open` of either until one is renamed while neither runs (move its directory
-under the instances directory), or the config accepts it with `lint-allow
-"app-id-shared" reason="..."`.
+`open` of either until one is renamed while neither runs, or the config accepts
+it with `lint-allow "app-id-shared" reason="..."`. There is no rename command:
+moving the directory under the instances directory renames the instance but
+checks nothing, so run `bubbler lint` on the new name, and redo its `wrap` and
+`desktop` entries, which still name the old one. A `try --keep` that finds a
+twin made while it ran keeps the instance and prints the same warning.
 
 `man` prints roff on stdout, rendered from the command tree this binary was
 built with: `bubbler.1` with a subsection for every subcommand, the files a run
@@ -3121,9 +3124,10 @@ silently and the lint stays silent to match), `dbus-without-rules`,
 `ghp_`/`sk-`/`AKIA` — whole words, so `TOKENIZERS_PARALLELISM` is not one),
 `tty-passthrough`, `tty-passthrough-without-seccomp` (`tty "passthrough"`
 with `seccomp { disable }`, which is the terminal handed over with the
-`TIOCSTI` rules taken away), `portal-talk-without-portals` (a rule reaching a portal name, a glob such as
-`org.freedesktop.*` included, is inert without `/.flatpak-info`, which is worse
-than wrong),
+`TIOCSTI` rules taken away), `portal-talk-without-portals` (a rule reaching a
+portal name, a glob such as `org.freedesktop.*` included, is inert without
+`/.flatpak-info`, which is worse than wrong; where the rule would undo
+`portals`, the help says to replace it with `portals` rather than add it),
 `wayland-clipboard-open` (`wayland clipboard="open"` with no `lint-allow`
 reason: the proxy forwards every clipboard read the sandbox asks for and
 only logs it, rather than forwarding one that follows a key, button or
@@ -3196,7 +3200,8 @@ its EGL will not drive a Wayland display without one, and the node carries
 the connectors, their modes, the monitors' EDID),
 `secrets-access`
 (`talk`/`own` of
-`org.freedesktop.secrets`, or of a glob covering it, on the session bus reaches the whole login keyring:
+`org.freedesktop.secrets`, or of a glob covering it, on the session bus reaches
+the whole login keyring:
 the Secret Service API partitions nothing between the applications that call
 it; the `secrets` child of `portals` raises the same note for the narrower
 path, the one this application's own portal secret comes through),
@@ -3375,9 +3380,9 @@ every call to it and leave the rules above as dead text.
 
 The same holds for a rule you write, so a config that grants `portals` is
 refused when any layer also has, on the session bus, a `talk` or `own` whose
-name covers `org.freedesktop.portal.Desktop` or `.Documents`, or a `call` there
-whose method part is empty or `*` (`=*`, `=*@/*`, `=@/<path>`). A name glob
-`org.foo.*` covers `org.foo` itself as well as every name under it
+name covers `org.freedesktop.portal.Desktop` or `.Documents`, or a `call`
+covering `.Desktop` whose method part is empty or `*` (`=*`, `=*@/*`,
+`=@/<path>`). A name glob `org.foo.*` covers `org.foo` itself as well as every name under it
 (`xdg-dbus-proxy(1)`), so `org.freedesktop.portal.Desktop.*`,
 `org.freedesktop.portal.*` and `org.freedesktop.*` all count:
 

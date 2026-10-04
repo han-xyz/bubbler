@@ -180,8 +180,50 @@ pub const APP_ID_SHARED_CHECK: &str = "app-id-shared";
 /// The existing instance, other than `name` itself, whose portal app id is
 /// `name`'s.
 pub fn app_id_twin(env: &Env, name: &str) -> Result<Option<String>, InstanceError> {
-    let names = Instance::list(env)?;
+    let names = list_in(&instances_root(env))?;
     Ok(dbus::app_id_twin(name, &names).map(str::to_owned))
+}
+
+/// The warning `name`'s run, or its keeping, prints when another instance
+/// in `root` shares its app id and `config` does not accept that.
+fn app_id_warning_in(
+    root: &Path,
+    name: &str,
+    config: &InstanceConfig,
+) -> Result<Option<String>, InstanceError> {
+    if config.accepts(APP_ID_SHARED_CHECK) {
+        return Ok(None);
+    }
+    let names = list_in(root)?;
+    Ok(dbus::app_id_twin(name, &names).map(|other| {
+        format!(
+            "instance `{name}` shares the portal app id `{}` with instance `{other}`, and with \
+             it portal permissions, forwarded documents and the window app id; rename one \
+             of the two, or accept it with `lint-allow \"{APP_ID_SHARED_CHECK}\"`",
+            dbus::app_id(name),
+        )
+    }))
+}
+
+/// Names of the instances under `root`, sorted. An absent root holds none.
+fn list_in(root: &Path) -> Result<Vec<String>, InstanceError> {
+    let entries = match fs::read_dir(root) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(InstanceError::Io(root.to_path_buf(), e)),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(io_err(root))?;
+        if let Some(n) = entry.file_name().to_str()
+            && validate_name(n).is_ok()
+            && entry.path().join(CONFIG_FILE).is_file()
+        {
+            names.push(n.to_owned());
+        }
+    }
+    names.sort();
+    Ok(names)
 }
 
 fn refuse_app_id_twin(env: &Env, name: &str) -> Result<(), InstanceError> {
@@ -518,6 +560,14 @@ impl Drop for Ephemeral {
         // it can do about a failure here.
         if let Err(e) = kept {
             eprintln!("bubbler: {}: {e}", dir.display());
+        } else if let Some(name) = &self.keep {
+            // `keep_as` refused a twin at the start; one made during the run
+            // is warned about, since the run's home is never thrown away.
+            match app_id_warning_in(&self.instances_root, name, &self.instance.config) {
+                Ok(Some(warning)) => eprintln!("bubbler: warning: {warning}"),
+                Ok(None) => {}
+                Err(e) => eprintln!("bubbler: warning: {e}"),
+            }
         }
         if self.remove_runtime
             && let Err(e) = fs::remove_dir_all(&self.runtime)
@@ -538,23 +588,7 @@ impl Instance {
     /// The line a real run prints when another instance shares this one's
     /// portal app id, unless the config accepts it with a `lint-allow`.
     pub fn app_id_warning(&self, env: &Env) -> Result<Option<String>, InstanceError> {
-        if self
-            .config
-            .lint_allows
-            .iter()
-            .any(|allow| allow.id == APP_ID_SHARED_CHECK)
-        {
-            return Ok(None);
-        }
-        Ok(app_id_twin(env, &self.name)?.map(|other| {
-            format!(
-                "instance `{}` shares the portal app id `{}` with instance `{other}`, and with \
-                 it portal permissions, forwarded documents and the window app id; rename one \
-                 of the two, or accept it with `lint-allow \"{APP_ID_SHARED_CHECK}\"`",
-                self.name,
-                dbus::app_id(&self.name),
-            )
-        }))
+        app_id_warning_in(&instances_root(env), &self.name, &self.config)
     }
 
     /// Private home directory on the host, bound to `/home/bubbler` inside.
@@ -646,24 +680,7 @@ impl Instance {
 
     /// Names of all instances, sorted. An absent root means no instances.
     pub fn list(env: &Env) -> Result<Vec<String>, InstanceError> {
-        let root = instances_root(env);
-        let entries = match fs::read_dir(&root) {
-            Ok(e) => e,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(InstanceError::Io(root, e)),
-        };
-        let mut names = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(io_err(&root))?;
-            if let Some(n) = entry.file_name().to_str()
-                && validate_name(n).is_ok()
-                && entry.path().join(CONFIG_FILE).is_file()
-            {
-                names.push(n.to_owned());
-            }
-        }
-        names.sort();
-        Ok(names)
+        list_in(&instances_root(env))
     }
 
     /// Remove the instance directory, including its private home, and its

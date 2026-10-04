@@ -10935,13 +10935,17 @@ fn an_existing_pair_sharing_an_app_id_is_reported_by_lint_and_run() {
                 && out.contains("`org.bubbler._2fa`"),
             "{out}"
         );
-        let (code, _, err) = run(tmp.path(), &["run", name]);
-        warned_codes.push(code);
-        assert!(
-            err.contains("bubbler: warning: ") && err.contains(&format!("`{other}`")),
-            "{err}"
-        );
-        assert!(err.contains("`org.bubbler._2fa`"), "{err}");
+        for start in ["run", "open"] {
+            let (code, _, err) = run(tmp.path(), &[start, name]);
+            warned_codes.push(code);
+            // `open` with no terminal anywhere writes its stderr to the run log.
+            let err = err + &run_log_of(tmp.path(), name);
+            assert!(
+                err.contains("bubbler: warning: ") && err.contains(&format!("`{other}`")),
+                "{start}: {err}"
+            );
+            assert!(err.contains("`org.bubbler._2fa`"), "{start}: {err}");
+        }
     }
     std::fs::write(
         instances.join("2fa/config.kdl"),
@@ -10953,7 +10957,51 @@ fn an_existing_pair_sharing_an_app_id_is_reported_by_lint_and_run() {
     let (code, _, err) = run(tmp.path(), &["run", "2fa"]);
     assert!(!err.contains("org.bubbler._2fa"), "{err}");
     // The warning stops nothing: the run fails, or not, as it does without it.
-    assert_eq!(warned_codes, [code, code], "{err}");
+    assert_eq!(warned_codes[0], code, "{err}");
+    // The allow is the one instance's own; the other still hears of the pair.
+    let (code, out, err) = run(tmp.path(), &["lint", "_2fa"]);
+    assert_eq!(code, 1, "{out}{err}");
+    assert!(out.contains("warning[app-id-shared]"), "{out}");
+    let (_, _, err) = run(tmp.path(), &["run", "_2fa"]);
+    assert!(err.contains("`org.bubbler._2fa`"), "{err}");
+}
+
+#[test]
+fn a_twin_made_while_a_try_runs_is_kept_with_a_warning() {
+    if !require_bwrap() {
+        return;
+    }
+    let Some(init) = real_init() else { return };
+    let tmp = setup();
+    let child = bubbler_live(tmp.path(), &init)
+        .args(["try", "--keep", "my_app", "--", "/usr/bin/sleep", "2"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // `--keep` is checked before bwrap starts, so the twin comes after it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while bwraps_under(child.id()).is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let (code, _, err) = run(tmp.path(), &["create", "my.app"]);
+    assert_eq!(code, 0, "{err}");
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(
+        tmp.path()
+            .join("data/bubbler/instances/my_app/config.kdl")
+            .is_file(),
+        "{err}"
+    );
+    assert!(
+        err.contains("bubbler: warning: ")
+            && err.contains("`my_app`")
+            && err.contains("`my.app`")
+            && err.contains("`org.bubbler.my_app`"),
+        "{err}"
+    );
 }
 
 /// A stand-in pasta: it records the argv it was given, reports readiness

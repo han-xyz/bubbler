@@ -487,9 +487,9 @@ const CHECK_LINES: &[(&str, &str)] = &[
     ),
     (
         "secrets-access",
-        "A `talk` or `own` of org.freedesktop.secrets or a glob covering it — the whole login keyring, which \
-         the Secret Service API partitions between no applications — or a `secrets` child \
-         of `portals`, which is this application's own portal secret.",
+        "A `talk` or `own` of org.freedesktop.secrets or a glob covering it — the whole \
+         login keyring, which the Secret Service API partitions between no applications — \
+         or a `secrets` child of `portals`, which is this application's own portal secret.",
     ),
     (
         "share-source-missing",

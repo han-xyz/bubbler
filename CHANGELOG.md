@@ -14,8 +14,10 @@
   package, and restart WirePlumber; until then each run with an audio grant
   warns that the running WirePlumber has not loaded this bubbler's policy.
 - A config is refused when its D-Bus rules would undo the `portals` split
-  (a `talk`, `own` or every-interface `call` on the portal names beside
-  `portals`), silence a `call`/`broadcast` with a `talk` or `own` covering its
+  (a `talk` or `own` on the portal names, or an every-interface `call` on
+  `org.freedesktop.portal.Desktop`, beside `portals`; a `call` on
+  `org.freedesktop.portal.Documents` adds nothing to the bundle and is
+  accepted), silence a `call`/`broadcast` with a `talk` or `own` covering its
   name (one that `notify`, `tray`, `input-method` or `mpris` adds included), or
   `own` a name bubbler trusts on the host bus (`org.a11y.*`,
   `org.freedesktop.portal.*`, `org.freedesktop.impl.portal.*`).
@@ -29,7 +31,8 @@
   (`my.app` beside `my_app`, `2fa` beside `_2fa`), since the two would share
   portal permissions, forwarded documents and the window app id. A pair that
   already exists is reported by `bubbler lint` as `app-id-shared` and warned
-  about on `run` and `open`; rename one, or accept it with `lint-allow`.
+  about on `run` and `open`, and by a `try --keep` that finds one made while
+  it ran; rename one, or accept it with `lint-allow`.
 
 ### Changed
 

@@ -611,18 +611,18 @@ pub(crate) fn bus_clash(services: &[Service]) -> Option<BusClash<'_>> {
 // `xdg-dbus-proxy(1)` reads a rule as `[METHOD][@PATH]`: an empty method or
 // `*` is every interface, while `org.foo.*` is the one interface `org.foo`.
 // A broadcast rule lets signals in and opens no call. `portals` itself
-// writes `Documents=*`, so a call on that one name adds nothing.
-fn reaches_every_portal(rule: &BusRule) -> bool {
-    let every = match rule {
+// writes `Documents=*`, so only a call reaching `Desktop` opens more.
+pub(crate) fn reaches_every_portal(rule: &BusRule) -> bool {
+    match rule {
         BusRule::See(_) | BusRule::Broadcast(..) => false,
-        BusRule::Talk(_) | BusRule::Own(_) => true,
-        BusRule::Call(name, _) if name == "org.freedesktop.portal.Documents" => false,
-        BusRule::Call(_, r) => {
-            let method = r.split_once('@').map_or(r.as_str(), |(m, _)| m);
-            method.is_empty() || method == "*"
+        BusRule::Talk(name) | BusRule::Own(name) => {
+            PORTAL_BUSES.iter().any(|p| name_covers(name, p))
         }
-    };
-    every && PORTAL_BUSES.iter().any(|p| name_covers(rule.name(), p))
+        BusRule::Call(name, r) => {
+            let method = r.split_once('@').map_or(r.as_str(), |(m, _)| m);
+            (method.is_empty() || method == "*") && name_covers(name, PORTAL_BUSES[0])
+        }
+    }
 }
 
 /// Whether the name a rule writes reaches the name or family `listed`.
@@ -1111,6 +1111,11 @@ pub struct InstanceConfig {
 }
 
 impl InstanceConfig {
+    /// Whether a `lint-allow` in this config accepts the check `id`.
+    pub fn accepts(&self, id: &str) -> bool {
+        self.lint_allows.iter().any(|allow| allow.id == id)
+    }
+
     /// The audio grant this instance carries: `None` when neither
     /// `pipewire` nor `pulseaudio` is granted, otherwise `microphone`
     /// ORed across whichever of the two are, since either one reaches
@@ -7665,8 +7670,9 @@ command "b""#
             "dbus {\n    broadcast \"org.freedesktop.portal.Desktop=@/org/freedesktop/portal/desktop\"\n}\nportals",
             "dbus {\n    broadcast \"org.freedesktop.portal.*=*\"\n}\nportals",
             "dbus {\n    see \"org.freedesktop.portal.Desktop\"\n}\nportals",
-            // `portals` writes this rule itself, so it adds nothing.
+            // `portals` writes `Documents=*` itself, so these add nothing.
             "dbus {\n    call \"org.freedesktop.portal.Documents=*\"\n}\nportals",
+            "dbus {\n    call \"org.freedesktop.portal.Documents.*=*\"\n}\nportals",
             "dbus {\n    own \"org.mozilla.firefox.*\"\n}\nportals",
             "dbus\nportals\nsystem-bus {\n    talk \"org.freedesktop.portal.Desktop\"\n}",
         ] {

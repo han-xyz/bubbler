@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use kdl::{KdlDocument, KdlNode};
 
 use crate::audio_policy::{self, LoadedRevision};
-use crate::config::{self, name_covers};
+use crate::config::{self, BusRule, name_covers};
 use crate::desktop;
 use crate::env::{Env, SANDBOX_HOME};
 use crate::error::{LintError, ReadError};
@@ -986,6 +986,24 @@ fn bus_rules(source: &Source) -> Vec<(&'static str, &KdlNode)> {
     out
 }
 
+/// Whether the session-bus rule `node` is one the parser refuses beside
+/// `portals`.
+fn undoes_portals(node: &KdlNode) -> bool {
+    let Some(a) = arg(node) else {
+        return false;
+    };
+    let rule = match node.name().value() {
+        "talk" => BusRule::Talk(a.to_owned()),
+        "own" => BusRule::Own(a.to_owned()),
+        "call" => match a.split_once('=') {
+            Some((name, r)) => BusRule::Call(name.to_owned(), r.to_owned()),
+            None => return false,
+        },
+        _ => return false,
+    };
+    config::reaches_every_portal(&rule)
+}
+
 /// The last layer that writes a `name` node, and that node: the merge
 /// keeps that one, so a finding about it belongs to that layer and not to
 /// the layer it overrode.
@@ -1281,8 +1299,9 @@ fn app_id_shared(ctx: &Context, f: &mut Findings) {
             dbus::app_id(other)
         ),
         help: format!(
-            "rename one of the two while neither runs (move its directory under the instances \
-             directory), or accept it with `lint-allow \"{}\" reason=\"...\"`",
+            "rename one of the two while neither runs: move its directory under the instances \
+             directory, run `bubbler lint` on the new name, and redo its `wrap` and `desktop` \
+             entries, which name the old one; or accept it with `lint-allow \"{}\" reason=\"...\"`",
             APP_ID_SHARED.id
         ),
     });
@@ -1992,9 +2011,17 @@ fn across_layers(ctx: &Context, sources: &[Source], f: &mut Findings) {
                     "add `portals` (and the `dbus` that carries it), or drop this node",
                 );
             }
-            for (_, rule) in bus_rules(source) {
+            for (bus, rule) in bus_rules(source) {
                 let Some(name) = rule_name(rule).filter(|n| name_covers(n, PORTAL_NAMES)) else {
                     continue;
+                };
+                let help = match bus == "dbus" && undoes_portals(rule) {
+                    true => {
+                        "replace the rule with `portals` (the two together are refused, since \
+                         the rule would undo the `portals` split), or keep the rule knowingly, \
+                         without `portals`"
+                    }
+                    false => "add `portals`, or drop the rule",
                 };
                 f.push(
                     i,
@@ -2004,14 +2031,15 @@ fn across_layers(ctx: &Context, sources: &[Source], f: &mut Findings) {
                         "`{name}` reaches the portal names, and without `portals` the sandbox has no \
                          `/.flatpak-info`, so every portal call is refused"
                     ),
-                    "add `portals`, or drop the rule",
+                    help,
                 );
             }
         }
     }
 
     // Keyed by bus as well as name: the two proxies are separate, so one
-    // name may hold a different policy on each.
+    // name may hold a different policy on each. Exact names only, as the
+    // parser compares them: this check is in `PARSER_EQUIVALENT`.
     let mut policies: Vec<(&str, String, &str, usize)> = Vec::new();
     for (i, source) in sources.iter().enumerate() {
         for (bus, rule) in bus_rules(source) {
@@ -3498,6 +3526,40 @@ mod tests {
                 ids(&lint(ctx, &[text])).contains(&"portal-talk-without-portals"),
                 "{text}"
             );
+        });
+    }
+
+    #[test]
+    fn following_the_portal_rule_help_gives_a_config_that_parses() {
+        with(&host(), |ctx| {
+            for rule in [
+                "talk \"org.freedesktop.*\"",
+                "talk \"org.freedesktop.portal.Desktop\"",
+                "call \"org.freedesktop.portal.Desktop=*\"",
+                "call \"org.freedesktop.portal.Desktop=org.freedesktop.portal.FileChooser.*\"",
+            ] {
+                let text = format!("dbus {{\n    {rule}\n}}\n");
+                let report = lint(ctx, &[&text]);
+                let help = &report
+                    .findings
+                    .iter()
+                    .find(|f| f.id == "portal-talk-without-portals")
+                    .unwrap_or_else(|| panic!("{rule}: {report:?}"))
+                    .help;
+                let followed = if help.starts_with("add `portals`") {
+                    format!("{text}portals\n")
+                } else {
+                    assert!(
+                        help.starts_with("replace the rule with `portals`"),
+                        "{help}"
+                    );
+                    format!("{}portals\n", text.replace(&format!("    {rule}\n"), ""))
+                };
+                assert!(
+                    config::parse(&followed).is_ok(),
+                    "{rule}: {help}: {followed}"
+                );
+            }
         });
     }
 

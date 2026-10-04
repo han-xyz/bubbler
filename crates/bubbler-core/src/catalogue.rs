@@ -280,8 +280,10 @@ pub static GRANTS: &[Grant] = &[
                gdk-pixbuf's image loaders look for `flatpak-spawn`, so the grant puts one \
                on the sandbox's path: `/usr/bin` becomes an overlay of itself, remounted \
                read-only, which needs unprivileged overlayfs — Linux 5.11 or newer. \
-               A `dbus` `talk`, `own` or every-interface `call` on the portal names undoes \
-               the set and is refused: drop `portals` for full portal access, or the rule.",
+               A `dbus` `talk` or `own` on the portal names, or an every-interface `call` \
+               on `org.freedesktop.portal.Desktop`, undoes the set and is refused: drop \
+               `portals` for full portal access, or the rule. A `call` on \
+               `org.freedesktop.portal.Documents` adds nothing and is accepted.",
         risk: Risk::Narrow,
         grammar: "portals [{ screencast remote-desktop ... }]",
     },
