@@ -19,8 +19,10 @@ type Started = (std::process::Child, PathBuf, tempfile::TempDir);
 /// the supervisor binds for it, and `wm` the window manager program.
 /// `stray` is a descriptor the supervisor inherits without being told of
 /// it, standing in for whatever the process that started the run had open.
+/// `wrapper` is a program, with its arguments, that runs the supervisor.
 #[derive(Default)]
 struct Opts<'a> {
+    wrapper: Option<&'a [&'a str]>,
     ctty: bool,
     stdio: Option<&'a OwnedFd>,
     stray: Option<&'a OwnedFd>,
@@ -74,7 +76,15 @@ fn start_with(cmd: &[&str], opts: Opts<'_>) -> Started {
     let sock = tmp.path().join("init.sock");
     let listener = UnixListener::bind(&sock).unwrap();
     let child = spawn_locked(Some(&listener), opts.stray.map(AsFd::as_fd), |fd| {
-        let mut init = Command::new(env!("CARGO_BIN_EXE_bubbler-init"));
+        let bin = env!("CARGO_BIN_EXE_bubbler-init");
+        let mut init = match opts.wrapper {
+            Some([program, args @ ..]) => {
+                let mut c = Command::new(program);
+                c.args(args).arg(bin);
+                c
+            }
+            _ => Command::new(bin),
+        };
         init.arg("--socket-fd").arg(
             fd.expect("a listener was handed over, so it has a number")
                 .to_string(),
@@ -353,6 +363,85 @@ fn start_guarded(cmd: &[&str], opts: Opts<'_>) -> Guarded {
 /// The same, for a run that needs nothing beyond its command.
 fn start(cmd: &[&str]) -> Guarded {
     start_guarded(cmd, Opts::default())
+}
+
+/// Makes the supervisor uid 0 of a user namespace of its own, where it
+/// holds every capability, CAP_SETPCAP included, and a full bounding set.
+const AS_NAMESPACE_ROOT: &[&str] = &["/usr/bin/unshare", "--user", "--map-root-user"];
+
+/// Returns false (after printing why) when `AS_NAMESPACE_ROOT` cannot hand
+/// a process a bounding set to empty here, as in a container that gives
+/// no user namespace.
+fn require_namespace_root() -> bool {
+    let probe = Command::new(AS_NAMESPACE_ROOT[0])
+        .args(&AS_NAMESPACE_ROOT[1..])
+        .args(["/usr/bin/grep", "^CapBnd:", "/proc/self/status"])
+        .stderr(Stdio::null())
+        .output();
+    let why = match probe {
+        Err(e) => format!("{} cannot run: {e}", AS_NAMESPACE_ROOT[0]),
+        Ok(out) if !out.status.success() => {
+            format!(
+                "a user namespace of its own left the probe at {}",
+                out.status
+            )
+        }
+        Ok(out) => match capability_sets(&String::from_utf8_lossy(&out.stdout)).first() {
+            Some((_, mask)) if *mask != 0 => return true,
+            _ => "a user namespace of its own came with an empty bounding set".to_owned(),
+        },
+    };
+    println!("skipping: {why}");
+    false
+}
+
+/// The `Cap*` lines of a `/proc/<pid>/status`, as name and mask.
+fn capability_sets(status: &str) -> Vec<(String, u64)> {
+    status
+        .lines()
+        .filter_map(|line| line.split_once(":\t"))
+        .filter(|(name, _)| name.starts_with("Cap"))
+        .map(|(name, mask)| (name.to_owned(), u64::from_str_radix(mask, 16).unwrap()))
+        .collect()
+}
+
+/// The capability sets of a main command the supervisor started, run
+/// under `wrapper` when one is given.
+fn capabilities_of_the_command(wrapper: Option<&[&str]>) -> Vec<(String, u64)> {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("status");
+    let fd = stdio_file(&out);
+    let (mut init, _sock) = start_guarded(
+        &["/usr/bin/grep", "^Cap", "/proc/self/status"],
+        Opts {
+            wrapper,
+            stdio: Some(&fd),
+            ..Opts::default()
+        },
+    );
+    assert!(init.wait_within(PATIENT).success(), "the run failed");
+    let sets = capability_sets(&std::fs::read_to_string(&out).unwrap());
+    assert_eq!(sets.len(), 5, "not every capability set was read");
+    sets
+}
+
+#[test]
+fn a_supervisor_holding_cap_setpcap_leaves_its_command_no_capability_at_all() {
+    if !require_namespace_root() {
+        return;
+    }
+    for (name, mask) in capabilities_of_the_command(Some(AS_NAMESPACE_ROOT)) {
+        assert_eq!(mask, 0, "{name} is {mask:x}");
+    }
+}
+
+#[test]
+fn a_supervisor_without_cap_setpcap_still_runs_its_command_without_capabilities() {
+    for (name, mask) in capabilities_of_the_command(None) {
+        if name != "CapBnd" {
+            assert_eq!(mask, 0, "{name} is {mask:x}");
+        }
+    }
 }
 
 #[test]

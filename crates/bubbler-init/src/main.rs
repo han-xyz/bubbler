@@ -205,18 +205,11 @@ fn take_ctty(command: &mut Command) {
 }
 
 // `PR_SET_NO_NEW_PRIVS` first, so nothing the supervisor `execve`s can
-// gain a privilege whatever it finds on the filesystem.
+// gain a privilege whatever it finds on the filesystem. The bounding set
+// before the other sets: dropping from it takes CAP_SETPCAP in effective.
 fn harden() -> rustix::io::Result<()> {
     set_no_new_privs(true)?;
     clear_ambient_capability_set()?;
-    let empty = CapabilitySets {
-        effective: CapabilitySet::empty(),
-        permitted: CapabilitySet::empty(),
-        inheritable: CapabilitySet::empty(),
-    };
-    if capabilities(None)? != empty {
-        set_capabilities(None, empty)?;
-    }
     // `.iter_names()`, not `.iter()`: rustix marks `CapabilitySet` with
     // bitflags' external-bits escape hatch (`const _ = !0;`) so a future
     // kernel's capability past bit 40 still round-trips through this
@@ -236,6 +229,14 @@ fn harden() -> rustix::io::Result<()> {
                 Err(e) => return Err(e),
             }
         }
+    }
+    let empty = CapabilitySets {
+        effective: CapabilitySet::empty(),
+        permitted: CapabilitySet::empty(),
+        inheritable: CapabilitySet::empty(),
+    };
+    if capabilities(None)? != empty {
+        set_capabilities(None, empty)?;
     }
     // A bwrap that is killed leaves this process a `SIGTERM`, which is the
     // one the run already knows how to end on.
