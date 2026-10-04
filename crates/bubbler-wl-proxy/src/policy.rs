@@ -124,7 +124,7 @@ pub struct Connection {
 
 #[derive(Debug, Default, Clone, Copy)]
 struct ToolFrame {
-    contact_or_button: bool,
+    press: bool,
     proximity: bool,
 }
 
@@ -195,8 +195,8 @@ impl Policy {
     /// What arms it: `wl_keyboard.key` pressed, `wl_pointer.button` either
     /// way, and `wl_touch.down` or `.up` — the release of each, because that
     /// is where a drag ends and where a paste is asked for. A tablet tool's
-    /// `frame` arms the same way when it holds a `down`, `up` or `button` and
-    /// no `proximity_in` or `proximity_out`; a tablet pad's `button` only when
+    /// `frame` arms when it holds a `down` or a pressed `button` and no
+    /// `proximity_in` or `proximity_out`; a tablet pad's `button` only when
     /// pressed. Input dated before the last one leaves it as it is.
     pub fn arm(&mut self, now: Instant) {
         self.last_input = self.last_input.max(Some(now));
@@ -302,20 +302,22 @@ impl Policy {
         Action::Forward
     }
 
-    // The compositor itself sends `down`, `up` and buttons in the frame of a
-    // `proximity_in` or `_out`, so only a frame without one arms.
+    // The compositor itself sends `down` and held buttons in the frame of a
+    // `proximity_in`, so only a frame without a proximity event arms.
     fn tool_event(&mut self, msg: &Incoming<'_>, name: &str, conn: &mut Connection, now: Instant) {
         let tool = msg.object;
         match name {
-            "down" | "up" | "button" => {
-                conn.tool_frames.entry(tool).or_default().contact_or_button = true;
+            "down" => conn.tool_frames.entry(tool).or_default().press = true,
+            // `state` is argument 2 of a tool button, and 1 is pressed.
+            "button" if matches!(msg.args.get(2), Some(Arg::Uint(1))) => {
+                conn.tool_frames.entry(tool).or_default().press = true;
             }
             "proximity_in" | "proximity_out" => {
                 conn.tool_frames.entry(tool).or_default().proximity = true;
             }
             "frame" => {
                 let frame = conn.tool_frames.remove(&tool).unwrap_or_default();
-                if frame.contact_or_button && !frame.proximity && msg.input_arms {
+                if frame.press && !frame.proximity && msg.input_arms {
                     self.arm(now);
                 }
             }
@@ -1041,9 +1043,7 @@ mod tests {
     fn a_tablet_tool_frame_with_contact_or_a_button_opens_the_gate() {
         for (iface, name, state) in [
             ("zwp_tablet_tool_v2", "down", 0),
-            ("zwp_tablet_tool_v2", "up", 0),
             ("zwp_tablet_tool_v2", "button", 1),
-            ("zwp_tablet_tool_v2", "button", 0),
             ("zwp_tablet_tool_v1", "down", 0),
             ("zwp_tablet_tool_v1", "button", 1),
         ] {
@@ -1053,6 +1053,19 @@ mod tests {
             proxy.now += GATE_WINDOW;
             let (action, _read) = proxy.receive(10, "wl_data_offer", "text/plain");
             assert_eq!(action, Action::Forward, "{iface}.{name} state {state}");
+        }
+    }
+
+    #[test]
+    fn a_tablet_tool_lift_or_button_release_opens_nothing() {
+        for iface in ["zwp_tablet_tool_v1", "zwp_tablet_tool_v2"] {
+            for (name, state) in [("up", 0), ("button", 0)] {
+                let mut proxy = proxy();
+                proxy.input(iface, name, state);
+                proxy.input(iface, "frame", 0);
+                let (action, _read) = proxy.receive(10, "wl_data_offer", "text/plain");
+                assert_eq!(action, Action::Drop, "{iface}.{name} state {state}");
+            }
         }
     }
 

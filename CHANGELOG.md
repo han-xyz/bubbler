@@ -86,10 +86,10 @@
 
 ### Fixed
 
-- A tablet pen touching down, lifting or pressing a button, and a tablet
-  pad button press, now allow a paste under the Wayland clipboard gate like
-  a key press or a mouse click; one sent as the pen enters or leaves a
-  window does not.
+- A tablet pen touching down or pressing a button, and a tablet pad button
+  press, now allow a paste under the Wayland clipboard gate like a key press
+  or a mouse click; one sent as the pen enters or leaves a window, a pen
+  lift and a button release do not.
 - An application no longer loses its Wayland connection when a monitor
   goes away just as it binds the output (a KVM switch, a dock, a display
   waking from sleep): `bubbler-wl-proxy` forwards a bind of a global the

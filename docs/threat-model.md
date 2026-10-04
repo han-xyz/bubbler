@@ -455,21 +455,24 @@ gates it instead. A `receive` on `wl_data_offer`,
 user input — a `wl_keyboard.key` the compositor reported as pressed, a
 `wl_pointer.button` in either direction, a `wl_touch.down` or
 `wl_touch.up`, a tablet tool's (`zwp_tablet_tool_v1` or `_v2`) `frame`
-holding a `down`, `up` or `button`, or a `zwp_tablet_pad_v2.button`
-reported as pressed — seen on any connection of that instance. Both ends
-of a press arm, so a drag that ends over a paste target arms on the
-release that ends it rather than only on the press that began it, however
-long the drag took. A tablet frame that also holds a `proximity_in` or
-`proximity_out` arms nothing: the protocol has the compositor itself send
-`down` and held buttons when a pen already touching the tablet enters a
-surface, and `up` and releases when it leaves one, so a sandbox could
-otherwise arm the gate by moving its window under a pen in use elsewhere.
+holding a `down` or a `button` reported as pressed, or a
+`zwp_tablet_pad_v2.button` reported as pressed — seen on any connection
+of that instance. Both ends of a pointer press or a touch arm, so a drag
+that ends over a paste target arms on the release that ends it rather
+than only on the press that began it, however long the drag took. A
+tablet tool's `up` and button release arm nothing, and neither does a
+tablet frame that also holds a `proximity_in` or `proximity_out`: the
+protocol has the compositor itself send `down` and held buttons when a
+pen already touching the tablet enters a surface, and the lift of a pen
+that touched down elsewhere may reach the surface it was moved over, so a
+sandbox could otherwise arm the gate by moving its window under a pen in
+use elsewhere.
 A key held when keyboard focus arrives is only listed in
 `wl_keyboard.enter`, which arms nothing. The second counts from the
-earliest moment the event could have reached the proxy, not from when the proxy read it: the last instant
-the proxy saw the compositor's side of that connection empty (nothing
-left to read after a read), or was waiting on it in `poll` with nothing
-unread. An empty read alone would not do: the proxy reads once per
+earliest moment the event could have reached the proxy, not from when
+the proxy read it: the last instant the proxy saw the compositor's side
+of that connection empty (nothing left to read after a read), or was
+waiting on it in `poll` with nothing unread. An empty read alone would not do: the proxy reads once per
 wake-up, so one is rare, and a key typed after a quiet minute would be
 dated a minute back. The proxy stops reading the compositor while the
 sandbox leaves a full queue unread, so a press that waited behind such a
