@@ -1,14 +1,14 @@
 //! What the proxy does with each message it has decoded: forward it, drop it,
 //! or refuse it and end the connection.
 //!
-//! Three rules matter, and all three came out of the spike measuring a real
-//! compositor. A global whose interface the tables do not describe is kept out
-//! of the registry, because the proxy could not parse a single message for it.
-//! Hiding the advertisement is not enough on its own — a client can name a
-//! global by its number without ever having seen it — so `bind` is checked
-//! against what this connection was actually offered. And an advertised
-//! version above the tables is clamped, because a client that bound the higher
-//! version would send opcodes past the end of the message lists.
+//! Three rules matter. A global whose interface the tables do not describe is
+//! kept out of the registry, because the proxy could not parse a single
+//! message for it. Hiding the advertisement is not enough on its own — a
+//! client can name a global by its number without ever having seen it — so
+//! `bind` is checked against what this connection was actually offered. And
+//! an advertised version above the tables is clamped, because a client that
+//! bound the higher version would send opcodes past the end of the message
+//! lists.
 //!
 //! On top of that sits the one rule this proxy exists for: a clipboard
 //! `receive` is forwarded only just after real user input, so an app cannot
@@ -41,16 +41,16 @@ pub const GATED_OFFERS: &[&str] = &[
     "zwp_primary_selection_offer_v1",
 ];
 
-/// Object id of `wl_display`, which is the same on every connection before
-/// either side has sent anything.
+// Object id of `wl_display`, which is the same on every connection before
+// either side has sent anything.
 const DISPLAY_ID: u32 = 1;
 
-/// Opcode of the `wl_display.error` event the proxy synthesises to refuse a
-/// bind. Code 0 goes with it: the error is the proxy's, not an interface's.
+// Opcode of the `wl_display.error` event the proxy synthesises to refuse a
+// bind. Code 0 goes with it: the error is the proxy's, not an interface's.
 const DISPLAY_ERROR: u16 = 0;
 
-/// Removed globals a connection still accepts a `bind` of, newest kept. A
-/// bind racing the removal arrives within one round trip of it.
+// Removed globals a connection still accepts a `bind` of, newest kept. A
+// bind racing the removal arrives within one round trip of it.
 const MAX_REMOVED_GLOBALS: usize = 64;
 
 const REMOVED_GLOBAL_LIFETIME: Duration = Duration::from_secs(3);
@@ -91,17 +91,12 @@ pub enum Action {
 #[derive(Debug)]
 pub struct Policy {
     gate: Gate,
-    /// Whether the compositor offered no security context of its own, so
-    /// this proxy is the only thing withholding [`PRIVILEGED`]. It
-    /// withholds them either way; this is what `--explain --wl-proxy`
-    /// reads to say whether the compositor enforces too.
     fallback_deny: bool,
     last_input: Option<Instant>,
 }
 
-/// What one global the compositor advertised is, as this connection was told
-/// it: the tables' entry for the interface and the version the client was
-/// offered, which is never above what the tables describe.
+// The tables' entry for the interface and the version the client was
+// offered, which is never above what the tables describe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Global {
     interface: usize,
@@ -113,9 +108,8 @@ struct Global {
 pub struct Connection {
     /// Which interface each object id on this connection belongs to.
     pub objects: Objects,
-    /// The globals this connection was offered, by their numeric name. A name
-    /// that is not in here was never advertised to this client, or was hidden
-    /// from it, and cannot be bound.
+    // A name that is not in here was never advertised to this client, or was
+    // hidden from it, and cannot be bound.
     globals: HashMap<u32, Global>,
     // Withdrawn after being offered, oldest first: still bindable, since
     // libwayland lets a bind that raced the removal through.
@@ -138,9 +132,8 @@ struct ToolFrame {
     proximity: bool,
 }
 
-/// One decoded message on its way through, with everything the policy needs to
-/// judge it. `args` and `fds` are the message's own, and both may be changed:
-/// an argument is rewritten when a version is clamped, and the descriptors are
+/// `args` and `fds` are the message's own, and both may be changed: an
+/// argument is rewritten when a version is clamped, and the descriptors are
 /// closed when the message is dropped.
 #[derive(Debug)]
 pub struct Incoming<'a> {
@@ -249,8 +242,6 @@ impl Policy {
         Ok(action)
     }
 
-    /// Requests: the clipboard gate. Everything else the client sends is the
-    /// compositor's business, not the proxy's.
     fn request(
         &mut self,
         msg: &mut Incoming<'_>,
@@ -306,7 +297,6 @@ impl Policy {
         drop_message(msg)
     }
 
-    /// Events: the registry is filtered, and input events arm the gate.
     fn event(&mut self, msg: &mut Incoming<'_>, conn: &mut Connection, now: Instant) -> Action {
         if msg.input_arms && is_user_input(msg) {
             self.arm(now);
@@ -380,8 +370,6 @@ impl Policy {
         }
     }
 
-    /// `wl_registry.global`: hide what cannot be parsed or must not be
-    /// reachable, and clamp what the tables describe at a lower version.
     fn global(&self, msg: &mut Incoming<'_>, conn: &mut Connection) -> Action {
         let (Some(Arg::Uint(name)), Some(Arg::String(Some(iface))), Some(Arg::Uint(version))) =
             (msg.args.first(), msg.args.get(1), msg.args.get(2))
@@ -417,8 +405,8 @@ impl Policy {
         Action::Forward
     }
 
-    /// `wl_registry.global_remove`: a name this connection never saw must not
-    /// be withdrawn either, or the client learns the global was there.
+    // `wl_registry.global_remove`: a name this connection never saw must not
+    // be withdrawn either, or the client learns the global was there.
     fn global_remove(msg: &mut Incoming<'_>, conn: &mut Connection, now: Instant) -> Action {
         let Some(Arg::Uint(name)) = msg.args.first() else {
             return Action::Forward;
@@ -436,10 +424,8 @@ impl Policy {
         Action::Forward
     }
 
-    /// `wl_registry.bind`: only a global this connection was offered, at a
-    /// version it was offered, and the new object is recorded at the version
-    /// the client actually bound so later opcodes are read against the right
-    /// message list.
+    // The new object is recorded at the version the client actually bound so
+    // later opcodes are read against the right message list.
     fn bind(
         &self,
         msg: &mut Incoming<'_>,
@@ -513,16 +499,13 @@ fn is_user_input(msg: &Incoming<'_>) -> bool {
     }
 }
 
-/// Do not forward this message, and close the descriptors it carried. That
-/// close is what a denied clipboard read is: the client's own read end sees
-/// end of file, exactly as if the selection had been empty.
 fn drop_message(msg: &mut Incoming<'_>) -> Action {
     msg.fds.clear();
     Action::Drop
 }
 
-/// Refuse the request with a `wl_display.error` naming `object`, and say so in
-/// the log — the connection is about to end, so this is the only record.
+// Refuse the request with a `wl_display.error` naming `object`, and say so in
+// the log — the connection is about to end, so this is the only record.
 fn refuse(object: u32, why: &str, audit: &mut Audit, now: Instant) -> Action {
     audit.line(
         Kind::Close,
@@ -534,11 +517,8 @@ fn refuse(object: u32, why: &str, audit: &mut Audit, now: Instant) -> Action {
     }
 }
 
-/// The bytes of a `wl_display.error` event blaming `object`.
-///
-/// An error the wire cannot carry (a client that bound an interface name of
-/// tens of kilobytes) encodes to nothing, and the relay closes the connection
-/// without a message rather than sending a truncated one.
+// An error the wire cannot carry encodes to nothing, and the relay closes the
+// connection without a message rather than sending a truncated one.
 fn display_error(object: u32, text: &str) -> Vec<u8> {
     let args = [
         Arg::Object(object),
