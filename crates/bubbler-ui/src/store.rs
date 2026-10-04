@@ -136,8 +136,6 @@ impl Store {
     }
 }
 
-/// One row, built from the three things that can each fail on their own:
-/// the config, the header and the lint run.
 fn row(env: &Env, ctx: &lint::Context<'_>, name: &str) -> Row {
     let path = instance::config_path(env, name);
     let text = config::read_bounded(&path).unwrap_or_default();
@@ -162,9 +160,8 @@ fn row(env: &Env, ctx: &lint::Context<'_>, name: &str) -> Row {
     }
 }
 
-/// The node names a config grants, in file order. Only the services: the
-/// column is for reading at a glance, and `tty` or `command` is not what
-/// a reader is scanning the list for.
+// Only the services: the column is for reading at a glance, and `tty` or
+// `command` is not what a reader is scanning the list for.
 fn nodes(config: &InstanceConfig) -> Vec<&'static str> {
     config.services.iter().map(|s| s.node_name()).collect()
 }
