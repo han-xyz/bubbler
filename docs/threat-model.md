@@ -2221,7 +2221,17 @@ largest file admitted with more than twice the room to spare. The
 reservation is address space charged at spawn, not memory used: under a
 `ulimit -v` below about 520 MB, or `vm.overcommit_memory=2` with
 `Committed_AS` near `CommitLimit`, every configuration read fails with
-`cannot start the parser thread` — exit 1, never a crash.
+`cannot start the parser thread` — exit 1, never a crash. The reserved
+stack is what bounds the parser; the two counts keep the deep recursions
+cheap and make the refusal a message that names the shape. Measured
+against `kdl` 6.7.1 on x86_64, parsing until the process aborts: a
+`document` frame is about 3.3 KB in a debug build; well-formed nesting
+aborts at 1348 levels on a release build's 8 MiB main-thread stack, 253
+in a debug build and 61 on a 2 MiB thread stack in a debug build; on the
+8 MiB stack a comment's run of `*` or `/` survives 2200 marks and aborts
+at 2500, and marks between runs of text survive 1024 and abort at 1500
+(512 and 256 on a 2 MiB stack); a file of nothing but `}` aborted a
+release build from 13 411 bytes.
 Include cycles and depth are bounded, an unknown node is an error rather
 than a silent skip, and a value that could forge a line in `--dry-run`
 output is refused.
