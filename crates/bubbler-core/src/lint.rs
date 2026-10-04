@@ -56,8 +56,8 @@ pub struct Check {
     pub severity: Severity,
 }
 
-/// Each check as a constant the code that reports it names, so a
-/// finding cannot carry an id no table holds.
+// Each check as a constant the code that reports it names, so a
+// finding cannot carry an id no table holds.
 // A note, not a warning: a wildcard is what the config asked for, and
 // how wide one is depends on who registers names under the suffix.
 const ALLOW_HOST_WILDCARD: Check = Check {
@@ -72,11 +72,7 @@ const APP_RUNTIME_RW: Check = Check {
     id: "app-runtime-rw",
     severity: Severity::Note,
 };
-// A warning, not a note: the host's audio daemon still does what the
-// grant asks either way, but without the drop-in a `pipewire`/
-// `pulseaudio` grant is not scoped at all — every other client's audio
-// and every microphone are reachable — so a reader has to see it rather
-// than read past it.
+// A warning, not a note: without the drop-in a `pipewire`/`pulseaudio` grant is not scoped at all.
 const AUDIO_POLICY_MISSING: Check = Check {
     id: "audio-policy-missing",
     severity: Severity::Warning,
@@ -122,9 +118,8 @@ const COMMAND_NOT_FOUND: Check = Check {
     id: "command-not-found",
     severity: Severity::Note,
 };
-// A hint is a file name, and a host that does not have the application
-// does not have its entry either, so this is a note like
-// `command-not-found` rather than a warning.
+// A hint is a file name, and a host that does not have the application does not have its entry
+// either, so this is a note like `command-not-found` rather than a warning.
 const DESKTOP_ENTRY_MISSING: Check = Check {
     id: "desktop-entry-missing",
     severity: Severity::Note,
@@ -133,9 +128,8 @@ const DBUS_WITHOUT_RULES: Check = Check {
     id: "dbus-without-rules",
     severity: Severity::Warning,
 };
-// An error, not a warning: these names are a way to run a command
-// outside the sandbox, so granting one is not a wider sandbox but no
-// sandbox at all.
+// An error, not a warning: these names are a way to run a command outside the sandbox, so granting
+// one is not a wider sandbox but no sandbox at all.
 const DBUS_NAME_IS_HOST_EXEC: Check = Check {
     id: "dbus-name-is-host-exec",
     severity: Severity::Error,
@@ -144,16 +138,14 @@ const DBUS_NAME_IS_RISKY: Check = Check {
     id: "dbus-name-is-risky",
     severity: Severity::Warning,
 };
-// A note, not a warning: the card nodes are what a mode-setting tool
-// asks for, and what they cost is worth saying once rather than making
-// the config argue for them.
+// A note, not a warning: the card nodes are what a mode-setting tool asks for, and what they cost
+// is worth saying once rather than making the config argue for them.
 const DRI_KMS: Check = Check {
     id: "dri-kms",
     severity: Severity::Note,
 };
-// A note about the host, like `audio-policy-missing`: the file asks for
-// nothing beyond the render nodes, and what the run adds to them depends
-// on which driver this machine's GPU is on.
+// A note about the host, like `audio-policy-missing`: the file asks for nothing beyond the render
+// nodes, and what the run adds to them depends on which driver this machine's GPU is on.
 const DRI_NVIDIA_PRIMARY: Check = Check {
     id: "dri-nvidia-primary",
     severity: Severity::Note,
@@ -166,16 +158,14 @@ const ENV_LOOKS_SECRET: Check = Check {
     id: "env-looks-secret",
     severity: Severity::Warning,
 };
-// A warning, not a note: the username stays hidden either way, but
-// everything else the host keeps in `/etc` becomes readable, and the
-// file cannot say which of that the application actually needs.
+// A warning, not a note: the username stays hidden either way, but everything else the host keeps
+// in `/etc` becomes readable, and the file cannot say which of that the application actually needs.
 const ETC_HOST: Check = Check {
     id: "etc-host",
     severity: Severity::Warning,
 };
-// An error, not a warning: what it names, the launcher refuses. A
-// `home-share` of the instance store or the profile layer would hand the
-// sandbox the files bubbler builds it out of.
+// An error, not a warning: what it names, the launcher refuses. A `home-share` of the instance
+// store or the profile layer would hand the sandbox the files bubbler builds it out of.
 const HOME_SHARE_RESERVED: Check = Check {
     id: "home-share-reserved",
     severity: Severity::Error,
@@ -192,17 +182,14 @@ const MPRIS_WILDCARD: Check = Check {
     id: "mpris-wildcard",
     severity: Severity::Warning,
 };
-// A warning and not a note: this is the one mode where the sandbox's
-// reach is decided by nothing bubbler binds. Every service on the host's
-// loopback, and every abstract unix socket, which lives in the network
-// namespace rather than in the filesystem.
+// A warning and not a note: this is the one mode where the sandbox's reach is decided by nothing
+// bubbler binds.
 const NETWORK_HOST: Check = Check {
     id: "network-host",
     severity: Severity::Warning,
 };
-// Information, not a warning: the filter is what the config asked for,
-// and what it cannot do is a property of address filtering rather than a
-// mistake in the file.
+// Information, not a warning: the filter is what the config asked for, and what it cannot do is a
+// property of address filtering rather than a mistake in the file.
 const OUTBOUND_DENY: Check = Check {
     id: "outbound-deny",
     severity: Severity::Note,
@@ -231,9 +218,7 @@ const PATH_SHARE_SOCKET: Check = Check {
     id: "path-share-socket",
     severity: Severity::Warning,
 };
-// A note, not a warning: the child is what the config asked for, the
-// same way `dri kms` is — worth saying once what it reaches rather than
-// making the file argue for it.
+// A note, not a warning: the child is what the config asked for, the same way `dri kms` is.
 const PIPEWIRE_MICROPHONE: Check = Check {
     id: "pipewire-microphone",
     severity: Severity::Note,
@@ -242,10 +227,7 @@ const PORTAL_TALK_WITHOUT_PORTALS: Check = Check {
     id: "portal-talk-without-portals",
     severity: Severity::Warning,
 };
-// A note, not a warning: nothing is granted twice and nothing is wider
-// than it says. It is about reading the file — a run of a dozen
-// `home-share` lines is a wall a reader skims past, and one block with
-// the paths under it is the same grants at a glance.
+// A note, not a warning: nothing is granted twice and nothing is wider than it says.
 const REPEAT_OUTSIDE_BLOCK: Check = Check {
     id: "repeat-outside-block",
     severity: Severity::Note,
@@ -254,19 +236,14 @@ const SECCOMP_DISABLED: Check = Check {
     id: "seccomp-disabled",
     severity: Severity::Warning,
 };
-// Two sites report this check: the D-Bus rule in `dbus_node`, and the
-// `secrets` child of `portals` in `per_layer`, which reaches the same
-// keyring interface through the portal instead of a bare bus name.
+// Two sites report this check: the D-Bus rule in `dbus_node`, and the `secrets` child of `portals`
+// in `per_layer`.
 const SECRETS_ACCESS: Check = Check {
     id: "secrets-access",
     severity: Severity::Note,
 };
-// A warning, not an error: a profile is written for a host that has the
-// directory, and one that does not is a host the profile was not written
-// for. The launcher refuses the run outright, so nothing is skipped
-// quietly by the lint letting it through — unless the node is marked
-// `optional=#true`, in which case the launcher itself skips the bind and
-// the lint stays silent to match.
+// A warning, not an error: a profile is written for a host that has the directory, and one that
+// does not is a host the profile was not written for.
 const SHARE_SOURCE_MISSING: Check = Check {
     id: "share-source-missing",
     severity: Severity::Warning,
@@ -295,9 +272,7 @@ const WAYLAND_HOST: Check = Check {
     id: "wayland-host",
     severity: Severity::Warning,
 };
-// A note, not a warning: the nested server gives up nothing outside the
-// sandbox, but a user who writes `x11` for an application with several
-// windows gets them stacked in one frame with nothing to move them.
+// A note, not a warning: the nested server gives up nothing outside the sandbox.
 const X11_NESTED_NO_WM: Check = Check {
     id: "x11-nested-no-wm",
     severity: Severity::Note,
@@ -461,8 +436,8 @@ pub struct Context<'a> {
     pub app_id_twin: Option<&'a str>,
 }
 
-/// Commands known to start a sandbox of their own inside this one, which
-/// takes a user namespace. A heuristic list, and the message says so.
+// Commands known to start a sandbox of their own inside this one, which
+// takes a user namespace. A heuristic list, and the message says so.
 const NESTERS: &[&str] = &[
     "chromium",
     "chrome",
@@ -478,9 +453,8 @@ const NESTERS: &[&str] = &[
     "signal-desktop",
 ];
 
-/// Home directories the private home exists to keep out, together with
-/// everything under them: one key file out of `.ssh` is the key. firejail
-/// blacklists the same set for every profile it ships.
+// Home directories the private home exists to keep out, together with everything under them: one
+// key file out of `.ssh` is the key. firejail blacklists the same set for every profile it ships.
 const SENSITIVE_TREE: &[&str] = &[
     ".ssh",
     ".gnupg",
@@ -490,14 +464,12 @@ const SENSITIVE_TREE: &[&str] = &[
     ".mozilla",
 ];
 
-/// Home directories that are sensitive whole and not one subdirectory at
-/// a time: they hold every application's state, and an application's own
-/// share of its own directory under them is what a profile is for.
+// Home directories that are sensitive whole and not one subdirectory at a time: they hold every
+// application's state.
 const SENSITIVE_ROOT: &[&str] = &[".config", ".local", ".local/share", ".cache"];
 
-/// System-bus names whose interesting methods are behind an `auth_admin`
-/// polkit action, which polkit judges against the proxy's credentials —
-/// that is, against the user.
+// System-bus names whose interesting methods are behind an `auth_admin` polkit action, which polkit
+// judges against the proxy's credentials — that is, against the user.
 const POLKIT_NAMES: &[&str] = &[
     "org.freedesktop.UDisks2",
     "org.freedesktop.NetworkManager",
@@ -508,9 +480,8 @@ const POLKIT_NAMES: &[&str] = &[
     "org.freedesktop.timedate1",
 ];
 
-/// Underscore-separated words that make an environment variable name
-/// look like a credential. Whole segments, not substrings: `GITHUB_TOKEN`
-/// is one and `TOKENIZERS_PARALLELISM` is not.
+// Underscore-separated words that make an environment variable name look like a credential. Whole
+// segments, not substrings: `GITHUB_TOKEN` is one and `TOKENIZERS_PARALLELISM` is not.
 const SECRET_SEGMENTS: &[&str] = &[
     "TOKEN",
     "TOKENS",
@@ -524,24 +495,17 @@ const SECRET_SEGMENTS: &[&str] = &[
     "PAT",
 ];
 
-/// Pairs of segments that mean the same as one of [`SECRET_SEGMENTS`].
+// Pairs of segments that mean the same as one of [`SECRET_SEGMENTS`].
 const SECRET_PAIRS: &[[&str; 2]] = &[["API", "KEY"], ["ACCESS", "KEY"], ["SECRET", "KEY"]];
 
-/// Prefixes of credentials that are recognisable on sight.
 const SECRET_VALUES: &[&str] = &["ghp_", "sk-", "AKIA"];
 
-/// The Secret Service name: one session-bus name for every secret the
-/// login keyring holds, with no partitioning between applications.
+// The Secret Service name: one session-bus name for every secret the login keyring holds, with no
+// partitioning between applications.
 const SECRETS_NAME: &str = "org.freedesktop.secrets";
 
-/// Session- and system-bus names that are a way to run a command outside
-/// the sandbox. `org.freedesktop.systemd1` starts a transient unit,
-/// `org.freedesktop.Flatpak` has `Spawn`, `ca.desrt.dconf` writes the
-/// session's settings database, and an `org.freedesktop.impl.portal.*`
-/// name is the *backend* of a portal rather than the portal, so a
-/// sandbox calling one answers the dialogs it should be shown. Owning
-/// one is refused by the parser.
-/// A trailing `.*` here is a family; a rule naming any member matches.
+// Session- and system-bus names that are a way to run a command outside the sandbox. A trailing
+// `.*` here is a family; a rule naming any member matches.
 const HOST_EXEC_NAMES: &[&str] = &[
     "org.freedesktop.systemd1",
     "org.freedesktop.Flatpak",
@@ -549,8 +513,6 @@ const HOST_EXEC_NAMES: &[&str] = &[
     "ca.desrt.dconf",
 ];
 
-/// Names that are defensible and worth writing down, each with the one
-/// sentence a reader needs about what the name is.
 const RISKY_NAMES: &[(&str, &str)] = &[
     (
         "org.kde.KWin",
@@ -574,9 +536,8 @@ const RISKY_NAMES: &[(&str, &str)] = &[
     ),
 ];
 
-/// The two name checks, over every rule of every bus node. Read across
-/// both buses because the proxy is one process and the names mean the
-/// same thing on either.
+// Read across both buses because the proxy is one process and the names mean the same thing on
+// either.
 fn bus_names(i: usize, source: &Source, f: &mut Findings) {
     for (_, rule) in bus_rules(source) {
         let level = rule.name().value();
@@ -613,17 +574,14 @@ fn bus_names(i: usize, source: &Source, f: &mut Findings) {
     }
 }
 
-/// Every XDG desktop portal name, as a family.
 const PORTAL_NAMES: &str = "org.freedesktop.portal.*";
 
-/// The nodes the proxy carries: rules on the session bus, or on the
-/// accessibility bus the same proxy serves.
+// The nodes the proxy carries: rules on the session bus, or on the
+// accessibility bus the same proxy serves.
 const BUNDLES: &[&str] = &["portals", "notify", "tray", "mpris", "a11y", "input-method"];
 
-/// Checks that name exactly what the parser or the resolver refuses. A
-/// report whose errors are all from this set has already said why the
-/// config does not parse, so the run is a verdict; anything else leaves
-/// the parse failure unexplained and the run has to report that instead.
+// Checks that name exactly what the parser or the resolver refuses. A report whose errors are all
+// from this set has already said why the config does not parse, so the run is a verdict.
 const PARSER_EQUIVALENT: &[&str] = &[
     BUNDLE_WITHOUT_DBUS.id,
     CAMERA_WITHOUT_PORTALS.id,
@@ -631,8 +589,7 @@ const PARSER_EQUIVALENT: &[&str] = &[
     OWN_ON_SYSTEM_BUS.id,
 ];
 
-/// Whether the report's errors, taken together, say why the config would
-/// not parse. No errors at all explain nothing.
+// No errors at all explain nothing.
 fn explains_a_parse_failure(report: &Report) -> bool {
     let mut errors = report
         .findings
@@ -642,11 +599,9 @@ fn explains_a_parse_failure(report: &Report) -> bool {
     errors.peek().is_some() && errors.all(|f| PARSER_EQUIVALENT.contains(&f.id))
 }
 
-/// Lint one profile, resolved through its layers and `include`s.
-///
-/// A finding is reported against the layer that wrote the node. The
-/// flattened profile is resolved too, so a layer that does not parse and
-/// no check explains is a failed run rather than a clean report.
+/// Lint one profile, resolved through its layers and `include`s. The flattened profile is resolved
+/// too, so a layer that does not parse and no check explains is a failed run rather than a clean
+/// report.
 pub fn lint_profile(ctx: &Context, resolver: &Resolver, name: &str) -> Result<Report, LintError> {
     let layers = resolver.layers(name)?;
     let mut sources = Vec::with_capacity(layers.len());
@@ -673,10 +628,9 @@ pub fn lint_config(ctx: &Context, path: &Path) -> Result<Report, LintError> {
     lint_text(ctx, Where::File(path.to_path_buf()), text)
 }
 
-/// Lint one config already in hand, which is what an editor holding an
-/// unsaved buffer has. A file the parser rejects is a failed run rather
-/// than a clean report, unless a check already said what is wrong with
-/// it — `own` on the system bus is refused by both.
+/// Lint one config already in hand, which is what an editor holding an unsaved buffer has. A file
+/// the parser rejects is a failed run rather than a clean report, unless a check already said what
+/// is wrong with it.
 pub fn lint_text(ctx: &Context, at: Where, text: String) -> Result<Report, LintError> {
     let source = Source::read(at, text)?;
     let report = run(ctx, std::slice::from_ref(&source));
@@ -763,17 +717,12 @@ pub fn render_json(report: &Report) -> String {
     out
 }
 
-/// One layer as the checks read it.
 struct Source {
     at: Where,
     text: String,
     doc: KdlDocument,
-    /// The same top-level nodes with every repeatable block expanded
-    /// into the lines it stands for. Every check but
-    /// `repeat-outside-block` reads this: a check that saw only the
-    /// line form would ignore half of a block-form config, and
-    /// `home-share-reserved` is an error nothing else catches before
-    /// the launcher.
+    // Every check but `repeat-outside-block` reads this: a check that saw only the line form would
+    // ignore half of a block-form config.
     flat: Vec<KdlNode>,
 }
 
@@ -782,21 +731,14 @@ impl Source {
         let doc = config::parse_document(&text)?;
         let mut flat = Vec::new();
         for node in doc.nodes() {
-            // A block the config parser refuses is read here as the node
-            // it is: the refusal comes back from the resolve that
-            // follows the lint, and one malformed block must not take
-            // the whole report down with it.
+            // A block the config parser refuses is read here as the node it is: the refusal comes
+            // back from the resolve that follows the lint.
             match config::parse_repeatable_block(node) {
                 Ok(Some(lines)) => flat.extend(lines),
                 Ok(None) | Err(_) => {
                     flat.push(node.clone());
-                    // The config parser splits a `portals` block's
-                    // `camera` child into the same `Service::Camera` a
-                    // bare `camera` node parses to, so the checks that
-                    // read a `camera` see it in either form. The
-                    // `portals` node stays in the list, which is what
-                    // keeps `camera-without-portals` silent for the
-                    // child.
+                    // The `portals` node stays in the list, which is what keeps
+                    // `camera-without-portals` silent for the child.
                     if node.name().value() == "portals" {
                         flat.extend(kids(node).filter(|c| c.name().value() == "camera").cloned());
                     }
@@ -811,12 +753,8 @@ impl Source {
         })
     }
 
-    /// Line and column of a byte offset into the layer, both 1-based,
-    /// the line counted by every newline KDL reads and the column in
-    /// characters. A file written with carriage returns is one line to
-    /// `str::lines` and many to the parser, and a finding has to point
-    /// where the parser's own refusals do. A built-in layer has no file
-    /// to point into, so it reports neither.
+    // A file written with carriage returns is one line to `str::lines` and many to the parser, and
+    // a finding has to point where the parser's own refusals do.
     fn position(&self, offset: usize) -> (Option<u32>, Option<u32>) {
         if matches!(self.at, Where::BuiltIn(_)) {
             return (None, None);
@@ -845,8 +783,7 @@ impl Source {
     }
 }
 
-/// A finding before it is paired with the layer it came from; `offset` orders
-/// the findings of one layer the way the file reads.
+// `offset` orders the findings of one layer the way the file reads.
 struct Pending {
     layer: usize,
     offset: usize,
@@ -855,7 +792,6 @@ struct Pending {
     help: String,
 }
 
-/// Findings collected so far, in the order the checks ran.
 #[derive(Default)]
 struct Findings(Vec<Pending>);
 
@@ -878,14 +814,12 @@ impl Findings {
     }
 }
 
-/// Run every check over `sources`, which are in merge order, and drop the
-/// warnings and notes a `lint-allow` node accepted. Errors are never
-/// dropped: they name something the file cannot do.
+// Run every check over `sources`, which are in merge order, and drop the warnings and notes a
+// `lint-allow` node accepted.
 fn run(ctx: &Context, sources: &[Source]) -> Report {
     let mut f = Findings::default();
-    // Read across the layers, since the node a per-layer finding depends
-    // on may be written in another file than the node it is about. The
-    // last layer that names the mode is the one the merge keeps.
+    // Read across the layers, since the node a per-layer finding depends on may be written in
+    // another file than the node it is about.
     let host_net = last(sources, "network").is_some_and(|(_, n)| arg(n) == Some("host"));
     for (i, source) in sources.iter().enumerate() {
         per_layer(ctx, i, source, host_net, &mut f);
@@ -933,11 +867,7 @@ fn run(ctx: &Context, sources: &[Source]) -> Report {
     }
 }
 
-/// Report every `lint-allow` node that accepted nothing: no check of any
-/// layer reported the id it names. Errors are never accepted, so naming
-/// one is naming nothing — but the parser refuses those ids already.
-///
-/// Read from the findings collected so far, which is why this runs last.
+// Read from the findings collected so far, which is why this runs last.
 fn unused_allows(sources: &[Source], f: &mut Findings) {
     let silenced: Vec<&'static str> =
         f.0.iter()
@@ -964,7 +894,6 @@ fn unused_allows(sources: &[Source], f: &mut Findings) {
     }
 }
 
-/// Top-level nodes of `source` named `name`, in file order.
 fn top<'a>(source: &'a Source, name: &str) -> Vec<&'a KdlNode> {
     source
         .flat
@@ -973,9 +902,7 @@ fn top<'a>(source: &'a Source, name: &str) -> Vec<&'a KdlNode> {
         .collect()
 }
 
-/// Every rule child of every bus node of `source`, each paired with the
-/// bus it belongs to. The two proxies are separate filters, so a rule is
-/// never read outside the bus that carries it.
+// The two proxies are separate filters, so a rule is never read outside the bus that carries it.
 fn bus_rules(source: &Source) -> Vec<(&'static str, &KdlNode)> {
     let mut out = Vec::new();
     for bus in ["dbus", "system-bus"] {
@@ -1002,9 +929,8 @@ fn undoes_portals(node: &KdlNode) -> bool {
     config::reaches_every_portal(&rule)
 }
 
-/// The last layer that writes a `name` node, and that node: the merge
-/// keeps that one, so a finding about it belongs to that layer and not to
-/// the layer it overrode.
+// The last layer that writes a `name` node, and that node: the merge keeps that one, so a finding
+// about it belongs to that layer and not to the layer it overrode.
 fn last<'a>(sources: &'a [Source], name: &str) -> Option<(usize, &'a KdlNode)> {
     sources
         .iter()
@@ -1013,12 +939,10 @@ fn last<'a>(sources: &'a [Source], name: &str) -> Option<(usize, &'a KdlNode)> {
         .find_map(|(i, s)| top(s, name).last().map(|n| (i, *n)))
 }
 
-/// Child nodes of `node`, or none when it has no block.
 fn kids(node: &KdlNode) -> impl Iterator<Item = &KdlNode> {
     node.children().into_iter().flat_map(KdlDocument::nodes)
 }
 
-/// The node's first positional argument as a string.
 fn arg(node: &KdlNode) -> Option<&str> {
     node.entries()
         .iter()
@@ -1026,16 +950,10 @@ fn arg(node: &KdlNode) -> Option<&str> {
         .and_then(|e| e.value().as_string())
 }
 
-/// What a filtered `network` node says beyond its mode: that the filter
-/// is on at all, and which of its names cover more than the config's
-/// author can have meant.
 fn network_node(i: usize, node: &KdlNode, f: &mut Findings) {
     if kids(node).any(|c| c.name().value() == "outbound" && arg(c) == Some("deny")) {
-        // What the filter leaves open depends on whether a name is in
-        // it: an `allow-host` moves the resolver behind the proxy's
-        // cgroup, so telling this reader the sandbox reaches its
-        // resolver would be telling them the opposite of what their
-        // config does.
+        // What the filter leaves open depends on whether a name is in it: an `allow-host` moves the
+        // resolver behind the proxy's cgroup.
         let (message, help) = if kids(node).any(|c| c.name().value() == "allow-host") {
             (
                 "`outbound \"deny\"` with `allow-host`: the sandbox reaches the \
@@ -1083,11 +1001,8 @@ fn network_node(i: usize, node: &KdlNode, f: &mut Findings) {
     }
 }
 
-/// What a `camera nodes=#true` costs that the portal half does not: a
-/// device list frozen at launch, and, on a host with no camera, nothing
-/// to bind at all. `host_net` is whether the merged config puts the
-/// sandbox on the host's network namespace, which decides whether a
-/// uevent about a camera plugged in later can reach it at all.
+// `host_net` is whether the merged config puts the sandbox on the host's network namespace, which
+// decides whether a uevent about a camera plugged in later can reach it at all.
 fn camera_nodes(ctx: &Context, i: usize, node: &KdlNode, host_net: bool, f: &mut Findings) {
     let dev = Path::new("/dev");
     let present = ctx.host.list_dir(dev).into_iter().any(|name| {
@@ -1110,12 +1025,8 @@ fn camera_nodes(ctx: &Context, i: usize, node: &KdlNode, host_net: bool, f: &mut
              application is a plain V4L2 client",
         );
     }
-    // The uevent half holds only where the namespace does: a udev
-    // monitor is a `NETLINK_KOBJECT_UEVENT` socket, which receives from
-    // its own network namespace alone (`netlink(7)`), and measured on
-    // this host a listener sharing the host's namespace saw every
-    // uevent while one under `--unshare-net` saw none. The frozen list
-    // is what stays true under either mode.
+    // The uevent half holds only where the namespace does. The frozen list is what stays true under
+    // either mode.
     let unheard = match host_net {
         true => "",
         false => {
@@ -1136,7 +1047,6 @@ fn camera_nodes(ctx: &Context, i: usize, node: &KdlNode, host_net: bool, f: &mut
     );
 }
 
-/// The node's `key=` property as a string.
 fn prop<'a>(node: &'a KdlNode, key: &str) -> Option<&'a str> {
     node.entries()
         .iter()
@@ -1144,16 +1054,12 @@ fn prop<'a>(node: &'a KdlNode, key: &str) -> Option<&'a str> {
         .and_then(|e| e.value().as_string())
 }
 
-/// Whether a nested `x11` node has already answered the question the
-/// no-window-manager note asks: a fullscreen server has the one window
-/// there is nothing to arrange in, and `wm=` names the program that
-/// arranges the rest. Neither leaves anything for the note to say.
+// A fullscreen server has the one window there is nothing to arrange in, and `wm=` names the
+// program that arranges the rest.
 fn x11_manages_its_windows(node: &KdlNode) -> bool {
     flag(node, "fullscreen") == Some(true) || prop(node, "wm").is_some()
 }
 
-/// The node's `key=` property as a boolean, which is what the device
-/// properties of `gamepad` and `camera` are written as.
 fn flag(node: &KdlNode, key: &str) -> Option<bool> {
     node.entries()
         .iter()
@@ -1161,8 +1067,8 @@ fn flag(node: &KdlNode, key: &str) -> Option<bool> {
         .and_then(|e| e.value().as_bool())
 }
 
-/// The bus name a rule child names: the whole argument for a policy rule,
-/// the part before `=` for `call` and `broadcast`.
+// The bus name a rule child names: the whole argument for a policy rule,
+// the part before `=` for `call` and `broadcast`.
 fn rule_name(node: &KdlNode) -> Option<&str> {
     let a = arg(node)?;
     match node.name().value() {
@@ -1171,9 +1077,8 @@ fn rule_name(node: &KdlNode) -> Option<&str> {
     }
 }
 
-/// The `pipewire-microphone` note, if `node` carries the child: `name`
-/// is `node`'s own name, since `pipewire` and `pulseaudio` share this
-/// wording and differ only in which one is being named.
+// `name` is `node`'s own name, since `pipewire` and `pulseaudio` share this wording and differ only
+// in which one is being named.
 fn microphone_note(i: usize, node: &KdlNode, name: &str, f: &mut Findings) {
     if kids(node).any(|c| c.name().value() == "microphone") {
         f.push(
@@ -1189,8 +1094,6 @@ fn microphone_note(i: usize, node: &KdlNode, name: &str, f: &mut Findings) {
     }
 }
 
-/// The `audio-devices-offered` note, if a `pipewire` node carries the
-/// `devices` child.
 fn devices_note(i: usize, node: &KdlNode, f: &mut Findings) {
     if kids(node).any(|c| c.name().value() == "devices") {
         f.push(
@@ -1206,11 +1109,8 @@ fn devices_note(i: usize, node: &KdlNode, f: &mut Findings) {
     }
 }
 
-/// The `audio-policy-missing` warning. `pipewire` and `pulseaudio`
-/// share one instance-wide audio reach — [`InstanceConfig::audio`] ORs
-/// them the same way — so this is called once per run over every layer
-/// rather than once per node, and names the first audio node found
-/// across them; a config granting both gets one finding, not two.
+// `pipewire` and `pulseaudio` share one instance-wide audio reach, so this is called once per run
+// over every layer rather than once per node; a config granting both gets one finding, not two.
 fn audio_policy_missing(ctx: &Context, sources: &[Source], f: &mut Findings) {
     let Some(case) = audio_policy::missing(ctx.host, ctx.env) else {
         return;
@@ -1237,9 +1137,8 @@ fn audio_policy_missing(ctx: &Context, sources: &[Source], f: &mut Findings) {
             .collect::<Vec<_>>()
             .join(", "),
     );
-    // The hook is the half that decides links, so its absence leaves the
-    // grant scoped and the output mix still readable; without the drop-in
-    // nothing is scoped at all.
+    // The hook is the half that decides links, so its absence leaves the grant scoped and the
+    // output mix still readable; without the drop-in nothing is scoped at all.
     let message = match case {
         audio_policy::Missing::DropIn => format!(
             "{drop_in}: this `{name}` grant reaches every PipeWire node instead of what it \
@@ -1304,8 +1203,8 @@ fn app_id_shared(ctx: &Context, f: &mut Findings) {
     });
 }
 
-/// The `audio-policy-differs` warning: a copy of the policy WirePlumber
-/// loads is not this binary's, whether or not the other half is there.
+// The `audio-policy-differs` warning: a copy of the policy WirePlumber
+// loads is not this binary's, whether or not the other half is there.
 fn audio_policy_differs(ctx: &Context, sources: &[Source], f: &mut Findings) {
     let paths = audio_policy::differing(ctx.host, ctx.env);
     if paths.is_empty() {
@@ -1378,8 +1277,6 @@ fn audio_policy_not_loaded(ctx: &Context, sources: &[Source], f: &mut Findings) 
     );
 }
 
-/// The first `pipewire` or `pulseaudio` node across the layers, with its
-/// layer and name: the one instance-wide audio reach the policy scopes.
 fn audio_node(sources: &[Source]) -> Option<(usize, &KdlNode, &str)> {
     sources.iter().enumerate().find_map(|(i, s)| {
         s.flat
@@ -1389,8 +1286,8 @@ fn audio_node(sources: &[Source]) -> Option<(usize, &KdlNode, &str)> {
     })
 }
 
-/// Checks that need one layer and nothing else, apart from `host_net`:
-/// the merged mode a `camera` message reads differently under.
+// Checks that need one layer and nothing else, apart from `host_net`: the merged mode a `camera`
+// message reads differently under.
 fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut Findings) {
     bus_names(i, source, f);
     repeat_outside_block(i, source, f);
@@ -1562,11 +1459,8 @@ fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut F
     }
 }
 
-/// Two or more line-form nodes of one repeatable kind, offered as the
-/// one block that says the same thing. Read from the layer's own
-/// document rather than from its expanded nodes: this is the one check
-/// that is about how the file is written, so a block must not look like
-/// the lines it stands for.
+// Read from the layer's own document rather than from its expanded nodes: this is the one check
+// that is about how the file is written, so a block must not look like the lines it stands for.
 fn repeat_outside_block(i: usize, source: &Source, f: &mut Findings) {
     for kind in config::REPEATABLE {
         let written: Vec<&KdlNode> = source
@@ -1578,10 +1472,8 @@ fn repeat_outside_block(i: usize, source: &Source, f: &mut Findings) {
         if written.len() < 2 {
             continue;
         }
-        // A node the config parser will refuse anyway has no block form
-        // to offer; skip this `kind` rather than every `kind` after it
-        // — `collect` into an `Option` stops at the first `None`
-        // without reaching past this one.
+        // Skip this `kind` rather than every `kind` after it — `collect` into an `Option` stops at
+        // the first `None` without reaching past this one.
         let Some(mut parts) = written
             .iter()
             .copied()
@@ -1607,15 +1499,8 @@ fn repeat_outside_block(i: usize, source: &Source, f: &mut Findings) {
     }
 }
 
-/// One line-form node as the child it would be written as inside a
-/// block: the first argument becomes the name, and `env`'s property
-/// becomes a name and one argument. `None` for a node whose shape the
-/// config parser refuses, which has no block form to offer.
-///
-/// A value prints through `KdlValue`'s own `Display`, which quotes only
-/// where a bare identifier would not round-trip (`".config"`, a path
-/// with a `/`) and leaves the rest bare (`mode=ro`) — the same choice
-/// every other value in a written config already makes.
+// A value prints through `KdlValue`'s own `Display`, which quotes only where a bare identifier
+// would not round-trip and leaves the rest bare.
 fn as_block_child(node: &KdlNode) -> Option<String> {
     if node.name().value() == "env" {
         let entry = node.entries().first()?;
@@ -1669,9 +1554,8 @@ fn env_node(i: usize, node: &KdlNode, f: &mut Findings) {
     }
 }
 
-/// Whether a variable is named or valued like a credential. Matched by
-/// hand rather than with a pattern crate, which is a dependency this
-/// would be the only user of.
+// Matched by hand rather than with a pattern crate, which is a dependency this would be the only
+// user of.
 fn looks_secret(key: &str, value: &str) -> bool {
     let upper = key.to_ascii_uppercase();
     let segments: Vec<&str> = upper.split('_').collect();
@@ -1743,9 +1627,8 @@ fn path_share(ctx: &Context, i: usize, node: &KdlNode, f: &mut Findings) {
             "name a directory outside the sandbox's own layout; the launcher refuses this one",
         );
     }
-    // Before the type check below, which would otherwise report a socket
-    // source as a share of the wrong type and say nothing about what a
-    // shared socket is.
+    // Before the type check below, which would otherwise report a socket source as a share of the
+    // wrong type and say nothing about what a shared socket is.
     let source = ctx.host.canonicalize(path).unwrap_or_else(|| path.into());
     let named_socket = path
         .file_name()
@@ -1798,13 +1681,9 @@ fn path_share(ctx: &Context, i: usize, node: &KdlNode, f: &mut Findings) {
     }
 }
 
-/// Report a share whose host source is not a directory or a regular file,
-/// and say which of the two it is: absent, or there as something else.
-/// Returns whether the source is one a share should name.
-///
-/// `path-share` is the only one the launcher holds to this, but a
-/// `home-share` or `etc-share` of a fifo or a device node is a bind
-/// nobody means to write, so the lint holds all three to it.
+// `path-share` is the only one the launcher holds to a directory or a regular file, but a
+// `home-share` or `etc-share` of a fifo or a device node is a bind nobody means to write, so the
+// lint holds all three to it.
 fn share_source(
     ctx: &Context,
     i: usize,
@@ -1815,10 +1694,8 @@ fn share_source(
     f: &mut Findings,
 ) -> bool {
     let Some(ty) = ctx.host.file_type(source) else {
-        // An optional share with an absent source is a silent no-op at
-        // launch (`forward.rs`), so nothing to warn about: the profile
-        // asked for exactly this skip. `etc-share` has no `optional`
-        // property, so `flag` reads it as unset there.
+        // An optional share with an absent source is a silent no-op at launch, so nothing to warn
+        // about. `etc-share` has no `optional` property, so `flag` reads it as unset there.
         if flag(node, "optional") == Some(true) {
             return false;
         }
@@ -1852,7 +1729,6 @@ fn share_source(
     false
 }
 
-/// What a file type is called in a finding, with its article.
 fn kind(ty: std::fs::FileType) -> &'static str {
     if ty.is_socket() {
         "a socket"
@@ -1867,10 +1743,6 @@ fn kind(ty: std::fs::FileType) -> &'static str {
     }
 }
 
-/// The session bus's own rules: a name claimed more widely than the app
-/// owns, and the one name that is every secret the keyring holds. That
-/// second finding's other site is the `secrets` child of `portals`,
-/// reported from `per_layer` instead.
 fn dbus_node(i: usize, node: &KdlNode, f: &mut Findings) {
     for rule in kids(node) {
         let level = rule.name().value();
@@ -1953,8 +1825,8 @@ fn system_bus(i: usize, node: &KdlNode, f: &mut Findings) {
     }
 }
 
-/// Checks that need the whole set of layers: a grant one layer relies on
-/// may be written in another.
+// Checks that need the whole set of layers: a grant one layer relies on
+// may be written in another.
 fn across_layers(ctx: &Context, sources: &[Source], f: &mut Findings) {
     let anywhere = |name: &str| sources.iter().any(|s| !top(s, name).is_empty());
     let has_dbus = anywhere("dbus");
@@ -2044,9 +1916,8 @@ fn across_layers(ctx: &Context, sources: &[Source], f: &mut Findings) {
         }
     }
 
-    // Keyed by bus as well as name: the two proxies are separate, so one
-    // name may hold a different policy on each. Exact names only, as the
-    // parser compares them: this check is in `PARSER_EQUIVALENT`.
+    // Keyed by bus as well as name: the two proxies are separate, so one name may hold a different
+    // policy on each. Exact names only, as the parser compares them.
     let mut policies: Vec<(&str, String, &str, usize)> = Vec::new();
     for (i, source) in sources.iter().enumerate() {
         for (bus, rule) in bus_rules(source) {
@@ -2085,9 +1956,8 @@ fn across_layers(ctx: &Context, sources: &[Source], f: &mut Findings) {
         }
     }
 
-    // The last layer that names the mode is the one the merge keeps, so a
-    // bare `wayland` written over `clipboard="open"` leaves the gate on
-    // and nothing to report.
+    // The last layer that names the mode is the one the merge keeps, so a bare `wayland` written
+    // over `clipboard="open"` leaves the gate on and nothing to report.
     if let Some((i, node)) = last(sources, "wayland")
         && prop(node, "clipboard") == Some("open")
     {
@@ -2178,15 +2048,13 @@ fn across_layers(ctx: &Context, sources: &[Source], f: &mut Findings) {
     }
 }
 
-/// Whether an application directory holds the entry a `desktop` node
-/// names. Probed rather than read: only its existence decides this.
+// Probed rather than read: only its existence decides this.
 fn entry_exists(ctx: &Context, name: &str) -> bool {
     desktop::Dirs::from_env(ctx.env)
         .lookup()
         .any(|dir| ctx.host.file_type(&dir.join(name)).is_some())
 }
 
-/// Whether a command starts a sandbox of its own, by basename.
 fn is_nester(argv0: &str) -> bool {
     let base = Path::new(argv0)
         .file_name()
@@ -2195,11 +2063,8 @@ fn is_nester(argv0: &str) -> bool {
     base.starts_with("electron") || NESTERS.contains(&base)
 }
 
-/// Whether a `command` names a file this host has: the path itself when
-/// it holds a separator, else one of the `$PATH` directories. A command
-/// written for the sandbox's own home is looked up under this host's
-/// `$HOME`, but only where a `home-share` binds that path in — with no
-/// share, nothing puts a file there however the host is arranged.
+// A command written for the sandbox's own home is looked up under this host's `$HOME`, but only
+// where a `home-share` binds that path in.
 fn on_path(ctx: &Context, sources: &[Source], argv0: &str) -> bool {
     let path = Path::new(argv0);
     if path.components().count() > 1 {
@@ -2215,8 +2080,6 @@ fn on_path(ctx: &Context, sources: &[Source], argv0: &str) -> bool {
         .any(|dir| ctx.host.file_type(&dir.join(argv0)).is_some())
 }
 
-/// Whether a `home-share` of any layer puts `rel` — that path itself or
-/// a directory above it — into the sandbox's home.
 fn home_share_covers(sources: &[Source], rel: &Path) -> bool {
     sources
         .iter()
