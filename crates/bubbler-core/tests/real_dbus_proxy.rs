@@ -1,11 +1,14 @@
 //! xdg-dbus-proxy(1) says a filtered name becomes "(at least) TALK" once called or heard;
 //! measured here on a private bus whether that lets a call outside the rule through.
 
+use std::ffi::OsStr;
 use std::fs::File;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use bubbler_core::dbus::portal_rules;
+use bubbler_core::config::Service;
+use bubbler_core::dbus::{HostBuses, plan, portal_rules, proxy_command};
 
 const PYTHON: &str = "/usr/bin/python3";
 const SERVICE: &str = concat!(
@@ -46,6 +49,30 @@ fn missing() -> Option<String> {
     (!python).then(|| format!("{PYTHON} with dbus-python and PyGObject is not installed"))
 }
 
+/// The bus address bubbler hands xdg-dbus-proxy for a host bus at `socket`.
+fn proxy_address(socket: &Path) -> String {
+    let plan = plan(&[Service::Dbus { rules: vec![] }], "t").expect("dbus is granted");
+    let buses = HostBuses {
+        session: Some(socket),
+        system: None,
+        a11y: None,
+    };
+    proxy_command(
+        Path::new("xdg-dbus-proxy"),
+        &plan,
+        buses,
+        Path::new("/run/user/1000/bubbler/t"),
+        false,
+        OsStr::new("3"),
+    )
+    .into_iter()
+    .find_map(|arg| {
+        let arg = arg.into_string().unwrap();
+        arg.starts_with("unix:path=").then_some(arg)
+    })
+    .expect("the session bus address")
+}
+
 /// A private bus, a service owning `name` on it, and an xdg-dbus-proxy
 /// in front of it with `rules`.
 struct Probe {
@@ -57,6 +84,17 @@ struct Probe {
 
 impl Probe {
     fn start(name: &str, signal_path: &str, signal_iface: &str, rules: &[String]) -> Probe {
+        Probe::start_in("", name, signal_path, signal_iface, rules)
+    }
+
+    /// [`Probe::start`] with the bus socket in the subdirectory `bus_dir`.
+    fn start_in(
+        bus_dir: &str,
+        name: &str,
+        signal_path: &str,
+        signal_iface: &str,
+        rules: &[String],
+    ) -> Probe {
         // `/tmp`, not `TMPDIR`: a socket path longer than 108 bytes cannot
         // be bound.
         let dir = tempfile::Builder::new()
@@ -69,8 +107,9 @@ impl Probe {
             children: Vec::new(),
             dir,
         };
-        let bus = probe.address("bus");
-        let socket = probe.dir.path().join("bus");
+        let socket = probe.dir.path().join(bus_dir).join("bus");
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let bus = proxy_address(&socket);
         probe.spawn(
             "dbus-daemon",
             &[
@@ -256,6 +295,32 @@ fn a_call_rule_without_a_path_still_refuses_after_a_call_and_a_broadcast() {
     let steps = split_steps();
     let t = probe.client(&steps.iter().map(String::as_str).collect::<Vec<_>>());
     assert_split_holds(&t);
+}
+
+// Measured with xdg-dbus-proxy 0.1.9: given the raw path it fails with
+// "Address element ... does not contain a colon".
+#[test]
+fn the_proxy_reaches_a_bus_whose_path_needs_escaping() {
+    if let Some(why) = missing() {
+        say(&format!("skipping: {why}"));
+        return;
+    }
+    let rule = format!("{SPLIT}=org.example.Allowed.*");
+    let probe = Probe::start_in(
+        "a,b;c%d e=f",
+        SPLIT,
+        OBJECT,
+        "org.example.Allowed",
+        &[format!("--call={rule}")],
+    );
+    let at = |label: &str, method: &str| format!("{label} name {OBJECT} {method}");
+    let steps = [
+        at("a", "org.example.Denied.Ping"),
+        at("b", "org.example.Allowed.Ping"),
+    ];
+    let t = probe.client(&steps.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_row(&t, "a", REFUSED);
+    assert_row(&t, "b", SERVED);
 }
 
 /// The `portals` rule set as bubbler renders it, against a stand-in
