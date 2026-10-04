@@ -860,11 +860,16 @@ reaches PipeWire only through its security context, never the session's
 `pipewire-0`, and PipeWire does not read `/.flatpak-info` for a client
 whose context already sets `pipewire.access`: its access module logs
 `has already access: 'restricted'` and returns before it looks at the pid
-(measured, PipeWire 1.6.9). Such a client never carries
-`pipewire.access = "flatpak"`, the one property WirePlumber's Flatpak
-rules act on (`find-flatpak-access.lua`, 0.5.18); a context client with
-bubbler's file, `[Instance]` included, gets the drop-in's permissions and
-nothing else (measured, WirePlumber 0.5.18). The camera is gated by the
+(measured, PipeWire 1.6.9). WirePlumber's Flatpak rules
+(`find-flatpak-access.lua`, 0.5.18) apply only where its
+`get_client_access` yields "flatpak", which it never does for
+`pipewire.access = "restricted"`, whatever `pipewire.client.access` or
+`pipewire.sec.flatpak` say. A context client with bubbler's file,
+`[Instance]` included, gets the drop-in's permissions and nothing else,
+and so does one that sets `pipewire.client.access = "flatpak"` and
+`pipewire.sec.flatpak = "true"` itself: the daemon keeps the first and
+drops the second, and the client sees what one without them sees
+(measured, PipeWire 1.6.9, WirePlumber 0.5.18). The camera is gated by the
 portal's own permission store, keyed by the app id the portal reads from
 the proxy's copy of the file. Two instance names can give one app id
 (`my.app`, `my_app`), so a name another instance's app id already has is

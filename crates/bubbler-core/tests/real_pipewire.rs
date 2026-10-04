@@ -926,8 +926,13 @@ fn a_playback_context_gets_no_link_to_another_clients_stream() {
 /// at connect, from its configuration's `context.properties` or from
 /// `PIPEWIRE_PROPS`, reaches the daemon in its first update, before any
 /// session manager can see the client; `Core.update_properties` is an
-/// update after that.
-const CLAIM: &str = r#"{ "bubbler.audio": "playback,microphone", "pipewire.sec.bubbler.audio": "playback,microphone" }"#;
+/// update after that. Beside it, the two keys besides `pipewire.access`
+/// from which WirePlumber's `get_client_access` reads "flatpak".
+const CLAIM: &str = r#"{ "bubbler.audio": "playback,microphone", "pipewire.sec.bubbler.audio": "playback,microphone", "pipewire.client.access": "flatpak", "pipewire.sec.flatpak": "true" }"#;
+
+/// What the daemon carries of the Flatpak half of `CLAIM` (PipeWire
+/// 1.6.9 drops `pipewire.sec.flatpak`).
+const CLAIMED_FLATPAK: &str = r#"pipewire.client.access = "flatpak""#;
 
 /// What `wpexec` runs to claim the microphone once connected and then
 /// open a capture stream of its own.
@@ -935,6 +940,8 @@ const CLAIM_LATER: &str = r#"
 Core.update_properties {
   ["bubbler.audio"] = "playback,microphone",
   ["pipewire.sec.bubbler.audio"] = "playback,microphone",
+  ["pipewire.client.access"] = "flatpak",
+  ["pipewire.sec.flatpak"] = "true",
 }
 claimer = LocalNode ("adapter", {
   ["factory.name"] = "support.null-audio-sink",
@@ -981,6 +988,23 @@ fn a_playback_context_that_claims_the_microphone_gets_the_playback_grant() {
     let script = bed.dir().join("claim.lua");
     std::fs::write(&script, CLAIM_LATER).expect("the later claim's script");
     let out = bed.dir().join("captured.wav");
+
+    let plain = measure(&bed, PLAYBACK, &[SINK], str::to_owned).reach;
+    let claimer = measure(&bed, PLAYBACK, &[SINK], |program| {
+        format!("PIPEWIRE_CONFIG_DIR={} {program}", config.display())
+    })
+    .reach;
+    for kept in [CLAIMED_FLATPAK, AS_THE_CONTEXT_SET_IT] {
+        assert!(
+            claimer.properties.iter().any(|line| line == kept),
+            "{:?}",
+            claimer.properties
+        );
+    }
+    assert_eq!(
+        claimer.view, plain.view,
+        "a client that claims Flatpak's access"
+    );
 
     for (route, claimed, program) in [
         (
