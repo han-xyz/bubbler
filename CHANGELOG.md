@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.26.1
+
+### Fixed
+
+- `bubbler-init` now empties its bounding set when it holds `CAP_SETPCAP`.
+  It used to empty its effective set first, so every drop failed and was
+  ignored. This had no effect under bubblewrap as shipped, which already
+  hands it an empty bounding set and no `CAP_SETPCAP`.
+
+### Changed
+
+- Comments across the source were shortened, with no behaviour change. The
+  WirePlumber hook script's text changed with them (its policy revision is
+  unchanged), so a copy of the script you installed yourself now reports
+  `audio-policy-differs` until rewritten with
+  `bubbler audio-policy --print --script`; packaged copies are replaced by
+  the package.
+
 ## 0.26.0
 
 ### Security

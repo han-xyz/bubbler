@@ -2145,19 +2145,24 @@ stop's: a command that exits during the grace does not start a new one for
 the exec'd children, the window manager or the X server.
 
 `bubbler-init` makes itself non-dumpable, sets `PR_SET_NO_NEW_PRIVS`,
-clears the ambient set, empties the effective, permitted and inheritable
-sets, and takes `PR_SET_PDEATHSIG` (`SIGTERM`) before it installs a signal
-handler or starts anything. Between the emptying and `PR_SET_PDEATHSIG` it
-asks to drop from the bounding set every capability the rustix it is built
-with names (41 with rustix 1.1.4) that the set still holds. That drop
-never takes effect: `PR_CAPBSET_DROP` needs `CAP_SETPCAP` in the effective
-set (`capabilities(7)`), the effective set is already empty by then, and
-the `EPERM` is ignored. The bounding set is therefore whatever bwrap
-handed over. Today that is empty: bubbler passes bwrap no `--cap-add`,
-`bwrap(1)` leaves no capability by default, and `/proc/self/status` inside
-`bwrap --unshare-all` shows `CapBnd` 0 (measured on bwrap 0.13.0). Under
-a bwrap that left the bounding set non-empty it would stay non-empty, and
-a capability a newer kernel adds past those 41 is not even asked about.
+clears the ambient set, drops from the bounding set every capability the
+rustix it is built with names (41 with rustix 1.1.4) that the set still
+holds, empties the effective, permitted and inheritable sets, and takes
+`PR_SET_PDEATHSIG` (`SIGTERM`) before it installs a signal handler or
+starts anything. The bounding-set drop comes before the emptying because
+`PR_CAPBSET_DROP` needs `CAP_SETPCAP` in the effective set
+(`capabilities(7)`). Started with `CAP_SETPCAP` and a full bounding set
+(uid 0 of a user namespace of its own), it leaves the commands it starts
+`CapBnd` 0 along with the other four sets (tested). Without `CAP_SETPCAP`
+the drop fails with `EPERM`, which is ignored, and the bounding set stays
+as handed over. Under bwrap that is already empty: bubbler passes bwrap
+no `--cap-add`, `bwrap(1)` leaves no capability by default, and
+`/proc/self/status` inside `bwrap --unshare-all` shows all five sets 0
+(measured on bwrap 0.13.0), so there is nothing to drop. A capability a
+newer kernel adds past those 41 stays in the bounding set wherever it
+was. A bounding-set entry is not a held capability: with the permitted,
+inheritable and ambient sets empty and `PR_SET_NO_NEW_PRIVS` set, no
+`execve` from `bubbler-init` or its children gains one.
 What prevents regaining a capability is the rest: with `no_new_privs` set, `execve` grants nothing
 the process could not have done without the `execve`
 (`PR_SET_NO_NEW_PRIVS(2const)`); with the permitted and effective sets
