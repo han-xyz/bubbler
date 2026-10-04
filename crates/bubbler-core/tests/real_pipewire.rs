@@ -797,6 +797,99 @@ fn a_microphone_context_sees_every_port_and_link_of_a_capture_node() {
     );
 }
 
+/// A camera's node of each class and another client's video stream, as
+/// the bed adds one null node of each.
+const VIDEO_NODES: [(&str, &str); 4] = [
+    ("video-source", "Video/Source"),
+    ("video-sink", "Video/Sink"),
+    ("video-duplex", "Video/Duplex"),
+    ("video-stream", "Stream/Output/Video"),
+];
+
+/// Every grant word in some context: none of them reaches a video node.
+const EVERY_GRANT: [&str; 4] = [PLAYBACK, PLAYBACK_MICROPHONE, MICROPHONE_DEVICES, EXCLUSIVE];
+
+/// The bed's `VIDEO_NODES` added, lingering, with ports and a link from
+/// the sink's monitor into the video sink: the ids of the nodes.
+fn video_nodes_with_a_link(bed: &PipeWireBed) -> Vec<String> {
+    for (name, class) in VIDEO_NODES {
+        // Without `adapter.auto-port-config` a null node of a class the
+        // adapter does not know gets no ports (PipeWire 1.6.9).
+        let out = bed
+            .command("pw-cli")
+            .args([
+                "create-node",
+                "adapter",
+                &format!(
+                    "{{ factory.name = support.null-audio-sink, node.name = {name}, \
+                     media.class = {class}, audio.position = \"FL,FR\", object.linger = true, \
+                     adapter.auto-port-config = {{ mode = dsp, position = preserve }} }}"
+                ),
+            ])
+            .output()
+            .expect("pw-cli did not run");
+        assert!(out.status.success(), "{out:?}");
+    }
+    wait_for("the video nodes' ports", || {
+        let ports = bed.host_tool("pw-link", &["-io"]);
+        VIDEO_NODES
+            .iter()
+            .all(|(name, _)| ports.contains(&format!("{name}:")))
+    });
+    let linked = bed
+        .command("pw-link")
+        .args(["-L", "bed-sink:monitor_FL", "video-sink:playback_FL"])
+        .output()
+        .expect("pw-link did not run");
+    assert!(linked.status.success(), "{linked:?}");
+    wait_for("the link into the video sink", || {
+        bed.links().contains("video-sink:playback_FL")
+    });
+    let listing = bed.info_from_host();
+    VIDEO_NODES
+        .iter()
+        .map(|(name, _)| {
+            object(&listing, &[&format!("node.name = \"{name}\""), NODE])
+                .expect("a video node in the bed")
+                .id
+        })
+        .collect()
+}
+
+#[test]
+fn no_audio_context_sees_a_video_node_or_its_ports_and_links() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let nodes = video_nodes_with_a_link(&bed);
+    for props in EVERY_GRANT {
+        let listing = bed.info_in_context(props, &[SINK]);
+        for (name, _) in VIDEO_NODES {
+            assert!(
+                object(&listing, &[&format!("node.name = \"{name}\""), NODE]).is_none(),
+                "{name} under {props}:\n{listing}"
+            );
+        }
+        assert_eq!(
+            objects_of(&listing, &nodes),
+            Vec::<String>::new(),
+            "ports or links of a video node under {props}:\n{listing}"
+        );
+    }
+}
+
+#[test]
+fn a_microphone_context_connected_first_sees_no_later_video_node_or_its_ports_and_links() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let monitor = ContextMonitor::start(&bed, PLAYBACK_MICROPHONE);
+    let nodes = video_nodes_with_a_link(&bed);
+    let mut ids = objects_of(&bed.info_from_host(), &nodes);
+    ids.extend(nodes);
+    monitor.sees_none_of(&ids);
+}
+
 #[test]
 fn a_bubbler_context_with_no_grant_the_drop_in_knows_falls_back_to_playback() {
     let Some(bed) = PipeWireBed::start() else {

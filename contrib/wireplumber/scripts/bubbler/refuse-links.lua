@@ -86,8 +86,9 @@
 -- application starts at that application's saved levels, and a target
 -- the user picks for it is saved under those names.
 --
--- A sandbox without the microphone grant sees no port and no link of a
--- node 50-bubbler.conf hides from it, as it sees no such node.
+-- A sandbox sees no port and no link of a node 50-bubbler.conf hides from
+-- it, as it sees no such node: a capture node without the microphone
+-- grant, and every video node, since no grant covers a camera.
 --
 -- The policy states its revision in the metadata `bubbler-policy`, key
 -- `revision` on subject 0, which no sandbox can see: bubbler reads it to
@@ -102,7 +103,7 @@ local BUBBLER_ENGINE = "org.bubbler"
 
 -- Raised whenever what this policy makes WirePlumber do changes; bubbler
 -- expects the revision it ships with and reads it from this line.
-local POLICY_REVISION = 2
+local POLICY_REVISION = 3
 
 local EPERM = -1
 
@@ -550,9 +551,8 @@ SimpleEventHook {
 
 -- The ports and links of a node 50-bubbler.conf hides carry no
 -- `media.class` for its rules to match (PipeWire 1.6.9), only the node's
--- id, so they are hidden here, from every sandbox without the microphone
--- grant. Each is hidden when the later of it and its node arrives: the
--- daemon may register a port before its node.
+-- id, so they are hidden here. Each is hidden when the later of it and
+-- its node arrives: the daemon may register a port before its node.
 local nodes = ObjectManager {
   Interest { type = "node" },
 }
@@ -561,19 +561,34 @@ local ports_and_links = ObjectManager {
   Interest { type = "link" },
 }
 
-local function blind_to_capture (client)
-  return client.properties ["pipewire.sec.engine"] == BUBBLER_ENGINE and
-      not granted (client, "microphone")
+local function is_sandbox (client)
+  return client.properties ["pipewire.sec.engine"] == BUBBLER_ENGINE
 end
 
-local function is_capture_node (node_id)
-  if not node_id then
-    return false
+-- Whether a stream would carry video to or from the node.
+local function video (node_props)
+  local class = node_props ["media.class"] or ""
+  return class:find ("^Video/") ~= nil or class:find ("^Stream/.*/Video$") ~= nil
+end
+
+-- Whether 50-bubbler.conf hides the node from the sandbox `client`.
+local function hidden_from (client, node_props)
+  return video (node_props) or
+      (capture_capable (node_props) and not granted (client, "microphone"))
+end
+
+-- Whether the node `node_id` names is one hidden from `client`, as a
+-- function of the id.
+local function hides_node (client)
+  return function (node_id)
+    if not node_id then
+      return false
+    end
+    local node = nodes:lookup {
+      Constraint { "bound-id", "=", node_id, type = "gobject" },
+    }
+    return node ~= nil and hidden_from (client, node.properties)
   end
-  local node = nodes:lookup {
-    Constraint { "bound-id", "=", node_id, type = "gobject" },
-  }
-  return node ~= nil and capture_capable (node.properties)
 end
 
 -- Whether a port or link belongs to a node `of_node` holds for.
@@ -597,30 +612,33 @@ local function hidden_of (of_node)
   return hidden
 end
 
-local function hide_from_connected_sandboxes (hidden)
+-- `hidden_for (client)` is the permissions table to apply to a connected
+-- sandbox, or false or nil where there is nothing to hide from it.
+local function hide_from_connected_sandboxes (hidden_for)
   local source = Plugin.find ("standard-event-source")
-  if not source or not hidden then
+  if not source then
     return
   end
   for client in source:call ("get-object-manager", "client"):iterate () do
-    if blind_to_capture (client) then
+    local hidden = is_sandbox (client) and hidden_for (client)
+    if hidden then
       client:update_permissions (hidden)
     end
   end
 end
 
 nodes:connect ("object-added", function (_, node)
-  if capture_capable (node.properties) then
-    local id = tostring (node ["bound-id"])
-    hide_from_connected_sandboxes (hidden_of (function (node_id)
-      return node_id == id
-    end))
-  end
+  local id = tostring (node ["bound-id"])
+  hide_from_connected_sandboxes (function (client)
+    return hidden_from (client, node.properties) and
+        hidden_of (function (node_id) return node_id == id end)
+  end)
 end)
 ports_and_links:connect ("object-added", function (_, object)
-  if belongs (object, is_capture_node) then
-    hide_from_connected_sandboxes ({ [object ["bound-id"]] = "-" })
-  end
+  hide_from_connected_sandboxes (function (client)
+    return belongs (object, hides_node (client)) and
+        { [object ["bound-id"]] = "-" }
+  end)
 end)
 nodes:activate ()
 ports_and_links:activate ()
@@ -635,8 +653,11 @@ SimpleEventHook {
   },
   execute = function (event)
     local client = event:get_subject ()
-    local hidden = hidden_of (is_capture_node)
-    if blind_to_capture (client) and hidden then
+    if not is_sandbox (client) then
+      return
+    end
+    local hidden = hidden_of (hides_node (client))
+    if hidden then
       client:update_permissions (hidden)
     end
   end
