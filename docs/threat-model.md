@@ -2281,6 +2281,13 @@ stderr, and any byte stream the sandbox itself produced go through
 `safe_text::render` instead, which shows the same control bytes in caret
 notation rather than folding a whole sequence to one mark, since text
 read back this way is meant to be read byte for byte and not summarised.
+`render` decodes C1 rather than matching it byte for byte: `U+0080`–`U+009F`
+are the controls, while the same byte values inside a longer sequence are
+ordinary text (`\u{201c}` is `e2 80 9c`), and escaping those would mangle
+every quotation mark a log holds. The rendering is not reversible: a log
+that held the two characters `^` and `[` reads the same as one that held an
+`ESC`. That is `cat -v`'s bargain, and the reason the raw bytes still go to
+a pipe.
 
 **Does not defend:** anything printed straight to a pipe rather than a
 terminal — a pipe is a tool on the other end and gets the bytes as they
