@@ -29,17 +29,14 @@ pub(crate) const CONFIG_HEADER: &str = "// bubbler config: ";
 /// header at all.
 pub const CONFIG_VERSION: u32 = 3;
 
-/// The version a config has to record for a bare `network` node to mean
-/// what this bubbler makes of it. Each migration is measured against the
-/// version that introduced it, not against [`CONFIG_VERSION`]: a file
-/// that has been through one has been through it whatever came after.
+// Each migration is measured against the version that introduced it,
+// not against [`CONFIG_VERSION`]: a file that has been through one has
+// been through it whatever came after.
 const ISOLATED_NETWORK_VERSION: u32 = 2;
 
-/// The version a config has to record for a bare `portals` node to mean
-/// what this bubbler makes of it. See [`ISOLATED_NETWORK_VERSION`].
 const PORTAL_CHILDREN_VERSION: u32 = 3;
 
-/// Where `reseed` keeps the `config.kdl` it replaces.
+// Where `reseed` keeps the `config.kdl` it replaces.
 const BACKUP_FILE: &str = "config.kdl.bak";
 
 /// Service names [`Instance::ephemeral`] accepts as grants: the bare
@@ -74,7 +71,7 @@ pub fn instances_root(env: &Env) -> PathBuf {
     env.data_home.join("bubbler").join("instances")
 }
 
-/// Directory holding throwaway instances, one per bubbler pid.
+// Directory holding throwaway instances, one per bubbler pid.
 fn try_root(env: &Env) -> PathBuf {
     env.data_home.join("bubbler").join("try")
 }
@@ -115,9 +112,9 @@ pub struct Instance {
     pub config_version: Option<u32>,
 }
 
-/// Whether `name` is the shape [`Instance::ephemeral`] gives a throwaway
-/// sandbox, `try-<pid>`, whose runtime directory is swept once that pid is
-/// gone. An instance of that name would have its own swept out from under it.
+// Whether `name` is the shape [`Instance::ephemeral`] gives a throwaway
+// sandbox, `try-<pid>`, whose runtime directory is swept once that pid is
+// gone. An instance of that name would have its own swept out from under it.
 fn is_try_name(name: &str) -> bool {
     name.strip_prefix("try-")
         .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
@@ -145,15 +142,15 @@ fn validate_name(name: &str) -> Result<(), InstanceError> {
     }
 }
 
-/// Bytes a `sockaddr_un` holds, the terminating NUL among them
-/// (`unix(7)`).
+// Bytes a `sockaddr_un` holds, the terminating NUL among them
+// (`unix(7)`).
 const SUN_PATH_MAX: usize = 108;
 
-/// Refuse a name whose runtime sockets would not fit a `sockaddr_un`.
-/// The kernel truncates a longer path without saying so, and what the
-/// user then sees is a client failing on a path that is not the one
-/// bubbler printed. Checked where the instance is created, so the name is
-/// still the user's to change.
+// Refuse a name whose runtime sockets would not fit a `sockaddr_un`.
+// The kernel truncates a longer path without saying so, and what the
+// user then sees is a client failing on a path that is not the one
+// bubbler printed. Checked where the instance is created, so the name is
+// still the user's to change.
 // Every socket an instance can have, longest first: the proxy binds its
 // own in the `dbus/` subdirectory, one level deeper than the path the
 // launcher then moves it to, so those are the longest of all.
@@ -184,8 +181,8 @@ pub fn app_id_twin(env: &Env, name: &str) -> Result<Option<String>, InstanceErro
     Ok(dbus::app_id_twin(name, &names).map(str::to_owned))
 }
 
-/// The warning `name`'s run, or its keeping, prints when another instance
-/// in `root` shares its app id and `config` does not accept that.
+// The warning `name`'s run, or its keeping, prints when another instance
+// in `root` shares its app id and `config` does not accept that.
 fn app_id_warning_in(
     root: &Path,
     name: &str,
@@ -205,7 +202,7 @@ fn app_id_warning_in(
     }))
 }
 
-/// Names of the instances under `root`, sorted. An absent root holds none.
+// Names of the instances under `root`, sorted. An absent root holds none.
 fn list_in(root: &Path) -> Result<Vec<String>, InstanceError> {
     let entries = match fs::read_dir(root) {
         Ok(e) => e,
@@ -241,9 +238,9 @@ fn io_err(path: &Path) -> impl FnOnce(io::Error) -> InstanceError + '_ {
     move |e| InstanceError::Io(path.to_path_buf(), e)
 }
 
-/// One `config.kdl`, refused on its size before it is read. A file past
-/// the parser's bound is the [`crate::error::ConfigError`] the parser
-/// gives; anything else names the path, the way [`io_err`] does.
+// One `config.kdl`, refused on its size before it is read. A file past
+// the parser's bound is the [`crate::error::ConfigError`] the parser
+// gives; anything else names the path, the way [`io_err`] does.
 fn read_config(path: &Path) -> Result<String, InstanceError> {
     config::read_bounded(path).map_err(|e| match e {
         ReadError::Io(e) => InstanceError::Io(path.to_path_buf(), e),
@@ -251,15 +248,15 @@ fn read_config(path: &Path) -> Result<String, InstanceError> {
     })
 }
 
-/// [`fsutil::write_atomic`] as an [`InstanceError`]: a config is
-/// replaced whole or not at all.
+// [`fsutil::write_atomic`] as an [`InstanceError`]: a config is
+// replaced whole or not at all.
 fn write_atomic(path: &Path, text: &str) -> Result<(), InstanceError> {
     fsutil::write_atomic(path, text).map_err(|(at, e)| InstanceError::Io(at, e))
 }
 
-/// Lay out an instance directory: `dir` itself (never overwriting one),
-/// a private `home/` and `config.kdl` holding `text`. `name` only names
-/// the instance in the "already exists" error.
+// Lay out an instance directory: `dir` itself (never overwriting one),
+// a private `home/` and `config.kdl` holding `text`. `name` only names
+// the instance in the "already exists" error.
 fn make_dir(dir: &Path, name: &str, text: &str) -> Result<(), InstanceError> {
     if let Some(parent) = dir.parent() {
         fs::create_dir_all(parent).map_err(io_err(parent))?;
@@ -274,7 +271,6 @@ fn make_dir(dir: &Path, name: &str, text: &str) -> Result<(), InstanceError> {
     fs::write(&cfg_path, text).map_err(io_err(&cfg_path))
 }
 
-/// The service one [`GRANTS`] name adds.
 fn grant_service(name: &str) -> Option<Service> {
     Some(match name {
         // Always the security context: `--grant wayland` is not where a
@@ -319,8 +315,8 @@ fn grant_service(name: &str) -> Option<Service> {
     })
 }
 
-/// Add one bare service node per grant. A grant the config already holds
-/// is skipped: the parser rejects a duplicate.
+// Add one bare service node per grant. A grant the config already holds
+// is skipped: the parser rejects a duplicate.
 fn with_grants(cfg: &mut InstanceConfig, grants: &[&str]) -> Result<(), InstanceError> {
     for g in grants {
         let svc = grant_service(g).ok_or_else(|| InstanceError::InvalidGrant((*g).to_owned()))?;
@@ -350,9 +346,7 @@ fn with_grants(cfg: &mut InstanceConfig, grants: &[&str]) -> Result<(), Instance
                 .iter()
                 .any(|s| matches!(s, Service::Network { .. })),
             // And for the two display grants, whose mode the bare grant
-            // does not carry either: `--grant x11` on a profile holding
-            // `x11 "host"` would otherwise write a second node the
-            // parser refuses.
+            // does not carry either.
             Service::Wayland(_) => cfg
                 .services
                 .iter()
@@ -386,10 +380,10 @@ fn with_grants(cfg: &mut InstanceConfig, grants: &[&str]) -> Result<(), Instance
     Ok(())
 }
 
-/// What a `config.kdl` holds when its profile grants nothing: the same
-/// examples the `generic` profile is written with. A flattened profile
-/// keeps no comments, so without this `bubbler edit` on a fresh instance
-/// would open a file holding only its header.
+// What a `config.kdl` holds when its profile grants nothing: the same
+// examples the `generic` profile is written with. A flattened profile
+// keeps no comments, so without this `bubbler edit` on a fresh instance
+// would open a file holding only its header.
 const STARTER: &str = "\
 // Baseline sandbox only. Add grants below, e.g.:
 //   wayland
@@ -399,10 +393,8 @@ const STARTER: &str = "\
 //   command \"foot\"
 ";
 
-/// The flattened profile as the text a new instance's `config.kdl` holds:
-/// a header naming the profile it came from, then the canonical KDL of the
-/// merged result plus one bare node per grant. The text is parsed back, so
-/// nothing is written that bubbler would then refuse to open.
+// The text is parsed back, so nothing is written that bubbler would then
+// refuse to open.
 fn seed(
     env: &Env,
     profile_name: &str,
@@ -425,8 +417,7 @@ fn seed(
 
 /// The profile name the first line records, if that line is the header a
 /// seeded config carries and what follows it is a profile name. A config
-/// written by hand without it names no profile to re-flatten, and no
-/// profile for an instance list to show either.
+/// written by hand without it names no profile to re-flatten.
 pub fn profile_header(text: &str) -> Option<&str> {
     let name = text
         .lines()
@@ -436,9 +427,9 @@ pub fn profile_header(text: &str) -> Option<&str> {
     is_plain_name(name).then_some(name)
 }
 
-/// The version the header records, if the file has one. Only the leading
-/// comment block is read: a `// bubbler config:` line further down is
-/// part of somebody's notes, not a header.
+// The version the header records, if the file has one. Only the leading
+// comment block is read: a `// bubbler config:` line further down is
+// part of somebody's notes, not a header.
 fn config_version(text: &str) -> Option<u32> {
     text.lines()
         .take_while(|l| {
@@ -449,8 +440,8 @@ fn config_version(text: &str) -> Option<u32> {
         .and_then(|v| v.trim().parse().ok())
 }
 
-/// The pid a sweepable directory is named after: decimal digits only, so
-/// `-1`, `+5` and `0` name no process and are left alone.
+// The pid a sweepable directory is named after: decimal digits only, so
+// `-1`, `+5` and `0` name no process and are left alone.
 fn dir_pid(name: &str) -> Option<Pid> {
     if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -458,10 +449,10 @@ fn dir_pid(name: &str) -> Option<Pid> {
     Pid::from_raw(i32::try_from(name.parse::<u32>().ok()?).ok()?)
 }
 
-/// Remove every entry of `dir` named `<prefix><pid>`, or that with the
-/// start lock's suffix, whose pid is not a live process, and nothing
-/// else. Best effort: an entry that cannot be removed is reported, never
-/// fatal.
+// Remove every entry of `dir` named `<prefix><pid>`, or that with the
+// start lock's suffix, whose pid is not a live process, and nothing
+// else. Best effort: an entry that cannot be removed is reported, never
+// fatal.
 fn sweep_dir(dir: &Path, prefix: &str) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -508,21 +499,19 @@ pub fn sweep_stale(env: &Env) {
 pub struct Ephemeral {
     /// The instance itself; the launcher takes it like any other.
     pub instance: Instance,
-    /// Instance name to keep the directory under, if any.
     keep: Option<String>,
     // `Drop` runs without an `Env`, so the paths it needs are copied here.
     instances_root: PathBuf,
     runtime: PathBuf,
     start_lock: PathBuf,
-    /// Whether the runtime directory and start lock are this guard's to remove.
+    // Whether the runtime directory and start lock are this guard's to remove.
     remove_runtime: bool,
 }
 
 impl Ephemeral {
     /// Keep the sandbox afterwards as instance `name` instead of removing
     /// it. The name is checked now so a run that cannot be kept never
-    /// starts: kept, it is what the next run's sockets are named after,
-    /// so it faces the same length limit as a name given to `create`.
+    /// starts.
     pub fn keep_as(&mut self, env: &Env, name: &str) -> Result<(), InstanceError> {
         validate_name(name)?;
         check_socket_paths(env, name)?;
@@ -709,13 +698,8 @@ impl Instance {
     }
 
     /// Write `config` back to `config.kdl`, keeping the headers the file
-    /// carries: the profile it was seeded from, so `reseed` still knows
-    /// where to re-flatten it from, and the config version, so no later
-    /// run warns about meanings this file has just been written against.
-    /// What it replaces is kept beside it as `config.kdl.bak`. Both files
-    /// are written through [`fsutil::write_atomic`]: the rename is atomic,
-    /// so a reader sees one whole config or the other, and a symlink left
-    /// under either name is replaced rather than written through.
+    /// carries: the profile it was seeded from, and the config version.
+    /// What it replaces is kept beside it as `config.kdl.bak`.
     ///
     /// Comments and layout are not kept: the file is rendered from the
     /// config, which holds the grants and not the text around them.
@@ -725,8 +709,7 @@ impl Instance {
         let mut text = String::new();
         // A profile is only named where the file already named one: a
         // header invented here would send `reseed` to somebody else's
-        // profile. The name passed the profile grammar to be read as a
-        // header at all, so it holds no newline of its own.
+        // profile.
         if let Some(profile_name) = profile_header(&held) {
             text.push_str(&format!("{PROFILE_HEADER}{profile_name}\n"));
         }
@@ -773,9 +756,7 @@ impl Instance {
 
     /// Record the current version in a config that does not already, by
     /// replacing an older header or writing one after the profile header.
-    /// `true` when the file was changed. What it records is that the file
-    /// has been read against the current meanings, which is what
-    /// [`Instance::migration_warning`] stops warning about.
+    /// `true` when the file was changed.
     pub fn mark_version(env: &Env, name: &str) -> Result<bool, InstanceError> {
         let cfg_path = config_path_checked(env, name)?;
         let text = read_config(&cfg_path)?;
@@ -806,8 +787,7 @@ impl Instance {
     /// starts: a node whose meaning changed after the version the file
     /// records asks for a different sandbox now than it did when it was
     /// written. A file recording no version counts as version 1. One
-    /// string per migration the file has not been through, since a file
-    /// old enough may not have been through either.
+    /// string per migration the file has not been through.
     pub fn migration_warning(&self) -> Vec<String> {
         let written = self.config_version.unwrap_or(1);
         let services = &self.config.services;
