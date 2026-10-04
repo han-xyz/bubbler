@@ -187,7 +187,8 @@ impl Detail {
         }
         // The selection follows the entry it was on. What the row says is
         // asked before where it lives, because an index is what the entry
-        // beside it inherits.
+        // beside it inherits: a cursor that followed the index would put the
+        // next Space on an entry nobody aimed at.
         self.selected = row
             .and_then(|(node, target, text)| {
                 let rows = &self.rows;
@@ -381,7 +382,10 @@ impl Detail {
 
     // The duplicate rule is the parser's, down to a share whose path is
     // written another way. A question that cannot be asked is answered
-    // `false`.
+    // `false`. A line the parser reads as one node and the emitter cannot
+    // write as one — two `lint-allow` ids — is the splice path's to take.
+    // Only a repeat is answered: a buffer that does not parse for another
+    // reason is the pane's business and not this line's.
     fn would_repeat(&self, written: &Node) -> bool {
         let (Ok(mut text), Ok(node)) = (kdl_out::render(&self.buf), kdl_out::node(written)) else {
             return false;
@@ -496,8 +500,10 @@ impl Detail {
         }
     }
 
-    // Each `/-` line names the entry it was read above, so a section that
-    // grows or shrinks above them moves that entry and has to move them with it.
+    // Move the `/-` lines of one section that sit below the entry at
+    // `i` by `by` entries. Each of them names the entry it was read
+    // above, so a section that grows or shrinks above them moves that
+    // entry and has to move them with it.
     fn shift_disabled(&mut self, rank: u8, i: usize, by: isize) {
         for entry in &mut self.buf.disabled {
             if config::section_rank(&entry.node) == rank && entry.before > i {
@@ -850,7 +856,8 @@ fn rows(cfg: &InstanceConfig) -> Result<Vec<Row>, String> {
     let mut rows = out.rows;
     // A repeatable node with an entry keeps a bare row after its last
     // one: Enter on an entry writes that entry, and there has to be a
-    // row that writes the next.
+    // row that writes the next. With no entry at all its row is the one
+    // in the absent block below, where Enter opens the same prompt.
     for node in config::REPEATABLE {
         let Some(last) = rows.iter().rposition(|r| r.node == *node) else {
             continue;
