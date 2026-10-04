@@ -671,9 +671,8 @@ impl Relay {
         let address = SocketAddrUnix::new(&self.upstream)?;
         match connect(&socket, &address) {
             Ok(()) => Ok(socket),
-            // A connection the kernel could not finish at once finishes on
-            // the first write, which is queued like any other. `EAGAIN` is
-            // not that: on a Unix socket it is a full accept queue.
+            // Finishes on the first write. `EAGAIN` on a Unix socket is a full
+            // accept queue, not a connect in progress.
             Err(Errno::INPROGRESS) => Ok(socket),
             Err(err) => Err(err),
         }

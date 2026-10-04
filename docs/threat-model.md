@@ -355,9 +355,14 @@ That last check is the one that matters: hiding a global from
 draft that only withheld advertisements was bound straight through by
 exactly that route while this was being built. A global the compositor
 withdraws after offering it stays bindable at the interface and version
-offered, since libwayland lets a bind that raced the removal through and
-the compositor makes the object inert; the proxy remembers the last 64
-per connection. The proxy applies a denylist of its own on every
+offered for three seconds, since libwayland lets a bind that raced the
+removal through and the compositor makes the object inert while it still
+holds the global; the proxy remembers the last 64 per connection, and a
+new announcement of the same number replaces the old one. What stays the
+compositor's to get right: a compositor that reuses a number within those
+three seconds for a global it does not announce to this client receives
+a bind checked against the old interface, and only its own checks of the
+interface name and the global's visibility stop it. The proxy applies a denylist of its own on every
 connection — 40 interface names: the 31 Hyprland withholds from a
 sandboxed client, plus nine of the same class found by reading every
 global the proxy's tables describe, whether another compositor implements
@@ -452,28 +457,39 @@ the selection *with* focus is not a privileged protocol. `bubbler-wl-proxy`
 gates it instead. A `receive` on `wl_data_offer`,
 `zwp_primary_selection_offer_v1`, `zwlr_data_control_offer_v1` or
 `ext_data_control_offer_v1` is forwarded only within one second of real
-user input — a `wl_keyboard.key` the compositor reported as pressed, a
-`wl_pointer.button` in either direction, a `wl_touch.down` or
-`wl_touch.up`, a tablet tool's (`zwp_tablet_tool_v1` or `_v2`) `frame`
-holding a `down` or a `button` reported as pressed, or a
-`zwp_tablet_pad_v2.button` reported as pressed — seen on any connection
-of that instance. Both ends of a pointer press or a touch arm, so a drag
-that ends over a paste target arms on the release that ends it rather
-than only on the press that began it, however long the drag took. A
-tablet tool's `up` and button release arm nothing, and neither does a
-tablet frame that also holds a `proximity_in` or `proximity_out`: the
-protocol has the compositor itself send `down` and held buttons when a
-pen already touching the tablet enters a surface, and the lift of a pen
-that touched down elsewhere may reach the surface it was moved over, so a
-sandbox could otherwise arm the gate by moving its window under a pen in
-use elsewhere.
+user input — a `wl_keyboard.key` or `wl_pointer.button` the compositor
+reported as pressed, a `wl_touch.down`, a tablet tool's
+(`zwp_tablet_tool_v1` or `_v2`) `frame` holding a `down` or a `button`
+reported as pressed, or a `zwp_tablet_pad_v2.button` reported as pressed
+— seen on any connection of that instance. No release arms: the core
+protocol does not say which client a release goes to, and the lift of a
+pen that touched down elsewhere may reach the surface it was moved over,
+so a sandbox could otherwise arm the gate by moving its window under a
+pen or button held down elsewhere. A tablet frame that holds a
+`proximity_in` or `proximity_out` arms nothing either: the protocol has the compositor
+itself send `down` and held buttons when a pen already touching the
+tablet enters a surface.
+
+A drop into the sandbox does not arm the gate at all. The release that
+ends a drag belongs to the implicit grab of the client the drag started
+from, and what the drop target is sent is `wl_data_device.drop`, after
+which "the destination can still perform wl_data_offer.receive
+requests". So after a `drop` the proxy forwards a `receive` on that
+drag's own `wl_data_offer`, the one named in the `wl_data_device.enter`
+before it, until the client sends `finish` or destroys the offer, or the
+next `enter` names another; the selection, the primary selection and the
+data-control offers stay behind the gate. A `leave` ends a drag that was
+not dropped; it does not end one that was, since a compositor may send it
+right after the drop, before the transfer the drop allows. A `receive`
+on the drag's offer before the drop, which the protocol allows so a
+target can look at the data, goes through the gate like any other.
 A key held when keyboard focus arrives is only listed in
 `wl_keyboard.enter`, which arms nothing. The second counts from the
 earliest moment the event could have reached the proxy, not from when
 the proxy read it: the last instant the proxy saw the compositor's side
 of that connection empty (nothing left to read after a read), or was
-waiting on it in `poll` with nothing unread. An empty read alone would not do: the proxy reads once per
-wake-up, so one is rare, and a key typed after a quiet minute would be
+waiting on it in `poll` with nothing unread. An empty read alone would
+not do: the proxy reads once per wake-up, so one is rare, and a key typed after a quiet minute would be
 dated a minute back. The proxy stops reading the compositor while the
 sandbox leaves a full queue unread, so a press that waited behind such a
 stall is dated at the stall's start. Input can also wait in the
@@ -563,7 +579,8 @@ every connection inside it.
 `real_wayland_proxy_leaves_no_headless_clipboard_path`,
 `policy::tests::a_clipboard_read_without_input_is_denied_on_every_offer`,
 `policy::tests::every_arming_event_opens_the_gate`,
-`policy::tests::a_key_release_does_not_open_the_gate`,
+`policy::tests::no_release_opens_the_gate`,
+`policy::tests::a_drop_allows_a_read_of_its_own_offer_and_nothing_else`,
 `policy::tests::the_gate_closes_again_one_millisecond_past_the_window`,
 `policy::tests::an_open_gate_forwards_the_read_and_says_so`,
 `policy::tests::an_offer_the_compositor_created_is_gated_like_any_other`,

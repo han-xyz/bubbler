@@ -8142,17 +8142,18 @@ fn real_wayland_proxy_refuses_a_hidden_bind() {
     assert_eq!(out.status.code(), Some(0), "{log}");
     // The refusal quotes back every part of what was asked for: which
     // interface, at which number, at which version. Version 1 is what the
-    // fixture binds at.
+    // fixture binds at. The security context keeps the global from the
+    // proxy's own connection too, so to the proxy it was never offered.
     assert_eq!(
         said.trim(),
         format!(
-            "refused: bind of hidden global {interface} (name {number}, v1) \
+            "refused: bind of unoffered global {interface} (name {number}, v1) \
              refused by the sandbox proxy"
         ),
         "the bind was not refused as expected: {log}"
     );
     assert!(
-        log.contains("bubbler-wl-proxy: connection closed: bind of hidden global"),
+        log.contains("bubbler-wl-proxy: connection closed: bind of unoffered global"),
         "{log}"
     );
 }

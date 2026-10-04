@@ -66,6 +66,10 @@
   `bubbler-wl-proxy`, or send control sequences through it to a terminal:
   the MIME type of a clipboard read and the interface of a refused bind are
   written escaped and cut at 128 bytes.
+- No release opens the Wayland clipboard gate any more: a mouse button or
+  key release, a touch lift and a pen lift or button release allow no
+  paste, since the protocol does not say which application a release goes
+  to. Presses still do.
 
 ### Changed
 
@@ -91,6 +95,9 @@
   press, now allow a paste under the Wayland clipboard gate like a key press
   or a mouse click; one sent as the pen enters or leaves a window, a pen
   lift and a button release do not.
+- Drag-and-drop into a sandboxed application now delivers its data under
+  the Wayland clipboard gate: after the drop, the application may read the
+  dragged data until it finishes with it, without opening the clipboard.
 - An application no longer loses its Wayland connection when a monitor
   goes away just as it binds the output (a KVM switch, a dock, a display
   waking from sleep): `bubbler-wl-proxy` forwards a bind of a global the

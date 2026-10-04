@@ -53,6 +53,9 @@ const DISPLAY_ERROR: u16 = 0;
 /// bind racing the removal arrives within one round trip of it.
 const MAX_REMOVED_GLOBALS: usize = 64;
 
+/// How long after its removal a global stays bindable.
+const REMOVED_GLOBAL_LIFETIME: Duration = Duration::from_secs(3);
+
 /// Whether a clipboard read has to follow user input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gate {
@@ -117,9 +120,17 @@ pub struct Connection {
     globals: HashMap<u32, Global>,
     // Withdrawn after being offered, oldest first: still bindable, since
     // libwayland lets a bind that raced the removal through.
-    removed: VecDeque<(u32, Global)>,
+    removed: VecDeque<(u32, Global, Instant)>,
     // Per tablet tool, what its unfinished frame held so far.
     tool_frames: HashMap<u32, ToolFrame>,
+    // Per data device, the offer of the drag that entered it last.
+    drags: HashMap<u32, Drag>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Drag {
+    offer: u32,
+    dropped: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -192,12 +203,11 @@ impl Policy {
     /// Record user input at `now`: from here a clipboard read is forwarded for
     /// [`GATE_WINDOW`].
     ///
-    /// What arms it: `wl_keyboard.key` pressed, `wl_pointer.button` either
-    /// way, and `wl_touch.down` or `.up` — the release of each, because that
-    /// is where a drag ends and where a paste is asked for. A tablet tool's
-    /// `frame` arms when it holds a `down` or a pressed `button` and no
-    /// `proximity_in` or `proximity_out`; a tablet pad's `button` only when
-    /// pressed. Input dated before the last one leaves it as it is.
+    /// What arms it: `wl_keyboard.key` and `wl_pointer.button` pressed, and
+    /// `wl_touch.down`; no release arms. A tablet tool's `frame` arms when it
+    /// holds a `down` or a pressed `button` and no `proximity_in` or
+    /// `proximity_out`; a tablet pad's `button` only when pressed. Input
+    /// dated before the last one leaves it as it is.
     pub fn arm(&mut self, now: Instant) {
         self.last_input = self.last_input.max(Some(now));
     }
@@ -223,7 +233,7 @@ impl Policy {
             return self.bind(msg, conn, audit, now);
         }
         let action = match msg.from_client {
-            true => self.request(msg, audit, now),
+            true => self.request(msg, conn, audit, now),
             false => self.event(msg, conn, now),
         };
         if action == Action::Forward {
@@ -242,7 +252,17 @@ impl Policy {
 
     /// Requests: the clipboard gate. Everything else the client sends is the
     /// compositor's business, not the proxy's.
-    fn request(&mut self, msg: &mut Incoming<'_>, audit: &mut Audit, now: Instant) -> Action {
+    fn request(
+        &mut self,
+        msg: &mut Incoming<'_>,
+        conn: &mut Connection,
+        audit: &mut Audit,
+        now: Instant,
+    ) -> Action {
+        if msg.interface.name == "wl_data_offer" && matches!(msg.message.name, "finish" | "destroy")
+        {
+            conn.drags.retain(|_, drag| drag.offer != msg.object);
+        }
         if msg.message.name != "receive" || GATED_OFFERS.binary_search(&msg.interface.name).is_err()
         {
             return Action::Forward;
@@ -258,6 +278,12 @@ impl Policy {
                 now,
                 &format!("bubbler-wl-proxy: clipboard read allowed (open): {iface}, {mime}"),
             );
+            return Action::Forward;
+        }
+        // `wl_data_device.drop`: "the destination can still perform
+        // wl_data_offer.receive requests" on the offer of that drag.
+        let dropped_here = |drag: &Drag| drag.dropped && drag.offer == msg.object;
+        if msg.interface.name == "wl_data_offer" && conn.drags.values().any(dropped_here) {
             return Action::Forward;
         }
         let age = self
@@ -291,7 +317,8 @@ impl Policy {
                 self.tool_event(msg, name, conn, now)
             }
             ("wl_registry", "global") => return self.global(msg, conn),
-            ("wl_registry", "global_remove") => return Self::global_remove(msg, conn),
+            ("wl_registry", "global_remove") => return Self::global_remove(msg, conn, now),
+            ("wl_data_device", name) => Self::drag_event(msg, name, conn),
             ("wl_display", "delete_id") => {
                 if let Some(Arg::Uint(id)) = msg.args.first() {
                     conn.objects.delete_id(*id);
@@ -325,6 +352,35 @@ impl Policy {
         }
     }
 
+    // A compositor may send `leave` right after `drop`, while the transfer
+    // the drop allows is still to come, so `leave` ends only an undropped drag.
+    fn drag_event(msg: &Incoming<'_>, name: &str, conn: &mut Connection) {
+        let device = msg.object;
+        match name {
+            "enter" => match msg.args.get(4) {
+                Some(Arg::Object(offer)) if *offer != 0 => {
+                    let drag = Drag {
+                        offer: *offer,
+                        dropped: false,
+                    };
+                    conn.drags.insert(device, drag);
+                }
+                _ => {
+                    conn.drags.remove(&device);
+                }
+            },
+            "leave" if conn.drags.get(&device).is_some_and(|drag| !drag.dropped) => {
+                conn.drags.remove(&device);
+            }
+            "drop" => {
+                if let Some(drag) = conn.drags.get_mut(&device) {
+                    drag.dropped = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// `wl_registry.global`: hide what cannot be parsed or must not be
     /// reachable, and clamp what the tables describe at a lower version.
     fn global(&self, msg: &mut Incoming<'_>, conn: &mut Connection) -> Action {
@@ -334,6 +390,7 @@ impl Policy {
             return Action::Forward;
         };
         let (name, version) = (*name, *version);
+        conn.removed.retain(|(removed, ..)| *removed != name);
         let described = iface.to_str().ok().and_then(|iface| {
             let known = tables::index_of(iface).zip(tables::lookup(iface));
             // Whatever the compositor does: `PRIVILEGED` is the proxy's
@@ -363,7 +420,7 @@ impl Policy {
 
     /// `wl_registry.global_remove`: a name this connection never saw must not
     /// be withdrawn either, or the client learns the global was there.
-    fn global_remove(msg: &mut Incoming<'_>, conn: &mut Connection) -> Action {
+    fn global_remove(msg: &mut Incoming<'_>, conn: &mut Connection, now: Instant) -> Action {
         let Some(Arg::Uint(name)) = msg.args.first() else {
             return Action::Forward;
         };
@@ -375,7 +432,7 @@ impl Policy {
             if conn.removed.len() == MAX_REMOVED_GLOBALS {
                 conn.removed.pop_front();
             }
-            conn.removed.push_back((name, global));
+            conn.removed.push_back((name, global, now));
         }
         Action::Forward
     }
@@ -415,10 +472,10 @@ impl Policy {
         // The name must have been offered, for this very interface, at this
         // version or above: a client may name a global it never saw.
         let offered = conn.globals.get(&name).or_else(|| {
-            conn.removed
-                .iter()
-                .rev()
-                .find_map(|(removed, global)| (*removed == name).then_some(global))
+            conn.removed.iter().rev().find_map(|(removed, global, at)| {
+                let recent = now.saturating_duration_since(*at) <= REMOVED_GLOBAL_LIFETIME;
+                (*removed == name && recent).then_some(global)
+            })
         });
         let bound = client_text(&wanted);
         let refused = match offered.map(|global| (global, tables::by_index(global.interface))) {
@@ -445,13 +502,12 @@ impl Policy {
 
 fn is_user_input(msg: &Incoming<'_>) -> bool {
     match (msg.interface.name, msg.message.name) {
-        // `state` is argument 3 of a key, and 1 is pressed. Both ends of
-        // a press arm otherwise: letting go of the mouse over a paste
-        // target is user input by any reading, and a touch drag *drops*
-        // on `up`, which a long drag would otherwise reach the gate a
-        // second or more after the `down` that started it.
-        ("wl_keyboard", "key") => matches!(msg.args.get(3), Some(Arg::Uint(1))),
-        ("wl_pointer", "button") | ("wl_touch", "down" | "up") => true,
+        // `state` is argument 3 of a key or a button, and 1 is pressed. No
+        // release arms: a drop is the data device's `drop`, not a release.
+        ("wl_keyboard", "key") | ("wl_pointer", "button") => {
+            matches!(msg.args.get(3), Some(Arg::Uint(1)))
+        }
+        ("wl_touch", "down") => true,
         // `state` is argument 2 of a pad button, and 1 is pressed.
         ("zwp_tablet_pad_v2", "button") => matches!(msg.args.get(2), Some(Arg::Uint(1))),
         _ => false,
@@ -899,6 +955,32 @@ mod tests {
     }
 
     #[test]
+    fn a_removed_name_announced_again_is_judged_by_the_new_announcement() {
+        let mut proxy = proxy();
+        proxy.advertise(3, "wl_output", 4);
+        remove_global(&mut proxy, 3);
+        proxy.advertise(3, "hyprland_global_shortcuts_manager_v1", 1);
+        let action = proxy.bind(3, "wl_output", 4, 5);
+        assert_eq!(
+            error_text(&action),
+            "bind of hidden global wl_output (name 3, v4) refused by the sandbox proxy"
+        );
+    }
+
+    #[test]
+    fn a_removed_global_stops_being_bindable_once_it_expires() {
+        let mut proxy = proxy();
+        proxy.advertise(3, "wl_output", 4);
+        remove_global(&mut proxy, 3);
+        proxy.now += REMOVED_GLOBAL_LIFETIME + Duration::from_millis(1);
+        let action = proxy.bind(3, "wl_output", 4, 5);
+        assert_eq!(
+            error_text(&action),
+            "bind of unoffered global wl_output (name 3, v4) refused by the sandbox proxy"
+        );
+    }
+
+    #[test]
     fn only_the_latest_removed_globals_stay_bindable() {
         let mut proxy = proxy();
         let count = u32::try_from(MAX_REMOVED_GLOBALS).expect("fits") + 1;
@@ -1016,10 +1098,7 @@ mod tests {
         for (iface, name, state) in [
             ("wl_keyboard", "key", 1),
             ("wl_pointer", "button", 1),
-            ("wl_pointer", "button", 0),
             ("wl_touch", "down", 0),
-            // A touch drag drops on the release, not on the press.
-            ("wl_touch", "up", 0),
             ("zwp_tablet_pad_v2", "button", 1),
         ] {
             let mut proxy = proxy();
@@ -1032,11 +1111,111 @@ mod tests {
     }
 
     #[test]
-    fn a_key_release_does_not_open_the_gate() {
+    fn no_release_opens_the_gate() {
+        for (iface, name) in [
+            ("wl_keyboard", "key"),
+            ("wl_pointer", "button"),
+            ("wl_touch", "up"),
+        ] {
+            let mut proxy = proxy();
+            proxy.input(iface, name, 0);
+            let (action, _read) = proxy.receive(10, "wl_data_offer", "text/plain");
+            assert_eq!(action, Action::Drop, "{iface}.{name}");
+        }
+    }
+
+    const DEVICE: u32 = 5;
+    const DRAG_OFFER: u32 = SERVER_ID_BASE + 1;
+    const SELECTION_OFFER: u32 = SERVER_ID_BASE + 2;
+
+    fn device_event(proxy: &mut Proxy, name: &str, mut args: Vec<Arg>) {
+        map(&mut proxy.conn, DEVICE, "wl_data_device", 3);
+        let action = proxy
+            .send(
+                false,
+                DEVICE,
+                "wl_data_device",
+                name,
+                &mut args,
+                &mut Vec::new(),
+            )
+            .expect("accountable");
+        assert_eq!(action, Action::Forward);
+    }
+
+    fn introduce(proxy: &mut Proxy, offer: u32) {
+        device_event(proxy, "data_offer", vec![Arg::NewId(offer)]);
+    }
+
+    fn enter(proxy: &mut Proxy, offer: u32) {
+        introduce(proxy, offer);
+        let args = vec![
+            Arg::Uint(1),
+            Arg::Object(20),
+            Arg::Fixed(0),
+            Arg::Fixed(0),
+            Arg::Object(offer),
+        ];
+        device_event(proxy, "enter", args);
+    }
+
+    #[test]
+    fn a_drop_allows_a_read_of_its_own_offer_and_nothing_else() {
         let mut proxy = proxy();
-        proxy.input("wl_keyboard", "key", 0);
-        let (action, _read) = proxy.receive(10, "wl_data_offer", "text/plain");
+        enter(&mut proxy, DRAG_OFFER);
+        let (before, _read) = proxy.receive(DRAG_OFFER, "wl_data_offer", "text/uri-list");
+        assert_eq!(before, Action::Drop, "a read before the drop");
+        device_event(&mut proxy, "drop", Vec::new());
+        let (dropped, _read) = proxy.receive(DRAG_OFFER, "wl_data_offer", "text/uri-list");
+        assert_eq!(dropped, Action::Forward);
+        introduce(&mut proxy, SELECTION_OFFER);
+        let (selection, _read) = proxy.receive(SELECTION_OFFER, "wl_data_offer", "text/plain");
+        assert_eq!(selection, Action::Drop, "the selection stays gated");
+    }
+
+    #[test]
+    fn a_drag_that_left_before_its_drop_opens_nothing() {
+        let mut proxy = proxy();
+        enter(&mut proxy, DRAG_OFFER);
+        device_event(&mut proxy, "leave", Vec::new());
+        device_event(&mut proxy, "drop", Vec::new());
+        let (action, _read) = proxy.receive(DRAG_OFFER, "wl_data_offer", "text/uri-list");
         assert_eq!(action, Action::Drop);
+    }
+
+    #[test]
+    fn a_dropped_offer_is_readable_until_it_is_finished() {
+        let mut proxy = proxy();
+        enter(&mut proxy, DRAG_OFFER);
+        device_event(&mut proxy, "drop", Vec::new());
+        device_event(&mut proxy, "leave", Vec::new());
+        let (action, _read) = proxy.receive(DRAG_OFFER, "wl_data_offer", "text/uri-list");
+        assert_eq!(action, Action::Forward, "a leave right after the drop");
+        proxy
+            .send(
+                true,
+                DRAG_OFFER,
+                "wl_data_offer",
+                "finish",
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .expect("accountable");
+        let (action, _read) = proxy.receive(DRAG_OFFER, "wl_data_offer", "text/uri-list");
+        assert_eq!(action, Action::Drop, "after finish");
+    }
+
+    #[test]
+    fn a_second_drag_replaces_the_first_offer() {
+        let mut proxy = proxy();
+        enter(&mut proxy, DRAG_OFFER);
+        device_event(&mut proxy, "drop", Vec::new());
+        enter(&mut proxy, SELECTION_OFFER);
+        let (action, _read) = proxy.receive(DRAG_OFFER, "wl_data_offer", "text/uri-list");
+        assert_eq!(action, Action::Drop);
+        device_event(&mut proxy, "drop", Vec::new());
+        let (action, _read) = proxy.receive(SELECTION_OFFER, "wl_data_offer", "text/uri-list");
+        assert_eq!(action, Action::Forward);
     }
 
     #[test]
