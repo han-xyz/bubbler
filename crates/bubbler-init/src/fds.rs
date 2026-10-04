@@ -1,15 +1,12 @@
 //! The descriptors a process was handed but was not given.
 //!
-//! Every descriptor a parent leaves open without `FD_CLOEXEC` is inherited,
-//! and neither bubbler nor its supervisor picks its parent: a shell, a
-//! terminal, a service manager or a build system opens what it likes and
-//! passes it on without meaning to. bwrap hands every descriptor it holds
-//! to the sandbox, so one nobody meant to give reaches the sandbox, its
-//! supervisor, every command exec'd in it and every sidecar of the run.
+//! Every descriptor a parent leaves open without `FD_CLOEXEC` is inherited.
+//! bwrap hands every descriptor it holds to the sandbox, so one nobody
+//! meant to give reaches the sandbox, its supervisor, every command exec'd
+//! in it and every sidecar of the run.
 //!
-//! A sweep is the answer at both ends, and the two halves are not equally
-//! safe. [`sweep_cloexec`] only marks, which no owner of a descriptor can
-//! be harmed by, so it is a safe function. [`close_strays`] closes numbers
+//! [`sweep_cloexec`] only marks, which no owner of a descriptor can be
+//! harmed by, so it is a safe function. [`close_strays`] closes numbers
 //! outright, which would be a double close and then a stolen descriptor
 //! for anything still holding one, so it is `unsafe` and has a contract.
 
@@ -19,20 +16,14 @@ use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use rustix::fs::{Dir, Mode, OFlags};
 use rustix::io::{Errno, FdFlags, fcntl_setfd};
 
-/// Where the kernel lists a process's own open descriptors.
 const FD_DIR: &str = "/proc/self/fd";
 
-/// The first descriptor a sweep looks at. Below it is the stdio every
-/// process is expected to have, which each spawn sets up for itself.
+// Below it is the stdio every process is expected to have, which each
+// spawn sets up for itself.
 const FIRST: RawFd = 3;
 
 /// Mark every descriptor above stdio close-on-exec except the ones `keep`
 /// names, so the next spawn inherits only what it was built to.
-///
-/// Nothing is closed and no descriptor changes hands: an owner keeps its
-/// own, and a flag that was going to be set on it for the spawn anyway is
-/// set a moment earlier. For a process that has descriptors of its own to
-/// go on using — bubbler during a run.
 ///
 /// Only one thread may spawn while a sweep's result stands, since the
 /// flag is process-wide state, and a descriptor that has gone away by
@@ -55,11 +46,6 @@ pub fn sweep_cloexec(keep: &[RawFd]) -> io::Result<()> {
 }
 
 /// Close every descriptor above stdio except the ones `keep` names.
-///
-/// For a process that holds nothing above stdio of its own, so an
-/// unasked-for descriptor is gone from it as well as from its children —
-/// the supervisor at the top of `main`, where the sandbox's whole
-/// descriptor table is whatever bwrap passed through.
 ///
 /// # Safety
 ///
@@ -84,9 +70,8 @@ pub unsafe fn close_strays(keep: &[RawFd]) -> io::Result<()> {
     Ok(())
 }
 
-/// Every descriptor above stdio this process holds that `keep` does not
-/// name. The listing's own descriptor is never among them, and it is
-/// closed before the caller acts on the numbers.
+// The listing's own descriptor is never among them, and it is closed
+// before the caller acts on the numbers.
 fn strays(keep: &[RawFd]) -> io::Result<Vec<RawFd>> {
     let dir = rustix::fs::open(
         FD_DIR,
