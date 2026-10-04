@@ -10,9 +10,6 @@ include!(concat!(env!("OUT_DIR"), "/tables.rs"));
 
 /// The wire kind of one argument, which is all the codec needs: how many
 /// bytes it occupies and whether it carries a file descriptor or an object id.
-///
-/// `Int` and `Uint` differ only in how the value reads; both are four bytes,
-/// and an argument the XML types as an enum is recorded as `Uint`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArgKind {
     /// Signed 32-bit integer.
@@ -115,15 +112,7 @@ pub fn by_index(index: usize) -> Option<&'static Interface> {
 
 /// The globals the fallback denylist lets a sandbox bind: every interface in
 /// [`INTERFACES`] that no other interface's `new_id` creates and that the
-/// `PRIVILEGED` denylist does not hide. Ordinary application protocols — the
-/// client's own surfaces, buffers, input and windows — the two legacy shells,
-/// and `wl_display`, which nothing creates either and which object 1 always
-/// is.
-///
-/// Written down so a `wayrs-protocols` bump cannot quietly widen what the
-/// fallback path offers. A global in neither list fails
-/// `every_bindable_global_is_denied_or_written_down`, and that failure is the
-/// moment someone decides whether the new protocol is privileged.
+/// `PRIVILEGED` denylist does not hide.
 pub const ALLOWED_GLOBALS: &[&str] = &[
     "ext_background_effect_manager_v1",
     "wl_compositor",
