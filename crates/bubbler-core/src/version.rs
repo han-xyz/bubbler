@@ -85,9 +85,8 @@ pub fn parse(name: &str, output: &str) -> Version {
 }
 
 /// Ask `program` for its version. Nothing about the answer is trusted
-/// beyond its shape, and every failure — a missing binary, a non-zero
-/// exit, output that is not UTF-8 — is [`Version::Unknown`] rather than
-/// an error: a version check must never be what stops a run.
+/// beyond its shape, and every failure is [`Version::Unknown`] rather
+/// than an error: a version check must never be what stops a run.
 pub fn probe(program: &Path, name: &str) -> Version {
     // No stdin and no stderr: this runs before the descriptor sweep a
     // spawn makes, and the answer is one line on stdout.
@@ -123,13 +122,8 @@ pub fn proxy(env: &Env) -> Version {
 }
 
 /// The advisory lines a launch prints on stderr, in the order it prints
-/// them. Nothing silences them: the whole point of the bwrap line is
-/// that the host tool cannot enforce what bubbler configured, and a
-/// configuration that could turn it off would be one nobody reads.
-///
-/// The proxy line is printed only for a config that starts the proxy —
-/// `dbus`, `portals`, `a11y` or `system-bus` — since a sandbox with no
-/// bus is not exposed to what its advisories describe.
+/// them. The proxy line is printed only for a config that starts the
+/// proxy — `dbus`, `portals`, `a11y` or `system-bus`.
 pub fn warnings(bwrap: Version, proxy: Version, services: &[Service]) -> Vec<String> {
     let mut out = Vec::new();
     if bwrap.below(BWRAP_FLOOR) {
