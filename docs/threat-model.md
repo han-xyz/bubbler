@@ -1045,10 +1045,32 @@ a hidden source — its description in `port.alias`, its node's id, its
 channels and format — and every link to or from one (measured, PipeWire
 1.6.9, WirePlumber 0.5.18). The linking hook now hides each port and
 link of those nodes from every context without `microphone`: from one
-connected before the node, from one connected after, and under a
-WirePlumber restarted with both already in the graph (measured). Each
-appears to such a context for the instant between the daemon adding it
-and WirePlumber hiding it, as the node itself does.
+connected before the node, from one connected after, and from one that
+connects after WirePlumber restarted with both already in the graph
+(measured). `Audio/Source` counts anywhere in the class, in the drop-in
+and in the hook alike.
+
+An object that appears while a sandbox is connected is announced to that
+sandbox by PipeWire before WirePlumber hides it. This covers a microphone
+plugged in, any new source, the source's ports and links, and a camera
+node. The sandbox therefore learns that the object exists, and its
+properties (name, id, format), at that moment. No audio flows. Objects
+already present when the sandbox connects are never shown to it. Nodes
+have behaved this way since 0.23; ports and links behave the same way
+(measured, PipeWire 1.6.9, WirePlumber 0.5.18).
+
+A WirePlumber restart does the same for a sandbox that stays connected
+across it: the restarted WirePlumber announces the ports and links of the
+hidden capture nodes to that sandbox again, and then hides them again
+(measured). The nodes themselves are not announced again.
+
+A node's client sets its class and may change it later. When a node turns
+into a capture or video node, the hook hides the node, its ports and its
+links from every sandbox connected at that time. A sandbox that connects
+afterwards still sees the node, but not its ports or links. The
+permission manager matches the class the node was created with, and an
+entry the hook sets before the manager attaches does not survive the
+attach (both measured).
 
 Every camera node (`Video/Source`, `Video/Sink`, `Video/Duplex`) and
 every video stream (`Stream/Output/Video`, `Stream/Input/Video`) is
@@ -1059,8 +1081,10 @@ read and execute, and saw other clients' video streams read-only (measured,
 PipeWire 1.6.9, WirePlumber 0.5.18). The stream rule's `r` leaves video
 streams out explicitly. Where two rules of a permission manager matched one
 node, the stream rule's `r` was applied whichever rule came first
-(measured). The same hiding applies to a sandbox's own video stream. An
-audio grant has no use for one.
+(measured). The same hiding applies to a sandbox's own video stream. The
+drop-in's rules cannot tell a node's owner from any other client. A video
+node that appears while a sandbox is connected is announced to it first,
+as above.
 
 Card objects (`Audio/Device`) stay visible to every audio context, with
 their profiles and routes. A card holding only a microphone, and the input
@@ -1313,6 +1337,12 @@ recognised `pipewire.sec.bubbler.audio` value, or none at all, lands in the base
 ahead of the grant-specific one rather than falling through to
 WirePlumber's own default, so a typo in the property still narrows
 rather than widens.
+
+**Does not defend:** an object's arrival. A source, a camera, or a port or
+link of either, that appears while a sandbox is connected is announced to
+that sandbox, with its properties, before WirePlumber hides it. Ports and
+links are announced again across a WirePlumber restart. Card objects and
+their profiles stay visible.
 
 **Does not defend:** absence. Measured on this host (WirePlumber 0.5.15):
 a `restricted` client with no matching `access.rules` entry does not get

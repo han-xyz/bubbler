@@ -10,9 +10,18 @@
   saved volume or mute. A sandbox's stream named like a host application
   still starts at that application's saved volume.
 - A sandbox without the `microphone` grant no longer sees the ports of a
-  source it cannot see, nor a link to or from one: they named the
-  microphone (`port.alias`) and gave its channels and format. 0.24.2 hid
-  the source nodes alone.
+  source it cannot see, nor a link to or from one, once the source is in
+  the graph: they named the microphone (`port.alias`) and gave its channels
+  and format. 0.24.2 hid the source nodes alone.
+- An object that appears while a sandbox is connected is still announced to
+  that sandbox by PipeWire before WirePlumber hides it. This covers a
+  microphone plugged in, a new source, its ports and links, and a camera
+  node. The sandbox learns that the object exists and its properties (name,
+  id, format) at that moment; no audio flows. Objects present before the
+  sandbox connects are never shown. Nodes have behaved this way since 0.23.
+  A WirePlumber restart announces the hidden ports and links again to a
+  sandbox that stays connected (measured on PipeWire 1.6.9, WirePlumber
+  0.5.18).
 - No sandbox with an audio grant sees a camera node (`Video/*`), another
   client's video stream, or their ports and links any more, whatever its
   grant. Cameras go through the portal. Card objects (`Audio/Device`) with
