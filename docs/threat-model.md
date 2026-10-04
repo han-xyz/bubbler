@@ -2087,8 +2087,10 @@ have planted it. Remove it from {host}/ to continue.` A component the sweep
 cannot even read — a directory `chmod 000`'d along the way, say — refuses the
 launch the same way rather than guessing what is behind it:
 `refusing to start: cannot check whether {path} is a symlink in {tree}
-({host}: {error}); make it readable or remove it.` Nothing is deleted either
-way; the sweep only reads. It does not run under `--dry-run` or `--explain`,
+({host}: {error}); make it readable or remove it.` The mode does not protect
+such a directory: bwrap creates the destination as root of its user
+namespace, which no mode stops. Nothing is deleted either way; the sweep only
+reads. It does not run under `--dry-run` or `--explain`,
 which bind nothing.
 
 **Does not defend:** TOCTOU. There is no per-instance lock, so a second
