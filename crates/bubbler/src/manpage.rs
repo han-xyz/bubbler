@@ -191,9 +191,11 @@ const ENVIRONMENT: &[(&str, &str)] = &[
          and $VAR in them are not expanded. VISUAL wins.",
     ),
     (
-        "BUBBLER_INIT, BUBBLER_DBUS_PROXY, BUBBLER_WL_PROXY, BUBBLER_NET_PROXY, BUBBLER_PASTA",
-        "Replace the bubbler-init, xdg-dbus-proxy, bubbler-wl-proxy, bubbler-net-proxy and \
-         pasta binaries a run uses; each must name a regular file. For tests and debugging.",
+        "BUBBLER_INIT, BUBBLER_DBUS_PROXY, BUBBLER_WL_PROXY, BUBBLER_NET_PROXY, BUBBLER_PASTA, \
+         BUBBLER_PW_METADATA",
+        "Replace the bubbler-init, xdg-dbus-proxy, bubbler-wl-proxy, bubbler-net-proxy, pasta \
+         and pw-metadata binaries a run uses; each must name a regular file. For tests and \
+         debugging.",
     ),
     (
         "BUBBLER_PROFILE_DIR",
@@ -320,8 +322,9 @@ const CHECK_LINES: &[(&str, &str)] = &[
         "audio-policy-not-loaded",
         "A `pipewire` or `pulseaudio` grant where the running WirePlumber has not loaded \
          this bubbler's policy, or another revision of it: the grant is not enforced as \
-         configured until `systemctl --user restart wireplumber`. A note instead where \
-         WirePlumber could not be asked.",
+         configured until `systemctl --user restart wireplumber`. Held back where a policy \
+         file is missing or differs, whose own warning comes first; `lint-allow` silences \
+         the run warning as well. A note instead where WirePlumber could not be asked.",
     ),
     (
         "bundle-without-dbus",
