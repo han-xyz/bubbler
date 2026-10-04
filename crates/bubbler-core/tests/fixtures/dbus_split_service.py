@@ -1,6 +1,5 @@
-# Answers every method call addressed to it, whatever the interface, so
-# a refusal can only have come from the proxy in front of it. `Emit`
-# also broadcasts `Tick` on the interface and path given.
+# Answers every method call, whatever the interface, so a refusal can only have come from the
+# proxy in front of it. `Emit` also broadcasts `Tick` on the interface and path given.
 import sys
 
 import dbus

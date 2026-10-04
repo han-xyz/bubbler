@@ -1,12 +1,5 @@
-//! xdg-dbus-proxy's `call` filter measured on a private bus.
-//!
-//! xdg-dbus-proxy(1) says a name filtered to some interfaces is "considered
-//! to be (at least) TALK" once the client has called it or received one of
-//! its broadcasts. Each test here makes that call and receives that
-//! broadcast on one connection, then asks for an interface outside the rule,
-//! by the well-known name and by the unique one. Every process is the
-//! test's own, on a bus of its own: nothing reaches the session or system
-//! bus.
+//! xdg-dbus-proxy(1) says a filtered name becomes "(at least) TALK" once called or heard;
+//! measured here on a private bus whether that lets a call outside the rule through.
 
 use std::fs::File;
 use std::process::{Child, Command, Stdio};
@@ -27,18 +20,7 @@ const CLIENT: &str = concat!(
 const SERVED: &str = "served";
 const REFUSED: &str = "refused org.freedesktop.DBus.Error.AccessDenied";
 
-/// Write a skip reason to descriptor 2 itself: libtest's capture holds
-/// `eprintln!` until a test fails, and a skip nobody sees is not acted on.
-fn say(line: &str) {
-    let text = format!("{line}\n");
-    let mut rest = text.as_bytes();
-    while !rest.is_empty() {
-        match rustix::io::write(rustix::stdio::stderr(), rest) {
-            Ok(0) | Err(_) => return,
-            Ok(n) => rest = &rest[n..],
-        }
-    }
-}
+include!("support/say.rs");
 
 /// What this host lacks for the probe, if anything.
 fn missing() -> Option<String> {
@@ -54,7 +36,10 @@ fn missing() -> Option<String> {
         }
     }
     let python = Command::new(PYTHON)
-        .args(["-c", "import dbus, gi"])
+        .args([
+            "-c",
+            "import dbus.mainloop.glib; from gi.repository import GLib",
+        ])
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|s| s.success());
@@ -192,7 +177,7 @@ fn assert_row(transcript: &str, label: &str, verdict: &str) {
 const SPLIT: &str = "org.example.Split";
 const OBJECT: &str = "/org/example/Obj";
 
-/// The rows the brief's split takes, on the object at `OBJECT`.
+/// Rows a-f against the Allowed/Denied split, on the object at `OBJECT`.
 fn split_steps() -> Vec<String> {
     let at =
         |label: &str, target: &str, method: &str| format!("{label} {target} {OBJECT} {method}");
@@ -315,6 +300,16 @@ fn portals_still_refuse_screencast_after_a_settings_call_and_broadcast() {
         ),
         at("e3", "name", "org.freedesktop.DBus.Properties.Set"),
         at("e4", "unique", "org.freedesktop.DBus.Properties.Set"),
+        at(
+            "e5",
+            "name",
+            "org.freedesktop.DBus.Properties.GetAll org.freedesktop.portal.ScreenCast",
+        ),
+        at(
+            "e6",
+            "name",
+            "org.freedesktop.DBus.Properties.Get org.freedesktop.portal.RemoteDesktop AvailableDeviceTypes",
+        ),
         at("f0", "name", "org.freedesktop.portal.Settings.Emit"),
         "wait".to_owned(),
         at(
@@ -343,6 +338,8 @@ fn portals_still_refuse_screencast_after_a_settings_call_and_broadcast() {
         ("e2", SERVED),
         ("e3", REFUSED),
         ("e4", REFUSED),
+        ("e5", SERVED),
+        ("e6", SERVED),
         ("f0", SERVED),
         ("wait", "1 signals"),
         ("f1", REFUSED),

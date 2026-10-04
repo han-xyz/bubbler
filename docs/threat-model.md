@@ -797,8 +797,16 @@ Measured with xdg-dbus-proxy 0.1.9 on a private bus
 (`crates/bubbler-core/tests/real_dbus_proxy.rs`): after an allowed call and
 an allowed broadcast on one connection, a call to an interface or path the
 `call` rules do not name is still refused, by the well-known name and by
-the owner's unique name, and with the `portals` rules `ScreenCast` stays
-refused after a `Settings` call and signal.
+the owner's unique name. With the `portals` rules, what stays refused after
+a `Settings` call and signal is a method call on an interface outside the
+split (`ScreenCast.CreateSession`, `RemoteDesktop.CreateSession`) and
+`Properties.Set`. What stays readable is every interface's properties on the
+portal object: the `Properties.Get` and `GetAll` rules match the method and
+path, never the interface named in the message body, so
+`GetAll("org.freedesktop.portal.ScreenCast")` and
+`Get("org.freedesktop.portal.RemoteDesktop", "AvailableDeviceTypes")` are
+answered, as is `Introspect`. That reads versions and capability flags such
+as the source and device types a backend offers; it grants nothing.
 
 **Does not defend:** what the rules grant. `talk` to a service is talk to
 that service, and a service reachable through the bus is as trusted as
