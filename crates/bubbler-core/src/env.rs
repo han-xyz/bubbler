@@ -34,11 +34,8 @@ pub fn is_passthrough(name: &OsStr) -> bool {
 /// directory specification asks for.
 ///
 /// A relative entry is dropped rather than resolved: that specification
-/// says every path in these variables must be absolute and that an
-/// implementation meeting a relative one is to consider it invalid and
-/// ignore it. An empty entry means the current directory and goes the
-/// same way. What it would otherwise cost is a launcher entry read from
-/// wherever the process happened to be started.
+/// says every path in these variables must be absolute. An empty entry
+/// means the current directory and goes the same way.
 pub fn xdg_dirs(value: Option<OsString>, defaults: &[&str]) -> Vec<PathBuf> {
     value
         .filter(|v| !v.is_empty())
@@ -65,10 +62,9 @@ pub struct Env {
     /// configuration after `$XDG_CONFIG_HOME`.
     pub config_dirs: Vec<PathBuf>,
     /// `$XDG_DATA_DIRS` (or `/usr/local/share:/usr/share`), in precedence
-    /// order; where an application's own desktop entry is looked up,
-    /// under `$XDG_DATA_HOME`'s copy of the same name. Absolute: the XDG
-    /// base directory specification says a relative entry is invalid, and
-    /// the binary drops it before filling this in.
+    /// order; where an application's own desktop entry is looked up.
+    /// Absolute: the XDG base directory specification says a relative
+    /// entry is invalid, and the binary drops it before filling this in.
     pub data_dirs: Vec<PathBuf>,
     /// `$XDG_RUNTIME_DIR`; required, sockets live here.
     pub runtime_dir: PathBuf,
@@ -97,10 +93,8 @@ pub struct Env {
     /// `/run/dbus/system_bus_socket` is used when it names none.
     pub dbus_system_address: Option<OsString>,
     /// `$AT_SPI_BUS_ADDRESS` as the host set it: where the session says
-    /// its accessibility bus is, which is what at-spi2's own clients
-    /// read before they ask `org.a11y.Bus`. Untrusted like the D-Bus
-    /// addresses, and only a `unix:path=` address names a socket bubbler
-    /// can proxy.
+    /// its accessibility bus is. Untrusted like the D-Bus addresses, and
+    /// only a `unix:path=` address names a socket bubbler can proxy.
     pub at_spi_bus_address: Option<OsString>,
     /// `$BUBBLER_DBUS_LOG=1`: run the D-Bus proxy with `--log`, which
     /// prints every filtered message to bubbler's stderr.
