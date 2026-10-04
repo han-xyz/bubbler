@@ -16,13 +16,8 @@ use rustix::io::Errno as OsErrno;
 use crate::config::Userns;
 use crate::error::LaunchError;
 
-/// Syscalls the default filter answers with `EPERM`: the kernel keyring,
-/// NUMA and VM controls, module and kexec loading, accounting, quota, the
-/// system clock and the host name, io_uring, and the calls that reach
-/// into another process (`pidfd_getfd`, `kcmp`) — each either already
-/// unreachable in bubbler's baseline sandbox or unused by desktop apps. The
-/// argument-filtered `ioctl` rules are [`DEFAULT_IOCTL_EPERM`] instead:
-/// denying `ioctl` outright would break every program.
+/// Syscalls the default filter answers with `EPERM` — each either already
+/// unreachable in bubbler's baseline sandbox or unused by desktop apps.
 pub const DEFAULT_EPERM: &[&str] = &[
     "syslog",
     "uselib",
@@ -65,52 +60,20 @@ pub const DEFAULT_EPERM: &[&str] = &[
     "nfsservctl",
     "vm86",
     "vm86old",
-    // The kernel surface every recent mitigation bypass was written
-    // against, and nothing a desktop application needs through a
-    // sandbox: an io_uring ring is a second syscall path that the audit
-    // and LSM hooks see differently from the first. `EPERM` and not
-    // `ENOSYS`, because the kernel's own `io_uring_disabled=2` answers
-    // `EPERM` and every runtime is tested against that answer.
     "io_uring_setup",
     "io_uring_enter",
     "io_uring_register",
-    // Takes a descriptor out of another process by pidfd. The sandbox
-    // shares its pid namespace with `bubbler-init` and with every
-    // command run through the exec channel.
     "pidfd_getfd",
-    // Compares two processes' kernel objects, which tells a caller
-    // whether two descriptors are the same open file — a side channel
-    // out of the sandbox's own process tree.
     "kcmp",
 ];
 
 /// Denied with `EPERM` on top of [`DEFAULT_EPERM`], but only where the
-/// filter carries a single ABI. `modify_ldt` writes the local descriptor
-/// table, which 16-bit code and several Wine patches need. Every rule
-/// here goes in after both architectures, so it holds for both ABIs;
-/// keeping this one would break the 32-bit code the second architecture
-/// exists to filter rather than kill, which is why flatpak allows it
-/// wherever its own filter is multiarch (`flatpak-run.c`). The cost is
-/// real and not confined to 32-bit callers: on a multiarch build 64-bit
-/// code can call `modify_ldt` too, where a single-architecture filter
-/// answered `EPERM` (measured). A profile that wants it back writes
-/// `seccomp { deny "modify_ldt" }`.
+/// filter carries a single ABI.
 pub const SINGLE_ARCH_EPERM: &[&str] = &["modify_ldt"];
 
 /// Syscalls the default filter answers with `ENOSYS`, so libc falls back
-/// to the older call instead of failing: seccomp cannot inspect `clone3`'s
-/// `clone_args`, and the new mount API can rewrite the sandbox's own VFS.
-/// An application whose user namespaces are not disabled gets the mount
-/// API back ([`MOUNT_API`]); sidecars never do.
-// The mount API hole is CVE-2021-41133: rewriting the VFS a host service reads
-// through /proc/PID/root. An instance that may nest reaches that class anyway
-// through `mount` in a user namespace of its own, so these rules close it only
-// together with `userns "disable"`, which now denies both APIs the capability.
-// `mount_setattr` is left out:
-// bubblewrap 0.13 needs it for every bind mount and has no fallback, and it
-// needs CAP_SYS_ADMIN over the mount namespace, cannot clear locked flags and
-// cannot ID-map a host filesystem, so with userns and `mount` allowed it adds
-// nothing `mount(MS_REMOUNT|MS_BIND)` does not.
+/// to the older call instead of failing. An application whose user namespaces
+/// are not disabled gets the mount API back ([`MOUNT_API`]); sidecars never do.
 pub const DEFAULT_ENOSYS: &[&str] = &[
     "clone3",
     "open_tree",
@@ -122,39 +85,15 @@ pub const DEFAULT_ENOSYS: &[&str] = &[
 ];
 
 /// Syscalls answered with `ENOSYS` by *number*, because libseccomp 2.6.0
-/// has no name for them: the newest of the mount API (`open_tree_attr`),
-/// the namespace-listing call (`listns`) and `fchroot`. Numbers from
-/// `asm/unistd_64.h`; post-424 numbers are shared with i386, which
-/// `asm/unistd_32.h` confirms for 467 and 470. `fchroot` is proposed and
-/// not merged, so 472 is allocated to nothing yet and the rule denies a
-/// number that already answers `ENOSYS`;
-/// `no_numbered_rule_names_a_number_the_headers_give_to_another_call`
-/// is what fails the day a kernel gives it to some other call.
-///
-/// They are added through [`ScmpSyscall::from`] so libseccomp's name
-/// table is never consulted, and they go into the filter *before* the
-/// architectures of `EXTRA_ARCHES`: libseccomp translates a rule to a
-/// second architecture through the syscall's name, and a number the
-/// native table cannot name answers `EFAULT` instead (measured with
-/// libseccomp 2.6.0 and i386 in the filter). So these three rules hold
-/// for the build architecture alone, where the named mount-API rules of
-/// [`DEFAULT_ENOSYS`] hold for both. The name is kept beside the number
-/// so a profile can `allow` it and so the day libseccomp learns the name
-/// is a test failure rather than a duplicate rule.
+/// has no name for them. Numbers from `asm/unistd_64.h`. These three rules
+/// hold for the build architecture alone.
 // The mount-API class this closes is CVE-2021-41133; flatpak carries the
 // same numbers in `flatpak-syscalls-private.h`.
 pub const DEFAULT_ENOSYS_NUMBERED: &[(&str, i32)] =
     &[("open_tree_attr", 467), ("listns", 470), ("fchroot", 472)];
 
 /// The mount-API rules of [`DEFAULT_ENOSYS`] and [`DEFAULT_ENOSYS_NUMBERED`]
-/// that an application which may start a sandbox of its own is spared:
-/// bubblewrap is moving its bind mounts onto them, with the `mount()`
-/// fallback compiled out on distributions that assume a new kernel. Every
-/// call that creates, attaches or reconfigures a mount needs `CAP_SYS_ADMIN`
-/// in the user namespace owning the mount namespace, which only a user
-/// namespace of the sandbox's own grants, so with `userns "disable"` they
-/// stay denied; `open_tree` without `OPEN_TREE_CLONE` only opens an `O_PATH`
-/// descriptor, which `open` already gives.
+/// that an application which may start a sandbox of its own is spared.
 pub const MOUNT_API: &[&str] = &[
     "open_tree",
     "move_mount",
@@ -183,12 +122,8 @@ pub const TIOCSTI: u32 = 0x5412;
 /// `asm-generic/ioctls.h`.
 pub const TIOCLINUX: u32 = 0x541C;
 
-/// Architectures added to the filter beyond the one bubbler was built
-/// for. On x86_64 that is i386, so a 32-bit binary in the sandbox is
-/// filtered instead of killed by the ABI check; libseccomp translates
-/// every rule to it by name, including the `_time64` numbers glibc issues
-/// there. x32 is deliberately not among them: it shares x86_64's
-/// `AUDIT_ARCH` value, and libseccomp's own guard denies its numbers.
+// x32 is deliberately not among the extra architectures: it shares x86_64's
+// `AUDIT_ARCH` value, and libseccomp's own guard denies its numbers.
 #[cfg(target_arch = "x86_64")]
 const EXTRA_ARCHES: &[ScmpArch] = &[ScmpArch::X86];
 #[cfg(not(target_arch = "x86_64"))]
@@ -220,7 +155,6 @@ impl Errno {
         }
     }
 
-    /// The number the syscall returns, as a positive `errno` value.
     fn raw(self) -> i32 {
         match self {
             Self::Eperm => OsErrno::PERM.raw_os_error(),
@@ -263,10 +197,7 @@ pub struct RuleSet {
     /// Syscall names denied with `ENOSYS`.
     pub enosys: Vec<String>,
     /// Syscalls denied by number, each with the name a profile names it
-    /// by and the errno it currently returns. See
-    /// [`DEFAULT_ENOSYS_NUMBERED`]; `deny` of one of these names moves
-    /// its errno here rather than pushing the bare name into `eperm` or
-    /// `enosys`, since libseccomp cannot resolve it by name either way.
+    /// by and the errno it currently returns.
     pub enosys_numbered: Vec<(String, i32, Errno)>,
     /// `ioctl` request numbers denied with `EPERM`, matched on the low 32
     /// bits of argument 1.
@@ -300,9 +231,6 @@ impl RuleSet {
         }
     }
 
-    /// The denylist of an application that may create user namespaces:
-    /// the default set without [`MOUNT_API`], so a sandbox it starts
-    /// inside this one can mount.
     fn nesting_set() -> Self {
         let mut set = Self::default_set();
         for name in MOUNT_API {
@@ -311,11 +239,9 @@ impl RuleSet {
         set
     }
 
-    /// The application's set — [`Self::default_set`] less [`MOUNT_API`]
-    /// unless `userns` is disabled — with `cfg`'s allows removed
-    /// and its denies appended, or `None` when the profile disabled the
-    /// filter. Naming `ioctl` in either list drops the
-    /// [`DEFAULT_IOCTL_EPERM`] rules.
+    /// The application's set — [`Self::default_set`] less [`MOUNT_API`] unless `userns` is
+    /// disabled — with `cfg`'s allows removed and its denies appended, or `None` when the profile
+    /// disabled the filter. Naming `ioctl` in either list drops the [`DEFAULT_IOCTL_EPERM`] rules.
     pub fn with(cfg: &SeccompConfig, userns: Userns) -> Option<Self> {
         if cfg.disable {
             return None;
@@ -338,16 +264,12 @@ impl RuleSet {
             // the name was on, and keeps a repeated `deny` from doubling.
             set.remove(name);
             if name == "ioctl" {
-                // A rule matching every request subsumes the two that
-                // match one each; keeping both would put `ioctl` in the
-                // filter twice with two different actions.
+                // A rule matching every request subsumes the two that match one each; keeping both
+                // would put `ioctl` in the filter twice with two different actions.
                 set.ioctl_eperm.clear();
             }
-            // A numbered name has no name libseccomp resolves, so pushing
-            // it into `eperm`/`enosys` like every other `deny` would only
-            // leave it unresolvable and skipped — fully allowed instead
-            // of denied. It stays in `enosys_numbered` with the errno the
-            // profile chose.
+            // A numbered name has no name libseccomp resolves, so pushing it into `eperm`/`enosys`
+            // like every other `deny` would only leave it unresolvable and skipped.
             if let Some((_, nr)) = DEFAULT_ENOSYS_NUMBERED.iter().find(|(n, _)| n == name) {
                 set.enosys_numbered.push((name.clone(), *nr, *errno));
                 continue;
@@ -367,41 +289,30 @@ impl RuleSet {
     }
 }
 
-/// Mask applied to `ioctl`'s request argument, so the rule looks at the
-/// low 32 bits — the same half the kernel hands the driver, which makes a
-/// request of `0x1_0000_5412` TIOCSTI to both.
+// Mask applied to `ioctl`'s request argument, so the rule looks at the low 32 bits — the same
+// half the kernel hands the driver, which makes a request of `0x1_0000_5412` TIOCSTI to both.
 const REQUEST_MASK: u64 = 0xFFFF_FFFF;
 
-/// Set once a compile has named its skipped rules. Which names those are
-/// follows from the build, not from the launch, so an instance that also
-/// starts a proxy sidecar would otherwise say it all twice.
+// Set once a compile has named its skipped rules. Which names those are
+// follows from the build, not from the launch, so an instance that also
+// starts a proxy sidecar would otherwise say it all twice.
 static NOTED: AtomicBool = AtomicBool::new(false);
 
-/// Whether this compile is the one that names `skipped` on stderr: the
-/// first that has anything to name. A compile that failed, or that
-/// skipped nothing, leaves the report to the next one.
 fn take_note(skipped: &[String], noted: &AtomicBool) -> bool {
     !skipped.is_empty() && !noted.swap(true, Ordering::Relaxed)
 }
 
-/// One build's output: the filter, how many rules reached it, and the
-/// names this libseccomp did not know.
 struct Built {
     filter: ScmpFilterContext,
     rules: usize,
     skipped: Vec<String>,
 }
 
-/// The rule set as one loadable BPF program for `--add-seccomp-fd`, or
-/// `None` when no rule went in — an `allow` list that takes every rule
-/// back, or names this libseccomp does not know. Everything not named is
-/// allowed, and `log` turns matches into audit log entries instead of
+/// The rule set as one loadable BPF program for `--add-seccomp-fd`, or `None` when no rule went
+/// in. Everything not named is allowed, and `log` turns matches into audit log entries instead of
 /// errors.
 pub fn compile(set: &RuleSet, log: bool) -> Result<Option<Program>, LaunchError> {
     let built = build(set, log)?;
-    // A skipped name is a rule that is not in the filter, so it is
-    // reported whatever the log switch says: the alternative is a
-    // silently weaker sandbox on a libseccomp too old for the list.
     if take_note(&built.skipped, &NOTED) {
         for name in &built.skipped {
             eprintln!("bubbler: seccomp: {name} unknown to this libseccomp, rule skipped");
@@ -410,10 +321,8 @@ pub fn compile(set: &RuleSet, log: bool) -> Result<Option<Program>, LaunchError>
     if built.rules == 0 {
         return Ok(None);
     }
-    // The prefix goes out only together with libseccomp's program: it
-    // ends by falling into libseccomp's first instruction, so on its own
-    // it is not a filter the kernel would accept. A rule set that keeps
-    // the prefix and no rule at all is therefore no filter either.
+    // The prefix goes out only together with libseccomp's program: it ends by falling into
+    // libseccomp's first instruction, so on its own it is not a filter the kernel would accept.
     let mut bytes = match set.personality {
         true => personality_prefix(log),
         false => Vec::new(),
@@ -425,30 +334,18 @@ pub fn compile(set: &RuleSet, log: bool) -> Result<Option<Program>, LaunchError>
     }))
 }
 
-/// `set` as a libseccomp filter over [`ARCHES`], allowing everything it
-/// does not name. A syscall appears once even if both lists carry it:
-/// libseccomp refuses a second action for the same number, and the first
-/// list `RuleSet` puts it on decides.
+// A syscall appears once even if both lists carry it: libseccomp refuses a second action for
+// the same number, and the first list `RuleSet` puts it on decides.
 fn build(set: &RuleSet, log: bool) -> Result<Built, LaunchError> {
     let mut filter = ScmpFilterContext::new(ScmpAction::Allow).map_err(failed)?;
     // A syscall from an ABI the filter does not carry cannot be matched
-    // by number — x32 shares x86_64's `AUDIT_ARCH` value and offsets
-    // every number by `__X32_SYSCALL_BIT` — so such a caller is killed
-    // rather than let through. `man 2 seccomp` requires exactly this of
-    // any policy that does not enumerate the x32 numbers as well.
+    // by number, so such a caller is killed rather than let through.
     filter
         .set_act_badarch(ScmpAction::KillProcess)
         .map_err(failed)?;
     let mut seen: BTreeSet<i32> = BTreeSet::new();
-    // Before the architectures on purpose: `man 3 seccomp_arch_add` says
-    // a rule added before an architecture does not reach it, and that is
-    // the only way these three go in at all. libseccomp translates a
-    // rule to another architecture through the syscall's *name*, and
-    // answers `EFAULT` for a number the native table cannot name
-    // (measured with libseccomp 2.6.0 and i386 in the filter). So the
-    // choice is a rule on the build architecture or no rule; a 32-bit
-    // binary in the sandbox still reaches these three numbers, which is
-    // recorded in `docs/threat-model.md`.
+    // Before the architectures on purpose: `man 3 seccomp_arch_add` says a rule added before an
+    // architecture does not reach it, and that is the only way these three go in at all.
     for (_, nr, errno) in &set.enosys_numbered {
         let nr = ScmpSyscall::from(*nr);
         if !seen.insert(nr.into()) {
@@ -456,9 +353,8 @@ fn build(set: &RuleSet, log: bool) -> Result<Built, LaunchError> {
         }
         filter.add_rule(action(log, *errno), nr).map_err(failed)?;
     }
-    // `man 3 seccomp_arch_add`: rules added after an architecture is
-    // added reach every architecture in the filter, and rules added
-    // before it do not. So the architectures come first.
+    // `man 3 seccomp_arch_add`: rules added after an architecture is added reach every architecture
+    // in the filter, and rules added before it do not. So the architectures come first.
     for arch in EXTRA_ARCHES {
         filter.add_arch(*arch).map_err(failed)?;
     }
@@ -505,8 +401,6 @@ fn build(set: &RuleSet, log: bool) -> Result<Built, LaunchError> {
     })
 }
 
-/// What a matching syscall gets: the error, or an audit log entry and
-/// then the syscall it asked for.
 fn action(log: bool, errno: Errno) -> ScmpAction {
     match log {
         true => ScmpAction::Log,
@@ -516,9 +410,8 @@ fn action(log: bool, errno: Errno) -> ScmpAction {
     }
 }
 
-/// The filter as the bytes bwrap reads. libseccomp writes cBPF to a file
-/// descriptor, so it goes through a memfd rather than a temporary file;
-/// `export_bpf_mem` would do it in one call but needs libseccomp 2.6.
+// libseccomp writes cBPF to a file descriptor, so it goes through a memfd rather than a
+// temporary file; `export_bpf_mem` would do it in one call but needs libseccomp 2.6.
 fn export(filter: &ScmpFilterContext) -> Result<Vec<u8>, LaunchError> {
     let io = |e: std::io::Error| LaunchError::Seccomp(format!("exporting the filter: {e}"));
     let fd = rustix::fs::memfd_create("bubbler-seccomp", MemfdFlags::CLOEXEC)
@@ -532,30 +425,26 @@ fn export(filter: &ScmpFilterContext) -> Result<Vec<u8>, LaunchError> {
 }
 
 /// The persona values a sandbox may set: `PER_LINUX`, `PER_LINUX32`,
-/// `UNAME26`, both together, and the query. Everything else — the
-/// `ADDR_NO_RANDOMIZE`, `READ_IMPLIES_EXEC` and `MMAP_PAGE_ZERO` that
-/// turn off an exploit mitigation among them — is `EPERM`. Values from
+/// `UNAME26`, both together, and the query. Values from
 /// `linux/personality.h`.
 pub const PERSONALITY_ALLOWED: [u32; 5] = [0x0, 0x8, 0x2_0000, 0x2_0008, 0xffff_ffff];
 
-/// `AUDIT_ARCH_X86_64` and `AUDIT_ARCH_I386` from `linux/audit.h`.
+// `AUDIT_ARCH_X86_64` and `AUDIT_ARCH_I386` from `linux/audit.h`.
 const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 const AUDIT_ARCH_I386: u32 = 0x4000_0003;
-/// `__NR_personality` from `asm/unistd_64.h` and `asm/unistd_32.h`.
+// `__NR_personality` from `asm/unistd_64.h` and `asm/unistd_32.h`.
 const NR_PERSONALITY_X86_64: u32 = 135;
 const NR_PERSONALITY_I386: u32 = 136;
-/// Instruction codes from `linux/bpf_common.h`: `BPF_LD | BPF_W |
-/// BPF_ABS`, `BPF_JMP | BPF_JEQ | BPF_K`, `BPF_JMP | BPF_JA` and
-/// `BPF_RET | BPF_K`.
+// Instruction codes from `linux/bpf_common.h`.
 const BPF_LD_W_ABS: u16 = 0x0020;
 const BPF_JEQ_K: u16 = 0x0015;
 const BPF_JA: u16 = 0x0005;
 const BPF_RET_K: u16 = 0x0006;
-/// Filter return values from `linux/seccomp.h`.
+// Filter return values from `linux/seccomp.h`.
 const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 const SECCOMP_RET_LOG: u32 = 0x7ffc_0000;
 
-/// One `struct sock_filter` as its little-endian bytes.
+// One `struct sock_filter` as its little-endian bytes.
 fn insn(code: u16, jt: u8, jf: u8, k: u32) -> [u8; 8] {
     let mut b = [0u8; 8];
     b[..2].copy_from_slice(&code.to_le_bytes());
@@ -567,20 +456,12 @@ fn insn(code: u16, jt: u8, jf: u8, k: u32) -> [u8; 8] {
 
 /// A cBPF block that returns `EPERM` (or logs) for `personality` with an
 /// argument outside [`PERSONALITY_ALLOWED`] and otherwise falls off its
-/// end, so it can be placed before libseccomp's program: cBPF jumps are
-/// relative and forward, so a block whose last instruction jumps to the
-/// one after it is a prefix of any program. libseccomp cannot express a
-/// per-argument allowlist in a default-allow filter — two comparisons on
-/// one argument are `EINVAL` and an `ALLOW` rule is `EACCES` — which is
-/// why this is written by hand.
+/// end, so it can be placed before libseccomp's program.
 ///
 /// Offsets are `struct seccomp_data` from `linux/seccomp.h`: `nr` 0,
 /// `arch` 4, `args[0]` 16, of which the low word is what the kernel
 /// reads, `personality` taking an `unsigned int`. The comment on each
 /// line is its index, and a jump from index `i` lands at `i + 1 + jt`.
-/// Where the filter carries no i386 the second branch never matches and
-/// the main program kills the foreign ABI after the prefix falls
-/// through.
 pub(crate) fn personality_prefix(log: bool) -> Vec<u8> {
     let deny = match log {
         true => SECCOMP_RET_LOG,
@@ -610,12 +491,10 @@ fn failed(e: SeccompError) -> LaunchError {
     LaunchError::Seccomp(e.to_string())
 }
 
-/// The number libseccomp resolves `name` to on the build architecture, or
-/// `None` when this libseccomp does not know the name at all. A syscall
-/// the build architecture does not itself have — `clock_adjtime64` on
-/// x86_64, say — answers with a negative pseudo-number that still names
-/// a real rule on the other architectures in the filter, so only the
-/// sign of the answer tells the two apart.
+/// The number libseccomp resolves `name` to on the build architecture, or `None` when this
+/// libseccomp does not know the name at all. A syscall the build architecture does not itself
+/// have answers with a negative pseudo-number that still names a real rule on the other
+/// architectures in the filter.
 pub fn syscall_number(name: &str) -> Option<i64> {
     ScmpSyscall::from_name(name)
         .ok()
