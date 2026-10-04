@@ -53,7 +53,6 @@ const DISPLAY_ERROR: u16 = 0;
 /// bind racing the removal arrives within one round trip of it.
 const MAX_REMOVED_GLOBALS: usize = 64;
 
-/// How long after its removal a global stays bindable.
 const REMOVED_GLOBAL_LIFETIME: Duration = Duration::from_secs(3);
 
 /// Whether a clipboard read has to follow user input.

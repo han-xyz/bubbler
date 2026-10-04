@@ -986,8 +986,6 @@ fn bus_rules(source: &Source) -> Vec<(&'static str, &KdlNode)> {
     out
 }
 
-/// Whether the session-bus rule `node` is one the parser refuses beside
-/// `portals`.
 fn undoes_portals(node: &KdlNode) -> bool {
     let Some(a) = arg(node) else {
         return false;
@@ -1284,7 +1282,6 @@ fn audio_policy_missing(ctx: &Context, sources: &[Source], f: &mut Findings) {
     f.push(i, node, &AUDIO_POLICY_MISSING, message, &help);
 }
 
-/// The `app-id-shared` warning, at the top of the instance's one layer.
 fn app_id_shared(ctx: &Context, f: &mut Findings) {
     let Some(other) = ctx.app_id_twin else {
         return;
@@ -1327,15 +1324,12 @@ fn audio_policy_differs(ctx: &Context, sources: &[Source], f: &mut Findings) {
 }
 
 fn audio_policy_not_loaded(ctx: &Context, sources: &[Source], f: &mut Findings) {
-    // The missing or differing files are the cause, and their findings name the fix.
     let differs_accepted = sources
         .iter()
         .flat_map(|s| top(s, "lint-allow"))
         .filter_map(arg)
         .any(|id| id == audio_policy::DIFFERS_CHECK);
-    if audio_policy::missing(ctx.host, ctx.env).is_some()
-        || (!differs_accepted && !audio_policy::differing(ctx.host, ctx.env).is_empty())
-    {
+    if audio_policy::held_back(differs_accepted, ctx.host, ctx.env) {
         return;
     }
     let Some((i, node, name)) = audio_node(sources) else {

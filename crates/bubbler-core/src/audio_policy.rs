@@ -241,11 +241,16 @@ pub fn not_loaded_warning(
     read: impl FnOnce(&Env) -> LoadedRevision,
 ) -> Option<String> {
     cfg.audio()?;
-    let differs_reported = !cfg.accepts(DIFFERS_CHECK) && !differing(host, env).is_empty();
-    if missing(host, env).is_some() || differs_reported || cfg.accepts(NOT_LOADED_CHECK) {
+    if held_back(cfg.accepts(DIFFERS_CHECK), host, env) || cfg.accepts(NOT_LOADED_CHECK) {
         return None;
     }
     read(env).run_warning()
+}
+
+/// Whether the not-loaded check gives way to a file that is missing, or differs and that is not
+/// accepted: those findings name the fix, which a restart alone does not make.
+pub fn held_back(accepts_differs: bool, host: &dyn Host, env: &Env) -> bool {
+    missing(host, env).is_some() || (!accepts_differs && !differing(host, env).is_empty())
 }
 
 /// The audio group header's suffix: the policy missing, differing or not loaded; `""` where it is
@@ -350,16 +355,13 @@ pub const PW_DUMP: &str = "/usr/bin/pw-dump";
 
 /// The metadata object the loaded hook states its policy revision in,
 /// under [`REVISION_KEY`] on subject 0.
-pub const POLICY_METADATA: &str = "bubbler-policy";
+const POLICY_METADATA: &str = "bubbler-policy";
 
 /// The key of [`POLICY_METADATA`] that holds the revision.
-pub const REVISION_KEY: &str = "revision";
+const REVISION_KEY: &str = "revision";
 
-/// How the hook states its revision, the one place it is written down.
 const REVISION_LINE: &str = "local POLICY_REVISION = ";
 
-/// How long [`loaded_revision`] waits for an answer before it calls the
-/// revision unknown.
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The most of [`PW_DUMP`]'s output [`loaded_revision`] reads; more is
@@ -401,7 +403,7 @@ pub enum LoadedRevision {
     Current,
     /// Another, with the value it states.
     Other(String),
-    /// None: no [`POLICY_METADATA`], or one without [`REVISION_KEY`],
+    /// None: no `bubbler-policy` metadata, or one without a `revision` key,
     /// which is a hook older than revisions or none at all.
     Absent,
     /// Not known, and why: the tool is missing, the daemon unreachable,
@@ -471,7 +473,7 @@ impl LoadedRevision {
 }
 
 /// What `pw-dump` printed on stdout, read as a [`LoadedRevision`]: the
-/// [`REVISION_KEY`] on subject 0 of every metadata named [`POLICY_METADATA`] whose creator is a
+/// `revision` on subject 0 of every metadata named `bubbler-policy` whose creator is a
 /// client in the dump outside any security context, with `pipewire.access` `unrestricted` or unset.
 /// Current only where each of those states this bubbler's revision; an object of another shape is
 /// skipped.
@@ -1257,8 +1259,8 @@ mod tests {
     const HOST_TOOL: u32 = 36;
     const SANDBOX: u32 = 35;
 
-    /// A `bubbler-policy` made by `client`, shaped as the bed printed the one a playback context
-    /// published under a policy that let it.
+    // A `bubbler-policy` made by `client`, shaped as the bed printed the one a playback context
+    // published under a policy that let it.
     fn policy_by(client: u32, value: u32) -> String {
         format!(
             r#"  {{
@@ -1826,11 +1828,11 @@ mod tests {
         );
     }
 
-    /// The revision and a digest of the two policy files it was last set
-    /// for.
-    const PINNED: (u32, u64) = (7, 16712005933581669285);
+    // The revision and a digest of the two policy files it was last set
+    // for.
+    const PINNED: (u32, u64) = (7, 8792488252579200087);
 
-    /// FNV-1a, 64 bit.
+    // FNV-1a, 64 bit.
     fn digest(bytes: impl Iterator<Item = u8>) -> u64 {
         bytes.fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)

@@ -122,8 +122,8 @@ pub struct Detail {
     /// cannot be told about a bind after the fact, so an edit describes
     /// the next start.
     pub live: bool,
-    /// Kept while this config is open, since it is linted on every change; asked again on the
-    /// next open.
+    // Kept while this config is open, since it is linted on every change; asked again on the
+    // next open.
     loaded: AskedOnce,
 }
 

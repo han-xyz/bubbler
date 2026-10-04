@@ -1,5 +1,6 @@
 -- bubbler's audio policy: the links WirePlumber may not make for a
--- sandbox, and the levels it may not save of one.
+-- sandbox, the levels it may not save of one, and the ports, links and
+-- video streams it may not see.
 --
 -- Install as bubbler/refuse-links.lua in one of
 --   /usr/share/wireplumber/scripts/
@@ -41,9 +42,16 @@
 --     — so it is set on the client below.
 --
 -- So: of a bubbler sandbox's nodes only its audio streams are linked, to
--- device nodes and to its own; a capture stream only to an
--- `Audio/Source*` or `Audio/Duplex` node, and only where the instance
--- was granted `microphone`; and the sandbox links nothing itself.
+-- device nodes and to its own; a capture stream only to a node with
+-- `Audio/Source` anywhere in the class or an `Audio/Duplex` one, and only
+-- where the instance was granted `microphone`; and the sandbox links
+-- nothing itself.
+--
+-- The permission managers match a node by its class at creation and see
+-- no port or link, so the hook hides the rest itself: the ports and links
+-- of a source a context may not see, every camera node with its ports and
+-- links, every video stream but the sandbox's own, and a node whose class
+-- turned into one of these.
 --
 -- A sandbox offers no device: its nodes that are not plain audio streams,
 -- its streams that carry a link group, and its streams named after any
@@ -430,10 +438,8 @@ SimpleEventHook {
   end
 }:register ()
 
--- Whether the node belongs to a bubbler context or may: a node carrying a
--- `client.id` WirePlumber does not know yet counts as a sandbox's, so a
--- restart fails closed. A node with no `client.id` is the daemon's or
--- WirePlumber's own.
+-- A `client.id` WirePlumber does not know yet counts as a sandbox's, so a
+-- restart fails closed.
 local function may_belong_to_a_sandbox (source, node_props)
   local client_id = node_props ["client.id"]
   if not client_id then
@@ -443,12 +449,8 @@ local function may_belong_to_a_sandbox (source, node_props)
       bubbler_client (source, client_id) ~= nil
 end
 
--- Stock saves a node's volume, mute and channel volumes under a key built
--- from names its client chooses (node/state-stream.lua formKey), and
--- restores them to the next node of those names: a sandbox naming its
--- node after a host application would set that application's volume.
--- node/store-stream-props is the only hook on this event (WirePlumber
--- 0.5.18).
+-- Stock keys saved levels by names the client chooses (formKey in
+-- node/state-stream.lua); the only hook on it in WirePlumber 0.5.18.
 SimpleEventHook {
   name = "bubbler/no-saved-state-from-a-sandbox",
   before = "node/store-stream-props",
@@ -559,13 +561,13 @@ local function is_sandbox (client)
   return client.properties ["pipewire.sec.engine"] == BUBBLER_ENGINE
 end
 
--- Both bubbler's and with the instance id the security context set, which no
--- client can; another engine may carry the same id string.
+-- The owner is bubbler's too and carries the instance id the security
+-- context set, which no client can; another engine may carry the same id.
 local function same_sandbox (client, node_props)
   local instance = client.properties ["pipewire.sec.instance-id"]
   local owner_id = node_props ["client.id"]
   local source = Plugin.find ("standard-event-source")
-  if not instance or not owner_id or not source or not is_sandbox (client) then
+  if not instance or not owner_id or not source then
     return false
   end
   local owner = lookup (source, "client", owner_id)
