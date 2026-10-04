@@ -1880,6 +1880,14 @@ match:
 `<n>` is how many components the path has, counted from the path itself so the
 two can never disagree.
 
+The path is refused only where nft could not carry it inside a quoted string —
+a `"`, whitespace, a control byte or a byte outside ASCII. Everything a systemd
+unit name holds passes: `user@1000.service` is where a user session's delegated
+subtree lives, `@`, `:` and `+` are ordinary characters in one, and a `-` in a
+name arrives escaped as `\x2d`. nft resolves such a path as written and fails
+to resolve it with the backslash doubled, and a trailing `\` does not escape
+the closing quote, so passing them through is both necessary and safe.
+
 `SO_MARK` would have done the matching too, and was rejected after measuring:
 glibc's resolver opens its own sockets and the caller cannot mark them, so a
 marked proxy could not use `getaddrinfo` — and `meta skuid` cannot tell the two
@@ -1927,7 +1935,10 @@ accounting sees the whole run.
 
 **The proxy process.** `bubbler-net-proxy` is a workspace binary installed
 beside `bubbler-init` and found the same way (`$BUBBLER_NET_PROXY`, then next
-to the running `bubbler`, then `/usr/lib/bubbler/bubbler-net-proxy`), bound
+to the running `bubbler`, then `/usr/lib/bubbler/bubbler-net-proxy`), never on
+`PATH`, since the one process a name-filtered sandbox lets out must not be
+whatever else on a `PATH` answers to the name. A run with an `allow-host`
+fails to start when the binary is missing. It is bound
 read-only into the sandbox at `/run/bubbler-net-proxy` and always exec'd from
 there — it has to be visible in the mount namespace it joins. bubbler starts it
 after pasta and before the application is let go of its `--block-fd`, with a

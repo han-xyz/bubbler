@@ -1740,9 +1740,11 @@ generated rather than bound. Before pasta starts, the namespace of the
 pid bwrap reported is compared with bubbler's own, so a sandbox that died
 in between cannot make pasta configure the *host* namespace; the user
 namespace is asked of the network namespace that owns it rather than of
-the pid, which bwrap moves. A sandbox whose namespace cannot be connected
-waits at `--block-fd` and is stopped, never started without the network
-it was granted.
+the pid, which bwrap moves into a nested user namespace shortly after it
+reports `child-pid` (measured on bwrap 0.11.2, 6 runs of 6); letting pasta
+resolve `/proc/<child-pid>/ns/user` itself failed 5 times in 8. A sandbox
+whose namespace cannot be connected waits at `--block-fd` and is stopped,
+never started without the network it was granted.
 
 `outbound "deny"` narrows the namespace to what the config names. By
 address that is an nftables ruleset in the sandbox's own network
