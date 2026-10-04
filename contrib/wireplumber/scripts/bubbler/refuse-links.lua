@@ -426,7 +426,7 @@ SimpleEventHook {
 -- `client.id` WirePlumber does not know yet counts as a sandbox's, so a
 -- restart fails closed. A node with no `client.id` is the daemon's or
 -- WirePlumber's own.
-local function maybe_a_sandboxs (source, node_props)
+local function may_belong_to_a_sandbox (source, node_props)
   local client_id = node_props ["client.id"]
   if not client_id then
     return false
@@ -452,7 +452,7 @@ SimpleEventHook {
   },
   execute = function (event)
     local node = event:get_subject ()
-    if not maybe_a_sandboxs (event:get_source (), node.properties) then
+    if not may_belong_to_a_sandbox (event:get_source (), node.properties) then
       return
     end
     log:debug (node, string.format ("not saving the levels of %s (client %s)",

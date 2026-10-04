@@ -3766,8 +3766,8 @@ fn node_id(bed: &PipeWireBed, name: &str) -> String {
 
 fn levels(bed: &PipeWireBed, name: &str) -> Levels {
     let params = bed.host_tool("pw-cli", &["enum-params", &node_id(bed, name), "Props"]);
-    // An array's first element is printed two lines below its key, a
-    // scalar one line below.
+    // The first value printed after a key is a scalar's own, or an
+    // array's first element: the first channel's volume.
     let value = |key: &str| {
         params
             .lines()
@@ -3816,11 +3816,17 @@ fn restored(bed: &PipeWireBed, name: &str) {
 fn save_on_the_host(bed: &PipeWireBed, kind: &NodeKind) {
     let _first = kind.on_the_host(bed, "host-first");
     restored(bed, "host-first");
-    set_levels(bed, "host-first", "{ channelVolumes: [ 0.8, 0.8 ] }");
+    let volume = SAVED.volume;
+    set_levels(
+        bed,
+        "host-first",
+        &format!("{{ channelVolumes: [ {volume}, {volume} ] }}"),
+    );
+    let stored = format!("{volume:.6}");
     wait_for("the host node's volume in the saved state", || {
         saved_stream_state(bed)
             .lines()
-            .any(|line| line.contains(SHARED_APP) && line.contains("0.800000"))
+            .any(|line| line.contains(SHARED_APP) && line.contains(&stored))
     });
 }
 
@@ -3919,6 +3925,11 @@ fn a_host_streams_volume_is_restored_to_the_next_host_stream_of_its_name() {
 
 /// The same for a sink a `devices` context offers and a later host sink
 /// of its names.
+///
+/// The nodes share `application.name`, not `node.name` as a host device
+/// does: `pw-cat` and `pw-loopback` both give a node a `media.name` where
+/// it has none (measured on PipeWire 1.6.9), and stock keys on that before
+/// `node.name`. The hook does not depend on which name forms the key.
 #[test]
 fn a_host_sink_keeps_its_volume_when_a_devices_contexts_sink_of_its_name_is_turned_down() {
     let Some(bed) = PipeWireBed::start() else {
@@ -3941,8 +3952,10 @@ fn a_host_sink_keeps_its_volume_when_a_devices_contexts_sink_of_its_name_is_turn
     );
 }
 
-/// A context's stream turned down as WirePlumber restarts, when the
-/// WirePlumber that starts may know the stream before its client.
+/// A context's stream turned down after a WirePlumber restart: the rule
+/// holds under the WirePlumber started then, which finds the stream
+/// already in the graph. Its levels are set once that WirePlumber is up
+/// and knows the stream's client.
 #[test]
 fn a_host_stream_keeps_its_volume_when_a_contexts_stream_is_turned_down_across_a_restart() {
     let Some(mut bed) = PipeWireBed::start() else {
