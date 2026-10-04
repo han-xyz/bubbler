@@ -113,7 +113,6 @@ impl Header {
     }
 }
 
-/// Read the next 4-byte word of `body` and step `at` past it.
 fn take_word(body: &[u8], at: &mut usize) -> Result<u32, WireError> {
     let end = at.checked_add(4).ok_or(WireError::Truncated)?;
     let word = body.get(*at..end).ok_or(WireError::Truncated)?;
@@ -121,7 +120,6 @@ fn take_word(body: &[u8], at: &mut usize) -> Result<u32, WireError> {
     Ok(u32::from_ne_bytes([word[0], word[1], word[2], word[3]]))
 }
 
-/// Read `len` bytes of `body` and step `at` past them and their padding.
 fn take_bytes<'a>(body: &'a [u8], at: &mut usize, len: usize) -> Result<&'a [u8], WireError> {
     let padded = len
         .checked_next_multiple_of(4)
@@ -136,7 +134,6 @@ fn take_bytes<'a>(body: &'a [u8], at: &mut usize, len: usize) -> Result<&'a [u8]
     Ok(bytes)
 }
 
-/// Append a length prefix and the bytes it counts, padded to a whole word.
 fn put_bytes(body: &mut Vec<u8>, bytes: &[u8]) -> Result<(), WireError> {
     let len = u32::try_from(bytes.len()).map_err(|_| WireError::TooLarge(bytes.len()))?;
     body.extend_from_slice(&len.to_ne_bytes());
@@ -224,8 +221,7 @@ pub fn encode(object: u32, opcode: u16, args: &[Arg]) -> Result<Vec<u8>, WireErr
     Ok(out)
 }
 
-/// How many file descriptors a message with this signature owns. The relay
-/// needs this to take the right number off the socket's fd queue.
+/// How many file descriptors a message with this signature owns.
 pub fn fd_count(sig: &[ArgKind]) -> usize {
     sig.iter().filter(|kind| **kind == ArgKind::Fd).count()
 }
