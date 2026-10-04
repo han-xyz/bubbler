@@ -204,9 +204,8 @@ fn take_ctty(command: &mut Command) {
     }
 }
 
-// `PR_SET_NO_NEW_PRIVS` first, so nothing the supervisor `execve`s can
-// gain a privilege whatever it finds on the filesystem. The bounding set
-// before the other sets: dropping from it takes CAP_SETPCAP in effective.
+// No-new-privs first; the bounding set before the other sets, since
+// `PR_CAPBSET_DROP` takes CAP_SETPCAP in effective.
 fn harden() -> rustix::io::Result<()> {
     set_no_new_privs(true)?;
     clear_ambient_capability_set()?;

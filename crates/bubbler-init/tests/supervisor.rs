@@ -19,7 +19,6 @@ type Started = (std::process::Child, PathBuf, tempfile::TempDir);
 /// the supervisor binds for it, and `wm` the window manager program.
 /// `stray` is a descriptor the supervisor inherits without being told of
 /// it, standing in for whatever the process that started the run had open.
-/// `wrapper` is a program, with its arguments, that runs the supervisor.
 #[derive(Default)]
 struct Opts<'a> {
     wrapper: Option<&'a [&'a str]>,
@@ -391,11 +390,25 @@ fn require_namespace_root() -> bool {
             _ => "a user namespace of its own came with an empty bounding set".to_owned(),
         },
     };
-    println!("skipping: {why}");
+    say(&format!("skipping: {why}"));
     false
 }
 
-/// The `Cap*` lines of a `/proc/<pid>/status`, as name and mask.
+// Not `println!`: libtest captures it for a passing test, and a skip
+// nobody sees is a skip nobody acts on. Fd 2 itself bypasses the capture.
+fn say(line: &str) {
+    let text = format!("{line}\n");
+    let mut rest = text.as_bytes();
+    while !rest.is_empty() {
+        match rustix::io::write(std::io::stderr(), rest) {
+            Ok(0) => return,
+            Ok(n) => rest = &rest[n..],
+            Err(rustix::io::Errno::INTR) => {}
+            Err(_) => return,
+        }
+    }
+}
+
 fn capability_sets(status: &str) -> Vec<(String, u64)> {
     status
         .lines()
@@ -405,8 +418,6 @@ fn capability_sets(status: &str) -> Vec<(String, u64)> {
         .collect()
 }
 
-/// The capability sets of a main command the supervisor started, run
-/// under `wrapper` when one is given.
 fn capabilities_of_the_command(wrapper: Option<&[&str]>) -> Vec<(String, u64)> {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("status");
@@ -437,10 +448,19 @@ fn a_supervisor_holding_cap_setpcap_leaves_its_command_no_capability_at_all() {
 
 #[test]
 fn a_supervisor_without_cap_setpcap_still_runs_its_command_without_capabilities() {
+    const CAP_SETPCAP: u64 = 1 << 8;
+    let own = capability_sets(&std::fs::read_to_string("/proc/self/status").unwrap());
+    let own_mask = |set: &str| own.iter().find(|(name, _)| name == set).unwrap().1;
+    // Where this test runs with CAP_SETPCAP, as root in CI's container,
+    // the supervisor holds it too and so must empty the bounding set.
+    let bounding_left = if own_mask("CapEff") & CAP_SETPCAP == 0 {
+        own_mask("CapBnd")
+    } else {
+        0
+    };
     for (name, mask) in capabilities_of_the_command(None) {
-        if name != "CapBnd" {
-            assert_eq!(mask, 0, "{name} is {mask:x}");
-        }
+        let expected = if name == "CapBnd" { bounding_left } else { 0 };
+        assert_eq!(mask, expected, "{name} is {mask:x}");
     }
 }
 
