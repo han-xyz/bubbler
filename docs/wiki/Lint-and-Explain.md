@@ -60,7 +60,12 @@ restart WirePlumber), `audio-policy-differs` (a
 copy WirePlumber loads is not this bubbler's: under an older one a sandbox can
 claim the microphone grant; names each file and what writes it again, and
 `lint-allow "audio-policy-differs" reason="..."` accepts a copy edited on
-purpose).
+purpose), `audio-policy-not-loaded` (both files installed, and the running
+WirePlumber has not loaded this bubbler's policy or holds another revision,
+which it names: the grant is not enforced as configured until `systemctl
+--user restart wireplumber`; a note instead, naming why, where WirePlumber
+could not be asked — no `pw-metadata`, no daemon, no answer within two
+seconds).
 
 **Notes** (information): `allow-host-wildcard`, `app-runtime-rw`,
 `outbound-deny`, `ozone-hint-unnecessary`,

@@ -9,6 +9,19 @@
   sandbox naming its stream like a host application set that application's
   saved volume or mute. A sandbox's stream named like a host application
   still starts at that application's saved volume.
+- The audio policy files changed: rewrite them if they are your own copies
+  (`bubbler audio-policy --print` and `--print --script`), or update the
+  package, and restart WirePlumber; until then each run with an audio grant
+  warns that the running WirePlumber has not loaded this bubbler's policy.
+
+### Added
+
+- `bubbler run`, `try` and `open` of an instance with a `pipewire` or
+  `pulseaudio` grant warn when the running WirePlumber has not loaded this
+  bubbler's audio policy, or has loaded another revision of it, and name
+  `systemctl --user restart wireplumber`; `bubbler lint` reports
+  `audio-policy-not-loaded` (a note where WirePlumber could not be asked), and
+  `--explain` shows the loaded state beside the installed one.
 
 ## 0.25.0
 

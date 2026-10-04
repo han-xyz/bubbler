@@ -716,8 +716,22 @@ wireplumber`. A copy you edited on purpose is accepted with
 `lint-allow "audio-policy-differs" reason="..."`, which silences both the
 lint and the run warning for every config that carries it, directly or
 through a profile. The check compares the copies WirePlumber loads with
-bubbler's own; whether the running WirePlumber has loaded them, it cannot
-tell. It reads the search directories (`$XDG_CONFIG_HOME`,
+bubbler's own. Whether the running WirePlumber has loaded them is a second
+check, made for an instance with a `pipewire` or `pulseaudio` grant once both
+files are installed: the linking hook publishes its `policy revision`, and
+bubbler reads it with `pw-metadata -n bubbler-policy`. WirePlumber reads the
+policy only when it starts, so after an install or an upgrade that changed
+the policy a run prints ``bubbler: warning: the running WirePlumber has not
+loaded this bubbler's audio policy: audio grants are not enforced as
+configured; run `systemctl --user restart wireplumber` `` until WirePlumber is
+restarted, or `the running WirePlumber has loaded audio policy revision <N>,
+not this bubbler's <M>: …` where it holds another revision; `bubbler lint`
+warns `audio-policy-not-loaded` and `--explain` adds the same to the audio
+group's header. Where a file is missing, only the missing file's warning is
+printed: its fix ends in the same restart. Where WirePlumber cannot be asked
+(no `pw-metadata`, no daemon on the socket, no answer within two seconds) a
+run says nothing and `bubbler lint` notes it. The run goes on in every case.
+The first check reads the search directories (`$XDG_CONFIG_HOME`,
 `$XDG_CONFIG_DIRS`, `$XDG_DATA_HOME`, `$XDG_DATA_DIRS`) from bubbler's own
 environment, which can differ from the one WirePlumber was started with. An ALSA client reaches the same
 daemon through `/etc/alsa`, which the baseline binds: those files are where
@@ -3134,7 +3148,13 @@ is absent — an older bubbler's, under which
 a sandbox can claim the microphone grant for itself, or one you edited.
 The finding names each such file and what writes it again; accept an
 edit made on purpose with `lint-allow "audio-policy-differs"
-reason="..."`).
+reason="..."`),
+`audio-policy-not-loaded` (a `pipewire` or `pulseaudio` grant, both policy
+files installed, and the running WirePlumber has not loaded this bubbler's
+policy, or has loaded another `policy revision`, which it names: the grant
+is not enforced as configured until `systemctl --user restart wireplumber`.
+A note instead, naming why, where WirePlumber could not be asked: no
+`pw-metadata`, no daemon, or no answer within two seconds).
 
 **Notes** are information and fail nothing: `app-runtime-rw` (a shared
 application runtime directory granted `mode=rw`, so the sandbox can replace the
@@ -4361,7 +4381,11 @@ found by `$XDG_DATA_HOME`, `$XDG_DATA_DIRS` and `/usr/share`. Without the drop-i
 reaches every PipeWire node instead of what it asks for; without the
 hook beside it the grant is scoped but a sandbox can still record the
 sink's monitor ports, which carry every other application's audio. A run
-and `bubbler lint` say which of the two is missing.
+and `bubbler lint` say which of the two is missing and, once both are in
+place, whether the running WirePlumber has loaded them. After an upgrade of
+bubbler whose changelog says the policy changed, write your own copies again
+(the commands above; a package updates its copy under `/usr/share`) and
+restart WirePlumber: until then each run with an audio grant warns.
 
 Run the same commands again after an upgrade that changes the policy —
 0.24.2 does — and restart WirePlumber: a copy you wrote yourself is not

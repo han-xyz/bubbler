@@ -254,6 +254,22 @@ of it. The daemons' own names are not granted: fcitx5's carries `Exit`,
 or stop the input method for every application in the session. On Wayland the
 compositor's own text-input path needs no grant at all.
 
+## Audio
+
+`pipewire` and `pulseaudio` hand the sandbox a socket of this run's own
+PipeWire security context; what that context may reach is decided by
+bubbler's WirePlumber policy, the drop-in and the linking hook it loads (see
+[Devices](Devices.md)). Without them installed a grant reaches every PipeWire
+node, and every run and `bubbler lint` say so. WirePlumber does not save the
+volume or mute of a sandbox's nodes, its streams or a `devices` instance's
+offered devices: it would key them by names the application chooses, so a
+sandbox could set a host application's saved volume. WirePlumber loads the
+policy only when it starts; the hook publishes its revision, and while the
+running WirePlumber has not loaded this bubbler's policy a run with an audio
+grant warns and `bubbler lint` reports `audio-policy-not-loaded`. That check
+trusts the host: any process of yours can publish the same metadata, and no
+sandbox can see or create it.
+
 ## Egress proxy
 
 `allow-host` filters egress by name, and a name is no part of a packet, so the

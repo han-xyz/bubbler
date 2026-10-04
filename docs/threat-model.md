@@ -1160,6 +1160,27 @@ to the group under
 that does name the directories each file is looked for in and the
 `bubbler audio-policy --print` / `--print --script` fix.
 
+Installed files are not a loaded policy: WirePlumber reads the drop-in
+and the hook when it starts, so after an install or an upgrade the
+running one enforces whatever it loaded before, or nothing. Since 0.26.0
+the hook publishes its `policy revision` as metadata `bubbler-policy`
+(key `revision`, subject 0), and for an instance with an audio grant and
+both files installed, bubbler runs `pw-metadata -n bubbler-policy` against
+the session's PipeWire before each `run`, `try` and `open`, for `bubbler
+lint` and for `--explain`: absent metadata or another revision is a
+`bubbler: warning:` naming `systemctl --user restart wireplumber`, and an
+`audio-policy-not-loaded` lint warning. What that proves: a client of the
+session's PipeWire published that revision, which is what the hook does
+once WirePlumber has loaded it. What it does not: that the publisher is
+WirePlumber — any host process of the user's can create metadata of that
+name, and the host is trusted (boundary 4). A sandbox can neither see
+the metadata nor create one of that name (bed test
+`no_context_sees_or_makes_the_policys_metadata`), so it cannot silence
+the warning. Where the question gets no answer — no `pw-metadata`, no
+daemon, nothing within two seconds — the run warns nothing and lint
+notes it: an unknown is not reported as a stale policy. The run goes on
+in every case.
+
 The private pulse server closes a gap the context alone cannot: a pulse
 client can `LOAD_MODULE` a server into loading `module-native-protocol-tcp`
 or a tunnel module that would then run outside the sandbox's network

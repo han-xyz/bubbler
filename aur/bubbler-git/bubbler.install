@@ -12,11 +12,13 @@ NOTE
 
 _changed() {
   cat <<'NOTE'
-bubbler's WirePlumber policy changed in 0.24.2: until WirePlumber restarts,
-a sandbox with a pipewire grant can record other applications through a link
-of its own or a sink it offers, give itself the microphone, or silence host
-audio with a filter it offers, and a microphone grant records nothing.
-Restart it:
+bubbler's WirePlumber policy changed in 0.26.0. Until WirePlumber restarts,
+pipewire and pulseaudio grants are held to the policy it loaded when it
+started, not to this one, and each run of such an instance warns so. Under
+a policy older than 0.24.2 a sandbox with a pipewire grant can record other
+applications through a link of its own or a sink it offers, give itself the
+microphone, or silence host audio with a filter it offers, and a microphone
+grant records nothing. Restart it:
     systemctl --user restart wireplumber
 Any copy of the policy outside /usr/share (under ~/.config, ~/.local/share,
 /etc or /usr/local/share) is not updated by the package and is the one
@@ -29,12 +31,12 @@ post_install() {
   _note
 }
 
-# 0.23.0 is the first release with the policy, 0.24.2 the last that
+# 0.23.0 is the first release with the policy, 0.26.0 the last that
 # changed it; a later release that changes it adds its own version.
 post_upgrade() {
   if (( $(vercmp "$2" 0.23.0) < 0 )); then
     _note
-  elif (( $(vercmp "$2" 0.24.2) < 0 )); then
+  elif (( $(vercmp "$2" 0.26.0) < 0 )); then
     _changed
   fi
 }
