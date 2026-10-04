@@ -22,79 +22,24 @@ pub use crate::tty::TtyMode;
 use crate::dbus;
 use crate::seccomp::{DEFAULT_ENOSYS_NUMBERED, syscall_number};
 
-/// Largest configuration bubbler hands to the KDL parser. A profile or
-/// a `config.kdl` is a screenful of grants — the shipped profiles are
-/// under 5 KB with their headers — and this is the input
-/// [`PARSER_STACK`] is sized for: the parser may take one stack frame
-/// per byte of the text, so the bytes are the bound on its depth.
+/// Largest configuration bubbler hands to the KDL parser. The parser may take a stack frame per
+/// byte, so this is the bound [`PARSER_STACK`] is sized for.
 pub const MAX_BYTES: usize = 64 * 1024;
 
-/// Stack reserved for the thread [`parse_document`] runs the parser on.
-///
-/// `kdl` 6.7.1 recurses in three places. Two are driven by bytes a
-/// count can see and are bounded by [`MAX_NESTING`] and
-/// [`MAX_COMMENT_MARKS`]. The third is not: `document` (in its
-/// `v2_parser.rs`) recovers from a top-level token `nodes` refuses —
-/// `}`, `)`, `=` and the rest — by consuming one byte and calling
-/// itself, one frame per byte it cannot place, and no count of the
-/// text bounds that short of refusing every unplaceable byte, which is
-/// refusing every syntax error. So the depth is bounded by the size
-/// instead: at most [`MAX_BYTES`] `document` frames, plus the few the
-/// counted recursions add. Measured in a debug build on x86_64, a
-/// `document` frame is about 3.3 KB, so 64 Ki of them need about 216
-/// MB; this reservation leaves more than twice that. Linux commits the
-/// pages of a thread's stack as they are touched, so the reservation
-/// uses no memory until a file makes the parser use it; it is address
-/// space charged at spawn, and a `ulimit -v` or a strict overcommit
-/// setting that cannot charge it fails the spawn as
-/// [`ConfigError::ParserThread`] rather than parsing anywhere else. A
-/// file of nothing but `}` aborted a release build of bubbler on its
-/// 8 MiB main-thread stack from 13 411 bytes.
+/// Stack reserved for the parser thread: room for a `kdl` 6.7.1 `document` frame (about 3.3 KB
+/// in a debug build on x86_64) per byte of a [`MAX_BYTES`] file, twice over.
 pub const PARSER_STACK: usize = 512 << 20;
 
-// The reservation above is half a gibibyte of address space charged
-// every time a configuration is read, and a 32-bit process has under
-// four of them to charge it against: the parser thread would fail to
-// start on a machine with memory to spare. Refusing the build says so
-// once, where it can be read, rather than every run of every command
-// on the target.
+// The parser stack is half a GiB of address space charged on every read: too much for 32 bits.
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("bubbler reserves a 512 MiB parser stack and supports 64-bit targets only");
 
-/// Most `{` bubbler hands to the KDL parser in one file, counted
-/// wherever they stand: in strings and comments too, and never given
-/// back by a `}`. The deepest node bubbler defines is two levels
-/// (`network { dns { … } }`) and the shipped profiles hold two braces
-/// at most, so a config that means something, header examples pasted
-/// into its comments included, stays well under this.
-///
-/// `kdl` 6.7.1 descends into children by recursion, once per `{` it
-/// reads as one, and it can read no `{` the text does not hold: N
-/// braces in the text are at most N descents, however the parser reads
-/// them. Measured on x86_64, parsing well-formed nesting until the
-/// process aborts: 1348 levels on the 8 MiB stack a main thread has in
-/// a release build, 253 in a debug build, and 61 on a 2 MiB stack in a
-/// debug build. The bound sits far under the smallest of those, and the
-/// parser runs on the stack [`parse_document`] reserves, where the
-/// children descents are a rounding error.
+/// Most `{` one file may hold, counted wherever they stand, strings and comments too, and never
+/// given back by a `}`: `kdl` 6.7.1 descends once per `{` it reads.
 pub const MAX_NESTING: usize = 32;
 
-/// Most `*` and `/` bubbler lets one `/* */` comment hold, nested
-/// comments included. `kdl` 6.7.1 reads a block comment by recursion
-/// (`commented_block` in its `v2_parser.rs`): once per `*`, per `/`,
-/// per nested comment and per run of other text between them, so a
-/// comment made of `/` overflows the stack from 2.5 KB of otherwise
-/// valid KDL. Seven lines of a starred box fit under this; no comment
-/// that says something holds more.
-///
-/// Measured against `kdl` 6.7.1 on x86_64 in a debug build, parsing
-/// until the process aborts: on the 8 MiB stack of a main thread, a run
-/// of `*` or `/` survives 2200 and aborts at 2500, and a mark between
-/// runs of text — two descents per mark, the worst shape — survives
-/// 1024 marks and aborts at 1500. On the 2 MiB stack of a spawned
-/// thread those are 512 and 256. The bound sits below the worst shape
-/// on the smaller stack, as [`MAX_NESTING`] does, so a comment is a
-/// rounding error on the stack [`parse_document`] reserves.
+/// Most `*` and `/` one `/* */` comment may hold, nested comments included: `kdl` 6.7.1 recurses
+/// on each, and a comment of `/` overflowed the main stack from 2.5 KB.
 pub const MAX_COMMENT_MARKS: usize = 128;
 
 /// Keys `env` may not set: the sandbox owns them.
@@ -113,15 +58,10 @@ pub const RESERVED_ENV: &[&str] = &[
     "DBUS_SYSTEM_BUS_ADDRESS",
     "AT_SPI_BUS_ADDRESS",
     "IBUS_USE_PORTAL",
-    // The token the session issued to bubbler, which activates a window
-    // and takes the keyboard focus in that session. Nothing copies it
-    // in — `env::is_passthrough` is an allowlist and it is not on it —
-    // and a config must not plant one either.
+    // Activates a window and takes the keyboard focus in the session.
     "XDG_ACTIVATION_TOKEN",
-    // The proxy variables, whether or not a config has an `allow-host`:
-    // an `env` node naming one would point the sandbox at a proxy of its
-    // own, past the single opening its filter leaves. A test holds these
-    // to `network::PROXY_ENV_NAMES`, which is what the launcher sets.
+    // Set by the launcher whether or not there is an `allow-host`: a test holds these to
+    // `network::PROXY_ENV_NAMES`.
     "HTTPS_PROXY",
     "HTTP_PROXY",
     "https_proxy",
@@ -131,21 +71,15 @@ pub const RESERVED_ENV: &[&str] = &[
     "NODE_USE_ENV_PROXY",
 ];
 
-/// `/etc` entries `etc-share` may not name: the sandbox generates its own
-/// `passwd` and `group`, and binding the host's account files back in
-/// would undo that and leak the shadow hashes. The `-` and `+` forms are
-/// the backup and NIS-compatibility files next to them.
+/// `/etc` entries `etc-share` may not name: the sandbox's own `passwd` and `group` hide the host's,
+/// and the shadow files hold its hashes. `-` and `+` are the backup and NIS forms.
 pub const RESERVED_ETC: &[&str] = &[
     "passwd", "passwd-", "passwd+", "group", "group-", "group+", "shadow", "shadow-", "shadow+",
     "gshadow", "gshadow-", "gshadow+",
 ];
 
-/// Every top-level node a `config.kdl` may hold, in the order the
-/// README documents them. The parser resolves a node name against this
-/// list before it reaches a match arm and
-/// [`crate::catalogue::GRANTS`] describes each entry, so what bubbler
-/// takes and what bubbler documents are one list. `include` is not here:
-/// it is the one node only a profile layer takes.
+/// Every top-level node a `config.kdl` may hold. [`crate::catalogue::GRANTS`] describes each, so
+/// what bubbler takes and what it documents are one list; `include` is a profile layer's only.
 pub const NODES: &[&str] = &[
     "wayland",
     "x11",
@@ -179,27 +113,20 @@ pub const NODES: &[&str] = &[
     "command",
 ];
 
-/// The cap on the sandbox's `/tmp`, in bytes: the `tmp size="…"` node.
-/// A tmpfs is pinned host memory, so this is how much of the host's RAM
-/// a sandbox may take with files it writes to `/tmp`.
+/// The cap on the sandbox's `/tmp` in bytes (`tmp size=`): host memory it may pin as files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TmpSize(pub u64);
 
-/// Largest `tmp size=` bubbler accepts: 64 GiB. A cap past this is a
-/// number nobody meant to write, and the pages behind it are the host's.
+/// Largest `tmp size=` bubbler accepts.
 pub const TMP_SIZE_MAX: u64 = 64 * 1024 * 1024 * 1024;
 
 /// Whether the sandbox may create user namespaces of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Userns {
-    /// The baseline's `--unshare-all`, which leaves nested user
-    /// namespaces working: a browser's own sandbox and Steam's
-    /// pressure-vessel both need them.
+    /// Nested user namespaces work: a browser's sandbox and Steam's pressure-vessel need them.
     #[default]
     Allow,
-    /// `--unshare-user --disable-userns`: the sandbox cannot create a
-    /// further user namespace, and so cannot regain inside it the
-    /// capabilities that make mount and pid namespaces reachable again.
+    /// `--unshare-user --disable-userns`: no nested user namespace to regain capabilities in.
     Disable,
 }
 
@@ -234,10 +161,8 @@ pub enum EtcMode {
 /// compositor as a security context, or the host's socket as it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaylandMode {
-    /// A `wp_security_context_v1` listener the compositor treats as
-    /// sandboxed, falling back to the host socket with a warning where
-    /// the compositor offers none. The application reaches it through
-    /// bubbler's own proxy, which is where `clipboard` applies.
+    /// A `wp_security_context_v1` listener reached through bubbler's proxy, where `clipboard`
+    /// applies; the host socket, with a warning, where the compositor offers none.
     Sandboxed {
         /// Whether a clipboard read has to follow input of the user's.
         clipboard: Clipboard,
@@ -272,9 +197,7 @@ pub enum Clipboard {
     Open,
 }
 
-/// Absolute path of the X server bubbler starts inside the sandbox.
-/// A host binary under the read-only `/usr`, so the sandbox holds no
-/// copy of its own and cannot replace it.
+/// The X server bubbler starts inside the sandbox: a host binary under the read-only `/usr`.
 pub const XWAYLAND: &str = "/usr/bin/Xwayland";
 
 /// The window the nested X server draws itself in, as one Wayland
@@ -308,24 +231,11 @@ impl Default for NestedX11 {
 }
 
 impl NestedX11 {
-    /// The Xwayland command line, in the order the server takes it.
-    /// The three `-nolisten` flags leave the display reachable only over
-    /// the socket `bubbler-init` owns and `-noreset` stops a client's exit
-    /// from resetting the server; `-ac` is the access control X11 has no
-    /// use for here, the display being the sandbox's own. The `-listenfd`
-    /// that hands the server that socket is appended when the supervisor
-    /// starts it, not here. The window manager, if the config names one,
-    /// is a program of the supervisor's and never a flag of the server's.
+    /// The Xwayland command line. The supervisor appends the `-listenfd` that hands the server its
+    /// socket, and runs any window manager as a program of its own.
     pub fn xwayland_argv(&self) -> Vec<OsString> {
-        // `Xserver(1)`: `-nolisten local` drops the abstract socket the
-        // server would otherwise also answer on. An abstract name belongs
-        // to the network namespace and ignores the mount namespace, so
-        // under `network "host"` it is a host-wide address: a host client
-        // could reach this server, which `-ac` lets anyone use.
-        // `-nolisten unix` drops the server's own path socket: the
-        // supervisor binds `/tmp/.X11-unix/X0` before the server exists
-        // and hands it over with `-listenfd`, so a second socket of the
-        // server's own would only take the name away from that one.
+        // No abstract socket, which is host-wide under `network "host"` while `-ac` lets anyone in,
+        // and no path socket of its own: the supervisor's, handed over by `-listenfd`, is the one.
         let mut argv: Vec<OsString> = [
             XWAYLAND,
             ":0",
@@ -342,7 +252,6 @@ impl NestedX11 {
         .into_iter()
         .map(OsString::from)
         .collect();
-        // A fullscreen server has no window to decorate or to size.
         if self.fullscreen {
             argv.push(OsString::from("-fullscreen"));
         } else {
@@ -397,22 +306,18 @@ pub struct Share {
     pub mode: ShareMode,
 }
 
-/// One accepted lint finding: the check it silences and why. Only
-/// warnings and notes can be silenced; an error names something the file
-/// cannot do, and there is nothing to accept about it.
+/// One accepted lint finding: the check it silences and why. Only warnings and notes can be
+/// silenced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LintAllow {
     /// A check id from [`crate::lint::CHECKS`].
     pub id: String,
-    /// Why this file accepts the finding. Required: the reason is the
-    /// whole value of writing the node down.
+    /// Why this file accepts the finding; required.
     pub reason: String,
 }
 
-/// One rule for the filtering D-Bus proxy. `See`, `Talk` and `Own` are the
-/// three policy levels for a well-known name; `Call` and `Broadcast` pair a
-/// name with an `[METHOD][@PATH]` rule narrowing it to single methods,
-/// signals or object subtrees (`xdg-dbus-proxy(1)`).
+/// One rule for the filtering D-Bus proxy: `See`, `Talk` and `Own` set a name's policy level;
+/// `Call` and `Broadcast` narrow a name to one `[METHOD][@PATH]` rule (`xdg-dbus-proxy(1)`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BusRule {
     /// The name is visible: it shows up in `ListNames` and its owner
@@ -429,10 +334,8 @@ pub enum BusRule {
 }
 
 impl BusRule {
-    /// The name and node word of a policy rule, or `None` for `call` and
-    /// `broadcast`, which narrow a policy rather than set one. A name
-    /// holds one policy: two of them for the same name would leave which
-    /// one the proxy applies to argument order.
+    /// The name and node word of a policy rule, or `None` for `call` and `broadcast`. A name holds
+    /// one policy: with two, argument order would pick the one the proxy applies.
     pub fn policy(&self) -> Option<(&str, &'static str)> {
         match self {
             BusRule::See(n) => Some((n, "see")),
@@ -608,10 +511,8 @@ pub(crate) fn bus_clash(services: &[Service]) -> Option<BusClash<'_>> {
     None
 }
 
-// `xdg-dbus-proxy(1)` reads a rule as `[METHOD][@PATH]`: an empty method or
-// `*` is every interface, while `org.foo.*` is the one interface `org.foo`.
-// A broadcast rule lets signals in and opens no call. `portals` itself
-// writes `Documents=*`, so only a call reaching `Desktop` opens more.
+// `xdg-dbus-proxy(1)`: an empty method or `*` is every interface, `org.foo.*` only `org.foo`.
+// `portals` itself writes `Documents=*`, so only a call reaching `Desktop` opens more.
 pub(crate) fn reaches_every_portal(rule: &BusRule) -> bool {
     match rule {
         BusRule::See(_) | BusRule::Broadcast(..) => false,
@@ -625,11 +526,8 @@ pub(crate) fn reaches_every_portal(rule: &BusRule) -> bool {
     }
 }
 
-/// Whether the name a rule writes reaches the name or family `listed`.
-/// Either side may end in `.*`, which stands for the name before it and
-/// every name under it: `talk "org.freedesktop.*"` reaches
-/// `org.freedesktop.systemd1`, and `org.freedesktop.impl.portal.*` is
-/// reached by naming any one of its members.
+/// Whether the name a rule writes reaches the name or family `listed`. Either side may end in
+/// `.*`, which stands for the name before it and every name under it.
 pub(crate) fn name_covers(written: &str, listed: &str) -> bool {
     glob_covers(written, listed) || glob_covers(listed, written)
 }
@@ -646,16 +544,8 @@ fn glob_covers(glob: &str, name: &str) -> bool {
         })
 }
 
-/// One optional group of portal interfaces, written as a child of the
-/// `portals` node. The bare node grants a safe set — a file chooser, a
-/// notification, a print dialog — and each child adds one group on top
-/// of it, because `--call=org.freedesktop.portal.*=*` would grant screen
-/// capture, input injection, autostart entries and the login secret to
-/// every sandbox that wanted a file chooser.
-///
-/// `camera` is a child too, but it parses to [`Service::Camera`]: it was
-/// a top-level node before the split and stays one, so the two spellings
-/// are the same grant and writing both is a duplicate.
+/// One optional group of portal interfaces, a child of `portals` granted on top of the bare node's
+/// safe set. `camera` is a child too, but parses to [`Service::Camera`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Portal {
     /// ScreenCast and Screenshot.
@@ -673,9 +563,7 @@ pub enum Portal {
 }
 
 impl Portal {
-    /// Every child, in the order the manual and the man page list them:
-    /// widest first, so a reader meets the expensive ones before the
-    /// narrow ones.
+    /// Every child, widest first: the order the manual and the man page list them in.
     pub const ALL: &'static [Portal] = &[
         Portal::ScreenCast,
         Portal::RemoteDesktop,
@@ -697,9 +585,8 @@ impl Portal {
         }
     }
 
-    /// The `org.freedesktop.portal.<Iface>` interfaces the child opens
-    /// on `org.freedesktop.portal.Desktop`, which is what
-    /// [`crate::dbus`] turns into `--call` and `--broadcast` rules.
+    /// The `org.freedesktop.portal.<Iface>` interfaces the child opens on
+    /// `org.freedesktop.portal.Desktop`.
     pub fn interfaces(self) -> &'static [&'static str] {
         match self {
             Self::ScreenCast => &["ScreenCast", "Screenshot"],
@@ -726,8 +613,7 @@ impl Portal {
         }
     }
 
-    /// The child `name` names, if it is one. `camera` is deliberately
-    /// not here: it parses to [`Service::Camera`].
+    /// The child `name` names. `camera` is not one here: it parses to [`Service::Camera`].
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL.iter().copied().find(|p| p.node_name() == name)
     }
@@ -783,9 +669,7 @@ pub enum Service {
         path: PathBuf,
         /// Read-only unless `mode=rw`.
         mode: ShareMode,
-        /// A missing source is skipped rather than refused, so one
-        /// profile can name a path that only some installs of an app
-        /// have.
+        /// A missing source is skipped, not refused: a profile may name a path some installs lack.
         optional: bool,
     },
     /// Bind a host path outside the home at that same path inside the
@@ -796,9 +680,7 @@ pub enum Service {
         path: PathBuf,
         /// Read-only unless `mode=rw`.
         mode: ShareMode,
-        /// A missing source is skipped rather than refused, so one
-        /// profile can name a path that only some installs of an app
-        /// have.
+        /// A missing source is skipped, not refused: a profile may name a path some installs lack.
         optional: bool,
     },
     /// Bind one host `/etc` entry read-only at the same path, on top of
@@ -813,10 +695,8 @@ pub enum Service {
         /// Proxy filter rules, in file order; repeats are harmless.
         rules: Vec<BusRule>,
     },
-    /// The system bus, filtered by the same `xdg-dbus-proxy` sidecar. The
-    /// `rules` list is the whole confinement: behind a granted name the
-    /// sandbox is an ordinary process of the user, since the bus sees the
-    /// proxy's credentials and not the sandbox's.
+    /// The system bus, filtered by the `xdg-dbus-proxy` sidecar of [`Service::Dbus`]. The bus sees
+    /// the proxy's credentials, so `rules` is the whole confinement.
     SystemBus {
         /// Proxy filter rules, in file order; never an `own`.
         rules: Vec<BusRule>,
@@ -824,9 +704,7 @@ pub enum Service {
     /// The XDG desktop portal rule bundle plus the `/.flatpak-info` file
     /// portals read to identify the sandbox. Requires [`Service::Dbus`].
     Portals {
-        /// Interface groups granted on top of the safe set, in file
-        /// order. Each is a grant of its own, so two layers granting
-        /// different children add up rather than one replacing the other.
+        /// Interface groups on top of the safe set, in file order; two layers' children add up.
         children: Vec<Portal>,
     },
     /// Talk to `org.freedesktop.Notifications`. Requires [`Service::Dbus`].
@@ -845,21 +723,14 @@ pub enum Service {
         /// devices for the whole session.
         uinput: bool,
     },
-    /// Every `/dev/hidraw*` node the host has at launch, plus
-    /// `/sys/class/hidraw`: the raw HID interfaces a security key, a
-    /// hardware wallet or a controller driven through hidapi is opened
-    /// through. `gamepad hidraw=#true` grants the same thing.
+    /// Every `/dev/hidraw*` node at launch plus `/sys/class/hidraw`: what security keys, hardware
+    /// wallets and hidapi controllers are opened through. `gamepad hidraw=#true` grants the same.
     Hidraw,
-    /// Cameras through `org.freedesktop.portal.Camera`, which needs no
-    /// device in the sandbox: the portal opens the node in the host
-    /// daemon and hands back a connected PipeWire socket. Requires
-    /// [`Service::Portals`], whose `/.flatpak-info` is what earns the
-    /// instance a permission of its own rather than the blanket one
-    /// every unsandboxed process on the machine shares.
+    /// Cameras through `org.freedesktop.portal.Camera`, which needs no device in the sandbox.
+    /// Requires [`Service::Portals`], whose `/.flatpak-info` earns the instance its own permission.
     Camera {
-        /// Also bind the V4L2 device nodes, for the plain V4L2 clients
-        /// that will never speak the portal. Every `/dev/video*` and
-        /// `/dev/media*` the host has, a virtual camera among them.
+        /// Also bind every `/dev/video*` and `/dev/media*` node, for V4L2 clients without the
+        /// portal.
         nodes: bool,
     },
     /// Own `org.mpris.MediaPlayer2.<name>` so media keys and player
@@ -869,29 +740,15 @@ pub enum Service {
         /// element.
         name: String,
     },
-    /// The session's accessibility bus, a third bus filtered by the same
-    /// proxy: the sandbox registers itself with the AT-SPI registry and
-    /// answers the screen readers, magnifiers and on-screen keyboards
-    /// that read it, since a call *into* the sandbox is incoming and
-    /// unfiltered. The registry's `RegisterKeystrokeListener`,
-    /// `GenerateKeyboardEvent`, `GenerateMouseEvent` and `RegisterEvent`
-    /// are deliberately left out of its rules: they are every keystroke
-    /// of every accessible application and input injected into the
-    /// session, which is what makes the raw bus X11-class. Requires
+    /// The session's accessibility bus through the D-Bus proxy, so assistive tools can read the
+    /// app; the registry's keystroke-listener and event-generating methods stay closed. Requires
     /// [`Service::Dbus`].
     A11y,
-    /// Talk to the two sandboxed input-method portal names,
-    /// `org.freedesktop.portal.Fcitx` and `org.freedesktop.portal.IBus`,
-    /// which carry the per-client text-input interface and nothing else.
-    /// The daemons' own names are deliberately not granted: they hold
-    /// the configuration and lifecycle methods (`Exit`, `Restart`,
-    /// `SetConfig`, `SetCurrentIM`), which is tampering and denial of
-    /// service for the whole session. Requires [`Service::Dbus`].
+    /// Talk to `org.freedesktop.portal.Fcitx` and `org.freedesktop.portal.IBus`, the per-client
+    /// text-input names; the daemons' own names are not granted. Requires [`Service::Dbus`].
     InputMethod,
-    /// Share `$XDG_RUNTIME_DIR/app/<id>` with everything else that names
-    /// the same id: the directory applications serve their own sockets
-    /// in, so one sandbox can reach another's. One id is one trust
-    /// domain; nothing about the boundary tells the peers apart.
+    /// Share `$XDG_RUNTIME_DIR/app/<id>` with everything else naming the same id, so one sandbox
+    /// can reach another's sockets: one id is one trust domain.
     AppRuntime {
         /// Reverse-DNS application id, the directory's name under `app/`.
         id: String,
@@ -902,10 +759,7 @@ pub enum Service {
 }
 
 impl Service {
-    /// The KDL node this grant is written as, which is what
-    /// [`crate::catalogue::GRANTS`] is keyed by. Every variant is named
-    /// here: a grant whose node the catalogue cannot look up is one
-    /// nothing can explain to the user.
+    /// The KDL node this grant is written as, the key of [`crate::catalogue::GRANTS`].
     pub fn node_name(&self) -> &'static str {
         match self {
             Self::Wayland(_) => "wayland",
@@ -933,9 +787,7 @@ impl Service {
     }
 }
 
-/// The audio grant an instance carries, once `pipewire` and `pulseaudio`
-/// are folded into the one set the per-instance security context 0.23
-/// builds from: two nodes writing to one instance-wide reach.
+/// The audio grant of an instance: `pipewire` and `pulseaudio` folded into one instance-wide set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioSet {
     /// `microphone` was asked for under `pipewire`, `pulseaudio`, or both.
@@ -946,10 +798,8 @@ pub struct AudioSet {
     pub exclusive: bool,
 }
 
-/// The nodes a config may hold more than once, in the order [`NODES`]
-/// lists them. Every other node is one per file: a second one is a
-/// [`ConfigError::Duplicate`], because which of the two applied would be
-/// a matter of file order.
+/// The nodes a config may hold more than once, in [`NODES`] order. A second of any other node is
+/// a [`ConfigError::Duplicate`].
 pub const REPEATABLE: &[&str] = &[
     "home-share",
     "path-share",
@@ -968,8 +818,7 @@ pub enum Node {
     Service(Service),
     /// An `env` node, with every variable it sets.
     Env(Vec<(String, String)>),
-    /// A `lint-allow` node. One node accepts one id; the list is what a
-    /// caller building a node by hand may hold.
+    /// A `lint-allow` node; a written node accepts one id.
     LintAllow(Vec<LintAllow>),
     /// An `etc` node: the allowlist or the host's whole `/etc`.
     Etc(EtcMode),
@@ -988,8 +837,7 @@ pub enum Node {
 }
 
 impl Node {
-    /// The KDL node it was written as, which is the name [`NODES`] and
-    /// [`crate::catalogue::GRANTS`] hold it under.
+    /// The KDL node it was written as.
     pub fn name(&self) -> &'static str {
         match self {
             Self::Service(s) => s.node_name(),
@@ -1005,20 +853,14 @@ impl Node {
         }
     }
 
-    /// Whether the node carries anything beyond its own name — an
-    /// argument, a property or children. A node that does not is
-    /// spelled out by its name alone, so a `/-` line would keep nothing
-    /// that granting it again does not write.
+    /// Whether the node carries anything beyond its own name, so a `/-` line has more to keep.
     pub fn has_content(&self) -> bool {
         let s = match self {
-            // The one other node with a bare spelling: like a service's
-            // default mode, the allowlist is what granting nothing more
-            // writes.
+            // Like a service's default mode, the allowlist is the bare spelling.
             Self::Etc(mode) => return *mode != EtcMode::default(),
             Self::Service(s) => s,
             _ => {
-                // Every other node takes an argument or children to parse
-                // at all, so there is no bare spelling of one.
+                // Every other node needs an argument or children to parse at all.
                 return true;
             }
         };
@@ -1061,10 +903,8 @@ impl Node {
 pub struct Disabled {
     /// The node, parsed exactly as the enabled line would have been.
     pub node: Node,
-    /// Index into its section's enabled entries this one sits before
-    /// (`== len` after the last), so it is written back where it was
-    /// read. A `/-` line above a node of another section counts every
-    /// entry of its own section written above it.
+    /// Index into its section's enabled entries this one sits before (`== len` after the last),
+    /// so it is written back where it was read.
     pub before: usize,
 }
 
@@ -1102,11 +942,8 @@ pub struct InstanceConfig {
     /// instance's launcher entry from, where the command's own entry is
     /// not named after it.
     pub desktop: Option<String>,
-    /// Nodes the file keeps without granting them: the `/-` lines, in
-    /// the order [`crate::kdl_out::nodes`] writes them — by section, and
-    /// within a section in file order, which is where they are written
-    /// back. Nothing downstream of the parser sees them: they are
-    /// neither granted, linted nor explained.
+    /// The `/-` lines, in the order [`crate::kdl_out::nodes`] writes them back; never granted,
+    /// linted or explained.
     pub disabled: Vec<Disabled>,
 }
 
@@ -1116,10 +953,8 @@ impl InstanceConfig {
         self.lint_allows.iter().any(|allow| allow.id == id)
     }
 
-    /// The audio grant this instance carries: `None` when neither
-    /// `pipewire` nor `pulseaudio` is granted, otherwise `microphone`
-    /// ORed across whichever of the two are, since either one reaches
-    /// the same context socket.
+    /// The audio grant: `None` without `pipewire` or `pulseaudio`, otherwise each flag ORed across
+    /// both, since both reach the same context socket.
     pub fn audio(&self) -> Option<AudioSet> {
         self.services.iter().fold(None, |set, svc| {
             let (microphone, devices, exclusive) = match svc {
@@ -1168,9 +1003,8 @@ pub fn parse(text: &str) -> Result<InstanceConfig, ConfigError> {
     Ok(parse_doc(text, false)?.0.config)
 }
 
-/// Where the nodes of a config are, counting from one. A line is `None`
-/// only where a node's span falls outside the text it was parsed from,
-/// which the parser's own spans are not.
+/// Where the nodes of a config are, counting from one; a line is `None` only for a span outside
+/// the text.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Lines {
     /// Line of each granted service, parallel to
@@ -1191,36 +1025,15 @@ pub fn node_lines(text: &str) -> Result<Lines, ConfigError> {
     Ok(parse_doc(text, false)?.1)
 }
 
-/// Parse one profile layer, which may also `include` other profiles.
-///
-/// A bundle node (`portals`, `notify`, `mpris`) without `dbus` is not an
-/// error here: the `dbus` grant may come from an included layer. The
-/// resolver applies that check to the merged result.
+/// Parse one profile layer, which may also `include` other profiles. A bundle node without `dbus`
+/// is not an error here: the resolver checks the merged result.
 pub fn parse_profile(text: &str) -> Result<RawProfile, ConfigError> {
     Ok(parse_doc(text, true)?.0)
 }
 
-/// Parse KDL text on a stack sized for what a bounded file can make
-/// the parser do.
-///
-/// Every configuration bubbler reads is parsed here. `kdl` 6.7.1
-/// recurses on three things and a file that drives any of them deep
-/// enough overflows the stack and aborts the process instead of
-/// returning an error. Two are driven by bytes: it descends once per
-/// `{` and once per `*` or `/` in a block comment, and the pre-check
-/// refuses the text before the parser sees it when either count passes
-/// its bound. The third is its recovery from a top-level token it
-/// cannot place, one frame per such byte, which no count bounds; so
-/// the text is bounded to [`MAX_BYTES`] and the
-/// parser runs on a thread with [`PARSER_STACK`] reserved for it, on
-/// which at most that many frames plus the two counted recursions
-/// fit with room to spare. The caller's stack is never parsed on:
-/// a thread that cannot be started is an error, not a fallback.
-///
-/// The count is a pre-check and not a parser: it counts every `{` in
-/// the text and measures the comment after every `/*`, wherever they
-/// stand, and decides nothing about what the document means. Text it
-/// accepts may still be invalid KDL.
+/// Parse KDL text on a thread with [`PARSER_STACK`] reserved, after refusing text past the size,
+/// brace and comment bounds. A thread that cannot start is [`ConfigError::ParserThread`], never a
+/// parse on the caller's stack.
 pub fn parse_document(text: &str) -> Result<KdlDocument, ConfigError> {
     check_bounds(text)?;
     let parsed = std::thread::scope(|scope| {
@@ -1236,8 +1049,6 @@ pub fn parse_document(text: &str) -> Result<KdlDocument, ConfigError> {
     Ok(parsed?)
 }
 
-/// What a panic payload says, for the error that carries it out of the
-/// parser thread.
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_owned()
@@ -1248,17 +1059,8 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// Read a configuration file, refusing one past [`MAX_BYTES`] on its
-/// size rather than after it is in memory. Every configuration bubbler
-/// parses comes through here: `fs::read_to_string` would allocate a
-/// file of any size first and leave the bound to say no afterwards,
-/// which bounds the parser's stack but nothing else.
-///
-/// The size is taken from the file's metadata and the read is bounded
-/// again at [`MAX_BYTES`] + 1 bytes, so a file that grows between the
-/// two — or one whose size the metadata cannot know, as procfs and a
-/// pipe cannot — is refused by the second bound instead of being read
-/// to the end.
+/// Read a configuration file, refusing one past [`MAX_BYTES`] on its size before reading and again
+/// on a read capped one byte past the bound, for a file that grows or has no size.
 pub fn read_bounded(path: &Path) -> Result<String, ReadError> {
     let too_large = |bytes: usize| {
         ReadError::TooLarge(ConfigError::TooLarge {
@@ -1281,38 +1083,8 @@ pub fn read_bounded(path: &Path) -> Result<String, ReadError> {
     Ok(text)
 }
 
-/// Refuse text past [`MAX_BYTES`], holding more than [`MAX_NESTING`]
-/// `{`, or holding a `/*` with more than [`MAX_COMMENT_MARKS`] `*` or
-/// `/` in the comment after it. Counting by hand is the point: see
-/// [`parse_document`].
-///
-/// The count keeps no model of where strings and comments are. The
-/// parser recovers from a string it cannot read — a bad escape, a NUL,
-/// a `"""` mid-line, a multi-line body whose lines do not carry the
-/// indentation of its closing quotes, and more shapes than a model of
-/// its grammar keeps up with — by reading what was written inside it as
-/// nodes, descending into every `{` there and recursing on every `/*`.
-/// What recovery cannot do is put a `{` or a `/*` into the text. So
-/// every `{` counts wherever it stands and a `}` closes nothing: a file
-/// holding more `{` than the parser may descend into is refused whether
-/// or not it would have descended into them. Every `/*` is measured
-/// from where it stands for the same reason. A `{` or a `/*` inside a
-/// string or a comment the parser does read as one is over-counted,
-/// which refuses a file the parser would have read; no configuration
-/// that grants anything writes thirty-three braces, or a comment as
-/// busy as the bound, anywhere in it.
-///
-/// These two counts are not what keeps the parser on its stack — the
-/// stack [`parse_document`] reserves is sized for a frame per byte of
-/// the text, and a file of [`MAX_NESTING`] braces or a comment at the
-/// bound costs a handful of frames beside that. They keep the deep
-/// recursions cheap and the refusal a message that names the shape.
-///
-/// Measuring from every `/*` costs linear work: a measure stops one
-/// mark past the bound, so it steps past at most [`MAX_COMMENT_MARKS`]
-/// / 2 further `/*` before it stops, and each byte of the text is
-/// walked by at most that many measures plus one — 65 × [`MAX_BYTES`]
-/// steps in the worst layout, a few milliseconds unoptimised.
+// Every `{` and `/*` counts wherever it stands: the parser recovers from a bad string by reading
+// its inside as nodes. A measure stops one mark past the bound, so the work stays linear.
 fn check_bounds(text: &str) -> Result<(), ConfigError> {
     if text.len() > MAX_BYTES {
         return Err(ConfigError::TooLarge {
@@ -1348,11 +1120,7 @@ fn check_bounds(text: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Index of the newline that ends the `//` comment at `at`, or the end
-/// of the text. KDL ends the comment at any of the newlines it reads,
-/// not only at a line feed: a file with carriage returns for line
-/// endings would otherwise be one comment to the end of the text, and
-/// a `/-` line inside it would go unread.
+// KDL ends a `//` comment at any newline it reads, carriage returns included.
 fn line_comment_end(b: &[u8], at: usize) -> usize {
     let mut i = at;
     while i < b.len() {
@@ -1364,12 +1132,8 @@ fn line_comment_end(b: &[u8], at: usize) -> usize {
     b.len()
 }
 
-/// Length of the newline at `at`, if one starts there. kdl 6.7.1 reads
-/// eight forms (`NEWLINES` in its `v2_parser.rs`), and every one of them
-/// ends a comment, opens a line and may open a multi-line string. Every
-/// line bubbler counts — the parser's refusals here, the linter's
-/// findings — is counted with this, so one file has one set of line
-/// numbers.
+/// Length of the newline at `at`: any of the eight forms kdl 6.7.1 reads (`NEWLINES`). Every
+/// line number bubbler reports is counted with this, so one file has one set of them.
 pub(crate) fn newline_len(b: &[u8], at: usize) -> Option<usize> {
     match *b.get(at)? {
         b'\r' if b.get(at + 1) == Some(&b'\n') => Some(2),
@@ -1384,16 +1148,8 @@ pub(crate) fn newline_len(b: &[u8], at: usize) -> Option<usize> {
     }
 }
 
-/// Index just past the `/* */` comment at `at`, and how many `*` and
-/// `/` it holds between its own `/*` and `*/` — what the parser
-/// recurses on, and what [`MAX_COMMENT_MARKS`] bounds. KDL nests them,
-/// so the first `*/` does not always end one.
-///
-/// One mark past the bound the walk stops and the end reported is the
-/// end of the text: [`check_bounds`] refuses the comment there, and
-/// [`slashdash_marks`], running over accepted text, never meets one.
-/// Walking on would let a string full of `/*`, each measured from
-/// where it stands, cost the square of its length.
+// Index past the nested `/* */` at `at`, and its `*` and `/`. One mark past the bound it stops at
+// the end of the text: only `check_bounds` meets that, `slashdash_marks` reads accepted text.
 fn block_comment_end(b: &[u8], at: usize) -> (usize, usize) {
     let mut open: usize = 1;
     let mut marks: usize = 0;
@@ -1426,24 +1182,8 @@ fn block_comment_end(b: &[u8], at: usize) -> (usize, usize) {
     (b.len(), marks)
 }
 
-/// Index just past the string whose opening quote is at `quote`, opened
-/// by `hashes` `#` before it, or `None` where the string never ends.
-/// [`slashdash_marks`] steps over what it spans, and runs over text the
-/// parser has already accepted, so a string it steps over is one the
-/// parser read as a string too; [`check_bounds`] runs before the parse
-/// and trusts no span at all.
-///
-/// A quoted string ends at the first `"` that is not escaped; a raw string
-/// has no escapes; either ends at a `"` followed by at least as many `#`
-/// as opened it. `"""` *and a newline* open the multi-line form, which
-/// holds lines of its own — a `"` among them ends nothing — and closes
-/// only on a `"""` carrying those hashes that stands on a line of its
-/// own after whitespace, `\`-escaped whitespace too in a quoted string:
-/// kdl 6.7.1 reads one mid-line as body in a raw string and as an error
-/// in a quoted one, never as the end (`raw_string` and `quoted_string`
-/// in its `v2_parser.rs`). Without
-/// the newline the three quotes are an empty string and a quote, which
-/// is how `#"""a"#` holds `""a`.
+// Only for text the parser accepted (`slashdash_marks`), so a string stepped over is one it read.
+// kdl 6.7.1 closes the multi-line form only on a `"""` alone on its line after whitespace.
 fn string_end(b: &[u8], quote: usize, hashes: usize) -> Option<usize> {
     let triple = b.get(quote..quote + 3) == Some(b"\"\"\"".as_slice())
         && newline_len(b, quote + 3).is_some();
@@ -1468,11 +1208,8 @@ fn string_end(b: &[u8], quote: usize, hashes: usize) -> Option<usize> {
                 }
             }
             b'"' => {
-                // One quote inside the multi-line form is content, and
-                // so are three with anything but whitespace before them
-                // on their line: taking either as the end would leave
-                // the scan reading the rest of the string as
-                // configuration.
+                // In the multi-line form one quote, or three after other text on their line,
+                // is content.
                 if triple
                     && (b.get(i..i + 3) != Some(b"\"\"\"".as_slice())
                         || !only_spaces(&b[line_start..i], hashes == 0))
@@ -1492,12 +1229,8 @@ fn string_end(b: &[u8], quote: usize, hashes: usize) -> Option<usize> {
     None
 }
 
-/// Whether `b` is nothing but what kdl 6.7.1 lets stand before a
-/// multi-line string's closing quotes: its `UNICODE_SPACES`, and with
-/// `escapes` its `ws_escape` too — a `\` followed by one or more of
-/// those spaces (`quoted_string` in its `v2_parser.rs`; a `\` before a
-/// newline is one [`string_end`] has already begun the next line
-/// after). A raw string has no escapes and closes on the spaces alone.
+// kdl 6.7.1 lets only its `UNICODE_SPACES` stand before a multi-line string's closing quotes,
+// and in a quoted string its `ws_escape` too: a `\` and spaces.
 fn only_spaces(b: &[u8], escapes: bool) -> bool {
     let mut i = 0;
     while i < b.len() {
@@ -1516,8 +1249,7 @@ fn only_spaces(b: &[u8], escapes: bool) -> bool {
     true
 }
 
-/// Length of the space at `at`, if one of kdl 6.7.1's `UNICODE_SPACES`
-/// (`v2_parser.rs`) starts there, by the bytes UTF-8 writes it as.
+// One of kdl 6.7.1's `UNICODE_SPACES`, by its UTF-8 bytes.
 fn space_len(b: &[u8], at: usize) -> Option<usize> {
     match *b.get(at)? {
         b'\t' | b' ' => Some(1),
@@ -1534,11 +1266,7 @@ fn space_len(b: &[u8], at: usize) -> Option<usize> {
     }
 }
 
-/// Line number, counting from one, of the byte at `offset` in `text`.
-/// Every newline [`newline_len`] knows opens a line, not the line feed
-/// alone: KDL reads eight of them, so a file written with carriage
-/// returns has the lines the parser sees and not the one `str::lines`
-/// would find. A CRLF opens one line, not two.
+// Every newline `newline_len` knows opens a line, as the parser sees them; a CRLF opens one.
 fn line_at(text: &str, offset: usize) -> Option<u32> {
     let b = text.get(..offset)?.as_bytes();
     let mut line: u32 = 1;
@@ -1555,8 +1283,6 @@ fn line_at(text: &str, offset: usize) -> Option<u32> {
     Some(line)
 }
 
-/// The parsed layer and where its nodes are: `--explain` names the node
-/// a bwrap argument came from.
 fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigError> {
     let doc: KdlDocument = parse_document(text)?;
     let mut cfg = InstanceConfig::default();
@@ -1567,17 +1293,13 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
     let mut seen_etc = false;
     let mut seen_seccomp = false;
     for node in doc.nodes() {
-        // The `/-` lines above a node are read before the node itself, so
-        // the entries a file keeps without granting them come out in the
-        // order they are written.
+        // A node's `/-` lines are read before it, so disabled entries keep their written order.
         if let Some(format) = node.format() {
             let at = Counts::of(&cfg);
             let found = disabled_in(&format.leading, profile, at)?;
             cfg.disabled.extend(found);
         }
         let name = node.name().value();
-        // Not a grant but a layer to merge under this one, so it is taken
-        // here rather than parsed into a [`Node`].
         if name == "include" {
             reject_types(node)?;
             if !profile {
@@ -1653,10 +1375,7 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
                     cfg.command = Some(argv);
                 }
             }
-            // What a node granted is counted rather than recorded per arm,
-            // so a node added to the match above is placed without being
-            // listed a second time here; only the two that grant nothing
-            // are named.
+            // Counted rather than recorded per arm, so a new arm needs no entry here.
             let grew = lines.services.len() < cfg.services.len() || lines.env.len() < cfg.env.len();
             if grew || matches!(name, "userns" | "seccomp") {
                 let line = line_at(text, offset);
@@ -1670,13 +1389,10 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
             }
         }
     }
-    // What is left under the last node, and the whole of a file that
-    // writes no node at all: the parser keeps the `/-` lines there.
+    // The parser keeps the `/-` lines under the last node, and those of a file with no node, here.
     if let Some(format) = doc.format() {
         let at = Counts::of(&cfg);
-        // One or the other: a file with no node keeps the whole of its
-        // text in the leading, and reading both would record every entry
-        // twice if a later parser put it in both.
+        // A file with no node keeps its whole text in the leading; reading both could count twice.
         let tail = if doc.nodes().is_empty() {
             &format.leading
         } else {
@@ -1685,12 +1401,8 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
         let found = disabled_in(tail, profile, at)?;
         cfg.disabled.extend(found);
     }
-    // A section is written back in one piece, so a `/-` line written
-    // above a node of a later section is written below it next time.
-    // The list follows the writing rather than the file: a config parsed
-    // from what bubbler wrote has to be the config bubbler wrote. The
-    // sort is stable, and `before` only grows down a section, so the
-    // order inside one is the file's.
+    // Written back by section, so the list follows the writing: a config parsed from what bubbler
+    // wrote is the config it wrote. The sort is stable, keeping file order inside a section.
     cfg.disabled.sort_by_key(|d| section_rank(&d.node));
     if !profile && let Some(node) = bundle_without_dbus(&cfg.services) {
         return Err(ConfigError::BadArgument {
@@ -1730,12 +1442,8 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
     ))
 }
 
-/// One top-level node as everything it grants, each with the byte offset
-/// of the text it was written at. Almost every node grants one thing and
-/// is written on one line; a `portals` block grants one thing per child,
-/// and so does a repeatable block (see [`parse_repeatable_block`]), and a
-/// reader — `--explain`'s line numbers, the linter's positions — has to
-/// be able to point at the child rather than at the block above it.
+/// One top-level node as everything it grants, each with the byte offset it was written at. A
+/// `portals` or repeatable block grants one thing per child, so a reader can point at the child.
 pub(crate) fn parse_node(node: &KdlNode, profile: bool) -> Result<Vec<(Node, usize)>, ConfigError> {
     if let Some(lines) = parse_repeatable_block(node)? {
         let mut out = Vec::with_capacity(lines.len());
@@ -1759,21 +1467,9 @@ pub(crate) fn parse_node(node: &KdlNode, profile: bool) -> Result<Vec<(Node, usi
     )])
 }
 
-/// A repeatable node written as a block, as the line-form nodes it
-/// stands for; `None` for every other node.
-///
-/// The child's name is what the line form's first argument was, and the
-/// child's properties come over unchanged, so the result goes through
-/// the node's own parser: `grant`'s dedup, every `ConfigError` shape and
-/// every check downstream stay exactly as they are for the line form,
-/// which is what makes the two spellings one grammar rather than two.
-/// `env` is the one kind with no positional argument to lift — its line
-/// form is `env KEY="value"` — so its child is `KEY "value"` and the
-/// name and the argument become the property.
-///
-/// Each synthesised node keeps the child's spans, so an error, a line
-/// number and a lint finding point at the line the entry is written on
-/// rather than at the block above it.
+/// A repeatable node written as a block, as the line-form nodes it stands for, each keeping its
+/// child's spans; `None` for every other node. The result goes through the line form's parser, so
+/// the two spellings are one grammar; `env`'s child `KEY "value"` becomes `KEY="value"`.
 pub(crate) fn parse_repeatable_block(node: &KdlNode) -> Result<Option<Vec<KdlNode>>, ConfigError> {
     let name = node.name().value();
     if !REPEATABLE.contains(&name) {
@@ -1792,8 +1488,6 @@ pub(crate) fn parse_repeatable_block(node: &KdlNode) -> Result<Option<Vec<KdlNod
     for child in kids.nodes() {
         reject_types(child)?;
         let mut line = line_form(name, child);
-        // The entries the child carried are the line form's, after the
-        // one its name becomes.
         let carried: Vec<kdl::KdlEntry> = child.entries().to_vec();
         line.entries_mut().clear();
         if name == "env" {
@@ -1823,19 +1517,11 @@ pub(crate) fn parse_repeatable_block(node: &KdlNode) -> Result<Option<Vec<KdlNod
     Ok(Some(out))
 }
 
-/// What an `env` block's child has to be. One string: the line form is
-/// `env KEY="value"`, and `KEY="value"` is an entry in KDL, not a name a
-/// node can be written under.
 const ENV_CHILD: &str = "an env child is one KEY \"value\" pair: exactly one string argument";
 
-/// The `portals` node: the bundle with its children, and separately the
-/// `camera` grant a `camera` child writes, with the offset of that child
-/// so a duplicate points at the line that wrote it. A bare node has no
-/// children and no camera.
+// The camera grant comes with its child's offset, so a duplicate points at that line.
 fn parse_portals(node: &KdlNode) -> Result<(Service, Option<(Service, usize)>), ConfigError> {
-    // Repeated here and not left to `parse_one`: a block is taken by
-    // `parse_node` before `parse_one` runs, so this is the only place a
-    // type annotation on a `portals` block is seen.
+    // A block is taken by `parse_node` before `parse_one` runs, so its type is checked here.
     reject_types(node)?;
     reject_arguments(node)?;
     let Some(kids) = node.children() else {
@@ -1888,10 +1574,6 @@ fn parse_portals(node: &KdlNode) -> Result<(Service, Option<(Service, usize)>), 
     Ok((Service::Portals { children }, camera))
 }
 
-/// The `pipewire` or `pulseaudio` node: bare grants playback, a
-/// `microphone` child adds capture, an `exclusive` child lets a stream
-/// hold a device for itself, and on `pipewire` a `devices` child lets the
-/// instance offer devices. Returns which children were given.
 fn parse_audio(node: &KdlNode) -> Result<AudioSet, ConfigError> {
     reject_types(node)?;
     reject_arguments(node)?;
@@ -1945,11 +1627,7 @@ fn parse_audio(node: &KdlNode) -> Result<AudioSet, ConfigError> {
     Ok(set)
 }
 
-/// `child` as the line-form node `name` would have been written as: the
-/// child's name becomes the first argument only where the caller asks
-/// for it, so this one keeps the entries and children as they are and
-/// only renames the node. The name and node spans stay the child's, so
-/// an error or a line number points where the text is.
+// Spans stay the child's, so an error or a line number points where the text is.
 fn line_form(name: &str, child: &KdlNode) -> KdlNode {
     let mut line = child.clone();
     let mut ident = KdlIdentifier::from(name);
@@ -1958,17 +1636,14 @@ fn line_form(name: &str, child: &KdlNode) -> KdlNode {
     line
 }
 
-/// One top-level node, whatever kind it is, with none of the checks that
-/// need the rest of the file: no duplicate, no `portals` needs `dbus`.
-/// An enabled node goes through here and then through those checks; a
-/// disabled one (`/-…`) goes through here alone, so a line the editor
-/// turned off is still a line bubbler would have read.
+/// One top-level node, without the checks that need the rest of the file (duplicates, `portals`
+/// needs `dbus`). A disabled `/-` node goes through here alone, so it is still a line bubbler
+/// reads.
 pub(crate) fn parse_one(node: &KdlNode, profile: bool) -> Result<Node, ConfigError> {
     let name = node.name().value();
     reject_types(node)?;
-    // Resolved against the table rather than by falling off the end
-    // of the match: an arm added without an entry there is a node
-    // the catalogue never describes, and the two lists would drift.
+    // Resolved against `NODES` rather than the match's last arm: an arm without an entry there
+    // would be a node the catalogue never describes.
     if !NODES.contains(&name) && name != "include" {
         return Err(ConfigError::UnknownNode(name.to_owned()));
     }
@@ -1989,10 +1664,7 @@ pub(crate) fn parse_one(node: &KdlNode, profile: bool) -> Result<Node, ConfigErr
                     microphone,
                     exclusive,
                 },
-                // Unreachable through the arm above, and an error
-                // rather than a fallback: a name added to that list
-                // and forgotten here would otherwise grant whichever
-                // service the fallback named.
+                // Unreachable; an error, not a fallback that would grant another service.
                 other => return Err(ConfigError::UnknownNode(other.to_owned())),
             })
         }
@@ -2004,10 +1676,7 @@ pub(crate) fn parse_one(node: &KdlNode, profile: bool) -> Result<Node, ConfigErr
                 "hidraw" => Service::Hidraw,
                 "a11y" => Service::A11y,
                 "input-method" => Service::InputMethod,
-                // Unreachable through the arm above, and an error
-                // rather than a fallback: a name added to that list
-                // and forgotten here would otherwise grant whichever
-                // service the fallback named.
+                // Unreachable; an error, not a fallback that would grant another service.
                 other => return Err(ConfigError::UnknownNode(other.to_owned())),
             })
         }
@@ -2033,10 +1702,7 @@ pub(crate) fn parse_one(node: &KdlNode, profile: bool) -> Result<Node, ConfigErr
         }
         "portals" => {
             let (portals, camera) = parse_portals(node)?;
-            // Only `parse_node` above reaches a `portals` node holding a
-            // `camera` child, and it takes the camera itself: one `Node`
-            // has nowhere to put a second grant, so a caller arriving
-            // here with one would drop it.
+            // Only `parse_node` reaches a block with a `camera` child, and takes the camera itself.
             debug_assert!(camera.is_none(), "a portals block goes through parse_node");
             return Ok(Node::Service(portals));
         }
@@ -2061,9 +1727,7 @@ pub(crate) fn parse_one(node: &KdlNode, profile: bool) -> Result<Node, ConfigErr
             Node::Env(pairs)
         }
         "lint-allow" => Node::LintAllow(vec![parse_lint_allow(node)?]),
-        // `include` names a layer to merge under this one; it grants
-        // nothing, so there is no node to hold it. A profile takes it in
-        // the loop above, and what reaches here is a `/-include` line.
+        // A profile takes `include` in `parse_doc`; what reaches here is a `/-include` line.
         "include" => {
             return Err(bad(
                 node,
@@ -2080,10 +1744,8 @@ pub(crate) fn parse_one(node: &KdlNode, profile: bool) -> Result<Node, ConfigErr
     })
 }
 
-/// Add one grant, refusing a second node that would grant the same
-/// thing. What "the same" is differs by node: a share is one path or one
-/// id, and a node carrying a mode or children is one per file, since two
-/// of them would leave the width of the grant to file order.
+// A share is one per path or id; a node with a mode or children is one per file, or the grant's
+// width would be left to file order.
 fn grant(held: &mut Vec<Service>, svc: Service) -> Result<(), ConfigError> {
     let twice = match &svc {
         Service::HomeShare { path, .. } => held
@@ -2092,9 +1754,7 @@ fn grant(held: &mut Vec<Service>, svc: Service) -> Result<(), ConfigError> {
         Service::PathShare { path, .. } => held
             .iter()
             .any(|s| matches!(s, Service::PathShare { path: p, .. } if p == path)),
-        // Keyed on the entry rather than on the whole node so that a
-        // property added to `etc-share` later cannot make two nodes for
-        // one entry, the way a mode did for the two shares above.
+        // Keyed on the entry alone, so a property added later cannot make two nodes for one entry.
         Service::EtcShare { name } => held
             .iter()
             .any(|s| matches!(s, Service::EtcShare { name: n } if n == name)),
@@ -2110,8 +1770,6 @@ fn grant(held: &mut Vec<Service>, svc: Service) -> Result<(), ConfigError> {
         Service::Dbus { .. } => held.iter().any(|s| matches!(s, Service::Dbus { .. })),
         Service::SystemBus { .. } => held.iter().any(|s| matches!(s, Service::SystemBus { .. })),
         Service::Mpris { .. } => held.iter().any(|s| matches!(s, Service::Mpris { .. })),
-        // A second `portals` node would leave which set of children
-        // applies to file order.
         Service::Portals { .. } => held.iter().any(|s| matches!(s, Service::Portals { .. })),
         // The rest carry nothing a second node could differ in, so an
         // equal grant is the same grant.
@@ -2124,10 +1782,8 @@ fn grant(held: &mut Vec<Service>, svc: Service) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// How many entries of each section a file has written so far, counted
-/// the way [`crate::kdl_out::nodes`] writes them back. A disabled node
-/// is remembered as an index into its own section, and this is what that
-/// index counts.
+// Entries per section written so far, counted as `kdl_out::nodes` writes them back: what a
+// disabled node's `before` indexes.
 #[derive(Debug, Clone, Copy, Default)]
 struct Counts {
     lint_allows: usize,
@@ -2143,7 +1799,6 @@ struct Counts {
 }
 
 impl Counts {
-    /// What `cfg` has written so far.
     fn of(cfg: &InstanceConfig) -> Self {
         Self {
             lint_allows: cfg.lint_allows.len(),
@@ -2159,7 +1814,6 @@ impl Counts {
         }
     }
 
-    /// Where a disabled `node` sits among the entries of its own section.
     fn before(&self, node: &Node) -> usize {
         match node {
             Node::Service(_) => self.services,
@@ -2176,12 +1830,8 @@ impl Counts {
     }
 }
 
-/// Which section of the file a node belongs to, numbered in the order
-/// [`crate::kdl_out::nodes`] writes the sections. Kept in step with that
-/// function by the round trip: a rank out of order writes a config that
-/// parses back as a different one. Everything that sorts or groups
-/// disabled entries — the parser here, the editor's rows — ranks them
-/// through this, so there is one order and not one per reader.
+/// The section a node belongs to, ranked in the order [`crate::kdl_out::nodes`] writes them. Every
+/// sort or grouping of disabled entries goes through this; the round trip keeps the two in step.
 pub fn section_rank(node: &Node) -> u8 {
     match node {
         Node::LintAllow(_) => 0,
@@ -2197,16 +1847,8 @@ pub fn section_rank(node: &Node) -> u8 {
     }
 }
 
-/// The disabled entries written in one run of leading or trailing text,
-/// which is where the KDL parser leaves a `/-` node it dropped. The
-/// markers are found first and the text parsed once with them cut out:
-/// what was written `/-` is then a node like any other, and what was not
-/// — an indented one, one inside a comment, a string or a block — is
-/// left exactly as it was. One parse, because the bound bubbler puts on
-/// the text it parses is only a bound on the work if the text is parsed
-/// a fixed number of times. A line that is valid KDL but not a node
-/// bubbler takes refuses the file, the way the enabled line would: an
-/// entry the editor turned off is one it can turn back on.
+// The `/-` markers are cut out and the text parsed once: the size bound bounds the work only if
+// each text is parsed a fixed number of times.
 fn disabled_in(text: &str, profile: bool, at: Counts) -> Result<Vec<Disabled>, ConfigError> {
     let marks = slashdash_marks(text);
     if marks.is_empty() {
@@ -2232,13 +1874,8 @@ fn disabled_in(text: &str, profile: bool, at: Counts) -> Result<Vec<Disabled>, C
     Ok(out)
 }
 
-/// Where every `/-` that opens a line of `text` is, in order. Only
-/// column zero at the top level counts: KDL drops an indented `/-` node
-/// as well and bubbler leaves that the comment it reads as, and a `/-`
-/// child of a node is a comment whether the node above it is granted or
-/// kept. Comments, strings and esclines are stepped over rather than
-/// searched — a `/-` inside one is not a node, and the line under an
-/// escline continues the node above rather than opening one.
+// Only a `/-` at column zero of the top level is a disabled node; comments, strings and esclines
+// are stepped over, since a `/-` inside one is not a node.
 fn slashdash_marks(text: &str) -> Vec<usize> {
     let b = text.as_bytes();
     let mut out = Vec::new();
@@ -2291,9 +1928,7 @@ fn slashdash_marks(text: &str) -> Vec<usize> {
     out
 }
 
-/// Index just past the newline the escline at `at` ends on. KDL lets a
-/// `\` carry a node onto the line below, so nothing on that line opens a
-/// node of its own.
+// KDL's `\` carries a node onto the line below, so nothing on that line opens a node.
 fn escline_end(b: &[u8], at: usize) -> usize {
     let mut i = at + 1;
     while i < b.len() {
@@ -2309,9 +1944,6 @@ fn escline_end(b: &[u8], at: usize) -> usize {
     b.len()
 }
 
-/// `include "<profile>"`: one string argument, repeatable. The name is
-/// checked against the profile directories by the resolver, which is
-/// where a name that cannot be looked up is a `NotFound`.
 fn parse_include(node: &KdlNode) -> Result<String, ConfigError> {
     let name = one_string_arg(node)?;
     if node.children().is_some() {
@@ -2320,14 +1952,11 @@ fn parse_include(node: &KdlNode) -> Result<String, ConfigError> {
     Ok(name.to_owned())
 }
 
-/// Two `dbus` nodes hold different rules, so the grant is recognised by
-/// its variant rather than by value.
 fn has_dbus(services: &[Service]) -> bool {
     services.iter().any(|s| matches!(s, Service::Dbus { .. }))
 }
 
-/// The bundles are only sets of proxy rules; without `dbus` there is no
-/// proxy to carry them, and the grant would be silently dropped.
+// Without `dbus` no proxy carries a bundle's rules, and the grant would be dropped silently.
 fn bundle_without_dbus(services: &[Service]) -> Option<&'static str> {
     if has_dbus(services) {
         return None;
@@ -2343,11 +1972,8 @@ fn bundle_without_dbus(services: &[Service]) -> Option<&'static str> {
     })
 }
 
-/// Whether a `camera` node is granted with no `portals` to carry it.
-/// The portal is the whole of the bare grant and half of `nodes=#true`,
-/// and without `/.flatpak-info` the portal reads the sandbox as an
-/// ordinary process: the permission it stores is then the blanket one
-/// every unsandboxed process on the machine shares, not this instance's.
+// Without `portals`' `/.flatpak-info` the camera portal stores the blanket permission every
+// unsandboxed process shares.
 fn camera_without_portals(services: &[Service]) -> bool {
     services.iter().any(|s| matches!(s, Service::Camera { .. }))
         && !services
@@ -2355,11 +1981,8 @@ fn camera_without_portals(services: &[Service]) -> bool {
             .any(|s| matches!(s, Service::Portals { .. }))
 }
 
-/// Whether a nested `x11` is granted without what the server it starts
-/// needs: the Xwayland inside is a Wayland client, and it renders
-/// through glamor, which has no software path here — without `wayland`
-/// it has nothing to connect to and without `dri` it dies on the first
-/// frame, so the display the config promises would never exist.
+// The nested Xwayland is a Wayland client rendering through glamor, which has no software path:
+// without `wayland` and `dri` the display never exists.
 fn nested_x11_without_display_stack(services: &[Service]) -> bool {
     services
         .iter()
@@ -2375,8 +1998,6 @@ fn bad(node: &KdlNode, reason: &str) -> ConfigError {
     }
 }
 
-/// KDL type annotations are syntax we do not interpret, so they must not
-/// pass silently.
 fn reject_types(node: &KdlNode) -> Result<(), ConfigError> {
     if node.ty().is_some() || node.entries().iter().any(|e| e.ty().is_some()) {
         return Err(bad(node, "type annotations are not supported"));
@@ -2384,7 +2005,6 @@ fn reject_types(node: &KdlNode) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Flag-style services take no arguments, properties or children.
 fn reject_entries(node: &KdlNode) -> Result<(), ConfigError> {
     reject_arguments(node)?;
     if node.children().is_some() {
@@ -2406,9 +2026,6 @@ fn reject_arguments(node: &KdlNode) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// `<node> "<value>" [mode=ro|rw]`, the shape `home-share`, `path-share`
-/// and `app-runtime` have in common; `validate` decides which values the
-/// node accepts and normalises them, and `what` names them in its errors.
 fn parse_share<T>(
     node: &KdlNode,
     what: &str,
@@ -2437,11 +2054,8 @@ fn parse_share<T>(
                     _ => return Err(bad(node, "mode must be \"ro\" or \"rw\"")),
                 };
             }
-            // Guarded by the caller rather than a fixed list of node
-            // names: `app-runtime` shares this parser but has no
-            // `optional` property, since its `id` names a directory
-            // bubbler itself makes, never a path an app may or may not
-            // have installed.
+            // `app-runtime` has no `optional`: its id names a directory bubbler makes, never a
+            // path an app may or may not have installed.
             Some("optional") if allow_optional => {
                 optional = e
                     .value()
@@ -2463,10 +2077,8 @@ fn parse_share<T>(
     Ok((value, mode, optional))
 }
 
-/// The id of an `app-runtime` node. Validated as an application id
-/// because that is what every consumer of the `app/` convention writes:
-/// it rules out `.`, `..`, anything holding `/`, and every single-element
-/// name, so an id can never name one of bubbler's own runtime children.
+// An application id rules out `.`, `..`, `/` and single-element names, so it never names one
+// of bubbler's own runtime children.
 fn validate_app_id(node: &KdlNode, s: &str) -> Result<String, ConfigError> {
     if !dbus::is_valid_app_id(s) {
         return Err(bad(
@@ -2517,7 +2129,7 @@ pub fn is_bus_name(s: &str) -> bool {
     is_name_glob(s, 2)
 }
 
-/// `mpris name` is a suffix of a bus name, so one element is enough there.
+// `mpris name` is a suffix of a bus name, so one element is enough there.
 fn is_name_glob(s: &str, min_elements: usize) -> bool {
     let mut count = 0;
     let mut elements = s.split('.').peekable();
@@ -2539,17 +2151,14 @@ fn is_name_element(s: &str) -> bool {
         && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// `dbus` itself is bare; every rule is a child node. Names are checked
-/// here so a typo cannot become a silent hole in the proxy filter.
+// Names are checked so a typo cannot become a silent hole in the proxy filter.
 fn parse_dbus(node: &KdlNode) -> Result<Service, ConfigError> {
     Ok(Service::Dbus {
         rules: parse_bus_rules(node, true)?,
     })
 }
 
-/// `system-bus { see|talk|call|broadcast "<name>" }`: the children `dbus`
-/// takes minus `own`, and at least one of them, since a bus that answers
-/// nothing is not what the node was written for.
+// At least one rule: a bus that answers nothing is not what the node was written for.
 fn parse_system_bus(node: &KdlNode) -> Result<Service, ConfigError> {
     let rules = parse_bus_rules(node, false)?;
     if rules.is_empty() {
@@ -2561,8 +2170,6 @@ fn parse_system_bus(node: &KdlNode) -> Result<Service, ConfigError> {
     Ok(Service::SystemBus { rules })
 }
 
-/// The rule children both bus nodes take, `own` among them only when
-/// `own_allowed`.
 fn parse_bus_rules(node: &KdlNode, own_allowed: bool) -> Result<Vec<BusRule>, ConfigError> {
     reject_arguments(node)?;
     let mut rules = Vec::new();
@@ -2625,8 +2232,7 @@ fn parse_bus_rules(node: &KdlNode, own_allowed: bool) -> Result<Vec<BusRule>, Co
     Ok(rules)
 }
 
-/// The value is not echoed back: it is arbitrary text and may hold the
-/// control bytes the error message would then carry.
+// Not echoed back: the value is arbitrary text and may hold control bytes.
 fn bus_name(node: &KdlNode, s: &str) -> Result<String, ConfigError> {
     if !is_bus_name(s) {
         return Err(bad(
@@ -2686,8 +2292,7 @@ fn parse_mpris(node: &KdlNode) -> Result<Service, ConfigError> {
     Ok(Service::Mpris { name })
 }
 
-/// bwrap 0.11.2 exits when `--setenv` is given an empty key or one holding
-/// `=`, so only a C-identifier key can reach it.
+// bwrap 0.11.2 exits when a `--setenv` key is empty or holds `=`.
 fn is_env_key(key: &str) -> bool {
     let mut bytes = key.bytes();
     bytes
@@ -2696,9 +2301,8 @@ fn is_env_key(key: &str) -> bool {
         && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
-/// Names a byte that cannot appear in a value bubbler turns into an argv
-/// element: `execve` cuts a string at NUL, and a line break would forge an
-/// extra element in `--dry-run` output, which is one element per line.
+// `execve` cuts a string at NUL, and a line break would forge an element in `--dry-run` output,
+// which is one element per line.
 fn forbidden_byte(s: &str) -> Option<&'static str> {
     s.bytes().find_map(|b| match b {
         0 => Some("a NUL byte"),
@@ -2708,10 +2312,7 @@ fn forbidden_byte(s: &str) -> Option<&'static str> {
     })
 }
 
-/// `lint-allow "<check-id>" reason="<text>"`. The id is resolved against
-/// the check table, so a typo cannot leave a finding un-silenced and the
-/// file's author none the wiser; an id whose check reports an error is
-/// refused for the same reason, since nothing would ever silence it.
+// Resolved against the check table, so a typo cannot leave a finding silently un-silenced.
 fn parse_lint_allow(node: &KdlNode) -> Result<LintAllow, ConfigError> {
     let mut id: Option<&str> = None;
     let mut reason: Option<&str> = None;
@@ -2747,8 +2348,7 @@ fn parse_lint_allow(node: &KdlNode) -> Result<LintAllow, ConfigError> {
     }
     let id = id.ok_or_else(|| bad(node, "expects exactly one check id argument"))?;
     let Some(check) = crate::lint::check(id) else {
-        // The id is echoed back only after the table has recognised the
-        // shape of it: a plain kebab-case word carries no control bytes.
+        // Echoed only in the shape of a check id: a kebab-case word carries no control bytes.
         let shape = id
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
@@ -2815,9 +2415,7 @@ fn parse_env(node: &KdlNode, out: &mut Vec<(String, String)>) -> Result<(), Conf
     Ok(())
 }
 
-/// Only absolute paths whose every other component is a normal name. The
-/// path is bound at what it says, so `..` in it would name one thing here
-/// and another inside the sandbox.
+// Bound at what it says, so `..` would name one thing here and another in the sandbox.
 fn validate_absolute(node: &KdlNode, s: &str) -> Result<PathBuf, ConfigError> {
     let p = Path::new(s);
     let mut comps = p.components();
@@ -2831,7 +2429,6 @@ fn validate_absolute(node: &KdlNode, s: &str) -> Result<PathBuf, ConfigError> {
     Ok(p.components().collect())
 }
 
-/// Only plain relative paths: every component must be a normal name.
 fn validate_relative(node: &KdlNode, s: &str) -> Result<PathBuf, ConfigError> {
     let p = Path::new(s);
     if s.is_empty() || !p.components().all(|c| matches!(c, Component::Normal(_))) {
@@ -2843,21 +2440,8 @@ fn validate_relative(node: &KdlNode, s: &str) -> Result<PathBuf, ConfigError> {
     Ok(p.components().collect())
 }
 
-/// `network ["host"|"none"] { dns "<ip>"; allow-port <n> [udp=#true];
-/// outbound "deny"; allow-out "<ip>[/<len>]" [port=<n>] [proto="tcp"];
-/// allow-host "<name>" [port=<n>]; no-ipv6 }`. The bare node is the
-/// sandbox's own network namespace, which is the default; the two
-/// spellings name the host's namespace and no namespace at all.
-///
-/// `dns` says what the sandbox's resolver file holds, so it belongs to
-/// the two modes that have a network to carry a query; under `none` it
-/// is refused. The other children configure the sandbox's own namespace
-/// — the pasta sidecar and the nftables ruleset in it — and only the
-/// isolated mode has one. None of them is ignored where it cannot apply:
-/// that would leave a config granting less than it says. `allow-out`
-/// without `outbound "deny"` is refused for the same reason from the
-/// other side: it would name rules nothing installs, and `allow-host`
-/// without it would name what a sandbox nothing filters reaches anyway.
+// No child is ignored where its mode cannot apply, which would grant less than the file says:
+// `dns` needs a network, the rest the isolated namespace, `allow-*` an `outbound "deny"`.
 fn parse_network(node: &KdlNode) -> Result<Service, ConfigError> {
     let mut cfg = NetworkConfig::default();
     let mut seen_mode = false;
@@ -2887,10 +2471,8 @@ fn parse_network(node: &KdlNode) -> Result<Service, ConfigError> {
         match child.name().value() {
             "dns" => {
                 let ip = parse_dns(child)?;
-                // The sandbox's loopback is its own, so such an address
-                // names a resolver inside the sandbox and never the host
-                // one meant. pasta refuses a loopback `--dns-forward` for
-                // the same reason.
+                // The isolated sandbox's loopback is its own; pasta refuses a loopback
+                // `--dns-forward` too.
                 if ip.is_loopback() && cfg.mode == NetworkMode::Isolated {
                     return Err(bad(
                         child,
@@ -3009,12 +2591,8 @@ fn parse_network(node: &KdlNode) -> Result<Service, ConfigError> {
              reachable already and no proxy runs",
         ));
     }
-    // pasta forwards a port by connecting to it inside the namespace
-    // (`pasta(1)`, "Handling of local traffic"), and inside the
-    // namespace that port is the egress proxy: the forward would publish
-    // bubbler's own proxy on the host's loopback for anything on the host
-    // to reach, with the sandbox's allowlist as the only thing between it
-    // and the names the proxy may dial.
+    // pasta serves a forwarded port from inside the namespace, where this port is the egress
+    // proxy: the forward would publish the proxy on the host's loopback.
     if !cfg.allow_hosts.is_empty() && cfg.forwards.iter().any(|f| f.port == PROXY_PORT) {
         return Err(bad(
             node,
@@ -3024,12 +2602,8 @@ fn parse_network(node: &KdlNode) -> Result<Service, ConfigError> {
             ),
         ));
     }
-    // The same port from the other side: inside the namespace it is the
-    // proxy's own listener, so a name granted on it is a name the proxy
-    // would dial itself for as soon as it resolved to the loopback it
-    // sits on — a tunnel slot per request and no egress at all. The
-    // proxy refuses an inward address anyway; this is so the config
-    // says why rather than the run failing later.
+    // On the proxy's own port a granted name has the proxy dial itself; the proxy refuses that
+    // anyway, and this says why at parse time.
     if let Some(allowed) = cfg.allow_hosts.iter().find(|a| a.port == PROXY_PORT) {
         return Err(bad(
             node,
@@ -3042,9 +2616,6 @@ fn parse_network(node: &KdlNode) -> Result<Service, ConfigError> {
     Ok(Service::Network(cfg))
 }
 
-/// `allow-out "<ip>[/<len>]" [port=<n>] [proto="tcp"|"udp"]`: one
-/// destination, every port and both protocols unless the properties
-/// narrow it.
 fn parse_allow_out(node: &KdlNode) -> Result<AllowOut, ConfigError> {
     let mut dest: Option<Cidr> = None;
     let mut port: Option<u16> = None;
@@ -3095,12 +2666,7 @@ fn parse_allow_out(node: &KdlNode) -> Result<AllowOut, ConfigError> {
     Ok(AllowOut { dest, port, proto })
 }
 
-/// `allow-host "<name>" [port=<n>]`: one name, reached on
-/// [`AllowHost::DEFAULT_PORT`] unless the property says otherwise.
-///
-/// What a name may be is [`HostPattern`]'s to say, and its reason is
-/// passed on as written: like the others here it never echoes the
-/// value, which is arbitrary text out of a config file.
+// The reason comes from `HostPattern`, which never echoes the value either.
 fn parse_allow_host(node: &KdlNode) -> Result<AllowHost, ConfigError> {
     let mut pattern: Option<HostPattern> = None;
     let mut port: Option<u16> = None;
@@ -3143,15 +2709,12 @@ fn parse_allow_host(node: &KdlNode) -> Result<AllowHost, ConfigError> {
     })
 }
 
-/// `dns "<ip>"`. The value is not echoed back: it is arbitrary text and
-/// may hold the control bytes the error message would then carry.
+// Not echoed back: the value is arbitrary text and may hold control bytes.
 fn parse_dns(node: &KdlNode) -> Result<IpAddr, ConfigError> {
     let s = one_string_arg(node)?;
     IpAddr::from_str(s).map_err(|_| bad(node, "expects an IP address such as \"1.1.1.1\""))
 }
 
-/// `allow-port <n> [udp=#true]`: one port number, TCP unless the property
-/// says otherwise.
 fn parse_allow_port(node: &KdlNode) -> Result<Forward, ConfigError> {
     let mut port: Option<u16> = None;
     let mut udp: Option<bool> = None;
@@ -3194,8 +2757,6 @@ fn parse_allow_port(node: &KdlNode) -> Result<Forward, ConfigError> {
     })
 }
 
-/// `gamepad [hidraw=#true] [uinput=#true]`: the bare node is the evdev
-/// grant, and each property adds one more class of device node to it.
 fn parse_gamepad(node: &KdlNode) -> Result<Service, ConfigError> {
     let mut hidraw: Option<bool> = None;
     let mut uinput: Option<bool> = None;
@@ -3213,8 +2774,7 @@ fn parse_gamepad(node: &KdlNode) -> Result<Service, ConfigError> {
                 });
             }
         };
-        // Written twice, the two entries disagree about a device class
-        // and the winner would be a matter of their order in the line.
+        // Two entries would leave the winner to their order in the line.
         if slot.is_some() {
             return Err(ConfigError::Duplicate(format!(
                 "{} {prop}",
@@ -3236,10 +2796,7 @@ fn parse_gamepad(node: &KdlNode) -> Result<Service, ConfigError> {
     })
 }
 
-/// `<width>x<height>`, both positive decimals, as Xwayland's
-/// `-geometry` takes it. Returns the canonical spelling: a value the
-/// parser accepted and rewrote differently would not survive being
-/// written back to the config file.
+// Returns the canonical spelling, so an accepted value survives being written back.
 fn parse_geometry(s: &str) -> Option<String> {
     let (w, h) = s.split_once('x')?;
     // No sign, no leading zero, no unit: `-1`, `01` and `1280px` are all
@@ -3251,9 +2808,6 @@ fn parse_geometry(s: &str) -> Option<String> {
     Some(format!("{}x{}", positive(w)?, positive(h)?))
 }
 
-/// `etc ["host"]`: the bare node keeps the tmpfs allowlist, `"host"`
-/// binds the host's whole `/etc` read-only in its place. Nothing about
-/// either is configurable, so no property and no child applies to it.
 fn parse_etc(node: &KdlNode) -> Result<EtcMode, ConfigError> {
     if node.children().is_some() {
         return Err(bad(node, "takes no children"));
@@ -3288,11 +2842,7 @@ fn parse_etc(node: &KdlNode) -> Result<EtcMode, ConfigError> {
     })
 }
 
-/// `wayland ["host"] [clipboard="open"]`: the bare node is the security
-/// context, and the property is the one thing about the proxy in front
-/// of it a config decides. A property with `"host"` is an error rather
-/// than a value dropped quietly: there is no proxy on the session's
-/// socket, so a gate written there would be one nothing applies.
+// A property beside `"host"` is an error: no proxy sits on the session's socket to apply it.
 fn parse_wayland(node: &KdlNode) -> Result<WaylandMode, ConfigError> {
     if node.children().is_some() {
         return Err(bad(node, "takes no children"));
@@ -3322,8 +2872,7 @@ fn parse_wayland(node: &KdlNode) -> Result<WaylandMode, ConfigError> {
                 prop: prop.to_owned(),
             });
         }
-        // Written twice, the two entries disagree about the gate and the
-        // winner would be a matter of their order in the line.
+        // Two entries would leave the winner to their order in the line.
         if clipboard.is_some() {
             return Err(ConfigError::Duplicate(format!(
                 "{} {prop}",
@@ -3334,9 +2883,8 @@ fn parse_wayland(node: &KdlNode) -> Result<WaylandMode, ConfigError> {
             .value()
             .as_string()
             .ok_or_else(|| bad(node, "clipboard must be \"open\""))?;
-        // Only the way out of the default: the gate is what the proxy is
-        // for, and `clipboard="paste"` would be a second spelling of the
-        // bare node for the emitter to choose between.
+        // Only the way out of the default: `clipboard="paste"` would be a second spelling of the
+        // bare node.
         if s != "open" {
             return Err(bad(node, &format!("expected `open`, got `{s}`")));
         }
@@ -3353,11 +2901,7 @@ fn parse_wayland(node: &KdlNode) -> Result<WaylandMode, ConfigError> {
     })
 }
 
-/// `x11 ["host"] [geometry="WxH"] [fullscreen=#true] [grab=#true]
-/// [wm="<program>"]`: the bare node is a nested Xwayland the properties
-/// describe the window of. A property with `"host"` is an error rather
-/// than a value dropped quietly: the session's server is not this
-/// sandbox's to size, nor its windows this sandbox's to manage.
+// A property beside `"host"` is an error: the session's server is not this sandbox's to size.
 fn parse_x11(node: &KdlNode) -> Result<X11Mode, ConfigError> {
     if node.children().is_some() {
         return Err(bad(node, "takes no children"));
@@ -3384,8 +2928,7 @@ fn parse_x11(node: &KdlNode) -> Result<X11Mode, ConfigError> {
             host = true;
             continue;
         };
-        // Written twice, the two entries disagree about the window and
-        // the winner would be a matter of their order in the line.
+        // Two entries would leave the winner to their order in the line.
         let dup = || ConfigError::Duplicate(format!("{} {prop}", node.name().value()));
         match prop {
             "geometry" => {
@@ -3411,13 +2954,8 @@ fn parse_x11(node: &KdlNode) -> Result<X11Mode, ConfigError> {
                     .value()
                     .as_string()
                     .ok_or_else(|| bad(node, "wm must be a string like \"twm\""))?;
-                // One program name, resolved on the sandbox's own `PATH`:
-                // a path would name a host binary the sandbox may not
-                // hold, and a name with whitespace in it would be an
-                // argument list the supervisor does not split. A leading
-                // `-` is refused because the name is passed to
-                // `bubbler-init` as the argument of `--wm`: a value that
-                // reads as a switch would be one.
+                // One name on the sandbox's `PATH`: no host path, no argument list, and no
+                // leading `-`, since it is passed as the argument of `bubbler-init --wm`.
                 if s.is_empty()
                     || s.starts_with('-')
                     || s.contains('/')
@@ -3470,8 +3008,6 @@ fn parse_x11(node: &KdlNode) -> Result<X11Mode, ConfigError> {
     }))
 }
 
-/// `camera [nodes=#true]`: the bare node is the portal grant, which
-/// binds nothing, and the property adds the V4L2 device nodes to it.
 fn parse_camera(node: &KdlNode) -> Result<Service, ConfigError> {
     let mut nodes: Option<bool> = None;
     for e in node.entries() {
@@ -3484,8 +3020,7 @@ fn parse_camera(node: &KdlNode) -> Result<Service, ConfigError> {
                 prop: prop.to_owned(),
             });
         }
-        // Written twice, the two entries disagree about the device nodes
-        // and the winner would be a matter of their order in the line.
+        // Two entries would leave the winner to their order in the line.
         if nodes.is_some() {
             return Err(ConfigError::Duplicate(format!(
                 "{} {prop}",
@@ -3506,9 +3041,6 @@ fn parse_camera(node: &KdlNode) -> Result<Service, ConfigError> {
     })
 }
 
-/// `dri [kms=#true]`: the bare node is the render nodes and the sysfs a
-/// driver reads, and the property adds the primary nodes mode setting
-/// goes through.
 fn parse_dri(node: &KdlNode) -> Result<Service, ConfigError> {
     let mut kms: Option<bool> = None;
     for e in node.entries() {
@@ -3521,8 +3053,7 @@ fn parse_dri(node: &KdlNode) -> Result<Service, ConfigError> {
                 prop: prop.to_owned(),
             });
         }
-        // Written twice, the two entries disagree about the card nodes
-        // and the winner would be a matter of their order in the line.
+        // Two entries would leave the winner to their order in the line.
         if kms.is_some() {
             return Err(ConfigError::Duplicate(format!(
                 "{} {prop}",
@@ -3543,7 +3074,6 @@ fn parse_dri(node: &KdlNode) -> Result<Service, ConfigError> {
     })
 }
 
-/// `userns "allow"|"disable"`, the same shape `tty` has.
 fn parse_userns(node: &KdlNode) -> Result<Userns, ConfigError> {
     let arg = one_string_arg(node)?;
     if node.children().is_some() {
@@ -3552,11 +3082,8 @@ fn parse_userns(node: &KdlNode) -> Result<Userns, ConfigError> {
     Userns::from_str(arg)
 }
 
-/// `tmp size="2G"`: one `size=` property, a decimal number with a `K`,
-/// `M` or `G` suffix, at most [`TMP_SIZE_MAX`]. No argument and no
-/// children. The suffix is required: a bare number in a config that also
-/// writes `2G` elsewhere would read as bytes to bubbler and as gibibytes
-/// to everyone else.
+// The suffix is required: a bare number would read as bytes to bubbler and as gibibytes to a
+// reader who sees `2G` elsewhere.
 fn parse_tmp(node: &KdlNode) -> Result<TmpSize, ConfigError> {
     if node.children().is_some() {
         return Err(bad(node, "takes no children"));
@@ -3613,9 +3140,7 @@ fn parse_tmp(node: &KdlNode) -> Result<TmpSize, ConfigError> {
     Ok(TmpSize(bytes))
 }
 
-/// `tty "pty"|"passthrough"|"none"`. The name of the mode is the whole
-/// node: an unknown one is an error, never a silent fallback to the
-/// default, which would give the sandbox a terminal the file refused it.
+// An unknown mode is an error, never a fallback giving the sandbox a terminal the file refused.
 fn parse_tty(node: &KdlNode) -> Result<TtyMode, ConfigError> {
     let arg = one_string_arg(node)?;
     if node.children().is_some() {
@@ -3624,9 +3149,7 @@ fn parse_tty(node: &KdlNode) -> Result<TtyMode, ConfigError> {
     TtyMode::from_str(arg)
 }
 
-/// `seccomp` itself is bare; every rule is a child node. Names are resolved
-/// by libseccomp here, so a typo cannot silently leave a syscall allowed
-/// the profile meant to deny.
+// Names are resolved by libseccomp, so a typo cannot leave allowed a syscall meant denied.
 fn parse_seccomp(node: &KdlNode) -> Result<SeccompConfig, ConfigError> {
     reject_arguments(node)?;
     let mut cfg = SeccompConfig::default();
@@ -3669,8 +3192,7 @@ fn parse_seccomp(node: &KdlNode) -> Result<SeccompConfig, ConfigError> {
     Ok(cfg)
 }
 
-/// The syscall names argued to one `allow` or `deny` child. `errno` is
-/// [`deny_errno`]'s business; any other property is an error.
+// `errno` is `deny_errno`'s business; any other property is an error.
 fn syscall_names(node: &KdlNode) -> Result<Vec<String>, ConfigError> {
     let mut names = Vec::new();
     for e in node.entries() {
@@ -3695,9 +3217,7 @@ fn syscall_names(node: &KdlNode) -> Result<Vec<String>, ConfigError> {
     Ok(names)
 }
 
-/// A name is echoed back only once it is known to be a plain identifier:
-/// config text is untrusted and may hold the control bytes the error
-/// message would then carry.
+// Echoed only once known to be a plain identifier: config text may hold control bytes.
 fn syscall_name(node: &KdlNode, s: &str) -> Result<String, ConfigError> {
     let plain = !s.is_empty()
         && s.bytes()
@@ -3717,8 +3237,7 @@ fn syscall_name(node: &KdlNode, s: &str) -> Result<String, ConfigError> {
     Ok(s.to_owned())
 }
 
-/// `deny` without `errno` means `EPERM`; KDL lets a property repeat, and
-/// the last one wins.
+// Without `errno` a deny is `EPERM`; KDL lets a property repeat, and the last one wins.
 fn deny_errno(node: &KdlNode) -> Result<Errno, ConfigError> {
     let mut errno = Errno::Eperm;
     // Every occurrence is checked, not only the one KDL lets win: a
@@ -3737,10 +3256,8 @@ fn deny_errno(node: &KdlNode) -> Result<Errno, ConfigError> {
     Ok(errno)
 }
 
-/// `desktop "<name>.desktop"`: the basename of the vendor entry an
-/// instance's launcher entry is written from. A basename and not a path,
-/// because the entry is looked up in the XDG application directories; a
-/// path here would name a file outside them that nothing re-checks.
+// A basename: the entry is looked up in the XDG application directories, and a path would name
+// a file outside them that nothing re-checks.
 fn parse_desktop(node: &KdlNode) -> Result<String, ConfigError> {
     let name = one_string_arg(node)?;
     if node.children().is_some() {
@@ -3750,8 +3267,7 @@ fn parse_desktop(node: &KdlNode) -> Result<String, ConfigError> {
         .strip_suffix(".desktop")
         .is_some_and(|stem| !stem.is_empty() && !stem.contains('/') && stem != "." && stem != "..");
     if !plain || forbidden_byte(name).is_some() {
-        // Not echoed back: the value is config text and may hold the
-        // control bytes the error message would then carry.
+        // Not echoed back: config text may hold control bytes.
         return Err(bad(
             node,
             "expects the file name of a desktop entry, such as \"org.example.App.desktop\"",
