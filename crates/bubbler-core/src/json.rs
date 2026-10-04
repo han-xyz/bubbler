@@ -4,8 +4,6 @@
 //! which is the one thing in a hand-written encoder that is easy to get
 //! subtly wrong.
 
-/// `s` as a JSON string literal.
-///
 /// Every control character is escaped, `DEL` and the C1 range included:
 /// a value out of a config bubbler did not write reaches a terminal
 /// through the reader of this JSON, and U+009B is a one-character CSI
