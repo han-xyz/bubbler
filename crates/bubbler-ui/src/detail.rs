@@ -99,13 +99,12 @@ impl Row {
 /// The instance being edited, its unsaved config, and what the linter
 /// makes of that config as it stands.
 pub struct Detail {
-    /// The instance, opened once: its `save` is the only writer.
+    // The instance, opened once: its `save` is the only writer.
     inst: Instance,
     /// The profile its header names, for the title line.
     pub profile: Option<String>,
     /// The config as edited.
     pub buf: InstanceConfig,
-    /// The config as last written, which is what `u` goes back to.
     saved: InstanceConfig,
     /// The rows the pane shows: every entry the config holds, granted
     /// or disabled, the row that adds another entry of a repeatable
@@ -186,14 +185,9 @@ impl Detail {
                 self.trouble = Some(e);
             }
         }
-        // The selection follows the entry it was on: toggling `wayland`
-        // off moves it into the ungranted half, and the cursor goes with
-        // it rather than staying on whatever slid into the row. What the
-        // row says is asked before where it lives, because an index is
-        // what the entry beside it inherits: disabling the first of two
-        // `home-share`s leaves `Service(0)` naming the second, and a
-        // cursor that followed the index would put the next Space on an
-        // entry nobody aimed at.
+        // The selection follows the entry it was on. What the row says is
+        // asked before where it lives, because an index is what the entry
+        // beside it inherits.
         self.selected = row
             .and_then(|(node, target, text)| {
                 let rows = &self.rows;
@@ -216,8 +210,8 @@ impl Detail {
         self.lint(env);
     }
 
-    /// Lint the buffer as it stands, which is the whole value of showing
-    /// findings at all: the file on disk is not what is being read.
+    // Lint the buffer as it stands, which is the whole value of showing
+    // findings at all: the file on disk is not what is being read.
     fn lint(&mut self, env: &Env) {
         self.findings.clear();
         let Ok(text) = kdl_out::render(&self.buf) else {
@@ -286,10 +280,8 @@ impl Detail {
 
     /// Grant, disable, enable or revoke the selected node. A granted
     /// node that carries anything beyond its name is kept as a `/-`
-    /// line rather than dropped: Space is how a grant is tried without,
-    /// not how the line that spells it out is lost. A node that takes an
-    /// argument cannot be granted this way and says so: there is nothing
-    /// sensible to write for it.
+    /// line rather than dropped. A node that takes an argument cannot be
+    /// granted this way and says so.
     pub fn toggle(&mut self, env: &Env) -> String {
         let Some(row) = self.row().cloned() else {
             return String::new();
@@ -358,8 +350,8 @@ impl Detail {
             kdl_out::node(&written).map_err(|e| e.to_string())?;
         }
         // A row that adds an entry pushes rather than replaces it, and
-        // what makes two entries one node — the path of a share, the
-        // key of an `env` — is the parser's rule and not the editor's.
+        // what makes two entries one node is the parser's rule and not
+        // the editor's.
         // So the parser is asked before the push: a buffer holding both
         // renders to a config it refuses, which is the pane going blank
         // with `given more than once` under it.
@@ -387,18 +379,9 @@ impl Detail {
         format!("removed {}", flatten(&text))
     }
 
-    /// Whether the buffer already holds `written`, asked by rendering
-    /// the buffer with that node under it and reading it back: the
-    /// duplicate rule is the parser's, down to a share whose path is
-    /// written another way.
-    ///
-    /// A question that cannot be asked is answered `false`. A line the
-    /// parser reads as one node and the emitter cannot write as one —
-    /// two `lint-allow` ids — is the splice path's to take, and refusing
-    /// it here would refuse a line the editor accepted before this check
-    /// existed. Only a repeat is answered for the same reason: a buffer
-    /// that does not parse for another reason is the pane's business and
-    /// not this line's.
+    // The duplicate rule is the parser's, down to a share whose path is
+    // written another way. A question that cannot be asked is answered
+    // `false`.
     fn would_repeat(&self, written: &Node) -> bool {
         let (Ok(mut text), Ok(node)) = (kdl_out::render(&self.buf), kdl_out::node(written)) else {
             return false;
@@ -408,8 +391,6 @@ impl Detail {
         matches!(config::parse(&text), Err(config::ConfigError::Duplicate(_)))
     }
 
-    /// Put what was written into the buffer, over the node the row names
-    /// where there is one.
     fn write(&mut self, written: Node, target: Target) {
         if let Target::Disabled(i) = target {
             // An edit of a disabled entry leaves it disabled: Space is
@@ -463,9 +444,6 @@ impl Detail {
         }
     }
 
-    /// The node a row names, read back out of the buffer as the parser
-    /// would have read it from the file: what [`Node::has_content`] is
-    /// asked about, and what a `/-` line keeps.
     fn node_at(&self, target: Target) -> Option<Node> {
         Some(match target {
             Target::Service(i) => Node::Service(self.buf.services.get(i)?.clone()),
@@ -483,15 +461,12 @@ impl Detail {
         })
     }
 
-    /// Take the node a row names out of the buffer, and leave the `/-`
-    /// lines of its section pointing at the entries they were read
-    /// above: the ones below this entry now sit one nearer the top.
+    // Leave the `/-` lines of its section pointing at the entries they
+    // were read above: the ones below this entry now sit one nearer the top.
     fn remove(&mut self, target: Target) {
         let Some(node) = self.node_at(target) else {
-            // The row names no entry, or names one the buffer has lost.
-            // An index is stale only between a change and the refresh
-            // that follows it, and a panic here would leave the terminal
-            // raw and the editor gone.
+            // The row names no entry, or names one the buffer has lost. A
+            // panic here would leave the terminal raw and the editor gone.
             return;
         };
         match target {
@@ -521,10 +496,8 @@ impl Detail {
         }
     }
 
-    /// Move the `/-` lines of one section that sit below the entry at
-    /// `i` by `by` entries. Each of them names the entry it was read
-    /// above, so a section that grows or shrinks above them moves that
-    /// entry and has to move them with it.
+    // Each `/-` line names the entry it was read above, so a section that
+    // grows or shrinks above them moves that entry and has to move them with it.
     fn shift_disabled(&mut self, rank: u8, i: usize, by: isize) {
         for entry in &mut self.buf.disabled {
             if config::section_rank(&entry.node) == rank && entry.before > i {
@@ -533,9 +506,8 @@ impl Detail {
         }
     }
 
-    /// Keep the entry a row names as a `/-` line where it is: `before`
-    /// is the index it had, which is the index of the entry that
-    /// follows it once it is out of its section.
+    // `before` is the index it had, which is the index of the entry that
+    // follows it once it is out of its section.
     fn disable(&mut self, target: Target) {
         let (Some(node), Some(before)) = (self.node_at(target), index_of(target)) else {
             return;
@@ -554,10 +526,8 @@ impl Detail {
         self.buf.disabled.insert(at, Disabled { node, before });
     }
 
-    /// Put a disabled entry back among the entries it was read with. A
-    /// node a config holds one of — `tty`, `command` — is written over
-    /// where one is granted: the entry the cursor is on is the one that
-    /// was asked for.
+    // A node a config holds one of is written over where one is granted:
+    // the entry the cursor is on is the one that was asked for.
     fn enable(&mut self, i: usize) -> String {
         let Some(entry) = self.buf.disabled.get(i).cloned() else {
             return String::new();
@@ -588,8 +558,6 @@ impl Detail {
         }
     }
 
-    /// Put an entry into its section at `at`, and say what that did to
-    /// the section.
     fn insert(&mut self, node: Node, at: usize) -> Placed {
         match node {
             Node::Service(s) => {
@@ -635,8 +603,6 @@ impl Detail {
         }
     }
 
-    /// How many entries the section `node` belongs to holds, which is
-    /// where a `before` past the end of it lands.
     fn section_len(&self, node: &Node) -> usize {
         match node {
             Node::LintAllow(_) => self.buf.lint_allows.len(),
@@ -677,33 +643,25 @@ impl Detail {
 }
 
 /// A node written on one line, whatever it looks like in the file: a
-/// block node is valid KDL on one line too, so the prompt can hold every
-/// node the config has and `e` stays for the ones worth reading in an
-/// editor.
+/// block node is valid KDL on one line too.
 pub fn flatten(text: &str) -> String {
     text.lines().map(str::trim).collect::<Vec<&str>>().join(" ")
 }
 
-/// What putting an entry back into its section did, which is what the
-/// editor says about it: a line appearing is not a line written over.
 enum Placed {
-    /// The section gained this many entries.
     Added(usize),
-    /// The granted node of a kind a config holds one of was written
-    /// over, because two of that node is not a config bubbler reads.
+    // The granted node of a kind a config holds one of was written
+    // over, because two of that node is not a config bubbler reads.
     Replaced,
-    /// The value is the node's own default, which a file spells by
-    /// leaving the node out: no line is written at all.
+    // The value is the node's own default, which a file spells by
+    // leaving the node out: no line is written at all.
     Default,
-    /// The default was written over a granted value: the line that was
-    /// there is gone, and none takes its place.
     DefaultOver,
 }
 
 impl Placed {
-    /// What writing a node a config holds one of did: `held` says
-    /// whether one was granted before it, `bare` whether what was
-    /// written is the default the file holds no line for.
+    // `held` says whether one was granted before it, `bare` whether what
+    // was written is the default the file holds no line for.
     fn one_of(held: bool, bare: bool) -> Self {
         match (held, bare) {
             (true, true) => Self::DefaultOver,
@@ -713,7 +671,6 @@ impl Placed {
         }
     }
 
-    /// How many entries the section gained.
     fn count(&self) -> usize {
         match self {
             Self::Added(n) => *n,
@@ -722,16 +679,14 @@ impl Placed {
     }
 }
 
-/// How far a line that writes `n` entries moves what was below the one
-/// entry it replaced.
+// How far a line that writes `n` entries moves what was below the one
+// entry it replaced.
 fn grew_by(n: usize) -> isize {
     isize::try_from(n.saturating_sub(1)).unwrap_or_default()
 }
 
-/// Where in its section the entry a target names sits, which is what a
-/// `/-` line's `before` counts. A node a config holds one of is the
-/// first entry of a section of its own; a row that names no entry has
-/// no index at all.
+// A node a config holds one of is the first entry of a section of its
+// own; a row that names no entry has no index at all.
 fn index_of(target: Target) -> Option<usize> {
     Some(match target {
         Target::LintAllow(i) | Target::Service(i) | Target::Env(i) => i,
@@ -746,9 +701,9 @@ fn index_of(target: Target) -> Option<usize> {
     })
 }
 
-/// The one node a line wrote. Two nodes on one line is refused rather
-/// than half-applied: the row the prompt was opened on names one node,
-/// and the editor never writes a node the user cannot see.
+// Two nodes on one line is refused rather than half-applied: the row the
+// prompt was opened on names one node, and the editor never writes a node
+// the user cannot see.
 fn written(raw: RawProfile) -> Result<Node, String> {
     if !raw.includes.is_empty() {
         return Err("an instance config includes no profile".to_owned());
@@ -790,12 +745,9 @@ fn written(raw: RawProfile) -> Result<Node, String> {
     }
 }
 
-/// The rows of a config: every entry it holds, granted or disabled, in
-/// the order [`kdl_out::nodes`] renders them so that the line numbers
-/// below are the ones the linter reports; a row after the last entry of
-/// every repeatable node it holds, which is what writes another one;
-/// then every node it does not hold at all, in the order the catalogue
-/// and the README document them.
+// The rows of a config: every entry it holds, granted or disabled, in
+// the order [`kdl_out::nodes`] renders them so that the line numbers
+// below are the ones the linter reports.
 fn rows(cfg: &InstanceConfig) -> Result<Vec<Row>, String> {
     let mut out = Builder::default();
     out.section(
@@ -898,8 +850,7 @@ fn rows(cfg: &InstanceConfig) -> Result<Vec<Row>, String> {
     let mut rows = out.rows;
     // A repeatable node with an entry keeps a bare row after its last
     // one: Enter on an entry writes that entry, and there has to be a
-    // row that writes the next. With no entry at all its row is the one
-    // in the absent block below, where Enter opens the same prompt.
+    // row that writes the next.
     for node in config::REPEATABLE {
         let Some(last) = rows.iter().rposition(|r| r.node == *node) else {
             continue;
@@ -930,7 +881,6 @@ fn rows(cfg: &InstanceConfig) -> Result<Vec<Row>, String> {
     Ok(rows)
 }
 
-/// Rows and the line each starts on, counted as they are added.
 #[derive(Default)]
 struct Builder {
     rows: Vec<Row>,
@@ -938,11 +888,11 @@ struct Builder {
 }
 
 impl Builder {
-    /// One section of the file: its entries with the disabled ones of
-    /// the same section among them, in the one order
-    /// [`kdl_out::section_entries`] holds for every reader of a section.
-    /// That order is the file's, which is what makes a row's line the
-    /// line a finding names.
+    // One section of the file: its entries with the disabled ones of
+    // the same section among them, in the one order
+    // [`kdl_out::section_entries`] holds for every reader of a section.
+    // That order is the file's, which is what makes a row's line the
+    // line a finding names.
     fn section(
         &mut self,
         cfg: &InstanceConfig,
