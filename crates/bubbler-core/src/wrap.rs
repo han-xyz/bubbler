@@ -22,33 +22,27 @@ use crate::instance::{self, Instance};
 use crate::kdl_out::quote;
 use crate::{dbus, fsutil, init_bin, network};
 
-/// File the registry lives in, under `$XDG_CONFIG_HOME/bubbler/`.
 const REGISTRY_FILE: &str = "wraps.kdl";
 
-/// File whose `flock(2)` serialises a read-modify-write of the registry.
-/// Its own contents are never read: it exists because the registry is
-/// *replaced* by a rename, so a lock taken on the registry itself would
-/// be a lock on an inode the next writer no longer has.
+// It exists because the registry is *replaced* by a rename, so a lock
+// taken on the registry itself would be a lock on an inode the next
+// writer no longer has.
 const LOCK_FILE: &str = "wraps.kdl.lock";
 
-/// First line of the registry. Informational only — nothing reads it
-/// back — so that a person opening the file can see what wrote it.
+// First line of the registry. Informational only — nothing reads it
+// back — so that a person opening the file can see what wrote it.
 const HEADER: &str = "// bubbler wraps: 1\n";
 
-/// Directory the shims go in, relative to `$HOME`. The only directory a
-/// user can add to their own `PATH` without a password; `/usr/local/bin`,
-/// where firejail puts its links, needs root and is out of bounds for
-/// packaged files anyway.
+// Directory the shims go in, relative to `$HOME`. The only directory a
+// user can add to their own `PATH` without a password.
 const SHIM_DIR: &str = ".local/bin";
 
-/// File name of the bubbler binary, which is what a shim points at.
+// File name of the bubbler binary, which is what a shim points at.
 const BUBBLER_BIN: &str = "bubbler";
 
 /// Names a shim may not take: bubbler resolves each of them through
 /// `PATH` itself, so a shim of that name would shadow the real program —
 /// `bubbler` into a loop, the rest into every sandbox failing to start.
-/// Taken from the constants that name those binaries, so a rename there
-/// cannot leave this list behind.
 pub const RESERVED: &[&str] = &[
     BUBBLER_BIN,
     init_bin::NAME,
@@ -107,9 +101,7 @@ pub struct Added {
     /// `~/.local/bin/<name>`.
     pub path: PathBuf,
     /// A shim of bubbler's was already there that the registry did not
-    /// name, and this call took it over. Worth saying out loud: it is
-    /// either a registry that was edited or a leftover of a `wrap` that
-    /// failed halfway.
+    /// name, and this call took it over.
     pub adopted: bool,
 }
 
@@ -207,10 +199,9 @@ pub fn list(env: &Env, bubbler: &Path) -> Result<Vec<Entry>, WrapError> {
         .collect())
 }
 
-/// A shim runs only if all three hold: the path is one of bubbler's
-/// symlinks, the binary it names is there, and the instance it opens
-/// still exists. A deleted instance leaves a link that would fail on
-/// use, which is what `broken` is for.
+// A shim runs only if all three hold: the path is one of bubbler's
+// symlinks, the binary it names is there, and the instance it opens
+// still exists.
 fn state_of(env: &Env, wrap: &Wrap, path: &Path, bubbler: &Path) -> State {
     let runs = is_ours(path, bubbler) && fs::metadata(path).is_ok_and(|m| m.is_file());
     let instance = instance::config_path_checked(env, &wrap.instance).is_ok();
@@ -220,11 +211,11 @@ fn state_of(env: &Env, wrap: &Wrap, path: &Path, bubbler: &Path) -> State {
     }
 }
 
-/// Whether `path` is a shim bubbler made: a symlink at the running
-/// binary, or at some other file named `bubbler` — a package upgrade or
-/// a dev build changes the path, and the shim is still bubbler's own.
-/// Never true of a regular file or of a link pointing anywhere else, so
-/// nothing bubbler did not create is ever repointed or removed.
+// Whether `path` is a shim bubbler made: a symlink at the running
+// binary, or at some other file named `bubbler` — a package upgrade or
+// a dev build changes the path, and the shim is still bubbler's own.
+// Never true of a regular file or of a link pointing anywhere else, so
+// nothing bubbler did not create is ever repointed or removed.
 fn is_ours(path: &Path, bubbler: &Path) -> bool {
     let Ok(target) = fs::read_link(path) else {
         return false;
@@ -298,7 +289,7 @@ pub fn add(env: &Env, instance: &str, name: &str, bubbler: &Path) -> Result<Adde
 /// only when it is one of bubbler's: a regular file, or a symlink
 /// somebody else aimed somewhere else, is not something bubbler made,
 /// and it stays where it is while the entry that no longer describes it
-/// goes. `bubbler` is the running binary, as for [`list`].
+/// goes.
 pub fn remove(env: &Env, name: &str, bubbler: &Path) -> Result<PathBuf, WrapError> {
     // The reserved list is not applied here: a registry naming one is
     // rejected on read, and undoing something is never the moment to
@@ -323,8 +314,7 @@ pub fn remove(env: &Env, name: &str, bubbler: &Path) -> Result<PathBuf, WrapErro
 
 /// What is wrong with reaching `dir/name` through `search_path`, if
 /// anything: `~/.local/bin` is not on Arch's default `PATH` at all, and
-/// a shim behind the directory the real program is in never runs. A
-/// shim nobody can reach is worth a warning, never a silent success.
+/// a shim behind the directory the real program is in never runs.
 pub fn path_warning(dir: &Path, name: &str, search_path: &[PathBuf]) -> Option<String> {
     let dir_key = canonical(dir);
     let Some(here) = search_path.iter().position(|p| canonical(p) == dir_key) else {
@@ -347,25 +337,25 @@ pub fn path_warning(dir: &Path, name: &str, search_path: &[PathBuf]) -> Option<S
     })
 }
 
-/// Whether `p` is a regular file with an execute bit anyone holds, which
-/// is what a `PATH` search stops at.
+// Whether `p` is a regular file with an execute bit anyone holds, which
+// is what a `PATH` search stops at.
 fn is_executable(p: &Path) -> bool {
     fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-/// `p` with symlinks resolved where that is possible, so two spellings
-/// of the same directory compare equal. A path that cannot be resolved
-/// compares as written, which is the most that can be said about it.
+// `p` with symlinks resolved where that is possible, so two spellings
+// of the same directory compare equal. A path that cannot be resolved
+// compares as written.
 fn canonical(p: &Path) -> PathBuf {
     fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// Point `dir/name` at `target`: the link is made under a name carrying
-/// this process's pid and renamed over the shim, since `symlink(2)`
-/// refuses an existing path and unlinking first would leave the shim
-/// missing in between. `O_EXCL` semantics come free — `symlink(2)` fails
-/// with `EEXIST` — so a file already under the temporary name is never
-/// followed and never removed.
+// Point `dir/name` at `target`: the link is made under a name carrying
+// this process's pid and renamed over the shim, since `symlink(2)`
+// refuses an existing path and unlinking first would leave the shim
+// missing in between. `O_EXCL` semantics come free — `symlink(2)` fails
+// with `EEXIST` — so a file already under the temporary name is never
+// followed and never removed.
 fn link(target: &Path, dir: &Path, name: &str) -> Result<(), WrapError> {
     let tmp = dir.join(format!(".{name}.{}.new", std::process::id()));
     std::os::unix::fs::symlink(target, &tmp).map_err(|e| WrapError::Io(tmp.clone(), e))?;
@@ -379,10 +369,9 @@ fn link(target: &Path, dir: &Path, name: &str) -> Result<(), WrapError> {
     Ok(())
 }
 
-/// Exclusive lock over the registry, held until it is dropped.
-/// `flock(2)` is released by the kernel when the descriptor closes, so a
-/// bubbler killed while holding it leaves nothing to time out, unlike a
-/// lock whose existence is a file.
+// `flock(2)` is released by the kernel when the descriptor closes, so a
+// bubbler killed while holding it leaves nothing to time out, unlike a
+// lock whose existence is a file.
 struct Lock(#[allow(dead_code)] OwnedFd);
 
 fn lock(env: &Env) -> Result<Lock, WrapError> {
@@ -401,8 +390,8 @@ fn lock(env: &Env) -> Result<Lock, WrapError> {
     Ok(Lock(fd))
 }
 
-/// The registry as KDL: the header, then one `wrap` node per shim in
-/// name order, so the file does not churn between writes.
+// The registry as KDL: the header, then one `wrap` node per shim in
+// name order, so the file does not churn between writes.
 fn render(wraps: &[Wrap]) -> String {
     let mut out = String::from(HEADER);
     for w in wraps {
@@ -415,8 +404,7 @@ fn render(wraps: &[Wrap]) -> String {
     out
 }
 
-/// Write the registry in one step, creating its directory if needed.
-/// Callers hold [`lock`] across the read this replaces.
+// Callers hold [`lock`] across the read this replaces.
 fn save(env: &Env, wraps: &[Wrap]) -> Result<(), WrapError> {
     write(env, &render(wraps))
 }
@@ -429,13 +417,13 @@ fn write(env: &Env, text: &str) -> Result<(), WrapError> {
     fsutil::write_atomic(&path, text).map_err(|(at, e)| WrapError::Io(at, e))
 }
 
-/// Parse the registry. Every deviation is an error: a name bubbler would
-/// not have written is a file somebody else edited, and dispatch builds
-/// an instance path out of what it says.
-///
-/// Through [`config::parse_document`], because this is the same recursive
-/// KDL parser every other configuration goes through, and it is read on
-/// every start under a shim name.
+// Every deviation is an error: a name bubbler would not have written is
+// a file somebody else edited, and dispatch builds an instance path out
+// of what it says.
+//
+// Through [`config::parse_document`], because this is the same recursive
+// KDL parser every other configuration goes through, and it is read on
+// every start under a shim name.
 fn parse(path: &Path, text: &str) -> Result<Vec<Wrap>, WrapError> {
     let doc = config::parse_document(text).map_err(|source| WrapError::Parse {
         path: path.to_path_buf(),
