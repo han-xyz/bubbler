@@ -7,41 +7,7 @@
 --   $XDG_DATA_HOME/wireplumber/scripts/
 -- beside 50-bubbler.conf, which is what loads it.
 --
--- The permission managers in 50-bubbler.conf say what a sandbox may
--- see. Three things they cannot say, because each is a fact about a
--- link's two ends and a permission is a fact about one object:
---
---   * A sink's monitor ports carry everything the session is playing
---     and are reached through the sink's own read permission, so a
---     capture stream asking for `stream.capture.sink` records every
---     other application. Hiding sinks is not an option — that is the
---     grant.
---
---   * Stream nodes are readable because the private pulse server of a
---     `pulseaudio` grant must see the streams it creates, and
---     PW_PERM_L is only consulted for a node the client cannot see
---     ("a link can be made between a node that doesn't have permission
---     to see the other node", pipewire/permission.h), so a readable
---     stream is a linkable one: measured on PipeWire 1.6.8, a capture
---     stream aimed at another client's playback stream is linked to it
---     and records it.
---
---   * A client can make a link itself, and the daemon lets any client
---     link two nodes it can see (PipeWire 1.6.8,
---     src/pipewire/impl-link.c `check_permission`: read on both nodes
---     for the client creating the link, and the owner of each node must
---     see the other unless the creating client holds PW_PERM_L). A
---     playback sandbox has to see the sink for its own audio to reach
---     it, so no node permission tells "WirePlumber links my stream to
---     the sink" apart from "I link the sink's monitor to my capture
---     stream". What separates them is the link factory: measured on
---     1.6.8, a client that cannot see the `link-factory` global gets
---     ENOENT from the core and makes no link, while WirePlumber goes on
---     linking on its behalf. The permission managers cannot express
---     that — measured: their `rules` are not applied to factory globals
---     — so it is set on the client below.
---
--- So: of a bubbler sandbox's nodes only its audio streams are linked, to
+-- Of a bubbler sandbox's nodes only its audio streams are linked, to
 -- device nodes and to its own; a capture stream only to a node with
 -- `Audio/Source` anywhere in the class or an `Audio/Duplex` one, and only
 -- where the instance was granted `microphone`; and the sandbox links
@@ -102,7 +68,6 @@ local lutils = require ("linking-utils")
 local cutils = require ("common-utils")
 local log = Log.open_topic ("s-linking")
 
--- The engine name bubbler gives every security context it creates.
 local BUBBLER_ENGINE = "org.bubbler"
 
 -- Raised whenever what this policy makes WirePlumber do changes; bubbler
@@ -118,15 +83,12 @@ local AUDIO_STREAM_CLASS = {
   input = "Stream/Input/Audio",
 }
 
--- The object of `kind` ("client", "node") whose bound id is `id`, or nil.
 local function lookup (source, kind, id)
   return source:call ("get-object-manager", kind):lookup {
     Constraint { "bound-id", "=", id, type = "gobject" },
   }
 end
 
--- The client object `client_id` names, or nil where the graph has no
--- such client (a node whose client is already gone).
 local function bubbler_client (source, client_id)
   if not client_id then
     return nil
@@ -138,26 +100,21 @@ local function bubbler_client (source, client_id)
   return nil
 end
 
--- Whether the client's grant holds `word`: the grant is a
--- comma-separated list of words, and no word may match inside another.
+-- The grant is a comma-separated list of words, and no word may match
+-- inside another.
 local function granted (client, word)
   local grant = client.properties ["pipewire.sec.bubbler.audio"] or ""
   return ("," .. grant .. ","):find ("," .. word .. ",", 1, true) ~= nil
 end
 
--- Whether the client's grant lets its own devices stand beside the
--- host's.
 local function offers_devices (client)
   return granted (client, "devices")
 end
 
--- Whether the target is a sandbox's node that is not the stream's own.
 -- A sink, source or filter of a sandbox without the device grant keeps no
 -- session item, so a target meets one only when it was itemised before
 -- WirePlumber knew its client and has not been swept yet: this is the
--- backstop that keeps a host stream off it in that window. A device of a
--- sandbox with the device grant is a device like the host's; its streams
--- are still its own.
+-- backstop that keeps a host stream off it in that window.
 local function foreign_sandbox_node (source, si_props, target_props)
   local owner = bubbler_client (source, target_props ["client.id"])
   if not owner then
@@ -189,7 +146,6 @@ end
 local HOLDS_ITS_TARGET =
     "a stream that would hold its target for itself, without the exclusive grant"
 
--- Why this link may not be made, or nil where it may.
 local function refusal (si_props, target_props, client)
   if si_props ["media.class"] ~=
       AUDIO_STREAM_CLASS [si_props ["item.node.direction"]] then
@@ -280,15 +236,8 @@ SimpleEventHook {
   end
 }:register ()
 
--- The keys a stock lookup by name matches a target on:
--- linking/find-defined-target takes a candidate whose `node.name` or
--- `object.path` is the pinned value, and
--- linking/find-media-role-sink-target one whose `node.name`, failing
--- that whose `node.nick`, is the preferred target.
 local NAME_KEYS = { "node.name", "object.path", "node.nick" }
 
--- Whether `props` has a name among `NAME_KEYS` that is also one of the
--- device's.
 local function shares_a_name (props, device)
   for _, key in ipairs (NAME_KEYS) do
     for _, device_key in ipairs (NAME_KEYS) do
@@ -300,13 +249,6 @@ local function shares_a_name (props, device)
   return false
 end
 
--- Whether a session item that is no stream — a device or a filter — of
--- the host's, or of a sandbox whose own devices stand beside the host's,
--- and not the item of the node `node_id` itself, shares a name with any
--- of `props_list`. A stream pinned to that name would otherwise be aimed
--- at whichever of the two a lookup meets first, streams included. A host
--- stream of the same name is left alone: two instances of one
--- application commonly share one.
 local function shadows_a_device (source, node_id, props_list)
   for si in source:call ("get-object-manager", "session-item"):iterate {
       type = "SiLinkable" } do
@@ -325,10 +267,6 @@ local function shadows_a_device (source, node_id, props_list)
   return false
 end
 
--- Whether any of `props_list` marks its node a smart filter, which
--- lib/filter-utils.lua puts in front of the device it names: every stream
--- aimed at that device would go through it. The `filters` metadata, the
--- other place a node is marked smart, is hidden from every sandbox.
 local function smart_filter (props_list)
   for _, props in ipairs (props_list) do
     if cutils.parseBool (props ["filter.smart"]) then
@@ -338,12 +276,8 @@ local function smart_filter (props_list)
   return false
 end
 
--- Whether `node`, as it stands now, is kept out of the session: a node of
--- a sandbox that shares a name with a device, a smart filter, and without
--- the device grant every node that is not a plain audio stream.
 -- `item_props`, where the node has a session item, are what the finders
--- read: frozen at the item's creation. A stream carries a link group only
--- as one half of a filter.
+-- read: frozen at the item's creation.
 local function kept_from_the_session (source, node, item_props)
   local node_props = node.properties
   local client = bubbler_client (source, node_props ["client.id"])
@@ -365,12 +299,8 @@ local function kept_from_the_session (source, node, item_props)
 end
 
 -- A sandbox offers no device: of its nodes only its plain audio streams
--- become session items. Every finder, the smart-filter chain
--- (lib/filter-utils.lua) and the default-node rescan search session items
--- alone, so a sink, source or filter a sandbox makes is never a target,
--- a filter or a default for anyone; the node stays in the graph,
--- unlinked, and its client gets no error. node/create-item is the only
--- maker of a node's session item.
+-- become session items. node/create-item is the only maker of a node's
+-- session item.
 SimpleEventHook {
   name = "bubbler/no-device-from-a-sandbox",
   after = "bubbler/destroy-refused-link-once-its-ends-are-known",
@@ -395,16 +325,10 @@ SimpleEventHook {
   end
 }:register ()
 
--- The same, for a node that has a session item all the same: one that
--- reached node-added before WirePlumber knew its client (after a
--- WirePlumber restart the node is already in the graph), and a stream
--- that has since changed its own properties into a filter's (a client
--- may, and no event follows), or a stream older than the host device it
--- is named after (a headset that reconnects). Default-node selection and
--- the filter chain are rebuilt only in these two rescans and read the
--- node's current properties there (default-nodes/rescan.lua,
--- lib/filter-utils.lua rescanFilters), so removing the item first keeps
--- the node out of both.
+-- Default-node selection and the filter chain are rebuilt only in these
+-- two rescans and read the node's current properties there
+-- (default-nodes/rescan.lua, lib/filter-utils.lua rescanFilters), so
+-- removing the item first keeps the node out of both.
 SimpleEventHook {
   name = "bubbler/no-device-from-a-sandbox-on-rescan",
   before = { "default-nodes/rescan", "lib/filter-utils/rescan",
@@ -472,7 +396,7 @@ SimpleEventHook {
   end
 }:register ()
 
--- Every factory in the graph. A sandbox keeps `client-node`, which is
+-- A sandbox keeps `client-node`, which is
 -- what a stream is made through (pipewire-pulse's included), and loses
 -- the rest: `link-factory`, through which it would link what it can see
 -- itself, and every factory that makes a node or other object the daemon
@@ -484,11 +408,8 @@ local factories = ObjectManager {
   Interest { type = "factory" },
 }
 
--- A factory the graph gains after a sandbox's access was decided, or one
--- this object manager had not listed yet when it was, is hidden from
--- every sandbox already connected. Before the standard event source is
--- loaded no access has been decided, and bubbler/hide-factories will
--- find the factory listed here.
+-- Before the standard event source is loaded no access has been decided,
+-- and bubbler/hide-factories will find the factory listed here.
 factories:connect ("object-added", function (_, factory)
   local source = Plugin.find ("standard-event-source")
   if not source or factory.properties ["factory.name"] == STREAM_FACTORY then
@@ -702,8 +623,7 @@ SimpleEventHook {
 -- only outside every security context: a context's client has
 -- `pipewire.sec.engine` from the context's socket before it says
 -- anything (module-protocol-native.c) and can neither change nor drop
--- it. A restricted client outside every context can wear the marker
--- too; confining those is not this policy's.
+-- it.
 local function made_by_wireplumber (source, link)
   local linger = link.properties ["object.linger"]
   local creator = link.properties ["client.id"]
@@ -716,8 +636,6 @@ local function made_by_wireplumber (source, link)
       client.properties ["pipewire.sec.engine"] == nil
 end
 
--- The properties of the node `node_id` names where it belongs to a
--- bubbler context, or nil.
 local function bubbler_node (source, node_id)
   local node = lookup (source, "node", node_id)
   if node and bubbler_client (source, node.properties ["client.id"]) then
@@ -726,8 +644,6 @@ local function bubbler_node (source, node_id)
   return nil
 end
 
--- Whether a sandbox's capture stream may record from `output`: a source,
--- and only with the microphone grant.
 local function may_record_from (source, capture_props, output_props)
   local client = bubbler_client (source, capture_props ["client.id"])
   return client ~= nil and capture_capable (output_props) and
@@ -763,20 +679,12 @@ local function own_stream_link (source, link, sandbox_output, sandbox_input)
   return host ~= nil and may_record_from (source, sandbox_input, host.properties)
 end
 
--- Whether `props` are those of a device a sandbox offers under the device
--- grant: one of its nodes that is no stream.
 local function offered_device (source, props)
   local client = bubbler_client (source, props ["client.id"])
   return client ~= nil and offers_devices (client) and
       (props ["media.class"] or ""):find ("^Stream/") == nil
 end
 
--- Whether a link between `output` and `input`, one of them a device a
--- sandbox offers, is one WirePlumber makes for a stream aimed at that
--- device: a playback stream into it, or a capture stream from it, where a
--- sandbox's capture stream needs a source and the microphone grant as it
--- does from a host device. Nothing else flows into an offered device: not
--- a source, not a sink's monitor, since the sandbox hears what does.
 local function offered_device_link (source, output, input)
   if offered_device (source, input) then
     return output ["media.class"] == AUDIO_STREAM_CLASS.output
@@ -792,11 +700,6 @@ end
 -- check would otherwise ask again. Serials are never reused.
 local destroying = {}
 
--- By the link's ends, not its creator: a link a sandbox won before its
--- factory was hidden lingers with no creator on it at all, and any other
--- client's link to or from a sandbox is one the policy above would have
--- refused. WirePlumber's own links are kept only where they are the
--- ones the policy permits.
 local function destroy_if_refused (source, link)
   local serial = link.properties ["object.serial"]
   if destroying [serial] then
@@ -879,8 +782,7 @@ end
 
 -- At `link-added` the node at an end, or the client that owns it, may
 -- not be in WirePlumber's object managers yet, and the link would pass
--- as one with no sandbox at either end. It is decided again when that
--- node or a bubbler client arrives. A bubbler client's arrival also
+-- as one with no sandbox at either end. A bubbler client's arrival also
 -- rescans defaults and links, whose first hook removes the session item
 -- a node of that client got while the client was not known yet:
 -- default-nodes/rescan-trigger rescans on session items, the default
