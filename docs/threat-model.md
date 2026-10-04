@@ -379,6 +379,10 @@ outright, with no context and no proxy at all (lint `wayland-host`). The
 session's Xwayland is outside all of it: `x11 "host"` reaches a server that
 is an ordinary client of your session, though a bare `x11` starts one on
 this socket (below) which the proxy filters and gates like anything else.
+Under either `"host"` value the compositor's client is the application
+itself, and a compositor that reads `/.flatpak-info` by pid, as mutter
+does, shows whatever app id a nested mount namespace puts there ([Who a
+host service sees](#who-a-host-service-sees)).
 
 The proxy is also not a shield in front of the compositor. Everything it
 can parse it re-encodes and forwards, so a message that is well formed and
@@ -777,7 +781,13 @@ key is absent from the call, not a value a rule can reject.
 read-only from there, the way the synthetic `/etc` files below are: the
 sandbox's `/` is a writable tmpfs, so what stops an application from
 rewriting the file the host portal identifies it by is the read-only bind
-and not the directory it lands in.
+and not the directory it lands in. The bind stops a rewrite of bubbler's
+file; it does not stop a process that makes a mount namespace of its own —
+a nested user namespace is allowed by default — from covering
+`/.flatpak-info` with another file, or with none, for itself and its
+children. That is no escape here: the portals read the copy the proxy
+sidecar holds, and PipeWire, which reads the application's own, decides
+nothing by it ([Who a host service sees](#who-a-host-service-sees)).
 
 What `portals` buys from PipeWire's own Flatpak policy is narrower than it
 sounds, and worth stating exactly. `/.flatpak-info`, which `portals` writes,
@@ -836,6 +846,44 @@ bus](manual.md#the-system-bus) ·
 `descriptors_a_reply_carries_are_closed`,
 `real_dbus_portals_answer_the_flatpak_spawn_a_loader_looks_for`,
 `the_flatpak_spawn_shim_is_an_overlay_the_remount_takes_back`
+
+### Who a host service sees
+
+**Defends:** a host service that takes its peer's pid from the socket
+(`SO_PEERCRED`) and reads `/proc/<pid>/root/.flatpak-info` learns the
+identity bubbler gave the sandbox only where that peer is a sidecar:
+
+- session, system and accessibility bus: the `xdg-dbus-proxy` sidecar,
+  with a copy of the file of its own that the application cannot reach;
+  xdg-desktop-portal and flatpak-portal read that copy.
+- default `wayland`: the `bubbler-wl-proxy` sidecar. The app id and
+  instance id the compositor holds are the security-context metadata,
+  bound to the listening socket when bubbler registers it, not looked up
+  by pid.
+- `pulseaudio`: the private `pipewire-pulse` sidecar.
+- the PipeWire context socket: the application's own pid, through which
+  PipeWire's access module reads the file (its source), so a process that
+  covers `/.flatpak-info` in a nested mount namespace shows PipeWire a
+  file of its choosing. Measured in the private bed (PipeWire 1.6.9,
+  WirePlumber 0.5.18): a context client showing bubbler's file, a forged
+  one or none got the same `pipewire.access`, `pipewire.access.effective`
+  and `pipewire.sec.*` properties, the same permissions and the same
+  visible objects as one started without nesting, and PipeWire published
+  no `pipewire.access.portal.*` or `pipewire.sec.flatpak` for any of
+  them. What decides a client's access is the security context's
+  properties, which the daemon stamps on every client of the socket.
+- `wayland "host"` and `x11 "host"`: the application's own pid.
+- sockets reached through `path-share`, `home-share` and `app-runtime`:
+  the application's own pid.
+
+**Does not defend:** a service that reads the file by the application's
+own pid sees what the application chooses. mutter reads
+`/proc/<pid>/root/.flatpak-info` of a window's client for its sandboxed
+app id (its source, not measured), so under `wayland "host"` or
+`x11 "host"` on GNOME a sandbox can show a forged app id for its windows.
+
+[User namespaces](#user-namespaces-inside-the-sandbox) ·
+`a_forged_or_hidden_flatpak_info_changes_nothing_a_context_gets`
 
 ### Audio
 
