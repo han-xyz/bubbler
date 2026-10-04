@@ -256,30 +256,32 @@ struct Object {
 /// The object whose block carries every one of `markers`, or `None` when
 /// the client `listing` came from cannot see it.
 fn object(listing: &str, markers: &[&str]) -> Option<Object> {
-    let listing = format!("\n{listing}");
-    let block = listing
-        .split("\n\tid: ")
-        .skip(1)
-        .find(|block| markers.iter().all(|marker| block.contains(marker)))?;
+    let block = block(listing, markers)?;
     Some(Object {
         id: block.lines().next()?.to_owned(),
-        permissions: block
-            .lines()
-            .find_map(|line| line.trim().strip_prefix("permissions: "))?
+        permissions: property_lines(block)
+            .find_map(|line| line.strip_prefix("permissions: "))?
             .to_owned(),
-        // A property line is printed with a leading `*` when the value
-        // has changed since the last listing, so the name is not at the
-        // start of what `trim` leaves.
-        serial: block
-            .lines()
-            .find_map(|line| {
-                line.trim()
-                    .trim_start_matches('*')
-                    .trim_start()
-                    .strip_prefix("object.serial = \"")
-            })
+        serial: property_lines(block)
+            .find_map(|line| line.strip_prefix("object.serial = \""))
             .map(|serial| serial.trim_end_matches('"').to_owned()),
     })
+}
+
+fn blocks(listing: &str) -> impl Iterator<Item = &str> {
+    listing.split("\tid: ").skip(1)
+}
+
+fn block<'a>(listing: &'a str, markers: &[&str]) -> Option<&'a str> {
+    blocks(listing).find(|block| markers.iter().all(|marker| block.contains(marker)))
+}
+
+// pw-cli prints a property with a leading `*` when its value changed since
+// the last listing.
+fn property_lines(block: &str) -> impl Iterator<Item = &str> {
+    block
+        .lines()
+        .map(|line| line.trim().trim_start_matches('*').trim_start())
 }
 
 /// The same, with the process's own log in the failure: a server that
@@ -3587,6 +3589,11 @@ struct Reach {
     view: Vec<String>,
 }
 
+struct Measured {
+    reach: Reach,
+    flatpak_info: Option<String>,
+}
+
 // `pw-cli -m` ends at the end of its input, which the test's own stdin may reach.
 const MONITOR: &str = "sh -c 'sleep 600 | pw-cli -m'";
 const MONITOR_CLIENT: &str = r#"application.name = "pw-cli""#;
@@ -3594,6 +3601,14 @@ const IN_A_CONTEXT: &str = "pipewire.sec.engine";
 const DECIDED: &str = "pipewire.access.effective";
 const PID: &str = "pipewire.sec.pid = ";
 const PER_CONNECTION: [&str; 2] = [PID, "pipewire.sec.socket = "];
+
+// What the daemon would publish had it read a client's `/.flatpak-info`.
+const FROM_THE_FILE: [&str; 3] = [
+    "pipewire.access.portal.app_id = ",
+    "pipewire.access.portal.instance_id = ",
+    "pipewire.sec.flatpak = ",
+];
+const AS_THE_CONTEXT_SET_IT: &str = r#"pipewire.access = "restricted""#;
 
 // The most specific first: a port's `port.alias` names its node too.
 const NAMES: [&str; 6] = [
@@ -3605,30 +3620,19 @@ const NAMES: [&str; 6] = [
     "core.name = ",
 ];
 
-fn block<'a>(listing: &'a str, markers: &[&str]) -> Option<&'a str> {
-    listing
-        .split("\n\tid: ")
-        .find(|block| markers.iter().all(|marker| block.contains(marker)))
-}
-
-fn property_lines(block: &str) -> impl Iterator<Item = &str> {
-    block
-        .lines()
-        .map(|line| line.trim().trim_start_matches('*').trim_start())
-}
-
-// Also returns the `/.flatpak-info` PipeWire finds through the client's pid.
-fn reach(
+// The view is a second client's, started the same way: the monitor prints
+// nothing that could be read while it runs.
+fn measure(
     bed: &PipeWireBed,
     props: &str,
     markers: &[&str],
     wrap: impl Fn(&str) -> String,
-) -> (Reach, Option<String>) {
+) -> Measured {
     let monitor = [CLIENT, MONITOR_CLIENT, IN_A_CONTEXT, DECIDED];
     wait_for("the previous monitor gone", || {
         block(&bed.info_from_host(), &monitor[..3]).is_none()
     });
-    let _monitor = Streaming(bed.spawn_in_context(props, &wrap(MONITOR)));
+    let running = Streaming(bed.spawn_in_context(props, &wrap(MONITOR)));
     let mut listing = String::new();
     wait_for("the monitor's access decision", || {
         listing = bed.info_from_host();
@@ -3647,11 +3651,16 @@ fn reach(
         .map(str::to_owned)
         .collect();
     properties.sort();
+    drop(running);
 
-    let seen = format!("\n{}", bed.info_in_context(props, markers));
-    let mut view: Vec<String> = seen
-        .split("\n\tid: ")
-        .skip(1)
+    let mut seen = String::new();
+    wait_for("the client's view of the graph", || {
+        seen = bed.in_context(props, &wrap("pw-cli info all"));
+        markers
+            .iter()
+            .all(|marker| object(&seen, &[marker]).is_some())
+    });
+    let mut view: Vec<String> = blocks(&seen)
         .map(|block| {
             let field = |prefix: &str| {
                 property_lines(block)
@@ -3668,7 +3677,10 @@ fn reach(
         })
         .collect();
     view.sort();
-    (Reach { properties, view }, flatpak_info)
+    Measured {
+        reach: Reach { properties, view },
+        flatpak_info,
+    }
 }
 
 #[test]
@@ -3676,12 +3688,19 @@ fn a_forged_or_hidden_flatpak_info_changes_nothing_a_context_gets() {
     let Some(bed) = PipeWireBed::start() else {
         return;
     };
-    if !Command::new("sh")
+    if on_path("bwrap").is_none() {
+        say("skipping: bwrap not installed");
+        return;
+    }
+    let probe = Command::new("sh")
         .args(["-c", &nested(None, "true")])
-        .status()
-        .is_ok_and(|status| status.success())
-    {
-        say("skipping: bwrap cannot make a nested user namespace on this host");
+        .output()
+        .expect("sh did not run");
+    if !probe.status.success() {
+        say(&format!(
+            "skipping: bwrap cannot make the nested namespace on this host: {}",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        ));
         return;
     }
     let bubblers = bubbler_core::dbus::flatpak_info("bed", true);
@@ -3697,21 +3716,32 @@ fn a_forged_or_hidden_flatpak_info_changes_nothing_a_context_gets() {
         (PLAYBACK, &[SINK][..]),
         (PLAYBACK_MICROPHONE, &[SINK, SOURCE][..]),
     ] {
-        let (plain, _) = reach(&bed, props, markers, str::to_owned);
+        let plain = measure(&bed, props, markers, str::to_owned).reach;
         for (case, file) in [
             ("bubbler's file", Some(&files[0])),
             ("a forged file", Some(&files[1])),
             ("no file", None),
         ] {
-            let (nested_reach, seen) = reach(&bed, props, markers, |program| {
+            let nested_client = measure(&bed, props, markers, |program| {
                 nested(file.map(|(path, _)| path.as_path()), program)
             });
             assert_eq!(
-                seen.as_ref(),
+                nested_client.flatpak_info.as_ref(),
                 file.map(|(_, text)| text),
                 "{case}: not what the client's /proc/<pid>/root holds"
             );
-            assert_eq!(nested_reach, plain, "{case} under {props}");
+            let properties = &nested_client.reach.properties;
+            assert!(
+                properties.iter().any(|line| line == AS_THE_CONTEXT_SET_IT),
+                "{case}: {properties:?}"
+            );
+            for key in FROM_THE_FILE {
+                assert!(
+                    !properties.iter().any(|line| line.starts_with(key)),
+                    "{case}: the daemon read the file: {properties:?}"
+                );
+            }
+            assert_eq!(nested_client.reach, plain, "{case} under {props}");
         }
     }
 }
