@@ -1740,11 +1740,15 @@ fn second_session_manager(bed: &PipeWireBed) -> Command {
 
 /// `command`, a `pw-cli`, making `link` and holding it: a link `pw-cli`
 /// makes lives while it runs, and it runs until its stdin closes.
-fn holding_a_link(mut command: Command, link: &str) -> Streaming {
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+fn holding_a_link(command: Command, link: &str) -> Streaming {
+    holding_a_link_logged(command, link, Path::new("/dev/null"))
+}
+
+/// The same with what `pw-cli` says kept in `log`, where a refusal shows.
+fn holding_a_link_logged(mut command: Command, link: &str, log: &Path) -> Streaming {
+    let out = std::fs::File::create(log).expect("a log for pw-cli");
+    let err = out.try_clone().expect("a second handle on that log");
+    command.stdin(Stdio::piped()).stdout(out).stderr(err);
     own_process_group(&mut command);
     let mut child = command.spawn().expect("pw-cli did not run");
     std::io::Write::write_all(
@@ -2947,10 +2951,10 @@ fn a_host_recorder_records_from_a_source_a_devices_context_offers() {
 
 /// What may flow into a `devices` context's sink is a stream's audio,
 /// linked by a session manager: a host stream is kept, a sink's monitor
-/// is destroyed even from a session manager, the source is refused by the
-/// daemon where the context cannot see it and destroyed by the hook where
-/// it can (`microphone`), and a patchbay's link from the stream is
-/// destroyed.
+/// is destroyed even from a session manager, the source's link is refused
+/// by the daemon or destroyed by the hook where the context cannot see the
+/// source and destroyed by the hook where it can (`microphone`), and a
+/// patchbay's link from the stream is destroyed.
 #[test]
 fn only_a_session_managers_link_from_a_stream_into_a_devices_sink_is_kept() {
     only_a_session_managers_link_from_a_stream_into_the_sink_of(DEVICES);
@@ -3003,32 +3007,29 @@ fn only_a_session_managers_link_from_a_stream_into_the_sink_of(context: &str) {
     wait_for("the hook destroying the monitor's link", || {
         links_destroyed(&bed) == before + 1
     });
-    let source_link = "bed-source capture_FR offered playback_FR";
-    let mut destroyed = before + 1;
-    let _source = if context == DEVICES {
-        let refused = second_session_manager(&bed)
-            .arg("create-link")
-            .args(source_link.split(' '))
-            .output()
-            .expect("pw-cli did not run");
-        let said = format!(
-            "{}{}",
-            String::from_utf8_lossy(&refused.stdout),
-            String::from_utf8_lossy(&refused.stderr)
-        );
-        assert!(
-            said.contains("Operation not permitted"),
-            "the daemon did not refuse the source's link:\n{said}"
-        );
-        None
-    } else {
-        let held = holding_a_link(second_session_manager(&bed), source_link);
-        destroyed += 1;
-        wait_for("the hook destroying the source's link", || {
-            links_destroyed(&bed) == destroyed
+    let said = bed.dir().join("source-link.log");
+    let _source = holding_a_link_logged(
+        second_session_manager(&bed),
+        "bed-source capture_FR offered playback_FR",
+        &said,
+    );
+    if context == DEVICES {
+        // Measured on PipeWire 1.6.9 under CPU load: the daemon let the
+        // link be made 23 times in 150, and the hook destroyed each.
+        let refused = || {
+            std::fs::read_to_string(&said)
+                .unwrap_or_default()
+                .contains("Operation not permitted")
+        };
+        wait_for("the source's link refused or destroyed", || {
+            refused() || links_destroyed(&bed) > before + 1
         });
-        Some(held)
-    };
+    } else {
+        wait_for("the hook destroying the source's link", || {
+            links_destroyed(&bed) == before + 2
+        });
+    }
+    let destroyed = links_destroyed(&bed);
     bed.command("pw-link")
         .args(["-L", "player:output_FL", "offered:playback_FL"])
         .output()
