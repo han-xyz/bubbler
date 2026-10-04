@@ -2020,7 +2020,15 @@ the wrong port and for an IP literal (`allow-out` is how an address is named),
 address refuses the connection, `504` for a connect that times out after ten
 seconds, `503` past 64 concurrent tunnels, `408` for a request that arrives
 too slowly, and `400`/`414` for a malformed or over-long one. A name that
-resolves to a link-local address has that answer skipped rather than dialled.
+resolves to a link-local address has that answer skipped rather than dialled,
+and so does one that resolves to loopback or the unspecified address: loopback
+inside the namespace is the sandbox's own, so a listed name that resolves there
+points the proxy at the application — or at the proxy itself, one tunnel slot
+per request — and `169.254.0.0/16` is where pasta's DNS forwarder sits, so a
+listed name resolving there would hand the application back the resolver the
+ruleset took away from it. Nothing else about the address is judged: what the
+sandbox may reach is decided by the name its config granted, and the namespace
+routes nowhere an `allow-out` could not name.
 Plain HTTP is not forwarded, and neither is UDP, so a client that would use
 HTTP/3 falls back to TCP. A tunnel idle for 60 seconds is closed.
 
