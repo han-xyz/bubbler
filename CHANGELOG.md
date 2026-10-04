@@ -24,8 +24,8 @@
   A WirePlumber restart announces the hidden ports and links again to a
   sandbox that stays connected (measured on PipeWire 1.6.9, WirePlumber
   0.5.18).
-- No sandbox with an audio grant sees a camera node (`Video/*`), another
-  sandbox's video stream, or their ports and links any more, whatever its
+- No sandbox with an audio grant sees a camera node (`Video/*`), any video
+  stream but its own, or their ports and links any more, whatever its
   grant. Cameras go through the portal. Card objects (`Audio/Device`) with
   their profiles and routes stay visible, so a card that only records still
   shows that a microphone exists (measured on PipeWire 1.6.9, WirePlumber
@@ -60,16 +60,15 @@
   and read the clipboard up to a second after the moment it chose. For one
   second after a sandbox stops holding its connection back, input on it
   opens no clipboard read at all, since it may have waited in the
-  compositor's buffer: input on that connection opens no paste for one
-  second after reading resumes.
+  compositor's buffer.
 - A sandbox can no longer write lines of its own into the audit log of
   `bubbler-wl-proxy`, or send control sequences through it to a terminal:
   the MIME type of a clipboard read and the interface of a refused bind are
   written escaped and cut at 128 bytes.
-- No release opens the Wayland clipboard gate any more: a mouse button or
-  key release, a touch lift and a pen lift or button release allow no
-  paste, since the protocol does not say which application a release goes
-  to. Presses still do.
+- A mouse button release and a touch lift no longer open the Wayland
+  clipboard gate, and a tablet pen lift or button release does not either,
+  since the protocol does not say which application a release goes to.
+  Presses still do.
 
 ### Changed
 
@@ -96,8 +95,7 @@
 
 - A tablet pen touching down or pressing a button, and a tablet pad button
   press, now allow a paste under the Wayland clipboard gate like a key press
-  or a mouse click; one sent as the pen enters or leaves a window, a pen
-  lift and a button release do not.
+  or a mouse click; one sent as the pen enters or leaves a window does not.
 - Drag-and-drop into a sandboxed application now delivers its data under
   the Wayland clipboard gate: after the drop, the application may read the
   dragged data until it finishes with it, without opening the clipboard.

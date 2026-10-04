@@ -832,12 +832,12 @@ The proxy gives a name the most permissive rule written for it, so the
 parser refuses a config whose rules would apply more widely than they
 read: a `talk` or `own` on `org.freedesktop.portal.Desktop` or
 `.Documents`, or an every-interface `call` on `.Desktop`, beside `portals`,
-which would undo its split; a `talk` or `own`, written or added by a grant such as
-`notify`, covering a name a `call` or `broadcast` on the same bus filters;
-and an `own` covering
-`org.a11y.*`, `org.freedesktop.portal.*` or `org.freedesktop.impl.portal.*`,
-since the two host-bus calls above trust whoever owns `org.a11y.Bus` and
-`org.freedesktop.portal.Documents`. Across profile layers too.
+which would undo its split; a `talk` or `own`, written or added by a grant
+such as `notify`, covering a name a `call` or `broadcast` on the same bus
+filters; and an `own` covering `org.a11y.*`, `org.freedesktop.portal.*` or
+`org.freedesktop.impl.portal.*`, since the two host-bus calls above trust
+whoever owns `org.a11y.Bus` and `org.freedesktop.portal.Documents`. Across
+profile layers too.
 
 `xdg-dbus-proxy(1)` says a filtered name counts as "(at least) TALK" once
 the client has called it or received its broadcast; in practice that does not
@@ -1058,11 +1058,11 @@ writable, and, in both managers, no permission at all on the metadata
 objects and on the session manager's own client, and read and nothing
 else on every stream node but a video one. The playback manager alone
 adds no permission at all on every node a stream can record from —
-each class beginning `Audio/Source` (`/Virtual`, a filter's source such
-as echo-cancel; `/Internal`) and `Audio/Duplex`, the classes WirePlumber offers as a
-default source; before 0.24.2 it hid `Audio/Source` alone, and a
-playback sandbox saw the rest (measured) — and the linking hook refuses
-a capture stream every other target by the same test. Withholding all
+each class holding `Audio/Source` (`/Virtual`, a filter's source such as
+echo-cancel; `/Internal`) and `Audio/Duplex`, the classes WirePlumber
+offers as a default source; before 0.24.2 it hid `Audio/Source` alone,
+and a playback sandbox saw the rest (measured) — and the linking hook
+refuses a capture stream every other target by the same test. Withholding all
 permissions on a source withholds more than its visibility: `PW_PERM_L`
 is what lets a link be made to a node the client cannot see, and the
 playback manager grants it nowhere, so a capture stream a playback-only
@@ -1088,9 +1088,9 @@ node. The sandbox therefore learns that the object exists, and its
 properties (name, id, format), at that moment. No audio flows. Nodes
 have behaved this way since 0.23; ports and links behave the same way
 (measured, PipeWire 1.6.9, WirePlumber 0.5.18). Objects already present
-when the sandbox connects are not shown to it, but for the two cases
-below: a WirePlumber restart, and a node that changed its class before the
-sandbox connected.
+when the sandbox connects are not shown to it, except a node that changed
+its class before then (below); a WirePlumber restart re-announces ports
+and links to a connected sandbox (below).
 
 A WirePlumber restart does the same for a sandbox that stays connected
 across it: the restarted WirePlumber announces the ports and links of the
@@ -1139,8 +1139,8 @@ Card objects (`Audio/Device`) stay visible to every audio context, with
 their profiles and routes. A card holding only a microphone, and the input
 profiles and routes of a combined card, therefore show a context without
 `microphone` that a microphone exists, and what it is called. Hiding a
-card whose every node is a hidden source was decided (D17) and not built:
-it could not be tested. The test bed cannot make a device object without
+card whose every node is a hidden source is not built: it could not be
+tested. The test bed cannot make a device object without
 hardware or root. `spa-device-factory` with `api.alsa.pcm.device` or
 `api.alsa.acp.device` on a card that does not exist creates no device
 (each fails opening the card's control). The only other SPA device
@@ -1444,7 +1444,8 @@ but `unrestricted` (`flatpak` on a host-socket client holding a
 `/.flatpak-info`, `unrestricted` on WirePlumber's and a host tool's), and
 one whose creator is not in the dump or not of the expected shape (all
 measured on PipeWire 1.6.9 and WirePlumber 0.5.18, a context claiming
-`pipewire.sec.engine = "org.host"` both at connect and by a later update). An ignored object can make the answer "not loaded" or "another
+`pipewire.sec.engine = "org.host"` both at connect and by a later
+update). An ignored object can make the answer "not loaded" or "another
 revision", never "current"; the `default` metadata plays no part. What it
 does not prove: that the creator is WirePlumber — a host process of the
 user's that published the revision would pass, and the host is trusted

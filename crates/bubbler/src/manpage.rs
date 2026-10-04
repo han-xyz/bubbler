@@ -329,7 +329,8 @@ const CHECK_LINES: &[(&str, &str)] = &[
          this bubbler's policy, or another revision of it: the grant is not enforced as \
          configured until `systemctl --user restart wireplumber`. Held back where a policy \
          file is missing or differs, whose own warning comes first; `lint-allow` silences \
-         the run warning as well. A note instead where WirePlumber could not be asked.",
+         the run warning as well. A warning too where PipeWire answered but its answer could \
+         not be read. A note instead where WirePlumber could not be asked.",
     ),
     (
         "bundle-without-dbus",
