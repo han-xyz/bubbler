@@ -640,9 +640,14 @@ struct ContextMonitor {
 impl ContextMonitor {
     /// Started once its client sees the sink, so its access is decided.
     fn start(bed: &PipeWireBed, props: &str) -> ContextMonitor {
+        ContextMonitor::running(bed, props, "stdbuf -oL pw-mon -N -a -o")
+    }
+
+    /// The same for any `program` that prints the globals it is shown as
+    /// `pw-mon` does.
+    fn running(bed: &PipeWireBed, props: &str, program: &str) -> ContextMonitor {
         let log = bed.dir().join("context-monitor.log");
-        let running =
-            Streaming(bed.spawn_in_context_logged(props, "stdbuf -oL pw-mon -N -a -o", Some(&log)));
+        let running = Streaming(bed.spawn_in_context_logged(props, program, Some(&log)));
         let monitor = ContextMonitor {
             _running: running,
             log,
@@ -959,6 +964,68 @@ fn a_microphone_context_connected_first_sees_no_later_video_node_or_its_ports_an
     let mut ids = objects_of(&bed.info_from_host(), &nodes);
     ids.extend(nodes);
     monitor.sees_none_of(&ids);
+}
+
+#[test]
+fn a_video_stream_is_hidden_from_every_context_but_its_own_client() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let Some(fixture) = changes_its_properties(&bed) else {
+        return;
+    };
+    let props = |name: &str| {
+        format!(
+            "{{ media.class = Stream/Output/Video, node.name = {name}, node.autoconnect = false, \
+             adapter.auto-port-config = {{ mode = dsp, position = preserve }} }}"
+        )
+    };
+    let own = ContextMonitor::running(
+        &bed,
+        PLAYBACK,
+        &format!("'{}' out '{}'", fixture.display(), props("own-video")),
+    );
+    let _other = Streaming(bed.spawn_in_context(
+        PLAYBACK_MICROPHONE,
+        &format!("'{}' out '{}'", fixture.display(), props("other-video")),
+    ));
+    let mut command = bed.command(&fixture.to_string_lossy());
+    command
+        .args(["out", &props("host-video")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    own_process_group(&mut command);
+    let _host = Streaming(command.spawn().expect("the fixture did not run"));
+    let mut hidden = video_nodes_with_a_link(&bed);
+
+    let mut host = String::new();
+    let stream = |host: &str, name: &str| object(host, &[&format!("node.name = \"{name}\""), NODE]);
+    wait_for("the three video streams with their ports", || {
+        host = bed.info_from_host();
+        ["own-video", "other-video", "host-video"]
+            .iter()
+            .all(|name| {
+                stream(&host, name).is_some_and(|node| {
+                    !objects_of(&host, std::slice::from_ref(&node.id)).is_empty()
+                })
+            })
+    });
+    let own_node = stream(&host, "own-video").expect("the own stream").id;
+    let mut own_ids = objects_of(&host, std::slice::from_ref(&own_node));
+    own_ids.push(own_node);
+    wait_for(
+        "the own video stream and its ports, seen by its client",
+        || {
+            let visible = own.visible();
+            own_ids.iter().all(|id| visible.contains(id))
+        },
+    );
+    for name in ["other-video", "host-video"] {
+        hidden.push(stream(&host, name).expect("a video stream").id);
+    }
+    let mut ids = objects_of(&host, &hidden);
+    ids.extend(hidden);
+    own.sees_none_of(&ids);
 }
 
 #[test]

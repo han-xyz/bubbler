@@ -99,7 +99,7 @@ local BUBBLER_ENGINE = "org.bubbler"
 
 -- Raised whenever what this policy makes WirePlumber do changes; bubbler
 -- expects the revision it ships with and reads it from this line.
-local POLICY_REVISION = 4
+local POLICY_REVISION = 5
 
 local EPERM = -1
 
@@ -559,20 +559,19 @@ local function is_sandbox (client)
   return client.properties ["pipewire.sec.engine"] == BUBBLER_ENGINE
 end
 
--- Whether a stream would carry video to or from the node.
-local function video (node_props)
-  local class = node_props ["media.class"] or ""
-  return class:find ("^Video/") ~= nil or class:find ("^Stream/.*/Video$") ~= nil
-end
-
--- Whether 50-bubbler.conf hides the node from the sandbox `client`.
+-- Cameras and capture nodes are hidden by 50-bubbler.conf; a video stream
+-- here, as no rule there can tell the sandbox's own from another's.
 local function hidden_from (client, node_props)
-  return video (node_props) or
-      (capture_capable (node_props) and not granted (client, "microphone"))
+  local class = node_props ["media.class"] or ""
+  if class:find ("^Video/") then
+    return true
+  end
+  if class:find ("^Stream/.*/Video$") then
+    return node_props ["client.id"] ~= tostring (client ["bound-id"])
+  end
+  return capture_capable (node_props) and not granted (client, "microphone")
 end
 
--- Whether the node `node_id` names is one hidden from `client`, as a
--- function of the id.
 local function hides_node (client)
   return function (node_id)
     if not node_id then
@@ -594,10 +593,18 @@ end
 
 local function hidden_of (of_node)
   local hidden
+  local function hide (object)
+    hidden = hidden or {}
+    hidden [object ["bound-id"]] = "-"
+  end
+  for node in nodes:iterate () do
+    if of_node (tostring (node ["bound-id"])) then
+      hide (node)
+    end
+  end
   for object in ports_and_links:iterate () do
     if belongs (object, of_node) then
-      hidden = hidden or {}
-      hidden [object ["bound-id"]] = "-"
+      hide (object)
     end
   end
   return hidden
@@ -618,23 +625,16 @@ local function hide_from_connected_sandboxes (hidden_for)
   end
 end
 
-local function hide_node_from_connected_sandboxes (node, with_the_node)
+local function hide_node_from_connected_sandboxes (node)
   local id = tostring (node ["bound-id"])
   hide_from_connected_sandboxes (function (client)
-    if not hidden_from (client, node.properties) then
-      return nil
-    end
-    local hidden = hidden_of (function (node_id) return node_id == id end)
-    if with_the_node then
-      hidden = hidden or {}
-      hidden [node ["bound-id"]] = "-"
-    end
-    return hidden
+    return hidden_from (client, node.properties) and
+        hidden_of (function (node_id) return node_id == id end)
   end)
 end
 
 nodes:connect ("object-added", function (_, node)
-  hide_node_from_connected_sandboxes (node, false)
+  hide_node_from_connected_sandboxes (node)
   -- A node's client sets its class and may change it later; the permission
   -- manager does not look at the node again (WirePlumber 0.5.18).
   local class = node.properties ["media.class"]
@@ -642,7 +642,7 @@ nodes:connect ("object-added", function (_, node)
     local now = changed.properties ["media.class"]
     if now ~= class then
       class = now
-      hide_node_from_connected_sandboxes (changed, true)
+      hide_node_from_connected_sandboxes (changed)
     end
   end)
 end)
