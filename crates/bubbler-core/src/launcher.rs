@@ -2086,8 +2086,7 @@ fn start_net_proxy(
     // cgroup handle and `ns` open across the spawn, so `borrow_raw`
     // borrows descriptors nothing has closed.
     //
-    // The order is the manual's ("The proxy process"), after `setsid`, which leaves the proxy
-    // no controlling terminal through which to open the caller's `/dev/tty`.
+    // The order is the manual's ("The proxy process").
     unsafe {
         cmd.pre_exec(move || {
             rustix::process::setsid()?;
