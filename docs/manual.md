@@ -1878,13 +1878,15 @@ match:
 `<n>` is how many components the path has, counted from the path itself so the
 two can never disagree.
 
-The path is refused only where nft could not carry it inside a quoted string —
-a `"`, whitespace, a control byte or a byte outside ASCII. Everything a systemd
-unit name holds passes: `user@1000.service` is where a user session's delegated
-subtree lives, `@`, `:` and `+` are ordinary characters in one, and a `-` in a
-name arrives escaped as `\x2d`. nft resolves such a path as written and fails
-to resolve it with the backslash doubled, and a trailing `\` does not escape
-the closing quote, so passing them through is both necessary and safe.
+Besides an empty path, a leading or trailing `/` and an empty, `.` or `..`
+component, the only characters refused in the path are those nft could not
+carry inside a quoted string — a `"`, whitespace, a control byte or a byte
+outside ASCII. Everything a systemd unit name holds passes: `user@1000.service`
+is where a user session's delegated subtree lives, `@`, `:` and `+` are
+ordinary characters in one, and a `-` in a name arrives escaped as `\x2d`.
+Measured 2026-08-27: nft resolves such a path as written and fails to resolve
+it with the backslash doubled, and a trailing `\` does not escape the closing
+quote, so passing them through is both necessary and safe.
 
 `SO_MARK` would have done the matching too, and was rejected after measuring:
 glibc's resolver opens its own sockets and the caller cannot mark them, so a

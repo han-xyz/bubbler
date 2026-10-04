@@ -711,7 +711,10 @@ is what closes it, now for both APIs. A hand-written cBPF prefix ahead of the
 compiled filter allows `personality` only the five values a desktop
 application has any business setting (`PER_LINUX`, `PER_LINUX32`,
 `UNAME26`, both together, and the query value `0xffffffff`) and answers
-`EPERM` for the rest, `ADDR_NO_RANDOMIZE` among them — the prefix only
+`EPERM` for the rest, `ADDR_NO_RANDOMIZE` among them. It is written by hand
+because libseccomp cannot express a per-argument allowlist in a
+default-allow filter: two comparisons on one argument are `EINVAL` and an
+`ALLOW` rule is `EACCES`. The prefix only
 recognises the `x86_64`/`i386` `AUDIT_ARCH` and syscall-number values, so it
 is compiled into every filter but is inert on any other build architecture,
 where `personality` is as unrestricted as any syscall neither denylist
@@ -757,13 +760,10 @@ mount-API calls (`open_tree`, `move_mount`, `fsopen`, `fsconfig`,
 closes by itself when libseccomp learns the names, which
 `the_numbered_rules_are_the_ones_this_libseccomp_cannot_name` fails on.
 Numbers from 425 on are shared with i386, which `asm/unistd_32.h` confirms
-for 467 and 470. `fchroot` is proposed and not merged, so 472 is allocated to nothing yet and
-the rule denies a number that already answers `ENOSYS`;
+for 467 and 470. `fchroot` is proposed and not merged, so 472 is allocated
+to nothing yet and the rule denies a number that already answers `ENOSYS`;
 `no_numbered_rule_names_a_number_the_headers_give_to_another_call` is what
-fails the day a kernel gives it to some other call. The `personality` prefix
-is written by hand because libseccomp cannot express a per-argument
-allowlist in a default-allow filter: two comparisons on one argument are
-`EINVAL` and an `ALLOW` rule is `EACCES`.
+fails the day a kernel gives it to some other call.
 
 ### User namespaces inside the sandbox
 
