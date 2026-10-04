@@ -3,9 +3,12 @@
 //! it loads — embedded so bubbler can hand both out (`bubbler
 //! audio-policy --print`, `--print --script`) and detect when none of
 //! the host's `wireplumber.conf.d` directories holds the drop-in,
-//! without touching the source tree it was built from.
+//! without touching the source tree it was built from; and the policy
+//! revision the running WirePlumber has loaded.
 
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::config::InstanceConfig;
 use crate::env::Env;
@@ -306,6 +309,126 @@ pub fn differs_help(paths: &[PathBuf], env: &Env) -> String {
          accepted with `lint-allow \"{DIFFERS_CHECK}\" reason=\"...\"`",
         steps.join(" and ")
     )
+}
+
+/// Where the tool that reads the running WirePlumber's metadata is
+/// installed: the `pipewire` package, beside `pw-container`.
+pub const PW_METADATA: &str = "/usr/bin/pw-metadata";
+
+/// The metadata object the loaded hook states its policy revision in,
+/// under [`REVISION_KEY`] on subject 0.
+pub const POLICY_METADATA: &str = "bubbler-policy";
+
+/// The key of [`POLICY_METADATA`] that holds the revision.
+pub const REVISION_KEY: &str = "revision";
+
+/// How the hook states its revision, the one place it is written down.
+const REVISION_LINE: &str = "local POLICY_REVISION = ";
+
+/// How long [`loaded_revision`] waits for an answer before it calls the
+/// revision unknown.
+const READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The policy revision of this bubbler's hook: the one the running
+/// WirePlumber should have loaded.
+pub fn revision() -> u32 {
+    HOOK.lines()
+        .find_map(|line| line.strip_prefix(REVISION_LINE))
+        .and_then(|value| value.trim().parse().ok())
+        .expect("the embedded hook states its revision as an integer")
+}
+
+/// Which policy revision the running WirePlumber has loaded, against
+/// [`revision`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadedRevision {
+    /// This bubbler's.
+    Current,
+    /// Another, with the value it states.
+    Other(String),
+    /// None: no [`POLICY_METADATA`], or one without [`REVISION_KEY`],
+    /// which is a hook older than revisions or none at all.
+    Absent,
+    /// Not known, and why: the tool is missing, the daemon unreachable,
+    /// or the answer unreadable.
+    Unknown(String),
+}
+
+/// What `pw-metadata -n bubbler-policy` printed on stdout, read as a
+/// [`LoadedRevision`]. No such metadata prints nothing (measured on
+/// PipeWire 1.6.9).
+pub fn parse_loaded_revision(stdout: &str) -> LoadedRevision {
+    let mut lines = stdout.lines();
+    let Some(found) = lines.next() else {
+        return LoadedRevision::Absent;
+    };
+    if !found.starts_with(&format!("Found \"{POLICY_METADATA}\" metadata ")) {
+        return LoadedRevision::Unknown(format!("unexpected pw-metadata output: {found}"));
+    }
+    let update = format!("update: id:0 key:'{REVISION_KEY}' value:'");
+    let Some(value) = lines.find_map(|line| {
+        line.strip_prefix(&update)
+            .and_then(|rest| rest.rsplit_once("' type:'"))
+            .map(|(value, _)| value)
+    }) else {
+        return LoadedRevision::Absent;
+    };
+    if value == revision().to_string() {
+        LoadedRevision::Current
+    } else {
+        LoadedRevision::Other(value.to_owned())
+    }
+}
+
+/// The policy revision the WirePlumber serving the PipeWire socket in
+/// `runtime_dir` has loaded, asked of [`PW_METADATA`] with nothing of
+/// bubbler's environment but that directory. An answer that does not
+/// come within two seconds is [`LoadedRevision::Unknown`].
+pub fn loaded_revision(runtime_dir: &Path) -> LoadedRevision {
+    let spawned = Command::new(PW_METADATA)
+        .arg("-n")
+        .arg(POLICY_METADATA)
+        .env_clear()
+        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(e) => return LoadedRevision::Unknown(format!("{PW_METADATA}: {e}")),
+    };
+    let deadline = Instant::now() + READ_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                // Killed and reaped either way; an error here is a child
+                // already gone, which the wait collects.
+                let _ = child.kill();
+                let _ = child.wait();
+                return LoadedRevision::Unknown(format!(
+                    "{PW_METADATA} did not answer within {} s",
+                    READ_TIMEOUT.as_secs()
+                ));
+            }
+            Err(e) => return LoadedRevision::Unknown(format!("{PW_METADATA}: {e}")),
+        }
+    }
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(e) => return LoadedRevision::Unknown(format!("{PW_METADATA}: {e}")),
+    };
+    if !output.status.success() {
+        let said = String::from_utf8_lossy(&output.stderr);
+        return LoadedRevision::Unknown(format!(
+            "{PW_METADATA} {}: {}",
+            output.status,
+            said.trim()
+        ));
+    }
+    parse_loaded_revision(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// `path` as one word of a POSIX shell command: as it is where a shell
@@ -760,5 +883,82 @@ mod tests {
         let edited = install_dirs(&e)[0].join(DROP_IN_NAME);
         let other = whole.text(edited.to_str().unwrap(), "# another version\n");
         assert_eq!(explain_suffix(&other, &e), EXPLAIN_SUFFIX_DIFFERS);
+    }
+
+    /// What `pw-metadata -n bubbler-policy` printed on a bed whose hook
+    /// states revision 1 (PipeWire 1.6.9, WirePlumber 0.5.18).
+    const MEASURED: &str = "Found \"bubbler-policy\" metadata 27\n\
+                            update: id:0 key:'revision' value:'1' type:'Spa:Int'\n";
+
+    fn stating(value: u32) -> String {
+        MEASURED.replace("value:'1'", &format!("value:'{value}'"))
+    }
+
+    #[test]
+    fn the_revision_is_the_integer_the_hook_states() {
+        assert!(HOOK.contains(&format!("\nlocal POLICY_REVISION = {}\n", revision())));
+    }
+
+    #[test]
+    fn a_metadata_stating_this_revision_is_current() {
+        assert_eq!(
+            parse_loaded_revision(&stating(revision())),
+            LoadedRevision::Current
+        );
+    }
+
+    #[test]
+    fn a_metadata_stating_another_revision_names_it() {
+        let other = revision() + 1;
+        assert_eq!(
+            parse_loaded_revision(&stating(other)),
+            LoadedRevision::Other(other.to_string())
+        );
+    }
+
+    /// No such metadata prints nothing at all; one without the key prints
+    /// only the line that found it.
+    #[test]
+    fn no_metadata_or_no_revision_key_is_absent() {
+        assert_eq!(parse_loaded_revision(""), LoadedRevision::Absent);
+        assert_eq!(
+            parse_loaded_revision("Found \"bubbler-policy\" metadata 27\n"),
+            LoadedRevision::Absent
+        );
+    }
+
+    #[test]
+    fn output_of_another_shape_is_unknown() {
+        for garbage in [
+            "can't connect: Host is down\n",
+            "Found \"default\" metadata 3\n",
+        ] {
+            assert!(
+                matches!(parse_loaded_revision(garbage), LoadedRevision::Unknown(_)),
+                "{garbage}"
+            );
+        }
+    }
+
+    /// The revision and a digest of the two policy files it was last set
+    /// for.
+    const PINNED: (u32, u64) = (1, 16613455862939437426);
+
+    /// FNV-1a, 64 bit.
+    fn digest(bytes: impl Iterator<Item = u8>) -> u64 {
+        bytes.fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+
+    #[test]
+    fn the_policy_files_are_the_ones_their_revision_was_pinned_for() {
+        let now = (revision(), digest(DROP_IN.bytes().chain(HOOK.bytes())));
+        assert_eq!(
+            now, PINNED,
+            "50-bubbler.conf or refuse-links.lua changed: if what WirePlumber does \
+             changed with it, raise POLICY_REVISION in refuse-links.lua; then set PINNED \
+             to the pair on the left"
+        );
     }
 }

@@ -17,6 +17,7 @@ use rustix::process::{
     Pid, Signal, kill_process, kill_process_group, set_parent_process_death_signal,
 };
 
+use bubbler_core::audio_policy::{self, LoadedRevision};
 use bubbler_core::host::RealHost;
 use bubbler_core::pipewire::{
     PIPEWIRE, PULSE_CONF, PULSE_DROP_IN, PULSE_NATIVE, PULSE_OVERRIDE, PULSE_SOCKET_INSIDE,
@@ -3977,4 +3978,109 @@ fn a_host_stream_keeps_its_volume_when_a_contexts_stream_is_turned_down_across_a
         "saved:\n{}",
         saved_stream_state(&bed)
     );
+}
+
+/// What the bed's WirePlumber answers once the hook it loaded has had the
+/// time to publish its revision. A bound, not a proof, as
+/// `window_in_which_it_would_link` is: nothing announces a metadata that
+/// is never published.
+fn loaded_revision(bed: &PipeWireBed) -> LoadedRevision {
+    let run = bed.dir().join("run");
+    let mut answer = audio_policy::loaded_revision(&run);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while answer == LoadedRevision::Absent && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        answer = audio_policy::loaded_revision(&run);
+    }
+    answer
+}
+
+/// A bed whose hook is the shipped one with `from` replaced by `to`.
+fn bed_with_the_hook_changed(from: &str, to: &str) -> Option<PipeWireBed> {
+    assert!(HOOK.contains(from), "the hook holds no {from:?}");
+    PipeWireBed::start_with(|dir| {
+        std::fs::write(
+            dir.join("data").join(HOOK_IN_DATA_DIR),
+            HOOK.replace(from, to),
+        )
+        .expect("the changed hook");
+    })
+    .map(|(bed, ())| bed)
+}
+
+#[test]
+fn the_loaded_policy_states_this_bubblers_revision() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    assert_eq!(loaded_revision(&bed), LoadedRevision::Current);
+}
+
+#[test]
+fn a_hook_that_publishes_no_revision_is_absent() {
+    let Some(bed) = bed_with_the_hook_changed(
+        r#"ImplMetadata ("bubbler-policy")"#,
+        r#"ImplMetadata ("not-bubbler-policy")"#,
+    ) else {
+        return;
+    };
+    assert_eq!(loaded_revision(&bed), LoadedRevision::Absent);
+}
+
+#[test]
+fn a_hook_of_another_revision_names_it() {
+    let current = audio_policy::revision();
+    let other = current + 1;
+    let Some(bed) = bed_with_the_hook_changed(
+        &format!("local POLICY_REVISION = {current}\n"),
+        &format!("local POLICY_REVISION = {other}\n"),
+    ) else {
+        return;
+    };
+    assert_eq!(
+        loaded_revision(&bed),
+        LoadedRevision::Other(other.to_string())
+    );
+}
+
+/// A context can neither read the revision, nor write it, nor publish a
+/// metadata of the same name for bubbler to read instead.
+#[test]
+fn no_context_sees_or_makes_the_policys_metadata() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    assert_eq!(loaded_revision(&bed), LoadedRevision::Current);
+    let named = "\"metadata.name\": \"bubbler-policy\"";
+    for (props, grant) in [(PLAYBACK, "playback"), (DEVICES, "playback,devices")] {
+        bed.info_in_context(props, &[SINK]);
+        let seen = bed.in_context(props, "pw-dump");
+        assert!(!seen.contains(named), "a {grant} context sees it:\n{seen}");
+
+        let set = bed.output_in_context(props, "pw-metadata -n bubbler-policy 0 revision 0");
+        // pw-cli has no command for any type but a node, a device or a
+        // link; the core looks the factory up before it checks the type,
+        // so a visible metadata factory answers "wrong resource type"
+        // (measured from the host on PipeWire 1.6.9) and a hidden one this.
+        let made = bed.output_in_context(
+            props,
+            "pw-cli create-node metadata '{ metadata.name = bubbler-policy, \
+             object.linger = true }'",
+        );
+        assert!(
+            String::from_utf8_lossy(&made.stderr).contains("unknown factory name metadata"),
+            "a {grant} context was not refused the metadata factory: {made:?}"
+        );
+        std::thread::sleep(FORBIDDEN_LINK_LIFE);
+        assert_eq!(
+            bed.dump_from_host().matches(named).count(),
+            1,
+            "a {grant} context made a second one: {made:?}"
+        );
+        assert_eq!(
+            audio_policy::loaded_revision(&bed.dir().join("run")),
+            LoadedRevision::Current,
+            "a {grant} context changed the revision: {set:?}"
+        );
+    }
 }

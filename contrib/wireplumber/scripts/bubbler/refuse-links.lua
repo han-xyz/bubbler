@@ -85,6 +85,10 @@
 -- those names are left to stock: a sandbox's stream named like a host
 -- application starts at that application's saved levels, and a target
 -- the user picks for it is saved under those names.
+--
+-- The policy states its revision in the metadata `bubbler-policy`, key
+-- `revision` on subject 0, which no sandbox can see: bubbler reads it to
+-- tell a WirePlumber still running an older policy.
 
 local lutils = require ("linking-utils")
 local cutils = require ("common-utils")
@@ -92,6 +96,10 @@ local log = Log.open_topic ("s-linking")
 
 -- The engine name bubbler gives every security context it creates.
 local BUBBLER_ENGINE = "org.bubbler"
+
+-- Raised whenever what this policy makes WirePlumber do changes; bubbler
+-- expects the revision it ships with and reads it from this line.
+local POLICY_REVISION = 1
 
 local EPERM = -1
 
@@ -771,3 +779,15 @@ SimpleEventHook {
     end
   end
 }:register ()
+
+-- A global, as stock metadata.lua keeps its own: a script's globals live
+-- as long as the script, and a local nothing refers to would be collected
+-- and the metadata destroyed with it.
+policy_revision_metadata = ImplMetadata ("bubbler-policy")
+policy_revision_metadata:activate (Features.ALL, function (m, e)
+  if e then
+    log:warning ("bubbler-policy metadata not activated: " .. tostring (e))
+    return
+  end
+  m:set (0, "revision", "Spa:Int", tostring (POLICY_REVISION))
+end)
