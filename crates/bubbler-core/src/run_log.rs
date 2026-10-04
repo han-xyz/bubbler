@@ -1,15 +1,6 @@
 //! What a run started from a desktop entry or a shim has to say, kept in
 //! the instance directory instead of thrown away.
 //!
-//! A launcher gives the process it starts no terminal, so bubbler's own
-//! warnings, a sidecar's errors and the application's stderr would all go
-//! nowhere. While a [`Redirect`] lives, fd 2 is a pipe a thread copies
-//! into `last-run.log`; it stops at [`MAX_BYTES`], measured against the
-//! file itself before every write so a second bubbler appending to the
-//! same log cannot push it over, and keeps draining afterwards, so an
-//! application that never stops writing fills neither the disk nor the
-//! pipe.
-//!
 //! **The copying thread must never spawn a process.** The launcher clears
 //! `CLOEXEC` on the descriptors one child is meant to inherit and puts it
 //! back once that spawn has happened (`RealAlloc::inheritable` in
@@ -34,27 +25,25 @@ pub const LOG_FILE: &str = "last-run.log";
 
 /// Most the log ever holds, the note below included. A cap and not a
 /// rotation: what a run said last is what a user is looking for, and one
-/// mebibyte of it is more than a launcher failure ever needs. It caps the
-/// file, not one writer's share of it.
+/// mebibyte of it is more than a launcher failure ever needs.
 pub const MAX_BYTES: u64 = 1 << 20;
 
-/// Kept free under [`MAX_BYTES`] by every writer but a start that ended
-/// without binding, so that start's error is recorded even when the run
-/// before it filled the log, which it appends to rather than empties.
+// Kept free under [`MAX_BYTES`] by every writer but a start that ended
+// without binding, so that start's error is recorded even when the run
+// before it filled the log, which it appends to rather than empties.
 const FAILURE_ROOM: u64 = 4096;
 
-/// Where the output of a run, a start that joined one and an exec stops.
+// Where the output of a run, a start that joined one and an exec stops.
 const RUN_CAP: u64 = MAX_BYTES - FAILURE_ROOM;
 
-/// Written once, in place of the output that no longer fits.
+// Written once, in place of the output that no longer fits.
 const NOTE: &str = "\nbubbler: log full; the rest of this run's output was dropped\n";
 
-/// Tried once when a tee's log fails, so a cut-off record reads as one.
+// Tried once when a tee's log fails, so a cut-off record reads as one.
 const STOPPED: &str = "\nbubbler: writing the log failed; the record of this run stops here\n";
 
-/// How long a [`Redirect`] or a [`Relay`] waits for its copying thread on
-/// the way out. A process that outlived the run still holds the pipe open,
-/// and giving up costs the last few lines, never the exit.
+// A process that outlived the run still holds the pipe open,
+// and giving up costs the last few lines, never the exit.
 const FLUSH: Duration = Duration::from_secs(1);
 
 /// The log of the instance whose directory is `dir`.
@@ -79,10 +68,10 @@ pub fn read(path: &Path) -> Result<Option<Vec<u8>>, LaunchError> {
     Ok(Some(text))
 }
 
-/// Open the log for `flags`, refusing everything that is not a regular
-/// file of the user's own: a symlink is not followed (`O_NOFOLLOW`), a
-/// fifo cannot park the open (`O_NONBLOCK`, which a regular file ignores)
-/// and any other type is refused outright.
+// Open the log for `flags`, refusing everything that is not a regular
+// file of the user's own: a symlink is not followed (`O_NOFOLLOW`), a
+// fifo cannot park the open (`O_NONBLOCK`, which a regular file ignores)
+// and any other type is refused outright.
 fn open(path: &Path, flags: OFlags) -> io::Result<OwnedFd> {
     let file = rustix::fs::open(
         path,
@@ -102,24 +91,23 @@ fn open(path: &Path, flags: OFlags) -> io::Result<OwnedFd> {
 /// fd 2 pointed at an instance's log for as long as this lives. Dropping
 /// it puts the caller's own stderr back.
 pub struct Redirect {
-    /// Where [`Redirect::started`], [`Redirect::joined`] or
-    /// [`Redirect::not_started`] tells the copying thread the cap its
-    /// copy stops at; dropped unsettled, the thread empties the log first.
+    // Where [`Redirect::started`], [`Redirect::joined`] or
+    // [`Redirect::not_started`] tells the copying thread the cap its
+    // copy stops at; dropped unsettled, the thread empties the log first.
     settle: Option<SyncSender<u64>>,
-    /// The log, when it is to be emptied, for [`Redirect::started`] to
-    /// empty before it returns.
+    // The log, when it is to be emptied, for [`Redirect::started`] to
+    // empty before it returns.
     to_empty: Option<OwnedFd>,
     saved: OwnedFd,
-    /// bubbler's end of the pipe. Dropped first on the way out, since the
-    /// copying thread ends on the last writer closing it.
+    // bubbler's end of the pipe. Dropped first on the way out, since the
+    // copying thread ends on the last writer closing it.
     writer: Option<OwnedFd>,
     done: Receiver<()>,
 }
 
 /// Point fd 2 at `path` and copy everything written there into it.
 /// `truncate` empties the file first, which is what starting a sandbox
-/// does; an exec into a live instance appends instead, so a run's log
-/// outlives the commands sent into it.
+/// does; an exec into a live instance appends instead.
 ///
 /// With `truncate`, nothing is copied until the run says which it turned
 /// out to be — [`Redirect::started`], [`Redirect::joined`] or
@@ -129,9 +117,6 @@ pub struct Redirect {
 /// log it is writing. Until then what is written
 /// waits in the pipe, which holds far more than a start says before
 /// its bind.
-///
-/// The file is opened `O_APPEND` either way, so a second bubbler writing
-/// to the same log lands after what is already there rather than over it.
 pub fn redirect(path: &Path, truncate: bool) -> Result<Redirect, LaunchError> {
     start(path, truncate, false)
 }
@@ -171,8 +156,7 @@ fn start(path: &Path, truncate: bool, keep_stderr: bool) -> Result<Redirect, Lau
     // Nothing in here may start a process; see the module comment.
     std::thread::spawn(move || {
         // A sender dropped unused is the redirect dropped before the run
-        // said, which keeps what was asked for. A failed truncation costs
-        // the old run's lines staying ahead of this one's, nothing more.
+        // said, which keeps what was asked for.
         let cap = match truncate {
             true => settled.recv().unwrap_or_else(|_| {
                 let _ = rustix::fs::ftruncate(&file, 0);
@@ -229,7 +213,7 @@ impl Redirect {
         self.settle_on(MAX_BYTES);
     }
 
-    /// The first answer is the one that counts; the channel holds one.
+    // The first answer is the one that counts; the channel holds one.
     fn settle_on(&self, cap: u64) {
         if let Some(settle) = &self.settle {
             let _ = settle.try_send(cap);
@@ -302,22 +286,16 @@ impl Drop for Relay {
     }
 }
 
-/// Copy `src` to `dst` while `size` reports room under `cap`,
-/// then say once that the rest was dropped and keep reading. Draining to
-/// the end matters: a writer whose pipe fills stops dead, and the writer
-/// here is the sandbox.
-///
-/// `size` is the destination's own size, asked for again before every
-/// write rather than counted here, so whatever another writer has
-/// appended in the meantime counts against the same cap.
-///
-/// `stderr`, when given, is sent every byte read, past the cap too, after
-/// the file has had its share: a stderr nobody reads blocks the copy, and
-/// the record is what matters then. A stderr whose reader has gone is given
-/// up on; any other failure there costs that chunk. With a `stderr`, a file
-/// that fails is given one try at a note saying so, when it has room for
-/// it under the cap, then given up on while the copy goes on, since the
-/// caller's own stderr is what the run was promised.
+// Draining to the end matters: a writer whose pipe fills stops dead, and
+// the writer here is the sandbox.
+//
+// `size` is the destination's own size, asked for again before every
+// write rather than counted here, so whatever another writer has
+// appended in the meantime counts against the same cap.
+//
+// `stderr`, when given, is sent every byte read, past the cap too, after
+// the file has had its share: a stderr nobody reads blocks the copy, and
+// the record is what matters then.
 fn copy_capped(
     mut src: impl Read,
     dst: impl Write,
@@ -358,10 +336,10 @@ fn copy_capped(
     }
 }
 
-/// The caller's stderr, written to as if it blocked: its file description
-/// may be one a parent shares with `O_NONBLOCK` set, where a full pipe
-/// answers `WouldBlock`, and a chunk dropped for that is output the
-/// caller would have had without bubbler in between.
+// The caller's stderr, written to as if it blocked: its file description
+// may be one a parent shares with `O_NONBLOCK` set, where a full pipe
+// answers `WouldBlock`, and a chunk dropped for that is output the
+// caller would have had without bubbler in between.
 struct Blocking(std::fs::File);
 
 impl Write for Blocking {
@@ -381,8 +359,8 @@ impl Write for Blocking {
     }
 }
 
-/// Write what of `chunk` fits under `cap` to `dst`, and the note the
-/// first time something does not.
+// Write what of `chunk` fits under `cap` to `dst`, and the note the
+// first time something does not.
 fn append_capped(
     mut dst: impl Write,
     chunk: &[u8],
