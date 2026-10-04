@@ -120,6 +120,7 @@ run_job() {
     local job="$1" log="$CACHE/logs/$job-$(date +%Y%m%d-%H%M%S).log" status=0
     local -a user_env=()
     # Root in a rootful docker container leaves root-owned files in the cache.
+    # The chown back makes cached git checkouts foreign to root, hence safe.directory below.
     [ "$runtime" != docker ] || user_env=(-e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)")
     echo "== $job: log $log"
     "$runtime" run --rm \
@@ -130,6 +131,7 @@ run_job() {
         -e CARGO_INCREMENTAL=0 -e RUST_BACKTRACE=1 \
         -e CARGO_TARGET_DIR=/cache/target \
         -e CARGO_HOME=/cache/cargo -e RUSTUP_HOME=/cache/rustup \
+        -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e 'GIT_CONFIG_VALUE_0=*' \
         -e PATH=/cache/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/bin \
         "${user_env[@]}" \
         "$IMAGE" bash -c "$(job_script "$job")" >"$log" 2>&1 || status=$?
