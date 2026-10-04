@@ -1,11 +1,7 @@
 //! Bytes bubbler did not write, made safe to put on a terminal.
 //!
-//! A log is the sandbox's own output and an explanation echoes the
-//! values a config holds, and a terminal *acts* on the control sequences
-//! in either: an OSC 52 in `last-run.log` writes the reader's clipboard,
-//! a `\x1b[2J` clears the screen the log was asked for, and a title
-//! sequence renames the window. Reading a record is not replaying it, so
-//! the control characters are shown rather than sent.
+//! Reading a record is not replaying it, so the control characters are
+//! shown rather than sent.
 //!
 //! Only what reaches a terminal is rendered; the caller decides. A pipe
 //! is a tool on the other end and gets the bytes as they are.
@@ -15,18 +11,7 @@ use std::borrow::Cow;
 /// Render the control characters in `bytes` so a terminal shows them
 /// instead of acting on them: C0 and `DEL` in caret notation (`ESC` is
 /// `^[`), C1 controls and bytes that are not UTF-8 as `\xNN`, everything
-/// else unchanged. `\n` and `\t` are left alone — they are what a log is
-/// laid out with, and a terminal that acts on them is doing what the
-/// reader wants.
-///
-/// C1 is decoded rather than matched byte for byte: `U+0080`–`U+009F` are
-/// the controls, while the same byte values inside a longer sequence are
-/// ordinary text (`\u{201c}` is `e2 80 9c`), and escaping those would
-/// mangle every quotation mark a log holds.
-///
-/// The rendering is not reversible: a log that held the two characters
-/// `^` and `[` reads the same as one that held an `ESC`. That is
-/// `cat -v`'s bargain, and the reason the raw bytes still go to a pipe.
+/// else unchanged. `\n` and `\t` are left alone.
 pub fn render(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut rest = bytes;
@@ -54,7 +39,6 @@ pub fn render(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// One character as a terminal may see it.
 fn push_char(out: &mut Vec<u8>, c: char) {
     match c {
         '\n' | '\t' => out.push(c as u8),
@@ -68,8 +52,8 @@ fn push_char(out: &mut Vec<u8>, c: char) {
     }
 }
 
-/// One byte as `\xNN`, lowercase, so it reads as the escape a shell or a
-/// Rust literal would spell the same way.
+// One byte as `\xNN`, lowercase, so it reads as the escape a shell or a
+// Rust literal would spell the same way.
 fn push_hex(out: &mut Vec<u8>, b: u8) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     out.extend_from_slice(&[
@@ -82,16 +66,7 @@ fn push_hex(out: &mut Vec<u8>, b: u8) {
 
 /// `s` with everything a terminal would act on replaced by `?`: every C0
 /// control but `\n` and `\t`, `DEL`, the C1 controls, and any sequence an
-/// `ESC` introduces — a CSI, an OSC up to its `BEL` or string
-/// terminator, an APC, and a lone `ESC` — each whole sequence becoming
-/// one `?`.
-///
-/// This is the `str` path, for text bubbler formats into a line it draws
-/// itself: a table cell, a lint message quoting a config value, a title.
-/// [`render`] is the byte path, for a log or an argv the reader asked to
-/// see as it was written; it keeps the characters in caret notation
-/// rather than dropping them. Neither is reversible, and text that holds
-/// nothing to replace is borrowed rather than rebuilt.
+/// `ESC` introduces, each whole sequence becoming one `?`.
 pub fn sanitize(s: &str) -> Cow<'_, str> {
     if !s.chars().any(needs_replacing) {
         return Cow::Borrowed(s);
@@ -112,9 +87,6 @@ pub fn sanitize(s: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Whether one character is one a terminal acts on: C0 but for the two a
-/// line is laid out with, `DEL`, and the C1 controls, which a terminal
-/// reads as their two-character escapes (`\u{9b}` is CSI).
 fn needs_replacing(c: char) -> bool {
     match c {
         '\n' | '\t' => false,
@@ -123,11 +95,9 @@ fn needs_replacing(c: char) -> bool {
     }
 }
 
-/// Step past the rest of the sequence an `ESC` opened, so the whole of it
-/// is the one `?` already written. A CSI ends at its final byte
-/// (`0x40`–`0x7e`), an OSC, APC, PM or DCS at `BEL` or at the string
-/// terminator `ESC \`, and anything else is a two-character escape whose
-/// second character is ordinary text.
+// Step past the rest of the sequence an `ESC` opened, so the whole of it
+// is the one `?` already written. Anything else is a two-character
+// escape whose second character is ordinary text.
 fn skip_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     match chars.peek() {
         Some('[') => {
