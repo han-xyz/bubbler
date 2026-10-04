@@ -86,8 +86,11 @@
   `audio-policy-not-loaded` (a note where WirePlumber could not be asked), and
   `--explain` shows the loaded state beside the installed one. Where PipeWire
   answers but its answer cannot be read, the run and the lint warn that the
-  loaded policy could not be verified. A revision published by a client in a
-  security context, as a sandbox under an older policy could, is ignored.
+  loaded policy could not be verified. Only a revision published by a host
+  client counts: one whose creator is in a security context or has a
+  restricted `pipewire.access` (a Flatpak or portal client) is ignored. The
+  drop-in already keeps every sandbox from publishing one; the check does
+  not rely on it alone.
 
 ### Fixed
 

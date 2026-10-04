@@ -1451,14 +1451,15 @@ does shape is its own streams, which can carry any properties: bubbler
 skips every object that is not of the expected shape, and an answer that
 is too large (over 8 MiB, about twenty times a desktop session's whole
 dump), cut short at two seconds or not a dump is a warning that the loaded
-policy could not be verified, naming why. Streams do not slow the answer to
-that point: with 128 64-channel streams in a context (the most the bed's
-PipeWire accepted from 200 asked) a metadata-only `pw-dump` took about
-100 ms; the whole dump of a desktop session is about 0.4 MiB.
-Only where the question gets no answer at all — no `pw-dump`, no daemon,
-nothing within two seconds — does the run warn nothing and lint note it:
-an unknown is not reported as a stale policy. The run goes on in every
-case.
+policy could not be verified, naming why. A sandbox's streams do grow the
+answer: the bed's whole dump is 62 KiB and read in under 15 ms; with 30
+64-channel streams in a context (the most the bed's PipeWire accepted from
+128 asked) it is 4.3 MiB, half the limit, and read in about 170 ms. More
+streams can make the answer that warning, never "current". The whole dump
+of a desktop session is about 0.4 MiB. Only where the question gets no
+answer at all — no `pw-dump`, no daemon, nothing within two seconds —
+does the run warn nothing and lint note it: an unknown is not reported as
+a stale policy. The run goes on in every case.
 
 The private pulse server closes a gap the context alone cannot: a pulse
 client can `LOAD_MODULE` a server into loading `module-native-protocol-tcp`
