@@ -44,9 +44,10 @@ pub struct ServiceCtx<'a> {
     pub init_bin: &'a Path,
 }
 
-/// Apply every service to `args`. A [`Service::HomeShare`] `path` must be
-/// relative and a [`Service::PathShare`] `path` absolute, both normalised,
-/// exactly as the parser leaves them.
+/// Apply every service to `args`, each argument tagged with the position of
+/// its node in `services`. A [`Service::HomeShare`] `path` must be relative
+/// and a [`Service::PathShare`] `path` absolute, both normalised, exactly as
+/// the parser leaves them.
 pub fn apply_all(
     services: &[Service],
     env: &Env,
@@ -153,7 +154,7 @@ pub(crate) fn require_socket(
     require(host, service, path, "a socket", |t| t.is_socket())
 }
 
-/// The source must be a regular file, e.g. an Xauthority cookie file.
+/// The source must be a regular file.
 pub(crate) fn require_file(
     host: &dyn Host,
     service: &'static str,
@@ -213,8 +214,8 @@ fn network(
         None => {}
     }
     if !cfg.allow_hosts.is_empty() {
-        // Bound whatever it is and wherever it was found: one path for every build
-        // keeps the argv the launcher execs and the argv `--explain` prints the same.
+        // One path inside for every build keeps the argv the launcher execs
+        // and the argv `--explain` prints the same.
         let (program, _) = network::net_proxy_program(env, host)?;
         args.ro_bind(&program, Path::new(network::NET_PROXY_INSIDE));
         // The port is fixed ([`network::PROXY_PORT`]), so these are
@@ -250,8 +251,9 @@ pub(crate) fn check_wayland_display(value: Option<&OsStr>) -> Result<&OsStr, Lau
     Ok(display)
 }
 
-/// [`check_wayland_display`] on the run's [`Env`]. The launcher checks the process
-/// environment's own value separately: the Wayland client reads that one itself.
+/// [`check_wayland_display`] on the run's [`Env`]. The launcher checks the
+/// process environment's own value separately: the Wayland client reads that
+/// one itself.
 pub(crate) fn wayland_display(env: &Env) -> Result<&OsStr, LaunchError> {
     check_wayland_display(env.wayland_display.as_deref())
 }
@@ -271,8 +273,9 @@ fn wayland(
         // The launcher creates this one after the argv is built, like the
         // proxied bus socket, so there is nothing here to probe.
         Some(WaylandPlan::Proxy { socket }) => args.ro_bind(socket, &inside),
-        // A missing plan is read as the session's socket: a caller that built the context by hand
-        // must not get a bind of a socket nobody is going to create.
+        // A missing plan is read as the session's socket: a caller that
+        // built the context by hand must not get a bind of a socket
+        // nobody is going to create.
         _ => {
             let sock = require_socket(host, "wayland", inside)?;
             args.ro_bind(&sock, &sock);
@@ -360,12 +363,12 @@ fn gamepad(
     // The `hidraw` binds may belong to a `hidraw` node of its own, so the
     // tag this was called with is put back before the rest of the grant.
     let pad = args.origin();
-    // The directory, not the nodes it holds today: a node bound one by one freezes the device
+    // The directory, not its nodes: a node bound one by one freezes the device
     // list at start, while the directory shows a controller plugged in later.
     let dev = require_dir(host, "gamepad", PathBuf::from("/dev/input"))?;
     args.dev_bind(&dev, &dev);
-    // `/sys/class/input` entries are symlinks into `/sys/devices`, and a bluetooth or virtual
-    // controller lives outside the GPU directories `dri` exposes.
+    // `/sys/class/input` entries link into `/sys/devices`, and a bluetooth or
+    // virtual controller lives outside the GPU directories `dri` exposes.
     for p in ["/sys/class/input", "/sys/devices"] {
         let p = require_dir(host, "gamepad", PathBuf::from(p))?;
         args.ro_bind(&p, &p);
@@ -514,8 +517,8 @@ fn gamepad_uinput(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchErr
     Ok(())
 }
 
-// The source is not probed: it exists only once the launcher's sidecar has created it, and a
-// `--dry-run` names the path a run would bind with nothing started at all.
+// The source is not probed: it exists only once the launcher's sidecar has
+// created it.
 fn pipewire(
     env: &Env,
     args: &mut BwrapArgs,
@@ -537,7 +540,7 @@ fn audio_context(host: &dyn Host) -> Result<(), LaunchError> {
     Ok(())
 }
 
-// The source is not probed, for the reason [`pipewire`]'s is not.
+// The source is not probed, for the reason `pipewire`'s is not.
 fn pulseaudio(
     env: &Env,
     args: &mut BwrapArgs,
@@ -545,8 +548,8 @@ fn pulseaudio(
     ctx: &ServiceCtx,
 ) -> Result<(), LaunchError> {
     audio_context(host)?;
-    // The module that makes the sidecar a pulse server, named here so a host without it is a
-    // refusal that says what to install rather than a sidecar that never comes up.
+    // The module that makes the sidecar a pulse server, named here so a host
+    // without it is a refusal that says what to install.
     require_file(host, "pulseaudio", PathBuf::from(pipewire::PULSE_MODULE))?;
     let inside = env.runtime_dir.join("pulse/native");
     args.ro_bind(&pipewire::pulse_socket(&ctx.instance_runtime), &inside);
@@ -556,8 +559,8 @@ fn pulseaudio(
     Ok(())
 }
 
-// The source is not probed here: it exists only once the launcher has checked the proxy's
-// socket and moved it out of the directory the proxy can write to.
+// The source is not probed here: it exists only once the launcher has checked
+// the proxy's socket and moved it out of the directory the proxy can write to.
 fn dbus_socket(env: &Env, args: &mut BwrapArgs, ctx: &ServiceCtx) {
     let inside = env.runtime_dir.join("bus");
     args.ro_bind(
@@ -569,7 +572,7 @@ fn dbus_socket(env: &Env, args: &mut BwrapArgs, ctx: &ServiceCtx) {
     args.setenv(OsStr::new("DBUS_SESSION_BUS_ADDRESS"), &address);
 }
 
-// The source is not probed here for the same reason [`dbus_socket`]'s is not.
+// The source is not probed here for the same reason `dbus_socket`'s is not.
 fn system_bus_socket(args: &mut BwrapArgs, ctx: &ServiceCtx) {
     args.ro_bind(
         &dbus::app_bus_path(&ctx.instance_runtime, dbus::SYSTEM_SOCKET),
@@ -577,7 +580,8 @@ fn system_bus_socket(args: &mut BwrapArgs, ctx: &ServiceCtx) {
     );
 }
 
-// The source is not probed here for the same reason [`dbus_socket`]'s is not.
+// Not probed: it exists only once the launcher has moved the proxy's socket
+// out of the proxy's reach.
 fn a11y(env: &Env, args: &mut BwrapArgs, ctx: &ServiceCtx) -> Result<(), LaunchError> {
     if !ctx.dbus.is_some_and(|p| p.a11y.is_some()) {
         return Err(LaunchError::BadValue {
@@ -616,12 +620,12 @@ fn portals(
             reason: "requires dbus".to_owned(),
         })?;
     args.ro_bind_data(plan.flatpak_info.clone(), Path::new(dbus::FLATPAK_INFO));
-    // The identity file is what makes gdk-pixbuf's glycin loaders look for `flatpak-spawn`
-    // (glycin 2.1.5, `libglycin-2.so`); without one GTK's icon loading fails an assertion.
+    // The identity file is what makes gdk-pixbuf's glycin loaders look for
+    // `flatpak-spawn` (glycin 2.1.5, `libglycin-2.so`).
     args.flatpak_spawn_shim(ctx.init_bin);
     let doc = env.runtime_dir.join("doc");
-    // `by-app/<app id>` itself is never probed: the FUSE creates it on the first lookup for any
-    // valid app id (`ensure_by_app_inode`), so it is absent until something asks for it.
+    // `by-app/<app id>` itself is never probed: the FUSE creates it on the
+    // first lookup for any valid app id (`ensure_by_app_inode`).
     let mounted =
         host.file_type(&doc).is_some_and(|t| t.is_dir()) && host.is_mountpoint(&doc) == Some(true);
     if mounted {
@@ -653,8 +657,8 @@ pub fn apply_env(pairs: &[(String, String)], args: &mut BwrapArgs) -> Result<(),
     Ok(())
 }
 
-// Canonical is what the caller must bind: binding the path as written would mount whatever
-// a symlink on it points at instead.
+// Canonical is what the caller must bind: binding the path as written would
+// mount whatever a symlink on it points at instead.
 fn resolve_source(
     host: &dyn Host,
     service: &'static str,
@@ -670,8 +674,8 @@ fn resolve_source(
     probe(host, service, real)
 }
 
-// Both are canonicalised, so a symlink cannot turn a grant inside `root` into a bind of
-// something outside it.
+// Both are canonicalised, so a symlink cannot turn a grant inside `root` into a
+// bind of something outside it.
 fn confine(
     host: &dyn Host,
     service: &'static str,
@@ -695,24 +699,24 @@ fn confine(
     Ok(real)
 }
 
-// flatpak refuses the same set in `dont_export_in` (`flatpak-exports.c`), and for the same
-// reason: a share of one of these takes the sandbox apart.
+// flatpak refuses the same set in `dont_export_in` (`flatpak-exports.c`), and
+// for the same reason: a share of one of these takes the sandbox apart.
 const DENIED_ROOTS: &[&str] = &[
     "/proc", "/sys", "/dev", "/etc", "/usr", "/opt", "/home", "/tmp", "/var", "/run",
 ];
 
-// flatpak exposes the same path (`flatpak-context.c`).
+// Carved out of the `/run` denial: removable media is a real share target,
+// and flatpak exposes it too (`flatpak-context.c`).
 const MEDIA_ROOT: &str = "/run/media";
 
 #[derive(Clone, Copy)]
 enum End {
     Source,
-    // The path as written, which is where the bind lands.
     Destination,
 }
 
-// Each root in resolved form as well: only the resolved form matches the canonical source
-// of a share, and only the written form matches its destination.
+// Each root as written and as resolved: only the resolved form matches a
+// share's canonical source, and only the written form its destination.
 fn env_roots(host: &dyn Host, env: &Env) -> Vec<PathBuf> {
     let under = |dir: &Path| {
         host.canonicalize(dir)
@@ -727,16 +731,15 @@ fn env_roots(host: &dyn Host, env: &Env) -> Vec<PathBuf> {
         env.config_home.join("bubbler"),
         under(&env.config_home),
     ];
-    // The system profile layer wherever `$BUBBLER_PROFILE_DIR` moved it. The default
-    // `/usr/share/bubbler/profiles` needs no entry of its own — `/usr` is a fixed root.
+    // The system profile layer wherever `$BUBBLER_PROFILE_DIR` moved it; the
+    // default under `/usr` needs no entry of its own, `/usr` is a fixed root.
     named.extend(env.profile_dir_override.clone());
     let resolved: Vec<PathBuf> = named.iter().filter_map(|p| host.canonicalize(p)).collect();
     named.into_iter().chain(resolved).collect()
 }
 
-// An ancestor counts: binding it would cover the root with a mount of its own. The roots the
-// environment names are checked first, so neither the `/run/media` carve-out nor the test
-// hook can lift them.
+// An ancestor counts: binding it would cover the root. The roots the
+// environment names come first, so no carve-out or test hook lifts them.
 fn denied_root(
     host: &dyn Host,
     env: &Env,
@@ -764,15 +767,16 @@ fn denied_root(
         .or_else(|| fixed_root(written, env).map(|root| (root, End::Destination)))
 }
 
-// `$BUBBLER_TEST_ALLOW_PATH` lifts all of them for one subtree, and `/run/media` is carved
-// out of `/run` alone.
+// `$BUBBLER_TEST_ALLOW_PATH` lifts all of them for one subtree, and
+// `/run/media` is carved out of `/run` alone.
 fn fixed_root(path: &Path, env: &Env) -> Option<PathBuf> {
     if let Some(allow) = env.test_allow_path.as_deref()
         && path.starts_with(allow)
     {
         return None;
     }
-    // `denied_root` already refused `/`; the check stays so this function stands alone.
+    // `denied_root` already refused `/`; the check stays so this function
+    // stands alone.
     if path == Path::new("/") {
         return Some(PathBuf::from("/"));
     }
@@ -824,8 +828,8 @@ fn nested(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
 }
 
-// bwrap applies binds in the order given, so two shares whose destinations nest would either
-// fail (a read-only parent bound first) or silently hide one another.
+// bwrap applies binds in order, so two shares whose destinations nest would
+// fail (a read-only parent first) or silently hide one another.
 fn path_shares<'a>(
     services: &'a [Service],
     env: &Env,
@@ -842,8 +846,8 @@ fn path_shares<'a>(
             continue;
         };
         let src = match resolve_source(host, "path-share", path, require_dir_or_file) {
-            // A missing optional source is a silent no-op; matched on the missing path itself,
-            // so a source that fails to resolve for another reason still refuses the launch.
+            // Matched on the missing path itself: a source that fails to
+            // resolve for another reason still refuses the launch.
             Err(LaunchError::MissingResource { path: p, .. }) if *optional && p == *path => {
                 continue;
             }
@@ -901,8 +905,8 @@ fn home_share(
         &written,
         "the home directory",
     ) {
-        // Matched on the missing path itself: a `home-share` that cannot resolve because
-        // `$HOME` is gone stays the launch error it always was.
+        // Matched on the missing path itself: a `home-share` that cannot
+        // resolve because `$HOME` is gone is a launch error.
         Err(LaunchError::MissingResource { path, .. }) if optional && path == written => {
             return Ok(());
         }
@@ -917,9 +921,9 @@ fn home_share(
     Ok(())
 }
 
-/// Bind every `--share` after the config's own services. The first share that is a directory
-/// becomes the working directory. A share the config already makes, one given twice, and one
-/// that contains or sits inside another share are all errors.
+/// Bind every `--share` after the config's own services; the first directory
+/// becomes the working directory. A share the config already makes, one given
+/// twice, and one that contains or sits inside another share are errors.
 pub fn apply_shares(
     services: &[Service],
     shares: &[Share],
@@ -951,8 +955,8 @@ pub fn apply_shares(
     Ok(())
 }
 
-// Nothing is bound until the last one has passed: a run refused halfway would otherwise be a
-// sandbox built from the shares before the error.
+// Nothing is bound until the last one has passed: a run refused halfway would
+// otherwise be a sandbox built from the shares before the error.
 fn share_plan(
     services: &[Service],
     shares: &[Share],
@@ -963,7 +967,8 @@ fn share_plan(
     let mut out: Vec<(PathBuf, PathBuf)> = Vec::new();
     for s in shares {
         let (src, dst) = share_paths(env, host, &s.path)?;
-        // The exact cases first: naming the same place twice is a mistake worth its own sentence.
+        // The exact cases first, so naming the same place twice gets its own
+        // message rather than the general overlap one.
         if config.iter().any(|(_, d)| *d == dst) {
             return Err(LaunchError::BadValue {
                 service: "--share",
@@ -996,8 +1001,8 @@ fn share_plan(
     Ok(out)
 }
 
-// Only the two share nodes: another service binding under a share's destination is invisible
-// to the overlap rule (today `x11`'s cookie at `/home/bubbler/.Xauthority`).
+// Only the two share nodes: a service binding under a share's destination,
+// like `x11`'s cookie at `/home/bubbler/.Xauthority`, escapes the overlap rule.
 fn config_shares(
     services: &[Service],
     env: &Env,
@@ -1008,8 +1013,9 @@ fn config_shares(
         let Service::HomeShare { path, optional, .. } = s else {
             continue;
         };
-        // The name of the node that would be at fault, not of the flag: `apply_all` resolved
-        // this same path before us.
+        // The name of the node that would be at fault, not of the flag:
+        // `apply_all` resolved this same path before us, so a failure here
+        // is the config's, not the caller's.
         let written = env.home.join(path);
         let src = match confine(
             host,
@@ -1018,8 +1024,8 @@ fn config_shares(
             &written,
             "the home directory",
         ) {
-            // A missing optional source binds nothing, so it is not a share to check
-            // `--share` against.
+            // A missing optional source binds nothing, so it is not a share to
+            // check `--share` against.
             Err(LaunchError::MissingResource { path: p, .. }) if *optional && p == written => {
                 continue;
             }
@@ -1033,7 +1039,6 @@ fn config_shares(
     Ok(out)
 }
 
-// The same rule two `path-share` nodes are held to, in the same words.
 fn overlap(src: &Path, dst: &Path, other_src: Option<&Path>, other_dst: &Path) -> Option<String> {
     let where_ = if nested(dst, other_dst) {
         String::new()
@@ -1064,8 +1069,8 @@ fn share_paths(
             reason: format!("{} is not absolute", written.display()),
         });
     }
-    // A `..` left in the path would walk out of every comparison below: `$HOME/x/..` maps
-    // over the private home while comparing equal to nothing.
+    // A `..` left in the path would walk out of every comparison below:
+    // `$HOME/x/..` maps over the private home while comparing equal to nothing.
     if !comps.all(|c| matches!(c, Component::Normal(_))) {
         return Err(LaunchError::BadValue {
             service: "--share",
@@ -1122,16 +1127,16 @@ pub(crate) fn reserved_in_home_reason(host: &dyn Host, env: &Env, rel: &Path) ->
     Some(denied_reason(&written, &src, &root, end))
 }
 
-// [`denied_root`] cannot answer here: the real home is a root of its own and every path
-// inside it is nested with it, so the home itself is left out of the roots checked.
+// `denied_root` cannot answer here: every path inside the real home is nested
+// with it, so the home itself is left out of the roots checked.
 fn denied_root_in_home(
     host: &dyn Host,
     env: &Env,
     canonical: &Path,
     dst: &Path,
 ) -> Option<(PathBuf, End)> {
-    // The private home first, so that a share of the whole real home is named by what it
-    // would cover.
+    // The private home first, so that a share of the whole real home is named
+    // by what it would cover.
     if dst == Path::new(SANDBOX_HOME) {
         return Some((PathBuf::from(SANDBOX_HOME), End::Destination));
     }
@@ -1151,15 +1156,15 @@ fn etc_share(args: &mut BwrapArgs, host: &dyn Host, name: &OsStr) -> Result<(), 
     Ok(())
 }
 
-/// Where one `app-runtime` id's directory lives, on the host and inside the sandbox alike:
-/// KeePassXC, and every other user of the convention, computes `$XDG_RUNTIME_DIR/app/<id>`
-/// from its own environment.
+/// Where one `app-runtime` id's directory lives, on the host and inside the
+/// sandbox alike: KeePassXC, and every other user of the convention, computes
+/// `$XDG_RUNTIME_DIR/app/<id>` from its own environment.
 pub(crate) fn app_runtime_dir(env: &Env, id: &str) -> PathBuf {
     env.runtime_dir.join("app").join(id)
 }
 
-// The source is not probed here: the launcher creates it and checks it with `O_NOFOLLOW`
-// right before the sandbox starts, which is the only order in which the check means anything.
+// The source is not probed here: the launcher creates it and checks it with
+// `O_NOFOLLOW` right before the sandbox starts.
 fn app_runtime(env: &Env, args: &mut BwrapArgs, id: &str, mode: ShareMode) {
     let dir = app_runtime_dir(env, id);
     match mode {
@@ -1168,8 +1173,8 @@ fn app_runtime(env: &Env, args: &mut BwrapArgs, id: &str, mode: ShareMode) {
     }
 }
 
-// `--perms`, `--size` and `--overlay-src` may precede the flag inside one operation. A test
-// holds every flag the builder can emit to this list or the one of flags that create nothing.
+// `--perms`, `--size` and `--overlay-src` may precede the flag. A test holds
+// every flag the builder emits to this list or the one that creates nothing.
 const CREATES: &[(&str, usize)] = &[
     ("--bind", 2),
     ("--bind-try", 2),
@@ -1200,15 +1205,15 @@ fn destination(op: &Explained) -> Option<&OsStr> {
     None
 }
 
-// Read-only binds are here too: one id's `app-runtime` directory is writable by whichever
-// other instance names the same id.
+// Read-only binds are here too: one id's `app-runtime` directory is writable by
+// whichever other instance names the same id.
 fn writable_trees(ops: &[Explained], env: &Env) -> Vec<(PathBuf, PathBuf, &'static str)> {
     let app = env.runtime_dir.join("app");
     let doc = env.runtime_dir.join("doc");
     let mut out = Vec::new();
     for op in ops {
-        // The flag is looked for rather than assumed first: the builder emits prefixed
-        // operations — `--perms 0700 --bind src dst`.
+        // The flag is looked for rather than assumed first: the builder emits
+        // prefixed operations — `--perms 0700 --bind src dst`.
         let Some(i) = op
             .args
             .iter()
@@ -1234,9 +1239,10 @@ fn writable_trees(ops: &[Explained], env: &Env) -> Vec<(PathBuf, PathBuf, &'stat
     out
 }
 
-/// Refuse the launch when a path the argv has bwrap create sits behind a symlink inside a
-/// tree the application can write (GHSA-pxhw-h44j-8pfx). A component that cannot be
-/// `lstat`ed refuses the run as well; nothing is deleted.
+/// Refuse the launch when a path the argv has bwrap create sits behind a
+/// symlink inside a tree the application can write (GHSA-pxhw-h44j-8pfx). A
+/// component that cannot be `lstat`ed refuses the run as well; nothing is
+/// deleted.
 pub fn sweep_destinations(
     ops: &[Explained],
     env: &Env,

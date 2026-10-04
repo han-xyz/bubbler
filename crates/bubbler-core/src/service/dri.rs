@@ -17,13 +17,13 @@ const DRI_DEV: &str = "/dev/dri";
 
 const DRM_CLASS: &str = "/sys/class/drm";
 
-/// GPU access: the render node of every GPU the host has, plus each GPU's own `/sys/devices`
-/// directory and whichever NVIDIA nodes are there. `kms` adds the primary (`card*`) nodes and
-/// leaves the sysfs behind them readable.
+/// GPU access: the render node of every GPU the host has, plus each GPU's own
+/// `/sys/devices` directory and whichever NVIDIA nodes are there. `kms` adds
+/// the primary (`card*`) nodes and leaves the sysfs behind them readable.
 pub(super) fn dri(args: &mut BwrapArgs, host: &dyn Host, kms: bool) -> Result<(), LaunchError> {
     let dev = require_dir(host, "dri", PathBuf::from(DRI_DEV))?;
-    // udev's `by-path` links are the only discovery path: a node's name says nothing about
-    // which kind it is.
+    // udev's `by-path` links are the only discovery path: a node's name says
+    // nothing about which kind it is.
     let by_path = dev.join("by-path");
     let (render, card) = dri_nodes(host, &by_path);
     if render.is_empty() {
@@ -42,8 +42,8 @@ pub(super) fn dri(args: &mut BwrapArgs, host: &dyn Host, kms: bool) -> Result<()
             args.dev_bind(&node, &node);
         }
     }
-    // Paths from Arch wiki Bubblewrap/Examples. `/sys/dev/char` is the symlinks a driver maps
-    // a device number through.
+    // Paths from Arch wiki Bubblewrap/Examples. `/sys/dev/char` is the symlinks
+    // a driver maps a device number through.
     for p in ["/sys/dev/char", "/sys/devices/system/cpu"] {
         let p = require_dir(host, "dri", PathBuf::from(p))?;
         args.ro_bind(&p, &p);
@@ -51,8 +51,8 @@ pub(super) fn dri(args: &mut BwrapArgs, host: &dyn Host, kms: bool) -> Result<()
     for name in &render {
         dri_sysfs(args, host, name, kms)?;
     }
-    // `/sys/class/drm` is rebuilt from the symlinks above rather than bound, since its own
-    // entries are the primary nodes and their connectors.
+    // `/sys/class/drm` is rebuilt from the symlinks above rather than bound,
+    // since its own entries are the primary nodes and their connectors.
     let version = Path::new(DRM_CLASS).join("version");
     if host.file_type(&version).is_some_and(|t| t.is_file()) {
         args.ro_bind(&version, &version);
@@ -69,8 +69,8 @@ pub(super) fn dri(args: &mut BwrapArgs, host: &dyn Host, kms: bool) -> Result<()
             args.dev_bind(&p, &p);
         }
     }
-    // libnvidia-glvnd and NVML read `/sys/module/nvidia/initstate` and fall back to Mesa when
-    // it is missing (verified on driver 610).
+    // libnvidia-glvnd and NVML fall back to Mesa without `nvidia/initstate`
+    // (verified on driver 610); the other `nvidia_*` directories cover CUDA.
     let modules = Path::new("/sys/module");
     for name in host.list_dir(modules) {
         if !name.as_encoded_bytes().starts_with(b"nvidia") {
@@ -84,8 +84,8 @@ pub(super) fn dri(args: &mut BwrapArgs, host: &dyn Host, kms: bool) -> Result<()
     Ok(())
 }
 
-// udev writes those links as `../<node>`; a link of any other shape points outside the
-// device directory this grant is confined to, and names nothing.
+// udev writes those links as `../<node>`; a link of any other shape is not
+// trusted to name a node.
 fn dri_nodes(host: &dyn Host, by_path: &Path) -> (BTreeSet<OsString>, BTreeSet<OsString>) {
     let (mut render, mut card) = (BTreeSet::new(), BTreeSet::new());
     for entry in host.list_dir(by_path) {
@@ -119,7 +119,6 @@ pub(crate) fn dri_binds_a_primary_node(host: &dyn Host) -> bool {
     })
 }
 
-// From the link beside the device: `.../0000:01:00.0/driver` -> `.../bus/pci/drivers/nvidia`.
 fn dri_driver(host: &dyn Host, dir: &Path) -> Option<OsString> {
     let target = host.read_link(&dir.join("driver")).ok().flatten()?;
     target.file_name().map(OsStr::to_os_string)
@@ -140,8 +139,8 @@ fn dri_sysfs(
             path: link,
         });
     };
-    // Every GPU's directory is under `/sys/devices`, and one that resolves elsewhere is a
-    // tree this grant knows nothing about.
+    // Every GPU's directory is under `/sys/devices`, and one that resolves
+    // elsewhere is a tree this grant knows nothing about.
     let Ok(rel) = dir.strip_prefix(devices) else {
         return Err(LaunchError::BadValue {
             service: "dri",
@@ -155,8 +154,8 @@ fn dri_sysfs(
     args.ro_bind(&dir, &dir);
     let drm = dir.join("drm");
     if !kms {
-        // NVIDIA's EGL declines a Wayland display without the primary node (measured on driver
-        // 610: llvmpipe); only the node is needed, the sysfs below stays masked.
+        // NVIDIA's EGL declines a Wayland display without the primary node
+        // (measured on driver 610); the node alone is enough.
         let nvidia = dri_driver(host, &dir).is_some_and(|d| d == "nvidia");
         for entry in host.list_dir(&drm) {
             let card = drm.join(&entry);
@@ -169,8 +168,8 @@ fn dri_sysfs(
                 let node = Path::new(DRI_DEV).join(&entry);
                 args.dev_bind(&node, &node);
             }
-            // The primary node's directory holds the connectors, each with the monitor's
-            // EDID; the node's own attributes carry the framebuffer geometry.
+            // The card directory holds the connectors with the monitors' EDID;
+            // its own attributes carry the framebuffer geometry.
             args.mask_dir(&card);
         }
     }
