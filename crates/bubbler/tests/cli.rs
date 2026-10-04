@@ -10973,19 +10973,23 @@ fn a_twin_made_while_a_try_runs_is_kept_with_a_warning() {
     }
     let Some(init) = real_init() else { return };
     let tmp = setup();
-    let child = bubbler_live(tmp.path(), &init)
-        .args(["try", "--keep", "my_app", "--", "/usr/bin/sleep", "2"])
+    // `cat` holds the sandbox open until the test closes its stdin.
+    let mut child = bubbler_live(tmp.path(), &init)
+        .args(["try", "--keep", "my_app", "--", "/usr/bin/cat"])
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     // `--keep` is checked before bwrap starts, so the twin comes after it.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while bwraps_under(child.id()).is_empty() && Instant::now() < deadline {
+    while bwraps_under(child.id()).is_empty() {
+        assert!(Instant::now() < deadline, "bwrap never started");
         std::thread::sleep(Duration::from_millis(20));
     }
     let (code, _, err) = run(tmp.path(), &["create", "my.app"]);
     assert_eq!(code, 0, "{err}");
+    drop(child.stdin.take());
     let out = child.wait_with_output().unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{err}");
