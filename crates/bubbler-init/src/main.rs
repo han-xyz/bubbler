@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rustix::event::{Nsecs, PollFd, PollFlags, Timespec, poll};
-use rustix::fs::{Mode, OFlags, fcntl_getfl, fcntl_setfl};
+use rustix::fs::{FileType, Mode, OFlags};
 use rustix::io::{Errno, FdFlags, fcntl_dupfd_cloexec, fcntl_getfd, fcntl_setfd};
 use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 use rustix::process::{
@@ -287,15 +287,37 @@ fn harden() -> rustix::io::Result<()> {
 /// The reason is dropped when that stderr would block: the status still
 /// tells the client, and a blocked write would stall the whole loop.
 fn refuse(stream: &UnixStream, report: Option<OwnedFd>, why: &str) {
-    if let Some(fd) = report
-        && let Ok(flags) = fcntl_getfl(&fd)
-        && fcntl_setfl(&fd, flags | OFlags::NONBLOCK).is_ok()
-    {
-        let _ = rustix::io::write(&fd, format!("bubbler-init: {why}\n").as_bytes());
-        // O_NONBLOCK is on the open file description the client shares.
-        let _ = fcntl_setfl(&fd, flags);
+    if let Some(fd) = report {
+        write_unless_blocked(&fd, format!("bubbler-init: {why}\n").as_bytes());
     }
     let _ = wire::send_status(stream, NOT_EXECUTABLE);
+}
+
+/// Write `line` to `fd` without blocking and without changing the flags
+/// of the open file description the client shares with it; a line that
+/// cannot go out at once is dropped.
+fn write_unless_blocked(fd: &OwnedFd, line: &[u8]) {
+    let Ok(stat) = rustix::fs::fstat(fd) else {
+        return;
+    };
+    match FileType::from_raw_mode(stat.st_mode) {
+        FileType::Socket => {
+            let flags = rustix::net::SendFlags::DONTWAIT | rustix::net::SendFlags::NOSIGNAL;
+            let _ = rustix::net::send(fd, line, flags);
+        }
+        // A reopen would write from offset 0 over the start of the file,
+        // and O_NONBLOCK does nothing for a regular file anyway.
+        FileType::RegularFile => {
+            let _ = rustix::io::write(fd, line);
+        }
+        _ => {
+            let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
+            let flags = OFlags::WRONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
+            if let Ok(own) = rustix::fs::open(path, flags, Mode::empty()) {
+                let _ = rustix::io::write(&own, line);
+            }
+        }
+    }
 }
 
 /// Execute one received request; a malformed one closes the connection,

@@ -1393,6 +1393,54 @@ fn a_refusal_whose_stderr_takes_no_write_does_not_stall_the_supervisor() {
     init.stop();
 }
 
+/// Have many requests refused with `err` as their stderr while a thread
+/// keeps reading the flags of `err`'s open file description; true if it
+/// ever saw `O_NONBLOCK` there.
+fn nonblocking_seen_during_refusals(sock: &Path, err: std::os::fd::BorrowedFd<'_>) -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // A long reason makes each refusal's write, and any window around it, longer.
+    let program = format!("/nonexistent{}", "/bubbler-test-command".repeat(150));
+    let done = AtomicBool::new(false);
+    let seen = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            while !done.load(Ordering::Relaxed) {
+                let flags = rustix::fs::fcntl_getfl(err).unwrap();
+                if flags.contains(rustix::fs::OFlags::NONBLOCK) {
+                    seen.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+        let null = std::fs::File::open("/dev/null").unwrap();
+        for _ in 0..300 {
+            let st = exec_with(sock, &[&program], null.as_fd(), err);
+            assert_eq!(ExitStatus::from_raw(st).code(), Some(127));
+        }
+        done.store(true, Ordering::Relaxed);
+    });
+    seen.load(Ordering::Relaxed)
+}
+
+#[test]
+fn a_refusal_leaves_the_flags_of_the_callers_descriptor_alone() {
+    let (mut init, sock) = start(&["/usr/bin/sleep", "30"]);
+    let (pipe_read, pipe_write) = rustix::pipe::pipe().unwrap();
+    let (master, slave) = pty_pair();
+    for (name, reader, err) in [("pipe", pipe_read, pipe_write), ("pty", master, slave)] {
+        let drain = std::thread::spawn(move || {
+            let mut buf = [0u8; 65536];
+            while matches!(rustix::io::read(&reader, &mut buf), Ok(n) if n > 0) {}
+        });
+        assert!(
+            !nonblocking_seen_during_refusals(&sock, err.as_fd()),
+            "a refusal made the caller's {name} non-blocking"
+        );
+        drop(err);
+        drain.join().unwrap();
+    }
+    init.stop();
+}
+
 /// A command that ignores SIGTERM and exits once the file named by its
 /// first argument exists.
 const COMMAND_IGNORES_TERM_UNTIL: &str = r#"#!/usr/bin/python3
