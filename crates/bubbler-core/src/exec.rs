@@ -60,10 +60,9 @@ pub fn connect(env: &Env, name: &str) -> Result<Option<UnixStream>, LaunchError>
     }
 }
 
-/// Longest a liveness probe waits for a connection the listener has
-/// queued but not yet accepted. A probe may be made on every redraw, so
-/// it is bounded; a supervisor that has not accepted within it is still
-/// counted as running, since it answered the connect.
+// Longest a liveness probe waits for a connection the listener has
+// queued but not yet accepted. A probe may be made on every redraw, so
+// it is bounded.
 const PROBE_WAIT: Timespec = Timespec {
     tv_sec: 0,
     tv_nsec: 200_000_000,
@@ -71,17 +70,8 @@ const PROBE_WAIT: Timespec = Timespec {
 
 /// Whether an instance is running, without sending it anything and
 /// without touching the socket: the connection is opened and dropped.
-///
-/// Never parks. The connect is made on a non-blocking socket, so a
-/// supervisor whose backlog is full — `AF_UNIX` answers `EAGAIN` rather
-/// than queueing — is read as running instead of holding the caller
-/// until it accepts, and a connection that is queued is waited on for
-/// 200 ms at most.
-///
-/// A socket left over from a dead run is left where it is: unlinking
-/// belongs to the start that is about to bind the path again.
-/// Anything that is not a connection a listener answered counts as not
-/// running, since nothing could be exec'd through it either.
+/// Never parks. Anything that is not a connection a listener answered
+/// counts as not running.
 pub fn is_live(env: &Env, name: &str) -> bool {
     is_live_at(&socket_path(env, name))
 }
@@ -121,16 +111,15 @@ pub(crate) fn is_live_at(path: &Path) -> bool {
     }
 }
 
-/// Poll with no wait at all: the relay asks between its own reads and
-/// must never park here.
+// Poll with no wait at all: the relay asks between its own reads and
+// must never park here.
 const NOW: Timespec = Timespec {
     tv_sec: 0,
     tv_nsec: 0,
 };
 
-/// The signals that end a relayed exec, and the code each leaves. Caught
-/// rather than fatal because the terminal is bubbler's to give back: a
-/// killed relay would leave the user's terminal raw.
+// Caught rather than fatal because the terminal is bubbler's to give
+// back: a killed relay would leave the user's terminal raw.
 const STOP_SIGNALS: [i32; 3] = [SIGINT, SIGTERM, SIGHUP];
 
 fn protocol_error(e: io::Error) -> LaunchError {
@@ -142,16 +131,15 @@ fn protocol_error(e: io::Error) -> LaunchError {
     }
 }
 
-/// Whether the supervisor has sent something: the status is the only
-/// thing it ever writes, so anything readable means the command is over.
+// Whether the supervisor has sent something: the status is the only
+// thing it ever writes, so anything readable means the command is over.
 fn status_ready(stream: &UnixStream) -> bool {
     let mut fds = [PollFd::new(stream, PollFlags::IN)];
     poll(&mut fds, Some(&NOW)).is_ok() && !fds[0].revents().is_empty()
 }
 
-/// The descriptor the supervisor is given for one of fds 0, 1 and 2.
-/// Everything is duplicated: bubbler drops its copies once the request is
-/// on its way, and the ones inside the sandbox live on.
+// Everything is duplicated: bubbler drops its copies once the request is
+// on its way, and the ones inside the sandbox live on.
 fn fd_for(
     target: StdioTarget,
     index: usize,
@@ -182,20 +170,10 @@ fn fd_for(
 }
 
 /// Run `argv` inside the live instance and return the exit code to
-/// propagate. `mode` decides what the command gets for stdio: in `pty`
-/// mode bubbler allocates one, asks the supervisor to make it the
-/// command's controlling terminal and relays it, so the sandbox never
-/// holds a descriptor for the user's terminal.
-///
-/// Waits without a deadline: the command may run for as long as it likes.
-/// Detaching (`^]` three times) returns 0 and leaves it under the
-/// instance's supervisor — with bubbler gone its pty hangs up, so a
-/// command that does not ignore `SIGHUP` ends there.
-///
-/// A `SIGINT`, `SIGTERM` or `SIGHUP` while output is being relayed ends
-/// the relay the same way and returns `128 + signal`: the command stays
-/// with the supervisor, which is the most an exec can do about it — the
-/// channel carries a request and a status, and nothing else.
+/// propagate. Detaching (`^]` three times) returns 0 and leaves the
+/// command under the instance's supervisor. A `SIGINT`, `SIGTERM` or
+/// `SIGHUP` while output is being relayed ends the relay the same way
+/// and returns `128 + signal`.
 pub fn run_in(
     stream: &UnixStream,
     argv: &[OsString],
@@ -217,7 +195,7 @@ pub fn run_in_with(
     let mut plan = tty::plan(mode, is_tty);
     // The pty copies the first terminal bubbler has, and is allocated
     // before raw mode: afterwards it would carry raw settings into the
-    // sandbox, leaving the command without echo or line editing.
+    // sandbox.
     if let Some(i) = plan
         .needs_pty()
         .then(|| is_tty.iter().position(|t| *t))
@@ -248,7 +226,7 @@ pub fn run_in_with(
     let mut registered = SignalGuard(Vec::new());
     // Only while something is being relayed. With nothing of ours in
     // between, the terminal is untouched and a signal is the caller's to
-    // die of, as it was before the command was sent.
+    // die of.
     if master.is_some() || !pipes.is_empty() {
         for sig in STOP_SIGNALS {
             let id = signal_hook::flag::register_usize(sig, Arc::clone(&stop), sig as usize)
@@ -267,9 +245,9 @@ pub fn run_in_with(
         false => None,
     };
     // Output the user's own descriptors cannot take goes here instead:
-    // when none of them can be written to at all (`bubbler exec x
-    // < /dev/tty > out`) and when one stops taking it. Draining somewhere
-    // is what keeps the command from blocking on a full pty or pipe.
+    // when none of them can be written to at all and when one stops
+    // taking it. Draining somewhere is what keeps the command from
+    // blocking on a full pty or pipe.
     let sink = tty::null_stdio()?;
     let mut received: Option<io::Result<i32>> = None;
     let mut signalled: Option<i32> = None;
@@ -292,8 +270,7 @@ pub fn run_in_with(
                 return Some(code);
             }
             // A status already in hand wins over a signal arriving with
-            // it; what is left here ends the relay with nothing to
-            // report but the signal itself.
+            // it.
             match stop.swap(0, Ordering::SeqCst) {
                 0 => None,
                 sig => {
