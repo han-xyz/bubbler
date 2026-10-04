@@ -13,29 +13,24 @@ use clap::Command;
 use clap_mangen::Man;
 use clap_mangen::roff::{Roff, bold, roman};
 
-/// The `.TH` manual name both pages carry.
 const MANUAL: &str = "bubbler manual";
 
-/// The `.TH` line, written here rather than through `roff`, which drops
-/// an empty argument instead of quoting it: an empty date has to keep
-/// its place or the source and the manual are read as the two fields
-/// before them.
-///
-/// The date is left empty on purpose. A page generated at package time
-/// carries whatever day that was, so a date would be the one field that
-/// differs between two builds of the same source; man(1) simply prints
-/// nothing in its place.
+// Written here rather than through `roff`, which drops an empty argument
+// instead of quoting it: an empty date has to keep its place or the source
+// and the manual are read as the two fields before them.
+//
+// The date is left empty on purpose. A page generated at package time
+// carries whatever day that was, so a date would be the one field that
+// differs between two builds of the same source.
 fn title(name: &str, section: &str, version: &str) -> String {
     format!(".TH {name} {section} \"\" \"{version}\" \"{MANUAL}\"")
 }
 
-/// The two lines `roff` writes above every render to define an
-/// apostrophe that survives every roff implementation. A page carries
-/// them once, and each section is rendered separately here, so they are
-/// dropped from the sections and written at the top by hand.
+// The two lines `roff` writes above every render. A page carries them
+// once, and each section is rendered separately here, so they are dropped
+// from the sections and written at the top by hand.
 const PREAMBLE: [&str; 2] = [r".ie \n(.g .ds Aq \(aq", r".el .ds Aq '"];
 
-/// Paths a run reads or writes, as the `FILES` section lists them.
 const FILES: &[(&str, &str)] = &[
     (
         "$XDG_DATA_HOME/bubbler/instances/<name>/config.kdl",
@@ -125,7 +120,6 @@ const FILES: &[(&str, &str)] = &[
     ),
 ];
 
-/// Variables bubbler reads, as the `ENVIRONMENT` section lists them.
 const ENVIRONMENT: &[(&str, &str)] = &[
     (
         "HOME, XDG_RUNTIME_DIR",
@@ -215,13 +209,11 @@ const ENVIRONMENT: &[(&str, &str)] = &[
     ),
 ];
 
-/// The pages and programs a reader goes to next.
 const SEE_ALSO: &str = "bubbler-config(5), bwrap(1), xdg-dbus-proxy(1), pasta(1)";
 
-/// What a run needs on the host beyond the binary itself, as the
-/// `REQUIREMENTS` section lists them. The two version floors are formatted
-/// from `version::BWRAP_FLOOR` and `version::PROXY_FLOOR` themselves, so
-/// this page cannot name a number the code does not actually check.
+// The two version floors are formatted from `version::BWRAP_FLOOR` and
+// `version::PROXY_FLOOR` themselves, so this page cannot name a number the
+// code does not actually check.
 fn requirements() -> Vec<(String, &'static str)> {
     let (a, b, c) = BWRAP_FLOOR;
     let (x, y, z) = PROXY_FLOOR;
@@ -253,7 +245,6 @@ fn requirements() -> Vec<(String, &'static str)> {
     ]
 }
 
-/// What `config.kdl` is, before the node-by-node list.
 const CONFIG_DESCRIPTION: &[&str] = &[
     "An instance's config.kdl, and the profile it was seeded from, are the same KDL. \
      Every node in it is a grant: a sandbox starts with nothing but the baseline \
@@ -286,9 +277,8 @@ const CONFIG_DESCRIPTION: &[&str] = &[
      id no check has is a parse error.",
 ];
 
-/// One line per lint check, keyed by its id. Kept beside the page rather
-/// than in the table itself: `lint::Check` is what the linter matches on,
-/// and a test here holds the two lists together.
+// Kept beside the page rather than in the table itself: `lint::Check` is
+// what the linter matches on, and a test here holds the two lists together.
 const CHECK_LINES: &[(&str, &str)] = &[
     (
         "allow-host-wildcard",
@@ -542,9 +532,8 @@ const CHECK_LINES: &[(&str, &str)] = &[
     ),
 ];
 
-/// One line of `id`'s check, or the id itself when the tables have
-/// drifted; a page is not the place to fail a run over its own prose,
-/// and the unit test below is what keeps the two lists together.
+// A page is not the place to fail a run over its own prose, and the unit
+// test below is what keeps the two lists together.
 fn check_line(id: &str) -> &str {
     CHECK_LINES
         .iter()
@@ -552,39 +541,32 @@ fn check_line(id: &str) -> &str {
         .map_or(id, |(_, line)| *line)
 }
 
-/// The one non-ASCII character bubbler's prose uses, written as the
-/// escape every roff understands: a page rendered by `nroff` without
-/// `preconv` in front of it reads a UTF-8 em dash as three bytes of
-/// noise, and a man page is not always read through man(1).
+// A page rendered by `nroff` without `preconv` in front of it reads a
+// UTF-8 em dash as three bytes of noise, and a man page is not always read
+// through man(1).
 fn roff_ascii(line: String) -> String {
     line.replace('\u{2014}', r"\(em")
 }
 
-/// A rendered chunk as lines, without the preamble [`PREAMBLE`] repeats
-/// at the top of every render.
 fn body(chunk: &str) -> impl Iterator<Item = &str> {
     chunk.lines().filter(|l| !PREAMBLE.contains(l))
 }
 
-/// A rendered chunk as lines, without its `.SH` headings: the sections
-/// of a subcommand sit under one `.SS` of their own here, and a second
-/// level of headings inside it would read as a page of its own. Only a
-/// control line can start with `.SH ` — `roff` writes `\&` in front of a
-/// text line that would.
+// The sections of a subcommand sit under one `.SS` of their own here, and
+// a second level of headings inside it would read as a page of its own.
+// Only a control line can start with `.SH ` — `roff` writes `\&` in front
+// of a text line that would.
 fn headless(chunk: &str) -> impl Iterator<Item = &str> {
     body(chunk).filter(|l| !l.starts_with(".SH "))
 }
 
-/// Render one section through `f` and return it as roff lines.
 fn section(f: impl FnOnce(&mut Vec<u8>) -> std::io::Result<()>) -> String {
     let mut buf = Vec::new();
     f(&mut buf).expect("writing roff into a Vec cannot fail");
     String::from_utf8(buf).expect("clap help text and roff output are UTF-8")
 }
 
-/// Every subcommand under `cmd`, depth first and in declaration order,
-/// each paired with the full command line it is invoked as. Hidden ones
-/// are left out, as they are left out of `--help`.
+// Hidden subcommands are left out, as they are left out of `--help`.
 fn subcommands(cmd: &Command, path: &str) -> Vec<(String, Command)> {
     let mut out = Vec::new();
     for sub in cmd.get_subcommands().filter(|s| !s.is_hide_set()) {
@@ -671,8 +653,7 @@ pub fn page(cmd: Command, version: &str) -> Vec<OsString> {
 
 /// `bubbler-config(5)`: every node a config may hold, written from the
 /// same catalogue the rest of bubbler explains grants from, and every
-/// lint check by id, so the page and the binary cannot disagree about
-/// what a config takes.
+/// lint check by id.
 pub fn config_page(version: &str) -> Vec<OsString> {
     let mut roff = Roff::default();
     roff.control("SH", ["NAME"]);
