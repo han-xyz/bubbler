@@ -1771,7 +1771,9 @@ outwards.
 
 The rules are installed by spawning `nft -f -` — a short-lived child that
 enters the sandbox's owning user namespace and its network namespace, and is
-fed the ruleset on stdin. It runs after bwrap reports the sandbox pid, before
+fed the ruleset on stdin. It is spawned rather than linked: a library would
+pull in `libnftnl` or `bindgen` for a text format that is stable and one
+process away. It runs after bwrap reports the sandbox pid, before
 pasta and before the sandbox is let go of its `--block-fd`, so the namespace
 has a policy before it has a route and the application has not executed an
 instruction either way. If it fails for any reason — a ruleset nftables
