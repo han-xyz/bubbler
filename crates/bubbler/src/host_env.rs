@@ -17,11 +17,10 @@ use rustix::io::fcntl_getfd;
 /// anything else opens a descriptor: the kernel hands out the lowest free
 /// number, so each open lands exactly in the gap it is meant for.
 ///
-/// The Rust runtime already does this on Linux (`sanitize_standard_fds`),
-/// verified by removing this call and finding `/dev/null` on the
-/// sandbox's stdout all the same. It stays because the guarantee the
-/// terminal plan rests on should be bubbler's own and visible, not an
-/// implementation detail of the runtime it happens to be built with.
+/// The Rust runtime already does this on Linux (`sanitize_standard_fds`).
+/// It stays because the guarantee the terminal plan rests on should be
+/// bubbler's own and visible, not an implementation detail of the runtime
+/// it happens to be built with.
 pub fn fill_closed_stdio() -> Result<()> {
     // The std handles name fds 0, 1 and 2 whether or not they are open, so
     // the probe needs no raw descriptor of its own.
@@ -51,11 +50,6 @@ pub fn fill_closed_stdio() -> Result<()> {
 /// Build an [`Env`] from the current process environment. A missing or
 /// empty `$HOME` or `$XDG_RUNTIME_DIR` is an error: both are needed for
 /// any sandbox, and an empty one would silently become a relative path.
-/// `$BUBBLER_INIT`, `$BUBBLER_DBUS_PROXY`, `$BUBBLER_WL_PROXY`,
-/// `$BUBBLER_NET_PROXY`, `$BUBBLER_PASTA` and `$BUBBLER_PW_DUMP`
-/// override where the `bubbler-init`, `xdg-dbus-proxy`, `bubbler-wl-proxy`,
-/// `bubbler-net-proxy`, `pasta` and `pw-dump` binaries are taken from, and
-/// `$BUBBLER_PROFILE_DIR` where the system profile layer is read from.
 pub fn from_process() -> Result<Env> {
     let home = PathBuf::from(
         env::var_os("HOME")
@@ -123,14 +117,9 @@ pub fn from_process() -> Result<Env> {
     })
 }
 
-/// `$BUBBLER_TEST_ALLOW_PATH`: the one extra root `path-share` accepts,
-/// at both ends of a share, for tests and debugging. It must be absolute
-/// and not `/`, and is resolved here so it compares against the canonical
-/// source; a path that does not exist is kept as written and therefore
-/// matches nothing.
-/// `$BUBBLER_PROFILE_DIR`, which must be absolute: the directory is a
-/// reserved root every share is checked against, and a relative one would
-/// name a different directory from every working directory.
+// The directory is a reserved root every share is checked against, and a
+// relative one would name a different directory from every working
+// directory.
 fn profile_dir() -> Result<Option<PathBuf>> {
     let Some(value) = env::var_os("BUBBLER_PROFILE_DIR").filter(|v| !v.is_empty()) else {
         return Ok(None);
