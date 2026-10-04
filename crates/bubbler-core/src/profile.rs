@@ -41,10 +41,9 @@ pub const NAMES: &[&str] = &[
     "vesktop",
 ];
 
-/// First line of a seeded `config.kdl`, and of a profile `profile edit`
-/// writes, followed by the profile name. It is what `reseed` reads back
-/// to know which profile to flatten again, so the three places that write
-/// it must write the same bytes.
+/// First line of a seeded `config.kdl`, and of a profile `profile edit` writes, followed by the
+/// profile name. It is what `reseed` reads back to know which profile to flatten again, so the
+/// three places that write it must write the same bytes.
 pub(crate) const PROFILE_HEADER: &str = "// bubbler profile: ";
 
 /// Where the system profile layer lives unless `$BUBBLER_PROFILE_DIR`
@@ -114,7 +113,6 @@ pub struct Layer {
 }
 
 impl Layer {
-    /// How this layer is named in an error message.
     fn label(&self) -> String {
         match &self.path {
             Some(p) => p.display().to_string(),
@@ -163,9 +161,8 @@ pub struct Resolver {
     system_dir: PathBuf,
 }
 
-/// A layer's identity while an `include` chain is being followed. Two
-/// layers of the same profile name are different identities, which is
-/// what lets `include "<own name>"` extend the layer below it.
+// Two layers of the same profile name are different identities, which is what lets
+// `include "<own name>"` extend the layer below it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LayerId {
     File(PathBuf),
@@ -259,9 +256,8 @@ impl Resolver {
                     path: Some(path),
                     text,
                 }),
-                // A layer past the parser's bound is refused as the
-                // parser refuses it, named by the file it was read
-                // from, since that is the layer nothing below can fix.
+                // A layer past the parser's bound is refused as the parser refuses it, named by the
+                // file it was read from, since that is the layer nothing below can fix.
                 Err(ReadError::TooLarge(source)) => {
                     return Err(ProfileError::Parse {
                         origin: path.display().to_string(),
@@ -318,10 +314,9 @@ impl Resolver {
         acc.finish(name)
     }
 
-    /// Every layer [`Resolver::resolve`] would merge, in merge order.
-    /// A layer whose nodes the parser rejects is still returned: the
-    /// linter has more to say about such a file than "it does not parse",
-    /// and the layers under it are reached through its `include` nodes.
+    /// Every layer [`Resolver::resolve`] would merge, in merge order. A layer whose nodes the
+    /// parser rejects is still returned: the linter has more to say about such a file than "it does
+    /// not parse", and the layers under it are reached through its `include` nodes.
     pub fn layers(&self, name: &str) -> Result<Vec<Layer>, ProfileError> {
         let mut out = Vec::new();
         let mut chain = Vec::new();
@@ -336,8 +331,7 @@ impl Resolver {
         Ok(out)
     }
 
-    /// Visit the `skip`th layer of `name`, its `include`s first. `done`
-    /// carries the layers already visited across the whole traversal.
+    // `done` carries the layers already visited across the whole traversal.
     fn expand(
         &self,
         name: &str,
@@ -359,10 +353,8 @@ impl Resolver {
         if chain.contains(&id) {
             return Err(ProfileError::Cycle(chain_labels(chain, &id)));
         }
-        // A layer two branches both include is visited once, at the first
-        // place it is reached: merging it again would put its nodes over
-        // the nearer layer that included it, and a diamond of includes
-        // would cost a re-read per path through it.
+        // A layer two branches both include is visited once, at the first place it is reached:
+        // merging it again would put its nodes over the nearer layer that included it.
         if done.contains(&id) {
             return Ok(());
         }
@@ -382,9 +374,8 @@ impl Resolver {
         };
         let includes = match &raw {
             Some(raw) => raw.includes.clone(),
-            // A layer the parser rejects still names the layers under it,
-            // and a caller that collects has to reach them before it can
-            // say what is wrong where.
+            // A layer the parser rejects still names the layers under it, and a caller that
+            // collects has to reach them before it can say what is wrong where.
             None => includes_of(&layer.text).map_err(|source| ProfileError::Parse {
                 origin: label.clone(),
                 source,
@@ -392,16 +383,14 @@ impl Resolver {
         };
         chain.push(id);
         for inc in &includes {
-            // `include "<own name>"` names the layer below this one, which
-            // is how a user profile extends the built-in of the same name
-            // instead of forking it.
+            // `include "<own name>"` names the layer below this one, which is how a user profile
+            // extends the built-in of the same name instead of forking it.
             if inc != name {
                 self.expand(inc, 0, visit, chain, done)?;
                 continue;
             }
-            // Saying so beats `NotFound` on a name the file itself has:
-            // the profile exists, it is this layer, and there is nothing
-            // under it to extend.
+            // Saying so beats `NotFound` on a name the file itself has: the profile exists, it is
+            // this layer, and there is nothing under it to extend.
             if below == 0 {
                 return Err(ProfileError::SelfIncludeAtBottom(label));
             }
@@ -428,18 +417,13 @@ impl Resolver {
     }
 }
 
-/// What a traversal does with each layer it reaches.
 enum Visit<'a> {
-    /// Merge it into the flattened configuration.
     Merge(&'a mut Merged),
-    /// Keep it as it was read, for a caller that reads it itself.
     Collect(&'a mut Vec<Layer>),
 }
 
-/// The `include` names of a layer whose nodes the parser rejected, read
-/// straight from its KDL. Only the shape `parse_profile` accepts is
-/// followed, so a malformed `include` node names no layer at all rather
-/// than the wrong one.
+// Only the shape `parse_profile` accepts is followed, so a malformed `include` node names no layer
+// at all rather than the wrong one.
 fn includes_of(text: &str) -> Result<Vec<String>, ConfigError> {
     let doc = config::parse_document(text)?;
     Ok(doc
@@ -454,8 +438,6 @@ fn includes_of(text: &str) -> Result<Vec<String>, ConfigError> {
         .collect())
 }
 
-/// Profile names in `dir`: every readable `<name>.kdl` whose name is a
-/// plain profile name. A missing directory holds none.
 fn names_in(dir: &Path) -> Result<Vec<String>, ProfileError> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
@@ -480,9 +462,7 @@ fn names_in(dir: &Path) -> Result<Vec<String>, ProfileError> {
     Ok(names)
 }
 
-/// What a new user profile holds when no layer below carries the name:
-/// the same commented examples the `generic` profile is written with. An
-/// empty file would say nothing about what a profile may grant.
+// An empty file would say nothing about what a profile may grant.
 const TEMPLATE: &str = "\
 // Grants a new instance is seeded with, e.g.:
 //   wayland
@@ -492,9 +472,8 @@ const TEMPLATE: &str = "\
 //   command \"foot\"
 ";
 
-/// The text `edit_path` writes for a profile the user layer does not hold
-/// yet: an `include` of the layer below, so editing extends the shipped
-/// profile instead of forking it, or [`TEMPLATE`] when there is none.
+// The text `edit_path` writes for a profile the user layer does not hold yet: an `include` of the
+// layer below, so editing extends the shipped profile instead of forking it.
 fn starter(name: &str, below: bool) -> String {
     // The name passed the profile name grammar, so it holds no quote,
     // backslash or newline that would need escaping here.
@@ -506,11 +485,9 @@ fn starter(name: &str, below: bool) -> String {
     format!("{PROFILE_HEADER}{name} (user layer)\n{body}")
 }
 
-/// The flattened profile as `bubbler profile show` prints it: the header
-/// a seeded `config.kdl` carries, then every node under a `// from:`
-/// comment naming the layer that contributed it. Consecutive nodes from
-/// one layer share the comment. Lines are `OsString` because a profile
-/// path need not be UTF-8.
+/// The flattened profile as `bubbler profile show` prints it: the header a seeded `config.kdl`
+/// carries, then every node under a `// from:` comment naming the layer that contributed it. Lines
+/// are `OsString` because a profile path need not be UTF-8.
 pub fn show(name: &str, resolved: &Resolved) -> Vec<OsString> {
     let mut out = vec![OsString::from(format!("{PROFILE_HEADER}{name}"))];
     let mut last: Option<&NodeOrigin> = None;
@@ -529,7 +506,6 @@ pub fn show(name: &str, resolved: &Resolved) -> Vec<OsString> {
     out
 }
 
-/// The layer one merged node came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Src {
     origin: Origin,
@@ -537,9 +513,7 @@ struct Src {
     label: String,
 }
 
-/// Layers merged so far, each item paired with the layer that put it
-/// there. Included layers merge first, so a later item is the more
-/// specific one.
+// Included layers merge first, so a later item is the more specific one.
 #[derive(Debug, Default)]
 struct Merged {
     services: Vec<(Service, Src)>,
@@ -578,18 +552,16 @@ impl Merged {
                 }
             }
         }
-        // Union by id, the later layer's reason winning, so a profile
-        // that includes another can restate why it accepts a finding
-        // without the included layer's wording overriding it.
+        // Union by id, the later layer's reason winning, so a profile that includes another can
+        // restate why it accepts a finding without the included layer's wording overriding it.
         for allow in &raw.config.lint_allows {
             match self.lint_allows.iter_mut().find(|(a, _)| a.id == allow.id) {
                 Some(slot) => *slot = (allow.clone(), src.clone()),
                 None => self.lint_allows.push((allow.clone(), src.clone())),
             }
         }
-        // Kept as written, layer by layer, and never merged with one
-        // another or with a grant: a `/-` line grants nothing, so there
-        // is no conflict between two of them to resolve.
+        // Kept as written, layer by layer, and never merged with one another or with a grant: a
+        // `/-` line grants nothing, so there is no conflict between two of them to resolve.
         for entry in &raw.config.disabled {
             self.disabled.push((entry.clone(), src.clone()));
         }
@@ -644,11 +616,8 @@ impl Merged {
         Ok(())
     }
 
-    /// Add one grant. Repeats of the same grant collapse; a share of the
-    /// same path in two modes is a conflict rather than a silent choice.
-    /// Every variant is listed: a new grant must be given a merge rule
-    /// here, since collapsing one that carries a mode would pick a
-    /// privilege level nobody wrote.
+    // Every variant is listed: a new grant must be given a merge rule here, since collapsing one
+    // that carries a mode would pick a privilege level nobody wrote.
     fn add_service(&mut self, svc: &Service, src: &Src) -> Result<(), ProfileError> {
         match svc {
             Service::HomeShare { path, optional, .. } => {
@@ -701,17 +670,11 @@ impl Merged {
                         _ => None,
                     })
                 {
-                    // The mode is one choice and the including layer makes
-                    // it; the children are grants of their own, so they add
-                    // up rather than being replaced wholesale.
+                    // The mode is one choice and the including layer makes it; the children are
+                    // grants of their own, so they add up rather than being replaced wholesale.
                     held.mode = cfg.mode;
-                    // `outbound` is not the mode: a filter, once a layer
-                    // has asked for one, is a floor. A layer above it
-                    // that says nothing about `outbound` — which is every
-                    // bare `network` node — would otherwise turn the
-                    // filter off by omission, and widening a sandbox by
-                    // omission is the one thing a merge must never do.
-                    // Turning it *on* from above is fine, and unions.
+                    // `outbound` is not the mode: a filter, once a layer has asked for one, is a
+                    // floor.
                     if held.outbound == Outbound::Deny && cfg.outbound != Outbound::Deny {
                         return Err(ProfileError::Conflict {
                             node: "network".to_owned(),
@@ -775,9 +738,8 @@ impl Merged {
                         _ => None,
                     })
                 {
-                    // The card nodes are a grant of their own on top of
-                    // the render nodes, so they add up rather than the
-                    // last layer deciding them.
+                    // The card nodes are a grant of their own on top of the render nodes, so they
+                    // add up rather than the last layer deciding them.
                     *held_kms |= *kms;
                     *held_src = src.clone();
                     return Ok(());
@@ -808,9 +770,8 @@ impl Merged {
                         _ => None,
                     })
                 {
-                    // The device half is a grant of its own on top of the
-                    // portal, so it adds up rather than the last layer
-                    // deciding it.
+                    // The device half is a grant of its own on top of the portal, so it adds up
+                    // rather than the last layer deciding it.
                     *held_nodes |= *nodes;
                     *held_src = src.clone();
                     return Ok(());
@@ -877,10 +838,8 @@ impl Merged {
                         _ => None,
                     })
                 {
-                    // A grant of its own, on top of the socket the bare
-                    // node gives, so it adds up rather than the last
-                    // layer deciding it — the same rule `dri kms` and
-                    // `gamepad`'s properties merge by.
+                    // A grant of its own, on top of the socket the bare node gives, so it adds up
+                    // rather than the last layer deciding it.
                     *held_microphone |= *microphone;
                     *held_devices |= *devices;
                     *held_exclusive |= *exclusive;
@@ -922,12 +881,8 @@ impl Merged {
         Ok(())
     }
 
-    /// Whether a share of the same kind and key is already merged, after
-    /// checking the two modes agree. `same` selects the shares of one
-    /// kind, so `home-share "x"` is never measured against
-    /// `path-share "/x"`; `name` names the node when its key is not text
-    /// a KDL file could hold. The key is a path for the two share nodes
-    /// and the id for `app-runtime`.
+    // Whether a share of the same kind and key is already merged, after checking the two modes
+    // agree.
     fn holds_share<K: PartialEq + ?Sized>(
         &self,
         svc: &Service,
@@ -953,13 +908,8 @@ impl Merged {
         Ok(true)
     }
 
-    /// ORs `optional` into the held share `same` finds, and moves its
-    /// source to `src`: an including layer must be able to relax a
-    /// base's share for a host that lacks it, and a base cannot know
-    /// every host, so any layer marking it optional wins — the same
-    /// rule `dri kms` merges by. Called only after [`Self::holds_share`]
-    /// has confirmed the two agree on path and mode, so `same` always
-    /// finds an entry here.
+    // Called only after [`Self::holds_share`] has confirmed the two agree on path and mode, so
+    // `same` always finds an entry here.
     fn merge_share_optional(
         &mut self,
         optional: bool,
@@ -976,10 +926,8 @@ impl Merged {
         }
     }
 
-    /// The flattened profile: its config, its canonical KDL, and where
-    /// each node came from. The text is parsed back so what an instance is
-    /// seeded with is known to be a config bubbler accepts, including the
-    /// checks no single layer could make (`portals` needs `dbus`).
+    // The text is parsed back so what an instance is seeded with is known to be a config bubbler
+    // accepts, including the checks no single layer could make (`portals` needs `dbus`).
     fn finish(self, name: &str) -> Result<Resolved, ProfileError> {
         let bad = |source| ProfileError::Parse {
             origin: format!("flattened profile `{name}`"),
@@ -1126,10 +1074,8 @@ impl Merged {
     }
 }
 
-/// The `/-` lines of one section, written under the section's last node.
-/// Where a layer wrote one is an index into that layer's own nodes, and
-/// the merged section is not the one it counted, so the position a
-/// single layer had is not carried across the merge.
+// Where a layer wrote a `/-` line is an index into that layer's own nodes, and the merged section
+// is not the one it counted, so the position a single layer had is not carried across the merge.
 fn kept<'a>(
     disabled: &'a [(Disabled, Src)],
     is: fn(&Node) -> bool,
@@ -1146,9 +1092,8 @@ fn kept<'a>(
     Ok(())
 }
 
-/// Union `rules` into `held`, dropping repeats. A name the two layers
-/// give two policy levels is a conflict rather than a union: which level
-/// applied would be layer order, and that is a privilege nobody wrote.
+// A name the two layers give two policy levels is a conflict rather than a union: which level
+// applied would be layer order, and that is a privilege nobody wrote.
 fn union_bus_rules(
     node: &str,
     held: &mut Vec<BusRule>,
@@ -1177,7 +1122,6 @@ fn union_bus_rules(
     Ok(())
 }
 
-/// The path and mode of a `home-share` node, and nothing else.
 fn home_share(s: &Service) -> Option<(&Path, ShareMode)> {
     match s {
         Service::HomeShare {
@@ -1189,7 +1133,6 @@ fn home_share(s: &Service) -> Option<(&Path, ShareMode)> {
     }
 }
 
-/// The path and mode of a `path-share` node, and nothing else.
 fn path_share(s: &Service) -> Option<(&Path, ShareMode)> {
     match s {
         Service::PathShare {
@@ -1201,7 +1144,6 @@ fn path_share(s: &Service) -> Option<(&Path, ShareMode)> {
     }
 }
 
-/// The id and mode of an `app-runtime` node, and nothing else.
 fn app_runtime(s: &Service) -> Option<(&str, ShareMode)> {
     match s {
         Service::AppRuntime { id, mode } => Some((id, *mode)),
