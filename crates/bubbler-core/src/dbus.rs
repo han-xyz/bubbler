@@ -56,29 +56,19 @@ pub const FLATPAK_DIR: &str = ".flatpak";
 /// `child-pid` out of it to get a pidfd of the sandbox.
 pub const BWRAPINFO: &str = "bwrapinfo.json";
 
-/// Object path every portal interface but `Request` and `Session` is
-/// served on.
 const DESKTOP_PATH: &str = "/org/freedesktop/portal/desktop";
 
-/// Object path `Request` objects are created under, one per outstanding
-/// call; `xdg-dbus-proxy(1)` matches a rule's path exactly, so a rule at
-/// [`DESKTOP_PATH`] never matches one of these.
+// `xdg-dbus-proxy(1)` matches a rule's path exactly, so a rule at
+// `DESKTOP_PATH` never matches one of these.
 const REQUEST_PATH: &str = "/org/freedesktop/portal/desktop/request/*";
 
-/// Object path `Session` objects are created under, one per open
-/// session; see [`REQUEST_PATH`].
 const SESSION_PATH: &str = "/org/freedesktop/portal/desktop/session/*";
 
 /// Interfaces the bare `portals` node opens on
 /// `org.freedesktop.portal.Desktop`: a file chooser, a link, a
 /// notification, a print job, the read-only monitors a toolkit polls.
-/// Every interface that hands the sandbox the screen, the input stream,
-/// an autostart entry, the location or a secret is a child instead —
-/// `--call=org.freedesktop.portal.*=*` granted all of them to anything
-/// that wanted a file chooser.
 // `Request` and `Session` are not here: their objects live under their
-// own subtrees, not at `DESKTOP_PATH`, so `portal_rules` gives them
-// rules of their own instead of routing them through this list.
+// own subtrees, not at `DESKTOP_PATH`, so `portal_rules` gives them rules of their own.
 pub const PORTAL_SAFE: &[&str] = &[
     "FileChooser",
     "OpenURI",
@@ -97,28 +87,21 @@ pub const PORTAL_SAFE: &[&str] = &[
     "GameMode",
 ];
 
-/// One `--call` for `iface` on the desktop object.
 fn portal_call(iface: &str) -> String {
     format!("--call=org.freedesktop.portal.Desktop=org.freedesktop.portal.{iface}.*@{DESKTOP_PATH}")
 }
 
-/// One `--broadcast` for `iface` on the desktop object.
 fn portal_broadcast(iface: &str) -> String {
     format!(
         "--broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.{iface}.*@{DESKTOP_PATH}"
     )
 }
 
-/// Every proxy argument `portals` and its `children` ask for. The
-/// `Documents` bus keeps a wildcard: it is one service with no
-/// privileged interface on it, and the document view it serves is the
-/// grant itself.
-// No `--talk` of either bus name. `xdg-dbus-proxy(1)` resolves a name to
-// one point on an ordered ladder — SEE < TALK < OWN — and a `--call`
-// rule only applies while the name sits below TALK. Naming
-// `org.freedesktop.portal.Desktop` in both would forward every call and
-// leave the rules below as dead text, which is the whole of what this
-// function is for.
+/// Every proxy argument `portals` and its `children` ask for. The `Documents` bus keeps
+/// a wildcard: it is one service with no privileged interface on it, and the document
+/// view it serves is the grant itself.
+// No `--talk` of either bus name: a `--call` rule only applies while the name sits below
+// TALK (`xdg-dbus-proxy(1)`), so a `--talk` would leave the rules below as dead text.
 pub fn portal_rules(children: &[Portal]) -> Vec<String> {
     let ifaces = || {
         PORTAL_SAFE
@@ -129,15 +112,8 @@ pub fn portal_rules(children: &[Portal]) -> Vec<String> {
     let mut out: Vec<String> = ifaces().map(portal_call).collect();
     out.push("--call=org.freedesktop.portal.Documents=*".to_owned());
     out.extend(ifaces().map(portal_broadcast));
-    // The `Documents` broadcast wildcard is what a `--talk` of that name
-    // used to carry: a filtered name receives no signal without a
-    // `--broadcast` rule of its own.
+    // A filtered name receives no signal without a `--broadcast` rule of its own.
     out.push("--broadcast=org.freedesktop.portal.Documents=*".to_owned());
-    // Request and Session are per-call and per-session objects, not
-    // interfaces on the desktop object itself, so both the calls a
-    // sandbox makes on them (Close, in practice) and the Response/
-    // signals they broadcast need a rule of their own rather than one
-    // that only ever matches DESKTOP_PATH.
     for (iface, path) in [("Request", REQUEST_PATH), ("Session", SESSION_PATH)] {
         out.push(format!(
             "--call=org.freedesktop.portal.Desktop=org.freedesktop.portal.{iface}.*@{path}"
@@ -148,30 +124,23 @@ pub fn portal_rules(children: &[Portal]) -> Vec<String> {
             "--broadcast=org.freedesktop.portal.Desktop=org.freedesktop.portal.{iface}.*@{path}"
         ));
     }
-    // GDBusProxy and libportal both call Properties.Get/GetAll on the
-    // desktop object when a client constructs its proxy, before it makes
-    // any portal call at all; without these two every such client fails
-    // at construction. `Set` is left out: no portal property here is
-    // meant to be written from inside the sandbox.
+    // GDBusProxy and libportal both call Properties.Get/GetAll when a client constructs its
+    // proxy. `Set` is left out: no portal property here is meant to be written from inside.
     out.push(format!(
         "--call=org.freedesktop.portal.Desktop=org.freedesktop.DBus.Properties.Get@{DESKTOP_PATH}"
     ));
     out.push(format!(
         "--call=org.freedesktop.portal.Desktop=org.freedesktop.DBus.Properties.GetAll@{DESKTOP_PATH}"
     ));
-    // Introspection is how a client discovers which portal interfaces
-    // this session actually serves; a Qt or `gdbus`-style client asks for
-    // it before its first call. It reads the desktop object's XML and
-    // nothing else, so it is safe where `Properties.Set` is not.
+    // Introspection reads the desktop object's XML and nothing else, so it is
+    // safe where `Properties.Set` is not.
     out.push(format!(
         "--call=org.freedesktop.portal.Desktop=org.freedesktop.DBus.Introspectable.Introspect@{DESKTOP_PATH}"
     ));
     out
 }
 
-/// What `camera` opens. It rode on `--call=org.freedesktop.portal.*=*`
-/// while that existed; with the wildcard gone the node carries the
-/// interface itself.
+/// What `camera` opens.
 pub fn camera_rules() -> [String; 2] {
     [portal_call("Camera"), portal_broadcast("Camera")]
 }
@@ -180,9 +149,8 @@ pub fn camera_rules() -> [String; 2] {
 pub(crate) fn grant_policies(svc: &Service) -> Vec<BusRule> {
     match svc {
         Service::Notify => vec![BusRule::Talk("org.freedesktop.Notifications".to_owned())],
-        // The watcher is all a tray icon takes: an item registers on the
-        // app's own unique name, and the calls the host makes back into it
-        // are incoming, which the proxy does not filter (`xdg-dbus-proxy(1)`).
+        // An item registers on the app's own unique name, and the calls the host makes back
+        // into it are incoming, which the proxy does not filter (`xdg-dbus-proxy(1)`).
         Service::Tray => vec![BusRule::Talk("org.kde.StatusNotifierWatcher".to_owned())],
         // Both portal names, whichever daemon the session runs; not the
         // daemons' own names, which carry `Exit` and `SetConfig`.
@@ -213,17 +181,7 @@ pub(crate) fn grant_policies(svc: &Service) -> Vec<BusRule> {
 
 /// Rules the `a11y` grant gets on the accessibility bus, which is the
 /// whole of what a sandboxed client may ask that bus for: registering
-/// the application with the AT-SPI registry, and reading back what is
-/// registered so a toolkit knows whether to emit its events.
-///
-/// `RegisterKeystrokeListener`, `GenerateKeyboardEvent`,
-/// `GenerateMouseEvent` and `RegisterEvent` are deliberately absent. The
-/// bus is a peer bus with no policy of its own and offers them to every
-/// client: they are every keystroke of every accessible application and
-/// input injected into the session, which is what makes the raw bus the
-/// same class of grant as the X11 socket. What a screen reader does to
-/// the sandbox needs no rule here — calls *into* it are incoming, and
-/// `xdg-dbus-proxy(1)` filters only what the client sends.
+/// the application with the AT-SPI registry, and reading back what is registered.
 // The set flatpak grants a sandboxed client (`flatpak-run-dbus.c`).
 pub const A11Y_RULES: &[&str] = &[
     "--call=org.a11y.atspi.Registry=org.a11y.atspi.Socket.Embed@/org/a11y/atspi/accessible/root",
@@ -284,10 +242,8 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// The buses the proxy serves, in the order it is told to bind them:
-    /// each socket's file name — the one it has in the proxy's directory
-    /// and, once the launcher has moved it, in the instance's — with the
-    /// config node that granted it, so a failure names what to change.
+    /// The buses the proxy serves, in the order it is told to bind them: each socket's
+    /// file name with the config node that granted it, so a failure names what to change.
     pub fn buses(&self) -> Vec<(&'static str, &'static str)> {
         let mut out = Vec::new();
         if self.session.is_some() {
@@ -338,14 +294,11 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
                         push(&mut rules, render(&r), i);
                     }
                 }
-                // Its rules are its own bus's, below: nothing of the
-                // grant belongs on the session bus, since the address of
-                // the accessibility bus is resolved before the sandbox
+                // The address of the accessibility bus is resolved before the sandbox
                 // starts rather than asked for from inside it.
                 Service::A11y => {}
-                // Every other grant is listed rather than caught by a
-                // wildcard: a new bundle must be given its rules here, and
-                // a wildcard would silently give it none.
+                // Listed rather than caught by a wildcard: a new bundle must be given
+                // its rules here, and a wildcard would silently give it none.
                 Service::Wayland(_)
                 | Service::X11(_)
                 | Service::Network { .. }
@@ -360,9 +313,6 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
                 | Service::Dbus { .. }
                 | Service::SystemBus { .. }
                 | Service::AppRuntime { .. } => {}
-                // The Camera interface is on `org.freedesktop.portal.Desktop`,
-                // which `portals` already talks to, but the node names the
-                // interface itself now that the bundle grants no wildcard.
                 Service::Camera { .. } => {
                     for r in camera_rules() {
                         push(&mut rules, r, i);
@@ -376,8 +326,6 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
         node,
         rules: explicit_rules(explicit, node),
     });
-    // A fixed set, with no user rules to merge: the node takes no
-    // children, and every rule is the granting node's.
     let a11y = a11y.map(|node| {
         let mut rules = Vec::new();
         for r in A11Y_RULES {
@@ -395,8 +343,6 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
     })
 }
 
-/// The config's own rules for one bus, in file order, all of them the
-/// bus node's own.
 fn explicit_rules(rules: &[BusRule], node: usize) -> Vec<Rule> {
     let mut out = Vec::new();
     for rule in rules {
@@ -405,8 +351,8 @@ fn explicit_rules(rules: &[BusRule], node: usize) -> Vec<Rule> {
     out
 }
 
-/// Append `rule` unless it is already there: the proxy takes repeats, but
-/// a deduplicated list is what the user can compare against the config.
+// The proxy takes repeats, but a deduplicated list is what the user can
+// compare against the config.
 fn push(rules: &mut Vec<Rule>, rule: String, node: usize) {
     let arg = OsString::from(rule);
     if !rules.iter().any(|r| r.arg == arg) {
@@ -414,9 +360,8 @@ fn push(rules: &mut Vec<Rule>, rule: String, node: usize) {
     }
 }
 
-/// One policy argument in the glued `--talk=<name>` form. A name may
-/// start with `-`, which a separated `--talk <name>` would turn into an
-/// option of its own.
+// The glued `--talk=<name>` form: a name may start with `-`, which a separated
+// `--talk <name>` would turn into an option of its own.
 fn render(rule: &BusRule) -> String {
     match rule {
         BusRule::See(n) => format!("--see={n}"),
@@ -428,10 +373,8 @@ fn render(rule: &BusRule) -> String {
 }
 
 /// Application id of an instance: `org.bubbler.` and the instance name as
-/// one trailing element. Every `.` in the name becomes `_`, because only
-/// the last element of an id may hold `-`, and a leading digit is
-/// prefixed, which flatpak's own name check rejects even though the
-/// portal's does not.
+/// one trailing element. Every `.` in the name becomes `_`, and a leading digit is
+/// prefixed.
 pub fn app_id(instance: &str) -> String {
     let mut tail = instance.replace('.', "_");
     if tail.starts_with(|c: char| c.is_ascii_digit()) {
@@ -524,10 +467,8 @@ pub fn app_bus_path(instance_runtime: &Path, socket: &str) -> PathBuf {
 }
 
 /// Host session bus socket: the `unix:path=` of `$DBUS_SESSION_BUS_ADDRESS`
-/// when it is set, else `$XDG_RUNTIME_DIR/bus`. Unguarded, and
-/// crate-private for it: outside this crate the session bus is reachable
-/// only through [`guarded_host_bus`], so the guard is not a step a
-/// caller can leave out.
+/// when it is set, else `$XDG_RUNTIME_DIR/bus`. Unguarded, and crate-private for it:
+/// outside this crate the session bus is reachable only through [`guarded_host_bus`].
 pub(crate) fn host_bus(env: &Env) -> Result<PathBuf, LaunchError> {
     Ok(address_path(
         env.dbus_address.as_deref(),
@@ -557,29 +498,8 @@ pub fn guarded_host_a11y_bus(host: &dyn Host, env: &Env) -> Result<PathBuf, Laun
     outside_our_runtime(host, env, A11Y_NODE, host_a11y_bus(env)?)
 }
 
-/// Refuse a host bus path that resolves into bubbler's own runtime
-/// directory, naming `node` as the grant that rejected it. Those
-/// directories hold the instances' control sockets and the proxy's own
-/// output: an address pointing there would have the proxy connect to a
-/// sandbox's exec channel or to a socket it is about to serve itself,
-/// and the address is host environment, which is untrusted input.
-///
-/// Caught: an address that names such a socket, whether it spells the
-/// path out, reaches it through a symlink, or walks into it with `..`.
-/// Both sides are compared in the form [`resolve`] gives, and that
-/// resolved path is what comes back, so the caller stats and connects to
-/// the path this checked rather than to a name that can be repointed
-/// in between.
-///
-/// Not caught: a hard link to one of those sockets, or a
-/// `$XDG_RUNTIME_DIR` that names a different directory altogether. Both
-/// need the uid that already owns the runtime directory and every socket
-/// in it, which is the user's own; bubbler does not defend a user
-/// against themselves. What this defends is the address — a stale,
-/// copied or hostile value in an otherwise sane environment.
-///
-/// Resolving reads the filesystem, which is why the caller passes its
-/// [`Host`]: an explanation resolves the same way a run does.
+// The resolved path is what comes back, so the caller stats and connects to
+// the path this checked rather than to a name that can be repointed in between.
 fn outside_our_runtime(
     host: &dyn Host,
     env: &Env,
@@ -598,18 +518,8 @@ fn outside_our_runtime(
     Ok(path)
 }
 
-/// `path` with links and `..` taken out: the host's own canonical form
-/// where the path exists, else its directory's canonical form with the
-/// file name joined back on — a bus socket need not exist yet, and the
-/// explanation of a run resolves before anything is created. What no
-/// lookup answers is folded lexically, so a `..` is never left in place
-/// for a prefix comparison to walk past.
-///
-/// Where neither the socket nor its directory exists, only that lexical
-/// form is left, and a link that would be followed later is not followed
-/// here: an explanation can describe a bus the run it describes goes on
-/// to refuse. An explanation is not a run, and the run is the one that
-/// has to be right.
+// A bus socket need not exist yet, and the explanation of a run resolves before
+// anything is created; what no lookup answers is folded lexically.
 fn resolve(host: &dyn Host, path: &Path) -> PathBuf {
     if let Some(real) = host.canonicalize(path) {
         return lexical(&real);
@@ -623,10 +533,6 @@ fn resolve(host: &dyn Host, path: &Path) -> PathBuf {
     }
 }
 
-/// `path` with `.` dropped and every `..` folded into the component
-/// before it. Purely textual: it is what is left when the filesystem
-/// cannot answer, and it is applied to a canonical path too, which by
-/// definition has neither component.
 fn lexical(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in path.components() {
@@ -644,10 +550,8 @@ fn lexical(path: &Path) -> PathBuf {
 }
 
 /// Host system bus socket: the `unix:path=` of `$DBUS_SYSTEM_BUS_ADDRESS`
-/// when it is set, else [`SYSTEM_BUS_PATH`], which is what libdbus and
-/// libsystemd fall back to. Unguarded, and crate-private for it: outside
-/// this crate the system bus is reachable only through
-/// [`guarded_host_system_bus`].
+/// when it is set, else [`SYSTEM_BUS_PATH`]. Unguarded, and crate-private for it:
+/// outside this crate the system bus is reachable only through [`guarded_host_system_bus`].
 pub(crate) fn host_system_bus(env: &Env) -> Result<PathBuf, LaunchError> {
     Ok(address_path(
         env.dbus_system_address.as_deref(),
@@ -657,18 +561,9 @@ pub(crate) fn host_system_bus(env: &Env) -> Result<PathBuf, LaunchError> {
     .unwrap_or_else(|| PathBuf::from(SYSTEM_BUS_PATH)))
 }
 
-/// Host accessibility bus socket: the `unix:path=` of
-/// `$AT_SPI_BUS_ADDRESS` when the session set one, else the address
-/// `org.a11y.Bus` answers `GetAddress` with on the session bus. That is
-/// the order at-spi2's own clients ask in, so bubbler proxies the bus
-/// the applications on this host are already on. Unguarded, and
-/// crate-private for it: outside this crate the accessibility bus is
-/// reachable only through [`guarded_host_a11y_bus`].
-///
-/// Every failure stops the run instead of dropping the grant: an `a11y`
-/// sandbox whose socket has no bus behind it looks to the application
-/// like a broken toolkit and to the user like a sandbox that quietly
-/// gave them less than the config asked for.
+/// Host accessibility bus socket: the `unix:path=` of `$AT_SPI_BUS_ADDRESS` when the
+/// session set one, else the address `org.a11y.Bus` answers `GetAddress` with on the
+/// session bus. Unguarded; every failure stops the run instead of dropping the grant.
 pub(crate) fn host_a11y_bus(env: &Env) -> Result<PathBuf, LaunchError> {
     match address_path(
         env.at_spi_bus_address.as_deref(),
@@ -680,26 +575,8 @@ pub(crate) fn host_a11y_bus(env: &Env) -> Result<PathBuf, LaunchError> {
     }
 }
 
-/// The socket `org.a11y.Bus` hands out: one `GetAddress` call, made by
-/// bubbler's own bus client, so an `a11y` grant needs no program on
-/// `PATH` to find the bus with.
-///
-/// The question goes to the bus `env` names rather than to whatever
-/// `$DBUS_SESSION_BUS_ADDRESS` this process happens to have inherited:
-/// the address that comes back is the one the sandbox is given, and it
-/// must name the same session as the socket the `dbus` grant proxies.
-/// [`host_bus`] resolves it, so an unset variable falls back to
-/// `$XDG_RUNTIME_DIR/bus` here as it does everywhere else.
-///
-/// That resolver is the unguarded one, and what makes it safe is an
-/// ordering rather than a check here: `a11y` is never granted without
-/// `dbus` (the parser refuses the node, see [`plan`]), and both the run
-/// and the explanation resolve the session bus through
-/// [`guarded_host_bus`] before they reach this. A
-/// `$DBUS_SESSION_BUS_ADDRESS` naming a socket under bubbler's own
-/// runtime directory has therefore already failed the run, instead of
-/// becoming the bus this client asks — a socket a sandboxed instance
-/// could answer on, with an accessibility address of its choosing.
+// Precondition: `a11y` is never granted without `dbus`, and both the run and the
+// explanation resolve the session bus through `guarded_host_bus` before they reach this.
 fn ask_a11y_bus(env: &Env) -> Result<PathBuf, LaunchError> {
     let mut session = Session::connect(&host_bus(env)?).map_err(a11y_failure)?;
     let reply = session
@@ -713,20 +590,12 @@ fn ask_a11y_bus(env: &Env) -> Result<PathBuf, LaunchError> {
             &[],
         )
         .map_err(a11y_failure)?;
-    // `GetAddress` answers with a single string. Anything else is an
-    // answer to some other question, and picking a value out of it would
-    // be a guess.
     let [Value::Str(address)] = reply.as_slice() else {
         return Err(LaunchError::A11y(
             "org.a11y.Bus answered GetAddress with no address".to_owned(),
         ));
     };
-    // A D-Bus string is UTF-8 by the specification and the decoder holds
-    // it to that, so the socket path in it is text; the reply is bytes
-    // no further.
-    //
-    // The address is not echoed, for the reason `address_path` does not
-    // echo the variable's either: it is host input, and an address may
+    // The address is not echoed: it is host input, and an address may
     // hold anything.
     unix_path(OsStr::new(address.as_str())).map_err(|fault| {
         LaunchError::A11y(
@@ -743,16 +612,9 @@ fn ask_a11y_bus(env: &Env) -> Result<PathBuf, LaunchError> {
     })
 }
 
-/// A failed `GetAddress` as a launch error: a refusal names itself, and
-/// anything else is the connection or the wire under it.
-///
-/// Both carry text this process did not write — an error name and
-/// message from the bus, a socket path from the environment — so both go
-/// through [`bus_note`].
 fn a11y_failure(e: WireError) -> LaunchError {
     LaunchError::A11y(match e {
-        // A bus that answers an error with no text at all: the name is
-        // the half that matters, and a trailing colon would promise a
+        // The name is the half that matters, and a trailing colon would promise a
         // sentence that is not there.
         WireError::Remote { name, message } if message.is_empty() => {
             format!("org.a11y.Bus.GetAddress failed: {}", bus_note(&name))
@@ -769,13 +631,11 @@ fn a11y_failure(e: WireError) -> LaunchError {
     })
 }
 
-/// Text bubbler did not write, as a note to hang on an error message:
-/// the first line of it, with the control characters shown rather than
-/// sent to whatever terminal reads the message.
+// Text bubbler did not write: the first line of it, with the control characters
+// shown rather than sent to whatever terminal reads the message.
 fn bus_note(text: &str) -> String {
-    /// Characters of the line the message carries; a D-Bus error name
-    /// and its text fit, a peer with more to say does not get to fill
-    /// the terminal with it.
+    // A D-Bus error name and its text fit; a peer with more to say does not get
+    // to fill the terminal with it.
     const KEPT: usize = 200;
 
     let line = text.split('\n').next().unwrap_or_default();
@@ -788,11 +648,8 @@ fn bus_note(text: &str) -> String {
     }
 }
 
-/// The socket a `DBUS_*_BUS_ADDRESS` names: `None` when the variable is
-/// unset or empty, so the caller's default path applies. A transport
-/// bubbler cannot bind (`tcp:`, `unix:abstract=`) is an error naming the
-/// variable rather than that default: the session is on the bus the
-/// variable names, and proxying another one would filter the wrong bus.
+// A transport bubbler cannot bind is an error rather than the default path: the session is
+// on the bus the variable names, and proxying another one would filter the wrong bus.
 fn address_path(
     address: Option<&OsStr>,
     var: &'static str,
@@ -801,8 +658,7 @@ fn address_path(
     let Some(address) = address.filter(|a| !a.is_empty()) else {
         return Ok(None);
     };
-    // The value itself is not echoed: it is host input, and an address
-    // may hold anything.
+    // The value itself is not echoed: it is host input.
     let reason = match unix_path(address) {
         Ok(p) => return Ok(Some(p)),
         Err(AddressFault::NoPath) => format!(
@@ -817,22 +673,18 @@ fn address_path(
     Err(LaunchError::BadValue { service, reason })
 }
 
-/// Why an address list gave no socket path.
 #[derive(Debug, PartialEq, Eq)]
 enum AddressFault {
-    /// No `unix:` entry names a usable `path=` and no other socket key.
     NoPath,
-    /// No entry was usable, and one `path=` has a `%` without two hex
-    /// digits after it.
     BadEscape,
 }
 
-/// Keys of which a `unix:` entry names exactly one (the D-Bus
-/// specification, "Server Addresses").
+// Keys of which a `unix:` entry names exactly one (the D-Bus
+// specification, "Server Addresses").
 const UNIX_SOCKET_KEYS: [&[u8]; 5] = [b"path", b"abstract", b"runtime", b"dir", b"tmpdir"];
 
-/// Path of the first `unix:` entry of a `;`-separated D-Bus address list
-/// that names a `path=` and no other socket key, its `%XX` escapes undone.
+// The first `unix:` entry of a `;`-separated D-Bus address list
+// that names a `path=` and no other socket key.
 fn unix_path(address: &OsStr) -> Result<PathBuf, AddressFault> {
     let mut fault = AddressFault::NoPath;
     let entries = address.as_bytes().split(|b| *b == b';');
@@ -876,8 +728,8 @@ fn unescape_address_value(value: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// `value` as a D-Bus address value: every byte outside the
-/// specification's optionally-escaped set `[-0-9A-Za-z_/.\*]` as `%XX`.
+// Every byte outside the specification's optionally-escaped set
+// `[-0-9A-Za-z_/.\*]` as `%XX`.
 fn escape_address_value(value: &[u8]) -> OsString {
     let mut out = Vec::with_capacity(value.len());
     for &b in value {
@@ -899,11 +751,9 @@ pub fn proxy_program(env: &Env) -> PathBuf {
 }
 
 /// The host socket of each bus a plan grants, as the launcher resolved
-/// them. One named value rather than three arguments of one type:
-/// which socket serves which bus is the whole of the confinement, and a
-/// call site that swapped two would hand an application one bus behind
-/// another bus's rules. `None` leaves that bus out of the proxy's
-/// command, so a section without a socket is not pointed anywhere else.
+/// them. `None` leaves that bus out of the proxy's command.
+// One named value rather than three arguments of one type: which socket serves which
+// bus is the whole of the confinement.
 #[derive(Debug, Clone, Copy)]
 pub struct HostBuses<'a> {
     /// Session bus, from [`guarded_host_bus`].
@@ -918,11 +768,6 @@ pub struct HostBuses<'a> {
 /// each granted host bus, serves the filtered socket for it in the
 /// `dbus/` subdirectory of `instance_runtime` and exits when `ready_fd`
 /// is closed (`xdg-dbus-proxy(1)`).
-///
-/// `buses` holds the host socket of each section the plan carries. A
-/// section given no socket is left out rather than pointed somewhere
-/// else; the sandbox's bind of it then fails, since the proxy never
-/// creates it.
 pub fn proxy_command(
     program: &Path,
     plan: &Plan,
@@ -962,9 +807,7 @@ pub fn proxy_command_nodes(
         let mut address = OsString::from("unix:path=");
         address.push(escape_address_value(host.as_os_str().as_bytes()));
         // The address and the socket path must precede the options of
-        // that bus: an option applies to the address before it. All of
-        // them are the granting node's, so an explanation reads one bus
-        // at a time instead of both addresses in one group.
+        // that bus: an option applies to the address before it.
         let node = Some(section.node);
         argv.push((address, node));
         argv.push((
