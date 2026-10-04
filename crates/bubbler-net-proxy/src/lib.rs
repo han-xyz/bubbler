@@ -9,10 +9,7 @@
 //!
 //! Nothing here reads a config file or an environment variable: the
 //! allowlist arrives as argv, already validated by the config that
-//! wrote it, and so do the resolver addresses. The proxy runs inside
-//! the sandbox's mount namespace, where NSS would ask the application
-//! itself what a name resolves to, so [`dns`] speaks the wire format
-//! rather than calling `getaddrinfo`.
+//! wrote it, and so do the resolver addresses.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
