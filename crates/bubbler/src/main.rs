@@ -37,16 +37,14 @@ use bubbler_core::wrap;
 use clap::builder::{OsStringValueParser, TypedValueParser};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
-/// `eprintln!` for a diagnostic, through [`eprint_echoed`]. Every message
-/// bubbler writes to stderr quotes something it did not author — a
-/// profile name, a config value, a path, an error from the host — so a
-/// terminal reading them needs the same sanitiser stdout gets.
+// Every message bubbler writes to stderr quotes something it did not
+// author, so a terminal reading them needs the same sanitiser stdout gets.
 macro_rules! ediag {
     ($($arg:tt)*) => { $crate::eprint_echoed(&format!($($arg)*)) };
 }
 
-/// `--tty` takes the names the config's `tty` node takes; clap already
-/// says which value was rejected, so only the reason is passed on.
+// clap already says which value was rejected, so only the reason is
+// passed on.
 fn tty_mode(s: &str) -> Result<TtyMode, String> {
     TtyMode::from_str(s).map_err(|e| match e {
         ConfigError::BadArgument { reason, .. } => reason,
@@ -54,14 +52,9 @@ fn tty_mode(s: &str) -> Result<TtyMode, String> {
     })
 }
 
-/// One `--share` value: a path, optionally with `=ro` or `=rw` at the end.
-/// The *last* such suffix is the mode, so a path whose own name ends in
-/// one is still shareable by spelling the mode out (`dir=ro=rw`).
-///
-/// A relative path is joined to the current directory, a `.` is dropped
-/// and a `..` is resolved on the host, because the core binds a share at
-/// the path it was given and refuses one holding either; `--share ..`
-/// therefore shares the parent directory at its resolved path.
+// A relative path is joined to the current directory, a `.` is dropped
+// and a `..` is resolved on the host, because the core binds a share at
+// the path it was given and refuses one holding either.
 fn share_flag(raw: OsString) -> Result<Share, String> {
     let bytes = raw.as_bytes();
     let (path, mode) = if let Some(p) = bytes.strip_suffix(b"=ro") {
@@ -83,9 +76,8 @@ fn share_flag(raw: OsString) -> Result<Share, String> {
             .join(path)
     };
     // `join` keeps a `.` where it was written and `components` drops it,
-    // so rebuilding the path is what makes `--share .` name the directory
-    // rather than a path with a stray component in every message. Only
-    // `..`, which `components` keeps, is left for the host to resolve.
+    // so rebuilding the path is what makes `--share .` name the directory.
+    // Only `..`, which `components` keeps, is left for the host to resolve.
     let path: PathBuf = path.components().collect();
     if path.components().any(|c| c == Component::ParentDir) {
         return std::fs::canonicalize(&path)
@@ -95,9 +87,8 @@ fn share_flag(raw: OsString) -> Result<Share, String> {
     Ok(Share { path, mode })
 }
 
-/// Why `run --share` cannot join a sandbox that is already up: a share is
-/// one of the binds bwrap made when it started, and a live mount
-/// namespace takes no more.
+// A share is one of the binds bwrap made when it started, and a live
+// mount namespace takes no more.
 fn share_needs_a_fresh_sandbox(name: &str) -> anyhow::Error {
     anyhow::anyhow!("instance `{name}` is running; --share needs a fresh sandbox, exit it first")
 }
@@ -122,7 +113,6 @@ enum Format {
     Json,
 }
 
-/// The `--explain` flags `run` and `try` share.
 struct Explaining {
     mode: Explain,
     format: Format,
@@ -635,10 +625,8 @@ fn main() -> ExitCode {
     code
 }
 
-/// Bytes bubbler is about to echo, made safe when they are going to a
-/// terminal that would act on the control characters in them. A pipe
-/// gets them as they are: the reader there is a tool, and `bubbler log |
-/// grep` has to match what the run really wrote.
+// A pipe gets them as they are: the reader there is a tool, and `bubbler
+// log | grep` has to match what the run really wrote.
 fn echoed(bytes: &[u8], terminal: bool) -> Cow<'_, [u8]> {
     match terminal {
         true => Cow::Owned(safe_text::render(bytes)),
@@ -654,10 +642,8 @@ fn write_lines(out: &mut dyn Write, lines: &[&OsStr], terminal: bool) -> io::Res
     out.flush()
 }
 
-/// Print one line per element, byte for byte: argv and paths are not UTF-8
-/// and a lossy rendering would not be the audit trail it claims to be. A
-/// reader that closed the pipe early (`| head`) is a normal end, not a
-/// failure.
+// Byte for byte: argv and paths are not UTF-8 and a lossy rendering
+// would not be the audit trail it claims to be.
 fn print_lines(lines: &[&OsStr], what: &str) -> Result<i32> {
     let mut out = io::stdout().lock();
     let terminal = out.is_terminal();
@@ -668,8 +654,6 @@ fn print_lines(lines: &[&OsStr], what: &str) -> Result<i32> {
     }
 }
 
-/// Print bytes as they are. A reader that left early (`| head`) is a
-/// normal end here too.
 fn print_bytes(bytes: &[u8], what: &str) -> Result<i32> {
     let mut out = io::stdout().lock();
     let written = out.write_all(bytes).and_then(|()| out.flush());
@@ -680,7 +664,6 @@ fn print_bytes(bytes: &[u8], what: &str) -> Result<i32> {
     }
 }
 
-/// Write one of the two files the audio policy is made of.
 fn print_policy(script: bool) -> Result<i32> {
     match script {
         true => print_bytes(audio_policy::HOOK.as_bytes(), "the audio policy's hook"),
@@ -688,17 +671,13 @@ fn print_policy(script: bool) -> Result<i32> {
     }
 }
 
-/// Print bytes bubbler did not write, with what a terminal would act on
-/// rendered rather than sent ([`safe_text`]). A log replayed to a
-/// terminal is the sandbox writing to it a second time, with the user
-/// reading rather than watching, and a desktop entry carries the
-/// application's own keys.
+// A log replayed to a terminal is the sandbox writing to it a second
+// time, with the user reading rather than watching, and a desktop entry
+// carries the application's own keys.
 fn print_echoed_bytes(bytes: &[u8], what: &str) -> Result<i32> {
     print_bytes(&echoed(bytes, io::stdout().is_terminal()), what)
 }
 
-/// Write one diagnostic line to stderr, with what a terminal would act on
-/// rendered rather than sent ([`safe_text`]). Reached through [`ediag!`].
 fn eprint_echoed(text: &str) {
     let mut err = io::stderr().lock();
     let safe = echoed(text.as_bytes(), err.is_terminal());
@@ -707,10 +686,8 @@ fn eprint_echoed(text: &str) {
     let _ = err.write_all(&safe).and_then(|()| err.write_all(b"\n"));
 }
 
-/// Print the argv of `inst` with every argument under the node it came
-/// from, or, with `--proxy` or `--wl-proxy`, the argv of one of its
-/// sidecars. Nothing is started: `--explain` is a `--dry-run` with a
-/// different framing.
+// Nothing is started: `--explain` is a `--dry-run` with a different
+// framing.
 fn explain(
     env: &Env,
     inst: &Instance,
@@ -801,9 +778,6 @@ fn explain(
     print_lines(&lines, "the explanation")
 }
 
-/// The entry an instance's launcher entry is generated from, and where
-/// it goes. Split out because `--refresh` builds the same thing for an
-/// entry whose path is already decided.
 fn build_entry(
     dirs: &desktop::Dirs,
     inst: &Instance,
@@ -817,10 +791,6 @@ fn build_entry(
     Ok((desktop::target(dirs, &inst.name, &source, replace), entry))
 }
 
-/// Re-generate every entry bubbler has written: a new bubbler path, a
-/// changed config or an updated application file all reach the menu
-/// through this. Each entry is rewritten where it already is, so an entry
-/// written with `--replace` keeps shadowing the application's.
 fn refresh_entries(env: &Env, dirs: &desktop::Dirs, program: &Path) -> Result<i32> {
     let entries = desktop::generated(dirs);
     if entries.is_empty() {
@@ -860,13 +830,9 @@ fn refresh_entries(env: &Env, dirs: &desktop::Dirs, program: &Path) -> Result<i3
     Ok(i32::from(failed > 0))
 }
 
-/// The connection a start that lost the race to another start of the
-/// instance joins that one through, the way a later run would: the
-/// winner has bound the control socket, and a connection waits there
-/// until its sandbox answers. Tried once; a winner already gone again is
-/// the start's own error. A winner whose start then fails ends the join
-/// as an instance that stopped while the command was running, as it does
-/// for any exec made while a start is under way.
+// Tried once; a winner already gone again is the start's own error. A
+// winner whose start then fails ends the join as an instance that stopped
+// while the command was running.
 fn join_after_lost_start(
     env: &Env,
     name: &str,
@@ -887,11 +853,8 @@ fn join_after_lost_start(
     }
 }
 
-/// The log a run without a terminal writes, started by `start`
-/// ([`run_log::redirect`] or [`run_log::tee`]), or `None` after saying why
-/// there is none: a log that cannot be opened — a symlink where the file
-/// belongs, a full disk — is a lost record, and losing the record is not
-/// a reason to refuse the sandbox the user asked for.
+// A log that cannot be opened is a lost record, and losing the record is
+// not a reason to refuse the sandbox the user asked for.
 fn open_log(
     start: fn(&Path, bool) -> Result<run_log::Redirect, LaunchError>,
     path: &Path,
@@ -907,18 +870,16 @@ fn open_log(
     }
 }
 
-/// What `desktop-file-validate` rejects about an entry just written, as
-/// warnings: the file is on disk either way, since what it says about an
-/// application's own copied keys is not bubbler's to correct.
+// The file is on disk either way, since what `desktop-file-validate` says
+// about an application's own copied keys is not bubbler's to correct.
 fn warn_invalid(path: &Path) {
     for line in desktop::validate(path) {
         ediag!("bubbler: warning: {line}");
     }
 }
 
-/// Rebuild the launcher's MIME cache after the applications directory has
-/// changed. A missing tool is a warning: it costs the entry its place in
-/// "Open With" lists, and nothing else about it.
+// A missing tool is a warning: it costs the entry its place in "Open
+// With" lists, and nothing else about it.
 fn update_desktop_db(dir: &Path) {
     match desktop::update_database(dir) {
         Ok(true) => {}
@@ -931,17 +892,15 @@ fn update_desktop_db(dir: &Path) {
     }
 }
 
-/// File name of the terminal editor `bubbler ui` starts.
 const UI_BINARY: &str = "bubbler-ui";
 
-/// Whether `path` is a file a `PATH` search would run.
 fn executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-/// Where the terminal editor is: beside this binary first, so a pair
-/// built or unpacked together stay a pair, then the first on `$PATH`.
+// Beside this binary first, so a pair built or unpacked together stay a
+// pair, then the first on `$PATH`.
 fn ui_binary(exe: &Path, search_path: &[PathBuf]) -> Option<PathBuf> {
     let sibling = exe.parent().map(|dir| dir.join(UI_BINARY));
     if let Some(sibling) = sibling.filter(|p| executable(p)) {
@@ -953,11 +912,9 @@ fn ui_binary(exe: &Path, search_path: &[PathBuf]) -> Option<PathBuf> {
         .find(|candidate| executable(candidate))
 }
 
-/// Program and arguments from `$VISUAL`, else `$EDITOR`. The value is
-/// split into argv and never passed to a shell, so quotes and `$VAR` in
-/// it are not expanded. Resolved before anything is opened or written:
-/// `profile edit` creates the file it is about to edit, and a host with
-/// no editor set must be told so rather than left with a new profile.
+// Resolved before anything is opened or written: `profile edit` creates
+// the file it is about to edit, and a host with no editor set must be told
+// so rather than left with a new profile.
 fn editor_argv() -> Result<(OsString, Vec<OsString>)> {
     let editor = host_env::editor().context("neither VISUAL nor EDITOR is set")?;
     let mut parts = editor
@@ -969,8 +926,7 @@ fn editor_argv() -> Result<(OsString, Vec<OsString>)> {
     Ok((program, parts.collect()))
 }
 
-/// Open `path` in the editor [`editor_argv`] resolved and wait.
-/// `Some(code)` is a non-zero editor exit to propagate as bubbler's own.
+// `Some(code)` is a non-zero editor exit to propagate as bubbler's own.
 fn run_editor(program: &OsStr, args: &[OsString], path: &Path) -> Result<Option<i32>> {
     let status = Command::new(program)
         .args(args)
@@ -980,9 +936,8 @@ fn run_editor(program: &OsStr, args: &[OsString], path: &Path) -> Result<Option<
     Ok((!status.success()).then(|| launcher::exit_code(status)))
 }
 
-/// Exit code for a file the editor has just left: 0 when it parses again,
-/// 1 after naming what is still wrong with it. The file is kept either
-/// way, since only its author knows what it was meant to say.
+// The file is kept either way, since only its author knows what it was
+// meant to say.
 fn recheck<T, E>(path: &Path, result: Result<T, E>) -> i32
 where
     E: std::error::Error + Send + Sync + 'static,
@@ -997,8 +952,8 @@ where
     }
 }
 
-/// Print a report and return the exit code it earns. The text form goes
-/// out byte for byte, since a profile path need not be UTF-8.
+// The text form goes out byte for byte, since a profile path need not be
+// UTF-8.
 fn report(report: &lint::Report, opts: &LintOpts) -> Result<i32> {
     let code = lint::exit_code(report, opts.deny.as_deref() == Some("warnings"));
     if opts.format.as_deref() == Some("json") {
@@ -1015,11 +970,9 @@ fn report(report: &lint::Report, opts: &LintOpts) -> Result<i32> {
     Ok(code)
 }
 
-/// The errors and warnings of a lint run on stderr, prefixed so they are
-/// plainly bubbler's and plainly not the command's own output. Notes are
-/// left out, the exit code is untouched, and a run that could not be made
-/// at all says nothing: this rides along with another command, and must
-/// never be what fails it.
+// Notes are left out, the exit code is untouched, and a run that could
+// not be made at all says nothing: this rides along with another command,
+// and must never be what fails it.
 fn warn_lint(result: Result<lint::Report, bubbler_core::error::LintError>) {
     let Ok(report) = result else {
         return;
@@ -1038,26 +991,16 @@ fn warn_lint(result: Result<lint::Report, bubbler_core::error::LintError>) {
     }
 }
 
-/// What a config written before the current version has to say about
-/// itself, on stderr and before the run it applies to.
 fn warn_migration(inst: &Instance) {
     for text in inst.migration_warning() {
         ediag!("bubbler: warning: {text}");
     }
 }
 
-/// The command line the sandbox is given, with every host file among its
-/// arguments put where the sandbox will find it, or `None` where the
-/// caller's own command is to be left as it is.
-///
-/// The plan is made over the whole resolved command line, program
-/// included; the program is never a document. What each argument is
-/// decided to be is reported on stderr, and a `preview` (`--dry-run` or
-/// `--explain`) prints what a real run would ask for without asking for
-/// it. Failure is never fatal — an argument that could not be handed
-/// over is passed on as it was, and the run goes ahead with a warning
-/// naming the gap. A command that resolves to nothing is left to fail
-/// where it always did.
+// Failure is never fatal — an argument that could not be handed over is
+// passed on as it was, and the run goes ahead with a warning naming the
+// gap. A command that resolves to nothing is left to fail where it always
+// did.
 fn forwarded_or(
     env: &Env,
     inst: &Instance,
@@ -1144,22 +1087,18 @@ fn forwarded_or(
     Some(forward::rewrite(argv, &planned, &forwards))
 }
 
-/// A connection to the host session bus for the document portal call.
-/// The address is resolved through the same guard a launch uses, so an
-/// address pointing into bubbler's own runtime directory is refused
-/// here too.
+// The address is resolved through the same guard a launch uses, so an
+// address pointing into bubbler's own runtime directory is refused here
+// too.
 fn portal_session(env: &Env) -> Result<dbus_wire::Session> {
     let bus = dbus::guarded_host_bus(&RealHost, env).context("resolving the session bus")?;
     Ok(dbus_wire::Session::connect(&bus)?)
 }
 
-/// The `bubbler open` command line this process stands for, when it was
-/// started through a PATH shim. `argv[0]` is the only place the name it
-/// was called by survives — `current_exe()` reads `/proc/self/exe` and so
-/// resolves the symlink — and it is caller-controlled, so the name is a
-/// key into the registry bubbler wrote and never an instance name in its
-/// own right. A name the registry does not hold is not a shim, and the
-/// ordinary CLI runs.
+// `argv[0]` is the only place the name it was called by survives —
+// `current_exe()` reads `/proc/self/exe` and so resolves the symlink — and
+// it is caller-controlled, so the name is a key into the registry bubbler
+// wrote and never an instance name in its own right.
 fn shim_dispatch(argv: &[OsString]) -> Result<Option<Vec<OsString>>> {
     let Some(name) = wrap::shim_name(argv.first().map(OsString::as_os_str)) else {
         return Ok(None);
@@ -1182,7 +1121,6 @@ fn shim_dispatch(argv: &[OsString]) -> Result<Option<Vec<OsString>>> {
     Ok(Some(wrap::open_argv(&found.instance, &args)))
 }
 
-/// `bubbler man [--config]`: the page is built from the parser alone.
 fn print_man(config: bool) -> Result<i32> {
     let version = format!("bubbler {}", env!("CARGO_PKG_VERSION"));
     let lines = match config {
@@ -1261,10 +1199,9 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             command,
         } => {
             // Before the config is read, and connected first so a run
-            // into a live sandbox adds to its log, the way `open` does;
-            // unlike `open`, the run's stderr still goes where it went.
-            // The stream is kept, so the log is emptied or added to on the
-            // same answer the run then acts on.
+            // into a live sandbox adds to its log. The stream is kept, so
+            // the log is emptied or added to on the same answer the run
+            // then acts on.
             let starts = !dry_run && explain_mode.is_none();
             let mut probed = None;
             if starts && !tty::host_is_tty().iter().any(|t| *t) {
@@ -1522,9 +1459,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             // A launcher starts its children with no terminal at all, so
             // one on any of the three descriptors means somebody is
             // watching: the run keeps its own stderr and the sandbox is
-            // given a terminal. With none anywhere there is nothing to
-            // hand over or to stand in for, the sandbox gets pipes
-            // bubbler reads, and every stderr goes to the log.
+            // given a terminal.
             let watched = tty::host_is_tty().iter().any(|t| *t);
             if !watched {
                 *log = open_log(
