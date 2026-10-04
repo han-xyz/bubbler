@@ -6,7 +6,9 @@
 /// written down here is advertised to the sandbox, and adding it is the
 /// only thing that hides it.
 ///
-/// Sorted, so a name added out of place is a diff a reader can follow.
+/// Sorted: the proxy looks a name up with `binary_search`, which can
+/// miss a name in an unsorted list and advertise it, so a test keeps
+/// the order.
 /// Included by both `bubbler-wl-proxy` and `bubbler-core`, so the
 /// denylist the proxy applies and the one core explains are one list.
 pub const PRIVILEGED: &[&str] = &[
