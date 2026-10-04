@@ -34,30 +34,27 @@ use bubbler_init::{fds, proto, wire};
 mod pw_hold;
 mod spawn;
 
-/// Supervisor tick: the `poll` timeout, so `accept`, `wait` and every
-/// request read are non-blocking and one iteration is bounded by it.
+// The `poll` timeout, so `accept`, `wait` and every request read are
+// non-blocking and one iteration is bounded by it.
 const TICK: Duration = Duration::from_millis(20);
 const TICK_TIMESPEC: Timespec = Timespec {
     tv_sec: 0,
     tv_nsec: TICK.subsec_nanos() as Nsecs,
 };
-/// How long a process gets between SIGTERM and SIGKILL.
 const GRACE: Duration = Duration::from_secs(5);
-/// Deadline for one whole request, counted from the accept.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-/// Raw wait status for a command that could not be executed, as a shell reports it.
+// Raw wait status for a command that could not be executed, as a shell reports it.
 const NOT_EXECUTABLE: i32 = 127 << 8;
-/// Connections whose request has not arrived in full. The oldest is
-/// dropped to make room, so stalled clients cannot grow the table.
+// Connections whose request has not arrived in full. The oldest is
+// dropped to make room, so stalled clients cannot grow the table.
 const MAX_PENDING: usize = 16;
-/// The display socket inside the sandbox, and the display every process
-/// there is pointed at. The server is always started as `:0`.
+// The server is always started as `:0`.
 const X11_SOCKET: &str = "/tmp/.X11-unix/X0";
 const DISPLAY: &str = ":0";
-/// Clients the display socket queues before the server has taken it
-/// over. Only the first one has to wait for a server to start at all.
+// Clients the display socket queues before the server has taken it
+// over. Only the first one has to wait for a server to start at all.
 const X11_BACKLOG: i32 = 16;
-/// The one usage line, so a grammar error always names the whole grammar.
+// The one usage line, so a grammar error always names the whole grammar.
 const USAGE: &str = "bubbler-init: usage: --socket-fd N [--ctty] \
 [--x11 argv... --] [--x11-socket path] [--wm program] -- cmd...";
 
@@ -70,63 +67,47 @@ struct Args {
     command: Vec<OsString>,
 }
 
-/// The nested X server, the socket bound for it and the window manager
-/// that goes with it. The socket listens from before the command starts,
-/// so a client may connect while there is no server yet; that connection
-/// is what starts one, and the server accepts it itself.
 struct X11 {
     argv: Vec<OsString>,
     wm: Option<OsString>,
     listener: UnixListener,
-    /// Set on the first connection and never cleared: the server owns the
-    /// socket from then on, so init neither polls nor accepts it again,
-    /// and a server that failed to start is not started a second time.
+    // Set on the first connection and never cleared: the server owns the
+    // socket from then on, so init neither polls nor accepts it again,
+    // and a server that failed to start is not started a second time.
     started: bool,
     server: Option<Child>,
     wm_child: Option<Child>,
 }
 
-/// A command run for a client, with the connection waiting for its status.
 struct Exec {
     child: Child,
     stream: UnixStream,
 }
 
-/// The end of the run: whether anything has asked for it, and the moment
-/// whatever ignored SIGTERM is SIGKILLed.
 #[derive(Default)]
 struct Stopping {
-    /// Set by the first stop event and never cleared. From then on no new
-    /// exec'd child is started: one spawned now could only be killed
-    /// moments later, without the SIGTERM every other child was given.
-    /// Nor is the X server, which a client connecting during the grace
-    /// would otherwise wake for the seconds it has left.
+    // Set by the first stop event and never cleared. From then on no new
+    // exec'd child is started: one spawned now could only be killed
+    // moments later, without the SIGTERM every other child was given.
     asked: bool,
-    /// Set by the first stop event and never moved: whatever is still
-    /// running at the end is held to it too.
+    // Set by the first stop event and never moved: whatever is still
+    // running at the end is held to it too.
     kill_at: Option<Instant>,
     killed: bool,
 }
 
-/// An accepted connection whose request is still arriving.
 struct Pending {
     stream: UnixStream,
     incoming: wire::Incoming,
     deadline: Instant,
 }
 
-/// Parse `--socket-fd N [--ctty] [--x11 argv... --] [--x11-socket path]
-/// [--wm program] -- cmd...`; anything else is a usage error.
 fn parse_args() -> Option<Args> {
     parse_from(std::env::args_os().skip(1))
 }
 
-/// The grammar itself, over any argv but this process's own. The X server
-/// argv ends at its own bare `--`, so it may hold any words, including the
-/// command's own. `--x11-socket` overrides the path init binds for the
-/// display; it exists for this crate's own tests, which run on a host
-/// where `/tmp/.X11-unix/X0` is the session's own display, and bubbler
-/// never passes it.
+// `--x11-socket` overrides the path init binds for the display; it exists
+// for this crate's own tests, and bubbler never passes it.
 fn parse_from(mut it: impl Iterator<Item = OsString>) -> Option<Args> {
     let mut socket_fd = None;
     let mut ctty = false;
@@ -176,7 +157,6 @@ fn parse_from(mut it: impl Iterator<Item = OsString>) -> Option<Args> {
     })
 }
 
-/// Adopt the inherited listening socket named by `--socket-fd`, CLOEXEC at once.
 fn listener_from_fd(fd: i32) -> Option<UnixListener> {
     if fd < 3 {
         return None;
@@ -203,10 +183,8 @@ fn listener_from_fd(fd: i32) -> Option<UnixListener> {
     Some(listener)
 }
 
-/// Give the command its own session with its stdin as the controlling
-/// terminal, so job control and `/dev/tty` work inside the sandbox. Only
-/// ever called for a terminal bubbler allocated: claiming whatever sits
-/// on fd 0 would take over the user's own terminal in passthrough mode.
+// Only ever called for a terminal bubbler allocated: claiming whatever sits
+// on fd 0 would take over the user's own terminal in passthrough mode.
 fn take_ctty(command: &mut Command) {
     // SAFETY: the closure runs in the forked child between fork and execve,
     // where only async-signal-safe work is allowed: `setsid` and
@@ -226,22 +204,8 @@ fn take_ctty(command: &mut Command) {
     }
 }
 
-/// Give up what the supervisor will never use, and tie its life to its
-/// parent's. Under bwrap every capability set is empty and
-/// `no_new_privs` is already on, so most of this is stating the posture
-/// rather than changing it — which is the point: `bubbler-init` is pid 2,
-/// under bwrap's pid-1 reaper, and the parent of everything it starts;
-/// a supervisor started any other way must not be the one process that
-/// kept a privilege. The bounding set is only written where something is left
-/// in it, since `PR_CAPBSET_DROP` takes `CAP_SETPCAP`, which a sandbox
-/// does not have; reading it takes nothing.
-///
-/// `PR_SET_NO_NEW_PRIVS` first, so nothing the supervisor `execve`s can
-/// gain a privilege whatever it finds on the filesystem. Then the
-/// ambient set, then the three sets `capset` carries, then the bounding
-/// set, then the parent-death signal: a bwrap that is killed leaves this
-/// process a `SIGTERM`, which is the one the run already knows how to
-/// end on.
+// `PR_SET_NO_NEW_PRIVS` first, so nothing the supervisor `execve`s can
+// gain a privilege whatever it finds on the filesystem.
 fn harden() -> rustix::io::Result<()> {
     set_no_new_privs(true)?;
     clear_ambient_capability_set()?;
@@ -254,24 +218,17 @@ fn harden() -> rustix::io::Result<()> {
         set_capabilities(None, empty)?;
     }
     // `.iter_names()`, not `.iter()`: rustix marks `CapabilitySet` with
-    // bitflags' external-bits escape hatch (`const _ = !0;`) so a future
-    // kernel's capability past bit 40 still round-trips through this
-    // type, and `.iter()` yields that one unnamed remainder as a single
-    // multi-bit flag. `capability_is_in_bounding_set` and
+    // bitflags' external-bits escape hatch (`const _ = !0;`), and `.iter()`
+    // yields that one unnamed remainder as a single multi-bit flag.
+    // `capability_is_in_bounding_set` and
     // `remove_capability_from_bounding_set` both reject anything but a
-    // single bit with `EINVAL`, so `.iter()` would fail on that last
-    // flag on every kernel this runs on; `.iter_names()` yields only the
-    // 41 capabilities this build of rustix knows the names of.
+    // single bit with `EINVAL`.
     for (_, capability) in CapabilitySet::all().iter_names() {
         if capability_is_in_bounding_set(capability)? {
-            // A caller without CAP_SETPCAP gets EPERM here — the normal
-            // case for a supervisor started outside bwrap, where the
-            // bounding set was never bwrap's to empty in the first
-            // place. That leaves it as this process found it, which
-            // `PR_SET_NO_NEW_PRIVS` above already made inert: no
-            // `execve` from here can turn a bounding-set entry into a
-            // held capability, so there is nothing left to gain by
-            // refusing to run instead.
+            // A caller without CAP_SETPCAP gets EPERM here. That leaves the
+            // bounding set as this process found it, which
+            // `PR_SET_NO_NEW_PRIVS` above already made inert: no `execve`
+            // from here can turn a bounding-set entry into a held capability.
             match remove_capability_from_bounding_set(capability) {
                 Ok(()) | Err(Errno::PERM) => {}
                 Err(e) => return Err(e),
@@ -282,11 +239,8 @@ fn harden() -> rustix::io::Result<()> {
     Ok(())
 }
 
-/// Turn a request down: say why on the connection's own stderr, and
-/// answer the status a shell reports for a command it could not run.
-/// The reason is dropped when that stderr would block: the status still
-/// tells the client. A regular file is written as is, so one on a hung mount
-/// can still stall the loop.
+// A regular file is written as is, so one on a hung mount can still stall
+// the loop.
 fn refuse(stream: &UnixStream, report: Option<OwnedFd>, why: &str) {
     if let Some(fd) = report {
         write_unless_blocked(&fd, format!("bubbler-init: {why}\n").as_bytes());
@@ -294,9 +248,8 @@ fn refuse(stream: &UnixStream, report: Option<OwnedFd>, why: &str) {
     let _ = wire::send_status(stream, NOT_EXECUTABLE);
 }
 
-/// Write `line` to `fd` without blocking and without changing the flags
-/// of the open file description the client shares with it; a line that
-/// cannot go out at once is dropped.
+// Write `line` to `fd` without blocking and without changing the flags
+// of the open file description the client shares with it.
 fn write_unless_blocked(fd: &OwnedFd, line: &[u8]) {
     let Ok(stat) = rustix::fs::fstat(fd) else {
         return;
@@ -331,11 +284,9 @@ fn write_unless_blocked(fd: &OwnedFd, line: &[u8]) {
     }
 }
 
-/// Execute one received request; a malformed one closes the connection,
-/// spawning nothing. Whether the command takes fd 0 as its controlling
-/// terminal is the request's own flag, not the instance's `--ctty`: the
-/// client knows which of the fds it just sent is a pty it allocated.
-/// Once the run is stopping nothing new is started at all.
+// Whether the command takes fd 0 as its controlling terminal is the
+// request's own flag, not the instance's `--ctty`: the client knows which
+// of the fds it just sent is a pty it allocated.
 fn serve(
     stream: UnixStream,
     request: &proto::Request,
@@ -383,9 +334,7 @@ fn serve(
     }
 }
 
-/// Take one read step on every connection `poll` reported, spawning the
-/// commands whose requests are now whole. `ready` is parallel to
-/// `pending` and shrinks with it.
+// `ready` is parallel to `pending` and shrinks with it.
 fn read_pending(
     pending: &mut Vec<Pending>,
     ready: &mut Vec<bool>,
@@ -416,7 +365,6 @@ fn read_pending(
     }
 }
 
-/// Answer and drop every exec connection whose child has exited.
 fn reap(execs: &mut Vec<Exec>) {
     execs.retain_mut(|e| match e.child.try_wait() {
         Ok(None) => true,
@@ -428,10 +376,9 @@ fn reap(execs: &mut Vec<Exec>) {
     });
 }
 
-/// Whether a child is gone. `try_wait` fails only where init cannot learn
-/// the child's fate at all, and a process it can no longer account for is
-/// treated as gone: assuming it is still up is what would leave the
-/// command drawing on a display that is not there.
+// A process init can no longer account for is treated as gone: assuming
+// it is still up is what would leave the command drawing on a display that
+// is not there.
 fn has_exited(child: &mut Child, what: &str) -> bool {
     match child.try_wait() {
         Ok(None) => false,
@@ -443,17 +390,15 @@ fn has_exited(child: &mut Child, what: &str) -> bool {
     }
 }
 
-/// Signal every exec'd child. They are unreaped here, so their pids are still theirs.
+// Exec'd children are unreaped here, so their pids are still theirs.
 fn signal_execs(execs: &[Exec], sig: Signal) {
     for e in execs {
         let _ = kill_process(Pid::from_child(&e.child), sig);
     }
 }
 
-/// Ask the run to end: SIGTERM the command and every exec'd child, and
-/// set the deadline at which whatever ignored it is SIGKILLed. The
-/// deadline is the point: a command that traps SIGTERM would otherwise
-/// keep the sandbox alive for as long as it liked.
+// The deadline is the point: a command that traps SIGTERM would otherwise
+// keep the sandbox alive for as long as it liked.
 fn begin_stop(command: &Child, execs: &[Exec], stopping: &mut Stopping) {
     // Nothing here is reaped until the loop exits, so every pid is still its own.
     let _ = kill_process(Pid::from_child(command), Signal::TERM);
@@ -465,8 +410,6 @@ fn begin_stop(command: &Child, execs: &[Exec], stopping: &mut Stopping) {
     stopping.kill_at = stopping.kill_at.or(Some(Instant::now() + GRACE));
 }
 
-/// SIGTERM the remaining exec'd children and SIGKILL whatever outlives
-/// the stop's deadline, or a fresh grace when no stop was asked.
 fn shutdown(execs: &mut Vec<Exec>, kill_at: Option<Instant>) {
     if execs.is_empty() {
         return;
@@ -486,9 +429,9 @@ fn shutdown(execs: &mut Vec<Exec>, kill_at: Option<Instant>) {
     execs.clear();
 }
 
-/// Bind the socket the nested X server will inherit. It is listening
-/// before the command runs, so the first client waits in its queue
-/// instead of failing to connect while the server is still starting.
+// The socket is listening before the command runs, so the first client
+// waits in its queue instead of failing to connect while the server is
+// still starting.
 fn bind_x11(path: &Path) -> Result<UnixListener, String> {
     if let Some(dir) = path.parent() {
         match rustix::fs::mkdir(dir, Mode::from_raw_mode(0o1777)) {
@@ -517,10 +460,8 @@ fn bind_x11(path: &Path) -> Result<UnixListener, String> {
     Ok(UnixListener::from(sock))
 }
 
-/// Hand the listening socket to the X server. The connection that woke
-/// init is deliberately left in the queue: the server accepts it on the
-/// very descriptor it inherits, so the client that waited is served by
-/// the server it woke, on the socket it already connected to.
+// The connection that woke init is deliberately left in the queue: the
+// server accepts it on the very descriptor it inherits.
 fn start_x11(x: &mut X11) -> Result<(), String> {
     let (program, rest) = x.argv.split_first().ok_or("no server to run")?;
     // A duplicate carries the socket across this one exec, so the
@@ -538,9 +479,8 @@ fn start_x11(x: &mut X11) -> Result<(), String> {
     Ok(())
 }
 
-/// Start the window manager beside the server. It is a convenience and
-/// not a display: one that is missing or that exits is reported, and the
-/// command keeps running on a server that simply manages nothing.
+// The window manager is a convenience and not a display: one that is
+// missing or that exits is reported, and the command keeps running.
 fn start_wm(x: &mut X11) {
     let Some(wm) = x.wm.as_ref() else { return };
     match Command::new(wm).env("DISPLAY", DISPLAY).spawn() {
@@ -549,8 +489,6 @@ fn start_wm(x: &mut X11) {
     }
 }
 
-/// SIGTERM one child and SIGKILL whatever outlives the stop's deadline,
-/// or a fresh grace when no stop was asked, then reap it.
 fn stop_child(child: &mut Child, kill_at: Option<Instant>) {
     let _ = kill_process(Pid::from_child(child), Signal::TERM);
     let deadline = kill_at.unwrap_or_else(|| Instant::now() + GRACE);
@@ -564,10 +502,10 @@ fn stop_child(child: &mut Child, kill_at: Option<Instant>) {
     let _ = child.wait();
 }
 
-/// Stop the window manager and then the server. Only ever called once
-/// the command and every exec'd child are gone: nothing may lose its
-/// display while it is still drawing on it, and the window manager is
-/// never left managing a server that has already exited.
+// Stop the window manager and then the server. Only ever called once
+// the command and every exec'd child are gone: nothing may lose its
+// display while it is still drawing on it, and the window manager is
+// never left managing a server that has already exited.
 fn stop_x11(x11: Option<&mut X11>, kill_at: Option<Instant>) {
     let Some(x) = x11 else { return };
     if let Some(wm) = x.wm_child.as_mut() {
@@ -578,7 +516,6 @@ fn stop_x11(x11: Option<&mut X11>, kill_at: Option<Instant>) {
     }
 }
 
-/// The command's exit code, or 128 + signal when a signal killed it.
 fn code_of(status: ExitStatus) -> u8 {
     let code = status
         .code()
@@ -587,9 +524,8 @@ fn code_of(status: ExitStatus) -> u8 {
     u8::try_from(code).unwrap_or(1)
 }
 
-/// Whether this process was started as `name` rather than as the
-/// supervisor. One file is bound at every mode's own path, so the
-/// basename of `argv[0]` is the whole of what separates the modes.
+// One file is bound at every mode's own path, so the basename of
+// `argv[0]` is the whole of what separates the modes.
 fn started_as(name: &str) -> bool {
     std::env::args_os()
         .next()
@@ -600,14 +536,13 @@ fn main() -> ExitCode {
     // Before anything the supervisor does to its own process: the shim
     // keeps the descriptors its caller forwarded, which the sweep below
     // exists to close, and it holds no privilege the command should not
-    // have — it is a child of the sandboxed application, not its parent.
+    // have.
     if started_as(spawn::NAME) {
         return spawn::run(std::env::args_os().skip(1));
     }
     // Also before the sweep, and for the same reason: the holder reports
     // on a descriptor bubbler passed it, and it is not the sandbox's
-    // supervisor but a process of the audio sidecar, with no control
-    // socket and no command of its own.
+    // supervisor but a process of the audio sidecar.
     if started_as(pw_hold::NAME) {
         return pw_hold::run();
     }
@@ -617,9 +552,7 @@ fn main() -> ExitCode {
     };
     // Before the socket is adopted, the display is bound or anything at
     // all is started. `--socket-fd` is the one descriptor this argv names,
-    // so everything else above stdio is something bwrap passed through
-    // from whatever started bubbler; the display socket is bound here and
-    // handed to the server on a duplicate of its own.
+    // so everything else above stdio is something bwrap passed through.
     //
     // SAFETY: nothing above stdio has an owner in this process yet. Only
     // the argv has been read, `parse_from` opens nothing, and every
@@ -639,9 +572,8 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     // A non-dumpable process can only be ptraced, or have fds taken with
-    // pidfd_getfd, by a tracer holding CAP_SYS_PTRACE, even where
-    // kernel.yama.ptrace_scope is 0; execve resets it, so the command and every
-    // exec'd child are unaffected.
+    // pidfd_getfd, by a tracer holding CAP_SYS_PTRACE; execve resets it, so
+    // the command and every exec'd child are unaffected.
     if let Err(e) = set_dumpable_behavior(DumpableBehavior::NotDumpable) {
         eprintln!("bubbler-init: cannot become non-dumpable: {e}");
         return ExitCode::from(2);
@@ -651,11 +583,6 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     let stop = Arc::new(AtomicBool::new(false));
-    // SIGHUP is the terminal going away and SIGQUIT the keyboard asking;
-    // both mean the run is over, and the command is owed the same grace
-    // either way. Left on their default dispositions they would kill the
-    // supervisor outright, and the command would be reaped by bwrap with
-    // no SIGTERM of its own.
     for sig in [
         signal_hook::consts::SIGTERM,
         signal_hook::consts::SIGINT,
@@ -721,11 +648,8 @@ fn main() -> ExitCode {
             return ExitCode::from(code_of(status));
         }
         if let Some(x) = x11.as_mut() {
-            // A server that exits takes the display with it: the command
-            // cannot draw any more, so it is stopped instead of left
-            // blind. Checked after the command's own exit, so the two
-            // going down together is not reported as the server stopping
-            // the command.
+            // Checked after the command's own exit, so the two going down
+            // together is not reported as the server stopping the command.
             if x.server.as_mut().is_some_and(|s| has_exited(s, "Xwayland")) {
                 eprintln!("bubbler-init: Xwayland exited; stopping the command");
                 begin_stop(&command, &execs, &mut stopping);
@@ -749,12 +673,9 @@ fn main() -> ExitCode {
             signal_execs(&execs, Signal::KILL);
             stopping.killed = true;
         }
-        // The listener, the display socket while nothing serves it, and
-        // every half-read request in one poll set: a client that stops
-        // mid-request delays nothing but itself. The display socket
-        // leaves that set once the run is ending, so a client connecting
-        // during the grace wakes nothing — and so that the loop does not
-        // spin on a connection it has decided not to answer.
+        // The display socket leaves the poll set once the run is ending, so
+        // a client connecting during the grace wakes nothing — and so that
+        // the loop does not spin on a connection it has decided not to answer.
         let waking = x11
             .as_ref()
             .filter(|x| !x.started && !stopping.asked)
@@ -782,9 +703,7 @@ fn main() -> ExitCode {
         drop(fds);
         // Taken here and nowhere else, so a stop that arrived while this
         // set was being built or polled is acted on before anything that
-        // poll reported: the display socket was in the set from before
-        // the signal, and the client that woke it must not start a server
-        // anyway. A signal pending before `poll` returns has run its
+        // poll reported. A signal pending before `poll` returns has run its
         // handler by the time this reads the flag, so the two cannot
         // cross: init spawns no threads, so that handler is this thread's
         // own, run on its way out of the syscall.
@@ -803,11 +722,8 @@ fn main() -> ExitCode {
             }
             Ok(_) => {}
         }
-        // The first client to connect is what starts the server, and the
-        // window manager goes up with it: neither exists in a sandbox
-        // whose command never speaks X11. Nor in one that is ending: the
-        // socket leaves the poll set when the run is asked to stop, but a
-        // wake already in hand can be older than the asking.
+        // The socket leaves the poll set when the run is asked to stop, but
+        // a wake already in hand can be older than the asking.
         if wake_x11
             && !stopping.asked
             && let Some(x) = x11.as_mut()
