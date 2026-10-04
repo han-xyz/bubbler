@@ -54,7 +54,6 @@ pub enum Action {
 }
 
 impl Action {
-    /// A command whose whole answer is its output.
     fn capture(title: impl Into<String>, args: Vec<OsString>) -> Self {
         Self::Capture {
             title: title.into(),
@@ -65,8 +64,6 @@ impl Action {
         }
     }
 
-    /// `bubbler log <name>`, opened where the newest lines are, headed by
-    /// the `outcome` of a start that failed.
     fn run_log(name: &str, outcome: Option<String>) -> Self {
         Self::Capture {
             title: format!("last-run.log of {name}"),
@@ -334,8 +331,7 @@ impl App {
 
     /// Read the store again and put the detail screen's buffer back on
     /// the file, which is what an `$EDITOR` run or an outside change asks
-    /// for — unless the buffer holds edits the file does not. Those are
-    /// the user's, and nothing the editor ran is a reason to drop them.
+    /// for — unless the buffer holds edits the file does not.
     pub fn reload(&mut self) {
         self.reload_store();
         let Some(name) = self.detail.as_ref().map(|d| d.name().to_owned()) else {
@@ -377,9 +373,6 @@ impl App {
         Some(Action::run_log(name, Some(outcome)))
     }
 
-    /// The offset of the viewer's last page over `lines` lines: the
-    /// viewer scrolls by what it can show rather than by rows in a list,
-    /// so this is the last page and not the last line on its own.
     fn last_page(&self, lines: usize) -> usize {
         lines.saturating_sub(self.page.max(1))
     }
@@ -392,7 +385,6 @@ impl App {
         }
     }
 
-    /// Pop one screen, never the root.
     fn back(&mut self) {
         if self.stack.len() > 1 {
             self.stack.pop();
@@ -432,8 +424,6 @@ impl App {
         }
     }
 
-    /// Keys every list screen shares: the movement, the help and the way
-    /// out. `true` when the key was one of them.
     fn common_key(&mut self, key: KeyEvent, len: usize, index: usize) -> Option<usize> {
         let last = len.saturating_sub(1);
         Some(match key.code {
@@ -468,8 +458,6 @@ impl App {
         None
     }
 
-    /// The keys that act on the selected instance. Split out because
-    /// every one of them needs a name and the list may be empty.
     fn instance_action(&mut self, key: KeyEvent, name: String) -> Option<Action> {
         match key.code {
             KeyCode::Enter => {
@@ -781,7 +769,6 @@ impl App {
         None
     }
 
-    /// Open a one-line prompt.
     fn ask(
         &mut self,
         title: impl Into<String>,
@@ -797,7 +784,6 @@ impl App {
         });
     }
 
-    /// Ask for the name a shim takes on `PATH`.
     fn wrap_prompt(&mut self, name: String) {
         self.ask(
             format!("shim for `{name}` in ~/.local/bin"),
@@ -808,7 +794,6 @@ impl App {
         );
     }
 
-    /// Open a confirmation.
     fn choose(&mut self, question: impl Into<String>, choices: Vec<Choice>) {
         self.dialog = Some(Dialog::Choose {
             question: question.into(),
@@ -856,7 +841,6 @@ impl App {
         }
     }
 
-    /// What a confirmed answer does.
     fn confirmed(&mut self, confirm: Confirm) -> Option<Action> {
         match confirm {
             Confirm::Delete(name) => Some(Action::capture(
@@ -894,10 +878,9 @@ impl App {
         }
     }
 
-    /// What a submitted prompt does. A prompt whose answer the parser
-    /// refuses stays open with the reason under it, because retyping the
-    /// whole line to fix one character is what makes an editor worse than
-    /// the file.
+    // A prompt whose answer the parser refuses stays open with the reason
+    // under it, because retyping the whole line to fix one character is
+    // what makes an editor worse than the file.
     fn answered(&mut self) -> Option<Action> {
         let Some(Dialog::Ask { input, prompt, .. }) = &self.dialog else {
             return None;
@@ -910,10 +893,7 @@ impl App {
                 Some(Action::capture(
                     format!("create {value}"),
                     // `--` closes the option list, so what was typed is
-                    // the instance name whatever it starts with: a
-                    // leading `-` is then refused by the CLI's own name
-                    // grammar, which says why, rather than as a flag it
-                    // has never heard of.
+                    // the instance name whatever it starts with.
                     args(&["create", "--profile", &profile, "--", &value]),
                 ))
             }
@@ -973,7 +953,6 @@ impl App {
     }
 }
 
-/// The `bubbler run --explain` a viewer is showing.
 fn explain_action(explain: &Explain) -> Action {
     let mut argv = args(&["run", &explain.name, "--explain"]);
     if explain.full {
@@ -991,16 +970,12 @@ fn explain_action(explain: &Explain) -> Action {
     }
 }
 
-/// A command line, one argument per element.
 fn args(parts: &[&str]) -> Vec<OsString> {
     parts.iter().map(OsString::from).collect()
 }
 
-/// A command line typed into a prompt, split the way a shell splits a
-/// simple one and no further: whitespace separates arguments, `"` holds a
-/// run of them together and `\` escapes the next character. Nothing is
-/// expanded, because nothing here reaches a shell — there is no `$HOME`
-/// and no `*` for anything to mean.
+// Nothing is expanded, because nothing here reaches a shell — there is no
+// `$HOME` and no `*` for anything to mean.
 fn split(value: &str) -> Result<Vec<OsString>, String> {
     let mut args = Vec::new();
     let mut current = String::new();
@@ -1043,11 +1018,6 @@ fn split(value: &str) -> Result<Vec<OsString>, String> {
     Ok(args)
 }
 
-/// `<profile> [grant ...] [keep=<name>] [-- <command ...>]` as a `bubbler
-/// try` command line. The whole grammar of that prompt: a throwaway
-/// sandbox takes a profile, the bare grants on top of it, a name to keep
-/// it under, and the command to run in it — which a profile with no
-/// `command` node of its own has no other way of being given.
 fn try_args(value: &str) -> Result<Vec<OsString>, String> {
     let typed = split(value)?;
     let mut parts = typed.iter();
