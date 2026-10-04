@@ -31,7 +31,6 @@ impl Input {
         self.cursor
     }
 
-    /// Byte offset of the cursor, for slicing the value.
     fn offset(&self) -> usize {
         self.value
             .char_indices()
