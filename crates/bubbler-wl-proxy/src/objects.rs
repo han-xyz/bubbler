@@ -95,7 +95,6 @@ pub struct Entry {
 pub struct Objects {
     map: HashMap<u32, Entry>,
     hidden_globals: HashSet<u32>,
-    /// Destroyed objects in the server's range, which the cap does not count.
     server_zombies: usize,
 }
 
@@ -123,7 +122,6 @@ impl Objects {
         }
     }
 
-    /// Map `id`, checking the range its sender may allocate from and the cap.
     fn record(
         &mut self,
         from_client: bool,
