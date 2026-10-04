@@ -821,13 +821,12 @@ will not decode, it carries fewer or more descriptors than it declares,
 or more than four. A frame length past the specification's 128 MiB, a
 header-field length past 64 MiB, an unknown byte-order flag or an
 unknown protocol version leaves no way to find the next message and
-fails the connection. No read goes past the end of the
-message being read, so descriptors are counted against the message they
-came with. Every descriptor a message carries is closed on arrival, since
-bubbler passes descriptors out and never takes one back. The client is
-host-side code running as your uid on your own bus: it is bubbler
-talking to your session, not the sandbox, which reaches that bus only
-through the proxy.
+fails the connection. No read goes past the end of the message being
+read, so descriptors are counted against the message they came with.
+Every descriptor a message carries is closed on arrival, since bubbler
+passes descriptors out and never takes one back. The client is host-side
+code running as your uid on your own bus: it is bubbler talking to your
+session, not the sandbox, which reaches that bus only through the proxy.
 
 The proxy gives a name the most permissive rule written for it, so the
 parser refuses a config whose rules would apply more widely than they
@@ -1117,14 +1116,24 @@ a camera, and a sandbox reaches one through the camera portal. Until
 clients' video streams read-only (measured, PipeWire 1.6.9, WirePlumber
 0.5.18). The drop-in's rules cannot tell a node's owner, so the hook
 hides a video stream unless the client named by the node's `client.id`
-carries the viewer's `pipewire.sec.instance-id`, which the security
-context sets and no client can, and the stream rule's `r` leaves video
-streams out:
-where two rules of a permission manager matched one node, the stream
-rule's `r` was applied whichever rule came first, and an entry the hook
-sets survives the manager's attach only on a node no rule matches (both
-measured). A video node that appears while a sandbox is connected is
-announced to it first, as above.
+and the viewer are both bubbler's (`pipewire.sec.engine =
+"org.bubbler"`) and carry the same `pipewire.sec.instance-id`, both of
+which the security context sets and no client can; a stream of a context
+of another engine carrying the same id string stays hidden. The stream rule's
+`r` leaves video streams out: where two rules of a permission manager
+matched one node, the stream rule's `r` was applied whichever rule came
+first, and an entry the hook sets survives the manager's attach only on
+a node no rule matches (both measured). The instance id is the
+launcher's pid, which is not unique across pid namespaces: two bubbler
+runs whose launchers hold the same pid number in different pid
+namespaces (a toolbox or distrobox container sharing the host's
+PipeWire) count as one sandbox and see each other's video streams. The
+hook looks the owner up among the clients WirePlumber has already
+listed, so a client whose access is decided before the stream's owner is
+listed, as after a WirePlumber restart, does not see that stream until
+it reconnects; that fails closed (read from the hook, not measured). A
+video node that appears while a sandbox is connected is announced to it
+first, as above.
 
 Card objects (`Audio/Device`) stay visible to every audio context, with
 their profiles and routes. A card holding only a microphone, and the input

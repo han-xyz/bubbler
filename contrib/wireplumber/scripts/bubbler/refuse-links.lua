@@ -99,7 +99,7 @@ local BUBBLER_ENGINE = "org.bubbler"
 
 -- Raised whenever what this policy makes WirePlumber do changes; bubbler
 -- expects the revision it ships with and reads it from this line.
-local POLICY_REVISION = 6
+local POLICY_REVISION = 7
 
 local EPERM = -1
 
@@ -559,17 +559,18 @@ local function is_sandbox (client)
   return client.properties ["pipewire.sec.engine"] == BUBBLER_ENGINE
 end
 
--- Whether the node's owning client belongs to the same sandbox as `client`:
--- both carry the instance id the security context set, which no client can.
+-- Both bubbler's and with the instance id the security context set, which no
+-- client can; another engine may carry the same id string.
 local function same_sandbox (client, node_props)
   local instance = client.properties ["pipewire.sec.instance-id"]
   local owner_id = node_props ["client.id"]
   local source = Plugin.find ("standard-event-source")
-  if not instance or not owner_id or not source then
+  if not instance or not owner_id or not source or not is_sandbox (client) then
     return false
   end
   local owner = lookup (source, "client", owner_id)
-  return owner ~= nil and owner.properties ["pipewire.sec.instance-id"] == instance
+  return owner ~= nil and is_sandbox (owner)
+    and owner.properties ["pipewire.sec.instance-id"] == instance
 end
 
 -- Cameras and capture nodes are hidden by 50-bubbler.conf; a video stream

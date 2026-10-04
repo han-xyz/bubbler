@@ -31,6 +31,9 @@ pub const PLAYBACK_MICROPHONE: &str = r#"{ "pipewire.sec.engine": "org.bubbler",
 /// [`PLAYBACK_MICROPHONE`] for another sandbox: another instance id.
 pub const OTHER_SANDBOX: &str = r#"{ "pipewire.sec.engine": "org.bubbler", "pipewire.sec.app-id": "bed", "pipewire.sec.instance-id": "t2", "pipewire.access": "restricted", "pipewire.sec.bubbler.audio": "playback,microphone" }"#;
 
+/// A context another engine made, carrying [`PLAYBACK`]'s instance id.
+pub const OTHER_ENGINE: &str = r#"{ "pipewire.sec.engine": "org.other", "pipewire.sec.app-id": "bed", "pipewire.sec.instance-id": "t1", "pipewire.access": "restricted" }"#;
+
 /// The same with the `devices` child: the context's own devices stand
 /// beside the host's.
 pub const DEVICES: &str = r#"{ "pipewire.sec.engine": "org.bubbler", "pipewire.sec.app-id": "bed", "pipewire.sec.instance-id": "t1", "pipewire.access": "restricted", "pipewire.sec.bubbler.audio": "playback,devices" }"#;
@@ -1007,6 +1010,10 @@ fn a_video_stream_is_hidden_from_every_sandbox_but_its_own() {
         OTHER_SANDBOX,
         &format!("'{}' out '{}'", fixture.display(), props("other-video")),
     ));
+    let _foreign = Streaming(bed.spawn_in_context(
+        OTHER_ENGINE,
+        &format!("'{}' out '{}'", fixture.display(), props("foreign-video")),
+    ));
     let mut command = bed.command(&fixture.to_string_lossy());
     command
         .args(["out", &props("host-video")])
@@ -1018,15 +1025,20 @@ fn a_video_stream_is_hidden_from_every_sandbox_but_its_own() {
 
     let mut host = String::new();
     let stream = |host: &str, name: &str| object(host, &[&format!("node.name = \"{name}\""), NODE]);
-    wait_for("the four video streams with their ports", || {
+    wait_for("the five video streams with their ports", || {
         host = bed.info_from_host();
-        ["own-video", "sibling-video", "other-video", "host-video"]
-            .iter()
-            .all(|name| {
-                stream(&host, name).is_some_and(|node| {
-                    !objects_of(&host, std::slice::from_ref(&node.id)).is_empty()
-                })
-            })
+        [
+            "own-video",
+            "sibling-video",
+            "other-video",
+            "foreign-video",
+            "host-video",
+        ]
+        .iter()
+        .all(|name| {
+            stream(&host, name)
+                .is_some_and(|node| !objects_of(&host, std::slice::from_ref(&node.id)).is_empty())
+        })
     });
     let own_nodes = ["own-video", "sibling-video"].map(|name| stream(&host, name).unwrap().id);
     let mut own_ids = objects_of(&host, &own_nodes);
@@ -1038,12 +1050,29 @@ fn a_video_stream_is_hidden_from_every_sandbox_but_its_own() {
             own_ids.iter().all(|id| visible.contains(id))
         },
     );
-    for name in ["other-video", "host-video"] {
+    let log = bed.dir().join("late-sibling.log");
+    let late = ContextMonitor {
+        _running: Streaming(bed.spawn_in_context_logged(
+            PLAYBACK_MICROPHONE,
+            "stdbuf -oL pw-mon -N -a -o",
+            Some(&log),
+        )),
+        log,
+    };
+    wait_for(
+        "the sandbox's video streams, seen by a client that connected after them",
+        || {
+            let visible = late.visible();
+            own_ids.iter().all(|id| visible.contains(id))
+        },
+    );
+    for name in ["other-video", "foreign-video", "host-video"] {
         hidden.push(stream(&host, name).expect("a video stream").id);
     }
     let mut ids = objects_of(&host, &hidden);
     ids.extend(hidden);
     own.sees_none_of(&ids);
+    late.sees_none_of(&ids);
 }
 
 #[test]
