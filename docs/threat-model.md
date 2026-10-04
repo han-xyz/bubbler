@@ -1054,10 +1054,12 @@ An object that appears while a sandbox is connected is announced to that
 sandbox by PipeWire before WirePlumber hides it. This covers a microphone
 plugged in, any new source, the source's ports and links, and a camera
 node. The sandbox therefore learns that the object exists, and its
-properties (name, id, format), at that moment. No audio flows. Objects
-already present when the sandbox connects are never shown to it. Nodes
+properties (name, id, format), at that moment. No audio flows. Nodes
 have behaved this way since 0.23; ports and links behave the same way
-(measured, PipeWire 1.6.9, WirePlumber 0.5.18).
+(measured, PipeWire 1.6.9, WirePlumber 0.5.18). Objects already present
+when the sandbox connects are not shown to it, but for the two cases
+below: a WirePlumber restart, and a node that changed its class before the
+sandbox connected.
 
 A WirePlumber restart does the same for a sandbox that stays connected
 across it: the restarted WirePlumber announces the ports and links of the

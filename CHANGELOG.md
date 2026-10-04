@@ -17,8 +17,10 @@
   that sandbox by PipeWire before WirePlumber hides it. This covers a
   microphone plugged in, a new source, its ports and links, and a camera
   node. The sandbox learns that the object exists and its properties (name,
-  id, format) at that moment; no audio flows. Objects present before the
-  sandbox connects are never shown. Nodes have behaved this way since 0.23.
+  id, format) at that moment; no audio flows. Nodes have behaved this way
+  since 0.23. Objects present before the sandbox connects are not shown,
+  but for a node that turned into a source before then, which the sandbox
+  still sees without its ports and links.
   A WirePlumber restart announces the hidden ports and links again to a
   sandbox that stays connected (measured on PipeWire 1.6.9, WirePlumber
   0.5.18).
