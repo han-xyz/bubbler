@@ -21,9 +21,8 @@ use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 /// The terminal the editor draws on.
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
 
-/// The signals that end the editor. Caught rather than fatal because the
-/// terminal is the editor's to give back: killed in raw mode, it would
-/// leave the user without an echo.
+// Caught rather than fatal because the terminal is the editor's to give
+// back: killed in raw mode, it would leave the user without an echo.
 const STOP_SIGNALS: [i32; 3] = [SIGINT, SIGTERM, SIGHUP];
 
 /// Raw mode and the alternate screen, and a terminal drawing on them.
@@ -36,8 +35,7 @@ pub fn enter() -> io::Result<Term> {
 /// Give the terminal back. Raw mode goes first: it has more side effects
 /// than the alternate screen, so it is the one that must not be left on
 /// if a later step fails. The cursor is shown again before the screen is
-/// left, because a frame with a dialog on it hid the cursor, and a shell
-/// with no cursor is what the user would be handed otherwise. Idempotent,
+/// left, because a frame with a dialog on it hid the cursor. Idempotent,
 /// so the panic hook and the signal path can call it and the ordinary
 /// path still runs.
 pub fn leave() -> io::Result<()> {
