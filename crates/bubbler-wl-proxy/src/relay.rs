@@ -299,12 +299,15 @@ impl Conn {
         // the connection lives, so it is never read again: polling it once
         // more would be a spin, not a wake-up.
         let woke = PollFlags::IN | PollFlags::HUP | PollFlags::ERR;
-        // A drained side the poll watched was empty until the poll returned,
-        // or it would have returned sooner; an unwatched one may fill unseen.
+        // A watched side poll did not report was empty when poll returned; one that
+        // was empty and woke it is dated at that return. An unwatched side may fill unseen.
         if !self.flags(false).contains(PollFlags::IN) {
             self.server_drained = false;
             self.server_held_back |= self.client.out_bytes >= MAX_QUEUE;
         } else {
+            if !server.intersects(woke) {
+                self.server_drained = true;
+            }
             if self.server_drained {
                 self.server_unread_since = now;
             }
@@ -752,16 +755,22 @@ mod tests {
             self.step_at(Instant::now())
         }
 
-        /// One round at `now`, as if every side the relay polls had woken it:
-        /// a side the relay would not poll for reading is not read.
+        // One round at `now`, each side ready as `poll` finds it at once.
         fn step_at(&mut self, now: Instant) -> Result<(), String> {
-            let client = self.conn.flags(true);
-            let server = self.conn.flags(false);
+            let ready = |side: &Side, flags: PollFlags| {
+                if flags.is_empty() {
+                    return PollFlags::empty();
+                }
+                let mut polled = [PollFd::from_borrowed_fd(side.fd.as_fd(), flags)];
+                poll(&mut polled, Some(&Timespec::default())).expect("poll");
+                polled[0].revents()
+            };
+            let client = ready(&self.conn.client, self.conn.flags(true));
+            let server = ready(&self.conn.server, self.conn.flags(false));
             self.conn
                 .service(client, server, &mut self.policy, &mut self.audit, now)
         }
 
-        /// Map the objects the gate tests talk through: a keyboard and an offer.
         fn map_input_and_offer(&mut self) {
             for (id, iface) in [(KEYBOARD, "wl_keyboard"), (OFFER, "wl_data_offer")] {
                 let index = tables::index_of(iface).expect("in the tables");
@@ -784,8 +793,7 @@ mod tests {
             rustix::io::write(&self.server, &message).expect("the compositor writes");
         }
 
-        /// The client asks for the selection; answers whether the request
-        /// reached the compositor.
+        // Whether the client's `receive` reached the compositor.
         fn paste(&mut self, now: Instant) -> bool {
             let receive = opcode("wl_data_offer", true, "receive");
             let mime = std::ffi::CString::new("text/plain").expect("no NUL");
@@ -807,7 +815,6 @@ mod tests {
             !self.recv_server().0.is_empty()
         }
 
-        /// Read everything the proxy has written to the client so far.
         fn drain_client(&mut self) {
             let mut buf = vec![0u8; 1 << 16];
             while let Ok(n) = rustix::io::read(&self.client, &mut buf[..]) {
@@ -862,13 +869,7 @@ mod tests {
         wired.step_at(start).expect("an idle round");
         // More than the cap aimed at the client, which reads none of it: the
         // proxy stops reading the compositor until the client drains.
-        let stall = vec![0u8; MAX_QUEUE + (1 << 20)];
-        wired.conn.client.out_bytes += stall.len();
-        wired.conn.client.out.push_back(Frame {
-            data: stall,
-            off: 0,
-            fds: Vec::new(),
-        });
+        queue_at_client(&mut wired, MAX_QUEUE + (1 << 20));
         wired.step_at(start).expect("the stall begins");
         assert!(!wired.conn.flags(false).contains(PollFlags::IN));
         wired.press_key();
@@ -906,7 +907,6 @@ mod tests {
         assert!(wired.paste(pressed + GATE_WINDOW), "{}", wired.log.text());
     }
 
-    /// Queue `len` bytes at a client that has not read them yet.
     fn queue_at_client(wired: &mut Wired, len: usize) {
         wired.conn.client.out_bytes += len;
         wired.conn.client.out.push_back(Frame {
@@ -914,6 +914,28 @@ mod tests {
             off: 0,
             fds: Vec::new(),
         });
+    }
+
+    #[test]
+    fn a_stall_that_held_nothing_back_leaves_later_input_its_own_date() {
+        let mut wired = wired(Gate::Paste);
+        wired.map_input_and_offer();
+        let start = Instant::now();
+        wired.step_at(start).expect("an idle round");
+        queue_at_client(&mut wired, MAX_QUEUE + (1 << 20));
+        wired.step_at(start).expect("the stall begins");
+        while !wired.conn.client.out.is_empty() {
+            wired.drain_client();
+            wired.step_at(start).expect("the client drains");
+        }
+        wired
+            .step_at(start)
+            .expect("reading resumes, nothing to read");
+        let pressed = start + Duration::from_secs(60);
+        wired.press_key();
+        wired.step_at(pressed).expect("the key is read");
+        wired.drain_client();
+        assert!(wired.paste(pressed), "{}", wired.log.text());
     }
 
     #[test]

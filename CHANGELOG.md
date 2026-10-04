@@ -39,8 +39,8 @@
   and read the clipboard up to a second after the moment it chose. For one
   second after a sandbox stops holding its connection back, input on it
   opens no clipboard read at all, since it may have waited in the
-  compositor's buffer: a paste within a second after an application froze
-  its own connection is refused once.
+  compositor's buffer: input on that connection opens no paste for one
+  second after reading resumes.
 
 ### Changed
 
@@ -61,7 +61,8 @@
 
 - A tablet pen touching down, lifting or pressing a button, and a tablet
   pad button press, now allow a paste under the Wayland clipboard gate like
-  a key press or a mouse click.
+  a key press or a mouse click; one sent as the pen enters or leaves a
+  window does not.
 - A stopped run is over by the first stop's deadline: a command that exits
   late in the grace no longer gives the exec'd children, the window manager
   and the X server a new five seconds each before they are killed.

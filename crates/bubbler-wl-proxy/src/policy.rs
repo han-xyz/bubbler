@@ -111,6 +111,14 @@ pub struct Connection {
     /// that is not in here was never advertised to this client, or was hidden
     /// from it, and cannot be bound.
     globals: HashMap<u32, Global>,
+    // Per tablet tool, what its unfinished frame held so far.
+    tool_frames: HashMap<u32, ToolFrame>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ToolFrame {
+    contact_or_button: bool,
+    proximity: bool,
 }
 
 /// One decoded message on its way through, with everything the policy needs to
@@ -180,8 +188,9 @@ impl Policy {
     /// What arms it: `wl_keyboard.key` pressed, `wl_pointer.button` either
     /// way, and `wl_touch.down` or `.up` — the release of each, because that
     /// is where a drag ends and where a paste is asked for. A tablet tool's
-    /// `down`, `up` and `button` arm the same way, a tablet pad's `button`
-    /// only when pressed. Input dated before the last one leaves it as it is.
+    /// `frame` arms the same way when it holds a `down`, `up` or `button` and
+    /// no `proximity_in` or `proximity_out`; a tablet pad's `button` only when
+    /// pressed. Input dated before the last one leaves it as it is.
     pub fn arm(&mut self, now: Instant) {
         self.last_input = self.last_input.max(Some(now));
     }
@@ -271,6 +280,9 @@ impl Policy {
             self.arm(now);
         }
         match (msg.interface.name, msg.message.name) {
+            ("zwp_tablet_tool_v1" | "zwp_tablet_tool_v2", name) => {
+                self.tool_event(msg, name, conn, now)
+            }
             ("wl_registry", "global") => return self.global(msg, conn),
             ("wl_registry", "global_remove") => return Self::global_remove(msg, conn),
             ("wl_display", "delete_id") => {
@@ -281,6 +293,27 @@ impl Policy {
             _ => {}
         }
         Action::Forward
+    }
+
+    // The compositor itself sends `down`, `up` and buttons in the frame of a
+    // `proximity_in` or `_out`, so only a frame without one arms.
+    fn tool_event(&mut self, msg: &Incoming<'_>, name: &str, conn: &mut Connection, now: Instant) {
+        let tool = msg.object;
+        match name {
+            "down" | "up" | "button" => {
+                conn.tool_frames.entry(tool).or_default().contact_or_button = true;
+            }
+            "proximity_in" | "proximity_out" => {
+                conn.tool_frames.entry(tool).or_default().proximity = true;
+            }
+            "frame" => {
+                let frame = conn.tool_frames.remove(&tool).unwrap_or_default();
+                if frame.contact_or_button && !frame.proximity && msg.input_arms {
+                    self.arm(now);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// `wl_registry.global`: hide what cannot be parsed or must not be
@@ -382,7 +415,6 @@ impl Policy {
     }
 }
 
-/// Whether an event is user input that arms the gate.
 fn is_user_input(msg: &Incoming<'_>) -> bool {
     match (msg.interface.name, msg.message.name) {
         // `state` is argument 3 of a key, and 1 is pressed. Both ends of
@@ -392,7 +424,6 @@ fn is_user_input(msg: &Incoming<'_>) -> bool {
         // second or more after the `down` that started it.
         ("wl_keyboard", "key") => matches!(msg.args.get(3), Some(Arg::Uint(1))),
         ("wl_pointer", "button") | ("wl_touch", "down" | "up") => true,
-        ("zwp_tablet_tool_v1" | "zwp_tablet_tool_v2", "down" | "up" | "button") => true,
         // `state` is argument 2 of a pad button, and 1 is pressed.
         ("zwp_tablet_pad_v2", "button") => matches!(msg.args.get(2), Some(Arg::Uint(1))),
         _ => false,
@@ -593,7 +624,9 @@ mod tests {
                 ],
                 ("wl_touch", "up") => vec![Arg::Uint(1), Arg::Uint(0), Arg::Int(0)],
                 (_, "down") => vec![Arg::Uint(1)],
-                (_, "up") => Vec::new(),
+                (_, "up" | "proximity_out") => Vec::new(),
+                (_, "proximity_in") => vec![Arg::Uint(1), Arg::Object(0), Arg::Object(0)],
+                (_, "frame") => vec![Arg::Uint(0)],
                 (_, "button") if iface.starts_with("zwp_tablet") => {
                     vec![Arg::Uint(1), Arg::Uint(0x14b), Arg::Uint(state)]
                 }
@@ -858,12 +891,6 @@ mod tests {
             ("wl_touch", "down", 0),
             // A touch drag drops on the release, not on the press.
             ("wl_touch", "up", 0),
-            ("zwp_tablet_tool_v2", "down", 0),
-            ("zwp_tablet_tool_v2", "up", 0),
-            ("zwp_tablet_tool_v2", "button", 1),
-            ("zwp_tablet_tool_v2", "button", 0),
-            ("zwp_tablet_tool_v1", "down", 0),
-            ("zwp_tablet_tool_v1", "button", 1),
             ("zwp_tablet_pad_v2", "button", 1),
         ] {
             let mut proxy = proxy();
@@ -881,6 +908,50 @@ mod tests {
         proxy.input("wl_keyboard", "key", 0);
         let (action, _read) = proxy.receive(10, "wl_data_offer", "text/plain");
         assert_eq!(action, Action::Drop);
+    }
+
+    #[test]
+    fn a_tablet_tool_frame_with_contact_or_a_button_opens_the_gate() {
+        for (iface, name, state) in [
+            ("zwp_tablet_tool_v2", "down", 0),
+            ("zwp_tablet_tool_v2", "up", 0),
+            ("zwp_tablet_tool_v2", "button", 1),
+            ("zwp_tablet_tool_v2", "button", 0),
+            ("zwp_tablet_tool_v1", "down", 0),
+            ("zwp_tablet_tool_v1", "button", 1),
+        ] {
+            let mut proxy = proxy();
+            proxy.input(iface, name, state);
+            proxy.input(iface, "frame", 0);
+            proxy.now += GATE_WINDOW;
+            let (action, _read) = proxy.receive(10, "wl_data_offer", "text/plain");
+            assert_eq!(action, Action::Forward, "{iface}.{name} state {state}");
+        }
+    }
+
+    #[test]
+    fn a_tablet_tool_frame_that_changes_proximity_opens_nothing() {
+        for iface in ["zwp_tablet_tool_v1", "zwp_tablet_tool_v2"] {
+            for frame in [
+                &[("proximity_in", 0), ("down", 0), ("button", 1)][..],
+                &[("button", 0), ("up", 0), ("proximity_out", 0)][..],
+            ] {
+                let mut proxy = proxy();
+                for (name, state) in frame {
+                    proxy.input(iface, name, *state);
+                }
+                proxy.input(iface, "frame", 0);
+                let (action, _read) = proxy.receive(10, "wl_data_offer", "text/plain");
+                assert_eq!(action, Action::Drop, "{iface}: {frame:?}");
+            }
+            let mut proxy = proxy();
+            proxy.input(iface, "proximity_in", 0);
+            proxy.input(iface, "frame", 0);
+            proxy.input(iface, "down", 0);
+            proxy.input(iface, "frame", 0);
+            let (action, _read) = proxy.receive(10, "wl_data_offer", "text/plain");
+            assert_eq!(action, Action::Forward, "{iface}: a later frame");
+        }
     }
 
     #[test]

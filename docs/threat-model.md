@@ -448,12 +448,18 @@ gates it instead. A `receive` on `wl_data_offer`,
 `ext_data_control_offer_v1` is forwarded only within one second of real
 user input — a `wl_keyboard.key` the compositor reported as pressed, a
 `wl_pointer.button` in either direction, a `wl_touch.down` or
-`wl_touch.up`, a tablet tool's (`zwp_tablet_tool_v1` or `_v2`) `down`,
-`up` or `button`, or a `zwp_tablet_pad_v2.button` reported as pressed —
-seen on any connection of that instance. Both ends of a
-press arm, so a drag that ends over a paste target arms on the release
-that ends it rather than only on the press that began it, however long
-the drag took. The second counts from the earliest moment the event could
+`wl_touch.up`, a tablet tool's (`zwp_tablet_tool_v1` or `_v2`) `frame`
+holding a `down`, `up` or `button`, or a `zwp_tablet_pad_v2.button`
+reported as pressed — seen on any connection of that instance. Both ends
+of a press arm, so a drag that ends over a paste target arms on the
+release that ends it rather than only on the press that began it, however
+long the drag took. A tablet frame that also holds a `proximity_in` or
+`proximity_out` arms nothing: the protocol has the compositor itself send
+`down` and held buttons when a pen already touching the tablet enters a
+surface, and `up` and releases when it leaves one, so a sandbox could
+otherwise arm the gate by moving its window under a pen in use elsewhere.
+A key held when keyboard focus arrives is only listed in
+`wl_keyboard.enter`, which arms nothing. The second counts from the earliest moment the event could
 have reached the proxy, not from when the proxy read it: the last instant
 the proxy saw the compositor's side of that connection empty (nothing
 left to read after a read), or was waiting on it in `poll` with nothing
@@ -465,11 +471,9 @@ stall is dated at the stall's start. Input can also wait in the
 compositor's own buffer, which the proxy cannot see, so for one second
 after the proxy resumes reading a connection the sandbox held back, input
 on that connection arms nothing at all, however short the stall. The cost:
-a paste within a second after an application froze its own connection is
-refused once. The event's own `time` argument is not used: the protocol
-leaves its clock undefined. Outside the window the
-request is not
-forwarded and the descriptor it carried is closed, so the client reads end
+input on that connection opens no paste for one second after reading
+resumes. The event's own `time` argument is not used: the protocol leaves
+its clock undefined. Outside the window the request is not forwarded and the descriptor it carried is closed, so the client reads end
 of file exactly as if the selection had been empty, and one line goes to
 the audit log:
 
@@ -509,7 +513,12 @@ only an audit line per read (lint `wayland-clipboard-open`, which wants a
 `lint-allow` reason), and `wayland "host"` has no proxy in front of it at
 all. Nothing here stops the sandbox *writing* the selection, and nothing
 here is a boundary against a compositor's own bugs. There is no per-MIME
-policy and no prompt.
+policy and no prompt. Input the compositor delays on its own — under load,
+or held in its buffer while the proxy reads a busy connection without
+stalling it — is dated when the proxy can first see it, and so may open
+the gate later than the input happened. The stalled-client case above was
+inferred from the protocol and the proxy's code, not reproduced against a
+live compositor.
 
 **Hard limits.** The proxy is bounded rather than trusting, and the
 bounds do not all do the same thing. Three of them end one connection,
