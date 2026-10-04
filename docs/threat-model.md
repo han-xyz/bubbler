@@ -1072,10 +1072,11 @@ permission manager matches the class the node was created with, and an
 entry the hook sets before the manager attaches does not survive the
 attach (both measured).
 
-Every camera node (`Video/Source`, `Video/Sink`, `Video/Duplex`) is
-hidden from every context, whatever its grant, together with its ports and
-links, the same way. So is every video stream (`Stream/Output/Video`,
-`Stream/Input/Video`) but to the client that made it, which keeps seeing
+Every camera node (`Video/` anywhere in its class: `Video/Source`,
+`Video/Sink`, `Video/Duplex`) is hidden from every context, whatever its
+grant, together with its ports and links, the same way. So is every video
+stream (`Stream/Output/Video`, `Stream/Input/Video`) but to the client
+that made it, which keeps seeing
 its own stream, its ports and its links; another client of the same
 sandbox does not see it. No audio grant covers a camera, and a sandbox
 reaches one through the camera portal. Until 0.26.0 every context saw

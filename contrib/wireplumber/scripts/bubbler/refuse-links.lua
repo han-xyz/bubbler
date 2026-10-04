@@ -563,10 +563,10 @@ end
 -- here, as no rule there can tell the sandbox's own from another's.
 local function hidden_from (client, node_props)
   local class = node_props ["media.class"] or ""
-  if class:find ("^Video/") then
+  if class:find ("Video/", 1, true) then
     return true
   end
-  if class:find ("^Stream/.*/Video$") then
+  if class:find ("Stream/", 1, true) and class:find ("/Video$") then
     return node_props ["client.id"] ~= tostring (client ["bound-id"])
   end
   return capture_capable (node_props) and not granted (client, "microphone")

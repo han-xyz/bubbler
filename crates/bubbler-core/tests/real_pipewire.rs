@@ -553,40 +553,49 @@ fn window_in_which_it_would_link(bed: &PipeWireBed, grant: &str) {
 
 /// Every node a stream can record from, by the markers that name it in a
 /// listing: what a context without the microphone grant may not see.
-const CAPTURE_NODES: [&str; 4] = [
+const CAPTURE_NODES: [&str; 5] = [
     SOURCE,
     r#"node.name = "virtual-source""#,
     r#"node.name = "duplex""#,
     r#"node.name = "odd-source""#,
+    r#"node.name = "stream-source""#,
 ];
 
-/// A class holding `Audio/Source` past its start, which the drop-in's
-/// unanchored match hides.
-const ODD_SOURCE_CLASS: &str = "Custom/Audio/Source";
+/// Classes holding `Audio/Source` past their start, which the drop-in's
+/// unanchored match hides, one of them also a stream's.
+const ODD_SOURCES: [(&str, &str); 2] = [
+    ("odd-source", "Custom/Audio/Source"),
+    ("stream-source", "Stream/Input/Audio/Source"),
+];
 
 /// The bed's `OTHER_SOURCES` added and a host recorder linked to the null
 /// source, so each capture node has ports and one has a link: the
 /// recorder, and the ids of every capture node.
 fn capture_nodes_with_a_link(bed: &PipeWireBed) -> (Streaming, Vec<String>) {
     add_other_sources(bed);
-    // Ports for a class the adapter does not know need
-    // `adapter.auto-port-config` (PipeWire 1.6.9).
-    let created = bed
-        .command("pw-cli")
-        .args([
-            "create-node",
-            "adapter",
-            &format!(
-                "{{ factory.name = support.null-audio-sink, node.name = odd-source, \
-                 media.class = {ODD_SOURCE_CLASS}, audio.position = \"FL,FR\", \
-                 object.linger = true, adapter.auto-port-config = {{ mode = dsp }} }}"
-            ),
-        ])
-        .output()
-        .expect("pw-cli did not run");
-    assert!(created.status.success(), "{created:?}");
-    wait_for("the odd source's ports", || {
-        bed.host_tool("pw-link", &["-io"]).contains("odd-source:")
+    for (name, class) in ODD_SOURCES {
+        // Ports for a class the adapter does not know need
+        // `adapter.auto-port-config` (PipeWire 1.6.9).
+        let created = bed
+            .command("pw-cli")
+            .args([
+                "create-node",
+                "adapter",
+                &format!(
+                    "{{ factory.name = support.null-audio-sink, node.name = {name}, \
+                     media.class = {class}, audio.position = \"FL,FR\", object.linger = true, \
+                     node.autoconnect = false, adapter.auto-port-config = {{ mode = dsp }} }}"
+                ),
+            ])
+            .output()
+            .expect("pw-cli did not run");
+        assert!(created.status.success(), "{created:?}");
+    }
+    wait_for("the odd sources' ports", || {
+        let ports = bed.host_tool("pw-link", &["-io"]);
+        ODD_SOURCES
+            .iter()
+            .all(|(name, _)| ports.contains(&format!("{name}:")))
     });
     let recorder = host_stream(
         bed,
@@ -875,10 +884,11 @@ fn a_microphone_context_sees_every_port_and_link_of_a_capture_node() {
 
 /// A camera's node of each class and another client's video stream, as
 /// the bed adds one null node of each.
-const VIDEO_NODES: [(&str, &str); 4] = [
+const VIDEO_NODES: [(&str, &str); 5] = [
     ("video-source", "Video/Source"),
     ("video-sink", "Video/Sink"),
     ("video-duplex", "Video/Duplex"),
+    ("odd-video-source", "Custom/Video/Source"),
     ("video-stream", "Stream/Output/Video"),
 ];
 

@@ -1346,7 +1346,7 @@ mod tests {
 
     /// The revision and a digest of the two policy files it was last set
     /// for.
-    const PINNED: (u32, u64) = (5, 1405857587386047328);
+    const PINNED: (u32, u64) = (5, 12795935190296801916);
 
     /// FNV-1a, 64 bit.
     fn digest(bytes: impl Iterator<Item = u8>) -> u64 {
