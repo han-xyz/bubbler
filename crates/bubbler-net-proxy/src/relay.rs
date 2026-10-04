@@ -1,12 +1,6 @@
 //! The blind half of the proxy: once a tunnel is up, bytes go across
 //! unread.
 //!
-//! RFC 9110 §9.3.6 asks for exactly this — a proxy that has answered
-//! `200` treats the connection "as a tunnel, simply forwarding octets
-//! in both directions without attempting to parse or modify" them. The
-//! payload is TLS the proxy has no key for in any case; what this loop
-//! owes the sandbox is not inspection but bounds.
-//!
 //! Each direction carries one buffer, and a side is read only while its
 //! buffer is empty, so neither peer can make the proxy hold more than
 //! two buffers however fast it writes. A direction whose source is done
@@ -112,27 +106,18 @@ pub fn run(client: TcpStream, upstream: TcpStream, idle: Duration) -> io::Result
     }
 }
 
-/// Whether a side is worth acting on for `want`.
-///
-/// A hangup or an error answers every wait, and the read or write that
-/// follows is what turns it into an end of stream or a broken pipe —
-/// so the caller acts on it exactly where it asked for something.
+// A hangup or an error answers every wait, and the read or write that
+// follows is what turns it into an end of stream or a broken pipe —
+// so the caller acts on it exactly where it asked for something.
 fn ready(asked: PollFlags, got: PollFlags, want: PollFlags) -> bool {
     asked.contains(want) && got.intersects(want | PollFlags::HUP | PollFlags::ERR)
 }
 
-/// One direction of the tunnel: the bytes in flight, and whether either
-/// end of it is finished.
 struct Dir {
-    /// What has been read and not yet written.
     buf: Box<[u8; CHUNK]>,
-    /// How much of `buf` holds bytes.
     len: usize,
-    /// How much of that has been written.
     off: usize,
-    /// The source will send nothing more, or cannot be read at all.
     source_done: bool,
-    /// The sink's write end is shut, or writing to it failed.
     sink_done: bool,
 }
 
@@ -149,32 +134,26 @@ impl Default for Dir {
 }
 
 impl Dir {
-    /// Whether bytes are waiting for the sink.
     fn pending(&self) -> bool {
         self.off < self.len
     }
 
-    /// Whether this direction is over.
     fn done(&self) -> bool {
         self.sink_done
     }
 
-    /// Read only while nothing is waiting: a peer that does not read
-    /// must not make the proxy hold more than one buffer for it.
+    // Read only while nothing is waiting: a peer that does not read
+    // must not make the proxy hold more than one buffer for it.
     fn wants_read(&self) -> bool {
         !self.source_done && !self.pending() && !self.sink_done
     }
 
-    /// Write while anything is waiting.
     fn wants_write(&self) -> bool {
         self.pending() && !self.sink_done
     }
 
-    /// Shut the sink's write end once the source is done and the last
-    /// byte has gone out.
-    ///
-    /// Only that half: the other direction may still be carrying an
-    /// answer, and closing the socket would take it with it.
+    // Only that half: the other direction may still be carrying an
+    // answer, and closing the socket would take it with it.
     fn close_sink(&mut self, sink: &TcpStream) {
         if self.sink_done || !self.source_done || self.pending() {
             return;
@@ -185,8 +164,7 @@ impl Dir {
         self.sink_done = true;
     }
 
-    /// Take a buffer's worth from the source. Called only while the
-    /// buffer is empty.
+    // Called only while the buffer is empty.
     fn read_from(&mut self, source: &TcpStream) -> bool {
         let mut source = source;
         match source.read(&mut self.buf[..]) {
@@ -209,7 +187,6 @@ impl Dir {
         }
     }
 
-    /// Hand the sink what is waiting.
     fn write_to(&mut self, sink: &TcpStream) -> bool {
         let mut sink = sink;
         match sink.write(&self.buf[self.off..self.len]) {
@@ -229,9 +206,9 @@ impl Dir {
         }
     }
 
-    /// A sink that cannot be written to ends this direction: the bytes
-    /// in hand have nowhere to go, and there is no shutdown left to
-    /// send.
+    // A sink that cannot be written to ends this direction: the bytes
+    // in hand have nowhere to go, and there is no shutdown left to
+    // send.
     fn give_up(&mut self) {
         self.source_done = true;
         self.off = self.len;
@@ -239,7 +216,6 @@ impl Dir {
     }
 }
 
-/// Whether an error means "not now" rather than "not at all".
 fn would_wait(err: &io::Error) -> bool {
     matches!(
         err.kind(),
