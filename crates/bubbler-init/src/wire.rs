@@ -22,8 +22,8 @@ fn invalid(msg: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
 
-/// Arm the socket with the time left until `deadline`, so a whole request,
-/// not merely one read, has to finish inside it.
+// Arm the socket with the time left until `deadline`, so a whole request,
+// not merely one read, has to finish inside it.
 fn arm(stream: &UnixStream, deadline: Instant) -> io::Result<()> {
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
@@ -32,8 +32,8 @@ fn arm(stream: &UnixStream, deadline: Instant) -> io::Result<()> {
     stream.set_read_timeout(Some(left))
 }
 
-/// `read_exact` that re-arms the timeout before every read, so a client
-/// trickling bytes cannot extend the deadline.
+// `read_exact` that re-arms the timeout before every read, so a client
+// trickling bytes cannot extend the deadline.
 fn read_exact_by(stream: &UnixStream, buf: &mut [u8], deadline: Instant) -> io::Result<()> {
     let mut done = 0;
     while done < buf.len() {
@@ -126,7 +126,6 @@ pub fn recv_request(
 pub struct Incoming {
     prefix: [u8; 4],
     have: usize,
-    /// Payload length, known once the prefix is whole.
     want: Option<usize>,
     payload: Vec<u8>,
     fds: Vec<OwnedFd>,
@@ -172,9 +171,8 @@ impl Incoming {
         }
     }
 
-    /// Read towards the length prefix; `Ok(true)` once it is whole. The
-    /// fds ride on it, so they are collected here and nowhere else: a
-    /// plain `read` of the payload discards ancillary data.
+    // The fds ride on the length prefix, so they are collected here and
+    // nowhere else: a plain `read` of the payload discards ancillary data.
     fn read_prefix(&mut self, stream: &UnixStream) -> io::Result<bool> {
         let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(REQUEST_FDS))];
         let mut anc = RecvAncillaryBuffer::new(&mut space);
@@ -214,9 +212,8 @@ impl Incoming {
     }
 }
 
-/// Whether the connection had nothing more to give right now. `EINTR` is
-/// counted with it: the caller polls again, and the signal is acted on by
-/// the loop that called in.
+// `EINTR` is counted with `WouldBlock`: the caller polls again, and the
+// signal is acted on by the loop that called in.
 fn would_block(e: &io::Error) -> bool {
     matches!(
         e.kind(),
