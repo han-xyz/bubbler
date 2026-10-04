@@ -1111,6 +1111,22 @@ The same rule refuses a sandboxed JACK client's own connections
 (`jack_connect` and the patchbay tools), so an audio application that
 wires its graph by hand plays only what WirePlumber links for it.
 
+WirePlumber saves a node's volume, mute and channel volumes under a key
+built from names the client chooses — the first of `application.id`,
+`application.name`, `media.name`, `node.name` (`node/store-stream-props`
+in its `state-stream.lua`) — and restores them to the next node of those
+names, so a sandbox's stream named like a host application could set that
+application's volume or mute it for good. Since 0.26.0 the hook ends that
+save for every node of an `org.bubbler` client, its streams and a
+`devices` instance's offered devices alike, and for every node carrying a
+`client.id` WirePlumber does not know yet, so a WirePlumber restart fails
+closed; a node with no `client.id` (a device the daemon or WirePlumber
+made) is the host's. The change itself still applies to the sandbox's
+node (measured in the test bed, WirePlumber 0.5.18: a host stream and a
+host sink keep the volume and mute the host saved after a sandbox's
+stream or offered sink of the same names was turned down or muted, and a
+host stream's own change is restored to the next host stream as before).
+
 Without that hook installed beside the drop-in the grant is scoped and
 every other client's audio is not: a capture stream asking for
 `stream.capture.sink` records the output mix, another client's stream is
@@ -1207,7 +1223,12 @@ device instead of the chosen one, or, where the sandbox's node is a plain
 stream named after a device that is absent at that moment, nowhere.
 Nothing is captured: every link to the sandbox is still refused. This is
 read from the script, not measured, and is to be measured and closed
-after 0.25.0. A change of the
+after 0.25.0. Two uses of the client-chosen key that saved levels are
+stored under are left as they are: a sandbox's stream named like a host
+application starts at the volume and mute that application saved (it
+reads them; it cannot change them), and a target the user picks for a
+sandbox's stream in a mixer is saved under that key, so the host
+application of the same names is later sent to that device. A change of the
 host's `node.features.audio.*` settings has WirePlumber reconfigure every
 session item it made (`node/create-item.lua`, `reconfigureAudioAdapters`)
 and register again the items the hook removed, until the rescan that

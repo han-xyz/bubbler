@@ -3679,3 +3679,289 @@ fn an_exclusive_contexts_stream_holds_the_sink_against_a_later_host_stream() {
         bed.links()
     );
 }
+
+/// The application name every node below carries: the first of the names
+/// stock WirePlumber keys a node's saved volume on (node/state-stream.lua
+/// `formKey`), so the host's nodes and the context's share one key.
+const SHARED_APP: &str = "shared-app";
+
+const NODE: &str = "type: PipeWire:Interface:Node";
+
+/// A node `pw-cat` makes: its direction, the class it is given, and its
+/// file.
+struct NodeKind {
+    direction: &'static str,
+    class: &'static str,
+    file: &'static str,
+}
+
+const PLAYBACK_STREAM: NodeKind = NodeKind {
+    direction: "-p",
+    class: "",
+    file: "-",
+};
+
+/// A sink without routes, which stock WirePlumber saves and restores as
+/// it does a stream.
+const ROUTELESS_SINK: NodeKind = NodeKind {
+    direction: "-r",
+    class: "media.class = Audio/Sink, ",
+    file: "/dev/null",
+};
+
+impl NodeKind {
+    fn props(&self, name: &str) -> String {
+        format!(
+            "{{ {}application.name = {SHARED_APP}, node.name = {name} }}",
+            self.class
+        )
+    }
+
+    fn on_the_host(&self, bed: &PipeWireBed, name: &str) -> Streaming {
+        host_stream(
+            bed,
+            &[self.direction, "-a", "-P", &self.props(name), self.file],
+        )
+    }
+
+    fn in_context(&self, bed: &PipeWireBed, context: &str, name: &str) -> Streaming {
+        Streaming(bed.spawn_in_context(
+            context,
+            &format!(
+                "pw-cat {} -a -P '{}' {} < /dev/zero",
+                self.direction,
+                self.props(name),
+                self.file
+            ),
+        ))
+    }
+}
+
+/// A node's volume and mute, as its `Props` parameter carries them: the
+/// volume of its first channel, which is what a mixer sets.
+#[derive(Debug, PartialEq)]
+struct Levels {
+    volume: f32,
+    mute: bool,
+}
+
+/// What the host's first node of `SHARED_APP` is set to and saved with.
+const SAVED: Levels = Levels {
+    volume: 0.8,
+    mute: false,
+};
+
+/// The `pw-cli` id of the node named `name`, once it is in the graph.
+fn node_id(bed: &PipeWireBed, name: &str) -> String {
+    let marker = format!("node.name = \"{name}\"");
+    let mut id = String::new();
+    wait_for(&format!("the node {name}"), || {
+        object(&bed.info_from_host(), &[NODE, &marker]).is_some_and(|node| {
+            id = node.id;
+            true
+        })
+    });
+    id
+}
+
+fn levels(bed: &PipeWireBed, name: &str) -> Levels {
+    let params = bed.host_tool("pw-cli", &["enum-params", &node_id(bed, name), "Props"]);
+    // An array's first element is printed two lines below its key, a
+    // scalar one line below.
+    let value = |key: &str| {
+        params
+            .lines()
+            .skip_while(|line| !line.contains(&format!("Props:{key} (")))
+            .map(str::trim)
+            .find(|line| line.starts_with("Float ") || line.starts_with("Bool "))
+            .map(str::to_owned)
+            .unwrap_or_else(|| panic!("no {key} in the Props of {name}:\n{params}"))
+    };
+    Levels {
+        volume: value("channelVolumes")
+            .strip_prefix("Float ")
+            .and_then(|volume| volume.parse().ok())
+            .expect("a float volume"),
+        mute: value("mute") == "Bool true",
+    }
+}
+
+/// Set `pod` on the node named `name` from the host, as a mixer does.
+fn set_levels(bed: &PipeWireBed, name: &str, pod: &str) {
+    bed.host_tool("pw-cli", &["set-param", &node_id(bed, name), "Props", pod]);
+}
+
+/// What the bed's WirePlumber has written of its saved stream state.
+fn saved_stream_state(bed: &PipeWireBed) -> String {
+    std::fs::read_to_string(bed.dir().join("state/wireplumber/stream-properties"))
+        .unwrap_or_default()
+}
+
+/// A bound, not a proof, as `window_in_which_it_would_link` is: nothing
+/// announces a save that did not happen, or a restore that set nothing.
+fn window_in_which_it_would_save() {
+    std::thread::sleep(Duration::from_secs(2));
+}
+
+/// Wait for the node named `name` and the window in which stock
+/// WirePlumber sets the levels it restores on a new node: saved ones, or
+/// defaults where none are, so a change made earlier would be undone.
+fn restored(bed: &PipeWireBed, name: &str) {
+    node_id(bed, name);
+    window_in_which_it_would_save();
+}
+
+/// A host node of `kind` set to `SAVED`, kept until WirePlumber has
+/// written it to its state, and gone.
+fn save_on_the_host(bed: &PipeWireBed, kind: &NodeKind) {
+    let _first = kind.on_the_host(bed, "host-first");
+    restored(bed, "host-first");
+    set_levels(bed, "host-first", "{ channelVolumes: [ 0.8, 0.8 ] }");
+    wait_for("the host node's volume in the saved state", || {
+        saved_stream_state(bed)
+            .lines()
+            .any(|line| line.contains(SHARED_APP) && line.contains("0.800000"))
+    });
+}
+
+/// A node of `kind` in a context carrying `context`, once `pod` set on
+/// it has changed its levels.
+fn changed_in_context(bed: &PipeWireBed, kind: &NodeKind, context: &str, pod: &str) -> Streaming {
+    let node = kind.in_context(bed, context, "sandboxed");
+    restored(bed, "sandboxed");
+    let untouched = levels(bed, "sandboxed");
+    set_levels(bed, "sandboxed", pod);
+    wait_for("the context's node changed", || {
+        levels(bed, "sandboxed") != untouched
+    });
+    node
+}
+
+/// The levels the next host node of `kind` has once WirePlumber would
+/// have restored them.
+fn next_host_levels(bed: &PipeWireBed, kind: &NodeKind) -> Levels {
+    let _next = kind.on_the_host(bed, "host-next");
+    restored(bed, "host-next");
+    levels(bed, "host-next")
+}
+
+/// A context's stream named like a host application and turned down
+/// leaves that application's saved volume as the host saved it.
+#[test]
+fn a_host_stream_keeps_its_volume_when_a_contexts_stream_of_its_name_is_turned_down() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    save_on_the_host(&bed, &PLAYBACK_STREAM);
+    let sandboxed = changed_in_context(
+        &bed,
+        &PLAYBACK_STREAM,
+        PLAYBACK,
+        "{ channelVolumes: [ 0.3, 0.3 ] }",
+    );
+    window_in_which_it_would_save();
+    drop(sandboxed);
+    assert_eq!(
+        next_host_levels(&bed, &PLAYBACK_STREAM),
+        SAVED,
+        "saved:\n{}",
+        saved_stream_state(&bed)
+    );
+}
+
+#[test]
+fn a_host_stream_keeps_its_mute_when_a_contexts_stream_of_its_name_is_muted() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    save_on_the_host(&bed, &PLAYBACK_STREAM);
+    let sandboxed = changed_in_context(&bed, &PLAYBACK_STREAM, PLAYBACK, "{ mute: true }");
+    window_in_which_it_would_save();
+    drop(sandboxed);
+    assert_eq!(
+        next_host_levels(&bed, &PLAYBACK_STREAM),
+        SAVED,
+        "saved:\n{}",
+        saved_stream_state(&bed)
+    );
+}
+
+/// What is not saved still takes effect on the context's own stream.
+#[test]
+fn a_contexts_stream_takes_the_volume_it_is_set_to() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let _sandboxed = changed_in_context(
+        &bed,
+        &PLAYBACK_STREAM,
+        PLAYBACK,
+        "{ channelVolumes: [ 0.3, 0.3 ] }",
+    );
+    window_in_which_it_would_save();
+    assert_eq!(
+        levels(&bed, "sandboxed"),
+        Levels {
+            volume: 0.3,
+            mute: false
+        }
+    );
+}
+
+#[test]
+fn a_host_streams_volume_is_restored_to_the_next_host_stream_of_its_name() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    save_on_the_host(&bed, &PLAYBACK_STREAM);
+    assert_eq!(next_host_levels(&bed, &PLAYBACK_STREAM), SAVED);
+}
+
+/// The same for a sink a `devices` context offers and a later host sink
+/// of its names.
+#[test]
+fn a_host_sink_keeps_its_volume_when_a_devices_contexts_sink_of_its_name_is_turned_down() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    save_on_the_host(&bed, &ROUTELESS_SINK);
+    let offered = changed_in_context(
+        &bed,
+        &ROUTELESS_SINK,
+        DEVICES,
+        "{ channelVolumes: [ 0.3, 0.3 ] }",
+    );
+    window_in_which_it_would_save();
+    drop(offered);
+    assert_eq!(
+        next_host_levels(&bed, &ROUTELESS_SINK),
+        SAVED,
+        "saved:\n{}",
+        saved_stream_state(&bed)
+    );
+}
+
+/// A context's stream turned down as WirePlumber restarts, when the
+/// WirePlumber that starts may know the stream before its client.
+#[test]
+fn a_host_stream_keeps_its_volume_when_a_contexts_stream_is_turned_down_across_a_restart() {
+    let Some(mut bed) = PipeWireBed::start() else {
+        return;
+    };
+    save_on_the_host(&bed, &PLAYBACK_STREAM);
+    let sandboxed = PLAYBACK_STREAM.in_context(&bed, PLAYBACK, "sandboxed");
+    restored(&bed, "sandboxed");
+    bed.restart_session_manager();
+    set_levels(&bed, "sandboxed", "{ channelVolumes: [ 0.3, 0.3 ] }");
+    wait_for("the context's node turned down", || {
+        levels(&bed, "sandboxed").volume == 0.3
+    });
+    window_in_which_it_would_save();
+    drop(sandboxed);
+    assert_eq!(
+        next_host_levels(&bed, &PLAYBACK_STREAM),
+        SAVED,
+        "saved:\n{}",
+        saved_stream_state(&bed)
+    );
+}

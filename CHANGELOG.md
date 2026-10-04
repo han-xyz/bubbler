@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.26.0
+
+### Security
+
+- WirePlumber no longer saves the volume or mute of a sandbox's streams or
+  offered devices: it keyed them by names the application chooses, so a
+  sandbox naming its stream like a host application set that application's
+  saved volume or mute. A sandbox's stream named like a host application
+  still starts at that application's saved volume.
+
 ## 0.25.0
 
 ### Security

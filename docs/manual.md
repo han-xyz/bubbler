@@ -685,7 +685,12 @@ one) plays nothing: its stream carries a link group, which a stream
 needs only as half of a filter. A stream WirePlumber restores to a saved
 target can be sent to the default device by a sandbox's node of the
 device's name, which "Audio" in `docs/threat-model.md` lists among what
-this does not cover. Before 0.24.2 a sandbox could still win
+this does not cover. WirePlumber does not remember a sandboxed
+application's volume or mute between runs, nor those of the devices a
+`devices` instance offers: it would save them under names the application
+chooses, which one of your applications may share. A sandboxed stream named
+like one of your applications still starts at that application's saved
+volume. Before 0.24.2 a sandbox could still win
 a link of its own in the first instant of a new connection, now and then,
 and keep it, and
 a sink it offered could become the default and take every host stream

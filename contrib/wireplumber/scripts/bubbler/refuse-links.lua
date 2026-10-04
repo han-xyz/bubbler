@@ -1,5 +1,5 @@
 -- bubbler's audio policy: the links WirePlumber may not make for a
--- sandbox.
+-- sandbox, and the levels it may not save of one.
 --
 -- Install as bubbler/refuse-links.lua in one of
 --   /usr/share/wireplumber/scripts/
@@ -77,6 +77,14 @@
 -- WirePlumber sees it, unless WirePlumber made it and it is one the
 -- hooks above would have let it make; one drawn in a patchbay is
 -- destroyed.
+--
+-- WirePlumber saves the volume, mute and channel volumes of no node of a
+-- sandbox, its streams and its offered devices alike, nor of a node whose
+-- client it does not know yet: they are saved under names the client
+-- chooses, which a host application's saved levels share. Two uses of
+-- those names are left to stock: a sandbox's stream named like a host
+-- application starts at that application's saved levels, and a target
+-- the user picks for it is saved under those names.
 
 local lutils = require ("linking-utils")
 local cutils = require ("common-utils")
@@ -411,6 +419,46 @@ SimpleEventHook {
           tostring (si.properties ["client.id"])))
       si:remove ()
     end
+  end
+}:register ()
+
+-- Whether the node belongs to a bubbler context or may: a node carrying a
+-- `client.id` WirePlumber does not know yet counts as a sandbox's, so a
+-- restart fails closed. A node with no `client.id` is the daemon's or
+-- WirePlumber's own.
+local function maybe_a_sandboxs (source, node_props)
+  local client_id = node_props ["client.id"]
+  if not client_id then
+    return false
+  end
+  return lookup (source, "client", client_id) == nil or
+      bubbler_client (source, client_id) ~= nil
+end
+
+-- Stock saves a node's volume, mute and channel volumes under a key built
+-- from names its client chooses (node/state-stream.lua formKey), and
+-- restores them to the next node of those names: a sandbox naming its
+-- node after a host application would set that application's volume.
+-- node/store-stream-props is the only hook on this event (WirePlumber
+-- 0.5.18).
+SimpleEventHook {
+  name = "bubbler/no-saved-state-from-a-sandbox",
+  before = "node/store-stream-props",
+  interests = {
+    EventInterest {
+      Constraint { "event.type", "=", "node-params-changed" },
+      Constraint { "event.subject.param-id", "=", "Props" },
+    },
+  },
+  execute = function (event)
+    local node = event:get_subject ()
+    if not maybe_a_sandboxs (event:get_source (), node.properties) then
+      return
+    end
+    log:debug (node, string.format ("not saving the levels of %s (client %s)",
+        tostring (node.properties ["node.name"]),
+        tostring (node.properties ["client.id"])))
+    event:stop_processing ()
   end
 }:register ()
 
