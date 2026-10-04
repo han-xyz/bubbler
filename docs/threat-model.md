@@ -219,8 +219,9 @@ it — a private home at `/home/bubbler`, an empty `$XDG_RUNTIME_DIR` at
 the host's path sharing the `/run` cap, since it is a directory `--dir`
 makes inside that tmpfs, and a cleared environment. bwrap itself stays as
 pid 1 in the sandbox, where every process can read `/proc/1/environ`, and
-`--clearenv` cleans only what bwrap starts; bubbler therefore starts every
-bwrap, a sidecar's included, with an empty environment, so
+`--clearenv` cleans only what bwrap starts (bubblewrap issue #725);
+bubbler therefore starts every bwrap, a sidecar's included, with an empty
+environment, so
 `/proc/1/environ` holds nothing of the caller's. `/proc/1/cmdline` is as
 readable, so bwrap reads its options from a sealed memfd through `--args`:
 its command line holds `--args <fd>` and the command, and neither the
@@ -2051,7 +2052,13 @@ never `$XDG_RUNTIME_DIR`, where every instance's control socket lives.
 bubbler creates the directory, never the sandbox, and opens it
 `O_NOFOLLOW` so a symlink planted where it belongs is refused. The id
 grammar — at least two `.`-separated elements — is what makes an id that
-names `bubbler`, `..` or a path impossible.
+names `bubbler`, `..` or a path impossible. An existing `app/<id>` is
+reused whatever its mode — a native KeePassXC leaves it at 0755 — since
+`$XDG_RUNTIME_DIR` being 0700 is what keeps it private. The `O_NOFOLLOW`
+check is point-in-time: bwrap binds by path and resolves the source again
+when it mounts. That window is not a hole: nothing a sandbox controls can
+write `app/`, and a host process that could is already bubbler's uid and
+needs no swapped symlink to reach anything.
 
 **Does not defend:** co-tenancy. `mode=rw` lets that sandbox unlink the
 socket its peers connect to and bind its own, or leave a symlink the peer
