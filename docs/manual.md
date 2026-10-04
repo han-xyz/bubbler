@@ -2409,11 +2409,13 @@ from the including file replace the included one — so a layer can relax a
 by key, `gamepad`'s `hidraw` and `uinput` are unioned one property at a time
 rather than the last layer deciding both, `dbus` and `system-bus` rules and
 `seccomp` lists are unioned, and `seccomp { disable }` in any layer disables
-the filter. One bus name may not end up with two policies — `talk` in one
-layer and `see` in another — which is an error naming the name, as it is
-inside a single node. `portals`, `notify`, `tray`, `mpris`, `a11y` and
-`input-method` need `dbus` in the merged result, not in every layer, so a layer
-may add `notify` to a `dbus` it includes.
+the filter. A share marked `optional=#true` in any layer stays optional, so a
+profile can relax a share it includes for a host that lacks the path: the
+included layer cannot know every host. One bus name may not end up with two
+policies — `talk` in one layer and `see` in another — which is an error naming
+the name, as it is inside a single node. `portals`, `notify`, `tray`, `mpris`,
+`a11y` and `input-method` need `dbus` in the merged result, not in every layer,
+so a layer may add `notify` to a `dbus` it includes.
 
 `create` and `try` write the flattened result, so `config.kdl` is one screen
 that says everything the sandbox will be granted. Flattening keeps no
