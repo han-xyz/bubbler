@@ -2244,7 +2244,9 @@ where it lies would, with the same checks and the same refusals, and writes
 nothing back.
 
 `$BUBBLER_TEST_ALLOW_PATH=<dir>` adds one more allowed root; it must be
-absolute and cannot be `/`. It exists so tests can share a temporary directory
+absolute and cannot be `/`, and is resolved so it compares against the canonical
+source; a path that does not exist is kept as written and therefore matches
+nothing. It exists so tests can share a temporary directory
 under the otherwise denied `/tmp`. It adds a root rather than switching the
 denylist off, and it cannot lift the ones your environment names: your home,
 `$XDG_RUNTIME_DIR`, the instance directory and the profile layer stay refused.
