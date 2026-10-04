@@ -981,7 +981,9 @@ The compositor keeps accepting connections on the context socket after
 bubbler's own connection to it is gone, until the descriptor it was given as
 `close_fd` hangs up. bubbler holds the write end of that pipe for the length of
 the run, so the context ends when the run does and the socket file goes with
-it.
+it. Metadata is set at most once each and nothing but `destroy` may follow
+`commit`, so the handshake is one-shot: bind the manager, create the
+listener, set the three strings, commit, destroy, roundtrip.
 
 `bubbler-wl-proxy` sits between the two sockets in a bwrap of its own, started
 before the sandbox and stopped with it. The listener it serves — the `wayland`
