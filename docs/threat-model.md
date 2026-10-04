@@ -762,6 +762,16 @@ host-side code running as your uid on your own bus: it is bubbler
 talking to your session, not the sandbox, which reaches that bus only
 through the proxy.
 
+The proxy gives a name the most permissive rule written for it, so the
+parser refuses a config whose rules would apply more widely than they
+read: a `talk`, `own` or every-interface `call`/`broadcast` on
+`org.freedesktop.portal.Desktop` or `.Documents` beside `portals`, which
+would undo its split; a `talk` or `own` covering a name a `call` or
+`broadcast` on the same bus filters; and an `own` covering
+`org.a11y.*`, `org.freedesktop.portal.*` or `org.freedesktop.impl.portal.*`,
+since the two host-bus calls above trust whoever owns `org.a11y.Bus` and
+`org.freedesktop.portal.Documents`. Across profile layers too.
+
 **Does not defend:** what the rules grant. `talk` to a service is talk to
 that service, and a service reachable through the bus is as trusted as
 the bus makes it; `bubbler lint` warns about the wide ones (a name owned

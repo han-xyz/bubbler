@@ -10867,6 +10867,27 @@ fn lint_on_an_instance_reads_its_own_config() {
     assert_eq!(code, 3);
 }
 
+#[test]
+fn a_talk_that_undoes_portals_is_refused_by_lint_and_run() {
+    let tmp = setup();
+    run(tmp.path(), &["create", "t"]);
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    std::fs::write(
+        &cfg,
+        "dbus {\n    talk \"org.freedesktop.portal.*\"\n}\nportals\ncommand \"/usr/bin/true\"\n",
+    )
+    .unwrap();
+    let want = "`talk \"org.freedesktop.portal.*\"` opens every portal interface, which undoes \
+                `portals`; for full portal access drop `portals` and keep the rule, otherwise \
+                drop the rule";
+    let (code, _, err) = run(tmp.path(), &["lint", "t"]);
+    assert_eq!(code, 3, "{err}");
+    assert!(err.contains(want), "{err}");
+    let (code, _, err) = run(tmp.path(), &["run", "t"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains(want), "{err}");
+}
+
 /// A stand-in pasta: it records the argv it was given, reports readiness
 /// on the `--pid` path exactly as pasta does — or never, with
 /// `FAKE_PASTA_HANG=1` — and then waits to be killed. What it proves is what bubbler does around the sidecar, not

@@ -13,6 +13,17 @@
   (`bubbler audio-policy --print` and `--print --script`), or update the
   package, and restart WirePlumber; until then each run with an audio grant
   warns that the running WirePlumber has not loaded this bubbler's policy.
+- A config is refused when its D-Bus rules would undo the `portals` split
+  (a `talk`, `own` or every-interface `call`/`broadcast` on the portal names
+  beside `portals`), silence a `call`/`broadcast` with a `talk` or `own` of the
+  same name, or `own` a name bubbler trusts on the host bus (`org.a11y.*`,
+  `org.freedesktop.portal.*`, `org.freedesktop.impl.portal.*`).
+
+### Changed
+
+- A config or profile that parsed before may now be refused with
+  ``bad argument for `dbus` ``: drop `portals` and keep the rule for full
+  portal access, or drop the rule the message names.
 
 ### Added
 

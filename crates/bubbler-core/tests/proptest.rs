@@ -188,13 +188,28 @@ fn bus_rules(own_allowed: bool) -> impl Strategy<Value = Vec<BusRule>> {
                     3 => BusRule::Call(name, member),
                     _ => BusRule::Broadcast(name, member),
                 };
-                let conflict = match rule.policy() {
-                    Some((name, level)) => out
-                        .iter()
-                        .filter_map(BusRule::policy)
-                        .any(|(held, was)| held == name && was != level),
-                    None => false,
+                // The parser refuses a `talk` or `own` beside a `call` or
+                // `broadcast` of the same name: the filter would be inert.
+                let wide = |r: &BusRule| match r {
+                    BusRule::Talk(n) | BusRule::Own(n) => Some(n.clone()),
+                    _ => None,
                 };
+                let narrow = |r: &BusRule| match r {
+                    BusRule::Call(n, _) | BusRule::Broadcast(n, _) => Some(n.clone()),
+                    _ => None,
+                };
+                let silenced = out.iter().any(|held| {
+                    (wide(&rule).is_some() && wide(&rule) == narrow(held))
+                        || (narrow(&rule).is_some() && narrow(&rule) == wide(held))
+                });
+                let conflict = silenced
+                    || match rule.policy() {
+                        Some((name, level)) => out
+                            .iter()
+                            .filter_map(BusRule::policy)
+                            .any(|(held, was)| held == name && was != level),
+                        None => false,
+                    };
                 if !conflict {
                     out.push(rule);
                 }

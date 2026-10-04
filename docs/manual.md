@@ -3357,6 +3357,22 @@ one point on an ordered ladder — SEE below TALK below OWN — and a
 `org.freedesktop.portal.Desktop` in a `--talk` as well would forward
 every call to it and leave the rules above as dead text.
 
+The same holds for a rule you write, so a config that grants `portals` is
+refused when any layer also has, on the session bus, a `talk` or `own` whose
+name covers `org.freedesktop.portal.Desktop` or `.Documents` (globs such as
+`org.freedesktop.portal.*` or `org.freedesktop.*` included), or a `call` or
+`broadcast` there whose method part is empty, `*`, or a glob covering every
+`org.freedesktop.portal.` interface (`=*`, `=*@/*`, `=@/<path>`,
+`=org.freedesktop.portal.*`):
+
+    bad argument for `dbus`: `talk "org.freedesktop.portal.*"` opens every portal interface, which undoes `portals`; for full portal access drop `portals` and keep the rule, otherwise drop the rule
+
+A profile names the layer each half came from. A narrow rule such as
+`call "org.freedesktop.portal.Desktop=org.freedesktop.portal.ScreenCast.*"`
+beside `portals` is accepted: it adds one interface and reads as that. More
+generally, a `talk` or `own` covering a name that a `call` or `broadcast` on
+the same bus filters is refused, since the filter would do nothing.
+
 The interfaces the bare node opens on the desktop object are
 `FileChooser`, `OpenURI`, `Notification`, `Settings`, `Print`, `Email`,
 `Trash`, `Account`, `Inhibit`, `ProxyResolver`, `NetworkMonitor`,
@@ -3440,6 +3456,12 @@ A rule grants exactly as much as it reads, and the globs are wide: `own
 "org.*"` claims every well-known name under `org.`, and `mpris name="*"` owns
 the whole `org.mpris.MediaPlayer2.` tree, so the sandbox can impersonate any
 player on the session bus. Name the application, not a prefix.
+
+`own` of a name covering `org.a11y.*`, `org.freedesktop.portal.*` or
+`org.freedesktop.impl.portal.*` is refused, a wider glob such as
+`org.freedesktop.*` or `org.*` included: bubbler trusts whoever owns
+`org.a11y.Bus` and `org.freedesktop.portal.Documents` on the host bus, and
+an `impl.portal` name is a portal backend.
 
 ### The system bus
 

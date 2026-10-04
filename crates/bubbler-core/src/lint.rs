@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use kdl::{KdlDocument, KdlNode};
 
 use crate::audio_policy::{self, LoadedRevision};
-use crate::config;
+use crate::config::{self, name_covers};
 use crate::desktop;
 use crate::env::{Env, SANDBOX_HOME};
 use crate::error::{LintError, ReadError};
@@ -530,7 +530,8 @@ const SECRETS_NAME: &str = "org.freedesktop.secrets";
 /// `org.freedesktop.Flatpak` has `Spawn`, `ca.desrt.dconf` writes the
 /// session's settings database, and an `org.freedesktop.impl.portal.*`
 /// name is the *backend* of a portal rather than the portal, so a
-/// sandbox owning or calling one answers the dialogs it should be shown.
+/// sandbox calling one answers the dialogs it should be shown. Owning
+/// one is refused by the parser.
 /// A trailing `.*` here is a family; a rule naming any member matches.
 const HOST_EXEC_NAMES: &[&str] = &[
     "org.freedesktop.systemd1",
@@ -563,19 +564,6 @@ const RISKY_NAMES: &[(&str, &str)] = &[
          partitioning between the applications that call it",
     ),
 ];
-
-/// Whether the name a rule writes reaches the name or family `listed`.
-/// Either side may end in `.*`, which stands for every name under the
-/// prefix: `talk "org.freedesktop.*"` reaches `org.freedesktop.systemd1`,
-/// and `org.freedesktop.impl.portal.*` is reached by naming any one of
-/// its members.
-fn name_covers(written: &str, listed: &str) -> bool {
-    let under = |glob: &str, name: &str| {
-        glob.strip_suffix('*')
-            .is_some_and(|prefix| name.starts_with(prefix))
-    };
-    written == listed || under(written, listed) || under(listed, written)
-}
 
 /// The two name checks, over every rule of every bus node. Read across
 /// both buses because the proxy is one process and the names mean the
@@ -3456,7 +3444,21 @@ mod tests {
         with(&host(), |ctx| {
             let text = "dbus {\n    talk \"org.freedesktop.portal.Desktop\"\n}";
             assert_eq!(ids(&lint(ctx, &[text])), ["portal-talk-without-portals"]);
-            assert_eq!(ids(&lint(ctx, &[text, "portals"])), [] as [&str; 0]);
+        });
+    }
+
+    /// Beside `portals` the same rule is no warning but a config the
+    /// parser refuses, and the run says so instead of a clean report.
+    #[test]
+    fn a_portal_talk_beside_the_portals_grant_fails_the_run() {
+        with(&host(), |ctx| {
+            let text = "dbus {\n    talk \"org.freedesktop.portal.Desktop\"\n}\nportals".to_owned();
+            let err = lint_text(ctx, Where::File("/p/0.kdl".into()), text).unwrap_err();
+            assert!(
+                matches!(&err, LintError::Config(crate::error::ConfigError::BadArgument { reason, .. })
+                    if reason.contains("undoes `portals`")),
+                "{err:?}"
+            );
         });
     }
 

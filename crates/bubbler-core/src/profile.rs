@@ -554,12 +554,29 @@ struct Merged {
     desktop: Option<(String, Src)>,
     lint_allows: Vec<(LintAllow, Src)>,
     disabled: Vec<(Disabled, Src)>,
+    // The merged bus node keeps only the last layer's source, and an
+    // error names the layer each rule came from.
+    bus_rule_srcs: Vec<(&'static str, BusRule, Src)>,
 }
 
 impl Merged {
     fn merge(&mut self, raw: &RawProfile, src: &Src) -> Result<(), ProfileError> {
         for svc in &raw.config.services {
             self.add_service(svc, src)?;
+            let (bus, rules) = match svc {
+                Service::Dbus { rules } => ("dbus", rules),
+                Service::SystemBus { rules } => ("system-bus", rules),
+                _ => continue,
+            };
+            for rule in rules {
+                if !self
+                    .bus_rule_srcs
+                    .iter()
+                    .any(|(b, r, _)| *b == bus && r == rule)
+                {
+                    self.bus_rule_srcs.push((bus, rule.clone(), src.clone()));
+                }
+            }
         }
         // Union by id, the later layer's reason winning, so a profile
         // that includes another can restate why it accepts a finding
@@ -968,6 +985,24 @@ impl Merged {
             origin: format!("flattened profile `{name}`"),
             source,
         };
+        let services: Vec<Service> = self.services.iter().map(|(s, _)| s.clone()).collect();
+        if let Some(clash) = config::bus_clash(&services) {
+            let at = |rule: &BusRule| {
+                self.bus_rule_srcs
+                    .iter()
+                    .find(|(b, r, _)| *b == clash.bus() && r == rule)
+                    .map_or_else(String::new, |(_, _, src)| format!(" in {}", src.label))
+            };
+            let portals_at = self
+                .services
+                .iter()
+                .find(|(s, _)| matches!(s, Service::Portals { .. }))
+                .map_or_else(String::new, |(_, src)| format!(" in {}", src.label));
+            return Err(bad(ConfigError::BadArgument {
+                node: clash.bus().to_owned(),
+                reason: clash.reason(at, &portals_at),
+            }));
+        }
         // Same order as `kdl_out::nodes`, so the nodes and their origins
         // stay in step; a unit test holds the two together.
         let mut origins = Vec::new();
@@ -3182,5 +3217,55 @@ mod tests {
                 assert!(out.contains(&skipped.to_owned()), "{name}: {out:?}");
             }
         }
+    }
+
+    fn clash(user: &[(&str, &str)]) -> String {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolver(tmp.path(), user, &[]);
+        let err = r.resolve("a").unwrap_err();
+        let ProfileError::Parse {
+            source: ConfigError::BadArgument { reason, .. },
+            ..
+        } = &err
+        else {
+            panic!("{err:?}")
+        };
+        reason.clone()
+    }
+
+    #[test]
+    fn a_rule_in_one_layer_that_undoes_portals_in_another_is_refused() {
+        let talk = "dbus {\n    talk \"org.freedesktop.portal.*\"\n}\n";
+        let portals = "dbus\nportals\n";
+        for (a, b) in [(talk, portals), (portals, talk)] {
+            let reason = clash(&[("a", &format!("include \"b\"\n{a}")), ("b", b)]);
+            let (rule_in, portals_in) = if a == talk {
+                ("a.kdl", "b.kdl")
+            } else {
+                ("b.kdl", "a.kdl")
+            };
+            assert!(
+                reason.contains("`talk \"org.freedesktop.portal.*\"` in ")
+                    && reason.contains(&format!("{rule_in} opens"))
+                    && reason.contains("`portals` in ")
+                    && reason.contains(&format!("{portals_in};"))
+                    && reason.contains("drop `portals`"),
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_talk_in_one_layer_that_silences_a_call_in_another_is_refused() {
+        let reason = clash(&[
+            ("a", "include \"b\"\ndbus {\n    talk \"a.b.*\"\n}\n"),
+            ("b", "dbus {\n    call \"a.b.C=a.b.C.Get\"\n}\n"),
+        ]);
+        assert!(
+            reason.contains("`talk \"a.b.*\"` in ")
+                && reason.contains("a.kdl leaves `call \"a.b.C=a.b.C.Get\"` in ")
+                && reason.contains("b.kdl inert"),
+            "{reason}"
+        );
     }
 }

@@ -43,6 +43,19 @@ name under `org.`; `mpris name="*"` lets the sandbox impersonate any player.
 Never `own "org.kde.*"` — it covers the tray watcher. Name the application.
 `bubbler lint` warns on `own-too-wide` and `mpris-wildcard`.
 
+The proxy gives a name the most permissive rule written for it, so three
+shapes are refused when the config is read, across profile layers too:
+
+- beside `portals`, a `talk` or `own` covering `org.freedesktop.portal.Desktop`
+  or `.Documents`, or a `call`/`broadcast` there whose method is empty, `*` or
+  a glob over every portal interface — it would undo the `portals` split. Drop
+  `portals` and keep the rule for full portal access, or drop the rule;
+- a `talk` or `own` covering a name a `call` or `broadcast` on the same bus
+  filters — the filter would do nothing;
+- `own` covering `org.a11y.*`, `org.freedesktop.portal.*` or
+  `org.freedesktop.impl.portal.*` (`org.freedesktop.*` and `org.*` included):
+  bubbler trusts whoever owns those names on the host bus.
+
 ## Names that are a way out
 
 Four session- or system-bus names are refused outright as
@@ -50,8 +63,9 @@ Four session- or system-bus names are refused outright as
 sandbox but no sandbox: `org.freedesktop.systemd1` starts a transient unit,
 `org.freedesktop.Flatpak` has `Spawn`, `ca.desrt.dconf` writes the session's
 settings database, and any `org.freedesktop.impl.portal.*` name is a portal
-*backend* rather than the portal itself, so a sandbox that can call or own
-one answers the dialogs a portal should be showing you. A trailing `.*` here
+*backend* rather than the portal itself, so a sandbox that can call one
+answers the dialogs a portal should be showing you (owning one is refused
+when the config is read). A trailing `.*` here
 is a family; a rule naming any member of it matches.
 
 Four more are defensible but wide enough that `bubbler lint` wants a reason
