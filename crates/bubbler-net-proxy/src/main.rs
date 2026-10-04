@@ -408,6 +408,7 @@ fn is_inward(ip: &IpAddr) -> bool {
     }
 }
 
+// Write the line for a request refused before it ever named a target.
 // The refusals that *do* name a target write their own line and must not
 // come through here twice.
 //

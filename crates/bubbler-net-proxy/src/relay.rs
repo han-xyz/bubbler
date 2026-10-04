@@ -118,6 +118,7 @@ struct Dir {
     len: usize,
     off: usize,
     source_done: bool,
+    // The sink's write end is shut, or writing to it failed.
     sink_done: bool,
 }
 
