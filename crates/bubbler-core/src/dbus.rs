@@ -728,9 +728,17 @@ fn ask_a11y_bus(env: &Env) -> Result<PathBuf, LaunchError> {
     // The address is not echoed, for the reason `address_path` does not
     // echo the variable's either: it is host input, and an address may
     // hold anything.
-    unix_path(OsStr::new(address.as_str())).ok_or_else(|| {
+    unix_path(OsStr::new(address.as_str())).map_err(|fault| {
         LaunchError::A11y(
-            "the address org.a11y.Bus returned is not a `unix:path=<path>` socket".to_owned(),
+            match fault {
+                AddressFault::NoPath => {
+                    "the address org.a11y.Bus returned is not a `unix:path=<path>` socket"
+                }
+                AddressFault::BadEscape => {
+                    "the address org.a11y.Bus returned has a bad `%XX` escape in its `unix:path=`"
+                }
+            }
+            .to_owned(),
         )
     })
 }
@@ -793,36 +801,61 @@ fn address_path(
     let Some(address) = address.filter(|a| !a.is_empty()) else {
         return Ok(None);
     };
-    match unix_path(address) {
-        Some(p) => Ok(Some(p)),
-        // The value itself is not echoed: it is host input, and an
-        // address may hold anything.
-        None => Err(LaunchError::BadValue {
-            service,
-            reason: format!(
-                "${var} names no Unix socket path; bubbler can proxy only a \
-                 `unix:path=<path>` address"
-            ),
-        }),
-    }
+    // The value itself is not echoed: it is host input, and an address
+    // may hold anything.
+    let reason = match unix_path(address) {
+        Ok(p) => return Ok(Some(p)),
+        Err(AddressFault::NoPath) => format!(
+            "${var} names no Unix socket path; bubbler can proxy only a \
+             `unix:path=<path>` address"
+        ),
+        Err(AddressFault::BadEscape) => format!(
+            "${var} has a bad `%XX` escape in its `unix:path=`; a `%` must be \
+             followed by two hex digits"
+        ),
+    };
+    Err(LaunchError::BadValue { service, reason })
 }
 
+/// Why an address list gave no socket path.
+#[derive(Debug, PartialEq, Eq)]
+enum AddressFault {
+    /// No `unix:` entry names a usable `path=` and no other socket key.
+    NoPath,
+    /// No entry was usable, and one `path=` has a `%` without two hex
+    /// digits after it.
+    BadEscape,
+}
+
+/// Keys of which a `unix:` entry names exactly one (the D-Bus
+/// specification, "Server Addresses").
+const UNIX_SOCKET_KEYS: [&[u8]; 5] = [b"path", b"abstract", b"runtime", b"dir", b"tmpdir"];
+
 /// Path of the first `unix:` entry of a `;`-separated D-Bus address list
-/// that names a `path=`, its `%XX` escapes undone; `None` when no entry
-/// names a usable one.
-fn unix_path(address: &OsStr) -> Option<PathBuf> {
-    address
-        .as_bytes()
-        .split(|b| *b == b';')
-        .filter_map(|entry| entry.strip_prefix(b"unix:"))
-        .find_map(|pairs| {
-            let value = pairs
-                .split(|b| *b == b',')
-                .find_map(|pair| pair.strip_prefix(b"path="))?;
-            let path = unescape_address_value(value)?;
-            (!path.is_empty() && !path.contains(&0))
-                .then(|| PathBuf::from(OsString::from_vec(path)))
-        })
+/// that names a `path=` and no other socket key, its `%XX` escapes undone.
+fn unix_path(address: &OsStr) -> Result<PathBuf, AddressFault> {
+    let mut fault = AddressFault::NoPath;
+    let entries = address.as_bytes().split(|b| *b == b';');
+    for pairs in entries.filter_map(|entry| entry.strip_prefix(b"unix:")) {
+        let mut socket_keys = pairs.split(|b| *b == b',').filter_map(|pair| {
+            let at = pair.iter().position(|b| *b == b'=')?;
+            let key = &pair[..at];
+            UNIX_SOCKET_KEYS
+                .contains(&key)
+                .then_some((key, &pair[at + 1..]))
+        });
+        let (Some((b"path", value)), None) = (socket_keys.next(), socket_keys.next()) else {
+            continue;
+        };
+        match unescape_address_value(value) {
+            Some(path) if !path.is_empty() && !path.contains(&0) => {
+                return Ok(PathBuf::from(OsString::from_vec(path)));
+            }
+            Some(_) => {}
+            None => fault = AddressFault::BadEscape,
+        }
+    }
+    Err(fault)
 }
 
 fn unescape_address_value(value: &[u8]) -> Option<Vec<u8>> {
@@ -1534,7 +1567,7 @@ mod tests {
             unix_path(OsStr::new(
                 "tcp:host=localhost,port=1;unix:abstract=/x;unix:path=/a;unix:path=/b"
             )),
-            Some(PathBuf::from("/a"))
+            Ok(PathBuf::from("/a"))
         );
     }
 
@@ -1542,7 +1575,7 @@ mod tests {
     fn an_address_key_may_come_after_the_path_or_before_it() {
         assert_eq!(
             unix_path(OsStr::new("unix:guid=deadbeef,path=/x")),
-            Some(PathBuf::from("/x"))
+            Ok(PathBuf::from("/x"))
         );
     }
 
@@ -1550,15 +1583,45 @@ mod tests {
     fn a_path_value_is_unescaped() {
         assert_eq!(
             unix_path(OsStr::new("unix:path=/run/a%2cb%3Bc%25d%20e%ff")),
-            Some(PathBuf::from(OsStr::from_bytes(b"/run/a,b;c%d e\xff")))
+            Ok(PathBuf::from(OsStr::from_bytes(b"/run/a,b;c%d e\xff")))
         );
-        for bad in [
-            "unix:path=/x%",
-            "unix:path=/x%2",
-            "unix:path=/x%zz",
-            "unix:path=%00",
+        for bad in ["unix:path=/x%", "unix:path=/x%2", "unix:path=/x%zz"] {
+            assert_eq!(
+                unix_path(OsStr::new(bad)),
+                Err(AddressFault::BadEscape),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            unix_path(OsStr::new("unix:path=%00")),
+            Err(AddressFault::NoPath)
+        );
+    }
+
+    #[test]
+    fn an_entry_naming_more_than_one_socket_key_is_passed_over() {
+        let mut e = env();
+        for (address, want) in [
+            ("unix:path=/a,abstract=/b;unix:path=/c", Some("/c")),
+            ("unix:path=/a,path=/b;unix:path=/c", Some("/c")),
+            ("unix:abstract=/b,path=/a", None),
         ] {
-            assert_eq!(unix_path(OsStr::new(bad)), None, "{bad}");
+            e.dbus_address = Some(address.into());
+            assert_eq!(host_bus(&e).ok(), want.map(PathBuf::from), "{address}");
+        }
+    }
+
+    #[test]
+    fn a_bad_escape_is_passed_over_and_named_when_nothing_else_is_usable() {
+        let mut e = env();
+        e.dbus_address = Some("unix:path=/x%zz;unix:path=/b".into());
+        assert_eq!(host_bus(&e).ok(), Some(PathBuf::from("/b")));
+        for bad in ["unix:path=/x%zz", "unix:path=/x%2;tcp:host=h,port=1"] {
+            e.dbus_address = Some(bad.into());
+            let Err(LaunchError::BadValue { reason, .. }) = host_bus(&e) else {
+                panic!("{bad} was accepted");
+            };
+            assert!(reason.contains("escape"), "{bad}: {reason}");
         }
     }
 
@@ -1592,7 +1655,7 @@ mod tests {
             argv[2],
             OsString::from("unix:path=/run/a%2cb%3bc%25d%3de%20f%ff/A-z_0.9*\\bus")
         );
-        assert_eq!(unix_path(&argv[2]).as_deref(), Some(host));
+        assert_eq!(unix_path(&argv[2]).ok().as_deref(), Some(host));
     }
 
     #[test]

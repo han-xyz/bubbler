@@ -114,7 +114,9 @@
   terminal, a full pipe) no longer stalls `bubbler-init`; the reason is
   dropped and the exit status still reports the refusal.
 - Bus addresses are read as D-Bus writes them: the first `unix:path=` of a
-  `;`-separated list, its keys in any order, `%XX` escapes undone. The
+  `;`-separated list, its keys in any order, `%XX` escapes undone. An entry
+  that also names `abstract=` or another socket key is passed over, and an
+  address whose only path has a bad escape is refused naming it. The
   address handed to `xdg-dbus-proxy` escapes the socket path, so a path
   holding `,`, `;` or `%` reaches the same socket bwrap binds.
 - A message that is not the reply no longer fails bubbler's own D-Bus calls
