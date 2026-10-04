@@ -44,15 +44,9 @@ pub struct ServiceCtx<'a> {
     pub init_bin: &'a Path,
 }
 
-/// Apply every service to `args`. `host` reports the type of a host path
-/// with symlinks followed, so tests run without real sockets. A
-/// [`Service::HomeShare`] `path` must be relative and a
-/// [`Service::PathShare`] `path` absolute, both normalised, exactly as the
-/// parser leaves them.
-///
-/// Every argument a service adds is tagged with the position of its node
-/// in `services`, including the two bound after the loop: the tag is set
-/// here, so no service has to carry one.
+/// Apply every service to `args`. A [`Service::HomeShare`] `path` must be
+/// relative and a [`Service::PathShare`] `path` absolute, both normalised,
+/// exactly as the parser leaves them.
 pub fn apply_all(
     services: &[Service],
     env: &Env,
@@ -86,14 +80,10 @@ pub fn apply_all(
             // overlapping shares must be refused before either is emitted.
             Service::PathShare { .. } => {}
             // Bound after the loop, so its whole-`/sys/devices` bind always
-            // follows the device directories `dri` binds under it rather
-            // than depending on the order of the two nodes in the file.
-            // The masks `dri` lays over the card directories are emitted
-            // after this bind again, in the builder's own late section.
+            // follows the device directories `dri` binds under it.
             Service::Gamepad { .. } => {}
             // Bound after the loop with `gamepad hidraw=#true`, which is
-            // the same grant written the older way: one bind, whether the
-            // config holds one node or both.
+            // the same grant written the older way.
             Service::Hidraw => {}
             // Rule-only bundles: they reach the sandbox through the proxy
             // the launcher starts, not through bwrap arguments.
@@ -107,8 +97,7 @@ pub fn apply_all(
         _ => None,
     });
     // One grant however it is written, and the name is the node an error
-    // points at: the bare one when the config holds both. Its arguments
-    // are attributed to that same node.
+    // points at: the bare one when the config holds both.
     let bare = services.iter().position(|s| *s == Service::Hidraw);
     let hidraw_node = match (bare, pad.is_some_and(|(_, h, _)| h)) {
         (Some(i), _) => Some(("hidraw", Origin::Service(i))),
@@ -173,7 +162,6 @@ pub(crate) fn require_file(
     require(host, service, path, "a regular file", |t| t.is_file())
 }
 
-/// The source must be a directory, e.g. a `/sys` subtree.
 fn require_dir(
     host: &dyn Host,
     service: &'static str,
@@ -182,9 +170,8 @@ fn require_dir(
     require(host, service, path, "a directory", |t| t.is_dir())
 }
 
-/// The source must be a tree or a file to bind: a socket or a device node
-/// under a shared path is a grant of its own kind, never a side effect of
-/// sharing a path.
+// A socket or a device node under a shared path is a grant of its own kind,
+// never a side effect of sharing a path.
 fn require_dir_or_file(
     host: &dyn Host,
     service: &'static str,
@@ -195,8 +182,8 @@ fn require_dir_or_file(
     })
 }
 
-/// The source may be of any type; only used where the user named the path
-/// in the config rather than the environment naming it.
+// Only used where the user named the path in the config rather than the
+// environment naming it.
 fn require_exists(
     host: &dyn Host,
     service: &'static str,
@@ -208,21 +195,6 @@ fn require_exists(
     }
 }
 
-/// The resolver configuration, and the host's network namespace where
-/// the node asked for it. The isolated mode needs nothing of bwrap beyond
-/// the baseline's `--unshare-all`; what connects it is the pasta sidecar
-/// the launcher starts once bwrap has reported the sandbox pid.
-///
-/// The bind is phase 4, so it lands inside the phase-2 tmpfs on `/etc`.
-/// A generated file rather than the host's, except under `"host"` with no
-/// `dns` child: the host's `/etc/resolv.conf` may name a resolver on its
-/// own loopback, which a sandbox with its own namespace can never reach.
-///
-/// An `allow-host` adds the two halves of the egress proxy that belong
-/// to the sandbox's own argv: the binary, bound where the sidecar execs
-/// it from after joining this mount namespace, and the seven variables
-/// that tell the application where it listens. The proxy process itself
-/// is the launcher's, like pasta.
 fn network(
     env: &Env,
     args: &mut BwrapArgs,
@@ -241,12 +213,8 @@ fn network(
         None => {}
     }
     if !cfg.allow_hosts.is_empty() {
-        // Bound whatever it is and wherever it was found: the installed
-        // path is visible in here anyway, and one path for every build
-        // keeps the argv the launcher execs and the argv `--explain`
-        // prints the same. A missing binary fails the launch here,
-        // before a sandbox is started that would be pointed at a proxy
-        // nothing runs.
+        // Bound whatever it is and wherever it was found: one path for every build
+        // keeps the argv the launcher execs and the argv `--explain` prints the same.
         let (program, _) = network::net_proxy_program(env, host)?;
         args.ro_bind(&program, Path::new(network::NET_PROXY_INSIDE));
         // The port is fixed ([`network::PROXY_PORT`]), so these are
@@ -259,9 +227,7 @@ fn network(
 }
 
 /// A compositor socket's name, refused unless it is exactly one path
-/// component: `$WAYLAND_DISPLAY` is untrusted host input, and an
-/// absolute or `..` name would otherwise decide what a bind mounts, or
-/// what endpoint the launcher hands its listening socket to. Everything
+/// component: `$WAYLAND_DISPLAY` is untrusted host input. Everything
 /// that uses the value goes through here first.
 pub(crate) fn check_wayland_display(value: Option<&OsStr>) -> Result<&OsStr, LaunchError> {
     let display = value.ok_or(LaunchError::MissingEnv {
@@ -284,20 +250,14 @@ pub(crate) fn check_wayland_display(value: Option<&OsStr>) -> Result<&OsStr, Lau
     Ok(display)
 }
 
-/// [`check_wayland_display`] on the run's [`Env`], the value every bind
-/// takes the socket name from. The launcher checks the process
-/// environment's own value separately: the Wayland client reads that one
-/// itself, and the two need not be the same string.
+/// [`check_wayland_display`] on the run's [`Env`]. The launcher checks the process
+/// environment's own value separately: the Wayland client reads that one itself.
 pub(crate) fn wayland_display(env: &Env) -> Result<&OsStr, LaunchError> {
     check_wayland_display(env.wayland_display.as_deref())
 }
 
-/// Bind a Wayland socket at `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`, which
-/// must be a plain socket name: the socket bubbler's own proxy accepts
-/// on for a sandboxed grant, the session's own socket for
-/// `wayland "host"`. Arch wiki (Bubblewrap/Examples) pattern.
-/// `XDG_SESSION_TYPE=wayland` only when X11 is not also granted, so
-/// toolkits do not get mixed signals.
+// `XDG_SESSION_TYPE=wayland` only when X11 is not also granted, so
+// toolkits do not get mixed signals.
 fn wayland(
     env: &Env,
     args: &mut BwrapArgs,
@@ -311,9 +271,8 @@ fn wayland(
         // The launcher creates this one after the argv is built, like the
         // proxied bus socket, so there is nothing here to probe.
         Some(WaylandPlan::Proxy { socket }) => args.ro_bind(socket, &inside),
-        // A missing plan is read as the session's socket: a caller that
-        // built the context by hand must not get a bind of a socket
-        // nobody is going to create.
+        // A missing plan is read as the session's socket: a caller that built the context by hand
+        // must not get a bind of a socket nobody is going to create.
         _ => {
             let sock = require_socket(host, "wayland", inside)?;
             args.ro_bind(&sock, &sock);
@@ -339,13 +298,6 @@ pub fn x11_display_number(display: &OsStr) -> Option<u32> {
     num.parse().ok()
 }
 
-/// `x11 "host"` binds the session's X11 socket at the same path (Arch
-/// wiki: binding to a different display number may not work) and any
-/// Xauthority file at the fixed inner path `/home/bubbler/.Xauthority`,
-/// so the host location stays hidden. The `$HOME/.Xauthority` fallback
-/// follows libX11's default, not the wiki, and is used only when it is a
-/// regular file. The nested mode binds nothing of the host's: the server
-/// is started inside the sandbox and `DISPLAY` names it.
 fn x11(
     env: &Env,
     args: &mut BwrapArgs,
@@ -353,20 +305,14 @@ fn x11(
     mode: &X11Mode,
 ) -> Result<(), LaunchError> {
     if let X11Mode::Nested(nested) = mode {
-        // Probed on the host because that is where the binary is read
-        // from: `/usr` is bound read-only, so a sandbox without
-        // `xorg-xwayland` installed outside has no server to start, and
+        // Probed on the host because that is where the binary is read from:
         // failing here beats a `DISPLAY` that names nothing.
         require_file(host, "x11", PathBuf::from(config::XWAYLAND))?;
         // The display number is fixed: the server is the only one in
-        // this sandbox, and `exec` children take the variable from the
-        // supervisor that started it. Nothing is bound and no cookie is
-        // handed over — an X client inside reaches no other display.
+        // this sandbox.
         args.setenv(OsStr::new("DISPLAY"), OsStr::new(":0"));
         // The window manager is not probed on the host: the supervisor
-        // resolves it on the sandbox's own `PATH`, and a name that
-        // resolves to nothing there is a line in its log rather than a
-        // launch that fails.
+        // resolves it on the sandbox's own `PATH`.
         args.x11_server(
             nested.xwayland_argv(),
             nested.wm.as_deref().map(OsString::from),
@@ -405,11 +351,6 @@ fn x11(
     Ok(())
 }
 
-/// Game controllers: `/dev/input` with device access, plus the `/sys`
-/// entries that identify a device and the udev database where the host
-/// has one. `/dev/input` is every input device, keyboards included.
-/// `hidraw` names the node the raw HID devices were granted by, when they
-/// were; `uinput` adds the injection node.
 fn gamepad(
     args: &mut BwrapArgs,
     host: &dyn Host,
@@ -419,14 +360,12 @@ fn gamepad(
     // The `hidraw` binds may belong to a `hidraw` node of its own, so the
     // tag this was called with is put back before the rest of the grant.
     let pad = args.origin();
-    // The directory, not the nodes it holds today, exactly as flatpak's
-    // `--device=input`: a node bound one by one freezes the device list at
-    // start, while the directory shows a controller plugged in later.
+    // The directory, not the nodes it holds today: a node bound one by one freezes the device
+    // list at start, while the directory shows a controller plugged in later.
     let dev = require_dir(host, "gamepad", PathBuf::from("/dev/input"))?;
     args.dev_bind(&dev, &dev);
-    // `/sys/class/input` entries are symlinks into `/sys/devices`, and a
-    // bluetooth or virtual controller lives outside the GPU directories
-    // `dri` exposes, so the whole tree is bound read-only.
+    // `/sys/class/input` entries are symlinks into `/sys/devices`, and a bluetooth or virtual
+    // controller lives outside the GPU directories `dri` exposes.
     for p in ["/sys/class/input", "/sys/devices"] {
         let p = require_dir(host, "gamepad", PathBuf::from(p))?;
         args.ro_bind(&p, &p);
@@ -458,15 +397,8 @@ fn gamepad(
     Ok(())
 }
 
-/// The `/dev/hidraw*` nodes the host has right now, plus the sysfs class
-/// directory that names them. `service` is the node this was granted
-/// by — `hidraw` or the older `gamepad hidraw=#true` — so an error
-/// names the line the user wrote.
-// There is no `/dev/hidraw` directory to bind instead, so the list is
-// whatever is plugged in when the sandbox starts: a device connected
-// later has no node inside. Nothing is refused when there are none —
-// hidraw nodes come and go with the hardware, and every one of them is a
-// HID device, not only a controller.
+// `service` is the node this was granted by — `hidraw` or the older
+// `gamepad hidraw=#true` — so an error names the line the user wrote.
 fn hidraw(args: &mut BwrapArgs, host: &dyn Host, service: &'static str) -> Result<(), LaunchError> {
     let dev = Path::new("/dev");
     for name in host.list_dir(dev) {
@@ -474,7 +406,6 @@ fn hidraw(args: &mut BwrapArgs, host: &dyn Host, service: &'static str) -> Resul
             continue;
         }
         let p = dev.join(&name);
-        // A name is not a node: only the character devices are bound.
         if host.file_type(&p).is_some_and(|t| t.is_char_device()) {
             // `-try`: the node is one this loop found a moment ago, and a
             // device unplugged before the exec must not fail the launch.
@@ -498,14 +429,6 @@ fn hidraw(args: &mut BwrapArgs, host: &dyn Host, service: &'static str) -> Resul
     }
 }
 
-/// Cameras. The bare grant reaches the sandbox through the portal on the
-/// bus and produces no argument at all; `nodes` adds the device half.
-///
-/// Without `portals` there is no `/.flatpak-info`, so the portal reads
-/// the sandbox as an ordinary process of the user and the permission it
-/// would store is the blanket one every unsandboxed process shares. The
-/// grant is refused here rather than quietly downgraded; the parser
-/// rejects that config already.
 fn camera(
     services: &[Service],
     args: &mut BwrapArgs,
@@ -532,21 +455,7 @@ fn camera(
     Ok(())
 }
 
-/// The V4L2 device nodes for a `camera nodes=#true`, plus the sysfs
-/// directories that name them and the udev database that identifies
-/// them. `udev` is false where another grant binds `/run/udev` already.
-/// Every one is emitted only where the host has it: a machine with no
-/// camera has none of them, and the portal half of the grant works
-/// either way, so a missing node is not a failed launch.
-// `/dev/media*` is bound beside `/dev/video*` because a UVC camera's
-// controls are a media controller device, not a V4L2 one.
-//
-// `/dev/v4l/by-id` and `by-path` hold relative symlinks (`../../video0`,
-// as udev writes them) onto the nodes bound above, so they resolve
-// inside. The `/sys` entries do not: `/sys/class/video4linux/videoN` and
-// `/sys/bus/media/devices/*` point into `/sys/devices`, which this grant
-// deliberately does not bind, so sysfs enumeration finds nothing. What
-// works inside is opening `/dev/videoN` directly.
+// `udev` is false where another grant binds `/run/udev` already.
 fn camera_nodes(args: &mut BwrapArgs, host: &dyn Host, udev: bool) -> Result<(), LaunchError> {
     let dev = Path::new("/dev");
     for name in host.list_dir(dev) {
@@ -555,16 +464,12 @@ fn camera_nodes(args: &mut BwrapArgs, host: &dyn Host, udev: bool) -> Result<(),
             continue;
         }
         let p = dev.join(&name);
-        // A name is not a node: only the character devices are bound.
         if host.file_type(&p).is_some_and(|t| t.is_char_device()) {
             // `-try`: the node is one this loop found a moment ago, and a
             // camera unplugged before the exec must not fail the launch.
             args.dev_bind_try(&p, &p);
         }
     }
-    // Identification only. `/run/udev/data` is a database read at
-    // enumeration time; the udev monitor behind it is a netlink socket,
-    // which delivers no uevents in the sandbox's own network namespace.
     let dirs: &[&str] = match udev {
         true => &[
             "/dev/v4l",
@@ -593,9 +498,6 @@ fn camera_nodes(args: &mut BwrapArgs, host: &dyn Host, udev: bool) -> Result<(),
     Ok(())
 }
 
-/// `/dev/uinput`, which is how a process creates input devices for the
-/// whole session. Warned about on every launch: the grant reaches out of
-/// the sandbox, so it is never a quiet one.
 fn gamepad_uinput(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
     let p = require(
         host,
@@ -612,20 +514,8 @@ fn gamepad_uinput(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchErr
     Ok(())
 }
 
-/// Bind the socket of this instance's own PipeWire security context
-/// where a client looks for one; clients find it through
-/// `$XDG_RUNTIME_DIR`, so no variable is needed.
-///
-/// The session's `pipewire-0` is not bound and neither is its manager
-/// socket: a client that arrives through the context is tagged with the
-/// instance and its grant set, which is what the session manager's
-/// policy acts on, and one that reached the session's own socket would
-/// be tagged with nothing.
-///
-/// The source is not probed, unlike every other bind of a host path: it
-/// exists only once the launcher's sidecar has created it, and a
-/// `--dry-run` names the path a run would bind with nothing started at
-/// all — exactly as [`dbus_socket`] names the proxy's.
+// The source is not probed: it exists only once the launcher's sidecar has created it, and a
+// `--dry-run` names the path a run would bind with nothing started at all.
 fn pipewire(
     env: &Env,
     args: &mut BwrapArgs,
@@ -640,29 +530,14 @@ fn pipewire(
     Ok(())
 }
 
-/// Require the tool every audio grant's context is created with. Checked
-/// where the argv is built, so a host without it fails a `--dry-run`
-/// too, and by name, so what a run reports is a missing package and not
-/// a shell inside a sidecar.
+// Checked where the argv is built, so a host without it fails a
+// `--dry-run` too.
 fn audio_context(host: &dyn Host) -> Result<(), LaunchError> {
     require_file(host, "pipewire", PathBuf::from(pipewire::PW_CONTAINER))?;
     Ok(())
 }
 
-/// Bind the socket of this instance's own PulseAudio server where a
-/// client looks for one, and set `PULSE_SERVER` to it.
-///
-/// The session's own pulse socket is not bound: that server is the
-/// session's, loads modules for whoever asks and knows nothing of this
-/// instance. The one bound here is a `pipewire-pulse` the launcher
-/// starts for this run alone, connected to the instance's security
-/// context, so every pulse client of the sandbox arrives on the daemon
-/// tagged like a native one — and it refuses to load a module.
-///
-/// The source is not probed, for the reason [`pipewire`]'s is not: it
-/// exists only once that sidecar has created it and the launcher has
-/// moved it out of the server's own directory, and a `--dry-run` names
-/// the path a run would bind with nothing started at all.
+// The source is not probed, for the reason [`pipewire`]'s is not.
 fn pulseaudio(
     env: &Env,
     args: &mut BwrapArgs,
@@ -670,9 +545,8 @@ fn pulseaudio(
     ctx: &ServiceCtx,
 ) -> Result<(), LaunchError> {
     audio_context(host)?;
-    // The module that makes the sidecar a pulse server, from a package
-    // of its own; named here so a host without it is a refusal that says
-    // what to install rather than a sidecar that never comes up.
+    // The module that makes the sidecar a pulse server, named here so a host without it is a
+    // refusal that says what to install rather than a sidecar that never comes up.
     require_file(host, "pulseaudio", PathBuf::from(pipewire::PULSE_MODULE))?;
     let inside = env.runtime_dir.join("pulse/native");
     args.ro_bind(&pipewire::pulse_socket(&ctx.instance_runtime), &inside);
@@ -682,14 +556,8 @@ fn pulseaudio(
     Ok(())
 }
 
-/// Bind the socket the launcher's `xdg-dbus-proxy` serves at the usual
-/// `$XDG_RUNTIME_DIR/bus` and point clients at it. The host bus is never
-/// bound; only the filtered socket is.
-///
-/// The source is not probed here, unlike every other bind: it exists only
-/// once the launcher has checked the proxy's socket and moved it out of
-/// the directory the proxy can write to. A `--dry-run` builds the same
-/// argv with no proxy running at all.
+// The source is not probed here: it exists only once the launcher has checked the proxy's
+// socket and moved it out of the directory the proxy can write to.
 fn dbus_socket(env: &Env, args: &mut BwrapArgs, ctx: &ServiceCtx) {
     let inside = env.runtime_dir.join("bus");
     args.ro_bind(
@@ -701,13 +569,7 @@ fn dbus_socket(env: &Env, args: &mut BwrapArgs, ctx: &ServiceCtx) {
     args.setenv(OsStr::new("DBUS_SESSION_BUS_ADDRESS"), &address);
 }
 
-/// Bind the socket the same proxy serves for the system bus at the path
-/// every client library compiles in, so no environment variable points at
-/// it. `/run` is a tmpfs this builder creates and the bind comes after it.
-///
-/// The source is not probed here for the same reason [`dbus_socket`]'s is
-/// not: it exists only once the launcher has moved the proxy's socket out
-/// of the proxy's reach.
+// The source is not probed here for the same reason [`dbus_socket`]'s is not.
 fn system_bus_socket(args: &mut BwrapArgs, ctx: &ServiceCtx) {
     args.ro_bind(
         &dbus::app_bus_path(&ctx.instance_runtime, dbus::SYSTEM_SOCKET),
@@ -715,20 +577,7 @@ fn system_bus_socket(args: &mut BwrapArgs, ctx: &ServiceCtx) {
     );
 }
 
-/// Bind the socket the same proxy serves for the accessibility bus at
-/// `$XDG_RUNTIME_DIR/at-spi/bus` and name it in `AT_SPI_BUS_ADDRESS`,
-/// which is where at-spi2's own clients look before they ask any bus for
-/// an address (`atspi-misc.c`). The host's accessibility socket is never
-/// bound; only the filtered one is, and what it filters is the fixed
-/// [`dbus::A11Y_RULES`].
-///
-/// The source is not probed here for the same reason [`dbus_socket`]'s is
-/// not: it exists only once the launcher has moved the proxy's socket out
-/// of the proxy's reach.
-///
-/// Without a plan holding that bus nothing ever creates the socket, so
-/// the grant is refused rather than quietly dropped; the parser rejects
-/// that config already.
+// The source is not probed here for the same reason [`dbus_socket`]'s is not.
 fn a11y(env: &Env, args: &mut BwrapArgs, ctx: &ServiceCtx) -> Result<(), LaunchError> {
     if !ctx.dbus.is_some_and(|p| p.a11y.is_some()) {
         return Err(LaunchError::BadValue {
@@ -747,32 +596,12 @@ fn a11y(env: &Env, args: &mut BwrapArgs, ctx: &ServiceCtx) -> Result<(), LaunchE
     Ok(())
 }
 
-/// Point the IBus client library at the sandboxed portal name instead of
-/// the daemon's own; fcitx5's Qt and GTK clients watch for their portal
-/// name by themselves. The rules that make either name reachable are the
-/// plan's, and neither daemon's main name — which carries `Exit`,
-/// `SetConfig` and their kin — is among them.
 // `ibusbus.c`: the library uses the portal when `IBUS_USE_PORTAL` is set
-// or `/.flatpak-info` exists. bubbler sets no IM module variable: the
-// toolkits pick the Wayland text-input protocol by themselves, and an
-// Xwayland application needs a profile's `env` to say which module.
+// or `/.flatpak-info` exists.
 fn input_method(args: &mut BwrapArgs) {
     args.setenv(OsStr::new("IBUS_USE_PORTAL"), OsStr::new("1"));
 }
 
-/// Bind `/.flatpak-info` so portals know the sandbox, and this instance's
-/// own view of the document portal — `$XDG_RUNTIME_DIR/doc/by-app/<app id>`
-/// on the host — at `$XDG_RUNTIME_DIR/doc`, the path the portal hands back
-/// for a picked file. Read-write: the portal strips write permission from
-/// every document it did not grant WRITE, so the bind adds no policy. Only
-/// the per-app subtree is bound; the mount root holds every app's
-/// documents. Without a mount there (no xdg-document-portal) the launch
-/// warns and runs with the identity file alone.
-///
-/// The bytes of `/.flatpak-info` come from the launcher's plan, which
-/// hands the proxy the same file. Without a plan there is no proxy and no
-/// bus, so the grant is refused rather than quietly dropped; the parser
-/// rejects that config already.
 fn portals(
     env: &Env,
     args: &mut BwrapArgs,
@@ -787,18 +616,12 @@ fn portals(
             reason: "requires dbus".to_owned(),
         })?;
     args.ro_bind_data(plan.flatpak_info.clone(), Path::new(dbus::FLATPAK_INFO));
-    // The identity file is also what makes gdk-pixbuf's glycin loaders
-    // look for `flatpak-spawn` on the default path (glycin 2.1.5,
-    // `libglycin-2.so`); without one GTK's icon loading fails an
-    // assertion and takes the application down with it. The shim runs
-    // the loader inside this sandbox, which is the trust level glycin's
-    // own sandbox-less fallback would have given it.
+    // The identity file is what makes gdk-pixbuf's glycin loaders look for `flatpak-spawn`
+    // (glycin 2.1.5, `libglycin-2.so`); without one GTK's icon loading fails an assertion.
     args.flatpak_spawn_shim(ctx.init_bin);
     let doc = env.runtime_dir.join("doc");
-    // `by-app/<app id>` itself is never probed: the FUSE creates it on
-    // the first lookup for any valid app id (xdg-desktop-portal,
-    // document-portal/document-portal-fuse.c, `ensure_by_app_inode`), so
-    // it is absent until something asks for it.
+    // `by-app/<app id>` itself is never probed: the FUSE creates it on the first lookup for any
+    // valid app id (`ensure_by_app_inode`), so it is absent until something asks for it.
     let mounted =
         host.file_type(&doc).is_some_and(|t| t.is_dir()) && host.is_mountpoint(&doc) == Some(true);
     if mounted {
@@ -815,9 +638,7 @@ fn portals(
 
 /// Emit profile/instance `env` pairs after all service variables, so a
 /// profile can layer toolkit settings on top. A [`RESERVED_ENV`] key is
-/// refused here as well as in the parser, so a caller building an
-/// [`crate::config::InstanceConfig`] by hand cannot override what the
-/// sandbox sets.
+/// refused here as well as in the parser.
 pub fn apply_env(pairs: &[(String, String)], args: &mut BwrapArgs) -> Result<(), LaunchError> {
     for (i, (k, v)) in pairs.iter().enumerate() {
         args.tag(Origin::Env(i));
@@ -832,11 +653,8 @@ pub fn apply_env(pairs: &[(String, String)], args: &mut BwrapArgs) -> Result<(),
     Ok(())
 }
 
-/// The canonical form of a host path a config named, accepted only if
-/// `probe` allows its type. Canonical is what the caller must bind:
-/// binding the path as written would mount whatever a symlink on it
-/// points at instead, and it is also the only form a policy check can be
-/// made on.
+// Canonical is what the caller must bind: binding the path as written would mount whatever
+// a symlink on it points at instead.
 fn resolve_source(
     host: &dyn Host,
     service: &'static str,
@@ -852,9 +670,8 @@ fn resolve_source(
     probe(host, service, real)
 }
 
-/// Resolve `src` and require that it stays under `root`; both are
-/// canonicalised, so a symlink cannot turn a grant inside `root` into a
-/// bind of something outside it. Returns the canonical source.
+// Both are canonicalised, so a symlink cannot turn a grant inside `root` into a bind of
+// something outside it.
 fn confine(
     host: &dyn Host,
     service: &'static str,
@@ -878,38 +695,24 @@ fn confine(
     Ok(real)
 }
 
-/// Host roots `path-share` never binds, whatever the config says. The
-/// baseline owns `/proc`, `/dev`, `/etc`, `/tmp`, `/var` and `/run`;
-/// `/usr` and `/opt` are already read-only mounts a phase-4 bind cannot
-/// nest inside; `/home` is what the private home replaces. flatpak
-/// refuses the same set in `dont_export_in` (`flatpak-exports.c`), and
-/// for the same reason: a share of one of these takes the sandbox apart.
+// flatpak refuses the same set in `dont_export_in` (`flatpak-exports.c`), and for the same
+// reason: a share of one of these takes the sandbox apart.
 const DENIED_ROOTS: &[&str] = &[
     "/proc", "/sys", "/dev", "/etc", "/usr", "/opt", "/home", "/tmp", "/var", "/run",
 ];
 
-/// Removable media, mounted here by udisks, is a real share target, so it
-/// is carved out of the `/run` denial. flatpak exposes the same path
-/// (`flatpak-context.c`).
+// flatpak exposes the same path (`flatpak-context.c`).
 const MEDIA_ROOT: &str = "/run/media";
 
-/// Which end of a share met a reserved root: the host path it resolves
-/// to, or the path inside the sandbox it would be bound at.
 #[derive(Clone, Copy)]
 enum End {
-    /// The canonical source.
     Source,
-    /// The path as written, which is where the bind lands.
+    // The path as written, which is where the bind lands.
     Destination,
 }
 
-/// The roots the environment names, each in resolved form as well: with a
-/// symlink anywhere on the way to one of them, only the resolved form
-/// matches the canonical source of a share, and only the written form
-/// matches its destination. The instance store and the profile layers are
-/// resolved on their own as well as under a resolved `$XDG_DATA_HOME` or
-/// `$XDG_CONFIG_HOME`, since either link alone moves them. A root that
-/// does not resolve is kept as written.
+// Each root in resolved form as well: only the resolved form matches the canonical source
+// of a share, and only the written form matches its destination.
 fn env_roots(host: &dyn Host, env: &Env) -> Vec<PathBuf> {
     let under = |dir: &Path| {
         host.canonicalize(dir)
@@ -921,26 +724,19 @@ fn env_roots(host: &dyn Host, env: &Env) -> Vec<PathBuf> {
         env.runtime_dir.clone(),
         env.data_home.join("bubbler"),
         under(&env.data_home),
-        // The user's profile layer. A sandbox that can write a profile
-        // there writes the config of every instance seeded from it
-        // afterwards, which is the break the instance store is denied for.
         env.config_home.join("bubbler"),
         under(&env.config_home),
     ];
-    // The system profile layer wherever `$BUBBLER_PROFILE_DIR` moved it:
-    // it is read as a layer at that path, so it is the same break as the
-    // user's own. The default `/usr/share/bubbler/profiles` needs no
-    // entry of its own — `/usr` is a fixed root, and read-only besides.
+    // The system profile layer wherever `$BUBBLER_PROFILE_DIR` moved it. The default
+    // `/usr/share/bubbler/profiles` needs no entry of its own — `/usr` is a fixed root.
     named.extend(env.profile_dir_override.clone());
     let resolved: Vec<PathBuf> = named.iter().filter_map(|p| host.canonicalize(p)).collect();
     named.into_iter().chain(resolved).collect()
 }
 
-/// The reserved root a share meets, at either end: the path is that root,
-/// is inside it, or is one of its ancestors. An ancestor is refused
-/// because binding it would cover the root with a mount of its own. The
-/// roots the environment names are checked first and on both ends, so
-/// neither the `/run/media` carve-out nor the test hook can lift them.
+// An ancestor counts: binding it would cover the root with a mount of its own. The roots the
+// environment names are checked first, so neither the `/run/media` carve-out nor the test
+// hook can lift them.
 fn denied_root(
     host: &dyn Host,
     env: &Env,
@@ -968,18 +764,15 @@ fn denied_root(
         .or_else(|| fixed_root(written, env).map(|root| (root, End::Destination)))
 }
 
-/// The fixed reserved root a path meets. `$BUBBLER_TEST_ALLOW_PATH` lifts
-/// all of them for one subtree, and `/run/media` is carved out of `/run`
-/// alone.
+// `$BUBBLER_TEST_ALLOW_PATH` lifts all of them for one subtree, and `/run/media` is carved
+// out of `/run` alone.
 fn fixed_root(path: &Path, env: &Env) -> Option<PathBuf> {
     if let Some(allow) = env.test_allow_path.as_deref()
         && path.starts_with(allow)
     {
         return None;
     }
-    // `/` is an ancestor of every root and every path is inside it, so
-    // only sharing `/` itself is what the entry can mean. `denied_root`
-    // already refused it; the check stays so this function stands alone.
+    // `denied_root` already refused `/`; the check stays so this function stands alone.
     if path == Path::new("/") {
         return Some(PathBuf::from("/"));
     }
@@ -991,8 +784,7 @@ fn fixed_root(path: &Path, env: &Env) -> Option<PathBuf> {
 }
 
 /// Why `path-share "<written>"` would be refused for meeting a reserved
-/// root, if it would. The launcher raises the same sentence as an error
-/// when it builds the argv; the linter reports it against the node, on a
+/// root, if it would. The linter reports it against the node, on a
 /// source that need not exist yet.
 pub(crate) fn reserved_reason(host: &dyn Host, env: &Env, written: &Path) -> Option<String> {
     let src = host
@@ -1002,7 +794,6 @@ pub(crate) fn reserved_reason(host: &dyn Host, env: &Env, written: &Path) -> Opt
     Some(denied_reason(written, &src, &root, end))
 }
 
-/// Why a share was refused, naming the end that met the root.
 fn denied_reason(written: &Path, src: &Path, root: &Path, end: End) -> String {
     match end {
         End::Destination => format!(
@@ -1028,18 +819,13 @@ fn denied_reason(written: &Path, src: &Path, root: &Path, end: End) -> String {
     }
 }
 
-/// Whether two paths are the same or one contains the other, compared
-/// component-wise so `/kioxiaa` is not inside `/kioxia`.
+// Component-wise, so `/kioxiaa` is not inside `/kioxia`.
 fn nested(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
 }
 
-/// Every `path-share` as (position in `services`, written destination,
-/// canonical source, mode), with the reserved roots and the overlap rule
-/// applied. bwrap applies binds in the order given, so two shares whose
-/// destinations nest would either fail (a read-only parent bound first)
-/// or silently hide one another; sharing one host tree twice is refused
-/// with them, so that file order stays irrelevant either way.
+// bwrap applies binds in the order given, so two shares whose destinations nest would either
+// fail (a read-only parent bound first) or silently hide one another.
 fn path_shares<'a>(
     services: &'a [Service],
     env: &Env,
@@ -1056,11 +842,8 @@ fn path_shares<'a>(
             continue;
         };
         let src = match resolve_source(host, "path-share", path, require_dir_or_file) {
-            // A missing optional source is a silent no-op rather than the
-            // launch error below: `--explain` is where the skip is
-            // reported. Matched on the missing path itself, the same way
-            // `home_share` is, so a source that fails to resolve for a
-            // reason other than "not there" still refuses the launch.
+            // A missing optional source is a silent no-op; matched on the missing path itself,
+            // so a source that fails to resolve for another reason still refuses the launch.
             Err(LaunchError::MissingResource { path: p, .. }) if *optional && p == *path => {
                 continue;
             }
@@ -1102,18 +885,6 @@ fn path_shares<'a>(
     Ok(shares)
 }
 
-/// Bind `$HOME/<path>` to `/home/bubbler/<path>`. The host path must exist,
-/// may be of any type and must resolve inside the real home; bubbler never
-/// creates directories in the real home. The roots bubbler keeps inside
-/// the home — the instance store and the profile layer — are refused in
-/// both modes, as they are for `path-share` and `--share`. Resolving and
-/// binding both happen by path, so a symlink swapped in between the two
-/// is not detected; that is inherent to bwrap path binds.
-///
-/// `optional` turns a missing source into a silent no-op rather than the
-/// launch error every other absent resource is: a profile can name a path
-/// only some installs of an app have, and `--explain` is where the skip
-/// is reported.
 fn home_share(
     env: &Env,
     args: &mut BwrapArgs,
@@ -1130,10 +901,8 @@ fn home_share(
         &written,
         "the home directory",
     ) {
-        // Matched on the missing path itself, not just the error kind: a
-        // `home-share` that cannot resolve because `$HOME` is gone is a
-        // much bigger problem than one absent optional entry, and stays
-        // the launch error it always was.
+        // Matched on the missing path itself: a `home-share` that cannot resolve because
+        // `$HOME` is gone stays the launch error it always was.
         Err(LaunchError::MissingResource { path, .. }) if optional && path == written => {
             return Ok(());
         }
@@ -1148,14 +917,9 @@ fn home_share(
     Ok(())
 }
 
-/// Bind every `--share` after the config's own services, each tagged with
-/// its position. A path under the real home lands at the same relative
-/// path in the private home, any other at its own path, and both under
-/// the reserved roots `path-share` is held to. The first share that is a
-/// directory
-/// becomes the working directory. A share the config already makes, one
-/// given twice, and one that contains or sits inside another share are
-/// all errors rather than a second bind of the same place.
+/// Bind every `--share` after the config's own services. The first share that is a directory
+/// becomes the working directory. A share the config already makes, one given twice, and one
+/// that contains or sits inside another share are all errors.
 pub fn apply_shares(
     services: &[Service],
     shares: &[Share],
@@ -1163,9 +927,6 @@ pub fn apply_shares(
     args: &mut BwrapArgs,
     host: &dyn Host,
 ) -> Result<(), LaunchError> {
-    // Without a flag there is nothing to check, and `share_plan` would
-    // resolve the config's own shares a second time only to compare them
-    // against nothing.
     if shares.is_empty() {
         return Ok(());
     }
@@ -1190,11 +951,8 @@ pub fn apply_shares(
     Ok(())
 }
 
-/// Every `--share` as (canonical source, destination), in the order the
-/// flags were given, once all of them have passed the checks the config
-/// nodes get. Nothing is bound until the last one has: a run refused
-/// halfway would otherwise be a sandbox built from the shares before the
-/// error.
+// Nothing is bound until the last one has passed: a run refused halfway would otherwise be a
+// sandbox built from the shares before the error.
 fn share_plan(
     services: &[Service],
     shares: &[Share],
@@ -1205,10 +963,7 @@ fn share_plan(
     let mut out: Vec<(PathBuf, PathBuf)> = Vec::new();
     for s in shares {
         let (src, dst) = share_paths(env, host, &s.path)?;
-        // The exact cases first: naming the same place twice is a
-        // mistake worth its own sentence, and the overlap rule below
-        // would otherwise answer for it in the general terms of two
-        // shares that contain one another.
+        // The exact cases first: naming the same place twice is a mistake worth its own sentence.
         if config.iter().any(|(_, d)| *d == dst) {
             return Err(LaunchError::BadValue {
                 service: "--share",
@@ -1241,13 +996,8 @@ fn share_plan(
     Ok(out)
 }
 
-/// Every share the config makes, as (canonical source, destination),
-/// each resolved the way the service that binds it resolves it: a
-/// symlink in the home makes the two sides of a `home-share` different
-/// paths, and the source is the side a `--share` of that symlink meets.
-// Only the two share nodes are listed. Another service that binds under
-// a share's destination is invisible to the overlap rule: today that is
-// `x11`, whose cookie lands at `/home/bubbler/.Xauthority`.
+// Only the two share nodes: another service binding under a share's destination is invisible
+// to the overlap rule (today `x11`'s cookie at `/home/bubbler/.Xauthority`).
 fn config_shares(
     services: &[Service],
     env: &Env,
@@ -1258,9 +1008,8 @@ fn config_shares(
         let Service::HomeShare { path, optional, .. } = s else {
             continue;
         };
-        // The name of the node that would be at fault, not of the flag:
-        // `apply_all` resolved this same path before us, so a failure
-        // here is the config's, not the caller's.
+        // The name of the node that would be at fault, not of the flag: `apply_all` resolved
+        // this same path before us.
         let written = env.home.join(path);
         let src = match confine(
             host,
@@ -1269,9 +1018,8 @@ fn config_shares(
             &written,
             "the home directory",
         ) {
-            // A missing optional source binds nothing, so it is not a
-            // share to check `--share` against either; `apply_all`'s
-            // `home_share` makes the same skip.
+            // A missing optional source binds nothing, so it is not a share to check
+            // `--share` against.
             Err(LaunchError::MissingResource { path: p, .. }) if *optional && p == written => {
                 continue;
             }
@@ -1285,10 +1033,7 @@ fn config_shares(
     Ok(out)
 }
 
-/// Why one `--share` overlaps another share, if it does: the same rule
-/// two `path-share` nodes are held to, in the same words. `None` where
-/// the two are unrelated, and where a share the config makes has no
-/// source to compare against.
+// The same rule two `path-share` nodes are held to, in the same words.
 fn overlap(src: &Path, dst: &Path, other_src: Option<&Path>, other_dst: &Path) -> Option<String> {
     let where_ = if nested(dst, other_dst) {
         String::new()
@@ -1307,12 +1052,6 @@ fn overlap(src: &Path, dst: &Path, other_src: Option<&Path>, other_dst: &Path) -
     ))
 }
 
-/// Source and destination of one `--share`: the source resolved and
-/// type-checked as `path-share` does, the destination by where the written
-/// path lies, and either way under the reserved roots the config nodes
-/// are held to. The path must be absolute and free of `.` and `..`, which
-/// is what the parser guarantees for a node and nothing guarantees for a
-/// flag; a path that is neither is refused rather than repaired here.
 fn share_paths(
     env: &Env,
     host: &dyn Host,
@@ -1325,11 +1064,8 @@ fn share_paths(
             reason: format!("{} is not absolute", written.display()),
         });
     }
-    // The config nodes are normalised at parse time; a flag is checked
-    // here instead. A `..` left in the path would walk out of every
-    // comparison below — the destination it is bound at is built from the
-    // path as written, so `$HOME/x/..` maps over the private home while
-    // comparing equal to nothing.
+    // A `..` left in the path would walk out of every comparison below: `$HOME/x/..` maps
+    // over the private home while comparing equal to nothing.
     if !comps.all(|c| matches!(c, Component::Normal(_))) {
         return Err(LaunchError::BadValue {
             service: "--share",
@@ -1356,11 +1092,6 @@ fn share_paths(
     Ok((src, written.components().collect()))
 }
 
-/// Refuse a share that maps into the private home and meets one of the
-/// roots bubbler keeps for itself there. `home-share` and a `--share` of
-/// a path under the real home land in the same place and are held to the
-/// same roots, so both come through here; `written` is the host path the
-/// entry names, which is what the message quotes back.
 fn deny_reserved_in_home(
     host: &dyn Host,
     env: &Env,
@@ -1379,9 +1110,8 @@ fn deny_reserved_in_home(
 }
 
 /// Why `home-share "<rel>"` would be refused for meeting one of the
-/// roots bubbler keeps inside the home, if it would. The launcher raises
-/// the same sentence as an error when it builds the argv; the linter
-/// reports it against the node, on a source that need not exist yet.
+/// roots bubbler keeps inside the home, if it would. The linter reports it
+/// against the node, on a source that need not exist yet.
 pub(crate) fn reserved_in_home_reason(host: &dyn Host, env: &Env, rel: &Path) -> Option<String> {
     let written = env.home.join(rel);
     let src = host
@@ -1392,22 +1122,16 @@ pub(crate) fn reserved_in_home_reason(host: &dyn Host, env: &Env, rel: &Path) ->
     Some(denied_reason(&written, &src, &root, end))
 }
 
-/// The reserved root a share that maps into the private home meets.
-/// [`denied_root`] cannot answer for one: the real home is a root of its
-/// own there and every path inside it is nested with it, so what is left
-/// to check is the roots that lie *within* the home — the instance store
-/// and the profile layer, wherever XDG puts them — and the private home
-/// itself as a destination. Ancestors count, as they do for `path-share`:
-/// binding one covers the root beneath it.
+// [`denied_root`] cannot answer here: the real home is a root of its own and every path
+// inside it is nested with it, so the home itself is left out of the roots checked.
 fn denied_root_in_home(
     host: &dyn Host,
     env: &Env,
     canonical: &Path,
     dst: &Path,
 ) -> Option<(PathBuf, End)> {
-    // The private home first, so that a share of the whole real home is
-    // named by what it would cover rather than by whichever root inside
-    // it happens to be found first.
+    // The private home first, so that a share of the whole real home is named by what it
+    // would cover.
     if dst == Path::new(SANDBOX_HOME) {
         return Some((PathBuf::from(SANDBOX_HOME), End::Destination));
     }
@@ -1419,10 +1143,6 @@ fn denied_root_in_home(
         .map(|root| (root, End::Source))
 }
 
-/// Bind one host `/etc` entry read-only at `/etc/<name>`, on top of the
-/// baseline allowlist. The entry must resolve inside `/etc`, so a symlink
-/// there cannot pull an unrelated part of the host into the sandbox; the
-/// names the sandbox generates itself were rejected by the parser.
 fn etc_share(args: &mut BwrapArgs, host: &dyn Host, name: &OsStr) -> Result<(), LaunchError> {
     let etc = Path::new("/etc");
     let dst = etc.join(name);
@@ -1431,24 +1151,15 @@ fn etc_share(args: &mut BwrapArgs, host: &dyn Host, name: &OsStr) -> Result<(), 
     Ok(())
 }
 
-/// Where one `app-runtime` id's directory lives, on the host and inside
-/// the sandbox alike. The same path on both sides is the whole point:
-/// KeePassXC, and every other user of the convention, computes
-/// `$XDG_RUNTIME_DIR/app/<id>` from its own environment and would look
-/// somewhere else if bubbler moved it.
+/// Where one `app-runtime` id's directory lives, on the host and inside the sandbox alike:
+/// KeePassXC, and every other user of the convention, computes `$XDG_RUNTIME_DIR/app/<id>`
+/// from its own environment.
 pub(crate) fn app_runtime_dir(env: &Env, id: &str) -> PathBuf {
     env.runtime_dir.join("app").join(id)
 }
 
-/// Bind the shared directory of one application id at that same path.
-/// Only the leaf is bound, never `app/` and never the runtime directory,
-/// so no id reaches another one's directory or `bubbler/`, where every
-/// instance's control socket is.
-///
-/// The source is not probed here: the launcher creates it and checks it
-/// with `O_NOFOLLOW` right before the sandbox starts, which is the only
-/// order in which the check means anything. Nothing is probed on a
-/// `--dry-run` either, where no directory has been created.
+// The source is not probed here: the launcher creates it and checks it with `O_NOFOLLOW`
+// right before the sandbox starts, which is the only order in which the check means anything.
 fn app_runtime(env: &Env, args: &mut BwrapArgs, id: &str, mode: ShareMode) {
     let dir = app_runtime_dir(env, id);
     match mode {
@@ -1457,13 +1168,8 @@ fn app_runtime(env: &Env, args: &mut BwrapArgs, id: &str, mode: ShareMode) {
     }
 }
 
-/// bwrap operations that create a path inside the sandbox, and how many
-/// arguments stand between the flag and that path. `--perms`, `--size`
-/// and `--overlay-src` may precede the flag inside one operation, so the
-/// flag is looked for rather than assumed to be first. `--overlay` and
-/// `--ro-overlay` are here for completeness though the builder emits
-/// neither; a test holds every flag the builder can emit to either this
-/// list or the one of flags that create nothing.
+// `--perms`, `--size` and `--overlay-src` may precede the flag inside one operation. A test
+// holds every flag the builder can emit to this list or the one of flags that create nothing.
 const CREATES: &[(&str, usize)] = &[
     ("--bind", 2),
     ("--bind-try", 2),
@@ -1485,8 +1191,6 @@ const CREATES: &[(&str, usize)] = &[
     ("--ro-overlay", 1),
 ];
 
-/// The path one operation creates inside the sandbox, or `None` for an
-/// operation that creates none.
 fn destination(op: &Explained) -> Option<&OsStr> {
     for (i, arg) in op.args.iter().enumerate() {
         if let Some((_, at)) = CREATES.iter().find(|(flag, _)| arg == OsStr::new(flag)) {
@@ -1496,22 +1200,15 @@ fn destination(op: &Explained) -> Option<&OsStr> {
     None
 }
 
-/// The trees an application inside the sandbox may write, read off the
-/// argv itself: each is a bind whose destination the sandbox can create
-/// files in, paired with the host directory behind it. Read-only binds
-/// are here too — one id's `app-runtime` directory is writable by
-/// whichever other instance names the same id, and a link planted there
-/// is planted for this run as well.
+// Read-only binds are here too: one id's `app-runtime` directory is writable by whichever
+// other instance names the same id.
 fn writable_trees(ops: &[Explained], env: &Env) -> Vec<(PathBuf, PathBuf, &'static str)> {
     let app = env.runtime_dir.join("app");
     let doc = env.runtime_dir.join("doc");
     let mut out = Vec::new();
     for op in ops {
-        // The flag is looked for rather than assumed first: the builder
-        // emits prefixed operations — `--perms 0700 --bind src dst` — and
-        // a tree read off only the bare three-element shape would be
-        // dropped silently, taking the sweep of everything under it with
-        // it. [`destination`] reads an operation the same way.
+        // The flag is looked for rather than assumed first: the builder emits prefixed
+        // operations — `--perms 0700 --bind src dst`.
         let Some(i) = op
             .args
             .iter()
@@ -1537,29 +1234,9 @@ fn writable_trees(ops: &[Explained], env: &Env) -> Vec<(PathBuf, PathBuf, &'stat
     out
 }
 
-/// Refuse the launch when a path the argv has bwrap create sits behind a
-/// symlink inside a tree the application can write.
-///
-/// bubblewrap below 0.12.0 creates the parents of a destination without
-/// checking for links on the way, so an application that plants
-/// `Downloads -> /oldroot/<victim>` in its own home has the next launch
-/// write into `<victim>` outside the sandbox (GHSA-pxhw-h44j-8pfx,
-/// reproduced on 0.11.2). The sweep runs whatever version the host has:
-/// it costs one `lstat` per component and it is the mitigation the
-/// warning points at.
-///
-/// Every component of the destination's path relative to its tree is
-/// `lstat`ed at the tree's real location on the host, the last one
-/// included — the destination itself is what bwrap creates. A component
-/// that cannot be `lstat`ed refuses the run as well: bwrap creates the
-/// destination as root of its user namespace, past a mode that stops
-/// bubbler, so an unreadable directory is not a clean one. Nothing is
-/// deleted: what planted the link is what the user has to see.
-///
-/// No lock keeps a concurrently running instance of the same sandbox
-/// from planting a link between this check and bwrap's own `mkdir`;
-/// only bwrap 0.12.0 and later closes that window, which is what the
-/// version warning points at.
+/// Refuse the launch when a path the argv has bwrap create sits behind a symlink inside a
+/// tree the application can write (GHSA-pxhw-h44j-8pfx). A component that cannot be
+/// `lstat`ed refuses the run as well; nothing is deleted.
 pub fn sweep_destinations(
     ops: &[Explained],
     env: &Env,
