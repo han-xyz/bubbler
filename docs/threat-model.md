@@ -2160,9 +2160,7 @@ no `--cap-add`, `bwrap(1)` leaves no capability by default, and
 `/proc/self/status` inside `bwrap --unshare-all` shows all five sets 0
 (measured on bwrap 0.13.0), so there is nothing to drop. A capability a
 newer kernel adds past those 41 stays in the bounding set wherever it
-was. A bounding-set entry is not a held capability: with the permitted,
-inheritable and ambient sets empty and `PR_SET_NO_NEW_PRIVS` set, no
-`execve` from `bubbler-init` or its children gains one.
+was.
 What prevents regaining a capability is the rest: with `no_new_privs` set, `execve` grants nothing
 the process could not have done without the `execve`
 (`PR_SET_NO_NEW_PRIVS(2const)`); with the permitted and effective sets
@@ -2188,6 +2186,8 @@ convenience channel, not a boundary, and the manual says so.
 `a_start_waiting_on_the_lock_ends_when_stopped`,
 `an_exec_is_refused_once_the_run_is_stopping`,
 `sighup_and_sigquit_end_the_run_with_the_same_grace_as_sigterm`,
+`a_supervisor_holding_cap_setpcap_leaves_its_command_no_capability_at_all`,
+`a_supervisor_without_cap_setpcap_still_runs_its_command_without_capabilities`,
 `real_bwrap_exec_round_trip`
 
 ### Desktop entries and PATH shims
