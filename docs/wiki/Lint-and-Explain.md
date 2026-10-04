@@ -66,9 +66,10 @@ claim the microphone grant; names each file and what writes it again, and
 purpose), `audio-policy-not-loaded` (both files installed, and the running
 WirePlumber has not loaded this bubbler's policy or holds another revision,
 which it names: the grant is not enforced as configured until `systemctl
---user restart wireplumber`; a note instead, naming why, where WirePlumber
-could not be asked — no `pw-dump`, no daemon, no readable answer within two
-seconds; not reported beside `audio-policy-missing` or an
+--user restart wireplumber`; a warning that the loaded policy could not be
+verified, naming why, where PipeWire answered but the answer could not be
+read; a note instead, naming why, where WirePlumber could not be asked — no
+`pw-dump`, no daemon, no answer within two seconds; not reported beside `audio-policy-missing` or an
 `audio-policy-differs` that is not accepted, and its `lint-allow` silences
 the run warning too).
 

@@ -6836,6 +6836,11 @@ fn audio_policy_is_silent_before_a_real_run_with_the_whole_policy_installed() {
 }
 
 fn stderr_on_bed(bed: &common::bed::PipeWireBed, config: &str, args: &[&str]) -> String {
+    stderr_asking(("XDG_RUNTIME_DIR", &bed.dir().join("run")), config, args)
+}
+
+/// The same with `(name, value)` in the environment instead of a bed's runtime directory.
+fn stderr_asking((name, value): (&str, &Path), config: &str, args: &[&str]) -> String {
     let tmp = setup();
     install_audio_policy(tmp.path(), true, true);
     // `x11 "host"` ends the run on the test root's missing `$DISPLAY`, after the warnings and
@@ -6848,11 +6853,7 @@ fn stderr_on_bed(bed: &common::bed::PipeWireBed, config: &str, args: &[&str]) ->
         &config,
     )
     .unwrap();
-    let out = bubbler(tmp.path())
-        .env("XDG_RUNTIME_DIR", bed.dir().join("run"))
-        .args(args)
-        .output()
-        .unwrap();
+    let out = common::output_past_a_busy_exec(bubbler(tmp.path()).env(name, value).args(args));
     let err = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(err.contains("x11 \"host\" grants no isolation"), "{err}");
     assert_eq!(out.status.code(), Some(1), "{err}");
@@ -6915,6 +6916,25 @@ fn a_run_under_a_wireplumber_of_another_revision_names_it() {
 }
 
 #[test]
+fn a_run_whose_loaded_policy_could_not_be_read_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tool = tmp.path().join("pw-dump");
+    let over = bubbler_core::audio_policy::DUMP_CAP + 1;
+    std::fs::write(
+        &tool,
+        format!("#!/bin/sh\nhead -c {over} /dev/zero | tr '\\0' ' '\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let err = stderr_asking(("BUBBLER_PW_DUMP", &tool), "pipewire\n", &["run", "t"]);
+    assert!(
+        err.contains("bubbler: warning: the audio policy the running WirePlumber loaded could not be verified"),
+        "{err}"
+    );
+    assert!(err.contains("printed more than"), "{err}");
+}
+
+#[test]
 fn profile_lint_of_every_profile_asks_wireplumber_once() {
     let tmp = setup();
     install_audio_policy(tmp.path(), true, true);
@@ -6926,7 +6946,7 @@ fn profile_lint_of_every_profile_asks_wireplumber_once() {
     std::fs::write(
         &tool,
         format!(
-            "#!/bin/sh\necho asked >> '{}'\necho '[]'\n",
+            "#!/bin/sh\necho asked >> '{}'\necho 'not a dump'\n",
             asked.display()
         ),
     )

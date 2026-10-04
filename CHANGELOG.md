@@ -76,7 +76,9 @@
   bubbler's audio policy, or has loaded another revision of it, and name
   `systemctl --user restart wireplumber`; `bubbler lint` reports
   `audio-policy-not-loaded` (a note where WirePlumber could not be asked), and
-  `--explain` shows the loaded state beside the installed one.
+  `--explain` shows the loaded state beside the installed one. Where PipeWire
+  answers but its answer cannot be read, the run and the lint warn that the
+  loaded policy could not be verified.
 
 ### Fixed
 

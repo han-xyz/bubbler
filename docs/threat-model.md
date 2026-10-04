@@ -1380,22 +1380,31 @@ running one enforces whatever it loaded before, or nothing. Since 0.26.0
 the hook publishes its `policy revision` as metadata `bubbler-policy`
 (key `revision`, subject 0), and for an instance with an audio grant and
 both files installed as this bubbler ships them (or a differing copy
-accepted with `lint-allow`), bubbler runs `pw-dump` against
-the session's PipeWire when a `run`, `try` or `open` starts a new
+accepted with `lint-allow`), bubbler runs `pw-dump
+PipeWire:Interface:Metadata` against the session's PipeWire when a `run`, `try` or `open` starts a new
 sandbox (joining a running instance does not ask), for `bubbler lint` and
 for `--explain`: absent metadata or another revision is a
 `bubbler: warning:` naming `systemctl --user restart wireplumber`, and an
-`audio-policy-not-loaded` lint warning. What that proves: a client of the
-session's PipeWire published that revision, which is what the hook does
-once WirePlumber has loaded it. What it does not: that the publisher is
-WirePlumber — any host process of the user's can create metadata of that
-name, and the host is trusted (boundary 4). A sandbox can neither see
-the metadata nor create one of that name (bed test
-`no_context_sees_or_makes_the_policys_metadata`), so it cannot silence
-the warning. Where the question gets no answer — no `pw-dump`, no
-daemon, nothing readable within two seconds — the run warns nothing and lint
-notes it: an unknown is not reported as a stale policy. The run goes on
-in every case.
+`audio-policy-not-loaded` lint warning; no revision is asked once more
+half a second later, since WirePlumber publishes it a moment after it
+starts. What that proves: a client of the session's PipeWire published
+that revision, which is what the hook does once WirePlumber has loaded it.
+What it does not: that the publisher is WirePlumber — any host process of
+the user's can create metadata of that name, and the host is trusted
+(boundary 4). The dump names each object's `client.id`, but whether a
+creator can set that itself is not measured, so bubbler does not rely on
+it; two or more metadata objects of that name read as another revision and
+warn. A sandbox can neither see the metadata nor create one of that name
+(bed test `no_context_sees_or_makes_the_policys_metadata`). What a sandbox
+does shape is its own streams, and `pw-dump`'s pattern also matches a
+node's `object.path`, so a stream can put itself in the answer with any
+properties: bubbler skips every object that is not a metadata of the
+expected shape, and an answer that is too large (over 1 MiB), cut short at
+two seconds or not a dump is a warning that the loaded policy could not be
+verified, not silence. Only where the question gets no answer at all — no
+`pw-dump`, no daemon, nothing within two seconds — does the run warn
+nothing and lint note it: an unknown is not reported as a stale policy.
+The run goes on in every case.
 
 The private pulse server closes a gap the context alone cannot: a pulse
 client can `LOAD_MODULE` a server into loading `module-native-protocol-tcp`

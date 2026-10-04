@@ -1359,6 +1359,18 @@ fn audio_policy_not_loaded(ctx: &Context, sources: &[Source], f: &mut Findings) 
         );
         return;
     }
+    if let Some(cause) = loaded.unverified() {
+        f.push(
+            i,
+            node,
+            &AUDIO_POLICY_NOT_LOADED,
+            format!("{cause}: whether this `{name}` grant is enforced as configured is not known"),
+            &format!(
+                "lint again; where this repeats, run {restart}, which loads the installed policy"
+            ),
+        );
+        return;
+    }
     let Some(cause) = loaded.not_loaded() else {
         return;
     };
@@ -4082,6 +4094,21 @@ mod tests {
     }
 
     #[test]
+    fn a_loaded_policy_that_could_not_be_read_is_a_warning_naming_why() {
+        let reason = "/usr/bin/pw-dump printed more than 1048576 bytes";
+        let loaded = LoadedRevision::Unreadable(reason.to_owned());
+        let report = lint_loaded(&whole_policy(), loaded, &["pipewire"]);
+        assert_eq!(ids(&report), ["audio-policy-not-loaded"]);
+        let finding = &report.findings[0];
+        assert_eq!(finding.severity, Severity::Warning);
+        assert!(
+            finding.message.contains("could not be verified"),
+            "{finding:?}"
+        );
+        assert!(finding.message.contains(reason), "{finding:?}");
+    }
+
+    #[test]
     fn the_loaded_policy_is_asked_only_of_an_audio_grant_with_the_whole_policy() {
         let e = env();
         let path = [PathBuf::from("/usr/bin")];
@@ -4120,6 +4147,7 @@ mod tests {
         for loaded in [
             LoadedRevision::Absent,
             LoadedRevision::Unknown("x".to_owned()),
+            LoadedRevision::Unreadable("x".to_owned()),
         ] {
             let report = lint_loaded(
                 &whole_policy(),

@@ -747,8 +747,13 @@ is printed: rewriting it comes before the restart. `lint-allow
 "audio-policy-not-loaded" reason="..."` silences the run warning as well as
 the lint; a copy kept older on purpose needs it beside the
 `audio-policy-differs` one, since WirePlumber then loads that older copy. Where WirePlumber cannot be asked
-(no `pw-dump`, no daemon on the socket, no readable answer within two seconds) a
-run says nothing and `bubbler lint` notes it. The run goes on in every case.
+(no `pw-dump`, no daemon on the socket, no answer within two seconds) a
+run says nothing and `bubbler lint` notes it. Where PipeWire answered but the
+answer could not be read (more than 1 MiB, cut short at two seconds, not a
+dump) a run warns that the loaded policy could not be verified, naming why,
+and `bubbler lint` warns the same. An answer of no revision is asked once more
+half a second later, since WirePlumber publishes it a moment after it starts.
+The run goes on in every case.
 The first check reads the search directories (`$XDG_CONFIG_HOME`,
 `$XDG_CONFIG_DIRS`, `$XDG_DATA_HOME`, `$XDG_DATA_DIRS`) from bubbler's own
 environment, which can differ from the one WirePlumber was started with. An ALSA client reaches the same
@@ -3177,8 +3182,9 @@ silences the warning on `run` and `open`),
 files installed, and the running WirePlumber has not loaded this bubbler's
 policy, or has loaded another `policy revision`, which it names: the grant
 is not enforced as configured until `systemctl --user restart wireplumber`.
-A note instead, naming why, where WirePlumber could not be asked: no
-`pw-dump`, no daemon, or no readable answer within two seconds).
+A warning too, naming why, where PipeWire answered but the answer could not
+be read; a note instead, naming why, where WirePlumber could not be asked: no
+`pw-dump`, no daemon, or no answer within two seconds).
 
 **Notes** are information and fail nothing: `app-runtime-rw` (a shared
 application runtime directory granted `mode=rw`, so the sandbox can replace the

@@ -27,7 +27,6 @@ wayrs-client.workspace = true
 wayrs-protocols.workspace = true
 unicode-width.workspace = true
 libc.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]

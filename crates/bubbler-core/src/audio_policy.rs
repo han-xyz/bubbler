@@ -7,13 +7,13 @@
 //! revision the running WirePlumber has loaded.
 
 use std::cell::OnceCell;
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread::JoinHandle;
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde_json::Value;
 
 use crate::config::InstanceConfig;
 use crate::env::Env;
@@ -362,10 +362,18 @@ const REVISION_LINE: &str = "local POLICY_REVISION = ";
 /// revision unknown.
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 
-// A session graph's dump is tens to hundreds of KiB.
-const DUMP_CAP: u64 = 16 * 1024 * 1024;
+/// The most of [`PW_DUMP`]'s output [`loaded_revision`] reads; more is
+/// [`LoadedRevision::Unreadable`].
+// The bed's metadata objects printed 11.6 KiB (PipeWire 1.6.9); a session holds more of them.
+pub const DUMP_CAP: usize = 1024 * 1024;
 
+// The type `pw-dump` is asked for. Its pattern also matches a node's `object.path`, which any
+// client sets, so the answer can hold objects of any shape (PipeWire 1.6.9).
 const METADATA_TYPE: &str = "PipeWire:Interface:Metadata";
+
+// WirePlumber accepts clients a moment before the hook publishes the revision (measured in the
+// bed), so a run just after a restart can find none.
+const ABSENT_AGAIN_AFTER: Duration = Duration::from_millis(500);
 
 /// The policy revision of this bubbler's hook: the one the running
 /// WirePlumber should have loaded.
@@ -388,9 +396,14 @@ pub enum LoadedRevision {
     /// which is a hook older than revisions or none at all.
     Absent,
     /// Not known, and why: the tool is missing, the daemon unreachable,
-    /// or the answer unreadable.
+    /// or no answer in time.
     Unknown(String),
+    /// PipeWire answered, but the answer could not be read, and why: more
+    /// than [`DUMP_CAP`], cut short, or not a dump.
+    Unreadable(String),
 }
+
+const UNVERIFIED: &str = "the audio policy the running WirePlumber loaded could not be verified";
 
 const NOT_ENFORCED: &str = "audio grants are not enforced as configured";
 
@@ -402,7 +415,9 @@ impl LoadedRevision {
     /// bubbler's; `None` where it is, or where that is not known.
     pub fn not_loaded(&self) -> Option<String> {
         match self {
-            LoadedRevision::Current | LoadedRevision::Unknown(_) => None,
+            LoadedRevision::Current
+            | LoadedRevision::Unknown(_)
+            | LoadedRevision::Unreadable(_) => None,
             LoadedRevision::Absent => Some(
                 "the running WirePlumber has not loaded this bubbler's audio policy".to_owned(),
             ),
@@ -414,63 +429,74 @@ impl LoadedRevision {
         }
     }
 
-    /// The run's warning for [`Absent`](Self::Absent) and [`Other`](Self::Other); `None` otherwise.
+    /// Why the loaded policy could not be verified, for
+    /// [`Unreadable`](Self::Unreadable); `None` otherwise.
+    pub fn unverified(&self) -> Option<String> {
+        match self {
+            LoadedRevision::Unreadable(reason) => Some(format!("{UNVERIFIED}: {reason}")),
+            _ => None,
+        }
+    }
+
+    /// The run's warning for [`Absent`](Self::Absent), [`Other`](Self::Other) and
+    /// [`Unreadable`](Self::Unreadable); `None` otherwise.
     pub fn run_warning(&self) -> Option<String> {
-        self.not_loaded()
-            .map(|cause| format!("{cause}: {NOT_ENFORCED}; run `{RESTART}`"))
+        self.unverified().or_else(|| {
+            self.not_loaded()
+                .map(|cause| format!("{cause}: {NOT_ENFORCED}; run `{RESTART}`"))
+        })
     }
 
     fn explain_suffix(&self) -> Option<String> {
-        self.not_loaded()
-            .map(|cause| format!(" ({cause}: grant not enforced as configured)"))
+        self.unverified()
+            .map(|cause| format!(" ({cause})"))
+            .or_else(|| {
+                self.not_loaded()
+                    .map(|cause| format!(" ({cause}: grant not enforced as configured)"))
+            })
     }
 }
 
-#[derive(Deserialize)]
-struct DumpObject {
-    #[serde(rename = "type")]
-    kind: String,
-    props: Option<DumpProps>,
-    metadata: Option<Vec<MetadataEntry>>,
-}
-
-#[derive(Deserialize)]
-struct DumpProps {
-    #[serde(rename = "metadata.name")]
-    name: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct MetadataEntry {
-    subject: u64,
-    key: String,
-    value: serde_json::Value,
-}
-
 /// What `pw-dump` printed on stdout, read as a [`LoadedRevision`]: the
-/// [`REVISION_KEY`] on subject 0 of the metadata named [`POLICY_METADATA`].
+/// [`REVISION_KEY`] on subject 0 of the one metadata named [`POLICY_METADATA`].
+/// An object of another shape is skipped; more than one so named is never
+/// [`LoadedRevision::Current`].
 pub fn parse_loaded_revision(dump: &[u8]) -> LoadedRevision {
-    let objects: Vec<DumpObject> = match serde_json::from_slice(dump) {
+    // No object matching the pattern prints nothing and exits 0 (PipeWire 1.6.9).
+    if dump.is_empty() {
+        return LoadedRevision::Absent;
+    }
+    let objects: Vec<Value> = match serde_json::from_slice(dump) {
         Ok(objects) => objects,
-        Err(e) => return LoadedRevision::Unknown(format!("unreadable pw-dump output: {e}")),
+        Err(e) => return LoadedRevision::Unreadable(format!("unreadable pw-dump output: {e}")),
     };
-    let entry = objects
+    let policies: Vec<&Value> = objects
         .iter()
         .filter(|object| {
-            object.kind == METADATA_TYPE
-                && object
-                    .props
-                    .as_ref()
-                    .and_then(|props| props.name.as_deref())
-                    == Some(POLICY_METADATA)
+            object["type"] == METADATA_TYPE && object["props"]["metadata.name"] == POLICY_METADATA
         })
-        .flat_map(|object| object.metadata.iter().flatten())
-        .find(|entry| entry.subject == 0 && entry.key == REVISION_KEY);
+        .collect();
+    match policies.as_slice() {
+        [] => LoadedRevision::Absent,
+        [policy] => revision_in(policy),
+        more => LoadedRevision::Other(format!(
+            "unclear ({} metadata objects named {POLICY_METADATA})",
+            more.len()
+        )),
+    }
+}
+
+fn revision_in(policy: &Value) -> LoadedRevision {
+    let entry = policy["metadata"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["subject"] == 0 && entry["key"] == REVISION_KEY);
     let Some(entry) = entry else {
         return LoadedRevision::Absent;
     };
-    let value = match &entry.value {
-        serde_json::Value::String(text) => text.clone(),
+    let value = match &entry["value"] {
+        Value::String(text) => text.clone(),
         other => other.to_string(),
     };
     if value == revision().to_string() {
@@ -502,9 +528,21 @@ impl AskedOnce {
     }
 }
 
-/// [`loaded_revision`] of the WirePlumber serving `runtime_dir`, asked of `program`.
+/// [`loaded_revision`] of the WirePlumber serving `runtime_dir`, asked of `program`; an
+/// [`Absent`](LoadedRevision::Absent) answer is asked again once, a moment later.
 pub fn loaded_revision_asking(program: &Path, runtime_dir: &Path) -> LoadedRevision {
+    match ask(program, runtime_dir) {
+        LoadedRevision::Absent => {
+            std::thread::sleep(ABSENT_AGAIN_AFTER);
+            ask(program, runtime_dir)
+        }
+        answer => answer,
+    }
+}
+
+fn ask(program: &Path, runtime_dir: &Path) -> LoadedRevision {
     let spawned = Command::new(program)
+        .arg(METADATA_TYPE)
         .env_clear()
         .env("XDG_RUNTIME_DIR", runtime_dir)
         .stdin(Stdio::null())
@@ -515,45 +553,64 @@ pub fn loaded_revision_asking(program: &Path, runtime_dir: &Path) -> LoadedRevis
         Ok(child) => child,
         Err(e) => return LoadedRevision::Unknown(format!("{}: {e}", program.display())),
     };
-    // Read while it runs: a dump larger than the pipe would block it until the timeout.
-    let stdout = read_capped(child.stdout.take().expect("stdout was piped"));
-    let stderr = read_capped(child.stderr.take().expect("stderr was piped"));
     let deadline = Instant::now() + READ_TIMEOUT;
-    let status = loop {
-        let unknown = match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-                continue;
+    let stdout = chunks(child.stdout.take().expect("stdout was piped"));
+    let stderr = chunks(child.stderr.take().expect("stderr was piped"));
+    let mut dump = Vec::new();
+    loop {
+        match stdout.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Piped::Chunk(chunk)) => {
+                dump.extend_from_slice(&chunk);
+                if dump.len() > DUMP_CAP {
+                    stop(&mut child);
+                    return LoadedRevision::Unreadable(format!(
+                        "{} printed more than {DUMP_CAP} bytes",
+                        program.display()
+                    ));
+                }
             }
-            Ok(None) => format!(
-                "{} did not answer within {} s",
-                program.display(),
-                READ_TIMEOUT.as_secs()
-            ),
-            Err(e) => format!("{}: {e}", program.display()),
-        };
-        // Killed and reaped either way; an error here is a child already
-        // gone, which the wait collects.
-        let _ = child.kill();
-        let _ = child.wait();
-        return LoadedRevision::Unknown(unknown);
-    };
-    let stdout = match stdout.join().expect("the pipe reader does not panic") {
-        Ok(stdout) => stdout,
-        Err(e) => return LoadedRevision::Unknown(format!("{}: {e}", program.display())),
-    };
-    if stdout.len() as u64 > DUMP_CAP {
-        return LoadedRevision::Unknown(format!(
-            "{} printed more than {DUMP_CAP} bytes",
-            program.display()
-        ));
+            Ok(Piped::End) | Err(RecvTimeoutError::Disconnected) => break,
+            Ok(Piped::Failed(e)) => {
+                stop(&mut child);
+                return LoadedRevision::Unknown(format!("{}: {e}", program.display()));
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                stop(&mut child);
+                let seconds = READ_TIMEOUT.as_secs();
+                return if dump.is_empty() {
+                    LoadedRevision::Unknown(format!(
+                        "{} did not answer within {seconds} s",
+                        program.display()
+                    ))
+                } else {
+                    LoadedRevision::Unreadable(format!(
+                        "{} did not finish within {seconds} s",
+                        program.display()
+                    ))
+                };
+            }
+        }
     }
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                stop(&mut child);
+                return LoadedRevision::Unknown(format!(
+                    "{} did not exit within {} s",
+                    program.display(),
+                    READ_TIMEOUT.as_secs()
+                ));
+            }
+            Err(e) => {
+                stop(&mut child);
+                return LoadedRevision::Unknown(format!("{}: {e}", program.display()));
+            }
+        }
+    };
     if !status.success() {
-        let said = stderr
-            .join()
-            .expect("the pipe reader does not panic")
-            .unwrap_or_default();
+        let said = collected(&stderr, deadline);
         return LoadedRevision::Unknown(format!(
             "{} {}: {}",
             program.display(),
@@ -561,15 +618,53 @@ pub fn loaded_revision_asking(program: &Path, runtime_dir: &Path) -> LoadedRevis
             String::from_utf8_lossy(&said).trim()
         ));
     }
-    parse_loaded_revision(&stdout)
+    parse_loaded_revision(&dump)
 }
 
-fn read_capped(pipe: impl Read + Send + 'static) -> JoinHandle<std::io::Result<Vec<u8>>> {
+enum Piped {
+    Chunk(Vec<u8>),
+    End,
+    Failed(std::io::Error),
+}
+
+// Read on a thread while the program runs: one blocked on a full pipe would never exit.
+fn chunks(mut pipe: impl Read + Send + 'static) -> Receiver<Piped> {
+    let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
-        let mut read = Vec::new();
-        pipe.take(DUMP_CAP + 1).read_to_end(&mut read)?;
-        Ok(read)
-    })
+        let mut buffer = vec![0; 64 * 1024];
+        loop {
+            let piped = match pipe.read(&mut buffer) {
+                Ok(0) => Piped::End,
+                Ok(n) => Piped::Chunk(buffer[..n].to_vec()),
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => Piped::Failed(e),
+            };
+            let last = !matches!(piped, Piped::Chunk(_));
+            if sender.send(piped).is_err() || last {
+                return;
+            }
+        }
+    });
+    receiver
+}
+
+fn collected(receiver: &Receiver<Piped>, deadline: Instant) -> Vec<u8> {
+    let mut said = Vec::new();
+    while let Ok(Piped::Chunk(chunk)) =
+        receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    {
+        said.extend_from_slice(&chunk);
+        if said.len() > DUMP_CAP {
+            break;
+        }
+    }
+    said
+}
+
+// Killed and reaped; an error here is a child already gone, which the wait collects.
+fn stop(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// `path` as one word of a POSIX shell command: as it is where a shell
@@ -1106,6 +1201,76 @@ mod tests {
         );
     }
 
+    // A stream a sandbox opened with `metadata.name = 1` and an `object.path` matching the
+    // pattern, as `pw-dump` printed it among the metadata objects (PipeWire 1.6.9), params cut.
+    const ODD_NODE: &str = r#"  {
+    "id": 35,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "permissions": [ "r", "w", "x", "m" ],
+    "info": {
+      "max-input-ports": 0,
+      "max-output-ports": 129,
+      "change-mask": [ "input-ports", "output-ports", "state", "props", "params" ],
+      "n-input-ports": 0,
+      "n-output-ports": 2,
+      "state": "running",
+      "error": null,
+      "props": {
+        "application.name": "pw-cat",
+        "client.id": 34,
+        "media.class": "Stream/Output/Audio",
+        "metadata.name": 1,
+        "node.name": "odd",
+        "object.id": 35,
+        "object.path": "PipeWire:Interface:Metadata",
+        "object.serial": 37
+      }
+    }
+  },
+"#;
+
+    fn with_objects_first(objects: &str) -> String {
+        stating(revision()).replacen("[\n", &format!("[\n{objects}"), 1)
+    }
+
+    #[test]
+    fn a_stream_naming_itself_like_a_metadata_leaves_the_answer_alone() {
+        assert_eq!(
+            parse_loaded_revision(with_objects_first(ODD_NODE).as_bytes()),
+            LoadedRevision::Current
+        );
+    }
+
+    #[test]
+    fn objects_of_an_unexpected_shape_are_skipped() {
+        let odd = r#"1, "x", null, [], { "type": 5 },
+  { "type": "PipeWire:Interface:Metadata", "props": 3, "metadata": {} },
+  { "type": "PipeWire:Interface:Metadata", "props": { "metadata.name": 1 },
+    "metadata": [ 1, { "subject": "0", "key": "revision", "value": 0 } ] },
+"#;
+        assert_eq!(
+            parse_loaded_revision(with_objects_first(odd).as_bytes()),
+            LoadedRevision::Current
+        );
+    }
+
+    #[test]
+    fn two_policy_metadata_objects_are_never_current() {
+        let policy = &MEASURED[MEASURED.find("  {\n    \"id\": 27").expect("the policy")..];
+        let policy = policy.trim_end().trim_end_matches(']').trim_end();
+        let twice = with_objects_first(&format!("{policy},\n"));
+        let answer = parse_loaded_revision(twice.as_bytes());
+        let LoadedRevision::Other(value) = &answer else {
+            panic!("{answer:?}");
+        };
+        assert!(
+            value.contains("2 metadata objects named bubbler-policy"),
+            "{value}"
+        );
+    }
+
+    /// `pw-dump` given a pattern no object matches prints nothing and exits 0 (PipeWire 1.6.9).
     #[test]
     fn no_metadata_or_no_revision_key_is_absent() {
         let renamed = MEASURED.replace("\"bubbler-policy\"", "\"not-bubbler-policy\"");
@@ -1114,7 +1279,7 @@ mod tests {
             "\"subject\": 0, \"key\": \"revision\"",
             "\"subject\": 31, \"key\": \"revision\"",
         );
-        for dump in ["[]", &renamed, &keyless, &elsewhere] {
+        for dump in ["", "[]", &renamed, &keyless, &elsewhere] {
             assert_eq!(
                 parse_loaded_revision(dump.as_bytes()),
                 LoadedRevision::Absent,
@@ -1124,13 +1289,13 @@ mod tests {
     }
 
     #[test]
-    fn an_unparsable_or_truncated_dump_is_unknown() {
+    fn an_unparsable_or_truncated_dump_is_unreadable() {
         let truncated = &MEASURED[..MEASURED.find("\"revision\"").expect("the key")];
-        for dump in ["", "no such line\n", "{}", truncated] {
+        for dump in ["no such line\n", "{}", truncated] {
             assert!(
                 matches!(
                     parse_loaded_revision(dump.as_bytes()),
-                    LoadedRevision::Unknown(_)
+                    LoadedRevision::Unreadable(_)
                 ),
                 "{dump}"
             );
@@ -1138,17 +1303,70 @@ mod tests {
     }
 
     #[test]
-    fn a_dump_larger_than_the_cap_is_unknown() {
+    fn a_dump_larger_than_the_cap_is_unreadable_and_cut_off_at_once() {
         let tmp = tempfile::tempdir().expect("a temp dir");
         let tool = stand_in(
             tmp.path(),
-            &format!("head -c {} /dev/zero | tr '\\0' ' '; echo '[]'", DUMP_CAP),
+            &format!(
+                "head -c {} /dev/zero | tr '\\0' ' '; exec sleep 30",
+                DUMP_CAP + 1
+            ),
         );
+        let started = Instant::now();
         let answer = asking_past_a_busy_exec(&tool, tmp.path());
-        let LoadedRevision::Unknown(reason) = answer else {
+        assert!(started.elapsed() < READ_TIMEOUT, "{:?}", started.elapsed());
+        let LoadedRevision::Unreadable(reason) = answer else {
             panic!("{answer:?}");
         };
         assert!(reason.contains("more than"), "{reason}");
+    }
+
+    #[test]
+    fn a_dump_cut_short_by_the_timeout_is_unreadable() {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let tool = stand_in(tmp.path(), "echo '['; exec sleep 30");
+        let answer = asking_past_a_busy_exec(&tool, tmp.path());
+        let LoadedRevision::Unreadable(reason) = answer else {
+            panic!("{answer:?}");
+        };
+        assert!(reason.contains("did not finish within"), "{reason}");
+    }
+
+    fn answering(dir: &Path, first: &str, then: &str) -> (PathBuf, PathBuf) {
+        let asked = dir.join("asked");
+        std::fs::write(dir.join("first"), first).expect("the first answer");
+        std::fs::write(dir.join("then"), then).expect("the later answer");
+        let d = dir.display();
+        let tool = stand_in(
+            dir,
+            &format!(
+                "if [ -e '{d}/asked' ]; then cat '{d}/then'; else cat '{d}/first'; fi\n\
+                 echo asked >> '{d}/asked'"
+            ),
+        );
+        (tool, asked)
+    }
+
+    fn asks(asked: &Path) -> usize {
+        std::fs::read_to_string(asked)
+            .expect("the stand-in was asked")
+            .lines()
+            .count()
+    }
+
+    #[test]
+    fn an_absent_revision_is_asked_once_more_before_it_is_answered() {
+        let current = stating(revision());
+        for (first, then, expected, times) in [
+            ("[]", current.as_str(), LoadedRevision::Current, 2),
+            ("[]", "[]", LoadedRevision::Absent, 2),
+            (current.as_str(), "[]", LoadedRevision::Current, 1),
+        ] {
+            let tmp = tempfile::tempdir().expect("a temp dir");
+            let (tool, asked) = answering(tmp.path(), first, then);
+            assert_eq!(asking_past_a_busy_exec(&tool, tmp.path()), expected);
+            assert_eq!(asks(&asked), times, "{expected:?}");
+        }
     }
 
     fn stand_in(dir: &Path, script: &str) -> PathBuf {
@@ -1241,6 +1459,17 @@ mod tests {
         assert_eq!(
             LoadedRevision::Unknown("no daemon".to_owned()).run_warning(),
             None
+        );
+    }
+
+    #[test]
+    fn a_revision_that_could_not_be_read_is_a_run_warning_naming_why() {
+        let warning = LoadedRevision::Unreadable("cut short".to_owned())
+            .run_warning()
+            .expect("a warning");
+        assert!(
+            warning.contains("could not be verified: cut short"),
+            "{warning}"
         );
     }
 

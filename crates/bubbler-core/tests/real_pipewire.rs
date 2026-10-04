@@ -4007,7 +4007,7 @@ impl Drop for Load {
 
 /// `pw-metadata` printed no key in 5 of 400 reads under this load (PipeWire 1.6.9).
 #[test]
-#[ignore = "keeps every core busy, which the tests running beside it would feel; run explicitly"]
+#[ignore = "keeps every core busy, which the tests beside it would feel; run with BUBBLER_TEST_SESSION=1 and --ignored"]
 fn the_revision_reads_as_current_every_time_under_cpu_load() {
     let Some(bed) = PipeWireBed::start() else {
         return;

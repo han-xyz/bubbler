@@ -51,7 +51,6 @@ proptest = "1"
 # Raw `keyctl`, which rustix does not wrap. Already in the locked graph
 # through libseccomp and signal-hook, so this adds no crate.
 libc = "0.2"
-# Typed reading of `pw-dump`'s JSON: the tree has no JSON parser (`json.rs`
-# only encodes). serde and serde_derive are already in it through kdl.
-serde = { version = "1", features = ["derive"] }
+# Reading `pw-dump`'s JSON: the tree has no JSON parser (`json.rs` only
+# encodes).
 serde_json = "1"
