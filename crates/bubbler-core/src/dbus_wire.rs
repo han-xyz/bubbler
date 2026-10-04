@@ -26,49 +26,51 @@ use rustix::net::{
 };
 
 /// Longest a call waits for its reply, and the whole of what a connect
-/// and its authentication may take.
+/// and its authentication may take. A bus that has not answered within
+/// it is not going to; bubbler's callers have a user waiting.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 const PROTOCOL_VERSION: u8 = 1;
 
 const FIXED_HEADER: usize = 16;
 
+// The specification's maximum array length, 64 MiB.
 const MAX_ARRAY: usize = 1 << 26;
 
-// This is the limit on what may be *sent*: a message the encoder
-// produces has to stay inside it or no conforming peer would read it.
+// The specification's maximum message length. This is the limit on what may be *sent*:
+// a message the encoder produces has to stay inside it or no conforming peer would read it.
 const MAX_MESSAGE: usize = 1 << 27;
 
-// The limit on what is *read*, which is bubbler's own and far tighter: it keeps
-// the buffer a hostile peer can make this process hold to something a desktop can spare.
+// The limit on what is *read*, bubbler's own: the largest reply it reads (the doc-id list
+// `AddFull` answers with) is four orders of magnitude smaller, and a hostile peer gets no more.
 const MAX_INCOMING: usize = 16 << 20;
 // A reply this client reads must always fit what it may send.
 const _: () = assert!(MAX_INCOMING < MAX_MESSAGE);
 
-// [`MAX_ARRAY`] bounds an array's bytes, not what reading it costs: an `aq` of 16 MiB is
-// eight million [`Value`]s. So the count is bounded too, across nesting rather than per array.
+// `MAX_ARRAY` bounds an array's bytes, not what reading it costs, so the count is bounded too.
+// The replies bubbler reads hold a handful of values; a million is a bound on a hostile peer.
 const MAX_VALUES: usize = 1 << 20;
 
+// The specification's maximum signature length.
 const MAX_SIGNATURE: usize = 255;
 
 // 32 array type codes and 32 open parentheses. Counted across variants too: without a
 // running total a reply could nest them until the decoder's recursion ran out of stack.
 const MAX_DEPTH: usize = 64;
 
-// Nesting of one kind — arrays, or structs and dict entries — the
-// specification allows.
+// The specification's limit for one kind: 32 arrays, or 32 structs and dict entries.
 const MAX_CONTAINER_DEPTH: usize = 32;
 
 // Linux caps `SCM_RIGHTS` at 253 per message, so a longer list could never leave in
 // one piece.
 const MAX_CALL_FDS: usize = 253;
 
-// Nothing bubbler calls answers with one; the room exists so a peer that sends some
-// cannot leave them queued, and every one that arrives is closed at once.
+// Nothing bubbler calls answers with one; the room exists so a peer that sends some cannot
+// leave them queued. `Session::call` refuses a reply that declares more than this.
 const MAX_REPLY_FDS: usize = 4;
 
-// Longest authentication line accepted, so a peer that never sends
-// `\r\n` cannot grow the buffer without bound.
+// So a peer that never sends `\r\n` cannot grow the buffer without bound. The lines in use
+// are a few dozen bytes.
 const MAX_AUTH_LINE: usize = 4096;
 
 const MSG_METHOD_CALL: u8 = 1;
@@ -85,11 +87,10 @@ const FIELD_SENDER: u8 = 7;
 const FIELD_SIGNATURE: u8 = 8;
 const FIELD_UNIX_FDS: u8 = 9;
 
-// For an activatable name that only means it has not been started yet.
+// `GetNameOwner`'s answer when nobody holds the name; for an activatable name that only
+// means it has not been started yet.
 const ERROR_NO_OWNER: &str = "org.freedesktop.DBus.Error.NameHasNoOwner";
 
-// What the bus answers with when a name is not activatable at all, and
-// what it sends back for a call it cannot deliver.
 const ERROR_SERVICE_UNKNOWN: &str = "org.freedesktop.DBus.Error.ServiceUnknown";
 
 const BUS_NAME: &str = "org.freedesktop.DBus";
@@ -564,15 +565,14 @@ fn encode_str(out: &mut Vec<u8>, text: &str) -> Result<(), WireError> {
 }
 
 // Its alignment is 1, so no padding is ever needed before it, and its
-// length has been checked to fit a byte by [`parse_signature`].
+// length has been checked to fit a byte by `parse_signature`.
 fn encode_signature(out: &mut Vec<u8>, sig: &str) {
     out.push(sig.len() as u8);
     out.extend_from_slice(sig.as_bytes());
     out.push(0);
 }
 
-// An array: a UINT32 of the element bytes, padding to the element's
-// alignment which the length does not count, then the elements.
+// The length does not count the padding to the element's alignment.
 fn encode_array(
     out: &mut Vec<u8>,
     element: &Type,
@@ -888,9 +888,7 @@ struct Message {
     // On a bus the bus itself fills this in, and a client cannot forge it.
     sender: Option<String>,
     signature: String,
-    // What `UNIX_FDS` declared, which must match what arrived.
     unix_fds: u32,
-    // Descriptors that arrived with its bytes, all closed already.
     fds_arrived: usize,
     body: Vec<u8>,
 }
@@ -1041,8 +1039,6 @@ fn decode_message(message: &[u8]) -> Result<Message, WireError> {
     })
 }
 
-// The ASCII decimal digits of `uid`, each byte written as two hex
-// digits: what `AUTH EXTERNAL` takes.
 fn uid_hex(uid: u32) -> String {
     const DIGITS: [u8; 16] = *b"0123456789abcdef";
     let mut out = String::new();
@@ -1085,8 +1081,6 @@ pub struct Session {
     // An owner that changes mid-session makes the next call fail rather than
     // accept a reply from the wrong sender.
     owners: Vec<(String, String)>,
-    // Descriptors received and closed with the bytes of the message
-    // being read, to be checked against what that message declares.
     fds_seen: usize,
     // "Must not be zero", so the first call sends 1.
     serial: u32,
@@ -1096,9 +1090,9 @@ pub struct Session {
 }
 
 impl Session {
-    /// Connect to the bus socket at `path`, authenticate as this uid with
-    /// `EXTERNAL`, negotiate descriptor passing and say `Hello`, all inside one
-    /// [`CALL_TIMEOUT`]. A bus that refuses descriptor passing is used anyway.
+    /// Connect to `path`, authenticate as this uid with `EXTERNAL`, negotiate descriptor
+    /// passing and say `Hello`, all inside one [`CALL_TIMEOUT`]. A bus that refuses descriptor
+    /// passing is used anyway; a call with descriptors then fails, [`WireError::NoFdPassing`].
     pub fn connect(path: &Path) -> Result<Self, WireError> {
         let deadline = Instant::now() + CALL_TIMEOUT;
         let failed = |source: Errno| WireError::Connect {
@@ -1150,9 +1144,9 @@ impl Session {
         self.fd_passing
     }
 
-    /// Call `member` on `iface` of `path` at `dest`, with `body` marshalled against `sig`
-    /// and `fds` beside it. An `ERROR` becomes [`WireError::Remote`] and leaves the session
-    /// usable; every other failure leaves it half-read and to be dropped.
+    /// Call `member` on `iface` of `path` at `dest`, addressed to the unique owner of a well-known
+    /// `dest`. One [`CALL_TIMEOUT`] covers the owner lookup, any activation and the reply. An
+    /// `ERROR` becomes [`WireError::Remote`] and leaves the session usable; any other, half-read.
     // A destination, an object, an interface, a member, a signature, a
     // body and its descriptors is what a D-Bus method call is.
     #[allow(clippy::too_many_arguments)]

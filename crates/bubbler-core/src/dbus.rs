@@ -294,8 +294,8 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
                         push(&mut rules, render(&r), i);
                     }
                 }
-                // The address of the accessibility bus is resolved before the sandbox
-                // starts rather than asked for from inside it.
+                // Its rules are on its own bus (`A11Y_RULES`), and that bus's address is
+                // resolved before the sandbox starts rather than asked for from inside it.
                 Service::A11y => {}
                 // Listed rather than caught by a wildcard: a new bundle must be given
                 // its rules here, and a wildcard would silently give it none.
@@ -683,8 +683,6 @@ enum AddressFault {
 // specification, "Server Addresses").
 const UNIX_SOCKET_KEYS: [&[u8]; 5] = [b"path", b"abstract", b"runtime", b"dir", b"tmpdir"];
 
-// The first `unix:` entry of a `;`-separated D-Bus address list
-// that names a `path=` and no other socket key.
 fn unix_path(address: &OsStr) -> Result<PathBuf, AddressFault> {
     let mut fault = AddressFault::NoPath;
     let entries = address.as_bytes().split(|b| *b == b';');
@@ -728,8 +726,6 @@ fn unescape_address_value(value: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-// Every byte outside the specification's optionally-escaped set
-// `[-0-9A-Za-z_/.\*]` as `%XX`.
 fn escape_address_value(value: &[u8]) -> OsString {
     let mut out = Vec::with_capacity(value.len());
     for &b in value {
@@ -751,7 +747,8 @@ pub fn proxy_program(env: &Env) -> PathBuf {
 }
 
 /// The host socket of each bus a plan grants, as the launcher resolved
-/// them. `None` leaves that bus out of the proxy's command.
+/// them. `None` leaves that bus out of the proxy's command, and the sandbox's bind of it
+/// then fails, since the proxy never creates it.
 // One named value rather than three arguments of one type: which socket serves which
 // bus is the whole of the confinement.
 #[derive(Debug, Clone, Copy)]
@@ -806,8 +803,8 @@ pub fn proxy_command_nodes(
         };
         let mut address = OsString::from("unix:path=");
         address.push(escape_address_value(host.as_os_str().as_bytes()));
-        // The address and the socket path must precede the options of
-        // that bus: an option applies to the address before it.
+        // An option applies to the address before it, so each bus's address and socket come
+        // first. All carry the granting node, so an explanation reads one bus at a time.
         let node = Some(section.node);
         argv.push((address, node));
         argv.push((

@@ -4,9 +4,9 @@
 //! the file then appears inside at `$XDG_RUNTIME_DIR/doc/<id>/<name>`.
 //!
 //! Nothing here widens a sandbox on its own: [`plan`] only classifies
-//! arguments, [`register`] grants one file per call with `read`, or
-//! `read`+`write` where the user could write it anyway, and every
-//! failure leaves the argument as it was.
+//! arguments, [`register`] grants each file `read`, or
+//! `read`+`write` where the user could write it anyway, in one call per
+//! permission set, and every failure leaves the argument as it was.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -29,11 +29,10 @@ const PORTAL_IFACE: &str = "org.freedesktop.portal.Documents";
 // Bit 2 (`persistent`) is deliberately not set — a grant lasts the session.
 const FLAG_REUSE_EXISTING: u32 = 1;
 
-// Under `$XDG_RUNTIME_DIR` both on the host and inside the sandbox.
 const DOC_DIR: &str = "doc";
 
-// `/etc` is not one of them — it is a tmpfs with [`ETC_ALLOWLIST`] bound over it — and
-// neither are the `/bin` and `/lib` symlinks, which point at `/usr` inside.
+// Bound at the same path inside. `/etc` is not one of them — it is a tmpfs with
+// `ETC_ALLOWLIST` bound over it — nor are the `/bin` and `/lib` symlinks.
 const BASELINE_ROOTS: [&str; 2] = ["/usr", "/opt"];
 
 // `sysfs`, as `statfs(2)` lists it. rustix names `PROC_SUPER_MAGIC`
@@ -303,9 +302,9 @@ pub fn register(
         .collect()
 }
 
-/// The argument list with every file the sandbox will see put at the path it will see it
-/// at. `planned` must be the [`plan`] (or [`plan_args`]) of these same `args`, and
-/// `forwards` the [`register`] of the candidates in it: an index names a position.
+/// `args` with every file the sandbox will see put at its path inside; the rest are copied
+/// as they were, and an index past the end is dropped. `planned` must be the [`plan`] (or
+/// [`plan_args`]) of these same `args`, and `forwards` the [`register`] of its candidates.
 pub fn rewrite(args: &[OsString], planned: &[Planned], forwards: &[Forward]) -> Vec<OsString> {
     debug_assert!(
         planned.len() <= args.len()
@@ -456,7 +455,6 @@ fn classify(index: usize, arg: &OsStr, visible: &[Root], host: &dyn Host) -> Pla
 
 struct Root {
     host: PathBuf,
-    // Where the sandbox sees them, when that is not the same path.
     inside: Option<PathBuf>,
 }
 
@@ -516,7 +514,7 @@ fn visible_roots(
                     host,
                     same(path.clone()),
                     // The launcher refuses a `path-share` that meets a reserved root; a source
-                    // resolving to `/` would otherwise claim every argument as already visible.
+                    // resolving to `/` or to the user's home would otherwise claim every argument.
                     |_| crate::service::reserved_reason(host, env, path).is_none(),
                 )
             }
