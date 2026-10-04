@@ -6,8 +6,6 @@
 //! started on the first client that connects and stopped last.
 
 use std::ffi::{OsStr, OsString};
-use std::fs::File;
-use std::io::Write;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -18,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rustix::event::{Nsecs, PollFd, PollFlags, Timespec, poll};
-use rustix::fs::Mode;
+use rustix::fs::{Mode, OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::io::{Errno, FdFlags, fcntl_dupfd_cloexec, fcntl_getfd, fcntl_setfd};
 use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 use rustix::process::{
@@ -104,8 +102,10 @@ struct Stopping {
     /// Nor is the X server, which a client connecting during the grace
     /// would otherwise wake for the seconds it has left.
     asked: bool,
-    /// Cleared once the SIGKILL has gone out.
+    /// Set by the first stop event and never moved: whatever is still
+    /// running at the end is held to it too.
     kill_at: Option<Instant>,
+    killed: bool,
 }
 
 /// An accepted connection whose request is still arriving.
@@ -229,10 +229,10 @@ fn take_ctty(command: &mut Command) {
 /// Give up what the supervisor will never use, and tie its life to its
 /// parent's. Under bwrap every capability set is empty and
 /// `no_new_privs` is already on, so most of this is stating the posture
-/// rather than changing it — which is the point: `bubbler-init` is PID 1
-/// of the sandbox and the parent of everything in it, and a supervisor
-/// started any other way must not be the one process that kept a
-/// privilege. The bounding set is only written where something is left
+/// rather than changing it — which is the point: `bubbler-init` is pid 2,
+/// under bwrap's pid-1 reaper, and the parent of everything it starts;
+/// a supervisor started any other way must not be the one process that
+/// kept a privilege. The bounding set is only written where something is left
 /// in it, since `PR_CAPBSET_DROP` takes `CAP_SETPCAP`, which a sandbox
 /// does not have; reading it takes nothing.
 ///
@@ -284,9 +284,16 @@ fn harden() -> rustix::io::Result<()> {
 
 /// Turn a request down: say why on the connection's own stderr, and
 /// answer the status a shell reports for a command it could not run.
+/// The reason is dropped when that stderr would block: the status still
+/// tells the client, and a blocked write would stall the whole loop.
 fn refuse(stream: &UnixStream, report: Option<OwnedFd>, why: &str) {
-    if let Some(fd) = report {
-        let _ = writeln!(File::from(fd), "bubbler-init: {why}");
+    if let Some(fd) = report
+        && let Ok(flags) = fcntl_getfl(&fd)
+        && fcntl_setfl(&fd, flags | OFlags::NONBLOCK).is_ok()
+    {
+        let _ = rustix::io::write(&fd, format!("bubbler-init: {why}\n").as_bytes());
+        // O_NONBLOCK is on the open file description the client shares.
+        let _ = fcntl_setfl(&fd, flags);
     }
     let _ = wire::send_status(stream, NOT_EXECUTABLE);
 }
@@ -425,13 +432,14 @@ fn begin_stop(command: &Child, execs: &[Exec], stopping: &mut Stopping) {
     stopping.kill_at = stopping.kill_at.or(Some(Instant::now() + GRACE));
 }
 
-/// SIGTERM the remaining exec'd children and SIGKILL whatever outlives the grace.
-fn shutdown(execs: &mut Vec<Exec>) {
+/// SIGTERM the remaining exec'd children and SIGKILL whatever outlives
+/// the stop's deadline, or a fresh grace when no stop was asked.
+fn shutdown(execs: &mut Vec<Exec>, kill_at: Option<Instant>) {
     if execs.is_empty() {
         return;
     }
     signal_execs(execs, Signal::TERM);
-    let deadline = Instant::now() + GRACE;
+    let deadline = kill_at.unwrap_or_else(|| Instant::now() + GRACE);
     while !execs.is_empty() && Instant::now() < deadline {
         std::thread::sleep(TICK);
         reap(execs);
@@ -508,10 +516,11 @@ fn start_wm(x: &mut X11) {
     }
 }
 
-/// SIGTERM one child and SIGKILL whatever outlives the grace, then reap it.
-fn stop_child(child: &mut Child) {
+/// SIGTERM one child and SIGKILL whatever outlives the stop's deadline,
+/// or a fresh grace when no stop was asked, then reap it.
+fn stop_child(child: &mut Child, kill_at: Option<Instant>) {
     let _ = kill_process(Pid::from_child(child), Signal::TERM);
-    let deadline = Instant::now() + GRACE;
+    let deadline = kill_at.unwrap_or_else(|| Instant::now() + GRACE);
     while Instant::now() < deadline {
         if !matches!(child.try_wait(), Ok(None)) {
             return;
@@ -526,13 +535,13 @@ fn stop_child(child: &mut Child) {
 /// the command and every exec'd child are gone: nothing may lose its
 /// display while it is still drawing on it, and the window manager is
 /// never left managing a server that has already exited.
-fn stop_x11(x11: Option<&mut X11>) {
+fn stop_x11(x11: Option<&mut X11>, kill_at: Option<Instant>) {
     let Some(x) = x11 else { return };
     if let Some(wm) = x.wm_child.as_mut() {
-        stop_child(wm);
+        stop_child(wm, kill_at);
     }
     if let Some(server) = x.server.as_mut() {
-        stop_child(server);
+        stop_child(server, kill_at);
     }
 }
 
@@ -663,7 +672,7 @@ fn main() -> ExitCode {
         Ok(child) => child,
         Err(e) => {
             eprintln!("bubbler-init: {}: {e}", program.to_string_lossy());
-            stop_x11(x11.as_mut());
+            stop_x11(x11.as_mut(), None);
             return ExitCode::from(127);
         }
     };
@@ -674,8 +683,8 @@ fn main() -> ExitCode {
     loop {
         if let Ok(Some(status)) = command.try_wait() {
             reap(&mut execs);
-            shutdown(&mut execs);
-            stop_x11(x11.as_mut());
+            shutdown(&mut execs, stopping.kill_at);
+            stop_x11(x11.as_mut(), stopping.kill_at);
             return ExitCode::from(code_of(status));
         }
         if let Some(x) = x11.as_mut() {
@@ -702,10 +711,10 @@ fn main() -> ExitCode {
             }
         }
         reap(&mut execs);
-        if stopping.kill_at.is_some_and(|at| Instant::now() >= at) {
+        if !stopping.killed && stopping.kill_at.is_some_and(|at| Instant::now() >= at) {
             let _ = kill_process(Pid::from_child(&command), Signal::KILL);
             signal_execs(&execs, Signal::KILL);
-            stopping.kill_at = None;
+            stopping.killed = true;
         }
         // The listener, the display socket while nothing serves it, and
         // every half-read request in one poll set: a client that stops

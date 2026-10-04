@@ -858,10 +858,11 @@ application could not reach itself — the loader runs at the trust level
 glycin's own sandbox-less fallback gives it, inside bubbler's sandbox rather
 than beside it. `--host`, `--talk-name` and the rest of the options that only
 mean something with the host's bus behind them are refused by name, not
-ignored, so nothing believes it was given a channel out. `--sandbox`, its
-`--sandbox-*` companions, `--no-network`, `--watch-bus` and
-`--latest-version` are accepted and build nothing: the command runs with
-this sandbox's whole reach. The cost is the
+ignored, so nothing believes it was given a channel out. `--sandbox`, the
+`--sandbox-expose*` and `--sandbox-flag*` options, `--no-network`,
+`--watch-bus` and `--latest-version` are accepted and build nothing: the
+command runs with this sandbox's whole reach. Any other `--sandbox-*`
+option is an unknown option and fails the call. The cost is the
 mount it takes to put the shim where `env -i` will find it: `/usr/bin`
 becomes an overlay of itself with the writes going to a tmpfs nothing can
 see, and is remounted read-only immediately after the shim is bound. Left
@@ -1929,9 +1930,14 @@ non-dumpable. The wire decoder refuses an empty, truncated or oversized
 request and one that carries no descriptors, and a client that trickles
 bytes cannot extend the deadline. Once the run is stopping — the display
 gone, or a SIGTERM to `bubbler-init` — a request is turned down rather
-than served (`bubbler-init: stopping; <program> was not run`, exit 127),
-so nothing is spawned into a sandbox that is being torn down and no child
-reaches the SIGKILL deadline without having been asked to stop first.
+than served (`bubbler-init: stopping; <program> was not run`, exit 127;
+the reason is dropped, not waited for, when the client's stderr takes no
+write), so nothing is spawned into a sandbox that is being torn down and no
+direct child of `bubbler-init` reaches the SIGKILL deadline without having
+been asked to stop first. Their own children get no SIGTERM from
+`bubbler-init`; they end with the pid namespace. The deadline is the first
+stop's: a command that exits during the grace does not start a new one for
+the exec'd children, the window manager or the X server.
 
 `bubbler-init` makes itself non-dumpable, sets `PR_SET_NO_NEW_PRIVS`,
 clears the ambient set and the three sets `capset` carries, drops

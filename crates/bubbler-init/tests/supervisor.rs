@@ -1364,6 +1364,78 @@ fn an_exec_is_refused_once_the_run_is_stopping() {
 }
 
 #[test]
+fn a_refusal_whose_stderr_takes_no_write_does_not_stall_the_supervisor() {
+    let (mut init, sock) = start(&["/usr/bin/sleep", "30"]);
+    let (_unread, full) = rustix::pipe::pipe().unwrap();
+    rustix::fs::fcntl_setfl(&full, rustix::fs::OFlags::NONBLOCK).unwrap();
+    // One byte at a time at the end: a page-sized write is refused while
+    // a short message would still fit.
+    while rustix::io::write(&full, &[0u8; 4096]).is_ok() {}
+    while rustix::io::write(&full, &[0u8]).is_ok() {}
+    rustix::fs::fcntl_setfl(&full, rustix::fs::OFlags::empty()).unwrap();
+    let s = UnixStream::connect(&sock).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let null = std::fs::File::open("/dev/null").unwrap();
+    let argv = [std::ffi::OsStr::new("/nonexistent/bubbler-test-command")];
+    wire::send_request(&s, &argv, 0, [null.as_fd(), null.as_fd(), full.as_fd()]).unwrap();
+    let st = wire::recv_status(&s).expect("the refusal was never answered");
+    assert_eq!(ExitStatus::from_raw(st).code(), Some(127));
+    assert!(
+        !rustix::fs::fcntl_getfl(&full)
+            .unwrap()
+            .contains(rustix::fs::OFlags::NONBLOCK),
+        "the client's descriptor was left non-blocking"
+    );
+    assert_eq!(
+        ExitStatus::from_raw(exec(&sock, &["/usr/bin/true"])).code(),
+        Some(0)
+    );
+    init.stop();
+}
+
+/// A command that ignores SIGTERM and exits once the file named by its
+/// first argument exists.
+const COMMAND_IGNORES_TERM_UNTIL: &str = r#"#!/usr/bin/python3
+import os, signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+open(sys.argv[0] + ".ready", "w").write("deaf")
+while not os.path.exists(sys.argv[1]):
+    time.sleep(0.02)
+"#;
+
+#[test]
+fn a_command_exiting_late_in_the_grace_does_not_extend_it_for_exec_children() {
+    if !require_python() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let cmd = write_script(dir.path(), "deaf", COMMAND_IGNORES_TERM_UNTIL, true);
+    let child = write_script(dir.path(), "deaf-exec", COMMAND_IGNORES_TERM, true);
+    let release = dir.path().join("release");
+    let (mut init, sock) = start(&[cmd.to_str().unwrap(), release.to_str().unwrap()]);
+    wait_until_deaf(&cmd);
+    let exec_argv = child.to_str().unwrap().to_owned();
+    let status = std::thread::spawn(move || exec(&sock, &[&exec_argv]));
+    wait_until_deaf(&child);
+    let asked = Instant::now();
+    rustix::process::kill_process(
+        rustix::process::Pid::from_child(init.child()),
+        rustix::process::Signal::TERM,
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_secs(4));
+    std::fs::write(&release, "").unwrap();
+    assert_eq!(init.wait_within(Duration::from_secs(15)).code(), Some(0));
+    assert!(
+        asked.elapsed() < Duration::from_millis(6500),
+        "the exec'd child outlived the first deadline: {:?}",
+        asked.elapsed()
+    );
+    let st = status.join().unwrap();
+    assert_eq!(ExitStatus::from_raw(st).signal(), Some(9));
+}
+
+#[test]
 fn a_server_that_cannot_be_spawned_terminates_the_command() {
     let dir = tempfile::tempdir().unwrap();
     let xsock = dir.path().join("X0");

@@ -62,6 +62,12 @@
 - A tablet pen touching down, lifting or pressing a button, and a tablet
   pad button press, now allow a paste under the Wayland clipboard gate like
   a key press or a mouse click.
+- A stopped run is over by the first stop's deadline: a command that exits
+  late in the grace no longer gives the exec'd children, the window manager
+  and the X server a new five seconds each before they are killed.
+- An `exec` refused while the client's stderr took no write (a paused
+  terminal, a full pipe) no longer stalls `bubbler-init`; the reason is
+  dropped and the exit status still reports the refusal.
 
 ## 0.25.0
 
