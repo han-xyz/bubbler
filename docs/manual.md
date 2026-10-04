@@ -727,8 +727,11 @@ configured; run `systemctl --user restart wireplumber` `` until WirePlumber is
 restarted, or `the running WirePlumber has loaded audio policy revision <N>,
 not this bubbler's <M>: …` where it holds another revision; `bubbler lint`
 warns `audio-policy-not-loaded` and `--explain` adds the same to the audio
-group's header. Where a file is missing, only the missing file's warning is
-printed: its fix ends in the same restart. Where WirePlumber cannot be asked
+group's header. Where a file is missing or differs, only that file's warning
+is printed: rewriting it comes before the restart. `lint-allow
+"audio-policy-not-loaded" reason="..."` silences the run warning as well as
+the lint; a copy kept older on purpose needs it beside the
+`audio-policy-differs` one, since WirePlumber then loads that older copy. Where WirePlumber cannot be asked
 (no `pw-metadata`, no daemon on the socket, no answer within two seconds) a
 run says nothing and `bubbler lint` notes it. The run goes on in every case.
 The first check reads the search directories (`$XDG_CONFIG_HOME`,
@@ -4382,15 +4385,12 @@ reaches every PipeWire node instead of what it asks for; without the
 hook beside it the grant is scoped but a sandbox can still record the
 sink's monitor ports, which carry every other application's audio. A run
 and `bubbler lint` say which of the two is missing and, once both are in
-place, whether the running WirePlumber has loaded them. After an upgrade of
-bubbler whose changelog says the policy changed, write your own copies again
-(the commands above; a package updates its copy under `/usr/share`) and
-restart WirePlumber: until then each run with an audio grant warns.
+place, whether the running WirePlumber has loaded them.
 
 Run the same commands again after an upgrade that changes the policy —
-0.24.2 does — and restart WirePlumber: a copy you wrote yourself is not
+0.26.0 does — and restart WirePlumber: a copy you wrote yourself is not
 updated by the upgrade, and a running WirePlumber keeps the hook it
-started with. That holds for every copy no package installed — under
+started with; until then each run with an audio grant warns. That holds for every copy no package installed — under
 `~/.config`, `~/.local/share`, `/etc/wireplumber` or
 `/usr/local/share/wireplumber`, and under `/usr/share` for a source
 install — since a package updates only its own copy and each of the

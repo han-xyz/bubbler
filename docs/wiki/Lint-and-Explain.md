@@ -65,7 +65,9 @@ WirePlumber has not loaded this bubbler's policy or holds another revision,
 which it names: the grant is not enforced as configured until `systemctl
 --user restart wireplumber`; a note instead, naming why, where WirePlumber
 could not be asked — no `pw-metadata`, no daemon, no answer within two
-seconds).
+seconds; not reported beside `audio-policy-missing` or an
+`audio-policy-differs` that is not accepted, and its `lint-allow` silences
+the run warning too).
 
 **Notes** (information): `allow-host-wildcard`, `app-runtime-rw`,
 `outbound-deny`, `ozone-hint-unnecessary`,

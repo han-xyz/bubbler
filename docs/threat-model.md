@@ -1165,9 +1165,11 @@ and the hook when it starts, so after an install or an upgrade the
 running one enforces whatever it loaded before, or nothing. Since 0.26.0
 the hook publishes its `policy revision` as metadata `bubbler-policy`
 (key `revision`, subject 0), and for an instance with an audio grant and
-both files installed, bubbler runs `pw-metadata -n bubbler-policy` against
-the session's PipeWire before each `run`, `try` and `open`, for `bubbler
-lint` and for `--explain`: absent metadata or another revision is a
+both files installed as this bubbler ships them (or a differing copy
+accepted with `lint-allow`), bubbler runs `pw-metadata -n bubbler-policy` against
+the session's PipeWire when a `run`, `try` or `open` starts a new
+sandbox (joining a running instance does not ask), for `bubbler lint` and
+for `--explain`: absent metadata or another revision is a
 `bubbler: warning:` naming `systemctl --user restart wireplumber`, and an
 `audio-policy-not-loaded` lint warning. What that proves: a client of the
 session's PipeWire published that revision, which is what the hook does
