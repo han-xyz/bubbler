@@ -1453,7 +1453,8 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
         cfg.disabled.extend(found);
     }
     // The list follows the writing rather than the file: a config parsed from what bubbler wrote
-    // has to be the config bubbler wrote.
+    // has to be the config bubbler wrote. The sort is stable, and `before` only grows down a
+    // section, so the order inside one is the file's.
     cfg.disabled.sort_by_key(|d| section_rank(&d.node));
     if !profile && let Some(node) = bundle_without_dbus(&cfg.services) {
         return Err(ConfigError::BadArgument {
@@ -1890,8 +1891,9 @@ impl Counts {
 }
 
 /// Which section of the file a node belongs to, numbered in the order [`crate::kdl_out::nodes`]
-/// writes the sections. Everything that sorts or groups disabled entries ranks them through this,
-/// so there is one order and not one per reader.
+/// writes the sections. Kept in step with that function by the round trip: a rank out of order
+/// writes a config that parses back as a different one. Everything that sorts or groups disabled
+/// entries ranks them through this, so there is one order and not one per reader.
 pub fn section_rank(node: &Node) -> u8 {
     match node {
         Node::LintAllow(_) => 0,
@@ -2660,8 +2662,9 @@ fn parse_network(node: &KdlNode) -> Result<Service, ConfigError> {
              reachable already and no proxy runs",
         ));
     }
-    // Inside the namespace that port is the egress proxy: the forward would publish bubbler's own
-    // proxy on the host's loopback (`pasta(1)`, "Handling of local traffic").
+    // pasta forwards a port by connecting to it inside the namespace (`pasta(1)`, "Handling of
+    // local traffic"), and inside the namespace that port is the egress proxy: the forward would
+    // publish bubbler's own proxy on the host's loopback.
     if !cfg.allow_hosts.is_empty() && cfg.forwards.iter().any(|f| f.port == PROXY_PORT) {
         return Err(bad(
             node,
@@ -3027,8 +3030,10 @@ fn parse_x11(node: &KdlNode) -> Result<X11Mode, ConfigError> {
                     .value()
                     .as_string()
                     .ok_or_else(|| bad(node, "wm must be a string like \"twm\""))?;
-                // A path would name a host binary the sandbox may not hold. A leading `-` is
-                // refused because the name is passed to `bubbler-init` as the argument of `--wm`.
+                // A path would name a host binary the sandbox may not hold, and a name with
+                // whitespace in it would be an argument list the supervisor does not split. A
+                // leading `-` is refused because the name is passed to `bubbler-init` as the
+                // argument of `--wm`.
                 if s.is_empty()
                     || s.starts_with('-')
                     || s.contains('/')

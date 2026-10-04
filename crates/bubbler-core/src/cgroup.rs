@@ -1,23 +1,6 @@
 //! The two cgroups a run with an `allow-host` needs: the one the sandbox
 //! runs in and the one the egress proxy runs in, side by side under a
 //! parent of their own.
-//!
-//! nftables matches a cgroup by path (`socket cgroupv2 level N "<path>"`)
-//! but stores the id it resolved, so the proxy's directory has to exist
-//! before `nft -f` reads the rule and to live as long as the sandbox: one
-//! made afterwards matches nothing, silently.
-//!
-//! bwrap never changes cgroup, so `--unshare-cgroup` makes whatever cgroup
-//! bwrap was started in the root of the sandbox's cgroup namespace — and
-//! everything under that root is nameable from inside. So bubbler puts
-//! itself in `sandbox/` before it spawns bwrap — bwrap, the supervisor and
-//! the application inherit it, and the namespace root becomes `sandbox` —
-//! and the proxy goes into `proxy/`, a **sibling outside** that root.
-//!
-//! The parent holds no process, only the two leaves, so the "no internal
-//! processes" rule cannot be reached: it constrains a cgroup that has
-//! both processes and controllers enabled for its children, and nothing
-//! here writes `cgroup.subtree_control` at all.
 
 use std::fs::File;
 use std::io::{Read, Write};

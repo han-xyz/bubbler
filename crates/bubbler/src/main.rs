@@ -625,7 +625,7 @@ fn main() -> ExitCode {
     code
 }
 
-// A pipe gets them as they are: the reader there is a tool, and `bubbler
+// A pipe gets the bytes as they are: the reader there is a tool, and `bubbler
 // log | grep` has to match what the run really wrote.
 fn echoed(bytes: &[u8], terminal: bool) -> Cow<'_, [u8]> {
     match terminal {
@@ -831,9 +831,9 @@ fn refresh_entries(env: &Env, dirs: &desktop::Dirs, program: &Path) -> Result<i3
 }
 
 // The connection a start that lost the race to another start of the
-// instance joins that one through. Tried once; a winner already gone again is the start's own error. A
-// winner whose start then fails ends the join as an instance that stopped
-// while the command was running.
+// instance joins that one through. Tried once; a winner already gone
+// again is the start's own error. A winner whose start then fails ends
+// the join as an instance that stopped while the command was running.
 fn join_after_lost_start(
     env: &Env,
     name: &str,

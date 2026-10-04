@@ -1712,7 +1712,8 @@ fn sandbox_namespaces(child_pid: i32) -> Result<SandboxNs, LaunchError> {
 }
 
 // `nft` is spawned, not linked: a library means `libnftnl` or `bindgen` for a stable text
-// format. `cgroup` must exist already: nftables stores the id the path resolves to.
+// format. `cgroup` must exist already: nftables stores the id the path resolves to, so a
+// cgroup made after this would be matched by nothing.
 fn install_rules(
     cfg: &NetworkConfig,
     ns: &SandboxNs,
@@ -2125,6 +2126,8 @@ fn start_net_proxy(
     // Never `LaunchError::Spawn`, which names bwrap: a failed `pre_exec` step arrives as a failed
     // spawn too, and its `NotFound` is not a missing binary.
     let spawned = cmd.spawn();
+    // `cmd` holds bubbler's copy of the relay's write end; the relay only
+    // sees the end of the output once that copy is gone.
     drop(cmd);
     let child =
         spawned.map_err(|e| LaunchError::Network(format!("starting the egress proxy: {e}")))?;

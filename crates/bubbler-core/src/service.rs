@@ -1174,7 +1174,8 @@ fn app_runtime(env: &Env, args: &mut BwrapArgs, id: &str, mode: ShareMode) {
 }
 
 // `--perms`, `--size` and `--overlay-src` may precede the flag. A test holds
-// every flag the builder emits to this list or the one that creates nothing.
+// every flag the builder emits to this list or the list of flags that create
+// nothing.
 const CREATES: &[(&str, usize)] = &[
     ("--bind", 2),
     ("--bind-try", 2),

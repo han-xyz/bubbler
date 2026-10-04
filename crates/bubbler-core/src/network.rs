@@ -349,8 +349,8 @@ pub struct Cgroup {
 }
 
 impl Cgroup {
-    /// The sandbox's cgroup from its path relative to the cgroup2 mount,
-    /// or why that text is no path to write a rule from. `level` is
+    /// The egress proxy's cgroup from its path relative to the cgroup2
+    /// mount, or why that text is no path to write a rule from. `level` is
     /// counted from the path, so the two can never disagree.
     ///
     /// What is refused is what nft could not carry inside a quoted path,
@@ -713,8 +713,8 @@ pub struct Attach<'a> {
     /// The sandbox's user namespace. It must be the one that *owns* the
     /// network namespace, which is not always the one
     /// `/proc/<child-pid>/ns/user` names by the time pasta looks. Handing
-    /// pasta a descriptor bubbler opened at `child-pid` time closes that
-    /// race.
+    /// pasta a descriptor bubbler asked of the network namespace
+    /// (`NS_GET_USERNS`) closes that race.
     pub userns: &'a OsStr,
     /// Where pasta writes its own pid once the namespace is configured,
     /// which is what bubbler waits for. `pasta(1)`: "Write own PID to

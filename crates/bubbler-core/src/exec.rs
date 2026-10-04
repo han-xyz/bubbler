@@ -170,15 +170,11 @@ fn fd_for(
 }
 
 /// Run `argv` inside the live instance and return the exit code to
-/// propagate. `mode` decides what the command gets for stdio: in `pty`
-/// mode bubbler allocates one, asks the supervisor to make it the
-/// command's controlling terminal and relays it, so the sandbox never
-/// holds a descriptor for the user's terminal.
+/// propagate. `mode` decides what the command gets for stdio.
 ///
 /// Waits without a deadline: the command may run for as long as it likes.
 /// Detaching (`^]` three times) returns 0 and leaves it under the
-/// instance's supervisor — with bubbler gone its pty hangs up, so a
-/// command that does not ignore `SIGHUP` ends there.
+/// instance's supervisor.
 ///
 /// A `SIGINT`, `SIGTERM` or `SIGHUP` while output is being relayed ends
 /// the relay the same way and returns `128 + signal`.

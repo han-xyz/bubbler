@@ -92,7 +92,8 @@ enum Kind {
 
 /// Where the `bubbler-init` supervisor is bound inside every sandbox.
 // Not under `/usr`: bwrap 0.11.2 refuses a destination in that read-only
-// bind ("Can't mkdir parents for …: Read-only file system").
+// bind ("Can't mkdir parents for /usr/lib/bubbler/bubbler-init: Read-only
+// file system").
 pub const INIT_INSIDE: &str = "/run/bubbler-init";
 
 /// Where the `flatpak-spawn` shim — the same `bubbler-init` binary — is bound

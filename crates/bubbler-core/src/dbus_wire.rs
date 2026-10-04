@@ -69,8 +69,8 @@ const MAX_CALL_FDS: usize = 253;
 // leave them queued. `Session::call` refuses a reply that declares more than this.
 const MAX_REPLY_FDS: usize = 4;
 
-// So a peer that never sends `\r\n` cannot grow the buffer without bound. The lines in use
-// are a few dozen bytes.
+// Longest authentication line accepted, so a peer that never sends `\r\n` cannot grow the
+// buffer without bound. The lines in use are a few dozen bytes.
 const MAX_AUTH_LINE: usize = 4096;
 
 const MSG_METHOD_CALL: u8 = 1;

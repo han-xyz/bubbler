@@ -699,15 +699,10 @@ impl Instance {
 
     /// Write `config` back to `config.kdl`, keeping the headers the file
     /// carries: the profile it was seeded from, so `reseed` still knows
-    /// where to re-flatten it from, and the config version, so no later
-    /// run warns about meanings this file has just been written against.
-    /// What it replaces is kept beside it as `config.kdl.bak`. Both files
-    /// are written through [`fsutil::write_atomic`]: the rename is atomic,
-    /// so a reader sees one whole config or the other, and a symlink left
-    /// under either name is replaced rather than written through.
-    ///
-    /// Comments and layout are not kept: the file is rendered from the
-    /// config, which holds the grants and not the text around them.
+    /// where to re-flatten it from, and the config version. `config.kdl`
+    /// and `config.kdl.bak` are written through [`fsutil::write_atomic`]:
+    /// a symlink left under either name is replaced rather than written
+    /// through.
     pub fn save(&self, config: &InstanceConfig) -> Result<(), InstanceError> {
         let cfg_path = self.config_path();
         let held = read_config(&cfg_path)?;

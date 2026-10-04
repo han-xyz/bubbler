@@ -2,27 +2,10 @@
 //! `wp_security_context_v1` (wayland-protocols staging,
 //! `security-context-v1.xml`).
 //!
-//! A sandbox engine binds and listens on a socket of its own, hands the
-//! compositor that listening fd plus metadata (engine, application id,
-//! instance id), and binds the socket into the sandbox instead of the
-//! session's. Clients arriving on it are marked as sandboxed, and the
-//! compositor withholds the privileged globals — screen capture,
-//! clipboard management, input injection, overlays, window management —
-//! from them. Which globals those are is the compositor's policy, not
-//! bubbler's; bubbler only attaches the metadata.
-//!
 //! [`probe`] and [`create_context`] connect over `$WAYLAND_DISPLAY` in
 //! `$XDG_RUNTIME_DIR`, which wayrs reads from the process environment
 //! itself. Nothing here can check that value, so the launcher validates
-//! its shape — one path component — before calling in; an absolute or
-//! `..` name would otherwise steer the connection, and the listening fd
-//! with it, at an endpoint of the caller's choosing.
-//!
-//! wayrs also honours `$WAYLAND_SOCKET`, a connection *file descriptor*
-//! inherited from a parent, which it adopts and closes with the
-//! connection — a number that may well be a descriptor this process is
-//! using for something else. The launcher refuses to run rather than
-//! connect that way; see [`refuse_inherited`].
+//! its shape — one path component — before calling in.
 
 use std::ffi::{CString, OsStr, OsString};
 use std::io;

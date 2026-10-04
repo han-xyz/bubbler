@@ -44,8 +44,6 @@ const BUBBLER_BIN: &str = "bubbler";
 /// Names a shim may not take: bubbler resolves each of them through
 /// `PATH` itself, so a shim of that name would shadow the real program —
 /// `bubbler` into a loop, the rest into every sandbox failing to start.
-/// Taken from the constants that name those binaries, so a rename there
-/// cannot leave this list behind.
 pub const RESERVED: &[&str] = &[
     BUBBLER_BIN,
     init_bin::NAME,

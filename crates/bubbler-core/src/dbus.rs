@@ -804,7 +804,7 @@ pub fn proxy_command_nodes(
         let mut address = OsString::from("unix:path=");
         address.push(escape_address_value(host.as_os_str().as_bytes()));
         // An option applies to the address before it, so each bus's address and socket come
-        // first. All carry the granting node, so an explanation reads one bus at a time.
+        // first. These carry the bus's granting node, so an explanation reads one bus at a time.
         let node = Some(section.node);
         argv.push((address, node));
         argv.push((
