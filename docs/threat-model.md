@@ -1162,8 +1162,10 @@ Streams are readable rather than hidden because the private
 application it serves and cannot answer a client about a node it cannot
 see: hidden streams make `paplay` fail with a protocol error, measured
 on the test bed. Readable is also linkable — `PW_PERM_L` is consulted
-only for a node the client *cannot* see — so what a permission cannot
-decide, the linking hook the drop-in loads
+only for a node the client *cannot* see (`pipewire/permission.h`);
+measured on PipeWire 1.6.8, a capture stream aimed at another client's
+playback stream is linked to it and records it — so what a permission
+cannot decide, the linking hook the drop-in loads
 (`contrib/wireplumber/scripts/bubbler/refuse-links.lua`) decides in the
 session manager: for any `org.bubbler` client it refuses a link to
 another client's stream in either direction, a capture link to a sink
