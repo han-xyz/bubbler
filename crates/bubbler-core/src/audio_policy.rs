@@ -41,12 +41,12 @@ pub const HOOK: &str =
 /// it, so the two must change together.
 pub const HOOK_NAME: &str = "bubbler/refuse-links.lua";
 
-/// Where WirePlumber was built to look for its own scripts, which the
-/// default `$XDG_DATA_DIRS` also ends with.
+// Where WirePlumber was built to look for its own scripts, which the
+// default `$XDG_DATA_DIRS` also ends with.
 const DATA_DIR: &str = "/usr/share";
 
-/// Where WirePlumber was built to look for configuration after
-/// `$XDG_CONFIG_DIRS`.
+// Where WirePlumber was built to look for configuration after
+// `$XDG_CONFIG_DIRS`.
 const SYSCONF_DIR: &str = "/etc";
 
 /// The `wireplumber.conf.d` directories WirePlumber 0.5.18 reads the
@@ -82,10 +82,9 @@ pub fn install_dirs(env: &Env) -> Vec<PathBuf> {
 /// [`install_dirs`] is among these and `/etc` is not either:
 /// `$XDG_DATA_HOME`, then `$XDG_DATA_DIRS`, then the directory
 /// WirePlumber was built with, which the default `$XDG_DATA_DIRS`
-/// already holds and which is listed once either way — these are what a
-/// diagnostic names.
+/// already holds and which is listed once either way.
 /// `$WIREPLUMBER_DATA_DIR`, which would replace the whole search, is not
-/// consulted: a session that sets it is a WirePlumber developer's.
+/// consulted.
 pub fn hook_dirs(env: &Env) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::with_capacity(env.data_dirs.len() + 2);
     let bases = std::iter::once(env.data_home.as_path())
@@ -102,8 +101,7 @@ pub fn hook_dirs(env: &Env) -> Vec<PathBuf> {
 
 /// Full path of the drop-in WirePlumber loads: the first of
 /// [`install_dirs`] that holds a file named [`DROP_IN_NAME`]; `None`
-/// where none does, which is what an absent policy is measured by
-/// everywhere else in this module.
+/// where none does.
 pub fn installed(host: &dyn Host, env: &Env) -> Option<PathBuf> {
     install_dirs(env).into_iter().find_map(|dir| {
         let path = dir.join(DROP_IN_NAME);
@@ -133,12 +131,9 @@ pub enum Missing {
     Both,
 }
 
-/// Exact text of the warning a real run prints for each case, without
-/// the `bubbler: warning:` prefix every diagnostic bubbler prints
-/// already carries. Each says what is reachable in *that* case: with
-/// the drop-in installed and only the hook missing the grant is still
-/// scoped, so the microphone is not in reach and saying it were would
-/// cost the warning its credit.
+// Each says what is reachable in *that* case: with the drop-in installed
+// and only the hook missing the grant is still scoped, so the microphone
+// is not in reach.
 const RUN_WARNING_DROP_IN: &str = "audio policy drop-in not found (50-bubbler.conf): the \
      sandbox has full access to every PipeWire node (microphone and every other client's \
      audio reachable)";
@@ -149,10 +144,9 @@ const RUN_WARNING_BOTH: &str = "audio policy drop-in and hook script not found \
      (50-bubbler.conf, bubbler/refuse-links.lua): the sandbox has full access to every \
      PipeWire node (microphone and every other client's audio reachable)";
 
-/// Suffix a `pipewire`/`pulseaudio` `--explain` group header takes for
-/// each case: the grant looks scoped to what the config asks for and in
-/// fact reaches more. `crate::explain::render` appends it in the same
-/// place a group's `KMS_NOTE`/`NVIDIA_NOTE` lands.
+// Suffix a `pipewire`/`pulseaudio` `--explain` group header takes for
+// each case: the grant looks scoped to what the config asks for and in
+// fact reaches more.
 const EXPLAIN_SUFFIX_DROP_IN: &str =
     " (policy drop-in 50-bubbler.conf not found: microphone reachable)";
 const EXPLAIN_SUFFIX_HOOK: &str = " (policy hook script bubbler/refuse-links.lua not found: \
@@ -160,8 +154,8 @@ const EXPLAIN_SUFFIX_HOOK: &str = " (policy hook script bubbler/refuse-links.lua
 const EXPLAIN_SUFFIX_BOTH: &str = " (policy drop-in 50-bubbler.conf and hook script \
      bubbler/refuse-links.lua not found: microphone reachable)";
 
-/// The `--explain` suffix where both files are installed but either
-/// differs from the copy this binary embeds.
+// The `--explain` suffix where both files are installed but either
+// differs from the copy this binary embeds.
 const EXPLAIN_SUFFIX_DIFFERS: &str = " (policy files 50-bubbler.conf and \
      bubbler/refuse-links.lua differ from this bubbler's: grant not enforced as documented)";
 
@@ -212,9 +206,7 @@ pub const NOT_LOADED_CHECK: &str = "audio-policy-not-loaded";
 /// The warning where this run needs it: `cfg` grants `pipewire` or
 /// `pulseaudio` and the host holds less than the whole policy, or a
 /// copy that differs from this binary's which `cfg` does not accept with
-/// a `lint-allow` of [`DIFFERS_CHECK`], or both. Printed once per real
-/// run (`main.rs`'s `Run`, `Try` and `Open`), never for `--dry-run` or
-/// `--explain`, which carry their own framing.
+/// a `lint-allow` of [`DIFFERS_CHECK`], or both.
 pub fn run_warning(cfg: &InstanceConfig, host: &dyn Host, env: &Env) -> Option<String> {
     cfg.audio()?;
     let missing = missing(host, env).map(Missing::run_warning);
@@ -353,11 +345,10 @@ pub fn differs_help(paths: &[PathBuf], env: &Env) -> String {
 /// installed: the `pipewire` package, beside `pw-container`.
 pub const PW_DUMP: &str = "/usr/bin/pw-dump";
 
-/// The metadata object the loaded hook states its policy revision in,
-/// under [`REVISION_KEY`] on subject 0.
+// The metadata object the loaded hook states its policy revision in,
+// under [`REVISION_KEY`] on subject 0.
 const POLICY_METADATA: &str = "bubbler-policy";
 
-/// The key of [`POLICY_METADATA`] that holds the revision.
 const REVISION_KEY: &str = "revision";
 
 const REVISION_LINE: &str = "local POLICY_REVISION = ";
@@ -690,8 +681,8 @@ fn stop(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// `path` as one word of a POSIX shell command: as it is where a shell
-/// would leave every character alone, else in single quotes.
+// `path` as one word of a POSIX shell command: as it is where a shell
+// would leave every character alone, else in single quotes.
 fn shell_word(path: &Path) -> String {
     let text = path.display().to_string();
     let is_plain = !text.is_empty()
