@@ -38,7 +38,7 @@ a call *into* the sandbox needs no rule.
 ## Wildcards are wide
 
 `*` is a dot-namespace wildcard: `org.freedesktop.*` matches
-`org.freedesktop.UPower`, not `org.freedesktopFoo`. `own "org.*"` claims every
+`org.freedesktop` and `org.freedesktop.UPower`, not `org.freedesktopFoo`. `own "org.*"` claims every
 name under `org.`; `mpris name="*"` lets the sandbox impersonate any player.
 Never `own "org.kde.*"` — it covers the tray watcher. Name the application.
 `bubbler lint` warns on `own-too-wide` and `mpris-wildcard`.
@@ -47,11 +47,14 @@ The proxy gives a name the most permissive rule written for it, so three
 shapes are refused when the config is read, across profile layers too:
 
 - beside `portals`, a `talk` or `own` covering `org.freedesktop.portal.Desktop`
-  or `.Documents`, or a `call`/`broadcast` there whose method is empty, `*` or
-  a glob over every portal interface — it would undo the `portals` split. Drop
-  `portals` and keep the rule for full portal access, or drop the rule;
-- a `talk` or `own` covering a name a `call` or `broadcast` on the same bus
-  filters — the filter would do nothing;
+  or `.Documents`, or a `call` there whose method is empty or `*` — it would
+  undo the `portals` split. Drop `portals` and keep the rule for full portal
+  access, or drop the rule. A method `org.foo.*` is the one interface
+  `org.foo`, and a `broadcast` opens no call, so both are accepted;
+- a `talk` or `own` — written, or added by `notify`, `tray`, `input-method` or
+  `mpris` — covering a name a `call` or `broadcast` on the same bus filters:
+  TALK lets every call and broadcast of the name through, so the filter would
+  do nothing;
 - `own` covering `org.a11y.*`, `org.freedesktop.portal.*` or
   `org.freedesktop.impl.portal.*` (`org.freedesktop.*` and `org.*` included):
   bubbler trusts whoever owns those names on the host bus.

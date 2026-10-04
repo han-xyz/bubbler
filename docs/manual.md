@@ -3359,19 +3359,32 @@ every call to it and leave the rules above as dead text.
 
 The same holds for a rule you write, so a config that grants `portals` is
 refused when any layer also has, on the session bus, a `talk` or `own` whose
-name covers `org.freedesktop.portal.Desktop` or `.Documents` (globs such as
-`org.freedesktop.portal.*` or `org.freedesktop.*` included), or a `call` or
-`broadcast` there whose method part is empty, `*`, or a glob covering every
-`org.freedesktop.portal.` interface (`=*`, `=*@/*`, `=@/<path>`,
-`=org.freedesktop.portal.*`):
+name covers `org.freedesktop.portal.Desktop` or `.Documents`, or a `call` there
+whose method part is empty or `*` (`=*`, `=*@/*`, `=@/<path>`). A name glob
+`org.foo.*` covers `org.foo` itself as well as every name under it
+(`xdg-dbus-proxy(1)`), so `org.freedesktop.portal.Desktop.*`,
+`org.freedesktop.portal.*` and `org.freedesktop.*` all count:
 
     bad argument for `dbus`: `talk "org.freedesktop.portal.*"` opens every portal interface, which undoes `portals`; for full portal access drop `portals` and keep the rule, otherwise drop the rule
 
 A profile names the layer each half came from. A narrow rule such as
 `call "org.freedesktop.portal.Desktop=org.freedesktop.portal.ScreenCast.*"`
-beside `portals` is accepted: it adds one interface and reads as that. More
-generally, a `talk` or `own` covering a name that a `call` or `broadcast` on
-the same bus filters is refused, since the filter would do nothing.
+beside `portals` is accepted: it adds one interface and reads as that. A
+method part ending in `.*` names one interface, so
+`=org.freedesktop.portal.*` is the interface `org.freedesktop.portal`, not
+every portal interface, and is accepted too. A `broadcast` rule only lets
+signals in and opens no call, so any `broadcast` beside `portals` is accepted.
+The `Documents=*` rules the bundle itself writes are refused when written by
+hand, since the bundle already grants them.
+
+More generally, a `talk` or `own` covering a name that a `call` or `broadcast`
+on the same bus filters is refused: TALK lets every call and every broadcast
+of the name through, so the filter would do nothing. A filter whose glob is
+wider than the `talk` still filters the other names and is accepted. The
+`talk` and `own` that `notify`, `tray`, `input-method` and `mpris` add count
+too, and the message names the grant:
+
+    bad argument for `dbus`: `notify` opens `org.freedesktop.Notifications` to every call and signal, which leaves `call "org.freedesktop.Notifications=*"` inert; drop `notify` or the filter
 
 The interfaces the bare node opens on the desktop object are
 `FileChooser`, `OpenURI`, `Notification`, `Settings`, `Print`, `Email`,

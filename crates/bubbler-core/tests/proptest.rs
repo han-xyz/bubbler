@@ -249,6 +249,16 @@ fn bus_services() -> impl Strategy<Value = Vec<Service>> {
                 }
                 return out;
             };
+            // The parser refuses a `call` or `broadcast` on a name that
+            // `notify` or `tray` already talks to: the filter would be inert.
+            let mut rules = rules;
+            rules.retain(|r| match r {
+                BusRule::Call(n, _) | BusRule::Broadcast(n, _) => {
+                    !(notify && n == "org.freedesktop.Notifications"
+                        || tray && n == "org.kde.StatusNotifierWatcher")
+                }
+                _ => true,
+            });
             out.push(Service::Dbus { rules });
             if let Some(rules) = system_bus {
                 out.push(Service::SystemBus { rules });

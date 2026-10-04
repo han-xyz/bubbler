@@ -240,8 +240,9 @@ pub static GRANTS: &[Grant] = &[
                every name under `org.`. The proxy speaks to the bus with your credentials, \
                so a name the sandbox is given is reached as you — `own \
                \"org.freedesktop.secrets\"` is the login keyring, every secret in it. \
-               A `talk` or `own` beside a `call` or `broadcast` of the name it covers, and \
-               an `own` of an `org.a11y`, portal or portal-backend name, are refused.",
+               A `talk` or `own` (a grant's own included) beside a `call` or `broadcast` \
+               of a name it covers, and an `own` of an `org.a11y`, portal or \
+               portal-backend name, are refused.",
         risk: Risk::Outward,
         grammar: "dbus { see|talk|own \"<name>\"; call|broadcast \"<name>=<rule>\" }",
     },
@@ -279,8 +280,8 @@ pub static GRANTS: &[Grant] = &[
                gdk-pixbuf's image loaders look for `flatpak-spawn`, so the grant puts one \
                on the sandbox's path: `/usr/bin` becomes an overlay of itself, remounted \
                read-only, which needs unprivileged overlayfs — Linux 5.11 or newer. \
-               A `dbus` rule that reaches every interface of the portal names undoes the \
-               set and is refused: drop `portals` for full portal access, or the rule.",
+               A `dbus` `talk`, `own` or every-interface `call` on the portal names undoes \
+               the set and is refused: drop `portals` for full portal access, or the rule.",
         risk: Risk::Narrow,
         grammar: "portals [{ screencast remote-desktop ... }]",
     },

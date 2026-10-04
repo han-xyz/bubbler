@@ -987,20 +987,21 @@ impl Merged {
         };
         let services: Vec<Service> = self.services.iter().map(|(s, _)| s.clone()).collect();
         if let Some(clash) = config::bus_clash(&services) {
-            let at = |rule: &BusRule| {
+            let rule_at = |rule: &BusRule| {
                 self.bus_rule_srcs
                     .iter()
                     .find(|(b, r, _)| *b == clash.bus() && r == rule)
-                    .map_or_else(String::new, |(_, _, src)| format!(" in {}", src.label))
+                    .map(|(_, _, src)| src.label.clone())
             };
-            let portals_at = self
-                .services
-                .iter()
-                .find(|(s, _)| matches!(s, Service::Portals { .. }))
-                .map_or_else(String::new, |(_, src)| format!(" in {}", src.label));
+            let grant_at = |node: &str| {
+                self.services
+                    .iter()
+                    .find(|(s, _)| s.node_name() == node)
+                    .map(|(_, src)| src.label.clone())
+            };
             return Err(bad(ConfigError::BadArgument {
                 node: clash.bus().to_owned(),
-                reason: clash.reason(at, &portals_at),
+                reason: clash.reason(rule_at, grant_at),
             }));
         }
         // Same order as `kdl_out::nodes`, so the nodes and their origins
@@ -3263,8 +3264,21 @@ mod tests {
         ]);
         assert!(
             reason.contains("`talk \"a.b.*\"` in ")
-                && reason.contains("a.kdl leaves `call \"a.b.C=a.b.C.Get\"` in ")
+                && reason.contains("a.kdl lets every call and signal of the name through, which leaves `call \"a.b.C=a.b.C.Get\"` in ")
                 && reason.contains("b.kdl inert"),
+            "{reason}"
+        );
+        let reason = clash(&[
+            ("a", "include \"b\"\nnotify\n"),
+            (
+                "b",
+                "dbus {\n    call \"org.freedesktop.Notifications=*\"\n}\n",
+            ),
+        ]);
+        assert!(
+            reason.contains("`notify` in ")
+                && reason.contains("a.kdl opens `org.freedesktop.Notifications`")
+                && reason.contains("b.kdl inert; drop `notify` or the filter"),
             "{reason}"
         );
     }

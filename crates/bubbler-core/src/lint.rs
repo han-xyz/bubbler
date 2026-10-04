@@ -1872,8 +1872,7 @@ fn system_bus(i: usize, node: &KdlNode, f: &mut Findings) {
                 "own names on the session bus; the system bus takes `see`, `talk` and `call`",
             ),
             "talk" => {
-                let bare = name.strip_suffix(".*").unwrap_or(name);
-                if !POLKIT_NAMES.contains(&bare) {
+                if !POLKIT_NAMES.iter().any(|p| name_covers(name, p)) {
                     continue;
                 }
                 f.push(
@@ -3313,6 +3312,11 @@ mod tests {
             assert_eq!(ids(&lint(ctx, &[narrow])), [] as [&str; 0]);
             let other = "system-bus {\n    talk \"org.freedesktop.UPower\"\n}";
             assert_eq!(ids(&lint(ctx, &[other])), [] as [&str; 0]);
+            // A glob that covers one is a talk to it.
+            let glob = "system-bus {\n    talk \"org.freedesktop.UDisks2.*\"\n}";
+            assert_eq!(ids(&lint(ctx, &[glob])), ["system-bus-polkit-name"]);
+            let wide = "system-bus {\n    talk \"org.freedesktop.*\"\n}";
+            assert!(ids(&lint(ctx, &[wide])).contains(&"system-bus-polkit-name"));
         });
     }
 
@@ -3368,6 +3372,9 @@ mod tests {
                 "call \"org.freedesktop.Flatpak=org.freedesktop.Flatpak.Spawn@/\"",
                 "broadcast \"ca.desrt.dconf=ca.desrt.dconf.Writer.Notify@/\"",
                 "talk \"org.freedesktop.impl.portal.Access\"",
+                // `org.foo.*` matches `org.foo` itself (`xdg-dbus-proxy(1)`).
+                "talk \"org.freedesktop.systemd1.*\"",
+                "talk \"ca.desrt.dconf.*\"",
                 // Glob-aware in both directions: a wildcard that covers a
                 // listed name, and a name covered by a listed wildcard.
                 "talk \"org.freedesktop.*\"",

@@ -176,16 +176,24 @@ pub fn camera_rules() -> [String; 2] {
     [portal_call("Camera"), portal_broadcast("Camera")]
 }
 
-/// Rules the `input-method` grant gets: both portal names, whichever
-/// daemon the session runs. The client libraries watch for the name and
-/// use it when the daemon's own name is not visible, which is what the
-/// proxy's filtering leaves them.
-// Not the daemons' own names: fcitx5's carries `Exit`, `SetConfig` and
-// their kin, which reconfigure the daemon for the whole session.
-const INPUT_METHOD_RULES: &[&str] = &[
-    "--talk=org.freedesktop.portal.Fcitx",
-    "--talk=org.freedesktop.portal.IBus",
-];
+/// The `talk` and `own` rules a grant adds on the session bus.
+pub(crate) fn grant_policies(svc: &Service) -> Vec<BusRule> {
+    match svc {
+        Service::Notify => vec![BusRule::Talk("org.freedesktop.Notifications".to_owned())],
+        // The watcher is all a tray icon takes: an item registers on the
+        // app's own unique name, and the calls the host makes back into it
+        // are incoming, which the proxy does not filter (`xdg-dbus-proxy(1)`).
+        Service::Tray => vec![BusRule::Talk("org.kde.StatusNotifierWatcher".to_owned())],
+        // Both portal names, whichever daemon the session runs; not the
+        // daemons' own names, which carry `Exit` and `SetConfig`.
+        Service::InputMethod => vec![
+            BusRule::Talk("org.freedesktop.portal.Fcitx".to_owned()),
+            BusRule::Talk("org.freedesktop.portal.IBus".to_owned()),
+        ],
+        Service::Mpris { name } => vec![BusRule::Own(format!("org.mpris.MediaPlayer2.{name}"))],
+        _ => Vec::new(),
+    }
+}
 
 /// Rules the `a11y` grant gets on the accessibility bus, which is the
 /// whole of what a sandboxed client may ask that bus for: registering
@@ -309,23 +317,9 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
                         push(&mut rules, r, i);
                     }
                 }
-                Service::Notify => push(
-                    &mut rules,
-                    "--talk=org.freedesktop.Notifications".to_owned(),
-                    i,
-                ),
-                // The watcher is all a tray icon takes: an item registers
-                // on the app's own unique name, and the calls the host
-                // makes back into it are incoming, which the proxy does
-                // not filter (`xdg-dbus-proxy(1)`).
-                Service::Tray => push(
-                    &mut rules,
-                    "--talk=org.kde.StatusNotifierWatcher".to_owned(),
-                    i,
-                ),
-                Service::InputMethod => {
-                    for r in INPUT_METHOD_RULES {
-                        push(&mut rules, (*r).to_owned(), i);
+                Service::Notify | Service::Tray | Service::InputMethod | Service::Mpris { .. } => {
+                    for r in grant_policies(s) {
+                        push(&mut rules, render(&r), i);
                     }
                 }
                 // Its rules are its own bus's, below: nothing of the
@@ -333,13 +327,6 @@ pub fn plan(services: &[Service], instance: &str) -> Option<Plan> {
                 // the accessibility bus is resolved before the sandbox
                 // starts rather than asked for from inside it.
                 Service::A11y => {}
-                Service::Mpris { name } => {
-                    push(
-                        &mut rules,
-                        format!("--own=org.mpris.MediaPlayer2.{name}"),
-                        i,
-                    );
-                }
                 // Every other grant is listed rather than caught by a
                 // wildcard: a new bundle must be given its rules here, and
                 // a wildcard would silently give it none.

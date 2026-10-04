@@ -14,16 +14,21 @@
   package, and restart WirePlumber; until then each run with an audio grant
   warns that the running WirePlumber has not loaded this bubbler's policy.
 - A config is refused when its D-Bus rules would undo the `portals` split
-  (a `talk`, `own` or every-interface `call`/`broadcast` on the portal names
-  beside `portals`), silence a `call`/`broadcast` with a `talk` or `own` of the
-  same name, or `own` a name bubbler trusts on the host bus (`org.a11y.*`,
+  (a `talk`, `own` or every-interface `call` on the portal names beside
+  `portals`), silence a `call`/`broadcast` with a `talk` or `own` covering its
+  name (one that `notify`, `tray`, `input-method` or `mpris` adds included), or
+  `own` a name bubbler trusts on the host bus (`org.a11y.*`,
   `org.freedesktop.portal.*`, `org.freedesktop.impl.portal.*`).
+- A bus name glob `org.foo.*` now covers `org.foo` itself, as the proxy reads
+  it: `bubbler lint` reports `talk "org.freedesktop.systemd1.*"` as
+  `dbus-name-is-host-exec`, and a glob over a polkit-backed system service as
+  `system-bus-polkit-name`.
 
 ### Changed
 
 - A config or profile that parsed before may now be refused with
   ``bad argument for `dbus` ``: drop `portals` and keep the rule for full
-  portal access, or drop the rule the message names.
+  portal access, or drop the rule or grant the message names.
 
 ### Added
 

@@ -476,91 +476,130 @@ const TRUSTED_NAMES: [&str; 3] = [
 ];
 
 /// D-Bus rules the proxy would apply more widely than they read, or an `own` the sandbox must not hold.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BusClash<'a> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BusClash<'a> {
+    /// An `own` covering a name bubbler trusts on the host bus.
+    OwnsTrusted(&'a BusRule),
     /// A session-bus rule reaching every portal interface beside `portals`.
     UndoesPortals(&'a BusRule),
     /// A `talk` or `own` that leaves a `call` or `broadcast` on the same bus inert.
     SilencesFilter {
-        /// `dbus` or `system-bus`.
         bus: &'static str,
-        /// The `talk` or `own`.
         wide: &'a BusRule,
-        /// The `call` or `broadcast` it silences.
         narrow: &'a BusRule,
     },
-    /// An `own` covering a name bubbler trusts on the host bus.
-    OwnsTrusted(&'a BusRule),
+    /// A grant's own `talk` or `own` of `name` that leaves a session-bus filter inert.
+    GrantSilencesFilter {
+        grant: &'static str,
+        name: String,
+        narrow: &'a BusRule,
+    },
 }
 
 impl BusClash<'_> {
-    /// The bus node the clash is on.
-    pub fn bus(&self) -> &'static str {
+    pub(crate) fn bus(&self) -> &'static str {
         match self {
             BusClash::SilencesFilter { bus, .. } => bus,
-            BusClash::UndoesPortals(_) | BusClash::OwnsTrusted(_) => "dbus",
+            _ => "dbus",
         }
     }
 
-    /// What is wrong and what to do. `at` says where a rule was written
-    /// and `portals_at` where `portals` was, each as `" in <layer>"` or
-    /// empty for a single file.
-    pub fn reason(&self, at: impl Fn(&BusRule) -> String, portals_at: &str) -> String {
+    /// What is wrong and what to do, naming the layer `rule_at` or `grant_at` gives for each half.
+    pub(crate) fn reason(
+        &self,
+        rule_at: impl Fn(&BusRule) -> Option<String>,
+        grant_at: impl Fn(&str) -> Option<String>,
+    ) -> String {
+        let at = |label: Option<String>| label.map_or_else(String::new, |l| format!(" in {l}"));
         match self {
-            BusClash::UndoesPortals(rule) => format!(
-                "{}{} opens every portal interface, which undoes `portals`{portals_at}; \
-                 for full portal access drop `portals` and keep the rule, otherwise drop the rule",
-                rule.written(),
-                at(rule),
-            ),
-            BusClash::SilencesFilter { wide, narrow, .. } => format!(
-                "{}{} leaves {}{} inert, since the proxy applies the wider rule; \
-                 drop one of the two",
-                wide.written(),
-                at(wide),
-                narrow.written(),
-                at(narrow),
-            ),
             BusClash::OwnsTrusted(rule) => format!(
                 "{}{} covers a name bubbler trusts on the host bus \
                  (`org.a11y.*`, `org.freedesktop.portal.*`, `org.freedesktop.impl.portal.*`); \
                  drop the rule",
                 rule.written(),
-                at(rule),
+                at(rule_at(rule)),
+            ),
+            BusClash::UndoesPortals(rule) => format!(
+                "{}{} opens every portal interface, which undoes `portals`{}; \
+                 for full portal access drop `portals` and keep the rule, otherwise drop the rule",
+                rule.written(),
+                at(rule_at(rule)),
+                at(grant_at("portals")),
+            ),
+            BusClash::SilencesFilter { wide, narrow, .. } => format!(
+                "{}{} lets every call and signal of the name through, which leaves {}{} \
+                 inert; drop one of the two",
+                wide.written(),
+                at(rule_at(wide)),
+                narrow.written(),
+                at(rule_at(narrow)),
+            ),
+            BusClash::GrantSilencesFilter {
+                grant,
+                name,
+                narrow,
+            } => format!(
+                "`{grant}`{} opens `{name}` to every call and signal, which leaves {}{} \
+                 inert; drop `{grant}` or the filter",
+                at(grant_at(grant)),
+                narrow.written(),
+                at(rule_at(narrow)),
             ),
         }
     }
 }
 
-/// The first [`BusClash`] in `services`, over both bus nodes and `portals`.
-pub fn bus_clash(services: &[Service]) -> Option<BusClash<'_>> {
-    let portals = services
+/// The first [`BusClash`] in `services`, over both bus nodes and the grants that add rules.
+pub(crate) fn bus_clash(services: &[Service]) -> Option<BusClash<'_>> {
+    let buses: Vec<(&'static str, &[BusRule])> = services
         .iter()
-        .any(|s| matches!(s, Service::Portals { .. }));
+        .filter_map(|svc| match svc {
+            Service::Dbus { rules } => Some(("dbus", rules.as_slice())),
+            Service::SystemBus { rules } => Some(("system-bus", rules.as_slice())),
+            _ => None,
+        })
+        .collect();
+    let all = || buses.iter().flat_map(|(_, rules)| rules.iter());
+    // First, so an `own` beside `portals` is not told to keep the rule.
+    if let Some(rule) = all().find(
+        |r| matches!(r, BusRule::Own(name) if TRUSTED_NAMES.iter().any(|t| name_covers(name, t))),
+    ) {
+        return Some(BusClash::OwnsTrusted(rule));
+    }
+    let session: &[BusRule] = buses
+        .iter()
+        .find(|(bus, _)| *bus == "dbus")
+        .map_or(&[], |(_, rules)| rules);
+    let is_filter = |r: &&BusRule| matches!(r, BusRule::Call(..) | BusRule::Broadcast(..));
+    if services
+        .iter()
+        .any(|s| matches!(s, Service::Portals { .. }))
+        && let Some(rule) = session.iter().find(|r| reaches_every_portal(r))
+    {
+        return Some(BusClash::UndoesPortals(rule));
+    }
+    for (bus, rules) in &buses {
+        for wide in rules.iter() {
+            if let BusRule::Talk(name) | BusRule::Own(name) = wide
+                && let Some(narrow) = rules
+                    .iter()
+                    .filter(is_filter)
+                    .find(|r| glob_covers(name, r.name()))
+            {
+                return Some(BusClash::SilencesFilter { bus, wide, narrow });
+            }
+        }
+    }
     for svc in services {
-        let (bus, rules) = match svc {
-            Service::Dbus { rules } => ("dbus", rules),
-            Service::SystemBus { rules } => ("system-bus", rules),
-            _ => continue,
-        };
-        for rule in rules {
-            if bus == "dbus" && portals && reaches_every_portal(rule) {
-                return Some(BusClash::UndoesPortals(rule));
-            }
-            if let BusRule::Own(name) = rule
-                && TRUSTED_NAMES.iter().any(|t| name_covers(name, t))
+        for policy in dbus::grant_policies(svc) {
+            if let Some(narrow) = session
+                .iter()
+                .filter(is_filter)
+                .find(|r| glob_covers(policy.name(), r.name()))
             {
-                return Some(BusClash::OwnsTrusted(rule));
-            }
-            if let BusRule::Talk(name) | BusRule::Own(name) = rule
-                && let Some(narrow) = rules.iter().find(|r| {
-                    matches!(r, BusRule::Call(..) | BusRule::Broadcast(..))
-                        && name_covers(name, r.name())
-                })
-            {
-                return Some(BusClash::SilencesFilter {
-                    bus,
-                    wide: rule,
+                return Some(BusClash::GrantSilencesFilter {
+                    grant: svc.node_name(),
+                    name: policy.name().to_owned(),
                     narrow,
                 });
             }
@@ -569,34 +608,40 @@ pub fn bus_clash(services: &[Service]) -> Option<BusClash<'_>> {
     None
 }
 
-// `xdg-dbus-proxy(1)` reads a rule as `[METHOD][@PATH]`; an empty method or
-// `*` is every interface.
+// `xdg-dbus-proxy(1)` reads a rule as `[METHOD][@PATH]`: an empty method or
+// `*` is every interface, while `org.foo.*` is the one interface `org.foo`.
+// A broadcast rule lets signals in and opens no call.
 fn reaches_every_portal(rule: &BusRule) -> bool {
     let every = match rule {
-        BusRule::See(_) => false,
+        BusRule::See(_) | BusRule::Broadcast(..) => false,
         BusRule::Talk(_) | BusRule::Own(_) => true,
-        BusRule::Call(_, r) | BusRule::Broadcast(_, r) => {
+        BusRule::Call(_, r) => {
             let method = r.split_once('@').map_or(r.as_str(), |(m, _)| m);
-            method.is_empty()
-                || method
-                    .strip_suffix('*')
-                    .is_some_and(|prefix| "org.freedesktop.portal.".starts_with(prefix))
+            method.is_empty() || method == "*"
         }
     };
     every && PORTAL_BUSES.iter().any(|p| name_covers(rule.name(), p))
 }
 
 /// Whether the name a rule writes reaches the name or family `listed`.
-/// Either side may end in `.*`, which stands for every name under the
-/// prefix: `talk "org.freedesktop.*"` reaches `org.freedesktop.systemd1`,
-/// and `org.freedesktop.impl.portal.*` is reached by naming any one of
-/// its members.
+/// Either side may end in `.*`, which stands for the name before it and
+/// every name under it: `talk "org.freedesktop.*"` reaches
+/// `org.freedesktop.systemd1`, and `org.freedesktop.impl.portal.*` is
+/// reached by naming any one of its members.
 pub(crate) fn name_covers(written: &str, listed: &str) -> bool {
-    let under = |glob: &str, name: &str| {
-        glob.strip_suffix('*')
-            .is_some_and(|prefix| name.starts_with(prefix))
-    };
-    written == listed || under(written, listed) || under(listed, written)
+    glob_covers(written, listed) || glob_covers(listed, written)
+}
+
+// `xdg-dbus-proxy(1)`: "A name of "org.foo.*" matches "org.foo",
+// org.foo.bar", and "org.foo.bar.gazonk", but not "org.foobar"."
+fn glob_covers(glob: &str, name: &str) -> bool {
+    name == glob
+        || glob.strip_suffix(".*").is_some_and(|prefix| {
+            name == prefix
+                || name
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with('.'))
+        })
 }
 
 /// One optional group of portal interfaces, written as a child of the
@@ -1657,7 +1702,7 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
     if let Some(clash) = bus_clash(&cfg.services) {
         return Err(ConfigError::BadArgument {
             node: clash.bus().to_owned(),
-            reason: clash.reason(|_| String::new(), ""),
+            reason: clash.reason(|_| None, |_| None),
         });
     }
     if !profile && nested_x11_without_display_stack(&cfg.services) {
@@ -5590,7 +5635,7 @@ command "b""#
                 talk "org.freedesktop.Notifications"
                 own "org.mpris.MediaPlayer2.firefox.*"
                 call "org.freedesktop.portal.Desktop=org.freedesktop.portal.Settings.Read@/org/freedesktop/portal/desktop"
-                broadcast "org.freedesktop.portal.Desktop=org.freedesktop.portal.Settings.SettingChanged@/org/freedesktop/portal/desktop"
+                broadcast "org.freedesktop.portal.Desktop=@/org/freedesktop/portal/desktop"
             }
             portals
             notify
@@ -5622,8 +5667,7 @@ command "b""#
             rules[3],
             BusRule::Broadcast(
                 "org.freedesktop.portal.Desktop".into(),
-                "org.freedesktop.portal.Settings.SettingChanged@/org/freedesktop/portal/desktop"
-                    .into()
+                "@/org/freedesktop/portal/desktop".into()
             )
         );
     }
@@ -7577,22 +7621,32 @@ command "b""#
             "talk \"org.freedesktop.portal.Documents\"",
             "talk \"org.freedesktop.portal.*\"",
             "talk \"org.freedesktop.*\"",
-            "own \"org.freedesktop.portal.Desktop\"",
-            "own \"org.freedesktop.portal.*\"",
+            // `org.foo.*` matches `org.foo` itself (`xdg-dbus-proxy(1)`).
+            "talk \"org.freedesktop.portal.Desktop.*\"",
+            "talk \"org.freedesktop.portal.Documents.*\"",
+            "call \"org.freedesktop.portal.Desktop.*=*\"",
             "call \"org.freedesktop.portal.Desktop=*\"",
             "call \"org.freedesktop.portal.Desktop=*@/*\"",
             "call \"org.freedesktop.portal.Desktop=@/org/freedesktop/portal/desktop\"",
-            "call \"org.freedesktop.portal.Desktop=org.freedesktop.portal.*\"",
-            "broadcast \"org.freedesktop.portal.*=*\"",
         ] {
             let reason = refused(&format!("dbus {{\n    {rule}\n}}\nportals"));
             assert!(reason.contains(rule), "{rule}: {reason}");
             assert!(reason.contains("drop `portals`"), "{rule}: {reason}");
-            // Without `portals` the rule is a grant of its own, except an
-            // `own` of a portal name, which is refused anyway.
-            if !rule.starts_with("own") {
-                assert!(parse(&format!("dbus {{\n    {rule}\n}}")).is_ok(), "{rule}");
-            }
+            assert!(parse(&format!("dbus {{\n    {rule}\n}}")).is_ok(), "{rule}");
+        }
+    }
+
+    #[test]
+    fn an_own_of_a_portal_name_beside_portals_is_told_to_drop_the_rule() {
+        for rule in [
+            "own \"org.freedesktop.portal.Desktop\"",
+            "own \"org.freedesktop.*\"",
+        ] {
+            let reason = refused(&format!("dbus {{\n    {rule}\n}}\nportals"));
+            assert!(
+                reason.contains("drop the rule") && !reason.contains("drop `portals`"),
+                "{rule}: {reason}"
+            );
         }
     }
 
@@ -7603,6 +7657,11 @@ command "b""#
             "dbus {\n    talk \"org.freedesktop.portal.Desktop\"\n}",
             "dbus {\n    call \"org.freedesktop.portal.Desktop=org.freedesktop.portal.ScreenCast.*\"\n}\nportals",
             "dbus {\n    call \"org.freedesktop.portal.Desktop=org.freedesktop.portal.Settings.Read@/org/freedesktop/portal/desktop\"\n}\nportals",
+            // The method part names one interface, `org.freedesktop.portal`.
+            "dbus {\n    call \"org.freedesktop.portal.Desktop=org.freedesktop.portal.*\"\n}\nportals",
+            // A broadcast rule lets signals in and opens no call.
+            "dbus {\n    broadcast \"org.freedesktop.portal.Desktop=@/org/freedesktop/portal/desktop\"\n}\nportals",
+            "dbus {\n    broadcast \"org.freedesktop.portal.*=*\"\n}\nportals",
             "dbus {\n    see \"org.freedesktop.portal.Desktop\"\n}\nportals",
             "dbus {\n    own \"org.mozilla.firefox.*\"\n}\nportals",
             "dbus\nportals\nsystem-bus {\n    talk \"org.freedesktop.portal.Desktop\"\n}",
@@ -7615,20 +7674,51 @@ command "b""#
     fn a_talk_or_own_that_silences_a_filter_on_the_same_bus_is_refused() {
         for (wide, narrow) in [
             ("talk \"a.b.*\"", "call \"a.b.C=a.b.C.Get\""),
+            ("talk \"a.b.C.*\"", "call \"a.b.C=a.b.C.Get\""),
+            ("own \"a.b.C\"", "call \"a.b.C=*\""),
+            // TALK receives the name's broadcasts (`xdg-dbus-proxy(1)`).
             ("talk \"a.b.C\"", "broadcast \"a.b.C=*\""),
-            ("own \"a.b.C\"", "call \"a.b.*=*\""),
         ] {
             let reason = refused(&format!("dbus {{\n    {wide}\n    {narrow}\n}}"));
             assert!(reason.contains(wide) && reason.contains(narrow), "{reason}");
         }
         let reason = refused("system-bus {\n    call \"a.b.C=*\"\n    talk \"a.b.*\"\n}");
         assert!(reason.contains("talk \"a.b.*\""), "{reason}");
-        // Different buses are different proxies, and different names are
-        // different filters.
+        // Different buses are different proxies, different names are
+        // different filters, and a filter wider than the talk still
+        // filters every other name it covers.
+        for text in [
+            "dbus {\n    talk \"a.b.C\"\n}\nsystem-bus {\n    call \"a.b.C=*\"\n}",
+            "dbus {\n    talk \"a.b.C\"\n    call \"a.b.D=*\"\n}",
+            "dbus {\n    talk \"a.b.C\"\n    call \"a.b.*=a.b.D.Get\"\n}",
+        ] {
+            assert!(parse(text).is_ok(), "{text}: {:?}", parse(text));
+        }
+    }
+
+    #[test]
+    fn a_grant_that_talks_to_a_name_a_call_filters_is_refused() {
+        for (grant, call) in [
+            (
+                "notify",
+                "call \"org.freedesktop.Notifications=org.freedesktop.Notifications.GetCapabilities\"",
+            ),
+            ("tray", "call \"org.kde.StatusNotifierWatcher=*\""),
+            ("input-method", "call \"org.freedesktop.portal.Fcitx=*\""),
+            ("input-method", "call \"org.freedesktop.portal.IBus=*\""),
+            ("mpris name=\"*\"", "call \"org.mpris.MediaPlayer2.mpv=*\""),
+        ] {
+            let reason = refused(&format!("dbus {{\n    {call}\n}}\n{grant}"));
+            let node = grant.split(' ').next().unwrap_or(grant);
+            assert!(
+                reason.contains(&format!("`{node}`")) && reason.contains(call),
+                "{grant}: {reason}"
+            );
+        }
         assert!(
-            parse("dbus {\n    talk \"a.b.C\"\n}\nsystem-bus {\n    call \"a.b.C=*\"\n}").is_ok()
+            parse("dbus {\n    call \"org.mpris.MediaPlayer2.mpv=*\"\n}\nmpris name=\"vlc\"")
+                .is_ok()
         );
-        assert!(parse("dbus {\n    talk \"a.b.C\"\n    call \"a.b.D=*\"\n}").is_ok());
     }
 
     #[test]
@@ -7636,6 +7726,7 @@ command "b""#
         for name in [
             "org.a11y.Bus",
             "org.a11y.*",
+            "org.a11y",
             "org.freedesktop.portal.Documents",
             "org.freedesktop.portal.*",
             "org.freedesktop.impl.portal.Access",
@@ -7655,6 +7746,6 @@ command "b""#
                 "{rule}"
             );
         }
-        assert!(parse("dbus {\n    own \"org.a11y\"\n    talk \"org.a11y.Bus\"\n}").is_ok());
+        assert!(parse("dbus {\n    own \"org.a11ytools.App\"\n}").is_ok());
     }
 }

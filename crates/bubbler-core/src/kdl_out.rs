@@ -927,7 +927,7 @@ mod tests {
                 talk "ca.desrt.dconf"
                 own "org.example.App"
                 call "org.freedesktop.portal.Desktop=org.freedesktop.portal.Settings.Read@/org/freedesktop/portal/desktop"
-                broadcast "org.freedesktop.portal.Desktop=org.freedesktop.portal.Settings.SettingChanged@/org/freedesktop/portal/desktop"
+                broadcast "org.freedesktop.portal.Desktop=@/org/freedesktop/portal/desktop"
             }
             system-bus {
                 see "org.freedesktop.NetworkManager"

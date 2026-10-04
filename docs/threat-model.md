@@ -764,10 +764,11 @@ through the proxy.
 
 The proxy gives a name the most permissive rule written for it, so the
 parser refuses a config whose rules would apply more widely than they
-read: a `talk`, `own` or every-interface `call`/`broadcast` on
+read: a `talk`, `own` or every-interface `call` on
 `org.freedesktop.portal.Desktop` or `.Documents` beside `portals`, which
-would undo its split; a `talk` or `own` covering a name a `call` or
-`broadcast` on the same bus filters; and an `own` covering
+would undo its split; a `talk` or `own`, written or added by a grant such as
+`notify`, covering a name a `call` or `broadcast` on the same bus filters;
+and an `own` covering
 `org.a11y.*`, `org.freedesktop.portal.*` or `org.freedesktop.impl.portal.*`,
 since the two host-bus calls above trust whoever owns `org.a11y.Bus` and
 `org.freedesktop.portal.Documents`. Across profile layers too.
