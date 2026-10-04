@@ -775,7 +775,8 @@ those nodes have no render/primary split of their own, so `dri` on that
 driver is as wide with the bare node as with `kms=#true`:
 every `/dev/nvidia*` char device with device access, and every
 `/sys/module/nvidia*` directory read-only. NVML and libglvnd read
-`/sys/module/nvidia/initstate` and fall back to Mesa without it. All of it is
+`/sys/module/nvidia/initstate` and fall back to Mesa without it; the other
+`nvidia_*` module directories cost nothing and cover CUDA. All of it is
 emitted only when it exists — the nodes are made by the setuid
 `nvidia-modprobe` a udev rule runs, which a sandbox can never do for itself,
 so a node missing at launch stays missing. The `/dev/nvidia-caps` directory
