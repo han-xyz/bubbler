@@ -21,7 +21,6 @@ usage() {
     exit 2
 }
 
-# The prelude's `step` names what failed; the bodies follow the YAML's steps.
 job_script() {
     cat <<'EOF'
 step() {
