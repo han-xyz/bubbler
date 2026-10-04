@@ -749,11 +749,12 @@ the lint; a copy kept older on purpose needs it beside the
 `audio-policy-differs` one, since WirePlumber then loads that older copy. Where WirePlumber cannot be asked
 (no `pw-dump`, no daemon on the socket, no answer within two seconds) a
 run says nothing and `bubbler lint` notes it. Where PipeWire answered but the
-answer could not be read (more than 1 MiB, cut short at two seconds, not a
-dump), or holds a `bubbler-policy` metadata that is not the one WirePlumber
-made (two of them, or one made by another client than WirePlumber's
-`default` metadata) a run warns that the loaded policy could not be verified, naming why,
-and `bubbler lint` warns the same. An answer of no revision is asked once more
+answer could not be read (more than 8 MiB, cut short at two seconds, not a
+dump) a run warns that the loaded policy could not be verified, naming why,
+and `bubbler lint` warns the same. Only a `bubbler-policy` metadata made by a
+client outside any security context counts, so one a sandbox made is
+ignored; where WirePlumber runs as several instances each publishes one, and
+all must state this bubbler's revision. An answer of no revision is asked once more
 half a second later, since WirePlumber publishes it a moment after it starts.
 The run goes on in every case.
 The first check reads the search directories (`$XDG_CONFIG_HOME`,

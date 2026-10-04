@@ -85,9 +85,9 @@
   `systemctl --user restart wireplumber`; `bubbler lint` reports
   `audio-policy-not-loaded` (a note where WirePlumber could not be asked), and
   `--explain` shows the loaded state beside the installed one. Where PipeWire
-  answers but its answer cannot be read, or the revision was not published by
-  the client that made WirePlumber's `default` metadata, the run and the lint
-  warn that the loaded policy could not be verified.
+  answers but its answer cannot be read, the run and the lint warn that the
+  loaded policy could not be verified. A revision published by a client in a
+  security context, as a sandbox under an older policy could, is ignored.
 
 ### Fixed
 

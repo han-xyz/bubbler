@@ -3993,6 +3993,96 @@ fn a_hook_of_another_revision_names_it() {
     );
 }
 
+/// A context's attempt to pass for WirePlumber: it claims to be outside any security context, then
+/// publishes this bubbler's revision.
+const PUBLISH_CURRENT: &str = r#"
+Core.update_properties { ["pipewire.sec.engine"] = "org.host" }
+published = ImplMetadata ("bubbler-policy")
+published:activate (Features.ALL, function (m, e)
+  if e then
+    print ("not published: " .. tostring (e))
+    return
+  end
+  m:set (0, "revision", "Spa:Int", "REVISION")
+  print ("published")
+end)
+"#;
+
+/// A bed whose hook, like 0.24.1's and older, leaves a context the metadata factory, and whose
+/// drop-in leaves it the metadata objects: without both, its own metadata is gone as soon as it is
+/// made (PipeWire 1.6.9). The hook's `from` is replaced by `to` as well.
+fn bed_that_lets_a_context_publish(from: &str, to: &str) -> Option<PipeWireBed> {
+    let factories_hidden = "if name ~= STREAM_FACTORY then";
+    let metadata_hidden = r#"metadata.name = "!null""#;
+    assert!(HOOK.contains(factories_hidden) && HOOK.contains(from));
+    assert!(DROP_IN.contains(metadata_hidden));
+    let hook = HOOK
+        .replace(
+            factories_hidden,
+            r#"if name ~= STREAM_FACTORY and name ~= "metadata" then"#,
+        )
+        .replace(from, to);
+    let drop_in = DROP_IN.replace(metadata_hidden, r#"metadata.name = "no-such-metadata""#);
+    PipeWireBed::start_with(|dir| {
+        std::fs::write(dir.join("data").join(HOOK_IN_DATA_DIR), hook).expect("the changed hook");
+        std::fs::write(
+            dir.join("wireplumber/wireplumber.conf.d/50-bubbler.conf"),
+            drop_in,
+        )
+        .expect("the changed drop-in");
+    })
+    .map(|(bed, ())| bed)
+}
+
+#[test]
+fn a_contexts_policy_metadata_is_not_read_as_wireplumbers() {
+    let current = audio_policy::revision();
+    let older = current - 1;
+    for (from, to, expected) in [
+        (
+            format!("local POLICY_REVISION = {current}\n"),
+            format!("local POLICY_REVISION = {older}\n"),
+            LoadedRevision::Other(older.to_string()),
+        ),
+        (
+            r#"ImplMetadata ("bubbler-policy")"#.to_owned(),
+            r#"ImplMetadata ("not-bubbler-policy")"#.to_owned(),
+            LoadedRevision::Absent,
+        ),
+    ] {
+        let Some(bed) = bed_that_lets_a_context_publish(&from, &to) else {
+            return;
+        };
+        let script = bed.dir().join("publish.lua");
+        std::fs::write(
+            &script,
+            PUBLISH_CURRENT.replace("REVISION", &current.to_string()),
+        )
+        .expect("the publishing script");
+        let log = bed.dir().join("publish.log");
+        let _publisher = Streaming(bed.spawn_in_context_logged(
+            PLAYBACK,
+            &format!(
+                "WIREPLUMBER_CONFIG_DIR={} wpexec {}",
+                bed.dir().join("wireplumber").display(),
+                script.display()
+            ),
+            Some(&log),
+        ));
+        let named = "\"metadata.name\": \"bubbler-policy\"";
+        let wireplumbers = bed.dump_from_host().matches(named).count();
+        wait_for("the context's bubbler-policy in the graph", || {
+            bed.dump_from_host().matches(named).count() > wireplumbers
+        });
+        assert_eq!(
+            loaded_revision(&bed),
+            expected,
+            "{}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+    }
+}
+
 /// Load generators this test started, stopped and reaped however it ends.
 struct Load(Vec<Child>);
 
