@@ -782,8 +782,6 @@ fn a_playback_context_connected_first_sees_no_port_or_link_of_a_later_capture_no
     monitor.sees_none_of(&objects_of(&bed.info_from_host(), &capture_nodes));
 }
 
-/// The WirePlumber started then finds the context, the capture nodes and
-/// their ports all in the graph already, and a capture node added after it.
 #[test]
 fn a_playback_context_sees_no_port_or_link_of_a_capture_node_across_a_restart() {
     let Some(mut bed) = PipeWireBed::start() else {
@@ -791,6 +789,8 @@ fn a_playback_context_sees_no_port_or_link_of_a_capture_node_across_a_restart() 
     };
     let monitor = ContextMonitor::start(&bed, PLAYBACK);
     let (_recorder, capture_nodes) = capture_nodes_with_a_link(&bed);
+    // The restarted WirePlumber finds the context, the capture nodes and
+    // their ports already in the graph.
     bed.restart_session_manager();
     let created = bed
         .command("pw-cli")
@@ -821,8 +821,6 @@ fn a_playback_context_sees_no_port_or_link_of_a_capture_node_across_a_restart() 
     );
 }
 
-/// A node's client sets its class, and may change it after the node is
-/// in the graph.
 #[test]
 fn a_playback_context_sees_no_port_of_a_node_that_turns_into_a_source() {
     let Some(bed) = PipeWireBed::start() else {
@@ -882,8 +880,6 @@ fn a_microphone_context_sees_every_port_and_link_of_a_capture_node() {
     );
 }
 
-/// A camera's node of each class and another client's video stream, as
-/// the bed adds one null node of each.
 const VIDEO_NODES: [(&str, &str); 5] = [
     ("video-source", "Video/Source"),
     ("video-sink", "Video/Sink"),
@@ -892,7 +888,6 @@ const VIDEO_NODES: [(&str, &str); 5] = [
     ("video-stream", "Stream/Output/Video"),
 ];
 
-/// Every grant word in some context: none of them reaches a video node.
 const EVERY_GRANT: [&str; 4] = [PLAYBACK, PLAYBACK_MICROPHONE, MICROPHONE_DEVICES, EXCLUSIVE];
 
 /// The bed's `VIDEO_NODES` added, lingering, with ports and a link from
