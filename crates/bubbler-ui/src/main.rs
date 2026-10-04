@@ -32,14 +32,12 @@ use crate::cli::Cli;
 use crate::store::Store;
 use crate::term::Term;
 
-/// How long the loop waits for a key before looking at the world again.
-/// One second, because the only thing a tick does is probe each
-/// instance's control socket, and a running sandbox is not news that
-/// needs to arrive faster.
+// One second, because the only thing a tick does is probe each
+// instance's control socket, and a running sandbox is not news that
+// needs to arrive faster.
 const TICK: Duration = Duration::from_secs(1);
 
-/// What `--help` prints. `bubbler-ui` takes no options of its own: the
-/// editor is the interface.
+// `bubbler-ui` takes no options of its own: the editor is the interface.
 const USAGE: &str = "\
 bubbler-ui — edit bubbler instances, with what each grant costs beside it
 
@@ -105,9 +103,8 @@ fn run() -> Result<()> {
     restored.context("restoring the terminal")
 }
 
-/// Draw, wait for a key or a tick, act. No threads: `poll` is the whole
-/// scheduler, and the only thing that happens without a key is the
-/// liveness probe.
+// No threads: `poll` is the whole scheduler, and the only thing that
+// happens without a key is the liveness probe.
 fn event_loop(
     terminal: &mut Term,
     app: &mut App,
@@ -167,8 +164,6 @@ fn event_loop(
     Ok(())
 }
 
-/// Take the children that have ended out of `started`, with how each
-/// ended.
 fn reap(started: &mut Vec<(String, Child)>) -> Vec<(String, ExitStatus)> {
     let mut ended = Vec::new();
     started.retain_mut(|(name, child)| match child.try_wait() {
@@ -181,7 +176,6 @@ fn reap(started: &mut Vec<(String, Child)>) -> Vec<(String, ExitStatus)> {
     ended
 }
 
-/// Spend what a keystroke asked for.
 fn perform(
     terminal: &mut Term,
     app: &mut App,
