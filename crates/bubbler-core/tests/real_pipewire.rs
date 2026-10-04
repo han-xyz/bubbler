@@ -1871,7 +1871,7 @@ fn a_host_stream_passes_by_what_a_context_offered(
     // have moved the stream.
     std::thread::sleep(FORBIDDEN_LINK_LIFE);
     let links = bed.links();
-    let defaults = bed.host_tool("pw-metadata", &["-n", "default"]);
+    let defaults = default_metadata(bed);
     assert!(defaults.contains("default.audio."), "{defaults}");
     assert!(
         !defaults.contains("offered"),
@@ -1888,6 +1888,17 @@ fn a_host_stream_passes_by_what_a_context_offered(
         "a host stream was linked to a node a {grant} context offered:\n{links}"
     );
     assert!(links.contains(bed_end), "{links}");
+}
+
+/// The `default` metadata's part of the host's `pw-dump`. Not `pw-metadata`:
+/// under load it now and then prints the object it found and exits before
+/// its keys (2 and 5 in 400 reads; `pw-dump` 0 in 400, PipeWire 1.6.9).
+fn default_metadata(bed: &PipeWireBed) -> String {
+    bed.dump_from_host()
+        .split_once("\"metadata.name\": \"default\"")
+        .and_then(|(_, rest)| rest.split("\"id\":").next())
+        .unwrap_or_default()
+        .to_owned()
 }
 
 #[test]
