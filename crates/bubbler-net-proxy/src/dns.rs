@@ -1,7 +1,14 @@
 //! The proxy's own DNS client: A and AAAA over UDP, TCP on truncation,
 //! to the resolver addresses bubbler passes as `--dns`.
 //!
-//! The proxy does not call `getaddrinfo`, and this module is why.
+//! The proxy does not call `getaddrinfo`, and this module is why. It
+//! runs inside the sandbox's mount namespace, where `/run` and `/etc`
+//! are tmpfs the application writes; the host's `nsswitch.conf` there
+//! names `resolve` and `mymachines` before `dns`, and those modules
+//! dial sockets by path. Measured 2026-08-28: an application that binds
+//! `/run/systemd/resolve/io.systemd.Resolve` answers the proxy's
+//! lookups itself, so a `CONNECT` to a listed name reached an address
+//! the application chose.
 //!
 //! The parser is bounded everywhere and trusts nothing: names are
 //! decompressed with strictly backwards pointers only, records are
