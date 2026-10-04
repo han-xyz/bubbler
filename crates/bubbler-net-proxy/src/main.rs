@@ -1,28 +1,16 @@
 //! The egress proxy bubbler puts in the sandbox's network namespace.
 //!
-//! bubbler joins this process to the sandbox's user, network and mount
-//! namespaces with no capability of its own and writes it into a cgroup
-//! the nftables ruleset accepts. That is the whole of its privilege: it
-//! is on the inside, in the one cgroup the filter lets out, and the
-//! application beside it is not.
-//!
-//! So it binds `127.0.0.1:<--port>` itself — after the namespaces are
+//! It binds `127.0.0.1:<--port>` itself — after the namespaces are
 //! joined, or the socket would be the host's loopback — reports on
 //! `--ready-fd` that it is listening, and from then on answers `CONNECT`
 //! and nothing else. The port is the launcher's to choose because the
 //! sandbox is told it in an environment variable of bwrap's argv, which
 //! is fixed before the namespace this binds in exists. Names come from
 //! argv; the sandbox never gets to add one.
-//!
-//! The mount namespace it joins is the sandbox's, which is why names
-//! are resolved by [`dns`] against the `--dns` addresses and never by
-//! `getaddrinfo`: NSS inside that namespace is the application's to
-//! answer.
 
-// The library — the parser, the allowlist and the relay — forbids
-// `unsafe`. The binary cannot: taking over a descriptor the launcher
-// passed by number is the one thing safe Rust has no wrapper for, and
-// it happens once, here, before anything else runs.
+// The library forbids `unsafe`. The binary cannot: taking over a
+// descriptor the launcher passed by number is the one thing safe Rust
+// has no wrapper for.
 #![deny(unsafe_code)]
 
 use std::ffi::OsString;
@@ -43,83 +31,60 @@ use bubbler_net_proxy::connect::{self, Status};
 use bubbler_net_proxy::dns;
 use bubbler_net_proxy::relay;
 
-/// The one usage line, so a grammar error always names the whole
-/// grammar.
+// The one usage line, so a grammar error always names the whole
+// grammar.
 const USAGE: &str = "bubbler-net-proxy: usage: --allow NAME:PORT [--allow NAME:PORT ...] \
 --dns IP [--dns IP ...] --port N --ready-fd N [--log-fd N] [--log-tunnels]";
 
-/// Tunnels one proxy carries at a time. Past this a connection is
-/// answered `503` and closed: a sandbox that opens sockets without
-/// bound must not cost the host a thread apiece.
+// Tunnels one proxy carries at a time. A sandbox that opens sockets
+// without bound must not cost the host a thread apiece.
 const MAX_TUNNELS: usize = 64;
 
-/// How long a client has to finish its request line and headers,
-/// counted once from the connection and not once per read. A client
-/// that dribbles one byte at a time holds a thread and one of the
-/// tunnel slots otherwise.
+// Counted once from the connection and not once per read. A client
+// that dribbles one byte at a time holds a thread and one of the
+// tunnel slots otherwise.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long the whole dial has, however many addresses the name
-/// resolved to. Per address it would be this times the length of the
-/// answer.
+// How long the whole dial has, however many addresses the name
+// resolved to. Per address it would be this times the length of the
+// answer.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long a write that is not the relay's may block: the `200`, the
-/// bytes that came behind it, and every refusal. The relay does its own
-/// waiting; a peer that will not read is not owed a thread.
+// How long a write that is not the relay's may block: the `200`, the
+// bytes that came behind it, and every refusal. The relay does its own
+// waiting; a peer that will not read is not owed a thread.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long a refusal written from the accept loop may block. Short,
-/// because the thread it holds is the one that takes every other
-/// connection: a client that never reads its `503` must not be able to
-/// stop the proxy from accepting.
+// How long a refusal written from the accept loop may block. Short,
+// because the thread it holds is the one that takes every other
+// connection: a client that never reads its `503` must not be able to
+// stop the proxy from accepting.
 const REFUSE_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// How long to wait after an `accept` that failed for a reason of its
-/// own. Retrying at once would spin against whatever is exhausted, one
-/// log line to a turn.
+// Retrying at once would spin against whatever is exhausted, one
+// log line to a turn.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
-/// Lines the log takes in one [`LOG_WINDOW`]. Every line is about
-/// something the sandbox did, so without a budget a client opening
-/// refused connections in a loop writes the whole of the instance's
-/// record and pushes everything else out of it.
+// Every line is about something the sandbox did, so without a budget a
+// client opening refused connections in a loop writes the whole of the
+// instance's record and pushes everything else out of it.
 const LOG_BUDGET: u32 = 20;
 
-/// The window [`LOG_BUDGET`] is counted over.
 const LOG_WINDOW: Duration = Duration::from_secs(1);
 
-/// Bytes taken from the client in one read while the request is being
-/// assembled.
 const READ_CHUNK: usize = 1024;
 
-/// What goes down `--ready-fd` once the listener is up. Its value says
-/// nothing; that it arrives at all is the whole message.
+// What goes down `--ready-fd` once the listener is up. Its value says
+// nothing; that it arrives at all is the whole message.
 const READY: u8 = 1;
 
-/// What the launcher asked for.
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
-    /// The `name:port` targets a tunnel may be opened to, as written.
     allow: Vec<String>,
-    /// The resolvers to ask, in order. The ruleset lets this process
-    /// reach them and lets the application reach nothing on port 53.
     dns: Vec<IpAddr>,
-    /// The loopback port to listen on, inside the namespace the
-    /// launcher joined this process to.
     port: u16,
-    /// Written one byte once the listener is up, and closed. The
-    /// launcher waits on it before it starts the application, so the
-    /// proxy variables it set name a port that already answers.
     ready_fd: i32,
-    /// Where the log goes; stderr when the launcher named nothing.
     log_fd: Option<i32>,
-    /// Whether the lines about what the proxy carried — the listener it
-    /// opened and every tunnel through it — are written at all. Off,
-    /// because that log shares a terminal with whatever the sandbox is
-    /// running and a full-screen application redraws over it; the
-    /// refusals are written either way, since those are what a user has
-    /// to notice.
     log_tunnels: bool,
 }
 
@@ -167,14 +132,11 @@ fn main() -> ExitCode {
     }
 }
 
-/// Parse the grammar over any argv but this process's own.
-///
-/// `--allow` and `--dns` repeat and must each appear at least once — a
-/// proxy with an empty allowlist would answer `403` to everything and
-/// one with no resolver `502`, and both are launcher bugs worth failing
-/// on. The other options appear once, `--log-tunnels` included, and no
-/// two may name the same descriptor: a number adopted twice would be
-/// closed twice.
+// `--allow` and `--dns` repeat and must each appear at least once — a
+// proxy with an empty allowlist would answer `403` to everything and
+// one with no resolver `502`, and both are launcher bugs worth failing
+// on. No two options may name the same descriptor: a number adopted
+// twice would be closed twice.
 fn parse_from(mut it: impl Iterator<Item = OsString>) -> Option<Args> {
     let mut allow: Vec<String> = Vec::new();
     let mut dns: Vec<IpAddr> = Vec::new();
@@ -210,9 +172,8 @@ fn parse_from(mut it: impl Iterator<Item = OsString>) -> Option<Args> {
     Some(args)
 }
 
-/// One port number a socket can be bound to: `0` would let the kernel
-/// choose, and a port nobody chose is one the launcher could not have
-/// put in the sandbox's environment.
+// `0` would let the kernel choose, and a port nobody chose is one the
+// launcher could not have put in the sandbox's environment.
 fn listen_port(word: OsString) -> Option<u16> {
     match word.to_str()?.parse::<u16>() {
         Ok(port) if port > 0 => Some(port),
@@ -220,7 +181,6 @@ fn listen_port(word: OsString) -> Option<u16> {
     }
 }
 
-/// One non-negative descriptor number.
 fn number(word: OsString) -> Option<i32> {
     match word.to_str()?.parse::<i32>() {
         Ok(fd) if fd >= 0 => Some(fd),
@@ -228,14 +188,9 @@ fn number(word: OsString) -> Option<i32> {
     }
 }
 
-/// Bind the loopback listener, tell the launcher it is up, and serve
-/// until the process is stopped.
-///
-/// The byte goes out only once the listener is up, so the launcher never
-/// releases an application whose proxy address answers nothing. The
-/// namespace is the sandbox's own and nothing else has run in it, so a
-/// port the launcher picked is free; a bind that fails anyway ends the
-/// process, and the launcher's wait ends with it.
+// The namespace is the sandbox's own and nothing else has run in it, so a
+// port the launcher picked is free; a bind that fails anyway ends the
+// process, and the launcher's wait ends with it.
 fn serve(
     list: Allowlist,
     dns: Vec<SocketAddr>,
@@ -283,11 +238,9 @@ fn serve(
     }
 }
 
-/// One tunnel's worth of the count, given back when the thread ends.
 struct Live(Arc<AtomicUsize>);
 
 impl Live {
-    /// Count one more tunnel.
     fn take(live: &Arc<AtomicUsize>) -> Self {
         live.fetch_add(1, Ordering::SeqCst);
         Self(Arc::clone(live))
@@ -300,13 +253,7 @@ impl Drop for Live {
     }
 }
 
-/// Serve one connection: read its request, judge it, and either relay
-/// or refuse.
 fn tunnel(mut client: TcpStream, list: &Allowlist, dns: &[SocketAddr], log: &Log) {
-    // One deadline for the whole header phase. A request arriving in
-    // pieces is ordinary and must still be served; a request that never
-    // ends must not be able to keep a slot by writing a byte now and
-    // then.
     let deadline = Instant::now() + HEADER_TIMEOUT;
     let (request, buffered) = match read_request(&mut client, deadline) {
         Ok(pair) => pair,
@@ -348,12 +295,9 @@ fn tunnel(mut client: TcpStream, list: &Allowlist, dns: &[SocketAddr], log: &Log
     }
 }
 
-/// Answer `200`, hand the upstream what came behind the blank line, and
-/// leave both sockets as the relay wants them.
-///
-/// These are the only writes outside the relay that could block on a
-/// peer, so both carry [`WRITE_TIMEOUT`]; the relay polls and wants
-/// neither that nor the header deadline.
+// These are the only writes outside the relay that could block on a
+// peer, so both carry [`WRITE_TIMEOUT`]; the relay polls and wants
+// neither that nor the header deadline.
 fn open(client: &TcpStream, upstream: &TcpStream, buffered: &[u8]) -> io::Result<()> {
     client.set_write_timeout(Some(WRITE_TIMEOUT))?;
     upstream.set_write_timeout(Some(WRITE_TIMEOUT))?;
@@ -367,16 +311,12 @@ fn open(client: &TcpStream, upstream: &TcpStream, buffered: &[u8]) -> io::Result
     upstream.set_write_timeout(None)
 }
 
-/// Read until the request is whole.
-///
-/// `Err(Some(status))` is a request to answer and close; `Err(None)` is
-/// a client that went away, which is answered with nothing. The success
-/// value carries the tunnel bytes that arrived with the request.
-///
-/// `deadline` bounds the phase, not the read: a socket timeout starts
-/// again with every `recv`, so what is set before each read is what is
-/// left of the one budget. A client still talking when it runs out is
-/// answered `408`.
+// `Err(Some(status))` is a request to answer and close; `Err(None)` is
+// a client that went away, which is answered with nothing.
+//
+// `deadline` bounds the phase, not the read: a socket timeout starts
+// again with every `recv`, so what is set before each read is what is
+// left of the one budget.
 fn read_request(
     client: &mut TcpStream,
     deadline: Instant,
@@ -413,8 +353,6 @@ fn read_request(
     }
 }
 
-/// Whether a read stopped because the deadline did, rather than because
-/// the connection did.
 fn is_timeout(err: &io::Error) -> bool {
     matches!(
         err.kind(),
@@ -422,22 +360,6 @@ fn is_timeout(err: &io::Error) -> bool {
     )
 }
 
-/// Open the upstream connection, or say why there is none.
-///
-/// Addresses are tried in the order the resolver gave them, and the
-/// whole dial shares one [`CONNECT_TIMEOUT`]: a name answering with
-/// thirty blackholed records must not hold a tunnel slot thirty times
-/// as long as one that answers with one.
-///
-/// A loopback or link-local answer is skipped rather than dialled.
-/// Loopback inside this namespace is the sandbox's own, so a listed
-/// name that resolves there points the proxy at the application — or at
-/// the proxy itself, one tunnel slot per request. `169.254.0.0/16` is
-/// where pasta's DNS forwarder sits, and a listed name resolving there
-/// would hand the application back the resolver the ruleset took away
-/// from it. Nothing else about the address is judged: what the sandbox
-/// may reach is decided by the name its config granted, and the
-/// namespace routes nowhere an `allow-out` could not name.
 fn dial(
     host: &str,
     port: u16,
@@ -468,15 +390,12 @@ fn dial(
     })
 }
 
-/// Whether `ip` points back inside the namespace rather than out of
-/// it: loopback (`127.0.0.0/8`, `::1`), the unspecified address, or
-/// link-local (`169.254.0.0/16`, `fe80::/10`). An IPv4-mapped address
-/// (`::ffff:a.b.c.d`) is judged by its IPv4 half, which is what a
-/// dual-stack socket dials.
-///
-/// The IPv6 link-local half is written out rather than taken from
-/// `Ipv6Addr::is_unicast_link_local`, which the workspace's declared
-/// minimum toolchain need not have.
+// An IPv4-mapped address (`::ffff:a.b.c.d`) is judged by its IPv4 half,
+// which is what a dual-stack socket dials.
+//
+// The IPv6 link-local half is written out rather than taken from
+// `Ipv6Addr::is_unicast_link_local`, which the workspace's declared
+// minimum toolchain need not have.
 fn is_inward(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified() || v4.is_link_local(),
@@ -489,20 +408,12 @@ fn is_inward(ip: &IpAddr) -> bool {
     }
 }
 
-/// Write the line for a request refused before it ever named a target:
-/// one this proxy could not read, one that was not a `CONNECT`, one that
-/// ran out the header deadline, or one that arrived with every tunnel
-/// slot taken.
-///
-/// Unconditional, because none of these is traffic: each is a client
-/// doing something no `allow-host` could explain, and with the traffic
-/// log off a run of nothing but these would otherwise print nothing at
-/// all. The refusals that *do* name a target write their own line and
-/// must not come through here twice.
-///
-/// Nothing of the request is repeated: those bytes are the sandbox's to
-/// choose, and a line built out of them is a line the application writes
-/// into the run's record.
+// The refusals that *do* name a target write their own line and must not
+// come through here twice.
+//
+// Nothing of the request is repeated: those bytes are the sandbox's to
+// choose, and a line built out of them is a line the application writes
+// into the run's record.
 fn note_refusal(log: &Log, status: Status) {
     let why = match status.code {
         400 => "malformed request",
@@ -518,7 +429,6 @@ fn note_refusal(log: &Log, status: Status) {
     log.line(&format!("refused {} {why}", status.code));
 }
 
-/// Answer a request that will not be served and close the connection.
 fn refuse(mut client: TcpStream, status: Status, wait: Duration, log: &Log) {
     // One short line, but to a client that never reads it: the write
     // must not be able to hold the thread it is on, and for a `503`
@@ -534,34 +444,21 @@ fn refuse(mut client: TcpStream, status: Status, wait: Duration, log: &Log) {
     let _ = client.shutdown(std::net::Shutdown::Both);
 }
 
-/// Where the proxy's lines go, and how many of them a second carries.
-///
-/// Every line is about something the sandbox did, so a client opening
-/// refused connections in a loop could otherwise write the whole of the
-/// record this log is copied into. [`LOG_BUDGET`] lines a window get
-/// through; the rest are counted, and the count goes out as one line
-/// when the window rolls.
 struct Log {
     sink: Mutex<Sink>,
-    /// Whether [`Log::if_verbose`] writes anything.
     verbose: bool,
 }
 
-/// The sink and its budget under one lock, so two tunnel threads cannot
-/// interleave a line.
+// The sink and its budget under one lock, so two tunnel threads cannot
+// interleave a line.
 struct Sink {
-    /// Where the lines are written.
     out: Box<dyn Write + Send>,
-    /// When the window now being counted began.
     window: Instant,
-    /// Lines written in it.
     written: u32,
-    /// Lines the budget swallowed in it.
     suppressed: u64,
 }
 
 impl Log {
-    /// Write to `out`. `verbose` is `--log-tunnels`.
     fn new(out: Box<dyn Write + Send>, verbose: bool) -> Self {
         Self {
             sink: Mutex::new(Sink {
@@ -574,35 +471,25 @@ impl Log {
         }
     }
 
-    /// Write to a descriptor the launcher passed.
     fn to_fd(fd: OwnedFd, verbose: bool) -> Self {
         Self::new(Box::new(File::from(fd)), verbose)
     }
 
-    /// Write to stderr, which is where the lines go when the launcher
-    /// named no descriptor.
     fn to_stderr(verbose: bool) -> Self {
         Self::new(Box::new(io::stderr()), verbose)
     }
 
-    /// One line, prefixed with the program name, unless this window's
-    /// budget is spent.
     fn line(&self, msg: &str) {
         self.at(Instant::now(), msg);
     }
 
-    /// [`Log::line`], but only where the launcher asked for the traffic
-    /// itself to be written. Nothing a user has to act on goes through
-    /// here: this is the record of what the proxy carried, and it is
-    /// silent by default so that a full-screen application sharing the
-    /// terminal is not redrawn over.
+    // Nothing a user has to act on goes through here.
     fn if_verbose(&self, msg: &str) {
         if self.verbose {
             self.line(msg);
         }
     }
 
-    /// [`Log::line`] against a clock the caller names.
     fn at(&self, now: Instant, msg: &str) {
         let mut sink = self
             .sink
@@ -627,18 +514,14 @@ impl Log {
 }
 
 impl Sink {
-    /// Write one line and get it out of the buffer.
-    ///
-    /// A log that cannot be written is not worth failing a tunnel over,
-    /// and there is nowhere left to report it to.
+    // A log that cannot be written is not worth failing a tunnel over,
+    // and there is nowhere left to report it to.
     fn put(&mut self, msg: &str) {
         let _ = writeln!(self.out, "bubbler-net-proxy: {msg}");
         let _ = self.out.flush();
     }
 }
 
-/// Take ownership of a descriptor the launcher passed by number, and
-/// keep it out of anything this process might ever exec.
 #[allow(unsafe_code)]
 fn adopt(fd: i32) -> io::Result<OwnedFd> {
     // SAFETY: the precondition is that `fd` names a descriptor this
