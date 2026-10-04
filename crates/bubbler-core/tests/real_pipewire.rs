@@ -4055,6 +4055,10 @@ fn no_context_sees_or_makes_the_policys_metadata() {
     for (props, grant) in [(PLAYBACK, "playback"), (DEVICES, "playback,devices")] {
         bed.info_in_context(props, &[SINK]);
         let seen = bed.in_context(props, "pw-dump");
+        assert!(
+            seen.contains("\"node.name\": \"bed-sink\""),
+            "a {grant} context's pw-dump listed nothing:\n{seen}"
+        );
         assert!(!seen.contains(named), "a {grant} context sees it:\n{seen}");
 
         let set = bed.output_in_context(props, "pw-metadata -n bubbler-policy 0 revision 0");

@@ -385,7 +385,12 @@ pub fn parse_loaded_revision(stdout: &str) -> LoadedRevision {
 /// bubbler's environment but that directory. An answer that does not
 /// come within two seconds is [`LoadedRevision::Unknown`].
 pub fn loaded_revision(runtime_dir: &Path) -> LoadedRevision {
-    let spawned = Command::new(PW_METADATA)
+    loaded_revision_asking(Path::new(PW_METADATA), runtime_dir)
+}
+
+/// [`loaded_revision`], asked of `program` in place of [`PW_METADATA`].
+fn loaded_revision_asking(program: &Path, runtime_dir: &Path) -> LoadedRevision {
+    let spawned = Command::new(program)
         .arg("-n")
         .arg(POLICY_METADATA)
         .env_clear()
@@ -396,34 +401,38 @@ pub fn loaded_revision(runtime_dir: &Path) -> LoadedRevision {
         .spawn();
     let mut child = match spawned {
         Ok(child) => child,
-        Err(e) => return LoadedRevision::Unknown(format!("{PW_METADATA}: {e}")),
+        Err(e) => return LoadedRevision::Unknown(format!("{}: {e}", program.display())),
     };
     let deadline = Instant::now() + READ_TIMEOUT;
     loop {
-        match child.try_wait() {
+        let unknown = match child.try_wait() {
             Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            Ok(None) => {
-                // Killed and reaped either way; an error here is a child
-                // already gone, which the wait collects.
-                let _ = child.kill();
-                let _ = child.wait();
-                return LoadedRevision::Unknown(format!(
-                    "{PW_METADATA} did not answer within {} s",
-                    READ_TIMEOUT.as_secs()
-                ));
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
             }
-            Err(e) => return LoadedRevision::Unknown(format!("{PW_METADATA}: {e}")),
-        }
+            Ok(None) => format!(
+                "{} did not answer within {} s",
+                program.display(),
+                READ_TIMEOUT.as_secs()
+            ),
+            Err(e) => format!("{}: {e}", program.display()),
+        };
+        // Killed and reaped either way; an error here is a child already
+        // gone, which the wait collects.
+        let _ = child.kill();
+        let _ = child.wait();
+        return LoadedRevision::Unknown(unknown);
     }
     let output = match child.wait_with_output() {
         Ok(output) => output,
-        Err(e) => return LoadedRevision::Unknown(format!("{PW_METADATA}: {e}")),
+        Err(e) => return LoadedRevision::Unknown(format!("{}: {e}", program.display())),
     };
     if !output.status.success() {
         let said = String::from_utf8_lossy(&output.stderr);
         return LoadedRevision::Unknown(format!(
-            "{PW_METADATA} {}: {}",
+            "{} {}: {}",
+            program.display(),
             output.status,
             said.trim()
         ));
@@ -929,15 +938,59 @@ mod tests {
 
     #[test]
     fn output_of_another_shape_is_unknown() {
-        for garbage in [
-            "can't connect: Host is down\n",
-            "Found \"default\" metadata 3\n",
-        ] {
+        for garbage in ["no such line\n", "Found \"default\" metadata 3\n"] {
             assert!(
                 matches!(parse_loaded_revision(garbage), LoadedRevision::Unknown(_)),
                 "{garbage}"
             );
         }
+    }
+
+    /// A stand-in for `pw-metadata` at a path of its own, running `script`.
+    fn stand_in(dir: &Path, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("pw-metadata");
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).expect("the stand-in");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("the stand-in made executable");
+        path
+    }
+
+    #[test]
+    fn a_missing_tool_is_unknown() {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let answer = loaded_revision_asking(&tmp.path().join("pw-metadata"), tmp.path());
+        assert!(matches!(answer, LoadedRevision::Unknown(_)), "{answer:?}");
+    }
+
+    /// What `pw-metadata` does where no daemon answers on the socket
+    /// (measured on PipeWire 1.6.9): exit 255, the reason on stderr.
+    #[test]
+    fn an_unreachable_daemon_is_unknown_and_says_why() {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let tool = stand_in(
+            tmp.path(),
+            "echo \"can't connect: Host is down\" >&2; exit 255",
+        );
+        let answer = loaded_revision_asking(&tool, tmp.path());
+        let LoadedRevision::Unknown(reason) = answer else {
+            panic!("{answer:?}");
+        };
+        assert!(reason.contains("can't connect: Host is down"), "{reason}");
+    }
+
+    #[test]
+    fn a_tool_that_does_not_answer_in_time_is_unknown() {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let tool = stand_in(tmp.path(), "exec sleep 30");
+        let started = Instant::now();
+        let answer = loaded_revision_asking(&tool, tmp.path());
+        assert!(matches!(answer, LoadedRevision::Unknown(_)), "{answer:?}");
+        assert!(
+            started.elapsed() < READ_TIMEOUT * 2,
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     /// The revision and a digest of the two policy files it was last set
