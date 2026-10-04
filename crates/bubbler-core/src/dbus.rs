@@ -373,8 +373,10 @@ fn render(rule: &BusRule) -> String {
 }
 
 /// Application id of an instance: `org.bubbler.` and the instance name as
-/// one trailing element. Every `.` in the name becomes `_`, and a leading digit is
-/// prefixed.
+/// one trailing element. Every `.` in the name becomes `_`, because only
+/// the last element of an id may hold `-`, and a leading digit is
+/// prefixed, which flatpak's own name check rejects even though the
+/// portal's does not.
 pub fn app_id(instance: &str) -> String {
     let mut tail = instance.replace('.', "_");
     if tail.starts_with(|c: char| c.is_ascii_digit()) {

@@ -291,6 +291,10 @@ impl Drop for Relay {
 // Draining to the end matters: a writer whose pipe fills stops dead, and
 // the writer here is the sandbox.
 //
+// `size` is the destination's own size, asked for again before every
+// write rather than counted here, so whatever another writer has
+// appended in the meantime counts against the same cap.
+//
 // `stderr`, when given, is sent every byte read, past the cap too, after
 // the file has had its share: a stderr nobody reads blocks the copy, and
 // the record is what matters then. A stderr whose reader has gone is given

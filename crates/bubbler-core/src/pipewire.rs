@@ -157,6 +157,11 @@ pub fn socket(instance_runtime: &Path) -> PathBuf {
 /// `<instance runtime dir>/pwpulse`: the directory the private pulse
 /// server of a `pulseaudio` grant writes, which is that sidecar's whole
 /// `/tmp`.
+///
+/// Not [`dir`]: the two audio sidecars share the instance's context but
+/// neither may write what the other reads — the pulse server is the
+/// process the sandboxed application talks to, and the context sidecar
+/// has the session's own socket.
 pub fn pulse_dir(instance_runtime: &Path) -> PathBuf {
     instance_runtime.join("pwpulse")
 }

@@ -355,6 +355,13 @@ impl Escape {
     }
 }
 
+/// `O_NONBLOCK` is what keeps a terminal that has stopped reading from
+/// parking the loop that also services the exit check, the signal flags
+/// and the detach sequence — but the flag belongs to the open file
+/// description, which every duplicate of the descriptor shares, the
+/// user's shell among them. So the destination is [`reopen`]ed where it
+/// can be, and not even a `SIGKILL` leaves a flag behind; only where it
+/// cannot is the host's own flag changed and put back.
 struct Unblocked<'a> {
     host: BorrowedFd<'a>,
     // A description of `host`'s file that only this relay holds.

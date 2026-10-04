@@ -1039,6 +1039,9 @@ fn decode_message(message: &[u8]) -> Result<Message, WireError> {
     })
 }
 
+/// The ASCII decimal digits of `uid`, each byte written as two hex digits: what `AUTH EXTERNAL`
+/// takes. "31303030 is ASCII decimal \"1000\" represented in hex, so the client is authenticating
+/// as Unix uid 1000".
 fn uid_hex(uid: u32) -> String {
     const DIGITS: [u8; 16] = *b"0123456789abcdef";
     let mut out = String::new();
@@ -1235,7 +1238,11 @@ impl Session {
                 continue;
             }
             // Serials are guessable, so a reply is only a reply if it came from the name's
-            // owner. The bus itself is the exception, and only for an error.
+            // owner. The bus itself is the exception, and only for an error: "when a method call
+            // message cannot be sent or received due to a security policy, the message bus should
+            // send an error reply", and it does the same for a peer that went away mid-call.
+            // `SENDER` "is controlled by the message bus, so it is as reliable and trustworthy as
+            // the message bus itself" — no peer can put the bus's name there.
             match reply.sender.as_deref() {
                 Some(sender) if sender == owner => {}
                 Some(sender) if sender == BUS_NAME && reply.kind == MSG_ERROR => {}
@@ -1480,7 +1487,8 @@ impl Session {
     }
 
     // No read goes past the end of the message, so none of the next one's descriptors
-    // arrive with it.
+    // arrive with it. A message that is big-endian, longer than [`MAX_INCOMING`] or whose header
+    // will not decode is skipped, since nothing in it can be trusted to say it is the reply.
     fn receive(&mut self, deadline: Instant) -> Result<Message, WireError> {
         loop {
             let mut want = FIXED_HEADER;

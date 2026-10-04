@@ -25,7 +25,9 @@ use crate::init_bin::{self, Found};
 pub const PASTA_BIN: &str = "pasta";
 
 /// Address the sandbox's resolver points at in an isolated namespace, and
-/// the one pasta translates to the host's nameserver.
+/// the one pasta translates to the host's nameserver. Link-local, and
+/// deliberately not a loopback address: pasta's `conf.c` refuses a
+/// loopback `--dns-forward` outright.
 pub const DNS_FORWARD: IpAddr = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1));
 
 // The port a resolver is queried on, which is the one port an
@@ -356,7 +358,14 @@ impl Cgroup {
     /// What is refused is what nft could not carry inside a quoted path,
     /// and nothing else: a `"` would end the string and `;` after it
     /// would start a second rule, in a process holding `CAP_NET_ADMIN`
-    /// over the sandbox's namespaces.
+    /// over the sandbox's namespaces. Everything a systemd unit name
+    /// holds passes — `user@1000.service` is where a user session's
+    /// delegated subtree lives, `@`, `:` and `+` are ordinary characters
+    /// in one, and a `-` in a name arrives escaped as `\x2d`. Measured:
+    /// nft resolves such a path as written and fails to resolve it with
+    /// the backslash doubled, and a trailing `\` does not escape the
+    /// closing quote, so passing them through is both necessary and
+    /// safe.
     pub fn new(path: &str) -> Result<Self, String> {
         if path.is_empty() {
             return Err("a cgroup path is not empty".to_owned());
@@ -605,6 +614,12 @@ fn resolvers(cfg: &NetworkConfig) -> Option<Vec<IpAddr>> {
 /// The nftables ruleset an `outbound "deny"` is, as `nft -f -` takes it,
 /// or `None` where nothing is filtered.
 ///
+/// `oifname "lo" accept` opens the sandbox's own loopback, and it is
+/// safe only because [`pasta_argv`] passes `-T none -U none`: pasta's
+/// outbound forwarding would put a socket of pasta's on that loopback
+/// and splice it to the host, which never becomes a packet and so is
+/// never seen by netfilter.
+///
 /// `cgroup` is the leaf the proxy sidecar puts itself in, beside the
 /// sandbox's own and outside anything the application can name. Without
 /// an `allow-host` the argument is unused.
@@ -632,9 +647,13 @@ pub fn ruleset(cfg: &NetworkConfig, cgroup: Option<&Cgroup>) -> Option<String> {
         "oifname \"lo\" accept".to_owned(),
         "ct state established,related accept".to_owned(),
     ];
-    // Listed in nftables' own order, which is what `nft list ruleset`
-    // prints back. `no-ipv6` leaves the namespace no IPv6 address at all,
-    // and then the rule would match nothing.
+    // Neighbour discovery is how an IPv6 stack finds its router and its
+    // neighbours, and the sandbox sends it like any other packet: without
+    // this rule the policy below stops IPv6 before any `allow-out` over
+    // it could ever match, so a v6 destination would be dead however it
+    // was written. Listed in nftables' own order, which is what `nft list
+    // ruleset` prints back. `no-ipv6` leaves the namespace no IPv6
+    // address at all, and then the rule would match nothing.
     if !cfg.no_ipv6 {
         rules.push(
             "icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, \
@@ -658,7 +677,10 @@ pub fn ruleset(cfg: &NetworkConfig, cgroup: Option<&Cgroup>) -> Option<String> {
     for allowed in &cfg.allow_out {
         // A resolver named by address is still a resolver: under an
         // `allow-host` it belongs to the proxy like the generated rules
-        // above.
+        // above. An `allow-out` that names no port covers 53 among every
+        // other and is written as it stands — narrowing a whole address
+        // because one of its ports is DNS would take away what the node
+        // plainly asks for.
         let resolver = allowed.port == Some(DNS_PORT);
         for rule in allow_out_rules(allowed) {
             rules.push(match resolver {

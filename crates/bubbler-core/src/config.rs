@@ -37,13 +37,21 @@ pub const PARSER_STACK: usize = 512 << 20;
 compile_error!("bubbler reserves a 512 MiB parser stack and supports 64-bit targets only");
 
 /// Most `{` bubbler hands to the KDL parser in one file, counted wherever they stand: in strings
-/// and comments too, and never given back by a `}`. `kdl` 6.7.1 descends into children by
-/// recursion, once per `{` it reads as one.
+/// and comments too, and never given back by a `}`. The deepest node bubbler defines is two levels
+/// (`network { dns { … } }`) and the shipped profiles hold two braces at most, so a config that
+/// means something, header examples pasted into its comments included, stays well under this.
+/// `kdl` 6.7.1 descends into children by recursion, once per `{` it reads as one. The bound sits
+/// far under the smallest of the measured abort depths in docs/threat-model.md, and the parser
+/// runs on the stack [`parse_document`] reserves, where the children descents are a rounding
+/// error.
 pub const MAX_NESTING: usize = 32;
 
 /// Most `*` and `/` bubbler lets one `/* */` comment hold, nested comments included. `kdl` 6.7.1
 /// reads a block comment by recursion (`commented_block` in its `v2_parser.rs`): once per `*`,
-/// per `/`, per nested comment and per run of other text between them.
+/// per `/`, per nested comment and per run of other text between them. Seven lines of a starred
+/// box fit under this; no comment that says something holds more. The bound sits below the worst
+/// shape on the smaller stack, as [`MAX_NESTING`] does, so a comment is a rounding error on the
+/// stack [`parse_document`] reserves.
 pub const MAX_COMMENT_MARKS: usize = 128;
 
 /// Keys `env` may not set: the sandbox owns them.
@@ -1127,6 +1135,20 @@ pub fn read_bounded(path: &Path) -> Result<String, ReadError> {
     Ok(text)
 }
 
+// Counting by hand is the point: see [`parse_document`].
+//
+// The count keeps no model of where strings and comments are. The parser recovers from a string
+// it cannot read — a bad escape, a NUL, a `"""` mid-line, a multi-line body whose lines do not
+// carry the indentation of its closing quotes, and more shapes than a model of its grammar keeps
+// up with — by reading what was written inside it as nodes, descending into every `{` there and
+// recursing on every `/*`. What recovery cannot do is put a `{` or a `/*` into the text. So every
+// `{` counts wherever it stands and a `}` closes nothing: a file holding more `{` than the parser
+// may descend into is refused whether or not it would have descended into them. Every `/*` is
+// measured from where it stands for the same reason. A `{` or a `/*` inside a string or a comment
+// the parser does read as one is over-counted, which refuses a file the parser would have read;
+// no configuration that grants anything writes thirty-three braces, or a comment as busy as the
+// bound, anywhere in it.
+//
 // Measuring from every `/*` costs linear work: each byte of the text is walked by at most
 // MAX_COMMENT_MARKS / 2 + 1 measures, 65 × MAX_BYTES steps, a few milliseconds unoptimised.
 fn check_bounds(text: &str) -> Result<(), ConfigError> {
@@ -1254,7 +1276,9 @@ fn string_end(b: &[u8], quote: usize, hashes: usize) -> Option<usize> {
             }
             b'"' => {
                 // One quote inside the multi-line form is content, and so are three with anything
-                // but whitespace before them on their line.
+                // but whitespace before them on their line. kdl 6.7.1 reads one mid-line as body in
+                // a raw string and as an error in a quoted one, never as the end (`raw_string` and
+                // `quoted_string` in its `v2_parser.rs`).
                 if triple
                     && (b.get(i..i + 3) != Some(b"\"\"\"".as_slice())
                         || !only_spaces(&b[line_start..i], hashes == 0))
@@ -1424,7 +1448,8 @@ fn parse_doc(text: &str, profile: bool) -> Result<(RawProfile, Lines), ConfigErr
                 }
             }
             // What a node granted is counted rather than recorded per arm, so a node added to the
-            // match above is placed without being listed a second time here.
+            // match above is placed without being listed a second time here; only the two that
+            // grant nothing are named.
             let grew = lines.services.len() < cfg.services.len() || lines.env.len() < cfg.env.len();
             if grew || matches!(name, "userns" | "seccomp") {
                 let line = line_at(text, offset);

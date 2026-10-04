@@ -196,6 +196,9 @@ fn require_exists(
     }
 }
 
+/// A generated file rather than the host's, except under `"host"` with no
+/// `dns` child: the host's `/etc/resolv.conf` may name a resolver on its
+/// own loopback, which a sandbox with its own namespace can never reach.
 fn network(
     env: &Env,
     args: &mut BwrapArgs,
@@ -228,7 +231,9 @@ fn network(
 }
 
 /// A compositor socket's name, refused unless it is exactly one path
-/// component: `$WAYLAND_DISPLAY` is untrusted host input. Everything
+/// component: `$WAYLAND_DISPLAY` is untrusted host input, and an
+/// absolute or `..` name would otherwise decide what a bind mounts, or
+/// what endpoint the launcher hands its listening socket to. Everything
 /// that uses the value goes through here first.
 pub(crate) fn check_wayland_display(value: Option<&OsStr>) -> Result<&OsStr, LaunchError> {
     let display = value.ok_or(LaunchError::MissingEnv {
@@ -629,6 +634,10 @@ fn portals(
     let mounted =
         host.file_type(&doc).is_some_and(|t| t.is_dir()) && host.is_mountpoint(&doc) == Some(true);
     if mounted {
+        // Read-write: the portal strips write permission from every
+        // document it did not grant WRITE, so the bind adds no policy. Only
+        // the per-app subtree is bound; the mount root holds every app's
+        // documents.
         args.bind(&doc.join("by-app").join(&plan.app_id), &doc);
     } else {
         eprintln!(
@@ -642,7 +651,9 @@ fn portals(
 
 /// Emit profile/instance `env` pairs after all service variables, so a
 /// profile can layer toolkit settings on top. A [`RESERVED_ENV`] key is
-/// refused here as well as in the parser.
+/// refused here as well as in the parser, so a caller building an
+/// [`crate::config::InstanceConfig`] by hand cannot override what the
+/// sandbox sets.
 pub fn apply_env(pairs: &[(String, String)], args: &mut BwrapArgs) -> Result<(), LaunchError> {
     for (i, (k, v)) in pairs.iter().enumerate() {
         args.tag(Origin::Env(i));
@@ -1148,6 +1159,10 @@ fn denied_root_in_home(
         .map(|root| (root, End::Source))
 }
 
+/// Bind one host `/etc` entry read-only at `/etc/<name>`, on top of the
+/// baseline allowlist. The entry must resolve inside `/etc`, so a symlink
+/// there cannot pull an unrelated part of the host into the sandbox; the
+/// names the sandbox generates itself were rejected by the parser.
 fn etc_share(args: &mut BwrapArgs, host: &dyn Host, name: &OsStr) -> Result<(), LaunchError> {
     let etc = Path::new("/etc");
     let dst = etc.join(name);

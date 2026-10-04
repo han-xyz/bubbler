@@ -747,7 +747,11 @@ fn is_document_id(id: &str) -> bool {
 }
 
 // Only failures the decoder cannot also raise, all of which `Session::call` checks
-// before it sends anything; the marshalling errors a reply can produce count as breaking.
+// before it sends anything. The marshalling errors a reply can produce as easily as a body —
+// `BadSignature` and `Unsupported` from a variant or a dict entry inside an answer, `BadString`,
+// `ArrayTooLong`, `MessageTooLong`, `Depth` — count as breaking: the values bubbler encodes here
+// cannot raise them, and reading a reply that far means the connection is past a point this
+// client can account for.
 fn before_sending(e: &WireError) -> bool {
     matches!(
         e,

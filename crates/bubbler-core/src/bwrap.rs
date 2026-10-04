@@ -109,7 +109,11 @@ pub trait FdAllocator {
     /// Fd holding `content`, for an `--add-seccomp-fd`.
     fn data(&mut self, content: &[u8]) -> io::Result<OsString>;
     /// Host path of a file holding `content`, for a `--ro-bind` at
-    /// `dest`.
+    /// `dest`. A file and not bwrap's own `--ro-bind-data`, which binds a
+    /// file it has already unlinked: a sandbox that nests one of its own
+    /// cannot re-bind such a destination (the nested bwrap resolves its
+    /// source through `/proc/self/fd`, and an unlinked dentry there is
+    /// ENOENT), which is what kept Steam's runtime from starting.
     fn file(&mut self, dest: &Path, content: &[u8]) -> io::Result<OsString>;
     /// Fd of the listening control socket `bubbler-init` serves.
     fn init_socket(&mut self) -> io::Result<OsString>;
@@ -300,7 +304,13 @@ impl BwrapArgs {
         }
         push(&mut a.skeleton, b, [o("--proc"), o("/proc")]);
         push(&mut a.skeleton, b, [o("--dev"), o("/dev")]);
-        // The bind follows `--dev`, which would otherwise hide it.
+        // Wine's and Proton's synchronisation primitive, which flatpak binds
+        // with no permission of its own: the objects it makes belong to the
+        // process that opened it, so there is no host state behind it. The
+        // deliberate trade is that every sandbox reaches the ntsync driver's
+        // ioctl surface (`drivers/misc/ntsync`, kernel 6.14 and later) rather
+        // than Wine falling back to slow sync. The bind follows `--dev`,
+        // which would otherwise hide it.
         let ntsync = Path::new("/dev/ntsync");
         if host.file_type(ntsync).is_some_and(|t| t.is_char_device()) {
             push(
@@ -543,8 +553,9 @@ impl BwrapArgs {
     /// one.
     pub fn chdir(&mut self, dir: &Path) {
         let flag = OsStr::new("--chdir");
-        // Silently leaving the working directory where it was would put the
-        // sandbox in whatever directory bwrap inherited — a host path.
+        // Silently leaving the working directory where it was would put
+        // the sandbox in whatever directory bwrap inherited — a host
+        // path — instead of in the share the caller asked for.
         let args = self
             .namespaces
             .iter_mut()

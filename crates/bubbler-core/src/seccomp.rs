@@ -362,7 +362,13 @@ fn build(set: &RuleSet, log: bool) -> Result<Built, LaunchError> {
     let mut seen: BTreeSet<i32> = BTreeSet::new();
     // Before the architectures on purpose: `man 3 seccomp_arch_add` says
     // a rule added before an architecture does not reach it, and that is
-    // the only way these three go in at all.
+    // the only way these three go in at all. libseccomp translates a
+    // rule to another architecture through the syscall's *name*, and
+    // answers `EFAULT` for a number the native table cannot name
+    // (measured with libseccomp 2.6.0 and i386 in the filter). So the
+    // choice is a rule on the build architecture or no rule; a 32-bit
+    // binary in the sandbox still reaches these three numbers, which is
+    // recorded in `docs/threat-model.md`.
     for (_, nr, errno) in &set.enosys_numbered {
         let nr = ScmpSyscall::from(*nr);
         if !seen.insert(nr.into()) {
@@ -477,7 +483,10 @@ fn insn(code: u16, jt: u8, jf: u8, k: u32) -> [u8; 8] {
 /// argument outside [`PERSONALITY_ALLOWED`] and otherwise falls off its
 /// end, so it can be placed before libseccomp's program: cBPF jumps are
 /// relative and forward, so a block whose last instruction jumps to the
-/// one after it is a prefix of any program.
+/// one after it is a prefix of any program. libseccomp cannot express a
+/// per-argument allowlist in a default-allow filter — two comparisons on
+/// one argument are `EINVAL` and an `ALLOW` rule is `EACCES` — which is
+/// why this is written by hand.
 ///
 /// Offsets are `struct seccomp_data` from `linux/seccomp.h`: `nr` 0,
 /// `arch` 4, `args[0]` 16, of which the low word is what the kernel

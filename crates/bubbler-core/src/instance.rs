@@ -345,7 +345,9 @@ fn with_grants(cfg: &mut InstanceConfig, grants: &[&str]) -> Result<(), Instance
                 .iter()
                 .any(|s| matches!(s, Service::Network { .. })),
             // And for the two display grants, whose mode the bare grant
-            // does not carry either.
+            // does not carry either: `--grant x11` on a profile holding
+            // `x11 "host"` would otherwise write a second node the
+            // parser refuses.
             Service::Wayland(_) => cfg
                 .services
                 .iter()

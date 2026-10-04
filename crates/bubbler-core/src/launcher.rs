@@ -81,6 +81,7 @@ const PASTA_STOP: Duration = Duration::from_secs(1);
 // A bound on a hang, not on the work: `nft` took 1.5 ms when measured.
 const NFT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// It binds one socket after three `setns` calls; this is a bound on a hang and not on the work.
 const NET_PROXY_READY: Duration = Duration::from_secs(5);
 
 const NET_PROXY_STOP: Duration = Duration::from_secs(5);
@@ -167,8 +168,15 @@ impl FdAllocator for DryRunAlloc {
 }
 
 /// Allocator for a real run: seccomp memfds, generated files in the run's runtime directory, the
-/// bound control socket and a sidecar ready pipe. Each generated file is the live source of a
-/// read-only bind, so the allocator unlinks what it wrote only when dropped after its sandbox.
+/// bound control socket and a sidecar ready pipe.
+///
+/// A generated file is the live source of a read-only bind, so its content must not change and it
+/// must not be unlinked while any sandbox holds that bind. Each allocator therefore owns the files
+/// it wrote and is the only thing that unlinks them, when it drops after its own sandbox has
+/// exited; and no two allocators of one run write the same path, which is what
+/// [`RealAlloc::sidecar`]'s name prefix is for — `portals` gives the application sandbox and the
+/// D-Bus proxy a `/.flatpak-info` each, and the proxy is already running with its own bound when
+/// the application's argv is built.
 #[derive(Debug)]
 pub struct RealAlloc {
     /// Fds bwrap inherits; they stay open until it has been spawned.
@@ -207,8 +215,8 @@ impl Drop for RealAlloc {
 }
 
 impl RealAlloc {
-    /// Allocate around an already inherited control socket fd; `dir` is the run's runtime
-    /// directory.
+    /// Allocate around an already inherited control socket fd. `dir` is the run's runtime
+    /// directory, which the caller has created.
     pub fn new(socket: RawFd, dir: PathBuf) -> Self {
         let mut a = Self::in_dir(dir, "");
         a.socket = Some(socket);
@@ -292,7 +300,8 @@ impl RealAlloc {
     }
 
     // CLOEXEC at rest, cleared only around the one spawn they were built for. That window is
-    // process-wide; bubbler's other threads (run-log copier, KDL parser) open no fd, spawn nothing.
+    // process-wide; bubbler's other threads (run-log copier, KDL parser) open no fd, spawn nothing,
+    // and no configuration is parsed while the window is open.
     fn inheritable(&self, on: bool) -> io::Result<()> {
         let flags = match on {
             true => FdFlags::empty(),
@@ -1250,6 +1259,8 @@ fn read_report(
     Ok(report)
 }
 
+// The sidecar keeps serving after the move: it listens on the socket it bound, not on the path,
+// and the sandbox connects through the new one.
 // Move first, check second: the reverse lets a sidecar swap a symlink in after the check, and
 // bwrap resolves bind sources through links. Once moved, only bubbler can touch the entry.
 fn adopt_socket(
@@ -1830,6 +1841,11 @@ fn install_rules(
     Ok(())
 }
 
+// `bwrap`, found on bubbler's own `PATH`, to be started with an empty environment: it stays pid 1
+// inside the sandbox, where its environ is readable, and `--clearenv` cleans only what it starts
+// (https://github.com/containers/bubblewrap/issues/725). Its command line is readable there too,
+// so `argv`'s options reach it through `--args` from a descriptor `alloc` holds until the spawn
+// has happened ([`RealAlloc::close_options`]).
 // The `--` and the command stay on argv: bwrap drops a command it finds in an `--args` file.
 // Call before the spawn window opens, so the options descriptor is in it.
 fn bwrap_command(argv: &Argv, alloc: &mut RealAlloc) -> Result<Command, LaunchError> {
@@ -2301,8 +2317,10 @@ fn mkdir_private(dir: &Path) -> Result<(), LaunchError> {
 // the rest.
 const LEFTOVER_BUDGET: usize = 100_000;
 
-// Only after this run's control-socket bind found no live run: that makes it the one start
-// clearing. What is at the name is moved aside and removed best-effort, never followed.
+// Only after this run's control-socket bind found no live run. Only one start at a time gets
+// there, and a run that is ending holds a start back until its teardown is done — except for a
+// start that binds in the moment between the sandbox's exit and the ending run taking the lock.
+// What is at the name is moved aside and removed best-effort, never followed.
 fn fresh_sidecar_dir(dir: &Path) -> Result<(), LaunchError> {
     let io_at = |e: Errno| LaunchError::Io(dir.to_path_buf(), e.into());
     let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
@@ -2929,7 +2947,9 @@ fn wait_relaying(
 
 /// Start the instance and return the exit code to propagate. `AlreadyRunning` when it is live,
 /// for the caller to turn into an exec. A stop signal during startup stops what was started and
-/// returns 128+SIGTERM. `log` is told whether this run started the sandbox.
+/// returns 128+SIGTERM. `log` is told whether this run started the sandbox. On `AlreadyRunning` it
+/// is told nothing: the caller either [joins](run_log::Redirect::joined) that run or says it did
+/// not start.
 pub fn run(
     env: &Env,
     inst: &Instance,
@@ -3073,8 +3093,9 @@ impl Drop for SocketGuard {
     }
 }
 
-// Taken once the sandbox has exited, so a start made now waits for this run's teardown. A lock
-// that cannot be had costs only that guarantee, so it is a warning.
+// Taken once the sandbox has exited, so a start made now waits for this run's teardown.
+// Blocking: a stop signal has usually ended the run by now, and another start holds the lock only
+// from its liveness check to its bind. A lock that cannot be had costs only that guarantee, so it is a warning.
 fn lock_for_teardown(path: &Path) -> Option<OwnedFd> {
     let locked = open_start_lock(path).and_then(|lock| {
         flock(&lock, FlockOperation::LockExclusive)
@@ -3154,6 +3175,8 @@ fn start_and_wait(
     {
         stdio.pty = Some(tty::allocate(host[i].as_fd())?);
     }
+    // Before the argv is built, for the same reason the proxy is: a bind whose source is not there
+    // is a failed start, not a warning.
     prepare_app_runtime(env, &inst.config.services)?;
     // Before bwrap, which never changes cgroup: the sandbox inherits the run's `sandbox` leaf, and
     // the proxy's leaf beside it is out of its reach. Dropped after the sidecars below.
@@ -3161,7 +3184,8 @@ fn start_and_wait(
         Some(_) => Some(cgroup::create(&inst.name, std::process::id())?),
         None => None,
     };
-    // The operations, not the flat argv, because the sweep reads their destinations.
+    // The operations, not the flat argv, because the sweep reads their destinations. Flattened
+    // again straight after, so what bwrap is handed is what `build_argv` would have produced.
     let (args, resolved) = build_args_on(env, inst, command, stdio.ctty(), &RealHost)?;
     let finished = args.finish_ops(resolved, &mut alloc)?;
     // A destination behind a planted link is a write outside the sandbox on bwrap below 0.12.0,

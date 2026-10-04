@@ -1476,8 +1476,9 @@ fn repeat_outside_block(i: usize, source: &Source, f: &mut Findings) {
         if written.len() < 2 {
             continue;
         }
-        // Skip this `kind` rather than every `kind` after it — `collect` into an `Option` stops at
-        // the first `None` without reaching past this one.
+        // A node the config parser will refuse anyway has no block form to offer; skip this `kind`
+        // rather than every `kind` after it — `collect` into an `Option` stops at the first `None`
+        // without reaching past this one.
         let Some(mut parts) = written
             .iter()
             .copied()
@@ -1503,6 +1504,7 @@ fn repeat_outside_block(i: usize, source: &Source, f: &mut Findings) {
     }
 }
 
+// `None` for a node whose shape the config parser refuses, which has no block form to offer.
 // A value prints through `KdlValue`'s own `Display`, which quotes only where a bare identifier
 // would not round-trip and leaves the rest bare.
 fn as_block_child(node: &KdlNode) -> Option<String> {
