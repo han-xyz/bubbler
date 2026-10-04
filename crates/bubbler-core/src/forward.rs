@@ -1,12 +1,7 @@
 //! Handing the sandbox one host file at a time through the document
-//! portal.
-//!
-//! A file manager's "open with" expands to a host path the sandbox
-//! cannot see: the instance home is private and nothing else of the
-//! user's home is bound. `org.freedesktop.portal.Documents.AddFull`
+//! portal. `org.freedesktop.portal.Documents.AddFull`
 //! takes an `O_PATH` descriptor of the file and returns a document id;
-//! the file then appears inside at `$XDG_RUNTIME_DIR/doc/<id>/<name>`,
-//! which the `portals` service binds as this instance's by-app view.
+//! the file then appears inside at `$XDG_RUNTIME_DIR/doc/<id>/<name>`.
 //!
 //! Nothing here widens a sandbox on its own: [`plan`] only classifies
 //! arguments, [`register`] grants one file per call with `read`, or
@@ -27,35 +22,24 @@ use crate::dbus_wire::{Session, Value, WireError};
 use crate::env::{Env, SANDBOX_HOME};
 use crate::host::Host;
 
-/// The document portal: bus name, object and interface.
 const PORTAL_NAME: &str = "org.freedesktop.portal.Documents";
 const PORTAL_PATH: &str = "/org/freedesktop/portal/documents";
 const PORTAL_IFACE: &str = "org.freedesktop.portal.Documents";
 
-/// `AddFull` flag 1, `reuse_existing`: a file already exported to this
-/// app id keeps the id it has instead of collecting one per open. Bit 2
-/// (`persistent`) is deliberately not set — a grant lasts the session.
+// Bit 2 (`persistent`) is deliberately not set — a grant lasts the session.
 const FLAG_REUSE_EXISTING: u32 = 1;
 
-/// Directory of the by-app document view, under `$XDG_RUNTIME_DIR` both
-/// on the host and inside the sandbox.
+// Under `$XDG_RUNTIME_DIR` both on the host and inside the sandbox.
 const DOC_DIR: &str = "doc";
 
-/// Host trees the baseline binds at the same path inside every sandbox:
-/// `--ro-bind /usr` and `--ro-bind-try /opt`. `/etc` is not one of them
-/// — it is a tmpfs with [`ETC_ALLOWLIST`] bound over it — and neither
-/// are the `/bin` and `/lib` symlinks, which point at `/usr` inside
-/// whatever they are on the host.
+// `/etc` is not one of them — it is a tmpfs with [`ETC_ALLOWLIST`] bound over it — and
+// neither are the `/bin` and `/lib` symlinks, which point at `/usr` inside.
 const BASELINE_ROOTS: [&str; 2] = ["/usr", "/opt"];
 
-/// `sysfs`, as `statfs(2)` lists it. rustix names `PROC_SUPER_MAGIC`
-/// but not this one, and a bind mount of either filesystem answers to a
-/// path no prefix test would catch.
+// `sysfs`, as `statfs(2)` lists it. rustix names `PROC_SUPER_MAGIC`
+// but not this one.
 const SYSFS_MAGIC: rustix::fs::FsWord = 0x6265_6572;
 
-/// Path prefixes never forwarded: they name kernel interfaces and the
-/// sandbox's own devices, not documents, and the sandbox has its own
-/// `/proc` and `/dev` already.
 const REFUSED_ROOTS: [&str; 3] = ["/proc", "/sys", "/dev"];
 
 /// A host file an argument names, worth asking the portal for.
@@ -93,10 +77,8 @@ pub enum Skip {
     /// Under `/proc`, `/sys` or `/dev`: a kernel interface, not a
     /// document, and one the sandbox has its own of already.
     Refused,
-    /// Holds a `..` component. Refused rather than folded, the same way
-    /// `config.rs` refuses one in a share path: what it resolves to
-    /// depends on symlinks along the way, and a path that says one file
-    /// and opens another is not one to hand over.
+    /// Holds a `..` component. Refused rather than folded: what it resolves to
+    /// depends on symlinks along the way.
     DotDot,
     /// Already reachable inside *at the same path*: a `path-share`
     /// source, an `etc-share` entry, or one of the trees the baseline
@@ -109,10 +91,8 @@ pub enum Skip {
 pub enum Planned {
     /// A host file to ask the portal for.
     Forward(Candidate),
-    /// A file the sandbox already sees, under another name: everything
-    /// bound under [`SANDBOX_HOME`] keeps its relative path but not its
-    /// host one, so the argument becomes the path inside. No portal and
-    /// no grant are involved — the share is already there.
+    /// A file the sandbox already sees, under another name, so the argument becomes
+    /// the path inside. No portal and no grant are involved.
     Rename {
         /// Position in the argument list this was found at.
         arg_index: usize,
@@ -188,14 +168,8 @@ pub enum ForwardError {
 }
 
 /// Classify every argument: which name a host file worth forwarding,
-/// which name one bubbler will not forward and why, which are not paths.
-///
-/// `args` are the *arguments* of the sandboxed command, never the
-/// program itself — a program is a path inside the sandbox, and
-/// replacing it with a document path would swap the binary that runs.
-///
-/// Nothing is registered and nothing is opened here, so the result is
-/// what `--dry-run` and `--explain` print.
+/// which name one bubbler will not forward and why, which are not paths. `args` are the
+/// *arguments* of the sandboxed command, never the program itself; nothing is opened here.
 pub fn plan(
     env: &Env,
     cfg: &InstanceConfig,
@@ -207,11 +181,7 @@ pub fn plan(
 }
 
 /// [`plan`] over a whole command line, the program included: index 0 is
-/// never a document — replacing it would swap the binary that runs — and
-/// the indices are into `cmd`, so [`rewrite`] takes that same slice.
-///
-/// This is what a caller holding an argv wants; [`plan`] is for one that
-/// has already split the program off.
+/// never a document, and the indices are into `cmd`, so [`rewrite`] takes that same slice.
 pub fn plan_args(
     env: &Env,
     cfg: &InstanceConfig,
@@ -228,7 +198,6 @@ pub fn plan_args(
     out
 }
 
-/// [`plan`] with the first argument at `offset` of the caller's list.
 fn plan_from(
     offset: usize,
     env: &Env,
@@ -244,16 +213,9 @@ fn plan_from(
         .collect()
 }
 
-/// Ask the portal for every candidate and say where each file landed.
-///
-/// One answer per candidate, in the order given: an entry that failed
-/// leaves that argument alone rather than the whole launch. `AddFull`
-/// takes one permission set for all of its descriptors, so the
-/// candidates are grouped by permission and one call is made per group.
-///
-/// The session is the caller's: any [`WireError`] other than a refusal
-/// leaves the connection half-read, so a caller that means to reuse it
-/// drops it instead.
+/// Ask the portal for every candidate and say where each file landed, one answer per
+/// candidate in the order given. Any [`WireError`] other than a refusal leaves the
+/// connection half-read, so a caller that means to reuse it drops it instead.
 pub fn register(
     env: &Env,
     instance: &str,
@@ -271,10 +233,8 @@ pub fn register(
     }
 
     let app_id = crate::dbus::app_id(instance);
-    // A refusal leaves the session usable, and so does a call that
-    // never left this process; anything else leaves the connection
-    // half-read, so the remaining groups are failed with the same
-    // reason instead of being sent down a connection that is gone.
+    // Anything but a refusal or a call that never left this process leaves the connection
+    // half-read, so the remaining groups are failed with the same reason.
     let mut broken: Option<String> = None;
     for write in permission_sets(candidates) {
         let group: Vec<&Opened> = open
@@ -321,11 +281,8 @@ pub fn register(
                     done[opened.index] = Some(Ok(Forward {
                         arg_index: candidate.arg_index,
                         host: candidate.host.clone(),
-                        // The name the descriptor has, not the one the
-                        // plan saw: the portal reads it off the
-                        // descriptor the same way, so a file renamed
-                        // since cannot leave a document path that opens
-                        // nothing.
+                        // The name the descriptor has, not the one the plan saw: a file
+                        // renamed since cannot leave a document path that opens nothing.
                         inside: env.runtime_dir.join(DOC_DIR).join(id).join(&opened.name),
                         write: candidate.write,
                     }));
@@ -346,20 +303,9 @@ pub fn register(
         .collect()
 }
 
-/// The argument list with every file the sandbox will see put at the
-/// path it will see it at: the ones the portal exported, and the ones a
-/// share already holds under [`SANDBOX_HOME`].
-///
-/// The renames come out of the plan and need no portal at all, so this
-/// is worth calling even when nothing was registered. Arguments neither
-/// covers are copied as they were, `file://` URIs included.
-///
-/// All three lists count positions the same way, and the caller must
-/// keep them that way: `planned` must be the [`plan`] (or
-/// [`plan_args`]) of these same `args`, and `forwards` the [`register`]
-/// of the candidates in it. An index from another argument list is
-/// applied to whatever sits at that position here — it names a
-/// position, not an argument — and only one past the end is dropped.
+/// The argument list with every file the sandbox will see put at the path it will see it
+/// at. `planned` must be the [`plan`] (or [`plan_args`]) of these same `args`, and
+/// `forwards` the [`register`] of the candidates in it: an index names a position.
 pub fn rewrite(args: &[OsString], planned: &[Planned], forwards: &[Forward]) -> Vec<OsString> {
     debug_assert!(
         planned.len() <= args.len()
@@ -441,7 +387,6 @@ pub fn warning_lines(planned: &[Planned]) -> Vec<String> {
         .collect()
 }
 
-/// What one argument is.
 fn classify(index: usize, arg: &OsStr, visible: &[Root], host: &dyn Host) -> Planned {
     let given = match host_path(arg) {
         Some(path) if path.is_absolute() => path,
@@ -455,9 +400,7 @@ fn classify(index: usize, arg: &OsStr, visible: &[Root], host: &dyn Host) -> Pla
         return Planned::Skip(index, given, Skip::DotDot);
     }
     // Every rule below is applied to the file the path ends at, not to
-    // the name: `~/shared/link` may point anywhere, and a rule that
-    // reads the name alone would grant what the link names instead of
-    // what it opens. Messages keep the path as the user wrote it.
+    // the name: `~/shared/link` may point anywhere.
     let real = host.canonicalize(&given).unwrap_or_else(|| given.clone());
     let refused = |p: &Path| REFUSED_ROOTS.iter().any(|root| p.starts_with(root));
     if refused(&given) || refused(&real) {
@@ -479,8 +422,6 @@ fn classify(index: usize, arg: &OsStr, visible: &[Root], host: &dyn Host) -> Pla
                     false => inside.join(rest),
                 };
                 match inside == given {
-                    // What the sandbox sees is what the argument
-                    // already says; there is nothing to rewrite.
                     true => Planned::Skip(index, given, Skip::AlreadyVisible),
                     false => Planned::Rename {
                         arg_index: index,
@@ -513,26 +454,14 @@ fn classify(index: usize, arg: &OsStr, visible: &[Root], host: &dyn Host) -> Pla
     })
 }
 
-/// A host tree the sandbox already reaches, and where it sees it.
 struct Root {
-    /// Where the files are on the host.
     host: PathBuf,
-    /// Where the sandbox sees them, when that is not the same path.
-    /// Everything bound under [`SANDBOX_HOME`] keeps its relative path
-    /// and loses its host one; a `path-share` and the baseline trees are
-    /// bound at the path they have on the host.
+    // Where the sandbox sees them, when that is not the same path.
     inside: Option<PathBuf>,
 }
 
-/// Host trees the sandbox can already reach: what the baseline binds,
-/// the source of every share the config grants and of every `--share`
-/// this run adds, and the instance's own home.
-///
-/// The mapping mirrors the binds: `home-share` puts `$HOME/<path>` at
-/// `SANDBOX_HOME/<path>` and the instance home is the sandbox home, so
-/// both need the argument rewritten; `path-share`, `etc-share` and the
-/// baseline trees keep the host path. A `--share` is one or the other by
-/// where its path lies.
+// The mapping mirrors the binds: `home-share` puts `$HOME/<path>` at
+// `SANDBOX_HOME/<path>` and the instance home is the sandbox home.
 fn visible_roots(
     env: &Env,
     cfg: &InstanceConfig,
@@ -554,8 +483,7 @@ fn visible_roots(
         add_root(&mut roots, host, same(PathBuf::from(root)), |_| true);
     }
     for name in ETC_ALLOWLIST {
-        // The baseline binds each entry wherever it resolves
-        // (`--ro-bind /etc/<name> /etc/<name>`, and bwrap resolves the
+        // The baseline binds each entry wherever it resolves (bwrap resolves the
         // source), so the tree it lands on is visible at that path.
         add_root(&mut roots, host, same(etc(name)), |_| true);
     }
@@ -563,10 +491,7 @@ fn visible_roots(
         match service {
             Service::HomeShare { path, optional, .. } => {
                 // A missing optional source binds nothing, the same skip
-                // `home_share` itself makes, so it is not a root either:
-                // an argument under it is a file like any other, not one
-                // the sandbox already sees under a path that was never
-                // bound.
+                // `home_share` itself makes, so it is not a root either.
                 if *optional && host.file_type(&env.home.join(path)).is_none() {
                     continue;
                 }
@@ -577,9 +502,8 @@ fn visible_roots(
                         host: env.home.join(path),
                         inside: Some(Path::new(SANDBOX_HOME).join(path)),
                     },
-                    // `home_share` confines the resolved source to the
-                    // home directory and fails the launch when it
-                    // leaves it.
+                    // `home_share` confines the resolved source to the home
+                    // directory and fails the launch when it leaves it.
                     |real| real.starts_with(&env.home),
                 )
             }
@@ -591,11 +515,8 @@ fn visible_roots(
                     &mut roots,
                     host,
                     same(path.clone()),
-                    // The launcher refuses a `path-share` that meets a
-                    // reserved root, so one never reaches a bind — and a
-                    // source resolving to `/` or to the user's home
-                    // would otherwise claim every argument as already
-                    // visible.
+                    // The launcher refuses a `path-share` that meets a reserved root; a source
+                    // resolving to `/` would otherwise claim every argument as already visible.
                     |_| crate::service::reserved_reason(host, env, path).is_none(),
                 )
             }
@@ -611,13 +532,10 @@ fn visible_roots(
         }
     }
     // A `--share` is a bind like the two share nodes above, so a file
-    // under one is inside already: forwarding it would hand the command
-    // a document path for a file it can open where it was named.
+    // under one is inside already.
     for share in &cfg.shares {
         match share.path.strip_prefix(&env.home) {
-            // The same mapping `service::share_paths` binds by: under
-            // the real home at the same relative path in the private
-            // home, anywhere else at its own path.
+            // The same mapping `service::share_paths` binds by.
             Ok(rel) => add_root(
                 &mut roots,
                 host,
@@ -632,18 +550,14 @@ fn visible_roots(
             }),
         }
     }
-    // A root that is not absolute compares against nothing, and `/` or
-    // an empty one is a prefix of every path — which would quietly
+    // `/` or an empty root is a prefix of every path — which would quietly
     // forward no file at all.
     roots.retain(|root| root.host.is_absolute() && root.host != Path::new("/"));
     roots
 }
 
-/// Add a root, and where its source resolves elsewhere the tree it
-/// really names as well: a bind resolves its source but mounts it at
-/// the path the config wrote (`service.rs`), so the sandbox sees that
-/// tree at the written path. `keep` is asked about the resolved source,
-/// and answers what the launcher would refuse before binding it at all.
+// A bind resolves its source but mounts it at the path the config wrote, so the tree a
+// source really names is a root too. `keep` answers what the launcher would refuse.
 fn add_root(roots: &mut Vec<Root>, host: &dyn Host, root: Root, keep: impl FnOnce(&Path) -> bool) {
     if let Some(real) = host.canonicalize(&root.host)
         && real != root.host
@@ -658,23 +572,16 @@ fn add_root(roots: &mut Vec<Root>, host: &dyn Host, root: Root, keep: impl FnOnc
     roots.push(root);
 }
 
-/// One entry of the host `/etc`. The rest of `/etc` inside is a tmpfs,
-/// so nothing else there is visible to the sandbox.
 fn etc(name: impl AsRef<Path>) -> PathBuf {
     Path::new("/etc").join(name)
 }
 
-/// The host path an argument names, or `None` when it names none: a
-/// flag, a bare word, another URI scheme, a `file://` URI with a
-/// foreign authority, or a path with a nul in it, which names no file.
 fn host_path(arg: &OsStr) -> Option<PathBuf> {
     let bytes = arg.as_bytes();
     let decoded;
     let path: &[u8] = match bytes.split_at_checked(5) {
-        // "file://localhost/x" and "file:///x" name the same file;
-        // RFC 8089 gives an empty authority and "localhost" that
-        // meaning and nothing else. A host bubbler cannot reach is not
-        // a file to forward.
+        // RFC 8089 gives an empty authority and "localhost" that meaning and nothing
+        // else. A host bubbler cannot reach is not a file to forward.
         Some((scheme, rest)) if scheme.eq_ignore_ascii_case(b"file:") => {
             let rest = match rest.strip_prefix(b"//") {
                 None => rest,
@@ -703,10 +610,8 @@ fn host_path(arg: &OsStr) -> Option<PathBuf> {
     Some(PathBuf::from(OsString::from_vec(path.to_vec())))
 }
 
-/// Percent-decoding as "URI Syntax" defines it. A `%` that does not
-/// start a valid escape is left as it is: senders that never encoded it
-/// meant the character, and a file that does not exist is refused a few
-/// lines later anyway.
+// A `%` that does not start a valid escape is left as it is: senders that
+// never encoded it meant the character.
 fn percent_decode(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut rest = bytes;
@@ -731,13 +636,11 @@ fn percent_decode(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// One hexadecimal digit, either case.
 fn hex(b: u8) -> Option<u8> {
     char::from(b).to_digit(16).map(|d| d as u8)
 }
 
-/// The permission sets the candidates need, in the order they first
-/// occur, so the calls go out in a fixed order.
+// In the order they first occur, so the calls go out in a fixed order.
 fn permission_sets(candidates: &[Candidate]) -> Vec<bool> {
     let mut sets: Vec<bool> = Vec::with_capacity(2);
     for candidate in candidates {
@@ -748,9 +651,6 @@ fn permission_sets(candidates: &[Candidate]) -> Vec<bool> {
     sets
 }
 
-/// What the sandbox is granted over the file. `delete` and
-/// `grant-permissions` are never asked for: an app that was handed one
-/// file has no business removing it or passing it on.
 fn permissions(write: bool) -> Vec<Value> {
     let mut list = vec![Value::Str("read".to_owned())];
     if write {
@@ -759,9 +659,8 @@ fn permissions(write: bool) -> Vec<Value> {
     list
 }
 
-/// ` (→ <canonical>)` where the argument is a symlink, empty where the
-/// path is already the file: what is exported is the file at the end of
-/// the link, and an explanation that hid that would name the wrong file.
+// What is exported is the file at the end of the link, and an explanation
+// that hid that would name the wrong file.
 fn resolved_clause(candidate: &Candidate) -> String {
     match candidate.host == candidate.given {
         true => String::new(),
@@ -769,7 +668,6 @@ fn resolved_clause(candidate: &Candidate) -> String {
     }
 }
 
-/// The word `--explain` prints for a permission set.
 fn permission_text(write: bool) -> &'static str {
     match write {
         true => "write",
@@ -777,14 +675,8 @@ fn permission_text(write: bool) -> &'static str {
     }
 }
 
-/// Open the file for the portal to `fstat`.
-///
-/// `O_PATH` is what Flatpak passes and all the portal needs: the
-/// descriptor names the file without being readable or writable, so
-/// bubbler never holds an open handle to the user's document. Symlinks
-/// are followed — the desktop handed us the link and the user means the
-/// file at the end of it — and the type is re-checked on the descriptor
-/// so a path that changed since [`plan`] cannot pass as a file.
+// `O_PATH` is what Flatpak passes and all the portal needs: bubbler never
+// holds an open handle to the user's document.
 fn open_path(path: &Path) -> Result<(OwnedFd, OsString), ForwardError> {
     let failed = |source: rustix::io::Errno| ForwardError::Open {
         path: path.to_path_buf(),
@@ -797,10 +689,7 @@ fn open_path(path: &Path) -> Result<(OwnedFd, OsString), ForwardError> {
         return Err(ForwardError::NotAFile(path.to_path_buf()));
     }
     // Everything under `/proc` and `/sys` `fstat`s as a regular file, so
-    // the type says nothing about it. `/proc/self/fd/<n>` names what the
-    // descriptor is really open on, which is the one account of it a
-    // swap between the plan and the open cannot have changed, and
-    // `fstatfs` names the filesystem it is on whatever it is called.
+    // the type says nothing about it.
     let real = opened_path(fd.as_fd()).map_err(failed)?;
     let magic = rustix::fs::fstatfs(&fd).map_err(failed)?.f_type;
     if magic == rustix::fs::PROC_SUPER_MAGIC
@@ -812,9 +701,8 @@ fn open_path(path: &Path) -> Result<(OwnedFd, OsString), ForwardError> {
             real,
         });
     }
-    // A regular file has a name; a descriptor whose path has none is
-    // not one this could export, so the candidate's own name is left to
-    // the portal to disagree with.
+    // A descriptor whose path has no name is not one this could export, so
+    // the candidate's own name is left to the portal to disagree with.
     let name = real.file_name().map_or_else(
         || OsString::from(path.file_name().unwrap_or_default()),
         OsStr::to_os_string,
@@ -822,20 +710,14 @@ fn open_path(path: &Path) -> Result<(OwnedFd, OsString), ForwardError> {
     Ok((fd, name))
 }
 
-/// One candidate that opened: the descriptor the portal is handed and
-/// the name the file has now.
 struct Opened {
-    /// Position in the candidate list.
     index: usize,
-    /// `O_PATH` descriptor of the file.
     fd: OwnedFd,
-    /// Basename of what the descriptor is open on.
     name: OsString,
 }
 
-/// The path `fd` is open on, as `/proc/self/fd/<n>` gives it. A file
-/// unlinked meanwhile reads as its old path with ` (deleted)` after it,
-/// which is under no root either way.
+// A file unlinked meanwhile reads as its old path with ` (deleted)` after it,
+// which is under no root either way.
 fn opened_path(fd: BorrowedFd<'_>) -> Result<PathBuf, rustix::io::Errno> {
     use std::os::fd::AsRawFd;
     let link = Path::new("/proc/self/fd").join(fd.as_raw_fd().to_string());
@@ -843,10 +725,8 @@ fn opened_path(fd: BorrowedFd<'_>) -> Result<PathBuf, rustix::io::Errno> {
     Ok(PathBuf::from(OsString::from_vec(target.into_bytes())))
 }
 
-/// The document ids out of an `AddFull` reply, checked to be one usable
-/// name per file. The portal is another process on the bus, so an id
-/// that is not a single path component is refused rather than joined
-/// into a path.
+// The portal is another process on the bus, so an id that is not a single
+// path component is refused rather than joined into a path.
 fn document_ids(values: &[Value], expected: usize) -> Result<Vec<String>, ForwardError> {
     let [Value::Array(ids), Value::Dict(_)] = values else {
         return Err(ForwardError::Answer("a reply that is not (as, a{sv})"));
@@ -864,26 +744,12 @@ fn document_ids(values: &[Value], expected: usize) -> Result<Vec<String>, Forwar
         .collect()
 }
 
-/// Whether an id names one directory under the document view and
-/// nothing else.
 fn is_document_id(id: &str) -> bool {
     !id.is_empty() && id != "." && id != ".." && !id.contains('/') && !id.contains('\0')
 }
 
-/// Whether a wire failure happened before the call left this process,
-/// which leaves the connection exactly as it was. [`Session::call`]
-/// makes these checks before it sends anything: no destination, a
-/// connection that passes no descriptors, more descriptors than a
-/// message may carry, an index the call was not given, and a body that
-/// does not match the signature this module wrote.
-///
-/// Only failures the decoder cannot also raise are listed. The
-/// marshalling errors a reply can produce as easily as a body —
-/// `BadSignature` and `Unsupported` from a variant or a dict entry
-/// inside an answer, `BadString`, `ArrayTooLong`, `MessageTooLong`,
-/// `Depth` — count as breaking: the values bubbler encodes here cannot
-/// raise them, and reading a reply that far means the connection is
-/// past a point this client can account for.
+// Only failures the decoder cannot also raise, all of which `Session::call` checks
+// before it sends anything; the marshalling errors a reply can produce count as breaking.
 fn before_sending(e: &WireError) -> bool {
     matches!(
         e,
@@ -896,9 +762,6 @@ fn before_sending(e: &WireError) -> bool {
     )
 }
 
-/// A wire failure as a reason one file did not make it. A refusal keeps
-/// the portal's own error name; everything else is the connection
-/// failing, which is not the portal's word for anything.
 fn wire_reason(e: &WireError) -> ForwardError {
     match e {
         WireError::Remote { name, message } => ForwardError::Portal {
@@ -910,9 +773,8 @@ fn wire_reason(e: &WireError) -> ForwardError {
 }
 
 impl ForwardError {
-    /// The same reason again, for the next file of a call that failed
-    /// for all of them. [`io::Error`] is not `Clone`, so an open failure
-    /// — which is never shared — keeps only its text here.
+    // `io::Error` is not `Clone`, so an open failure — which is never shared —
+    // keeps only its text here.
     fn again(&self) -> Self {
         match self {
             ForwardError::Open { path, source } => ForwardError::Open {
