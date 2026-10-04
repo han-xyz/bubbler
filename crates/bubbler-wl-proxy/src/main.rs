@@ -28,35 +28,26 @@ use bubbler_wl_proxy::audit::{Audit, Kind};
 use bubbler_wl_proxy::policy::{Gate, Policy};
 use bubbler_wl_proxy::relay;
 
-/// The one usage line, so a grammar error always names the whole grammar.
+// The one usage line, so a grammar error always names the whole grammar.
 const USAGE: &str = "bubbler-wl-proxy: usage: --listen-fd N --upstream PATH \
 --gate paste|open [--fallback-deny] [--log-fd N] [--ready-fd N]";
 
-/// How long the upstream socket has to answer the one connection the proxy
-/// makes before saying it is up. A compositor that never accepts must fail
-/// the launch, not hold it open.
+// A compositor that never accepts must fail the launch, not hold it open.
 const PROBE: Duration = Duration::from_secs(2);
 
-/// How long to wait before trying the upstream again while its accept queue
-/// is full — the one answer a Unix socket gives that is worth retrying.
+// How long to wait before trying the upstream again while its accept queue
+// is full — the one answer a Unix socket gives that is worth retrying.
 const RETRY: Duration = Duration::from_millis(50);
 
-/// What the launcher asked for.
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
-    /// The listening socket the sandbox connects to.
     listen_fd: i32,
-    /// The socket every connection is forwarded to.
     upstream: PathBuf,
-    /// Whether a clipboard read has to follow user input.
     gate: Gate,
-    /// Hide the privileged interfaces, for a compositor with no security
-    /// context of its own to hide them.
     fallback_deny: bool,
-    /// Where the audit log goes; stderr when the launcher named nothing.
     log_fd: Option<i32>,
-    /// Written one byte and closed once the proxy is serving, so the launcher
-    /// can start the sandbox knowing the socket will answer.
+    // Written one byte and closed once the proxy is serving, so the launcher
+    // can start the sandbox knowing the socket will answer.
     ready_fd: Option<i32>,
 }
 
@@ -66,9 +57,7 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     // The log is opened first, so every failure after this point reaches the
-    // launcher's own record and not just a stderr it may not be reading. A log
-    // descriptor that cannot be opened is the one failure with nowhere else to
-    // go.
+    // launcher's own record and not just a stderr it may not be reading.
     let mut audit = match args.log_fd.map(adopt).transpose() {
         Ok(Some(log)) => Audit::to_fd(log),
         Ok(None) => Audit::to_stderr(),
@@ -96,10 +85,8 @@ fn main() -> ExitCode {
     }
 }
 
-/// Parse the grammar over any argv but this process's own.
-///
-/// Every option may appear once, and no two may name the same descriptor: a
-/// number adopted twice would be closed twice.
+// Every option may appear once, and no two may name the same descriptor: a
+// number adopted twice would be closed twice.
 fn parse_from(mut it: impl Iterator<Item = OsString>) -> Option<Args> {
     let mut listen_fd = None;
     let mut upstream = None;
@@ -144,7 +131,6 @@ fn parse_from(mut it: impl Iterator<Item = OsString>) -> Option<Args> {
     Some(args)
 }
 
-/// One non-negative descriptor number.
 fn number(word: OsString) -> Option<i32> {
     match word.to_str()?.parse::<i32>() {
         Ok(fd) if fd >= 0 => Some(fd),
@@ -152,8 +138,6 @@ fn number(word: OsString) -> Option<i32> {
     }
 }
 
-/// Adopt the listener, reach the compositor once, and tell the launcher the
-/// socket will answer. Everything that can fail before the loop fails here.
 fn prepare(args: &Args) -> io::Result<OwnedFd> {
     let listener = adopt(args.listen_fd)?;
     if !rustix::net::sockopt::socket_acceptconn(&listener)? {
@@ -184,14 +168,9 @@ fn prepare(args: &Args) -> io::Result<OwnedFd> {
     Ok(listener)
 }
 
-/// Open and drop one connection to `upstream`, to prove it answers, giving up
-/// after [`PROBE`].
-///
-/// Nothing here may block without a bound: this runs before the readiness
-/// byte, and a compositor that has wedged with a full accept queue would
-/// otherwise hold the whole launch open. A Unix socket answers a full queue
-/// with `EAGAIN` on a socket that is not connecting at all, so that answer is
-/// retried on a fresh socket rather than waited on.
+// A Unix socket answers a full queue with `EAGAIN` on a socket that is not
+// connecting at all, so that answer is retried on a fresh socket rather than
+// waited on.
 fn probe(upstream: &Path) -> io::Result<()> {
     let address = SocketAddrUnix::new(upstream)?;
     let deadline = Instant::now() + PROBE;
@@ -215,7 +194,6 @@ fn probe(upstream: &Path) -> io::Result<()> {
     }
 }
 
-/// Wait for a connection the kernel could not finish at once.
 fn finish(socket: &OwnedFd, deadline: Instant) -> io::Result<()> {
     let left = deadline.saturating_duration_since(Instant::now());
     let timeout = Timespec {
@@ -232,13 +210,10 @@ fn finish(socket: &OwnedFd, deadline: Instant) -> io::Result<()> {
     }
 }
 
-/// The one failure the upstream socket cannot report itself.
 fn timed_out() -> io::Error {
     io::Error::other(format!("timed out after {} s", PROBE.as_secs()))
 }
 
-/// Take ownership of a descriptor the launcher passed by number, and keep it
-/// out of anything this process might ever exec.
 #[allow(unsafe_code)]
 fn adopt(fd: i32) -> io::Result<OwnedFd> {
     // SAFETY: the precondition is that `fd` names a descriptor this process
