@@ -1501,12 +1501,6 @@ v4l2loopback or OBS virtual camera among them, since Arch's `70-uaccess.rules`
 keys on the `video4linux` and `media` subsystems and nothing further — but the
 portal is strictly the narrower of the two.
 
-The device list is frozen at launch, and under an isolated network namespace no
-camera plugged in later is announced either: a udev monitor is a
-`NETLINK_KOBJECT_UEVENT` socket, which receives from its own network namespace
-alone (`netlink(7)`). Measured, a listener sharing the host's namespace saw
-every uevent while one under `--unshare-net` saw none.
-
 Permissions on the nodes are what stop a sandbox from opening one: `/dev/video*`
 is `0660 root:video`, plus an ACL for the logged-in user from that `uaccess`
 tag. On a seat with no `uaccess` — a headless machine, a session logind does
@@ -1515,11 +1509,11 @@ not own — the grant produces a node the sandbox cannot read.
 The device list is frozen at launch: there is no `/dev/video` directory to bind
 instead, so a camera plugged in later has no node inside, and with a network
 namespace of its own the sandbox is not told about one either — the udev
-monitor is a netlink socket, and its notifications do not cross a network
-namespace. `/run/udev/data` still names the devices that were there when the
-sandbox started. The portal path has neither problem: the watching happens in
-the host daemon, and node changes arrive as traffic on the socket it already
-handed over.
+monitor is a `NETLINK_KOBJECT_UEVENT` socket, and its notifications do not cross
+a network namespace (`netlink(7)`). `/run/udev/data` still names the devices
+that were there when the sandbox started. The portal path has neither problem:
+the watching happens in the host daemon, and node changes arrive as traffic on
+the socket it already handed over.
 
 The `/sys` half is names, not a working sysfs. Both
 `/sys/class/video4linux/videoN` and the entries under `/sys/bus/media` are
