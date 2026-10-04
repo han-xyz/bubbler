@@ -3,15 +3,10 @@
 //!
 //! The document portal takes `O_PATH` descriptors, and no command-line
 //! tool passes one on our behalf, so bubbler speaks the protocol itself
-//! instead of spawning `dbus-send`. Only what those calls need is here:
-//! `EXTERNAL` authentication over a Unix socket, one method call at a
-//! time, replies matched by serial. This is host-side code talking to
-//! the user's own bus as the user; nothing in a sandbox reaches it.
+//! instead of spawning `dbus-send`.
 //!
 //! Every wire fact is from the D-Bus specification
-//! (<https://dbus.freedesktop.org/doc/dbus-specification.html>),
-//! sections "Type System", "Message Format" and "Authentication
-//! Protocol"; each rule is cited where it is applied. The decoder is
+//! (<https://dbus.freedesktop.org/doc/dbus-specification.html>). The decoder is
 //! strict on purpose: a reply is input from another process, and a
 //! length, an alignment or a padding byte that does not match the
 //! specification is a reason to fail the call, never to guess.
@@ -31,94 +26,55 @@ use rustix::net::{
 };
 
 /// Longest a call waits for its reply, and the whole of what a connect
-/// and its authentication may take. A bus that has not answered within
-/// it is not going to; bubbler's callers have a user waiting.
+/// and its authentication may take.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Major protocol version of every message ("Message Format": the
-/// version for this specification is 1, and a mismatch means the two
-/// sides cannot talk at all).
 const PROTOCOL_VERSION: u8 = 1;
 
-/// Bytes of the fixed part of a header: the four bytes, the body length,
-/// the serial and the length of the header-field array.
 const FIXED_HEADER: usize = 16;
 
-/// "Arrays have a maximum length defined to be 2 to the 26th power or
-/// 67108864 (64 MiB). Implementations must not send or accept arrays
-/// exceeding this length."
 const MAX_ARRAY: usize = 1 << 26;
 
-/// "The maximum length of a message, including header, header alignment
-/// padding, and body is 2 to the 27th power or 134217728 (128 MiB)."
-/// This is the limit on what may be *sent*: a message the encoder
-/// produces has to stay inside it or no conforming peer would read it.
+// This is the limit on what may be *sent*: a message the encoder
+// produces has to stay inside it or no conforming peer would read it.
 const MAX_MESSAGE: usize = 1 << 27;
 
-/// The limit on what is *read*, which is bubbler's own and far tighter.
-///
-/// The specification's 128 MiB is a ceiling for a general bus client,
-/// not a size anything here expects: every reply bubbler reads at run
-/// time is a string (`Hello`, `GetNameOwner`, `GetAddress`), a number
-/// (`StartServiceByName`) or the doc-id list `AddFull` answers with,
-/// which has one short id per file a single command was handed (the
-/// tests also read `GetId` and a `Properties.Get` variant). 16 MiB is already four orders of
-/// magnitude more than the largest of those, and it keeps the buffer a
-/// hostile peer can make this process hold to something a desktop can
-/// spare.
+// The limit on what is *read*, which is bubbler's own and far tighter: it keeps
+// the buffer a hostile peer can make this process hold to something a desktop can spare.
 const MAX_INCOMING: usize = 16 << 20;
 // A reply this client reads must always fit what it may send.
 const _: () = assert!(MAX_INCOMING < MAX_MESSAGE);
 
-/// Values one decoded block may produce.
-///
-/// [`MAX_ARRAY`] bounds an array's bytes, not what reading it costs: an
-/// `aq` of 16 MiB is eight million [`Value`]s, tens of bytes each, from
-/// one message that was inside every limit the specification states. So
-/// the count is bounded too, across nesting rather than per array. The
-/// replies bubbler reads hold a handful of values; a million is a bound
-/// on a hostile peer, not a limit any answer meets.
+// [`MAX_ARRAY`] bounds an array's bytes, not what reading it costs: an `aq` of 16 MiB is
+// eight million [`Value`]s. So the count is bounded too, across nesting rather than per array.
 const MAX_VALUES: usize = 1 << 20;
 
-/// "The maximum length of a signature is 255."
 const MAX_SIGNATURE: usize = 255;
 
-/// "The maximum depth of container type nesting is 32 array type codes
-/// and 32 open parentheses", so 64 in total. Counted across variants
-/// too: a variant's signature is read from the message, and without a
-/// running total a reply could nest them until the decoder's recursion
-/// ran out of stack.
+// 32 array type codes and 32 open parentheses. Counted across variants too: without a
+// running total a reply could nest them until the decoder's recursion ran out of stack.
 const MAX_DEPTH: usize = 64;
 
-/// Nesting of one kind — arrays, or structs and dict entries — the
-/// specification allows.
+// Nesting of one kind — arrays, or structs and dict entries — the
+// specification allows.
 const MAX_CONTAINER_DEPTH: usize = 32;
 
-/// Descriptors one message may carry: Linux caps `SCM_RIGHTS` at 253 per
-/// message, so a longer list could never leave in one piece.
+// Linux caps `SCM_RIGHTS` at 253 per message, so a longer list could never leave in
+// one piece.
 const MAX_CALL_FDS: usize = 253;
 
-/// Descriptors a reply is given room to carry. Nothing bubbler calls
-/// answers with one; the room exists so a peer that sends some cannot
-/// leave them queued, and every one that arrives is closed at once.
-///
-/// [`Session::call`] refuses a reply that declares more than this. The
-/// control buffer's alignment slack may let a few more arrive; the kernel
-/// closes any that do not fit, and every one that arrives is closed.
+// Nothing bubbler calls answers with one; the room exists so a peer that sends some
+// cannot leave them queued, and every one that arrives is closed at once.
 const MAX_REPLY_FDS: usize = 4;
 
-/// Longest authentication line accepted, so a peer that never sends
-/// `\r\n` cannot grow the buffer without bound. The lines in use are a
-/// few dozen bytes.
+// Longest authentication line accepted, so a peer that never sends
+// `\r\n` cannot grow the buffer without bound.
 const MAX_AUTH_LINE: usize = 4096;
 
-/// Message types ("Message Format"): a call, its reply, an error reply,
-/// a signal.
 const MSG_METHOD_CALL: u8 = 1;
 const MSG_METHOD_RETURN: u8 = 2;
 const MSG_ERROR: u8 = 3;
 
-/// Header field codes ("Header Fields").
 const FIELD_PATH: u8 = 1;
 const FIELD_INTERFACE: u8 = 2;
 const FIELD_MEMBER: u8 = 3;
@@ -129,18 +85,13 @@ const FIELD_SENDER: u8 = 7;
 const FIELD_SIGNATURE: u8 = 8;
 const FIELD_UNIX_FDS: u8 = 9;
 
-/// What the bus answers `GetNameOwner` with when nobody holds the name:
-/// "If the requested name doesn't have an owner, returns a
-/// `org.freedesktop.DBus.Error.NameHasNoOwner` error." For an activatable
-/// name that only means it has not been started yet.
+// For an activatable name that only means it has not been started yet.
 const ERROR_NO_OWNER: &str = "org.freedesktop.DBus.Error.NameHasNoOwner";
 
-/// What the bus answers with when a name is not activatable at all, and
-/// what it sends back for a call it cannot deliver.
+// What the bus answers with when a name is not activatable at all, and
+// what it sends back for a call it cannot deliver.
 const ERROR_SERVICE_UNKNOWN: &str = "org.freedesktop.DBus.Error.ServiceUnknown";
 
-/// The bus's own name, object and interface: where `Hello` and `GetId`
-/// live.
 const BUS_NAME: &str = "org.freedesktop.DBus";
 const BUS_PATH: &str = "/org/freedesktop/DBus";
 const BUS_INTERFACE: &str = "org.freedesktop.DBus";
@@ -272,10 +223,6 @@ pub enum WireError {
 /// One value on the wire. The model covers the whole D-Bus type system
 /// except dict keys that are not strings, which nothing bubbler talks to
 /// uses; see [`WireError::Unsupported`].
-///
-/// `Fd` carries no descriptor: on the wire a `h` is only an index into
-/// the descriptors that travel beside the message, and the descriptors
-/// themselves are passed to [`Session::call`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// `y`: unsigned 8-bit integer.
@@ -317,7 +264,6 @@ pub enum Value {
 }
 
 impl Value {
-    /// What this value is, for an error that has to name it.
     fn kind(&self) -> &'static str {
         match self {
             Value::Byte(_) => "a byte",
@@ -342,7 +288,6 @@ impl Value {
     }
 }
 
-/// One single complete type, parsed out of a signature.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Type {
     Byte,
@@ -365,10 +310,8 @@ enum Type {
 }
 
 impl Type {
-    /// Alignment in bytes, from "Summary of D-Bus marshalling". Arrays
-    /// align like the length that starts them, structs and dict entries
-    /// to 8 whatever they hold, and a variant like the signature that
-    /// starts it, which needs no padding at all.
+    // From "Summary of D-Bus marshalling": a variant aligns like the signature
+    // that starts it, which needs no padding at all.
     fn alignment(&self) -> usize {
         match self {
             Type::Byte | Type::Signature | Type::Variant => 1,
@@ -384,7 +327,6 @@ impl Type {
         }
     }
 
-    /// The type code that opens this type, for an error that has to name it.
     fn code(&self) -> char {
         match self {
             Type::Byte => 'y',
@@ -407,7 +349,6 @@ impl Type {
         }
     }
 
-    /// Whether this is a basic type, which is all a dict entry's key may be.
     fn is_basic(&self) -> bool {
         !matches!(
             self,
@@ -416,12 +357,6 @@ impl Type {
     }
 }
 
-/// Parse a signature into the single complete types it lists.
-///
-/// Rejects everything "Valid Signatures" rejects: an array with no
-/// element type, unbalanced parentheses, an empty struct, a dict entry
-/// outside an array or with other than two fields or a container key,
-/// nesting past the limits, and a signature over 255 bytes.
 fn parse_signature(sig: &str) -> Result<Vec<Type>, WireError> {
     let bad = || WireError::BadSignature(sig.to_owned());
     if sig.len() > MAX_SIGNATURE {
@@ -436,8 +371,6 @@ fn parse_signature(sig: &str) -> Result<Vec<Type>, WireError> {
     Ok(out)
 }
 
-/// Parse one single complete type at `at`, tracking how deep in arrays
-/// and in structs it already is.
 fn parse_type(
     bytes: &[u8],
     at: &mut usize,
@@ -511,9 +444,6 @@ fn parse_type(
     })
 }
 
-/// Whether `path` meets "Valid Object Paths": it begins with `/`, its
-/// elements hold only `[A-Za-z0-9_]`, none is empty, and only the root
-/// path ends in `/`.
 fn valid_object_path(path: &str) -> bool {
     if path == "/" {
         return true;
@@ -530,7 +460,6 @@ fn valid_object_path(path: &str) -> bool {
         })
 }
 
-/// Grow `out` with nul bytes until its length is a multiple of `align`.
 fn pad(out: &mut Vec<u8>, align: usize) {
     let over = out.len() % align;
     if over != 0 {
@@ -538,17 +467,12 @@ fn pad(out: &mut Vec<u8>, align: usize) {
     }
 }
 
-/// `n` rounded up to a multiple of `align`.
 fn align_up(n: usize, align: usize) -> usize {
     n.div_ceil(align) * align
 }
 
-/// Marshal `values` against `sig`, little-endian.
-///
-/// Offset 0 of the result is taken to be a multiple of 8 from the start
-/// of the message, which is what both blocks a message has are:
-/// alignment is "calculated globally, with respect to the first byte in
-/// the message", and a body begins on an 8-byte boundary.
+/// Marshal `values` against `sig`, little-endian. Offset 0 of the result is
+/// taken to be a multiple of 8 from the start of the message.
 pub fn encode(sig: &str, values: &[Value]) -> Result<Vec<u8>, WireError> {
     let types = parse_signature(sig)?;
     if types.len() != values.len() {
@@ -564,7 +488,6 @@ pub fn encode(sig: &str, values: &[Value]) -> Result<Vec<u8>, WireError> {
     Ok(out)
 }
 
-/// Marshal one value of type `ty`, padding to its alignment first.
 fn encode_value(
     out: &mut Vec<u8>,
     ty: &Type,
@@ -614,9 +537,6 @@ fn encode_value(
             }
         }
         (Type::Variant, Value::Variant(inner)) => {
-            // "Variants are marshalled as the SIGNATURE of the contents
-            // (which must be a single complete type), followed by a
-            // marshalled value with the type given by that signature."
             let sig = signature_of(inner, 0)?;
             let types = parse_signature(&sig)?;
             let [inner_type] = types.as_slice() else {
@@ -631,8 +551,7 @@ fn encode_value(
     Ok(())
 }
 
-/// A `s`/`o` string: a UINT32 length, the text, a trailing nul. The
-/// caller has padded to 4 already.
+// The caller has padded to 4 already.
 fn encode_str(out: &mut Vec<u8>, text: &str) -> Result<(), WireError> {
     if text.as_bytes().contains(&0) {
         return Err(WireError::BadString);
@@ -644,17 +563,16 @@ fn encode_str(out: &mut Vec<u8>, text: &str) -> Result<(), WireError> {
     Ok(())
 }
 
-/// A `g` signature: a single-byte length, the text, a trailing nul. Its
-/// alignment is 1, so no padding is ever needed before it, and its
-/// length has been checked to fit a byte by [`parse_signature`].
+// Its alignment is 1, so no padding is ever needed before it, and its
+// length has been checked to fit a byte by [`parse_signature`].
 fn encode_signature(out: &mut Vec<u8>, sig: &str) {
     out.push(sig.len() as u8);
     out.extend_from_slice(sig.as_bytes());
     out.push(0);
 }
 
-/// An array: a UINT32 of the element bytes, padding to the element's
-/// alignment which the length does not count, then the elements.
+// An array: a UINT32 of the element bytes, padding to the element's
+// alignment which the length does not count, then the elements.
 fn encode_array(
     out: &mut Vec<u8>,
     element: &Type,
@@ -703,13 +621,8 @@ fn encode_array(
     Ok(())
 }
 
-/// The signature of a value, for the variant that has to carry one.
-///
-/// An empty array or dict has no element type to read off its contents,
-/// so one cannot go in a variant; nothing bubbler sends does. `depth`
-/// bounds the walk: this runs before the encoder has recursed at all, so
-/// without it a deep enough value would overflow the stack here rather
-/// than come back as an error.
+// `depth` bounds the walk: this runs before the encoder has recursed at all, so without
+// it a deep enough value would overflow the stack here rather than come back as an error.
 fn signature_of(value: &Value, depth: usize) -> Result<String, WireError> {
     if depth > MAX_DEPTH {
         return Err(WireError::Depth);
@@ -753,13 +666,11 @@ fn signature_of(value: &Value, depth: usize) -> Result<String, WireError> {
     })
 }
 
-/// A cursor over a marshalled block, refusing everything the
-/// specification does not allow rather than reading on.
 struct Reader<'a> {
     buf: &'a [u8],
     at: usize,
-    /// Values produced so far, counted across every container: the
-    /// budget belongs to the block, not to one array inside it.
+    // Counted across every container: the budget belongs to the block,
+    // not to one array inside it.
     values: usize,
 }
 
@@ -772,8 +683,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// Account for one value about to be produced. Bytes of a byte array
-    /// are not counted: they stay bytes, and cost what they weigh.
+    // Bytes of a byte array are not counted: they stay bytes, and cost what they weigh.
     fn value(&mut self) -> Result<(), WireError> {
         self.values += 1;
         if self.values > MAX_VALUES {
@@ -782,8 +692,6 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
-    /// Step over the padding before a value of alignment `align`,
-    /// refusing padding that is not nul.
     fn align(&mut self, align: usize) -> Result<(), WireError> {
         let over = self.at % align;
         let padding = if over == 0 { 0 } else { align - over };
@@ -809,9 +717,6 @@ impl<'a> Reader<'a> {
         Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
-    /// `len` bytes of text and the nul after them. "The value of any
-    /// string-like type is conceptually 0 or more Unicode codepoints
-    /// encoded in UTF-8, none of which may be U+0000."
     fn text(&mut self, len: usize) -> Result<String, WireError> {
         let bytes = self.take(len)?;
         if bytes.contains(&0) || self.byte()? != 0 {
@@ -824,11 +729,6 @@ impl<'a> Reader<'a> {
 
 /// Unmarshal `body` against `sig`, little-endian, with offset 0 taken to
 /// be a multiple of 8 from the start of the message.
-///
-/// Strict: a value that runs past the end, padding that is not nul, an
-/// array over the length limit, a string that is not nul-terminated
-/// UTF-8, a boolean that is not 0 or 1, an object path the rules forbid
-/// and bytes left over at the end are all errors.
 pub fn decode(sig: &str, body: &[u8]) -> Result<Vec<Value>, WireError> {
     let types = parse_signature(sig)?;
     let mut reader = Reader::new(body);
@@ -842,7 +742,6 @@ pub fn decode(sig: &str, body: &[u8]) -> Result<Vec<Value>, WireError> {
     Ok(out)
 }
 
-/// Unmarshal one value of type `ty`, stepping over its padding first.
 fn decode_value(reader: &mut Reader<'_>, ty: &Type, depth: usize) -> Result<Value, WireError> {
     if depth > MAX_DEPTH {
         return Err(WireError::Depth);
@@ -928,10 +827,6 @@ fn decode_value(reader: &mut Reader<'_>, ty: &Type, depth: usize) -> Result<Valu
     })
 }
 
-/// Unmarshal an array: the byte count, the element padding the count
-/// does not include, then elements until exactly that many bytes are
-/// read. An element that ends anywhere else is a disagreement about the
-/// layout, not something to read on from.
 fn decode_array(reader: &mut Reader<'_>, element: &Type, depth: usize) -> Result<Value, WireError> {
     if depth >= MAX_DEPTH {
         return Err(WireError::Depth);
@@ -983,27 +878,23 @@ fn decode_array(reader: &mut Reader<'_>, element: &Type, depth: usize) -> Result
     Ok(value)
 }
 
-/// One message off the wire, with its body still marshalled: the body's
-/// signature is a header field, so it is known only once the header is.
+// One message off the wire, with its body still marshalled: the body's
+// signature is a header field, so it is known only once the header is.
 #[derive(Debug)]
 struct Message {
     kind: u8,
     reply_serial: Option<u32>,
     error_name: Option<String>,
-    /// Unique name of the sender, which on a bus the bus itself fills in
-    /// and a client cannot forge.
+    // On a bus the bus itself fills this in, and a client cannot forge it.
     sender: Option<String>,
     signature: String,
-    /// What `UNIX_FDS` declared, which must match what arrived.
+    // What `UNIX_FDS` declared, which must match what arrived.
     unix_fds: u32,
-    /// Descriptors that arrived with its bytes, all closed already.
+    // Descriptors that arrived with its bytes, all closed already.
     fds_arrived: usize,
     body: Vec<u8>,
 }
 
-/// Marshal one message: the fixed header, the header fields, padding to
-/// 8, then the body. "The length of the header must be a multiple of 8,
-/// allowing the body to begin on an 8-byte boundary."
 fn encode_message(
     kind: u8,
     flags: u8,
@@ -1043,14 +934,8 @@ fn encode_message(
     Ok(message)
 }
 
-/// Where the body of the message starting at `head` begins and how long
-/// it is, read from the fixed header alone, in either byte order. The
-/// header-field array's length is the UINT32 at offset 12, the last of
-/// the fixed part.
-///
-/// Bounded by the specification's maximum, past which no length can be
-/// trusted to find the next message; whether a message this long is
-/// read into memory is [`MAX_INCOMING`]'s to decide.
+// Bounded by the specification's maximum, past which no length can be trusted to find the
+// next message; whether a message this long is read into memory is `MAX_INCOMING`'s to decide.
 fn frame(head: &[u8]) -> Result<(usize, usize), WireError> {
     let head = head.get(..FIXED_HEADER).ok_or(WireError::Truncated)?;
     let uint32 = |at: usize| {
@@ -1079,12 +964,8 @@ fn frame(head: &[u8]) -> Result<(usize, usize), WireError> {
     Ok((body_at, body_len))
 }
 
-/// Unmarshal one whole message. Header fields whose code is known must
-/// have the type the specification gives them; unknown codes are
-/// ignored, which is what "Header Fields" requires of a client meeting a
-/// newer bus. A code that appears twice is refused: the specification
-/// gives no rule for which copy wins, and two readers picking different
-/// ones is how a message means two things at once.
+// A code that appears twice is refused: the specification gives no rule for which copy
+// wins, and two readers picking different ones is how a message means two things at once.
 fn decode_message(message: &[u8]) -> Result<Message, WireError> {
     if message.first().is_some_and(|b| *b != b'l') {
         return Err(WireError::Endianness(message[0]));
@@ -1160,10 +1041,8 @@ fn decode_message(message: &[u8]) -> Result<Message, WireError> {
     })
 }
 
-/// The ASCII decimal digits of `uid`, each byte written as two hex
-/// digits: what `AUTH EXTERNAL` takes. "31303030 is ASCII decimal
-/// \"1000\" represented in hex, so the client is authenticating as Unix
-/// uid 1000".
+// The ASCII decimal digits of `uid`, each byte written as two hex
+// digits: what `AUTH EXTERNAL` takes.
 fn uid_hex(uid: u32) -> String {
     const DIGITS: [u8; 16] = *b"0123456789abcdef";
     let mut out = String::new();
@@ -1174,7 +1053,6 @@ fn uid_hex(uid: u32) -> String {
     out
 }
 
-/// `Timespec` for `poll`, which takes no `Duration`.
 fn timespec(d: Duration) -> Timespec {
     Timespec {
         tv_sec: d.as_secs() as Secs,
@@ -1182,7 +1060,6 @@ fn timespec(d: Duration) -> Timespec {
     }
 }
 
-/// Park until `fd` is ready for `events`, or until `deadline`.
 fn wait(fd: BorrowedFd<'_>, events: PollFlags, deadline: Instant) -> Result<(), WireError> {
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -1200,42 +1077,28 @@ fn wait(fd: BorrowedFd<'_>, events: PollFlags, deadline: Instant) -> Result<(), 
 }
 
 /// A connected, authenticated session-bus client that has been given its
-/// unique name.
-///
-/// One call at a time, each with its own deadline. Anything but a
-/// [`WireError::Remote`] leaves the connection half-read, so the caller
-/// drops the session rather than calling again.
+/// unique name. Anything but a [`WireError::Remote`] leaves the connection
+/// half-read, so the caller drops the session rather than calling again.
 #[derive(Debug)]
 pub struct Session {
     socket: OwnedFd,
-    /// Unique names already looked up for well-known destinations, so a
-    /// second call to the same name costs no round trip. An owner that
-    /// changes mid-session makes the next call fail rather than accept a
-    /// reply from the wrong sender.
+    // An owner that changes mid-session makes the next call fail rather than
+    // accept a reply from the wrong sender.
     owners: Vec<(String, String)>,
-    /// Descriptors received and closed with the bytes of the message
-    /// being read, to be checked against what that message declares.
+    // Descriptors received and closed with the bytes of the message
+    // being read, to be checked against what that message declares.
     fds_seen: usize,
-    /// Serial of the last message sent; "must not be zero", so the first
-    /// call sends 1.
+    // "Must not be zero", so the first call sends 1.
     serial: u32,
     unique_name: String,
     fd_passing: bool,
-    /// Bytes read from the socket that no message has claimed yet.
     buf: Vec<u8>,
 }
 
 impl Session {
     /// Connect to the bus socket at `path`, authenticate as this uid with
-    /// `EXTERNAL`, negotiate descriptor passing and say `Hello`.
-    ///
-    /// The whole opening — connect, authenticate, `Hello` — shares one
-    /// [`CALL_TIMEOUT`], so a bus that answers each step just inside the
-    /// deadline cannot hold the caller for a multiple of it.
-    ///
-    /// A bus that answers `NEGOTIATE_UNIX_FD` with `ERROR` is used
-    /// anyway; only a call that carries descriptors then fails, with
-    /// [`WireError::NoFdPassing`].
+    /// `EXTERNAL`, negotiate descriptor passing and say `Hello`, all inside one
+    /// [`CALL_TIMEOUT`]. A bus that refuses descriptor passing is used anyway.
     pub fn connect(path: &Path) -> Result<Self, WireError> {
         let deadline = Instant::now() + CALL_TIMEOUT;
         let failed = |source: Errno| WireError::Connect {
@@ -1287,34 +1150,11 @@ impl Session {
         self.fd_passing
     }
 
-    /// Call `member` on `iface` of `path` at `dest`, with a body of
-    /// `body` marshalled against `sig` and `fds` travelling beside it,
-    /// and return the reply's values.
-    ///
-    /// `dest` may be a well-known name or a unique one, but not empty.
-    /// A well-known name is resolved to its owner first — started with
-    /// `StartServiceByName` and resolved again if nobody holds it yet —
-    /// and the message is **addressed to that unique name**, so the peer
-    /// that answers is the one that was looked up. The owner is
-    /// remembered for the session, and forgotten again as soon as a call
-    /// to it comes back saying nobody is there.
-    ///
-    /// A reply is taken only when its `REPLY_SERIAL` is this call's, its
-    /// type is `METHOD_RETURN` or `ERROR`, and its `SENDER` is either
-    /// that owner or — for an `ERROR` alone — `org.freedesktop.DBus`,
-    /// which the bus stamps itself when it cannot deliver the call.
-    /// Everything else that arrives meanwhile is dropped, as are any
-    /// descriptors it carries: nothing bubbler calls answers with one.
-    /// An `ERROR` becomes [`WireError::Remote`] and leaves the session
-    /// usable; every other failure leaves it half-read and to be
-    /// dropped.
-    ///
-    /// One [`CALL_TIMEOUT`] covers all of it: the owner lookup, any
-    /// activation and the second lookup, the sending, and every message
-    /// skipped on the way to the reply.
+    /// Call `member` on `iface` of `path` at `dest`, with `body` marshalled against `sig`
+    /// and `fds` beside it. An `ERROR` becomes [`WireError::Remote`] and leaves the session
+    /// usable; every other failure leaves it half-read and to be dropped.
     // A destination, an object, an interface, a member, a signature, a
-    // body and its descriptors is what a D-Bus method call is; a struct
-    // of the names would only move the same list one line up.
+    // body and its descriptors is what a D-Bus method call is.
     #[allow(clippy::too_many_arguments)]
     pub fn call(
         &mut self,
@@ -1330,8 +1170,8 @@ impl Session {
         self.call_by(dest, path, iface, member, sig, body, fds, deadline)
     }
 
-    /// [`Session::call`] against a deadline the caller owns, so the
-    /// opening handshake and an owner lookup share the call's.
+    // Against a deadline the caller owns, so the opening handshake and an
+    // owner lookup share the call's.
     #[allow(clippy::too_many_arguments)]
     fn call_by(
         &mut self,
@@ -1362,17 +1202,14 @@ impl Session {
         // to; the lookup is itself a call, to a name that needs none.
         let owner = self.owner_of(dest, deadline)?;
         let body = encode(sig, body)?;
-        // Addressed to the owner rather than to the well-known name: the
-        // peer that answers is then the one that was looked up, and a
-        // restart between the lookup and the call is an error from the
-        // bus instead of a call served by a different process.
+        // Addressed to the owner: a restart between the lookup and the call is an
+        // error from the bus instead of a call served by a different process.
         let mut fields = vec![
             (FIELD_PATH, Value::ObjectPath(path.to_owned())),
             (FIELD_DESTINATION, Value::Str(owner.clone())),
         ];
-        // An empty interface is no interface: the member is left to be
-        // resolved by the callee, which the specification allows for a
-        // method call.
+        // An empty interface is no interface: the member is left to be resolved
+        // by the callee, which the specification allows for a method call.
         if !iface.is_empty() {
             fields.push((FIELD_INTERFACE, Value::Str(iface.to_owned())));
         }
@@ -1389,9 +1226,8 @@ impl Session {
         self.send(&message, fds, deadline)?;
 
         loop {
-            // Checked here as well as inside the read: a peer that keeps
-            // sending messages to skip never blocks the reader, so
-            // without this the deadline would only bound an idle bus.
+            // Checked here as well as inside the read: a peer that keeps sending
+            // messages to skip never blocks the reader.
             if Instant::now() >= deadline {
                 return Err(WireError::Timeout);
             }
@@ -1399,25 +1235,13 @@ impl Session {
             if reply.reply_serial != Some(serial) {
                 continue;
             }
-            // "if a signal has a reply serial it must be ignored even
-            // though it has no meaning as of this version of the spec",
-            // and an unknown message type "must be ignored" as well:
+            // A signal with a reply serial and an unknown message type "must be ignored":
             // only the two reply types may answer a call.
             if reply.kind != MSG_METHOD_RETURN && reply.kind != MSG_ERROR {
                 continue;
             }
-            // Serials are guessable, so a reply is only a reply if it
-            // came from the name's owner. Anyone else on the bus — a
-            // sandboxed instance with the `dbus` grant included — could
-            // otherwise answer first and choose what bubbler believes.
-            //
-            // The bus itself is the exception, and only for an error:
-            // "when a method call message cannot be sent or received due
-            // to a security policy, the message bus should send an error
-            // reply", and it does the same for a peer that went away
-            // mid-call. `SENDER` "is controlled by the message bus, so
-            // it is as reliable and trustworthy as the message bus
-            // itself" — no peer can put the bus's name there.
+            // Serials are guessable, so a reply is only a reply if it came from the name's
+            // owner. The bus itself is the exception, and only for an error.
             match reply.sender.as_deref() {
                 Some(sender) if sender == owner => {}
                 Some(sender) if sender == BUS_NAME && reply.kind == MSG_ERROR => {}
@@ -1438,20 +1262,15 @@ impl Session {
                     let Some(name) = reply.error_name else {
                         return Err(WireError::BadMessage("an error reply with no error name"));
                     };
-                    // Whoever was looked up is not there any more, so the
-                    // next call resolves the name again — and starts the
-                    // service — instead of addressing the same corpse for
-                    // the rest of the session.
+                    // Whoever was looked up is not there any more, so the next call
+                    // resolves the name again — and starts the service.
                     if name == ERROR_NO_OWNER || name == ERROR_SERVICE_UNKNOWN {
                         self.owners.retain(|(cached, _)| cached != dest);
                     }
                     Err(WireError::Remote {
                         name,
-                        // "If the first argument exists and is a string,
-                        // it is an error message." The name is the half
-                        // that matters, so a body that will not decode
-                        // leaves the refusal a refusal rather than a
-                        // wire failure.
+                        // The name is the half that matters, so a body that will not
+                        // decode leaves the refusal a refusal rather than a wire failure.
                         message: match decode(&reply.signature, &reply.body) {
                             Ok(values) => match values.first() {
                                 Some(Value::Str(text)) => text.clone(),
@@ -1466,19 +1285,8 @@ impl Session {
         }
     }
 
-    /// The unique name that may answer a call to `dest`.
-    ///
-    /// A unique name owns itself and the bus answers for its own name,
-    /// so neither needs asking; every other destination is a well-known
-    /// name whose owner the bus is asked for once per session.
-    ///
-    /// Asking first is what lets the reply be checked, but it also skips
-    /// the auto-starting a plain call would have done — and both names
-    /// bubbler calls (`org.a11y.Bus`,
-    /// `org.freedesktop.portal.Documents`) are activatable. So a name
-    /// with no owner is started explicitly and looked up again, inside
-    /// the same deadline. A name that still has no owner, or one the bus
-    /// cannot start, comes back as the bus's own error.
+    // Asking first is what lets the reply be checked, but it also skips the auto-starting
+    // a plain call would have done. So a name with no owner is started explicitly.
     fn owner_of(&mut self, dest: &str, deadline: Instant) -> Result<String, WireError> {
         if dest == BUS_NAME || dest.starts_with(':') {
             return Ok(dest.to_owned());
@@ -1497,7 +1305,6 @@ impl Session {
         Ok(owner)
     }
 
-    /// `GetNameOwner`: the unique name that holds `dest` right now.
     fn ask_owner(&mut self, dest: &str, deadline: Instant) -> Result<String, WireError> {
         let reply = self.call_by(
             BUS_NAME,
@@ -1520,12 +1327,8 @@ impl Session {
         Ok(owner.clone())
     }
 
-    /// `StartServiceByName(dest, 0)`: what auto-starting would have done.
-    ///
-    /// The result code is not read. It says the service was started or
-    /// was already running, and the specification itself notes that
-    /// neither is a guarantee it is still there — the lookup that
-    /// follows is what decides.
+    // The result code is not read: neither started nor already running is a
+    // guarantee the service is still there, and the lookup that follows decides.
     fn start_service(&mut self, dest: &str, deadline: Instant) -> Result<(), WireError> {
         self.call_by(
             BUS_NAME,
@@ -1540,9 +1343,6 @@ impl Session {
         Ok(())
     }
 
-    /// The authentication handshake: the credentials nul byte and
-    /// `AUTH EXTERNAL <uid in hex>`, then `NEGOTIATE_UNIX_FD`, then
-    /// `BEGIN`, after which the socket carries messages only.
     fn authenticate(&mut self, deadline: Instant) -> Result<(), WireError> {
         let uid = rustix::process::getuid().as_raw();
         // "Immediately after connecting to the server, the client must
@@ -1568,11 +1368,8 @@ impl Session {
         Ok(())
     }
 
-    /// The unique name, from the `Hello` every connection owes the bus
-    /// before it may send anything else.
-    ///
-    /// "Unique connection names must begin with the character ':'": a
-    /// name that does not is not one the bus assigned.
+    // "Unique connection names must begin with the character ':'": a
+    // name that does not is not one the bus assigned.
     fn hello(&mut self, deadline: Instant) -> Result<String, WireError> {
         let reply = self.call_by(
             BUS_NAME,
@@ -1595,8 +1392,6 @@ impl Session {
         Ok(name.clone())
     }
 
-    /// One `\r\n`-terminated authentication line, without its ending.
-    /// "All bytes must be in the ASCII character set."
     fn line(&mut self, deadline: Instant) -> Result<String, WireError> {
         loop {
             if let Some(end) = self.buf.windows(2).position(|w| w == b"\r\n") {
@@ -1613,10 +1408,8 @@ impl Session {
         }
     }
 
-    /// Write every byte, with `fds` attached to the first `sendmsg` so
-    /// they travel with the message they belong to: descriptors "may not
-    /// be sent before the first byte of the message itself is
-    /// transferred or after the last byte".
+    // `fds` go with the first `sendmsg`: descriptors "may not be sent before the first
+    // byte of the message itself is transferred or after the last byte".
     fn send(
         &self,
         bytes: &[u8],
@@ -1642,8 +1435,6 @@ impl Session {
                 Ok(0) => return Err(WireError::Closed),
                 Ok(n) => {
                     sent += n;
-                    // Sent once, with the first bytes; the rest of the
-                    // message carries none.
                     carried = &[];
                 }
                 Err(Errno::INTR) => {}
@@ -1656,11 +1447,8 @@ impl Session {
         Ok(())
     }
 
-    /// Read up to `most` bytes of whatever the socket has into the
-    /// buffer, waiting for it if there is nothing yet. Any descriptor that
-    /// arrives is closed at once: no call bubbler makes expects one back,
-    /// and one left open would be a descriptor the bus chose for us to
-    /// hold.
+    // Any descriptor that arrives is closed at once: no call bubbler makes expects one
+    // back, and one left open would be a descriptor the bus chose for us to hold.
     fn fill(&mut self, most: usize, deadline: Instant) -> Result<(), WireError> {
         let mut chunk = [0u8; 4096];
         let chunk = &mut chunk[..most.min(4096)];
@@ -1697,15 +1485,8 @@ impl Session {
         }
     }
 
-    /// The next whole message this client can read, taken off the
-    /// buffer with the descriptors that arrived with it.
-    ///
-    /// Those are its own: they "may not be sent before the first byte of
-    /// the message itself is transferred or after the last byte", and no
-    /// read goes past the end of the message, so none of the next one's
-    /// arrive with it. A message that is big-endian, longer than
-    /// [`MAX_INCOMING`] or whose header will not decode is skipped,
-    /// since nothing in it can be trusted to say it is the reply.
+    // No read goes past the end of the message, so none of the next one's descriptors
+    // arrive with it.
     fn receive(&mut self, deadline: Instant) -> Result<Message, WireError> {
         loop {
             let mut want = FIXED_HEADER;
@@ -1739,8 +1520,6 @@ impl Session {
         }
     }
 
-    /// Read the rest of a `total`-byte message too long to hold, and drop
-    /// it with its descriptors.
     fn discard(&mut self, total: usize, deadline: Instant) -> Result<(), WireError> {
         let mut left = total - self.buf.len();
         self.buf.clear();
@@ -1757,9 +1536,8 @@ impl Session {
     }
 }
 
-/// Refuse a body naming a descriptor the call was not given: an index
-/// past the end would have the far side `fstat` whatever happened to be
-/// at that position instead.
+// An index past the end would have the far side `fstat` whatever happened to be
+// at that position instead.
 fn check_fd_indices(value: &Value, count: u32) -> Result<(), WireError> {
     match value {
         Value::Fd(index) => {
