@@ -272,7 +272,9 @@ is probed, never mere existence, so a variable naming a directory is
 refused instead of binding the tree under it. `WAYLAND_DISPLAY` is checked
 in both the values it has — the run's own and the process environment's,
 which the Wayland client reads itself — before the launcher connects to
-the compositor. `WAYLAND_SOCKET` is refused when set at all: the client
+the compositor; an absolute or `..` name would otherwise steer the
+connection, and the listening fd with it, at an endpoint of the caller's
+choosing. `WAYLAND_SOCKET` is refused when set at all: the client
 would adopt the descriptor number it names as its connection and close it
 with the connection.
 
@@ -2143,15 +2145,23 @@ stop's: a command that exits during the grace does not start a new one for
 the exec'd children, the window manager or the X server.
 
 `bubbler-init` makes itself non-dumpable, sets `PR_SET_NO_NEW_PRIVS`,
-clears the ambient set and the three sets `capset` carries, drops from
-the bounding set every capability the rustix it is built with names (41
-with rustix 1.1.4; a capability a newer kernel adds past those stays in
-the bounding set, which `no_new_privs` leaves nothing to gain from), and
-takes `PR_SET_PDEATHSIG`
-(`SIGTERM`) before it installs a signal handler or starts anything. Under
-bwrap the capability sets are already empty and `no_new_privs` is already
-on: the steps are taken so that the posture is the supervisor's own and
-not something it inherited. SIGHUP and SIGQUIT end the run exactly as
+clears the ambient set and the three sets `capset` carries, tries to drop
+from the bounding set every capability the rustix it is built with names
+(41 with rustix 1.1.4), and takes `PR_SET_PDEATHSIG` (`SIGTERM`) before it
+installs a signal handler or starts anything. A drop the kernel refuses
+with `EPERM` — every one, for a process without `CAP_SETPCAP` — is
+ignored and leaves that capability in the bounding set, as it does a
+capability a newer kernel adds past those 41. What stays there is nothing
+to gain from: with `no_new_privs` set, `execve` grants nothing the
+process could not have done without it; with the permitted set empty,
+`capset` can add to neither it nor the inheritable set; and a capability
+is ambient only while it is both permitted and inheritable
+(`capabilities(7)`). Under bwrap every set, the bounding set included, is
+already empty and `no_new_privs` is already on, so there is nothing to
+drop: bubbler passes bwrap no `--cap-add`, and `bwrap(1)` leaves no
+capability by default (measured on bwrap 0.13.0: `CapBnd` 0). The steps
+are taken so that the posture is the supervisor's own and not something
+it inherited. SIGHUP and SIGQUIT end the run exactly as
 SIGTERM does, so a terminal that goes away gives the command its grace
 instead of leaving it to bwrap's reaper.
 

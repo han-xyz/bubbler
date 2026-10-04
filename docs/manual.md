@@ -1948,16 +1948,18 @@ log, and the allowlist as argv (`--allow <name>:<port>`, one per entry) rather
 than as a file the sandbox could reach. In the child, before `execve`, in this
 order:
 
-1. its pid into the `proxy` leaf's `cgroup.procs`, opened before the fork and
+1. `setsid`, which leaves the proxy no controlling terminal through which to
+   open the caller's `/dev/tty`;
+2. its pid into the `proxy` leaf's `cgroup.procs`, opened before the fork and
    written before the joins, after which the descriptor's namespace no longer
    matches;
-2. `setns` into the sandbox's user namespace, then its network namespace, then
+3. `setns` into the sandbox's user namespace, then its network namespace, then
    its mount namespace;
-3. `chdir("/")`, since the inherited working directory is a host dentry that a
+4. `chdir("/")`, since the inherited working directory is a host dentry that a
    process in the sandbox's mount namespace could walk back out through;
-4. `SECBIT_NOROOT | SECBIT_NOROOT_LOCKED`;
-5. the ambient set cleared and every capability set emptied;
-6. `PR_SET_NO_NEW_PRIVS`, `PR_SET_PDEATHSIG(SIGTERM)`, `PR_SET_DUMPABLE(0)` —
+5. `SECBIT_NOROOT | SECBIT_NOROOT_LOCKED`;
+6. the ambient set cleared and every capability set emptied;
+7. `PR_SET_NO_NEW_PRIVS`, `PR_SET_PDEATHSIG(SIGTERM)`, `PR_SET_DUMPABLE(0)` —
    which `execve` resets, so the proxy sets it again itself.
 
 The securebits go *before* the sets are emptied and not after: `PR_SET_SECUREBITS`
