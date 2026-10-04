@@ -20,8 +20,8 @@ use crate::json;
 /// manager's policy matches on it, exactly as it matches `org.flatpak`.
 pub const ENGINE: &str = "org.bubbler";
 
-/// What `pipewire.access` is set to, which the daemon turns into
-/// `pipewire.access.effective` on every client of the context.
+// What `pipewire.access` is set to, which the daemon turns into
+// `pipewire.access.effective` on every client of the context.
 const ACCESS: &str = "restricted";
 
 /// The tool that creates a context, from the `pipewire` package. Bound
@@ -29,18 +29,14 @@ const ACCESS: &str = "restricted";
 /// this is.
 pub const PW_CONTAINER: &str = "/usr/bin/pw-container";
 
-/// Where the holder mode of `bubbler-init` is bound inside the sidecar,
-/// and the whole of what `pw-container` is given as its program.
-///
 /// One word with no shell metacharacter in it, because `pw-container`
 /// hands its program to `system()`; `/run` rather than `/usr/lib`, for
 /// the same reason [`crate::bwrap::INIT_INSIDE`] is there.
 pub const HOLDER_INSIDE: &str = "/run/bubbler-pw-hold";
 
-/// Names the descriptor the holder reports the socket's path on
-/// (`bubbler-init`'s `pw_hold::REPORT_FD`). `pw-container` drops every
-/// argv word after the program, so the environment is the only channel
-/// the holder has.
+/// Names the descriptor the holder reports the socket's path on.
+/// `pw-container` drops every argv word after the program, so the
+/// environment is the only channel the holder has.
 pub const REPORT_FD: &str = "BUBBLER_PW_REPORT_FD";
 
 /// The name a PipeWire client looks for under its runtime directory, and
@@ -62,9 +58,7 @@ pub const RUN_ID_SHOWN: &str = "<run id>";
 pub const PIPEWIRE: &str = "/usr/bin/pipewire";
 
 /// The module that config loads, and the whole of what makes the sidecar
-/// a PulseAudio server. From the `pipewire-pulse` package, which the
-/// `pipewire` package does not pull in, so a host can have every other
-/// piece of this and not that one.
+/// a PulseAudio server.
 pub const PULSE_MODULE: &str = "/usr/lib/pipewire-0.3/libpipewire-module-protocol-pulse.so";
 
 /// Name of the config file the private server is started with, and so
@@ -110,19 +104,6 @@ pub const REMOTE_INSIDE: &str = "/run/pipewire-0";
 /// configuration: the server listens on one socket of this run's own, a
 /// client may not make it load a module, and it asks no session bus for
 /// anything.
-///
-/// Module loading is what a pulse client uses to reach past the policy —
-/// `module-null-sink`, `module-loopback` and the rest run inside the
-/// server, not the sandbox — so it is refused here rather than left to
-/// the session manager's rules. The user's own
-/// `pipewire-pulse.conf.d` fragments are not copied beside this one:
-/// theirs would set `server.address` too, and the last one read would
-/// decide which socket this run serves.
-///
-/// D-Bus support is off because the sidecar has no bus to reach and
-/// every module that wants one says so on bubbler's stderr otherwise
-/// ("Enable DBus support. This will enable DBus support in the various
-/// modules that require it", `pipewire.conf(5)`).
 pub const PULSE_OVERRIDE: &str = concat!(
     "context.properties = {\n",
     "    support.dbus = false\n",
@@ -172,11 +153,6 @@ pub fn socket(instance_runtime: &Path) -> PathBuf {
 /// `<instance runtime dir>/pwpulse`: the directory the private pulse
 /// server of a `pulseaudio` grant writes, which is that sidecar's whole
 /// `/tmp`.
-///
-/// Not [`dir`]: the two audio sidecars share the instance's context but
-/// neither may write what the other reads — the pulse server is the
-/// process the sandboxed application talks to, and the context sidecar
-/// has the session's own socket.
 pub fn pulse_dir(instance_runtime: &Path) -> PathBuf {
     instance_runtime.join("pwpulse")
 }
@@ -203,9 +179,7 @@ pub fn pulse_config_dir(instance_runtime: &Path) -> PathBuf {
 
 /// The three directories a `pipewire-pulse.conf` is looked for in, in
 /// the order PipeWire itself reads them: the user's own, the system's,
-/// then the one the package ships ("An equally named file in a directory
-/// with a higher precedence makes the analogous files ignored", Arch
-/// wiki, PipeWire#Configuration).
+/// then the one the package ships.
 pub fn pulse_conf_dirs(config_home: &Path) -> [PathBuf; 3] {
     [
         config_home.join("pipewire"),
@@ -255,9 +229,7 @@ pub fn grant(audio: AudioSet) -> String {
 /// The context properties, as one JSON object for `pw-container -P`.
 ///
 /// Every value is written through [`json::string`]: `instance` is a name
-/// the user chose, and although the parser allows nothing in it that
-/// would end a JSON string, this is the encoder and not the place to
-/// depend on that. The whole value is one argv element handed to bwrap,
+/// the user chose. The whole value is one argv element handed to bwrap,
 /// which no shell sees — only the program word is.
 pub fn properties(instance: &str, run_id: &str, audio: AudioSet) -> String {
     let grant = grant(audio);
