@@ -15,11 +15,6 @@ use bubbler_core::env::{DEFAULT_CONFIG_DIRS, DEFAULT_DATA_DIRS, Env, xdg_dirs};
 /// empty `$HOME` or `$XDG_RUNTIME_DIR` is an error for the same reason it
 /// is one in the CLI: the instance store and the control sockets hang off
 /// them, and an empty one would silently become a relative path.
-///
-/// The fields a sandbox is built from — the display sockets, the bus
-/// addresses, the binary overrides — are left unset: nothing here builds
-/// one, and a value read but never used is a claim this process cannot
-/// keep.
 pub fn from_process() -> Result<Env> {
     let home = PathBuf::from(
         env::var_os("HOME")
@@ -60,9 +55,8 @@ pub fn from_process() -> Result<Env> {
     })
 }
 
-/// `$BUBBLER_PROFILE_DIR`, which must be absolute: the directory is a
-/// reserved root the share checks name, and a relative one would name a
-/// different directory from every working directory.
+// The directory is a reserved root the share checks name, and a relative
+// one would name a different directory from every working directory.
 fn profile_dir() -> Result<Option<PathBuf>> {
     let Some(path) = var_path("BUBBLER_PROFILE_DIR") else {
         return Ok(None);
@@ -76,22 +70,21 @@ fn profile_dir() -> Result<Option<PathBuf>> {
     Ok(Some(path))
 }
 
-/// Where WirePlumber looks for its configuration after
-/// `$XDG_CONFIG_HOME`, from `$XDG_CONFIG_DIRS` as read: the audio policy
-/// lint has to look in the same places.
+// Where WirePlumber looks for its configuration after
+// `$XDG_CONFIG_HOME`, from `$XDG_CONFIG_DIRS` as read: the audio policy
+// lint has to look in the same places.
 fn config_dirs(value: Option<OsString>) -> Vec<PathBuf> {
     xdg_dirs(value, DEFAULT_CONFIG_DIRS)
 }
 
-/// `$XDG_DATA_DIRS` as the CLI reads it, so the UI and the CLI search the
-/// same places for the WirePlumber policy files.
+// `$XDG_DATA_DIRS` as the CLI reads it, so the UI and the CLI search the
+// same places for the WirePlumber policy files.
 fn data_dirs(value: Option<OsString>) -> Vec<PathBuf> {
     xdg_dirs(value, DEFAULT_DATA_DIRS)
 }
 
-/// One environment variable as a path, where an empty value counts as
-/// unset: an empty one would be the current directory, which is not what
-/// any of these name.
+// An empty value would be the current directory, which is not what any of
+// these name.
 fn var_path(name: &str) -> Option<PathBuf> {
     env::var_os(name)
         .filter(|v| !v.is_empty())
