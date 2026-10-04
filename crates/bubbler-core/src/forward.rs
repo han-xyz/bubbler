@@ -1595,10 +1595,10 @@ mod tests {
         (&*stream).write_all(&message).unwrap();
     }
 
-    /// A reply in an endianness the client does not read: the call
-    /// fails without the far side having refused anything, which is
-    /// what leaves the connection half-read.
-    fn server_wrong_endianness(stream: &UnixStream, call: &Call) {
+    /// A reply whose byte-order flag is flipped to big-endian: its
+    /// header-field length, read that way, is past 2^26, so the frame
+    /// cannot be measured and the connection is left half-read.
+    fn server_unusable_frame(stream: &UnixStream, call: &Call) {
         let mut message = reply_bytes(9, call.serial, PORTAL_OWNER, "", &[]);
         message[0] = b'B';
         (&*stream).write_all(&message).unwrap();
@@ -1989,10 +1989,10 @@ mod tests {
         let (bus, server) = fake_bus(tmp.path(), |stream| {
             server_start(&stream);
             let call = server_addfull(&stream);
-            // A reply this client does not read leaves the connection
+            // A frame whose length cannot be read leaves the connection
             // half-read, which is the case the second group must not be
             // sent down.
-            server_wrong_endianness(&stream, &call);
+            server_unusable_frame(&stream, &call);
             server_end(&stream);
         });
         let mut session = Session::connect(&bus).unwrap();

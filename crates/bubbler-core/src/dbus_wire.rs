@@ -3486,8 +3486,6 @@ mod tests {
         server.join().unwrap();
     }
 
-    /// The reply to a call to `:1.5`, with what `stray` writes, given the
-    /// call's serial, standing before it.
     fn reply_behind(stray: impl FnOnce(&UnixStream, u32) + Send + 'static) -> Vec<Value> {
         let tmp = tempfile::tempdir().unwrap();
         let (path, server) = fake_bus(tmp.path(), move |stream| {

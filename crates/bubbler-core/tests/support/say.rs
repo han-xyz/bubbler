@@ -1,5 +1,3 @@
-// `include!`d by `bed.rs` and `real_dbus_proxy.rs`.
-
 /// Say why a test is being skipped where a plain `cargo test` will show
 /// it. Written to descriptor 2 rather than through `eprintln!`: libtest
 /// captures the Rust-side handle until a test fails, and a skip nobody
