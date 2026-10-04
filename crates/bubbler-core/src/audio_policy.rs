@@ -355,6 +355,10 @@ pub const POLICY_METADATA: &str = "bubbler-policy";
 /// The key of [`POLICY_METADATA`] that holds the revision.
 pub const REVISION_KEY: &str = "revision";
 
+// WirePlumber makes it on every session; the server sets its `client.id`, which a client cannot
+// choose (measured on PipeWire 1.6.9).
+const DEFAULT_METADATA: &str = "default";
+
 /// How the hook states its revision, the one place it is written down.
 const REVISION_LINE: &str = "local POLICY_REVISION = ";
 
@@ -367,8 +371,8 @@ const READ_TIMEOUT: Duration = Duration::from_secs(2);
 // The bed's metadata objects printed 11.6 KiB (PipeWire 1.6.9); a session holds more of them.
 pub const DUMP_CAP: usize = 1024 * 1024;
 
-// The type `pw-dump` is asked for. Its pattern also matches a node's `object.path`, which any
-// client sets, so the answer can hold objects of any shape (PipeWire 1.6.9).
+// `pw-dump`'s pattern also matches a node's `object.path`, which any client sets, so the answer
+// can hold objects of any shape (PipeWire 1.6.9).
 const METADATA_TYPE: &str = "PipeWire:Interface:Metadata";
 
 // WirePlumber accepts clients a moment before the hook publishes the revision (measured in the
@@ -401,6 +405,10 @@ pub enum LoadedRevision {
     /// PipeWire answered, but the answer could not be read, and why: more
     /// than [`DUMP_CAP`], cut short, or not a dump.
     Unreadable(String),
+    /// A revision that cannot be taken as WirePlumber's, and why: more than
+    /// one [`POLICY_METADATA`] or `default` metadata, or a [`POLICY_METADATA`]
+    /// another client made.
+    Ambiguous(String),
 }
 
 const UNVERIFIED: &str = "the audio policy the running WirePlumber loaded could not be verified";
@@ -417,7 +425,8 @@ impl LoadedRevision {
         match self {
             LoadedRevision::Current
             | LoadedRevision::Unknown(_)
-            | LoadedRevision::Unreadable(_) => None,
+            | LoadedRevision::Unreadable(_)
+            | LoadedRevision::Ambiguous(_) => None,
             LoadedRevision::Absent => Some(
                 "the running WirePlumber has not loaded this bubbler's audio policy".to_owned(),
             ),
@@ -430,16 +439,18 @@ impl LoadedRevision {
     }
 
     /// Why the loaded policy could not be verified, for
-    /// [`Unreadable`](Self::Unreadable); `None` otherwise.
+    /// [`Unreadable`](Self::Unreadable) and [`Ambiguous`](Self::Ambiguous); `None` otherwise.
     pub fn unverified(&self) -> Option<String> {
         match self {
-            LoadedRevision::Unreadable(reason) => Some(format!("{UNVERIFIED}: {reason}")),
+            LoadedRevision::Unreadable(reason) | LoadedRevision::Ambiguous(reason) => {
+                Some(format!("{UNVERIFIED}: {reason}"))
+            }
             _ => None,
         }
     }
 
-    /// The run's warning for [`Absent`](Self::Absent), [`Other`](Self::Other) and
-    /// [`Unreadable`](Self::Unreadable); `None` otherwise.
+    /// The run's warning for every answer but [`Current`](Self::Current) and
+    /// [`Unknown`](Self::Unknown); `None` for those.
     pub fn run_warning(&self) -> Option<String> {
         self.unverified().or_else(|| {
             self.not_loaded()
@@ -458,9 +469,9 @@ impl LoadedRevision {
 }
 
 /// What `pw-dump` printed on stdout, read as a [`LoadedRevision`]: the
-/// [`REVISION_KEY`] on subject 0 of the one metadata named [`POLICY_METADATA`].
-/// An object of another shape is skipped; more than one so named is never
-/// [`LoadedRevision::Current`].
+/// [`REVISION_KEY`] on subject 0 of the one metadata named [`POLICY_METADATA`],
+/// made by the client that made the one named `default`. An object
+/// of another shape is skipped.
 pub fn parse_loaded_revision(dump: &[u8]) -> LoadedRevision {
     // No object matching the pattern prints nothing and exits 0 (PipeWire 1.6.9).
     if dump.is_empty() {
@@ -470,20 +481,50 @@ pub fn parse_loaded_revision(dump: &[u8]) -> LoadedRevision {
         Ok(objects) => objects,
         Err(e) => return LoadedRevision::Unreadable(format!("unreadable pw-dump output: {e}")),
     };
-    let policies: Vec<&Value> = objects
-        .iter()
-        .filter(|object| {
-            object["type"] == METADATA_TYPE && object["props"]["metadata.name"] == POLICY_METADATA
-        })
-        .collect();
-    match policies.as_slice() {
-        [] => LoadedRevision::Absent,
-        [policy] => revision_in(policy),
-        more => LoadedRevision::Other(format!(
-            "unclear ({} metadata objects named {POLICY_METADATA})",
-            more.len()
-        )),
+    let named = |name: &str| -> Vec<&Value> {
+        objects
+            .iter()
+            .filter(|object| {
+                object["type"] == METADATA_TYPE && object["props"]["metadata.name"] == name
+            })
+            .collect()
+    };
+    let policy = match named(POLICY_METADATA).as_slice() {
+        [] => return LoadedRevision::Absent,
+        [policy] => *policy,
+        more => return LoadedRevision::Ambiguous(more_than_one(POLICY_METADATA, more)),
+    };
+    let default = match named(DEFAULT_METADATA).as_slice() {
+        [] => {
+            return LoadedRevision::Ambiguous(format!(
+                "no metadata named {DEFAULT_METADATA} to tell WirePlumber's client by"
+            ));
+        }
+        [default] => *default,
+        more => return LoadedRevision::Ambiguous(more_than_one(DEFAULT_METADATA, more)),
+    };
+    let (maker, wireplumber) = (
+        &policy["props"]["client.id"],
+        &default["props"]["client.id"],
+    );
+    if maker.is_null() || maker != wireplumber {
+        return LoadedRevision::Ambiguous(format!(
+            "{POLICY_METADATA} was made by client {maker}, not WirePlumber's {wireplumber}"
+        ));
     }
+    revision_in(policy)
+}
+
+fn more_than_one(name: &str, objects: &[&Value]) -> String {
+    let makers: Vec<String> = objects
+        .iter()
+        .map(|object| object["props"]["client.id"].to_string())
+        .collect();
+    format!(
+        "{} metadata objects named {name}, made by clients {}",
+        objects.len(),
+        makers.join(", ")
+    )
 }
 
 fn revision_in(policy: &Value) -> LoadedRevision {
@@ -1255,19 +1296,53 @@ mod tests {
         );
     }
 
+    fn object_of(name: &str) -> String {
+        let at = MEASURED
+            .find(&format!("\"metadata.name\": \"{name}\""))
+            .expect("the object");
+        let start = MEASURED[..at].rfind("  {\n").expect("its start");
+        let end = start + MEASURED[start..].find("\n  }").expect("its end") + "\n  }".len();
+        MEASURED[start..end].to_owned()
+    }
+
+    fn ambiguity(dump: &str) -> String {
+        match parse_loaded_revision(dump.as_bytes()) {
+            LoadedRevision::Ambiguous(why) => why,
+            answer => panic!("{answer:?}"),
+        }
+    }
+
     #[test]
     fn two_policy_metadata_objects_are_never_current() {
-        let policy = &MEASURED[MEASURED.find("  {\n    \"id\": 27").expect("the policy")..];
-        let policy = policy.trim_end().trim_end_matches(']').trim_end();
-        let twice = with_objects_first(&format!("{policy},\n"));
-        let answer = parse_loaded_revision(twice.as_bytes());
-        let LoadedRevision::Other(value) = &answer else {
-            panic!("{answer:?}");
-        };
+        let policy = object_of(POLICY_METADATA).replace("\"client.id\": 18", "\"client.id\": 35");
+        let why = ambiguity(&with_objects_first(&format!("{policy},\n")));
         assert!(
-            value.contains("2 metadata objects named bubbler-policy"),
-            "{value}"
+            why.contains("2 metadata objects named bubbler-policy"),
+            "{why}"
         );
+    }
+
+    #[test]
+    fn a_policy_metadata_another_client_made_is_never_current() {
+        let forged = stating(revision()).replacen("\"client.id\": 18", "\"client.id\": 35", 2);
+        let forged = forged.replacen("\"client.id\": 35", "\"client.id\": 18", 1);
+        let why = ambiguity(&forged);
+        assert!(why.contains("client 35, not WirePlumber's 18"), "{why}");
+    }
+
+    #[test]
+    fn two_default_metadata_objects_are_never_current() {
+        let default = object_of("default").replace("\"client.id\": 18", "\"client.id\": 36");
+        let why = ambiguity(&with_objects_first(&format!("{default},\n")));
+        assert!(why.contains("2 metadata objects named default"), "{why}");
+    }
+
+    #[test]
+    fn a_policy_metadata_without_wireplumbers_default_is_never_current() {
+        let alone = stating(revision())
+            .replace("\"metadata.name\": \"default\"", "\"metadata.name\": \"x\"");
+        let why = ambiguity(&alone);
+        assert!(why.contains("no metadata named default"), "{why}");
     }
 
     /// `pw-dump` given a pattern no object matches prints nothing and exits 0 (PipeWire 1.6.9).

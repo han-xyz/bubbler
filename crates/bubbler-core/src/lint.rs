@@ -1366,7 +1366,9 @@ fn audio_policy_not_loaded(ctx: &Context, sources: &[Source], f: &mut Findings) 
             &AUDIO_POLICY_NOT_LOADED,
             format!("{cause}: whether this `{name}` grant is enforced as configured is not known"),
             &format!(
-                "lint again; where this repeats, run {restart}, which loads the installed policy"
+                "`pw-dump PipeWire:Interface:Metadata` shows what was read, a stream that put \
+                 itself in it included; an object another client made goes when that client \
+                 disconnects; {restart} loads the installed policy"
             ),
         );
         return;

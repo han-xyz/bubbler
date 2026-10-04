@@ -750,7 +750,9 @@ the lint; a copy kept older on purpose needs it beside the
 (no `pw-dump`, no daemon on the socket, no answer within two seconds) a
 run says nothing and `bubbler lint` notes it. Where PipeWire answered but the
 answer could not be read (more than 1 MiB, cut short at two seconds, not a
-dump) a run warns that the loaded policy could not be verified, naming why,
+dump), or holds a `bubbler-policy` metadata that is not the one WirePlumber
+made (two of them, or one made by another client than WirePlumber's
+`default` metadata) a run warns that the loaded policy could not be verified, naming why,
 and `bubbler lint` warns the same. An answer of no revision is asked once more
 half a second later, since WirePlumber publishes it a moment after it starts.
 The run goes on in every case.
