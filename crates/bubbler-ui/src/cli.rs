@@ -14,7 +14,6 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 /// File name of the command line binary this editor drives.
 pub const BINARY: &str = "bubbler";
 
-/// Whether `path` is a file a `PATH` search would run.
 fn executable(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
@@ -55,16 +54,14 @@ impl Cli {
     /// Start a sandbox and come straight back to the editor: a process
     /// group of its own, so a signal the terminal sends to the editor's
     /// foreground group does not reach it, and `/dev/null` for stdio, so
-    /// it holds no descriptor of this terminal. It stays in this session
-    /// and this session's controlling terminal is still its own; it is
-    /// not `setsid(2)`, and a hangup on the terminal is still delivered.
+    /// it holds no descriptor of this terminal. It is not `setsid(2)`,
+    /// and a hangup on the terminal is still delivered.
     pub fn detached(&self, args: &[OsString]) -> io::Result<Child> {
         self.command(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            // A new process group, not a new session: it is what keeps
-            // `^C` in the editor off the sandbox, and it is asked for
+            // A new process group, not a new session: it is asked for
             // without a `pre_exec` closure and so without an unsafe block.
             .process_group(0)
             .spawn()
@@ -77,10 +74,8 @@ impl Cli {
         self.command(args).status()
     }
 
-    /// Run and collect what it printed, for the commands whose whole
-    /// answer is their output: the explanation, a lint report, a profile.
-    /// stdout and stderr are kept apart, so a warning cannot be read as
-    /// part of the report.
+    /// Run and collect what it printed. stdout and stderr are kept apart,
+    /// so a warning cannot be read as part of the report.
     pub fn captured(&self, args: &[OsString]) -> io::Result<Output> {
         let out = self.command(args).stdin(Stdio::null()).output()?;
         Ok(Output {
@@ -92,9 +87,7 @@ impl Cli {
 }
 
 /// What a captured run printed. Lossy text, because it is on its way to a
-/// terminal buffer and not to a file: bubbler's own output is UTF-8, and
-/// a path that is not is better shown with a replacement character than
-/// not at all.
+/// terminal buffer and not to a file.
 #[derive(Debug, Clone)]
 pub struct Output {
     /// How the command ended.
