@@ -3914,6 +3914,45 @@ fn a_hook_of_another_revision_names_it() {
     );
 }
 
+/// Load generators this test started, stopped and reaped however it ends.
+struct Load(Vec<Child>);
+
+impl Drop for Load {
+    fn drop(&mut self) {
+        for child in &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// `pw-metadata` printed no key in 5 of 400 reads under this load (PipeWire 1.6.9).
+#[test]
+#[ignore = "keeps every core busy, which the tests running beside it would feel; run explicitly"]
+fn the_revision_reads_as_current_every_time_under_cpu_load() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let mut load = Load(Vec::new());
+    for _ in 0..2 * cores {
+        match Command::new("yes").stdout(Stdio::null()).spawn() {
+            Ok(child) => load.0.push(child),
+            Err(e) => {
+                say(&format!("skipping: yes did not start: {e}"));
+                return;
+            }
+        }
+    }
+    let answers: Vec<LoadedRevision> = (0..400).map(|_| loaded_revision(&bed)).collect();
+    drop(load);
+    let missed: Vec<_> = answers
+        .iter()
+        .filter(|answer| **answer != LoadedRevision::Current)
+        .collect();
+    assert!(missed.is_empty(), "{} of 400: {missed:?}", missed.len());
+}
+
 /// A context can neither read the revision, nor write it, nor publish a
 /// metadata of the same name for bubbler to read instead.
 #[test]
