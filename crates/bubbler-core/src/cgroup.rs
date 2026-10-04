@@ -6,30 +6,6 @@
 //! but stores the id it resolved, so the proxy's directory has to exist
 //! before `nft -f` reads the rule and to live as long as the sandbox: one
 //! made afterwards matches nothing, silently.
-//!
-//! Why two, and why bubbler moves *itself*. bwrap never changes cgroup,
-//! so `--unshare-cgroup` makes whatever cgroup bwrap was started in the
-//! root of the sandbox's cgroup namespace — and everything under that
-//! root is nameable from inside. Measured on this host: with the default
-//! `userns "allow"` an application can `unshare(CLONE_NEWUSER |
-//! CLONE_NEWCGROUP | CLONE_NEWNS)`, mount cgroup2 (`CAP_SYS_ADMIN` in the
-//! user namespace owning its own new cgroup namespace), see a proxy
-//! cgroup placed under that root, write its pid into it and have the
-//! whole network. So bubbler puts itself in `sandbox/` before it spawns
-//! bwrap — bwrap, the supervisor and the application inherit it, and the
-//! namespace root becomes `sandbox` — and the proxy goes into `proxy/`,
-//! a **sibling outside** that root: unnameable through any cgroupfs the
-//! application mounts, and refused by `nsdelegate` even if it were named.
-//!
-//! The parent holds no process, only the two leaves, so the "no internal
-//! processes" rule cannot be reached: it constrains a cgroup that has
-//! both processes and controllers enabled for its children, and nothing
-//! here writes `cgroup.subtree_control` at all.
-//!
-//! Both are created under bubbler's own cgroup, which on a systemd user
-//! session is a delegated cgroup2 subtree the user may write; without
-//! such a subtree there is nothing to create and `allow-host` cannot be
-//! served.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -45,41 +21,32 @@ use crate::error::LaunchError;
 use crate::host;
 use crate::network;
 
-/// Where the unified hierarchy is mounted. Every path a rule carries is
-/// relative to this.
+// Every path a rule carries is relative to this.
 const CGROUP2_ROOT: &str = "/sys/fs/cgroup";
 
-/// The line of `/proc/<pid>/cgroup` that names the unified hierarchy;
-/// the others are v1 controllers, which the `socket cgroupv2` match has
-/// nothing to do with.
+// The line of `/proc/<pid>/cgroup` that names the unified hierarchy;
+// the others are v1 controllers.
 const UNIFIED: &str = "0::";
 
-/// Longest `/proc/self/cgroup` this reads. The file is a handful of
-/// lines of the kernel's own making; a bound is here because everything
-/// bubbler reads has one.
+// The file is a handful of lines of the kernel's own making; a bound is
+// here because everything bubbler reads has one.
 const MAX_CGROUP_FILE: u64 = 64 * 1024;
 
-/// The leaf bubbler moves itself into, and so the root of the sandbox's
-/// cgroup namespace.
+// The leaf bubbler moves itself into, and so the root of the sandbox's
+// cgroup namespace.
 const SANDBOX_LEAF: &str = "sandbox";
 
-/// The leaf the egress proxy writes itself into, which is what the
-/// ruleset accepts.
+// The leaf the egress proxy writes itself into, which is what the
+// ruleset accepts.
 const PROXY_LEAF: &str = "proxy";
 
-/// How long the teardown waits for the sandbox's processes to be gone
-/// before giving up on removing the directories. bwrap's
-/// `--die-with-parent` kills them as it exits, which is not quite
-/// instant, and a cgroup with a process left in it cannot be removed.
+// bwrap's `--die-with-parent` kills the sandbox's processes as it exits,
+// which is not quite instant, and a cgroup with a process left in it
+// cannot be removed.
 const RELEASE_WAIT: Duration = Duration::from_secs(2);
 
-/// How often that is retried.
 const RELEASE_POLL: Duration = Duration::from_millis(50);
 
-/// One run's cgroups: the parent, its two leaves, an open descriptor for
-/// the proxy leaf's `cgroup.procs`, and where bubbler was before it
-/// moved itself.
-///
 /// The descriptor is opened here so the proxy's `pre_exec` — which may
 /// allocate nothing and open nothing — has only a `write` left to do.
 /// Dropping the handle moves bubbler back and removes all three
@@ -87,21 +54,17 @@ const RELEASE_POLL: Duration = Duration::from_millis(50);
 /// them: the proxy is stopped and the sandbox has exited by then.
 #[derive(Debug)]
 pub struct SandboxCgroup {
-    /// The parent, which holds no process and is removed last.
+    // The parent, which holds no process and is removed last.
     dir: PathBuf,
-    /// The leaf bubbler and therefore the sandbox are in.
+    // The leaf bubbler and therefore the sandbox are in.
     sandbox: PathBuf,
-    /// The leaf the proxy is in.
     proxy: PathBuf,
-    /// The proxy leaf's `cgroup.procs`, open for writing.
     procs: OwnedFd,
-    /// The cgroup bubbler was in before this, to move back to.
     home: PathBuf,
-    /// bubbler's own pid, which is what was moved and what moves back.
+    // bubbler's own pid, which is what was moved and what moves back.
     pid: u32,
-    /// The proxy leaf as an nftables rule names it.
     spec: network::Cgroup,
-    /// How directories are made and removed, which only a test changes.
+    // How directories are made and removed, which only a test changes.
     ops: Ops,
 }
 
@@ -118,14 +81,11 @@ impl SandboxCgroup {
         self.procs.as_fd()
     }
 
-    /// Move bubbler back where it was and remove the three directories,
-    /// in the only order the kernel takes: the leaves have to be empty,
-    /// and the parent has to have no children left.
-    ///
-    /// Every step is best-effort. A move back that fails leaves empty
-    /// directories under the user's own subtree, which the next run of
-    /// this instance sweeps ([`create`]); ending a run over it would
-    /// help nobody.
+    // Move bubbler back where it was and remove the three directories,
+    // in the only order the kernel takes: the leaves have to be empty,
+    // and the parent has to have no children left.
+    //
+    // Every step is best-effort.
     fn release(&mut self) {
         let _ = write_pid(&self.home, self.pid);
         // The sandbox's processes go with bwrap, which has exited by the
@@ -149,8 +109,6 @@ impl Drop for SandboxCgroup {
     }
 }
 
-/// Write `pid` into the `cgroup.procs` of the cgroup directory `dir`,
-/// which is how a process is moved into it.
 fn write_pid(dir: &Path, pid: u32) -> std::io::Result<()> {
     File::options()
         .write(true)
@@ -165,10 +123,7 @@ fn write_pid(dir: &Path, pid: u32) -> std::io::Result<()> {
 /// spawned, since the sandbox's cgroup namespace root is fixed at the
 /// `--unshare-cgroup`, so the sandbox's pid is not yet known.
 ///
-/// Fails the launch rather than warning: the ruleset is written around
-/// the proxy leaf, and a run that asked for `allow-host` and got no
-/// cgroup would either have no rules at all or rules naming a path that
-/// resolves to nothing.
+/// Fails the launch rather than warning.
 pub fn create(instance: &str, pid: u32) -> Result<SandboxCgroup, LaunchError> {
     create_under(
         Path::new(CGROUP2_ROOT),
@@ -179,24 +134,24 @@ pub fn create(instance: &str, pid: u32) -> Result<SandboxCgroup, LaunchError> {
     )
 }
 
-/// The two things the kernel does for a cgroup directory that it does
-/// not do for a plain one: it fills a new one with `cgroup.procs` and
-/// the rest of the interface files, and it takes them away with the
-/// directory when that is removed. Nothing in this module creates or
-/// deletes an interface file, so a test drives it against a tree of
-/// plain directories by doing those two things itself.
+// The two things the kernel does for a cgroup directory that it does
+// not do for a plain one: it fills a new one with `cgroup.procs` and
+// the rest of the interface files, and it takes them away with the
+// directory when that is removed. Nothing in this module creates or
+// deletes an interface file, so a test drives it against a tree of
+// plain directories by doing those two things itself.
 #[derive(Debug, Clone, Copy)]
 struct Ops {
     mkdir: fn(&Path) -> Result<(), Errno>,
     rmdir: fn(&Path) -> Result<(), Errno>,
-    /// Whether a pid is a running process, which decides whether a leaf
-    /// is a live run's.
+    // Whether a pid is a running process, which decides whether a leaf
+    // is a live run's.
     alive: fn(i32) -> bool,
 }
 
 impl Ops {
-    /// What a real cgroup2 filesystem needs, which is nothing beyond the
-    /// two system calls.
+    // What a real cgroup2 filesystem needs, which is nothing beyond the
+    // two system calls.
     const KERNEL: Self = Self {
         mkdir: kernel_mkdir,
         rmdir: kernel_rmdir,
@@ -208,20 +163,20 @@ fn kernel_alive(pid: i32) -> bool {
     Pid::from_raw(pid).is_some_and(host::pid_alive)
 }
 
-/// 0755 like every other cgroup: the directory is the user's own and
-/// the kernel makes the files inside it.
+// 0755 like every other cgroup: the directory is the user's own and
+// the kernel makes the files inside it.
 fn kernel_mkdir(dir: &Path) -> Result<(), Errno> {
     rustix::fs::mkdir(dir, Mode::from_raw_mode(0o755))
 }
 
-/// A cgroup goes away with `rmdir`, interface files and all — but only
-/// once it holds neither a process nor a child cgroup.
+// A cgroup goes away with `rmdir`, interface files and all — but only
+// once it holds neither a process nor a child cgroup.
 fn kernel_rmdir(dir: &Path) -> Result<(), Errno> {
     rustix::fs::rmdir(dir)
 }
 
-/// [`create`] under one cgroup2 root and one starting cgroup, so a test
-/// can name both.
+// [`create`] under one cgroup2 root and one starting cgroup, so a test
+// can name both.
 fn create_under(
     root: &Path,
     own: &str,
@@ -240,12 +195,8 @@ fn create_under(
         ))
     })?;
     let home = root.join(own);
-    // A bubbler killed with SIGKILL leaves its directories behind, and
-    // they are empty: no process outlives the run that was in them. They
-    // are swept here rather than at exit because only here is it known
-    // that this instance is not running — a live run's directories
-    // refuse to be removed anyway, since a cgroup holding a process
-    // cannot be.
+    // The directories are swept here rather than at exit because only
+    // here is it known that this instance is not running.
     sweep(ops, &home, &prefix, pid);
     let dir = root.join(&base);
     let (sandbox, proxy) = (dir.join(SANDBOX_LEAF), dir.join(PROXY_LEAF));
@@ -299,18 +250,18 @@ fn create_under(
     Ok(cgroup)
 }
 
-/// Remove what was made, deepest first, ignoring what is not there.
+// Remove what was made, deepest first, ignoring what is not there.
 fn remove(ops: Ops, dirs: &[&PathBuf]) {
     for d in dirs {
         let _ = (ops.rmdir)(d);
     }
 }
 
-/// Remove empty cgroups of earlier runs of this instance: those named
-/// `{prefix}{pid}` exactly, whose pid is no running process but `own`.
-/// A live run's leaves stay even while still empty, as they are between
-/// another start's `mkdir` and its move into them; a pid reused since
-/// leaves a leftover for a later start to sweep.
+// Remove empty cgroups of earlier runs of this instance: those named
+// `{prefix}{pid}` exactly, whose pid is no running process but `own`.
+// A live run's leaves stay even while still empty, as they are between
+// another start's `mkdir` and its move into them; a pid reused since
+// leaves a leftover for a later start to sweep.
 fn sweep(ops: Ops, home: &Path, prefix: &str, own: u32) {
     let Ok(entries) = std::fs::read_dir(home) else {
         return;
@@ -335,8 +286,8 @@ fn sweep(ops: Ops, home: &Path, prefix: &str, own: u32) {
     }
 }
 
-/// Why a cgroup could not be made, in the terms of what the user would
-/// have to change. Everything else is reported as it arrived.
+// Why a cgroup could not be made, in the terms of what the user would
+// have to change. Everything else is reported as it arrived.
 fn bad_subtree(e: Errno, dir: &Path) -> LaunchError {
     match e {
         Errno::ACCESS | Errno::PERM | Errno::ROFS | Errno::NOENT => LaunchError::Network(format!(
@@ -358,14 +309,10 @@ fn bad_subtree(e: Errno, dir: &Path) -> LaunchError {
 
 /// bubbler's own cgroup, relative to the cgroup2 mount and without the
 /// leading `/`. Empty where bubbler is in the root cgroup itself.
-///
-/// Also what an explanation names its placeholder under, so the block
-/// `--explain` prints is the shape a run would install.
 pub fn own_path() -> Result<String, LaunchError> {
     let path = PathBuf::from("/proc/self/cgroup");
-    // Read with a bound like everything else bubbler reads, and by
-    // length rather than by the reported size: a procfs file reports
-    // none.
+    // Read with a bound, and by length rather than by the reported size:
+    // a procfs file reports none.
     let mut text = String::new();
     File::open(&path)
         .and_then(|f| f.take(MAX_CGROUP_FILE).read_to_string(&mut text))
@@ -390,13 +337,9 @@ pub fn placeholder(own: &str, instance: &str) -> String {
     format!("{base}bubbler-{instance}-<pid>/{PROXY_LEAF}")
 }
 
-/// The unified hierarchy's path out of a `/proc/<pid>/cgroup` file,
-/// relative to the cgroup2 mount: the `0::` line with its prefix and
-/// leading `/` taken off.
-///
-/// `None` where there is no such line, which is a host with no cgroup2
-/// hierarchy — or one where bubbler is in a v1 controller only, which
-/// the `socket cgroupv2` match cannot see either.
+// `None` where there is no such line, which is a host with no cgroup2
+// hierarchy — or one where bubbler is in a v1 controller only, which
+// the `socket cgroupv2` match cannot see either.
 fn unified_of(text: &str) -> Option<&str> {
     text.lines()
         .find_map(|line| line.strip_prefix(UNIFIED))
