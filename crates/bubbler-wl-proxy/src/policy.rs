@@ -95,8 +95,7 @@ pub struct Policy {
     last_input: Option<Instant>,
 }
 
-// The tables' entry for the interface and the version the client was
-// offered, which is never above what the tables describe.
+// The version is never above what the tables describe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Global {
     interface: usize,
