@@ -40,9 +40,8 @@ pub fn render(cfg: &InstanceConfig) -> Result<String, ConfigError> {
 /// disabled entry is one node on its `/-` line.
 pub fn nodes(cfg: &InstanceConfig) -> Result<Vec<String>, ConfigError> {
     let mut out = Vec::new();
-    // Ahead of the grants: a finding the file has accepted is about the
-    // file, and reading it first says what the nodes below were allowed
-    // to be.
+    // Ahead of the grants: a finding the file has accepted is about the file, and reading it first
+    // says what the nodes below were allowed to be.
     section(
         cfg,
         |n| matches!(n, Node::LintAllow(_)),
@@ -135,13 +134,9 @@ pub enum Entry<'a, T> {
     Disabled(usize, &'a Disabled),
 }
 
-/// One section of the file: its `enabled` nodes with the disabled
-/// entries of the same section among them, each before the entry it was
-/// read above. An entry pointing past the last one comes after it rather
-/// than being dropped: the section may have lost the node it sat above
-/// since. Both readers of a section — [`nodes`] below and the editor's
-/// row list — walk this, so a file and the editor's view of it cannot
-/// disagree about where a `/-` line sits.
+/// One section of the file: its `enabled` nodes with the disabled entries of the same section
+/// among them, each before the entry it was read above. An entry pointing past the last one comes
+/// after it rather than being dropped.
 pub fn section_entries<'a, T>(
     cfg: &'a InstanceConfig,
     is: fn(&Node) -> bool,
@@ -161,11 +156,11 @@ pub fn section_entries<'a, T>(
         out.extend(of_section(&|before| before == i));
         out.push(Entry::Enabled(node));
     }
+    // The section may have lost the node it sat above since.
     out.extend(of_section(&|before| before >= end));
     out
 }
 
-/// One section of the file as the lines it is written back as.
 fn section(
     cfg: &InstanceConfig,
     is: fn(&Node) -> bool,
@@ -204,9 +199,8 @@ pub fn node(n: &Node) -> Result<String, ConfigError> {
             }
             out
         }
-        // One node accepts one check id, and two of them would be two
-        // lines: a `/-` prefix on the first would leave the second
-        // granted.
+        // One node accepts one check id, and two of them would be two lines: a `/-` prefix on
+        // the first would leave the second granted.
         Node::LintAllow(allows) => match allows.as_slice() {
             [one] => lint_allow(one),
             other => {
@@ -343,9 +337,8 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
                         .to_owned(),
                 });
             }
-            // `own` is refused there for the same reason the node itself
-            // is narrow: the name would be owned with the user's own
-            // credentials.
+            // `own` is refused there for the same reason the node itself is narrow: the name
+            // would be owned with the user's own credentials.
             if let Some(name) = rules.iter().find_map(|r| match r {
                 BusRule::Own(n) => Some(n),
                 _ => None,
@@ -363,18 +356,12 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
     })
 }
 
-/// `node` cut to `max` columns on screen, with the cut marked `…`. Where
-/// something follows the node's first quoted argument — the `mode=` of a
-/// share, a second argument, the brace closing a block — the cut is made
-/// *inside* that argument so what follows stays in view: a `home-share`
-/// whose mode fell off the end would hide the one thing the reader is
-/// looking for. A node with nothing after its argument, and one whose
-/// remainder does not fit on its own, is cut at the end as any other
-/// text would be. Columns rather than characters, because a share named
-/// in Chinese is twice as wide as its character count and a line cut to
-/// the count would overflow the column it was cut for. Display only: the
-/// result is not KDL the parser reads back.
+/// `node` cut to `max` columns on screen, with the cut marked `…`. Where something follows the
+/// node's first quoted argument, the cut is made *inside* that argument so what follows stays in
+/// view. Display only: the result is not KDL the parser reads back.
 pub fn shorten(node: &str, max: usize) -> String {
+    // Columns rather than characters, because a share named in Chinese is twice as wide as its
+    // character count and a line cut to the count would overflow the column it was cut for.
     if node.width() <= max {
         return node.to_owned();
     }
@@ -389,9 +376,6 @@ pub fn shorten(node: &str, max: usize) -> String {
     })
 }
 
-/// `node` cut inside its first quoted argument, or `None` where that
-/// buys nothing: no quoted argument, nothing after it, or a remainder
-/// leaving no room for even one character of the argument itself.
 fn shorten_in_argument(node: &str, max: usize) -> Option<String> {
     let chars: Vec<char> = node.chars().collect();
     let open = chars.iter().position(|c| *c == '"')?;
@@ -431,12 +415,10 @@ fn shorten_in_argument(node: &str, max: usize) -> Option<String> {
     )
 }
 
-/// Columns `chars` takes on screen.
 fn columns(chars: &[char]) -> usize {
     chars.iter().filter_map(|c| c.width()).sum()
 }
 
-/// How many of `chars` fit in `budget` columns.
 fn fits(chars: &[char], budget: usize) -> usize {
     let mut used = 0;
     for (i, c) in chars.iter().enumerate() {
@@ -448,7 +430,6 @@ fn fits(chars: &[char], budget: usize) -> usize {
     chars.len()
 }
 
-/// Index of the `"` closing the one at `open`, honouring `\"` inside it.
 fn closing_quote(chars: &[char], open: usize) -> Option<usize> {
     let mut i = open + 1;
     while i < chars.len() {
@@ -461,9 +442,7 @@ fn closing_quote(chars: &[char], open: usize) -> Option<usize> {
     None
 }
 
-/// `node` without its `mode=`, for a message that names the node and the
-/// two modes it was granted in separately: a header stating one of them
-/// would read as settled. A node carrying no mode comes back as it is.
+/// `node` without its `mode=`. A node carrying no mode comes back as it is.
 /// `optional=#true`, when present, always follows `mode=` and is kept.
 pub(crate) fn without_mode(node: &str) -> String {
     let (base, optional) = match node.strip_suffix(" optional=#true") {
@@ -487,8 +466,8 @@ pub(crate) fn share_mode(mode: ShareMode) -> &'static str {
     }
 }
 
-/// `optional=#true` written only when set: `#false` is the default, so a
-/// share that omitted the property reads back exactly as it was written.
+// `optional=#true` written only when set: `#false` is the default, so a
+// share that omitted the property reads back exactly as it was written.
 fn optional_suffix(optional: bool) -> &'static str {
     match optional {
         true => " optional=#true",
@@ -496,8 +475,6 @@ fn optional_suffix(optional: bool) -> &'static str {
     }
 }
 
-/// `pipewire`/`pulseaudio`: bare unless a child was granted, then the
-/// block form the parser reads back as the same grant.
 fn audio_node(name: &str, microphone: bool, devices: bool, exclusive: bool) -> String {
     let children: Vec<&str> = [
         ("microphone", microphone),
@@ -517,9 +494,8 @@ fn audio_node(name: &str, microphone: bool, devices: bool, exclusive: bool) -> S
     format!("{name} {{\n{body}}}")
 }
 
-/// `x11` and only the properties that differ from the window a bare
-/// node describes: a default written out would be read back as the same
-/// server, and the shortest spelling is the one a user wrote.
+// `x11` and only the properties that differ from the window a bare node describes: a default
+// written out would be read back as the same server.
 fn x11(n: &NestedX11) -> String {
     let mut node = String::from("x11");
     if n.geometry != NestedX11::default().geometry {
@@ -539,8 +515,6 @@ fn x11(n: &NestedX11) -> String {
     node
 }
 
-/// The `network` node: its mode where it is not the default, then one
-/// line per child.
 fn network(cfg: &NetworkConfig) -> String {
     let mut node = String::from("network");
     match cfg.mode {
@@ -566,8 +540,7 @@ fn network(cfg: &NetworkConfig) -> String {
         kids.push(format!("allow-out {a}"));
     }
     // After the addresses: a name is the same policy written the other
-    // way, and the file reads as the address rules plus what the proxy
-    // is told.
+    // way.
     for a in &cfg.allow_hosts {
         kids.push(format!("allow-host {a}"));
     }
@@ -589,7 +562,6 @@ fn network(cfg: &NetworkConfig) -> String {
     node
 }
 
-/// A bus node with its rule children, one per line.
 fn bus_block(name: &str, rules: &[BusRule]) -> String {
     let mut node = format!("{name} {{\n");
     for r in rules {
@@ -702,9 +674,8 @@ pub fn command(argv: &[OsString]) -> Result<String, ConfigError> {
     Ok(node)
 }
 
-/// Config values come from KDL text and are therefore UTF-8. A caller
-/// that built an [`InstanceConfig`] by hand may not have kept that, and a
-/// lossy rendering would name a different path than the grant did.
+// Config values come from KDL text and are therefore UTF-8. A lossy rendering would name a
+// different path than the grant did.
 fn text<'a>(node: &str, what: &str, s: &'a OsStr) -> Result<&'a str, ConfigError> {
     s.to_str().ok_or_else(|| ConfigError::BadArgument {
         node: node.to_owned(),
