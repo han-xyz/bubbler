@@ -553,17 +553,41 @@ fn window_in_which_it_would_link(bed: &PipeWireBed, grant: &str) {
 
 /// Every node a stream can record from, by the markers that name it in a
 /// listing: what a context without the microphone grant may not see.
-const CAPTURE_NODES: [&str; 3] = [
+const CAPTURE_NODES: [&str; 4] = [
     SOURCE,
     r#"node.name = "virtual-source""#,
     r#"node.name = "duplex""#,
+    r#"node.name = "odd-source""#,
 ];
+
+/// A class holding `Audio/Source` past its start, which the drop-in's
+/// unanchored match hides.
+const ODD_SOURCE_CLASS: &str = "Custom/Audio/Source";
 
 /// The bed's `OTHER_SOURCES` added and a host recorder linked to the null
 /// source, so each capture node has ports and one has a link: the
 /// recorder, and the ids of every capture node.
 fn capture_nodes_with_a_link(bed: &PipeWireBed) -> (Streaming, Vec<String>) {
     add_other_sources(bed);
+    // Ports for a class the adapter does not know need
+    // `adapter.auto-port-config` (PipeWire 1.6.9).
+    let created = bed
+        .command("pw-cli")
+        .args([
+            "create-node",
+            "adapter",
+            &format!(
+                "{{ factory.name = support.null-audio-sink, node.name = odd-source, \
+                 media.class = {ODD_SOURCE_CLASS}, audio.position = \"FL,FR\", \
+                 object.linger = true, adapter.auto-port-config = {{ mode = dsp }} }}"
+            ),
+        ])
+        .output()
+        .expect("pw-cli did not run");
+    assert!(created.status.success(), "{created:?}");
+    wait_for("the odd source's ports", || {
+        bed.host_tool("pw-link", &["-io"]).contains("odd-source:")
+    });
     let recorder = host_stream(
         bed,
         &["-r", "-a", "-P", "{ node.name = host-rec }", "/dev/null"],
@@ -572,7 +596,7 @@ fn capture_nodes_with_a_link(bed: &PipeWireBed) -> (Streaming, Vec<String>) {
         bed.links().contains("bed-source:capture_")
     });
     let listing = bed.info_from_host();
-    let nodes = CAPTURE_NODES
+    let nodes: Vec<String> = CAPTURE_NODES
         .iter()
         .map(|marker| {
             object(&listing, &[marker, NODE])
@@ -580,11 +604,15 @@ fn capture_nodes_with_a_link(bed: &PipeWireBed) -> (Streaming, Vec<String>) {
                 .id
         })
         .collect();
+    for node in &nodes {
+        assert!(
+            !objects_of(&listing, std::slice::from_ref(node)).is_empty(),
+            "no port of capture node {node} found in the host's listing:\n{listing}"
+        );
+    }
     (recorder, nodes)
 }
 
-/// The ids of the ports and links in `listing` that belong to any of
-/// `nodes`.
 fn objects_of(listing: &str, nodes: &[String]) -> Vec<String> {
     let markers: Vec<String> = nodes
         .iter()
@@ -626,8 +654,6 @@ impl ContextMonitor {
         monitor
     }
 
-    /// The ids of the objects the client sees now: added and not
-    /// removed since.
     fn visible(&self) -> BTreeSet<String> {
         let said = std::fs::read_to_string(&self.log).unwrap_or_default();
         let mut visible = BTreeSet::new();
@@ -653,8 +679,6 @@ impl ContextMonitor {
         visible
     }
 
-    /// Wait until the client sees none of `ids`, or fail naming those it
-    /// still sees.
     fn sees_none_of(&self, ids: &[String]) {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
@@ -780,6 +804,53 @@ fn a_playback_context_sees_no_port_or_link_of_a_capture_node_across_a_restart() 
         objects_of(&listing, &nodes),
         Vec::<String>::new(),
         "ports or links of a hidden capture node after a restart:\n{listing}"
+    );
+}
+
+/// A node's client sets its class, and may change it after the node is
+/// in the graph.
+#[test]
+fn a_playback_context_sees_no_port_of_a_node_that_turns_into_a_source() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let Some(fixture) = changes_its_properties(&bed) else {
+        return;
+    };
+    let monitor = ContextMonitor::start(&bed, PLAYBACK);
+    let mut command = bed.command(&fixture.to_string_lossy());
+    command
+        .args([
+            "out",
+            "{ media.class = Stream/Output/Audio, node.name = turncoat, node.autoconnect = false }",
+            "{ media.class = Audio/Source }",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    own_process_group(&mut command);
+    let _turncoat = Streaming(command.spawn().expect("the fixture did not run"));
+    let turned = [
+        r#"node.name = "turncoat""#,
+        r#"media.class = "Audio/Source""#,
+        NODE,
+    ];
+    let mut host = String::new();
+    wait_for("the stream turned into a source, with its ports", || {
+        host = bed.info_from_host();
+        object(&host, &turned)
+            .is_some_and(|node| !objects_of(&host, std::slice::from_ref(&node.id)).is_empty())
+    });
+    let node = object(&host, &turned).expect("the turned node").id;
+    let mut ids = objects_of(&host, std::slice::from_ref(&node));
+    ids.push(node.clone());
+    monitor.sees_none_of(&ids);
+    // The node itself stays visible to a context connected after the
+    // change: the permission manager matches the class it was created with.
+    let later = bed.info_in_context(PLAYBACK, &[SINK]);
+    assert_eq!(
+        objects_of(&later, std::slice::from_ref(&node)),
+        Vec::<String>::new(),
+        "a context connected after the change sees its ports:\n{later}"
     );
 }
 
@@ -1023,8 +1094,7 @@ fn a_playback_context_gets_no_link_to_another_clients_stream() {
 /// from which WirePlumber's `get_client_access` reads "flatpak".
 const CLAIM: &str = r#"{ "bubbler.audio": "playback,microphone", "pipewire.sec.bubbler.audio": "playback,microphone", "pipewire.client.access": "flatpak", "pipewire.sec.flatpak": "true" }"#;
 
-/// What the daemon carries of the Flatpak half of `CLAIM` (PipeWire
-/// 1.6.9 drops `pipewire.sec.flatpak`).
+/// PipeWire 1.6.9 drops `pipewire.sec.flatpak` of `CLAIM`.
 const CLAIMED_FLATPAK: &str = r#"pipewire.client.access = "flatpak""#;
 
 /// What `wpexec` runs to claim the microphone once connected and then
@@ -1987,9 +2057,8 @@ fn a_host_stream_passes_by_what_a_context_offered(
     assert!(links.contains(bed_end), "{links}");
 }
 
-/// The `default` metadata's part of the host's `pw-dump`. Not `pw-metadata`:
-/// under load it now and then prints the object it found and exits before
-/// its keys (2 and 5 in 400 reads; `pw-dump` 0 in 400, PipeWire 1.6.9).
+/// Not `pw-metadata`: under load it printed no keys in 7 of 800 reads
+/// (`pw-dump` 0 of 400, PipeWire 1.6.9).
 fn default_metadata(bed: &PipeWireBed) -> String {
     bed.dump_from_host()
         .split_once("\"metadata.name\": \"default\"")

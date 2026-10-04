@@ -86,10 +86,6 @@
 -- application starts at that application's saved levels, and a target
 -- the user picks for it is saved under those names.
 --
--- A sandbox sees no port and no link of a node 50-bubbler.conf hides from
--- it, as it sees no such node: a capture node without the microphone
--- grant, and every video node, since no grant covers a camera.
---
 -- The policy states its revision in the metadata `bubbler-policy`, key
 -- `revision` on subject 0, which no sandbox can see: bubbler reads it to
 -- tell a WirePlumber still running an older policy.
@@ -103,7 +99,7 @@ local BUBBLER_ENGINE = "org.bubbler"
 
 -- Raised whenever what this policy makes WirePlumber do changes; bubbler
 -- expects the revision it ships with and reads it from this line.
-local POLICY_REVISION = 3
+local POLICY_REVISION = 4
 
 local EPERM = -1
 
@@ -166,11 +162,11 @@ local function foreign_sandbox_node (source, si_props, target_props)
 end
 
 -- Whether a stream can record from the node: the classes 50-bubbler.conf
--- hides without the microphone grant (its `~Audio/Source.*` is an
--- unanchored match, so it hides at least these).
+-- hides without the microphone grant, `Audio/Source` anywhere in the class
+-- as its unanchored `~Audio/Source.*` matches, and `Audio/Duplex`.
 local function capture_capable (node_props)
   local class = node_props ["media.class"] or ""
-  return class:find ("^Audio/Source") ~= nil or class == "Audio/Duplex"
+  return class:find ("Audio/Source", 1, true) ~= nil or class == "Audio/Duplex"
 end
 
 -- Whether the stream would hold its target for itself: asked for it
@@ -549,10 +545,8 @@ SimpleEventHook {
   end
 }:register ()
 
--- The ports and links of a node 50-bubbler.conf hides carry no
--- `media.class` for its rules to match (PipeWire 1.6.9), only the node's
--- id, so they are hidden here. Each is hidden when the later of it and
--- its node arrives: the daemon may register a port before its node.
+-- Ports and links carry no `media.class` for 50-bubbler.conf to match, only
+-- a node id, and may arrive before their node (PipeWire 1.6.9).
 local nodes = ObjectManager {
   Interest { type = "node" },
 }
@@ -591,7 +585,6 @@ local function hides_node (client)
   end
 end
 
--- Whether a port or link belongs to a node `of_node` holds for.
 local function belongs (object, of_node)
   local props = object.properties
   return of_node (props ["node.id"]) or
@@ -599,8 +592,6 @@ local function belongs (object, of_node)
       of_node (props ["link.input.node"])
 end
 
--- The ports and links that belong to a node `of_node` holds for, as a
--- permissions table hiding each, or nil where there are none.
 local function hidden_of (of_node)
   local hidden
   for object in ports_and_links:iterate () do
@@ -627,11 +618,32 @@ local function hide_from_connected_sandboxes (hidden_for)
   end
 end
 
-nodes:connect ("object-added", function (_, node)
+local function hide_node_from_connected_sandboxes (node, with_the_node)
   local id = tostring (node ["bound-id"])
   hide_from_connected_sandboxes (function (client)
-    return hidden_from (client, node.properties) and
-        hidden_of (function (node_id) return node_id == id end)
+    if not hidden_from (client, node.properties) then
+      return nil
+    end
+    local hidden = hidden_of (function (node_id) return node_id == id end)
+    if with_the_node then
+      hidden = hidden or {}
+      hidden [node ["bound-id"]] = "-"
+    end
+    return hidden
+  end)
+end
+
+nodes:connect ("object-added", function (_, node)
+  hide_node_from_connected_sandboxes (node, false)
+  -- A node's client sets its class and may change it later; the permission
+  -- manager does not look at the node again (WirePlumber 0.5.18).
+  local class = node.properties ["media.class"]
+  node:connect ("notify::properties", function (changed)
+    local now = changed.properties ["media.class"]
+    if now ~= class then
+      class = now
+      hide_node_from_connected_sandboxes (changed, true)
+    end
   end)
 end)
 ports_and_links:connect ("object-added", function (_, object)
