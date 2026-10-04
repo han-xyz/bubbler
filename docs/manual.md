@@ -3835,7 +3835,8 @@ model.
 page-migration calls, module and kexec loading, `iopl`/`ioperm`, swap,
 `reboot`, `syslog`, quota, the system clock and the host name, io_uring
 (`io_uring_setup`, `io_uring_enter`, `io_uring_register` — a second syscall
-path that every recent mitigation bypass was written against, and the
+path, which the audit and LSM hooks see differently from the first, that
+every recent mitigation bypass was written against, and the
 kernel's own `io_uring_disabled=2` already answers `EPERM`, which is what
 every runtime that falls back gracefully is tested against), `pidfd_getfd`
 (takes a descriptor out of another process by pidfd — the sandbox shares its
@@ -3845,7 +3846,8 @@ out of the sandbox's own process tree) — the list is `DEFAULT_EPERM` in
 `crates/bubbler-core/src/seccomp.rs`. Two `ioctl` requests
 are denied by their argument as well: `TIOCSTI` (0x5412) and `TIOCLINUX`
 (0x541C), which push bytes into a terminal's input queue (CVE-2017-5226,
-CVE-2023-28100). `ENOSYS`: `clone3`, and with `userns "disable"` and in every
+CVE-2023-28100). `ENOSYS`: `clone3` (seccomp cannot inspect its
+`clone_args`), and with `userns "disable"` and in every
 sidecar the new mount API (`open_tree`, `move_mount`, `fsopen`, `fsconfig`,
 `fsmount`, `fspick`) — together `DEFAULT_ENOSYS` in the same file. An
 application that may nest keeps the mount API, `open_tree_attr` with it,

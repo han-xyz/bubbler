@@ -756,6 +756,14 @@ mount-API calls (`open_tree`, `move_mount`, `fsopen`, `fsconfig`,
 `fsmount`, `fspick`), where they are denied, are denied on both ABIs. The gap
 closes by itself when libseccomp learns the names, which
 `the_numbered_rules_are_the_ones_this_libseccomp_cannot_name` fails on.
+Numbers from 425 on are shared with i386, which `asm/unistd_32.h` confirms
+for 467 and 470. `fchroot` is proposed and not merged, so 472 is allocated to nothing yet and
+the rule denies a number that already answers `ENOSYS`;
+`no_numbered_rule_names_a_number_the_headers_give_to_another_call` is what
+fails the day a kernel gives it to some other call. The `personality` prefix
+is written by hand because libseccomp cannot express a per-argument
+allowlist in a default-allow filter: two comparisons on one argument are
+`EINVAL` and an `ALLOW` rule is `EACCES`.
 
 ### User namespaces inside the sandbox
 
