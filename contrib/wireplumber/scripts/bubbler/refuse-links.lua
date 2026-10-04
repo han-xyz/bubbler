@@ -15,10 +15,13 @@
 --
 -- Under the device grant (`devices` in its grant) a sandbox's nodes that
 -- are no stream are devices like the host's: WirePlumber may link another
--- client's stream to them and make one a default. Into such a device flows
--- only a playback stream; a capture stream records from it as from a host
--- device. Every factory but `client-node` stays hidden from it all the
--- same, so its devices are nodes it runs itself, carrying its client id.
+-- client's stream to them and make one a default. A node of such a sandbox
+-- that is marked a smart filter (`filter.smart`) or shares a `node.name`,
+-- `object.path` or `node.nick` with another device keeps no session item
+-- all the same. Into such a device flows only a playback stream; a
+-- capture stream records from it as from a host device. Every factory
+-- but `client-node` stays hidden from it all the same, so its devices
+-- are nodes it runs itself, carrying its client id.
 --
 -- A link with a sandbox's node at either end is destroyed when
 -- WirePlumber sees it, unless WirePlumber made it and it is one the
@@ -391,6 +394,8 @@ SimpleEventHook {
 -- `spa-node-factory`, `metadata`, ...) — such a node, made with
 -- `object.linger`, carries no `client.id` (PipeWire 1.6.9,
 -- module-adapter.c), so nothing below could tell it was a sandbox's.
+-- The permission managers cannot express that — measured: their `rules`
+-- are not applied to factory globals — so it is set on the client below.
 local STREAM_FACTORY = "client-node"
 local factories = ObjectManager {
   Interest { type = "factory" },
