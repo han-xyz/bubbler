@@ -4,7 +4,7 @@
 //! never reaches a host bus itself.
 
 use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 
 use crate::config::{BusRule, Portal, Service};
@@ -807,13 +807,54 @@ fn address_path(
     }
 }
 
-/// Path out of a `unix:path=<path>[,<key>=<value>]...` D-Bus address;
-/// `None` for any other transport, and for an empty path.
+/// Path of the first `unix:` entry of a `;`-separated D-Bus address list
+/// that names a `path=`, its `%XX` escapes undone; `None` when no entry
+/// names a usable one.
 fn unix_path(address: &OsStr) -> Option<PathBuf> {
-    let rest = address.as_bytes().strip_prefix(b"unix:path=")?;
-    let end = rest.iter().position(|b| *b == b',').unwrap_or(rest.len());
-    let path = &rest[..end];
-    (!path.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(path)))
+    address
+        .as_bytes()
+        .split(|b| *b == b';')
+        .filter_map(|entry| entry.strip_prefix(b"unix:"))
+        .find_map(|pairs| {
+            let value = pairs
+                .split(|b| *b == b',')
+                .find_map(|pair| pair.strip_prefix(b"path="))?;
+            let path = unescape_address_value(value)?;
+            (!path.is_empty() && !path.contains(&0))
+                .then(|| PathBuf::from(OsString::from_vec(path)))
+        })
+}
+
+fn unescape_address_value(value: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(value.len());
+    let mut rest = value;
+    while let Some((&b, tail)) = rest.split_first() {
+        if b != b'%' {
+            out.push(b);
+            rest = tail;
+            continue;
+        }
+        let hex = tail
+            .get(..2)
+            .filter(|h| h.iter().all(u8::is_ascii_hexdigit))?;
+        out.push(u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?);
+        rest = &tail[2..];
+    }
+    Some(out)
+}
+
+/// `value` as a D-Bus address value: every byte outside the
+/// specification's optionally-escaped set `[-0-9A-Za-z_/.\*]` as `%XX`.
+fn escape_address_value(value: &[u8]) -> OsString {
+    let mut out = Vec::with_capacity(value.len());
+    for &b in value {
+        if b.is_ascii_alphanumeric() || b"-_/.\\*".contains(&b) {
+            out.push(b);
+        } else {
+            out.extend_from_slice(format!("%{b:02x}").as_bytes());
+        }
+    }
+    OsString::from_vec(out)
 }
 
 /// The proxy binary to run: `$BUBBLER_DBUS_PROXY` when it is set, else
@@ -886,7 +927,7 @@ pub fn proxy_command_nodes(
             continue;
         };
         let mut address = OsString::from("unix:path=");
-        address.push(host);
+        address.push(escape_address_value(host.as_os_str().as_bytes()));
         // The address and the socket path must precede the options of
         // that bus: an option applies to the address before it. All of
         // them are the granting node's, so an explanation reads one bus
@@ -1485,6 +1526,73 @@ mod tests {
             ),
             "the link into bubbler's own directory was accepted"
         );
+    }
+
+    #[test]
+    fn the_first_unix_entry_naming_a_path_in_an_address_list_is_taken() {
+        assert_eq!(
+            unix_path(OsStr::new(
+                "tcp:host=localhost,port=1;unix:abstract=/x;unix:path=/a;unix:path=/b"
+            )),
+            Some(PathBuf::from("/a"))
+        );
+    }
+
+    #[test]
+    fn an_address_key_may_come_after_the_path_or_before_it() {
+        assert_eq!(
+            unix_path(OsStr::new("unix:guid=deadbeef,path=/x")),
+            Some(PathBuf::from("/x"))
+        );
+    }
+
+    #[test]
+    fn a_path_value_is_unescaped() {
+        assert_eq!(
+            unix_path(OsStr::new("unix:path=/run/a%2cb%3Bc%25d%20e%ff")),
+            Some(PathBuf::from(OsStr::from_bytes(b"/run/a,b;c%d e\xff")))
+        );
+        for bad in [
+            "unix:path=/x%",
+            "unix:path=/x%2",
+            "unix:path=/x%zz",
+            "unix:path=%00",
+        ] {
+            assert_eq!(unix_path(OsStr::new(bad)), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_abstract_address_alone_is_still_refused() {
+        let mut e = env();
+        e.dbus_address = Some("unix:guid=deadbeef,abstract=/x".into());
+        let Err(LaunchError::BadValue { reason, .. }) = host_bus(&e) else {
+            panic!("an abstract address was accepted");
+        };
+        assert!(reason.contains("`unix:path=<path>`"), "{reason}");
+    }
+
+    #[test]
+    fn the_proxy_address_escapes_the_path_so_it_parses_back_to_it() {
+        let p = plan(&[Service::Dbus { rules: vec![] }], "t").expect("dbus is granted");
+        let host = Path::new(OsStr::from_bytes(b"/run/a,b;c%d=e f\xff/A-z_0.9*\\bus"));
+        let argv = proxy_command(
+            Path::new(PROXY_BIN),
+            &p,
+            HostBuses {
+                session: Some(host),
+                system: None,
+                a11y: None,
+            },
+            Path::new("/run/user/1000/bubbler/t"),
+            false,
+            OsStr::new("4"),
+        );
+        assert_eq!(
+            argv[2],
+            OsString::from("unix:path=/run/a%2cb%3bc%25d%3de%20f%ff/A-z_0.9*\\bus")
+        );
+        assert_eq!(unix_path(&argv[2]).as_deref(), Some(host));
     }
 
     #[test]

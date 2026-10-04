@@ -68,6 +68,10 @@
 - An `exec` refused while the client's stderr took no write (a paused
   terminal, a full pipe) no longer stalls `bubbler-init`; the reason is
   dropped and the exit status still reports the refusal.
+- Bus addresses are read as D-Bus writes them: the first `unix:path=` of a
+  `;`-separated list, its keys in any order, `%XX` escapes undone. The
+  address handed to `xdg-dbus-proxy` escapes the socket path, so a path
+  holding `,`, `;` or `%` reaches the same socket bwrap binds.
 
 ## 0.25.0
 
