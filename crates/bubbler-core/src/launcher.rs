@@ -50,74 +50,44 @@ use crate::{
     wayland,
 };
 
-/// How often a running sandbox is checked for having exited.
 const POLL: Duration = Duration::from_millis(100);
 
-/// How long the sandbox has to report its pid before the run continues
-/// without being able to shut it down gracefully.
+// Past this the run goes on without a pid to stop the sandbox gracefully.
 const INFO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long the D-Bus proxy has to report that its socket is up.
 const PROXY_READY: Duration = Duration::from_secs(5);
 
-/// How long a proxy may take to leave after its ready pipe is closed
-/// before it is killed.
 const PROXY_STOP: Duration = Duration::from_secs(1);
 
-/// How long the Wayland proxy may take to leave after SIGTERM before it
-/// is killed.
 const WL_PROXY_STOP: Duration = Duration::from_secs(5);
 
-/// How long the audio sidecar has to report the socket of the security
-/// context it created.
 const PW_READY: Duration = Duration::from_secs(5);
 
-/// How long that sidecar may take to leave after SIGTERM before it is
-/// killed.
 const PW_STOP: Duration = Duration::from_secs(5);
 
-/// How long the private PulseAudio server has to create its socket
-/// before the run is stopped. It reports readiness on nothing, so this
-/// bounds a wait on the socket appearing.
+// The server reports readiness on nothing: this bounds the wait for its socket.
 const PULSE_READY: Duration = Duration::from_secs(5);
 
-/// How long that server may take to leave after SIGTERM before it is
-/// killed.
 const PULSE_STOP: Duration = Duration::from_secs(5);
 
-/// The longest report line the audio sidecar is read for. What the
-/// holder writes is a constant of bubbler's; anything longer is not the
-/// holder answering.
+// The holder writes a constant of bubbler's; a longer line is not the holder answering.
 const PW_REPORT_MAX: usize = 4096;
 
-/// How long pasta has to report that it has configured the sandbox's
-/// network namespace.
 const PASTA_READY: Duration = Duration::from_secs(5);
 
-/// How long pasta may take to leave after SIGTERM before it is killed.
 const PASTA_STOP: Duration = Duration::from_secs(1);
 
-/// How long `nft` has to install the outbound ruleset. Measured at 1.5 ms
-/// on this host, so this is a bound on a hang and not on the work.
+// A bound on a hang, not on the work: `nft` took 1.5 ms when measured.
 const NFT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long the egress proxy has to report that it is listening. It
-/// binds one socket after three `setns` calls; this is a bound on a hang
-/// and not on the work.
 const NET_PROXY_READY: Duration = Duration::from_secs(5);
 
-/// How long the egress proxy may take to leave after SIGTERM before it
-/// is killed.
 const NET_PROXY_STOP: Duration = Duration::from_secs(5);
 
-/// How long the supervisor has to appear inside the sandbox before the
-/// run goes on without a pid to signal.
 const SUPERVISOR_WAIT: Duration = Duration::from_secs(2);
 
-/// The name a generated file takes in the run's runtime directory: the
-/// path it is bound at inside the sandbox with its separators flattened,
-/// and `prefix` in front of it, so `--explain` names the file a run
-/// would write and no two destinations collide on one name.
+/// The runtime-directory name of a generated file: its sandbox path flattened behind `prefix`,
+/// so `--explain` names the file a run would write and no two destinations collide.
 pub(crate) fn data_name(prefix: &str, dest: &Path) -> OsString {
     let mut name = OsString::from(prefix);
     let mut first = true;
@@ -133,9 +103,8 @@ pub(crate) fn data_name(prefix: &str, dest: &Path) -> OsString {
     name
 }
 
-/// What a sidecar's generated files are called apart from the
-/// application sandbox's: both write into the run's one runtime
-/// directory, and `portals` gives both of them a `/.flatpak-info`.
+// Sandbox and sidecars write into the one runtime directory, and `portals` gives each a
+// `/.flatpak-info`.
 const SIDECAR_PREFIX: &str = "proxy-";
 
 /// Allocator for `--dry-run`: numbers every fd 3, 4, ... and names each
@@ -148,9 +117,7 @@ pub struct DryRunAlloc {
 }
 
 impl DryRunAlloc {
-    /// `dir` is the run's runtime directory, which is where a real run
-    /// writes the generated files. Fd numbering starts above the
-    /// process's own stdio.
+    /// `dir` is the run's runtime directory; fd numbering starts above stdio.
     pub fn new(dir: PathBuf) -> Self {
         Self {
             next: 2,
@@ -198,19 +165,9 @@ impl FdAllocator for DryRunAlloc {
     }
 }
 
-/// Allocator for a real run: memfds for seccomp filters, generated files
-/// in the run's runtime directory, the control socket bubbler already
-/// bound, and a sidecar ready pipe.
-///
-/// A generated file is the live source of a read-only bind, so its
-/// content must not change and it must not be unlinked while any sandbox
-/// holds that bind. Each allocator therefore owns the files it wrote and
-/// is the only thing that unlinks them, when it drops after its own
-/// sandbox has exited; and no two allocators of one run write the same
-/// path, which is what [`RealAlloc::sidecar`]'s name prefix is for —
-/// `portals` gives the application sandbox and the D-Bus proxy a
-/// `/.flatpak-info` each, and the proxy is already running with its own
-/// bound when the application's argv is built.
+/// Allocator for a real run: seccomp memfds, generated files in the run's runtime directory, the
+/// bound control socket and a sidecar ready pipe. Each generated file is the live source of a
+/// read-only bind, so the allocator unlinks what it wrote only when dropped after its sandbox.
 #[derive(Debug)]
 pub struct RealAlloc {
     /// Fds bwrap inherits; they stay open until it has been spawned.
@@ -222,11 +179,7 @@ pub struct RealAlloc {
     /// [`FdAllocator::listener`] hands it over. Handed out once: a
     /// number given twice would be closed twice.
     pub listen: Option<OwnedFd>,
-    /// Which of `fds` that socket became, so bubbler's own copy can be
-    /// closed again once the sidecar holding it has been spawned.
     listen_fd: Option<RawFd>,
-    /// Which of `fds` holds bwrap's options, closed again once the
-    /// bwrap that reads them has been spawned.
     options_fd: Option<RawFd>,
     /// Read end of the ready pipe, once [`FdAllocator::ready_pipe`] made one.
     pub ready_read: Option<OwnedFd>,
@@ -238,40 +191,31 @@ pub struct RealAlloc {
     /// Write end of the pipe the sandbox is blocked on. Writing to it or
     /// dropping it is what lets the sandbox exec its command.
     pub block_write: Option<OwnedFd>,
-    /// The run's runtime directory, where the generated files go.
     dir: PathBuf,
-    /// What this allocator's file names begin with, so a sidecar's are
-    /// never the application sandbox's.
     prefix: &'static str,
-    /// The generated files written there so far, removed when this
-    /// allocator drops. It outlives the sandbox it built the argv for —
-    /// a bind whose source is unlinked is exactly what this replaced.
     written: Vec<PathBuf>,
 }
 
 impl Drop for RealAlloc {
     fn drop(&mut self) {
         for path in self.written.drain(..) {
-            // Nothing to report: the run is over, and a file left behind
-            // is overwritten by the next start of the same instance.
+            // A file left behind is overwritten by the next start of the same instance.
             let _ = std::fs::remove_file(path);
         }
     }
 }
 
 impl RealAlloc {
-    /// Allocate around an already inherited control socket fd. `dir` is
-    /// the run's runtime directory, which the caller has created.
+    /// Allocate around an already inherited control socket fd; `dir` is the run's runtime
+    /// directory.
     pub fn new(socket: RawFd, dir: PathBuf) -> Self {
         let mut a = Self::in_dir(dir, "");
         a.socket = Some(socket);
         a
     }
 
-    /// Allocate for a sidecar sandbox: generated files and a ready pipe,
-    /// but no control socket to hand out. Its files are named apart from
-    /// the application sandbox's, which are bound into a sandbox this
-    /// one must not write under.
+    /// Allocate for a sidecar sandbox: generated files and a ready pipe, no control socket, and
+    /// file names apart from the application sandbox's.
     pub fn sidecar(dir: PathBuf) -> Self {
         Self::in_dir(dir, SIDECAR_PREFIX)
     }
@@ -301,26 +245,20 @@ impl RealAlloc {
         a
     }
 
-    /// Keep `fd` open for the child and report the number it will see.
     fn keep(&mut self, fd: OwnedFd) -> OsString {
         let n = fd.as_raw_fd();
         self.fds.push(fd);
         OsString::from(n.to_string())
     }
 
-    /// Close bubbler's own copy of the listening socket, once the
-    /// sidecar that accepts on it has been spawned. Nothing to do where
-    /// no listener was handed over.
     fn close_listener(&mut self) {
         if let Some(fd) = self.listen_fd.take() {
             self.fds.retain(|held| held.as_raw_fd() != fd);
         }
     }
 
-    /// bwrap's options, each ended by a NUL, in a sealed memfd it reads
-    /// through `--args`; the number it is inherited as. Sealed rather than
-    /// a pipe so nothing has to write while bwrap reads, whatever the
-    /// length; kept with the other fds, so only this spawn inherits it.
+    // A sealed memfd rather than a pipe, so nothing has to write while bwrap reads, whatever the
+    // length.
     fn options(&mut self, options: &[OsString]) -> io::Result<OsString> {
         if let Some(option) = options.iter().find(|o| o.as_bytes().contains(&0)) {
             return Err(io::Error::new(
@@ -346,29 +284,14 @@ impl RealAlloc {
         Ok(self.keep(f.into()))
     }
 
-    /// Close bubbler's own copy of the options, once the bwrap that reads
-    /// them has been spawned.
     fn close_options(&mut self) {
         if let Some(fd) = self.options_fd.take() {
             self.fds.retain(|held| held.as_raw_fd() != fd);
         }
     }
 
-    /// Clear `CLOEXEC` on every fd the next spawn is meant to inherit, or
-    /// put it back once that spawn has happened.
-    ///
-    /// bubbler spawns more than one process per run — the D-Bus proxy
-    /// before the sandbox, pasta after it — and each of these fds belongs
-    /// to exactly one of them. They are `CLOEXEC` at rest, so the window
-    /// in which they can be inherited is the one spawn they were built
-    /// for.
-    ///
-    /// That window is process-wide, so only one thread may spawn while it
-    /// is open. bubbler's other threads are the last-run log's copier
-    /// ([`crate::run_log`]) and the KDL parser's
-    /// ([`crate::config::parse_document`]); neither opens a descriptor or
-    /// starts a process, and no configuration is parsed while the window
-    /// is open.
+    // The window is process-wide, so only one thread may spawn while it is open; bubbler's other
+    // threads (the run log's copier, the KDL parser) open no descriptor and start no process.
     fn inheritable(&self, on: bool) -> io::Result<()> {
         let flags = match on {
             true => FdFlags::empty(),
@@ -380,19 +303,8 @@ impl RealAlloc {
         Ok(())
     }
 
-    /// Every descriptor the spawn this allocator was built for is meant to
-    /// inherit, which is what [`spawning`] keeps and marks the rest against.
-    ///
-    /// Three sources: the ones [`RealAlloc::inheritable`] opens the window
-    /// for, the control socket bubbler dup'ed for the sandbox, and the
-    /// write end of the info pipe — which is never close-on-exec at all,
-    /// because bwrap reports the sandbox pid on it and the caller closes
-    /// it by hand the moment bwrap has been started.
-    ///
-    /// Only descriptors that are still open: a caller that closes one
-    /// takes it out of the allocator in the same breath, since a number
-    /// left here after its descriptor is gone would exempt from the next
-    /// sweep whatever the kernel had handed that number to since.
+    // The info pipe's write end is never CLOEXEC: the caller closes it by hand after the spawn. A
+    // caller closing a fd takes it out here too, or the next sweep would spare a recycled number.
     fn intended(&self) -> Vec<RawFd> {
         let mut fds: Vec<RawFd> = self.fds.iter().map(AsRawFd::as_raw_fd).collect();
         fds.extend(self.socket);
@@ -401,31 +313,16 @@ impl RealAlloc {
     }
 }
 
-/// Mark every descriptor above stdio close-on-exec except the ones `keep`
-/// names, immediately before a spawn.
-///
-/// bubbler is started by whatever the user runs it from, and a shell, a
-/// terminal or a build system hands a process descriptors it never asked
-/// for — `makepkg` runs a `check()` with two of its own open. bwrap passes
-/// on every descriptor it holds, so without this each of those reaches the
-/// sandbox, the supervisor, every command exec'd in it, the D-Bus and
-/// Wayland proxies, pasta and the `nft` that holds CAP_NET_ADMIN over the
-/// sandbox's namespaces. Nothing is closed: bubbler's own descriptors stay
-/// open for the rest of the run and only stop crossing into children.
-///
-/// Like [`RealAlloc::inheritable`], the window is process-wide, so only
-/// one thread may spawn while it is open; bubbler's only other thread
-/// starts no process at all ([`crate::run_log`]).
+// Nothing is closed: bubbler's own descriptors stay open and only stop crossing into children.
+// Process-wide like `RealAlloc::inheritable`, so one spawning thread at a time.
 fn spawning(keep: &[RawFd]) -> Result<(), LaunchError> {
     fds::sweep_cloexec(keep).map_err(LaunchError::Descriptors)
 }
 
 impl FdAllocator for RealAlloc {
     fn data(&mut self, content: &[u8]) -> io::Result<OsString> {
-        // `MFD_CLOEXEC` and cleared again only around the spawn this argv
-        // was built for ([`RealAlloc::inheritable`]): a data file holds
-        // the sandbox's `/etc/passwd`, its `/.flatpak-info` and its
-        // resolver, and no sidecar of the run has any use for one.
+        // Inheritable only around the spawn this argv was built for: no sidecar needs the sandbox's
+        // `/etc/passwd`, `/.flatpak-info` or resolver.
         let fd = rustix::fs::memfd_create("bubbler-data", MemfdFlags::CLOEXEC)?;
         let mut f = std::fs::File::from(fd);
         f.write_all(content)?;
@@ -433,11 +330,8 @@ impl FdAllocator for RealAlloc {
         Ok(self.keep(f.into()))
     }
 
-    /// `O_NOFOLLOW` so a link cannot move the write out of the runtime
-    /// directory, and the mode is set rather than left to the caller's
-    /// umask, so what the sandbox sees does not depend on how bubbler
-    /// was started. bwrap takes the destination's permissions from the
-    /// source, so this is the mode `/etc/passwd` has inside.
+    // `O_NOFOLLOW` keeps the write in the runtime directory; the mode is set, not left to the
+    // umask, since bwrap gives the destination the source's mode.
     fn file(&mut self, dest: &Path, content: &[u8]) -> io::Result<OsString> {
         let path = self.dir.join(data_name(self.prefix, dest));
         let mut f = std::fs::File::from(rustix::fs::open(
@@ -458,9 +352,7 @@ impl FdAllocator for RealAlloc {
         }
     }
 
-    /// The sandboxed sidecar writes the ready byte, so it inherits the
-    /// write end; the read end stays here and out of every child. One
-    /// pipe per run: a second call replaces the first.
+    // One pipe per run: a second call replaces the first.
     fn ready_pipe(&mut self) -> io::Result<OsString> {
         let (read, write) = rustix::pipe::pipe()?;
         fcntl_setfd(&read, FdFlags::CLOEXEC)?;
@@ -468,9 +360,6 @@ impl FdAllocator for RealAlloc {
         Ok(self.keep(write))
     }
 
-    /// The socket bubbler bound and listened on for this sidecar, handed
-    /// over by number. It is kept with the other inherited descriptors,
-    /// so it is inheritable for exactly the one spawn it was built for.
     fn listener(&mut self) -> io::Result<OsString> {
         match self.listen.take() {
             Some(fd) => {
@@ -481,9 +370,8 @@ impl FdAllocator for RealAlloc {
         }
     }
 
-    /// bwrap inherits the write end and reports the sandbox pid on it.
-    /// The write end is kept apart from the other fds because the caller
-    /// drops it right after the spawn to get EOF instead of a hang.
+    // Kept apart from the other fds: the caller drops the write end right after the spawn, so a
+    // bwrap that never answers gives EOF instead of a hang.
     fn info_pipe(&mut self) -> io::Result<OsString> {
         let (read, write) = rustix::pipe::pipe()?;
         fcntl_setfd(&read, FdFlags::CLOEXEC)?;
@@ -493,9 +381,7 @@ impl FdAllocator for RealAlloc {
         Ok(OsString::from(n.to_string()))
     }
 
-    /// bwrap inherits the read end and waits on it; the write end stays
-    /// here and out of every child, so nothing but bubbler can release
-    /// the sandbox.
+    // The write end stays out of every child, so nothing but bubbler can release the sandbox.
     fn block_pipe(&mut self) -> io::Result<OsString> {
         let (read, write) = rustix::pipe::pipe()?;
         fcntl_setfd(&write, FdFlags::CLOEXEC)?;
@@ -504,7 +390,6 @@ impl FdAllocator for RealAlloc {
     }
 }
 
-/// The `network` grant of a config, if it has one.
 fn network_of(services: &[Service]) -> Option<&NetworkConfig> {
     services.iter().find_map(|s| match s {
         Service::Network(cfg) => Some(cfg),
@@ -512,7 +397,6 @@ fn network_of(services: &[Service]) -> Option<&NetworkConfig> {
     })
 }
 
-/// How the config's `wayland` grant is to be served, if it has one.
 fn wayland_mode(services: &[Service]) -> Option<WaylandMode> {
     services.iter().find_map(|s| match s {
         Service::Wayland(mode) => Some(*mode),
@@ -535,12 +419,9 @@ pub fn resolve_command<'a>(
     }
 }
 
-/// Complete bwrap argv (without the program name) for an instance.
-/// `command` from the CLI replaces the config's `command` entirely.
-/// `alloc` turns each generated data file and channel into the fd number
-/// bwrap reads it from. `ctty` says the sandbox's stdin will be the slave
-/// of a pty bubbler allocated, which is the only case in which the
-/// supervisor may claim it.
+/// Complete bwrap argv (without the program name) for an instance; `command` replaces the
+/// config's entirely. `ctty` says the sandbox's stdin is the slave of a pty bubbler allocated,
+/// the only case in which the supervisor may claim it.
 pub fn build_argv(
     env: &Env,
     inst: &Instance,
@@ -551,8 +432,6 @@ pub fn build_argv(
     build_argv_on(env, inst, command, alloc, ctty, &RealHost)
 }
 
-/// [`build_argv`] against one view of the host, so a test can state which
-/// device nodes and sockets the sandbox is built from.
 fn build_argv_on(
     env: &Env,
     inst: &Instance,
@@ -565,9 +444,8 @@ fn build_argv_on(
     args.finish(command, alloc)
 }
 
-/// Every argument of an instance's argv with the node that produced it,
-/// numbering fds the way [`build_argv`] does under `--dry-run`. Nothing
-/// is created: an explanation describes a launch, it does not perform one.
+/// Every argument of an instance's argv with the node that produced it, fds numbered as
+/// [`build_argv`] numbers them under `--dry-run`. Nothing is created.
 pub fn explain(
     env: &Env,
     inst: &Instance,
@@ -577,8 +455,6 @@ pub fn explain(
     explain_on(env, inst, command, ctty, &RealHost)
 }
 
-/// [`explain`] against one view of the host, so a test can state which
-/// sockets and device nodes the explanation is built from.
 fn explain_on(
     env: &Env,
     inst: &Instance,
@@ -591,14 +467,8 @@ fn explain_on(
     args.finish_explained(command, &mut alloc)
 }
 
-/// The builder and the command behind [`build_argv`], before the fds are
-/// numbered: what the argv and the explanation of it are both made from.
-///
-/// Nothing here asks the compositor anything. A sandboxed `wayland`
-/// binds the socket bubbler's own proxy accepts on however the
-/// compositor answered about `wp_security_context_manager_v1`; that
-/// answer decides only what the proxy connects to, which is the
-/// sidecar's argv and not this one.
+// Nothing here asks the compositor: its answer decides only what the Wayland proxy connects
+// to, which is the sidecar's argv.
 fn build_args_on<'a>(
     env: &Env,
     inst: &'a Instance,
@@ -611,9 +481,8 @@ fn build_args_on<'a>(
     let instance_runtime = instance_runtime_dir(env, &inst.name);
     let wayland_plan =
         wayland_mode(&inst.config.services).map(|m| wayland::plan(m, &instance_runtime));
-    // Resolved before the services rather than beside the bind at the
-    // end: `portals` binds the same file as the `flatpak-spawn` shim, so
-    // a run that cannot find the supervisor must fail before either.
+    // Before the services: `portals` binds the same file as the `flatpak-spawn` shim, so a missing
+    // supervisor must fail before either.
     let init = init_bin::locate(env, host)?;
     let ctx = service::ServiceCtx {
         instance_runtime,
@@ -637,12 +506,8 @@ fn build_args_on<'a>(
     if ctty {
         args.ctty();
     }
-    // Two grants make the sandbox wait at startup, and each is tagged
-    // with the node that asked for it. A portal call is answered by the
-    // identity bubbler publishes from bwrap's own info document, so the
-    // app waits until that file is there; an isolated `network` waits
-    // until pasta has configured the namespace, which cannot happen
-    // before bwrap has reported the pid to attach to.
+    // A portal call needs the published identity and an isolated `network` needs pasta, so either
+    // grant makes the sandbox wait at startup.
     let waits = [
         inst.config
             .services
@@ -654,10 +519,7 @@ fn build_args_on<'a>(
             .iter()
             .position(|s| matches!(s, Service::Network(c) if c.is_isolated())),
     ];
-    // One `--block-fd`, whichever grants asked for it: bwrap reads the fd
-    // once, and a second flag would leave the sandbox waiting for a pipe
-    // nothing closes. The portal grant is the one named where a config
-    // holds both, so an explanation of a portal sandbox reads as before.
+    // One `--block-fd`: bwrap reads it once, and a second would wait on a pipe nothing closes.
     if let Some(i) = waits.into_iter().flatten().next() {
         args.tag(Origin::Service(i));
         args.block_until_released();
@@ -683,10 +545,8 @@ fn build_args_on<'a>(
     Ok((args, command))
 }
 
-/// Load `set` into the sandbox as one filter, or say on stderr that this
-/// instance runs unfiltered. A profile asking for no filter is honoured,
-/// but never silently — and one whose `allow` list leaves nothing to deny
-/// asked for the same thing the long way round.
+// A profile asking for no filter, or whose `allow` list leaves nothing to deny, is honoured but
+// never silently.
 fn apply_seccomp(
     args: &mut BwrapArgs,
     set: Option<seccomp::RuleSet>,
@@ -705,9 +565,8 @@ fn apply_seccomp(
     Ok(())
 }
 
-/// Complete bwrap argv (without the program name) for the sidecar that
-/// creates one instance's PipeWire security context. `alloc` keeps the
-/// read end of the pipe the holder inside reports the socket's path on.
+/// Complete bwrap argv (without the program name) for the sidecar that creates one instance's
+/// PipeWire security context. `alloc` keeps the read end of the pipe the holder reports on.
 pub fn pw_context_argv(
     env: &Env,
     ctx: &pipewire::Context<'_>,
@@ -721,34 +580,27 @@ pub fn pw_context_argv(
         &pipewire::dir(ctx.instance_runtime),
         host,
     );
-    // The sidecar has no `seccomp` node of its own: an instance may relax
-    // its own filter, never the one around the process that holds its
-    // security context open.
+    // No instance `seccomp` node reaches here: an instance may relax its own filter, never the one
+    // around the process holding its security context.
     args.tag(Origin::Seccomp);
     if let Some(program) = seccomp::compile(&seccomp::RuleSet::default_set(), env.seccomp_log)? {
         args.add_seccomp(program.bytes, program.arches);
     }
     args.tag(Origin::Command);
-    // The supervisor binary a second time, under the name that selects
-    // its holder mode: `pw-container` runs one word, and the basename of
-    // that word is the whole of what chooses the mode.
+    // The supervisor binary again, under the name that selects its holder mode: `pw-container`
+    // runs one word, and that word's basename alone chooses the mode.
     args.ro_bind(&init, Path::new(pipewire::HOLDER_INSIDE));
-    // `pw-container` finds the session's daemon under this, and the
-    // holder finds the descriptor to report on under the other. Nothing
-    // else of the environment survives the baseline's `--clearenv`.
+    // `pw-container` finds the daemon under this and the holder its report fd under the next;
+    // nothing else survives the baseline's `--clearenv`.
     args.setenv(OsStr::new("XDG_RUNTIME_DIR"), env.runtime_dir.as_os_str());
     args.setenv(OsStr::new(pipewire::REPORT_FD), &report);
     let properties = pipewire::properties(ctx.instance, ctx.run_id, ctx.audio);
     args.finish_plain(&pipewire::command(&properties), alloc)
 }
 
-/// Complete bwrap argv (without the program name) for the sidecar that
-/// serves one instance's `pulseaudio` grant: a PulseAudio server of this
-/// run's own, connected to the run's security context.
-///
-/// It is given no readiness pipe. `pipewire` reports nothing on one, and
-/// what says the server is up is the socket appearing in the directory
-/// bubbler bound as its `/tmp`.
+/// Complete bwrap argv (without the program name) for the sidecar serving one instance's
+/// `pulseaudio` grant. It gets no readiness pipe: the socket appearing in the directory bound
+/// as its `/tmp` is what says the server is up.
 pub fn pw_pulse_argv(
     env: &Env,
     instance_runtime: &Path,
@@ -761,24 +613,20 @@ pub fn pw_pulse_argv(
         &pipewire::pulse_dir(instance_runtime),
         host,
     );
-    // No `seccomp` node of the instance's reaches this filter, for the
-    // reason it does not reach the context sidecar's: the process a
-    // grant is served through is not the process the grant is for.
+    // No instance `seccomp` node reaches here either: the process serving a grant is not the
+    // process the grant is for.
     args.tag(Origin::Seccomp);
     if let Some(program) = seccomp::compile(&seccomp::RuleSet::default_set(), env.seccomp_log)? {
         args.add_seccomp(program.bytes, program.arches);
     }
     args.tag(Origin::Command);
-    // The runtime directory is the bound `/tmp` and not the session's:
-    // this server writes its socket and its pid file under it, and the
-    // session's runtime directory is not in this sandbox at all.
+    // The bound `/tmp`: the session's runtime directory is not in this sandbox at all.
     args.setenv(OsStr::new("XDG_RUNTIME_DIR"), OsStr::new("/tmp"));
     args.setenv(
         OsStr::new("PIPEWIRE_REMOTE"),
         OsStr::new(pipewire::REMOTE_INSIDE),
     );
-    // Which replaces the whole config search path, so the copy bubbler
-    // wrote is the only configuration this server can read.
+    // Replaces the whole config search path, so bubbler's copy is all this server can read.
     args.setenv(
         OsStr::new("PIPEWIRE_CONFIG_DIR"),
         OsStr::new(pipewire::PULSE_CONFIG_INSIDE),
@@ -786,10 +634,9 @@ pub fn pw_pulse_argv(
     args.finish_plain(&pipewire::pulse_command(), alloc)
 }
 
-/// Complete bwrap argv (without the program name) for the D-Bus proxy
-/// sidecar of one instance. `buses` holds the host socket of each bus
-/// the plan grants, already type-checked; `alloc` keeps the read end of
-/// the pipe the proxy reports readiness on.
+/// Complete bwrap argv (without the program name) for an instance's D-Bus proxy sidecar.
+/// `buses` are the granted host bus sockets, already type-checked; `alloc` keeps the read end
+/// of the ready pipe.
 pub fn proxy_argv(
     env: &Env,
     plan: &dbus::Plan,
@@ -803,17 +650,9 @@ pub fn proxy_argv(
     args.finish_plain(&plain, alloc)
 }
 
-/// Every argument of the sidecar's argv with what produced it, or `None`
-/// when the instance grants no bus and so starts no proxy. The host bus
-/// socket is not probed here, as nothing is started: `--dry-run` builds
-/// the app's bus bind from a socket that does not exist yet either.
-///
-/// Each address is resolved the way a run would resolve it, since an
-/// argv without them is not the argv that would be run. For the
-/// accessibility bus that means reading `$AT_SPI_BUS_ADDRESS` and, when
-/// the session set none, asking `org.a11y.Bus` where its socket is —
-/// the one question this view asks anything. The sandbox's own argv
-/// asks nothing: it binds the socket the sidecar will serve.
+/// The D-Bus sidecar's argv with what produced each argument, or `None` where no bus is
+/// granted. Host sockets are not probed, but addresses are resolved as a run would, which for
+/// the accessibility bus may ask `org.a11y.Bus`.
 pub fn explain_proxy(env: &Env, inst: &Instance) -> Result<Option<Vec<Explained>>, LaunchError> {
     let Some(plan) = dbus::plan(&inst.config.services, &inst.name) else {
         return Ok(None);
@@ -850,9 +689,7 @@ pub fn explain_proxy(env: &Env, inst: &Instance) -> Result<Option<Vec<Explained>
     Ok(Some(args.finish_plain_explained(&command, &mut alloc)?))
 }
 
-/// The builder and the command behind [`proxy_argv`], each command
-/// element with the node that asked for it. `alloc` numbers the ready
-/// pipe first, which is where the sidecar's fd numbering starts.
+// `alloc` numbers the ready pipe first, which is where the sidecar's fd numbering starts.
 fn proxy_args(
     env: &Env,
     plan: &dbus::Plan,
@@ -864,8 +701,6 @@ fn proxy_args(
     let ready = alloc.ready_pipe().map_err(LaunchError::Data)?;
     let program = dbus::proxy_program(env);
     let command = dbus::proxy_command_nodes(&program, plan, buses, dir, env.dbus_log, &ready);
-    // A rule belongs to the node that asked for it; the proxy's own
-    // invocation is the command it is.
     let command: Vec<(OsString, Origin)> = command
         .into_iter()
         .map(|(arg, node)| (arg, node.map_or(Origin::Command, Origin::Service)))
@@ -877,18 +712,16 @@ fn proxy_args(
         &dbus::socket_dir(dir),
         host,
     );
-    // The sidecar has no `seccomp` node of its own: an instance may relax
-    // its own filter, never the one around the process holding its bus.
+    // An instance may relax its own filter, never the one around the process holding its bus.
     args.tag(Origin::Seccomp);
     if let Some(program) = seccomp::compile(&seccomp::RuleSet::default_set(), env.seccomp_log)? {
         args.add_seccomp(program.bytes, program.arches);
     }
-    // The proxy reads this to decide it is talking for a sandboxed app;
-    // without `portals` it is only the `[Application]` section.
+    // The proxy reads this to decide it talks for a sandboxed app; without `portals` it is only
+    // the `[Application]` section.
     args.tag(Origin::Identity);
     args.ro_bind_data(plan.flatpak_info.clone(), Path::new(dbus::FLATPAK_INFO));
-    // An overriding binary is not on the sandbox's `PATH`, so it is bound
-    // in at its own path; the packaged proxy needs no bind.
+    // An overriding binary is not on the sandbox's `PATH`; the packaged proxy needs no bind.
     if env.proxy_override.is_some() {
         args.tag(Origin::Command);
         let program = service::require_file(host, "dbus", program)?;
@@ -897,18 +730,14 @@ fn proxy_args(
     Ok((args, command))
 }
 
-/// Where a `wayland` grant sits in the config, which is what the
-/// sidecar's arguments are attributed to.
 fn wayland_node(services: &[Service]) -> Option<usize> {
     services
         .iter()
         .position(|s| matches!(s, Service::Wayland(_)))
 }
 
-/// Complete bwrap argv (without the program name) for the Wayland proxy
-/// sidecar of one instance. `plan` says which sockets it serves and
-/// connects to; `alloc` hands over the listening socket and keeps the
-/// read end of the pipe the proxy reports readiness on.
+/// Complete bwrap argv (without the program name) for an instance's Wayland proxy sidecar.
+/// `alloc` hands over the listening socket and keeps the read end of the ready pipe.
 pub fn wl_proxy_argv(
     env: &Env,
     plan: &ProxyPlan,
@@ -921,10 +750,8 @@ pub fn wl_proxy_argv(
     args.finish_plain(&plain, alloc)
 }
 
-/// Every argument of the Wayland sidecar's argv with what produced it,
-/// or `None` when the instance grants no sandboxed `wayland` and so
-/// starts no proxy. Nothing is probed and nothing is started: like the
-/// D-Bus proxy's, this is the argv a run would build, described.
+/// The Wayland sidecar's argv with what produced each argument, or `None` where no sandboxed
+/// `wayland` is granted. Nothing is probed or started.
 pub fn explain_wayland_proxy(
     env: &Env,
     inst: &Instance,
@@ -940,13 +767,9 @@ pub fn explain_wayland_proxy(
     Ok(Some(args.finish_plain_explained(&command, &mut alloc)?))
 }
 
-/// How an explanation describes the Wayland proxy of `inst`, or `None`
-/// where the instance grants no sandboxed `wayland`.
-///
-/// The compositor is not asked anything — `--dry-run` and `--explain`
-/// connect to nothing — so this is the run a compositor that implements
-/// `wp_security_context_manager_v1` gets. One that does not says so on
-/// stderr and has the proxy hide the privileged globals instead.
+/// The Wayland proxy plan an explanation of `inst` shows, or `None` without a sandboxed
+/// `wayland`. The compositor is not asked, so this is the plan for one that implements
+/// `wp_security_context_manager_v1`.
 pub fn wl_proxy_plan(env: &Env, inst: &Instance) -> Option<ProxyPlan> {
     match wayland_mode(&inst.config.services) {
         Some(WaylandMode::Sandboxed { clipboard }) => Some(ProxyPlan::context(
@@ -957,10 +780,8 @@ pub fn wl_proxy_plan(env: &Env, inst: &Instance) -> Option<ProxyPlan> {
     }
 }
 
-/// The builder and the command behind [`wl_proxy_argv`], each command
-/// element with the node that asked for it. `alloc` numbers the
-/// listening socket first and the ready pipe second, which is the order
-/// the proxy's own arguments name them in.
+// `alloc` numbers the listening socket, then the ready pipe: the order the proxy's arguments
+// name them in.
 fn wl_proxy_args(
     env: &Env,
     plan: &ProxyPlan,
@@ -977,18 +798,13 @@ fn wl_proxy_args(
         .map(|(arg, node)| (arg, node.map_or(Origin::Command, Origin::Service)))
         .collect();
     let mut args = BwrapArgs::wl_proxy_baseline(&plan.upstream, host);
-    // The sidecar has no `seccomp` node of its own: an instance may relax
-    // its own filter, never the one around the process holding its
-    // connection to the compositor.
+    // An instance may relax its own filter, never the one around its compositor connection.
     args.tag(Origin::Seccomp);
     if let Some(program) = seccomp::compile(&seccomp::RuleSet::default_set(), env.seccomp_log)? {
         args.add_seccomp(program.bytes, program.arches);
     }
-    // Where the binary was found is what says whether it is reachable
-    // from in here: the installed one is under the read-only `/usr` this
-    // sandbox already has, and bwrap would refuse a destination in there
-    // anyway. An override or a build tree's copy is bound in at its own
-    // path.
+    // The installed binary is under this sandbox's read-only `/usr`, where bwrap would refuse a
+    // destination anyway; an override or a build tree's copy is bound in at its own path.
     if found != init_bin::Found::Installed {
         args.tag(Origin::Command);
         args.ro_bind(&program, &program);
@@ -996,23 +812,15 @@ fn wl_proxy_args(
     Ok((args, command))
 }
 
-/// Where the `network` grant sits in the config, which is what the
-/// egress proxy's arguments are attributed to.
 fn network_node(services: &[Service]) -> Option<usize> {
     services
         .iter()
         .position(|s| matches!(s, Service::Network(_)))
 }
 
-/// Every argument of the egress proxy's argv with what produced it, or
-/// `None` when the instance names no `allow-host` and so starts no
-/// proxy.
-///
-/// Not a bwrap argv like the other two sidecars': the proxy runs in the
-/// sandbox's own namespaces, which bubbler puts it in directly, so what
-/// there is to describe is the program and the arguments it is given.
-/// Nothing is started and nothing is created — the descriptor it will
-/// report readiness on is named rather than numbered.
+/// The egress proxy's program and arguments with what produced each, or `None` where no
+/// `allow-host` is named. Not a bwrap argv: the proxy runs directly in the sandbox's
+/// namespaces. Nothing is started; the readiness descriptor is named, not numbered.
 pub fn explain_net_proxy(
     env: &Env,
     inst: &Instance,
@@ -1023,9 +831,8 @@ pub fn explain_net_proxy(
     ) else {
         return Ok(None);
     };
-    // Probed like the sandbox's own argv, which binds this very path: an
-    // explanation that named a binary the run could not find would
-    // describe a launch that fails.
+    // Probed like the sandbox's argv, which binds this path: an explanation naming a binary the
+    // run could not find would describe a launch that fails.
     let (program, _) = network::net_proxy_program(env, &RealHost)?;
     let mut items = vec![Explained {
         origin: Origin::Command,
@@ -1040,11 +847,8 @@ pub fn explain_net_proxy(
         },
         env.net_proxy_log,
     );
-    // One option and its value to a line, which is how the grammar
-    // reads and how the launcher builds it. The pairing holds because
-    // every option that takes a value comes first and the one bare word,
-    // `--log-tunnels`, is appended last: a flag added anywhere else
-    // would shift every line after it.
+    // One option and its value per line. Holds because every valued option comes first and the
+    // bare `--log-tunnels` is appended last.
     items.extend(argv.chunks(2).map(|pair| Explained {
         origin: Origin::Service(node),
         args: pair.to_vec(),
@@ -1053,27 +857,20 @@ pub fn explain_net_proxy(
     Ok(Some(items))
 }
 
-/// A running proxy sidecar. Dropping every end of its `--fd` pipe that
-/// bubbler holds is what makes `xdg-dbus-proxy` exit, so the handle must
-/// outlive the sandbox that uses the socket.
+/// A running D-Bus proxy sidecar. Dropping it closes the ready pipe, which is what makes
+/// `xdg-dbus-proxy` exit, so it must outlive the sandbox using the socket.
 #[derive(Debug)]
 pub struct ProxyHandle {
     child: Child,
-    /// Holds both ends of the ready pipe and the `/.flatpak-info` fd.
     alloc: RealAlloc,
-    /// The proxy's own directory, removed once it has exited.
     socket_dir: PathBuf,
-    /// Copies the proxy's stderr to bubbler's. Fields drop after `drop`
-    /// has reaped the proxy, so the copy can see the end of its output.
+    // Fields drop after `drop` has reaped the proxy, so the copy sees the end of its output.
     _stderr: run_log::Relay,
 }
 
 impl Drop for ProxyHandle {
-    /// Close the ready pipe so the proxy exits by itself, then reap it;
-    /// a proxy that ignores the closed pipe is killed instead of leaking.
-    // The proxy polls its own write end and leaves on `POLLHUP`, which
-    // needs the last *read* end gone: keeping ours would hold it alive
-    // until the kill below.
+    // The proxy leaves on `POLLHUP` of its write end, which needs our read end gone too; one that
+    // ignores it is killed.
     fn drop(&mut self) {
         self.alloc.fds.clear();
         self.alloc.ready_read.take();
@@ -1090,17 +887,13 @@ impl Drop for ProxyHandle {
             }
             std::thread::sleep(POLL);
         }
-        // The directory is bubbler's own and holds only what the proxy put
-        // there; the socket it served has been moved out of it already.
+        // Holds only what the proxy put there; the socket it served was moved out already.
         remove_sidecar_dir(&self.socket_dir);
     }
 }
 
-/// Wait for the sidecar's ready byte, which says it has bound its socket
-/// and is accepting connections. False when the deadline passes, the pipe
-/// reaches EOF or the child is gone: nothing is listening either way.
-/// [`LaunchError::Stopped`] once `stop` is set, the sidecar gone or not:
-/// a Ctrl-C reaches the sidecar's process group too, and kills it.
+// False on deadline, EOF or a gone child: nothing is listening either way. `Stopped` once
+// `stop` is set: a Ctrl-C reaches the sidecar's process group too.
 fn wait_ready(
     ready: &OwnedFd,
     child: &mut Child,
@@ -1141,49 +934,30 @@ fn wait_ready(
     Ok(is_ready)
 }
 
-/// Whether `child` is still a process of this run's, and so still one to
-/// signal.
-///
-/// A sidecar that has already been reaped — by the run's own check, or
-/// by a readiness wait giving up on it — is not: that pid names whatever
-/// the kernel has handed it to since, and a signal would go to a
-/// stranger. `try_wait` answers from the status it cached the first
-/// time, so a reaping anywhere in the run is caught here.
+// A reaped sidecar's pid may be a stranger's by now; `try_wait` answers from its cached status,
+// so a reaping anywhere in the run is caught here.
 fn still_running(child: &mut Child) -> bool {
     !matches!(child.try_wait(), Ok(Some(_)))
 }
 
-/// A run's Wayland sidecar: the proxy the application connects to, the
-/// socket it accepts on, and, where the compositor took one, the
-/// security context it forwards through.
-///
-/// Dropping the handle stops the proxy and ends the context — the
-/// compositor stops accepting when the write end of the close pipe hangs
-/// up — so it must outlive the sandbox connecting through the socket.
+/// A run's Wayland sidecar: the proxy, the socket it accepts on and, where the compositor took
+/// one, the security context. Dropping it stops the proxy and ends the context, so it must
+/// outlive the sandbox.
 #[derive(Debug)]
 pub struct WaylandHandle {
-    /// The proxy sidecar, in its own bwrap.
     child: Child,
-    /// Holds the proxy's listening socket and both ends of its ready
-    /// pipe; clearing it is what closes them.
     alloc: RealAlloc,
-    /// Write end of the pipe handed to the compositor as `close_fd`;
-    /// `None` where the compositor offers no security context.
+    // The compositor's `close_fd`; `None` where it offers no security context.
     _close: Option<OwnedFd>,
-    /// Removes the socket the application connects to when the run ends.
     _socket: FileGuard,
-    /// Removes the socket the compositor accepts on, where there is one.
     _context: Option<FileGuard>,
-    /// Copies the proxy's stderr to bubbler's. Fields drop after `drop`
-    /// has reaped the proxy, so the copy can see the end of its output.
+    // Fields drop after `drop` has reaped the proxy, so the copy sees the end of its output.
     _stderr: run_log::Relay,
 }
 
 impl Drop for WaylandHandle {
-    /// Stop the proxy: SIGTERM, then SIGKILL if it is still there. The
-    /// signal goes to bwrap, whose `--die-with-parent` takes the proxy
-    /// inside it down with it; nothing else can, since the proxy holds
-    /// no pipe of bubbler's it could see hang up.
+    // To bwrap, whose `--die-with-parent` takes the proxy down: the proxy holds no pipe of
+    // bubbler's whose hangup it could see.
     fn drop(&mut self) {
         if still_running(&mut self.child) {
             if let Some(pid) = i32::try_from(self.child.id()).ok().and_then(Pid::from_raw) {
@@ -1208,28 +982,9 @@ impl Drop for WaylandHandle {
     }
 }
 
-/// Bind the socket this run's application connects to and put
-/// `bubbler-wl-proxy` in front of it, so every message the application
-/// sends the compositor is decoded and judged before it is forwarded and
-/// a clipboard read has to follow input of the user's.
-///
-/// Where the compositor implements `wp_security_context_v1` the proxy
-/// forwards through a second socket registered as a security context for
-/// the instance, so the compositor withholds the privileged globals as
-/// well; where it does not, the proxy connects to the session's own
-/// socket and hides those globals itself. `Ok(None)` only for
-/// `wayland "host"`, which asks for the session's socket outright.
-///
-/// Called before the argv is built, like the D-Bus proxy: the socket has
-/// to be there for bwrap to bind. The handle must outlive the sandbox.
-///
-/// Nothing is connected to before the environment it would be connected
-/// through has been checked: wayrs reads `$WAYLAND_DISPLAY` and
-/// `$WAYLAND_SOCKET` itself, and both are untrusted host input.
-///
-/// Marks every descriptor of the calling process above stdio that this
-/// spawn is not meant to hand over close-on-exec, so an embedder's own
-/// open files do not cross into the sandbox; none is closed.
+/// Bind the socket this run's application connects to and start `bubbler-wl-proxy` behind it,
+/// through a security context where the compositor has one. `Ok(None)` only for `wayland
+/// "host"`. The handle must outlive the sandbox; other fds above stdio are made CLOEXEC.
 pub fn start_wayland(
     env: &Env,
     dir: &Path,
@@ -1243,12 +998,8 @@ pub fn start_wayland(
     ) else {
         return Ok(None);
     };
-    // The same check the bind makes, made before the connection rather
-    // than after it: a display name that is a path would otherwise pick
-    // the endpoint this run hands its listening socket to. Both values
-    // go through it: the bind takes the name from `env`, and wayrs reads
-    // the process environment itself, which nothing here can hand a
-    // string of its own.
+    // The bind's own check, made before connecting: a display name that is a path would pick the
+    // endpoint. wayrs reads the process environment itself, so both values go through it.
     let display = service::wayland_display(env)?;
     service::check_wayland_display(std::env::var_os("WAYLAND_DISPLAY").as_deref())?;
     wayland::refuse_inherited(std::env::var_os("WAYLAND_SOCKET").as_deref())?;
@@ -1259,19 +1010,13 @@ pub fn start_wayland(
                 "bubbler: note: wayland: no wp_security_context_manager_v1; \
                  the proxy hides the privileged globals instead"
             );
-            // The session's socket is bound into the proxy's sandbox, so
-            // it is type-checked like every other bind source.
-            // The probe follows symlinks, as the bind does and as
-            // `wayland "host"` always has: the name is one component
-            // under `$XDG_RUNTIME_DIR`, which is the user's own 0700
-            // directory, so whatever could plant a link there is already
-            // the user.
+            // Follows symlinks, as the bind does: the name is one component under the user's own
+            // 0700 `$XDG_RUNTIME_DIR`, so whatever could plant a link there is already the user.
             let session = service::require_socket(host, "wayland", env.runtime_dir.join(display))?;
             ProxyPlan::fallback(dir, session, clipboard)
         }
     };
-    // The compositor is accepting before the proxy can dial: the context
-    // is what makes the connection behind it a sandboxed client's.
+    // The context makes the connection behind it a sandboxed client's, so it precedes the dial.
     let (close, context) = match plan.context {
         true => {
             let (close, guard) = bind_context(dir, &inst.name)?;
@@ -1287,7 +1032,6 @@ pub fn start_wayland(
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     spawning(&alloc.intended())?;
     let (child, stderr) = spawn_sidecar(cmd)?;
-    // From here on every exit path stops the proxy through the handle.
     let mut handle = WaylandHandle {
         child,
         alloc,
@@ -1296,16 +1040,11 @@ pub fn start_wayland(
         _socket: socket,
         _context: context,
     };
-    // bubbler's own copy of the listening socket goes as soon as the
-    // proxy has it. Nothing of bubbler's may be able to accept on the
-    // sandbox's display socket, and a second holder would also keep the
-    // kernel queueing connections in the backlog after the sidecar had
-    // died — the application would wait on a socket nothing answers
-    // instead of being refused outright.
+    // Nothing of bubbler's may accept on the sandbox's display socket, and a second holder would
+    // keep connections queueing after the sidecar died instead of refusing them.
     handle.alloc.close_listener();
     handle.alloc.close_options();
-    // What is left is CLOEXEC again before the instance's own bwrap is
-    // spawned: the ready pipe belongs to this one spawn and no other.
+    // CLOEXEC again before the instance's own bwrap: the ready pipe belongs to this spawn only.
     handle.alloc.inheritable(false).map_err(LaunchError::Data)?;
     let WaylandHandle { child, alloc, .. } = &mut handle;
     let ready = alloc
@@ -1322,12 +1061,8 @@ pub fn start_wayland(
     Ok(Some(handle))
 }
 
-/// Bind and listen on `path`, removing a socket an earlier run was
-/// killed before its guard could.
-///
-/// Only a missing file is nothing to do: anything else here is this
-/// instance's own 0700 directory refusing, which the bind would not
-/// survive either.
+// Removes a socket left by a killed run; any error but a missing file is the instance's own
+// 0700 directory refusing, which the bind would not survive either.
 fn bind_listener(path: &Path) -> Result<UnixListener, LaunchError> {
     if let Err(e) = std::fs::remove_file(path)
         && e.kind() != io::ErrorKind::NotFound
@@ -1337,20 +1072,12 @@ fn bind_listener(path: &Path) -> Result<UnixListener, LaunchError> {
     UnixListener::bind(path).map_err(|e| WaylandError::Listen(path.to_path_buf(), e).into())
 }
 
-/// Bind the socket the compositor accepts on and register it as a
-/// security context for the instance, so a client arriving through it is
-/// a sandboxed one. The write end of the close pipe and the guard that
-/// removes the socket are the run's to hold: the context lasts exactly
-/// as long as they do.
+// The context lasts exactly as long as the returned close pipe end and socket guard.
 fn bind_context(dir: &Path, instance: &str) -> Result<(OwnedFd, FileGuard), LaunchError> {
     let path = wayland::context_socket_path(dir);
     let listener = bind_listener(&path)?;
-    // From here the socket is this run's to remove, however the handshake
-    // below goes.
     let guard = FileGuard(path);
-    // Close-on-exec on both ends: nothing but this process may hold the
-    // write end, or the compositor would keep accepting for as long as
-    // whatever inherited it lived.
+    // CLOEXEC on both ends: any other holder of the write end would keep the compositor accepting.
     let (close_read, close_write) =
         pipe_with(PipeFlags::CLOEXEC).map_err(|e| WaylandError::Pipe(e.into()))?;
     wayland::create_context(
@@ -1362,42 +1089,24 @@ fn bind_context(dir: &Path, instance: &str) -> Result<(OwnedFd, FileGuard), Laun
     Ok((close_write, guard))
 }
 
-/// A run's PipeWire security context: the sidecar that created it and
-/// the directory its socket lives in.
-///
-/// `pw-container` tears the context down when its program exits, so
-/// dropping this handle is what ends it, and it must outlive the sandbox
-/// that connects through the socket.
+/// A run's PipeWire security context and its sidecar. `pw-container` tears the context down when
+/// its program exits, so dropping this ends it; it must outlive the sandbox.
 #[derive(Debug)]
 pub struct PwHandle {
-    /// The sidecar sandbox: bwrap, `pw-container` in it, the holder in
-    /// that.
     child: Child,
-    /// Holds both ends of the pipe the holder reported on; clearing it
-    /// is what closes them.
     alloc: RealAlloc,
-    /// The instance's context directory, removed once the sidecar has
-    /// exited. `pw-container` unlinks the name it chose, which the
-    /// holder renamed away, so what is left there is bubbler's.
+    // `pw-container` unlinks the name it chose, which the holder renamed away, so what is left
+    // here is bubbler's.
     dir: PathBuf,
-    /// Removes the socket once it has been moved out of `dir`; `None`
-    /// until then, when whatever is in there goes with the directory.
+    // `None` until the socket is moved out of `dir`; until then it goes with the directory.
     _socket: Option<FileGuard>,
-    /// Copies the sidecar's stderr to bubbler's. Fields drop after `drop`
-    /// has reaped the sidecar, so the copy can see the end of its output.
+    // Fields drop after `drop` has reaped the sidecar, so the copy sees the end of its output.
     _stderr: run_log::Relay,
 }
 
 impl Drop for PwHandle {
-    /// Stop the sidecar: SIGTERM, then SIGKILL if it is still there.
-    ///
-    /// The signal goes to bwrap and not to `pw-container`: the sidecar
-    /// runs with `--new-session`, so it is in no process group of
-    /// bubbler's, and `pw-container` ignores SIGTERM until its own
-    /// program has exited (measured on 1.6.8). What ends it is bwrap
-    /// dying, which takes the pid namespace with it — bwrap's own
-    /// reaper is pid 1 there, `pw-container` its child (`man bwrap`,
-    /// `--as-pid-1`: unset for this sidecar).
+    // To bwrap, not `pw-container`, which ignores SIGTERM until its program exits (measured on
+    // 1.6.8); bwrap dying takes the pid namespace with it.
     fn drop(&mut self) {
         if still_running(&mut self.child) {
             if let Some(pid) = i32::try_from(self.child.id()).ok().and_then(Pid::from_raw) {
@@ -1419,23 +1128,14 @@ impl Drop for PwHandle {
         }
         self.alloc.fds.clear();
         self.alloc.ready_read.take();
-        // The directory is bubbler's own and holds nothing but the
-        // context socket; the sandbox that bound it has exited by now.
+        // Holds nothing but the context socket, and the sandbox that bound it has exited.
         remove_sidecar_dir(&self.dir);
     }
 }
 
-/// Create this run's PipeWire security context and wait for its socket,
-/// so the socket is there for bwrap to bind. `Ok(None)` where the
-/// instance grants no audio at all. The handle must outlive the sandbox.
-///
-/// Called before the argv is built, like the other sidecars: what the
-/// sandbox binds is what this creates, and a bind whose source is not
-/// there is a failed start rather than a sandbox without audio.
-///
-/// Marks every descriptor of the calling process above stdio that this
-/// spawn is not meant to hand over close-on-exec, so an embedder's own
-/// open files do not cross into the sidecar; none is closed.
+/// Create this run's PipeWire security context and wait for its socket, which bwrap then binds.
+/// `Ok(None)` where no audio is granted. The handle must outlive the sandbox; other fds above
+/// stdio are made CLOEXEC.
 pub fn start_pw_context(
     env: &Env,
     dir: &Path,
@@ -1446,16 +1146,11 @@ pub fn start_pw_context(
     let Some(audio) = inst.config.audio() else {
         return Ok(None);
     };
-    // Before anything is started, and not only where the sandbox's argv
-    // is built (`service::audio_context`, which is what a `--dry-run`
-    // fails on): a run reaches that point after this sidecar is up, so
-    // without this the missing tool would surface as a sidecar that
-    // never reported its socket.
+    // Checked before anything starts: otherwise a missing tool surfaces as a sidecar that never
+    // reported its socket.
     service::require_file(host, "pipewire", PathBuf::from(pipewire::PW_CONTAINER))?;
-    // The session's own daemon, which nothing but this sidecar reaches.
-    // Probed here and not where the sandbox's argv is built: that argv
-    // names only the context's socket, and an explanation of it describes
-    // a run on a host whose daemon may not be up yet.
+    // Probed here, not with the sandbox's argv: that names only the context's socket, and its
+    // explanation describes a host whose daemon may not be up yet.
     service::require_socket(host, "pipewire", pipewire::host_socket(&env.runtime_dir))?;
     // The sidecar's whole `/tmp`, and the only thing it can write.
     let pw = pipewire::dir(dir);
@@ -1475,7 +1170,6 @@ pub fn start_pw_context(
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     spawning(&alloc.intended())?;
     let (child, stderr) = spawn_sidecar(cmd)?;
-    // From here on every exit path stops the sidecar through the handle.
     let mut handle = PwHandle {
         child,
         alloc,
@@ -1484,17 +1178,15 @@ pub fn start_pw_context(
         _socket: None,
     };
     handle.alloc.close_options();
-    // The instance's own bwrap must not inherit these: a second holder
-    // of the report pipe would keep bubbler from seeing it hang up.
+    // A second holder of the report pipe would keep bubbler from seeing it hang up.
     handle.alloc.inheritable(false).map_err(LaunchError::Data)?;
     let PwHandle { child, alloc, .. } = &mut handle;
     let ready = alloc
         .ready_read
         .as_ref()
         .ok_or_else(|| LaunchError::Data(io::Error::other("no report pipe was allocated")))?;
-    // The holder reports the name it renamed the socket to as its own
-    // sandbox sees it — that sandbox's `/tmp` is this directory — so the
-    // one answer bubbler takes is the name it planned for.
+    // The holder reports the name as its own sandbox sees it (that `/tmp` is this directory), so
+    // the only answer taken is the planned name.
     if read_report(ready, child, Instant::now() + PW_READY, stop)?.as_deref()
         != Some(pipewire::SOCKET_INSIDE)
     {
@@ -1516,14 +1208,8 @@ pub fn start_pw_context(
     Ok(Some(handle))
 }
 
-/// The line the holder reports the context socket on, without its
-/// newline, or `None` when the deadline passes, the pipe reaches EOF or
-/// the sidecar is gone; [`LaunchError::Stopped`] once `stop` is set, the
-/// sidecar gone or not, as [`wait_ready`].
-///
-/// A byte at a time: the line is one short path, and the descriptor stays
-/// open afterwards, so a longer read would block on a pipe with nothing
-/// more coming.
+// A byte at a time: the descriptor stays open afterwards, so a longer read would block on a
+// pipe with nothing more coming.
 fn read_report(
     ready: &OwnedFd,
     child: &mut Child,
@@ -1569,21 +1255,8 @@ fn read_report(
     Ok(report)
 }
 
-/// Move the socket a sidecar made (`from`: its directory and the name it
-/// made it under) out of the one directory that sidecar can write, into
-/// `to`, then prove that what was moved is a socket of this user's. The
-/// returned guard removes it when the run ends.
-///
-/// The sidecar keeps serving after the move: it listens on the socket it
-/// bound, not on the path, and the sandbox connects through the new one.
-// The move comes first and the check second, as [`adopt_proxy_bus`]'s
-// does: the reverse leaves a window in which a sidecar that keeps
-// swapping the name can put a symlink in the place of the socket that
-// was just checked, and bwrap resolves a bind source through links.
-// Nothing outside the instance directory can touch the entry once it is
-// here, so its type cannot change after this. `O_NOFOLLOW` then makes a
-// symlink fail with ELOOP instead of being followed, since `stat`
-// through a path would report the type of the target.
+// Move first, check second: the reverse lets a sidecar swap a symlink in after the check, and
+// bwrap resolves bind sources through links. Once moved, only bubbler can touch the entry.
 fn adopt_socket(
     service: &'static str,
     from: (&Path, &str),
@@ -1639,34 +1312,21 @@ fn adopt_socket(
     Ok(guard)
 }
 
-/// A run's private PulseAudio server: the sidecar it runs in, the
-/// directory it writes and the socket bubbler moved out of it.
-///
-/// Dropping the handle stops it, so it must outlive the sandbox that
-/// connects through its socket — and it is dropped before [`PwHandle`],
-/// since this server is a client of that context.
+/// A run's private PulseAudio server sidecar. Dropping it stops the server, so it must outlive
+/// the sandbox, and it drops before [`PwHandle`], whose context it is a client of.
 #[derive(Debug)]
 pub struct PulseHandle {
-    /// The sidecar sandbox: bwrap, `pipewire` in it.
     child: Child,
-    /// Holds the descriptors that spawn inherited; clearing it is what
-    /// closes them.
     alloc: RealAlloc,
-    /// The server's own directory, removed once it has exited: its
-    /// configuration, the socket it made and the pid file beside it.
     dir: PathBuf,
-    /// Removes the socket once it has been moved out of `dir`; `None`
-    /// until then, when what is in there goes with the directory.
+    // `None` until the socket is moved out of `dir`; until then it goes with the directory.
     _socket: Option<FileGuard>,
-    /// Copies the server's stderr to bubbler's. Fields drop after `drop`
-    /// has reaped the server, so the copy can see the end of its output.
+    // Fields drop after `drop` has reaped the server, so the copy sees the end of its output.
     _stderr: run_log::Relay,
 }
 
 impl Drop for PulseHandle {
-    /// Stop the server: SIGTERM, then SIGKILL if it is still there. The
-    /// signal goes to bwrap, whose `--die-with-parent` takes the server
-    /// inside it down with it.
+    // To bwrap, whose `--die-with-parent` takes the server down with it.
     fn drop(&mut self) {
         if still_running(&mut self.child) {
             if let Some(pid) = i32::try_from(self.child.id()).ok().and_then(Pid::from_raw) {
@@ -1687,24 +1347,14 @@ impl Drop for PulseHandle {
             }
         }
         self.alloc.fds.clear();
-        // The directory is bubbler's own and holds nothing but this
-        // server's; the sandbox that bound its socket has exited by now.
+        // Holds only this server's files, and the sandbox that bound its socket has exited.
         remove_sidecar_dir(&self.dir);
     }
 }
 
-/// Start this run's private PulseAudio server and wait for its socket,
-/// so the socket is there for bwrap to bind. `Ok(None)` where the
-/// instance grants no `pulseaudio`. The handle must outlive the sandbox.
-///
-/// Called after [`start_pw_context`], whose socket this server connects
-/// to, and before the argv is built, like every other sidecar: a bind
-/// whose source is not there is a failed start rather than a sandbox
-/// without audio.
-///
-/// Marks every descriptor of the calling process above stdio that this
-/// spawn is not meant to hand over close-on-exec, so an embedder's own
-/// open files do not cross into the sidecar; none is closed.
+/// Start this run's private PulseAudio server, a client of [`start_pw_context`]'s context, and
+/// wait for its socket. `Ok(None)` without `pulseaudio`. The handle must outlive the sandbox;
+/// other fds above stdio are made CLOEXEC.
 pub fn start_pw_pulse(
     env: &Env,
     dir: &Path,
@@ -1720,10 +1370,8 @@ pub fn start_pw_pulse(
     {
         return Ok(None);
     }
-    // Before the configuration is written and the server started, for
-    // the reason the context sidecar's tool is: without it this server
-    // comes up with no protocol to serve, and the run would fail on the
-    // readiness deadline rather than on the package that is missing.
+    // Checked first: without the module the server serves no protocol, and the run would fail on
+    // the readiness deadline instead of naming the missing package.
     service::require_file(host, "pulseaudio", PathBuf::from(pipewire::PULSE_MODULE))?;
     prepare_pulse_dir(env, host, dir)?;
     let pw = pipewire::pulse_dir(dir);
@@ -1735,7 +1383,6 @@ pub fn start_pw_pulse(
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     spawning(&alloc.intended())?;
     let (child, stderr) = spawn_sidecar(cmd)?;
-    // From here on every exit path stops the sidecar through the handle.
     let mut handle = PulseHandle {
         child,
         alloc,
@@ -1774,31 +1421,19 @@ pub fn start_pw_pulse(
     Ok(Some(handle))
 }
 
-/// Make the private pulse server's directory and write what it reads
-/// there, before the server is started.
 fn prepare_pulse_dir(env: &Env, host: &dyn Host, dir: &Path) -> Result<(), LaunchError> {
-    // The sidecar's whole `/tmp`, and the only thing it can write; made
-    // afresh, so nothing a dead run left there is taken for the new
-    // server's socket (readiness is `native` appearing) or written through.
+    // Made afresh, so nothing a dead run left is taken for the new server's socket or written
+    // through.
     fresh_sidecar_dir(&pipewire::pulse_dir(dir))?;
-    // The server binds the address it is given and creates no directory
-    // for it (measured on 1.6.8: "bind() to '/tmp/pulse/native' failed:
-    // No such file or directory"), so this is bubbler's to make.
+    // The server creates no directory for its address (measured on 1.6.8: "bind() to
+    // '/tmp/pulse/native' failed: No such file or directory").
     mkdir_private(&pipewire::pulse_socket_dir(dir))?;
     write_pulse_config(env, host, dir)?;
     Ok(())
 }
 
-/// Write the configuration of this run's private PulseAudio server into
-/// the sidecar's own directory and return the directory its
-/// `PIPEWIRE_CONFIG_DIR` names.
-///
-/// The host's effective `pipewire-pulse.conf` is copied rather than
-/// pointed at: `PIPEWIRE_CONFIG_DIR` replaces the search path whole and
-/// has no fallback for the main file. Only that file is copied — the
-/// user's own fragments beside it are left where they are, since one of
-/// them setting `server.address` would decide which socket this run
-/// serves and where it lands.
+// The host's main file is copied, not pointed at: `PIPEWIRE_CONFIG_DIR` replaces the search
+// path whole with no fallback for it. The user's fragments are not copied.
 fn write_pulse_config(env: &Env, host: &dyn Host, dir: &Path) -> Result<PathBuf, LaunchError> {
     let dirs = pipewire::pulse_conf_dirs(&env.config_home);
     let source = pipewire::pulse_conf(host, &env.config_home).ok_or_else(|| {
@@ -1822,11 +1457,8 @@ fn write_pulse_config(env: &Env, host: &dyn Host, dir: &Path) -> Result<PathBuf,
     Ok(cfg)
 }
 
-/// Write `content` to `path`, readable and writable by this user alone.
-///
-/// `O_NOFOLLOW` so a link cannot move the write out of the runtime
-/// directory, and the mode is set rather than left to the umask or to
-/// what an earlier run gave the file.
+// `O_NOFOLLOW` keeps the write in the runtime directory; the mode is set, not left to the
+// umask or to an earlier run.
 fn write_private(path: &Path, content: &[u8]) -> Result<(), LaunchError> {
     let io_at = |e: Errno| LaunchError::Io(path.to_path_buf(), e.into());
     let file = rustix::fs::open(
@@ -1841,13 +1473,8 @@ fn write_private(path: &Path, content: &[u8]) -> Result<(), LaunchError> {
         .map_err(|e| LaunchError::Io(path.to_path_buf(), e))
 }
 
-/// Start the filtering D-Bus proxy for an instance in its own sandbox and
-/// wait for it to report readiness, so the socket exists before the
-/// instance's own bwrap binds it. The handle must outlive the sandbox.
-///
-/// Marks every descriptor of the calling process above stdio that this
-/// spawn is not meant to hand over close-on-exec, so an embedder's own
-/// open files do not cross into the sandbox; none is closed.
+/// Start an instance's filtering D-Bus proxy in its own sandbox and wait until its socket
+/// exists. The handle must outlive the sandbox; other fds above stdio are made CLOEXEC.
 pub fn start_proxy(
     env: &Env,
     dir: &Path,
@@ -1873,10 +1500,8 @@ pub fn start_proxy(
             service::require_socket(host, dbus::SYSTEM_NODE, path)
         })
         .transpose()?;
-    // Resolved before the proxy starts, like the other two: the address
-    // is what the session says its accessibility bus is, and asking for
-    // it after the sandbox is up would be asking on behalf of a bus that
-    // is already meant to be serving.
+    // Resolved before the proxy starts: asking after the sandbox is up would be asking for a bus
+    // already meant to be serving.
     let a11y_bus = plan
         .a11y
         .as_ref()
@@ -1885,9 +1510,8 @@ pub fn start_proxy(
             service::require_socket(host, dbus::A11Y_NODE, path)
         })
         .transpose()?;
-    // After the bus guards, so a refused bus address is reported before a
-    // missing package; before the spawn, so a missing binary is not bwrap's
-    // own execvp line after the full PROXY_READY wait.
+    // After the bus guards, so a refused address is reported before a missing package; before the
+    // spawn, so a missing binary is not bwrap's execvp line after the full PROXY_READY wait.
     let program = dbus::proxy_program(env);
     let found = if program.components().count() > 1 {
         rustix::fs::access(&program, Access::EXEC_OK).is_ok()
@@ -1924,7 +1548,6 @@ pub fn start_proxy(
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     spawning(&alloc.intended())?;
     let (child, stderr) = spawn_sidecar(cmd)?;
-    // From here on every exit path stops the proxy through the handle.
     let mut handle = ProxyHandle {
         child,
         alloc,
@@ -1946,14 +1569,8 @@ pub fn start_proxy(
     Ok(handle)
 }
 
-/// Stop a sandbox that must not run after all, before the pipe it waits
-/// on is closed by the failing run unwinding.
-///
-/// The sandbox process is killed by pid and not only through bwrap:
-/// killing bwrap leaves its child where it is, and closing the block pipe
-/// on the way out would then let it exec. It is pid 1 of its own pid
-/// namespace and ignores signals it has no handler for, but SIGKILL from
-/// an ancestor namespace is not among those (`pid_namespaces(7)`).
+// By pid, not only through bwrap: killing bwrap leaves its child, which the closing block pipe
+// would let exec. SIGKILL from an ancestor namespace reaches a pid 1 (`pid_namespaces(7)`).
 fn abort_sandbox(child: &mut Child, sandbox: Option<i32>) {
     if let Some(pid) = sandbox.and_then(Pid::from_raw) {
         let _ = kill_process(pid, Signal::KILL);
@@ -1962,29 +1579,19 @@ fn abort_sandbox(child: &mut Child, sandbox: Option<i32>) {
     let _ = child.wait();
 }
 
-/// A running pasta sidecar: the sandbox's network namespace is connected
-/// to the outside for exactly as long as this handle is alive.
+// The sandbox's namespace is connected to the outside exactly as long as this lives.
 #[derive(Debug)]
 struct PastaHandle {
     child: Child,
-    /// Set once the run has reaped the sidecar, which is both what makes
-    /// the notice below appear once and what stops the pid from being
-    /// signalled after it has stopped being pasta's.
+    // Also stops the pid being signalled once it is no longer pasta's.
     exited: bool,
-    /// Copies pasta's stderr to bubbler's. Fields drop after `drop` has
-    /// reaped it, so the copy can see the end of its output.
+    // Fields drop after `drop` has reaped pasta, so the copy sees the end of its output.
     _stderr: run_log::Relay,
 }
 
 impl PastaHandle {
-    /// Say, once, that the sidecar is gone. The sandbox keeps running:
-    /// its namespace is simply no longer connected to anything, and
-    /// killing an application over a lost network would lose whatever it
-    /// has not written out.
-    // Through the relay's own warning channel and not `eprintln!`: this
-    // runs inside the loop that answers the exit check and the signals,
-    // and one blocking write to a terminal that has stopped reading
-    // would park that loop for good.
+    // The sandbox keeps running, unconnected. The relay's warning channel, not `eprintln!`: one
+    // blocking terminal write would park the loop answering the exit check and the signals.
     fn check(&mut self, warn: &tty::Warn) {
         if self.exited {
             return;
@@ -2000,14 +1607,10 @@ impl PastaHandle {
 }
 
 impl Drop for PastaHandle {
-    /// Stop pasta, and do not return until it is gone. pasta exits by
-    /// itself when the namespace it serves does (`pasta(1)`, and bubbler
-    /// does not pass `--no-netns-quit`), but a sidecar with a route out of
-    /// the host must not be left to a condition bubbler does not control.
+    // pasta quits with its namespace (`pasta(1)`; no `--no-netns-quit`), but a sidecar with a
+    // route out is not left to a condition bubbler does not control.
     fn drop(&mut self) {
-        // A sidecar the run has already reaped is not signalled
-        // ([`still_running`]); `exited` is the run's own check having
-        // seen it go.
+        // `exited` is the run's own check having seen it go.
         if self.exited || !still_running(&mut self.child) {
             return;
         }
@@ -2030,14 +1633,8 @@ impl Drop for PastaHandle {
     }
 }
 
-/// Whether the namespace `held` names is the one at `path`.
-///
-/// Compared by the identity of the nsfs file — device and inode — which
-/// is what `namespaces(7)` gives as the test for two processes being in
-/// the same namespace. Asked of the descriptor the run already holds
-/// rather than of `/proc/<pid>/ns/net` a second time: resolving that path
-/// again can land on a namespace the descriptor never named, which is the
-/// pid reuse this check exists to catch.
+// Compared by nsfs device and inode (`namespaces(7)`), on the descriptor already held:
+// resolving `/proc/<pid>/ns/net` again could land on a reused pid's namespace.
 fn same_namespace(held: BorrowedFd<'_>, path: &Path) -> Result<bool, LaunchError> {
     let theirs =
         rustix::fs::stat(path).map_err(|e| LaunchError::Io(path.to_path_buf(), e.into()))?;
@@ -2045,15 +1642,12 @@ fn same_namespace(held: BorrowedFd<'_>, path: &Path) -> Result<bool, LaunchError
     Ok((ours.st_dev, ours.st_ino) == (theirs.st_dev, theirs.st_ino))
 }
 
-/// `NS_GET_USERNS` as `linux/nsfs.h` defines it, `_IO(0xb7, 0x1)`: it
-/// answers with a descriptor for the user namespace that owns the
-/// namespace its argument descriptor names (`ioctl_ns(2)`).
+// `_IO(0xb7, 0x1)` from `linux/nsfs.h`: returns a descriptor for the owning user namespace
+// (`ioctl_ns(2)`).
 const NS_GET_USERNS: Opcode = ioctl::opcode::none(0xb7, 0x1);
 
-/// The `NS_GET_USERNS` call. Neither `NoArg` nor `Getter` describes it:
-/// it takes no argument and answers with an open descriptor as its
-/// return value, which `NoArg` throws away and `Getter` would read out
-/// of a buffer the kernel never writes into.
+// Neither `NoArg` nor `Getter` fits: the descriptor is the return value, which `NoArg` drops
+// and `Getter` would read from a buffer the kernel never writes.
 struct NsGetUserns;
 
 // SAFETY: `NS_GET_USERNS` takes no argument and writes nothing into
@@ -2084,47 +1678,26 @@ unsafe impl ioctl::Ioctl for NsGetUserns {
     }
 }
 
-/// The user namespace that owns the network namespace `netns` names.
-///
-/// Asked of the namespace rather than of a pid: bwrap moves the sandbox
-/// into a nested user namespace shortly after reporting `child-pid`, so
-/// `/proc/<pid>/ns/user` names whichever namespace the process is in by
-/// the time the path is resolved, while the user namespace that owns a
-/// network namespace is fixed when the namespace is created
-/// (`ioctl_ns(2)`, `namespaces(7)`).
+// Asked of the netns, not a pid: bwrap moves the sandbox into a nested user namespace after
+// reporting `child-pid`, while a netns's owner is fixed at creation (`ioctl_ns(2)`).
 fn owning_userns(netns: BorrowedFd<'_>) -> rustix::io::Result<OwnedFd> {
     // SAFETY: `NsGetUserns` describes what `NS_GET_USERNS` does, and it
     // is made on a descriptor of an nsfs file, which is what `netns` is.
     unsafe { ioctl::ioctl(netns, NsGetUserns) }
 }
 
-/// The sandbox's network namespace, and the user namespace that owns it.
-/// Both are needed twice — once to install the outbound ruleset, once to
-/// hand pasta the namespace it configures — and both must stay open
-/// across those spawns, so they are opened once and passed around.
+// Held open across the ruleset and pasta spawns, so the pid cannot be reused under them.
 struct SandboxNs {
-    /// `/proc/<child-pid>/ns/net`, held open so the pid cannot be reused
-    /// out from under the two spawns that follow.
     net: OwnedFd,
-    /// The user namespace that owns [`SandboxNs::net`], which is where a
-    /// process holds the capabilities to configure it.
+    // Where a process holds the capabilities to configure `net`.
     user: OwnedFd,
-    /// `/proc/<child-pid>/ns/mnt`, which the egress proxy joins as well:
-    /// it resolves names through the sandbox's own `/etc/resolv.conf`
-    /// and sees the sandbox's filesystem and no more of the host's.
-    /// Owned by the same user namespace as [`SandboxNs::net`], so the
-    /// join costs no further capability.
+    // Joined by the egress proxy, so it resolves through the sandbox's `resolv.conf` and sees only
+    // its filesystem; owned like `net`, so the join costs no further capability.
     mnt: OwnedFd,
 }
 
-/// Open the sandbox's network namespace and the user namespace that owns
-/// it, refusing a pid that is no longer a sandbox of bubbler's.
-///
-/// The pid comes from bwrap's info document, and a sandbox that died in
-/// the meantime leaves it to be handed out again: `nft` and pasta both
-/// act on the network namespace of whatever holds the pid *now*, so a
-/// pid that is not in a namespace of its own is not the sandbox, and
-/// acting on it would mean acting on the host's own network.
+// The pid may have been reused since bwrap reported it: one not in a namespace of its own is
+// not the sandbox, and `nft` and pasta would act on the host's network.
 fn sandbox_namespaces(child_pid: i32) -> Result<SandboxNs, LaunchError> {
     let net_path = PathBuf::from(format!("/proc/{child_pid}/ns/net"));
     let net = rustix::fs::open(&net_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
@@ -2138,10 +1711,8 @@ fn sandbox_namespaces(child_pid: i32) -> Result<SandboxNs, LaunchError> {
     let mnt_path = PathBuf::from(format!("/proc/{child_pid}/ns/mnt"));
     let mnt = rustix::fs::open(&mnt_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
         .map_err(|e| LaunchError::Io(mnt_path, e.into()))?;
-    // Checked on its own descriptor and not left to the check above: a
-    // pid reused in the window between the two `open`s would give a
-    // mount namespace of a stranger's while the network namespace is
-    // still the sandbox's, and the proxy would be joined to both.
+    // Its own check: a pid reused between the two `open`s would join the proxy to a stranger's
+    // mount namespace and the sandbox's network namespace.
     if same_namespace(mnt.as_fd(), Path::new("/proc/self/ns/mnt"))? {
         return Err(LaunchError::Network(
             "sandbox pid reused; refusing to join the host mount namespace".to_owned(),
@@ -2150,27 +1721,8 @@ fn sandbox_namespaces(child_pid: i32) -> Result<SandboxNs, LaunchError> {
     Ok(SandboxNs { net, user, mnt })
 }
 
-/// Install the `outbound "deny"` ruleset in the sandbox's own network
-/// namespace, or do nothing where the config filters nothing.
-///
-/// Runs before pasta and before the sandbox is let go of its
-/// `--block-fd`, so the namespace has a policy before it has a route and
-/// the application has not run an instruction either way. A failure here
-/// stops the run: a sandbox that asked to be filtered and was not would
-/// be a sandbox with a wider network than its config says.
-///
-/// `nft` is spawned rather than linked: the alternatives pull in either
-/// `libnftnl` or `bindgen` for a text format that is stable and one
-/// process away. It is handed the ruleset on stdin, and the ruleset is
-/// built from typed values in [`network::ruleset`] — a user string
-/// reaching this argv would be command injection into a process holding
-/// `CAP_NET_ADMIN` over the sandbox's namespaces.
-///
-/// `cgroup` is the one this run's egress proxy will join, and it must
-/// already exist: the rule carries a path but the kernel stores the id
-/// it resolves to, so a cgroup made after this would be matched by
-/// nothing. A config with an `allow-host` and no cgroup is refused
-/// below rather than filtered less than it asked for.
+// Before pasta and the release, and fatal when it fails. `cgroup` must exist already:
+// nftables stores the id the path resolves to, so a later cgroup would match nothing.
 fn install_rules(
     cfg: &NetworkConfig,
     ns: &SandboxNs,
@@ -2178,10 +1730,8 @@ fn install_rules(
     stop: &AtomicBool,
 ) -> Result<(), LaunchError> {
     let Some(text) = network::ruleset(cfg, cgroup) else {
-        // Nothing to install where nothing is filtered — and nothing
-        // either where the ruleset could not be written, which is a run
-        // that asked to be filtered and would have had the whole
-        // network.
+        // Nothing to install where nothing is filtered; a filtered run whose ruleset could not be
+        // written must not get the whole network.
         if cfg.outbound == network::Outbound::Deny && cfg.is_isolated() {
             return Err(LaunchError::BadValue {
                 service: "network",
@@ -2209,18 +1759,8 @@ fn install_rules(
     // table and the parent holds `ns` open across the spawn, so
     // `borrow_raw` borrows descriptors nothing has closed.
     //
-    // What the exec'd `nft` ends up holding, and why each step is
-    // needed. The user namespace is entered first: entering the network
-    // namespace takes the capabilities the user namespace grants
-    // (`setns(2)`). Capabilities do not survive `execve`, so
-    // CAP_NET_ADMIN goes into the inheritable and then the ambient set,
-    // which is what carries it across (`capabilities(7)`); without it
-    // the exec would depend on what the owning user namespace happens to
-    // map this uid to. `SECBIT_NOROOT` then stops the kernel from
-    // handing a uid-0 exec the full set on top of that — bwrap's own
-    // nested user namespace maps bubbler to 0 — and `_LOCKED` keeps the
-    // child from undoing it. `nft` therefore runs with CAP_NET_ADMIN in
-    // the sandbox's user namespace and no other capability anywhere.
+    // User namespace first: entering the netns takes the capabilities it grants (`setns(2)`).
+    // Ambient CAP_NET_ADMIN and a locked `SECBIT_NOROOT` leave `nft` that one capability.
     unsafe {
         cmd.pre_exec(move || {
             let user = BorrowedFd::borrow_raw(user);
@@ -2241,10 +1781,8 @@ fn install_rules(
     // the ruleset arrives on a pipe this spawn makes for itself.
     spawning(&[])?;
     let mut child = cmd.spawn().map_err(|e| match e.kind() {
-        // Only a `nft` that is really missing gets the message naming the
-        // package. A `pre_exec` closure that failed comes back as a spawn
-        // failure too, and telling somebody to install what they already
-        // have would cost them the actual reason.
+        // Only a really missing `nft` names the package: a failed `pre_exec` is a spawn failure
+        // too.
         io::ErrorKind::NotFound if on_path(network::NFT_BIN).is_none() => LaunchError::BadValue {
             service: "network",
             reason: format!(
@@ -2260,13 +1798,8 @@ fn install_rules(
         .take()
         .expect("stdin is piped, so the child always has one");
     let written = stdin.write_all(text.as_bytes());
-    // Closed before the wait, or `nft` would sit on a read that never
-    // ends and the wait below would spend its whole deadline. The write
-    // itself is not on a deadline: it is bounded by the pipe buffer, and
-    // a ruleset larger than that with an `nft` that reads none of it
-    // leaves bubbler waiting — with the sandbox still held at its
-    // `--block-fd`, so a hang here is a run that never starts rather than
-    // one that starts unfiltered.
+    // Closed before the wait, or `nft` reads forever. The write has no deadline: a hang there
+    // leaves the sandbox held at `--block-fd`, never started rather than unfiltered.
     drop(stdin);
     let deadline = Instant::now() + NFT_TIMEOUT;
     let status = loop {
@@ -2306,16 +1839,8 @@ fn install_rules(
     Ok(())
 }
 
-/// `bwrap`, found on bubbler's own `PATH`, to be started with an empty
-/// environment: it stays pid 1 inside the sandbox, where its environ is
-/// readable, and `--clearenv` cleans only what it starts
-/// (https://github.com/containers/bubblewrap/issues/725).
-///
-/// Its command line is readable there too, so `argv`'s options reach it
-/// through `--args` from a descriptor `alloc` holds until the spawn has
-/// happened ([`RealAlloc::close_options`]). The `--` and the command stay
-/// on the command line: bwrap drops a command it finds in an `--args`
-/// file. Call before the spawn window opens, so the descriptor is in it.
+// The `--` and the command stay on argv: bwrap drops a command it finds in an `--args` file.
+// Call before the spawn window opens, so the options descriptor is in it.
 fn bwrap_command(argv: &Argv, alloc: &mut RealAlloc) -> Result<Command, LaunchError> {
     let bwrap = on_path("bwrap").ok_or(LaunchError::BwrapMissing)?;
     let options = alloc.options(argv.options()).map_err(LaunchError::Data)?;
@@ -2327,9 +1852,8 @@ fn bwrap_command(argv: &Argv, alloc: &mut RealAlloc) -> Result<Command, LaunchEr
     Ok(cmd)
 }
 
-/// Spawn a sidecar's bwrap with `/dev/null` for stdin and stdout and a
-/// [`run_log::relay`] for stderr: a sidecar parses what the sandbox sends
-/// it, so it holds none of the caller's stdio and no terminal.
+// A sidecar parses what the sandbox sends it, so it holds none of the caller's stdio and no
+// terminal.
 fn spawn_sidecar(mut cmd: Command) -> Result<(Child, run_log::Relay), LaunchError> {
     let (stderr, relay) = run_log::relay()?;
     cmd.stdin(Stdio::null())
@@ -2346,18 +1870,11 @@ fn spawn_sidecar(mut cmd: Command) -> Result<(Child, run_log::Relay), LaunchErro
     Ok((child, relay))
 }
 
-/// Where a spawn looks with `PATH` unset: the directories execvp falls
-/// back on, which `Command` would have used on a program named without a
-/// directory.
+// execvp's fallback with `PATH` unset.
 const DEFAULT_PATH: &str = "/usr/bin:/bin";
 
-/// Where `bin` is found on `$PATH`, if anywhere.
-///
-/// The library reads the environment here for two things only: `bwrap`
-/// itself, which is started with none, and an error message, where a
-/// failed spawn has to tell a package that is not installed from a
-/// failure of bubbler's own, the two arriving as the same `NotFound`.
-/// With `PATH` unset it searches [`DEFAULT_PATH`], as a spawn would.
+// The library reads the environment only here: for `bwrap`, which starts with none, and to
+// tell a missing package from bubbler's own `NotFound` in an error message.
 fn on_path(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH").unwrap_or_else(|| DEFAULT_PATH.into());
     std::env::split_paths(&path).find_map(|dir| {
@@ -2371,16 +1888,8 @@ fn on_path(bin: &str) -> Option<PathBuf> {
     })
 }
 
-/// Start pasta on the sandbox's network namespace and wait until it has
-/// configured it. `child_pid` is the `child-pid` bwrap reported, and the
-/// sandbox must still be held at its `--block-fd`: until this returns the
-/// namespace has no route out at all.
-///
-/// pasta is handed two paths into bubbler's own descriptors rather than
-/// paths of its own to open. It makes itself non-dumpable while it starts
-/// (`pasta(1)`, self-isolation), and a non-dumpable process cannot open
-/// `/proc/self/fd/...`, so the paths name bubbler's process — which is
-/// why both descriptors have to stay open across the spawn.
+// The sandbox must still be held at `--block-fd`. pasta goes non-dumpable while starting, so
+// its paths name bubbler's `/proc/self/fd`, and both descriptors stay open across the spawn.
 fn start_pasta(
     env: &Env,
     cfg: &NetworkConfig,
@@ -2402,13 +1911,10 @@ fn start_pasta(
             child: &OsString::from(child_pid.to_string()),
         },
     );
-    // Nothing above stdio here either: pasta opens the two descriptors
-    // through bubbler's own `/proc` entry rather than inheriting them, so
-    // marking them close-on-exec — which they already are — costs nothing.
+    // Nothing above stdio: pasta opens both descriptors through bubbler's `/proc` entry.
     spawning(&[])?;
-    // pasta's own messages, on both its stdout and its stderr, go where
-    // bubbler's do, never to the caller's stdout (that is the argv audit
-    // trail) and never as the caller's own descriptor.
+    // pasta's stdout and stderr go where bubbler's messages do: never to the caller's stdout (the
+    // argv audit trail), nor as the caller's own descriptor.
     let (log, stderr) = run_log::relay()?;
     let log_too = log.try_clone().map_err(LaunchError::Data)?;
     let missing = || LaunchError::BadValue {
@@ -2444,7 +1950,6 @@ fn start_pasta(
         io::ErrorKind::NotFound => missing(),
         _ => LaunchError::Spawn(e),
     })?;
-    // From here on every exit path stops pasta through the handle.
     let mut handle = PastaHandle {
         child,
         exited: false,
@@ -2463,28 +1968,19 @@ fn start_pasta(
     Ok(handle)
 }
 
-/// A run's egress proxy.
-///
-/// The cgroup it is in belongs to the run and outlives it: a cgroup
-/// still holding a process cannot be removed, so the handle is dropped
-/// — which stops the proxy — before the cgroup's own guard is.
+// Dropped, which stops the proxy, before the run's cgroup guard: a cgroup holding a process
+// cannot be removed.
 #[derive(Debug)]
 struct NetProxyHandle {
     child: Child,
-    /// Set once the run has reaped the sidecar, which is what makes the
-    /// notice appear once and stops the pid from being signalled after
-    /// it has stopped being the proxy's.
+    // Also stops the pid being signalled once it is no longer the proxy's.
     exited: bool,
-    /// Copies the proxy's stderr to bubbler's. Fields drop after `drop` has
-    /// reaped it, so the copy can see the end of its output.
+    // Fields drop after `drop` has reaped the proxy, so the copy sees the end of its output.
     _stderr: run_log::Relay,
 }
 
 impl NetProxyHandle {
-    /// Say, once, that the proxy is gone. The sandbox keeps running: its
-    /// filter is unchanged, so what it loses is the one way out it had,
-    /// and killing an application over that would lose whatever it has
-    /// not written out.
+    // The sandbox keeps running: its filter is unchanged, it only loses its one way out.
     fn check(&mut self, warn: &tty::Warn) {
         if self.exited {
             return;
@@ -2501,10 +1997,8 @@ impl NetProxyHandle {
 }
 
 impl Drop for NetProxyHandle {
-    /// Stop the proxy and do not return until it is gone. It also holds
-    /// `PR_SET_PDEATHSIG`, but that only covers bubbler dying: a run
-    /// that ends normally must not leave a process inside the sandbox's
-    /// namespaces, and the cgroup cannot be removed while one is there.
+    // `PR_SET_PDEATHSIG` covers only bubbler dying; a normal end must not leave a process in the
+    // sandbox's namespaces, and the cgroup cannot be removed while one is there.
     fn drop(&mut self) {
         if self.exited || !still_running(&mut self.child) {
             return;
@@ -2528,16 +2022,12 @@ impl Drop for NetProxyHandle {
     }
 }
 
-/// What an isolated `network` starts once the sandbox has a pid: the
-/// ruleset, pasta, and — where the config names an `allow-host` — the
-/// egress proxy in its cgroup.
 struct NetworkSidecars {
     pasta: PastaHandle,
     proxy: Option<NetProxyHandle>,
 }
 
 impl NetworkSidecars {
-    /// Check on both sidecars, each of which says once that it is gone.
     fn check(&mut self, warn: &tty::Warn) {
         self.pasta.check(warn);
         if let Some(proxy) = self.proxy.as_mut() {
@@ -2546,16 +2036,8 @@ impl NetworkSidecars {
     }
 }
 
-/// Give the sandbox's namespace its policy, its route and — for an
-/// `allow-host` — its one way out, in that order.
-///
-/// The order is the whole of the safety here: `cgroup` was made before
-/// bwrap was spawned — earlier than the ruleset that names it, and early
-/// enough that the sandbox inherited the leaf beside it — the ruleset is
-/// installed before pasta connects anything, and the proxy is listening
-/// before the caller releases the sandbox from its `--block-fd`. At no
-/// point is the sandbox both connected and unfiltered, and at no point
-/// can the application reach for a proxy that is not yet answering.
+// The order is the safety: cgroup before bwrap, ruleset before pasta, proxy listening before
+// the release, so the sandbox is never connected and unfiltered, nor reaching a silent proxy.
 fn start_network(
     env: &Env,
     cfg: &NetworkConfig,
@@ -2572,24 +2054,8 @@ fn start_network(
     Ok(NetworkSidecars { pasta, proxy })
 }
 
-/// Start the egress proxy inside the sandbox's namespaces and wait until
-/// it is listening.
-///
-/// The process bubbler forks holds nothing: it writes itself into the
-/// run's cgroup, joins the sandbox's user, network and mount namespaces,
-/// clears every capability set and locks `SECBIT_NOROOT`. What lets it
-/// out is the cgroup and only the cgroup — the ruleset accepts that and
-/// rejects the rest, so a bug in the proxy costs an attacker the names
-/// the config listed and no capability at all.
-///
-/// It is exec'd from [`network::NET_PROXY_INSIDE`], which the sandbox's
-/// own argv bound: after the mount join a host path of bubbler's
-/// resolves to nothing.
-///
-/// `log_tunnels` is [`crate::env::Env::net_proxy_log`]: the proxy's
-/// lines land on bubbler's stderr, which is the terminal the sandboxed
-/// application is drawing on, so only the refusals are written unless
-/// the caller asked for the rest.
+// Exec'd from `network::NET_PROXY_INSIDE`: after the mount join a host path resolves to
+// nothing. Only refusals are logged unless `log_tunnels`: its lines land on the app's terminal.
 fn start_net_proxy(
     cfg: &NetworkConfig,
     ns: &SandboxNs,
@@ -2614,8 +2080,7 @@ fn start_net_proxy(
     let (log, stderr) = run_log::relay()?;
     let mut cmd = Command::new(network::NET_PROXY_INSIDE);
     cmd.args(&argv)
-        // Nothing of the host's environment: the proxy reads none of it,
-        // and every variable is one more thing crossing into the
+        // The proxy reads none of the host's environment, and every variable would cross into the
         // sandbox's namespaces.
         .env_clear()
         .stdin(Stdio::null())
@@ -2632,35 +2097,8 @@ fn start_net_proxy(
     // cgroup handle and `ns` open across the spawn, so `borrow_raw`
     // borrows descriptors nothing has closed.
     //
-    // What the exec'd proxy ends up holding, and why each step is in
-    // this order. `setsid` first, which needs nothing: in a session of
-    // its own the proxy has no controlling terminal, so it cannot open
-    // `/dev/tty` and reach the caller's. The pid goes into `cgroup.procs`
-    // next, while the process is still bubbler's own uid in bubbler's
-    // own namespaces:
-    // that is what the ruleset accepts, and doing it after the joins
-    // would write through a descriptor from a namespace that no longer
-    // matches. The user namespace is entered before the other two,
-    // since entering a network or mount namespace takes the
-    // capabilities its owning user namespace grants (`setns(2)`); the
-    // mount namespace is owned by the same one, so it costs nothing
-    // further. `chdir` follows the mount join because the inherited
-    // working directory is a host dentry, and a process in the
-    // sandbox's mount namespace holding one could walk back out through
-    // it. Only then are the capability sets emptied — the joins needed
-    // them. `SECBIT_NOROOT` stops the kernel from handing a uid-0
-    // `execve` a full set on top of that — bwrap's outer user namespace
-    // maps bubbler to 0, so without it the proxy would exec with every
-    // capability in the sandbox's user namespace — and `_LOCKED` keeps
-    // the child from undoing it. It is set *before* the sets are
-    // emptied, since `PR_SET_SECUREBITS` itself takes CAP_SETPCAP:
-    // dropping first leaves nothing to set it with. Then the ambient
-    // set is cleared and every set emptied, which needs no capability
-    // at all. `PR_SET_NO_NEW_PRIVS` then makes the bounding set moot:
-    // no `execve` from here can gain a privilege, whatever it finds.
-    // Last, the parent-death signal so a bubbler that is killed takes
-    // the proxy with it, and `PR_SET_DUMPABLE 0` for the time before
-    // `execve`, which resets it; the proxy sets it again itself.
+    // The order is the manual's ("The proxy process"), after `setsid`, which leaves the proxy
+    // no controlling terminal through which to open the caller's `/dev/tty`.
     unsafe {
         cmd.pre_exec(move || {
             rustix::process::setsid()?;
@@ -2696,17 +2134,14 @@ fn start_net_proxy(
         });
     }
     spawning(&[done.as_raw_fd()])?;
-    // Never `LaunchError::Spawn`, whose text names bwrap: everything the
-    // `pre_exec` closure returns — the `cgroup.procs` write, the three
-    // `setns`, the `prctl`s — arrives here as a failed spawn too, and a
-    // `NotFound` from one of those is not a missing binary either.
+    // Never `LaunchError::Spawn`, which names bwrap: a failed `pre_exec` step arrives as a failed
+    // spawn too, and its `NotFound` is not a missing binary.
     let spawned = cmd.spawn();
     // `cmd` holds bubbler's copy of the relay's write end; see
     // `spawn_sidecar`.
     drop(cmd);
     let child =
         spawned.map_err(|e| LaunchError::Network(format!("starting the egress proxy: {e}")))?;
-    // From here on every exit path stops the proxy through the handle.
     let mut handle = NetProxyHandle {
         child,
         exited: false,
@@ -2732,18 +2167,8 @@ fn start_net_proxy(
     Ok(handle)
 }
 
-/// Put the calling thread on a session keyring of its own
-/// (`keyctl(2)` `KEYCTL_JOIN_SESSION_KEYRING` with a null name, which
-/// creates an anonymous one).
-///
-/// Called in the forked child before `execve`, so the sandbox never
-/// inherits the login session keyring: `keyctl` is on the default
-/// denylist, but a profile may take it off, and the keys behind
-/// `@s` are the user's — not this instance's. A kernel without
-/// `CONFIG_KEYS` answers ENOSYS and there is no keyring to inherit
-/// either, so that one case is not a failure.
-///
-/// `rustix` wraps no keyring call, which is why this is `libc`.
+// ENOSYS (no `CONFIG_KEYS`) is not a failure: there is no keyring to inherit either. rustix
+// wraps no keyring call, hence `libc`.
 fn join_session_keyring() -> io::Result<()> {
     // SAFETY: one syscall taking its arguments by value, allocating
     // nothing and touching no memory of this process — async-signal-safe,
@@ -2766,9 +2191,7 @@ fn join_session_keyring() -> io::Result<()> {
     }
 }
 
-/// `value` as decimal ASCII in `buf`, for the one write the proxy's
-/// `pre_exec` makes: formatting through `format!` there would allocate,
-/// which a forked child may not do.
+// For the proxy's `pre_exec`, where `format!` would allocate in a forked child.
 fn decimal(value: i32, buf: &mut [u8; 10]) -> &[u8] {
     let mut value = value.unsigned_abs();
     let mut at = buf.len();
@@ -2783,8 +2206,6 @@ fn decimal(value: i32, buf: &mut [u8; 10]) -> &[u8] {
     &buf[at..]
 }
 
-/// Open a directory bubbler itself created under `$XDG_RUNTIME_DIR`,
-/// for the `*at` calls that move the proxied socket.
 fn open_dir(path: &Path) -> Result<OwnedFd, LaunchError> {
     rustix::fs::open(
         path,
@@ -2794,21 +2215,8 @@ fn open_dir(path: &Path) -> Result<OwnedFd, LaunchError> {
     .map_err(|e| LaunchError::Io(path.to_path_buf(), e.into()))
 }
 
-/// Move the proxy's socket out of the one directory the proxy can write
-/// to, then prove that what was moved really is a socket of this user's
-/// (`uid`). The returned guard removes the moved entry when the run ends.
-///
-/// The proxy keeps serving after the move: it listens on the socket it
-/// bound, not on the path, and the sandbox connects through the new one.
-// The move comes first and the check second: the reverse leaves a window
-// in which a proxy that keeps swapping the name can put a symlink in the
-// place of the socket that was just checked. Nothing outside the instance
-// directory can touch the entry once it is here, so its type cannot
-// change after this. `O_NOFOLLOW` then makes a symlink fail with ELOOP
-// instead of being followed, since `stat` through a path would report the
-// type of the target and bwrap would bind that target.
-// `node` is the config node that granted this bus, so a failure names what
-// the user would have to change rather than the sidecar that failed.
+// Move first, check second, as in `adopt_socket`. `node` is the config node that granted the
+// bus, so a failure names what the user would change.
 fn adopt_proxy_bus(
     dir: &Path,
     socket: &str,
@@ -2860,9 +2268,7 @@ fn adopt_proxy_bus(
     Ok(guard)
 }
 
-/// Clear the name of a directory a sidecar planted where its socket
-/// belongs, so the next start's rename onto it does not fail. Whatever it
-/// holds goes with it: after the move nothing but bubbler can reach it.
+// Else the next start's rename onto this name fails; after the move only bubbler reaches it.
 fn remove_moved_dir(inst: &OwnedFd, dir: &Path, socket: &str) {
     if let Err(e) = move_aside(inst, dir, OsStr::new(socket)) {
         eprintln!(
@@ -2872,11 +2278,7 @@ fn remove_moved_dir(inst: &OwnedFd, dir: &Path, socket: &str) {
     }
 }
 
-/// Move aside a directory at a socket's name under `inst` (the directory
-/// `dir`) before a socket is renamed onto it: one is left there when a
-/// run is killed between moving a planted directory in and clearing it,
-/// and a socket cannot replace a directory. Anything else at the name is
-/// replaced by the rename.
+// A killed run can leave a directory at the name, and a rename cannot put a socket over one.
 fn clear_socket_name(inst: &OwnedFd, dir: &Path, socket: &str) -> rustix::io::Result<()> {
     match rustix::fs::statat(inst, socket, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(stat)
@@ -2890,9 +2292,8 @@ fn clear_socket_name(inst: &OwnedFd, dir: &Path, socket: &str) -> rustix::io::Re
     }
 }
 
-/// The one directory bubbler owns under `$XDG_RUNTIME_DIR`. Every
-/// instance's runtime state is a subdirectory of it, which is why a host
-/// bus address that resolves into it is refused.
+/// The one directory bubbler owns under `$XDG_RUNTIME_DIR`, holding every instance's runtime
+/// state; a host bus address resolving into it is refused.
 pub const RUNTIME_SUBDIR: &str = "bubbler";
 
 /// `$XDG_RUNTIME_DIR/bubbler/<name>`: an instance's runtime state on the
@@ -2901,9 +2302,7 @@ pub fn instance_runtime_dir(env: &Env, name: &str) -> PathBuf {
     env.runtime_dir.join(RUNTIME_SUBDIR).join(name)
 }
 
-/// Create `dir` with mode 0700, tolerating one that already exists. Only
-/// the user can create anything under `$XDG_RUNTIME_DIR`, so a directory
-/// left over from an earlier run is reused as is.
+// An existing directory is reused as is: only the user can create under `$XDG_RUNTIME_DIR`.
 fn mkdir_private(dir: &Path) -> Result<(), LaunchError> {
     match rustix::fs::mkdir(dir, Mode::RWXU) {
         Ok(()) | Err(Errno::EXIST) => Ok(()),
@@ -2911,21 +2310,12 @@ fn mkdir_private(dir: &Path) -> Result<(), LaunchError> {
     }
 }
 
-/// How many entries one start unlinks, lifts or opens while clearing what
-/// dead runs' sidecars left, so a tree of any size delays a start by a
-/// bounded amount; what is left over is taken up again by the next start.
+// Bounds how long clearing dead runs' leftovers delays one start; the next start takes up
+// the rest.
 const LEFTOVER_BUDGET: usize = 100_000;
 
-/// Create `dir` afresh, mode 0700, failing on an entry that is still
-/// there. Whatever is at its name is first renamed aside in the same
-/// directory and then removed best-effort, so nothing a dead run's
-/// sidecar left — a link out of the runtime directory above all, or a
-/// tree no walk can finish — is followed by anything bubbler writes
-/// there or can block the start. Called after this run has bound the
-/// instance's control socket and found no live run behind it. Only one
-/// start at a time gets there, and a run that is ending holds a start
-/// back until its teardown is done — except for a start that binds in the
-/// moment between the sandbox's exit and the ending run taking the lock.
+// Whatever is at the name is renamed aside and removed best-effort, so no link or endless
+// tree a dead sidecar left is written through or blocks the start.
 fn fresh_sidecar_dir(dir: &Path) -> Result<(), LaunchError> {
     let io_at = |e: Errno| LaunchError::Io(dir.to_path_buf(), e.into());
     let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
@@ -2940,11 +2330,8 @@ fn fresh_sidecar_dir(dir: &Path) -> Result<(), LaunchError> {
     rustix::fs::mkdirat(&at, name, Mode::RWXU).map_err(io_at)
 }
 
-/// Rename `name` under `at` (the directory `dir`) aside and remove it
-/// best-effort with every earlier leftover of that name, saying so when
-/// it could not be removed in full. The rename is within the one
-/// directory bubbler owns, so no mode or depth of the tree can refuse it,
-/// and a link is moved as the link.
+// A rename within bubbler's own directory: no mode or depth refuses it, and a link moves as
+// the link.
 fn move_aside(at: &OwnedFd, dir: &Path, name: &OsStr) -> rustix::io::Result<()> {
     let moved = rename_to_free(at, name, at, &mut 0, |seq| leftover_name(name, seq))?;
     clear_leftovers(at, name);
@@ -2957,10 +2344,7 @@ fn move_aside(at: &OwnedFd, dir: &Path, name: &OsStr) -> rustix::io::Result<()> 
     Ok(())
 }
 
-/// Remove a sidecar's directory once the sidecar has exited, best-effort
-/// and within the budget: `std::fs::remove_dir_all` recurses, and a tree
-/// deep enough overflows the stack and aborts bubbler. What is left is
-/// moved aside by the next start.
+// Not `std::fs::remove_dir_all`: it recurses, and a deep enough tree overflows the stack.
 fn remove_sidecar_dir(dir: &Path) {
     let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
         return;
@@ -2971,9 +2355,7 @@ fn remove_sidecar_dir(dir: &Path) {
     let _ = remove_tree(&at, name, &mut LEFTOVER_BUDGET.clone());
 }
 
-/// `<name>.leftover.<pid>.<seq>`: where [`move_aside`] moves what it
-/// found at `name`. Only bubbler can write the instance's runtime
-/// directory, so the name has no one to be guessed by.
+// Only bubbler writes the instance's runtime directory, so the name need not be unguessable.
 fn leftover_name(name: &OsStr, seq: u64) -> OsString {
     let mut aside = leftover_prefix(name);
     aside.push(format!("{}.{seq}", std::process::id()));
@@ -2986,9 +2368,7 @@ fn leftover_prefix(name: &OsStr) -> OsString {
     prefix
 }
 
-/// Remove every earlier leftover of `name` under `at` that the budget
-/// reaches. A failure is left for the next start: the warning is said
-/// once, by the start that moved the tree aside.
+// A failure is left for the next start; the start that moved the tree aside already warned.
 fn clear_leftovers(at: &OwnedFd, name: &OsStr) {
     let prefix = leftover_prefix(name);
     let mut budget = LEFTOVER_BUDGET;
@@ -3004,9 +2384,7 @@ fn clear_leftovers(at: &OwnedFd, name: &OsStr) {
     }
 }
 
-/// Rename `name` under `from` to the first name `make` gives from `seq`
-/// on that is free under `to`, never replacing an entry; the name it took
-/// is returned and `seq` left past it.
+// Never replaces an entry; `seq` is left past the name taken.
 fn rename_to_free(
     from: &OwnedFd,
     name: &OsStr,
@@ -3025,16 +2403,11 @@ fn rename_to_free(
     }
 }
 
-/// How many names are read from one directory before the ones read are
-/// dealt with, so a directory of any width costs bounded memory.
+// Names read before acting on them, so a directory of any width costs bounded memory.
 const READ_BATCH: usize = 1024;
 
-/// Remove `name` under `at` and, where it is a directory, everything in
-/// it, following no link, holding a fixed number of descriptors whatever
-/// the depth: each pass empties the directories directly in the top one
-/// and lifts what they hold up into it. Each entry unlinked, lifted or
-/// opened takes one off `budget`, and what was done stays done, so a call
-/// that fails with `EAGAIN` once it is spent has still shrunk the tree.
+// A fixed number of descriptors at any depth: each pass empties the directories in the top
+// one and lifts their contents into it. Work done before `EAGAIN` stays done.
 fn remove_tree(at: &OwnedFd, name: &OsStr, budget: &mut usize) -> rustix::io::Result<()> {
     let Some(top) = unlink_or_open(at, name)? else {
         return Ok(());
@@ -3075,11 +2448,8 @@ fn spend(budget: &mut usize) -> rustix::io::Result<()> {
     Ok(())
 }
 
-/// Unlink `name` under `at` unless it is a directory; a directory is
-/// given back to its owner (0700) and opened for reading. A sidecar runs
-/// as the user and can leave one no one may read, write or move to
-/// another parent; the mode changes on the directory that was opened,
-/// never on whatever a path names by then, and a link is never followed.
+// A sidecar can leave a directory no one may read or move; the mode changes on the opened
+// directory, never on whatever the path names by then, and no link is followed.
 fn unlink_or_open(at: &OwnedFd, name: &OsStr) -> rustix::io::Result<Option<OwnedFd>> {
     let stat = rustix::fs::statat(at, name, AtFlags::SYMLINK_NOFOLLOW)?;
     if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory {
@@ -3104,7 +2474,6 @@ fn unlink_or_open(at: &OwnedFd, name: &OsStr) -> rustix::io::Result<Option<Owned
     .map(Some)
 }
 
-/// Up to `max` of the names in `dir`, from its start.
 fn entry_names(dir: &OwnedFd, max: usize) -> rustix::io::Result<Vec<OsString>> {
     let mut names = Vec::new();
     for entry in rustix::fs::Dir::read_from(dir)? {
@@ -3120,13 +2489,11 @@ fn entry_names(dir: &OwnedFd, max: usize) -> rustix::io::Result<Vec<OsString>> {
     Ok(names)
 }
 
-/// Create `$XDG_RUNTIME_DIR/bubbler/<name>/` with mode 0700; an existing
-/// directory is reused as is. Not a lock: what a second start of the same
-/// instance collides with is the control socket in it.
+/// Create `$XDG_RUNTIME_DIR/bubbler/<name>/` with mode 0700, reusing an existing one. Not a
+/// lock: a second start of the instance collides on the control socket in it.
 pub fn prepare_runtime_dir(env: &Env, inst: &Instance) -> Result<PathBuf, LaunchError> {
-    // Each level is created 0700 outright rather than created wide and
-    // narrowed afterwards; a missing $XDG_RUNTIME_DIR is created, but its
-    // parent is not, since that would mean the session has no runtime dir.
+    // Each level is created 0700 outright; a missing `$XDG_RUNTIME_DIR` is created but not its
+    // parent, which would mean the session has no runtime dir.
     mkdir_private(&env.runtime_dir)?;
     mkdir_private(&env.runtime_dir.join(RUNTIME_SUBDIR))?;
     let dir = instance_runtime_dir(env, &inst.name);
@@ -3134,29 +2501,8 @@ pub fn prepare_runtime_dir(env: &Env, inst: &Instance) -> Result<PathBuf, Launch
     Ok(dir)
 }
 
-/// Create the host directory behind every `app-runtime` grant and check
-/// it is one, so the bind the argv names has a source before bwrap runs.
-/// Only bubbler ever creates these, never a sandbox: `app/<id>` is a
-/// rendezvous, and whoever creates it decides what the others bind.
-///
-/// An existing directory is reused whatever its mode — on a host running
-/// a native KeePassXC it is already there at 0755, and `$XDG_RUNTIME_DIR`
-/// being 0700 is what keeps it private.
-///
-/// Both levels are opened `O_NOFOLLOW|O_DIRECTORY` and the leaf is made
-/// and checked relative to the `app` descriptor, so neither a symlink at
-/// `app` nor one at `app/<id>` can move the source somewhere else while
-/// the destination path stays the one the config named. No sandbox can
-/// plant either — only the leaf is ever bound, so `app` itself is not a
-/// directory any sandbox holds — but the check is what makes that
-/// property something bubbler enforces rather than assumes.
-///
-/// The check is point-in-time: bwrap resolves the source path again when
-/// it mounts, and the descriptors here are closed rather than handed to
-/// it, because bwrap binds by path and has no fd form. That window is
-/// not a hole. Nothing a sandbox controls can write `app/`, and a host
-/// process that could is already the same uid as bubbler — it owns the
-/// account and needs no swapped symlink to reach anything.
+// Only bubbler creates these, never a sandbox: whoever creates `app/<id>` decides what the
+// others bind. Why the check-then-bind window is no hole: threat model, app-runtime.
 fn prepare_app_runtime(env: &Env, services: &[Service]) -> Result<(), LaunchError> {
     let ids: Vec<&str> = services
         .iter()
@@ -3176,9 +2522,7 @@ fn prepare_app_runtime(env: &Env, services: &[Service]) -> Result<(), LaunchErro
     let at = open_dir_nofollow(rustix::fs::CWD, &app, &app, "app-runtime")?;
     for id in ids {
         let dir = service::app_runtime_dir(env, id);
-        // `mkdir` reports EEXIST for a symlink too, since it does not
-        // follow the last component, so the probe below is where one is
-        // caught.
+        // `mkdir` reports EEXIST for a symlink too, so the probe below is what catches one.
         match rustix::fs::mkdirat(&at, id, Mode::RWXU) {
             Ok(()) | Err(Errno::EXIST) => {}
             Err(e) => return Err(LaunchError::Io(dir, e.into())),
@@ -3188,9 +2532,7 @@ fn prepare_app_runtime(env: &Env, services: &[Service]) -> Result<(), LaunchErro
     Ok(())
 }
 
-/// Open `path` under `at` as a directory without following a symlink in
-/// its last component. `named` is the whole path and `service` what
-/// needed it, for the error only.
+// `named` and `service` are for the error only.
 fn open_dir_nofollow<P: rustix::path::Arg>(
     at: impl AsFd,
     path: P,
@@ -3224,8 +2566,7 @@ pub fn exit_code(status: ExitStatus) -> i32 {
     }
 }
 
-/// Value of `child-pid` in bwrap's `--info-fd` JSON. Scanned rather than
-/// parsed: bwrap adds members over time and only this one matters.
+// Scanned rather than parsed: bwrap adds members over time and only this one matters.
 fn parse_child_pid(buf: &[u8]) -> Option<i32> {
     const KEY: &[u8] = b"\"child-pid\"";
     let after = buf.windows(KEY.len()).position(|w| w == KEY)? + KEY.len();
@@ -3246,9 +2587,8 @@ fn parse_child_pid(buf: &[u8]) -> Option<i32> {
     std::str::from_utf8(&tail[start..end]).ok()?.parse().ok()
 }
 
-/// End of the first complete JSON object in `buf`: braces counted outside
-/// strings. bwrap writes its info as one multi-line document, and a
-/// truncated one is no use to the portals that parse it.
+// Braces counted outside strings: bwrap writes one multi-line document, and portals cannot
+// use a truncated one.
 fn json_object_end(buf: &[u8]) -> Option<usize> {
     let mut depth = 0u32;
     let mut in_string = false;
@@ -3271,10 +2611,7 @@ fn json_object_end(buf: &[u8]) -> Option<usize> {
     None
 }
 
-/// Read the info pipe until bwrap has reported a whole document with
-/// `child-pid` in it, or until the deadline, EOF or the child's own exit
-/// says it never will. The bytes come back as bwrap wrote them.
-// Portals read that same document back out of `bwrapinfo.json`.
+// Portals read this same document back out of `bwrapinfo.json`, so it is returned as written.
 fn read_sandbox_info(
     info: &OwnedFd,
     child: &mut Child,
@@ -3311,31 +2648,19 @@ fn read_sandbox_info(
     }
 }
 
-/// Whether `pid` is running the supervisor, by the name in
-/// `/proc/<pid>/comm`. The reaper's child carries bwrap's name until it
-/// execs, and a failed exec leaves something else there entirely.
+// The reaper's child carries bwrap's name until it execs, and a failed exec leaves another.
 fn is_supervisor(pid: Pid) -> bool {
     let comm = format!("/proc/{}/comm", pid.as_raw_nonzero());
     std::fs::read_to_string(comm).is_ok_and(|name| name == format!("{}\n", init_bin::NAME))
 }
 
-/// Host pid of the supervisor in the sandbox, for signalling it directly.
-/// `reaper` is the `child-pid` bwrap reported.
-///
-/// That reaper is pid 1 of the sandbox's pid namespace and ignores every
-/// signal from outside it that it has no handler for
-/// (`pid_namespaces(7)`); `bubbler-init` is its only child at startup and
-/// does handle SIGTERM.
-// Only callable once the sandbox has been released: a sandbox still
-// waiting on `--block-fd` has not forked the supervisor yet.
+// The reaper is pid 1 there and ignores outside signals it has no handler for; `bubbler-init`,
+// its first child, handles SIGTERM. Only once released: a held sandbox has not forked it.
 fn supervisor_pid(reaper: i32, child: &mut Child, deadline: Instant) -> Option<Pid> {
     let children = PathBuf::from(format!("/proc/{reaper}/task/{reaper}/children"));
     loop {
-        // An empty list and a child that has not exec'd yet are both worth
-        // waiting on: the reaper forks the supervisor a moment after it
-        // appears. A read that fails means the sandbox is already gone, or
-        // this kernel has no `children` file, and neither gets better by
-        // asking again.
+        // An empty list or a child not yet exec'd is worth waiting on; a failed read means the
+        // sandbox is gone or the kernel has no `children` file, and neither improves.
         let list = std::fs::read_to_string(&children).ok()?;
         if let Some(pid) = list
             .split_ascii_whitespace()
@@ -3353,9 +2678,6 @@ fn supervisor_pid(reaper: i32, child: &mut Child, deadline: Instant) -> Option<P
     }
 }
 
-/// Removes one of the run's own files when it leaves, on every path: the
-/// control socket, the proxied bus socket once it has been moved, and the
-/// Wayland socket the compositor accepts on.
 #[derive(Debug)]
 struct FileGuard(PathBuf);
 
@@ -3367,9 +2689,7 @@ impl Drop for FileGuard {
     }
 }
 
-/// Removes this run's `$XDG_RUNTIME_DIR/.flatpak/bubbler-<instance>` when
-/// the run leaves, on every path — only that entry, and only one this run
-/// created: the `.flatpak` directory above it is shared with flatpak.
+// Removes only this run's entry: the `.flatpak` directory above it is shared with flatpak.
 struct FlatpakGuard(PathBuf);
 
 impl Drop for FlatpakGuard {
@@ -3380,9 +2700,8 @@ impl Drop for FlatpakGuard {
     }
 }
 
-/// Remove a `.flatpak` entry a killed run left behind, and only that: a
-/// directory holding nothing but a `bwrapinfo.json` whose `child-pid` is
-/// no longer a live process. Anything else is someone's to keep.
+// Only a directory holding nothing but a `bwrapinfo.json` whose `child-pid` is dead; anything
+// else is someone's to keep.
 fn sweep_identity(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -3402,21 +2721,14 @@ fn sweep_identity(dir: &Path) {
     }
 }
 
-/// Publish bwrap's own info document as
-/// `$XDG_RUNTIME_DIR/.flatpak/bubbler-<instance>/bwrapinfo.json`, which is
-/// how xdg-desktop-portal turns a sandboxed bus peer into a pidfd of the
-/// sandbox. The guard removes the directory again when the run ends.
-///
-/// The instance directory is created outright, never adopted: a second
-/// run of the same instance must not publish over the first one's
-/// identity, and a directory that is not a dead run's is an error.
+// Created outright, never adopted: a second run of the instance must not publish over the
+// first one's identity.
 fn publish_bwrapinfo(env: &Env, instance: &str, info: &[u8]) -> Result<FlatpakGuard, LaunchError> {
     mkdir_private(&env.runtime_dir.join(dbus::FLATPAK_DIR))?;
     let dir = dbus::flatpak_instance_dir(env, instance);
     sweep_identity(&dir);
     rustix::fs::mkdir(&dir, Mode::RWXU)
         .map_err(|e| LaunchError::Io(dir.to_path_buf(), e.into()))?;
-    // From here on the directory is removed again however this ends.
     let guard = FlatpakGuard(dir.clone());
     // Written and renamed inside the directory, so a portal reading it
     // never sees half a document.
@@ -3427,8 +2739,7 @@ fn publish_bwrapinfo(env: &Env, instance: &str, info: &[u8]) -> Result<FlatpakGu
     Ok(guard)
 }
 
-/// Give xdg-desktop-portal this run's identity, or say why portals will
-/// not work. Never fatal: an app whose portal calls fail still runs.
+// Never fatal: an app whose portal calls fail still runs.
 fn publish_identity(env: &Env, instance: &str, info: Option<&[u8]>) -> Option<FlatpakGuard> {
     let Some(info) = info else {
         eprintln!("bubbler: warning: the sandbox reported no pid, so portal operations will fail");
@@ -3445,17 +2756,15 @@ fn publish_identity(env: &Env, instance: &str, info: Option<&[u8]>) -> Option<Fl
     }
 }
 
-/// Let the sandbox past its `--block-fd`. Closing the pipe releases it
-/// just as the byte does, so a failed write still starts the app.
+// Closing the pipe releases the sandbox as the byte does, so a failed write still starts it.
 fn release_block(alloc: &mut RealAlloc) {
     if let Some(fd) = alloc.block_write.take() {
         let _ = rustix::io::write(&fd, b"\n");
     }
 }
 
-/// Drops this run's signal actions when it leaves, so a later run never
-/// sees a stale flag. `signal-hook` leaves its own handler in place, so
-/// the signals stay caught and are ignored until the next run.
+/// Unregisters this run's signal actions when it leaves; `signal-hook`'s handler stays, so the
+/// signals stay caught and ignored until the next run.
 pub(crate) struct SignalGuard(pub(crate) Vec<SigId>);
 
 impl Drop for SignalGuard {
@@ -3467,9 +2776,7 @@ impl Drop for SignalGuard {
     }
 }
 
-/// What bwrap is spawned with for one of fds 0, 1 and 2. The slave is
-/// duplicated per fd, so closing bubbler's own copy after the spawn
-/// leaves the sandbox's three intact.
+// The slave is duplicated per fd, so closing bubbler's copy leaves the sandbox's three intact.
 fn stdio_for(target: StdioTarget, pty: Option<&Pty>) -> Result<Stdio, LaunchError> {
     match (target, pty) {
         (StdioTarget::Slave, Some(p)) => {
@@ -3486,30 +2793,18 @@ fn stdio_for(target: StdioTarget, pty: Option<&Pty>) -> Result<Stdio, LaunchErro
     }
 }
 
-/// What every wait loop watches besides the sandbox process itself: the
-/// signal flags, the supervisor a stop is forwarded to, and the sidecar
-/// whose own exit the run has to notice.
 struct Watch<'a> {
-    /// Set by the signal handler; cleared as the run acts on it.
     stop: &'a AtomicBool,
-    /// The process inside the sandbox a SIGTERM goes to, if it was found.
     supervisor: Option<Pid>,
-    /// Latched once a stop has been seen, for as long as the run lasts.
     stopping: &'a AtomicBool,
-    /// The sidecars an isolated `network` started, where the run has
-    /// them.
     network: &'a mut Option<NetworkSidecars>,
-    /// Where a word about the sidecar goes without blocking the loop.
     warn: &'a tty::Warn,
-    /// The instance's start lock, taken into `ending` the moment the
-    /// sandbox's exit is seen rather than once the output is drained.
+    // Taken into `ending` when the exit is seen, not once the output is drained.
     start_lock: &'a Path,
     ending: Option<OwnedFd>,
 }
 
-/// Forward a caught signal to the sandbox and report the exit code once
-/// bwrap has one. The single place a run learns that it is over, and so
-/// the one place the sidecar is checked on as well.
+// The single place a run learns it is over, so the sidecars are checked here too.
 fn check_exit(child: &mut Child, w: &mut Watch<'_>) -> io::Result<Option<i32>> {
     if let Some(status) = child.try_wait()? {
         // Once only: a second open of the file would wait on this one.
@@ -3531,21 +2826,15 @@ fn check_exit(child: &mut Child, w: &mut Watch<'_>) -> io::Result<Option<i32>> {
         // Latched, unlike `stop` itself: from here on the user is
         // waiting, and the relay hands over what it holds accordingly.
         stopping.store(true, Ordering::SeqCst);
-        // bubblewrap 0.11.2 exits on SIGTERM instead of forwarding it,
-        // so the signal goes to the supervisor, which stops the command
-        // within its grace period; without its pid the sandbox can only
-        // be brought down through bwrap and --die-with-parent. Racing
-        // the child's own exit is normal, so a failed kill is not an
-        // error.
+        // bubblewrap 0.11.2 exits on SIGTERM instead of forwarding it, so the supervisor gets it;
+        // bwrap and `--die-with-parent` are the fallback. A failed kill is a race with the exit.
         let target = supervisor.unwrap_or_else(|| Pid::from_child(child));
         let _ = kill_process(target, Signal::TERM);
     }
     Ok(None)
 }
 
-/// The exit check as the relay wants it: a closure reporting the code
-/// once there is one. A `try_wait` that fails ends the wait too, with the
-/// error left in `failed` for the caller to return.
+// A failing `try_wait` ends the wait too, its error left in `failed`.
 fn until_exit<'a>(
     child: &'a mut Child,
     w: &'a mut Watch<'_>,
@@ -3560,8 +2849,6 @@ fn until_exit<'a>(
     }
 }
 
-/// Wait for a sandbox that has no terminal and no pipes of ours: nothing
-/// to move, so the loop only watches for the exit and for signals.
 fn wait_plain(child: &mut Child, w: &mut Watch<'_>) -> Result<i32, LaunchError> {
     loop {
         if let Some(code) = check_exit(child, w).map_err(LaunchError::Spawn)? {
@@ -3571,8 +2858,6 @@ fn wait_plain(child: &mut Child, w: &mut Watch<'_>) -> Result<i32, LaunchError> 
     }
 }
 
-/// Wait while copying the sandbox's output pipes to bubbler's own stdout
-/// and stderr, which is all `tty "none"` needs.
 fn wait_pumping(
     child: &mut Child,
     w: &mut Watch<'_>,
@@ -3591,24 +2876,15 @@ fn wait_pumping(
     }
 }
 
-/// The host side of a relayed run: what the user types, where the pty's
-/// output goes, and where that output is drained instead when nothing of
-/// bubbler's can take it, or after a detach.
 struct RelayEnds<'a> {
     input: Option<BorrowedFd<'a>>,
     output: BorrowedFd<'a>,
-    /// What to call `output` when it stops taking the sandbox's output.
     out_name: &'static str,
     sink: BorrowedFd<'a>,
 }
 
-/// Wait while relaying between the user's terminal and the sandbox's pty.
-///
-/// Detaching ends the relay, not the run: bubbler holds the master, and
-/// closing it would hang up the terminal inside, while leaving would take
-/// the sandbox with it through `--die-with-parent`. So it goes on
-/// waiting, quietly, with the pty drained into `sink` so a program inside
-/// cannot fill it and block.
+// Detaching ends the relay, not the run: closing the master would hang up the terminal inside
+// and leaving would kill the sandbox, so it waits on with the pty drained into `sink`.
 fn wait_relaying(
     child: &mut Child,
     w: &mut Watch<'_>,
@@ -3636,9 +2912,7 @@ fn wait_relaying(
     let code = match end {
         RelayEnd::Exited(code) => code,
         RelayEnd::Detached => {
-            // Restored first: the note would otherwise be printed with the
-            // terminal still raw, and its newline would not return the
-            // cursor to the first column.
+            // Restored first, or the note would print in raw mode without a carriage return.
             if let Some(guard) = raw.as_mut() {
                 guard.restore();
             }
@@ -3666,28 +2940,9 @@ fn wait_relaying(
     }
 }
 
-/// Start the instance: bind its control socket, run bwrap around
-/// `bubbler-init`, forward SIGINT/SIGTERM once as SIGTERM and return the
-/// exit code to propagate. `mode` decides what the sandbox gets for stdio;
-/// in `pty` mode bubbler allocates one and relays, so the sandbox never
-/// holds a descriptor for the user's terminal. `AlreadyRunning` when the
-/// instance is live; that is an exec, which the caller decides on.
-///
-/// `log` is the run's log, if it has one: it is told the run
-/// [started](run_log::Redirect::started) the sandbox once the control
-/// socket is bound, and otherwise that it
-/// [did not](run_log::Redirect::not_started), since another start may be
-/// writing to it. On `AlreadyRunning` it is told nothing: the caller
-/// either [joins](run_log::Redirect::joined) that run or says it did not
-/// start.
-///
-/// Marks every descriptor of the calling process above stdio that this
-/// spawn is not meant to hand over close-on-exec, so an embedder's own
-/// open files do not cross into the sandbox; none is closed.
-///
-/// A stop signal caught while the sidecars are starting ends the start:
-/// what was started is stopped and removed, and the code is the one a
-/// run stopped by that signal gives.
+/// Start the instance and return the exit code to propagate. `AlreadyRunning` when it is live,
+/// for the caller to turn into an exec. `log` is told whether this run started the sandbox;
+/// other fds above stdio are made CLOEXEC.
 pub fn run(
     env: &Env,
     inst: &Instance,
@@ -3705,7 +2960,6 @@ pub fn run(
     ended
 }
 
-/// [`run`] up to telling `log` the run did not start the sandbox.
 fn start_run(
     env: &Env,
     inst: &Instance,
@@ -3713,21 +2967,16 @@ fn start_run(
     mode: TtyMode,
     log: Option<&run_log::Redirect>,
 ) -> Result<i32, LaunchError> {
-    // Before anything is created: a host tool below its floor is a fact
-    // about this run, and the reader has to see it whether or not the
-    // run then fails for another reason.
+    // Before anything is created: a tool below its floor is reported even if the run then fails
+    // for another reason.
     for line in version::warnings(version::bwrap(), version::proxy(env), &inst.config.services) {
         eprintln!("bubbler: warning: {line}");
     }
     prepare_runtime_dir(env, inst)?;
     let stop = Arc::new(AtomicBool::new(false));
     let mut registered = SignalGuard(Vec::new());
-    // From here on and not only once the sandbox is up: the sidecars can
-    // take seconds to start, and a signal's default action in that
-    // window would leave them and the runtime directory behind. SIGHUP
-    // among them: a terminal that goes away must still leave through the
-    // same path, which stops the sandbox and hands the settings back,
-    // rather than killing bubbler where it stands.
+    // Caught from here: a signal's default action while sidecars start would leave them behind.
+    // SIGHUP too, so a terminal that goes away leaves through the same path.
     for sig in [SIGINT, SIGTERM, SIGHUP] {
         let id =
             signal_hook::flag::register(sig, Arc::clone(&stop)).map_err(LaunchError::Signal)?;
@@ -3741,34 +2990,24 @@ fn start_run(
     }
 }
 
-/// The exit code of a run a stop signal ended before the sandbox was let
-/// go: the one its command gives when the SIGTERM a normal run forwards
-/// stops it.
+// What the command gives when the forwarded SIGTERM stops it.
 const STOPPED_CODE: i32 = 128 + SIGTERM;
 
-/// What [`start_lock_path`] puts after the instance's name. `@` is no
-/// character an instance name may hold, so the file can be no instance's
-/// runtime directory.
+/// `@` is no character of an instance name, so the lock file is no instance's runtime directory.
 pub(crate) const START_LOCK_SUFFIX: &str = "@start.lock";
 
-/// How often a start waiting on another's start lock tries again and
-/// looks at its stop flag.
 const START_LOCK_POLL: Duration = Duration::from_millis(50);
 
-/// `$XDG_RUNTIME_DIR/bubbler/<name>@start.lock`, the lock a start of
-/// `name` holds from its liveness check through its bind. Beside the
-/// runtime directory rather than in it, so that removing the directory
-/// leaves it; only a throwaway sandbox, which no other start shares,
-/// removes its own, since a start that locked a file since unlinked
-/// would hold a lock nobody else sees.
+/// The lock a start holds from its liveness check through its bind, beside the runtime
+/// directory so removing that leaves it. Only a throwaway sandbox removes its own: a lock on an
+/// unlinked file is one nobody else sees.
 pub(crate) fn start_lock_path(env: &Env, name: &str) -> PathBuf {
     env.runtime_dir
         .join(RUNTIME_SUBDIR)
         .join(format!("{name}{START_LOCK_SUFFIX}"))
 }
 
-/// Open the start lock, creating it, without following a link and
-/// without a FIFO parking the open.
+// Follows no link, and no FIFO can park the open.
 fn open_start_lock(path: &Path) -> Result<OwnedFd, LaunchError> {
     rustix::fs::open(
         path,
@@ -3783,14 +3022,8 @@ fn open_start_lock(path: &Path) -> Result<OwnedFd, LaunchError> {
     .map_err(|e| LaunchError::Io(path.to_path_buf(), e.into()))
 }
 
-/// Bind the instance's control socket in `dir`, the one place a socket
-/// left by a dead run is unlinked. `AlreadyRunning` when a run answers on
-/// it, which a start that lost the race to another finds too: the check,
-/// the unlink and the bind all happen under the lock at `lock_path`,
-/// released on return. `Stopped` when a stop signal arrives while it
-/// waits. `log` is told the run [started](run_log::Redirect::started)
-/// while the lock is still held, so a start that joins this one adds to
-/// it only after it was emptied.
+// The liveness check, the unlink of a dead run's socket and the bind all happen under the lock;
+// `log` is told the run started while it is held, so a joining start adds after the emptying.
 fn bind_control_socket(
     dir: &Path,
     lock_path: &Path,
@@ -3834,9 +3067,7 @@ fn bind_control_socket(
     Ok((listener, guard))
 }
 
-/// Removes the control socket this run bound when the run leaves, and
-/// only that one: a start made once this run's sandbox had exited may
-/// have bound its own at the same path.
+// Only the socket this run bound: a start after this sandbox exited may have bound its own.
 #[derive(Debug)]
 struct SocketGuard {
     path: PathBuf,
@@ -3856,11 +3087,8 @@ impl Drop for SocketGuard {
     }
 }
 
-/// Take the start lock again once the sandbox has exited, so a start
-/// made now waits for this run's teardown instead of binding into it.
-/// Blocking: a stop signal has usually ended the run by now, and another
-/// start holds the lock only from its liveness check to its bind. A lock
-/// that cannot be had costs only that guarantee, so it is a warning.
+// So a start made now waits for this run's teardown. A lock that cannot be had costs only that
+// guarantee, so it is a warning.
 fn lock_for_teardown(path: &Path) -> Option<OwnedFd> {
     let locked = open_start_lock(path).and_then(|lock| {
         flock(&lock, FlockOperation::LockExclusive)
@@ -3876,8 +3104,6 @@ fn lock_for_teardown(path: &Path) -> Option<OwnedFd> {
     }
 }
 
-/// [`run`] once its runtime directory is there, with the stop signals
-/// already caught in `stop`.
 fn start_and_wait(
     env: &Env,
     inst: &Instance,
@@ -3889,9 +3115,7 @@ fn start_and_wait(
 ) -> Result<i32, LaunchError> {
     let dir = instance_runtime_dir(env, &inst.name);
     let lock_path = start_lock_path(env, &inst.name);
-    // Declared first so that it is dropped last: taken again once the
-    // sandbox has exited, it holds a relaunch back until everything
-    // below is torn down.
+    // Declared first to drop last: it holds a relaunch back until everything below is torn down.
     let _ending: Option<OwnedFd>;
     let sock_path = dir.join(exec::SOCKET_NAME);
     let io_at = |e: Errno| LaunchError::Io(sock_path.clone(), e.into());
@@ -3909,10 +3133,8 @@ fn start_and_wait(
         Some(plan) => Some(start_proxy(env, &dir, plan, &RealHost, stop)?),
         None => None,
     };
-    // Between the proxy's ready byte and the sandbox's bind each socket
-    // is moved where the proxy cannot reach it, and only then checked. The
-    // guards stay in scope for the whole run; each removes its socket
-    // when it drops.
+    // Each socket is moved out of the proxy's reach, then checked; each guard removes its socket
+    // at the end of the run.
     let mut buses: Vec<FileGuard> = Vec::new();
     if let Some(plan) = &plan {
         for (socket, node) in plan.buses() {
@@ -3922,33 +3144,24 @@ fn start_and_wait(
     if stop.load(Ordering::SeqCst) {
         return Ok(STOPPED_CODE);
     }
-    // Before the argv is built, for the same reason the D-Bus proxy is:
-    // the socket the sandbox binds is the one this sidecar accepts on,
-    // and a bind of a socket nothing is listening on is a failed start.
-    // The handle holds the proxy and the security context open for the
-    // whole run. `wayland "host"` asks for the session's socket outright,
-    // and without the grant there is nothing to start.
+    // Before the argv: the sandbox binds the socket this sidecar accepts on, and a bind of a
+    // socket nothing listens on is a failed start.
     let _wayland = start_wayland(env, &dir, inst, &RealHost, stop)?;
     if stop.load(Ordering::SeqCst) {
         return Ok(STOPPED_CODE);
     }
-    // Before the argv is built, for the same reason: the socket an audio
-    // grant binds is the one this sidecar's holder creates, and it is
-    // the only PipeWire socket the sandbox is given.
+    // Before the argv too: the context socket is the only PipeWire socket the sandbox gets.
     let _pw_context = start_pw_context(env, &dir, inst, &RealHost, stop)?;
     if stop.load(Ordering::SeqCst) {
         return Ok(STOPPED_CODE);
     }
-    // After the context, which it connects to, and before the sandbox,
-    // whose only PulseAudio socket it serves. Dropped before the context
-    // handle, since this server is one of that context's clients.
+    // After the context it connects to, before the sandbox it serves; dropped before the context.
     let _pw_pulse = start_pw_pulse(env, &dir, inst, &RealHost, stop)?;
     let host = tty::host_stdio()?;
     let is_tty = tty::host_is_tty();
     let mut stdio = tty::plan(mode, is_tty);
-    // The pty copies the settings of the first terminal bubbler has, and
-    // is allocated before raw mode: afterwards it would carry raw
-    // settings, leaving the sandbox without echo or line editing.
+    // Allocated before raw mode, whose settings it would otherwise copy, leaving the sandbox
+    // without echo or line editing.
     if let Some(i) = stdio
         .needs_pty()
         .then(|| is_tty.iter().position(|t| *t))
@@ -3959,25 +3172,17 @@ fn start_and_wait(
     // Before the argv is built, for the same reason the proxy is: a bind
     // whose source is not there is a failed start, not a warning.
     prepare_app_runtime(env, &inst.config.services)?;
-    // Before bwrap is spawned, and not later: bwrap never changes cgroup,
-    // so whatever cgroup it is started in becomes the root of the
-    // sandbox's cgroup namespace. This moves bubbler into the run's
-    // `sandbox` leaf, so the sandbox inherits it and the proxy's leaf
-    // beside it is outside anything the application can name. Dropped
-    // after the sidecars below, which is what puts bubbler back and
-    // removes the directories.
+    // Before bwrap, which never changes cgroup: the sandbox inherits the run's `sandbox` leaf, and
+    // the proxy's leaf beside it is out of its reach. Dropped after the sidecars below.
     let net_cgroup = match isolated.filter(|c| !c.allow_hosts.is_empty()) {
         Some(_) => Some(cgroup::create(&inst.name, std::process::id())?),
         None => None,
     };
-    // The operations rather than the flat argv, because the sweep below
-    // reads their destinations. Flattened again straight after, so what
-    // bwrap is handed is what `build_argv` would have produced.
+    // The operations, not the flat argv, because the sweep reads their destinations.
     let (args, resolved) = build_args_on(env, inst, command, stdio.ctty(), &RealHost)?;
     let finished = args.finish_ops(resolved, &mut alloc)?;
-    // Before the spawn and after the argv: a destination behind a link an
-    // application planted is a write outside the sandbox on every bwrap
-    // below 0.12.0, and the run is refused rather than made safe.
+    // A destination behind a planted link is a write outside the sandbox on bwrap below 0.12.0,
+    // so the run is refused.
     service::sweep_destinations(&finished.ops, env, &RealHost)?;
     let argv = finished.into_argv();
     // What `stop` becomes once a run has seen it: `stop` is cleared as
@@ -3992,17 +3197,13 @@ fn start_and_wait(
     if stop.load(Ordering::SeqCst) {
         return Ok(STOPPED_CODE);
     }
-    // Raw from here on: the pty inside has the line discipline now, so
-    // Ctrl-C is a byte for it and the guard restores the terminal on
-    // every way out of this function.
+    // Raw from here: the pty inside has the line discipline, so Ctrl-C is a byte for it.
     let mut raw = match stdio.raw_mode() {
         true => Some(RawGuard::new(host[0].as_fd())?),
         false => None,
     };
     let mut cmd = bwrap_command(&argv, &mut alloc)?;
-    // The sandbox's own fds are inheritable for exactly this spawn: the
-    // proxy was started before it and pasta is started after it, and the
-    // instance's control socket in particular is neither one's to hold.
+    // Inheritable for exactly this spawn: the proxy started before it and pasta starts after it.
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     fcntl_setfd(&inherited, FdFlags::empty()).map_err(io_at)?;
     spawning(&alloc.intended())?;
@@ -4023,10 +3224,8 @@ fn start_and_wait(
         })?;
     alloc.close_options();
     alloc.inheritable(false).map_err(LaunchError::Data)?;
-    // The sandbox holds the listening socket and the info pipe now; bubbler
-    // keeping copies would make a dead instance look live and hide the EOF.
-    // Each number is given up with its descriptor, so nothing a later
-    // sweep is asked to spare is a number that has since been recycled.
+    // Copies kept here would make a dead instance look live and hide the EOF; each number goes
+    // with its descriptor, so no later sweep spares a recycled number.
     alloc.socket.take();
     drop(inherited);
     drop(listener);
@@ -4052,11 +3251,8 @@ fn start_and_wait(
         true => publish_identity(env, &inst.name, info.as_ref().map(|(_, raw)| &raw[..])),
         false => None,
     };
-    // pasta before the release, and before the supervisor is looked for:
-    // a sandbox held at `--block-fd` has not forked the supervisor yet,
-    // and one let go before its namespace is connected would start with
-    // no network at all. A sandbox that cannot be connected is stopped
-    // where it stands rather than run without what it was granted.
+    // pasta before the release and the supervisor lookup: a held sandbox has not forked it yet,
+    // and one released unconnected would start without network. One that cannot is stopped.
     let mut network = match isolated {
         Some(cfg) => {
             let started = match info.as_ref() {
@@ -4070,9 +3266,8 @@ fn start_and_wait(
             match started {
                 Ok(handle) => Some(handle),
                 Err(e) => {
-                    // A Ctrl-C reaches the held bwrap too and kills it,
-                    // which is the stop's doing. Any other failure is
-                    // reported, a stop pending or not.
+                    // A Ctrl-C kills the held bwrap too, which is the stop's doing; any other
+                    // failure is reported.
                     let bwrap_ended = matches!(child.try_wait(), Ok(Some(_)));
                     abort_sandbox(&mut child, info.as_ref().map(|(pid, _)| *pid));
                     if stop.load(Ordering::SeqCst) && bwrap_ended {
@@ -4098,11 +3293,8 @@ fn start_and_wait(
     let supervisor = info.as_ref().and_then(|(reaper, _)| {
         supervisor_pid(*reaper, &mut child, Instant::now() + SUPERVISOR_WAIT)
     });
-    // Output the user's own descriptors cannot take goes here instead:
-    // when none of them can be written to at all (`bubbler run x
-    // < /dev/tty > out`), when one stops taking it (a reader that left),
-    // and after a detach. Draining somewhere is what keeps a command from
-    // blocking on a full pty or pipe.
+    // Where output goes that the user's descriptors cannot take, and after a detach: draining
+    // keeps a command from blocking on a full pty or pipe.
     let sink = tty::null_stdio()?;
     let caught = tty::Caught {
         winch: &winch,
@@ -4121,9 +3313,7 @@ fn start_and_wait(
     let code = match &master {
         Some(master) => {
             let out = tty::output_fd(&stdio, &host);
-            // With nothing of the user's able to take the output it goes
-            // to the sink, which never refuses it, so the name is never
-            // printed.
+            // The sink never refuses output, so this name is never printed.
             let (host_out, out_name) = match out {
                 Some(i) => (host[i].as_fd(), tty::FD_NAMES[i]),
                 None => (sink.as_fd(), tty::FD_NAMES[1]),
@@ -4158,16 +3348,13 @@ fn start_and_wait(
         .take()
         .or_else(|| lock_for_teardown(&lock_path));
     let code = code?;
-    // After the wait and not before it: the generated files are the live
-    // sources of the sandbox's read-only binds, and dropping the
-    // allocator unlinks them.
+    // After the wait: the generated files are the live sources of the sandbox's binds, and
+    // dropping the allocator unlinks them.
     drop(alloc);
     Ok(code)
 }
 
-/// Run `argv` inside the live instance `name` and return its exit code.
-/// `mode` decides the terminal the command inside gets, exactly as for
-/// [`run`].
+/// Run `argv` inside the live instance `name` and return its exit code; `mode` is as for [`run`].
 pub fn exec(env: &Env, name: &str, argv: &[OsString], mode: TtyMode) -> Result<i32, LaunchError> {
     match exec::connect(env, name)? {
         Some(stream) => exec::run_in(&stream, argv, mode),
