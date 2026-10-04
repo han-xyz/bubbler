@@ -62,6 +62,10 @@
   opens no clipboard read at all, since it may have waited in the
   compositor's buffer: input on that connection opens no paste for one
   second after reading resumes.
+- A sandbox can no longer write lines of its own into the audit log of
+  `bubbler-wl-proxy`, or send control sequences through it to a terminal:
+  the MIME type of a clipboard read and the interface of a refused bind are
+  written escaped and cut at 128 bytes.
 
 ### Changed
 
@@ -86,6 +90,15 @@
   pad button press, now allow a paste under the Wayland clipboard gate like
   a key press or a mouse click; one sent as the pen enters or leaves a
   window does not.
+- An application no longer loses its Wayland connection when a monitor
+  goes away just as it binds the output (a KVM switch, a dock, a display
+  waking from sleep): `bubbler-wl-proxy` forwards a bind of a global the
+  compositor has just removed, and a refused bind is logged with its real
+  cause (hidden, never offered, or another interface or version).
+- `bubbler-wl-proxy` logs a compositor whose accept queue is full as
+  `no upstream socket` and closes the application's connection, where it
+  used to pair the connection with a socket that never connected and end it
+  without a log line.
 - A stopped run is over by the first stop's deadline: a command that exits
   late in the grace no longer gives the exec'd children, the window manager
   and the X server a new five seconds each before they are killed.

@@ -16,6 +16,25 @@ use std::time::{Duration, Instant};
 /// counted instead.
 pub const RATE: Duration = Duration::from_secs(1);
 
+/// Longest a client-chosen string grows a line, in bytes after escaping.
+pub const MAX_CLIENT_TEXT: usize = 128;
+
+/// A string the client chose, as a line may carry it: escaped, so no control
+/// byte can end the line or reach a terminal, and cut at [`MAX_CLIENT_TEXT`]
+/// with `...[cut]` marking the cut.
+pub fn client_text(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        let escaped = c.escape_debug().to_string();
+        if out.len() + escaped.len() > MAX_CLIENT_TEXT {
+            out.push_str("...[cut]");
+            break;
+        }
+        out.push_str(&escaped);
+    }
+    out
+}
+
 /// What a line is about, and so which budget it comes out of.
 ///
 /// The two are counted apart on purpose. A client that asks for the clipboard

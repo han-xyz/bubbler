@@ -672,8 +672,9 @@ impl Relay {
         match connect(&socket, &address) {
             Ok(()) => Ok(socket),
             // A connection the kernel could not finish at once finishes on
-            // the first write, which is queued like any other.
-            Err(Errno::INPROGRESS) | Err(Errno::AGAIN) => Ok(socket),
+            // the first write, which is queued like any other. `EAGAIN` is
+            // not that: on a Unix socket it is a full accept queue.
+            Err(Errno::INPROGRESS) => Ok(socket),
             Err(err) => Err(err),
         }
     }
@@ -1188,6 +1189,60 @@ mod tests {
         assert!(
             waited.elapsed() >= Duration::from_millis(50),
             "the loop did not wait at all"
+        );
+    }
+
+    #[test]
+    fn a_compositor_with_a_full_accept_queue_is_a_logged_failure() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let listener =
+            std::os::unix::net::UnixListener::bind(dir.path().join("listen")).expect("a listener");
+        listener.set_nonblocking(true).expect("non-blocking");
+        let upstream = dir.path().join("upstream");
+        let compositor = socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("a socket");
+        let address = SocketAddrUnix::new(&upstream).expect("an address");
+        rustix::net::bind(&compositor, &address).expect("bind");
+        rustix::net::listen(&compositor, 0).expect("listen");
+        let mut queued = Vec::new();
+        loop {
+            let socket = socket_with(
+                AddressFamily::UNIX,
+                SocketType::STREAM,
+                SocketFlags::NONBLOCK,
+                None,
+            )
+            .expect("a socket");
+            match connect(&socket, &address) {
+                Ok(()) => queued.push(socket),
+                Err(Errno::AGAIN) => break,
+                Err(err) => panic!("filling the accept queue: {err}"),
+            }
+        }
+        let log = Buf::default();
+        let mut relay = Relay {
+            listener: OwnedFd::from(listener),
+            upstream,
+            policy: Policy::new(Gate::Paste, false),
+            audit: Audit::new(Box::new(log.clone())),
+            conns: Vec::new(),
+            backoff: false,
+            refusing: false,
+        };
+        let _app = UnixStream::connect(dir.path().join("listen")).expect("the app connects");
+        relay.accept(Instant::now());
+        assert!(relay.conns.is_empty());
+        assert_eq!(
+            log.text(),
+            format!(
+                "bubbler-wl-proxy: connection closed: no upstream socket: {}\n",
+                Errno::AGAIN
+            )
         );
     }
 

@@ -69,7 +69,7 @@ Ten processes can come with a sandbox, and they are not one kind of thing:
 | `xdg-dbus-proxy` | its own bwrap sandbox, sibling of the app's | **Yes.** It is a filter, it sees only the host bus sockets read-only — up to three of them — and the instance's `dbus/` subdirectory read-write, and the socket it serves is moved out of its reach before anything is bound. Its stdin and stdout are `/dev/null` and its stderr a pipe bubbler copies to its own. |
 | `pw-container` | its own bwrap sandbox, sibling of the app's, started for every `pipewire` or `pulseaudio` grant | **Not a party to one.** It creates the boundary rather than standing in it: once the context exists, the sandboxed application's PipeWire traffic reaches the session daemon directly through the socket bwrap binds in, and the daemon applies whatever policy the WirePlumber drop-in matches to the context's properties — `pw-container` itself is never on that path, and the sandboxed app never talks to it. What it holds: the one connection it opens to the host's `pipewire-0` to create the context, its own `<inst>/pw` directory as its whole `/tmp` and nothing else, no network, no home; stdin and stdout are `/dev/null` and stderr a pipe bubbler copies to its own. It runs until its own child — the holder that reports the socket's path and then waits on a signal — exits, and that exit is what tears the context down. |
 | the private `pipewire-pulse` | its own bwrap sandbox, sibling of the app's and of `pw-container`'s, only with a `pulseaudio` grant | **Yes.** Unlike the context holder, this one is in the data path: a pulse client inside the sandbox speaks the PulseAudio protocol to it directly, over the socket bwrap binds in, which is why it is confined the same way the proxies are. It reaches nothing of the session — its own outbound connection is the context socket alone, so it arrives at the daemon as a client of this same context — and its own `<inst>/pwpulse` directory is its whole `/tmp`, sharing no bind with `pw-container`'s `<inst>/pw`. Its socket is adopted into `<inst>/` — moved out of its own reach and checked — before bubbler binds it into the sandbox, the same pattern the context socket and the D-Bus proxy's both follow. What it enforces beyond the daemon's own policy: `pulse.allow-module-loading = false` in the config bubbler writes for it, so a client cannot `LOAD_MODULE` its way past a WirePlumber policy that never gated module loading at all. Its stdin and stdout are `/dev/null` and its stderr a pipe bubbler copies to its own. |
-| `bubbler-wl-proxy` | its own bwrap sandbox, sibling of the app's, in front of every sandboxed `wayland` (bare or `clipboard="open"`) | **Yes.** It is the only thing listening on the socket the sandbox connects to, and it forwards nothing it could not decode: every message is parsed against generated interface tables and re-encoded from what was parsed. It sees all of the sandbox's display traffic in both directions. What it holds is the app-facing listener, handed in by number, one connection to the compositor for each of the up to 256 client connections it accepts, and two more descriptors the launcher passes — the audit log and the readiness pipe — with `/dev/null` as stdin and stdout and a pipe bubbler copies to its own stderr as stderr. The `wayland-context` socket it dials is the one thing of the run bound into its sandbox: no home, no network, no instance runtime directory, no `init.sock`, default seccomp. It does not see what a clipboard read returns; those bytes travel on a descriptor it passes through without reading. |
+| `bubbler-wl-proxy` | its own bwrap sandbox, sibling of the app's, in front of every sandboxed `wayland` (bare or `clipboard="open"`) | **Yes.** It is the only thing listening on the socket the sandbox connects to, and it forwards nothing it could not decode: every message is parsed against generated interface tables and re-encoded from what was parsed. It sees all of the sandbox's display traffic in both directions. What it holds is the app-facing listener, handed in by number, one connection to the compositor for each of the up to 256 client connections it accepts, and one more descriptor the launcher passes, the readiness pipe, with `/dev/null` as stdin and stdout and a pipe bubbler copies to its own stderr as stderr; the audit log goes to that stderr pipe. The `wayland-context` socket it dials is the one thing of the run bound into its sandbox: no home, no network, no instance runtime directory, no `init.sock`, default seccomp. It does not see what a clipboard read returns; those bytes travel on a descriptor it passes through without reading. |
 | `bubbler-init` | *inside* the sandbox, as pid 2 | **No.** It is the supervisor, not a guard: it shares the sandbox with the application. What it holds — the listening control socket — is kept from the application by being an inherited descriptor with no path, `CLOEXEC` in the only process that has it, and `PR_SET_DUMPABLE` off so `/proc/<init>/fd` cannot be walked. |
 | `Xwayland` | *inside* the sandbox, started by `bubbler-init` on the first X connection, only with a bare `x11` | **No.** It is the sandbox's own X server rather than a guard in front of one: every client on it is a process of this instance, and X11 isolates none of them from each other. What it replaces is the session's display — it reaches the compositor on the instance's own Wayland socket and listens nowhere but `/tmp/.X11-unix/X0` in the sandbox's private `/tmp`, a socket `bubbler-init` binds and hands over rather than one the server opens. A command that never speaks X11 never starts it. See "X11" below. |
 | a window manager | *inside* the sandbox, started by `bubbler-init` with the server, only with `x11 wm="…"` | **No.** It is a sibling of the application under `bubbler-init`, resolved on the sandbox's own `PATH`, with the same access to that X server as the application it manages and no more reach into it than any other sibling has. Arch enables the Yama LSM with `kernel.yama.ptrace_scope` at 1 (restricted), which stops a `ptrace` on a tracee outside a restricted scope unless the tracer is privileged or holds `CAP_SYS_PTRACE`; the kernel's Yama document defines that scope as the tracer's own descendants, `PR_SET_PTRACER` being the opt-in, and two siblings are outside each other's. bubbler ships none and probes none; a name that resolves to nothing is a log line. |
@@ -353,12 +353,17 @@ it saw — with a synthesised `wl_display.error` and a closed connection.
 That last check is the one that matters: hiding a global from
 `wl_registry.global` does not stop a client naming it by number, and a
 draft that only withheld advertisements was bound straight through by
-exactly that route while this was being built. On a compositor with no
-security context the proxy applies a denylist of its own — 40 interface
-names: the 31 Hyprland withholds from a sandboxed client, plus nine of
-the same class found by reading every global the proxy's tables describe,
-whether another compositor implements it or Hyprland hands it to a
-sandboxed client anyway — and the launch says so with a note. What the
+exactly that route while this was being built. A global the compositor
+withdraws after offering it stays bindable at the interface and version
+offered, since libwayland lets a bind that raced the removal through and
+the compositor makes the object inert; the proxy remembers the last 64
+per connection. The proxy applies a denylist of its own on every
+connection — 40 interface names: the 31 Hyprland withholds from a
+sandboxed client, plus nine of the same class found by reading every
+global the proxy's tables describe, whether another compositor implements
+it or Hyprland hands it to a sandboxed client anyway — and on a
+compositor with no security context, where that list is the only
+enforcement, the launch says so with a note. What the
 list lets through is written down too, so a protocol bump that brings a
 new global fails a test rather than reaching a sandbox unexamined.
 
@@ -410,6 +415,7 @@ a pid names the sidecar.
 `policy::tests::binding_a_global_that_was_never_advertised_is_refused`,
 `policy::tests::binding_above_the_advertised_version_is_refused`,
 `policy::tests::binding_a_name_under_another_interface_is_refused`,
+`policy::tests::a_bind_racing_the_removal_of_its_global_is_forwarded`,
 `a_sandboxed_wayland_grant_names_the_proxy_in_front_of_it`,
 `real_wayland_binds_bubblers_own_socket_not_the_hosts`,
 `real_wayland_proxy_hands_the_application_a_smaller_registry`,
@@ -459,8 +465,8 @@ long the drag took. A tablet frame that also holds a `proximity_in` or
 surface, and `up` and releases when it leaves one, so a sandbox could
 otherwise arm the gate by moving its window under a pen in use elsewhere.
 A key held when keyboard focus arrives is only listed in
-`wl_keyboard.enter`, which arms nothing. The second counts from the earliest moment the event could
-have reached the proxy, not from when the proxy read it: the last instant
+`wl_keyboard.enter`, which arms nothing. The second counts from the
+earliest moment the event could have reached the proxy, not from when the proxy read it: the last instant
 the proxy saw the compositor's side of that connection empty (nothing
 left to read after a read), or was waiting on it in `poll` with nothing
 unread. An empty read alone would not do: the proxy reads once per
@@ -473,9 +479,10 @@ after the proxy resumes reading a connection the sandbox held back, input
 on that connection arms nothing at all, however short the stall. The cost:
 input on that connection opens no paste for one second after reading
 resumes. The event's own `time` argument is not used: the protocol leaves
-its clock undefined. Outside the window the request is not forwarded and the descriptor it carried is closed, so the client reads end
-of file exactly as if the selection had been empty, and one line goes to
-the audit log:
+its clock undefined. Outside the window the request is not forwarded and
+the descriptor it carried is closed, so the client reads end of file
+exactly as if the selection had been empty, and one line goes to the
+audit log:
 
 ```
 bubbler-wl-proxy: clipboard read denied (wl_data_offer, text/plain): no input since the proxy started
@@ -523,9 +530,9 @@ live compositor.
 **Hard limits.** The proxy is bounded rather than trusting, and the
 bounds do not all do the same thing. Three of them end one connection,
 with a `connection closed: …` line naming which and why while every other
-connection carries on: 253 descriptors waiting on one side, which is
-Linux's own maximum for a single `recvmsg` and far past the two any
-message owns; 64 MiB of bytes queued across all of one sandbox's
+connection carries on: more than 253 descriptors waiting on one side,
+253 being Linux's own maximum for a single `recvmsg` and far past the
+two any message owns; 64 MiB of bytes queued across all of one sandbox's
 connections at once, where the connection holding the most is the one
 that gives way; and 65 536 live object ids on a connection. The other two
 apply back-pressure instead. 4 MiB queued in one direction stops the
@@ -537,6 +544,10 @@ The gate window is one second and the audit log is one line a
 second per kind — gate lines and closures budgeted apart, so a `receive` in
 a loop cannot push the line that says why a connection ended out of the
 record — with what a burst swallowed counted onto the next line. The
+strings a client chooses, the MIME type of a `receive` and the interface
+of a refused `bind`, are written escaped and cut at 128 bytes, so a
+sandbox cannot end a line, forge one or send a terminal control sequence
+through the log. The
 upstream socket is dialled once before the run starts, bounded at two
 seconds, so a compositor that is not answering stops the launch rather than
 every connection inside it.

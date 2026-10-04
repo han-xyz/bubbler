@@ -14,12 +14,12 @@
 //! `receive` is forwarded only just after real user input, so an app cannot
 //! read the selection in the background.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
 use std::os::fd::OwnedFd;
 use std::time::{Duration, Instant};
 
-use crate::audit::{Audit, Kind};
+use crate::audit::{Audit, Kind, client_text};
 use crate::objects::{ObjectError, Objects};
 use crate::tables::{self, Interface, Message};
 use crate::wire::{self, Arg};
@@ -48,6 +48,10 @@ const DISPLAY_ID: u32 = 1;
 /// Opcode of the `wl_display.error` event the proxy synthesises to refuse a
 /// bind. Code 0 goes with it: the error is the proxy's, not an interface's.
 const DISPLAY_ERROR: u16 = 0;
+
+/// Removed globals a connection still accepts a `bind` of, newest kept. A
+/// bind racing the removal arrives within one round trip of it.
+const MAX_REMOVED_GLOBALS: usize = 64;
 
 /// Whether a clipboard read has to follow user input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +115,9 @@ pub struct Connection {
     /// that is not in here was never advertised to this client, or was hidden
     /// from it, and cannot be bound.
     globals: HashMap<u32, Global>,
+    // Withdrawn after being offered, oldest first: still bindable, since
+    // libwayland lets a bind that raced the removal through.
+    removed: VecDeque<(u32, Global)>,
     // Per tablet tool, what its unfinished frame held so far.
     tool_frames: HashMap<u32, ToolFrame>,
 }
@@ -242,7 +249,7 @@ impl Policy {
         }
         let iface = msg.interface.name;
         let mime = match msg.args.first() {
-            Some(Arg::String(Some(mime))) => mime.to_string_lossy().into_owned(),
+            Some(Arg::String(Some(mime))) => client_text(&mime.to_string_lossy()),
             _ => String::new(),
         };
         if self.gate == Gate::Open {
@@ -362,7 +369,12 @@ impl Policy {
         if conn.objects.is_hidden(name) {
             return drop_message(msg);
         }
-        conn.globals.remove(&name);
+        if let Some(global) = conn.globals.remove(&name) {
+            if conn.removed.len() == MAX_REMOVED_GLOBALS {
+                conn.removed.pop_front();
+            }
+            conn.removed.push_back((name, global));
+        }
         Action::Forward
     }
 
@@ -397,21 +409,35 @@ impl Policy {
             ));
         };
         let (name, version, new_id) = (*name, *version, *new_id);
-        let wanted = iface.to_string_lossy().into_owned();
+        let wanted = iface.to_string_lossy();
         // The name must have been offered, for this very interface, at this
         // version or above: a client may name a global it never saw.
-        let offered = conn.globals.get(&name).copied().filter(|global| {
-            tables::by_index(global.interface).is_some_and(|known| known.name == wanted)
-                && (1..=global.version).contains(&version)
+        let offered = conn.globals.get(&name).or_else(|| {
+            conn.removed
+                .iter()
+                .rev()
+                .find_map(|(removed, global)| (*removed == name).then_some(global))
         });
-        let Some(global) = offered else {
-            let why = format!(
-                "bind of hidden global {wanted} (name {name}, v{version}) refused by the sandbox proxy"
-            );
-            return Ok(refuse(msg.object, &why, audit, now));
+        let bound = client_text(&wanted);
+        let refused = match offered.map(|global| (global, tables::by_index(global.interface))) {
+            Some((global, Some(known)))
+                if known.name == wanted && (1..=global.version).contains(&version) =>
+            {
+                conn.objects.bind(name, global.interface, version, new_id)?;
+                return Ok(Action::Forward);
+            }
+            Some((global, known)) => format!(
+                "global {bound} (name {name}, v{version}), offered as {} v{},",
+                known.map_or("?", |known| known.name),
+                global.version
+            ),
+            None if conn.objects.is_hidden(name) => {
+                format!("hidden global {bound} (name {name}, v{version})")
+            }
+            None => format!("unoffered global {bound} (name {name}, v{version})"),
         };
-        conn.objects.bind(name, global.interface, version, new_id)?;
-        Ok(Action::Forward)
+        let why = format!("bind of {refused} refused by the sandbox proxy");
+        Ok(refuse(msg.object, &why, audit, now))
     }
 }
 
@@ -822,7 +848,106 @@ mod tests {
         let action = proxy.bind(9, "wl_compositor", 1, 3);
         assert_eq!(
             error_text(&action),
-            "bind of hidden global wl_compositor (name 9, v1) refused by the sandbox proxy"
+            "bind of unoffered global wl_compositor (name 9, v1) refused by the sandbox proxy"
+        );
+        assert!(
+            proxy
+                .log
+                .text()
+                .contains("connection closed: bind of unoffered global wl_compositor (name 9, v1)")
+        );
+    }
+
+    fn remove_global(proxy: &mut Proxy, name: u32) -> Action {
+        let mut args = vec![Arg::Uint(name)];
+        proxy
+            .send(
+                false,
+                REGISTRY,
+                "wl_registry",
+                "global_remove",
+                &mut args,
+                &mut Vec::new(),
+            )
+            .expect("accountable")
+    }
+
+    #[test]
+    fn a_bind_racing_the_removal_of_its_global_is_forwarded() {
+        let mut proxy = proxy();
+        proxy.advertise(3, "wl_output", 4);
+        assert_eq!(remove_global(&mut proxy, 3), Action::Forward);
+        assert_eq!(proxy.bind(3, "wl_output", 4, 5), Action::Forward);
+        let entry = proxy.conn.objects.get(5).expect("the output is mapped");
+        assert_eq!(entry.version, 4);
+        assert_eq!(proxy.log.text(), "");
+    }
+
+    #[test]
+    fn a_removed_global_is_still_bound_only_as_it_was_offered() {
+        let mut proxy = proxy();
+        proxy.advertise(3, "wl_output", 2);
+        remove_global(&mut proxy, 3);
+        let action = proxy.bind(3, "wl_output", 3, 5);
+        assert_eq!(
+            error_text(&action),
+            "bind of global wl_output (name 3, v3), offered as wl_output v2, \
+             refused by the sandbox proxy"
+        );
+    }
+
+    #[test]
+    fn only_the_latest_removed_globals_stay_bindable() {
+        let mut proxy = proxy();
+        let count = u32::try_from(MAX_REMOVED_GLOBALS).expect("fits") + 1;
+        for name in 1..=count {
+            proxy.advertise(name, "wl_output", 4);
+            remove_global(&mut proxy, name);
+        }
+        assert_eq!(proxy.bind(count, "wl_output", 4, 5), Action::Forward);
+        let action = proxy.bind(1, "wl_output", 4, 6);
+        assert_eq!(
+            error_text(&action),
+            "bind of unoffered global wl_output (name 1, v4) refused by the sandbox proxy"
+        );
+    }
+
+    #[test]
+    fn a_refused_bind_writes_its_interface_escaped_on_one_line() {
+        let mut proxy = proxy();
+        proxy.bind(9, "x\nbubbler-wl-proxy: forged\u{1b}[2J", 1, 3);
+        assert_eq!(
+            proxy.log.text(),
+            "bubbler-wl-proxy: connection closed: bind of unoffered global \
+             x\\nbubbler-wl-proxy: forged\\u{1b}[2J (name 9, v1) refused by the sandbox proxy\n"
+        );
+    }
+
+    #[test]
+    fn a_clipboard_read_writes_its_mime_type_escaped_on_one_line() {
+        let mut proxy = proxy();
+        proxy.receive(
+            10,
+            "wl_data_offer",
+            "text/plain\nbubbler-wl-proxy: forged\u{1b}[2J",
+        );
+        assert_eq!(
+            proxy.log.text(),
+            "bubbler-wl-proxy: clipboard read denied (wl_data_offer, \
+             text/plain\\nbubbler-wl-proxy: forged\\u{1b}[2J): no input since the proxy started\n"
+        );
+    }
+
+    #[test]
+    fn an_over_long_mime_type_is_cut_and_marked() {
+        let mut proxy = Proxy::new(Gate::Open, false);
+        proxy.receive(10, "wl_data_offer", &"a".repeat(4096));
+        assert_eq!(
+            proxy.log.text(),
+            format!(
+                "bubbler-wl-proxy: clipboard read allowed (open): wl_data_offer, {}...[cut]\n",
+                "a".repeat(128)
+            )
         );
     }
 
@@ -833,7 +958,8 @@ mod tests {
         let action = proxy.bind(3, "wl_compositor", 3, 4);
         assert_eq!(
             error_text(&action),
-            "bind of hidden global wl_compositor (name 3, v3) refused by the sandbox proxy"
+            "bind of global wl_compositor (name 3, v3), offered as wl_compositor v2, \
+             refused by the sandbox proxy"
         );
     }
 
@@ -844,7 +970,8 @@ mod tests {
         let action = proxy.bind(3, "wl_shm", 1, 4);
         assert_eq!(
             error_text(&action),
-            "bind of hidden global wl_shm (name 3, v1) refused by the sandbox proxy"
+            "bind of global wl_shm (name 3, v1), offered as wl_compositor v1, \
+             refused by the sandbox proxy"
         );
     }
 
