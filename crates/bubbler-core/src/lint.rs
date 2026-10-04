@@ -604,8 +604,8 @@ fn bus_names(i: usize, source: &Source, f: &mut Findings) {
     }
 }
 
-/// The prefix every XDG desktop portal name starts with.
-const PORTAL_PREFIX: &str = "org.freedesktop.portal.";
+/// Every XDG desktop portal name, as a family.
+const PORTAL_NAMES: &str = "org.freedesktop.portal.*";
 
 /// The nodes the proxy carries: rules on the session bus, or on the
 /// accessibility bus the same proxy serves.
@@ -1819,15 +1819,18 @@ fn dbus_node(i: usize, node: &KdlNode, f: &mut Findings) {
         if level == "own" {
             own_too_wide(i, rule, f);
         }
-        if !matches!(level, "talk" | "own") || rule_name(rule) != Some(SECRETS_NAME) {
+        if !matches!(level, "talk" | "own") {
             continue;
         }
+        let Some(name) = rule_name(rule).filter(|n| name_covers(n, SECRETS_NAME)) else {
+            continue;
+        };
         f.push(
             i,
             rule,
             &SECRETS_ACCESS,
             format!(
-                "`{level} \"{SECRETS_NAME}\"` reaches the whole login keyring: the Secret \
+                "`{level} \"{name}\"` reaches the whole login keyring: the Secret \
                  Service API partitions nothing between the applications that call it"
             ),
             "keep the app's secrets in the private home, or accept it with \
@@ -1958,7 +1961,7 @@ fn across_layers(ctx: &Context, sources: &[Source], f: &mut Findings) {
                 );
             }
             for (_, rule) in bus_rules(source) {
-                let Some(name) = rule_name(rule).filter(|n| n.starts_with(PORTAL_PREFIX)) else {
+                let Some(name) = rule_name(rule).filter(|n| name_covers(n, PORTAL_NAMES)) else {
                     continue;
                 };
                 f.push(
@@ -1966,7 +1969,7 @@ fn across_layers(ctx: &Context, sources: &[Source], f: &mut Findings) {
                     rule,
                     &PORTAL_TALK_WITHOUT_PORTALS,
                     format!(
-                        "`{name}` is a portal name, and without `portals` the sandbox has no \
+                        "`{name}` reaches the portal names, and without `portals` the sandbox has no \
                          `/.flatpak-info`, so every portal call is refused"
                     ),
                     "add `portals`, or drop the rule",
@@ -3064,8 +3067,12 @@ mod tests {
         with(&host(), |ctx| {
             // The name is also `dbus-name-is-risky` now (deliberate: both
             // checks say something true and different about the name).
-            for rule in ["talk", "own"] {
-                let text = format!("dbus {{\n    {rule} \"org.freedesktop.secrets\"\n}}");
+            for (rule, name) in [
+                ("talk", "org.freedesktop.secrets"),
+                ("own", "org.freedesktop.secrets"),
+                ("talk", "org.freedesktop.secrets.*"),
+            ] {
+                let text = format!("dbus {{\n    {rule} \"{name}\"\n}}");
                 let report = lint(ctx, &[&text]);
                 assert_eq!(
                     ids(&report),
@@ -3451,6 +3458,11 @@ mod tests {
         with(&host(), |ctx| {
             let text = "dbus {\n    talk \"org.freedesktop.portal.Desktop\"\n}";
             assert_eq!(ids(&lint(ctx, &[text])), ["portal-talk-without-portals"]);
+            let text = "dbus {\n    talk \"org.freedesktop.*\"\n}";
+            assert!(
+                ids(&lint(ctx, &[text])).contains(&"portal-talk-without-portals"),
+                "{text}"
+            );
         });
     }
 

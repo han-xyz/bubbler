@@ -610,11 +610,13 @@ pub(crate) fn bus_clash(services: &[Service]) -> Option<BusClash<'_>> {
 
 // `xdg-dbus-proxy(1)` reads a rule as `[METHOD][@PATH]`: an empty method or
 // `*` is every interface, while `org.foo.*` is the one interface `org.foo`.
-// A broadcast rule lets signals in and opens no call.
+// A broadcast rule lets signals in and opens no call. `portals` itself
+// writes `Documents=*`, so a call on that one name adds nothing.
 fn reaches_every_portal(rule: &BusRule) -> bool {
     let every = match rule {
         BusRule::See(_) | BusRule::Broadcast(..) => false,
         BusRule::Talk(_) | BusRule::Own(_) => true,
+        BusRule::Call(name, _) if name == "org.freedesktop.portal.Documents" => false,
         BusRule::Call(_, r) => {
             let method = r.split_once('@').map_or(r.as_str(), |(m, _)| m);
             method.is_empty() || method == "*"
@@ -7663,6 +7665,8 @@ command "b""#
             "dbus {\n    broadcast \"org.freedesktop.portal.Desktop=@/org/freedesktop/portal/desktop\"\n}\nportals",
             "dbus {\n    broadcast \"org.freedesktop.portal.*=*\"\n}\nportals",
             "dbus {\n    see \"org.freedesktop.portal.Desktop\"\n}\nportals",
+            // `portals` writes this rule itself, so it adds nothing.
+            "dbus {\n    call \"org.freedesktop.portal.Documents=*\"\n}\nportals",
             "dbus {\n    own \"org.mozilla.firefox.*\"\n}\nportals",
             "dbus\nportals\nsystem-bus {\n    talk \"org.freedesktop.portal.Desktop\"\n}",
         ] {

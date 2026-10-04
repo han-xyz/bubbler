@@ -191,7 +191,23 @@ pub(crate) fn grant_policies(svc: &Service) -> Vec<BusRule> {
             BusRule::Talk("org.freedesktop.portal.IBus".to_owned()),
         ],
         Service::Mpris { name } => vec![BusRule::Own(format!("org.mpris.MediaPlayer2.{name}"))],
-        _ => Vec::new(),
+        Service::Portals { .. }
+        | Service::Camera { .. }
+        | Service::A11y
+        | Service::Wayland(_)
+        | Service::X11(_)
+        | Service::Network { .. }
+        | Service::Dri { .. }
+        | Service::Pipewire { .. }
+        | Service::Pulseaudio { .. }
+        | Service::Gamepad { .. }
+        | Service::Hidraw
+        | Service::HomeShare { .. }
+        | Service::PathShare { .. }
+        | Service::EtcShare { .. }
+        | Service::Dbus { .. }
+        | Service::SystemBus { .. }
+        | Service::AppRuntime { .. } => Vec::new(),
     }
 }
 

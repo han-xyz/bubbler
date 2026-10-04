@@ -3112,8 +3112,9 @@ silently and the lint stays silent to match), `dbus-without-rules`,
 `ghp_`/`sk-`/`AKIA` — whole words, so `TOKENIZERS_PARALLELISM` is not one),
 `tty-passthrough`, `tty-passthrough-without-seccomp` (`tty "passthrough"`
 with `seccomp { disable }`, which is the terminal handed over with the
-`TIOCSTI` rules taken away), `portal-talk-without-portals` (a portal rule is
-inert without `/.flatpak-info`, which is worse than wrong),
+`TIOCSTI` rules taken away), `portal-talk-without-portals` (a rule reaching a portal name, a glob such as
+`org.freedesktop.*` included, is inert without `/.flatpak-info`, which is worse
+than wrong),
 `wayland-clipboard-open` (`wayland clipboard="open"` with no `lint-allow`
 reason: the proxy forwards every clipboard read the sandbox asks for and
 only logs it, rather than forwarding one that follows a key, button or
@@ -3182,7 +3183,7 @@ its EGL will not drive a Wayland display without one, and the node carries
 the connectors, their modes, the monitors' EDID),
 `secrets-access`
 (`talk`/`own` of
-`org.freedesktop.secrets` on the session bus reaches the whole login keyring:
+`org.freedesktop.secrets`, or of a glob covering it, on the session bus reaches the whole login keyring:
 the Secret Service API partitions nothing between the applications that call
 it; the `secrets` child of `portals` raises the same note for the narrower
 path, the one this application's own portal secret comes through),
@@ -3374,8 +3375,8 @@ method part ending in `.*` names one interface, so
 `=org.freedesktop.portal.*` is the interface `org.freedesktop.portal`, not
 every portal interface, and is accepted too. A `broadcast` rule only lets
 signals in and opens no call, so any `broadcast` beside `portals` is accepted.
-The `Documents=*` rules the bundle itself writes are refused when written by
-hand, since the bundle already grants them.
+A `call` on `org.freedesktop.portal.Documents` beside `portals` is accepted
+and changes nothing: the bundle already writes `Documents=*`.
 
 More generally, a `talk` or `own` covering a name that a `call` or `broadcast`
 on the same bus filters is refused: TALK lets every call and every broadcast
