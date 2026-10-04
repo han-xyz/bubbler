@@ -10,6 +10,19 @@
 //! clipboard management, input injection, overlays, window management —
 //! from them. Which globals those are is the compositor's policy, not
 //! bubbler's; bubbler only attaches the metadata.
+//!
+//! [`probe`] and [`create_context`] connect over `$WAYLAND_DISPLAY` in
+//! `$XDG_RUNTIME_DIR`, which wayrs reads from the process environment
+//! itself. Nothing here can check that value, so the launcher validates
+//! its shape — one path component — before calling in; an absolute or
+//! `..` name would otherwise steer the connection, and the listening fd
+//! with it, at an endpoint of the caller's choosing.
+//!
+//! wayrs also honours `$WAYLAND_SOCKET`, a connection *file descriptor*
+//! inherited from a parent, which it adopts and closes with the
+//! connection — a number that may well be a descriptor this process is
+//! using for something else. The launcher refuses to run rather than
+//! connect that way; see [`refuse_inherited`].
 
 use std::ffi::{CString, OsStr, OsString};
 use std::io;
@@ -37,7 +50,8 @@ pub const SOCKET_NAME: &str = "wayland";
 
 /// File name of the socket the compositor accepts on as this run's
 /// security context, beside [`SOCKET_NAME`]. Only the proxy connects to
-/// it.
+/// it: the application reaches the compositor through the proxy, which
+/// is where the clipboard gate applies.
 pub const CONTEXT_SOCKET_NAME: &str = "wayland-context";
 
 /// File name of the proxy binary.
@@ -56,7 +70,8 @@ include!("../../bubbler-wl-proxy/src/privileged.rs");
 /// Host path of the proxy binary and where it was found:
 /// [`Env::wl_proxy_override`] (`$BUBBLER_WL_PROXY`), else next to the
 /// running executable, else [`PROXY_BIN`]. A run cannot go on without
-/// one, so a missing binary fails the launch rather than warning.
+/// one — the application would connect to a socket nothing accepts on —
+/// so a missing binary fails the launch rather than warning.
 pub fn locate_proxy(env: &Env, host: &dyn Host) -> Result<(PathBuf, Found), LaunchError> {
     init_bin::locate_binary(
         env.wl_proxy_override.as_deref(),
@@ -266,7 +281,8 @@ pub fn refuse_inherited(socket: Option<&OsStr>) -> Result<(), WaylandError> {
 
 /// Which socket a run binds, from the configured mode alone. What the
 /// compositor answered about `wp_security_context_manager_v1` does not
-/// enter into it.
+/// enter into it: a sandboxed `wayland` connects to bubbler's proxy
+/// either way, and the answer decides only what the proxy connects to.
 pub fn plan(mode: WaylandMode, instance_runtime: &Path) -> WaylandPlan {
     match mode {
         WaylandMode::Host => WaylandPlan::Host,
@@ -293,7 +309,10 @@ pub fn probe() -> Result<bool, WaylandError> {
 /// `app_id`/`instance_id` under engine [`ENGINE`], so clients that
 /// connect through it are sandboxed ones.
 ///
-/// `listener` must already be listening.
+/// `listener` must already be listening. The compositor keeps accepting
+/// on it after this call returns and bubbler's connection is dropped,
+/// until `close_fd` signals hangup — the caller holds its write end for
+/// as long as the sandbox may connect.
 pub fn create_context(
     listener: OwnedFd,
     close_fd: OwnedFd,

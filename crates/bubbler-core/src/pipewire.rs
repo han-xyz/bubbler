@@ -29,12 +29,16 @@ const ACCESS: &str = "restricted";
 /// this is.
 pub const PW_CONTAINER: &str = "/usr/bin/pw-container";
 
+/// Where the holder mode of `bubbler-init` is bound inside the sidecar,
+/// and the whole of what `pw-container` is given as its program.
+///
 /// One word with no shell metacharacter in it, because `pw-container`
 /// hands its program to `system()`; `/run` rather than `/usr/lib`, for
 /// the same reason [`crate::bwrap::INIT_INSIDE`] is there.
 pub const HOLDER_INSIDE: &str = "/run/bubbler-pw-hold";
 
-/// Names the descriptor the holder reports the socket's path on.
+/// Names the descriptor the holder reports the socket's path on
+/// (`bubbler-init`'s `pw_hold::REPORT_FD`).
 /// `pw-container` drops every argv word after the program, so the
 /// environment is the only channel the holder has.
 pub const REPORT_FD: &str = "BUBBLER_PW_REPORT_FD";
@@ -179,7 +183,9 @@ pub fn pulse_config_dir(instance_runtime: &Path) -> PathBuf {
 
 /// The three directories a `pipewire-pulse.conf` is looked for in, in
 /// the order PipeWire itself reads them: the user's own, the system's,
-/// then the one the package ships.
+/// then the one the package ships ("An equally named file in a directory
+/// with a higher precedence makes the analogous files ignored", Arch
+/// wiki, PipeWire#Configuration).
 pub fn pulse_conf_dirs(config_home: &Path) -> [PathBuf; 3] {
     [
         config_home.join("pipewire"),
@@ -229,7 +235,9 @@ pub fn grant(audio: AudioSet) -> String {
 /// The context properties, as one JSON object for `pw-container -P`.
 ///
 /// Every value is written through [`json::string`]: `instance` is a name
-/// the user chose. The whole value is one argv element handed to bwrap,
+/// the user chose, and although the parser allows nothing in it that
+/// would end a JSON string, this is the encoder and not the place to
+/// depend on that. The whole value is one argv element handed to bwrap,
 /// which no shell sees — only the program word is.
 pub fn properties(instance: &str, run_id: &str, audio: AudioSet) -> String {
     let grant = grant(audio);

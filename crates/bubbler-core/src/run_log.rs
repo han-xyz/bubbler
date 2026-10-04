@@ -42,7 +42,8 @@ const NOTE: &str = "\nbubbler: log full; the rest of this run's output was dropp
 // Tried once when a tee's log fails, so a cut-off record reads as one.
 const STOPPED: &str = "\nbubbler: writing the log failed; the record of this run stops here\n";
 
-// A process that outlived the run still holds the pipe open,
+// How long a [`Redirect`] or a [`Relay`] waits for its copying thread on
+// the way out. A process that outlived the run still holds the pipe open,
 // and giving up costs the last few lines, never the exit.
 const FLUSH: Duration = Duration::from_secs(1);
 
@@ -156,7 +157,8 @@ fn start(path: &Path, truncate: bool, keep_stderr: bool) -> Result<Redirect, Lau
     // Nothing in here may start a process; see the module comment.
     std::thread::spawn(move || {
         // A sender dropped unused is the redirect dropped before the run
-        // said, which keeps what was asked for.
+        // said, which keeps what was asked for. A failed truncation costs
+        // the old run's lines staying ahead of this one's, nothing more.
         let cap = match truncate {
             true => settled.recv().unwrap_or_else(|_| {
                 let _ = rustix::fs::ftruncate(&file, 0);
@@ -295,7 +297,11 @@ impl Drop for Relay {
 //
 // `stderr`, when given, is sent every byte read, past the cap too, after
 // the file has had its share: a stderr nobody reads blocks the copy, and
-// the record is what matters then.
+// the record is what matters then. A stderr whose reader has gone is given
+// up on; any other failure there costs that chunk. With a `stderr`, a file
+// that fails is given one try at a note saying so, when it has room for
+// it under the cap, then given up on while the copy goes on, since the
+// caller's own stderr is what the run was promised.
 fn copy_capped(
     mut src: impl Read,
     dst: impl Write,

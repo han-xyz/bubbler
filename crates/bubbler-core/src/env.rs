@@ -35,7 +35,9 @@ pub fn is_passthrough(name: &OsStr) -> bool {
 ///
 /// A relative entry is dropped rather than resolved: that specification
 /// says every path in these variables must be absolute. An empty entry
-/// means the current directory and goes the same way.
+/// means the current directory and goes the same way. What it would
+/// otherwise cost is a launcher entry read from wherever the process
+/// happened to be started.
 pub fn xdg_dirs(value: Option<OsString>, defaults: &[&str]) -> Vec<PathBuf> {
     value
         .filter(|v| !v.is_empty())

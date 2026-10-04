@@ -170,10 +170,18 @@ fn fd_for(
 }
 
 /// Run `argv` inside the live instance and return the exit code to
-/// propagate. Detaching (`^]` three times) returns 0 and leaves the
-/// command under the instance's supervisor. A `SIGINT`, `SIGTERM` or
-/// `SIGHUP` while output is being relayed ends the relay the same way
-/// and returns `128 + signal`.
+/// propagate. `mode` decides what the command gets for stdio: in `pty`
+/// mode bubbler allocates one, asks the supervisor to make it the
+/// command's controlling terminal and relays it, so the sandbox never
+/// holds a descriptor for the user's terminal.
+///
+/// Waits without a deadline: the command may run for as long as it likes.
+/// Detaching (`^]` three times) returns 0 and leaves it under the
+/// instance's supervisor — with bubbler gone its pty hangs up, so a
+/// command that does not ignore `SIGHUP` ends there.
+///
+/// A `SIGINT`, `SIGTERM` or `SIGHUP` while output is being relayed ends
+/// the relay the same way and returns `128 + signal`.
 pub fn run_in(
     stream: &UnixStream,
     argv: &[OsString],
@@ -195,7 +203,7 @@ pub fn run_in_with(
     let mut plan = tty::plan(mode, is_tty);
     // The pty copies the first terminal bubbler has, and is allocated
     // before raw mode: afterwards it would carry raw settings into the
-    // sandbox.
+    // sandbox, leaving the command without echo or line editing.
     if let Some(i) = plan
         .needs_pty()
         .then(|| is_tty.iter().position(|t| *t))

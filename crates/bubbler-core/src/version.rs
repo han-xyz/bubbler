@@ -122,8 +122,13 @@ pub fn proxy(env: &Env) -> Version {
 }
 
 /// The advisory lines a launch prints on stderr, in the order it prints
-/// them. The proxy line is printed only for a config that starts the
-/// proxy — `dbus`, `portals`, `a11y` or `system-bus`.
+/// them. Nothing silences them: the whole point of the bwrap line is
+/// that the host tool cannot enforce what bubbler configured, and a
+/// configuration that could turn it off would be one nobody reads.
+///
+/// The proxy line is printed only for a config that starts the proxy —
+/// `dbus`, `portals`, `a11y` or `system-bus` — since a sandbox with no
+/// bus is not exposed to what its advisories describe.
 pub fn warnings(bwrap: Version, proxy: Version, services: &[Service]) -> Vec<String> {
     let mut out = Vec::new();
     if bwrap.below(BWRAP_FLOOR) {

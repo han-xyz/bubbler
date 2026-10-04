@@ -11,7 +11,9 @@ use std::borrow::Cow;
 /// Render the control characters in `bytes` so a terminal shows them
 /// instead of acting on them: C0 and `DEL` in caret notation (`ESC` is
 /// `^[`), C1 controls and bytes that are not UTF-8 as `\xNN`, everything
-/// else unchanged. `\n` and `\t` are left alone.
+/// else unchanged. `\n` and `\t` are left alone — they are what a log is
+/// laid out with, and a terminal that acts on them is doing what the
+/// reader wants.
 pub fn render(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut rest = bytes;
@@ -66,7 +68,10 @@ fn push_hex(out: &mut Vec<u8>, b: u8) {
 
 /// `s` with everything a terminal would act on replaced by `?`: every C0
 /// control but `\n` and `\t`, `DEL`, the C1 controls, and any sequence an
-/// `ESC` introduces, each whole sequence becoming one `?`.
+/// `ESC` introduces — a CSI, an OSC up to its `BEL` or string
+/// terminator, an APC, and a lone `ESC` — each whole sequence becoming
+/// one `?`. Text that holds nothing to replace is borrowed rather than
+/// rebuilt.
 pub fn sanitize(s: &str) -> Cow<'_, str> {
     if !s.chars().any(needs_replacing) {
         return Cow::Borrowed(s);
@@ -96,8 +101,10 @@ fn needs_replacing(c: char) -> bool {
 }
 
 // Step past the rest of the sequence an `ESC` opened, so the whole of it
-// is the one `?` already written. Anything else is a two-character
-// escape whose second character is ordinary text.
+// is the one `?` already written. A CSI ends at its final byte
+// (`0x40`–`0x7e`), an OSC, APC, PM or DCS at `BEL` or at the string
+// terminator `ESC \`, and anything else is a two-character escape whose
+// second character is ordinary text.
 fn skip_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     match chars.peek() {
         Some('[') => {

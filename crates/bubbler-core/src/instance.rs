@@ -147,10 +147,9 @@ fn validate_name(name: &str) -> Result<(), InstanceError> {
 const SUN_PATH_MAX: usize = 108;
 
 // Refuse a name whose runtime sockets would not fit a `sockaddr_un`.
-// The kernel truncates a longer path without saying so, and what the
-// user then sees is a client failing on a path that is not the one
-// bubbler printed. Checked where the instance is created, so the name is
-// still the user's to change.
+// Checked where the instance is created, so the name is still the
+// user's to change.
+//
 // Every socket an instance can have, longest first: the proxy binds its
 // own in the `dbus/` subdirectory, one level deeper than the path the
 // launcher then moves it to, so those are the longest of all.
@@ -511,7 +510,8 @@ pub struct Ephemeral {
 impl Ephemeral {
     /// Keep the sandbox afterwards as instance `name` instead of removing
     /// it. The name is checked now so a run that cannot be kept never
-    /// starts.
+    /// starts: kept, it is what the next run's sockets are named after,
+    /// so it faces the same length limit as a name given to `create`.
     pub fn keep_as(&mut self, env: &Env, name: &str) -> Result<(), InstanceError> {
         validate_name(name)?;
         check_socket_paths(env, name)?;
@@ -698,8 +698,13 @@ impl Instance {
     }
 
     /// Write `config` back to `config.kdl`, keeping the headers the file
-    /// carries: the profile it was seeded from, and the config version.
-    /// What it replaces is kept beside it as `config.kdl.bak`.
+    /// carries: the profile it was seeded from, so `reseed` still knows
+    /// where to re-flatten it from, and the config version, so no later
+    /// run warns about meanings this file has just been written against.
+    /// What it replaces is kept beside it as `config.kdl.bak`. Both files
+    /// are written through [`fsutil::write_atomic`]: the rename is atomic,
+    /// so a reader sees one whole config or the other, and a symlink left
+    /// under either name is replaced rather than written through.
     ///
     /// Comments and layout are not kept: the file is rendered from the
     /// config, which holds the grants and not the text around them.
@@ -709,7 +714,8 @@ impl Instance {
         let mut text = String::new();
         // A profile is only named where the file already named one: a
         // header invented here would send `reseed` to somebody else's
-        // profile.
+        // profile. The name passed the profile grammar to be read as a
+        // header at all, so it holds no newline of its own.
         if let Some(profile_name) = profile_header(&held) {
             text.push_str(&format!("{PROFILE_HEADER}{profile_name}\n"));
         }
@@ -756,7 +762,9 @@ impl Instance {
 
     /// Record the current version in a config that does not already, by
     /// replacing an older header or writing one after the profile header.
-    /// `true` when the file was changed.
+    /// `true` when the file was changed. What it records is that the file
+    /// has been read against the current meanings, which is what
+    /// [`Instance::migration_warning`] stops warning about.
     pub fn mark_version(env: &Env, name: &str) -> Result<bool, InstanceError> {
         let cfg_path = config_path_checked(env, name)?;
         let text = read_config(&cfg_path)?;
@@ -787,7 +795,8 @@ impl Instance {
     /// starts: a node whose meaning changed after the version the file
     /// records asks for a different sandbox now than it did when it was
     /// written. A file recording no version counts as version 1. One
-    /// string per migration the file has not been through.
+    /// string per migration the file has not been through, since a file
+    /// old enough may not have been through either.
     pub fn migration_warning(&self) -> Vec<String> {
         let written = self.config_version.unwrap_or(1);
         let services = &self.config.services;

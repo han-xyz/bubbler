@@ -84,7 +84,7 @@ pub fn install_dirs(env: &Env) -> Vec<PathBuf> {
 /// WirePlumber was built with, which the default `$XDG_DATA_DIRS`
 /// already holds and which is listed once either way.
 /// `$WIREPLUMBER_DATA_DIR`, which would replace the whole search, is not
-/// consulted.
+/// consulted: a session that sets it is a WirePlumber developer's.
 pub fn hook_dirs(env: &Env) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::with_capacity(env.data_dirs.len() + 2);
     let bases = std::iter::once(env.data_home.as_path())
@@ -131,9 +131,11 @@ pub enum Missing {
     Both,
 }
 
-// Each says what is reachable in *that* case: with the drop-in installed
-// and only the hook missing the grant is still scoped, so the microphone
-// is not in reach.
+// Exact text of the warning a real run prints for each case, without
+// the `bubbler: warning:` prefix every diagnostic bubbler prints
+// already carries. Each says what is reachable in *that* case: with
+// the drop-in installed and only the hook missing the grant is still
+// scoped, so the microphone is not in reach.
 const RUN_WARNING_DROP_IN: &str = "audio policy drop-in not found (50-bubbler.conf): the \
      sandbox has full access to every PipeWire node (microphone and every other client's \
      audio reachable)";
@@ -206,7 +208,9 @@ pub const NOT_LOADED_CHECK: &str = "audio-policy-not-loaded";
 /// The warning where this run needs it: `cfg` grants `pipewire` or
 /// `pulseaudio` and the host holds less than the whole policy, or a
 /// copy that differs from this binary's which `cfg` does not accept with
-/// a `lint-allow` of [`DIFFERS_CHECK`], or both.
+/// a `lint-allow` of [`DIFFERS_CHECK`], or both. Printed once per real
+/// run (`main.rs`'s `Run`, `Try` and `Open`), never for `--dry-run` or
+/// `--explain`, which carry their own framing.
 pub fn run_warning(cfg: &InstanceConfig, host: &dyn Host, env: &Env) -> Option<String> {
     cfg.audio()?;
     let missing = missing(host, env).map(Missing::run_warning);

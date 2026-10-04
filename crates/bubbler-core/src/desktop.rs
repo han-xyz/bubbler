@@ -222,8 +222,10 @@ pub fn source(dirs: &Dirs, name: &str, config: &InstanceConfig) -> Result<PathBu
 
 // The first directory holding `file` as an entry bubbler did not write.
 // With `shown`, an entry a launcher does not display is passed over as
-// well. A `desktop` hint sets it false, because that is the user naming
-// the file they mean.
+// well, which is what the `<command>.desktop` step wants: a name that
+// happens to match a MIME-handler-only entry is the same wrong answer
+// there as in the scan. A `desktop` hint sets it false, because that is
+// the user naming the file they mean.
 fn find(dirs: &Dirs, file: &OsStr, shown: bool) -> Option<PathBuf> {
     dirs.lookup().map(|d| d.join(file)).find(|p| {
         std::fs::read_to_string(p).is_ok_and(|t| {
@@ -517,7 +519,9 @@ fn executable(path: &Path) -> bool {
 
 /// What `desktop-file-validate` calls an error in the entry at `path`,
 /// empty when it is installed and content with the file, and empty when
-/// it is not installed at all. Its hints and warnings are left out.
+/// it is not installed at all. Its hints and warnings are left out: they
+/// are about the application's own file, which bubbler copied and is not
+/// in a position to fix.
 pub fn validate(path: &Path) -> Vec<String> {
     let Ok(out) = Command::new("desktop-file-validate").arg(path).output() else {
         return Vec::new();

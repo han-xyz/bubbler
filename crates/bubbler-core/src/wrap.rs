@@ -24,6 +24,7 @@ use crate::{dbus, fsutil, init_bin, network};
 
 const REGISTRY_FILE: &str = "wraps.kdl";
 
+// File whose `flock(2)` serialises a read-modify-write of the registry.
 // It exists because the registry is *replaced* by a rename, so a lock
 // taken on the registry itself would be a lock on an inode the next
 // writer no longer has.
@@ -43,6 +44,8 @@ const BUBBLER_BIN: &str = "bubbler";
 /// Names a shim may not take: bubbler resolves each of them through
 /// `PATH` itself, so a shim of that name would shadow the real program —
 /// `bubbler` into a loop, the rest into every sandbox failing to start.
+/// Taken from the constants that name those binaries, so a rename there
+/// cannot leave this list behind.
 pub const RESERVED: &[&str] = &[
     BUBBLER_BIN,
     init_bin::NAME,
@@ -289,7 +292,7 @@ pub fn add(env: &Env, instance: &str, name: &str, bubbler: &Path) -> Result<Adde
 /// only when it is one of bubbler's: a regular file, or a symlink
 /// somebody else aimed somewhere else, is not something bubbler made,
 /// and it stays where it is while the entry that no longer describes it
-/// goes.
+/// goes. `bubbler` is the running binary, as for [`list`].
 pub fn remove(env: &Env, name: &str, bubbler: &Path) -> Result<PathBuf, WrapError> {
     // The reserved list is not applied here: a registry naming one is
     // rejected on read, and undoing something is never the moment to

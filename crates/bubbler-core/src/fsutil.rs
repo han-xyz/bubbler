@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 /// name atomically.
 ///
 /// The sibling is created with `O_EXCL` and carries this process's pid,
-/// so a file already sitting under that name is never opened or followed,
-/// and two bubblers writing at once never share one.
+/// so a file already sitting under that name — a symlink aimed somewhere
+/// else among them — is never opened or followed, and two bubblers
+/// writing at once never share one.
 ///
 /// The returned path is where it went wrong: the sibling for a failed
 /// write, `path` itself for a failed rename.
@@ -42,7 +43,7 @@ pub fn write_atomic(path: &Path, text: &str) -> Result<(), (PathBuf, io::Error)>
     })();
     // Deliberate: the error to report is the write's or the rename's own.
     // A cleanup that also failed leaves a stray sibling, which no caller
-    // reads.
+    // reads; reporting it instead would hide what actually went wrong.
     if let Err(e) = written {
         let _ = fs::remove_file(&tmp);
         return Err((tmp, e));

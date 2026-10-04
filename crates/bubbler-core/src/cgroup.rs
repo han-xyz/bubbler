@@ -6,6 +6,18 @@
 //! but stores the id it resolved, so the proxy's directory has to exist
 //! before `nft -f` reads the rule and to live as long as the sandbox: one
 //! made afterwards matches nothing, silently.
+//!
+//! bwrap never changes cgroup, so `--unshare-cgroup` makes whatever cgroup
+//! bwrap was started in the root of the sandbox's cgroup namespace — and
+//! everything under that root is nameable from inside. So bubbler puts
+//! itself in `sandbox/` before it spawns bwrap — bwrap, the supervisor and
+//! the application inherit it, and the namespace root becomes `sandbox` —
+//! and the proxy goes into `proxy/`, a **sibling outside** that root.
+//!
+//! The parent holds no process, only the two leaves, so the "no internal
+//! processes" rule cannot be reached: it constrains a cgroup that has
+//! both processes and controllers enabled for its children, and nothing
+//! here writes `cgroup.subtree_control` at all.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -40,13 +52,18 @@ const SANDBOX_LEAF: &str = "sandbox";
 // ruleset accepts.
 const PROXY_LEAF: &str = "proxy";
 
-// bwrap's `--die-with-parent` kills the sandbox's processes as it exits,
-// which is not quite instant, and a cgroup with a process left in it
-// cannot be removed.
+// How long the teardown waits for the sandbox's processes to be gone
+// before giving up on removing the directories. bwrap's
+// `--die-with-parent` kills them as it exits, which is not quite
+// instant, and a cgroup with a process left in it cannot be removed.
 const RELEASE_WAIT: Duration = Duration::from_secs(2);
 
 const RELEASE_POLL: Duration = Duration::from_millis(50);
 
+/// One run's cgroups: the parent, its two leaves, an open descriptor for
+/// the proxy leaf's `cgroup.procs`, and where bubbler was before it
+/// moved itself.
+///
 /// The descriptor is opened here so the proxy's `pre_exec` — which may
 /// allocate nothing and open nothing — has only a `write` left to do.
 /// Dropping the handle moves bubbler back and removes all three
@@ -60,6 +77,7 @@ pub struct SandboxCgroup {
     sandbox: PathBuf,
     proxy: PathBuf,
     procs: OwnedFd,
+    // The cgroup bubbler was in before this, to move back to.
     home: PathBuf,
     // bubbler's own pid, which is what was moved and what moves back.
     pid: u32,
@@ -123,7 +141,10 @@ fn write_pid(dir: &Path, pid: u32) -> std::io::Result<()> {
 /// spawned, since the sandbox's cgroup namespace root is fixed at the
 /// `--unshare-cgroup`, so the sandbox's pid is not yet known.
 ///
-/// Fails the launch rather than warning.
+/// Fails the launch rather than warning: the ruleset is written around
+/// the proxy leaf, and a run that asked for `allow-host` and got no
+/// cgroup would either have no rules at all or rules naming a path that
+/// resolves to nothing.
 pub fn create(instance: &str, pid: u32) -> Result<SandboxCgroup, LaunchError> {
     create_under(
         Path::new(CGROUP2_ROOT),
@@ -195,8 +216,12 @@ fn create_under(
         ))
     })?;
     let home = root.join(own);
-    // The directories are swept here rather than at exit because only
-    // here is it known that this instance is not running.
+    // A bubbler killed with SIGKILL leaves its directories behind, and
+    // they are empty: no process outlives the run that was in them. They
+    // are swept here rather than at exit because only here is it known
+    // that this instance is not running — a live run's directories
+    // refuse to be removed anyway, since a cgroup holding a process
+    // cannot be.
     sweep(ops, &home, &prefix, pid);
     let dir = root.join(&base);
     let (sandbox, proxy) = (dir.join(SANDBOX_LEAF), dir.join(PROXY_LEAF));
@@ -309,6 +334,9 @@ fn bad_subtree(e: Errno, dir: &Path) -> LaunchError {
 
 /// bubbler's own cgroup, relative to the cgroup2 mount and without the
 /// leading `/`. Empty where bubbler is in the root cgroup itself.
+///
+/// Also what an explanation names its placeholder under, so the block
+/// `--explain` prints is the shape a run would install.
 pub fn own_path() -> Result<String, LaunchError> {
     let path = PathBuf::from("/proc/self/cgroup");
     // Read with a bound, and by length rather than by the reported size:
