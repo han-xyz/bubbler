@@ -38,8 +38,7 @@ pub enum Found {
 /// running executable, else `installed`.
 ///
 /// Must be a regular file; an override that is not one is an error,
-/// never a silent fallback to another binary. `service` names the grant
-/// a failure is reported against.
+/// never a silent fallback to another binary.
 pub fn locate_binary(
     over: Option<&Path>,
     name: &str,
