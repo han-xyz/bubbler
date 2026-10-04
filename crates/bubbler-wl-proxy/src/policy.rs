@@ -133,6 +133,9 @@ pub struct Incoming<'a> {
     pub args: &'a mut Vec<Arg>,
     /// Descriptors the message carries, in the order its `fd` arguments name.
     pub fds: &'a mut Vec<OwnedFd>,
+    /// Whether user input in it may arm the gate. False while the relay cannot
+    /// tell how long the event waited in the compositor's own buffer.
+    pub input_arms: bool,
 }
 
 impl Connection {
@@ -264,33 +267,15 @@ impl Policy {
 
     /// Events: the registry is filtered, and input events arm the gate.
     fn event(&mut self, msg: &mut Incoming<'_>, conn: &mut Connection, now: Instant) -> Action {
+        if msg.input_arms && is_user_input(msg) {
+            self.arm(now);
+        }
         match (msg.interface.name, msg.message.name) {
             ("wl_registry", "global") => return self.global(msg, conn),
             ("wl_registry", "global_remove") => return Self::global_remove(msg, conn),
             ("wl_display", "delete_id") => {
                 if let Some(Arg::Uint(id)) = msg.args.first() {
                     conn.objects.delete_id(*id);
-                }
-            }
-            // `state` is argument 3 of a key, and 1 is pressed. Both ends of
-            // a press arm otherwise: letting go of the mouse over a paste
-            // target is user input by any reading, and a touch drag *drops*
-            // on `up`, which a long drag would otherwise reach the gate a
-            // second or more after the `down` that started it.
-            ("wl_keyboard", "key") => {
-                if let Some(Arg::Uint(1)) = msg.args.get(3) {
-                    self.arm(now);
-                }
-            }
-            ("wl_pointer", "button") => self.arm(now),
-            ("wl_touch", "down" | "up") => self.arm(now),
-            ("zwp_tablet_tool_v1" | "zwp_tablet_tool_v2", "down" | "up" | "button") => {
-                self.arm(now)
-            }
-            // `state` is argument 2 of a pad button, and 1 is pressed.
-            ("zwp_tablet_pad_v2", "button") => {
-                if let Some(Arg::Uint(1)) = msg.args.get(2) {
-                    self.arm(now);
                 }
             }
             _ => {}
@@ -394,6 +379,23 @@ impl Policy {
         };
         conn.objects.bind(name, global.interface, version, new_id)?;
         Ok(Action::Forward)
+    }
+}
+
+/// Whether an event is user input that arms the gate.
+fn is_user_input(msg: &Incoming<'_>) -> bool {
+    match (msg.interface.name, msg.message.name) {
+        // `state` is argument 3 of a key, and 1 is pressed. Both ends of
+        // a press arm otherwise: letting go of the mouse over a paste
+        // target is user input by any reading, and a touch drag *drops*
+        // on `up`, which a long drag would otherwise reach the gate a
+        // second or more after the `down` that started it.
+        ("wl_keyboard", "key") => matches!(msg.args.get(3), Some(Arg::Uint(1))),
+        ("wl_pointer", "button") | ("wl_touch", "down" | "up") => true,
+        ("zwp_tablet_tool_v1" | "zwp_tablet_tool_v2", "down" | "up" | "button") => true,
+        // `state` is argument 2 of a pad button, and 1 is pressed.
+        ("zwp_tablet_pad_v2", "button") => matches!(msg.args.get(2), Some(Arg::Uint(1))),
+        _ => false,
     }
 }
 
@@ -515,6 +517,7 @@ mod tests {
                 message: &list[at],
                 args,
                 fds,
+                input_arms: true,
             };
             self.policy
                 .apply(&mut msg, &mut self.conn, &mut self.audit, self.now)

@@ -36,7 +36,11 @@
 - The Wayland clipboard gate dates input from the earliest moment it could
   have reached `bubbler-wl-proxy`, not from when the proxy read it: a
   sandbox that stopped reading its connection could hold a key press back
-  and read the clipboard up to a second after the moment it chose.
+  and read the clipboard up to a second after the moment it chose. For one
+  second after a sandbox stops holding its connection back, input on it
+  opens no clipboard read at all, since it may have waited in the
+  compositor's buffer: a paste within a second after an application froze
+  its own connection is refused once.
 
 ### Changed
 

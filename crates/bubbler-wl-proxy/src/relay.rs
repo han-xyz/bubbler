@@ -31,7 +31,7 @@ use rustix::net::{
 
 use crate::audit::{Audit, Kind};
 use crate::objects::ObjectError;
-use crate::policy::{Action, Connection, Incoming, Policy};
+use crate::policy::{Action, Connection, GATE_WINDOW, Incoming, Policy};
 use crate::wire::{self, Header, WireError};
 
 /// Bytes to ask for when nothing is half-read. libwayland's own connection
@@ -117,6 +117,10 @@ struct Conn {
     // unread on it can have arrived: the instant input read from it is dated at.
     server_drained: bool,
     server_unread_since: Instant,
+    // Set while the client's full queue keeps the compositor side unread; input
+    // read before `quiet_until` may have waited in the compositor's own buffer.
+    server_held_back: bool,
+    quiet_until: Option<Instant>,
 }
 
 /// The listener, the socket to forward to, and every live connection.
@@ -232,6 +236,8 @@ impl Conn {
             broken: false,
             server_drained: true,
             server_unread_since: now,
+            server_held_back: false,
+            quiet_until: None,
         }
     }
 
@@ -297,8 +303,15 @@ impl Conn {
         // or it would have returned sooner; an unwatched one may fill unseen.
         if !self.flags(false).contains(PollFlags::IN) {
             self.server_drained = false;
-        } else if self.server_drained {
-            self.server_unread_since = now;
+            self.server_held_back |= self.client.out_bytes >= MAX_QUEUE;
+        } else {
+            if self.server_drained {
+                self.server_unread_since = now;
+            }
+            if self.server_held_back {
+                self.server_held_back = false;
+                self.quiet_until = Some(now + GATE_WINDOW);
+            }
         }
         if client.intersects(woke) && !self.closing && !self.client.eof {
             self.pump(true, policy, audit, now)?;
@@ -333,6 +346,7 @@ impl Conn {
             closing,
             server_drained,
             server_unread_since,
+            quiet_until,
             ..
         } = self;
         let (src, dst) = match from_client {
@@ -388,6 +402,7 @@ impl Conn {
                 message,
                 args: &mut args,
                 fds: &mut fds,
+                input_arms: !quiet_until.is_some_and(|end| now < end),
             };
             let action = policy
                 .apply(&mut incoming, state, audit, arrived)
@@ -672,7 +687,7 @@ mod tests {
     use rustix::net::socketpair;
 
     use super::*;
-    use crate::policy::{GATE_WINDOW, Gate};
+    use crate::policy::Gate;
     use crate::tables;
     use crate::wire::Arg;
 
@@ -889,6 +904,66 @@ mod tests {
         wired.press_key();
         wired.step_at(pressed).expect("the key is read");
         assert!(wired.paste(pressed + GATE_WINDOW), "{}", wired.log.text());
+    }
+
+    /// Queue `len` bytes at a client that has not read them yet.
+    fn queue_at_client(wired: &mut Wired, len: usize) {
+        wired.conn.client.out_bytes += len;
+        wired.conn.client.out.push_back(Frame {
+            data: vec![0u8; len],
+            off: 0,
+            fds: Vec::new(),
+        });
+    }
+
+    #[test]
+    fn input_read_within_a_window_of_a_stall_ending_opens_no_gate() {
+        let mut wired = wired(Gate::Paste);
+        wired.map_input_and_offer();
+        let start = Instant::now();
+        wired.step_at(start).expect("an idle round");
+        queue_at_client(&mut wired, MAX_QUEUE + (1 << 20));
+        wired.step_at(start).expect("the stall begins");
+        let resumed = start + Duration::from_secs(5);
+        while !wired.conn.client.out.is_empty() {
+            wired.drain_client();
+            wired.step_at(resumed).expect("the client drains");
+        }
+
+        wired.press_key();
+        let fresh = resumed + Duration::from_millis(10);
+        wired.step_at(fresh).expect("the key is read");
+        wired.drain_client();
+        assert!(
+            !wired.paste(fresh),
+            "a key read just after a stall opened the gate"
+        );
+
+        wired.press_key();
+        let after = resumed + GATE_WINDOW + Duration::from_millis(10);
+        wired.step_at(after).expect("the key is read");
+        assert!(wired.paste(after), "{}", wired.log.text());
+    }
+
+    #[test]
+    fn a_stall_of_one_round_still_starts_the_quiet_period() {
+        let mut wired = wired(Gate::Paste);
+        wired.map_input_and_offer();
+        let start = Instant::now();
+        wired.step_at(start).expect("an idle round");
+        // Exactly the cap: the next round does not poll the compositor, and
+        // its flush takes the queue back under the cap.
+        queue_at_client(&mut wired, MAX_QUEUE);
+        wired.step_at(start).expect("one round of back-pressure");
+        assert!(wired.conn.flags(false).contains(PollFlags::IN));
+        wired.step_at(start).expect("reading resumes");
+        wired.press_key();
+        let fresh = start + Duration::from_millis(10);
+        wired.step_at(fresh).expect("the key is read");
+        assert!(
+            !wired.paste(fresh),
+            "the quiet period is started by the stall itself, however short"
+        );
     }
 
     #[test]

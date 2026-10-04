@@ -455,12 +455,19 @@ press arm, so a drag that ends over a paste target arms on the release
 that ends it rather than only on the press that began it, however long
 the drag took. The second counts from the earliest moment the event could
 have reached the proxy, not from when the proxy read it: the last instant
-the proxy saw the compositor's side of that connection empty, or was
-waiting on it with nothing unread. The proxy stops reading the compositor
-while the sandbox leaves a full queue unread, so a press that waited
-behind such a stall is dated at the stall's start and opens nothing once
-the stall outlasted the window. The event's own `time` argument is not
-used: the protocol leaves its clock undefined. Outside the window the
+the proxy saw the compositor's side of that connection empty (nothing
+left to read after a read), or was waiting on it in `poll` with nothing
+unread. An empty read alone would not do: the proxy reads once per
+wake-up, so one is rare, and a key typed after a quiet minute would be
+dated a minute back. The proxy stops reading the compositor while the
+sandbox leaves a full queue unread, so a press that waited behind such a
+stall is dated at the stall's start. Input can also wait in the
+compositor's own buffer, which the proxy cannot see, so for one second
+after the proxy resumes reading a connection the sandbox held back, input
+on that connection arms nothing at all, however short the stall. The cost:
+a paste within a second after an application froze its own connection is
+refused once. The event's own `time` argument is not used: the protocol
+leaves its clock undefined. Outside the window the
 request is not
 forwarded and the descriptor it carried is closed, so the client reads end
 of file exactly as if the selection had been empty, and one line goes to
