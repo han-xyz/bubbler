@@ -906,29 +906,35 @@ fn video_nodes_with_a_link(bed: &PipeWireBed) -> Vec<String> {
             .expect("pw-cli did not run");
         assert!(out.status.success(), "{out:?}");
     }
-    wait_for("the video nodes' ports", || {
+    let ends = ["bed-sink:monitor_FL", "video-sink:playback_FL"];
+    wait_for("the two ports the link joins", || {
         let ports = bed.host_tool("pw-link", &["-io"]);
-        VIDEO_NODES
-            .iter()
-            .all(|(name, _)| ports.contains(&format!("{name}:")))
+        ends.iter()
+            .all(|end| ports.lines().any(|port| port.trim() == *end))
     });
     let linked = bed
         .command("pw-link")
-        .args(["-L", "bed-sink:monitor_FL", "video-sink:playback_FL"])
+        .args(["-L", ends[0], ends[1]])
         .output()
         .expect("pw-link did not run");
     assert!(linked.status.success(), "{linked:?}");
     wait_for("the link into the video sink", || {
-        bed.links().contains("video-sink:playback_FL")
+        bed.links().contains(ends[1])
     });
-    let listing = bed.info_from_host();
+    let node = |listing: &str, name: &str| {
+        object(listing, &[&format!("node.name = \"{name}\""), NODE]).map(|node| node.id)
+    };
+    let mut listing = String::new();
+    wait_for("every video node with its ports", || {
+        listing = bed.info_from_host();
+        VIDEO_NODES.iter().all(|(name, _)| {
+            node(&listing, name)
+                .is_some_and(|id| !objects_of(&listing, std::slice::from_ref(&id)).is_empty())
+        })
+    });
     VIDEO_NODES
         .iter()
-        .map(|(name, _)| {
-            object(&listing, &[&format!("node.name = \"{name}\""), NODE])
-                .expect("a video node in the bed")
-                .id
-        })
+        .filter_map(|(name, _)| node(&listing, name))
         .collect()
 }
 
