@@ -112,7 +112,9 @@ pub fn by_index(index: usize) -> Option<&'static Interface> {
 
 /// The globals the fallback denylist lets a sandbox bind: every interface in
 /// [`INTERFACES`] that no other interface's `new_id` creates and that the
-/// `PRIVILEGED` denylist does not hide.
+/// `PRIVILEGED` denylist does not hide. A global in neither list fails
+/// `every_bindable_global_is_denied_or_written_down`, and that failure is the
+/// moment someone decides whether the new protocol is privileged.
 pub const ALLOWED_GLOBALS: &[&str] = &[
     "ext_background_effect_manager_v1",
     "wl_compositor",
