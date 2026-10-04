@@ -63,8 +63,8 @@ pub static GRANTS: &[Grant] = &[
                injection, overlays and window management, exactly which being the \
                compositor's policy. The application reaches that socket through a \
                proxy of bubbler's, which forwards a clipboard read only just after a \
-               key, button or touch of yours, so a sandbox cannot poll the selection \
-               in the background for whatever you copy next; `clipboard=\"open\"` \
+               key, button, touch or pen press of yours, so a sandbox cannot poll the \
+               selection in the background for whatever you copy next; `clipboard=\"open\"` \
                forwards every read and logs it instead, and lint warns. On a compositor \
                without the protocol the proxy connects to the session socket and \
                hides the privileged interfaces in the compositor's place, and the \

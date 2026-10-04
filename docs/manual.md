@@ -1068,8 +1068,8 @@ version above what it was offered is refused with a synthesised
 `wl_display.error` and the connection is closed. Asking inside a sandbox for
 the number `zwlr_data_control_manager_v1` has on this host:
 
-    refused: bind of hidden global zwlr_data_control_manager_v1 (name 38, v1) refused by the sandbox proxy
-    bubbler-wl-proxy: connection closed: bind of hidden global zwlr_data_control_manager_v1 (name 38, v1) refused by the sandbox proxy
+    refused: bind of unoffered global zwlr_data_control_manager_v1 (name 38, v1) refused by the sandbox proxy
+    bubbler-wl-proxy: connection closed: bind of unoffered global zwlr_data_control_manager_v1 (name 38, v1) refused by the sandbox proxy
 
 The proxy is also what a hostile client would try to exhaust, so it is bounded
 in every direction — and the bounds do not all do the same thing. Three of them
@@ -1090,20 +1090,20 @@ waiting is served then rather than refused.
 **The paste gate.** This is the rule the proxy exists for. A `receive` request
 on `wl_data_offer`, `zwp_primary_selection_offer_v1`,
 `zwlr_data_control_offer_v1` or `ext_data_control_offer_v1` is forwarded only
-within one second of real user input: a `wl_keyboard.key` the compositor
-reported as pressed, a `wl_pointer.button` in either direction, or a
-`wl_touch.down` or `wl_touch.up`. Both ends of a press arm, and deliberately:
-letting go of the mouse over a paste target is user input by any reading, and a
-touch drag *drops* on the `up`, which a long one would otherwise reach the gate
-a second or more after the `down` that started it. The window is one second and
-the state is per instance rather than per connection — an application with
-helper processes reads the selection on a connection that never held keyboard
-focus, and gating each connection on its own input would deny every
-multi-process toolkit. A drag-and-drop offer is a `wl_data_offer` like any other
-and goes through the same gate, which costs nothing: a drop is a button or
-touch release, and the release is what arms, so the `receive` that follows a
-drop is inside the window that release opened however long the drag itself
-took. Outside the window the request is not forwarded and the descriptor it
+within one second of real user input: a `wl_keyboard.key` or
+`wl_pointer.button` the compositor reported as pressed, a `wl_touch.down`, a
+tablet pen touching down or a tablet tool button pressed, or a tablet pad
+button pressed. No release arms: the protocol does not say which client a
+release goes to, so a sandbox could otherwise arm the gate by moving its window
+under a button or pen held down elsewhere. The window is one second and the
+state is per instance rather than per connection — an application with helper
+processes reads the selection on a connection that never held keyboard focus,
+and gating each connection on its own input would deny every multi-process
+toolkit. A drop into the sandbox arms nothing either, but after a
+`wl_data_device.drop` the application may read that drag's own offer until it
+sends `finish` or destroys the offer; the selection stays behind the gate, and
+a read of the drag's offer before the drop goes through the gate like any
+other. Outside the window the request is not forwarded and the descriptor it
 carried is closed, so the client reads end of file, exactly as if the selection
 had been empty, and one line goes to the log. Run with `secret` on the
 session's selection, a client that

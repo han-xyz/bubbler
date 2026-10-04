@@ -521,7 +521,7 @@ const CHECK_LINES: &[(&str, &str)] = &[
         "wayland-clipboard-open",
         "`wayland clipboard=\"open\"` with no `lint-allow` reason: the proxy forwards \
          every clipboard read the sandbox asks for and only logs it, rather than \
-         forwarding one that follows a key, button or touch of yours.",
+         forwarding one that follows a key, button, touch or pen press of yours.",
     ),
     (
         "wayland-host",

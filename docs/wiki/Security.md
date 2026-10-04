@@ -73,15 +73,16 @@ because hiding an advertisement alone does not stop a client naming a global by
 its number:
 
 ```
-refused: bind of hidden global zwlr_data_control_manager_v1 (name 38, v1) refused by the sandbox proxy
+refused: bind of unoffered global zwlr_data_control_manager_v1 (name 38, v1) refused by the sandbox proxy
 ```
 
 **The paste gate.** `receive` on `wl_data_offer`,
 `zwp_primary_selection_offer_v1` and the two data-control offers is forwarded
-only within one second of a `wl_keyboard.key` press, a `wl_pointer.button` or a
-`wl_touch.down` or `.up` — both ends of a press arm, so a drag arms on the
-release that drops it — seen on any of that instance's connections. Otherwise
-the descriptor is closed — the client reads end of file, as if the selection
+only within one second of a press of a key, a pointer button, a tablet tool
+button or a tablet pad button, or a touch or pen touching down — no release
+arms — seen on any of that instance's connections. After a drop the
+application may read that drag's own data until it finishes or destroys the
+offer; the clipboard stays closed. Otherwise the descriptor is closed — the client reads end of file, as if the selection
 were empty — and a line goes to the log (at most one a second):
 
 ```
