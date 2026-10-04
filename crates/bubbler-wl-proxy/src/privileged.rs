@@ -2,6 +2,10 @@
 /// connection, whether or not the compositor also withholds them
 /// through `wp_security_context_v1` of its own.
 ///
+/// It is a denylist and nothing more: a privileged protocol nobody has
+/// written down here is advertised to the sandbox, and adding it is the
+/// only thing that hides it.
+///
 /// Included by both `bubbler-wl-proxy` and `bubbler-core`, so the
 /// denylist the proxy applies and the one core explains are one list.
 pub const PRIVILEGED: &[&str] = &[
