@@ -1034,6 +1034,17 @@ client opens — linked by the session manager on the client's behalf, not
 by the client itself — gets no link to a source it was never given the
 permission to see.
 
+A port or link carries no `media.class` for those rules to match, only
+the id of its node, so until 0.26.0 a playback sandbox saw every port of
+a hidden source — its description in `port.alias`, its node's id, its
+channels and format — and every link to or from one (measured, PipeWire
+1.6.9, WirePlumber 0.5.18). The linking hook now hides each port and
+link of those nodes from every context without `microphone`: from one
+connected before the node, from one connected after, and under a
+WirePlumber restarted with both already in the graph (measured). Each
+appears to such a context for the instant between the daemon adding it
+and WirePlumber hiding it, as the node itself does.
+
 Streams are readable rather than hidden because the private
 `pipewire-pulse` a `pulseaudio` grant runs creates a stream node per
 application it serves and cannot answer a client about a node it cannot

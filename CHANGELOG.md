@@ -9,6 +9,10 @@
   sandbox naming its stream like a host application set that application's
   saved volume or mute. A sandbox's stream named like a host application
   still starts at that application's saved volume.
+- A sandbox without the `microphone` grant no longer sees the ports of a
+  source it cannot see, nor a link to or from one: they named the
+  microphone (`port.alias`) and gave its channels and format. 0.24.2 hid
+  the source nodes alone.
 - The audio policy files changed: rewrite them if they are your own copies
   (`bubbler audio-policy --print` and `--print --script`), or update the
   package, and restart WirePlumber; until then each run with an audio grant
