@@ -87,7 +87,9 @@ impl Cli {
 }
 
 /// What a captured run printed. Lossy text, because it is on its way to a
-/// terminal buffer and not to a file.
+/// terminal buffer and not to a file: bubbler's own output is UTF-8, and
+/// a path that is not is better shown with a replacement character than
+/// not at all.
 #[derive(Debug, Clone)]
 pub struct Output {
     /// How the command ended.
