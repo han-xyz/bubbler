@@ -25,7 +25,7 @@
   sandbox that stays connected (measured on PipeWire 1.6.9, WirePlumber
   0.5.18).
 - No sandbox with an audio grant sees a camera node (`Video/*`), another
-  client's video stream, or their ports and links any more, whatever its
+  sandbox's video stream, or their ports and links any more, whatever its
   grant. Cameras go through the portal. Card objects (`Audio/Device`) with
   their profiles and routes stay visible, so a card that only records still
   shows that a microphone exists (measured on PipeWire 1.6.9, WirePlumber

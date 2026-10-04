@@ -658,9 +658,9 @@ devices, is not kept, and the name rule below still holds: a node of the
 instance named after one of your devices is no device. Microphones stay
 behind `microphone`. The pulse server of a `pulseaudio` grant shares the
 instance's context and so carries `devices` too, and cannot use it.
-No grant shows a camera over this socket, nor another client's video
-stream. A video stream the application makes stays visible to the client
-that made it. A camera goes through `--grant camera` and the portal.
+No grant shows a camera over this socket, nor another sandbox's video
+stream. A video stream the application makes stays visible to every
+process of the instance. A camera goes through `--grant camera` and the portal.
 `exclusive`, on either node (`pipewire { exclusive }`,
 `pulseaudio { exclusive }`, ORed like `microphone`), lets a stream hold a
 sink or source for itself: ask for it exclusively (mpv's `--audio-exclusive`,

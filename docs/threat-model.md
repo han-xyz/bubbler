@@ -1109,15 +1109,17 @@ attach (both measured).
 Every camera node (`Video/` anywhere in its class: `Video/Source`,
 `Video/Sink`, `Video/Duplex`) is hidden from every context, whatever its
 grant, together with its ports and links, the same way. So is every video
-stream (`Stream/Output/Video`, `Stream/Input/Video`) but to the client
-that made it, which keeps seeing
-its own stream, its ports and its links; another client of the same
-sandbox does not see it. No audio grant covers a camera, and a sandbox
-reaches one through the camera portal. Until 0.26.0 every context saw
-camera nodes read and execute, and saw other clients' video streams
-read-only (measured, PipeWire 1.6.9, WirePlumber 0.5.18). The drop-in's
-rules cannot tell a node's owner, so the hook hides video streams by the
-node's `client.id`, and the stream rule's `r` leaves video streams out:
+stream (`Stream/Output/Video`, `Stream/Input/Video`) but to the sandbox
+that made it: every client of that sandbox keeps seeing the stream, its
+ports and its links, as it sees its audio streams. No audio grant covers
+a camera, and a sandbox reaches one through the camera portal. Until
+0.26.0 every context saw camera nodes read and execute, and saw other
+clients' video streams read-only (measured, PipeWire 1.6.9, WirePlumber
+0.5.18). The drop-in's rules cannot tell a node's owner, so the hook
+hides a video stream unless the client named by the node's `client.id`
+carries the viewer's `pipewire.sec.instance-id`, which the security
+context sets and no client can, and the stream rule's `r` leaves video
+streams out:
 where two rules of a permission manager matched one node, the stream
 rule's `r` was applied whichever rule came first, and an entry the hook
 sets survives the manager's attach only on a node no rule matches (both

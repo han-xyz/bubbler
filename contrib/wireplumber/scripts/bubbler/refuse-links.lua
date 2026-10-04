@@ -99,7 +99,7 @@ local BUBBLER_ENGINE = "org.bubbler"
 
 -- Raised whenever what this policy makes WirePlumber do changes; bubbler
 -- expects the revision it ships with and reads it from this line.
-local POLICY_REVISION = 5
+local POLICY_REVISION = 6
 
 local EPERM = -1
 
@@ -559,15 +559,28 @@ local function is_sandbox (client)
   return client.properties ["pipewire.sec.engine"] == BUBBLER_ENGINE
 end
 
+-- Whether the node's owning client belongs to the same sandbox as `client`:
+-- both carry the instance id the security context set, which no client can.
+local function same_sandbox (client, node_props)
+  local instance = client.properties ["pipewire.sec.instance-id"]
+  local owner_id = node_props ["client.id"]
+  local source = Plugin.find ("standard-event-source")
+  if not instance or not owner_id or not source then
+    return false
+  end
+  local owner = lookup (source, "client", owner_id)
+  return owner ~= nil and owner.properties ["pipewire.sec.instance-id"] == instance
+end
+
 -- Cameras and capture nodes are hidden by 50-bubbler.conf; a video stream
--- here, as no rule there can tell the sandbox's own from another's.
+-- here, as no rule there can tell which sandbox made it.
 local function hidden_from (client, node_props)
   local class = node_props ["media.class"] or ""
   if class:find ("Video/", 1, true) then
     return true
   end
   if class:find ("Stream/", 1, true) and class:find ("/Video$") then
-    return node_props ["client.id"] ~= tostring (client ["bound-id"])
+    return not same_sandbox (client, node_props)
   end
   return capture_capable (node_props) and not granted (client, "microphone")
 end
