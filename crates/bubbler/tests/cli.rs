@@ -6835,14 +6835,11 @@ fn audio_policy_is_silent_before_a_real_run_with_the_whole_policy_installed() {
     assert_eq!(out.status.code(), Some(1), "{err}");
 }
 
-/// The stderr of `bubbler <args>` run against `bed`'s PipeWire, with the
-/// whole policy installed under the test root, and instance `t` and
-/// profile `t` both holding `config`. Its `x11 "host"` ends the run on
-/// the test root's missing `$DISPLAY` after the warnings, before any
-/// sandbox starts.
 fn stderr_on_bed(bed: &common::bed::PipeWireBed, config: &str, args: &[&str]) -> String {
     let tmp = setup();
     install_audio_policy(tmp.path(), true, true);
+    // `x11 "host"` ends the run on the test root's missing `$DISPLAY`, after the warnings and
+    // before any sandbox starts.
     let config = format!("{config}x11 \"host\"\ncommand \"/usr/bin/true\"\n");
     write_profile(tmp.path(), "system", "t", &config);
     bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
@@ -6862,7 +6859,6 @@ fn stderr_on_bed(bed: &common::bed::PipeWireBed, config: &str, args: &[&str]) ->
     err
 }
 
-/// The line a run prints for `loaded`.
 fn not_loaded_line(loaded: &LoadedRevision) -> String {
     format!(
         "bubbler: warning: {}",
@@ -6870,8 +6866,6 @@ fn not_loaded_line(loaded: &LoadedRevision) -> String {
     )
 }
 
-/// A bed whose hook publishes no revision, as a WirePlumber that loaded
-/// an older bubbler's hook, or none, answers.
 fn bed_without_the_revision() -> Option<common::bed::PipeWireBed> {
     let bed = common::bed::bed_with_the_hook_changed(
         r#"ImplMetadata ("bubbler-policy")"#,
@@ -6920,10 +6914,9 @@ fn a_run_under_a_wireplumber_of_another_revision_names_it() {
     assert!(err.contains(&format!("revision {other}")), "{err}");
 }
 
-/// Without an audio grant the running WirePlumber is not asked, so a
-/// WirePlumber without the policy draws no warning.
 #[test]
 fn a_run_without_an_audio_grant_does_not_ask_wireplumber() {
+    // The bed has no policy loaded: a WirePlumber asked would draw the warning.
     let Some(bed) = bed_without_the_revision() else {
         return;
     };

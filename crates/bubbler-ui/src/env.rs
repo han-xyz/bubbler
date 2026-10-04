@@ -111,9 +111,8 @@ pub fn search_path() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-/// Which audio policy the running WirePlumber has loaded, asked once per
-/// run of the editor: it lints on every change, and where nothing answers
-/// the question takes two seconds.
+/// Asked once per run of the editor: it lints on every change, and where nothing answers the
+/// question takes two seconds.
 pub fn loaded_revision(runtime_dir: &Path) -> LoadedRevision {
     static LOADED: OnceLock<LoadedRevision> = OnceLock::new();
     LOADED

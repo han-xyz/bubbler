@@ -228,11 +228,8 @@ pub fn run_warning(cfg: &InstanceConfig, host: &dyn Host, env: &Env) -> Option<S
     }
 }
 
-/// The warning where this run needs it: `cfg` grants `pipewire` or
-/// `pulseaudio`, the host holds the whole policy, and the WirePlumber
-/// serving `env`'s runtime directory, asked through `read`, has not
-/// loaded this bubbler's. Where a half is [`missing`], [`run_warning`]
-/// already says so with the same restart, and `read` is not asked.
+/// `read` is asked only for an audio grant on a host holding the whole policy: where a half is
+/// [`missing`], [`run_warning`] already says so, with the same restart.
 pub fn not_loaded_warning(
     cfg: &InstanceConfig,
     host: &dyn Host,
@@ -246,10 +243,8 @@ pub fn not_loaded_warning(
     read(&env.runtime_dir).run_warning()
 }
 
-/// The suffix an audio group's header takes: what the host is missing of
-/// the policy, or how its copy differs and whether the running
-/// WirePlumber, asked through `read` as for [`not_loaded_warning`], has
-/// loaded it; `""` where all is in place.
+/// The audio group header's suffix: the policy missing, differing or not loaded; `""` where it is
+/// installed and loaded, or the loaded one is not known. `read` as for [`not_loaded_warning`].
 pub fn explain_suffix(
     cfg: &InstanceConfig,
     host: &dyn Host,
@@ -387,8 +382,6 @@ pub enum LoadedRevision {
     Unknown(String),
 }
 
-/// What a WirePlumber that has not loaded this bubbler's policy leaves
-/// of a grant.
 const NOT_ENFORCED: &str = "audio grants are not enforced as configured";
 
 /// What loads the installed policy into the running WirePlumber.
@@ -411,13 +404,11 @@ impl LoadedRevision {
         }
     }
 
-    /// The line a real run prints on stderr for this answer, if any.
     pub fn run_warning(&self) -> Option<String> {
         self.not_loaded()
             .map(|cause| format!("{cause}: {NOT_ENFORCED}; run `{RESTART}`"))
     }
 
-    /// What `--explain` appends to the audio group's header for it.
     fn explain_suffix(&self) -> Option<String> {
         self.not_loaded()
             .map(|cause| format!(" ({cause}: grant not enforced as configured)"))
@@ -458,7 +449,6 @@ pub fn loaded_revision(runtime_dir: &Path) -> LoadedRevision {
     loaded_revision_asking(Path::new(PW_METADATA), runtime_dir)
 }
 
-/// [`loaded_revision`], asked of `program` in place of [`PW_METADATA`].
 fn loaded_revision_asking(program: &Path, runtime_dir: &Path) -> LoadedRevision {
     let spawned = Command::new(program)
         .arg("-n")
@@ -1024,7 +1014,6 @@ mod tests {
         }
     }
 
-    /// A stand-in for `pw-metadata` at a path of its own, running `script`.
     fn stand_in(dir: &Path, script: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("pw-metadata");
@@ -1041,10 +1030,9 @@ mod tests {
         assert!(matches!(answer, LoadedRevision::Unknown(_)), "{answer:?}");
     }
 
-    /// What `pw-metadata` does where no daemon answers on the socket
-    /// (measured on PipeWire 1.6.9): exit 255, the reason on stderr.
     #[test]
     fn an_unreachable_daemon_is_unknown_and_says_why() {
+        // No daemon answering: `pw-metadata` exits 255, the reason on stderr (PipeWire 1.6.9).
         let tmp = tempfile::tempdir().expect("a temp dir");
         let tool = stand_in(
             tmp.path(),
@@ -1099,9 +1087,6 @@ mod tests {
         );
     }
 
-    /// The reader is asked only for an audio grant on a host that holds
-    /// the whole policy: a missing half is already the run's warning,
-    /// and its fix is the same restart.
     #[test]
     fn the_loaded_policy_is_asked_only_where_it_can_add_a_warning() {
         let e = env();

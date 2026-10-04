@@ -447,10 +447,8 @@ pub struct Context<'a> {
     pub host: &'a dyn Host,
     /// `$PATH` split into directories, for `command-not-found`.
     pub search_path: &'a [PathBuf],
-    /// Which policy the WirePlumber serving a runtime directory has
-    /// loaded, for `audio-policy-not-loaded`:
-    /// [`audio_policy::loaded_revision`] outside the tests. Asked only of
-    /// a config with an audio grant.
+    /// [`audio_policy::loaded_revision`] outside the tests; asked only of a config with an audio
+    /// grant and the whole policy installed.
     pub loaded_revision: &'a dyn Fn(&Path) -> LoadedRevision,
 }
 
@@ -1289,10 +1287,8 @@ fn audio_policy_differs(ctx: &Context, sources: &[Source], f: &mut Findings) {
     );
 }
 
-/// The `audio-policy-not-loaded` warning, or its note where the running
-/// WirePlumber could not be asked. Not where a half of the policy is
-/// missing: `audio-policy-missing` says so, with the same restart.
 fn audio_policy_not_loaded(ctx: &Context, sources: &[Source], f: &mut Findings) {
+    // `audio-policy-missing` already says so, with the same restart.
     if audio_policy::missing(ctx.host, ctx.env).is_some() {
         return;
     }
@@ -3892,7 +3888,6 @@ mod tests {
         });
     }
 
-    /// A host holding the whole policy, as this binary ships it.
     fn whole_policy() -> FakeHost {
         let (file, _, _) = fake::types();
         let drop_in = "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf";
@@ -3903,8 +3898,6 @@ mod tests {
             .text(HOOK_PATH, audio_policy::HOOK)
     }
 
-    /// Lint `layers` on `host` with the running WirePlumber answering
-    /// `loaded`.
     fn lint_loaded(host: &dyn Host, loaded: LoadedRevision, layers: &[&str]) -> Report {
         let e = env();
         let path = [PathBuf::from("/usr/bin")];
@@ -3961,8 +3954,6 @@ mod tests {
         assert!(finding.message.contains(reason), "{finding:?}");
     }
 
-    /// No audio grant asks nothing, and a missing half is its own
-    /// finding with the same restart in its help.
     #[test]
     fn the_loaded_policy_is_asked_only_of_an_audio_grant_with_the_whole_policy() {
         let e = env();
