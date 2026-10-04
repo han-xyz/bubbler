@@ -81,7 +81,8 @@ const PASTA_STOP: Duration = Duration::from_secs(1);
 // A bound on a hang, not on the work: `nft` took 1.5 ms when measured.
 const NFT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// It binds one socket after three `setns` calls; this is a bound on a hang and not on the work.
+/// How long the egress proxy has to report that it is listening. It binds one socket after three
+/// `setns` calls; this is a bound on a hang and not on the work.
 const NET_PROXY_READY: Duration = Duration::from_secs(5);
 
 const NET_PROXY_STOP: Duration = Duration::from_secs(5);
@@ -3095,7 +3096,8 @@ impl Drop for SocketGuard {
 
 // Taken once the sandbox has exited, so a start made now waits for this run's teardown.
 // Blocking: a stop signal has usually ended the run by now, and another start holds the lock only
-// from its liveness check to its bind. A lock that cannot be had costs only that guarantee, so it is a warning.
+// from its liveness check to its bind. A lock that cannot be had costs only that guarantee, so it
+// is a warning.
 fn lock_for_teardown(path: &Path) -> Option<OwnedFd> {
     let locked = open_start_lock(path).and_then(|lock| {
         flock(&lock, FlockOperation::LockExclusive)

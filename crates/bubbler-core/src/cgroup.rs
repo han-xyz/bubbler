@@ -1,20 +1,6 @@
 //! The two cgroups a run with an `allow-host` needs: the one the sandbox
 //! runs in and the one the egress proxy runs in, side by side under a
 //! parent of their own.
-//!
-//! nftables matches a cgroup by path (`socket cgroupv2 level N "<path>"`)
-//! but stores the id it resolved, so the proxy's directory has to exist
-//! before `nft -f` reads the rule and to live as long as the sandbox: one
-//! made afterwards matches nothing, silently.
-//!
-//! bwrap never changes cgroup, so `--unshare-cgroup` makes whatever cgroup
-//! bwrap was started in the root of the sandbox's cgroup namespace — and
-//! everything under that root is nameable from inside. So bubbler puts
-//! itself in `sandbox/` before it spawns bwrap — bwrap, the supervisor and
-//! the application inherit it, and the namespace root becomes `sandbox` —
-//! and the proxy goes into `proxy/`, a **sibling outside** that root:
-//! unnameable through any cgroupfs the application mounts, and refused by
-//! `nsdelegate` even if it were named.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -133,6 +119,20 @@ fn write_pid(dir: &Path, pid: u32) -> std::io::Result<()> {
 
 /// Make this run's cgroups under bubbler's own and move bubbler into the
 /// sandbox leaf, so that everything it spawns from here on is in it.
+///
+/// nftables matches a cgroup by path (`socket cgroupv2 level N "<path>"`)
+/// but stores the id it resolved, so the proxy's directory has to exist
+/// before `nft -f` reads the rule and to live as long as the sandbox: one
+/// made afterwards matches nothing, silently.
+///
+/// bwrap never changes cgroup, so `--unshare-cgroup` makes whatever cgroup
+/// bwrap was started in the root of the sandbox's cgroup namespace — and
+/// everything under that root is nameable from inside. So bubbler puts
+/// itself in `sandbox/` before it spawns bwrap — bwrap, the supervisor and
+/// the application inherit it, and the namespace root becomes `sandbox` —
+/// and the proxy goes into `proxy/`, a **sibling outside** that root:
+/// unnameable through any cgroupfs the application mounts, and refused by
+/// `nsdelegate` even if it were named.
 ///
 /// `pid` is bubbler's own: the name has to be settled before bwrap is
 /// spawned, since the sandbox's cgroup namespace root is fixed at the

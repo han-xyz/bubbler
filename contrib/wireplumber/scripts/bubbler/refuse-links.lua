@@ -15,13 +15,13 @@
 --
 -- Under the device grant (`devices` in its grant) a sandbox's nodes that
 -- are no stream are devices like the host's: WirePlumber may link another
--- client's stream to them and make one a default. A node of such a sandbox
--- that is marked a smart filter (`filter.smart`) or shares a `node.name`,
--- `object.path` or `node.nick` with another device keeps no session item
--- all the same. Into such a device flows only a playback stream; a
--- capture stream records from it as from a host device. Every factory
--- but `client-node` stays hidden from it all the same, so its devices
--- are nodes it runs itself, carrying its client id.
+-- client's stream to them and make one a default. Into such a device flows
+-- only a playback stream; a capture stream records from it as from a host
+-- device. Every factory but `client-node` stays hidden from it all the
+-- same, so its devices are nodes it runs itself, carrying its client id.
+-- A node of such a sandbox that is marked a smart filter (`filter.smart`)
+-- or shares a `node.name`, `object.path` or `node.nick` with another
+-- device keeps no session item all the same.
 --
 -- A link with a sandbox's node at either end is destroyed when
 -- WirePlumber sees it, unless WirePlumber made it and it is one the

@@ -50,8 +50,9 @@ pub const MAX_NESTING: usize = 32;
 /// reads a block comment by recursion (`commented_block` in its `v2_parser.rs`): once per `*`,
 /// per `/`, per nested comment and per run of other text between them. Seven lines of a starred
 /// box fit under this; no comment that says something holds more. The bound sits below the worst
-/// shape on the smaller stack, as [`MAX_NESTING`] does, so a comment is a rounding error on the
-/// stack [`parse_document`] reserves.
+/// shape — a mark between runs of text, two descents per mark — on the 2 MiB stack of a spawned
+/// thread, as [`MAX_NESTING`] does, so a comment is a rounding error on the stack
+/// [`parse_document`] reserves.
 pub const MAX_COMMENT_MARKS: usize = 128;
 
 /// Keys `env` may not set: the sandbox owns them.
@@ -1135,7 +1136,9 @@ pub fn read_bounded(path: &Path) -> Result<String, ReadError> {
     Ok(text)
 }
 
-// Counting by hand is the point: see [`parse_document`].
+// Counting by hand is the point: `kdl` 6.7.1 descends once per `{` and once per `*` or `/` in a
+// block comment, and a file that drives either of them deep enough overflows the stack and aborts
+// the process instead of returning an error.
 //
 // The count keeps no model of where strings and comments are. The parser recovers from a string
 // it cannot read — a bad escape, a NUL, a `"""` mid-line, a multi-line body whose lines do not
@@ -1276,9 +1279,9 @@ fn string_end(b: &[u8], quote: usize, hashes: usize) -> Option<usize> {
             }
             b'"' => {
                 // One quote inside the multi-line form is content, and so are three with anything
-                // but whitespace before them on their line. kdl 6.7.1 reads one mid-line as body in
-                // a raw string and as an error in a quoted one, never as the end (`raw_string` and
-                // `quoted_string` in its `v2_parser.rs`).
+                // but whitespace before them on their line. kdl 6.7.1 reads a `"""` mid-line as
+                // body in a raw string and as an error in a quoted one, never as the end
+                // (`raw_string` and `quoted_string` in its `v2_parser.rs`).
                 if triple
                     && (b.get(i..i + 3) != Some(b"\"\"\"".as_slice())
                         || !only_spaces(&b[line_start..i], hashes == 0))

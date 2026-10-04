@@ -196,6 +196,9 @@ fn require_exists(
     }
 }
 
+/// The resolver configuration, and the host's network namespace where
+/// the node asked for it.
+///
 /// A generated file rather than the host's, except under `"host"` with no
 /// `dns` child: the host's `/etc/resolv.conf` may name a resolver on its
 /// own loopback, which a sandbox with its own namespace can never reach.
