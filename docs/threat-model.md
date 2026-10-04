@@ -2141,8 +2141,11 @@ stop's: a command that exits during the grace does not start a new one for
 the exec'd children, the window manager or the X server.
 
 `bubbler-init` makes itself non-dumpable, sets `PR_SET_NO_NEW_PRIVS`,
-clears the ambient set and the three sets `capset` carries, drops
-whatever is left in the bounding set, and takes `PR_SET_PDEATHSIG`
+clears the ambient set and the three sets `capset` carries, drops from
+the bounding set every capability the rustix it is built with names (41
+with rustix 1.1.4; a capability a newer kernel adds past those stays in
+the bounding set, which `no_new_privs` leaves nothing to gain from), and
+takes `PR_SET_PDEATHSIG`
 (`SIGTERM`) before it installs a signal handler or starts anything. Under
 bwrap the capability sets are already empty and `no_new_privs` is already
 on: the steps are taken so that the posture is the supervisor's own and

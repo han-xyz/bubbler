@@ -2046,9 +2046,8 @@ last label is all digits is refused as an address written the wrong way.
 `getaddrinfo` also reads hex forms such as `0x7f000001`, which are letters and
 digits and do parse as a name: a config writing one has named an address on
 purpose, and the proxy refuses an address as a `CONNECT` target whatever its
-shape. The
-port defaults to 443, the name and the port are one grant rather than two, and
-a duplicate of both is an error.
+shape. The port defaults to 443, the name and the port are one grant rather
+than two, and a duplicate of both is an error.
 
 **DNS becomes the proxy's alone.** With any `allow-host` the two resolver rules
 carry the cgroup match, so the proxy resolves and the application does not.
