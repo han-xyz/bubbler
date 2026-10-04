@@ -3801,7 +3801,9 @@ No descriptor of yours is left changed: bubbler opens one of its own for
 the output it relays, so the non-blocking flag it needs never reaches
 the descriptor your shell holds, and where it cannot open one — a
 redirect to a socket, say — it writes without setting the flag at all
-rather than set it on something you share.
+rather than set it on something you share. A descriptor 0, 1 or 2 that bubbler
+was started without is filled with `/dev/null` at startup, before anything
+can take the number.
 
 The pty is allocated on the host, so its name inside is not its name outside.
 `/proc/self/fd/0` still reads back a host `/dev/pts/N`, a path the sandbox's
