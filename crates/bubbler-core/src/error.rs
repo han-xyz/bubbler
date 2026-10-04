@@ -38,9 +38,7 @@ pub enum ConfigError {
     #[error("no command: add a `command` node to the config or pass one after `--`")]
     MissingCommand,
     /// Larger than [`crate::config::MAX_BYTES`], and so refused before
-    /// the parser sees it. The KDL parser can take one stack frame per
-    /// byte it cannot place, and the stack it runs on is sized for
-    /// this many.
+    /// the parser sees it.
     #[error("configuration is {bytes} bytes; bubbler parses at most {max}")]
     TooLarge {
         /// Size of the text that was offered.
@@ -50,11 +48,7 @@ pub enum ConfigError {
     },
     /// More than [`crate::config::MAX_NESTING`] `{` in the text, counted
     /// wherever they stand — in strings and comments too, and never
-    /// given back by a `}`. The KDL parser descends into `{` by
-    /// recursion, once per brace it reads as one, and it recovers from
-    /// a string it cannot read by reading the inside as nodes, so no
-    /// string is trusted to hold its braces: N braces in the text are
-    /// at most N descents, and this keeps N small.
+    /// given back by a `}`.
     #[error(
         "`{{` appears more than {max} times in the file (line {line}); braces are counted wherever they stand, strings and comments included"
     )]
@@ -66,9 +60,7 @@ pub enum ConfigError {
     },
     /// A `/*` with more than [`crate::config::MAX_COMMENT_MARKS`] `*` or
     /// `/` in the comment after it, measured wherever the `/*` stands —
-    /// inside a string too, for the reason [`Self::TooDeep`] gives. The
-    /// KDL parser reads a block comment by recursing once per one of
-    /// those, and this keeps that count small.
+    /// inside a string too.
     #[error(
         "the `/*` at line {line} opens a comment holding more than {max} `*` or `/`; comments are measured wherever they open, strings included"
     )]
@@ -80,9 +72,6 @@ pub enum ConfigError {
     },
     /// The thread the parser runs on, with the stack
     /// [`crate::config::PARSER_STACK`] reserves, could not be started.
-    /// Nothing is parsed on the caller's stack instead: the reservation
-    /// is what keeps a file of unplaceable bytes from aborting the
-    /// process.
     #[error("cannot start the parser thread")]
     ParserThread(#[source] io::Error),
     /// The parser panicked, and the panic was caught at the thread it
@@ -266,10 +255,7 @@ pub enum LaunchError {
         reason: String,
     },
     /// A destination bwrap would create sits behind a symlink inside a
-    /// tree the application can write. bubblewrap below 0.12.0 follows
-    /// it and creates the file outside the sandbox
-    /// (GHSA-pxhw-h44j-8pfx); bubbler never deletes the link, since what
-    /// planted it is what the user has to know about.
+    /// tree the application can write.
     #[error(
         "refusing to start: {inside} is a symlink in {tree} (-> {target}); an app may have \
          planted it. Remove it from {host}/ to continue."
@@ -287,9 +273,7 @@ pub enum LaunchError {
     },
     /// Whether a destination sits behind a symlink could not be told: a
     /// component under a directory the user cannot search, or a loop on
-    /// the way. bwrap creates the destination as root of its user
-    /// namespace, which no mode stops, so what bubbler cannot see is
-    /// refused rather than passed.
+    /// the way.
     #[error(
         "refusing to start: cannot check whether {inside} is a symlink in {tree} ({host}: \
          {source}); make it readable or remove it"
@@ -308,7 +292,7 @@ pub enum LaunchError {
     /// A destination the argv was built with has a `..` or a root
     /// component, which the symlink sweep cannot walk on the host.
     /// bubbler builds every destination itself, so this is a bug in the
-    /// builder; refusing keeps the sweep honest about what it checked.
+    /// builder.
     #[error(
         "refusing to start: destination {0} has a `..` or root component the symlink sweep cannot walk"
     )]
@@ -322,8 +306,7 @@ pub enum LaunchError {
     Data(#[source] io::Error),
     /// Reading this process's own open descriptors, or marking the ones a
     /// child must not inherit close-on-exec, failed. Nothing is spawned
-    /// after this: a child started anyway would hold whatever bubbler was
-    /// handed by the process that started it.
+    /// after this.
     #[error("keeping inherited descriptors out of the child")]
     Descriptors(#[source] io::Error),
     /// Spawning `bwrap` failed for a reason other than it being missing.
@@ -347,29 +330,22 @@ pub enum LaunchError {
     #[error("the start was stopped by a signal")]
     Stopped,
     /// The sidecar that creates this run's PipeWire security context did
-    /// not report the socket it made. The run stops here: a sandbox
-    /// started anyway would either have no audio socket at all or, if
-    /// one were bound from the session instead, the untagged client the
-    /// context exists to prevent.
+    /// not report the socket it made. The run stops here.
     #[error("pw-container did not create this instance's PipeWire security context: {0}")]
     PwContext(String),
     /// The private PulseAudio server of a `pulseaudio` grant did not
-    /// come up. The run stops here for the reason a missing context
-    /// does: the sandbox would start with a bind of a socket nothing
-    /// listens on, and there is no second server to fall back to.
+    /// come up. The run stops here.
     #[error("pipewire-pulse did not serve this instance's private PulseAudio socket: {0}")]
     PwPulse(String),
     /// The pasta sidecar could not be started or did not report that it
     /// had configured the sandbox's network namespace. The sandbox is
-    /// stopped rather than let go: an isolated `network` that reached
-    /// nothing would look like a broken application.
+    /// stopped rather than let go.
     #[error("connecting the sandbox network namespace: {0}")]
     Network(String),
     /// The accessibility bus could not be found: `$AT_SPI_BUS_ADDRESS`
     /// named no socket bubbler can bind, the session bus could not be
     /// reached, or `org.a11y.Bus` did not answer with a `unix:path=`
-    /// address. An `a11y` sandbox stops here rather than start with a
-    /// socket that has no bus behind it.
+    /// address.
     #[error("finding the accessibility bus: {0}")]
     A11y(String),
     /// Nothing listens on the instance's control socket.
@@ -387,8 +363,7 @@ pub enum LaunchError {
     Signal(#[source] io::Error),
     /// The compositor refused, or could not be asked for, the Wayland
     /// security context the `wayland` grant registers the sandbox as.
-    /// The run stops rather than fall back to the session socket, which
-    /// would be a weaker sandbox than the configuration asked for.
+    /// The run stops rather than fall back to the session socket.
     #[error(transparent)]
     Wayland(#[from] crate::wayland::WaylandError),
     /// Command resolution failed (config had no `command` and none given).
