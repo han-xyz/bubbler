@@ -168,6 +168,7 @@ fn prepare(args: &Args) -> io::Result<OwnedFd> {
     Ok(listener)
 }
 
+// Nothing here may block without a bound: this runs before the readiness byte.
 // A Unix socket answers a full queue with `EAGAIN` on a socket that is not
 // connecting at all, so that answer is retried on a fresh socket rather than
 // waited on.
