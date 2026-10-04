@@ -36,8 +36,12 @@ const IGNORED: &[&[u8]] = &[
 
 const IGNORED_PREFIXES: &[&[u8]] = &[b"--sandbox-expose", b"--sandbox-flag"];
 
-// Refused by name rather than dropped, since a caller told its command
-// has one of these and silently given none would go on believing it.
+// Options there is no sub-sandbox here to honour either, but which
+// widen what the command may reach rather than narrow it: the host
+// itself, a bus name to hold, another `/app` or `/usr` over the one it
+// has, the caller's pid namespace. Refused by name rather than dropped,
+// since a caller told its command has one of these and silently given
+// none would go on believing it.
 const HOST_ONLY: &[&[u8]] = &[
     b"--host",
     b"--talk-name",
