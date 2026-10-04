@@ -2,14 +2,6 @@
 //! the supervisor binary: it runs the command it is given right here,
 //! inside the sandbox it was called in, instead of asking a host portal
 //! to run it outside.
-//!
-//! gdk-pixbuf's glycin loaders pick their sandbox by looking for
-//! `/.flatpak-info`, and a sandbox that carries one (bubbler's `portals`
-//! grant writes it) is expected to have `flatpak-spawn` on the default
-//! path — without it GTK's icon loading fails an assertion and takes the
-//! application down. Running the loader here is the trust level glycin's
-//! own no-sandbox fallback would have given it, and nothing in this mode
-//! ever reaches the host bus.
 
 use std::ffi::{OsStr, OsString};
 use std::os::fd::BorrowedFd;
@@ -24,27 +16,17 @@ use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
 /// that selects this mode.
 pub const NAME: &str = "flatpak-spawn";
 
-/// What one `flatpak-spawn` command line asks for, once the options a
-/// sandbox of bubbler's own can answer have been read off it.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Spawn {
-    /// `--directory=DIR`: the working directory of the command.
     directory: Option<PathBuf>,
-    /// `--env=K=V` pairs, in the order they were given.
     env: Vec<(OsString, OsString)>,
-    /// `--clear-env`: start the command from an empty environment.
     clear_env: bool,
-    /// `--forward-fd=N`: descriptors the caller passed and the command
-    /// is to keep.
     forward: Vec<i32>,
-    /// The command and its own arguments.
     argv: Vec<OsString>,
 }
 
-/// Options a real `flatpak-spawn` would answer by building a sub-sandbox
-/// on the host. There is no host side here and no sub-sandbox to build,
-/// so each one is read and dropped; the command still runs, inside this
-/// sandbox, which is what the caller wanted the loader for.
+// There is no host side here and no sub-sandbox to build, so each option
+// is read and dropped.
 const IGNORED: &[&[u8]] = &[
     b"--sandbox",
     b"--watch-bus",
@@ -52,16 +34,10 @@ const IGNORED: &[&[u8]] = &[
     b"--no-network",
 ];
 
-/// Prefixes of the same kind, each carrying a value: what the host would
-/// have exposed to the sub-sandbox, and the flags it would have set.
 const IGNORED_PREFIXES: &[&[u8]] = &[b"--sandbox-expose", b"--sandbox-flag"];
 
-/// Options there is no sub-sandbox here to honour either, but which
-/// widen what the command may reach rather than narrow it: the host
-/// itself, a bus name to hold, another `/app` or `/usr` over the one it
-/// has, the caller's pid namespace. Refused by name rather than dropped,
-/// since a caller told its command has one of these and silently given
-/// none would go on believing it.
+// Refused by name rather than dropped, since a caller told its command
+// has one of these and silently given none would go on believing it.
 const HOST_ONLY: &[&[u8]] = &[
     b"--host",
     b"--talk-name",
@@ -70,9 +46,8 @@ const HOST_ONLY: &[&[u8]] = &[
     b"--expose-pids",
 ];
 
-/// Read one `flatpak-spawn` command line. The first word that is not an
-/// option ends the options: the rest belongs to the command, whose own
-/// arguments (`prlimit --as=…`) must not be read as this shim's.
+// The first word that is not an option ends the options: the rest belongs
+// to the command, whose own arguments must not be read as this shim's.
 fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Spawn, String> {
     let mut s = Spawn::default();
     let mut it = args.into_iter();
@@ -135,9 +110,8 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Spawn, String> {
     Ok(s)
 }
 
-/// The `=VALUE` half of an option that takes one, or an error naming the
-/// whole word: this grammar has no form where the value is a word of its
-/// own, since a value taken from the next word would swallow a command.
+// This grammar has no form where the value is a word of its own, since a
+// value taken from the next word would swallow a command.
 fn value_of<'a>(word: &OsString, value: Option<&'a OsStr>) -> Result<&'a OsStr, String> {
     value.ok_or_else(|| format!("{}: needs a =VALUE", word.to_string_lossy()))
 }
@@ -159,9 +133,8 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
         // instead of being adopted. Nothing else in this process holds a
         // handle to it: the shim opens nothing before this point.
         let borrowed = unsafe { BorrowedFd::borrow_raw(*fd) };
-        // The command inherits every descriptor that is not CLOEXEC, and
-        // `execvp` below keeps this process, so clearing the flag is the
-        // whole of forwarding one.
+        // The command inherits every descriptor that is not CLOEXEC, so
+        // clearing the flag is the whole of forwarding one.
         if let Err(e) =
             fcntl_getfd(borrowed).and_then(|flags| fcntl_setfd(borrowed, flags - FdFlags::CLOEXEC))
         {
