@@ -34,39 +34,37 @@ use crate::objects::ObjectError;
 use crate::policy::{Action, Connection, GATE_WINDOW, Incoming, Policy};
 use crate::wire::{self, Header, WireError};
 
-/// Bytes to ask for when nothing is half-read. libwayland's own connection
-/// buffer is this size, so a larger read rarely finds more.
+// Bytes to ask for when nothing is half-read. libwayland's own connection
+// buffer is this size, so a larger read rarely finds more.
 const CHUNK: usize = 4096;
 
-/// Descriptors one `recvmsg` may collect. Linux caps `SCM_RIGHTS` at 253 per
-/// message, so the buffer can never be too small and the kernel never has to
-/// truncate — a truncated control message would silently close a client's fd.
+// Descriptors one `recvmsg` may collect. Linux caps `SCM_RIGHTS` at 253 per
+// message, so the buffer can never be too small and the kernel never has to
+// truncate — a truncated control message would silently close a client's fd.
 const MAX_FDS: usize = 253;
 
-/// Descriptors one message may carry. The protocol's largest is two.
+// Descriptors one message may carry. The protocol's largest is two.
 const MAX_MESSAGE_FDS: usize = 4;
 
-/// Bytes one direction may have waiting before the proxy stops reading the
-/// side that feeds it. A peer that does not read is not a reason to grow.
+// Bytes one direction may have waiting before the proxy stops reading the
+// side that feeds it. A peer that does not read is not a reason to grow.
 const MAX_QUEUE: usize = 4 << 20;
 
-/// Bytes every connection of one sandbox may have waiting between them. The
-/// per-direction cap bounds one connection; this bounds a client that opens
-/// many, and the connection holding the most is the one that gives way.
+// Bytes every connection of one sandbox may have waiting between them. The
+// per-direction cap bounds one connection; this bounds a client that opens many.
 const MAX_TOTAL_QUEUE: usize = 64 << 20;
 
-/// Connections one proxy serves at a time. A toolkit opens one per process;
-/// past this the listener is left alone and the kernel's backlog holds them.
+// Connections one proxy serves at a time. A toolkit opens one per process;
+// past this the listener is left alone and the kernel's backlog holds them.
 const MAX_CONNECTIONS: usize = 256;
 
-/// How long the loop waits before accepting again after running out of
-/// descriptors. Retrying at once would spin against a table that is full.
+// How long the loop waits before accepting again after running out of
+// descriptors. Retrying at once would spin against a table that is full.
 const BACKOFF: Timespec = Timespec {
     tv_sec: 0,
     tv_nsec: 100_000_000,
 };
 
-/// One message waiting to be written, with the descriptors it owns.
 #[derive(Debug)]
 struct Frame {
     data: Vec<u8>,
@@ -74,8 +72,6 @@ struct Frame {
     fds: Vec<OwnedFd>,
 }
 
-/// One end of a connection: what has been read from it and not yet parsed,
-/// and what is waiting to be written to it.
 #[derive(Debug)]
 struct Side {
     fd: OwnedFd,
@@ -86,8 +82,8 @@ struct Side {
     eof: bool,
 }
 
-/// Which connection and which of its two sides one entry of the poll array
-/// stands for, since an entry is only there when it has something to wait for.
+// Which connection and which of its two sides one entry of the poll array
+// stands for, since an entry is only there when it has something to wait for.
 #[derive(Debug, Clone, Copy)]
 enum Slot {
     Listener,
@@ -95,23 +91,20 @@ enum Slot {
     Server(usize),
 }
 
-/// Whether an error means the process is out of descriptors, in which case
-/// asking again at once would only spin.
 fn out_of_descriptors(err: Errno) -> bool {
     err == Errno::MFILE || err == Errno::NFILE
 }
 
-/// One client and the upstream connection opened for it.
 #[derive(Debug)]
 struct Conn {
     client: Side,
     server: Side,
     state: Connection,
-    /// The client has been refused: nothing more is read, and the connection
-    /// ends once the error has gone out.
+    // The client has been refused: nothing more is read, and the connection
+    // ends once the error has gone out.
     closing: bool,
-    /// A descriptor failed; the connection ends without a word, because the
-    /// peer going away is not a policy event.
+    // A descriptor failed; the connection ends without a word, because the
+    // peer going away is not a policy event.
     broken: bool,
     // Whether the compositor side was last seen empty, and since when nothing
     // unread on it can have arrived: the instant input read from it is dated at.
@@ -123,7 +116,6 @@ struct Conn {
     quiet_until: Option<Instant>,
 }
 
-/// The listener, the socket to forward to, and every live connection.
 #[derive(Debug)]
 struct Relay {
     listener: OwnedFd,
@@ -131,11 +123,11 @@ struct Relay {
     policy: Policy,
     audit: Audit,
     conns: Vec<Conn>,
-    /// Set when `accept` ran out of descriptors: the next round waits instead
-    /// of asking again, and clears it.
+    // Set when `accept` ran out of descriptors: the next round waits instead
+    // of asking again, and clears it.
     backoff: bool,
-    /// Set for as long as that lasts, so the log says so once when it starts
-    /// and not once per round of waiting.
+    // Set for as long as that lasts, so the log says so once when it starts
+    // and not once per round of waiting.
     refusing: bool,
 }
 
@@ -182,9 +174,8 @@ impl Side {
     }
 }
 
-/// How many bytes to read next: enough for a fresh batch, and never less than
-/// the rest of a message that has already declared its size, so even a maximal
-/// one can be completed.
+// How many bytes to read next: never less than the rest of a message that
+// has already declared its size, so even a maximal one can be completed.
 fn want(buf: &[u8]) -> usize {
     match Header::decode(buf) {
         Ok(header) => usize::from(header.size)
@@ -194,9 +185,8 @@ fn want(buf: &[u8]) -> usize {
     }
 }
 
-/// Write what the socket will take of `side`'s queue. Descriptors ride with
-/// the first byte of their own frame, which is why they are cleared as soon as
-/// any of it has gone out.
+// Descriptors ride with the first byte of their own frame, which is why they
+// are cleared as soon as any of it has gone out.
 fn flush(side: &mut Side) -> io::Result<()> {
     while let Some(frame) = side.out.front_mut() {
         let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_MESSAGE_FDS))];
@@ -241,8 +231,8 @@ impl Conn {
         }
     }
 
-    /// What to poll one side for. Reading stops while the other side's queue
-    /// is full, so a slow peer slows the sender instead of growing memory.
+    // Reading stops while the other side's queue is full, so a slow peer
+    // slows the sender instead of growing memory.
     fn flags(&self, client: bool) -> PollFlags {
         let (side, other) = match client {
             true => (&self.client, &self.server),
@@ -258,14 +248,12 @@ impl Conn {
         flags
     }
 
-    /// Whether everything this connection still had to say has been said.
-    ///
-    /// The half-close arms are deliberate: a peer that has gone still leaves
-    /// what it already sent to be delivered, so the connection lives until
-    /// the queue aimed at the side that is *still there* is empty. It never
-    /// waits on a queue aimed at the side that hung up — nobody is left to
-    /// read that one — and it never waits on a peer that will not read, since
-    /// that peer hanging up is itself what ends the connection.
+    // The half-close arms are deliberate: a peer that has gone still leaves
+    // what it already sent to be delivered, so the connection lives until
+    // the queue aimed at the side that is *still there* is empty. It never
+    // waits on a queue aimed at the side that hung up — nobody is left to
+    // read that one — and it never waits on a peer that will not read, since
+    // that peer hanging up is itself what ends the connection.
     fn finished(&self) -> bool {
         self.broken
             // Refused: the client gets its `wl_display.error`, then nothing.
@@ -280,13 +268,12 @@ impl Conn {
             || (self.server.eof && self.client.out.is_empty())
     }
 
-    /// Bytes this connection has waiting in both directions.
     fn queued(&self) -> usize {
         self.client.out_bytes + self.server.out_bytes
     }
 
-    /// One round of work for this connection. An error names a protocol fault
-    /// the proxy will not forward past; the connection is closed either way.
+    // An error names a protocol fault the proxy will not forward past; the
+    // connection is closed either way.
     fn service(
         &mut self,
         client: PollFlags,
@@ -333,8 +320,6 @@ impl Conn {
         Ok(())
     }
 
-    /// Read from one side, decode every whole message it has sent, and queue
-    /// what the policy lets through on the other side.
     fn pump(
         &mut self,
         from_client: bool,
@@ -441,7 +426,6 @@ impl Conn {
     }
 }
 
-/// Take one batch of bytes and descriptors off `side`.
 fn receive(side: &mut Side) -> Result<(), String> {
     let start = side.buf.len();
     side.buf.resize(start + want(&side.buf), 0);
@@ -489,7 +473,6 @@ fn receive(side: &mut Side) -> Result<(), String> {
 }
 
 impl Relay {
-    /// Wait for something to happen, then serve every connection that has.
     fn step(&mut self) -> io::Result<()> {
         let backing_off = self.backoff;
         let listening = self.conns.len() < MAX_CONNECTIONS && !backing_off;
@@ -568,9 +551,8 @@ impl Relay {
                 }
             }
         }
-        // One sandbox, many connections: the per-direction cap bounds each of
-        // them, this bounds the lot. The connection holding the most is the
-        // one that took the total over, and is the one that goes.
+        // The connection holding the most is the one that took the total
+        // over, and is the one that goes.
         let live = || {
             conns
                 .iter()
@@ -609,8 +591,6 @@ impl Relay {
         Ok(())
     }
 
-    /// Take every connection the listener has waiting, opening one upstream
-    /// connection for each.
     fn accept(&mut self, now: Instant) {
         while self.conns.len() < MAX_CONNECTIONS {
             let client =
@@ -644,10 +624,8 @@ impl Relay {
         }
     }
 
-    /// Out of descriptors: say so once and leave the listener out of the next
-    /// round, so the loop waits rather than asking again immediately. The
-    /// connections already open keep being served throughout, and one of them
-    /// ending is what frees the descriptors this needs.
+    // The connections already open keep being served throughout, and one of
+    // them ending is what frees the descriptors this needs.
     fn wait_for_descriptors(&mut self, now: Instant) {
         self.backoff = true;
         if !self.refusing {
@@ -660,7 +638,6 @@ impl Relay {
         }
     }
 
-    /// Open one connection to the socket the sandbox is really talking to.
     fn dial(&self) -> Result<OwnedFd, Errno> {
         let socket = socket_with(
             AddressFamily::UNIX,
