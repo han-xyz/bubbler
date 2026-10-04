@@ -2267,7 +2267,7 @@ mod tests {
             profile_dir_override: None,
             proxy_override: None,
             pasta_override: None,
-            pw_metadata_override: None,
+            pw_dump_override: None,
             wl_proxy_override: None,
             net_proxy_override: None,
         }
@@ -4069,7 +4069,7 @@ mod tests {
 
     #[test]
     fn a_loaded_policy_not_known_is_a_note_naming_why() {
-        let reason = "/usr/bin/pw-metadata exit status: 255: can't connect: Host is down";
+        let reason = "/usr/bin/pw-dump exit status: 255: can't connect: Host is down";
         let report = lint_loaded(
             &whole_policy(),
             LoadedRevision::Unknown(reason.to_owned()),

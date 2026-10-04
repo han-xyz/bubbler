@@ -52,9 +52,9 @@ pub fn fill_closed_stdio() -> Result<()> {
 /// empty `$HOME` or `$XDG_RUNTIME_DIR` is an error: both are needed for
 /// any sandbox, and an empty one would silently become a relative path.
 /// `$BUBBLER_INIT`, `$BUBBLER_DBUS_PROXY`, `$BUBBLER_WL_PROXY`,
-/// `$BUBBLER_NET_PROXY`, `$BUBBLER_PASTA` and `$BUBBLER_PW_METADATA`
+/// `$BUBBLER_NET_PROXY`, `$BUBBLER_PASTA` and `$BUBBLER_PW_DUMP`
 /// override where the `bubbler-init`, `xdg-dbus-proxy`, `bubbler-wl-proxy`,
-/// `bubbler-net-proxy`, `pasta` and `pw-metadata` binaries are taken from, and
+/// `bubbler-net-proxy`, `pasta` and `pw-dump` binaries are taken from, and
 /// `$BUBBLER_PROFILE_DIR` where the system profile layer is read from.
 pub fn from_process() -> Result<Env> {
     let home = PathBuf::from(
@@ -111,7 +111,7 @@ pub fn from_process() -> Result<Env> {
         pasta_override: env::var_os("BUBBLER_PASTA")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from),
-        pw_metadata_override: env::var_os("BUBBLER_PW_METADATA")
+        pw_dump_override: env::var_os("BUBBLER_PW_DUMP")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from),
         wl_proxy_override: env::var_os("BUBBLER_WL_PROXY")

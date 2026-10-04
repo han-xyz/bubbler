@@ -54,7 +54,7 @@ pub fn from_process() -> Result<Env> {
         profile_dir_override: profile_dir()?,
         proxy_override: None,
         pasta_override: None,
-        pw_metadata_override: None,
+        pw_dump_override: None,
         wl_proxy_override: None,
         net_proxy_override: None,
     })

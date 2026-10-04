@@ -192,9 +192,9 @@ const ENVIRONMENT: &[(&str, &str)] = &[
     ),
     (
         "BUBBLER_INIT, BUBBLER_DBUS_PROXY, BUBBLER_WL_PROXY, BUBBLER_NET_PROXY, BUBBLER_PASTA, \
-         BUBBLER_PW_METADATA",
+         BUBBLER_PW_DUMP",
         "Replace the bubbler-init, xdg-dbus-proxy, bubbler-wl-proxy, bubbler-net-proxy, pasta \
-         and pw-metadata binaries a run uses; each must name a regular file. For tests and \
+         and pw-dump binaries a run uses; each must name a regular file. For tests and \
          debugging.",
     ),
     (

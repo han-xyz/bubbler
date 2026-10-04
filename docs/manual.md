@@ -735,7 +735,7 @@ through a profile. The check compares the copies WirePlumber loads with
 bubbler's own. Whether the running WirePlumber has loaded them is a second
 check, made for an instance with a `pipewire` or `pulseaudio` grant once both
 files are installed: the linking hook publishes its `policy revision`, and
-bubbler reads it with `pw-metadata -n bubbler-policy`. WirePlumber reads the
+bubbler reads it from `pw-dump`. WirePlumber reads the
 policy only when it starts, so after an install or an upgrade that changed
 the policy a run prints ``bubbler: warning: the running WirePlumber has not
 loaded this bubbler's audio policy: audio grants are not enforced as
@@ -748,7 +748,7 @@ is printed: rewriting it comes before the restart. `lint-allow
 "audio-policy-not-loaded" reason="..."` silences the run warning as well as
 the lint; a copy kept older on purpose needs it beside the
 `audio-policy-differs` one, since WirePlumber then loads that older copy. Where WirePlumber cannot be asked
-(no `pw-metadata`, no daemon on the socket, no answer within two seconds) a
+(no `pw-dump`, no daemon on the socket, no readable answer within two seconds) a
 run says nothing and `bubbler lint` notes it. The run goes on in every case.
 The first check reads the search directories (`$XDG_CONFIG_HOME`,
 `$XDG_CONFIG_DIRS`, `$XDG_DATA_HOME`, `$XDG_DATA_DIRS`) from bubbler's own
@@ -3179,7 +3179,7 @@ files installed, and the running WirePlumber has not loaded this bubbler's
 policy, or has loaded another `policy revision`, which it names: the grant
 is not enforced as configured until `systemctl --user restart wireplumber`.
 A note instead, naming why, where WirePlumber could not be asked: no
-`pw-metadata`, no daemon, or no answer within two seconds).
+`pw-dump`, no daemon, or no readable answer within two seconds).
 
 **Notes** are information and fail nothing: `app-runtime-rw` (a shared
 application runtime directory granted `mode=rw`, so the sandbox can replace the

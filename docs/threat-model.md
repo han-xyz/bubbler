@@ -1374,7 +1374,7 @@ running one enforces whatever it loaded before, or nothing. Since 0.26.0
 the hook publishes its `policy revision` as metadata `bubbler-policy`
 (key `revision`, subject 0), and for an instance with an audio grant and
 both files installed as this bubbler ships them (or a differing copy
-accepted with `lint-allow`), bubbler runs `pw-metadata -n bubbler-policy` against
+accepted with `lint-allow`), bubbler runs `pw-dump` against
 the session's PipeWire when a `run`, `try` or `open` starts a new
 sandbox (joining a running instance does not ask), for `bubbler lint` and
 for `--explain`: absent metadata or another revision is a
@@ -1386,8 +1386,8 @@ WirePlumber — any host process of the user's can create metadata of that
 name, and the host is trusted (boundary 4). A sandbox can neither see
 the metadata nor create one of that name (bed test
 `no_context_sees_or_makes_the_policys_metadata`), so it cannot silence
-the warning. Where the question gets no answer — no `pw-metadata`, no
-daemon, nothing within two seconds — the run warns nothing and lint
+the warning. Where the question gets no answer — no `pw-dump`, no
+daemon, nothing readable within two seconds — the run warns nothing and lint
 notes it: an unknown is not reported as a stale policy. The run goes on
 in every case.
 

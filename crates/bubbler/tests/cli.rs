@@ -6922,16 +6922,19 @@ fn profile_lint_of_every_profile_asks_wireplumber_once() {
         write_profile(tmp.path(), "user", name, "pipewire\ncommand \"sh\"\n");
     }
     let asked = tmp.path().join("asked");
-    let tool = tmp.path().join("pw-metadata");
+    let tool = tmp.path().join("pw-dump");
     std::fs::write(
         &tool,
-        format!("#!/bin/sh\necho asked >> '{}'\n", asked.display()),
+        format!(
+            "#!/bin/sh\necho asked >> '{}'\necho '[]'\n",
+            asked.display()
+        ),
     )
     .unwrap();
     std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
     let out = common::output_past_a_busy_exec(
         bubbler(tmp.path())
-            .env("BUBBLER_PW_METADATA", &tool)
+            .env("BUBBLER_PW_DUMP", &tool)
             .args(["profile", "lint", "--all"]),
     );
     let stdout = String::from_utf8_lossy(&out.stdout);

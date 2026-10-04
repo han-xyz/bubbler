@@ -338,8 +338,9 @@ impl PipeWireBed {
     /// the graph; a context opened before that gets the daemon's own
     /// permissions instead of the drop-in's.
     fn wait_for_the_session_manager(&self) {
-        wait_for("the bed's wireplumber", || {
-            self.dump_from_host().contains("\"wireplumber.daemon\"")
+        wait_for("the bed's wireplumber and its policy revision", || {
+            let dump = self.dump_from_host();
+            dump.contains("\"wireplumber.daemon\"") && publishes_a_revision(&dump)
         });
     }
 
@@ -494,19 +495,19 @@ fn session_tests_wanted() -> bool {
     std::env::var_os("BUBBLER_TEST_SESSION").is_some_and(|value| value == "1")
 }
 
-/// What the bed's WirePlumber answers once the hook it loaded has had the
-/// time to publish its revision. A bound, not a proof, as
-/// `window_in_which_it_would_link` is: nothing announces a metadata that
-/// is never published.
+/// Whether the hook has set its revision: it does so once its metadata activates, after
+/// WirePlumber is in the graph. A name ending in `bubbler-policy` counts, as a changed hook's does.
+fn publishes_a_revision(dump: &str) -> bool {
+    dump.split("bubbler-policy\"").skip(1).any(|rest| {
+        rest.split("\"id\":")
+            .next()
+            .is_some_and(|object| object.contains("\"key\": \"revision\""))
+    })
+}
+
+/// What the bed's WirePlumber answers, asked once.
 pub fn loaded_revision(bed: &PipeWireBed) -> LoadedRevision {
-    let run = bed.dir().join("run");
-    let mut answer = audio_policy::loaded_revision_asking(Path::new(audio_policy::PW_METADATA), &run);
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while answer == LoadedRevision::Absent && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(50));
-        answer = audio_policy::loaded_revision_asking(Path::new(audio_policy::PW_METADATA), &run);
-    }
-    answer
+    audio_policy::loaded_revision_asking(Path::new(audio_policy::PW_DUMP), &bed.dir().join("run"))
 }
 
 /// A bed whose hook is the shipped one with `from` replaced by `to`.

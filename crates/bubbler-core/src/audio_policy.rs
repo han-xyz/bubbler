@@ -7,9 +7,13 @@
 //! revision the running WirePlumber has loaded.
 
 use std::cell::OnceCell;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+use serde::Deserialize;
 
 use crate::config::InstanceConfig;
 use crate::env::Env;
@@ -342,7 +346,7 @@ pub fn differs_help(paths: &[PathBuf], env: &Env) -> String {
 
 /// Where the tool that reads the running WirePlumber's metadata is
 /// installed: the `pipewire` package, beside `pw-container`.
-pub const PW_METADATA: &str = "/usr/bin/pw-metadata";
+pub const PW_DUMP: &str = "/usr/bin/pw-dump";
 
 /// The metadata object the loaded hook states its policy revision in,
 /// under [`REVISION_KEY`] on subject 0.
@@ -357,6 +361,11 @@ const REVISION_LINE: &str = "local POLICY_REVISION = ";
 /// How long [`loaded_revision`] waits for an answer before it calls the
 /// revision unknown.
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+// A session graph's dump is tens to hundreds of KiB.
+const DUMP_CAP: u64 = 16 * 1024 * 1024;
+
+const METADATA_TYPE: &str = "PipeWire:Interface:Metadata";
 
 /// The policy revision of this bubbler's hook: the one the running
 /// WirePlumber should have loaded.
@@ -417,29 +426,57 @@ impl LoadedRevision {
     }
 }
 
-/// What `pw-metadata -n bubbler-policy` printed on stdout, read as a
-/// [`LoadedRevision`]. No such metadata prints nothing (measured on
-/// PipeWire 1.6.9).
-pub fn parse_loaded_revision(stdout: &str) -> LoadedRevision {
-    let mut lines = stdout.lines();
-    let Some(found) = lines.next() else {
+#[derive(Deserialize)]
+struct DumpObject {
+    #[serde(rename = "type")]
+    kind: String,
+    props: Option<DumpProps>,
+    metadata: Option<Vec<MetadataEntry>>,
+}
+
+#[derive(Deserialize)]
+struct DumpProps {
+    #[serde(rename = "metadata.name")]
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MetadataEntry {
+    subject: u64,
+    key: String,
+    value: serde_json::Value,
+}
+
+/// What `pw-dump` printed on stdout, read as a [`LoadedRevision`]: the
+/// [`REVISION_KEY`] on subject 0 of the metadata named [`POLICY_METADATA`].
+pub fn parse_loaded_revision(dump: &[u8]) -> LoadedRevision {
+    let objects: Vec<DumpObject> = match serde_json::from_slice(dump) {
+        Ok(objects) => objects,
+        Err(e) => return LoadedRevision::Unknown(format!("unreadable pw-dump output: {e}")),
+    };
+    let entry = objects
+        .iter()
+        .filter(|object| {
+            object.kind == METADATA_TYPE
+                && object
+                    .props
+                    .as_ref()
+                    .and_then(|props| props.name.as_deref())
+                    == Some(POLICY_METADATA)
+        })
+        .flat_map(|object| object.metadata.iter().flatten())
+        .find(|entry| entry.subject == 0 && entry.key == REVISION_KEY);
+    let Some(entry) = entry else {
         return LoadedRevision::Absent;
     };
-    if !found.starts_with(&format!("Found \"{POLICY_METADATA}\" metadata ")) {
-        return LoadedRevision::Unknown(format!("unexpected pw-metadata output: {found}"));
-    }
-    let update = format!("update: id:0 key:'{REVISION_KEY}' value:'");
-    let Some(value) = lines.find_map(|line| {
-        line.strip_prefix(&update)
-            .and_then(|rest| rest.rsplit_once("' type:'"))
-            .map(|(value, _)| value)
-    }) else {
-        return LoadedRevision::Absent;
+    let value = match &entry.value {
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
     };
     if value == revision().to_string() {
         LoadedRevision::Current
     } else {
-        LoadedRevision::Other(value.to_owned())
+        LoadedRevision::Other(value)
     }
 }
 
@@ -447,14 +484,14 @@ pub fn parse_loaded_revision(stdout: &str) -> LoadedRevision {
 /// bubbler's environment; no answer within two seconds is [`LoadedRevision::Unknown`].
 pub fn loaded_revision(env: &Env) -> LoadedRevision {
     let program = env
-        .pw_metadata_override
+        .pw_dump_override
         .as_deref()
-        .unwrap_or(Path::new(PW_METADATA));
+        .unwrap_or(Path::new(PW_DUMP));
     loaded_revision_asking(program, &env.runtime_dir)
 }
 
 /// [`loaded_revision`] asked on the first [`get`](Self::get) only, so that everything one caller
-/// lints or runs pays for one `pw-metadata` at most.
+/// lints or runs pays for one `pw-dump` at most.
 #[derive(Default)]
 pub struct AskedOnce(OnceCell<LoadedRevision>);
 
@@ -468,8 +505,6 @@ impl AskedOnce {
 /// [`loaded_revision`] of the WirePlumber serving `runtime_dir`, asked of `program`.
 pub fn loaded_revision_asking(program: &Path, runtime_dir: &Path) -> LoadedRevision {
     let spawned = Command::new(program)
-        .arg("-n")
-        .arg(POLICY_METADATA)
         .env_clear()
         .env("XDG_RUNTIME_DIR", runtime_dir)
         .stdin(Stdio::null())
@@ -480,10 +515,13 @@ pub fn loaded_revision_asking(program: &Path, runtime_dir: &Path) -> LoadedRevis
         Ok(child) => child,
         Err(e) => return LoadedRevision::Unknown(format!("{}: {e}", program.display())),
     };
+    // Read while it runs: a dump larger than the pipe would block it until the timeout.
+    let stdout = read_capped(child.stdout.take().expect("stdout was piped"));
+    let stderr = read_capped(child.stderr.take().expect("stderr was piped"));
     let deadline = Instant::now() + READ_TIMEOUT;
-    loop {
+    let status = loop {
         let unknown = match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
@@ -500,21 +538,38 @@ pub fn loaded_revision_asking(program: &Path, runtime_dir: &Path) -> LoadedRevis
         let _ = child.kill();
         let _ = child.wait();
         return LoadedRevision::Unknown(unknown);
-    }
-    let output = match child.wait_with_output() {
-        Ok(output) => output,
+    };
+    let stdout = match stdout.join().expect("the pipe reader does not panic") {
+        Ok(stdout) => stdout,
         Err(e) => return LoadedRevision::Unknown(format!("{}: {e}", program.display())),
     };
-    if !output.status.success() {
-        let said = String::from_utf8_lossy(&output.stderr);
+    if stdout.len() as u64 > DUMP_CAP {
+        return LoadedRevision::Unknown(format!(
+            "{} printed more than {DUMP_CAP} bytes",
+            program.display()
+        ));
+    }
+    if !status.success() {
+        let said = stderr
+            .join()
+            .expect("the pipe reader does not panic")
+            .unwrap_or_default();
         return LoadedRevision::Unknown(format!(
             "{} {}: {}",
             program.display(),
-            output.status,
-            said.trim()
+            status,
+            String::from_utf8_lossy(&said).trim()
         ));
     }
-    parse_loaded_revision(&String::from_utf8_lossy(&output.stdout))
+    parse_loaded_revision(&stdout)
+}
+
+fn read_capped(pipe: impl Read + Send + 'static) -> JoinHandle<std::io::Result<Vec<u8>>> {
+    std::thread::spawn(move || {
+        let mut read = Vec::new();
+        pipe.take(DUMP_CAP + 1).read_to_end(&mut read)?;
+        Ok(read)
+    })
 }
 
 /// `path` as one word of a POSIX shell command: as it is where a shell
@@ -568,7 +623,7 @@ mod tests {
             profile_dir_override: None,
             proxy_override: None,
             pasta_override: None,
-            pw_metadata_override: None,
+            pw_dump_override: None,
             wl_proxy_override: None,
             net_proxy_override: None,
         }
@@ -980,13 +1035,53 @@ mod tests {
         );
     }
 
-    /// What `pw-metadata -n bubbler-policy` printed on a bed whose hook
-    /// states revision 1 (PipeWire 1.6.9, WirePlumber 0.5.18).
-    const MEASURED: &str = "Found \"bubbler-policy\" metadata 27\n\
-                            update: id:0 key:'revision' value:'1' type:'Spa:Int'\n";
+    /// The metadata objects of what `pw-dump` printed on a bed whose hook
+    /// states revision 4 (PipeWire 1.6.9, WirePlumber 0.5.18).
+    const MEASURED: &str = r#"[
+  {
+    "id": 24,
+    "type": "PipeWire:Interface:Metadata",
+    "version": 3,
+    "permissions": [ "r", "w", "x" ],
+    "props": {
+      "client.id": 18,
+      "factory.id": 4,
+      "metadata.name": "default",
+      "module.id": 3,
+      "object.serial": 25
+    },
+    "metadata": [
+      { "subject": 0, "key": "default.audio.sink", "type": "Spa:String:JSON", "value": { "name": "bed-sink" } },
+      { "subject": 0, "key": "default.audio.source", "type": "Spa:String:JSON", "value": { "name": "bed-source" } }
+    ]
+  },
+  {
+    "id": 27,
+    "type": "PipeWire:Interface:Metadata",
+    "version": 3,
+    "permissions": [ "r", "w", "x" ],
+    "props": {
+      "client.id": 18,
+      "factory.id": 4,
+      "metadata.name": "bubbler-policy",
+      "module.id": 3,
+      "object.serial": 28
+    },
+    "metadata": [
+      { "subject": 0, "key": "revision", "type": "Spa:Int", "value": 4 }
+    ]
+  }
+]
+"#;
+
+    const MEASURED_REVISION: &str = r#""key": "revision", "type": "Spa:Int", "value": 4 }"#;
 
     fn stating(value: u32) -> String {
-        MEASURED.replace("value:'1'", &format!("value:'{value}'"))
+        assert!(MEASURED.contains(MEASURED_REVISION));
+        MEASURED.replace(
+            MEASURED_REVISION,
+            &MEASURED_REVISION.replace("4 }", &format!("{value} }}")),
+        )
     }
 
     #[test]
@@ -997,7 +1092,7 @@ mod tests {
     #[test]
     fn a_metadata_stating_this_revision_is_current() {
         assert_eq!(
-            parse_loaded_revision(&stating(revision())),
+            parse_loaded_revision(stating(revision()).as_bytes()),
             LoadedRevision::Current
         );
     }
@@ -1006,35 +1101,59 @@ mod tests {
     fn a_metadata_stating_another_revision_names_it() {
         let other = revision() + 1;
         assert_eq!(
-            parse_loaded_revision(&stating(other)),
+            parse_loaded_revision(stating(other).as_bytes()),
             LoadedRevision::Other(other.to_string())
         );
     }
 
-    /// No such metadata prints nothing at all; one without the key prints
-    /// only the line that found it.
     #[test]
     fn no_metadata_or_no_revision_key_is_absent() {
-        assert_eq!(parse_loaded_revision(""), LoadedRevision::Absent);
-        assert_eq!(
-            parse_loaded_revision("Found \"bubbler-policy\" metadata 27\n"),
-            LoadedRevision::Absent
+        let renamed = MEASURED.replace("\"bubbler-policy\"", "\"not-bubbler-policy\"");
+        let keyless = MEASURED.replace("\"revision\"", "\"other\"");
+        let elsewhere = MEASURED.replace(
+            "\"subject\": 0, \"key\": \"revision\"",
+            "\"subject\": 31, \"key\": \"revision\"",
         );
-    }
-
-    #[test]
-    fn output_of_another_shape_is_unknown() {
-        for garbage in ["no such line\n", "Found \"default\" metadata 3\n"] {
-            assert!(
-                matches!(parse_loaded_revision(garbage), LoadedRevision::Unknown(_)),
-                "{garbage}"
+        for dump in ["[]", &renamed, &keyless, &elsewhere] {
+            assert_eq!(
+                parse_loaded_revision(dump.as_bytes()),
+                LoadedRevision::Absent,
+                "{dump}"
             );
         }
     }
 
+    #[test]
+    fn an_unparsable_or_truncated_dump_is_unknown() {
+        let truncated = &MEASURED[..MEASURED.find("\"revision\"").expect("the key")];
+        for dump in ["", "no such line\n", "{}", truncated] {
+            assert!(
+                matches!(
+                    parse_loaded_revision(dump.as_bytes()),
+                    LoadedRevision::Unknown(_)
+                ),
+                "{dump}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dump_larger_than_the_cap_is_unknown() {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let tool = stand_in(
+            tmp.path(),
+            &format!("head -c {} /dev/zero | tr '\\0' ' '; echo '[]'", DUMP_CAP),
+        );
+        let answer = asking_past_a_busy_exec(&tool, tmp.path());
+        let LoadedRevision::Unknown(reason) = answer else {
+            panic!("{answer:?}");
+        };
+        assert!(reason.contains("more than"), "{reason}");
+    }
+
     fn stand_in(dir: &Path, script: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let path = dir.join("pw-metadata");
+        let path = dir.join("pw-dump");
         std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).expect("the stand-in");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .expect("the stand-in made executable");
@@ -1061,13 +1180,13 @@ mod tests {
     #[test]
     fn a_missing_tool_is_unknown() {
         let tmp = tempfile::tempdir().expect("a temp dir");
-        let answer = loaded_revision_asking(&tmp.path().join("pw-metadata"), tmp.path());
+        let answer = loaded_revision_asking(&tmp.path().join("pw-dump"), tmp.path());
         assert!(matches!(answer, LoadedRevision::Unknown(_)), "{answer:?}");
     }
 
     #[test]
     fn an_unreachable_daemon_is_unknown_and_says_why() {
-        // No daemon answering: `pw-metadata` exits 255, the reason on stderr (PipeWire 1.6.9).
+        // No daemon answering: `pw-dump` exits 255, the reason on stderr (PipeWire 1.6.9).
         let tmp = tempfile::tempdir().expect("a temp dir");
         let tool = stand_in(
             tmp.path(),
