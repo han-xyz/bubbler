@@ -2026,13 +2026,18 @@ HTTP/3 falls back to TCP. A tunnel idle for 60 seconds is closed.
 
 **The names.** ASCII letters, digits and `-` per label, no label starting or
 ending with `-`, at most 63 characters a label and 253 in the name as written,
-the trailing dot counted; case is folded and one trailing dot is stripped. A
+the trailing dot counted (DNS's own rules: RFC 1035 §2.3.1 with RFC 1123 §2.1's
+leading digit); case is folded and one trailing dot is stripped. A
 single label is a name too (`localhost`), which is what the test suite lists. `*.` in front of the first
 label stands for exactly one label — `*.example.com` covers `api.example.com`
 and neither `example.com` itself nor `a.b.example.com` — and a wildcard
 directly under a top-level domain raises the `allow-host-wildcard` note. There
 is no IDNA conversion: write the `xn--` form the name resolves as. A name whose
-last label is all digits is refused as an address written the wrong way. The
+last label is all digits is refused as an address written the wrong way.
+`getaddrinfo` also reads hex forms such as `0x7f000001`, which are letters and
+digits and do parse as a name: a config writing one has named an address on
+purpose, and the proxy refuses an address as a `CONNECT` target whatever its
+shape. The
 port defaults to 443, the name and the port are one grant rather than two, and
 a duplicate of both is an error.
 
