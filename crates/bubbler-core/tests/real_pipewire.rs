@@ -3566,3 +3566,152 @@ fn no_context_sees_or_makes_the_policys_metadata() {
         );
     }
 }
+
+// bwrap's own tmpfs as the root, so a file can sit at `/.flatpak-info`
+// without touching the host's `/`.
+const NESTED_ROOT: &str = "bwrap --unshare-user --die-with-parent \
+    --ro-bind /usr /usr --ro-bind /etc /etc --ro-bind-try /bin /bin \
+    --ro-bind-try /lib /lib --ro-bind-try /lib64 /lib64 \
+    --bind /tmp /tmp --proc /proc --dev /dev";
+
+fn nested(flatpak_info: Option<&Path>, program: &str) -> String {
+    let file = flatpak_info
+        .map(|file| format!(" --ro-bind {} /.flatpak-info", file.display()))
+        .unwrap_or_default();
+    format!("{NESTED_ROOT}{file} -- {program}")
+}
+
+#[derive(Debug, PartialEq)]
+struct Reach {
+    properties: Vec<String>,
+    view: Vec<String>,
+}
+
+// `pw-cli -m` ends at the end of its input, which the test's own stdin may reach.
+const MONITOR: &str = "sh -c 'sleep 600 | pw-cli -m'";
+const MONITOR_CLIENT: &str = r#"application.name = "pw-cli""#;
+const IN_A_CONTEXT: &str = "pipewire.sec.engine";
+const DECIDED: &str = "pipewire.access.effective";
+const PID: &str = "pipewire.sec.pid = ";
+const PER_CONNECTION: [&str; 2] = [PID, "pipewire.sec.socket = "];
+
+// The most specific first: a port's `port.alias` names its node too.
+const NAMES: [&str; 6] = [
+    "port.alias = ",
+    "node.name = ",
+    "factory.name = ",
+    "module.name = ",
+    "application.name = ",
+    "core.name = ",
+];
+
+fn block<'a>(listing: &'a str, markers: &[&str]) -> Option<&'a str> {
+    listing
+        .split("\n\tid: ")
+        .find(|block| markers.iter().all(|marker| block.contains(marker)))
+}
+
+fn property_lines(block: &str) -> impl Iterator<Item = &str> {
+    block
+        .lines()
+        .map(|line| line.trim().trim_start_matches('*').trim_start())
+}
+
+// Also returns the `/.flatpak-info` PipeWire finds through the client's pid.
+fn reach(
+    bed: &PipeWireBed,
+    props: &str,
+    markers: &[&str],
+    wrap: impl Fn(&str) -> String,
+) -> (Reach, Option<String>) {
+    let monitor = [CLIENT, MONITOR_CLIENT, IN_A_CONTEXT, DECIDED];
+    wait_for("the previous monitor gone", || {
+        block(&bed.info_from_host(), &monitor[..3]).is_none()
+    });
+    let _monitor = Streaming(bed.spawn_in_context(props, &wrap(MONITOR)));
+    let mut listing = String::new();
+    wait_for("the monitor's access decision", || {
+        listing = bed.info_from_host();
+        block(&listing, &monitor).is_some()
+    });
+    let client = block(&listing, &monitor).expect("the monitor");
+    let pid = property_lines(client)
+        .find_map(|line| line.strip_prefix(PID))
+        .expect("the monitor's pid")
+        .trim_matches('"');
+    let flatpak_info = std::fs::read_to_string(format!("/proc/{pid}/root/.flatpak-info")).ok();
+    let mut properties: Vec<String> = property_lines(client)
+        .filter(|line| {
+            line.starts_with("pipewire.") && !PER_CONNECTION.iter().any(|key| line.starts_with(key))
+        })
+        .map(str::to_owned)
+        .collect();
+    properties.sort();
+
+    let seen = format!("\n{}", bed.info_in_context(props, markers));
+    let mut view: Vec<String> = seen
+        .split("\n\tid: ")
+        .skip(1)
+        .map(|block| {
+            let field = |prefix: &str| {
+                property_lines(block)
+                    .find_map(|line| line.strip_prefix(prefix))
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            let name = NAMES
+                .iter()
+                .map(|prefix| field(prefix))
+                .find(|name| !name.is_empty())
+                .unwrap_or_default();
+            format!("{} {name} {}", field("type: "), field("permissions: "))
+        })
+        .collect();
+    view.sort();
+    (Reach { properties, view }, flatpak_info)
+}
+
+#[test]
+fn a_forged_or_hidden_flatpak_info_changes_nothing_a_context_gets() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    if !Command::new("sh")
+        .args(["-c", &nested(None, "true")])
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        say("skipping: bwrap cannot make a nested user namespace on this host");
+        return;
+    }
+    let bubblers = bubbler_core::dbus::flatpak_info("bed", true);
+    let forged = b"[Application]\nname=org.example.Other\n\n[Instance]\ninstance-id=4242\n";
+    let mut files = Vec::new();
+    for (name, text) in [("bubblers", &bubblers[..]), ("forged", &forged[..])] {
+        let path = bed.dir().join(format!("{name}-flatpak-info"));
+        std::fs::write(&path, text).expect("a /.flatpak-info to bind");
+        files.push((path, String::from_utf8_lossy(text).into_owned()));
+    }
+
+    for (props, markers) in [
+        (PLAYBACK, &[SINK][..]),
+        (PLAYBACK_MICROPHONE, &[SINK, SOURCE][..]),
+    ] {
+        let (plain, _) = reach(&bed, props, markers, str::to_owned);
+        for (case, file) in [
+            ("bubbler's file", Some(&files[0])),
+            ("a forged file", Some(&files[1])),
+            ("no file", None),
+        ] {
+            let (nested_reach, seen) = reach(&bed, props, markers, |program| {
+                nested(file.map(|(path, _)| path.as_path()), program)
+            });
+            assert_eq!(
+                seen.as_ref(),
+                file.map(|(_, text)| text),
+                "{case}: not what the client's /proc/<pid>/root holds"
+            );
+            assert_eq!(nested_reach, plain, "{case} under {props}");
+        }
+    }
+}
