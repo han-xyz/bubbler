@@ -58,6 +58,7 @@ pub struct Check {
 
 // Each check as a constant the code that reports it names, so a
 // finding cannot carry an id no table holds.
+
 // A note, not a warning: a wildcard is what the config asked for, and
 // how wide one is depends on who registers names under the suffix.
 const ALLOW_HOST_WILDCARD: Check = Check {
@@ -495,7 +496,7 @@ const SECRET_SEGMENTS: &[&str] = &[
     "PAT",
 ];
 
-// Pairs of segments that mean the same as one of [`SECRET_SEGMENTS`].
+// Pairs of segments that mean the same as one of `SECRET_SEGMENTS`.
 const SECRET_PAIRS: &[[&str; 2]] = &[["API", "KEY"], ["ACCESS", "KEY"], ["SECRET", "KEY"]];
 
 const SECRET_VALUES: &[&str] = &["ghp_", "sk-", "AKIA"];
@@ -737,8 +738,10 @@ impl Source {
                 Ok(Some(lines)) => flat.extend(lines),
                 Ok(None) | Err(_) => {
                     flat.push(node.clone());
-                    // The `portals` node stays in the list, which is what keeps
-                    // `camera-without-portals` silent for the child.
+                    // The config parser splits a `portals` block's `camera` child into the same
+                    // `Service::Camera` a bare `camera` node parses to, so the checks that read a
+                    // `camera` see it in either form. The `portals` node stays in the list, which
+                    // is what keeps `camera-without-portals` silent for the child.
                     if node.name().value() == "portals" {
                         flat.extend(kids(node).filter(|c| c.name().value() == "camera").cloned());
                     }
@@ -819,7 +822,8 @@ impl Findings {
 fn run(ctx: &Context, sources: &[Source]) -> Report {
     let mut f = Findings::default();
     // Read across the layers, since the node a per-layer finding depends on may be written in
-    // another file than the node it is about.
+    // another file than the node it is about. The last layer that names the mode is the one the
+    // merge keeps.
     let host_net = last(sources, "network").is_some_and(|(_, n)| arg(n) == Some("host"));
     for (i, source) in sources.iter().enumerate() {
         per_layer(ctx, i, source, host_net, &mut f);

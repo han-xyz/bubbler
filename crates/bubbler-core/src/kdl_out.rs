@@ -134,9 +134,11 @@ pub enum Entry<'a, T> {
     Disabled(usize, &'a Disabled),
 }
 
-/// One section of the file: its `enabled` nodes with the disabled entries of the same section
-/// among them, each before the entry it was read above. An entry pointing past the last one comes
-/// after it rather than being dropped.
+/// One section of the file: its `enabled` nodes with the disabled entries of the same section among
+/// them, each before the entry it was read above. An entry pointing past the last one comes after
+/// it rather than being dropped: the section may have lost the node it sat above since. Both
+/// readers of a section — [`nodes`] below and the editor's row list — walk this, so a file and the
+/// editor's view of it cannot disagree about where a `/-` line sits.
 pub fn section_entries<'a, T>(
     cfg: &'a InstanceConfig,
     is: fn(&Node) -> bool,
@@ -156,7 +158,6 @@ pub fn section_entries<'a, T>(
         out.extend(of_section(&|before| before == i));
         out.push(Entry::Enabled(node));
     }
-    // The section may have lost the node it sat above since.
     out.extend(of_section(&|before| before >= end));
     out
 }
@@ -358,10 +359,11 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
 
 /// `node` cut to `max` columns on screen, with the cut marked `…`. Where something follows the
 /// node's first quoted argument, the cut is made *inside* that argument so what follows stays in
-/// view. Display only: the result is not KDL the parser reads back.
+/// view. A node with nothing after its argument, and one whose remainder does not fit on its own,
+/// is cut at the end as any other text would be. Columns rather than characters, because a share
+/// named in Chinese is twice as wide as its character count and a line cut to the count would
+/// overflow the column it was cut for. Display only: the result is not KDL the parser reads back.
 pub fn shorten(node: &str, max: usize) -> String {
-    // Columns rather than characters, because a share named in Chinese is twice as wide as its
-    // character count and a line cut to the count would overflow the column it was cut for.
     if node.width() <= max {
         return node.to_owned();
     }
@@ -674,8 +676,9 @@ pub fn command(argv: &[OsString]) -> Result<String, ConfigError> {
     Ok(node)
 }
 
-// Config values come from KDL text and are therefore UTF-8. A lossy rendering would name a
-// different path than the grant did.
+// Config values come from KDL text and are therefore UTF-8. A caller that built an `InstanceConfig`
+// by hand may not have kept that, and a lossy rendering would name a different path than the grant
+// did.
 fn text<'a>(node: &str, what: &str, s: &'a OsStr) -> Result<&'a str, ConfigError> {
     s.to_str().ok_or_else(|| ConfigError::BadArgument {
         node: node.to_owned(),

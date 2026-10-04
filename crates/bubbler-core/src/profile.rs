@@ -473,7 +473,8 @@ const TEMPLATE: &str = "\
 ";
 
 // The text `edit_path` writes for a profile the user layer does not hold yet: an `include` of the
-// layer below, so editing extends the shipped profile instead of forking it.
+// layer below, so editing extends the shipped profile instead of forking it, or `TEMPLATE` when
+// there is none.
 fn starter(name: &str, below: bool) -> String {
     // The name passed the profile name grammar, so it holds no quote,
     // backslash or newline that would need escaping here.
@@ -486,8 +487,9 @@ fn starter(name: &str, below: bool) -> String {
 }
 
 /// The flattened profile as `bubbler profile show` prints it: the header a seeded `config.kdl`
-/// carries, then every node under a `// from:` comment naming the layer that contributed it. Lines
-/// are `OsString` because a profile path need not be UTF-8.
+/// carries, then every node under a `// from:` comment naming the layer that contributed it.
+/// Consecutive nodes from one layer share the comment. Lines are `OsString` because a profile path
+/// need not be UTF-8.
 pub fn show(name: &str, resolved: &Resolved) -> Vec<OsString> {
     let mut out = vec![OsString::from(format!("{PROFILE_HEADER}{name}"))];
     let mut last: Option<&NodeOrigin> = None;
