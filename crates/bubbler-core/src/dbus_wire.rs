@@ -102,9 +102,9 @@ const MAX_CALL_FDS: usize = 253;
 /// answers with one; the room exists so a peer that sends some cannot
 /// leave them queued, and every one that arrives is closed at once.
 ///
-/// A message carrying more than this fails closed: the kernel closes the
-/// ones that do not fit and sets `MSG_CTRUNC`, so fewer arrive than
-/// `UNIX_FDS` declares and [`Session::receive`] refuses the message.
+/// [`Session::call`] refuses a reply that declares more than this. The
+/// control buffer's alignment slack may let a few more arrive; the kernel
+/// closes any that do not fit, and every one that arrives is closed.
 const MAX_REPLY_FDS: usize = 4;
 
 /// Longest authentication line accepted, so a peer that never sends
@@ -1428,6 +1428,9 @@ impl Session {
                 return Err(WireError::BadMessage(
                     "a reply with fewer or more descriptors than it declares",
                 ));
+            }
+            if reply.fds_arrived > MAX_REPLY_FDS {
+                return Err(WireError::BadMessage("a reply with too many descriptors"));
             }
             return match reply.kind {
                 MSG_METHOD_RETURN => decode(&reply.signature, &reply.body),
@@ -3150,6 +3153,39 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_carrying_one_descriptor_past_the_cap_is_refused() {
+        const SENT: usize = MAX_REPLY_FDS + 1;
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, server) = fake_bus(tmp.path(), |stream| {
+            server_auth(&stream, true);
+            server_hello(&stream, ":1.23");
+            let (bytes, _) = server_message(&stream);
+            let body = encode("s", &[Value::Str("five".to_owned())]).unwrap();
+            let message = encode_message(
+                MSG_METHOD_RETURN,
+                0,
+                2,
+                &[
+                    (FIELD_REPLY_SERIAL, Value::Uint32(serial_of(&bytes))),
+                    (FIELD_SENDER, Value::Str(":1.5".to_owned())),
+                    (FIELD_SIGNATURE, Value::Signature("s".to_owned())),
+                    (FIELD_UNIX_FDS, Value::Uint32(SENT as u32)),
+                ],
+                &body,
+            )
+            .unwrap();
+            server_send_fds(&stream, &message, &[stream.as_fd(); SENT]);
+        });
+        let mut session = Session::connect(&path).unwrap();
+        let err = session
+            .call(":1.5", "/org/a", "org.a", "Ask", "", &[], &[])
+            .unwrap_err();
+        assert!(matches!(err, WireError::BadMessage(_)), "{err:?}");
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn a_message_that_declares_descriptors_it_did_not_send_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let (path, server) = fake_bus(tmp.path(), |stream| {
@@ -3546,7 +3582,8 @@ mod tests {
 
     #[test]
     fn a_message_with_more_descriptors_than_taken_before_the_reply_is_skipped() {
-        // Eight: the control buffer's alignment slack holds up to six.
+        // Eight: the control buffer's alignment slack holds up to six
+        // (rustix 1.1.5's `cmsg_space!` adds the alignment of `cmsghdr`).
         const SENT: usize = 8;
         let reply = reply_behind(|stream, serial| {
             let mut fields = vec![(FIELD_UNIX_FDS, Value::Uint32(SENT as u32))];
