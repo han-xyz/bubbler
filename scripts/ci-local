@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# scripts/ci-local [job]   job: check, deny, msrv or sandbox-probe; none runs all
+# scripts/ci-local --list  the job names
+# .github/workflows/ci.yml is the source; the job bodies below mirror its steps
+# (scripts/ci-local.test fails when the job names differ). Runs in
+# archlinux:latest with the tree mounted read-only and the build in a cache
+# directory outside it. Exit 0 all jobs passed, 1 a job failed, 2 could not run.
+set -euo pipefail
+
+IMAGE=archlinux:latest
+JOBS=(check deny msrv sandbox-probe)
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/bubbler-ci-local"
+
+die() {
+    echo "ci-local: $*" >&2
+    exit 2
+}
+
+usage() {
+    echo "usage: scripts/ci-local [${JOBS[*]// /|}] | --list" >&2
+    exit 2
+}
+
+# The prelude's `step` names what failed; the bodies follow the YAML's steps.
+job_script() {
+    cat <<'EOF'
+step() {
+    local name="$1"
+    shift
+    echo "==> step: $name"
+    "$@" || {
+        echo "==> step FAILED: $name"
+        return 1
+    }
+}
+finish() {
+    local status=$?
+    [ -z "${HOST_UID:-}" ] || chown -R "$HOST_UID:$HOST_GID" /cache
+    exit "$status"
+}
+trap finish EXIT
+set -e
+EOF
+    case "$1" in
+        check)
+            cat <<'EOF'
+step "system packages" pacman -Syu --noconfirm --needed \
+    nodejs git gcc pkgconf rustup \
+    libseccomp bubblewrap passt nftables python3 xorg-xwayland \
+    wl-clipboard
+step "rust stable" bash -c 'rustup default stable
+rustup component add clippy rustfmt
+cargo --version'
+cd /src
+step "cargo fmt --all --check" cargo fmt --all --check
+step "cargo clippy" cargo clippy --workspace --all-targets --locked -- -D warnings
+step "cargo doc" env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+step "cargo test" cargo test --workspace --locked
+EOF
+            ;;
+        deny)
+            cat <<'EOF'
+step "system packages" pacman -Syu --noconfirm --needed nodejs git gcc pkgconf rustup
+step "rustup default stable" rustup default stable
+cd /src
+step "cargo-deny" bash -c 'pacman -S --noconfirm --needed cargo-deny \
+    || cargo install --locked cargo-deny'
+step "cargo deny" cargo deny --workspace check
+EOF
+            ;;
+        msrv)
+            cat <<'EOF'
+step "system packages" pacman -Syu --noconfirm --needed \
+    nodejs git gcc pkgconf rustup libseccomp
+step "rustup toolchain install 1.95" rustup toolchain install 1.95 --profile minimal
+cd /src
+step "cargo +1.95 check" cargo +1.95 check --workspace --all-targets --locked
+EOF
+            ;;
+        sandbox-probe)
+            cat <<'EOF'
+set +e
+pacman -Syu --noconfirm --needed \
+    bubblewrap passt libseccomp nftables xorg-xwayland wl-clipboard
+printf 'max_user_namespaces: '
+cat /proc/sys/user/max_user_namespaces || echo unreadable
+unshare -Urn true \
+    && echo "unshare -Urn: OK" || echo "unshare -Urn: FAIL"
+bwrap --unshare-all --ro-bind / / -- /bin/true \
+    && echo "bwrap: OK" || echo "bwrap: FAIL"
+pasta --version || echo "pasta: missing"
+nft --version || echo "nft: missing"
+Xwayland -version || echo "Xwayland: missing"
+wl-copy --version || echo "wl-copy: missing"
+echo "WAYLAND_DISPLAY: ${WAYLAND_DISPLAY:-unset}"
+exit 0
+EOF
+            ;;
+    esac
+}
+
+pick_runtime() {
+    local candidate
+    for candidate in docker podman; do
+        if command -v "$candidate" >/dev/null; then
+            echo "$candidate"
+            return
+        fi
+    done
+    die "neither docker nor podman is installed"
+}
+
+report_failure() {
+    local log="$1"
+    grep -E '^==> step FAILED' "$log" || true
+    grep -E -B2 -A3 'test .* \.\.\. FAILED|panicked at' "$log" | head -n 80 || true
+}
+
+run_job() {
+    local job="$1" log="$CACHE/logs/$job-$(date +%Y%m%d-%H%M%S).log" status=0
+    local -a user_env=()
+    # Root in a rootful docker container leaves root-owned files in the cache.
+    [ "$runtime" != docker ] || user_env=(-e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)")
+    echo "== $job: log $log"
+    "$runtime" run --rm \
+        -v "$root:/src:ro" \
+        -v "$CACHE/target:/cache/target" \
+        -v "$CACHE/cargo:/cache/cargo" \
+        -v "$CACHE/rustup:/cache/rustup" \
+        -e CARGO_INCREMENTAL=0 -e RUST_BACKTRACE=1 \
+        -e CARGO_TARGET_DIR=/cache/target \
+        -e CARGO_HOME=/cache/cargo -e RUSTUP_HOME=/cache/rustup \
+        -e PATH=/cache/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/bin \
+        "${user_env[@]}" \
+        "$IMAGE" bash -c "$(job_script "$job")" >"$log" 2>&1 || status=$?
+    if [ "$status" -ne 0 ]; then
+        report_failure "$log"
+    fi
+    results+=("$job: $([ "$status" -eq 0 ] && echo pass || echo "FAIL ($status)")  $log")
+    return "$status"
+}
+
+selected=("${JOBS[@]}")
+case "${1:-}" in
+    --list)
+        printf '%s\n' "${JOBS[@]}"
+        exit 0
+        ;;
+    "") ;;
+    -*) usage ;;
+    *)
+        [ $# -eq 1 ] || usage
+        [[ " ${JOBS[*]} " == *" $1 "* ]] || usage
+        selected=("$1")
+        ;;
+esac
+
+runtime="$(pick_runtime)"
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+mkdir -p "$CACHE/target" "$CACHE/cargo" "$CACHE/rustup" "$CACHE/logs"
+
+dirty=clean
+[ -z "$(git status --porcelain)" ] || dirty=dirty
+echo "commit $(git rev-parse --short HEAD), tree $dirty (uncommitted changes are included)"
+
+results=()
+failed=0
+for job in "${selected[@]}"; do
+    run_job "$job" || failed=1
+done
+
+echo
+printf '%s\n' "${results[@]}"
+exit "$failed"

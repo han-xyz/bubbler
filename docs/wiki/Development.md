@@ -144,10 +144,26 @@ and `bwrap --unshare-all` work on the runner — hosted runners fail the bwrap
 line under Docker's seccomp profile, so real-sandbox coverage needs a
 self-hosted runner).
 
+## Before a push
+
+```sh
+scripts/ci-local [check|deny|msrv|sandbox-probe]
+```
+
+Runs the jobs of `.github/workflows/ci.yml` in the same `archlinux:latest`
+container (`docker`, else `podman`), on the tree as it is, uncommitted changes
+included. The tree is mounted read-only and the build goes to
+`${XDG_CACHE_HOME:-~/.cache}/bubbler-ci-local/`, so a second run is fast and the
+repository stays clean. Each job's full log is a file there; a failure prints
+the failing step and the `FAILED` / `panicked at` lines. Exit 0 when every job
+passed, 1 when one failed, 2 when it could not run. `scripts/ci-local.test`
+checks it without a container and fails when the YAML's job names and the
+script's differ.
+
 ## Releasing
 
 Two commands, run on the feature branch once the checks pass and `CHANGELOG.md`
-has its `## X.Y.Z` heading:
+has its `## X.Y.Z` heading, and `scripts/ci-local` passes before the push:
 
 ```sh
 scripts/release X.Y.Z

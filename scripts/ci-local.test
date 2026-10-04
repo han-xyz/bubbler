@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE CDPATH
+
+here="$(cd -- "$(dirname "$0")" >/dev/null && pwd -P)"
+script="$here/ci-local"
+root="$(dirname "$here")"
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+failures=0
+check() {
+    if ! "$@"; then
+        echo "FAIL: $*" >&2
+        failures=$((failures + 1))
+    fi
+}
+
+bash_bin="$(command -v bash)"
+tools="$work/tools"
+mkdir "$tools"
+for tool in git dirname mkdir date id grep head cat printf; do
+    ln -s "$(command -v "$tool")" "$tools/$tool"
+done
+
+stub="$work/stub"
+mkdir "$stub"
+cat >"$stub/docker" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" >>"$STUB_LOG"
+echo "---" >>"$STUB_LOG"
+exit "${STUB_EXIT:-0}"
+EOF
+chmod +x "$stub/docker"
+
+export STUB_LOG="$work/calls" XDG_CACHE_HOME="$work/cache"
+before="$(git -C "$root" status --porcelain)"
+
+run() {
+    PATH="$stub:$tools" "$bash_bin" "$script" "$@"
+}
+
+rc=0
+PATH="$tools" "$bash_bin" "$script" check >/dev/null 2>"$work/err" || rc=$?
+check test "$rc" = 2
+check grep -q 'neither docker nor podman' "$work/err"
+check test ! -e "$work/cache"
+
+rc=0
+run no-such-job >/dev/null 2>&1 || rc=$?
+check test "$rc" = 2
+rc=0
+run check deny >/dev/null 2>&1 || rc=$?
+check test "$rc" = 2
+check test ! -e "$STUB_LOG"
+
+out="$(run deny)"
+check test "$(grep -c '^---$' "$STUB_LOG")" = 1
+check grep -q 'cargo deny --workspace check' "$STUB_LOG"
+check test -z "$(grep 'cargo fmt' "$STUB_LOG" || true)"
+check grep -qxF "$root:/src:ro" "$STUB_LOG"
+check grep -qxF "$work/cache/bubbler-ci-local/target:/cache/target" "$STUB_LOG"
+check grep -qxF 'archlinux:latest' "$STUB_LOG"
+check grep -qxF 'CARGO_INCREMENTAL=0' "$STUB_LOG"
+check grep -qxF 'RUST_BACKTRACE=1' "$STUB_LOG"
+check test -d "$work/cache/bubbler-ci-local/cargo"
+check test -d "$work/cache/bubbler-ci-local/rustup"
+check grep -q '^commit ' <<<"$out"
+check grep -q '^deny: pass  ' <<<"$out"
+check test "$(git -C "$root" status --porcelain)" = "$before"
+
+: >"$STUB_LOG"
+rc=0
+out="$(STUB_EXIT=1 run 2>&1)" || rc=$?
+check test "$rc" = 1
+check test "$(grep -c '^---$' "$STUB_LOG")" = 4
+check grep -q '^msrv: FAIL (1)  ' <<<"$out"
+
+yaml_jobs="$(sed -n '/^jobs:/,$ s/^  \([a-z-][a-z-]*\):$/\1/p' "$root/.github/workflows/ci.yml")"
+check test "$yaml_jobs" = "$(run --list)"
+
+if [ "$failures" -ne 0 ]; then
+    echo "$failures check(s) failed" >&2
+    exit 1
+fi
+echo "all ci-local checks passed"
