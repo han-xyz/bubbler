@@ -1441,6 +1441,43 @@ fn a_refusal_leaves_the_flags_of_the_callers_descriptor_alone() {
     init.stop();
 }
 
+#[test]
+fn a_refusal_writes_nothing_through_a_descriptor_given_without_write_access() {
+    use rustix::fs::{Mode, OFlags};
+    let (mut init, sock) = start(&["/usr/bin/sleep", "30"]);
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("fifo");
+    let owner = Mode::RUSR | Mode::WUSR;
+    rustix::fs::mknodat(rustix::fs::CWD, &fifo, rustix::fs::FileType::Fifo, owner, 0).unwrap();
+    let reader = rustix::fs::open(&fifo, OFlags::RDONLY | OFlags::NONBLOCK, Mode::empty()).unwrap();
+    let path_only = rustix::fs::open(&fifo, OFlags::PATH, Mode::empty()).unwrap();
+    let file = dir.path().join("file");
+    std::fs::write(&file, "kept").unwrap();
+    let read_only = std::fs::File::open(&file).unwrap();
+    let null = std::fs::File::open("/dev/null").unwrap();
+    for (name, err) in [
+        ("read-only FIFO", reader.as_fd()),
+        ("O_PATH FIFO", path_only.as_fd()),
+        ("read-only file", read_only.as_fd()),
+    ] {
+        let st = exec_with(
+            &sock,
+            &["/nonexistent/bubbler-test-command"],
+            null.as_fd(),
+            err,
+        );
+        assert_eq!(ExitStatus::from_raw(st).code(), Some(127), "{name}");
+    }
+    let mut buf = [0u8; 256];
+    let got = rustix::io::read(&reader, &mut buf);
+    assert!(
+        !matches!(got, Ok(n) if n > 0),
+        "the refusal wrote into a FIFO the client gave only to read or as a path"
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "kept");
+    init.stop();
+}
+
 /// A command that ignores SIGTERM and exits once the file named by its
 /// first argument exists.
 const COMMAND_IGNORES_TERM_UNTIL: &str = r#"#!/usr/bin/python3

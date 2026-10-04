@@ -311,6 +311,16 @@ fn write_unless_blocked(fd: &OwnedFd, line: &[u8]) {
             let _ = rustix::io::write(fd, line);
         }
         _ => {
+            // A reopen through /proc can grant write access the client's
+            // descriptor never had, so only one it can write through is reopened.
+            let Ok(given) = rustix::fs::fcntl_getfl(fd) else {
+                return;
+            };
+            let access = given & OFlags::RWMODE;
+            if given.contains(OFlags::PATH) || (access != OFlags::WRONLY && access != OFlags::RDWR)
+            {
+                return;
+            }
             let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
             let flags = OFlags::WRONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
             if let Ok(own) = rustix::fs::open(path, flags, Mode::empty()) {
