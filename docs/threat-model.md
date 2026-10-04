@@ -817,10 +817,11 @@ whose header it cannot read that way, a big-endian one, or one over
 16 MiB (read to its end by its length, never held) is skipped like any
 other message that is not the reply, since nothing in it can be trusted
 to say it is one. The reply, once taken, fails the call when its body
-will not decode or it carries fewer or more descriptors than it
-declares. A frame length past the specification's 128 MiB, an unknown
-byte-order flag or an unknown protocol version leaves no way to find the
-next message and fails the connection. No read goes past the end of the
+will not decode, it carries fewer or more descriptors than it declares,
+or more than four. A frame length past the specification's 128 MiB, a
+header-field length past 64 MiB, an unknown byte-order flag or an
+unknown protocol version leaves no way to find the next message and
+fails the connection. No read goes past the end of the
 message being read, so descriptors are counted against the message they
 came with. Every descriptor a message carries is closed on arrival, since
 bubbler passes descriptors out and never takes one back. The client is
