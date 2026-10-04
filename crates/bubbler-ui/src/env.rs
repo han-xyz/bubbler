@@ -15,6 +15,11 @@ use bubbler_core::env::{DEFAULT_CONFIG_DIRS, DEFAULT_DATA_DIRS, Env, xdg_dirs};
 /// empty `$HOME` or `$XDG_RUNTIME_DIR` is an error for the same reason it
 /// is one in the CLI: the instance store and the control sockets hang off
 /// them, and an empty one would silently become a relative path.
+///
+/// The fields a sandbox is built from — the display sockets, the bus
+/// addresses, the binary overrides — are left unset: nothing here builds
+/// one, and a value read but never used is a claim this process cannot
+/// keep.
 pub fn from_process() -> Result<Env> {
     let home = PathBuf::from(
         env::var_os("HOME")
