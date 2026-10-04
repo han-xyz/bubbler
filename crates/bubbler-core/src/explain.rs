@@ -23,25 +23,20 @@ use crate::pipewire;
 use crate::seccomp::{self, Errno};
 use crate::wayland;
 
-/// Arguments of the baseline listed before the rest is summed up. The
-/// baseline is the same in every sandbox and the longest group by far.
+// Arguments of the baseline listed before the rest is summed up. The
+// baseline is the same in every sandbox and the longest group by far.
 const BASELINE_SHOWN: usize = 8;
 
-/// What a `dri kms=#true` group is headed with. The card nodes are two
-/// arguments like any other, and neither they nor the masks that are
-/// missing beside them say what granting them opens.
+// The card nodes are two arguments like any other, and neither they nor the masks that are
+// missing beside them say what granting them opens.
 const KMS_NOTE: &str = " (kms: card nodes, EDID and framebuffer geometry readable)";
 
-/// What a bare `dri` group is headed with where the grant bound a
-/// primary node anyway: a GPU on the proprietary NVIDIA driver, whose
-/// EGL will not drive a Wayland display without it. The file says
-/// nothing about that node, so the header says what it reads through
-/// it: connectors, their modes, the monitors' EDID — measured with
-/// `modetest`, not the master-only reach [`KMS_NOTE`] carries.
+// What a bare `dri` group is headed with where the grant bound a primary node anyway: a GPU on the
+// proprietary NVIDIA driver, whose EGL will not drive a Wayland display without it.
 const NVIDIA_NOTE: &str = " (nvidia: primary node bound for its EGL — connectors, their modes, the monitors' EDID readable)";
 
-/// Longest node text a header shows. A `path-share` of a deep path would
-/// otherwise set the width of the column for every other group.
+// Longest node text a header shows. A `path-share` of a deep path would
+// otherwise set the width of the column for every other group.
 const LABEL_MAX: usize = 40;
 
 /// Where the nodes of a config were written, for the group headers.
@@ -54,8 +49,6 @@ pub struct Source<'a> {
 }
 
 impl Source<'_> {
-    /// `<file>:<line>` of the node behind `origin`, empty for one the
-    /// file does not answer for.
     fn of(&self, origin: Origin) -> String {
         let line = match origin {
             Origin::Service(i) => self.lines.services.get(i).copied().flatten(),
@@ -110,17 +103,14 @@ pub struct View<'a> {
     /// List the baseline instead of summing it up after its first
     /// arguments.
     pub full: bool,
-    /// The version of the `bwrap` this argv would be handed, so a reader
-    /// sees both halves of the sandbox: the arguments, and the binary
-    /// that carries them out. [`crate::version::Version::Unknown`] where
-    /// the tool could not be asked.
+    /// The version of the `bwrap` this argv would be handed.
+    /// [`crate::version::Version::Unknown`] where the tool could not be asked.
     pub bwrap: crate::version::Version,
 }
 
-/// The proxy rules each node of `cfg` contributes, as (position in
-/// `services`, rule), in the order the proxy is given them. Empty when
-/// the config grants no bus and starts no proxy. `instance` is a
-/// validated instance name.
+/// The proxy rules each node of `cfg` contributes, as (position in `services`, rule), in the order
+/// the proxy is given them. Empty when the config grants no bus and starts no proxy. `instance` is
+/// a validated instance name.
 pub fn rules(cfg: &InstanceConfig, instance: &str) -> Vec<(usize, String)> {
     let Some(plan) = dbus::plan(&cfg.services, instance) else {
         return Vec::new();
@@ -137,10 +127,8 @@ pub fn rules(cfg: &InstanceConfig, instance: &str) -> Vec<(usize, String)> {
     .collect()
 }
 
-/// One node's arguments. Arguments of one origin are collected into a
-/// single group even where the phases separate them: `network` inserts
-/// `--share-net` into phase 1 and binds `/etc/resolv.conf` in phase 4,
-/// and both are that node's.
+// One node's arguments. Arguments of one origin are collected into a
+// single group even where the phases separate them.
 struct Group<'a> {
     origin: Origin,
     label: String,
@@ -149,17 +137,15 @@ struct Group<'a> {
 }
 
 impl Group<'_> {
-    /// Argv elements, which is what the counts are in: an operation is a
-    /// line here but several arguments to bwrap.
+    // Argv elements, which is what the counts are in: an operation is a
+    // line here but several arguments to bwrap.
     fn len(&self) -> usize {
         self.items.iter().map(|i| i.args.len()).sum()
     }
 }
 
-/// Whether a group holds a `--dev-bind` of a primary DRM node. Read off
-/// the arguments rather than probed again: what the note beside them
-/// says is that they are there, and a run this explains would be the one
-/// that put them there.
+// Read off the arguments rather than probed again: what the note beside them says is that they
+// are there, and a run this explains would be the one that put them there.
 fn binds_a_primary_node(items: &[&Explained]) -> bool {
     items.iter().any(|i| {
         let [flag, src, ..] = i.args.as_slice() else {
@@ -174,8 +160,8 @@ fn binds_a_primary_node(items: &[&Explained]) -> bool {
     })
 }
 
-/// Whether a service also carries rules for the D-Bus proxy, which are
-/// not bwrap arguments and so are invisible in an argv.
+// Whether a service also carries rules for the D-Bus proxy, which are
+// not bwrap arguments and so are invisible in an argv.
 fn carries_rules(s: &Service) -> bool {
     matches!(
         s,
@@ -191,8 +177,7 @@ fn carries_rules(s: &Service) -> bool {
     )
 }
 
-/// The node an origin names, as its KDL. A block node is named by the
-/// line it opens on, since the rules under it are not arguments.
+// A block node is named by the line it opens on, since the rules under it are not arguments.
 fn label(origin: Origin, cfg: &InstanceConfig) -> Result<String, ConfigError> {
     Ok(kdl_out::shorten(
         &match origin {
@@ -200,8 +185,7 @@ fn label(origin: Origin, cfg: &InstanceConfig) -> Result<String, ConfigError> {
             Origin::Seccomp => "seccomp".to_owned(),
             Origin::Userns => "userns".to_owned(),
             // Only reached in Host mode: the allowlist's items stay
-            // tagged `Origin::Baseline`, so there is no bare-node case
-            // to spell here.
+            // tagged `Origin::Baseline`.
             Origin::Etc => "etc \"host\"".to_owned(),
             Origin::Tmp => match cfg.tmp {
                 Some(size) => kdl_out::tmp(size),
@@ -237,10 +221,8 @@ fn label(origin: Origin, cfg: &InstanceConfig) -> Result<String, ConfigError> {
     ))
 }
 
-/// Where the node behind `origin` was written, in this view. The
-/// sidecar's filter is never the config's: it gets the default rule set
-/// whatever a `seccomp` node says, so that group names no line of the
-/// file it did not come from.
+// The sidecar's filter is never the config's: it gets the default rule set whatever a `seccomp`
+// node says, so that group names no line of the file it did not come from.
 fn source(origin: Origin, view: &View) -> String {
     match view.proxy && origin == Origin::Seccomp {
         true => String::new(),
@@ -248,11 +230,9 @@ fn source(origin: Origin, view: &View) -> String {
     }
 }
 
-/// Groups in emit order: a group appears where its first argument does.
-/// In the sandbox's own argv a granted service that produced no argument
-/// at all keeps its place among the services around it, so that a grant
-/// which reaches the sandbox another way is not simply missing; in the
-/// sidecar's, the nodes are only those its rules came from.
+// In the sandbox's own argv a granted service that produced no argument at all keeps its place
+// among the services around it, so that a grant which reaches the sandbox another way is not simply
+// missing.
 fn groups<'a>(items: &'a [Explained], view: &View) -> Result<Vec<Group<'a>>, ConfigError> {
     let mut out: Vec<Group> = Vec::new();
     for item in items {
@@ -269,11 +249,8 @@ fn groups<'a>(items: &'a [Explained], view: &View) -> Result<Vec<Group<'a>>, Con
     if view.proxy {
         return Ok(out);
     }
-    // A `seccomp` node that leaves nothing to load — `disable`, or an
-    // `allow` list that empties the denylist — produced no argument to be
-    // found under, and that is the one worth seeing. It belongs where the
-    // filter is loaded, which is after the baseline and ahead of the
-    // grants.
+    // A `seccomp` node that leaves nothing to load produced no argument to be found under. It
+    // belongs where the filter is loaded, which is after the baseline and ahead of the grants.
     if view.cfg.seccomp != SeccompConfig::default()
         && !out.iter().any(|g| g.origin == Origin::Seccomp)
     {
@@ -325,9 +302,8 @@ fn groups<'a>(items: &'a [Explained], view: &View) -> Result<Vec<Group<'a>>, Con
     Ok(out)
 }
 
-/// One operation as a line: the arguments as written, then what a
-/// generated fd among them refers to. A path that is not UTF-8 is shown
-/// with the replacement character; `--dry-run` is the byte-exact form.
+// A path that is not UTF-8 is shown with the replacement character; `--dry-run` is the
+// byte-exact form.
 fn operation(item: &Explained) -> String {
     let mut line = item
         .args
@@ -341,15 +317,12 @@ fn operation(item: &Explained) -> String {
     line
 }
 
-/// What a node granted that is not an argument, each on its own line
-/// under a lead-in naming what it is: it is the whole grant of a node
-/// that contributes no argument, and easy to miss under one that does.
+// What a node granted that is not an argument, each on its own line under a lead-in naming what
+// it is: it is the whole grant of a node that contributes no argument.
 fn listed(empty: bool, items: Vec<String>) -> Vec<String> {
     under(if empty { "rule-only: " } else { "rules: " }, items)
 }
 
-/// `items` under a lead-in, the first line carrying it and the rest
-/// aligned beneath.
 fn under(lead: &str, items: Vec<String>) -> Vec<String> {
     let mut out = Vec::new();
     for item in items {
@@ -362,10 +335,8 @@ fn under(lead: &str, items: Vec<String>) -> Vec<String> {
     out
 }
 
-/// The outbound ruleset, exactly as `nft -f -` is fed it. A grant that
-/// is neither a bwrap argument nor a D-Bus rule, so nothing else in this
-/// view would show it; the nesting is kept, with each tab widened to
-/// four columns so a terminal shows what the file holds.
+// The outbound ruleset, exactly as `nft -f -` is fed it. The nesting is kept, with each tab
+// widened to four columns so a terminal shows what the file holds.
 fn ruleset_lines(cfg: &NetworkConfig, instance: &str) -> Vec<String> {
     let cgroup = match cfg.allow_hosts.is_empty() {
         true => None,
@@ -380,28 +351,15 @@ fn ruleset_lines(cfg: &NetworkConfig, instance: &str) -> Vec<String> {
     )
 }
 
-/// The cgroup an explanation writes the `allow-host` rules around: the
-/// proxy leaf of the pair a run of this instance would create, with
-/// bubbler's own pid — which a run that is not happening does not have —
-/// left as `<pid>`.
-///
-/// bubbler's own cgroup is read where it can be, since that is what
-/// decides the `level` the rule matches at and so what the block would
-/// actually say; a host that will not answer gets a placeholder there
-/// too, and the shape is still the shape. `None` only where neither
-/// makes a path a rule could carry, and then the block is left out
-/// rather than shown wrong.
+// bubbler's own cgroup is read where it can be, since that is what decides the `level` the rule
+// matches at; a host that will not answer gets a placeholder there.
 fn placeholder_cgroup(instance: &str) -> Option<network::Cgroup> {
     let own = cgroup::own_path().unwrap_or_else(|_| "<own-cgroup>".to_owned());
     network::Cgroup::new(&cgroup::placeholder(&own, instance)).ok()
 }
 
-/// The egress proxy an `allow-host` is served by, as the launcher will
-/// run it. `None` where the node names no name to reach.
-///
-/// The descriptor it reports readiness on is only known once the run has
-/// made the pipe, so it is named here rather than numbered; the log
-/// descriptor is bubbler's own stderr, always.
+// The descriptor the egress proxy reports readiness on is only known once the run has made the
+// pipe, so it is named here rather than numbered.
 fn net_proxy_line(cfg: &NetworkConfig, log_tunnels: bool) -> Option<String> {
     if cfg.allow_hosts.is_empty() {
         return None;
@@ -422,10 +380,8 @@ fn net_proxy_line(cfg: &NetworkConfig, log_tunnels: bool) -> Option<String> {
     Some(line)
 }
 
-/// The pasta argv an isolated `network` node is served by. The two
-/// descriptors and the sandbox pid are only known once bwrap is running,
-/// so they are named here rather than numbered; `--dry-run` is the
-/// sandbox's own argv and says nothing about sidecars.
+// The two pasta descriptors and the sandbox pid are only known once bwrap is running,
+// so they are named here rather than numbered.
 fn sidecar_line(cfg: &NetworkConfig) -> String {
     let argv = network::pasta_argv(
         cfg,
@@ -443,19 +399,9 @@ fn sidecar_line(cfg: &NetworkConfig) -> String {
     line
 }
 
-/// The Wayland proxy a bare `wayland` node is served by: which socket
-/// the application connects to, which the proxy forwards to, and what it
-/// does with a clipboard read. None of it is a bwrap argument of the
-/// sandbox, so nothing else in this view would show it.
 fn wl_sidecar_line(plan: &wayland::ProxyPlan) -> String {
-    // The count is the denylist's length, not a measurement: how many of
-    // those a compositor actually offers is only known once a client has
-    // read the registry, which an explanation never does. It is shown
-    // whether or not the compositor also took a security context: the
-    // proxy applies PRIVILEGED either way, and `context` says only
-    // whether the compositor withholds them as well — which is what the
-    // last field reports, since one enforcer and two are not the same
-    // sandbox.
+    // The count is the denylist's length, not a measurement. It is shown whether or not the
+    // compositor also took a security context: the proxy applies PRIVILEGED either way.
     format!(
         "    sidecar: bubbler-wl-proxy listener {} → upstream {}, gate {}, \
          hides {} privileged globals, compositor enforces too: {}",
@@ -470,22 +416,16 @@ fn wl_sidecar_line(plan: &wayland::ProxyPlan) -> String {
     )
 }
 
-/// Where the first of an instance's audio grants sits, which is the
-/// group the one context they share is described under.
+// Where the first of an instance's audio grants sits, which is the
+// group the one context they share is described under.
 fn audio_node(services: &[Service]) -> Option<usize> {
     services
         .iter()
         .position(|s| matches!(s, Service::Pipewire { .. } | Service::Pulseaudio { .. }))
 }
 
-/// The `pw-container` an audio grant is served through, and what the
-/// context it creates says about the sandbox. Neither is an argument of
-/// the sandbox's own argv: the one bind names a socket, and everything
-/// that makes it this instance's socket is on the other side of it.
-///
-/// The run id is only known once there is a run, so it is named here
-/// rather than filled in, the way the sidecar descriptors of the other
-/// grants are.
+// The run id is only known once there is a run, so it is named here rather than filled in, the
+// way the sidecar descriptors of the other grants are.
 fn pw_context_lines(instance: &str, audio: AudioSet) -> [String; 2] {
     let properties = pipewire::properties(instance, pipewire::RUN_ID_SHOWN, audio);
     let mut sidecar = String::from("    sidecar:");
@@ -503,10 +443,6 @@ fn pw_context_lines(instance: &str, audio: AudioSet) -> [String; 2] {
     ]
 }
 
-/// The private PulseAudio server a `pulseaudio` grant is served by, and
-/// what bubbler's own configuration of it withholds. It runs on the
-/// context the group above describes; only the protocol its clients
-/// speak is older.
 fn pw_pulse_lines() -> [String; 2] {
     let mut sidecar = String::from("    sidecar:");
     for arg in pipewire::pulse_command() {
@@ -519,8 +455,6 @@ fn pw_pulse_lines() -> [String; 2] {
     ]
 }
 
-/// The D-Bus proxy rules of the node at `index`, in the order the proxy
-/// is given them.
 fn rules_of(index: usize, rules: &[(usize, String)]) -> Vec<String> {
     rules
         .iter()
@@ -529,8 +463,8 @@ fn rules_of(index: usize, rules: &[(usize, String)]) -> Vec<String> {
         .collect()
 }
 
-/// What a `seccomp` node did to the default denylist, which is the whole
-/// grant of one that disables the filter and loads no program at all.
+// What a `seccomp` node did to the default denylist, which is the whole
+// grant of one that disables the filter and loads no program at all.
 fn seccomp_lines(cfg: &SeccompConfig) -> Vec<String> {
     if cfg.disable {
         return vec!["filter disabled".to_owned()];
@@ -550,13 +484,8 @@ fn seccomp_lines(cfg: &SeccompConfig) -> Vec<String> {
     out
 }
 
-/// Every call the application's filter answers with an errno, as the
-/// launcher builds it for this config; empty where the filter is
-/// disabled. `loaded` is whether the argv carries the compiled program:
-/// a set `compile` found no rule in loads none, the `personality` prefix
-/// included. A name this libseccomp cannot resolve is left out, as
-/// `compile` leaves it out. With `log` every rule writes an audit entry
-/// and lets the call through, so each says `logged` for its errno.
+// `loaded` is whether the argv carries the compiled program: a set `compile` found no rule in
+// loads none, the `personality` prefix included.
 fn filter_lines(cfg: &InstanceConfig, loaded: bool, log: bool) -> Vec<String> {
     let Some(set) = seccomp::RuleSet::with(&cfg.seccomp, cfg.userns) else {
         return Vec::new();
@@ -597,9 +526,8 @@ fn filter_lines(cfg: &InstanceConfig, loaded: bool, log: bool) -> Vec<String> {
         .collect()
 }
 
-/// `text` padded with spaces to `columns` on screen. `{:<n$}` counts
-/// characters, which would put a label named in a wide script out of
-/// line with the column beside it by its own width again.
+// `{:<n$}` counts characters, which would put a label named in a wide script out of
+// line with the column beside it by its own width again.
 fn pad(text: &str, columns: usize) -> String {
     let mut out = text.to_owned();
     out.push_str(&" ".repeat(columns.saturating_sub(text.width())));
@@ -633,10 +561,8 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
                 Some(Service::Dri { kms: false }) if binds_a_primary_node(&g.items) => {
                     header.push_str(NVIDIA_NOTE);
                 }
-                // One context and one policy for the whole instance, so
-                // the absent drop-in is said once, on the group that
-                // describes the context — which is the node `lint`'s
-                // `audio-policy-missing` names as well.
+                // One context and one policy for the whole instance, so the absent drop-in is said
+                // once, on the group that describes the context.
                 Some(Service::Pipewire { .. } | Service::Pulseaudio { .. })
                     if audio_node(&view.cfg.services) == Some(i) =>
                 {
@@ -668,8 +594,7 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
             match g.origin {
                 Origin::Service(i) => match view.cfg.services.get(i) {
                     // Checked before `carries_rules`: a `Portals` service
-                    // matches both, and its children are a grant of their
-                    // own on top of the bundle's rules.
+                    // matches both.
                     Some(Service::Portals { children }) => {
                         out.extend(listed(n == 0, rules_of(i, view.rules)));
                         if !children.is_empty() {
@@ -686,20 +611,14 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
                         out.extend(listed(n == 0, rules_of(i, view.rules)));
                     }
                     // An isolated `network` is half a sidecar: its own
-                    // arguments are only the resolver file, and what
-                    // connects the namespace is the process below.
+                    // arguments are only the resolver file.
                     Some(Service::Network(cfg)) if cfg.is_isolated() => {
                         out.push(sidecar_line(cfg));
                         out.extend(net_proxy_line(cfg, view.net_proxy_log));
                         out.extend(ruleset_lines(cfg, view.instance));
                     }
-                    // The one `--ro-bind` names the proxy's own socket
-                    // whatever the compositor answered; only what the
-                    // proxy connects to changes. No probe is run for an
-                    // explanation, so the sidecar line below is what a
-                    // run gets on a compositor that implements the
-                    // protocol; one that does not says so on stderr and
-                    // has the proxy dial the session's socket instead.
+                    // No probe is run for an explanation, so the sidecar line below is what a run
+                    // gets on a compositor that implements the protocol.
                     Some(Service::Wayland(WaylandMode::Sandboxed { .. })) => {
                         out.push(format!(
                             "    security-context: engine={} app={} instance={}",
@@ -710,8 +629,7 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
                         out.extend(view.wl_proxy.map(wl_sidecar_line));
                     }
                     // One context serves both audio nodes, so it is
-                    // described under the first of them; a second group
-                    // saying the same would read as a second sidecar.
+                    // described under the first of them.
                     Some(s @ (Service::Pipewire { .. } | Service::Pulseaudio { .. })) => {
                         if audio_node(&view.cfg.services) == Some(i) {
                             out.extend(
@@ -735,9 +653,7 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
                         out.push("    raw socket: x11 \"host\"".to_owned());
                     }
                     // An optional share with no argument bound nothing: a
-                    // required one would have refused the launch instead,
-                    // so this is the one case zero arguments means a
-                    // grant that a live run quietly does not act on.
+                    // required one would have refused the launch instead.
                     Some(
                         s @ (Service::HomeShare { optional: true, .. }
                         | Service::PathShare { optional: true, .. }),
@@ -748,8 +664,7 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
                         ));
                     }
                     // The nested mode needs no line of its own: the argv
-                    // it hands the supervisor is an argument above, and
-                    // that one carries the explanation.
+                    // it hands the supervisor is an argument above.
                     _ => {}
                 },
                 Origin::Seccomp => {
@@ -788,10 +703,8 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
 }
 
 /// One JSON object per operation, in argv order and with nothing elided:
-/// `{"origin":{"kind","node","index","line"},"args":[...],"note"}`. The
-/// result has no trailing newline. An argument that is not UTF-8 is
-/// written with the replacement character, since JSON has no byte
-/// strings; `--dry-run` is the byte-exact form.
+/// `{"origin":{"kind","node","index","line"},"args":[...],"note"}`. The result has no trailing
+/// newline. An argument that is not UTF-8 is written with the replacement character.
 pub fn render_json(items: &[Explained], view: &View) -> Result<String, ConfigError> {
     let mut out = String::from("[\n");
     for (n, item) in items.iter().enumerate() {
@@ -841,7 +754,6 @@ pub fn render_json(items: &[Explained], view: &View) -> Result<String, ConfigErr
     Ok(out)
 }
 
-/// [`json::string`] for an argument, which is not necessarily UTF-8.
 fn quote_os(s: &OsStr) -> String {
     json::string(&s.to_string_lossy())
 }
