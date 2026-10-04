@@ -36,9 +36,9 @@ pub fn client_text(text: &str) -> String {
 
 /// What a line is about, and so which budget it comes out of.
 ///
-/// The two are counted apart on purpose. A client that asks for the clipboard
-/// in a tight loop must not be able to spend the log's whole budget and push
-/// the one line that says why its connection ended out of the record.
+/// A client that asks for the clipboard in a tight loop must not be able to
+/// spend the log's whole budget and push the one line that says why its
+/// connection ended out of the record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// A clipboard read was allowed or denied.
@@ -47,7 +47,6 @@ pub enum Kind {
     Close,
 }
 
-/// One kind's share of the log: when it last wrote, and what it swallowed.
 #[derive(Debug, Default, Clone, Copy)]
 struct Budget {
     last: Option<Instant>,
@@ -96,9 +95,7 @@ impl Audit {
     /// [`RATE`] ago — in which case it is counted and the count is appended
     /// to the next line of that kind that does go out.
     ///
-    /// A log that cannot be written is not a reason to stop proxying: the
-    /// sandbox keeps its display either way, and the descriptor belongs to
-    /// the launcher, not to the client.
+    /// A log that cannot be written is not a reason to stop proxying.
     pub fn line(&mut self, kind: Kind, now: Instant, text: &str) {
         let budget = match kind {
             Kind::Gate => &mut self.gate,
