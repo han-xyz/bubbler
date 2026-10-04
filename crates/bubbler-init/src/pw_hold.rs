@@ -33,12 +33,8 @@ pub const REPORT_FD: &str = "BUBBLER_PW_REPORT_FD";
 /// for under its runtime directory, which is where bubbler binds it.
 pub const SOCKET_NAME: &str = "pipewire-0";
 
-/// Rename the context socket `remote` to [`SOCKET_NAME`] beside itself
-/// and report the path it now has on `report`, one line.
-///
-/// A bound unix socket keeps its identity across `rename(2)` — the
-/// listening socket is the inode, not the name — so a client that
-/// connects to the new path reaches the same server.
+// A bound unix socket keeps its identity across `rename(2)`, so a client
+// that connects to the new path reaches the same server.
 fn hand_over(remote: &Path, report: BorrowedFd<'_>) -> Result<PathBuf, String> {
     let to = remote.with_file_name(SOCKET_NAME);
     rustix::fs::rename(remote, &to)
@@ -54,9 +50,7 @@ fn hand_over(remote: &Path, report: BorrowedFd<'_>) -> Result<PathBuf, String> {
 /// has exited tears the security context down with it.
 pub fn run() -> ExitCode {
     // Set before anything is renamed: from here on the holder leaves
-    // with `pw-container` even if nothing signals it. That is a backstop
-    // behind the sidecar's own pid namespace, whose pid 1 is bwrap's own
-    // reaper — `pw-container` is its child.
+    // with `pw-container` even if nothing signals it.
     if let Err(e) = set_parent_process_death_signal(Some(Signal::TERM)) {
         eprintln!("{NAME}: cannot ask to die with pw-container: {e}");
         return ExitCode::from(2);
@@ -80,11 +74,6 @@ pub fn run() -> ExitCode {
     // `pw-container` was started with.
     let report = unsafe { OwnedFd::from_raw_fd(fd) };
     let stop = Arc::new(AtomicBool::new(false));
-    // The four the supervisor takes, for the same reason: each of them
-    // means the run is over, and left on their default dispositions they
-    // would kill this process where it stands instead of letting it
-    // report the exit `pw-container` reads.
-    //
     // Before the report and not after it: the line below is what tells
     // bubbler the context is up, and the run it belongs to can end at
     // any moment from then on. A SIGTERM in the window between the two
@@ -106,15 +95,12 @@ pub fn run() -> ExitCode {
         eprintln!("{NAME}: {why}");
         return ExitCode::from(1);
     }
-    // Closed as soon as the path is out: bubbler reads one line and then
-    // waits on nothing, and a descriptor held open here would keep it
-    // from seeing the end of a holder that died before reporting.
+    // Closed as soon as the path is out: a descriptor held open here would
+    // keep bubbler from seeing the end of a holder that died before reporting.
     drop(report);
     while !stop.load(Ordering::Relaxed) {
-        // A signal that arrived between the check above and this call
-        // would not interrupt it, so the wait is bounded rather than
-        // endless; a signal during it ends it at once, since `poll` is
-        // never restarted after a handler (`signal(7)`).
+        // A signal that arrived between the check above and this call would
+        // not interrupt it, so the wait is bounded rather than endless.
         match poll(&mut [], Some(&TICK)) {
             Ok(_) | Err(Errno::INTR) => {}
             Err(e) => {
@@ -126,14 +112,13 @@ pub fn run() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// How long the holder waits between checks of the stop flag.
 const TICK: Timespec = Timespec {
     tv_sec: 1,
     tv_nsec: 0 as Nsecs,
 };
 
-/// Write every byte of `line` to `fd`, since a pipe may take a short
-/// write and the reader on the other side waits for the whole line.
+// A pipe may take a short write and the reader on the other side waits
+// for the whole line.
 fn write_all(fd: BorrowedFd<'_>, line: &[u8]) -> Result<(), Errno> {
     let mut rest = line;
     while !rest.is_empty() {
