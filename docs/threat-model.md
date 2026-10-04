@@ -273,8 +273,8 @@ refused instead of binding the tree under it. `WAYLAND_DISPLAY` is checked
 in both the values it has — the run's own and the process environment's,
 which the Wayland client reads itself — before the launcher connects to
 the compositor; an absolute or `..` name would otherwise steer the
-connection, and the listening fd with it, at an endpoint of the caller's
-choosing. `WAYLAND_SOCKET` is refused when set at all: the client
+connection, and the listening fd bubbler hands the compositor with it, at
+an endpoint of the caller's choosing. `WAYLAND_SOCKET` is refused when set at all: the client
 would adopt the descriptor number it names as its connection and close it
 with the connection.
 
@@ -1743,7 +1743,7 @@ sandbox binds and map the host's loopback back in. `/etc/resolv.conf` is
 generated rather than bound. Before pasta starts, the namespace of the
 pid bwrap reported is compared with bubbler's own, so a sandbox that died
 in between cannot make pasta configure the *host* namespace; the user
-namespace is asked of the network namespace that owns it rather than of
+namespace is asked of the network namespace it owns rather than of
 the pid, which bwrap moves into a nested user namespace shortly after it
 reports `child-pid` (measured on bwrap 0.11.2, 6 runs of 6); letting pasta
 resolve `/proc/<child-pid>/ns/user` itself failed 5 times in 8. A sandbox
@@ -2145,23 +2145,25 @@ stop's: a command that exits during the grace does not start a new one for
 the exec'd children, the window manager or the X server.
 
 `bubbler-init` makes itself non-dumpable, sets `PR_SET_NO_NEW_PRIVS`,
-clears the ambient set and the three sets `capset` carries, tries to drop
-from the bounding set every capability the rustix it is built with names
-(41 with rustix 1.1.4), and takes `PR_SET_PDEATHSIG` (`SIGTERM`) before it
-installs a signal handler or starts anything. A drop the kernel refuses
-with `EPERM` — every one, for a process without `CAP_SETPCAP` — is
-ignored and leaves that capability in the bounding set, as it does a
-capability a newer kernel adds past those 41. What stays there is nothing
-to gain from: with `no_new_privs` set, `execve` grants nothing the
-process could not have done without it; with the permitted set empty,
-`capset` can add to neither it nor the inheritable set; and a capability
-is ambient only while it is both permitted and inheritable
-(`capabilities(7)`). Under bwrap every set, the bounding set included, is
-already empty and `no_new_privs` is already on, so there is nothing to
-drop: bubbler passes bwrap no `--cap-add`, and `bwrap(1)` leaves no
-capability by default (measured on bwrap 0.13.0: `CapBnd` 0). The steps
-are taken so that the posture is the supervisor's own and not something
-it inherited. SIGHUP and SIGQUIT end the run exactly as
+clears the ambient set, empties the effective, permitted and inheritable
+sets, and takes `PR_SET_PDEATHSIG` (`SIGTERM`) before it installs a signal
+handler or starts anything. Between the emptying and `PR_SET_PDEATHSIG` it
+asks to drop from the bounding set every capability the rustix it is built
+with names (41 with rustix 1.1.4) that the set still holds. That drop
+never takes effect: `PR_CAPBSET_DROP` needs `CAP_SETPCAP` in the effective
+set (`capabilities(7)`), the effective set is already empty by then, and
+the `EPERM` is ignored. The bounding set is therefore whatever bwrap
+handed over. Today that is empty: bubbler passes bwrap no `--cap-add`,
+`bwrap(1)` leaves no capability by default, and `/proc/self/status` inside
+`bwrap --unshare-all` shows `CapBnd` 0 (measured on bwrap 0.13.0). Under
+a bwrap that left the bounding set non-empty it would stay non-empty, and
+a capability a newer kernel adds past those 41 is not even asked about.
+What prevents regaining a capability is the rest: with `no_new_privs` set, `execve` grants nothing
+the process could not have done without the `execve`
+(`PR_SET_NO_NEW_PRIVS(2const)`); with the permitted and effective sets
+empty, `capset` can add to neither the permitted nor the inheritable set;
+and a capability is ambient only while it is both permitted and
+inheritable. SIGHUP and SIGQUIT end the run exactly as
 SIGTERM does, so a terminal that goes away gives the command its grace
 instead of leaving it to bwrap's reaper.
 
