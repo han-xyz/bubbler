@@ -1,21 +1,7 @@
 //! The proxy's own DNS client: A and AAAA over UDP, TCP on truncation,
 //! to the resolver addresses bubbler passes as `--dns`.
 //!
-//! The proxy does not call `getaddrinfo`, and this module is why. It
-//! runs inside the sandbox's mount namespace, where `/run` and `/etc`
-//! are tmpfs the application writes; the host's `nsswitch.conf` there
-//! names `resolve` and `mymachines` before `dns`, and those modules
-//! dial sockets by path. Measured 2026-08-28: an application that binds
-//! `/run/systemd/resolve/io.systemd.Resolve` answers the proxy's
-//! lookups itself, so a `CONNECT` to a listed name reached an address
-//! the application chose. Name policy enforced by a resolver the
-//! attacker answers is no policy at all.
-//!
-//! What is left is a resolver the application cannot reach: only the
-//! proxy's cgroup may send to port 53 (`network::ruleset`), and the
-//! forwarder address is not local to the namespace. So this speaks the
-//! wire format itself — the smallest client that can ask two questions
-//! and read the answers — and reads nothing off the filesystem at all.
+//! The proxy does not call `getaddrinfo`, and this module is why.
 //!
 //! The parser is bounded everywhere and trusts nothing: names are
 //! decompressed with strictly backwards pointers only, records are
@@ -44,21 +30,20 @@ pub const TRIES: u32 = 3;
 /// all of it.
 pub const BUDGET: Duration = Duration::from_secs(10);
 
-/// Bytes read from one datagram. A server that was not asked for EDNS
-/// must answer in 512 or set `TC`; the slack is for one that does not.
+// Bytes read from one datagram. A server that was not asked for EDNS
+// must answer in 512 or set `TC`; the slack is for one that does not.
 const MAX_UDP: usize = 4096;
 
-/// Bytes read from one TCP answer.
 const MAX_TCP: usize = 8192;
 
-/// Longest name, from DNS.
+// Longest name, from DNS.
 const MAX_NAME: usize = 255;
 
-/// Longest label, from DNS.
+// Longest label, from DNS.
 const MAX_LABEL: usize = 63;
 
-/// Compression pointers one name may follow. Pointers must already
-/// point backwards, so this only bounds the work.
+// Compression pointers one name may follow. Pointers must already
+// point backwards, so this only bounds the work.
 const MAX_JUMPS: usize = 16;
 
 /// Answer records read from one message. Everything past this is
@@ -68,13 +53,9 @@ pub const MAX_RECORDS: usize = 32;
 /// `CNAME` hops followed inside one answer.
 pub const MAX_CNAMES: usize = 8;
 
-/// `A`, an IPv4 address.
 const TYPE_A: u16 = 1;
-/// `CNAME`, another name to look under.
 const TYPE_CNAME: u16 = 5;
-/// `AAAA`, an IPv6 address.
 const TYPE_AAAA: u16 = 28;
-/// Class `IN`, the only class this asks about.
 const CLASS_IN: u16 = 1;
 
 /// Why an answer could not be read.
@@ -162,9 +143,8 @@ pub fn parse(msg: &[u8]) -> Result<Reply, DnsError> {
     })
 }
 
-/// A bound as the wire counts things. The constants are small; the
-/// saturation is only so this is a `const`-free expression with no cast
-/// that could wrap.
+// The constants are small; the saturation is only so this is a
+// `const`-free expression with no cast that could wrap.
 fn as_u16(n: usize) -> u16 {
     u16::try_from(n).unwrap_or(u16::MAX)
 }
@@ -210,7 +190,6 @@ pub fn resolve_at(name: &str, port: u16, servers: &[SocketAddr]) -> io::Result<V
         .collect())
 }
 
-/// Ask one question of every resolver until one answers it.
 fn ask(
     name: &str,
     qtype: u16,
@@ -234,8 +213,6 @@ fn ask(
     Err(last)
 }
 
-/// One question to one resolver, over UDP and then over TCP if the
-/// answer was truncated.
 fn once(name: &str, qtype: u16, server: &SocketAddr) -> io::Result<Reply> {
     let id = query_id();
     let question = question(name, qtype, id)?;
@@ -246,11 +223,9 @@ fn once(name: &str, qtype: u16, server: &SocketAddr) -> io::Result<Reply> {
     checked(&over_tcp(server, &question)?, id, name, qtype)
 }
 
-/// Parse one answer and hold it to the question that was asked.
-///
-/// The id and the echoed question are what tell this answer from one
-/// that arrived by chance; `rcode` 3 is "no such name", which is an
-/// answer with no addresses and not a reason to ask again.
+// The id and the echoed question are what tell this answer from one
+// that arrived by chance; `rcode` 3 is "no such name", which is an
+// answer with no addresses and not a reason to ask again.
 fn checked(msg: &[u8], id: u16, name: &str, qtype: u16) -> io::Result<Reply> {
     let reply = parse(msg).map_err(io::Error::other)?;
     if reply.id != id {
@@ -268,7 +243,6 @@ fn checked(msg: &[u8], id: u16, name: &str, qtype: u16) -> io::Result<Reply> {
     }
 }
 
-/// Send one question and take one datagram back.
 fn over_udp(server: &SocketAddr, question: &[u8]) -> io::Result<Vec<u8>> {
     let local = match server {
         SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
@@ -287,8 +261,6 @@ fn over_udp(server: &SocketAddr, question: &[u8]) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Ask the same question over TCP, which is what a truncated answer
-/// asks for.
 fn over_tcp(server: &SocketAddr, question: &[u8]) -> io::Result<Vec<u8>> {
     let mut socket = TcpStream::connect_timeout(server, TIMEOUT)?;
     socket.set_read_timeout(Some(TIMEOUT))?;
@@ -308,10 +280,8 @@ fn over_tcp(server: &SocketAddr, question: &[u8]) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// One question message: the header, the name, the type and class `IN`.
-///
-/// `RD` is the only flag set — these resolvers are recursive, and this
-/// client follows nothing but the `CNAME`s an answer already holds.
+// `RD` is the only flag set — these resolvers are recursive, and this
+// client follows nothing but the `CNAME`s an answer already holds.
 fn question(name: &str, qtype: u16, id: u16) -> io::Result<Vec<u8>> {
     let mut msg = Vec::with_capacity(name.len() + 18);
     msg.extend_from_slice(&id.to_be_bytes());
@@ -324,9 +294,8 @@ fn question(name: &str, qtype: u16, id: u16) -> io::Result<Vec<u8>> {
     Ok(msg)
 }
 
-/// Write `name` as DNS labels. The name is one a `CONNECT` target
-/// already passed the LDH rules, so a failure here is a bug rather than
-/// a client's doing.
+// The name is one a `CONNECT` target already passed the LDH rules, so a
+// failure here is a bug rather than a client's doing.
 fn encode_name(name: &str, out: &mut Vec<u8>) -> io::Result<()> {
     let name = name.strip_suffix('.').unwrap_or(name);
     if name.is_empty() || name.len() > MAX_NAME {
@@ -344,11 +313,9 @@ fn encode_name(name: &str, out: &mut Vec<u8>) -> io::Result<()> {
     Ok(())
 }
 
-/// A fresh 16-bit id for one question.
-///
-/// Never a fixed one: with the id and the ephemeral port, an answer
-/// nobody asked for has to guess both, on top of coming from the
-/// resolver's own address.
+// Never a fixed id: with the id and the ephemeral port, an answer
+// nobody asked for has to guess both, on top of coming from the
+// resolver's own address.
 fn query_id() -> u16 {
     let mut bytes = [0u8; 2];
     let mut got = 0;
@@ -364,8 +331,6 @@ fn query_id() -> u16 {
     u16::from_be_bytes(bytes)
 }
 
-/// The id when the kernel will not give one: the clock's nanoseconds,
-/// which no other process here shares.
 fn fallback_id() -> u16 {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -373,33 +338,23 @@ fn fallback_id() -> u16 {
     (nanos & 0xffff) as u16
 }
 
-/// One answer record, reduced to what a dial can use.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Record {
-    /// The owner name, lower case and without the root dot.
     name: String,
-    /// What it holds.
     data: Data,
 }
 
-/// The record types this client reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Data {
-    /// An `A` record.
     V4(Ipv4Addr),
-    /// An `AAAA` record.
     V6(Ipv6Addr),
-    /// A `CNAME`, and the name it points at.
     Cname(String),
-    /// Anything else, which this client passes over.
     Other,
 }
 
-/// The addresses an answer holds for `name`, following its `CNAME`s.
-///
-/// Records whose owner is not the name being looked up are ignored, so
-/// a resolver cannot slip an address for a name nobody asked about into
-/// the same answer.
+// Records whose owner is not the name being looked up are ignored, so
+// a resolver cannot slip an address for a name nobody asked about into
+// the same answer.
 fn chain(name: &str, records: &[Record]) -> Vec<IpAddr> {
     let mut target = name.to_owned();
     let mut out = Vec::new();
@@ -427,33 +382,28 @@ fn chain(name: &str, records: &[Record]) -> Vec<IpAddr> {
     out
 }
 
-/// A cursor over one message that cannot leave it.
+// A cursor over one message that cannot leave it.
 struct Reader<'a> {
-    /// The whole message, which a compression pointer may reach into.
+    // The whole message, which a compression pointer may reach into.
     msg: &'a [u8],
-    /// Where the next field begins.
     at: usize,
 }
 
 impl<'a> Reader<'a> {
-    /// Read `msg` from its first byte.
     fn new(msg: &'a [u8]) -> Self {
         Self { msg, at: 0 }
     }
 
-    /// One byte.
     fn u8(&mut self) -> Result<u8, DnsError> {
         let b = *self.msg.get(self.at).ok_or(DnsError::Short)?;
         self.at += 1;
         Ok(b)
     }
 
-    /// Two bytes, big-endian, as the wire writes every number.
     fn u16(&mut self) -> Result<u16, DnsError> {
         Ok(u16::from_be_bytes([self.u8()?, self.u8()?]))
     }
 
-    /// Four bytes, big-endian.
     fn u32(&mut self) -> Result<u32, DnsError> {
         Ok(u32::from_be_bytes([
             self.u8()?,
@@ -463,7 +413,6 @@ impl<'a> Reader<'a> {
         ]))
     }
 
-    /// Move to `to`, which must be inside the message.
     fn seek(&mut self, to: usize) -> Result<(), DnsError> {
         if to > self.msg.len() {
             return Err(DnsError::Short);
@@ -472,12 +421,10 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
-    /// One name, decompressed, lower case and without the root dot.
-    ///
-    /// A pointer must point strictly backwards, which is what makes a
-    /// loop impossible rather than merely bounded; the jump count is
-    /// there so a chain of legal pointers cannot cost more than the
-    /// message is long.
+    // A pointer must point strictly backwards, which is what makes a
+    // loop impossible rather than merely bounded; the jump count is
+    // there so a chain of legal pointers cannot cost more than the
+    // message is long.
     fn name(&mut self) -> Result<String, DnsError> {
         let mut out = String::new();
         let mut at = self.at;
@@ -524,8 +471,8 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
-    /// One answer record. `rdlength` is what says where the next one
-    /// begins, whatever the record itself turned out to hold.
+    // `rdlength` is what says where the next record begins, whatever the
+    // record itself turned out to hold.
     fn record(&mut self) -> Result<Record, DnsError> {
         let name = self.name()?;
         let rtype = self.u16()?;
