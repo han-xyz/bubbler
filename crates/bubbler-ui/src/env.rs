@@ -6,9 +6,11 @@
 
 use std::env;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
+use bubbler_core::audio_policy::{self, LoadedRevision};
 use bubbler_core::env::{DEFAULT_CONFIG_DIRS, DEFAULT_DATA_DIRS, Env, xdg_dirs};
 
 /// Build an [`Env`] from the current process environment. A missing or
@@ -107,6 +109,16 @@ pub fn search_path() -> Vec<PathBuf> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Which audio policy the running WirePlumber has loaded, asked once per
+/// run of the editor: it lints on every change, and where nothing answers
+/// the question takes two seconds.
+pub fn loaded_revision(runtime_dir: &Path) -> LoadedRevision {
+    static LOADED: OnceLock<LoadedRevision> = OnceLock::new();
+    LOADED
+        .get_or_init(|| audio_policy::loaded_revision(runtime_dir))
+        .clone()
 }
 
 /// The shell an `exec` starts by default: `$SHELL`, else `/bin/sh`. It is

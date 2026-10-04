@@ -317,6 +317,13 @@ const CHECK_LINES: &[(&str, &str)] = &[
          the grant asks for.",
     ),
     (
+        "audio-policy-not-loaded",
+        "A `pipewire` or `pulseaudio` grant where the running WirePlumber has not loaded \
+         this bubbler's policy, or another revision of it: the grant is not enforced as \
+         configured until `systemctl --user restart wireplumber`. A note instead where \
+         WirePlumber could not be asked.",
+    ),
+    (
         "bundle-without-dbus",
         "A `portals`, `notify`, `tray`, `mpris`, `a11y` or `input-method` grant that no \
          layer gives a `dbus` to carry its rules.",

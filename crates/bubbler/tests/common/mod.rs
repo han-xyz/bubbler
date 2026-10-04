@@ -41,6 +41,14 @@ pub fn say(line: &str) {
     }
 }
 
+/// The private PipeWire and WirePlumber pair `bubbler-core`'s bed tests
+/// start, for a test that points bubbler at it.
+// Most of the bed drives contexts the CLI tests do not need.
+#[allow(dead_code)]
+pub mod bed {
+    include!("../../../bubbler-core/tests/support/bed.rs");
+}
+
 /// The two host binaries the probes below run. Named absolutely: a probe
 /// that resolved them on `PATH` would be measuring the `PATH` a test set
 /// rather than the host.

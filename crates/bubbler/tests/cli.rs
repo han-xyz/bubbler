@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use bubbler_core::audio_policy::LoadedRevision;
 use bubbler_core::bwrap::ETC_ALLOWLIST;
 use bubbler_core::instance::CONFIG_VERSION;
 use bubbler_core::pipewire::{PULSE_MODULE, PW_CONTAINER};
@@ -6834,6 +6835,102 @@ fn audio_policy_is_silent_before_a_real_run_with_the_whole_policy_installed() {
     assert_eq!(out.status.code(), Some(1), "{err}");
 }
 
+/// The stderr of `bubbler <args>` run against `bed`'s PipeWire, with the
+/// whole policy installed under the test root, and instance `t` and
+/// profile `t` both holding `config`. Its `x11 "host"` ends the run on
+/// the test root's missing `$DISPLAY` after the warnings, before any
+/// sandbox starts.
+fn stderr_on_bed(bed: &common::bed::PipeWireBed, config: &str, args: &[&str]) -> String {
+    let tmp = setup();
+    install_audio_policy(tmp.path(), true, true);
+    let config = format!("{config}x11 \"host\"\ncommand \"/usr/bin/true\"\n");
+    write_profile(tmp.path(), "system", "t", &config);
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    std::fs::write(
+        tmp.path().join("data/bubbler/instances/t/config.kdl"),
+        &config,
+    )
+    .unwrap();
+    let out = bubbler(tmp.path())
+        .env("XDG_RUNTIME_DIR", bed.dir().join("run"))
+        .args(args)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("x11 \"host\" grants no isolation"), "{err}");
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    err
+}
+
+/// The line a run prints for `loaded`.
+fn not_loaded_line(loaded: &LoadedRevision) -> String {
+    format!(
+        "bubbler: warning: {}",
+        loaded.run_warning().expect("a warning")
+    )
+}
+
+/// A bed whose hook publishes no revision, as a WirePlumber that loaded
+/// an older bubbler's hook, or none, answers.
+fn bed_without_the_revision() -> Option<common::bed::PipeWireBed> {
+    let bed = common::bed::bed_with_the_hook_changed(
+        r#"ImplMetadata ("bubbler-policy")"#,
+        r#"ImplMetadata ("not-bubbler-policy")"#,
+    )?;
+    assert_eq!(common::bed::loaded_revision(&bed), LoadedRevision::Absent);
+    Some(bed)
+}
+
+#[test]
+fn a_run_under_the_wireplumber_that_loaded_this_policy_says_nothing_of_it() {
+    let Some(bed) = common::bed::PipeWireBed::start() else {
+        return;
+    };
+    assert_eq!(common::bed::loaded_revision(&bed), LoadedRevision::Current);
+    let err = stderr_on_bed(&bed, "pipewire\n", &["run", "t"]);
+    assert!(!err.contains("WirePlumber"), "{err}");
+}
+
+#[test]
+fn a_run_and_a_try_under_a_wireplumber_without_this_policy_say_so() {
+    let Some(bed) = bed_without_the_revision() else {
+        return;
+    };
+    let expected = not_loaded_line(&LoadedRevision::Absent);
+    let err = stderr_on_bed(&bed, "pipewire\n", &["run", "t"]);
+    assert!(err.contains(&expected), "{err}");
+    let err = stderr_on_bed(&bed, "pulseaudio\n", &["try", "--profile", "t"]);
+    assert!(err.contains(&expected), "{err}");
+}
+
+#[test]
+fn a_run_under_a_wireplumber_of_another_revision_names_it() {
+    let other = (bubbler_core::audio_policy::revision() + 1).to_string();
+    let current = bubbler_core::audio_policy::revision();
+    let Some(bed) = common::bed::bed_with_the_hook_changed(
+        &format!("local POLICY_REVISION = {current}\n"),
+        &format!("local POLICY_REVISION = {other}\n"),
+    ) else {
+        return;
+    };
+    let loaded = LoadedRevision::Other(other.clone());
+    assert_eq!(common::bed::loaded_revision(&bed), loaded);
+    let err = stderr_on_bed(&bed, "pipewire\n", &["run", "t"]);
+    assert!(err.contains(&not_loaded_line(&loaded)), "{err}");
+    assert!(err.contains(&format!("revision {other}")), "{err}");
+}
+
+/// Without an audio grant the running WirePlumber is not asked, so a
+/// WirePlumber without the policy draws no warning.
+#[test]
+fn a_run_without_an_audio_grant_does_not_ask_wireplumber() {
+    let Some(bed) = bed_without_the_revision() else {
+        return;
+    };
+    let err = stderr_on_bed(&bed, "", &["run", "t"]);
+    assert!(!err.contains("WirePlumber"), "{err}");
+}
+
 /// The nested mode's whole server command line reaches the supervisor:
 /// `--x11`, the argv, and the `--` that closes it, all before the `--`
 /// the sandbox's own command follows. The words are the contract with
@@ -10544,7 +10641,8 @@ fn run(tmp: &Path, args: &[&str]) -> (i32, String, String) {
 /// `microphone` is a note, not a warning: it fails nothing, and the exit
 /// code says so. The drop-in is installed in the fake $XDG_CONFIG_HOME so
 /// the count is the profile's `pipewire-microphone` note alone, not also
-/// `audio-policy-missing`.
+/// `audio-policy-missing`; and no PipeWire answers in the test root, whose
+/// `audio-policy-not-loaded` note the profile accepts.
 #[test]
 fn profile_lint_notes_a_microphone_child() {
     let tmp = setup();
@@ -10553,7 +10651,8 @@ fn profile_lint_notes_a_microphone_child() {
         tmp.path(),
         "user",
         "mic",
-        "pipewire {\n    microphone\n}\ncommand \"sh\"\n",
+        "pipewire {\n    microphone\n}\ncommand \"sh\"\n\
+         lint-allow \"audio-policy-not-loaded\" reason=\"no PipeWire here\"\n",
     );
     let (code, out, _) = run(tmp.path(), &["profile", "lint", "mic"]);
     assert_eq!(code, 0, "{out}");

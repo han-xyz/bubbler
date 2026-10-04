@@ -100,11 +100,11 @@ pub struct View<'a> {
     /// `full` prints.
     pub seccomp_log: bool,
     /// What an audio grant's group header ends with:
-    /// [`crate::audio_policy::Missing::explain_suffix`] where this host
-    /// holds less than the whole policy, else empty. Asked of the host
-    /// by the caller, like `bwrap` below: an explanation describes a
-    /// run, and probes for it itself.
-    pub audio_policy: &'static str,
+    /// [`crate::audio_policy::explain_suffix`]: what this host holds of
+    /// the policy and whether the running WirePlumber has loaded it, else
+    /// empty. Asked of the host by the caller, like `bwrap` below: an
+    /// explanation describes a run, and probes for it itself.
+    pub audio_policy: &'a str,
     /// The sidecar's argv rather than the sandbox's: its groups are the
     /// rules themselves, and a grant that contributes neither an argument
     /// nor a rule to it is not a group of it.

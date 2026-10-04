@@ -1650,6 +1650,7 @@ mod tests {
                 env: &e,
                 host: &host,
                 search_path: &search_path,
+                loaded_revision: &|_: &Path| crate::audio_policy::LoadedRevision::Current,
             };
             let report =
                 lint::lint_profile(&ctx, &r, name).unwrap_or_else(|err| panic!("{name}: {err}"));

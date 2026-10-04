@@ -228,14 +228,47 @@ pub fn run_warning(cfg: &InstanceConfig, host: &dyn Host, env: &Env) -> Option<S
     }
 }
 
-/// The suffix an audio group's header takes, `""` where the host holds
-/// the whole policy.
-pub fn explain_suffix(host: &dyn Host, env: &Env) -> &'static str {
-    match missing(host, env) {
-        Some(case) => case.explain_suffix(),
-        None if !differing(host, env).is_empty() => EXPLAIN_SUFFIX_DIFFERS,
-        None => "",
+/// The warning where this run needs it: `cfg` grants `pipewire` or
+/// `pulseaudio`, the host holds the whole policy, and the WirePlumber
+/// serving `env`'s runtime directory, asked through `read`, has not
+/// loaded this bubbler's. Where a half is [`missing`], [`run_warning`]
+/// already says so with the same restart, and `read` is not asked.
+pub fn not_loaded_warning(
+    cfg: &InstanceConfig,
+    host: &dyn Host,
+    env: &Env,
+    read: impl FnOnce(&Path) -> LoadedRevision,
+) -> Option<String> {
+    cfg.audio()?;
+    if missing(host, env).is_some() {
+        return None;
     }
+    read(&env.runtime_dir).run_warning()
+}
+
+/// The suffix an audio group's header takes: what the host is missing of
+/// the policy, or how its copy differs and whether the running
+/// WirePlumber, asked through `read` as for [`not_loaded_warning`], has
+/// loaded it; `""` where all is in place.
+pub fn explain_suffix(
+    cfg: &InstanceConfig,
+    host: &dyn Host,
+    env: &Env,
+    read: impl FnOnce(&Path) -> LoadedRevision,
+) -> String {
+    if let Some(case) = missing(host, env) {
+        return case.explain_suffix().to_owned();
+    }
+    let differs = if differing(host, env).is_empty() {
+        ""
+    } else {
+        EXPLAIN_SUFFIX_DIFFERS
+    };
+    let loaded = match cfg.audio() {
+        Some(_) => read(&env.runtime_dir).explain_suffix(),
+        None => None,
+    };
+    format!("{differs}{}", loaded.unwrap_or_default())
 }
 
 /// The policy files WirePlumber loads that are not the ones this binary
@@ -352,6 +385,43 @@ pub enum LoadedRevision {
     /// Not known, and why: the tool is missing, the daemon unreachable,
     /// or the answer unreadable.
     Unknown(String),
+}
+
+/// What a WirePlumber that has not loaded this bubbler's policy leaves
+/// of a grant.
+const NOT_ENFORCED: &str = "audio grants are not enforced as configured";
+
+/// What loads the installed policy into the running WirePlumber.
+pub const RESTART: &str = "systemctl --user restart wireplumber";
+
+impl LoadedRevision {
+    /// Which policy the running WirePlumber holds where it is not this
+    /// bubbler's; `None` where it is, or where that is not known.
+    pub fn not_loaded(&self) -> Option<String> {
+        match self {
+            LoadedRevision::Current | LoadedRevision::Unknown(_) => None,
+            LoadedRevision::Absent => Some(
+                "the running WirePlumber has not loaded this bubbler's audio policy".to_owned(),
+            ),
+            LoadedRevision::Other(loaded) => Some(format!(
+                "the running WirePlumber has loaded audio policy revision {loaded}, not this \
+                 bubbler's {}",
+                revision()
+            )),
+        }
+    }
+
+    /// The line a real run prints on stderr for this answer, if any.
+    pub fn run_warning(&self) -> Option<String> {
+        self.not_loaded()
+            .map(|cause| format!("{cause}: {NOT_ENFORCED}; run `{RESTART}`"))
+    }
+
+    /// What `--explain` appends to the audio group's header for it.
+    fn explain_suffix(&self) -> Option<String> {
+        self.not_loaded()
+            .map(|cause| format!(" ({cause}: grant not enforced as configured)"))
+    }
 }
 
 /// What `pw-metadata -n bubbler-policy` printed on stdout, read as a
@@ -878,20 +948,28 @@ mod tests {
     #[test]
     fn explain_suffix_is_empty_once_both_files_are_installed() {
         let e = env();
+        let audio = crate::config::parse("pipewire\ncommand \"true\"").unwrap();
+        let current = |_: &Path| LoadedRevision::Current;
         assert_eq!(
-            explain_suffix(&FakeHost::default(), &e),
+            explain_suffix(&audio, &FakeHost::default(), &e, current),
             Missing::Both.explain_suffix()
         );
         let half = holding(&[install_dirs(&e)[0].join(DROP_IN_NAME)]);
-        assert_eq!(explain_suffix(&half, &e), Missing::Hook.explain_suffix());
+        assert_eq!(
+            explain_suffix(&audio, &half, &e, current),
+            Missing::Hook.explain_suffix()
+        );
         let whole = holding(&[
             install_dirs(&e)[0].join(DROP_IN_NAME),
             hook_dirs(&e)[0].join(HOOK_NAME),
         ]);
-        assert_eq!(explain_suffix(&whole, &e), "");
+        assert_eq!(explain_suffix(&audio, &whole, &e, current), "");
         let edited = install_dirs(&e)[0].join(DROP_IN_NAME);
         let other = whole.text(edited.to_str().unwrap(), "# another version\n");
-        assert_eq!(explain_suffix(&other, &e), EXPLAIN_SUFFIX_DIFFERS);
+        assert_eq!(
+            explain_suffix(&audio, &other, &e, current),
+            EXPLAIN_SUFFIX_DIFFERS
+        );
     }
 
     /// What `pw-metadata -n bubbler-policy` printed on a bed whose hook
@@ -990,6 +1068,98 @@ mod tests {
             started.elapsed() < READ_TIMEOUT * 2,
             "{:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_policy_not_loaded_is_a_run_warning_naming_the_restart() {
+        let absent = LoadedRevision::Absent.run_warning().expect("a warning");
+        assert!(
+            absent.contains("the running WirePlumber has not loaded this bubbler's audio policy"),
+            "{absent}"
+        );
+        let other = LoadedRevision::Other("7".to_owned())
+            .run_warning()
+            .expect("a warning");
+        assert!(
+            other.contains(&format!("revision 7, not this bubbler's {}", revision())),
+            "{other}"
+        );
+        for warning in [absent, other] {
+            assert!(warning.contains("not enforced as configured"), "{warning}");
+            assert!(
+                warning.contains("`systemctl --user restart wireplumber`"),
+                "{warning}"
+            );
+        }
+        assert_eq!(LoadedRevision::Current.run_warning(), None);
+        assert_eq!(
+            LoadedRevision::Unknown("no daemon".to_owned()).run_warning(),
+            None
+        );
+    }
+
+    /// The reader is asked only for an audio grant on a host that holds
+    /// the whole policy: a missing half is already the run's warning,
+    /// and its fix is the same restart.
+    #[test]
+    fn the_loaded_policy_is_asked_only_where_it_can_add_a_warning() {
+        let e = env();
+        let whole = holding(&[
+            install_dirs(&e)[0].join(DROP_IN_NAME),
+            hook_dirs(&e)[0].join(HOOK_NAME),
+        ]);
+        let audio = crate::config::parse("pipewire\ncommand \"true\"").unwrap();
+        let silent = crate::config::parse("command \"true\"").unwrap();
+        let unasked = |_: &Path| -> LoadedRevision { panic!("the reader was asked") };
+        assert_eq!(not_loaded_warning(&silent, &whole, &e, unasked), None);
+        assert_eq!(
+            not_loaded_warning(&audio, &FakeHost::default(), &e, unasked),
+            None
+        );
+        let asked = std::cell::Cell::new(None);
+        let warning = not_loaded_warning(&audio, &whole, &e, |dir: &Path| {
+            asked.set(Some(dir.to_owned()));
+            LoadedRevision::Absent
+        });
+        assert_eq!(warning, LoadedRevision::Absent.run_warning());
+        assert_eq!(asked.take(), Some(e.runtime_dir.clone()));
+    }
+
+    #[test]
+    fn explain_says_the_loaded_policy_beside_the_installed_one() {
+        let e = env();
+        let audio = crate::config::parse("pipewire\ncommand \"true\"").unwrap();
+        let whole = holding(&[
+            install_dirs(&e)[0].join(DROP_IN_NAME),
+            hook_dirs(&e)[0].join(HOOK_NAME),
+        ]);
+        let other = |_: &Path| LoadedRevision::Other("7".to_owned());
+        let suffix = explain_suffix(&audio, &whole, &e, other);
+        assert!(suffix.starts_with(" ("), "{suffix}");
+        assert!(suffix.contains("revision 7"), "{suffix}");
+        assert_eq!(
+            explain_suffix(&audio, &whole, &e, |_: &Path| LoadedRevision::Current),
+            ""
+        );
+        assert_eq!(
+            explain_suffix(&audio, &whole, &e, |_: &Path| LoadedRevision::Unknown(
+                "no daemon".to_owned()
+            )),
+            ""
+        );
+        let edited = install_dirs(&e)[0].join(DROP_IN_NAME);
+        let unasked = |_: &Path| -> LoadedRevision { panic!("the reader was asked") };
+        let silent = crate::config::parse("command \"true\"").unwrap();
+        assert_eq!(explain_suffix(&silent, &whole, &e, unasked), "");
+        let differs = whole.text(edited.to_str().unwrap(), "# another version\n");
+        assert_eq!(
+            explain_suffix(&audio, &differs, &e, other),
+            format!("{EXPLAIN_SUFFIX_DIFFERS}{suffix}")
+        );
+        assert_eq!(
+            explain_suffix(&audio, &FakeHost::default(), &e, unasked),
+            Missing::Both.explain_suffix()
         );
     }
 

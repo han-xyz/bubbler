@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use kdl::{KdlDocument, KdlNode};
 
-use crate::audio_policy;
+use crate::audio_policy::{self, LoadedRevision};
 use crate::config;
 use crate::desktop;
 use crate::env::{Env, SANDBOX_HOME};
@@ -84,6 +84,18 @@ const AUDIO_DEVICES_OFFERED: Check = Check {
 const AUDIO_POLICY_DIFFERS: Check = Check {
     id: audio_policy::DIFFERS_CHECK,
     severity: Severity::Warning,
+};
+// A warning, as `audio-policy-missing` is: the files are in place and the
+// grant is still not enforced as they state it.
+const AUDIO_POLICY_NOT_LOADED: Check = Check {
+    id: "audio-policy-not-loaded",
+    severity: Severity::Warning,
+};
+// The same id as a note, where the running WirePlumber could not be asked:
+// nothing says the grant is not enforced, only that it was not measured.
+const AUDIO_POLICY_NOT_LOADED_UNKNOWN: Check = Check {
+    id: AUDIO_POLICY_NOT_LOADED.id,
+    severity: Severity::Note,
 };
 const BUNDLE_WITHOUT_DBUS: Check = Check {
     id: "bundle-without-dbus",
@@ -299,6 +311,7 @@ pub const CHECKS: &[Check] = &[
     AUDIO_DEVICES_OFFERED,
     AUDIO_POLICY_DIFFERS,
     AUDIO_POLICY_MISSING,
+    AUDIO_POLICY_NOT_LOADED,
     BUNDLE_WITHOUT_DBUS,
     CAMERA_NODES_NONE_PRESENT,
     CAMERA_NODES_NO_HOTPLUG,
@@ -434,6 +447,11 @@ pub struct Context<'a> {
     pub host: &'a dyn Host,
     /// `$PATH` split into directories, for `command-not-found`.
     pub search_path: &'a [PathBuf],
+    /// Which policy the WirePlumber serving a runtime directory has
+    /// loaded, for `audio-policy-not-loaded`:
+    /// [`audio_policy::loaded_revision`] outside the tests. Asked only of
+    /// a config with an audio grant.
+    pub loaded_revision: &'a dyn Fn(&Path) -> LoadedRevision,
 }
 
 /// Commands known to start a sandbox of their own inside this one, which
@@ -880,6 +898,7 @@ fn run(ctx: &Context, sources: &[Source]) -> Report {
     across_layers(ctx, sources, &mut f);
     audio_policy_missing(ctx, sources, &mut f);
     audio_policy_differs(ctx, sources, &mut f);
+    audio_policy_not_loaded(ctx, sources, &mut f);
     let allowed: Vec<&str> = sources
         .iter()
         .flat_map(|s| top(s, "lint-allow"))
@@ -1267,6 +1286,46 @@ fn audio_policy_differs(ctx: &Context, sources: &[Source], f: &mut Findings) {
         &AUDIO_POLICY_DIFFERS,
         audio_policy::differs_message(&paths),
         &audio_policy::differs_help(&paths, ctx.env),
+    );
+}
+
+/// The `audio-policy-not-loaded` warning, or its note where the running
+/// WirePlumber could not be asked. Not where a half of the policy is
+/// missing: `audio-policy-missing` says so, with the same restart.
+fn audio_policy_not_loaded(ctx: &Context, sources: &[Source], f: &mut Findings) {
+    if audio_policy::missing(ctx.host, ctx.env).is_some() {
+        return;
+    }
+    let Some((i, node, name)) = audio_node(sources) else {
+        return;
+    };
+    let restart = format!("`{}`", audio_policy::RESTART);
+    let loaded = (ctx.loaded_revision)(&ctx.env.runtime_dir);
+    if let LoadedRevision::Unknown(reason) = &loaded {
+        f.push(
+            i,
+            node,
+            &AUDIO_POLICY_NOT_LOADED_UNKNOWN,
+            format!(
+                "whether the running WirePlumber has loaded this bubbler's audio policy is \
+                 not known: {reason}"
+            ),
+            &format!(
+                "with PipeWire and WirePlumber running in this session, lint again; {restart} \
+                 loads the installed policy"
+            ),
+        );
+        return;
+    }
+    let Some(cause) = loaded.not_loaded() else {
+        return;
+    };
+    f.push(
+        i,
+        node,
+        &AUDIO_POLICY_NOT_LOADED,
+        format!("{cause}: this `{name}` grant is not enforced as configured"),
+        &format!("run {restart}, which loads the installed policy"),
     );
 }
 
@@ -2165,10 +2224,12 @@ mod tests {
     fn with<T>(host: &dyn Host, f: impl FnOnce(&Context) -> T) -> T {
         let e = env();
         let path = [PathBuf::from("/usr/bin")];
+        let current = |_: &Path| LoadedRevision::Current;
         f(&Context {
             env: &e,
             host,
             search_path: &path,
+            loaded_revision: &current,
         })
     }
 
@@ -2950,6 +3011,7 @@ mod tests {
             env: &inside,
             host: &host,
             search_path: &search,
+            loaded_revision: &|_: &Path| LoadedRevision::Current,
         };
         assert_eq!(
             ids(&lint(&ctx, &["home-share \"myprofiles\" mode=rw"])),
@@ -2961,6 +3023,7 @@ mod tests {
             env: &outside,
             host: &host,
             search_path: &search,
+            loaded_revision: &|_: &Path| LoadedRevision::Current,
         };
         assert_eq!(
             ids(&lint(&ctx, &["path-share \"/kioxia/profiles\" mode=rw"])),
@@ -3829,6 +3892,111 @@ mod tests {
         });
     }
 
+    /// A host holding the whole policy, as this binary ships it.
+    fn whole_policy() -> FakeHost {
+        let (file, _, _) = fake::types();
+        let drop_in = "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf";
+        host()
+            .with(drop_in, file)
+            .text(drop_in, audio_policy::DROP_IN)
+            .with(HOOK_PATH, file)
+            .text(HOOK_PATH, audio_policy::HOOK)
+    }
+
+    /// Lint `layers` on `host` with the running WirePlumber answering
+    /// `loaded`.
+    fn lint_loaded(host: &dyn Host, loaded: LoadedRevision, layers: &[&str]) -> Report {
+        let e = env();
+        let path = [PathBuf::from("/usr/bin")];
+        let read = |_: &Path| loaded.clone();
+        lint(
+            &Context {
+                env: &e,
+                host,
+                search_path: &path,
+                loaded_revision: &read,
+            },
+            layers,
+        )
+    }
+
+    #[test]
+    fn a_policy_not_loaded_is_a_warning_naming_the_restart() {
+        for loaded in [
+            LoadedRevision::Absent,
+            LoadedRevision::Other("7".to_owned()),
+        ] {
+            let report = lint_loaded(&whole_policy(), loaded.clone(), &["pipewire"]);
+            assert_eq!(ids(&report), ["audio-policy-not-loaded"], "{loaded:?}");
+            let finding = &report.findings[0];
+            assert_eq!(finding.severity, Severity::Warning, "{loaded:?}");
+            assert!(
+                finding
+                    .message
+                    .contains(&loaded.not_loaded().expect("a cause")),
+                "{finding:?}"
+            );
+            assert!(
+                finding
+                    .help
+                    .contains("systemctl --user restart wireplumber"),
+                "{finding:?}"
+            );
+        }
+        let report = lint_loaded(&whole_policy(), LoadedRevision::Current, &["pipewire"]);
+        assert_eq!(ids(&report), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn a_loaded_policy_not_known_is_a_note_naming_why() {
+        let reason = "/usr/bin/pw-metadata exit status: 255: can't connect: Host is down";
+        let report = lint_loaded(
+            &whole_policy(),
+            LoadedRevision::Unknown(reason.to_owned()),
+            &["pulseaudio"],
+        );
+        assert_eq!(ids(&report), ["audio-policy-not-loaded"]);
+        let finding = &report.findings[0];
+        assert_eq!(finding.severity, Severity::Note);
+        assert!(finding.message.contains(reason), "{finding:?}");
+    }
+
+    /// No audio grant asks nothing, and a missing half is its own
+    /// finding with the same restart in its help.
+    #[test]
+    fn the_loaded_policy_is_asked_only_of_an_audio_grant_with_the_whole_policy() {
+        let e = env();
+        let path = [PathBuf::from("/usr/bin")];
+        let unasked = |_: &Path| -> LoadedRevision { panic!("the reader was asked") };
+        for (host, layer, expected) in [
+            (whole_policy(), "wayland", &[][..]),
+            (host(), "pipewire", &["audio-policy-missing"][..]),
+        ] {
+            let ctx = Context {
+                env: &e,
+                host: &host,
+                search_path: &path,
+                loaded_revision: &unasked,
+            };
+            assert_eq!(ids(&lint(&ctx, &[layer])), expected, "{layer}");
+        }
+    }
+
+    #[test]
+    fn a_policy_not_loaded_is_accepted_with_a_lint_allow() {
+        for loaded in [
+            LoadedRevision::Absent,
+            LoadedRevision::Unknown("x".to_owned()),
+        ] {
+            let report = lint_loaded(
+                &whole_policy(),
+                loaded,
+                &["pipewire\nlint-allow \"audio-policy-not-loaded\" reason=\"restarted later\""],
+            );
+            assert_eq!(ids(&report), [] as [&str; 0]);
+        }
+    }
+
     #[test]
     fn audio_policy_missing_is_accepted_with_a_lint_allow() {
         with(&host(), |ctx| {
@@ -3910,6 +4078,7 @@ mod tests {
                 env: &e,
                 host: &host,
                 search_path: &search_path,
+                loaded_revision: &|_: &Path| LoadedRevision::Current,
             };
             let report =
                 lint_profile(&ctx, &resolver, name).unwrap_or_else(|err| panic!("{name}: {err}"));
@@ -3970,6 +4139,7 @@ mod tests {
             env: &e,
             host: &host,
             search_path: &search,
+            loaded_revision: &|_: &Path| LoadedRevision::Current,
         };
         let err = lint_profile(&ctx, &r, "app").expect_err("`bluetooth` is not a node");
         assert!(matches!(err, LintError::Profile(_)), "{err:?}");
@@ -4003,6 +4173,7 @@ mod tests {
             env: &e,
             host: &host,
             search_path: &search,
+            loaded_revision: &|_: &Path| LoadedRevision::Current,
         };
         let mut all = Report::default();
         for name in ["a", "b"] {

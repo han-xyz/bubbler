@@ -773,6 +773,8 @@ fn explain(
     }
     let rules = explain::rules(&inst.config, &inst.name);
     let wl_proxy = launcher::wl_proxy_plan(env, inst);
+    let audio_suffix =
+        audio_policy::explain_suffix(&inst.config, &RealHost, env, audio_policy::loaded_revision);
     let view = explain::View {
         title,
         instance: &inst.name,
@@ -783,7 +785,7 @@ fn explain(
         },
         rules: &rules,
         wl_proxy: wl_proxy.as_ref(),
-        audio_policy: audio_policy::explain_suffix(&RealHost, env),
+        audio_policy: &audio_suffix,
         net_proxy_log: env.net_proxy_log,
         seccomp_log: env.seccomp_log,
         proxy: opts.proxy || opts.wl_proxy || opts.net_proxy,
@@ -1236,6 +1238,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                 env: &env,
                 host: &RealHost,
                 search_path: &path,
+                loaded_revision: &audio_policy::loaded_revision,
             };
             warn_lint(lint::lint_config(&ctx, &inst.config_path()));
             print_lines(&[inst.dir.as_os_str()], "the instance directory")
@@ -1352,6 +1355,14 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                     {
                         ediag!("bubbler: warning: {warning}");
                     }
+                    if let Some(warning) = audio_policy::not_loaded_warning(
+                        &inst.config,
+                        &RealHost,
+                        &env,
+                        audio_policy::loaded_revision,
+                    ) {
+                        ediag!("bubbler: warning: {warning}");
+                    }
                     match launcher::run(&env, &inst, command, mode, log.as_ref()) {
                         Err(e @ LaunchError::AlreadyRunning(_)) => {
                             join_after_lost_start(&env, &name, log.as_ref(), e)?
@@ -1444,6 +1455,14 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             {
                 ediag!("bubbler: warning: {warning}");
             }
+            if let Some(warning) = audio_policy::not_loaded_warning(
+                &eph.instance.config,
+                &RealHost,
+                &env,
+                audio_policy::loaded_revision,
+            ) {
+                ediag!("bubbler: warning: {warning}");
+            }
             let mode = tty.unwrap_or(eph.instance.config.tty);
             let code = launcher::run(&env, &eph.instance, command, mode, None);
             // Something else already answers on this pid's control socket,
@@ -1531,6 +1550,14 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                     }
                     if let Some(warning) = audio_policy::run_warning(&inst.config, &RealHost, &env)
                     {
+                        ediag!("bubbler: warning: {warning}");
+                    }
+                    if let Some(warning) = audio_policy::not_loaded_warning(
+                        &inst.config,
+                        &RealHost,
+                        &env,
+                        audio_policy::loaded_revision,
+                    ) {
                         ediag!("bubbler: warning: {warning}");
                     }
                     match launcher::run(&env, &inst, command, mode, log.as_ref()) {
@@ -1677,6 +1704,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                     env: &env,
                     host: &RealHost,
                     search_path: &search,
+                    loaded_revision: &audio_policy::loaded_revision,
                 };
                 warn_lint(lint::lint_config(&ctx, &path));
             }
@@ -1710,6 +1738,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                         env: &env,
                         host: &RealHost,
                         search_path: &search,
+                        loaded_revision: &audio_policy::loaded_revision,
                     };
                     warn_lint(lint::lint_profile(&ctx, &profiles, &name));
                 }
@@ -1722,6 +1751,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                     env: &env,
                     host: &RealHost,
                     search_path: &search,
+                    loaded_revision: &audio_policy::loaded_revision,
                 };
                 let found = match (name.as_deref(), all) {
                     (Some(name), false) => lint::lint_profile(&ctx, &profiles, name),
@@ -1755,6 +1785,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                 env: &env,
                 host: &RealHost,
                 search_path: &path,
+                loaded_revision: &audio_policy::loaded_revision,
             };
             warn_lint(lint::lint_config(&ctx, &config));
             print_lines(&[config.as_os_str()], "the config path")
@@ -1786,6 +1817,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                 env: &env,
                 host: &RealHost,
                 search_path: &path,
+                loaded_revision: &audio_policy::loaded_revision,
             };
             // Every way the run itself can fail is exit 3: "this file is
             // not one bubbler reads" is a different answer from "this

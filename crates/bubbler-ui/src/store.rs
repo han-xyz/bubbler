@@ -84,6 +84,7 @@ impl Store {
             env,
             host: &RealHost,
             search_path: &search,
+            loaded_revision: &crate::env::loaded_revision,
         };
         let rows = names.iter().map(|name| row(env, &ctx, name)).collect();
         let (profiles, profile_error) = match profile::Resolver::new(env).list() {

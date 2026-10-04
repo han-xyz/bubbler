@@ -223,6 +223,7 @@ impl Detail {
             env,
             host: &RealHost,
             search_path: &search,
+            loaded_revision: &crate::env::loaded_revision,
         };
         match lint::lint_text(&ctx, Where::File(self.path()), text) {
             Ok(report) => self.findings = report.findings,
