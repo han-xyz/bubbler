@@ -6,6 +6,7 @@
 /// written down here is advertised to the sandbox, and adding it is the
 /// only thing that hides it.
 ///
+/// Sorted, so a name added out of place is a diff a reader can follow.
 /// Included by both `bubbler-wl-proxy` and `bubbler-core`, so the
 /// denylist the proxy applies and the one core explains are one list.
 pub const PRIVILEGED: &[&str] = &[
