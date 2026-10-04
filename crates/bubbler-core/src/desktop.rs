@@ -30,10 +30,9 @@ pub const SUFFIX: &str = " (Bubbler)";
 /// safe: an entry without it was written by somebody else.
 pub const MARKER: &str = "X-Bubbler-Instance";
 
-/// Name of the `bubbler` binary as an entry's `Exec` may name it.
+// Name of the `bubbler` binary as an entry's `Exec` may name it.
 const BINARY: &str = "bubbler";
 
-/// Subdirectory of a data directory that holds desktop entries.
 const APPLICATIONS: &str = "applications";
 
 /// Where entries are read from and written to. Read order is user first,
@@ -49,9 +48,7 @@ pub struct Dirs {
 
 impl Dirs {
     /// The `applications` directory of `$XDG_DATA_HOME` and of every
-    /// `$XDG_DATA_DIRS` entry, which is exactly where a launcher looks —
-    /// a host that puts entries elsewhere (a Nix profile, a flatpak
-    /// export) says so in that variable and bubbler follows it.
+    /// `$XDG_DATA_DIRS` entry, which is exactly where a launcher looks.
     pub fn from_env(env: &Env) -> Self {
         Self {
             user: env.data_home.join(APPLICATIONS),
@@ -65,22 +62,21 @@ impl Dirs {
     }
 }
 
-/// The `[Desktop Entry]` keys a lookup decides on, read without parsing
-/// the rest of the file.
+// The `[Desktop Entry]` keys a lookup decides on, read without parsing
+// the rest of the file.
 struct Head<'a> {
     exec: Option<&'a str>,
     marker: Option<&'a str>,
-    /// `NoDisplay=true`: an entry a launcher does not show, which is what
-    /// an application's MIME-handler-only entries are. Never the one a
-    /// user means by the application's name.
+    // `NoDisplay=true`: an entry a launcher does not show, which is what
+    // an application's MIME-handler-only entries are.
     no_display: bool,
-    /// `Hidden=true`, which the specification calls "strictly equivalent
-    /// to the .desktop file not existing at all".
+    // `Hidden=true`, which the specification calls "strictly equivalent
+    // to the .desktop file not existing at all".
     hidden: bool,
 }
 
-/// Read the `[Desktop Entry]` group of `text`, ignoring every other
-/// group: only the main group decides what an entry is and what it runs.
+// Read the `[Desktop Entry]` group of `text`, ignoring every other
+// group: only the main group decides what an entry is and what it runs.
 fn head(text: &str) -> Head<'_> {
     let mut found = Head {
         exec: None,
@@ -103,7 +99,6 @@ fn head(text: &str) -> Head<'_> {
     found
 }
 
-/// The lines of one group, without its header.
 fn group_lines<'a>(text: &'a str, group: &'a str) -> impl Iterator<Item = &'a str> {
     text.lines()
         .skip_while(move |l| header(l) != Some(group))
@@ -111,19 +106,17 @@ fn group_lines<'a>(text: &'a str, group: &'a str) -> impl Iterator<Item = &'a st
         .take_while(|l| header(l).is_none())
 }
 
-/// The group a `[name]` line names, or `None` for any other line.
 fn header(line: &str) -> Option<&str> {
     line.strip_prefix('[')?.strip_suffix(']')
 }
 
-/// `key=value` split with the space the specification allows around the
-/// `=` removed. Comments and blank lines have no `=` and fall out here.
+// `key=value` split with the space the specification allows around the
+// `=` removed. Comments and blank lines have no `=` and fall out here.
 fn split_key(line: &str) -> Option<(&str, &str)> {
     let (key, value) = line.split_once('=')?;
     Some((key.trim_end(), value.trim_start()))
 }
 
-/// The part of a key before its `[locale]` suffix.
 fn base_key(key: &str) -> &str {
     key.split('[').next().unwrap_or(key)
 }
@@ -133,9 +126,8 @@ pub fn owner(text: &str) -> Option<&str> {
     head(text).marker
 }
 
-/// The program an `Exec` value runs, unquoted. Only the first argument is
-/// read, which is the one a launcher has to find on `PATH` before it will
-/// show the entry at all.
+// Only the first argument is read, which is the one a launcher has to
+// find on `PATH` before it will show the entry at all.
 fn exec_program(value: &str) -> Option<String> {
     let value = value.trim_start();
     if let Some(quoted) = value.strip_prefix('"') {
@@ -158,9 +150,9 @@ fn exec_program(value: &str) -> Option<String> {
     Some(word.to_owned())
 }
 
-/// `value` as one argument of an `Exec` value: quoted only where it holds
-/// a character the specification reserves, since a quoted argument is
-/// also where a field code would stop expanding.
+// `value` as one argument of an `Exec` value: quoted only where it holds
+// a character the specification reserves, since a quoted argument is
+// also where a field code would stop expanding.
 fn exec_quote(value: &str) -> String {
     const RESERVED: &[char] = &[
         ' ', '\t', '\n', '"', '\'', '\\', '>', '<', '~', '|', '&', ';', '$', '*', '?', '#', '(',
@@ -184,8 +176,8 @@ fn exec_quote(value: &str) -> String {
     out
 }
 
-/// The command basename an entry is looked up by: the first word of the
-/// instance's `command`, without its directory.
+// The command basename an entry is looked up by: the first word of the
+// instance's `command`, without its directory.
 fn command_name(config: &InstanceConfig) -> Option<&OsStr> {
     Path::new(config.command.as_ref()?.first()?).file_name()
 }
@@ -195,11 +187,9 @@ fn command_name(config: &InstanceConfig) -> Option<&OsStr> {
 /// the one entry whose `Exec` runs `<command>`.
 ///
 /// Entries bubbler generated are never a source; neither are entries a
-/// launcher does not display, which is what an application's
-/// MIME-handler-only entries are — a `desktop` node excepted, since that
-/// is the user naming the file. Two candidates are an error rather than a
-/// guess: `lutris` matches its own entry and its URL handler, and only
-/// the user knows which one the instance is for.
+/// launcher does not display — a `desktop` node excepted, since that is
+/// the user naming the file. Two candidates are an error rather than a
+/// guess.
 pub fn source(dirs: &Dirs, name: &str, config: &InstanceConfig) -> Result<PathBuf, DesktopError> {
     if let Some(hint) = &config.desktop {
         return find(dirs, OsStr::new(hint), false).ok_or_else(|| DesktopError::HintNotFound {
@@ -230,12 +220,10 @@ pub fn source(dirs: &Dirs, name: &str, config: &InstanceConfig) -> Result<PathBu
     }
 }
 
-/// The first directory holding `file` as an entry bubbler did not write.
-/// With `shown`, an entry a launcher does not display is passed over as
-/// well, which is what the `<command>.desktop` step wants: a name that
-/// happens to match a MIME-handler-only entry is the same wrong answer
-/// there as in the scan. A `desktop` hint sets it false, because that is
-/// the user naming the file they mean.
+// The first directory holding `file` as an entry bubbler did not write.
+// With `shown`, an entry a launcher does not display is passed over as
+// well. A `desktop` hint sets it false, because that is the user naming
+// the file they mean.
 fn find(dirs: &Dirs, file: &OsStr, shown: bool) -> Option<PathBuf> {
     dirs.lookup().map(|d| d.join(file)).find(|p| {
         std::fs::read_to_string(p).is_ok_and(|t| {
@@ -245,9 +233,9 @@ fn find(dirs: &Dirs, file: &OsStr, shown: bool) -> Option<PathBuf> {
     })
 }
 
-/// Every entry whose `Exec` runs `command`, in lookup order, one per file
-/// name: a user's own copy of an entry shadows the system's, the way a
-/// launcher resolves it.
+// Every entry whose `Exec` runs `command`, in lookup order, one per file
+// name: a user's own copy of an entry shadows the system's, the way a
+// launcher resolves it.
 fn scan(dirs: &Dirs, command: &OsStr) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = Vec::new();
     for dir in dirs.lookup() {
@@ -283,8 +271,8 @@ fn scan(dirs: &Dirs, command: &OsStr) -> Vec<PathBuf> {
     found
 }
 
-/// Which of the keys bubbler owns the source's `[Desktop Entry]` group
-/// already carries, and therefore which are rewritten rather than added.
+// Which of the keys bubbler owns the source's `[Desktop Entry]` group
+// already carries, and therefore which are rewritten rather than added.
 #[derive(Default)]
 struct Present {
     try_exec: bool,
@@ -294,11 +282,7 @@ struct Present {
 /// The generated entry's text: `text` with `Name`, `Exec`, `TryExec`,
 /// `DBusActivatable` and the marker key changed and nothing else touched.
 ///
-/// `program` is what the entry calls to reach bubbler. Every `Exec`,
-/// including each `[Desktop Action]`'s, becomes `<program> open
-/// <instance> -- <the vendor's own command line>`, so field codes stay
-/// where the vendor put them: they expand at the tail, which is where
-/// `bubbler open` collects the command.
+/// `program` is what the entry calls to reach bubbler.
 pub fn patch(text: &str, instance: &str, program: &Path) -> Result<String, DesktopError> {
     if let Some(owner) = owner(text) {
         return Err(DesktopError::Generated(owner.to_owned()));
@@ -377,10 +361,9 @@ pub fn patch(text: &str, instance: &str, program: &Path) -> Result<String, Deskt
     Ok(text)
 }
 
-/// Put the keys bubbler adds at the end of the `[Desktop Entry]` group's
-/// own lines, before the blank lines the vendor left between it and what
-/// follows: a key written after that separator reads as the next group's,
-/// and the blank line is the vendor's layout, which is copied through.
+// Put the keys bubbler adds at the end of the `[Desktop Entry]` group's
+// own lines, before the blank lines the vendor left between it and what
+// follows: a key written after that separator reads as the next group's.
 fn push_added(out: &mut Vec<String>, present: &Present, instance: &str, program: &str, eol: &str) {
     let at = out
         .iter()
@@ -389,13 +372,10 @@ fn push_added(out: &mut Vec<String>, present: &Present, instance: &str, program:
     out.splice(at..at, added(present, instance, program, eol));
 }
 
-/// The keys the source did not carry, written at the end of its
-/// `[Desktop Entry]` group.
-///
-/// `DBusActivatable=true` is set to `false` rather than dropped, and
-/// added where it was absent, because a launcher that understands the key
-/// ignores `Exec` entirely and asks the session bus to start the
-/// application — outside the sandbox, with nothing printed anywhere.
+// `DBusActivatable=true` is set to `false` rather than dropped, and
+// added where it was absent, because a launcher that understands the key
+// ignores `Exec` entirely and asks the session bus to start the
+// application — outside the sandbox, with nothing printed anywhere.
 fn added(present: &Present, instance: &str, program: &str, eol: &str) -> Vec<String> {
     let mut lines = Vec::new();
     if !present.try_exec {
@@ -528,8 +508,8 @@ pub fn program(exe: &Path, search_path: &[PathBuf]) -> PathBuf {
     }
 }
 
-/// Whether `path` is a file a `PATH` search would run: a name without an
-/// execute bit is one the search passes over.
+// Whether `path` is a file a `PATH` search would run: a name without an
+// execute bit is one the search passes over.
 fn executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
@@ -537,9 +517,7 @@ fn executable(path: &Path) -> bool {
 
 /// What `desktop-file-validate` calls an error in the entry at `path`,
 /// empty when it is installed and content with the file, and empty when
-/// it is not installed at all. Its hints and warnings are left out: they
-/// are about the application's own file, which bubbler copied and is not
-/// in a position to fix.
+/// it is not installed at all. Its hints and warnings are left out.
 pub fn validate(path: &Path) -> Vec<String> {
     let Ok(out) = Command::new("desktop-file-validate").arg(path).output() else {
         return Vec::new();
