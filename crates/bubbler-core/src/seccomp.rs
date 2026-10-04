@@ -72,8 +72,9 @@ pub const DEFAULT_EPERM: &[&str] = &[
 pub const SINGLE_ARCH_EPERM: &[&str] = &["modify_ldt"];
 
 /// Syscalls the default filter answers with `ENOSYS`, so libc falls back
-/// to the older call instead of failing. An application whose user namespaces
-/// are not disabled gets the mount API back ([`MOUNT_API`]); sidecars never do.
+/// to the older call instead of failing. An application whose user
+/// namespaces are not disabled gets the mount API back ([`MOUNT_API`]);
+/// sidecars never do.
 pub const DEFAULT_ENOSYS: &[&str] = &[
     "clone3",
     "open_tree",
@@ -85,15 +86,16 @@ pub const DEFAULT_ENOSYS: &[&str] = &[
 ];
 
 /// Syscalls answered with `ENOSYS` by *number*, because libseccomp 2.6.0
-/// has no name for them. Numbers from `asm/unistd_64.h`. These three rules
-/// hold for the build architecture alone.
+/// has no name for them. Numbers from `asm/unistd_64.h`. These three
+/// rules hold for the build architecture alone.
 // The mount-API class this closes is CVE-2021-41133; flatpak carries the
 // same numbers in `flatpak-syscalls-private.h`.
 pub const DEFAULT_ENOSYS_NUMBERED: &[(&str, i32)] =
     &[("open_tree_attr", 467), ("listns", 470), ("fchroot", 472)];
 
-/// The mount-API rules of [`DEFAULT_ENOSYS`] and [`DEFAULT_ENOSYS_NUMBERED`]
-/// that an application which may start a sandbox of its own is spared.
+/// The mount-API rules of [`DEFAULT_ENOSYS`] and
+/// [`DEFAULT_ENOSYS_NUMBERED`] that an application which may start a
+/// sandbox of its own is spared.
 pub const MOUNT_API: &[&str] = &[
     "open_tree",
     "move_mount",
@@ -122,8 +124,9 @@ pub const TIOCSTI: u32 = 0x5412;
 /// `asm-generic/ioctls.h`.
 pub const TIOCLINUX: u32 = 0x541C;
 
-// x32 is deliberately not among the extra architectures: it shares x86_64's
-// `AUDIT_ARCH` value, and libseccomp's own guard denies its numbers.
+// x32 is deliberately not among the extra architectures: it shares
+// x86_64's `AUDIT_ARCH` value, and libseccomp's own guard denies its
+// numbers.
 #[cfg(target_arch = "x86_64")]
 const EXTRA_ARCHES: &[ScmpArch] = &[ScmpArch::X86];
 #[cfg(not(target_arch = "x86_64"))]
@@ -197,7 +200,10 @@ pub struct RuleSet {
     /// Syscall names denied with `ENOSYS`.
     pub enosys: Vec<String>,
     /// Syscalls denied by number, each with the name a profile names it
-    /// by and the errno it currently returns.
+    /// by and the errno it currently returns. `deny` of one of these
+    /// names moves its errno here rather than pushing the bare name into
+    /// `eperm` or `enosys`, since libseccomp cannot resolve it by name
+    /// either way.
     pub enosys_numbered: Vec<(String, i32, Errno)>,
     /// `ioctl` request numbers denied with `EPERM`, matched on the low 32
     /// bits of argument 1.
@@ -239,9 +245,11 @@ impl RuleSet {
         set
     }
 
-    /// The application's set — [`Self::default_set`] less [`MOUNT_API`] unless `userns` is
-    /// disabled — with `cfg`'s allows removed and its denies appended, or `None` when the profile
-    /// disabled the filter. Naming `ioctl` in either list drops the [`DEFAULT_IOCTL_EPERM`] rules.
+    /// The application's set — [`Self::default_set`] less [`MOUNT_API`]
+    /// unless `userns` is disabled — with `cfg`'s allows removed
+    /// and its denies appended, or `None` when the profile disabled the
+    /// filter. Naming `ioctl` in either list drops the
+    /// [`DEFAULT_IOCTL_EPERM`] rules.
     pub fn with(cfg: &SeccompConfig, userns: Userns) -> Option<Self> {
         if cfg.disable {
             return None;
@@ -264,12 +272,15 @@ impl RuleSet {
             // the name was on, and keeps a repeated `deny` from doubling.
             set.remove(name);
             if name == "ioctl" {
-                // A rule matching every request subsumes the two that match one each; keeping both
-                // would put `ioctl` in the filter twice with two different actions.
+                // A rule matching every request subsumes the two that
+                // match one each; keeping both would put `ioctl` in the
+                // filter twice with two different actions.
                 set.ioctl_eperm.clear();
             }
-            // A numbered name has no name libseccomp resolves, so pushing it into `eperm`/`enosys`
-            // like every other `deny` would only leave it unresolvable and skipped.
+            // A numbered name has no name libseccomp resolves, so pushing
+            // it into `eperm`/`enosys` like every other `deny` would only
+            // leave it unresolvable and skipped — fully allowed instead
+            // of denied.
             if let Some((_, nr)) = DEFAULT_ENOSYS_NUMBERED.iter().find(|(n, _)| n == name) {
                 set.enosys_numbered.push((name.clone(), *nr, *errno));
                 continue;
@@ -289,8 +300,9 @@ impl RuleSet {
     }
 }
 
-// Mask applied to `ioctl`'s request argument, so the rule looks at the low 32 bits — the same
-// half the kernel hands the driver, which makes a request of `0x1_0000_5412` TIOCSTI to both.
+// Mask applied to `ioctl`'s request argument, so the rule looks at the
+// low 32 bits — the same half the kernel hands the driver, which makes a
+// request of `0x1_0000_5412` TIOCSTI to both.
 const REQUEST_MASK: u64 = 0xFFFF_FFFF;
 
 // Set once a compile has named its skipped rules. Which names those are
@@ -308,11 +320,13 @@ struct Built {
     skipped: Vec<String>,
 }
 
-/// The rule set as one loadable BPF program for `--add-seccomp-fd`, or `None` when no rule went
-/// in. Everything not named is allowed, and `log` turns matches into audit log entries instead of
-/// errors.
+/// The rule set as one loadable BPF program for `--add-seccomp-fd`, or
+/// `None` when no rule went in. Everything not named is allowed, and
+/// `log` turns matches into audit log entries instead of errors.
 pub fn compile(set: &RuleSet, log: bool) -> Result<Option<Program>, LaunchError> {
     let built = build(set, log)?;
+    // A skipped name is a rule that is not in the filter, so it is
+    // reported whatever the log switch says.
     if take_note(&built.skipped, &NOTED) {
         for name in &built.skipped {
             eprintln!("bubbler: seccomp: {name} unknown to this libseccomp, rule skipped");
@@ -321,8 +335,9 @@ pub fn compile(set: &RuleSet, log: bool) -> Result<Option<Program>, LaunchError>
     if built.rules == 0 {
         return Ok(None);
     }
-    // The prefix goes out only together with libseccomp's program: it ends by falling into
-    // libseccomp's first instruction, so on its own it is not a filter the kernel would accept.
+    // The prefix goes out only together with libseccomp's program: it
+    // ends by falling into libseccomp's first instruction, so on its own
+    // it is not a filter the kernel would accept.
     let mut bytes = match set.personality {
         true => personality_prefix(log),
         false => Vec::new(),
@@ -334,8 +349,9 @@ pub fn compile(set: &RuleSet, log: bool) -> Result<Option<Program>, LaunchError>
     }))
 }
 
-// A syscall appears once even if both lists carry it: libseccomp refuses a second action for
-// the same number, and the first list `RuleSet` puts it on decides.
+// A syscall appears once even if both lists carry it: libseccomp refuses
+// a second action for the same number, and the first list `RuleSet` puts
+// it on decides.
 fn build(set: &RuleSet, log: bool) -> Result<Built, LaunchError> {
     let mut filter = ScmpFilterContext::new(ScmpAction::Allow).map_err(failed)?;
     // A syscall from an ABI the filter does not carry cannot be matched
@@ -344,8 +360,9 @@ fn build(set: &RuleSet, log: bool) -> Result<Built, LaunchError> {
         .set_act_badarch(ScmpAction::KillProcess)
         .map_err(failed)?;
     let mut seen: BTreeSet<i32> = BTreeSet::new();
-    // Before the architectures on purpose: `man 3 seccomp_arch_add` says a rule added before an
-    // architecture does not reach it, and that is the only way these three go in at all.
+    // Before the architectures on purpose: `man 3 seccomp_arch_add` says
+    // a rule added before an architecture does not reach it, and that is
+    // the only way these three go in at all.
     for (_, nr, errno) in &set.enosys_numbered {
         let nr = ScmpSyscall::from(*nr);
         if !seen.insert(nr.into()) {
@@ -353,8 +370,9 @@ fn build(set: &RuleSet, log: bool) -> Result<Built, LaunchError> {
         }
         filter.add_rule(action(log, *errno), nr).map_err(failed)?;
     }
-    // `man 3 seccomp_arch_add`: rules added after an architecture is added reach every architecture
-    // in the filter, and rules added before it do not. So the architectures come first.
+    // `man 3 seccomp_arch_add`: rules added after an architecture is
+    // added reach every architecture in the filter, and rules added
+    // before it do not. So the architectures come first.
     for arch in EXTRA_ARCHES {
         filter.add_arch(*arch).map_err(failed)?;
     }
@@ -410,8 +428,9 @@ fn action(log: bool, errno: Errno) -> ScmpAction {
     }
 }
 
-// libseccomp writes cBPF to a file descriptor, so it goes through a memfd rather than a
-// temporary file; `export_bpf_mem` would do it in one call but needs libseccomp 2.6.
+// libseccomp writes cBPF to a file descriptor, so it goes through a memfd
+// rather than a temporary file; `export_bpf_mem` would do it in one call
+// but needs libseccomp 2.6.
 fn export(filter: &ScmpFilterContext) -> Result<Vec<u8>, LaunchError> {
     let io = |e: std::io::Error| LaunchError::Seccomp(format!("exporting the filter: {e}"));
     let fd = rustix::fs::memfd_create("bubbler-seccomp", MemfdFlags::CLOEXEC)
@@ -456,7 +475,9 @@ fn insn(code: u16, jt: u8, jf: u8, k: u32) -> [u8; 8] {
 
 /// A cBPF block that returns `EPERM` (or logs) for `personality` with an
 /// argument outside [`PERSONALITY_ALLOWED`] and otherwise falls off its
-/// end, so it can be placed before libseccomp's program.
+/// end, so it can be placed before libseccomp's program: cBPF jumps are
+/// relative and forward, so a block whose last instruction jumps to the
+/// one after it is a prefix of any program.
 ///
 /// Offsets are `struct seccomp_data` from `linux/seccomp.h`: `nr` 0,
 /// `arch` 4, `args[0]` 16, of which the low word is what the kernel
@@ -491,10 +512,11 @@ fn failed(e: SeccompError) -> LaunchError {
     LaunchError::Seccomp(e.to_string())
 }
 
-/// The number libseccomp resolves `name` to on the build architecture, or `None` when this
-/// libseccomp does not know the name at all. A syscall the build architecture does not itself
-/// have answers with a negative pseudo-number that still names a real rule on the other
-/// architectures in the filter.
+/// The number libseccomp resolves `name` to on the build architecture, or
+/// `None` when this libseccomp does not know the name at all. A syscall
+/// the build architecture does not itself have answers with a negative
+/// pseudo-number that still names a real rule on the other architectures
+/// in the filter, so only the sign of the answer tells the two apart.
 pub fn syscall_number(name: &str) -> Option<i64> {
     ScmpSyscall::from_name(name)
         .ok()

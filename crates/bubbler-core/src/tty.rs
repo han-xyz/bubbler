@@ -41,9 +41,12 @@ const NOW: Timespec = Timespec {
 // status arrives.
 const DRAIN: Duration = Duration::from_millis(200);
 
-// A terminal frees its write room a buffer at a time, so `write` keeps failing for a while with
-// nothing wrong: measured here, a pty read 256 bytes at a time refuses for 2.0 s at 5 reads a
-// second and 4.5 s at 2, so a second of it means nothing and five is the first length that does.
+// How long a destination that is taking nothing at all is still waited
+// for before what is left is given up on. A terminal frees its write
+// room a buffer at a time, so `write` keeps failing for a while with
+// nothing wrong: measured here, a pty read 256 bytes at a time refuses
+// for 2.0 s at 5 reads a second and 4.5 s at 2, so a second of it means
+// nothing and five is the first length that does.
 const STALL: Duration = Duration::from_secs(5);
 
 // The whole of what handing over one destination's last output may
@@ -55,11 +58,15 @@ const FLUSH_MAX: Duration = Duration::from_secs(10);
 const HURRY: Duration = Duration::from_millis(200);
 
 // How much output may wait for a host terminal that is not taking it.
+// Once this much is held the sandbox's side is left unread, so its pty
+// or pipe fills and it blocks in its own `write`: output is slowed to
+// the speed of the terminal, never dropped.
 const PENDING_MAX: usize = 64 * 1024;
 
-// How much may wait once the command's status is in hand. Holding back is pointless from then
-// on — nothing can reach the pty or the pipe any more — and what the kernel still buffers there,
-// itself capped, is the end of the output the user asked for.
+// How much may wait once the command's status is in hand. Holding back
+// is pointless from then on — nothing can reach the pty or the pipe any
+// more — and what the kernel still buffers there, itself capped, is the
+// end of the output the user asked for.
 const DRAIN_MAX: usize = 2 * PENDING_MAX;
 
 // `^]`, the detach key.
@@ -175,8 +182,10 @@ pub fn null_stdio() -> Result<OwnedFd, LaunchError> {
 }
 
 /// bubbler's own fds 0, 1 and 2, duplicated so a plan can index them by
-/// number. A descriptor the process was started without stands in as
-/// `/dev/null`, so a plan can assume all three exist.
+/// number. The copies are `CLOEXEC`: what the sandbox gets is decided by
+/// the plan, never inherited by accident. A descriptor the process was
+/// started without stands in as `/dev/null`, so a plan can assume all
+/// three exist.
 pub fn host_stdio() -> Result<[OwnedFd; 3], LaunchError> {
     let (i, o, e) = (std::io::stdin(), std::io::stdout(), std::io::stderr());
     let dup = |fd: BorrowedFd<'_>| match fd.try_clone_to_owned() {
@@ -192,7 +201,8 @@ pub fn host_stdio() -> Result<[OwnedFd; 3], LaunchError> {
 pub const FD_NAMES: [&str; 3] = ["stdin", "stdout", "stderr"];
 
 /// Which of bubbler's fds the pty's output goes back out on: the first of
-/// 1, 2 and 0 the pty stands in for. `None` when there is no pty, or when
+/// 1, 2 and 0 the pty stands in for, so output still reaches the terminal
+/// when stdout alone is redirected. `None` when there is no pty, or when
 /// the only candidate is a terminal opened read-only.
 pub fn output_fd(plan: &StdioPlan, host: &[OwnedFd; 3]) -> Option<usize> {
     [1, 2, 0]
@@ -200,8 +210,8 @@ pub fn output_fd(plan: &StdioPlan, host: &[OwnedFd; 3]) -> Option<usize> {
         .find(|i| plan.fds[*i] == StdioTarget::Slave && writable(host[*i].as_fd()))
 }
 
-// An fd whose access mode cannot be
-// read is taken as unusable, which only costs it its turn as the output.
+// An fd whose access mode cannot be read is taken as unusable, which only
+// costs it its turn as the output.
 fn writable(fd: BorrowedFd<'_>) -> bool {
     fcntl_getfl(fd).is_ok_and(|f| f & OFlags::ACCMODE != OFlags::RDONLY)
 }
@@ -292,6 +302,8 @@ pub enum RelayEnd {
     Detached,
 }
 
+// Escapes are held back until the run either completes or cannot, so a
+// `^]` the user meant for the app still arrives, just late.
 struct Escape {
     held: usize,
     since: Option<Instant>,
@@ -353,6 +365,8 @@ struct Unblocked<'a> {
 
 // Whether `fd` has an offset of its own, which a second description of
 // it would not share: it would write from 0 over what is already there.
+// True of the two seekable kinds a descriptor can be open on, and both
+// of them take a write without ever blocking on a reader.
 fn seekable(fd: BorrowedFd<'_>) -> bool {
     rustix::fs::fstat(fd).is_ok_and(|stat| {
         matches!(
@@ -362,9 +376,11 @@ fn seekable(fd: BorrowedFd<'_>) -> bool {
     })
 }
 
-// A second description of what `fd` is open on, non-blocking and held by nobody else, or `None`
-// when there can be none: a socket has no such description, a [`seekable`] one would start over
-// at offset 0, and a descriptor that is not already writable would gain an access it was denied.
+// A second description of what `fd` is open on, non-blocking and held by
+// nobody else, or `None` when there can be none: a socket has no such
+// description, a [`seekable`] one would start over at offset 0, and a
+// descriptor that is not already writable would gain an access it was
+// denied.
 fn reopen(fd: BorrowedFd<'_>) -> Option<OwnedFd> {
     if !writable(fd) || seekable(fd) {
         return None;
@@ -382,8 +398,8 @@ fn reopen(fd: BorrowedFd<'_>) -> Option<OwnedFd> {
 }
 
 /// Where a run's warnings go while it waits: a description of fd 2 that
-/// only bubbler holds, non-blocking, opened once when the wait starts.
-/// A warning that will not go through at once is dropped.
+/// only bubbler holds, non-blocking, opened once when the wait starts. A
+/// warning that will not go through at once is dropped.
 pub(crate) struct Warn {
     fd: Option<OwnedFd>,
     // Whether `fd` is a description bubbler opened for itself, and so
@@ -407,7 +423,8 @@ impl Warn {
                 own: true,
             },
             // A seekable fd 2 (`2> log`), a socket, or a terminal on a
-            // system without `/proc`. Its flags stay exactly as the caller left them.
+            // system without `/proc`. Its flags stay exactly as the
+            // caller left them.
             None => Self {
                 fd: Some(dup),
                 own: false,
@@ -424,9 +441,10 @@ impl Warn {
             let _ = write(fd, msg.as_bytes());
             return;
         }
-        // fd 2 as the caller left it: making it non-blocking would make it non-blocking for the
-        // shell that shares the description, so instead a socket is told not to wait for this one
-        // message, which touches nothing...
+        // fd 2 as the caller left it: making it non-blocking would make
+        // it non-blocking for the shell that shares the description, so
+        // instead a socket is told not to wait for this one message,
+        // which touches nothing...
         match rustix::net::send(fd, msg.as_bytes(), SendFlags::DONTWAIT) {
             Err(Errno::NOTSOCK) => {}
             _ => return,
@@ -617,10 +635,14 @@ pub struct Caught<'a> {
     pub stop: &'a AtomicBool,
 }
 
-/// Carry bytes between the user's terminal and the sandbox's pty until `until` reports an exit or
-/// the user detaches. Every `caught.winch` is answered by copying `host_out`'s size onto the pty,
-/// so `host_out` must be the user's terminal. Output `host_out` refuses goes to `sink` instead,
-/// which must be a descriptor that always accepts it ([`null_stdio`]).
+/// Carry bytes between the user's terminal and the sandbox's pty until
+/// `until` reports an exit or the user detaches. Every `caught.winch` is
+/// answered by copying `host_out`'s size onto the pty, so `host_out` must
+/// be the user's terminal. Output `host_out` refuses goes to `sink`
+/// instead, which must be a descriptor that always accepts it
+/// ([`null_stdio`]). What the pty still holds when the command's status
+/// arrives is read out too, and handed over before this returns unless
+/// `caught.stop` says the user is waiting for bubbler to be gone.
 pub fn relay(
     master: BorrowedFd<'_>,
     host_in: Option<BorrowedFd<'_>>,
@@ -726,8 +748,10 @@ pub fn relay(
         if reading && revents.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR) {
             match read(master, &mut buf) {
                 Ok(0) => reading = false,
-                // A terminal that cannot take the output — closed, gone, or opened read-only —
-                // costs the output its destination, never the run.
+                // A terminal that cannot take the output — closed, gone,
+                // or opened read-only — costs the output its destination,
+                // never the run: the command is still going, its status is
+                // still due, and its pty must go on being emptied.
                 Ok(n) => {
                     out.push(&buf[..n]);
                     out.flush();
@@ -741,8 +765,8 @@ pub fn relay(
     }
 }
 
-// `reading` says whether the master is worth reading at all. Nothing here is worth failing a
-// finished run over, so every error just ends it.
+// `reading` says whether the master is worth reading at all. Nothing here
+// is worth failing a finished run over, so every error just ends it.
 fn drain(master: BorrowedFd<'_>, out: &mut Out<'_>, mut reading: bool, stop: &AtomicBool) {
     out.relax();
     let deadline = Instant::now() + DRAIN;
@@ -780,13 +804,19 @@ fn drain(master: BorrowedFd<'_>, out: &mut Out<'_>, mut reading: bool, stop: &At
         }
     }
     // The deadline bounds how long more is read out of the pty, never
-    // what has already been read.
+    // what has already been read: that is the end of the command's
+    // output, and it is handed over for as long as the host is taking it
+    // and the user is not waiting.
     out.finish(stop, Instant::now() + FLUSH_MAX);
 }
 
-/// Copy each pipe to the fd next to it until `until` reports an exit and the pipes have run dry,
-/// or 200 ms after that at the latest. A destination that stops taking output is replaced by
-/// `sink`.
+/// Copy each pipe to the fd next to it until `until` reports an exit and
+/// the pipes have run dry, or 200 ms after that at the latest. This is
+/// the whole relay for a sandbox with no terminal: same poll loop, no
+/// threads, and nothing that can hand the sandbox a terminal fd. A
+/// destination that stops taking output is replaced by `sink`. What the
+/// pipes hold when the status arrives is handed over as in the relay, and
+/// `stop` cuts that short the same way.
 pub fn pump(
     pipes: &[(BorrowedFd<'_>, BorrowedFd<'_>, &str)],
     sink: BorrowedFd<'_>,
@@ -877,8 +907,8 @@ pub fn pump(
     }
 }
 
-// `VEOF` is only acted on in canonical mode, so a
-// reader that turned `ICANON` off would just receive a stray byte.
+// `VEOF` is only acted on in canonical mode, so a reader that turned
+// `ICANON` off would just receive a stray byte.
 fn eof_char(master: BorrowedFd<'_>) -> Option<u8> {
     let settings = tcgetattr(master).ok()?;
     settings
@@ -887,7 +917,7 @@ fn eof_char(master: BorrowedFd<'_>) -> Option<u8> {
         .then(|| settings.special_codes[SpecialCodeIndex::VEOF])
 }
 
-// The kernel then raises
+// Copy the host terminal's size onto the pty. The kernel then raises
 // `SIGWINCH` for the pty's foreground process group inside the sandbox.
 fn resize(master: BorrowedFd<'_>, host: BorrowedFd<'_>) {
     if let Ok(size) = tcgetwinsize(host) {
@@ -897,8 +927,10 @@ fn resize(master: BorrowedFd<'_>, host: BorrowedFd<'_>) {
     }
 }
 
-// Reading the sandbox side has to go on either way — a pty or a pipe
-// nobody empties fills up, and the command blocks in `write` forever.
+// `false` when `dest` already was the sink: there is nowhere left to put
+// the output, and the copy stops. Reading the sandbox side has to go on
+// either way — a pty or a pipe nobody empties fills up, and the command
+// blocks in `write` forever.
 fn redirect<'a>(
     dest: &mut BorrowedFd<'a>,
     sink: BorrowedFd<'a>,
@@ -909,8 +941,9 @@ fn redirect<'a>(
     if dest.as_raw_fd() == sink.as_raw_fd() {
         return false;
     }
-    // Truncated output is worth a word, and a warning that cannot be written either (the
-    // terminal is what just failed) is nothing to act on.
+    // Truncated output is worth a word, and a warning that cannot be
+    // written either (the terminal is what just failed) is nothing to act
+    // on.
     warn.say(&format!(
         "bubbler: output to {what} failed: {}; discarding further output\n",
         std::io::Error::from(e)

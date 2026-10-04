@@ -5,10 +5,9 @@
 //! Outbound filtering lives here too: `outbound "deny"` turns the
 //! `allow-out` children into the nftables ruleset the launcher installs
 //! in the sandbox's own network namespace. Rules are generated from
-//! typed values and from nothing else.
-//!
-//! pasta's own defaults are wrong for a sandbox, which is why every
-//! invocation here carries the same six `none` values.
+//! typed values and from nothing else — an address that reached `nft -f
+//! -` as a string would be command injection into a process holding
+//! `CAP_NET_ADMIN` over the sandbox's namespaces.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -29,20 +28,22 @@ pub const PASTA_BIN: &str = "pasta";
 /// the one pasta translates to the host's nameserver.
 pub const DNS_FORWARD: IpAddr = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1));
 
-// The port a resolver is queried on, which is the one port an `allow-host` takes away from the
-// application: only the proxy's cgroup may reach it.
+// The port a resolver is queried on, which is the one port an
+// `allow-host` takes away from the application: only the proxy's cgroup
+// may reach it.
 const DNS_PORT: u16 = 53;
 
-// Only the host itself, never the LAN: the node says the host may reach a port of the sandbox,
-// and pasta's own default of every address would say rather more.
+// Only the host itself, never the LAN: the node says the host may reach a
+// port of the sandbox, and pasta's own default of every address would say
+// rather more.
 const FORWARD_ADDRESS: &str = "127.0.0.1";
 
 /// Which network namespace the sandbox runs in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
     /// The sandbox's own namespace, connected to the outside by a pasta
-    /// sidecar: its own loopback, none of the host's abstract unix sockets
-    /// and no LAN broadcast.
+    /// sidecar: its own loopback, none of the host's abstract unix
+    /// sockets and no LAN broadcast.
     #[default]
     Isolated,
     /// The host's own namespace (`--share-net`): every service on the
@@ -216,8 +217,9 @@ impl FromStr for Cidr {
         let addr = IpAddr::from_str(addr).map_err(|_| {
             bad("expects an address or a prefix, such as \"1.1.1.1\" or \"140.82.112.0/20\"")
         })?;
-        // An IPv4-mapped address is an IPv4 destination wearing IPv6 notation: the packet leaves
-        // as IPv4 and an `ip6 daddr` rule never matches it, so the rule would be silently inert.
+        // An IPv4-mapped address is an IPv4 destination wearing IPv6
+        // notation: the packet leaves as IPv4 and an `ip6 daddr` rule
+        // never matches it, so the rule would be silently inert.
         if let IpAddr::V6(v6) = addr
             && v6.to_ipv4_mapped().is_some()
         {
@@ -328,8 +330,14 @@ impl fmt::Display for AllowHost {
     }
 }
 
-/// The egress proxy's cgroup, as the nftables `socket cgroupv2` match names it, and the one
-/// thing the ruleset accepts once an `allow-host` is in play.
+/// The egress proxy's cgroup, as the nftables `socket cgroupv2` match
+/// names it, and the one thing the ruleset accepts once an `allow-host`
+/// is in play.
+///
+/// The match resolves the path to a cgroup id when `nft` reads the rule,
+/// so the directory has to exist before the ruleset is installed and to
+/// live as long as the sandbox: a cgroup created afterwards matches
+/// nothing.
 ///
 /// The fields are private and [`Cgroup::new`] is the only way to one, so
 /// the [`fmt::Display`] below cannot be reached with a path no rule
@@ -439,25 +447,25 @@ pub fn net_proxy_program(env: &Env, host: &dyn Host) -> Result<(PathBuf, Found),
 /// namespace: a host path of bubbler's own resolves to nothing in
 /// there.
 ///
-/// Bound whatever the binary is and wherever it came from, so
-/// the argv the launcher builds and the one `--explain` prints name the
-/// same program.
+/// Bound whatever the binary is and wherever it came from, so the argv
+/// the launcher builds and the one `--explain` prints name the same
+/// program.
 pub const NET_PROXY_INSIDE: &str = "/run/bubbler-net-proxy";
 
 /// The loopback port the egress proxy listens on inside the sandbox.
 ///
 /// Fixed, and chosen by bubbler rather than by the proxy, because the
-/// seven variables that point the application at it are `--setenv`
-/// pairs of bwrap's argv.
+/// seven variables that point the application at it are `--setenv` pairs
+/// of bwrap's argv.
 pub const PROXY_PORT: u16 = 3128;
 
 /// The egress proxy's own argv, after the program name: what it may
 /// reach, which resolvers to ask, where it listens, and the descriptors
 /// it answers on.
 ///
-/// One place, so the process the launcher starts and the one
-/// `--explain` describes cannot drift apart. The proxy is spawned
-/// with one argument per `arg()` and never through a shell.
+/// One place, so the process the launcher starts and the one `--explain`
+/// describes cannot drift apart. The proxy is spawned with one argument
+/// per `arg()` and never through a shell.
 ///
 /// `log_tunnels` is [`crate::env::Env::net_proxy_log`]: without it the
 /// proxy writes its refusals and its own failures and nothing about the
@@ -580,12 +588,13 @@ pub fn resolv_conf(cfg: &NetworkConfig) -> Option<Vec<u8>> {
     Some(out.into_bytes())
 }
 
-// The one place that decides the nameservers, because the outbound ruleset has to accept exactly
-// these addresses.
+// The one place that decides the nameservers, because the outbound
+// ruleset has to accept exactly these addresses.
 fn resolvers(cfg: &NetworkConfig) -> Option<Vec<IpAddr>> {
     match (cfg.mode, cfg.dns.is_empty()) {
-        // Nothing to resolve with and nothing to resolve for: a `dns` child under `none` names a
-        // server no sandbox can reach, which is why the parser refuses one.
+        // Nothing to resolve with and nothing to resolve for: a `dns`
+        // child under `none` names a server no sandbox can reach, which
+        // is why the parser refuses one.
         (Mode::None, _) => None,
         (_, false) => Some(cfg.dns.clone()),
         (Mode::Isolated, true) => Some(vec![DNS_FORWARD]),
@@ -623,8 +632,9 @@ pub fn ruleset(cfg: &NetworkConfig, cgroup: Option<&Cgroup>) -> Option<String> {
         "oifname \"lo\" accept".to_owned(),
         "ct state established,related accept".to_owned(),
     ];
-    // Listed in nftables' own order, which is what `nft list ruleset` prints back. `no-ipv6` leaves
-    // the namespace no IPv6 address at all, and then the rule would match nothing.
+    // Listed in nftables' own order, which is what `nft list ruleset`
+    // prints back. `no-ipv6` leaves the namespace no IPv6 address at all,
+    // and then the rule would match nothing.
     if !cfg.no_ipv6 {
         rules.push(
             "icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, \
@@ -646,8 +656,9 @@ pub fn ruleset(cfg: &NetworkConfig, cgroup: Option<&Cgroup>) -> Option<String> {
         }
     }
     for allowed in &cfg.allow_out {
-        // A resolver named by address is still a resolver: under an `allow-host` it belongs to the
-        // proxy like the generated rules above.
+        // A resolver named by address is still a resolver: under an
+        // `allow-host` it belongs to the proxy like the generated rules
+        // above.
         let resolver = allowed.port == Some(DNS_PORT);
         for rule in allow_out_rules(allowed) {
             rules.push(match resolver {
@@ -656,8 +667,9 @@ pub fn ruleset(cfg: &NetworkConfig, cgroup: Option<&Cgroup>) -> Option<String> {
             });
         }
     }
-    // Last of the accepts: the proxy reaches whatever the names it was given resolve to, which is
-    // an address the config never wrote and no rule here could name.
+    // Last of the accepts: the proxy reaches whatever the names it was
+    // given resolve to, which is an address the config never wrote and
+    // no rule here could name.
     if let Some(m) = &gate {
         rules.push(format!("{m} accept"));
     }
@@ -698,9 +710,11 @@ pub const NFT_BIN: &str = "nft";
 /// so they are the caller's to keep valid until it has started.
 #[derive(Debug, Clone, Copy)]
 pub struct Attach<'a> {
-    /// The sandbox's user namespace. It must be the one that *owns* the network namespace, which
-    /// is not always the one `/proc/<child-pid>/ns/user` names by the time pasta looks. Handing
-    /// pasta a descriptor bubbler opened at `child-pid` time closes that race.
+    /// The sandbox's user namespace. It must be the one that *owns* the
+    /// network namespace, which is not always the one
+    /// `/proc/<child-pid>/ns/user` names by the time pasta looks. Handing
+    /// pasta a descriptor bubbler opened at `child-pid` time closes that
+    /// race.
     pub userns: &'a OsStr,
     /// Where pasta writes its own pid once the namespace is configured,
     /// which is what bubbler waits for. `pasta(1)`: "Write own PID to
@@ -734,8 +748,9 @@ pub fn pasta_argv(cfg: &NetworkConfig, at: Attach) -> Vec<OsString> {
         o("--map-guest-addr"),
         o("none"),
     ];
-    // A `dns` child names a server the sandbox reaches over the tap like any other address, and a
-    // translation rule for an address nothing points at is one more way into the host for no gain.
+    // A `dns` child names a server the sandbox reaches over the tap like
+    // any other address, and a translation rule for an address nothing
+    // points at is one more way into the host for no gain.
     if cfg.dns.is_empty() {
         argv.push(o("--dns-forward"));
         argv.push(OsString::from(DNS_FORWARD.to_string()));
@@ -751,9 +766,9 @@ pub fn pasta_argv(cfg: &NetworkConfig, at: Attach) -> Vec<OsString> {
     argv
 }
 
-// `pasta(1)` takes one address for the whole list, and a UDP list is always given even when it is
-// empty, since without it "UDP ports with numbers corresponding to forwarded TCP port numbers are
-// forwarded too".
+// `pasta(1)` takes one address for the whole list, and a UDP list is
+// always given even when it is empty, since without it "UDP ports with
+// numbers corresponding to forwarded TCP port numbers are forwarded too".
 fn forwards(cfg: &NetworkConfig, udp: bool) -> OsString {
     let ports: Vec<String> = cfg
         .forwards
