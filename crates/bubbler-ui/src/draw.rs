@@ -19,10 +19,10 @@ use crate::app::{App, Dialog, Screen, Viewer};
 use crate::detail::Detail;
 use crate::store::Row as InstanceRow;
 
-/// What one screen offers. Two lists because a footer that does not fit
-/// its terminal says nothing at all, and the full list is a screen of
-/// its own; the full one is pairs rather than one string so that `?` can
-/// lay it out in columns that keep a key beside what it does.
+// Two lists because a footer that does not fit its terminal says nothing
+// at all, and the full list is a screen of its own; the full one is pairs
+// rather than one string so that `?` can lay it out in columns that keep a
+// key beside what it does.
 struct Keys {
     screen: Screen,
     name: &'static str,
@@ -97,8 +97,8 @@ const KEYS: [Keys; 4] = [
     },
 ];
 
-/// Colour of a grant's row: the levels the catalogue draws, so an
-/// `outward` grant is visible before it is read.
+// Colour of a grant's row: the levels the catalogue draws, so an
+// `outward` grant is visible before it is read.
 fn risk_style(risk: Risk) -> Style {
     match risk {
         Risk::Narrow => Style::default(),
@@ -107,8 +107,8 @@ fn risk_style(risk: Risk) -> Style {
     }
 }
 
-/// One character that says the same thing as the colour, for a terminal
-/// with no colour and for a reader who cannot tell red from yellow.
+// One character that says the same thing as the colour, for a terminal
+// with no colour and for a reader who cannot tell red from yellow.
 fn risk_mark(risk: Risk) -> &'static str {
     match risk {
         Risk::Narrow => " ",
@@ -117,9 +117,9 @@ fn risk_mark(risk: Risk) -> &'static str {
     }
 }
 
-/// Text that came from a config, a lint message or a sandbox, made safe
-/// to put in a cell: the TUI writes its own cells, so nothing else
-/// renders the control characters in them ([`safe_text::sanitize`]).
+// Text that came from a config, a lint message or a sandbox, made safe
+// to put in a cell: the TUI writes its own cells, so nothing else
+// renders the control characters in them ([`safe_text::sanitize`]).
 fn safe(text: &str) -> String {
     safe_text::sanitize(text).into_owned()
 }
@@ -194,7 +194,6 @@ impl App {
     }
 }
 
-/// `1 instance`, `2 instances`.
 fn count(n: usize, what: &str) -> String {
     match n {
         1 => format!("1 {what}"),
@@ -202,8 +201,6 @@ fn count(n: usize, what: &str) -> String {
     }
 }
 
-/// The title line of the detail screen: what is being edited, what it
-/// came from and whether it is running.
 fn title(detail: &Detail) -> String {
     let mut title = safe(detail.name());
     if let Some(profile) = &detail.profile {
@@ -219,7 +216,6 @@ fn title(detail: &Detail) -> String {
     title
 }
 
-/// The instance list, or the one line that says how to make an instance.
 fn instances(app: &App, area: Rect, buf: &mut Buffer) {
     if app.store.rows.is_empty() {
         Paragraph::new(Text::from(vec![
@@ -271,15 +267,12 @@ fn instance_row(row: &InstanceRow) -> Row<'_> {
     ])
 }
 
-/// Columns a bordered pane spends on its own two edges.
 const BORDERS: usize = 2;
 
-/// Columns a row spends before its node text: the granted mark, the
-/// risk column, and a space either side of it.
+// Columns a row spends before its node text: the granted mark, the
+// risk column, and a space either side of it.
 const MARKS: usize = 5;
 
-/// The instance being edited: its grants on the left, what the selected
-/// one costs on the right.
 fn detail(detail: &Detail, area: Rect, buf: &mut Buffer) {
     let [banner, body] = Layout::vertical([
         Constraint::Length(u16::from(detail.live)),
@@ -295,10 +288,8 @@ fn detail(detail: &Detail, area: Rect, buf: &mut Buffer) {
     }
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(45), Constraint::Fill(1)]).areas(body);
-    // The mark and the risk column are what the eye runs down, so the
-    // width the border and those two leave is what the node text gets,
-    // and a node too wide is shortened rather than clipped by the pane:
-    // a clip takes off the `mode=` a share is read for.
+    // A node too wide is shortened rather than clipped by the pane: a clip
+    // takes off the `mode=` a share is read for.
     let room = usize::from(left.width).saturating_sub(BORDERS + MARKS);
     let items = detail.rows.iter().map(|row| {
         let grant = row.grant();
@@ -331,8 +322,6 @@ fn detail(detail: &Detail, area: Rect, buf: &mut Buffer) {
         .render(right, buf);
 }
 
-/// The right-hand pane: the catalogue entry for the selected node, then
-/// what the linter said about it.
 fn what_it_costs(detail: &Detail) -> Text<'static> {
     let mut lines = Vec::new();
     if let Some(trouble) = &detail.trouble {
@@ -394,7 +383,6 @@ fn what_it_costs(detail: &Detail) -> Text<'static> {
     Text::from(lines)
 }
 
-/// One finding as the two lines `bubbler lint` prints it in.
 fn finding_lines(finding: &Finding) -> Vec<Line<'static>> {
     vec![
         Line::styled(
@@ -413,7 +401,6 @@ fn finding_lines(finding: &Finding) -> Vec<Line<'static>> {
     ]
 }
 
-/// Every profile any layer holds, with the layer it resolves to.
 fn profiles(app: &App, area: Rect, buf: &mut Buffer) {
     if let Some(e) = &app.store.profile_error {
         Paragraph::new(Line::styled(
@@ -453,7 +440,6 @@ fn profiles(app: &App, area: Rect, buf: &mut Buffer) {
     StatefulWidget::render(table, area, buf, &mut state);
 }
 
-/// A report, an explanation or a log.
 fn viewer(viewer: &Viewer, area: Rect, buf: &mut Buffer) {
     let text = Text::from(
         viewer
@@ -469,10 +455,8 @@ fn viewer(viewer: &Viewer, area: Rect, buf: &mut Buffer) {
         .render(area, buf);
 }
 
-/// A hint split at the places a row may break: the spaces between its
-/// tokens, and never the ones inside a quoted token. `home-share
-/// "<path under $HOME>"` holds spaces of its own, and half of a path is
-/// the grammar of nothing.
+// A hint split at the places a row may break: the spaces between its
+// tokens, and never the ones inside a quoted token.
 fn tokens(hint: &str) -> Vec<&str> {
     let mut tokens = Vec::new();
     let mut quoted = false;
@@ -495,10 +479,8 @@ fn tokens(hint: &str) -> Vec<&str> {
     tokens
 }
 
-/// `hint` as rows no wider than `width`, filled a token at a time. A
-/// token wider than the row takes a row of its own rather than being
-/// cut in two; an empty hint is still one row, so a prompt keeps its
-/// shape.
+// A token wider than the row takes a row of its own rather than being
+// cut in two; an empty hint is still one row, so a prompt keeps its shape.
 fn wrapped(hint: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut rows: Vec<String> = Vec::new();
@@ -518,9 +500,8 @@ fn wrapped(hint: &str, width: usize) -> Vec<String> {
     rows
 }
 
-/// How tall a dialog stands: its border and what it holds. A prompt
-/// holds the field, a blank line, its grammar — as many rows as the
-/// width leaves it — and the line saying which key writes it.
+// A prompt holds the field, a blank line, its grammar — as many rows as
+// the width leaves it — and the line saying which key writes it.
 fn dialog_height(dialog: &Dialog, width: u16) -> u16 {
     match dialog {
         Dialog::Ask { hint, .. } => {
@@ -531,9 +512,6 @@ fn dialog_height(dialog: &Dialog, width: u16) -> u16 {
     }
 }
 
-/// Where a dialog goes: the middle of the screen, wide enough for a node
-/// and tall enough for the question, the field and every row of its
-/// grammar.
 fn dialog_area(dialog: &Dialog, area: Rect) -> Rect {
     let width = area.width.saturating_sub(4).clamp(20, 76);
     let height = dialog_height(dialog, width).min(area.height);
@@ -545,7 +523,6 @@ fn dialog_area(dialog: &Dialog, area: Rect) -> Rect {
     }
 }
 
-/// The prompt or the question over the screen.
 fn dialog(dialog: &Dialog, area: Rect, buf: &mut Buffer) {
     let area = dialog_area(dialog, area);
     Clear.render(area, buf);
@@ -605,12 +582,10 @@ pub fn cursor(app: &App, area: Rect) -> Option<Position> {
     })
 }
 
-/// One screen's keys as aligned columns, as wide as the overlay holds.
-/// Columns rather than one run-on line because wrapping a run-on line
-/// breaks wherever the width lands — between `D` and `desktop` at 100
-/// columns — and a key with someone else's description under it is
-/// worse than no list at all. No line starts with a space, so the
-/// paragraph's `trim` leaves the columns where they are.
+// Columns rather than one run-on line because wrapping a run-on line
+// breaks wherever the width lands, and a key with someone else's
+// description under it is worse than no list at all. No line starts with
+// a space, so the paragraph's `trim` leaves the columns where they are.
 fn key_grid(keys: &[(&str, &str)], width: u16) -> Vec<String> {
     const GAP: usize = 2;
     let key_width = keys
@@ -637,7 +612,6 @@ fn key_grid(keys: &[(&str, &str)], width: u16) -> Vec<String> {
         .collect()
 }
 
-/// Every key of every screen, over whatever is under it.
 fn help(area: Rect, buf: &mut Buffer) {
     let block = Block::bordered().title_top("keys");
     let inner = block.inner(area);
