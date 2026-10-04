@@ -640,6 +640,8 @@ that pins the socket, turns D-Bus support off and refuses `load-module`, which
 is how a pulse client would otherwise reach past the session manager's policy;
 your own `pipewire-pulse.conf.d` fragments are not copied, since a
 `server.address` in one of them would decide which socket the run serves.
+D-Bus support is off because the sidecar has no bus to reach and every
+module that wants one says so on bubbler's stderr otherwise.
 Bare, either grant is playback only. `microphone` on either node —
 `pipewire { microphone }`, `pulseaudio { microphone }` — adds capture: the
 grant is per instance, ORed into one set across both nodes and every
