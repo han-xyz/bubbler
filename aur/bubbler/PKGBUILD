@@ -2,7 +2,7 @@
 
 pkgbase=bubbler
 pkgname=(bubbler bubbler-ui)
-pkgver=0.26.0
+pkgver=0.26.1
 pkgrel=1
 pkgdesc='Application sandboxing on top of bubblewrap, with named instances, explicit resource grants, and a profile library'
 arch=(x86_64)
@@ -10,8 +10,8 @@ url='https://github.com/han-xyz/bubbler'
 license=(GPL-3.0-or-later)
 depends=('bubblewrap>=0.12.0' passt libseccomp libgcc glibc)
 makedepends=(cargo git)
-# git rev-parse v0.26.0 (the tag object, not the commit it points to)
-_tag=dae94064ce37536843fb0baadff4036289ff062f
+# git rev-parse v0.26.1 (the tag object, not the commit it points to)
+_tag=237e17ffb5042331d922c7e6127249032d7662a5
 source=("git+$url.git#tag=$_tag")
 sha256sums=(SKIP)
 
