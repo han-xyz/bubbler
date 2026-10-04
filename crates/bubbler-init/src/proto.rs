@@ -11,8 +11,8 @@ pub const MAX_REQUEST: usize = 1 << 20;
 /// controlling terminal. bubbler sets it only for a pty it allocated.
 pub const FLAG_CTTY: u32 = 1;
 
-/// Every flag bit this version knows; the rest must be zero, so an
-/// unrecognised request is refused rather than half honoured.
+// Every flag bit this version knows; the rest must be zero, so an
+// unrecognised request is refused rather than half honoured.
 const KNOWN_FLAGS: u32 = FLAG_CTTY;
 
 /// Malformed request bytes.
