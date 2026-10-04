@@ -773,6 +773,16 @@ and an `own` covering
 since the two host-bus calls above trust whoever owns `org.a11y.Bus` and
 `org.freedesktop.portal.Documents`. Across profile layers too.
 
+`xdg-dbus-proxy(1)` says a filtered name counts as "(at least) TALK" once
+the client has called it or received its broadcast; in practice that does not
+open the name to calls outside its `call` rules.
+Measured with xdg-dbus-proxy 0.1.9 on a private bus
+(`crates/bubbler-core/tests/real_dbus_proxy.rs`): after an allowed call and
+an allowed broadcast on one connection, a call to an interface or path the
+`call` rules do not name is still refused, by the well-known name and by
+the owner's unique name, and with the `portals` rules `ScreenCast` stays
+refused after a `Settings` call and signal.
+
 **Does not defend:** what the rules grant. `talk` to a service is talk to
 that service, and a service reachable through the bus is as trusted as
 the bus makes it; `bubbler lint` warns about the wide ones (a name owned
