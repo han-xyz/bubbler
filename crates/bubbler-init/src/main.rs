@@ -218,11 +218,13 @@ fn harden() -> rustix::io::Result<()> {
         set_capabilities(None, empty)?;
     }
     // `.iter_names()`, not `.iter()`: rustix marks `CapabilitySet` with
-    // bitflags' external-bits escape hatch (`const _ = !0;`), and `.iter()`
-    // yields that one unnamed remainder as a single multi-bit flag.
-    // `capability_is_in_bounding_set` and
+    // bitflags' external-bits escape hatch (`const _ = !0;`) so a future
+    // kernel's capability past bit 40 still round-trips through this
+    // type, and `.iter()` yields that one unnamed remainder as a single
+    // multi-bit flag. `capability_is_in_bounding_set` and
     // `remove_capability_from_bounding_set` both reject anything but a
-    // single bit with `EINVAL`.
+    // single bit with `EINVAL`; `.iter_names()` yields only the 41
+    // capabilities this build of rustix (1.1.4) knows the names of.
     for (_, capability) in CapabilitySet::all().iter_names() {
         if capability_is_in_bounding_set(capability)? {
             // A caller without CAP_SETPCAP gets EPERM here. That leaves the
@@ -235,6 +237,8 @@ fn harden() -> rustix::io::Result<()> {
             }
         }
     }
+    // A bwrap that is killed leaves this process a `SIGTERM`, which is the
+    // one the run already knows how to end on.
     set_parent_process_death_signal(Some(Signal::TERM))?;
     Ok(())
 }
@@ -397,7 +401,8 @@ fn signal_execs(execs: &[Exec], sig: Signal) {
     }
 }
 
-// The deadline is the point: a command that traps SIGTERM would otherwise
+// Set the deadline at which whatever ignored SIGTERM is SIGKILLed. The
+// deadline is the point: a command that traps SIGTERM would otherwise
 // keep the sandbox alive for as long as it liked.
 fn begin_stop(command: &Child, execs: &[Exec], stopping: &mut Stopping) {
     // Nothing here is reaped until the loop exits, so every pid is still its own.
@@ -572,8 +577,9 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     // A non-dumpable process can only be ptraced, or have fds taken with
-    // pidfd_getfd, by a tracer holding CAP_SYS_PTRACE; execve resets it, so
-    // the command and every exec'd child are unaffected.
+    // pidfd_getfd, by a tracer holding CAP_SYS_PTRACE, even where
+    // kernel.yama.ptrace_scope is 0; execve resets it, so the command and
+    // every exec'd child are unaffected.
     if let Err(e) = set_dumpable_behavior(DumpableBehavior::NotDumpable) {
         eprintln!("bubbler-init: cannot become non-dumpable: {e}");
         return ExitCode::from(2);

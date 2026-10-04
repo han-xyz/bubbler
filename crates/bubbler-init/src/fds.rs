@@ -18,8 +18,8 @@ use rustix::io::{Errno, FdFlags, fcntl_setfd};
 
 const FD_DIR: &str = "/proc/self/fd";
 
-// Below it is the stdio every process is expected to have, which each
-// spawn sets up for itself.
+// Below the first descriptor a sweep looks at is the stdio every process
+// is expected to have, which each spawn sets up for itself.
 const FIRST: RawFd = 3;
 
 /// Mark every descriptor above stdio close-on-exec except the ones `keep`
@@ -70,7 +70,8 @@ pub unsafe fn close_strays(keep: &[RawFd]) -> io::Result<()> {
     Ok(())
 }
 
-// The listing's own descriptor is never among them, and it is closed
+// Every descriptor above stdio this process holds that `keep` does not
+// name. The listing's own descriptor is never among them, and it is closed
 // before the caller acts on the numbers.
 fn strays(keep: &[RawFd]) -> io::Result<Vec<RawFd>> {
     let dir = rustix::fs::open(

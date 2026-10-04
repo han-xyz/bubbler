@@ -74,6 +74,11 @@ pub fn run() -> ExitCode {
     // `pw-container` was started with.
     let report = unsafe { OwnedFd::from_raw_fd(fd) };
     let stop = Arc::new(AtomicBool::new(false));
+    // The four the supervisor takes, for the same reason: each of them
+    // means the run is over, and left on their default dispositions they
+    // would kill this process where it stands instead of letting it
+    // report the exit `pw-container` reads.
+    //
     // Before the report and not after it: the line below is what tells
     // bubbler the context is up, and the run it belongs to can end at
     // any moment from then on. A SIGTERM in the window between the two
@@ -100,7 +105,9 @@ pub fn run() -> ExitCode {
     drop(report);
     while !stop.load(Ordering::Relaxed) {
         // A signal that arrived between the check above and this call would
-        // not interrupt it, so the wait is bounded rather than endless.
+        // not interrupt it, so the wait is bounded rather than endless; a
+        // signal during it ends it at once, since `poll` is never restarted
+        // after a handler (`signal(7)`).
         match poll(&mut [], Some(&TICK)) {
             Ok(_) | Err(Errno::INTR) => {}
             Err(e) => {
