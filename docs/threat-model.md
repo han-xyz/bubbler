@@ -1430,10 +1430,12 @@ metadata's `client.id`, which the server sets to the creating client's own
 and does not let the creator choose; an object whose creator carries
 `pipewire.sec.engine`, which the server sets on every client of a security
 context and refuses a client's own change to, is a sandbox's and is
-ignored, as is one whose creator is not in the dump or not of the expected
-shape (all measured on PipeWire 1.6.9 and WirePlumber 0.5.18, a context
-claiming `pipewire.sec.engine = "org.host"` both at connect and by a later
-update). An ignored object can make the answer "not loaded" or "another
+ignored; so is one whose creator's `pipewire.access` is set to anything
+but `unrestricted` (`flatpak` on a host-socket client holding a
+`/.flatpak-info`, `unrestricted` on WirePlumber's and a host tool's), and
+one whose creator is not in the dump or not of the expected shape (all
+measured on PipeWire 1.6.9 and WirePlumber 0.5.18, a context claiming
+`pipewire.sec.engine = "org.host"` both at connect and by a later update). An ignored object can make the answer "not loaded" or "another
 revision", never "current"; the `default` metadata plays no part. What it
 does not prove: that the creator is WirePlumber — a host process of the
 user's that published the revision would pass, and the host is trusted

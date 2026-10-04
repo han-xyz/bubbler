@@ -375,6 +375,11 @@ const CLIENT_TYPE: &str = "PipeWire:Interface:Client";
 // it (PipeWire 1.6.9).
 const SECURITY_CONTEXT_MARKER: &str = "pipewire.sec.engine";
 
+// Measured in the bed (PipeWire 1.6.9, WirePlumber 0.5.18): `unrestricted` on WirePlumber's client
+// and a host tool's, `flatpak` on a host-socket client holding a `/.flatpak-info`.
+const ACCESS: &str = "pipewire.access";
+const UNRESTRICTED: &str = "unrestricted";
+
 // WirePlumber accepts clients a moment before the hook publishes the revision (measured in the
 // bed), so a run just after a restart can find none.
 const ABSENT_AGAIN_AFTER: Duration = Duration::from_millis(500);
@@ -467,8 +472,9 @@ impl LoadedRevision {
 
 /// What `pw-dump` printed on stdout, read as a [`LoadedRevision`]: the
 /// [`REVISION_KEY`] on subject 0 of every metadata named [`POLICY_METADATA`] whose creator is a
-/// client in the dump outside any security context. Current only where each of those states this
-/// bubbler's revision; an object of another shape is skipped.
+/// client in the dump outside any security context, with `pipewire.access` `unrestricted` or unset.
+/// Current only where each of those states this bubbler's revision; an object of another shape is
+/// skipped.
 pub fn parse_loaded_revision(dump: &[u8]) -> LoadedRevision {
     let objects: Vec<Value> = match serde_json::from_slice(dump) {
         Ok(objects) => objects,
@@ -503,7 +509,12 @@ fn made_outside_a_sandbox(policy: &Value, objects: &[Value]) -> bool {
         .iter()
         .find(|object| object["type"] == CLIENT_TYPE && object["id"] == *creator)
         .and_then(|client| client["info"]["props"].as_object())
-        .is_some_and(|props| !props.contains_key(SECURITY_CONTEXT_MARKER))
+        .is_some_and(|props| {
+            !props.contains_key(SECURITY_CONTEXT_MARKER)
+                && props
+                    .get(ACCESS)
+                    .is_none_or(|access| access == UNRESTRICTED)
+        })
 }
 
 fn revision_in(policy: &Value) -> Option<String> {
@@ -1412,6 +1423,68 @@ mod tests {
         let creatorless = stating(revision()).replacen(&format!("\"client.id\": {WIREPLUMBER},\n      \"factory.id\": 4,\n      \"metadata.name\": \"bubbler-policy\""), "\"factory.id\": 4,\n      \"metadata.name\": \"bubbler-policy\"", 1);
         assert_ne!(creatorless, stating(revision()));
         assert_eq!(read(&creatorless), LoadedRevision::Absent);
+    }
+
+    /// A client of the host's socket whose process holds a `/.flatpak-info`, as the bed printed
+    /// it (PipeWire 1.6.9): no security-context marker, access `flatpak`.
+    const FLATPAK_CLIENT: &str = r#"  {
+    "id": 37,
+    "type": "PipeWire:Interface:Client",
+    "version": 3,
+    "permissions": [ "r", "w", "x", "m" ],
+    "info": {
+      "change-mask": [ "props" ],
+      "props": {
+        "application.name": "pw-cli",
+        "object.id": 37,
+        "pipewire.access": "flatpak",
+        "pipewire.access.effective": "flatpak",
+        "pipewire.sec.gid": 1000,
+        "pipewire.sec.pid": 528001,
+        "pipewire.sec.socket": "pipewire-0",
+        "pipewire.sec.uid": 1000
+      }
+    }
+  },
+"#;
+
+    #[test]
+    fn a_policy_by_a_creator_with_restricted_access_is_ignored() {
+        let alone = without_wireplumbers_policy(&stating(revision()));
+        for access in ["flatpak", "portal", "restricted"] {
+            let client = FLATPAK_CLIENT.replace("\"flatpak\"", &format!("\"{access}\""));
+            let dump = first_in(&alone, &format!("{client}{}", policy_by(37, revision())));
+            assert_eq!(read(&dump), LoadedRevision::Absent, "{access}");
+        }
+    }
+
+    #[test]
+    fn a_sandbox_claiming_to_be_wireplumber_is_ignored() {
+        let marker = "\"pipewire.sec.engine\": \"org.bubbler\",";
+        let claiming = stating(revision()).replacen(
+            marker,
+            &format!("{marker}\n        \"wireplumber.daemon\": true,"),
+            1,
+        );
+        assert_ne!(claiming, stating(revision()));
+        let alone = first_in(
+            &without_wireplumbers_policy(&claiming),
+            &policy_by(SANDBOX, revision()),
+        );
+        assert_eq!(read(&alone), LoadedRevision::Absent);
+    }
+
+    #[test]
+    fn a_host_creators_policy_decides() {
+        let other = revision() + 1;
+        let alone = without_wireplumbers_policy(&stating(revision()));
+        for (value, expected) in [
+            (revision(), LoadedRevision::Current),
+            (other, LoadedRevision::Other(other.to_string())),
+        ] {
+            let dump = first_in(&alone, &policy_by(HOST_TOOL, value));
+            assert_eq!(read(&dump), expected);
+        }
     }
 
     /// `pw-dump` omits a metadata object with no entries, as WirePlumber's `default` is on a
