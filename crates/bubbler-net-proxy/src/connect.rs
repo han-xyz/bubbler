@@ -1,20 +1,15 @@
 //! The one request this proxy understands: `CONNECT host:port`.
 //!
 //! A tunnel is opened on the strength of the request-target and of
-//! nothing else. `Host` must be there — RFC 9110 §9.3.6 requires a
-//! client to send it — but it is never what the target is taken from:
-//! the two may legitimately differ (the RFC's own example pairs a
-//! port-less `Host` with an authority carrying one), and authorising on
-//! a header a client also chooses would let one spelling pass the
+//! nothing else. `Host` must be there, but it is never what the target
+//! is taken from: the two may legitimately differ, and authorising on a
+//! header a client also chooses would let one spelling pass the
 //! allowlist and another be dialled.
 //!
-//! The parser is a pure function over the bytes read so far. It
-//! allocates the host string and nothing else, forwards no header
-//! onward — a `CONNECT` carries none — and tells the caller where the
-//! request ended, because whatever follows the blank line is already
-//! tunnel data (RFC 9110 §9.3.6: the tunnel "commences immediately
-//! following the blank line") and must be handed upstream, not read as
-//! a second request.
+//! The parser is a pure function over the bytes read so far. It tells
+//! the caller where the request ended, because whatever follows the
+//! blank line is already tunnel data and must be handed upstream, not
+//! read as a second request.
 
 use std::str;
 
@@ -57,10 +52,6 @@ pub struct Request {
 }
 
 /// Why a request was refused, as the status line says it.
-///
-/// Code `0` is not a status at all: it is the sentinel for "the bytes
-/// so far are no whole request yet", and the answer to one is to read
-/// more, never to write a response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("{code} {reason}")]
 pub struct Status {
@@ -81,7 +72,7 @@ impl Status {
     /// A target no `allow-host` covers, or an address where a name
     /// belongs.
     pub const FORBIDDEN: Self = Self::new(403, "Forbidden");
-    /// Any method but `CONNECT`. This is not a general-purpose proxy.
+    /// Any method but `CONNECT`.
     pub const METHOD_NOT_ALLOWED: Self = Self {
         code: 405,
         reason: "Method Not Allowed",
@@ -98,7 +89,6 @@ impl Status {
     /// The upstream never answered inside the connect budget.
     pub const GATEWAY_TIMEOUT: Self = Self::new(504, "Gateway Timeout");
 
-    /// One status without the `Allow` header.
     const fn new(code: u16, reason: &'static str) -> Self {
         Self {
             code,
@@ -167,13 +157,8 @@ pub fn parse(buf: &[u8]) -> Result<Request, Status> {
     })
 }
 
-/// One line from `from` on, without its terminator, and the offset just
-/// past that terminator.
-///
-/// A bare LF ends a line as well as CRLF: tolerated on the way in, never
-/// written on the way out. `over` is the answer when the line is longer
-/// than `window` — too long a request-line is a 414, too long a header
-/// is not.
+// A bare LF ends a line as well as CRLF: tolerated on the way in, never
+// written on the way out.
 fn split_line(
     buf: &[u8],
     from: usize,
@@ -193,13 +178,9 @@ fn split_line(
     }
 }
 
-/// The request-line: a method, an authority-form target and a version,
-/// one space apart.
-///
-/// A line that is three words of visible ASCII is judged by its method
-/// first, so a browser pointed at this port is told what the proxy does
-/// rather than what is wrong with its URI. A line that is not even that
-/// is a 400: there is no method to name.
+// A line that is three words of visible ASCII is judged by its method
+// first, so a browser pointed at this port is told what the proxy does
+// rather than what is wrong with its URI.
 fn request_line(line: &[u8]) -> Result<(String, u16), Status> {
     if !line
         .iter()
@@ -223,11 +204,9 @@ fn request_line(line: &[u8]) -> Result<(String, u16), Status> {
     target_of(target)
 }
 
-/// The authority-form target: a name, a colon, and a port.
-///
-/// An address is refused rather than dialled, whichever notation it is
-/// in: names are what an `allow-host` grants, and `93.184.216.34:443`
-/// would otherwise be a way past every one of them.
+// An address is refused rather than dialled, whichever notation it is
+// in: names are what an `allow-host` grants, and `93.184.216.34:443`
+// would otherwise be a way past every one of them.
 fn target_of(target: &[u8]) -> Result<(String, u16), Status> {
     if target.len() > MAX_TARGET {
         return Err(Status::URI_TOO_LONG);
@@ -263,11 +242,9 @@ fn target_of(target: &[u8]) -> Result<(String, u16), Status> {
     Ok((name.to_ascii_lowercase(), port))
 }
 
-/// One header field, and whether it was `Host`.
-///
-/// Nothing is kept: a `CONNECT` forwards no header, so the fields are
-/// read only far enough to know the request is well formed and to count
-/// the one field it must carry.
+// Nothing is kept: a `CONNECT` forwards no header, so the fields are
+// read only far enough to know the request is well formed and to count
+// the one field it must carry.
 fn field(line: &[u8]) -> Result<bool, Status> {
     // Obsolete line folding: RFC 9112 leaves a proxy that is not a
     // message/http translator the choice of rejecting a folded field or
@@ -292,7 +269,7 @@ fn field(line: &[u8]) -> Result<bool, Status> {
     Ok(name.eq_ignore_ascii_case(b"host"))
 }
 
-/// Whether `b` is a `tchar`, the only thing a field name is made of.
+// Whether `b` is a `tchar`, the only thing a field name is made of.
 fn is_token(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
