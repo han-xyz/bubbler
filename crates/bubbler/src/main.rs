@@ -831,9 +831,11 @@ fn refresh_entries(env: &Env, dirs: &desktop::Dirs, program: &Path) -> Result<i3
 }
 
 // The connection a start that lost the race to another start of the
-// instance joins that one through. Tried once; a winner already gone
-// again is the start's own error. A winner whose start then fails ends
-// the join as an instance that stopped while the command was running.
+// instance joins that one through, the way a later run would: the
+// winner has bound the control socket, and a connection waits there
+// until its sandbox answers. Tried once; a winner already gone again is
+// the start's own error. A winner whose start then fails ends the join
+// as an instance that stopped while the command was running.
 fn join_after_lost_start(
     env: &Env,
     name: &str,
