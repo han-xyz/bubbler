@@ -447,11 +447,21 @@ gates it instead. A `receive` on `wl_data_offer`,
 `zwp_primary_selection_offer_v1`, `zwlr_data_control_offer_v1` or
 `ext_data_control_offer_v1` is forwarded only within one second of real
 user input — a `wl_keyboard.key` the compositor reported as pressed, a
-`wl_pointer.button` in either direction, or a `wl_touch.down` or
-`wl_touch.up` — seen on any connection of that instance. Both ends of a
+`wl_pointer.button` in either direction, a `wl_touch.down` or
+`wl_touch.up`, a tablet tool's (`zwp_tablet_tool_v1` or `_v2`) `down`,
+`up` or `button`, or a `zwp_tablet_pad_v2.button` reported as pressed —
+seen on any connection of that instance. Both ends of a
 press arm, so a drag that ends over a paste target arms on the release
 that ends it rather than only on the press that began it, however long
-the drag took. Outside the window the request is not
+the drag took. The second counts from the earliest moment the event could
+have reached the proxy, not from when the proxy read it: the last instant
+the proxy saw the compositor's side of that connection empty, or was
+waiting on it with nothing unread. The proxy stops reading the compositor
+while the sandbox leaves a full queue unread, so a press that waited
+behind such a stall is dated at the stall's start and opens nothing once
+the stall outlasted the window. The event's own `time` argument is not
+used: the protocol leaves its clock undefined. Outside the window the
+request is not
 forwarded and the descriptor it carried is closed, so the client reads end
 of file exactly as if the selection had been empty, and one line goes to
 the audit log:

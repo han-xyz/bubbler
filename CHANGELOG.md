@@ -33,6 +33,10 @@
   already exists is reported by `bubbler lint` as `app-id-shared` and warned
   about on `run` and `open`, and by a `try --keep` that finds one made while
   it ran; rename one, or accept it with `lint-allow`.
+- The Wayland clipboard gate dates input from the earliest moment it could
+  have reached `bubbler-wl-proxy`, not from when the proxy read it: a
+  sandbox that stopped reading its connection could hold a key press back
+  and read the clipboard up to a second after the moment it chose.
 
 ### Changed
 
@@ -48,6 +52,12 @@
   `systemctl --user restart wireplumber`; `bubbler lint` reports
   `audio-policy-not-loaded` (a note where WirePlumber could not be asked), and
   `--explain` shows the loaded state beside the installed one.
+
+### Fixed
+
+- A tablet pen touching down, lifting or pressing a button, and a tablet
+  pad button press, now allow a paste under the Wayland clipboard gate like
+  a key press or a mouse click.
 
 ## 0.25.0
 

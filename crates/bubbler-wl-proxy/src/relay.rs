@@ -113,6 +113,10 @@ struct Conn {
     /// A descriptor failed; the connection ends without a word, because the
     /// peer going away is not a policy event.
     broken: bool,
+    // Whether the compositor side was last seen empty, and since when nothing
+    // unread on it can have arrived: the instant input read from it is dated at.
+    server_drained: bool,
+    server_unread_since: Instant,
 }
 
 /// The listener, the socket to forward to, and every live connection.
@@ -219,13 +223,15 @@ fn flush(side: &mut Side) -> io::Result<()> {
 }
 
 impl Conn {
-    fn new(client: OwnedFd, server: OwnedFd) -> Self {
+    fn new(client: OwnedFd, server: OwnedFd, now: Instant) -> Self {
         Self {
             client: Side::new(client),
             server: Side::new(server),
             state: Connection::new(),
             closing: false,
             broken: false,
+            server_drained: true,
+            server_unread_since: now,
         }
     }
 
@@ -287,6 +293,13 @@ impl Conn {
         // the connection lives, so it is never read again: polling it once
         // more would be a spin, not a wake-up.
         let woke = PollFlags::IN | PollFlags::HUP | PollFlags::ERR;
+        // A drained side the poll watched was empty until the poll returned,
+        // or it would have returned sooner; an unwatched one may fill unseen.
+        if !self.flags(false).contains(PollFlags::IN) {
+            self.server_drained = false;
+        } else if self.server_drained {
+            self.server_unread_since = now;
+        }
         if client.intersects(woke) && !self.closing && !self.client.eof {
             self.pump(true, policy, audit, now)?;
         }
@@ -318,13 +331,27 @@ impl Conn {
             server,
             state,
             closing,
+            server_drained,
+            server_unread_since,
             ..
         } = self;
         let (src, dst) = match from_client {
             true => (&mut *client, &mut *server),
             false => (&mut *server, &mut *client),
         };
+        // Input arms the gate as of when it could first have arrived, not when
+        // it was read: a client that stops reading decides the latter.
+        let arrived = match from_client {
+            true => now,
+            false => *server_unread_since,
+        };
         receive(src)?;
+        if !from_client {
+            *server_drained = rustix::io::ioctl_fionread(&src.fd).is_ok_and(|n| n == 0);
+            if *server_drained {
+                *server_unread_since = now;
+            }
+        }
         let mut at = 0;
         while !*closing {
             let rest = &src.buf[at..];
@@ -363,7 +390,7 @@ impl Conn {
                 fds: &mut fds,
             };
             let action = policy
-                .apply(&mut incoming, state, audit, now)
+                .apply(&mut incoming, state, audit, arrived)
                 .map_err(|err| err.to_string())?;
             match action {
                 // Re-encoded rather than copied: what the far side reads is
@@ -587,7 +614,7 @@ impl Relay {
                     // A connection got in, so the shortage is over: the next
                     // one says so again if it comes back.
                     self.refusing = false;
-                    self.conns.push(Conn::new(client, server));
+                    self.conns.push(Conn::new(client, server, now));
                 }
                 Err(err) if out_of_descriptors(err) => return self.wait_for_descriptors(now),
                 Err(err) => self.audit.line(
@@ -645,7 +672,7 @@ mod tests {
     use rustix::net::socketpair;
 
     use super::*;
-    use crate::policy::Gate;
+    use crate::policy::{GATE_WINDOW, Gate};
     use crate::tables;
     use crate::wire::Arg;
 
@@ -697,7 +724,7 @@ mod tests {
         Wired {
             client,
             server,
-            conn: Conn::new(to_client, to_server),
+            conn: Conn::new(to_client, to_server, Instant::now()),
             policy: Policy::new(gate, false),
             audit: Audit::new(Box::new(log.clone())),
             log,
@@ -707,14 +734,72 @@ mod tests {
     impl Wired {
         /// One round of the loop, as if both sides had woken it.
         fn step(&mut self) -> Result<(), String> {
-            let both = PollFlags::IN | PollFlags::OUT;
-            self.conn.service(
-                both,
-                both,
-                &mut self.policy,
-                &mut self.audit,
-                Instant::now(),
+            self.step_at(Instant::now())
+        }
+
+        /// One round at `now`, as if every side the relay polls had woken it:
+        /// a side the relay would not poll for reading is not read.
+        fn step_at(&mut self, now: Instant) -> Result<(), String> {
+            let client = self.conn.flags(true);
+            let server = self.conn.flags(false);
+            self.conn
+                .service(client, server, &mut self.policy, &mut self.audit, now)
+        }
+
+        /// Map the objects the gate tests talk through: a keyboard and an offer.
+        fn map_input_and_offer(&mut self) {
+            for (id, iface) in [(KEYBOARD, "wl_keyboard"), (OFFER, "wl_data_offer")] {
+                let index = tables::index_of(iface).expect("in the tables");
+                self.conn
+                    .state
+                    .objects
+                    .bind(u32::MAX, index, 3, id)
+                    .expect("the object maps");
+            }
+        }
+
+        fn press_key(&mut self) {
+            let key = opcode("wl_keyboard", false, "key");
+            let message = wire::encode(
+                KEYBOARD,
+                key,
+                &[Arg::Uint(1), Arg::Uint(0), Arg::Uint(30), Arg::Uint(1)],
             )
+            .expect("encodes");
+            rustix::io::write(&self.server, &message).expect("the compositor writes");
+        }
+
+        /// The client asks for the selection; answers whether the request
+        /// reached the compositor.
+        fn paste(&mut self, now: Instant) -> bool {
+            let receive = opcode("wl_data_offer", true, "receive");
+            let mime = std::ffi::CString::new("text/plain").expect("no NUL");
+            let message =
+                wire::encode(OFFER, receive, &[Arg::String(Some(mime)), Arg::Fd]).expect("encodes");
+            let (_read, write) = rustix::pipe::pipe().expect("a pipe");
+            let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+            let mut cmsg = SendAncillaryBuffer::new(&mut space);
+            let carried = [write.as_fd()];
+            assert!(cmsg.push(SendAncillaryMessage::ScmRights(&carried)));
+            sendmsg(
+                &self.client,
+                &[IoSlice::new(&message)],
+                &mut cmsg,
+                SendFlags::NOSIGNAL,
+            )
+            .expect("the client sends the read");
+            self.step_at(now).expect("a gated read is not a fault");
+            !self.recv_server().0.is_empty()
+        }
+
+        /// Read everything the proxy has written to the client so far.
+        fn drain_client(&mut self) {
+            let mut buf = vec![0u8; 1 << 16];
+            while let Ok(n) = rustix::io::read(&self.client, &mut buf[..]) {
+                if n == 0 {
+                    break;
+                }
+            }
         }
 
         /// Read from the compositor's end, collecting any descriptors that
@@ -749,6 +834,87 @@ mod tests {
                 Err(err) => panic!("{err}"),
             }
         }
+    }
+
+    const KEYBOARD: u32 = 90;
+    const OFFER: u32 = 10;
+
+    #[test]
+    fn a_key_press_held_back_by_a_stalled_client_opens_no_gate() {
+        let mut wired = wired(Gate::Paste);
+        wired.map_input_and_offer();
+        let start = Instant::now();
+        wired.step_at(start).expect("an idle round");
+        // More than the cap aimed at the client, which reads none of it: the
+        // proxy stops reading the compositor until the client drains.
+        let stall = vec![0u8; MAX_QUEUE + (1 << 20)];
+        wired.conn.client.out_bytes += stall.len();
+        wired.conn.client.out.push_back(Frame {
+            data: stall,
+            off: 0,
+            fds: Vec::new(),
+        });
+        wired.step_at(start).expect("the stall begins");
+        assert!(!wired.conn.flags(false).contains(PollFlags::IN));
+        wired.press_key();
+        wired
+            .step_at(start + Duration::from_millis(100))
+            .expect("the key waits");
+
+        let late = start + GATE_WINDOW + Duration::from_millis(500);
+        while !wired.conn.client.out.is_empty() {
+            wired.drain_client();
+            wired.step_at(late).expect("the client drains");
+        }
+        wired.step_at(late).expect("the key is read");
+        wired.drain_client();
+        assert!(
+            !wired.paste(late),
+            "a press that waited out the window opened the gate"
+        );
+        assert!(
+            wired.log.text().contains("clipboard read denied"),
+            "{}",
+            wired.log.text()
+        );
+    }
+
+    #[test]
+    fn a_key_pressed_after_a_long_idle_opens_the_gate() {
+        let mut wired = wired(Gate::Paste);
+        wired.map_input_and_offer();
+        let start = Instant::now();
+        wired.step_at(start).expect("an idle round");
+        let pressed = start + Duration::from_secs(10);
+        wired.press_key();
+        wired.step_at(pressed).expect("the key is read");
+        assert!(wired.paste(pressed + GATE_WINDOW), "{}", wired.log.text());
+    }
+
+    #[test]
+    fn a_read_that_leaves_bytes_behind_does_not_move_the_input_instant_on() {
+        let mut wired = wired(Gate::Paste);
+        wired.map_input_and_offer();
+        let start = Instant::now();
+        wired.step_at(start).expect("an idle round");
+        // More than one read's worth ahead of the key, so the first read
+        // returns a full buffer and the key comes in the second.
+        let delete_id = opcode("wl_display", false, "delete_id");
+        let one = wire::encode(1, delete_id, &[Arg::Uint(0xFF00_0001)]).expect("encodes");
+        let mut batch = Vec::new();
+        while batch.len() <= CHUNK {
+            batch.extend_from_slice(&one);
+        }
+        rustix::io::write(&wired.server, &batch).expect("the compositor writes");
+        wired.press_key();
+        wired.step_at(start).expect("the first read");
+        let later = start + GATE_WINDOW + Duration::from_millis(500);
+        wired.step_at(later).expect("the second read");
+        wired.drain_client();
+        assert!(
+            !wired.paste(later),
+            "the key was dated at a read that never found the socket empty"
+        );
     }
 
     fn opcode(interface: &str, from_client: bool, name: &str) -> u16 {

@@ -176,9 +176,11 @@ impl Policy {
     ///
     /// What arms it: `wl_keyboard.key` pressed, `wl_pointer.button` either
     /// way, and `wl_touch.down` or `.up` — the release of each, because that
-    /// is where a drag ends and where a paste is asked for.
+    /// is where a drag ends and where a paste is asked for. A tablet tool's
+    /// `down`, `up` and `button` arm the same way, a tablet pad's `button`
+    /// only when pressed. Input dated before the last one leaves it as it is.
     pub fn arm(&mut self, now: Instant) {
-        self.last_input = Some(now);
+        self.last_input = self.last_input.max(Some(now));
     }
 
     /// Judge one message, and keep the connection's object map in step with
@@ -282,6 +284,15 @@ impl Policy {
             }
             ("wl_pointer", "button") => self.arm(now),
             ("wl_touch", "down" | "up") => self.arm(now),
+            ("zwp_tablet_tool_v1" | "zwp_tablet_tool_v2", "down" | "up" | "button") => {
+                self.arm(now)
+            }
+            // `state` is argument 2 of a pad button, and 1 is pressed.
+            ("zwp_tablet_pad_v2", "button") => {
+                if let Some(Arg::Uint(1)) = msg.args.get(2) {
+                    self.arm(now);
+                }
+            }
             _ => {}
         }
         Action::Forward
@@ -578,6 +589,11 @@ mod tests {
                     Arg::Fixed(0),
                 ],
                 ("wl_touch", "up") => vec![Arg::Uint(1), Arg::Uint(0), Arg::Int(0)],
+                (_, "down") => vec![Arg::Uint(1)],
+                (_, "up") => Vec::new(),
+                (_, "button") if iface.starts_with("zwp_tablet") => {
+                    vec![Arg::Uint(1), Arg::Uint(0x14b), Arg::Uint(state)]
+                }
                 _ => vec![Arg::Uint(1), Arg::Uint(0), Arg::Uint(30), Arg::Uint(state)],
             };
             let action = self
@@ -839,6 +855,13 @@ mod tests {
             ("wl_touch", "down", 0),
             // A touch drag drops on the release, not on the press.
             ("wl_touch", "up", 0),
+            ("zwp_tablet_tool_v2", "down", 0),
+            ("zwp_tablet_tool_v2", "up", 0),
+            ("zwp_tablet_tool_v2", "button", 1),
+            ("zwp_tablet_tool_v2", "button", 0),
+            ("zwp_tablet_tool_v1", "down", 0),
+            ("zwp_tablet_tool_v1", "button", 1),
+            ("zwp_tablet_pad_v2", "button", 1),
         ] {
             let mut proxy = proxy();
             proxy.input(iface, name, state);
@@ -855,6 +878,23 @@ mod tests {
         proxy.input("wl_keyboard", "key", 0);
         let (action, _read) = proxy.receive(10, "wl_data_offer", "text/plain");
         assert_eq!(action, Action::Drop);
+    }
+
+    #[test]
+    fn a_tablet_pad_button_release_does_not_open_the_gate() {
+        let mut proxy = proxy();
+        proxy.input("zwp_tablet_pad_v2", "button", 0);
+        let (action, _read) = proxy.receive(10, "wl_data_offer", "text/plain");
+        assert_eq!(action, Action::Drop);
+    }
+
+    #[test]
+    fn input_dated_earlier_does_not_move_the_last_input_back() {
+        let mut proxy = proxy();
+        let now = proxy.now;
+        proxy.policy.arm(now);
+        proxy.policy.arm(now - Duration::from_secs(5));
+        assert_eq!(proxy.policy.last_input(), Some(now));
     }
 
     #[test]
