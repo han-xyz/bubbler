@@ -285,7 +285,8 @@ fn harden() -> rustix::io::Result<()> {
 /// Turn a request down: say why on the connection's own stderr, and
 /// answer the status a shell reports for a command it could not run.
 /// The reason is dropped when that stderr would block: the status still
-/// tells the client, and a blocked write would stall the whole loop.
+/// tells the client. A regular file is written as is, so one on a hung mount
+/// can still stall the loop.
 fn refuse(stream: &UnixStream, report: Option<OwnedFd>, why: &str) {
     if let Some(fd) = report {
         write_unless_blocked(&fd, format!("bubbler-init: {why}\n").as_bytes());
