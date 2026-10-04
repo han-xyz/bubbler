@@ -379,10 +379,12 @@ outright, with no context and no proxy at all (lint `wayland-host`). The
 session's Xwayland is outside all of it: `x11 "host"` reaches a server that
 is an ordinary client of your session, though a bare `x11` starts one on
 this socket (below) which the proxy filters and gates like anything else.
-Under either `"host"` value the compositor's client is the application
-itself, and a compositor that reads `/.flatpak-info` by pid, as mutter
-does, shows whatever app id a nested mount namespace puts there ([Who a
-host service sees](#who-a-host-service-sees)).
+Under `wayland "host"` the compositor's client is the application itself;
+under `x11 "host"` it is the session's Xwayland, and the application is a
+client of that X server. A compositor or window manager that reads
+`/.flatpak-info` by a window's pid, as mutter does, shows whatever app id
+a nested mount namespace puts there ([Who a host service
+sees](#who-a-host-service-sees)).
 
 The proxy is also not a shield in front of the compositor. Everything it
 can parse it re-encodes and forwards, so a message that is well formed and
@@ -786,20 +788,21 @@ file; it does not stop a process that makes a mount namespace of its own —
 a nested user namespace is allowed by default — from covering
 `/.flatpak-info` with another file, or with none, for itself and its
 children. That is no escape here: the portals read the copy the proxy
-sidecar holds, and PipeWire, which reads the application's own, decides
-nothing by it ([Who a host service sees](#who-a-host-service-sees)).
+sidecar holds, and PipeWire never reads the file for a context client
+([Who a host service sees](#who-a-host-service-sees)).
 
-What `portals` buys from PipeWire's own Flatpak policy is narrower than it
-sounds, and worth stating exactly. `/.flatpak-info`, which `portals` writes,
-puts a client under WirePlumber's Flatpak access rules; measured on this
-host (WirePlumber 0.5.15): such a client gets permissions `rwx` rather than
-the unsandboxed default `rwxm` — no `m`, so no muting, rerouting or
-destroying another client's nodes or links. It does not narrow visibility:
-every node on the graph still shows up to the client, 22 of 22 measured on
-this host, capture nodes included — the policy trims what a sandboxed
-client can *do* to other clients' nodes, not what it can *see* or *read*.
-Camera nodes are the one exception, gated separately by the portal's own
-permission store rather than by this access level.
+`portals` puts nothing under PipeWire's own Flatpak policy. A sandbox
+reaches PipeWire only through its security context, never the session's
+`pipewire-0`, and PipeWire does not read `/.flatpak-info` for a client
+whose context already sets `pipewire.access`: its access module logs
+`has already access: 'restricted'` and returns before it looks at the pid
+(measured, PipeWire 1.6.9). Such a client never carries
+`pipewire.access = "flatpak"`, the one property WirePlumber's Flatpak
+rules act on (`find-flatpak-access.lua`, 0.5.18); a context client with
+bubbler's file, `[Instance]` included, gets the drop-in's permissions and
+nothing else (measured, WirePlumber 0.5.18). The camera is gated by the
+portal's own permission store, keyed by the app id the portal reads from
+the proxy's copy of the file.
 
 The identity file also costs the grant a program. gdk-pixbuf's glycin image
 loaders read `/.flatpak-info` to pick their own sandbox, and on finding one
@@ -861,26 +864,38 @@ identity bubbler gave the sandbox only where that peer is a sidecar:
   bound to the listening socket when bubbler registers it, not looked up
   by pid.
 - `pulseaudio`: the private `pipewire-pulse` sidecar.
-- the PipeWire context socket: the application's own pid, through which
-  PipeWire's access module reads the file (its source), so a process that
-  covers `/.flatpak-info` in a nested mount namespace shows PipeWire a
-  file of its choosing. Measured in the private bed (PipeWire 1.6.9,
-  WirePlumber 0.5.18): a context client showing bubbler's file, a forged
-  one or none got the same `pipewire.access`, `pipewire.access.effective`
-  and `pipewire.sec.*` properties, the same permissions and the same
-  visible objects as one started without nesting, and PipeWire published
-  no `pipewire.access.portal.*` or `pipewire.sec.flatpak` for any of
-  them. What decides a client's access is the security context's
-  properties, which the daemon stamps on every client of the socket.
-- `wayland "host"` and `x11 "host"`: the application's own pid.
-- sockets reached through `path-share`, `home-share` and `app-runtime`:
-  the application's own pid.
+- the PipeWire context socket: the application's own pid, but PipeWire
+  does not read `/.flatpak-info` for a client whose context already sets
+  `pipewire.access` — its access module logs `has already access:
+  'restricted'` and returns before the pid check — so a file a nested
+  mount namespace puts there, or hides, is never consulted. Measured in
+  the private bed (PipeWire 1.6.9, WirePlumber 0.5.18): a context client
+  run in a nested namespace over bubbler's file, a forged one or none
+  carries the same `pipewire.access`, `pipewire.access.effective` and
+  `pipewire.sec.*` properties as one started without nesting, no
+  `pipewire.access.portal.*` and no `pipewire.sec.flatpak`, and itself
+  sees the same objects with the same permissions.
+- bare `x11`: the sandbox's own Xwayland, inside it, sees the
+  application's pid; the compositor sees the `bubbler-wl-proxy` sidecar
+  that carries Xwayland's traffic.
+- `wayland "host"`: the application's own pid. `x11 "host"`: the
+  session's X server sees the application's pid, and the compositor sees
+  that server.
+- sockets reached through `path-share`, `home-share` and `app-runtime`,
+  and under `network "host"` abstract sockets and loopback services: the
+  application's own pid.
+
+The list covers the channels bubbler builds or binds; a socket a host
+service opens and hands to the sandbox — the PipeWire remote the camera
+portal returns, for one — carries that service's identity, not the
+application's.
 
 **Does not defend:** a service that reads the file by the application's
 own pid sees what the application chooses. mutter reads
 `/proc/<pid>/root/.flatpak-info` of a window's client for its sandboxed
-app id (its source, not measured), so under `wayland "host"` or
-`x11 "host"` on GNOME a sandbox can show a forged app id for its windows.
+app id (its source, not measured), so under `wayland "host"`, and for
+an X window under `x11 "host"`, a sandbox on GNOME can show a forged app
+id for its windows.
 
 [User namespaces](#user-namespaces-inside-the-sandbox) ·
 `a_forged_or_hidden_flatpak_info_changes_nothing_a_context_gets`

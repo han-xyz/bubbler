@@ -7,7 +7,7 @@ Terms this repo uses; synonyms to avoid in code, docs and commits.
 - `render node` — `/dev/dri/renderD<N>`, the unprivileged GPU node; say "render node", not "GPU device".
 - `primary node` — `/dev/dri/card<N>`; not "card device".
 - `KMS` — kernel mode setting, the primary node's display control; the `dri kms=#true` property.
-- `Flatpak policy` — what PipeWire/WirePlumber grant a client that carries `/.flatpak-info`: `rwx` without `m`, camera through the portal permission store.
+- `Flatpak policy` — what PipeWire/WirePlumber grant a client of the session's own socket that carries `/.flatpak-info`: `rwx` without `m` (WirePlumber 0.5.15), camera through the portal permission store. A bubbler sandbox never gets it: PipeWire 1.6.9 skips the file for a security-context client whose context already sets `pipewire.access`.
 - `security context` — a per-sandbox server socket a compositor or PipeWire labels; wl-proxy has one, PipeWire's is 0.23.
 - `module loading` — pipewire-pulse `LOAD_MODULE`, gated only by `pulse.allow-module-loading`.
 - `permission manager` — a WirePlumber `access.permission-managers` entry the policy drop-in's `access.rules` matches a context into by its `pipewire.sec.bubbler.audio` value; not "access rule", which is the match rather than the grant it applies.
