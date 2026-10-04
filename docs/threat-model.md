@@ -362,13 +362,13 @@ new announcement of the same number replaces the old one. What stays the
 compositor's to get right: a compositor that reuses a number within those
 three seconds for a global it does not announce to this client receives
 a bind checked against the old interface, and only its own checks of the
-interface name and the global's visibility stop it. The proxy applies a denylist of its own on every
-connection — 40 interface names: the 31 Hyprland withholds from a
-sandboxed client, plus nine of the same class found by reading every
-global the proxy's tables describe, whether another compositor implements
-it or Hyprland hands it to a sandboxed client anyway — and on a
-compositor with no security context, where that list is the only
-enforcement, the launch says so with a note. What the
+interface name and the global's visibility stop it. The proxy applies a
+denylist of its own on every connection — 40 interface names: the 31
+Hyprland withholds from a sandboxed client, plus nine of the same class
+found by reading every global the proxy's tables describe, whether
+another compositor implements it or Hyprland hands it to a sandboxed
+client anyway — and on a compositor with no security context, where that
+list is the only enforcement, the launch says so with a note. What the
 list lets through is written down too, so a protocol bump that brings a
 new global fails a test rather than reaching a sandbox unexamined.
 
@@ -466,9 +466,9 @@ protocol does not say which client a release goes to, and the lift of a
 pen that touched down elsewhere may reach the surface it was moved over,
 so a sandbox could otherwise arm the gate by moving its window under a
 pen or button held down elsewhere. A tablet frame that holds a
-`proximity_in` or `proximity_out` arms nothing either: the protocol has the compositor
-itself send `down` and held buttons when a pen already touching the
-tablet enters a surface.
+`proximity_in` or `proximity_out` arms nothing either: the protocol has the
+compositor itself send `down` and held buttons when a pen already
+touching the tablet enters a surface.
 
 A drop into the sandbox does not arm the gate at all. The release that
 ends a drag belongs to the implicit grab of the client the drag started
@@ -489,19 +489,19 @@ earliest moment the event could have reached the proxy, not from when
 the proxy read it: the last instant the proxy saw the compositor's side
 of that connection empty (nothing left to read after a read), or was
 waiting on it in `poll` with nothing unread. An empty read alone would
-not do: the proxy reads once per wake-up, so one is rare, and a key typed after a quiet minute would be
-dated a minute back. The proxy stops reading the compositor while the
-sandbox leaves a full queue unread, so a press that waited behind such a
-stall is dated at the stall's start. Input can also wait in the
-compositor's own buffer, which the proxy cannot see, so for one second
-after the proxy resumes reading a connection the sandbox held back, input
-on that connection arms nothing at all, however short the stall. The cost:
-input on that connection opens no paste for one second after reading
-resumes. The event's own `time` argument is not used: the protocol leaves
-its clock undefined. Outside the window the request is not forwarded and
-the descriptor it carried is closed, so the client reads end of file
-exactly as if the selection had been empty, and one line goes to the
-audit log:
+not do: the proxy reads once per wake-up, so one is rare, and a key typed
+after a quiet minute would be dated a minute back. The proxy stops
+reading the compositor while the sandbox leaves a full queue unread, so
+a press that waited behind such a stall is dated at the stall's start.
+Input can also wait in the compositor's own buffer, which the proxy
+cannot see, so for one second after the proxy resumes reading a
+connection the sandbox held back, input on that connection arms nothing
+at all, however short the stall. The cost: input on that connection
+opens no paste for one second after reading resumes. The event's own
+`time` argument is not used: the protocol leaves its clock undefined.
+Outside the window the request is not forwarded and the descriptor it
+carried is closed, so the client reads end of file exactly as if the
+selection had been empty, and one line goes to the audit log:
 
 ```
 bubbler-wl-proxy: clipboard read denied (wl_data_offer, text/plain): no input since the proxy started
