@@ -3105,9 +3105,10 @@ fn a_sink_a_devices_context_offers_may_become_the_default() {
         return;
     };
     let default_sink = || {
-        bed.host_tool("pw-metadata", &["-n", "default"])
-            .lines()
-            .find(|line| line.contains("key:'default.audio.sink'"))
+        default_metadata(&bed)
+            .split("\"key\": \"default.audio.sink\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\"key\":").next())
             .unwrap_or_default()
             .to_owned()
     };
@@ -3117,11 +3118,11 @@ fn a_sink_a_devices_context_offers_may_become_the_default() {
          node.name = offered }' /dev/null",
     ));
     wait_for("the context's sink as the default", || {
-        default_sink().contains("\"name\":\"offered\"")
+        default_sink().contains("\"name\": \"offered\"")
     });
     drop(offered);
     wait_for("the host's sink as the default again", || {
-        default_sink().contains("\"name\":\"bed-sink\"")
+        default_sink().contains("\"name\": \"bed-sink\"")
     });
 }
 
