@@ -7,6 +7,7 @@
 //! disabled, and the bed's PipeWire loads no device factory, so the
 //! graph holds one null sink and one null source and nothing else.
 
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::process::Output;
 
@@ -550,11 +551,135 @@ fn window_in_which_it_would_link(bed: &PipeWireBed, grant: &str) {
     std::thread::sleep(Duration::from_secs(2));
 }
 
+/// Every node a stream can record from, by the markers that name it in a
+/// listing: what a context without the microphone grant may not see.
+const CAPTURE_NODES: [&str; 3] = [
+    SOURCE,
+    r#"node.name = "virtual-source""#,
+    r#"node.name = "duplex""#,
+];
+
+/// The bed's `OTHER_SOURCES` added and a host recorder linked to the null
+/// source, so each capture node has ports and one has a link: the
+/// recorder, and the ids of every capture node.
+fn capture_nodes_with_a_link(bed: &PipeWireBed) -> (Streaming, Vec<String>) {
+    add_other_sources(bed);
+    let recorder = host_stream(
+        bed,
+        &["-r", "-a", "-P", "{ node.name = host-rec }", "/dev/null"],
+    );
+    wait_for("the host recorder's link from the null source", || {
+        bed.links().contains("bed-source:capture_")
+    });
+    let listing = bed.info_from_host();
+    let nodes = CAPTURE_NODES
+        .iter()
+        .map(|marker| {
+            object(&listing, &[marker, NODE])
+                .expect("a capture node in the bed")
+                .id
+        })
+        .collect();
+    (recorder, nodes)
+}
+
+/// The ids of the ports and links in `listing` that belong to any of
+/// `nodes`.
+fn objects_of(listing: &str, nodes: &[String]) -> Vec<String> {
+    let markers: Vec<String> = nodes
+        .iter()
+        .flat_map(|node| {
+            ["node.id", "link.output.node", "link.input.node"]
+                .map(|key| format!("{key} = \"{node}\""))
+        })
+        .collect();
+    let mut ids: Vec<String> = blocks(listing)
+        .filter(|block| markers.iter().any(|marker| block.contains(marker.as_str())))
+        .filter_map(|block| block.lines().next())
+        .map(str::to_owned)
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// `pw-mon` in a context for the length of a test: what a client that
+/// connected before the objects it is shown sees of them.
+struct ContextMonitor {
+    _running: Streaming,
+    log: PathBuf,
+}
+
+impl ContextMonitor {
+    /// Started once its client sees the sink, so its access is decided.
+    fn start(bed: &PipeWireBed, props: &str) -> ContextMonitor {
+        let log = bed.dir().join("context-monitor.log");
+        let running =
+            Streaming(bed.spawn_in_context_logged(props, "stdbuf -oL pw-mon -N -a -o", Some(&log)));
+        let monitor = ContextMonitor {
+            _running: running,
+            log,
+        };
+        let sink = object(&bed.info_from_host(), &[SINK]).expect("the sink").id;
+        wait_for("the monitor's view of the sink", || {
+            monitor.visible().contains(&sink)
+        });
+        monitor
+    }
+
+    /// The ids of the objects the client sees now: added and not
+    /// removed since.
+    fn visible(&self) -> BTreeSet<String> {
+        let said = std::fs::read_to_string(&self.log).unwrap_or_default();
+        let mut visible = BTreeSet::new();
+        let mut lines = said.lines();
+        while let Some(line) = lines.next() {
+            let id = || {
+                lines
+                    .clone()
+                    .next()
+                    .and_then(|next| next.trim().strip_prefix("id: "))
+                    .map(str::to_owned)
+            };
+            match (line, id()) {
+                ("added:", Some(id)) => {
+                    visible.insert(id);
+                }
+                ("removed:", Some(id)) => {
+                    visible.remove(&id);
+                }
+                _ => {}
+            }
+        }
+        visible
+    }
+
+    /// Wait until the client sees none of `ids`, or fail naming those it
+    /// still sees.
+    fn sees_none_of(&self, ids: &[String]) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let seen: Vec<_> = ids
+                .iter()
+                .filter(|id| self.visible().contains(*id))
+                .collect();
+            if seen.is_empty() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a context still sees {seen:?} of a hidden capture node"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
 #[test]
 fn a_playback_context_sees_no_source_no_metadata_and_only_reads_streams() {
     let Some(bed) = PipeWireBed::start() else {
         return;
     };
+    let (_recorder, capture_nodes) = capture_nodes_with_a_link(&bed);
     let wav = bed.dir().join("tone.wav");
     silence(&wav);
     let _other = streaming(
@@ -578,6 +703,14 @@ fn a_playback_context_sees_no_source_no_metadata_and_only_reads_streams() {
     assert!(!seen.contains("\"metadata.name\""), "{seen}");
 
     let listing = bed.info_in_context(PLAYBACK, &[SINK, STREAM]);
+    for marker in CAPTURE_NODES {
+        assert!(object(&listing, &[marker]).is_none(), "{listing}");
+    }
+    assert_eq!(
+        objects_of(&listing, &capture_nodes),
+        Vec::<String>::new(),
+        "ports or links of a hidden capture node:\n{listing}"
+    );
     let sink = object(&listing, &[SINK]).expect("the sink is visible");
     assert_eq!(sink.permissions, "r-x--", "on the sink:\n{listing}");
     // Another client's stream is visible because the private pulse
@@ -598,6 +731,69 @@ fn a_playback_context_sees_no_source_no_metadata_and_only_reads_streams() {
     assert!(
         refused.contains("Permission denied") && refused.contains("requires -wx--"),
         "muting the sink from a playback context was not refused:\n{refused}"
+    );
+}
+
+#[test]
+fn a_playback_context_connected_first_sees_no_port_or_link_of_a_later_capture_node() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let monitor = ContextMonitor::start(&bed, PLAYBACK);
+    let (_recorder, capture_nodes) = capture_nodes_with_a_link(&bed);
+    monitor.sees_none_of(&objects_of(&bed.info_from_host(), &capture_nodes));
+}
+
+/// The WirePlumber started then finds the context, the capture nodes and
+/// their ports all in the graph already, and a capture node added after it.
+#[test]
+fn a_playback_context_sees_no_port_or_link_of_a_capture_node_across_a_restart() {
+    let Some(mut bed) = PipeWireBed::start() else {
+        return;
+    };
+    let monitor = ContextMonitor::start(&bed, PLAYBACK);
+    let (_recorder, capture_nodes) = capture_nodes_with_a_link(&bed);
+    bed.restart_session_manager();
+    let created = bed
+        .command("pw-cli")
+        .args([
+            "create-node",
+            "adapter",
+            "{ factory.name = support.null-audio-sink, node.name = late-source, \
+             media.class = Audio/Source, audio.position = \"FL,FR\", object.linger = true }",
+        ])
+        .output()
+        .expect("pw-cli did not run");
+    assert!(created.status.success(), "{created:?}");
+    let late = r#"node.name = "late-source""#;
+    let mut nodes = capture_nodes;
+    let mut host = String::new();
+    wait_for("the late source's ports", || {
+        host = bed.info_from_host();
+        object(&host, &[late, NODE])
+            .is_some_and(|node| !objects_of(&host, std::slice::from_ref(&node.id)).is_empty())
+    });
+    nodes.push(object(&host, &[late, NODE]).expect("the late source").id);
+    monitor.sees_none_of(&objects_of(&host, &nodes));
+    let listing = bed.info_in_context(PLAYBACK, &[SINK]);
+    assert_eq!(
+        objects_of(&listing, &nodes),
+        Vec::<String>::new(),
+        "ports or links of a hidden capture node after a restart:\n{listing}"
+    );
+}
+
+#[test]
+fn a_microphone_context_sees_every_port_and_link_of_a_capture_node() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let (_recorder, capture_nodes) = capture_nodes_with_a_link(&bed);
+    let listing = bed.info_in_context(PLAYBACK_MICROPHONE, &CAPTURE_NODES);
+    assert_eq!(
+        objects_of(&listing, &capture_nodes),
+        objects_of(&bed.info_from_host(), &capture_nodes),
+        "{listing}"
     );
 }
 

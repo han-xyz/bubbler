@@ -86,6 +86,9 @@
 -- application starts at that application's saved levels, and a target
 -- the user picks for it is saved under those names.
 --
+-- A sandbox without the microphone grant sees no port and no link of a
+-- node 50-bubbler.conf hides from it, as it sees no such node.
+--
 -- The policy states its revision in the metadata `bubbler-policy`, key
 -- `revision` on subject 0, which no sandbox can see: bubbler reads it to
 -- tell a WirePlumber still running an older policy.
@@ -99,7 +102,7 @@ local BUBBLER_ENGINE = "org.bubbler"
 
 -- Raised whenever what this policy makes WirePlumber do changes; bubbler
 -- expects the revision it ships with and reads it from this line.
-local POLICY_REVISION = 1
+local POLICY_REVISION = 2
 
 local EPERM = -1
 
@@ -542,6 +545,100 @@ SimpleEventHook {
     client:update_permissions (hidden)
     log:info (client, "every factory but " .. STREAM_FACTORY ..
         " hidden from " .. tostring (client.properties ["pipewire.sec.app-id"]))
+  end
+}:register ()
+
+-- The ports and links of a node 50-bubbler.conf hides carry no
+-- `media.class` for its rules to match (PipeWire 1.6.9), only the node's
+-- id, so they are hidden here, from every sandbox without the microphone
+-- grant. Each is hidden when the later of it and its node arrives: the
+-- daemon may register a port before its node.
+local nodes = ObjectManager {
+  Interest { type = "node" },
+}
+local ports_and_links = ObjectManager {
+  Interest { type = "port" },
+  Interest { type = "link" },
+}
+
+local function blind_to_capture (client)
+  return client.properties ["pipewire.sec.engine"] == BUBBLER_ENGINE and
+      not granted (client, "microphone")
+end
+
+local function is_capture_node (node_id)
+  if not node_id then
+    return false
+  end
+  local node = nodes:lookup {
+    Constraint { "bound-id", "=", node_id, type = "gobject" },
+  }
+  return node ~= nil and capture_capable (node.properties)
+end
+
+-- Whether a port or link belongs to a node `of_node` holds for.
+local function belongs (object, of_node)
+  local props = object.properties
+  return of_node (props ["node.id"]) or
+      of_node (props ["link.output.node"]) or
+      of_node (props ["link.input.node"])
+end
+
+-- The ports and links that belong to a node `of_node` holds for, as a
+-- permissions table hiding each, or nil where there are none.
+local function hidden_of (of_node)
+  local hidden
+  for object in ports_and_links:iterate () do
+    if belongs (object, of_node) then
+      hidden = hidden or {}
+      hidden [object ["bound-id"]] = "-"
+    end
+  end
+  return hidden
+end
+
+local function hide_from_connected_sandboxes (hidden)
+  local source = Plugin.find ("standard-event-source")
+  if not source or not hidden then
+    return
+  end
+  for client in source:call ("get-object-manager", "client"):iterate () do
+    if blind_to_capture (client) then
+      client:update_permissions (hidden)
+    end
+  end
+end
+
+nodes:connect ("object-added", function (_, node)
+  if capture_capable (node.properties) then
+    local id = tostring (node ["bound-id"])
+    hide_from_connected_sandboxes (hidden_of (function (node_id)
+      return node_id == id
+    end))
+  end
+end)
+ports_and_links:connect ("object-added", function (_, object)
+  if belongs (object, is_capture_node) then
+    hide_from_connected_sandboxes ({ [object ["bound-id"]] = "-" })
+  end
+end)
+nodes:activate ()
+ports_and_links:activate ()
+
+SimpleEventHook {
+  name = "bubbler/hide-capture-ports-and-links",
+  before = "client/apply-access",
+  interests = {
+    EventInterest {
+      Constraint { "event.type", "=", "select-access" },
+    },
+  },
+  execute = function (event)
+    local client = event:get_subject ()
+    local hidden = hidden_of (is_capture_node)
+    if blind_to_capture (client) and hidden then
+      client:update_permissions (hidden)
+    end
   end
 }:register ()
 
