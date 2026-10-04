@@ -1,9 +1,10 @@
-//! Spawns bubblewrap and the sidecars a sandbox needs — the filtering
-//! D-Bus proxy and, for an isolated `network`, pasta. The only
-//! process-spawning code in the crate; it never goes through a shell,
-//! every spawn is preceded by a [`fds::sweep_cloexec`] so a child holds
-//! only the descriptors it was meant to, and every sidecar is killed on
-//! every way out of a run.
+//! Spawns bubblewrap and the sidecars a sandbox needs: the D-Bus, Wayland and
+//! egress proxies, the audio sidecars, pasta and `nft`. The only
+//! process-spawning code in the crate; it never goes through a shell.
+//! Every spawn is preceded by a [`fds::sweep_cloexec`], so a child holds
+//! only the descriptors it was meant to: each public function that spawns
+//! marks the caller's other descriptors above stdio close-on-exec, closing
+//! none. Every sidecar is killed on every way out of a run.
 
 use std::ffi::{OsStr, OsString, c_void};
 use std::io::{self, Seek, SeekFrom, Write};
@@ -290,8 +291,8 @@ impl RealAlloc {
         }
     }
 
-    // The window is process-wide, so only one thread may spawn while it is open; bubbler's other
-    // threads (the run log's copier, the KDL parser) open no descriptor and start no process.
+    // CLOEXEC at rest, cleared only around the one spawn they were built for. That window is
+    // process-wide; bubbler's other threads (run-log copier, KDL parser) open no fd, spawn nothing.
     fn inheritable(&self, on: bool) -> io::Result<()> {
         let flags = match on {
             true => FdFlags::empty(),
@@ -313,8 +314,8 @@ impl RealAlloc {
     }
 }
 
-// Nothing is closed: bubbler's own descriptors stay open and only stop crossing into children.
-// Process-wide like `RealAlloc::inheritable`, so one spawning thread at a time.
+// Call immediately before a spawn. Nothing is closed: bubbler's own descriptors only stop
+// crossing into children. Process-wide like `RealAlloc::inheritable`.
 fn spawning(keep: &[RawFd]) -> Result<(), LaunchError> {
     fds::sweep_cloexec(keep).map_err(LaunchError::Descriptors)
 }
@@ -520,6 +521,7 @@ fn build_args_on<'a>(
             .position(|s| matches!(s, Service::Network(c) if c.is_isolated())),
     ];
     // One `--block-fd`: bwrap reads it once, and a second would wait on a pipe nothing closes.
+    // The portal node is first, so it is the one named where both ask.
     if let Some(i) = waits.into_iter().flatten().next() {
         args.tag(Origin::Service(i));
         args.block_until_released();
@@ -613,7 +615,7 @@ pub fn pw_pulse_argv(
         &pipewire::pulse_dir(instance_runtime),
         host,
     );
-    // No instance `seccomp` node reaches here either: the process serving a grant is not the
+    // No instance `seccomp` node reaches here: the process serving a grant is not the
     // process the grant is for.
     args.tag(Origin::Seccomp);
     if let Some(program) = seccomp::compile(&seccomp::RuleSet::default_set(), env.seccomp_log)? {
@@ -864,7 +866,6 @@ pub struct ProxyHandle {
     child: Child,
     alloc: RealAlloc,
     socket_dir: PathBuf,
-    // Fields drop after `drop` has reaped the proxy, so the copy sees the end of its output.
     _stderr: run_log::Relay,
 }
 
@@ -907,8 +908,7 @@ fn wait_ready(
             tv_nsec: POLL.subsec_nanos() as Nsecs,
         };
         match poll(&mut [PollFd::new(ready, PollFlags::IN)], Some(&slice)) {
-            // `Ok(0)` already waited out the slice; a failing poll keeps
-            // failing, so sleep rather than spin until the deadline.
+            // `Ok(0)` already waited out the slice; a failing poll keeps failing, so sleep.
             Ok(0) => {}
             Err(_) => std::thread::sleep(POLL),
             Ok(_) => match rustix::io::read(ready, &mut byte) {
@@ -951,7 +951,6 @@ pub struct WaylandHandle {
     _close: Option<OwnedFd>,
     _socket: FileGuard,
     _context: Option<FileGuard>,
-    // Fields drop after `drop` has reaped the proxy, so the copy sees the end of its output.
     _stderr: run_log::Relay,
 }
 
@@ -984,7 +983,7 @@ impl Drop for WaylandHandle {
 
 /// Bind the socket this run's application connects to and start `bubbler-wl-proxy` behind it,
 /// through a security context where the compositor has one. `Ok(None)` only for `wayland
-/// "host"`. The handle must outlive the sandbox; other fds above stdio are made CLOEXEC.
+/// "host"`. The handle must outlive the sandbox.
 pub fn start_wayland(
     env: &Env,
     dir: &Path,
@@ -1100,7 +1099,6 @@ pub struct PwHandle {
     dir: PathBuf,
     // `None` until the socket is moved out of `dir`; until then it goes with the directory.
     _socket: Option<FileGuard>,
-    // Fields drop after `drop` has reaped the sidecar, so the copy sees the end of its output.
     _stderr: run_log::Relay,
 }
 
@@ -1134,8 +1132,7 @@ impl Drop for PwHandle {
 }
 
 /// Create this run's PipeWire security context and wait for its socket, which bwrap then binds.
-/// `Ok(None)` where no audio is granted. The handle must outlive the sandbox; other fds above
-/// stdio are made CLOEXEC.
+/// `Ok(None)` where no audio is granted. The handle must outlive the sandbox.
 pub fn start_pw_context(
     env: &Env,
     dir: &Path,
@@ -1152,7 +1149,6 @@ pub fn start_pw_context(
     // Probed here, not with the sandbox's argv: that names only the context's socket, and its
     // explanation describes a host whose daemon may not be up yet.
     service::require_socket(host, "pipewire", pipewire::host_socket(&env.runtime_dir))?;
-    // The sidecar's whole `/tmp`, and the only thing it can write.
     let pw = pipewire::dir(dir);
     fresh_sidecar_dir(&pw)?;
     // The pid of this run: two runs of one instance are then two
@@ -1223,8 +1219,7 @@ fn read_report(
             tv_nsec: POLL.subsec_nanos() as Nsecs,
         };
         match poll(&mut [PollFd::new(ready, PollFlags::IN)], Some(&slice)) {
-            // `Ok(0)` already waited out the slice; a failing poll keeps
-            // failing, so sleep rather than spin until the deadline.
+            // `Ok(0)` already waited out the slice; a failing poll keeps failing, so sleep.
             Ok(0) => {}
             Err(_) => std::thread::sleep(POLL),
             Ok(_) => {
@@ -1279,7 +1274,6 @@ fn adopt_socket(
         },
         e => LaunchError::Io(path.clone(), e.into()),
     })?;
-    // Whatever was moved is bubbler's to remove from here on, socket or not.
     let guard = FileGuard(path.clone());
     let wrong_type = |expected| LaunchError::WrongType {
         service,
@@ -1321,7 +1315,6 @@ pub struct PulseHandle {
     dir: PathBuf,
     // `None` until the socket is moved out of `dir`; until then it goes with the directory.
     _socket: Option<FileGuard>,
-    // Fields drop after `drop` has reaped the server, so the copy sees the end of its output.
     _stderr: run_log::Relay,
 }
 
@@ -1353,8 +1346,7 @@ impl Drop for PulseHandle {
 }
 
 /// Start this run's private PulseAudio server, a client of [`start_pw_context`]'s context, and
-/// wait for its socket. `Ok(None)` without `pulseaudio`. The handle must outlive the sandbox;
-/// other fds above stdio are made CLOEXEC.
+/// wait for its socket. `Ok(None)` without `pulseaudio`. The handle must outlive the sandbox.
 pub fn start_pw_pulse(
     env: &Env,
     dir: &Path,
@@ -1433,7 +1425,7 @@ fn prepare_pulse_dir(env: &Env, host: &dyn Host, dir: &Path) -> Result<(), Launc
 }
 
 // The host's main file is copied, not pointed at: `PIPEWIRE_CONFIG_DIR` replaces the search
-// path whole with no fallback for it. The user's fragments are not copied.
+// path whole. User fragments are not: a `server.address` in one would pick the socket.
 fn write_pulse_config(env: &Env, host: &dyn Host, dir: &Path) -> Result<PathBuf, LaunchError> {
     let dirs = pipewire::pulse_conf_dirs(&env.config_home);
     let source = pipewire::pulse_conf(host, &env.config_home).ok_or_else(|| {
@@ -1474,7 +1466,7 @@ fn write_private(path: &Path, content: &[u8]) -> Result<(), LaunchError> {
 }
 
 /// Start an instance's filtering D-Bus proxy in its own sandbox and wait until its socket
-/// exists. The handle must outlive the sandbox; other fds above stdio are made CLOEXEC.
+/// exists. The handle must outlive the sandbox.
 pub fn start_proxy(
     env: &Env,
     dir: &Path,
@@ -1569,8 +1561,8 @@ pub fn start_proxy(
     Ok(handle)
 }
 
-// By pid, not only through bwrap: killing bwrap leaves its child, which the closing block pipe
-// would let exec. SIGKILL from an ancestor namespace reaches a pid 1 (`pid_namespaces(7)`).
+// Before the failing run closes the block pipe, by pid: killing bwrap leaves its child. SIGKILL
+// from an ancestor pid namespace reaches a pid 1 (`pid_namespaces(7)`).
 fn abort_sandbox(child: &mut Child, sandbox: Option<i32>) {
     if let Some(pid) = sandbox.and_then(Pid::from_raw) {
         let _ = kill_process(pid, Signal::KILL);
@@ -1583,9 +1575,8 @@ fn abort_sandbox(child: &mut Child, sandbox: Option<i32>) {
 #[derive(Debug)]
 struct PastaHandle {
     child: Child,
-    // Also stops the pid being signalled once it is no longer pasta's.
+    // Set once reaped: the notice appears once and the pid is never signalled after.
     exited: bool,
-    // Fields drop after `drop` has reaped pasta, so the copy sees the end of its output.
     _stderr: run_log::Relay,
 }
 
@@ -1610,7 +1601,6 @@ impl Drop for PastaHandle {
     // pasta quits with its namespace (`pasta(1)`; no `--no-netns-quit`), but a sidecar with a
     // route out is not left to a condition bubbler does not control.
     fn drop(&mut self) {
-        // `exited` is the run's own check having seen it go.
         if self.exited || !still_running(&mut self.child) {
             return;
         }
@@ -1711,7 +1701,7 @@ fn sandbox_namespaces(child_pid: i32) -> Result<SandboxNs, LaunchError> {
     let mnt_path = PathBuf::from(format!("/proc/{child_pid}/ns/mnt"));
     let mnt = rustix::fs::open(&mnt_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
         .map_err(|e| LaunchError::Io(mnt_path, e.into()))?;
-    // Its own check: a pid reused between the two `open`s would join the proxy to a stranger's
+    // Checked apart: a pid reused between the two `open`s would join the proxy to a stranger's
     // mount namespace and the sandbox's network namespace.
     if same_namespace(mnt.as_fd(), Path::new("/proc/self/ns/mnt"))? {
         return Err(LaunchError::Network(
@@ -1721,8 +1711,8 @@ fn sandbox_namespaces(child_pid: i32) -> Result<SandboxNs, LaunchError> {
     Ok(SandboxNs { net, user, mnt })
 }
 
-// Before pasta and the release, and fatal when it fails. `cgroup` must exist already:
-// nftables stores the id the path resolves to, so a later cgroup would match nothing.
+// `nft` is spawned, not linked: a library means `libnftnl` or `bindgen` for a stable text
+// format. `cgroup` must exist already: nftables stores the id the path resolves to.
 fn install_rules(
     cfg: &NetworkConfig,
     ns: &SandboxNs,
@@ -1973,9 +1963,8 @@ fn start_pasta(
 #[derive(Debug)]
 struct NetProxyHandle {
     child: Child,
-    // Also stops the pid being signalled once it is no longer the proxy's.
+    // Set once reaped: the notice appears once and the pid is never signalled after.
     exited: bool,
-    // Fields drop after `drop` has reaped the proxy, so the copy sees the end of its output.
     _stderr: run_log::Relay,
 }
 
@@ -2072,7 +2061,6 @@ fn start_net_proxy(
         cfg,
         network::ProxyFds {
             ready: &OsString::from(done.as_raw_fd().to_string()),
-            // The proxy's audit lines go where bubbler's own do.
             log: OsStr::new("2"),
         },
         log_tunnels,
@@ -2137,8 +2125,6 @@ fn start_net_proxy(
     // Never `LaunchError::Spawn`, which names bwrap: a failed `pre_exec` step arrives as a failed
     // spawn too, and its `NotFound` is not a missing binary.
     let spawned = cmd.spawn();
-    // `cmd` holds bubbler's copy of the relay's write end; see
-    // `spawn_sidecar`.
     drop(cmd);
     let child =
         spawned.map_err(|e| LaunchError::Network(format!("starting the egress proxy: {e}")))?;
@@ -2235,7 +2221,6 @@ fn adopt_proxy_bus(
         },
         e => LaunchError::Io(path.clone(), e.into()),
     })?;
-    // Whatever was moved is bubbler's to remove from here on, socket or not.
     let guard = FileGuard(path.clone());
     let wrong_type = |expected| LaunchError::WrongType {
         service: node,
@@ -2268,7 +2253,7 @@ fn adopt_proxy_bus(
     Ok(guard)
 }
 
-// Else the next start's rename onto this name fails; after the move only bubbler reaches it.
+// Cleared so the next start's rename onto this name works; after the move only bubbler reaches it.
 fn remove_moved_dir(inst: &OwnedFd, dir: &Path, socket: &str) {
     if let Err(e) = move_aside(inst, dir, OsStr::new(socket)) {
         eprintln!(
@@ -2314,8 +2299,8 @@ fn mkdir_private(dir: &Path) -> Result<(), LaunchError> {
 // the rest.
 const LEFTOVER_BUDGET: usize = 100_000;
 
-// Whatever is at the name is renamed aside and removed best-effort, so no link or endless
-// tree a dead sidecar left is written through or blocks the start.
+// Only after this run's control-socket bind found no live run: that makes it the one start
+// clearing. What is at the name is moved aside and removed best-effort, never followed.
 fn fresh_sidecar_dir(dir: &Path) -> Result<(), LaunchError> {
     let io_at = |e: Errno| LaunchError::Io(dir.to_path_buf(), e.into());
     let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
@@ -2344,7 +2329,8 @@ fn move_aside(at: &OwnedFd, dir: &Path, name: &OsStr) -> rustix::io::Result<()> 
     Ok(())
 }
 
-// Not `std::fs::remove_dir_all`: it recurses, and a deep enough tree overflows the stack.
+// Only once the sidecar has exited. Not `std::fs::remove_dir_all`: it recurses, and a deep
+// enough tree overflows the stack.
 fn remove_sidecar_dir(dir: &Path) {
     let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
         return;
@@ -2532,7 +2518,6 @@ fn prepare_app_runtime(env: &Env, services: &[Service]) -> Result<(), LaunchErro
     Ok(())
 }
 
-// `named` and `service` are for the error only.
 fn open_dir_nofollow<P: rustix::path::Arg>(
     at: impl AsFd,
     path: P,
@@ -2941,8 +2926,8 @@ fn wait_relaying(
 }
 
 /// Start the instance and return the exit code to propagate. `AlreadyRunning` when it is live,
-/// for the caller to turn into an exec. `log` is told whether this run started the sandbox;
-/// other fds above stdio are made CLOEXEC.
+/// for the caller to turn into an exec. A stop signal during startup stops what was started and
+/// returns 128+SIGTERM. `log` is told whether this run started the sandbox.
 pub fn run(
     env: &Env,
     inst: &Instance,
@@ -3071,7 +3056,6 @@ fn bind_control_socket(
 #[derive(Debug)]
 struct SocketGuard {
     path: PathBuf,
-    /// Device and inode of the socket as bound.
     id: (u64, u64),
 }
 
@@ -3087,8 +3071,8 @@ impl Drop for SocketGuard {
     }
 }
 
-// So a start made now waits for this run's teardown. A lock that cannot be had costs only that
-// guarantee, so it is a warning.
+// Taken once the sandbox has exited, so a start made now waits for this run's teardown. A lock
+// that cannot be had costs only that guarantee, so it is a warning.
 fn lock_for_teardown(path: &Path) -> Option<OwnedFd> {
     let locked = open_start_lock(path).and_then(|lock| {
         flock(&lock, FlockOperation::LockExclusive)
@@ -3144,13 +3128,12 @@ fn start_and_wait(
     if stop.load(Ordering::SeqCst) {
         return Ok(STOPPED_CODE);
     }
-    // Before the argv: the sandbox binds the socket this sidecar accepts on, and a bind of a
-    // socket nothing listens on is a failed start.
+    // The sandbox binds the socket this sidecar accepts on, so it too starts before the argv.
     let _wayland = start_wayland(env, &dir, inst, &RealHost, stop)?;
     if stop.load(Ordering::SeqCst) {
         return Ok(STOPPED_CODE);
     }
-    // Before the argv too: the context socket is the only PipeWire socket the sandbox gets.
+    // Before the argv: the context socket is the only PipeWire socket the sandbox gets.
     let _pw_context = start_pw_context(env, &dir, inst, &RealHost, stop)?;
     if stop.load(Ordering::SeqCst) {
         return Ok(STOPPED_CODE);
@@ -3169,8 +3152,6 @@ fn start_and_wait(
     {
         stdio.pty = Some(tty::allocate(host[i].as_fd())?);
     }
-    // Before the argv is built, for the same reason the proxy is: a bind
-    // whose source is not there is a failed start, not a warning.
     prepare_app_runtime(env, &inst.config.services)?;
     // Before bwrap, which never changes cgroup: the sandbox inherits the run's `sandbox` leaf, and
     // the proxy's leaf beside it is out of its reach. Dropped after the sidecars below.
