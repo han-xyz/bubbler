@@ -4,6 +4,7 @@
 //! holds cannot fail to parse, which is why there is no syntax error to
 //! recover from anywhere below.
 
+use bubbler_core::audio_policy::AskedOnce;
 use bubbler_core::catalogue::{self, Grant};
 use bubbler_core::config::{
     self, Disabled, EtcMode, InstanceConfig, Node, Portal, RawProfile, Service, Userns,
@@ -121,6 +122,9 @@ pub struct Detail {
     /// cannot be told about a bind after the fact, so an edit describes
     /// the next start.
     pub live: bool,
+    /// Kept while this config is open, since it is linted on every change; asked again on the
+    /// next open.
+    loaded: AskedOnce,
 }
 
 impl Detail {
@@ -140,6 +144,7 @@ impl Detail {
             findings: Vec::new(),
             trouble: None,
             live,
+            loaded: AskedOnce::default(),
         };
         detail.refresh(env);
         Ok(detail)
@@ -223,7 +228,7 @@ impl Detail {
             env,
             host: &RealHost,
             search_path: &search,
-            loaded_revision: &crate::env::loaded_revision,
+            loaded_revision: &|env: &Env| self.loaded.get(env),
         };
         match lint::lint_text(&ctx, Where::File(self.path()), text) {
             Ok(report) => self.findings = report.findings,

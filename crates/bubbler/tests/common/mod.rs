@@ -41,9 +41,7 @@ pub fn say(line: &str) {
     }
 }
 
-/// The private PipeWire and WirePlumber pair `bubbler-core`'s bed tests
-/// start, for a test that points bubbler at it.
-// Most of the bed drives contexts the CLI tests do not need.
+/// `bubbler-core`'s PipeWire bed; the CLI tests use only part of it, hence the allow.
 #[allow(dead_code)]
 pub mod bed {
     include!("../../../bubbler-core/tests/support/bed.rs");

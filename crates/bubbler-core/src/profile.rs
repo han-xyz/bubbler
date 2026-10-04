@@ -1218,6 +1218,7 @@ mod tests {
             profile_dir_override: Some(root.join("system")),
             proxy_override: None,
             pasta_override: None,
+            pw_metadata_override: None,
             wl_proxy_override: None,
             net_proxy_override: None,
         }
@@ -1650,7 +1651,9 @@ mod tests {
                 env: &e,
                 host: &host,
                 search_path: &search_path,
-                loaded_revision: &|_: &Path| crate::audio_policy::LoadedRevision::Current,
+                loaded_revision: &|_: &crate::env::Env| {
+                    crate::audio_policy::LoadedRevision::Current
+                },
             };
             let report =
                 lint::lint_profile(&ctx, &r, name).unwrap_or_else(|err| panic!("{name}: {err}"));

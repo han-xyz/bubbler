@@ -3,6 +3,7 @@
 //! liveness probe on every tick.
 
 use anyhow::{Context, Result};
+use bubbler_core::audio_policy::AskedOnce;
 use bubbler_core::env::Env;
 use bubbler_core::host::RealHost;
 use bubbler_core::instance::{self, Instance};
@@ -80,11 +81,12 @@ impl Store {
     pub fn load(env: &Env) -> Result<Self> {
         let names = Instance::list(env).context("listing instances")?;
         let search = crate::env::search_path();
+        let asked = AskedOnce::default();
         let ctx = lint::Context {
             env,
             host: &RealHost,
             search_path: &search,
-            loaded_revision: &crate::env::loaded_revision,
+            loaded_revision: &|env: &Env| asked.get(env),
         };
         let rows = names.iter().map(|name| row(env, &ctx, name)).collect();
         let (profiles, profile_error) = match profile::Resolver::new(env).list() {

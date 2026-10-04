@@ -111,6 +111,9 @@ pub fn from_process() -> Result<Env> {
         pasta_override: env::var_os("BUBBLER_PASTA")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from),
+        pw_metadata_override: env::var_os("BUBBLER_PW_METADATA")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from),
         wl_proxy_override: env::var_os("BUBBLER_WL_PROXY")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from),

@@ -88,7 +88,7 @@ const AUDIO_POLICY_DIFFERS: Check = Check {
 // A warning, as `audio-policy-missing` is: the files are in place and the
 // grant is still not enforced as they state it.
 const AUDIO_POLICY_NOT_LOADED: Check = Check {
-    id: "audio-policy-not-loaded",
+    id: audio_policy::NOT_LOADED_CHECK,
     severity: Severity::Warning,
 };
 // The same id as a note, where the running WirePlumber could not be asked:
@@ -449,7 +449,7 @@ pub struct Context<'a> {
     pub search_path: &'a [PathBuf],
     /// [`audio_policy::loaded_revision`] outside the tests; asked only of a config with an audio
     /// grant and the whole policy installed.
-    pub loaded_revision: &'a dyn Fn(&Path) -> LoadedRevision,
+    pub loaded_revision: &'a dyn Fn(&Env) -> LoadedRevision,
 }
 
 /// Commands known to start a sandbox of their own inside this one, which
@@ -1288,15 +1288,22 @@ fn audio_policy_differs(ctx: &Context, sources: &[Source], f: &mut Findings) {
 }
 
 fn audio_policy_not_loaded(ctx: &Context, sources: &[Source], f: &mut Findings) {
-    // `audio-policy-missing` already says so, with the same restart.
-    if audio_policy::missing(ctx.host, ctx.env).is_some() {
+    // The missing or differing files are the cause, and their findings name the fix.
+    let differs_accepted = sources
+        .iter()
+        .flat_map(|s| top(s, "lint-allow"))
+        .filter_map(arg)
+        .any(|id| id == audio_policy::DIFFERS_CHECK);
+    if audio_policy::missing(ctx.host, ctx.env).is_some()
+        || (!differs_accepted && !audio_policy::differing(ctx.host, ctx.env).is_empty())
+    {
         return;
     }
     let Some((i, node, name)) = audio_node(sources) else {
         return;
     };
     let restart = format!("`{}`", audio_policy::RESTART);
-    let loaded = (ctx.loaded_revision)(&ctx.env.runtime_dir);
+    let loaded = (ctx.loaded_revision)(ctx.env);
     if let LoadedRevision::Unknown(reason) = &loaded {
         f.push(
             i,
@@ -2210,6 +2217,7 @@ mod tests {
             profile_dir_override: None,
             proxy_override: None,
             pasta_override: None,
+            pw_metadata_override: None,
             wl_proxy_override: None,
             net_proxy_override: None,
         }
@@ -2220,7 +2228,7 @@ mod tests {
     fn with<T>(host: &dyn Host, f: impl FnOnce(&Context) -> T) -> T {
         let e = env();
         let path = [PathBuf::from("/usr/bin")];
-        let current = |_: &Path| LoadedRevision::Current;
+        let current = |_: &Env| LoadedRevision::Current;
         f(&Context {
             env: &e,
             host,
@@ -3007,7 +3015,7 @@ mod tests {
             env: &inside,
             host: &host,
             search_path: &search,
-            loaded_revision: &|_: &Path| LoadedRevision::Current,
+            loaded_revision: &|_: &Env| LoadedRevision::Current,
         };
         assert_eq!(
             ids(&lint(&ctx, &["home-share \"myprofiles\" mode=rw"])),
@@ -3019,7 +3027,7 @@ mod tests {
             env: &outside,
             host: &host,
             search_path: &search,
-            loaded_revision: &|_: &Path| LoadedRevision::Current,
+            loaded_revision: &|_: &Env| LoadedRevision::Current,
         };
         assert_eq!(
             ids(&lint(&ctx, &["path-share \"/kioxia/profiles\" mode=rw"])),
@@ -3901,7 +3909,7 @@ mod tests {
     fn lint_loaded(host: &dyn Host, loaded: LoadedRevision, layers: &[&str]) -> Report {
         let e = env();
         let path = [PathBuf::from("/usr/bin")];
-        let read = |_: &Path| loaded.clone();
+        let read = |_: &Env| loaded.clone();
         lint(
             &Context {
                 env: &e,
@@ -3958,7 +3966,7 @@ mod tests {
     fn the_loaded_policy_is_asked_only_of_an_audio_grant_with_the_whole_policy() {
         let e = env();
         let path = [PathBuf::from("/usr/bin")];
-        let unasked = |_: &Path| -> LoadedRevision { panic!("the reader was asked") };
+        let unasked = |_: &Env| -> LoadedRevision { panic!("the reader was asked") };
         for (host, layer, expected) in [
             (whole_policy(), "wayland", &[][..]),
             (host(), "pipewire", &["audio-policy-missing"][..]),
@@ -3971,6 +3979,20 @@ mod tests {
             };
             assert_eq!(ids(&lint(&ctx, &[layer])), expected, "{layer}");
         }
+    }
+
+    #[test]
+    fn a_differing_copy_holds_the_not_loaded_finding_back_unless_accepted() {
+        let drop_in = "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf";
+        let differs = whole_policy().text(drop_in, "# another version\n");
+        let report = lint_loaded(&differs, LoadedRevision::Absent, &["pipewire"]);
+        assert_eq!(ids(&report), ["audio-policy-differs"]);
+        let report = lint_loaded(
+            &differs,
+            LoadedRevision::Absent,
+            &["pipewire\nlint-allow \"audio-policy-differs\" reason=\"kept on purpose\""],
+        );
+        assert_eq!(ids(&report), ["audio-policy-not-loaded"]);
     }
 
     #[test]
@@ -4069,7 +4091,7 @@ mod tests {
                 env: &e,
                 host: &host,
                 search_path: &search_path,
-                loaded_revision: &|_: &Path| LoadedRevision::Current,
+                loaded_revision: &|_: &Env| LoadedRevision::Current,
             };
             let report =
                 lint_profile(&ctx, &resolver, name).unwrap_or_else(|err| panic!("{name}: {err}"));
@@ -4130,7 +4152,7 @@ mod tests {
             env: &e,
             host: &host,
             search_path: &search,
-            loaded_revision: &|_: &Path| LoadedRevision::Current,
+            loaded_revision: &|_: &Env| LoadedRevision::Current,
         };
         let err = lint_profile(&ctx, &r, "app").expect_err("`bluetooth` is not a node");
         assert!(matches!(err, LintError::Profile(_)), "{err:?}");
@@ -4164,7 +4186,7 @@ mod tests {
             env: &e,
             host: &host,
             search_path: &search,
-            loaded_revision: &|_: &Path| LoadedRevision::Current,
+            loaded_revision: &|_: &Env| LoadedRevision::Current,
         };
         let mut all = Report::default();
         for name in ["a", "b"] {

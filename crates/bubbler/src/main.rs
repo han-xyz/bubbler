@@ -1229,6 +1229,9 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
         return print_policy(script);
     }
     let env = host_env::from_process()?;
+    // One answer per invocation: `profile lint --all` would otherwise ask once per audio profile.
+    let asked = audio_policy::AskedOnce::default();
+    let loaded_revision = |env: &Env| asked.get(env);
     match cli.cmd {
         Cmd::Create { name, profile } => {
             let inst = Instance::create(&env, &name, &profile)
@@ -1238,7 +1241,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                 env: &env,
                 host: &RealHost,
                 search_path: &path,
-                loaded_revision: &audio_policy::loaded_revision,
+                loaded_revision: &loaded_revision,
             };
             warn_lint(lint::lint_config(&ctx, &inst.config_path()));
             print_lines(&[inst.dir.as_os_str()], "the instance directory")
@@ -1359,7 +1362,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                         &inst.config,
                         &RealHost,
                         &env,
-                        audio_policy::loaded_revision,
+                        loaded_revision,
                     ) {
                         ediag!("bubbler: warning: {warning}");
                     }
@@ -1459,7 +1462,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                 &eph.instance.config,
                 &RealHost,
                 &env,
-                audio_policy::loaded_revision,
+                loaded_revision,
             ) {
                 ediag!("bubbler: warning: {warning}");
             }
@@ -1556,7 +1559,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                         &inst.config,
                         &RealHost,
                         &env,
-                        audio_policy::loaded_revision,
+                        loaded_revision,
                     ) {
                         ediag!("bubbler: warning: {warning}");
                     }
@@ -1704,7 +1707,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                     env: &env,
                     host: &RealHost,
                     search_path: &search,
-                    loaded_revision: &audio_policy::loaded_revision,
+                    loaded_revision: &loaded_revision,
                 };
                 warn_lint(lint::lint_config(&ctx, &path));
             }
@@ -1738,7 +1741,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                         env: &env,
                         host: &RealHost,
                         search_path: &search,
-                        loaded_revision: &audio_policy::loaded_revision,
+                        loaded_revision: &loaded_revision,
                     };
                     warn_lint(lint::lint_profile(&ctx, &profiles, &name));
                 }
@@ -1751,7 +1754,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                     env: &env,
                     host: &RealHost,
                     search_path: &search,
-                    loaded_revision: &audio_policy::loaded_revision,
+                    loaded_revision: &loaded_revision,
                 };
                 let found = match (name.as_deref(), all) {
                     (Some(name), false) => lint::lint_profile(&ctx, &profiles, name),
@@ -1785,7 +1788,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                 env: &env,
                 host: &RealHost,
                 search_path: &path,
-                loaded_revision: &audio_policy::loaded_revision,
+                loaded_revision: &loaded_revision,
             };
             warn_lint(lint::lint_config(&ctx, &config));
             print_lines(&[config.as_os_str()], "the config path")
@@ -1817,7 +1820,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                 env: &env,
                 host: &RealHost,
                 search_path: &path,
-                loaded_revision: &audio_policy::loaded_revision,
+                loaded_revision: &loaded_revision,
             };
             // Every way the run itself can fail is exit 3: "this file is
             // not one bubbler reads" is a different answer from "this

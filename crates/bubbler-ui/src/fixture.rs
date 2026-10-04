@@ -37,6 +37,8 @@ pub fn env(root: &Path) -> Env {
         profile_dir_override: Some(root.join("profiles")),
         proxy_override: None,
         pasta_override: None,
+        // A path with nothing at it: no test asks the host's WirePlumber.
+        pw_metadata_override: Some(root.join("pw-metadata")),
         wl_proxy_override: None,
         net_proxy_override: None,
     }

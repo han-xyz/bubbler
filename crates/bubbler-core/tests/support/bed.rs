@@ -1,6 +1,5 @@
-// A private PipeWire and WirePlumber pair for the tests that measure
-// bubbler against a real one: `include!`d by `real_pipewire.rs` and by the
-// bubbler crate's `tests/common`, which drives the CLI against it.
+// A private PipeWire and WirePlumber pair, `include!`d by `real_pipewire.rs` and by the bubbler
+// crate's `tests/common`.
 
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -514,11 +513,11 @@ fn session_tests_wanted() -> bool {
 /// is never published.
 pub fn loaded_revision(bed: &PipeWireBed) -> LoadedRevision {
     let run = bed.dir().join("run");
-    let mut answer = audio_policy::loaded_revision(&run);
+    let mut answer = audio_policy::loaded_revision_asking(Path::new(audio_policy::PW_METADATA), &run);
     let deadline = Instant::now() + Duration::from_secs(2);
     while answer == LoadedRevision::Absent && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
-        answer = audio_policy::loaded_revision(&run);
+        answer = audio_policy::loaded_revision_asking(Path::new(audio_policy::PW_METADATA), &run);
     }
     answer
 }

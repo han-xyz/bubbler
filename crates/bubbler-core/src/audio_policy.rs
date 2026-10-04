@@ -6,6 +6,7 @@
 //! without touching the source tree it was built from; and the policy
 //! revision the running WirePlumber has loaded.
 
+use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -201,6 +202,9 @@ pub fn missing(host: &dyn Host, env: &Env) -> Option<Missing> {
 /// lint check that reports it.
 pub const DIFFERS_CHECK: &str = "audio-policy-differs";
 
+/// The lint check for a policy the running WirePlumber has not loaded.
+pub const NOT_LOADED_CHECK: &str = "audio-policy-not-loaded";
+
 /// The warning where this run needs it: `cfg` grants `pipewire` or
 /// `pulseaudio` and the host holds less than the whole policy, or a
 /// copy that differs from this binary's which `cfg` does not accept with
@@ -210,11 +214,7 @@ pub const DIFFERS_CHECK: &str = "audio-policy-differs";
 pub fn run_warning(cfg: &InstanceConfig, host: &dyn Host, env: &Env) -> Option<String> {
     cfg.audio()?;
     let missing = missing(host, env).map(Missing::run_warning);
-    let accepted = cfg
-        .lint_allows
-        .iter()
-        .any(|allow| allow.id == DIFFERS_CHECK);
-    let paths = if accepted {
+    let paths = if accepts(cfg, DIFFERS_CHECK) {
         Vec::new()
     } else {
         differing(host, env)
@@ -228,19 +228,24 @@ pub fn run_warning(cfg: &InstanceConfig, host: &dyn Host, env: &Env) -> Option<S
     }
 }
 
-/// `read` is asked only for an audio grant on a host holding the whole policy: where a half is
-/// [`missing`], [`run_warning`] already says so, with the same restart.
+/// Held back where [`run_warning`] reports the installed files, which a restart alone does not fix,
+/// and where `cfg` accepts [`NOT_LOADED_CHECK`]; `read` is not asked then.
 pub fn not_loaded_warning(
     cfg: &InstanceConfig,
     host: &dyn Host,
     env: &Env,
-    read: impl FnOnce(&Path) -> LoadedRevision,
+    read: impl FnOnce(&Env) -> LoadedRevision,
 ) -> Option<String> {
     cfg.audio()?;
-    if missing(host, env).is_some() {
+    let differs_reported = !accepts(cfg, DIFFERS_CHECK) && !differing(host, env).is_empty();
+    if missing(host, env).is_some() || differs_reported || accepts(cfg, NOT_LOADED_CHECK) {
         return None;
     }
-    read(&env.runtime_dir).run_warning()
+    read(env).run_warning()
+}
+
+fn accepts(cfg: &InstanceConfig, check: &str) -> bool {
+    cfg.lint_allows.iter().any(|allow| allow.id == check)
 }
 
 /// The audio group header's suffix: the policy missing, differing or not loaded; `""` where it is
@@ -249,7 +254,7 @@ pub fn explain_suffix(
     cfg: &InstanceConfig,
     host: &dyn Host,
     env: &Env,
-    read: impl FnOnce(&Path) -> LoadedRevision,
+    read: impl FnOnce(&Env) -> LoadedRevision,
 ) -> String {
     if let Some(case) = missing(host, env) {
         return case.explain_suffix().to_owned();
@@ -260,7 +265,7 @@ pub fn explain_suffix(
         EXPLAIN_SUFFIX_DIFFERS
     };
     let loaded = match cfg.audio() {
-        Some(_) => read(&env.runtime_dir).explain_suffix(),
+        Some(_) => read(env).explain_suffix(),
         None => None,
     };
     format!("{differs}{}", loaded.unwrap_or_default())
@@ -384,7 +389,7 @@ pub enum LoadedRevision {
 
 const NOT_ENFORCED: &str = "audio grants are not enforced as configured";
 
-/// What loads the installed policy into the running WirePlumber.
+/// WirePlumber reads the policy files only when it starts.
 pub const RESTART: &str = "systemctl --user restart wireplumber";
 
 impl LoadedRevision {
@@ -404,6 +409,7 @@ impl LoadedRevision {
         }
     }
 
+    /// The run's warning for [`Absent`](Self::Absent) and [`Other`](Self::Other); `None` otherwise.
     pub fn run_warning(&self) -> Option<String> {
         self.not_loaded()
             .map(|cause| format!("{cause}: {NOT_ENFORCED}; run `{RESTART}`"))
@@ -441,15 +447,30 @@ pub fn parse_loaded_revision(stdout: &str) -> LoadedRevision {
     }
 }
 
-/// The policy revision the WirePlumber serving the PipeWire socket in
-/// `runtime_dir` has loaded, asked of [`PW_METADATA`] with nothing of
-/// bubbler's environment but that directory. An answer that does not
-/// come within two seconds is [`LoadedRevision::Unknown`].
-pub fn loaded_revision(runtime_dir: &Path) -> LoadedRevision {
-    loaded_revision_asking(Path::new(PW_METADATA), runtime_dir)
+/// The revision loaded by the WirePlumber on `env`'s runtime directory, asked with nothing else of
+/// bubbler's environment; no answer within two seconds is [`LoadedRevision::Unknown`].
+pub fn loaded_revision(env: &Env) -> LoadedRevision {
+    let program = env
+        .pw_metadata_override
+        .as_deref()
+        .unwrap_or(Path::new(PW_METADATA));
+    loaded_revision_asking(program, &env.runtime_dir)
 }
 
-fn loaded_revision_asking(program: &Path, runtime_dir: &Path) -> LoadedRevision {
+/// [`loaded_revision`] asked on the first [`get`](Self::get) only, so that everything one caller
+/// lints or runs pays for one `pw-metadata` at most.
+#[derive(Default)]
+pub struct AskedOnce(OnceCell<LoadedRevision>);
+
+impl AskedOnce {
+    /// The answer for `env`, asked of it on the first call and kept.
+    pub fn get(&self, env: &Env) -> LoadedRevision {
+        self.0.get_or_init(|| loaded_revision(env)).clone()
+    }
+}
+
+/// [`loaded_revision`] of the WirePlumber serving `runtime_dir`, asked of `program`.
+pub fn loaded_revision_asking(program: &Path, runtime_dir: &Path) -> LoadedRevision {
     let spawned = Command::new(program)
         .arg("-n")
         .arg(POLICY_METADATA)
@@ -551,6 +572,7 @@ mod tests {
             profile_dir_override: None,
             proxy_override: None,
             pasta_override: None,
+            pw_metadata_override: None,
             wl_proxy_override: None,
             net_proxy_override: None,
         }
@@ -939,7 +961,7 @@ mod tests {
     fn explain_suffix_is_empty_once_both_files_are_installed() {
         let e = env();
         let audio = crate::config::parse("pipewire\ncommand \"true\"").unwrap();
-        let current = |_: &Path| LoadedRevision::Current;
+        let current = |_: &Env| LoadedRevision::Current;
         assert_eq!(
             explain_suffix(&audio, &FakeHost::default(), &e, current),
             Missing::Both.explain_suffix()
@@ -1023,6 +1045,23 @@ mod tests {
         path
     }
 
+    // A thread of this binary that forked while the stand-in was open for writing makes its exec
+    // fail with ETXTBSY until that child execs, within a scheduling turn.
+    fn asking_past_a_busy_exec(tool: &Path, runtime_dir: &Path) -> LoadedRevision {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let answer = loaded_revision_asking(tool, runtime_dir);
+            match &answer {
+                LoadedRevision::Unknown(reason)
+                    if reason.contains("os error 26") && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                _ => return answer,
+            }
+        }
+    }
+
     #[test]
     fn a_missing_tool_is_unknown() {
         let tmp = tempfile::tempdir().expect("a temp dir");
@@ -1038,7 +1077,7 @@ mod tests {
             tmp.path(),
             "echo \"can't connect: Host is down\" >&2; exit 255",
         );
-        let answer = loaded_revision_asking(&tool, tmp.path());
+        let answer = asking_past_a_busy_exec(&tool, tmp.path());
         let LoadedRevision::Unknown(reason) = answer else {
             panic!("{answer:?}");
         };
@@ -1050,12 +1089,15 @@ mod tests {
         let tmp = tempfile::tempdir().expect("a temp dir");
         let tool = stand_in(tmp.path(), "exec sleep 30");
         let started = Instant::now();
-        let answer = loaded_revision_asking(&tool, tmp.path());
-        assert!(matches!(answer, LoadedRevision::Unknown(_)), "{answer:?}");
+        let answer = asking_past_a_busy_exec(&tool, tmp.path());
+        let elapsed = started.elapsed();
+        let LoadedRevision::Unknown(reason) = answer else {
+            panic!("{answer:?}");
+        };
+        assert!(reason.contains("did not answer within"), "{reason}");
         assert!(
-            started.elapsed() < READ_TIMEOUT * 2,
-            "{:?}",
-            started.elapsed()
+            (READ_TIMEOUT..READ_TIMEOUT * 2).contains(&elapsed),
+            "{elapsed:?}"
         );
     }
 
@@ -1096,19 +1138,58 @@ mod tests {
         ]);
         let audio = crate::config::parse("pipewire\ncommand \"true\"").unwrap();
         let silent = crate::config::parse("command \"true\"").unwrap();
-        let unasked = |_: &Path| -> LoadedRevision { panic!("the reader was asked") };
+        let unasked = |_: &Env| -> LoadedRevision { panic!("the reader was asked") };
         assert_eq!(not_loaded_warning(&silent, &whole, &e, unasked), None);
         assert_eq!(
             not_loaded_warning(&audio, &FakeHost::default(), &e, unasked),
             None
         );
         let asked = std::cell::Cell::new(None);
-        let warning = not_loaded_warning(&audio, &whole, &e, |dir: &Path| {
-            asked.set(Some(dir.to_owned()));
+        let warning = not_loaded_warning(&audio, &whole, &e, |asked_of: &Env| {
+            asked.set(Some(asked_of.runtime_dir.clone()));
             LoadedRevision::Absent
         });
         assert_eq!(warning, LoadedRevision::Absent.run_warning());
         assert_eq!(asked.take(), Some(e.runtime_dir.clone()));
+    }
+
+    #[test]
+    fn a_differing_copy_is_the_one_warning_unless_accepted() {
+        let e = env();
+        let whole = || {
+            holding(&[
+                install_dirs(&e)[0].join(DROP_IN_NAME),
+                hook_dirs(&e)[0].join(HOOK_NAME),
+            ])
+        };
+        let edited = install_dirs(&e)[0].join(DROP_IN_NAME);
+        let differs = whole().text(edited.to_str().unwrap(), "# another version\n");
+        let absent = |_: &Env| LoadedRevision::Absent;
+        let unasked = |_: &Env| -> LoadedRevision { panic!("the reader was asked") };
+        let config = |allows: &[&str]| {
+            let allows: String = allows
+                .iter()
+                .map(|id| format!("lint-allow \"{id}\" reason=\"kept on purpose\"\n"))
+                .collect();
+            crate::config::parse(&format!("pipewire\n{allows}command \"true\"")).unwrap()
+        };
+        let plain = config(&[]);
+        assert!(run_warning(&plain, &differs, &e).is_some());
+        assert_eq!(not_loaded_warning(&plain, &differs, &e, unasked), None);
+        let differs_accepted = config(&[DIFFERS_CHECK]);
+        assert_eq!(run_warning(&differs_accepted, &differs, &e), None);
+        assert_eq!(
+            not_loaded_warning(&differs_accepted, &differs, &e, absent),
+            LoadedRevision::Absent.run_warning()
+        );
+        let both = config(&[DIFFERS_CHECK, NOT_LOADED_CHECK]);
+        assert_eq!(run_warning(&both, &differs, &e), None);
+        assert_eq!(not_loaded_warning(&both, &differs, &e, absent), None);
+        let not_loaded_accepted = config(&[NOT_LOADED_CHECK]);
+        assert_eq!(
+            not_loaded_warning(&not_loaded_accepted, &whole(), &e, unasked),
+            None
+        );
     }
 
     #[test]
@@ -1119,22 +1200,22 @@ mod tests {
             install_dirs(&e)[0].join(DROP_IN_NAME),
             hook_dirs(&e)[0].join(HOOK_NAME),
         ]);
-        let other = |_: &Path| LoadedRevision::Other("7".to_owned());
+        let other = |_: &Env| LoadedRevision::Other("7".to_owned());
         let suffix = explain_suffix(&audio, &whole, &e, other);
         assert!(suffix.starts_with(" ("), "{suffix}");
         assert!(suffix.contains("revision 7"), "{suffix}");
         assert_eq!(
-            explain_suffix(&audio, &whole, &e, |_: &Path| LoadedRevision::Current),
+            explain_suffix(&audio, &whole, &e, |_: &Env| LoadedRevision::Current),
             ""
         );
         assert_eq!(
-            explain_suffix(&audio, &whole, &e, |_: &Path| LoadedRevision::Unknown(
+            explain_suffix(&audio, &whole, &e, |_: &Env| LoadedRevision::Unknown(
                 "no daemon".to_owned()
             )),
             ""
         );
         let edited = install_dirs(&e)[0].join(DROP_IN_NAME);
-        let unasked = |_: &Path| -> LoadedRevision { panic!("the reader was asked") };
+        let unasked = |_: &Env| -> LoadedRevision { panic!("the reader was asked") };
         let silent = crate::config::parse("command \"true\"").unwrap();
         assert_eq!(explain_suffix(&silent, &whole, &e, unasked), "");
         let differs = whole.text(edited.to_str().unwrap(), "# another version\n");

@@ -3557,7 +3557,10 @@ fn no_context_sees_or_makes_the_policys_metadata() {
             "a {grant} context made a second one: {made:?}"
         );
         assert_eq!(
-            audio_policy::loaded_revision(&bed.dir().join("run")),
+            audio_policy::loaded_revision_asking(
+                Path::new(audio_policy::PW_METADATA),
+                &bed.dir().join("run")
+            ),
             LoadedRevision::Current,
             "a {grant} context changed the revision: {set:?}"
         );

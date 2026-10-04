@@ -6915,6 +6915,32 @@ fn a_run_under_a_wireplumber_of_another_revision_names_it() {
 }
 
 #[test]
+fn profile_lint_of_every_profile_asks_wireplumber_once() {
+    let tmp = setup();
+    install_audio_policy(tmp.path(), true, true);
+    for name in ["a", "b"] {
+        write_profile(tmp.path(), "user", name, "pipewire\ncommand \"sh\"\n");
+    }
+    let asked = tmp.path().join("asked");
+    let tool = tmp.path().join("pw-metadata");
+    std::fs::write(
+        &tool,
+        format!("#!/bin/sh\necho asked >> '{}'\n", asked.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = common::output_past_a_busy_exec(
+        bubbler(tmp.path())
+            .env("BUBBLER_PW_METADATA", &tool)
+            .args(["profile", "lint", "--all"]),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("audio-policy-not-loaded"), "{stdout}");
+    let asks = std::fs::read_to_string(&asked).unwrap_or_default();
+    assert_eq!(asks.lines().count(), 1, "{stdout}");
+}
+
+#[test]
 fn a_run_without_an_audio_grant_does_not_ask_wireplumber() {
     // The bed has no policy loaded: a WirePlumber asked would draw the warning.
     let Some(bed) = bed_without_the_revision() else {

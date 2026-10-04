@@ -796,6 +796,7 @@ fn env(root: &Path, system: &Path) -> Env {
         profile_dir_override: Some(system.to_path_buf()),
         proxy_override: None,
         pasta_override: None,
+        pw_metadata_override: None,
         wl_proxy_override: None,
         net_proxy_override: None,
     }
