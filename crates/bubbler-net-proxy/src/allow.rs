@@ -12,20 +12,6 @@ use std::fmt;
 
 /// A name an `allow-host` names: ASCII labels, lower case, with an
 /// optional `*.` in front standing for exactly one label.
-///
-/// The rules are DNS's own (RFC 1035 §2.3.1 with RFC 1123 §2.1's leading
-/// digit): letters, digits and `-`, no label starting or ending in `-`,
-/// 63 characters to a label and 253 to a name. bubbler converts nothing:
-/// an internationalised name is written as the `xn--` A-labels it
-/// resolves as, so what the config says and what the proxy compares a
-/// `CONNECT` target against are the same bytes.
-///
-/// A name whose last label is all digits is refused, so no address in
-/// the notations a config would write one in parses as a name;
-/// `allow-out` is where an address goes. `getaddrinfo` also reads hex
-/// forms such as `0x7f000001`, which are letters and digits and do parse
-/// here — a config writing one has named an address on purpose, and the
-/// proxy refuses an address as a `CONNECT` target whatever its shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostPattern {
     /// The labels under the wildcard, lower case and without the root
@@ -38,10 +24,10 @@ pub struct HostPattern {
 }
 
 impl HostPattern {
-    /// Longest name accepted, measured over the text as written: a
-    /// trailing dot counts toward it, so no name buys a label with one.
+    // Longest name accepted, measured over the text as written: a
+    // trailing dot counts toward it, so no name buys a label with one.
     const MAX_NAME: usize = 253;
-    /// Longest single label, from DNS.
+    // Longest single label, from DNS.
     const MAX_LABEL: usize = 63;
 
     /// Parse `s` as an `allow-host` name, or say what is wrong with it.
@@ -89,10 +75,7 @@ impl HostPattern {
         Ok(Self { labels, wildcard })
     }
 
-    /// Whether `s` is a label, or why it is not one. The one place the
-    /// rule is written: [`HostPattern::parse`] holds a config to it and
-    /// [`HostPattern::matches`] holds the probe to the same rule, so a
-    /// name that could never be written cannot be matched either.
+    /// Whether `s` is a label, or why it is not one.
     pub(crate) fn check_label(s: &str) -> Result<(), String> {
         if s.is_empty() {
             return Err(
@@ -116,10 +99,7 @@ impl HostPattern {
         Ok(())
     }
 
-    /// Whether `host` is a name this pattern covers. Case is ignored and
-    /// one trailing dot with it, since a `CONNECT` target may carry
-    /// either form; a wildcard covers exactly one label, never the name
-    /// itself and never two labels under it.
+    /// Whether `host` is a name this pattern covers.
     ///
     /// The probe is held to the rules [`HostPattern::parse`] takes, the
     /// wildcard's own label included: a `CONNECT` target is text the
@@ -160,9 +140,6 @@ impl fmt::Display for HostPattern {
 
 /// The names and ports one run of the proxy may connect to, as the
 /// `--allow` words gave them.
-///
-/// Order is the argv's and means nothing: a target is allowed when any
-/// entry covers it, and no entry ever widens another.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Allowlist {
     entries: Vec<(HostPattern, u16)>,
@@ -204,17 +181,13 @@ impl Allowlist {
 
     /// Whether a `CONNECT` target may be reached: some entry's name
     /// covers `host` and that same entry's port is `port`.
-    ///
-    /// Name and port are one grant, never two: an entry for
-    /// `api.example:443` is no reason to reach `api.example:22`.
     pub fn matches(&self, host: &str, port: u16) -> bool {
         self.entries
             .iter()
             .any(|(pattern, allowed)| *allowed == port && pattern.matches(host))
     }
 
-    /// How many targets the list holds, for the line the proxy logs
-    /// when it starts.
+    /// How many targets the list holds.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
