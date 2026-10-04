@@ -22,7 +22,14 @@
 - A bus name glob `org.foo.*` now covers `org.foo` itself, as the proxy reads
   it: `bubbler lint` reports `talk "org.freedesktop.systemd1.*"` as
   `dbus-name-is-host-exec`, and a glob over a polkit-backed system service as
-  `system-bus-polkit-name`.
+  `system-bus-polkit-name`; `secrets-access` and `portal-talk-without-portals`
+  match a glob covering their name too.
+- Two instances can no longer share a portal app id: `create` and
+  `try --keep` refuse a name whose app id another instance already has
+  (`my.app` beside `my_app`, `2fa` beside `_2fa`), since the two would share
+  portal permissions, forwarded documents and the window app id. A pair that
+  already exists is reported by `bubbler lint` as `app-id-shared` and warned
+  about on `run` and `open`; rename one, or accept it with `lint-allow`.
 
 ### Changed
 

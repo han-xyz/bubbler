@@ -296,6 +296,11 @@ const CHECK_LINES: &[(&str, &str)] = &[
          name anyone registers under that suffix.",
     ),
     (
+        "app-id-shared",
+        "Another instance has the same portal app id (`my.app` beside `my_app`), so the \
+         two share portal permissions, forwarded documents and the window app id.",
+    ),
+    (
         "app-runtime-rw",
         "An `app-runtime` shared mode=rw, so the sandbox can replace the sockets every \
          other instance naming that id connects to.",
@@ -468,8 +473,8 @@ const CHECK_LINES: &[(&str, &str)] = &[
     ),
     (
         "portal-talk-without-portals",
-        "A portal name in the bus rules without `portals`, so the call is refused rather \
-         than answered.",
+        "A bus rule reaching a portal name, a glob included, without `portals`, so the \
+         call is refused rather than answered.",
     ),
     (
         "repeat-outside-block",
@@ -482,7 +487,7 @@ const CHECK_LINES: &[(&str, &str)] = &[
     ),
     (
         "secrets-access",
-        "A `talk` or `own` of org.freedesktop.secrets — the whole login keyring, which \
+        "A `talk` or `own` of org.freedesktop.secrets or a glob covering it — the whole login keyring, which \
          the Secret Service API partitions between no applications — or a `secrets` child \
          of `portals`, which is this application's own portal secret.",
     ),

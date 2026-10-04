@@ -36,6 +36,9 @@ sandbox).
 `path-share-mountpoint`, `path-share-socket`, `share-source-missing`,
 `dbus-without-rules`, `env-looks-secret`, `tty-passthrough`,
 `tty-passthrough-without-seccomp`, `portal-talk-without-portals`,
+`app-id-shared` (another instance has the same portal app id, `my.app` beside
+`my_app`: portal permissions, forwarded documents and the window app id are
+shared; rename one, or `lint-allow` it, which silences the run warning too),
 `wayland-host`, `wayland-clipboard-open`, `network-host`, `etc-host` (`etc
 "host"` binds the host's whole `/etc` read-only in place of the allowlist:
 `hostname`, `fstab`, `ssh/ssh_config`, `X11` config and every other

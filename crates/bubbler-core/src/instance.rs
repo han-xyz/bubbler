@@ -173,6 +173,28 @@ fn check_socket_paths(env: &Env, name: &str) -> Result<(), InstanceError> {
     Ok(())
 }
 
+/// The `lint-allow` id that accepts two instances sharing a portal app id,
+/// and the lint check that reports it.
+pub const APP_ID_SHARED_CHECK: &str = "app-id-shared";
+
+/// The existing instance, other than `name` itself, whose portal app id is
+/// `name`'s.
+pub fn app_id_twin(env: &Env, name: &str) -> Result<Option<String>, InstanceError> {
+    let names = Instance::list(env)?;
+    Ok(dbus::app_id_twin(name, &names).map(str::to_owned))
+}
+
+fn refuse_app_id_twin(env: &Env, name: &str) -> Result<(), InstanceError> {
+    match app_id_twin(env, name)? {
+        Some(other) => Err(InstanceError::AppIdShared {
+            name: name.to_owned(),
+            other,
+            app_id: dbus::app_id(name),
+        }),
+        None => Ok(()),
+    }
+}
+
 fn io_err(path: &Path) -> impl FnOnce(io::Error) -> InstanceError + '_ {
     move |e| InstanceError::Io(path.to_path_buf(), e)
 }
@@ -466,6 +488,7 @@ impl Ephemeral {
         if fs::symlink_metadata(self.instances_root.join(name)).is_ok() {
             return Err(InstanceError::AlreadyExists(name.to_owned()));
         }
+        refuse_app_id_twin(env, name)?;
         self.keep = Some(name.to_owned());
         Ok(())
     }
@@ -512,6 +535,28 @@ impl Drop for Ephemeral {
 }
 
 impl Instance {
+    /// The line a real run prints when another instance shares this one's
+    /// portal app id, unless the config accepts it with a `lint-allow`.
+    pub fn app_id_warning(&self, env: &Env) -> Result<Option<String>, InstanceError> {
+        if self
+            .config
+            .lint_allows
+            .iter()
+            .any(|allow| allow.id == APP_ID_SHARED_CHECK)
+        {
+            return Ok(None);
+        }
+        Ok(app_id_twin(env, &self.name)?.map(|other| {
+            format!(
+                "instance `{}` shares the portal app id `{}` with instance `{other}`, and with \
+                 it portal permissions, forwarded documents and the window app id; rename one \
+                 of the two, or accept it with `lint-allow \"{APP_ID_SHARED_CHECK}\"`",
+                self.name,
+                dbus::app_id(&self.name),
+            )
+        }))
+    }
+
     /// Private home directory on the host, bound to `/home/bubbler` inside.
     pub fn home(&self) -> PathBuf {
         self.dir.join("home")
@@ -527,6 +572,7 @@ impl Instance {
     pub fn create(env: &Env, name: &str, profile_name: &str) -> Result<Self, InstanceError> {
         validate_name(name)?;
         check_socket_paths(env, name)?;
+        refuse_app_id_twin(env, name)?;
         let (text, config) = seed(env, profile_name, &[])?;
         let dir = instances_root(env).join(name);
         make_dir(&dir, name, &text)?;

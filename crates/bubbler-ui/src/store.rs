@@ -10,7 +10,7 @@ use bubbler_core::instance::{self, Instance};
 use bubbler_core::lint::{self, Severity};
 use bubbler_core::profile;
 use bubbler_core::wrap::{self, Wrap};
-use bubbler_core::{config, config::InstanceConfig, exec};
+use bubbler_core::{config, config::InstanceConfig, dbus, exec};
 
 /// One instance as a row: what it was seeded from, whether it is running,
 /// what it grants and what the linter makes of it.
@@ -82,13 +82,20 @@ impl Store {
         let names = Instance::list(env).context("listing instances")?;
         let search = crate::env::search_path();
         let asked = AskedOnce::default();
-        let ctx = lint::Context {
-            env,
-            host: &RealHost,
-            search_path: &search,
-            loaded_revision: &|env: &Env| asked.get(env),
-        };
-        let rows = names.iter().map(|name| row(env, &ctx, name)).collect();
+        let loaded_revision = |env: &Env| asked.get(env);
+        let rows = names
+            .iter()
+            .map(|name| {
+                let ctx = lint::Context {
+                    env,
+                    host: &RealHost,
+                    search_path: &search,
+                    loaded_revision: &loaded_revision,
+                    app_id_twin: dbus::app_id_twin(name, &names),
+                };
+                row(env, &ctx, name)
+            })
+            .collect();
         let (profiles, profile_error) = match profile::Resolver::new(env).list() {
             Ok(entries) => (entries, None),
             Err(e) => (Vec::new(), Some(e.to_string())),
@@ -179,6 +186,17 @@ mod tests {
         assert!(!ff.live, "nothing was started");
         assert_eq!(ff.error, None);
         assert!(!store.profiles.is_empty(), "the built-in layer is a layer");
+    }
+
+    #[test]
+    fn two_instances_sharing_an_app_id_each_count_a_warning() {
+        let (_tmp, env) = fixture::store(&[("2fa", "generic"), ("x", "generic")]);
+        let warnings = |name: &str| Store::load(&env).unwrap().row(name).unwrap().lint.unwrap()[1];
+        let alone = warnings("2fa");
+        let root = instance::instances_root(&env);
+        std::fs::rename(root.join("x"), root.join("_2fa")).unwrap();
+        assert_eq!(warnings("2fa"), alone + 1);
+        assert_eq!(warnings("_2fa"), alone + 1);
     }
 
     #[test]

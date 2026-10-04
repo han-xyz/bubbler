@@ -1242,6 +1242,8 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                 host: &RealHost,
                 search_path: &path,
                 loaded_revision: &loaded_revision,
+                // `create` refuses a name another instance's app id has.
+                app_id_twin: None,
             };
             warn_lint(lint::lint_config(&ctx, &inst.config_path()));
             print_lines(&[inst.dir.as_os_str()], "the instance directory")
@@ -1353,6 +1355,9 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                         ediag!(
                             "bubbler: warning: x11 \"host\" grants no isolation between X clients"
                         );
+                    }
+                    if let Some(warning) = inst.app_id_warning(&env).context("listing instances")? {
+                        ediag!("bubbler: warning: {warning}");
                     }
                     if let Some(warning) = audio_policy::run_warning(&inst.config, &RealHost, &env)
                     {
@@ -1551,6 +1556,9 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                             "bubbler: warning: x11 \"host\" grants no isolation between X clients"
                         );
                     }
+                    if let Some(warning) = inst.app_id_warning(&env).context("listing instances")? {
+                        ediag!("bubbler: warning: {warning}");
+                    }
                     if let Some(warning) = audio_policy::run_warning(&inst.config, &RealHost, &env)
                     {
                         ediag!("bubbler: warning: {warning}");
@@ -1703,11 +1711,13 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             // or a share of `.ssh`, so it is linted like a profile is.
             if code == 0 {
                 let search = host_env::search_path();
+                let twin = instance::app_id_twin(&env, &name).context("listing instances")?;
                 let ctx = lint::Context {
                     env: &env,
                     host: &RealHost,
                     search_path: &search,
                     loaded_revision: &loaded_revision,
+                    app_id_twin: twin.as_deref(),
                 };
                 warn_lint(lint::lint_config(&ctx, &path));
             }
@@ -1742,6 +1752,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                         host: &RealHost,
                         search_path: &search,
                         loaded_revision: &loaded_revision,
+                        app_id_twin: None,
                     };
                     warn_lint(lint::lint_profile(&ctx, &profiles, &name));
                 }
@@ -1755,6 +1766,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                     host: &RealHost,
                     search_path: &search,
                     loaded_revision: &loaded_revision,
+                    app_id_twin: None,
                 };
                 let found = match (name.as_deref(), all) {
                     (Some(name), false) => lint::lint_profile(&ctx, &profiles, name),
@@ -1784,11 +1796,13 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                 .with_context(|| format!("reseeding instance `{name}`"))?;
             let config = inst.config_path();
             let path = host_env::search_path();
+            let twin = instance::app_id_twin(&env, &name).context("listing instances")?;
             let ctx = lint::Context {
                 env: &env,
                 host: &RealHost,
                 search_path: &path,
                 loaded_revision: &loaded_revision,
+                app_id_twin: twin.as_deref(),
             };
             warn_lint(lint::lint_config(&ctx, &config));
             print_lines(&[config.as_os_str()], "the config path")
@@ -1816,18 +1830,22 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
         Cmd::Man { config } => print_man(config),
         Cmd::Lint { name, opts } => {
             let path = host_env::search_path();
-            let ctx = lint::Context {
-                env: &env,
-                host: &RealHost,
-                search_path: &path,
-                loaded_revision: &loaded_revision,
-            };
             // Every way the run itself can fail is exit 3: "this file is
             // not one bubbler reads" is a different answer from "this
             // config grants too much", and CI has to tell them apart.
             let found = instance::config_path_checked(&env, &name)
+                .and_then(|config| Ok((config, instance::app_id_twin(&env, &name)?)))
                 .map_err(anyhow::Error::new)
-                .and_then(|config| Ok(lint::lint_config(&ctx, &config)?));
+                .and_then(|(config, twin)| {
+                    let ctx = lint::Context {
+                        env: &env,
+                        host: &RealHost,
+                        search_path: &path,
+                        loaded_revision: &loaded_revision,
+                        app_id_twin: twin.as_deref(),
+                    };
+                    Ok(lint::lint_config(&ctx, &config)?)
+                });
             match found {
                 Ok(found) => report(&found, &opts),
                 Err(e) => {

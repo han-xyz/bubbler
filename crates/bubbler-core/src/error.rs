@@ -199,6 +199,17 @@ pub enum InstanceError {
     /// `sockaddr_un` holds, so the kernel would truncate them silently.
     #[error("{0} is longer than the 107 bytes a Unix socket path may have; use a shorter name")]
     SocketPathTooLong(PathBuf),
+    /// A new name whose portal app id another instance already has.
+    #[error(
+        "instance `{name}` would share the portal app id `{app_id}` with instance `{other}`, \
+         and with it portal permissions, forwarded documents and the window app id; \
+         choose a name that differs from `{other}` in more than `.` against `_` or a leading `_`"
+    )]
+    AppIdShared {
+        name: String,
+        other: String,
+        app_id: String,
+    },
     /// Asking the instance's control socket whether it is running failed.
     #[error("checking whether the instance is running")]
     Probe(#[source] LaunchError),

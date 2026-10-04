@@ -274,7 +274,16 @@ refuses outright if the instance path is a symlink rather than following it.
 
 Instance names are letters, digits, `.`, `_` and `-`; they cannot start with
 `-`, cannot be `.` or `..`, and cannot look like `try-<digits>`, which is the
-shape `try` gives its own sandboxes and sweeps by pid.
+shape `try` gives its own sandboxes and sweeps by pid. Nor can a new name give
+the same application id (see "D-Bus") as an existing instance: `my.app` and
+`my_app` both give `org.bubbler.my_app`, `2fa` and `_2fa` both
+`org.bubbler._2fa`, and two such instances would share portal permissions,
+forwarded documents and the window app id. `create` and `try --keep` refuse
+such a name, naming the instance that has it. A pair made before 0.26.0 is
+reported by `bubbler lint` (`app-id-shared`) and warned about on each `run` or
+`open` of either until one is renamed while neither runs (move its directory
+under the instances directory), or the config accepts it with `lint-allow
+"app-id-shared" reason="..."`.
 
 `man` prints roff on stdout, rendered from the command tree this binary was
 built with: `bubbler.1` with a subsection for every subcommand, the files a run
@@ -3153,6 +3162,10 @@ a sandbox can claim the microphone grant for itself, or one you edited.
 The finding names each such file and what writes it again; accept an
 edit made on purpose with `lint-allow "audio-policy-differs"
 reason="..."`),
+`app-id-shared` (another instance has the same application id, such as `my.app`
+beside `my_app`, so the two share portal permissions, forwarded documents and
+the window app id; rename one, or accept it with a `lint-allow`, which also
+silences the warning on `run` and `open`),
 `audio-policy-not-loaded` (a `pipewire` or `pulseaudio` grant, both policy
 files installed, and the running WirePlumber has not loaded this bubbler's
 policy, or has loaded another `policy revision`, which it names: the grant
@@ -3313,7 +3326,9 @@ application id `org.bubbler.<name>`, which is what portals and the proxy
 identify it by. A `.` in the name becomes `_`, since only the last element
 of an id may hold a `-` and xdg-desktop-portal refuses every operation of a
 sandbox whose id it cannot parse; a leading digit is prefixed with `_`,
-which the portal would take but flatpak's own name check would not.
+which the portal would take but flatpak's own name check would not. Since
+two names can map to one id that way, a name another instance's id already
+has is refused when it is made (see "Usage").
 
 That file is also what makes gdk-pixbuf's glycin image loaders look for
 `flatpak-spawn`: seeing one, they run

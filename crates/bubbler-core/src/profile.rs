@@ -1690,6 +1690,7 @@ mod tests {
                 loaded_revision: &|_: &crate::env::Env| {
                     crate::audio_policy::LoadedRevision::Current
                 },
+                app_id_twin: None,
             };
             let report =
                 lint::lint_profile(&ctx, &r, name).unwrap_or_else(|err| panic!("{name}: {err}"));

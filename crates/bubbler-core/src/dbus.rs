@@ -440,6 +440,17 @@ pub fn app_id(instance: &str) -> String {
     format!("org.bubbler.{tail}")
 }
 
+/// The instance among `existing` whose [`app_id`] is `name`'s under another
+/// name: the two would share portal permissions, forwarded documents and
+/// the window app id.
+pub fn app_id_twin<'a>(name: &str, existing: &'a [String]) -> Option<&'a str> {
+    let id = app_id(name);
+    existing
+        .iter()
+        .find(|other| *other != name && app_id(other) == id)
+        .map(String::as_str)
+}
+
 /// Whether `id` is an application id xdg-desktop-portal accepts: at least
 /// two `.`-separated non-empty elements of `[A-Za-z0-9_]`, `-` allowed
 /// only in the last one, at most 255 bytes.
@@ -1344,6 +1355,23 @@ mod tests {
         ] {
             assert_eq!(app_id(instance), id, "{instance}");
             assert!(is_valid_app_id(&app_id(instance)), "{instance}");
+        }
+    }
+
+    #[test]
+    fn an_app_id_twin_is_another_name_with_the_same_app_id() {
+        let names = |n: &[&str]| n.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        for (name, existing, twin) in [
+            ("my_app", names(&["ff", "my.app"]), Some("my.app")),
+            ("my.app", names(&["my_app"]), Some("my_app")),
+            ("_2fa", names(&["2fa"]), Some("2fa")),
+            ("2fa", names(&["_2fa"]), Some("_2fa")),
+            ("_hidden", names(&[".hidden"]), Some(".hidden")),
+            ("my.app", names(&["my.app"]), None),
+            ("my-app", names(&["my.app", "my_app2", "ff"]), None),
+            ("ff", names(&[]), None),
+        ] {
+            assert_eq!(app_id_twin(name, &existing), twin, "{name} {existing:?}");
         }
     }
 

@@ -24,6 +24,7 @@ use crate::json;
 use crate::network::HostPattern;
 use crate::profile::Resolver;
 use crate::service;
+use crate::{dbus, instance};
 
 /// How much a finding weighs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +63,10 @@ pub struct Check {
 const ALLOW_HOST_WILDCARD: Check = Check {
     id: "allow-host-wildcard",
     severity: Severity::Note,
+};
+const APP_ID_SHARED: Check = Check {
+    id: instance::APP_ID_SHARED_CHECK,
+    severity: Severity::Warning,
 };
 const APP_RUNTIME_RW: Check = Check {
     id: "app-runtime-rw",
@@ -307,6 +312,7 @@ const X11_WITHOUT_REASON: Check = Check {
 /// errors rather than silently accepting nothing.
 pub const CHECKS: &[Check] = &[
     ALLOW_HOST_WILDCARD,
+    APP_ID_SHARED,
     APP_RUNTIME_RW,
     AUDIO_DEVICES_OFFERED,
     AUDIO_POLICY_DIFFERS,
@@ -450,6 +456,9 @@ pub struct Context<'a> {
     /// [`audio_policy::loaded_revision`] outside the tests; asked only of a config with an audio
     /// grant and the whole policy installed.
     pub loaded_revision: &'a dyn Fn(&Env) -> LoadedRevision,
+    /// The other instance whose portal app id the linted instance's is, for `app-id-shared`;
+    /// `None` for a profile.
+    pub app_id_twin: Option<&'a str>,
 }
 
 /// Commands known to start a sandbox of their own inside this one, which
@@ -885,6 +894,7 @@ fn run(ctx: &Context, sources: &[Source]) -> Report {
     audio_policy_missing(ctx, sources, &mut f);
     audio_policy_differs(ctx, sources, &mut f);
     audio_policy_not_loaded(ctx, sources, &mut f);
+    app_id_shared(ctx, &mut f);
     let allowed: Vec<&str> = sources
         .iter()
         .flat_map(|s| top(s, "lint-allow"))
@@ -1254,6 +1264,28 @@ fn audio_policy_missing(ctx: &Context, sources: &[Source], f: &mut Findings) {
         ),
     };
     f.push(i, node, &AUDIO_POLICY_MISSING, message, &help);
+}
+
+/// The `app-id-shared` warning, at the top of the instance's one layer.
+fn app_id_shared(ctx: &Context, f: &mut Findings) {
+    let Some(other) = ctx.app_id_twin else {
+        return;
+    };
+    f.0.push(Pending {
+        layer: 0,
+        offset: 0,
+        check: &APP_ID_SHARED,
+        message: format!(
+            "this instance shares the portal app id `{}` with instance `{other}`, and with it \
+             portal permissions, forwarded documents and the window app id",
+            dbus::app_id(other)
+        ),
+        help: format!(
+            "rename one of the two while neither runs (move its directory under the instances \
+             directory), or accept it with `lint-allow \"{}\" reason=\"...\"`",
+            APP_ID_SHARED.id
+        ),
+    });
 }
 
 /// The `audio-policy-differs` warning: a copy of the policy WirePlumber
@@ -2224,6 +2256,7 @@ mod tests {
             host,
             search_path: &path,
             loaded_revision: &current,
+            app_id_twin: None,
         })
     }
 
@@ -3006,6 +3039,7 @@ mod tests {
             host: &host,
             search_path: &search,
             loaded_revision: &|_: &Env| LoadedRevision::Current,
+            app_id_twin: None,
         };
         assert_eq!(
             ids(&lint(&ctx, &["home-share \"myprofiles\" mode=rw"])),
@@ -3018,6 +3052,7 @@ mod tests {
             host: &host,
             search_path: &search,
             loaded_revision: &|_: &Env| LoadedRevision::Current,
+            app_id_twin: None,
         };
         assert_eq!(
             ids(&lint(&ctx, &["path-share \"/kioxia/profiles\" mode=rw"])),
@@ -3937,6 +3972,7 @@ mod tests {
                 host,
                 search_path: &path,
                 loaded_revision: &read,
+                app_id_twin: None,
             },
             layers,
         )
@@ -3997,6 +4033,7 @@ mod tests {
                 host: &host,
                 search_path: &path,
                 loaded_revision: &unasked,
+                app_id_twin: None,
             };
             assert_eq!(ids(&lint(&ctx, &[layer])), expected, "{layer}");
         }
@@ -4113,6 +4150,7 @@ mod tests {
                 host: &host,
                 search_path: &search_path,
                 loaded_revision: &|_: &Env| LoadedRevision::Current,
+                app_id_twin: None,
             };
             let report =
                 lint_profile(&ctx, &resolver, name).unwrap_or_else(|err| panic!("{name}: {err}"));
@@ -4174,6 +4212,7 @@ mod tests {
             host: &host,
             search_path: &search,
             loaded_revision: &|_: &Env| LoadedRevision::Current,
+            app_id_twin: None,
         };
         let err = lint_profile(&ctx, &r, "app").expect_err("`bluetooth` is not a node");
         assert!(matches!(err, LintError::Profile(_)), "{err:?}");
@@ -4208,6 +4247,7 @@ mod tests {
             host: &host,
             search_path: &search,
             loaded_revision: &|_: &Env| LoadedRevision::Current,
+            app_id_twin: None,
         };
         let mut all = Report::default();
         for name in ["a", "b"] {

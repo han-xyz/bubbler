@@ -224,11 +224,19 @@ impl Detail {
             return;
         };
         let search = crate::env::search_path();
+        let twin = match instance::app_id_twin(env, &self.inst.name) {
+            Ok(twin) => twin,
+            Err(e) => {
+                self.trouble = Some(e.to_string());
+                return;
+            }
+        };
         let ctx = lint::Context {
             env,
             host: &RealHost,
             search_path: &search,
             loaded_revision: &|env: &Env| self.loaded.get(env),
+            app_id_twin: twin.as_deref(),
         };
         match lint::lint_text(&ctx, Where::File(self.path()), text) {
             Ok(report) => self.findings = report.findings,

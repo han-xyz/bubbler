@@ -10888,6 +10888,74 @@ fn a_talk_that_undoes_portals_is_refused_by_lint_and_run() {
     assert!(err.contains(want), "{err}");
 }
 
+#[test]
+fn a_name_sharing_another_instances_app_id_is_refused() {
+    let tmp = setup();
+    let (code, _, err) = run(tmp.path(), &["create", "my.app"]);
+    assert_eq!(code, 0, "{err}");
+    let instances = tmp.path().join("data/bubbler/instances");
+    for args in [
+        &["create", "my_app"][..],
+        &["try", "--keep", "my_app", "--", "/usr/bin/true"],
+    ] {
+        let (code, _, err) = run(tmp.path(), args);
+        assert_eq!(code, 1, "{args:?}: {err}");
+        assert!(
+            err.contains("`my_app`")
+                && err.contains("`my.app`")
+                && err.contains("`org.bubbler.my_app`"),
+            "{args:?}: {err}"
+        );
+        assert!(!instances.join("my_app").exists(), "{args:?}");
+    }
+}
+
+#[test]
+fn an_existing_pair_sharing_an_app_id_is_reported_by_lint_and_run() {
+    let tmp = setup();
+    let instances = tmp.path().join("data/bubbler/instances");
+    for name in ["2fa", "other"] {
+        let (code, _, err) = run(tmp.path(), &["create", name]);
+        assert_eq!(code, 0, "{err}");
+        std::fs::write(
+            instances.join(name).join("config.kdl"),
+            "command \"/usr/bin/true\"\n",
+        )
+        .unwrap();
+    }
+    // A pair made before the refusal existed.
+    std::fs::rename(instances.join("other"), instances.join("_2fa")).unwrap();
+    let mut warned_codes = Vec::new();
+    for (name, other) in [("2fa", "_2fa"), ("_2fa", "2fa")] {
+        let (code, out, err) = run(tmp.path(), &["lint", name]);
+        assert_eq!(code, 1, "{out}{err}");
+        assert!(
+            out.contains("warning[app-id-shared]")
+                && out.contains(&format!("`{other}`"))
+                && out.contains("`org.bubbler._2fa`"),
+            "{out}"
+        );
+        let (code, _, err) = run(tmp.path(), &["run", name]);
+        warned_codes.push(code);
+        assert!(
+            err.contains("bubbler: warning: ") && err.contains(&format!("`{other}`")),
+            "{err}"
+        );
+        assert!(err.contains("`org.bubbler._2fa`"), "{err}");
+    }
+    std::fs::write(
+        instances.join("2fa/config.kdl"),
+        "lint-allow \"app-id-shared\" reason=\"one app, two homes\"\ncommand \"/usr/bin/true\"\n",
+    )
+    .unwrap();
+    let (code, out, err) = run(tmp.path(), &["lint", "2fa"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let (code, _, err) = run(tmp.path(), &["run", "2fa"]);
+    assert!(!err.contains("org.bubbler._2fa"), "{err}");
+    // The warning stops nothing: the run fails, or not, as it does without it.
+    assert_eq!(warned_codes, [code, code], "{err}");
+}
+
 /// A stand-in pasta: it records the argv it was given, reports readiness
 /// on the `--pid` path exactly as pasta does — or never, with
 /// `FAKE_PASTA_HANG=1` — and then waits to be killed. What it proves is what bubbler does around the sidecar, not

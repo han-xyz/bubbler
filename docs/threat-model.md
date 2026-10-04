@@ -329,6 +329,8 @@ describes goes on to refuse.
 **Defends:** a `wayland` grant binds a socket bubbler listens on itself,
 registered with the compositor through `wp_security_context_v1` as engine
 `org.bubbler`, app id `org.bubbler.<inst>`, instance id `bubbler-<inst>`.
+Two names can give one app id (`my.app`, `my_app`), so a name another
+instance's app id already has is refused when it is made.
 A client on it is one the compositor knows to be sandboxed, and the
 compositor withholds its privileged globals from such a client. The
 sandbox does not connect to that socket: it connects to a second one
