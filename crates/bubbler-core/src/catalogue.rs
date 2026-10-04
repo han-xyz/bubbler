@@ -6,9 +6,7 @@
 use std::fmt;
 
 /// How far a node reaches when it is written as wide as it can be
-/// written. The ceiling, not what one config asks for: a reader deciding
-/// whether to grant a node needs the worst it can mean, and [`Grant::cost`]
-/// says which spelling reaches it.
+/// written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Risk {
     /// One resource, with no authority over anything the sandbox is not
@@ -50,9 +48,7 @@ pub struct Grant {
 }
 
 /// Every node a config may hold, in the order [`crate::config::NODES`]
-/// lists them, which is the order the README documents them in. A unit
-/// test holds the two lists together: a node the parser takes and the
-/// catalogue does not describe is a grant nothing can explain.
+/// lists them, which is the order the README documents them in.
 pub static GRANTS: &[Grant] = &[
     Grant {
         node: "wayland",
