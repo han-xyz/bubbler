@@ -1557,13 +1557,14 @@ mod tests {
     }
 
     /// Nothing more from the client: the connection ends where it is.
+    /// A client that stopped mid-message closes with bytes unread, which
+    /// the kernel reports here as a reset once nothing it sent is left.
     fn server_end(stream: &UnixStream) {
         let mut byte = [0u8; 1];
-        assert_eq!(
-            (&*stream).read(&mut byte).unwrap(),
-            0,
-            "the client sent a message it had no reason to send"
-        );
+        match (&*stream).read(&mut byte) {
+            Ok(got) => assert_eq!(got, 0, "the client sent a message it had no reason to send"),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset),
+        }
     }
 
     /// An `AddFull` answer whose `a{sv}` holds a variant claiming a type

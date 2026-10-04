@@ -770,10 +770,19 @@ has another message to skip cannot outlast it, and a bus that goes
 silent costs a forwarding run fifteen seconds at the outside (the
 connect plus one `AddFull` per permission set, of which there are at
 most two) and an `a11y` lookup ten, bounded rather than hung; the
-decoder refuses what it cannot read exactly — padding that is not nul,
-a length that does not match its elements, an interior nul, a repeated
-header field, a container nested past the limit — instead of guessing;
-and every descriptor a reply carries is closed on arrival, since
+decoder never guesses at what it cannot read exactly — padding that is
+not nul, a length that does not match its elements, an interior nul, a
+repeated header field, a container nested past the limit. A message
+whose header it cannot read that way, a big-endian one, or one over
+16 MiB (read to its end by its length, never held) is skipped like any
+other message that is not the reply, since nothing in it can be trusted
+to say it is one. The reply, once taken, fails the call when its body
+will not decode or it carries fewer or more descriptors than it
+declares. A frame length past the specification's 128 MiB, an unknown
+byte-order flag or an unknown protocol version leaves no way to find the
+next message and fails the connection. No read goes past the end of the
+message being read, so descriptors are counted against the message they
+came with. Every descriptor a message carries is closed on arrival, since
 bubbler passes descriptors out and never takes one back. The client is
 host-side code running as your uid on your own bus: it is bubbler
 talking to your session, not the sandbox, which reaches that bus only
@@ -898,6 +907,11 @@ bus](manual.md#the-system-bus) ·
 `a_flood_of_messages_to_skip_does_not_outlast_the_deadline`,
 `a_bus_that_says_nothing_times_the_call_out`,
 `descriptors_a_reply_carries_are_closed`,
+`a_big_endian_message_before_the_reply_is_skipped`,
+`a_message_over_the_size_limit_before_the_reply_is_skipped`,
+`a_header_field_the_decoder_does_not_support_before_the_reply_is_skipped`,
+`a_message_with_more_descriptors_than_taken_before_the_reply_is_skipped`,
+`descriptors_of_a_message_right_behind_the_reply_are_not_the_replys`,
 `real_dbus_portals_answer_the_flatpak_spawn_a_loader_looks_for`,
 `the_flatpak_spawn_shim_is_an_overlay_the_remount_takes_back`
 

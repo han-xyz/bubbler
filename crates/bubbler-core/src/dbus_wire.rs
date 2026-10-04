@@ -996,6 +996,8 @@ struct Message {
     signature: String,
     /// What `UNIX_FDS` declared, which must match what arrived.
     unix_fds: u32,
+    /// Descriptors that arrived with its bytes, all closed already.
+    fds_arrived: usize,
     body: Vec<u8>,
 }
 
@@ -1042,33 +1044,36 @@ fn encode_message(
 }
 
 /// Where the body of the message starting at `head` begins and how long
-/// it is, read from the fixed header alone. The header-field array's
-/// length is the UINT32 at offset 12, the last of the fixed part.
+/// it is, read from the fixed header alone, in either byte order. The
+/// header-field array's length is the UINT32 at offset 12, the last of
+/// the fixed part.
 ///
-/// Bounded by [`MAX_INCOMING`] rather than by the specification's own
-/// maximum: this decides how many bytes will be read into memory on the
-/// say-so of sixteen bytes from a peer.
+/// Bounded by the specification's maximum, past which no length can be
+/// trusted to find the next message; whether a message this long is
+/// read into memory is [`MAX_INCOMING`]'s to decide.
 fn frame(head: &[u8]) -> Result<(usize, usize), WireError> {
     let head = head.get(..FIXED_HEADER).ok_or(WireError::Truncated)?;
-    if head[0] != b'l' {
-        return Err(WireError::Endianness(head[0]));
-    }
+    let uint32 = |at: usize| {
+        let bytes = [head[at], head[at + 1], head[at + 2], head[at + 3]];
+        match head[0] {
+            b'l' => Ok(u32::from_le_bytes(bytes) as usize),
+            b'B' => Ok(u32::from_be_bytes(bytes) as usize),
+            other => Err(WireError::Endianness(other)),
+        }
+    };
     if head[3] != PROTOCOL_VERSION {
         return Err(WireError::BadMessage("a message of an unknown version"));
     }
-    let body_len = u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as usize;
-    let fields_len = u32::from_le_bytes([head[12], head[13], head[14], head[15]]) as usize;
+    let body_len = uint32(4)?;
+    let fields_len = uint32(12)?;
     if fields_len > MAX_ARRAY {
         return Err(WireError::ArrayTooLong(fields_len));
-    }
-    if body_len > MAX_INCOMING {
-        return Err(WireError::MessageTooLong(body_len));
     }
     let body_at = align_up(FIXED_HEADER + fields_len, 8);
     let total = body_at
         .checked_add(body_len)
         .ok_or(WireError::MessageTooLong(body_len))?;
-    if total > MAX_INCOMING {
+    if total > MAX_MESSAGE {
         return Err(WireError::MessageTooLong(total));
     }
     Ok((body_at, body_len))
@@ -1081,6 +1086,9 @@ fn frame(head: &[u8]) -> Result<(usize, usize), WireError> {
 /// gives no rule for which copy wins, and two readers picking different
 /// ones is how a message means two things at once.
 fn decode_message(message: &[u8]) -> Result<Message, WireError> {
+    if message.first().is_some_and(|b| *b != b'l') {
+        return Err(WireError::Endianness(message[0]));
+    }
     let (body_at, body_len) = frame(message)?;
     let fields_end = FIXED_HEADER
         + u32::from_le_bytes([message[12], message[13], message[14], message[15]]) as usize;
@@ -1147,6 +1155,7 @@ fn decode_message(message: &[u8]) -> Result<Message, WireError> {
         sender,
         signature,
         unix_fds,
+        fds_arrived: 0,
         body,
     })
 }
@@ -1204,8 +1213,8 @@ pub struct Session {
     /// changes mid-session makes the next call fail rather than accept a
     /// reply from the wrong sender.
     owners: Vec<(String, String)>,
-    /// Descriptors received and closed since the last whole message, to
-    /// be checked against what that message declares.
+    /// Descriptors received and closed with the bytes of the message
+    /// being read, to be checked against what that message declares.
     fds_seen: usize,
     /// Serial of the last message sent; "must not be zero", so the first
     /// call sends 1.
@@ -1415,6 +1424,11 @@ impl Session {
                 Some(_) => continue,
                 None => return Err(WireError::BadMessage("a reply with no sender")),
             }
+            if reply.fds_arrived != reply.unix_fds as usize {
+                return Err(WireError::BadMessage(
+                    "a reply with fewer or more descriptors than it declares",
+                ));
+            }
             return match reply.kind {
                 MSG_METHOD_RETURN => decode(&reply.signature, &reply.body),
                 MSG_ERROR => {
@@ -1592,7 +1606,7 @@ impl Session {
             if self.buf.len() > MAX_AUTH_LINE {
                 return Err(WireError::Auth("a line with no end".to_owned()));
             }
-            self.fill(deadline)?;
+            self.fill(MAX_AUTH_LINE, deadline)?;
         }
     }
 
@@ -1639,18 +1653,20 @@ impl Session {
         Ok(())
     }
 
-    /// Read whatever the socket has into the buffer, waiting for it if
-    /// there is nothing yet. Any descriptor that arrives is closed at
-    /// once: no call bubbler makes expects one back, and one left open
-    /// would be a descriptor the bus chose for us to hold.
-    fn fill(&mut self, deadline: Instant) -> Result<(), WireError> {
+    /// Read up to `most` bytes of whatever the socket has into the
+    /// buffer, waiting for it if there is nothing yet. Any descriptor that
+    /// arrives is closed at once: no call bubbler makes expects one back,
+    /// and one left open would be a descriptor the bus chose for us to
+    /// hold.
+    fn fill(&mut self, most: usize, deadline: Instant) -> Result<(), WireError> {
         let mut chunk = [0u8; 4096];
+        let chunk = &mut chunk[..most.min(4096)];
         loop {
             let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_REPLY_FDS))];
             let mut ancillary = RecvAncillaryBuffer::new(&mut space);
             match recvmsg(
                 &self.socket,
-                &mut [IoSliceMut::new(&mut chunk)],
+                &mut [IoSliceMut::new(chunk)],
                 &mut ancillary,
                 RecvFlags::CMSG_CLOEXEC,
             ) {
@@ -1678,29 +1694,37 @@ impl Session {
         }
     }
 
-    /// The next whole message, read and taken off the buffer.
+    /// The next whole message this client can read, taken off the
+    /// buffer with the descriptors that arrived with it.
     ///
-    /// The descriptors that arrived while it was being read are its own:
-    /// they "may not be sent before the first byte of the message itself
-    /// is transferred or after the last byte", and the kernel hands back
-    /// the data of one `sendmsg` with the descriptors that came with it.
-    /// A message that declares a different number than arrived is
-    /// refused rather than read.
+    /// Those are its own: they "may not be sent before the first byte of
+    /// the message itself is transferred or after the last byte", and no
+    /// read goes past the end of the message, so none of the next one's
+    /// arrive with it. A message that is big-endian, longer than
+    /// [`MAX_INCOMING`] or whose header will not decode is skipped,
+    /// since nothing in it can be trusted to say it is the reply.
     fn receive(&mut self, deadline: Instant) -> Result<Message, WireError> {
         loop {
+            let mut want = FIXED_HEADER;
             if self.buf.len() >= FIXED_HEADER {
                 let (body_at, body_len) = frame(&self.buf)?;
-                let total = body_at + body_len;
-                if self.buf.len() >= total {
-                    let bytes: Vec<u8> = self.buf.drain(..total).collect();
-                    let message = decode_message(&bytes)?;
-                    let arrived = std::mem::take(&mut self.fds_seen);
-                    if arrived != message.unix_fds as usize {
-                        return Err(WireError::BadMessage(
-                            "a message with fewer or more descriptors than it declares",
-                        ));
+                want = body_at + body_len;
+                if want > MAX_INCOMING {
+                    self.discard(want, deadline)?;
+                    continue;
+                }
+                if self.buf.len() >= want {
+                    let bytes: Vec<u8> = self.buf.drain(..want).collect();
+                    let fds_arrived = std::mem::take(&mut self.fds_seen);
+                    match decode_message(&bytes) {
+                        Ok(message) => {
+                            return Ok(Message {
+                                fds_arrived,
+                                ..message
+                            });
+                        }
+                        Err(_) => continue,
                     }
-                    return Ok(message);
                 }
             }
             // A message already whole is handed over above whatever the
@@ -1708,8 +1732,25 @@ impl Session {
             if Instant::now() >= deadline {
                 return Err(WireError::Timeout);
             }
-            self.fill(deadline)?;
+            self.fill(want - self.buf.len(), deadline)?;
         }
+    }
+
+    /// Read the rest of a `total`-byte message too long to hold, and drop
+    /// it with its descriptors.
+    fn discard(&mut self, total: usize, deadline: Instant) -> Result<(), WireError> {
+        let mut left = total - self.buf.len();
+        self.buf.clear();
+        while left > 0 {
+            if Instant::now() >= deadline {
+                return Err(WireError::Timeout);
+            }
+            self.fill(left, deadline)?;
+            left -= self.buf.len();
+            self.buf.clear();
+        }
+        self.fds_seen = 0;
+        Ok(())
     }
 }
 
@@ -3409,6 +3450,152 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// The reply to a call to `:1.5`, with what `stray` writes, given the
+    /// call's serial, standing before it.
+    fn reply_behind(stray: impl FnOnce(&UnixStream, u32) + Send + 'static) -> Vec<Value> {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, server) = fake_bus(tmp.path(), move |stream| {
+            server_start(&stream);
+            let (bytes, _) = server_message(&stream);
+            stray(&stream, serial_of(&bytes));
+            server_reply(
+                &stream,
+                3,
+                serial_of(&bytes),
+                ":1.5",
+                "s",
+                &[Value::Str("the reply".to_owned())],
+            );
+        });
+        let mut session = Session::connect(&path).unwrap();
+        let reply = session
+            .call(":1.5", "/org/a", "org.a", "Ask", "", &[], &[])
+            .unwrap();
+        drop(session);
+        server.join().unwrap();
+        reply
+    }
+
+    #[test]
+    fn a_big_endian_message_before_the_reply_is_skipped() {
+        let reply = reply_behind(|stream, _| {
+            // Eight bytes of header fields, a length that read
+            // little-endian would be past every limit.
+            let mut message = vec![b'B', 4, 0, PROTOCOL_VERSION];
+            message.extend_from_slice(&0u32.to_be_bytes());
+            message.extend_from_slice(&7u32.to_be_bytes());
+            message.extend_from_slice(&8u32.to_be_bytes());
+            message.extend_from_slice(&[0; 8]);
+            (&*stream).write_all(&message).unwrap();
+        });
+        assert_eq!(reply, vec![Value::Str("the reply".to_owned())]);
+    }
+
+    #[test]
+    fn a_message_over_the_size_limit_before_the_reply_is_skipped() {
+        let reply = reply_behind(|stream, serial| {
+            let mut message = encode_message(
+                MSG_METHOD_RETURN,
+                0,
+                2,
+                &[
+                    (FIELD_REPLY_SERIAL, Value::Uint32(serial)),
+                    (FIELD_SENDER, Value::Str(":1.5".to_owned())),
+                    (FIELD_SIGNATURE, Value::Signature("ay".to_owned())),
+                ],
+                &[],
+            )
+            .unwrap();
+            let body_len = MAX_INCOMING as u32;
+            message[4..8].copy_from_slice(&body_len.to_le_bytes());
+            message.resize(message.len() + MAX_INCOMING, 0);
+            (&*stream).write_all(&message).unwrap();
+        });
+        assert_eq!(reply, vec![Value::Str("the reply".to_owned())]);
+    }
+
+    #[test]
+    fn a_header_field_the_decoder_does_not_support_before_the_reply_is_skipped() {
+        let reply = reply_behind(|stream, serial| {
+            let dict = Value::Dict(vec![("k".to_owned(), Value::Str("v".to_owned()))]);
+            let mut message = encode_message(
+                MSG_METHOD_RETURN,
+                0,
+                2,
+                &[
+                    (FIELD_REPLY_SERIAL, Value::Uint32(serial)),
+                    (FIELD_SENDER, Value::Str(":1.5".to_owned())),
+                    (200, dict),
+                ],
+                &[],
+            )
+            .unwrap();
+            let at = message
+                .windows(6)
+                .position(|w| w == b"a{ss}\0")
+                .expect("the dict's signature");
+            message[at + 2] = b'u';
+            assert!(matches!(
+                decode_message(&message),
+                Err(WireError::Unsupported(_))
+            ));
+            (&*stream).write_all(&message).unwrap();
+        });
+        assert_eq!(reply, vec![Value::Str("the reply".to_owned())]);
+    }
+
+    #[test]
+    fn a_message_with_more_descriptors_than_taken_before_the_reply_is_skipped() {
+        // Eight: the control buffer's alignment slack holds up to six.
+        const SENT: usize = 8;
+        let reply = reply_behind(|stream, serial| {
+            let mut fields = vec![(FIELD_UNIX_FDS, Value::Uint32(SENT as u32))];
+            fields.extend(signal_fields(serial));
+            let body = encode("s", &[Value::Str("ignore me".to_owned())]).unwrap();
+            let message = encode_message(4, 0, 2, &fields, &body).unwrap();
+            let fds = [stream.as_fd(); SENT];
+            server_send_fds(stream, &message, &fds);
+        });
+        assert_eq!(reply, vec![Value::Str("the reply".to_owned())]);
+    }
+
+    #[test]
+    fn descriptors_of_a_message_right_behind_the_reply_are_not_the_replys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, server) = fake_bus(tmp.path(), |stream| {
+            server_auth(&stream, true);
+            server_hello(&stream, ":1.31");
+            // Written before the call is read, so the client finds both
+            // queued: the first call after `Hello` has serial 2.
+            server_reply(&stream, 3, 2, ":1.5", "s", &[Value::Str("ok".to_owned())]);
+            let mut fields = vec![(FIELD_UNIX_FDS, Value::Uint32(1))];
+            fields.extend(signal_fields(2));
+            let body = encode("s", &[Value::Str("ignore me".to_owned())]).unwrap();
+            let message = encode_message(4, 0, 4, &fields, &body).unwrap();
+            server_send_fds(&stream, &message, &[stream.as_fd()]);
+            let call = server_call(&stream);
+            assert_eq!(call.serial, 2);
+        });
+        let mut session = Session::connect(&path).unwrap();
+        let reply = session
+            .call(":1.5", "/org/a", "org.a", "Ask", "", &[], &[])
+            .unwrap();
+        assert_eq!(reply, vec![Value::Str("ok".to_owned())]);
+        server.join().unwrap();
+        drop(session);
+    }
+
+    fn signal_fields(reply_serial: u32) -> Vec<(u8, Value)> {
+        vec![
+            (FIELD_PATH, Value::ObjectPath("/org/a".to_owned())),
+            (FIELD_INTERFACE, Value::Str("org.a".to_owned())),
+            (FIELD_MEMBER, Value::Str("Changed".to_owned())),
+            (FIELD_SENDER, Value::Str(":1.5".to_owned())),
+            (FIELD_SIGNATURE, Value::Signature("s".to_owned())),
+            (FIELD_REPLY_SERIAL, Value::Uint32(reply_serial)),
+        ]
+    }
+
     #[test]
     fn a_return_the_bus_sends_for_a_peer_is_not_taken_for_a_reply() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3544,16 +3731,17 @@ mod tests {
     }
 
     #[test]
-    fn a_message_longer_than_this_client_accepts_is_refused() {
-        // The specification's ceiling, which is what may be sent.
+    fn a_frame_longer_than_the_specification_allows_is_refused() {
         assert_eq!(MAX_MESSAGE, 1 << 27);
         let mut head = [0u8; FIXED_HEADER];
         head[0] = b'l';
         head[1] = MSG_METHOD_RETURN;
         head[3] = PROTOCOL_VERSION;
-        // Sixteen bytes claiming more than this client will ever hold.
-        head[4..8].copy_from_slice(&((MAX_INCOMING + 1) as u32).to_le_bytes());
+        head[4..8].copy_from_slice(&((MAX_MESSAGE - FIXED_HEADER + 1) as u32).to_le_bytes());
         assert!(matches!(frame(&head), Err(WireError::MessageTooLong(_))));
+        // Longer than this client holds, but a length it can skip by.
+        head[4..8].copy_from_slice(&((MAX_INCOMING + 1) as u32).to_le_bytes());
+        assert_eq!(frame(&head).unwrap(), (FIXED_HEADER, MAX_INCOMING + 1));
         head[4..8].copy_from_slice(&8u32.to_le_bytes());
         assert_eq!(frame(&head).unwrap(), (FIXED_HEADER, 8));
     }

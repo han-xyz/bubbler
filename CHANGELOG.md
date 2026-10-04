@@ -72,6 +72,11 @@
   `;`-separated list, its keys in any order, `%XX` escapes undone. The
   address handed to `xdg-dbus-proxy` escapes the socket path, so a path
   holding `,`, `;` or `%` reaches the same socket bwrap binds.
+- A message that is not the reply no longer fails bubbler's own D-Bus calls
+  (the accessibility bus lookup, forwarding a file): one that is big-endian,
+  over 16 MiB, carries a header field it cannot decode or more descriptors
+  than it takes is skipped, and the descriptors of a message queued right
+  behind the reply are no longer counted against the reply.
 
 ## 0.25.0
 
