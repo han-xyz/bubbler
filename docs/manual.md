@@ -4216,7 +4216,9 @@ Instances live in `$XDG_DATA_HOME/bubbler/instances/<name>/` (by default under
 emptied by each run that starts a sandbox, added to by one that execs into a
 running instance, and never over a mebibyte: the cap is measured against the
 file before every write, so two bubblers writing to it cannot between them
-push it over. Desktop entries are written to `$XDG_DATA_HOME/applications/`,
+push it over. The file is opened `O_APPEND` either way, so a second bubbler
+writing to the same log lands after what is already there rather than over
+it. Desktop entries are written to `$XDG_DATA_HOME/applications/`,
 which together with the shim directory below is all bubbler ever writes to
 outside its own state. Every
 run except a dry run or an explanation also creates
