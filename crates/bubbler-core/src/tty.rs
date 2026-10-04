@@ -20,64 +20,56 @@ use rustix::termios::{
 
 use crate::error::{ConfigError, LaunchError};
 
-/// Bytes moved per read. A terminal hands over far less at a time; this
-/// only bounds a fast writer inside the sandbox.
+// Bytes moved per read. A terminal hands over far less at a time; this
+// only bounds a fast writer inside the sandbox.
 const CHUNK: usize = 8192;
 
-/// Relay tick: how often the exit check and the `SIGWINCH` flag are
-/// serviced when no fd is ready.
+// Relay tick: how often the exit check and the `SIGWINCH` flag are
+// serviced when no fd is ready.
 const TICK: Duration = Duration::from_millis(100);
 const TICK_TIMESPEC: Timespec = Timespec {
     tv_sec: 0,
     tv_nsec: TICK.subsec_nanos() as Nsecs,
 };
 
-/// A poll that only asks and never waits.
 const NOW: Timespec = Timespec {
     tv_sec: 0,
     tv_nsec: 0,
 };
 
-/// How long output still in the pty is waited for after the command's
-/// status arrives.
+// How long output still in the pty is waited for after the command's
+// status arrives.
 const DRAIN: Duration = Duration::from_millis(200);
 
-/// How long a destination that is taking nothing at all is still waited
-/// for before what is left is given up on. A terminal frees its write
-/// room a buffer at a time, so `write` keeps failing for a while with
-/// nothing wrong: measured here, a pty read 256 bytes at a time refuses
-/// for 2.0 s at 5 reads a second and 4.5 s at 2, so a second of it means
-/// nothing and five is the first length that does.
+// A terminal frees its write room a buffer at a time, so `write` keeps failing for a while with
+// nothing wrong: measured here, a pty read 256 bytes at a time refuses for 2.0 s at 5 reads a
+// second and 4.5 s at 2, so a second of it means nothing and five is the first length that does.
 const STALL: Duration = Duration::from_secs(5);
 
-/// The whole of what handing over one destination's last output may
-/// take, however well it is going. The backstop behind [`STALL`].
+// The whole of what handing over one destination's last output may
+// take, however well it is going. The backstop behind [`STALL`].
 const FLUSH_MAX: Duration = Duration::from_secs(10);
 
-/// How much longer that output is offered once the user is waiting for
-/// bubbler to be gone. What the host will take at once it still gets.
+// How much longer that output is offered once the user is waiting for
+// bubbler to be gone. What the host will take at once it still gets.
 const HURRY: Duration = Duration::from_millis(200);
 
-/// How much output may wait for a host terminal that is not taking it.
-/// Once this much is held the sandbox's side is left unread, so its pty
-/// or pipe fills and it blocks in its own `write`: output is slowed to
-/// the speed of the terminal, never dropped.
+// How much output may wait for a host terminal that is not taking it.
 const PENDING_MAX: usize = 64 * 1024;
 
-/// How much may wait once the command's status is in hand. Holding back
-/// is pointless from then on — nothing can reach the pty or the pipe any
-/// more — and what the kernel still buffers there, itself capped, is the
-/// end of the output the user asked for.
+// How much may wait once the command's status is in hand. Holding back is pointless from then
+// on — nothing can reach the pty or the pipe any more — and what the kernel still buffers there,
+// itself capped, is the end of the output the user asked for.
 const DRAIN_MAX: usize = 2 * PENDING_MAX;
 
-/// `^]`, the detach key.
+// `^]`, the detach key.
 const ESCAPE: u8 = 0x1d;
 
 /// What the user is told when the detach sequence is typed. The sandbox
 /// keeps running either way; what ends is the relay.
 pub const DETACHED_NOTE: &str = "bubbler: detached; the sandbox keeps running";
 
-/// How many `ESCAPE` bytes in a row detach, and how long that run may take.
+// How many `ESCAPE` bytes in a row detach, and how long that run may take.
 const DETACH_RUN: usize = 3;
 const DETACH_WINDOW: Duration = Duration::from_secs(1);
 
@@ -183,13 +175,8 @@ pub fn null_stdio() -> Result<OwnedFd, LaunchError> {
 }
 
 /// bubbler's own fds 0, 1 and 2, duplicated so a plan can index them by
-/// number. The copies are `CLOEXEC`: what the sandbox gets is decided by
-/// the plan, never inherited by accident.
-///
-/// A descriptor the process was started without stands in as `/dev/null`,
-/// so a plan can assume all three exist. The `bubbler` binary fills such
-/// gaps at startup, before anything can take the number; this is the
-/// backstop for a library caller that does not.
+/// number. A descriptor the process was started without stands in as
+/// `/dev/null`, so a plan can assume all three exist.
 pub fn host_stdio() -> Result<[OwnedFd; 3], LaunchError> {
     let (i, o, e) = (std::io::stdin(), std::io::stdout(), std::io::stderr());
     let dup = |fd: BorrowedFd<'_>| match fd.try_clone_to_owned() {
@@ -205,8 +192,7 @@ pub fn host_stdio() -> Result<[OwnedFd; 3], LaunchError> {
 pub const FD_NAMES: [&str; 3] = ["stdin", "stdout", "stderr"];
 
 /// Which of bubbler's fds the pty's output goes back out on: the first of
-/// 1, 2 and 0 the pty stands in for, so output still reaches the terminal
-/// when stdout alone is redirected. `None` when there is no pty, or when
+/// 1, 2 and 0 the pty stands in for. `None` when there is no pty, or when
 /// the only candidate is a terminal opened read-only.
 pub fn output_fd(plan: &StdioPlan, host: &[OwnedFd; 3]) -> Option<usize> {
     [1, 2, 0]
@@ -214,8 +200,8 @@ pub fn output_fd(plan: &StdioPlan, host: &[OwnedFd; 3]) -> Option<usize> {
         .find(|i| plan.fds[*i] == StdioTarget::Slave && writable(host[*i].as_fd()))
 }
 
-/// Whether `fd` was opened for writing. An fd whose access mode cannot be
-/// read is taken as unusable, which only costs it its turn as the output.
+// An fd whose access mode cannot be
+// read is taken as unusable, which only costs it its turn as the output.
 fn writable(fd: BorrowedFd<'_>) -> bool {
     fcntl_getfl(fd).is_ok_and(|f| f & OFlags::ACCMODE != OFlags::RDONLY)
 }
@@ -306,9 +292,6 @@ pub enum RelayEnd {
     Detached,
 }
 
-/// The `^]`x3 detach run. Escapes are held back until the run either
-/// completes or cannot, so a `^]` the user meant for the app still
-/// arrives, just late.
 struct Escape {
     held: usize,
     since: Option<Instant>,
@@ -322,7 +305,7 @@ impl Escape {
         }
     }
 
-    /// Append what the sandbox should see of `chunk`; `true` means detach.
+    // Append what the sandbox should see of `chunk`; `true` means detach.
     fn feed(&mut self, chunk: &[u8], now: Instant, out: &mut Vec<u8>) -> bool {
         for &byte in chunk {
             if byte != ESCAPE {
@@ -344,7 +327,6 @@ impl Escape {
         false
     }
 
-    /// Release escapes whose run can no longer finish in time.
     fn expire(&mut self, now: Instant, out: &mut Vec<u8>) {
         if self
             .since
@@ -361,28 +343,16 @@ impl Escape {
     }
 }
 
-/// One destination of the sandbox's output, with a way to write to it
-/// that cannot block.
-///
-/// `O_NONBLOCK` is what keeps a terminal that has stopped reading from
-/// parking the loop that also services the exit check, the signal flags
-/// and the detach sequence — but the flag belongs to the open file
-/// description, which every duplicate of the descriptor shares, the
-/// user's shell among them. So the destination is [`reopen`]ed where it
-/// can be, and not even a `SIGKILL` leaves a flag behind; only where it
-/// cannot is the host's own flag changed and put back.
 struct Unblocked<'a> {
     host: BorrowedFd<'a>,
-    /// A description of `host`'s file that only this relay holds.
+    // A description of `host`'s file that only this relay holds.
     own: Option<OwnedFd>,
-    /// What `host`'s own flags were, when they had to be changed.
+    // What `host`'s own flags were, when they had to be changed.
     saved: Option<OFlags>,
 }
 
-/// Whether `fd` has an offset of its own, which a second description of
-/// it would not share: it would write from 0 over what is already there.
-/// True of the two seekable kinds a descriptor can be open on, and both
-/// of them take a write without ever blocking on a reader.
+// Whether `fd` has an offset of its own, which a second description of
+// it would not share: it would write from 0 over what is already there.
 fn seekable(fd: BorrowedFd<'_>) -> bool {
     rustix::fs::fstat(fd).is_ok_and(|stat| {
         matches!(
@@ -392,11 +362,9 @@ fn seekable(fd: BorrowedFd<'_>) -> bool {
     })
 }
 
-/// A second description of what `fd` is open on, non-blocking and held
-/// by nobody else, or `None` when there can be none: a socket has no
-/// such description, a [`seekable`] one would start over at offset 0,
-/// and a descriptor that is not already writable would gain an access it
-/// was denied — for the read end of a pipe, its *other* end.
+// A second description of what `fd` is open on, non-blocking and held by nobody else, or `None`
+// when there can be none: a socket has no such description, a [`seekable`] one would start over
+// at offset 0, and a descriptor that is not already writable would gain an access it was denied.
 fn reopen(fd: BorrowedFd<'_>) -> Option<OwnedFd> {
     if !writable(fd) || seekable(fd) {
         return None;
@@ -415,20 +383,11 @@ fn reopen(fd: BorrowedFd<'_>) -> Option<OwnedFd> {
 
 /// Where a run's warnings go while it waits: a description of fd 2 that
 /// only bubbler holds, non-blocking, opened once when the wait starts.
-/// The relay makes one for the output it had to discard, and the
-/// launcher one for the sidecar it noticed the end of.
-///
-/// A warning about output the host would not take must never be written
-/// to a host that would not take it — with the destination re-opened, fd
-/// 2 is the user's own blocking terminal, and one `write` to a terminal
-/// that has stopped reading parks the loop that answers the exit check
-/// and the signals for good. So a warning that will not go through at
-/// once is dropped: truncated output is worth a word, never a run that
-/// only `SIGKILL` can end.
+/// A warning that will not go through at once is dropped.
 pub(crate) struct Warn {
     fd: Option<OwnedFd>,
-    /// Whether `fd` is a description bubbler opened for itself, and so
-    /// one whose non-blocking flag is nobody else's business.
+    // Whether `fd` is a description bubbler opened for itself, and so
+    // one whose non-blocking flag is nobody else's business.
     own: bool,
 }
 
@@ -448,8 +407,7 @@ impl Warn {
                 own: true,
             },
             // A seekable fd 2 (`2> log`), a socket, or a terminal on a
-            // system without `/proc`. Its flags stay exactly as the
-            // caller left them; `say` works around that instead.
+            // system without `/proc`. Its flags stay exactly as the caller left them.
             None => Self {
                 fd: Some(dup),
                 own: false,
@@ -466,10 +424,9 @@ impl Warn {
             let _ = write(fd, msg.as_bytes());
             return;
         }
-        // fd 2 as the caller left it: making it non-blocking would make
-        // it non-blocking for the shell that shares the description, so
-        // instead a socket is told not to wait for this one message,
-        // which touches nothing...
+        // fd 2 as the caller left it: making it non-blocking would make it non-blocking for the
+        // shell that shares the description, so instead a socket is told not to wait for this one
+        // message, which touches nothing...
         match rustix::net::send(fd, msg.as_bytes(), SendFlags::DONTWAIT) {
             Err(Errno::NOTSOCK) => {}
             _ => return,
@@ -483,8 +440,6 @@ impl Warn {
     }
 }
 
-/// The destinations of one relay, each with a way to write to it that
-/// cannot block, for as long as the relay runs.
 struct NonBlocking<'a> {
     dests: Vec<Unblocked<'a>>,
 }
@@ -520,7 +475,6 @@ impl<'a> NonBlocking<'a> {
         Self { dests }
     }
 
-    /// Where to write destination `i`'s output.
     fn fd(&self, i: usize) -> BorrowedFd<'_> {
         let dest = &self.dests[i];
         dest.own.as_ref().map_or(dest.host, |fd| fd.as_fd())
@@ -539,26 +493,19 @@ impl Drop for NonBlocking<'_> {
     }
 }
 
-/// Where the sandbox's output goes, and what of it the host has not
-/// taken yet. Bounded by [`PENDING_MAX`] while the command runs:
-/// back-pressure reaches the sandbox through its own pty, and nothing is
-/// ever dropped.
 struct Out<'a> {
     fd: BorrowedFd<'a>,
-    /// Where the output goes once `fd` refuses it: a descriptor that
-    /// always takes it ([`null_stdio`]).
+    // Where the output goes once `fd` refuses it: a descriptor that
+    // always takes it ([`null_stdio`]).
     sink: BorrowedFd<'a>,
-    /// What to call `fd` when it stops taking the output.
     name: &'a str,
-    /// Where a word about output that had to be dropped goes, without
-    /// ever waiting for it to be taken.
     warn: &'a Warn,
-    /// A ring: a partial write moves its front, never the rest of it.
+    // A ring: a partial write moves its front, never the rest of it.
     pending: VecDeque<u8>,
-    /// How much may wait here before the sandbox's side is left unread.
+    // How much may wait here before the sandbox's side is left unread.
     limit: usize,
-    /// False once even the sink refuses the output: there is nowhere
-    /// left to put it, and reading for it stops.
+    // False once even the sink refuses the output: there is nowhere
+    // left to put it, and reading for it stops.
     open: bool,
 }
 
@@ -575,18 +522,16 @@ impl<'a> Out<'a> {
         }
     }
 
-    /// Stop holding the sandbox back: its status has arrived, so what is
-    /// left in its pty or pipe is all there will ever be.
+    // Stop holding the sandbox back: its status has arrived, so what is
+    // left in its pty or pipe is all there will ever be.
     fn relax(&mut self) {
         self.limit = DRAIN_MAX;
     }
 
-    /// Whether output is waiting for the host to take it.
     fn waiting(&self) -> bool {
         !self.pending.is_empty()
     }
 
-    /// Whether no more may be read for it until the host catches up.
     fn full(&self) -> bool {
         self.pending.len() >= self.limit
     }
@@ -595,8 +540,8 @@ impl<'a> Out<'a> {
         self.pending.extend(bytes);
     }
 
-    /// Hand the host what it will take right now. Never blocks: what is
-    /// left waits for the next `POLLOUT`.
+    // Hand the host what it will take right now. Never blocks: what is
+    // left waits for the next `POLLOUT`.
     fn flush(&mut self) {
         while self.open && !self.pending.is_empty() {
             // The front run of the ring; the rest follows next turn.
@@ -610,15 +555,6 @@ impl<'a> Out<'a> {
         }
     }
 
-    /// Hand over what is still waiting, for as long as the host keeps
-    /// taking it: this is the end of the command's output, and a
-    /// deadline is no reason to drop it.
-    ///
-    /// Bounded three ways, none of which ever blocks: `by`, which is one
-    /// [`FLUSH_MAX`] shared by every destination of a hand-over rather
-    /// than one each; [`STALL`] without a single byte getting through;
-    /// and [`HURRY`] from the moment `stop` says the user is waiting for
-    /// bubbler to be gone.
     fn finish(&mut self, stop: &AtomicBool, by: Instant) {
         let mut moved = Instant::now();
         let mut hurried = stop.load(Ordering::SeqCst).then_some(moved);
@@ -649,7 +585,7 @@ impl<'a> Out<'a> {
         }
     }
 
-    /// The one place output is dropped, and it is always announced.
+    // The one place output is dropped, and it is always announced.
     fn give_up(&mut self, why: &str) {
         self.warn.say(&format!(
             "bubbler: {} bytes of output to {} were dropped: {why}\n",
@@ -659,8 +595,8 @@ impl<'a> Out<'a> {
         self.pending.clear();
     }
 
-    /// Send what `fd` would not take to the sink from now on; when that
-    /// already was the sink, the output has nowhere left to go.
+    // Send what `fd` would not take to the sink from now on; when that
+    // already was the sink, the output has nowhere left to go.
     fn failed(&mut self, e: Errno) {
         if redirect(&mut self.fd, self.sink, e, self.name, self.warn) {
             return;
@@ -681,24 +617,10 @@ pub struct Caught<'a> {
     pub stop: &'a AtomicBool,
 }
 
-/// Carry bytes between the user's terminal and the sandbox's pty until
-/// `until` reports an exit or the user detaches. `master` is never
-/// closed: that would tear the pty down under a running command. Every
-/// `caught.winch` is answered by copying `host_out`'s size onto the pty,
-/// so `host_out` must be the user's terminal; the size it starts with is
-/// the one [`allocate`] copied from the terminal it was given. Output
-/// `host_out` refuses goes to `sink` instead, which must be a descriptor
-/// that always accepts it ([`null_stdio`]).
-///
-/// Nothing here ever waits on the host: it is written to through a
-/// description of bubbler's own that is non-blocking, and so is the one
-/// warning that can come of it. A host that stops reading must never
-/// park the loop that answers `until` and the signals. Up to 64 KiB of
-/// output waits here, and beyond that the pty is left unread, so the
-/// sandbox blocks on its own terminal rather than losing a byte; what it
-/// still holds when the command's status arrives is read out too, and
-/// handed over before this returns unless `caught.stop` says the user is
-/// waiting for bubbler to be gone.
+/// Carry bytes between the user's terminal and the sandbox's pty until `until` reports an exit or
+/// the user detaches. Every `caught.winch` is answered by copying `host_out`'s size onto the pty,
+/// so `host_out` must be the user's terminal. Output `host_out` refuses goes to `sink` instead,
+/// which must be a descriptor that always accepts it ([`null_stdio`]).
 pub fn relay(
     master: BorrowedFd<'_>,
     host_in: Option<BorrowedFd<'_>>,
@@ -780,9 +702,7 @@ pub fn relay(
         if let Some(fd) = read_stdin.filter(|_| stdin_ready) {
             match read(fd, &mut buf) {
                 // A terminal that hung up, or a stdin that is not one and
-                // has run out. No plan produces the latter — a pipe or a
-                // redirect goes to the sandbox directly — so in bubbler
-                // this is the terminal going away.
+                // has run out.
                 Ok(0) => {
                     stdin = None;
                     if let Some(eof) = eof_char(master) {
@@ -806,10 +726,8 @@ pub fn relay(
         if reading && revents.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR) {
             match read(master, &mut buf) {
                 Ok(0) => reading = false,
-                // A terminal that cannot take the output — closed, gone,
-                // or opened read-only — costs the output its destination,
-                // never the run: the command is still going, its status is
-                // still due, and its pty must go on being emptied.
+                // A terminal that cannot take the output — closed, gone, or opened read-only —
+                // costs the output its destination, never the run.
                 Ok(n) => {
                     out.push(&buf[..n]);
                     out.flush();
@@ -823,13 +741,8 @@ pub fn relay(
     }
 }
 
-/// Move what the pty and the output buffer still hold to the host: the
-/// status arrives before the last output has been read out, and the host
-/// may still be behind. [`DRAIN`] bounds how long more is read out of
-/// the pty, with [`DRAIN_MAX`] to hold it in, and what has been read by
-/// then is handed over for as long as the host takes it. `reading` says
-/// whether the master is worth reading at all. Nothing here is worth
-/// failing a finished run over, so every error just ends it.
+// `reading` says whether the master is worth reading at all. Nothing here is worth failing a
+// finished run over, so every error just ends it.
 fn drain(master: BorrowedFd<'_>, out: &mut Out<'_>, mut reading: bool, stop: &AtomicBool) {
     out.relax();
     let deadline = Instant::now() + DRAIN;
@@ -867,21 +780,13 @@ fn drain(master: BorrowedFd<'_>, out: &mut Out<'_>, mut reading: bool, stop: &At
         }
     }
     // The deadline bounds how long more is read out of the pty, never
-    // what has already been read: that is the end of the command's
-    // output, and it is handed over for as long as the host is taking it
-    // and the user is not waiting.
+    // what has already been read.
     out.finish(stop, Instant::now() + FLUSH_MAX);
 }
 
-/// Copy each pipe to the fd next to it until `until` reports an exit and
-/// the pipes have run dry, or 200 ms after that at the latest. This is
-/// the whole relay for a sandbox with no terminal: same poll loop, no
-/// threads, and nothing that can hand the sandbox a terminal fd. A
-/// destination that stops taking output is replaced by `sink`, so a
-/// reader that left early (`bubbler run ... | head`) cannot leave the
-/// command blocked on a full pipe. What the pipes hold when the status
-/// arrives is handed over as in the relay, and `stop` cuts that short
-/// the same way.
+/// Copy each pipe to the fd next to it until `until` reports an exit and the pipes have run dry,
+/// or 200 ms after that at the latest. A destination that stops taking output is replaced by
+/// `sink`.
 pub fn pump(
     pipes: &[(BorrowedFd<'_>, BorrowedFd<'_>, &str)],
     sink: BorrowedFd<'_>,
@@ -914,9 +819,7 @@ pub fn pump(
         if let Some((code, deadline)) = exited
             && ((!open.contains(&true) && !waiting) || Instant::now() >= deadline)
         {
-            // As in the relay: the deadline ends the reading, and what
-            // was read is handed over while the host is taking it. One
-            // deadline for the hand-over, not one for each pipe.
+            // One deadline for the hand-over, not one for each pipe.
             let by = Instant::now() + FLUSH_MAX;
             for out in &mut outs {
                 out.finish(stop, by);
@@ -974,9 +877,8 @@ pub fn pump(
     }
 }
 
-/// The pty's end-of-file character, or `None` when its line discipline
-/// has no notion of one: `VEOF` is only acted on in canonical mode, so a
-/// reader that turned `ICANON` off would just receive a stray byte.
+// `VEOF` is only acted on in canonical mode, so a
+// reader that turned `ICANON` off would just receive a stray byte.
 fn eof_char(master: BorrowedFd<'_>) -> Option<u8> {
     let settings = tcgetattr(master).ok()?;
     settings
@@ -985,8 +887,8 @@ fn eof_char(master: BorrowedFd<'_>) -> Option<u8> {
         .then(|| settings.special_codes[SpecialCodeIndex::VEOF])
 }
 
-/// Copy the host terminal's size onto the pty. The kernel then raises
-/// `SIGWINCH` for the pty's foreground process group inside the sandbox.
+// The kernel then raises
+// `SIGWINCH` for the pty's foreground process group inside the sandbox.
 fn resize(master: BorrowedFd<'_>, host: BorrowedFd<'_>) {
     if let Ok(size) = tcgetwinsize(host) {
         // Only the window size is at stake, and a host fd that is not a
@@ -995,12 +897,8 @@ fn resize(master: BorrowedFd<'_>, host: BorrowedFd<'_>) {
     }
 }
 
-/// Send what `dest` would not take to `sink` from now on, and say so
-/// once, calling it `what`. `false` when `dest` already was the sink:
-/// there is nowhere left to put the output, and the copy stops.
-///
-/// Reading the sandbox side has to go on either way — a pty or a pipe
-/// nobody empties fills up, and the command blocks in `write` forever.
+// Reading the sandbox side has to go on either way — a pty or a pipe
+// nobody empties fills up, and the command blocks in `write` forever.
 fn redirect<'a>(
     dest: &mut BorrowedFd<'a>,
     sink: BorrowedFd<'a>,
@@ -1011,9 +909,8 @@ fn redirect<'a>(
     if dest.as_raw_fd() == sink.as_raw_fd() {
         return false;
     }
-    // Truncated output is worth a word, and a warning that cannot be
-    // written either (the terminal is what just failed) is nothing to act
-    // on.
+    // Truncated output is worth a word, and a warning that cannot be written either (the
+    // terminal is what just failed) is nothing to act on.
     warn.say(&format!(
         "bubbler: output to {what} failed: {}; discarding further output\n",
         std::io::Error::from(e)
@@ -1022,7 +919,6 @@ fn redirect<'a>(
     true
 }
 
-/// `Timespec` for `poll`, which takes no `Duration`.
 fn timespec(d: Duration) -> Timespec {
     Timespec {
         tv_sec: d.as_secs() as Secs,
