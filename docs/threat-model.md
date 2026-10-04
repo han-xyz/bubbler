@@ -1025,10 +1025,10 @@ does not gain it, both measured in the test bed)
 — each read+execute on the graph and the client's own objects, nothing
 writable, and, in both managers, no permission at all on the metadata
 objects and on the session manager's own client, and read and nothing
-else on every stream node. The playback manager alone adds no permission
-at all on every node a stream can record from — each class beginning
-`Audio/Source` (`/Virtual`, a filter's source such as echo-cancel;
-`/Internal`) and `Audio/Duplex`, the classes WirePlumber offers as a
+else on every stream node but a video one. The playback manager alone
+adds no permission at all on every node a stream can record from —
+each class beginning `Audio/Source` (`/Virtual`, a filter's source such
+as echo-cancel; `/Internal`) and `Audio/Duplex`, the classes WirePlumber offers as a
 default source; before 0.24.2 it hid `Audio/Source` alone, and a
 playback sandbox saw the rest (measured) — and the linking hook refuses
 a capture stream every other target by the same test. Withholding all
@@ -1049,6 +1049,31 @@ connected before the node, from one connected after, and under a
 WirePlumber restarted with both already in the graph (measured). Each
 appears to such a context for the instant between the daemon adding it
 and WirePlumber hiding it, as the node itself does.
+
+Every camera node (`Video/Source`, `Video/Sink`, `Video/Duplex`) and
+every video stream (`Stream/Output/Video`, `Stream/Input/Video`) is
+hidden from every context, whatever its grant, together with its ports and
+links, the same way. No audio grant covers a camera, and a sandbox reaches
+one through the camera portal. Until 0.26.0 every context saw these nodes
+read and execute, and saw other clients' video streams read-only (measured,
+PipeWire 1.6.9, WirePlumber 0.5.18). The stream rule's `r` leaves video
+streams out explicitly. Where two rules of a permission manager matched one
+node, the stream rule's `r` was applied whichever rule came first
+(measured). The same hiding applies to a sandbox's own video stream. An
+audio grant has no use for one.
+
+Card objects (`Audio/Device`) stay visible to every audio context, with
+their profiles and routes. A card holding only a microphone, and the input
+profiles and routes of a combined card, therefore show a context without
+`microphone` that a microphone exists, and what it is called. Hiding a
+card whose every node is a hidden source was decided (D17) and not built:
+it could not be tested. The test bed cannot make a device object without
+hardware or root. `spa-device-factory` with `api.alsa.pcm.device` or
+`api.alsa.acp.device` on a card that does not exist creates no device
+(each fails opening the card's control). The only other SPA device
+factories installed, v4l2 and bluez5, were not tried: they enumerate a
+camera or BlueZ. A WirePlumber script's `SpaDevice` loads the same
+factories, and a kernel dummy card needs root to load.
 
 Streams are readable rather than hidden because the private
 `pipewire-pulse` a `pulseaudio` grant runs creates a stream node per

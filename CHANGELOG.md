@@ -13,6 +13,12 @@
   source it cannot see, nor a link to or from one: they named the
   microphone (`port.alias`) and gave its channels and format. 0.24.2 hid
   the source nodes alone.
+- No sandbox with an audio grant sees a camera node (`Video/*`), another
+  client's video stream, or their ports and links any more, whatever its
+  grant. Cameras go through the portal. Card objects (`Audio/Device`) with
+  their profiles and routes stay visible, so a card that only records still
+  shows that a microphone exists (measured on PipeWire 1.6.9, WirePlumber
+  0.5.18).
 - The audio policy files changed: rewrite them if they are your own copies
   (`bubbler audio-policy --print` and `--print --script`), or update the
   package, and restart WirePlumber; until then each run with an audio grant
