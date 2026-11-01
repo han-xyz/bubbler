@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.26.2
+
+### Added
+
+- `capturable` under `pipewire { }` and `pulseaudio { }`: a host program may
+  link this sandbox's playback to a node of no bubbler sandbox, which is how
+  Vesktop shares a game's audio. Off by default and in every profile. A
+  sandbox still cannot make the link itself, and capture into a sandbox
+  stays refused. Needs policy revision 8: `systemctl --user restart
+  wireplumber` after upgrading.
+
 ## 0.26.1
 
 ### Fixed

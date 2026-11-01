@@ -515,6 +515,7 @@ pub fn bed_with_the_hook_changed(from: &str, to: &str) -> Option<PipeWireBed> {
     bed_with_the_hook_changes(&[(from, to)])
 }
 
+/// A bed whose hook is the shipped one with each `from` replaced by its `to`.
 pub fn bed_with_the_hook_changes(changes: &[(&str, &str)]) -> Option<PipeWireBed> {
     let mut hook = HOOK.to_owned();
     for (from, to) in changes {
