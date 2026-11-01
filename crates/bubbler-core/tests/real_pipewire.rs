@@ -1960,6 +1960,14 @@ fn wait_for_ports(bed: &PipeWireBed, wanted: &[&str]) {
     });
 }
 
+fn port_id(bed: &PipeWireBed, port: &str) -> String {
+    bed.host_tool("pw-link", &["-io", "-I"])
+        .lines()
+        .find_map(|line| line.trim().strip_suffix(port)?.split_whitespace().next())
+        .unwrap_or_else(|| panic!("no port {port}"))
+        .to_owned()
+}
+
 fn ask(program: &mut Streaming, line: &str) {
     std::io::Write::write_all(
         program.0.stdin.as_mut().expect("pw-cli's stdin"),
@@ -2065,7 +2073,14 @@ fn a_host_programs_link_from_a_capturable_contexts_playback_to_its_own_sink_is_k
     let linked = || peers(&bed.links(), "player:output_FR").contains(&"shared:input_FR");
     let before = links_destroyed(&bed);
 
-    ask(&mut program, &format!("create-link {TO_THE_HOST_SINK}"));
+    ask(
+        &mut program,
+        &format!(
+            "create-link - {} - {}",
+            port_id(&bed, "player:output_FR"),
+            port_id(&bed, "shared:input_FR"),
+        ),
+    );
     wait_for("the host program's link", || {
         linked() || links_destroyed(&bed) > before
     });
@@ -2087,6 +2102,100 @@ fn a_host_programs_link_from_a_capturable_contexts_playback_to_its_own_sink_is_k
         let listing = bed.info_from_host();
         block(&listing, &[&active[0], &active[1]]).is_some()
     });
+}
+
+// A hook variant whose first decision finds the input node unknown. It then arrives as
+// `known`, heard as `node-known`: a second `node-added` would make a second session item.
+const INPUT_NODE_KNOWN_AFTER_THE_LINK: [(&str, &str); 3] = [
+    (
+        "local function lookup (source, kind, id)\n",
+        "local late_node\nlocal function lookup (source, kind, id)\n  if kind == \"node\" and id == late_node then\n    return nil\n  end\n",
+    ),
+    (
+        "\"c\", \"node-added\", \"client-added\" }",
+        "\"c\", \"node-added\", \"client-added\", \"node-known\" }",
+    ),
+    (
+        "    destroy_if_refused (event:get_source (), event:get_subject ())\n",
+        "    local source, link = event:get_source (), event:get_subject ()\n    local id = link.properties [\"link.input.node\"]\n    local node = lookup (source, \"node\", id)\n    late_node = id\n    destroy_if_refused (source, link)\n    late_node = nil\n    if node then\n      source:call (\"push-event\", \"known\", node, nil)\n    end\n",
+    ),
+];
+
+#[test]
+fn a_host_programs_link_from_a_capturable_contexts_playback_to_a_sink_known_late_is_kept() {
+    let Some(bed) = bed_with_the_hook_changes(&INPUT_NODE_KNOWN_AFTER_THE_LINK) else {
+        return;
+    };
+    let (_player, mut program) = a_player_and_a_host_program(&bed, CAPTURABLE);
+    let linked = || peers(&bed.links(), "player:output_FR").contains(&"shared:input_FR");
+    let before = links_destroyed(&bed);
+
+    ask(&mut program, &format!("create-link {TO_THE_HOST_SINK}"));
+    wait_for("the host program's link", || {
+        linked() || links_destroyed(&bed) > before
+    });
+    lingering_link(&bed, "{}", "player:output_FL", "shared:input_FL");
+    wait_for("the hook destroying the later lingering link", || {
+        links_destroyed(&bed) > before
+    });
+    std::thread::sleep(FORBIDDEN_LINK_LIFE);
+
+    assert!(linked(), "the host program's link went:\n{}", bed.links());
+    assert_eq!(links_destroyed(&bed), before + 1);
+}
+
+#[test]
+fn a_host_programs_link_from_a_capturable_contexts_playback_into_a_capture_stream_known_late_is_destroyed()
+ {
+    let Some(bed) = bed_with_the_hook_changes(&INPUT_NODE_KNOWN_AFTER_THE_LINK) else {
+        return;
+    };
+    let (_player, mut program) = a_player_and_a_host_program(&bed, CAPTURABLE);
+    let _recorder = Streaming(bed.spawn_in_context(OTHER_SANDBOX, &unlinked_recorder("recorder")));
+    wait_for_ports(&bed, &["recorder:input_FR"]);
+    decided_owner_of(&bed, "recorder");
+    let before = links_destroyed(&bed);
+
+    ask(
+        &mut program,
+        "create-link player output_FR recorder input_FR",
+    );
+    wait_for(
+        "the hook destroying the link once the node is known",
+        || links_destroyed(&bed) == before + 1,
+    );
+    std::thread::sleep(FORBIDDEN_LINK_LIFE);
+
+    let links = bed.links();
+    assert!(peers(&links, "player:output_FR").is_empty(), "{links}");
+}
+
+#[test]
+fn a_capturable_contexts_streams_keep_the_links_wireplumber_makes_them() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let _player = streaming(
+        &bed,
+        CAPTURABLE,
+        "pw-cat -p -a - < /dev/zero",
+        "Stream/Output/Audio",
+    );
+    let _recorder = streaming(
+        &bed,
+        CAPTURABLE_MICROPHONE,
+        "pw-record /dev/null",
+        "Stream/Input/Audio",
+    );
+    let both_linked = || {
+        let links = bed.links();
+        links.contains("bed-sink:playback_") && links.contains("bed-source:capture_")
+    };
+    wait_for("a link to the sink and one from the source", both_linked);
+    std::thread::sleep(FORBIDDEN_LINK_LIFE);
+
+    assert!(both_linked(), "a link went:\n{}", bed.links());
+    assert_eq!(links_destroyed(&bed), 0);
 }
 
 #[test]

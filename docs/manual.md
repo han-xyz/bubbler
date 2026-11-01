@@ -689,8 +689,7 @@ selects streams by name is selecting by text the sandbox controls. The sandbox
 itself still cannot make this link, and neither can a program in another
 sandbox or a Flatpak: it takes a host program whose `pipewire.access` is
 `unrestricted`, the stock setting. A link whose creator WirePlumber does not
-know yet, as after a WirePlumber restart, is destroyed, not decided again, and
-the program may link again.
+know yet is destroyed, not decided again, and the program may link again.
 It is off by default and in every shipped profile, and it needs a policy of
 revision 8.
 Two kinds of application are not supported under a scoped grant, with or

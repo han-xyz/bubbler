@@ -682,8 +682,8 @@ pub enum Service {
         /// A stream of the instance may hold a device for itself: ask for it
         /// exclusively or pass encoded audio through it.
         exclusive: bool,
-        /// A host program may link this instance's playback to a node of its own,
-        /// and so hear it.
+        /// A host program may link this instance's playback to a node of no bubbler
+        /// sandbox, and so hear it.
         capturable: bool,
     },
     /// Access to this instance's private pulse server: playback only
@@ -693,7 +693,8 @@ pub enum Service {
         microphone: bool,
         /// As `pipewire`'s: a stream may hold a device for itself.
         exclusive: bool,
-        /// As `pipewire`'s: a host program may link this instance's playback to its own node.
+        /// As `pipewire`'s: a host program may link this instance's playback to a node of
+        /// no bubbler sandbox.
         capturable: bool,
     },
     /// Bind `$HOME/<path>` on the host to the same relative path inside the

@@ -512,13 +512,18 @@ pub fn loaded_revision(bed: &PipeWireBed) -> LoadedRevision {
 
 /// A bed whose hook is the shipped one with `from` replaced by `to`.
 pub fn bed_with_the_hook_changed(from: &str, to: &str) -> Option<PipeWireBed> {
-    assert!(HOOK.contains(from), "the hook holds no {from:?}");
+    bed_with_the_hook_changes(&[(from, to)])
+}
+
+pub fn bed_with_the_hook_changes(changes: &[(&str, &str)]) -> Option<PipeWireBed> {
+    let mut hook = HOOK.to_owned();
+    for (from, to) in changes {
+        assert!(hook.contains(from), "the hook holds no {from:?}");
+        hook = hook.replace(from, to);
+    }
     PipeWireBed::start_with(|dir| {
-        std::fs::write(
-            dir.join("data").join(HOOK_IN_DATA_DIR),
-            HOOK.replace(from, to),
-        )
-        .expect("the changed hook");
+        std::fs::write(dir.join("data").join(HOOK_IN_DATA_DIR), hook)
+            .expect("the changed hook");
     })
     .map(|(bed, ())| bed)
 }

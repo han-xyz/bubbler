@@ -700,9 +700,10 @@ end
 -- A client can name another as a link's creator only on a link that
 -- lingers, and cannot set its own access (see `made_by_wireplumber`).
 local function captured_by_a_host_program (source, link, output, input)
+  -- An input node not known yet is decided once it is: only a host program's
+  -- link gets here, and a sandbox cannot make one.
   if not output or input or
-      output ["media.class"] ~= AUDIO_STREAM_CLASS.output or
-      not lookup (source, "node", link.properties ["link.input.node"]) then
+      output ["media.class"] ~= AUDIO_STREAM_CLASS.output then
     return false
   end
   local owner = bubbler_client (source, output ["client.id"])

@@ -1373,7 +1373,8 @@ its own stream names, so a host program selecting streams by name is
 selecting by text the sandbox controls. Capture into any of bubbler's
 contexts, links of a sandbox's non-stream node and every lingering link
 stay refused. A capture link whose creator WirePlumber does not know yet
-is destroyed, not decided again, and the program may link again. A link whose
+is destroyed, not decided again, and the program may link again; one whose
+input node WirePlumber does not know yet stands until it does. A link whose
 end's node, or that node's owner, WirePlumber does not know yet when the
 link appears is decided again once it does, and so is the default. A node a sandbox creates through
 the `adapter` factory with `object.linger` set carries no `client.id`
