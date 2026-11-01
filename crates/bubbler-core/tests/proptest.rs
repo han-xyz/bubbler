@@ -83,7 +83,7 @@ fn rel_path() -> impl Strategy<Value = PathBuf> {
 
 /// The grants written as a bare node, each at most once.
 fn flag_services() -> impl Strategy<Value = Vec<Service>> {
-    prop::collection::vec(any::<bool>(), 6).prop_map(|on| {
+    prop::collection::vec(any::<bool>(), 8).prop_map(|on| {
         [
             Service::Wayland(WaylandMode::default()),
             // `"host"`: every subset of this list has to parse, and the
@@ -94,10 +94,12 @@ fn flag_services() -> impl Strategy<Value = Vec<Service>> {
                 microphone: false,
                 devices: false,
                 exclusive: false,
+                capturable: on[6],
             },
             Service::Pulseaudio {
                 microphone: false,
                 exclusive: false,
+                capturable: on[7],
             },
             Service::Hidraw,
         ]

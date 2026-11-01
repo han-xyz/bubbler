@@ -4582,6 +4582,7 @@ mod tests {
                 microphone: false,
                 devices: false,
                 exclusive: false,
+                capturable: false,
             },
         };
         let argv =
@@ -4668,6 +4669,7 @@ mod tests {
                 microphone: true,
                 devices: false,
                 exclusive: false,
+                capturable: false,
             },
         };
         let mut alloc = DryRunAlloc::sidecar(dir.clone());

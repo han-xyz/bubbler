@@ -226,6 +226,7 @@ pub fn grant(audio: AudioSet) -> String {
         ("microphone", audio.microphone),
         ("devices", audio.devices),
         ("exclusive", audio.exclusive),
+        ("capturable", audio.capturable),
     ];
     std::iter::once("playback")
         .chain(
@@ -281,6 +282,7 @@ mod tests {
             microphone,
             devices: false,
             exclusive: false,
+            capturable: false,
         }
     }
 
@@ -308,12 +310,44 @@ mod tests {
                 microphone,
                 devices: true,
                 exclusive: false,
+                capturable: false,
             };
             assert_eq!(grant(audio), grant_string);
         }
     }
 
-    /// `exclusive` joins the grant as a word of its own, last.
+    /// `capturable` is a word of its own, last, and only where it was asked for.
+    #[test]
+    fn the_grant_carries_capturable_only_when_set() {
+        for (microphone, devices, exclusive, grant_string) in [
+            (false, false, false, "playback,capturable"),
+            (true, false, false, "playback,microphone,capturable"),
+            (false, false, true, "playback,exclusive,capturable"),
+            (
+                true,
+                true,
+                true,
+                "playback,microphone,devices,exclusive,capturable",
+            ),
+        ] {
+            let audio = AudioSet {
+                microphone,
+                devices,
+                exclusive,
+                capturable: true,
+            };
+            assert_eq!(grant(audio), grant_string);
+            assert_eq!(
+                grant(AudioSet {
+                    capturable: false,
+                    ..audio
+                }),
+                grant_string.strip_suffix(",capturable").unwrap()
+            );
+        }
+    }
+
+    /// `exclusive` joins the grant as a word of its own, after `microphone` and `devices`.
     #[test]
     fn the_grant_carries_exclusive_as_a_word() {
         for (microphone, devices, grant_string) in [
@@ -325,6 +359,7 @@ mod tests {
                 microphone,
                 devices,
                 exclusive: true,
+                capturable: false,
             };
             assert_eq!(grant(audio), grant_string);
         }

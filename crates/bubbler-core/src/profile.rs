@@ -829,22 +829,35 @@ impl Merged {
                 microphone,
                 devices,
                 exclusive,
+                capturable,
             } => {
-                if let Some((held_microphone, held_devices, held_exclusive, held_src)) =
-                    self.services.iter_mut().find_map(|(s, src)| match s {
-                        Service::Pipewire {
-                            microphone: held_microphone,
-                            devices: held_devices,
-                            exclusive: held_exclusive,
-                        } => Some((held_microphone, held_devices, held_exclusive, src)),
-                        _ => None,
-                    })
-                {
+                if let Some((
+                    held_microphone,
+                    held_devices,
+                    held_exclusive,
+                    held_capturable,
+                    held_src,
+                )) = self.services.iter_mut().find_map(|(s, src)| match s {
+                    Service::Pipewire {
+                        microphone: held_microphone,
+                        devices: held_devices,
+                        exclusive: held_exclusive,
+                        capturable: held_capturable,
+                    } => Some((
+                        held_microphone,
+                        held_devices,
+                        held_exclusive,
+                        held_capturable,
+                        src,
+                    )),
+                    _ => None,
+                }) {
                     // A grant of its own, on top of the socket the bare node gives, so it adds up
                     // rather than the last layer deciding it.
                     *held_microphone |= *microphone;
                     *held_devices |= *devices;
                     *held_exclusive |= *exclusive;
+                    *held_capturable |= *capturable;
                     *held_src = src.clone();
                     return Ok(());
                 }
@@ -852,18 +865,21 @@ impl Merged {
             Service::Pulseaudio {
                 microphone,
                 exclusive,
+                capturable,
             } => {
-                if let Some((held_microphone, held_exclusive, held_src)) =
+                if let Some((held_microphone, held_exclusive, held_capturable, held_src)) =
                     self.services.iter_mut().find_map(|(s, src)| match s {
                         Service::Pulseaudio {
                             microphone: held_microphone,
                             exclusive: held_exclusive,
-                        } => Some((held_microphone, held_exclusive, src)),
+                            capturable: held_capturable,
+                        } => Some((held_microphone, held_exclusive, held_capturable, src)),
                         _ => None,
                     })
                 {
                     *held_microphone |= *microphone;
                     *held_exclusive |= *exclusive;
+                    *held_capturable |= *capturable;
                     *held_src = src.clone();
                     return Ok(());
                 }
@@ -1261,7 +1277,8 @@ mod tests {
         }));
         assert!(cfg("vesktop").services.contains(&Service::Pulseaudio {
             microphone: true,
-            exclusive: false
+            exclusive: false,
+            capturable: false
         }));
         let steam = cfg("steam");
         assert!(steam.services.contains(&Service::Gamepad {
@@ -1403,7 +1420,8 @@ mod tests {
                 Service::Dri { kms: false },
                 Service::Pulseaudio {
                     microphone: false,
-                    exclusive: false
+                    exclusive: false,
+                    capturable: false
                 },
                 network(),
                 Service::Dbus { rules: Vec::new() },
@@ -1431,7 +1449,8 @@ mod tests {
                 Service::Dri { kms: false },
                 Service::Pulseaudio {
                     microphone: true,
-                    exclusive: false
+                    exclusive: false,
+                    capturable: false
                 },
                 network()
             ]
@@ -1450,7 +1469,8 @@ mod tests {
                 Service::Dri { kms: false },
                 Service::Pulseaudio {
                     microphone: false,
-                    exclusive: false
+                    exclusive: false,
+                    capturable: false
                 },
                 network(),
                 Service::Dbus { rules: Vec::new() },
@@ -2585,7 +2605,8 @@ mod tests {
             vec![Service::Pipewire {
                 microphone: true,
                 devices: false,
-                exclusive: false
+                exclusive: false,
+                capturable: false
             }]
         );
 
@@ -2599,7 +2620,8 @@ mod tests {
             vec![Service::Pipewire {
                 microphone: true,
                 devices: false,
-                exclusive: false
+                exclusive: false,
+                capturable: false
             }]
         );
     }
@@ -2626,6 +2648,32 @@ mod tests {
             );
             let audio = r.resolve("a").unwrap().config.audio().unwrap();
             assert!(audio.microphone && audio.devices, "{upper} over {lower}");
+        }
+    }
+
+    /// `capturable` ORs across layers on either audio node.
+    #[test]
+    fn capturable_ors_across_layers_on_either_node() {
+        let tmp = tempfile::tempdir().unwrap();
+        for node in ["pipewire", "pulseaudio"] {
+            for (upper, lower) in [
+                (
+                    format!("{node} {{\n    capturable\n}}\n"),
+                    format!("{node} {{\n    microphone\n}}\n"),
+                ),
+                (
+                    format!("{node} {{\n    microphone\n}}\n"),
+                    format!("{node} {{\n    capturable\n}}\n"),
+                ),
+            ] {
+                let r = resolver(
+                    tmp.path(),
+                    &[("a", &format!("include \"b\"\n{upper}"))],
+                    &[("b", &lower)],
+                );
+                let audio = r.resolve("a").unwrap().config.audio().unwrap();
+                assert!(audio.microphone && audio.capturable, "{upper} over {lower}");
+            }
         }
     }
 
@@ -3057,7 +3105,8 @@ mod tests {
                 Service::Pipewire {
                     microphone: false,
                     devices: false,
-                    exclusive: false
+                    exclusive: false,
+                    capturable: false
                 },
                 Service::Dri { kms: false }
             ]

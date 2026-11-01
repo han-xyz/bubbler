@@ -3716,6 +3716,7 @@ mod tests {
                 microphone: false,
                 devices: false,
                 exclusive: false,
+                capturable: false,
             }],
             &env(),
             &audio_host(),
@@ -3751,6 +3752,7 @@ mod tests {
             &[Service::Pulseaudio {
                 microphone: false,
                 exclusive: false,
+                capturable: false,
             }],
             &env(),
             &audio_host(),
@@ -3796,7 +3798,7 @@ mod tests {
             .filter(|(p, _)| *p != crate::pipewire::PULSE_MODULE)
             .collect();
         assert!(matches!(
-            argv(&[Service::Pulseaudio { microphone: false, exclusive: false }], &env(), &host),
+            argv(&[Service::Pulseaudio { microphone: false, exclusive: false, capturable: false }], &env(), &host),
             Err(LaunchError::MissingResource { service: "pulseaudio", ref path })
                 if path == Path::new(crate::pipewire::PULSE_MODULE)
         ));
@@ -3812,10 +3814,12 @@ mod tests {
                 microphone: false,
                 devices: false,
                 exclusive: false,
+                capturable: false,
             },
             Service::Pulseaudio {
                 microphone: false,
                 exclusive: false,
+                capturable: false,
             },
         ] {
             let host: Vec<(&str, Kind)> = audio_host()

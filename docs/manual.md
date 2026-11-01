@@ -519,10 +519,12 @@ file order does not affect the generated argv.
     pipewire { microphone }          #   also every microphone and line-in
     pipewire { devices }             #   its own sinks and sources as devices
     pipewire { exclusive }           #   a stream may hold a device for itself
+    pipewire { capturable }          #   a host program may capture its playback
     pulseaudio                       # $XDG_RUNTIME_DIR/pulse/native, sets
                                      #   PULSE_SERVER; playback only
     pulseaudio { microphone }        #   also every microphone and line-in
     pulseaudio { exclusive }         #   a stream may hold a device for itself
+    pulseaudio { capturable }        #   a host program may capture its playback
     gamepad                          # /dev/input, and the sysfs that names it
                                      #   hidraw=#true is the `hidraw` grant,
                                      #   uinput=#true adds /dev/uinput
@@ -676,6 +678,12 @@ instance gets no link and its client an error ("holding a device for one
 stream needs the exclusive grant"), so the player does not play until you
 add `exclusive`; the instance's other streams are linked mixed, never in
 passthrough.
+`capturable`, on either node (`pipewire { capturable }`,
+`pulseaudio { capturable }`, ORed like `microphone`), lets a host program
+link this sandbox's playback to a node of its own, which is how a voice chat
+program shares what a game plays. That program hears everything the sandbox
+plays. It is off by default and in every shipped profile, and it needs a
+policy of revision 8.
 Two kinds of application are not supported under a scoped grant, with or
 without `devices`: one that connects its own ports (a JACK client under
 `pw-jack`), since the link factory stays hidden from every sandbox, and

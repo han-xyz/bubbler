@@ -140,18 +140,20 @@ pub static GRANTS: &[Grant] = &[
                `exclusive` lets a stream hold a sink or source for itself (exclusive \
                access, encoded passthrough), keeping every later stream off it; without \
                it such a stream gets no link. \
+               `capturable` lets a host program link this sandbox's playback to its own \
+               node, so it hears what the sandbox plays; it needs a policy of revision 8. \
                The `camera` grant is the portal-mediated way to reach a device instead.",
         risk: Risk::Wide,
-        grammar: "pipewire [{ microphone; devices; exclusive }]",
+        grammar: "pipewire [{ microphone; devices; exclusive; capturable }]",
     },
     Grant {
         node: "pulseaudio",
         summary: "this instance's own private PulseAudio server, and `PULSE_SERVER` pointing at it",
         cost: "The same reach `pipewire` has, through the older protocol: bare is playback \
                only with the policy drop-in installed; `microphone` adds every \
-               `Audio/Source` the host has, capture allowed; `exclusive` as on `pipewire`.",
+               `Audio/Source` the host has, capture allowed; `exclusive` and `capturable` as on `pipewire`.",
         risk: Risk::Wide,
-        grammar: "pulseaudio [{ microphone; exclusive }]",
+        grammar: "pulseaudio [{ microphone; exclusive; capturable }]",
     },
     Grant {
         node: "gamepad",

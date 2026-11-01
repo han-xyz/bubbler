@@ -661,6 +661,30 @@ fn explain_states_the_exclusive_grant() {
     );
 }
 
+/// `capturable` reaches the one context from either audio node.
+#[test]
+fn explain_states_the_capturable_grant() {
+    if !require_host_program(PW_CONTAINER) {
+        return;
+    }
+    let tmp = setup();
+    bubbler(tmp.path()).args(["create", "t"]).status().unwrap();
+    let cfg = tmp.path().join("data/bubbler/instances/t/config.kdl");
+    for node in ["pipewire", "pulseaudio"] {
+        std::fs::write(
+            &cfg,
+            format!("{node} {{\n    capturable\n}}\ncommand \"true\"\n"),
+        )
+        .unwrap();
+        let (code, out, err) = run(tmp.path(), &["run", "t", "--explain"]);
+        assert_eq!(code, 0, "{err}");
+        assert!(
+            out.contains("(context: org.bubbler t playback,capturable)"),
+            "{out}"
+        );
+    }
+}
+
 /// `devices` is a note naming what the instance hears, and `lint-allow`
 /// accepts it like any check.
 #[test]
@@ -13152,6 +13176,30 @@ fn man_renders_the_page_and_a_section_for_every_subcommand() {
     for section in [".SH FILES", ".SH ENVIRONMENT", ".SH \"SEE ALSO\""] {
         assert!(roff.contains(section), "no {section}");
     }
+}
+
+/// The config page is the catalogue, so it carries the word and what it opens.
+#[test]
+fn man_config_states_the_capturable_grant() {
+    let tmp = setup();
+    let out = bubbler(tmp.path())
+        .args(["man", "--config"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = rendered(&String::from_utf8_lossy(&out.stdout));
+    assert!(
+        text.contains("pipewire [{ microphone; devices; exclusive; capturable }]"),
+        "{text}"
+    );
+    assert!(
+        text.contains("pulseaudio [{ microphone; exclusive; capturable }]"),
+        "{text}"
+    );
+    assert!(
+        text.contains("`capturable` lets a host program link this sandbox's playback"),
+        "{text}"
+    );
 }
 
 #[test]

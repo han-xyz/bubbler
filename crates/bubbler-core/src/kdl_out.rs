@@ -252,11 +252,13 @@ pub fn service(s: &Service) -> Result<String, ConfigError> {
             microphone,
             devices,
             exclusive,
-        } => audio_node("pipewire", *microphone, *devices, *exclusive),
+            capturable,
+        } => audio_node("pipewire", *microphone, *devices, *exclusive, *capturable),
         Service::Pulseaudio {
             microphone,
             exclusive,
-        } => audio_node("pulseaudio", *microphone, false, *exclusive),
+            capturable,
+        } => audio_node("pulseaudio", *microphone, false, *exclusive, *capturable),
         Service::Portals { children } => {
             if children.is_empty() {
                 return Ok("portals".to_owned());
@@ -477,11 +479,18 @@ fn optional_suffix(optional: bool) -> &'static str {
     }
 }
 
-fn audio_node(name: &str, microphone: bool, devices: bool, exclusive: bool) -> String {
+fn audio_node(
+    name: &str,
+    microphone: bool,
+    devices: bool,
+    exclusive: bool,
+    capturable: bool,
+) -> String {
     let children: Vec<&str> = [
         ("microphone", microphone),
         ("devices", devices),
         ("exclusive", exclusive),
+        ("capturable", capturable),
     ]
     .into_iter()
     .filter_map(|(child, on)| on.then_some(child))
@@ -1350,7 +1359,21 @@ mod tests {
         }
     }
 
-    /// `exclusive` is written back last, on either audio node.
+    /// `capturable` is written back last, on either audio node.
+    #[test]
+    fn capturable_round_trips_on_both_audio_nodes() {
+        for text in [
+            "pipewire {\n    capturable\n}\n",
+            "pipewire {\n    microphone\n    devices\n    exclusive\n    capturable\n}\n",
+            "pulseaudio {\n    capturable\n}\n",
+            "pulseaudio {\n    microphone\n    exclusive\n    capturable\n}\n",
+        ] {
+            let cfg = crate::config::parse(text).unwrap();
+            assert_eq!(render(&cfg).unwrap(), text);
+        }
+    }
+
+    /// `exclusive` is written back after `microphone` and `devices`, on either audio node.
     #[test]
     fn exclusive_round_trips_on_both_audio_nodes() {
         for text in [

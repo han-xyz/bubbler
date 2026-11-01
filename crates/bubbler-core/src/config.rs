@@ -682,6 +682,9 @@ pub enum Service {
         /// A stream of the instance may hold a device for itself: ask for it
         /// exclusively or pass encoded audio through it.
         exclusive: bool,
+        /// A host program may link this instance's playback to a node of its own,
+        /// and so hear it.
+        capturable: bool,
     },
     /// Access to this instance's private pulse server: playback only
     /// unless `microphone` is set.
@@ -690,6 +693,8 @@ pub enum Service {
         microphone: bool,
         /// As `pipewire`'s: a stream may hold a device for itself.
         exclusive: bool,
+        /// As `pipewire`'s: a host program may link this instance's playback to its own node.
+        capturable: bool,
     },
     /// Bind `$HOME/<path>` on the host to the same relative path inside the
     /// private home.
@@ -837,6 +842,8 @@ pub struct AudioSet {
     pub devices: bool,
     /// `exclusive` was asked for under `pipewire`, `pulseaudio`, or both.
     pub exclusive: bool,
+    /// `capturable` was asked for under `pipewire`, `pulseaudio`, or both.
+    pub capturable: bool,
 }
 
 /// The nodes a config may hold more than once, in the order [`NODES`] lists them. Every other
@@ -925,11 +932,13 @@ impl Node {
                 microphone,
                 devices,
                 exclusive,
-            } => *microphone || *devices || *exclusive,
+                capturable,
+            } => *microphone || *devices || *exclusive || *capturable,
             Service::Pulseaudio {
                 microphone,
                 exclusive,
-            } => *microphone || *exclusive,
+                capturable,
+            } => *microphone || *exclusive || *capturable,
             Service::Notify
             | Service::Tray
             | Service::Hidraw
@@ -1008,22 +1017,25 @@ impl InstanceConfig {
     /// the same context socket.
     pub fn audio(&self) -> Option<AudioSet> {
         self.services.iter().fold(None, |set, svc| {
-            let (microphone, devices, exclusive) = match svc {
+            let (microphone, devices, exclusive, capturable) = match svc {
                 Service::Pipewire {
                     microphone,
                     devices,
                     exclusive,
-                } => (*microphone, *devices, *exclusive),
+                    capturable,
+                } => (*microphone, *devices, *exclusive, *capturable),
                 Service::Pulseaudio {
                     microphone,
                     exclusive,
-                } => (*microphone, false, *exclusive),
+                    capturable,
+                } => (*microphone, false, *exclusive, *capturable),
                 _ => return set,
             };
             Some(AudioSet {
                 microphone: set.is_some_and(|s| s.microphone) || microphone,
                 devices: set.is_some_and(|s| s.devices) || devices,
                 exclusive: set.is_some_and(|s| s.exclusive) || exclusive,
+                capturable: set.is_some_and(|s| s.capturable) || capturable,
             })
         })
     }
@@ -1664,6 +1676,7 @@ fn parse_audio(node: &KdlNode) -> Result<AudioSet, ConfigError> {
         microphone: false,
         devices: false,
         exclusive: false,
+        capturable: false,
     };
     let Some(kids) = node.children() else {
         return Ok(set);
@@ -1675,6 +1688,7 @@ fn parse_audio(node: &KdlNode) -> Result<AudioSet, ConfigError> {
         let seen = match (name, parent) {
             ("microphone", _) => &mut set.microphone,
             ("exclusive", _) => &mut set.exclusive,
+            ("capturable", _) => &mut set.capturable,
             ("devices", "pipewire") => &mut set.devices,
             ("devices", _) => {
                 return Err(bad(
@@ -1686,9 +1700,9 @@ fn parse_audio(node: &KdlNode) -> Result<AudioSet, ConfigError> {
             }
             _ => {
                 let children = if parent == "pipewire" {
-                    "`microphone`, `devices` and `exclusive`"
+                    "`microphone`, `devices`, `exclusive` and `capturable`"
                 } else {
-                    "`microphone` and `exclusive`"
+                    "`microphone`, `exclusive` and `capturable`"
                 };
                 return Err(bad(
                     node,
@@ -1736,16 +1750,19 @@ pub(crate) fn parse_one(node: &KdlNode, profile: bool) -> Result<Node, ConfigErr
                 microphone,
                 devices,
                 exclusive,
+                capturable,
             } = parse_audio(node)?;
             Node::Service(match name {
                 "pipewire" => Service::Pipewire {
                     microphone,
                     devices,
                     exclusive,
+                    capturable,
                 },
                 "pulseaudio" => Service::Pulseaudio {
                     microphone,
                     exclusive,
+                    capturable,
                 },
                 // Unreachable through the arm above, and an error rather than a fallback: a name
                 // forgotten here would otherwise grant whichever service the fallback named.
@@ -4416,11 +4433,13 @@ mod tests {
                 Service::Pipewire {
                     microphone: false,
                     devices: false,
-                    exclusive: false
+                    exclusive: false,
+                    capturable: false
                 },
                 Service::Pulseaudio {
                     microphone: false,
-                    exclusive: false
+                    exclusive: false,
+                    capturable: false
                 }
             ]
         );
@@ -4447,11 +4466,13 @@ mod tests {
                     microphone: false,
                     devices: false,
                     exclusive: false,
+                    capturable: false,
                 },
                 Service::Pipewire {
                     microphone: true,
                     devices: false,
                     exclusive: false,
+                    capturable: false,
                 },
             ),
             (
@@ -4459,10 +4480,12 @@ mod tests {
                 Service::Pulseaudio {
                     microphone: false,
                     exclusive: false,
+                    capturable: false,
                 },
                 Service::Pulseaudio {
                     microphone: true,
                     exclusive: false,
+                    capturable: false,
                 },
             ),
         ] {
@@ -4570,7 +4593,8 @@ mod tests {
             parse("pipewire {\n    line-in\n}"),
             Err(ConfigError::BadArgument { reason, .. })
                 if reason == "`line-in` is not a child of `pipewire`; \
-                              the children are `microphone`, `devices` and `exclusive`"
+                              the children are `microphone`, `devices`, `exclusive` and \
+                              `capturable`"
         ));
     }
 
@@ -4585,7 +4609,8 @@ mod tests {
             Some(AudioSet {
                 microphone: true,
                 devices: true,
-                exclusive: false
+                exclusive: false,
+                capturable: false
             })
         );
     }
@@ -4623,8 +4648,61 @@ mod tests {
             parse("pulseaudio {\n    line-in\n}"),
             Err(ConfigError::BadArgument { reason, .. })
                 if reason == "`line-in` is not a child of `pulseaudio`; \
-                              the children are `microphone` and `exclusive`"
+                              the children are `microphone`, `exclusive` and `capturable`"
         ));
+    }
+
+    /// `capturable` is a child of both audio nodes and off unless written.
+    #[test]
+    fn pipewire_and_pulseaudio_take_a_capturable_child() {
+        for text in [
+            "pipewire {\n    capturable\n}",
+            "pipewire {\n    microphone\n    devices\n    exclusive\n    capturable\n}",
+            "pipewire {\n    capturable\n    microphone\n}",
+            "pulseaudio {\n    capturable\n}",
+            "pulseaudio {\n    capturable\n    exclusive\n}",
+        ] {
+            let audio = parse(text).unwrap().audio().expect("an audio grant");
+            assert!(audio.capturable, "{text}");
+            assert_eq!(audio.microphone, text.contains("microphone"), "{text}");
+            assert_eq!(audio.devices, text.contains("devices"), "{text}");
+            assert_eq!(audio.exclusive, text.contains("exclusive"), "{text}");
+        }
+        for text in ["pipewire", "pulseaudio", "pipewire {\n    exclusive\n}"] {
+            assert!(!parse(text).unwrap().audio().unwrap().capturable, "{text}");
+        }
+        for parent in ["pipewire", "pulseaudio"] {
+            assert!(matches!(
+                parse(&format!("{parent} {{\n    capturable\n    capturable\n}}")),
+                Err(ConfigError::Duplicate(n)) if n == "capturable"
+            ));
+            assert!(matches!(
+                parse(&format!("{parent} {{\n    capturable #true\n}}")),
+                Err(ConfigError::BadArgument { node, reason })
+                    if node == parent
+                        && reason == "`capturable` takes no arguments, properties or children"
+            ));
+        }
+    }
+
+    /// `capturable` ORs across both nodes, which one context serves.
+    #[test]
+    fn audio_carries_capturable_from_either_node() {
+        for text in [
+            "pipewire {\n    capturable\n}\npulseaudio",
+            "pipewire\npulseaudio {\n    capturable\n}",
+        ] {
+            assert_eq!(
+                parse(text).unwrap().audio(),
+                Some(AudioSet {
+                    microphone: false,
+                    devices: false,
+                    exclusive: false,
+                    capturable: true
+                }),
+                "{text}"
+            );
+        }
     }
 
     /// `exclusive` ORs across both nodes: either one asking for it is the
@@ -4640,7 +4718,8 @@ mod tests {
                 Some(AudioSet {
                     microphone: false,
                     devices: false,
-                    exclusive: true
+                    exclusive: true,
+                    capturable: false
                 }),
                 "{text}"
             );
@@ -4658,7 +4737,8 @@ mod tests {
             Some(AudioSet {
                 microphone: false,
                 devices: false,
-                exclusive: false
+                exclusive: false,
+                capturable: false
             })
         );
         assert_eq!(
@@ -4668,7 +4748,8 @@ mod tests {
             Some(AudioSet {
                 microphone: true,
                 devices: false,
-                exclusive: false
+                exclusive: false,
+                capturable: false
             })
         );
         assert_eq!(
@@ -4678,7 +4759,8 @@ mod tests {
             Some(AudioSet {
                 microphone: true,
                 devices: false,
-                exclusive: false
+                exclusive: false,
+                capturable: false
             })
         );
     }
@@ -6306,7 +6388,8 @@ command "b""#
                 node: Node::Service(Service::Pipewire {
                     microphone: false,
                     devices: false,
-                    exclusive: false
+                    exclusive: false,
+                    capturable: false
                 }),
                 before: 1,
             }]

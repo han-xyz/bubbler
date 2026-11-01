@@ -285,10 +285,12 @@ fn grant_service(name: &str) -> Option<Service> {
             microphone: false,
             devices: false,
             exclusive: false,
+            capturable: false,
         },
         "pulseaudio" => Service::Pulseaudio {
             microphone: false,
             exclusive: false,
+            capturable: false,
         },
         "dbus" => Service::Dbus { rules: Vec::new() },
         "portals" => Service::Portals {
