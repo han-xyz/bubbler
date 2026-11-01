@@ -151,7 +151,8 @@ pub static GRANTS: &[Grant] = &[
         summary: "this instance's own private PulseAudio server, and `PULSE_SERVER` pointing at it",
         cost: "The same reach `pipewire` has, through the older protocol: bare is playback \
                only with the policy drop-in installed; `microphone` adds every \
-               `Audio/Source` the host has, capture allowed; `exclusive` and `capturable` as on `pipewire`.",
+               `Audio/Source` the host has, capture allowed; `exclusive` and \
+               `capturable` as on `pipewire`.",
         risk: Risk::Wide,
         grammar: "pulseaudio [{ microphone; exclusive; capturable }]",
     },

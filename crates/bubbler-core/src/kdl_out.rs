@@ -1359,7 +1359,6 @@ mod tests {
         }
     }
 
-    /// `capturable` is written back last, on either audio node.
     #[test]
     fn capturable_round_trips_on_both_audio_nodes() {
         for text in [

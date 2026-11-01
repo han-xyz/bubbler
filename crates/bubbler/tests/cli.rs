@@ -661,7 +661,6 @@ fn explain_states_the_exclusive_grant() {
     );
 }
 
-/// `capturable` reaches the one context from either audio node.
 #[test]
 fn explain_states_the_capturable_grant() {
     if !require_host_program(PW_CONTAINER) {
@@ -13178,7 +13177,6 @@ fn man_renders_the_page_and_a_section_for_every_subcommand() {
     }
 }
 
-/// The config page is the catalogue, so it carries the word and what it opens.
 #[test]
 fn man_config_states_the_capturable_grant() {
     let tmp = setup();

@@ -316,7 +316,6 @@ mod tests {
         }
     }
 
-    /// `capturable` is a word of its own, last, and only where it was asked for.
     #[test]
     fn the_grant_carries_capturable_only_when_set() {
         for (microphone, devices, exclusive, grant_string) in [

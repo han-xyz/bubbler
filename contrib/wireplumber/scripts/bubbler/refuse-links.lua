@@ -26,7 +26,8 @@
 -- A link with a sandbox's node at either end is destroyed when
 -- WirePlumber sees it, unless WirePlumber made it and it is one the
 -- hooks above would have let it make; one drawn in a patchbay is
--- destroyed.
+-- destroyed. Under the `capturable` grant a host program's own live link
+-- from a playback stream to a node of no sandbox is kept too.
 --
 -- The policy states its revision in the metadata `bubbler-policy`, key
 -- `revision` on subject 0, which no sandbox can see: bubbler reads it to
@@ -40,7 +41,7 @@ local BUBBLER_ENGINE = "org.bubbler"
 
 -- Raised whenever what this policy makes WirePlumber do changes; bubbler
 -- expects the revision it ships with and reads it from this line.
-local POLICY_REVISION = 7
+local POLICY_REVISION = 8
 
 local EPERM = -1
 
@@ -696,6 +697,29 @@ local function offered_device_link (source, output, input)
       may_record_from (source, input, output)
 end
 
+-- A client can name another as a link's creator only on a link that
+-- lingers, and cannot set its own access (see `made_by_wireplumber`).
+local function captured_by_a_host_program (source, link, output, input)
+  if not output or input or
+      output ["media.class"] ~= AUDIO_STREAM_CLASS.output or
+      not lookup (source, "node", link.properties ["link.input.node"]) then
+    return false
+  end
+  local owner = bubbler_client (source, output ["client.id"])
+  if not owner or not granted (owner, "capturable") then
+    return false
+  end
+  local linger = link.properties ["object.linger"]
+  local creator = link.properties ["client.id"]
+  if linger == "true" or linger == "1" or not creator then
+    return false
+  end
+  local client = lookup (source, "client", creator)
+  return client ~= nil and
+      client.properties ["pipewire.sec.engine"] == nil and
+      client.properties ["pipewire.access"] == "unrestricted"
+end
+
 -- The `object.serial` of every link already asked to go, which a later
 -- check would otherwise ask again. Serials are never reused.
 local destroying = {}
@@ -713,6 +737,9 @@ local function destroy_if_refused (source, link)
   local output = bubbler_node (source, link.properties ["link.output.node"])
   local input = bubbler_node (source, link.properties ["link.input.node"])
   if not output and not input then
+    return
+  end
+  if captured_by_a_host_program (source, link, output, input) then
     return
   end
   local allowed

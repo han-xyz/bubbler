@@ -682,8 +682,11 @@ passthrough.
 `pulseaudio { capturable }`, ORed like `microphone`), lets a host program
 link this sandbox's playback to a node of its own, which is how a voice chat
 program shares what a game plays. That program hears everything the sandbox
-plays. It is off by default and in every shipped profile, and it needs a
-policy of revision 8.
+plays, and so does a sandbox with `microphone` recording the host node the
+program routes it to. The sandbox itself still cannot make this link, and
+neither can a program in another sandbox or a Flatpak.
+It is off by default and in every shipped profile, and it needs a policy of
+revision 8.
 Two kinds of application are not supported under a scoped grant, with or
 without `devices`: one that connects its own ports (a JACK client under
 `pw-jack`), since the link factory stays hidden from every sandbox, and
@@ -697,7 +700,8 @@ reaches every node the config did not ask for, while without the hook the
 grant is scoped and every other client's audio stays recordable.
 The hook also keeps a sandbox from linking anything itself, and destroys
 any link to or from a sandbox's node that is not one of its own streams
-as WirePlumber would link it, one you draw in a patchbay included. A sandbox
+as WirePlumber would link it, one you draw in a patchbay included, but for
+the link `capturable` allows. A sandbox
 offers no audio device: a sink, source or filter it creates through its own
 connection stays out of WirePlumber's session, so it is never a default, a
 target or one of your smart filters, and your streams are linked as if it

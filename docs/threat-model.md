@@ -1355,7 +1355,19 @@ socket before it says anything and can neither change nor drop it
 client outside every context is unconfined anyway. A restricted client
 outside every context — another sandboxer's, an application on the
 portal path — can wear the marker too and keep a link it makes to a
-sandbox's stream; confining those clients is not bubbler's. A link whose
+sandbox's stream; confining those clients is not bubbler's. Under the
+`capturable` grant one more link is kept: a non-lingering link from the
+sandbox's `Stream/Output/Audio` to a node of no sandbox, whose creator
+is a connected client outside every security context with
+`pipewire.access = "unrestricted"`. The daemon writes `client.id` on such
+a link itself (measured on PipeWire 1.6.10: a context's claim to a host
+client's id was overwritten), and the link ends with its creator. A
+sandbox still cannot make this link, since the link factory stays hidden
+from it. What the grant exposes is the instance's playback: any such host
+program hears everything it plays, and so, through the host node that
+program routes it to, does a sandbox with `microphone` recording that
+node. Capture into any sandbox, links of a sandbox's non-stream node and
+every lingering link stay refused. A link whose
 end's node, or that node's owner, WirePlumber does not know yet when the
 link appears is decided again once it does, and so is the default. A node a sandbox creates through
 the `adapter` factory with `object.linger` set carries no `client.id`

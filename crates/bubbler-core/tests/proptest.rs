@@ -81,7 +81,7 @@ fn rel_path() -> impl Strategy<Value = PathBuf> {
     prop::collection::vec("[a-z]{1,5}", 1..3).prop_map(|parts| parts.iter().collect())
 }
 
-/// The grants written as a bare node, each at most once.
+/// The grants written as a bare node or with `capturable`, each at most once.
 fn flag_services() -> impl Strategy<Value = Vec<Service>> {
     prop::collection::vec(any::<bool>(), 8).prop_map(|on| {
         [

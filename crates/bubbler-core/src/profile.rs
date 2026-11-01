@@ -2651,7 +2651,6 @@ mod tests {
         }
     }
 
-    /// `capturable` ORs across layers on either audio node.
     #[test]
     fn capturable_ors_across_layers_on_either_node() {
         let tmp = tempfile::tempdir().unwrap();

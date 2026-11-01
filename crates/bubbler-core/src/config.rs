@@ -4652,7 +4652,6 @@ mod tests {
         ));
     }
 
-    /// `capturable` is a child of both audio nodes and off unless written.
     #[test]
     fn pipewire_and_pulseaudio_take_a_capturable_child() {
         for text in [
@@ -4685,7 +4684,6 @@ mod tests {
         }
     }
 
-    /// `capturable` ORs across both nodes, which one context serves.
     #[test]
     fn audio_carries_capturable_from_either_node() {
         for text in [
