@@ -715,7 +715,9 @@ local function captured_by_a_host_program (source, link, output, input)
     return false
   end
   local client = lookup (source, "client", creator)
+  -- WirePlumber's own links stay under `own_stream_link`.
   return client ~= nil and
+      client.properties ["wireplumber.daemon"] ~= "true" and
       client.properties ["pipewire.sec.engine"] == nil and
       client.properties ["pipewire.access"] == "unrestricted"
 end
@@ -727,8 +729,8 @@ local destroying = {}
 -- By the link's ends, not its creator: a link a sandbox won before its
 -- factory was hidden lingers with no creator on it at all, and any other
 -- client's link to or from a sandbox is one the policy above would have
--- refused. WirePlumber's own links are kept only where they are the
--- ones the policy permits.
+-- refused, but for the one `captured_by_a_host_program` keeps. WirePlumber's
+-- own links are kept only where they are the ones the policy permits.
 local function destroy_if_refused (source, link)
   local serial = link.properties ["object.serial"]
   if destroying [serial] then

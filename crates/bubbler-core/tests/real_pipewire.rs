@@ -1971,19 +1971,51 @@ fn ask(program: &mut Streaming, line: &str) {
 // A voice chat program's shape: one live client owning a virtual sink and
 // linking into it. Vencord's venmic makes the same node and link.
 fn host_program_with_a_sink(bed: &PipeWireBed) -> Streaming {
-    let mut command = bed.command("pw-cli");
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    own_process_group(&mut command);
-    let mut program = Streaming(command.spawn().expect("pw-cli did not run"));
+    let mut program = waiting_for_commands(bed.command("pw-cli"));
     ask(
         &mut program,
         "create-node adapter factory.name=support.null-audio-sink node.name=shared \
          media.class=Audio/Sink/Virtual audio.position=[FL,FR]",
     );
     program
+}
+
+fn waiting_for_commands(mut pw_cli: Command) -> Streaming {
+    pw_cli
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    own_process_group(&mut pw_cli);
+    Streaming(pw_cli.spawn().expect("pw-cli did not run"))
+}
+
+// `properties` go in the client's own configuration, the only place a client
+// outside a context says them before it connects.
+fn host_client_named(bed: &PipeWireBed, name: &str, properties: &str) -> Streaming {
+    let config = bed.dir().join(name);
+    std::fs::create_dir_all(config.join("client.conf.d")).expect("a client config directory");
+    std::fs::copy(PIPEWIRE_CLIENT_CONF, config.join("client.conf"))
+        .expect("a copy of the stock client.conf");
+    std::fs::write(
+        config.join("client.conf.d/props.conf"),
+        format!("context.properties = {{ application.name = {name} {properties} }}\n"),
+    )
+    .expect("the client's drop-in");
+    let mut command = bed.command("pw-cli");
+    command.env("PIPEWIRE_CONFIG_DIR", &config);
+    let client = waiting_for_commands(command);
+    wait_for_decided_client(bed, &format!(r#"application.name = "{name}""#));
+    client
+}
+
+fn wait_for_decided_client(bed: &PipeWireBed, marker: &str) {
+    wait_for(&format!("the session manager deciding {marker}"), || {
+        block(
+            &bed.info_from_host(),
+            &[marker, "pipewire.access.effective"],
+        )
+        .is_some()
+    });
 }
 
 fn decided_owner_of(bed: &PipeWireBed, node: &str) -> String {
@@ -2047,6 +2079,148 @@ fn a_host_programs_link_from_a_capturable_contexts_playback_to_its_own_sink_is_k
 
     assert!(linked(), "the host program's link went:\n{}", bed.links());
     assert_eq!(links_destroyed(&bed), before + 1);
+    let active = [
+        format!(r#"link.input.node = "{}""#, node_id(&bed, "shared")),
+        r#"state: "active""#.to_owned(),
+    ];
+    wait_for("the host program's link active", || {
+        let listing = bed.info_from_host();
+        block(&listing, &[&active[0], &active[1]]).is_some()
+    });
+}
+
+#[test]
+fn a_host_programs_kept_link_ends_with_it() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let (_player, _sink_owner) = a_player_and_a_host_program(&bed, CAPTURABLE);
+    let mut program = host_client_named(&bed, "linker", "");
+    let before = links_destroyed(&bed);
+
+    ask(&mut program, &format!("create-link {TO_THE_HOST_SINK}"));
+    // `spa_atob` reads only `true` and `1`, so this one does not linger either.
+    ask(
+        &mut program,
+        "create-link player output_FL shared input_FL object.linger=TRUE",
+    );
+    wait_for("both links", || {
+        let links = bed.links();
+        peers(&links, "player:output_FR").contains(&"shared:input_FR")
+            && peers(&links, "player:output_FL").contains(&"shared:input_FL")
+    });
+    std::thread::sleep(FORBIDDEN_LINK_LIFE);
+    assert_eq!(links_destroyed(&bed), before);
+
+    drop(program);
+    wait_for("the links ending with their creator", || {
+        let links = bed.links();
+        peers(&links, "player:output_FR").is_empty() && peers(&links, "player:output_FL").is_empty()
+    });
+    assert_eq!(links_destroyed(&bed), before);
+}
+
+#[test]
+fn a_restricted_host_clients_link_from_a_capturable_contexts_playback_is_destroyed() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let (_player, _sink_owner) = a_player_and_a_host_program(&bed, CAPTURABLE);
+    let mut restricted = host_client_named(
+        &bed,
+        "restricted-host",
+        r#"pipewire.client.access = "restricted" pipewire.access = "unrestricted""#,
+    );
+    let name = r#"application.name = "restricted-host""#;
+    let listing = bed.info_from_host();
+    let client = block(&listing, &[name]).expect("the restricted client");
+    assert!(
+        client.contains(r#"pipewire.access = "restricted""#),
+        "{client}"
+    );
+    assert!(!client.contains("pipewire.sec.engine"), "{client}");
+    let before = links_destroyed(&bed);
+
+    ask(&mut restricted, &format!("create-link {TO_THE_HOST_SINK}"));
+    wait_for("the hook destroying the restricted client's link", || {
+        links_destroyed(&bed) == before + 1
+    });
+    std::thread::sleep(FORBIDDEN_LINK_LIFE);
+
+    let links = bed.links();
+    assert!(peers(&links, "player:output_FR").is_empty(), "{links}");
+}
+
+#[test]
+fn an_unrestricted_contexts_link_from_a_capturable_contexts_playback_is_destroyed() {
+    let Some(bed) = PipeWireBed::start() else {
+        return;
+    };
+    let (_player, _sink_owner) = a_player_and_a_host_program(&bed, CAPTURABLE);
+    let mut in_context = waiting_for_commands(bed.context_command(
+        r#"{ "pipewire.sec.engine": "org.other", "pipewire.sec.app-id": "unrestricted-context", "pipewire.access": "unrestricted" }"#,
+        "pw-cli",
+    ));
+    let app = r#"pipewire.sec.app-id = "unrestricted-context""#;
+    wait_for_decided_client(&bed, app);
+    let listing = bed.info_from_host();
+    let client = block(&listing, &[app]).expect("the context's client");
+    assert!(
+        client.contains(r#"pipewire.access = "unrestricted""#),
+        "{client}"
+    );
+    let before = links_destroyed(&bed);
+
+    ask(&mut in_context, &format!("create-link {TO_THE_HOST_SINK}"));
+    wait_for("the hook destroying the context's link", || {
+        links_destroyed(&bed) == before + 1
+    });
+    std::thread::sleep(FORBIDDEN_LINK_LIFE);
+
+    let links = bed.links();
+    assert!(peers(&links, "player:output_FR").is_empty(), "{links}");
+}
+
+// A hook variant whose first line never knows `player`'s client: WirePlumber
+// links it as it would before knowing the client. Not produced on a real restart.
+#[test]
+fn wireplumbers_link_from_a_capturable_contexts_playback_into_a_host_recorder_is_destroyed() {
+    let Some(bed) = bed_with_the_hook_changed(
+        "    local client = bubbler_client (source, si_props [\"client.id\"])\n    if foreign_sandbox_node",
+        "    local client = si_props [\"node.name\"] ~= \"player\" and bubbler_client (source, si_props [\"client.id\"]) or nil\n    if foreign_sandbox_node",
+    ) else {
+        return;
+    };
+    let _recorder = host_stream(
+        &bed,
+        &[
+            "-r",
+            "-a",
+            "-P",
+            "{ node.name = host-recorder, node.autoconnect = false }",
+            "/dev/null",
+        ],
+    );
+    wait_for_ports(&bed, &["host-recorder:input_FR"]);
+    decided_owner_of(&bed, "host-recorder");
+    let before = links_destroyed(&bed);
+
+    let _player = streaming(
+        &bed,
+        CAPTURABLE,
+        "pw-cat -p -a --target host-recorder -P '{ node.name = player, node.dont-fallback = true }' - < /dev/zero",
+        "Stream/Output/Audio",
+    );
+    wait_for("the hook destroying WirePlumber's link", || {
+        links_destroyed(&bed) > before
+    });
+    wait_for("no link into the host recorder", || {
+        !bed.links().contains("host-recorder:input_")
+    });
+    std::thread::sleep(FORBIDDEN_LINK_LIFE);
+
+    let links = bed.links();
+    assert!(!links.contains("host-recorder:input_"), "{links}");
 }
 
 #[test]

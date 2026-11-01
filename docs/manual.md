@@ -680,11 +680,17 @@ add `exclusive`; the instance's other streams are linked mixed, never in
 passthrough.
 `capturable`, on either node (`pipewire { capturable }`,
 `pulseaudio { capturable }`, ORed like `microphone`), lets a host program
-link this sandbox's playback to a node of its own, which is how a voice chat
-program shares what a game plays. That program hears everything the sandbox
-plays, and so does a sandbox with `microphone` recording the host node the
-program routes it to. The sandbox itself still cannot make this link, and
-neither can a program in another sandbox or a Flatpak.
+link this sandbox's playback to a node of no bubbler sandbox, which is how a
+voice chat program shares what a game plays. That program hears everything
+the sandbox plays, and so does a sandbox with `microphone` recording the host
+node the program routes it to, where that node is `Audio/Source*` or
+`Audio/Duplex`. The sandbox chooses its own stream names, so a program that
+selects streams by name is selecting by text the sandbox controls. The sandbox
+itself still cannot make this link, and neither can a program in another
+sandbox or a Flatpak: it takes a host program whose `pipewire.access` is
+`unrestricted`, the stock setting. A link whose creator WirePlumber does not
+know yet, as after a WirePlumber restart, is destroyed, not decided again, and
+the program may link again.
 It is off by default and in every shipped profile, and it needs a policy of
 revision 8.
 Two kinds of application are not supported under a scoped grant, with or

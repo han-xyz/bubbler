@@ -1357,17 +1357,23 @@ outside every context — another sandboxer's, an application on the
 portal path — can wear the marker too and keep a link it makes to a
 sandbox's stream; confining those clients is not bubbler's. Under the
 `capturable` grant one more link is kept: a non-lingering link from the
-sandbox's `Stream/Output/Audio` to a node of no sandbox, whose creator
+sandbox's `Stream/Output/Audio` to a node of no bubbler sandbox (another
+sandboxer's or a Flatpak's capture stream counts as one), whose creator
 is a connected client outside every security context with
-`pipewire.access = "unrestricted"`. The daemon writes `client.id` on such
+`pipewire.access = "unrestricted"` and no `wireplumber.daemon` marker, so
+WirePlumber's own links stay under the rule above. The daemon writes `client.id` on such
 a link itself (measured on PipeWire 1.6.10: a context's claim to a host
 client's id was overwritten), and the link ends with its creator. A
 sandbox still cannot make this link, since the link factory stays hidden
 from it. What the grant exposes is the instance's playback: any such host
 program hears everything it plays, and so, through the host node that
 program routes it to, does a sandbox with `microphone` recording that
-node. Capture into any sandbox, links of a sandbox's non-stream node and
-every lingering link stay refused. A link whose
+node, where it is `Audio/Source*` or `Audio/Duplex`. The sandbox chooses
+its own stream names, so a host program selecting streams by name is
+selecting by text the sandbox controls. Capture into any of bubbler's
+contexts, links of a sandbox's non-stream node and every lingering link
+stay refused. A capture link whose creator WirePlumber does not know yet
+is destroyed, not decided again, and the program may link again. A link whose
 end's node, or that node's owner, WirePlumber does not know yet when the
 link appears is decided again once it does, and so is the default. A node a sandbox creates through
 the `adapter` factory with `object.linger` set carries no `client.id`
@@ -1623,6 +1629,17 @@ loops against the hook, each new link destroyed in turn.
 `real_bwrap_pulseaudio_serves_a_private_server`,
 `a_playback_context_sees_no_source_no_metadata_and_only_reads_streams`,
 `a_playback_context_that_claims_the_microphone_gets_the_playback_grant`,
+`a_host_programs_link_from_a_capturable_contexts_playback_to_its_own_sink_is_kept`,
+`a_host_programs_kept_link_ends_with_it`,
+`a_host_programs_link_from_playback_without_the_grant_is_destroyed`,
+`a_lingering_link_from_a_capturable_contexts_playback_is_destroyed`,
+`a_host_programs_link_from_a_capturable_contexts_playback_into_a_capture_stream_is_destroyed`,
+`the_capturable_grant_lets_a_host_program_link_no_device_a_context_offers`,
+`the_capturable_grant_lets_a_host_program_link_nothing_into_a_contexts_capture_stream`,
+`a_contexts_link_claiming_a_host_programs_client_id_is_judged_by_its_real_creator`,
+`a_restricted_host_clients_link_from_a_capturable_contexts_playback_is_destroyed`,
+`an_unrestricted_contexts_link_from_a_capturable_contexts_playback_is_destroyed`,
+`wireplumbers_link_from_a_capturable_contexts_playback_into_a_host_recorder_is_destroyed`,
 `a_playback_context_cannot_nest_a_context_that_claims_the_microphone`,
 `a_host_stream_does_not_play_into_a_sink_a_playback_context_offers`,
 `a_host_stream_aimed_at_a_sink_a_playback_context_offers_plays_on_the_default`,
