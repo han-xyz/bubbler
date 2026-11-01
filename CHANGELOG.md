@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.26.3
+
+### Fixed
+
+- An ending run could remove a quick relaunch's control socket on a
+  filesystem that reuses inode numbers at once, such as ext4. `/run/user` on
+  tmpfs was not affected.
+
 ## 0.26.2
 
 ### Added

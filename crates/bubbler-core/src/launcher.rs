@@ -3064,10 +3064,17 @@ fn bind_control_socket(
         _ => {}
     }
     let listener = UnixListener::bind(&sock_path).map_err(io_at)?;
-    let bound = std::fs::symlink_metadata(&sock_path).map_err(io_at)?;
+    let held = rustix::fs::open(
+        &sock_path,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| io_at(e.into()))?;
+    let bound = rustix::fs::fstat(&held).map_err(|e| io_at(e.into()))?;
     let guard = SocketGuard {
-        id: (bound.dev(), bound.ino()),
+        id: (bound.st_dev as u64, bound.st_ino as u64),
         path: sock_path,
+        _held: held,
     };
     if let Some(log) = log {
         log.started();
@@ -3076,10 +3083,12 @@ fn bind_control_socket(
 }
 
 // Only the socket this run bound: a start after this sandbox exited may have bound its own.
+// The held descriptor keeps the inode allocated, so a later socket cannot reuse its number.
 #[derive(Debug)]
 struct SocketGuard {
     path: PathBuf,
     id: (u64, u64),
+    _held: OwnedFd,
 }
 
 impl Drop for SocketGuard {
