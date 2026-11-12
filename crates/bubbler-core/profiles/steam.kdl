@@ -113,10 +113,6 @@ dri
 pulseaudio
 network
 gamepad
-// A private session bus inside the sandbox, reaching nothing of the host.
-// Steam client build 1792618285 relaunches through its runtime, whose
-// steam-runtime-launcher-service signals each helper's exit to the client
-// by unique name; xdg-dbus-proxy 0.1.x drops that unicast signal, so Steam
-// hangs on its first helper. With no bus it exits. A `dbus` grant's
-// address is replaced by this bus, so the grant does nothing here.
+// Steam build 1792618285's runtime launcher signals a helper's exit by unique
+// name, which xdg-dbus-proxy 0.1.x drops; a private bus avoids the proxy.
 command "dbus-run-session" "--" "steam"
