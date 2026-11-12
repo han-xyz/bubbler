@@ -9,6 +9,8 @@
   instance changes `command` the same way: `command "dbus-run-session" "--"
   "steam"`.
 - `BUBBLER_DBUS_LOG=1` now shows the D-Bus proxy's log.
+- rustix updated to 1.1.6 for RUSTSEC-2026-0486 (unsound xattr functions, which
+  bubbler does not call).
 
 ## 0.26.3
 
