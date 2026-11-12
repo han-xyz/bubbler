@@ -1040,7 +1040,7 @@ pub fn start_wayland(
     let cmd = bwrap_command(&argv, &mut alloc)?;
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     spawning(&alloc.intended())?;
-    let (child, stderr) = spawn_sidecar(cmd)?;
+    let (child, stderr) = spawn_sidecar(cmd, false)?;
     let mut handle = WaylandHandle {
         child,
         alloc,
@@ -1175,7 +1175,7 @@ pub fn start_pw_context(
     let cmd = bwrap_command(&argv, &mut alloc)?;
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     spawning(&alloc.intended())?;
-    let (child, stderr) = spawn_sidecar(cmd)?;
+    let (child, stderr) = spawn_sidecar(cmd, false)?;
     let mut handle = PwHandle {
         child,
         alloc,
@@ -1386,7 +1386,7 @@ pub fn start_pw_pulse(
     let cmd = bwrap_command(&argv, &mut alloc)?;
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     spawning(&alloc.intended())?;
-    let (child, stderr) = spawn_sidecar(cmd)?;
+    let (child, stderr) = spawn_sidecar(cmd, false)?;
     let mut handle = PulseHandle {
         child,
         alloc,
@@ -1551,7 +1551,7 @@ pub fn start_proxy(
     let cmd = bwrap_command(&argv, &mut alloc)?;
     alloc.inheritable(true).map_err(LaunchError::Data)?;
     spawning(&alloc.intended())?;
-    let (child, stderr) = spawn_sidecar(cmd)?;
+    let (child, stderr) = spawn_sidecar(cmd, env.dbus_log)?;
     let mut handle = ProxyHandle {
         child,
         alloc,
@@ -1861,12 +1861,17 @@ fn bwrap_command(argv: &Argv, alloc: &mut RealAlloc) -> Result<Command, LaunchEr
 }
 
 // A sidecar parses what the sandbox sends it, so it holds none of the caller's stdio and no
-// terminal.
-fn spawn_sidecar(mut cmd: Command) -> Result<(Child, run_log::Relay), LaunchError> {
+// terminal. `xdg-dbus-proxy --log` writes to stdout, so `log_stdout` sends it to the relay too.
+fn spawn_sidecar(
+    mut cmd: Command,
+    log_stdout: bool,
+) -> Result<(Child, run_log::Relay), LaunchError> {
     let (stderr, relay) = run_log::relay()?;
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(stderr);
+    let stdout = match log_stdout {
+        true => Stdio::from(stderr.try_clone().map_err(LaunchError::Data)?),
+        false => Stdio::null(),
+    };
+    cmd.stdin(Stdio::null()).stdout(stdout).stderr(stderr);
     let spawned = cmd.spawn();
     // `cmd` holds bubbler's copy of the relay's write end; the relay only
     // sees the end of the output once that copy is gone.
