@@ -90,18 +90,10 @@
 // service on the host's loopback and every host abstract unix socket
 // along with them.
 //
+// `notify` and `tray` are left out: both need `dbus`, which the private bus
+// below makes inert.
+//
 // Bare by design. Add:
-//   dbus {
-//       own "com.steampowered.*"
-//       talk "org.freedesktop.ScreenSaver"
-//       talk "org.freedesktop.PowerManagement"
-//   }
-//   lint-allow {
-//       "own-too-wide" reason="com.steampowered.* is Steam's own name space, and the client claims several names under it"
-//   }
-//     — the names the client claims for itself (steam:// URL handling
-//       among them) and the two power-save blockers it holds while a game
-//       runs.
 //   system-bus {
 //       talk "org.freedesktop.UPower"
 //       see "org.freedesktop.UDisks2"
@@ -111,11 +103,6 @@
 //       Wine builds from UDisks2: `see` plus that one call, and
 //       no more. A `talk` there would reach loop setup, mount and LUKS
 //       unlock, which polkit judges as you.
-//   notify
-//     — the friend and download notifications. Needs `dbus`.
-//   tray
-//     — the tray icon, and with it the client's "minimise to tray".
-//       Needs `dbus`.
 //   pipewire
 //     — a game or the client speaking PipeWire itself, and the
 //       screen-share portal, which `portals` above rules out anyway.
@@ -126,4 +113,10 @@ dri
 pulseaudio
 network
 gamepad
-command "steam"
+// A private session bus inside the sandbox, reaching nothing of the host.
+// Steam client build 1792618285 relaunches through its runtime, whose
+// steam-runtime-launcher-service signals each helper's exit to the client
+// by unique name; xdg-dbus-proxy 0.1.x drops that unicast signal, so Steam
+// hangs on its first helper. With no bus it exits. A `dbus` grant's
+// address is replaced by this bus, so the grant does nothing here.
+command "dbus-run-session" "--" "steam"

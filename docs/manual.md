@@ -2624,16 +2624,22 @@ may ever carry `userns "disable"` — pressure-vessel nests its own bubblewrap f
 every Proton game. `/dev/hugepages`, `/dev/fuse` and `/dev/snd` are still not
 bound.
 
-Neither gaming profile reaches a bus at all now. What their headers list, and
-what each is worth: the names the client claims for itself
-(`own "com.steampowered.*"` with its `own-too-wide` allow, `own
-"net.lutris.Lutris"`), the power-save blockers a running game holds
-(`org.freedesktop.ScreenSaver`, `org.freedesktop.PowerManagement`), GameMode
-for Lutris — inert where `gamemoded` is not installed — and on the system bus
-UPower plus UDisks2 enumeration: `see` and the one `GetManagedObjects` call
-Wine builds its drive list from, never a `talk`, which would also hand the
-sandbox loop setup, mount and LUKS unlock, judged by polkit as you. `notify`
-and `tray` are there too, one rule each.
+`lutris` reaches no bus at all. What its header lists, and what each item is
+worth: the name the client claims for itself (`own "net.lutris.Lutris"`), the
+power-save blockers a running game holds (`org.freedesktop.ScreenSaver`,
+`org.freedesktop.PowerManagement`), GameMode — inert where `gamemoded` is not
+installed — and on the system bus UPower plus UDisks2 enumeration: `see` and
+the one `GetManagedObjects` call Wine builds its drive list from, never a
+`talk`, which would also hand the sandbox loop setup, mount and LUKS unlock,
+judged by polkit as you. `notify` and `tray` are there too, one rule each.
+
+`steam` runs Steam as `dbus-run-session -- steam`: a private session bus
+inside the sandbox that reaches nothing of the host. The client's runtime
+launcher signals each helper's exit to the client by unique name, and
+xdg-dbus-proxy drops that signal, so behind the filtering proxy Steam hangs on
+its first helper. A `dbus` grant's address is replaced by the private bus, so
+it does nothing there, and `notify` and `tray` do not work. Its header still
+lists the system-bus rules above.
 
 `steam` is also the one profile that must not be given `portals`, and that is
 not an oversight: the grant writes `/.flatpak-info`, Steam's own runtime reads

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.26.4
+
+### Fixed
+
+- The steam profile starts Steam on a private D-Bus session bus, because the
+  client's runtime launcher hangs behind the filtering proxy. An existing
+  instance changes `command` the same way: `command "dbus-run-session" "--"
+  "steam"`.
+- `BUBBLER_DBUS_LOG=1` now shows the D-Bus proxy's log.
+
 ## 0.26.3
 
 ### Fixed

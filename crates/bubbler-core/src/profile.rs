@@ -1339,12 +1339,19 @@ mod tests {
             "libreoffice",
             "lutris",
             "mpv",
-            "steam",
             "thunderbird",
             "vesktop",
         ] {
             assert_eq!(cfg(n).command, Some(vec![OsString::from(n)]), "{n}");
         }
+        assert_eq!(
+            cfg("steam").command,
+            Some(
+                ["dbus-run-session", "--", "steam"]
+                    .map(OsString::from)
+                    .to_vec()
+            )
+        );
 
         assert!(matches!(r.resolve("nope"), Err(ProfileError::NotFound(n)) if n == "nope"));
     }
