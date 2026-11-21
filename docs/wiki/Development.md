@@ -215,7 +215,7 @@ both commands in a throwaway repository.
 | `crates/bubbler-core/src/seccomp.rs` | `DEFAULT_EPERM`, `DEFAULT_ENOSYS`, filter compile |
 | `crates/bubbler-core/src/dbus.rs` | proxy plan |
 | `crates/bubbler-core/src/lint.rs` | every check id |
-| `crates/bubbler-core/profiles/*.kdl` | built-in profiles |
+| `crates/bubbler-model/profiles/*.kdl` | built-in profiles |
 | `docs/threat-model.md` | long-form threat model |
 | `contrib/apparmor/` | untested AppArmor profile |
 

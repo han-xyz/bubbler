@@ -9,9 +9,8 @@ publish = false
 description = "Plan layer of bubbler: services, the bwrap argument builder, explain and lint"
 
 [features]
-# Test helpers (`host::fake`, `sidecar_argv::test_support`,
-# `desktop::test_support`) for the run crate's tests; never enabled in a
-# normal build.
+# Test helpers for the run crate's tests; never enabled in a normal
+# build.
 test-support = ["dep:tempfile"]
 
 [dependencies]

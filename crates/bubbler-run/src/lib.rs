@@ -1,10 +1,9 @@
-pub use bubbler_model::{
-    catalogue, checks, config, env, error, instance, json, kdl_out, names, paths, profile,
-    safe_text, wrap,
+pub(crate) use bubbler_model::{
+    config, env, error, instance, kdl_out, names, paths, profile, safe_text, wrap,
 };
-pub use bubbler_plan::{
-    audio_policy, bwrap, cgroup_text, dbus, dbus_wire, desktop, explain, forward, host, init_bin,
-    lint, network, pipewire, seccomp, service, sidecar_argv, tty, version, wayland,
+pub(crate) use bubbler_plan::{
+    audio_policy, bwrap, cgroup_text, dbus, dbus_wire, desktop, forward, host, init_bin, network,
+    pipewire, service, sidecar_argv, tty, version, wayland,
 };
 
 pub mod audio_policy_ask;

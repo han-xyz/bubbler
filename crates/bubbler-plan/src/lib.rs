@@ -1,6 +1,5 @@
-pub use bubbler_model::{
-    catalogue, checks, config, env, error, instance, json, kdl_out, names, paths, profile,
-    safe_text, wrap,
+pub(crate) use bubbler_model::{
+    checks, config, env, error, instance, json, kdl_out, names, paths, profile,
 };
 
 pub mod audio_policy;

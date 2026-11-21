@@ -15,7 +15,7 @@ test-support = []
 
 [dependencies]
 # The `HostPattern` rule an `allow-host` is parsed by is the same one
-# the egress proxy holds a `CONNECT` target to; core takes it from the
+# the egress proxy holds a `CONNECT` target to; the model takes it from the
 # proxy's library rather than keeping a second copy of a filter rule.
 bubbler-net-proxy.workspace = true
 kdl.workspace = true
