@@ -76,11 +76,11 @@ bump() {
     phase=bump
     sed -i \
         -e "/^\[workspace.package\]/,/^\[/ s/^version = \"$old\"/version = \"$version\"/" \
-        -e "s/^\(bubbler-\(core\|init\|net-proxy\) = {.*version = \)\"$old\"/\1\"$version\"/" \
+        -e "s/^\(bubbler-\(core\|model\|plan\|run\|init\|net-proxy\) = {.*version = \)\"$old\"/\1\"$version\"/" \
         Cargo.toml
     [ "$(workspace_version <Cargo.toml)" = "$version" ] \
-        && [ "$(grep -c "^bubbler-\(core\|init\|net-proxy\) = {.*version = \"$version\"" Cargo.toml)" = 3 ] \
-        || die "Cargo.toml does not have the four version sites in the expected form"
+        && [ "$(grep -c "^bubbler-\(core\|model\|plan\|run\|init\|net-proxy\) = {.*version = \"$version\"" Cargo.toml)" = 6 ] \
+        || die "Cargo.toml does not have the seven version sites in the expected form"
 
     "$CARGO" update -w --offline
     (cd fuzz && "$CARGO" update -w --offline)

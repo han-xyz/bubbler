@@ -44,6 +44,9 @@ rust-version = "1.0.0"
 
 [workspace.dependencies]
 bubbler-core = { path = "crates/bubbler-core", version = "1.0.0" }
+bubbler-model = { path = "crates/bubbler-model", version = "1.0.0" }
+bubbler-plan = { path = "crates/bubbler-plan", version = "1.0.0" }
+bubbler-run = { path = "crates/bubbler-run", version = "1.0.0" }
 bubbler-init = { path = "crates/bubbler-init", version = "1.0.0" }
 bubbler-net-proxy = { path = "crates/bubbler-net-proxy", version = "1.0.0" }
 kdl = "1.0.0"
@@ -119,11 +122,11 @@ RELEASE_CARGO=false check refuses 9.9.9
 check test "$(git log -1 --format=%s)" = "chore: release v9.9.9"
 check test "$(git log -1 --format=%B | grep -c .)" = 1
 check test "$(git show --name-only --format= HEAD | sort | tr '\n' ' ')" = "Cargo.lock Cargo.toml fuzz/Cargo.lock "
-check test "$(git diff HEAD~1 HEAD -- Cargo.toml | grep -c '^+[^+]')" = 4
+check test "$(git diff HEAD~1 HEAD -- Cargo.toml | grep -c '^+[^+]')" = 7
 check grep -q '^kdl = "1.0.0"' Cargo.toml
 check grep -q '^rust-version = "1.0.0"' Cargo.toml
 check grep -q '^version = "9.9.9"' Cargo.toml
-check test "$(grep -c 'version = "9.9.9"' Cargo.toml)" = 4
+check test "$(grep -c 'version = "9.9.9"' Cargo.toml)" = 7
 check test -z "$(git status --porcelain)"
 check refuses 9.9.9
 
