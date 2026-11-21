@@ -17,6 +17,7 @@ pub use crate::cgroup_text::placeholder;
 use crate::network;
 use crate::proc;
 use crate::run::launch_error::LaunchError;
+use crate::run::launcher::NetworkError;
 
 // Every path a rule carries is relative to this.
 const CGROUP2_ROOT: &str = "/sys/fs/cgroup";
@@ -206,9 +207,10 @@ fn create_under(
         false => format!("{own}/{prefix}{pid}"),
     };
     let spec = network::Cgroup::new(&format!("{base}/{PROXY_LEAF}")).map_err(|why| {
-        LaunchError::Network(format!(
-            "the cgroup this run would create is no path a rule could carry ({why}): {base}"
-        ))
+        NetworkError::CgroupUnrepresentable {
+            why,
+            base: base.clone(),
+        }
     })?;
     let home = root.join(own);
     // A bubbler killed with SIGKILL leaves its directories behind, and
@@ -236,10 +238,7 @@ fn create_under(
         Ok(procs) => procs,
         Err(e) => {
             remove(ops, &[&proxy, &sandbox, &dir]);
-            return Err(LaunchError::Network(format!(
-                "opening {}/cgroup.procs: {e}",
-                proxy.display()
-            )));
+            return Err(NetworkError::CgroupProcs { proxy, errno: e }.into());
         }
     };
     let cgroup = SandboxCgroup {
@@ -262,10 +261,11 @@ fn create_under(
             cgroup.dir.clone(),
         ];
         remove(ops, &dirs.iter().collect::<Vec<_>>());
-        return Err(LaunchError::Network(format!(
-            "moving bubbler into {}: {e}",
-            cgroup.sandbox.display()
-        )));
+        return Err(NetworkError::CgroupMove {
+            sandbox: cgroup.sandbox.clone(),
+            err: e,
+        }
+        .into());
     }
     Ok(cgroup)
 }
@@ -310,21 +310,23 @@ fn sweep(ops: Ops, home: &Path, prefix: &str, own: u32) {
 // have to change. Everything else is reported as it arrived.
 fn bad_subtree(e: Errno, dir: &Path) -> LaunchError {
     match e {
-        Errno::ACCESS | Errno::PERM | Errno::ROFS | Errno::NOENT => LaunchError::Network(format!(
-            "allow-host needs a delegated cgroup2 subtree (a systemd user session provides \
-             one): creating {}: {e}",
-            dir.display()
-        )),
+        Errno::ACCESS | Errno::PERM | Errno::ROFS | Errno::NOENT => {
+            NetworkError::CgroupNotDelegated {
+                dir: dir.to_owned(),
+                errno: e,
+            }
+        }
         // The sweep above removes what an earlier run left, so what is
         // left here is a directory holding a process: another bubbler
         // with this instance and this pid, which cannot be, or something
         // else of the user's under the same name.
-        Errno::EXIST => LaunchError::Network(format!(
-            "{} already exists and is not empty; another process is in it",
-            dir.display()
-        )),
-        _ => LaunchError::Network(format!("creating {}: {e}", dir.display())),
+        Errno::EXIST => NetworkError::CgroupOccupied(dir.to_owned()),
+        _ => NetworkError::CgroupCreate {
+            dir: dir.to_owned(),
+            errno: e,
+        },
     }
+    .into()
 }
 
 /// bubbler's own cgroup, relative to the cgroup2 mount and without the
@@ -340,13 +342,9 @@ pub fn own_path() -> Result<String, LaunchError> {
     File::open(&path)
         .and_then(|f| f.take(MAX_CGROUP_FILE).read_to_string(&mut text))
         .map_err(|e| LaunchError::Io(path.clone(), e))?;
-    unified_of(&text).map(str::to_owned).ok_or_else(|| {
-        LaunchError::Network(
-            "this process is in no cgroup2 hierarchy, which is what an `allow-host` ruleset \
-             matches on"
-                .to_owned(),
-        )
-    })
+    unified_of(&text)
+        .map(str::to_owned)
+        .ok_or_else(|| NetworkError::NoCgroup2.into())
 }
 
 // `None` where there is no such line, which is a host with no cgroup2
@@ -588,9 +586,10 @@ mod tests {
         let tmp = tempfile::tempdir().expect("a temporary directory");
         fake_root(tmp.path(), &[own, &format!("{own}/bubbler-t-33/busy")]);
         let refused = create_under(tmp.path(), own, "t", 33, FAKE);
-        let Err(LaunchError::Network(why)) = refused else {
+        let Err(LaunchError::Network(err)) = refused else {
             panic!("{refused:?}")
         };
+        let why = err.to_string();
         assert!(why.contains("bubbler-t-33"), "{why}");
         assert!(why.contains("already exists"), "{why}");
     }

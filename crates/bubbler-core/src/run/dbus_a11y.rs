@@ -13,6 +13,56 @@ use crate::env::Env;
 use crate::host::Host;
 use crate::run::launch_error::LaunchError;
 
+/// Why the accessibility bus could not be found: `$AT_SPI_BUS_ADDRESS`
+/// named no socket bubbler can bind, the session bus could not be
+/// reached, or `org.a11y.Bus` did not answer with a `unix:path=` address.
+/// Text the bus sent is shown through `bus_note`; the address it
+/// answered with is never echoed, as it is host input.
+#[derive(Debug, thiserror::Error)]
+pub enum A11yError {
+    /// `GetAddress` answered with something other than one string.
+    #[error("finding the accessibility bus: org.a11y.Bus answered GetAddress with no address")]
+    NoAddress,
+    /// The answer is no `unix:path=` address.
+    #[error(
+        "finding the accessibility bus: the address org.a11y.Bus returned is not a \
+         `unix:path=<path>` socket"
+    )]
+    NoPath,
+    /// The answer's `unix:path=` holds a malformed `%XX` escape.
+    #[error(
+        "finding the accessibility bus: the address org.a11y.Bus returned has a bad `%XX` \
+         escape in its `unix:path=`"
+    )]
+    BadEscape,
+    /// `GetAddress` was refused with a D-Bus error and no text. The
+    /// name is the half that matters, and a trailing colon would promise
+    /// a sentence that is not there.
+    #[error("finding the accessibility bus: org.a11y.Bus.GetAddress failed: {}", bus_note(.name))]
+    Refused {
+        /// The D-Bus error name.
+        name: String,
+    },
+    /// `GetAddress` was refused with a D-Bus error and its text.
+    #[error(
+        "finding the accessibility bus: org.a11y.Bus.GetAddress failed: {}: {}",
+        bus_note(.name),
+        bus_note(.message)
+    )]
+    RefusedWithMessage {
+        /// The D-Bus error name.
+        name: String,
+        /// The text the error came with.
+        message: String,
+    },
+    /// The session bus could not be asked at all.
+    #[error(
+        "finding the accessibility bus: asking the session bus for the accessibility bus: {}",
+        bus_note(&.0.to_string())
+    )]
+    Session(WireError),
+}
+
 /// The host accessibility bus address, refused when it lands in
 /// bubbler's own runtime directory. The bus is asked for its address
 /// first, as a run does; the unguarded resolver is crate-private.
@@ -55,44 +105,26 @@ fn ask_a11y_bus(env: &Env) -> Result<PathBuf, LaunchError> {
         )
         .map_err(a11y_failure)?;
     let [Value::Str(address)] = reply.as_slice() else {
-        return Err(LaunchError::A11y(
-            "org.a11y.Bus answered GetAddress with no address".to_owned(),
-        ));
+        return Err(A11yError::NoAddress.into());
     };
     // The address is not echoed: it is host input, and an address may
     // hold anything.
     unix_path(OsStr::new(address.as_str())).map_err(|fault| {
-        LaunchError::A11y(
-            match fault {
-                AddressFault::NoPath => {
-                    "the address org.a11y.Bus returned is not a `unix:path=<path>` socket"
-                }
-                AddressFault::BadEscape => {
-                    "the address org.a11y.Bus returned has a bad `%XX` escape in its `unix:path=`"
-                }
-            }
-            .to_owned(),
-        )
+        match fault {
+            AddressFault::NoPath => A11yError::NoPath,
+            AddressFault::BadEscape => A11yError::BadEscape,
+        }
+        .into()
     })
 }
 
 fn a11y_failure(e: WireError) -> LaunchError {
-    LaunchError::A11y(match e {
-        // The name is the half that matters, and a trailing colon would promise a
-        // sentence that is not there.
-        WireError::Remote { name, message } if message.is_empty() => {
-            format!("org.a11y.Bus.GetAddress failed: {}", bus_note(&name))
-        }
-        WireError::Remote { name, message } => format!(
-            "org.a11y.Bus.GetAddress failed: {}: {}",
-            bus_note(&name),
-            bus_note(&message)
-        ),
-        other => format!(
-            "asking the session bus for the accessibility bus: {}",
-            bus_note(&other.to_string())
-        ),
-    })
+    match e {
+        WireError::Remote { name, message } if message.is_empty() => A11yError::Refused { name },
+        WireError::Remote { name, message } => A11yError::RefusedWithMessage { name, message },
+        other => A11yError::Session(other),
+    }
+    .into()
 }
 
 // Text bubbler did not write: the first line of it, with the control characters
@@ -252,9 +284,10 @@ mod tests {
         });
         let mut e = env();
         e.runtime_dir = tmp.path().to_owned();
-        let Err(LaunchError::A11y(msg)) = host_a11y_bus(&e) else {
+        let Err(LaunchError::A11y(err)) = host_a11y_bus(&e) else {
             panic!("a refused call was accepted");
         };
+        let msg = err.to_string();
         server.join().unwrap();
         assert!(msg.contains("org.a11y.Bus.GetAddress failed"), "{msg}");
         assert!(
@@ -264,11 +297,7 @@ mod tests {
         assert!(msg.contains("^[]52;c;aGk=^G"), "{msg}");
         assert!(!msg.contains('\x1b'), "{msg}");
         assert!(!msg.contains("more"), "{msg}");
-        assert!(
-            LaunchError::A11y(msg)
-                .to_string()
-                .starts_with("finding the accessibility bus: "),
-        );
+        assert!(msg.starts_with("finding the accessibility bus: "), "{msg}");
     }
 
     #[test]
@@ -280,11 +309,14 @@ mod tests {
         // that echoed it raw would hand the terminal whatever it holds.
         e.runtime_dir = tmp.path().join("a\x1bb");
         std::fs::create_dir(&e.runtime_dir).unwrap();
-        let Err(LaunchError::A11y(msg)) = host_a11y_bus(&e) else {
+        let Err(LaunchError::A11y(err)) = host_a11y_bus(&e) else {
             panic!("a bus that is not there was accepted");
         };
+        let msg = err.to_string();
         assert!(
-            msg.starts_with("asking the session bus for the accessibility bus: "),
+            msg.starts_with(
+                "finding the accessibility bus: asking the session bus for the accessibility bus: "
+            ),
             "{msg}"
         );
         assert!(msg.contains("^["), "{msg}");
@@ -304,9 +336,10 @@ mod tests {
         );
         let mut e = env();
         e.runtime_dir = tmp.path().to_owned();
-        let Err(LaunchError::A11y(msg)) = host_a11y_bus(&e) else {
+        let Err(LaunchError::A11y(err)) = host_a11y_bus(&e) else {
             panic!("an abstract address was accepted");
         };
+        let msg = err.to_string();
         server.join().unwrap();
         assert!(msg.contains("unix:path="), "{msg}");
         // The address is host input; the message says what was wrong
@@ -334,11 +367,55 @@ mod tests {
             let (_bus, server) = bus_answering(tmp.path(), sig, body);
             let mut e = env();
             e.runtime_dir = tmp.path().to_owned();
-            let Err(LaunchError::A11y(msg)) = host_a11y_bus(&e) else {
+            let Err(LaunchError::A11y(err)) = host_a11y_bus(&e) else {
                 panic!("a reply of {sig:?} was accepted");
             };
+            let msg = err.to_string();
             server.join().unwrap();
             assert!(msg.contains("org.a11y.Bus"), "{sig:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_missing_accessibility_bus_reads_as_before() {
+        let session = WireError::Io(std::io::Error::other("Connection reset by peer"));
+        for (e, text) in [
+            (
+                A11yError::NoAddress,
+                "finding the accessibility bus: org.a11y.Bus answered GetAddress with no address",
+            ),
+            (
+                A11yError::NoPath,
+                "finding the accessibility bus: the address org.a11y.Bus returned is not a \
+                 `unix:path=<path>` socket",
+            ),
+            (
+                A11yError::BadEscape,
+                "finding the accessibility bus: the address org.a11y.Bus returned has a bad \
+                 `%XX` escape in its `unix:path=`",
+            ),
+            (
+                A11yError::Refused {
+                    name: "org.freedesktop.DBus.Error.ServiceUnknown".to_owned(),
+                },
+                "finding the accessibility bus: org.a11y.Bus.GetAddress failed: \
+                 org.freedesktop.DBus.Error.ServiceUnknown",
+            ),
+            (
+                A11yError::RefusedWithMessage {
+                    name: "org.freedesktop.DBus.Error.Failed".to_owned(),
+                    message: "no bus".to_owned(),
+                },
+                "finding the accessibility bus: org.a11y.Bus.GetAddress failed: \
+                 org.freedesktop.DBus.Error.Failed: no bus",
+            ),
+            (
+                A11yError::Session(session),
+                "finding the accessibility bus: asking the session bus for the accessibility \
+                 bus: talking to the bus: Connection reset by peer",
+            ),
+        ] {
+            assert_eq!(LaunchError::from(e).to_string(), text);
         }
     }
 }

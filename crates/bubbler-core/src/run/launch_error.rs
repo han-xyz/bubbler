@@ -9,6 +9,9 @@ use thiserror::Error;
 
 use crate::model::error::ConfigError;
 use crate::plan::plan_error::PlanError;
+use crate::run::dbus_a11y::A11yError;
+use crate::run::exec::ControlError;
+use crate::run::launcher::{NetworkError, PipeWireError};
 use crate::wayland_context::WaylandError;
 
 /// Failures while turning a config into a running sandbox.
@@ -58,28 +61,20 @@ pub enum LaunchError {
     /// What the run was to bind, set or filter could not be resolved.
     #[error(transparent)]
     Plan(#[from] PlanError),
-    /// The sidecar that creates this run's PipeWire security context did
-    /// not report the socket it made. The run stops here.
-    #[error("pw-container did not create this instance's PipeWire security context: {0}")]
-    PwContext(String),
-    /// The private PulseAudio server of a `pulseaudio` grant did not
+    /// A PipeWire sidecar of the `pipewire` or `pulseaudio` grant did not
     /// come up. The run stops here.
-    #[error("pipewire-pulse did not serve this instance's private PulseAudio socket: {0}")]
-    PwPulse(String),
-    /// The pasta sidecar could not be started or did not report that it
-    /// had configured the sandbox's network namespace. The sandbox is
-    /// stopped rather than let go.
-    #[error("connecting the sandbox network namespace: {0}")]
-    Network(String),
-    /// The accessibility bus could not be found: `$AT_SPI_BUS_ADDRESS`
-    /// named no socket bubbler can bind, the session bus could not be
-    /// reached, or `org.a11y.Bus` did not answer with a `unix:path=`
-    /// address.
-    #[error("finding the accessibility bus: {0}")]
-    A11y(String),
+    #[error(transparent)]
+    PipeWire(#[from] PipeWireError),
+    /// The sandbox's network namespace could not be connected or
+    /// filtered. The sandbox is stopped rather than let go.
+    #[error(transparent)]
+    Network(#[from] NetworkError),
+    /// The accessibility bus could not be found.
+    #[error(transparent)]
+    A11y(#[from] A11yError),
     /// The other end of the exec channel spoke out of protocol or hung up.
-    #[error("exec channel: {0}")]
-    Protocol(String),
+    #[error(transparent)]
+    Control(#[from] ControlError),
     /// The compositor refused, or could not be asked for, the Wayland
     /// security context the `wayland` grant registers the sandbox as.
     /// The run stops rather than fall back to the session socket.

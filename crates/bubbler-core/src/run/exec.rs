@@ -32,6 +32,20 @@ use crate::tty_relay::{self, RawGuard, RelayEnd};
 
 pub use crate::paths::{SOCKET_NAME, socket_path};
 
+/// How the exec channel to a running instance failed.
+#[derive(Debug, thiserror::Error)]
+pub enum ControlError {
+    /// The instance hung up before it sent the command's status.
+    #[error("exec channel: the instance stopped while the command was running")]
+    Stopped,
+    /// Sending the request or reading the answer failed.
+    #[error("exec channel: {0}")]
+    Io(io::Error),
+    /// The channel closed with neither a status nor a stop signal.
+    #[error("exec channel: the instance sent no status for the command")]
+    NoStatus,
+}
+
 /// Connect to a live instance. `Ok(None)` when nothing listens. A refused
 /// socket is left over from a dead run and is left where it is: only a
 /// start unlinks it, under the lock it binds the path again under.
@@ -115,10 +129,8 @@ const STOP_SIGNALS: [i32; 3] = [SIGINT, SIGTERM, SIGHUP];
 
 fn protocol_error(e: io::Error) -> LaunchError {
     match e.kind() {
-        io::ErrorKind::UnexpectedEof => {
-            LaunchError::Protocol("the instance stopped while the command was running".into())
-        }
-        _ => LaunchError::Protocol(e.to_string()),
+        io::ErrorKind::UnexpectedEof => ControlError::Stopped.into(),
+        _ => ControlError::Io(e).into(),
     }
 }
 
@@ -210,7 +222,7 @@ pub fn run_in_with(
         flags,
         [send[0].as_fd(), send[1].as_fd(), send[2].as_fd()],
     )
-    .map_err(|e| LaunchError::Protocol(e.to_string()))?;
+    .map_err(|e| LaunchError::from(ControlError::Io(e)))?;
     // The fds are in the socket's queue and no longer need an owner here.
     // The slave goes with them: one left behind would keep the pty from
     // ever reporting the end of the command's output.
@@ -325,9 +337,7 @@ pub fn run_in_with(
         // The guard puts the terminal back as this returns, which is the
         // whole reason the signal was caught instead of fatal.
         (_, None, Some(sig)) => Ok(128 + sig),
-        (_, None, None) => Err(LaunchError::Protocol(
-            "the instance sent no status for the command".into(),
-        )),
+        (_, None, None) => Err(ControlError::NoStatus.into()),
     }
 }
 
@@ -534,8 +544,28 @@ mod tests {
                 &[OsString::from("true")],
                 tty::TtyMode::Passthrough
             ),
-            Err(LaunchError::Protocol(_))
+            Err(LaunchError::Control(_))
         ));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn a_failed_exec_channel_reads_as_before() {
+        for (e, text) in [
+            (
+                ControlError::Stopped,
+                "exec channel: the instance stopped while the command was running",
+            ),
+            (
+                ControlError::Io(io::Error::other("Broken pipe")),
+                "exec channel: Broken pipe",
+            ),
+            (
+                ControlError::NoStatus,
+                "exec channel: the instance sent no status for the command",
+            ),
+        ] {
+            assert_eq!(LaunchError::from(e).to_string(), text);
+        }
     }
 }

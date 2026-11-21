@@ -14,7 +14,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -95,6 +95,178 @@ const NET_PROXY_READY: Duration = Duration::from_secs(5);
 const NET_PROXY_STOP: Duration = Duration::from_secs(5);
 
 const SUPERVISOR_WAIT: Duration = Duration::from_secs(2);
+
+/// A PipeWire sidecar of the `pipewire` or `pulseaudio` grant did not
+/// come up. The run stops here.
+#[derive(Debug, thiserror::Error)]
+pub enum PipeWireError {
+    /// `pw-container` exited before it reported the security context's socket.
+    #[error(
+        "pw-container did not create this instance's PipeWire security context: it exited \
+         ({0})"
+    )]
+    ContextExited(ExitStatus),
+    /// `pw-container` reported no socket, or another one, in time.
+    #[error(
+        "pw-container did not create this instance's PipeWire security context: it did not \
+         report `{}` within {:?}",
+        pipewire::SOCKET_INSIDE,
+        PW_READY
+    )]
+    ContextSilent,
+    /// The private `pipewire-pulse` exited before it made its socket.
+    #[error(
+        "pipewire-pulse did not serve this instance's private PulseAudio socket: it exited ({0})"
+    )]
+    PulseExited(ExitStatus),
+    /// The private `pipewire-pulse` did not make the socket at this path in time.
+    #[error(
+        "pipewire-pulse did not serve this instance's private PulseAudio socket: it did not \
+         create `{}` within {:?}",
+        .0.display(),
+        PULSE_READY
+    )]
+    PulseSilent(PathBuf),
+}
+
+/// The sandbox's network namespace could not be connected or filtered:
+/// pasta, `nft`, the egress proxy or the cgroups an `allow-host` needs.
+/// The sandbox is stopped rather than let go.
+#[derive(Debug, thiserror::Error)]
+pub enum NetworkError {
+    /// The sandbox pid shares bubbler's network namespace, so it is no
+    /// longer the sandbox.
+    #[error(
+        "connecting the sandbox network namespace: sandbox pid reused; refusing to configure the \
+         host network namespace"
+    )]
+    PidReusedNet,
+    /// The sandbox pid shares bubbler's mount namespace.
+    #[error(
+        "connecting the sandbox network namespace: sandbox pid reused; refusing to join the host \
+         mount namespace"
+    )]
+    PidReusedMnt,
+    /// bwrap reported no pid, so pasta has nothing to attach to.
+    #[error(
+        "connecting the sandbox network namespace: bwrap reported no sandbox pid for pasta to \
+         attach to"
+    )]
+    NoSandboxPid,
+    /// pasta did not report that it configured the namespace.
+    #[error("connecting the sandbox network namespace: pasta did not configure the namespace")]
+    PastaNotReady,
+    /// `nft` could not be started.
+    #[error(
+        "connecting the sandbox network namespace: starting `{}`: {}",
+        network::NFT_BIN,
+        .0
+    )]
+    NftStart(io::Error),
+    /// Waiting on `nft` failed.
+    #[error("connecting the sandbox network namespace: waiting for `nft`: {0}")]
+    NftWait(io::Error),
+    /// `nft` did not finish in time and was killed.
+    #[error(
+        "connecting the sandbox network namespace: `{}` did not install the outbound ruleset \
+         within {} seconds",
+        network::NFT_BIN,
+        NFT_TIMEOUT.as_secs()
+    )]
+    NftTimeout,
+    /// `nft` exited unsuccessfully.
+    #[error(
+        "connecting the sandbox network namespace: `{}` refused the outbound ruleset ({})",
+        network::NFT_BIN,
+        .0
+    )]
+    NftRefused(ExitStatus),
+    /// Writing the ruleset to `nft` failed.
+    #[error("connecting the sandbox network namespace: writing the outbound ruleset: {0}")]
+    NftWrite(io::Error),
+    /// The egress proxy could not be started.
+    #[error("connecting the sandbox network namespace: starting the egress proxy: {0}")]
+    ProxyStart(io::Error),
+    /// The egress proxy exited before it reported its socket.
+    #[error(
+        "connecting the sandbox network namespace: the egress proxy did not start: it exited \
+         ({0})"
+    )]
+    ProxyExited(ExitStatus),
+    /// The egress proxy reported no listening socket in time.
+    #[error(
+        "connecting the sandbox network namespace: the egress proxy did not start: it did not \
+         report a listening socket within {:?}",
+        NET_PROXY_READY
+    )]
+    ProxySilent,
+    /// The cgroup a run would create is no path a ruleset can carry.
+    #[error(
+        "connecting the sandbox network namespace: the cgroup this run would create is no path \
+         a rule could carry ({why}): {base}"
+    )]
+    CgroupUnrepresentable {
+        /// Why the path cannot be carried.
+        why: String,
+        /// The cgroup, relative to the cgroup2 mount.
+        base: String,
+    },
+    /// The proxy cgroup's `cgroup.procs` could not be opened.
+    #[error(
+        "connecting the sandbox network namespace: opening {}/cgroup.procs: {errno}",
+        .proxy.display()
+    )]
+    CgroupProcs {
+        /// The proxy cgroup.
+        proxy: PathBuf,
+        /// What the kernel said.
+        errno: Errno,
+    },
+    /// bubbler could not move itself into the sandbox cgroup.
+    #[error(
+        "connecting the sandbox network namespace: moving bubbler into {}: {err}",
+        .sandbox.display()
+    )]
+    CgroupMove {
+        /// The sandbox cgroup.
+        sandbox: PathBuf,
+        /// What the write failed with.
+        err: io::Error,
+    },
+    /// Creating a cgroup was refused: bubbler's own is not delegated to the user.
+    #[error(
+        "connecting the sandbox network namespace: allow-host needs a delegated cgroup2 subtree \
+         (a systemd user session provides one): creating {}: {errno}",
+        .dir.display()
+    )]
+    CgroupNotDelegated {
+        /// The cgroup that could not be made.
+        dir: PathBuf,
+        /// What the kernel said.
+        errno: Errno,
+    },
+    /// The cgroup exists and holds a process.
+    #[error(
+        "connecting the sandbox network namespace: {} already exists and is not empty; another \
+         process is in it",
+        .0.display()
+    )]
+    CgroupOccupied(PathBuf),
+    /// Creating a cgroup failed otherwise.
+    #[error("connecting the sandbox network namespace: creating {}: {errno}", .dir.display())]
+    CgroupCreate {
+        /// The cgroup that could not be made.
+        dir: PathBuf,
+        /// What the kernel said.
+        errno: Errno,
+    },
+    /// bubbler is in no cgroup2 hierarchy.
+    #[error(
+        "connecting the sandbox network namespace: this process is in no cgroup2 hierarchy, \
+         which is what an `allow-host` ruleset matches on"
+    )]
+    NoCgroup2,
+}
 
 /// The runtime-directory name of a generated file: its sandbox path flattened behind `prefix`,
 /// so `--explain` names the file a run would write and no two destinations collide.
@@ -1203,14 +1375,11 @@ pub fn start_pw_context(
     if read_report(ready, child, Instant::now() + PW_READY, stop)?.as_deref()
         != Some(pipewire::SOCKET_INSIDE)
     {
-        let what = match child.try_wait() {
-            Ok(Some(status)) => format!("it exited ({status})"),
-            _ => format!(
-                "it did not report `{}` within {PW_READY:?}",
-                pipewire::SOCKET_INSIDE
-            ),
-        };
-        return Err(LaunchError::PwContext(what));
+        return Err(match child.try_wait() {
+            Ok(Some(status)) => PipeWireError::ContextExited(status),
+            _ => PipeWireError::ContextSilent,
+        }
+        .into());
     }
     handle._socket = Some(adopt_socket(
         "pipewire",
@@ -1415,13 +1584,10 @@ pub fn start_pw_pulse(
             return Err(LaunchError::Stopped);
         }
         if let Ok(Some(status)) = handle.child.try_wait() {
-            return Err(LaunchError::PwPulse(format!("it exited ({status})")));
+            return Err(PipeWireError::PulseExited(status).into());
         }
         if Instant::now() >= deadline {
-            return Err(LaunchError::PwPulse(format!(
-                "it did not create `{}` within {PULSE_READY:?}",
-                made.display()
-            )));
+            return Err(PipeWireError::PulseSilent(made.to_path_buf()).into());
         }
         std::thread::sleep(POLL);
     }
@@ -1714,9 +1880,7 @@ fn sandbox_namespaces(child_pid: i32) -> Result<SandboxNs, LaunchError> {
     let net = rustix::fs::open(&net_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
         .map_err(|e| LaunchError::Io(net_path.clone(), e.into()))?;
     if same_namespace(net.as_fd(), Path::new("/proc/self/ns/net"))? {
-        return Err(LaunchError::Network(
-            "sandbox pid reused; refusing to configure the host network namespace".to_owned(),
-        ));
+        return Err(NetworkError::PidReusedNet.into());
     }
     let user = owning_userns(net.as_fd()).map_err(|e| LaunchError::Io(net_path, e.into()))?;
     let mnt_path = PathBuf::from(format!("/proc/{child_pid}/ns/mnt"));
@@ -1725,9 +1889,7 @@ fn sandbox_namespaces(child_pid: i32) -> Result<SandboxNs, LaunchError> {
     // Checked apart: a pid reused between the two `open`s would join the proxy to a stranger's
     // mount namespace and the sandbox's network namespace.
     if same_namespace(mnt.as_fd(), Path::new("/proc/self/ns/mnt"))? {
-        return Err(LaunchError::Network(
-            "sandbox pid reused; refusing to join the host mount namespace".to_owned(),
-        ));
+        return Err(NetworkError::PidReusedMnt.into());
     }
     Ok(SandboxNs { net, user, mnt })
 }
@@ -1805,7 +1967,7 @@ fn install_rules(
                 ),
             })
         }
-        _ => LaunchError::Network(format!("starting `{}`: {e}", network::NFT_BIN)),
+        _ => NetworkError::NftStart(e).into(),
     })?;
     let mut stdin = child
         .stdin
@@ -1819,7 +1981,7 @@ fn install_rules(
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
-            Err(e) => return Err(LaunchError::Network(format!("waiting for `nft`: {e}"))),
+            Err(e) => return Err(NetworkError::NftWait(e).into()),
             Ok(None) => {}
         }
         if Instant::now() >= deadline {
@@ -1832,11 +1994,7 @@ fn install_rules(
     let Some(status) = status else {
         let _ = child.kill();
         let _ = child.wait();
-        return Err(LaunchError::Network(format!(
-            "`{}` did not install the outbound ruleset within {} seconds",
-            network::NFT_BIN,
-            NFT_TIMEOUT.as_secs()
-        )));
+        return Err(NetworkError::NftTimeout.into());
     };
     // A Ctrl-C reaches `nft` too, in bubbler's process group: killed by
     // a signal while a stop is pending, it is the stop's doing.
@@ -1844,12 +2002,9 @@ fn install_rules(
         return Err(LaunchError::Stopped);
     }
     if !status.success() {
-        return Err(LaunchError::Network(format!(
-            "`{}` refused the outbound ruleset ({status})",
-            network::NFT_BIN
-        )));
+        return Err(NetworkError::NftRefused(status).into());
     }
-    written.map_err(|e| LaunchError::Network(format!("writing the outbound ruleset: {e}")))?;
+    written.map_err(NetworkError::NftWrite)?;
     Ok(())
 }
 
@@ -1987,9 +2142,7 @@ fn start_pasta(
         Instant::now() + PASTA_READY,
         stop,
     )? {
-        return Err(LaunchError::Network(
-            "pasta did not configure the namespace".to_owned(),
-        ));
+        return Err(NetworkError::PastaNotReady.into());
     }
     Ok(handle)
 }
@@ -2163,8 +2316,7 @@ fn start_net_proxy(
     // `cmd` holds bubbler's copy of the relay's write end; the relay only
     // sees the end of the output once that copy is gone.
     drop(cmd);
-    let child =
-        spawned.map_err(|e| LaunchError::Network(format!("starting the egress proxy: {e}")))?;
+    let child = spawned.map_err(NetworkError::ProxyStart)?;
     let mut handle = NetProxyHandle {
         child,
         exited: false,
@@ -2179,13 +2331,11 @@ fn start_net_proxy(
         Instant::now() + NET_PROXY_READY,
         stop,
     )? {
-        let what = match handle.child.try_wait() {
-            Ok(Some(status)) => format!("it exited ({status})"),
-            _ => format!("it did not report a listening socket within {NET_PROXY_READY:?}"),
-        };
-        return Err(LaunchError::Network(format!(
-            "the egress proxy did not start: {what}"
-        )));
+        return Err(match handle.child.try_wait() {
+            Ok(Some(status)) => NetworkError::ProxyExited(status),
+            _ => NetworkError::ProxySilent,
+        }
+        .into());
     }
     Ok(handle)
 }
@@ -3255,9 +3405,7 @@ fn start_and_wait(
                 Some((child_pid, _)) => {
                     start_network(env, cfg, *child_pid, net_cgroup.as_ref(), stop)
                 }
-                None => Err(LaunchError::Network(
-                    "bwrap reported no sandbox pid for pasta to attach to".to_owned(),
-                )),
+                None => Err(NetworkError::NoSandboxPid.into()),
             };
             match started {
                 Ok(handle) => Some(handle),
@@ -6545,5 +6693,142 @@ mod tests {
                 .contains("/home/bubbler/Downloads is a symlink"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_pipewire_sidecar_that_did_not_come_up_reads_as_before() {
+        let exited = || ExitStatus::from_raw(256);
+        for (e, text) in [
+            (
+                PipeWireError::ContextExited(exited()),
+                "pw-container did not create this instance's PipeWire security context: it \
+                 exited (exit status: 1)",
+            ),
+            (
+                PipeWireError::ContextSilent,
+                "pw-container did not create this instance's PipeWire security context: it did \
+                 not report `/tmp/pipewire-0` within 5s",
+            ),
+            (
+                PipeWireError::PulseExited(exited()),
+                "pipewire-pulse did not serve this instance's private PulseAudio socket: it \
+                 exited (exit status: 1)",
+            ),
+            (
+                PipeWireError::PulseSilent(PathBuf::from("/run/user/1000/bubbler/t/pulse/native")),
+                "pipewire-pulse did not serve this instance's private PulseAudio socket: it did \
+                 not create `/run/user/1000/bubbler/t/pulse/native` within 5s",
+            ),
+        ] {
+            assert_eq!(LaunchError::from(e).to_string(), text);
+        }
+    }
+
+    #[test]
+    fn a_network_that_could_not_be_connected_reads_as_before() {
+        const AT: &str = "connecting the sandbox network namespace: ";
+        let failed = || io::Error::other("Broken pipe");
+        let refused = || ExitStatus::from_raw(256);
+        let dir = || PathBuf::from("/sys/fs/cgroup/a/bubbler-t-9");
+        let errno = Errno::ACCESS;
+        for (e, text) in [
+            (
+                NetworkError::PidReusedNet,
+                "sandbox pid reused; refusing to configure the host network namespace".to_owned(),
+            ),
+            (
+                NetworkError::PidReusedMnt,
+                "sandbox pid reused; refusing to join the host mount namespace".to_owned(),
+            ),
+            (
+                NetworkError::NoSandboxPid,
+                "bwrap reported no sandbox pid for pasta to attach to".to_owned(),
+            ),
+            (
+                NetworkError::PastaNotReady,
+                "pasta did not configure the namespace".to_owned(),
+            ),
+            (
+                NetworkError::NftStart(failed()),
+                "starting `nft`: Broken pipe".to_owned(),
+            ),
+            (
+                NetworkError::NftWait(failed()),
+                "waiting for `nft`: Broken pipe".to_owned(),
+            ),
+            (
+                NetworkError::NftTimeout,
+                "`nft` did not install the outbound ruleset within 5 seconds".to_owned(),
+            ),
+            (
+                NetworkError::NftRefused(refused()),
+                "`nft` refused the outbound ruleset (exit status: 1)".to_owned(),
+            ),
+            (
+                NetworkError::NftWrite(failed()),
+                "writing the outbound ruleset: Broken pipe".to_owned(),
+            ),
+            (
+                NetworkError::ProxyStart(failed()),
+                "starting the egress proxy: Broken pipe".to_owned(),
+            ),
+            (
+                NetworkError::ProxyExited(refused()),
+                "the egress proxy did not start: it exited (exit status: 1)".to_owned(),
+            ),
+            (
+                NetworkError::ProxySilent,
+                "the egress proxy did not start: it did not report a listening socket within 5s"
+                    .to_owned(),
+            ),
+            (
+                NetworkError::CgroupUnrepresentable {
+                    why: "a space".to_owned(),
+                    base: "a b/bubbler-t-9".to_owned(),
+                },
+                "the cgroup this run would create is no path a rule could carry (a space): \
+                 a b/bubbler-t-9"
+                    .to_owned(),
+            ),
+            (
+                NetworkError::CgroupProcs {
+                    proxy: dir().join("proxy"),
+                    errno,
+                },
+                format!("opening /sys/fs/cgroup/a/bubbler-t-9/proxy/cgroup.procs: {errno}"),
+            ),
+            (
+                NetworkError::CgroupMove {
+                    sandbox: dir().join("sandbox"),
+                    err: failed(),
+                },
+                "moving bubbler into /sys/fs/cgroup/a/bubbler-t-9/sandbox: Broken pipe".to_owned(),
+            ),
+            (
+                NetworkError::CgroupNotDelegated { dir: dir(), errno },
+                format!(
+                    "allow-host needs a delegated cgroup2 subtree (a systemd user session \
+                     provides one): creating /sys/fs/cgroup/a/bubbler-t-9: {errno}"
+                ),
+            ),
+            (
+                NetworkError::CgroupOccupied(dir()),
+                "/sys/fs/cgroup/a/bubbler-t-9 already exists and is not empty; another process \
+                 is in it"
+                    .to_owned(),
+            ),
+            (
+                NetworkError::CgroupCreate { dir: dir(), errno },
+                format!("creating /sys/fs/cgroup/a/bubbler-t-9: {errno}"),
+            ),
+            (
+                NetworkError::NoCgroup2,
+                "this process is in no cgroup2 hierarchy, which is what an `allow-host` ruleset \
+                 matches on"
+                    .to_owned(),
+            ),
+        ] {
+            assert_eq!(LaunchError::from(e).to_string(), format!("{AT}{text}"));
+        }
     }
 }
