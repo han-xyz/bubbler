@@ -7,6 +7,7 @@ pub mod exec;
 pub mod forward_register;
 pub mod fsutil;
 pub mod instance_ops;
+pub mod launch_error;
 pub mod launcher;
 pub mod proc;
 pub mod profile_ops;

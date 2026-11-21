@@ -26,7 +26,7 @@ use signal_hook::SigId;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 
 use crate::env::Env;
-use crate::error::LaunchError;
+use crate::run::launch_error::LaunchError;
 use crate::tty::{self, StdioPlan, StdioTarget};
 use crate::tty_relay::{self, RawGuard, RelayEnd};
 

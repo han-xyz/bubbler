@@ -14,9 +14,9 @@ use rustix::process::Pid;
 
 use crate::cgroup_text::PROXY_LEAF;
 pub use crate::cgroup_text::placeholder;
-use crate::error::LaunchError;
 use crate::network;
 use crate::proc;
+use crate::run::launch_error::LaunchError;
 
 // Every path a rule carries is relative to this.
 const CGROUP2_ROOT: &str = "/sys/fs/cgroup";

@@ -380,7 +380,7 @@ pub fn reseed(env: &Env, name: &str) -> Result<Instance, InstanceError> {
     // bwrap cannot be told about a bind after the fact: rewriting it
     // now would describe grants that sandbox does not have.
     if crate::exec::connect(env, name)
-        .map_err(InstanceError::Probe)?
+        .map_err(|e| InstanceError::Probe(e.into()))?
         .is_some()
     {
         return Err(InstanceError::AlreadyRunning(name.to_owned()));

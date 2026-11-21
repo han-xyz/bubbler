@@ -9,8 +9,8 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 
 use crate::env::{Env, SANDBOX_HOME};
-use crate::error::LaunchError;
 use crate::host::Host;
+use crate::plan::plan_error::PlanError;
 
 /// Which decision put an argument in the argv. Rendering one takes the
 /// config it indexes into, so it stays a tag here and text elsewhere.
@@ -878,7 +878,7 @@ impl BwrapArgs {
         self,
         command: &[OsString],
         alloc: &mut dyn FdAllocator,
-    ) -> Result<Argv, LaunchError> {
+    ) -> Result<Argv, PlanError> {
         Ok(self.finish_ops(command, alloc)?.into_argv())
     }
 
@@ -889,7 +889,7 @@ impl BwrapArgs {
         self,
         command: &[OsString],
         alloc: &mut dyn FdAllocator,
-    ) -> Result<Vec<Explained>, LaunchError> {
+    ) -> Result<Vec<Explained>, PlanError> {
         Ok(self.finish_ops(command, alloc)?.ops)
     }
 
@@ -900,12 +900,12 @@ impl BwrapArgs {
         mut self,
         command: &[OsString],
         alloc: &mut dyn FdAllocator,
-    ) -> Result<Finished, LaunchError> {
+    ) -> Result<Finished, PlanError> {
         let ctty = self.ctty;
         let x11 = self.x11.take();
         let mut out = self.emit(alloc)?;
         let options = out.len();
-        let socket = alloc.init_socket().map_err(LaunchError::Data)?;
+        let socket = alloc.init_socket().map_err(PlanError::Data)?;
         out.push(Explained {
             origin: Origin::Init,
             args: vec![
@@ -965,7 +965,7 @@ impl BwrapArgs {
         self,
         command: &[OsString],
         alloc: &mut dyn FdAllocator,
-    ) -> Result<Argv, LaunchError> {
+    ) -> Result<Argv, PlanError> {
         let mut args = flatten(self.emit(alloc)?);
         let command_at = args.len();
         args.push(OsString::from("--"));
@@ -980,7 +980,7 @@ impl BwrapArgs {
         self,
         command: &[(OsString, Origin)],
         alloc: &mut dyn FdAllocator,
-    ) -> Result<Vec<Explained>, LaunchError> {
+    ) -> Result<Vec<Explained>, PlanError> {
         let mut out = self.emit(alloc)?;
         let separator = (OsString::from("--"), Origin::Command);
         for (arg, origin) in std::iter::once(&separator).chain(command) {
@@ -993,7 +993,7 @@ impl BwrapArgs {
         Ok(out)
     }
 
-    fn emit(self, alloc: &mut dyn FdAllocator) -> Result<Vec<Explained>, LaunchError> {
+    fn emit(self, alloc: &mut dyn FdAllocator) -> Result<Vec<Explained>, PlanError> {
         let mut out = Vec::new();
         for item in [
             self.namespaces,
@@ -1010,28 +1010,28 @@ impl BwrapArgs {
                 Kind::Args(a) => (a, None),
                 Kind::Noted { args, note } => (args, Some(note)),
                 Kind::Data { content, dest } => {
-                    let src = alloc.file(&dest, &content).map_err(LaunchError::Data)?;
+                    let src = alloc.file(&dest, &content).map_err(PlanError::Data)?;
                     (
                         vec!["--ro-bind".into(), src, dest.into_os_string()],
                         Some(format!("generated file, {} bytes", content.len())),
                     )
                 }
                 Kind::InfoFd => {
-                    let fd = alloc.info_pipe().map_err(LaunchError::Data)?;
+                    let fd = alloc.info_pipe().map_err(PlanError::Data)?;
                     (
                         vec!["--info-fd".into(), fd],
                         Some("pipe: bwrap reports the sandbox pid on it".to_owned()),
                     )
                 }
                 Kind::BlockFd => {
-                    let fd = alloc.block_pipe().map_err(LaunchError::Data)?;
+                    let fd = alloc.block_pipe().map_err(PlanError::Data)?;
                     (
                         vec!["--block-fd".into(), fd],
                         Some("pipe: the sandbox waits on it until bubbler lets it go".to_owned()),
                     )
                 }
                 Kind::Seccomp { program, arches } => {
-                    let fd = alloc.data(&program).map_err(LaunchError::Data)?;
+                    let fd = alloc.data(&program).map_err(PlanError::Data)?;
                     (
                         vec!["--add-seccomp-fd".into(), fd],
                         Some(format!("filter, {} bytes, {arches}", program.len())),
@@ -1930,7 +1930,7 @@ mod tests {
         let mut args = BwrapArgs::baseline(&env(), Path::new("/i/home"), &FakeHost::default());
         args.ro_bind_data(b"x".to_vec(), Path::new("/etc/x"));
         let r = args.finish(&["sh".into()], &mut Failing);
-        assert!(matches!(r, Err(LaunchError::Data(_))));
+        assert!(matches!(r, Err(PlanError::Data(_))));
     }
 
     #[test]

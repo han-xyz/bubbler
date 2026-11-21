@@ -10,14 +10,19 @@ use crate::dbus::{
 use crate::dbus_session::Session;
 use crate::dbus_wire::{Value, WireError};
 use crate::env::Env;
-use crate::error::LaunchError;
 use crate::host::Host;
+use crate::run::launch_error::LaunchError;
 
 /// The host accessibility bus address, refused when it lands in
 /// bubbler's own runtime directory. The bus is asked for its address
 /// first, as a run does; the unguarded resolver is crate-private.
 pub fn guarded_host_a11y_bus(host: &dyn Host, env: &Env) -> Result<PathBuf, LaunchError> {
-    outside_our_runtime(host, env, A11Y_NODE, host_a11y_bus(env)?)
+    Ok(outside_our_runtime(
+        host,
+        env,
+        A11Y_NODE,
+        host_a11y_bus(env)?,
+    )?)
 }
 
 /// Host accessibility bus socket: the `unix:path=` of `$AT_SPI_BUS_ADDRESS` when the
@@ -112,6 +117,7 @@ mod tests {
     use super::*;
     use crate::dbus::tests::env;
     use crate::dbus_session::testing::*;
+    use crate::plan::plan_error::PlanError;
     use std::ffi::OsString;
     use std::path::Path;
     use std::thread::JoinHandle;
@@ -134,7 +140,8 @@ mod tests {
             "unix:path=",
         ] {
             e.at_spi_bus_address = Some(bad.into());
-            let Err(LaunchError::BadValue { service, reason }) = host_a11y_bus(&e) else {
+            let Err(LaunchError::Plan(PlanError::BadValue { service, reason })) = host_a11y_bus(&e)
+            else {
                 panic!("{bad} was accepted");
             };
             assert_eq!(service, A11Y_NODE);

@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{Clipboard, WaylandMode};
 use crate::env::Env;
-use crate::error::LaunchError;
 use crate::host::Host;
 use crate::init_bin::{self, Found};
+use crate::plan::plan_error::PlanError;
 
 /// Sandbox engine name bubbler identifies itself to compositors by. It
 /// pairs with the application id: the two together name an application.
@@ -43,7 +43,7 @@ include!("../../../bubbler-wl-proxy/src/privileged.rs");
 /// running executable, else [`PROXY_BIN`]. A run cannot go on without
 /// one — the application would connect to a socket nothing accepts on —
 /// so a missing binary fails the launch rather than warning.
-pub fn locate_proxy(env: &Env, host: &dyn Host) -> Result<(PathBuf, Found), LaunchError> {
+pub fn locate_proxy(env: &Env, host: &dyn Host) -> Result<(PathBuf, Found), PlanError> {
     init_bin::locate_binary(
         env.wl_proxy_override.as_deref(),
         PROXY_NAME,
@@ -234,7 +234,7 @@ mod tests {
         );
         assert!(matches!(
             locate_proxy(&env(Some("/build/adir".into())), &host),
-            Err(LaunchError::WrongType {
+            Err(PlanError::WrongType {
                 service: "wayland",
                 expected: "a regular file",
                 ..
@@ -242,7 +242,7 @@ mod tests {
         ));
         assert!(matches!(
             locate_proxy(&env(Some("/build/gone".into())), &host),
-            Err(LaunchError::MissingResource {
+            Err(PlanError::MissingResource {
                 service: "wayland",
                 ..
             })
@@ -261,7 +261,7 @@ mod tests {
         );
         assert!(matches!(
             locate_proxy(&env(None), &crate::host::fake::FakeHost::default()),
-            Err(LaunchError::MissingResource { service: "wayland", path }) if path == Path::new(PROXY_BIN)
+            Err(PlanError::MissingResource { service: "wayland", path }) if path == Path::new(PROXY_BIN)
         ));
     }
 

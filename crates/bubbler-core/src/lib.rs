@@ -5,11 +5,17 @@ pub mod model;
 pub mod plan;
 pub mod run;
 
+/// Every error type at the path it had before the layers split.
+pub mod error {
+    pub use crate::model::error::*;
+    pub use crate::plan::plan_error::PlanError;
+    pub use crate::run::launch_error::*;
+}
+
 pub use model::catalogue;
 pub use model::checks;
 pub use model::config;
 pub use model::env;
-pub use model::error;
 pub use model::instance;
 pub use model::json;
 pub use model::kdl_out;

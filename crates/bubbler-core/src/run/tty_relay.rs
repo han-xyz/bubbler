@@ -17,7 +17,7 @@ use rustix::termios::{
     tcsetattr, tcsetwinsize,
 };
 
-use crate::error::LaunchError;
+use crate::run::launch_error::LaunchError;
 
 use crate::tty::{Pty, StdioPlan, StdioTarget};
 

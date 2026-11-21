@@ -9,9 +9,9 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::config::{BusRule, Portal, Service};
 use crate::env::Env;
-use crate::error::LaunchError;
 use crate::host::Host;
 use crate::paths::RUNTIME_SUBDIR;
+use crate::plan::plan_error::PlanError;
 
 pub(crate) use crate::config::dbus::grant_policies;
 pub use crate::config::dbus::{app_id, app_id_twin, is_valid_app_id};
@@ -366,7 +366,7 @@ pub fn flatpak_instance_dir(env: &Env, instance: &str) -> PathBuf {
 /// Host session bus socket: the `unix:path=` of `$DBUS_SESSION_BUS_ADDRESS`
 /// when it is set, else `$XDG_RUNTIME_DIR/bus`. Unguarded, and crate-private for it:
 /// outside this crate the session bus is reachable only through [`guarded_host_bus`].
-pub(crate) fn host_bus(env: &Env) -> Result<PathBuf, LaunchError> {
+pub(crate) fn host_bus(env: &Env) -> Result<PathBuf, PlanError> {
     Ok(address_path(
         env.dbus_address.as_deref(),
         "DBUS_SESSION_BUS_ADDRESS",
@@ -378,13 +378,13 @@ pub(crate) fn host_bus(env: &Env) -> Result<PathBuf, LaunchError> {
 /// The host session bus address, refused when it lands in bubbler's own
 /// runtime directory. A run and a dry run both resolve the bus through
 /// here; the unguarded resolver behind it is crate-private.
-pub fn guarded_host_bus(host: &dyn Host, env: &Env) -> Result<PathBuf, LaunchError> {
+pub fn guarded_host_bus(host: &dyn Host, env: &Env) -> Result<PathBuf, PlanError> {
     outside_our_runtime(host, env, SESSION_NODE, host_bus(env)?)
 }
 
 /// The host system bus address, refused when it lands in bubbler's own
 /// runtime directory. The unguarded resolver behind it is crate-private.
-pub fn guarded_host_system_bus(host: &dyn Host, env: &Env) -> Result<PathBuf, LaunchError> {
+pub fn guarded_host_system_bus(host: &dyn Host, env: &Env) -> Result<PathBuf, PlanError> {
     outside_our_runtime(host, env, SYSTEM_NODE, host_system_bus(env)?)
 }
 
@@ -395,11 +395,11 @@ pub(crate) fn outside_our_runtime(
     env: &Env,
     node: &'static str,
     path: PathBuf,
-) -> Result<PathBuf, LaunchError> {
+) -> Result<PathBuf, PlanError> {
     let ours = resolve(host, &env.runtime_dir.join(RUNTIME_SUBDIR));
     let path = resolve(host, &path);
     if path.starts_with(&ours) {
-        return Err(LaunchError::BadValue {
+        return Err(PlanError::BadValue {
             service: node,
             reason: "the host bus address names a socket under bubbler's own runtime directory"
                 .to_owned(),
@@ -442,7 +442,7 @@ fn lexical(path: &Path) -> PathBuf {
 /// Host system bus socket: the `unix:path=` of `$DBUS_SYSTEM_BUS_ADDRESS`
 /// when it is set, else [`SYSTEM_BUS_PATH`]. Unguarded, and crate-private for it:
 /// outside this crate the system bus is reachable only through [`guarded_host_system_bus`].
-pub(crate) fn host_system_bus(env: &Env) -> Result<PathBuf, LaunchError> {
+pub(crate) fn host_system_bus(env: &Env) -> Result<PathBuf, PlanError> {
     Ok(address_path(
         env.dbus_system_address.as_deref(),
         "DBUS_SYSTEM_BUS_ADDRESS",
@@ -457,7 +457,7 @@ pub(crate) fn address_path(
     address: Option<&OsStr>,
     var: &'static str,
     service: &'static str,
-) -> Result<Option<PathBuf>, LaunchError> {
+) -> Result<Option<PathBuf>, PlanError> {
     let Some(address) = address.filter(|a| !a.is_empty()) else {
         return Ok(None);
     };
@@ -473,7 +473,7 @@ pub(crate) fn address_path(
              followed by two hex digits"
         ),
     };
-    Err(LaunchError::BadValue { service, reason })
+    Err(PlanError::BadValue { service, reason })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1100,7 +1100,7 @@ pub(crate) mod tests {
             "unix:path=",
         ] {
             e.dbus_address = Some(bad.into());
-            let Err(LaunchError::BadValue { service, reason }) = host_bus(&e) else {
+            let Err(PlanError::BadValue { service, reason }) = host_bus(&e) else {
                 panic!("{bad} was accepted");
             };
             assert_eq!(service, "dbus");
@@ -1128,7 +1128,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 guarded_host_bus(&ours, &e),
-                Err(LaunchError::BadValue {
+                Err(PlanError::BadValue {
                     service: SESSION_NODE,
                     ..
                 })
@@ -1194,7 +1194,7 @@ pub(crate) mod tests {
         assert_eq!(host_bus(&e).ok(), Some(PathBuf::from("/b")));
         for bad in ["unix:path=/x%zz", "unix:path=/x%2;tcp:host=h,port=1"] {
             e.dbus_address = Some(bad.into());
-            let Err(LaunchError::BadValue { reason, .. }) = host_bus(&e) else {
+            let Err(PlanError::BadValue { reason, .. }) = host_bus(&e) else {
                 panic!("{bad} was accepted");
             };
             assert!(reason.contains("escape"), "{bad}: {reason}");
@@ -1205,7 +1205,7 @@ pub(crate) mod tests {
     fn an_abstract_address_alone_is_still_refused() {
         let mut e = env();
         e.dbus_address = Some("unix:guid=deadbeef,abstract=/x".into());
-        let Err(LaunchError::BadValue { reason, .. }) = host_bus(&e) else {
+        let Err(PlanError::BadValue { reason, .. }) = host_bus(&e) else {
             panic!("an abstract address was accepted");
         };
         assert!(reason.contains("`unix:path=<path>`"), "{reason}");
@@ -1553,7 +1553,7 @@ pub(crate) mod tests {
             "unix:path=",
         ] {
             e.dbus_system_address = Some(bad.into());
-            let Err(LaunchError::BadValue { service, reason }) = host_system_bus(&e) else {
+            let Err(PlanError::BadValue { service, reason }) = host_system_bus(&e) else {
                 panic!("{bad} was accepted");
             };
             assert_eq!(service, "system-bus");

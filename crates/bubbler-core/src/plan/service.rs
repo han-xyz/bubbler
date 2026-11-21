@@ -16,10 +16,10 @@ use crate::bwrap::{BwrapArgs, Explained, Origin};
 use crate::config::{self, RESERVED_ENV, Service, Share, ShareMode, X11Mode};
 use crate::dbus;
 use crate::env::{Env, SANDBOX_HOME};
-use crate::error::LaunchError;
 use crate::host::Host;
 use crate::network::{self, Mode as NetworkMode, NetworkConfig};
 use crate::pipewire;
+use crate::plan::plan_error::PlanError;
 use crate::wayland::WaylandPlan;
 
 mod dri;
@@ -54,7 +54,7 @@ pub fn apply_all(
     args: &mut BwrapArgs,
     host: &dyn Host,
     ctx: &ServiceCtx,
-) -> Result<(), LaunchError> {
+) -> Result<(), PlanError> {
     let has_x11 = services.iter().any(|s| matches!(s, Service::X11(_)));
     let shares = path_shares(services, env, host)?;
     for (i, s) in services.iter().enumerate() {
@@ -133,11 +133,11 @@ fn require(
     path: PathBuf,
     expected: &'static str,
     accept: impl Fn(FileType) -> bool,
-) -> Result<PathBuf, LaunchError> {
+) -> Result<PathBuf, PlanError> {
     match host.file_type(&path) {
-        None => Err(LaunchError::MissingResource { service, path }),
+        None => Err(PlanError::MissingResource { service, path }),
         Some(t) if accept(t) => Ok(path),
-        Some(_) => Err(LaunchError::WrongType {
+        Some(_) => Err(PlanError::WrongType {
             service,
             path,
             expected,
@@ -150,7 +150,7 @@ pub(crate) fn require_socket(
     host: &dyn Host,
     service: &'static str,
     path: PathBuf,
-) -> Result<PathBuf, LaunchError> {
+) -> Result<PathBuf, PlanError> {
     require(host, service, path, "a socket", |t| t.is_socket())
 }
 
@@ -159,7 +159,7 @@ pub(crate) fn require_file(
     host: &dyn Host,
     service: &'static str,
     path: PathBuf,
-) -> Result<PathBuf, LaunchError> {
+) -> Result<PathBuf, PlanError> {
     require(host, service, path, "a regular file", |t| t.is_file())
 }
 
@@ -167,7 +167,7 @@ fn require_dir(
     host: &dyn Host,
     service: &'static str,
     path: PathBuf,
-) -> Result<PathBuf, LaunchError> {
+) -> Result<PathBuf, PlanError> {
     require(host, service, path, "a directory", |t| t.is_dir())
 }
 
@@ -177,7 +177,7 @@ fn require_dir_or_file(
     host: &dyn Host,
     service: &'static str,
     path: PathBuf,
-) -> Result<PathBuf, LaunchError> {
+) -> Result<PathBuf, PlanError> {
     require(host, service, path, "a directory or a regular file", |t| {
         t.is_dir() || t.is_file()
     })
@@ -189,10 +189,10 @@ fn require_exists(
     host: &dyn Host,
     service: &'static str,
     path: PathBuf,
-) -> Result<PathBuf, LaunchError> {
+) -> Result<PathBuf, PlanError> {
     match host.file_type(&path) {
         Some(_) => Ok(path),
-        None => Err(LaunchError::MissingResource { service, path }),
+        None => Err(PlanError::MissingResource { service, path }),
     }
 }
 
@@ -207,7 +207,7 @@ fn network(
     args: &mut BwrapArgs,
     host: &dyn Host,
     cfg: &NetworkConfig,
-) -> Result<(), LaunchError> {
+) -> Result<(), PlanError> {
     if cfg.mode == NetworkMode::Host {
         args.share_net();
     }
@@ -238,8 +238,8 @@ fn network(
 /// absolute or `..` name would otherwise decide what a bind mounts, or
 /// what endpoint the launcher hands its listening socket to. Everything
 /// that uses the value goes through here first.
-pub(crate) fn check_wayland_display(value: Option<&OsStr>) -> Result<&OsStr, LaunchError> {
-    let display = value.ok_or(LaunchError::MissingEnv {
+pub(crate) fn check_wayland_display(value: Option<&OsStr>) -> Result<&OsStr, PlanError> {
+    let display = value.ok_or(PlanError::MissingEnv {
         service: "wayland",
         var: "WAYLAND_DISPLAY",
     })?;
@@ -248,7 +248,7 @@ pub(crate) fn check_wayland_display(value: Option<&OsStr>) -> Result<&OsStr, Lau
         (comps.next(), comps.next()),
         (Some(Component::Normal(_)), None)
     ) {
-        return Err(LaunchError::BadValue {
+        return Err(PlanError::BadValue {
             service: "wayland",
             reason: format!(
                 "cannot use WAYLAND_DISPLAY={}; only a plain socket name is supported",
@@ -262,7 +262,7 @@ pub(crate) fn check_wayland_display(value: Option<&OsStr>) -> Result<&OsStr, Lau
 /// [`check_wayland_display`] on the run's [`Env`]. The launcher checks the
 /// process environment's own value separately: the Wayland client reads that
 /// one itself.
-pub(crate) fn wayland_display(env: &Env) -> Result<&OsStr, LaunchError> {
+pub(crate) fn wayland_display(env: &Env) -> Result<&OsStr, PlanError> {
     check_wayland_display(env.wayland_display.as_deref())
 }
 
@@ -274,7 +274,7 @@ fn wayland(
     host: &dyn Host,
     claim_session: bool,
     plan: Option<&WaylandPlan>,
-) -> Result<(), LaunchError> {
+) -> Result<(), PlanError> {
     let display = wayland_display(env)?;
     let inside = env.runtime_dir.join(display);
     match plan {
@@ -309,12 +309,7 @@ pub fn x11_display_number(display: &OsStr) -> Option<u32> {
     num.parse().ok()
 }
 
-fn x11(
-    env: &Env,
-    args: &mut BwrapArgs,
-    host: &dyn Host,
-    mode: &X11Mode,
-) -> Result<(), LaunchError> {
+fn x11(env: &Env, args: &mut BwrapArgs, host: &dyn Host, mode: &X11Mode) -> Result<(), PlanError> {
     if let X11Mode::Nested(nested) = mode {
         // Probed on the host because that is where the binary is read from:
         // failing here beats a `DISPLAY` that names nothing.
@@ -330,11 +325,11 @@ fn x11(
         );
         return Ok(());
     }
-    let display = env.display.as_deref().ok_or(LaunchError::MissingEnv {
+    let display = env.display.as_deref().ok_or(PlanError::MissingEnv {
         service: "x11",
         var: "DISPLAY",
     })?;
-    let n = x11_display_number(display).ok_or_else(|| LaunchError::BadValue {
+    let n = x11_display_number(display).ok_or_else(|| PlanError::BadValue {
         service: "x11",
         reason: format!(
             "cannot use DISPLAY={}; only local displays like :0 are supported",
@@ -367,7 +362,7 @@ fn gamepad(
     host: &dyn Host,
     hidraw: Option<(&'static str, Origin)>,
     uinput: bool,
-) -> Result<(), LaunchError> {
+) -> Result<(), PlanError> {
     // The `hidraw` binds may belong to a `hidraw` node of its own, so the
     // tag this was called with is put back before the rest of the grant.
     let pad = args.origin();
@@ -390,7 +385,7 @@ fn gamepad(
         None => {}
         Some(t) if t.is_dir() => args.ro_bind(&udev, &udev),
         Some(_) => {
-            return Err(LaunchError::WrongType {
+            return Err(PlanError::WrongType {
                 service: "gamepad",
                 path: udev,
                 expected: "a directory",
@@ -410,7 +405,7 @@ fn gamepad(
 
 // `service` is the node this was granted by — `hidraw` or the older
 // `gamepad hidraw=#true` — so an error names the line the user wrote.
-fn hidraw(args: &mut BwrapArgs, host: &dyn Host, service: &'static str) -> Result<(), LaunchError> {
+fn hidraw(args: &mut BwrapArgs, host: &dyn Host, service: &'static str) -> Result<(), PlanError> {
     let dev = Path::new("/dev");
     for name in host.list_dir(dev) {
         if !name.as_encoded_bytes().starts_with(b"hidraw") {
@@ -432,7 +427,7 @@ fn hidraw(args: &mut BwrapArgs, host: &dyn Host, service: &'static str) -> Resul
             args.ro_bind(&class, &class);
             Ok(())
         }
-        Some(_) => Err(LaunchError::WrongType {
+        Some(_) => Err(PlanError::WrongType {
             service,
             path: class,
             expected: "a directory",
@@ -445,12 +440,12 @@ fn camera(
     args: &mut BwrapArgs,
     host: &dyn Host,
     nodes: bool,
-) -> Result<(), LaunchError> {
+) -> Result<(), PlanError> {
     if !services
         .iter()
         .any(|s| matches!(s, Service::Portals { .. }))
     {
-        return Err(LaunchError::BadValue {
+        return Err(PlanError::BadValue {
             service: "camera",
             reason: "requires portals".to_owned(),
         });
@@ -467,7 +462,7 @@ fn camera(
 }
 
 // `udev` is false where another grant binds `/run/udev` already.
-fn camera_nodes(args: &mut BwrapArgs, host: &dyn Host, udev: bool) -> Result<(), LaunchError> {
+fn camera_nodes(args: &mut BwrapArgs, host: &dyn Host, udev: bool) -> Result<(), PlanError> {
     let dev = Path::new("/dev");
     for name in host.list_dir(dev) {
         let bytes = name.as_encoded_bytes();
@@ -498,7 +493,7 @@ fn camera_nodes(args: &mut BwrapArgs, host: &dyn Host, udev: bool) -> Result<(),
             None => {}
             Some(t) if t.is_dir() => args.ro_bind(&p, &p),
             Some(_) => {
-                return Err(LaunchError::WrongType {
+                return Err(PlanError::WrongType {
                     service: "camera",
                     path: p,
                     expected: "a directory",
@@ -509,7 +504,7 @@ fn camera_nodes(args: &mut BwrapArgs, host: &dyn Host, udev: bool) -> Result<(),
     Ok(())
 }
 
-fn gamepad_uinput(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), LaunchError> {
+fn gamepad_uinput(args: &mut BwrapArgs, host: &dyn Host) -> Result<(), PlanError> {
     let p = require(
         host,
         "gamepad",
@@ -532,7 +527,7 @@ fn pipewire(
     args: &mut BwrapArgs,
     host: &dyn Host,
     ctx: &ServiceCtx,
-) -> Result<(), LaunchError> {
+) -> Result<(), PlanError> {
     audio_context(host)?;
     args.ro_bind(
         &pipewire::socket(&ctx.instance_runtime),
@@ -543,7 +538,7 @@ fn pipewire(
 
 // Checked where the argv is built, so a host without it fails a
 // `--dry-run` too.
-fn audio_context(host: &dyn Host) -> Result<(), LaunchError> {
+fn audio_context(host: &dyn Host) -> Result<(), PlanError> {
     require_file(host, "pipewire", PathBuf::from(pipewire::PW_CONTAINER))?;
     Ok(())
 }
@@ -554,7 +549,7 @@ fn pulseaudio(
     args: &mut BwrapArgs,
     host: &dyn Host,
     ctx: &ServiceCtx,
-) -> Result<(), LaunchError> {
+) -> Result<(), PlanError> {
     audio_context(host)?;
     // The module that makes the sidecar a pulse server, named here so a host
     // without it is a refusal that says what to install.
@@ -590,9 +585,9 @@ fn system_bus_socket(args: &mut BwrapArgs, ctx: &ServiceCtx) {
 
 // Not probed: it exists only once the launcher has moved the proxy's socket
 // out of the proxy's reach.
-fn a11y(env: &Env, args: &mut BwrapArgs, ctx: &ServiceCtx) -> Result<(), LaunchError> {
+fn a11y(env: &Env, args: &mut BwrapArgs, ctx: &ServiceCtx) -> Result<(), PlanError> {
     if !ctx.dbus.is_some_and(|p| p.a11y.is_some()) {
-        return Err(LaunchError::BadValue {
+        return Err(PlanError::BadValue {
             service: dbus::A11Y_NODE,
             reason: "requires dbus".to_owned(),
         });
@@ -619,11 +614,11 @@ fn portals(
     args: &mut BwrapArgs,
     host: &dyn Host,
     ctx: &ServiceCtx,
-) -> Result<(), LaunchError> {
+) -> Result<(), PlanError> {
     let plan = ctx
         .dbus
         .filter(|p| p.session.is_some())
-        .ok_or(LaunchError::BadValue {
+        .ok_or(PlanError::BadValue {
             service: "portals",
             reason: "requires dbus".to_owned(),
         })?;
@@ -657,11 +652,11 @@ fn portals(
 /// refused here as well as in the parser, so a caller building an
 /// [`crate::config::InstanceConfig`] by hand cannot override what the
 /// sandbox sets.
-pub fn apply_env(pairs: &[(String, String)], args: &mut BwrapArgs) -> Result<(), LaunchError> {
+pub fn apply_env(pairs: &[(String, String)], args: &mut BwrapArgs) -> Result<(), PlanError> {
     for (i, (k, v)) in pairs.iter().enumerate() {
         args.tag(Origin::Env(i));
         if RESERVED_ENV.contains(&k.as_str()) {
-            return Err(LaunchError::BadValue {
+            return Err(PlanError::BadValue {
                 service: "env",
                 reason: format!("{k} is set by bubbler and cannot be overridden"),
             });
@@ -677,10 +672,10 @@ fn resolve_source(
     host: &dyn Host,
     service: &'static str,
     src: &Path,
-    probe: fn(&dyn Host, &'static str, PathBuf) -> Result<PathBuf, LaunchError>,
-) -> Result<PathBuf, LaunchError> {
+    probe: fn(&dyn Host, &'static str, PathBuf) -> Result<PathBuf, PlanError>,
+) -> Result<PathBuf, PlanError> {
     let Some(real) = host.canonicalize(src) else {
-        return Err(LaunchError::MissingResource {
+        return Err(PlanError::MissingResource {
             service,
             path: src.to_path_buf(),
         });
@@ -696,16 +691,16 @@ fn confine(
     root: &Path,
     src: &Path,
     outside: &str,
-) -> Result<PathBuf, LaunchError> {
+) -> Result<PathBuf, PlanError> {
     let root = host
         .canonicalize(root)
-        .ok_or_else(|| LaunchError::MissingResource {
+        .ok_or_else(|| PlanError::MissingResource {
             service,
             path: root.to_path_buf(),
         })?;
     let real = resolve_source(host, service, src, require_exists)?;
     if !real.starts_with(&root) {
-        return Err(LaunchError::BadValue {
+        return Err(PlanError::BadValue {
             service,
             reason: format!("{} resolves outside {outside}", src.display()),
         });
@@ -848,7 +843,7 @@ fn path_shares<'a>(
     services: &'a [Service],
     env: &Env,
     host: &dyn Host,
-) -> Result<Vec<(usize, &'a Path, PathBuf, ShareMode)>, LaunchError> {
+) -> Result<Vec<(usize, &'a Path, PathBuf, ShareMode)>, PlanError> {
     let mut shares: Vec<(usize, &Path, PathBuf, ShareMode)> = Vec::new();
     for (i, s) in services.iter().enumerate() {
         let Service::PathShare {
@@ -862,13 +857,13 @@ fn path_shares<'a>(
         let src = match resolve_source(host, "path-share", path, require_dir_or_file) {
             // Matched on the missing path itself: a source that fails to
             // resolve for another reason still refuses the launch.
-            Err(LaunchError::MissingResource { path: p, .. }) if *optional && p == *path => {
+            Err(PlanError::MissingResource { path: p, .. }) if *optional && p == *path => {
                 continue;
             }
             result => result?,
         };
         if let Some((root, end)) = denied_root(host, env, &src, path) {
-            return Err(LaunchError::BadValue {
+            return Err(PlanError::BadValue {
                 service: "path-share",
                 reason: denied_reason(path, &src, &root, end),
             });
@@ -890,7 +885,7 @@ fn path_shares<'a>(
                     b_src.display()
                 )
             };
-            return Err(LaunchError::BadValue {
+            return Err(PlanError::BadValue {
                 service: "path-share",
                 reason: format!(
                     "{} and {} overlap{where_}; one share cannot contain another",
@@ -910,7 +905,7 @@ fn home_share(
     rel: &Path,
     mode: ShareMode,
     optional: bool,
-) -> Result<(), LaunchError> {
+) -> Result<(), PlanError> {
     let written = env.home.join(rel);
     let src = match confine(
         host,
@@ -921,7 +916,7 @@ fn home_share(
     ) {
         // Matched on the missing path itself: a `home-share` that cannot
         // resolve because `$HOME` is gone is a launch error.
-        Err(LaunchError::MissingResource { path, .. }) if optional && path == written => {
+        Err(PlanError::MissingResource { path, .. }) if optional && path == written => {
             return Ok(());
         }
         result => result?,
@@ -944,7 +939,7 @@ pub fn apply_shares(
     env: &Env,
     args: &mut BwrapArgs,
     host: &dyn Host,
-) -> Result<(), LaunchError> {
+) -> Result<(), PlanError> {
     if shares.is_empty() {
         return Ok(());
     }
@@ -976,7 +971,7 @@ fn share_plan(
     shares: &[Share],
     env: &Env,
     host: &dyn Host,
-) -> Result<Vec<(PathBuf, PathBuf)>, LaunchError> {
+) -> Result<Vec<(PathBuf, PathBuf)>, PlanError> {
     let config = config_shares(services, env, host)?;
     let mut out: Vec<(PathBuf, PathBuf)> = Vec::new();
     for s in shares {
@@ -984,13 +979,13 @@ fn share_plan(
         // The exact cases first, so naming the same place twice gets its own
         // message rather than the general overlap one.
         if config.iter().any(|(_, d)| *d == dst) {
-            return Err(LaunchError::BadValue {
+            return Err(PlanError::BadValue {
                 service: "--share",
                 reason: format!("{} already shared by config.kdl", s.path.display()),
             });
         }
         if out.iter().any(|(_, d)| *d == dst) {
-            return Err(LaunchError::BadValue {
+            return Err(PlanError::BadValue {
                 service: "--share",
                 reason: format!("{} given twice", s.path.display()),
             });
@@ -1004,7 +999,7 @@ fn share_plan(
             );
         for (o_src, o_dst) in against {
             if let Some(reason) = overlap(&src, &dst, o_src, o_dst) {
-                return Err(LaunchError::BadValue {
+                return Err(PlanError::BadValue {
                     service: "--share",
                     reason,
                 });
@@ -1021,7 +1016,7 @@ fn config_shares(
     services: &[Service],
     env: &Env,
     host: &dyn Host,
-) -> Result<Vec<(Option<PathBuf>, PathBuf)>, LaunchError> {
+) -> Result<Vec<(Option<PathBuf>, PathBuf)>, PlanError> {
     let mut out: Vec<(Option<PathBuf>, PathBuf)> = Vec::new();
     for s in services {
         let Service::HomeShare { path, optional, .. } = s else {
@@ -1040,7 +1035,7 @@ fn config_shares(
         ) {
             // A missing optional source binds nothing, so it is not a share to
             // check `--share` against.
-            Err(LaunchError::MissingResource { path: p, .. }) if *optional && p == written => {
+            Err(PlanError::MissingResource { path: p, .. }) if *optional && p == written => {
                 continue;
             }
             result => result?,
@@ -1075,10 +1070,10 @@ fn share_paths(
     env: &Env,
     host: &dyn Host,
     written: &Path,
-) -> Result<(PathBuf, PathBuf), LaunchError> {
+) -> Result<(PathBuf, PathBuf), PlanError> {
     let mut comps = written.components();
     if comps.next() != Some(Component::RootDir) {
-        return Err(LaunchError::BadValue {
+        return Err(PlanError::BadValue {
             service: "--share",
             reason: format!("{} is not absolute", written.display()),
         });
@@ -1086,7 +1081,7 @@ fn share_paths(
     // A `..` left in the path would walk out of every comparison below:
     // `$HOME/x/..` maps over the private home while comparing equal to nothing.
     if !comps.all(|c| matches!(c, Component::Normal(_))) {
-        return Err(LaunchError::BadValue {
+        return Err(PlanError::BadValue {
             service: "--share",
             reason: format!(
                 "{} contains `.` or `..`; give the path without them",
@@ -1103,7 +1098,7 @@ fn share_paths(
     }
     let src = resolve_source(host, "--share", written, require_dir_or_file)?;
     if let Some((root, end)) = denied_root(host, env, &src, written) {
-        return Err(LaunchError::BadValue {
+        return Err(PlanError::BadValue {
             service: "--share",
             reason: denied_reason(written, &src, &root, end),
         });
@@ -1118,9 +1113,9 @@ fn deny_reserved_in_home(
     written: &Path,
     src: &Path,
     dst: &Path,
-) -> Result<(), LaunchError> {
+) -> Result<(), PlanError> {
     match denied_root_in_home(host, env, src, dst) {
-        Some((root, end)) => Err(LaunchError::BadValue {
+        Some((root, end)) => Err(PlanError::BadValue {
             service,
             reason: denied_reason(written, src, &root, end),
         }),
@@ -1166,7 +1161,7 @@ fn denied_root_in_home(
 /// baseline allowlist. The entry must resolve inside `/etc`, so a symlink
 /// there cannot pull an unrelated part of the host into the sandbox; the
 /// names the sandbox generates itself were rejected by the parser.
-fn etc_share(args: &mut BwrapArgs, host: &dyn Host, name: &OsStr) -> Result<(), LaunchError> {
+fn etc_share(args: &mut BwrapArgs, host: &dyn Host, name: &OsStr) -> Result<(), PlanError> {
     let etc = Path::new("/etc");
     let dst = etc.join(name);
     let src = confine(host, "etc-share", etc, &dst, "/etc")?;
@@ -1262,11 +1257,7 @@ fn writable_trees(ops: &[Explained], env: &Env) -> Vec<(PathBuf, PathBuf, &'stat
 /// symlink inside a tree the application can write (GHSA-pxhw-h44j-8pfx). A
 /// component that cannot be `lstat`ed refuses the run as well; nothing is
 /// deleted.
-pub fn sweep_destinations(
-    ops: &[Explained],
-    env: &Env,
-    host: &dyn Host,
-) -> Result<(), LaunchError> {
+pub fn sweep_destinations(ops: &[Explained], env: &Env, host: &dyn Host) -> Result<(), PlanError> {
     let trees = writable_trees(ops, env);
     // bwrap reads options up to the first `--`; everything after it is
     // bubbler-init's argv, whatever flags it spells.
@@ -1286,14 +1277,14 @@ pub fn sweep_destinations(
             let mut inside = inside_root.clone();
             for part in rel.components() {
                 let Component::Normal(name) = part else {
-                    return Err(LaunchError::UnwalkableDestination(dst.to_path_buf()));
+                    return Err(PlanError::UnwalkableDestination(dst.to_path_buf()));
                 };
                 on_host.push(name);
                 inside.push(name);
                 match host.read_link(&on_host) {
                     Ok(None) => {}
                     Ok(Some(target)) => {
-                        return Err(LaunchError::PlantedSymlink {
+                        return Err(PlanError::PlantedSymlink {
                             inside,
                             tree,
                             target,
@@ -1301,7 +1292,7 @@ pub fn sweep_destinations(
                         });
                     }
                     Err(source) => {
-                        return Err(LaunchError::UncheckedDestination {
+                        return Err(PlanError::UncheckedDestination {
                             inside,
                             tree,
                             host: on_host,
@@ -1381,7 +1372,7 @@ mod tests {
         services: &[Service],
         env: &Env,
         existing: &[(&str, Kind)],
-    ) -> Result<Vec<String>, LaunchError> {
+    ) -> Result<Vec<String>, PlanError> {
         argv_linked(services, env, existing, &[])
     }
 
@@ -1402,7 +1393,7 @@ mod tests {
         plan: &WaylandPlan,
         env: &Env,
         existing: &[(&str, Kind)],
-    ) -> Result<Vec<String>, LaunchError> {
+    ) -> Result<Vec<String>, PlanError> {
         argv_planned(
             &[Service::Wayland(WaylandMode::default())],
             env,
@@ -1417,7 +1408,7 @@ mod tests {
         env: &Env,
         existing: &[(&str, Kind)],
         links: &[(&str, &str)],
-    ) -> Result<Vec<String>, LaunchError> {
+    ) -> Result<Vec<String>, PlanError> {
         argv_planned(services, env, existing, links, None)
     }
 
@@ -1447,7 +1438,7 @@ mod tests {
         existing: &[(&str, Kind)],
         links: &[(&str, &str)],
         wayland: Option<&WaylandPlan>,
-    ) -> Result<Vec<String>, LaunchError> {
+    ) -> Result<Vec<String>, PlanError> {
         let host = fake_host(existing, links);
         let plan = dbus::plan(services, "t");
         let ctx = ServiceCtx {
@@ -1468,7 +1459,7 @@ mod tests {
         services: &[Service],
         shares: &[Share],
         existing: &[(&str, Kind)],
-    ) -> Result<Vec<String>, LaunchError> {
+    ) -> Result<Vec<String>, PlanError> {
         argv_shared_linked(services, shares, existing, &[])
     }
 
@@ -1477,7 +1468,7 @@ mod tests {
         shares: &[Share],
         existing: &[(&str, Kind)],
         links: &[(&str, &str)],
-    ) -> Result<Vec<String>, LaunchError> {
+    ) -> Result<Vec<String>, PlanError> {
         let env = env();
         let host = fake_host(existing, links);
         let plan = dbus::plan(services, "t");
@@ -1557,7 +1548,7 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    LaunchError::BadValue {
+                    PlanError::BadValue {
                         service: "wayland",
                         ..
                     }
@@ -1567,7 +1558,7 @@ mod tests {
         }
         assert!(matches!(
             check_wayland_display(None),
-            Err(LaunchError::MissingEnv {
+            Err(PlanError::MissingEnv {
                 service: "wayland",
                 var: "WAYLAND_DISPLAY"
             })
@@ -1609,7 +1600,7 @@ mod tests {
         e.wayland_display = Some("nested/wayland-1".into());
         assert!(matches!(
             argv_wayland(&plan, &e, &[]),
-            Err(LaunchError::BadValue {
+            Err(PlanError::BadValue {
                 service: "wayland",
                 ..
             })
@@ -1643,7 +1634,7 @@ mod tests {
     fn wayland_missing_socket_or_env_fails() {
         assert!(matches!(
             argv(&[Service::Wayland(WaylandMode::default())], &env(), &[]),
-            Err(LaunchError::MissingResource {
+            Err(PlanError::MissingResource {
                 service: "wayland",
                 ..
             })
@@ -1652,7 +1643,7 @@ mod tests {
         e.wayland_display = None;
         assert!(matches!(
             argv(&[Service::Wayland(WaylandMode::default())], &e, &[]),
-            Err(LaunchError::MissingEnv {
+            Err(PlanError::MissingEnv {
                 service: "wayland",
                 var: "WAYLAND_DISPLAY"
             })
@@ -1668,7 +1659,7 @@ mod tests {
                     &env(),
                     &[("/run/user/1000/wayland-1", kind)]
                 ),
-                Err(LaunchError::WrongType {
+                Err(PlanError::WrongType {
                     service: "wayland",
                     expected: "a socket",
                     ..
@@ -1800,7 +1791,7 @@ mod tests {
     fn nested_x11_without_xwayland_on_the_host_fails() {
         assert!(matches!(
             argv(&[Service::X11(X11Mode::default())], &env(), &[]),
-            Err(LaunchError::MissingResource { service: "x11", .. })
+            Err(PlanError::MissingResource { service: "x11", .. })
         ));
     }
 
@@ -1860,7 +1851,7 @@ mod tests {
                 &env(),
                 &[("/tmp/.X11-unix/X0", Sock)]
             ),
-            Err(LaunchError::MissingResource { service: "x11", .. })
+            Err(PlanError::MissingResource { service: "x11", .. })
         ));
     }
 
@@ -1874,7 +1865,7 @@ mod tests {
                 &e,
                 &[("/tmp/.X11-unix/X0", Sock), ("/", Dir)]
             ),
-            Err(LaunchError::WrongType {
+            Err(PlanError::WrongType {
                 service: "x11",
                 expected: "a regular file",
                 ..
@@ -1890,7 +1881,7 @@ mod tests {
                 &env(),
                 &[("/tmp/.X11-unix/X0", File)]
             ),
-            Err(LaunchError::WrongType {
+            Err(PlanError::WrongType {
                 service: "x11",
                 expected: "a socket",
                 ..
@@ -1908,7 +1899,7 @@ mod tests {
                 &e,
                 &[("/run/user/1000/wayland-1", Sock)]
             ),
-            Err(LaunchError::BadValue {
+            Err(PlanError::BadValue {
                 service: "wayland",
                 ..
             })
@@ -1920,7 +1911,7 @@ mod tests {
                 &e,
                 &[("/run/user/1000/nested/wayland-1", Sock)]
             ),
-            Err(LaunchError::BadValue {
+            Err(PlanError::BadValue {
                 service: "wayland",
                 ..
             })
@@ -1943,7 +1934,7 @@ mod tests {
                             ("/run/user/1000/..", Dir),
                         ]
                     ),
-                    Err(LaunchError::BadValue {
+                    Err(PlanError::BadValue {
                         service: "wayland",
                         ..
                     })
@@ -1963,7 +1954,7 @@ mod tests {
                 &e,
                 &[("/run/user/1000/dconf", Dir)]
             ),
-            Err(LaunchError::WrongType {
+            Err(PlanError::WrongType {
                 service: "wayland",
                 expected: "a socket",
                 ..
@@ -1983,7 +1974,7 @@ mod tests {
         e.display = None;
         assert!(matches!(
             argv(&[Service::X11(X11Mode::Host)], &e, &[]),
-            Err(LaunchError::MissingEnv {
+            Err(PlanError::MissingEnv {
                 service: "x11",
                 var: "DISPLAY"
             })
@@ -2030,7 +2021,7 @@ mod tests {
         ));
         assert!(matches!(
             argv(std::slice::from_ref(&host), &env(), &[]),
-            Err(LaunchError::MissingResource {
+            Err(PlanError::MissingResource {
                 service: "network",
                 ..
             })
@@ -2180,7 +2171,7 @@ mod tests {
         }];
         assert!(matches!(
             argv(&svcs, &env(), &[]),
-            Err(LaunchError::MissingResource {
+            Err(PlanError::MissingResource {
                 service: "home-share",
                 ..
             })
@@ -2229,7 +2220,7 @@ mod tests {
             &[("/home/user/RootLink", "/")],
         );
         assert!(
-            matches!(&r, Err(LaunchError::BadValue { service: "home-share", reason }) if reason.contains("outside the home directory")),
+            matches!(&r, Err(PlanError::BadValue { service: "home-share", reason }) if reason.contains("outside the home directory")),
             "{r:?}"
         );
     }
@@ -2291,7 +2282,7 @@ mod tests {
         let mut args = BwrapArgs::baseline(&e, Path::new("/i/home"), &host);
         assert!(matches!(
             apply_all(&svcs, &e, &mut args, &NoHome(host), &argv_ctx(&None)),
-            Err(LaunchError::MissingResource {
+            Err(PlanError::MissingResource {
                 service: "home-share",
                 ..
             })
@@ -2314,7 +2305,7 @@ mod tests {
         }];
         let err = argv(&svcs, &e, &[(&dir, Dir)]).unwrap_err();
         assert!(
-            matches!(&err, LaunchError::BadValue { service: "home-share", reason }
+            matches!(&err, PlanError::BadValue { service: "home-share", reason }
                 if reason == &format!("bubbler never shares {dir}")),
             "{err}"
         );
@@ -2343,7 +2334,7 @@ mod tests {
             }];
             let err = argv(&svcs, &e, &[(path, Dir), ("/kioxia/profiles", Dir)]).unwrap_err();
             assert!(
-                matches!(&err, LaunchError::BadValue { service: "path-share", reason }
+                matches!(&err, PlanError::BadValue { service: "path-share", reason }
                     if reason == &want),
                 "{path}: {err}"
             );
@@ -2371,7 +2362,7 @@ mod tests {
             }];
             let e = argv(&svcs, &env(), &[(&store, Dir)]).unwrap_err();
             assert!(
-                matches!(&e, LaunchError::BadValue { service: "home-share", reason }
+                matches!(&e, PlanError::BadValue { service: "home-share", reason }
                     if reason == &format!("bubbler never shares {store}")),
                 "{mode:?}: {e}"
             );
@@ -2391,7 +2382,7 @@ mod tests {
         }];
         let e = argv(&svcs, &env(), &[(&layer, Dir)]).unwrap_err();
         assert!(
-            matches!(&e, LaunchError::BadValue { service: "home-share", reason }
+            matches!(&e, PlanError::BadValue { service: "home-share", reason }
                 if reason == &format!("bubbler never shares {layer}")),
             "{e}"
         );
@@ -2410,7 +2401,7 @@ mod tests {
         }];
         let e = argv(&svcs, &env(), &[(&above, Dir)]).unwrap_err();
         assert!(
-            matches!(&e, LaunchError::BadValue { service: "home-share", reason }
+            matches!(&e, PlanError::BadValue { service: "home-share", reason }
                 if reason == &format!("bubbler never shares {above}, which overlaps {store}")),
             "{e}"
         );
@@ -2500,7 +2491,7 @@ mod tests {
         assert!(
             matches!(
                 e,
-                LaunchError::MissingResource {
+                PlanError::MissingResource {
                     service: "--share",
                     ..
                 }
@@ -2520,7 +2511,7 @@ mod tests {
         assert!(
             matches!(
                 e,
-                LaunchError::BadValue {
+                PlanError::BadValue {
                     service: "--share",
                     ..
                 }
@@ -2543,7 +2534,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(&e, LaunchError::BadValue { service: "--share", reason } if reason.contains("already shared by config.kdl")),
+            matches!(&e, PlanError::BadValue { service: "--share", reason } if reason.contains("already shared by config.kdl")),
             "{e}"
         );
         // Given twice.
@@ -2553,7 +2544,7 @@ mod tests {
         };
         let e = argv_shared(&[], &[s.clone(), s], &[("/srv/src", Dir)]).unwrap_err();
         assert!(
-            matches!(&e, LaunchError::BadValue { service: "--share", reason } if reason.contains("given twice")),
+            matches!(&e, PlanError::BadValue { service: "--share", reason } if reason.contains("given twice")),
             "{e}"
         );
     }
@@ -2574,7 +2565,7 @@ mod tests {
             &[(&store, Dir)],
         )
         .unwrap_err();
-        let LaunchError::BadValue { service, reason } = &e else {
+        let PlanError::BadValue { service, reason } = &e else {
             panic!("{e}");
         };
         assert_eq!(*service, "--share");
@@ -2592,7 +2583,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(&e, LaunchError::BadValue { service: "--share", reason }
+            matches!(&e, PlanError::BadValue { service: "--share", reason }
                 if reason == &format!("bubbler never shares {above}, which overlaps {store}")),
             "{e}"
         );
@@ -2616,7 +2607,7 @@ mod tests {
             )
             .unwrap_err();
             assert!(
-                matches!(&e, LaunchError::BadValue { service: "--share", reason }
+                matches!(&e, PlanError::BadValue { service: "--share", reason }
                     if reason == &format!("{} contains `.` or `..`; give the path without them", path.display())),
                 "{e}"
             );
@@ -2634,7 +2625,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(&e, LaunchError::BadValue { service: "--share", reason }
+            matches!(&e, PlanError::BadValue { service: "--share", reason }
                 if reason == "srv/a is not absolute"),
             "{e}"
         );
@@ -2660,7 +2651,7 @@ mod tests {
             &[(&home("app"), &home("Projects/app"))],
         )
         .unwrap_err();
-        let LaunchError::BadValue { service, reason } = &e else {
+        let PlanError::BadValue { service, reason } = &e else {
             panic!("{e}");
         };
         assert_eq!(*service, "--share");
@@ -2718,7 +2709,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(&e, LaunchError::BadValue { service: "--share", reason }
+            matches!(&e, PlanError::BadValue { service: "--share", reason }
                 if reason == "/srv/a/b and /srv/a overlap; one share cannot contain another"),
             "{e}"
         );
@@ -2745,7 +2736,7 @@ mod tests {
             ],
         )
         .unwrap_err();
-        let LaunchError::BadValue { service, reason } = &e else {
+        let PlanError::BadValue { service, reason } = &e else {
             panic!("{e}");
         };
         assert_eq!(*service, "--share");
@@ -2772,7 +2763,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(&e, LaunchError::BadValue { service: "--share", reason } if reason.contains("/home/bubbler")),
+            matches!(&e, PlanError::BadValue { service: "--share", reason } if reason.contains("/home/bubbler")),
             "{e}"
         );
     }
@@ -2832,7 +2823,7 @@ mod tests {
             };
             let r = argv(&[share(path, ShareMode::ReadOnly)], &e, &[(path, Dir)]);
             assert!(
-                matches!(&r, Err(LaunchError::BadValue { service: "path-share", reason })
+                matches!(&r, Err(PlanError::BadValue { service: "path-share", reason })
                     if *reason == want),
                 "{path} should be refused with `{want}`, got {r:?}"
             );
@@ -2849,7 +2840,7 @@ mod tests {
                 &[("/home/user/.local/share/bubbler", "/kioxia/bubbler")],
             );
             assert!(
-                matches!(&r, Err(LaunchError::BadValue { service: "path-share", reason })
+                matches!(&r, Err(PlanError::BadValue { service: "path-share", reason })
                     if reason.contains("/kioxia/bubbler")),
                 "{path}: {r:?}"
             );
@@ -2894,7 +2885,7 @@ mod tests {
             &[("/kioxia/link", "/etc")],
         );
         assert!(
-            matches!(&r, Err(LaunchError::BadValue { service: "path-share", reason })
+            matches!(&r, Err(PlanError::BadValue { service: "path-share", reason })
                 if reason.contains("/etc")),
             "{r:?}"
         );
@@ -2904,7 +2895,7 @@ mod tests {
     fn path_share_missing_source_fails() {
         assert!(matches!(
             argv(&[share("/kioxia/Steam", ShareMode::ReadOnly)], &env(), &[]),
-            Err(LaunchError::MissingResource {
+            Err(PlanError::MissingResource {
                 service: "path-share",
                 ..
             })
@@ -2968,7 +2959,7 @@ mod tests {
             assert!(
                 matches!(
                     &r,
-                    Err(LaunchError::BadValue {
+                    Err(PlanError::BadValue {
                         service: "path-share",
                         ..
                     })
@@ -2997,7 +2988,7 @@ mod tests {
         for (path, kind) in cases {
             let r = argv(&[share(path, ShareMode::ReadOnly)], &e, &[(path, *kind)]);
             assert!(
-                matches!(&r, Err(LaunchError::BadValue { service: "path-share", reason })
+                matches!(&r, Err(PlanError::BadValue { service: "path-share", reason })
                     if reason.contains("/kioxia/cfg/bubbler")),
                 "{path}: {r:?}"
             );
@@ -3027,7 +3018,7 @@ mod tests {
         assert!(
             matches!(
                 &r,
-                Err(LaunchError::BadValue {
+                Err(PlanError::BadValue {
                     service: "path-share",
                     ..
                 })
@@ -3048,7 +3039,7 @@ mod tests {
                 &[("/run/media/disk", Dir)],
             );
             assert!(
-                matches!(&r, Err(LaunchError::BadValue { service: "path-share", reason })
+                matches!(&r, Err(PlanError::BadValue { service: "path-share", reason })
                     if reason.contains("/run/media/disk/xdg/bubbler")),
                 "hook {hook:?}: {r:?}"
             );
@@ -3080,7 +3071,7 @@ mod tests {
                 &[(dst, "/kioxia/data")],
             );
             assert!(
-                matches!(&r, Err(LaunchError::BadValue { service: "path-share", reason })
+                matches!(&r, Err(PlanError::BadValue { service: "path-share", reason })
                     if reason.contains(dst)),
                 "{dst}: {r:?}"
             );
@@ -3097,7 +3088,7 @@ mod tests {
         assert!(
             matches!(
                 &r,
-                Err(LaunchError::WrongType {
+                Err(PlanError::WrongType {
                     service: "path-share",
                     expected: "a directory or a regular file",
                     ..
@@ -3119,7 +3110,7 @@ mod tests {
         for path in ["/tmp/other", "/tmp", "/etc"] {
             let r = argv(&[share(path, ShareMode::ReadOnly)], &e, &[(path, Dir)]);
             assert!(
-                matches!(&r, Err(LaunchError::BadValue { .. })),
+                matches!(&r, Err(PlanError::BadValue { .. })),
                 "{path}: {r:?}"
             );
         }
@@ -3144,7 +3135,7 @@ mod tests {
         ] {
             let r = both(a, b);
             assert!(
-                matches!(&r, Err(LaunchError::BadValue { service: "path-share", reason })
+                matches!(&r, Err(PlanError::BadValue { service: "path-share", reason })
                     if reason.contains(a) && reason.contains(b)),
                 "{a} and {b}: {r:?}"
             );
@@ -3165,7 +3156,7 @@ mod tests {
             &[("/mnt/link", "/kioxia/Steam")],
         );
         assert!(
-            matches!(&r, Err(LaunchError::BadValue { service: "path-share", reason })
+            matches!(&r, Err(PlanError::BadValue { service: "path-share", reason })
                 if reason.contains("/mnt/link") && reason.contains("/kioxia/Steam")),
             "{r:?}"
         );
@@ -3182,7 +3173,7 @@ mod tests {
             &[("/etc/escape", "/home/user")],
         );
         assert!(
-            matches!(&r, Err(LaunchError::BadValue { service: "etc-share", reason }) if reason.contains("outside")),
+            matches!(&r, Err(PlanError::BadValue { service: "etc-share", reason }) if reason.contains("outside")),
             "{r:?}"
         );
     }
@@ -3301,7 +3292,7 @@ mod tests {
 
     /// The binds a `camera` node adds on top of the grants it requires,
     /// so a test names what that node emitted and nothing else.
-    fn camera_binds(nodes: bool, existing: &[(&str, Kind)]) -> Result<Vec<String>, LaunchError> {
+    fn camera_binds(nodes: bool, existing: &[(&str, Kind)]) -> Result<Vec<String>, PlanError> {
         let base_argv = argv(&camera_base(), &env(), existing)?;
         let mut with = camera_base();
         with.push(Service::Camera { nodes });
@@ -3387,7 +3378,7 @@ mod tests {
             assert!(
                 matches!(
                     camera_binds(true, &[(path, File)]),
-                    Err(LaunchError::WrongType {
+                    Err(PlanError::WrongType {
                         service: "camera",
                         expected: "a directory",
                         ..
@@ -3408,7 +3399,7 @@ mod tests {
             assert!(
                 matches!(
                     argv(&[Service::Camera { nodes }], &env(), &camera_host()),
-                    Err(LaunchError::BadValue {
+                    Err(PlanError::BadValue {
                         service: "camera",
                         ..
                     })
@@ -3501,7 +3492,7 @@ mod tests {
             assert!(
                 matches!(
                     argv(&[pad(false, false)], &env(), &host),
-                    Err(LaunchError::WrongType {
+                    Err(PlanError::WrongType {
                         service: "gamepad",
                         expected: "a directory",
                         ..
@@ -3516,7 +3507,7 @@ mod tests {
             .collect();
         assert!(matches!(
             argv(&[pad(false, false)], &env(), &host),
-            Err(LaunchError::MissingResource {
+            Err(PlanError::MissingResource {
                 service: "gamepad",
                 ..
             })
@@ -3565,7 +3556,7 @@ mod tests {
         host.push(("/sys/class/hidraw", File));
         assert!(matches!(
             argv(&[pad(true, false)], &env(), &host),
-            Err(LaunchError::WrongType {
+            Err(PlanError::WrongType {
                 service: "gamepad",
                 expected: "a directory",
                 ..
@@ -3627,7 +3618,7 @@ mod tests {
         // `gamepad hidraw=#true` each point at their own line.
         assert!(matches!(
             argv(&[Service::Hidraw], &env(), &[("/sys/class/hidraw", File)]),
-            Err(LaunchError::WrongType {
+            Err(PlanError::WrongType {
                 service: "hidraw",
                 expected: "a directory",
                 ..
@@ -3651,7 +3642,7 @@ mod tests {
         // error rather than a sandbox quietly without the node.
         assert!(matches!(
             argv(&[pad(false, true)], &env(), &gamepad_host()),
-            Err(LaunchError::MissingResource {
+            Err(PlanError::MissingResource {
                 service: "gamepad",
                 ..
             })
@@ -3660,7 +3651,7 @@ mod tests {
         host.push(("/dev/uinput", File));
         assert!(matches!(
             argv(&[pad(false, true)], &env(), &host),
-            Err(LaunchError::WrongType {
+            Err(PlanError::WrongType {
                 service: "gamepad",
                 expected: "a character device",
                 ..
@@ -3799,7 +3790,7 @@ mod tests {
             .collect();
         assert!(matches!(
             argv(&[Service::Pulseaudio { microphone: false, exclusive: false, capturable: false }], &env(), &host),
-            Err(LaunchError::MissingResource { service: "pulseaudio", ref path })
+            Err(PlanError::MissingResource { service: "pulseaudio", ref path })
                 if path == Path::new(crate::pipewire::PULSE_MODULE)
         ));
     }
@@ -3829,7 +3820,7 @@ mod tests {
             assert!(
                 matches!(
                     argv(std::slice::from_ref(&service), &env(), &host),
-                    Err(LaunchError::MissingResource { service: "pipewire", ref path })
+                    Err(PlanError::MissingResource { service: "pipewire", ref path })
                         if path == Path::new(crate::pipewire::PW_CONTAINER)
                 ),
                 "{service:?}"
@@ -3856,7 +3847,7 @@ mod tests {
                 &env(),
                 &[("/etc/java", Dir)]
             ),
-            Err(LaunchError::MissingResource {
+            Err(PlanError::MissingResource {
                 service: "etc-share",
                 ..
             })
@@ -4014,7 +4005,7 @@ mod tests {
         assert!(
             matches!(
                 argv(&[Service::A11y], &env(), &[]),
-                Err(LaunchError::BadValue {
+                Err(PlanError::BadValue {
                     service: "a11y",
                     ..
                 })
@@ -4294,7 +4285,7 @@ mod tests {
             assert!(
                 matches!(
                     apply_env(&[((*key).to_owned(), "x".into())], &mut args),
-                    Err(LaunchError::BadValue { service: "env", .. })
+                    Err(PlanError::BadValue { service: "env", .. })
                 ),
                 "{key}"
             );
@@ -4487,7 +4478,7 @@ mod tests {
             .link(&format!("{home}/a/b"), "/oldroot/x");
         let err = sweep_destinations(&ops, &e, &host).unwrap_err();
         assert!(
-            matches!(err, LaunchError::UncheckedDestination { .. }),
+            matches!(err, PlanError::UncheckedDestination { .. }),
             "{err}"
         );
         let text = err.to_string();
@@ -4514,10 +4505,7 @@ mod tests {
             op(&["--ro-bind", "/etc/hosts", "/home/bubbler/../etc/hosts"]),
         ];
         let err = sweep_destinations(&ops, &e, &FakeHost::default()).unwrap_err();
-        assert!(
-            matches!(err, LaunchError::UnwalkableDestination(_)),
-            "{err}"
-        );
+        assert!(matches!(err, PlanError::UnwalkableDestination(_)), "{err}");
     }
 
     /// Options end at bwrap's `--`; the argv bubbler-init and the command

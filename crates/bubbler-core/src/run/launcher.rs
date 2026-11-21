@@ -40,13 +40,15 @@ use bubbler_init::fds;
 use crate::bwrap::{Argv, BwrapArgs, Explained, FdAllocator, Origin};
 use crate::config::{EtcMode, NetworkConfig, Service, Userns, WaylandMode};
 use crate::env::Env;
-use crate::error::{ConfigError, LaunchError};
+use crate::error::ConfigError;
 use crate::exec::SignalGuard;
 pub use crate::exec::exit_code;
 use crate::host::{Host, RealHost};
 use crate::instance::Instance;
 pub use crate::paths::{RUNTIME_SUBDIR, instance_runtime_dir};
 pub(crate) use crate::paths::{START_LOCK_SUFFIX, start_lock_path};
+use crate::plan::plan_error::PlanError;
+use crate::run::launch_error::LaunchError;
 use crate::tty::{self, Pty, StdioTarget, TtyMode};
 use crate::tty_relay::{self, RawGuard, RelayEnd};
 use crate::wayland::ProxyPlan;
@@ -457,7 +459,7 @@ fn build_argv_on(
     host: &dyn Host,
 ) -> Result<Argv, LaunchError> {
     let (args, command) = build_args_on(env, inst, command, ctty, host)?;
-    args.finish(command, alloc)
+    Ok(args.finish(command, alloc)?)
 }
 
 /// Every argument of an instance's argv with the node that produced it, fds numbered as
@@ -480,7 +482,7 @@ fn explain_on(
 ) -> Result<Vec<Explained>, LaunchError> {
     let (args, command) = build_args_on(env, inst, command, ctty, host)?;
     let mut alloc = DryRunAlloc::new(instance_runtime_dir(env, &inst.name));
-    args.finish_explained(command, &mut alloc)
+    Ok(args.finish_explained(command, &mut alloc)?)
 }
 
 // Nothing here asks the compositor: its answer decides only what the Wayland proxy connects
@@ -612,7 +614,7 @@ pub fn pw_context_argv(
     args.setenv(OsStr::new("XDG_RUNTIME_DIR"), env.runtime_dir.as_os_str());
     args.setenv(OsStr::new(pipewire::REPORT_FD), &report);
     let properties = pipewire::properties(ctx.instance, ctx.run_id, ctx.audio);
-    args.finish_plain(&pipewire::command(&properties), alloc)
+    Ok(args.finish_plain(&pipewire::command(&properties), alloc)?)
 }
 
 /// Complete bwrap argv (without the program name) for the sidecar serving one instance's
@@ -648,7 +650,7 @@ pub fn pw_pulse_argv(
         OsStr::new("PIPEWIRE_CONFIG_DIR"),
         OsStr::new(pipewire::PULSE_CONFIG_INSIDE),
     );
-    args.finish_plain(&pipewire::pulse_command(), alloc)
+    Ok(args.finish_plain(&pipewire::pulse_command(), alloc)?)
 }
 
 /// Complete bwrap argv (without the program name) for an instance's D-Bus proxy sidecar.
@@ -664,7 +666,7 @@ pub fn proxy_argv(
 ) -> Result<Argv, LaunchError> {
     let (args, command) = proxy_args(env, plan, buses, dir, host, alloc)?;
     let plain: Vec<OsString> = command.into_iter().map(|(arg, _)| arg).collect();
-    args.finish_plain(&plain, alloc)
+    Ok(args.finish_plain(&plain, alloc)?)
 }
 
 /// The D-Bus sidecar's argv with what produced each argument, or `None` where no bus is
@@ -764,7 +766,7 @@ pub fn wl_proxy_argv(
 ) -> Result<Argv, LaunchError> {
     let (args, command) = wl_proxy_args(env, plan, node, host, alloc)?;
     let plain: Vec<OsString> = command.into_iter().map(|(arg, _)| arg).collect();
-    args.finish_plain(&plain, alloc)
+    Ok(args.finish_plain(&plain, alloc)?)
 }
 
 /// The Wayland sidecar's argv with what produced each argument, or `None` where no sandboxed
@@ -1285,17 +1287,19 @@ fn adopt_socket(
     clear_socket_name(&target, to_dir, name)
         .map_err(|e| LaunchError::Io(path.clone(), e.into()))?;
     rustix::fs::renameat(&source, made, &target, name).map_err(|e| match e {
-        Errno::NOENT => LaunchError::MissingResource {
+        Errno::NOENT => LaunchError::Plan(PlanError::MissingResource {
             service,
             path: from_dir.join(made),
-        },
+        }),
         e => LaunchError::Io(path.clone(), e.into()),
     })?;
     let guard = FileGuard(path.clone());
-    let wrong_type = |expected| LaunchError::WrongType {
-        service,
-        path: path.clone(),
-        expected,
+    let wrong_type = |expected| {
+        LaunchError::Plan(PlanError::WrongType {
+            service,
+            path: path.clone(),
+            expected,
+        })
     };
     let socket = rustix::fs::openat(
         &target,
@@ -1448,10 +1452,10 @@ fn write_pulse_config(env: &Env, host: &dyn Host, dir: &Path) -> Result<PathBuf,
     let source = pipewire::pulse_conf(host, &env.config_home).ok_or_else(|| {
         // The last directory searched is the one the package ships, so
         // that is the path a report can be acted on.
-        LaunchError::MissingResource {
+        LaunchError::Plan(PlanError::MissingResource {
             service: "pulseaudio",
             path: dirs[dirs.len() - 1].join(pipewire::PULSE_CONF),
-        }
+        })
     })?;
     let text = std::fs::read(&source).map_err(|e| LaunchError::Io(source.clone(), e))?;
     let cfg = pipewire::pulse_config_dir(dir);
@@ -1516,7 +1520,7 @@ pub fn start_proxy(
         .as_ref()
         .map(|_| {
             let path = dbus_a11y::guarded_host_a11y_bus(host, env)?;
-            service::require_socket(host, dbus::A11Y_NODE, path)
+            Ok::<_, LaunchError>(service::require_socket(host, dbus::A11Y_NODE, path)?)
         })
         .transpose()?;
     // After the bus guards, so a refused address is reported before a missing package; before the
@@ -1528,14 +1532,14 @@ pub fn start_proxy(
         on_path(&program.to_string_lossy()).is_some()
     };
     if !found {
-        return Err(LaunchError::BadValue {
+        return Err(LaunchError::Plan(PlanError::BadValue {
             service: "dbus",
             reason: format!(
                 "`{}` is not on PATH; install the `xdg-dbus-proxy` package, or drop the \
                  `dbus`, `portals`, `a11y` and `system-bus` nodes",
                 program.display()
             ),
-        });
+        }));
     }
     // The proxy gets this directory and nothing else of the instance's
     // runtime state, so it is created here rather than bound from above.
@@ -1741,12 +1745,12 @@ fn install_rules(
         // Nothing to install where nothing is filtered; a filtered run whose ruleset could not be
         // written must not get the whole network.
         if cfg.outbound == network::Outbound::Deny && cfg.is_isolated() {
-            return Err(LaunchError::BadValue {
+            return Err(LaunchError::Plan(PlanError::BadValue {
                 service: "network",
                 reason: "the ruleset an `allow-host` needs is written around the \
                          egress proxy's own cgroup, and none was made for this run"
                     .to_owned(),
-            });
+            }));
         }
         return Ok(());
     };
@@ -1791,14 +1795,16 @@ fn install_rules(
     let mut child = cmd.spawn().map_err(|e| match e.kind() {
         // Only a really missing `nft` names the package: a failed `pre_exec` is a spawn failure
         // too.
-        io::ErrorKind::NotFound if on_path(network::NFT_BIN).is_none() => LaunchError::BadValue {
-            service: "network",
-            reason: format!(
-                "`{}` is not on PATH; install the `nftables` package, or drop \
+        io::ErrorKind::NotFound if on_path(network::NFT_BIN).is_none() => {
+            LaunchError::Plan(PlanError::BadValue {
+                service: "network",
+                reason: format!(
+                    "`{}` is not on PATH; install the `nftables` package, or drop \
                  `outbound \"deny\"` to leave the sandbox network unfiltered",
-                network::NFT_BIN
-            ),
-        },
+                    network::NFT_BIN
+                ),
+            })
+        }
         _ => LaunchError::Network(format!("starting `{}`: {e}", network::NFT_BIN)),
     })?;
     let mut stdin = child
@@ -1935,13 +1941,15 @@ fn start_pasta(
     // argv audit trail), nor as the caller's own descriptor.
     let (log, stderr) = run_log::relay()?;
     let log_too = log.try_clone().map_err(LaunchError::Data)?;
-    let missing = || LaunchError::BadValue {
-        service: "network",
-        reason: format!(
-            "`{}` is not on PATH; install the `passt` package, or write \
+    let missing = || {
+        LaunchError::Plan(PlanError::BadValue {
+            service: "network",
+            reason: format!(
+                "`{}` is not on PATH; install the `passt` package, or write \
              `network \"host\"` to use the host network namespace",
-            network::PASTA_BIN
-        ),
+                network::PASTA_BIN
+            ),
+        })
     };
     let program = match &env.pasta_override {
         Some(path) => path.clone(),
@@ -2244,17 +2252,19 @@ fn adopt_proxy_bus(
     let path = dbus::app_bus_path(dir, socket);
     clear_socket_name(&to, dir, socket).map_err(|e| LaunchError::Io(path.clone(), e.into()))?;
     rustix::fs::renameat(&from, socket, &to, socket).map_err(|e| match e {
-        Errno::NOENT => LaunchError::MissingResource {
+        Errno::NOENT => LaunchError::Plan(PlanError::MissingResource {
             service: node,
             path: dbus::proxy_bus_path(dir, socket),
-        },
+        }),
         e => LaunchError::Io(path.clone(), e.into()),
     })?;
     let guard = FileGuard(path.clone());
-    let wrong_type = |expected| LaunchError::WrongType {
-        service: node,
-        path: path.clone(),
-        expected,
+    let wrong_type = |expected| {
+        LaunchError::Plan(PlanError::WrongType {
+            service: node,
+            path: path.clone(),
+            expected,
+        })
     };
     let bus = rustix::fs::openat(
         &to,
@@ -2552,11 +2562,11 @@ fn open_dir_nofollow<P: rustix::path::Arg>(
         Mode::empty(),
     )
     .map_err(|e| match e {
-        Errno::LOOP | Errno::NOTDIR => LaunchError::WrongType {
+        Errno::LOOP | Errno::NOTDIR => LaunchError::Plan(PlanError::WrongType {
             service,
             path: named.to_path_buf(),
             expected: "a directory",
-        },
+        }),
         e => LaunchError::Io(named.to_path_buf(), e.into()),
     })
 }
@@ -3760,10 +3770,10 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    LaunchError::BadValue {
+                    LaunchError::Plan(PlanError::BadValue {
                         service: "wayland",
                         ..
-                    }
+                    })
                 ),
                 "{bad}: {err:?}"
             );
@@ -3771,10 +3781,10 @@ mod tests {
         e.wayland_display = None;
         assert!(matches!(
             start_wayland(&e, &dir, &app, &RealHost, &AtomicBool::new(false)),
-            Err(LaunchError::MissingEnv {
+            Err(LaunchError::Plan(PlanError::MissingEnv {
                 service: "wayland",
                 var: "WAYLAND_DISPLAY"
-            })
+            }))
         ));
         assert!(!wayland::socket_path(&dir).exists());
         assert!(!wayland::context_socket_path(&dir).exists());
@@ -4059,10 +4069,10 @@ mod tests {
         let i = inst(tmp.path(), "command \"foot\"");
         assert!(matches!(
             build_argv(&e, &i, None, &mut dry(&e), false),
-            Err(LaunchError::MissingResource {
+            Err(LaunchError::Plan(PlanError::MissingResource {
                 service: "init",
                 ..
-            })
+            }))
         ));
     }
 
@@ -4156,19 +4166,19 @@ mod tests {
         }];
         assert!(matches!(
             prepare_app_runtime(&e, &svcs),
-            Err(LaunchError::WrongType {
+            Err(LaunchError::Plan(PlanError::WrongType {
                 service: "app-runtime",
                 ..
-            })
+            }))
         ));
         std::fs::remove_file(tmp.path().join("run/app/org.example.App")).unwrap();
         std::fs::write(tmp.path().join("run/app/org.example.App"), b"").unwrap();
         assert!(matches!(
             prepare_app_runtime(&e, &svcs),
-            Err(LaunchError::WrongType {
+            Err(LaunchError::Plan(PlanError::WrongType {
                 service: "app-runtime",
                 ..
-            })
+            }))
         ));
     }
 
@@ -4189,10 +4199,10 @@ mod tests {
                     mode: crate::config::ShareMode::ReadOnly,
                 }]
             ),
-            Err(LaunchError::WrongType {
+            Err(LaunchError::Plan(PlanError::WrongType {
                 service: "app-runtime",
                 ..
-            })
+            }))
         ));
     }
 
@@ -4213,10 +4223,10 @@ mod tests {
         }];
         assert!(matches!(
             prepare_app_runtime(&e, &svcs),
-            Err(LaunchError::WrongType {
+            Err(LaunchError::Plan(PlanError::WrongType {
                 service: "app-runtime",
                 ..
-            })
+            }))
         ));
         assert!(!tmp.path().join("elsewhere/org.example.App").exists());
     }
@@ -4536,10 +4546,10 @@ mod tests {
         assert!(argv.contains(&"/build/bubbler-wl-proxy".to_owned()));
         assert!(matches!(
             wl_proxy_argv(&e, &plan, 0, &FakeHost::default(), &mut dry(&e)),
-            Err(LaunchError::MissingResource {
+            Err(LaunchError::Plan(PlanError::MissingResource {
                 service: "wayland",
                 ..
-            })
+            }))
         ));
     }
 
@@ -4679,7 +4689,7 @@ mod tests {
         );
         assert!(matches!(
             start_pw_context(&e, &dir, &i, &host, &AtomicBool::new(false)),
-            Err(LaunchError::MissingResource { service: "pipewire", ref path })
+            Err(LaunchError::Plan(PlanError::MissingResource { service: "pipewire", ref path }))
                 if path == Path::new(pipewire::PW_CONTAINER)
         ));
         assert!(!pipewire::dir(&dir).exists(), "a context directory is left");
@@ -4706,7 +4716,7 @@ mod tests {
         );
         assert!(matches!(
             start_pw_pulse(&e, &dir, &i, &host, &AtomicBool::new(false)),
-            Err(LaunchError::MissingResource { service: "pulseaudio", ref path })
+            Err(LaunchError::Plan(PlanError::MissingResource { service: "pulseaudio", ref path }))
                 if path == Path::new(pipewire::PULSE_MODULE)
         ));
         assert!(
@@ -4899,11 +4909,11 @@ mod tests {
                 (&dir, pipewire::PULSE_ADOPTED),
                 rustix::process::getuid().as_raw(),
             ),
-            Err(LaunchError::WrongType {
+            Err(LaunchError::Plan(PlanError::WrongType {
                 service: "pulseaudio",
                 expected: "a directory",
                 ..
-            })
+            }))
         ));
         assert_eq!(
             std::fs::read(elsewhere.join(pipewire::PULSE_NATIVE))
@@ -5130,7 +5140,7 @@ mod tests {
         std::fs::create_dir_all(pipewire::pulse_dir(&dir)).unwrap();
         assert!(matches!(
             write_pulse_config(&e, &FakeHost::default(), &dir),
-            Err(LaunchError::MissingResource { service: "pulseaudio", ref path })
+            Err(LaunchError::Plan(PlanError::MissingResource { service: "pulseaudio", ref path }))
                 if path == Path::new("/usr/share/pipewire/pipewire-pulse.conf")
         ));
     }
@@ -5493,7 +5503,7 @@ mod tests {
                 explain_proxy(&e, &cfg).map(|_| ()),
             ] {
                 match got {
-                    Err(LaunchError::BadValue { service, reason }) => {
+                    Err(LaunchError::Plan(PlanError::BadValue { service, reason })) => {
                         assert_eq!(service, node);
                         assert_eq!(
                             reason,
@@ -5524,10 +5534,10 @@ mod tests {
                 assert!(
                     matches!(
                         got,
-                        Err(LaunchError::BadValue {
+                        Err(LaunchError::Plan(PlanError::BadValue {
                             service: "dbus",
                             ..
-                        })
+                        }))
                     ),
                     "{}: {got:?}",
                     path(&sneaky)
@@ -5704,10 +5714,10 @@ mod tests {
                 &FakeHost::default(),
                 &mut dry(&e),
             ),
-            Err(LaunchError::MissingResource {
+            Err(LaunchError::Plan(PlanError::MissingResource {
                 service: "dbus",
                 ..
-            })
+            }))
         ));
     }
 
@@ -5785,10 +5795,10 @@ mod tests {
                 dbus::SYSTEM_NODE,
                 own_uid()
             ),
-            Err(LaunchError::MissingResource {
+            Err(LaunchError::Plan(PlanError::MissingResource {
                 service: "system-bus",
                 ..
-            })
+            }))
         ));
     }
 
@@ -5800,21 +5810,21 @@ mod tests {
         std::fs::create_dir(dbus::socket_dir(dir)).unwrap();
         assert!(matches!(
             adopt_proxy_bus(dir, socket, dbus::SESSION_NODE, own_uid()),
-            Err(LaunchError::MissingResource {
+            Err(LaunchError::Plan(PlanError::MissingResource {
                 service: "dbus",
                 ..
-            })
+            }))
         ));
         // A symlink is the attack: `stat` through it would report the type
         // of its target, and bwrap would bind that target.
         std::os::unix::fs::symlink("/etc", dbus::proxy_bus_path(dir, socket)).unwrap();
         assert!(matches!(
             adopt_proxy_bus(dir, socket, dbus::SESSION_NODE, own_uid()),
-            Err(LaunchError::WrongType {
+            Err(LaunchError::Plan(PlanError::WrongType {
                 service: "dbus",
                 expected: "a socket",
                 ..
-            })
+            }))
         ));
         // Moved out of the proxy's reach first, so a refused run leaves
         // nothing of it behind either.
@@ -5829,11 +5839,11 @@ mod tests {
         std::fs::write(dbus::proxy_bus_path(dir, socket), b"").unwrap();
         assert!(matches!(
             adopt_proxy_bus(dir, socket, dbus::SESSION_NODE, own_uid()),
-            Err(LaunchError::WrongType {
+            Err(LaunchError::Plan(PlanError::WrongType {
                 service: "dbus",
                 expected: "a socket",
                 ..
-            })
+            }))
         ));
         assert!(!dbus::app_bus_path(dir, socket).exists());
         // A directory is refused like anything else, and removed with what
@@ -5843,11 +5853,11 @@ mod tests {
         std::fs::write(dbus::proxy_bus_path(dir, socket).join("x"), b"").unwrap();
         assert!(matches!(
             adopt_proxy_bus(dir, socket, dbus::SESSION_NODE, own_uid()),
-            Err(LaunchError::WrongType {
+            Err(LaunchError::Plan(PlanError::WrongType {
                 service: "dbus",
                 expected: "a socket",
                 ..
-            })
+            }))
         ));
         assert!(
             !dbus::app_bus_path(dir, socket).exists(),
@@ -5899,10 +5909,10 @@ mod tests {
 
             assert!(matches!(
                 adopt_proxy_bus(&dir, socket, dbus::SESSION_NODE, own_uid()),
-                Err(LaunchError::WrongType {
+                Err(LaunchError::Plan(PlanError::WrongType {
                     expected: "a socket",
                     ..
-                })
+                }))
             ));
 
             let app_bus = dbus::app_bus_path(&dir, socket);
@@ -6079,11 +6089,11 @@ mod tests {
         let _listener = UnixListener::bind(dbus::proxy_bus_path(dir, socket)).unwrap();
         assert!(matches!(
             adopt_proxy_bus(dir, socket, dbus::SESSION_NODE, own_uid() + 1),
-            Err(LaunchError::WrongType {
+            Err(LaunchError::Plan(PlanError::WrongType {
                 service: "dbus",
                 expected: "a socket owned by this user",
                 ..
-            })
+            }))
         ));
         assert!(!dbus::app_bus_path(dir, socket).exists());
     }
@@ -6100,11 +6110,11 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, dbus::socket_dir(&dir)).unwrap();
         assert!(matches!(
             adopt_proxy_bus(&dir, socket, dbus::SESSION_NODE, own_uid()),
-            Err(LaunchError::WrongType {
+            Err(LaunchError::Plan(PlanError::WrongType {
                 service: "dbus",
                 expected: "a directory",
                 ..
-            })
+            }))
         ));
         assert!(elsewhere.join(socket).exists());
     }

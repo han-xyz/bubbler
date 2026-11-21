@@ -6,14 +6,13 @@ use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use libseccomp::error::SeccompError;
 use libseccomp::{
     ScmpAction, ScmpArch, ScmpArgCompare, ScmpCompareOp, ScmpFilterContext, ScmpSyscall,
 };
 use rustix::fs::MemfdFlags;
 
 use crate::config::Userns;
-use crate::error::LaunchError;
+use crate::plan::plan_error::PlanError;
 
 pub use crate::config::seccomp::{
     DEFAULT_ENOSYS, DEFAULT_ENOSYS_NUMBERED, DEFAULT_EPERM, Errno, MOUNT_API, SeccompConfig,
@@ -200,7 +199,7 @@ struct Built {
 /// The rule set as one loadable BPF program for `--add-seccomp-fd`, or
 /// `None` when no rule went in. Everything not named is allowed, and
 /// `log` turns matches into audit log entries instead of errors.
-pub fn compile(set: &RuleSet, log: bool) -> Result<Option<Program>, LaunchError> {
+pub fn compile(set: &RuleSet, log: bool) -> Result<Option<Program>, PlanError> {
     let built = build(set, log)?;
     // A skipped name is a rule that is not in the filter, so it is
     // reported whatever the log switch says.
@@ -229,13 +228,14 @@ pub fn compile(set: &RuleSet, log: bool) -> Result<Option<Program>, LaunchError>
 // A syscall appears once even if both lists carry it: libseccomp refuses
 // a second action for the same number, and the first list `RuleSet` puts
 // it on decides.
-fn build(set: &RuleSet, log: bool) -> Result<Built, LaunchError> {
-    let mut filter = ScmpFilterContext::new(ScmpAction::Allow).map_err(failed)?;
+fn build(set: &RuleSet, log: bool) -> Result<Built, PlanError> {
+    let mut filter =
+        ScmpFilterContext::new(ScmpAction::Allow).map_err(PlanError::SeccompCompile)?;
     // A syscall from an ABI the filter does not carry cannot be matched
     // by number, so such a caller is killed rather than let through.
     filter
         .set_act_badarch(ScmpAction::KillProcess)
-        .map_err(failed)?;
+        .map_err(PlanError::SeccompCompile)?;
     let mut seen: BTreeSet<i32> = BTreeSet::new();
     // Before the architectures on purpose: `man 3 seccomp_arch_add` says
     // a rule added before an architecture does not reach it, and that is
@@ -251,13 +251,15 @@ fn build(set: &RuleSet, log: bool) -> Result<Built, LaunchError> {
         if !seen.insert(nr.into()) {
             continue;
         }
-        filter.add_rule(action(log, *errno), nr).map_err(failed)?;
+        filter
+            .add_rule(action(log, *errno), nr)
+            .map_err(PlanError::SeccompCompile)?;
     }
     // `man 3 seccomp_arch_add`: rules added after an architecture is
     // added reach every architecture in the filter, and rules added
     // before it do not. So the architectures come first.
     for arch in EXTRA_ARCHES {
-        filter.add_arch(*arch).map_err(failed)?;
+        filter.add_arch(*arch).map_err(PlanError::SeccompCompile)?;
     }
     let mut skipped = Vec::new();
     for (names, errno) in [(&set.eperm, Errno::Eperm), (&set.enosys, Errno::Enosys)] {
@@ -269,7 +271,9 @@ fn build(set: &RuleSet, log: bool) -> Result<Built, LaunchError> {
             if !seen.insert(nr.into()) {
                 continue;
             }
-            filter.add_rule(action(log, errno), nr).map_err(failed)?;
+            filter
+                .add_rule(action(log, errno), nr)
+                .map_err(PlanError::SeccompCompile)?;
         }
     }
     let mut rules = seen.len();
@@ -291,7 +295,7 @@ fn build(set: &RuleSet, log: bool) -> Result<Built, LaunchError> {
             );
             filter
                 .add_rule_conditional(action(log, Errno::Eperm), ioctl, &[cmp])
-                .map_err(failed)?;
+                .map_err(PlanError::SeccompCompile)?;
             rules += 1;
         }
     }
@@ -314,11 +318,11 @@ fn action(log: bool, errno: Errno) -> ScmpAction {
 // libseccomp writes cBPF to a file descriptor, so it goes through a memfd
 // rather than a temporary file; `export_bpf_mem` would do it in one call
 // but needs libseccomp 2.6.
-fn export(filter: &ScmpFilterContext) -> Result<Vec<u8>, LaunchError> {
-    let io = |e: std::io::Error| LaunchError::Seccomp(format!("exporting the filter: {e}"));
+fn export(filter: &ScmpFilterContext) -> Result<Vec<u8>, PlanError> {
+    let io = PlanError::SeccompExport;
     let fd = rustix::fs::memfd_create("bubbler-seccomp", MemfdFlags::CLOEXEC)
         .map_err(|e| io(e.into()))?;
-    filter.export_bpf(&fd).map_err(failed)?;
+    filter.export_bpf(&fd).map_err(PlanError::SeccompCompile)?;
     let mut file = std::fs::File::from(fd);
     file.seek(SeekFrom::Start(0)).map_err(io)?;
     let mut bytes = Vec::new();
@@ -392,10 +396,6 @@ pub(crate) fn personality_prefix(log: bool) -> Vec<u8> {
         insn(BPF_RET_K, 0, 0, deny),                   // 14
     ];
     block.concat()
-}
-
-fn failed(e: SeccompError) -> LaunchError {
-    LaunchError::Seccomp(e.to_string())
 }
 
 #[cfg(test)]

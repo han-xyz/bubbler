@@ -11,6 +11,7 @@ pub mod init_bin;
 pub mod lint;
 pub mod network;
 pub mod pipewire;
+pub mod plan_error;
 pub mod seccomp;
 pub mod service;
 pub mod tty;

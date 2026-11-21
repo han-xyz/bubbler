@@ -18,8 +18,8 @@ use rustix::event::{PollFd, PollFlags, poll};
 use rustix::fs::{Mode, OFlags};
 use rustix::pipe::PipeFlags;
 
-use crate::error::LaunchError;
 pub use crate::paths::{LOG_FILE, log_path as path};
+use crate::run::launch_error::LaunchError;
 
 /// Most the log ever holds, the note below included. A cap and not a
 /// rotation: what a run said last is what a user is looking for, and one

@@ -13,7 +13,7 @@ use std::path::Path;
 /// `(from, to, first occurrence)`; an entry matches on `from` and `to`.
 type Entry = (&'static str, &'static str, &'static str);
 
-const DEBT: &[Entry] = &[("error", "wayland_context", "model/error.rs:368")];
+const DEBT: &[Entry] = &[];
 
 const TEST_DEBT: &[Entry] = &[
     ("bwrap", "launcher", "plan/bwrap.rs:1167"),
@@ -28,7 +28,7 @@ const TEST_DEBT: &[Entry] = &[
     ("profile", "network", "model/profile.rs:2019"),
     ("profile", "service", "model/profile.rs:3106"),
     ("profile", "version", "model/profile.rs:3148"),
-    ("service", "launcher", "plan/service.rs:1461"),
+    ("service", "launcher", "plan/service.rs:1452"),
 ];
 
 const LAYERS: [&str; 3] = ["model", "plan", "run"];

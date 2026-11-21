@@ -14,9 +14,9 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 
 use crate::env::Env;
-use crate::error::LaunchError;
 use crate::host::Host;
 use crate::init_bin::{self, Found};
+use crate::plan::plan_error::PlanError;
 
 pub use crate::config::network::{
     AllowHost, AllowOut, Cgroup, Cidr, Forward, HostPattern, Mode, NetworkConfig, Outbound,
@@ -54,7 +54,7 @@ pub const NET_PROXY_INSTALLED: &str = "/usr/lib/bubbler/bubbler-net-proxy";
 /// The [`Found`] half is what says whether the binary has to be bound
 /// into the sandbox's mount namespace, which the proxy joins before it
 /// execs.
-pub fn net_proxy_program(env: &Env, host: &dyn Host) -> Result<(PathBuf, Found), LaunchError> {
+pub fn net_proxy_program(env: &Env, host: &dyn Host) -> Result<(PathBuf, Found), PlanError> {
     init_bin::locate_binary(
         env.net_proxy_override.as_deref(),
         NET_PROXY_NAME,
@@ -1045,7 +1045,7 @@ mod tests {
         );
         assert!(matches!(
             net_proxy_program(&proxy_env_for(Some("/build/adir".into())), &host),
-            Err(LaunchError::WrongType {
+            Err(PlanError::WrongType {
                 service: "network",
                 expected: "a regular file",
                 ..
@@ -1053,7 +1053,7 @@ mod tests {
         ));
         assert!(matches!(
             net_proxy_program(&proxy_env_for(Some("/build/gone".into())), &host),
-            Err(LaunchError::MissingResource {
+            Err(PlanError::MissingResource {
                 service: "network",
                 ..
             })
@@ -1073,7 +1073,7 @@ mod tests {
         );
         assert!(matches!(
             net_proxy_program(&proxy_env_for(None), &crate::host::fake::FakeHost::default()),
-            Err(LaunchError::MissingResource { service: "network", path })
+            Err(PlanError::MissingResource { service: "network", path })
                 if path == std::path::Path::new(NET_PROXY_INSTALLED)
         ));
     }

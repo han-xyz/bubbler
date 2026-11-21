@@ -7,8 +7,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::env::Env;
-use crate::error::LaunchError;
 use crate::host::Host;
+use crate::plan::plan_error::PlanError;
 use crate::service;
 
 pub use crate::names::INIT_BIN as NAME;
@@ -45,7 +45,7 @@ pub fn locate_binary(
     installed: &str,
     service: &'static str,
     host: &dyn Host,
-) -> Result<(PathBuf, Found), LaunchError> {
+) -> Result<(PathBuf, Found), PlanError> {
     if let Some(p) = over {
         let path = service::require_file(host, service, p.to_path_buf())?;
         return Ok((path, Found::Override));
@@ -65,7 +65,7 @@ pub fn locate_binary(
 /// else next to the running executable, else [`INSTALLED`]. Where it was
 /// found does not matter here — the supervisor is bound into every
 /// sandbox at [`crate::bwrap::INIT_INSIDE`] wherever it came from.
-pub fn locate(env: &Env, host: &dyn Host) -> Result<PathBuf, LaunchError> {
+pub fn locate(env: &Env, host: &dyn Host) -> Result<PathBuf, PlanError> {
     locate_binary(env.init_override.as_deref(), NAME, INSTALLED, "init", host).map(|(p, _)| p)
 }
 
@@ -121,7 +121,7 @@ mod tests {
         );
         assert!(matches!(
             locate(&env(Some("/opt/adir".into())), &host),
-            Err(LaunchError::WrongType {
+            Err(PlanError::WrongType {
                 service: "init",
                 expected: "a regular file",
                 ..
@@ -129,7 +129,7 @@ mod tests {
         ));
         assert!(matches!(
             locate(&env(Some("/opt/gone".into())), &host),
-            Err(LaunchError::MissingResource {
+            Err(PlanError::MissingResource {
                 service: "init",
                 ..
             })
@@ -143,7 +143,7 @@ mod tests {
         assert_eq!(locate(&env(None), &host).unwrap(), PathBuf::from(INSTALLED));
         assert!(matches!(
             locate(&env(None), &FakeHost::default()),
-            Err(LaunchError::MissingResource { service: "init", path }) if path == Path::new(INSTALLED)
+            Err(PlanError::MissingResource { service: "init", path }) if path == Path::new(INSTALLED)
         ));
     }
 

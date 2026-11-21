@@ -8,8 +8,8 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::{Component, Path, PathBuf};
 
 use crate::bwrap::BwrapArgs;
-use crate::error::LaunchError;
 use crate::host::Host;
+use crate::plan::plan_error::PlanError;
 
 use super::require_dir;
 
@@ -20,14 +20,14 @@ const DRM_CLASS: &str = "/sys/class/drm";
 /// GPU access: the render node of every GPU the host has, plus each GPU's own
 /// `/sys/devices` directory and whichever NVIDIA nodes are there. `kms` adds
 /// the primary (`card*`) nodes and leaves the sysfs behind them readable.
-pub(super) fn dri(args: &mut BwrapArgs, host: &dyn Host, kms: bool) -> Result<(), LaunchError> {
+pub(super) fn dri(args: &mut BwrapArgs, host: &dyn Host, kms: bool) -> Result<(), PlanError> {
     let dev = require_dir(host, "dri", PathBuf::from(DRI_DEV))?;
     // udev's `by-path` links are the only discovery path: a node's name says
     // nothing about which kind it is.
     let by_path = dev.join("by-path");
     let (render, card) = dri_nodes(host, &by_path);
     if render.is_empty() {
-        return Err(LaunchError::MissingResource {
+        return Err(PlanError::MissingResource {
             service: "dri",
             path: by_path,
         });
@@ -129,12 +129,12 @@ fn dri_sysfs(
     host: &dyn Host,
     name: &OsStr,
     kms: bool,
-) -> Result<(), LaunchError> {
+) -> Result<(), PlanError> {
     let class = Path::new(DRM_CLASS).join(name);
     let link = class.join("device");
     let devices = Path::new("/sys/devices");
     let Some(dir) = host.canonicalize(&link) else {
-        return Err(LaunchError::MissingResource {
+        return Err(PlanError::MissingResource {
             service: "dri",
             path: link,
         });
@@ -142,7 +142,7 @@ fn dri_sysfs(
     // Every GPU's directory is under `/sys/devices`, and one that resolves
     // elsewhere is a tree this grant knows nothing about.
     let Ok(rel) = dir.strip_prefix(devices) else {
-        return Err(LaunchError::BadValue {
+        return Err(PlanError::BadValue {
             service: "dri",
             reason: format!(
                 "`{}` resolves to `{}`, outside /sys/devices",
@@ -426,7 +426,7 @@ mod tests {
             .collect();
         assert!(matches!(
             argv_linked(&[Service::Dri { kms: false }], &env(), &host, &links),
-            Err(LaunchError::MissingResource { service: "dri", path })
+            Err(PlanError::MissingResource { service: "dri", path })
                 if path == Path::new("/dev/dri/by-path")
         ));
     }
@@ -447,7 +447,7 @@ mod tests {
             &links,
         );
         assert!(
-            matches!(&r, Err(LaunchError::BadValue { service: "dri", reason })
+            matches!(&r, Err(PlanError::BadValue { service: "dri", reason })
                 if reason.contains("/sys/devices")),
             "{r:?}"
         );
@@ -537,7 +537,7 @@ mod tests {
                 &env(),
                 &[("/dev/dri", File)]
             ),
-            Err(LaunchError::WrongType {
+            Err(PlanError::WrongType {
                 service: "dri",
                 expected: "a directory",
                 ..
