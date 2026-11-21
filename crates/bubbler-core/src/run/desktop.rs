@@ -556,10 +556,10 @@ mod tests {
     use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
 
-    const KITTY: &str = include_str!("../fixtures/kitty.desktop");
-    const FIREFOX: &str = include_str!("../fixtures/firefox.desktop");
-    const KEEPASSXC: &str = include_str!("../fixtures/org.keepassxc.KeePassXC.desktop");
-    const STEAM: &str = include_str!("../fixtures/steam.desktop");
+    const KITTY: &str = include_str!("../../fixtures/kitty.desktop");
+    const FIREFOX: &str = include_str!("../../fixtures/firefox.desktop");
+    const KEEPASSXC: &str = include_str!("../../fixtures/org.keepassxc.KeePassXC.desktop");
+    const STEAM: &str = include_str!("../../fixtures/steam.desktop");
 
     /// The whole generated entry for the smallest real vendor file, so
     /// what is copied and what is changed is one comparison.

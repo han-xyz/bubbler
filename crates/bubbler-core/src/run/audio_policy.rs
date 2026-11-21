@@ -22,7 +22,7 @@ use crate::host::Host;
 /// The drop-in, exactly as shipped in `contrib/`. Loaded by the
 /// real-PipeWire test bed and printed verbatim by `bubbler audio-policy
 /// --print`.
-pub const DROP_IN: &str = include_str!("../../../contrib/wireplumber/50-bubbler.conf");
+pub const DROP_IN: &str = include_str!("../../../../contrib/wireplumber/50-bubbler.conf");
 
 /// File name WirePlumber loads the drop-in under, in any of
 /// [`install_dirs`].
@@ -34,7 +34,7 @@ pub const DROP_IN_NAME: &str = "50-bubbler.conf";
 /// keeps a sandbox off the sink's monitor ports and off another
 /// client's stream is this script rather than a rule.
 pub const HOOK: &str =
-    include_str!("../../../contrib/wireplumber/scripts/bubbler/refuse-links.lua");
+    include_str!("../../../../contrib/wireplumber/scripts/bubbler/refuse-links.lua");
 
 /// Path WirePlumber loads the hook under, relative to one of
 /// [`hook_dirs`]; the name the drop-in's `wireplumber.components` gives

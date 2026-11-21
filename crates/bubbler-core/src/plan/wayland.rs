@@ -48,7 +48,7 @@ pub const PROXY_BIN: &str = "/usr/lib/bubbler/bubbler-wl-proxy";
 // The proxy's own file rather than a copy kept in step by hand: a name
 // in one list and not the other would be a global core calls hidden and
 // the proxy forwards.
-include!("../../bubbler-wl-proxy/src/privileged.rs");
+include!("../../../bubbler-wl-proxy/src/privileged.rs");
 
 /// Host path of the proxy binary and where it was found:
 /// [`Env::wl_proxy_override`] (`$BUBBLER_WL_PROXY`), else next to the
