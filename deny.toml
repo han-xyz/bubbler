@@ -80,8 +80,9 @@ multiple-versions = "warn"
 # A "*" requirement means "whatever crates.io had that day", which
 # defeats the committed lockfile on every `cargo update`.
 wildcards = "deny"
-# Does not exempt the workspace's own path deps: they are publishable,
-# so they carry a `version` key instead.
+# Exempts the workspace's own path deps: every crate here is
+# `publish = false`. They still carry a `version` key, which
+# scripts/release bumps.
 allow-wildcard-paths = true
 highlight = "all"
 workspace-default-features = "allow"

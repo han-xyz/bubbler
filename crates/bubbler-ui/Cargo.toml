@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 description = "terminal editor for bubbler instances: what a grant costs, next to the toggle"
 
 [[bin]]

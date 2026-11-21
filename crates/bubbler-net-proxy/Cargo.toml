@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 description = "CONNECT-only egress proxy for bubbler sandboxes: the one process a name-filtered network namespace lets out"
 
 [lib]

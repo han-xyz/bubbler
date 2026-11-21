@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 description = "Library core of bubbler: config model, services, bwrap argument builder, launcher"
 
 [dependencies]
