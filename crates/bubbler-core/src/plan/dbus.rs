@@ -12,18 +12,12 @@ use crate::dbus_wire::{Session, Value, WireError};
 use crate::env::Env;
 use crate::error::LaunchError;
 use crate::host::Host;
-use crate::launcher::RUNTIME_SUBDIR;
+use crate::paths::RUNTIME_SUBDIR;
 
 pub(crate) use crate::config::dbus::grant_policies;
 pub use crate::config::dbus::{app_id, app_id_twin, is_valid_app_id};
 pub use crate::names::PROXY_BIN;
-
-/// File name of the session bus socket, in the proxy's directory and in
-/// the instance's after the launcher moves it.
-pub const SESSION_SOCKET: &str = "bus";
-
-/// File name of the system bus socket, in the same two directories.
-pub const SYSTEM_SOCKET: &str = "system";
+pub use crate::paths::{SESSION_SOCKET, SYSTEM_SOCKET, app_bus_path, proxy_bus_path, socket_dir};
 
 /// Config node that grants the session bus, for errors about its socket.
 pub const SESSION_NODE: &str = "dbus";
@@ -368,27 +362,6 @@ pub fn flatpak_instance_dir(env: &Env, instance: &str) -> PathBuf {
     env.runtime_dir
         .join(FLATPAK_DIR)
         .join(flatpak_instance_id(instance))
-}
-
-/// The only directory the proxy sandbox may write to. The instance
-/// directory above it is never handed to the proxy: it holds the control
-/// socket, and reaching that socket means running commands in the app.
-pub fn socket_dir(instance_runtime: &Path) -> PathBuf {
-    instance_runtime.join("dbus")
-}
-
-/// Where the proxy creates one filtered socket, in [`socket_dir`]: the
-/// one path the proxy sandbox can write to. `socket` is [`SESSION_SOCKET`],
-/// [`SYSTEM_SOCKET`] or [`A11Y_SOCKET`].
-pub fn proxy_bus_path(instance_runtime: &Path, socket: &str) -> PathBuf {
-    socket_dir(instance_runtime).join(socket)
-}
-
-/// Where a sandbox's bus bind comes from: the socket after the launcher
-/// has checked it and moved it out of [`socket_dir`]. The proxy cannot
-/// reach this path, so nothing can be swapped for it once it is there.
-pub fn app_bus_path(instance_runtime: &Path, socket: &str) -> PathBuf {
-    instance_runtime.join(socket)
 }
 
 /// Host session bus socket: the `unix:path=` of `$DBUS_SESSION_BUS_ADDRESS`

@@ -3200,6 +3200,7 @@ mod tests {
                 rules: &[],
                 wl_proxy: None,
                 audio_policy: "",
+                own_cgroup: None,
                 net_proxy_log: false,
                 seccomp_log: false,
                 proxy: false,

@@ -12,7 +12,7 @@ use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -22,24 +22,14 @@ use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::io::Errno;
 use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType, socket_with};
 use rustix::pipe::PipeFlags;
+use signal_hook::SigId;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 
 use crate::env::Env;
 use crate::error::LaunchError;
-use crate::launcher::{SignalGuard, exit_code};
 use crate::tty::{self, RawGuard, RelayEnd, StdioPlan, StdioTarget};
 
-/// Name of the control socket inside an instance's runtime directory.
-pub const SOCKET_NAME: &str = "init.sock";
-
-/// `$XDG_RUNTIME_DIR/bubbler/<name>/init.sock`. `name` is an instance
-/// name the caller has already validated.
-pub fn socket_path(env: &Env, name: &str) -> PathBuf {
-    env.runtime_dir
-        .join(crate::launcher::RUNTIME_SUBDIR)
-        .join(name)
-        .join(SOCKET_NAME)
-}
+pub use crate::paths::{SOCKET_NAME, socket_path};
 
 /// Connect to a live instance. `Ok(None)` when nothing listens. A refused
 /// socket is left over from a dead run and is left where it is: only a
@@ -349,11 +339,35 @@ pub(crate) fn close_for_good(listener: std::os::unix::net::UnixListener) {
         .expect("shutdown fails only on a descriptor that is not a socket");
 }
 
+/// Process exit code to propagate: the child's code, or `128 + signal`.
+pub fn exit_code(status: ExitStatus) -> i32 {
+    if let Some(c) = status.code() {
+        c
+    } else if let Some(sig) = status.signal() {
+        128 + sig
+    } else {
+        1
+    }
+}
+
+/// Unregisters this run's signal actions when it leaves; `signal-hook`'s handler stays, so the
+/// signals stay caught and ignored until the next run.
+pub(crate) struct SignalGuard(pub(crate) Vec<SigId>);
+
+impl Drop for SignalGuard {
+    fn drop(&mut self) {
+        for id in self.0.drain(..) {
+            // `false` only means the handler was already removed.
+            let _ = signal_hook::low_level::unregister(id);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
     fn env(runtime_dir: &Path) -> Env {
@@ -394,6 +408,13 @@ mod tests {
         let dir = runtime_dir.join("bubbler").join(name);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn exit_code_from_status() {
+        assert_eq!(exit_code(ExitStatus::from_raw(0)), 0);
+        assert_eq!(exit_code(ExitStatus::from_raw(3 << 8)), 3);
+        assert_eq!(exit_code(ExitStatus::from_raw(9)), 137);
     }
 
     #[test]

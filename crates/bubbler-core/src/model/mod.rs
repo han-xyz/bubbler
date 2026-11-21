@@ -6,5 +6,6 @@ pub mod error;
 pub mod json;
 pub mod kdl_out;
 pub mod names;
+pub mod paths;
 pub mod profile;
 pub mod safe_text;

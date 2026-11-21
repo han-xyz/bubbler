@@ -14,7 +14,7 @@ use crate::error::{InstanceError, ReadError};
 use crate::fsutil;
 use crate::kdl_out;
 use crate::profile::{self, PROFILE_HEADER};
-use crate::{dbus, exec, host, launcher};
+use crate::{dbus, exec, launcher, proc};
 
 pub use crate::catalogue::BARE_GRANTS as GRANTS;
 pub use crate::checks::APP_ID_SHARED_CHECK;
@@ -417,7 +417,7 @@ fn sweep_dir(dir: &Path, prefix: &str) {
         else {
             continue;
         };
-        if host::pid_alive(pid) {
+        if proc::pid_alive(pid) {
             continue;
         }
         // A file that is not a start lock is nothing a try made, so the

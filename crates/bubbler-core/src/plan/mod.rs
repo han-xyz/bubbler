@@ -1,4 +1,5 @@
 pub mod bwrap;
+pub mod cgroup_text;
 pub mod dbus;
 pub mod explain;
 pub mod host;

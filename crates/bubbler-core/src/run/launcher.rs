@@ -14,7 +14,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -33,7 +33,6 @@ use rustix::thread::{
     clear_ambient_capability_set, configure_capability_in_ambient_set, move_into_link_name_space,
     set_capabilities, set_capabilities_secure_bits, set_no_new_privs,
 };
-use signal_hook::SigId;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 
 use bubbler_init::fds;
@@ -42,12 +41,16 @@ use crate::bwrap::{Argv, BwrapArgs, Explained, FdAllocator, Origin};
 use crate::config::{EtcMode, NetworkConfig, Service, Userns, WaylandMode};
 use crate::env::Env;
 use crate::error::{ConfigError, LaunchError};
+use crate::exec::SignalGuard;
+pub use crate::exec::exit_code;
 use crate::host::{Host, RealHost};
 use crate::instance::Instance;
+pub use crate::paths::{RUNTIME_SUBDIR, instance_runtime_dir};
+pub(crate) use crate::paths::{START_LOCK_SUFFIX, start_lock_path};
 use crate::tty::{self, Pty, RawGuard, RelayEnd, StdioTarget, TtyMode};
 use crate::wayland::{ProxyPlan, WaylandError};
 use crate::{
-    cgroup, dbus, exec, host, init_bin, network, pipewire, run_log, seccomp, service, version,
+    cgroup, dbus, exec, init_bin, network, pipewire, proc, run_log, seccomp, service, version,
     wayland,
 };
 
@@ -2301,16 +2304,6 @@ fn clear_socket_name(inst: &OwnedFd, dir: &Path, socket: &str) -> rustix::io::Re
     }
 }
 
-/// The one directory bubbler owns under `$XDG_RUNTIME_DIR`, holding every instance's runtime
-/// state; a host bus address resolving into it is refused.
-pub const RUNTIME_SUBDIR: &str = "bubbler";
-
-/// `$XDG_RUNTIME_DIR/bubbler/<name>`: an instance's runtime state on the
-/// host. `name` is an instance name the caller has already validated.
-pub fn instance_runtime_dir(env: &Env, name: &str) -> PathBuf {
-    env.runtime_dir.join(RUNTIME_SUBDIR).join(name)
-}
-
 // An existing directory is reused as is: only the user can create under `$XDG_RUNTIME_DIR`.
 fn mkdir_private(dir: &Path) -> Result<(), LaunchError> {
     match rustix::fs::mkdir(dir, Mode::RWXU) {
@@ -2566,17 +2559,6 @@ fn open_dir_nofollow<P: rustix::path::Arg>(
     })
 }
 
-/// Process exit code to propagate: the child's code, or `128 + signal`.
-pub fn exit_code(status: ExitStatus) -> i32 {
-    if let Some(c) = status.code() {
-        c
-    } else if let Some(sig) = status.signal() {
-        128 + sig
-    } else {
-        1
-    }
-}
-
 // Scanned rather than parsed: bwrap adds members over time and only this one matters.
 fn parse_child_pid(buf: &[u8]) -> Option<i32> {
     const KEY: &[u8] = b"\"child-pid\"";
@@ -2726,7 +2708,7 @@ fn sweep_identity(dir: &Path) {
     };
     let gone = parse_child_pid(&info)
         .and_then(Pid::from_raw)
-        .is_some_and(|pid| !host::pid_alive(pid));
+        .is_some_and(|pid| !proc::pid_alive(pid));
     if gone {
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2771,19 +2753,6 @@ fn publish_identity(env: &Env, instance: &str, info: Option<&[u8]>) -> Option<Fl
 fn release_block(alloc: &mut RealAlloc) {
     if let Some(fd) = alloc.block_write.take() {
         let _ = rustix::io::write(&fd, b"\n");
-    }
-}
-
-/// Unregisters this run's signal actions when it leaves; `signal-hook`'s handler stays, so the
-/// signals stay caught and ignored until the next run.
-pub(crate) struct SignalGuard(pub(crate) Vec<SigId>);
-
-impl Drop for SignalGuard {
-    fn drop(&mut self) {
-        for id in self.0.drain(..) {
-            // `false` only means the handler was already removed.
-            let _ = signal_hook::low_level::unregister(id);
-        }
     }
 }
 
@@ -3006,19 +2975,7 @@ fn start_run(
 // What the command gives when the forwarded SIGTERM stops it.
 const STOPPED_CODE: i32 = 128 + SIGTERM;
 
-/// `@` is no character of an instance name, so the lock file is no instance's runtime directory.
-pub(crate) const START_LOCK_SUFFIX: &str = "@start.lock";
-
 const START_LOCK_POLL: Duration = Duration::from_millis(50);
-
-/// The lock a start holds from its liveness check through its bind, beside the runtime
-/// directory so removing that leaves it. Only a throwaway sandbox removes its own: a lock on an
-/// unlinked file is one nobody else sees.
-pub(crate) fn start_lock_path(env: &Env, name: &str) -> PathBuf {
-    env.runtime_dir
-        .join(RUNTIME_SUBDIR)
-        .join(format!("{name}{START_LOCK_SUFFIX}"))
-}
 
 // Follows no link, and no FIFO can park the open.
 fn open_start_lock(path: &Path) -> Result<OwnedFd, LaunchError> {
@@ -3764,6 +3721,7 @@ mod tests {
                 rules: &[],
                 wl_proxy: None,
                 audio_policy: "",
+                own_cgroup: None,
                 net_proxy_log: false,
                 seccomp_log: false,
                 proxy: false,
@@ -3865,6 +3823,7 @@ mod tests {
                 rules: &[],
                 wl_proxy: None,
                 audio_policy: "",
+                own_cgroup: None,
                 net_proxy_log: false,
                 seccomp_log: false,
                 proxy: false,
@@ -6390,13 +6349,6 @@ mod tests {
     fn only_a_process_running_the_supervisor_is_signalled() {
         let me = Pid::from_raw(std::process::id() as i32).expect("a live pid");
         assert!(!is_supervisor(me), "this test binary is not the supervisor");
-    }
-
-    #[test]
-    fn exit_code_from_status() {
-        assert_eq!(exit_code(ExitStatus::from_raw(0)), 0);
-        assert_eq!(exit_code(ExitStatus::from_raw(3 << 8)), 3);
-        assert_eq!(exit_code(ExitStatus::from_raw(9)), 137);
     }
 
     #[test]

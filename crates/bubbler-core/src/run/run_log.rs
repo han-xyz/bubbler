@@ -10,7 +10,7 @@
 
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::time::Duration;
 
@@ -19,9 +19,7 @@ use rustix::fs::{Mode, OFlags};
 use rustix::pipe::PipeFlags;
 
 use crate::error::LaunchError;
-
-/// Name of the log inside the instance directory.
-pub const LOG_FILE: &str = "last-run.log";
+pub use crate::paths::{LOG_FILE, log_path as path};
 
 /// Most the log ever holds, the note below included. A cap and not a
 /// rotation: what a run said last is what a user is looking for, and one
@@ -46,11 +44,6 @@ const STOPPED: &str = "\nbubbler: writing the log failed; the record of this run
 // the way out. A process that outlived the run still holds the pipe open,
 // and giving up costs the last few lines, never the exit.
 const FLUSH: Duration = Duration::from_secs(1);
-
-/// The log of the instance whose directory is `dir`.
-pub fn path(dir: &Path) -> PathBuf {
-    dir.join(LOG_FILE)
-}
 
 /// The log's contents, or `None` when the instance has never been started
 /// without a terminal. Read without following a symlink: the file is

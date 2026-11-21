@@ -10,7 +10,7 @@ use std::path::Path;
 use unicode_width::UnicodeWidthStr;
 
 use crate::bwrap::{Explained, Origin};
-use crate::cgroup;
+use crate::cgroup_text;
 use crate::config::{
     AudioSet, InstanceConfig, Lines, SeccompConfig, Service, WaylandMode, X11Mode,
 };
@@ -96,6 +96,10 @@ pub struct View<'a> {
     /// [`crate::audio_policy::explain_suffix`], asked by the caller as `bwrap` below is: an
     /// explanation describes a run and does not probe the host itself.
     pub audio_policy: &'a str,
+    /// bubbler's own cgroup, as [`crate::cgroup::own_path`] reads it, which an `allow-host`
+    /// ruleset's placeholder cgroup is named under; `None` where the host will not answer.
+    /// Asked by the caller for the same reason as `audio_policy`.
+    pub own_cgroup: Option<&'a str>,
     /// The sidecar's argv rather than the sandbox's: its groups are the
     /// rules themselves, and a grant that contributes neither an argument
     /// nor a rule to it is not a group of it.
@@ -337,10 +341,10 @@ fn under(lead: &str, items: Vec<String>) -> Vec<String> {
 
 // The outbound ruleset, exactly as `nft -f -` is fed it. The nesting is kept, with each tab
 // widened to four columns so a terminal shows what the file holds.
-fn ruleset_lines(cfg: &NetworkConfig, instance: &str) -> Vec<String> {
+fn ruleset_lines(cfg: &NetworkConfig, instance: &str, own_cgroup: Option<&str>) -> Vec<String> {
     let cgroup = match cfg.allow_hosts.is_empty() {
         true => None,
-        false => placeholder_cgroup(instance),
+        false => placeholder_cgroup(own_cgroup, instance),
     };
     let Some(text) = network::ruleset(cfg, cgroup.as_ref()) else {
         return Vec::new();
@@ -353,9 +357,9 @@ fn ruleset_lines(cfg: &NetworkConfig, instance: &str) -> Vec<String> {
 
 // bubbler's own cgroup is read where it can be, since that is what decides the `level` the rule
 // matches at; a host that will not answer gets a placeholder there.
-fn placeholder_cgroup(instance: &str) -> Option<network::Cgroup> {
-    let own = cgroup::own_path().unwrap_or_else(|_| "<own-cgroup>".to_owned());
-    network::Cgroup::new(&cgroup::placeholder(&own, instance)).ok()
+fn placeholder_cgroup(own: Option<&str>, instance: &str) -> Option<network::Cgroup> {
+    let own = own.unwrap_or("<own-cgroup>");
+    network::Cgroup::new(&cgroup_text::placeholder(own, instance)).ok()
 }
 
 // The descriptor the egress proxy reports readiness on is only known once the run has made the
@@ -615,7 +619,7 @@ pub fn render(items: &[Explained], view: &View) -> Result<Vec<String>, ConfigErr
                     Some(Service::Network(cfg)) if cfg.is_isolated() => {
                         out.push(sidecar_line(cfg));
                         out.extend(net_proxy_line(cfg, view.net_proxy_log));
-                        out.extend(ruleset_lines(cfg, view.instance));
+                        out.extend(ruleset_lines(cfg, view.instance, view.own_cgroup));
                     }
                     // No probe is run for an explanation, so the sidecar line below is what a run
                     // gets on a compositor that implements the protocol.
@@ -843,6 +847,7 @@ mod tests {
                 rules: &rules,
                 wl_proxy: None,
                 audio_policy: "",
+                own_cgroup: None,
                 net_proxy_log: false,
                 seccomp_log: false,
                 proxy: false,
@@ -955,6 +960,7 @@ bwrap
                 rules: &[],
                 wl_proxy: None,
                 audio_policy: "",
+                own_cgroup: None,
                 net_proxy_log: false,
                 seccomp_log: false,
                 proxy: false,
@@ -1003,6 +1009,7 @@ bwrap
                 rules: &[],
                 wl_proxy: None,
                 audio_policy: "",
+                own_cgroup: None,
                 net_proxy_log: false,
                 seccomp_log: false,
                 proxy: false,
@@ -1056,6 +1063,7 @@ bwrap
                     rules: &[],
                     wl_proxy: Some(&plan),
                     audio_policy: "",
+                    own_cgroup: None,
                     net_proxy_log: false,
                     seccomp_log: false,
                     proxy: false,
@@ -1107,6 +1115,7 @@ bwrap
                     rules: &[],
                     wl_proxy: None,
                     audio_policy: "",
+                    own_cgroup: None,
                     net_proxy_log: false,
                     seccomp_log: false,
                     proxy: false,
@@ -1172,6 +1181,7 @@ bwrap
                 rules: &[],
                 wl_proxy: None,
                 audio_policy: "",
+                own_cgroup: None,
                 net_proxy_log: false,
                 seccomp_log: false,
                 proxy: false,
@@ -1237,6 +1247,7 @@ bwrap
                     rules: &[],
                     wl_proxy: None,
                     audio_policy: suffix,
+                    own_cgroup: None,
                     net_proxy_log: false,
                     seccomp_log: false,
                     proxy: false,
@@ -1289,6 +1300,7 @@ bwrap
                     rules: &[],
                     wl_proxy: None,
                     audio_policy: "",
+                    own_cgroup: None,
                     net_proxy_log: false,
                     seccomp_log: false,
                     proxy: false,
@@ -1341,6 +1353,7 @@ bwrap
                 rules: &[],
                 wl_proxy: None,
                 audio_policy: "",
+                own_cgroup: None,
                 net_proxy_log: false,
                 seccomp_log: false,
                 proxy: false,
@@ -1382,6 +1395,7 @@ bwrap
                     rules: &[],
                     wl_proxy: None,
                     audio_policy: "",
+                    own_cgroup: None,
                     net_proxy_log: false,
                     seccomp_log: false,
                     proxy: false,
@@ -1485,6 +1499,7 @@ bwrap
                 rules: &rules,
                 wl_proxy: None,
                 audio_policy: "",
+                own_cgroup: None,
                 net_proxy_log: false,
                 seccomp_log: false,
                 proxy: false,
@@ -1536,6 +1551,7 @@ bwrap
             rules: &[],
             wl_proxy: None,
             audio_policy: "",
+            own_cgroup: None,
             net_proxy_log: false,
             seccomp_log: false,
             proxy: false,
@@ -1582,6 +1598,7 @@ bwrap
                     rules: &bare_rules,
                     wl_proxy: None,
                     audio_policy: "",
+                    own_cgroup: None,
                     net_proxy_log: false,
                     seccomp_log: false,
                     proxy: false,
@@ -1622,6 +1639,7 @@ bwrap
                 rules: &node_rules,
                 wl_proxy: None,
                 audio_policy: "",
+                own_cgroup: None,
                 net_proxy_log: false,
                 seccomp_log: false,
                 proxy: false,
@@ -1652,6 +1670,7 @@ bwrap
                 rules: &[],
                 wl_proxy: None,
                 audio_policy: "",
+                own_cgroup: None,
                 net_proxy_log: false,
                 seccomp_log: false,
                 proxy: false,
@@ -1700,6 +1719,7 @@ bwrap
                 rules: &[],
                 wl_proxy: None,
                 audio_policy: "",
+                own_cgroup: None,
                 net_proxy_log: false,
                 seccomp_log: false,
                 proxy: false,
@@ -1747,6 +1767,7 @@ bwrap
             rules: &rules,
             wl_proxy: None,
             audio_policy: "",
+            own_cgroup: None,
             net_proxy_log: false,
             seccomp_log: false,
             proxy: true,
@@ -1784,6 +1805,7 @@ bwrap
                 rules: &[],
                 wl_proxy: None,
                 audio_policy: "",
+                own_cgroup: None,
                 net_proxy_log: false,
                 seccomp_log: false,
                 proxy: false,
@@ -1827,6 +1849,7 @@ bwrap
                 rules: &[],
                 wl_proxy: None,
                 audio_policy: "",
+                own_cgroup: None,
                 net_proxy_log: false,
                 seccomp_log: false,
                 proxy: false,
@@ -1868,6 +1891,7 @@ bwrap
                 rules: &[],
                 wl_proxy: None,
                 audio_policy: "",
+                own_cgroup: None,
                 net_proxy_log: false,
                 seccomp_log: false,
                 proxy: false,
@@ -1900,6 +1924,7 @@ bwrap
                 rules: &[],
                 wl_proxy: None,
                 audio_policy: "",
+                own_cgroup: None,
                 net_proxy_log: false,
                 seccomp_log: false,
                 proxy: false,
@@ -1935,6 +1960,7 @@ bwrap
                 rules: &[],
                 wl_proxy: None,
                 audio_policy: "",
+                own_cgroup: None,
                 net_proxy_log: false,
                 seccomp_log: log,
                 proxy: false,
@@ -2129,6 +2155,7 @@ bwrap
             rules: &[],
             wl_proxy: None,
             audio_policy: "",
+            own_cgroup: None,
             net_proxy_log: false,
             seccomp_log: false,
             proxy: false,
@@ -2173,6 +2200,7 @@ bwrap
             rules: &[],
             wl_proxy: None,
             audio_policy: "",
+            own_cgroup: None,
             net_proxy_log: false,
             seccomp_log: false,
             proxy: false,
@@ -2212,6 +2240,7 @@ bwrap
             rules: &[],
             wl_proxy: None,
             audio_policy: "",
+            own_cgroup: None,
             net_proxy_log: false,
             seccomp_log: false,
             proxy: false,
@@ -2262,6 +2291,7 @@ bwrap
             rules: &[],
             wl_proxy: None,
             audio_policy: "",
+            own_cgroup: None,
             net_proxy_log: false,
             seccomp_log: false,
             proxy: false,
@@ -2301,6 +2331,7 @@ bwrap
             rules: &[],
             wl_proxy: None,
             audio_policy: "",
+            own_cgroup: None,
             net_proxy_log: false,
             seccomp_log: false,
             proxy: false,
@@ -2343,6 +2374,7 @@ bwrap
                 rules: &[],
                 wl_proxy: None,
                 audio_policy: "",
+                own_cgroup: None,
                 net_proxy_log: false,
                 seccomp_log: false,
                 proxy: false,
@@ -2397,6 +2429,7 @@ bwrap
             rules: &[],
             wl_proxy: None,
             audio_policy: "",
+            own_cgroup: None,
             net_proxy_log: false,
             seccomp_log: false,
             proxy: false,

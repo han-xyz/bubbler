@@ -15,6 +15,7 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
 use bubbler_core::audio_policy;
+use bubbler_core::cgroup;
 use bubbler_core::config::{self, Service, Share, ShareMode, X11Mode};
 use bubbler_core::dbus;
 use bubbler_core::dbus_wire;
@@ -752,6 +753,7 @@ fn explain(
     let wl_proxy = launcher::wl_proxy_plan(env, inst);
     let audio_suffix =
         audio_policy::explain_suffix(&inst.config, &RealHost, env, audio_policy::loaded_revision);
+    let own_cgroup = cgroup::own_path().ok();
     let view = explain::View {
         title,
         instance: &inst.name,
@@ -763,6 +765,7 @@ fn explain(
         rules: &rules,
         wl_proxy: wl_proxy.as_ref(),
         audio_policy: &audio_suffix,
+        own_cgroup: own_cgroup.as_deref(),
         net_proxy_log: env.net_proxy_log,
         seccomp_log: env.seccomp_log,
         proxy: opts.proxy || opts.wl_proxy || opts.net_proxy,

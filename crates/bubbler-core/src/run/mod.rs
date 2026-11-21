@@ -7,6 +7,7 @@ pub mod forward;
 pub mod fsutil;
 pub mod instance;
 pub mod launcher;
+pub mod proc;
 pub mod run_log;
 pub mod tty;
 pub mod version;

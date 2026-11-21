@@ -12,9 +12,11 @@ use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 use rustix::process::Pid;
 
+use crate::cgroup_text::PROXY_LEAF;
+pub use crate::cgroup_text::placeholder;
 use crate::error::LaunchError;
-use crate::host;
 use crate::network;
+use crate::proc;
 
 // Every path a rule carries is relative to this.
 const CGROUP2_ROOT: &str = "/sys/fs/cgroup";
@@ -30,10 +32,6 @@ const MAX_CGROUP_FILE: u64 = 64 * 1024;
 // The leaf bubbler moves itself into, and so the root of the sandbox's
 // cgroup namespace.
 const SANDBOX_LEAF: &str = "sandbox";
-
-// The leaf the egress proxy writes itself into, which is what the
-// ruleset accepts.
-const PROXY_LEAF: &str = "proxy";
 
 // How long the teardown waits for the sandbox's processes to be gone
 // before giving up on removing the directories. bwrap's
@@ -178,7 +176,7 @@ impl Ops {
 }
 
 fn kernel_alive(pid: i32) -> bool {
-    Pid::from_raw(pid).is_some_and(host::pid_alive)
+    Pid::from_raw(pid).is_some_and(proc::pid_alive)
 }
 
 // 0755 like every other cgroup: the directory is the user's own and
@@ -349,17 +347,6 @@ pub fn own_path() -> Result<String, LaunchError> {
                 .to_owned(),
         )
     })
-}
-
-/// The leaf an explanation names, under the cgroup a run of `instance`
-/// would create: the sandbox pid is not part of it, and bubbler's own is
-/// whatever the run has.
-pub fn placeholder(own: &str, instance: &str) -> String {
-    let base = match own.is_empty() {
-        true => String::new(),
-        false => format!("{own}/"),
-    };
-    format!("{base}bubbler-{instance}-<pid>/{PROXY_LEAF}")
 }
 
 // `None` where there is no such line, which is a host with no cgroup2
