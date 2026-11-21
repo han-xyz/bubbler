@@ -18,7 +18,6 @@ const DEBT: &[Entry] = &[
     ("error", "wayland", "model/error.rs:368"),
     ("explain", "version", "plan/explain.rs:112"),
     ("lint", "audio_policy", "plan/lint.rs:16"),
-    ("lint", "desktop", "plan/lint.rs:19"),
 ];
 
 const TEST_DEBT: &[Entry] = &[

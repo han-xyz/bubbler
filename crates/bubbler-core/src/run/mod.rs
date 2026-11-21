@@ -1,7 +1,7 @@
 pub mod audio_policy;
 pub mod cgroup;
 pub mod dbus_wire;
-pub mod desktop;
+pub mod desktop_ops;
 pub mod exec;
 pub mod forward;
 pub mod fsutil;

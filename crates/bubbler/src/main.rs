@@ -20,6 +20,7 @@ use bubbler_core::config::{self, Service, Share, ShareMode, X11Mode};
 use bubbler_core::dbus;
 use bubbler_core::dbus_wire;
 use bubbler_core::desktop;
+use bubbler_core::desktop_ops;
 use bubbler_core::env::Env;
 use bubbler_core::error::{ConfigError, LaunchError};
 use bubbler_core::exec;
@@ -789,15 +790,15 @@ fn build_entry(
     program: &Path,
     replace: bool,
 ) -> Result<(PathBuf, String)> {
-    let source = desktop::source(dirs, &inst.name, &inst.config)
+    let source = desktop_ops::source(dirs, &inst.name, &inst.config)
         .with_context(|| format!("finding the desktop entry instance `{}` is for", inst.name))?;
-    let entry = desktop::render(&source, &inst.name, program)
+    let entry = desktop_ops::render(&source, &inst.name, program)
         .with_context(|| format!("reading {}", source.display()))?;
     Ok((desktop::target(dirs, &inst.name, &source, replace), entry))
 }
 
 fn refresh_entries(env: &Env, dirs: &desktop::Dirs, program: &Path) -> Result<i32> {
-    let entries = desktop::generated(dirs);
+    let entries = desktop_ops::generated(dirs);
     if entries.is_empty() {
         ediag!(
             "bubbler: no entry of bubbler's in {}; `bubbler desktop <instance>` writes one",
@@ -815,7 +816,7 @@ fn refresh_entries(env: &Env, dirs: &desktop::Dirs, program: &Path) -> Result<i3
                 // shadows the application's was decided when it was
                 // written, and a refresh is not the place to change it.
                 let (_, entry) = build_entry(dirs, &inst, program, false)?;
-                desktop::write(&path, &entry, &name)
+                desktop_ops::write(&path, &entry, &name)
                     .with_context(|| format!("writing {}", path.display()))?;
                 warn_invalid(&path);
                 Ok(())
@@ -881,7 +882,7 @@ fn open_log(
 // The file is on disk either way, since what `desktop-file-validate` says
 // about an application's own copied keys is not bubbler's to correct.
 fn warn_invalid(path: &Path) {
-    for line in desktop::validate(path) {
+    for line in desktop_ops::validate(path) {
         ediag!("bubbler: warning: {line}");
     }
 }
@@ -889,7 +890,7 @@ fn warn_invalid(path: &Path) {
 // A missing tool is a warning: it costs the entry its place in "Open
 // With" lists, and nothing else about it.
 fn update_desktop_db(dir: &Path) {
-    match desktop::update_database(dir) {
+    match desktop_ops::update_database(dir) {
         Ok(true) => {}
         Ok(false) => ediag!(
             "bubbler: warning: update-desktop-database is not installed \
@@ -1560,7 +1561,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
         } => {
             let dirs = desktop::Dirs::from_env(&env);
             let exe = std::env::current_exe().context("finding this bubbler binary")?;
-            let program = desktop::program(&exe, &host_env::search_path());
+            let program = desktop_ops::program(&exe, &host_env::search_path());
             if refresh {
                 return refresh_entries(&env, &dirs, &program);
             }
@@ -1568,7 +1569,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             // with it, so this is out of reach from the command line.
             let name = name.context("`desktop` takes an instance name or `--refresh`")?;
             if remove {
-                let gone = desktop::remove(&dirs, &name)
+                let gone = desktop_ops::remove(&dirs, &name)
                     .with_context(|| format!("removing the desktop entry of `{name}`"))?;
                 update_desktop_db(&dirs.user);
                 let lines: Vec<&OsStr> = gone.iter().map(|p| p.as_os_str()).collect();
@@ -1582,7 +1583,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                 // `Exec=`, copied from a file bubbler did not write.
                 return print_echoed_bytes(entry.as_bytes(), "the desktop entry");
             }
-            desktop::write(&target, &entry, &name)
+            desktop_ops::write(&target, &entry, &name)
                 .with_context(|| format!("writing {}", target.display()))?;
             warn_invalid(&target);
             update_desktop_db(&dirs.user);

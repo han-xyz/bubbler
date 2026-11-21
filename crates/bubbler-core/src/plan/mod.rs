@@ -1,6 +1,7 @@
 pub mod bwrap;
 pub mod cgroup_text;
 pub mod dbus;
+pub mod desktop;
 pub mod explain;
 pub mod host;
 pub mod init_bin;
