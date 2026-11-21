@@ -5,6 +5,7 @@
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitStatus;
+use std::time::Duration;
 
 use rustix::io::Errno;
 
@@ -14,8 +15,19 @@ use crate::model::error::ConfigError;
 use crate::plan::plan_error::PlanError;
 use crate::run::dbus_a11y::A11yError;
 use crate::run::exec::ControlError;
-use crate::run::launcher;
 use crate::wayland_context::WaylandError;
+
+pub(crate) const PW_READY: Duration = Duration::from_secs(5);
+
+// The server reports readiness on nothing: this bounds the wait for its socket.
+pub(crate) const PULSE_READY: Duration = Duration::from_secs(5);
+
+// A bound on a hang, not on the work: `nft` took 1.5 ms when measured.
+pub(crate) const NFT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the egress proxy has to report that it is listening. It binds one socket after three
+/// `setns` calls; this is a bound on a hang and not on the work.
+pub(crate) const NET_PROXY_READY: Duration = Duration::from_secs(5);
 
 /// Failures while turning a config into a running sandbox.
 #[derive(Debug, Error)]
@@ -103,7 +115,7 @@ pub enum PipeWireError {
         "pw-container did not create this instance's PipeWire security context: it did not \
          report `{}` within {:?}",
         crate::pipewire::SOCKET_INSIDE,
-        launcher::PW_READY
+        PW_READY
     )]
     ContextSilent,
     /// The private `pipewire-pulse` exited before it made its socket.
@@ -116,7 +128,7 @@ pub enum PipeWireError {
         "pipewire-pulse did not serve this instance's private PulseAudio socket: it did not \
          create `{}` within {:?}",
         .0.display(),
-        launcher::PULSE_READY
+        PULSE_READY
     )]
     PulseSilent(PathBuf),
 }
@@ -163,7 +175,7 @@ pub enum NetworkError {
         "connecting the sandbox network namespace: `{}` did not install the outbound ruleset \
          within {} seconds",
         crate::network::NFT_BIN,
-        launcher::NFT_TIMEOUT.as_secs()
+        NFT_TIMEOUT.as_secs()
     )]
     NftTimeout,
     /// `nft` exited unsuccessfully.
@@ -189,7 +201,7 @@ pub enum NetworkError {
     #[error(
         "connecting the sandbox network namespace: the egress proxy did not start: it did not \
          report a listening socket within {:?}",
-        launcher::NET_PROXY_READY
+        NET_PROXY_READY
     )]
     ProxySilent,
     /// The cgroup a run would create is no path a ruleset can carry.

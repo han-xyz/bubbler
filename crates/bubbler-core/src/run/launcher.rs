@@ -47,7 +47,9 @@ use crate::instance::Instance;
 pub use crate::paths::{RUNTIME_SUBDIR, instance_runtime_dir};
 pub(crate) use crate::paths::{START_LOCK_SUFFIX, start_lock_path};
 use crate::plan::plan_error::PlanError;
-use crate::run::launch_error::{LaunchError, NetworkError, PipeWireError};
+use crate::run::launch_error::{
+    LaunchError, NET_PROXY_READY, NFT_TIMEOUT, NetworkError, PULSE_READY, PW_READY, PipeWireError,
+};
 pub use crate::sidecar_argv::{
     DryRunAlloc, build_argv, explain, explain_net_proxy, explain_wayland_proxy, proxy_argv,
     pw_context_argv, pw_pulse_argv, resolve_command, wl_proxy_argv, wl_proxy_plan,
@@ -75,12 +77,7 @@ const PROXY_STOP: Duration = Duration::from_secs(1);
 
 const WL_PROXY_STOP: Duration = Duration::from_secs(5);
 
-pub(crate) const PW_READY: Duration = Duration::from_secs(5);
-
 const PW_STOP: Duration = Duration::from_secs(5);
-
-// The server reports readiness on nothing: this bounds the wait for its socket.
-pub(crate) const PULSE_READY: Duration = Duration::from_secs(5);
 
 const PULSE_STOP: Duration = Duration::from_secs(5);
 
@@ -90,13 +87,6 @@ const PW_REPORT_MAX: usize = 4096;
 const PASTA_READY: Duration = Duration::from_secs(5);
 
 const PASTA_STOP: Duration = Duration::from_secs(1);
-
-// A bound on a hang, not on the work: `nft` took 1.5 ms when measured.
-pub(crate) const NFT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How long the egress proxy has to report that it is listening. It binds one socket after three
-/// `setns` calls; this is a bound on a hang and not on the work.
-pub(crate) const NET_PROXY_READY: Duration = Duration::from_secs(5);
 
 const NET_PROXY_STOP: Duration = Duration::from_secs(5);
 
